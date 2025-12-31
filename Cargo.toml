@@ -1,0 +1,47 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/raster",
+    "crates/raster-macros",
+    "crates/raster-core",
+    "crates/raster-compiler",
+    "crates/raster-runtime",
+    "crates/raster-backend",
+    "crates/raster-analysis",
+    "crates/raster-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/casettek/raster"
+authors = ["Raster Contributors"]
+
+[workspace.dependencies]
+# Internal crates
+raster-core = { path = "crates/raster-core", version = "0.1.0" }
+raster-macros = { path = "crates/raster-macros", version = "0.1.0" }
+raster-runtime = { path = "crates/raster-runtime", version = "0.1.0" }
+raster-backend = { path = "crates/raster-backend", version = "0.1.0" }
+raster-compiler = { path = "crates/raster-compiler", version = "0.1.0" }
+raster-analysis = { path = "crates/raster-analysis", version = "0.1.0" }
+
+# External dependencies
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+anyhow = "1.0"
+
+# Proc macro dependencies
+syn = { version = "2.0", features = ["full"] }
+quote = "1.0"
+proc-macro2 = "1.0"
+
+# CLI dependencies
+clap = { version = "4.5", features = ["derive"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

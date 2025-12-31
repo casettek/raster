@@ -1,0 +1,20 @@
+[package]
+name = "raster-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "CLI tool for the Raster toolchain"
+
+[[bin]]
+name = "cargo-raster"
+path = "src/main.rs"
+
+[dependencies]
+raster-core.workspace = true
+raster-compiler.workspace = true
+raster-runtime.workspace = true
+raster-analysis.workspace = true
+clap.workspace = true
+anyhow.workspace = true

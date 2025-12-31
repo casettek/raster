@@ -1,0 +1,17 @@
+[package]
+name = "raster"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Rust-based developer toolchain for tile-based execution"
+
+[dependencies]
+raster-core.workspace = true
+raster-macros.workspace = true
+raster-runtime.workspace = true
+
+[features]
+default = ["tracing"]
+tracing = ["raster-runtime/tracing"]

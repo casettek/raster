@@ -1,0 +1,17 @@
+[package]
+name = "raster-macros"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Procedural macros for the Raster toolchain"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+raster-core.workspace = true
+syn.workspace = true
+quote.workspace = true
+proc-macro2.workspace = true
