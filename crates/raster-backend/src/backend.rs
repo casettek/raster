@@ -57,15 +57,33 @@ pub struct CompilationOutput {
     pub artifact_dir: Option<PathBuf>,
 }
 
+/// RISC0's minimum segment size for proving (2^16).
+pub const MIN_PROOF_SEGMENT_CYCLES: u64 = 65536;
+
+/// Calculate the proof cycle count (padded to next power of 2, min 2^16).
+pub fn calculate_proof_cycles(actual_cycles: u64) -> u64 {
+    if actual_cycles <= MIN_PROOF_SEGMENT_CYCLES {
+        MIN_PROOF_SEGMENT_CYCLES
+    } else {
+        // Round up to next power of 2
+        actual_cycles.next_power_of_two()
+    }
+}
+
 /// Result of executing a tile.
 #[derive(Debug, Clone)]
 pub struct TileExecution {
     /// The serialized output of the tile execution.
     pub output: Vec<u8>,
 
-    /// Cycle count for the execution (if available).
-    /// Always provided in Estimate mode, may be provided in Prove mode.
+    /// Actual cycle count for the execution (if available).
+    /// This is the real number of cycles the program used.
     pub cycles: Option<u64>,
+
+    /// Proof cycle count (padded to power of 2 for STARK proving).
+    /// This represents what proving would actually cost.
+    /// Only meaningful for zkVM backends.
+    pub proof_cycles: Option<u64>,
 
     /// The serialized receipt (proof) from execution.
     /// Only present when executed in Prove mode.
@@ -77,10 +95,12 @@ pub struct TileExecution {
 
 impl TileExecution {
     /// Create a new execution result with just output (for estimate mode).
+    /// Automatically calculates proof_cycles based on actual cycles.
     pub fn estimate(output: Vec<u8>, cycles: u64) -> Self {
         Self {
             output,
             cycles: Some(cycles),
+            proof_cycles: Some(calculate_proof_cycles(cycles)),
             receipt: None,
             verified: None,
         }
@@ -88,9 +108,11 @@ impl TileExecution {
 
     /// Create a new execution result with output and receipt (for prove mode).
     pub fn proved(output: Vec<u8>, cycles: Option<u64>, receipt: Vec<u8>, verified: bool) -> Self {
+        let proof_cycles = cycles.map(calculate_proof_cycles);
         Self {
             output,
             cycles,
+            proof_cycles,
             receipt: Some(receipt),
             verified: Some(verified),
         }

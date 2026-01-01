@@ -1,3 +1,6 @@
+//! Tile types for the Raster toolchain.
+
+use alloc::string::{String, ToString};
 use serde::{Deserialize, Serialize};
 
 /// Unique identifier for a tile.

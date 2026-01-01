@@ -5,11 +5,39 @@ use raster_backend::{
     Backend, CompilationOutput, ExecutionMode, ResourceEstimate, TileExecution,
 };
 use raster_core::{tile::TileMetadata, Error, Result};
-use risc0_zkvm::{
-    default_executor, default_prover, ExecutorEnv, ProverOpts, VerifierContext,
-};
+use risc0_zkvm::{default_executor, ExecutorEnv, ProverOpts};
 use std::fs;
 use std::path::PathBuf;
+
+/// Check if Metal GPU acceleration is available (compile-time + runtime).
+pub fn is_metal_available() -> bool {
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    {
+        // Metal feature is enabled and we're on macOS
+        true
+    }
+    #[cfg(not(all(feature = "metal", target_os = "macos")))]
+    {
+        false
+    }
+}
+
+/// Check if CUDA GPU acceleration is available (compile-time).
+pub fn is_cuda_available() -> bool {
+    #[cfg(feature = "cuda")]
+    {
+        true
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        false
+    }
+}
+
+/// Check if any GPU acceleration is available.
+pub fn is_gpu_available() -> bool {
+    is_metal_available() || is_cuda_available()
+}
 
 /// RISC0 zkVM backend for compiling and executing tiles with optional proving.
 pub struct Risc0Backend {
@@ -53,6 +81,7 @@ impl Risc0Backend {
     }
 
     /// Load a compiled ELF from the artifact directory.
+    #[allow(dead_code)]
     fn load_elf(&self, tile_id: &str) -> Result<Vec<u8>> {
         let builder = self.guest_builder();
         let elf_path = builder.artifact_dir(tile_id).join("guest.elf");
@@ -118,7 +147,11 @@ impl Backend for Risc0Backend {
         mode: ExecutionMode,
     ) -> Result<TileExecution> {
         // Build the executor environment with the input
+        // Write length first, then raw bytes (guest expects this format)
+        let input_len = input.len() as u32;
         let env = ExecutorEnv::builder()
+            .write(&input_len)
+            .map_err(|e| Error::Other(format!("Failed to write input length: {}", e)))?
             .write_slice(input)
             .build()
             .map_err(|e| Error::Other(format!("Failed to build executor env: {}", e)))?;
@@ -138,11 +171,21 @@ impl Backend for Risc0Backend {
                 Ok(TileExecution::estimate(output, cycles))
             }
             ExecutionMode::Prove { verify } => {
-                // Execute with proving
-                let prover = default_prover();
-                let prove_info = prover
-                    .prove(env, &compilation.elf)
-                    .map_err(|e| Error::Other(format!("Proving failed: {}", e)))?;
+                // Execute with proving, optionally using GPU acceleration
+                let prove_info = if self.use_gpu && is_gpu_available() {
+                    // Use GPU-accelerated prover
+                    let opts = ProverOpts::default();
+                    let prover = risc0_zkvm::default_prover();
+                    prover
+                        .prove_with_opts(env, &compilation.elf, &opts)
+                        .map_err(|e| Error::Other(format!("GPU proving failed: {}", e)))?
+                } else {
+                    // Use default CPU prover
+                    let prover = risc0_zkvm::default_prover();
+                    prover
+                        .prove(env, &compilation.elf)
+                        .map_err(|e| Error::Other(format!("Proving failed: {}", e)))?
+                };
 
                 let receipt = prove_info.receipt;
                 let output = receipt.journal.bytes.clone();

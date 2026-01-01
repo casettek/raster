@@ -7,9 +7,20 @@ repository.workspace = true
 authors.workspace = true
 description = "Core types and schemas for the Raster toolchain"
 
+[features]
+default = ["std"]
+std = ["serde/std", "serde_json", "bincode"]
+alloc = []
+
 [dependencies]
 serde.workspace = true
-serde_json.workspace = true
-thiserror.workspace = true
+# postcard is no_std compatible for tile ABI serialization
+postcard.workspace = true
+
+# Optional std-only dependencies
+serde_json = { workspace = true, optional = true }
+bincode = { workspace = true, optional = true }
+
+# linkme is only available on platforms that support it (not RISC-V zkVM)
+[target.'cfg(not(target_arch = "riscv32"))'.dependencies]
 linkme.workspace = true
-bincode.workspace = true

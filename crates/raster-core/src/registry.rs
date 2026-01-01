@@ -2,9 +2,11 @@
 //!
 //! This module provides a global registry of tiles that are automatically
 //! populated by the `#[tile]` macro using linkme's distributed slices.
-//! The registry enables both host-side tile discovery and guest-side
-//! tile execution in the RISC0 zkVM.
+//! The registry enables host-side tile discovery.
+//!
+//! This module requires the `std` feature.
 
+use std::vec::Vec;
 use crate::tile::{TileId, TileIdStatic, TileMetadata, TileMetadataStatic};
 use crate::Result;
 use linkme::distributed_slice;

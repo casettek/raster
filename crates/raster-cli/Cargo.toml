@@ -7,17 +7,26 @@ repository.workspace = true
 authors.workspace = true
 description = "CLI tool for the Raster toolchain"
 
+[features]
+default = []
+# Enable Metal GPU acceleration for proving (macOS Apple Silicon)
+metal = ["raster-backend-risc0/metal"]
+# Enable CUDA GPU acceleration for proving (NVIDIA GPUs)
+cuda = ["raster-backend-risc0/cuda"]
+
 [[bin]]
 name = "cargo-raster"
 path = "src/main.rs"
 
 [dependencies]
-raster-core.workspace = true
+raster-core = { workspace = true, features = ["std"] }
 raster-backend.workspace = true
+raster-backend-risc0.workspace = true
 raster-compiler.workspace = true
 raster-runtime.workspace = true
 raster-analysis.workspace = true
 clap.workspace = true
 anyhow.workspace = true
 serde_json.workspace = true
+postcard.workspace = true
 hex = "0.4"

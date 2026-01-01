@@ -7,6 +7,13 @@ repository.workspace = true
 authors.workspace = true
 description = "RISC0 zkVM backend for the Raster toolchain"
 
+[features]
+default = []
+# Enable Metal GPU acceleration for proving (macOS Apple Silicon)
+metal = ["risc0-zkvm/metal"]
+# Enable CUDA GPU acceleration for proving (NVIDIA GPUs)
+cuda = ["risc0-zkvm/cuda"]
+
 [dependencies]
 raster-core.workspace = true
 raster-backend.workspace = true

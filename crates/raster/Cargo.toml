@@ -7,11 +7,14 @@ repository.workspace = true
 authors.workspace = true
 description = "Rust-based developer toolchain for tile-based execution"
 
-[dependencies]
-raster-core.workspace = true
-raster-macros.workspace = true
-raster-runtime.workspace = true
-
 [features]
-default = ["tracing"]
-tracing = ["raster-runtime/tracing"]
+default = ["std"]
+std = ["raster-core/std", "raster-runtime"]
+alloc = ["raster-core/alloc"]
+
+[dependencies]
+raster-core = { workspace = true, default-features = false }
+raster-macros.workspace = true
+
+# Runtime is only available with std
+raster-runtime = { workspace = true, optional = true }

@@ -151,14 +151,14 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
         let name = input_names[0];
         if returns_result {
             quote! {
-                let #name: #ty = ::raster::core::bincode::deserialize(input)
-                    .map_err(|e| ::raster::core::Error::Other(format!("Failed to deserialize input: {}", e)))?;
+                let #name: #ty = ::raster::core::postcard::from_bytes(input)
+                    .map_err(|e| ::raster::core::Error::Serialization(::alloc::format!("Failed to deserialize input: {}", e)))?;
                 let result = #fn_name(#name)?;
             }
         } else {
             quote! {
-                let #name: #ty = ::raster::core::bincode::deserialize(input)
-                    .map_err(|e| ::raster::core::Error::Other(format!("Failed to deserialize input: {}", e)))?;
+                let #name: #ty = ::raster::core::postcard::from_bytes(input)
+                    .map_err(|e| ::raster::core::Error::Serialization(::alloc::format!("Failed to deserialize input: {}", e)))?;
                 let result = #fn_name(#name);
             }
         }
@@ -167,14 +167,14 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
         let tuple_type = quote! { (#(#input_types),*) };
         if returns_result {
             quote! {
-                let (#(#input_names),*): #tuple_type = ::raster::core::bincode::deserialize(input)
-                    .map_err(|e| ::raster::core::Error::Other(format!("Failed to deserialize input: {}", e)))?;
+                let (#(#input_names),*): #tuple_type = ::raster::core::postcard::from_bytes(input)
+                    .map_err(|e| ::raster::core::Error::Serialization(::alloc::format!("Failed to deserialize input: {}", e)))?;
                 let result = #fn_name(#(#input_names),*)?;
             }
         } else {
             quote! {
-                let (#(#input_names),*): #tuple_type = ::raster::core::bincode::deserialize(input)
-                    .map_err(|e| ::raster::core::Error::Other(format!("Failed to deserialize input: {}", e)))?;
+                let (#(#input_names),*): #tuple_type = ::raster::core::postcard::from_bytes(input)
+                    .map_err(|e| ::raster::core::Error::Serialization(::alloc::format!("Failed to deserialize input: {}", e)))?;
                 let result = #fn_name(#(#input_names),*);
             }
         }
@@ -203,15 +203,16 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
         // Keep the original function unchanged
         #input_fn
 
-        // Generate the ABI wrapper function
-        fn #wrapper_name(input: &[u8]) -> ::raster::core::Result<::std::vec::Vec<u8>> {
+        // Generate the ABI wrapper function (available on all platforms, no_std compatible)
+        pub fn #wrapper_name(input: &[u8]) -> ::raster::core::Result<::alloc::vec::Vec<u8>> {
             #deserialize_and_call
 
-            ::raster::core::bincode::serialize(&result)
-                .map_err(|e| ::raster::core::Error::Other(format!("Failed to serialize output: {}", e)))
+            ::raster::core::postcard::to_allocvec(&result)
+                .map_err(|e| ::raster::core::Error::Serialization(::alloc::format!("Failed to serialize output: {}", e)))
         }
 
-        // Register the tile in the distributed slice
+        // Register the tile in the distributed slice (only on platforms that support linkme and std)
+        #[cfg(all(feature = "std", not(target_arch = "riscv32")))]
         #[::raster::core::linkme::distributed_slice(::raster::core::registry::TILE_REGISTRY)]
         #[linkme(crate = ::raster::core::linkme)]
         static #registration_name: ::raster::core::registry::TileRegistration =

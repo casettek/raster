@@ -2,9 +2,11 @@
 
 use crate::BackendType;
 use anyhow::{anyhow, Context, Result};
-use raster_backend::{Backend, ExecutionMode, NativeBackend};
+use raster_backend::{Backend, CompilationOutput, ExecutionMode, NativeBackend};
+use raster_backend_risc0::{is_gpu_available, Risc0Backend};
 use raster_compiler::{Builder, TileDiscovery};
 use std::env;
+use std::fs;
 use std::path::PathBuf;
 
 /// Get the output directory for artifacts.
@@ -21,17 +23,14 @@ fn project_path() -> PathBuf {
 }
 
 /// Create a backend instance.
-fn create_backend(backend_type: BackendType) -> Result<Box<dyn Backend>> {
+fn create_backend(backend_type: BackendType, use_gpu: bool) -> Result<Box<dyn Backend>> {
     match backend_type {
         BackendType::Native => Ok(Box::new(NativeBackend::new())),
         BackendType::Risc0 => {
-            // RISC0 backend would be created here
-            // For now, return an error since it requires additional setup
-            Err(anyhow!(
-                "RISC0 backend is not available in this build. \n\
-                 To use RISC0, ensure risc0-zkvm is installed and the \n\
-                 raster-backend-risc0 crate is properly configured."
-            ))
+            let backend = Risc0Backend::new(output_dir())
+                .with_user_crate(project_path())
+                .with_gpu(use_gpu);
+            Ok(Box::new(backend))
         }
     }
 }
@@ -62,7 +61,7 @@ pub fn build(backend_type: BackendType, tile: Option<String>) -> Result<()> {
     }
     println!();
 
-    let backend = create_backend(backend_type)?;
+    let backend = create_backend(backend_type, false)?;
     let builder = Builder::new(output_dir())
         .with_backend(backend)
         .with_project_path(project_path());
@@ -79,10 +78,17 @@ pub fn build(backend_type: BackendType, tile: Option<String>) -> Result<()> {
     } else {
         // Build all tiles using source discovery
         let output = builder.build_from_source()?;
-        println!(
-            "Compiled {} tile(s) using {} backend",
-            output.tiles_compiled, output.backend
-        );
+        if output.skipped_cached > 0 {
+            println!(
+                "Compiled {} tile(s), {} cached (unchanged) using {} backend",
+                output.tiles_compiled, output.skipped_cached, output.backend
+            );
+        } else {
+            println!(
+                "Compiled {} tile(s) using {} backend",
+                output.tiles_compiled, output.backend
+            );
+        }
         for (tile_id, artifact) in &output.artifacts {
             println!("  {} -> {}", tile_id, artifact.artifact_dir.display());
         }
@@ -100,6 +106,7 @@ pub fn run(
     input: Option<&str>,
     prove: bool,
     verify: bool,
+    use_gpu: bool,
     no_trace: bool,
 ) -> Result<()> {
     // Determine execution mode
@@ -117,11 +124,25 @@ pub fn run(
         ExecutionMode::Prove { verify: false } => "prove",
     };
 
+    // Check GPU availability and warn if requested but not available
+    let gpu_status = if use_gpu {
+        if is_gpu_available() {
+            " (GPU enabled)"
+        } else {
+            eprintln!("Warning: --gpu requested but GPU acceleration not available.");
+            eprintln!("         Rebuild with 'metal' feature on macOS or 'cuda' on Linux/Windows.");
+            " (GPU requested but unavailable, using CPU)"
+        }
+    } else {
+        ""
+    };
+
     println!(
-        "Running tile '{}' with {} backend in {} mode...",
+        "Running tile '{}' with {} backend in {} mode{}...",
         tile_id,
         backend_type_name(backend_type),
-        mode_name
+        mode_name,
+        gpu_status
     );
     if !no_trace {
         println!("(tracing enabled)");
@@ -141,13 +162,13 @@ pub fn run(
 
     // Prepare input
     let input_bytes = if let Some(input_json) = input {
-        // Parse JSON input and serialize with bincode
+        // Parse JSON input and serialize with postcard
         let value: serde_json::Value =
             serde_json::from_str(input_json).context("Failed to parse input JSON")?;
-        raster_core::bincode::serialize(&value).context("Failed to serialize input")?
+        postcard::to_allocvec(&value).context("Failed to serialize input")?
     } else {
         // Empty input (unit type)
-        raster_core::bincode::serialize(&()).context("Failed to serialize empty input")?
+        postcard::to_allocvec(&()).context("Failed to serialize empty input")?
     };
 
     // For native backend, we need to run the user's compiled binary
@@ -171,11 +192,34 @@ pub fn run(
     }
 
     // For RISC0 backend, we need to use the full compilation and execution pipeline
-    let backend = create_backend(backend_type)?;
+    let backend = create_backend(backend_type, use_gpu)?;
 
-    // First compile the tile
+    // Use Builder for compilation with caching
+    let builder = Builder::new(output_dir())
+        .with_backend(create_backend(backend_type, use_gpu)?)
+        .with_project_path(project_path());
+
+    // Build tile (uses cache if source unchanged)
     println!("Compiling tile...");
-    let compilation = backend.compile_tile(&tile.metadata, &tile.source_file)?;
+    let (artifact, was_cached) = builder.build_tile_with_cache_info(tile_id)?;
+    
+    if was_cached {
+        println!("Using cached build (source unchanged)");
+    }
+    
+    // Load the compilation output from artifacts
+    let elf = if let Some(ref elf_path) = artifact.elf_path {
+        fs::read(elf_path).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let method_id = hex::decode(&artifact.method_id).unwrap_or_default();
+    
+    let compilation = CompilationOutput {
+        elf,
+        method_id,
+        artifact_dir: Some(artifact.artifact_dir),
+    };
 
     // Execute with the specified mode
     println!("Executing in zkVM...");
@@ -183,9 +227,15 @@ pub fn run(
 
     println!();
     println!("Execution complete!");
-    println!("  Output bytes: {} bytes", result.output.len());
     if let Some(cycles) = result.cycles {
         println!("  Cycles: {}", cycles);
+    }
+    // Show proof cycles in estimate mode to help users understand proving cost
+    if let Some(proof_cycles) = result.proof_cycles {
+        if result.receipt.is_none() {
+            // Only show this hint in estimate mode
+            println!("  Proof cycles: {} (padded for STARK proving)", proof_cycles);
+        }
     }
     if result.receipt.is_some() {
         println!(
@@ -296,9 +346,9 @@ fn main() {
 
     // Execute via registry
     if let Some(tile) = find_tile_by_str("double") {
-        let input = raster::core::bincode::serialize(&42u64).unwrap();
+        let input = raster::core::postcard::to_allocvec(&42u64).unwrap();
         let output = tile.execute(&input).unwrap();
-        let result: u64 = raster::core::bincode::deserialize(&output).unwrap();
+        let result: u64 = raster::core::postcard::from_bytes(&output).unwrap();
         println!("double(42) via registry = {}", result);
     }
 }

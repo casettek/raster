@@ -52,6 +52,10 @@ enum Commands {
         #[arg(long)]
         verify: bool,
 
+        /// Use GPU acceleration for proving (Metal on macOS, CUDA on Linux/Windows)
+        #[arg(long)]
+        gpu: bool,
+
         /// Disable tracing
         #[arg(long)]
         no_trace: bool,
@@ -93,8 +97,9 @@ fn main() -> Result<()> {
             input,
             prove,
             verify,
+            gpu,
             no_trace,
-        } => commands::run(backend, &tile, input.as_deref(), prove, verify, no_trace),
+        } => commands::run(backend, &tile, input.as_deref(), prove, verify, gpu, no_trace),
         Commands::List => commands::list_tiles(),
         Commands::Analyze { trace_path } => commands::analyze(trace_path),
         Commands::Init { name } => commands::init(name),

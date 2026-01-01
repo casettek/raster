@@ -1,3 +1,7 @@
+//! Manifest types (requires std feature).
+
+use std::string::String;
+use std::vec::Vec;
 use serde::{Deserialize, Serialize};
 use crate::tile::TileMetadata;
 use crate::schema::SequenceSchema;

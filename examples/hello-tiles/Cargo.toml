@@ -3,5 +3,9 @@ name = "hello-tiles"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = ["std"]
+std = ["raster/std"]
+
 [dependencies]
-raster = { path = "../../crates/raster" }
+raster = { path = "../../crates/raster", default-features = false }
