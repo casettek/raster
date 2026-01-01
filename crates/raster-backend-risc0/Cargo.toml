@@ -1,11 +1,11 @@
 [package]
-name = "raster-compiler"
+name = "raster-backend-risc0"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Build orchestration for the Raster toolchain"
+description = "RISC0 zkVM backend for the Raster toolchain"
 
 [dependencies]
 raster-core.workspace = true
@@ -14,4 +14,13 @@ anyhow.workspace = true
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+bincode.workspace = true
+
+# RISC0 zkVM dependencies
+risc0-zkvm = { version = "1.2", default-features = false, features = ["prove", "std"] }
+risc0-build = "1.2"
+
+# For guest crate generation
+tempfile = "3.14"
+cargo_metadata = "0.19"
 hex = "0.4"

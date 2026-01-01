@@ -8,5 +8,5 @@
 pub mod builder;
 pub mod schema_gen;
 
-pub use builder::Builder;
+pub use builder::{Builder, BuildOutput, TileArtifact, TileManifest};
 pub use schema_gen::SchemaGenerator;

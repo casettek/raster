@@ -1,14 +1,17 @@
 //! CLI tool for the Raster toolchain.
+//!
+//! Provides commands for building, running, and analyzing Raster tiles.
 
 mod commands;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use anyhow::Result;
 
 #[derive(Parser)]
 #[command(name = "cargo-raster")]
 #[command(bin_name = "cargo raster")]
 #[command(about = "Raster toolchain CLI", long_about = None)]
+#[command(version)]
 enum Cli {
     #[command(subcommand)]
     Raster(Commands),
@@ -17,14 +20,45 @@ enum Cli {
 #[derive(Parser)]
 enum Commands {
     /// Build tiles and generate schemas
-    Build,
+    Build {
+        /// Backend to use for compilation
+        #[arg(long, short, value_enum, default_value = "native")]
+        backend: BackendType,
 
-    /// Execute a sequence natively
+        /// Specific tile to build (builds all if not specified)
+        #[arg(long)]
+        tile: Option<String>,
+    },
+
+    /// Execute a tile
     Run {
+        /// Backend to use for execution
+        #[arg(long, short, value_enum, default_value = "native")]
+        backend: BackendType,
+
+        /// Tile ID to execute
+        #[arg(long)]
+        tile: String,
+
+        /// Input data as JSON string
+        #[arg(long)]
+        input: Option<String>,
+
+        /// Generate a proof (RISC0 backend only)
+        #[arg(long)]
+        prove: bool,
+
+        /// Verify the generated proof (implies --prove)
+        #[arg(long)]
+        verify: bool,
+
         /// Disable tracing
         #[arg(long)]
         no_trace: bool,
     },
+
+    /// List all registered tiles
+    List,
 
     /// Analyze execution traces
     Analyze {
@@ -39,12 +73,29 @@ enum Commands {
     },
 }
 
+/// Available backends for compilation and execution.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum BackendType {
+    /// Native execution without zkVM (default)
+    Native,
+    /// RISC0 zkVM backend with optional proving
+    Risc0,
+}
+
 fn main() -> Result<()> {
     let Cli::Raster(cmd) = Cli::parse();
 
     match cmd {
-        Commands::Build => commands::build(),
-        Commands::Run { no_trace } => commands::run(no_trace),
+        Commands::Build { backend, tile } => commands::build(backend, tile),
+        Commands::Run {
+            backend,
+            tile,
+            input,
+            prove,
+            verify,
+            no_trace,
+        } => commands::run(backend, &tile, input.as_deref(), prove, verify, no_trace),
+        Commands::List => commands::list_tiles(),
         Commands::Analyze { trace_path } => commands::analyze(trace_path),
         Commands::Init { name } => commands::init(name),
     }
