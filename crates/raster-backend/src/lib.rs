@@ -6,5 +6,7 @@
 pub mod backend;
 pub mod native;
 
-pub use backend::Backend;
+pub use backend::{
+    Backend, CompilationOutput, ExecutionMode, ResourceEstimate, TileExecution,
+};
 pub use native::NativeBackend;

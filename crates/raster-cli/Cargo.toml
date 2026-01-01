@@ -13,8 +13,11 @@ path = "src/main.rs"
 
 [dependencies]
 raster-core.workspace = true
+raster-backend.workspace = true
 raster-compiler.workspace = true
 raster-runtime.workspace = true
 raster-analysis.workspace = true
 clap.workspace = true
 anyhow.workspace = true
+serde_json.workspace = true
+hex = "0.4"
