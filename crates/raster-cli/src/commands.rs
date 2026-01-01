@@ -1,10 +1,9 @@
 //! Command implementations for the Raster CLI.
 
 use crate::BackendType;
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use raster_backend::{Backend, ExecutionMode, NativeBackend};
-use raster_compiler::Builder;
-use raster_core::registry::{find_tile_by_str, iter_tiles, tile_count};
+use raster_compiler::{Builder, TileDiscovery};
 use std::env;
 use std::path::PathBuf;
 
@@ -39,16 +38,29 @@ fn create_backend(backend_type: BackendType) -> Result<Box<dyn Backend>> {
 
 /// Build command: compile tiles using the specified backend.
 pub fn build(backend_type: BackendType, tile: Option<String>) -> Result<()> {
-    println!("Building tiles with {} backend...", backend_type_name(backend_type));
+    println!(
+        "Building tiles with {} backend...",
+        backend_type_name(backend_type)
+    );
     println!();
 
-    // Check if we have any tiles registered
-    let count = tile_count();
-    if count == 0 {
-        println!("No tiles registered. Make sure to use the #[tile] macro.");
+    // Discover tiles from source files
+    let discovery = TileDiscovery::new(project_path());
+    let discovered_tiles = discovery
+        .discover()
+        .map_err(|e| anyhow!("Failed to discover tiles: {}", e))?;
+
+    if discovered_tiles.is_empty() {
+        println!("No tiles found. Make sure to use the #[tile] macro.");
         println!("Hint: Run this command from within your Raster project directory.");
         return Ok(());
     }
+
+    println!("Discovered {} tile(s) from source:", discovered_tiles.len());
+    for t in &discovered_tiles {
+        println!("  - {} ({}:{})", t.metadata.name, t.source_file, t.line_number);
+    }
+    println!();
 
     let backend = create_backend(backend_type)?;
     let builder = Builder::new(output_dir())
@@ -65,9 +77,12 @@ pub fn build(backend_type: BackendType, tile: Option<String>) -> Result<()> {
             println!("  ELF: {}", elf_path.display());
         }
     } else {
-        // Build all tiles
-        let output = builder.build_from_registry()?;
-        println!("Compiled {} tile(s) using {} backend", output.tiles_compiled, output.backend);
+        // Build all tiles using source discovery
+        let output = builder.build_from_source()?;
+        println!(
+            "Compiled {} tile(s) using {} backend",
+            output.tiles_compiled, output.backend
+        );
         for (tile_id, artifact) in &output.artifacts {
             println!("  {} -> {}", tile_id, artifact.artifact_dir.display());
         }
@@ -102,51 +117,56 @@ pub fn run(
         ExecutionMode::Prove { verify: false } => "prove",
     };
 
-    println!("Running tile '{}' with {} backend in {} mode...",
-             tile_id, backend_type_name(backend_type), mode_name);
+    println!(
+        "Running tile '{}' with {} backend in {} mode...",
+        tile_id,
+        backend_type_name(backend_type),
+        mode_name
+    );
     if !no_trace {
         println!("(tracing enabled)");
     }
     println!();
 
-    // Find the tile in the registry
-    let tile = find_tile_by_str(tile_id)
-        .ok_or_else(|| anyhow!("Tile '{}' not found in registry", tile_id))?;
+    // Discover tiles from source
+    let discovery = TileDiscovery::new(project_path());
+    let tiles = discovery
+        .discover()
+        .map_err(|e| anyhow!("Failed to discover tiles: {}", e))?;
+
+    let tile = tiles
+        .iter()
+        .find(|t| t.metadata.id.0 == tile_id)
+        .ok_or_else(|| anyhow!("Tile '{}' not found in project source", tile_id))?;
 
     // Prepare input
     let input_bytes = if let Some(input_json) = input {
         // Parse JSON input and serialize with bincode
-        let value: serde_json::Value = serde_json::from_str(input_json)
-            .context("Failed to parse input JSON")?;
-        raster_core::bincode::serialize(&value)
-            .context("Failed to serialize input")?
+        let value: serde_json::Value =
+            serde_json::from_str(input_json).context("Failed to parse input JSON")?;
+        raster_core::bincode::serialize(&value).context("Failed to serialize input")?
     } else {
         // Empty input (unit type)
-        raster_core::bincode::serialize(&())
-            .context("Failed to serialize empty input")?
+        raster_core::bincode::serialize(&()).context("Failed to serialize empty input")?
     };
 
-    // For native backend, we can execute directly via the registry
+    // For native backend, we need to run the user's compiled binary
     if backend_type == BackendType::Native {
-        println!("Executing tile directly via registry...");
-        let output_bytes = tile.execute(&input_bytes)?;
-
+        println!("Native execution requires running your project's binary directly.");
         println!();
-        println!("Execution complete!");
-        println!("  Output bytes: {} bytes", output_bytes.len());
-
-        // Try to decode as JSON for display
-        if !output_bytes.is_empty() {
-            if let Ok(output_str) = raster_core::bincode::deserialize::<String>(&output_bytes) {
-                println!("  Output (string): {}", output_str);
-            } else {
-                println!("  Output (hex): {}", hex::encode(&output_bytes));
-            }
-        }
-
-        // Simulate cycle count for native
-        println!("  Cycles: ~1000 (simulated)");
-
+        println!("To run tiles natively, use one of these methods:");
+        println!();
+        println!("  1. Run your project directly:");
+        println!("     cargo run");
+        println!();
+        println!("  2. Build and run your project binary:");
+        println!("     cargo build");
+        println!(
+            "     ./target/debug/<your-project-name>"
+        );
+        println!();
+        println!("The tile '{}' was found at {}:{}", 
+            tile_id, tile.source_file, tile.line_number);
         return Ok(());
     }
 
@@ -155,8 +175,7 @@ pub fn run(
 
     // First compile the tile
     println!("Compiling tile...");
-    let metadata = tile.metadata_owned();
-    let compilation = backend.compile_tile(&metadata, "src/lib.rs")?;
+    let compilation = backend.compile_tile(&tile.metadata, &tile.source_file)?;
 
     // Execute with the specified mode
     println!("Executing in zkVM...");
@@ -169,7 +188,10 @@ pub fn run(
         println!("  Cycles: {}", cycles);
     }
     if result.receipt.is_some() {
-        println!("  Receipt: generated ({} bytes)", result.receipt.as_ref().map(|r| r.len()).unwrap_or(0));
+        println!(
+            "  Receipt: generated ({} bytes)",
+            result.receipt.as_ref().map(|r| r.len()).unwrap_or(0)
+        );
     }
     if let Some(verified) = result.verified {
         println!("  Verified: {}", verified);
@@ -180,18 +202,26 @@ pub fn run(
 
 /// List command: show all registered tiles.
 pub fn list_tiles() -> Result<()> {
-    let count = tile_count();
-    println!("Registered tiles: {}", count);
+    // Discover tiles from source files
+    let discovery = TileDiscovery::new(project_path());
+    let tiles = discovery
+        .discover()
+        .map_err(|e| anyhow!("Failed to discover tiles: {}", e))?;
+
+    println!("Discovered tiles: {}", tiles.len());
     println!();
 
-    if count == 0 {
-        println!("No tiles registered. Make sure to use the #[tile] macro.");
+    if tiles.is_empty() {
+        println!("No tiles found. Make sure to use the #[tile] macro.");
         return Ok(());
     }
 
-    for tile in iter_tiles() {
-        println!("  {} (id: {})", tile.metadata.name, tile.id_str());
-        if let Some(desc) = tile.metadata.description {
+    for tile in tiles {
+        println!(
+            "  {} (id: {})",
+            tile.metadata.name, tile.metadata.id.0
+        );
+        if let Some(desc) = &tile.metadata.description {
             println!("    Description: {}", desc);
         }
         if let Some(cycles) = tile.metadata.estimated_cycles {
@@ -200,6 +230,7 @@ pub fn list_tiles() -> Result<()> {
         if let Some(memory) = tile.metadata.max_memory {
             println!("    Max memory: {} bytes", memory);
         }
+        println!("    Source: {}:{}", tile.source_file, tile.line_number);
         println!();
     }
 

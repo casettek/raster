@@ -1,10 +1,11 @@
 //! Build orchestration for Raster projects.
 
+use crate::discovery::{DiscoveredTile, TileDiscovery};
 use raster_backend::{Backend, CompilationOutput, NativeBackend};
 use raster_core::{
     manifest::Manifest,
     registry::{iter_tiles, TileRegistration},
-    Result, Error,
+    Error, Result,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -48,14 +49,76 @@ impl Builder {
         self.backend.name()
     }
 
-    /// Discover all registered tiles.
+    /// Discover all registered tiles from the in-process registry.
     ///
     /// This uses the tile registry populated by the `#[tile]` macro.
+    /// Note: This only works when the tiles are linked into the same binary.
     pub fn discover_tiles(&self) -> Vec<&'static TileRegistration> {
         iter_tiles().collect()
     }
 
-    /// Build all tiles from the registry.
+    /// Discover tiles by scanning source files.
+    ///
+    /// This parses the project's source files to find `#[tile]` annotations.
+    /// This works even when the CLI is a separate binary from the user's project.
+    pub fn discover_tiles_from_source(&self) -> Result<Vec<DiscoveredTile>> {
+        let project_path = self
+            .project_path
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+
+        let discovery = TileDiscovery::new(&project_path);
+        discovery.discover()
+    }
+
+    /// Build all tiles discovered from source files.
+    ///
+    /// This is the preferred method for CLI usage since it doesn't require
+    /// the tiles to be linked into the CLI binary.
+    pub fn build_from_source(&self) -> Result<BuildOutput> {
+        let tiles = self.discover_tiles_from_source()?;
+
+        if tiles.is_empty() {
+            return Ok(BuildOutput {
+                tiles_compiled: 0,
+                schemas_generated: 0,
+                artifacts: HashMap::new(),
+                backend: self.backend.name().to_string(),
+            });
+        }
+
+        let mut artifacts = HashMap::new();
+        let mut compiled = 0;
+
+        for tile in tiles {
+            let tile_id = &tile.metadata.id.0;
+
+            match self.backend.compile_tile(&tile.metadata, &tile.source_file) {
+                Ok(output) => {
+                    // Write artifacts
+                    let artifact = self.write_tile_artifacts(tile_id, &output)?;
+                    artifacts.insert(tile_id.clone(), artifact);
+                    compiled += 1;
+                }
+                Err(e) => {
+                    eprintln!("Warning: Failed to compile tile '{}': {}", tile_id, e);
+                }
+            }
+        }
+
+        Ok(BuildOutput {
+            tiles_compiled: compiled,
+            schemas_generated: 0,
+            artifacts,
+            backend: self.backend.name().to_string(),
+        })
+    }
+
+    /// Build all tiles from the in-process registry.
+    ///
+    /// Note: This only works when tiles are linked into the same binary.
+    /// For CLI usage, prefer `build_from_source()`.
     pub fn build_from_registry(&self) -> Result<BuildOutput> {
         let tiles: Vec<_> = self.discover_tiles();
 
@@ -136,8 +199,16 @@ impl Builder {
         })
     }
 
-    /// Build a single tile by ID.
+    /// Build a single tile by ID using source-based discovery.
     pub fn build_tile(&self, tile_id: &str) -> Result<TileArtifact> {
+        // First try source-based discovery
+        let tiles = self.discover_tiles_from_source()?;
+        if let Some(tile) = tiles.iter().find(|t| t.metadata.id.0 == tile_id) {
+            let output = self.backend.compile_tile(&tile.metadata, &tile.source_file)?;
+            return self.write_tile_artifacts(tile_id, &output);
+        }
+
+        // Fall back to registry (for in-process usage)
         let tile = iter_tiles()
             .find(|t| t.id_str() == tile_id)
             .ok_or_else(|| Error::InvalidTileId(tile_id.to_string()))?;

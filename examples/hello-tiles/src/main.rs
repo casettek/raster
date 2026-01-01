@@ -43,7 +43,7 @@ use raster::prelude::*;
 /// A simple tile that greets a user by name.
 ///
 /// This tile takes a String input and returns a greeting.
-#[tile(description = "Greets a user by name")]
+#[tile]
 fn greet(name: String) -> String {
     format!("Hello, {}!", name)
 }
@@ -51,7 +51,7 @@ fn greet(name: String) -> String {
 /// A tile that adds emphasis to a message.
 ///
 /// This tile takes a String and returns it with exclamation marks.
-#[tile(estimated_cycles = 100, description = "Adds exclamation marks for emphasis")]
+#[tile]
 fn exclaim(message: String) -> String {
     format!("{}!!!", message)
 }
@@ -59,7 +59,7 @@ fn exclaim(message: String) -> String {
 /// A tile that computes Fibonacci numbers.
 ///
 /// This demonstrates a more computationally intensive tile.
-#[tile(estimated_cycles = 10000, max_memory = 1024, description = "Computes nth Fibonacci number")]
+#[tile]
 fn fibonacci(n: u64) -> u64 {
     if n <= 1 {
         return n;
