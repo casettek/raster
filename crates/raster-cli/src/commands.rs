@@ -222,13 +222,13 @@ pub fn run(
     };
 
     // Execute with the specified mode
-    println!("Executing in zkVM...");
+    println!("Executing in Risc0...");
     let result = backend.execute_tile(&compilation, &input_bytes, mode)?;
 
     println!();
     println!("Execution complete!");
     if let Some(cycles) = result.cycles {
-        println!("  Cycles: {}", cycles);
+        println!("  Compute Cycles: {}", cycles);
     }
     // Show proof cycles in estimate mode to help users understand proving cost
     if let Some(proof_cycles) = result.proof_cycles {
@@ -449,21 +449,29 @@ pub fn preview(sequence_id: &str, input: Option<&str>, use_gpu: bool) -> Result<
 
     // Execute each tile in sequence
     for (idx, tile_id) in sequence.tiles.iter().enumerate() {
+        // Check if compilation is needed before building
+        let needs_compile = !builder.is_tile_cached(tile_id);
+
+        if needs_compile {
+            println!(
+                "[{}/{}] Compiling tile '{}'...",
+                idx + 1,
+                sequence.tiles.len(),
+                tile_id
+            );
+        }
+
+        // Build tile (uses cache if available)
+        let (artifact, _was_cached) = builder
+            .build_tile_with_cache_info(tile_id)
+            .with_context(|| format!("Failed to build tile '{}'", tile_id))?;
+
         println!(
             "[{}/{}] Executing tile '{}'...",
             idx + 1,
             sequence.tiles.len(),
             tile_id
         );
-
-        // Build tile (uses cache if available)
-        let (artifact, was_cached) = builder
-            .build_tile_with_cache_info(tile_id)
-            .with_context(|| format!("Failed to build tile '{}'", tile_id))?;
-
-        if was_cached {
-            println!("      (using cached build)");
-        }
 
         // Load compilation output
         let elf = if let Some(ref elf_path) = artifact.elf_path {
@@ -502,7 +510,7 @@ pub fn preview(sequence_id: &str, input: Option<&str>, use_gpu: bool) -> Result<
     println!("╔══════════════════════════════════════════════════════════════╗");
     println!("║                     Cycle Count Summary                      ║");
     println!("╠════════════════════╦══════════════════╦══════════════════════╣");
-    println!("║ Tile               ║ Cycles           ║ Proof Cycles         ║");
+    println!("║ Tile               ║ Compute Cycles   ║ Proof Cycles         ║");
     println!("╠════════════════════╬══════════════════╬══════════════════════╣");
 
     let mut total_cycles = 0u64;
