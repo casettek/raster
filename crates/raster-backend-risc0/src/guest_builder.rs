@@ -183,21 +183,21 @@ impl GuestBuilder {
 
         format!(
             r##"[package]
-name = "raster-guest-{tile_id}"
-version = "0.1.0"
-edition = "2021"
+            name = "raster-guest-{tile_id}"
+            version = "0.1.0"
+            edition = "2021"
 
-[dependencies]
-risc0-zkvm = {{ version = "1.2", default-features = false }}
-raster = {{ path = "{raster_path}", default-features = false }}
-{user_crate_dep}
+            [dependencies]
+            risc0-zkvm = {{ version = "1.2", default-features = false }}
+            raster = {{ path = "{raster_path}", default-features = false }}
+            {user_crate_dep}
 
-[profile.release]
-opt-level = 3
-lto = true
+            [profile.release]
+            opt-level = 3
+            lto = true
 
-[workspace]
-"##,
+            [workspace]
+            "##,
             tile_id = tile_id,
             user_crate_dep = user_crate_dep,
             raster_path = raster_path
