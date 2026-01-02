@@ -75,6 +75,21 @@ enum Commands {
         /// Project name
         name: String,
     },
+
+    /// Preview a sequence with cycle count breakdown
+    Preview {
+        /// Sequence name to execute (default: "main")
+        #[arg(long, default_value = "main")]
+        sequence: String,
+
+        /// Input data as JSON string
+        #[arg(long)]
+        input: Option<String>,
+
+        /// Use GPU acceleration for execution (Metal on macOS, CUDA on Linux/Windows)
+        #[arg(long)]
+        gpu: bool,
+    },
 }
 
 /// Available backends for compilation and execution.
@@ -103,5 +118,8 @@ fn main() -> Result<()> {
         Commands::List => commands::list_tiles(),
         Commands::Analyze { trace_path } => commands::analyze(trace_path),
         Commands::Init { name } => commands::init(name),
+        Commands::Preview { sequence, input, gpu } => {
+            commands::preview(&sequence, input.as_deref(), gpu)
+        }
     }
 }

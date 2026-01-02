@@ -18,7 +18,7 @@ use raster::prelude::*;
 /// This tile takes a String input and returns a greeting.
 #[tile]
 pub fn greet(name: String) -> String {
-    format!("Hello, {}!!!", name)
+    format!("Hello, {}!", name)
 }
 
 /// A tile that adds emphasis to a message.
@@ -26,7 +26,7 @@ pub fn greet(name: String) -> String {
 /// This tile takes a String and returns it with exclamation marks.
 #[tile]
 pub fn exclaim(message: String) -> String {
-    format!("{}!!!", message)
+    format!("{}!", message)
 }
 
 /// A tile that computes Fibonacci numbers.
@@ -46,6 +46,3 @@ pub fn fibonacci(n: u64) -> u64 {
     }
     b
 }
-
-
-// touch
