@@ -6,7 +6,7 @@
 
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
-use syn::{parse_macro_input, FnArg, ItemFn, Pat, ReturnType, Type};
+use syn::{parse_macro_input, visit::Visit, Expr, ExprCall, ExprPath, FnArg, ItemFn, Pat, ReturnType, Type};
 
 /// Parses optional tile attributes from the macro invocation.
 struct TileAttrs {
@@ -231,20 +231,156 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
     TokenStream::from(expanded)
 }
 
-/// Declares a sequence of tiles with control flow.
+/// Parses optional sequence attributes from the macro invocation.
+struct SequenceAttrs {
+    description: Option<String>,
+}
+
+impl SequenceAttrs {
+    fn parse(attr: TokenStream) -> Self {
+        let mut attrs = SequenceAttrs {
+            description: None,
+        };
+
+        if attr.is_empty() {
+            return attrs;
+        }
+
+        // Parse comma-separated key=value pairs
+        let attr_str = attr.to_string();
+        for part in attr_str.split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+
+            if let Some((key, value)) = part.split_once('=') {
+                let key = key.trim();
+                let value = value.trim().trim_matches('"');
+                if key == "description" {
+                    attrs.description = Some(value.to_string());
+                }
+            }
+        }
+
+        attrs
+    }
+}
+
+/// Visitor that extracts function call names from the AST.
+/// It collects function names in the order they appear.
+struct TileCallExtractor {
+    tile_calls: Vec<String>,
+}
+
+impl TileCallExtractor {
+    fn new() -> Self {
+        Self { tile_calls: Vec::new() }
+    }
+}
+
+impl<'ast> Visit<'ast> for TileCallExtractor {
+    fn visit_expr_call(&mut self, node: &'ast ExprCall) {
+        // Check if this is a simple function call (not a method call)
+        if let Expr::Path(ExprPath { path, .. }) = &*node.func {
+            // Get the function name (last segment of the path)
+            if let Some(segment) = path.segments.last() {
+                let fn_name = segment.ident.to_string();
+                // Skip common non-tile functions
+                if !is_excluded_function(&fn_name) {
+                    self.tile_calls.push(fn_name);
+                }
+            }
+        }
+        // Continue visiting nested expressions
+        syn::visit::visit_expr_call(self, node);
+    }
+}
+
+/// Check if a function name should be excluded from tile extraction.
+/// These are common Rust functions that are not tiles.
+fn is_excluded_function(name: &str) -> bool {
+    matches!(
+        name,
+        // Common Rust functions that aren't tiles
+        "println" | "print" | "eprintln" | "eprint" | "dbg" |
+        "format" | "panic" | "assert" | "assert_eq" | "assert_ne" |
+        "Some" | "None" | "Ok" | "Err" |
+        "Box" | "Vec" | "String" | "to_string" | "to_owned" |
+        "clone" | "into" | "from" | "default" |
+        // Allocator functions
+        "alloc" | "dealloc"
+    )
+}
+
+/// Declares a sequence of tiles with linear control flow.
+///
+/// The `#[sequence]` macro parses the function body to extract tile calls
+/// in the order they appear. The function remains callable for native execution,
+/// and the sequence is registered for use with `cargo raster preview`.
+///
+/// # Attributes
+/// - `description = "..."` - Human-readable description of the sequence
 ///
 /// # Example
 /// ```ignore
 /// #[sequence]
-/// fn my_sequence() {
-///     tile_a();
-///     tile_b();
+/// fn main(name: String) -> String {
+///     let greeting = greet(name);
+///     exclaim(greeting)
 /// }
 /// ```
+///
+/// This will register a sequence named "main" with tiles `["greet", "exclaim"]`.
 #[proc_macro_attribute]
-pub fn sequence(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    // TODO: Implement sequence macro
-    // - Parse control flow
-    // - Generate schema
-    item
+pub fn sequence(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let attrs = SequenceAttrs::parse(attr);
+    let input_fn = parse_macro_input!(item as ItemFn);
+
+    let fn_name = &input_fn.sig.ident;
+    let fn_name_str = fn_name.to_string();
+    let registration_name = format_ident!("__RASTER_SEQUENCE_REGISTRATION_{}", fn_name.to_string().to_uppercase());
+
+    // Extract tile calls from the function body
+    let mut extractor = TileCallExtractor::new();
+    extractor.visit_item_fn(&input_fn);
+    let tile_calls = extractor.tile_calls;
+
+    // Generate the tile list as a static array
+    let tile_count = tile_calls.len();
+    let tile_strs: Vec<_> = tile_calls.iter().map(|s| s.as_str()).collect();
+
+    // Generate description expression
+    let description_expr = match &attrs.description {
+        Some(desc) => {
+            let desc_str = desc.as_str();
+            quote! { ::core::option::Option::Some(#desc_str) }
+        }
+        None => quote! { ::core::option::Option::None },
+    };
+
+    let expanded = quote! {
+        // Keep the original function unchanged for native execution
+        #input_fn
+
+        // Static array of tile IDs for this sequence
+        #[cfg(all(feature = "std", not(target_arch = "riscv32")))]
+        static __RASTER_SEQUENCE_TILES: [&'static str; #tile_count] = [#(#tile_strs),*];
+
+        // Register the sequence in the distributed slice (only on platforms that support linkme and std)
+        #[cfg(all(feature = "std", not(target_arch = "riscv32")))]
+        #[::raster::core::linkme::distributed_slice(::raster::core::registry::SEQUENCE_REGISTRY)]
+        #[linkme(crate = ::raster::core::linkme)]
+        static #registration_name: ::raster::core::registry::SequenceRegistration =
+            ::raster::core::registry::SequenceRegistration::new(
+                ::raster::core::registry::SequenceMetadataStatic::new(
+                    #fn_name_str,
+                    #fn_name_str,
+                    #description_expr,
+                ),
+                &__RASTER_SEQUENCE_TILES,
+            );
+    };
+
+    TokenStream::from(expanded)
 }

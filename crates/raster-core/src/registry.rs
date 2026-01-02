@@ -115,3 +115,90 @@ pub fn all_tile_metadata() -> Vec<TileMetadata> {
         .map(|reg| reg.metadata.to_owned())
         .collect()
 }
+
+// ============================================================================
+// Sequence Registry
+// ============================================================================
+
+/// Static metadata for a sequence, using static strings for const construction.
+#[derive(Debug, Clone, Copy)]
+pub struct SequenceMetadataStatic {
+    /// Unique identifier for this sequence (e.g., "main").
+    pub id: &'static str,
+    /// Human-readable name.
+    pub name: &'static str,
+    /// Optional description.
+    pub description: Option<&'static str>,
+}
+
+impl SequenceMetadataStatic {
+    /// Create new static sequence metadata.
+    pub const fn new(id: &'static str, name: &'static str, description: Option<&'static str>) -> Self {
+        Self { id, name, description }
+    }
+}
+
+/// A registration entry for a sequence in the global registry.
+///
+/// Each `#[sequence]`-annotated function generates a `SequenceRegistration`
+/// that is automatically added to the `SEQUENCE_REGISTRY` distributed slice.
+#[derive(Clone, Copy)]
+pub struct SequenceRegistration {
+    /// Static metadata describing the sequence.
+    pub metadata: SequenceMetadataStatic,
+    /// Ordered list of tile IDs that make up this sequence.
+    /// These are the tile function names in execution order.
+    pub tiles: &'static [&'static str],
+}
+
+impl SequenceRegistration {
+    /// Create a new sequence registration with const construction.
+    pub const fn new(metadata: SequenceMetadataStatic, tiles: &'static [&'static str]) -> Self {
+        Self { metadata, tiles }
+    }
+
+    /// Get the sequence ID.
+    pub const fn id(&self) -> &'static str {
+        self.metadata.id
+    }
+
+    /// Get the ordered list of tile IDs.
+    pub const fn tile_ids(&self) -> &'static [&'static str] {
+        self.tiles
+    }
+
+    /// Get the number of tiles in this sequence.
+    pub const fn tile_count(&self) -> usize {
+        self.tiles.len()
+    }
+}
+
+impl std::fmt::Debug for SequenceRegistration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SequenceRegistration")
+            .field("metadata", &self.metadata)
+            .field("tiles", &self.tiles)
+            .finish()
+    }
+}
+
+/// The global distributed slice containing all sequence registrations.
+///
+/// This slice is populated at link time by the `#[sequence]` macro.
+#[distributed_slice]
+pub static SEQUENCE_REGISTRY: [SequenceRegistration];
+
+/// Iterate over all registered sequences.
+pub fn iter_sequences() -> impl Iterator<Item = &'static SequenceRegistration> {
+    SEQUENCE_REGISTRY.iter()
+}
+
+/// Find a sequence by its ID.
+pub fn find_sequence(id: &str) -> Option<&'static SequenceRegistration> {
+    SEQUENCE_REGISTRY.iter().find(|reg| reg.metadata.id == id)
+}
+
+/// Get the count of registered sequences.
+pub fn sequence_count() -> usize {
+    SEQUENCE_REGISTRY.len()
+}

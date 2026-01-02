@@ -36,7 +36,10 @@ pub mod prelude {
     
     // Registry is only available with std and on platforms that support linkme
     #[cfg(all(feature = "std", not(target_arch = "riscv32")))]
-    pub use crate::core::registry::{TileRegistration, iter_tiles, find_tile, find_tile_by_str, tile_count};
+    pub use crate::core::registry::{
+        TileRegistration, iter_tiles, find_tile, find_tile_by_str, tile_count,
+        SequenceRegistration, SequenceMetadataStatic, iter_sequences, find_sequence, sequence_count,
+    };
     
     pub use crate::{tile, sequence};
     

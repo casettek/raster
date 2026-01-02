@@ -4,7 +4,7 @@ use crate::BackendType;
 use anyhow::{anyhow, Context, Result};
 use raster_backend::{Backend, CompilationOutput, ExecutionMode, NativeBackend};
 use raster_backend_risc0::{is_gpu_available, Risc0Backend};
-use raster_compiler::{Builder, TileDiscovery};
+use raster_compiler::{Builder, SequenceDiscovery, TileDiscovery};
 use std::env;
 use std::fs;
 use std::path::PathBuf;
@@ -374,4 +374,194 @@ fn backend_type_name(backend_type: BackendType) -> &'static str {
         BackendType::Native => "native",
         BackendType::Risc0 => "risc0",
     }
+}
+
+/// Preview command: execute a sequence with cycle count breakdown.
+pub fn preview(sequence_id: &str, input: Option<&str>, use_gpu: bool) -> Result<()> {
+    println!("Running sequence '{}' in preview mode...", sequence_id);
+    println!();
+
+    // Discover sequences from source
+    let discovery = SequenceDiscovery::new(project_path());
+    let sequences = discovery
+        .discover()
+        .map_err(|e| anyhow!("Failed to discover sequences: {}", e))?;
+
+    let sequence = sequences
+        .iter()
+        .find(|s| s.id == sequence_id)
+        .ok_or_else(|| {
+            let available: Vec<_> = sequences.iter().map(|s| s.id.as_str()).collect();
+            if available.is_empty() {
+                anyhow!(
+                    "Sequence '{}' not found. No sequences defined.\n\
+                     Hint: Add #[sequence] attribute to a function.",
+                    sequence_id
+                )
+            } else {
+                anyhow!(
+                    "Sequence '{}' not found. Available sequences: {}",
+                    sequence_id,
+                    available.join(", ")
+                )
+            }
+        })?;
+
+    if sequence.tiles.is_empty() {
+        println!("Sequence '{}' has no tiles.", sequence_id);
+        return Ok(());
+    }
+
+    println!("Sequence: {} ({} tiles)", sequence.id, sequence.tiles.len());
+    println!("Tiles: {}", sequence.tiles.join(" → "));
+    println!();
+
+    // Create RISC0 backend for execution
+    let backend = Risc0Backend::new(output_dir())
+        .with_user_crate(project_path())
+        .with_gpu(use_gpu);
+
+    // Create builder for compilation
+    let builder = Builder::new(output_dir())
+        .with_backend(Box::new(
+            Risc0Backend::new(output_dir())
+                .with_user_crate(project_path())
+                .with_gpu(use_gpu),
+        ))
+        .with_project_path(project_path());
+
+    // Prepare initial input
+    let mut current_input = if let Some(input_json) = input {
+        let value: serde_json::Value =
+            serde_json::from_str(input_json).context("Failed to parse input JSON")?;
+        postcard::to_allocvec(&value).context("Failed to serialize input")?
+    } else {
+        postcard::to_allocvec(&()).context("Failed to serialize empty input")?
+    };
+
+    // Track cycle counts for each tile
+    struct TileResult {
+        name: String,
+        cycles: u64,
+        proof_cycles: u64,
+    }
+    let mut results: Vec<TileResult> = Vec::new();
+
+    // Execute each tile in sequence
+    for (idx, tile_id) in sequence.tiles.iter().enumerate() {
+        println!(
+            "[{}/{}] Executing tile '{}'...",
+            idx + 1,
+            sequence.tiles.len(),
+            tile_id
+        );
+
+        // Build tile (uses cache if available)
+        let (artifact, was_cached) = builder
+            .build_tile_with_cache_info(tile_id)
+            .with_context(|| format!("Failed to build tile '{}'", tile_id))?;
+
+        if was_cached {
+            println!("      (using cached build)");
+        }
+
+        // Load compilation output
+        let elf = if let Some(ref elf_path) = artifact.elf_path {
+            fs::read(elf_path).unwrap_or_default()
+        } else {
+            return Err(anyhow!("No ELF found for tile '{}'", tile_id));
+        };
+        let method_id = hex::decode(&artifact.method_id).unwrap_or_default();
+
+        let compilation = CompilationOutput {
+            elf,
+            method_id,
+            artifact_dir: Some(artifact.artifact_dir),
+        };
+
+        // Execute in estimate mode
+        let result = backend
+            .execute_tile(&compilation, &current_input, ExecutionMode::Estimate)
+            .with_context(|| format!("Failed to execute tile '{}'", tile_id))?;
+
+        let cycles = result.cycles.unwrap_or(0);
+        let proof_cycles = result.proof_cycles.unwrap_or(0);
+
+        results.push(TileResult {
+            name: tile_id.clone(),
+            cycles,
+            proof_cycles,
+        });
+
+        // Output becomes input for next tile
+        current_input = result.output;
+    }
+
+    // Print summary table
+    println!();
+    println!("╔══════════════════════════════════════════════════════════════╗");
+    println!("║                     Cycle Count Summary                      ║");
+    println!("╠════════════════════╦══════════════════╦══════════════════════╣");
+    println!("║ Tile               ║ Cycles           ║ Proof Cycles         ║");
+    println!("╠════════════════════╬══════════════════╬══════════════════════╣");
+
+    let mut total_cycles = 0u64;
+    let mut total_proof_cycles = 0u64;
+
+    for result in &results {
+        println!(
+            "║ {:<18} ║ {:>16} ║ {:>20} ║",
+            truncate_str(&result.name, 18),
+            format_number(result.cycles),
+            format_number(result.proof_cycles)
+        );
+        total_cycles += result.cycles;
+        total_proof_cycles += result.proof_cycles;
+    }
+
+    println!("╠════════════════════╬══════════════════╬══════════════════════╣");
+    println!(
+        "║ {:<18} ║ {:>16} ║ {:>20} ║",
+        "TOTAL",
+        format_number(total_cycles),
+        format_number(total_proof_cycles)
+    );
+    println!("╚════════════════════╩══════════════════╩══════════════════════╝");
+
+    // Try to deserialize and display final output
+    println!();
+    if let Ok(output_str) = postcard::from_bytes::<String>(&current_input) {
+        println!("Output: \"{}\"", output_str);
+    } else if let Ok(output_num) = postcard::from_bytes::<u64>(&current_input) {
+        println!("Output: {}", output_num);
+    } else {
+        println!("Output: {} bytes", current_input.len());
+    }
+
+    Ok(())
+}
+
+/// Truncate a string to a maximum length.
+fn truncate_str(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        s.to_string()
+    } else {
+        format!("{}...", &s[..max_len - 3])
+    }
+}
+
+/// Format a number with thousand separators.
+fn format_number(n: u64) -> String {
+    let s = n.to_string();
+    let mut result = String::new();
+    let chars: Vec<char> = s.chars().collect();
+    
+    for (i, c) in chars.iter().enumerate() {
+        if i > 0 && (chars.len() - i) % 3 == 0 {
+            result.push(',');
+        }
+        result.push(*c);
+    }
+    
+    result
 }

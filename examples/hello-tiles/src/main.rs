@@ -27,16 +27,35 @@
 //! cargo raster run --backend risc0 --tile greet --input '"World"' --prove --verify
 //! ```
 //!
+//! Preview sequence with cycle counts:
+//! ```sh
+//! cargo raster preview --input '"Raster"'
+//! ```
+//!
 //! List all registered tiles:
 //! ```sh
 //! cargo raster list
 //! ```
 
-// Re-export tiles from the library
-use hello_tiles::{greet, exclaim};
+use hello_tiles::{exclaim, greet};
+use raster::prelude::*;
 
+/// The main sequence that greets and adds emphasis.
+///
+/// This sequence:
+/// 1. Takes a name as input
+/// 2. Generates a greeting with `greet`
+/// 3. Adds emphasis with `exclaim`
+///
+/// Run with: `cargo raster preview --input '"Raster"'`
+#[sequence(description = "Greet and exclaim sequence")]
+fn greet_sequence(name: String) -> String {
+    let greeting = greet(name);
+    exclaim(greeting)
+}
+
+/// Entry point that runs the greet sequence natively.
 fn main() {
-    let greeting = greet("Raster".to_string());
-    let excited = exclaim(greeting);
-    println!("{}", excited);
+    let result = greet_sequence("Raster".to_string());
+    println!("{}", result);
 }

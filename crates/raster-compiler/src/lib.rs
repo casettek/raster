@@ -11,5 +11,5 @@ pub mod discovery;
 pub mod schema_gen;
 
 pub use builder::{Builder, BuildOutput, TileArtifact, TileManifest};
-pub use discovery::{DiscoveredTile, TileDiscovery};
+pub use discovery::{DiscoveredSequence, DiscoveredTile, SequenceDiscovery, TileDiscovery};
 pub use schema_gen::SchemaGenerator;
