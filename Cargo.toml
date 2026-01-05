@@ -11,7 +11,6 @@ members = [
     "crates/raster-analysis",
     "crates/raster-cli",
     "examples/hello-tiles",
-    "examples/fibonacci-sequence",
 ]
 
 [workspace.package]

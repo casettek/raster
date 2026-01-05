@@ -303,6 +303,19 @@ impl Builder {
         })
     }
 
+    /// Check if a tile is cached and doesn't need recompilation.
+    /// Returns true if cached, false if compilation is needed.
+    pub fn is_tile_cached(&self, tile_id: &str) -> bool {
+        // First try source-based discovery
+        if let Ok(tiles) = self.discover_tiles_from_source() {
+            if let Some(tile) = tiles.iter().find(|t| t.metadata.id.0 == tile_id) {
+                return !self.needs_compilation(tile_id, &tile.source_file)
+                    && self.load_cached_compilation(tile_id).is_some();
+            }
+        }
+        false
+    }
+
     /// Build a single tile by ID using source-based discovery.
     /// Uses cached artifacts if source hasn't changed.
     /// Returns (artifact, was_cached).

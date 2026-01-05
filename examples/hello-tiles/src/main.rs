@@ -12,7 +12,9 @@ use raster::prelude::*;
 #[sequence]
 fn greet_sequence(name: String) -> String {
     let greeting = greet(name);
-    exclaim(greeting)
+    let e1 = exclaim(greeting);
+    let e2 = exclaim(e1);
+    exclaim(e2)
 }
 
 /// Entry point that runs the greet sequence natively.
