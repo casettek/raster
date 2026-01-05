@@ -90,6 +90,13 @@ enum Commands {
         #[arg(long)]
         gpu: bool,
     },
+
+    /// Generate control flow schema (CFS)
+    Cfs {
+        /// Output file path (default: target/raster/cfs.json)
+        #[arg(long, short)]
+        output: Option<String>,
+    },
 }
 
 /// Available backends for compilation and execution.
@@ -121,5 +128,6 @@ fn main() -> Result<()> {
         Commands::Preview { sequence, input, gpu } => {
             commands::preview(&sequence, input.as_deref(), gpu)
         }
+        Commands::Cfs { output } => commands::cfs(output),
     }
 }

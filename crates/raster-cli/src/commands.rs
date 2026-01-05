@@ -4,7 +4,7 @@ use crate::BackendType;
 use anyhow::{anyhow, Context, Result};
 use raster_backend::{Backend, CompilationOutput, ExecutionMode, NativeBackend};
 use raster_backend_risc0::{is_gpu_available, Risc0Backend};
-use raster_compiler::{Builder, SequenceDiscovery, TileDiscovery};
+use raster_compiler::{Builder, CfsBuilder, SequenceDiscovery, TileDiscovery, extract_project_name};
 use std::env;
 use std::fs;
 use std::path::PathBuf;
@@ -407,13 +407,16 @@ pub fn preview(sequence_id: &str, input: Option<&str>, use_gpu: bool) -> Result<
             }
         })?;
 
-    if sequence.tiles.is_empty() {
+    // Extract tile IDs from calls
+    let tile_ids: Vec<String> = sequence.calls.iter().map(|c| c.callee.clone()).collect();
+    
+    if tile_ids.is_empty() {
         println!("Sequence '{}' has no tiles.", sequence_id);
         return Ok(());
     }
 
-    println!("Sequence: {} ({} tiles)", sequence.id, sequence.tiles.len());
-    println!("Tiles: {}", sequence.tiles.join(" → "));
+    println!("Sequence: {} ({} tiles)", sequence.id, tile_ids.len());
+    println!("Tiles: {}", tile_ids.join(" → "));
     println!();
 
     // Create RISC0 backend for execution
@@ -448,7 +451,7 @@ pub fn preview(sequence_id: &str, input: Option<&str>, use_gpu: bool) -> Result<
     let mut results: Vec<TileResult> = Vec::new();
 
     // Execute each tile in sequence
-    for (idx, tile_id) in sequence.tiles.iter().enumerate() {
+    for (idx, tile_id) in tile_ids.iter().enumerate() {
         // Check if compilation is needed before building
         let needs_compile = !builder.is_tile_cached(tile_id);
 
@@ -456,7 +459,7 @@ pub fn preview(sequence_id: &str, input: Option<&str>, use_gpu: bool) -> Result<
             println!(
                 "[{}/{}] Compiling tile '{}'...",
                 idx + 1,
-                sequence.tiles.len(),
+                tile_ids.len(),
                 tile_id
             );
         }
@@ -469,7 +472,7 @@ pub fn preview(sequence_id: &str, input: Option<&str>, use_gpu: bool) -> Result<
         println!(
             "[{}/{}] Executing tile '{}'...",
             idx + 1,
-            sequence.tiles.len(),
+            tile_ids.len(),
             tile_id
         );
 
@@ -572,4 +575,62 @@ fn format_number(n: u64) -> String {
     }
     
     result
+}
+
+/// CFS command: generate control flow schema.
+pub fn cfs(output: Option<String>) -> Result<()> {
+    println!("Generating control flow schema...");
+    println!();
+
+    let root = project_path();
+    
+    // Extract project name from Cargo.toml
+    let project_name = extract_project_name(&root)
+        .map_err(|e| anyhow!("Failed to extract project name: {}", e))?;
+
+    // Build the CFS
+    let builder = CfsBuilder::new(&project_name);
+    let cfs = builder
+        .build(&root)
+        .map_err(|e| anyhow!("Failed to build CFS: {}", e))?;
+
+    // Serialize to JSON
+    let json = serde_json::to_string_pretty(&cfs)
+        .context("Failed to serialize CFS to JSON")?;
+
+    // Determine output path
+    let output_path = match output {
+        Some(path) => PathBuf::from(path),
+        None => output_dir().join("cfs.json"),
+    };
+
+    // Create parent directories if needed
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    // Write the file
+    fs::write(&output_path, &json)?;
+
+    println!("Generated CFS with {} tiles and {} sequences", 
+        cfs.tiles.len(), 
+        cfs.sequences.len()
+    );
+    println!();
+    println!("Tiles:");
+    for tile in &cfs.tiles {
+        println!("  - {} (inputs: {}, outputs: {})", tile.id, tile.inputs, tile.outputs);
+    }
+    println!();
+    println!("Sequences:");
+    for seq in &cfs.sequences {
+        println!("  - {} ({} items)", seq.id, seq.items.len());
+        for (idx, item) in seq.items.iter().enumerate() {
+            println!("      [{}] {} '{}'", idx, item.item_type, item.item_id);
+        }
+    }
+    println!();
+    println!("CFS written to: {}", output_path.display());
+
+    Ok(())
 }
