@@ -16,23 +16,23 @@ use raster::prelude::*;
 /// A simple tile that greets a user by name.
 ///
 /// This tile takes a String input and returns a greeting.
-#[tile]
+#[tile(iter)]
 pub fn greet(name: String) -> String {
-    format!("Hello, {}!!", name)
+    format!("Hello, {}!!!!", name)
 }
 
 /// A tile that adds emphasis to a message.
 ///
 /// This tile takes a String and returns it with exclamation marks.
-#[tile]
+#[tile(iter)]
 pub fn exclaim(message: String) -> String {
-    format!("{}!!", message)
+    format!("{}!!!!", message)
 }
 
 /// A tile that computes Fibonacci numbers.
 ///
 /// This demonstrates a more computationally intensive tile.
-#[tile]
+#[tile(iter)]
 pub fn fibonacci(n: u64) -> u64 {
     if n <= 1 {
         return n;

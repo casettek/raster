@@ -134,6 +134,7 @@ mod tests {
             line_number: 1,
             input_count: inputs,
             output_count: outputs,
+            tile_type: "iter".to_string(),
         }
     }
 
