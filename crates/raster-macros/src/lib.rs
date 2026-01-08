@@ -231,6 +231,26 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
         None => quote! { ::core::option::Option::None },
     };
 
+    // For recursive tiles, also generate a macro with the same name that allows `tile_name!(args)` syntax
+    let recursive_macro = if attrs.tile_type == "recur" {
+        let macro_name = format_ident!("{}", fn_name);
+        quote! {
+            /// Macro wrapper for recursive tile invocation.
+            /// Use `tile_name!(args)` to invoke this recursive tile.
+            /// For native execution, this simply calls the underlying function.
+            /// The `!` syntax signals to the CFS compiler that this tile should
+            /// be executed recursively until its first output returns true.
+            #[macro_export]
+            macro_rules! #macro_name {
+                ($($args:expr),* $(,)?) => {
+                    #fn_name($($args),*)
+                };
+            }
+        }
+    } else {
+        quote! {}
+    };
+
     let expanded = quote! {
         // Keep the original function unchanged
         #input_fn
@@ -258,6 +278,9 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
                 ),
                 #wrapper_name,
             );
+
+        // For recursive tiles, generate a macro wrapper for the `!` syntax
+        #recursive_macro
     };
 
     TokenStream::from(expanded)

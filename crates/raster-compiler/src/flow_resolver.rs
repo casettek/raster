@@ -168,11 +168,13 @@ mod tests {
                     callee: "greet".to_string(),
                     result_binding: Some("greeting".to_string()),
                     arguments: vec!["name".to_string()],
+                    is_recursive: false,
                 },
                 SequenceCall {
                     callee: "exclaim".to_string(),
                     result_binding: None,
                     arguments: vec!["greeting".to_string()],
+                    is_recursive: false,
                 },
             ],
         );

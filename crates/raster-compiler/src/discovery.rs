@@ -369,6 +369,8 @@ pub struct SequenceCall {
     pub result_binding: Option<String>,
     /// Arguments passed to the function (variable names or expressions).
     pub arguments: Vec<String>,
+    /// Whether this call uses recursive execution (indicated by `!` suffix).
+    pub is_recursive: bool,
 }
 
 /// Discovers sequences by scanning source files.
@@ -604,6 +606,13 @@ impl SequenceDiscovery {
             return None;
         }
         
+        // Check for ! suffix indicating recursive execution (e.g., count_to!(0, 5))
+        let (callee, is_recursive) = if callee.ends_with('!') {
+            (&callee[..callee.len() - 1], true)
+        } else {
+            (callee, false)
+        };
+        
         // Extract arguments from between ( and )
         let args_start = paren_pos + 1;
         let mut depth = 1;
@@ -630,6 +639,7 @@ impl SequenceDiscovery {
             callee: callee.to_string(),
             result_binding,
             arguments,
+            is_recursive,
         })
     }
 
@@ -920,10 +930,12 @@ mod tests {
         assert_eq!(call.callee, "greet");
         assert_eq!(call.result_binding, Some("greeting".to_string()));
         assert_eq!(call.arguments, vec!["name".to_string()]);
+        assert!(!call.is_recursive);
         
         let call = discovery.parse_let_statement("let result = add(a, b);").unwrap();
         assert_eq!(call.callee, "add");
         assert_eq!(call.arguments, vec!["a".to_string(), "b".to_string()]);
+        assert!(!call.is_recursive);
     }
 
     #[test]
@@ -934,6 +946,26 @@ mod tests {
         assert_eq!(call.callee, "exclaim");
         assert_eq!(call.result_binding, None);
         assert_eq!(call.arguments, vec!["greeting".to_string()]);
+        assert!(!call.is_recursive);
+    }
+
+    #[test]
+    fn test_parse_recursive_call() {
+        let discovery = SequenceDiscovery::new(".");
+        
+        // Test recursive let statement with ! suffix
+        let call = discovery.parse_let_statement("let result = count_to!(0, 5);").unwrap();
+        assert_eq!(call.callee, "count_to");
+        assert_eq!(call.result_binding, Some("result".to_string()));
+        assert_eq!(call.arguments, vec!["0".to_string(), "5".to_string()]);
+        assert!(call.is_recursive);
+        
+        // Test recursive expression call with ! suffix
+        let call = discovery.parse_expression_call("count_to!(current, goal)").unwrap();
+        assert_eq!(call.callee, "count_to");
+        assert_eq!(call.result_binding, None);
+        assert_eq!(call.arguments, vec!["current".to_string(), "goal".to_string()]);
+        assert!(call.is_recursive);
     }
 }
 
