@@ -134,6 +134,7 @@ mod tests {
             line_number: 1,
             input_count: inputs,
             output_count: outputs,
+            tile_type: "iter".to_string(),
         }
     }
 
@@ -167,11 +168,13 @@ mod tests {
                     callee: "greet".to_string(),
                     result_binding: Some("greeting".to_string()),
                     arguments: vec!["name".to_string()],
+                    is_recursive: false,
                 },
                 SequenceCall {
                     callee: "exclaim".to_string(),
                     result_binding: None,
                     arguments: vec!["greeting".to_string()],
+                    is_recursive: false,
                 },
             ],
         );

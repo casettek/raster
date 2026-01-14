@@ -23,6 +23,8 @@ pub struct DiscoveredTile {
     pub input_count: usize,
     /// Number of output values (1 for most functions, 0 for unit return).
     pub output_count: usize,
+    /// Tile type (e.g., "tile", "recur").
+    pub tile_type: String,
 }
 
 /// Discovers tiles by scanning source files.
@@ -107,6 +109,7 @@ impl TileDiscovery {
                     if fn_line.starts_with("fn ") || fn_line.starts_with("pub fn ") {
                         if let Some(fn_name) = self.extract_fn_name(fn_line) {
                             let (input_count, output_count) = self.extract_fn_arity(fn_line);
+                            let tile_type = attrs.tile_type.clone().unwrap_or_else(|| "iter".to_string());
                             tiles.push(DiscoveredTile {
                                 metadata: TileMetadata {
                                     id: TileId(fn_name.clone()),
@@ -119,6 +122,7 @@ impl TileDiscovery {
                                 line_number: fn_line_idx + 1, // 1-indexed
                                 input_count,
                                 output_count,
+                                tile_type,
                             });
                         }
                     }
@@ -133,6 +137,7 @@ impl TileDiscovery {
     }
 
     /// Parse tile attributes from the macro invocation.
+    /// The first argument is the tile type (required).
     fn parse_tile_attrs(&self, line: &str) -> TileAttrs {
         let mut attrs = TileAttrs::default();
 
@@ -140,10 +145,31 @@ impl TileDiscovery {
         if let Some(start) = line.find('(') {
             if let Some(end) = line.rfind(')') {
                 let content = &line[start + 1..end];
+                let mut first = true;
                 
                 for part in content.split(',') {
                     let part = part.trim();
+                    if part.is_empty() {
+                        continue;
+                    }
+                    
+                    if first {
+                        // First argument is the tile type
+                        first = false;
+                        match part {
+                            "iter" | "recur" => {
+                                attrs.tile_type = Some(part.to_string());
+                            }
+                            _ => {
+                                // Unknown type, default to "iter"
+                                attrs.tile_type = Some("iter".to_string());
+                            }
+                        }
+                        continue;
+                    }
+                    
                     if let Some((key, value)) = part.split_once('=') {
+                        // Key=value pair
                         let key = key.trim();
                         let value = value.trim().trim_matches('"');
                         
@@ -306,6 +332,7 @@ struct TileAttrs {
     description: Option<String>,
     estimated_cycles: Option<u64>,
     max_memory: Option<u64>,
+    tile_type: Option<String>,
 }
 
 // ============================================================================
@@ -342,6 +369,8 @@ pub struct SequenceCall {
     pub result_binding: Option<String>,
     /// Arguments passed to the function (variable names or expressions).
     pub arguments: Vec<String>,
+    /// Whether this call uses recursive execution (indicated by `!` suffix).
+    pub is_recursive: bool,
 }
 
 /// Discovers sequences by scanning source files.
@@ -577,6 +606,13 @@ impl SequenceDiscovery {
             return None;
         }
         
+        // Check for ! suffix indicating recursive execution (e.g., count_to!(0, 5))
+        let (callee, is_recursive) = if callee.ends_with('!') {
+            (&callee[..callee.len() - 1], true)
+        } else {
+            (callee, false)
+        };
+        
         // Extract arguments from between ( and )
         let args_start = paren_pos + 1;
         let mut depth = 1;
@@ -603,6 +639,7 @@ impl SequenceDiscovery {
             callee: callee.to_string(),
             result_binding,
             arguments,
+            is_recursive,
         })
     }
 
@@ -804,18 +841,45 @@ mod tests {
     fn test_parse_tile_attrs() {
         let discovery = TileDiscovery::new(".");
         
-        let attrs = discovery.parse_tile_attrs("#[tile]");
+        // Standard iter type
+        let attrs = discovery.parse_tile_attrs("#[tile(iter)]");
+        assert_eq!(attrs.tile_type, Some("iter".to_string()));
         assert!(attrs.description.is_none());
         assert!(attrs.estimated_cycles.is_none());
         
-        let attrs = discovery.parse_tile_attrs("#[tile(description = \"Test tile\")]");
+        // With additional attributes
+        let attrs = discovery.parse_tile_attrs("#[tile(iter, description = \"Test tile\")]");
+        assert_eq!(attrs.tile_type, Some("iter".to_string()));
         assert_eq!(attrs.description, Some("Test tile".to_string()));
         
         let attrs = discovery.parse_tile_attrs(
-            "#[tile(estimated_cycles = 1000, description = \"Complex\")]"
+            "#[tile(iter, estimated_cycles = 1000, description = \"Complex\")]"
         );
+        assert_eq!(attrs.tile_type, Some("iter".to_string()));
         assert_eq!(attrs.estimated_cycles, Some(1000));
         assert_eq!(attrs.description, Some("Complex".to_string()));
+    }
+
+    #[test]
+    fn test_parse_tile_type() {
+        let discovery = TileDiscovery::new(".");
+        
+        // Iter type
+        let attrs = discovery.parse_tile_attrs("#[tile(iter)]");
+        assert_eq!(attrs.tile_type, Some("iter".to_string()));
+        
+        // Recur type
+        let attrs = discovery.parse_tile_attrs("#[tile(recur)]");
+        assert_eq!(attrs.tile_type, Some("recur".to_string()));
+        
+        // Recur with other attrs
+        let attrs = discovery.parse_tile_attrs("#[tile(recur, description = \"Recursive tile\")]");
+        assert_eq!(attrs.tile_type, Some("recur".to_string()));
+        assert_eq!(attrs.description, Some("Recursive tile".to_string()));
+        
+        // No parens - type is None (will default to "iter" at discovery time)
+        let attrs = discovery.parse_tile_attrs("#[tile]");
+        assert!(attrs.tile_type.is_none());
     }
 
     #[test]
@@ -866,10 +930,12 @@ mod tests {
         assert_eq!(call.callee, "greet");
         assert_eq!(call.result_binding, Some("greeting".to_string()));
         assert_eq!(call.arguments, vec!["name".to_string()]);
+        assert!(!call.is_recursive);
         
         let call = discovery.parse_let_statement("let result = add(a, b);").unwrap();
         assert_eq!(call.callee, "add");
         assert_eq!(call.arguments, vec!["a".to_string(), "b".to_string()]);
+        assert!(!call.is_recursive);
     }
 
     #[test]
@@ -880,6 +946,26 @@ mod tests {
         assert_eq!(call.callee, "exclaim");
         assert_eq!(call.result_binding, None);
         assert_eq!(call.arguments, vec!["greeting".to_string()]);
+        assert!(!call.is_recursive);
+    }
+
+    #[test]
+    fn test_parse_recursive_call() {
+        let discovery = SequenceDiscovery::new(".");
+        
+        // Test recursive let statement with ! suffix
+        let call = discovery.parse_let_statement("let result = count_to!(0, 5);").unwrap();
+        assert_eq!(call.callee, "count_to");
+        assert_eq!(call.result_binding, Some("result".to_string()));
+        assert_eq!(call.arguments, vec!["0".to_string(), "5".to_string()]);
+        assert!(call.is_recursive);
+        
+        // Test recursive expression call with ! suffix
+        let call = discovery.parse_expression_call("count_to!(current, goal)").unwrap();
+        assert_eq!(call.callee, "count_to");
+        assert_eq!(call.result_binding, None);
+        assert_eq!(call.arguments, vec!["current".to_string(), "goal".to_string()]);
+        assert!(call.is_recursive);
     }
 }
 

@@ -8,8 +8,12 @@ use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use syn::{parse_macro_input, visit::Visit, Expr, ExprCall, ExprPath, FnArg, ItemFn, Pat, ReturnType, Type};
 
-/// Parses optional tile attributes from the macro invocation.
+/// Parses tile attributes from the macro invocation.
+/// 
+/// The first argument must be the tile type: `iter` or `recur`.
 struct TileAttrs {
+    /// Tile type (required: "iter" or "recur").
+    tile_type: String,
     estimated_cycles: Option<u64>,
     max_memory: Option<u64>,
     description: Option<String>,
@@ -18,24 +22,42 @@ struct TileAttrs {
 impl TileAttrs {
     fn parse(attr: TokenStream) -> Self {
         let mut attrs = TileAttrs {
+            tile_type: "iter".to_string(), // fallback, but should always be specified
             estimated_cycles: None,
             max_memory: None,
             description: None,
         };
 
         if attr.is_empty() {
-            return attrs;
+            panic!("tile macro requires a type argument, e.g., #[tile(iter)] or #[tile(recur)]");
         }
 
-        // Parse comma-separated key=value pairs
+        // Parse comma-separated: first is tile type, rest are key=value pairs
         let attr_str = attr.to_string();
+        let mut first = true;
+        
         for part in attr_str.split(',') {
             let part = part.trim();
             if part.is_empty() {
                 continue;
             }
 
+            if first {
+                // First argument is the tile type
+                first = false;
+                match part {
+                    "iter" | "recur" => {
+                        attrs.tile_type = part.to_string();
+                    }
+                    _ => {
+                        panic!("Unknown tile type '{}'. Valid types: iter, recur", part);
+                    }
+                }
+                continue;
+            }
+
             if let Some((key, value)) = part.split_once('=') {
+                // Key=value pair
                 let key = key.trim();
                 let value = value.trim().trim_matches('"');
                 match key {
@@ -64,21 +86,31 @@ impl TileAttrs {
 /// 2. Generates an ABI wrapper that handles bincode serialization/deserialization
 /// 3. Registers the tile in the global `TILE_REGISTRY` distributed slice
 ///
-/// # Attributes
+/// # Arguments
+/// The first argument is required and specifies the tile type:
+/// - `iter` - Standard iterative tile (most common)
+/// - `recur` - Recursive tile for stateful computations
+///
+/// # Optional Attributes
 /// - `estimated_cycles = N` - Expected cycle count for resource estimation
 /// - `max_memory = N` - Maximum memory usage in bytes
 /// - `description = "..."` - Human-readable description
 ///
 /// # Example
 /// ```ignore
-/// #[tile]
+/// #[tile(iter)]
 /// fn compute(input: u64) -> u64 {
 ///     input * 2
 /// }
 ///
-/// #[tile(estimated_cycles = 1000, description = "Greets a user")]
+/// #[tile(iter, estimated_cycles = 1000, description = "Greets a user")]
 /// fn greet(name: String) -> String {
 ///     format!("Hello, {}!", name)
+/// }
+///
+/// #[tile(recur)]
+/// fn iterate(state: State) -> State {
+///     // recursive computation
 /// }
 /// ```
 #[proc_macro_attribute]
@@ -199,6 +231,26 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
         None => quote! { ::core::option::Option::None },
     };
 
+    // For recursive tiles, also generate a macro with the same name that allows `tile_name!(args)` syntax
+    let recursive_macro = if attrs.tile_type == "recur" {
+        let macro_name = format_ident!("{}", fn_name);
+        quote! {
+            /// Macro wrapper for recursive tile invocation.
+            /// Use `tile_name!(args)` to invoke this recursive tile.
+            /// For native execution, this simply calls the underlying function.
+            /// The `!` syntax signals to the CFS compiler that this tile should
+            /// be executed recursively until its first output returns true.
+            #[macro_export]
+            macro_rules! #macro_name {
+                ($($args:expr),* $(,)?) => {
+                    #fn_name($($args),*)
+                };
+            }
+        }
+    } else {
+        quote! {}
+    };
+
     let expanded = quote! {
         // Keep the original function unchanged
         #input_fn
@@ -226,6 +278,9 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
                 ),
                 #wrapper_name,
             );
+
+        // For recursive tiles, generate a macro wrapper for the `!` syntax
+        #recursive_macro
     };
 
     TokenStream::from(expanded)

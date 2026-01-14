@@ -53,14 +53,19 @@ pub struct TileDef {
 }
 
 impl TileDef {
-    /// Create a new tile definition.
-    pub fn new(id: impl Into<String>, inputs: usize, outputs: usize) -> Self {
+    /// Create a new tile definition with the specified type.
+    pub fn new(id: impl Into<String>, tile_type: impl Into<String>, inputs: usize, outputs: usize) -> Self {
         Self {
             id: id.into(),
-            tile_type: "iter".to_string(),
+            tile_type: tile_type.into(),
             inputs,
             outputs,
         }
+    }
+
+    /// Create a new tile definition with the default "iter" type.
+    pub fn iter(id: impl Into<String>, inputs: usize, outputs: usize) -> Self {
+        Self::new(id, "iter", inputs, outputs)
     }
 }
 
