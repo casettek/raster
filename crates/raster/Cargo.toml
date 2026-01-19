@@ -9,7 +9,7 @@ description = "Rust-based developer toolchain for tile-based execution"
 
 [features]
 default = ["std"]
-std = ["raster-core/std", "raster-runtime", "base64"]
+std = ["raster-core/std", "raster-runtime", "base64", "serde", "serde_json"]
 alloc = ["raster-core/alloc"]
 
 [dependencies]
@@ -21,3 +21,7 @@ raster-runtime = { workspace = true, optional = true }
 
 # Base64 for subprocess communication (std only)
 base64 = { workspace = true, optional = true }
+
+# Serde and serde_json for input parsing (std only)
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }

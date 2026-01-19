@@ -13,7 +13,7 @@ extern crate alloc;
 extern crate std;
 
 pub use raster_core as core;
-pub use raster_macros::{tile, sequence};
+pub use raster_macros::{tile, sequence, main};
 
 // Runtime is only available with std feature
 #[cfg(feature = "std")]
@@ -24,7 +24,7 @@ pub use raster_runtime::{Executor, Tracer, FileTracer, NoOpTracer};
 mod exec_helper;
 
 #[cfg(feature = "std")]
-pub use exec_helper::try_execute_tile_from_args;
+pub use exec_helper::{try_execute_tile_from_args, parse_main_input};
 
 /// Prelude module for convenient imports.
 pub mod prelude {

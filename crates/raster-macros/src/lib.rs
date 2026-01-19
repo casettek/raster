@@ -384,3 +384,104 @@ pub fn sequence(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     TokenStream::from(expanded)
 }
+
+/// Entry point macro that handles raster CLI tile execution requests and input parsing.
+///
+/// Apply this to your main function to automatically handle subprocess
+/// tile execution for the native backend, and optionally parse CLI input arguments.
+///
+/// # Basic Example (no input)
+/// ```ignore
+/// #[raster::main]
+/// fn main() {
+///     let result = greet_sequence("Raster".to_string());
+///     println!("{}", result);
+/// }
+/// ```
+///
+/// # With Input Parameter
+/// ```ignore
+/// #[raster::main]
+/// fn main(name: String) {
+///     let result = greet_sequence(name);
+///     println!("{}", result);
+/// }
+/// ```
+///
+/// Run with: `cargo run -- --input '"Raster"'`
+///
+/// The macro parses `--input <json>` from command line arguments and deserializes
+/// it into the parameter type. Multiple parameters are deserialized from a JSON array.
+///
+/// # Expansion
+///
+/// `fn main(name: String)` expands to:
+/// ```ignore
+/// fn main() {
+///     if ::raster::try_execute_tile_from_args() {
+///         return;
+///     }
+///     
+///     let name: String = ::raster::parse_main_input()
+///         .expect("Failed to parse --input argument. Usage: --input '<json>'");
+///     
+///     let result = greet_sequence(name);
+///     println!("{}", result);
+/// }
+/// ```
+#[proc_macro_attribute]
+pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    let input_fn = parse_macro_input!(item as ItemFn);
+    
+    let fn_block = &input_fn.block;
+    let fn_attrs = &input_fn.attrs;
+    
+    // Extract parameters from the function signature
+    let params: Vec<_> = input_fn.sig.inputs.iter().collect();
+    
+    // Generate input parsing code based on parameters
+    let input_parsing = if params.is_empty() {
+        // No parameters - no input parsing needed
+        quote! {}
+    } else if params.len() == 1 {
+        // Single parameter - deserialize directly
+        let param = &params[0];
+        if let FnArg::Typed(pat_type) = param {
+            let pat = &pat_type.pat;
+            let ty = &pat_type.ty;
+            quote! {
+                let #pat: #ty = ::raster::parse_main_input()
+                    .expect("Failed to parse --input argument. Usage: --input '<json>'");
+            }
+        } else {
+            quote! {}
+        }
+    } else {
+        // Multiple parameters - deserialize as tuple
+        let names: Vec<_> = params.iter().filter_map(|p| {
+            if let FnArg::Typed(pt) = p { Some(&pt.pat) } else { None }
+        }).collect();
+        let types: Vec<_> = params.iter().filter_map(|p| {
+            if let FnArg::Typed(pt) = p { Some(&pt.ty) } else { None }
+        }).collect();
+        quote! {
+            let (#(#names),*): (#(#types),*) = ::raster::parse_main_input()
+                .expect("Failed to parse --input argument. Usage: --input '[val1, val2, ...]'");
+        }
+    };
+    
+    let expanded = quote! {
+        #(#fn_attrs)*
+        fn main() {
+            if ::raster::try_execute_tile_from_args() {
+                return;
+            }
+            
+            #input_parsing
+            
+            #fn_block
+        }
+    };
+    
+    TokenStream::from(expanded)
+}
