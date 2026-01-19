@@ -19,6 +19,13 @@ pub use raster_macros::{tile, sequence};
 #[cfg(feature = "std")]
 pub use raster_runtime::{Executor, Tracer, FileTracer, NoOpTracer};
 
+// Tile execution helper for native backend subprocess communication
+#[cfg(feature = "std")]
+mod exec_helper;
+
+#[cfg(feature = "std")]
+pub use exec_helper::try_execute_tile_from_args;
+
 /// Prelude module for convenient imports.
 pub mod prelude {
     pub use crate::core::{
@@ -45,4 +52,8 @@ pub mod prelude {
     
     #[cfg(feature = "std")]
     pub use crate::{Executor, Tracer, FileTracer, NoOpTracer};
+    
+    // Tile execution helper for native backend
+    #[cfg(all(feature = "std", not(target_arch = "riscv32")))]
+    pub use crate::try_execute_tile_from_args;
 }

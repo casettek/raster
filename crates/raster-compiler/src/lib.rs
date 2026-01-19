@@ -13,7 +13,7 @@ pub mod discovery;
 pub mod flow_resolver;
 pub mod schema_gen;
 
-pub use builder::{Builder, BuildOutput, TileArtifact, TileManifest};
+pub use builder::{Builder, BuildOutput, TileArtifact, TileManifest, TileRunner};
 pub use cfs_builder::{CfsBuilder, extract_project_name};
 pub use discovery::{DiscoveredSequence, DiscoveredTile, SequenceCall, SequenceDiscovery, TileDiscovery};
 pub use flow_resolver::FlowResolver;

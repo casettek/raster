@@ -7,7 +7,7 @@ pub mod backend;
 pub mod native;
 
 pub use backend::{
-    calculate_proof_cycles, Backend, CompilationOutput, ExecutionMode, ResourceEstimate,
-    TileExecution, MIN_PROOF_SEGMENT_CYCLES,
+    calculate_proof_cycles, ArtifactStore, Backend, Executable, ExecutionMode, ResourceEstimate,
+    TileExecDescriptor, TileExecutionResult, MIN_PROOF_SEGMENT_CYCLES,
 };
-pub use native::NativeBackend;
+pub use native::{NativeArtifactStore, NativeBackend, NativeExecutable};

@@ -50,6 +50,8 @@ linkme = "0.3"
 postcard = { version = "1.0", default-features = false, features = ["alloc"] }
 # bincode is used by std-only code (CLI, backend)
 bincode = "1.3"
+# base64 for encoding tile input/output in subprocess communication
+base64 = "0.22"
 
 [profile.release]
 opt-level = 3

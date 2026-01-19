@@ -3,7 +3,7 @@ use raster::prelude::*;
 
 /// The main sequence that greets and adds emphasis.
 ///
-/// This sequence:o0
+/// This sequence:
 /// 1. Takes a name as input
 /// 2. Generates a greeting with `greet`
 /// 3. Adds emphasis with `exclaim`
@@ -19,6 +19,12 @@ fn greet_sequence(name: String) -> String {
 
 /// Entry point that runs the greet sequence natively.
 fn main() {
+    // Handle raster CLI tile execution requests (for native backend)
+    if try_execute_tile_from_args() {
+        return;
+    }
+
+    // Normal execution
     let result = greet_sequence("Raster".to_string());
     println!("{}", result);
 }

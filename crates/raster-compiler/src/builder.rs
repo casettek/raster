@@ -1,7 +1,7 @@
 //! Build orchestration for Raster projects.
 
 use crate::discovery::{DiscoveredTile, TileDiscovery};
-use raster_backend::{Backend, CompilationOutput, NativeBackend};
+use raster_backend::{Backend, Executable, ExecutionMode, NativeBackend, TileExecutionResult};
 use raster_core::{
     manifest::Manifest,
     registry::{iter_tiles, TileRegistration},
@@ -12,13 +12,14 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 /// Compute a simple hash of a file's contents for cache invalidation.
 fn compute_source_hash(path: &str) -> Option<String> {
     let mut file = fs::File::open(path).ok()?;
     let mut contents = Vec::new();
     file.read_to_end(&mut contents).ok()?;
-    
+
     // Simple hash: use the first 16 bytes of a basic checksum
     // This is fast and good enough for cache invalidation
     let mut hash: u64 = 0;
@@ -32,8 +33,8 @@ fn compute_source_hash(path: &str) -> Option<String> {
 
 /// Orchestrates the build process for a Raster project.
 pub struct Builder {
-    /// The backend to use for compilation.
-    backend: Box<dyn Backend>,
+    /// The backend to use for compilation (shared via Arc for TileRunner).
+    backend: Arc<dyn Backend>,
     /// Output directory for artifacts.
     output_dir: PathBuf,
     /// Path to the user's project.
@@ -44,15 +45,16 @@ impl Builder {
     /// Create a new builder with the given output directory.
     pub fn new(output_dir: PathBuf) -> Self {
         Self {
-            backend: Box::new(NativeBackend::new()),
+            backend: Arc::new(NativeBackend::new()),
             output_dir,
             project_path: None,
         }
     }
 
     /// Set a custom backend for compilation.
+    /// Accepts Box<dyn Backend> for convenience, converts to Arc internally.
     pub fn with_backend(mut self, backend: Box<dyn Backend>) -> Self {
-        self.backend = backend;
+        self.backend = Arc::from(backend);
         self
     }
 
@@ -67,64 +69,17 @@ impl Builder {
         self.backend.name()
     }
 
-    /// Check if a tile needs to be recompiled.
-    /// Returns true if compilation is needed, false if cached artifacts are valid.
-    fn needs_compilation(&self, tile_id: &str, source_path: &str) -> bool {
-        let manifest_path = self
-            .output_dir
-            .join("tiles")
-            .join(tile_id)
-            .join(self.backend.name())
-            .join("manifest.json");
-
-        // If manifest doesn't exist, we need to compile
-        let manifest_content = match fs::read_to_string(&manifest_path) {
-            Ok(content) => content,
-            Err(_) => return true,
-        };
-
-        // Parse the manifest
-        let manifest: TileManifest = match serde_json::from_str(&manifest_content) {
-            Ok(m) => m,
-            Err(_) => return true,
-        };
-
-        // If no source hash stored, we need to recompile
-        let stored_hash = match manifest.source_hash {
-            Some(h) => h,
-            None => return true,
-        };
-
-        // Compute current source hash
-        let current_hash = match compute_source_hash(source_path) {
-            Some(h) => h,
-            None => return true,
-        };
-
-        // If hashes differ, we need to recompile
-        stored_hash != current_hash
-    }
-
-    /// Load cached compilation output if available and valid.
-    fn load_cached_compilation(&self, tile_id: &str) -> Option<CompilationOutput> {
-        let backend_dir = self
-            .output_dir
-            .join("tiles")
-            .join(tile_id)
-            .join(self.backend.name());
-
-        let elf_path = backend_dir.join("guest.elf");
-        let method_id_path = backend_dir.join("method_id");
-
-        let elf = fs::read(&elf_path).ok()?;
-        let method_id_hex = fs::read_to_string(&method_id_path).ok()?;
-        let method_id = hex::decode(method_id_hex.trim()).ok()?;
-
-        Some(CompilationOutput {
-            elf,
-            method_id,
-            artifact_dir: Some(backend_dir),
-        })
+    /// Try to load a cached executable from the artifact store.
+    /// Returns None if not cached or cache is stale.
+    fn load_cached_executable(
+        &self,
+        tile_id: &str,
+        source_path: &str,
+    ) -> Option<Box<dyn Executable>> {
+        let source_hash = compute_source_hash(source_path);
+        self.backend
+            .artifact_store()
+            .load(tile_id, &self.output_dir, source_hash.as_deref())
     }
 
     /// Discover all registered tiles from the in-process registry.
@@ -167,37 +122,43 @@ impl Builder {
             });
         }
 
+        let store = self.backend.artifact_store();
         let mut artifacts = HashMap::new();
         let mut compiled = 0;
         let mut skipped = 0;
 
         for tile in tiles {
             let tile_id = &tile.metadata.id.0;
+            let source_hash = compute_source_hash(&tile.source_file);
 
-            // Check if we can use cached artifacts
-            if !self.needs_compilation(tile_id, &tile.source_file) {
-                if let Some(cached) = self.load_cached_compilation(tile_id) {
-                    let artifact = TileArtifact {
-                        tile_id: tile_id.clone(),
-                        elf_path: cached.artifact_dir.as_ref().map(|d| d.join("guest.elf")),
-                        method_id: hex::encode(&cached.method_id),
-                        artifact_dir: cached.artifact_dir.unwrap_or_else(|| {
-                            self.output_dir
-                                .join("tiles")
-                                .join(tile_id)
-                                .join(self.backend.name())
-                        }),
-                    };
-                    artifacts.insert(tile_id.clone(), artifact);
-                    skipped += 1;
-                    continue;
-                }
+            // Try loading from cache (backend handles its own format)
+            if let Some(cached) = store.load(tile_id, &self.output_dir, source_hash.as_deref()) {
+                let artifact = TileArtifact {
+                    tile_id: tile_id.clone(),
+                    artifact_dir: cached
+                        .artifact_dir()
+                        .map(|p| p.to_path_buf())
+                        .unwrap_or_else(|| self.default_artifact_dir(tile_id)),
+                };
+                artifacts.insert(tile_id.clone(), artifact);
+                skipped += 1;
+                continue;
             }
 
-            match self.backend.compile_tile(&tile.metadata, &tile.source_file) {
-                Ok(output) => {
-                    // Write artifacts with source hash
-                    let artifact = self.write_tile_artifacts(tile_id, &output, Some(&tile.source_file))?;
+            // Compile tile (backend returns its own Executable type)
+            match self.backend.prepare_tile_executable(&tile.metadata, &tile.source_file) {
+                Ok(executable) => {
+                    // Persist artifacts (backend handles its own format)
+                    let artifact_dir = store.save(
+                        executable.as_ref(),
+                        &self.output_dir,
+                        source_hash.as_deref(),
+                    )?;
+
+                    let artifact = TileArtifact {
+                        tile_id: tile_id.clone(),
+                        artifact_dir,
+                    };
                     artifacts.insert(tile_id.clone(), artifact);
                     compiled += 1;
                 }
@@ -214,6 +175,14 @@ impl Builder {
             artifacts,
             backend: self.backend.name().to_string(),
         })
+    }
+
+    /// Get the default artifact directory for a tile.
+    fn default_artifact_dir(&self, tile_id: &str) -> PathBuf {
+        self.output_dir
+            .join("tiles")
+            .join(tile_id)
+            .join(self.backend.name())
     }
 
     /// Build all tiles from the in-process registry.
@@ -233,6 +202,7 @@ impl Builder {
             });
         }
 
+        let store = self.backend.artifact_store();
         let mut artifacts = HashMap::new();
         let mut compiled = 0;
 
@@ -247,10 +217,21 @@ impl Builder {
                 .map(|p| p.join("src/lib.rs").to_string_lossy().to_string())
                 .unwrap_or_else(|| "src/lib.rs".to_string());
 
-            match self.backend.compile_tile(&metadata, &source_path) {
-                Ok(output) => {
-                    // Write artifacts
-                    let artifact = self.write_tile_artifacts(tile_id, &output, Some(&source_path))?;
+            let source_hash = compute_source_hash(&source_path);
+
+            match self.backend.prepare_tile_executable(&metadata, &source_path) {
+                Ok(executable) => {
+                    // Persist artifacts
+                    let artifact_dir = store.save(
+                        executable.as_ref(),
+                        &self.output_dir,
+                        source_hash.as_deref(),
+                    )?;
+
+                    let artifact = TileArtifact {
+                        tile_id: tile_id.to_string(),
+                        artifact_dir,
+                    };
                     artifacts.insert(tile_id.to_string(), artifact);
                     compiled += 1;
                 }
@@ -271,10 +252,13 @@ impl Builder {
 
     /// Build all tiles and schemas from a manifest.
     pub fn build(&self, manifest: &Manifest) -> Result<BuildOutput> {
+        let store = self.backend.artifact_store();
         let mut artifacts = HashMap::new();
         let mut compiled = 0;
 
         for tile_meta in &manifest.tiles {
+            let tile_id = &tile_meta.id.0;
+
             // Determine source path (placeholder for now)
             let source_path = self
                 .project_path
@@ -282,14 +266,26 @@ impl Builder {
                 .map(|p| p.join("src/lib.rs").to_string_lossy().to_string())
                 .unwrap_or_else(|| "src/lib.rs".to_string());
 
-            match self.backend.compile_tile(tile_meta, &source_path) {
-                Ok(output) => {
-                    let artifact = self.write_tile_artifacts(&tile_meta.id.0, &output, Some(&source_path))?;
-                    artifacts.insert(tile_meta.id.0.clone(), artifact);
+            let source_hash = compute_source_hash(&source_path);
+
+            match self.backend.prepare_tile_executable(tile_meta, &source_path) {
+                Ok(executable) => {
+                    // Persist artifacts
+                    let artifact_dir = store.save(
+                        executable.as_ref(),
+                        &self.output_dir,
+                        source_hash.as_deref(),
+                    )?;
+
+                    let artifact = TileArtifact {
+                        tile_id: tile_id.clone(),
+                        artifact_dir,
+                    };
+                    artifacts.insert(tile_id.clone(), artifact);
                     compiled += 1;
                 }
                 Err(e) => {
-                    eprintln!("Warning: Failed to compile tile '{}': {}", tile_meta.id.0, e);
+                    eprintln!("Warning: Failed to compile tile '{}': {}", tile_id, e);
                 }
             }
         }
@@ -309,8 +305,9 @@ impl Builder {
         // First try source-based discovery
         if let Ok(tiles) = self.discover_tiles_from_source() {
             if let Some(tile) = tiles.iter().find(|t| t.metadata.id.0 == tile_id) {
-                return !self.needs_compilation(tile_id, &tile.source_file)
-                    && self.load_cached_compilation(tile_id).is_some();
+                return self
+                    .load_cached_executable(tile_id, &tile.source_file)
+                    .is_some();
             }
         }
         false
@@ -318,7 +315,6 @@ impl Builder {
 
     /// Build a single tile by ID using source-based discovery.
     /// Uses cached artifacts if source hasn't changed.
-    /// Returns (artifact, was_cached).
     pub fn build_tile(&self, tile_id: &str) -> Result<TileArtifact> {
         let (artifact, _) = self.build_tile_with_cache_info(tile_id)?;
         Ok(artifact)
@@ -326,29 +322,62 @@ impl Builder {
 
     /// Build a single tile by ID, returning whether cache was used.
     pub fn build_tile_with_cache_info(&self, tile_id: &str) -> Result<(TileArtifact, bool)> {
+        let (executable, artifact_dir, was_cached) = self.build_tile_executable(tile_id)?;
+        // Discard the executable, caller only needs the artifact
+        drop(executable);
+        Ok((
+            TileArtifact {
+                tile_id: tile_id.to_string(),
+                artifact_dir,
+            },
+            was_cached,
+        ))
+    }
+
+    /// Build a tile and return the executable directly.
+    ///
+    /// This avoids the unnecessary reload pattern where we compile, save to disk,
+    /// discard the executable, then reload it. Instead, we keep the executable
+    /// in memory and return it directly.
+    ///
+    /// Returns (executable, artifact_dir, was_cached).
+    pub fn build_tile_executable(
+        &self,
+        tile_id: &str,
+    ) -> Result<(Box<dyn Executable>, PathBuf, bool)> {
+        let store = self.backend.artifact_store();
+
         // First try source-based discovery
         let tiles = self.discover_tiles_from_source()?;
+        println!("build tiles: {:?}", tiles);
+
         if let Some(tile) = tiles.iter().find(|t| t.metadata.id.0 == tile_id) {
+            let source_hash = compute_source_hash(&tile.source_file);
+
             // Check cache first
-            if !self.needs_compilation(tile_id, &tile.source_file) {
-                if let Some(cached) = self.load_cached_compilation(tile_id) {
-                    return Ok((TileArtifact {
-                        tile_id: tile_id.to_string(),
-                        elf_path: cached.artifact_dir.as_ref().map(|d| d.join("guest.elf")),
-                        method_id: hex::encode(&cached.method_id),
-                        artifact_dir: cached.artifact_dir.unwrap_or_else(|| {
-                            self.output_dir
-                                .join("tiles")
-                                .join(tile_id)
-                                .join(self.backend.name())
-                        }),
-                    }, true));
-                }
+            if let Some(cached) = store.load(tile_id, &self.output_dir, source_hash.as_deref()) {
+                println!("cached executable loaded");
+                let artifact_dir = cached
+                    .artifact_dir()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| self.default_artifact_dir(tile_id));
+                return Ok((cached, artifact_dir, true));
             }
 
-            let output = self.backend.compile_tile(&tile.metadata, &tile.source_file)?;
-            let artifact = self.write_tile_artifacts(tile_id, &output, Some(&tile.source_file))?;
-            return Ok((artifact, false));
+            // Compile the tile
+            let executable = self
+                .backend
+                .prepare_tile_executable(&tile.metadata, &tile.source_file)?;
+            println!("executable compiled");
+
+            // Persist artifacts
+            let artifact_dir = store.save(
+                executable.as_ref(),
+                &self.output_dir,
+                source_hash.as_deref(),
+            )?;
+
+            return Ok((executable, artifact_dir, false));
         }
 
         // Fall back to registry (for in-process usage)
@@ -363,61 +392,41 @@ impl Builder {
             .map(|p| p.join("src/lib.rs").to_string_lossy().to_string())
             .unwrap_or_else(|| "src/lib.rs".to_string());
 
-        let output = self.backend.compile_tile(&metadata, &source_path)?;
-        let artifact = self.write_tile_artifacts(tile_id, &output, Some(&source_path))?;
-        Ok((artifact, false))
+        let source_hash = compute_source_hash(&source_path);
+
+        let executable = self.backend.prepare_tile_executable(&metadata, &source_path)?;
+        let artifact_dir = store.save(
+            executable.as_ref(),
+            &self.output_dir,
+            source_hash.as_deref(),
+        )?;
+
+        Ok((executable, artifact_dir, false))
     }
 
-    /// Write tile artifacts to the output directory.
-    fn write_tile_artifacts(
-        &self,
-        tile_id: &str,
-        output: &CompilationOutput,
-        source_path: Option<&str>,
-    ) -> Result<TileArtifact> {
-        let artifact_dir = self.output_dir.join("tiles").join(tile_id);
-        let backend_dir = artifact_dir.join(self.backend.name());
+    /// Build a tile and return a TileRunner that can execute it.
+    /// This encapsulates the entire build + load process.
+    ///
+    /// Uses `build_tile_executable` internally to get the executable directly,
+    /// avoiding the unnecessary reload pattern.
+    pub fn build_tile_runner(&self, tile_id: &str) -> Result<TileRunner> {
+        let (executable, _artifact_dir, _was_cached) = self.build_tile_executable(tile_id)?;
 
-        fs::create_dir_all(&backend_dir).map_err(|e| {
-            Error::Io(e)
-        })?;
-
-        // Write ELF if non-empty
-        let elf_path = if !output.elf.is_empty() {
-            let path = backend_dir.join("guest.elf");
-            fs::write(&path, &output.elf).map_err(Error::Io)?;
-            Some(path)
-        } else {
-            None
-        };
-
-        // Write method ID
-        let method_id_path = backend_dir.join("method_id");
-        let method_id_hex = hex::encode(&output.method_id);
-        fs::write(&method_id_path, &method_id_hex).map_err(Error::Io)?;
-
-        // Compute source hash for cache invalidation
-        let source_hash = source_path.and_then(compute_source_hash);
-
-        // Write manifest
-        let manifest = TileManifest {
+        Ok(TileRunner {
+            backend: self.backend.clone(),
+            executable,
             tile_id: tile_id.to_string(),
-            backend: self.backend.name().to_string(),
-            method_id: method_id_hex.clone(),
-            elf_size: output.elf.len(),
-            source_hash,
-        };
-        let manifest_path = backend_dir.join("manifest.json");
-        let manifest_json = serde_json::to_string_pretty(&manifest)
-            .map_err(|e| Error::Serialization(e.to_string()))?;
-        fs::write(&manifest_path, manifest_json).map_err(Error::Io)?;
-
-        Ok(TileArtifact {
-            tile_id: tile_id.to_string(),
-            elf_path,
-            method_id: method_id_hex,
-            artifact_dir: backend_dir,
         })
+    }
+
+    /// Get the project path.
+    pub fn project_path(&self) -> Option<&PathBuf> {
+        self.project_path.as_ref()
+    }
+
+    /// Get the output directory.
+    pub fn output_dir(&self) -> &PathBuf {
+        &self.output_dir
     }
 }
 
@@ -436,15 +445,14 @@ pub struct BuildOutput {
     pub backend: String,
 }
 
-/// Artifact produced for a single tile.
+/// Artifact produced for a single tile (backend-agnostic).
+/// 
+/// The specific artifact format (ELF files, binaries, etc.) is handled
+/// by each backend's ArtifactStore implementation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TileArtifact {
     /// The tile ID.
     pub tile_id: String,
-    /// Path to the ELF binary (if produced).
-    pub elf_path: Option<PathBuf>,
-    /// Method ID (hex-encoded).
-    pub method_id: String,
     /// Directory containing all artifacts.
     pub artifact_dir: PathBuf,
 }
@@ -463,4 +471,43 @@ pub struct TileManifest {
     /// Hash of source file for cache invalidation.
     #[serde(default)]
     pub source_hash: Option<String>,
+}
+
+/// A compiled tile that is ready to run.
+///
+/// TileRunner encapsulates the backend and loaded executable,
+/// providing a simple `run()` method that abstracts away backend-specific
+/// execution details (ELF loading, zkVM execution, subprocess calls, etc.).
+pub struct TileRunner {
+    /// The backend to use for execution (shared).
+    backend: Arc<dyn Backend>,
+    /// The loaded executable (opaque, backend-specific).
+    executable: Box<dyn Executable>,
+    /// The tile ID.
+    tile_id: String,
+}
+
+impl TileRunner {
+    /// Run the tile with the given input and execution mode.
+    ///
+    /// This abstracts the execution model - callers just "run" the tile
+    /// without needing to know about backend-specific details.
+    pub fn run(&self, input: &[u8], mode: ExecutionMode) -> Result<TileExecutionResult> {
+        self.backend.execute_tile(self.executable.as_ref(), input, mode)
+    }
+
+    /// Get the tile ID.
+    pub fn tile_id(&self) -> &str {
+        &self.tile_id
+    }
+
+    /// Get a reference to the executable.
+    pub fn executable(&self) -> &dyn Executable {
+        self.executable.as_ref()
+    }
+
+    /// Get the backend name.
+    pub fn backend_name(&self) -> &'static str {
+        self.backend.name()
+    }
 }
