@@ -12,9 +12,15 @@ pub mod cfs_builder;
 pub mod discovery;
 pub mod flow_resolver;
 pub mod schema_gen;
+pub mod ast;
+pub mod sequence;
+pub mod tile;
 
 pub use builder::{Builder, BuildOutput, TileArtifact, TileManifest, TileRunner};
 pub use cfs_builder::{CfsBuilder, extract_project_name};
 pub use discovery::{DiscoveredSequence, DiscoveredTile, SequenceCall, SequenceDiscovery, TileDiscovery};
 pub use flow_resolver::FlowResolver;
 pub use schema_gen::SchemaGenerator;
+pub use ast::{
+    ProjectAst
+};

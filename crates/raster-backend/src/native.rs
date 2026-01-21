@@ -7,7 +7,7 @@
 //! and runs it with special arguments to execute a specific tile.
 
 use crate::backend::{
-    ArtifactStore, Backend, Executable, ExecutionMode, ResourceEstimate, TileExecutionResult,
+    ArtifactStore, Backend, CompilationArtifact, ExecutionMode, ResourceEstimate, TileExecutionResult,
 };
 use raster_core::{tile::TileMetadata, Error, Result};
 use serde::{Deserialize, Serialize};
@@ -25,7 +25,7 @@ pub struct NativeExecutable {
     pub tile_id: String,
 }
 
-impl Executable for NativeExecutable {
+impl CompilationArtifact for NativeExecutable {
     fn tile_id(&self) -> &str {
         &self.tile_id
     }
@@ -57,7 +57,7 @@ pub struct NativeArtifactStore;
 impl ArtifactStore for NativeArtifactStore {
     fn save(
         &self,
-        executable: &dyn Executable,
+        executable: &dyn CompilationArtifact,
         output_dir: &Path,
         source_hash: Option<&str>,
     ) -> Result<PathBuf> {
@@ -93,7 +93,7 @@ impl ArtifactStore for NativeArtifactStore {
         tile_id: &str,
         output_dir: &Path,
         source_hash: Option<&str>,
-    ) -> Option<Box<dyn Executable>> {
+    ) -> Option<Box<dyn CompilationArtifact>> {
         let artifact_dir = output_dir.join("tiles").join(tile_id).join("native");
 
         let manifest_content = fs::read_to_string(artifact_dir.join("manifest.json")).ok()?;
@@ -228,11 +228,11 @@ impl Backend for NativeBackend {
         "native"
     }
 
-    fn prepare_tile_executable(
+    fn compile_tile(
         &self,
         metadata: &TileMetadata,
         _source_path: &str,
-    ) -> Result<Box<dyn Executable>> {
+    ) -> Result<Box<dyn CompilationArtifact>> {
         // Native backend builds the user's project
         let project_path = self.project_path.as_ref().ok_or_else(|| {
             Error::Other("Native backend requires project_path to be set".into())
@@ -281,12 +281,12 @@ impl Backend for NativeBackend {
 
     fn execute_tile(
         &self,
-        executable: &dyn Executable,
+        compilation_artifact: &dyn CompilationArtifact,
         input: &[u8],
         mode: ExecutionMode,
     ) -> Result<TileExecutionResult> {
         // Downcast to NativeExecutable
-        let native = executable
+        let native = compilation_artifact 
             .as_any()
             .downcast_ref::<NativeExecutable>()
             .ok_or_else(|| Error::Other("Expected NativeExecutable".into()))?;
@@ -374,7 +374,7 @@ impl Backend for NativeBackend {
         })
     }
 
-    fn verify_receipt(&self, _executable: &dyn Executable, _receipt: &[u8]) -> Result<bool> {
+    fn verify_receipt(&self, _executable: &dyn CompilationArtifact, _receipt: &[u8]) -> Result<bool> {
         Err(Error::Other(
             "Native backend does not support proof verification. Use the RISC0 backend.".into(),
         ))

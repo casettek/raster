@@ -29,6 +29,16 @@ pub fn exclaim(message: String) -> String {
     format!("{}!!", message)
 }
 
+#[tile]
+pub fn raster_wish(message: String) -> String {
+    format!("{}\nHope you  will have fun with Raster!", message)
+}
+
+#[tile]
+pub fn current_wish(message: String) -> String {
+    format!("{}\nHappy new year!", message)
+}
+
 /// A tile that computes Fibonacci numbers.
 ///
 /// This demonstrates a more computationally intensive tile.

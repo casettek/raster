@@ -359,13 +359,15 @@ pub fn sequence(attr: TokenStream, item: TokenStream) -> TokenStream {
         None => quote! { ::core::option::Option::None },
     };
 
+    let tiles_static_name = format_ident!("__RASTER_SEQUENCE_TILES_{}", fn_name.to_string().to_uppercase());
+
     let expanded = quote! {
         // Keep the original function unchanged for native execution
         #input_fn
 
         // Static array of tile IDs for this sequence
         #[cfg(all(feature = "std", not(target_arch = "riscv32")))]
-        static __RASTER_SEQUENCE_TILES: [&'static str; #tile_count] = [#(#tile_strs),*];
+        static #tiles_static_name: [&'static str; #tile_count] = [#(#tile_strs),*]; 
 
         // Register the sequence in the distributed slice (only on platforms that support linkme and std)
         #[cfg(all(feature = "std", not(target_arch = "riscv32")))]
@@ -378,7 +380,7 @@ pub fn sequence(attr: TokenStream, item: TokenStream) -> TokenStream {
                     #fn_name_str,
                     #description_expr,
                 ),
-                &__RASTER_SEQUENCE_TILES,
+                &#tiles_static_name,
             );
     };
 

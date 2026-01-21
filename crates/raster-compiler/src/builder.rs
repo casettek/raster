@@ -1,7 +1,7 @@
 //! Build orchestration for Raster projects.
 
-use crate::discovery::{DiscoveredTile, TileDiscovery};
-use raster_backend::{Backend, Executable, ExecutionMode, NativeBackend, TileExecutionResult};
+use crate::{ast::ProjectAst, discovery::{DiscoveredTile, TileDiscovery}, sequence::SequenceExplorer, tile::TileExplorer};
+use raster_backend::{Backend, CompilationArtifact, ExecutionMode, NativeBackend, TileExecutionResult};
 use raster_core::{
     manifest::Manifest,
     registry::{iter_tiles, TileRegistration},
@@ -69,18 +69,6 @@ impl Builder {
         self.backend.name()
     }
 
-    /// Try to load a cached executable from the artifact store.
-    /// Returns None if not cached or cache is stale.
-    fn load_cached_executable(
-        &self,
-        tile_id: &str,
-        source_path: &str,
-    ) -> Option<Box<dyn Executable>> {
-        let source_hash = compute_source_hash(source_path);
-        self.backend
-            .artifact_store()
-            .load(tile_id, &self.output_dir, source_hash.as_deref())
-    }
 
     /// Discover all registered tiles from the in-process registry.
     ///
@@ -100,6 +88,13 @@ impl Builder {
             .as_ref()
             .cloned()
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+
+        let project_ast = ProjectAst::new(&project_path).unwrap();
+        let tile_explorer = TileExplorer::new(&project_ast);
+        let sequences = SequenceExplorer::new(&project_ast, &tile_explorer);
+
+        println!("\nproject_ast: {:?}", project_ast);
+        println!("\nsequences: {:#?}", sequences);
 
         let discovery = TileDiscovery::new(&project_path);
         discovery.discover()
@@ -146,7 +141,7 @@ impl Builder {
             }
 
             // Compile tile (backend returns its own Executable type)
-            match self.backend.prepare_tile_executable(&tile.metadata, &tile.source_file) {
+            match self.backend.compile_tile(&tile.metadata, &tile.source_file) {
                 Ok(executable) => {
                     // Persist artifacts (backend handles its own format)
                     let artifact_dir = store.save(
@@ -219,7 +214,7 @@ impl Builder {
 
             let source_hash = compute_source_hash(&source_path);
 
-            match self.backend.prepare_tile_executable(&metadata, &source_path) {
+            match self.backend.compile_tile(&metadata, &source_path) {
                 Ok(executable) => {
                     // Persist artifacts
                     let artifact_dir = store.save(
@@ -268,7 +263,7 @@ impl Builder {
 
             let source_hash = compute_source_hash(&source_path);
 
-            match self.backend.prepare_tile_executable(tile_meta, &source_path) {
+            match self.backend.compile_tile(tile_meta, &source_path) {
                 Ok(executable) => {
                     // Persist artifacts
                     let artifact_dir = store.save(
@@ -299,19 +294,6 @@ impl Builder {
         })
     }
 
-    /// Check if a tile is cached and doesn't need recompilation.
-    /// Returns true if cached, false if compilation is needed.
-    pub fn is_tile_cached(&self, tile_id: &str) -> bool {
-        // First try source-based discovery
-        if let Ok(tiles) = self.discover_tiles_from_source() {
-            if let Some(tile) = tiles.iter().find(|t| t.metadata.id.0 == tile_id) {
-                return self
-                    .load_cached_executable(tile_id, &tile.source_file)
-                    .is_some();
-            }
-        }
-        false
-    }
 
     /// Build a single tile by ID using source-based discovery.
     /// Uses cached artifacts if source hasn't changed.
@@ -344,7 +326,7 @@ impl Builder {
     pub fn build_tile_executable(
         &self,
         tile_id: &str,
-    ) -> Result<(Box<dyn Executable>, PathBuf, bool)> {
+    ) -> Result<(Box<dyn CompilationArtifact>, PathBuf, bool)> {
         let store = self.backend.artifact_store();
 
         // First try source-based discovery
@@ -367,7 +349,7 @@ impl Builder {
             // Compile the tile
             let executable = self
                 .backend
-                .prepare_tile_executable(&tile.metadata, &tile.source_file)?;
+                .compile_tile(&tile.metadata, &tile.source_file)?;
             println!("executable compiled");
 
             // Persist artifacts
@@ -394,7 +376,7 @@ impl Builder {
 
         let source_hash = compute_source_hash(&source_path);
 
-        let executable = self.backend.prepare_tile_executable(&metadata, &source_path)?;
+        let executable = self.backend.compile_tile(&metadata, &source_path)?;
         let artifact_dir = store.save(
             executable.as_ref(),
             &self.output_dir,
@@ -482,7 +464,7 @@ pub struct TileRunner {
     /// The backend to use for execution (shared).
     backend: Arc<dyn Backend>,
     /// The loaded executable (opaque, backend-specific).
-    executable: Box<dyn Executable>,
+    executable: Box<dyn CompilationArtifact>,
     /// The tile ID.
     tile_id: String,
 }
@@ -502,7 +484,7 @@ impl TileRunner {
     }
 
     /// Get a reference to the executable.
-    pub fn executable(&self) -> &dyn Executable {
+    pub fn executable(&self) -> &dyn CompilationArtifact {
         self.executable.as_ref()
     }
 

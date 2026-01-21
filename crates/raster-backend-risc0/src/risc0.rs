@@ -2,7 +2,7 @@
 
 use crate::guest_builder::GuestBuilder;
 use raster_backend::{
-    ArtifactStore, Backend, Executable, ExecutionMode, ResourceEstimate, TileExecutionResult,
+    ArtifactStore, Backend, CompilationArtifact, ExecutionMode, ResourceEstimate, TileExecutionResult,
 };
 use raster_core::{tile::TileMetadata, Error, Result};
 use risc0_zkvm::{default_executor, ExecutorEnv, ProverOpts};
@@ -54,7 +54,7 @@ pub struct Risc0Executable {
     pub artifact_dir: Option<PathBuf>,
 }
 
-impl Executable for Risc0Executable {
+impl CompilationArtifact for Risc0Executable {
     fn tile_id(&self) -> &str {
         &self.tile_id
     }
@@ -100,7 +100,7 @@ impl Default for Risc0ArtifactStore {
 impl ArtifactStore for Risc0ArtifactStore {
     fn save(
         &self,
-        executable: &dyn Executable,
+        executable: &dyn CompilationArtifact,
         output_dir: &Path,
         source_hash: Option<&str>,
     ) -> Result<PathBuf> {
@@ -141,7 +141,7 @@ impl ArtifactStore for Risc0ArtifactStore {
         tile_id: &str,
         output_dir: &Path,
         source_hash: Option<&str>,
-    ) -> Option<Box<dyn Executable>> {
+    ) -> Option<Box<dyn CompilationArtifact>> {
         let artifact_dir = output_dir.join("tiles").join(tile_id).join("risc0");
 
         let manifest_content = fs::read_to_string(artifact_dir.join("manifest.json")).ok()?;
@@ -238,11 +238,11 @@ impl Backend for Risc0Backend {
         "risc0"
     }
 
-    fn prepare_tile_executable(
+    fn compile_tile(
         &self,
         metadata: &TileMetadata,
         _source_path: &str,
-    ) -> Result<Box<dyn Executable>> {
+    ) -> Result<Box<dyn CompilationArtifact>> {
         let tile_id = &metadata.id.0;
         let builder = self.guest_builder();
 
@@ -282,7 +282,7 @@ impl Backend for Risc0Backend {
 
     fn execute_tile(
         &self,
-        executable: &dyn Executable,
+        executable: &dyn CompilationArtifact,
         input: &[u8],
         mode: ExecutionMode,
     ) -> Result<TileExecutionResult> {
@@ -374,7 +374,7 @@ impl Backend for Risc0Backend {
         })
     }
 
-    fn verify_receipt(&self, executable: &dyn Executable, receipt_bytes: &[u8]) -> Result<bool> {
+    fn verify_receipt(&self, executable: &dyn CompilationArtifact, receipt_bytes: &[u8]) -> Result<bool> {
         // Downcast to Risc0Executable
         let risc0 = executable
             .as_any()

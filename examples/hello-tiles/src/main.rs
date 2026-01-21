@@ -1,4 +1,4 @@
-use hello_tiles::{exclaim, greet};
+use hello_tiles::{current_wish, exclaim, greet, raster_wish};
 
 /// The main sequence that greets and adds emphasis.
 ///
@@ -14,9 +14,13 @@ fn greet_sequence(name: String) -> String {
     let greeting = greet(name);
     let e1 = exclaim(greeting);
     let e2 = exclaim(e1);
-    exclaim(e2)
+    exclaim(wish_sequence(e2))
 }
 
+#[raster::sequence]
+fn wish_sequence(name: String) -> String {
+    current_wish(raster_wish(name))
+}
 /// Entry point that runs the greet sequence natively.
 ///
 /// The `name` parameter is parsed from `--input` CLI argument.

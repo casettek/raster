@@ -4,6 +4,8 @@ use crate::BackendType;
 use anyhow::{anyhow, Context, Result};
 use raster_backend::{Backend, ExecutionMode, NativeBackend};
 use raster_backend_risc0::{is_gpu_available, Risc0Backend};
+use raster_compiler::ProjectAst;
+use raster_compiler::tile::TileExplorer;
 use raster_compiler::{
     extract_project_name, Builder, CfsBuilder, SequenceDiscovery, TileDiscovery,
 };
@@ -208,32 +210,22 @@ pub fn run(
 
 /// List command: show all registered tiles.
 pub fn list_tiles() -> Result<()> {
-    // Discover tiles from source files
-    let discovery = TileDiscovery::new(project_path());
-    let tiles = discovery
-        .discover()
-        .map_err(|e| anyhow!("Failed to discover tiles: {}", e))?;
+    let project_ast = ProjectAst::new(&project_path())?;
+    let tile_explorer = TileExplorer::new(&project_ast);
 
-    println!("Discovered tiles: {}", tiles.len());
-    println!();
 
-    if tiles.is_empty() {
-        println!("No tiles found. Make sure to use the #[tile] macro.");
-        return Ok(());
-    }
-
-    for tile in tiles {
-        println!("  {} (id: {})", tile.metadata.name, tile.metadata.id.0);
-        if let Some(desc) = &tile.metadata.description {
-            println!("    Description: {}", desc);
+    for tile in tile_explorer.tiles {
+        println!("  {}", tile.function.signature);
+        if let Some(description) = tile.description {
+            println!("    Description: {}", description);
         }
-        if let Some(cycles) = tile.metadata.estimated_cycles {
+        if let Some(cycles) = tile.estimated_cycles {
             println!("    Estimated cycles: {}", cycles);
         }
-        if let Some(memory) = tile.metadata.max_memory {
+        if let Some(memory) = tile.max_memory {
             println!("    Max memory: {} bytes", memory);
         }
-        println!("    Source: {}:{}", tile.source_file, tile.line_number);
+        println!("    Source: {}", tile.function.path.display());
         println!();
     }
 
@@ -403,16 +395,6 @@ pub fn preview(sequence_id: &str, input: Option<&str>, use_gpu: bool) -> Result<
     // Execute each tile in sequence using TileRunner
     for (idx, tile_id) in tile_ids.iter().enumerate() {
         // Check if compilation is needed before building
-        let needs_compile = !builder.is_tile_cached(tile_id);
-
-        if needs_compile {
-            println!(
-                "[{}/{}] Compiling tile '{}'...",
-                idx + 1,
-                tile_ids.len(),
-                tile_id
-            );
-        }
 
         // Build tile and get a runner (uses cache if available)
         let runner = builder

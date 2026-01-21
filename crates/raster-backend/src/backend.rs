@@ -70,7 +70,7 @@ pub struct TileExecDescriptor {
 /// This trait provides a common interface for executables across different backends.
 /// Backends define their own concrete types (e.g., NativeExecutable, Risc0Executable)
 /// that implement this trait.
-pub trait Executable: Send + Sync + Any {
+pub trait CompilationArtifact: Send + Sync + Any {
     /// Get the tile ID this executable is for.
     fn tile_id(&self) -> &str;
 
@@ -101,7 +101,7 @@ pub trait ArtifactStore: Send + Sync {
     /// The artifact directory path where artifacts were written.
     fn save(
         &self,
-        executable: &dyn Executable,
+        executable: &dyn CompilationArtifact,
         output_dir: &Path,
         source_hash: Option<&str>,
     ) -> Result<PathBuf>;
@@ -120,7 +120,7 @@ pub trait ArtifactStore: Send + Sync {
         tile_id: &str,
         output_dir: &Path,
         source_hash: Option<&str>,
-    ) -> Option<Box<dyn Executable>>;
+    ) -> Option<Box<dyn CompilationArtifact>>;
 
     /// Check if recompilation is needed.
     /// 
@@ -229,11 +229,11 @@ pub trait Backend: Send + Sync {
     ///
     /// # Returns
     /// An opaque executable that can be passed to execute_tile.
-    fn prepare_tile_executable(
+    fn compile_tile(
         &self,
         metadata: &TileMetadata,
         source_path: &str,
-    ) -> Result<Box<dyn Executable>>;
+    ) -> Result<Box<dyn CompilationArtifact>>;
 
     /// Execute a tile with the given input.
     ///
@@ -246,7 +246,7 @@ pub trait Backend: Send + Sync {
     /// Execution result including output, cycle count, and optional proof.
     fn execute_tile(
         &self,
-        executable: &dyn Executable,
+        compilation_artifact: &dyn CompilationArtifact,
         input: &[u8],
         mode: ExecutionMode,
     ) -> Result<TileExecutionResult>;
@@ -269,5 +269,5 @@ pub trait Backend: Send + Sync {
     ///
     /// # Returns
     /// True if the proof is valid, false otherwise.
-    fn verify_receipt(&self, executable: &dyn Executable, receipt: &[u8]) -> Result<bool>;
+    fn verify_receipt(&self, executable: &dyn CompilationArtifact, receipt: &[u8]) -> Result<bool>;
 }
