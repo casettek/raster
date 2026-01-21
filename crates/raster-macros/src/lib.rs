@@ -88,6 +88,7 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let fn_name = &input_fn.sig.ident;
     let fn_name_str = fn_name.to_string();
+
     let wrapper_name = format_ident!("__raster_tile_entry_{}", fn_name);
     let registration_name = format_ident!("__RASTER_TILE_REGISTRATION_{}", fn_name.to_string().to_uppercase());
 

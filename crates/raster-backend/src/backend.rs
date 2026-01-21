@@ -225,14 +225,12 @@ pub trait Backend: Send + Sync {
     ///
     /// # Arguments
     /// * `metadata` - Metadata about the tile being compiled
-    /// * `source_path` - Path to the source file containing the tile
     ///
     /// # Returns
     /// An opaque executable that can be passed to execute_tile.
     fn compile_tile(
         &self,
         metadata: &TileMetadata,
-        source_path: &str,
     ) -> Result<Box<dyn CompilationArtifact>>;
 
     /// Execute a tile with the given input.

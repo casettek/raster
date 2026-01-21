@@ -48,7 +48,9 @@ use serde::de::DeserializeOwned;
 ///
 /// On success, it prints: `RASTER_OUTPUT:<base64_output>`
 /// On error, it prints an error message and exits with code 1.
+#[cfg(feature = "std")]
 pub fn try_execute_tile_from_args() -> bool {
+    std::println!("try_execute_tile_from_args");
     let args: std::vec::Vec<std::string::String> = std::env::args().collect();
 
     // Look for --raster-exec argument

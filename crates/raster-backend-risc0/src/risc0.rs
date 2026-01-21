@@ -43,7 +43,7 @@ pub fn is_gpu_available() -> bool {
 
 /// RISC0 executable - ELF binary and method ID.
 #[derive(Debug, Clone)]
-pub struct Risc0Executable {
+pub struct Risc0CompilationArtifact {
     /// The compiled guest ELF binary.
     pub elf: Vec<u8>,
     /// The method ID (image ID) for the compiled tile.
@@ -54,7 +54,7 @@ pub struct Risc0Executable {
     pub artifact_dir: Option<PathBuf>,
 }
 
-impl CompilationArtifact for Risc0Executable {
+impl CompilationArtifact for Risc0CompilationArtifact {
     fn tile_id(&self) -> &str {
         &self.tile_id
     }
@@ -106,7 +106,7 @@ impl ArtifactStore for Risc0ArtifactStore {
     ) -> Result<PathBuf> {
         let risc0 = executable
             .as_any()
-            .downcast_ref::<Risc0Executable>()
+            .downcast_ref::<Risc0CompilationArtifact>()
             .ok_or_else(|| Error::Other("Invalid executable type for Risc0ArtifactStore".into()))?;
 
         let artifact_dir = output_dir
@@ -155,7 +155,7 @@ impl ArtifactStore for Risc0ArtifactStore {
         let elf = fs::read(artifact_dir.join("guest.elf")).ok()?;
         let method_id = hex::decode(&manifest.method_id).ok()?;
 
-        Some(Box::new(Risc0Executable {
+        Some(Box::new(Risc0CompilationArtifact {
             elf,
             method_id,
             tile_id: tile_id.to_string(),
@@ -241,7 +241,6 @@ impl Backend for Risc0Backend {
     fn compile_tile(
         &self,
         metadata: &TileMetadata,
-        _source_path: &str,
     ) -> Result<Box<dyn CompilationArtifact>> {
         let tile_id = &metadata.id.0;
         let builder = self.guest_builder();
@@ -272,7 +271,7 @@ impl Backend for Risc0Backend {
             .write_artifacts(tile_id, &elf, method_id.as_bytes())
             .map_err(|e| Error::Other(format!("Failed to write artifacts: {}", e)))?;
 
-        Ok(Box::new(Risc0Executable {
+        Ok(Box::new(Risc0CompilationArtifact {
             elf,
             method_id: method_id.as_bytes().to_vec(),
             tile_id: tile_id.to_string(),
@@ -282,14 +281,14 @@ impl Backend for Risc0Backend {
 
     fn execute_tile(
         &self,
-        executable: &dyn CompilationArtifact,
+        compilation_artifact: &dyn CompilationArtifact,
         input: &[u8],
         mode: ExecutionMode,
     ) -> Result<TileExecutionResult> {
         // Downcast to Risc0Executable
-        let risc0 = executable
+        let risc0 = compilation_artifact
             .as_any()
-            .downcast_ref::<Risc0Executable>()
+            .downcast_ref::<Risc0CompilationArtifact>()
             .ok_or_else(|| Error::Other("Expected Risc0Executable".into()))?;
 
         // Build the executor environment with the input
@@ -378,7 +377,7 @@ impl Backend for Risc0Backend {
         // Downcast to Risc0Executable
         let risc0 = executable
             .as_any()
-            .downcast_ref::<Risc0Executable>()
+            .downcast_ref::<Risc0CompilationArtifact>()
             .ok_or_else(|| Error::Other("Expected Risc0Executable".into()))?;
 
         let receipt: risc0_zkvm::Receipt = bincode::deserialize(receipt_bytes)

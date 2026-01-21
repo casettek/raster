@@ -1,10 +1,12 @@
 //! Command implementations for the Raster CLI.
+mod tile;
 
 use crate::BackendType;
 use anyhow::{anyhow, Context, Result};
 use raster_backend::{Backend, ExecutionMode, NativeBackend};
 use raster_backend_risc0::{is_gpu_available, Risc0Backend};
 use raster_compiler::ProjectAst;
+use raster_compiler::sequence::SequenceExplorer;
 use raster_compiler::tile::TileExplorer;
 use raster_compiler::{
     extract_project_name, Builder, CfsBuilder, SequenceDiscovery, TileDiscovery,
@@ -131,6 +133,12 @@ pub fn run(
         ExecutionMode::Prove { verify: false } => "prove",
     };
 
+    let project_ast = ProjectAst::new(&project_path()).unwrap();
+    let tile_explorer = TileExplorer::new(&project_ast);
+
+    let tile = tile_explorer.get(tile_id).unwrap();
+    tile::validate_tile_input(tile, input)?;
+
     // Check GPU availability and warn if requested but not available
     let gpu_status = if use_gpu {
         if is_gpu_available() {
@@ -171,16 +179,23 @@ pub fn run(
     let builder = Builder::new(output_dir())
         .with_backend(create_backend(backend_type, use_gpu)?)
         .with_project_path(project_path());
+    
+   
+
+    println!("\nproject_ast: {:?}", project_ast);
 
     // Build tile and get a runner (uses cache if source unchanged)
     println!("Building tile '{}'...", tile_id);
     let tile_runner= builder.build_tile_runner(tile_id)?;
 
+
     // Execute using TileRunner (abstracts backend-specific details)
     println!("Executing tile with {} backend...", tile_runner.backend_name());
     let result = tile_runner.run(&input_bytes, mode)?;
 
+    let output_display = tile::decode_tile_output(tile, &result.output);
     println!();
+    println!("  Output: {}", output_display);
     println!("Execution complete!");
     if let Some(cycles) = result.cycles {
         println!("  Compute Cycles: {}", cycles);

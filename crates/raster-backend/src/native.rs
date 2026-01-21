@@ -18,14 +18,14 @@ use std::process::Command;
 
 /// Native executable - just a path to the compiled binary.
 #[derive(Debug, Clone)]
-pub struct NativeExecutable {
+pub struct NativeCompilationArtifact {
     /// Path to the compiled binary.
     pub binary_path: PathBuf,
     /// The tile ID this executable is for.
     pub tile_id: String,
 }
 
-impl CompilationArtifact for NativeExecutable {
+impl CompilationArtifact for NativeCompilationArtifact {
     fn tile_id(&self) -> &str {
         &self.tile_id
     }
@@ -63,7 +63,7 @@ impl ArtifactStore for NativeArtifactStore {
     ) -> Result<PathBuf> {
         let native = executable
             .as_any()
-            .downcast_ref::<NativeExecutable>()
+            .downcast_ref::<NativeCompilationArtifact>()
             .ok_or_else(|| Error::Other("Invalid executable type for NativeArtifactStore".into()))?;
 
         let artifact_dir = output_dir
@@ -109,7 +109,7 @@ impl ArtifactStore for NativeArtifactStore {
             return None;
         }
 
-        Some(Box::new(NativeExecutable {
+        Some(Box::new(NativeCompilationArtifact {
             binary_path: manifest.binary_path,
             tile_id: tile_id.to_string(),
         }))
@@ -231,7 +231,6 @@ impl Backend for NativeBackend {
     fn compile_tile(
         &self,
         metadata: &TileMetadata,
-        _source_path: &str,
     ) -> Result<Box<dyn CompilationArtifact>> {
         // Native backend builds the user's project
         let project_path = self.project_path.as_ref().ok_or_else(|| {
@@ -273,7 +272,7 @@ impl Backend for NativeBackend {
         }
 
 
-        Ok(Box::new(NativeExecutable {
+        Ok(Box::new(NativeCompilationArtifact {
             binary_path,
             tile_id: metadata.id.0.clone(),
         }))
@@ -288,7 +287,7 @@ impl Backend for NativeBackend {
         // Downcast to NativeExecutable
         let native = compilation_artifact 
             .as_any()
-            .downcast_ref::<NativeExecutable>()
+            .downcast_ref::<NativeCompilationArtifact>()
             .ok_or_else(|| Error::Other("Expected NativeExecutable".into()))?;
 
         // Native backend cannot generate proofs
@@ -298,43 +297,18 @@ impl Backend for NativeBackend {
             ));
         }
 
-        let binary_path = &native.binary_path;
-
-        // #region agent log
-        {
-            use std::io::Write;
-            use std::os::unix::fs::PermissionsExt;
-            let file_metadata = fs::metadata(binary_path);
-            let (exists, is_file, permissions, is_executable) = match &file_metadata {
-                Ok(m) => {
-                    let mode = m.permissions().mode();
-                    (true, m.is_file(), format!("{:o}", mode), (mode & 0o111) != 0)
-                }
-                Err(e) => (false, false, format!("error: {}", e), false),
-            };
-            let log_entry = serde_json::json!({"location":"native.rs:execute_tile:pre_exec","message":"About to execute binary","data":{"binary_path":binary_path.display().to_string(),"tile_id":&native.tile_id,"exists":exists,"is_file":is_file,"permissions":permissions,"is_executable":is_executable},"timestamp":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis(),"sessionId":"debug-session","hypothesisId":"A,B,C,D"});
-            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/Users/kungfun/dev/xxx/raster/.cursor/debug.log") { let _ = writeln!(f, "{}", log_entry); }
-        }
-        // #endregion
-
         // Encode input as base64
         let input_b64 = base64_encode(input);
 
         // Run the binary with --raster-exec arguments
-        let output = Command::new(binary_path)
+        let output = Command::new(&native.binary_path)
             .args(["--raster-exec", &native.tile_id, "--input", &input_b64])
             .output()
             .map_err(|e| {
-                // #region agent log
-                {
-                    use std::io::Write;
-                    let log_entry = serde_json::json!({"location":"native.rs:execute_tile:exec_error","message":"Binary execution failed","data":{"binary_path":binary_path.display().to_string(),"error":format!("{}",e),"error_kind":format!("{:?}",e.kind())},"timestamp":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis(),"sessionId":"debug-session","hypothesisId":"A,E"});
-                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/Users/kungfun/dev/xxx/raster/.cursor/debug.log") { let _ = writeln!(f, "{}", log_entry); }
-                }
-                // #endregion
                 Error::Other(format!("Failed to execute binary: {}", e))
             })?;
 
+        println!("output: {:#?}", output);
         if !output.status.success() {
             return Err(Error::Other(format!(
                 "Tile execution failed: {}",

@@ -141,7 +141,7 @@ impl Builder {
             }
 
             // Compile tile (backend returns its own Executable type)
-            match self.backend.compile_tile(&tile.metadata, &tile.source_file) {
+            match self.backend.compile_tile(&tile.metadata) {
                 Ok(executable) => {
                     // Persist artifacts (backend handles its own format)
                     let artifact_dir = store.save(
@@ -214,7 +214,7 @@ impl Builder {
 
             let source_hash = compute_source_hash(&source_path);
 
-            match self.backend.compile_tile(&metadata, &source_path) {
+            match self.backend.compile_tile(&metadata) {
                 Ok(executable) => {
                     // Persist artifacts
                     let artifact_dir = store.save(
@@ -263,7 +263,7 @@ impl Builder {
 
             let source_hash = compute_source_hash(&source_path);
 
-            match self.backend.compile_tile(tile_meta, &source_path) {
+            match self.backend.compile_tile(tile_meta) {
                 Ok(executable) => {
                     // Persist artifacts
                     let artifact_dir = store.save(
@@ -349,8 +349,7 @@ impl Builder {
             // Compile the tile
             let executable = self
                 .backend
-                .compile_tile(&tile.metadata, &tile.source_file)?;
-            println!("executable compiled");
+                .compile_tile(&tile.metadata)?;
 
             // Persist artifacts
             let artifact_dir = store.save(
@@ -376,7 +375,7 @@ impl Builder {
 
         let source_hash = compute_source_hash(&source_path);
 
-        let executable = self.backend.compile_tile(&metadata, &source_path)?;
+        let executable = self.backend.compile_tile(&metadata)?;
         let artifact_dir = store.save(
             executable.as_ref(),
             &self.output_dir,
