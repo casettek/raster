@@ -18,7 +18,7 @@ fn compute_source_hash(path: &str) -> Option<String> {
     let mut file = fs::File::open(path).ok()?;
     let mut contents = Vec::new();
     file.read_to_end(&mut contents).ok()?;
-    
+
     // Simple hash: use the first 16 bytes of a basic checksum
     // This is fast and good enough for cache invalidation
     let mut hash: u64 = 0;
@@ -197,7 +197,8 @@ impl Builder {
             match self.backend.compile_tile(&tile.metadata, &tile.source_file) {
                 Ok(output) => {
                     // Write artifacts with source hash
-                    let artifact = self.write_tile_artifacts(tile_id, &output, Some(&tile.source_file))?;
+                    let artifact =
+                        self.write_tile_artifacts(tile_id, &output, Some(&tile.source_file))?;
                     artifacts.insert(tile_id.clone(), artifact);
                     compiled += 1;
                 }
@@ -250,7 +251,8 @@ impl Builder {
             match self.backend.compile_tile(&metadata, &source_path) {
                 Ok(output) => {
                     // Write artifacts
-                    let artifact = self.write_tile_artifacts(tile_id, &output, Some(&source_path))?;
+                    let artifact =
+                        self.write_tile_artifacts(tile_id, &output, Some(&source_path))?;
                     artifacts.insert(tile_id.to_string(), artifact);
                     compiled += 1;
                 }
@@ -284,12 +286,16 @@ impl Builder {
 
             match self.backend.compile_tile(tile_meta, &source_path) {
                 Ok(output) => {
-                    let artifact = self.write_tile_artifacts(&tile_meta.id.0, &output, Some(&source_path))?;
+                    let artifact =
+                        self.write_tile_artifacts(&tile_meta.id.0, &output, Some(&source_path))?;
                     artifacts.insert(tile_meta.id.0.clone(), artifact);
                     compiled += 1;
                 }
                 Err(e) => {
-                    eprintln!("Warning: Failed to compile tile '{}': {}", tile_meta.id.0, e);
+                    eprintln!(
+                        "Warning: Failed to compile tile '{}': {}",
+                        tile_meta.id.0, e
+                    );
                 }
             }
         }
@@ -332,21 +338,26 @@ impl Builder {
             // Check cache first
             if !self.needs_compilation(tile_id, &tile.source_file) {
                 if let Some(cached) = self.load_cached_compilation(tile_id) {
-                    return Ok((TileArtifact {
-                        tile_id: tile_id.to_string(),
-                        elf_path: cached.artifact_dir.as_ref().map(|d| d.join("guest.elf")),
-                        method_id: hex::encode(&cached.method_id),
-                        artifact_dir: cached.artifact_dir.unwrap_or_else(|| {
-                            self.output_dir
-                                .join("tiles")
-                                .join(tile_id)
-                                .join(self.backend.name())
-                        }),
-                    }, true));
+                    return Ok((
+                        TileArtifact {
+                            tile_id: tile_id.to_string(),
+                            elf_path: cached.artifact_dir.as_ref().map(|d| d.join("guest.elf")),
+                            method_id: hex::encode(&cached.method_id),
+                            artifact_dir: cached.artifact_dir.unwrap_or_else(|| {
+                                self.output_dir
+                                    .join("tiles")
+                                    .join(tile_id)
+                                    .join(self.backend.name())
+                            }),
+                        },
+                        true,
+                    ));
                 }
             }
 
-            let output = self.backend.compile_tile(&tile.metadata, &tile.source_file)?;
+            let output = self
+                .backend
+                .compile_tile(&tile.metadata, &tile.source_file)?;
             let artifact = self.write_tile_artifacts(tile_id, &output, Some(&tile.source_file))?;
             return Ok((artifact, false));
         }
@@ -378,9 +389,7 @@ impl Builder {
         let artifact_dir = self.output_dir.join("tiles").join(tile_id);
         let backend_dir = artifact_dir.join(self.backend.name());
 
-        fs::create_dir_all(&backend_dir).map_err(|e| {
-            Error::Io(e)
-        })?;
+        fs::create_dir_all(&backend_dir).map_err(|e| Error::Io(e))?;
 
         // Write ELF if non-empty
         let elf_path = if !output.elf.is_empty() {

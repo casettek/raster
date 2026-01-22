@@ -95,11 +95,9 @@ impl TileDiscovery {
                 let mut fn_line_idx = i + 1;
                 while fn_line_idx < lines.len() {
                     let fn_line = lines[fn_line_idx].trim();
-                    
+
                     // Skip empty lines, comments, and other attributes
-                    if fn_line.is_empty() 
-                        || fn_line.starts_with("//") 
-                        || fn_line.starts_with("#[") 
+                    if fn_line.is_empty() || fn_line.starts_with("//") || fn_line.starts_with("#[")
                     {
                         fn_line_idx += 1;
                         continue;
@@ -109,7 +107,10 @@ impl TileDiscovery {
                     if fn_line.starts_with("fn ") || fn_line.starts_with("pub fn ") {
                         if let Some(fn_name) = self.extract_fn_name(fn_line) {
                             let (input_count, output_count) = self.extract_fn_arity(fn_line);
-                            let tile_type = attrs.tile_type.clone().unwrap_or_else(|| "iter".to_string());
+                            let tile_type = attrs
+                                .tile_type
+                                .clone()
+                                .unwrap_or_else(|| "iter".to_string());
                             tiles.push(DiscoveredTile {
                                 metadata: TileMetadata {
                                     id: TileId(fn_name.clone()),
@@ -146,13 +147,13 @@ impl TileDiscovery {
             if let Some(end) = line.rfind(')') {
                 let content = &line[start + 1..end];
                 let mut first = true;
-                
+
                 for part in content.split(',') {
                     let part = part.trim();
                     if part.is_empty() {
                         continue;
                     }
-                    
+
                     if first {
                         // First argument is the tile type
                         first = false;
@@ -167,12 +168,12 @@ impl TileDiscovery {
                         }
                         continue;
                     }
-                    
+
                     if let Some((key, value)) = part.split_once('=') {
                         // Key=value pair
                         let key = key.trim();
                         let value = value.trim().trim_matches('"');
-                        
+
                         match key {
                             "estimated_cycles" => {
                                 attrs.estimated_cycles = value.parse().ok();
@@ -231,12 +232,12 @@ impl TileDiscovery {
         let Some(start) = line.find('(') else {
             return 0;
         };
-        
+
         // Find matching closing paren, handling nested parens
         let after_open = &line[start + 1..];
         let mut depth = 1;
         let mut end_pos = after_open.len();
-        
+
         for (i, c) in after_open.chars().enumerate() {
             match c {
                 '(' => depth += 1,
@@ -250,20 +251,20 @@ impl TileDiscovery {
                 _ => {}
             }
         }
-        
+
         let args_str = &after_open[..end_pos];
-        
+
         // Empty args
         if args_str.trim().is_empty() {
             return 0;
         }
-        
+
         // Count arguments by counting commas at depth 0, plus 1
         // Handle nested generics like Vec<(A, B)>
         let mut count = 1;
         let mut angle_depth: usize = 0;
         let mut paren_depth: usize = 0;
-        
+
         for c in args_str.chars() {
             match c {
                 '<' => angle_depth += 1,
@@ -274,7 +275,7 @@ impl TileDiscovery {
                 _ => {}
             }
         }
-        
+
         count
     }
 
@@ -286,27 +287,27 @@ impl TileDiscovery {
             // No return type means unit ()
             return 0;
         };
-        
+
         let after_arrow = &line[arrow_pos + 2..];
-        
+
         // Find the return type (ends at { or where or end of line)
         let end_pos = after_arrow
             .find(|c: char| c == '{' || c == '\n')
             .unwrap_or(after_arrow.len());
-        
+
         let return_type = after_arrow[..end_pos].trim();
-        
+
         // Check for unit type
         if return_type == "()" {
             return 0;
         }
-        
+
         // Check for tuple - starts with ( and contains commas at depth 0
         if return_type.starts_with('(') {
             // Find matching )
             let mut depth = 0;
             let mut comma_count = 0;
-            
+
             for c in return_type.chars() {
                 match c {
                     '(' => depth += 1,
@@ -315,13 +316,13 @@ impl TileDiscovery {
                     _ => {}
                 }
             }
-            
+
             // Tuple with N elements has N-1 commas
             if comma_count > 0 {
                 return comma_count + 1;
             }
         }
-        
+
         // Single value or non-tuple type
         1
     }
@@ -442,9 +443,7 @@ impl SequenceDiscovery {
                     let fn_line = lines[fn_line_idx].trim();
 
                     // Skip empty lines, comments, and other attributes
-                    if fn_line.is_empty()
-                        || fn_line.starts_with("//")
-                        || fn_line.starts_with("#[")
+                    if fn_line.is_empty() || fn_line.starts_with("//") || fn_line.starts_with("#[")
                     {
                         fn_line_idx += 1;
                         continue;
@@ -456,7 +455,7 @@ impl SequenceDiscovery {
                             // Extract parameter names and count
                             let param_names = self.extract_param_names(fn_line);
                             let input_count = param_names.len();
-                            
+
                             // Parse the function body to extract tile calls with bindings
                             let body_start = fn_line_idx;
                             let calls = self.extract_sequence_calls(&lines, body_start);
@@ -542,9 +541,9 @@ impl SequenceDiscovery {
 
             if in_body {
                 let trimmed = line.trim();
-                
+
                 // Skip comments and macros
-                if trimmed.starts_with("//") 
+                if trimmed.starts_with("//")
                     || trimmed.starts_with("println!")
                     || trimmed.starts_with("print!")
                     || trimmed.starts_with("format!")
@@ -578,12 +577,12 @@ impl SequenceDiscovery {
     fn parse_let_statement(&self, line: &str) -> Option<SequenceCall> {
         // Remove "let " prefix
         let after_let = line.strip_prefix("let ")?.trim();
-        
+
         // Find the = sign
         let eq_pos = after_let.find('=')?;
         let binding = after_let[..eq_pos].trim().to_string();
         let rhs = after_let[eq_pos + 1..].trim();
-        
+
         // Parse the function call from the RHS
         self.parse_call_expr(rhs, Some(binding))
     }
@@ -596,28 +595,28 @@ impl SequenceDiscovery {
     /// Parse a function call expression and extract callee and arguments.
     fn parse_call_expr(&self, expr: &str, result_binding: Option<String>) -> Option<SequenceCall> {
         let trimmed = expr.trim().trim_end_matches(';');
-        
+
         // Find the function name (identifier before first '(')
         let paren_pos = trimmed.find('(')?;
         let callee = trimmed[..paren_pos].trim();
-        
+
         // Skip if callee contains path separators or is a method call
         if callee.contains("::") || callee.contains('.') || callee.is_empty() {
             return None;
         }
-        
+
         // Check for ! suffix indicating recursive execution (e.g., count_to!(0, 5))
         let (callee, is_recursive) = if callee.ends_with('!') {
             (&callee[..callee.len() - 1], true)
         } else {
             (callee, false)
         };
-        
+
         // Extract arguments from between ( and )
         let args_start = paren_pos + 1;
         let mut depth = 1;
         let mut args_end = trimmed.len();
-        
+
         for (i, c) in trimmed[args_start..].chars().enumerate() {
             match c {
                 '(' => depth += 1,
@@ -631,10 +630,10 @@ impl SequenceDiscovery {
                 _ => {}
             }
         }
-        
+
         let args_str = &trimmed[args_start..args_end];
         let arguments = self.parse_arguments(args_str);
-        
+
         Some(SequenceCall {
             callee: callee.to_string(),
             result_binding,
@@ -648,12 +647,12 @@ impl SequenceDiscovery {
         if args_str.trim().is_empty() {
             return Vec::new();
         }
-        
+
         let mut args = Vec::new();
         let mut current_arg = String::new();
         let mut paren_depth: usize = 0;
         let mut angle_depth: usize = 0;
-        
+
         for c in args_str.chars() {
             match c {
                 '(' => {
@@ -679,13 +678,13 @@ impl SequenceDiscovery {
                 _ => current_arg.push(c),
             }
         }
-        
+
         // Don't forget the last argument
         let last = current_arg.trim();
         if !last.is_empty() {
             args.push(last.to_string());
         }
-        
+
         args
     }
 
@@ -693,11 +692,29 @@ impl SequenceDiscovery {
     fn is_excluded(&self, name: &str) -> bool {
         matches!(
             name,
-            "println" | "print" | "eprintln" | "eprint" | "dbg" |
-            "format" | "panic" | "assert" | "assert_eq" | "assert_ne" |
-            "Some" | "None" | "Ok" | "Err" |
-            "Box" | "Vec" | "String" | "to_string" | "to_owned" |
-            "clone" | "into" | "from" | "default"
+            "println"
+                | "print"
+                | "eprintln"
+                | "eprint"
+                | "dbg"
+                | "format"
+                | "panic"
+                | "assert"
+                | "assert_eq"
+                | "assert_ne"
+                | "Some"
+                | "None"
+                | "Ok"
+                | "Err"
+                | "Box"
+                | "Vec"
+                | "String"
+                | "to_string"
+                | "to_owned"
+                | "clone"
+                | "into"
+                | "from"
+                | "default"
         )
     }
 
@@ -707,11 +724,11 @@ impl SequenceDiscovery {
         let Some(start) = line.find('(') else {
             return Vec::new();
         };
-        
+
         let after_open = &line[start + 1..];
         let mut depth = 1;
         let mut end_pos = after_open.len();
-        
+
         for (i, c) in after_open.chars().enumerate() {
             match c {
                 '(' => depth += 1,
@@ -725,17 +742,17 @@ impl SequenceDiscovery {
                 _ => {}
             }
         }
-        
+
         let args_str = &after_open[..end_pos];
         if args_str.trim().is_empty() {
             return Vec::new();
         }
-        
+
         // Parse each parameter, extracting just the name (before the colon)
         let mut names = Vec::new();
         let mut current = String::new();
         let mut angle_depth: usize = 0;
-        
+
         for c in args_str.chars() {
             match c {
                 '<' => {
@@ -755,12 +772,12 @@ impl SequenceDiscovery {
                 _ => current.push(c),
             }
         }
-        
+
         // Last parameter
         if let Some(name) = self.extract_param_name(&current) {
             names.push(name);
         }
-        
+
         names
     }
 
@@ -770,14 +787,14 @@ impl SequenceDiscovery {
         if param.is_empty() {
             return None;
         }
-        
+
         // Find the colon separating name from type
         let colon_pos = param.find(':')?;
         let name = param[..colon_pos].trim();
-        
+
         // Handle patterns like "mut name"
         let name = name.strip_prefix("mut ").unwrap_or(name).trim();
-        
+
         if name.is_empty() {
             None
         } else {
@@ -822,7 +839,7 @@ mod tests {
     #[test]
     fn test_extract_fn_name() {
         let discovery = TileDiscovery::new(".");
-        
+
         assert_eq!(
             discovery.extract_fn_name("fn greet(name: String) -> String {"),
             Some("greet".to_string())
@@ -840,21 +857,20 @@ mod tests {
     #[test]
     fn test_parse_tile_attrs() {
         let discovery = TileDiscovery::new(".");
-        
+
         // Standard iter type
         let attrs = discovery.parse_tile_attrs("#[tile(iter)]");
         assert_eq!(attrs.tile_type, Some("iter".to_string()));
         assert!(attrs.description.is_none());
         assert!(attrs.estimated_cycles.is_none());
-        
+
         // With additional attributes
         let attrs = discovery.parse_tile_attrs("#[tile(iter, description = \"Test tile\")]");
         assert_eq!(attrs.tile_type, Some("iter".to_string()));
         assert_eq!(attrs.description, Some("Test tile".to_string()));
-        
-        let attrs = discovery.parse_tile_attrs(
-            "#[tile(iter, estimated_cycles = 1000, description = \"Complex\")]"
-        );
+
+        let attrs = discovery
+            .parse_tile_attrs("#[tile(iter, estimated_cycles = 1000, description = \"Complex\")]");
         assert_eq!(attrs.tile_type, Some("iter".to_string()));
         assert_eq!(attrs.estimated_cycles, Some(1000));
         assert_eq!(attrs.description, Some("Complex".to_string()));
@@ -863,20 +879,20 @@ mod tests {
     #[test]
     fn test_parse_tile_type() {
         let discovery = TileDiscovery::new(".");
-        
+
         // Iter type
         let attrs = discovery.parse_tile_attrs("#[tile(iter)]");
         assert_eq!(attrs.tile_type, Some("iter".to_string()));
-        
+
         // Recur type
         let attrs = discovery.parse_tile_attrs("#[tile(recur)]");
         assert_eq!(attrs.tile_type, Some("recur".to_string()));
-        
+
         // Recur with other attrs
         let attrs = discovery.parse_tile_attrs("#[tile(recur, description = \"Recursive tile\")]");
         assert_eq!(attrs.tile_type, Some("recur".to_string()));
         assert_eq!(attrs.description, Some("Recursive tile".to_string()));
-        
+
         // No parens - type is None (will default to "iter" at discovery time)
         let attrs = discovery.parse_tile_attrs("#[tile]");
         assert!(attrs.tile_type.is_none());
@@ -885,29 +901,41 @@ mod tests {
     #[test]
     fn test_count_fn_args() {
         let discovery = TileDiscovery::new(".");
-        
+
         assert_eq!(discovery.count_fn_args("fn foo() -> u64 {"), 0);
-        assert_eq!(discovery.count_fn_args("fn greet(name: String) -> String {"), 1);
-        assert_eq!(discovery.count_fn_args("fn add(a: u64, b: u64) -> u64 {"), 2);
-        assert_eq!(discovery.count_fn_args("fn complex(a: Vec<(u64, u64)>, b: String) -> u64 {"), 2);
+        assert_eq!(
+            discovery.count_fn_args("fn greet(name: String) -> String {"),
+            1
+        );
+        assert_eq!(
+            discovery.count_fn_args("fn add(a: u64, b: u64) -> u64 {"),
+            2
+        );
+        assert_eq!(
+            discovery.count_fn_args("fn complex(a: Vec<(u64, u64)>, b: String) -> u64 {"),
+            2
+        );
     }
 
     #[test]
     fn test_count_fn_outputs() {
         let discovery = TileDiscovery::new(".");
-        
+
         assert_eq!(discovery.count_fn_outputs("fn foo() {"), 0);
         assert_eq!(discovery.count_fn_outputs("fn foo() -> () {"), 0);
         assert_eq!(discovery.count_fn_outputs("fn foo() -> u64 {"), 1);
         assert_eq!(discovery.count_fn_outputs("fn foo() -> String {"), 1);
         assert_eq!(discovery.count_fn_outputs("fn foo() -> (u64, String) {"), 2);
-        assert_eq!(discovery.count_fn_outputs("fn foo() -> (u64, String, bool) {"), 3);
+        assert_eq!(
+            discovery.count_fn_outputs("fn foo() -> (u64, String, bool) {"),
+            3
+        );
     }
 
     #[test]
     fn test_extract_param_names() {
         let discovery = SequenceDiscovery::new(".");
-        
+
         assert_eq!(
             discovery.extract_param_names("fn foo() {"),
             Vec::<String>::new()
@@ -925,14 +953,18 @@ mod tests {
     #[test]
     fn test_parse_let_statement() {
         let discovery = SequenceDiscovery::new(".");
-        
-        let call = discovery.parse_let_statement("let greeting = greet(name);").unwrap();
+
+        let call = discovery
+            .parse_let_statement("let greeting = greet(name);")
+            .unwrap();
         assert_eq!(call.callee, "greet");
         assert_eq!(call.result_binding, Some("greeting".to_string()));
         assert_eq!(call.arguments, vec!["name".to_string()]);
         assert!(!call.is_recursive);
-        
-        let call = discovery.parse_let_statement("let result = add(a, b);").unwrap();
+
+        let call = discovery
+            .parse_let_statement("let result = add(a, b);")
+            .unwrap();
         assert_eq!(call.callee, "add");
         assert_eq!(call.arguments, vec!["a".to_string(), "b".to_string()]);
         assert!(!call.is_recursive);
@@ -941,8 +973,10 @@ mod tests {
     #[test]
     fn test_parse_expression_call() {
         let discovery = SequenceDiscovery::new(".");
-        
-        let call = discovery.parse_expression_call("exclaim(greeting)").unwrap();
+
+        let call = discovery
+            .parse_expression_call("exclaim(greeting)")
+            .unwrap();
         assert_eq!(call.callee, "exclaim");
         assert_eq!(call.result_binding, None);
         assert_eq!(call.arguments, vec!["greeting".to_string()]);
@@ -952,20 +986,26 @@ mod tests {
     #[test]
     fn test_parse_recursive_call() {
         let discovery = SequenceDiscovery::new(".");
-        
+
         // Test recursive let statement with ! suffix
-        let call = discovery.parse_let_statement("let result = count_to!(0, 5);").unwrap();
+        let call = discovery
+            .parse_let_statement("let result = count_to!(0, 5);")
+            .unwrap();
         assert_eq!(call.callee, "count_to");
         assert_eq!(call.result_binding, Some("result".to_string()));
         assert_eq!(call.arguments, vec!["0".to_string(), "5".to_string()]);
         assert!(call.is_recursive);
-        
+
         // Test recursive expression call with ! suffix
-        let call = discovery.parse_expression_call("count_to!(current, goal)").unwrap();
+        let call = discovery
+            .parse_expression_call("count_to!(current, goal)")
+            .unwrap();
         assert_eq!(call.callee, "count_to");
         assert_eq!(call.result_binding, None);
-        assert_eq!(call.arguments, vec!["current".to_string(), "goal".to_string()]);
+        assert_eq!(
+            call.arguments,
+            vec!["current".to_string(), "goal".to_string()]
+        );
         assert!(call.is_recursive);
     }
 }
-

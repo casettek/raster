@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
 use raster_core::tile::TileId;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Performance metrics extracted from execution traces.

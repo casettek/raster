@@ -54,7 +54,12 @@ pub struct TileDef {
 
 impl TileDef {
     /// Create a new tile definition with the specified type.
-    pub fn new(id: impl Into<String>, tile_type: impl Into<String>, inputs: usize, outputs: usize) -> Self {
+    pub fn new(
+        id: impl Into<String>,
+        tile_type: impl Into<String>,
+        inputs: usize,
+        outputs: usize,
+    ) -> Self {
         Self {
             id: id.into(),
             tile_type: tile_type.into(),

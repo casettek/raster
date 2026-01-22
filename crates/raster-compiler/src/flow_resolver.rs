@@ -138,7 +138,11 @@ mod tests {
         }
     }
 
-    fn make_sequence(id: &str, param_names: Vec<&str>, calls: Vec<SequenceCall>) -> DiscoveredSequence {
+    fn make_sequence(
+        id: &str,
+        param_names: Vec<&str>,
+        calls: Vec<SequenceCall>,
+    ) -> DiscoveredSequence {
         let input_count = param_names.len();
         DiscoveredSequence {
             id: id.to_string(),
@@ -154,10 +158,7 @@ mod tests {
 
     #[test]
     fn test_resolve_simple_sequence() {
-        let tiles = vec![
-            make_tile("greet", 1, 1),
-            make_tile("exclaim", 1, 1),
-        ];
+        let tiles = vec![make_tile("greet", 1, 1), make_tile("exclaim", 1, 1)];
         let sequences = vec![];
 
         let seq = make_sequence(
@@ -198,7 +199,10 @@ mod tests {
         assert_eq!(items[1].item_type, "tile");
         assert_eq!(items[1].input_sources.len(), 1);
         match &items[1].input_sources[0].source {
-            InputSource::ItemOutput { item_index, output_index } => {
+            InputSource::ItemOutput {
+                item_index,
+                output_index,
+            } => {
                 assert_eq!(*item_index, 0);
                 assert_eq!(*output_index, 0);
             }
@@ -206,4 +210,3 @@ mod tests {
         }
     }
 }
-

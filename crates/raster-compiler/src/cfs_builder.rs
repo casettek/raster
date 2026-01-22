@@ -37,7 +37,14 @@ impl CfsBuilder {
         // Build tile definitions
         let tiles: Vec<TileDef> = discovered_tiles
             .iter()
-            .map(|t| TileDef::new(&t.metadata.id.0, &t.tile_type, t.input_count, t.output_count))
+            .map(|t| {
+                TileDef::new(
+                    &t.metadata.id.0,
+                    &t.tile_type,
+                    t.input_count,
+                    t.output_count,
+                )
+            })
             .collect();
 
         // Build sequence definitions with resolved data flow

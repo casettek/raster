@@ -1,6 +1,6 @@
-use raster_core::{Result, schema::SequenceSchema, trace::Trace};
-use raster_backend::{Backend, NativeBackend};
 use crate::tracer::Tracer;
+use raster_backend::{Backend, NativeBackend};
+use raster_core::{schema::SequenceSchema, trace::Trace, Result};
 
 /// Executes tiles according to a sequence schema.
 pub struct Executor<T: Tracer> {

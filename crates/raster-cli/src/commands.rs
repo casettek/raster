@@ -4,7 +4,9 @@ use crate::BackendType;
 use anyhow::{anyhow, Context, Result};
 use raster_backend::{Backend, CompilationOutput, ExecutionMode, NativeBackend};
 use raster_backend_risc0::{is_gpu_available, Risc0Backend};
-use raster_compiler::{Builder, CfsBuilder, SequenceDiscovery, TileDiscovery, extract_project_name};
+use raster_compiler::{
+    extract_project_name, Builder, CfsBuilder, SequenceDiscovery, TileDiscovery,
+};
 use std::env;
 use std::fs;
 use std::path::PathBuf;
@@ -57,7 +59,10 @@ pub fn build(backend_type: BackendType, tile: Option<String>) -> Result<()> {
 
     println!("Discovered {} tile(s) from source:", discovered_tiles.len());
     for t in &discovered_tiles {
-        println!("  - {} ({}:{})", t.metadata.name, t.source_file, t.line_number);
+        println!(
+            "  - {} ({}:{})",
+            t.metadata.name, t.source_file, t.line_number
+        );
     }
     println!();
 
@@ -182,12 +187,12 @@ pub fn run(
         println!();
         println!("  2. Build and run your project binary:");
         println!("     cargo build");
-        println!(
-            "     ./target/debug/<your-project-name>"
-        );
+        println!("     ./target/debug/<your-project-name>");
         println!();
-        println!("The tile '{}' was found at {}:{}", 
-            tile_id, tile.source_file, tile.line_number);
+        println!(
+            "The tile '{}' was found at {}:{}",
+            tile_id, tile.source_file, tile.line_number
+        );
         return Ok(());
     }
 
@@ -202,11 +207,11 @@ pub fn run(
     // Build tile (uses cache if source unchanged)
     println!("Compiling tile...");
     let (artifact, was_cached) = builder.build_tile_with_cache_info(tile_id)?;
-    
+
     if was_cached {
         println!("Using cached build (source unchanged)");
     }
-    
+
     // Load the compilation output from artifacts
     let elf = if let Some(ref elf_path) = artifact.elf_path {
         fs::read(elf_path).unwrap_or_default()
@@ -214,7 +219,7 @@ pub fn run(
         Vec::new()
     };
     let method_id = hex::decode(&artifact.method_id).unwrap_or_default();
-    
+
     let compilation = CompilationOutput {
         elf,
         method_id,
@@ -234,7 +239,10 @@ pub fn run(
     if let Some(proof_cycles) = result.proof_cycles {
         if result.receipt.is_none() {
             // Only show this hint in estimate mode
-            println!("  Proof cycles: {} (padded for STARK proving)", proof_cycles);
+            println!(
+                "  Proof cycles: {} (padded for STARK proving)",
+                proof_cycles
+            );
         }
     }
     if result.receipt.is_some() {
@@ -267,10 +275,7 @@ pub fn list_tiles() -> Result<()> {
     }
 
     for tile in tiles {
-        println!(
-            "  {} (id: {})",
-            tile.metadata.name, tile.metadata.id.0
-        );
+        println!("  {} (id: {})", tile.metadata.name, tile.metadata.id.0);
         if let Some(desc) = &tile.metadata.description {
             println!("    Description: {}", desc);
         }
@@ -311,7 +316,8 @@ pub fn init(name: String) -> Result<()> {
     std::fs::create_dir_all(&src_dir)?;
 
     // Write Cargo.toml
-    let cargo_toml = format!(r#"[package]
+    let cargo_toml = format!(
+        r#"[package]
 name = "{name}"
 version = "0.1.0"
 edition = "2021"
@@ -319,7 +325,8 @@ edition = "2021"
 [dependencies]
 raster = {{ path = "../path/to/raster/crates/raster" }}
 serde = {{ version = "1.0", features = ["derive"] }}
-"#);
+"#
+    );
     std::fs::write(project_dir.join("Cargo.toml"), cargo_toml)?;
 
     // Write main.rs with example tile
@@ -409,7 +416,7 @@ pub fn preview(sequence_id: &str, input: Option<&str>, use_gpu: bool) -> Result<
 
     // Extract tile IDs from calls
     let tile_ids: Vec<String> = sequence.calls.iter().map(|c| c.callee.clone()).collect();
-    
+
     if tile_ids.is_empty() {
         println!("Sequence '{}' has no tiles.", sequence_id);
         return Ok(());
@@ -566,14 +573,14 @@ fn format_number(n: u64) -> String {
     let s = n.to_string();
     let mut result = String::new();
     let chars: Vec<char> = s.chars().collect();
-    
+
     for (i, c) in chars.iter().enumerate() {
         if i > 0 && (chars.len() - i) % 3 == 0 {
             result.push(',');
         }
         result.push(*c);
     }
-    
+
     result
 }
 
@@ -583,7 +590,7 @@ pub fn cfs(output: Option<String>) -> Result<()> {
     println!();
 
     let root = project_path();
-    
+
     // Extract project name from Cargo.toml
     let project_name = extract_project_name(&root)
         .map_err(|e| anyhow!("Failed to extract project name: {}", e))?;
@@ -595,8 +602,7 @@ pub fn cfs(output: Option<String>) -> Result<()> {
         .map_err(|e| anyhow!("Failed to build CFS: {}", e))?;
 
     // Serialize to JSON
-    let json = serde_json::to_string_pretty(&cfs)
-        .context("Failed to serialize CFS to JSON")?;
+    let json = serde_json::to_string_pretty(&cfs).context("Failed to serialize CFS to JSON")?;
 
     // Determine output path
     let output_path = match output {
@@ -612,14 +618,18 @@ pub fn cfs(output: Option<String>) -> Result<()> {
     // Write the file
     fs::write(&output_path, &json)?;
 
-    println!("Generated CFS with {} tiles and {} sequences", 
-        cfs.tiles.len(), 
+    println!(
+        "Generated CFS with {} tiles and {} sequences",
+        cfs.tiles.len(),
         cfs.sequences.len()
     );
     println!();
     println!("Tiles:");
     for tile in &cfs.tiles {
-        println!("  - {} (inputs: {}, outputs: {})", tile.id, tile.inputs, tile.outputs);
+        println!(
+            "  - {} (inputs: {}, outputs: {})",
+            tile.id, tile.inputs, tile.outputs
+        );
     }
     println!();
     println!("Sequences:");

@@ -9,4 +9,4 @@ pub mod executor;
 pub mod tracer;
 
 pub use executor::Executor;
-pub use tracer::{Tracer, FileTracer, NoOpTracer};
+pub use tracer::{FileTracer, NoOpTracer, Tracer};

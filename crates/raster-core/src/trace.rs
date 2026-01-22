@@ -1,9 +1,9 @@
 //! Trace types (requires std feature).
 
+use crate::tile::TileId;
+use serde::{Deserialize, Serialize};
 use std::string::String;
 use std::vec::Vec;
-use serde::{Deserialize, Serialize};
-use crate::tile::TileId;
 
 /// A complete execution trace.
 #[derive(Debug, Clone, Serialize, Deserialize)]

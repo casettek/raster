@@ -1,5 +1,5 @@
-use raster_core::{Result, trace::Trace};
 use crate::metrics::Metrics;
+use raster_core::{trace::Trace, Result};
 
 /// Analyzes execution traces to extract performance metrics.
 pub struct Analyzer {}

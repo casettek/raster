@@ -6,10 +6,12 @@
 
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
-use syn::{parse_macro_input, visit::Visit, Expr, ExprCall, ExprPath, FnArg, ItemFn, Pat, ReturnType, Type};
+use syn::{
+    parse_macro_input, visit::Visit, Expr, ExprCall, ExprPath, FnArg, ItemFn, Pat, ReturnType, Type,
+};
 
 /// Parses tile attributes from the macro invocation.
-/// 
+///
 /// The first argument must be the tile type: `iter` or `recur`.
 struct TileAttrs {
     /// Tile type (required: "iter" or "recur").
@@ -35,7 +37,7 @@ impl TileAttrs {
         // Parse comma-separated: first is tile type, rest are key=value pairs
         let attr_str = attr.to_string();
         let mut first = true;
-        
+
         for part in attr_str.split(',') {
             let part = part.trim();
             if part.is_empty() {
@@ -121,7 +123,10 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
     let fn_name = &input_fn.sig.ident;
     let fn_name_str = fn_name.to_string();
     let wrapper_name = format_ident!("__raster_tile_entry_{}", fn_name);
-    let registration_name = format_ident!("__RASTER_TILE_REGISTRATION_{}", fn_name.to_string().to_uppercase());
+    let registration_name = format_ident!(
+        "__RASTER_TILE_REGISTRATION_{}",
+        fn_name.to_string().to_uppercase()
+    );
 
     // Extract input types for deserialization
     let input_types: Vec<_> = input_fn
@@ -293,9 +298,7 @@ struct SequenceAttrs {
 
 impl SequenceAttrs {
     fn parse(attr: TokenStream) -> Self {
-        let mut attrs = SequenceAttrs {
-            description: None,
-        };
+        let mut attrs = SequenceAttrs { description: None };
 
         if attr.is_empty() {
             return attrs;
@@ -330,7 +333,9 @@ struct TileCallExtractor {
 
 impl TileCallExtractor {
     fn new() -> Self {
-        Self { tile_calls: Vec::new() }
+        Self {
+            tile_calls: Vec::new(),
+        }
     }
 }
 
@@ -394,7 +399,10 @@ pub fn sequence(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let fn_name = &input_fn.sig.ident;
     let fn_name_str = fn_name.to_string();
-    let registration_name = format_ident!("__RASTER_SEQUENCE_REGISTRATION_{}", fn_name.to_string().to_uppercase());
+    let registration_name = format_ident!(
+        "__RASTER_SEQUENCE_REGISTRATION_{}",
+        fn_name.to_string().to_uppercase()
+    );
 
     // Extract tile calls from the function body
     let mut extractor = TileCallExtractor::new();

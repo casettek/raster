@@ -1,4 +1,4 @@
-use raster_core::{Result, schema::SequenceSchema};
+use raster_core::{schema::SequenceSchema, Result};
 
 /// Generates sequence schemas from source code.
 pub struct SchemaGenerator {}

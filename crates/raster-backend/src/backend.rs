@@ -147,7 +147,8 @@ pub trait Backend: Send + Sync {
     ///
     /// # Returns
     /// Compilation output including the ELF binary and method ID.
-    fn compile_tile(&self, metadata: &TileMetadata, source_path: &str) -> Result<CompilationOutput>;
+    fn compile_tile(&self, metadata: &TileMetadata, source_path: &str)
+        -> Result<CompilationOutput>;
 
     /// Execute a tile with the given input.
     ///

@@ -42,7 +42,11 @@ impl Backend for NativeBackend {
         "native"
     }
 
-    fn compile_tile(&self, metadata: &TileMetadata, _source_path: &str) -> Result<CompilationOutput> {
+    fn compile_tile(
+        &self,
+        metadata: &TileMetadata,
+        _source_path: &str,
+    ) -> Result<CompilationOutput> {
         // Native backend doesn't actually compile to a separate binary.
         // The tile is already compiled into the host binary.
         // We return empty artifacts as a placeholder.

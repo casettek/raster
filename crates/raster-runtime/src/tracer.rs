@@ -1,4 +1,7 @@
-use raster_core::{Result, trace::{Trace, TraceEvent}};
+use raster_core::{
+    trace::{Trace, TraceEvent},
+    Result,
+};
 use std::path::PathBuf;
 
 /// Trait for capturing execution traces.

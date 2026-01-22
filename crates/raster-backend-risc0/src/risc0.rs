@@ -1,9 +1,7 @@
 //! RISC0 zkVM backend implementation.
 
 use crate::guest_builder::GuestBuilder;
-use raster_backend::{
-    Backend, CompilationOutput, ExecutionMode, ResourceEstimate, TileExecution,
-};
+use raster_backend::{Backend, CompilationOutput, ExecutionMode, ResourceEstimate, TileExecution};
 use raster_core::{tile::TileMetadata, Error, Result};
 use risc0_zkvm::{default_executor, ExecutorEnv, ProverOpts};
 use std::fs;
@@ -101,36 +99,41 @@ impl Backend for Risc0Backend {
         "risc0"
     }
 
-    fn compile_tile(&self, metadata: &TileMetadata, _source_path: &str) -> Result<CompilationOutput> {
+    fn compile_tile(
+        &self,
+        metadata: &TileMetadata,
+        _source_path: &str,
+    ) -> Result<CompilationOutput> {
         let tile_id = &metadata.id.0;
         let builder = self.guest_builder();
 
         // Create a temporary directory for building
-        let temp_dir = tempfile::tempdir().map_err(|e| {
-            Error::Other(format!("Failed to create temp directory: {}", e))
-        })?;
+        let temp_dir = tempfile::tempdir()
+            .map_err(|e| Error::Other(format!("Failed to create temp directory: {}", e)))?;
 
         let guest_dir = temp_dir.path().join(format!("guest-{}", tile_id));
-        fs::create_dir_all(&guest_dir).map_err(|e| {
-            Error::Other(format!("Failed to create guest directory: {}", e))
-        })?;
+        fs::create_dir_all(&guest_dir)
+            .map_err(|e| Error::Other(format!("Failed to create guest directory: {}", e)))?;
 
         // Build the guest
         let elf_path = builder.build_guest(tile_id, &guest_dir).map_err(|e| {
-            Error::Other(format!("Failed to build guest for tile '{}': {}", tile_id, e))
+            Error::Other(format!(
+                "Failed to build guest for tile '{}': {}",
+                tile_id, e
+            ))
         })?;
 
         // Read the ELF
-        let elf = fs::read(&elf_path).map_err(|e| {
-            Error::Other(format!("Failed to read ELF: {}", e))
-        })?;
+        let elf =
+            fs::read(&elf_path).map_err(|e| Error::Other(format!("Failed to read ELF: {}", e)))?;
 
         // Compute the image ID (method ID)
         let method_id = risc0_zkvm::compute_image_id(&elf)
             .map_err(|e| Error::Other(format!("Failed to compute image ID: {}", e)))?;
 
         // Write artifacts to output directory
-        let artifact_dir = builder.write_artifacts(tile_id, &elf, method_id.as_bytes())
+        let artifact_dir = builder
+            .write_artifacts(tile_id, &elf, method_id.as_bytes())
             .map_err(|e| Error::Other(format!("Failed to write artifacts: {}", e)))?;
 
         Ok(CompilationOutput {
@@ -198,10 +201,7 @@ impl Backend for Risc0Backend {
                     let image_id = risc0_zkvm::compute_image_id(&compilation.elf)
                         .map_err(|e| Error::Other(format!("Failed to compute image ID: {}", e)))?;
 
-                    receipt
-                        .verify(image_id)
-                        .map(|_| true)
-                        .unwrap_or(false)
+                    receipt.verify(image_id).map(|_| true).unwrap_or(false)
                 } else {
                     false
                 };
@@ -227,7 +227,11 @@ impl Backend for Risc0Backend {
         })
     }
 
-    fn verify_receipt(&self, compilation: &CompilationOutput, receipt_bytes: &[u8]) -> Result<bool> {
+    fn verify_receipt(
+        &self,
+        compilation: &CompilationOutput,
+        receipt_bytes: &[u8],
+    ) -> Result<bool> {
         let receipt: risc0_zkvm::Receipt = bincode::deserialize(receipt_bytes)
             .map_err(|e| Error::Other(format!("Failed to deserialize receipt: {}", e)))?;
 
