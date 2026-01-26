@@ -2,44 +2,17 @@
 
 use crate::guest_builder::GuestBuilder;
 use raster_backend::{
-    ArtifactStore, Backend, CompilationArtifact, ExecutionMode, ResourceEstimate, TileExecutionResult,
+    ArtifactStore, Backend, CompilationArtifact, ExecutionMode, ResourceEstimate,
+    TileExecutionResult,
 };
-use raster_core::{tile::TileMetadata, Error, Result};
 use risc0_zkvm::{default_executor, ExecutorEnv, ProverOpts};
 use serde::{Deserialize, Serialize};
 use std::any::Any;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
-/// Check if Metal GPU acceleration is available (compile-time + runtime).
-pub fn is_metal_available() -> bool {
-    #[cfg(all(feature = "metal", target_os = "macos"))]
-    {
-        // Metal feature is enabled and we're on macOS
-        true
-    }
-    #[cfg(not(all(feature = "metal", target_os = "macos")))]
-    {
-        false
-    }
-}
-
-/// Check if CUDA GPU acceleration is available (compile-time).
-pub fn is_cuda_available() -> bool {
-    #[cfg(feature = "cuda")]
-    {
-        true
-    }
-    #[cfg(not(feature = "cuda"))]
-    {
-        false
-    }
-}
-
-/// Check if any GPU acceleration is available.
-pub fn is_gpu_available() -> bool {
-    is_metal_available() || is_cuda_available()
-}
+use raster_core::{tile::TileMetadata, Error, Result};
 
 /// RISC0 executable - ELF binary and method ID.
 #[derive(Debug, Clone)]
@@ -55,12 +28,12 @@ pub struct Risc0CompilationArtifact {
 }
 
 impl CompilationArtifact for Risc0CompilationArtifact {
-    fn tile_id(&self) -> &str {
+    fn id(&self) -> &str {
         &self.tile_id
     }
 
-    fn artifact_dir(&self) -> Option<&Path> {
-        self.artifact_dir.as_deref()
+    fn path(&self) -> &Path {
+        self.artifact_dir.as_ref().unwrap()
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -109,10 +82,7 @@ impl ArtifactStore for Risc0ArtifactStore {
             .downcast_ref::<Risc0CompilationArtifact>()
             .ok_or_else(|| Error::Other("Invalid executable type for Risc0ArtifactStore".into()))?;
 
-        let artifact_dir = output_dir
-            .join("tiles")
-            .join(&risc0.tile_id)
-            .join("risc0");
+        let artifact_dir = output_dir.join("tiles").join(&risc0.tile_id).join("risc0");
 
         fs::create_dir_all(&artifact_dir).map_err(Error::Io)?;
 
@@ -120,7 +90,11 @@ impl ArtifactStore for Risc0ArtifactStore {
         fs::write(artifact_dir.join("guest.elf"), &risc0.elf).map_err(Error::Io)?;
 
         // Write method ID (hex encoded)
-        fs::write(artifact_dir.join("method_id"), hex::encode(&risc0.method_id)).map_err(Error::Io)?;
+        fs::write(
+            artifact_dir.join("method_id"),
+            hex::encode(&risc0.method_id),
+        )
+        .map_err(Error::Io)?;
 
         // Write manifest
         let manifest = Risc0Manifest {
@@ -179,8 +153,6 @@ pub struct Risc0Backend {
     output_dir: PathBuf,
     /// Path to the user's crate (for building guests).
     user_crate_path: Option<PathBuf>,
-    /// Whether to use GPU acceleration for proving.
-    use_gpu: bool,
     /// Artifact store for caching compiled artifacts.
     artifact_store: Risc0ArtifactStore,
 }
@@ -191,7 +163,6 @@ impl Risc0Backend {
         Self {
             output_dir,
             user_crate_path: None,
-            use_gpu: false,
             artifact_store: Risc0ArtifactStore::new(),
         }
     }
@@ -199,12 +170,6 @@ impl Risc0Backend {
     /// Set the path to the user's crate containing tiles.
     pub fn with_user_crate(mut self, path: PathBuf) -> Self {
         self.user_crate_path = Some(path);
-        self
-    }
-
-    /// Enable GPU acceleration for proving.
-    pub fn with_gpu(mut self, enabled: bool) -> Self {
-        self.use_gpu = enabled;
         self
     }
 
@@ -238,11 +203,17 @@ impl Backend for Risc0Backend {
         "risc0"
     }
 
-    fn compile_tile(
-        &self,
-        metadata: &TileMetadata,
-    ) -> Result<Box<dyn CompilationArtifact>> {
+    fn compile_tile(&self, metadata: &TileMetadata, content_hash: Option<&str>) -> Result<Box<dyn CompilationArtifact>> {
         let tile_id = &metadata.id.0;
+        
+
+        // TODO: move content hashing to the artifact store
+        // Check cache first - RISC0 builds are expensive, so caching is important
+        if let Some(cached) = self.artifact_store.load(tile_id, &self.output_dir, content_hash) {
+            return Ok(cached);
+        }
+
+        // Not cached, need to build
         let builder = self.guest_builder();
 
         // Create a temporary directory for building
@@ -254,9 +225,12 @@ impl Backend for Risc0Backend {
             .map_err(|e| Error::Other(format!("Failed to create guest directory: {}", e)))?;
 
         // Build the guest
-        let elf_path = builder
-            .build_guest(tile_id, &guest_dir)
-            .map_err(|e| Error::Other(format!("Failed to build guest for tile '{}': {}", tile_id, e)))?;
+        let elf_path = builder.build_guest(tile_id, &guest_dir).map_err(|e| {
+            Error::Other(format!(
+                "Failed to build guest for tile '{}': {}",
+                tile_id, e
+            ))
+        })?;
 
         // Read the ELF
         let elf =
@@ -266,15 +240,25 @@ impl Backend for Risc0Backend {
         let method_id = risc0_zkvm::compute_image_id(&elf)
             .map_err(|e| Error::Other(format!("Failed to compute image ID: {}", e)))?;
 
-        // Write artifacts to output directory
-        let artifact_dir = builder
-            .write_artifacts(tile_id, &elf, method_id.as_bytes())
-            .map_err(|e| Error::Other(format!("Failed to write artifacts: {}", e)))?;
-
-        Ok(Box::new(Risc0CompilationArtifact {
+        // Create the artifact
+        let artifact = Risc0CompilationArtifact {
             elf,
             method_id: method_id.as_bytes().to_vec(),
             tile_id: tile_id.to_string(),
+            artifact_dir: None, // Will be set after saving
+        };
+
+        // Save to cache for future builds
+        let artifact_dir = self.artifact_store.save(
+            &artifact,
+            &self.output_dir,
+            content_hash,
+        )?;
+
+        Ok(Box::new(Risc0CompilationArtifact {
+            elf: artifact.elf,
+            method_id: artifact.method_id,
+            tile_id: artifact.tile_id,
             artifact_dir: Some(artifact_dir),
         }))
     }
@@ -316,21 +300,10 @@ impl Backend for Risc0Backend {
                 Ok(TileExecutionResult::estimate(output, cycles))
             }
             ExecutionMode::Prove { verify } => {
-                // Execute with proving, optionally using GPU acceleration
-                let prove_info = if self.use_gpu && is_gpu_available() {
-                    // Use GPU-accelerated prover
-                    let opts = ProverOpts::default();
-                    let prover = risc0_zkvm::default_prover();
-                    prover
-                        .prove_with_opts(env, &risc0.elf, &opts)
-                        .map_err(|e| Error::Other(format!("GPU proving failed: {}", e)))?
-                } else {
-                    // Use default CPU prover
-                    let prover = risc0_zkvm::default_prover();
-                    prover
-                        .prove(env, &risc0.elf)
-                        .map_err(|e| Error::Other(format!("Proving failed: {}", e)))?
-                };
+                let prover = risc0_zkvm::default_prover();
+                let prove_info = prover
+                    .prove(env, &risc0.elf)
+                    .map_err(|e| Error::Other(format!("Proving failed: {}", e)))?;
 
                 let receipt = prove_info.receipt;
                 let output = receipt.journal.bytes.clone();
@@ -373,7 +346,11 @@ impl Backend for Risc0Backend {
         })
     }
 
-    fn verify_receipt(&self, executable: &dyn CompilationArtifact, receipt_bytes: &[u8]) -> Result<bool> {
+    fn verify_receipt(
+        &self,
+        executable: &dyn CompilationArtifact,
+        receipt_bytes: &[u8],
+    ) -> Result<bool> {
         // Downcast to Risc0Executable
         let risc0 = executable
             .as_any()

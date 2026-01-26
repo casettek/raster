@@ -2,8 +2,13 @@ use anyhow::Result;
 use cargo_toml::Manifest;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use syn::{parse_file, visit::Visit, Attribute, Expr, ExprCall, ExprLit, FnArg, Lit, Meta, Pat};
+use syn::{
+    parse_file,
+    visit::Visit,
+    Attribute, Expr, ExprCall, ExprLit, FnArg, Lit, Local, Meta, Pat,
+};
 use walkdir::WalkDir;
+
 
 #[derive(Debug, Clone)]
 pub struct ProjectAst {
@@ -12,27 +17,38 @@ pub struct ProjectAst {
     pub functions: Vec<FunctionAstItem>,
 }
 
+/// Captures detailed information about a function call within a function body.
+#[derive(Debug, Clone)]
+pub struct CallInfo {
+    /// The name of the function being called
+    pub callee: String,
+    /// The arguments passed to the function (as string representations)
+    pub arguments: Vec<String>,
+    /// The variable name this call result is bound to, if any (e.g., `let x = foo()` -> Some("x"))
+    pub result_binding: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct FunctionAstItem {
     pub name: String,
     pub path: PathBuf,
-    pub calls: Vec<String>,
+    /// Detailed information about each function call in this function's body
+    pub call_infos: Vec<CallInfo>,
     pub macros: Vec<MacroAstItem>,
-    pub inputs: Vec<Type>,
-    pub output: Option<Type>,
+    /// Parameter names of the function
+    pub input_names: Vec<String>,
+    /// Parameter types of the function
+    pub inputs: Vec<String>,
+    pub output: Option<String>,
     pub signature: String,
 }
-
-type Type = String;
 
 #[derive(Debug, Clone)]
 pub struct MacroAstItem {
     pub name: String,
     pub args: HashMap<String, String>,
 }
-
 // TODO: Project AST Explorer should contain function with full path resulution (like mod's)
-
 impl ProjectAst {
     pub fn new(project_root: &Path) -> Result<Self> {
         let cargo_toml_path = project_root.join("Cargo.toml");
@@ -90,19 +106,20 @@ impl ProjectAst {
                     .map(|attr| Self::parse_macro(attr))
                     .collect();
 
-                let inputs: Vec<Type> = func
+                let (input_names, inputs): (Vec<String>, Vec<String>) = func
                     .sig
                     .inputs
                     .iter()
                     .filter_map(|arg| {
                         if let FnArg::Typed(pat_type) = arg {
                             let ty = &pat_type.ty;
-                            Some(quote::quote!(#ty).to_string())
+                            let name = Self::extract_param_name(&pat_type.pat);
+                            Some((name, quote::quote!(#ty).to_string()))
                         } else {
                             None
                         }
                     })
-                    .collect();
+                    .unzip();
 
                 let output = if let syn::ReturnType::Type(_, ty) = &func.sig.output {
                     Some(quote::quote!(#ty).to_string())
@@ -115,12 +132,13 @@ impl ProjectAst {
 
                 let mut visitor = CallVisitor::new();
                 visitor.visit_item_fn(func);
-                let calls = visitor.get_calls();
+                let call_infos = visitor.get_call_infos();
                 let function_info = FunctionAstItem {
                     name,
                     path: path.clone(),
-                    calls,
+                    call_infos,
                     macros,
+                    input_names,
                     inputs,
                     output,
                     signature,
@@ -176,29 +194,94 @@ impl ProjectAst {
 
         MacroAstItem { name, args }
     }
+
+    /// Extracts the parameter name from a pattern
+    fn extract_param_name(pat: &Pat) -> String {
+        match pat {
+            Pat::Ident(pat_ident) => pat_ident.ident.to_string(),
+            Pat::Type(pat_type) => Self::extract_param_name(&pat_type.pat),
+            Pat::Wild(_) => "_".to_string(),
+            _ => quote::quote!(#pat).to_string(),
+        }
+    }
 }
 
-pub struct CallVisitor(Vec<String>);
+pub struct CallVisitor {
+    call_infos: Vec<CallInfo>,
+    /// Tracks the current let binding name when visiting let statements
+    current_binding: Option<String>,
+}
 
 impl CallVisitor {
     fn new() -> Self {
-        Self(Vec::new())
+        Self {
+            call_infos: Vec::new(),
+            current_binding: None,
+        }
     }
 
-    fn get_calls(&self) -> Vec<String> {
-        self.0.clone()
+    fn get_call_infos(&self) -> Vec<CallInfo> {
+        self.call_infos.clone()
+    }
+
+    /// Extracts the binding name from a pattern (e.g., `x` from `let x = ...`)
+    fn extract_binding_name(pat: &Pat) -> Option<String> {
+        match pat {
+            Pat::Ident(pat_ident) => Some(pat_ident.ident.to_string()),
+            Pat::Type(pat_type) => Self::extract_binding_name(&pat_type.pat),
+            _ => None,
+        }
+    }
+
+    /// Converts an expression to its string representation for argument capture
+    fn expr_to_string(expr: &Expr) -> String {
+        quote::quote!(#expr).to_string()
     }
 }
 
 impl<'ast> Visit<'ast> for CallVisitor {
+    fn visit_local(&mut self, node: &'ast Local) {
+        // Extract the binding name from the let pattern
+        let binding_name = Self::extract_binding_name(&node.pat);
+        
+        // Set the current binding context before visiting the initializer
+        self.current_binding = binding_name;
+        
+        // Visit the initializer expression (this will trigger visit_expr_call if there's a call)
+        if let Some(init) = &node.init {
+            self.visit_expr(&init.expr);
+        }
+        
+        // Clear the binding context after processing
+        self.current_binding = None;
+    }
+
     fn visit_expr_call(&mut self, node: &'ast ExprCall) {
         if let Expr::Path(path) = &*node.func {
             if let Some(ident) = path.path.get_ident() {
-                let name = ident.to_string();
+                let callee = ident.to_string();
 
-                self.0.push(name);
+                // Capture all arguments as string representations
+                let arguments: Vec<String> = node
+                    .args
+                    .iter()
+                    .map(|arg| Self::expr_to_string(arg))
+                    .collect();
+
+                // Take the current binding if this is a direct call in a let statement
+                let result_binding = self.current_binding.take();
+
+                self.call_infos.push(CallInfo {
+                    callee,
+                    arguments,
+                    result_binding,
+                });
             }
         }
+        
+        // Continue visiting nested calls (but clear binding context for nested calls)
+        let saved_binding = self.current_binding.take();
         syn::visit::visit_expr_call(self, node);
+        self.current_binding = saved_binding;
     }
 }

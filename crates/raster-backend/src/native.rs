@@ -9,12 +9,13 @@
 use crate::backend::{
     ArtifactStore, Backend, CompilationArtifact, ExecutionMode, ResourceEstimate, TileExecutionResult,
 };
-use raster_core::{tile::TileMetadata, Error, Result};
+use raster_core::{Error, Result, tile::TileMetadata};
 use serde::{Deserialize, Serialize};
 use std::any::Any;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
 
 /// Native executable - just a path to the compiled binary.
 #[derive(Debug, Clone)]
@@ -26,12 +27,12 @@ pub struct NativeCompilationArtifact {
 }
 
 impl CompilationArtifact for NativeCompilationArtifact {
-    fn tile_id(&self) -> &str {
+    fn id(&self) -> &str {
         &self.tile_id
     }
 
-    fn artifact_dir(&self) -> Option<&Path> {
-        self.binary_path.parent()
+    fn path(&self) -> &Path {
+        self.binary_path.parent().unwrap()
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -228,10 +229,7 @@ impl Backend for NativeBackend {
         "native"
     }
 
-    fn compile_tile(
-        &self,
-        metadata: &TileMetadata,
-    ) -> Result<Box<dyn CompilationArtifact>> {
+    fn compile_tile(&self, tile_metadata: &TileMetadata, _content_hash: Option<&str>) -> Result<Box<dyn CompilationArtifact>> {
         // Native backend builds the user's project
         let project_path = self.project_path.as_ref().ok_or_else(|| {
             Error::Other("Native backend requires project_path to be set".into())
@@ -274,7 +272,7 @@ impl Backend for NativeBackend {
 
         Ok(Box::new(NativeCompilationArtifact {
             binary_path,
-            tile_id: metadata.id.0.clone(),
+            tile_id: tile_metadata.id.0.clone(),
         }))
     }
 

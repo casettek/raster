@@ -39,6 +39,7 @@ impl TileIdStatic {
     }
 }
 
+// TODO: restructure to only care tile metadata
 /// Metadata about a tile's resource requirements and characteristics.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TileMetadata {
@@ -51,6 +52,7 @@ pub struct TileMetadata {
 
     /// Maximum memory usage in bytes
     pub max_memory: Option<u64>,
+
 }
 
 impl TileMetadata {

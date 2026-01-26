@@ -1,9 +1,12 @@
 //! Backend trait and execution mode definitions.
-
-use raster_core::{tile::TileMetadata, Result};
 use serde::{Deserialize, Serialize};
-use std::any::Any;
+
+use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::io::Read;
+use std::any::Any;
+use raster_core::tile::TileMetadata;
+use raster_core::Result;
 
 /// Execution mode for tiles.
 ///
@@ -72,10 +75,10 @@ pub struct TileExecDescriptor {
 /// that implement this trait.
 pub trait CompilationArtifact: Send + Sync + Any {
     /// Get the tile ID this executable is for.
-    fn tile_id(&self) -> &str;
+    fn id(&self) -> &str;
 
     /// Get the artifact directory (if persisted).
-    fn artifact_dir(&self) -> Option<&Path>;
+    fn path(&self) -> &Path;
 
     /// Downcast to concrete type (for backend internal use).
     fn as_any(&self) -> &dyn Any;
@@ -117,7 +120,7 @@ pub trait ArtifactStore: Send + Sync {
     /// The loaded executable, or None if not cached or cache is stale.
     fn load(
         &self,
-        tile_id: &str,
+        id: &str,
         output_dir: &Path,
         source_hash: Option<&str>,
     ) -> Option<Box<dyn CompilationArtifact>>;
@@ -133,7 +136,7 @@ pub trait ArtifactStore: Send + Sync {
     /// True if recompilation is needed, false if cache is valid.
     fn needs_recompilation(
         &self,
-        tile_id: &str,
+        id: &str,
         output_dir: &Path,
         source_hash: Option<&str>,
     ) -> bool;
@@ -142,7 +145,6 @@ pub trait ArtifactStore: Send + Sync {
 /// RISC0's minimum segment size for proving (2^16).
 pub const MIN_PROOF_SEGMENT_CYCLES: u64 = 65536;
 
-/// Calculate the proof cycle count (padded to next power of 2, min 2^16).
 pub fn calculate_proof_cycles(actual_cycles: u64) -> u64 {
     if actual_cycles <= MIN_PROOF_SEGMENT_CYCLES {
         MIN_PROOF_SEGMENT_CYCLES
@@ -222,16 +224,7 @@ pub trait Backend: Send + Sync {
     fn name(&self) -> &'static str;
 
     /// Compile a tile into an executable descriptor.
-    ///
-    /// # Arguments
-    /// * `metadata` - Metadata about the tile being compiled
-    ///
-    /// # Returns
-    /// An opaque executable that can be passed to execute_tile.
-    fn compile_tile(
-        &self,
-        metadata: &TileMetadata,
-    ) -> Result<Box<dyn CompilationArtifact>>;
+    fn compile_tile(&self, tile: &TileMetadata, content_hash: Option<&str>) -> Result<Box<dyn CompilationArtifact>>;
 
     /// Execute a tile with the given input.
     ///

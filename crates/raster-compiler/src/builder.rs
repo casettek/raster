@@ -1,53 +1,43 @@
 //! Build orchestration for Raster projects.
-
-use crate::{ast::ProjectAst, discovery::{DiscoveredTile, TileDiscovery}, sequence::SequenceExplorer, tile::TileExplorer};
-use raster_backend::{Backend, CompilationArtifact, ExecutionMode, NativeBackend, TileExecutionResult};
-use raster_core::{
-    manifest::Manifest,
-    registry::{iter_tiles, TileRegistration},
-    Error, Result,
-};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs;
-use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Arc;
+use anyhow::{anyhow, Context};
 
-/// Compute a simple hash of a file's contents for cache invalidation.
-fn compute_source_hash(path: &str) -> Option<String> {
-    let mut file = fs::File::open(path).ok()?;
-    let mut contents = Vec::new();
-    file.read_to_end(&mut contents).ok()?;
-
-    // Simple hash: use the first 16 bytes of a basic checksum
-    // This is fast and good enough for cache invalidation
-    let mut hash: u64 = 0;
-    for (i, byte) in contents.iter().enumerate() {
-        hash = hash.wrapping_add((*byte as u64).wrapping_mul((i as u64).wrapping_add(1)));
-        hash = hash.rotate_left(7);
-    }
-    let len_hash = contents.len() as u64;
-    Some(format!("{:016x}{:016x}", hash, len_hash))
-}
-
+use crate::{
+    tile::{TileDiscovery},
+    Project,
+};
+use raster_backend::{
+    Backend, CompilationArtifact, ExecutionMode, NativeBackend, TileExecutionResult,
+};
+use raster_core::{
+    Result, manifest::Manifest, registry::{TileRegistration, iter_tiles} 
+};
+use crate::tile::Tile;
 /// Orchestrates the build process for a Raster project.
-pub struct Builder {
+pub struct Builder<'ast> {
     /// The backend to use for compilation (shared via Arc for TileRunner).
     backend: Arc<dyn Backend>,
     /// Output directory for artifacts.
     output_dir: PathBuf,
     /// Path to the user's project.
-    project_path: Option<PathBuf>,
+    project: &'ast Project,
 }
 
-impl Builder {
+
+pub trait TileBuilder<'ast> {
+    fn build(&self, tile_id: &str) -> Result<TileArtifact>;
+}
+
+impl<'ast> Builder<'ast> {
     /// Create a new builder with the given output directory.
-    pub fn new(output_dir: PathBuf) -> Self {
+    pub fn new(project: &'ast Project, output_dir: PathBuf) -> Self {
         Self {
             backend: Arc::new(NativeBackend::new()),
             output_dir,
-            project_path: None,
+            project,
         }
     }
 
@@ -58,17 +48,9 @@ impl Builder {
         self
     }
 
-    /// Set the project path for the user's crate.
-    pub fn with_project_path(mut self, path: PathBuf) -> Self {
-        self.project_path = Some(path);
-        self
-    }
-
-    /// Get the backend name.
     pub fn backend_name(&self) -> &'static str {
         self.backend.name()
     }
-
 
     /// Discover all registered tiles from the in-process registry.
     ///
@@ -78,35 +60,14 @@ impl Builder {
         iter_tiles().collect()
     }
 
-    /// Discover tiles by scanning source files.
-    ///
-    /// This parses the project's source files to find `#[tile]` annotations.
-    /// This works even when the CLI is a separate binary from the user's project.
-    pub fn discover_tiles_from_source(&self) -> Result<Vec<DiscoveredTile>> {
-        let project_path = self
-            .project_path
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-
-        let project_ast = ProjectAst::new(&project_path).unwrap();
-        let tile_explorer = TileExplorer::new(&project_ast);
-        let sequences = SequenceExplorer::new(&project_ast, &tile_explorer);
-
-        println!("\nproject_ast: {:?}", project_ast);
-        println!("\nsequences: {:#?}", sequences);
-
-        let discovery = TileDiscovery::new(&project_path);
-        discovery.discover()
-    }
-
     /// Build all tiles discovered from source files.
     ///
     /// This is the preferred method for CLI usage since it doesn't require
     /// the tiles to be linked into the CLI binary.
     pub fn build_from_source(&self) -> Result<BuildOutput> {
-        let tiles = self.discover_tiles_from_source()?;
+        let tile_discovery = TileDiscovery::new(&self.project);
 
+        let tiles = tile_discovery.tiles;
         if tiles.is_empty() {
             return Ok(BuildOutput {
                 tiles_compiled: 0,
@@ -117,42 +78,20 @@ impl Builder {
             });
         }
 
-        let store = self.backend.artifact_store();
         let mut artifacts = HashMap::new();
         let mut compiled = 0;
-        let mut skipped = 0;
 
         for tile in tiles {
-            let tile_id = &tile.metadata.id.0;
-            let source_hash = compute_source_hash(&tile.source_file);
+            let tile_id = tile.id().to_string();
+            
+            let metadata = tile.to_metadata();
+            let content_hash = tile.to_content_hash();
 
-            // Try loading from cache (backend handles its own format)
-            if let Some(cached) = store.load(tile_id, &self.output_dir, source_hash.as_deref()) {
-                let artifact = TileArtifact {
-                    tile_id: tile_id.clone(),
-                    artifact_dir: cached
-                        .artifact_dir()
-                        .map(|p| p.to_path_buf())
-                        .unwrap_or_else(|| self.default_artifact_dir(tile_id)),
-                };
-                artifacts.insert(tile_id.clone(), artifact);
-                skipped += 1;
-                continue;
-            }
-
-            // Compile tile (backend returns its own Executable type)
-            match self.backend.compile_tile(&tile.metadata) {
+            match self.backend.compile_tile(&metadata, content_hash.as_deref()) {
                 Ok(executable) => {
-                    // Persist artifacts (backend handles its own format)
-                    let artifact_dir = store.save(
-                        executable.as_ref(),
-                        &self.output_dir,
-                        source_hash.as_deref(),
-                    )?;
-
                     let artifact = TileArtifact {
                         tile_id: tile_id.clone(),
-                        artifact_dir,
+                        artifact_dir: executable.path().to_path_buf()
                     };
                     artifacts.insert(tile_id.clone(), artifact);
                     compiled += 1;
@@ -165,7 +104,7 @@ impl Builder {
 
         Ok(BuildOutput {
             tiles_compiled: compiled,
-            skipped_cached: skipped,
+            skipped_cached: 0, // Backend handles caching internally now
             schemas_generated: 0,
             artifacts,
             backend: self.backend.name().to_string(),
@@ -180,101 +119,22 @@ impl Builder {
             .join(self.backend.name())
     }
 
-    /// Build all tiles from the in-process registry.
-    ///
-    /// Note: This only works when tiles are linked into the same binary.
-    /// For CLI usage, prefer `build_from_source()`.
-    pub fn build_from_registry(&self) -> Result<BuildOutput> {
-        let tiles: Vec<_> = self.discover_tiles();
-
-        if tiles.is_empty() {
-            return Ok(BuildOutput {
-                tiles_compiled: 0,
-                skipped_cached: 0,
-                schemas_generated: 0,
-                artifacts: HashMap::new(),
-                backend: self.backend.name().to_string(),
-            });
-        }
-
-        let store = self.backend.artifact_store();
-        let mut artifacts = HashMap::new();
-        let mut compiled = 0;
-
-        for tile in tiles {
-            let metadata = tile.metadata_owned();
-            let tile_id = tile.id_str();
-
-            // Determine source path (placeholder for now)
-            let source_path = self
-                .project_path
-                .as_ref()
-                .map(|p| p.join("src/lib.rs").to_string_lossy().to_string())
-                .unwrap_or_else(|| "src/lib.rs".to_string());
-
-            let source_hash = compute_source_hash(&source_path);
-
-            match self.backend.compile_tile(&metadata) {
-                Ok(executable) => {
-                    // Persist artifacts
-                    let artifact_dir = store.save(
-                        executable.as_ref(),
-                        &self.output_dir,
-                        source_hash.as_deref(),
-                    )?;
-
-                    let artifact = TileArtifact {
-                        tile_id: tile_id.to_string(),
-                        artifact_dir,
-                    };
-                    artifacts.insert(tile_id.to_string(), artifact);
-                    compiled += 1;
-                }
-                Err(e) => {
-                    eprintln!("Warning: Failed to compile tile '{}': {}", tile_id, e);
-                }
-            }
-        }
-
-        Ok(BuildOutput {
-            tiles_compiled: compiled,
-            skipped_cached: 0,
-            schemas_generated: 0,
-            artifacts,
-            backend: self.backend.name().to_string(),
-        })
-    }
-
     /// Build all tiles and schemas from a manifest.
     pub fn build(&self, manifest: &Manifest) -> Result<BuildOutput> {
-        let store = self.backend.artifact_store();
         let mut artifacts = HashMap::new();
         let mut compiled = 0;
 
         for tile_meta in &manifest.tiles {
             let tile_id = &tile_meta.id.0;
-
-            // Determine source path (placeholder for now)
-            let source_path = self
-                .project_path
-                .as_ref()
-                .map(|p| p.join("src/lib.rs").to_string_lossy().to_string())
-                .unwrap_or_else(|| "src/lib.rs".to_string());
-
-            let source_hash = compute_source_hash(&source_path);
-
-            match self.backend.compile_tile(tile_meta) {
+            // Compile tile - backend handles caching internally
+            // TODO: fix caching with content hash
+            match self.backend.compile_tile(tile_meta, None) {
                 Ok(executable) => {
-                    // Persist artifacts
-                    let artifact_dir = store.save(
-                        executable.as_ref(),
-                        &self.output_dir,
-                        source_hash.as_deref(),
-                    )?;
-
                     let artifact = TileArtifact {
                         tile_id: tile_id.clone(),
-                        artifact_dir,
+                        artifact_dir: executable
+                            .path()
+                            .to_path_buf(),
                     };
                     artifacts.insert(tile_id.clone(), artifact);
                     compiled += 1;
@@ -294,95 +154,28 @@ impl Builder {
         })
     }
 
-
-    /// Build a single tile by ID using source-based discovery.
-    /// Uses cached artifacts if source hasn't changed.
-    pub fn build_tile(&self, tile_id: &str) -> Result<TileArtifact> {
-        let (artifact, _) = self.build_tile_with_cache_info(tile_id)?;
-        Ok(artifact)
-    }
-
-    /// Build a single tile by ID, returning whether cache was used.
-    pub fn build_tile_with_cache_info(&self, tile_id: &str) -> Result<(TileArtifact, bool)> {
-        let (executable, artifact_dir, was_cached) = self.build_tile_executable(tile_id)?;
-        // Discard the executable, caller only needs the artifact
-        drop(executable);
-        Ok((
-            TileArtifact {
-                tile_id: tile_id.to_string(),
-                artifact_dir,
-            },
-            was_cached,
-        ))
-    }
-
     /// Build a tile and return the executable directly.
     ///
-    /// This avoids the unnecessary reload pattern where we compile, save to disk,
-    /// discard the executable, then reload it. Instead, we keep the executable
-    /// in memory and return it directly.
+    /// The backend handles caching internally - expensive backends like RISC0
+    /// will cache their artifacts, while fast backends like native will recompile.
     ///
     /// Returns (executable, artifact_dir, was_cached).
-    pub fn build_tile_executable(
+    /// Note: was_cached is always false now since caching is internal to the backend.
+    pub fn build_tile(
         &self,
         tile_id: &str,
-    ) -> Result<(Box<dyn CompilationArtifact>, PathBuf, bool)> {
-        let store = self.backend.artifact_store();
-
+    ) -> Result<Box<dyn CompilationArtifact>> {
         // First try source-based discovery
-        let tiles = self.discover_tiles_from_source()?;
-        println!("build tiles: {:?}", tiles);
+        let tile_discovery = TileDiscovery::new(self.project);
 
-        if let Some(tile) = tiles.iter().find(|t| t.metadata.id.0 == tile_id) {
-            let source_hash = compute_source_hash(&tile.source_file);
+        let tile = tile_discovery.get(tile_id).unwrap();
+            // Create metadata with source_file populated
+        let metadata = tile.to_metadata();
+        let content_hash = tile.to_content_hash();
+            // Compile tile - backend handles caching internally
+        let artifact = self.backend.compile_tile(&metadata, content_hash.as_deref())?;
 
-            // Check cache first
-            if let Some(cached) = store.load(tile_id, &self.output_dir, source_hash.as_deref()) {
-                println!("cached executable loaded");
-                let artifact_dir = cached
-                    .artifact_dir()
-                    .map(|p| p.to_path_buf())
-                    .unwrap_or_else(|| self.default_artifact_dir(tile_id));
-                return Ok((cached, artifact_dir, true));
-            }
-
-            // Compile the tile
-            let executable = self
-                .backend
-                .compile_tile(&tile.metadata)?;
-
-            // Persist artifacts
-            let artifact_dir = store.save(
-                executable.as_ref(),
-                &self.output_dir,
-                source_hash.as_deref(),
-            )?;
-
-            return Ok((executable, artifact_dir, false));
-        }
-
-        // Fall back to registry (for in-process usage)
-        let tile = iter_tiles()
-            .find(|t| t.id_str() == tile_id)
-            .ok_or_else(|| Error::InvalidTileId(tile_id.to_string()))?;
-
-        let metadata = tile.metadata_owned();
-        let source_path = self
-            .project_path
-            .as_ref()
-            .map(|p| p.join("src/lib.rs").to_string_lossy().to_string())
-            .unwrap_or_else(|| "src/lib.rs".to_string());
-
-        let source_hash = compute_source_hash(&source_path);
-
-        let executable = self.backend.compile_tile(&metadata)?;
-        let artifact_dir = store.save(
-            executable.as_ref(),
-            &self.output_dir,
-            source_hash.as_deref(),
-        )?;
-
-        Ok((executable, artifact_dir, false))
+        return Ok(artifact);
     }
 
     /// Build a tile and return a TileRunner that can execute it.
@@ -390,19 +183,53 @@ impl Builder {
     ///
     /// Uses `build_tile_executable` internally to get the executable directly,
     /// avoiding the unnecessary reload pattern.
-    pub fn build_tile_runner(&self, tile_id: &str) -> Result<TileRunner> {
-        let (executable, _artifact_dir, _was_cached) = self.build_tile_executable(tile_id)?;
+    pub fn build_tile_runner<'a>(&self, tile: &'a Tile<'a>) -> Result<TileRunner<'a>> {
+        let artifact =
+            self.build_tile(tile.id())?;
 
         Ok(TileRunner {
-            backend: self.backend.clone(),
-            executable,
-            tile_id: tile_id.to_string(),
+            backend: Arc::clone(&self.backend),
+            executable: artifact,
+            tile,
         })
     }
 
+    /// Build a sequence runner from an entrypoint sequence name.
+    ///
+    /// This creates a SequenceRunner that can execute a full sequence of tiles.
+    /// The sequence is expanded (resolving nested sequence calls) and all tiles
+    /// are pre-built before returning the runner.
+    ///
+    /// # Arguments
+    /// * `sequence_name` - The name of the sequence to build
+    ///
+    /// # Returns
+    /// A SequenceRunner ready to execute the sequence.
+    // pub fn build_sequence_runner<'ast>(
+    //     &self,
+    //     seq: &'ast Sequence<'ast>,
+    //     seq_discovery: &'ast SequenceDiscovery<'ast>,
+    // ) -> Result<SequenceRunner<'ast>> {
+    //     // Get the project path
+    //     // Build all tile runners (filter for tiles only from the flattened steps)
+    //     let tile_runners = seq.flatten(seq_discovery)
+    //         .filter_map(|step| match step {
+    //             FlattenedStep::Tile(tile) => Some(tile),
+    //             FlattenedStep::Sequence(_) => None,
+    //         })
+    //         .map(|tile| self.build_tile_runner(tile))
+    //         .collect::<Result<Vec<TileRunner>>>()?;
+
+    //     Ok(SequenceRunner {
+    //         backend: self.backend.clone(),
+    //         tile_runners,
+    //         sequence_name: seq.function.name.clone(),
+    //     })
+    // }
+
     /// Get the project path.
-    pub fn project_path(&self) -> Option<&PathBuf> {
-        self.project_path.as_ref()
+    pub fn project_path(&self) -> PathBuf {
+        self.project.root_path.clone()
     }
 
     /// Get the output directory.
@@ -427,7 +254,7 @@ pub struct BuildOutput {
 }
 
 /// Artifact produced for a single tile (backend-agnostic).
-/// 
+///
 /// The specific artifact format (ELF files, binaries, etc.) is handled
 /// by each backend's ArtifactStore implementation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -459,27 +286,23 @@ pub struct TileManifest {
 /// TileRunner encapsulates the backend and loaded executable,
 /// providing a simple `run()` method that abstracts away backend-specific
 /// execution details (ELF loading, zkVM execution, subprocess calls, etc.).
-pub struct TileRunner {
+pub struct TileRunner<'ast> {
     /// The backend to use for execution (shared).
     backend: Arc<dyn Backend>,
     /// The loaded executable (opaque, backend-specific).
     executable: Box<dyn CompilationArtifact>,
-    /// The tile ID.
-    tile_id: String,
+
+    tile: &'ast Tile<'ast>,
 }
 
-impl TileRunner {
+impl<'ast> TileRunner<'ast> {
     /// Run the tile with the given input and execution mode.
     ///
     /// This abstracts the execution model - callers just "run" the tile
     /// without needing to know about backend-specific details.
     pub fn run(&self, input: &[u8], mode: ExecutionMode) -> Result<TileExecutionResult> {
-        self.backend.execute_tile(self.executable.as_ref(), input, mode)
-    }
-
-    /// Get the tile ID.
-    pub fn tile_id(&self) -> &str {
-        &self.tile_id
+        self.backend
+            .execute_tile(self.executable.as_ref(), input, mode)
     }
 
     /// Get a reference to the executable.
@@ -491,4 +314,211 @@ impl TileRunner {
     pub fn backend_name(&self) -> &'static str {
         self.backend.name()
     }
+
+    pub fn validate_input(&self, input: Option<&str>) -> anyhow::Result<()> {
+        let tile_function = self.tile.function.clone();
+        let input_count = tile_function.inputs.len();
+
+        match (input_count, input) {
+            // No inputs expected, none provided - OK
+            (0, None) => Ok(()),
+
+            // No inputs expected, but input provided
+            (0, Some(_)) => Err(anyhow!(
+                "Tile '{}' takes no arguments, but --input was provided.\n\
+                 Signature: {}",
+                tile_function.name,
+                tile_function.signature
+            )),
+
+            // Inputs expected, none provided
+            (n, None) => Err(anyhow!(
+                "Tile '{}' requires {} argument(s), but no --input provided.\n\
+                 Signature: {}\n\
+                 Expected types: {}",
+                tile_function.name,
+                n,
+                tile_function.signature,
+                tile_function.inputs.join(", ")
+            )),
+
+            // Both present - validate structure
+            (n, Some(input_json)) => {
+                let value: serde_json::Value =
+                    serde_json::from_str(input_json).context("Failed to parse input JSON")?;
+
+                if n == 1 {
+                    // Single argument - validate it's not an array (unless type is array)
+                    Self::validate_single_input(&tile_function.inputs[0], &value)
+                } else {
+                    // Multiple arguments - expect array with correct length
+                    Self::validate_multiple_inputs(&tile_function.inputs, &value)
+                }
+            }
+        }
+    }
+
+    fn validate_single_input(expected_type: &str, value: &serde_json::Value) -> anyhow::Result<()> {
+        // Basic type checking based on JSON value type
+        let type_mismatch = match (expected_type, value) {
+            // String types
+            ("String" | "&str" | "& str", serde_json::Value::String(_)) => false,
+            ("String" | "&str" | "& str", _) => true,
+
+            // Numeric types
+            (
+                "u8" | "u16" | "u32" | "u64" | "usize" | "i8" | "i16" | "i32" | "i64" | "isize",
+                serde_json::Value::Number(_),
+            ) => false,
+            (
+                "u8" | "u16" | "u32" | "u64" | "usize" | "i8" | "i16" | "i32" | "i64" | "isize",
+                _,
+            ) => true,
+
+            // Boolean
+            ("bool", serde_json::Value::Bool(_)) => false,
+            ("bool", _) => true,
+
+            // Arrays/Vecs
+            (t, serde_json::Value::Array(_)) if t.starts_with("Vec<") || t.starts_with("Vec <") => {
+                false
+            }
+
+            // Objects/structs - can't easily validate, allow any object
+            (_, serde_json::Value::Object(_)) => false,
+
+            // Unknown types - don't fail, let runtime handle it
+            _ => false,
+        };
+
+        if type_mismatch {
+            Err(anyhow!(
+                "Expects input of type '{}', but got {}\n\
+                 Hint: Use proper JSON format, e.g., '\"hello\"' for strings, 42 for numbers",
+                expected_type,
+                Self::json_type_name(value)
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn validate_multiple_inputs(
+        expected_types: &[String],
+        value: &serde_json::Value,
+    ) -> anyhow::Result<()> {
+        match value {
+            serde_json::Value::Array(arr) => {
+                if arr.len() != expected_types.len() {
+                    Err(anyhow!(
+                        "Expects {} argument(s), but got {} in array.\n\
+                         Expected types: ({})\n\
+                         Hint: Use JSON array format, e.g., '[\"hello\", 42]'",
+                        expected_types.len(),
+                        arr.len(),
+                        expected_types.join(", ")
+                    ))
+                } else {
+                    // Optionally validate each element
+                    for (i, (expected, actual)) in expected_types.iter().zip(arr.iter()).enumerate()
+                    {
+                        if let Err(e) = Self::validate_single_input(expected, actual) {
+                            return Err(anyhow!("Argument {} invalid: {}", i + 1, e));
+                        }
+                    }
+                    Ok(())
+                }
+            }
+            _ => Err(anyhow!(
+                "Expects {} arguments, provide them as a JSON array.\n\
+                 Expected types: ({})\n\
+                 Example: --input '[\"hello\", 42]'",
+                expected_types.len(),
+                expected_types.join(", ")
+            )),
+        }
+    }
+
+    fn json_type_name(value: &serde_json::Value) -> &'static str {
+        match value {
+            serde_json::Value::Null => "null",
+            serde_json::Value::Bool(_) => "boolean",
+            serde_json::Value::Number(_) => "number",
+            serde_json::Value::String(_) => "string",
+            serde_json::Value::Array(_) => "array",
+            serde_json::Value::Object(_) => "object",
+        }
+    }
 }
+
+
+/// A compiled sequence ready to run.
+///
+/// SequenceRunner encapsulates a sequence of pre-built TileRunners that can
+/// be executed in order, with each tile's output becoming the next tile's input.
+pub struct SequenceRunner<'ast> {
+    /// The backend used for execution (shared).
+    backend: Arc<dyn Backend>,
+    /// Pre-built TileRunners in execution order.
+    step_runners: Vec<StepRunner<'ast>>,
+    /// The sequence name.
+    sequence_name: String,
+}
+
+pub enum StepRunner<'ast> {
+    Tile(TileRunner<'ast>),
+    Sequence(SequenceRunner<'ast>),
+}
+
+// impl<'ast> SequenceRunner<'ast> {
+//     /// Execute the full sequence, chaining outputs to inputs.
+//     ///
+//     /// The initial input is passed to the first tile, and each subsequent tile
+//     /// receives the output from the previous tile as its input.
+//     pub fn run(&self, input: &[u8], mode: ExecutionMode) -> Result<SequenceExecutionResult> {
+//         let mut current_input = input.to_vec();
+//         let mut step_results = Vec::new();
+
+//         for runner in &self.step_runners {
+//             let result = match runner {
+//                 StepRunner::Tile(tile_runner) => tile_runner.run(&current_input, mode)?,
+//                 StepRunner::Sequence(sequence_runner) => sequence_runner.run(&current_input, mode)?,
+//             };
+
+//             step_results.push(StepResult::Tile(TileResult {
+//                 output: result.output,
+//             }));
+
+//             // Output becomes input for next tile
+//             current_input = result.output;
+//         }
+
+//         Ok(SequenceExecutionResult {
+//             output: current_input,
+//             step_results,
+//         })
+//     }
+
+//     /// Get the sequence name.
+//     pub fn sequence_name(&self) -> &str {
+//         &self.sequence_name
+//     }
+
+//     /// Get the number of tiles in this sequence.
+//     pub fn tile_count(&self) -> usize {
+//         self.tile_runners.len()
+//     }
+
+//     /// Get the tile IDs in execution order.
+//     pub fn tile_ids(&self) -> Vec<&str> {
+//         self.tile_runners
+//             .iter()
+//             .map(|r| r.tile.function.name.as_str())
+//             .collect()
+//     }
+
+//     /// Get the backend name.
+//     pub fn backend_name(&self) -> &'static str {
+//         self.backend.name()
+//     }
+// }

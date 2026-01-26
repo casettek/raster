@@ -1,5 +1,16 @@
-use crate::{ProjectAst, ast::FunctionAstItem};
+use std::path::PathBuf;
 
+use crate::ast::FunctionAstItem;
+use crate::Project;
+
+use std::io::Read;
+
+use raster_core::tile::{TileId, TileMetadata};
+
+#[derive(Debug, Clone)]
+pub struct TileResult {
+    pub output: Vec<u8>,
+}
 #[derive(Debug, Clone)]
 pub struct Tile<'ast> {
     pub function: &'ast FunctionAstItem,
@@ -8,21 +19,68 @@ pub struct Tile<'ast> {
     pub description: Option<String>,
 }
 
+impl<'ast> Tile<'ast> {
+    pub fn id(&self) -> &str {
+        &self.function.name
+    }
+
+    pub fn source_file(&self) -> PathBuf {
+        self.function.path.clone()
+    }
+
+    /// Convert this Tile to a TileMetadata with source_file populated.
+    ///
+    /// This is used when passing tile information to backends for compilation.
+    /// The source_file allows backends (like RISC0) to compute hashes for caching.
+    pub fn to_metadata(&self) -> TileMetadata {
+        TileMetadata {
+            id: TileId::new(self.id()),
+            name: self.function.name.clone(),
+            description: self.description.clone(),
+            estimated_cycles: self.estimated_cycles,
+            max_memory: self.max_memory,
+        }
+    }
+
+    // TODO: move content hashing to the artifact store
+    pub fn to_content_hash(&self) -> Option<String> {
+        let mut file = std::fs::File::open(&self.source_file()).ok()?;
+        let mut contents = Vec::new();
+        std::io::Read::read_to_end(&mut file, &mut contents).ok()?;
+
+        // Simple hash: use the first 16 bytes of a basic checksum
+        // This is fast and good enough for cache invalidation
+        let mut hash: u64 = 0;
+        for (i, byte) in contents.iter().enumerate() {
+            hash = hash.wrapping_add((*byte as u64).wrapping_mul((i as u64).wrapping_add(1)));
+            hash = hash.rotate_left(7);
+        }
+        let len_hash = contents.len() as u64;
+        Some(format!("{:016x}{:016x}", hash, len_hash))
+    }
+}
+
 #[derive(Debug, Clone)]
-pub struct TileExplorer<'ast> {
+pub struct TileDiscovery<'ast> {
+    pub project: &'ast Project,
     pub tiles: Vec<Tile<'ast>>,
 }
 
-impl<'ast> TileExplorer<'ast> {
-    pub fn new(project_ast: &'ast ProjectAst) -> Self {
+impl<'ast> TileDiscovery<'ast> {
+    pub fn new(project: &'ast Project) -> Self {
+        let project_ast = &project.ast;
         let tiles = project_ast
             .functions
             .iter()
-            .filter(|f| f.macros.iter().any(|m| m.name == "tile" || m.name == "raster::tile"))
+            .filter(|f| {
+                f.macros
+                    .iter()
+                    .any(|m| m.name == "tile" || m.name == "raster::tile")
+            })
             .map(|f| Self::extract_tile(f))
             .collect();
 
-        Self { tiles }
+        Self { project, tiles }
     }
 
     fn extract_tile(func: &'ast FunctionAstItem) -> Tile<'ast> {
@@ -39,8 +97,7 @@ impl<'ast> TileExplorer<'ast> {
             .and_then(|m| m.args.get("max_memory"))
             .and_then(|v| v.parse().ok());
 
-        let description = tile_macro
-            .and_then(|m| m.args.get("description").cloned());
+        let description = tile_macro.and_then(|m| m.args.get("description").cloned());
 
         Tile {
             function: func,

@@ -289,7 +289,7 @@ impl<'ast> Visit<'ast> for TileCallExtractor {
                 let fn_name = segment.ident.to_string();
                 // Skip common non-tile functions
                 if !is_excluded_function(&fn_name) {
-                    self.tile_calls.push(fn_name);
+                    self.tile_calls.push(fn_name.to_owned());
                 }
             }
         }
