@@ -1,9 +1,7 @@
 //! Backend trait and execution mode definitions.
 use serde::{Deserialize, Serialize};
 
-use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::io::Read;
 use std::any::Any;
 use raster_core::tile::TileMetadata;
 use raster_core::Result;
@@ -104,7 +102,7 @@ pub trait ArtifactStore: Send + Sync {
     /// The artifact directory path where artifacts were written.
     fn save(
         &self,
-        executable: &dyn CompilationArtifact,
+        artifact: &dyn CompilationArtifact,
         output_dir: &Path,
         source_hash: Option<&str>,
     ) -> Result<PathBuf>;
@@ -213,6 +211,8 @@ pub struct ResourceEstimate {
     pub memory_bytes: Option<u64>,
 }
 
+
+
 /// Trait defining the interface for compilation and execution backends.
 ///
 /// Backends are responsible for:
@@ -237,7 +237,7 @@ pub trait Backend: Send + Sync {
     /// Execution result including output, cycle count, and optional proof.
     fn execute_tile(
         &self,
-        compilation_artifact: &dyn CompilationArtifact,
+        artifact: &dyn CompilationArtifact,
         input: &[u8],
         mode: ExecutionMode,
     ) -> Result<TileExecutionResult>;

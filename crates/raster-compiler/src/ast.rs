@@ -1,4 +1,3 @@
-use anyhow::Result;
 use cargo_toml::Manifest;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -8,6 +7,8 @@ use syn::{
     Attribute, Expr, ExprCall, ExprLit, FnArg, Lit, Local, Meta, Pat,
 };
 use walkdir::WalkDir;
+
+use raster_core::Result;
 
 
 #[derive(Debug, Clone)]

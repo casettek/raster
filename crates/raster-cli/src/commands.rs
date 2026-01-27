@@ -1,10 +1,11 @@
 //! Command implementations for the Raster CLI.
 mod utils;
-use utils::io_validation::{decode_output, encode_input};
+use utils::encode::{decode_output, encode_input};
 
 use crate::BackendType;
-use anyhow::{anyhow, Context, Result};
-use raster_backend::{Backend, ExecutionMode, NativeBackend};
+use raster_core::{Error, Result};
+use raster_backend::{Backend, ExecutionMode};
+use raster_backend_native::NativeBackend;
 use raster_backend_risc0::Risc0Backend;
 use raster_compiler::sequence::{FlattenedStep, SequenceDiscovery};
 use raster_compiler::tile::TileDiscovery;
@@ -15,6 +16,9 @@ use raster_compiler::{Builder, CfsBuilder};
 use std::env;
 use std::fs;
 use std::path::{PathBuf};
+use raster_compiler::backend::BackendImpl;
+
+pub mod tile;
 
 /// Get the output directory for artifacts.
 fn output_dir() -> PathBuf {
@@ -30,16 +34,15 @@ fn project_path() -> PathBuf {
 }
 
 /// Create a backend instance.
-fn create_backend(backend_type: BackendType) -> Result<Box<dyn Backend>> {
+fn create_backend(backend_type: BackendType) -> Result<BackendImpl> {
     match backend_type {
         BackendType::Native => {
-            let backend = NativeBackend::new().with_project_path(project_path());
-            Ok(Box::new(backend))
+            Ok(BackendImpl::Native(NativeBackend::new().with_project_path(project_path())))
         }
         BackendType::Risc0 => {
-            let backend = Risc0Backend::new(output_dir()).with_user_crate(project_path());
-            Ok(Box::new(backend))
+            Ok(BackendImpl::Risc0(Risc0Backend::new(output_dir()).with_user_crate(project_path())))
         }
+        _ => return Err(Error::Other("Invalid backend type".into())),
     }
 }
 
@@ -75,123 +78,37 @@ pub fn build(backend_type: BackendType, tile: Option<String>) -> Result<()> {
     println!();
 
     let backend = create_backend(backend_type)?;
-    let builder = Builder::new(&project, output_dir())
-        .with_backend(backend);
+    let builder = Builder::new(&project, &backend);
 
-    if let Some(tile_id) = tile {
-        // Build a single tile
-        println!("Building tile: {}", tile_id);
-        let artifact = builder.build_tile(&tile_id)?;
-        println!("  Artifact dir: {}", artifact.path().display());
-    } else {
-        // Build all tiles using source discovery
-        let output = builder.build_from_source()?;
-        if output.skipped_cached > 0 {
-            println!(
-                "Compiled {} tile(s), {} cached (unchanged) using {} backend",
-                output.tiles_compiled, output.skipped_cached, output.backend
-            );
-        } else {
-            println!(
-                "Compiled {} tile(s) using {} backend",
-                output.tiles_compiled, output.backend
-            );
-        }
-        for (tile_id, artifact) in &output.artifacts {
-            println!("  {} -> {}", tile_id, artifact.artifact_dir.display());
-        }
-    }
+    // if let Some(tile) = discovery.get(tile_id) {
+    //     // Build a single tile
+    //     println!("Building tile: {}", tile_id);
+    //     let artifact = builder.build_tile(&tile)?;
+    //     println!("  Artifact dir: {}", artifact.path().display());
+    // } else {
+    //     // Build all tiles using source discovery
+    //     let output = builder.build_from_source()?;
+    //     if output.skipped_cached > 0 {
+    //         println!(
+    //             "Compiled {} tile(s), {} cached (unchanged) using {} backend",
+    //             output.tiles_compiled, output.skipped_cached, output.backend
+    //         );
+    //     } else {
+    //         println!(
+    //             "Compiled {} tile(s) using {} backend",
+    //             output.tiles_compiled, output.backend
+    //         );
+    //     }
+    //     for (tile_id, artifact) in &output.artifacts {
+    //         println!("  {} -> {}", tile_id, artifact.artifact_dir.display());
+    //     }
+    // }
 
     println!();
     println!("Build complete!");
     Ok(())
 }
 
-/// Run command: execute a tile with the specified backend.
-pub fn run_tile(
-    backend_type: BackendType,
-    tile_id: &str,
-    input: Option<&str>,
-    prove: bool,
-    verify: bool,
-) -> Result<()> {
-    // Determine execution mode
-    let mode = match (prove, verify) {
-        (_, true) => ExecutionMode::prove_and_verify(),
-        (true, false) => ExecutionMode::prove(),
-        (false, false) => ExecutionMode::Estimate,
-    };
-
-    let project = Project::new(project_path())?;
-
-    let tile_discovery = TileDiscovery::new(&project);
-    let tile = tile_discovery.get(tile_id).unwrap();
-
-    let backend = create_backend(backend_type)?;
-    let builder = Builder::new(&project, output_dir())
-        .with_backend(backend);
-
-    let tile_runner = builder.build_tile_runner(&tile)?;
-    tile_runner.validate_input(input)?;
-
-    let input_bytes = encode_input(input)?;
-    let result = tile_runner.run(&input_bytes, mode)?;
-    let output_display = decode_output(
-        tile.function.output.as_deref().unwrap_or("()"),
-        &result.output,
-    );
-
-    println!();
-    println!("  Output: {}", output_display);
-    println!("Execution complete!");
-    if let Some(cycles) = result.cycles {
-        println!("  Compute Cycles: {}", cycles);
-    }
-    // Show proof cycles in estimate mode to help users understand proving cost
-    if let Some(proof_cycles) = result.proof_cycles {
-        if result.receipt.is_none() {
-            // Only show this hint in estimate mode
-            println!(
-                "  Proof cycles: {} (padded for STARK proving)",
-                proof_cycles
-            );
-        }
-    }
-    if result.receipt.is_some() {
-        println!(
-            "  Receipt: generated ({} bytes)",
-            result.receipt.as_ref().map(|r| r.len()).unwrap_or(0)
-        );
-    }
-    if let Some(verified) = result.verified {
-        println!("  Verified: {}", verified);
-    }
-
-    Ok(())
-}
-
-/// List command: show all registered tiles.
-pub fn list_tiles() -> Result<()> {
-    let project = Project::new(project_path())?;
-    let tile_explorer = TileDiscovery::new(&project);
-
-    for tile in tile_explorer.tiles.iter() {
-        println!("  {}", tile.function.signature);
-        if let Some(description) = &tile.description {
-            println!("    Description: {}", description);
-        }
-        if let Some(cycles) = &tile.estimated_cycles {
-            println!("    Estimated cycles: {}", cycles);
-        }
-        if let Some(memory) = &tile.max_memory {
-            println!("    Max memory: {} bytes", memory);
-        }
-        println!("    Source: {}", tile.source_file().display());
-        println!();
-    }
-
-    Ok(())
-}
 
 /// Analyze command: analyze execution traces.
 pub fn analyze(trace_path: Option<String>) -> Result<()> {
@@ -311,8 +228,7 @@ pub fn run_sequence(
 
     let backend = create_backend(backend_type)?;
 
-    let builder = Builder::new(&project, output_dir())
-        .with_backend(backend);
+    let builder = Builder::new(&project, &backend);
 
     for step in sequence.flatten(&sequence_discovery) {
         match step {
@@ -451,10 +367,10 @@ pub fn cfs(output: Option<String>) -> Result<()> {
     let cfs_builder = CfsBuilder::new(&project);
     let cfs = cfs_builder
         .build()
-        .map_err(|e| anyhow!("Failed to build CFS: {}", e))?;
+        .map_err(|e| Error::Other(format!("Failed to build CFS: {}", e)))?;
 
     // Serialize to JSON
-    let json = serde_json::to_string_pretty(&cfs).context("Failed to serialize CFS to JSON")?;
+    let json = serde_json::to_string_pretty(&cfs).map_err(|e| Error::Other(format!("Failed to serialize CFS to JSON: {}", e)))?;
 
     // Determine output path
     let output_path = match output {

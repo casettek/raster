@@ -1,16 +1,15 @@
-use anyhow::{Context, Result};
-
+use raster_core::{Error, Result};
 
 /// Validate that the provided input matches the tile's expected inputs.
 pub fn encode_input(input: Option<&str>) -> Result<Vec<u8>> {
     let input_bytes = if let Some(input_json) = input {
         // Parse JSON input and serialize with postcard
         let value: serde_json::Value =
-            serde_json::from_str(input_json).context("Failed to parse input JSON")?;
-        postcard::to_allocvec(&value).context("Failed to serialize input")?
+            serde_json::from_str(input_json).map_err(|e| Error::Other(format!("Failed to parse input JSON: {}", e)))?;
+        postcard::to_allocvec(&value).map_err(|e| Error::Other(format!("Failed to serialize input: {}", e)))?
     } else {
         // Empty input (unit type)
-        postcard::to_allocvec(&()).context("Failed to serialize empty input")?
+        postcard::to_allocvec(&()).map_err(|e| Error::Other(format!("Failed to serialize empty input: {}", e)))?
     };
     Ok(input_bytes)
 }
@@ -91,12 +90,12 @@ pub fn decode_output(output_type: &str, output: &[u8]) -> String {
         // Result types - unwrap if possible
         t if t.starts_with("Result<") || t.starts_with("Result <") => {
             // Try common inner types
-            if let Ok(s) = postcard::from_bytes::<Result<String, String>>(output) {
+            if let Ok(s) = postcard::from_bytes::<std::result::Result<String, String>>(output) {
                 match s {
                     Ok(v) => format!("Ok(\"{}\")", v),
                     Err(e) => format!("Err(\"{}\")", e),
                 }
-            } else if let Ok(n) = postcard::from_bytes::<Result<u64, String>>(output) {
+            } else if let Ok(n) = postcard::from_bytes::<std::result::Result<u64, String>>(output) {
                 match n {
                     Ok(v) => format!("Ok({})", v),
                     Err(e) => format!("Err(\"{}\")", e),

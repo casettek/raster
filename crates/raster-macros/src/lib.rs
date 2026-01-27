@@ -200,6 +200,15 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
         None => quote! { ::core::option::Option::None },
     };
 
+    // Generate description expression for emit_trace (needs to be used in multiple places)
+    let description_for_trace = match &attrs.description {
+        Some(desc) => {
+            let desc_str = desc.as_str();
+            quote! { ::core::option::Option::Some(#desc_str) }
+        }
+        None => quote! { ::core::option::Option::None },
+    };
+
     let expanded = quote! {
         // Keep the original function unchanged
         #input_fn
@@ -208,8 +217,16 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
         pub fn #wrapper_name(input: &[u8]) -> ::raster::core::Result<::alloc::vec::Vec<u8>> {
             #deserialize_and_call
 
-            ::raster::core::postcard::to_allocvec(&result)
-                .map_err(|e| ::raster::core::Error::Serialization(::alloc::format!("Failed to serialize output: {}", e)))
+            let output = ::raster::core::postcard::to_allocvec(&result)
+                .map_err(|e| ::raster::core::Error::Serialization(::alloc::format!("Failed to serialize output: {}", e)))?;
+
+            // Emit trace marker (only on std platforms, not on riscv32)
+            #[cfg(all(feature = "std", not(target_arch = "riscv32")))]
+            {
+                ::raster::emit_trace(#fn_name_str, #description_for_trace, input, &output);
+            }
+
+            Ok(output)
         }
 
         // Register the tile in the distributed slice (only on platforms that support linkme and std)

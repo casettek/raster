@@ -147,7 +147,8 @@ mod tests {
                 root_path: PathBuf::from("/test"),
                 functions: vec![],
             },
-            root_path: PathBuf::from("/test"),
+            root_dir: PathBuf::from("/test"),
+            output_dir: PathBuf::from("/test/target/raster"),
         }
     }
 

@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use crate::ast::FunctionAstItem;
+use crate::{ProjectAst, ast::FunctionAstItem};
 use crate::Project;
 
 use std::io::Read;
@@ -117,3 +117,4 @@ impl<'ast> TileDiscovery<'ast> {
         self.tiles.iter().any(|t| t.function.name == name)
     }
 }
+

@@ -93,7 +93,6 @@ impl<'ast> SequenceDiscovery<'ast> {
             })
             .collect();
 
-        println!("Sequence Steps: {:#?}", steps);
         Sequence {
             function: func,
             steps,

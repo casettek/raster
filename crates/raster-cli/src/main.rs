@@ -5,7 +5,7 @@
 mod commands;
 
 use clap::{Parser, ValueEnum};
-use anyhow::Result;
+use raster_core::Result;
 
 #[derive(Parser)]
 #[command(name = "cargo-raster")]
@@ -134,8 +134,8 @@ fn main() -> Result<()> {
             input,
             prove,
             verify,
-        } => commands::run_tile(backend, &tile, input.as_deref(), prove, verify),
-        Commands::List => commands::list_tiles(),
+        } => commands::tile::run_tile::run_tile(backend, &tile, input.as_deref(), prove, verify),
+        Commands::List => commands::tile::list_tile::list_tiles(),
         Commands::Analyze { trace_path } => commands::analyze(trace_path),
         Commands::Init { name } => commands::init(name),
         // Commands::Preview { sequence, input, gpu } => {

@@ -114,7 +114,7 @@ pub fn try_execute_tile_from_args() -> bool {
 
     // Encode output as base64 and print with marker
     let output_b64 = base64::engine::general_purpose::STANDARD.encode(&output);
-    std::println!("RASTER_OUTPUT:{:?}", output_b64);
+    std::println!("RASTER_OUTPUT:{}", output_b64);
 
     true
 }

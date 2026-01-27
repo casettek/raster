@@ -105,6 +105,7 @@ impl ArtifactStore for Risc0ArtifactStore {
         };
         let manifest_json = serde_json::to_string_pretty(&manifest)
             .map_err(|e| Error::Serialization(e.to_string()))?;
+
         fs::write(artifact_dir.join("manifest.json"), manifest_json).map_err(Error::Io)?;
 
         Ok(artifact_dir)

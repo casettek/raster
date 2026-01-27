@@ -15,6 +15,7 @@ pub mod ast;
 pub mod sequence;
 pub mod tile;
 pub mod project;
+pub mod backend;
 
 pub use builder::{Builder, BuildOutput, SequenceRunner,  TileArtifact, TileManifest, TileRunner};
 pub use cfs_builder::CfsBuilder;

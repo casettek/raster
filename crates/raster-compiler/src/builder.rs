@@ -3,25 +3,24 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use anyhow::{anyhow, Context};
+use raster_core::Error;
 
 use crate::{
-    tile::{TileDiscovery},
+    backend::BackendImpl,
+    tile::TileDiscovery,
     Project,
 };
 use raster_backend::{
-    Backend, CompilationArtifact, ExecutionMode, NativeBackend, TileExecutionResult,
+    Backend, CompilationArtifact, ExecutionMode, TileExecutionResult,
 };
 use raster_core::{
     Result, manifest::Manifest, registry::{TileRegistration, iter_tiles} 
 };
 use crate::tile::Tile;
 /// Orchestrates the build process for a Raster project.
-pub struct Builder<'ast> {
+pub struct Builder<'ast, 'b> {
     /// The backend to use for compilation (shared via Arc for TileRunner).
-    backend: Arc<dyn Backend>,
-    /// Output directory for artifacts.
-    output_dir: PathBuf,
+    backend: &'b BackendImpl,
     /// Path to the user's project.
     project: &'ast Project,
 }
@@ -31,22 +30,14 @@ pub trait TileBuilder<'ast> {
     fn build(&self, tile_id: &str) -> Result<TileArtifact>;
 }
 
-impl<'ast> Builder<'ast> {
-    /// Create a new builder with the given output directory.
-    pub fn new(project: &'ast Project, output_dir: PathBuf) -> Self {
+impl<'ast, 'b> Builder<'ast, 'b> {
+    pub fn new(project: &'ast Project, backend: &'b BackendImpl) -> Self {
         Self {
-            backend: Arc::new(NativeBackend::new()),
-            output_dir,
+            backend,
             project,
         }
     }
 
-    /// Set a custom backend for compilation.
-    /// Accepts Box<dyn Backend> for convenience, converts to Arc internally.
-    pub fn with_backend(mut self, backend: Box<dyn Backend>) -> Self {
-        self.backend = Arc::from(backend);
-        self
-    }
 
     pub fn backend_name(&self) -> &'static str {
         self.backend.name()
@@ -111,13 +102,6 @@ impl<'ast> Builder<'ast> {
         })
     }
 
-    /// Get the default artifact directory for a tile.
-    fn default_artifact_dir(&self, tile_id: &str) -> PathBuf {
-        self.output_dir
-            .join("tiles")
-            .join(tile_id)
-            .join(self.backend.name())
-    }
 
     /// Build all tiles and schemas from a manifest.
     pub fn build(&self, manifest: &Manifest) -> Result<BuildOutput> {
@@ -163,13 +147,8 @@ impl<'ast> Builder<'ast> {
     /// Note: was_cached is always false now since caching is internal to the backend.
     pub fn build_tile(
         &self,
-        tile_id: &str,
+        tile: &Tile<'ast>,
     ) -> Result<Box<dyn CompilationArtifact>> {
-        // First try source-based discovery
-        let tile_discovery = TileDiscovery::new(self.project);
-
-        let tile = tile_discovery.get(tile_id).unwrap();
-            // Create metadata with source_file populated
         let metadata = tile.to_metadata();
         let content_hash = tile.to_content_hash();
             // Compile tile - backend handles caching internally
@@ -183,12 +162,12 @@ impl<'ast> Builder<'ast> {
     ///
     /// Uses `build_tile_executable` internally to get the executable directly,
     /// avoiding the unnecessary reload pattern.
-    pub fn build_tile_runner<'a>(&self, tile: &'a Tile<'a>) -> Result<TileRunner<'a>> {
+    pub fn build_tile_runner<'a>(&self, tile: &'a Tile<'a>) -> Result<TileRunner<'a, 'b>> {
         let artifact =
-            self.build_tile(tile.id())?;
+            self.build_tile(tile)?;
 
         Ok(TileRunner {
-            backend: Arc::clone(&self.backend),
+            backend: &self.backend,
             executable: artifact,
             tile,
         })
@@ -227,14 +206,9 @@ impl<'ast> Builder<'ast> {
     //     })
     // }
 
-    /// Get the project path.
-    pub fn project_path(&self) -> PathBuf {
-        self.project.root_path.clone()
-    }
-
     /// Get the output directory.
     pub fn output_dir(&self) -> &PathBuf {
-        &self.output_dir
+        &self.project.output_dir
     }
 }
 
@@ -286,16 +260,16 @@ pub struct TileManifest {
 /// TileRunner encapsulates the backend and loaded executable,
 /// providing a simple `run()` method that abstracts away backend-specific
 /// execution details (ELF loading, zkVM execution, subprocess calls, etc.).
-pub struct TileRunner<'ast> {
+pub struct TileRunner<'ast, 'b> {
     /// The backend to use for execution (shared).
-    backend: Arc<dyn Backend>,
+    backend: &'b BackendImpl,
     /// The loaded executable (opaque, backend-specific).
     executable: Box<dyn CompilationArtifact>,
 
     tile: &'ast Tile<'ast>,
 }
 
-impl<'ast> TileRunner<'ast> {
+impl<'ast, 'b> TileRunner<'ast, 'b> {
     /// Run the tile with the given input and execution mode.
     ///
     /// This abstracts the execution model - callers just "run" the tile
@@ -315,7 +289,7 @@ impl<'ast> TileRunner<'ast> {
         self.backend.name()
     }
 
-    pub fn validate_input(&self, input: Option<&str>) -> anyhow::Result<()> {
+    pub fn validate_input(&self, input: Option<&str>) -> Result<()> {
         let tile_function = self.tile.function.clone();
         let input_count = tile_function.inputs.len();
 
@@ -324,15 +298,15 @@ impl<'ast> TileRunner<'ast> {
             (0, None) => Ok(()),
 
             // No inputs expected, but input provided
-            (0, Some(_)) => Err(anyhow!(
+            (0, Some(_)) => Err(Error::Other(format!(
                 "Tile '{}' takes no arguments, but --input was provided.\n\
                  Signature: {}",
                 tile_function.name,
                 tile_function.signature
-            )),
+            ))),
 
             // Inputs expected, none provided
-            (n, None) => Err(anyhow!(
+            (n, None) => Err(Error::Other(format!(
                 "Tile '{}' requires {} argument(s), but no --input provided.\n\
                  Signature: {}\n\
                  Expected types: {}",
@@ -340,12 +314,12 @@ impl<'ast> TileRunner<'ast> {
                 n,
                 tile_function.signature,
                 tile_function.inputs.join(", ")
-            )),
+            ))),
 
             // Both present - validate structure
             (n, Some(input_json)) => {
                 let value: serde_json::Value =
-                    serde_json::from_str(input_json).context("Failed to parse input JSON")?;
+                    serde_json::from_str(input_json).map_err(|e| Error::Other(format!("Failed to parse input JSON: {}", e)))?;
 
                 if n == 1 {
                     // Single argument - validate it's not an array (unless type is array)
@@ -358,7 +332,7 @@ impl<'ast> TileRunner<'ast> {
         }
     }
 
-    fn validate_single_input(expected_type: &str, value: &serde_json::Value) -> anyhow::Result<()> {
+    fn validate_single_input(expected_type: &str, value: &serde_json::Value) -> Result<()> {
         // Basic type checking based on JSON value type
         let type_mismatch = match (expected_type, value) {
             // String types
@@ -392,12 +366,12 @@ impl<'ast> TileRunner<'ast> {
         };
 
         if type_mismatch {
-            Err(anyhow!(
+            Err(Error::Other(format!(
                 "Expects input of type '{}', but got {}\n\
                  Hint: Use proper JSON format, e.g., '\"hello\"' for strings, 42 for numbers",
                 expected_type,
                 Self::json_type_name(value)
-            ))
+            )))
         } else {
             Ok(())
         }
@@ -406,36 +380,36 @@ impl<'ast> TileRunner<'ast> {
     fn validate_multiple_inputs(
         expected_types: &[String],
         value: &serde_json::Value,
-    ) -> anyhow::Result<()> {
+    ) -> Result<()> {
         match value {
             serde_json::Value::Array(arr) => {
                 if arr.len() != expected_types.len() {
-                    Err(anyhow!(
+                    Err(Error::Other(format!(
                         "Expects {} argument(s), but got {} in array.\n\
                          Expected types: ({})\n\
                          Hint: Use JSON array format, e.g., '[\"hello\", 42]'",
                         expected_types.len(),
                         arr.len(),
                         expected_types.join(", ")
-                    ))
+                    )))
                 } else {
                     // Optionally validate each element
                     for (i, (expected, actual)) in expected_types.iter().zip(arr.iter()).enumerate()
                     {
                         if let Err(e) = Self::validate_single_input(expected, actual) {
-                            return Err(anyhow!("Argument {} invalid: {}", i + 1, e));
+                            return Err(Error::Other(format!("Argument {} invalid: {}", i + 1, e)));
                         }
                     }
                     Ok(())
                 }
             }
-            _ => Err(anyhow!(
+            _ => Err(Error::Other(format!(
                 "Expects {} arguments, provide them as a JSON array.\n\
                  Expected types: ({})\n\
                  Example: --input '[\"hello\", 42]'",
                 expected_types.len(),
                 expected_types.join(", ")
-            )),
+            ))),
         }
     }
 
@@ -456,18 +430,18 @@ impl<'ast> TileRunner<'ast> {
 ///
 /// SequenceRunner encapsulates a sequence of pre-built TileRunners that can
 /// be executed in order, with each tile's output becoming the next tile's input.
-pub struct SequenceRunner<'ast> {
+pub struct SequenceRunner<'ast, 'b> {
     /// The backend used for execution (shared).
     backend: Arc<dyn Backend>,
     /// Pre-built TileRunners in execution order.
-    step_runners: Vec<StepRunner<'ast>>,
+    step_runners: Vec<StepRunner<'ast, 'b>>,
     /// The sequence name.
     sequence_name: String,
 }
 
-pub enum StepRunner<'ast> {
-    Tile(TileRunner<'ast>),
-    Sequence(SequenceRunner<'ast>),
+pub enum StepRunner<'ast, 'b> {
+    Tile(TileRunner<'ast, 'b>),
+    Sequence(SequenceRunner<'ast, 'b>),
 }
 
 // impl<'ast> SequenceRunner<'ast> {

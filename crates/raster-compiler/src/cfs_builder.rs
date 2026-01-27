@@ -5,7 +5,7 @@
 
 use raster_core::cfs::{ControlFlowSchema, InputBinding, SequenceDef, TileDef};
 
-use anyhow::Result;
+use raster_core::Result;
 use crate::Project;
 use crate::flow_resolver::FlowResolver;
 use crate::sequence::{Sequence, SequenceDiscovery};

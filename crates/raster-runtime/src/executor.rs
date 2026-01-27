@@ -1,23 +1,23 @@
 use raster_core::{Result, schema::SequenceSchema, trace::Trace};
-use raster_backend::{Backend, NativeBackend};
+use raster_backend::{Backend};
 use crate::tracer::Tracer;
 
 /// Executes tiles according to a sequence schema.
 pub struct Executor<T: Tracer> {
-    backend: Box<dyn Backend>,
+    backend: Option<Box<dyn Backend>>,
     tracer: T,
 }
 
 impl<T: Tracer> Executor<T> {
     pub fn new(tracer: T) -> Self {
         Self {
-            backend: Box::new(NativeBackend::new()),
+            backend: None,
             tracer,
         }
     }
 
     pub fn with_backend(mut self, backend: Box<dyn Backend>) -> Self {
-        self.backend = backend;
+        self.backend = Some(backend);
         self
     }
 

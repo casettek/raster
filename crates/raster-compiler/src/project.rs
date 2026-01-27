@@ -1,11 +1,8 @@
 use std::path::Path;
 use std::path::PathBuf;
 
+use raster_core::{Error, Result};
 use crate::ast::ProjectAst;
-use anyhow::{anyhow, Result};
-
-use crate::tile::TileDiscovery;
-use crate::tile::Tile;
 
 #[derive(Debug, Clone)]
 pub struct Project {
@@ -14,18 +11,22 @@ pub struct Project {
 
     /// Path to the project root.
     /// TODO: Change to &Path
-    pub root_path: PathBuf,
+    pub root_dir: PathBuf,
+    pub output_dir: PathBuf,
 }
 
 impl Project {
-    pub fn new(project_path: PathBuf) -> Result<Self> {
-        let name = Self::project_name(&project_path)?;
-        let ast = ProjectAst::new(&project_path)?;
+    pub fn new(root_dir: PathBuf) -> Result<Self> {
+        let name = Self::project_name(&root_dir)?;
+        let ast = ProjectAst::new(&root_dir)?;
+
+        let output_dir = root_dir.join("target").join("raster");
 
         Ok(Self {
             name,
             ast,
-            root_path: project_path,
+            root_dir,
+            output_dir,
         })
     }
 
@@ -46,14 +47,20 @@ impl Project {
             }
         }
 
-        Err(anyhow!("Could not determine project name"))
+        Err(Error::Other("Could not determine project name".into()))
     }
 
 }
 
-impl Project {
-    pub fn tiles(&self) -> Vec<Tile<'_>> {
-        // TODO: Lazy load tiles from the project
-        TileDiscovery::new(self).tiles
+pub struct ProjectDiscovery {
+    pub project: Project,
+    pub project_ast: ProjectAst,
+}
+
+impl ProjectDiscovery {
+    pub fn new(project: Project) -> Result<Self> {
+        let project_ast = ProjectAst::new(&project.root_dir)?;
+
+        Ok(Self { project, project_ast })
     }
 }

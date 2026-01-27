@@ -1,0 +1,17 @@
+[package]
+name = "raster-backend-native"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+raster-core.workspace = true
+raster-backend.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+bincode.workspace = true
+base64.workspace = true

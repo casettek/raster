@@ -6,16 +6,13 @@
 //! Native execution works via subprocess: the CLI builds the user's project
 //! and runs it with special arguments to execute a specific tile.
 
-use crate::backend::{
-    ArtifactStore, Backend, CompilationArtifact, ExecutionMode, ResourceEstimate, TileExecutionResult,
+use raster_backend::{
+    ArtifactStore, Backend, CompilationArtifact, ExecutionMode, ResourceEstimate, TileExecutionResult
 };
 use raster_core::{Error, Result, tile::TileMetadata};
-use serde::{Deserialize, Serialize};
-use std::any::Any;
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::Command;
 
+use std::{any::Any, fs, path::{Path, PathBuf}, process::Command};
+use serde::{Deserialize, Serialize};
 
 /// Native executable - just a path to the compiled binary.
 #[derive(Debug, Clone)]
@@ -58,26 +55,26 @@ pub struct NativeArtifactStore;
 impl ArtifactStore for NativeArtifactStore {
     fn save(
         &self,
-        executable: &dyn CompilationArtifact,
+        artifact: &dyn CompilationArtifact,
         output_dir: &Path,
         source_hash: Option<&str>,
     ) -> Result<PathBuf> {
-        let native = executable
+        let native_artifact = artifact
             .as_any()
             .downcast_ref::<NativeCompilationArtifact>()
             .ok_or_else(|| Error::Other("Invalid executable type for NativeArtifactStore".into()))?;
 
         let artifact_dir = output_dir
             .join("tiles")
-            .join(&native.tile_id)
+            .join(&native_artifact.tile_id)
             .join("native");
 
         fs::create_dir_all(&artifact_dir).map_err(Error::Io)?;
 
         // Write manifest with binary path reference
         let manifest = NativeManifest {
-            tile_id: native.tile_id.clone(),
-            binary_path: native.binary_path.clone(),
+            tile_id: native_artifact.tile_id.clone(),
+            binary_path: native_artifact.binary_path.clone(),
             source_hash: source_hash.map(String::from),
         };
 
@@ -307,6 +304,7 @@ impl Backend for NativeBackend {
             })?;
 
         println!("output: {:#?}", output);
+        println!("output stdout: {:#?} {:?}", output, output.stdout);
         if !output.status.success() {
             return Err(Error::Other(format!(
                 "Tile execution failed: {}",

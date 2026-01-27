@@ -10,7 +10,7 @@ members = [
     "crates/raster-backend-risc0",
     "crates/raster-analysis",
     "crates/raster-cli",
-    "examples/hello-tiles",
+    "examples/hello-tiles", "crates/raster-backend-native",
 ]
 
 [workspace.package]
@@ -26,6 +26,7 @@ raster-core = { path = "crates/raster-core", version = "0.1.0", default-features
 raster-macros = { path = "crates/raster-macros", version = "0.1.0" }
 raster-runtime = { path = "crates/raster-runtime", version = "0.1.0" }
 raster-backend = { path = "crates/raster-backend", version = "0.1.0" }
+raster-backend-native = { path = "crates/raster-backend-native", version = "0.1.0" }
 raster-backend-risc0 = { path = "crates/raster-backend-risc0", version = "0.1.0" }
 raster-compiler = { path = "crates/raster-compiler", version = "0.1.0" }
 raster-analysis = { path = "crates/raster-analysis", version = "0.1.0" }
