@@ -7,12 +7,18 @@
 //! and runs it with special arguments to execute a specific tile.
 
 use raster_backend::{
-    ArtifactStore, Backend, CompilationArtifact, ExecutionMode, ResourceEstimate, TileExecutionResult
+    ArtifactStore, Backend, CompilationArtifact, ExecutionMode, ResourceEstimate,
+    TileExecutionResult,
 };
-use raster_core::{Error, Result, tile::TileMetadata};
+use raster_core::{tile::TileMetadata, Error, Result};
 
-use std::{any::Any, fs, path::{Path, PathBuf}, process::Command};
 use serde::{Deserialize, Serialize};
+use std::{
+    any::Any,
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 /// Native executable - just a path to the compiled binary.
 #[derive(Debug, Clone)]
@@ -62,7 +68,9 @@ impl ArtifactStore for NativeArtifactStore {
         let native_artifact = artifact
             .as_any()
             .downcast_ref::<NativeCompilationArtifact>()
-            .ok_or_else(|| Error::Other("Invalid executable type for NativeArtifactStore".into()))?;
+            .ok_or_else(|| {
+                Error::Other("Invalid executable type for NativeArtifactStore".into())
+            })?;
 
         let artifact_dir = output_dir
             .join("tiles")
@@ -189,7 +197,7 @@ impl NativeBackend {
     /// Extract the binary name from a Cargo.toml file.
     fn extract_binary_name(project_path: &std::path::Path) -> Option<String> {
         let cargo_toml = std::fs::read_to_string(project_path.join("Cargo.toml")).ok()?;
-        
+
         // Simple parsing: look for name = "..." in [package] section
         let mut in_package = false;
         for line in cargo_toml.lines() {
@@ -226,11 +234,16 @@ impl Backend for NativeBackend {
         "native"
     }
 
-    fn compile_tile(&self, tile_metadata: &TileMetadata, _content_hash: Option<&str>) -> Result<Box<dyn CompilationArtifact>> {
+    fn compile_tile(
+        &self,
+        tile_metadata: &TileMetadata,
+        _content_hash: Option<&str>,
+    ) -> Result<Box<dyn CompilationArtifact>> {
         // Native backend builds the user's project
-        let project_path = self.project_path.as_ref().ok_or_else(|| {
-            Error::Other("Native backend requires project_path to be set".into())
-        })?;
+        let project_path = self
+            .project_path
+            .as_ref()
+            .ok_or_else(|| Error::Other("Native backend requires project_path to be set".into()))?;
 
         // Build the project
         let output = Command::new("cargo")
@@ -257,15 +270,12 @@ impl Backend for NativeBackend {
             Self::find_target_path(project_path).unwrap_or_else(|| project_path.join("target"));
         let binary_path = target_dir.join("release").join(&binary_name);
 
-
-
         if !binary_path.exists() {
             return Err(Error::Other(format!(
                 "Binary not found at: {}",
                 binary_path.display()
             )));
         }
-
 
         Ok(Box::new(NativeCompilationArtifact {
             binary_path,
@@ -280,7 +290,7 @@ impl Backend for NativeBackend {
         mode: ExecutionMode,
     ) -> Result<TileExecutionResult> {
         // Downcast to NativeExecutable
-        let native = compilation_artifact 
+        let native = compilation_artifact
             .as_any()
             .downcast_ref::<NativeCompilationArtifact>()
             .ok_or_else(|| Error::Other("Expected NativeExecutable".into()))?;
@@ -299,12 +309,8 @@ impl Backend for NativeBackend {
         let output = Command::new(&native.binary_path)
             .args(["--raster-exec", &native.tile_id, "--input", &input_b64])
             .output()
-            .map_err(|e| {
-                Error::Other(format!("Failed to execute binary: {}", e))
-            })?;
+            .map_err(|e| Error::Other(format!("Failed to execute binary: {}", e)))?;
 
-        println!("output: {:#?}", output);
-        println!("output stdout: {:#?} {:?}", output, output.stdout);
         if !output.status.success() {
             return Err(Error::Other(format!(
                 "Tile execution failed: {}",
@@ -314,6 +320,23 @@ impl Backend for NativeBackend {
 
         // Parse output - look for RASTER_OUTPUT: line
         let stdout = String::from_utf8_lossy(&output.stdout);
+
+        // Extract and pretty-print all RASTER_TRACE items
+        for line in stdout.clone().lines() {
+            if let Some(json_str) = line.strip_prefix("RASTER_TRACE:") {
+                match serde_json::from_str::<serde_json::Value>(json_str) {
+                    Ok(trace_item) => {
+                        if let Ok(pretty) = serde_json::to_string_pretty(&trace_item) {
+                            println!("{}", pretty);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to parse RASTER_TRACE: {}", e);
+                    }
+                }
+            }
+        }
+
         let output_b64 = stdout
             .lines()
             .find(|l| l.starts_with("RASTER_OUTPUT:"))
@@ -330,7 +353,10 @@ impl Backend for NativeBackend {
 
         // Return result with simulated cycles (native doesn't have real cycle counts)
         let simulated_cycles = if self.simulate_cycles { 1000 } else { 0 };
-        Ok(TileExecutionResult::estimate(output_bytes, simulated_cycles))
+        Ok(TileExecutionResult::estimate(
+            output_bytes,
+            simulated_cycles,
+        ))
     }
 
     fn artifact_store(&self) -> &dyn ArtifactStore {
@@ -344,7 +370,11 @@ impl Backend for NativeBackend {
         })
     }
 
-    fn verify_receipt(&self, _executable: &dyn CompilationArtifact, _receipt: &[u8]) -> Result<bool> {
+    fn verify_receipt(
+        &self,
+        _executable: &dyn CompilationArtifact,
+        _receipt: &[u8],
+    ) -> Result<bool> {
         Err(Error::Other(
             "Native backend does not support proof verification. Use the RISC0 backend.".into(),
         ))

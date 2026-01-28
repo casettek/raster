@@ -5,6 +5,35 @@ use std::vec::Vec;
 use serde::{Deserialize, Serialize};
 use crate::tile::TileId;
 
+/// Describes an input parameter for a tile function.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TraceInputParam {
+    /// Parameter name from the function signature
+    pub name: String,
+    /// Type name as a string (e.g., "u64", "String")
+    pub ty: String,
+}
+
+/// A structured trace item emitted during tile execution.
+///
+/// This captures the tile's function signature metadata along with
+/// the serialized input/output data for complete traceability.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TileTraceItem {
+    /// The tile function name/identifier
+    pub tile: String,
+    /// Optional human-readable description
+    pub desc: Option<String>,
+    /// Input parameter metadata (name and type for each parameter)
+    pub inputs: Vec<TraceInputParam>,
+    /// Base64-encoded postcard-serialized input data
+    pub input_data: String,
+    /// The return type as a string (e.g., "String", "Result<u64, Error>")
+    pub output_type: Option<String>,
+    /// Base64-encoded postcard-serialized output data
+    pub output_data: String,
+}
+
 /// A complete execution trace.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Trace {

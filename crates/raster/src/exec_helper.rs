@@ -151,3 +151,4 @@ pub fn parse_main_input<T: DeserializeOwned>() -> Option<T> {
     // Parse JSON directly into the target type
     serde_json::from_str(input_json).ok()
 }
+

@@ -5,8 +5,84 @@
 //! - `#[sequence]` - Declares tile ordering and control flow
 
 use proc_macro::TokenStream;
-use quote::{format_ident, quote};
+use quote::{format_ident, quote, ToTokens};
 use syn::{parse_macro_input, visit::Visit, Expr, ExprCall, ExprPath, FnArg, ItemFn, Pat, ReturnType, Type};
+
+/// Convert a syn::Type to a string representation for trace metadata.
+fn type_to_string(ty: &Type) -> String {
+    ty.to_token_stream().to_string().replace(" ", "")
+}
+
+/// Generate the deserialization and call logic for a tile function.
+///
+/// This handles three cases:
+/// 1. No arguments - just call the function
+/// 2. Single argument - deserialize directly from input bytes
+/// 3. Multiple arguments - deserialize as a tuple from input bytes
+fn add_serialization(
+    fn_name: &syn::Ident,
+    input_types: &[&Type],
+    input_names: &[&syn::Ident],
+    returns_result: bool,
+) -> proc_macro2::TokenStream {
+    if input_types.is_empty() {
+        // No arguments
+        if returns_result {
+            quote! {
+                let result = #fn_name()?;
+                let output = ::raster::core::postcard::to_allocvec(&result)
+                    .map_err(|e| ::raster::core::Error::Serialization(::alloc::format!("Failed to serialize output: {}", e)))?;
+            }
+        } else {
+            quote! {
+                let result = #fn_name();
+                let output = ::raster::core::postcard::to_allocvec(&result)
+                    .map_err(|e| ::raster::core::Error::Serialization(::alloc::format!("Failed to serialize output: {}", e)))?;
+            }
+        }
+    } else if input_types.len() == 1 {
+        // Single argument - deserialize directly
+        let ty = input_types[0];
+        let name = input_names[0];
+        if returns_result {
+            quote! {
+                let #name: #ty = ::raster::core::postcard::from_bytes(input)
+                    .map_err(|e| ::raster::core::Error::Serialization(::alloc::format!("Failed to deserialize input: {}", e)))?;
+                let result = #fn_name(#name)?;
+                let output = ::raster::core::postcard::to_allocvec(&result)
+                    .map_err(|e| ::raster::core::Error::Serialization(::alloc::format!("Failed to serialize output: {}", e)))?;
+            }
+        } else {
+            quote! {
+                let #name: #ty = ::raster::core::postcard::from_bytes(input)
+                    .map_err(|e| ::raster::core::Error::Serialization(::alloc::format!("Failed to deserialize input: {}", e)))?;
+                let result = #fn_name(#name);
+                let output = ::raster::core::postcard::to_allocvec(&result)
+                    .map_err(|e| ::raster::core::Error::Serialization(::alloc::format!("Failed to serialize output: {}", e)))?;
+            }
+        }
+    } else {
+        // Multiple arguments - deserialize as tuple
+        let tuple_type = quote! { (#(#input_types),*) };
+        if returns_result {
+            quote! {
+                let (#(#input_names),*): #tuple_type = ::raster::core::postcard::from_bytes(input)
+                    .map_err(|e| ::raster::core::Error::Serialization(::alloc::format!("Failed to deserialize input: {}", e)))?;
+                let result = #fn_name(#(#input_names),*)?;
+                let output = ::raster::core::postcard::to_allocvec(&result)
+                    .map_err(|e| ::raster::core::Error::Serialization(::alloc::format!("Failed to serialize output: {}", e)))?;
+            }
+        } else {
+            quote! {
+                let (#(#input_names),*): #tuple_type = ::raster::core::postcard::from_bytes(input)
+                    .map_err(|e| ::raster::core::Error::Serialization(::alloc::format!("Failed to deserialize input: {}", e)))?;
+                let result = #fn_name(#(#input_names),*);
+                let output = ::raster::core::postcard::to_allocvec(&result)
+                    .map_err(|e| ::raster::core::Error::Serialization(::alloc::format!("Failed to serialize output: {}", e)))?;
+            }
+        }
+    }
+}
 
 /// Parses optional tile attributes from the macro invocation.
 struct TileAttrs {
@@ -86,11 +162,12 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
     let attrs = TileAttrs::parse(attr);
     let input_fn = parse_macro_input!(item as ItemFn);
 
+    let with_tracing = add_tracing(&input_fn);
+
     let fn_name = &input_fn.sig.ident;
     let fn_name_str = fn_name.to_string();
 
     let wrapper_name = format_ident!("__raster_tile_entry_{}", fn_name);
-    let registration_name = format_ident!("__RASTER_TILE_REGISTRATION_{}", fn_name.to_string().to_uppercase());
 
     // Extract input types for deserialization
     let input_types: Vec<_> = input_fn
@@ -117,6 +194,37 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
         })
         .collect();
 
+    // Extract input parameter names as string literals for trace metadata
+    let input_name_strs: Vec<String> = input_fn
+        .sig
+        .inputs
+        .iter()
+        .filter_map(|arg| match arg {
+            FnArg::Typed(pat_type) => match &*pat_type.pat {
+                Pat::Ident(pat_ident) => Some(pat_ident.ident.to_string()),
+                _ => None,
+            },
+            FnArg::Receiver(_) => None,
+        })
+        .collect();
+
+    // Extract input type names as string literals for trace metadata
+    let input_type_strs: Vec<String> = input_fn
+        .sig
+        .inputs
+        .iter()
+        .filter_map(|arg| match arg {
+            FnArg::Typed(pat_type) => Some(type_to_string(&pat_type.ty)),
+            FnArg::Receiver(_) => None,
+        })
+        .collect();
+
+    // Extract return type as a string for trace metadata
+    let output_type_str: Option<String> = match &input_fn.sig.output {
+        ReturnType::Default => None,
+        ReturnType::Type(_, ty) => Some(type_to_string(ty)),
+    };
+
     // Check if function returns a Result or a plain value
     let returns_result = match &input_fn.sig.output {
         ReturnType::Default => false,
@@ -134,52 +242,6 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
-    // Generate the deserialization and call logic based on number of args
-    let deserialize_and_call = if input_types.is_empty() {
-        // No arguments
-        if returns_result {
-            quote! {
-                let result = #fn_name()?;
-            }
-        } else {
-            quote! {
-                let result = #fn_name();
-            }
-        }
-    } else if input_types.len() == 1 {
-        // Single argument - deserialize directly
-        let ty = input_types[0];
-        let name = input_names[0];
-        if returns_result {
-            quote! {
-                let #name: #ty = ::raster::core::postcard::from_bytes(input)
-                    .map_err(|e| ::raster::core::Error::Serialization(::alloc::format!("Failed to deserialize input: {}", e)))?;
-                let result = #fn_name(#name)?;
-            }
-        } else {
-            quote! {
-                let #name: #ty = ::raster::core::postcard::from_bytes(input)
-                    .map_err(|e| ::raster::core::Error::Serialization(::alloc::format!("Failed to deserialize input: {}", e)))?;
-                let result = #fn_name(#name);
-            }
-        }
-    } else {
-        // Multiple arguments - deserialize as tuple
-        let tuple_type = quote! { (#(#input_types),*) };
-        if returns_result {
-            quote! {
-                let (#(#input_names),*): #tuple_type = ::raster::core::postcard::from_bytes(input)
-                    .map_err(|e| ::raster::core::Error::Serialization(::alloc::format!("Failed to deserialize input: {}", e)))?;
-                let result = #fn_name(#(#input_names),*)?;
-            }
-        } else {
-            quote! {
-                let (#(#input_names),*): #tuple_type = ::raster::core::postcard::from_bytes(input)
-                    .map_err(|e| ::raster::core::Error::Serialization(::alloc::format!("Failed to deserialize input: {}", e)))?;
-                let result = #fn_name(#(#input_names),*);
-            }
-        }
-    };
 
     // Generate optional metadata fields
     let estimated_cycles_expr = match attrs.estimated_cycles {
@@ -209,41 +271,47 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
         None => quote! { ::core::option::Option::None },
     };
 
+    // Generate input params array for emit_trace: &[("name", "type"), ...]
+    let input_params_tokens = if input_name_strs.is_empty() {
+        quote! { &[] }
+    } else {
+        let pairs: Vec<_> = input_name_strs
+            .iter()
+            .zip(input_type_strs.iter())
+            .map(|(name, ty)| {
+                quote! { (#name, #ty) }
+            })
+            .collect();
+        quote! { &[#(#pairs),*] }
+    };
+
+    // Generate output type expression for emit_trace
+    let output_type_for_trace = match &output_type_str {
+        Some(ty_str) => {
+            quote! { ::core::option::Option::Some(#ty_str) }
+        }
+        None => quote! { ::core::option::Option::None },
+    };
+
+    // Generate the deserialization and call logic based on number of args
+    let fn_call_with_serialization = add_serialization(
+        fn_name,
+        &input_types,
+        &input_names,
+        returns_result,
+    );
+
+
     let expanded = quote! {
         // Keep the original function unchanged
         #input_fn
 
         // Generate the ABI wrapper function (available on all platforms, no_std compatible)
         pub fn #wrapper_name(input: &[u8]) -> ::raster::core::Result<::alloc::vec::Vec<u8>> {
-            #deserialize_and_call
-
-            let output = ::raster::core::postcard::to_allocvec(&result)
-                .map_err(|e| ::raster::core::Error::Serialization(::alloc::format!("Failed to serialize output: {}", e)))?;
-
-            // Emit trace marker (only on std platforms, not on riscv32)
-            #[cfg(all(feature = "std", not(target_arch = "riscv32")))]
-            {
-                ::raster::emit_trace(#fn_name_str, #description_for_trace, input, &output);
-            }
+            #fn_call_with_serialization
 
             Ok(output)
         }
-
-        // Register the tile in the distributed slice (only on platforms that support linkme and std)
-        #[cfg(all(feature = "std", not(target_arch = "riscv32")))]
-        #[::raster::core::linkme::distributed_slice(::raster::core::registry::TILE_REGISTRY)]
-        #[linkme(crate = ::raster::core::linkme)]
-        static #registration_name: ::raster::core::registry::TileRegistration =
-            ::raster::core::registry::TileRegistration::new(
-                ::raster::core::tile::TileMetadataStatic::new(
-                    #fn_name_str,
-                    #fn_name_str,
-                    #description_expr,
-                    #estimated_cycles_expr,
-                    #max_memory_expr,
-                ),
-                #wrapper_name,
-            );
     };
 
     TokenStream::from(expanded)
@@ -503,5 +571,85 @@ pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
     
+    TokenStream::from(expanded)
+}
+
+fn add_tracing(input: &ItemFn) -> TokenStream {
+    if std::env::var("CARGO_CFG_TARGET_ARCH").map(|v| v == "riscv32").unwrap_or(false) {
+        return TokenStream::from(quote! { #input });
+    }
+
+    let fn_name = &input.sig.ident;
+    let fn_name_str = fn_name.to_string();
+    let fn_vis = &input.vis;
+    let fn_sig = &input.sig;
+    let fn_block = &input.block;
+    let fn_attrs = &input.attrs;
+
+    // Create the inner function name
+    let inner_fn_name = format_ident!("__{}_impl", fn_name);
+
+    // Get parts of the signature for the inner function
+    let fn_generics = &input.sig.generics;
+    let fn_inputs = &input.sig.inputs;
+    let fn_output = &input.sig.output;
+
+    // Extract argument names to pass to the inner function call
+    let arg_names: Vec<_> = input
+        .sig
+        .inputs
+        .iter()
+        .filter_map(|arg| {
+            if let FnArg::Typed(pat_type) = arg {
+                if let Pat::Ident(pat_ident) = &*pat_type.pat {
+                    return Some(&pat_ident.ident);
+                }
+            }
+            None
+        })
+        .collect();
+
+    // Generate the trace call code using the same pattern as trace_call!
+    // but with the original function name
+    let arg_bindings: Vec<_> = arg_names
+        .iter()
+        .enumerate()
+        .map(|(i, arg)| {
+            let var_name = format_ident!("__trace_arg_{}", i);
+            (var_name, *arg)
+        })
+        .collect();
+
+    let let_bindings = arg_bindings.iter().map(|(var_name, arg)| {
+        quote! { let #var_name = #arg; }
+    });
+
+    let call_args = arg_bindings.iter().map(|(var_name, _)| {
+        quote! { #var_name }
+    });
+
+    let trace_args = arg_bindings.iter().enumerate().map(|(i, (var_name, _))| {
+        let arg_name = format!("arg{}", i);
+        quote! { (#arg_name, &format!("{:?}", #var_name) as &str) }
+    });
+
+    let expanded = quote! {
+        #(#fn_attrs)*
+        #fn_vis #fn_sig {
+            #[inline(always)]
+            fn #inner_fn_name #fn_generics (#fn_inputs) #fn_output #fn_block
+
+            #(#let_bindings)*
+            let __trace_result = #inner_fn_name(#(#call_args),*);
+            #[cfg(all(feature = "std", not(target_arch = "riscv32")))]
+            tracing_lite::__emit_trace(
+                #fn_name_str,
+                &[#(#trace_args),*],
+                &format!("{:?}", __trace_result)
+            );
+            __trace_result
+        }
+    };
+
     TokenStream::from(expanded)
 }

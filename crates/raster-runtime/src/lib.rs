@@ -5,8 +5,10 @@
 //! - Optional execution tracing
 //! - Trace capture and storage
 
-pub mod executor;
 pub mod tracer;
 
-pub use executor::Executor;
-pub use tracer::{Tracer, FileTracer, NoOpTracer};
+pub use tracer::{JsonSubscriber, Subscriber};
+
+// Re-export tile trace emission function for use by generated macro code
+#[doc(hidden)]
+pub use tracer::emit_trace;
