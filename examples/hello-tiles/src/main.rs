@@ -1,4 +1,6 @@
 use hello_tiles::{current_wish, exclaim, greet, raster_wish};
+use std::fs::File;
+use std::io::BufWriter;
 
 /// The main sequence that greets and adds emphasis.
 ///
@@ -27,6 +29,14 @@ fn wish_sequence(name: String) -> String {
 /// Run with: `cargo run -- --input '"YourName"'`
 #[raster::main]
 fn main(name: String) {
+    // let file = File::create("traces.json").expect("Failed to create trace file");
+    
+    // // Optional: wrap in BufWriter for better performance
+    // let writer = BufWriter::new(file);
+    
+    // // Initialize the tracer with the file subscriber
+    // raster::init_with(raster::JsonSubscriber::new(writer));
+
     let result = greet_sequence(name);
     println!("{}", result);
 }

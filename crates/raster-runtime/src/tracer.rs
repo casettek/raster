@@ -49,8 +49,24 @@ use std::sync::{Mutex, OnceLock};
 
 /// A trait for receiving trace events.
 pub trait Subscriber: Send + Sync {
-    /// Called when a function completes, with both arguments and return value.
-    fn on_trace(&self, function: &str, args: &[(&str, &str)], return_value: &str);
+    /// Called when a function completes, with full metadata and runtime values.
+    ///
+    /// # Arguments
+    /// - `function_name` - Name of the function being traced
+    /// - `param_names` - Names of the function parameters
+    /// - `param_types` - Types of the function parameters
+    /// - `return_type` - Return type of the function (None for unit)
+    /// - `input_values` - Debug-formatted input values at runtime
+    /// - `output_value` - Debug-formatted return value at runtime
+    fn on_trace(
+        &self,
+        function_name: &str,
+        param_names: &[&str],
+        param_types: &[&str],
+        return_type: Option<&str>,
+        input_values: &[&str],
+        output_value: &str,
+    );
 }
 
 /// The global subscriber instance.
@@ -71,20 +87,43 @@ impl<W: Write + Send> JsonSubscriber<W> {
 }
 
 impl<W: Write + Send + Sync> Subscriber for JsonSubscriber<W> {
-    fn on_trace(&self, function: &str, args: &[(&str, &str)], return_value: &str) {
-        let args_obj: serde_json::Map<String, serde_json::Value> = args
+    fn on_trace(
+        &self,
+        function_name: &str,
+        param_names: &[&str],
+        param_types: &[&str],
+        return_type: Option<&str>,
+        input_values: &[&str],
+        output_value: &str,
+    ) {
+        // Build params array with name, type, and value for each parameter
+        let params: Vec<serde_json::Value> = param_names
             .iter()
-            .map(|(k, v)| (k.to_string(), serde_json::Value::String(v.to_string())))
+            .zip(param_types.iter())
+            .zip(input_values.iter())
+            .map(|((name, ty), value)| {
+                serde_json::json!({
+                    "name": *name,
+                    "type": *ty,
+                    "value": *value
+                })
+            })
             .collect();
 
+        // Build return object with type and value
+        let return_obj = serde_json::json!({
+            "type": return_type.unwrap_or("()"),
+            "value": output_value
+        });
+
         let event = serde_json::json!({
-            "function": function,
-            "args": args_obj,
-            "return": return_value,
+            "function": function_name,
+            "params": params,
+            "return": return_obj,
         });
 
         if let Ok(mut writer) = self.writer.lock() {
-            let _ = writeln!(writer, "{}", event);
+            let _ = writeln!(writer, "RASTER_TRACE:{}", event);
             let _ = writer.flush();
         }
     }
@@ -110,29 +149,22 @@ pub fn init_with<S: Subscriber + 'static>(subscriber: S) {
 // This is not part of the public API.
 
 #[doc(hidden)]
-pub fn __emit_trace(function: &str, args: &[(&str, &str)], return_value: &str) {
-    if let Some(subscriber) = GLOBAL_SUBSCRIBER.get() {
-        subscriber.on_trace(function, args, return_value);
-    }
-}
-
-/// Emit a trace event for a function with binary input/output data.
-#[doc(hidden)]
-pub fn emit_trace(
+pub fn __emit_trace(
     function_name: &str,
-    input_bytes: &[u8],
-    output_bytes: &[u8],
+    param_names: &[&str],
+    param_types: &[&str],
+    return_type: Option<&str>,
+    input_values: &[&str],
+    output_value: &str,
 ) {
-    use base64::Engine;
-    
-    let input_b64 = base64::engine::general_purpose::STANDARD.encode(input_bytes);
-    let output_b64 = base64::engine::general_purpose::STANDARD.encode(output_bytes);
-    
-    let event = serde_json::json!({
-        "function": function_name,
-        "input": input_b64,
-        "output": output_b64,
-    });
-    
-    println!("{}", event);
+    if let Some(subscriber) = GLOBAL_SUBSCRIBER.get() {
+        subscriber.on_trace(
+            function_name,
+            param_names,
+            param_types,
+            return_type,
+            input_values,
+            output_value,
+        );
+    }
 }

@@ -6,80 +6,117 @@
 
 use proc_macro::TokenStream;
 use quote::{format_ident, quote, ToTokens};
-use syn::{parse_macro_input, visit::Visit, Expr, ExprCall, ExprPath, FnArg, ItemFn, Pat, ReturnType, Type};
+use syn::{
+    parse_macro_input, visit::Visit, Expr, ExprCall, ExprPath, FnArg, ItemFn, Pat, ReturnType, Type,
+};
 
-/// Convert a syn::Type to a string representation for trace metadata.
-fn type_to_string(ty: &Type) -> String {
-    ty.to_token_stream().to_string().replace(" ", "")
+/// Extract input types and parameter names from a function signature.
+fn extract_inputs(input: &ItemFn) -> (Vec<&Type>, Vec<&syn::Ident>) {
+    input
+        .sig
+        .inputs
+        .iter()
+        .filter_map(|arg| {
+            if let FnArg::Typed(pat_type) = arg {
+                if let Pat::Ident(pat_ident) = &*pat_type.pat {
+                    return Some((&*pat_type.ty, &pat_ident.ident));
+                }
+            }
+            None
+        })
+        .unzip()
 }
 
-/// Generate the deserialization and call logic for a tile function.
+/// Check if the function returns a Result type.
+fn returns_result(input: &ItemFn) -> bool {
+    matches!(&input.sig.output, ReturnType::Type(_, ty) if {
+        let ty_str = ty.to_token_stream().to_string();
+        ty_str.starts_with("Result") || ty_str.contains(":: Result")
+    })
+}
+
+/// Generate code to capture input values for tracing BEFORE the function call.
 ///
-/// This handles three cases:
-/// 1. No arguments - just call the function
-/// 2. Single argument - deserialize directly from input bytes
-/// 3. Multiple arguments - deserialize as a tuple from input bytes
-fn add_serialization(
-    fn_name: &syn::Ident,
-    input_types: &[&Type],
-    input_names: &[&syn::Ident],
-    returns_result: bool,
-) -> proc_macro2::TokenStream {
-    if input_types.is_empty() {
-        // No arguments
-        if returns_result {
-            quote! {
-                let result = #fn_name()?;
-                let output = ::raster::core::postcard::to_allocvec(&result)
-                    .map_err(|e| ::raster::core::Error::Serialization(::alloc::format!("Failed to serialize output: {}", e)))?;
-            }
-        } else {
-            quote! {
-                let result = #fn_name();
-                let output = ::raster::core::postcard::to_allocvec(&result)
-                    .map_err(|e| ::raster::core::Error::Serialization(::alloc::format!("Failed to serialize output: {}", e)))?;
-            }
+/// Returns a TokenStream that captures input values as formatted strings.
+fn gen_capture_inputs(input: &ItemFn) -> proc_macro2::TokenStream {
+    let (_, param_idents) = extract_inputs(input);
+    let param_count = param_idents.len();
+
+    if param_idents.is_empty() {
+        quote! {
+            #[cfg(all(feature = "std", not(target_arch = "riscv32")))]
+            let __trace_inputs: [::alloc::string::String; 0] = [];
         }
+    } else {
+        let format_exprs: Vec<_> = param_idents
+            .iter()
+            .map(|ident| quote! { ::alloc::format!("{:?}", #ident) })
+            .collect();
+        quote! {
+            #[cfg(all(feature = "std", not(target_arch = "riscv32")))]
+            let __trace_inputs: [::alloc::string::String; #param_count] = [
+                #(#format_exprs),*
+            ];
+        }
+    }
+}
+
+/// Generate only the input deserialization code.
+///
+/// Returns a TokenStream that deserializes input bytes into the appropriate variables.
+fn gen_inputs_deserialization(input: &ItemFn) -> proc_macro2::TokenStream {
+    let (input_types, input_names) = extract_inputs(input);
+
+    if input_types.is_empty() {
+        // No arguments - no deserialization needed
+        quote! {}
     } else if input_types.len() == 1 {
         // Single argument - deserialize directly
         let ty = input_types[0];
         let name = input_names[0];
-        if returns_result {
-            quote! {
-                let #name: #ty = ::raster::core::postcard::from_bytes(input)
-                    .map_err(|e| ::raster::core::Error::Serialization(::alloc::format!("Failed to deserialize input: {}", e)))?;
-                let result = #fn_name(#name)?;
-                let output = ::raster::core::postcard::to_allocvec(&result)
-                    .map_err(|e| ::raster::core::Error::Serialization(::alloc::format!("Failed to serialize output: {}", e)))?;
-            }
-        } else {
-            quote! {
-                let #name: #ty = ::raster::core::postcard::from_bytes(input)
-                    .map_err(|e| ::raster::core::Error::Serialization(::alloc::format!("Failed to deserialize input: {}", e)))?;
-                let result = #fn_name(#name);
-                let output = ::raster::core::postcard::to_allocvec(&result)
-                    .map_err(|e| ::raster::core::Error::Serialization(::alloc::format!("Failed to serialize output: {}", e)))?;
-            }
+        quote! {
+            let #name: #ty = ::raster::core::postcard::from_bytes(input)
+                .map_err(|e| ::raster::core::Error::Serialization(::alloc::format!("Failed to deserialize input: {}", e)))?;
         }
     } else {
         // Multiple arguments - deserialize as tuple
         let tuple_type = quote! { (#(#input_types),*) };
-        if returns_result {
-            quote! {
-                let (#(#input_names),*): #tuple_type = ::raster::core::postcard::from_bytes(input)
-                    .map_err(|e| ::raster::core::Error::Serialization(::alloc::format!("Failed to deserialize input: {}", e)))?;
-                let result = #fn_name(#(#input_names),*)?;
-                let output = ::raster::core::postcard::to_allocvec(&result)
-                    .map_err(|e| ::raster::core::Error::Serialization(::alloc::format!("Failed to serialize output: {}", e)))?;
-            }
+        quote! {
+            let (#(#input_names),*): #tuple_type = ::raster::core::postcard::from_bytes(input)
+                .map_err(|e| ::raster::core::Error::Serialization(::alloc::format!("Failed to deserialize input: {}", e)))?;
+        }
+    }
+}
+
+/// Add output serialization to the code pipeline.
+///
+/// Wraps the provided code with serialization of `result` to `output`.
+fn gen_output_serialization(_input: &ItemFn) -> proc_macro2::TokenStream {
+    quote! {
+        let output = ::raster::core::postcard::to_allocvec(&result)
+            .map_err(|e| ::raster::core::Error::Serialization(::alloc::format!("Failed to serialize output: {}", e)))?;
+    }
+}
+
+/// Generate only the function call code.
+///
+/// Returns a TokenStream that calls the function and stores the result.
+fn gen_function_call(input: &ItemFn) -> proc_macro2::TokenStream {
+    let fn_name = &input.sig.ident;
+    let (_, input_names) = extract_inputs(input);
+    let is_result = returns_result(input);
+
+    if input_names.is_empty() {
+        if is_result {
+            quote! { let result = #fn_name()?; }
         } else {
-            quote! {
-                let (#(#input_names),*): #tuple_type = ::raster::core::postcard::from_bytes(input)
-                    .map_err(|e| ::raster::core::Error::Serialization(::alloc::format!("Failed to deserialize input: {}", e)))?;
-                let result = #fn_name(#(#input_names),*);
-                let output = ::raster::core::postcard::to_allocvec(&result)
-                    .map_err(|e| ::raster::core::Error::Serialization(::alloc::format!("Failed to serialize output: {}", e)))?;
-            }
+            quote! { let result = #fn_name(); }
+        }
+    } else {
+        if is_result {
+            quote! { let result = #fn_name(#(#input_names),*)?; }
+        } else {
+            quote! { let result = #fn_name(#(#input_names),*); }
         }
     }
 }
@@ -159,89 +196,18 @@ impl TileAttrs {
 /// ```
 #[proc_macro_attribute]
 pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let attrs = TileAttrs::parse(attr);
     let input_fn = parse_macro_input!(item as ItemFn);
-
-    let with_tracing = add_tracing(&input_fn);
+    let fn_name_str = input_fn.sig.ident.to_string();
 
     let fn_name = &input_fn.sig.ident;
-    let fn_name_str = fn_name.to_string();
 
-    let wrapper_name = format_ident!("__raster_tile_entry_{}", fn_name);
+    let function_wrapper_name = format_ident!("__raster_tile_entry_{}", fn_name);
+    let registration_name = format_ident!(
+        "__RASTER_TILE_REGISTRATION_{}",
+        fn_name.to_string().to_uppercase()
+    );
 
-    // Extract input types for deserialization
-    let input_types: Vec<_> = input_fn
-        .sig
-        .inputs
-        .iter()
-        .filter_map(|arg| match arg {
-            FnArg::Typed(pat_type) => Some(&*pat_type.ty),
-            FnArg::Receiver(_) => None,
-        })
-        .collect();
-
-    // Extract input pattern names for calling the original function
-    let input_names: Vec<_> = input_fn
-        .sig
-        .inputs
-        .iter()
-        .filter_map(|arg| match arg {
-            FnArg::Typed(pat_type) => match &*pat_type.pat {
-                Pat::Ident(pat_ident) => Some(&pat_ident.ident),
-                _ => None,
-            },
-            FnArg::Receiver(_) => None,
-        })
-        .collect();
-
-    // Extract input parameter names as string literals for trace metadata
-    let input_name_strs: Vec<String> = input_fn
-        .sig
-        .inputs
-        .iter()
-        .filter_map(|arg| match arg {
-            FnArg::Typed(pat_type) => match &*pat_type.pat {
-                Pat::Ident(pat_ident) => Some(pat_ident.ident.to_string()),
-                _ => None,
-            },
-            FnArg::Receiver(_) => None,
-        })
-        .collect();
-
-    // Extract input type names as string literals for trace metadata
-    let input_type_strs: Vec<String> = input_fn
-        .sig
-        .inputs
-        .iter()
-        .filter_map(|arg| match arg {
-            FnArg::Typed(pat_type) => Some(type_to_string(&pat_type.ty)),
-            FnArg::Receiver(_) => None,
-        })
-        .collect();
-
-    // Extract return type as a string for trace metadata
-    let output_type_str: Option<String> = match &input_fn.sig.output {
-        ReturnType::Default => None,
-        ReturnType::Type(_, ty) => Some(type_to_string(ty)),
-    };
-
-    // Check if function returns a Result or a plain value
-    let returns_result = match &input_fn.sig.output {
-        ReturnType::Default => false,
-        ReturnType::Type(_, ty) => {
-            if let Type::Path(type_path) = &**ty {
-                type_path
-                    .path
-                    .segments
-                    .last()
-                    .map(|seg| seg.ident == "Result")
-                    .unwrap_or(false)
-            } else {
-                false
-            }
-        }
-    };
-
+    let attrs = TileAttrs::parse(attr);
 
     // Generate optional metadata fields
     let estimated_cycles_expr = match attrs.estimated_cycles {
@@ -262,59 +228,121 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
         None => quote! { ::core::option::Option::None },
     };
 
-    // Generate description expression for emit_trace (needs to be used in multiple places)
-    let description_for_trace = match &attrs.description {
-        Some(desc) => {
-            let desc_str = desc.as_str();
-            quote! { ::core::option::Option::Some(#desc_str) }
-        }
-        None => quote! { ::core::option::Option::None },
-    };
+    // Generate deserialization and function call
+    let inputs_deserialization = gen_inputs_deserialization(&input_fn);
+    let function_call = gen_function_call(&input_fn);
+    let output_serialization = gen_output_serialization(&input_fn);
 
-    // Generate input params array for emit_trace: &[("name", "type"), ...]
-    let input_params_tokens = if input_name_strs.is_empty() {
-        quote! { &[] }
-    } else {
-        let pairs: Vec<_> = input_name_strs
-            .iter()
-            .zip(input_type_strs.iter())
-            .map(|(name, ty)| {
-                quote! { (#name, #ty) }
-            })
-            .collect();
-        quote! { &[#(#pairs),*] }
-    };
+    // For riscv32 target, skip tracing entirely
+    if std::env::var("CARGO_CFG_TARGET_ARCH")
+        .map(|v| v == "riscv32")
+        .unwrap_or(false)
+    {
+        return TokenStream::from(quote! {
+            #input_fn 
+       
+            pub fn #function_wrapper_name(input: &[u8]) -> ::raster::core::Result<::alloc::vec::Vec<u8>> {
+                #inputs_deserialization
 
-    // Generate output type expression for emit_trace
-    let output_type_for_trace = match &output_type_str {
-        Some(ty_str) => {
+                #function_call
+                
+                #output_serialization
+                
+                Ok(output)
+            } 
+        });
+    }
+
+    // Extract parameter names and types for tracing metadata
+    let (param_names, param_types, param_idents): (Vec<_>, Vec<_>, Vec<_>) = input_fn
+        .sig
+        .inputs
+        .iter()
+        .filter_map(|arg| {
+            if let FnArg::Typed(pat_type) = arg {
+                if let Pat::Ident(pat_ident) = &*pat_type.pat {
+                    let name = pat_ident.ident.to_string();
+                    let ty = pat_type.ty.to_token_stream().to_string();
+                    let ident = &pat_ident.ident;
+                    return Some((name, ty, ident.clone()));
+                }
+            }
+            None
+        })
+        .fold((vec![], vec![], vec![]), |mut acc, (name, ty, ident)| {
+            acc.0.push(name);
+            acc.1.push(ty);
+            acc.2.push(ident);
+            acc
+        });
+
+    // Extract return type
+    let return_type_expr = match &input_fn.sig.output {
+        ReturnType::Default => quote! { ::core::option::Option::None },
+        ReturnType::Type(_, ty) => {
+            let ty_str = ty.to_token_stream().to_string();
             quote! { ::core::option::Option::Some(#ty_str) }
         }
-        None => quote! { ::core::option::Option::None },
     };
 
-    // Generate the deserialization and call logic based on number of args
-    let fn_call_with_serialization = add_serialization(
-        fn_name,
-        &input_types,
-        &input_names,
-        returns_result,
-    );
+    let param_count = param_idents.len();
 
+    // Generate code to capture input values BEFORE the function call
+    let tracer_capture_inputs = gen_capture_inputs(&input_fn);
 
-    let expanded = quote! {
+    // Generate trace emission that uses pre-captured values
+    let tracer_emit_trace = quote! {
+        #[cfg(all(feature = "std", not(target_arch = "riscv32")))]
+        {
+            let __trace_output = ::alloc::format!("{:?}", result);
+            let __trace_input_refs: [&str; #param_count] = __trace_inputs.each_ref().map(|s| s.as_str());
+            ::raster::__emit_trace(
+                #fn_name_str,
+                &[#(#param_names),*],
+                &[#(#param_types),*],
+                #return_type_expr,
+                &__trace_input_refs,
+                &__trace_output,
+            );
+        }
+    };
+
+    // Generate the wrapper body using the pipeline pattern
+    // add_tracing handles deserialization, input capture, and function call internally
+
+    TokenStream::from(quote! {
         // Keep the original function unchanged
         #input_fn
 
         // Generate the ABI wrapper function (available on all platforms, no_std compatible)
-        pub fn #wrapper_name(input: &[u8]) -> ::raster::core::Result<::alloc::vec::Vec<u8>> {
-            #fn_call_with_serialization
+        pub fn #function_wrapper_name(input: &[u8]) -> ::raster::core::Result<::alloc::vec::Vec<u8>> {
+            #inputs_deserialization
+
+            #tracer_capture_inputs
+
+            #function_call
+
+            #tracer_emit_trace
+
+            #output_serialization
 
             Ok(output)
         }
-    };
 
-    TokenStream::from(expanded)
+        #[::raster::core::linkme::distributed_slice(::raster::core::registry::TILE_REGISTRY)]
+        #[linkme(crate = ::raster::core::linkme)]
+        static #registration_name: ::raster::core::registry::TileRegistration =
+        ::raster::core::registry::TileRegistration::new(
+            ::raster::core::tile::TileMetadataStatic::new(
+                #fn_name_str,
+                #fn_name_str,
+                #description_expr,
+                #estimated_cycles_expr,
+                #max_memory_expr
+            ),
+            #function_wrapper_name,
+        );
+    })
 }
 
 /// Parses optional sequence attributes from the macro invocation.
@@ -324,9 +352,7 @@ struct SequenceAttrs {
 
 impl SequenceAttrs {
     fn parse(attr: TokenStream) -> Self {
-        let mut attrs = SequenceAttrs {
-            description: None,
-        };
+        let mut attrs = SequenceAttrs { description: None };
 
         if attr.is_empty() {
             return attrs;
@@ -361,7 +387,9 @@ struct TileCallExtractor {
 
 impl TileCallExtractor {
     fn new() -> Self {
-        Self { tile_calls: Vec::new() }
+        Self {
+            tile_calls: Vec::new(),
+        }
     }
 }
 
@@ -425,7 +453,10 @@ pub fn sequence(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let fn_name = &input_fn.sig.ident;
     let fn_name_str = fn_name.to_string();
-    let registration_name = format_ident!("__RASTER_SEQUENCE_REGISTRATION_{}", fn_name.to_string().to_uppercase());
+    let registration_name = format_ident!(
+        "__RASTER_SEQUENCE_REGISTRATION_{}",
+        fn_name.to_string().to_uppercase()
+    );
 
     // Extract tile calls from the function body
     let mut extractor = TileCallExtractor::new();
@@ -445,7 +476,10 @@ pub fn sequence(attr: TokenStream, item: TokenStream) -> TokenStream {
         None => quote! { ::core::option::Option::None },
     };
 
-    let tiles_static_name = format_ident!("__RASTER_SEQUENCE_TILES_{}", fn_name.to_string().to_uppercase());
+    let tiles_static_name = format_ident!(
+        "__RASTER_SEQUENCE_TILES_{}",
+        fn_name.to_string().to_uppercase()
+    );
 
     let expanded = quote! {
         // Keep the original function unchanged for native execution
@@ -453,7 +487,7 @@ pub fn sequence(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         // Static array of tile IDs for this sequence
         #[cfg(all(feature = "std", not(target_arch = "riscv32")))]
-        static #tiles_static_name: [&'static str; #tile_count] = [#(#tile_strs),*]; 
+        static #tiles_static_name: [&'static str; #tile_count] = [#(#tile_strs),*];
 
         // Register the sequence in the distributed slice (only on platforms that support linkme and std)
         #[cfg(all(feature = "std", not(target_arch = "riscv32")))]
@@ -520,13 +554,13 @@ pub fn sequence(attr: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let input_fn = parse_macro_input!(item as ItemFn);
-    
+
     let fn_block = &input_fn.block;
     let fn_attrs = &input_fn.attrs;
-    
+
     // Extract parameters from the function signature
     let params: Vec<_> = input_fn.sig.inputs.iter().collect();
-    
+
     // Generate input parsing code based on parameters
     let input_parsing = if params.is_empty() {
         // No parameters - no input parsing needed
@@ -546,108 +580,44 @@ pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     } else {
         // Multiple parameters - deserialize as tuple
-        let names: Vec<_> = params.iter().filter_map(|p| {
-            if let FnArg::Typed(pt) = p { Some(&pt.pat) } else { None }
-        }).collect();
-        let types: Vec<_> = params.iter().filter_map(|p| {
-            if let FnArg::Typed(pt) = p { Some(&pt.ty) } else { None }
-        }).collect();
+        let names: Vec<_> = params
+            .iter()
+            .filter_map(|p| {
+                if let FnArg::Typed(pt) = p {
+                    Some(&pt.pat)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let types: Vec<_> = params
+            .iter()
+            .filter_map(|p| {
+                if let FnArg::Typed(pt) = p {
+                    Some(&pt.ty)
+                } else {
+                    None
+                }
+            })
+            .collect();
         quote! {
             let (#(#names),*): (#(#types),*) = ::raster::parse_main_input()
                 .expect("Failed to parse --input argument. Usage: --input '[val1, val2, ...]'");
         }
     };
-    
+
     let expanded = quote! {
         #(#fn_attrs)*
         fn main() {
+            ::raster::init();
+
             if ::raster::try_execute_tile_from_args() {
                 return;
             }
-            
+
             #input_parsing
-            
+
             #fn_block
-        }
-    };
-    
-    TokenStream::from(expanded)
-}
-
-fn add_tracing(input: &ItemFn) -> TokenStream {
-    if std::env::var("CARGO_CFG_TARGET_ARCH").map(|v| v == "riscv32").unwrap_or(false) {
-        return TokenStream::from(quote! { #input });
-    }
-
-    let fn_name = &input.sig.ident;
-    let fn_name_str = fn_name.to_string();
-    let fn_vis = &input.vis;
-    let fn_sig = &input.sig;
-    let fn_block = &input.block;
-    let fn_attrs = &input.attrs;
-
-    // Create the inner function name
-    let inner_fn_name = format_ident!("__{}_impl", fn_name);
-
-    // Get parts of the signature for the inner function
-    let fn_generics = &input.sig.generics;
-    let fn_inputs = &input.sig.inputs;
-    let fn_output = &input.sig.output;
-
-    // Extract argument names to pass to the inner function call
-    let arg_names: Vec<_> = input
-        .sig
-        .inputs
-        .iter()
-        .filter_map(|arg| {
-            if let FnArg::Typed(pat_type) = arg {
-                if let Pat::Ident(pat_ident) = &*pat_type.pat {
-                    return Some(&pat_ident.ident);
-                }
-            }
-            None
-        })
-        .collect();
-
-    // Generate the trace call code using the same pattern as trace_call!
-    // but with the original function name
-    let arg_bindings: Vec<_> = arg_names
-        .iter()
-        .enumerate()
-        .map(|(i, arg)| {
-            let var_name = format_ident!("__trace_arg_{}", i);
-            (var_name, *arg)
-        })
-        .collect();
-
-    let let_bindings = arg_bindings.iter().map(|(var_name, arg)| {
-        quote! { let #var_name = #arg; }
-    });
-
-    let call_args = arg_bindings.iter().map(|(var_name, _)| {
-        quote! { #var_name }
-    });
-
-    let trace_args = arg_bindings.iter().enumerate().map(|(i, (var_name, _))| {
-        let arg_name = format!("arg{}", i);
-        quote! { (#arg_name, &format!("{:?}", #var_name) as &str) }
-    });
-
-    let expanded = quote! {
-        #(#fn_attrs)*
-        #fn_vis #fn_sig {
-            #[inline(always)]
-            fn #inner_fn_name #fn_generics (#fn_inputs) #fn_output #fn_block
-
-            #(#let_bindings)*
-            let __trace_result = #inner_fn_name(#(#call_args),*);
-            #[cfg(all(feature = "std", not(target_arch = "riscv32")))]
-            tracing_lite::__emit_trace(
-                #fn_name_str,
-                &[#(#trace_args),*],
-                &format!("{:?}", __trace_result)
-            );
-            __trace_result
         }
     };
 

@@ -7,8 +7,4 @@
 
 pub mod tracer;
 
-pub use tracer::{JsonSubscriber, Subscriber};
-
-// Re-export tile trace emission function for use by generated macro code
-#[doc(hidden)]
-pub use tracer::emit_trace;
+pub use tracer::{JsonSubscriber, Subscriber, init, init_with, __emit_trace};

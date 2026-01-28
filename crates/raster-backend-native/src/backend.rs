@@ -308,6 +308,7 @@ impl Backend for NativeBackend {
         // Run the binary with --raster-exec arguments
         let output = Command::new(&native.binary_path)
             .args(["--raster-exec", &native.tile_id, "--input", &input_b64])
+            .current_dir(".")
             .output()
             .map_err(|e| Error::Other(format!("Failed to execute binary: {}", e)))?;
 

@@ -17,21 +17,13 @@ pub use raster_macros::{tile, sequence, main};
 
 // Runtime is only available with std feature
 #[cfg(feature = "std")]
-pub use raster_runtime::{JsonSubscriber, Subscriber};
-
-// Re-export tile trace emission function for use by generated macro code (std only, not on RISC-V)
-#[cfg(all(feature = "std", not(target_arch = "riscv32")))]
-#[doc(hidden)]
-pub use raster_runtime::emit_trace;
-
+pub use raster_runtime::{JsonSubscriber, init, init_with, __emit_trace};
 // Tile execution helper for native backend subprocess communication
 #[cfg(feature = "std")]
 mod exec_helper;
 
 #[cfg(feature = "std")]
 pub use exec_helper::{try_execute_tile_from_args, parse_main_input};
-
-
 
 /// Prelude module for convenient imports.
 pub mod prelude {
