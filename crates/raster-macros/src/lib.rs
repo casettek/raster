@@ -95,8 +95,12 @@ fn gen_function_call(input: &ItemFn) -> proc_macro2::TokenStream {
     }
 }
 
-/// Parses optional tile attributes from the macro invocation.
+/// Parses tile attributes from the macro invocation.
+/// 
+/// Uses named argument `kind` for tile type: `#[tile(kind = iter)]` or `#[tile(kind = recur)]`.
 struct TileAttrs {
+    /// Tile type: "iter" (default) or "recur".
+    tile_type: String,
     estimated_cycles: Option<u64>,
     max_memory: Option<u64>,
     description: Option<String>,
@@ -105,17 +109,19 @@ struct TileAttrs {
 impl TileAttrs {
     fn parse(attr: TokenStream) -> Self {
         let mut attrs = TileAttrs {
+            tile_type: "iter".to_string(), // default to iter
             estimated_cycles: None,
             max_memory: None,
             description: None,
         };
 
         if attr.is_empty() {
-            return attrs;
+            return attrs; // Default to "iter" if no arguments
         }
 
         // Parse comma-separated key=value pairs
         let attr_str = attr.to_string();
+        
         for part in attr_str.split(',') {
             let part = part.trim();
             if part.is_empty() {
@@ -126,6 +132,12 @@ impl TileAttrs {
                 let key = key.trim();
                 let value = value.trim().trim_matches('"');
                 match key {
+                    "kind" => {
+                        match value {
+                            "iter" | "recur" => attrs.tile_type = value.to_string(),
+                            _ => panic!("Unknown tile kind '{}'. Valid kinds: iter, recur", value),
+                        }
+                    }
                     "estimated_cycles" => {
                         attrs.estimated_cycles = value.parse().ok();
                     }
@@ -152,6 +164,8 @@ impl TileAttrs {
 /// 3. Registers the tile in the global `TILE_REGISTRY` distributed slice
 ///
 /// # Attributes
+/// - `kind = iter` - Standard iterative tile (default if not specified)
+/// - `kind = recur` - Recursive tile for stateful computations
 /// - `estimated_cycles = N` - Expected cycle count for resource estimation
 /// - `max_memory = N` - Maximum memory usage in bytes
 /// - `description = "..."` - Human-readable description
@@ -163,9 +177,14 @@ impl TileAttrs {
 ///     input * 2
 /// }
 ///
-/// #[tile(estimated_cycles = 1000, description = "Greets a user")]
+/// #[tile(kind = iter, estimated_cycles = 1000, description = "Greets a user")]
 /// fn greet(name: String) -> String {
 ///     format!("Hello, {}!", name)
+/// }
+///
+/// #[tile(kind = recur)]
+/// fn iterate(state: State) -> State {
+///     // recursive computation
 /// }
 /// ```
 #[proc_macro_attribute]
@@ -278,6 +297,27 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
         );
     };
 
+ // For recursive tiles, also generate a macro with the same name that allows `tile_name!(args)` syntax
+    let recursive_macro = if attrs.tile_type == "recur" {
+        let macro_name = format_ident!("{}", fn_name);
+        quote! {
+            /// Macro wrapper for recursive tile invocation.
+            /// Use `tile_name!(args)` to invoke this recursive tile.
+            /// For native execution, this simply calls the underlying function.
+            /// The `!` syntax signals to the CFS compiler that this tile should
+            /// be executed recursively until its first output returns true.
+            #[macro_export]
+            macro_rules! #macro_name {
+                ($($args:expr),* $(,)?) => {
+                    #fn_name($($args),*)
+                };
+            }
+        }
+    } else {
+        quote! {}
+    };
+
+
     // Generate the modified original function with tracing injected
     // Use cfg to conditionally include tracing - on riscv32 or no-std, just run original body
     let traced_function = quote! {
@@ -307,7 +347,6 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
     TokenStream::from(quote! {
         // Original function with tracing injected
         #traced_function
-
         // Generate the ABI wrapper function (available on all platforms, no_std compatible)
         // The wrapper just calls the traced function - no need for separate tracing
         pub fn #function_wrapper_name(input: &[u8]) -> ::raster::core::Result<::alloc::vec::Vec<u8>> {

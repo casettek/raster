@@ -41,7 +41,7 @@ impl<'a> CfsBuilder<'a> {
             .map(|t| {
                 let input_count = t.function.inputs.len();
                 let output_count = if t.function.output.is_some() { 1 } else { 0 };
-                TileDef::new(&t.function.name, input_count, output_count)
+                TileDef::new(&t.function.name, &t.tile_type, input_count, output_count)
             })
             .collect();
 

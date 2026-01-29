@@ -1,11 +1,17 @@
 use hello_tiles::{current_wish, exclaim, greet, raster_wish};
+use raster::prelude::*;
 
-/// The main sequence that greets and adds emphasis.
+
+/// The main sequence that greets and adds emphasis, with recursive counting.
 ///
 /// This sequence:
 /// 1. Takes a name as input
 /// 2. Generates a greeting with `greet`
 /// 3. Adds emphasis with `exclaim`
+/// 4. Recursively counts to 5 using `count_to!`
+///
+/// The `!` suffix on `count_to!` invokes the recursive tile, which will
+/// execute repeatedly until its first output (done) returns true.
 ///
 /// Run with: `cargo run -- --input '"Raster"'`
 /// Or: `cargo raster preview --input '"Raster"'`

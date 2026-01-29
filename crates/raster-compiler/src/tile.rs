@@ -1,9 +1,8 @@
 use std::path::PathBuf;
 
-use crate::{ProjectAst, ast::FunctionAstItem};
 use crate::Project;
+use crate::{ast::FunctionAstItem};
 
-use std::io::Read;
 
 use raster_core::tile::{TileId, TileMetadata};
 
@@ -14,6 +13,8 @@ pub struct TileResult {
 #[derive(Debug, Clone)]
 pub struct Tile<'ast> {
     pub function: &'ast FunctionAstItem,
+    /// Tile type (e.g., "tile", "recur").
+    pub tile_type: String,
     pub estimated_cycles: Option<u64>,
     pub max_memory: Option<u64>,
     pub description: Option<String>,
@@ -89,6 +90,10 @@ impl<'ast> TileDiscovery<'ast> {
             .iter()
             .find(|m| m.name == "tile" || m.name == "raster::tile");
 
+        let tile_type = tile_macro
+            .and_then(|m| m.args.get("kind").cloned())
+            .unwrap_or_else(|| "iter".to_string());
+
         let estimated_cycles = tile_macro
             .and_then(|m| m.args.get("estimated_cycles"))
             .and_then(|v| v.parse().ok());
@@ -101,6 +106,7 @@ impl<'ast> TileDiscovery<'ast> {
 
         Tile {
             function: func,
+            tile_type,
             estimated_cycles,
             max_memory,
             description,
@@ -117,4 +123,3 @@ impl<'ast> TileDiscovery<'ast> {
         self.tiles.iter().any(|t| t.function.name == name)
     }
 }
-

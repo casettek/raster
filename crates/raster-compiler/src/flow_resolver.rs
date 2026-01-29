@@ -201,12 +201,14 @@ mod tests {
         // Create tiles
         let greet_tile = Tile {
             function: &greet_func,
+            tile_type: "tile".to_string(),
             estimated_cycles: None,
             max_memory: None,
             description: None,
         };
         let exclaim_tile = Tile {
             function: &exclaim_func,
+            tile_type: "iter".to_string(),
             estimated_cycles: None,
             max_memory: None,
             description: None,
