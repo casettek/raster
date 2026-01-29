@@ -7,4 +7,4 @@
 
 pub mod tracer;
 
-pub use tracer::{JsonSubscriber, Subscriber, init, init_with, __emit_trace};
+pub use tracer::{JsonSubscriber, Subscriber, init, init_with, __emit_trace, ExecutionCommitmentSubscriber};

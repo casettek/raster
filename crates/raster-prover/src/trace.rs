@@ -7,25 +7,11 @@ use bridgetree::{Hashable, Level, NonEmptyFrontier};
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::fmt::Debug;
+use std::io::Write;
 
 use crate::error::{BitPackerError, Result};
 use crate::precomputed::{EMPTY_TRIE_NODES, HASH_SIZE};
-
-/// A trace item containing input and output states.
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
-pub struct RawTraceItem<T> {
-    /// Input state for this step.
-    pub input: T,
-    /// Output state after execution.
-    pub output: T,
-}
-
-impl<T> RawTraceItem<T> {
-    /// Create a new trace item with the given input and output.
-    pub fn new(input: T, output: T) -> Self {
-        Self { input, output }
-    }
-}
+use raster_core::trace::TileTraceItem;
 
 /// Trait for types that can be hashed to bytes.
 pub trait BytesHashable {
@@ -38,10 +24,7 @@ pub trait BytesHashable {
     }
 }
 
-impl<T> BytesHashable for RawTraceItem<T>
-where
-    T: serde::Serialize + for<'de> serde::Deserialize<'de>,
-{
+impl BytesHashable for TileTraceItem {
     fn hash(&self) -> Vec<u8> {
         let data = bincode::serialize(self).expect("Failed to serialize for hashing");
         let mut hasher = Sha256::new();
@@ -112,10 +95,7 @@ impl ExecutionCommitment {
     ///
     /// Returns a vector of Merkle roots, one for each item in the trace.
     /// Each root represents the commitment up to and including that item.
-    pub fn from<T: serde::Serialize + for<'de> serde::Deserialize<'de> + Clone + Debug>(
-        items: &[RawTraceItem<T>],
-        seed: &[u8],
-    ) -> ExecutionCommitment {
+    pub fn from(items: &[TileTraceItem], seed: &[u8]) -> ExecutionCommitment {
         let items_hashes: Vec<Vec<u8>> = items.iter().map(|item| item.hash()).collect();
 
         let mut trace_tree = TraceBridgeTree::new(1);
@@ -134,10 +114,7 @@ impl ExecutionCommitment {
     }
 
     /// Try to create a commitment, returning an error on failure.
-    pub fn try_from<T: serde::Serialize + for<'de> serde::Deserialize<'de> + Clone + Debug>(
-        items: &[RawTraceItem<T>],
-        seed: &[u8],
-    ) -> Result<ExecutionCommitment> {
+    pub fn try_from(items: &[TileTraceItem], seed: &[u8]) -> Result<ExecutionCommitment> {
         if items.is_empty() {
             return Err(BitPackerError::EmptyTrace);
         }
@@ -165,8 +142,8 @@ impl ExecutionCommitment {
     /// Get the frontier (partial Merkle path) at position n.
     ///
     /// This can be used to continue building the tree from position n.
-    pub fn frontier<T: serde::Serialize + for<'de> serde::Deserialize<'de> + Clone + Debug>(
-        items: &[RawTraceItem<T>],
+    pub fn frontier(
+        items: &[TileTraceItem],
         n: usize,
         seed: &[u8],
     ) -> Option<NonEmptyFrontier<Bytes>> {
@@ -183,8 +160,8 @@ impl ExecutionCommitment {
     }
 
     /// Try to get the frontier, returning an error on failure.
-    pub fn try_frontier<T: serde::Serialize + for<'de> serde::Deserialize<'de> + Clone + Debug>(
-        items: &[RawTraceItem<T>],
+    pub fn try_frontier(
+        items: &[TileTraceItem],
         n: usize,
         seed: &[u8],
     ) -> Result<NonEmptyFrontier<Bytes>> {
@@ -262,10 +239,7 @@ impl ExecutionCommitmentBuilder {
     /// Append a single trace item to the commitment.
     ///
     /// Computes the hash of the item, adds it to the tree, and stores the new root.
-    pub fn append<T: serde::Serialize + for<'de> serde::Deserialize<'de>>(
-        &mut self,
-        item: &RawTraceItem<T>,
-    ) {
+    pub fn append(&mut self, item: &TileTraceItem) {
         let item_hash = item.hash();
         self.trace_tree.append(Bytes(item_hash));
         if let Some(root) = self.trace_tree.root(0) {
@@ -277,10 +251,7 @@ impl ExecutionCommitmentBuilder {
     ///
     /// This is the fallible version of [`append`](Self::append) that propagates
     /// serialization errors instead of panicking.
-    pub fn try_append<T: serde::Serialize + for<'de> serde::Deserialize<'de>>(
-        &mut self,
-        item: &RawTraceItem<T>,
-    ) -> Result<()> {
+    pub fn try_append(&mut self, item: &TileTraceItem) -> Result<()> {
         let item_hash = item.try_hash()?;
         self.trace_tree.append(Bytes(item_hash));
         if let Some(root) = self.trace_tree.root(0) {
@@ -313,27 +284,136 @@ impl ExecutionCommitmentBuilder {
     }
 }
 
+/// Builder for incrementally constructing an ExecutionCommitment with streaming output.
+///
+/// Similar to `ExecutionCommitmentBuilder`, but writes each new root to the
+/// provided writer as raw bytes (32 bytes per root) immediately after appending.
+///
+/// # Example
+///
+/// ```ignore
+/// let file = File::create("roots.bin")?;
+/// let mut builder = ExecutionCommitmentBuilderWithWriter::new(seed, file);
+/// builder.append(&item1)?; // writes root to file
+/// builder.append(&item2)?; // writes root to file
+/// let commitment = builder.build();
+/// ```
+pub struct ExecutionCommitmentBuilderWithWriter<W: Write> {
+    trace_tree: TraceBridgeTree,
+    roots: Vec<Vec<u8>>,
+    writer: W,
+}
+
+impl<W: Write> ExecutionCommitmentBuilderWithWriter<W> {
+    /// Initialize a new builder with the given seed and writer.
+    ///
+    /// The seed is used as the initial leaf in the Merkle tree.
+    /// The writer will receive each new root as raw bytes (32 bytes) after each append.
+    pub fn new(seed: &[u8], writer: W) -> Self {
+        let mut trace_tree = TraceBridgeTree::new(1);
+        trace_tree.append(Bytes(seed.to_vec()));
+        Self {
+            trace_tree,
+            roots: Vec::new(),
+            writer,
+        }
+    }
+
+    /// Append a single trace item to the commitment and write the root to the writer.
+    ///
+    /// Computes the hash of the item, adds it to the tree, stores the new root,
+    /// and writes the root as raw bytes (32 bytes) to the writer.
+    ///
+    /// Returns an `io::Result` to handle potential write errors.
+    pub fn append(&mut self, item: &TileTraceItem) -> std::io::Result<()> {
+        let item_hash = item.hash();
+        self.trace_tree.append(Bytes(item_hash));
+        if let Some(root) = self.trace_tree.root(0) {
+            self.writer.write_all(&root.0)?;
+            self.roots.push(root.0);
+        }
+        Ok(())
+    }
+
+    /// Try to append a single trace item, returning an error on failure.
+    ///
+    /// This is the fallible version that handles both serialization and IO errors,
+    /// returning a `BitPackerError` on failure.
+    pub fn try_append(&mut self, item: &TileTraceItem) -> Result<()> {
+        let item_hash = item.try_hash()?;
+        self.trace_tree.append(Bytes(item_hash));
+        if let Some(root) = self.trace_tree.root(0) {
+            self.writer.write_all(&root.0)?;
+            self.roots.push(root.0);
+        }
+        Ok(())
+    }
+
+    /// Get the current Merkle root.
+    ///
+    /// Returns `None` if no items have been appended yet.
+    /// This is useful for checking intermediate state during streaming.
+    pub fn current_root(&self) -> Option<&[u8]> {
+        self.roots.last().map(|v| v.as_slice())
+    }
+
+    /// Get the number of items that have been appended.
+    pub fn len(&self) -> usize {
+        self.roots.len()
+    }
+
+    /// Check if no items have been appended yet.
+    pub fn is_empty(&self) -> bool {
+        self.roots.is_empty()
+    }
+
+    /// Consume the builder and return the ExecutionCommitment.
+    pub fn build(self) -> ExecutionCommitment {
+        ExecutionCommitment(self.roots)
+    }
+
+    /// Consume the builder and return both the ExecutionCommitment and the writer.
+    ///
+    /// This is useful when you need to recover the writer after building,
+    /// for example to flush or close a file.
+    pub fn into_inner(self) -> (ExecutionCommitment, W) {
+        (ExecutionCommitment(self.roots), self.writer)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::precomputed;
 
+    /// Helper function to create a TileTraceItem for testing.
+    fn make_tile_trace_item(input: u64, output: u64) -> TileTraceItem {
+        TileTraceItem {
+            tile: format!("test_tile_{}", input),
+            desc: None,
+            inputs: vec![],
+            input_data: format!("{}", input),
+            output_type: Some("u64".to_string()),
+            output_data: format!("{}", output),
+        }
+    }
+
     #[test]
     fn trace_should_be_not_equal() {
-        let items: Vec<RawTraceItem<u64>> = vec![
-            RawTraceItem::new(0, 0),
-            RawTraceItem::new(1, 1),
-            RawTraceItem::new(2, 2),
-            RawTraceItem::new(3, 3),
-            RawTraceItem::new(4, 4),
+        let items: Vec<TileTraceItem> = vec![
+            make_tile_trace_item(0, 0),
+            make_tile_trace_item(1, 1),
+            make_tile_trace_item(2, 2),
+            make_tile_trace_item(3, 3),
+            make_tile_trace_item(4, 4),
         ];
 
-        let ref_items: Vec<RawTraceItem<u64>> = vec![
-            RawTraceItem::new(0, 0),
-            RawTraceItem::new(1, 1),
-            RawTraceItem::new(5, 5), // Different
-            RawTraceItem::new(3, 3),
-            RawTraceItem::new(4, 4),
+        let ref_items: Vec<TileTraceItem> = vec![
+            make_tile_trace_item(0, 0),
+            make_tile_trace_item(1, 1),
+            make_tile_trace_item(5, 5), // Different
+            make_tile_trace_item(3, 3),
+            make_tile_trace_item(4, 4),
         ];
 
         let binded_trace = ExecutionCommitment::from(&items, &precomputed::EMPTY_TRIE_NODES[0]);
@@ -347,7 +427,7 @@ mod tests {
         for ((item, ref_item), (binded_trace_item, ref_binded_trace_item)) in
             trace_comp_iter.zip(binded_trace_comp_iter)
         {
-            if item != ref_item {
+            if item.input_data != ref_item.input_data || item.output_data != ref_item.output_data {
                 assert_ne!(binded_trace_item, ref_binded_trace_item);
             }
         }
@@ -355,26 +435,26 @@ mod tests {
 
     #[test]
     fn test_trace_item_hash() {
-        let item: RawTraceItem<u64> = RawTraceItem::new(1, 2);
+        let item = make_tile_trace_item(1, 2);
         let hash = item.hash();
         assert_eq!(hash.len(), 32); // SHA256 produces 32 bytes
     }
 
     #[test]
     fn test_try_from_empty_trace() {
-        let items: Vec<RawTraceItem<u64>> = vec![];
+        let items: Vec<TileTraceItem> = vec![];
         let result = ExecutionCommitment::try_from(&items, &precomputed::EMPTY_TRIE_NODES[0]);
         assert!(matches!(result, Err(BitPackerError::EmptyTrace)));
     }
 
     #[test]
     fn test_builder_matches_batch_from() {
-        let items: Vec<RawTraceItem<u64>> = vec![
-            RawTraceItem::new(0, 0),
-            RawTraceItem::new(1, 1),
-            RawTraceItem::new(2, 2),
-            RawTraceItem::new(3, 3),
-            RawTraceItem::new(4, 4),
+        let items: Vec<TileTraceItem> = vec![
+            make_tile_trace_item(0, 0),
+            make_tile_trace_item(1, 1),
+            make_tile_trace_item(2, 2),
+            make_tile_trace_item(3, 3),
+            make_tile_trace_item(4, 4),
         ];
 
         let seed = &precomputed::EMPTY_TRIE_NODES[0];
@@ -404,13 +484,13 @@ mod tests {
         assert!(builder.is_empty());
 
         // After appending one item
-        builder.append(&RawTraceItem::new(1u64, 2u64));
+        builder.append(&make_tile_trace_item(1, 2));
         assert!(builder.current_root().is_some());
         assert_eq!(builder.len(), 1);
         assert!(!builder.is_empty());
 
         // After appending another item
-        builder.append(&RawTraceItem::new(3u64, 4u64));
+        builder.append(&make_tile_trace_item(3, 4));
         assert_eq!(builder.len(), 2);
     }
 
@@ -419,7 +499,7 @@ mod tests {
         let seed = &precomputed::EMPTY_TRIE_NODES[0];
         let mut builder = ExecutionCommitmentBuilder::new(seed);
 
-        let item = RawTraceItem::new(1u64, 2u64);
+        let item = make_tile_trace_item(1, 2);
         let result = builder.try_append(&item);
         assert!(result.is_ok());
         assert_eq!(builder.len(), 1);

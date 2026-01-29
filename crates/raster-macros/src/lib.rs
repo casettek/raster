@@ -633,7 +633,11 @@ pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let expanded = quote! {
         #(#fn_attrs)*
         fn main() {
-            ::raster::init();
+            let file = std::fs::File::create("execution_trace.bin")
+                .expect("Failed to create trace output file");
+            let commitment_subscriber = ::raster::ExecutionCommitmentSubscriber::new(file);
+
+            ::raster::init_with(commitment_subscriber);
 
             if ::raster::try_execute_tile_from_args() {
                 return;

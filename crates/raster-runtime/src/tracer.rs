@@ -4,6 +4,8 @@ use std::sync::{Mutex, OnceLock};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use raster_core::trace::{TileTraceItem, TraceInputParam};
+use raster_prover::precomputed::EMPTY_TRIE_NODES;
+use raster_prover::trace::{ExecutionCommitment, ExecutionCommitmentBuilder, ExecutionCommitmentBuilderWithWriter};
 
 /// A trait for receiving trace events.
 pub trait Subscriber: Send + Sync {
@@ -78,20 +80,32 @@ impl<W: Write + Send + Sync> Subscriber for JsonSubscriber<W> {
     }
 }
 
+/// A subscriber that builds a cryptographic commitment to the execution trace.
+///
+/// This subscriber incrementally builds an `ExecutionCommitment` by appending
+/// trace items to an internal `ExecutionCommitmentBuilder`. After execution
+/// completes, call `build()` to retrieve the final commitment.
 pub struct ExecutionCommitmentSubscriber<W: Write + Send> {
-    writer: Mutex<W>,
+    builder: Mutex<ExecutionCommitmentBuilderWithWriter<W>>,
 }
 
 impl<W: Write + Send> ExecutionCommitmentSubscriber<W> {
-    /// Creates a new JSON subscriber that writes to the given writer.
+    /// Creates a new execution commitment subscriber.
+    ///
+    /// Uses the precomputed empty trie node as the seed for the Merkle tree.
     pub fn new(writer: W) -> Self {
         Self {
-            writer: Mutex::new(writer),
+            builder: Mutex::new(ExecutionCommitmentBuilderWithWriter::new(&EMPTY_TRIE_NODES[0], writer)),
         }
+    }
+
+    /// Consume the subscriber and return the built commitment.
+    pub fn build(self) -> ExecutionCommitment {
+        self.builder.into_inner().unwrap().build()
     }
 }
 
-impl<W: Write + Send + Sync> Subscriber for ExecutionCommitmentSubscriber<W> {
+impl<W: Write + Send> Subscriber for ExecutionCommitmentSubscriber<W> {
     fn on_trace(
         &self,
         function_name: &str,
@@ -116,11 +130,8 @@ impl<W: Write + Send + Sync> Subscriber for ExecutionCommitmentSubscriber<W> {
             output_data: BASE64_STANDARD.encode(output),
         };
 
-        if let Ok(mut writer) = self.writer.lock() {
-            if let Ok(json) = serde_json::to_string(&item) {
-                let _ = writeln!(writer, "RASTER_TRACE:{}", json);
-                let _ = writer.flush();
-            }
+        if let Ok(mut builder) = self.builder.lock() {
+            builder.try_append(&item).unwrap();
         }
     }
 }

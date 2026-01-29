@@ -10,6 +10,7 @@ description = "Native execution and tracing runtime for Raster"
 [dependencies]
 raster-core.workspace = true
 raster-macros.workspace = true
+raster-prover.workspace = true
 
 anyhow.workspace = true
 thiserror.workspace = true

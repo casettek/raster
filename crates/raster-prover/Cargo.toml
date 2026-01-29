@@ -7,7 +7,7 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
-raster-core.workspace = true
+raster-core = { workspace = true, features = ["std"] }
 bincode.workspace = true
 bridgetree.workspace = true
 hex.workspace = true

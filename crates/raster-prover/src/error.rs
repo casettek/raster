@@ -16,6 +16,8 @@ pub enum BitPackerError {
     InvalidWindow(String),
     /// Trace is empty.
     EmptyTrace,
+    /// IO error.
+    IoError(String),
 }
 
 impl fmt::Display for BitPackerError  {
@@ -42,11 +44,20 @@ impl fmt::Display for BitPackerError  {
             BitPackerError::EmptyTrace => {
                 write!(f, "Trace is empty")
             }
+            BitPackerError::IoError(msg) => {
+                write!(f, "IO error: {}", msg)
+            }
         }
     }
 }
 
 impl std::error::Error for BitPackerError {}
+
+impl From<std::io::Error> for BitPackerError {
+    fn from(err: std::io::Error) -> Self {
+        BitPackerError::IoError(err.to_string())
+    }
+}
 
 /// Result type for bphc operations.
 pub type Result<T> = std::result::Result<T, BitPackerError>;
