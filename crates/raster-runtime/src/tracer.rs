@@ -1,71 +1,29 @@
-//! A minimal tracing library with JSON output.
-//!
-//! This crate provides two ways to instrument synchronous functions:
-//!
-//! - `#[trace]` attribute macro: Automatically trace all calls to a function
-//! - `trace_call!()` function-like macro: Trace individual function calls at the call site
-//!
-//! All trace events are output as JSON with function arguments and return values.
-//!
-//! # Example: Using `#[trace]` attribute
-//!
-//! ```rust,no_run
-//! use tracing_lite::trace;
-//!
-//! tracing_lite::init();
-//!
-//! #[trace]
-//! fn add(a: i32, b: i32) -> i32 {
-//!     a + b
-//! }
-//!
-//! fn main() {
-//!     let result = add(1, 2);
-//!     println!("Result: {}", result);
-//! }
-//! ```
-//!
-//! # Example: Using `trace_call!()` macro
-//!
-//! ```rust,no_run
-//! use tracing_lite::trace_call;
-//!
-//! tracing_lite::init();
-//!
-//! fn multiply(a: i32, b: i32) -> i32 {
-//!     a * b
-//! }
-//!
-//! fn main() {
-//!     // Trace this specific call without modifying the function
-//!     let result = trace_call!(multiply(3, 4));
-//!     println!("Result: {}", result);
-//! }
-//! ```
-
 use std::io::{self, Write};
 use std::sync::{Mutex, OnceLock};
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use raster_core::trace::{TileTraceItem, TraceInputParam};
 
 /// A trait for receiving trace events.
 pub trait Subscriber: Send + Sync {
-    /// Called when a function completes, with full metadata and runtime values.
+    /// Called when a function completes, with serialized input/output bytes and metadata.
     ///
     /// # Arguments
     /// - `function_name` - Name of the function being traced
-    /// - `param_names` - Names of the function parameters
-    /// - `param_types` - Types of the function parameters
-    /// - `return_type` - Return type of the function (None for unit)
-    /// - `input_values` - Debug-formatted input values at runtime
-    /// - `output_value` - Debug-formatted return value at runtime
+    /// - `desc` - Optional human-readable description of the tile
+    /// - `input_params` - Slice of (name, type) tuples for each input parameter
+    /// - `output_type` - Optional return type as a string
+    /// - `input` - Serialized input bytes (postcard-encoded)
+    /// - `output` - Serialized output bytes (postcard-encoded)
     fn on_trace(
         &self,
         function_name: &str,
-        param_names: &[&str],
-        param_types: &[&str],
-        return_type: Option<&str>,
-        input_values: &[&str],
-        output_value: &str,
+        desc: Option<&str>,
+        input_params: &[(&str, &str)],
+        output_type: Option<&str>,
+        input: &[u8],
+        output: &[u8],
     );
 }
 
@@ -90,44 +48,83 @@ impl<W: Write + Send + Sync> Subscriber for JsonSubscriber<W> {
     fn on_trace(
         &self,
         function_name: &str,
-        param_names: &[&str],
-        param_types: &[&str],
-        return_type: Option<&str>,
-        input_values: &[&str],
-        output_value: &str,
+        desc: Option<&str>,
+        input_params: &[(&str, &str)],
+        output_type: Option<&str>,
+        input: &[u8],
+        output: &[u8],
     ) {
-        // Build params array with name, type, and value for each parameter
-        let params: Vec<serde_json::Value> = param_names
-            .iter()
-            .zip(param_types.iter())
-            .zip(input_values.iter())
-            .map(|((name, ty), value)| {
-                serde_json::json!({
-                    "name": *name,
-                    "type": *ty,
-                    "value": *value
+        let item = TileTraceItem {
+            tile: function_name.to_string(),
+            desc: desc.map(|s| s.to_string()),
+            inputs: input_params
+                .iter()
+                .map(|(name, ty)| TraceInputParam {
+                    name: name.to_string(),
+                    ty: ty.to_string(),
                 })
-            })
-            .collect();
-
-        // Build return object with type and value
-        let return_obj = serde_json::json!({
-            "type": return_type.unwrap_or("()"),
-            "value": output_value
-        });
-
-        let event = serde_json::json!({
-            "function": function_name,
-            "params": params,
-            "return": return_obj,
-        });
+                .collect(),
+            input_data: BASE64_STANDARD.encode(input),
+            output_type: output_type.map(|s| s.to_string()),
+            output_data: BASE64_STANDARD.encode(output),
+        };
 
         if let Ok(mut writer) = self.writer.lock() {
-            let _ = writeln!(writer, "RASTER_TRACE:{}", event);
-            let _ = writer.flush();
+            if let Ok(json) = serde_json::to_string(&item) {
+                let _ = writeln!(writer, "RASTER_TRACE:{}", json);
+                let _ = writer.flush();
+            }
         }
     }
 }
+
+pub struct ExecutionCommitmentSubscriber<W: Write + Send> {
+    writer: Mutex<W>,
+}
+
+impl<W: Write + Send> ExecutionCommitmentSubscriber<W> {
+    /// Creates a new JSON subscriber that writes to the given writer.
+    pub fn new(writer: W) -> Self {
+        Self {
+            writer: Mutex::new(writer),
+        }
+    }
+}
+
+impl<W: Write + Send + Sync> Subscriber for ExecutionCommitmentSubscriber<W> {
+    fn on_trace(
+        &self,
+        function_name: &str,
+        desc: Option<&str>,
+        input_params: &[(&str, &str)],
+        output_type: Option<&str>,
+        input: &[u8],
+        output: &[u8],
+    ) {
+        let item = TileTraceItem {
+            tile: function_name.to_string(),
+            desc: desc.map(|s| s.to_string()),
+            inputs: input_params
+                .iter()
+                .map(|(name, ty)| TraceInputParam {
+                    name: name.to_string(),
+                    ty: ty.to_string(),
+                })
+                .collect(),
+            input_data: BASE64_STANDARD.encode(input),
+            output_type: output_type.map(|s| s.to_string()),
+            output_data: BASE64_STANDARD.encode(output),
+        };
+
+        if let Ok(mut writer) = self.writer.lock() {
+            if let Ok(json) = serde_json::to_string(&item) {
+                let _ = writeln!(writer, "RASTER_TRACE:{}", json);
+                let _ = writer.flush();
+            }
+        }
+    }
+}
+
 
 /// Initializes the global subscriber with a JSON subscriber that writes to stdout.
 ///
@@ -145,26 +142,26 @@ pub fn init_with<S: Subscriber + 'static>(subscriber: S) {
     let _ = GLOBAL_SUBSCRIBER.set(Box::new(subscriber));
 }
 
-// Internal function used by the generated code from the #[trace] macro.
+// Internal function used by the generated code from the #[tile] macro.
 // This is not part of the public API.
 
 #[doc(hidden)]
 pub fn __emit_trace(
     function_name: &str,
-    param_names: &[&str],
-    param_types: &[&str],
-    return_type: Option<&str>,
-    input_values: &[&str],
-    output_value: &str,
+    desc: Option<&str>,
+    input_params: &[(&str, &str)],
+    output_type: Option<&str>,
+    input: &[u8],
+    output: &[u8],
 ) {
     if let Some(subscriber) = GLOBAL_SUBSCRIBER.get() {
         subscriber.on_trace(
             function_name,
-            param_names,
-            param_types,
-            return_type,
-            input_values,
-            output_value,
+            desc,
+            input_params,
+            output_type,
+            input,
+            output,
         );
     }
 }
