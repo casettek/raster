@@ -35,32 +35,6 @@ fn returns_result(input: &ItemFn) -> bool {
     })
 }
 
-/// Generate code to capture input values for tracing BEFORE the function call.
-///
-/// Returns a TokenStream that captures input values as formatted strings.
-fn gen_capture_inputs(input: &ItemFn) -> proc_macro2::TokenStream {
-    let (_, param_idents) = extract_inputs(input);
-    let param_count = param_idents.len();
-
-    if param_idents.is_empty() {
-        quote! {
-            #[cfg(all(feature = "std", not(target_arch = "riscv32")))]
-            let __trace_inputs: [::alloc::string::String; 0] = [];
-        }
-    } else {
-        let format_exprs: Vec<_> = param_idents
-            .iter()
-            .map(|ident| quote! { ::alloc::format!("{:?}", #ident) })
-            .collect();
-        quote! {
-            #[cfg(all(feature = "std", not(target_arch = "riscv32")))]
-            let __trace_inputs: [::alloc::string::String; #param_count] = [
-                #(#format_exprs),*
-            ];
-        }
-    }
-}
-
 /// Generate only the input deserialization code.
 ///
 /// Returns a TokenStream that deserializes input bytes into the appropriate variables.
@@ -173,7 +147,7 @@ impl TileAttrs {
 /// Marks a function as a Raster tile.
 ///
 /// This macro:
-/// 1. Preserves the original function unchanged
+/// 1. Injects tracing code into the original function (for std targets)
 /// 2. Generates an ABI wrapper that handles bincode serialization/deserialization
 /// 3. Registers the tile in the global `TILE_REGISTRY` distributed slice
 ///
@@ -200,6 +174,10 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
     let fn_name_str = input_fn.sig.ident.to_string();
 
     let fn_name = &input_fn.sig.ident;
+    let fn_vis = &input_fn.vis;
+    let fn_sig = &input_fn.sig;
+    let fn_attrs = &input_fn.attrs;
+    let fn_body = &input_fn.block;
 
     let function_wrapper_name = format_ident!("__raster_tile_entry_{}", fn_name);
     let registration_name = format_ident!(
@@ -233,7 +211,7 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
     let function_call = gen_function_call(&input_fn);
     let output_serialization = gen_output_serialization(&input_fn);
 
-    // For riscv32 target, skip tracing entirely
+    // For riscv32 target, skip tracing entirely - keep original function unchanged
     if std::env::var("CARGO_CFG_TARGET_ARCH")
         .map(|v| v == "riscv32")
         .unwrap_or(false)
@@ -254,7 +232,7 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 
     // Extract parameter names and types for tracing metadata
-    let (param_names, param_types, param_idents): (Vec<_>, Vec<_>, Vec<_>) = input_fn
+    let (param_names, param_types, _param_idents): (Vec<_>, Vec<_>, Vec<_>) = input_fn
         .sig
         .inputs
         .iter()
@@ -285,44 +263,78 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
-    let param_count = param_idents.len();
+    let param_count = param_names.len();
 
-    // Generate code to capture input values BEFORE the function call
-    let tracer_capture_inputs = gen_capture_inputs(&input_fn);
-
-    // Generate trace emission that uses pre-captured values
-    let tracer_emit_trace = quote! {
-        #[cfg(all(feature = "std", not(target_arch = "riscv32")))]
-        {
-            let __trace_output = ::alloc::format!("{:?}", result);
-            let __trace_input_refs: [&str; #param_count] = __trace_inputs.each_ref().map(|s| s.as_str());
-            ::raster::__emit_trace(
-                #fn_name_str,
-                &[#(#param_names),*],
-                &[#(#param_types),*],
-                #return_type_expr,
-                &__trace_input_refs,
-                &__trace_output,
-            );
+    // Generate code to capture input values at the start of the function (without cfg guard)
+    let tracer_capture_inputs = {
+        let (_, param_idents) = extract_inputs(&input_fn);
+        if param_idents.is_empty() {
+            quote! {
+                let __trace_inputs: [::alloc::string::String; 0] = [];
+            }
+        } else {
+            let format_exprs: Vec<_> = param_idents
+                .iter()
+                .map(|ident| quote! { ::alloc::format!("{:?}", #ident) })
+                .collect();
+            quote! {
+                let __trace_inputs: [::alloc::string::String; #param_count] = [
+                    #(#format_exprs),*
+                ];
+            }
         }
     };
 
-    // Generate the wrapper body using the pipeline pattern
-    // add_tracing handles deserialization, input capture, and function call internally
+    // Generate trace emission that uses pre-captured values
+    let tracer_emit_trace = quote! {
+        let __trace_output = ::alloc::format!("{:?}", __raster_result);
+        let __trace_input_refs: [&str; #param_count] = __trace_inputs.each_ref().map(|s| s.as_str());
+        ::raster::__emit_trace(
+            #fn_name_str,
+            &[#(#param_names),*],
+            &[#(#param_types),*],
+            #return_type_expr,
+            &__trace_input_refs,
+            &__trace_output,
+        );
+    };
+
+    // Generate the modified original function with tracing injected
+    // Use cfg to conditionally include tracing - on riscv32 or no-std, just run original body
+    let traced_function = quote! {
+        #(#fn_attrs)*
+        #fn_vis #fn_sig {
+            // On std + non-riscv32: wrap body in closure for tracing
+            #[cfg(all(feature = "std", not(target_arch = "riscv32")))]
+            {
+                // Capture inputs for tracing
+                #tracer_capture_inputs
+
+                // Execute original body via closure to handle early returns
+                let __raster_result = (|| #fn_body)();
+
+                // Emit trace after execution
+                #tracer_emit_trace
+
+                return __raster_result;
+            }
+
+            // On riscv32 or no-std: just execute original body directly
+            #[cfg(not(all(feature = "std", not(target_arch = "riscv32"))))]
+            #fn_body
+        }
+    };
 
     TokenStream::from(quote! {
-        // Keep the original function unchanged
-        #input_fn
+        // Original function with tracing injected
+        #traced_function
 
         // Generate the ABI wrapper function (available on all platforms, no_std compatible)
+        // The wrapper just calls the traced function - no need for separate tracing
         pub fn #function_wrapper_name(input: &[u8]) -> ::raster::core::Result<::alloc::vec::Vec<u8>> {
             #inputs_deserialization
 
-            #tracer_capture_inputs
-
             #function_call
-
-            #tracer_emit_trace
 
             #output_serialization
 

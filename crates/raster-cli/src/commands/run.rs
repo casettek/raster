@@ -57,17 +57,14 @@ pub fn run(backend_type: BackendType, input: Option<&str>) -> Result<()> {
 
     // Build command with optional input argument
     let mut cmd = Command::new(&binary_path);
-    cmd.current_dir(&project_path)
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
+    cmd.current_dir(&project_path);
 
     if let Some(input_json) = input {
         cmd.args(["--input", input_json]);
     }
 
-    // Execute the binary and stream output
+    // Execute the binary and capture output
     let output = cmd
-        .current_dir(".")
         .output()
         .map_err(|e| Error::Other(format!("Failed to execute binary: {}", e)))?;
 
@@ -78,21 +75,43 @@ pub fn run(backend_type: BackendType, input: Option<&str>) -> Result<()> {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
 
-    // Extract and pretty-print all RASTER_TRACE items
-    for line in stdout.clone().lines() {
+    // Separate trace items from regular program output
+    let mut trace_items: Vec<serde_json::Value> = Vec::new();
+    let mut program_output: Vec<&str> = Vec::new();
+
+    for line in stdout.lines() {
         if let Some(json_str) = line.strip_prefix("RASTER_TRACE:") {
-            match serde_json::from_str::<serde_json::Value>(json_str) {
-                Ok(trace_item) => {
-                    if let Ok(pretty) = serde_json::to_string_pretty(&trace_item) {
-                        println!("{}", pretty);
-                    }
+            if let Ok(trace_item) = serde_json::from_str::<serde_json::Value>(json_str) {
+                trace_items.push(trace_item);
+            }
+        } else {
+            program_output.push(line);
+        }
+    }
+
+    // Print program output first
+    if !program_output.is_empty() {
+        println!("Output:");
+        for line in &program_output {
+            println!("  {}", line);
+        }
+        println!();
+    }
+
+    // Print trace items as pretty JSON
+    if !trace_items.is_empty() {
+        println!("Trace ({} tile executions):", trace_items.len());
+        for trace_item in &trace_items {
+            if let Ok(pretty) = serde_json::to_string_pretty(&trace_item) {
+                // Indent each line of the pretty JSON
+                for line in pretty.lines() {
+                    println!("  {}", line);
                 }
-                Err(e) => {
-                    eprintln!("Failed to parse RASTER_TRACE: {}", e);
-                }
+                println!();
             }
         }
     }
+
     Ok(())
 }
 
