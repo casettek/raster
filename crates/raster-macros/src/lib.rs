@@ -211,27 +211,6 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
     let function_call = gen_function_call(&input_fn);
     let output_serialization = gen_output_serialization(&input_fn);
 
-    // For riscv32 target, skip tracing entirely - keep original function unchanged
-    if std::env::var("CARGO_CFG_TARGET_ARCH")
-        .map(|v| v == "riscv32")
-        .unwrap_or(false)
-    {
-        return TokenStream::from(quote! {
-            #input_fn 
-       
-            pub fn #function_wrapper_name(input: &[u8]) -> ::raster::core::Result<::alloc::vec::Vec<u8>> {
-                #inputs_deserialization
-
-                #function_call
-                
-                #output_serialization
-                
-                Ok(output)
-            } 
-        });
-    }
-
-    // Extract parameter names and types for tracing metadata
     let (param_names, param_types, _param_idents): (Vec<_>, Vec<_>, Vec<_>) = input_fn
         .sig
         .inputs
@@ -341,6 +320,7 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
             Ok(output)
         }
 
+        #[cfg(all(feature = "std", not(target_arch = "riscv32")))]
         #[::raster::core::linkme::distributed_slice(::raster::core::registry::TILE_REGISTRY)]
         #[linkme(crate = ::raster::core::linkme)]
         static #registration_name: ::raster::core::registry::TileRegistration =

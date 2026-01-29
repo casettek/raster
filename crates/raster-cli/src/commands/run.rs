@@ -6,9 +6,6 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 /// Run the user program with the specified backend.
-///
-/// Unlike `run-tile` which executes individual tiles, this command builds
-/// and runs the entire user program.
 pub fn run(backend_type: BackendType, input: Option<&str>) -> Result<()> {
     // Only native backend is supported for whole-program execution
     if backend_type != BackendType::Native {
