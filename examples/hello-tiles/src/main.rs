@@ -1,6 +1,4 @@
 use hello_tiles::{current_wish, exclaim, greet, raster_wish};
-use std::fs::File;
-use std::io::BufWriter;
 
 /// The main sequence that greets and adds emphasis.
 ///

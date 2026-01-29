@@ -112,6 +112,17 @@ enum Commands {
         #[arg(long, short)]
         output: Option<String>,
     },
+
+    /// Run the user program
+    Run {
+        /// Backend to use for execution
+        #[arg(long, short, value_enum, default_value = "native")]
+        backend: BackendType,
+
+        /// Input data as JSON string
+        #[arg(long)]
+        input: Option<String>,
+    },
 }
 
 /// Available backends for compilation and execution.
@@ -149,5 +160,6 @@ fn main() -> Result<()> {
             verify,
         } => commands::run_sequence(backend, &sequence, input.as_deref(), prove, verify),
         Commands::Cfs { output } => commands::cfs(output),
+        Commands::Run { backend, input } => commands::run::run(backend, input.as_deref()),
     }
 }

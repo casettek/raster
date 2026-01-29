@@ -1,5 +1,6 @@
 //! Command implementations for the Raster CLI.
 mod utils;
+pub mod run;
 use utils::encode::{decode_output, encode_input};
 
 use crate::BackendType;
