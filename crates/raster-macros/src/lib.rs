@@ -5,14 +5,101 @@
 //! - `#[sequence]` - Declares tile ordering and control flow
 
 use proc_macro::TokenStream;
-use quote::{format_ident, quote};
-use syn::{parse_macro_input, visit::Visit, Expr, ExprCall, ExprPath, FnArg, ItemFn, Pat, ReturnType, Type};
+use quote::{format_ident, quote, ToTokens};
+use syn::{
+    parse_macro_input, visit::Visit, Expr, ExprCall, ExprPath, FnArg, ItemFn, Pat, ReturnType, Type,
+};
+
+/// Extract input types and parameter names from a function signature.
+fn extract_inputs(input: &ItemFn) -> (Vec<&Type>, Vec<&syn::Ident>) {
+    input
+        .sig
+        .inputs
+        .iter()
+        .filter_map(|arg| {
+            if let FnArg::Typed(pat_type) = arg {
+                if let Pat::Ident(pat_ident) = &*pat_type.pat {
+                    return Some((&*pat_type.ty, &pat_ident.ident));
+                }
+            }
+            None
+        })
+        .unzip()
+}
+
+/// Check if the function returns a Result type.
+fn returns_result(input: &ItemFn) -> bool {
+    matches!(&input.sig.output, ReturnType::Type(_, ty) if {
+        let ty_str = ty.to_token_stream().to_string();
+        ty_str.starts_with("Result") || ty_str.contains(":: Result")
+    })
+}
+
+/// Generate only the input deserialization code.
+///
+/// Returns a TokenStream that deserializes input bytes into the appropriate variables.
+fn gen_inputs_deserialization(input: &ItemFn) -> proc_macro2::TokenStream {
+    let (input_types, input_names) = extract_inputs(input);
+
+    if input_types.is_empty() {
+        // No arguments - no deserialization needed
+        quote! {}
+    } else if input_types.len() == 1 {
+        // Single argument - deserialize directly
+        let ty = input_types[0];
+        let name = input_names[0];
+        quote! {
+            let #name: #ty = ::raster::core::postcard::from_bytes(input)
+                .map_err(|e| ::raster::core::Error::Serialization(::alloc::format!("Failed to deserialize input: {}", e)))?;
+        }
+    } else {
+        // Multiple arguments - deserialize as tuple
+        let tuple_type = quote! { (#(#input_types),*) };
+        quote! {
+            let (#(#input_names),*): #tuple_type = ::raster::core::postcard::from_bytes(input)
+                .map_err(|e| ::raster::core::Error::Serialization(::alloc::format!("Failed to deserialize input: {}", e)))?;
+        }
+    }
+}
+
+/// Add output serialization to the code pipeline.
+///
+/// Wraps the provided code with serialization of `result` to `output`.
+fn gen_output_serialization(_input: &ItemFn) -> proc_macro2::TokenStream {
+    quote! {
+        let output = ::raster::core::postcard::to_allocvec(&result)
+            .map_err(|e| ::raster::core::Error::Serialization(::alloc::format!("Failed to serialize output: {}", e)))?;
+    }
+}
+
+/// Generate only the function call code.
+///
+/// Returns a TokenStream that calls the function and stores the result.
+fn gen_function_call(input: &ItemFn) -> proc_macro2::TokenStream {
+    let fn_name = &input.sig.ident;
+    let (_, input_names) = extract_inputs(input);
+    let is_result = returns_result(input);
+
+    if input_names.is_empty() {
+        if is_result {
+            quote! { let result = #fn_name()?; }
+        } else {
+            quote! { let result = #fn_name(); }
+        }
+    } else {
+        if is_result {
+            quote! { let result = #fn_name(#(#input_names),*)?; }
+        } else {
+            quote! { let result = #fn_name(#(#input_names),*); }
+        }
+    }
+}
 
 /// Parses tile attributes from the macro invocation.
 /// 
-/// The first argument must be the tile type: `iter` or `recur`.
+/// Uses named argument `kind` for tile type: `#[tile(kind = iter)]` or `#[tile(kind = recur)]`.
 struct TileAttrs {
-    /// Tile type (required: "iter" or "recur").
+    /// Tile type: "iter" (default) or "recur".
     tile_type: String,
     estimated_cycles: Option<u64>,
     max_memory: Option<u64>,
@@ -22,19 +109,18 @@ struct TileAttrs {
 impl TileAttrs {
     fn parse(attr: TokenStream) -> Self {
         let mut attrs = TileAttrs {
-            tile_type: "iter".to_string(), // fallback, but should always be specified
+            tile_type: "iter".to_string(), // default to iter
             estimated_cycles: None,
             max_memory: None,
             description: None,
         };
 
         if attr.is_empty() {
-            panic!("tile macro requires a type argument, e.g., #[tile(iter)] or #[tile(recur)]");
+            return attrs; // Default to "iter" if no arguments
         }
 
-        // Parse comma-separated: first is tile type, rest are key=value pairs
+        // Parse comma-separated key=value pairs
         let attr_str = attr.to_string();
-        let mut first = true;
         
         for part in attr_str.split(',') {
             let part = part.trim();
@@ -42,25 +128,16 @@ impl TileAttrs {
                 continue;
             }
 
-            if first {
-                // First argument is the tile type
-                first = false;
-                match part {
-                    "iter" | "recur" => {
-                        attrs.tile_type = part.to_string();
-                    }
-                    _ => {
-                        panic!("Unknown tile type '{}'. Valid types: iter, recur", part);
-                    }
-                }
-                continue;
-            }
-
             if let Some((key, value)) = part.split_once('=') {
-                // Key=value pair
                 let key = key.trim();
                 let value = value.trim().trim_matches('"');
                 match key {
+                    "kind" => {
+                        match value {
+                            "iter" | "recur" => attrs.tile_type = value.to_string(),
+                            _ => panic!("Unknown tile kind '{}'. Valid kinds: iter, recur", value),
+                        }
+                    }
                     "estimated_cycles" => {
                         attrs.estimated_cycles = value.parse().ok();
                     }
@@ -82,135 +159,52 @@ impl TileAttrs {
 /// Marks a function as a Raster tile.
 ///
 /// This macro:
-/// 1. Preserves the original function unchanged
+/// 1. Injects tracing code into the original function (for std targets)
 /// 2. Generates an ABI wrapper that handles bincode serialization/deserialization
 /// 3. Registers the tile in the global `TILE_REGISTRY` distributed slice
 ///
-/// # Arguments
-/// The first argument is required and specifies the tile type:
-/// - `iter` - Standard iterative tile (most common)
-/// - `recur` - Recursive tile for stateful computations
-///
-/// # Optional Attributes
+/// # Attributes
+/// - `kind = iter` - Standard iterative tile (default if not specified)
+/// - `kind = recur` - Recursive tile for stateful computations
 /// - `estimated_cycles = N` - Expected cycle count for resource estimation
 /// - `max_memory = N` - Maximum memory usage in bytes
 /// - `description = "..."` - Human-readable description
 ///
 /// # Example
 /// ```ignore
-/// #[tile(iter)]
+/// #[tile]
 /// fn compute(input: u64) -> u64 {
 ///     input * 2
 /// }
 ///
-/// #[tile(iter, estimated_cycles = 1000, description = "Greets a user")]
+/// #[tile(kind = iter, estimated_cycles = 1000, description = "Greets a user")]
 /// fn greet(name: String) -> String {
 ///     format!("Hello, {}!", name)
 /// }
 ///
-/// #[tile(recur)]
+/// #[tile(kind = recur)]
 /// fn iterate(state: State) -> State {
 ///     // recursive computation
 /// }
 /// ```
 #[proc_macro_attribute]
 pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let attrs = TileAttrs::parse(attr);
     let input_fn = parse_macro_input!(item as ItemFn);
+    let fn_name_str = input_fn.sig.ident.to_string();
 
     let fn_name = &input_fn.sig.ident;
-    let fn_name_str = fn_name.to_string();
-    let wrapper_name = format_ident!("__raster_tile_entry_{}", fn_name);
-    let registration_name = format_ident!("__RASTER_TILE_REGISTRATION_{}", fn_name.to_string().to_uppercase());
+    let fn_vis = &input_fn.vis;
+    let fn_sig = &input_fn.sig;
+    let fn_attrs = &input_fn.attrs;
+    let fn_body = &input_fn.block;
 
-    // Extract input types for deserialization
-    let input_types: Vec<_> = input_fn
-        .sig
-        .inputs
-        .iter()
-        .filter_map(|arg| match arg {
-            FnArg::Typed(pat_type) => Some(&*pat_type.ty),
-            FnArg::Receiver(_) => None,
-        })
-        .collect();
+    let function_wrapper_name = format_ident!("__raster_tile_entry_{}", fn_name);
+    let registration_name = format_ident!(
+        "__RASTER_TILE_REGISTRATION_{}",
+        fn_name.to_string().to_uppercase()
+    );
 
-    // Extract input pattern names for calling the original function
-    let input_names: Vec<_> = input_fn
-        .sig
-        .inputs
-        .iter()
-        .filter_map(|arg| match arg {
-            FnArg::Typed(pat_type) => match &*pat_type.pat {
-                Pat::Ident(pat_ident) => Some(&pat_ident.ident),
-                _ => None,
-            },
-            FnArg::Receiver(_) => None,
-        })
-        .collect();
-
-    // Check if function returns a Result or a plain value
-    let returns_result = match &input_fn.sig.output {
-        ReturnType::Default => false,
-        ReturnType::Type(_, ty) => {
-            if let Type::Path(type_path) = &**ty {
-                type_path
-                    .path
-                    .segments
-                    .last()
-                    .map(|seg| seg.ident == "Result")
-                    .unwrap_or(false)
-            } else {
-                false
-            }
-        }
-    };
-
-    // Generate the deserialization and call logic based on number of args
-    let deserialize_and_call = if input_types.is_empty() {
-        // No arguments
-        if returns_result {
-            quote! {
-                let result = #fn_name()?;
-            }
-        } else {
-            quote! {
-                let result = #fn_name();
-            }
-        }
-    } else if input_types.len() == 1 {
-        // Single argument - deserialize directly
-        let ty = input_types[0];
-        let name = input_names[0];
-        if returns_result {
-            quote! {
-                let #name: #ty = ::raster::core::postcard::from_bytes(input)
-                    .map_err(|e| ::raster::core::Error::Serialization(::alloc::format!("Failed to deserialize input: {}", e)))?;
-                let result = #fn_name(#name)?;
-            }
-        } else {
-            quote! {
-                let #name: #ty = ::raster::core::postcard::from_bytes(input)
-                    .map_err(|e| ::raster::core::Error::Serialization(::alloc::format!("Failed to deserialize input: {}", e)))?;
-                let result = #fn_name(#name);
-            }
-        }
-    } else {
-        // Multiple arguments - deserialize as tuple
-        let tuple_type = quote! { (#(#input_types),*) };
-        if returns_result {
-            quote! {
-                let (#(#input_names),*): #tuple_type = ::raster::core::postcard::from_bytes(input)
-                    .map_err(|e| ::raster::core::Error::Serialization(::alloc::format!("Failed to deserialize input: {}", e)))?;
-                let result = #fn_name(#(#input_names),*)?;
-            }
-        } else {
-            quote! {
-                let (#(#input_names),*): #tuple_type = ::raster::core::postcard::from_bytes(input)
-                    .map_err(|e| ::raster::core::Error::Serialization(::alloc::format!("Failed to deserialize input: {}", e)))?;
-                let result = #fn_name(#(#input_names),*);
-            }
-        }
-    };
+    let attrs = TileAttrs::parse(attr);
 
     // Generate optional metadata fields
     let estimated_cycles_expr = match attrs.estimated_cycles {
@@ -231,7 +225,79 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
         None => quote! { ::core::option::Option::None },
     };
 
-    // For recursive tiles, also generate a macro with the same name that allows `tile_name!(args)` syntax
+    // Generate deserialization and function call
+    let inputs_deserialization = gen_inputs_deserialization(&input_fn);
+    let function_call = gen_function_call(&input_fn);
+    let output_serialization = gen_output_serialization(&input_fn);
+
+    let (param_names, param_types, _param_idents): (Vec<_>, Vec<_>, Vec<_>) = input_fn
+        .sig
+        .inputs
+        .iter()
+        .filter_map(|arg| {
+            if let FnArg::Typed(pat_type) = arg {
+                if let Pat::Ident(pat_ident) = &*pat_type.pat {
+                    let name = pat_ident.ident.to_string();
+                    let ty = pat_type.ty.to_token_stream().to_string();
+                    let ident = &pat_ident.ident;
+                    return Some((name, ty, ident.clone()));
+                }
+            }
+            None
+        })
+        .fold((vec![], vec![], vec![]), |mut acc, (name, ty, ident)| {
+            acc.0.push(name);
+            acc.1.push(ty);
+            acc.2.push(ident);
+            acc
+        });
+
+    // Extract return type
+    let return_type_expr = match &input_fn.sig.output {
+        ReturnType::Default => quote! { ::core::option::Option::None },
+        ReturnType::Type(_, ty) => {
+            let ty_str = ty.to_token_stream().to_string();
+            quote! { ::core::option::Option::Some(#ty_str) }
+        }
+    };
+
+    let param_count = param_names.len();
+
+    // Generate code to capture input values at the start of the function (without cfg guard)
+    let tracer_capture_inputs = {
+        let (_, param_idents) = extract_inputs(&input_fn);
+        if param_idents.is_empty() {
+            quote! {
+                let __trace_inputs: [::alloc::string::String; 0] = [];
+            }
+        } else {
+            let format_exprs: Vec<_> = param_idents
+                .iter()
+                .map(|ident| quote! { ::alloc::format!("{:?}", #ident) })
+                .collect();
+            quote! {
+                let __trace_inputs: [::alloc::string::String; #param_count] = [
+                    #(#format_exprs),*
+                ];
+            }
+        }
+    };
+
+    // Generate trace emission that uses pre-captured values
+    let tracer_emit_trace = quote! {
+        let __trace_output = ::alloc::format!("{:?}", __raster_result);
+        let __trace_input_refs: [&str; #param_count] = __trace_inputs.each_ref().map(|s| s.as_str());
+        ::raster::__emit_trace(
+            #fn_name_str,
+            &[#(#param_names),*],
+            &[#(#param_types),*],
+            #return_type_expr,
+            &__trace_input_refs,
+            &__trace_output,
+        );
+    };
+
+ // For recursive tiles, also generate a macro with the same name that allows `tile_name!(args)` syntax
     let recursive_macro = if attrs.tile_type == "recur" {
         let macro_name = format_ident!("{}", fn_name);
         quote! {
@@ -251,39 +317,63 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! {}
     };
 
-    let expanded = quote! {
-        // Keep the original function unchanged
-        #input_fn
 
+    // Generate the modified original function with tracing injected
+    // Use cfg to conditionally include tracing - on riscv32 or no-std, just run original body
+    let traced_function = quote! {
+        #(#fn_attrs)*
+        #fn_vis #fn_sig {
+            // On std + non-riscv32: wrap body in closure for tracing
+            #[cfg(all(feature = "std", not(target_arch = "riscv32")))]
+            {
+                // Capture inputs for tracing
+                #tracer_capture_inputs
+
+                // Execute original body via closure to handle early returns
+                let __raster_result = (|| #fn_body)();
+
+                // Emit trace after execution
+                #tracer_emit_trace
+
+                return __raster_result;
+            }
+
+            // On riscv32 or no-std: just execute original body directly
+            #[cfg(not(all(feature = "std", not(target_arch = "riscv32"))))]
+            #fn_body
+        }
+    };
+
+    TokenStream::from(quote! {
+        // Original function with tracing injected
+        #traced_function
         // Generate the ABI wrapper function (available on all platforms, no_std compatible)
-        pub fn #wrapper_name(input: &[u8]) -> ::raster::core::Result<::alloc::vec::Vec<u8>> {
-            #deserialize_and_call
+        // The wrapper just calls the traced function - no need for separate tracing
+        pub fn #function_wrapper_name(input: &[u8]) -> ::raster::core::Result<::alloc::vec::Vec<u8>> {
+            #inputs_deserialization
 
-            ::raster::core::postcard::to_allocvec(&result)
-                .map_err(|e| ::raster::core::Error::Serialization(::alloc::format!("Failed to serialize output: {}", e)))
+            #function_call
+
+            #output_serialization
+
+            Ok(output)
         }
 
-        // Register the tile in the distributed slice (only on platforms that support linkme and std)
         #[cfg(all(feature = "std", not(target_arch = "riscv32")))]
         #[::raster::core::linkme::distributed_slice(::raster::core::registry::TILE_REGISTRY)]
         #[linkme(crate = ::raster::core::linkme)]
         static #registration_name: ::raster::core::registry::TileRegistration =
-            ::raster::core::registry::TileRegistration::new(
-                ::raster::core::tile::TileMetadataStatic::new(
-                    #fn_name_str,
-                    #fn_name_str,
-                    #description_expr,
-                    #estimated_cycles_expr,
-                    #max_memory_expr,
-                ),
-                #wrapper_name,
-            );
-
-        // For recursive tiles, generate a macro wrapper for the `!` syntax
-        #recursive_macro
-    };
-
-    TokenStream::from(expanded)
+        ::raster::core::registry::TileRegistration::new(
+            ::raster::core::tile::TileMetadataStatic::new(
+                #fn_name_str,
+                #fn_name_str,
+                #description_expr,
+                #estimated_cycles_expr,
+                #max_memory_expr
+            ),
+            #function_wrapper_name,
+        );
+    })
 }
 
 /// Parses optional sequence attributes from the macro invocation.
@@ -293,9 +383,7 @@ struct SequenceAttrs {
 
 impl SequenceAttrs {
     fn parse(attr: TokenStream) -> Self {
-        let mut attrs = SequenceAttrs {
-            description: None,
-        };
+        let mut attrs = SequenceAttrs { description: None };
 
         if attr.is_empty() {
             return attrs;
@@ -330,7 +418,9 @@ struct TileCallExtractor {
 
 impl TileCallExtractor {
     fn new() -> Self {
-        Self { tile_calls: Vec::new() }
+        Self {
+            tile_calls: Vec::new(),
+        }
     }
 }
 
@@ -343,7 +433,7 @@ impl<'ast> Visit<'ast> for TileCallExtractor {
                 let fn_name = segment.ident.to_string();
                 // Skip common non-tile functions
                 if !is_excluded_function(&fn_name) {
-                    self.tile_calls.push(fn_name);
+                    self.tile_calls.push(fn_name.to_owned());
                 }
             }
         }
@@ -394,7 +484,10 @@ pub fn sequence(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let fn_name = &input_fn.sig.ident;
     let fn_name_str = fn_name.to_string();
-    let registration_name = format_ident!("__RASTER_SEQUENCE_REGISTRATION_{}", fn_name.to_string().to_uppercase());
+    let registration_name = format_ident!(
+        "__RASTER_SEQUENCE_REGISTRATION_{}",
+        fn_name.to_string().to_uppercase()
+    );
 
     // Extract tile calls from the function body
     let mut extractor = TileCallExtractor::new();
@@ -414,13 +507,18 @@ pub fn sequence(attr: TokenStream, item: TokenStream) -> TokenStream {
         None => quote! { ::core::option::Option::None },
     };
 
+    let tiles_static_name = format_ident!(
+        "__RASTER_SEQUENCE_TILES_{}",
+        fn_name.to_string().to_uppercase()
+    );
+
     let expanded = quote! {
         // Keep the original function unchanged for native execution
         #input_fn
 
         // Static array of tile IDs for this sequence
         #[cfg(all(feature = "std", not(target_arch = "riscv32")))]
-        static __RASTER_SEQUENCE_TILES: [&'static str; #tile_count] = [#(#tile_strs),*];
+        static #tiles_static_name: [&'static str; #tile_count] = [#(#tile_strs),*];
 
         // Register the sequence in the distributed slice (only on platforms that support linkme and std)
         #[cfg(all(feature = "std", not(target_arch = "riscv32")))]
@@ -433,8 +531,125 @@ pub fn sequence(attr: TokenStream, item: TokenStream) -> TokenStream {
                     #fn_name_str,
                     #description_expr,
                 ),
-                &__RASTER_SEQUENCE_TILES,
+                &#tiles_static_name,
             );
+    };
+
+    TokenStream::from(expanded)
+}
+
+/// Entry point macro that handles raster CLI tile execution requests and input parsing.
+///
+/// Apply this to your main function to automatically handle subprocess
+/// tile execution for the native backend, and optionally parse CLI input arguments.
+///
+/// # Basic Example (no input)
+/// ```ignore
+/// #[raster::main]
+/// fn main() {
+///     let result = greet_sequence("Raster".to_string());
+///     println!("{}", result);
+/// }
+/// ```
+///
+/// # With Input Parameter
+/// ```ignore
+/// #[raster::main]
+/// fn main(name: String) {
+///     let result = greet_sequence(name);
+///     println!("{}", result);
+/// }
+/// ```
+///
+/// Run with: `cargo run -- --input '"Raster"'`
+///
+/// The macro parses `--input <json>` from command line arguments and deserializes
+/// it into the parameter type. Multiple parameters are deserialized from a JSON array.
+///
+/// # Expansion
+///
+/// `fn main(name: String)` expands to:
+/// ```ignore
+/// fn main() {
+///     if ::raster::try_execute_tile_from_args() {
+///         return;
+///     }
+///     
+///     let name: String = ::raster::parse_main_input()
+///         .expect("Failed to parse --input argument. Usage: --input '<json>'");
+///     
+///     let result = greet_sequence(name);
+///     println!("{}", result);
+/// }
+/// ```
+#[proc_macro_attribute]
+pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    let input_fn = parse_macro_input!(item as ItemFn);
+
+    let fn_block = &input_fn.block;
+    let fn_attrs = &input_fn.attrs;
+
+    // Extract parameters from the function signature
+    let params: Vec<_> = input_fn.sig.inputs.iter().collect();
+
+    // Generate input parsing code based on parameters
+    let input_parsing = if params.is_empty() {
+        // No parameters - no input parsing needed
+        quote! {}
+    } else if params.len() == 1 {
+        // Single parameter - deserialize directly
+        let param = &params[0];
+        if let FnArg::Typed(pat_type) = param {
+            let pat = &pat_type.pat;
+            let ty = &pat_type.ty;
+            quote! {
+                let #pat: #ty = ::raster::parse_main_input()
+                    .expect("Failed to parse --input argument. Usage: --input '<json>'");
+            }
+        } else {
+            quote! {}
+        }
+    } else {
+        // Multiple parameters - deserialize as tuple
+        let names: Vec<_> = params
+            .iter()
+            .filter_map(|p| {
+                if let FnArg::Typed(pt) = p {
+                    Some(&pt.pat)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let types: Vec<_> = params
+            .iter()
+            .filter_map(|p| {
+                if let FnArg::Typed(pt) = p {
+                    Some(&pt.ty)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        quote! {
+            let (#(#names),*): (#(#types),*) = ::raster::parse_main_input()
+                .expect("Failed to parse --input argument. Usage: --input '[val1, val2, ...]'");
+        }
+    };
+
+    let expanded = quote! {
+        #(#fn_attrs)*
+        fn main() {
+            ::raster::init();
+
+            if ::raster::try_execute_tile_from_args() {
+                return;
+            }
+
+            #input_parsing
+
+            #fn_block
+        }
     };
 
     TokenStream::from(expanded)

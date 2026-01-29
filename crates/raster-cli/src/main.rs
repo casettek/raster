@@ -5,7 +5,7 @@
 mod commands;
 
 use clap::{Parser, ValueEnum};
-use anyhow::Result;
+use raster_core::Result;
 
 #[derive(Parser)]
 #[command(name = "cargo-raster")]
@@ -31,7 +31,7 @@ enum Commands {
     },
 
     /// Execute a tile
-    Run {
+    RunTile {
         /// Backend to use for execution
         #[arg(long, short, value_enum, default_value = "native")]
         backend: BackendType,
@@ -51,14 +51,6 @@ enum Commands {
         /// Verify the generated proof (implies --prove)
         #[arg(long)]
         verify: bool,
-
-        /// Use GPU acceleration for proving (Metal on macOS, CUDA on Linux/Windows)
-        #[arg(long)]
-        gpu: bool,
-
-        /// Disable tracing
-        #[arg(long)]
-        no_trace: bool,
     },
 
     /// List all registered tiles
@@ -77,18 +69,41 @@ enum Commands {
     },
 
     /// Preview a sequence with cycle count breakdown
-    Preview {
-        /// Sequence name to execute (default: "main")
-        #[arg(long, default_value = "main")]
+    // Preview {
+    //     /// Sequence name to execute (default: "main")
+    //     #[arg(long, default_value = "main")]
+    //     sequence: String,
+
+    //     /// Input data as JSON string
+    //     #[arg(long)]
+    //     input: Option<String>,
+
+    //     /// Use GPU acceleration for execution (Metal on macOS, CUDA on Linux/Windows)
+    //     #[arg(long)]
+    //     gpu: bool,
+    // },
+
+    /// Execute a sequence
+    RunSequence {
+        /// Backend to use for execution
+        #[arg(long, short, value_enum, default_value = "native")]
+        backend: BackendType,
+
+        /// Sequence name to execute
+        #[arg(long)]
         sequence: String,
 
         /// Input data as JSON string
         #[arg(long)]
         input: Option<String>,
 
-        /// Use GPU acceleration for execution (Metal on macOS, CUDA on Linux/Windows)
+        /// Generate a proof (RISC0 backend only)
         #[arg(long)]
-        gpu: bool,
+        prove: bool,
+
+        /// Verify the generated proof (implies --prove)
+        #[arg(long)]
+        verify: bool,
     },
 
     /// Generate control flow schema (CFS)
@@ -96,6 +111,17 @@ enum Commands {
         /// Output file path (default: target/raster/cfs.json)
         #[arg(long, short)]
         output: Option<String>,
+    },
+
+    /// Run the user program
+    Run {
+        /// Backend to use for execution
+        #[arg(long, short, value_enum, default_value = "native")]
+        backend: BackendType,
+
+        /// Input data as JSON string
+        #[arg(long)]
+        input: Option<String>,
     },
 }
 
@@ -113,21 +139,27 @@ fn main() -> Result<()> {
 
     match cmd {
         Commands::Build { backend, tile } => commands::build(backend, tile),
-        Commands::Run {
+        Commands::RunTile {
             backend,
             tile,
             input,
             prove,
             verify,
-            gpu,
-            no_trace,
-        } => commands::run(backend, &tile, input.as_deref(), prove, verify, gpu, no_trace),
-        Commands::List => commands::list_tiles(),
+        } => commands::tile::run_tile::run_tile(backend, &tile, input.as_deref(), prove, verify),
+        Commands::List => commands::tile::list_tile::list_tiles(),
         Commands::Analyze { trace_path } => commands::analyze(trace_path),
         Commands::Init { name } => commands::init(name),
-        Commands::Preview { sequence, input, gpu } => {
-            commands::preview(&sequence, input.as_deref(), gpu)
-        }
+        // Commands::Preview { sequence, input, gpu } => {
+        //     commands::preview(&sequence, input.as_deref(), gpu)
+        // }
+        Commands::RunSequence {
+            backend,
+            sequence,
+            input,
+            prove,
+            verify,
+        } => commands::run_sequence(backend, &sequence, input.as_deref(), prove, verify),
         Commands::Cfs { output } => commands::cfs(output),
+        Commands::Run { backend, input } => commands::run::run(backend, input.as_deref()),
     }
 }

@@ -16,7 +16,7 @@ use raster::prelude::*;
 /// A simple tile that greets a user by name.
 ///
 /// This tile takes a String input and returns a greeting.
-#[tile(iter)]
+#[tile(kind = iter)]
 pub fn greet(name: String) -> String {
     format!("Hello, {}!!!!", name)
 }
@@ -24,15 +24,25 @@ pub fn greet(name: String) -> String {
 /// A tile that adds emphasis to a message.
 ///
 /// This tile takes a String and returns it with exclamation marks.
-#[tile(iter)]
+#[tile(kind = iter)]
 pub fn exclaim(message: String) -> String {
     format!("{}!!!!", message)
+}
+
+#[tile]
+pub fn raster_wish(message: String) -> String {
+    format!("{}\nHope you  will have fun with Raster!", message)
+}
+
+#[tile]
+pub fn current_wish(message: String) -> String {
+    format!("{}\nHappy new year!", message)
 }
 
 /// A tile that computes Fibonacci numbers.
 ///
 /// This demonstrates a more computationally intensive tile.
-#[tile(iter)]
+#[tile(kind = iter)]
 pub fn fibonacci(n: u64) -> u64 {
     if n <= 1 {
         return n;
@@ -57,7 +67,7 @@ pub fn fibonacci(n: u64) -> u64 {
 ///          count_to(1, 3) -> (false, 2, 3)  
 ///          count_to(2, 3) -> (false, 3, 3)  
 ///          count_to(3, 3) -> (true, 3, 3)   <- done! reached the goal
-#[tile(recur)]
+#[tile(kind = recur)]
 pub fn count_to(current: u64, goal: u64) -> (bool, u64, u64) {
     if current >= goal {
         // Goal reached, we're done

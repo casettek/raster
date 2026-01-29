@@ -5,8 +5,6 @@
 //! - Optional execution tracing
 //! - Trace capture and storage
 
-pub mod executor;
 pub mod tracer;
 
-pub use executor::Executor;
-pub use tracer::{Tracer, FileTracer, NoOpTracer};
+pub use tracer::{JsonSubscriber, Subscriber, init, init_with, __emit_trace};

@@ -1,8 +1,10 @@
 //! Backend trait and execution mode definitions.
-
-use raster_core::{tile::TileMetadata, Result};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+
+use std::path::{Path, PathBuf};
+use std::any::Any;
+use raster_core::tile::TileMetadata;
+use raster_core::Result;
 
 /// Execution mode for tiles.
 ///
@@ -44,8 +46,10 @@ impl ExecutionMode {
 }
 
 /// Result of compiling a tile.
+/// 
+/// NOTE: This struct is deprecated and will be removed. Use the Executable trait instead.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CompilationOutput {
+pub struct TileExecDescriptor {
     /// The compiled guest ELF binary.
     pub elf: Vec<u8>,
 
@@ -53,14 +57,92 @@ pub struct CompilationOutput {
     /// This is a unique identifier derived from the ELF.
     pub method_id: Vec<u8>,
 
+    /// The tile ID this compilation is for.
+    #[serde(default)]
+    pub tile_id: String,
+
     /// Path where artifacts were written (if applicable).
     pub artifact_dir: Option<PathBuf>,
+    pub exec_path: Option<PathBuf>,
+}
+
+/// Opaque executable descriptor - each backend defines its own concrete type.
+/// 
+/// This trait provides a common interface for executables across different backends.
+/// Backends define their own concrete types (e.g., NativeExecutable, Risc0Executable)
+/// that implement this trait.
+pub trait CompilationArtifact: Send + Sync + Any {
+    /// Get the tile ID this executable is for.
+    fn id(&self) -> &str;
+
+    /// Get the artifact directory (if persisted).
+    fn path(&self) -> &Path;
+
+    /// Downcast to concrete type (for backend internal use).
+    fn as_any(&self) -> &dyn Any;
+
+    /// Downcast to mutable concrete type (for backend internal use).
+    fn as_any_mut(&mut self) -> &mut dyn Any;
+}
+
+/// Artifact persistence interface - each backend implements its own.
+/// 
+/// The ArtifactStore trait provides a common interface for persisting and loading
+/// backend-specific executable artifacts. Each backend implements this to handle
+/// its own artifact format (e.g., native binaries vs zkVM ELF files).
+pub trait ArtifactStore: Send + Sync {
+    /// Save an executable to disk.
+    /// 
+    /// # Arguments
+    /// * `executable` - The executable to save
+    /// * `output_dir` - The base output directory
+    /// * `source_hash` - Optional hash of the source file for cache invalidation
+    /// 
+    /// # Returns
+    /// The artifact directory path where artifacts were written.
+    fn save(
+        &self,
+        artifact: &dyn CompilationArtifact,
+        output_dir: &Path,
+        source_hash: Option<&str>,
+    ) -> Result<PathBuf>;
+
+    /// Load a cached executable if valid.
+    /// 
+    /// # Arguments
+    /// * `tile_id` - The tile ID to load
+    /// * `output_dir` - The base output directory
+    /// * `source_hash` - Optional hash to validate against cached artifacts
+    /// 
+    /// # Returns
+    /// The loaded executable, or None if not cached or cache is stale.
+    fn load(
+        &self,
+        id: &str,
+        output_dir: &Path,
+        source_hash: Option<&str>,
+    ) -> Option<Box<dyn CompilationArtifact>>;
+
+    /// Check if recompilation is needed.
+    /// 
+    /// # Arguments
+    /// * `tile_id` - The tile ID to check
+    /// * `output_dir` - The base output directory
+    /// * `source_hash` - Optional hash to validate against cached artifacts
+    /// 
+    /// # Returns
+    /// True if recompilation is needed, false if cache is valid.
+    fn needs_recompilation(
+        &self,
+        id: &str,
+        output_dir: &Path,
+        source_hash: Option<&str>,
+    ) -> bool;
 }
 
 /// RISC0's minimum segment size for proving (2^16).
 pub const MIN_PROOF_SEGMENT_CYCLES: u64 = 65536;
 
-/// Calculate the proof cycle count (padded to next power of 2, min 2^16).
 pub fn calculate_proof_cycles(actual_cycles: u64) -> u64 {
     if actual_cycles <= MIN_PROOF_SEGMENT_CYCLES {
         MIN_PROOF_SEGMENT_CYCLES
@@ -72,7 +154,7 @@ pub fn calculate_proof_cycles(actual_cycles: u64) -> u64 {
 
 /// Result of executing a tile.
 #[derive(Debug, Clone)]
-pub struct TileExecution {
+pub struct TileExecutionResult {
     /// The serialized output of the tile execution.
     pub output: Vec<u8>,
 
@@ -93,7 +175,7 @@ pub struct TileExecution {
     pub verified: Option<bool>,
 }
 
-impl TileExecution {
+impl TileExecutionResult {
     /// Create a new execution result with just output (for estimate mode).
     /// Automatically calculates proof_cycles based on actual cycles.
     pub fn estimate(output: Vec<u8>, cycles: u64) -> Self {
@@ -129,6 +211,8 @@ pub struct ResourceEstimate {
     pub memory_bytes: Option<u64>,
 }
 
+
+
 /// Trait defining the interface for compilation and execution backends.
 ///
 /// Backends are responsible for:
@@ -139,20 +223,13 @@ pub trait Backend: Send + Sync {
     /// Get the name of this backend.
     fn name(&self) -> &'static str;
 
-    /// Compile a tile into a standalone artifact.
-    ///
-    /// # Arguments
-    /// * `metadata` - Metadata about the tile being compiled
-    /// * `source_path` - Path to the source file containing the tile
-    ///
-    /// # Returns
-    /// Compilation output including the ELF binary and method ID.
-    fn compile_tile(&self, metadata: &TileMetadata, source_path: &str) -> Result<CompilationOutput>;
+    /// Compile a tile into an executable descriptor.
+    fn compile_tile(&self, tile: &TileMetadata, content_hash: Option<&str>) -> Result<Box<dyn CompilationArtifact>>;
 
     /// Execute a tile with the given input.
     ///
     /// # Arguments
-    /// * `compilation` - The compilation output from `compile_tile`
+    /// * `executable` - The executable from `prepare_tile_execute`
     /// * `input` - Serialized input data (bincode format)
     /// * `mode` - Execution mode (estimate or prove)
     ///
@@ -160,10 +237,15 @@ pub trait Backend: Send + Sync {
     /// Execution result including output, cycle count, and optional proof.
     fn execute_tile(
         &self,
-        compilation: &CompilationOutput,
+        artifact: &dyn CompilationArtifact,
         input: &[u8],
         mode: ExecutionMode,
-    ) -> Result<TileExecution>;
+    ) -> Result<TileExecutionResult>;
+
+    /// Get the artifact store for this backend.
+    /// 
+    /// The artifact store handles persistence and caching of compiled artifacts.
+    fn artifact_store(&self) -> &dyn ArtifactStore;
 
     /// Estimate resource usage for a tile without executing it.
     ///
@@ -173,10 +255,10 @@ pub trait Backend: Send + Sync {
     /// Verify a proof receipt.
     ///
     /// # Arguments
-    /// * `compilation` - The compilation output (for method ID)
+    /// * `executable` - The executable (for method ID/verification key)
     /// * `receipt` - The serialized receipt to verify
     ///
     /// # Returns
     /// True if the proof is valid, false otherwise.
-    fn verify_receipt(&self, compilation: &CompilationOutput, receipt: &[u8]) -> Result<bool>;
+    fn verify_receipt(&self, executable: &dyn CompilationArtifact, receipt: &[u8]) -> Result<bool>;
 }

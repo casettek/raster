@@ -21,12 +21,12 @@ path = "src/main.rs"
 [dependencies]
 raster-core = { workspace = true, features = ["std"] }
 raster-backend.workspace = true
+raster-backend-native.workspace = true
 raster-backend-risc0.workspace = true
 raster-compiler.workspace = true
 raster-runtime.workspace = true
 raster-analysis.workspace = true
 clap.workspace = true
-anyhow.workspace = true
 serde_json.workspace = true
 postcard.workspace = true
 hex = "0.4"

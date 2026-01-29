@@ -254,10 +254,12 @@ impl GuestBuilder {
 
         // Write main.rs
         let main_rs = self.generate_guest_main(tile_id);
+        println!("main_rs: {:?}", main_rs);
         fs::write(src_dir.join("main.rs"), main_rs)?;
 
         // Write Cargo.toml
         let cargo_toml = self.generate_guest_cargo_toml(tile_id);
+        println!("cargo_toml: {:?}", cargo_toml);
         fs::write(guest_dir.join("Cargo.toml"), cargo_toml)?;
 
         // Find RISC0's cargo with the riscv32im-risc0-zkvm-elf target

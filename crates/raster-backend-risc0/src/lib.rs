@@ -14,4 +14,4 @@
 mod guest_builder;
 mod risc0;
 
-pub use risc0::{is_cuda_available, is_gpu_available, is_metal_available, Risc0Backend};
+pub use risc0::{Risc0ArtifactStore, Risc0Backend, Risc0CompilationArtifact};

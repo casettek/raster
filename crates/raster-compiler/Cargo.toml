@@ -10,8 +10,18 @@ description = "Build orchestration for the Raster toolchain"
 [dependencies]
 raster-core = { workspace = true, features = ["std"] }
 raster-backend.workspace = true
-anyhow.workspace = true
+raster-backend-risc0.workspace = true
+raster-backend-native.workspace = true
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 hex = "0.4"
+walkdir.workspace = true
+
+# Rust source parsing
+syn = { version = "2", features = ["full", "parsing", "visit"] }
+proc-macro2 = "1"
+quote = "1"
+
+# Cargo.toml parsing
+cargo_toml = "0.20"
