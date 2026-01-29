@@ -1,5 +1,4 @@
-use hello_tiles::{current_wish, exclaim, greet, raster_wish};
-use raster::prelude::*;
+use hello_tiles::{count_to, current_wish, exclaim, greet, raster_wish};
 
 
 /// The main sequence that greets and adds emphasis, with recursive counting.
