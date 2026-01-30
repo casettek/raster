@@ -269,6 +269,152 @@ pub struct Iter<'a, 'b> {
     index: usize,
 }
 
+/// Streaming bit packer with a 2-block sliding window and callback-based block emission.
+///
+/// Unlike `BitPacker` which requires all items upfront, `StreamingBitPacker` allows
+/// iterative item addition. When the first block (64 bits) is filled, it is emitted
+/// via the callback and the window shifts.
+///
+/// # Example
+///
+/// ```
+/// use bphc::bit_packer::StreamingBitPacker;
+///
+/// let mut emitted_blocks = Vec::new();
+/// {
+///     let mut packer = StreamingBitPacker::new(8, |block| {
+///         emitted_blocks.push(block);
+///     });
+///     
+///     // Push 8 items of 8 bits each = 64 bits = 1 full block
+///     for i in 0..8u8 {
+///         packer.push(&[i]);
+///     }
+///     
+///     // Get remaining blocks
+///     let (remaining0, remaining1) = packer.finish();
+/// }
+/// ```
+pub struct StreamingBitPacker<F>
+where
+    F: FnMut(u64),
+{
+    bits_per_item: usize,
+    blocks: [u64; 2],     // Sliding window of 2 blocks
+    bit_offset: usize,    // Current bit position (0-127)
+    on_block_complete: F, // Callback when block 0 is filled
+}
+
+impl<F> StreamingBitPacker<F>
+where
+    F: FnMut(u64),
+{
+    /// Create a new StreamingBitPacker with the specified bits per item.
+    ///
+    /// # Arguments
+    ///
+    /// * `bits_per_item` - Number of bits to use per item (must be <= 64)
+    /// * `on_block_complete` - Callback invoked when a 64-bit block is complete
+    ///
+    /// # Panics
+    ///
+    /// Panics if `bits_per_item` is 0 or greater than 64.
+    pub fn new(bits_per_item: usize, on_block_complete: F) -> Self {
+        assert!(
+            bits_per_item > 0 && bits_per_item <= 64,
+            "bits_per_item must be between 1 and 64"
+        );
+        Self {
+            bits_per_item,
+            blocks: [0u64; 2],
+            bit_offset: 0,
+            on_block_complete,
+        }
+    }
+
+    /// Push an item into the packer.
+    ///
+    /// The item is cropped to `bits_per_item` bits and packed into the current
+    /// window position. When the first block (64 bits) is filled, it is emitted
+    /// via the callback and the window shifts.
+    ///
+    /// # Arguments
+    ///
+    /// * `item` - The bytes to pack (will be cropped to `bits_per_item` bits)
+    pub fn push(&mut self, item: &[u8]) {
+        // Crop the item to the specified number of bits
+        let cropped = item.to_vec().crop(self.bits_per_item);
+
+        // Convert cropped bytes to u64 (little-endian)
+        let mut item_bytes = [0u8; 8];
+        let bytes_len = cropped.len().min(8);
+        item_bytes[..bytes_len].copy_from_slice(&cropped[..bytes_len]);
+        let item_u64 = u64::from_le_bytes(item_bytes);
+
+        // Calculate position within the 2-block window
+        let block_offset = self.bit_offset % 64;
+
+        // Pack into the current position
+        // If bit_offset < 64, we're in block 0; otherwise we're in block 1
+        if self.bit_offset < 64 {
+            // Writing to block 0
+            self.blocks[0] |= item_u64 << block_offset;
+
+            // Check for overflow into block 1
+            let overflow = (block_offset + self.bits_per_item).saturating_sub(64);
+            if overflow != 0 {
+                self.blocks[1] |= item_u64 >> (self.bits_per_item - overflow);
+            }
+        } else {
+            // Writing to block 1
+            self.blocks[1] |= item_u64 << block_offset;
+        }
+
+        // Advance bit offset
+        self.bit_offset += self.bits_per_item;
+
+        // Check if block 0 is complete (we've written past 64 bits)
+        if self.bit_offset >= 64 {
+            // Only emit and shift if we just crossed the 64-bit boundary
+            // or if we're now at 128 bits (block 1 is full)
+            if self.bit_offset >= 64 && self.bit_offset - self.bits_per_item < 64 {
+                // We just completed block 0, emit it
+                (self.on_block_complete)(self.blocks[0]);
+
+                // Shift: block 1 becomes block 0
+                self.blocks[0] = self.blocks[1];
+                self.blocks[1] = 0;
+                self.bit_offset -= 64;
+            } else if self.bit_offset >= 128 {
+                // Block 1 is also full, emit block 0 (which was block 1)
+                (self.on_block_complete)(self.blocks[0]);
+
+                // Shift again
+                self.blocks[0] = self.blocks[1];
+                self.blocks[1] = 0;
+                self.bit_offset -= 64;
+            }
+        }
+    }
+
+    /// Finish packing and return any remaining data in the blocks.
+    ///
+    /// # Returns
+    ///
+    /// A tuple of two optional u64 values:
+    /// - First: The remaining block 0 if `bit_offset > 0`
+    /// - Second: The remaining block 1 if `bit_offset > 64`
+    pub fn finish(self) -> (Option<u64>, Option<u64>) {
+        if self.bit_offset == 0 {
+            (None, None)
+        } else if self.bit_offset <= 64 {
+            (Some(self.blocks[0]), None)
+        } else {
+            (Some(self.blocks[0]), Some(self.blocks[1]))
+        }
+    }
+}
+
 impl<'a, 'b> Iterator for Iter<'a, 'b> {
     type Item = u64;
 
@@ -680,5 +826,197 @@ mod tests {
                 );
             }
         }
+    }
+
+    // StreamingBitPacker tests
+
+    #[test]
+    fn streaming_should_emit_block_when_full() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let emitted_blocks = Rc::new(RefCell::new(Vec::new()));
+        let emitted_clone = emitted_blocks.clone();
+
+        let mut packer = StreamingBitPacker::new(8, move |block| {
+            emitted_clone.borrow_mut().push(block);
+        });
+
+        // Push 8 items of 8 bits each = 64 bits = 1 full block
+        for i in 0..8u8 {
+            packer.push(&[i]);
+        }
+
+        // Should have emitted 1 block
+        assert_eq!(emitted_blocks.borrow().len(), 1);
+
+        let (remaining0, remaining1) = packer.finish();
+        assert!(remaining0.is_none());
+        assert!(remaining1.is_none());
+
+        // Verify the emitted block has the correct content
+        let expected = u64::from_le_bytes([0, 1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(emitted_blocks.borrow()[0], expected);
+    }
+
+    #[test]
+    fn streaming_should_return_remaining_in_finish() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let emitted_blocks = Rc::new(RefCell::new(Vec::new()));
+        let emitted_clone = emitted_blocks.clone();
+
+        let mut packer = StreamingBitPacker::new(8, move |block| {
+            emitted_clone.borrow_mut().push(block);
+        });
+
+        // Push only 4 items = 32 bits, not enough for a full block
+        for i in 0..4u8 {
+            packer.push(&[i]);
+        }
+
+        // No blocks should have been emitted
+        assert_eq!(emitted_blocks.borrow().len(), 0);
+
+        let (remaining0, remaining1) = packer.finish();
+        assert!(remaining0.is_some());
+        assert!(remaining1.is_none());
+
+        let expected = u64::from_le_bytes([0, 1, 2, 3, 0, 0, 0, 0]);
+        assert_eq!(remaining0.unwrap(), expected);
+    }
+
+    #[test]
+    fn streaming_matches_bitpacker_pack() {
+        // Test that streaming produces the same result as batch packing
+        let fingerprints: Vec<Vec<u8>> = (0..12u8).map(|n| [n; 32].to_vec()).collect();
+
+        let bp = BitPacker(8);
+        let expected_packed = bp.pack(&fingerprints);
+
+        let mut emitted_blocks = Vec::new();
+        {
+            let mut packer = StreamingBitPacker::new(8, |block| {
+                emitted_blocks.push(block);
+            });
+
+            for fp in &fingerprints {
+                packer.push(fp);
+            }
+
+            let (remaining0, remaining1) = packer.finish();
+            if let Some(block) = remaining0 {
+                emitted_blocks.push(block);
+            }
+            if let Some(block) = remaining1 {
+                emitted_blocks.push(block);
+            }
+        }
+
+        assert_eq!(emitted_blocks, expected_packed);
+    }
+
+    #[test]
+    fn streaming_9_bit_matches_bitpacker() {
+        // Test with 9-bit items that span across block boundaries
+        let fingerprints: Vec<Vec<u8>> = vec![
+            [0b00000000u8; 32].to_vec(),
+            [0b11111111u8; 32].to_vec(),
+            [0b00000000u8; 32].to_vec(),
+            [0b11111111u8; 32].to_vec(),
+            [0b00000000u8; 32].to_vec(),
+            [0b11111111u8; 32].to_vec(),
+            [0b00000000u8; 32].to_vec(),
+            [0b11111111u8; 32].to_vec(),
+            [0b00000000u8; 32].to_vec(),
+            [0b11111111u8; 32].to_vec(),
+            [0b00000000u8; 32].to_vec(),
+            [0b11111111u8; 32].to_vec(),
+        ];
+
+        let bp = BitPacker(9);
+        let expected_packed = bp.pack(&fingerprints);
+
+        let mut emitted_blocks = Vec::new();
+        {
+            let mut packer = StreamingBitPacker::new(9, |block| {
+                emitted_blocks.push(block);
+            });
+
+            for fp in &fingerprints {
+                packer.push(fp);
+            }
+
+            let (remaining0, remaining1) = packer.finish();
+            if let Some(block) = remaining0 {
+                emitted_blocks.push(block);
+            }
+            if let Some(block) = remaining1 {
+                emitted_blocks.push(block);
+            }
+        }
+
+        assert_eq!(emitted_blocks, expected_packed);
+    }
+
+    #[test]
+    fn streaming_empty_finish() {
+        let packer = StreamingBitPacker::new(8, |_block| {
+            panic!("should not emit any blocks");
+        });
+
+        let (remaining0, remaining1) = packer.finish();
+        assert!(remaining0.is_none());
+        assert!(remaining1.is_none());
+    }
+
+    #[test]
+    fn streaming_multiple_block_emissions() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let emitted_blocks = Rc::new(RefCell::new(Vec::new()));
+        let emitted_clone = emitted_blocks.clone();
+
+        let mut packer = StreamingBitPacker::new(8, move |block| {
+            emitted_clone.borrow_mut().push(block);
+        });
+
+        // Push 20 items = 160 bits = 2 full blocks + 32 bits remaining
+        for i in 0..20u8 {
+            packer.push(&[i]);
+        }
+
+        // Should have emitted 2 blocks
+        assert_eq!(emitted_blocks.borrow().len(), 2);
+
+        let (remaining0, remaining1) = packer.finish();
+        assert!(remaining0.is_some());
+        assert!(remaining1.is_none());
+
+        // Add remaining to emitted for comparison
+        if let Some(block) = remaining0 {
+            emitted_blocks.borrow_mut().push(block);
+        }
+
+        // Verify against BitPacker
+        let fingerprints: Vec<Vec<u8>> = (0..20u8).map(|n| [n; 32].to_vec()).collect();
+        let bp = BitPacker(8);
+        let expected_packed = bp.pack(&fingerprints);
+
+        assert_eq!(*emitted_blocks.borrow(), expected_packed);
+    }
+
+    #[test]
+    #[should_panic(expected = "bits_per_item must be between 1 and 64")]
+    fn streaming_panics_on_zero_bits() {
+        let _ = StreamingBitPacker::new(0, |_| {});
+    }
+
+    #[test]
+    #[should_panic(expected = "bits_per_item must be between 1 and 64")]
+    fn streaming_panics_on_too_many_bits() {
+        let _ = StreamingBitPacker::new(65, |_| {});
     }
 }

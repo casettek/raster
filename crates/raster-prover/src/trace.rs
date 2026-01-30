@@ -202,182 +202,67 @@ impl ExecutionCommitment {
     }
 }
 
-/// Builder for incrementally constructing an ExecutionCommitment.
-///
-/// This allows appending trace items one at a time rather than
-/// providing all items upfront, which is useful for streaming scenarios.
-///
-/// # Example
-///
-/// ```ignore
-/// let mut builder = ExecutionCommitmentBuilder::new(seed);
-/// builder.append(&item1);
-/// builder.append(&item2);
-/// // Can check intermediate state
-/// let current = builder.current_root();
-/// // Finalize
-/// let commitment = builder.build();
-/// ```
-pub struct ExecutionCommitmentBuilder {
-    trace_tree: TraceBridgeTree,
-    roots: Vec<Vec<u8>>,
-}
-
-impl ExecutionCommitmentBuilder {
-    /// Initialize a new builder with the given seed.
-    ///
-    /// The seed is used as the initial leaf in the Merkle tree.
-    pub fn new(seed: &[u8]) -> Self {
-        let mut trace_tree = TraceBridgeTree::new(1);
-        trace_tree.append(Bytes(seed.to_vec()));
-        Self {
-            trace_tree,
-            roots: Vec::new(),
-        }
-    }
-
-    /// Append a single trace item to the commitment.
-    ///
-    /// Computes the hash of the item, adds it to the tree, and stores the new root.
-    pub fn append(&mut self, item: &TileTraceItem) {
-        let item_hash = item.hash();
-        self.trace_tree.append(Bytes(item_hash));
-        if let Some(root) = self.trace_tree.root(0) {
-            self.roots.push(root.0);
-        }
-    }
-
-    /// Try to append a single trace item, returning an error on failure.
-    ///
-    /// This is the fallible version of [`append`](Self::append) that propagates
-    /// serialization errors instead of panicking.
-    pub fn try_append(&mut self, item: &TileTraceItem) -> Result<()> {
-        let item_hash = item.try_hash()?;
-        self.trace_tree.append(Bytes(item_hash));
-        if let Some(root) = self.trace_tree.root(0) {
-            self.roots.push(root.0);
-        }
-        Ok(())
-    }
-
-    /// Get the current Merkle root.
-    ///
-    /// Returns `None` if no items have been appended yet.
-    /// This is useful for checking intermediate state during streaming.
-    pub fn current_root(&self) -> Option<&[u8]> {
-        self.roots.last().map(|v| v.as_slice())
-    }
-
-    /// Get the number of items that have been appended.
-    pub fn len(&self) -> usize {
-        self.roots.len()
-    }
-
-    /// Check if no items have been appended yet.
-    pub fn is_empty(&self) -> bool {
-        self.roots.is_empty()
-    }
-
-    /// Consume the builder and return the ExecutionCommitment.
-    pub fn build(self) -> ExecutionCommitment {
-        ExecutionCommitment(self.roots)
-    }
-}
-
 /// Builder for incrementally constructing an ExecutionCommitment with streaming output.
 ///
-/// Similar to `ExecutionCommitmentBuilder`, but writes each new root to the
+/// Similar to `TraceCommitmentSink`, but writes each new root to the
 /// provided writer as raw bytes (32 bytes per root) immediately after appending.
 ///
 /// # Example
 ///
 /// ```ignore
 /// let file = File::create("roots.bin")?;
-/// let mut builder = ExecutionCommitmentBuilderWithWriter::new(seed, file);
+/// let mut builder = TraceCommitmentSink::new(seed, file);
 /// builder.append(&item1)?; // writes root to file
 /// builder.append(&item2)?; // writes root to file
-/// let commitment = builder.build();
 /// ```
-pub struct ExecutionCommitmentBuilderWithWriter<W: Write> {
-    trace_tree: TraceBridgeTree,
-    roots: Vec<Vec<u8>>,
-    writer: W,
+pub struct TraceCommitmentProducer {
+    frontier: NonEmptyFrontier<Bytes>,
+    trace_items_commitments: Vec<Vec<u8>>,
 }
 
-impl<W: Write> ExecutionCommitmentBuilderWithWriter<W> {
-    /// Initialize a new builder with the given seed and writer.
-    ///
-    /// The seed is used as the initial leaf in the Merkle tree.
-    /// The writer will receive each new root as raw bytes (32 bytes) after each append.
-    pub fn new(seed: &[u8], writer: W) -> Self {
+impl TraceCommitmentProducer {
+
+    pub fn new(seed: &[u8]) -> Self {
         let mut trace_tree = TraceBridgeTree::new(1);
         trace_tree.append(Bytes(seed.to_vec()));
-        Self {
-            trace_tree,
-            roots: Vec::new(),
-            writer,
-        }
+        let frontier = trace_tree.frontier().cloned().unwrap();
+        Self { frontier, trace_items_commitments: Vec::new() }
     }
 
-    /// Append a single trace item to the commitment and write the root to the writer.
-    ///
-    /// Computes the hash of the item, adds it to the tree, stores the new root,
-    /// and writes the root as raw bytes (32 bytes) to the writer.
-    ///
-    /// Returns an `io::Result` to handle potential write errors.
-    pub fn append(&mut self, item: &TileTraceItem) -> std::io::Result<()> {
+    pub fn append(&mut self, item: &TileTraceItem) -> Result<()> {
+        self.frontier.append(Bytes(item.hash()));
+        let mut trace_tree = TraceBridgeTree::from_frontier(1, self.frontier.clone());
         let item_hash = item.hash();
-        self.trace_tree.append(Bytes(item_hash));
-        if let Some(root) = self.trace_tree.root(0) {
-            self.writer.write_all(&root.0)?;
-            self.roots.push(root.0);
-        }
+        trace_tree.append(Bytes(item_hash));
+
+        let Some(root) = trace_tree.root(0) else {
+            return Err(BitPackerError::TreeRootError("Failed to get root".to_string()));
+        };
+
+        self.frontier = trace_tree.frontier().cloned().unwrap();
+        self.trace_items_commitments.push(root.0);
+
         Ok(())
     }
 
-    /// Try to append a single trace item, returning an error on failure.
-    ///
-    /// This is the fallible version that handles both serialization and IO errors,
-    /// returning a `BitPackerError` on failure.
     pub fn try_append(&mut self, item: &TileTraceItem) -> Result<()> {
         let item_hash = item.try_hash()?;
-        self.trace_tree.append(Bytes(item_hash));
-        if let Some(root) = self.trace_tree.root(0) {
-            self.writer.write_all(&root.0)?;
-            self.roots.push(root.0);
-        }
+        self.frontier.append(Bytes(item_hash));
+        let mut trace_tree = TraceBridgeTree::from_frontier(1, self.frontier.clone());
+        let item_hash = item.hash();
+        trace_tree.append(Bytes(item_hash));
+
+        let Some(root) = trace_tree.root(0) else {
+            return Err(BitPackerError::TreeRootError("Failed to get root".to_string()));
+        };
+
+        self.frontier = trace_tree.frontier().cloned().unwrap();
+        self.trace_items_commitments.push(root.0);
+
         Ok(())
     }
-
-    /// Get the current Merkle root.
-    ///
-    /// Returns `None` if no items have been appended yet.
-    /// This is useful for checking intermediate state during streaming.
-    pub fn current_root(&self) -> Option<&[u8]> {
-        self.roots.last().map(|v| v.as_slice())
-    }
-
-    /// Get the number of items that have been appended.
-    pub fn len(&self) -> usize {
-        self.roots.len()
-    }
-
-    /// Check if no items have been appended yet.
-    pub fn is_empty(&self) -> bool {
-        self.roots.is_empty()
-    }
-
-    /// Consume the builder and return the ExecutionCommitment.
-    pub fn build(self) -> ExecutionCommitment {
-        ExecutionCommitment(self.roots)
-    }
-
-    /// Consume the builder and return both the ExecutionCommitment and the writer.
-    ///
-    /// This is useful when you need to recover the writer after building,
-    /// for example to flush or close a file.
-    pub fn into_inner(self) -> (ExecutionCommitment, W) {
-        (ExecutionCommitment(self.roots), self.writer)
+    pub fn finish(self) -> Vec<Vec<u8>> {
+        self.trace_items_commitments
     }
 }
 
@@ -445,63 +330,5 @@ mod tests {
         let items: Vec<TileTraceItem> = vec![];
         let result = ExecutionCommitment::try_from(&items, &precomputed::EMPTY_TRIE_NODES[0]);
         assert!(matches!(result, Err(BitPackerError::EmptyTrace)));
-    }
-
-    #[test]
-    fn test_builder_matches_batch_from() {
-        let items: Vec<TileTraceItem> = vec![
-            make_tile_trace_item(0, 0),
-            make_tile_trace_item(1, 1),
-            make_tile_trace_item(2, 2),
-            make_tile_trace_item(3, 3),
-            make_tile_trace_item(4, 4),
-        ];
-
-        let seed = &precomputed::EMPTY_TRIE_NODES[0];
-
-        // Build using batch method
-        let batch_commitment = ExecutionCommitment::from(&items, seed);
-
-        // Build using incremental builder
-        let mut builder = ExecutionCommitmentBuilder::new(seed);
-        for item in &items {
-            builder.append(item);
-        }
-        let builder_commitment = builder.build();
-
-        // They should produce identical results
-        assert_eq!(batch_commitment.0, builder_commitment.0);
-    }
-
-    #[test]
-    fn test_builder_current_root() {
-        let seed = &precomputed::EMPTY_TRIE_NODES[0];
-        let mut builder = ExecutionCommitmentBuilder::new(seed);
-
-        // Initially no root
-        assert!(builder.current_root().is_none());
-        assert_eq!(builder.len(), 0);
-        assert!(builder.is_empty());
-
-        // After appending one item
-        builder.append(&make_tile_trace_item(1, 2));
-        assert!(builder.current_root().is_some());
-        assert_eq!(builder.len(), 1);
-        assert!(!builder.is_empty());
-
-        // After appending another item
-        builder.append(&make_tile_trace_item(3, 4));
-        assert_eq!(builder.len(), 2);
-    }
-
-    #[test]
-    fn test_builder_try_append() {
-        let seed = &precomputed::EMPTY_TRIE_NODES[0];
-        let mut builder = ExecutionCommitmentBuilder::new(seed);
-
-        let item = make_tile_trace_item(1, 2);
-        let result = builder.try_append(&item);
-        assert!(result.is_ok());
-        assert_eq!(builder.len(), 1);
     }
 }

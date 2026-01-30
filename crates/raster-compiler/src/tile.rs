@@ -1,9 +1,8 @@
 use std::path::PathBuf;
 
 use crate::Project;
-use crate::{ast::FunctionAstItem, ProjectAst};
+use crate::ast::FunctionAstItem;
 
-use std::io::Read;
 
 use raster_core::tile::{TileId, TileMetadata};
 

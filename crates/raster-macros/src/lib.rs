@@ -633,11 +633,35 @@ pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let expanded = quote! {
         #(#fn_attrs)*
         fn main() {
-            let file = std::fs::File::create("execution_trace.bin")
-                .expect("Failed to create trace output file");
-            let commitment_subscriber = ::raster::ExecutionCommitmentSubscriber::new(file);
+            // Parse --commit and --verify flags from CLI args
+            fn __parse_commit_verify() -> (Option<String>, Option<String>) {
+                let args: Vec<String> = std::env::args().collect();
+                let commit = args.iter().position(|a| a == "--commit")
+                    .and_then(|i| args.get(i + 1).cloned());
+                let verify = args.iter().position(|a| a == "--verify")
+                    .and_then(|i| args.get(i + 1).cloned());
+                (commit, verify)
+            }
 
-            ::raster::init_with(commitment_subscriber);
+            let (commit_path, verify_path) = __parse_commit_verify();
+            let bits = 16;
+
+            // Initialize subscriber based on flags
+            if let Some(path) = commit_path {
+                let file = std::fs::File::create(&path)
+                    .expect(&format!("Failed to create commit file: {}", path));
+                let exec_commit_subscriber = ::raster::ExecCommitSubscriber::new(bits, file);
+                ::raster::init_with(exec_commit_subscriber);
+            } else if let Some(path) = verify_path {
+                let exec_verify_subscriber = ::raster::ExecVerifySubscriber::new(
+                    bits,
+                    std::path::PathBuf::from(path),
+                );
+                ::raster::init_with(exec_verify_subscriber);
+            } else {
+                // Default: use JsonSubscriber for stdout output
+                ::raster::init();
+            }
 
             if ::raster::try_execute_tile_from_args() {
                 return;
@@ -646,6 +670,8 @@ pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
             #input_parsing
 
             #fn_block
+
+            ::raster::finish();
         }
     };
 

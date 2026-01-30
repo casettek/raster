@@ -17,7 +17,7 @@ pub use raster_macros::{tile, sequence, main};
 
 // Runtime is only available with std feature
 #[cfg(feature = "std")]
-pub use raster_runtime::{JsonSubscriber, init, init_with, __emit_trace, ExecutionCommitmentSubscriber};
+pub use raster_runtime::{JsonSubscriber, init, init_with, __emit_trace, ExecCommitSubscriber, ExecVerifySubscriber, finish};
 // Tile execution helper for native backend subprocess communication
 #[cfg(feature = "std")]
 mod exec_helper;

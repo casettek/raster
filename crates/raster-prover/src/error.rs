@@ -18,6 +18,8 @@ pub enum BitPackerError {
     EmptyTrace,
     /// IO error.
     IoError(String),
+    /// Failed to get root.
+    TreeRootError(String),
 }
 
 impl fmt::Display for BitPackerError  {
@@ -47,6 +49,9 @@ impl fmt::Display for BitPackerError  {
             BitPackerError::IoError(msg) => {
                 write!(f, "IO error: {}", msg)
             }
+            BitPackerError::TreeRootError(msg) => {
+                write!(f, "Failed to get root {}", msg)
+            }
         }
     }
 }
@@ -59,5 +64,5 @@ impl From<std::io::Error> for BitPackerError {
     }
 }
 
-/// Result type for bphc operations.
+/// Result type for bitpacker operations.
 pub type Result<T> = std::result::Result<T, BitPackerError>;
