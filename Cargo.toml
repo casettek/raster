@@ -10,7 +10,9 @@ members = [
     "crates/raster-backend-risc0",
     "crates/raster-analysis",
     "crates/raster-cli",
-    "examples/hello-tiles", "crates/raster-backend-native",
+    "crates/raster-prover",
+    "examples/hello-tiles", 
+    "crates/raster-backend-native",
 ]
 
 [workspace.package]
@@ -30,12 +32,22 @@ raster-backend-native = { path = "crates/raster-backend-native", version = "0.1.
 raster-backend-risc0 = { path = "crates/raster-backend-risc0", version = "0.1.0" }
 raster-compiler = { path = "crates/raster-compiler", version = "0.1.0" }
 raster-analysis = { path = "crates/raster-analysis", version = "0.1.0" }
+raster-prover = { path = "crates/raster-prover", version = "0.1.0" }
 
 # External dependencies
 serde = { version = "1.0", default-features = false, features = ["derive", "alloc"] }
 serde_json = "1.0"
 thiserror = "1.0"
 anyhow = "1.0"
+
+# Trace/Fingerprint dependencies
+bridgetree = "0.7.0"
+hex = "0.4.3"
+hex-literal = "1.1.0"
+incrementalmerkletree = "0.8.2"
+itertools = "0.14.0"
+rand = "0.9.2"
+sha2 = "0.10.9"
 
 # Proc macro dependencies
 syn = { version = "2.0", features = ["full", "visit"] }
