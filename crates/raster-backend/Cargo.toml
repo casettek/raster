@@ -9,7 +9,6 @@ description = "Backend abstraction layer for the Raster toolchain"
 
 [dependencies]
 raster-core.workspace = true
-raster-runtime.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 serde.workspace = true

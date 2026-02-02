@@ -7,11 +7,10 @@ use bridgetree::{Hashable, Level, NonEmptyFrontier};
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::fmt::Debug;
-use std::io::Write;
 
 use crate::error::{BitPackerError, Result};
 use crate::precomputed::{EMPTY_TRIE_NODES, HASH_SIZE};
-use raster_core::trace::TileTraceItem;
+use raster_core::trace::TraceItem;
 
 /// Trait for types that can be hashed to bytes.
 pub trait BytesHashable {
@@ -24,7 +23,7 @@ pub trait BytesHashable {
     }
 }
 
-impl BytesHashable for TileTraceItem {
+impl BytesHashable for TraceItem {
     fn hash(&self) -> Vec<u8> {
         let data = bincode::serialize(self).expect("Failed to serialize for hashing");
         let mut hasher = Sha256::new();
@@ -95,7 +94,7 @@ impl ExecutionCommitment {
     ///
     /// Returns a vector of Merkle roots, one for each item in the trace.
     /// Each root represents the commitment up to and including that item.
-    pub fn from(items: &[TileTraceItem], seed: &[u8]) -> ExecutionCommitment {
+    pub fn from(items: &[TraceItem], seed: &[u8]) -> ExecutionCommitment {
         let items_hashes: Vec<Vec<u8>> = items.iter().map(|item| item.hash()).collect();
 
         let mut trace_tree = TraceBridgeTree::new(1);
@@ -114,7 +113,7 @@ impl ExecutionCommitment {
     }
 
     /// Try to create a commitment, returning an error on failure.
-    pub fn try_from(items: &[TileTraceItem], seed: &[u8]) -> Result<ExecutionCommitment> {
+    pub fn try_from(items: &[TraceItem], seed: &[u8]) -> Result<ExecutionCommitment> {
         if items.is_empty() {
             return Err(BitPackerError::EmptyTrace);
         }
@@ -143,7 +142,7 @@ impl ExecutionCommitment {
     ///
     /// This can be used to continue building the tree from position n.
     pub fn frontier(
-        items: &[TileTraceItem],
+        items: &[TraceItem],
         n: usize,
         seed: &[u8],
     ) -> Option<NonEmptyFrontier<Bytes>> {
@@ -161,7 +160,7 @@ impl ExecutionCommitment {
 
     /// Try to get the frontier, returning an error on failure.
     pub fn try_frontier(
-        items: &[TileTraceItem],
+        items: &[TraceItem],
         n: usize,
         seed: &[u8],
     ) -> Result<NonEmptyFrontier<Bytes>> {
@@ -221,7 +220,6 @@ pub struct TraceCommitmentProducer {
 }
 
 impl TraceCommitmentProducer {
-
     pub fn new(seed: &[u8]) -> Self {
         let mut trace_tree = TraceBridgeTree::new(1);
         trace_tree.append(Bytes(seed.to_vec()));
@@ -229,7 +227,7 @@ impl TraceCommitmentProducer {
         Self { frontier, trace_items_commitments: Vec::new() }
     }
 
-    pub fn append(&mut self, item: &TileTraceItem) -> Result<()> {
+    pub fn append(&mut self, item: &TraceItem) -> Result<()> {
         self.frontier.append(Bytes(item.hash()));
         let mut trace_tree = TraceBridgeTree::from_frontier(1, self.frontier.clone());
         let item_hash = item.hash();
@@ -245,7 +243,7 @@ impl TraceCommitmentProducer {
         Ok(())
     }
 
-    pub fn try_append(&mut self, item: &TileTraceItem) -> Result<()> {
+    pub fn try_append(&mut self, item: &TraceItem) -> Result<()> {
         let item_hash = item.try_hash()?;
         self.frontier.append(Bytes(item_hash));
         let mut trace_tree = TraceBridgeTree::from_frontier(1, self.frontier.clone());
@@ -272,9 +270,9 @@ mod tests {
     use crate::precomputed;
 
     /// Helper function to create a TileTraceItem for testing.
-    fn make_tile_trace_item(input: u64, output: u64) -> TileTraceItem {
-        TileTraceItem {
-            tile: format!("test_tile_{}", input),
+    fn make_tile_trace_item(input: u64, output: u64) -> TraceItem {
+        TraceItem {
+            fn_name: format!("test_tile_{}", input),
             desc: None,
             inputs: vec![],
             input_data: format!("{}", input),
@@ -285,7 +283,7 @@ mod tests {
 
     #[test]
     fn trace_should_be_not_equal() {
-        let items: Vec<TileTraceItem> = vec![
+        let items: Vec<TraceItem> = vec![
             make_tile_trace_item(0, 0),
             make_tile_trace_item(1, 1),
             make_tile_trace_item(2, 2),
@@ -293,7 +291,7 @@ mod tests {
             make_tile_trace_item(4, 4),
         ];
 
-        let ref_items: Vec<TileTraceItem> = vec![
+        let ref_items: Vec<TraceItem> = vec![
             make_tile_trace_item(0, 0),
             make_tile_trace_item(1, 1),
             make_tile_trace_item(5, 5), // Different
@@ -327,7 +325,7 @@ mod tests {
 
     #[test]
     fn test_try_from_empty_trace() {
-        let items: Vec<TileTraceItem> = vec![];
+        let items: Vec<TraceItem> = vec![];
         let result = ExecutionCommitment::try_from(&items, &precomputed::EMPTY_TRIE_NODES[0]);
         assert!(matches!(result, Err(BitPackerError::EmptyTrace)));
     }

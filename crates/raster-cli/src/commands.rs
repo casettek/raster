@@ -1,6 +1,8 @@
 //! Command implementations for the Raster CLI.
 mod utils;
 pub mod run;
+pub mod tile;
+
 use utils::encode::{decode_output, encode_input};
 
 use crate::BackendType;
@@ -19,7 +21,6 @@ use std::fs;
 use std::path::{PathBuf};
 use raster_compiler::backend::BackendImpl;
 
-pub mod tile;
 
 /// Get the output directory for artifacts.
 fn output_dir() -> PathBuf {

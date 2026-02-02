@@ -5,6 +5,11 @@
 //! - Optional execution tracing
 //! - Trace capture and storage
 
-pub mod tracer;
-
-pub use tracer::{JsonSubscriber, Subscriber, init, init_with, __emit_trace, ExecCommitSubscriber, ExecVerifySubscriber, finish};
+pub mod tracing;
+pub use tracing::{
+    finish, init, init_with,
+    __emit_trace,
+    subscriber::{
+        commit::CommitSubscriber, json::JsonSubscriber, verify::VerifySubscriber, Subscriber,
+    },
+};

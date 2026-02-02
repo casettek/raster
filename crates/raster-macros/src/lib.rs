@@ -650,10 +650,10 @@ pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
             if let Some(path) = commit_path {
                 let file = std::fs::File::create(&path)
                     .expect(&format!("Failed to create commit file: {}", path));
-                let exec_commit_subscriber = ::raster::ExecCommitSubscriber::new(bits, file);
+                let exec_commit_subscriber = ::raster::CommitSubscriber::new(bits, file);
                 ::raster::init_with(exec_commit_subscriber);
             } else if let Some(path) = verify_path {
-                let exec_verify_subscriber = ::raster::ExecVerifySubscriber::new(
+                let exec_verify_subscriber = ::raster::VerifySubscriber::new(
                     bits,
                     std::path::PathBuf::from(path),
                 );
