@@ -19,9 +19,9 @@ pub struct TraceInputParam {
 /// This captures the tile's function signature metadata along with
 /// the serialized input/output data for complete traceability.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TileTraceItem {
+pub struct TraceItem {
     /// The tile function name/identifier
-    pub tile: String,
+    pub fn_name: String,
     /// Optional human-readable description
     pub desc: Option<String>,
     /// Input parameter metadata (name and type for each parameter)

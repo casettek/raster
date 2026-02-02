@@ -9,5 +9,3 @@ pub use backend::{
     calculate_proof_cycles, ArtifactStore, Backend, CompilationArtifact, ExecutionMode, ResourceEstimate,
     TileExecDescriptor, TileExecutionResult, MIN_PROOF_SEGMENT_CYCLES,
 };
-
-pub use raster_runtime::{init, JsonSubscriber, Subscriber};

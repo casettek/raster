@@ -1,0 +1,19 @@
+[package]
+name = "raster-prover"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+raster-core = { workspace = true, features = ["std"] }
+bincode.workspace = true
+bridgetree.workspace = true
+hex.workspace = true
+hex-literal.workspace = true
+incrementalmerkletree.workspace = true
+itertools.workspace = true
+rand.workspace = true
+sha2.workspace = true
+serde.workspace = true

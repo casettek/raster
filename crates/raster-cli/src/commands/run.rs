@@ -6,7 +6,12 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 /// Run the user program with the specified backend.
-pub fn run(backend_type: BackendType, input: Option<&str>) -> Result<()> {
+pub fn run(
+    backend_type: BackendType,
+    input: Option<&str>,
+    commit: Option<&str>,
+    audit: Option<&str>,
+) -> Result<()> {
     // Only native backend is supported for whole-program execution
     if backend_type != BackendType::Native {
         return Err(Error::Other(
@@ -60,6 +65,12 @@ pub fn run(backend_type: BackendType, input: Option<&str>) -> Result<()> {
         cmd.args(["--input", input_json]);
     }
 
+    if let Some(commit_path) = commit {
+        cmd.args(["--commit", commit_path]);
+    } else if let Some(audit_path) = audit {
+        cmd.args(["--audit", audit_path]);
+    }
+
     // Execute the binary and capture output
     let output = cmd
         .output()
@@ -67,7 +78,10 @@ pub fn run(backend_type: BackendType, input: Option<&str>) -> Result<()> {
 
     if !output.status.success() {
         let code = output.status.code().unwrap_or(-1);
-        return Err(Error::Other(format!("Program exited with code {}", code)));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        println!("stderr: {}", stderr);
+
+        return Err(Error::Other(format!("Program exited with code {}: {}", code, stderr)));
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);

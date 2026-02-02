@@ -72,6 +72,28 @@ fn gen_output_serialization(_input: &ItemFn) -> proc_macro2::TokenStream {
     }
 }
 
+/// Generate input serialization code for tracing in the original function.
+///
+/// This serializes the typed input parameters to bytes for the trace emission.
+fn gen_trace_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream {
+    let (input_types, input_names) = extract_inputs(input);
+
+    if input_types.is_empty() {
+        quote! { let __raster_input_bytes: ::alloc::vec::Vec<u8> = ::alloc::vec::Vec::new(); }
+    } else if input_types.len() == 1 {
+        let name = input_names[0];
+        quote! {
+            let __raster_input_bytes = ::raster::core::postcard::to_allocvec(&#name)
+                .unwrap_or_default();
+        }
+    } else {
+        quote! {
+            let __raster_input_bytes = ::raster::core::postcard::to_allocvec(&(#(&#input_names),*))
+                .unwrap_or_default();
+        }
+    }
+}
+
 /// Generate only the function call code.
 ///
 /// Returns a TokenStream that calls the function and stores the result.
@@ -96,7 +118,7 @@ fn gen_function_call(input: &ItemFn) -> proc_macro2::TokenStream {
 }
 
 /// Parses tile attributes from the macro invocation.
-/// 
+///
 /// Uses named argument `kind` for tile type: `#[tile(kind = iter)]` or `#[tile(kind = recur)]`.
 struct TileAttrs {
     /// Tile type: "iter" (default) or "recur".
@@ -121,7 +143,7 @@ impl TileAttrs {
 
         // Parse comma-separated key=value pairs
         let attr_str = attr.to_string();
-        
+
         for part in attr_str.split(',') {
             let part = part.trim();
             if part.is_empty() {
@@ -132,12 +154,10 @@ impl TileAttrs {
                 let key = key.trim();
                 let value = value.trim().trim_matches('"');
                 match key {
-                    "kind" => {
-                        match value {
-                            "iter" | "recur" => attrs.tile_type = value.to_string(),
-                            _ => panic!("Unknown tile kind '{}'. Valid kinds: iter, recur", value),
-                        }
-                    }
+                    "kind" => match value {
+                        "iter" | "recur" => attrs.tile_type = value.to_string(),
+                        _ => panic!("Unknown tile kind '{}'. Valid kinds: iter, recur", value),
+                    },
                     "estimated_cycles" => {
                         attrs.estimated_cycles = value.parse().ok();
                     }
@@ -230,74 +250,7 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
     let function_call = gen_function_call(&input_fn);
     let output_serialization = gen_output_serialization(&input_fn);
 
-    let (param_names, param_types, _param_idents): (Vec<_>, Vec<_>, Vec<_>) = input_fn
-        .sig
-        .inputs
-        .iter()
-        .filter_map(|arg| {
-            if let FnArg::Typed(pat_type) = arg {
-                if let Pat::Ident(pat_ident) = &*pat_type.pat {
-                    let name = pat_ident.ident.to_string();
-                    let ty = pat_type.ty.to_token_stream().to_string();
-                    let ident = &pat_ident.ident;
-                    return Some((name, ty, ident.clone()));
-                }
-            }
-            None
-        })
-        .fold((vec![], vec![], vec![]), |mut acc, (name, ty, ident)| {
-            acc.0.push(name);
-            acc.1.push(ty);
-            acc.2.push(ident);
-            acc
-        });
-
-    // Extract return type
-    let return_type_expr = match &input_fn.sig.output {
-        ReturnType::Default => quote! { ::core::option::Option::None },
-        ReturnType::Type(_, ty) => {
-            let ty_str = ty.to_token_stream().to_string();
-            quote! { ::core::option::Option::Some(#ty_str) }
-        }
-    };
-
-    let param_count = param_names.len();
-
-    // Generate code to capture input values at the start of the function (without cfg guard)
-    let tracer_capture_inputs = {
-        let (_, param_idents) = extract_inputs(&input_fn);
-        if param_idents.is_empty() {
-            quote! {
-                let __trace_inputs: [::alloc::string::String; 0] = [];
-            }
-        } else {
-            let format_exprs: Vec<_> = param_idents
-                .iter()
-                .map(|ident| quote! { ::alloc::format!("{:?}", #ident) })
-                .collect();
-            quote! {
-                let __trace_inputs: [::alloc::string::String; #param_count] = [
-                    #(#format_exprs),*
-                ];
-            }
-        }
-    };
-
-    // Generate trace emission that uses pre-captured values
-    let tracer_emit_trace = quote! {
-        let __trace_output = ::alloc::format!("{:?}", __raster_result);
-        let __trace_input_refs: [&str; #param_count] = __trace_inputs.each_ref().map(|s| s.as_str());
-        ::raster::__emit_trace(
-            #fn_name_str,
-            &[#(#param_names),*],
-            &[#(#param_types),*],
-            #return_type_expr,
-            &__trace_input_refs,
-            &__trace_output,
-        );
-    };
-
- // For recursive tiles, also generate a macro with the same name that allows `tile_name!(args)` syntax
+    // For recursive tiles, also generate a macro with the same name that allows `tile_name!(args)` syntax
     let recursive_macro = if attrs.tile_type == "recur" {
         let macro_name = format_ident!("{}", fn_name);
         quote! {
@@ -317,23 +270,63 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! {}
     };
 
+    // Generate input parameter metadata for tracing: &[("name", "Type"), ...]
+    let (input_types, input_names) = extract_inputs(&input_fn);
+    let input_param_tuples: Vec<_> = input_names
+        .iter()
+        .zip(input_types.iter())
+        .map(|(name, ty)| {
+            let name_str = name.to_string();
+            let ty_str = ty.to_token_stream().to_string();
+            quote! { (#name_str, #ty_str) }
+        })
+        .collect();
 
-    // Generate the modified original function with tracing injected
-    // Use cfg to conditionally include tracing - on riscv32 or no-std, just run original body
-    let traced_function = quote! {
+    // Generate trace description expression (Option<&str>)
+    let trace_desc_expr = match &attrs.description {
+        Some(desc) => {
+            let desc_str = desc.as_str();
+            quote! { ::core::option::Option::Some(#desc_str) }
+        }
+        None => quote! { ::core::option::Option::None },
+    };
+
+    // Generate output type expression (Option<&str>)
+    let trace_output_type_expr = match &input_fn.sig.output {
+        ReturnType::Default => quote! { ::core::option::Option::None },
+        ReturnType::Type(_, ty) => {
+            let ty_str = ty.to_token_stream().to_string();
+            quote! { ::core::option::Option::Some(#ty_str) }
+        }
+    };
+
+    // Generate input serialization code for tracing
+    let trace_input_serialization = gen_trace_input_serialization(&input_fn);
+
+    let original_function = quote! {
         #(#fn_attrs)*
         #fn_vis #fn_sig {
             // On std + non-riscv32: wrap body in closure for tracing
             #[cfg(all(feature = "std", not(target_arch = "riscv32")))]
             {
-                // Capture inputs for tracing
-                #tracer_capture_inputs
+                // Serialize inputs for tracing
+                #trace_input_serialization
 
                 // Execute original body via closure to handle early returns
                 let __raster_result = (|| #fn_body)();
 
-                // Emit trace after execution
-                #tracer_emit_trace
+                // Serialize output and emit trace
+                let __raster_output_bytes = ::raster::core::postcard::to_allocvec(&__raster_result)
+                    .unwrap_or_default();
+
+                ::raster::__emit_trace(
+                    #fn_name_str,
+                    #trace_desc_expr,
+                    &[#(#input_param_tuples),*],
+                    #trace_output_type_expr,
+                    &__raster_input_bytes,
+                    &__raster_output_bytes,
+                );
 
                 return __raster_result;
             }
@@ -346,9 +339,9 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     TokenStream::from(quote! {
         // Original function with tracing injected
-        #traced_function
+        #original_function
+
         // Generate the ABI wrapper function (available on all platforms, no_std compatible)
-        // The wrapper just calls the traced function - no need for separate tracing
         pub fn #function_wrapper_name(input: &[u8]) -> ::raster::core::Result<::alloc::vec::Vec<u8>> {
             #inputs_deserialization
 
@@ -640,7 +633,35 @@ pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let expanded = quote! {
         #(#fn_attrs)*
         fn main() {
-            ::raster::init();
+            // Parse --commit and --verify flags from CLI args
+            fn __parse_commit_audit() -> (Option<String>, Option<String>) {
+                let args: Vec<String> = std::env::args().collect();
+                let commit = args.iter().position(|a| a == "--commit")
+                    .and_then(|i| args.get(i + 1).cloned());
+                let audit = args.iter().position(|a| a == "--audit")
+                    .and_then(|i| args.get(i + 1).cloned());
+                (commit, audit)
+            }
+
+            let (commit_path, audit_path) = __parse_commit_audit();
+            let bits = 16;
+
+            // Initialize subscriber based on flags
+            if let Some(path) = commit_path {
+                let file = std::fs::File::create(&path)
+                    .expect(&format!("Failed to create commit file: {}", path));
+                let exec_commit_subscriber = ::raster::CommitSubscriber::new(bits, file);
+                ::raster::init_with(exec_commit_subscriber);
+            } else if let Some(path) = audit_path {
+                let exec_audit_subscriber = ::raster::AuditSubscriber::new(
+                    bits,
+                    std::path::PathBuf::from(path),
+                );
+                ::raster::init_with(exec_audit_subscriber);
+            } else {
+                // Default: use JsonSubscriber for stdout output
+                ::raster::init();
+            }
 
             if ::raster::try_execute_tile_from_args() {
                 return;
@@ -649,6 +670,8 @@ pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
             #input_parsing
 
             #fn_block
+
+            ::raster::finish();
         }
     };
 
