@@ -634,16 +634,16 @@ pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
         #(#fn_attrs)*
         fn main() {
             // Parse --commit and --verify flags from CLI args
-            fn __parse_commit_verify() -> (Option<String>, Option<String>) {
+            fn __parse_commit_audit() -> (Option<String>, Option<String>) {
                 let args: Vec<String> = std::env::args().collect();
                 let commit = args.iter().position(|a| a == "--commit")
                     .and_then(|i| args.get(i + 1).cloned());
-                let verify = args.iter().position(|a| a == "--verify")
+                let audit = args.iter().position(|a| a == "--audit")
                     .and_then(|i| args.get(i + 1).cloned());
-                (commit, verify)
+                (commit, audit)
             }
 
-            let (commit_path, verify_path) = __parse_commit_verify();
+            let (commit_path, audit_path) = __parse_commit_audit();
             let bits = 16;
 
             // Initialize subscriber based on flags
@@ -652,12 +652,12 @@ pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
                     .expect(&format!("Failed to create commit file: {}", path));
                 let exec_commit_subscriber = ::raster::CommitSubscriber::new(bits, file);
                 ::raster::init_with(exec_commit_subscriber);
-            } else if let Some(path) = verify_path {
-                let exec_verify_subscriber = ::raster::VerifySubscriber::new(
+            } else if let Some(path) = audit_path {
+                let exec_audit_subscriber = ::raster::AuditSubscriber::new(
                     bits,
                     std::path::PathBuf::from(path),
                 );
-                ::raster::init_with(exec_verify_subscriber);
+                ::raster::init_with(exec_audit_subscriber);
             } else {
                 // Default: use JsonSubscriber for stdout output
                 ::raster::init();

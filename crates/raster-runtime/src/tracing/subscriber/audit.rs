@@ -4,7 +4,7 @@ use std::sync::Mutex;
 
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
-use raster_core::trace::{TraceItem, TraceInputParam};
+use raster_core::trace::{TraceInputParam, TraceItem};
 use raster_prover::bit_packer::BitPacker;
 use raster_prover::precomputed::EMPTY_TRIE_NODES;
 use raster_prover::trace::TraceCommitmentProducer;
@@ -14,13 +14,14 @@ use crate::tracing::subscriber::Subscriber;
 ///
 /// On `on_complete()`, reads the expected packed u64s from the file and compares
 /// with the computed commitments, panicking on mismatch.
-pub struct VerifySubscriber {
+pub struct AuditSubscriber {
     expected_path: PathBuf,
     producer: Mutex<Option<TraceCommitmentProducer>>,
+    trace: Mutex<Vec<TraceItem>>,
     bit_packer: Mutex<BitPacker>,
 }
 
-impl VerifySubscriber {
+impl AuditSubscriber {
     /// Creates a new trace verification subscriber.
     ///
     /// # Arguments
@@ -31,11 +32,12 @@ impl VerifySubscriber {
             expected_path,
             producer: Mutex::new(Some(TraceCommitmentProducer::new(&EMPTY_TRIE_NODES[0]))),
             bit_packer: Mutex::new(BitPacker::new(bits)),
+            trace: Mutex::new(Vec::new()),
         }
     }
 }
 
-impl Subscriber for VerifySubscriber {
+impl Subscriber for AuditSubscriber {
     fn on_trace(
         &self,
         function_name: &str,
@@ -63,6 +65,10 @@ impl Subscriber for VerifySubscriber {
         if let Ok(mut producer) = self.producer.lock() {
             if let Some(producer) = producer.as_mut() {
                 producer.try_append(&item).unwrap();
+
+                if let Ok(mut trace) = self.trace.lock() {
+                    trace.push(item);
+                }
             }
         }
     }
@@ -112,20 +118,26 @@ impl Subscriber for VerifySubscriber {
                     );
                 }
 
-                for (i, (computed, expected)) in computed_packed
-                    .iter()
-                    .zip(expected_packed.iter())
-                    .enumerate()
-                {
-                    if computed != expected {
-                        panic!(
-                            "Trace commitment verification failed at index {}.\n\
-                             Expected: 0x{:016x}\n\
-                             Computed: 0x{:016x}",
-                            i, expected, computed
-                        );
-                    }
-                }
+                let diff = if let Ok(bit_packer) = self.bit_packer.lock() {
+                    bit_packer.diff(&computed_packed, &expected_packed)
+                } else {
+                    panic!("Failed to lock bit_packer");
+                };
+
+                if let Some((diff_index, computed, expected)) = diff {
+                    let diff_trace_item = if let Ok(trace) = self.trace.lock() {
+                        trace[diff_index].clone()
+                    } else {
+                        panic!("Failed to lock trace");
+                    };
+                    panic!(
+                        "Trace commitment verification failed at index {}.\n\
+                         Diff item: {:#?}\n\
+                         Expected: 0x{:016x}\n\
+                         Computed: 0x{:016x}",
+                        diff_index, diff_trace_item, expected, computed
+                    );
+                };
 
                 eprintln!(
                     "Trace commitment verification passed ({} values verified).",

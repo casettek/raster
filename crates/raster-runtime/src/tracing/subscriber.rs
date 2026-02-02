@@ -29,5 +29,5 @@ pub trait Subscriber: Send + Sync {
 pub(crate) static GLOBAL_SUBSCRIBER: OnceLock<Box<dyn Subscriber>> = OnceLock::new();
 
 pub mod json;
-pub mod verify;
+pub mod audit;
 pub mod commit;

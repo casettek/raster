@@ -10,7 +10,7 @@ pub fn run(
     backend_type: BackendType,
     input: Option<&str>,
     commit: Option<&str>,
-    verify: Option<&str>,
+    audit: Option<&str>,
 ) -> Result<()> {
     // Only native backend is supported for whole-program execution
     if backend_type != BackendType::Native {
@@ -67,8 +67,8 @@ pub fn run(
 
     if let Some(commit_path) = commit {
         cmd.args(["--commit", commit_path]);
-    } else if let Some(verify_path) = verify {
-        cmd.args(["--verify", verify_path]);
+    } else if let Some(audit_path) = audit {
+        cmd.args(["--audit", audit_path]);
     }
 
     // Execute the binary and capture output

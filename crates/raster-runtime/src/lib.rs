@@ -10,6 +10,6 @@ pub use tracing::{
     finish, init, init_with,
     __emit_trace,
     subscriber::{
-        commit::CommitSubscriber, json::JsonSubscriber, verify::VerifySubscriber, Subscriber,
+        commit::CommitSubscriber, json::JsonSubscriber, audit::AuditSubscriber, Subscriber,
     },
 };

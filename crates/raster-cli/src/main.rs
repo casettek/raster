@@ -123,13 +123,13 @@ enum Commands {
         #[arg(long)]
         input: Option<String>,
 
-        /// Write trace to file (mutually exclusive with --verify)
-        #[arg(long, conflicts_with = "verify")]
+        /// Write trace to file (mutually exclusive with --audit)
+        #[arg(long, conflicts_with = "audit")]
         commit: Option<String>,
 
         /// Read and verify trace from file (mutually exclusive with --commit)
         #[arg(long, conflicts_with = "commit")]
-        verify: Option<String>,
+        audit: Option<String>,
     },
 }
 
@@ -168,8 +168,8 @@ fn main() -> Result<()> {
             verify,
         } => commands::run_sequence(backend, &sequence, input.as_deref(), prove, verify),
         Commands::Cfs { output } => commands::cfs(output),
-        Commands::Run { backend, input, commit, verify } => {
-            commands::run::run(backend, input.as_deref(), commit.as_deref(), verify.as_deref())
+        Commands::Run { backend, input, commit, audit } => {
+            commands::run::run(backend, input.as_deref(), commit.as_deref(), audit.as_deref())
         }
     }
 }
