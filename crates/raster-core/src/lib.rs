@@ -25,6 +25,8 @@ pub mod manifest;
 pub mod schema;
 #[cfg(feature = "std")]
 pub mod trace;
+#[cfg(feature = "std")]
+pub mod ipc;
 
 // The registry module uses linkme which doesn't support RISC-V targets
 #[cfg(all(feature = "std", not(target_arch = "riscv32")))]

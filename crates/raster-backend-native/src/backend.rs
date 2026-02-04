@@ -10,6 +10,7 @@ use raster_backend::{
     ArtifactStore, Backend, CompilationArtifact, ExecutionMode, ResourceEstimate,
     TileExecutionResult,
 };
+use raster_core::ipc;
 use raster_core::{tile::TileMetadata, Error, Result};
 
 use serde::{Deserialize, Serialize};
@@ -323,31 +324,31 @@ impl Backend for NativeBackend {
         let stdout = String::from_utf8_lossy(&output.stdout);
 
         // Extract and pretty-print all RASTER_TRACE items
-        for line in stdout.clone().lines() {
-            if let Some(json_str) = line.strip_prefix("RASTER_TRACE:") {
-                match serde_json::from_str::<serde_json::Value>(json_str) {
+        let mut output_b64: Option<&str> = None;
+        for line in stdout.lines() {
+            if let Some(result) = ipc::parse_trace_value(line) {
+                match result {
                     Ok(trace_item) => {
                         if let Ok(pretty) = serde_json::to_string_pretty(&trace_item) {
                             println!("{}", pretty);
                         }
                     }
                     Err(e) => {
-                        eprintln!("Failed to parse RASTER_TRACE: {}", e);
+                        eprintln!("Failed to parse {}: {}", ipc::TRACE_PREFIX, e);
                     }
                 }
+            } else if let Some(data) = ipc::parse_output(line) {
+                output_b64 = Some(data);
             }
         }
 
-        let output_b64 = stdout
-            .lines()
-            .find(|l| l.starts_with("RASTER_OUTPUT:"))
-            .map(|l| l.trim_start_matches("RASTER_OUTPUT:"))
-            .ok_or_else(|| {
-                Error::Other(format!(
-                    "No RASTER_OUTPUT found in tile output. stdout: {}",
-                    stdout
-                ))
-            })?;
+        let output_b64 = output_b64.ok_or_else(|| {
+            Error::Other(format!(
+                "No {} found in tile output. stdout: {}",
+                ipc::OUTPUT_PREFIX,
+                stdout
+            ))
+        })?;
 
         let output_bytes = base64_decode(output_b64)
             .map_err(|e| Error::Other(format!("Failed to decode output: {}", e)))?;

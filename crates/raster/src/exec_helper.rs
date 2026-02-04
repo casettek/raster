@@ -4,6 +4,7 @@
 //! main() to handle tile execution requests from the raster CLI's native backend,
 //! and to parse input arguments.
 
+use crate::core::ipc;
 use crate::core::registry::find_tile_by_str;
 use serde::de::DeserializeOwned;
 
@@ -114,7 +115,7 @@ pub fn try_execute_tile_from_args() -> bool {
 
     // Encode output as base64 and print with marker
     let output_b64 = base64::engine::general_purpose::STANDARD.encode(&output);
-    std::println!("RASTER_OUTPUT:{}", output_b64);
+    ipc::emit_output(&output_b64);
 
     true
 }

@@ -1,6 +1,7 @@
 //! Run command: build and execute the user program as a whole.
 
 use crate::BackendType;
+use raster_core::ipc::{self, IpcMessage};
 use raster_core::trace::AuditResult;
 use raster_core::{Error, Result};
 use std::path::PathBuf;
@@ -93,16 +94,19 @@ pub fn run(
     let mut program_output: Vec<&str> = Vec::new();
 
     for line in stdout.lines() {
-        if let Some(json_str) = line.strip_prefix("RASTER_TRACE:") {
-            if let Ok(trace_item) = serde_json::from_str::<serde_json::Value>(json_str) {
-                trace_items.push(trace_item);
+        match ipc::parse_line(line) {
+            IpcMessage::Trace(item) => {
+                // Convert to Value for display
+                if let Ok(value) = serde_json::to_value(&item) {
+                    trace_items.push(value);
+                }
             }
-        } else if let Some(json_str) = line.strip_prefix("RASTER_AUDIT:") {
-            if let Ok(result) = serde_json::from_str::<AuditResult>(json_str) {
+            IpcMessage::Audit(result) => {
                 audit_result = Some(result);
             }
-        } else {
-            program_output.push(line);
+            IpcMessage::Output(_) | IpcMessage::Unknown(_) => {
+                program_output.push(line);
+            }
         }
     }
 

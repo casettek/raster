@@ -4,6 +4,7 @@ use std::sync::Mutex;
 
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
+use raster_core::ipc;
 use raster_core::trace::{AuditDiff, AuditResult, TraceInputParam, TraceItem};
 use raster_prover::bit_packer::BitPacker;
 use raster_prover::precomputed::EMPTY_TRIE_NODES;
@@ -157,10 +158,7 @@ impl Subscriber for AuditSubscriber {
                         }),
                         trace_window,
                     };
-                    println!(
-                        "RASTER_AUDIT:{}",
-                        serde_json::to_string(&result).unwrap()
-                    );
+                    ipc::emit_audit(&result);
                     return;
                 }
 
@@ -207,10 +205,7 @@ impl Subscriber for AuditSubscriber {
                         }),
                         trace_window,
                     };
-                    println!(
-                        "RASTER_AUDIT:{}",
-                        serde_json::to_string(&result).unwrap()
-                    );
+                    ipc::emit_audit(&result);
                 } else {
                     // Verification passed
                     let result = AuditResult {
@@ -219,10 +214,7 @@ impl Subscriber for AuditSubscriber {
                         diff: None,
                         trace_window: Vec::new(),
                     };
-                    println!(
-                        "RASTER_AUDIT:{}",
-                        serde_json::to_string(&result).unwrap()
-                    );
+                    ipc::emit_audit(&result);
                 }
             }
         }
