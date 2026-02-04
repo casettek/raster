@@ -4,12 +4,17 @@ use std::sync::Mutex;
 
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
-use raster_core::trace::{TraceInputParam, TraceItem};
+use raster_core::trace::{AuditDiff, AuditResult, TraceInputParam, TraceItem};
 use raster_prover::bit_packer::BitPacker;
 use raster_prover::precomputed::EMPTY_TRIE_NODES;
-use raster_prover::trace::TraceCommitmentProducer;
+use raster_prover::trace::{SerializableFrontier, TraceCommitmentProducer};
 
 use crate::tracing::subscriber::Subscriber;
+
+/// Number of trace items to include in the trace window when a diff is detected.
+/// This provides context around where execution diverged.
+const AUDIT_WINDOW_SIZE: usize = 10;
+
 /// A subscriber that computes trace commitments and verifies them against an expected file.
 ///
 /// On `on_complete()`, reads the expected packed u64s from the file and compares
@@ -18,6 +23,9 @@ pub struct AuditSubscriber {
     expected_path: PathBuf,
     producer: Mutex<Option<TraceCommitmentProducer>>,
     trace: Mutex<Vec<TraceItem>>,
+    /// Frontiers captured before each trace item is appended.
+    /// frontiers[i] is the frontier state before trace item i was added.
+    frontiers: Mutex<Vec<SerializableFrontier>>,
     bit_packer: Mutex<BitPacker>,
 }
 
@@ -33,6 +41,7 @@ impl AuditSubscriber {
             producer: Mutex::new(Some(TraceCommitmentProducer::new(&EMPTY_TRIE_NODES[0]))),
             bit_packer: Mutex::new(BitPacker::new(bits)),
             trace: Mutex::new(Vec::new()),
+            frontiers: Mutex::new(Vec::new()),
         }
     }
 }
@@ -64,6 +73,11 @@ impl Subscriber for AuditSubscriber {
 
         if let Ok(mut producer) = self.producer.lock() {
             if let Some(producer) = producer.as_mut() {
+                // Capture the frontier before appending this item
+                if let Ok(mut frontiers) = self.frontiers.lock() {
+                    frontiers.push(SerializableFrontier::from_frontier(&producer.frontier()));
+                }
+
                 producer.try_append(&item).unwrap();
 
                 if let Ok(mut trace) = self.trace.lock() {
@@ -110,12 +124,44 @@ impl Subscriber for AuditSubscriber {
 
                 // Compare computed vs expected
                 if computed_packed.len() != expected_packed.len() {
-                    panic!(
-                        "Trace commitment verification failed: length mismatch.\n\
-                         Expected {} u64 values, got {}.",
-                        expected_packed.len(),
-                        computed_packed.len()
+                    // Length mismatch - emit audit result with failure
+                    let (trace_window, frontier_bytes) = if let Ok(trace) = self.trace.lock() {
+                        let len = trace.len();
+                        let window_start = len.saturating_sub(AUDIT_WINDOW_SIZE);
+                        let window = trace[window_start..].to_vec();
+
+                        // Get the frontier at window start position
+                        let frontier = if let Ok(frontiers) = self.frontiers.lock() {
+                            if window_start < frontiers.len() {
+                                frontiers[window_start].to_bytes()
+                            } else if !frontiers.is_empty() {
+                                frontiers.last().unwrap().to_bytes()
+                            } else {
+                                Vec::new()
+                            }
+                        } else {
+                            Vec::new()
+                        };
+
+                        (window, frontier)
+                    } else {
+                        (Vec::new(), Vec::new())
+                    };
+
+                    let result = AuditResult {
+                        success: false,
+                        verified_count: 0,
+                        diff: Some(AuditDiff {
+                            index: 0,
+                            frontier: frontier_bytes,
+                        }),
+                        trace_window,
+                    };
+                    println!(
+                        "RASTER_AUDIT:{}",
+                        serde_json::to_string(&result).unwrap()
                     );
+                    return;
                 }
 
                 let diff = if let Ok(bit_packer) = self.bit_packer.lock() {
@@ -124,25 +170,60 @@ impl Subscriber for AuditSubscriber {
                     panic!("Failed to lock bit_packer");
                 };
 
-                if let Some((diff_index, computed, expected)) = diff {
-                    let diff_trace_item = if let Ok(trace) = self.trace.lock() {
-                        trace[diff_index].clone()
-                    } else {
-                        panic!("Failed to lock trace");
-                    };
-                    panic!(
-                        "Trace commitment verification failed at index {}.\n\
-                         Diff item: {:#?}\n\
-                         Expected: 0x{:016x}\n\
-                         Computed: 0x{:016x}",
-                        diff_index, diff_trace_item, expected, computed
-                    );
-                };
+                let verified_count = computed_packed.len();
 
-                eprintln!(
-                    "Trace commitment verification passed ({} values verified).",
-                    computed_packed.len()
-                );
+                if let Some((diff_index, _computed, _expected)) = diff {
+                    // Extract trace window: last N items up to and including the diff point
+                    let window_start = diff_index.saturating_sub(AUDIT_WINDOW_SIZE - 1);
+
+                    let (trace_window, frontier_bytes) = if let Ok(trace) = self.trace.lock() {
+                        let end = (diff_index + 1).min(trace.len());
+                        let window = trace[window_start..end].to_vec();
+
+                        // Get the frontier at window start position (before the first window item)
+                        let frontier = if let Ok(frontiers) = self.frontiers.lock() {
+                            if window_start < frontiers.len() {
+                                frontiers[window_start].to_bytes()
+                            } else if !frontiers.is_empty() {
+                                frontiers.last().unwrap().to_bytes()
+                            } else {
+                                Vec::new()
+                            }
+                        } else {
+                            Vec::new()
+                        };
+
+                        (window, frontier)
+                    } else {
+                        (Vec::new(), Vec::new())
+                    };
+
+                    let result = AuditResult {
+                        success: false,
+                        verified_count,
+                        diff: Some(AuditDiff {
+                            index: diff_index,
+                            frontier: frontier_bytes,
+                        }),
+                        trace_window,
+                    };
+                    println!(
+                        "RASTER_AUDIT:{}",
+                        serde_json::to_string(&result).unwrap()
+                    );
+                } else {
+                    // Verification passed
+                    let result = AuditResult {
+                        success: true,
+                        verified_count,
+                        diff: None,
+                        trace_window: Vec::new(),
+                    };
+                    println!(
+                        "RASTER_AUDIT:{}",
+                        serde_json::to_string(&result).unwrap()
+                    );
+                }
             }
         }
     }

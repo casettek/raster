@@ -4,6 +4,7 @@
 //! commitments to execution traces using incremental Merkle trees.
 
 use bridgetree::{Hashable, Level, NonEmptyFrontier};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::fmt::Debug;
@@ -41,8 +42,55 @@ impl BytesHashable for TraceItem {
 }
 
 /// Wrapper for byte vectors that implements Hashable for bridgetree.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Bytes(pub Vec<u8>);
+
+/// A serializable representation of a NonEmptyFrontier<Bytes>.
+///
+/// This can be used to persist and restore frontier state for replay.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SerializableFrontier {
+    /// The position in the tree (as u64)
+    pub position: u64,
+    /// The current leaf value
+    pub leaf: Vec<u8>,
+    /// The ommer hashes (path to root)
+    pub ommers: Vec<Vec<u8>>,
+}
+
+impl SerializableFrontier {
+    /// Convert a NonEmptyFrontier<Bytes> into a serializable form.
+    pub fn from_frontier(frontier: &NonEmptyFrontier<Bytes>) -> Self {
+        Self {
+            position: frontier.position().into(),
+            leaf: frontier.leaf().0.clone(),
+            ommers: frontier.ommers().iter().map(|o| o.0.clone()).collect(),
+        }
+    }
+
+    /// Reconstruct a NonEmptyFrontier<Bytes> from the serialized form.
+    ///
+    /// Returns None if the frontier cannot be reconstructed (e.g., invalid position).
+    pub fn to_frontier(&self) -> Option<NonEmptyFrontier<Bytes>> {
+        use bridgetree::Position;
+        NonEmptyFrontier::from_parts(
+            Position::from(self.position),
+            Bytes(self.leaf.clone()),
+            self.ommers.iter().map(|o| Bytes(o.clone())).collect(),
+        )
+        .ok()
+    }
+
+    /// Serialize to bytes using bincode.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        bincode::serialize(self).unwrap_or_default()
+    }
+
+    /// Deserialize from bytes using bincode.
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        bincode::deserialize(bytes).ok()
+    }
+}
 
 impl PartialEq for Bytes {
     fn eq(&self, other: &Self) -> bool {
@@ -259,6 +307,15 @@ impl TraceCommitmentProducer {
 
         Ok(())
     }
+
+    /// Get a clone of the current frontier state.
+    ///
+    /// This can be used to snapshot the frontier before appending items,
+    /// allowing replay from this point.
+    pub fn frontier(&self) -> NonEmptyFrontier<Bytes> {
+        self.frontier.clone()
+    }
+
     pub fn finish(self) -> Vec<Vec<u8>> {
         self.trace_items_commitments
     }

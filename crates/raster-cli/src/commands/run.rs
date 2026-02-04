@@ -1,6 +1,7 @@
 //! Run command: build and execute the user program as a whole.
 
 use crate::BackendType;
+use raster_core::trace::AuditResult;
 use raster_core::{Error, Result};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -86,14 +87,19 @@ pub fn run(
 
     let stdout = String::from_utf8_lossy(&output.stdout);
 
-    // Separate trace items from regular program output
+    // Separate trace items, audit results, and regular program output
     let mut trace_items: Vec<serde_json::Value> = Vec::new();
+    let mut audit_result: Option<AuditResult> = None;
     let mut program_output: Vec<&str> = Vec::new();
 
     for line in stdout.lines() {
         if let Some(json_str) = line.strip_prefix("RASTER_TRACE:") {
             if let Ok(trace_item) = serde_json::from_str::<serde_json::Value>(json_str) {
                 trace_items.push(trace_item);
+            }
+        } else if let Some(json_str) = line.strip_prefix("RASTER_AUDIT:") {
+            if let Ok(result) = serde_json::from_str::<AuditResult>(json_str) {
+                audit_result = Some(result);
             }
         } else {
             program_output.push(line);
@@ -120,6 +126,61 @@ pub fn run(
                 }
                 println!();
             }
+        }
+    }
+
+    // Handle audit result if present
+    if let Some(result) = audit_result {
+        if result.success {
+            println!(
+                "Audit verification passed ({} values verified).",
+                result.verified_count
+            );
+        } else {
+            println!("Audit verification FAILED!");
+            if let Some(ref diff) = result.diff {
+                println!("  Divergence detected at trace index: {}", diff.index);
+                if !diff.frontier.is_empty() {
+                    // Display frontier as hex for debugging/replay purposes
+                    let frontier_hex: String = diff.frontier.iter()
+                        .map(|b| format!("{:02x}", b))
+                        .collect();
+                    println!("  Frontier (hex): {}", frontier_hex);
+                }
+            }
+            println!(
+                "  Values verified before failure: {}",
+                result.verified_count
+            );
+
+            // Display trace window for debugging context
+            if !result.trace_window.is_empty() {
+                println!();
+                println!(
+                    "Trace window ({} items leading up to divergence):",
+                    result.trace_window.len()
+                );
+                for (i, item) in result.trace_window.iter().enumerate() {
+                    println!();
+                    println!("  [{}] {}", i, item.fn_name);
+                    if let Some(ref desc) = item.desc {
+                        println!("      Description: {}", desc);
+                    }
+                    if !item.inputs.is_empty() {
+                        println!("      Inputs:");
+                        for input in &item.inputs {
+                            println!("        - {}: {}", input.name, input.ty);
+                        }
+                    }
+                    if let Some(ref output_type) = item.output_type {
+                        println!("      Output type: {}", output_type);
+                    }
+                    println!("      Input data (base64): {}", item.input_data);
+                    println!("      Output data (base64): {}", item.output_data);
+                }
+            }
+
+            return Err(Error::Other("Audit verification failed".into()));
         }
     }
 
