@@ -12,6 +12,7 @@
 
 pub mod bit_packer;
 pub mod error;
+pub mod guest;
 pub mod precomputed;
 pub mod trace;
 pub mod utils;
