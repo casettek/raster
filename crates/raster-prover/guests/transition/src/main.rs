@@ -5,14 +5,17 @@
 //! 2. Hashing the trace item and appending it to the frontier
 //! 3. Returning the new frontier
 
-use risc0_zkvm::guest::env;
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+#![no_main]
+#![no_std]
+
+extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
 
-extern crate alloc;
+use risc0_zkvm::guest::env;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 risc0_zkvm::guest::entry!(main);
 

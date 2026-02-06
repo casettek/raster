@@ -3,6 +3,7 @@
 //! This module provides:
 //! - Shared types for guest input/output (TransitionInput, TransitionOutput)
 //! - Host-side utilities for preparing inputs and verifying outputs
+//! - The compiled transition guest ELF (when built)
 //!
 //! The types in this module are designed to be serialization-compatible with
 //! the types used in the RISC0 guest program.
@@ -12,6 +13,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::trace::SerializableFrontier;
+
+// Include the generated methods (ELF) from the build script.
+// This may not exist if the build failed or RISC0_SKIP_BUILD was set.
+#[cfg(not(feature = "skip-guest-build"))]
+include!(concat!(env!("OUT_DIR"), "/methods.rs"));
 
 /// Input to the transition guest program.
 ///

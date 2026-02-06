@@ -7,7 +7,10 @@ use raster_compiler::Project;
 use raster_core::ipc::{self, IpcMessage};
 use raster_core::trace::AuditResult;
 use raster_core::{Error, Result};
+use raster_prover::guest::{TransitionInput, TransitionOutput, TRANSITION_GUEST_ELF};
+use raster_prover::trace::SerializableFrontier;
 use raster_tracing::TraceReplayer;
+use risc0_zkvm::{default_prover, ExecutorEnv};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
@@ -223,6 +226,23 @@ pub fn run(
                         }
                     }
                 }
+
+                // Replay transition frontier with the transition guest
+                if let Some(ref diff) = result.diff {
+                    if let Some(frontier) = SerializableFrontier::from_bytes(&diff.frontier) {
+                        println!();
+                        println!("Replaying transition frontier with transition guest...");
+
+                        match replay_transitions(&frontier, &result.trace_window) {
+                            Ok(_) => {
+                                println!("All {} transitions proved successfully.", result.trace_window.len());
+                            }
+                            Err(e) => {
+                                println!("Transition replay failed: {}", e);
+                            }
+                        }
+                    }
+                }
             }
 
             return Err(Error::Other("Audit verification failed".into()));
@@ -280,4 +300,63 @@ fn extract_binary_name(project_path: &std::path::Path) -> Option<String> {
         }
     }
     None
+}
+
+/// Replay trace transitions using the transition guest to prove merkle tree state transitions.
+///
+/// For each trace item in the window:
+/// 1. Create a TransitionInput with the current frontier and trace item
+/// 2. Execute the transition guest in the RISC0 zkVM
+/// 3. Verify the output and update the frontier for the next iteration
+fn replay_transitions(
+    initial_frontier: &SerializableFrontier,
+    trace_window: &[raster_core::trace::TraceItem],
+) -> Result<()> {
+    // Load the transition guest ELF from raster-prover
+    let elf = TRANSITION_GUEST_ELF;
+
+    let mut current_frontier = initial_frontier.clone();
+    let prover = default_prover();
+
+    for (i, item) in trace_window.iter().enumerate() {
+        print!("  [{}] transition {} ... ", i, item.fn_name);
+
+        // Create the input for this transition
+        let input = TransitionInput::new(current_frontier.clone(), item.clone());
+
+        // Build the executor environment
+        let env = ExecutorEnv::builder()
+            .write(&input)
+            .map_err(|e| Error::Other(format!("Failed to write input: {}", e)))?
+            .build()
+            .map_err(|e| Error::Other(format!("Failed to build executor env: {}", e)))?;
+
+        // Prove the transition
+        let prove_info = prover
+            .prove(env, elf)
+            .map_err(|e| Error::Other(format!("Proving failed: {}", e)))?;
+
+        // Decode the output from the journal
+        let output: TransitionOutput = prove_info
+            .receipt
+            .journal
+            .decode()
+            .map_err(|e| Error::Other(format!("Failed to decode output: {}", e)))?;
+
+        // Verify the item hash matches
+        if !output.verify_item_hash(item) {
+            println!("FAILED: item hash mismatch");
+            return Err(Error::Other(format!(
+                "Transition {} failed: item hash mismatch",
+                i
+            )));
+        }
+
+        // Update the frontier for the next iteration
+        current_frontier = output.new_frontier;
+
+        println!("PROVED");
+    }
+
+    Ok(())
 }
