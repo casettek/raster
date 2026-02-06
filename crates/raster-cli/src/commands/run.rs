@@ -1,9 +1,13 @@
 //! Run command: build and execute the user program as a whole.
 
 use crate::BackendType;
+use raster_backend::ExecutionMode;
+use raster_backend_risc0::Risc0Backend;
+use raster_compiler::Project;
 use raster_core::ipc::{self, IpcMessage};
 use raster_core::trace::AuditResult;
 use raster_core::{Error, Result};
+use raster_tracing::TraceReplayer;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
@@ -181,6 +185,43 @@ pub fn run(
                     }
                     println!("      Input data (base64): {}", item.input_data);
                     println!("      Output data (base64): {}", item.output_data);
+                }
+
+                // Replay trace window with Risc0 backend for proof generation
+                println!();
+                println!("Replaying trace window with Risc0 backend...");
+
+                let project = Project::new(project_path.clone())?;
+                let output_dir = project_path.join("target").join("raster");
+                let backend = Risc0Backend::new(output_dir).with_user_crate(project_path.clone());
+                let replayer = TraceReplayer::new(&backend, &project);
+                let mode = ExecutionMode::prove_and_verify();
+
+                for (i, item) in result.trace_window.iter().enumerate() {
+                    print!("  [{}] {} ... ", i, item.fn_name);
+                    match replayer.replay(item, mode) {
+                        Ok(replay_result) => {
+                            if let Some(verified) = replay_result.execution_result.verified {
+                                if verified {
+                                    println!("PROVED (verified)");
+                                } else {
+                                    println!("PROVED (unverified)");
+                                }
+                            } else {
+                                println!("OK");
+                            }
+                            if let Some(output_matched) = replay_result.output_matched {
+                                if output_matched {
+                                    println!("      Output matches recorded trace");
+                                } else {
+                                    println!("      WARNING: Output differs from recorded trace!");
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            println!("FAILED: {}", e);
+                        }
+                    }
                 }
             }
 

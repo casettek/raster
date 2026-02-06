@@ -26,6 +26,7 @@ raster-backend-risc0.workspace = true
 raster-compiler.workspace = true
 raster-runtime.workspace = true
 raster-analysis.workspace = true
+raster-tracing.workspace = true
 clap.workspace = true
 serde_json.workspace = true
 postcard.workspace = true

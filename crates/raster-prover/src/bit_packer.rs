@@ -430,6 +430,137 @@ impl<'a, 'b> Iterator for Iter<'a, 'b> {
     }
 }
 
+/// Iterative bit packer that writes directly into a Vec<u64>.
+///
+/// Unlike `BitPacker` which requires all items upfront, `IterativeBitPacker`
+/// allows adding items one at a time to an existing Vec, tracking the position
+/// automatically.
+///
+/// # Example
+///
+/// ```
+/// use bphc::bit_packer::IterativeBitPacker;
+///
+/// let mut packed = Vec::new();
+/// {
+///     let mut packer = IterativeBitPacker::new(8, &mut packed);
+///     packer.push(&[1u8]);
+///     packer.push(&[2u8]);
+///     packer.push(&[3u8]);
+/// }
+/// // packed now contains the bit-packed data
+/// ```
+pub struct IterativeBitPacker<'a> {
+    bits_per_item: usize,
+    packed: &'a mut Vec<u64>,
+    bit_offset: usize, // Current global bit position
+}
+
+impl<'a> IterativeBitPacker<'a> {
+    /// Create a new IterativeBitPacker starting at position 0.
+    ///
+    /// # Arguments
+    ///
+    /// * `bits_per_item` - Number of bits to use per item (must be between 1 and 64)
+    /// * `packed` - Mutable reference to the Vec<u64> to write into
+    ///
+    /// # Panics
+    ///
+    /// Panics if `bits_per_item` is 0 or greater than 64.
+    pub fn new(bits_per_item: usize, packed: &'a mut Vec<u64>) -> Self {
+        assert!(
+            bits_per_item > 0 && bits_per_item <= 64,
+            "bits_per_item must be between 1 and 64"
+        );
+        Self {
+            bits_per_item,
+            packed,
+            bit_offset: 0,
+        }
+    }
+
+    /// Create a new IterativeBitPacker starting at a given item offset.
+    ///
+    /// This is useful for appending to existing packed data.
+    ///
+    /// # Arguments
+    ///
+    /// * `bits_per_item` - Number of bits to use per item (must be between 1 and 64)
+    /// * `packed` - Mutable reference to the Vec<u64> to write into
+    /// * `item_offset` - The item index to start writing from
+    ///
+    /// # Panics
+    ///
+    /// Panics if `bits_per_item` is 0 or greater than 64.
+    pub fn with_offset(bits_per_item: usize, packed: &'a mut Vec<u64>, item_offset: usize) -> Self {
+        assert!(
+            bits_per_item > 0 && bits_per_item <= 64,
+            "bits_per_item must be between 1 and 64"
+        );
+        Self {
+            bits_per_item,
+            packed,
+            bit_offset: item_offset * bits_per_item,
+        }
+    }
+
+    /// Push an item into the packer.
+    ///
+    /// The item is cropped to `bits_per_item` bits and packed into the current
+    /// position. The Vec is automatically grown if needed.
+    ///
+    /// # Arguments
+    ///
+    /// * `item` - The bytes to pack (will be cropped to `bits_per_item` bits)
+    pub fn push(&mut self, item: &[u8]) {
+        // Crop the item to the specified number of bits
+        let cropped = item.to_vec().crop(self.bits_per_item);
+
+        // Convert cropped bytes to u64 (little-endian)
+        let mut item_bytes = [0u8; 8];
+        let bytes_len = cropped.len().min(8);
+        item_bytes[..bytes_len].copy_from_slice(&cropped[..bytes_len]);
+        let item_u64 = u64::from_le_bytes(item_bytes);
+
+        // Calculate which block(s) the item spans
+        let block_idx = self.bit_offset / 64;
+        let block_offset = self.bit_offset % 64;
+
+        // Ensure we have enough blocks (auto-grow)
+        // We need at least block_idx + 1 blocks, and possibly block_idx + 2 if there's overflow
+        let overflow = (block_offset + self.bits_per_item).saturating_sub(64);
+        let required_blocks = if overflow != 0 {
+            block_idx + 2
+        } else {
+            block_idx + 1
+        };
+
+        if self.packed.len() < required_blocks {
+            self.packed.resize(required_blocks, 0u64);
+        }
+
+        // Pack the bits (same logic as BitPacker::pack)
+        self.packed[block_idx] |= item_u64 << block_offset;
+
+        if overflow != 0 {
+            self.packed[block_idx + 1] |= item_u64 >> (self.bits_per_item - overflow);
+        }
+
+        // Advance bit offset
+        self.bit_offset += self.bits_per_item;
+    }
+
+    /// Get the current number of items that have been packed.
+    pub fn item_count(&self) -> usize {
+        self.bit_offset / self.bits_per_item
+    }
+
+    /// Get the number of bits per item.
+    pub fn bits_per_item(&self) -> usize {
+        self.bits_per_item
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1018,5 +1149,224 @@ mod tests {
     #[should_panic(expected = "bits_per_item must be between 1 and 64")]
     fn streaming_panics_on_too_many_bits() {
         let _ = StreamingBitPacker::new(65, |_| {});
+    }
+
+    // IterativeBitPacker tests
+
+    #[test]
+    fn iterative_matches_bitpacker_pack_8bit() {
+        // Test that iterative produces the same result as batch packing
+        let fingerprints: Vec<Vec<u8>> = (0..12u8).map(|n| [n; 32].to_vec()).collect();
+
+        let bp = BitPacker(8);
+        let expected_packed = bp.pack(&fingerprints);
+
+        let mut packed = Vec::new();
+        {
+            let mut packer = IterativeBitPacker::new(8, &mut packed);
+            for fp in &fingerprints {
+                packer.push(fp);
+            }
+        }
+
+        assert_eq!(packed, expected_packed);
+    }
+
+    #[test]
+    fn iterative_matches_bitpacker_pack_9bit() {
+        // Test with 9-bit items that span across block boundaries
+        let fingerprints: Vec<Vec<u8>> = vec![
+            [0b00000000u8; 32].to_vec(),
+            [0b11111111u8; 32].to_vec(),
+            [0b00000000u8; 32].to_vec(),
+            [0b11111111u8; 32].to_vec(),
+            [0b00000000u8; 32].to_vec(),
+            [0b11111111u8; 32].to_vec(),
+            [0b00000000u8; 32].to_vec(),
+            [0b11111111u8; 32].to_vec(),
+            [0b00000000u8; 32].to_vec(),
+            [0b11111111u8; 32].to_vec(),
+            [0b00000000u8; 32].to_vec(),
+            [0b11111111u8; 32].to_vec(),
+        ];
+
+        let bp = BitPacker(9);
+        let expected_packed = bp.pack(&fingerprints);
+
+        let mut packed = Vec::new();
+        {
+            let mut packer = IterativeBitPacker::new(9, &mut packed);
+            for fp in &fingerprints {
+                packer.push(fp);
+            }
+        }
+
+        assert_eq!(packed, expected_packed);
+    }
+
+    #[test]
+    fn iterative_matches_bitpacker_various_sizes() {
+        // Test various bit sizes
+        for bits_per_item in [1, 2, 4, 7, 8, 9, 15, 16, 17, 32, 63, 64] {
+            let fingerprints: Vec<Vec<u8>> = (0..20u8).map(|n| [n; 32].to_vec()).collect();
+
+            let bp = BitPacker(bits_per_item);
+            let expected_packed = bp.pack(&fingerprints);
+
+            let mut packed = Vec::new();
+            {
+                let mut packer = IterativeBitPacker::new(bits_per_item, &mut packed);
+                for fp in &fingerprints {
+                    packer.push(fp);
+                }
+            }
+
+            assert_eq!(
+                packed, expected_packed,
+                "Mismatch for bits_per_item={}",
+                bits_per_item
+            );
+        }
+    }
+
+    #[test]
+    fn iterative_append_with_offset() {
+        // Test appending to existing packed data using with_offset
+        let fingerprints_first: Vec<Vec<u8>> = (0..8u8).map(|n| [n; 32].to_vec()).collect();
+        let fingerprints_second: Vec<Vec<u8>> = (8..16u8).map(|n| [n; 32].to_vec()).collect();
+        let fingerprints_all: Vec<Vec<u8>> = (0..16u8).map(|n| [n; 32].to_vec()).collect();
+
+        let bp = BitPacker(8);
+        let expected_packed = bp.pack(&fingerprints_all);
+
+        // First, pack the first batch
+        let mut packed = Vec::new();
+        {
+            let mut packer = IterativeBitPacker::new(8, &mut packed);
+            for fp in &fingerprints_first {
+                packer.push(fp);
+            }
+        }
+
+        // Then, append the second batch using with_offset
+        {
+            let mut packer = IterativeBitPacker::with_offset(8, &mut packed, 8);
+            for fp in &fingerprints_second {
+                packer.push(fp);
+            }
+        }
+
+        assert_eq!(packed, expected_packed);
+    }
+
+    #[test]
+    fn iterative_append_with_offset_9bit() {
+        // Test appending with 9-bit items (spans block boundaries)
+        let fingerprints_first: Vec<Vec<u8>> = (0..7u8).map(|n| [n; 32].to_vec()).collect();
+        let fingerprints_second: Vec<Vec<u8>> = (7..14u8).map(|n| [n; 32].to_vec()).collect();
+        let fingerprints_all: Vec<Vec<u8>> = (0..14u8).map(|n| [n; 32].to_vec()).collect();
+
+        let bp = BitPacker(9);
+        let expected_packed = bp.pack(&fingerprints_all);
+
+        // First, pack the first batch
+        let mut packed = Vec::new();
+        {
+            let mut packer = IterativeBitPacker::new(9, &mut packed);
+            for fp in &fingerprints_first {
+                packer.push(fp);
+            }
+        }
+
+        // Then, append the second batch using with_offset
+        {
+            let mut packer = IterativeBitPacker::with_offset(9, &mut packed, 7);
+            for fp in &fingerprints_second {
+                packer.push(fp);
+            }
+        }
+
+        assert_eq!(packed, expected_packed);
+    }
+
+    #[test]
+    fn iterative_auto_grow_vec() {
+        // Test that Vec grows automatically
+        let mut packed = Vec::new();
+        assert_eq!(packed.len(), 0);
+
+        // Push 8 items = 64 bits = 1 block
+        {
+            let mut packer = IterativeBitPacker::new(8, &mut packed);
+            for i in 0..8u8 {
+                packer.push(&[i]);
+            }
+        }
+        assert_eq!(packed.len(), 1);
+
+        // Push 8 more items = 64 more bits = 2 blocks total
+        {
+            let mut packer = IterativeBitPacker::with_offset(8, &mut packed, 8);
+            for i in 8..16u8 {
+                packer.push(&[i]);
+            }
+        }
+        assert_eq!(packed.len(), 2);
+    }
+
+    #[test]
+    fn iterative_item_count() {
+        let mut packed = Vec::new();
+        {
+            let mut packer = IterativeBitPacker::new(8, &mut packed);
+            assert_eq!(packer.item_count(), 0);
+
+            packer.push(&[1]);
+            assert_eq!(packer.item_count(), 1);
+
+            packer.push(&[2]);
+            assert_eq!(packer.item_count(), 2);
+
+            for _ in 0..10 {
+                packer.push(&[0]);
+            }
+            assert_eq!(packer.item_count(), 12);
+        }
+    }
+
+    #[test]
+    fn iterative_bits_per_item_accessor() {
+        let mut packed = Vec::new();
+        let packer = IterativeBitPacker::new(9, &mut packed);
+        assert_eq!(packer.bits_per_item(), 9);
+
+        let mut packed2 = Vec::new();
+        let packer2 = IterativeBitPacker::new(16, &mut packed2);
+        assert_eq!(packer2.bits_per_item(), 16);
+    }
+
+    #[test]
+    fn iterative_empty_vec() {
+        // Test with no items pushed
+        let mut packed = Vec::new();
+        {
+            let packer = IterativeBitPacker::new(8, &mut packed);
+            assert_eq!(packer.item_count(), 0);
+        }
+        assert_eq!(packed.len(), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "bits_per_item must be between 1 and 64")]
+    fn iterative_panics_on_zero_bits() {
+        let mut packed = Vec::new();
+        let _ = IterativeBitPacker::new(0, &mut packed);
+    }
+
+    #[test]
+    #[should_panic(expected = "bits_per_item must be between 1 and 64")]
+    fn iterative_panics_on_too_many_bits() {
+        let mut packed = Vec::new();
+        let _ = IterativeBitPacker::new(65, &mut packed);
     }
 }
