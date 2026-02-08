@@ -3,7 +3,7 @@ use std::sync::Mutex;
 
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
-use raster_core::trace::{TraceItem, TraceInputParam};
+use raster_core::trace::{TraceInputParam, TraceItem};
 
 use crate::tracing::subscriber::Subscriber;
 
@@ -48,12 +48,12 @@ impl<W: Write + Send + Sync> Subscriber for JsonSubscriber<W> {
         };
 
         let mut writer_guard = self.writer.lock().expect("Writer mutex poisoned");
-        serde_json::to_writer(&mut *writer_guard, &item).expect("Failed to write");
+        let json_str = serde_json::to_string(&item).expect("Failed to serialize");
+        write!(writer_guard, "RASTER_TRACE:{}\n", json_str).expect("Failed to write");
     }
 
     fn on_complete(&self) {
         let mut writer_guard = self.writer.lock().expect("Writer mutex poisoned");
-        writer_guard.flush().expect("Failed to flush writer"); 
+        writer_guard.flush().expect("Failed to flush writer");
     }
 }
-

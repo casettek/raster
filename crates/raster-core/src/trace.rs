@@ -1,9 +1,9 @@
 //! Trace types (requires std feature).
 
+use crate::tile::TileId;
+use serde::{Deserialize, Serialize};
 use std::string::String;
 use std::vec::Vec;
-use serde::{Deserialize, Serialize};
-use crate::tile::TileId;
 
 /// Describes an input parameter for a tile function.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -97,8 +97,6 @@ pub struct AuditDiff {
 pub struct AuditResult {
     /// Whether the audit verification passed (no mismatches detected)
     pub success: bool,
-    /// Number of trace items successfully verified
-    pub verified_count: usize,
     /// On mismatch: diff information including index and frontier
     pub diff: Option<AuditDiff>,
     /// Window of trace items leading up to and including the diff point.

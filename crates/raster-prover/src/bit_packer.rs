@@ -24,7 +24,7 @@ impl Crop for Vec<u8> {
             if let Some(first) = cropped.iter_mut().last() {
                 *first &= rem_mask;
             }
-        } 
+        }
 
         cropped
     }
@@ -120,10 +120,12 @@ impl BitPacker {
         }
 
         let intra_block_start_index = value_start_offset % 64;
-        let block = packed.get(block_index).ok_or(BitPackerError::IndexOutOfBounds {
-            index: block_index,
-            max: packed.len(),
-        })?;
+        let block = packed
+            .get(block_index)
+            .ok_or(BitPackerError::IndexOutOfBounds {
+                index: block_index,
+                max: packed.len(),
+            })?;
 
         let block_end_offset = ((block_index + 1) * 64) - 1;
         let block_value_bit_len = self.0 - value_end_offset.saturating_sub(block_end_offset);
@@ -133,10 +135,13 @@ impl BitPacker {
 
         if value_end_offset.saturating_sub(block_end_offset) > 0 {
             let next_block_index = block_index + 1;
-            let next_block = packed.get(next_block_index).ok_or(BitPackerError::IndexOutOfBounds {
-                index: next_block_index,
-                max: packed.len(),
-            })?;
+            let next_block =
+                packed
+                    .get(next_block_index)
+                    .ok_or(BitPackerError::IndexOutOfBounds {
+                        index: next_block_index,
+                        max: packed.len(),
+                    })?;
 
             let next_block_value_bit_len = self.0 - block_value_bit_len;
             let mask = (1u64 << next_block_value_bit_len) - 1u64;
@@ -236,8 +241,8 @@ impl BitPacker {
                 if self_byte != other_byte {
                     for bit in 0..8 {
                         if (self_byte >> bit & 1u8) != (other_byte >> bit & 1u8) {
-                            let diff_bit = bit + (byte_num * 8) + (i * 64);
-                            let diff_pos = diff_bit / self.0;
+                            let diff_bit_index = bit + (byte_num * 8) + (i * 64);
+                            let diff_pos = diff_bit_index / self.0;
 
                             let l_value = self.try_get(diff_pos, l_bits)?;
                             let r_value = self.try_get(diff_pos, r_bits)?;
@@ -285,12 +290,12 @@ pub struct Iter<'a, 'b> {
 ///     let mut packer = StreamingBitPacker::new(8, |block| {
 ///         emitted_blocks.push(block);
 ///     });
-///     
+///
 ///     // Push 8 items of 8 bits each = 64 bits = 1 full block
 ///     for i in 0..8u8 {
 ///         packer.push(&[i]);
 ///     }
-///     
+///
 ///     // Get remaining blocks
 ///     let (remaining0, remaining1) = packer.finish();
 /// }

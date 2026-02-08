@@ -14,7 +14,7 @@ use crate::tracing::subscriber::Subscriber;
 
 /// Number of trace items to include in the trace window when a diff is detected.
 /// This provides context around where execution diverged.
-const AUDIT_WINDOW_SIZE: usize = 10;
+const AUDIT_WINDOW_SIZE: usize = 2;
 
 /// A subscriber that computes trace commitments and verifies them against an expected file.
 ///
@@ -37,10 +37,13 @@ impl AuditSubscriber {
     /// - `bits` - Number of bits for the bit packer
     /// - `expected_path` - Path to the file containing expected packed commitments
     pub fn new(bits: usize, expected_path: PathBuf) -> Self {
+        let producer = TraceCommitmentProducer::new(&EMPTY_TRIE_NODES[0]);
+        let bit_packer = BitPacker::new(bits);
+
         Self {
             expected_path,
-            producer: Mutex::new(Some(TraceCommitmentProducer::new(&EMPTY_TRIE_NODES[0]))),
-            bit_packer: Mutex::new(BitPacker::new(bits)),
+            producer: Mutex::new(Some(producer)),
+            bit_packer: Mutex::new(bit_packer),
             trace: Mutex::new(Vec::new()),
             frontiers: Mutex::new(Vec::new()),
         }
@@ -72,13 +75,22 @@ impl Subscriber for AuditSubscriber {
             output_data: BASE64_STANDARD.encode(output),
         };
 
+        ipc::emit_trace(&item);
+
         if let Ok(mut producer) = self.producer.lock() {
             if let Some(producer) = producer.as_mut() {
-                // Capture the frontier before appending this item
+                // Capture the frontier
                 if let Ok(mut frontiers) = self.frontiers.lock() {
-                    frontiers.push(SerializableFrontier::from_frontier(&producer.frontier()));
-                }
+                    let ser_frontier = SerializableFrontier::from_frontier(&producer.frontier());
+                    let frontier_bytes = &ser_frontier.to_bytes();
+                    let frontier_hex: String = frontier_bytes
+                        .iter()
+                        .map(|b| format!("{:02x}", b))
+                        .collect();
 
+                    println!("{}{}", "RASTER_TRACE:", frontier_hex);
+                    frontiers.push(ser_frontier);
+                }
                 producer.try_append(&item).unwrap();
 
                 if let Ok(mut trace) = self.trace.lock() {
@@ -133,61 +145,34 @@ impl Subscriber for AuditSubscriber {
                 // Compare computed vs expected
                 if computed_packed.len() != expected_packed.len() {
                     // Length mismatch - emit audit result with failure
-                    let (trace_window, frontier_bytes, window_start) =
-                        if let Ok(trace) = self.trace.lock() {
-                            let len = trace.len();
-                            let window_start = len.saturating_sub(AUDIT_WINDOW_SIZE);
-                            let window = trace[window_start..].to_vec();
-
-                            // Get the frontier at window start position
-                            let frontier = if let Ok(frontiers) = self.frontiers.lock() {
-                                if window_start < frontiers.len() {
-                                    frontiers[window_start].to_bytes()
-                                } else if !frontiers.is_empty() {
-                                    frontiers.last().unwrap().to_bytes()
-                                } else {
-                                    Vec::new()
-                                }
-                            } else {
-                                Vec::new()
-                            };
-
-                            (window, frontier, window_start)
-                        } else {
-                            (Vec::new(), Vec::new(), 0)
-                        };
-
-                    let result = AuditResult {
-                        success: false,
-                        verified_count: 0,
-                        diff: Some(AuditDiff {
-                            index: 0,
-                            frontier: frontier_bytes,
-                            fingerprint: expected_bytes.clone(),
-                            bits_per_item,
-                            window_start_position: window_start,
-                        }),
-                        trace_window,
-                    };
-                    ipc::emit_audit(&result);
-                    return;
+                    // Add AuditResult enum
+                    // TODO: ipc::emit_audit(&result);
+                    panic!("length mismatch");
                 }
 
+                std::println!(
+                    "{}{}",
+                    "RASTER_TRACE:",
+                    format!("computed length: {}", computed_packed.len())
+                );
                 let diff = if let Ok(bit_packer) = self.bit_packer.lock() {
                     bit_packer.diff(&computed_packed, &expected_packed)
                 } else {
                     panic!("Failed to lock bit_packer");
                 };
 
-                let verified_count = computed_packed.len();
-
                 if let Some((diff_index, _computed, _expected)) = diff {
+                    std::println!(
+                        "{}{}",
+                        "RASTER_TRACE:",
+                        format!("diff index: {}", diff_index)
+                    );
                     // Extract trace window: last N items up to and including the diff point
                     let window_start = diff_index.saturating_sub(AUDIT_WINDOW_SIZE - 1);
 
                     let (trace_window, frontier_bytes) = if let Ok(trace) = self.trace.lock() {
-                        let end = (diff_index + 1).min(trace.len());
-                        let window = trace[window_start..end].to_vec();
+                        let end = diff_index.min(trace.len() - 1);
+                        let window = trace[window_start..=end].to_vec();
 
                         // Get the frontier at window start position (before the first window item)
                         let frontier = if let Ok(frontiers) = self.frontiers.lock() {
@@ -209,12 +194,11 @@ impl Subscriber for AuditSubscriber {
 
                     let result = AuditResult {
                         success: false,
-                        verified_count,
                         diff: Some(AuditDiff {
                             index: diff_index,
                             frontier: frontier_bytes,
-                            fingerprint: expected_bytes.clone(),
                             bits_per_item,
+                            fingerprint: expected_bytes.clone(),
                             window_start_position: window_start,
                         }),
                         trace_window,
@@ -224,7 +208,6 @@ impl Subscriber for AuditSubscriber {
                     // Verification passed
                     let result = AuditResult {
                         success: true,
-                        verified_count,
                         diff: None,
                         trace_window: Vec::new(),
                     };

@@ -189,11 +189,7 @@ impl ExecutionCommitment {
     /// Get the frontier (partial Merkle path) at position n.
     ///
     /// This can be used to continue building the tree from position n.
-    pub fn frontier(
-        items: &[TraceItem],
-        n: usize,
-        seed: &[u8],
-    ) -> Option<NonEmptyFrontier<Bytes>> {
+    pub fn frontier(items: &[TraceItem], n: usize, seed: &[u8]) -> Option<NonEmptyFrontier<Bytes>> {
         let items_hashes: Vec<Vec<u8>> = items.iter().map(|item| item.hash()).collect();
 
         let mut trace_tree = TraceBridgeTree::new(1);
@@ -272,17 +268,21 @@ impl TraceCommitmentProducer {
         let mut trace_tree = TraceBridgeTree::new(1);
         trace_tree.append(Bytes(seed.to_vec()));
         let frontier = trace_tree.frontier().cloned().unwrap();
-        Self { frontier, trace_items_commitments: Vec::new() }
+
+        Self {
+            frontier,
+            trace_items_commitments: Vec::new(),
+        }
     }
 
     pub fn append(&mut self, item: &TraceItem) -> Result<()> {
         self.frontier.append(Bytes(item.hash()));
-        let mut trace_tree = TraceBridgeTree::from_frontier(1, self.frontier.clone());
-        let item_hash = item.hash();
-        trace_tree.append(Bytes(item_hash));
+        let trace_tree = TraceBridgeTree::from_frontier(1, self.frontier.clone());
 
         let Some(root) = trace_tree.root(0) else {
-            return Err(BitPackerError::TreeRootError("Failed to get root".to_string()));
+            return Err(BitPackerError::TreeRootError(
+                "Failed to get root".to_string(),
+            ));
         };
 
         self.frontier = trace_tree.frontier().cloned().unwrap();
@@ -294,15 +294,16 @@ impl TraceCommitmentProducer {
     pub fn try_append(&mut self, item: &TraceItem) -> Result<()> {
         let item_hash = item.try_hash()?;
         self.frontier.append(Bytes(item_hash));
-        let mut trace_tree = TraceBridgeTree::from_frontier(1, self.frontier.clone());
-        let item_hash = item.hash();
-        trace_tree.append(Bytes(item_hash));
+        let trace_tree = TraceBridgeTree::from_frontier(1, self.frontier.clone());
 
         let Some(root) = trace_tree.root(0) else {
-            return Err(BitPackerError::TreeRootError("Failed to get root".to_string()));
+            return Err(BitPackerError::TreeRootError(
+                "Failed to get root".to_string(),
+            ));
         };
 
-        self.frontier = trace_tree.frontier().cloned().unwrap();
+        let root_hex: String = root.0.iter().map(|b| format!("{:02x}", b)).collect();
+        std::println!("{}{}", "RASTER_TRACE:root:", root_hex);
         self.trace_items_commitments.push(root.0);
 
         Ok(())

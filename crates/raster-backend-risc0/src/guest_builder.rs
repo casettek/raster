@@ -38,13 +38,14 @@ impl GuestBuilder {
         if let Ok(cargo_toml) = fs::read_to_string(path.join("Cargo.toml")) {
             // Extract the package name
             self.user_crate_name = Self::extract_package_name(&cargo_toml);
-            
+
             // Look for raster dependency path
             if let Some(raster_path) = Self::extract_raster_path(&cargo_toml) {
                 let absolute_raster = path.join(&raster_path).canonicalize().ok();
                 if let Some(raster_crate_path) = absolute_raster {
                     // The raster workspace is two levels up from crates/raster
-                    self.raster_workspace = raster_crate_path.parent()
+                    self.raster_workspace = raster_crate_path
+                        .parent()
                         .and_then(|p| p.parent())
                         .map(|p| p.to_path_buf());
                 }
@@ -110,12 +111,14 @@ impl GuestBuilder {
     pub fn generate_guest_main(&self, tile_id: &str) -> String {
         // Convert tile_id to a valid Rust identifier (replace hyphens with underscores)
         let fn_name = tile_id.replace('-', "_");
-        
+
         // The wrapper function name follows the pattern from the #[tile] macro
         let wrapper_name = format!("__raster_tile_entry_{}", fn_name);
-        
+
         // Get the crate name for the import
-        let crate_name = self.user_crate_name.as_ref()
+        let crate_name = self
+            .user_crate_name
+            .as_ref()
             .map(|n| n.replace('-', "_"))
             .unwrap_or_else(|| "user_crate".to_string());
 
@@ -175,7 +178,11 @@ impl GuestBuilder {
 
         // Use absolute path to the raster crate
         let raster_path = if let Some(ref workspace) = self.raster_workspace {
-            workspace.join("crates").join("raster").display().to_string()
+            workspace
+                .join("crates")
+                .join("raster")
+                .display()
+                .to_string()
         } else {
             // Fallback: assume we're in the raster workspace
             "../../../../crates/raster".to_string()
@@ -217,7 +224,7 @@ impl GuestBuilder {
         // Look in ~/.risc0/toolchains for the latest rust toolchain
         let home = env::var("HOME").ok()?;
         let toolchains_dir = PathBuf::from(&home).join(".risc0").join("toolchains");
-        
+
         if !toolchains_dir.exists() {
             return None;
         }
@@ -243,49 +250,42 @@ impl GuestBuilder {
     }
 
     /// Build a guest crate and return the path to the ELF.
-    pub fn build_guest(
-        &self,
-        tile_id: &str,
-        guest_dir: &Path,
-    ) -> Result<PathBuf, GuestBuildError> {
+    pub fn build_guest(&self, tile_id: &str, guest_dir: &Path) -> Result<PathBuf, GuestBuildError> {
         // Create guest source directory
         let src_dir = guest_dir.join("src");
         fs::create_dir_all(&src_dir)?;
 
         // Write main.rs
         let main_rs = self.generate_guest_main(tile_id);
-        println!("main_rs: {:?}", main_rs);
         fs::write(src_dir.join("main.rs"), main_rs)?;
 
         // Write Cargo.toml
         let cargo_toml = self.generate_guest_cargo_toml(tile_id);
-        println!("cargo_toml: {:?}", cargo_toml);
         fs::write(guest_dir.join("Cargo.toml"), cargo_toml)?;
 
         // Find RISC0's cargo with the riscv32im-risc0-zkvm-elf target
-        let cargo_path = Self::find_risc0_cargo()
-            .ok_or_else(|| GuestBuildError::CompilationFailed(
-                "RISC0 toolchain not found. Please install it with: rzup install".to_string()
-            ))?;
+        let cargo_path = Self::find_risc0_cargo().ok_or_else(|| {
+            GuestBuildError::CompilationFailed(
+                "RISC0 toolchain not found. Please install it with: rzup install".to_string(),
+            )
+        })?;
 
         // Get the toolchain directory (parent of bin/)
-        let toolchain_dir = cargo_path.parent()
+        let toolchain_dir = cargo_path
+            .parent()
             .and_then(|p| p.parent())
-            .ok_or_else(|| GuestBuildError::CompilationFailed(
-                "Invalid RISC0 toolchain path structure".to_string()
-            ))?;
+            .ok_or_else(|| {
+                GuestBuildError::CompilationFailed(
+                    "Invalid RISC0 toolchain path structure".to_string(),
+                )
+            })?;
 
         // Build using RISC0's cargo for risc0 target
         // We need to ensure cargo uses the RISC0 toolchain's rustc by setting RUSTC
         let rustc_path = toolchain_dir.join("bin").join("rustc");
         let output = Command::new(&cargo_path)
             .current_dir(guest_dir)
-            .args([
-                "build",
-                "--release",
-                "--target",
-                "riscv32im-risc0-zkvm-elf",
-            ])
+            .args(["build", "--release", "--target", "riscv32im-risc0-zkvm-elf"])
             .env("RUSTC", &rustc_path)
             .output()?;
 

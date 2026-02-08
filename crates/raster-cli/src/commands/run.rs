@@ -5,10 +5,12 @@ use raster_backend::ExecutionMode;
 use raster_backend_risc0::Risc0Backend;
 use raster_compiler::Project;
 use raster_core::ipc::{self, IpcMessage};
-use raster_core::trace::AuditResult;
+use raster_core::trace::{AuditResult, TraceItem};
 use raster_core::{Error, Result};
 use raster_prover::guest::{TransitionInput, TransitionOutput, TRANSITION_GUEST_ELF};
-use raster_prover::trace::SerializableFrontier;
+use raster_prover::trace::{
+    BytesHashable, ExecutionCommitment, SerializableFrontier, TraceBridgeTree,
+};
 use raster_tracing::TraceReplayer;
 use risc0_zkvm::{default_prover, ExecutorEnv};
 use std::path::PathBuf;
@@ -90,23 +92,23 @@ pub fn run(
         let stderr = String::from_utf8_lossy(&output.stderr);
         println!("stderr: {}", stderr);
 
-        return Err(Error::Other(format!("Program exited with code {}: {}", code, stderr)));
+        return Err(Error::Other(format!(
+            "Program exited with code {}: {}",
+            code, stderr
+        )));
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     // Separate trace items, audit results, and regular program output
-    let mut trace_items: Vec<serde_json::Value> = Vec::new();
+    let mut trace_items: Vec<TraceItem> = Vec::new();
     let mut audit_result: Option<AuditResult> = None;
     let mut program_output: Vec<&str> = Vec::new();
 
     for line in stdout.lines() {
         match ipc::parse_line(line) {
             IpcMessage::Trace(item) => {
-                // Convert to Value for display
-                if let Ok(value) = serde_json::to_value(&item) {
-                    trace_items.push(value);
-                }
+                trace_items.push(item);
             }
             IpcMessage::Audit(result) => {
                 audit_result = Some(result);
@@ -126,44 +128,60 @@ pub fn run(
         println!();
     }
 
+    let execution_commitment = ExecutionCommitment::from(
+        &trace_items,
+        &raster_prover::precomputed::EMPTY_TRIE_NODES[0],
+    );
+
+    // TEMP: add item SHA's
     // Print trace items as pretty JSON
     if !trace_items.is_empty() {
         println!("Trace ({} tile executions):", trace_items.len());
-        for trace_item in &trace_items {
+        for (trace_item, item_commitement) in trace_items.iter().zip(execution_commitment.0.iter())
+        {
             if let Ok(pretty) = serde_json::to_string_pretty(&trace_item) {
                 // Indent each line of the pretty JSON
                 for line in pretty.lines() {
                     println!("  {}", line);
                 }
-                println!();
             }
+            let item_commitment_hex: String = item_commitement
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect();
+            println!("Item commitemt: {:02X?}", item_commitment_hex);
+            println!();
         }
     }
 
     // Handle audit result if present
     if let Some(result) = audit_result {
         if result.success {
-            println!(
-                "Audit verification passed ({} values verified).",
-                result.verified_count
-            );
+            println!("Audit verification passed",);
         } else {
             println!("Audit verification FAILED!");
             if let Some(ref diff) = result.diff {
                 println!("  Divergence detected at trace index: {}", diff.index);
                 if !diff.frontier.is_empty() {
                     // Display frontier as hex for debugging/replay purposes
-                    let frontier_hex: String = diff.frontier.iter()
-                        .map(|b| format!("{:02x}", b))
-                        .collect();
+                    let frontier_hex: String =
+                        diff.frontier.iter().map(|b| format!("{:02x}", b)).collect();
+                    let ser_frontier = SerializableFrontier::from_bytes(&diff.frontier);
+                    let frontier = ser_frontier
+                        .expect("Can't deserialized frontier")
+                        .to_frontier()
+                        .expect("Can't reconstruct frontier");
+                    let mut tree = TraceBridgeTree::from_frontier(1, frontier);
+                    tree.append(raster_prover::trace::Bytes(trace_items[diff.index].hash()));
+                    let Some(root) = tree.root(0) else {
+                        panic!("Can't get tree root");
+                    };
+                    let root_hex: String = root.0.iter().map(|b| format!("{:02x}", b)).collect();
+
+                    println!("  Root (hex): {}", root_hex);
                     println!("  Frontier (hex): {}", frontier_hex);
                 }
             }
-            println!(
-                "  Values verified before failure: {}",
-                result.verified_count
-            );
-
             // Display trace window for debugging context
             if !result.trace_window.is_empty() {
                 println!();
@@ -250,9 +268,9 @@ pub fn run(
 
                         if replay_result.failed_at_index.is_none() {
                             println!(
-                                "All {} transitions proved successfully with fingerprint verification.",
-                                result.trace_window.len()
-                            );
+                                    "All {} transitions proved successfully with fingerprint verification.",
+                                    result.trace_window.len()
+                                );
                         } else if let Some(failed_idx) = replay_result.failed_at_index {
                             println!();
                             println!("Transition replay failed at index {}.", failed_idx);
