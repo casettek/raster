@@ -79,6 +79,14 @@ pub struct AuditDiff {
     /// Serialized merkle tree frontier before the first trace window item.
     /// This can be used to replay execution from the window start.
     pub frontier: Vec<u8>,
+    /// The expected fingerprint (packed u64s as bytes, little-endian).
+    /// Used to verify the computed tree root after each transition.
+    pub fingerprint: Vec<u8>,
+    /// Number of bits per fingerprint item.
+    pub bits_per_item: usize,
+    /// Starting position in the fingerprint for the trace window.
+    /// This is the position corresponding to the first item in trace_window.
+    pub window_start_position: usize,
 }
 
 /// Result of an audit verification run.

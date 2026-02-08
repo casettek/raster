@@ -123,31 +123,39 @@ impl Subscriber for AuditSubscriber {
                     .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()))
                     .collect();
 
+                // Get bits_per_item from the bit_packer
+                let bits_per_item = if let Ok(bp) = self.bit_packer.lock() {
+                    bp.bits_per_item()
+                } else {
+                    panic!("Failed to lock bit_packer");
+                };
+
                 // Compare computed vs expected
                 if computed_packed.len() != expected_packed.len() {
                     // Length mismatch - emit audit result with failure
-                    let (trace_window, frontier_bytes) = if let Ok(trace) = self.trace.lock() {
-                        let len = trace.len();
-                        let window_start = len.saturating_sub(AUDIT_WINDOW_SIZE);
-                        let window = trace[window_start..].to_vec();
+                    let (trace_window, frontier_bytes, window_start) =
+                        if let Ok(trace) = self.trace.lock() {
+                            let len = trace.len();
+                            let window_start = len.saturating_sub(AUDIT_WINDOW_SIZE);
+                            let window = trace[window_start..].to_vec();
 
-                        // Get the frontier at window start position
-                        let frontier = if let Ok(frontiers) = self.frontiers.lock() {
-                            if window_start < frontiers.len() {
-                                frontiers[window_start].to_bytes()
-                            } else if !frontiers.is_empty() {
-                                frontiers.last().unwrap().to_bytes()
+                            // Get the frontier at window start position
+                            let frontier = if let Ok(frontiers) = self.frontiers.lock() {
+                                if window_start < frontiers.len() {
+                                    frontiers[window_start].to_bytes()
+                                } else if !frontiers.is_empty() {
+                                    frontiers.last().unwrap().to_bytes()
+                                } else {
+                                    Vec::new()
+                                }
                             } else {
                                 Vec::new()
-                            }
-                        } else {
-                            Vec::new()
-                        };
+                            };
 
-                        (window, frontier)
-                    } else {
-                        (Vec::new(), Vec::new())
-                    };
+                            (window, frontier, window_start)
+                        } else {
+                            (Vec::new(), Vec::new(), 0)
+                        };
 
                     let result = AuditResult {
                         success: false,
@@ -155,6 +163,9 @@ impl Subscriber for AuditSubscriber {
                         diff: Some(AuditDiff {
                             index: 0,
                             frontier: frontier_bytes,
+                            fingerprint: expected_bytes.clone(),
+                            bits_per_item,
+                            window_start_position: window_start,
                         }),
                         trace_window,
                     };
@@ -202,6 +213,9 @@ impl Subscriber for AuditSubscriber {
                         diff: Some(AuditDiff {
                             index: diff_index,
                             frontier: frontier_bytes,
+                            fingerprint: expected_bytes.clone(),
+                            bits_per_item,
+                            window_start_position: window_start,
                         }),
                         trace_window,
                     };

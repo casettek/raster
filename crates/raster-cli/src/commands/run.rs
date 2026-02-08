@@ -233,12 +233,106 @@ pub fn run(
                         println!();
                         println!("Replaying transition frontier with transition guest...");
 
-                        match replay_transitions(&frontier, &result.trace_window) {
-                            Ok(_) => {
-                                println!("All {} transitions proved successfully.", result.trace_window.len());
+                        // Parse fingerprint bytes as little-endian u64s
+                        let fingerprint: Vec<u64> = diff
+                            .fingerprint
+                            .chunks_exact(8)
+                            .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()))
+                            .collect();
+
+                        let replay_result = replay_transitions(
+                            &frontier,
+                            &result.trace_window,
+                            fingerprint,
+                            diff.window_start_position,
+                            diff.bits_per_item,
+                        );
+
+                        if replay_result.failed_at_index.is_none() {
+                            println!(
+                                "All {} transitions proved successfully with fingerprint verification.",
+                                result.trace_window.len()
+                            );
+                        } else if let Some(failed_idx) = replay_result.failed_at_index {
+                            println!();
+                            println!("Transition replay failed at index {}.", failed_idx);
+                            println!(
+                                "  Transitions verified before failure: {}",
+                                replay_result.verified_count
+                            );
+
+                            // Show the exact trace item where fingerprint diverged
+                            if let Some(failed_item) = result.trace_window.get(failed_idx) {
+                                println!();
+                                println!(">>> DIVERGENT TRACE ITEM (index {}):", failed_idx);
+                                println!("    Function: {}", failed_item.fn_name);
+                                if let Some(ref desc) = failed_item.desc {
+                                    println!("    Description: {}", desc);
+                                }
+                                if !failed_item.inputs.is_empty() {
+                                    println!("    Inputs:");
+                                    for inp in &failed_item.inputs {
+                                        println!("      - {}: {}", inp.name, inp.ty);
+                                    }
+                                }
+                                if let Some(ref output_type) = failed_item.output_type {
+                                    println!("    Output type: {}", output_type);
+                                }
+                                println!("    Input data (base64): {}", failed_item.input_data);
+                                println!("    Output data (base64): {}", failed_item.output_data);
+
+                                // Show failure type
+                                if let Some(ref failure_type) = replay_result.failure_type {
+                                    println!();
+                                    match failure_type {
+                                        TransitionFailureType::FingerprintMismatch => {
+                                            println!(
+                                                "    Failure: Fingerprint mismatch at position {}",
+                                                diff.window_start_position + failed_idx
+                                            );
+                                        }
+                                        TransitionFailureType::ItemHashMismatch => {
+                                            println!("    Failure: Item hash mismatch");
+                                        }
+                                        TransitionFailureType::ProvingError(msg) => {
+                                            println!("    Failure: Proving error - {}", msg);
+                                        }
+                                    }
+                                }
                             }
-                            Err(e) => {
-                                println!("Transition replay failed: {}", e);
+
+                            // Show remaining items from the window
+                            let remaining_start = failed_idx + 1;
+                            if remaining_start < result.trace_window.len() {
+                                println!();
+                                println!(
+                                    ">>> REMAINING TRACE ITEMS ({} items not processed):",
+                                    result.trace_window.len() - remaining_start
+                                );
+                                for (offset, item) in
+                                    result.trace_window[remaining_start..].iter().enumerate()
+                                {
+                                    let idx = remaining_start + offset;
+                                    println!();
+                                    println!("    [{}] {}", idx, item.fn_name);
+                                    if let Some(ref desc) = item.desc {
+                                        println!("        Description: {}", desc);
+                                    }
+                                    if !item.inputs.is_empty() {
+                                        println!("        Inputs:");
+                                        for inp in &item.inputs {
+                                            println!("          - {}: {}", inp.name, inp.ty);
+                                        }
+                                    }
+                                    if let Some(ref output_type) = item.output_type {
+                                        println!("        Output type: {}", output_type);
+                                    }
+                                }
+                            } else {
+                                println!();
+                                println!(
+                                    ">>> No remaining trace items (failure occurred at last item)."
+                                );
                             }
                         }
                     }
@@ -302,16 +396,51 @@ fn extract_binary_name(project_path: &std::path::Path) -> Option<String> {
     None
 }
 
+/// Result of a transition replay operation.
+#[derive(Debug)]
+pub struct TransitionReplayResult {
+    /// Number of transitions successfully proved and verified
+    pub verified_count: usize,
+    /// If fingerprint verification failed, the index in trace_window where it failed
+    pub failed_at_index: Option<usize>,
+    /// The type of failure if any
+    pub failure_type: Option<TransitionFailureType>,
+}
+
+/// Type of transition failure.
+#[derive(Debug)]
+pub enum TransitionFailureType {
+    /// Item hash mismatch
+    ItemHashMismatch,
+    /// Fingerprint mismatch
+    FingerprintMismatch,
+    /// Proving error
+    ProvingError(String),
+}
+
 /// Replay trace transitions using the transition guest to prove merkle tree state transitions.
 ///
 /// For each trace item in the window:
-/// 1. Create a TransitionInput with the current frontier and trace item
+/// 1. Create a TransitionInput with the current frontier, trace item, and fingerprint data
 /// 2. Execute the transition guest in the RISC0 zkVM
-/// 3. Verify the output and update the frontier for the next iteration
+/// 3. Verify the output (including fingerprint) and update the frontier for the next iteration
+///
+/// # Arguments
+/// * `initial_frontier` - The frontier state before the first trace item
+/// * `trace_window` - The trace items to replay
+/// * `fingerprint` - The packed fingerprint u64s for verification
+/// * `window_start_position` - The starting position in the fingerprint for the first item
+/// * `bits_per_item` - Bits per fingerprint item
+///
+/// # Returns
+/// A `TransitionReplayResult` with details about success or failure
 fn replay_transitions(
     initial_frontier: &SerializableFrontier,
     trace_window: &[raster_core::trace::TraceItem],
-) -> Result<()> {
+    fingerprint: Vec<u64>,
+    window_start_position: usize,
+    bits_per_item: usize,
+) -> TransitionReplayResult {
     // Load the transition guest ELF from raster-prover
     let elf = TRANSITION_GUEST_ELF;
 
@@ -321,42 +450,93 @@ fn replay_transitions(
     for (i, item) in trace_window.iter().enumerate() {
         print!("  [{}] transition {} ... ", i, item.fn_name);
 
-        // Create the input for this transition
-        let input = TransitionInput::new(current_frontier.clone(), item.clone());
+        // Create the input for this transition with fingerprint data
+        let input = TransitionInput::new(
+            current_frontier.clone(),
+            item.clone(),
+            fingerprint.clone(),
+            window_start_position + i,
+            bits_per_item,
+        );
 
         // Build the executor environment
-        let env = ExecutorEnv::builder()
-            .write(&input)
-            .map_err(|e| Error::Other(format!("Failed to write input: {}", e)))?
-            .build()
-            .map_err(|e| Error::Other(format!("Failed to build executor env: {}", e)))?;
+        let env = match ExecutorEnv::builder().write(&input) {
+            Ok(builder) => match builder.build() {
+                Ok(env) => env,
+                Err(e) => {
+                    println!("FAILED: {}", e);
+                    return TransitionReplayResult {
+                        verified_count: i,
+                        failed_at_index: Some(i),
+                        failure_type: Some(TransitionFailureType::ProvingError(e.to_string())),
+                    };
+                }
+            },
+            Err(e) => {
+                println!("FAILED: {}", e);
+                return TransitionReplayResult {
+                    verified_count: i,
+                    failed_at_index: Some(i),
+                    failure_type: Some(TransitionFailureType::ProvingError(e.to_string())),
+                };
+            }
+        };
 
         // Prove the transition
-        let prove_info = prover
-            .prove(env, elf)
-            .map_err(|e| Error::Other(format!("Proving failed: {}", e)))?;
+        let prove_info = match prover.prove(env, elf) {
+            Ok(info) => info,
+            Err(e) => {
+                println!("FAILED: {}", e);
+                return TransitionReplayResult {
+                    verified_count: i,
+                    failed_at_index: Some(i),
+                    failure_type: Some(TransitionFailureType::ProvingError(e.to_string())),
+                };
+            }
+        };
 
         // Decode the output from the journal
-        let output: TransitionOutput = prove_info
-            .receipt
-            .journal
-            .decode()
-            .map_err(|e| Error::Other(format!("Failed to decode output: {}", e)))?;
+        let output: TransitionOutput = match prove_info.receipt.journal.decode() {
+            Ok(out) => out,
+            Err(e) => {
+                println!("FAILED: {}", e);
+                return TransitionReplayResult {
+                    verified_count: i,
+                    failed_at_index: Some(i),
+                    failure_type: Some(TransitionFailureType::ProvingError(e.to_string())),
+                };
+            }
+        };
 
         // Verify the item hash matches
         if !output.verify_item_hash(item) {
             println!("FAILED: item hash mismatch");
-            return Err(Error::Other(format!(
-                "Transition {} failed: item hash mismatch",
-                i
-            )));
+            return TransitionReplayResult {
+                verified_count: i,
+                failed_at_index: Some(i),
+                failure_type: Some(TransitionFailureType::ItemHashMismatch),
+            };
+        }
+
+        // Verify fingerprint
+        if !output.fingerprint_verified {
+            println!("FAILED: fingerprint mismatch");
+            return TransitionReplayResult {
+                verified_count: i,
+                failed_at_index: Some(i),
+                failure_type: Some(TransitionFailureType::FingerprintMismatch),
+            };
         }
 
         // Update the frontier for the next iteration
         current_frontier = output.new_frontier;
 
-        println!("PROVED");
+        println!("PROVED (fingerprint verified)");
     }
 
-    Ok(())
+    TransitionReplayResult {
+        verified_count: trace_window.len(),
+        failed_at_index: None,
+        failure_type: None,
+    }
 }

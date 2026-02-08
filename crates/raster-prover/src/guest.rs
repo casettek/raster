@@ -21,21 +21,37 @@ include!(concat!(env!("OUT_DIR"), "/methods.rs"));
 
 /// Input to the transition guest program.
 ///
-/// Contains the current frontier state and the trace item to append.
+/// Contains the current frontier state and the trace item to append,
+/// along with fingerprint verification data.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransitionInput {
     /// The current frontier state (before appending)
     pub frontier: SerializableFrontier,
     /// The trace item to hash and append
     pub trace_item: TraceItem,
+    /// Expected fingerprint (packed u64s) for verification
+    pub fingerprint: Vec<u64>,
+    /// Position in fingerprint to verify (index of this trace item in the window)
+    pub position: usize,
+    /// Bits per fingerprint item
+    pub bits_per_item: usize,
 }
 
 impl TransitionInput {
     /// Create a new transition input.
-    pub fn new(frontier: SerializableFrontier, trace_item: TraceItem) -> Self {
+    pub fn new(
+        frontier: SerializableFrontier,
+        trace_item: TraceItem,
+        fingerprint: Vec<u64>,
+        position: usize,
+        bits_per_item: usize,
+    ) -> Self {
         Self {
             frontier,
             trace_item,
+            fingerprint,
+            position,
+            bits_per_item,
         }
     }
 
@@ -47,13 +63,18 @@ impl TransitionInput {
 
 /// Output from the transition guest program.
 ///
-/// Contains the new frontier state after appending and the hash of the trace item.
+/// Contains the new frontier state after appending, the hash of the trace item,
+/// and fingerprint verification results.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransitionOutput {
     /// The new frontier state (after appending)
     pub new_frontier: SerializableFrontier,
     /// The SHA256 hash of the trace item that was appended
     pub item_hash: Vec<u8>,
+    /// The computed tree root after appending
+    pub tree_root: Vec<u8>,
+    /// Whether fingerprint verification passed
+    pub fingerprint_verified: bool,
 }
 
 impl TransitionOutput {
@@ -87,9 +108,19 @@ pub fn hash_trace_item_postcard(item: &TraceItem) -> Vec<u8> {
 /// This is useful for preparing inputs for multiple sequential transitions.
 /// Note: Each input depends on the output of the previous transition, so
 /// this function returns inputs that must be executed sequentially.
+///
+/// # Arguments
+/// * `initial_frontier` - The frontier state before the first trace item
+/// * `items` - The trace items to process
+/// * `fingerprint` - The packed fingerprint u64s for verification
+/// * `start_position` - The starting position in the fingerprint for the first item
+/// * `bits_per_item` - Bits per fingerprint item
 pub fn prepare_batch_inputs(
     initial_frontier: SerializableFrontier,
     items: &[TraceItem],
+    fingerprint: Vec<u64>,
+    start_position: usize,
+    bits_per_item: usize,
 ) -> Vec<TransitionInput> {
     items
         .iter()
@@ -99,10 +130,22 @@ pub fn prepare_batch_inputs(
             // For subsequent items, the caller must update the frontier
             // from the previous transition's output
             if i == 0 {
-                TransitionInput::new(initial_frontier.clone(), item.clone())
+                TransitionInput::new(
+                    initial_frontier.clone(),
+                    item.clone(),
+                    fingerprint.clone(),
+                    start_position + i,
+                    bits_per_item,
+                )
             } else {
                 // Placeholder - caller must update frontier between transitions
-                TransitionInput::new(initial_frontier.clone(), item.clone())
+                TransitionInput::new(
+                    initial_frontier.clone(),
+                    item.clone(),
+                    fingerprint.clone(),
+                    start_position + i,
+                    bits_per_item,
+                )
             }
         })
         .collect()
@@ -134,7 +177,8 @@ mod tests {
         };
 
         let item = make_test_trace_item(1);
-        let input = TransitionInput::new(frontier, item);
+        let fingerprint = vec![0u64; 1];
+        let input = TransitionInput::new(frontier, item, fingerprint, 0, 8);
 
         let bytes = input.to_bytes();
         assert!(!bytes.is_empty());
@@ -144,6 +188,8 @@ mod tests {
             postcard::from_bytes(&bytes).expect("Failed to deserialize");
         assert_eq!(recovered.frontier.position, 0);
         assert_eq!(recovered.trace_item.fn_name, "test_1");
+        assert_eq!(recovered.position, 0);
+        assert_eq!(recovered.bits_per_item, 8);
     }
 
     #[test]
@@ -174,7 +220,9 @@ mod tests {
                 leaf: correct_hash.clone(),
                 ommers: vec![],
             },
-            item_hash: correct_hash,
+            item_hash: correct_hash.clone(),
+            tree_root: correct_hash,
+            fingerprint_verified: true,
         };
 
         assert!(output.verify_item_hash(&item));
