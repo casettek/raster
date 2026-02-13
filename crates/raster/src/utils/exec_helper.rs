@@ -4,8 +4,9 @@
 //! main() to handle tile execution requests from the raster CLI's native backend,
 //! and to parse input arguments.
 
-use crate::core::ipc;
-use crate::core::registry::find_tile_by_str;
+use raster_core::ipc;
+use raster_core::registry::find_tile_by_str;
+
 use serde::de::DeserializeOwned;
 
 /// Check for --raster-exec arguments and execute the specified tile if present.
@@ -33,7 +34,7 @@ use serde::de::DeserializeOwned;
 ///     if raster::try_execute_tile_from_args() {
 ///         return;
 ///     }
-///     
+///
 ///     // Normal main logic...
 /// }
 /// ```
@@ -45,12 +46,12 @@ use serde::de::DeserializeOwned;
 ///
 /// # Protocol
 ///
-/// The function looks for: `--raster-exec <tile_id> --input <base64_input>`
 ///
-/// On success, it prints: `RASTER_OUTPUT:<base64_output>`
 /// On error, it prints an error message and exits with code 1.
 #[cfg(feature = "std")]
 pub fn try_execute_tile_from_args() -> bool {
+    use raster_core::postcard;
+
     let args: std::vec::Vec<std::string::String> = std::env::args().collect();
 
     // Look for --raster-exec argument
@@ -77,7 +78,7 @@ pub fn try_execute_tile_from_args() -> bool {
         }
     };
 
-    let input_b64 = match args.get(input_pos + 1) {
+    let input = match args.get(input_pos + 1) {
         Some(input) => input,
         None => {
             std::eprintln!("Error: --input requires a base64-encoded value");
@@ -85,15 +86,7 @@ pub fn try_execute_tile_from_args() -> bool {
         }
     };
 
-    // Decode input from base64
-    use base64::Engine;
-    let input = match base64::engine::general_purpose::STANDARD.decode(input_b64) {
-        Ok(data) => data,
-        Err(e) => {
-            std::eprintln!("Error: Failed to decode input: {}", e);
-            std::process::exit(1);
-        }
-    };
+    let input_bytes = postcard::to_allocvec(input).expect("Failed to serialize input to bytes");
 
     // Find the tile in the registry
     let tile = match find_tile_by_str(tile_id) {
@@ -105,7 +98,7 @@ pub fn try_execute_tile_from_args() -> bool {
     };
 
     // Execute the tile
-    let output = match tile.execute(&input) {
+    let output = match tile.execute(&input_bytes) {
         Ok(out) => out,
         Err(e) => {
             std::eprintln!("Error: Tile execution failed: {}", e);
@@ -113,9 +106,9 @@ pub fn try_execute_tile_from_args() -> bool {
         }
     };
 
-    // Encode output as base64 and print with marker
-    let output_b64 = base64::engine::general_purpose::STANDARD.encode(&output);
-    ipc::emit_output(&output_b64);
+    // TODO: broken - fix flow with single tile execution on native backend
+    // for now nonsent output
+    ipc::emit_output(&std::string::String::from_utf8_lossy(&output));
 
     true
 }
@@ -152,4 +145,3 @@ pub fn parse_main_input<T: DeserializeOwned>() -> Option<T> {
     // Parse JSON directly into the target type
     serde_json::from_str(input_json).ok()
 }
-

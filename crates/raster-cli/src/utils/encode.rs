@@ -4,12 +4,14 @@ use raster_core::{Error, Result};
 pub fn encode_input(input: Option<&str>) -> Result<Vec<u8>> {
     let input_bytes = if let Some(input_json) = input {
         // Parse JSON input and serialize with postcard
-        let value: serde_json::Value =
-            serde_json::from_str(input_json).map_err(|e| Error::Other(format!("Failed to parse input JSON: {}", e)))?;
-        postcard::to_allocvec(&value).map_err(|e| Error::Other(format!("Failed to serialize input: {}", e)))?
+        let value: serde_json::Value = serde_json::from_str(input_json)
+            .map_err(|e| Error::Other(format!("Failed to parse input JSON: {}", e)))?;
+        postcard::to_allocvec(&value)
+            .map_err(|e| Error::Other(format!("Failed to serialize input: {}", e)))?
     } else {
         // Empty input (unit type)
-        postcard::to_allocvec(&()).map_err(|e| Error::Other(format!("Failed to serialize empty input: {}", e)))?
+        postcard::to_allocvec(&())
+            .map_err(|e| Error::Other(format!("Failed to serialize empty input: {}", e)))?
     };
     Ok(input_bytes)
 }
@@ -19,12 +21,10 @@ pub fn decode_output(output_type: &str, output: &[u8]) -> String {
     // Try to decode based on the type hint
     match output_type.trim() {
         // String types
-        "String" | "& str" | "&str" => {
-            postcard::from_bytes::<String>(output)
-                .map(|s| format!("\"{}\"", s))
-                .unwrap_or_else(|_| format!("<{} bytes>", output.len()))
-        }
-        
+        "String" | "& str" | "&str" => postcard::from_bytes::<String>(output)
+            .map(|s| format!("\"{}\"", s))
+            .unwrap_or_else(|_| format!("<{} bytes>", output.len())),
+
         // Unsigned integers
         "u8" => postcard::from_bytes::<u8>(output)
             .map(|n| n.to_string())
@@ -41,7 +41,7 @@ pub fn decode_output(output_type: &str, output: &[u8]) -> String {
         "usize" => postcard::from_bytes::<usize>(output)
             .map(|n| n.to_string())
             .unwrap_or_else(|_| format!("<{} bytes>", output.len())),
-        
+
         // Signed integers
         "i8" => postcard::from_bytes::<i8>(output)
             .map(|n| n.to_string())
@@ -55,7 +55,7 @@ pub fn decode_output(output_type: &str, output: &[u8]) -> String {
         "i64" => postcard::from_bytes::<i64>(output)
             .map(|n| n.to_string())
             .unwrap_or_else(|_| format!("<{} bytes>", output.len())),
-        
+
         // Floats
         "f32" => postcard::from_bytes::<f32>(output)
             .map(|n| n.to_string())
@@ -63,15 +63,15 @@ pub fn decode_output(output_type: &str, output: &[u8]) -> String {
         "f64" => postcard::from_bytes::<f64>(output)
             .map(|n| n.to_string())
             .unwrap_or_else(|_| format!("<{} bytes>", output.len())),
-        
+
         // Boolean
         "bool" => postcard::from_bytes::<bool>(output)
             .map(|b| b.to_string())
             .unwrap_or_else(|_| format!("<{} bytes>", output.len())),
-        
+
         // Unit type
         "()" => "()".to_string(),
-        
+
         // Vec types - try to decode as JSON value for display
         t if t.starts_with("Vec<") || t.starts_with("Vec <") => {
             // Try as Vec<u8> first (common case)
@@ -86,7 +86,7 @@ pub fn decode_output(output_type: &str, output: &[u8]) -> String {
                     .unwrap_or_else(|_| format!("<{} bytes>", output.len()))
             }
         }
-        
+
         // Result types - unwrap if possible
         t if t.starts_with("Result<") || t.starts_with("Result <") => {
             // Try common inner types
@@ -104,13 +104,10 @@ pub fn decode_output(output_type: &str, output: &[u8]) -> String {
                 format!("<Result: {} bytes>", output.len())
             }
         }
-        
+
         // Unknown types - try serde_json::Value as fallback
-        _ => {
-            postcard::from_bytes::<serde_json::Value>(output)
-                .map(|v| v.to_string())
-                .unwrap_or_else(|_| format!("<{}: {} bytes>", output_type, output.len()))
-        }
+        _ => postcard::from_bytes::<serde_json::Value>(output)
+            .map(|v| v.to_string())
+            .unwrap_or_else(|_| format!("<{}: {} bytes>", output_type, output.len())),
     }
 }
-

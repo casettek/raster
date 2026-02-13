@@ -11,5 +11,4 @@ description = "Trace replay and verification for the Raster toolchain"
 raster-core.workspace = true
 raster-backend.workspace = true
 raster-compiler.workspace = true
-base64.workspace = true
 serde.workspace = true

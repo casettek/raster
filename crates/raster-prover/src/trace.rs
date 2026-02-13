@@ -11,6 +11,7 @@ use std::fmt::Debug;
 
 use crate::error::{BitPackerError, Result};
 use crate::precomputed::{EMPTY_TRIE_NODES, HASH_SIZE};
+
 use raster_core::trace::TraceItem;
 
 /// Trait for types that can be hashed to bytes.
@@ -26,14 +27,14 @@ pub trait BytesHashable {
 
 impl BytesHashable for TraceItem {
     fn hash(&self) -> Vec<u8> {
-        let data = bincode::serialize(self).expect("Failed to serialize for hashing");
+        let data = postcard::to_allocvec(self).expect("Failed to serialize for hashing");
         let mut hasher = Sha256::new();
         hasher.update(&data);
         hasher.finalize().to_vec()
     }
 
     fn try_hash(&self) -> Result<Vec<u8>> {
-        let data = bincode::serialize(self)
+        let data = postcard::to_allocvec(self)
             .map_err(|e| BitPackerError::SerializationError(e.to_string()))?;
         let mut hasher = Sha256::new();
         hasher.update(&data);
@@ -48,7 +49,7 @@ pub struct Bytes(pub Vec<u8>);
 /// A serializable representation of a NonEmptyFrontier<Bytes>.
 ///
 /// This can be used to persist and restore frontier state for replay.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SerializableFrontier {
     /// The position in the tree (as u64)
     pub position: u64,
@@ -83,12 +84,12 @@ impl SerializableFrontier {
 
     /// Serialize to bytes using bincode.
     pub fn to_bytes(&self) -> Vec<u8> {
-        bincode::serialize(self).unwrap_or_default()
+        postcard::to_allocvec(self).unwrap_or_default()
     }
 
     /// Deserialize from bytes using bincode.
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        bincode::deserialize(bytes).ok()
+        postcard::from_bytes(bytes).ok()
     }
 }
 
@@ -322,8 +323,47 @@ impl TraceCommitmentProducer {
     }
 }
 
+fn empty_at_level(level: u8) -> Vec<u8> {
+    use crate::precomputed;
+            if level == 0 {
+                return precomputed::EMPTY_TRIE_NODES[0].to_vec();
+            }
+            let child = empty_at_level(level - 1);
+            combine_level(level - 1, &child, &child)
+        }
+
+fn combine_level(level: u8, left: &[u8], right: &[u8]) -> Vec<u8> {
+            let mut data = Vec::with_capacity(1 + 32 + 32);
+            data.push(level);
+            data.extend_from_slice(left);
+            data.extend_from_slice(right);
+            let mut hasher = sha2::Sha256::new();
+            hasher.update(&data);
+            hasher.finalize().to_vec()
+        }
+pub fn compute_root_guest(position: u64, leaf: &[u8], ommers: &[Vec<u8>]) -> Vec<u8> {
+            let mut cur = leaf.to_vec();
+            let mut ommer_idx = 0;
+            for level in 0u8..32 {
+                let bit = (position >> level) & 1;
+                if bit == 0 {
+                    cur = combine_level(level, &cur, &empty_at_level(level));
+                } else {
+                    let left = if ommer_idx < ommers.len() {
+                        ommers[ommer_idx].clone()
+                    } else {
+                        empty_at_level(level)
+                    };
+                    cur = combine_level(level, &left, &cur);
+                    ommer_idx += 1;
+                }
+            }
+            cur
+        }
 #[cfg(test)]
 mod tests {
+    use raster_core::trace::TraceInputParam;
+
     use super::*;
     use crate::precomputed;
 
@@ -332,10 +372,13 @@ mod tests {
         TraceItem {
             fn_name: format!("test_tile_{}", input),
             desc: None,
-            inputs: vec![],
-            input_data: format!("{}", input),
+            inputs: vec![TraceInputParam {
+                name: "input".to_string(),
+                ty: "u64".to_string(),
+            }],
+            input_data: Vec::new(),
             output_type: Some("u64".to_string()),
-            output_data: format!("{}", output),
+            output_data: output.to_le_bytes().to_vec(),
         }
     }
 
@@ -386,5 +429,79 @@ mod tests {
         let items: Vec<TraceItem> = vec![];
         let result = ExecutionCommitment::try_from(&items, &precomputed::EMPTY_TRIE_NODES[0]);
         assert!(matches!(result, Err(BitPackerError::EmptyTrace)));
+    }
+
+    /// Test that guest-style compute_root matches bridgetree's root for various frontiers.
+    #[test]
+    fn test_compute_root_matches_bridgetree() {
+        use bridgetree::Level;
+
+        fn empty_at_level(level: u8) -> Vec<u8> {
+            if level == 0 {
+                return precomputed::EMPTY_TRIE_NODES[0].to_vec();
+            }
+            let child = empty_at_level(level - 1);
+            combine_level(level - 1, &child, &child)
+        }
+
+        fn combine_level(level: u8, left: &[u8], right: &[u8]) -> Vec<u8> {
+            let mut data = Vec::with_capacity(1 + 32 + 32);
+            data.push(level);
+            data.extend_from_slice(left);
+            data.extend_from_slice(right);
+            let mut hasher = sha2::Sha256::new();
+            hasher.update(&data);
+            hasher.finalize().to_vec()
+        }
+
+        fn compute_root_guest(position: u64, leaf: &[u8], ommers: &[Vec<u8>]) -> Vec<u8> {
+            let mut cur = leaf.to_vec();
+            let mut ommer_idx = 0;
+            for level in 0u8..32 {
+                let bit = (position >> level) & 1;
+                if bit == 0 {
+                    cur = combine_level(level, &cur, &empty_at_level(level));
+                } else {
+                    let left = if ommer_idx < ommers.len() {
+                        ommers[ommer_idx].clone()
+                    } else {
+                        empty_at_level(level)
+                    };
+                    cur = combine_level(level, &left, &cur);
+                    ommer_idx += 1;
+                }
+            }
+            cur
+        }
+
+        let seed = precomputed::EMPTY_TRIE_NODES[0];
+        let items: Vec<TraceItem> = (0..10).map(|i| make_tile_trace_item(i, i)).collect();
+
+        let mut tree = TraceBridgeTree::new(1);
+        tree.append(Bytes(seed.to_vec()));
+
+        for (i, item) in items.iter().enumerate() {
+            tree.append(Bytes(item.hash()));
+            let bridgetree_root = tree.root(0).expect("root").0.clone();
+
+            let frontier = tree.frontier().expect("frontier").clone();
+            let ser_frontier = SerializableFrontier::from_frontier(&frontier);
+            let deser_frontier = ser_frontier.to_frontier().expect("Can't deserialize frontier");
+
+            let pos = u64::from(deser_frontier.position());
+            let leaf = deser_frontier.leaf().0.clone();
+            let ommers: Vec<Vec<u8>> =
+                deser_frontier.ommers().iter().map(|o| o.0.clone()).collect();
+
+            let guest_root = compute_root_guest(pos, &leaf, &ommers);
+
+            assert_eq!(
+                bridgetree_root,
+                guest_root,
+                "Root mismatch at position {} (after {} items)",
+                pos,
+                i + 1
+            );
+        }
     }
 }

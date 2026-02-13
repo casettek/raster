@@ -4,15 +4,20 @@ use crate::BackendType;
 use raster_backend::ExecutionMode;
 use raster_backend_risc0::Risc0Backend;
 use raster_compiler::Project;
+use raster_core::fingerprint::{BitPacker, FingerprintAccumulator};
 use raster_core::ipc::{self, IpcMessage};
 use raster_core::trace::{AuditResult, TraceItem};
 use raster_core::{Error, Result};
-use raster_prover::guest::{TransitionInput, TransitionOutput, TRANSITION_GUEST_ELF};
 use raster_prover::trace::{
     BytesHashable, ExecutionCommitment, SerializableFrontier, TraceBridgeTree,
 };
-use raster_tracing::TraceReplayer;
-use risc0_zkvm::{default_prover, ExecutorEnv};
+use raster_prover::transition::{
+    InitTransitionState, TransitionInput, TransitionJournal, TransitionState, TRANSITION_GUEST_ELF,
+};
+use raster_prover::utils::DisplayBinary;
+use raster_tracing::{ReplayResult, TraceReplayer};
+use risc0_zkvm::{default_prover, ExecutorEnv, Receipt};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
@@ -139,17 +144,12 @@ pub fn run(
         println!("Trace ({} tile executions):", trace_items.len());
         for (trace_item, item_commitement) in trace_items.iter().zip(execution_commitment.0.iter())
         {
-            if let Ok(pretty) = serde_json::to_string_pretty(&trace_item) {
-                // Indent each line of the pretty JSON
-                for line in pretty.lines() {
-                    println!("  {}", line);
-                }
-            }
+            println!("   Trace item: fn: {}", trace_item.fn_name);
             let item_commitment_hex: String = item_commitement
                 .iter()
                 .map(|b| format!("{:02x}", b))
                 .collect();
-            println!("Item commitemt: {:02X?}", item_commitment_hex);
+            println!("    Item commitmemt: {:02X?}", item_commitment_hex);
             println!();
         }
     }
@@ -204,8 +204,6 @@ pub fn run(
                     if let Some(ref output_type) = item.output_type {
                         println!("      Output type: {}", output_type);
                     }
-                    println!("      Input data (base64): {}", item.input_data);
-                    println!("      Output data (base64): {}", item.output_data);
                 }
 
                 // Replay trace window with Risc0 backend for proof generation
@@ -218,10 +216,14 @@ pub fn run(
                 let replayer = TraceReplayer::new(&backend, &project);
                 let mode = ExecutionMode::prove_and_verify();
 
+                let mut replayed_results: BTreeMap<String, ReplayResult> = BTreeMap::new();
+
                 for (i, item) in result.trace_window.iter().enumerate() {
                     print!("  [{}] {} ... ", i, item.fn_name);
+
                     match replayer.replay(item, mode) {
                         Ok(replay_result) => {
+                            replayed_results.insert(item.fn_name.clone(), replay_result.clone());
                             if let Some(verified) = replay_result.execution_result.verified {
                                 if verified {
                                     println!("PROVED (verified)");
@@ -230,13 +232,6 @@ pub fn run(
                                 }
                             } else {
                                 println!("OK");
-                            }
-                            if let Some(output_matched) = replay_result.output_matched {
-                                if output_matched {
-                                    println!("      Output matches recorded trace");
-                                } else {
-                                    println!("      WARNING: Output differs from recorded trace!");
-                                }
                             }
                         }
                         Err(e) => {
@@ -258,12 +253,21 @@ pub fn run(
                             .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()))
                             .collect();
 
+                        let bits_packer = BitPacker(diff.bits_per_item);
+                        let window_fingerprint = bits_packer
+                            .get_range(
+                                diff.window_start_position,
+                                diff.window_start_position + 2,
+                                &fingerprint,
+                            )
+                            .expect("Failed to get window fingerprint");
+
                         let replay_result = replay_transitions(
                             &frontier,
                             &result.trace_window,
-                            fingerprint,
-                            diff.window_start_position,
+                            window_fingerprint,
                             diff.bits_per_item,
+                            &replayed_results,
                         );
 
                         if replay_result.failed_at_index.is_none() {
@@ -296,8 +300,6 @@ pub fn run(
                                 if let Some(ref output_type) = failed_item.output_type {
                                     println!("    Output type: {}", output_type);
                                 }
-                                println!("    Input data (base64): {}", failed_item.input_data);
-                                println!("    Output data (base64): {}", failed_item.output_data);
 
                                 // Show failure type
                                 if let Some(ref failure_type) = replay_result.failure_type {
@@ -456,101 +458,149 @@ fn replay_transitions(
     initial_frontier: &SerializableFrontier,
     trace_window: &[raster_core::trace::TraceItem],
     fingerprint: Vec<u64>,
-    window_start_position: usize,
     bits_per_item: usize,
+    replayed_results: &std::collections::BTreeMap<String, ReplayResult>,
 ) -> TransitionReplayResult {
     // Load the transition guest ELF from raster-prover
     let elf = TRANSITION_GUEST_ELF;
 
-    let mut current_frontier = initial_frontier.clone();
+    println!("transition elf");
+    println!("{:02X?}", elf);
+
+    let fingerprint_accumulator: FingerprintAccumulator =
+        FingerprintAccumulator::new(BitPacker(bits_per_item));
+    let current_frontier = initial_frontier.clone();
     let prover = default_prover();
+
+    let init_transition = InitTransitionState {
+        init_frontier: initial_frontier.clone(),
+        ref_fingerprint: FingerprintAccumulator::from(
+            fingerprint.clone(),
+            BitPacker(bits_per_item),
+            trace_window.len(),
+        ),
+    };
+    let init_state = TransitionState::Init(init_transition);
+
+    let mut transition_receipt: Option<Receipt> = None;
+    let current_state = init_state;
+    let mut current_journal: Option<TransitionJournal> = None;
 
     for (i, item) in trace_window.iter().enumerate() {
         print!("  [{}] transition {} ... ", i, item.fn_name);
 
+        println!("Current Frontier:");
+        let frontier_hex: String = current_frontier
+            .to_bytes()
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect();
+        println!("{}", frontier_hex);
+
+        println!("Current Hash");
+        let item_hash = item.hash();
+        let hash_hex: String = item_hash.iter().map(|b| format!("{:02x}", b)).collect();
+        println!("{}", hash_hex);
+
+        let Some(replay_result) = replayed_results.get(&item.fn_name) else {
+            panic!("Replayed IMAGE ID not found");
+        };
         // Create the input for this transition with fingerprint data
-        let input = TransitionInput::new(
-            current_frontier.clone(),
-            item.clone(),
-            fingerprint.clone(),
-            window_start_position + i,
-            bits_per_item,
-        );
+        let input = TransitionInput {
+            trace_item: item.clone(),
+            replay_image_id: replay_result.image_id.clone(),
+        };
+
+        // println!("Transition Input: ");
+        // println!("{:#?}", input);
+
+        let replay_receipt_bytes = replay_result.execution_result.receipt.clone().unwrap();
+        let replay_receipt: Receipt = postcard::from_bytes(&replay_receipt_bytes).unwrap();
 
         // Build the executor environment
-        let env = match ExecutorEnv::builder().write(&input) {
-            Ok(builder) => match builder.build() {
-                Ok(env) => env,
-                Err(e) => {
-                    println!("FAILED: {}", e);
-                    return TransitionReplayResult {
-                        verified_count: i,
-                        failed_at_index: Some(i),
-                        failure_type: Some(TransitionFailureType::ProvingError(e.to_string())),
-                    };
-                }
-            },
-            Err(e) => {
-                println!("FAILED: {}", e);
-                return TransitionReplayResult {
-                    verified_count: i,
-                    failed_at_index: Some(i),
-                    failure_type: Some(TransitionFailureType::ProvingError(e.to_string())),
-                };
-            }
+        let env = if let Some(journal) = current_journal {
+            let Some(transition_receipt) = transition_receipt else {
+                panic!("Transition receipt not found");
+            };
+            ExecutorEnv::builder()
+                .add_assumption(replay_receipt)
+                .add_assumption(transition_receipt)
+                .write(&input)
+                .unwrap()
+                .write(&current_state)
+                .unwrap()
+                .write(&journal)
+                .unwrap()
+                .build()
+                .unwrap()
+        } else {
+            ExecutorEnv::builder()
+                .add_assumption(replay_receipt)
+                .write(&input)
+                .unwrap()
+                .write(&current_state)
+                .unwrap()
+                .build()
+                .unwrap()
         };
 
         // Prove the transition
-        let prove_info = match prover.prove(env, elf) {
-            Ok(info) => info,
-            Err(e) => {
-                println!("FAILED: {}", e);
-                return TransitionReplayResult {
-                    verified_count: i,
-                    failed_at_index: Some(i),
-                    failure_type: Some(TransitionFailureType::ProvingError(e.to_string())),
-                };
-            }
-        };
+        let prove_info = prover.prove(env, elf).unwrap();
+
+        transition_receipt = Some(prove_info.receipt.clone());
 
         // Decode the output from the journal
-        let output: TransitionOutput = match prove_info.receipt.journal.decode() {
-            Ok(out) => out,
-            Err(e) => {
-                println!("FAILED: {}", e);
-                return TransitionReplayResult {
-                    verified_count: i,
-                    failed_at_index: Some(i),
-                    failure_type: Some(TransitionFailureType::ProvingError(e.to_string())),
-                };
-            }
-        };
+        let journal: TransitionJournal = prove_info.receipt.journal.decode().unwrap();
 
-        // Verify the item hash matches
-        if !output.verify_item_hash(item) {
-            println!("FAILED: item hash mismatch");
-            return TransitionReplayResult {
-                verified_count: i,
-                failed_at_index: Some(i),
-                failure_type: Some(TransitionFailureType::ItemHashMismatch),
-            };
-        }
+        current_journal = Some(journal.clone());
 
-        // Verify fingerprint
-        if !output.fingerprint_verified {
-            println!("FAILED: fingerprint mismatch");
-            return TransitionReplayResult {
-                verified_count: i,
-                failed_at_index: Some(i),
-                failure_type: Some(TransitionFailureType::FingerprintMismatch),
-            };
-        }
+        // // Verify the item hash matches
+        // if !output.verify_item_hash(item) {
+        //     println!("FAILED: item hash mismatch");
+        //     return TransitionReplayResult {
+        //         verified_count: i,
+        //         failed_at_index: Some(i),
+        //         failure_type: Some(TransitionFailureType::ItemHashMismatch),
+        //     };
+        // }
 
-        // Update the frontier for the next iteration
-        current_frontier = output.new_frontier;
+        // println!("Hash:");
+        // let hash_hex: String = output
+        //     .item_hash
+        //     .iter()
+        //     .map(|b| format!("{:02x}", b))
+        //     .collect();
+        // println!("{}", hash_hex);
+
+        // println!("Output Frontier:");
+        // let frontier_hex: String = output
+        //     .new_frontier
+        //     .to_bytes()
+        //     .iter()
+        //     .map(|b| format!("{:02x}", b))
+        //     .collect();
+        // println!("{}", frontier_hex);
+
+        // println!("Output Item Commitment:");
+        // let item_commitment_hex: String = output
+        //     .tree_root
+        //     .iter()
+        //     .map(|b| format!("{:02x}", b))
+        //     .collect();
+        // println!("{}", item_commitment_hex);
+
+        // // Update the frontier for the next iteration
+        // current_frontier = output.new_frontier;
+        // fingerprint_accumulator = output.current_fingerprint;
 
         println!("PROVED (fingerprint verified)");
     }
+
+    println!("Expected Fingerprint:");
+    fingerprint.print_binary();
+
+    println!("Final Fingerprint:");
+    fingerprint_accumulator.bits.print_binary();
 
     TransitionReplayResult {
         verified_count: trace_window.len(),

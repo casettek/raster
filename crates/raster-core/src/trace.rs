@@ -26,12 +26,12 @@ pub struct TraceItem {
     pub desc: Option<String>,
     /// Input parameter metadata (name and type for each parameter)
     pub inputs: Vec<TraceInputParam>,
-    /// Base64-encoded postcard-serialized input data
-    pub input_data: String,
+    /// Postcard-serialized input data
+    pub input_data: Vec<u8>,
     /// The return type as a string (e.g., "String", "Result<u64, Error>")
     pub output_type: Option<String>,
-    /// Base64-encoded postcard-serialized output data
-    pub output_data: String,
+    /// Postcard-serialized output data
+    pub output_data: Vec<u8>,
 }
 
 /// A complete execution trace.

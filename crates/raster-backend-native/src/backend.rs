@@ -10,7 +10,6 @@ use raster_backend::{
     ArtifactStore, Backend, CompilationArtifact, ExecutionMode, ResourceEstimate,
     TileExecutionResult,
 };
-use raster_core::ipc;
 use raster_core::{tile::TileMetadata, Error, Result};
 
 use serde::{Deserialize, Serialize};
@@ -45,6 +44,11 @@ impl CompilationArtifact for NativeCompilationArtifact {
 
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
+    }
+
+    fn artifact_id(&self) -> Vec<u8> {
+        // TODO: field used only for Risc0 backend
+        Vec::new()
     }
 }
 
@@ -290,75 +294,7 @@ impl Backend for NativeBackend {
         input: &[u8],
         mode: ExecutionMode,
     ) -> Result<TileExecutionResult> {
-        // Downcast to NativeExecutable
-        let native = compilation_artifact
-            .as_any()
-            .downcast_ref::<NativeCompilationArtifact>()
-            .ok_or_else(|| Error::Other("Expected NativeExecutable".into()))?;
-
-        // Native backend cannot generate proofs
-        if mode.generates_proof() {
-            return Err(Error::Other(
-                "Native backend does not support proof generation. Use the RISC0 backend.".into(),
-            ));
-        }
-
-        // Encode input as base64
-        let input_b64 = base64_encode(input);
-
-        // Run the binary with --raster-exec arguments
-        let output = Command::new(&native.binary_path)
-            .args(["--raster-exec", &native.tile_id, "--input", &input_b64])
-            .current_dir(".")
-            .output()
-            .map_err(|e| Error::Other(format!("Failed to execute binary: {}", e)))?;
-
-        if !output.status.success() {
-            return Err(Error::Other(format!(
-                "Tile execution failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            )));
-        }
-
-        // Parse output - look for RASTER_OUTPUT: line
-        let stdout = String::from_utf8_lossy(&output.stdout);
-
-        // Extract and pretty-print all RASTER_TRACE items
-        let mut output_b64: Option<&str> = None;
-        for line in stdout.lines() {
-            if let Some(result) = ipc::parse_trace_value(line) {
-                match result {
-                    Ok(trace_item) => {
-                        if let Ok(pretty) = serde_json::to_string_pretty(&trace_item) {
-                            println!("{}", pretty);
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("Failed to parse {}: {}", ipc::TRACE_PREFIX, e);
-                    }
-                }
-            } else if let Some(data) = ipc::parse_output(line) {
-                output_b64 = Some(data);
-            }
-        }
-
-        let output_b64 = output_b64.ok_or_else(|| {
-            Error::Other(format!(
-                "No {} found in tile output. stdout: {}",
-                ipc::OUTPUT_PREFIX,
-                stdout
-            ))
-        })?;
-
-        let output_bytes = base64_decode(output_b64)
-            .map_err(|e| Error::Other(format!("Failed to decode output: {}", e)))?;
-
-        // Return result with simulated cycles (native doesn't have real cycle counts)
-        let simulated_cycles = if self.simulate_cycles { 1000 } else { 0 };
-        Ok(TileExecutionResult::estimate(
-            output_bytes,
-            simulated_cycles,
-        ))
+        todo!("resturcture native backend");
     }
 
     fn artifact_store(&self) -> &dyn ArtifactStore {
@@ -381,16 +317,4 @@ impl Backend for NativeBackend {
             "Native backend does not support proof verification. Use the RISC0 backend.".into(),
         ))
     }
-}
-
-/// Encode bytes as base64 string.
-fn base64_encode(data: &[u8]) -> String {
-    use base64::Engine;
-    base64::engine::general_purpose::STANDARD.encode(data)
-}
-
-/// Decode base64 string to bytes.
-fn base64_decode(data: &str) -> std::result::Result<Vec<u8>, base64::DecodeError> {
-    use base64::Engine;
-    base64::engine::general_purpose::STANDARD.decode(data)
 }

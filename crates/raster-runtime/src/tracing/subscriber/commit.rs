@@ -1,10 +1,8 @@
 use std::io::Write;
 use std::sync::Mutex;
 
-use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use base64::Engine;
-use raster_core::trace::{TraceItem, TraceInputParam};
-use raster_prover::bit_packer::BitPacker;
+use raster_core::trace::{TraceInputParam, TraceItem};
+use raster_core::fingerprint::BitPacker;
 use raster_prover::precomputed::EMPTY_TRIE_NODES;
 use raster_prover::trace::TraceCommitmentProducer;
 
@@ -53,9 +51,9 @@ impl<W: Write + Send> Subscriber for CommitSubscriber<W> {
                     ty: ty.to_string(),
                 })
                 .collect(),
-            input_data: BASE64_STANDARD.encode(input),
+            input_data: input.to_vec(),
             output_type: output_type.map(|s| s.to_string()),
-            output_data: BASE64_STANDARD.encode(output),
+            output_data: output.to_vec(),
         };
 
         if let Ok(mut producer) = self.producer.lock() {

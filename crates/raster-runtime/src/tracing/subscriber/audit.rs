@@ -2,11 +2,9 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use base64::Engine;
 use raster_core::ipc;
 use raster_core::trace::{AuditDiff, AuditResult, TraceInputParam, TraceItem};
-use raster_prover::bit_packer::BitPacker;
+use raster_core::fingerprint::BitPacker;
 use raster_prover::precomputed::EMPTY_TRIE_NODES;
 use raster_prover::trace::{SerializableFrontier, TraceCommitmentProducer};
 
@@ -70,9 +68,9 @@ impl Subscriber for AuditSubscriber {
                     ty: ty.to_string(),
                 })
                 .collect(),
-            input_data: BASE64_STANDARD.encode(input),
+            input_data: input.to_vec(),
             output_type: output_type.map(|s| s.to_string()),
-            output_data: BASE64_STANDARD.encode(output),
+            output_data: output.to_vec(),
         };
 
         ipc::emit_trace(&item);

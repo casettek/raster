@@ -1,8 +1,6 @@
 use std::io::Write;
 use std::sync::Mutex;
 
-use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use base64::Engine;
 use raster_core::trace::{TraceInputParam, TraceItem};
 
 use crate::tracing::subscriber::Subscriber;
@@ -42,9 +40,9 @@ impl<W: Write + Send + Sync> Subscriber for JsonSubscriber<W> {
                     ty: ty.to_string(),
                 })
                 .collect(),
-            input_data: BASE64_STANDARD.encode(input),
+            input_data: input.to_vec(),
             output_type: output_type.map(|s| s.to_string()),
-            output_data: BASE64_STANDARD.encode(output),
+            output_data: output.to_vec(),
         };
 
         let mut writer_guard = self.writer.lock().expect("Writer mutex poisoned");

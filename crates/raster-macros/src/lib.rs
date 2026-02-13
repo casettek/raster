@@ -664,9 +664,6 @@ pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 ::raster::init();
             }
 
-            if ::raster::try_execute_tile_from_args() {
-                return;
-            }
 
             #input_parsing
 

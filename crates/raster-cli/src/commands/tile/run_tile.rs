@@ -1,12 +1,15 @@
+use raster_backend::ExecutionMode;
+use raster_compiler::builder::Builder;
+use raster_compiler::tile::TileDiscovery;
+use raster_compiler::Project;
 /// Run command: execute a tile with the specified backend.
 use raster_core::Result;
-use raster_backend::ExecutionMode;
-use raster_compiler::Project;
-use raster_compiler::tile::TileDiscovery;
-use raster_compiler::builder::Builder;
 
-use crate::{BackendType, commands::{create_backend, project_path}};
-use crate::commands::utils::encode::{decode_output, encode_input};
+use crate::utils::encode::{decode_output, encode_input};
+use crate::{
+    commands::{create_backend, project_path},
+    BackendType,
+};
 
 pub fn run_tile(
     backend_type: BackendType,

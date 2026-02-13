@@ -10,9 +10,8 @@
 //! - [`guest`] - RISC0 guest types for iterative trace verification
 //! - [`error`] - Error types for the library
 
-pub mod bit_packer;
 pub mod error;
-pub mod guest;
+pub mod transition;
 pub mod precomputed;
 pub mod trace;
 pub mod utils;

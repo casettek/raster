@@ -1,7 +1,5 @@
 //! Trace replayer for re-executing tiles with proof generation.
 
-use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use base64::Engine;
 use raster_backend::{Backend, ExecutionMode, TileExecutionResult};
 use raster_compiler::tile::TileDiscovery;
 use raster_compiler::Project;
@@ -17,11 +15,7 @@ pub struct ReplayResult {
     /// The execution result from the backend.
     pub execution_result: TileExecutionResult,
 
-    /// Whether the output matched the recorded output (if verification was requested).
-    /// - `Some(true)` if outputs match
-    /// - `Some(false)` if outputs differ
-    /// - `None` if output comparison was not performed
-    pub output_matched: Option<bool>,
+    pub image_id: Vec<u8>,
 }
 
 /// Replays trace items on a backend with proof generation.
@@ -62,12 +56,6 @@ impl<'a> TraceReplayer<'a> {
     /// # Returns
     /// A `ReplayResult` containing the execution result and optional output comparison.
     pub fn replay(&self, item: &TraceItem, mode: ExecutionMode) -> Result<ReplayResult> {
-        // 1. Decode input from base64
-        let input_bytes = BASE64_STANDARD
-            .decode(&item.input_data)
-            .map_err(|e| Error::Serialization(format!("Failed to decode input_data: {}", e)))?;
-
-        // 2. Look up tile by function name
         let discovery = TileDiscovery::new(self.project);
         let tile = discovery.get(&item.fn_name).ok_or_else(|| {
             Error::InvalidTileId(format!("Tile '{}' not found in project", item.fn_name))
@@ -79,25 +67,16 @@ impl<'a> TraceReplayer<'a> {
             .backend
             .compile_tile(&tile.to_metadata(), content_hash.as_deref())?;
 
+        let image_id = artifact.artifact_id();
         // 4. Execute with backend
         let exec_result = self
             .backend
-            .execute_tile(artifact.as_ref(), &input_bytes, mode)?;
-
-        // 5. Compare output if proof verification was requested
-        let output_matched = if mode.verifies_proof() {
-            let expected_output = BASE64_STANDARD.decode(&item.output_data).map_err(|e| {
-                Error::Serialization(format!("Failed to decode output_data: {}", e))
-            })?;
-            Some(exec_result.output == expected_output)
-        } else {
-            None
-        };
+            .execute_tile(artifact.as_ref(), &item.input_data, mode)?;
 
         Ok(ReplayResult {
             fn_name: item.fn_name.clone(),
             execution_result: exec_result,
-            output_matched,
+            image_id,
         })
     }
 
@@ -135,9 +114,8 @@ mod tests {
         let result = ReplayResult {
             fn_name: "test_fn".to_string(),
             execution_result: TileExecutionResult::estimate(vec![1, 2, 3], 1000),
-            output_matched: Some(true),
+            image_id: Vec::new(),
         };
         assert_eq!(result.fn_name, "test_fn");
-        assert!(result.output_matched.unwrap());
     }
 }

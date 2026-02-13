@@ -1,26 +1,24 @@
 //! Command implementations for the Raster CLI.
-mod utils;
 pub mod run;
 pub mod tile;
 
-use utils::encode::{decode_output, encode_input};
+use crate::utils::encode::{decode_output, encode_input};
 
 use crate::BackendType;
-use raster_core::{Error, Result};
 use raster_backend::{Backend, ExecutionMode};
 use raster_backend_native::NativeBackend;
 use raster_backend_risc0::Risc0Backend;
 use raster_compiler::sequence::{FlattenedStep, SequenceDiscovery};
 use raster_compiler::tile::TileDiscovery;
+use raster_core::{Error, Result};
 
 use raster_compiler::Project;
 use raster_compiler::{Builder, CfsBuilder};
 
+use raster_compiler::backend::BackendImpl;
 use std::env;
 use std::fs;
-use std::path::{PathBuf};
-use raster_compiler::backend::BackendImpl;
-
+use std::path::PathBuf;
 
 /// Get the output directory for artifacts.
 fn output_dir() -> PathBuf {
@@ -38,12 +36,12 @@ fn project_path() -> PathBuf {
 /// Create a backend instance.
 fn create_backend(backend_type: BackendType) -> Result<BackendImpl> {
     match backend_type {
-        BackendType::Native => {
-            Ok(BackendImpl::Native(NativeBackend::new().with_project_path(project_path())))
-        }
-        BackendType::Risc0 => {
-            Ok(BackendImpl::Risc0(Risc0Backend::new(output_dir()).with_user_crate(project_path())))
-        }
+        BackendType::Native => Ok(BackendImpl::Native(
+            NativeBackend::new().with_project_path(project_path()),
+        )),
+        BackendType::Risc0 => Ok(BackendImpl::Risc0(
+            Risc0Backend::new(output_dir()).with_user_crate(project_path()),
+        )),
         _ => return Err(Error::Other("Invalid backend type".into())),
     }
 }
@@ -72,10 +70,7 @@ pub fn build(backend_type: BackendType, tile: Option<String>) -> Result<()> {
     println!("Discovered {} tile(s) from source:", discovered_tiles.len());
     for t in &discovered_tiles {
         let metadata = t.to_metadata();
-        println!(
-            "  - {} ({})",
-            metadata.name, t.source_file().display()
-        );
+        println!("  - {} ({})", metadata.name, t.source_file().display());
     }
     println!();
 
@@ -110,7 +105,6 @@ pub fn build(backend_type: BackendType, tile: Option<String>) -> Result<()> {
     println!("Build complete!");
     Ok(())
 }
-
 
 /// Analyze command: analyze execution traces.
 pub fn analyze(trace_path: Option<String>) -> Result<()> {
@@ -209,7 +203,7 @@ pub fn run_sequence(
     tile_id: &str,
     input: Option<&str>,
     prove: bool,
-    verify: bool
+    verify: bool,
 ) -> Result<()> {
     let mode = match (prove, verify) {
         (_, true) => ExecutionMode::prove_and_verify(),
@@ -217,15 +211,17 @@ pub fn run_sequence(
         (false, false) => ExecutionMode::Estimate,
     };
 
-
     let project = Project::new(project_path())?;
 
     let tile_discovery = TileDiscovery::new(&project);
     let sequence_discovery = SequenceDiscovery::new(&project, &tile_discovery);
 
     let sequence = sequence_discovery.get(tile_id).unwrap();
-    
-    println!("Running sequence '{}' in preview mode...", sequence.function.name);
+
+    println!(
+        "Running sequence '{}' in preview mode...",
+        sequence.function.name
+    );
     println!();
 
     let backend = create_backend(backend_type)?;
@@ -356,7 +352,6 @@ fn format_number(n: u64) -> String {
     result
 }
 
-
 /// CFS command: generate control flow schema.
 pub fn cfs(output: Option<String>) -> Result<()> {
     println!("Generating control flow schema...");
@@ -365,14 +360,15 @@ pub fn cfs(output: Option<String>) -> Result<()> {
     let root = project_path();
 
     let project = Project::new(root)?;
-        // Build the CFS
+    // Build the CFS
     let cfs_builder = CfsBuilder::new(&project);
     let cfs = cfs_builder
         .build()
         .map_err(|e| Error::Other(format!("Failed to build CFS: {}", e)))?;
 
     // Serialize to JSON
-    let json = serde_json::to_string_pretty(&cfs).map_err(|e| Error::Other(format!("Failed to serialize CFS to JSON: {}", e)))?;
+    let json = serde_json::to_string_pretty(&cfs)
+        .map_err(|e| Error::Other(format!("Failed to serialize CFS to JSON: {}", e)))?;
 
     // Determine output path
     let output_path = match output {
