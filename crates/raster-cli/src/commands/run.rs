@@ -12,8 +12,10 @@ use raster_prover::trace::{
     BytesHashable, ExecutionCommitment, SerializableFrontier, TraceBridgeTree,
 };
 use raster_prover::transition::{
-    InitTransitionState, TransitionInput, TransitionJournal, TransitionState, TRANSITION_GUEST_ELF,
+    InitTransitionState, TransitionInput, TransitionJournal, TransitionState,
 };
+use raster_prover::{TRANSITION_GUEST_ELF, TRANSITION_GUEST_ID};
+
 use raster_prover::utils::DisplayBinary;
 use raster_tracing::{ReplayResult, TraceReplayer};
 use risc0_zkvm::{default_prover, ExecutorEnv, Receipt};
@@ -462,10 +464,6 @@ fn replay_transitions(
     replayed_results: &std::collections::BTreeMap<String, ReplayResult>,
 ) -> TransitionReplayResult {
     // Load the transition guest ELF from raster-prover
-    let elf = TRANSITION_GUEST_ELF;
-
-    println!("transition elf");
-    println!("{:02X?}", elf);
 
     let fingerprint_accumulator: FingerprintAccumulator =
         FingerprintAccumulator::new(BitPacker(bits_per_item));
@@ -480,11 +478,19 @@ fn replay_transitions(
             trace_window.len(),
         ),
     };
+    println!("init_transition fingerprint len: {}", init_transition.ref_fingerprint.len());
+    println!("{}", init_transition.ref_fingerprint);
+
     let init_state = TransitionState::Init(init_transition);
 
     let mut transition_receipt: Option<Receipt> = None;
-    let current_state = init_state;
+    let mut current_state = init_state;
     let mut current_journal: Option<TransitionJournal> = None;
+
+    let self_image_id: Vec<u8> = TRANSITION_GUEST_ID
+            .into_iter()
+            .flat_map(|val| val.to_le_bytes())
+            .collect();
 
     for (i, item) in trace_window.iter().enumerate() {
         print!("  [{}] transition {} ... ", i, item.fn_name);
@@ -517,14 +523,19 @@ fn replay_transitions(
         let replay_receipt_bytes = replay_result.execution_result.receipt.clone().unwrap();
         let replay_receipt: Receipt = postcard::from_bytes(&replay_receipt_bytes).unwrap();
 
+        
+
         // Build the executor environment
         let env = if let Some(journal) = current_journal {
+            println!("Next transition");
             let Some(transition_receipt) = transition_receipt else {
                 panic!("Transition receipt not found");
             };
             ExecutorEnv::builder()
                 .add_assumption(replay_receipt)
                 .add_assumption(transition_receipt)
+                .write(&self_image_id)
+                .unwrap()
                 .write(&input)
                 .unwrap()
                 .write(&current_state)
@@ -534,8 +545,11 @@ fn replay_transitions(
                 .build()
                 .unwrap()
         } else {
+            println!("Init transition");
             ExecutorEnv::builder()
                 .add_assumption(replay_receipt)
+                .write(&self_image_id)
+                .unwrap()
                 .write(&input)
                 .unwrap()
                 .write(&current_state)
@@ -545,7 +559,7 @@ fn replay_transitions(
         };
 
         // Prove the transition
-        let prove_info = prover.prove(env, elf).unwrap();
+        let prove_info = prover.prove(env, &TRANSITION_GUEST_ELF).unwrap();
 
         transition_receipt = Some(prove_info.receipt.clone());
 
@@ -553,6 +567,18 @@ fn replay_transitions(
         let journal: TransitionJournal = prove_info.receipt.journal.decode().unwrap();
 
         current_journal = Some(journal.clone());
+        current_state = journal.current_state.clone();
+        println!("Journal: {:?}", journal);
+
+        let next_state = match journal.current_state {
+            TransitionState::Next(next_state) => next_state,
+            TransitionState::Finished => panic!("Finished state"),
+            _ => panic!("Unknown state"),
+        };
+
+        println!("Next state fingerprint len: {}", next_state.fingerprint_acc.len());
+        println!("{}", next_state.fingerprint_acc);
+
 
         // // Verify the item hash matches
         // if !output.verify_item_hash(item) {
