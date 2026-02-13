@@ -493,20 +493,6 @@ fn replay_transitions(
             .collect();
 
     for (i, item) in trace_window.iter().enumerate() {
-        print!("  [{}] transition {} ... ", i, item.fn_name);
-
-        println!("Current Frontier:");
-        let frontier_hex: String = current_frontier
-            .to_bytes()
-            .iter()
-            .map(|b| format!("{:02x}", b))
-            .collect();
-        println!("{}", frontier_hex);
-
-        println!("Current Hash");
-        let item_hash = item.hash();
-        let hash_hex: String = item_hash.iter().map(|b| format!("{:02x}", b)).collect();
-        println!("{}", hash_hex);
 
         let Some(replay_result) = replayed_results.get(&item.fn_name) else {
             panic!("Replayed IMAGE ID not found");
@@ -517,14 +503,11 @@ fn replay_transitions(
             replay_image_id: replay_result.image_id.clone(),
         };
 
-        // println!("Transition Input: ");
-        // println!("{:#?}", input);
 
         let replay_receipt_bytes = replay_result.execution_result.receipt.clone().unwrap();
         let replay_receipt: Receipt = postcard::from_bytes(&replay_receipt_bytes).unwrap();
 
         
-
         // Build the executor environment
         let env = if let Some(journal) = current_journal {
             println!("Next transition");
@@ -568,58 +551,7 @@ fn replay_transitions(
 
         current_journal = Some(journal.clone());
         current_state = journal.current_state.clone();
-        println!("Journal: {:?}", journal);
 
-        let next_state = match journal.current_state {
-            TransitionState::Next(next_state) => next_state,
-            TransitionState::Finished => panic!("Finished state"),
-            _ => panic!("Unknown state"),
-        };
-
-        println!("Next state fingerprint len: {}", next_state.fingerprint_acc.len());
-        println!("{}", next_state.fingerprint_acc);
-
-
-        // // Verify the item hash matches
-        // if !output.verify_item_hash(item) {
-        //     println!("FAILED: item hash mismatch");
-        //     return TransitionReplayResult {
-        //         verified_count: i,
-        //         failed_at_index: Some(i),
-        //         failure_type: Some(TransitionFailureType::ItemHashMismatch),
-        //     };
-        // }
-
-        // println!("Hash:");
-        // let hash_hex: String = output
-        //     .item_hash
-        //     .iter()
-        //     .map(|b| format!("{:02x}", b))
-        //     .collect();
-        // println!("{}", hash_hex);
-
-        // println!("Output Frontier:");
-        // let frontier_hex: String = output
-        //     .new_frontier
-        //     .to_bytes()
-        //     .iter()
-        //     .map(|b| format!("{:02x}", b))
-        //     .collect();
-        // println!("{}", frontier_hex);
-
-        // println!("Output Item Commitment:");
-        // let item_commitment_hex: String = output
-        //     .tree_root
-        //     .iter()
-        //     .map(|b| format!("{:02x}", b))
-        //     .collect();
-        // println!("{}", item_commitment_hex);
-
-        // // Update the frontier for the next iteration
-        // current_frontier = output.new_frontier;
-        // fingerprint_accumulator = output.current_fingerprint;
-
-        println!("PROVED (fingerprint verified)");
     }
 
     println!("Expected Fingerprint:");
