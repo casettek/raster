@@ -7,15 +7,12 @@ repository.workspace = true
 authors.workspace = true
 
 
-
-
-[features]
-default = []
-# Enable risc0-zkvm host utilities for running/proving the transition guest
-risc0-host = ["dep:risc0-zkvm"]
+[build-dependencies]
+risc0-build = "1.2"
 
 [dependencies]
 raster-core = { workspace = true, features = ["std"] }
+
 bincode.workspace = true
 bridgetree.workspace = true
 hex.workspace = true
@@ -27,5 +24,9 @@ sha2.workspace = true
 serde.workspace = true
 postcard.workspace = true
 
-# Optional: RISC0 zkVM for host-side proving (not needed for type definitions)
-risc0-zkvm = { version = "1.2", optional = true }
+risc0-zkvm = { version = "1.2", default-features = false, features = ["prove", "std"] }
+
+[package.metadata.risc0]
+methods = ["guests/transition"]
+
+

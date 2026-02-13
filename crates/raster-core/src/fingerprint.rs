@@ -520,13 +520,29 @@ impl<'a, 'b> Iterator for Iter<'a, 'b> {
 /// }
 /// // packed now contains the bit-packed data
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct FingerprintAccumulator {
     pub bits_packer: BitPacker,
     pub bits: Vec<u64>,
     pub len: usize,
 }
 
+impl std::fmt::Display for FingerprintAccumulator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for bit in self.bits.iter() {
+            write!(f, "{:064b}", bit)?;
+        }
+        Ok(())
+    }
+}
+impl std::fmt::Debug for FingerprintAccumulator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for bit in self.bits.iter() {
+            write!(f, "{:064b}", bit)?;
+        }
+        Ok(())
+    }
+}
 impl FingerprintAccumulator {
     /// Create a new IterativeBitPacker starting at position 0.
     ///
@@ -593,8 +609,9 @@ impl FingerprintAccumulator {
         let item_u64 = u64::from_le_bytes(item_bytes);
 
         // Calculate which block(s) the item spans
-        let block_idx = self.bits_per_item() / 64;
-        let block_offset = self.bits_per_item() % 64;
+        let item_pos = self.len;
+        let block_idx = (item_pos * self.bits_per_item()) / 64;
+        let block_offset = (item_pos * self.bits_per_item()) % 64;
 
         // Ensure we have enough blocks (auto-grow)
         // We need at least block_idx + 1 blocks, and possibly block_idx + 2 if there's overflow
@@ -622,7 +639,7 @@ impl FingerprintAccumulator {
 
     /// Get the current number of items that have been packed.
     pub fn len(&self) -> usize {
-        self.len / self.bits_packer.bits_per_item()
+        self.len 
     }
 
     pub fn bits_per_item(&self) -> usize {
@@ -699,6 +716,30 @@ mod tests {
         let packed = bp.pack(&fingerprints);
 
         assert_eq!(expected_packed, packed);
+    }
+
+    #[test]
+    fn fingerprint_accumulator_push_matches_bit_packer_pack() {
+        let items: Vec<Vec<u8>> = vec![
+            vec![0b00000001u8; 32],
+            vec![0b00000011u8; 32],
+            vec![0b00000111u8; 32],
+        ];
+        let bp = BitPacker::new(8);
+        let expected = bp.pack(&items);
+        let fingerprint = FingerprintAccumulator{
+            bits_packer: bp,
+            bits: expected,
+            len: items.len(),
+        };
+
+        let mut acc = FingerprintAccumulator::new(bp);
+        for item in &items {
+            acc.push(item);
+        }
+
+        assert_eq!(acc.len(), 3);
+        assert_eq!(acc, fingerprint);
     }
 
     #[test]

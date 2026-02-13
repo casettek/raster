@@ -434,7 +434,6 @@ mod tests {
     /// Test that guest-style compute_root matches bridgetree's root for various frontiers.
     #[test]
     fn test_compute_root_matches_bridgetree() {
-        use bridgetree::Level;
 
         fn empty_at_level(level: u8) -> Vec<u8> {
             if level == 0 {

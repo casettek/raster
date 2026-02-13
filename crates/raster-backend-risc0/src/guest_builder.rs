@@ -241,6 +241,7 @@ impl GuestBuilder {
 
         for entry in rust_toolchains {
             let cargo = entry.path().join("bin").join("cargo");
+            println!("cargo: {}", cargo.display());
             if cargo.exists() {
                 return Some(cargo);
             }

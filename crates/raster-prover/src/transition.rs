@@ -15,11 +15,6 @@ use raster_core::fingerprint::FingerprintAccumulator;
 
 use crate::trace::SerializableFrontier;
 
-// Include the generated methods (ELF) from the build script.
-// This may not exist if the build failed or RISC0_SKIP_BUILD was set.
-#[cfg(not(feature = "skip-guest-build"))]
-include!(concat!(env!("OUT_DIR"), "/methods.rs"));
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransitionInput {
     pub trace_item: TraceItem,

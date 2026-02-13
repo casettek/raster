@@ -213,6 +213,8 @@ fn main() {
             )
             .expect("Failed to verify trace replay image id");
 
+            assert!(self_image_id == prev_journal.self_image_id, "Self image id does not match");
+
             let TransitionState::Next(prev_transition) = prev_journal.current_state else {
                 panic!("Provided Transition in Next State does not match the expected Transition State in Journal");
             };

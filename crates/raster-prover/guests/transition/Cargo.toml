@@ -8,14 +8,15 @@ edition = "2021"
 [dependencies]
 raster-core = { path = "../../../raster-core", features = ["std"] }
 
-bridgetree = "0.7"
-risc0-zkvm = "2.0.2"
-
+risc0-zkvm = "1.2"
 
 serde = { version = "1.0", features = ["derive"] }
 postcard = { version = "1.0", features = ["alloc"] }
+
 sha2 = "0.10"
 hex-literal = "1.1.0"
+
+bridgetree = "0.7"
 
 [profile.release]
 opt-level = 3
