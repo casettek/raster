@@ -1,3 +1,5 @@
+//! Error types for the raster-prover crate.
+
 use std::fmt;
 
 #[derive(Debug, Clone)]
@@ -22,7 +24,7 @@ pub enum BitPackerError {
     TreeRootError(String),
 }
 
-impl fmt::Display for BitPackerError  {
+impl fmt::Display for BitPackerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             BitPackerError::IndexOutOfBounds { index, max } => {

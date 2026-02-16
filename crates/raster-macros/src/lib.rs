@@ -567,10 +567,10 @@ pub fn sequence(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///     if ::raster::try_execute_tile_from_args() {
 ///         return;
 ///     }
-///     
+///
 ///     let name: String = ::raster::parse_main_input()
 ///         .expect("Failed to parse --input argument. Usage: --input '<json>'");
-///     
+///
 ///     let result = greet_sequence(name);
 ///     println!("{}", result);
 /// }
@@ -644,6 +644,7 @@ pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
             }
 
             let (commit_path, audit_path) = __parse_commit_audit();
+            // TODO: should be configurable value
             let bits = 16;
 
             // Initialize subscriber based on flags
@@ -663,9 +664,6 @@ pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 ::raster::init();
             }
 
-            if ::raster::try_execute_tile_from_args() {
-                return;
-            }
 
             #input_parsing
 

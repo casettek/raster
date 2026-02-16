@@ -7,9 +7,8 @@
 
 pub mod tracing;
 pub use tracing::{
-    finish, init, init_with,
-    __emit_trace,
+    __emit_trace, finish, init, init_with,
     subscriber::{
-        commit::CommitSubscriber, json::JsonSubscriber, audit::AuditSubscriber, Subscriber,
+        audit::AuditSubscriber, commit::CommitSubscriber, json::JsonSubscriber, Subscriber,
     },
 };

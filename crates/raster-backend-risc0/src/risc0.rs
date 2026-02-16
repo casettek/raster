@@ -5,6 +5,7 @@ use raster_backend::{
     ArtifactStore, Backend, CompilationArtifact, ExecutionMode, ResourceEstimate,
     TileExecutionResult,
 };
+use raster_core::postcard;
 use risc0_zkvm::{default_executor, ExecutorEnv, ProverOpts};
 use serde::{Deserialize, Serialize};
 use std::any::Any;
@@ -14,13 +15,13 @@ use std::path::{Path, PathBuf};
 
 use raster_core::{tile::TileMetadata, Error, Result};
 
-/// RISC0 executable - ELF binary and method ID.
+/// RISC0 executable - ELF binary and image ID.
 #[derive(Debug, Clone)]
 pub struct Risc0CompilationArtifact {
     /// The compiled guest ELF binary.
     pub elf: Vec<u8>,
-    /// The method ID (image ID) for the compiled tile.
-    pub method_id: Vec<u8>,
+    /// The image ID for the compiled tile.
+    pub image_id: Vec<u8>,
     /// The tile ID this executable is for.
     pub tile_id: String,
     /// Path where artifacts were written (if applicable).
@@ -30,6 +31,10 @@ pub struct Risc0CompilationArtifact {
 impl CompilationArtifact for Risc0CompilationArtifact {
     fn id(&self) -> &str {
         &self.tile_id
+    }
+
+    fn artifact_id(&self) -> Vec<u8> {
+        self.image_id.clone()
     }
 
     fn path(&self) -> &Path {
@@ -90,16 +95,13 @@ impl ArtifactStore for Risc0ArtifactStore {
         fs::write(artifact_dir.join("guest.elf"), &risc0.elf).map_err(Error::Io)?;
 
         // Write method ID (hex encoded)
-        fs::write(
-            artifact_dir.join("method_id"),
-            hex::encode(&risc0.method_id),
-        )
-        .map_err(Error::Io)?;
+        fs::write(artifact_dir.join("method_id"), hex::encode(&risc0.image_id))
+            .map_err(Error::Io)?;
 
         // Write manifest
         let manifest = Risc0Manifest {
             tile_id: risc0.tile_id.clone(),
-            method_id: hex::encode(&risc0.method_id),
+            method_id: hex::encode(&risc0.image_id),
             elf_size: risc0.elf.len(),
             source_hash: source_hash.map(String::from),
         };
@@ -132,7 +134,7 @@ impl ArtifactStore for Risc0ArtifactStore {
 
         Some(Box::new(Risc0CompilationArtifact {
             elf,
-            method_id,
+            image_id: method_id,
             tile_id: tile_id.to_string(),
             artifact_dir: Some(artifact_dir),
         }))
@@ -204,13 +206,19 @@ impl Backend for Risc0Backend {
         "risc0"
     }
 
-    fn compile_tile(&self, metadata: &TileMetadata, content_hash: Option<&str>) -> Result<Box<dyn CompilationArtifact>> {
+    fn compile_tile(
+        &self,
+        metadata: &TileMetadata,
+        content_hash: Option<&str>,
+    ) -> Result<Box<dyn CompilationArtifact>> {
         let tile_id = &metadata.id.0;
-        
 
         // TODO: move content hashing to the artifact store
         // Check cache first - RISC0 builds are expensive, so caching is important
-        if let Some(cached) = self.artifact_store.load(tile_id, &self.output_dir, content_hash) {
+        if let Some(cached) = self
+            .artifact_store
+            .load(tile_id, &self.output_dir, content_hash)
+        {
             return Ok(cached);
         }
 
@@ -244,21 +252,19 @@ impl Backend for Risc0Backend {
         // Create the artifact
         let artifact = Risc0CompilationArtifact {
             elf,
-            method_id: method_id.as_bytes().to_vec(),
+            image_id: method_id.as_bytes().to_vec(),
             tile_id: tile_id.to_string(),
             artifact_dir: None, // Will be set after saving
         };
 
         // Save to cache for future builds
-        let artifact_dir = self.artifact_store.save(
-            &artifact,
-            &self.output_dir,
-            content_hash,
-        )?;
+        let artifact_dir = self
+            .artifact_store
+            .save(&artifact, &self.output_dir, content_hash)?;
 
         Ok(Box::new(Risc0CompilationArtifact {
             elf: artifact.elf,
-            method_id: artifact.method_id,
+            image_id: artifact.image_id,
             tile_id: artifact.tile_id,
             artifact_dir: Some(artifact_dir),
         }))
@@ -323,7 +329,7 @@ impl Backend for Risc0Backend {
                 };
 
                 // Serialize the receipt
-                let receipt_bytes = bincode::serialize(&receipt)
+                let receipt_bytes = postcard::to_allocvec(&receipt)
                     .map_err(|e| Error::Other(format!("Failed to serialize receipt: {}", e)))?;
 
                 Ok(TileExecutionResult::proved(
@@ -358,7 +364,7 @@ impl Backend for Risc0Backend {
             .downcast_ref::<Risc0CompilationArtifact>()
             .ok_or_else(|| Error::Other("Expected Risc0Executable".into()))?;
 
-        let receipt: risc0_zkvm::Receipt = bincode::deserialize(receipt_bytes)
+        let receipt: risc0_zkvm::Receipt = postcard::from_bytes(receipt_bytes)
             .map_err(|e| Error::Other(format!("Failed to deserialize receipt: {}", e)))?;
 
         let image_id = risc0_zkvm::compute_image_id(&risc0.elf)

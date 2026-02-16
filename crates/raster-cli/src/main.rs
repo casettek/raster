@@ -3,6 +3,7 @@
 //! Provides commands for building, running, and analyzing Raster tiles.
 
 mod commands;
+mod utils;
 
 use clap::{Parser, ValueEnum};
 use raster_core::Result;
@@ -168,8 +169,16 @@ fn main() -> Result<()> {
             verify,
         } => commands::run_sequence(backend, &sequence, input.as_deref(), prove, verify),
         Commands::Cfs { output } => commands::cfs(output),
-        Commands::Run { backend, input, commit, audit } => {
-            commands::run::run(backend, input.as_deref(), commit.as_deref(), audit.as_deref())
-        }
+        Commands::Run {
+            backend,
+            input,
+            commit,
+            audit,
+        } => commands::run::run(
+            backend,
+            input.as_deref(),
+            commit.as_deref(),
+            audit.as_deref(),
+        ),
     }
 }

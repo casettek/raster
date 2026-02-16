@@ -1,0 +1,23 @@
+[package]
+name = "transition-guest"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+raster-core = { path = "../../../raster-core", features = ["std"] }
+
+risc0-zkvm = "1.2"
+
+serde = { version = "1.0", features = ["derive"] }
+postcard = { version = "1.0", features = ["alloc"] }
+
+sha2 = "0.10"
+hex-literal = "1.1.0"
+
+bridgetree = "0.7"
+
+[profile.release]
+opt-level = 3
+lto = true

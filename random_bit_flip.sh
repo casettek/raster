@@ -26,25 +26,29 @@ if [ "$FILE_SIZE" -eq 0 ]; then
     exit 1
 fi
 
-# 2. Pick a random byte offset (0 to FILE_SIZE - 1)
-BYTE_OFFSET=$(( RANDOM % FILE_SIZE ))
-
-# 3. Pick a random bit position (0 to 7)
-BIT_OFFSET=$(( RANDOM % 8 ))
-
-echo "Targeting byte $BYTE_OFFSET, bit $BIT_OFFSET..."
-
-# 4. Use Perl to flip the bit at that specific location
-# Open file for read+write, seek to byte, read it, XOR to flip bit, write back
+# 2. Use Perl to pick random (byte, bit) until bit is 1, then clear it
 perl -e '
-    my ($file, $byte_offset, $bit_offset) = @ARGV;
+    my ($file, $file_size) = @ARGV;
+    $file_size = int($file_size);
     open(my $fh, "+<:raw", $file) or die "Cannot open $file: $!";
-    seek($fh, $byte_offset, 0) or die "Cannot seek: $!";
-    read($fh, my $byte, 1) or die "Cannot read: $!";
-    my $new_byte = chr(ord($byte) ^ (1 << $bit_offset));
-    seek($fh, $byte_offset, 0) or die "Cannot seek back: $!";
-    print $fh $new_byte;
+    my $max_attempts = 10000;
+    for my $attempt (1 .. $max_attempts) {
+        my $byte_offset = int(rand($file_size));
+        my $bit_offset = int(rand(8));
+        seek($fh, $byte_offset, 0) or die "Cannot seek: $!";
+        read($fh, my $byte, 1) or die "Cannot read: $!";
+        my $ord = ord($byte);
+        if (($ord >> $bit_offset) & 1) {
+            my $new_byte = chr($ord & ~(1 << $bit_offset));
+            seek($fh, $byte_offset, 0) or die "Cannot seek back: $!";
+            print $fh $new_byte;
+            close($fh);
+            print "Disabled bit at byte $byte_offset, bit $bit_offset.\n";
+            exit 0;
+        }
+    }
     close($fh);
-' "$FILE" "$BYTE_OFFSET" "$BIT_OFFSET"
+    die "No set bit found after $max_attempts attempts.\n";
+' "$FILE" "$FILE_SIZE"
 
-echo "Bit flipped successfully in $FILE."
+echo "Bit disabled successfully in $FILE."

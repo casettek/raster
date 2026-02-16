@@ -3,7 +3,48 @@
 //! This module provides the `BitPacker` type for packing hash bits into
 //! compact fingerprints that can be efficiently compared.
 
-use crate::error::{BitPackerError, Result};
+use std::fmt;
+use std::result::Result;
+use std::string::String;
+use std::vec;
+use std::vec::Vec;
+
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone)]
+pub enum BitPackerError {
+    /// BitPacker index is out of bounds.
+    IndexOutOfBounds { index: usize, max: usize },
+    /// Invalid range for BitPacker operations.
+    InvalidRange {
+        start: usize,
+        end: usize,
+        max: usize,
+    },
+    /// Arrays have different lengths in comparison.
+    LengthMismatch { expected: usize, actual: usize },
+    /// Failed to serialize data.
+    SerializationError(String),
+}
+
+impl fmt::Display for BitPackerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            BitPackerError::IndexOutOfBounds { index, max } => {
+                write!(f, "Index {} out of bounds (max: {})", index, max)
+            }
+            BitPackerError::InvalidRange { start, end, max } => {
+                write!(f, "Invalid range [{}, {}) for max {}", start, end, max)
+            }
+            BitPackerError::LengthMismatch { expected, actual } => {
+                write!(f, "Length mismatch: expected {}, got {}", expected, actual)
+            }
+            BitPackerError::SerializationError(msg) => {
+                write!(f, "Serialization error: {}", msg)
+            }
+        }
+    }
+}
 
 /// Trait for cropping byte vectors to a specific bit length.
 pub trait Crop {
@@ -24,7 +65,7 @@ impl Crop for Vec<u8> {
             if let Some(first) = cropped.iter_mut().last() {
                 *first &= rem_mask;
             }
-        } 
+        }
 
         cropped
     }
@@ -38,13 +79,13 @@ impl Crop for Vec<u8> {
 /// # Example
 ///
 /// ```
-/// use bphc::bit_packer::BitPacker;
+/// use raster_core::fingerprint::BitPacker;
 ///
 /// let bp = BitPacker::new(8); // 8 bits per item
 /// let hashes = vec![vec![0u8; 32], vec![1u8; 32]];
 /// let packed = bp.pack(&hashes);
 /// ```
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
 pub struct BitPacker(pub usize);
 
 impl BitPacker {
@@ -104,7 +145,7 @@ impl BitPacker {
     /// Try to get a value at the specified index.
     ///
     /// Returns an error if the index is out of bounds.
-    pub fn try_get(&self, index: usize, packed: &[u64]) -> Result<u64> {
+    pub fn try_get(&self, index: usize, packed: &[u64]) -> Result<u64, BitPackerError> {
         let mut value = 0u64;
 
         let value_start_offset = index * self.0;
@@ -120,10 +161,12 @@ impl BitPacker {
         }
 
         let intra_block_start_index = value_start_offset % 64;
-        let block = packed.get(block_index).ok_or(BitPackerError::IndexOutOfBounds {
-            index: block_index,
-            max: packed.len(),
-        })?;
+        let block = packed
+            .get(block_index)
+            .ok_or(BitPackerError::IndexOutOfBounds {
+                index: block_index,
+                max: packed.len(),
+            })?;
 
         let block_end_offset = ((block_index + 1) * 64) - 1;
         let block_value_bit_len = self.0 - value_end_offset.saturating_sub(block_end_offset);
@@ -133,10 +176,13 @@ impl BitPacker {
 
         if value_end_offset.saturating_sub(block_end_offset) > 0 {
             let next_block_index = block_index + 1;
-            let next_block = packed.get(next_block_index).ok_or(BitPackerError::IndexOutOfBounds {
-                index: next_block_index,
-                max: packed.len(),
-            })?;
+            let next_block =
+                packed
+                    .get(next_block_index)
+                    .ok_or(BitPackerError::IndexOutOfBounds {
+                        index: next_block_index,
+                        max: packed.len(),
+                    })?;
 
             let next_block_value_bit_len = self.0 - block_value_bit_len;
             let mask = (1u64 << next_block_value_bit_len) - 1u64;
@@ -157,7 +203,12 @@ impl BitPacker {
     /// Try to get a range of packed values.
     ///
     /// Returns an error if the range is invalid.
-    pub fn try_get_range(&self, start: usize, end: usize, packed: &[u64]) -> Result<Vec<u64>> {
+    pub fn try_get_range(
+        &self,
+        start: usize,
+        end: usize,
+        packed: &[u64],
+    ) -> Result<Vec<u64>, BitPackerError> {
         if start >= end {
             return Err(BitPackerError::InvalidRange {
                 start,
@@ -215,10 +266,29 @@ impl BitPacker {
         self.try_diff(l_bits, r_bits).ok().flatten()
     }
 
+    pub fn diff_at_index(&self, index: usize, l_bits: &[u64], r_bits: &[u64]) -> bool {
+        self.try_diff_at_index(index, l_bits, r_bits).unwrap()
+    }
+
+    pub fn try_diff_at_index(&self, index: usize, l_bits: &[u64], r_bits: &[u64]) -> Result<bool, BitPackerError> {
+        let l_value = self.try_get(index, l_bits)?;
+        let r_value = self.try_get(index, r_bits)?;
+
+        if l_value != r_value {
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
+
     /// Try to find the first difference between two packed arrays.
     ///
     /// Returns an error if the arrays have different lengths.
-    pub fn try_diff(&self, l_bits: &[u64], r_bits: &[u64]) -> Result<Option<(usize, u64, u64)>> {
+    pub fn try_diff(
+        &self,
+        l_bits: &[u64],
+        r_bits: &[u64],
+    ) -> Result<Option<(usize, u64, u64)>, BitPackerError> {
         if l_bits.len() != r_bits.len() {
             return Err(BitPackerError::LengthMismatch {
                 expected: l_bits.len(),
@@ -236,8 +306,8 @@ impl BitPacker {
                 if self_byte != other_byte {
                     for bit in 0..8 {
                         if (self_byte >> bit & 1u8) != (other_byte >> bit & 1u8) {
-                            let diff_bit = bit + (byte_num * 8) + (i * 64);
-                            let diff_pos = diff_bit / self.0;
+                            let diff_bit_index = bit + (byte_num * 8) + (i * 64);
+                            let diff_pos = diff_bit_index / self.0;
 
                             let l_value = self.try_get(diff_pos, l_bits)?;
                             let r_value = self.try_get(diff_pos, r_bits)?;
@@ -278,19 +348,19 @@ pub struct Iter<'a, 'b> {
 /// # Example
 ///
 /// ```
-/// use bphc::bit_packer::StreamingBitPacker;
+/// use raster_core::fingerprint::StreamingBitPacker;
 ///
 /// let mut emitted_blocks = Vec::new();
 /// {
 ///     let mut packer = StreamingBitPacker::new(8, |block| {
 ///         emitted_blocks.push(block);
 ///     });
-///     
+///
 ///     // Push 8 items of 8 bits each = 64 bits = 1 full block
 ///     for i in 0..8u8 {
 ///         packer.push(&[i]);
 ///     }
-///     
+///
 ///     // Get remaining blocks
 ///     let (remaining0, remaining1) = packer.finish();
 /// }
@@ -430,6 +500,154 @@ impl<'a, 'b> Iterator for Iter<'a, 'b> {
     }
 }
 
+/// Iterative bit packer that writes directly into a Vec<u64>.
+///
+/// Unlike `BitPacker` which requires all items upfront, `IterativeBitPacker`
+/// allows adding items one at a time to an existing Vec, tracking the position
+/// automatically.
+///
+/// # Example
+///
+/// ```
+/// use raster_core::fingerprint::IterativeBitPacker;
+///
+/// let mut packed = Vec::new();
+/// {
+///     let mut packer = IterativeBitPacker::new(8, &mut packed);
+///     packer.push(&[1u8]);
+///     packer.push(&[2u8]);
+///     packer.push(&[3u8]);
+/// }
+/// // packed now contains the bit-packed data
+/// ```
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
+pub struct FingerprintAccumulator {
+    pub bits_packer: BitPacker,
+    pub bits: Vec<u64>,
+    pub len: usize,
+}
+
+impl std::fmt::Display for FingerprintAccumulator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for bit in self.bits.iter() {
+            write!(f, "{:064b}", bit)?;
+        }
+        Ok(())
+    }
+}
+impl std::fmt::Debug for FingerprintAccumulator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for bit in self.bits.iter() {
+            write!(f, "{:064b}", bit)?;
+        }
+        Ok(())
+    }
+}
+
+impl FingerprintAccumulator {
+    /// Create a new IterativeBitPacker starting at position 0.
+    ///
+    /// # Arguments
+    ///
+    /// * `bits_per_item` - Number of bits to use per item (must be between 1 and 64)
+    /// * `packed` - Mutable reference to the Vec<u64> to write into
+    ///
+    /// # Panics
+    ///
+    /// Panics if `bits_per_item` is 0 or greater than 64.
+    pub fn new(bits_packer: BitPacker) -> Self {
+        Self {
+            bits_packer,
+            bits: Vec::new(),
+            len: 0,
+        }
+    }
+
+    pub fn diff_at_index(&self, index: usize, other: &Self) -> bool {
+        assert!(self.len() > index && other.len() > index, "Index out of bounds");
+
+        self.bits_packer.diff_at_index(index, &self.bits, &other.bits)
+    }
+
+
+    /// Create a new IterativeBitPacker starting at a given item offset.
+    ///
+    /// This is useful for appending to existing packed data.
+    ///
+    /// # Arguments
+    ///
+    /// * `bits_per_item` - Number of bits to use per item (must be between 1 and 64)
+    /// * `packed` - Mutable reference to the Vec<u64> to write into
+    /// * `item_offset` - The item index to start writing from
+    ///
+    /// # Panics
+    ///
+    /// Panics if `bits_per_item` is 0 or greater than 64.
+    pub fn from(bits: Vec<u64>, bits_packer: BitPacker, len: usize) -> Self {
+        Self {
+            bits_packer,
+            bits,
+            len,
+        }
+    }
+
+    /// Push an item into the packer.
+    ///
+    /// The item is cropped to `bits_per_item` bits and packed into the current
+    /// position. The Vec is automatically grown if needed.
+    ///
+    /// # Arguments
+    ///
+    /// * `item` - The bytes to pack (will be cropped to `bits_per_item` bits)
+    pub fn push(&mut self, item: &[u8]) {
+        // Crop the item to the specified number of bits
+        let cropped = item.to_vec().crop(self.bits_per_item());
+
+        // Convert cropped bytes to u64 (little-endian)
+        let mut item_bytes = [0u8; 8];
+        let bytes_len = cropped.len().min(8);
+        item_bytes[..bytes_len].copy_from_slice(&cropped[..bytes_len]);
+        let item_u64 = u64::from_le_bytes(item_bytes);
+
+        // Calculate which block(s) the item spans
+        let item_pos = self.len;
+        let block_idx = (item_pos * self.bits_per_item()) / 64;
+        let block_offset = (item_pos * self.bits_per_item()) % 64;
+
+        // Ensure we have enough blocks (auto-grow)
+        // We need at least block_idx + 1 blocks, and possibly block_idx + 2 if there's overflow
+        let overflow = (block_offset + self.bits_packer.bits_per_item()).saturating_sub(64);
+        let required_blocks = if overflow != 0 {
+            block_idx + 2
+        } else {
+            block_idx + 1
+        };
+
+        if self.bits.len() < required_blocks {
+            self.bits.resize(required_blocks, 0u64);
+        }
+
+        // Pack the bits (same logic as BitPacker::pack)
+        self.bits[block_idx] |= item_u64 << block_offset;
+
+        if overflow != 0 {
+            self.bits[block_idx + 1] |= item_u64 >> (self.bits_packer.bits_per_item() - overflow);
+        }
+
+        // Advance bit offset
+        self.len += 1;
+    }
+
+    /// Get the current number of items that have been packed.
+    pub fn len(&self) -> usize {
+        self.len 
+    }
+
+    pub fn bits_per_item(&self) -> usize {
+        self.bits_packer.bits_per_item()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -499,6 +717,30 @@ mod tests {
         let packed = bp.pack(&fingerprints);
 
         assert_eq!(expected_packed, packed);
+    }
+
+    #[test]
+    fn fingerprint_accumulator_push_matches_bit_packer_pack() {
+        let items: Vec<Vec<u8>> = vec![
+            vec![0b00000001u8; 32],
+            vec![0b00000011u8; 32],
+            vec![0b00000111u8; 32],
+        ];
+        let bp = BitPacker::new(8);
+        let expected = bp.pack(&items);
+        let fingerprint = FingerprintAccumulator{
+            bits_packer: bp,
+            bits: expected,
+            len: items.len(),
+        };
+
+        let mut acc = FingerprintAccumulator::new(bp);
+        for item in &items {
+            acc.push(item);
+        }
+
+        assert_eq!(acc.len(), 3);
+        assert_eq!(acc, fingerprint);
     }
 
     #[test]
@@ -1018,5 +1260,178 @@ mod tests {
     #[should_panic(expected = "bits_per_item must be between 1 and 64")]
     fn streaming_panics_on_too_many_bits() {
         let _ = StreamingBitPacker::new(65, |_| {});
+    }
+
+    // IterativeBitPacker tests
+
+    #[test]
+    fn iterative_matches_bitpacker_pack_8bit() {
+        // Test that iterative produces the same result as batch packing
+        let fingerprints: Vec<Vec<u8>> = (0..12u8).map(|n| [n; 32].to_vec()).collect();
+
+        let bp = BitPacker(8);
+        let expected_packed = bp.pack(&fingerprints);
+
+        let mut fingerprint_accumulator = FingerprintAccumulator::new(BitPacker(8));
+        for fp in &fingerprints {
+            fingerprint_accumulator.push(fp);
+        }
+
+        assert_eq!(fingerprint_accumulator.bits, expected_packed);
+    }
+
+    #[test]
+    fn iterative_matches_bitpacker_pack_9bit() {
+        // Test with 9-bit items that span across block boundaries
+        let fingerprints: Vec<Vec<u8>> = vec![
+            [0b00000000u8; 32].to_vec(),
+            [0b11111111u8; 32].to_vec(),
+            [0b00000000u8; 32].to_vec(),
+            [0b11111111u8; 32].to_vec(),
+            [0b00000000u8; 32].to_vec(),
+            [0b11111111u8; 32].to_vec(),
+            [0b00000000u8; 32].to_vec(),
+            [0b11111111u8; 32].to_vec(),
+            [0b00000000u8; 32].to_vec(),
+            [0b11111111u8; 32].to_vec(),
+            [0b00000000u8; 32].to_vec(),
+            [0b11111111u8; 32].to_vec(),
+        ];
+
+        let bp = BitPacker(9);
+        let expected_packed = bp.pack(&fingerprints);
+
+        let mut fingerprint_accumulator = FingerprintAccumulator::new(BitPacker(9));
+        for fp in &fingerprints {
+            fingerprint_accumulator.push(fp);
+        }
+
+        assert_eq!(fingerprint_accumulator.bits, expected_packed);
+    }
+
+    #[test]
+    fn iterative_matches_bitpacker_various_sizes() {
+        // Test various bit sizes
+        for bits_per_item in [1, 2, 4, 7, 8, 9, 15, 16, 17, 32, 63, 64] {
+            let fingerprints: Vec<Vec<u8>> = (0..20u8).map(|n| [n; 32].to_vec()).collect();
+
+            let bp = BitPacker(bits_per_item);
+            let expected_packed = bp.pack(&fingerprints);
+
+            let mut fingerprint_accumulator = FingerprintAccumulator::new(BitPacker(bits_per_item));
+            for fp in &fingerprints {
+                fingerprint_accumulator.push(fp);
+            }
+
+            assert_eq!(
+                fingerprint_accumulator.bits, expected_packed,
+                "Mismatch for bits_per_item={}",
+                bits_per_item
+            );
+        }
+    }
+
+    #[test]
+    fn iterative_append_with_offset() {
+        // Test appending to existing packed data using with_offset
+        let fingerprints_first: Vec<Vec<u8>> = (0..8u8).map(|n| [n; 32].to_vec()).collect();
+        let fingerprints_second: Vec<Vec<u8>> = (8..16u8).map(|n| [n; 32].to_vec()).collect();
+        let fingerprints_all: Vec<Vec<u8>> = (0..16u8).map(|n| [n; 32].to_vec()).collect();
+
+        let bp = BitPacker(8);
+        let expected_packed = bp.pack(&fingerprints_all);
+
+        // First, pack the first batch
+        let mut fingerprint_accumulator = FingerprintAccumulator::new(BitPacker(8));
+        for fp in &fingerprints_first {
+            fingerprint_accumulator.push(fp);
+        }
+
+        // Then, append the second batch using with_offset
+        let mut fingerprint_accumulator =
+            FingerprintAccumulator::from(fingerprint_accumulator.bits, BitPacker(8), 8);
+        for fp in &fingerprints_second {
+            fingerprint_accumulator.push(fp);
+        }
+
+        assert_eq!(fingerprint_accumulator.bits, expected_packed);
+    }
+
+    #[test]
+    fn iterative_append_with_offset_9bit() {
+        // Test appending with 9-bit items (spans block boundaries)
+        let fingerprints_first: Vec<Vec<u8>> = (0..7u8).map(|n| [n; 32].to_vec()).collect();
+        let fingerprints_second: Vec<Vec<u8>> = (7..14u8).map(|n| [n; 32].to_vec()).collect();
+        let fingerprints_all: Vec<Vec<u8>> = (0..14u8).map(|n| [n; 32].to_vec()).collect();
+
+        let bp = BitPacker(9);
+        let expected_packed = bp.pack(&fingerprints_all);
+
+        // First, pack the first batch
+        let mut fingerprint_accumulator = FingerprintAccumulator::new(BitPacker(9));
+        for fp in &fingerprints_first {
+            fingerprint_accumulator.push(fp);
+        }
+
+        // Then, append the second batch using with_offset
+        let mut fingerprint_accumulator =
+            FingerprintAccumulator::from(fingerprint_accumulator.bits, BitPacker(9), 7);
+        for fp in &fingerprints_second {
+            fingerprint_accumulator.push(fp);
+        }
+
+        assert_eq!(fingerprint_accumulator.bits, expected_packed);
+    }
+
+    #[test]
+    fn iterative_auto_grow_vec() {
+        // Push 8 items = 64 bits = 1 block
+        let mut fingerprint_accumulator = FingerprintAccumulator::new(BitPacker(8));
+        for i in 0..8u8 {
+            fingerprint_accumulator.push(&[i]);
+        }
+        assert_eq!(fingerprint_accumulator.bits.len(), 1);
+
+        // Push 8 more items = 64 more bits = 2 blocks total
+        let mut fingerprint_accumulator =
+            FingerprintAccumulator::from(fingerprint_accumulator.bits, BitPacker(8), 8);
+        for i in 8..16u8 {
+            fingerprint_accumulator.push(&[i]);
+        }
+        assert_eq!(fingerprint_accumulator.bits.len(), 2);
+    }
+
+    #[test]
+    fn iterative_item_count() {
+        let mut fingerprint_accumulator = FingerprintAccumulator::new(BitPacker(8));
+        assert_eq!(fingerprint_accumulator.bits.len(), 0);
+
+        fingerprint_accumulator.push(&[1]);
+        assert_eq!(fingerprint_accumulator.bits.len(), 1);
+
+        fingerprint_accumulator.push(&[2]);
+        assert_eq!(fingerprint_accumulator.bits.len(), 2);
+
+        for _ in 0..10 {
+            fingerprint_accumulator.push(&[0]);
+        }
+        assert_eq!(fingerprint_accumulator.bits.len(), 12);
+    }
+
+    #[test]
+    fn iterative_bits_per_item_accessor() {
+        let fingerprint_accumulator = FingerprintAccumulator::new(BitPacker(9));
+        assert_eq!(fingerprint_accumulator.bits_packer.bits_per_item(), 9);
+
+        let fingerprint_accumulator2 = FingerprintAccumulator::new(BitPacker(16));
+        assert_eq!(fingerprint_accumulator2.bits_packer.bits_per_item(), 16);
+    }
+
+    #[test]
+    fn iterative_empty_vec() {
+        // Test with no items pushed
+        let fingerprint_accumulator = FingerprintAccumulator::new(BitPacker(8));
+        assert_eq!(fingerprint_accumulator.bits.len(), 0);
+        assert_eq!(fingerprint_accumulator.bits.len(), 0);
     }
 }

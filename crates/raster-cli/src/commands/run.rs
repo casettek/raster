@@ -1,7 +1,24 @@
 //! Run command: build and execute the user program as a whole.
 
 use crate::BackendType;
+
+use raster_backend::ExecutionMode;
+use raster_backend_risc0::Risc0Backend;
+use raster_compiler::Project;
+use raster_core::fingerprint::BitPacker;
+use raster_core::ipc::{self, IpcMessage};
+use raster_core::trace::AuditResult;
+use raster_core::trace::TraceItem;
 use raster_core::{Error, Result};
+
+use raster_prover::replay::{ReplayResult, Replayer};
+
+use raster_prover::trace::{
+    BytesHashable, ExecutionCommitment, SerializableFrontier, TraceBridgeTree,
+};
+use raster_prover::transition::{replay_transitions, TransitionJournal};
+
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
@@ -22,16 +39,13 @@ pub fn run(
     }
 
     let project_path = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-
-    // Extract binary name from Cargo.toml
-    let binary_name = extract_binary_name(&project_path)
-        .ok_or_else(|| Error::Other("Could not determine binary name from Cargo.toml".into()))?;
+    let project = Project::new(project_path).expect("Failed to read project");
 
     println!("Building project...");
 
     // Build the project with cargo build --release
     let build_status = Command::new("cargo")
-        .current_dir(&project_path)
+        .current_dir(&project.root_dir)
         .args(["build", "--release"])
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -42,9 +56,7 @@ pub fn run(
         return Err(Error::Other("cargo build failed".into()));
     }
 
-    // Find the target directory using cargo metadata
-    let target_dir = find_target_path(&project_path).unwrap_or_else(|| project_path.join("target"));
-    let binary_path = target_dir.join("release").join(&binary_name);
+    let binary_path = project.target_dir.join("release").join(&project.name);
 
     if !binary_path.exists() {
         return Err(Error::Other(format!(
@@ -54,12 +66,12 @@ pub fn run(
     }
 
     println!();
-    println!("Running {}...", binary_name);
+    println!("Running {}...", &project.name);
     println!();
 
     // Build command with optional input argument
     let mut cmd = Command::new(&binary_path);
-    cmd.current_dir(&project_path);
+    cmd.current_dir(&project.root_dir);
 
     if let Some(input_json) = input {
         cmd.args(["--input", input_json]);
@@ -81,22 +93,30 @@ pub fn run(
         let stderr = String::from_utf8_lossy(&output.stderr);
         println!("stderr: {}", stderr);
 
-        return Err(Error::Other(format!("Program exited with code {}: {}", code, stderr)));
+        return Err(Error::Other(format!(
+            "Program exited with code {}: {}",
+            code, stderr
+        )));
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
 
-    // Separate trace items from regular program output
-    let mut trace_items: Vec<serde_json::Value> = Vec::new();
+    // Separate trace items, audit results, and regular program output
+    let mut trace_items: Vec<TraceItem> = Vec::new();
+    let mut audit_result: Option<AuditResult> = None;
     let mut program_output: Vec<&str> = Vec::new();
 
     for line in stdout.lines() {
-        if let Some(json_str) = line.strip_prefix("RASTER_TRACE:") {
-            if let Ok(trace_item) = serde_json::from_str::<serde_json::Value>(json_str) {
-                trace_items.push(trace_item);
+        match ipc::parse_line(line) {
+            IpcMessage::Trace(item) => {
+                trace_items.push(item);
             }
-        } else {
-            program_output.push(line);
+            IpcMessage::Audit(result) => {
+                audit_result = Some(result);
+            }
+            IpcMessage::Output(_) | IpcMessage::Unknown(_) => {
+                program_output.push(line);
+            }
         }
     }
 
@@ -109,69 +129,126 @@ pub fn run(
         println!();
     }
 
-    // Print trace items as pretty JSON
-    if !trace_items.is_empty() {
-        println!("Trace ({} tile executions):", trace_items.len());
-        for trace_item in &trace_items {
-            if let Ok(pretty) = serde_json::to_string_pretty(&trace_item) {
-                // Indent each line of the pretty JSON
-                for line in pretty.lines() {
-                    println!("  {}", line);
-                }
+    // Handle audit result if present
+    if let Some(result) = audit_result {
+        if result.success {
+            println!("Audit verification passed",);
+        } else {
+            println!("Audit verification FAILED!");
+
+            // Display trace window for debugging context
+            if !result.trace_window.is_empty() {
                 println!();
+                println!(
+                    "Trace window ({} items leading up to divergence):",
+                    result.trace_window.len()
+                );
+                for (i, item) in result.trace_window.iter().enumerate() {
+                    println!();
+                    println!("  [{}] {}", i, item.fn_name);
+                    if let Some(ref desc) = item.desc {
+                        println!("      Description: {}", desc);
+                    }
+                    if !item.inputs.is_empty() {
+                        println!("      Inputs:");
+                        for input in &item.inputs {
+                            println!("        - {}: {}", input.name, input.ty);
+                        }
+                    }
+                    if let Some(ref output_type) = item.output_type {
+                        println!("      Output type: {}", output_type);
+                    }
+                }
+
+                // Replay trace window with Risc0 backend for proof generation
+                println!();
+                println!("Replaying trace window with Risc0 backend...");
+
+                let backend =
+                // TODO: Restructure backend <-> project relations
+                    Risc0Backend::new(project.output_dir.clone()).with_user_crate(project.root_dir.clone());
+
+                let replayer = Replayer::new(&backend, &project);
+                let mode = ExecutionMode::prove_and_verify();
+
+                let mut replayed_results: BTreeMap<String, ReplayResult> = BTreeMap::new();
+
+                for (i, item) in result.trace_window.iter().enumerate() {
+                    print!("  [{}] {} ... ", i, item.fn_name);
+
+                    match replayer.replay(item, mode) {
+                        Ok(replay_result) => {
+                            replayed_results.insert(item.fn_name.clone(), replay_result.clone());
+                        }
+                        Err(e) => {
+                            println!("FAILED: {}", e);
+                        }
+                    }
+                }
+
+                // Replay transition frontier with the transition guest
+                if let Some(ref diff) = result.diff {
+                    if let Some(frontier) = SerializableFrontier::from_bytes(&diff.frontier) {
+                        println!();
+                        println!("Replaying transition frontier with transition guest...");
+
+                        // Parse fingerprint bytes as little-endian u64s
+                        let fingerprint: Vec<u64> = diff
+                            .fingerprint
+                            .chunks_exact(8)
+                            .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()))
+                            .collect();
+
+                        let bits_packer = BitPacker(diff.bits_per_item);
+                        let window_fingerprint = bits_packer
+                            .get_range(
+                                diff.window_start_position,
+                                diff.window_start_position + 2,
+                                &fingerprint,
+                            )
+                            .expect("Failed to get window fingerprint");
+
+                        let Some(receipt) = replay_transitions(
+                            &frontier,
+                            &result.trace_window,
+                            window_fingerprint,
+                            diff.bits_per_item,
+                            &replayed_results,
+                        ) else {
+                            panic!("Failed to generate fraud proof");
+                        };
+
+                        let final_journal: TransitionJournal = receipt.journal.decode().unwrap();
+                        println!("{:?}", final_journal);
+                    }
+                }
             }
+
+            return Err(Error::Other("Audit verification failed".into()));
         }
     }
 
     Ok(())
 }
 
-/// Find the Cargo target directory for a project.
-/// Handles both workspace members and standalone projects.
-fn find_target_path(project_path: &std::path::Path) -> Option<PathBuf> {
-    // Run cargo metadata to get the target directory
-    let output = Command::new("cargo")
-        .current_dir(project_path)
-        .args(["metadata", "--format-version", "1", "--no-deps"])
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
-        return None;
-    }
-
-    let stdout = String::from_utf8(output.stdout).ok()?;
-    let meta: serde_json::Value = serde_json::from_str(&stdout).ok()?;
-
-    meta.get("target_directory")
-        .and_then(|v| v.as_str())
-        .map(PathBuf::from)
+/// Result of a transition replay operation.
+#[derive(Debug)]
+pub struct TransitionReplayResult {
+    /// Number of transitions successfully proved and verified
+    pub verified_count: usize,
+    /// If fingerprint verification failed, the index in trace_window where it failed
+    pub failed_at_index: Option<usize>,
+    /// The type of failure if any
+    pub failure_type: Option<TransitionFailureType>,
 }
 
-/// Extract the binary name from a Cargo.toml file.
-fn extract_binary_name(project_path: &std::path::Path) -> Option<String> {
-    let cargo_toml = std::fs::read_to_string(project_path.join("Cargo.toml")).ok()?;
-
-    // Simple parsing: look for name = "..." in [package] section
-    let mut in_package = false;
-    for line in cargo_toml.lines() {
-        let trimmed = line.trim();
-        if trimmed == "[package]" {
-            in_package = true;
-            continue;
-        }
-        if trimmed.starts_with('[') {
-            in_package = false;
-            continue;
-        }
-        if in_package && trimmed.starts_with("name") {
-            if let Some(start) = line.find('"') {
-                let rest = &line[start + 1..];
-                if let Some(end) = rest.find('"') {
-                    return Some(rest[..end].to_string());
-                }
-            }
-        }
-    }
-    None
+/// Type of transition failure.
+#[derive(Debug)]
+pub enum TransitionFailureType {
+    /// Item hash mismatch
+    ItemHashMismatch,
+    /// Fingerprint mismatch
+    FingerprintMismatch,
+    /// Proving error
+    ProvingError(String),
 }

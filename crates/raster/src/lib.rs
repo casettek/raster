@@ -17,13 +17,14 @@ pub use raster_macros::{main, sequence, tile};
 
 // Runtime is only available with std feature
 #[cfg(feature = "std")]
-pub use raster_runtime::{finish, init, init_with, __emit_trace, JsonSubscriber, CommitSubscriber, AuditSubscriber};
-// Tile execution helper for native backend subprocess communication
-#[cfg(feature = "std")]
-mod exec_helper;
+pub use raster_runtime::{
+    __emit_trace, finish, init, init_with, AuditSubscriber, CommitSubscriber, JsonSubscriber,
+};
 
 #[cfg(feature = "std")]
-pub use exec_helper::{parse_main_input, try_execute_tile_from_args};
+pub mod utils;
+#[cfg(feature = "std")]
+pub use utils::exec_helper::{parse_main_input, try_execute_tile_from_args};
 
 /// Prelude module for convenient imports.
 pub mod prelude {
@@ -37,7 +38,7 @@ pub mod prelude {
     pub use crate::core::{
         manifest::Manifest,
         schema::{ControlFlow, SequenceSchema},
-        trace::{Trace, TraceEvent, TraceInputParam, TraceItem},
+        trace::{TraceInputParam, TraceItem},
     };
 
     // Registry is only available with std and on platforms that support linkme

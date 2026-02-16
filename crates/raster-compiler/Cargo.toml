@@ -12,9 +12,11 @@ raster-core = { workspace = true, features = ["std"] }
 raster-backend.workspace = true
 raster-backend-risc0.workspace = true
 raster-backend-native.workspace = true
+
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+
 hex = "0.4"
 walkdir.workspace = true
 

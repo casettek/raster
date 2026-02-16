@@ -6,8 +6,15 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+
+[build-dependencies]
+risc0-build = "1.2"
+
 [dependencies]
 raster-core = { workspace = true, features = ["std"] }
+raster-compiler = { workspace = true }
+raster-backend = { workspace = true }
+
 bincode.workspace = true
 bridgetree.workspace = true
 hex.workspace = true
@@ -17,3 +24,11 @@ itertools.workspace = true
 rand.workspace = true
 sha2.workspace = true
 serde.workspace = true
+postcard.workspace = true
+
+risc0-zkvm = { version = "1.2", default-features = false, features = ["prove", "std"] }
+
+[package.metadata.risc0]
+methods = ["guests/transition"]
+
+

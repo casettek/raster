@@ -20,11 +20,16 @@ pub mod tile;
 #[cfg(feature = "std")]
 pub mod cfs;
 #[cfg(feature = "std")]
+pub mod ipc;
+#[cfg(feature = "std")]
 pub mod manifest;
 #[cfg(feature = "std")]
 pub mod schema;
 #[cfg(feature = "std")]
 pub mod trace;
+
+#[cfg(feature = "std")]
+pub mod fingerprint;
 
 // The registry module uses linkme which doesn't support RISC-V targets
 #[cfg(all(feature = "std", not(target_arch = "riscv32")))]

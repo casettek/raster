@@ -7,13 +7,16 @@
 //!
 //! - [`bit_packer::BitPacker`] - Pack hash bits into compact fingerprints
 //! - [`trace::ExecutionCommitment`] - Create incremental Merkle commitments
-//! - [`program::fibonacci`] - Example Fibonacci kernel implementation
+//! - [`guest`] - RISC0 guest types for iterative trace verification
 //! - [`error`] - Error types for the library
 
-pub mod bit_packer;
+include!(concat!(env!("OUT_DIR"), "/methods.rs"));
+
 pub mod error;
 pub mod precomputed;
+pub mod replay;
 pub mod trace;
+pub mod transition;
 pub mod utils;
 
 pub use error::{BitPackerError, Result};
