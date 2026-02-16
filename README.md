@@ -30,6 +30,12 @@ Raster is organized as a Rust workspace with the following crates:
 - **`raster-cli`**: Command-line tool (`cargo raster`)
 - **`raster`**: Convenience re-export crate for user applications
 
+## Documentation
+
+- `docs/architecture.md`: technical architecture notes
+- `docs/tile-authoring.md`: authoring guide for tiles/sequences
+- `docs/specs/README.md`: canonical, code-adjacent specs
+
 ## Installation
 
 ```bash

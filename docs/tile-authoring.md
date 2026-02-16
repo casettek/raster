@@ -1,15 +1,16 @@
 # Tile Authoring Guide
 
-## What is a Tile?
+## What a tile is
 
-A tile is an isolated compute unit that:
+A tile is a Rust free function annotated with `#[tile]`. The macro generates:
 
-- Takes explicit inputs
-- Produces explicit outputs
-- Can be compiled and executed independently
-- Generates trace data when run
+- A byte-ABI wrapper (`__raster_tile_entry_<fn_name>`)
+- Host registration metadata (on supported host targets)
+- Runtime trace hook wiring
 
-## Basic Tile
+Tiles are the unit compiled and executed by backends.
+
+## Minimal tile
 
 ```rust
 use raster::prelude::*;
@@ -20,197 +21,116 @@ fn double(x: u64) -> u64 {
 }
 ```
 
-The `#[tile]` macro:
+## Supported `#[tile(...)]` attributes
 
-- Registers the function as a tile
-- Generates metadata (ID, signature, resource hints)
-- Wraps execution with tracing hooks
+Use key/value syntax:
 
-## Tile Guidelines
+- `kind = iter | recur` (default: `iter`)
+- `description = "..."` (optional)
+- `estimated_cycles = <u64>` (optional)
+- `max_memory = <u64>` (optional)
 
-### Keep Tiles Focused
+Example:
 
-Good:
 ```rust
-#[tile]
-fn validate_signature(pubkey: &[u8], signature: &[u8], message: &[u8]) -> bool {
-    // Single responsibility: signature validation
+#[tile(
+    kind = iter,
+    description = "Doubles a number",
+    estimated_cycles = 1000,
+    max_memory = 4096
+)]
+fn double(x: u64) -> u64 {
+    x * 2
 }
 ```
 
-Bad:
-```rust
-#[tile]
-fn process_transaction(tx: Transaction) -> Result<Receipt> {
-    // Too broad: validation, execution, storage
-}
+Important:
+
+- Use `kind = recur`, not `#[tile(recur)]`.
+- Unknown attributes are ignored by the macro parser today.
+
+## Signature and type requirements
+
+Tiles should follow these constraints for reliable compilation/execution:
+
+- Use free functions (no `self` receiver).
+- Avoid generic tile signatures.
+- Use serde-compatible input/output types.
+- Prefer simple identifier parameters (avoid complex/destructured patterns).
+- Use `raster::core::Result<T>` for fallible tiles when possible.
+
+## Tile ABI contract (current implementation)
+
+Tile wrappers use `postcard` for input/output bytes.
+
+Input encoding by arity:
+
+- 0 args: `postcard(())`
+- 1 arg: `postcard(arg)`
+- N>1 args: `postcard((arg1, arg2, ...))`
+
+Output encoding:
+
+- `postcard(return_value)` (or `postcard(ok_value)` for `Result`)
+
+If decode/encode fails, the wrapper returns `raster_core::Error::Serialization`.
+
+## Recursive tiles (`kind = recur`)
+
+`recur` currently affects metadata and emits a helper macro (`tile_name!(...)`) for authoring ergonomics.
+
+Current limitations:
+
+- No runtime recursive execution loop exists yet.
+- Compiler call extraction does not reliably capture `tile_name!(...)` macro calls.
+- Treat recursion as an annotation/forward-compatible convention, not an enforced runtime behavior.
+
+## Sequences (`#[sequence]`)
+
+Sequences are currently a discovery/annotation surface:
+
+- They are registered on host targets.
+- Tooling extracts an ordered list of simple function calls.
+- They are not a full control-flow program representation today.
+
+Do not rely on sequence branching semantics being represented end-to-end.
+
+## CLI author workflow
+
+Common commands:
+
+```bash
+# List discovered tiles
+cargo raster list
+
+# Run one tile natively
+cargo raster run-tile --backend native --tile double --input "42"
+
+# Run one tile in RISC0 estimate mode
+cargo raster run-tile --backend risc0 --tile double --input "42"
+
+# Prove and verify
+cargo raster run-tile --backend risc0 --tile double --input "42" --prove --verify
 ```
 
-### Use Explicit Types
+## Testing guidance
 
-Good:
-```rust
-#[tile]
-fn hash_data(data: Vec<u8>) -> [u8; 32] {
-    // Clear input/output types
-}
-```
+### Unit tests
 
-Bad:
-```rust
-#[tile]
-fn hash_data(data: &dyn AsRef<[u8]>) -> Vec<u8> {
-    // Unclear contract
-}
-```
+Test tile functions like normal Rust functions.
 
-### Avoid Hidden State
+### ABI-level tests
 
-Good:
-```rust
-#[tile]
-fn increment(value: u64, delta: u64) -> u64 {
-    value + delta
-}
-```
+For backend interop, add tests that encode/decode inputs/outputs with `postcard` using the tile ABI shape (unit/value/tuple).
 
-Bad:
-```rust
-static mut COUNTER: u64 = 0;
+### Whole-program tests
 
-#[tile]
-fn increment() -> u64 {
-    unsafe { COUNTER += 1; COUNTER }
-}
-```
+Use `cargo raster run` for end-to-end native runs with optional `--commit`/`--audit` to validate trace commitment behavior.
 
-## Sequences
+## Recommended patterns
 
-Sequences describe how tiles are composed:
-
-```rust
-#[sequence]
-fn verify_and_execute() {
-    let valid = validate_signature(&pubkey, &sig, &msg);
-    if valid {
-        execute_transaction(&msg);
-    }
-}
-```
-
-The `#[sequence]` macro:
-
-- Parses control flow
-- Generates a schema (JSON/TOML)
-- Does NOT generate executable code
-
-## Resource Hints
-
-Provide estimates to help cost analysis:
-
-```rust
-#[tile(estimated_cycles = 1000, max_memory = 4096)]
-fn expensive_operation(input: Vec<u8>) -> Vec<u8> {
-    // Computationally intensive work
-}
-```
-
-## Testing
-
-Test tiles as normal Rust functions:
-
-```rust
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_double() {
-        assert_eq!(double(5), 10);
-    }
-}
-```
-
-For integration tests, use the runtime:
-
-```rust
-#[test]
-fn test_sequence() {
-    let schema = SequenceSchema::load("my_sequence.json")?;
-    let mut executor = Executor::new(FileTracer::new(...));
-    let result = executor.execute(&schema)?;
-    assert!(result.trace.is_some());
-}
-```
-
-## Best Practices
-
-1. **Tile Granularity**: Balance between too fine (overhead) and too coarse (inflexibility)
-2. **Determinism**: Tiles should be pure functions when possible
-3. **Serialization**: Use standard formats (JSON, bincode) for inputs/outputs
-4. **Error Handling**: Return `Result` types for fallible operations
-5. **Documentation**: Document expected behavior and resource usage
-
-## Common Patterns
-
-### Map-Reduce
-
-```rust
-#[tile]
-fn map(items: Vec<u64>) -> Vec<u64> {
-    items.iter().map(|x| x * 2).collect()
-}
-
-#[tile]
-fn reduce(items: Vec<u64>) -> u64 {
-    items.iter().sum()
-}
-
-#[sequence]
-fn map_reduce() {
-    let mapped = map(vec![1, 2, 3, 4]);
-    let sum = reduce(mapped);
-}
-```
-
-### Pipeline
-
-```rust
-#[tile]
-fn parse(input: String) -> Data { ... }
-
-#[tile]
-fn validate(data: Data) -> ValidatedData { ... }
-
-#[tile]
-fn execute(data: ValidatedData) -> Result { ... }
-
-#[sequence]
-fn pipeline() {
-    let data = parse(input);
-    let validated = validate(data);
-    execute(validated);
-}
-```
-
-### Conditional Branching
-
-```rust
-#[tile]
-fn check_condition(value: u64) -> bool { ... }
-
-#[tile]
-fn path_a(value: u64) -> u64 { ... }
-
-#[tile]
-fn path_b(value: u64) -> u64 { ... }
-
-#[sequence]
-fn conditional() {
-    if check_condition(value) {
-        path_a(value);
-    } else {
-        path_b(value);
-    }
-}
-```
+- Keep tiles focused and composable.
+- Use explicit stable input/output types.
+- Prefer deterministic logic for prove/verify workflows.
+- Document resource hints (`estimated_cycles`, `max_memory`) when known.
+- Keep sequence examples linear unless you are explicitly documenting current limitations.

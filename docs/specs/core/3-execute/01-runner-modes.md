@@ -1,0 +1,262 @@
+## Runner Modes
+
+This document specifies Raster’s “runner modes”: the supported ways to execute tiles (and, eventually, sequences) across different backends and checking postures.
+
+This is a routing/spec-index document. The per-mode execution contracts are specified in:
+
+- `02. Native Execution.md`
+- `03. Audit Execution.md`
+- `04. zkVM Preview Execution.md`
+- `05. Window Replay Execution.md`
+
+### Status in the current codebase
+
+- The codebase implements **backend selection** (`native` vs `risc0`) and **tile-level execution modes** (`estimate` vs `prove` vs `prove+verify`).
+- Dedicated runners for **audit** and **window replay**, and end-to-end **trace persistence**, are not implemented yet; this document calls out those gaps explicitly.
+
+---
+
+## Code audit tasks
+
+- **CLI mode flags and their mapping to runtime types**
+  - Inspect `crates/raster-cli/src/main.rs` for the user-facing flags and subcommands (`run-tile`, `run-sequence`, `run`) and their options.
+  - Inspect `crates/raster-cli/src/commands/*` for how those flags map to:
+    - backend selection (`BackendType::{Native,Risc0}`)
+    - execution mode selection (`raster_backend::ExecutionMode`)
+    - per-command behavior differences (`run-tile` vs `run-sequence` vs `run`)
+
+- **Execution mode type and result shape**
+  - Inspect `crates/raster-backend/src/backend.rs`:
+    - `ExecutionMode` variants and helper constructors
+    - `TileExecution` fields and how `estimate()` vs `proved()` populate them
+    - proof-cycle padding logic (`calculate_proof_cycles`, `MIN_PROOF_SEGMENT_CYCLES`)
+
+- **Backend-specific branching**
+  - Inspect `crates/raster-backend/src/native.rs` for:
+    - what “native execution” does today (and what is stubbed/TODO)
+    - error behavior when proof generation is requested
+  - Inspect `crates/raster-backend-risc0/src/risc0.rs` for:
+    - how `ExecutionMode::{Estimate,Prove}` affects executor/prover selection
+    - how `verify` is computed and surfaced in results
+    - how `--gpu` influences proving (and how “GPU available” is detected)
+
+- **Input/output ABI expectations (critical for runner modes)**
+  - Inspect `crates/raster-macros/src/lib.rs` (`#[tile]`) for:
+    - ABI wrapper naming convention: `__raster_tile_entry_<fn_name>`
+    - serialization format: `postcard` (including tuple encoding for multi-arg tiles)
+  - Inspect `crates/raster-backend-risc0/src/guest_builder.rs` for:
+    - the generated guest `main` and how it reads input (length prefix + raw bytes)
+    - how the guest calls the ABI wrapper and commits output to the journal
+
+- **Tracing / replay / audit surface (mostly not implemented yet)**
+  - Inspect `crates/raster-core/src/trace.rs` for the trace event model (`Trace`, `TraceEvent`).
+  - Inspect `crates/raster-runtime/src/tracing.rs` and `crates/raster-runtime/src/tracing/subscriber/*` for tile I/O tracing and commitment/audit subscribers.
+
+- **Compilation+execution pipeline touchpoints used by modes**
+  - Inspect `crates/raster-compiler/src/builder.rs` for:
+    - caching decisions (`needs_compilation`, `is_tile_cached`, `build_tile_with_cache_info`)
+    - artifact layout assumptions (`target/raster/tiles/<tile_id>/<backend>/…`)
+    - how cache invalidation hashing is computed (`compute_source_hash`)
+
+---
+
+## Spec output
+
+### Runner modes overview
+
+Raster exposes multiple “runner modes” that are meant to describe *how* a program is executed (native vs zkVM, with or without checking/replay). In the current codebase, the implemented knobs are:
+
+- **Backend selection**: `native` vs `risc0` (CLI: `--backend`)
+- **Execution mode**: `estimate` vs `prove` vs `prove+verify` (CLI: `--prove`, `--verify`)
+- **Tracing toggle**: present as a CLI flag (`--no-trace`) but not wired to persistence yet
+
+This spec defines four mode names used throughout the Execute specs:
+
+- **native**
+- **audit**
+- **zkVM-preview**
+- **window replay**
+
+Where the current codebase does not implement a mode end-to-end, this spec documents the observable behavior and explicitly calls out the gaps.
+
+---
+
+### Configuration surface
+
+#### CLI flags (current)
+
+- **`--backend {native|risc0}`**: selects which backend implementation is used.
+- **`--prove`**: requests proof generation (only meaningful for `risc0` backend).
+- **`--verify`**: requests verification of the generated proof. This flag implies prove+verify mode at selection time.
+- **`--commit <path>`** (whole-program `run` only): writes a packed trace commitment stream to the given file.
+- **`--audit <path>`** (whole-program `run` only): reads a packed trace commitment stream from the given file and checks the recomputed stream matches.
+
+#### Programmatic API knobs (current)
+
+- **`raster_backend::ExecutionMode`** is the only mode-like enum used by backends today:
+  - `Estimate`
+  - `Prove { verify: bool }`
+- **`raster_backend::Backend`** implementers branch on `ExecutionMode` inside `execute_tile`.
+
+---
+
+### Common ABI rules (apply to all runner modes)
+
+#### Tile ABI serialization
+
+- Tile ABI inputs and outputs **MUST** be encoded using `postcard`.
+- A tile with:
+  - **0 args**: the wrapper ignores the input bytes and calls the tile function.
+  - **1 arg**: the wrapper decodes the input bytes as the argument type.
+  - **2+ args**: the wrapper decodes the input bytes as a single tuple of argument types.
+- Tile outputs **MUST** be encoded by postcard-serializing the tile return value.
+
+This is implemented by the `#[tile]` macro-generated ABI wrapper `__raster_tile_entry_<fn_name>` in `crates/raster-macros/src/lib.rs`.
+
+#### zkVM host↔guest input framing (RISC0 backend)
+
+When executing via the RISC0 backend, the host **MUST** write the input to the guest as:
+
+1. a `u32` length (number of bytes)
+2. exactly that many raw bytes (the postcard-encoded tile input)
+
+The generated guest `main` reads the input in the same framing and passes the raw bytes directly to the tile ABI wrapper.
+
+---
+
+### Mode: native
+
+#### Semantics (as implemented today)
+
+Native mode means “execute without a zkVM” and without proof generation.
+
+- **Native mode MUST NOT attempt proof generation.**
+  - If a proof-generating `ExecutionMode` is requested on the native backend, the backend returns an error.
+
+#### What actually happens today (important)
+
+- **CLI has two distinct “native” paths:**
+  - `cargo raster run-tile --backend native ...` (tile-level execution via the native backend facade; currently stubbed/placeholder)
+  - `cargo raster run --backend native ...` (whole-program run; builds and runs the user binary as a subprocess)
+
+- **`NativeBackend::execute_tile` is a stub.**
+  - It returns an empty output and a simulated cycle count (default: 1000) in estimate mode.
+  - It does not call into the tile registry to run the tile.
+
+#### Trace behavior
+
+- Whole-program native runs can emit **tile I/O trace items** (stdout JSON) or write/check **packed commitment streams** (`--commit` / `--audit`) via `raster-runtime` subscribers initialized by `#[raster::main]`.
+
+#### Errors and diagnostics
+
+- **If proof generation is requested on the native backend**, execution **fails** with an error message indicating proofs are not supported.
+- **CLI native run** returns success after printing instructions; it does not validate that the user’s binary actually runs the tile.
+
+#### Example (library-side native execution via ABI wrapper)
+
+The following pattern matches the current ABI implementation (postcard-encoded input; execute wrapper; postcard-decode output):
+
+```rust
+use raster::prelude::*;
+
+fn main() {
+    let tile = find_tile_by_str("my_tile").expect("tile not found");
+    let input = raster::core::postcard::to_allocvec(&123u64).unwrap();
+    let output_bytes = tile.execute(&input).unwrap();
+    let output: u64 = raster::core::postcard::from_bytes(&output_bytes).unwrap();
+    println!("output = {output}");
+}
+```
+
+**Gap**: there is not yet a supported “native runner” that takes a tile ID and input bytes and executes it via `raster-backend`/`raster-runtime` end-to-end.
+
+---
+
+### Mode: audit
+
+Audit mode is intended to mean “execute while collecting artifacts suitable for later checking” (trace capture, schema compliance checks, etc.).
+
+#### Current status (code reality)
+
+Raster does not implement “audit execution” as a schema-enforcing runner, but it does implement an **audit posture for trace commitments** for whole-program runs:
+
+- `cargo raster run --audit <path>` initializes an `AuditSubscriber` that recomputes and checks packed commitments against a provided file.
+
+#### What to rely on today
+
+- Consumers **MAY** use `TraceEvent` types as the canonical event vocabulary for future audit traces.
+- Consumers **MAY** use `TraceItem` + packed commitment streams as the current “commitment-bearing” trace surface for native whole-program runs.
+
+**Gap**: the mode exists as a spec concept, but not as runnable code.
+
+---
+
+### Mode: zkVM-preview
+
+#### Semantics (as implemented today)
+
+zkVM-preview mode means “execute inside the zkVM to obtain outputs and cycle counts, without producing a proof.”
+
+In the current codebase, this corresponds to:
+
+- **Backend**: RISC0 (`crates/raster-backend-risc0`)
+- **Execution mode**: `ExecutionMode::Estimate`
+
+In this mode:
+
+- Execution **MUST** run the ELF in the RISC0 executor (not the prover).
+- The result **MUST** include:
+  - `output`: the guest journal bytes
+  - `cycles`: the actual executor cycle count
+  - `proof_cycles`: the padded proving cost estimate computed from `cycles`
+- The result **MUST NOT** include a receipt (`receipt = None`).
+
+#### CLI behavior
+
+- `cargo raster run-tile --backend risc0 --tile <id>` defaults to zkVM-preview mode unless `--prove`/`--verify` are provided.
+- `cargo raster preview --sequence <id>` executes each tile in the sequence in zkVM-preview mode and prints a compute/proof cycle breakdown.
+
+#### Errors and diagnostics
+
+- If the tile cannot be compiled to an ELF, zkVM-preview mode **fails**.
+- If the ELF fails to execute, zkVM-preview mode **fails**.
+
+#### Input encoding caveat (current divergence)
+
+The tile ABI wrapper expects `postcard` encoding of the tile’s declared input type(s). However:
+
+- The CLI currently converts `--input` JSON into `serde_json::Value`, then postcard-encodes that `Value`.
+- This means zkVM-preview via the CLI will only successfully deserialize inputs for tiles whose input type is `serde_json::Value` (or a compatible shape), not for typical strongly typed signatures like `fn f(x: u64) -> …` or `fn f(name: String) -> …`.
+
+**Gap**: the CLI does not currently have a type-directed input encoder for tile-specific input types, so `--input` is not generally usable for typed tiles.
+
+---
+
+### Mode: window replay
+
+Window replay mode is intended to mean “re-execute a previously recorded execution over a bounded window to reproduce/validate behavior.”
+
+#### Current status (code reality)
+
+- There is **no window replay mode implemented** today:
+  - No CLI subcommand accepts a trace and replays it.
+  - No runtime module performs trace-window selection or deterministic replay.
+  - `Trace` contains only coarse tile/sequence boundary events today and does not include the payload data required for deterministic replay.
+
+**Gap**: the mode exists as a spec concept, but not as runnable code.
+
+---
+
+### Related: proof generation and verification (not one of the four named modes)
+
+Although this spec focuses on native/audit/zkVM-preview/window replay, the current CLI and backend also support proving:
+
+- `risc0` + `ExecutionMode::Prove { verify: false }` (CLI: `--prove`)
+- `risc0` + `ExecutionMode::Prove { verify: true }` (CLI: `--verify`)
+
+Current implementation details worth documenting:
+
+- When `verify` is not requested, the RISC0 backend sets `verified = false` in the returned `TileExecution`.
+  - Consumers **MUST NOT** interpret `verified = false` as “verification failed”; it can also mean “verification was not attempted”.
+  - **Gap**: a clearer API would likely encode “not attempted” distinctly (e.g., `None`).
+

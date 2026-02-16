@@ -1,0 +1,222 @@
+## IDs and Hashing
+
+This document specifies **identifier** and **hash / digest** conventions used by Raster **as implemented today**. It is written for implementers and auditors.
+
+### Code audit tasks (where to look)
+
+- **Tile IDs**
+  - **`TileId` type**: `crates/raster-core/src/tile.rs`
+  - **Derivation (macro emits the ID as the function name)**: `crates/raster-macros/src/lib.rs` (`#[tile]`)
+  - **Registry matching/equality semantics**: `crates/raster-core/src/registry.rs`
+- **Sequence IDs**
+  - **Derivation (macro emits the ID as the function name)**: `crates/raster-macros/src/lib.rs` (`#[sequence]`)
+  - **Registry**: `crates/raster-core/src/registry.rs`
+  - **Schema uses sequence IDs**: `crates/raster-core/src/schema.rs`, `crates/raster-core/src/cfs.rs`
+- **Backend “method ID” / “image ID”**
+  - **RISC0 image ID derivation** (cryptographic, delegated to RISC0): `crates/raster-backend-risc0/src/risc0.rs` (`risc0_zkvm::compute_image_id(&elf)`)
+  - **How it’s persisted** (hex file + JSON manifest): `crates/raster-backend-risc0/src/guest_builder.rs` (`method_id` file, `manifest.json`)
+  - **Native backend placeholder “method_id”** (NOT cryptographic): `crates/raster-backend/src/native.rs`
+- **Build cache “source hash”**
+  - **Derivation** (custom checksum, not cryptographic): `crates/raster-compiler/src/builder.rs` (`compute_source_hash`)
+  - **Use**: `crates/raster-compiler/src/builder.rs` (`TileManifest.source_hash`, cache invalidation)
+- **Trace step hashing / commitments**
+  - **Trace item shape**: `crates/raster-core/src/trace.rs` (`TraceItem`)
+  - **Commitment construction and hashing**: `crates/raster-prover/src/trace.rs` and `crates/raster-prover/src/bit_packer.rs`
+  - **Runtime commit/audit subscribers**: `crates/raster-runtime/src/tracing/subscriber/{commit,audit}.rs`
+- **Schema hashing**
+  - **GAP**: there is no `SchemaHash` type nor schema-hash derivation in the current code.
+
+---
+
+### 1. Identifier and digest classes
+
+#### 1.1 `TileId` (implemented)
+
+- **Definition**: A `TileId` is an opaque, UTF-8 string wrapper (`TileId(pub String)`).
+- **Derivation (host build, current macros)**:
+  - The `#[tile(...)]` macro MUST set the tile’s ID to the Rust function name string (e.g., `fn double` ⇒ `"double"`).
+  - The same string is currently used as the human-facing name in tile metadata.
+- **Comparison**: Tile identity MUST be determined by exact string equality (`==`) on the underlying string.
+- **Validation**:
+  - Raster currently performs **no additional normalization** (no case-folding, trimming, Unicode normalization, etc.).
+  - Therefore, producers MUST treat tile IDs as **case-sensitive** and byte-for-byte stable.
+- **Stability guarantee**:
+  - A tile’s ID MUST change if and only if the annotated Rust function name changes (e.g., rename/refactor).
+
+**GAP (design)**: The spec set this section expects tile IDs to be derived from hashed canonical encodings. The current implementation uses developer-chosen strings (function names) and provides no collision resistance beyond normal Rust naming discipline.
+
+#### 1.2 Sequence ID (implemented)
+
+- **Definition**: Sequence IDs are plain UTF-8 strings.
+- **Derivation**:
+  - The `#[sequence]` macro MUST set the sequence’s ID to the Rust function name string.
+- **Comparison**: Sequence identity MUST be determined by exact string equality.
+
+#### 1.3 Control Flow Schema (CFS) identifiers (implemented)
+
+Raster’s CFS structures (`ControlFlowSchema`, `TileDef`, `SequenceDef`, `SequenceItem`) embed tile and sequence IDs as strings.
+
+- **Rule**: All references to tiles or sequences inside a CFS MUST use the same exact IDs as used in registration/discovery (today: function-name strings).
+- **Encoding note**: CFS is currently serialized by the CLI as JSON (`serde_json`), and fields are standard UTF-8 JSON strings.
+
+#### 1.4 Backend “method ID” / “image ID” (implemented, backend-defined)
+
+Raster uses the term “method ID” for the backend-defined identifier attached to a compiled tile artifact.
+
+- **Definition**: `CompilationOutput.method_id` is an opaque byte string (`Vec<u8>`).
+- **Persistence format** (as written by Raster build tooling):
+  - Raster build tooling MUST persist a **lowercase hex encoding** of `method_id` (no `0x` prefix, no whitespace required) to:
+    - `tiles/<tile_id>/<backend>/method_id` (a text file)
+    - `tiles/<tile_id>/<backend>/manifest.json` under key `"method_id"` (a JSON string)
+  - The hex encoding MUST represent the exact `method_id` bytes, in order, two hex digits per byte.
+
+##### 1.4.1 RISC0 image ID (implemented)
+
+When using the RISC0 backend, Raster MUST derive `method_id` as:
+
+- **Input**: the compiled guest ELF bytes (`elf: Vec<u8>`) as loaded from disk.
+- **Algorithm**: `method_id = risc0_zkvm::compute_image_id(elf).as_bytes()`.
+  - The internal hashing/commitment details are delegated to `risc0-zkvm` (currently `1.2`).
+- **Stability guarantee**:
+  - `method_id` MUST change whenever the ELF byte string changes.
+  - Raster makes **no stronger claim** (e.g., “same Rust source yields same ID”) because guest builds are not specified to be reproducible in this repository.
+
+##### 1.4.2 Native backend “method ID” placeholder (implemented; NOT cryptographic)
+
+When using the native backend, Raster currently sets:
+
+- `method_id = tile_id.as_bytes()`.
+
+This MUST be treated as a placeholder identifier only:
+
+- It MUST NOT be used as a security commitment.
+- It is not collision-resistant and is not a digest of code.
+
+**GAP (correctness/security)**: A native backend method ID SHOULD be derived from a stable artifact hash (e.g., hash of the compiled code, or an agreed-upon digest of a canonical program representation). This is not implemented today.
+
+#### 1.5 Build-cache “source hash” (implemented; NOT cryptographic)
+
+Raster’s compiler/builder computes a “source hash” solely for **cache invalidation**.
+
+- **Scope**: This value MUST be used only to decide whether a tile needs recompilation. It MUST NOT be used as a cryptographic commitment.
+- **Input**: raw bytes of a single source file read from the filesystem (no normalization).
+- **Algorithm** (as implemented; `u64` arithmetic):
+
+Let `contents` be the byte array. Initialize `h = 0` (64-bit unsigned).
+
+For each `(i, byte)` in `enumerate(contents)` (where `i` is 0-based):
+
+1. `h = h + (byte * (i + 1))` using wrapping `u64` arithmetic
+2. `h = rotl(h, 7)` (rotate-left by 7 bits in 64-bit space)
+
+Let `len_hash = len(contents)` as `u64`.
+
+The final string is:
+
+- `format!("{:016x}{:016x}", h, len_hash)` (lowercase hex, fixed width, zero-padded)
+
+**Stability guarantee**:
+
+- The source hash MUST change if any byte in the file changes, or if the file length changes.
+- The source hash MAY collide for distinct files (it is not designed to avoid collisions).
+
+#### 1.6 Trace item hashes / commitments (implemented for `TraceItem`; limited scope)
+
+Raster defines both:
+
+- a coarse event trace (`Trace` / `TraceEvent`), and
+- a tile I/O transcript record (`TraceItem`) used by runtime subscribers.
+
+For `TraceItem`, the current workspace implements:
+
+- a per-item hash: `SHA-256(postcard(TraceItem))`, and
+- an incremental Merkle “commitment stream” over the trace items (one root per appended item),
+- plus a compact packed representation of that commitment stream (bit-packed into `u64` blocks).
+
+However, Raster does not yet define:
+
+- a canonical, versioned, language-agnostic encoding for commitment input (it uses Rust `postcard` over `TraceItem` today),
+- a “program-level” trace commitment API that binds to schemas/artifact identities/entry inputs,
+- a windowing scheme for replay/verification protocols.
+
+**Important limitation (portability)**: because hashing uses `postcard` over Rust types, the commitment scheme is not specified to be stable across non-Rust implementations unless a versioned wire format is explicitly fixed.
+
+#### 1.7 Schema hash (NOT implemented)
+
+There is no `SchemaHash` type and no implemented hash derivation for `SequenceSchema` or `ControlFlowSchema`.
+
+**GAP (not implemented)**: Any spec text that assumes schema hashes exist or are persisted does not match the current codebase.
+
+---
+
+### 2. Domain separation (current state and requirements)
+
+#### 2.1 Current state (implemented)
+
+- The build-cache “source hash” has **no explicit domain separation tag**; it is an unkeyed checksum over file bytes.
+- The RISC0 “method ID” is domain-separated only insofar as `risc0-zkvm` defines its own image ID computation. Raster treats the result as **opaque**.
+
+#### 2.2 Required property for future hash-based IDs (GAP / not implemented)
+
+When Raster introduces cryptographic hashes for IDs (tile IDs, schema IDs, trace commitments), each hash derivation MUST:
+
+- use a **domain separation tag** (DST) unique to the object type and version, and
+- hash a **canonical byte encoding** of the object.
+
+This repo does not yet implement these DSTs or canonical encodings for IDs.
+
+---
+
+### 3. Byte ordering and serialization inputs (implemented behavior)
+
+- **Hex encodings**:
+  - `hex::encode(...)` is used for artifact `method_id` persistence. Producers MUST output lowercase hex.
+- **`source_hash`**:
+  - Operates on raw file bytes in filesystem order.
+  - Numeric operations are on `u64` values; the emitted digest is a **textual** hex representation and is stable across machine endianness.
+- **RISC0 method/image ID**:
+  - Input is the raw ELF byte string.
+  - Hashing details and any internal byte order are delegated to `risc0-zkvm`.
+
+**Related mismatch (informational, not an ID/hashing rule)**:
+
+- The backend trait documentation in `crates/raster-backend/src/backend.rs` describes tile inputs as “bincode format”, but the `#[tile]` macro and CLI execution paths serialize inputs with **`postcard`**. This is not directly an ID/hash rule, but it impacts any future “hash of serialized inputs” design.
+
+---
+
+### 4. Error cases and invariants (implemented)
+
+- **Artifact integrity**:
+  - A consumer that loads `tiles/<tile_id>/<backend>/method_id` MUST treat invalid hex as an error.
+  - A missing `method_id` file or `manifest.json` SHOULD be treated as “cache miss” / “needs rebuild” by build tooling.
+- **Cache invalidation**:
+  - If `TileManifest.source_hash` is absent, build tooling MUST assume recompilation is required (current builder behavior).
+
+---
+
+### 5. Examples
+
+#### 5.1 `source_hash` examples (implemented)
+
+- Empty file (`b""`) ⇒ `00000000000000000000000000000000`
+- File containing `b"abc"` ⇒ `000000000c5194800000000000000003`
+
+#### 5.2 `method_id` artifact file (format)
+
+Example contents of `tiles/double/risc0/method_id`:
+
+```text
+4f3a9c... (lowercase hex, no 0x prefix)
+```
+
+#### 5.3 Tile artifact manifest excerpt (format)
+
+Example `tiles/double/risc0/manifest.json`:
+
+```json
+{
+  "tile_id": "double",
+  "method_id": "4f3a9c... (lowercase hex)",
+  "elf_size": 123456
+}
+```

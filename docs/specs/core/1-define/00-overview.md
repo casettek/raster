@@ -1,0 +1,136 @@
+## Define: Overview
+
+This document is the high-level entry point for **authoring** Raster programs in Rust. It explains what a developer imports, what annotations exist, and the basic workflow for defining tiles and composing them into sequences.
+
+For details, see:
+
+- **Tiles**: `specs/Core/1. Define/02. Tiles.md`
+- **Sequences**: `specs/Core/1. Define/03. Sequences.md`
+- **Programs + entry point**: `specs/Core/1. Define/04. Programs and Entry Point.md`
+
+---
+
+## Code audit tasks (where to look)
+
+### Developer import surface (what crates/modules are used)
+
+- **Top-level user crate**
+  - `crates/raster/src/lib.rs`
+    - Re-exports: `pub use raster_core as core`
+    - Macro exports: `pub use raster_macros::{tile, sequence}`
+    - `raster::prelude` contents and feature gating
+  - `crates/raster/Cargo.toml`
+    - Feature flags (notably `std`) and which dependencies they gate.
+
+- **Core types used by authored code**
+  - `crates/raster-core/src/lib.rs`
+    - `no_std` posture, and which modules only exist with `std`
+    - Re-exports used by macro-generated code (`postcard`, and `linkme` when available)
+  - `crates/raster-core/src/tile.rs`
+    - `TileId`, `TileMetadata`, and static variants used during registration
+  - `crates/raster-core/src/error.rs`
+    - `Error` variants that surface during tile ABI (de)serialization and discovery/validation
+
+### Macros and attributes (authoring annotations)
+
+- `crates/raster-macros/src/lib.rs`
+  - `#[tile(...)]` attribute:
+    - Attribute parsing (`TileAttrs::parse`)
+    - ABI wrapper generation (`__raster_tile_entry_<fn_name>`)
+    - Optional `#[cfg]`-gated registry registration via distributed slices
+    - Recursive tile `tile_name!(...)` macro emission (for `recur` tiles only)
+  - `#[sequence(...)]` attribute:
+    - Call extraction visitor (`TileCallExtractor`) and exclusion list (`is_excluded_function`)
+    - Sequence registration shape (a static list of callee names only)
+
+### Registry/discovery model (host builds)
+
+- `crates/raster-core/src/registry.rs` (only when `std` and not `target_arch = "riscv32"`)
+  - `TILE_REGISTRY`, `SEQUENCE_REGISTRY`
+  - Lookup helpers: `iter_tiles`, `find_tile_*`, `iter_sequences`, `find_sequence`
+
+### Tooling entry selection (convention)
+
+- `crates/raster-cli/src/commands.rs` and `crates/raster-cli/src/main.rs`
+  - How `cargo raster preview` selects a default entry sequence (currently `"main"`)
+
+---
+
+## Spec output
+
+### 1) What a developer imports
+
+Raster programs are authored against the `raster` crate.
+
+- A Raster application SHOULD import `raster::prelude::*` to access the commonly-used types and authoring macros.
+- A Raster application MAY import items directly (e.g. `use raster::{tile, sequence};`) when it wants explicit imports.
+
+Feature/target gates that affect what can be imported:
+
+- When the `raster` crate is built **without** the `std` feature, std-only runtime helpers (e.g., tracing subscriber types and `init/finish`) MUST NOT be assumed to exist.
+- When compiling for `target_arch = "riscv32"`, the host registries backed by `linkme` MUST NOT be assumed to exist (they are not compiled on that target). Tooling that relies on registry discovery MUST run in a host build.
+
+### 2) What annotations exist (macros/attributes)
+
+Raster currently exposes exactly two procedural macro attributes for authors:
+
+- `#[tile(...)]`
+  - The macro accepts **key/value** arguments. The recognized keys are:
+    - `kind = iter | recur` (defaults to `iter` when omitted)
+    - `description = "..."` (string literal)
+    - `estimated_cycles = N` (parsed as `u64`)
+    - `max_memory = N` (parsed as `u64`, bytes)
+  - **Important**: positional forms like `#[tile(recur)]` are not interpreted as setting the kind; use `#[tile(kind = recur)]`.
+  - When `kind = recur`, macro expansion also emits a `tile_name!(...)` macro wrapper (same identifier as the function). However, the current compiler/CFS generator does not treat `tile_name!(...)` macro invocations as calls.
+
+- `#[sequence(...)]`
+  - The macro MAY accept `description = "..."`.
+  - The macro extracts an ordered list of callee function names from the sequence body and registers that list (host builds only).
+
+Important current constraint:
+
+- A `#[sequence]` definition MUST NOT be assumed to encode structured control flow (branches/loops) in its registry registration. The registration produced by the proc macro is only an ordered list of callee names; richer control-flow constructs, if desired, are not represented by this path today.
+
+### 3) How a developer writes a Raster program (high level)
+
+A Raster “program” is authored by defining:
+
+- **Tiles**: small Rust functions annotated with `#[tile(...)]`.
+- **Sequences**: Rust functions annotated with `#[sequence]` that call tiles (and potentially other sequences) in source order.
+- **An entry sequence**: a sequence ID chosen by the runner/tool (by convention `"main"`).
+
+At a high level:
+
+- A tile function MUST be a Rust free function that can be wrapped into a byte-oriented ABI by the macro system. (See `specs/Core/1. Define/02. Tiles.md` for the ABI contract and signature restrictions.)
+- A sequence MUST be a Rust free function annotated with `#[sequence]`. The toolchain treats the function name as the **sequence ID**. (See `specs/Core/1. Define/03. Sequences.md`.)
+- A runnable program SHOULD define a sequence named `main` and tools SHOULD treat `"main"` as the default entry sequence when none is specified. (See `specs/Core/1. Define/04. Programs and Entry Point.md`.)
+
+### 4) Minimal example
+
+```rust
+use raster::prelude::*;
+
+#[tile(description = "Double a number")]
+fn double(x: u64) -> u64 {
+    x * 2
+}
+
+#[sequence(description = "Entry sequence")]
+fn main(x: u64) -> u64 {
+    double(x)
+}
+```
+
+### 5) Current gaps and sharp edges (must-know for implementers)
+
+This section documents important behavior that the code currently implements (or does not), so implementers and authors do not assume capabilities that are not present.
+
+- **Registry presence is conditional**: tile/sequence registries exist only in host builds that enable `std` and do not target `riscv32`. Any workflow that “discovers” tiles/sequences from the running binary MUST be limited to those builds.
+
+- **Sequence registration is lossy**: the `#[sequence]` proc macro registers only a list of callee names (strings). It does not record argument bindings, dataflow, nested control flow, or callsite structure. Tools that need those details MUST obtain them via compiler-side discovery/analysis rather than the runtime registry list alone.
+
+- **Name-based identity is simplistic**: tile IDs and sequence IDs are currently derived from the Rust function identifier string (and sequence extraction records only the last path segment for direct calls). Implementations MUST NOT assume module-qualified disambiguation exists at the registry layer.
+
+- **Sequence call extraction is best-effort**: the `#[sequence]` macro’s call extractor only records simple free-function call expressions it sees in the syntax tree, and it only excludes a small hardcoded list of common Rust functions. Implementations MUST NOT assume the extracted list contains only tiles/sequences, or that it captures method calls (e.g. `x.foo()`), trait calls, or dynamic dispatch.
+
+- **Recursive `!` syntax is not represented in schemas today**: `#[tile(kind = recur)]` emits a `tile_name!(...)` macro as a convenience signal, but the compiler/CFS generator does not treat `tile_name!(...)` macro invocations as calls, and no executor implements recursive looping today.

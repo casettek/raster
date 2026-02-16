@@ -1,0 +1,172 @@
+
+## Overview
+
+This document specifies **how Raster versions things** (crates, on-disk / on-wire formats, and program metadata) and what **compatibility guarantees** exist today.
+
+Raster is currently early-stage. Some version fields exist in the data model, but **most formats do not yet have a formal compatibility contract or migration story**. Where the *desired* behavior differs from the *current implementation*, this spec explicitly marks the gap.
+
+## Code audit tasks (exact places to look)
+
+- **CFS version + encoding fields**
+  - `crates/raster-core/src/cfs.rs`: `ControlFlowSchema { version, encoding, ... }`
+  - `crates/raster-compiler/src/cfs_builder.rs`: sets `version: "1.0"` and `encoding: "postcard"`
+  - `crates/raster-cli/src/commands.rs`: `cfs` command writes `cfs.json` via `serde_json`
+- **“Manifest” / “Schema” version fields**
+  - `crates/raster-core/src/manifest.rs`: `Manifest.version` (project metadata)
+  - `crates/raster-core/src/schema.rs`: `SequenceSchema.version`
+  - `crates/raster-compiler/src/schema_gen.rs`: schema generation is `todo!()` (no producer yet)
+  - Note: this workspace does not include a schema-driven runtime that consumes `SequenceSchema` for execution today.
+- **Tile artifact manifest format (compiler output)**
+  - `crates/raster-compiler/src/builder.rs`: `TileManifest` JSON written to `tiles/<tile>/<backend>/manifest.json`
+  - `crates/raster-backend-risc0/src/guest_builder.rs`: writes/reads the same manifest path (integration point)
+- **Execution trace format**
+  - `crates/raster-core/src/trace.rs`: `Trace` has **no version field**
+- **Feature flags that affect behavior/availability**
+  - `crates/raster-core/src/lib.rs`: `std` gating for `cfs`, `manifest`, `schema`, `trace`; `riscv32` gating for `registry`
+  - `crates/raster-backend-risc0/src/risc0.rs`: backend feature flags (e.g., `cuda`, `metal`) affecting runtime compilation targets
+- **Errors for incompatibility / unsupported version**
+  - `crates/raster-core/src/error.rs`: currently has **no dedicated “unsupported version” error variant**
+
+## Version domains
+
+Raster uses multiple, independent “version” concepts. Implementations MUST NOT conflate them.
+
+- **Crate (software) version**
+  - The Rust crates in this repository are versioned via Cargo workspace versioning (SemVer).
+  - This is the version you see in `Cargo.toml` and via CLI `--version`.
+  - This version describes the *software release*, not a specific serialized format.
+
+- **Format version**
+  - A format version describes the schema of a serialized structure (JSON/postcard/etc).
+  - Today, the only explicit format version is `ControlFlowSchema.version`.
+
+- **Program/package metadata version**
+  - `Manifest.version` and `SequenceSchema.version` exist as user/project metadata fields.
+  - These are **not** currently used to negotiate compatibility of a serialized format.
+
+## Current versioned formats
+
+### Control Flow Schema (CFS)
+
+The CFS is represented by `raster_core::cfs::ControlFlowSchema` and is emitted by the CLI as JSON (`cfs.json`).
+
+- **`version` field**
+  - **Producers MUST** set `ControlFlowSchema.version` to the literal string `"1.0"`. (This is hard-coded today.)
+  - **Consumers MUST** treat `version` as an **opaque identifier**, not as SemVer and not as a numeric value.
+  - **Consumers SHOULD** implement a “fail-closed” policy:
+    - If `version != "1.0"`, they SHOULD reject the CFS as unsupported.
+
+**Implementation gap (current Raster code):**
+- Raster currently does **not** implement a CFS reader/verifier that enforces `version == "1.0"`. Any downstream consumer that simply deserializes JSON into `ControlFlowSchema` will accept arbitrary strings.
+- Raster’s core error type does not have an `UnsupportedVersion`-style error variant; callers typically use `Error::Other(...)` or `Error::Serialization(...)`.
+
+- **`encoding` field**
+  - `ControlFlowSchema.encoding` is currently set to `"postcard"`.
+  - Consumers MUST treat `encoding` as **descriptive metadata only** unless they have a separate, explicit agreement about what is encoded.
+
+**Implementation gap / ambiguity:**
+- The CLI currently writes the CFS itself as **JSON** (via `serde_json`). The meaning of `encoding: "postcard"` is therefore ambiguous in current implementations (it does not describe the outer file encoding).
+
+#### Example (CFS JSON)
+
+```json
+{
+  "version": "1.0",
+  "project": "hello-tiles",
+  "encoding": "postcard",
+  "tiles": [
+    { "id": "my_tile", "type": "iter", "inputs": 1, "outputs": 1 }
+  ],
+  "sequences": [
+    {
+      "id": "my_sequence",
+      "input_sources": [{ "source": { "type": "external" } }],
+      "items": [
+        {
+          "item_type": "tile",
+          "item_id": "my_tile",
+          "input_sources": [{ "source": { "type": "seq_input", "input_index": 0 } }]
+        }
+      ]
+    }
+  ]
+}
+```
+
+### Tile artifact manifest (`manifest.json`)
+
+The compiler writes a per-tile JSON manifest at:
+
+- `target/raster/tiles/<tile_id>/<backend>/manifest.json`
+
+It is represented by `raster_compiler::builder::TileManifest`.
+
+- This manifest currently has **no explicit version field**.
+- Deserialization uses Serde’s defaults (no `deny_unknown_fields`), which means:
+  - **Readers MAY** ignore unknown fields (forward-extensibility).
+  - **Readers MUST** fail if required fields are missing or have incompatible types.
+
+**Implementation behavior (cache invalidation):**
+- If the manifest file is missing or cannot be parsed, the compiler treats the artifact as stale and recompiles.
+- The only explicitly backward-compatible field today is `source_hash`, which is `Option<String>` with `#[serde(default)]` to allow older manifests without that field to deserialize.
+
+#### Example (tile artifact `manifest.json`)
+
+```json
+{
+  "tile_id": "my_tile",
+  "backend": "native",
+  "method_id": "0123abcd...deadbeef",
+  "elf_size": 123456,
+  "source_hash": "0f0f0f0f0f0f0f0f0000000000000420"
+}
+```
+
+### Sequence schema and project manifest
+
+`raster_core::schema::SequenceSchema` and `raster_core::manifest::Manifest` both include `version: String` fields.
+
+- These versions are currently **unconstrained strings**.
+- There is currently **no canonical source of truth** for what they mean (SemVer vs other) and no runtime/compile-time validation.
+
+**Implementation gaps:**
+- Schema generation (`crates/raster-compiler/src/schema_gen.rs`) is unimplemented, so `SequenceSchema.version` is not currently produced by Raster tooling.
+- The runtime executor currently does not enforce any compatibility checks using these fields.
+
+## Compatibility policy (what implementations MUST do)
+
+This section describes the policy that a **conforming verifier/reader** SHOULD implement when consuming Raster artifacts.
+
+### Fail-closed on unknown format versions
+
+- If a format includes an explicit format version field (e.g., `ControlFlowSchema.version`), a verifier/reader **SHOULD** reject inputs with unknown versions.
+- Rejection MUST be explicit (an error), not silent coercion or “best effort” interpretation.
+
+**Implementation gap (today):**
+- Raster does not yet provide a standardized verifier/reader layer that performs these checks.
+
+### Additive evolution requires optional fields
+
+To evolve a JSON/Serde-based format without breaking old readers:
+
+- New fields **SHOULD** be optional (`Option<T>`) and/or have `#[serde(default)]` so older data can still be read.
+- Removing or renaming required fields is a **breaking change** and SHOULD require a format major version bump.
+
+**Implementation note:**
+- Most Raster structs do not currently annotate defaults for future fields, so naive additions may break backward compatibility for strict readers.
+
+### No migrations today
+
+- Raster currently provides **no migration framework** for transforming artifacts between versions.
+- As a result, any incompatible format change will require coordinated updates across producer and consumer components.
+
+## Handling unknown versions in verifiers
+
+Raster does not yet ship a full “verifier” implementation for artifacts in the `specs/Core/4. Verify/` sense. For future verifier implementations:
+
+- The verifier **MUST** reject artifacts with unknown/unsupported format versions.
+- The verifier **MUST** report the exact version string encountered and the set of supported versions.
+
+**Implementation gap (today):**
+- There is no `UnsupportedVersion` error variant in `raster_core::Error`, so implementations currently use `Error::Other(...)` / `Error::Serialization(...)` for such failures.
+
