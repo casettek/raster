@@ -543,6 +543,7 @@ impl std::fmt::Debug for FingerprintAccumulator {
         Ok(())
     }
 }
+
 impl FingerprintAccumulator {
     /// Create a new IterativeBitPacker starting at position 0.
     ///

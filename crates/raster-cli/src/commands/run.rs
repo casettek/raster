@@ -1,24 +1,21 @@
 //! Run command: build and execute the user program as a whole.
 
 use crate::BackendType;
+
 use raster_backend::ExecutionMode;
 use raster_backend_risc0::Risc0Backend;
 use raster_compiler::Project;
-use raster_core::fingerprint::{BitPacker, FingerprintAccumulator};
+use raster_core::fingerprint::BitPacker;
 use raster_core::ipc::{self, IpcMessage};
 use raster_core::trace::{AuditResult, TraceItem};
 use raster_core::{Error, Result};
+
+use raster_prover::replay::{ReplayResult, TraceReplayer};
 use raster_prover::trace::{
     BytesHashable, ExecutionCommitment, SerializableFrontier, TraceBridgeTree,
 };
-use raster_prover::transition::{
-    InitTransitionState, TransitionInput, TransitionJournal, TransitionState,
-};
-use raster_prover::{TRANSITION_GUEST_ELF, TRANSITION_GUEST_ID};
+use raster_prover::transition::{replay_transitions, TransitionJournal};
 
-use raster_prover::utils::DisplayBinary;
-use raster_tracing::{ReplayResult, TraceReplayer};
-use risc0_zkvm::{default_prover, ExecutorEnv, Receipt};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -40,16 +37,13 @@ pub fn run(
     }
 
     let project_path = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-
-    // Extract binary name from Cargo.toml
-    let binary_name = extract_binary_name(&project_path)
-        .ok_or_else(|| Error::Other("Could not determine binary name from Cargo.toml".into()))?;
+    let project = Project::new(project_path).expect("Failed to read project");
 
     println!("Building project...");
 
     // Build the project with cargo build --release
     let build_status = Command::new("cargo")
-        .current_dir(&project_path)
+        .current_dir(&project.root_dir)
         .args(["build", "--release"])
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -60,9 +54,7 @@ pub fn run(
         return Err(Error::Other("cargo build failed".into()));
     }
 
-    // Find the target directory using cargo metadata
-    let target_dir = find_target_path(&project_path).unwrap_or_else(|| project_path.join("target"));
-    let binary_path = target_dir.join("release").join(&binary_name);
+    let binary_path = project.target_dir.join("release").join(&project.name);
 
     if !binary_path.exists() {
         return Err(Error::Other(format!(
@@ -72,12 +64,12 @@ pub fn run(
     }
 
     println!();
-    println!("Running {}...", binary_name);
+    println!("Running {}...", &project.name);
     println!();
 
     // Build command with optional input argument
     let mut cmd = Command::new(&binary_path);
-    cmd.current_dir(&project_path);
+    cmd.current_dir(&project.root_dir);
 
     if let Some(input_json) = input {
         cmd.args(["--input", input_json]);
@@ -133,27 +125,6 @@ pub fn run(
             println!("  {}", line);
         }
         println!();
-    }
-
-    let execution_commitment = ExecutionCommitment::from(
-        &trace_items,
-        &raster_prover::precomputed::EMPTY_TRIE_NODES[0],
-    );
-
-    // TEMP: add item SHA's
-    // Print trace items as pretty JSON
-    if !trace_items.is_empty() {
-        println!("Trace ({} tile executions):", trace_items.len());
-        for (trace_item, item_commitement) in trace_items.iter().zip(execution_commitment.0.iter())
-        {
-            println!("   Trace item: fn: {}", trace_item.fn_name);
-            let item_commitment_hex: String = item_commitement
-                .iter()
-                .map(|b| format!("{:02x}", b))
-                .collect();
-            println!("    Item commitmemt: {:02X?}", item_commitment_hex);
-            println!();
-        }
     }
 
     // Handle audit result if present
@@ -212,9 +183,10 @@ pub fn run(
                 println!();
                 println!("Replaying trace window with Risc0 backend...");
 
-                let project = Project::new(project_path.clone())?;
-                let output_dir = project_path.join("target").join("raster");
-                let backend = Risc0Backend::new(output_dir).with_user_crate(project_path.clone());
+                let backend =
+                // TODO: Restructure backend <-> project relations
+                    Risc0Backend::new(project.output_dir.clone()).with_user_crate(project.root_dir.clone());
+
                 let replayer = TraceReplayer::new(&backend, &project);
                 let mode = ExecutionMode::prove_and_verify();
 
@@ -226,15 +198,6 @@ pub fn run(
                     match replayer.replay(item, mode) {
                         Ok(replay_result) => {
                             replayed_results.insert(item.fn_name.clone(), replay_result.clone());
-                            if let Some(verified) = replay_result.execution_result.verified {
-                                if verified {
-                                    println!("PROVED (verified)");
-                                } else {
-                                    println!("PROVED (unverified)");
-                                }
-                            } else {
-                                println!("OK");
-                            }
                         }
                         Err(e) => {
                             println!("FAILED: {}", e);
@@ -264,99 +227,18 @@ pub fn run(
                             )
                             .expect("Failed to get window fingerprint");
 
-                        let replay_result = replay_transitions(
+                        let Some(receipt) = replay_transitions(
                             &frontier,
                             &result.trace_window,
                             window_fingerprint,
                             diff.bits_per_item,
                             &replayed_results,
-                        );
+                        ) else {
+                            panic!("Failed to generate fraud proof");
+                        };
 
-                        if replay_result.failed_at_index.is_none() {
-                            println!(
-                                    "All {} transitions proved successfully with fingerprint verification.",
-                                    result.trace_window.len()
-                                );
-                        } else if let Some(failed_idx) = replay_result.failed_at_index {
-                            println!();
-                            println!("Transition replay failed at index {}.", failed_idx);
-                            println!(
-                                "  Transitions verified before failure: {}",
-                                replay_result.verified_count
-                            );
-
-                            // Show the exact trace item where fingerprint diverged
-                            if let Some(failed_item) = result.trace_window.get(failed_idx) {
-                                println!();
-                                println!(">>> DIVERGENT TRACE ITEM (index {}):", failed_idx);
-                                println!("    Function: {}", failed_item.fn_name);
-                                if let Some(ref desc) = failed_item.desc {
-                                    println!("    Description: {}", desc);
-                                }
-                                if !failed_item.inputs.is_empty() {
-                                    println!("    Inputs:");
-                                    for inp in &failed_item.inputs {
-                                        println!("      - {}: {}", inp.name, inp.ty);
-                                    }
-                                }
-                                if let Some(ref output_type) = failed_item.output_type {
-                                    println!("    Output type: {}", output_type);
-                                }
-
-                                // Show failure type
-                                if let Some(ref failure_type) = replay_result.failure_type {
-                                    println!();
-                                    match failure_type {
-                                        TransitionFailureType::FingerprintMismatch => {
-                                            println!(
-                                                "    Failure: Fingerprint mismatch at position {}",
-                                                diff.window_start_position + failed_idx
-                                            );
-                                        }
-                                        TransitionFailureType::ItemHashMismatch => {
-                                            println!("    Failure: Item hash mismatch");
-                                        }
-                                        TransitionFailureType::ProvingError(msg) => {
-                                            println!("    Failure: Proving error - {}", msg);
-                                        }
-                                    }
-                                }
-                            }
-
-                            // Show remaining items from the window
-                            let remaining_start = failed_idx + 1;
-                            if remaining_start < result.trace_window.len() {
-                                println!();
-                                println!(
-                                    ">>> REMAINING TRACE ITEMS ({} items not processed):",
-                                    result.trace_window.len() - remaining_start
-                                );
-                                for (offset, item) in
-                                    result.trace_window[remaining_start..].iter().enumerate()
-                                {
-                                    let idx = remaining_start + offset;
-                                    println!();
-                                    println!("    [{}] {}", idx, item.fn_name);
-                                    if let Some(ref desc) = item.desc {
-                                        println!("        Description: {}", desc);
-                                    }
-                                    if !item.inputs.is_empty() {
-                                        println!("        Inputs:");
-                                        for inp in &item.inputs {
-                                            println!("          - {}: {}", inp.name, inp.ty);
-                                        }
-                                    }
-                                    if let Some(ref output_type) = item.output_type {
-                                        println!("        Output type: {}", output_type);
-                                    }
-                                }
-                            } else {
-                                println!();
-                                println!(
-                                    ">>> No remaining trace items (failure occurred at last item)."
-                                );
-                            }
-                        }
+                        let final_journal: TransitionJournal = receipt.journal.decode().unwrap();
+                        println!("{:?}", final_journal);
                     }
                 }
             }
@@ -366,56 +248,6 @@ pub fn run(
     }
 
     Ok(())
-}
-
-/// Find the Cargo target directory for a project.
-/// Handles both workspace members and standalone projects.
-fn find_target_path(project_path: &std::path::Path) -> Option<PathBuf> {
-    // Run cargo metadata to get the target directory
-    let output = Command::new("cargo")
-        .current_dir(project_path)
-        .args(["metadata", "--format-version", "1", "--no-deps"])
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
-        return None;
-    }
-
-    let stdout = String::from_utf8(output.stdout).ok()?;
-    let meta: serde_json::Value = serde_json::from_str(&stdout).ok()?;
-
-    meta.get("target_directory")
-        .and_then(|v| v.as_str())
-        .map(PathBuf::from)
-}
-
-/// Extract the binary name from a Cargo.toml file.
-fn extract_binary_name(project_path: &std::path::Path) -> Option<String> {
-    let cargo_toml = std::fs::read_to_string(project_path.join("Cargo.toml")).ok()?;
-
-    // Simple parsing: look for name = "..." in [package] section
-    let mut in_package = false;
-    for line in cargo_toml.lines() {
-        let trimmed = line.trim();
-        if trimmed == "[package]" {
-            in_package = true;
-            continue;
-        }
-        if trimmed.starts_with('[') {
-            in_package = false;
-            continue;
-        }
-        if in_package && trimmed.starts_with("name") {
-            if let Some(start) = line.find('"') {
-                let rest = &line[start + 1..];
-                if let Some(end) = rest.find('"') {
-                    return Some(rest[..end].to_string());
-                }
-            }
-        }
-    }
-    None
 }
 
 /// Result of a transition replay operation.
@@ -438,131 +270,4 @@ pub enum TransitionFailureType {
     FingerprintMismatch,
     /// Proving error
     ProvingError(String),
-}
-
-/// Replay trace transitions using the transition guest to prove merkle tree state transitions.
-///
-/// For each trace item in the window:
-/// 1. Create a TransitionInput with the current frontier, trace item, and fingerprint data
-/// 2. Execute the transition guest in the RISC0 zkVM
-/// 3. Verify the output (including fingerprint) and update the frontier for the next iteration
-///
-/// # Arguments
-/// * `initial_frontier` - The frontier state before the first trace item
-/// * `trace_window` - The trace items to replay
-/// * `fingerprint` - The packed fingerprint u64s for verification
-/// * `window_start_position` - The starting position in the fingerprint for the first item
-/// * `bits_per_item` - Bits per fingerprint item
-///
-/// # Returns
-/// A `TransitionReplayResult` with details about success or failure
-fn replay_transitions(
-    initial_frontier: &SerializableFrontier,
-    trace_window: &[raster_core::trace::TraceItem],
-    fingerprint: Vec<u64>,
-    bits_per_item: usize,
-    replayed_results: &std::collections::BTreeMap<String, ReplayResult>,
-) -> TransitionReplayResult {
-    // Load the transition guest ELF from raster-prover
-
-    let fingerprint_accumulator: FingerprintAccumulator =
-        FingerprintAccumulator::new(BitPacker(bits_per_item));
-    let current_frontier = initial_frontier.clone();
-    let prover = default_prover();
-
-    let init_transition = InitTransitionState {
-        init_frontier: initial_frontier.clone(),
-        ref_fingerprint: FingerprintAccumulator::from(
-            fingerprint.clone(),
-            BitPacker(bits_per_item),
-            trace_window.len(),
-        ),
-    };
-    println!("init_transition fingerprint len: {}", init_transition.ref_fingerprint.len());
-    println!("{}", init_transition.ref_fingerprint);
-
-    let init_state = TransitionState::Init(init_transition);
-
-    let mut transition_receipt: Option<Receipt> = None;
-    let mut current_state = init_state;
-    let mut current_journal: Option<TransitionJournal> = None;
-
-    let self_image_id: Vec<u8> = TRANSITION_GUEST_ID
-            .into_iter()
-            .flat_map(|val| val.to_le_bytes())
-            .collect();
-
-    for (i, item) in trace_window.iter().enumerate() {
-
-        let Some(replay_result) = replayed_results.get(&item.fn_name) else {
-            panic!("Replayed IMAGE ID not found");
-        };
-        // Create the input for this transition with fingerprint data
-        let input = TransitionInput {
-            trace_item: item.clone(),
-            replay_image_id: replay_result.image_id.clone(),
-        };
-
-
-        let replay_receipt_bytes = replay_result.execution_result.receipt.clone().unwrap();
-        let replay_receipt: Receipt = postcard::from_bytes(&replay_receipt_bytes).unwrap();
-
-        
-        // Build the executor environment
-        let env = if let Some(journal) = current_journal {
-            println!("Next transition");
-            let Some(transition_receipt) = transition_receipt else {
-                panic!("Transition receipt not found");
-            };
-            ExecutorEnv::builder()
-                .add_assumption(replay_receipt)
-                .add_assumption(transition_receipt)
-                .write(&self_image_id)
-                .unwrap()
-                .write(&input)
-                .unwrap()
-                .write(&current_state)
-                .unwrap()
-                .write(&journal)
-                .unwrap()
-                .build()
-                .unwrap()
-        } else {
-            println!("Init transition");
-            ExecutorEnv::builder()
-                .add_assumption(replay_receipt)
-                .write(&self_image_id)
-                .unwrap()
-                .write(&input)
-                .unwrap()
-                .write(&current_state)
-                .unwrap()
-                .build()
-                .unwrap()
-        };
-
-        // Prove the transition
-        let prove_info = prover.prove(env, &TRANSITION_GUEST_ELF).unwrap();
-
-        transition_receipt = Some(prove_info.receipt.clone());
-
-        // Decode the output from the journal
-        let journal: TransitionJournal = prove_info.receipt.journal.decode().unwrap();
-
-        current_journal = Some(journal.clone());
-        current_state = journal.current_state.clone();
-
-    }
-
-    println!("Expected Fingerprint:");
-    fingerprint.print_binary();
-
-    println!("Final Fingerprint:");
-    fingerprint_accumulator.bits.print_binary();
-
-    TransitionReplayResult {
-        verified_count: trace_window.len(),
-        failed_at_index: None,
-        failure_type: None,
-    }
 }

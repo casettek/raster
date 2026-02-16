@@ -12,6 +12,8 @@ risc0-build = "1.2"
 
 [dependencies]
 raster-core = { workspace = true, features = ["std"] }
+raster-compiler = { workspace = true }
+raster-backend = { workspace = true }
 
 bincode.workspace = true
 bridgetree.workspace = true

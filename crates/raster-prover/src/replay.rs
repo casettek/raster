@@ -1,23 +1,23 @@
 //! Trace replayer for re-executing tiles with proof generation.
 
-use raster_backend::{Backend, ExecutionMode, TileExecutionResult};
+use raster_backend::{Backend, ExecutionMode};
 use raster_compiler::tile::TileDiscovery;
 use raster_compiler::Project;
+
 use raster_core::trace::TraceItem;
 use raster_core::{Error, Result};
 
-/// Result of replaying a trace item.
 #[derive(Debug, Clone)]
 pub struct ReplayResult {
-    /// The function name that was replayed.
     pub fn_name: String,
 
-    /// The execution result from the backend.
-    pub execution_result: TileExecutionResult,
+    pub receipt: Vec<u8>,
 
     pub image_id: Vec<u8>,
 }
 
+/// Result of replaying a trace item.
+///
 /// Replays trace items on a backend with proof generation.
 ///
 /// `TraceReplayer` takes trace items (typically from `AuditResult.trace_window`)
@@ -75,7 +75,7 @@ impl<'a> TraceReplayer<'a> {
 
         Ok(ReplayResult {
             fn_name: item.fn_name.clone(),
-            execution_result: exec_result,
+            receipt: exec_result.receipt.unwrap(),
             image_id,
         })
     }
@@ -113,9 +113,10 @@ mod tests {
         // Basic test to ensure ReplayResult can be constructed and debug-printed
         let result = ReplayResult {
             fn_name: "test_fn".to_string(),
-            execution_result: TileExecutionResult::estimate(vec![1, 2, 3], 1000),
+            receipt: Vec::new(),
             image_id: Vec::new(),
         };
         assert_eq!(result.fn_name, "test_fn");
     }
 }
+

@@ -26,7 +26,6 @@ raster-backend-risc0.workspace = true
 raster-compiler.workspace = true
 raster-runtime.workspace = true
 raster-analysis.workspace = true
-raster-tracing.workspace = true
 raster-prover = { workspace = true }
 
 risc0-zkvm = { version = "1.2", features = ["prove", "std"] }
