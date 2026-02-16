@@ -1,0 +1,26 @@
+---
+description: Rust workspace implementation conventions for Raster
+globs: **/*.rs
+alwaysApply: false
+---
+
+# Rust Workspace Conventions
+
+## Rust implementation
+
+- Keep public APIs explicit and stable (`pub` surface, return types, and error shapes).
+- Validate external input at boundaries (CLI args, file IO, env, and serialized payloads).
+- Prefer `Result`-based error propagation with actionable context over panics in library code.
+- Preserve deterministic behavior for trace, fingerprint, and artifact generation paths.
+
+## Workspace structure
+
+- Keep domain types and shared contracts in `raster-core` when reused across crates.
+- Keep CLI orchestration in `raster-cli`; keep business logic in library crates.
+- Avoid circular dependencies between workspace crates; compose via narrow interfaces.
+- Maintain backward compatibility for serialized formats unless intentionally versioned.
+
+## File hygiene
+
+- Keep modules focused and split files that mix parsing, execution, and serialization concerns.
+- Use names tied to Raster domain terms (tile, sequence, trace, fingerprint, verifier).
