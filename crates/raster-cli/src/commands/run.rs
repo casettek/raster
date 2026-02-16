@@ -7,10 +7,12 @@ use raster_backend_risc0::Risc0Backend;
 use raster_compiler::Project;
 use raster_core::fingerprint::BitPacker;
 use raster_core::ipc::{self, IpcMessage};
-use raster_core::trace::{AuditResult, TraceItem};
+use raster_core::trace::AuditResult;
+use raster_core::trace::TraceItem;
 use raster_core::{Error, Result};
 
-use raster_prover::replay::{ReplayResult, TraceReplayer};
+use raster_prover::replay::{ReplayResult, Replayer};
+
 use raster_prover::trace::{
     BytesHashable, ExecutionCommitment, SerializableFrontier, TraceBridgeTree,
 };
@@ -133,28 +135,7 @@ pub fn run(
             println!("Audit verification passed",);
         } else {
             println!("Audit verification FAILED!");
-            if let Some(ref diff) = result.diff {
-                println!("  Divergence detected at trace index: {}", diff.index);
-                if !diff.frontier.is_empty() {
-                    // Display frontier as hex for debugging/replay purposes
-                    let frontier_hex: String =
-                        diff.frontier.iter().map(|b| format!("{:02x}", b)).collect();
-                    let ser_frontier = SerializableFrontier::from_bytes(&diff.frontier);
-                    let frontier = ser_frontier
-                        .expect("Can't deserialized frontier")
-                        .to_frontier()
-                        .expect("Can't reconstruct frontier");
-                    let mut tree = TraceBridgeTree::from_frontier(1, frontier);
-                    tree.append(raster_prover::trace::Bytes(trace_items[diff.index].hash()));
-                    let Some(root) = tree.root(0) else {
-                        panic!("Can't get tree root");
-                    };
-                    let root_hex: String = root.0.iter().map(|b| format!("{:02x}", b)).collect();
 
-                    println!("  Root (hex): {}", root_hex);
-                    println!("  Frontier (hex): {}", frontier_hex);
-                }
-            }
             // Display trace window for debugging context
             if !result.trace_window.is_empty() {
                 println!();
@@ -187,7 +168,7 @@ pub fn run(
                 // TODO: Restructure backend <-> project relations
                     Risc0Backend::new(project.output_dir.clone()).with_user_crate(project.root_dir.clone());
 
-                let replayer = TraceReplayer::new(&backend, &project);
+                let replayer = Replayer::new(&backend, &project);
                 let mode = ExecutionMode::prove_and_verify();
 
                 let mut replayed_results: BTreeMap<String, ReplayResult> = BTreeMap::new();

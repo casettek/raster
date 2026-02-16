@@ -2,9 +2,9 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
+use raster_core::fingerprint::BitPacker;
 use raster_core::ipc;
 use raster_core::trace::{AuditDiff, AuditResult, TraceInputParam, TraceItem};
-use raster_core::fingerprint::BitPacker;
 use raster_prover::precomputed::EMPTY_TRIE_NODES;
 use raster_prover::trace::{SerializableFrontier, TraceCommitmentProducer};
 

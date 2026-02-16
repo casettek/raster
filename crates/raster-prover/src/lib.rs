@@ -13,10 +13,10 @@
 include!(concat!(env!("OUT_DIR"), "/methods.rs"));
 
 pub mod error;
-pub mod transition;
 pub mod precomputed;
-pub mod trace;
-pub mod utils;
 pub mod replay;
+pub mod trace;
+pub mod transition;
+pub mod utils;
 
 pub use error::{BitPackerError, Result};

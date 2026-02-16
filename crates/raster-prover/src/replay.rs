@@ -25,12 +25,12 @@ pub struct ReplayResult {
 /// - Generating proofs for previously recorded executions
 /// - Verifying that replay produces the same outputs
 /// - Debugging execution discrepancies
-pub struct TraceReplayer<'a> {
+pub struct Replayer<'a> {
     backend: &'a dyn Backend,
     project: &'a Project,
 }
 
-impl<'a> TraceReplayer<'a> {
+impl<'a> Replayer<'a> {
     /// Create a new replayer with the given backend and project context.
     ///
     /// # Arguments
@@ -78,45 +78,6 @@ impl<'a> TraceReplayer<'a> {
             receipt: exec_result.receipt.unwrap(),
             image_id,
         })
-    }
-
-    /// Replay multiple trace items in sequence.
-    ///
-    /// This is a convenience method for replaying all items in a trace window.
-    /// Stops on first error and returns the results collected so far.
-    ///
-    /// # Arguments
-    /// * `items` - Slice of trace items to replay
-    /// * `mode` - Execution mode for all items
-    ///
-    /// # Returns
-    /// A vector of replay results for each successfully replayed item.
-    pub fn replay_all(
-        &self,
-        items: &[TraceItem],
-        mode: ExecutionMode,
-    ) -> Result<Vec<ReplayResult>> {
-        let mut results = Vec::with_capacity(items.len());
-        for item in items {
-            results.push(self.replay(item, mode)?);
-        }
-        Ok(results)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_replay_result_debug() {
-        // Basic test to ensure ReplayResult can be constructed and debug-printed
-        let result = ReplayResult {
-            fn_name: "test_fn".to_string(),
-            receipt: Vec::new(),
-            image_id: Vec::new(),
-        };
-        assert_eq!(result.fn_name, "test_fn");
     }
 }
 
