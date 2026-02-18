@@ -1,7 +1,7 @@
 pub mod subscriber;
 
-use crate::tracing::subscriber::{GLOBAL_SUBSCRIBER, Subscriber};
 use crate::tracing::subscriber::json::JsonSubscriber;
+use crate::tracing::subscriber::{Subscriber, GLOBAL_SUBSCRIBER};
 
 /// Initializes the global subscriber with a JSON subscriber that writes to stdout.
 ///
@@ -29,7 +29,7 @@ pub fn finish() {
 // This is not part of the public API.
 
 #[doc(hidden)]
-pub fn __emit_trace(
+pub fn emit_trace(
     function_name: &str,
     desc: Option<&str>,
     input_params: &[(&str, &str)],

@@ -11,8 +11,8 @@ members = [
     "crates/raster-analysis",
     "crates/raster-cli",
     "crates/raster-prover",
-    "examples/hello-tiles",
     "crates/raster-backend-native",
+    "examples/hello-tiles",
 ]
 
 [workspace.package]
@@ -33,7 +33,6 @@ raster-backend-risc0 = { path = "crates/raster-backend-risc0", version = "0.1.0"
 raster-compiler = { path = "crates/raster-compiler", version = "0.1.0" }
 raster-analysis = { path = "crates/raster-analysis", version = "0.1.0" }
 raster-prover = { path = "crates/raster-prover", version = "0.1.0" }
-raster-tracing = { path = "crates/raster-tracing", version = "0.1.0" }
 
 # External dependencies
 serde = { version = "1.0", default-features = false, features = ["derive", "alloc"] }

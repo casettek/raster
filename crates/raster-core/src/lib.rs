@@ -20,8 +20,6 @@ pub mod tile;
 #[cfg(feature = "std")]
 pub mod cfs;
 #[cfg(feature = "std")]
-pub mod ipc;
-#[cfg(feature = "std")]
 pub mod manifest;
 #[cfg(feature = "std")]
 pub mod schema;

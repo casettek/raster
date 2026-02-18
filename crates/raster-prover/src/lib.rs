@@ -6,7 +6,7 @@
 //! # Main Components
 //!
 //! - [`bit_packer::BitPacker`] - Pack hash bits into compact fingerprints
-//! - [`trace::ExecutionCommitment`] - Create incremental Merkle commitments
+//! - [`trace::TraceCommitment`] - Create incremental Merkle commitments
 //! - [`guest`] - RISC0 guest types for iterative trace verification
 //! - [`error`] - Error types for the library
 

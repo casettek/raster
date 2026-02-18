@@ -4,7 +4,6 @@
 //! main() to handle tile execution requests from the raster CLI's native backend,
 //! and to parse input arguments.
 
-use raster_core::ipc;
 use raster_core::registry::find_tile_by_str;
 
 use serde::de::DeserializeOwned;
@@ -105,10 +104,6 @@ pub fn try_execute_tile_from_args() -> bool {
             std::process::exit(1);
         }
     };
-
-    // TODO: broken - fix flow with single tile execution on native backend
-    // for now nonsent output
-    ipc::emit_output(&std::string::String::from_utf8_lossy(&output));
 
     true
 }

@@ -10,7 +10,8 @@ use std::cmp::Ordering;
 use bridgetree::{Hashable, Level, NonEmptyFrontier, Position};
 use risc0_zkvm::guest::env;
 
-use raster_core::fingerprint::FingerprintAccumulator;
+use raster_core::fingerprint::{Fingerprint, FingerprintAccumulator};
+
 use raster_core::trace::TraceItem;
 
 use serde::{Deserialize, Serialize};
@@ -24,7 +25,7 @@ use sha2::{Digest, Sha256};
 pub struct Bytes(pub Vec<u8>);
 
 pub type TraceBridgeTree = bridgetree::BridgeTree<Bytes, u64, 32>;
-/// A serializable representation of a frontier.
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SerializableFrontier {
     pub position: u64,
@@ -39,30 +40,30 @@ pub struct TransitionInput {
     pub replay_image_id: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct Transition {
     pub frontier: SerializableFrontier,
-    pub fingerprint_acc: FingerprintAccumulator,
+    pub actual_fingerprint_acc: FingerprintAccumulator,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct InitTransitionState {
     pub init_frontier: SerializableFrontier,
-    pub ref_fingerprint: FingerprintAccumulator,
+    pub fingerprint: Fingerprint,
     // TODO: Init Transition should verify proof of inclusion of reference fingerprint
     // pub ref_fingerprint_inclusion_proof: Vec<u8>,
     // TODO: Init Transition should contain reference to CFS
     // pub cfs: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub enum TransitionState {
     Init(InitTransitionState),
     Next(Transition),
     Finished,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct TransitionJournal {
     pub init_state: InitTransitionState,
     pub current_state: TransitionState,
@@ -182,15 +183,15 @@ fn main() {
                 panic!("Can't get tree root");
             };
 
-            let mut fingerprint_acc =
-                FingerprintAccumulator::new(init_transition.ref_fingerprint.bits_packer.clone());
-            fingerprint_acc.push(&tree_root.0);
+            let mut actual_fingerprint_acc =
+                FingerprintAccumulator::new(init_transition.fingerprint.bits_packer.clone());
+            actual_fingerprint_acc.append(&tree_root.0);
 
             let new_frontier = SerializableFrontier::from_frontier(&init_frontier);
 
             let current_state = TransitionState::Next(Transition {
                 frontier: new_frontier,
-                fingerprint_acc,
+                actual_fingerprint_acc,
             });
 
             let journal = TransitionJournal {
@@ -213,7 +214,10 @@ fn main() {
             )
             .expect("Failed to verify trace replay image id");
 
-            assert!(self_image_id == prev_journal.self_image_id, "Self image id does not match");
+            assert!(
+                self_image_id == prev_journal.self_image_id,
+                "Self image id does not match"
+            );
 
             let TransitionState::Next(prev_transition) = prev_journal.current_state else {
                 panic!("Provided Transition in Next State does not match the expected Transition State in Journal");
@@ -243,28 +247,30 @@ fn main() {
                 panic!("Can't get tree root");
             };
 
-            let mut fingerprint_acc = transition.fingerprint_acc.clone();
-            fingerprint_acc.push(&tree_root.0);
+            let mut actual_fingerprint_acc = transition.actual_fingerprint_acc.clone();
+            actual_fingerprint_acc.append(&tree_root.0);
 
             let new_frontier = SerializableFrontier::from_frontier(&current_frontier);
 
+            let actual_fingerprint: Fingerprint = actual_fingerprint_acc.into_fingerprint();
+
             let current_state =
-                if fingerprint_acc.len() == prev_journal.init_state.ref_fingerprint.len() {
-                    assert!(fingerprint_acc.diff_at_index(
-                        fingerprint_acc.len() - 1,
-                        &prev_journal.init_state.ref_fingerprint
+                if actual_fingerprint.len() == prev_journal.init_state.fingerprint.len() {
+                    assert!(actual_fingerprint.diff_at_index(
+                        actual_fingerprint.len() - 1,
+                        &prev_journal.init_state.fingerprint
                     ));
 
                     TransitionState::Finished
                 } else {
-                    assert!(!fingerprint_acc.diff_at_index(
-                        fingerprint_acc.len() - 1,
-                        &prev_journal.init_state.ref_fingerprint
+                    assert!(!actual_fingerprint.diff_at_index(
+                        actual_fingerprint.len() - 1,
+                        &prev_journal.init_state.fingerprint
                     ));
 
                     TransitionState::Next(Transition {
                         frontier: new_frontier,
-                        fingerprint_acc,
+                        actual_fingerprint_acc: FingerprintAccumulator::from(actual_fingerprint),
                     })
                 };
             let journal = TransitionJournal {
