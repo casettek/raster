@@ -146,51 +146,37 @@ impl BitPacker {
     ///
     /// Returns an error if the index is out of bounds.
     pub fn try_get(&self, index: usize, packed: &[u64]) -> Result<u64, BitPackerError> {
-        let mut value = 0u64;
+        let bit_width = self.0;
 
-        let value_start_offset = index * self.0;
-        let block_index = value_start_offset / 64;
-        let value_end_offset = value_start_offset + self.0 - 1;
+        let value_start_offset = index * bit_width;
+        let value_end_offset = value_start_offset + bit_width; // Exclusive end
         let max_bits = packed.len() * 64;
 
-        if value_end_offset >= max_bits {
+        if value_end_offset > max_bits {
             return Err(BitPackerError::IndexOutOfBounds {
                 index,
-                max: max_bits / self.0,
+                max: max_bits / bit_width,
             });
         }
 
-        let intra_block_start_index = value_start_offset % 64;
-        let block = packed
-            .get(block_index)
-            .ok_or(BitPackerError::IndexOutOfBounds {
-                index: block_index,
-                max: packed.len(),
-            })?;
+        let block_index = value_start_offset / 64;
+        let intra_block_offset = value_start_offset % 64;
 
-        let block_end_offset = ((block_index + 1) * 64) - 1;
-        let block_value_bit_len = self.0 - value_end_offset.saturating_sub(block_end_offset);
-        let mask = ((1u64 << block_value_bit_len) - 1u64) << intra_block_start_index;
+        let mask = if bit_width == 64 {
+            !0u64
+        } else {
+            (1u64 << bit_width) - 1
+        };
 
-        value |= (mask & *block) >> intra_block_start_index;
+        let mut value = packed[block_index] >> intra_block_offset;
 
-        if value_end_offset.saturating_sub(block_end_offset) > 0 {
-            let next_block_index = block_index + 1;
-            let next_block =
-                packed
-                    .get(next_block_index)
-                    .ok_or(BitPackerError::IndexOutOfBounds {
-                        index: next_block_index,
-                        max: packed.len(),
-                    })?;
-
-            let next_block_value_bit_len = self.0 - block_value_bit_len;
-            let mask = (1u64 << next_block_value_bit_len) - 1u64;
-
-            value |= (mask & *next_block) << block_value_bit_len;
+        let bits_in_first_block = 64 - intra_block_offset;
+        if bits_in_first_block < bit_width {
+            let next_block = packed[block_index + 1];
+            value |= next_block << bits_in_first_block;
         }
 
-        Ok(value)
+        Ok(value & mask)
     }
 
     /// Get a range of packed values.
@@ -200,62 +186,48 @@ impl BitPacker {
         self.try_get_range(start, end, packed).ok()
     }
 
-    /// Try to get a range of packed values.
-    ///
-    /// Returns an error if the range is invalid.
     pub fn try_get_range(
         &self,
         start: usize,
         end: usize,
         packed: &[u64],
     ) -> Result<Vec<u64>, BitPackerError> {
+        let bit_width = self.0;
         if start >= end {
+            return Ok(Vec::new());
+        }
+
+        let total_bits_needed = end * bit_width;
+        let max_bits_available = packed.len() * 64;
+
+        if total_bits_needed > max_bits_available {
             return Err(BitPackerError::InvalidRange {
                 start,
                 end,
-                max: packed.len() * 64 / self.0,
+                max: max_bits_available / bit_width,
             });
         }
 
-        let num_bits = (end - start) * self.0;
-        let num_blocks = (num_bits / 64) + (!num_bits.is_multiple_of(64)) as usize;
-
-        let start_offset = start * self.0;
-        let end_offset = (end * self.0) + self.0 - 1;
-        let max_bits = packed.len() * 64;
-
-        if start_offset > max_bits || end_offset > max_bits {
-            return Err(BitPackerError::InvalidRange {
-                start,
-                end,
-                max: max_bits / self.0,
-            });
-        }
-
-        let mut range: Vec<u64> = vec![0u64; num_blocks];
+        let num_elements = end - start;
+        let total_output_bits = num_elements * bit_width;
+        let num_blocks = total_output_bits.div_ceil(64);
+        let mut range = vec![0u64; num_blocks];
 
         for (i, index) in (start..end).enumerate() {
-            let bit_start = i * self.0;
-            let bit_end = bit_start + self.0 - 1;
+            let value = self.try_get(index, packed)?;
 
+            let bit_start = i * bit_width;
             let block_idx = bit_start / 64;
             let block_offset = bit_start % 64;
 
-            if let Some(value) = self.get(index, packed) {
-                if bit_end < (block_idx + 1) * 64 {
-                    range[block_idx] |= value << block_offset;
-                } else {
-                    let next_block_value_bit_len = bit_end - ((block_idx + 1) * 64);
-                    let current_block_value_bit_len = self.0 - next_block_value_bit_len;
-                    range[block_idx] |=
-                        (value & ((1u64 << current_block_value_bit_len) - 1u64)) << block_offset;
+            range[block_idx] |= value << block_offset;
 
-                    let overflow_bits = value >> current_block_value_bit_len;
-                    range[block_idx + 1] =
-                        range[block_idx + 1] << next_block_value_bit_len | overflow_bits;
-                }
+            let bits_written = 64 - block_offset;
+            if bits_written < bit_width {
+                range[block_idx + 1] |= value >> bits_written;
             }
         }
+
         Ok(range)
     }
 
@@ -505,26 +477,6 @@ impl<'a, 'b> Iterator for Iter<'a, 'b> {
     }
 }
 
-/// Iterative bit packer that writes directly into a Vec<u64>.
-///
-/// Unlike `BitPacker` which requires all items upfront, `IterativeBitPacker`
-/// allows adding items one at a time to an existing Vec, tracking the position
-/// automatically.
-///
-/// # Example
-///
-/// ```
-/// use raster_core::fingerprint::IterativeBitPacker;
-///
-/// let mut packed = Vec::new();
-/// {
-///     let mut packer = IterativeBitPacker::new(8, &mut packed);
-///     packer.push(&[1u8]);
-///     packer.push(&[2u8]);
-///     packer.push(&[3u8]);
-/// }
-/// // packed now contains the bit-packed data
-/// ```
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct Fingerprint {
     pub bits_packer: BitPacker,

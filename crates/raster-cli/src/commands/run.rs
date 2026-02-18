@@ -23,14 +23,12 @@ use raster_prover::transition::{replay_transitions, TransitionJournal};
 
 use crate::BackendType;
 
-/// Run the user program with the specified backend.
 pub fn run(
     backend_type: BackendType,
     input: Option<&str>,
     commit_flag: Option<&str>,
     audit_flag: Option<&str>,
 ) -> Result<()> {
-    // Only native backend is supported for whole-program execution
     if backend_type != BackendType::Native {
         return Err(Error::Other(
             "Only the native backend is supported for running entire programs. \
@@ -90,7 +88,6 @@ pub fn run(
     if !output.status.success() {
         let code = output.status.code().unwrap_or(-1);
         let stderr = String::from_utf8_lossy(&output.stderr);
-        println!("stderr: {}", stderr);
 
         return Err(Error::Other(format!(
             "Program exited with code {}: {}",
@@ -103,12 +100,19 @@ pub fn run(
     let mut trace_items: Vec<TraceItem> = Vec::new();
 
     for line in stdout.lines() {
-        let trace_item = serde_json::from_str(line).expect("Failed to parse Trace Item");
-        trace_items.push(trace_item);
+        if let Some(parsed) = line.strip_prefix("[trace]").map(serde_json::from_str) {
+            if let Ok(trace_item) = parsed {
+                trace_items.push(trace_item);
+            }
+        }
     }
 
     if commit_flag.is_some() {
-        commit(&trace_items, commit_path);
+        if commit_path.starts_with("fraud") {
+            fraud(&mut trace_items, commit_path)
+        } else {
+            commit(&trace_items, commit_path);
+        }
     } else if audit_flag.is_some() {
         let verification_result = verify(&trace_items, commit_path);
 
@@ -127,6 +131,23 @@ pub fn run(
     Ok(())
 }
 
+pub fn fraud(trace_items: &mut [TraceItem], commit_path: &str) {
+    let mut commitment_file =
+        std::fs::File::create(commit_path).expect("Failed to create commitemt file");
+
+    if let Some(fraud_trace_item) = trace_items.last_mut() {
+        fraud_trace_item.output_data = vec![0u8, 1u8];
+    };
+
+    let trace_commitment = TraceCommitment::from(trace_items, &EMPTY_TRIE_NODES[0]);
+
+    let bytes = postcard::to_allocvec(&trace_commitment).unwrap();
+
+    commitment_file
+        .write_all(&bytes)
+        .expect("Failed to save commitment");
+}
+
 pub fn commit(trace_items: &[TraceItem], commit_path: &str) {
     let mut commitment_file =
         std::fs::File::create(commit_path).expect("Failed to create commitemt file");
@@ -141,15 +162,20 @@ pub fn commit(trace_items: &[TraceItem], commit_path: &str) {
 
 pub fn verify(trace_items: &[TraceItem], commit_path: &str) -> VerificationResult {
     let trace_commitment = read_trace_commitment(commit_path);
+
+    let actual_trace_commitment = TraceCommitment::from(trace_items, &EMPTY_TRIE_NODES[0]);
+
     let mut trace_verifier: TraceVerifier =
         TraceVerifier::new(trace_commitment, &EMPTY_TRIE_NODES[0]);
 
     for trace_item in trace_items {
         if let VerificationResult::Fraud(fraud_window) = trace_verifier.verify(trace_item) {
+            println!("verification result: \nfraud: {:?}", fraud_window);
             return VerificationResult::Fraud(fraud_window);
         }
     }
 
+    println!("verification result: ok");
     VerificationResult::Ok
 }
 

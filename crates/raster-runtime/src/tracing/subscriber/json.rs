@@ -48,7 +48,7 @@ impl<W: Write + Send + Sync> Subscriber for JsonSubscriber<W> {
 
         let mut writer_guard = self.writer.lock().expect("Writer mutex poisoned");
         let json_str = serde_json::to_string(&item).expect("Failed to serialize");
-        write!(writer_guard, "{}", json_str).expect("Failed to write");
+        write!(writer_guard, "[trace]{}\n", json_str).expect("Failed to write");
     }
 
     fn on_complete(&self) {

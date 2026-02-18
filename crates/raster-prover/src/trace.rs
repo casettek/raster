@@ -145,6 +145,7 @@ pub type TraceTree = bridgetree::BridgeTree<Bytes, u64, 32>;
 pub type TraceTreeFrontier = NonEmptyFrontier<Bytes>;
 
 pub const WINDOW_SIZE: u8 = 2;
+pub const BITS_PER_ITEM: usize = 16;
 
 /// Commitment to an execution trace using incremental Merkle roots.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -155,15 +156,15 @@ pub struct TraceCommitment {
 
 impl TraceCommitment {
     pub fn from(items: &[TraceItem], seed: &[u8]) -> TraceCommitment {
-        let revealed_items = items[..(WINDOW_SIZE as usize)].to_vec();
+        // let revealed_items = items[..(WINDOW_SIZE as usize)].to_vec();
+        let revealed_items = items[..].to_vec();
 
         let items_hashes: Vec<Vec<u8>> = items.iter().map(|item| item.hash()).collect();
 
-        let mut trace_tree = TraceTree::new(1);
+        let mut trace_tree = TraceTree::new(BITS_PER_ITEM);
         trace_tree.append(Bytes(seed.to_vec()));
 
-        let mut fingerprint_acc =
-            FingerprintAccumulator::new(BitPacker((HASH_SIZE * 8) / (WINDOW_SIZE as usize)));
+        let mut fingerprint_acc = FingerprintAccumulator::new(BitPacker(33));
 
         for item_hash in &items_hashes {
             trace_tree.append(Bytes(item_hash.clone()));
@@ -306,8 +307,8 @@ impl TraceVerifier {
 
         let init_frontier = trace_tree.frontier().cloned().unwrap();
 
-        let mut fingerprint_acc =
-            FingerprintAccumulator::new(BitPacker((HASH_SIZE * 8) / (WINDOW_SIZE as usize)));
+        let bit_packer = trace_commitment.fingerprint.bits_packer.clone();
+        let mut fingerprint_acc = FingerprintAccumulator::new(bit_packer);
 
         let mut window_frontiers: Window<TraceTreeFrontier> = Window::new(WINDOW_SIZE.into());
         let window_items: Window<TraceItem> = Window::new(WINDOW_SIZE.into());
