@@ -156,8 +156,7 @@ pub struct TraceCommitment {
 
 impl TraceCommitment {
     pub fn from(items: &[TraceItem], seed: &[u8]) -> TraceCommitment {
-        // let revealed_items = items[..(WINDOW_SIZE as usize)].to_vec();
-        let revealed_items = items[..].to_vec();
+        let revealed_items = items[..(WINDOW_SIZE as usize)].to_vec();
 
         let items_hashes: Vec<Vec<u8>> = items.iter().map(|item| item.hash()).collect();
 
