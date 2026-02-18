@@ -180,6 +180,14 @@ impl TraceCommitment {
         }
     }
 
+    /// Try to create a commitment from items, returning an error if the trace is empty.
+    pub fn try_from(items: &[TraceItem], seed: &[u8]) -> Result<TraceCommitment> {
+        if items.is_empty() {
+            return Err(BitPackerError::EmptyTrace);
+        }
+        Ok(Self::from(items, seed))
+    }
+
     /// Get the frontier (partial Merkle path) at position n.
     ///
     /// This can be used to continue building the tree from position n.
@@ -427,21 +435,12 @@ mod tests {
             make_tile_trace_item(4, 4),
         ];
 
-        let binded_trace = ExecutionCommitment::from(&items, &precomputed::EMPTY_TRIE_NODES[0]);
+        let binded_trace = TraceCommitment::from(&items, &precomputed::EMPTY_TRIE_NODES[0]);
         let ref_binded_trace =
-            ExecutionCommitment::from(&ref_items, &precomputed::EMPTY_TRIE_NODES[0]);
+            TraceCommitment::from(&ref_items, &precomputed::EMPTY_TRIE_NODES[0]);
 
         // Check that different items produce different commitments
-        let trace_comp_iter = items.iter().zip(ref_items.iter());
-        let binded_trace_comp_iter = binded_trace.0.iter().zip(ref_binded_trace.0.iter());
-
-        for ((item, ref_item), (binded_trace_item, ref_binded_trace_item)) in
-            trace_comp_iter.zip(binded_trace_comp_iter)
-        {
-            if item.input_data != ref_item.input_data || item.output_data != ref_item.output_data {
-                assert_ne!(binded_trace_item, ref_binded_trace_item);
-            }
-        }
+        assert_ne!(binded_trace.fingerprint, ref_binded_trace.fingerprint);
     }
 
     #[test]
@@ -454,7 +453,7 @@ mod tests {
     #[test]
     fn test_try_from_empty_trace() {
         let items: Vec<TraceItem> = vec![];
-        let result = ExecutionCommitment::try_from(&items, &precomputed::EMPTY_TRIE_NODES[0]);
+        let result = TraceCommitment::try_from(&items, &precomputed::EMPTY_TRIE_NODES[0]);
         assert!(matches!(result, Err(BitPackerError::EmptyTrace)));
     }
 
@@ -510,7 +509,7 @@ mod tests {
             let bridgetree_root = tree.root(0).expect("root").0.clone();
 
             let frontier = tree.frontier().expect("frontier").clone();
-            let ser_frontier = SerializableFrontier::from_frontier(&frontier);
+            let ser_frontier = SerializableFrontier::from_frontier(frontier.clone());
             let deser_frontier = ser_frontier
                 .into_frontier()
                 .expect("Can't deserialize frontier");
