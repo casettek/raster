@@ -604,6 +604,14 @@ impl FingerprintAccumulator {
     pub fn into_fingerprint(self) -> Fingerprint {
         self.fingerprint
     }
+
+    pub fn fingerprint(&self) -> &Fingerprint {
+        &self.fingerprint
+    }
+
+    pub fn push(&mut self, item: &[u8]) {
+        self.append(item);
+    }
 }
 
 #[cfg(test)]
@@ -686,11 +694,7 @@ mod tests {
         ];
         let bp = BitPacker::new(8);
         let expected = bp.pack(&items);
-        let fingerprint = FingerprintAccumulator {
-            bits_packer: bp,
-            bits: expected,
-            len: items.len(),
-        };
+        let fingerprint = FingerprintAccumulator::from(Fingerprint::from(expected.clone(), bp, items.len()));
 
         let mut acc = FingerprintAccumulator::new(bp);
         for item in &items {
@@ -1235,7 +1239,7 @@ mod tests {
             fingerprint_accumulator.push(fp);
         }
 
-        assert_eq!(fingerprint_accumulator.bits, expected_packed);
+        assert_eq!(fingerprint_accumulator.fingerprint().bits, expected_packed);
     }
 
     #[test]
@@ -1264,7 +1268,7 @@ mod tests {
             fingerprint_accumulator.push(fp);
         }
 
-        assert_eq!(fingerprint_accumulator.bits, expected_packed);
+        assert_eq!(fingerprint_accumulator.fingerprint().bits, expected_packed);
     }
 
     #[test]
@@ -1282,7 +1286,7 @@ mod tests {
             }
 
             assert_eq!(
-                fingerprint_accumulator.bits, expected_packed,
+                fingerprint_accumulator.fingerprint().bits, expected_packed,
                 "Mismatch for bits_per_item={}",
                 bits_per_item
             );
@@ -1306,13 +1310,14 @@ mod tests {
         }
 
         // Then, append the second batch using with_offset
+        let fp = fingerprint_accumulator.into_fingerprint();
         let mut fingerprint_accumulator =
-            FingerprintAccumulator::from(fingerprint_accumulator.bits, BitPacker(8), 8);
-        for fp in &fingerprints_second {
-            fingerprint_accumulator.push(fp);
+            FingerprintAccumulator::from(Fingerprint::from(fp.bits, fp.bits_packer, fp.len));
+        for item in &fingerprints_second {
+            fingerprint_accumulator.push(item);
         }
 
-        assert_eq!(fingerprint_accumulator.bits, expected_packed);
+        assert_eq!(fingerprint_accumulator.fingerprint().bits, expected_packed);
     }
 
     #[test]
@@ -1327,18 +1332,19 @@ mod tests {
 
         // First, pack the first batch
         let mut fingerprint_accumulator = FingerprintAccumulator::new(BitPacker(9));
-        for fp in &fingerprints_first {
-            fingerprint_accumulator.push(fp);
+        for item in &fingerprints_first {
+            fingerprint_accumulator.push(item);
         }
 
         // Then, append the second batch using with_offset
+        let fp = fingerprint_accumulator.into_fingerprint();
         let mut fingerprint_accumulator =
-            FingerprintAccumulator::from(fingerprint_accumulator.bits, BitPacker(9), 7);
-        for fp in &fingerprints_second {
-            fingerprint_accumulator.push(fp);
+            FingerprintAccumulator::from(Fingerprint::from(fp.bits, fp.bits_packer, fp.len));
+        for item in &fingerprints_second {
+            fingerprint_accumulator.push(item);
         }
 
-        assert_eq!(fingerprint_accumulator.bits, expected_packed);
+        assert_eq!(fingerprint_accumulator.fingerprint().bits, expected_packed);
     }
 
     #[test]
@@ -1348,48 +1354,48 @@ mod tests {
         for i in 0..8u8 {
             fingerprint_accumulator.push(&[i]);
         }
-        assert_eq!(fingerprint_accumulator.bits.len(), 1);
+        assert_eq!(fingerprint_accumulator.fingerprint().bits.len(), 1);
 
         // Push 8 more items = 64 more bits = 2 blocks total
+        let fp = fingerprint_accumulator.into_fingerprint();
         let mut fingerprint_accumulator =
-            FingerprintAccumulator::from(fingerprint_accumulator.bits, BitPacker(8), 8);
+            FingerprintAccumulator::from(Fingerprint::from(fp.bits, fp.bits_packer, fp.len));
         for i in 8..16u8 {
             fingerprint_accumulator.push(&[i]);
         }
-        assert_eq!(fingerprint_accumulator.bits.len(), 2);
+        assert_eq!(fingerprint_accumulator.fingerprint().bits.len(), 2);
     }
 
     #[test]
     fn iterative_item_count() {
         let mut fingerprint_accumulator = FingerprintAccumulator::new(BitPacker(8));
-        assert_eq!(fingerprint_accumulator.bits.len(), 0);
+        assert_eq!(fingerprint_accumulator.len(), 0);
 
         fingerprint_accumulator.push(&[1]);
-        assert_eq!(fingerprint_accumulator.bits.len(), 1);
+        assert_eq!(fingerprint_accumulator.len(), 1);
 
         fingerprint_accumulator.push(&[2]);
-        assert_eq!(fingerprint_accumulator.bits.len(), 2);
+        assert_eq!(fingerprint_accumulator.len(), 2);
 
         for _ in 0..10 {
             fingerprint_accumulator.push(&[0]);
         }
-        assert_eq!(fingerprint_accumulator.bits.len(), 12);
+        assert_eq!(fingerprint_accumulator.len(), 12);
     }
 
     #[test]
     fn iterative_bits_per_item_accessor() {
         let fingerprint_accumulator = FingerprintAccumulator::new(BitPacker(9));
-        assert_eq!(fingerprint_accumulator.bits_packer.bits_per_item(), 9);
+        assert_eq!(fingerprint_accumulator.fingerprint().bits_packer.bits_per_item(), 9);
 
         let fingerprint_accumulator2 = FingerprintAccumulator::new(BitPacker(16));
-        assert_eq!(fingerprint_accumulator2.bits_packer.bits_per_item(), 16);
+        assert_eq!(fingerprint_accumulator2.fingerprint().bits_packer.bits_per_item(), 16);
     }
 
     #[test]
     fn iterative_empty_vec() {
         // Test with no items pushed
         let fingerprint_accumulator = FingerprintAccumulator::new(BitPacker(8));
-        assert_eq!(fingerprint_accumulator.bits.len(), 0);
-        assert_eq!(fingerprint_accumulator.bits.len(), 0);
+        assert_eq!(fingerprint_accumulator.fingerprint().bits.len(), 0);
     }
 }

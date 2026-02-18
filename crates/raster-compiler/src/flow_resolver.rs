@@ -6,9 +6,9 @@
 use raster_core::cfs::{InputBinding, InputSource, SequenceItem};
 use std::collections::HashMap;
 
-use crate::sequence::{Sequence, SequenceDiscovery};
-use crate::tile::{TileDiscovery};
 use crate::ast::CallInfo;
+use crate::sequence::{Sequence, SequenceDiscovery};
+use crate::tile::TileDiscovery;
 /// Resolves data flow within a sequence, producing `SequenceItem`s with
 /// correctly bound input sources.
 pub struct FlowResolver<'a, 'ast> {
@@ -130,14 +130,14 @@ impl<'a, 'ast> FlowResolver<'a, 'ast> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tile::Tile;
-    use crate::ast::ProjectAst;
-    use crate::Project;
-    use crate::sequence::SequenceStep;
-    use std::collections::HashMap;
-    use std::path::PathBuf;
     use crate::ast::FunctionAstItem;
     use crate::ast::MacroAstItem;
+    use crate::ast::ProjectAst;
+    use crate::sequence::SequenceStep;
+    use crate::tile::Tile;
+    use crate::Project;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
 
     fn make_mock_project() -> Project {
         Project {
@@ -149,6 +149,7 @@ mod tests {
             },
             root_dir: PathBuf::from("/test"),
             output_dir: PathBuf::from("/test/target/raster"),
+            target_dir: PathBuf::from("/test/target/"),
         }
     }
 
@@ -163,11 +164,14 @@ mod tests {
             }],
             input_names: input_names.iter().map(|s| s.to_string()).collect(),
             inputs: input_names.iter().map(|_| "String".to_string()).collect(),
-            output: if has_output { Some("String".to_string()) } else { None },
+            output: if has_output {
+                Some("String".to_string())
+            } else {
+                None
+            },
             signature: format!("fn {}()", name),
         }
     }
-
 
     fn make_sequence_function(
         name: &str,
@@ -218,9 +222,9 @@ mod tests {
             project: &project,
             tiles: vec![greet_tile, exclaim_tile],
         };
-        let sequence_discovery = SequenceDiscovery { 
+        let sequence_discovery = SequenceDiscovery {
             project: &project,
-            sequences: vec![] 
+            sequences: vec![],
         };
 
         // Create sequence function with call infos
@@ -280,4 +284,3 @@ mod tests {
         }
     }
 }
-
