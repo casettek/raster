@@ -1,0 +1,30 @@
+---
+alwaysApply: true
+---
+
+# Core Workflow
+
+Use the smallest safe change that solves the request.
+
+## Required sequence
+
+1. Confirm target area (`crates/*`, `examples/*`, `docs/*`).
+2. Implement focused changes only.
+3. Run scoped validation first, then broader checks if needed.
+4. Complete a spec touchpoint for non-trivial changes:
+   - update `docs/specs/` when behavior/contracts/architecture/operations changed, or
+   - record a justified no-op note.
+   - For trivial one-off UI/content/polish tweaks, no spec touchpoint is required.
+
+## Validation defaults
+
+- Single-crate changes: `cargo check -p <crate> && cargo test -p <crate>`
+- Cross-crate/shared changes: `cargo check --workspace && cargo test --workspace`
+- Before merge for substantial Rust changes: `cargo clippy --workspace --all-targets`
+
+## Guardrails
+
+- Do not add dependencies unless required by the task.
+- Avoid broad refactors unless explicitly requested.
+- Keep secrets out of code and docs; use environment variables.
+- Prefer explicit types and deterministic behavior over implicit behavior.
