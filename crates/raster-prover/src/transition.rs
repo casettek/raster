@@ -140,12 +140,9 @@ pub fn replay_transitions(
                 .unwrap()
         };
 
-        // Prove the transition
         let prove_info = prover.prove(env, &TRANSITION_GUEST_ELF).unwrap();
 
         transition_receipt = Some(prove_info.receipt.clone());
-
-        // Decode the output from the journal
         let journal: TransitionJournal = prove_info.receipt.journal.decode().unwrap();
 
         current_journal = Some(journal.clone());

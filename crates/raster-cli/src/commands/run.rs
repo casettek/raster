@@ -123,7 +123,7 @@ pub fn run(
                     .with_user_crate(project.root_dir.clone());
 
                 let replayer = Replayer::new(&backend, &project);
-                prove(fraud_window, &replayer);
+                let _fraud_proof = prove(fraud_window, &replayer);
             }
         }
     }
@@ -175,11 +175,10 @@ pub fn verify(trace_items: &[TraceItem], commit_path: &str) -> VerificationResul
         }
     }
 
-    println!("verification result: ok");
     VerificationResult::Ok
 }
 
-pub fn prove(fraud_window: TraceWindow, replayer: &Replayer) {
+pub fn prove(fraud_window: TraceWindow, replayer: &Replayer) -> risc0_zkvm::Receipt {
     let mode = ExecutionMode::prove_and_verify();
 
     let mut replayed_results: BTreeMap<String, ReplayResult> = BTreeMap::new();
@@ -210,9 +209,10 @@ pub fn prove(fraud_window: TraceWindow, replayer: &Replayer) {
             panic!("Failed to generate fraud proof");
         };
 
-        let final_journal: TransitionJournal = receipt.journal.decode().unwrap();
-        println!("{:?}", final_journal);
+        return receipt;
     }
+
+    panic!("Failed to generate fraud proof");
 }
 
 pub fn read_trace_commitment(commit_path: &str) -> TraceCommitment {

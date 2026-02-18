@@ -156,6 +156,11 @@ pub struct TraceCommitment {
 
 impl TraceCommitment {
     pub fn from(items: &[TraceItem], seed: &[u8]) -> TraceCommitment {
+        assert!(
+            items.len() > WINDOW_SIZE.into(),
+            "Trace length can't be less than verification window"
+        );
+
         let revealed_items = items[..(WINDOW_SIZE as usize)].to_vec();
 
         let items_hashes: Vec<Vec<u8>> = items.iter().map(|item| item.hash()).collect();
@@ -436,8 +441,7 @@ mod tests {
         ];
 
         let binded_trace = TraceCommitment::from(&items, &precomputed::EMPTY_TRIE_NODES[0]);
-        let ref_binded_trace =
-            TraceCommitment::from(&ref_items, &precomputed::EMPTY_TRIE_NODES[0]);
+        let ref_binded_trace = TraceCommitment::from(&ref_items, &precomputed::EMPTY_TRIE_NODES[0]);
 
         // Check that different items produce different commitments
         assert_ne!(binded_trace.fingerprint, ref_binded_trace.fingerprint);
