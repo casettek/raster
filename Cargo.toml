@@ -11,8 +11,9 @@ members = [
     "crates/raster-analysis",
     "crates/raster-cli",
     "crates/raster-prover",
-    "examples/hello-tiles",
+    "crates/raster-tracing",
     "crates/raster-backend-native",
+    "examples/hello-tiles",
 ]
 
 [workspace.package]

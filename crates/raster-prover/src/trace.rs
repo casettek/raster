@@ -4,15 +4,18 @@
 //! commitments to execution traces using incremental Merkle trees.
 
 use bridgetree::{Hashable, Level, NonEmptyFrontier};
+use raster_core::fingerprint::{Fingerprint, FingerprintAccumulator};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
+use std::collections::VecDeque;
 use std::fmt::Debug;
 
 use crate::error::{BitPackerError, Result};
 use crate::precomputed::{EMPTY_TRIE_NODES, HASH_SIZE};
 
-use raster_core::trace::TraceItem;
+use raster_core::fingerprint::BitPacker;
+use raster_core::trace::{TraceItem, TraceWindow};
 
 /// Trait for types that can be hashed to bytes.
 pub trait BytesHashable {
@@ -45,53 +48,6 @@ impl BytesHashable for TraceItem {
 /// Wrapper for byte vectors that implements Hashable for bridgetree.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Bytes(pub Vec<u8>);
-
-/// A serializable representation of a NonEmptyFrontier<Bytes>.
-///
-/// This can be used to persist and restore frontier state for replay.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct SerializableFrontier {
-    /// The position in the tree (as u64)
-    pub position: u64,
-    /// The current leaf value
-    pub leaf: Vec<u8>,
-    /// The ommer hashes (path to root)
-    pub ommers: Vec<Vec<u8>>,
-}
-
-impl SerializableFrontier {
-    /// Convert a NonEmptyFrontier<Bytes> into a serializable form.
-    pub fn from_frontier(frontier: &NonEmptyFrontier<Bytes>) -> Self {
-        Self {
-            position: frontier.position().into(),
-            leaf: frontier.leaf().0.clone(),
-            ommers: frontier.ommers().iter().map(|o| o.0.clone()).collect(),
-        }
-    }
-
-    /// Reconstruct a NonEmptyFrontier<Bytes> from the serialized form.
-    ///
-    /// Returns None if the frontier cannot be reconstructed (e.g., invalid position).
-    pub fn to_frontier(&self) -> Option<NonEmptyFrontier<Bytes>> {
-        use bridgetree::Position;
-        NonEmptyFrontier::from_parts(
-            Position::from(self.position),
-            Bytes(self.leaf.clone()),
-            self.ommers.iter().map(|o| Bytes(o.clone())).collect(),
-        )
-        .ok()
-    }
-
-    /// Serialize to bytes using bincode.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        postcard::to_allocvec(self).unwrap_or_default()
-    }
-
-    /// Deserialize from bytes using bincode.
-    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        postcard::from_bytes(bytes).ok()
-    }
-}
 
 impl PartialEq for Bytes {
     fn eq(&self, other: &Self) -> bool {
@@ -132,68 +88,105 @@ impl Hashable for Bytes {
     }
 }
 
-/// Bridge tree for trace commitments with 32 levels.
-pub type TraceBridgeTree = bridgetree::BridgeTree<Bytes, u64, 32>;
+/// A serializable representation of a NonEmptyFrontier<Bytes>.
+///
+/// This can be used to persist and restore frontier state for replay.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SerializableFrontier {
+    /// The position in the tree (as u64)
+    pub position: u64,
+    /// The current leaf value
+    pub leaf: Vec<u8>,
+    /// The ommer hashes (path to root)
+    pub ommers: Vec<Vec<u8>>,
+}
 
-/// Commitment to an execution trace using incremental Merkle roots.
-pub struct ExecutionCommitment(pub Vec<Vec<u8>>);
-
-impl ExecutionCommitment {
-    /// Create a commitment from a trace.
-    ///
-    /// Returns a vector of Merkle roots, one for each item in the trace.
-    /// Each root represents the commitment up to and including that item.
-    pub fn from(items: &[TraceItem], seed: &[u8]) -> ExecutionCommitment {
-        let items_hashes: Vec<Vec<u8>> = items.iter().map(|item| item.hash()).collect();
-
-        let mut trace_tree = TraceBridgeTree::new(1);
-        trace_tree.append(Bytes(seed.to_vec()));
-
-        let mut roots: Vec<Vec<u8>> = Vec::with_capacity(items.len());
-
-        for item_hash in &items_hashes {
-            trace_tree.append(Bytes(item_hash.clone()));
-            if let Some(root) = trace_tree.root(0) {
-                roots.push(root.0);
-            }
+impl SerializableFrontier {
+    /// Consume a NonEmptyFrontier<Bytes> into a serializable form.
+    pub fn from_frontier(frontier: TraceTreeFrontier) -> Self {
+        Self {
+            position: frontier.position().into(),
+            leaf: frontier.leaf().clone().0,
+            ommers: frontier
+                .ommers()
+                .clone()
+                .iter()
+                .map(|o| o.clone().0)
+                .collect(),
         }
-
-        ExecutionCommitment(roots)
     }
 
-    /// Try to create a commitment, returning an error on failure.
-    pub fn try_from(items: &[TraceItem], seed: &[u8]) -> Result<ExecutionCommitment> {
-        if items.is_empty() {
-            return Err(BitPackerError::EmptyTrace);
-        }
+    /// Reconstruct a NonEmptyFrontier<Bytes> from the serialized form.
+    ///
+    /// Returns None if the frontier cannot be reconstructed (e.g., invalid position).
+    pub fn into_frontier(self) -> Option<TraceTreeFrontier> {
+        use bridgetree::Position;
+        TraceTreeFrontier::from_parts(
+            Position::from(self.position),
+            Bytes(self.leaf.clone()),
+            self.ommers.iter().map(|o| Bytes(o.clone())).collect(),
+        )
+        .ok()
+    }
 
-        let mut items_hashes: Vec<Vec<u8>> = Vec::with_capacity(items.len());
-        for item in items {
-            items_hashes.push(item.try_hash()?);
-        }
+    /// Serialize to bytes using bincode.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        postcard::to_allocvec(self).unwrap_or_default()
+    }
 
-        let mut trace_tree = TraceBridgeTree::new(1);
+    /// Deserialize from bytes using bincode.
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        postcard::from_bytes(bytes).ok()
+    }
+}
+
+/// Bridge tree for trace commitments with 32 levels.
+pub type TraceTree = bridgetree::BridgeTree<Bytes, u64, 32>;
+pub type TraceTreeFrontier = NonEmptyFrontier<Bytes>;
+
+pub const WINDOW_SIZE: u8 = 2;
+
+/// Commitment to an execution trace using incremental Merkle roots.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TraceCommitment {
+    pub fingerprint: Fingerprint,
+    pub revealed_items: Vec<TraceItem>,
+}
+
+impl TraceCommitment {
+    pub fn from(items: &[TraceItem], seed: &[u8]) -> TraceCommitment {
+        let revealed_items = items[..(WINDOW_SIZE as usize)].to_vec();
+
+        let items_hashes: Vec<Vec<u8>> = items.iter().map(|item| item.hash()).collect();
+
+        let mut trace_tree = TraceTree::new(1);
         trace_tree.append(Bytes(seed.to_vec()));
 
-        let mut roots: Vec<Vec<u8>> = Vec::with_capacity(items.len());
+        let mut fingerprint_acc =
+            FingerprintAccumulator::new(BitPacker((HASH_SIZE * 8) / (WINDOW_SIZE as usize)));
 
         for item_hash in &items_hashes {
             trace_tree.append(Bytes(item_hash.clone()));
             if let Some(root) = trace_tree.root(0) {
-                roots.push(root.0);
+                fingerprint_acc.append(&root.0);
             }
         }
 
-        Ok(ExecutionCommitment(roots))
+        let fingerprint = fingerprint_acc.into_fingerprint();
+
+        TraceCommitment {
+            fingerprint,
+            revealed_items,
+        }
     }
 
     /// Get the frontier (partial Merkle path) at position n.
     ///
     /// This can be used to continue building the tree from position n.
-    pub fn frontier(items: &[TraceItem], n: usize, seed: &[u8]) -> Option<NonEmptyFrontier<Bytes>> {
+    pub fn frontier(items: &[TraceItem], n: usize, seed: &[u8]) -> Option<TraceTreeFrontier> {
         let items_hashes: Vec<Vec<u8>> = items.iter().map(|item| item.hash()).collect();
 
-        let mut trace_tree = TraceBridgeTree::new(1);
+        let mut trace_tree = TraceTree::new(1);
         trace_tree.append(Bytes(seed.to_vec()));
 
         for item_hash in items_hashes.iter().take(n) {
@@ -204,11 +197,7 @@ impl ExecutionCommitment {
     }
 
     /// Try to get the frontier, returning an error on failure.
-    pub fn try_frontier(
-        items: &[TraceItem],
-        n: usize,
-        seed: &[u8],
-    ) -> Result<NonEmptyFrontier<Bytes>> {
+    pub fn try_frontier(items: &[TraceItem], n: usize, seed: &[u8]) -> Result<TraceTreeFrontier> {
         if n > items.len() {
             return Err(BitPackerError::InvalidRange {
                 start: 0,
@@ -222,7 +211,7 @@ impl ExecutionCommitment {
             items_hashes.push(item.try_hash()?);
         }
 
-        let mut trace_tree = TraceBridgeTree::new(1);
+        let mut trace_tree = TraceTree::new(1);
         trace_tree.append(Bytes(seed.to_vec()));
 
         for item_hash in &items_hashes {
@@ -237,129 +226,167 @@ impl ExecutionCommitment {
 
     /// Get the number of commitments.
     pub fn len(&self) -> usize {
-        self.0.len()
+        self.fingerprint.len()
     }
 
     /// Check if the commitment is empty.
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.fingerprint.is_empty()
+    }
+
+    pub fn diff(&self, other: &TraceCommitment) -> Option<usize> {
+        assert!(
+            self.fingerprint.len() == other.fingerprint.len(),
+            "Trace commitetment length mismatch"
+        );
+        assert!(
+            self.fingerprint.bits_per_item() == other.fingerprint.bits_per_item(),
+            "Trace commitetment bit packing mismatch"
+        );
+
+        // TODO: did we actually need those diff parts in BitPacker?
+        let Some((index, _, _)) = self
+            .fingerprint
+            .bits_packer
+            .diff(&self.fingerprint.bits, &other.fingerprint.bits)
+        else {
+            return None;
+        };
+
+        Some(index)
     }
 }
 
-/// Builder for incrementally constructing an ExecutionCommitment with streaming output.
-///
-/// Similar to `TraceCommitmentSink`, but writes each new root to the
-/// provided writer as raw bytes (32 bytes per root) immediately after appending.
-///
-/// # Example
-///
-/// ```ignore
-/// let file = File::create("roots.bin")?;
-/// let mut builder = TraceCommitmentSink::new(seed, file);
-/// builder.append(&item1)?; // writes root to file
-/// builder.append(&item2)?; // writes root to file
-/// ```
-pub struct TraceCommitmentProducer {
-    frontier: NonEmptyFrontier<Bytes>,
-    trace_items_commitments: Vec<Vec<u8>>,
+struct Window<T: Clone> {
+    queue: VecDeque<Option<T>>,
+    size: usize,
 }
 
-impl TraceCommitmentProducer {
-    pub fn new(seed: &[u8]) -> Self {
-        let mut trace_tree = TraceBridgeTree::new(1);
+impl<T: Clone> Window<T> {
+    fn new(size: usize) -> Self {
+        Self {
+            queue: VecDeque::from(vec![None; size]),
+            size,
+        }
+    }
+
+    fn push(&mut self, item: T) {
+        self.queue.pop_front();
+        self.queue.push_back(Some(item));
+    }
+
+    fn first(&self) -> Option<&T> {
+        self.queue.iter().flatten().next()
+    }
+
+    fn to_vec(&self) -> Vec<T> {
+        self.queue.clone().into_iter().flatten().collect()
+    }
+}
+
+pub struct TraceVerifier {
+    pub trace_commitment: TraceCommitment,
+
+    pub fingerprint_acc: FingerprintAccumulator,
+    pub latest_frontier: TraceTreeFrontier,
+
+    pub window_frontiers: Window<TraceTreeFrontier>,
+    pub window_items: Window<TraceItem>,
+}
+
+pub enum VerificationResult {
+    Ok,
+    Fraud(TraceWindow),
+}
+
+impl TraceVerifier {
+    pub fn new(trace_commitment: TraceCommitment, seed: &[u8]) -> Self {
+        let mut trace_tree = TraceTree::new(1);
         trace_tree.append(Bytes(seed.to_vec()));
-        let frontier = trace_tree.frontier().cloned().unwrap();
+
+        let init_frontier = trace_tree.frontier().cloned().unwrap();
+
+        let mut fingerprint_acc =
+            FingerprintAccumulator::new(BitPacker((HASH_SIZE * 8) / (WINDOW_SIZE as usize)));
+
+        let mut window_frontiers: Window<TraceTreeFrontier> = Window::new(WINDOW_SIZE.into());
+        let window_items: Window<TraceItem> = Window::new(WINDOW_SIZE.into());
+
+        window_frontiers.push(init_frontier.clone());
 
         Self {
-            frontier,
-            trace_items_commitments: Vec::new(),
+            trace_commitment,
+
+            fingerprint_acc,
+            latest_frontier: init_frontier,
+
+            window_frontiers,
+            window_items,
         }
     }
 
-    pub fn append(&mut self, item: &TraceItem) -> Result<()> {
-        self.frontier.append(Bytes(item.hash()));
-        let trace_tree = TraceBridgeTree::from_frontier(1, self.frontier.clone());
+    pub fn verify(&mut self, item: &TraceItem) -> VerificationResult {
+        let item_frontier = self.latest_frontier.clone();
 
-        let Some(root) = trace_tree.root(0) else {
-            return Err(BitPackerError::TreeRootError(
-                "Failed to get root".to_string(),
-            ));
-        };
+        self.window_frontiers.push(item_frontier);
+        self.window_items.push(item.clone());
 
-        self.frontier = trace_tree.frontier().cloned().unwrap();
-        self.trace_items_commitments.push(root.0);
+        self.latest_frontier.append(Bytes(item.hash()));
 
-        Ok(())
-    }
+        let trace_tree = TraceTree::from_frontier(1, self.latest_frontier.clone());
 
-    pub fn try_append(&mut self, item: &TraceItem) -> Result<()> {
-        let item_hash = item.try_hash()?;
-        self.frontier.append(Bytes(item_hash));
-        let trace_tree = TraceBridgeTree::from_frontier(1, self.frontier.clone());
+        let root = trace_tree
+            .root(0)
+            .expect("Failed to get Trace Merkle Tree root");
 
-        let Some(root) = trace_tree.root(0) else {
-            return Err(BitPackerError::TreeRootError(
-                "Failed to get root".to_string(),
-            ));
-        };
+        self.latest_frontier = trace_tree.frontier().unwrap().clone();
+        self.fingerprint_acc.append(&root.0);
 
-        let root_hex: String = root.0.iter().map(|b| format!("{:02x}", b)).collect();
-        std::println!("{}{}", "RASTER_TRACE:root:", root_hex);
-        self.trace_items_commitments.push(root.0);
+        let latest_fingerprint = self.fingerprint_acc.clone().into_fingerprint();
 
-        Ok(())
-    }
+        let index = latest_fingerprint.len() - 1;
 
-    /// Get a clone of the current frontier state.
-    ///
-    /// This can be used to snapshot the frontier before appending items,
-    /// allowing replay from this point.
-    pub fn frontier(&self) -> NonEmptyFrontier<Bytes> {
-        self.frontier.clone()
-    }
+        if latest_fingerprint.bits_packer.diff_at_index(
+            index,
+            &latest_fingerprint.bits,
+            &self.trace_commitment.fingerprint.bits,
+        ) {
+            let diff_bits = self
+                .trace_commitment
+                .fingerprint
+                .bits_packer
+                .get_range(
+                    index.saturating_sub(WINDOW_SIZE.into()) + 1,
+                    index + 1,
+                    &self.trace_commitment.fingerprint.bits,
+                )
+                .unwrap();
 
-    pub fn finish(self) -> Vec<Vec<u8>> {
-        self.trace_items_commitments
+            let window_fingerprint = Fingerprint::from(
+                diff_bits,
+                self.trace_commitment.fingerprint.bits_packer,
+                WINDOW_SIZE.into(),
+            );
+
+            let window_frontier = self.window_frontiers.first().unwrap().clone();
+            let ser_window_frontier =
+                SerializableFrontier::from_frontier(window_frontier).to_bytes();
+
+            // TODO: consider renaming Window struct and TraceWindow have different behavior but
+            // similiar naming
+            let fraud_window = TraceWindow {
+                frontier: ser_window_frontier,
+                items: self.window_items.to_vec(),
+                fingerprint: window_fingerprint,
+            };
+
+            return VerificationResult::Fraud(fraud_window);
+        }
+
+        VerificationResult::Ok
     }
 }
 
-fn empty_at_level(level: u8) -> Vec<u8> {
-    use crate::precomputed;
-            if level == 0 {
-                return precomputed::EMPTY_TRIE_NODES[0].to_vec();
-            }
-            let child = empty_at_level(level - 1);
-            combine_level(level - 1, &child, &child)
-        }
-
-fn combine_level(level: u8, left: &[u8], right: &[u8]) -> Vec<u8> {
-            let mut data = Vec::with_capacity(1 + 32 + 32);
-            data.push(level);
-            data.extend_from_slice(left);
-            data.extend_from_slice(right);
-            let mut hasher = sha2::Sha256::new();
-            hasher.update(&data);
-            hasher.finalize().to_vec()
-        }
-pub fn compute_root_guest(position: u64, leaf: &[u8], ommers: &[Vec<u8>]) -> Vec<u8> {
-            let mut cur = leaf.to_vec();
-            let mut ommer_idx = 0;
-            for level in 0u8..32 {
-                let bit = (position >> level) & 1;
-                if bit == 0 {
-                    cur = combine_level(level, &cur, &empty_at_level(level));
-                } else {
-                    let left = if ommer_idx < ommers.len() {
-                        ommers[ommer_idx].clone()
-                    } else {
-                        empty_at_level(level)
-                    };
-                    cur = combine_level(level, &left, &cur);
-                    ommer_idx += 1;
-                }
-            }
-            cur
-        }
 #[cfg(test)]
 mod tests {
     use raster_core::trace::TraceInputParam;
@@ -434,7 +461,6 @@ mod tests {
     /// Test that guest-style compute_root matches bridgetree's root for various frontiers.
     #[test]
     fn test_compute_root_matches_bridgetree() {
-
         fn empty_at_level(level: u8) -> Vec<u8> {
             if level == 0 {
                 return precomputed::EMPTY_TRIE_NODES[0].to_vec();
@@ -476,7 +502,7 @@ mod tests {
         let seed = precomputed::EMPTY_TRIE_NODES[0];
         let items: Vec<TraceItem> = (0..10).map(|i| make_tile_trace_item(i, i)).collect();
 
-        let mut tree = TraceBridgeTree::new(1);
+        let mut tree = TraceTree::new(1);
         tree.append(Bytes(seed.to_vec()));
 
         for (i, item) in items.iter().enumerate() {
@@ -485,12 +511,17 @@ mod tests {
 
             let frontier = tree.frontier().expect("frontier").clone();
             let ser_frontier = SerializableFrontier::from_frontier(&frontier);
-            let deser_frontier = ser_frontier.to_frontier().expect("Can't deserialize frontier");
+            let deser_frontier = ser_frontier
+                .to_frontier()
+                .expect("Can't deserialize frontier");
 
             let pos = u64::from(deser_frontier.position());
             let leaf = deser_frontier.leaf().0.clone();
-            let ommers: Vec<Vec<u8>> =
-                deser_frontier.ommers().iter().map(|o| o.0.clone()).collect();
+            let ommers: Vec<Vec<u8>> = deser_frontier
+                .ommers()
+                .iter()
+                .map(|o| o.0.clone())
+                .collect();
 
             let guest_root = compute_root_guest(pos, &leaf, &ommers);
 

@@ -1,33 +1,34 @@
 //! Run command: build and execute the user program as a whole.
 
-use crate::BackendType;
+use std::collections::BTreeMap;
+use std::io::{Read, Write};
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
 
 use raster_backend::ExecutionMode;
 use raster_backend_risc0::Risc0Backend;
+
 use raster_compiler::Project;
-use raster_core::fingerprint::BitPacker;
-use raster_core::ipc::{self, IpcMessage};
-use raster_core::trace::AuditResult;
+
 use raster_core::trace::TraceItem;
+use raster_core::trace::TraceWindow;
 use raster_core::{Error, Result};
 
+use raster_prover::precomputed::EMPTY_TRIE_NODES;
 use raster_prover::replay::{ReplayResult, Replayer};
-
 use raster_prover::trace::{
-    BytesHashable, ExecutionCommitment, SerializableFrontier, TraceBridgeTree,
+    SerializableFrontier, TraceCommitment, TraceVerifier, VerificationResult,
 };
 use raster_prover::transition::{replay_transitions, TransitionJournal};
 
-use std::collections::BTreeMap;
-use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use crate::BackendType;
 
 /// Run the user program with the specified backend.
 pub fn run(
     backend_type: BackendType,
     input: Option<&str>,
-    commit: Option<&str>,
-    audit: Option<&str>,
+    commit_flag: Option<&str>,
+    audit_flag: Option<&str>,
 ) -> Result<()> {
     // Only native backend is supported for whole-program execution
     if backend_type != BackendType::Native {
@@ -65,6 +66,10 @@ pub fn run(
         )));
     }
 
+    let commit_path = commit_flag
+        .or(audit_flag)
+        .expect("Neither commit nor audit path was provided");
+
     println!();
     println!("Running {}...", &project.name);
     println!();
@@ -75,12 +80,6 @@ pub fn run(
 
     if let Some(input_json) = input {
         cmd.args(["--input", input_json]);
-    }
-
-    if let Some(commit_path) = commit {
-        cmd.args(["--commit", commit_path]);
-    } else if let Some(audit_path) = audit {
-        cmd.args(["--audit", audit_path]);
     }
 
     // Execute the binary and capture output
@@ -101,154 +100,113 @@ pub fn run(
 
     let stdout = String::from_utf8_lossy(&output.stdout);
 
-    // Separate trace items, audit results, and regular program output
     let mut trace_items: Vec<TraceItem> = Vec::new();
-    let mut audit_result: Option<AuditResult> = None;
-    let mut program_output: Vec<&str> = Vec::new();
 
     for line in stdout.lines() {
-        match ipc::parse_line(line) {
-            IpcMessage::Trace(item) => {
-                trace_items.push(item);
-            }
-            IpcMessage::Audit(result) => {
-                audit_result = Some(result);
-            }
-            IpcMessage::Output(_) | IpcMessage::Unknown(_) => {
-                program_output.push(line);
-            }
-        }
+        let trace_item = serde_json::from_str(line).expect("Failed to parse Trace Item");
+        trace_items.push(trace_item);
     }
 
-    // Print program output first
-    if !program_output.is_empty() {
-        println!("Output:");
-        for line in &program_output {
-            println!("  {}", line);
-        }
-        println!();
-    }
+    if commit_flag.is_some() {
+        commit(&trace_items, commit_path);
+    } else if audit_flag.is_some() {
+        let verification_result = verify(&trace_items, commit_path);
 
-    // Handle audit result if present
-    if let Some(result) = audit_result {
-        if result.success {
-            println!("Audit verification passed",);
-        } else {
-            println!("Audit verification FAILED!");
-
-            // Display trace window for debugging context
-            if !result.trace_window.is_empty() {
-                println!();
-                println!(
-                    "Trace window ({} items leading up to divergence):",
-                    result.trace_window.len()
-                );
-                for (i, item) in result.trace_window.iter().enumerate() {
-                    println!();
-                    println!("  [{}] {}", i, item.fn_name);
-                    if let Some(ref desc) = item.desc {
-                        println!("      Description: {}", desc);
-                    }
-                    if !item.inputs.is_empty() {
-                        println!("      Inputs:");
-                        for input in &item.inputs {
-                            println!("        - {}: {}", input.name, input.ty);
-                        }
-                    }
-                    if let Some(ref output_type) = item.output_type {
-                        println!("      Output type: {}", output_type);
-                    }
-                }
-
-                // Replay trace window with Risc0 backend for proof generation
-                println!();
-                println!("Replaying trace window with Risc0 backend...");
-
-                let backend =
-                // TODO: Restructure backend <-> project relations
-                    Risc0Backend::new(project.output_dir.clone()).with_user_crate(project.root_dir.clone());
+        match verification_result {
+            VerificationResult::Ok => println!("Verification Success"),
+            VerificationResult::Fraud(fraud_window) => {
+                let backend = Risc0Backend::new(project.output_dir.clone())
+                    .with_user_crate(project.root_dir.clone());
 
                 let replayer = Replayer::new(&backend, &project);
-                let mode = ExecutionMode::prove_and_verify();
-
-                let mut replayed_results: BTreeMap<String, ReplayResult> = BTreeMap::new();
-
-                for (i, item) in result.trace_window.iter().enumerate() {
-                    print!("  [{}] {} ... ", i, item.fn_name);
-
-                    match replayer.replay(item, mode) {
-                        Ok(replay_result) => {
-                            replayed_results.insert(item.fn_name.clone(), replay_result.clone());
-                        }
-                        Err(e) => {
-                            println!("FAILED: {}", e);
-                        }
-                    }
-                }
-
-                // Replay transition frontier with the transition guest
-                if let Some(ref diff) = result.diff {
-                    if let Some(frontier) = SerializableFrontier::from_bytes(&diff.frontier) {
-                        println!();
-                        println!("Replaying transition frontier with transition guest...");
-
-                        // Parse fingerprint bytes as little-endian u64s
-                        let fingerprint: Vec<u64> = diff
-                            .fingerprint
-                            .chunks_exact(8)
-                            .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()))
-                            .collect();
-
-                        let bits_packer = BitPacker(diff.bits_per_item);
-                        let window_fingerprint = bits_packer
-                            .get_range(
-                                diff.window_start_position,
-                                diff.window_start_position + 2,
-                                &fingerprint,
-                            )
-                            .expect("Failed to get window fingerprint");
-
-                        let Some(receipt) = replay_transitions(
-                            &frontier,
-                            &result.trace_window,
-                            window_fingerprint,
-                            diff.bits_per_item,
-                            &replayed_results,
-                        ) else {
-                            panic!("Failed to generate fraud proof");
-                        };
-
-                        let final_journal: TransitionJournal = receipt.journal.decode().unwrap();
-                        println!("{:?}", final_journal);
-                    }
-                }
+                prove(fraud_window, &replayer);
             }
-
-            return Err(Error::Other("Audit verification failed".into()));
         }
     }
 
     Ok(())
 }
 
-/// Result of a transition replay operation.
-#[derive(Debug)]
-pub struct TransitionReplayResult {
-    /// Number of transitions successfully proved and verified
-    pub verified_count: usize,
-    /// If fingerprint verification failed, the index in trace_window where it failed
-    pub failed_at_index: Option<usize>,
-    /// The type of failure if any
-    pub failure_type: Option<TransitionFailureType>,
+pub fn commit(trace_items: &[TraceItem], commit_path: &str) {
+    let mut commitment_file =
+        std::fs::File::create(commit_path).expect("Failed to create commitemt file");
+
+    let trace_commitment = TraceCommitment::from(trace_items, &EMPTY_TRIE_NODES[0]);
+    let bytes = postcard::to_allocvec(&trace_commitment).unwrap();
+
+    commitment_file
+        .write_all(&bytes)
+        .expect("Failed to save commitment");
 }
 
-/// Type of transition failure.
-#[derive(Debug)]
-pub enum TransitionFailureType {
-    /// Item hash mismatch
-    ItemHashMismatch,
-    /// Fingerprint mismatch
-    FingerprintMismatch,
-    /// Proving error
-    ProvingError(String),
+pub fn verify(trace_items: &[TraceItem], commit_path: &str) -> VerificationResult {
+    let trace_commitment = read_trace_commitment(commit_path);
+    let mut trace_verifier: TraceVerifier =
+        TraceVerifier::new(trace_commitment, &EMPTY_TRIE_NODES[0]);
+
+    for trace_item in trace_items {
+        if let VerificationResult::Fraud(fraud_window) = trace_verifier.verify(trace_item) {
+            return VerificationResult::Fraud(fraud_window);
+        }
+    }
+
+    VerificationResult::Ok
+}
+
+pub fn prove(fraud_window: TraceWindow, replayer: &Replayer) {
+    let mode = ExecutionMode::prove_and_verify();
+
+    let mut replayed_results: BTreeMap<String, ReplayResult> = BTreeMap::new();
+
+    for (i, item) in fraud_window.items.iter().enumerate() {
+        print!("  [{}] {} ... ", i, item.fn_name);
+
+        match replayer.replay(item, mode) {
+            Ok(replay_result) => {
+                replayed_results.insert(item.fn_name.clone(), replay_result.clone());
+            }
+            Err(e) => {
+                println!("FAILED: {}", e);
+            }
+        }
+    }
+
+    if let Some(frontier) = SerializableFrontier::from_bytes(&fraud_window.frontier) {
+        println!();
+        println!("Replaying transition frontier with transition guest...");
+
+        let Some(receipt) = replay_transitions(
+            &frontier,
+            &fraud_window.items,
+            fraud_window.fingerprint,
+            &replayed_results,
+        ) else {
+            panic!("Failed to generate fraud proof");
+        };
+
+        let final_journal: TransitionJournal = receipt.journal.decode().unwrap();
+        println!("{:?}", final_journal);
+    }
+}
+
+pub fn read_trace_commitment(commit_path: &str) -> TraceCommitment {
+    let mut file = std::fs::File::open(commit_path).unwrap_or_else(|e| {
+        panic!(
+            "Failed to open expected commitment file '{}': {}",
+            commit_path, e
+        )
+    });
+
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).unwrap_or_else(|e| {
+        panic!(
+            "Failed to read expected commitment file '{}': {}",
+            commit_path, e
+        )
+    });
+
+    let trace_commitment: TraceCommitment =
+        postcard::from_bytes(&bytes).expect("Failed to deserialize Trace Commitment");
+
+    trace_commitment
 }

@@ -10,7 +10,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use raster_core::fingerprint::{BitPacker, FingerprintAccumulator};
+use raster_core::fingerprint::{BitPacker, Fingerprint, FingerprintAccumulator};
 use raster_core::trace::TraceItem;
 
 use crate::replay::ReplayResult;
@@ -27,13 +27,13 @@ pub struct TransitionInput {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Transition {
     pub frontier: SerializableFrontier,
-    pub fingerprint_acc: FingerprintAccumulator,
+    pub actual_fingerprint_acc: FingerprintAccumulator,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InitTransitionState {
     pub init_frontier: SerializableFrontier,
-    pub ref_fingerprint: FingerprintAccumulator,
+    pub fingerprint: Fingerprint,
     // TODO: Init Transition should verify proof of inclusion of reference fingerprint
     // pub ref_fingerprint_inclusion_proof: Vec<u8>,
     // TODO: Init Transition should contain reference to CFS
@@ -74,24 +74,14 @@ pub struct TransitionJournal {
 pub fn replay_transitions(
     initial_frontier: &SerializableFrontier,
     trace_window: &[TraceItem],
-    fingerprint: Vec<u64>,
-    bits_per_item: usize,
+    fingerprint: Fingerprint,
     replayed_results: &std::collections::BTreeMap<String, ReplayResult>,
 ) -> Option<risc0_zkvm::Receipt> {
-    // Load the transition guest ELF from raster-prover
-
-    let fingerprint_accumulator: FingerprintAccumulator =
-        FingerprintAccumulator::new(BitPacker(bits_per_item));
-    let current_frontier = initial_frontier.clone();
     let prover = risc0_zkvm::default_prover();
 
     let init_transition = InitTransitionState {
         init_frontier: initial_frontier.clone(),
-        ref_fingerprint: FingerprintAccumulator::from(
-            fingerprint.clone(),
-            BitPacker(bits_per_item),
-            trace_window.len(),
-        ),
+        fingerprint,
     };
 
     let init_state = TransitionState::Init(init_transition);
@@ -105,7 +95,7 @@ pub fn replay_transitions(
         .flat_map(|val| val.to_le_bytes())
         .collect();
 
-    for (i, item) in trace_window.iter().enumerate() {
+    for item in trace_window {
         let Some(replay_result) = replayed_results.get(&item.fn_name) else {
             panic!("Replayed IMAGE ID not found");
         };

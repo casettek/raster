@@ -319,7 +319,7 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
                 let __raster_output_bytes = ::raster::core::postcard::to_allocvec(&__raster_result)
                     .unwrap_or_default();
 
-                ::raster::__emit_trace(
+                ::raster::emit_trace(
                     #fn_name_str,
                     #trace_desc_expr,
                     &[#(#input_param_tuples),*],
@@ -587,7 +587,6 @@ pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
     // Generate input parsing code based on parameters
     let input_parsing = if params.is_empty() {
-        // No parameters - no input parsing needed
         quote! {}
     } else if params.len() == 1 {
         // Single parameter - deserialize directly
@@ -633,37 +632,7 @@ pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let expanded = quote! {
         #(#fn_attrs)*
         fn main() {
-            // Parse --commit and --verify flags from CLI args
-            fn __parse_commit_audit() -> (Option<String>, Option<String>) {
-                let args: Vec<String> = std::env::args().collect();
-                let commit = args.iter().position(|a| a == "--commit")
-                    .and_then(|i| args.get(i + 1).cloned());
-                let audit = args.iter().position(|a| a == "--audit")
-                    .and_then(|i| args.get(i + 1).cloned());
-                (commit, audit)
-            }
-
-            let (commit_path, audit_path) = __parse_commit_audit();
-            // TODO: should be configurable value
-            let bits = 16;
-
-            // Initialize subscriber based on flags
-            if let Some(path) = commit_path {
-                let file = std::fs::File::create(&path)
-                    .expect(&format!("Failed to create commit file: {}", path));
-                let exec_commit_subscriber = ::raster::CommitSubscriber::new(bits, file);
-                ::raster::init_with(exec_commit_subscriber);
-            } else if let Some(path) = audit_path {
-                let exec_audit_subscriber = ::raster::AuditSubscriber::new(
-                    bits,
-                    std::path::PathBuf::from(path),
-                );
-                ::raster::init_with(exec_audit_subscriber);
-            } else {
-                // Default: use JsonSubscriber for stdout output
-                ::raster::init();
-            }
-
+            ::raster::init();
 
             #input_parsing
 

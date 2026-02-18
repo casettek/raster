@@ -30,6 +30,7 @@ impl<W: Write + Send + Sync> Subscriber for JsonSubscriber<W> {
         output: &[u8],
     ) {
         // TODO: should be enum TraceItem which have Tile/Sequence
+
         let item = TraceItem {
             fn_name: function_name.to_string(),
             desc: desc.map(|s| s.to_string()),
@@ -47,7 +48,7 @@ impl<W: Write + Send + Sync> Subscriber for JsonSubscriber<W> {
 
         let mut writer_guard = self.writer.lock().expect("Writer mutex poisoned");
         let json_str = serde_json::to_string(&item).expect("Failed to serialize");
-        write!(writer_guard, "RASTER_TRACE:{}\n", json_str).expect("Failed to write");
+        write!(writer_guard, "{}", json_str).expect("Failed to write");
     }
 
     fn on_complete(&self) {
