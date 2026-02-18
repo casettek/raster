@@ -513,7 +513,7 @@ mod tests {
             let frontier = tree.frontier().expect("frontier").clone();
             let ser_frontier = SerializableFrontier::from_frontier(&frontier);
             let deser_frontier = ser_frontier
-                .to_frontier()
+                .into_frontier()
                 .expect("Can't deserialize frontier");
 
             let pos = u64::from(deser_frontier.position());
