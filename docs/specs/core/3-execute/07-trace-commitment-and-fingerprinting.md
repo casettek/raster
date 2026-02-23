@@ -1,6 +1,6 @@
 ## Trace Commitment and Fingerprinting
 
-This document specifies Raster’s **implemented trace-item commitment scheme** (used by `#[raster::main]` via `--commit` / `--audit`) and the **intended future** commitment/fingerprinting surfaces needed for window replay and verifier workflows.
+This document specifies Raster’s **implemented trace-item commitment scheme** (used by the `#[sequence] fn main` entry point via `--commit` / `--audit`) and the **intended future** commitment/fingerprinting surfaces needed for window replay and verifier workflows.
 
 It also documents the current implementation status and explicitly identifies gaps between this spec and the codebase as it exists today.
 
@@ -15,7 +15,7 @@ It also documents the current implementation status and explicitly identifies ga
   - `crates/raster-prover/src/bit_packer.rs` (bit packing + first-diff locator)
 - **Runtime integration**
   - `crates/raster-runtime/src/tracing.rs` and `crates/raster-runtime/src/tracing/subscriber/*`
-  - `crates/raster-macros/src/lib.rs` (`#[raster::main]` parses `--commit` / `--audit` and initializes the corresponding subscriber)
+  - `crates/raster-macros/src/lib.rs` (the `#[sequence] fn main` entry point expansion initializes subscribers; CLI passes `--commit` / `--audit`)
 - **Related hashing/ID conventions**
   - `specs/Core/0. Conventions/01. IDs and Hashing.md`
 
@@ -102,7 +102,7 @@ Raster constructs an incremental Merkle commitment stream over the item hashes u
 
 To make comparisons compact, Raster packs a fixed number of bits from each root into `u64` blocks:
 
-- Let `bits_per_item = B` (currently `B = 16` as chosen by `#[raster::main]`).
+- Let `bits_per_item = B` (currently `B = 16` as chosen by the entry-point expansion).
 - For each root (32 bytes), crop to the lowest `B` bits (in the current little-endian packing convention used by `raster-prover::bit_packer`).
 - Pack consecutive cropped values into a `Vec<u64>` bitstream, then write the stream to disk as:
   - concatenated `u64::to_le_bytes()` blocks (little-endian), with no header.

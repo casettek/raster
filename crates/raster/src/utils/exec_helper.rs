@@ -14,10 +14,10 @@ use serde::de::DeserializeOwned;
 ///
 /// # Preferred Usage
 ///
-/// Use the `#[raster::main]` attribute macro, which handles this automatically:
+/// Use `#[raster::sequence] fn main(...)`, which handles this automatically:
 ///
 /// ```rust,ignore
-/// #[raster::main]
+/// #[raster::sequence]
 /// fn main() {
 ///     // Your normal main logic...
 /// }
@@ -110,7 +110,7 @@ pub fn try_execute_tile_from_args() -> bool {
 
 /// Parse the `--input` argument from command line and deserialize it.
 ///
-/// This function is used by the `#[raster::main]` macro to parse input arguments
+/// This function is used by the `#[raster::sequence] fn main(...)` entry point to parse input arguments
 /// passed via the command line. The input should be a JSON value.
 ///
 /// # Example

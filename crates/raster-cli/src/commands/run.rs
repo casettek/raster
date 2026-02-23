@@ -22,6 +22,8 @@ use raster_prover::transition::{replay_transitions, TransitionJournal};
 
 use crate::BackendType;
 
+pub struct Trace(Vec<StepRecord>);
+
 pub fn run(
     backend_type: BackendType,
     input: Option<&str>,
@@ -133,13 +135,13 @@ pub fn run(
         // TODO: in case of just simple execution did printing out trace items is enough or save
         // them to file
         //
+
         for step_record in trace {
             let padding = "\t".repeat(step_record.sequence_callstack_depth.try_into().unwrap());
-            println!("--------------------------------------------------------");
-            println!("{padding}exec_index: {}", step_record.exec_index);
-            println!("{padding}sequence_id: {}", step_record.sequence_id);
+            println!("\n{padding}exec_index: {}", step_record.exec_index);
             println!("{padding}tile_id: {}", step_record.fn_call_record.fn_name);
-            println!("--------------------------------------------------------");
+            println!("{padding}sequence_id: {}", step_record.sequence_id);
+            println!("{padding}intra_sequence_index: {}", step_record.intra_sequence_index);
         }
     }
 

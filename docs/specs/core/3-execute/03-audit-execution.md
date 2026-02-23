@@ -8,7 +8,7 @@ It is written to match the current codebase. Where the intended behavior (CFS en
 
 - There is **no schema-driven “audit execution” runner** today (no runtime component enforces a CFS while executing a sequence/program).
 - There *is* an implemented **trace-commitment audit posture** for whole-program native runs:
-  - `#[raster::main]` supports `--commit <path>` and `--audit <path>`.
+  - The `#[sequence] fn main` entry point supports `--commit <path>` and `--audit <path>`.
   - `--commit` writes a packed commitment stream for the tile I/O trace (`TraceItem`s).
   - `--audit` recomputes the packed stream and compares it to an expected file, reporting the first mismatch.
 - For zkVM execution, the RISC0 backend also supports **receipt verification** (`ExecutionMode::Prove { verify: true }`), but that is distinct from trace-commitment auditing.
@@ -100,7 +100,7 @@ This means “prove+verify” is informational today; it does not enforce an “
 
 ### 1b) Trace-commitment auditing (native whole-program runs)
 
-When a program is built using `#[raster::main]`, it can be run in one of three tracing postures:
+When a program uses `#[raster::sequence] fn main(...)` as its entry point, it can be run in one of three tracing postures:
 
 - Default: stdout JSON subscriber (`raster_runtime::JsonSubscriber`) emits `TraceItem`s.
 - `--commit <path>`: commitment subscriber (`raster_runtime::CommitSubscriber`) writes a packed commitment stream to `path`.

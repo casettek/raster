@@ -1,3 +1,5 @@
+use raster::prelude::*;
+
 use hello_tiles::{count_to, current_wish, exclaim, greet, raster_wish};
 
 /// The main sequence that greets and adds emphasis, with recursive counting.
@@ -13,7 +15,7 @@ use hello_tiles::{count_to, current_wish, exclaim, greet, raster_wish};
 ///
 /// Run with: `cargo run -- --input '"Raster"'`
 /// Or: `cargo raster preview --input '"Raster"'`
-#[raster::sequence]
+#[sequence]
 fn greet_sequence(name: String) -> String {
     let greeting = greet(name);
     let e1 = exclaim(greeting);
@@ -21,24 +23,22 @@ fn greet_sequence(name: String) -> String {
     exclaim(wish_sequence(e2))
 }
 
-#[raster::sequence]
+#[sequence]
 fn wish_sequence(name: String) -> String {
     let wish = current_wish(raster_wish(name));
     placeholder_sequence(wish)
 }
 
-#[raster::sequence]
+#[sequence]
 fn placeholder_sequence(placeholder: String) -> String {
-    format!("placeholder: {}", placeholder)
+    exclaim(placeholder)
 }
 
 /// Entry point that runs the greet sequence natively.
 ///
 /// The `name` parameter is parsed from `--input` CLI argument.
 /// Run with: `cargo run -- --input '"YourName"'`
-#[raster::main]
+#[sequence]
 fn main(name: String) {
     let result = greet_sequence(name);
-    println!("{}", result);
 }
-

@@ -401,7 +401,7 @@ fn main_sequence(name: String) -> String {
 
 - **Execution stack is not wired end-to-end**
   - `raster-backend::NativeBackend::execute_tile` is a stub and does not execute via the registry.
-  - The CLI “whole program” runner (`cargo raster run`) executes the user binary as a subprocess; tracing/commitment capture is handled by `#[raster::main]` + `raster-runtime` subscribers rather than an `Executor`.
+  - The CLI “whole program” runner (`cargo raster run`) executes the user binary as a subprocess; tracing/commitment capture is handled by the `#[sequence] fn main` entry point + `raster-runtime` subscribers rather than an `Executor`.
 
 - **Sequence schema generation is not implemented**
   - `raster-compiler::SchemaGenerator::generate` is `todo!()`.

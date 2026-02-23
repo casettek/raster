@@ -13,7 +13,7 @@ extern crate alloc;
 extern crate std;
 
 pub use raster_core as core;
-pub use raster_macros::{main, sequence, tile};
+pub use raster_macros::{sequence, tile};
 
 // Runtime is only available with std feature
 #[cfg(feature = "std")]
