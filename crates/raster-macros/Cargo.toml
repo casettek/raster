@@ -11,7 +11,8 @@ description = "Procedural macros for the Raster toolchain"
 proc-macro = true
 
 [dependencies]
-raster-core.workspace = true
+raster-core = { workspace = true, features = ["std"] }
+
 syn.workspace = true
 quote.workspace = true
 proc-macro2.workspace = true

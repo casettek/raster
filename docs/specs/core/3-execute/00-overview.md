@@ -41,7 +41,7 @@ Raster currently has **two practical execution entrypoints**:
 - **Native whole-program execution** (runs the project binary as a subprocess)
   - Command: `cargo raster run --backend native [--input <json>] [--commit <path> | --audit <path>]`
   - Implementation: `crates/raster-cli/src/commands/run.rs` builds the project, then executes the built binary with `--input/--commit/--audit` forwarded.
-  - Tracing/commitment behavior is controlled by the program’s `#[raster::main]` macro expansion, which initializes `raster-runtime` subscribers based on `--commit/--audit`.
+  - Tracing/commitment behavior is controlled by the program’s `#[sequence] fn main` entry point expansion, which initializes `raster-runtime` subscribers based on `--commit/--audit`.
 
 ### Important gap: schema-driven sequence runner is not implemented
 
@@ -179,7 +179,7 @@ Raster also defines a tile I/O “trace item” record used by runtime subscribe
 
 #### Implemented today (tile I/O trace + commitments)
 
-When a program uses the `#[raster::main]` macro:
+When a program uses `#[raster::sequence] fn main(...)` as its entry point:
 
 - By default, it initializes a `JsonSubscriber` that writes serialized `TraceItem`s to stdout.
 - With `--commit <path>`, it initializes a `CommitSubscriber` that writes packed commitment blocks to the given file.

@@ -10,8 +10,7 @@ use raster_backend_risc0::Risc0Backend;
 
 use raster_compiler::Project;
 
-use raster_core::trace::TraceItem;
-use raster_core::trace::TraceWindow;
+use raster_core::trace::{StepRecord, TraceWindow};
 use raster_core::{Error, Result};
 
 use raster_prover::precomputed::EMPTY_TRIE_NODES;
@@ -22,6 +21,8 @@ use raster_prover::trace::{
 use raster_prover::transition::{replay_transitions, TransitionJournal};
 
 use crate::BackendType;
+
+pub struct Trace(Vec<StepRecord>);
 
 pub fn run(
     backend_type: BackendType,
@@ -63,11 +64,6 @@ pub fn run(
             binary_path.display()
         )));
     }
-
-    let commit_path = commit_flag
-        .or(audit_flag)
-        .expect("Neither commit nor audit path was provided");
-
     println!();
     println!("Running {}...", &project.name);
     println!();
@@ -97,24 +93,33 @@ pub fn run(
 
     let stdout = String::from_utf8_lossy(&output.stdout);
 
-    let mut trace_items: Vec<TraceItem> = Vec::new();
+    let mut trace: Vec<StepRecord> = Vec::new();
 
     for line in stdout.lines() {
-        if let Some(parsed) = line.strip_prefix("[trace]").map(serde_json::from_str) {
-            if let Ok(trace_item) = parsed {
-                trace_items.push(trace_item);
+        if let Some(parsed) = line
+            .strip_prefix("[trace]")
+            .map(serde_json::from_str::<StepRecord>)
+        {
+            if let Ok(step_record) = parsed {
+                trace.push(step_record);
             }
         }
     }
 
     if commit_flag.is_some() {
-        if commit_path.starts_with("fraud") {
-            fraud(&mut trace_items, commit_path)
+        let commit_path = commit_flag.expect("Commitment path was provided");
+
+        // TODO: temprorary way to generate "fraud" trace commitment
+        // prefix file with fraud_{NAME}
+        //
+        if commit_path.starts_with("fraud_") {
+            fraud(&mut trace, commit_path)
         } else {
-            commit(&trace_items, commit_path);
+            commit(&trace, commit_path);
         }
     } else if audit_flag.is_some() {
-        let verification_result = verify(&trace_items, commit_path);
+        let commit_path = audit_flag.expect("Commitment path was provided");
+        let verification_result = verify(&trace, commit_path);
 
         match verification_result {
             VerificationResult::Ok => println!("Verification Success"),
@@ -126,17 +131,29 @@ pub fn run(
                 let _fraud_proof = prove(fraud_window, &replayer);
             }
         }
+    } else {
+        // TODO: in case of just simple execution did printing out trace items is enough or save
+        // them to file
+        //
+
+        for step_record in trace {
+            let padding = "\t".repeat(step_record.sequence_callstack_depth.try_into().unwrap());
+            println!("\n{padding}exec_index: {}", step_record.exec_index);
+            println!("{padding}tile_id: {}", step_record.fn_call_record.fn_name);
+            println!("{padding}sequence_id: {}", step_record.sequence_id);
+            println!("{padding}intra_sequence_index: {}", step_record.intra_sequence_index);
+        }
     }
 
     Ok(())
 }
 
-pub fn fraud(trace_items: &mut [TraceItem], commit_path: &str) {
+pub fn fraud(trace_items: &mut [StepRecord], commit_path: &str) {
     let mut commitment_file =
         std::fs::File::create(commit_path).expect("Failed to create commitemt file");
 
-    if let Some(fraud_trace_item) = trace_items.last_mut() {
-        fraud_trace_item.output_data = vec![0u8, 1u8];
+    if let Some(fraud_step) = trace_items.last_mut() {
+        fraud_step.fn_call_record.output_data = vec![0u8, 1u8];
     };
 
     let trace_commitment = TraceCommitment::from(trace_items, &EMPTY_TRIE_NODES[0]);
@@ -148,7 +165,7 @@ pub fn fraud(trace_items: &mut [TraceItem], commit_path: &str) {
         .expect("Failed to save commitment");
 }
 
-pub fn commit(trace_items: &[TraceItem], commit_path: &str) {
+pub fn commit(trace_items: &[StepRecord], commit_path: &str) {
     let mut commitment_file =
         std::fs::File::create(commit_path).expect("Failed to create commitemt file");
 
@@ -160,7 +177,7 @@ pub fn commit(trace_items: &[TraceItem], commit_path: &str) {
         .expect("Failed to save commitment");
 }
 
-pub fn verify(trace_items: &[TraceItem], commit_path: &str) -> VerificationResult {
+pub fn verify(trace_items: &[StepRecord], commit_path: &str) -> VerificationResult {
     let trace_commitment = read_trace_commitment(commit_path);
 
     let actual_trace_commitment = TraceCommitment::from(trace_items, &EMPTY_TRIE_NODES[0]);
@@ -184,11 +201,11 @@ pub fn prove(fraud_window: TraceWindow, replayer: &Replayer) -> risc0_zkvm::Rece
     let mut replayed_results: BTreeMap<String, ReplayResult> = BTreeMap::new();
 
     for (i, item) in fraud_window.items.iter().enumerate() {
-        print!("  [{}] {} ... ", i, item.fn_name);
+        print!("  [{}] {} ... ", i, item.fn_call_record.fn_name);
 
         match replayer.replay(item, mode) {
             Ok(replay_result) => {
-                replayed_results.insert(item.fn_name.clone(), replay_result.clone());
+                replayed_results.insert(item.fn_call_record.fn_name.clone(), replay_result.clone());
             }
             Err(e) => {
                 println!("FAILED: {}", e);

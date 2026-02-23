@@ -30,7 +30,7 @@ This document specifies how Raster “programs” are defined for the Core toolc
 - **Program packaging / artifacts**
   - `crates/raster-compiler/src/builder.rs`: artifact layout under `target/raster/tiles/<tile_id>/<backend>/` (`guest.elf`, `method_id`, `manifest.json`).
   - `crates/raster-cli/src/commands.rs`: `cfs()` writes `target/raster/cfs.json`.
-  - `crates/raster-runtime/src/tracing.rs` and `crates/raster-runtime/src/tracing/subscriber/*`: tracing/commitment subscribers used by `#[raster::main]`.
+  - `crates/raster-runtime/src/tracing.rs` and `crates/raster-runtime/src/tracing/subscriber/*`: tracing/commitment subscribers used by the `#[sequence] fn main` entry point.
 
 ### Specification
 
