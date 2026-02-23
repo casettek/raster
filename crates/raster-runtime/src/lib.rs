@@ -7,6 +7,6 @@
 
 pub mod tracing;
 pub use tracing::{
-    emit_trace, emit_trace_event, finish, init, init_with,
-    subscriber::{json::JsonSubscriber, Subscriber},
+    emit_trace_event, finish, init, init_with,
+    subscriber::{ExecutionSubscriber, Subscriber},
 };

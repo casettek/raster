@@ -94,7 +94,10 @@ pub fn run(
     let mut trace: Vec<StepRecord> = Vec::new();
 
     for line in stdout.lines() {
-        if let Some(parsed) = line.strip_prefix("[trace]").map(serde_json::from_str::<StepRecord>) {
+        if let Some(parsed) = line
+            .strip_prefix("[trace]")
+            .map(serde_json::from_str::<StepRecord>)
+        {
             if let Ok(step_record) = parsed {
                 trace.push(step_record);
             }
@@ -131,7 +134,12 @@ pub fn run(
         // them to file
         //
         for step_record in trace {
-            println!("{:?}", step_record);
+            let padding = "\t".repeat(step_record.sequence_callstack_depth.try_into().unwrap());
+            println!("--------------------------------------------------------");
+            println!("{padding}exec_index: {}", step_record.exec_index);
+            println!("{padding}sequence_id: {}", step_record.sequence_id);
+            println!("{padding}tile_id: {}", step_record.fn_call_record.fn_name);
+            println!("--------------------------------------------------------");
         }
     }
 

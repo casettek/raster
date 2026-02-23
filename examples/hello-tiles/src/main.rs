@@ -1,6 +1,5 @@
 use hello_tiles::{count_to, current_wish, exclaim, greet, raster_wish};
 
-
 /// The main sequence that greets and adds emphasis, with recursive counting.
 ///
 /// This sequence:
@@ -24,8 +23,15 @@ fn greet_sequence(name: String) -> String {
 
 #[raster::sequence]
 fn wish_sequence(name: String) -> String {
-    current_wish(raster_wish(name))
+    let wish = current_wish(raster_wish(name));
+    placeholder_sequence(wish)
 }
+
+#[raster::sequence]
+fn placeholder_sequence(placeholder: String) -> String {
+    format!("placeholder: {}", placeholder)
+}
+
 /// Entry point that runs the greet sequence natively.
 ///
 /// The `name` parameter is parsed from `--input` CLI argument.
@@ -35,3 +41,4 @@ fn main(name: String) {
     let result = greet_sequence(name);
     println!("{}", result);
 }
+

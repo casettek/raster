@@ -17,7 +17,7 @@ pub use raster_macros::{main, sequence, tile};
 
 // Runtime is only available with std feature
 #[cfg(feature = "std")]
-pub use raster_runtime::{emit_trace, emit_trace_event, finish, init, init_with, JsonSubscriber};
+pub use raster_runtime::{emit_trace_event, finish, init, init_with, ExecutionSubscriber};
 
 #[cfg(feature = "std")]
 pub mod utils;

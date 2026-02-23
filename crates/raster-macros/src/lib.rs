@@ -328,6 +328,7 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
                         ty: ::alloc::string::String::from(*t),
                     })
                     .collect();
+
                 let __raster_tile_record = ::raster::core::trace::FnCallRecord {
                     fn_name: ::alloc::string::String::from(#fn_name_str),
                     desc: #trace_desc_expr.map(|s: &str| ::alloc::string::String::from(s)),
@@ -413,54 +414,6 @@ impl SequenceAttrs {
 
         attrs
     }
-}
-
-/// Visitor that extracts function call names from the AST.
-/// It collects function names in the order they appear.
-struct TileCallExtractor {
-    tile_calls: Vec<String>,
-}
-
-impl TileCallExtractor {
-    fn new() -> Self {
-        Self {
-            tile_calls: Vec::new(),
-        }
-    }
-}
-
-impl<'ast> Visit<'ast> for TileCallExtractor {
-    fn visit_expr_call(&mut self, node: &'ast ExprCall) {
-        // Check if this is a simple function call (not a method call)
-        if let Expr::Path(ExprPath { path, .. }) = &*node.func {
-            // Get the function name (last segment of the path)
-            if let Some(segment) = path.segments.last() {
-                let fn_name = segment.ident.to_string();
-                // Skip common non-tile functions
-                if !is_excluded_function(&fn_name) {
-                    self.tile_calls.push(fn_name.to_owned());
-                }
-            }
-        }
-        // Continue visiting nested expressions
-        syn::visit::visit_expr_call(self, node);
-    }
-}
-
-/// Check if a function name should be excluded from tile extraction.
-/// These are common Rust functions that are not tiles.
-fn is_excluded_function(name: &str) -> bool {
-    matches!(
-        name,
-        // Common Rust functions that aren't tiles
-        "println" | "print" | "eprintln" | "eprint" | "dbg" |
-        "format" | "panic" | "assert" | "assert_eq" | "assert_ne" |
-        "Some" | "None" | "Ok" | "Err" |
-        "Box" | "Vec" | "String" | "to_string" | "to_owned" |
-        "clone" | "into" | "from" | "default" |
-        // Allocator functions
-        "alloc" | "dealloc"
-    )
 }
 
 /// Declares a sequence of tiles with linear control flow.
