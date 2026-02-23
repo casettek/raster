@@ -110,6 +110,15 @@ Example JSON encoding (illustrative of serde’s default externally tagged behav
 
 **Current implementation gap**: Raster does not provide an event-trace persistence implementation in this workspace; `Trace`/`TraceEvent` are data types only.
 
+### Macro-driven emission (implemented)
+
+When the `std` feature is enabled and the target is not `riscv32`:
+
+- The **`#[tile]`** macro wraps the function body so that on return it builds a `FnCallRecord` and calls `emit_trace_event(TraceEvent::Tile(record))`, so each tile execution produces a single `TraceEvent::Tile` event.
+- The **`#[sequence]`** macro wraps the function body so that it emits `TraceEvent::SequenceStart(record)` before running the body and `TraceEvent::SequenceEnd(record)` after. Event order is therefore SequenceStart → (zero or more Tile events from tiles called in the body) → SequenceEnd.
+
+The runtime API `emit_trace_event(TraceEvent)` dispatches to the global subscriber; the default `JsonSubscriber` handles `SequenceStart`, `SequenceEnd`, and `Tile` and writes step records for tiles (see “`TraceItem` JSON emission” below).
+
 ## `TraceItem` JSON emission (implemented; delimiter caveat)
 
 In addition to the coarse `TraceEvent` model, Raster defines a tile I/O transcript record:

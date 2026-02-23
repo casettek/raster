@@ -1,3 +1,4 @@
+use raster_core::trace::TraceEvent;
 use std::sync::OnceLock;
 
 /// A trait for receiving trace events.
@@ -11,15 +12,7 @@ pub trait Subscriber: Send + Sync {
     /// - `output_type` - Optional return type as a string
     /// - `input` - Serialized input bytes (postcard-encoded)
     /// - `output` - Serialized output bytes (postcard-encoded)
-    fn on_trace(
-        &self,
-        function_name: &str,
-        desc: Option<&str>,
-        input_params: &[(&str, &str)],
-        output_type: Option<&str>,
-        input: &[u8],
-        output: &[u8],
-    );
+    fn on_trace(&self, event: TraceEvent);
 
     fn on_complete(&self);
 }

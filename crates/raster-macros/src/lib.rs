@@ -315,18 +315,30 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
                 // Execute original body via closure to handle early returns
                 let __raster_result = (|| #fn_body)();
 
-                // Serialize output and emit trace
+                // Serialize output and emit TraceEvent::Tile
                 let __raster_output_bytes = ::raster::core::postcard::to_allocvec(&__raster_result)
                     .unwrap_or_default();
 
-                ::raster::emit_trace(
-                    #fn_name_str,
-                    #trace_desc_expr,
-                    &[#(#input_param_tuples),*],
-                    #trace_output_type_expr,
-                    &__raster_input_bytes,
-                    &__raster_output_bytes,
-                );
+                let __raster_inputs: ::alloc::vec::Vec<::raster::core::trace::FnInputParam> = [
+                    #(#input_param_tuples),*
+                ]
+                    .iter()
+                    .map(|(n, t)| ::raster::core::trace::FnInputParam {
+                        name: ::alloc::string::String::from(*n),
+                        ty: ::alloc::string::String::from(*t),
+                    })
+                    .collect();
+                let __raster_tile_record = ::raster::core::trace::FnCallRecord {
+                    fn_name: ::alloc::string::String::from(#fn_name_str),
+                    desc: #trace_desc_expr.map(|s: &str| ::alloc::string::String::from(s)),
+                    inputs: __raster_inputs,
+                    input_data: __raster_input_bytes.clone(),
+                    output_type: #trace_output_type_expr.map(|s: &str| ::alloc::string::String::from(s)),
+                    output_data: __raster_output_bytes.clone(),
+                };
+                ::raster::emit_trace_event(::raster::core::trace::TraceEvent::Tile(
+                    __raster_tile_record,
+                ));
 
                 return __raster_result;
             }
@@ -472,27 +484,18 @@ fn is_excluded_function(name: &str) -> bool {
 /// This will register a sequence named "main" with tiles `["greet", "exclaim"]`.
 #[proc_macro_attribute]
 pub fn sequence(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let attrs = SequenceAttrs::parse(attr);
     let input_fn = parse_macro_input!(item as ItemFn);
+    let fn_name_str = input_fn.sig.ident.to_string();
 
     let fn_name = &input_fn.sig.ident;
-    let fn_name_str = fn_name.to_string();
-    let registration_name = format_ident!(
-        "__RASTER_SEQUENCE_REGISTRATION_{}",
-        fn_name.to_string().to_uppercase()
-    );
+    let fn_vis = &input_fn.vis;
+    let fn_sig = &input_fn.sig;
+    let fn_attrs = &input_fn.attrs;
+    let fn_body = &input_fn.block;
 
-    // Extract tile calls from the function body
-    let mut extractor = TileCallExtractor::new();
-    extractor.visit_item_fn(&input_fn);
-    let tile_calls = extractor.tile_calls;
+    let attrs = SequenceAttrs::parse(attr);
 
-    // Generate the tile list as a static array
-    let tile_count = tile_calls.len();
-    let tile_strs: Vec<_> = tile_calls.iter().map(|s| s.as_str()).collect();
-
-    // Generate description expression
-    let description_expr = match &attrs.description {
+    let sequence_desc_expr = match &attrs.description {
         Some(desc) => {
             let desc_str = desc.as_str();
             quote! { ::core::option::Option::Some(#desc_str) }
@@ -500,32 +503,45 @@ pub fn sequence(attr: TokenStream, item: TokenStream) -> TokenStream {
         None => quote! { ::core::option::Option::None },
     };
 
-    let tiles_static_name = format_ident!(
-        "__RASTER_SEQUENCE_TILES_{}",
+    let sequence_output_type_expr = match &input_fn.sig.output {
+        ReturnType::Default => quote! { ::core::option::Option::None },
+        ReturnType::Type(_, ty) => {
+            let ty_str = ty.to_token_stream().to_string();
+            quote! { ::core::option::Option::Some(#ty_str) }
+        }
+    };
+
+    let registration_name = format_ident!(
+        "__RASTER_SEQUENCE_REGISTRATION_{}",
         fn_name.to_string().to_uppercase()
     );
 
     let expanded = quote! {
-        // Keep the original function unchanged for native execution
-        #input_fn
+        #(#fn_attrs)*
+        #fn_vis #fn_sig {
+            #[cfg(all(feature = "std", not(target_arch = "riscv32")))]
+            {
+                let __raster_seq_record = ::raster::core::trace::FnCallRecord {
+                    fn_name: String::from(#fn_name_str),
+                    desc: #sequence_desc_expr.map(|s: &str| String::from(s)),
+                    inputs: Vec::new(),
+                    input_data: Vec::new(),
+                    output_type: #sequence_output_type_expr.map(|s: &str| String::from(s)),
+                    output_data: Vec::new(),
+                };
+                ::raster::emit_trace_event(::raster::core::trace::TraceEvent::SequenceStart(
+                    __raster_seq_record.clone(),
+                ));
+                let __raster_result = (|| #fn_body)();
+                ::raster::emit_trace_event(::raster::core::trace::TraceEvent::SequenceEnd(
+                    __raster_seq_record,
+                ));
+                __raster_result
+            }
 
-        // Static array of tile IDs for this sequence
-        #[cfg(all(feature = "std", not(target_arch = "riscv32")))]
-        static #tiles_static_name: [&'static str; #tile_count] = [#(#tile_strs),*];
-
-        // Register the sequence in the distributed slice (only on platforms that support linkme and std)
-        #[cfg(all(feature = "std", not(target_arch = "riscv32")))]
-        #[::raster::core::linkme::distributed_slice(::raster::core::registry::SEQUENCE_REGISTRY)]
-        #[linkme(crate = ::raster::core::linkme)]
-        static #registration_name: ::raster::core::registry::SequenceRegistration =
-            ::raster::core::registry::SequenceRegistration::new(
-                ::raster::core::registry::SequenceMetadataStatic::new(
-                    #fn_name_str,
-                    #fn_name_str,
-                    #description_expr,
-                ),
-                &#tiles_static_name,
-            );
+            #[cfg(not(all(feature = "std", not(target_arch = "riscv32"))))]
+            #fn_body
+        }
     };
 
     TokenStream::from(expanded)

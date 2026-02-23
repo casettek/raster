@@ -1,8 +1,7 @@
 use std::path::PathBuf;
 
-use crate::Project;
 use crate::ast::FunctionAstItem;
-
+use crate::Project;
 
 use raster_core::tile::{TileId, TileMetadata};
 
@@ -10,11 +9,13 @@ use raster_core::tile::{TileId, TileMetadata};
 pub struct TileResult {
     pub output: Vec<u8>,
 }
+
 #[derive(Debug, Clone)]
 pub struct Tile<'ast> {
     pub function: &'ast FunctionAstItem,
     /// Tile type (e.g., "tile", "recur").
     pub tile_type: String,
+
     pub estimated_cycles: Option<u64>,
     pub max_memory: Option<u64>,
     pub description: Option<String>,
@@ -45,7 +46,7 @@ impl<'ast> Tile<'ast> {
 
     // TODO: move content hashing to the artifact store
     pub fn to_content_hash(&self) -> Option<String> {
-        let mut file = std::fs::File::open(&self.source_file()).ok()?;
+        let mut file = std::fs::File::open(self.source_file()).ok()?;
         let mut contents = Vec::new();
         std::io::Read::read_to_end(&mut file, &mut contents).ok()?;
 
@@ -78,7 +79,7 @@ impl<'ast> TileDiscovery<'ast> {
                     .iter()
                     .any(|m| m.name == "tile" || m.name == "raster::tile")
             })
-            .map(|f| Self::extract_tile(f))
+            .map(Self::extract_tile)
             .collect();
 
         Self { project, tiles }

@@ -17,7 +17,7 @@ pub use raster_macros::{main, sequence, tile};
 
 // Runtime is only available with std feature
 #[cfg(feature = "std")]
-pub use raster_runtime::{emit_trace, finish, init, init_with, JsonSubscriber};
+pub use raster_runtime::{emit_trace, emit_trace_event, finish, init, init_with, JsonSubscriber};
 
 #[cfg(feature = "std")]
 pub mod utils;
@@ -36,7 +36,7 @@ pub mod prelude {
     pub use crate::core::{
         manifest::Manifest,
         schema::{ControlFlow, SequenceSchema},
-        trace::{TraceInputParam, TraceItem},
+        trace::{FnCallRecord, FnInputParam, StepRecord},
     };
 
     // Registry is only available with std and on platforms that support linkme

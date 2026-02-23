@@ -15,7 +15,7 @@ use crate::error::{BitPackerError, Result};
 use crate::precomputed::{EMPTY_TRIE_NODES, HASH_SIZE};
 
 use raster_core::fingerprint::BitPacker;
-use raster_core::trace::{TraceItem, TraceWindow};
+use raster_core::trace::{StepRecord, TraceWindow};
 
 /// Trait for types that can be hashed to bytes.
 pub trait BytesHashable {
@@ -28,7 +28,7 @@ pub trait BytesHashable {
     }
 }
 
-impl BytesHashable for TraceItem {
+impl BytesHashable for StepRecord {
     fn hash(&self) -> Vec<u8> {
         let data = postcard::to_allocvec(self).expect("Failed to serialize for hashing");
         let mut hasher = Sha256::new();
@@ -151,11 +151,11 @@ pub const BITS_PER_ITEM: usize = 16;
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TraceCommitment {
     pub fingerprint: Fingerprint,
-    pub revealed_items: Vec<TraceItem>,
+    pub revealed_items: Vec<StepRecord>,
 }
 
 impl TraceCommitment {
-    pub fn from(items: &[TraceItem], seed: &[u8]) -> TraceCommitment {
+    pub fn from(items: &[StepRecord], seed: &[u8]) -> TraceCommitment {
         assert!(
             items.len() > WINDOW_SIZE.into(),
             "Trace length can't be less than verification window"
@@ -186,7 +186,7 @@ impl TraceCommitment {
     }
 
     /// Try to create a commitment from items, returning an error if the trace is empty.
-    pub fn try_from(items: &[TraceItem], seed: &[u8]) -> Result<TraceCommitment> {
+    pub fn try_from(items: &[StepRecord], seed: &[u8]) -> Result<TraceCommitment> {
         if items.is_empty() {
             return Err(BitPackerError::EmptyTrace);
         }
@@ -196,7 +196,7 @@ impl TraceCommitment {
     /// Get the frontier (partial Merkle path) at position n.
     ///
     /// This can be used to continue building the tree from position n.
-    pub fn frontier(items: &[TraceItem], n: usize, seed: &[u8]) -> Option<TraceTreeFrontier> {
+    pub fn frontier(items: &[StepRecord], n: usize, seed: &[u8]) -> Option<TraceTreeFrontier> {
         let items_hashes: Vec<Vec<u8>> = items.iter().map(|item| item.hash()).collect();
 
         let mut trace_tree = TraceTree::new(1);
@@ -210,7 +210,7 @@ impl TraceCommitment {
     }
 
     /// Try to get the frontier, returning an error on failure.
-    pub fn try_frontier(items: &[TraceItem], n: usize, seed: &[u8]) -> Result<TraceTreeFrontier> {
+    pub fn try_frontier(items: &[StepRecord], n: usize, seed: &[u8]) -> Result<TraceTreeFrontier> {
         if n > items.len() {
             return Err(BitPackerError::InvalidRange {
                 start: 0,
@@ -304,7 +304,7 @@ pub struct TraceVerifier {
     pub latest_frontier: TraceTreeFrontier,
 
     pub window_frontiers: Window<TraceTreeFrontier>,
-    pub window_items: Window<TraceItem>,
+    pub window_items: Window<StepRecord>,
 }
 
 pub enum VerificationResult {
@@ -323,7 +323,7 @@ impl TraceVerifier {
         let mut fingerprint_acc = FingerprintAccumulator::new(bit_packer);
 
         let mut window_frontiers: Window<TraceTreeFrontier> = Window::new(WINDOW_SIZE.into());
-        let window_items: Window<TraceItem> = Window::new(WINDOW_SIZE.into());
+        let window_items: Window<StepRecord> = Window::new(WINDOW_SIZE.into());
 
         window_frontiers.push(init_frontier.clone());
 
@@ -338,7 +338,7 @@ impl TraceVerifier {
         }
     }
 
-    pub fn verify(&mut self, item: &TraceItem) -> VerificationResult {
+    pub fn verify(&mut self, item: &StepRecord) -> VerificationResult {
         let item_frontier = self.latest_frontier.clone();
 
         self.window_frontiers.push(item_frontier);
@@ -402,29 +402,35 @@ impl TraceVerifier {
 
 #[cfg(test)]
 mod tests {
-    use raster_core::trace::TraceInputParam;
+    use raster_core::trace::{FnCallRecord, FnInputParam, StepRecord};
 
     use super::*;
     use crate::precomputed;
 
-    /// Helper function to create a TileTraceItem for testing.
-    fn make_tile_trace_item(input: u64, output: u64) -> TraceItem {
-        TraceItem {
-            fn_name: format!("test_tile_{}", input),
-            desc: None,
-            inputs: vec![TraceInputParam {
-                name: "input".to_string(),
-                ty: "u64".to_string(),
-            }],
-            input_data: Vec::new(),
-            output_type: Some("u64".to_string()),
-            output_data: output.to_le_bytes().to_vec(),
+    /// Helper function to create a step record for testing.
+    fn make_tile_trace_item(input: u64, output: u64) -> StepRecord {
+        StepRecord {
+            exec_index: input,
+            sequence_id: "test_sequence".to_string(),
+            intra_sequence_index: input,
+            sequence_callstack_depth: 0,
+            fn_call_record: FnCallRecord {
+                fn_name: format!("test_tile_{}", input),
+                desc: None,
+                inputs: vec![FnInputParam {
+                    name: "input".to_string(),
+                    ty: "u64".to_string(),
+                }],
+                input_data: Vec::new(),
+                output_type: Some("u64".to_string()),
+                output_data: output.to_le_bytes().to_vec(),
+            },
         }
     }
 
     #[test]
     fn trace_should_be_not_equal() {
-        let items: Vec<TraceItem> = vec![
+        let items: Vec<StepRecord> = vec![
             make_tile_trace_item(0, 0),
             make_tile_trace_item(1, 1),
             make_tile_trace_item(2, 2),
@@ -432,7 +438,7 @@ mod tests {
             make_tile_trace_item(4, 4),
         ];
 
-        let ref_items: Vec<TraceItem> = vec![
+        let ref_items: Vec<StepRecord> = vec![
             make_tile_trace_item(0, 0),
             make_tile_trace_item(1, 1),
             make_tile_trace_item(5, 5), // Different
@@ -456,7 +462,7 @@ mod tests {
 
     #[test]
     fn test_try_from_empty_trace() {
-        let items: Vec<TraceItem> = vec![];
+        let items: Vec<StepRecord> = vec![];
         let result = TraceCommitment::try_from(&items, &precomputed::EMPTY_TRIE_NODES[0]);
         assert!(matches!(result, Err(BitPackerError::EmptyTrace)));
     }
@@ -503,7 +509,7 @@ mod tests {
         }
 
         let seed = precomputed::EMPTY_TRIE_NODES[0];
-        let items: Vec<TraceItem> = (0..10).map(|i| make_tile_trace_item(i, i)).collect();
+        let items: Vec<StepRecord> = (0..10).map(|i| make_tile_trace_item(i, i)).collect();
 
         let mut tree = TraceTree::new(1);
         tree.append(Bytes(seed.to_vec()));
