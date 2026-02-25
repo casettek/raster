@@ -52,7 +52,6 @@ pub struct TileMetadata {
 
     /// Maximum memory usage in bytes
     pub max_memory: Option<u64>,
-
 }
 
 impl TileMetadata {

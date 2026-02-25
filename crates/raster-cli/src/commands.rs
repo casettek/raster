@@ -402,7 +402,14 @@ pub fn cfs(output: Option<String>) -> Result<()> {
     for seq in &cfs.sequences {
         println!("  - {} ({} items)", seq.id, seq.items.len());
         for (idx, item) in seq.items.iter().enumerate() {
-            println!("      [{}] {} '{}'", idx, item.item_type, item.item_id);
+            match item {
+                raster_core::cfs::SequenceChild::Tile(item) => {
+                    println!("      [{}] {} '{}'", idx, "tile", item.id)
+                }
+                raster_core::cfs::SequenceChild::Sequence(item) => {
+                    println!("      [{}] {} '{}'", idx, "tile", item.id)
+                }
+            }
         }
     }
     println!();

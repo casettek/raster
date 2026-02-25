@@ -24,12 +24,6 @@ use crate::BackendType;
 
 pub struct Trace(Vec<StepRecord>);
 
-impl std::fmt::Display for Trace {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!("")
-    }
-}
-
 pub fn run(
     backend_type: BackendType,
     input: Option<&str>,
@@ -110,6 +104,9 @@ pub fn run(
                 trace.push(step_record);
             }
         }
+        if let Some(debug) = line.strip_prefix("[debug]") {
+            println!("[degub]: {debug}");
+        }
     }
 
     if commit_flag.is_some() {
@@ -150,6 +147,10 @@ pub fn run(
             println!(
                 "{padding}intra_sequence_index: {}",
                 step_record.intra_sequence_index
+            );
+            println!(
+                "{padding}sequence_coordinates: {:?}",
+                step_record.sequence_coordinates,
             );
         }
     }
