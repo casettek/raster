@@ -24,6 +24,12 @@ use crate::BackendType;
 
 pub struct Trace(Vec<StepRecord>);
 
+impl std::fmt::Display for Trace {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!("")
+    }
+}
+
 pub fn run(
     backend_type: BackendType,
     input: Option<&str>,
@@ -141,7 +147,10 @@ pub fn run(
             println!("\n{padding}exec_index: {}", step_record.exec_index);
             println!("{padding}tile_id: {}", step_record.fn_call_record.fn_name);
             println!("{padding}sequence_id: {}", step_record.sequence_id);
-            println!("{padding}intra_sequence_index: {}", step_record.intra_sequence_index);
+            println!(
+                "{padding}intra_sequence_index: {}",
+                step_record.intra_sequence_index
+            );
         }
     }
 
