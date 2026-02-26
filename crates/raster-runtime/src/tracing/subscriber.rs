@@ -24,12 +24,15 @@ pub trait Subscriber: Send + Sync {
 }
 
 pub type SequenceId = String;
+
+#[derive(Debug, Clone)]
 pub struct SequenceCallstack {
     callstack: VecDeque<SequenceExecutionState>,
     cfs_resolver: CfsResolver,
     last_sequence_coordinates: CfsCoordinates,
 }
 
+#[derive(Debug, Clone)]
 pub struct SequenceExecutionState {
     id: SequenceId,
     current_index: u64,
@@ -46,22 +49,34 @@ impl SequenceCallstack {
     }
 
     fn push(&mut self, sequence_id: SequenceId) {
-        let Some(parent_sequence) = self.last_mut() else {
-            self.callstack.push_back(SequenceExecutionState {
-                id: sequence_id.clone(),
-                current_index: 0,
-                current_sequence_index: 0,
-            });
+        // 1. Get the data you need from the parent and DROP the borrow immediately
+        let sequence_pos: Option<u8> = self.callstack.back().map(|p| {
+            p.current_sequence_index
+                .try_into()
+                .expect("Index too large")
+        });
 
-            return;
-        };
+        // 2. Handle the coordinate update separately
+        // Use a temporary clone or local variable to avoid borrowing 'self' through the whole process
+        let base_coords = self.last_sequence_coordinates.clone();
 
-        parent_sequence.current_sequence_index += 1;
+        // Determine the position for the new coordinates
+        let pos = sequence_pos.unwrap_or(0);
 
-        self.last_sequence_coordinates = self
-            .cfs_resolver
-            .get_coordinates(&self.last_sequence_coordinates, sequence_id.clone());
+        // Update coordinates (this borrows self.cfs_resolver and self.last_sequence_coordinates)
+        self.last_sequence_coordinates =
+            self.cfs_resolver
+                .get_coordinates(&base_coords, sequence_id.clone(), pos);
 
+        // 3. Update the parent's index if it exists
+        if let Some(parent) = self.callstack.back_mut() {
+            parent.current_sequence_index += 1;
+        } else {
+            // Debug logging for empty case
+            println!("[debug] push empty {sequence_id}");
+        }
+
+        // 4. Finally, push the new state
         self.callstack.push_back(SequenceExecutionState {
             id: sequence_id,
             current_index: 0,
@@ -133,17 +148,21 @@ impl<W: Write + Send + Sync> Subscriber for ExecutionSubscriber<W> {
 
         match event {
             TraceEvent::SequenceStart(trace_item) => {
+                println!("[debug] SequenceStart: {}", trace_item.fn_name);
                 callstack_guard.push(trace_item.fn_name.clone());
             }
-            TraceEvent::SequenceEnd(_) => {
+            TraceEvent::SequenceEnd(trace_item) => {
+                println!("[debug] SequenceEnd: {}", trace_item.fn_name);
                 callstack_guard.pop();
             }
             TraceEvent::Tile(trace_item) => {
                 let last_sequence_state = callstack_guard
                     .last_mut()
                     .expect("Tile can't be called without sequence context");
+
                 last_sequence_state.current_index += 1;
                 let sequence_id = last_sequence_state.id.clone();
+
                 let intra_sequence_index = last_sequence_state.current_index;
                 let sequence_callstack_depth = (callstack_guard.len() as u64).saturating_sub(1);
 

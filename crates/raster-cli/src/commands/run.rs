@@ -1,9 +1,10 @@
 //! Run command: build and execute the user program as a whole.
 
 use std::collections::BTreeMap;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 
 use raster_backend::ExecutionMode;
 use raster_backend_risc0::Risc0Backend;
@@ -68,46 +69,96 @@ pub fn run(
     println!("Running {}...", &project.name);
     println!();
 
-    // Build command with optional input argument
     let mut cmd = Command::new(&binary_path);
     cmd.current_dir(&project.root_dir);
-
     if let Some(input_json) = input {
         cmd.args(["--input", input_json]);
     }
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
 
-    // Execute the binary and capture output
-    let output = cmd
-        .output()
-        .map_err(|e| Error::Other(format!("Failed to execute binary: {}", e)))?;
+    let mut child = cmd.spawn()?;
 
-    if !output.status.success() {
-        let code = output.status.code().unwrap_or(-1);
-        let stderr = String::from_utf8_lossy(&output.stderr);
+    let mut trace: Arc<Mutex<Vec<StepRecord>>> = Arc::new(Mutex::new(Vec::new()));
+    let mut log = Arc::new(Mutex::new(Vec::new()));
 
-        return Err(Error::Other(format!(
-            "Program exited with code {}: {}",
-            code, stderr
-        )));
-    }
+    let reader_trace = Arc::clone(&trace);
+    let reader_log = Arc::clone(&log);
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = child.stdout.take().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::Other, "Could not capture stdout")
+    })?;
 
-    let mut trace: Vec<StepRecord> = Vec::new();
+    let stderr = child.stderr.take().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::Other, "Could not capture stderr")
+    })?;
 
-    for line in stdout.lines() {
-        if let Some(parsed) = line
-            .strip_prefix("[trace]")
-            .map(serde_json::from_str::<StepRecord>)
-        {
-            if let Ok(step_record) = parsed {
-                trace.push(step_record);
+    let mut handles = Vec::new();
+
+    let stdout_handle = std::thread::spawn(move || {
+        let stdout_reader = BufReader::new(stdout);
+
+        for line in stdout_reader.lines() {
+            if let Ok(line_str) = line {
+                if let Some(parsed) = line_str
+                    .strip_prefix("[trace]")
+                    .map(serde_json::from_str::<StepRecord>)
+                {
+                    if let Ok(step_record) = parsed {
+                        let mut trace_lock = reader_trace.lock().unwrap();
+                        trace_lock.push(step_record);
+                    }
+                }
+                if let Some(debug_line) = line_str.strip_prefix("[debug]") {
+                    let mut log_lock = reader_log.lock().unwrap();
+                    log_lock.push(debug_line.to_string());
+                }
             }
         }
-        if let Some(debug) = line.strip_prefix("[debug]") {
-            println!("[degub]: {debug}");
+    });
+    handles.push(stdout_handle);
+
+    let mut errors = Arc::new(Mutex::new(Vec::new()));
+    let mut thread_errors = Arc::clone(&errors);
+    let stderr_handle = std::thread::spawn(move || {
+        let stderr_reader = BufReader::new(stderr);
+        for line in stderr_reader.lines() {
+            if let Ok(error_line) = line {
+                let mut errors_lock = thread_errors.lock().unwrap();
+                errors_lock.push(error_line);
+            }
         }
+    });
+    handles.push(stderr_handle);
+
+    let status = child.wait()?;
+    for handle in handles {
+        handle.join().expect("A child thread panicked");
     }
+    println!("Process exited with: {}", status);
+
+    let errors = Arc::try_unwrap(errors)
+        .expect("Cant move list out of Mutex. Some thread still holding copy of Arc")
+        .into_inner()
+        .unwrap();
+
+    let log = Arc::try_unwrap(log)
+        .expect("Cant move list out of Mutex. Some thread still holding copy of Arc")
+        .into_inner()
+        .unwrap();
+
+    for log_line in log {
+        println!("{log_line}");
+    }
+
+    for error_line in errors {
+        println!("{error_line}");
+    }
+
+    let mut trace = Arc::try_unwrap(trace)
+        .expect("Cant move list out of Mutex. Some thread still holding copy of Arc")
+        .into_inner()
+        .unwrap();
 
     if commit_flag.is_some() {
         let commit_path = commit_flag.expect("Commitment path was provided");

@@ -18,6 +18,14 @@ impl CfsCoordinates {
         self.0.is_empty()
     }
 
+    pub fn get(&self, index: usize) -> Option<&u8> {
+        self.0.get(index)
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
     pub fn push(&mut self, coord: u8) {
         self.0.push(coord);
     }

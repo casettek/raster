@@ -87,7 +87,7 @@ impl<'a> CfsBuilder<'a> {
     }
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct CfsResolver {
     pub cfs: ControlFlowSchema,
 }
@@ -151,8 +151,12 @@ impl CfsResolver {
         &self,
         parent_coords: &CfsCoordinates,
         sequence_id: SequenceId,
+        sequence_pos: u8,
     ) -> CfsCoordinates {
+        println!("[debug]CfsResolver::get_coordinates");
         if parent_coords.is_empty() {
+            println!("[debug]empty parent coords: {:?}", parent_coords);
+            println!("[debug]empty sequence_id: {:?}", sequence_id);
             let main_entrypoint_pos = self
                 .get_pos(String::from("main"))
                 .expect("Missing main in cfs");
@@ -166,25 +170,27 @@ impl CfsResolver {
 
             return current_coords;
         }
-        println!("[debug]CfsResolver::get_coordinates");
 
         println!("[debug]parent_coords: {:?}", parent_coords);
         println!("[debug]sequence_id: {:?}", sequence_id);
 
         let parent_sequence = self.resolve(parent_coords);
         println!(
-            "[debug]parent_sequence.items: {:?}",
+            "[debug] {} parent_sequence.items: {:?}",
+            parent_sequence.id,
             parent_sequence
                 .sequences()
                 .iter()
                 .map(|seq| seq.id.clone())
                 .collect::<Vec<_>>()
         );
+        println!("[debug]sequence_id: {:?}", sequence_id);
 
         let sequence_coord = parent_sequence
             .sequences()
             .iter()
-            .position(|item| item.id == sequence_id)
+            .enumerate()
+            .position(|(index, item)| item.id == sequence_id && index >= sequence_pos as usize)
             .unwrap_or_else(|| {
                 panic!(
                     "Wrong coordinates for sequence '{}': [{} [{:?}] {:?}]",
