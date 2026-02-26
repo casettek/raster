@@ -10,6 +10,27 @@ use serde::{Deserialize, Serialize};
 use std::string::{String, ToString};
 use std::vec::Vec;
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CfsCoordinates(pub Vec<u8>);
+
+impl CfsCoordinates {
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn get(&self, index: usize) -> Option<&u8> {
+        self.0.get(index)
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn push(&mut self, coord: u8) {
+        self.0.push(coord);
+    }
+}
+
 /// The root control flow schema structure for a Raster project.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ControlFlowSchema {
@@ -54,7 +75,12 @@ pub struct TileDef {
 
 impl TileDef {
     /// Create a new tile definition with the specified type.
-    pub fn new(id: impl Into<String>, tile_type: impl Into<String>, inputs: usize, outputs: usize) -> Self {
+    pub fn new(
+        id: impl Into<String>,
+        tile_type: impl Into<String>,
+        inputs: usize,
+        outputs: usize,
+    ) -> Self {
         Self {
             id: id.into(),
             tile_type: tile_type.into(),
@@ -69,15 +95,18 @@ impl TileDef {
     }
 }
 
+pub type SequenceId = String;
+pub type TileId = String;
+
 /// Definition of a sequence in the CFS.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SequenceDef {
     /// Unique identifier for the sequence (function name).
-    pub id: String,
+    pub id: SequenceId,
     /// Sources for the sequence's own inputs.
     pub input_sources: Vec<InputBinding>,
     /// Ordered list of items (tiles or nested sequences) in this sequence.
-    pub items: Vec<SequenceItem>,
+    pub items: Vec<SequenceChild>,
 }
 
 impl SequenceDef {
@@ -89,37 +118,40 @@ impl SequenceDef {
             items: Vec::new(),
         }
     }
+
+    pub fn sequences(&self) -> Vec<SequenceItem> {
+        self.items
+            .iter()
+            .filter_map(|item| match item {
+                SequenceChild::Tile(_) => None,
+                SequenceChild::Sequence(sequence) => Some(sequence.clone()),
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum SequenceChild {
+    Sequence(SequenceItem),
+    Tile(TileItem),
 }
 
 /// An item within a sequence (either a tile or a nested sequence).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SequenceItem {
-    /// Type of item: "tile" or "sequence".
-    pub item_type: String,
-    /// ID of the tile or sequence being invoked.
-    pub item_id: String,
+    /// ID of the sequence being invoked.
+    pub id: SequenceId,
     /// Sources for each input to this item.
-    pub input_sources: Vec<InputBinding>,
+    pub sources: Vec<InputBinding>,
 }
 
-impl SequenceItem {
-    /// Create a new tile item.
-    pub fn tile(id: impl Into<String>, input_sources: Vec<InputBinding>) -> Self {
-        Self {
-            item_type: "tile".to_string(),
-            item_id: id.into(),
-            input_sources,
-        }
-    }
-
-    /// Create a new sequence item.
-    pub fn sequence(id: impl Into<String>, input_sources: Vec<InputBinding>) -> Self {
-        Self {
-            item_type: "sequence".to_string(),
-            item_id: id.into(),
-            input_sources,
-        }
-    }
+/// An item within a sequence (either a tile or a nested sequence).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TileItem {
+    /// ID of the tile being invoked.
+    pub id: TileId,
+    /// Sources for each input to this item.
+    pub sources: Vec<InputBinding>,
 }
 
 /// A binding that specifies where an input value comes from.

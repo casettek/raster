@@ -20,13 +20,14 @@ fn greet_sequence(name: String) -> String {
     let greeting = greet(name);
     let e1 = exclaim(greeting);
     let e2 = exclaim(e1);
-    exclaim(wish_sequence(e2))
+    wish_sequence(exclaim(wish_sequence(e2)))
 }
 
 #[sequence]
 fn wish_sequence(name: String) -> String {
     let wish = current_wish(raster_wish(name));
-    placeholder_sequence(wish)
+    let wish_2 = placeholder_sequence(wish);
+    placeholder_sequence(wish_2)
 }
 
 #[sequence]
@@ -40,5 +41,7 @@ fn placeholder_sequence(placeholder: String) -> String {
 /// Run with: `cargo run -- --input '"YourName"'`
 #[sequence]
 fn main(name: String) {
-    let result = greet_sequence(name);
+    greet_sequence("Rust".to_string());
+    let name_2 = placeholder_sequence(name);
+    let result = greet_sequence(name_2);
 }
