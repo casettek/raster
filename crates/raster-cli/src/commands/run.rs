@@ -193,16 +193,13 @@ pub fn run(
         for step_record in trace {
             let padding = "\t".repeat(step_record.sequence_callstack_depth.try_into().unwrap());
             println!("\n{padding}exec_index: {}", step_record.exec_index);
-            println!("{padding}tile_id: {}", step_record.fn_call_record.fn_name);
             println!("{padding}sequence_id: {}", step_record.sequence_id);
-            println!(
-                "{padding}intra_sequence_index: {}",
-                step_record.intra_sequence_index
-            );
             println!(
                 "{padding}sequence_coordinates: {:?}",
                 step_record.sequence_coordinates,
             );
+
+            println!("{padding}tile_id: {}", step_record.fn_call_record.fn_name);
         }
     }
 

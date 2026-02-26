@@ -29,7 +29,7 @@ pub type SequenceId = String;
 pub struct SequenceCallstack {
     callstack: VecDeque<SequenceExecutionState>,
     cfs_resolver: CfsResolver,
-    last_sequence_coordinates: CfsCoordinates,
+    current_sequence_coordinates: CfsCoordinates,
 }
 
 #[derive(Debug, Clone)]
@@ -43,40 +43,36 @@ impl SequenceCallstack {
     fn new(cfs_resolver: CfsResolver) -> Self {
         SequenceCallstack {
             callstack: VecDeque::new(),
-            last_sequence_coordinates: CfsCoordinates(vec![]),
+            current_sequence_coordinates: CfsCoordinates(vec![]),
             cfs_resolver,
         }
     }
 
     fn push(&mut self, sequence_id: SequenceId) {
-        // 1. Get the data you need from the parent and DROP the borrow immediately
-        let sequence_pos: Option<u8> = self.callstack.back().map(|p| {
-            p.current_sequence_index
-                .try_into()
-                .expect("Index too large")
-        });
+        let parent_child_sequence_index = self
+            .callstack
+            .back()
+            .map(|p| {
+                p.current_sequence_index
+                    .try_into()
+                    .expect("Index too large")
+            })
+            .unwrap_or(0);
 
-        // 2. Handle the coordinate update separately
-        // Use a temporary clone or local variable to avoid borrowing 'self' through the whole process
-        let base_coords = self.last_sequence_coordinates.clone();
+        let parent_sequence_coords = self.current_sequence_coordinates.clone();
 
-        // Determine the position for the new coordinates
-        let pos = sequence_pos.unwrap_or(0);
+        self.current_sequence_coordinates = self.cfs_resolver.get_coordinates(
+            &parent_sequence_coords,
+            sequence_id.clone(),
+            parent_child_sequence_index,
+        );
 
-        // Update coordinates (this borrows self.cfs_resolver and self.last_sequence_coordinates)
-        self.last_sequence_coordinates =
-            self.cfs_resolver
-                .get_coordinates(&base_coords, sequence_id.clone(), pos);
-
-        // 3. Update the parent's index if it exists
         if let Some(parent) = self.callstack.back_mut() {
             parent.current_sequence_index += 1;
         } else {
-            // Debug logging for empty case
             println!("[debug] push empty {sequence_id}");
         }
 
-        // 4. Finally, push the new state
         self.callstack.push_back(SequenceExecutionState {
             id: sequence_id,
             current_index: 0,
@@ -85,15 +81,15 @@ impl SequenceCallstack {
     }
 
     fn pop(&mut self) -> Option<SequenceExecutionState> {
-        let mut current_sequence_coordinates = self.last_sequence_coordinates.clone();
+        let mut current_sequence_coordinates = self.current_sequence_coordinates.clone();
 
-        let mut coordinates = VecDeque::from(current_sequence_coordinates.0);
-        coordinates.pop_back();
+        let mut parent_sequence_coordinates = VecDeque::from(current_sequence_coordinates.0);
+        parent_sequence_coordinates.pop_back();
+        self.current_sequence_coordinates = CfsCoordinates(parent_sequence_coordinates.into());
 
-        self.last_sequence_coordinates = CfsCoordinates(coordinates.into());
         println!(
             "[debug] current coordinates: {:?}",
-            self.last_sequence_coordinates
+            self.current_sequence_coordinates
         );
 
         self.callstack.pop_back()
@@ -174,7 +170,7 @@ impl<W: Write + Send + Sync> Subscriber for ExecutionSubscriber<W> {
                     exec_index,
                     sequence_id,
                     intra_sequence_index,
-                    sequence_coordinates: callstack_guard.last_sequence_coordinates.clone(),
+                    sequence_coordinates: callstack_guard.current_sequence_coordinates.clone(),
                     sequence_callstack_depth,
                     fn_call_record: trace_item,
                 };
