@@ -3,7 +3,8 @@
 //! This module resolves how data flows between tiles in a sequence by tracking
 //! variable bindings and mapping them to `InputSource` references.
 
-use raster_core::cfs::{InputBinding, InputSource, SequenceItem};
+use raster_core::cfs::{InputBinding, InputSource, SequenceChild, SequenceItem, TileItem};
+use raster_core::tile::TileId;
 use std::collections::HashMap;
 
 use crate::ast::CallInfo;
@@ -36,8 +37,8 @@ impl<'a, 'ast> FlowResolver<'a, 'ast> {
         }
     }
 
-    /// Resolve a discovered sequence into a list of `SequenceItem`s with input sources.
-    pub fn resolve(&mut self, sequence: &Sequence<'ast>) -> Vec<SequenceItem> {
+    /// Resolve a discovered sequence into a list of `SequenceChild`s with input sources.
+    pub fn resolve(&mut self, sequence: &Sequence<'ast>) -> Vec<SequenceChild> {
         // Reset state for this sequence
         self.bindings.clear();
         self.param_indices.clear();
@@ -61,20 +62,20 @@ impl<'a, 'ast> FlowResolver<'a, 'ast> {
             let input_sources = self.resolve_call_inputs(call);
 
             // Determine if this is a tile or nested sequence
-            let item_type = if self.is_tile(&call.callee) {
-                "tile"
+            let item = if self.is_tile(&call.callee) {
+                SequenceChild::Tile(TileItem {
+                    id: call.callee.clone(),
+                    sources: input_sources,
+                })
             } else if self.is_sequence(&call.callee) {
-                "sequence"
+                SequenceChild::Sequence(SequenceItem {
+                    id: call.callee.clone(),
+                    sources: input_sources,
+                })
             } else {
-                // Assume it's a tile if we can't determine
-                "tile"
+                panic!("Unknown item type: {}", call.callee);
             };
 
-            let item = SequenceItem {
-                item_type: item_type.to_string(),
-                item_id: call.callee.clone(),
-                input_sources,
-            };
             items.push(item);
 
             // If this call has a result binding, record it

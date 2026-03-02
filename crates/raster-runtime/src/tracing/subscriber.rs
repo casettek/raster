@@ -1,7 +1,10 @@
+use raster_compiler::cfs_builder::CfsResolver;
+use raster_compiler::{CfsBuilder, Project};
+use raster_core::cfs::CfsCoordinates;
 use raster_core::trace::TraceEvent;
+
+use std::path::PathBuf;
 use std::sync::OnceLock;
-
-
 
 // TODO: consider adding linkme here
 /// The global subscriber instance.
@@ -21,84 +24,143 @@ pub trait Subscriber: Send + Sync {
 }
 
 pub type SequenceId = String;
-pub struct SequenceCallstack(VecDeque<SequenceExecutionState>);
+
+#[derive(Debug, Clone)]
+pub struct SequenceCallstack {
+    callstack: VecDeque<SequenceExecutionState>,
+    cfs_resolver: CfsResolver,
+    current_sequence_coordinates: CfsCoordinates,
+}
+
+#[derive(Debug, Clone)]
 pub struct SequenceExecutionState {
     id: SequenceId,
     current_index: u64,
+    current_sequence_index: u64,
 }
 
 impl SequenceCallstack {
-    fn new() -> Self {
-        SequenceCallstack(VecDeque::new())
+    fn new(cfs_resolver: CfsResolver) -> Self {
+        SequenceCallstack {
+            callstack: VecDeque::new(),
+            current_sequence_coordinates: CfsCoordinates(vec![]),
+            cfs_resolver,
+        }
     }
 
-    fn push(&mut self, state: SequenceExecutionState) {
-        self.0.push_back(state);
+    fn push(&mut self, sequence_id: SequenceId) {
+        let parent_child_sequence_index = self
+            .callstack
+            .back()
+            .map(|p| {
+                p.current_sequence_index
+                    .try_into()
+                    .expect("Index too large")
+            })
+            .unwrap_or(0);
+
+        let parent_sequence_coords = self.current_sequence_coordinates.clone();
+
+        self.current_sequence_coordinates = self.cfs_resolver.get_coordinates(
+            &parent_sequence_coords,
+            sequence_id.clone(),
+            parent_child_sequence_index,
+        );
+
+        if let Some(parent) = self.callstack.back_mut() {
+            parent.current_sequence_index += 1;
+        } else {
+            println!("[debug] push empty {sequence_id}");
+        }
+
+        self.callstack.push_back(SequenceExecutionState {
+            id: sequence_id,
+            current_index: 0,
+            current_sequence_index: 0,
+        });
     }
 
     fn pop(&mut self) -> Option<SequenceExecutionState> {
-        self.0.pop_back()
+        let mut current_sequence_coordinates = self.current_sequence_coordinates.clone();
+
+        let mut parent_sequence_coordinates = VecDeque::from(current_sequence_coordinates.0);
+        parent_sequence_coordinates.pop_back();
+        self.current_sequence_coordinates = CfsCoordinates(parent_sequence_coordinates.into());
+
+        println!(
+            "[debug] current coordinates: {:?}",
+            self.current_sequence_coordinates
+        );
+
+        self.callstack.pop_back()
     }
 
     fn last(&self) -> Option<&SequenceExecutionState> {
-        self.0.iter().last()
+        self.callstack.iter().last()
     }
 
     fn last_mut(&mut self) -> Option<&mut SequenceExecutionState> {
-        self.0.iter_mut().last()
+        self.callstack.iter_mut().last()
     }
 
     fn len(&self) -> usize {
-        self.0.len()
+        self.callstack.len()
     }
 }
 
 pub struct ExecutionSubscriber<W: Write + Send> {
     writer: Mutex<W>,
-    sequence_callstack: RwLock<SequenceCallstack>,
     exec_index: RwLock<u64>,
+    sequence_callstack: RwLock<SequenceCallstack>,
+    cfs_resolver: RwLock<CfsResolver>,
 }
 
 impl<W: Write + Send> ExecutionSubscriber<W> {
     /// Creates a new JSON subscriber that writes to the given writer.
     pub fn new(writer: W) -> Self {
+        let project_path = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let project = Project::new(project_path).expect("Failed to load project");
+
+        let cfs = CfsBuilder::new(&project)
+            .build()
+            .expect("Failed to build CFS");
+        let cfs_resolver = CfsResolver::new(cfs);
+
         Self {
             writer: Mutex::new(writer),
-            sequence_callstack: RwLock::new(SequenceCallstack::new()),
             exec_index: RwLock::new(0),
+            cfs_resolver: RwLock::new(cfs_resolver.clone()),
+            sequence_callstack: RwLock::new(SequenceCallstack::new(cfs_resolver)),
         }
     }
 }
 
 impl<W: Write + Send + Sync> Subscriber for ExecutionSubscriber<W> {
     fn on_trace(&self, event: TraceEvent) {
+        let mut callstack_guard = self
+            .sequence_callstack
+            .write()
+            .expect("Callstack RwLock poisoned");
+
         match event {
             TraceEvent::SequenceStart(trace_item) => {
-                self.sequence_callstack
-                    .write()
-                    .expect("RwLock poisoned")
-                    .push(SequenceExecutionState {
-                        id: trace_item.fn_name,
-                        current_index: 0,
-                    });
+                println!("[debug] SequenceStart: {}", trace_item.fn_name);
+                callstack_guard.push(trace_item.fn_name.clone());
             }
-            TraceEvent::SequenceEnd(_) => {
-                let _ = self
-                    .sequence_callstack
-                    .write()
-                    .expect("RwLock poisoned")
-                    .pop();
+            TraceEvent::SequenceEnd(trace_item) => {
+                println!("[debug] SequenceEnd: {}", trace_item.fn_name);
+                callstack_guard.pop();
             }
             TraceEvent::Tile(trace_item) => {
-                let mut stack = self.sequence_callstack.write().expect("RwLock poisoned");
-                let last_sequence_state = stack
+                let last_sequence_state = callstack_guard
                     .last_mut()
                     .expect("Tile can't be called without sequence context");
+
                 last_sequence_state.current_index += 1;
                 let sequence_id = last_sequence_state.id.clone();
+
                 let intra_sequence_index = last_sequence_state.current_index;
-                let sequence_callstack_depth = (stack.len() as u64).saturating_sub(1);
-                drop(stack);
+                let sequence_callstack_depth = (callstack_guard.len() as u64).saturating_sub(1);
 
                 let mut exec_index_guard = self.exec_index.write().expect("RwLock poisoned");
                 *exec_index_guard += 1;
@@ -108,6 +170,7 @@ impl<W: Write + Send + Sync> Subscriber for ExecutionSubscriber<W> {
                     exec_index,
                     sequence_id,
                     intra_sequence_index,
+                    sequence_coordinates: callstack_guard.current_sequence_coordinates.clone(),
                     sequence_callstack_depth,
                     fn_call_record: trace_item,
                 };
@@ -117,6 +180,7 @@ impl<W: Write + Send + Sync> Subscriber for ExecutionSubscriber<W> {
                 write!(writer_guard, "[trace]{}\n", json_str).expect("Failed to write");
             }
         }
+        drop(callstack_guard);
     }
 
     fn on_complete(&self) {

@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::string::String;
 use std::vec::Vec;
 
+use crate::cfs::CfsCoordinates;
 use crate::fingerprint::Fingerprint;
 
 /// Describes an input parameter for a tile function.
@@ -41,6 +42,7 @@ pub struct StepRecord {
     pub sequence_id: String,
     pub intra_sequence_index: u64,
     pub sequence_callstack_depth: u64,
+    pub sequence_coordinates: CfsCoordinates,
     pub fn_call_record: FnCallRecord,
 }
 
