@@ -12,7 +12,7 @@ use risc0_zkvm::guest::env;
 
 use raster_core::fingerprint::{Fingerprint, FingerprintAccumulator};
 
-use raster_core::trace::TraceItem;
+use raster_core::trace::StepRecord;
 
 use serde::{Deserialize, Serialize};
 
@@ -35,7 +35,7 @@ pub struct SerializableFrontier {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransitionInput {
-    pub trace_item: TraceItem,
+    pub trace_item: StepRecord,
 
     pub replay_image_id: Vec<u8>,
 }
@@ -144,9 +144,9 @@ impl SerializableFrontier {
 // Hashing
 // ============================================================================
 
-/// Hash a TraceItem using SHA256 of its postcard-serialized form.
-fn hash_trace_item(item: &TraceItem) -> Vec<u8> {
-    let data = postcard::to_allocvec(item).expect("Failed to serialize TraceItem");
+/// Hash a StepRecord using SHA256 of its postcard-serialized form.
+fn hash_trace_item(item: &StepRecord) -> Vec<u8> {
+    let data = postcard::to_allocvec(item).expect("Failed to serialize StepRecord");
     let mut hasher = Sha256::new();
     hasher.update(&data);
     hasher.finalize().to_vec()
@@ -172,7 +172,7 @@ fn main() {
             let replay_image_id_digest =
                 risc0_zkvm::sha::Digest::try_from(input.replay_image_id.as_slice())
                     .expect("image_id must be 32 bytes");
-            env::verify(replay_image_id_digest, &input.trace_item.output_data)
+            env::verify(replay_image_id_digest, &input.trace_item.fn_call_record.output_data)
                 .expect("Failed to verify trace replay image id");
 
             let item_hash = hash_trace_item(&input.trace_item);
@@ -236,7 +236,7 @@ fn main() {
                 risc0_zkvm::sha::Digest::try_from(input.replay_image_id.as_slice())
                     .expect("image_id must be 32 bytes");
             // TODO: Maybe replay guest should have full trace item as output journal
-            env::verify(replay_image_id_digest, &input.trace_item.output_data)
+            env::verify(replay_image_id_digest, &input.trace_item.fn_call_record.output_data)
                 .expect("Failed to verify trace replay image id");
 
             let item_hash = hash_trace_item(&input.trace_item);

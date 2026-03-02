@@ -1,11 +1,12 @@
 use crate::{
-    Project, tile::{TileDiscovery, TileResult}
+    tile::{TileDiscovery, TileResult},
+    Project,
 };
-use std::path::Path;
 use std::collections::HashSet;
+use std::path::Path;
 
-use crate::tile::Tile;
 use crate::ast::FunctionAstItem;
+use crate::tile::Tile;
 #[derive(Debug, Clone)]
 pub struct Sequence<'ast> {
     pub function: &'ast FunctionAstItem,
@@ -57,7 +58,8 @@ impl<'ast> SequenceDiscovery<'ast> {
             .map(|f| f.name.clone())
             .collect();
 
-        let sequences = project.ast
+        let sequences = project
+            .ast
             .functions
             .iter()
             .filter(|f| sequence_names.contains(&f.name))
@@ -112,12 +114,14 @@ impl<'ast> Sequence<'ast> {
     }
 
     pub fn source_file(&self) -> &Path {
-        &self.function.path.as_path()
+        &self.function.path
     }
 
-   pub fn flatten<'a>(&'a self, seq_discovery: &'a SequenceDiscovery<'ast>) -> SequenceStepIter<'a, 'ast> {
-        let mut stack = Vec::new();
-        stack.push(self.steps.iter());
+    pub fn flatten<'a>(
+        &'a self,
+        seq_discovery: &'a SequenceDiscovery<'ast>,
+    ) -> SequenceStepIter<'a, 'ast> {
+        let mut stack = vec![self.steps.iter()];
         let mut visited = HashSet::new();
         visited.insert(self.id().to_string());
 

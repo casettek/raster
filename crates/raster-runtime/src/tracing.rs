@@ -1,6 +1,9 @@
 pub mod subscriber;
 
-use crate::tracing::subscriber::json::JsonSubscriber;
+
+use raster_core::trace::TraceEvent;
+
+use crate::tracing::subscriber::ExecutionSubscriber;
 use crate::tracing::subscriber::{Subscriber, GLOBAL_SUBSCRIBER};
 
 /// Initializes the global subscriber with a JSON subscriber that writes to stdout.
@@ -8,7 +11,7 @@ use crate::tracing::subscriber::{Subscriber, GLOBAL_SUBSCRIBER};
 /// This function should be called once at the start of your program.
 /// Subsequent calls will have no effect.
 pub fn init() {
-    init_with(JsonSubscriber::new(std::io::stdout()));
+    init_with(ExecutionSubscriber::new(std::io::stdout()));
 }
 
 /// Initializes the global sub:scriber with a custom subscriber.
@@ -25,26 +28,12 @@ pub fn finish() {
     }
 }
 
-// Internal function used by the generated code from the #[tile] macro.
+// Internal function used by the generated code from the #[tile] and #[sequence] macros.
 // This is not part of the public API.
 
 #[doc(hidden)]
-pub fn emit_trace(
-    function_name: &str,
-    desc: Option<&str>,
-    input_params: &[(&str, &str)],
-    output_type: Option<&str>,
-    input: &[u8],
-    output: &[u8],
-) {
+pub fn emit_trace_event(event: TraceEvent) {
     if let Some(subscriber) = GLOBAL_SUBSCRIBER.get() {
-        subscriber.on_trace(
-            function_name,
-            desc,
-            input_params,
-            output_type,
-            input,
-            output,
-        );
+        subscriber.on_trace(event);
     }
 }

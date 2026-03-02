@@ -11,7 +11,7 @@
 use serde::{Deserialize, Serialize};
 
 use raster_core::fingerprint::{BitPacker, Fingerprint, FingerprintAccumulator};
-use raster_core::trace::TraceItem;
+use raster_core::trace::StepRecord;
 
 use crate::replay::ReplayResult;
 use crate::trace::SerializableFrontier;
@@ -19,7 +19,7 @@ use crate::{TRANSITION_GUEST_ELF, TRANSITION_GUEST_ID};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransitionInput {
-    pub trace_item: TraceItem,
+    pub trace_item: StepRecord,
 
     pub replay_image_id: Vec<u8>,
 }
@@ -73,7 +73,7 @@ pub struct TransitionJournal {
 /// A `TransitionReplayResult` with details about success or failure
 pub fn replay_transitions(
     initial_frontier: &SerializableFrontier,
-    trace_window: &[TraceItem],
+    trace_window: &[StepRecord],
     fingerprint: Fingerprint,
     replayed_results: &std::collections::BTreeMap<String, ReplayResult>,
 ) -> Option<risc0_zkvm::Receipt> {
@@ -96,7 +96,7 @@ pub fn replay_transitions(
         .collect();
 
     for item in trace_window {
-        let Some(replay_result) = replayed_results.get(&item.fn_name) else {
+        let Some(replay_result) = replayed_results.get(&item.fn_call_record.fn_name) else {
             panic!("Replayed IMAGE ID not found");
         };
         // Create the input for this transition with fingerprint data

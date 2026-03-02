@@ -2,12 +2,14 @@
 //!
 //! This crate provides:
 //! - `#[tile]` - Marks a function as a tile and registers it in the global registry
-//! - `#[sequence]` - Declares tile ordering and control flow
+//! - `#[sequence]` - Declares tile ordering and control flow. When the function is named `main`,
+//!   it is the program entry point and gets init, `--input` parsing, and finish automatically.
 
 use proc_macro::TokenStream;
 use quote::{format_ident, quote, ToTokens};
 use syn::{
-    parse_macro_input, visit::Visit, Expr, ExprCall, ExprPath, FnArg, ItemFn, Pat, ReturnType, Type,
+    parse_macro_input, visit::Visit, Block, Expr, ExprCall, ExprPath, FnArg, ItemFn, Pat,
+    ReturnType, Type,
 };
 
 /// Extract input types and parameter names from a function signature.
@@ -315,18 +317,31 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
                 // Execute original body via closure to handle early returns
                 let __raster_result = (|| #fn_body)();
 
-                // Serialize output and emit trace
+                // Serialize output and emit TraceEvent::Tile
                 let __raster_output_bytes = ::raster::core::postcard::to_allocvec(&__raster_result)
                     .unwrap_or_default();
 
-                ::raster::emit_trace(
-                    #fn_name_str,
-                    #trace_desc_expr,
-                    &[#(#input_param_tuples),*],
-                    #trace_output_type_expr,
-                    &__raster_input_bytes,
-                    &__raster_output_bytes,
-                );
+                let __raster_inputs: ::alloc::vec::Vec<::raster::core::trace::FnInputParam> = [
+                    #(#input_param_tuples),*
+                ]
+                    .iter()
+                    .map(|(n, t)| ::raster::core::trace::FnInputParam {
+                        name: ::alloc::string::String::from(*n),
+                        ty: ::alloc::string::String::from(*t),
+                    })
+                    .collect();
+
+                let __raster_tile_record = ::raster::core::trace::FnCallRecord {
+                    fn_name: ::alloc::string::String::from(#fn_name_str),
+                    desc: #trace_desc_expr.map(|s: &str| ::alloc::string::String::from(s)),
+                    inputs: __raster_inputs,
+                    input_data: __raster_input_bytes.clone(),
+                    output_type: #trace_output_type_expr.map(|s: &str| ::alloc::string::String::from(s)),
+                    output_data: __raster_output_bytes.clone(),
+                };
+                ::raster::emit_trace_event(::raster::core::trace::TraceEvent::Tile(
+                    __raster_tile_record,
+                ));
 
                 return __raster_result;
             }
@@ -403,52 +418,37 @@ impl SequenceAttrs {
     }
 }
 
-/// Visitor that extracts function call names from the AST.
-/// It collects function names in the order they appear.
-struct TileCallExtractor {
-    tile_calls: Vec<String>,
-}
-
-impl TileCallExtractor {
-    fn new() -> Self {
-        Self {
-            tile_calls: Vec::new(),
+/// Generates the sequence-wrapped body: either tracing (SequenceStart/body/SequenceEnd) or plain body depending on cfg.
+fn gen_sequence_wrapped_body(
+    fn_name_str: &str,
+    sequence_desc_expr: proc_macro2::TokenStream,
+    sequence_output_type_expr: proc_macro2::TokenStream,
+    body: &Block,
+) -> proc_macro2::TokenStream {
+    quote! {
+        #[cfg(all(feature = "std", not(target_arch = "riscv32")))]
+        {
+            let __raster_seq_record = ::raster::core::trace::FnCallRecord {
+                fn_name: String::from(#fn_name_str),
+                desc: #sequence_desc_expr.map(|s: &str| String::from(s)),
+                inputs: Vec::new(),
+                input_data: Vec::new(),
+                output_type: #sequence_output_type_expr.map(|s: &str| String::from(s)),
+                output_data: Vec::new(),
+            };
+            ::raster::emit_trace_event(::raster::core::trace::TraceEvent::SequenceStart(
+                __raster_seq_record.clone(),
+            ));
+            let __raster_result = (|| #body)();
+            ::raster::emit_trace_event(::raster::core::trace::TraceEvent::SequenceEnd(
+                __raster_seq_record,
+            ));
+            __raster_result
         }
-    }
-}
 
-impl<'ast> Visit<'ast> for TileCallExtractor {
-    fn visit_expr_call(&mut self, node: &'ast ExprCall) {
-        // Check if this is a simple function call (not a method call)
-        if let Expr::Path(ExprPath { path, .. }) = &*node.func {
-            // Get the function name (last segment of the path)
-            if let Some(segment) = path.segments.last() {
-                let fn_name = segment.ident.to_string();
-                // Skip common non-tile functions
-                if !is_excluded_function(&fn_name) {
-                    self.tile_calls.push(fn_name.to_owned());
-                }
-            }
-        }
-        // Continue visiting nested expressions
-        syn::visit::visit_expr_call(self, node);
+        #[cfg(not(all(feature = "std", not(target_arch = "riscv32"))))]
+        #body
     }
-}
-
-/// Check if a function name should be excluded from tile extraction.
-/// These are common Rust functions that are not tiles.
-fn is_excluded_function(name: &str) -> bool {
-    matches!(
-        name,
-        // Common Rust functions that aren't tiles
-        "println" | "print" | "eprintln" | "eprint" | "dbg" |
-        "format" | "panic" | "assert" | "assert_eq" | "assert_ne" |
-        "Some" | "None" | "Ok" | "Err" |
-        "Box" | "Vec" | "String" | "to_string" | "to_owned" |
-        "clone" | "into" | "from" | "default" |
-        // Allocator functions
-        "alloc" | "dealloc"
-    )
 }
 
 /// Declares a sequence of tiles with linear control flow.
@@ -457,42 +457,42 @@ fn is_excluded_function(name: &str) -> bool {
 /// in the order they appear. The function remains callable for native execution,
 /// and the sequence is registered for use with `cargo raster preview`.
 ///
+/// When the function is named **`main`**, it is the program entry point: the macro expands to
+/// `fn main() { init(); input_parsing; sequence_wrapped_body; finish(); }`. The `--input` CLI
+/// argument is parsed into the original function's parameters.
+///
 /// # Attributes
 /// - `description = "..."` - Human-readable description of the sequence
 ///
-/// # Example
+/// # Example (entry point)
 /// ```ignore
-/// #[sequence]
-/// fn main(name: String) -> String {
-///     let greeting = greet(name);
-///     exclaim(greeting)
+/// #[raster::sequence]
+/// fn main(name: String) {
+///     let result = greet_sequence(name);
+///     println!("{}", result);
 /// }
 /// ```
 ///
-/// This will register a sequence named "main" with tiles `["greet", "exclaim"]`.
+/// # Example (nested sequence)
+/// ```ignore
+/// #[sequence]
+/// fn greet_sequence(name: String) -> String {
+///     exclaim(greet(name))
+/// }
+/// ```
 #[proc_macro_attribute]
 pub fn sequence(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let attrs = SequenceAttrs::parse(attr);
     let input_fn = parse_macro_input!(item as ItemFn);
+    let fn_name_str = input_fn.sig.ident.to_string();
 
-    let fn_name = &input_fn.sig.ident;
-    let fn_name_str = fn_name.to_string();
-    let registration_name = format_ident!(
-        "__RASTER_SEQUENCE_REGISTRATION_{}",
-        fn_name.to_string().to_uppercase()
-    );
+    let fn_vis = &input_fn.vis;
+    let fn_sig = &input_fn.sig;
+    let fn_attrs = &input_fn.attrs;
+    let fn_body = &input_fn.block;
 
-    // Extract tile calls from the function body
-    let mut extractor = TileCallExtractor::new();
-    extractor.visit_item_fn(&input_fn);
-    let tile_calls = extractor.tile_calls;
+    let attrs = SequenceAttrs::parse(attr);
 
-    // Generate the tile list as a static array
-    let tile_count = tile_calls.len();
-    let tile_strs: Vec<_> = tile_calls.iter().map(|s| s.as_str()).collect();
-
-    // Generate description expression
-    let description_expr = match &attrs.description {
+    let sequence_desc_expr = match &attrs.description {
         Some(desc) => {
             let desc_str = desc.as_str();
             quote! { ::core::option::Option::Some(#desc_str) }
@@ -500,145 +500,85 @@ pub fn sequence(attr: TokenStream, item: TokenStream) -> TokenStream {
         None => quote! { ::core::option::Option::None },
     };
 
-    let tiles_static_name = format_ident!(
-        "__RASTER_SEQUENCE_TILES_{}",
-        fn_name.to_string().to_uppercase()
-    );
-
-    let expanded = quote! {
-        // Keep the original function unchanged for native execution
-        #input_fn
-
-        // Static array of tile IDs for this sequence
-        #[cfg(all(feature = "std", not(target_arch = "riscv32")))]
-        static #tiles_static_name: [&'static str; #tile_count] = [#(#tile_strs),*];
-
-        // Register the sequence in the distributed slice (only on platforms that support linkme and std)
-        #[cfg(all(feature = "std", not(target_arch = "riscv32")))]
-        #[::raster::core::linkme::distributed_slice(::raster::core::registry::SEQUENCE_REGISTRY)]
-        #[linkme(crate = ::raster::core::linkme)]
-        static #registration_name: ::raster::core::registry::SequenceRegistration =
-            ::raster::core::registry::SequenceRegistration::new(
-                ::raster::core::registry::SequenceMetadataStatic::new(
-                    #fn_name_str,
-                    #fn_name_str,
-                    #description_expr,
-                ),
-                &#tiles_static_name,
-            );
+    let sequence_output_type_expr = match &input_fn.sig.output {
+        ReturnType::Default => quote! { ::core::option::Option::None },
+        ReturnType::Type(_, ty) => {
+            let ty_str = ty.to_token_stream().to_string();
+            quote! { ::core::option::Option::Some(#ty_str) }
+        }
     };
 
-    TokenStream::from(expanded)
-}
+    let none_expr = quote! { ::core::option::Option::None };
 
-/// Entry point macro that handles raster CLI tile execution requests and input parsing.
-///
-/// Apply this to your main function to automatically handle subprocess
-/// tile execution for the native backend, and optionally parse CLI input arguments.
-///
-/// # Basic Example (no input)
-/// ```ignore
-/// #[raster::main]
-/// fn main() {
-///     let result = greet_sequence("Raster".to_string());
-///     println!("{}", result);
-/// }
-/// ```
-///
-/// # With Input Parameter
-/// ```ignore
-/// #[raster::main]
-/// fn main(name: String) {
-///     let result = greet_sequence(name);
-///     println!("{}", result);
-/// }
-/// ```
-///
-/// Run with: `cargo run -- --input '"Raster"'`
-///
-/// The macro parses `--input <json>` from command line arguments and deserializes
-/// it into the parameter type. Multiple parameters are deserialized from a JSON array.
-///
-/// # Expansion
-///
-/// `fn main(name: String)` expands to:
-/// ```ignore
-/// fn main() {
-///     if ::raster::try_execute_tile_from_args() {
-///         return;
-///     }
-///
-///     let name: String = ::raster::parse_main_input()
-///         .expect("Failed to parse --input argument. Usage: --input '<json>'");
-///
-///     let result = greet_sequence(name);
-///     println!("{}", result);
-/// }
-/// ```
-#[proc_macro_attribute]
-pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    let input_fn = parse_macro_input!(item as ItemFn);
-
-    let fn_block = &input_fn.block;
-    let fn_attrs = &input_fn.attrs;
-
-    // Extract parameters from the function signature
-    let params: Vec<_> = input_fn.sig.inputs.iter().collect();
-
-    // Generate input parsing code based on parameters
-    let input_parsing = if params.is_empty() {
-        quote! {}
-    } else if params.len() == 1 {
-        // Single parameter - deserialize directly
-        let param = &params[0];
-        if let FnArg::Typed(pat_type) = param {
-            let pat = &pat_type.pat;
-            let ty = &pat_type.ty;
-            quote! {
-                let #pat: #ty = ::raster::parse_main_input()
-                    .expect("Failed to parse --input argument. Usage: --input '<json>'");
+    let expanded = if input_fn.sig.ident == "main" {
+        // Entry point: replace with fn main() { init(); input_parsing; wrapped_body; finish(); }
+        let params: Vec<_> = input_fn.sig.inputs.iter().collect();
+        let input_parsing = if params.is_empty() {
+            quote! {}
+        } else if params.len() == 1 {
+            let param = &params[0];
+            if let FnArg::Typed(pat_type) = param {
+                let pat = &pat_type.pat;
+                let ty = &pat_type.ty;
+                quote! {
+                    let #pat: #ty = ::raster::parse_main_input()
+                        .expect("Failed to parse --input argument. Usage: --input '<json>'");
+                }
+            } else {
+                quote! {}
             }
         } else {
-            quote! {}
+            let names: Vec<_> = params
+                .iter()
+                .filter_map(|p| {
+                    if let FnArg::Typed(pt) = p {
+                        Some(&pt.pat)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            let types: Vec<_> = params
+                .iter()
+                .filter_map(|p| {
+                    if let FnArg::Typed(pt) = p {
+                        Some(&pt.ty)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            quote! {
+                let (#(#names),*): (#(#types),*) = ::raster::parse_main_input()
+                    .expect("Failed to parse --input argument. Usage: --input '[val1, val2, ...]'");
+            }
+        };
+        let body = gen_sequence_wrapped_body("main", none_expr.clone(), none_expr, &input_fn.block);
+        quote! {
+            #(#fn_attrs)*
+            fn main() {
+                ::raster::init();
+
+                #input_parsing
+
+                #body
+
+                ::raster::finish();
+            }
         }
     } else {
-        // Multiple parameters - deserialize as tuple
-        let names: Vec<_> = params
-            .iter()
-            .filter_map(|p| {
-                if let FnArg::Typed(pt) = p {
-                    Some(&pt.pat)
-                } else {
-                    None
-                }
-            })
-            .collect();
-        let types: Vec<_> = params
-            .iter()
-            .filter_map(|p| {
-                if let FnArg::Typed(pt) = p {
-                    Some(&pt.ty)
-                } else {
-                    None
-                }
-            })
-            .collect();
+        // Normal sequence: keep signature, wrap body
+        let body = gen_sequence_wrapped_body(
+            &fn_name_str,
+            sequence_desc_expr,
+            sequence_output_type_expr,
+            fn_body,
+        );
         quote! {
-            let (#(#names),*): (#(#types),*) = ::raster::parse_main_input()
-                .expect("Failed to parse --input argument. Usage: --input '[val1, val2, ...]'");
-        }
-    };
-
-    let expanded = quote! {
-        #(#fn_attrs)*
-        fn main() {
-            ::raster::init();
-
-            #input_parsing
-
-            #fn_block
-
-            ::raster::finish();
+            #(#fn_attrs)*
+            #fn_vis #fn_sig {
+                #body
+            }
         }
     };
 

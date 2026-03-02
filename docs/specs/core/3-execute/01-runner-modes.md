@@ -145,7 +145,7 @@ Native mode means “execute without a zkVM” and without proof generation.
 
 #### Trace behavior
 
-- Whole-program native runs can emit **tile I/O trace items** (stdout JSON) or write/check **packed commitment streams** (`--commit` / `--audit`) via `raster-runtime` subscribers initialized by `#[raster::main]`.
+- Whole-program native runs can emit **tile I/O trace items** (stdout JSON) or write/check **packed commitment streams** (`--commit` / `--audit`) via `raster-runtime` subscribers initialized by the `#[sequence] fn main` entry point.
 
 #### Errors and diagnostics
 

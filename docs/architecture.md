@@ -5,7 +5,7 @@
 Raster is a Rust workspace for defining, compiling, executing, and auditing tile-based programs.
 The current implementation is split across crates that handle:
 
-- Authoring surface (`#[tile]`, `#[sequence]`, `#[raster::main]`)
+- Authoring surface (`#[tile]`, `#[sequence]`; entry point is `#[sequence] fn main`)
 - Source discovery and compilation orchestration
 - Backend execution (native and RISC0)
 - Runtime trace emission and trace-commitment auditing
@@ -81,7 +81,7 @@ For RISC0, outputs include journal bytes, optional receipt bytes, cycles, and op
 ### Whole-program execution (`cargo raster run`)
 
 `run` currently supports native backend only and executes the built project binary as a subprocess.
-`#[raster::main]` configures runtime behavior:
+`#[raster::sequence] fn main(...)` configures runtime behavior:
 
 - default: JSON `TraceItem` stream to stdout
 - `--commit <path>`: write packed commitment stream

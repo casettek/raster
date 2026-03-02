@@ -4,7 +4,7 @@ use raster_backend::{Backend, ExecutionMode};
 use raster_compiler::tile::TileDiscovery;
 use raster_compiler::Project;
 
-use raster_core::trace::TraceItem;
+use raster_core::trace::StepRecord;
 use raster_core::{Error, Result};
 
 #[derive(Debug, Clone)]
@@ -55,10 +55,11 @@ impl<'a> Replayer<'a> {
     ///
     /// # Returns
     /// A `ReplayResult` containing the execution result and optional output comparison.
-    pub fn replay(&self, item: &TraceItem, mode: ExecutionMode) -> Result<ReplayResult> {
+    pub fn replay(&self, item: &StepRecord, mode: ExecutionMode) -> Result<ReplayResult> {
+        let record = &item.fn_call_record;
         let discovery = TileDiscovery::new(self.project);
-        let tile = discovery.get(&item.fn_name).ok_or_else(|| {
-            Error::InvalidTileId(format!("Tile '{}' not found in project", item.fn_name))
+        let tile = discovery.get(&record.fn_name).ok_or_else(|| {
+            Error::InvalidTileId(format!("Tile '{}' not found in project", record.fn_name))
         })?;
 
         // 3. Compile the tile
@@ -71,10 +72,10 @@ impl<'a> Replayer<'a> {
         // 4. Execute with backend
         let exec_result = self
             .backend
-            .execute_tile(artifact.as_ref(), &item.input_data, mode)?;
+            .execute_tile(artifact.as_ref(), &record.input_data, mode)?;
 
         Ok(ReplayResult {
-            fn_name: item.fn_name.clone(),
+            fn_name: record.fn_name.clone(),
             receipt: exec_result.receipt.unwrap(),
             image_id,
         })
