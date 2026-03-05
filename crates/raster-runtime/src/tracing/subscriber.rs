@@ -1,7 +1,7 @@
 use raster_compiler::cfs_builder::CfsResolver;
-use raster_compiler::{CfsBuilder, Project};
+use raster_compiler::{sequence, CfsBuilder, Project};
 use raster_core::cfs::CfsCoordinates;
-use raster_core::trace::TraceEvent;
+use raster_core::trace::{TileExecRecord, TraceEvent};
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -14,7 +14,7 @@ use std::collections::VecDeque;
 use std::io::Write;
 use std::sync::{Mutex, RwLock};
 
-use raster_core::trace::StepRecord;
+use raster_core::trace::{SequenceEndRecord, SequenceStartRecord, StepRecord};
 
 /// A trait for receiving trace events.
 pub trait Subscriber: Send + Sync {
@@ -73,11 +73,12 @@ impl SequenceCallstack {
             println!("[debug] push empty {sequence_id}");
         }
 
-        self.callstack.push_back(SequenceExecutionState {
+        let sequence_execution_state = SequenceExecutionState {
             id: sequence_id,
             current_index: 0,
             current_sequence_index: 0,
-        });
+        };
+        self.callstack.push_back(sequence_execution_state);
     }
 
     fn pop(&mut self) -> Option<SequenceExecutionState> {
@@ -110,9 +111,8 @@ impl SequenceCallstack {
 
 pub struct ExecutionSubscriber<W: Write + Send> {
     writer: Mutex<W>,
-    exec_index: RwLock<u64>,
-    sequence_callstack: RwLock<SequenceCallstack>,
-    cfs_resolver: RwLock<CfsResolver>,
+    exec_index: Mutex<u64>,
+    sequence_callstack: Mutex<SequenceCallstack>,
 }
 
 impl<W: Write + Send> ExecutionSubscriber<W> {
@@ -128,10 +128,15 @@ impl<W: Write + Send> ExecutionSubscriber<W> {
 
         Self {
             writer: Mutex::new(writer),
-            exec_index: RwLock::new(0),
-            cfs_resolver: RwLock::new(cfs_resolver.clone()),
-            sequence_callstack: RwLock::new(SequenceCallstack::new(cfs_resolver)),
+            exec_index: Mutex::new(0),
+            sequence_callstack: Mutex::new(SequenceCallstack::new(cfs_resolver)),
         }
+    }
+
+    fn write_record<T: serde::Serialize>(&self, record: &T) {
+        let json_str = serde_json::to_string(record).expect("Failed to serialize");
+        let mut writer_guard = self.writer.lock().expect("Writer mutex poisoned");
+        writeln!(writer_guard, "[trace]{}", json_str).expect("Failed to write");
     }
 }
 
@@ -139,48 +144,69 @@ impl<W: Write + Send + Sync> Subscriber for ExecutionSubscriber<W> {
     fn on_trace(&self, event: TraceEvent) {
         let mut callstack_guard = self
             .sequence_callstack
-            .write()
-            .expect("Callstack RwLock poisoned");
+            .lock()
+            .expect("Callstack Mutex poisoned");
 
         match event {
             TraceEvent::SequenceStart(trace_item) => {
                 println!("[debug] SequenceStart: {}", trace_item.fn_name);
                 callstack_guard.push(trace_item.fn_name.clone());
+
+                let sequence_start_record = SequenceStartRecord {
+                    sequence_id: trace_item.fn_name.clone(),
+                    sequence_coordinates: callstack_guard.current_sequence_coordinates.clone(),
+                    inputs: trace_item.inputs,
+                    input_data: trace_item.input_data,
+                };
+
+                drop(callstack_guard);
+                self.write_record(&sequence_start_record);
             }
             TraceEvent::SequenceEnd(trace_item) => {
-                println!("[debug] SequenceEnd: {}", trace_item.fn_name);
-                callstack_guard.pop();
+                println!("[debug] SequenceEnd: {}", trace_item.fn_name.clone());
+
+                let sequence_end_record = SequenceEndRecord {
+                    sequence_id: trace_item.fn_name.clone(),
+                    sequence_coordinates: callstack_guard.current_sequence_coordinates.clone(),
+                    output_type: trace_item.output_type,
+                    output_data: trace_item.output_data,
+                };
+
+                callstack_guard.pop().expect("Corrupted sequence stack");
+
+                drop(callstack_guard);
+                self.write_record(&sequence_end_record);
             }
-            TraceEvent::Tile(trace_item) => {
-                let last_sequence_state = callstack_guard
+            TraceEvent::TileExec(trace_item) => {
+                let current_sequence_state = callstack_guard
                     .last_mut()
                     .expect("Tile can't be called without sequence context");
 
-                last_sequence_state.current_index += 1;
-                let sequence_id = last_sequence_state.id.clone();
-
-                let intra_sequence_index = last_sequence_state.current_index;
+                current_sequence_state.current_index += 1;
+                let intra_sequence_index = current_sequence_state.current_index;
+                let sequence_id = current_sequence_state.id.clone();
+                let sequence_coordinates = callstack_guard.current_sequence_coordinates.clone();
                 let sequence_callstack_depth = (callstack_guard.len() as u64).saturating_sub(1);
 
-                let mut exec_index_guard = self.exec_index.write().expect("RwLock poisoned");
+                drop(callstack_guard);
+
+                let mut exec_index_guard = self.exec_index.lock().expect("Mutex poisoned");
                 *exec_index_guard += 1;
                 let exec_index = *exec_index_guard;
+                drop(exec_index_guard);
 
-                let step_record = StepRecord {
+                let step_record = TileExecRecord {
                     exec_index,
                     sequence_id,
                     intra_sequence_index,
-                    sequence_coordinates: callstack_guard.current_sequence_coordinates.clone(),
+                    sequence_coordinates,
                     sequence_callstack_depth,
                     fn_call_record: trace_item,
                 };
 
-                let mut writer_guard = self.writer.lock().expect("Writer mutex poisoned");
-                let json_str = serde_json::to_string(&step_record).expect("Failed to serialize");
-                write!(writer_guard, "[trace]{}\n", json_str).expect("Failed to write");
+                self.write_record(&step_record);
             }
         }
-        drop(callstack_guard);
     }
 
     fn on_complete(&self) {

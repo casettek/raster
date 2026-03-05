@@ -15,7 +15,7 @@ use crate::error::{BitPackerError, Result};
 use crate::precomputed::{EMPTY_TRIE_NODES, HASH_SIZE};
 
 use raster_core::fingerprint::BitPacker;
-use raster_core::trace::{StepRecord, TraceWindow};
+use raster_core::trace::{StepRecord, Trace, TraceWindow};
 
 /// Trait for types that can be hashed to bytes.
 pub trait BytesHashable {
@@ -155,15 +155,15 @@ pub struct TraceCommitment {
 }
 
 impl TraceCommitment {
-    pub fn from(items: &[StepRecord], seed: &[u8]) -> TraceCommitment {
+    pub fn from(trace: &Trace, seed: &[u8]) -> TraceCommitment {
         assert!(
-            items.len() > WINDOW_SIZE.into(),
+            trace.len() > WINDOW_SIZE.into(),
             "Trace length can't be less than verification window"
         );
 
-        let revealed_items = items[..(WINDOW_SIZE as usize)].to_vec();
+        let revealed_items = trace[..(WINDOW_SIZE as usize)].to_vec();
 
-        let items_hashes: Vec<Vec<u8>> = items.iter().map(|item| item.hash()).collect();
+        let items_hashes: Vec<Vec<u8>> = trace.iter().map(|item| item.hash()).collect();
 
         let mut trace_tree = TraceTree::new(BITS_PER_ITEM);
         trace_tree.append(Bytes(seed.to_vec()));
@@ -186,18 +186,18 @@ impl TraceCommitment {
     }
 
     /// Try to create a commitment from items, returning an error if the trace is empty.
-    pub fn try_from(items: &[StepRecord], seed: &[u8]) -> Result<TraceCommitment> {
-        if items.is_empty() {
+    pub fn try_from(trace: &Trace, seed: &[u8]) -> Result<TraceCommitment> {
+        if trace.is_empty() {
             return Err(BitPackerError::EmptyTrace);
         }
-        Ok(Self::from(items, seed))
+        Ok(Self::from(trace, seed))
     }
 
     /// Get the frontier (partial Merkle path) at position n.
     ///
     /// This can be used to continue building the tree from position n.
-    pub fn frontier(items: &[StepRecord], n: usize, seed: &[u8]) -> Option<TraceTreeFrontier> {
-        let items_hashes: Vec<Vec<u8>> = items.iter().map(|item| item.hash()).collect();
+    pub fn frontier(trace: &Trace, n: usize, seed: &[u8]) -> Option<TraceTreeFrontier> {
+        let items_hashes: Vec<Vec<u8>> = trace.iter().map(|item| item.hash()).collect();
 
         let mut trace_tree = TraceTree::new(1);
         trace_tree.append(Bytes(seed.to_vec()));
@@ -210,17 +210,17 @@ impl TraceCommitment {
     }
 
     /// Try to get the frontier, returning an error on failure.
-    pub fn try_frontier(items: &[StepRecord], n: usize, seed: &[u8]) -> Result<TraceTreeFrontier> {
-        if n > items.len() {
+    pub fn try_frontier(trace: &Trace, n: usize, seed: &[u8]) -> Result<TraceTreeFrontier> {
+        if n > trace.len() {
             return Err(BitPackerError::InvalidRange {
                 start: 0,
                 end: n,
-                max: items.len(),
+                max: trace.len(),
             });
         }
 
         let mut items_hashes: Vec<Vec<u8>> = Vec::with_capacity(n);
-        for item in items.iter().take(n) {
+        for item in trace.iter().take(n) {
             items_hashes.push(item.try_hash()?);
         }
 
@@ -402,18 +402,20 @@ impl TraceVerifier {
 
 #[cfg(test)]
 mod tests {
-    use raster_core::trace::{FnCallRecord, FnInputParam, StepRecord};
+    use raster_core::cfs::CfsCoordinates;
+    use raster_core::trace::{FnCallRecord, FnInputParam, TileExecRecord};
 
     use super::*;
     use crate::precomputed;
 
     /// Helper function to create a step record for testing.
     fn make_tile_trace_item(input: u64, output: u64) -> StepRecord {
-        StepRecord {
+        StepRecord::TileExec(TileExecRecord {
             exec_index: input,
             sequence_id: "test_sequence".to_string(),
             intra_sequence_index: input,
             sequence_callstack_depth: 0,
+            sequence_coordinates: CfsCoordinates([0]),
             fn_call_record: FnCallRecord {
                 fn_name: format!("test_tile_{}", input),
                 desc: None,
@@ -425,7 +427,7 @@ mod tests {
                 output_type: Some("u64".to_string()),
                 output_data: output.to_le_bytes().to_vec(),
             },
-        }
+        })
     }
 
     #[test]

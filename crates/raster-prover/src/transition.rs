@@ -11,7 +11,7 @@
 use serde::{Deserialize, Serialize};
 
 use raster_core::fingerprint::{BitPacker, Fingerprint, FingerprintAccumulator};
-use raster_core::trace::StepRecord;
+use raster_core::trace::{StepRecord, TileExecRecord};
 
 use crate::replay::ReplayResult;
 use crate::trace::SerializableFrontier;
@@ -19,7 +19,7 @@ use crate::{TRANSITION_GUEST_ELF, TRANSITION_GUEST_ID};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransitionInput {
-    pub trace_item: StepRecord,
+    pub trace_item: TileExecRecord,
 
     pub replay_image_id: Vec<u8>,
 }
@@ -36,7 +36,6 @@ pub struct InitTransitionState {
     pub fingerprint: Fingerprint,
     // TODO: Init Transition should verify proof of inclusion of reference fingerprint
     // pub ref_fingerprint_inclusion_proof: Vec<u8>,
-    // TODO: Init Transition should contain reference to CFS
     // pub cfs: Vec<u8>,
 }
 
@@ -71,7 +70,7 @@ pub struct TransitionJournal {
 ///
 /// # Returns
 /// A `TransitionReplayResult` with details about success or failure
-pub fn replay_transitions(
+pub fn step_transitions(
     initial_frontier: &SerializableFrontier,
     trace_window: &[StepRecord],
     fingerprint: Fingerprint,
@@ -95,58 +94,64 @@ pub fn replay_transitions(
         .flat_map(|val| val.to_le_bytes())
         .collect();
 
-    for item in trace_window {
-        let Some(replay_result) = replayed_results.get(&item.fn_call_record.fn_name) else {
-            panic!("Replayed IMAGE ID not found");
-        };
-        // Create the input for this transition with fingerprint data
-        let input = TransitionInput {
-            trace_item: item.clone(),
-            replay_image_id: replay_result.image_id.clone(),
-        };
+    for step_record in trace_window {
+        match step_record {
+            StepRecord::TileExec(item) => {
+                let Some(replay_result) = replayed_results.get(&item.fn_call_record.fn_name) else {
+                    panic!("Replayed IMAGE ID not found");
+                };
+                // Create the input for this transition with fingerprint data
+                let input = TransitionInput {
+                    trace_item: item.clone(),
+                    replay_image_id: replay_result.image_id.clone(),
+                };
 
-        let replay_receipt_bytes = replay_result.receipt.clone();
-        let replay_receipt: risc0_zkvm::Receipt =
-            postcard::from_bytes(&replay_receipt_bytes).unwrap();
+                let replay_receipt_bytes = replay_result.receipt.clone();
+                let replay_receipt: risc0_zkvm::Receipt =
+                    postcard::from_bytes(&replay_receipt_bytes).unwrap();
 
-        // Build the executor environment
-        let env = if let Some(journal) = current_journal {
-            let Some(transition_receipt) = transition_receipt else {
-                panic!("Transition receipt not found");
-            };
-            risc0_zkvm::ExecutorEnv::builder()
-                .add_assumption(replay_receipt)
-                .add_assumption(transition_receipt)
-                .write(&self_image_id)
-                .unwrap()
-                .write(&input)
-                .unwrap()
-                .write(&current_state)
-                .unwrap()
-                .write(&journal)
-                .unwrap()
-                .build()
-                .unwrap()
-        } else {
-            risc0_zkvm::ExecutorEnv::builder()
-                .add_assumption(replay_receipt)
-                .write(&self_image_id)
-                .unwrap()
-                .write(&input)
-                .unwrap()
-                .write(&current_state)
-                .unwrap()
-                .build()
-                .unwrap()
-        };
+                // Build the executor environment
+                let env = if let Some(journal) = current_journal {
+                    let Some(transition_receipt) = transition_receipt else {
+                        panic!("Transition receipt not found");
+                    };
+                    risc0_zkvm::ExecutorEnv::builder()
+                        .add_assumption(replay_receipt)
+                        .add_assumption(transition_receipt)
+                        .write(&self_image_id)
+                        .unwrap()
+                        .write(&input)
+                        .unwrap()
+                        .write(&current_state)
+                        .unwrap()
+                        .write(&journal)
+                        .unwrap()
+                        .build()
+                        .unwrap()
+                } else {
+                    risc0_zkvm::ExecutorEnv::builder()
+                        .add_assumption(replay_receipt)
+                        .write(&self_image_id)
+                        .unwrap()
+                        .write(&input)
+                        .unwrap()
+                        .write(&current_state)
+                        .unwrap()
+                        .build()
+                        .unwrap()
+                };
 
-        let prove_info = prover.prove(env, &TRANSITION_GUEST_ELF).unwrap();
+                let prove_info = prover.prove(env, &TRANSITION_GUEST_ELF).unwrap();
 
-        transition_receipt = Some(prove_info.receipt.clone());
-        let journal: TransitionJournal = prove_info.receipt.journal.decode().unwrap();
+                transition_receipt = Some(prove_info.receipt.clone());
+                let journal: TransitionJournal = prove_info.receipt.journal.decode().unwrap();
 
-        current_journal = Some(journal.clone());
-        current_state = journal.current_state.clone();
+                current_journal = Some(journal.clone());
+                current_state = journal.current_state.clone();
+            }
+            StepRecord::SequenceStart(item) => todo!(),
+            StepRecord::SequenceEnd(item) => todo!(),
+        }
     }
 
     transition_receipt

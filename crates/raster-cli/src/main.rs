@@ -131,6 +131,10 @@ enum Commands {
         /// Read and verify trace from file (mutually exclusive with --commit)
         #[arg(long, conflicts_with = "commit")]
         audit: Option<String>,
+
+        /// Read and verify trace from file (mutually exclusive with --commit)
+        #[arg(long)]
+        verbose: bool,
     },
 }
 
@@ -174,11 +178,13 @@ fn main() -> Result<()> {
             input,
             commit,
             audit,
+            verbose,
         } => commands::run::run(
             backend,
             input.as_deref(),
             commit.as_deref(),
             audit.as_deref(),
+            verbose,
         ),
     }
 }

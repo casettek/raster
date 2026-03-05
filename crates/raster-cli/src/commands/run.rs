@@ -11,7 +11,7 @@ use raster_backend_risc0::Risc0Backend;
 
 use raster_compiler::Project;
 
-use raster_core::trace::{StepRecord, TraceWindow};
+use raster_core::trace::{SequenceStartRecord, StepRecord, TileExecRecord, Trace, TraceWindow};
 use raster_core::{Error, Result};
 
 use raster_prover::precomputed::EMPTY_TRIE_NODES;
@@ -19,17 +19,16 @@ use raster_prover::replay::{ReplayResult, Replayer};
 use raster_prover::trace::{
     SerializableFrontier, TraceCommitment, TraceVerifier, VerificationResult,
 };
-use raster_prover::transition::{replay_transitions, TransitionJournal};
+use raster_prover::transition::{step_transitions, TransitionJournal};
 
 use crate::BackendType;
-
-pub struct Trace(Vec<StepRecord>);
 
 pub fn run(
     backend_type: BackendType,
     input: Option<&str>,
     commit_flag: Option<&str>,
     audit_flag: Option<&str>,
+    verbose: bool,
 ) -> Result<()> {
     if backend_type != BackendType::Native {
         return Err(Error::Other(
@@ -79,10 +78,10 @@ pub fn run(
 
     let mut child = cmd.spawn()?;
 
-    let mut trace: Arc<Mutex<Vec<StepRecord>>> = Arc::new(Mutex::new(Vec::new()));
-    let mut log = Arc::new(Mutex::new(Vec::new()));
-
+    let mut trace: Arc<Mutex<Trace>> = Arc::new(Mutex::new(Trace::new()));
     let reader_trace = Arc::clone(&trace);
+
+    let mut log = Arc::new(Mutex::new(Vec::new()));
     let reader_log = Arc::clone(&log);
 
     let stdout = child.stdout.take().ok_or_else(|| {
@@ -147,12 +146,20 @@ pub fn run(
         .into_inner()
         .unwrap();
 
-    for log_line in log {
-        println!("{log_line}");
+    if verbose {
+        if !log.is_empty() {
+            println!("Verbose log:");
+            for log_line in log {
+                println!("{log_line}");
+            }
+        }
     }
 
-    for error_line in errors {
-        println!("{error_line}");
+    if !errors.is_empty() {
+        println!("Error:");
+        for error_line in errors {
+            println!("{error_line}");
+        }
     }
 
     let mut trace = Arc::try_unwrap(trace)
@@ -188,33 +195,67 @@ pub fn run(
     } else {
         // TODO: in case of just simple execution did printing out trace items is enough or save
         // them to file
-        //
 
         for step_record in trace {
-            let padding = "\t".repeat(step_record.sequence_callstack_depth.try_into().unwrap());
-            println!("\n{padding}exec_index: {}", step_record.exec_index);
-            println!("{padding}sequence_id: {}", step_record.sequence_id);
-            println!(
-                "{padding}sequence_coordinates: {:?}",
-                step_record.sequence_coordinates,
-            );
+            match step_record {
+                StepRecord::TileExec(tile_exec_record) => {
+                    let padding = "\t".repeat(
+                        tile_exec_record
+                            .sequence_callstack_depth
+                            .try_into()
+                            .unwrap(),
+                    ) + "[tile exec] ";
 
-            println!("{padding}tile_id: {}", step_record.fn_call_record.fn_name);
+                    println!("\n{padding}exec_index: {}", tile_exec_record.exec_index);
+                    println!("{padding}sequence_id: {}", tile_exec_record.sequence_id);
+                    println!(
+                        "{padding}sequence_coordinates: {:?}",
+                        tile_exec_record.sequence_coordinates,
+                    );
+
+                    println!(
+                        "{padding}tile_id: {}",
+                        tile_exec_record.fn_call_record.fn_name
+                    );
+                }
+                StepRecord::SequenceStart(sequence_start_record) => {
+                    println!(
+                        "[sequence start] sequence id: {}",
+                        sequence_start_record.sequence_id
+                    );
+                }
+                StepRecord::SequenceEnd(sequence_end_record) => {
+                    println!(
+                        "[sequence end] sequence id: {}",
+                        sequence_end_record.sequence_id
+                    );
+                }
+            }
         }
     }
 
     Ok(())
 }
 
-pub fn fraud(trace_items: &mut [StepRecord], commit_path: &str) {
+pub fn fraud(trace: &mut Trace, commit_path: &str) {
     let mut commitment_file =
         std::fs::File::create(commit_path).expect("Failed to create commitemt file");
 
-    if let Some(fraud_step) = trace_items.last_mut() {
-        fraud_step.fn_call_record.output_data = vec![0u8, 1u8];
+    if let Some(fraud_step) = trace.last_mut() {
+        match fraud_step {
+            StepRecord::TileExec(tile_exec_record) => {
+                tile_exec_record.fn_call_record.output_data = vec![0u8, 1u8];
+            }
+            StepRecord::SequenceStart(sequence_start_record) => {
+                sequence_start_record.input_data.push(0);
+            }
+            StepRecord::SequenceEnd(sequence_end_record) => {
+                sequence_end_record.output_data.push(0);
+            }
+        }
     };
 
-    let trace_commitment = TraceCommitment::from(trace_items, &EMPTY_TRIE_NODES[0]);
+    let trace_commitment = TraceCommitment::from(trace, &EMPTY_TRIE_NODES[0]);
 
     let bytes = postcard::to_allocvec(&trace_commitment).unwrap();
 
@@ -223,11 +264,11 @@ pub fn fraud(trace_items: &mut [StepRecord], commit_path: &str) {
         .expect("Failed to save commitment");
 }
 
-pub fn commit(trace_items: &[StepRecord], commit_path: &str) {
+pub fn commit(trace: &Trace, commit_path: &str) {
     let mut commitment_file =
         std::fs::File::create(commit_path).expect("Failed to create commitemt file");
 
-    let trace_commitment = TraceCommitment::from(trace_items, &EMPTY_TRIE_NODES[0]);
+    let trace_commitment = TraceCommitment::from(trace, &EMPTY_TRIE_NODES[0]);
     let bytes = postcard::to_allocvec(&trace_commitment).unwrap();
 
     commitment_file
@@ -235,16 +276,16 @@ pub fn commit(trace_items: &[StepRecord], commit_path: &str) {
         .expect("Failed to save commitment");
 }
 
-pub fn verify(trace_items: &[StepRecord], commit_path: &str) -> VerificationResult {
+pub fn verify(trace: &Trace, commit_path: &str) -> VerificationResult {
     let trace_commitment = read_trace_commitment(commit_path);
 
-    let actual_trace_commitment = TraceCommitment::from(trace_items, &EMPTY_TRIE_NODES[0]);
+    let actual_trace_commitment = TraceCommitment::from(trace, &EMPTY_TRIE_NODES[0]);
 
     let mut trace_verifier: TraceVerifier =
         TraceVerifier::new(trace_commitment, &EMPTY_TRIE_NODES[0]);
 
-    for trace_item in trace_items {
-        if let VerificationResult::Fraud(fraud_window) = trace_verifier.verify(trace_item) {
+    for step_record in trace.iter() {
+        if let VerificationResult::Fraud(fraud_window) = trace_verifier.verify(step_record) {
             println!("verification result: \nfraud: {:?}", fraud_window);
             return VerificationResult::Fraud(fraud_window);
         }
@@ -258,16 +299,21 @@ pub fn prove(fraud_window: TraceWindow, replayer: &Replayer) -> risc0_zkvm::Rece
 
     let mut replayed_results: BTreeMap<String, ReplayResult> = BTreeMap::new();
 
-    for (i, item) in fraud_window.items.iter().enumerate() {
-        print!("  [{}] {} ... ", i, item.fn_call_record.fn_name);
-
-        match replayer.replay(item, mode) {
-            Ok(replay_result) => {
-                replayed_results.insert(item.fn_call_record.fn_name.clone(), replay_result.clone());
-            }
-            Err(e) => {
-                println!("FAILED: {}", e);
-            }
+    for (i, step_record) in fraud_window.items.iter().enumerate() {
+        match step_record {
+            StepRecord::TileExec(tile_exec) => match replayer.replay(tile_exec, mode) {
+                Ok(replay_result) => {
+                    replayed_results.insert(
+                        tile_exec.fn_call_record.fn_name.clone(),
+                        replay_result.clone(),
+                    );
+                }
+                Err(e) => {
+                    println!("FAILED: {}", e);
+                }
+            },
+            StepRecord::SequenceEnd(item) => todo!(),
+            StepRecord::SequenceStart(item) => todo!(),
         }
     }
 
@@ -275,7 +321,7 @@ pub fn prove(fraud_window: TraceWindow, replayer: &Replayer) -> risc0_zkvm::Rece
         println!();
         println!("Replaying transition frontier with transition guest...");
 
-        let Some(receipt) = replay_transitions(
+        let Some(receipt) = step_transitions(
             &frontier,
             &fraud_window.items,
             fraud_window.fingerprint,

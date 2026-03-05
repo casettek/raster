@@ -4,7 +4,7 @@ use raster_backend::{Backend, ExecutionMode};
 use raster_compiler::tile::TileDiscovery;
 use raster_compiler::Project;
 
-use raster_core::trace::StepRecord;
+use raster_core::trace::TileExecRecord;
 use raster_core::{Error, Result};
 
 #[derive(Debug, Clone)]
@@ -55,7 +55,7 @@ impl<'a> Replayer<'a> {
     ///
     /// # Returns
     /// A `ReplayResult` containing the execution result and optional output comparison.
-    pub fn replay(&self, item: &StepRecord, mode: ExecutionMode) -> Result<ReplayResult> {
+    pub fn replay(&self, item: &TileExecRecord, mode: ExecutionMode) -> Result<ReplayResult> {
         let record = &item.fn_call_record;
         let discovery = TileDiscovery::new(self.project);
         let tile = discovery.get(&record.fn_name).ok_or_else(|| {
