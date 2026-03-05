@@ -133,7 +133,7 @@ impl<W: Write + Send> ExecutionSubscriber<W> {
         }
     }
 
-    fn write_record<T: serde::Serialize>(&self, record: &T) {
+    fn write_record(&self, record: &StepRecord) {
         let json_str = serde_json::to_string(record).expect("Failed to serialize");
         let mut writer_guard = self.writer.lock().expect("Writer mutex poisoned");
         writeln!(writer_guard, "[trace]{}", json_str).expect("Failed to write");
@@ -152,12 +152,12 @@ impl<W: Write + Send + Sync> Subscriber for ExecutionSubscriber<W> {
                 println!("[debug] SequenceStart: {}", trace_item.fn_name);
                 callstack_guard.push(trace_item.fn_name.clone());
 
-                let sequence_start_record = SequenceStartRecord {
+                let sequence_start_record = StepRecord::SequenceStart(SequenceStartRecord {
                     sequence_id: trace_item.fn_name.clone(),
                     sequence_coordinates: callstack_guard.current_sequence_coordinates.clone(),
                     inputs: trace_item.inputs,
                     input_data: trace_item.input_data,
-                };
+                });
 
                 drop(callstack_guard);
                 self.write_record(&sequence_start_record);
@@ -165,12 +165,12 @@ impl<W: Write + Send + Sync> Subscriber for ExecutionSubscriber<W> {
             TraceEvent::SequenceEnd(trace_item) => {
                 println!("[debug] SequenceEnd: {}", trace_item.fn_name.clone());
 
-                let sequence_end_record = SequenceEndRecord {
+                let sequence_end_record = StepRecord::SequenceEnd(SequenceEndRecord {
                     sequence_id: trace_item.fn_name.clone(),
                     sequence_coordinates: callstack_guard.current_sequence_coordinates.clone(),
                     output_type: trace_item.output_type,
                     output_data: trace_item.output_data,
-                };
+                });
 
                 callstack_guard.pop().expect("Corrupted sequence stack");
 
@@ -195,14 +195,14 @@ impl<W: Write + Send + Sync> Subscriber for ExecutionSubscriber<W> {
                 let exec_index = *exec_index_guard;
                 drop(exec_index_guard);
 
-                let step_record = TileExecRecord {
+                let step_record = StepRecord::TileExec(TileExecRecord {
                     exec_index,
                     sequence_id,
                     intra_sequence_index,
                     sequence_coordinates,
                     sequence_callstack_depth,
                     fn_call_record: trace_item,
-                };
+                });
 
                 self.write_record(&step_record);
             }

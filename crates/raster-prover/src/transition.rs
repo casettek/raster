@@ -19,9 +19,10 @@ use crate::{TRANSITION_GUEST_ELF, TRANSITION_GUEST_ID};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransitionInput {
-    pub trace_item: TileExecRecord,
+    pub step_record: StepRecord,
 
-    pub replay_image_id: Vec<u8>,
+    // replay image id should be in declaration in cfs file
+    pub replay_image_id: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -31,7 +32,7 @@ pub struct Transition {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct InitTransitionState {
+pub struct InitTransition {
     pub init_frontier: SerializableFrontier,
     pub fingerprint: Fingerprint,
     // TODO: Init Transition should verify proof of inclusion of reference fingerprint
@@ -41,14 +42,14 @@ pub struct InitTransitionState {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TransitionState {
-    Init(InitTransitionState),
+    Init(InitTransition),
     Next(Transition),
     Finished,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransitionJournal {
-    pub init_state: InitTransitionState,
+    pub init_state: InitTransition,
     pub current_state: TransitionState,
 
     pub self_image_id: Vec<u8>,
@@ -78,7 +79,7 @@ pub fn step_transitions(
 ) -> Option<risc0_zkvm::Receipt> {
     let prover = risc0_zkvm::default_prover();
 
-    let init_transition = InitTransitionState {
+    let init_transition = InitTransition {
         init_frontier: initial_frontier.clone(),
         fingerprint,
     };
@@ -102,8 +103,8 @@ pub fn step_transitions(
                 };
                 // Create the input for this transition with fingerprint data
                 let input = TransitionInput {
-                    trace_item: item.clone(),
-                    replay_image_id: replay_result.image_id.clone(),
+                    step_record: step_record.clone(),
+                    replay_image_id: Some(replay_result.image_id.clone()),
                 };
 
                 let replay_receipt_bytes = replay_result.receipt.clone();
@@ -149,8 +150,92 @@ pub fn step_transitions(
                 current_journal = Some(journal.clone());
                 current_state = journal.current_state.clone();
             }
-            StepRecord::SequenceStart(item) => todo!(),
-            StepRecord::SequenceEnd(item) => todo!(),
+            StepRecord::SequenceStart(item) => {
+                let input = TransitionInput {
+                    step_record: step_record.clone(),
+                    replay_image_id: None,
+                };
+
+                // Build the executor environment
+                let env = if let Some(journal) = current_journal {
+                    let Some(transition_receipt) = transition_receipt else {
+                        panic!("Transition receipt not found");
+                    };
+                    risc0_zkvm::ExecutorEnv::builder()
+                        .add_assumption(transition_receipt)
+                        .write(&self_image_id)
+                        .unwrap()
+                        .write(&input)
+                        .unwrap()
+                        .write(&current_state)
+                        .unwrap()
+                        .write(&journal)
+                        .unwrap()
+                        .build()
+                        .unwrap()
+                } else {
+                    risc0_zkvm::ExecutorEnv::builder()
+                        .write(&self_image_id)
+                        .unwrap()
+                        .write(&input)
+                        .unwrap()
+                        .write(&current_state)
+                        .unwrap()
+                        .build()
+                        .unwrap()
+                };
+
+                let prove_info = prover.prove(env, &TRANSITION_GUEST_ELF).unwrap();
+
+                transition_receipt = Some(prove_info.receipt.clone());
+                let journal: TransitionJournal = prove_info.receipt.journal.decode().unwrap();
+
+                current_journal = Some(journal.clone());
+                current_state = journal.current_state.clone();
+            }
+            StepRecord::SequenceEnd(item) => {
+                let input = TransitionInput {
+                    step_record: step_record.clone(),
+                    replay_image_id: None,
+                };
+
+                // Build the executor environment
+                let env = if let Some(journal) = current_journal {
+                    let Some(transition_receipt) = transition_receipt else {
+                        panic!("Transition receipt not found");
+                    };
+                    risc0_zkvm::ExecutorEnv::builder()
+                        .add_assumption(transition_receipt)
+                        .write(&self_image_id)
+                        .unwrap()
+                        .write(&input)
+                        .unwrap()
+                        .write(&current_state)
+                        .unwrap()
+                        .write(&journal)
+                        .unwrap()
+                        .build()
+                        .unwrap()
+                } else {
+                    risc0_zkvm::ExecutorEnv::builder()
+                        .write(&self_image_id)
+                        .unwrap()
+                        .write(&input)
+                        .unwrap()
+                        .write(&current_state)
+                        .unwrap()
+                        .build()
+                        .unwrap()
+                };
+
+                let prove_info = prover.prove(env, &TRANSITION_GUEST_ELF).unwrap();
+
+                transition_receipt = Some(prove_info.receipt.clone());
+                let journal: TransitionJournal = prove_info.receipt.journal.decode().unwrap();
+
+                current_journal = Some(journal.clone());
+                current_state = journal.current_state.clone();
+            }
         }
     }
 

@@ -79,10 +79,10 @@ pub fn run(
     let mut child = cmd.spawn()?;
 
     let mut trace: Arc<Mutex<Trace>> = Arc::new(Mutex::new(Trace::new()));
-    let reader_trace = Arc::clone(&trace);
+    let mut reader_trace = Arc::clone(&trace);
 
     let mut log = Arc::new(Mutex::new(Vec::new()));
-    let reader_log = Arc::clone(&log);
+    let mut reader_log = Arc::clone(&log);
 
     let stdout = child.stdout.take().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::Other, "Could not capture stdout")
@@ -190,6 +190,7 @@ pub fn run(
 
                 let replayer = Replayer::new(&backend, &project);
                 let _fraud_proof = prove(fraud_window, &replayer);
+                println!("Faurd proof generated");
             }
         }
     } else {
@@ -300,6 +301,7 @@ pub fn prove(fraud_window: TraceWindow, replayer: &Replayer) -> risc0_zkvm::Rece
     let mut replayed_results: BTreeMap<String, ReplayResult> = BTreeMap::new();
 
     for (i, step_record) in fraud_window.items.iter().enumerate() {
+        println!("prove: {:?}", step_record);
         match step_record {
             StepRecord::TileExec(tile_exec) => match replayer.replay(tile_exec, mode) {
                 Ok(replay_result) => {
@@ -312,8 +314,8 @@ pub fn prove(fraud_window: TraceWindow, replayer: &Replayer) -> risc0_zkvm::Rece
                     println!("FAILED: {}", e);
                 }
             },
-            StepRecord::SequenceEnd(item) => todo!(),
-            StepRecord::SequenceStart(item) => todo!(),
+            StepRecord::SequenceEnd(item) => {}
+            StepRecord::SequenceStart(item) => {}
         }
     }
 

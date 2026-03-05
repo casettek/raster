@@ -12,7 +12,7 @@ use risc0_zkvm::guest::env;
 
 use raster_core::fingerprint::{Fingerprint, FingerprintAccumulator};
 
-use raster_core::trace::TileExecRecord;
+use raster_core::trace::{StepRecord, TileExecRecord};
 
 use serde::{Deserialize, Serialize};
 
@@ -35,9 +35,9 @@ pub struct SerializableFrontier {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransitionInput {
-    pub trace_item: TileExecRecord,
+    pub step_record: StepRecord,
 
-    pub replay_image_id: Vec<u8>,
+    pub replay_image_id: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
@@ -47,7 +47,7 @@ pub struct Transition {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-pub struct InitTransitionState {
+pub struct InitTransition {
     pub init_frontier: SerializableFrontier,
     pub fingerprint: Fingerprint,
     // TODO: Init Transition should verify proof of inclusion of reference fingerprint
@@ -58,14 +58,14 @@ pub struct InitTransitionState {
 
 #[derive(Clone, Serialize, Deserialize)]
 pub enum TransitionState {
-    Init(InitTransitionState),
+    Init(InitTransition),
     Next(Transition),
     Finished,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct TransitionJournal {
-    pub init_state: InitTransitionState,
+    pub init_state: InitTransition,
     pub current_state: TransitionState,
 
     pub self_image_id: Vec<u8>,
@@ -145,7 +145,7 @@ impl SerializableFrontier {
 // ============================================================================
 
 /// Hash a TileExecRecord using SHA256 of its postcard-serialized form.
-fn hash_trace_item(item: &TileExecRecord) -> Vec<u8> {
+fn hash_trace_item(item: &StepRecord) -> Vec<u8> {
     let data = postcard::to_allocvec(item).expect("Failed to serialize TileExecRecord");
     let mut hasher = Sha256::new();
     hasher.update(&data);
@@ -155,7 +155,6 @@ fn hash_trace_item(item: &TileExecRecord) -> Vec<u8> {
 // ============================================================================
 // Main
 // ============================================================================
-
 fn main() {
     let self_image_id: Vec<u8> = env::read();
 
@@ -169,16 +168,25 @@ fn main() {
                 .to_frontier()
                 .expect("Invalid frontier in input");
 
-            let replay_image_id_digest =
-                risc0_zkvm::sha::Digest::try_from(input.replay_image_id.as_slice())
-                    .expect("image_id must be 32 bytes");
-            env::verify(
-                replay_image_id_digest,
-                &input.trace_item.fn_call_record.output_data,
-            )
-            .expect("Failed to verify trace replay image id");
+            match &input.step_record {
+                StepRecord::TileExec(tile_exec_record) => {
+                    let replay_image_id = input
+                        .replay_image_id
+                        .expect("replay image id should be provided for tile execution should ");
+                    let replay_image_id_digest =
+                        risc0_zkvm::sha::Digest::try_from(replay_image_id.as_slice())
+                            .expect("image_id must be 32 bytes");
+                    env::verify(
+                        replay_image_id_digest,
+                        &tile_exec_record.fn_call_record.output_data,
+                    )
+                    .expect("Failed to verify trace replay image id");
+                }
+                StepRecord::SequenceStart(seq_start_record) => {}
+                StepRecord::SequenceEnd(seq_end_record) => {}
+            }
 
-            let item_hash = hash_trace_item(&input.trace_item);
+            let item_hash = hash_trace_item(&input.step_record);
             init_frontier.append(Bytes(item_hash.clone()));
 
             let tree = TraceBridgeTree::from_frontier(1, init_frontier.clone());
@@ -187,7 +195,7 @@ fn main() {
             };
 
             let mut actual_fingerprint_acc =
-                FingerprintAccumulator::new(init_transition.fingerprint.bits_packer.clone());
+                FingerprintAccumulator::new(init_transition.fingerprint.bits_packer);
             actual_fingerprint_acc.append(&tree_root.0);
 
             let new_frontier = SerializableFrontier::from_frontier(&init_frontier);
@@ -235,17 +243,27 @@ fn main() {
                 .to_frontier()
                 .expect("Invalid frontier in input");
 
-            let replay_image_id_digest =
-                risc0_zkvm::sha::Digest::try_from(input.replay_image_id.as_slice())
-                    .expect("image_id must be 32 bytes");
-            // TODO: Maybe replay guest should have full trace item as output journal
-            env::verify(
-                replay_image_id_digest,
-                &input.trace_item.fn_call_record.output_data,
-            )
-            .expect("Failed to verify trace replay image id");
+            match &input.step_record {
+                StepRecord::TileExec(tile_exec_record) => {
+                    let replay_image_id = input
+                        .replay_image_id
+                        .expect("replay image id should be provided for tile execution should ");
 
-            let item_hash = hash_trace_item(&input.trace_item);
+                    let replay_image_id_digest =
+                        risc0_zkvm::sha::Digest::try_from(replay_image_id.as_slice())
+                            .expect("image_id must be 32 bytes");
+                    // TODO: Maybe replay guest should have full trace item as output journal
+                    env::verify(
+                        replay_image_id_digest,
+                        &tile_exec_record.fn_call_record.output_data,
+                    )
+                    .expect("Failed to verify trace replay image id");
+                }
+                StepRecord::SequenceStart(seq_start_record) => {}
+                StepRecord::SequenceEnd(seq_end_record) => {}
+            }
+
+            let item_hash = hash_trace_item(&input.step_record);
             current_frontier.append(Bytes(item_hash.clone()));
 
             let tree = TraceBridgeTree::from_frontier(1, current_frontier.clone());
