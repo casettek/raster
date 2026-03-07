@@ -91,7 +91,10 @@ impl<'a, 'ast> FlowResolver<'a, 'ast> {
                             sources: input_sources,
                         })
                     } else {
-                        panic!("Unknown item type: {}", call.callee);
+                        unreachable!(
+                            "Bare call `{}` passed the filter but is neither a tile nor a sequence",
+                            call.callee
+                        )
                     }
                 }
             };
