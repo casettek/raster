@@ -6,6 +6,12 @@ This spec is written to match the code as it exists today. Where the implementat
 
 ## Code audit tasks (where to look)
 
+- **Canonical call primitives (authoring surface)**:
+  - `crates/raster/src/lib.rs`
+    - `call!(tile_fn, args...)` — canonical tile step boundary (`macro_rules!`)
+    - `call_seq!(seq_fn, args...)` — canonical sequence call boundary (`macro_rules!`)
+    - Both re-exported via `raster::prelude::*`
+
 - **Macro authoring surface (compile-time registration)**:
   - `crates/raster-macros/src/lib.rs`
     - `#[tile(...)]` macro expands:
@@ -65,7 +71,13 @@ A sequence is authored as a Rust function annotated with `#[sequence(...)]`.
 - The implementation optionally supports:
   - `description = "<string>"`
 
-The current toolchain models sequences as an ordered list of calls found in the function body, but only records call expressions whose callee is a bare identifier (no `::` paths, no method calls, and no macro invocations).
+The current toolchain models sequences as an ordered list of calls found in the function body. Calls may be expressed as:
+
+1. **Canonical call primitives** (preferred): `call!(tile_fn, args...)` and `call_seq!(seq_fn, args...)`.
+   These are recognized by the compiler directly from macro invocations and do not require name-based inference to determine tile vs. sequence.
+2. **Bare function calls** (soft-deprecated): `tile_fn(args...)`. Still supported but emit a compiler warning and rely on post-hoc name matching against known tiles/sequences.
+
+Bare function calls are retained for backward compatibility during the deprecation period.
 
 ## Intermediate representations
 
@@ -75,10 +87,11 @@ Discovery IR is produced by parsing the project’s `src/` directory recursively
 
 - **Functions** (`FunctionAstItem`): name, path, inputs, optional output type, and extracted `call_infos`
 - **Macros/attributes** (`MacroAstItem`): macro name plus key/value args (best-effort)
-- **Calls** (`CallInfo`): bare-identifier callsites with:
+- **Calls** (`CallInfo`): callsites extracted from sequence bodies, with:
   - `callee: String`
   - `arguments: Vec<String>` (stringified tokens per argument expression)
   - `result_binding: Option<String>` (only for `let name = callee(...);` with identifier patterns)
+  - `call_kind: CallKind` — `Tile` (from `call!`), `Sequence` (from `call_seq!`), or `Bare` (plain function call)
 
 From that AST, the compiler derives two “discovery views”:
 
@@ -135,17 +148,32 @@ As implemented today:
 
 - The sequence ID is the Rust function name.
 - Parameter names are extracted from `syn` patterns (best-effort; complex patterns may be stringified and are generally not useful for binding resolution).
-- Calls are extracted from the function body by walking the AST and recording call expressions whose callee is a bare identifier.
+- Calls are extracted from the function body by walking the AST, recording both canonical `call!`/`call_seq!` macro invocations and bare identifier function calls.
 
 ### Call extraction rules inside sequences
 
-The compiler currently extracts calls by visiting the parsed AST:
+The compiler extracts calls by visiting the parsed `syn` AST via `CallVisitor` (`crates/raster-compiler/src/ast.rs`):
 
-- It records a call only when the callee is a bare identifier (e.g., `greet(name)`).
+**Canonical call primitives (preferred path)**:
+
+- `call!(tile_fn, arg1, arg2, ...)` macro invocations are recognized when the macro path is `call` or `raster::call`. The first token is the callee; remaining tokens are arguments. Produces `CallInfo { call_kind: Tile, ... }`.
+- `call_seq!(seq_fn, arg1, arg2, ...)` macro invocations are recognized when the macro path is `call_seq` or `raster::call_seq`. Produces `CallInfo { call_kind: Sequence, ... }`.
+- Both forms correctly populate `result_binding` when used in `let name = call!(...)` or `let name = call_seq!(...)`.
+- The compiler does NOT need to match the callee against known tiles/sequences for canonical calls — the call kind is declared at the call site.
+
+**Bare function calls (backward compat, soft-deprecated)**:
+
+- A bare identifier call (e.g., `greet(name)`) is recorded with `call_kind: Bare`.
   - Path-qualified calls (e.g., `foo::bar(x)`) and method calls (e.g., `obj.bar(x)`) are not recorded.
-  - Macro invocations (e.g., `bar!(x)`) are not recorded.
-- It records `result_binding = Some(name)` only when a call is the direct initializer in `let name = callee(...);` (identifier patterns only; destructuring is not supported).
-- Arguments are captured as stringified tokens for each argument expression (not by comma-splitting source text).
+- During sequence discovery, bare calls to known tiles/sequences emit a compiler-level deprecation warning on stderr:
+  - `warning[raster]: bare call to tile \`<name>\` in sequence \`<seq>\` is deprecated. Use \`call!(<name>, ...)\` instead.`
+  - `warning[raster]: bare call to sequence \`<name>\` in sequence \`<seq>\` is deprecated. Use \`call_seq!(<name>, ...)\` instead.`
+- No warning is emitted for `call!`/`call_seq!` invocations.
+
+**Common to both forms**:
+
+- `result_binding = Some(name)` is set only when the call is the direct initializer in `let name = callee(...);` (identifier patterns only; destructuring is not supported).
+- Arguments are captured as stringified token representations of each argument expression.
 
 ## Lowering rules (discovery/resolved IR → CFS)
 
@@ -172,9 +200,12 @@ Each discovered sequence (`raster_compiler::sequence::Sequence<'ast>`) lowers to
 
 For each recorded call (from `FunctionAstItem.call_infos`):
 
-- If `callee` matches a known discovered tile ID, `item_type` MUST be `"tile"`.
-- Else if `callee` matches a known discovered sequence ID, `item_type` MUST be `"sequence"`.
-- Else `item_type` defaults to `"tile"`.
+- If `call_kind == Tile` (from `call!` macro): `item_type` MUST be `"tile"`. No name-matching required.
+- If `call_kind == Sequence` (from `call_seq!` macro): `item_type` MUST be `"sequence"`. No name-matching required.
+- If `call_kind == Bare`: fall back to name-based discovery matching:
+  - If `callee` matches a known discovered tile ID → `"tile"`.
+  - Else if `callee` matches a known discovered sequence ID → `"sequence"`.
+  - Else the call is excluded from CFS output (it is not classified as a tile or sequence step).
 
 ### Dataflow resolution (argument binding)
 
@@ -234,7 +265,7 @@ Discovery/building may fail with:
 
 ## Examples
 
-### Example authoring
+### Example authoring (canonical call primitives)
 
 ```rust
 use raster::prelude::*;
@@ -244,27 +275,34 @@ fn greet(name: String) -> String {
     format!("Hello, {name}!")
 }
 
-#[tile(kind = recur, description = "Counts until done")]
-fn count_to(state: (u64, u64)) -> (u64, u64) {
-    state
+#[tile]
+fn exclaim(message: String) -> String {
+    format!("{}!", message)
 }
 
 #[sequence(description = "Main flow")]
-fn main(name: String) -> String {
-    let greeting = greet(name);
-    let _state = count_to((0, 10));
-    greeting
+fn greet_sequence(name: String) -> String {
+    let greeting = call!(greet, name);
+    call!(exclaim, greeting)
+}
+
+#[sequence(description = "Entry point")]
+fn main(name: String) {
+    call_seq!(greet_sequence, name);
 }
 ```
 
-### Expected extracted information (current behavior)
+### Expected extracted information
 
-- Tile discovery will record:
+- Tile discovery records:
   - `greet`: `type = "iter"` (default), `inputs = 1`, `outputs = 1`
-  - `count_to`: `type = "recur"`, `inputs = 1`, `outputs = 1` (current limitation: tuple return types are still counted as a single output)
-- Sequence discovery + call extraction will record callsites only for bare-identifier calls:
-  - `greet(name)` is recorded, and `name` can resolve to `seq_input(0)`.
-  - `count_to((0, 10))` is recorded, but the argument string `"(0, 10)"` does not match a parameter/binding name, so it falls back to `external` in the CFS binding model.
+  - `exclaim`: `type = "iter"`, `inputs = 1`, `outputs = 1`
+- Sequence discovery + call extraction records:
+  - `greet_sequence` → calls: `[call!(greet, name) → Tile, call!(exclaim, greeting) → Tile]`
+    - `name` resolves to `seq_input(0)`
+    - `greeting` resolves to `item_output(0, 0)` (output of `greet`)
+  - `main` → calls: `[call_seq!(greet_sequence, name) → Sequence]`
+    - `name` resolves to `seq_input(0)`
 
 ### Expected CFS (informative JSON shape)
 
@@ -276,23 +314,37 @@ The CLI emits JSON for `ControlFlowSchema`. The relevant structure looks like:
   "project": "<from Cargo.toml>",
   "encoding": "postcard",
   "tiles": [
-    { "id": "greet", "type": "iter", "inputs": 1, "outputs": 1 },
-    { "id": "count_to", "type": "recur", "inputs": 1, "outputs": 1 }
+    { "id": "exclaim", "type": "iter", "inputs": 1, "outputs": 1 },
+    { "id": "greet", "type": "iter", "inputs": 1, "outputs": 1 }
   ],
   "sequences": [
+    {
+      "id": "greet_sequence",
+      "input_sources": [{ "source": { "type": "external" } }],
+      "items": [
+        {
+          "Tile": {
+            "id": "greet",
+            "sources": [{ "source": { "type": "seq_input", "input_index": 0 } }]
+          }
+        },
+        {
+          "Tile": {
+            "id": "exclaim",
+            "sources": [{ "source": { "type": "item_output", "item_index": 0, "output_index": 0 } }]
+          }
+        }
+      ]
+    },
     {
       "id": "main",
       "input_sources": [{ "source": { "type": "external" } }],
       "items": [
         {
-          "item_type": "tile",
-          "item_id": "greet",
-          "input_sources": [{ "source": { "type": "seq_input", "input_index": 0 } }]
-        },
-        {
-          "item_type": "tile",
-          "item_id": "count_to",
-          "input_sources": [{ "source": { "type": "external" } }]
+          "Sequence": {
+            "id": "greet_sequence",
+            "sources": [{ "source": { "type": "seq_input", "input_index": 0 } }]
+          }
         }
       ]
     }
@@ -300,11 +352,10 @@ The CLI emits JSON for `ControlFlowSchema`. The relevant structure looks like:
 }
 ```
 
-**Gap reminder**: macro invocations like `count_to!(...)` are not recorded as calls by the compiler today, complex argument expressions fall back to `external`, and multi-output/tuple-return arity is not modeled (outputs are `0` or `1`).
-
 ## Known gaps and follow-ups
 
 - Implement deterministic discovery ordering (sort directory entries and/or sort final `tiles`/`sequences` lists before emitting CFS).
-- Improve call extraction to handle more callee forms (e.g., `foo::bar(...)`, method calls, and/or selected macro invocations) or explicitly document them as out of scope.
-- Preserve recursive intent in the resolved IR and CFS (would require both extracting a recursion authoring signal and extending `raster_core::cfs` types and the lowering).
+- Path-qualified calls (e.g., `foo::bar(...)`) and method calls are not extracted — explicitly out of scope for the current call surface.
+- Recursive tile execution (`kind = recur`) is out of scope for `call!` in this round. The `call!` macro expands to a plain function call for `recur` tiles. A dedicated follow-up initiative will add orchestration-driven loop semantics when recursive execution is implemented.
 - Extend dataflow bindings to support tuple outputs (`output_index > 0`) and destructuring bindings.
+- Complex argument expressions (literals, compound expressions) fall back to `external` bindings — not modeled as constants.

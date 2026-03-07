@@ -2,20 +2,30 @@ use cargo_toml::Manifest;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use syn::{
-    parse_file,
-    visit::Visit,
-    Attribute, Expr, ExprCall, ExprLit, FnArg, Lit, Local, Meta, Pat,
+    parse_file, visit::Visit, Attribute, Expr, ExprCall, ExprLit, ExprMacro, FnArg, Lit, Local,
+    Meta, Pat,
 };
 use walkdir::WalkDir;
 
 use raster_core::Result;
-
 
 #[derive(Debug, Clone)]
 pub struct ProjectAst {
     pub name: String,
     pub root_path: PathBuf,
     pub functions: Vec<FunctionAstItem>,
+}
+
+/// Indicates whether a call was made via `call!` (tile) or `call_seq!` (sequence),
+/// or via a bare function call (kind unknown from syntax alone).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallKind {
+    /// Invoked via `call!(tile_fn, args...)` — caller declares this is a tile step.
+    Tile,
+    /// Invoked via `call_seq!(seq_fn, args...)` — caller declares this is a sequence call.
+    Sequence,
+    /// Bare function call — kind is inferred by matching against known tiles/sequences.
+    Bare,
 }
 
 /// Captures detailed information about a function call within a function body.
@@ -27,6 +37,8 @@ pub struct CallInfo {
     pub arguments: Vec<String>,
     /// The variable name this call result is bound to, if any (e.g., `let x = foo()` -> Some("x"))
     pub result_binding: Option<String>,
+    /// How the call was made: via `call!`, `call_seq!`, or a bare function call.
+    pub call_kind: CallKind,
 }
 
 #[derive(Debug, Clone)]
@@ -97,7 +109,6 @@ impl ProjectAst {
 
         for item in &ast.items {
             if let syn::Item::Fn(func) = item {
-                
                 let name = func.sig.ident.to_string();
 
                 let macros: Vec<MacroAstItem> = func
@@ -238,23 +249,85 @@ impl CallVisitor {
     fn expr_to_string(expr: &Expr) -> String {
         quote::quote!(#expr).to_string()
     }
+
+    /// Parse a `call!` or `call_seq!` macro token stream into (callee, arguments).
+    ///
+    /// The macro syntax is `call!(callee_fn, arg1, arg2, ...)`. The token stream
+    /// is a comma-separated list; the first token is the callee identifier.
+    fn parse_call_macro_args(mac: &syn::Macro) -> Option<(String, Vec<String>)> {
+        // Parse the macro tokens as a punctuated sequence of expressions.
+        let args: syn::punctuated::Punctuated<Expr, syn::Token![,]> = mac
+            .parse_body_with(syn::punctuated::Punctuated::parse_terminated)
+            .ok()?;
+
+        let mut iter = args.iter();
+
+        // First argument must be a plain identifier (the callee function name).
+        let callee_expr = iter.next()?;
+        let callee = match callee_expr {
+            Expr::Path(path) => path.path.get_ident()?.to_string(),
+            _ => return None,
+        };
+
+        // Remaining arguments are the call arguments.
+        let arguments: Vec<String> = iter.map(Self::expr_to_string).collect();
+
+        Some((callee, arguments))
+    }
+
+    /// Check if a macro path matches one of the canonical call primitive names.
+    ///
+    /// Matches: `call`, `call_seq`, `raster::call`, `raster::call_seq`.
+    fn macro_call_kind(mac: &syn::Macro) -> Option<CallKind> {
+        let segments: Vec<String> = mac
+            .path
+            .segments
+            .iter()
+            .map(|s| s.ident.to_string())
+            .collect();
+
+        match segments.as_slice() {
+            [name] | [_, name] if name == "call" => Some(CallKind::Tile),
+            [name] | [_, name] if name == "call_seq" => Some(CallKind::Sequence),
+            _ => None,
+        }
+    }
 }
 
 impl<'ast> Visit<'ast> for CallVisitor {
     fn visit_local(&mut self, node: &'ast Local) {
         // Extract the binding name from the let pattern
         let binding_name = Self::extract_binding_name(&node.pat);
-        
+
         // Set the current binding context before visiting the initializer
         self.current_binding = binding_name;
-        
-        // Visit the initializer expression (this will trigger visit_expr_call if there's a call)
+
+        // Visit the initializer expression (this will trigger visit_expr_call /
+        // visit_expr_macro if there's a call or macro invocation)
         if let Some(init) = &node.init {
             self.visit_expr(&init.expr);
         }
-        
+
         // Clear the binding context after processing
         self.current_binding = None;
+    }
+
+    fn visit_expr_macro(&mut self, node: &'ast ExprMacro) {
+        if let Some(call_kind) = Self::macro_call_kind(&node.mac) {
+            if let Some((callee, arguments)) = Self::parse_call_macro_args(&node.mac) {
+                let result_binding = self.current_binding.take();
+                self.call_infos.push(CallInfo {
+                    callee,
+                    arguments,
+                    result_binding,
+                    call_kind,
+                });
+                // Do not recurse into the macro body — arguments are already captured above.
+                return;
+            }
+        }
+        // For unrecognized macros, continue default visitation.
+        syn::visit::visit_expr_macro(self, node);
     }
 
     fn visit_expr_call(&mut self, node: &'ast ExprCall) {
@@ -276,13 +349,135 @@ impl<'ast> Visit<'ast> for CallVisitor {
                     callee,
                     arguments,
                     result_binding,
+                    call_kind: CallKind::Bare,
                 });
             }
         }
-        
+
         // Continue visiting nested calls (but clear binding context for nested calls)
         let saved_binding = self.current_binding.take();
         syn::visit::visit_expr_call(self, node);
         self.current_binding = saved_binding;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use syn::visit::Visit;
+
+    fn parse_calls(code: &str) -> Vec<CallInfo> {
+        let file: syn::File = syn::parse_str(code).expect("Failed to parse test code");
+        let mut visitor = CallVisitor::new();
+        visitor.visit_file(&file);
+        visitor.get_call_infos()
+    }
+
+    #[test]
+    fn test_bare_call_extraction() {
+        let calls = parse_calls("fn seq() { let x = greet(name); }");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].callee, "greet");
+        assert_eq!(calls[0].call_kind, CallKind::Bare);
+        assert_eq!(calls[0].result_binding.as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn test_call_macro_extraction() {
+        let calls = parse_calls("fn seq() { let greeting = call!(greet, name); }");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].callee, "greet");
+        assert_eq!(calls[0].call_kind, CallKind::Tile);
+        assert_eq!(calls[0].result_binding.as_deref(), Some("greeting"));
+        assert_eq!(calls[0].arguments, vec!["name"]);
+    }
+
+    #[test]
+    fn test_call_seq_macro_extraction() {
+        let calls = parse_calls("fn seq() { let result = call_seq!(wish_sequence, greeting); }");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].callee, "wish_sequence");
+        assert_eq!(calls[0].call_kind, CallKind::Sequence);
+        assert_eq!(calls[0].result_binding.as_deref(), Some("result"));
+        assert_eq!(calls[0].arguments, vec!["greeting"]);
+    }
+
+    #[test]
+    fn test_call_macro_no_args() {
+        let calls = parse_calls("fn seq() { let r = call!(no_arg_tile); }");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].callee, "no_arg_tile");
+        assert_eq!(calls[0].call_kind, CallKind::Tile);
+        assert_eq!(calls[0].arguments.len(), 0);
+    }
+
+    #[test]
+    fn test_call_macro_multiple_args() {
+        let calls = parse_calls("fn seq() { let r = call!(tile_fn, a, b, c); }");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].callee, "tile_fn");
+        assert_eq!(calls[0].call_kind, CallKind::Tile);
+        assert_eq!(calls[0].arguments.len(), 3);
+    }
+
+    #[test]
+    fn test_mixed_calls_in_sequence() {
+        let calls = parse_calls(
+            r#"
+            fn seq(name: String) -> String {
+                let greeting = call!(greet, name);
+                let e1 = call!(exclaim, greeting);
+                let result = call_seq!(wish_sequence, e1);
+                result
+            }
+            "#,
+        );
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[0].callee, "greet");
+        assert_eq!(calls[0].call_kind, CallKind::Tile);
+        assert_eq!(calls[1].callee, "exclaim");
+        assert_eq!(calls[1].call_kind, CallKind::Tile);
+        assert_eq!(calls[2].callee, "wish_sequence");
+        assert_eq!(calls[2].call_kind, CallKind::Sequence);
+    }
+
+    #[test]
+    fn test_statement_level_call_seq_no_binding() {
+        // call_seq! as a bare statement (no `let`) must still be captured.
+        let calls = parse_calls(
+            r#"
+            fn main() {
+                call_seq!(greet_sequence, x);
+            }
+            "#,
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].callee, "greet_sequence");
+        assert_eq!(calls[0].call_kind, CallKind::Sequence);
+        assert_eq!(calls[0].result_binding, None);
+    }
+
+    #[test]
+    fn test_statement_level_call_seq_extraction() {
+        // call_seq! used as a statement expression (no `let` binding) must still be captured.
+        let calls = parse_calls(
+            r#"
+            fn main(name: String) {
+                call_seq!(greet_sequence, "Rust".to_string());
+                let name_2 = call_seq!(placeholder_sequence, name);
+                let _result = call_seq!(greet_sequence, name_2);
+            }
+            "#,
+        );
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[0].callee, "greet_sequence");
+        assert_eq!(calls[0].call_kind, CallKind::Sequence);
+        assert_eq!(calls[0].result_binding, None);
+        assert_eq!(calls[1].callee, "placeholder_sequence");
+        assert_eq!(calls[1].call_kind, CallKind::Sequence);
+        assert_eq!(calls[1].result_binding.as_deref(), Some("name_2"));
+        assert_eq!(calls[2].callee, "greet_sequence");
+        assert_eq!(calls[2].call_kind, CallKind::Sequence);
+        assert_eq!(calls[2].result_binding.as_deref(), Some("_result"));
     }
 }

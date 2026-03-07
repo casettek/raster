@@ -7,7 +7,7 @@ use raster_core::cfs::{InputBinding, InputSource, SequenceChild, SequenceItem, T
 use raster_core::tile::TileId;
 use std::collections::HashMap;
 
-use crate::ast::CallInfo;
+use crate::ast::{CallInfo, CallKind};
 use crate::sequence::{Sequence, SequenceDiscovery};
 use crate::tile::TileDiscovery;
 /// Resolves data flow within a sequence, producing `SequenceItem`s with
@@ -50,30 +50,50 @@ impl<'a, 'ast> FlowResolver<'a, 'ast> {
 
         let mut items = Vec::new();
 
-        // Filter call_infos to only include tile/sequence calls (matching the steps)
+        // Filter call_infos to only include tile/sequence calls.
+        // For canonical call!/ call_seq! invocations, use the declared kind directly.
+        // For bare calls, fall back to matching against known tiles/sequences.
         let relevant_calls: Vec<&CallInfo> = sequence
             .function
             .call_infos
             .iter()
-            .filter(|call| self.is_tile(&call.callee) || self.is_sequence(&call.callee))
+            .filter(|call| match call.call_kind {
+                CallKind::Tile => true,
+                CallKind::Sequence => true,
+                CallKind::Bare => self.is_tile(&call.callee) || self.is_sequence(&call.callee),
+            })
             .collect();
 
         for (item_index, call) in relevant_calls.iter().enumerate() {
             let input_sources = self.resolve_call_inputs(call);
 
-            // Determine if this is a tile or nested sequence
-            let item = if self.is_tile(&call.callee) {
-                SequenceChild::Tile(TileItem {
+            // Determine if this is a tile or nested sequence.
+            // Canonical call!/call_seq! declarations take priority over discovery matching,
+            // which prevents misclassification when callee names overlap.
+            let item = match call.call_kind {
+                CallKind::Tile => SequenceChild::Tile(TileItem {
                     id: call.callee.clone(),
                     sources: input_sources,
-                })
-            } else if self.is_sequence(&call.callee) {
-                SequenceChild::Sequence(SequenceItem {
+                }),
+                CallKind::Sequence => SequenceChild::Sequence(SequenceItem {
                     id: call.callee.clone(),
                     sources: input_sources,
-                })
-            } else {
-                panic!("Unknown item type: {}", call.callee);
+                }),
+                CallKind::Bare => {
+                    if self.is_tile(&call.callee) {
+                        SequenceChild::Tile(TileItem {
+                            id: call.callee.clone(),
+                            sources: input_sources,
+                        })
+                    } else if self.is_sequence(&call.callee) {
+                        SequenceChild::Sequence(SequenceItem {
+                            id: call.callee.clone(),
+                            sources: input_sources,
+                        })
+                    } else {
+                        panic!("Unknown item type: {}", call.callee);
+                    }
+                }
             };
 
             items.push(item);
@@ -237,11 +257,13 @@ mod tests {
                     callee: "greet".to_string(),
                     result_binding: Some("greeting".to_string()),
                     arguments: vec!["name".to_string()],
+                    call_kind: CallKind::Bare,
                 },
                 CallInfo {
                     callee: "exclaim".to_string(),
                     result_binding: None,
                     arguments: vec!["greeting".to_string()],
+                    call_kind: CallKind::Bare,
                 },
             ],
         );
@@ -261,27 +283,35 @@ mod tests {
         assert_eq!(items.len(), 2);
 
         // First item: greet(name) where name is seq_input[0]
-        assert_eq!(items[0].item_id, "greet");
-        assert_eq!(items[0].item_type, "tile");
-        assert_eq!(items[0].input_sources.len(), 1);
-        match &items[0].input_sources[0].source {
-            InputSource::SeqInput { input_index } => assert_eq!(*input_index, 0),
-            _ => panic!("Expected SeqInput"),
+        match &items[0] {
+            SequenceChild::Tile(tile_item) => {
+                assert_eq!(tile_item.id, "greet");
+                assert_eq!(tile_item.sources.len(), 1);
+                match &tile_item.sources[0].source {
+                    InputSource::SeqInput { input_index } => assert_eq!(*input_index, 0),
+                    _ => panic!("Expected SeqInput"),
+                }
+            }
+            _ => panic!("Expected Tile item"),
         }
 
         // Second item: exclaim(greeting) where greeting is item_output[0][0]
-        assert_eq!(items[1].item_id, "exclaim");
-        assert_eq!(items[1].item_type, "tile");
-        assert_eq!(items[1].input_sources.len(), 1);
-        match &items[1].input_sources[0].source {
-            InputSource::ItemOutput {
-                item_index,
-                output_index,
-            } => {
-                assert_eq!(*item_index, 0);
-                assert_eq!(*output_index, 0);
+        match &items[1] {
+            SequenceChild::Tile(tile_item) => {
+                assert_eq!(tile_item.id, "exclaim");
+                assert_eq!(tile_item.sources.len(), 1);
+                match &tile_item.sources[0].source {
+                    InputSource::ItemOutput {
+                        item_index,
+                        output_index,
+                    } => {
+                        assert_eq!(*item_index, 0);
+                        assert_eq!(*output_index, 0);
+                    }
+                    _ => panic!("Expected ItemOutput"),
+                }
             }
-            _ => panic!("Expected ItemOutput"),
+            _ => panic!("Expected Tile item"),
         }
     }
 }

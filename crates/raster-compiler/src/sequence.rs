@@ -5,7 +5,7 @@ use crate::{
 use std::collections::HashSet;
 use std::path::Path;
 
-use crate::ast::FunctionAstItem;
+use crate::ast::{CallKind, FunctionAstItem};
 use crate::tile::Tile;
 #[derive(Debug, Clone)]
 pub struct Sequence<'ast> {
@@ -84,13 +84,34 @@ impl<'ast> SequenceDiscovery<'ast> {
             .call_infos
             .iter()
             .filter_map(|call_info| {
-                // Try to find tile by name
-                if let Some(tile) = tile_discovery.get(&call_info.callee) {
-                    Some(SequenceStep::Tile(tile))
-                } else if sequence_names.contains(&call_info.callee) {
-                    Some(SequenceStep::Sequence(call_info.callee.clone()))
-                } else {
-                    None
+                match call_info.call_kind {
+                    // Canonical call!: look up tile by name, must exist in discovery.
+                    CallKind::Tile => tile_discovery
+                        .get(&call_info.callee)
+                        .map(SequenceStep::Tile),
+                    // Canonical call_seq!: sequence declared explicitly — include by name.
+                    CallKind::Sequence => Some(SequenceStep::Sequence(call_info.callee.clone())),
+                    // Bare call: fall back to name-based discovery matching.
+                    // Emit a soft deprecation warning if the callee is a known tile or sequence.
+                    CallKind::Bare => {
+                        if let Some(tile) = tile_discovery.get(&call_info.callee) {
+                            eprintln!(
+                                "warning[raster]: bare call to tile `{}` in sequence `{}` is deprecated. \
+                                 Use `call!({}, ...)` instead.",
+                                call_info.callee, func.name, call_info.callee
+                            );
+                            Some(SequenceStep::Tile(tile))
+                        } else if sequence_names.contains(&call_info.callee) {
+                            eprintln!(
+                                "warning[raster]: bare call to sequence `{}` in sequence `{}` is deprecated. \
+                                 Use `call_seq!({}, ...)` instead.",
+                                call_info.callee, func.name, call_info.callee
+                            );
+                            Some(SequenceStep::Sequence(call_info.callee.clone()))
+                        } else {
+                            None
+                        }
+                    }
                 }
             })
             .collect();
