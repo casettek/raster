@@ -85,12 +85,35 @@ impl<'ast> SequenceDiscovery<'ast> {
             .iter()
             .filter_map(|call_info| {
                 match call_info.call_kind {
-                    // Canonical call!: look up tile by name, must exist in discovery.
-                    CallKind::Tile => tile_discovery
-                        .get(&call_info.callee)
-                        .map(SequenceStep::Tile),
-                    // Canonical call_seq!: sequence declared explicitly — include by name.
-                    CallKind::Sequence => Some(SequenceStep::Sequence(call_info.callee.clone())),
+                    // Canonical call!: callee must be a registered tile.
+                    CallKind::Tile => {
+                        match tile_discovery.get(&call_info.callee) {
+                            Some(tile) => Some(SequenceStep::Tile(tile)),
+                            None => {
+                                eprintln!(
+                                    "error[raster]: `call!` in sequence `{}` refers to unknown tile `{}`; \
+                                     it is not registered in tile discovery. \
+                                     Check the spelling or ensure `#[tile]` is applied.",
+                                    func.name, call_info.callee
+                                );
+                                None
+                            }
+                        }
+                    }
+                    // Canonical call_seq!: callee must be a registered sequence.
+                    CallKind::Sequence => {
+                        if sequence_names.contains(&call_info.callee) {
+                            Some(SequenceStep::Sequence(call_info.callee.clone()))
+                        } else {
+                            eprintln!(
+                                "error[raster]: `call_seq!` in sequence `{}` refers to unknown sequence `{}`; \
+                                 it is not registered in sequence discovery. \
+                                 Check the spelling or ensure `#[sequence]` is applied.",
+                                func.name, call_info.callee
+                            );
+                            None
+                        }
+                    }
                     // Bare call: fall back to name-based discovery matching.
                     // Emit a soft deprecation warning if the callee is a known tile or sequence.
                     CallKind::Bare => {

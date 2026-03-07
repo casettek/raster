@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use syn::{
     parse_file, visit::Visit, Attribute, Expr, ExprCall, ExprLit, ExprMacro, FnArg, Lit, Local,
-    Meta, Pat,
+    Meta, Pat, StmtMacro,
 };
 use walkdir::WalkDir;
 
@@ -330,6 +330,27 @@ impl<'ast> Visit<'ast> for CallVisitor {
         }
         // For unrecognized macros, continue default visitation.
         syn::visit::visit_expr_macro(self, node);
+    }
+
+    fn visit_stmt_macro(&mut self, node: &'ast StmtMacro) {
+        // Bare macro statements (e.g. `call_seq!(foo, x);` without a `let` binding) are
+        // parsed as `Stmt::Macro(StmtMacro)` by syn, not as `Stmt::Expr(Expr::Macro)`.
+        // The default Visit path for StmtMacro calls `visit_macro` (the raw Macro struct),
+        // which does NOT trigger `visit_expr_macro`. We handle them here so that statement-
+        // position `call!` and `call_seq!` invocations are captured without a binding.
+        if let Some(call_kind) = Self::macro_call_kind(&node.mac) {
+            if let Some((callee, arguments)) = Self::parse_call_macro_args(&node.mac) {
+                // current_binding is None here — bare statements have no let binding.
+                self.call_infos.push(CallInfo {
+                    callee,
+                    arguments,
+                    result_binding: None,
+                    call_kind,
+                });
+                return;
+            }
+        }
+        syn::visit::visit_stmt_macro(self, node);
     }
 
     fn visit_expr_call(&mut self, node: &'ast ExprCall) {

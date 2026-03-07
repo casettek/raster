@@ -51,15 +51,40 @@ impl<'a, 'ast> FlowResolver<'a, 'ast> {
         let mut items = Vec::new();
 
         // Filter call_infos to only include tile/sequence calls.
-        // For canonical call!/ call_seq! invocations, use the declared kind directly.
+        // For canonical call!/call_seq! invocations, validate the callee against discovery
+        // and emit an error for unknown callees (excluding them from the CFS).
         // For bare calls, fall back to matching against known tiles/sequences.
         let relevant_calls: Vec<&CallInfo> = sequence
             .function
             .call_infos
             .iter()
             .filter(|call| match call.call_kind {
-                CallKind::Tile => true,
-                CallKind::Sequence => true,
+                CallKind::Tile => {
+                    if !self.is_tile(&call.callee) {
+                        eprintln!(
+                            "error[raster]: `call!` in sequence `{}` refers to unknown tile `{}`; \
+                             it is not registered in tile discovery. \
+                             Check the spelling or ensure `#[tile]` is applied.",
+                            sequence.function.name, call.callee
+                        );
+                        false
+                    } else {
+                        true
+                    }
+                }
+                CallKind::Sequence => {
+                    if !self.is_sequence(&call.callee) {
+                        eprintln!(
+                            "error[raster]: `call_seq!` in sequence `{}` refers to unknown sequence `{}`; \
+                             it is not registered in sequence discovery. \
+                             Check the spelling or ensure `#[sequence]` is applied.",
+                            sequence.function.name, call.callee
+                        );
+                        false
+                    } else {
+                        true
+                    }
+                }
                 CallKind::Bare => self.is_tile(&call.callee) || self.is_sequence(&call.callee),
             })
             .collect();
@@ -70,6 +95,7 @@ impl<'a, 'ast> FlowResolver<'a, 'ast> {
             // Determine if this is a tile or nested sequence.
             // Canonical call!/call_seq! declarations take priority over discovery matching,
             // which prevents misclassification when callee names overlap.
+            // Unknown callees are already filtered out above.
             let item = match call.call_kind {
                 CallKind::Tile => SequenceChild::Tile(TileItem {
                     id: call.callee.clone(),
