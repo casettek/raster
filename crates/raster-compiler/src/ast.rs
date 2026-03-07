@@ -287,8 +287,10 @@ impl CallVisitor {
             .collect();
 
         match segments.as_slice() {
-            [name] | [_, name] if name == "call" => Some(CallKind::Tile),
-            [name] | [_, name] if name == "call_seq" => Some(CallKind::Sequence),
+            [name] if name == "call" => Some(CallKind::Tile),
+            [prefix, name] if prefix == "raster" && name == "call" => Some(CallKind::Tile),
+            [name] if name == "call_seq" => Some(CallKind::Sequence),
+            [prefix, name] if prefix == "raster" && name == "call_seq" => Some(CallKind::Sequence),
             _ => None,
         }
     }
