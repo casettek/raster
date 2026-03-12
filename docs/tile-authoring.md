@@ -82,15 +82,54 @@ If decode/encode fails, the wrapper returns `raster_core::Error::Serialization`.
 Current limitations:
 
 - No runtime recursive execution loop exists yet.
-- Compiler call extraction does not reliably capture `tile_name!(...)` macro calls.
+- `call!` on a `recur` tile expands to a plain function call — there is no orchestration-driven recursive loop. A dedicated follow-up initiative will add recursive execution semantics.
 - Treat recursion as an annotation/forward-compatible convention, not an enforced runtime behavior.
+
+## Call primitives (`call!` and `call_seq!`)
+
+Use `call!` and `call_seq!` inside sequences to invoke tiles and sub-sequences explicitly.
+
+```rust
+#[sequence]
+fn greet_sequence(name: String) -> String {
+    let greeting = call!(greet, name);        // invoke a tile
+    let e1 = call!(exclaim, greeting);         // invoke a tile, chain results
+    let result = call_seq!(wish_seq, e1);      // invoke a sub-sequence
+    result
+}
+```
+
+- `call!(tile_fn, args...)`: the canonical tile step boundary. The compiler extracts tile call sites from `call!` invocations.
+- `call_seq!(seq_fn, args...)`: the canonical sequence call boundary. The callee's `#[sequence]` wrapper handles `SequenceStart`/`SequenceEnd` trace events automatically.
+
+Both macros:
+
+- Return the callee's return value transparently — `let x = call!(foo, bar)` works as expected.
+- Work in `std` and `no_std` contexts with no overhead on `no_std` / riscv32 targets.
+- Are available via `use raster::prelude::*`.
+
+**`call!` and `call_seq!` are required.** Bare function calls (e.g. `greet(name)`) in sequence bodies are **not recognized** by the compiler. Only `call!` and `call_seq!` invocations are extracted as step boundaries for CFS generation.
+
+**Nested calls must be decomposed:**
+
+```rust
+// This will NOT work — nested calls are not extractable:
+// exclaim(greet(name))
+
+// Use explicit sequential bindings instead:
+let greeting = call!(greet, name);
+let exclaimed = call!(exclaim, greeting);
+```
+
+This makes the dataflow explicit and CFS-derivable.
 
 ## Sequences (`#[sequence]`)
 
-Sequences are currently a discovery/annotation surface:
+Sequences are a discovery/annotation surface:
 
 - They are registered on host targets.
-- Tooling extracts an ordered list of simple function calls.
+- Tooling extracts an ordered list of `call!`/`call_seq!` invocations for CFS derivation.
+- All tile and sequence invocations in sequence bodies MUST use `call!` or `call_seq!`.
 - They are not a full control-flow program representation today.
 
 Do not rely on sequence branching semantics being represented end-to-end.
@@ -133,4 +172,6 @@ Use `cargo raster run` for end-to-end native runs with optional `--commit`/`--au
 - Use explicit stable input/output types.
 - Prefer deterministic logic for prove/verify workflows.
 - Document resource hints (`estimated_cycles`, `max_memory`) when known.
+- Use `call!` for all tile invocations and `call_seq!` for all sequence invocations in sequence bodies. Bare function calls are not extracted by the compiler.
+- Decompose nested calls into sequential bindings (`let y = call!(g, x); let z = call!(f, y);`) for explicit dataflow and CFS derivation.
 - Keep sequence examples linear unless you are explicitly documenting current limitations.

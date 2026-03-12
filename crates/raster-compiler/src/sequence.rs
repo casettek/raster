@@ -5,7 +5,7 @@ use crate::{
 use std::collections::HashSet;
 use std::path::Path;
 
-use crate::ast::FunctionAstItem;
+use crate::ast::{CallKind, FunctionAstItem};
 use crate::tile::Tile;
 #[derive(Debug, Clone)]
 pub struct Sequence<'ast> {
@@ -84,13 +84,36 @@ impl<'ast> SequenceDiscovery<'ast> {
             .call_infos
             .iter()
             .filter_map(|call_info| {
-                // Try to find tile by name
-                if let Some(tile) = tile_discovery.get(&call_info.callee) {
-                    Some(SequenceStep::Tile(tile))
-                } else if sequence_names.contains(&call_info.callee) {
-                    Some(SequenceStep::Sequence(call_info.callee.clone()))
-                } else {
-                    None
+                match call_info.call_kind {
+                    // Canonical call!: callee must be a registered tile.
+                    CallKind::Tile => {
+                        match tile_discovery.get(&call_info.callee) {
+                            Some(tile) => Some(SequenceStep::Tile(tile)),
+                            None => {
+                                eprintln!(
+                                    "error[raster]: `call!` in sequence `{}` refers to unknown tile `{}`; \
+                                     it is not registered in tile discovery. \
+                                     Check the spelling or ensure `#[tile]` is applied.",
+                                    func.name, call_info.callee
+                                );
+                                None
+                            }
+                        }
+                    }
+                    // Canonical call_seq!: callee must be a registered sequence.
+                    CallKind::Sequence => {
+                        if sequence_names.contains(&call_info.callee) {
+                            Some(SequenceStep::Sequence(call_info.callee.clone()))
+                        } else {
+                            eprintln!(
+                                "error[raster]: `call_seq!` in sequence `{}` refers to unknown sequence `{}`; \
+                                 it is not registered in sequence discovery. \
+                                 Check the spelling or ensure `#[sequence]` is applied.",
+                                func.name, call_info.callee
+                            );
+                            None
+                        }
+                    }
                 }
             })
             .collect();
