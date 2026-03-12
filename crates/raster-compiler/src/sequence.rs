@@ -114,27 +114,6 @@ impl<'ast> SequenceDiscovery<'ast> {
                             None
                         }
                     }
-                    // Bare call: fall back to name-based discovery matching.
-                    // Emit a soft deprecation warning if the callee is a known tile or sequence.
-                    CallKind::Bare => {
-                        if let Some(tile) = tile_discovery.get(&call_info.callee) {
-                            eprintln!(
-                                "warning[raster]: bare call to tile `{}` in sequence `{}` is deprecated. \
-                                 Use `call!({}, ...)` instead.",
-                                call_info.callee, func.name, call_info.callee
-                            );
-                            Some(SequenceStep::Tile(tile))
-                        } else if sequence_names.contains(&call_info.callee) {
-                            eprintln!(
-                                "warning[raster]: bare call to sequence `{}` in sequence `{}` is deprecated. \
-                                 Use `call_seq!({}, ...)` instead.",
-                                call_info.callee, func.name, call_info.callee
-                            );
-                            Some(SequenceStep::Sequence(call_info.callee.clone()))
-                        } else {
-                            None
-                        }
-                    }
                 }
             })
             .collect();

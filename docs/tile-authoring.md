@@ -99,9 +99,7 @@ fn greet_sequence(name: String) -> String {
 }
 ```
 
-**Why use these instead of bare calls:**
-
-- `call!(tile_fn, args...)`: the canonical tile step boundary. The compiler reliably extracts tile call sites from `call!` invocations without guessing by name-matching.
+- `call!(tile_fn, args...)`: the canonical tile step boundary. The compiler extracts tile call sites from `call!` invocations.
 - `call_seq!(seq_fn, args...)`: the canonical sequence call boundary. The callee's `#[sequence]` wrapper handles `SequenceStart`/`SequenceEnd` trace events automatically.
 
 Both macros:
@@ -110,29 +108,28 @@ Both macros:
 - Work in `std` and `no_std` contexts with no overhead on `no_std` / riscv32 targets.
 - Are available via `use raster::prelude::*`.
 
-**Nested calls must be decomposed:** calls like `exclaim(greet(name))` must be rewritten as:
+**`call!` and `call_seq!` are required.** Bare function calls (e.g. `greet(name)`) in sequence bodies are **not recognized** by the compiler. Only `call!` and `call_seq!` invocations are extracted as step boundaries for CFS generation.
+
+**Nested calls must be decomposed:**
 
 ```rust
+// This will NOT work — nested calls are not extractable:
+// exclaim(greet(name))
+
+// Use explicit sequential bindings instead:
 let greeting = call!(greet, name);
 let exclaimed = call!(exclaim, greeting);
 ```
 
 This makes the dataflow explicit and CFS-derivable.
 
-**Bare function calls are soft-deprecated.** If you use `greet(name)` directly in a sequence body, the compiler will emit a deprecation warning during CFS generation:
-
-```
-warning[raster]: bare call to tile `greet` in sequence `my_seq` is deprecated.
-                 Use `call!(greet, ...)` instead.
-```
-
 ## Sequences (`#[sequence]`)
 
 Sequences are a discovery/annotation surface:
 
 - They are registered on host targets.
-- Tooling extracts an ordered list of tile/sequence calls for CFS derivation.
-- Prefer `call!`/`call_seq!` inside sequences for reliable extraction.
+- Tooling extracts an ordered list of `call!`/`call_seq!` invocations for CFS derivation.
+- All tile and sequence invocations in sequence bodies MUST use `call!` or `call_seq!`.
 - They are not a full control-flow program representation today.
 
 Do not rely on sequence branching semantics being represented end-to-end.
@@ -175,6 +172,6 @@ Use `cargo raster run` for end-to-end native runs with optional `--commit`/`--au
 - Use explicit stable input/output types.
 - Prefer deterministic logic for prove/verify workflows.
 - Document resource hints (`estimated_cycles`, `max_memory`) when known.
-- Always use `call!` for tile invocations and `call_seq!` for sequence invocations in sequence bodies.
-- Decompose nested calls (`f(g(x))`) into sequential bindings (`let y = call!(g, x); let z = call!(f, y);`) for explicit dataflow and reliable CFS derivation.
+- Use `call!` for all tile invocations and `call_seq!` for all sequence invocations in sequence bodies. Bare function calls are not extracted by the compiler.
+- Decompose nested calls into sequential bindings (`let y = call!(g, x); let z = call!(f, y);`) for explicit dataflow and CFS derivation.
 - Keep sequence examples linear unless you are explicitly documenting current limitations.

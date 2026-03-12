@@ -71,13 +71,14 @@ A sequence is authored as a Rust function annotated with `#[sequence(...)]`.
 - The implementation optionally supports:
   - `description = "<string>"`
 
-The current toolchain models sequences as an ordered list of calls found in the function body. Calls may be expressed as:
+The current toolchain models sequences as an ordered list of calls found in the function body. Calls MUST use the canonical call primitives:
 
-1. **Canonical call primitives** (preferred): `call!(tile_fn, args...)` and `call_seq!(seq_fn, args...)`.
-   These are recognized by the compiler directly from macro invocations and do not require name-based inference to determine tile vs. sequence.
-2. **Bare function calls** (soft-deprecated): `tile_fn(args...)`. Still supported but emit a compiler warning and rely on post-hoc name matching against known tiles/sequences.
+- `call!(tile_fn, args...)` — invokes a tile.
+- `call_seq!(seq_fn, args...)` — invokes a sub-sequence.
 
-Bare function calls are retained for backward compatibility during the deprecation period.
+These are recognized by the compiler directly from macro invocations and do not require name-based inference to determine tile vs. sequence.
+
+**Bare function calls** (e.g. `tile_fn(args...)`) are NOT extracted by the compiler. Only `call!` and `call_seq!` invocations are recognized as step boundaries in sequences.
 
 ## Intermediate representations
 
@@ -91,7 +92,7 @@ Discovery IR is produced by parsing the project’s `src/` directory recursively
   - `callee: String`
   - `arguments: Vec<String>` (stringified tokens per argument expression)
   - `result_binding: Option<String>` (only for `let name = callee(...);` with identifier patterns)
-  - `call_kind: CallKind` — `Tile` (from `call!`), `Sequence` (from `call_seq!`), or `Bare` (plain function call)
+  - `call_kind: CallKind` — `Tile` (from `call!`) or `Sequence` (from `call_seq!`)
 
 From that AST, the compiler derives two “discovery views”:
 
@@ -148,32 +149,21 @@ As implemented today:
 
 - The sequence ID is the Rust function name.
 - Parameter names are extracted from `syn` patterns (best-effort; complex patterns may be stringified and are generally not useful for binding resolution).
-- Calls are extracted from the function body by walking the AST, recording both canonical `call!`/`call_seq!` macro invocations and bare identifier function calls.
+- Calls are extracted from the function body by walking the AST, recording only canonical `call!`/`call_seq!` macro invocations. Bare function calls are not extracted.
 
 ### Call extraction rules inside sequences
 
 The compiler extracts calls by visiting the parsed `syn` AST via `CallVisitor` (`crates/raster-compiler/src/ast.rs`):
 
-**Canonical call primitives (preferred path)**:
-
 - `call!(tile_fn, arg1, arg2, ...)` macro invocations are recognized when the macro path is `call` or `raster::call`. The first token is the callee; remaining tokens are arguments. Produces `CallInfo { call_kind: Tile, ... }`.
 - `call_seq!(seq_fn, arg1, arg2, ...)` macro invocations are recognized when the macro path is `call_seq` or `raster::call_seq`. Produces `CallInfo { call_kind: Sequence, ... }`.
 - Both forms correctly populate `result_binding` when used in `let name = call!(...)` or `let name = call_seq!(...)`.
-- The compiler does NOT need to match the callee against known tiles/sequences for canonical calls — the call kind is declared at the call site.
-
-**Bare function calls (backward compat, soft-deprecated)**:
-
-- A bare identifier call (e.g., `greet(name)`) is recorded with `call_kind: Bare`.
-  - Path-qualified calls (e.g., `foo::bar(x)`) and method calls (e.g., `obj.bar(x)`) are not recorded.
-- During sequence discovery, bare calls to known tiles/sequences emit a compiler-level deprecation warning on stderr:
-  - `warning[raster]: bare call to tile \`<name>\` in sequence \`<seq>\` is deprecated. Use \`call!(<name>, ...)\` instead.`
-  - `warning[raster]: bare call to sequence \`<name>\` in sequence \`<seq>\` is deprecated. Use \`call_seq!(<name>, ...)\` instead.`
-- No warning is emitted for `call!`/`call_seq!` invocations.
-
-**Common to both forms**:
-
-- `result_binding = Some(name)` is set only when the call is the direct initializer in `let name = callee(...);` (identifier patterns only; destructuring is not supported).
+- Both forms handle expression-position macros (`let x = call!(...)`) via `visit_expr_macro` and statement-position macros (`call_seq!(...);`) via `visit_stmt_macro`.
+- The compiler validates callees against discovery: unknown tile names in `call!` or unknown sequence names in `call_seq!` produce `error[raster]` diagnostics on stderr and are excluded from the CFS.
+- `result_binding = Some(name)` is set only when the call is the direct initializer in `let name = call!(...);` (identifier patterns only; destructuring is not supported).
 - Arguments are captured as stringified token representations of each argument expression.
+
+**Bare function calls are not extracted.** Only `call!` and `call_seq!` macro invocations are recognized as step boundaries. Bare calls (e.g., `greet(name)`) in sequence bodies are ignored by the compiler and will not appear in the CFS.
 
 ## Lowering rules (discovery/resolved IR → CFS)
 
@@ -202,10 +192,7 @@ For each recorded call (from `FunctionAstItem.call_infos`):
 
 - If `call_kind == Tile` (from `call!` macro): `item_type` MUST be `"tile"`. No name-matching required.
 - If `call_kind == Sequence` (from `call_seq!` macro): `item_type` MUST be `"sequence"`. No name-matching required.
-- If `call_kind == Bare`: fall back to name-based discovery matching:
-  - If `callee` matches a known discovered tile ID → `"tile"`.
-  - Else if `callee` matches a known discovered sequence ID → `"sequence"`.
-  - Else the call is excluded from CFS output (it is not classified as a tile or sequence step).
+If the callee is not found in discovery (unknown tile or unknown sequence), the call is excluded from CFS output and an `error[raster]` diagnostic is emitted.
 
 ### Dataflow resolution (argument binding)
 

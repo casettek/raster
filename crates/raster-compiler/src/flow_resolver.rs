@@ -50,10 +50,8 @@ impl<'a, 'ast> FlowResolver<'a, 'ast> {
 
         let mut items = Vec::new();
 
-        // Filter call_infos to only include tile/sequence calls.
-        // For canonical call!/call_seq! invocations, validate the callee against discovery
-        // and emit an error for unknown callees (excluding them from the CFS).
-        // For bare calls, fall back to matching against known tiles/sequences.
+        // Filter call_infos to only include valid canonical call!/call_seq! invocations.
+        // Validate the callee against discovery and emit an error for unknown callees.
         let relevant_calls: Vec<&CallInfo> = sequence
             .function
             .call_infos
@@ -85,17 +83,13 @@ impl<'a, 'ast> FlowResolver<'a, 'ast> {
                         true
                     }
                 }
-                CallKind::Bare => self.is_tile(&call.callee) || self.is_sequence(&call.callee),
             })
             .collect();
 
         for (item_index, call) in relevant_calls.iter().enumerate() {
             let input_sources = self.resolve_call_inputs(call);
 
-            // Determine if this is a tile or nested sequence.
-            // Canonical call!/call_seq! declarations take priority over discovery matching,
-            // which prevents misclassification when callee names overlap.
-            // Unknown callees are already filtered out above.
+            // Call kind directly determines item type — no name-matching needed.
             let item = match call.call_kind {
                 CallKind::Tile => SequenceChild::Tile(TileItem {
                     id: call.callee.clone(),
@@ -105,24 +99,6 @@ impl<'a, 'ast> FlowResolver<'a, 'ast> {
                     id: call.callee.clone(),
                     sources: input_sources,
                 }),
-                CallKind::Bare => {
-                    if self.is_tile(&call.callee) {
-                        SequenceChild::Tile(TileItem {
-                            id: call.callee.clone(),
-                            sources: input_sources,
-                        })
-                    } else if self.is_sequence(&call.callee) {
-                        SequenceChild::Sequence(SequenceItem {
-                            id: call.callee.clone(),
-                            sources: input_sources,
-                        })
-                    } else {
-                        unreachable!(
-                            "Bare call `{}` passed the filter but is neither a tile nor a sequence",
-                            call.callee
-                        )
-                    }
-                }
             };
 
             items.push(item);
@@ -286,13 +262,13 @@ mod tests {
                     callee: "greet".to_string(),
                     result_binding: Some("greeting".to_string()),
                     arguments: vec!["name".to_string()],
-                    call_kind: CallKind::Bare,
+                    call_kind: CallKind::Tile,
                 },
                 CallInfo {
                     callee: "exclaim".to_string(),
                     result_binding: None,
                     arguments: vec!["greeting".to_string()],
-                    call_kind: CallKind::Bare,
+                    call_kind: CallKind::Tile,
                 },
             ],
         );

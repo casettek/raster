@@ -2,8 +2,8 @@ use cargo_toml::Manifest;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use syn::{
-    parse_file, visit::Visit, Attribute, Expr, ExprCall, ExprLit, ExprMacro, FnArg, Lit, Local,
-    Meta, Pat, StmtMacro,
+    parse_file, visit::Visit, Attribute, Expr, ExprLit, ExprMacro, FnArg, Lit, Local, Meta, Pat,
+    StmtMacro,
 };
 use walkdir::WalkDir;
 
@@ -16,16 +16,16 @@ pub struct ProjectAst {
     pub functions: Vec<FunctionAstItem>,
 }
 
-/// Indicates whether a call was made via `call!` (tile) or `call_seq!` (sequence),
-/// or via a bare function call (kind unknown from syntax alone).
+/// Indicates whether a call was made via `call!` (tile) or `call_seq!` (sequence).
+///
+/// Only canonical call primitives are recognized by the compiler. Bare function calls
+/// in sequence bodies are not extracted — authors must use `call!` or `call_seq!`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CallKind {
     /// Invoked via `call!(tile_fn, args...)` — caller declares this is a tile step.
     Tile,
     /// Invoked via `call_seq!(seq_fn, args...)` — caller declares this is a sequence call.
     Sequence,
-    /// Bare function call — kind is inferred by matching against known tiles/sequences.
-    Bare,
 }
 
 /// Captures detailed information about a function call within a function body.
@@ -353,35 +353,9 @@ impl<'ast> Visit<'ast> for CallVisitor {
         syn::visit::visit_stmt_macro(self, node);
     }
 
-    fn visit_expr_call(&mut self, node: &'ast ExprCall) {
-        if let Expr::Path(path) = &*node.func {
-            if let Some(ident) = path.path.get_ident() {
-                let callee = ident.to_string();
-
-                // Capture all arguments as string representations
-                let arguments: Vec<String> = node
-                    .args
-                    .iter()
-                    .map(|arg| Self::expr_to_string(arg))
-                    .collect();
-
-                // Take the current binding if this is a direct call in a let statement
-                let result_binding = self.current_binding.take();
-
-                self.call_infos.push(CallInfo {
-                    callee,
-                    arguments,
-                    result_binding,
-                    call_kind: CallKind::Bare,
-                });
-            }
-        }
-
-        // Continue visiting nested calls (but clear binding context for nested calls)
-        let saved_binding = self.current_binding.take();
-        syn::visit::visit_expr_call(self, node);
-        self.current_binding = saved_binding;
-    }
+    // Note: visit_expr_call is intentionally NOT overridden. Bare function calls
+    // (e.g. `greet(name)`) are not extracted — only canonical `call!` and `call_seq!`
+    // macro invocations are recognized as step boundaries in sequences.
 }
 
 #[cfg(test)]
@@ -397,12 +371,10 @@ mod tests {
     }
 
     #[test]
-    fn test_bare_call_extraction() {
+    fn test_bare_call_not_extracted() {
+        // Bare function calls (without call!/call_seq!) must NOT be extracted.
         let calls = parse_calls("fn seq() { let x = greet(name); }");
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].callee, "greet");
-        assert_eq!(calls[0].call_kind, CallKind::Bare);
-        assert_eq!(calls[0].result_binding.as_deref(), Some("x"));
+        assert_eq!(calls.len(), 0);
     }
 
     #[test]
