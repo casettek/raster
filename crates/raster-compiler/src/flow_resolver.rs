@@ -50,40 +50,24 @@ impl<'a, 'ast> FlowResolver<'a, 'ast> {
 
         let mut items = Vec::new();
 
-        // Filter call_infos to only include valid canonical call!/call_seq! invocations.
-        // Validate the callee against discovery and emit an error for unknown callees.
+        // Collect call_infos that correspond to validated sequence steps.
+        // Unknown callees are already rejected and diagnosed by SequenceDiscovery::extract_sequence
+        // (in sequence.rs) — only validated calls survive into sequence.steps and reach the resolver.
+        // We filter by step membership here to stay in sync with what discovery accepted.
+        let step_callees: Vec<&str> = sequence
+            .steps
+            .iter()
+            .map(|step| match step {
+                crate::sequence::SequenceStep::Tile(tile) => tile.function.name.as_str(),
+                crate::sequence::SequenceStep::Sequence(name) => name.as_str(),
+            })
+            .collect();
+
         let relevant_calls: Vec<&CallInfo> = sequence
             .function
             .call_infos
             .iter()
-            .filter(|call| match call.call_kind {
-                CallKind::Tile => {
-                    if !self.is_tile(&call.callee) {
-                        eprintln!(
-                            "error[raster]: `call!` in sequence `{}` refers to unknown tile `{}`; \
-                             it is not registered in tile discovery. \
-                             Check the spelling or ensure `#[tile]` is applied.",
-                            sequence.function.name, call.callee
-                        );
-                        false
-                    } else {
-                        true
-                    }
-                }
-                CallKind::Sequence => {
-                    if !self.is_sequence(&call.callee) {
-                        eprintln!(
-                            "error[raster]: `call_seq!` in sequence `{}` refers to unknown sequence `{}`; \
-                             it is not registered in sequence discovery. \
-                             Check the spelling or ensure `#[sequence]` is applied.",
-                            sequence.function.name, call.callee
-                        );
-                        false
-                    } else {
-                        true
-                    }
-                }
-            })
+            .filter(|call| step_callees.contains(&call.callee.as_str()))
             .collect();
 
         for (item_index, call) in relevant_calls.iter().enumerate() {
@@ -140,16 +124,6 @@ impl<'a, 'ast> FlowResolver<'a, 'ast> {
         // For now, we'll use external as a fallback
         // In a more complete implementation, we might want to handle this differently
         InputBinding::new(InputSource::External)
-    }
-
-    /// Check if a callee name is a known tile.
-    fn is_tile(&self, name: &str) -> bool {
-        self.tile_discovery.contains(name)
-    }
-
-    /// Check if a callee name is a known sequence.
-    fn is_sequence(&self, name: &str) -> bool {
-        self.sequence_discovery.get(name).is_some()
     }
 }
 

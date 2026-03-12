@@ -475,4 +475,22 @@ mod tests {
         assert_eq!(calls[2].call_kind, CallKind::Sequence);
         assert_eq!(calls[2].result_binding.as_deref(), Some("_result"));
     }
+
+    #[test]
+    fn test_qualified_call_macro_extraction() {
+        let calls = parse_calls("fn seq() { let x = raster::call!(greet, name); }");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].callee, "greet");
+        assert_eq!(calls[0].call_kind, CallKind::Tile);
+        assert_eq!(calls[0].result_binding.as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn test_qualified_call_seq_macro_extraction() {
+        let calls = parse_calls("fn seq() { let x = raster::call_seq!(wish_seq, name); }");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].callee, "wish_seq");
+        assert_eq!(calls[0].call_kind, CallKind::Sequence);
+        assert_eq!(calls[0].result_binding.as_deref(), Some("x"));
+    }
 }
