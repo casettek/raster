@@ -8,12 +8,11 @@
 use std::cmp::Ordering;
 
 use bridgetree::{Hashable, Level, NonEmptyFrontier, Position};
-use raster_core::cfs::ControlFlowSchema;
 use risc0_zkvm::guest::env;
 
+use raster_core::cfs::{CfsCoordinates, CfsCursor, ControlFlowSchema};
 use raster_core::fingerprint::{Fingerprint, FingerprintAccumulator};
-
-use raster_core::trace::{StepRecord, TileExecRecord};
+use raster_core::trace::StepRecord;
 
 use serde::{Deserialize, Serialize};
 
@@ -45,6 +44,7 @@ pub struct TransitionInput {
 pub struct Transition {
     pub frontier: SerializableFrontier,
     pub actual_fingerprint_acc: FingerprintAccumulator,
+    pub expected_next_coordinates: Vec<CfsCoordinates>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -53,7 +53,10 @@ pub struct InitTransition {
     pub fingerprint: Fingerprint,
     // TODO: Init Transition should verify proof of inclusion of reference fingerprint
     // pub ref_fingerprint_inclusion_proof: Vec<u8>,
+    //
     // TODO: Init Transition should contain reference to CFS
+    // This should happen in init transition to make sure that all element of window are verified
+    // against same CFS
     // pub cfs: ControlFlowSchema,
 }
 
@@ -157,10 +160,13 @@ fn hash_trace_item(item: &StepRecord) -> Vec<u8> {
 // Main
 // ============================================================================
 fn main() {
+    let cfs: ControlFlowSchema = env::read();
     let self_image_id: Vec<u8> = env::read();
 
     let input: TransitionInput = env::read();
     let state: TransitionState = env::read();
+
+    let cfs_cursor = CfsCursor::new(cfs);
 
     match state {
         TransitionState::Init(init_transition) => {
@@ -169,6 +175,7 @@ fn main() {
                 .to_frontier()
                 .expect("Invalid frontier in input");
 
+            let mut expected_next_coordinates: Vec<CfsCoordinates> = Vec::new();
             match &input.step_record {
                 StepRecord::TileExec(tile_exec_record) => {
                     let replay_image_id = input
@@ -182,9 +189,21 @@ fn main() {
                         &tile_exec_record.fn_call_record.output_data,
                     )
                     .expect("Failed to verify trace replay image id");
+
+                    expected_next_coordinates = cfs_cursor
+                        .try_get_next_coordinates(&tile_exec_record.coordinates)
+                        .expect("Wrong tile coordinates");
                 }
-                StepRecord::SequenceStart(seq_start_record) => {}
-                StepRecord::SequenceEnd(seq_end_record) => {}
+                StepRecord::SequenceStart(seq_start_record) => {
+                    expected_next_coordinates = cfs_cursor
+                        .try_get_next_coordinates(&seq_start_record.sequence_coordinates)
+                        .expect("Wrong tile coordinates");
+                }
+                StepRecord::SequenceEnd(seq_end_record) => {
+                    expected_next_coordinates = cfs_cursor
+                        .try_get_next_coordinates(&seq_end_record.sequence_coordinates)
+                        .expect("Wrong tile coordinates");
+                }
             }
 
             let item_hash = hash_trace_item(&input.step_record);
@@ -204,6 +223,7 @@ fn main() {
             let current_state = TransitionState::Next(Transition {
                 frontier: new_frontier,
                 actual_fingerprint_acc,
+                expected_next_coordinates,
             });
 
             let journal = TransitionJournal {
@@ -244,6 +264,7 @@ fn main() {
                 .to_frontier()
                 .expect("Invalid frontier in input");
 
+            let mut expected_next_coordinates = transition.expected_next_coordinates;
             match &input.step_record {
                 StepRecord::TileExec(tile_exec_record) => {
                     let replay_image_id = input
@@ -259,9 +280,28 @@ fn main() {
                         &tile_exec_record.fn_call_record.output_data,
                     )
                     .expect("Failed to verify trace replay image id");
+
+                    assert!(expected_next_coordinates.contains(&tile_exec_record.coordinates));
+                    expected_next_coordinates = cfs_cursor
+                        .try_get_next_coordinates(&tile_exec_record.coordinates)
+                        .expect("Wrong tile coordinates");
                 }
-                StepRecord::SequenceStart(seq_start_record) => {}
-                StepRecord::SequenceEnd(seq_end_record) => {}
+                StepRecord::SequenceStart(seq_start_record) => {
+                    assert!(
+                        expected_next_coordinates.contains(&seq_start_record.sequence_coordinates)
+                    );
+                    expected_next_coordinates = cfs_cursor
+                        .try_get_next_coordinates(&seq_start_record.sequence_coordinates)
+                        .expect("Wrong tile coordinates");
+                }
+                StepRecord::SequenceEnd(seq_end_record) => {
+                    assert!(
+                        expected_next_coordinates.contains(&seq_end_record.sequence_coordinates)
+                    );
+                    expected_next_coordinates = cfs_cursor
+                        .try_get_next_coordinates(&seq_end_record.sequence_coordinates)
+                        .expect("Wrong tile coordinates");
+                }
             }
 
             let item_hash = hash_trace_item(&input.step_record);
@@ -296,6 +336,7 @@ fn main() {
                     TransitionState::Next(Transition {
                         frontier: new_frontier,
                         actual_fingerprint_acc: FingerprintAccumulator::from(actual_fingerprint),
+                        expected_next_coordinates,
                     })
                 };
             let journal = TransitionJournal {

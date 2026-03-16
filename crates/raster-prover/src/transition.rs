@@ -8,6 +8,7 @@
 //! The types in this module are designed to be serialization-compatible with
 //! the types used in the RISC0 guest program.
 
+use raster_core::cfs::{CfsCoordinates, ControlFlowSchema};
 use serde::{Deserialize, Serialize};
 
 use raster_core::fingerprint::{BitPacker, Fingerprint, FingerprintAccumulator};
@@ -29,6 +30,7 @@ pub struct TransitionInput {
 pub struct Transition {
     pub frontier: SerializableFrontier,
     pub actual_fingerprint_acc: FingerprintAccumulator,
+    pub expected_next_coordinates: Vec<CfsCoordinates>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,9 +77,11 @@ pub fn step_transitions(
     initial_frontier: &SerializableFrontier,
     trace_window: &[StepRecord],
     fingerprint: Fingerprint,
+    cfs: &ControlFlowSchema,
     replayed_results: &std::collections::BTreeMap<String, ReplayResult>,
 ) -> Option<risc0_zkvm::Receipt> {
     let prover = risc0_zkvm::default_prover();
+    let cfs = cfs.clone();
 
     let init_transition = InitTransition {
         init_frontier: initial_frontier.clone(),
@@ -97,8 +101,9 @@ pub fn step_transitions(
 
     for step_record in trace_window {
         match step_record {
-            StepRecord::TileExec(item) => {
-                let Some(replay_result) = replayed_results.get(&item.fn_call_record.fn_name) else {
+            StepRecord::TileExec(record) => {
+                let Some(replay_result) = replayed_results.get(&record.fn_call_record.fn_name)
+                else {
                     panic!("Replayed IMAGE ID not found");
                 };
                 // Create the input for this transition with fingerprint data
@@ -119,6 +124,8 @@ pub fn step_transitions(
                     risc0_zkvm::ExecutorEnv::builder()
                         .add_assumption(replay_receipt)
                         .add_assumption(transition_receipt)
+                        .write(&cfs)
+                        .unwrap()
                         .write(&self_image_id)
                         .unwrap()
                         .write(&input)
@@ -132,6 +139,8 @@ pub fn step_transitions(
                 } else {
                     risc0_zkvm::ExecutorEnv::builder()
                         .add_assumption(replay_receipt)
+                        .write(&cfs)
+                        .unwrap()
                         .write(&self_image_id)
                         .unwrap()
                         .write(&input)
@@ -150,7 +159,7 @@ pub fn step_transitions(
                 current_journal = Some(journal.clone());
                 current_state = journal.current_state.clone();
             }
-            StepRecord::SequenceStart(item) => {
+            StepRecord::SequenceStart(record) => {
                 let input = TransitionInput {
                     step_record: step_record.clone(),
                     replay_image_id: None,
@@ -163,6 +172,8 @@ pub fn step_transitions(
                     };
                     risc0_zkvm::ExecutorEnv::builder()
                         .add_assumption(transition_receipt)
+                        .write(&cfs)
+                        .unwrap()
                         .write(&self_image_id)
                         .unwrap()
                         .write(&input)
@@ -175,6 +186,8 @@ pub fn step_transitions(
                         .unwrap()
                 } else {
                     risc0_zkvm::ExecutorEnv::builder()
+                        .write(&cfs)
+                        .unwrap()
                         .write(&self_image_id)
                         .unwrap()
                         .write(&input)
@@ -206,6 +219,8 @@ pub fn step_transitions(
                     };
                     risc0_zkvm::ExecutorEnv::builder()
                         .add_assumption(transition_receipt)
+                        .write(&cfs)
+                        .unwrap()
                         .write(&self_image_id)
                         .unwrap()
                         .write(&input)
@@ -218,6 +233,8 @@ pub fn step_transitions(
                         .unwrap()
                 } else {
                     risc0_zkvm::ExecutorEnv::builder()
+                        .write(&cfs)
+                        .unwrap()
                         .write(&self_image_id)
                         .unwrap()
                         .write(&input)

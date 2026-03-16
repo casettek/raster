@@ -1,7 +1,7 @@
 //! Run command: build and execute the user program as a whole.
 
 use raster_backend::backend::HexString;
-use raster_core::cfs::{CfsCoordinates, CfsCursor};
+use raster_core::cfs::{CfsCoordinates, CfsCursor, ControlFlowSchema};
 use rayon::prelude::*;
 
 use std::collections::{BTreeMap, HashMap};
@@ -244,7 +244,7 @@ pub fn run(
             VerificationResult::Ok => println!("Verification Success"),
             VerificationResult::Fraud(fraud_window) => {
                 let replayer = Replayer::new(&backend, &project);
-                let _fraud_proof = prove(fraud_window, &replayer);
+                let _fraud_proof = prove(fraud_window, &cfs, &replayer);
                 println!("Faurd proof generated");
             }
         }
@@ -345,15 +345,18 @@ pub fn verify(trace: &Trace, commit_path: &str) -> VerificationResult {
     VerificationResult::Ok
 }
 
-pub fn prove(fraud_window: TraceWindow, replayer: &Replayer) -> risc0_zkvm::Receipt {
+pub fn prove(
+    fraud_window: TraceWindow,
+    cfs: &ControlFlowSchema,
+    replayer: &Replayer,
+) -> risc0_zkvm::Receipt {
     let mode = ExecutionMode::prove_and_verify();
 
     let mut replayed_results: BTreeMap<String, ReplayResult> = BTreeMap::new();
 
     for (i, step_record) in fraud_window.items.iter().enumerate() {
-        println!("prove: {:?}", step_record);
-        match step_record {
-            StepRecord::TileExec(tile_exec) => match replayer.replay(tile_exec, mode) {
+        if let StepRecord::TileExec(tile_exec) = step_record {
+            match replayer.replay(tile_exec, mode) {
                 Ok(replay_result) => {
                     replayed_results.insert(
                         tile_exec.fn_call_record.fn_name.clone(),
@@ -361,14 +364,8 @@ pub fn prove(fraud_window: TraceWindow, replayer: &Replayer) -> risc0_zkvm::Rece
                     );
                 }
                 Err(e) => {
-                    println!("FAILED: {}", e);
+                    println!("FAILED to replay: {}", e);
                 }
-            },
-            StepRecord::SequenceEnd(item) => {
-                println!("SequenceEnd proove")
-            }
-            StepRecord::SequenceStart(item) => {
-                println!("SequenceStart proove")
             }
         }
     }
@@ -381,6 +378,7 @@ pub fn prove(fraud_window: TraceWindow, replayer: &Replayer) -> risc0_zkvm::Rece
             &frontier,
             &fraud_window.items,
             fraud_window.fingerprint,
+            &cfs,
             &replayed_results,
         ) else {
             panic!("Failed to generate fraud proof");

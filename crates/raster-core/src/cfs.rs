@@ -482,21 +482,17 @@ impl InputBinding {
 
 /// Source of an input value in the data flow schema.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
 pub enum InputSource {
     /// Input comes from outside the sequence (runtime-provided).
-    #[serde(rename = "external")]
     External,
 
     /// Input comes from one of the sequence's declared inputs.
-    #[serde(rename = "seq_input")]
     SeqInput {
         /// Index of the sequence input (0-based).
         input_index: usize,
     },
 
     /// Input comes from a previous item's output.
-    #[serde(rename = "item_output")]
     ItemOutput {
         /// Index of the item in the sequence (0-based).
         item_index: usize,
