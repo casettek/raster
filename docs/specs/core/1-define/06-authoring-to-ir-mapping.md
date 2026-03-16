@@ -80,6 +80,8 @@ Discovery IR is produced by parsing the project’s `src/` directory recursively
   - `arguments: Vec<String>` (stringified tokens per argument expression)
   - `result_binding: Option<String>` (only for `let name = callee(...);` with identifier patterns)
 
+The order of `call_infos` follows **execution order**: argument and nested calls are recorded before the call that uses them (e.g. for `current_wish(raster_wish(name))`, `raster_wish` is recorded before `current_wish`). This is achieved by `CallVisitor` visiting argument expressions before recording the current call.
+
 From that AST, the compiler derives two “discovery views”:
 
 - **Tiles**: `TileDiscovery` produces `Tile<'ast>` records with:
@@ -210,7 +212,7 @@ To ensure reproducible outputs, a canonicalized CFS SHOULD be derived with:
 
 - `cfs.tiles` sorted lexicographically by `TileDef.id`
 - `cfs.sequences` sorted lexicographically by `SequenceDef.id`
-- within each sequence, `SequenceDef.items` MUST preserve the authoring order (left-to-right within the sequence body)
+- within each sequence, `SequenceDef.items` MUST preserve execution order (argument/nested calls before the call that uses them, as given by `call_infos`)
 - within each item, `input_sources` MUST preserve the argument order of the call
 
 ### Current implementation behavior (non-canonical)

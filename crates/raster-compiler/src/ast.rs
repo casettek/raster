@@ -2,14 +2,11 @@ use cargo_toml::Manifest;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use syn::{
-    parse_file,
-    visit::Visit,
-    Attribute, Expr, ExprCall, ExprLit, FnArg, Lit, Local, Meta, Pat,
+    parse_file, visit::Visit, Attribute, Expr, ExprCall, ExprLit, FnArg, Lit, Local, Meta, Pat,
 };
 use walkdir::WalkDir;
 
 use raster_core::Result;
-
 
 #[derive(Debug, Clone)]
 pub struct ProjectAst {
@@ -97,7 +94,6 @@ impl ProjectAst {
 
         for item in &ast.items {
             if let syn::Item::Fn(func) = item {
-                
                 let name = func.sig.ident.to_string();
 
                 let macros: Vec<MacroAstItem> = func
@@ -242,32 +238,27 @@ impl CallVisitor {
 
 impl<'ast> Visit<'ast> for CallVisitor {
     fn visit_local(&mut self, node: &'ast Local) {
-        // Extract the binding name from the let pattern
         let binding_name = Self::extract_binding_name(&node.pat);
-        
-        // Set the current binding context before visiting the initializer
+
         self.current_binding = binding_name;
-        
-        // Visit the initializer expression (this will trigger visit_expr_call if there's a call)
+
         if let Some(init) = &node.init {
             self.visit_expr(&init.expr);
         }
-        
-        // Clear the binding context after processing
+
         self.current_binding = None;
     }
 
     fn visit_expr_call(&mut self, node: &'ast ExprCall) {
+        let saved_binding = self.current_binding.take();
+        syn::visit::visit_expr_call(self, node);
+        self.current_binding = saved_binding;
+
         if let Expr::Path(path) = &*node.func {
             if let Some(ident) = path.path.get_ident() {
                 let callee = ident.to_string();
 
-                // Capture all arguments as string representations
-                let arguments: Vec<String> = node
-                    .args
-                    .iter()
-                    .map(|arg| Self::expr_to_string(arg))
-                    .collect();
+                let arguments: Vec<String> = node.args.iter().map(Self::expr_to_string).collect();
 
                 // Take the current binding if this is a direct call in a let statement
                 let result_binding = self.current_binding.take();
@@ -279,10 +270,5 @@ impl<'ast> Visit<'ast> for CallVisitor {
                 });
             }
         }
-        
-        // Continue visiting nested calls (but clear binding context for nested calls)
-        let saved_binding = self.current_binding.take();
-        syn::visit::visit_expr_call(self, node);
-        self.current_binding = saved_binding;
     }
 }

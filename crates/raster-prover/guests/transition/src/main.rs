@@ -8,6 +8,7 @@
 use std::cmp::Ordering;
 
 use bridgetree::{Hashable, Level, NonEmptyFrontier, Position};
+use raster_core::cfs::ControlFlowSchema;
 use risc0_zkvm::guest::env;
 
 use raster_core::fingerprint::{Fingerprint, FingerprintAccumulator};
@@ -53,7 +54,7 @@ pub struct InitTransition {
     // TODO: Init Transition should verify proof of inclusion of reference fingerprint
     // pub ref_fingerprint_inclusion_proof: Vec<u8>,
     // TODO: Init Transition should contain reference to CFS
-    // pub cfs: Vec<u8>,
+    // pub cfs: ControlFlowSchema,
 }
 
 #[derive(Clone, Serialize, Deserialize)]

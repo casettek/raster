@@ -1,15 +1,22 @@
 //! Run command: build and execute the user program as a whole.
 
-use std::collections::BTreeMap;
+use raster_backend::backend::HexString;
+use raster_core::cfs::{CfsCoordinates, CfsCursor};
+use rayon::prelude::*;
+
+use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
+use std::thread;
 
-use raster_backend::ExecutionMode;
+use raster_backend::{Backend, ExecutionMode};
 use raster_backend_risc0::Risc0Backend;
+use raster_core::tile::TileId;
 
-use raster_compiler::Project;
+use raster_compiler::tile::TileDiscovery;
+use raster_compiler::{CfsBuilder, Project};
 
 use raster_core::trace::{SequenceStartRecord, StepRecord, TileExecRecord, Trace, TraceWindow};
 use raster_core::{Error, Result};
@@ -40,6 +47,12 @@ pub fn run(
 
     let project_path = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let project = Project::new(project_path).expect("Failed to read project");
+
+    println!("Control Flow Schema build..");
+    let cfs_builder = CfsBuilder::new(&project);
+    let cfs = cfs_builder
+        .build()
+        .map_err(|e| Error::Other(format!("Failed to build CFS: {}", e)))?;
 
     println!("Building project...");
 
@@ -167,6 +180,98 @@ pub fn run(
         .into_inner()
         .unwrap();
 
+    // Build all project tiles with Risc0
+    // TODO: Risc0 build can be perfomed in parallel to native user program execution
+
+    println!("Build Risc0 artifacts...");
+    let backend =
+        Risc0Backend::new(project.output_dir.clone()).with_user_crate(project.root_dir.clone());
+
+    let mut cfs_cursor = CfsCursor::new(cfs.clone());
+
+    let mut trace_coordinates: Vec<CfsCoordinates> = Vec::new();
+    let mut current_coordinates: CfsCoordinates;
+    for step_record in trace.iter() {
+        match step_record {
+            StepRecord::TileExec(tile_record) => {
+                println!("trace tile coordinates: {:?}", tile_record.coordinates);
+                println!("cfs coordinates: {:?}", cfs_cursor.coordinates());
+                current_coordinates = tile_record.coordinates.clone();
+
+                let next_coordinates_options =
+                    cfs_cursor.try_get_next_coordinates(&cfs_cursor.coordinates());
+                println!("next coordiates options: {:?}", next_coordinates_options);
+
+                if !cfs_cursor.is_next_coordinates(&current_coordinates) {
+                    panic!("Bad coordinate transition");
+                }
+                cfs_cursor.set_coordinates(current_coordinates);
+
+                trace_coordinates.push(tile_record.coordinates.clone());
+            }
+            StepRecord::SequenceEnd(sequence_end_record) => {
+                println!(
+                    "trace sequence end coordinates: {:?}",
+                    sequence_end_record.sequence_coordinates
+                );
+                println!("cfs coordinates: {:?}", cfs_cursor.coordinates());
+                current_coordinates = sequence_end_record.sequence_coordinates.clone();
+
+                let next_coordinates_options =
+                    cfs_cursor.try_get_next_coordinates(&cfs_cursor.coordinates());
+                println!("next coordiates options: {:?}", next_coordinates_options);
+
+                if !cfs_cursor.is_next_coordinates(&current_coordinates) {
+                    panic!("Bad coordinate transition");
+                }
+                cfs_cursor.set_coordinates(current_coordinates);
+
+                trace_coordinates.push(sequence_end_record.sequence_coordinates.clone());
+            }
+            StepRecord::SequenceStart(sequence_start_record) => {
+                println!(
+                    "trace sequence start coordinates: {:?}",
+                    sequence_start_record.sequence_coordinates
+                );
+                println!("cfs coordinates: {:?}", cfs_cursor.coordinates());
+
+                current_coordinates = sequence_start_record.sequence_coordinates.clone();
+
+                let next_coordinates_options =
+                    cfs_cursor.try_get_next_coordinates(&cfs_cursor.coordinates());
+                println!("next coordiates options: {:?}", next_coordinates_options);
+
+                if !cfs_cursor.is_next_coordinates(&current_coordinates) {
+                    panic!("Bad coordinate transition");
+                }
+                cfs_cursor.set_coordinates(current_coordinates);
+
+                trace_coordinates.push(sequence_start_record.sequence_coordinates.clone());
+            }
+        }
+        println!("");
+    }
+
+    // let tiles_discovery = TileDiscovery::new(&project);
+    // let tiles = tiles_discovery.tiles;
+    //
+    // let artifact_registry: HashMap<TileId, HexString> = tiles
+    //     .into_par_iter()
+    //     .map(|tile| {
+    //         let tile_metadata = tile.to_metadata();
+    //         let content_hash = tile.to_content_hash();
+    //
+    //         let artifact = backend.compile_tile(&tile_metadata, content_hash).unwrap();
+    //
+    //         // Return a tuple of (Key, Value)
+    //         (tile_metadata.id, artifact.artifact_id())
+    //     })
+    //     .collect();
+    //
+    // for (tile_id, image_id) in &artifact_registry {
+    //     println!("Registered: {:?}", tile_id);
+    // }
+
     if commit_flag.is_some() {
         let commit_path = commit_flag.expect("Commitment path was provided");
 
@@ -185,9 +290,6 @@ pub fn run(
         match verification_result {
             VerificationResult::Ok => println!("Verification Success"),
             VerificationResult::Fraud(fraud_window) => {
-                let backend = Risc0Backend::new(project.output_dir.clone())
-                    .with_user_crate(project.root_dir.clone());
-
                 let replayer = Replayer::new(&backend, &project);
                 let _fraud_proof = prove(fraud_window, &replayer);
                 println!("Faurd proof generated");
@@ -200,35 +302,30 @@ pub fn run(
         for step_record in trace {
             match step_record {
                 StepRecord::TileExec(tile_exec_record) => {
-                    let padding = "\t".repeat(
-                        tile_exec_record
-                            .sequence_callstack_depth
-                            .try_into()
-                            .unwrap(),
-                    ) + "[tile exec] ";
+                    println!("\nexec_index: {}", tile_exec_record.exec_index);
+                    println!("sequence_id: {}", tile_exec_record.sequence_id);
+                    println!("tile_coordinates: {:?}", tile_exec_record.coordinates,);
 
-                    println!("\n{padding}exec_index: {}", tile_exec_record.exec_index);
-                    println!("{padding}sequence_id: {}", tile_exec_record.sequence_id);
-                    println!(
-                        "{padding}sequence_coordinates: {:?}",
-                        tile_exec_record.sequence_coordinates,
-                    );
-
-                    println!(
-                        "{padding}tile_id: {}",
-                        tile_exec_record.fn_call_record.fn_name
-                    );
+                    println!("tile_id: {}", tile_exec_record.fn_call_record.fn_name);
                 }
                 StepRecord::SequenceStart(sequence_start_record) => {
                     println!(
                         "[sequence start] sequence id: {}",
                         sequence_start_record.sequence_id
                     );
+                    println!(
+                        "sequence coordinates: {:?}",
+                        sequence_start_record.sequence_coordinates
+                    );
                 }
                 StepRecord::SequenceEnd(sequence_end_record) => {
                     println!(
                         "[sequence end] sequence id: {}",
                         sequence_end_record.sequence_id
+                    );
+                    println!(
+                        "sequence coordinates: {:?}",
+                        sequence_end_record.sequence_coordinates
                     );
                 }
             }
@@ -314,8 +411,12 @@ pub fn prove(fraud_window: TraceWindow, replayer: &Replayer) -> risc0_zkvm::Rece
                     println!("FAILED: {}", e);
                 }
             },
-            StepRecord::SequenceEnd(item) => {}
-            StepRecord::SequenceStart(item) => {}
+            StepRecord::SequenceEnd(item) => {
+                println!("SequenceEnd proove")
+            }
+            StepRecord::SequenceStart(item) => {
+                println!("SequenceStart proove")
+            }
         }
     }
 

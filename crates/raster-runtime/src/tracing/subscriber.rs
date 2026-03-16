@@ -1,6 +1,6 @@
 use raster_compiler::cfs_builder::CfsResolver;
 use raster_compiler::{sequence, CfsBuilder, Project};
-use raster_core::cfs::CfsCoordinates;
+use raster_core::cfs::{CfsCoordinates, CfsCursor, SequenceChildId};
 use raster_core::trace::{TileExecRecord, TraceEvent};
 
 use std::path::PathBuf;
@@ -28,47 +28,40 @@ pub type SequenceId = String;
 #[derive(Debug, Clone)]
 pub struct SequenceCallstack {
     callstack: VecDeque<SequenceExecutionState>,
-    cfs_resolver: CfsResolver,
     current_sequence_coordinates: CfsCoordinates,
 }
 
 #[derive(Debug, Clone)]
 pub struct SequenceExecutionState {
     id: SequenceId,
-    current_index: u64,
-    current_sequence_index: u64,
+    current_index: u32,
 }
 
 impl SequenceCallstack {
-    fn new(cfs_resolver: CfsResolver) -> Self {
+    fn new() -> Self {
         SequenceCallstack {
             callstack: VecDeque::new(),
             current_sequence_coordinates: CfsCoordinates(vec![]),
-            cfs_resolver,
         }
     }
 
-    fn push(&mut self, sequence_id: SequenceId) {
-        let parent_child_sequence_index = self
+    fn push(&mut self, sequence_id: SequenceId, cfs_cursor: &CfsCursor) {
+        let parent_current_index = self
             .callstack
             .back()
-            .map(|p| {
-                p.current_sequence_index
-                    .try_into()
-                    .expect("Index too large")
-            })
+            .map(|p| p.current_index.try_into().expect("Index too large"))
             .unwrap_or(0);
 
         let parent_sequence_coords = self.current_sequence_coordinates.clone();
 
-        self.current_sequence_coordinates = self.cfs_resolver.get_coordinates(
+        self.current_sequence_coordinates = cfs_cursor.get_child_coordinates(
             &parent_sequence_coords,
-            sequence_id.clone(),
-            parent_child_sequence_index,
+            parent_current_index,
+            SequenceChildId::Sequence(sequence_id.clone()),
         );
 
         if let Some(parent) = self.callstack.back_mut() {
-            parent.current_sequence_index += 1;
+            parent.current_index += 1;
         } else {
             println!("[debug] push empty {sequence_id}");
         }
@@ -76,7 +69,6 @@ impl SequenceCallstack {
         let sequence_execution_state = SequenceExecutionState {
             id: sequence_id,
             current_index: 0,
-            current_sequence_index: 0,
         };
         self.callstack.push_back(sequence_execution_state);
     }
@@ -85,6 +77,7 @@ impl SequenceCallstack {
         let mut current_sequence_coordinates = self.current_sequence_coordinates.clone();
 
         let mut parent_sequence_coordinates = VecDeque::from(current_sequence_coordinates.0);
+
         parent_sequence_coordinates.pop_back();
         self.current_sequence_coordinates = CfsCoordinates(parent_sequence_coordinates.into());
 
@@ -113,6 +106,7 @@ pub struct ExecutionSubscriber<W: Write + Send> {
     writer: Mutex<W>,
     exec_index: Mutex<u64>,
     sequence_callstack: Mutex<SequenceCallstack>,
+    cfs_cursor: Mutex<CfsCursor>,
 }
 
 impl<W: Write + Send> ExecutionSubscriber<W> {
@@ -124,12 +118,13 @@ impl<W: Write + Send> ExecutionSubscriber<W> {
         let cfs = CfsBuilder::new(&project)
             .build()
             .expect("Failed to build CFS");
-        let cfs_resolver = CfsResolver::new(cfs);
+        let cfs_cursor = CfsCursor::new(cfs);
 
         Self {
             writer: Mutex::new(writer),
             exec_index: Mutex::new(0),
-            sequence_callstack: Mutex::new(SequenceCallstack::new(cfs_resolver)),
+            sequence_callstack: Mutex::new(SequenceCallstack::new()),
+            cfs_cursor: Mutex::new(cfs_cursor),
         }
     }
 
@@ -142,17 +137,37 @@ impl<W: Write + Send> ExecutionSubscriber<W> {
 
 impl<W: Write + Send + Sync> Subscriber for ExecutionSubscriber<W> {
     fn on_trace(&self, event: TraceEvent) {
-        let mut callstack_guard = self
-            .sequence_callstack
-            .lock()
-            .expect("Callstack Mutex poisoned");
+        println!("[debug] on_trace ------------------------------------ ",);
+        println!("[debug] {:?}", event);
+
+        let mut exec_index_guard = self.exec_index.lock().expect("Mutex poisoned");
+        *exec_index_guard += 1;
+        let exec_index = *exec_index_guard;
+        drop(exec_index_guard);
 
         match event {
             TraceEvent::SequenceStart(trace_item) => {
-                println!("[debug] SequenceStart: {}", trace_item.fn_name);
-                callstack_guard.push(trace_item.fn_name.clone());
+                println!("[debug] TraceEvent::SequenceStart ---------------------- ");
+                let mut callstack_guard = self
+                    .sequence_callstack
+                    .lock()
+                    .expect("Callstack Mutex poisoned");
 
+                let cfs_cursor_guard = self.cfs_cursor.lock().unwrap();
+                callstack_guard.push(trace_item.fn_name.clone(), &cfs_cursor_guard);
+                drop(cfs_cursor_guard);
+
+                let sequence_coordinates = callstack_guard.current_sequence_coordinates.clone();
+                let current_sequence_state = callstack_guard
+                    .last_mut()
+                    .expect("Tile can't be called without sequence context");
+                let sequence_id = current_sequence_state.id.clone();
+                println!(
+                    "[debug] TraceEvent::SequenceStart parent sequence {}[{:?}]",
+                    sequence_id, sequence_coordinates
+                );
                 let sequence_start_record = StepRecord::SequenceStart(SequenceStartRecord {
+                    exec_index,
                     sequence_id: trace_item.fn_name.clone(),
                     sequence_coordinates: callstack_guard.current_sequence_coordinates.clone(),
                     inputs: trace_item.inputs,
@@ -160,14 +175,34 @@ impl<W: Write + Send + Sync> Subscriber for ExecutionSubscriber<W> {
                 });
 
                 drop(callstack_guard);
+
+                let mut callstack_guard = self
+                    .sequence_callstack
+                    .lock()
+                    .expect("Callstack Mutex poisoned");
+                if let Some(current_sequence_state) = callstack_guard.last() {
+                    println!(
+                        "[debug] TraceEvent::SequenceStart current new state : {:?}",
+                        current_sequence_state
+                    );
+                } else {
+                    println!("[debug] TraceEvent::SequenceStart no parent");
+                }
                 self.write_record(&sequence_start_record);
             }
             TraceEvent::SequenceEnd(trace_item) => {
-                println!("[debug] SequenceEnd: {}", trace_item.fn_name.clone());
+                println!("[debug] TraceEvent::SequenceEnd");
+                let mut callstack_guard = self
+                    .sequence_callstack
+                    .lock()
+                    .expect("Callstack Mutex poisoned");
+
+                let sequence_coordinates = callstack_guard.current_sequence_coordinates.clone();
 
                 let sequence_end_record = StepRecord::SequenceEnd(SequenceEndRecord {
+                    exec_index,
+                    sequence_coordinates,
                     sequence_id: trace_item.fn_name.clone(),
-                    sequence_coordinates: callstack_guard.current_sequence_coordinates.clone(),
                     output_type: trace_item.output_type,
                     output_data: trace_item.output_data,
                 });
@@ -178,29 +213,50 @@ impl<W: Write + Send + Sync> Subscriber for ExecutionSubscriber<W> {
                 self.write_record(&sequence_end_record);
             }
             TraceEvent::TileExec(trace_item) => {
+                println!("[debug] TraceEvent::TileExec");
+                let mut callstack_guard = self
+                    .sequence_callstack
+                    .lock()
+                    .expect("Callstack Mutex poisoned");
+
+                let sequence_coordinates = callstack_guard.current_sequence_coordinates.clone();
                 let current_sequence_state = callstack_guard
                     .last_mut()
                     .expect("Tile can't be called without sequence context");
 
-                current_sequence_state.current_index += 1;
-                let intra_sequence_index = current_sequence_state.current_index;
                 let sequence_id = current_sequence_state.id.clone();
-                let sequence_coordinates = callstack_guard.current_sequence_coordinates.clone();
-                let sequence_callstack_depth = (callstack_guard.len() as u64).saturating_sub(1);
+                println!(
+                    "[debug] TraceEvent::TileExec parent sequence {}[{:?}]",
+                    sequence_id, sequence_coordinates
+                );
+
+                let parent_current_index = current_sequence_state.current_index;
+
+                println!(
+                    "[debug] TraceEvent::TileExec parent current index: {}",
+                    parent_current_index
+                );
+                let cfs_cursor_guard = self.cfs_cursor.lock().unwrap();
+                let tile_coordinates = cfs_cursor_guard.get_child_coordinates(
+                    &sequence_coordinates,
+                    parent_current_index,
+                    SequenceChildId::Tile(trace_item.fn_name.clone()),
+                );
+
+                current_sequence_state.current_index += 1;
+
+                println!(
+                    "[debug] TraceEvent::TileExec parent new index: {}",
+                    current_sequence_state.current_index
+                );
 
                 drop(callstack_guard);
-
-                let mut exec_index_guard = self.exec_index.lock().expect("Mutex poisoned");
-                *exec_index_guard += 1;
-                let exec_index = *exec_index_guard;
-                drop(exec_index_guard);
 
                 let step_record = StepRecord::TileExec(TileExecRecord {
                     exec_index,
                     sequence_id,
-                    intra_sequence_index,
-                    sequence_coordinates,
-                    sequence_callstack_depth,
+                    intra_sequence_index: parent_current_index,
+                    coordinates: tile_coordinates,
                     fn_call_record: trace_item,
                 });
 

@@ -4,8 +4,8 @@
 //! by combining tile discovery, sequence discovery, and data flow resolution.
 
 use raster_core::cfs::{
-    CfsCoordinates, ControlFlowSchema, InputBinding, SequenceChild, SequenceDef, SequenceId,
-    TileDef,
+    CfsCoordinate, CfsCoordinates, ControlFlowSchema, InputBinding, SequenceChildId,
+    SequenceChildItem, SequenceDef, SequenceId, SequenceItem, TileDef,
 };
 
 use crate::flow_resolver::FlowResolver;
@@ -97,7 +97,26 @@ impl CfsResolver {
         CfsResolver { cfs }
     }
 
-    pub fn resolve(&self, coords: &CfsCoordinates) -> &SequenceDef {
+    pub fn resolve_next_item(
+        &self,
+        coords: &CfsCoordinates,
+        intra_sequence_index: Option<usize>,
+    ) -> SequenceChildItem {
+        let sequence_def = self.get_sequence(coords);
+
+        if let Some(intra_sequence_index) = intra_sequence_index {
+            let child = sequence_def
+                .items
+                .get(intra_sequence_index)
+                .expect("Sequence doesnt contain item");
+
+            return child.clone();
+        }
+
+        SequenceChildItem::Sequence(SequenceItem::from(sequence_def.clone()))
+    }
+
+    pub fn get_sequence(&self, coords: &CfsCoordinates) -> &SequenceDef {
         let (start_coord, rest_coords) = coords
             .0
             .split_first()
@@ -122,9 +141,9 @@ impl CfsResolver {
             let child_sequence_id = current_sequence
                 .items
                 .iter()
-                .filter_map(|item| match item {
-                    SequenceChild::Tile(_) => None,
-                    SequenceChild::Sequence(sequence) => Some(sequence.id.clone()),
+                .map(|item| match item {
+                    SequenceChildItem::Tile(tile) => tile.id.clone(),
+                    SequenceChildItem::Sequence(sequence) => sequence.id.clone(),
                 })
                 .nth(coord as usize)
                 .expect("Could not resolve sequence coordinates");
@@ -140,30 +159,28 @@ impl CfsResolver {
         current_sequence
     }
 
-    pub fn get_pos(&self, sequence_id: SequenceId) -> Option<usize> {
+    pub fn get_sequence_pos(&self, sequence_id: SequenceId) -> Option<usize> {
         self.cfs
             .sequences
             .iter()
             .position(|sequence| sequence.id == sequence_id)
     }
 
-    pub fn get_coordinates(
+    pub fn get_child_coordinates(
         &self,
         parent_coords: &CfsCoordinates,
-        sequence_id: SequenceId,
-        sequence_pos: u8,
+        parent_current_index: CfsCoordinate,
+
+        child_id: SequenceChildId,
     ) -> CfsCoordinates {
-        println!("[debug]CfsResolver::get_coordinates");
         if parent_coords.is_empty() {
-            println!("[debug]empty parent coords: {:?}", parent_coords);
-            println!("[debug]empty sequence_id: {:?}", sequence_id);
-            let main_entrypoint_pos = self
-                .get_pos(String::from("main"))
+            let entrypoint_sequence_pos = self
+                .get_sequence_pos(String::from("main"))
                 .expect("Missing main in cfs");
 
             let mut current_coords = parent_coords.clone();
             current_coords.push(
-                main_entrypoint_pos
+                entrypoint_sequence_pos
                     .try_into()
                     .expect("entrypoint coordinates not fit to u8"),
             );
@@ -171,53 +188,54 @@ impl CfsResolver {
             return current_coords;
         }
 
-        println!("[debug]parent_coords: {:?}", parent_coords);
-        println!("[debug]sequence_id: {:?}", sequence_id);
-
-        let parent_sequence = self.resolve(parent_coords);
+        let parent_sequence = self.get_sequence(parent_coords);
         println!(
-            "[debug] {} parent_sequence.items: {:?}",
-            parent_sequence.id,
-            parent_sequence
-                .sequences()
-                .iter()
-                .map(|seq| seq.id.clone())
-                .collect::<Vec<_>>()
+            "[debug] get coordinates of parent sequence {:?}",
+            parent_coords
         );
-        println!("[debug]sequence_id: {:?}", sequence_id);
+        println!("[debug] sequence {:?}", parent_sequence.id);
 
-        let sequence_coord = parent_sequence
-            .sequences()
+        let child_coord = parent_sequence
+            .items
             .iter()
             .enumerate()
-            .position(|(index, item)| item.id == sequence_id && index >= sequence_pos as usize)
+            .position(|(index, item)| {
+                let id = match item {
+                    SequenceChildItem::Sequence(sequence_item) => {
+                        SequenceChildId::Sequence(sequence_item.id.clone())
+                    }
+                    SequenceChildItem::Tile(tile_item) => {
+                        SequenceChildId::Tile(tile_item.id.clone())
+                    }
+                };
+                id == child_id && index >= parent_current_index as usize
+            })
             .unwrap_or_else(|| {
                 panic!(
-                    "Wrong coordinates for sequence '{}': [{} [{:?}] {:?}]",
-                    sequence_id,
+                    "Wrong coordinates for sequence child '{:?}[index: {}]': [{} [{:?}] {:?}]",
+                    child_id,
+                    parent_current_index,
                     parent_sequence.id,
                     parent_coords,
                     parent_sequence
-                        .sequences()
+                        .items
                         .iter()
-                        .map(|seq| seq.id.clone())
+                        .cloned()
+                        .map(|item| match item {
+                            SequenceChildItem::Sequence(item) => item.id,
+                            SequenceChildItem::Tile(item) => item.id,
+                        })
                         .collect::<Vec<_>>()
                 )
             });
 
-        println!("[debug]sequence_coord: {:?}", sequence_coord);
-
         let mut current_coords = parent_coords.clone();
         current_coords.push(
-            sequence_coord
+            child_coord
                 .try_into()
                 .expect("Sequence coordinate out ouf bound u8"),
         );
 
-        println!("[debug]current_coords: {:?}", current_coords);
-        println!("[debug]                                          ");
-        println!("[debug]                                          ");
-        println!("[debug]                                          ");
         current_coords
     }
 }

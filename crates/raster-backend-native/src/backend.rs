@@ -7,8 +7,8 @@
 //! and runs it with special arguments to execute a specific tile.
 
 use raster_backend::{
-    ArtifactStore, Backend, CompilationArtifact, ExecutionMode, ResourceEstimate,
-    TileExecutionResult,
+    backend::HexString, ArtifactStore, Backend, CompilationArtifact, ExecutionMode,
+    ResourceEstimate, TileExecutionResult,
 };
 use raster_core::{tile::TileMetadata, Error, Result};
 
@@ -34,10 +34,6 @@ impl CompilationArtifact for NativeCompilationArtifact {
         &self.tile_id
     }
 
-    fn path(&self) -> &Path {
-        self.binary_path.parent().unwrap()
-    }
-
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -46,9 +42,9 @@ impl CompilationArtifact for NativeCompilationArtifact {
         self
     }
 
-    fn artifact_id(&self) -> Vec<u8> {
+    fn artifact_id(&self) -> HexString {
         // TODO: field used only for Risc0 backend
-        Vec::new()
+        String::new()
     }
 }
 
@@ -68,7 +64,7 @@ impl ArtifactStore for NativeArtifactStore {
         &self,
         artifact: &dyn CompilationArtifact,
         output_dir: &Path,
-        source_hash: Option<&str>,
+        source_hash: Option<String>,
     ) -> Result<PathBuf> {
         let native_artifact = artifact
             .as_any()
@@ -103,7 +99,7 @@ impl ArtifactStore for NativeArtifactStore {
         &self,
         tile_id: &str,
         output_dir: &Path,
-        source_hash: Option<&str>,
+        source_hash: Option<String>,
     ) -> Option<Box<dyn CompilationArtifact>> {
         let artifact_dir = output_dir.join("tiles").join(tile_id).join("native");
 
@@ -111,7 +107,7 @@ impl ArtifactStore for NativeArtifactStore {
         let manifest: NativeManifest = serde_json::from_str(&manifest_content).ok()?;
 
         // Validate source hash
-        if manifest.source_hash.as_deref() != source_hash {
+        if manifest.source_hash != source_hash {
             return None;
         }
 
@@ -124,15 +120,6 @@ impl ArtifactStore for NativeArtifactStore {
             binary_path: manifest.binary_path,
             tile_id: tile_id.to_string(),
         }))
-    }
-
-    fn needs_recompilation(
-        &self,
-        tile_id: &str,
-        output_dir: &Path,
-        source_hash: Option<&str>,
-    ) -> bool {
-        self.load(tile_id, output_dir, source_hash).is_none()
     }
 }
 
@@ -242,7 +229,7 @@ impl Backend for NativeBackend {
     fn compile_tile(
         &self,
         tile_metadata: &TileMetadata,
-        _content_hash: Option<&str>,
+        _content_hash: Option<String>,
     ) -> Result<Box<dyn CompilationArtifact>> {
         // Native backend builds the user's project
         let project_path = self

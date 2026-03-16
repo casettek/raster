@@ -41,14 +41,15 @@ pub struct FnCallRecord {
 pub struct TileExecRecord {
     pub exec_index: u64,
     pub sequence_id: String,
-    pub intra_sequence_index: u64,
-    pub sequence_callstack_depth: u64,
-    pub sequence_coordinates: CfsCoordinates,
+    pub intra_sequence_index: u32,
+    pub coordinates: CfsCoordinates,
     pub fn_call_record: FnCallRecord,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SequenceStartRecord {
+    pub exec_index: u64,
+
     pub sequence_id: String,
     pub sequence_coordinates: CfsCoordinates,
 
@@ -58,6 +59,8 @@ pub struct SequenceStartRecord {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SequenceEndRecord {
+    pub exec_index: u64,
+
     pub sequence_id: String,
     pub sequence_coordinates: CfsCoordinates,
 
@@ -117,6 +120,7 @@ pub struct TraceWindow {
     pub items: Vec<StepRecord>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TraceEvent {
     SequenceStart(FnCallRecord),
     SequenceEnd(FnCallRecord),

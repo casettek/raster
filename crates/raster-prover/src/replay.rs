@@ -58,6 +58,7 @@ impl<'a> Replayer<'a> {
     pub fn replay(&self, item: &TileExecRecord, mode: ExecutionMode) -> Result<ReplayResult> {
         let record = &item.fn_call_record;
         let discovery = TileDiscovery::new(self.project);
+
         let tile = discovery.get(&record.fn_name).ok_or_else(|| {
             Error::InvalidTileId(format!("Tile '{}' not found in project", record.fn_name))
         })?;
@@ -66,7 +67,7 @@ impl<'a> Replayer<'a> {
         let content_hash = tile.to_content_hash();
         let artifact = self
             .backend
-            .compile_tile(&tile.to_metadata(), content_hash.as_deref())?;
+            .compile_tile(&tile.to_metadata(), content_hash)?;
 
         let image_id = artifact.artifact_id();
         // 4. Execute with backend
@@ -74,6 +75,7 @@ impl<'a> Replayer<'a> {
             .backend
             .execute_tile(artifact.as_ref(), &record.input_data, mode)?;
 
+        let image_id = hex::decode(image_id).unwrap();
         Ok(ReplayResult {
             fn_name: record.fn_name.clone(),
             receipt: exec_result.receipt.unwrap(),
@@ -81,4 +83,3 @@ impl<'a> Replayer<'a> {
         })
     }
 }
-

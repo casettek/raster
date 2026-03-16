@@ -3,8 +3,7 @@
 //! This module resolves how data flows between tiles in a sequence by tracking
 //! variable bindings and mapping them to `InputSource` references.
 
-use raster_core::cfs::{InputBinding, InputSource, SequenceChild, SequenceItem, TileItem};
-use raster_core::tile::TileId;
+use raster_core::cfs::{InputBinding, InputSource, SequenceChildItem, SequenceItem, TileItem};
 use std::collections::HashMap;
 
 use crate::ast::CallInfo;
@@ -38,7 +37,7 @@ impl<'a, 'ast> FlowResolver<'a, 'ast> {
     }
 
     /// Resolve a discovered sequence into a list of `SequenceChild`s with input sources.
-    pub fn resolve(&mut self, sequence: &Sequence<'ast>) -> Vec<SequenceChild> {
+    pub fn resolve(&mut self, sequence: &Sequence<'ast>) -> Vec<SequenceChildItem> {
         // Reset state for this sequence
         self.bindings.clear();
         self.param_indices.clear();
@@ -63,12 +62,12 @@ impl<'a, 'ast> FlowResolver<'a, 'ast> {
 
             // Determine if this is a tile or nested sequence
             let item = if self.is_tile(&call.callee) {
-                SequenceChild::Tile(TileItem {
+                SequenceChildItem::Tile(TileItem {
                     id: call.callee.clone(),
                     sources: input_sources,
                 })
             } else if self.is_sequence(&call.callee) {
-                SequenceChild::Sequence(SequenceItem {
+                SequenceChildItem::Sequence(SequenceItem {
                     id: call.callee.clone(),
                     sources: input_sources,
                 })
