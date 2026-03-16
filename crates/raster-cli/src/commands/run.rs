@@ -194,62 +194,15 @@ pub fn run(
     for step_record in trace.iter() {
         match step_record {
             StepRecord::TileExec(tile_record) => {
-                println!("trace tile coordinates: {:?}", tile_record.coordinates);
-                println!("cfs coordinates: {:?}", cfs_cursor.coordinates());
-                current_coordinates = tile_record.coordinates.clone();
-
-                let next_coordinates_options =
-                    cfs_cursor.try_get_next_coordinates(&cfs_cursor.coordinates());
-                println!("next coordiates options: {:?}", next_coordinates_options);
-
-                if !cfs_cursor.is_next_coordinates(&current_coordinates) {
-                    panic!("Bad coordinate transition");
-                }
-                cfs_cursor.set_coordinates(current_coordinates);
-
                 trace_coordinates.push(tile_record.coordinates.clone());
             }
             StepRecord::SequenceEnd(sequence_end_record) => {
-                println!(
-                    "trace sequence end coordinates: {:?}",
-                    sequence_end_record.sequence_coordinates
-                );
-                println!("cfs coordinates: {:?}", cfs_cursor.coordinates());
-                current_coordinates = sequence_end_record.sequence_coordinates.clone();
-
-                let next_coordinates_options =
-                    cfs_cursor.try_get_next_coordinates(&cfs_cursor.coordinates());
-                println!("next coordiates options: {:?}", next_coordinates_options);
-
-                if !cfs_cursor.is_next_coordinates(&current_coordinates) {
-                    panic!("Bad coordinate transition");
-                }
-                cfs_cursor.set_coordinates(current_coordinates);
-
                 trace_coordinates.push(sequence_end_record.sequence_coordinates.clone());
             }
             StepRecord::SequenceStart(sequence_start_record) => {
-                println!(
-                    "trace sequence start coordinates: {:?}",
-                    sequence_start_record.sequence_coordinates
-                );
-                println!("cfs coordinates: {:?}", cfs_cursor.coordinates());
-
-                current_coordinates = sequence_start_record.sequence_coordinates.clone();
-
-                let next_coordinates_options =
-                    cfs_cursor.try_get_next_coordinates(&cfs_cursor.coordinates());
-                println!("next coordiates options: {:?}", next_coordinates_options);
-
-                if !cfs_cursor.is_next_coordinates(&current_coordinates) {
-                    panic!("Bad coordinate transition");
-                }
-                cfs_cursor.set_coordinates(current_coordinates);
-
                 trace_coordinates.push(sequence_start_record.sequence_coordinates.clone());
             }
         }
-        println!("");
     }
 
     // let tiles_discovery = TileDiscovery::new(&project);

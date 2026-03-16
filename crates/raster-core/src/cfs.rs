@@ -120,11 +120,8 @@ impl CfsCursor {
 
                         return Some(Vec::from([next_coordinates]));
                     } else if current_item_coordinate as usize == sequence_last_coordinate {
-                        // Else the next item is not part of the sequence it should be sequence end
                         let (current_sequence_coordinate, parent_sequence_coordinates) =
                             current_coordinates.split_last().expect("Empty coordinates");
-                        // that mean that child sequence is ended and we should check parent
-                        // sequence dit it have a next item within
                         let parent_sequence_coordinates =
                             CfsCoordinates(parent_sequence_coordinates.to_vec());
 
@@ -154,29 +151,28 @@ impl CfsCursor {
                 }
                 None => {
                     let mut next_coordinates_options: Vec<CfsCoordinates> = Vec::new();
+
+                    next_coordinates_options.push(current_coordinates.clone());
+
                     let mut next_coordinates = current_coordinates.clone();
-                    // SequenceStart
+
                     next_coordinates.push(0);
-                    next_coordinates_options.push(next_coordinates);
+                    if self.try_get_child_item(&next_coordinates).is_some() {
+                        next_coordinates_options.push(next_coordinates);
+                    }
 
                     let Some((current_sequence_coordinate, parent_sequence_coordinates)) =
                         current_coordinates.split_last()
                     else {
-                        // Entrypoint
+                        // Entrypoint start
                         next_coordinates_options.push(current_coordinates.clone());
 
                         return Some(next_coordinates_options);
                     };
 
-                    // that mean that child sequence is ended and we should check parent
-                    // sequence dit it have a next item within
                     let parent_sequence_coordinates =
                         CfsCoordinates(parent_sequence_coordinates.to_vec());
                     let (parent_sequence, _) = self.get_sequence(&parent_sequence_coordinates);
-
-                    let mut next_coordinates = parent_sequence_coordinates.clone();
-                    next_coordinates.push(*current_sequence_coordinate);
-                    next_coordinates_options.push(next_coordinates.clone());
 
                     if let Some(_next_item) = parent_sequence
                         .items
@@ -188,6 +184,10 @@ impl CfsCursor {
                         if self.try_get_child_item(&next_coordinates).is_some() {
                             next_coordinates_options.push(next_coordinates);
                         }
+                    } else {
+                        let mut next_coordinates = current_coordinates.clone();
+                        next_coordinates.pop();
+                        next_coordinates_options.push(next_coordinates);
                     }
 
                     return Some(next_coordinates_options);
@@ -230,24 +230,10 @@ impl CfsCursor {
     }
 
     pub fn try_get_child_item(&self, coordinates: &CfsCoordinates) -> Option<&SequenceChildItem> {
-        let (entrypoint_coordinates, rest_coordinates) = coordinates
-            .0
-            .split_first()
-            .map(|(h, t)| (*h as usize, t))
-            .unwrap_or_else(|| {
-                let entrypoint_coords = self
-                    .cfs
-                    .sequences
-                    .iter()
-                    .position(|s| s.id == "main")
-                    .expect("Missing main entrypoint");
-                (entrypoint_coords, &[][..])
-            });
-
-        let mut current_sequence = self.cfs.sequences.get(entrypoint_coordinates);
+        let mut current_sequence = self.cfs.sequences.get(self.entrypoint_coordinate as usize);
         let mut current_child_item: Option<&SequenceChildItem> = None;
 
-        for &coord in rest_coordinates {
+        for &coord in coordinates.iter() {
             let sequence = current_sequence?;
             let child = sequence.items.get(coord as usize)?;
             current_child_item = Some(child);
