@@ -90,7 +90,7 @@ impl ArtifactStore for Risc0ArtifactStore {
 
         let image_id = &risc0_artifact.image_id;
 
-        fs::write(artifact_dir.join("{source_hash}.elf"), &risc0_artifact.elf)
+        fs::write(artifact_dir.join(format!("{}.elf", source_hash.as_deref().unwrap_or("none"))), &risc0_artifact.elf)
             .map_err(Error::Io)?;
 
         fs::write(artifact_dir.join("image_id"), image_id).map_err(Error::Io)?;
