@@ -40,9 +40,11 @@ pub struct FnCallRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TileExecRecord {
     pub exec_index: u64,
+
     pub sequence_id: String,
-    pub intra_sequence_index: u32,
     pub coordinates: CfsCoordinates,
+
+    pub intra_sequence_index: u32,
     pub fn_call_record: FnCallRecord,
 }
 
@@ -51,7 +53,7 @@ pub struct SequenceStartRecord {
     pub exec_index: u64,
 
     pub sequence_id: String,
-    pub sequence_coordinates: CfsCoordinates,
+    pub coordinates: CfsCoordinates,
 
     pub inputs: Vec<FnInputParam>,
     pub input_data: Vec<u8>,
@@ -62,7 +64,7 @@ pub struct SequenceEndRecord {
     pub exec_index: u64,
 
     pub sequence_id: String,
-    pub sequence_coordinates: CfsCoordinates,
+    pub coordinates: CfsCoordinates,
 
     pub output_type: Option<String>,
     pub output_data: Vec<u8>,

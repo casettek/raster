@@ -196,12 +196,12 @@ fn main() {
                 }
                 StepRecord::SequenceStart(seq_start_record) => {
                     expected_next_coordinates = cfs_cursor
-                        .try_get_next_coordinates(&seq_start_record.sequence_coordinates)
+                        .try_get_next_coordinates(&seq_start_record.coordinates)
                         .expect("Wrong tile coordinates");
                 }
                 StepRecord::SequenceEnd(seq_end_record) => {
                     expected_next_coordinates = cfs_cursor
-                        .try_get_next_coordinates(&seq_end_record.sequence_coordinates)
+                        .try_get_next_coordinates(&seq_end_record.coordinates)
                         .expect("Wrong tile coordinates");
                 }
             }
@@ -287,19 +287,15 @@ fn main() {
                         .expect("Wrong tile coordinates");
                 }
                 StepRecord::SequenceStart(seq_start_record) => {
-                    assert!(
-                        expected_next_coordinates.contains(&seq_start_record.sequence_coordinates)
-                    );
+                    assert!(expected_next_coordinates.contains(&seq_start_record.coordinates));
                     expected_next_coordinates = cfs_cursor
-                        .try_get_next_coordinates(&seq_start_record.sequence_coordinates)
+                        .try_get_next_coordinates(&seq_start_record.coordinates)
                         .expect("Wrong tile coordinates");
                 }
                 StepRecord::SequenceEnd(seq_end_record) => {
-                    assert!(
-                        expected_next_coordinates.contains(&seq_end_record.sequence_coordinates)
-                    );
+                    assert!(expected_next_coordinates.contains(&seq_end_record.coordinates));
                     expected_next_coordinates = cfs_cursor
-                        .try_get_next_coordinates(&seq_end_record.sequence_coordinates)
+                        .try_get_next_coordinates(&seq_end_record.coordinates)
                         .expect("Wrong tile coordinates");
                 }
             }

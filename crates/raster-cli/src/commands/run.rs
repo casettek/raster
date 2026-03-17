@@ -197,10 +197,10 @@ pub fn run(
                 trace_coordinates.push(tile_record.coordinates.clone());
             }
             StepRecord::SequenceEnd(sequence_end_record) => {
-                trace_coordinates.push(sequence_end_record.sequence_coordinates.clone());
+                trace_coordinates.push(sequence_end_record.coordinates.clone());
             }
             StepRecord::SequenceStart(sequence_start_record) => {
-                trace_coordinates.push(sequence_start_record.sequence_coordinates.clone());
+                trace_coordinates.push(sequence_start_record.coordinates.clone());
             }
         }
     }
@@ -268,7 +268,7 @@ pub fn run(
                     );
                     println!(
                         "sequence coordinates: {:?}",
-                        sequence_start_record.sequence_coordinates
+                        sequence_start_record.coordinates
                     );
                 }
                 StepRecord::SequenceEnd(sequence_end_record) => {
@@ -278,7 +278,7 @@ pub fn run(
                     );
                     println!(
                         "sequence coordinates: {:?}",
-                        sequence_end_record.sequence_coordinates
+                        sequence_end_record.coordinates
                     );
                 }
             }

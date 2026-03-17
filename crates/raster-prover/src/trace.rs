@@ -414,8 +414,7 @@ mod tests {
             exec_index: input,
             sequence_id: "test_sequence".to_string(),
             intra_sequence_index: input,
-            sequence_callstack_depth: 0,
-            sequence_coordinates: CfsCoordinates([0]),
+            coordinates: CfsCoordinates([0]),
             fn_call_record: FnCallRecord {
                 fn_name: format!("test_tile_{}", input),
                 desc: None,

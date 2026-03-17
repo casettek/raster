@@ -136,9 +136,6 @@ impl<W: Write + Send> ExecutionSubscriber<W> {
 
 impl<W: Write + Send + Sync> Subscriber for ExecutionSubscriber<W> {
     fn on_trace(&self, event: TraceEvent) {
-        println!("[debug] on_trace ------------------------------------ ",);
-        println!("[debug] {:?}", event);
-
         let mut exec_index_guard = self.exec_index.lock().expect("Mutex poisoned");
         *exec_index_guard += 1;
         let exec_index = *exec_index_guard;
@@ -146,7 +143,6 @@ impl<W: Write + Send + Sync> Subscriber for ExecutionSubscriber<W> {
 
         match event {
             TraceEvent::SequenceStart(trace_item) => {
-                println!("[debug] TraceEvent::SequenceStart ---------------------- ");
                 let mut callstack_guard = self
                     .sequence_callstack
                     .lock()
@@ -161,36 +157,19 @@ impl<W: Write + Send + Sync> Subscriber for ExecutionSubscriber<W> {
                     .last_mut()
                     .expect("Tile can't be called without sequence context");
                 let sequence_id = current_sequence_state.id.clone();
-                println!(
-                    "[debug] TraceEvent::SequenceStart parent sequence {}[{:?}]",
-                    sequence_id, sequence_coordinates
-                );
+
                 let sequence_start_record = StepRecord::SequenceStart(SequenceStartRecord {
                     exec_index,
                     sequence_id: trace_item.fn_name.clone(),
-                    sequence_coordinates: callstack_guard.current_sequence_coordinates.clone(),
+                    coordinates: callstack_guard.current_sequence_coordinates.clone(),
                     inputs: trace_item.inputs,
                     input_data: trace_item.input_data,
                 });
 
                 drop(callstack_guard);
-
-                let mut callstack_guard = self
-                    .sequence_callstack
-                    .lock()
-                    .expect("Callstack Mutex poisoned");
-                if let Some(current_sequence_state) = callstack_guard.last() {
-                    println!(
-                        "[debug] TraceEvent::SequenceStart current new state : {:?}",
-                        current_sequence_state
-                    );
-                } else {
-                    println!("[debug] TraceEvent::SequenceStart no parent");
-                }
                 self.write_record(&sequence_start_record);
             }
             TraceEvent::SequenceEnd(trace_item) => {
-                println!("[debug] TraceEvent::SequenceEnd");
                 let mut callstack_guard = self
                     .sequence_callstack
                     .lock()
@@ -200,7 +179,7 @@ impl<W: Write + Send + Sync> Subscriber for ExecutionSubscriber<W> {
 
                 let sequence_end_record = StepRecord::SequenceEnd(SequenceEndRecord {
                     exec_index,
-                    sequence_coordinates,
+                    coordinates: sequence_coordinates,
                     sequence_id: trace_item.fn_name.clone(),
                     output_type: trace_item.output_type,
                     output_data: trace_item.output_data,
@@ -212,7 +191,6 @@ impl<W: Write + Send + Sync> Subscriber for ExecutionSubscriber<W> {
                 self.write_record(&sequence_end_record);
             }
             TraceEvent::TileExec(trace_item) => {
-                println!("[debug] TraceEvent::TileExec");
                 let mut callstack_guard = self
                     .sequence_callstack
                     .lock()
@@ -224,17 +202,8 @@ impl<W: Write + Send + Sync> Subscriber for ExecutionSubscriber<W> {
                     .expect("Tile can't be called without sequence context");
 
                 let sequence_id = current_sequence_state.id.clone();
-                println!(
-                    "[debug] TraceEvent::TileExec parent sequence {}[{:?}]",
-                    sequence_id, sequence_coordinates
-                );
-
                 let parent_current_index = current_sequence_state.current_index;
 
-                println!(
-                    "[debug] TraceEvent::TileExec parent current index: {}",
-                    parent_current_index
-                );
                 let cfs_cursor_guard = self.cfs_cursor.lock().unwrap();
                 let tile_coordinates = cfs_cursor_guard.get_child_coordinates(
                     &sequence_coordinates,
@@ -243,11 +212,6 @@ impl<W: Write + Send + Sync> Subscriber for ExecutionSubscriber<W> {
                 );
 
                 current_sequence_state.current_index += 1;
-
-                println!(
-                    "[debug] TraceEvent::TileExec parent new index: {}",
-                    current_sequence_state.current_index
-                );
 
                 drop(callstack_guard);
 
