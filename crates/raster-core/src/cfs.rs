@@ -11,8 +11,6 @@ use std::ops::{Deref, DerefMut};
 use std::string::{String, ToString};
 use std::vec::Vec;
 
-use crate::trace::StepRecord;
-
 pub type CfsCoordinate = u32;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

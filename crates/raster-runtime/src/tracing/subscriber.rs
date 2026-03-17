@@ -1,4 +1,3 @@
-use raster_compiler::cfs_builder::CfsResolver;
 use raster_compiler::{sequence, CfsBuilder, Project};
 use raster_core::cfs::{CfsCoordinates, CfsCursor, SequenceChildId};
 use raster_core::trace::{TileExecRecord, TraceEvent};
