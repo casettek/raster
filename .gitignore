@@ -23,3 +23,5 @@ coverage/
 
 # Documentation
 book/
+*.kb
+.kb
