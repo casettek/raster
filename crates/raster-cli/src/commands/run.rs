@@ -1,7 +1,6 @@
 //! Run command: build and execute the user program as a whole.
 
 use raster_backend::backend::HexString;
-use raster_core::cfs::{CfsCoordinates, CfsCursor, ControlFlowSchema};
 use rayon::prelude::*;
 
 use std::collections::{BTreeMap, HashMap};
@@ -13,12 +12,14 @@ use std::thread;
 
 use raster_backend::{Backend, ExecutionMode};
 use raster_backend_risc0::Risc0Backend;
-use raster_core::tile::TileId;
 
 use raster_compiler::tile::TileDiscovery;
 use raster_compiler::{CfsBuilder, Project};
 
+use raster_core::cfs::{CfsCoordinates, CfsCursor, ControlFlowSchema};
+use raster_core::tile::TileId;
 use raster_core::trace::{SequenceStartRecord, StepRecord, TileExecRecord, Trace, TraceWindow};
+use raster_core::transition::TransitionJournal;
 use raster_core::{Error, Result};
 
 use raster_prover::precomputed::EMPTY_TRIE_NODES;
@@ -26,7 +27,7 @@ use raster_prover::replay::{ReplayResult, Replayer};
 use raster_prover::trace::{
     SerializableFrontier, TraceCommitment, TraceVerifier, VerificationResult,
 };
-use raster_prover::transition::{step_transitions, TransitionJournal};
+use raster_prover::transition::step_transitions;
 
 use crate::BackendType;
 

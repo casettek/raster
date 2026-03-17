@@ -88,56 +88,34 @@ impl Hashable for Bytes {
     }
 }
 
-/// A serializable representation of a NonEmptyFrontier<Bytes>.
-///
-/// This can be used to persist and restore frontier state for replay.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct SerializableFrontier {
-    /// The position in the tree (as u64)
-    pub position: u64,
-    /// The current leaf value
-    pub leaf: Vec<u8>,
-    /// The ommer hashes (path to root)
-    pub ommers: Vec<Vec<u8>>,
+/// Re-export from raster-core; conversion to/from TraceTreeFrontier via functions below.
+pub use raster_core::transition::SerializableFrontier;
+
+/// Convert a trace tree frontier into a serializable form (for persistence/replay).
+pub fn serializable_frontier_from_trace_frontier(frontier: TraceTreeFrontier) -> SerializableFrontier {
+    SerializableFrontier {
+        position: frontier.position().into(),
+        leaf: frontier.leaf().clone().0,
+        ommers: frontier
+            .ommers()
+            .clone()
+            .iter()
+            .map(|o| o.clone().0)
+            .collect(),
+    }
 }
 
-impl SerializableFrontier {
-    /// Consume a NonEmptyFrontier<Bytes> into a serializable form.
-    pub fn from_frontier(frontier: TraceTreeFrontier) -> Self {
-        Self {
-            position: frontier.position().into(),
-            leaf: frontier.leaf().clone().0,
-            ommers: frontier
-                .ommers()
-                .clone()
-                .iter()
-                .map(|o| o.clone().0)
-                .collect(),
-        }
-    }
-
-    /// Reconstruct a NonEmptyFrontier<Bytes> from the serialized form.
-    ///
-    /// Returns None if the frontier cannot be reconstructed (e.g., invalid position).
-    pub fn into_frontier(self) -> Option<TraceTreeFrontier> {
-        use bridgetree::Position;
-        TraceTreeFrontier::from_parts(
-            Position::from(self.position),
-            Bytes(self.leaf.clone()),
-            self.ommers.iter().map(|o| Bytes(o.clone())).collect(),
-        )
-        .ok()
-    }
-
-    /// Serialize to bytes using bincode.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        postcard::to_allocvec(self).unwrap_or_default()
-    }
-
-    /// Deserialize from bytes using bincode.
-    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        postcard::from_bytes(bytes).ok()
-    }
+/// Reconstruct a TraceTreeFrontier from a serializable frontier.
+pub fn serializable_frontier_into_trace_frontier(
+    s: SerializableFrontier,
+) -> Option<TraceTreeFrontier> {
+    use bridgetree::Position;
+    TraceTreeFrontier::from_parts(
+        Position::from(s.position),
+        Bytes(s.leaf.clone()),
+        s.ommers.iter().map(|o| Bytes(o.clone())).collect(),
+    )
+    .ok()
 }
 
 /// Bridge tree for trace commitments with 32 levels.
@@ -383,7 +361,7 @@ impl TraceVerifier {
 
             let window_frontier = self.window_frontiers.first().unwrap().clone();
             let ser_window_frontier =
-                SerializableFrontier::from_frontier(window_frontier).to_bytes();
+                serializable_frontier_from_trace_frontier(window_frontier).to_bytes();
 
             // TODO: consider renaming Window struct and TraceWindow have different behavior but
             // similiar naming
@@ -520,9 +498,8 @@ mod tests {
             let bridgetree_root = tree.root(0).expect("root").0.clone();
 
             let frontier = tree.frontier().expect("frontier").clone();
-            let ser_frontier = SerializableFrontier::from_frontier(frontier.clone());
-            let deser_frontier = ser_frontier
-                .into_frontier()
+            let ser_frontier = serializable_frontier_from_trace_frontier(frontier.clone());
+            let deser_frontier = serializable_frontier_into_trace_frontier(ser_frontier)
                 .expect("Can't deserialize frontier");
 
             let pos = u64::from(deser_frontier.position());

@@ -8,54 +8,16 @@
 //! The types in this module are designed to be serialization-compatible with
 //! the types used in the RISC0 guest program.
 
-use raster_core::cfs::{CfsCoordinates, ControlFlowSchema};
-use serde::{Deserialize, Serialize};
-
-use raster_core::fingerprint::{BitPacker, Fingerprint, FingerprintAccumulator};
-use raster_core::trace::{StepRecord, TileExecRecord};
+use raster_core::cfs::ControlFlowSchema;
+use raster_core::fingerprint::{BitPacker, Fingerprint};
+use raster_core::trace::StepRecord;
+use raster_core::transition::{
+    InitTransition, Transition, TransitionInput, TransitionJournal, TransitionState,
+};
 
 use crate::replay::ReplayResult;
 use crate::trace::SerializableFrontier;
 use crate::{TRANSITION_GUEST_ELF, TRANSITION_GUEST_ID};
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TransitionInput {
-    pub step_record: StepRecord,
-
-    // replay image id should be in declaration in cfs file
-    pub replay_image_id: Option<Vec<u8>>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct Transition {
-    pub frontier: SerializableFrontier,
-    pub actual_fingerprint_acc: FingerprintAccumulator,
-    pub expected_next_coordinates: Vec<CfsCoordinates>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct InitTransition {
-    pub init_frontier: SerializableFrontier,
-    pub fingerprint: Fingerprint,
-    // TODO: Init Transition should verify proof of inclusion of reference fingerprint
-    // pub ref_fingerprint_inclusion_proof: Vec<u8>,
-    // pub cfs: Vec<u8>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum TransitionState {
-    Init(InitTransition),
-    Next(Transition),
-    Finished,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TransitionJournal {
-    pub init_state: InitTransition,
-    pub current_state: TransitionState,
-
-    pub self_image_id: Vec<u8>,
-}
 
 /// Replay trace transitions using the transition guest to prove merkle tree state transitions.
 ///

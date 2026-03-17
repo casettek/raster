@@ -13,67 +13,18 @@ use risc0_zkvm::guest::env;
 use raster_core::cfs::{CfsCoordinates, CfsCursor, ControlFlowSchema};
 use raster_core::fingerprint::{Fingerprint, FingerprintAccumulator};
 use raster_core::trace::StepRecord;
+use raster_core::transition::{
+    SerializableFrontier, Transition, TransitionInput, TransitionJournal, TransitionState,
+};
 
 use serde::{Deserialize, Serialize};
 
 use sha2::{Digest, Sha256};
 
-// ============================================================================
-// Wire-format types (same layout as host for postcard compatibility)
-// ============================================================================
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Bytes(pub Vec<u8>);
 
 pub type TraceBridgeTree = bridgetree::BridgeTree<Bytes, u64, 32>;
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct SerializableFrontier {
-    pub position: u64,
-    pub leaf: Vec<u8>,
-    pub ommers: Vec<Vec<u8>>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TransitionInput {
-    pub step_record: StepRecord,
-
-    pub replay_image_id: Option<Vec<u8>>,
-}
-
-#[derive(Clone, Serialize, Deserialize, PartialEq)]
-pub struct Transition {
-    pub frontier: SerializableFrontier,
-    pub actual_fingerprint_acc: FingerprintAccumulator,
-    pub expected_next_coordinates: Vec<CfsCoordinates>,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-pub struct InitTransition {
-    pub init_frontier: SerializableFrontier,
-    pub fingerprint: Fingerprint,
-    // TODO: Init Transition should verify proof of inclusion of reference fingerprint
-    // pub ref_fingerprint_inclusion_proof: Vec<u8>,
-    //
-    // TODO: Init Transition should contain reference to CFS
-    // This should happen in init transition to make sure that all element of window are verified
-    // against same CFS
-    // pub cfs: ControlFlowSchema,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-pub enum TransitionState {
-    Init(InitTransition),
-    Next(Transition),
-    Finished,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-pub struct TransitionJournal {
-    pub init_state: InitTransition,
-    pub current_state: TransitionState,
-
-    pub self_image_id: Vec<u8>,
-}
 
 // ============================================================================
 // Bytes + Hashable for bridgetree (matches prover's empty leaf and combine)
@@ -122,25 +73,23 @@ impl Hashable for Bytes {
 }
 
 // ============================================================================
-// SerializableFrontier <-> NonEmptyFrontier<Bytes>
+// SerializableFrontier <-> NonEmptyFrontier<Bytes> (guest-local conversion)
 // ============================================================================
 
-impl SerializableFrontier {
-    fn to_frontier(&self) -> Option<NonEmptyFrontier<Bytes>> {
-        NonEmptyFrontier::from_parts(
-            Position::from(self.position),
-            Bytes(self.leaf.clone()),
-            self.ommers.iter().map(|o| Bytes(o.clone())).collect(),
-        )
-        .ok()
-    }
+fn ser_frontier_to_frontier(ser: &SerializableFrontier) -> Option<NonEmptyFrontier<Bytes>> {
+    NonEmptyFrontier::from_parts(
+        Position::from(ser.position),
+        Bytes(ser.leaf.clone()),
+        ser.ommers.iter().map(|o| Bytes(o.clone())).collect(),
+    )
+    .ok()
+}
 
-    fn from_frontier(frontier: &NonEmptyFrontier<Bytes>) -> Self {
-        Self {
-            position: frontier.position().into(),
-            leaf: frontier.leaf().0.clone(),
-            ommers: frontier.ommers().iter().map(|o| o.0.clone()).collect(),
-        }
+fn frontier_to_ser_frontier(frontier: &NonEmptyFrontier<Bytes>) -> SerializableFrontier {
+    SerializableFrontier {
+        position: frontier.position().into(),
+        leaf: frontier.leaf().0.clone(),
+        ommers: frontier.ommers().iter().map(|o| o.0.clone()).collect(),
     }
 }
 
@@ -170,9 +119,7 @@ fn main() {
 
     match state {
         TransitionState::Init(init_transition) => {
-            let mut init_frontier = init_transition
-                .init_frontier
-                .to_frontier()
+            let mut init_frontier = ser_frontier_to_frontier(&init_transition.init_frontier)
                 .expect("Invalid frontier in input");
 
             let mut expected_next_coordinates: Vec<CfsCoordinates> = Vec::new();
@@ -218,7 +165,7 @@ fn main() {
                 FingerprintAccumulator::new(init_transition.fingerprint.bits_packer);
             actual_fingerprint_acc.append(&tree_root.0);
 
-            let new_frontier = SerializableFrontier::from_frontier(&init_frontier);
+            let new_frontier = frontier_to_ser_frontier(&init_frontier);
 
             let current_state = TransitionState::Next(Transition {
                 frontier: new_frontier,
@@ -259,10 +206,8 @@ fn main() {
                 "Transition Expected to be the same as the previous journal Transition"
             );
 
-            let mut current_frontier = transition
-                .frontier
-                .to_frontier()
-                .expect("Invalid frontier in input");
+            let mut current_frontier =
+                ser_frontier_to_frontier(&transition.frontier).expect("Invalid frontier in input");
 
             let mut expected_next_coordinates = transition.expected_next_coordinates;
             match &input.step_record {
@@ -311,7 +256,7 @@ fn main() {
             let mut actual_fingerprint_acc = transition.actual_fingerprint_acc.clone();
             actual_fingerprint_acc.append(&tree_root.0);
 
-            let new_frontier = SerializableFrontier::from_frontier(&current_frontier);
+            let new_frontier = frontier_to_ser_frontier(&current_frontier);
 
             let actual_fingerprint: Fingerprint = actual_fingerprint_acc.into_fingerprint();
 
