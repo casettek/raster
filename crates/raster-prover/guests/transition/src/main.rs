@@ -105,6 +105,68 @@ fn hash_trace_item(item: &StepRecord) -> Vec<u8> {
     hasher.finalize().to_vec()
 }
 
+fn step_coordinates(step: &StepRecord) -> &CfsCoordinates {
+    match step {
+        StepRecord::TileExec(tile_exec_record) => &tile_exec_record.coordinates,
+        StepRecord::SequenceStart(seq_start_record) => &seq_start_record.coordinates,
+        StepRecord::SequenceEnd(seq_end_record) => &seq_end_record.coordinates,
+    }
+}
+
+fn verify_step_record(step: &StepRecord, replay_image_id: Option<&Vec<u8>>) {
+    match step {
+        StepRecord::TileExec(tile_exec_record) => {
+            let replay_image_id = replay_image_id
+                .expect("replay image id should be provided for tile execution should ");
+            let replay_image_id_digest = risc0_zkvm::sha::Digest::try_from(replay_image_id.as_slice())
+                .expect("image_id must be 32 bytes");
+
+            env::verify(
+                replay_image_id_digest,
+                &tile_exec_record.fn_call_record.output_data,
+            )
+            .expect("Failed to verify trace replay image id");
+        }
+        StepRecord::SequenceStart(_) => {}
+        StepRecord::SequenceEnd(_) => {}
+    }
+}
+
+fn advance_expected_next_coordinates(
+    cfs_cursor: &CfsCursor,
+    step: &StepRecord,
+    expected: Option<&Vec<CfsCoordinates>>,
+) -> Vec<CfsCoordinates> {
+    let coordinates = step_coordinates(step);
+    if let Some(expected_next_coordinates) = expected {
+        assert!(
+            expected_next_coordinates.contains(coordinates),
+            "Step coordinates are not in expected next coordinates"
+        );
+    }
+
+    cfs_cursor
+        .try_get_next_coordinates(coordinates)
+        .expect("Wrong tile coordinates")
+}
+
+fn advance_frontier_root_fingerprint(
+    frontier: &mut NonEmptyFrontier<Bytes>,
+    step_record: &StepRecord,
+    fingerprint_acc: &mut FingerprintAccumulator,
+) -> SerializableFrontier {
+    let item_hash = hash_trace_item(step_record);
+    frontier.append(Bytes(item_hash));
+
+    let tree = TraceBridgeTree::from_frontier(1, frontier.clone());
+    let Some(tree_root) = tree.root(0) else {
+        panic!("Can't get tree root");
+    };
+    fingerprint_acc.append(&tree_root.0);
+
+    frontier_to_ser_frontier(frontier)
+}
+
 // ============================================================================
 // Main
 // ============================================================================
@@ -122,50 +184,17 @@ fn main() {
             let mut init_frontier = ser_frontier_to_frontier(&init_transition.init_frontier)
                 .expect("Invalid frontier in input");
 
-            let mut expected_next_coordinates: Vec<CfsCoordinates> = Vec::new();
-            match &input.step_record {
-                StepRecord::TileExec(tile_exec_record) => {
-                    let replay_image_id = input
-                        .replay_image_id
-                        .expect("replay image id should be provided for tile execution should ");
-                    let replay_image_id_digest =
-                        risc0_zkvm::sha::Digest::try_from(replay_image_id.as_slice())
-                            .expect("image_id must be 32 bytes");
-                    env::verify(
-                        replay_image_id_digest,
-                        &tile_exec_record.fn_call_record.output_data,
-                    )
-                    .expect("Failed to verify trace replay image id");
-
-                    expected_next_coordinates = cfs_cursor
-                        .try_get_next_coordinates(&tile_exec_record.coordinates)
-                        .expect("Wrong tile coordinates");
-                }
-                StepRecord::SequenceStart(seq_start_record) => {
-                    expected_next_coordinates = cfs_cursor
-                        .try_get_next_coordinates(&seq_start_record.coordinates)
-                        .expect("Wrong tile coordinates");
-                }
-                StepRecord::SequenceEnd(seq_end_record) => {
-                    expected_next_coordinates = cfs_cursor
-                        .try_get_next_coordinates(&seq_end_record.coordinates)
-                        .expect("Wrong tile coordinates");
-                }
-            }
-
-            let item_hash = hash_trace_item(&input.step_record);
-            init_frontier.append(Bytes(item_hash.clone()));
-
-            let tree = TraceBridgeTree::from_frontier(1, init_frontier.clone());
-            let Some(tree_root) = tree.root(0) else {
-                panic!("Can't get tree root");
-            };
+            verify_step_record(&input.step_record, input.replay_image_id.as_ref());
+            let expected_next_coordinates =
+                advance_expected_next_coordinates(&cfs_cursor, &input.step_record, None);
 
             let mut actual_fingerprint_acc =
                 FingerprintAccumulator::new(init_transition.fingerprint.bits_packer);
-            actual_fingerprint_acc.append(&tree_root.0);
-
-            let new_frontier = frontier_to_ser_frontier(&init_frontier);
+            let new_frontier = advance_frontier_root_fingerprint(
+                &mut init_frontier,
+                &input.step_record,
+                &mut actual_fingerprint_acc,
+            );
 
             let current_state = TransitionState::Next(Transition {
                 frontier: new_frontier,
@@ -209,54 +238,19 @@ fn main() {
             let mut current_frontier =
                 ser_frontier_to_frontier(&transition.frontier).expect("Invalid frontier in input");
 
-            let mut expected_next_coordinates = transition.expected_next_coordinates;
-            match &input.step_record {
-                StepRecord::TileExec(tile_exec_record) => {
-                    let replay_image_id = input
-                        .replay_image_id
-                        .expect("replay image id should be provided for tile execution should ");
-
-                    let replay_image_id_digest =
-                        risc0_zkvm::sha::Digest::try_from(replay_image_id.as_slice())
-                            .expect("image_id must be 32 bytes");
-                    // TODO: Maybe replay guest should have full trace item as output journal
-                    env::verify(
-                        replay_image_id_digest,
-                        &tile_exec_record.fn_call_record.output_data,
-                    )
-                    .expect("Failed to verify trace replay image id");
-
-                    assert!(expected_next_coordinates.contains(&tile_exec_record.coordinates));
-                    expected_next_coordinates = cfs_cursor
-                        .try_get_next_coordinates(&tile_exec_record.coordinates)
-                        .expect("Wrong tile coordinates");
-                }
-                StepRecord::SequenceStart(seq_start_record) => {
-                    assert!(expected_next_coordinates.contains(&seq_start_record.coordinates));
-                    expected_next_coordinates = cfs_cursor
-                        .try_get_next_coordinates(&seq_start_record.coordinates)
-                        .expect("Wrong tile coordinates");
-                }
-                StepRecord::SequenceEnd(seq_end_record) => {
-                    assert!(expected_next_coordinates.contains(&seq_end_record.coordinates));
-                    expected_next_coordinates = cfs_cursor
-                        .try_get_next_coordinates(&seq_end_record.coordinates)
-                        .expect("Wrong tile coordinates");
-                }
-            }
-
-            let item_hash = hash_trace_item(&input.step_record);
-            current_frontier.append(Bytes(item_hash.clone()));
-
-            let tree = TraceBridgeTree::from_frontier(1, current_frontier.clone());
-            let Some(tree_root) = tree.root(0) else {
-                panic!("Can't get tree root");
-            };
+            verify_step_record(&input.step_record, input.replay_image_id.as_ref());
+            let expected_next_coordinates = advance_expected_next_coordinates(
+                &cfs_cursor,
+                &input.step_record,
+                Some(&transition.expected_next_coordinates),
+            );
 
             let mut actual_fingerprint_acc = transition.actual_fingerprint_acc.clone();
-            actual_fingerprint_acc.append(&tree_root.0);
-
-            let new_frontier = frontier_to_ser_frontier(&current_frontier);
+            let new_frontier = advance_frontier_root_fingerprint(
+                &mut current_frontier,
+                &input.step_record,
+                &mut actual_fingerprint_acc,
+            );
 
             let actual_fingerprint: Fingerprint = actual_fingerprint_acc.into_fingerprint();
 
