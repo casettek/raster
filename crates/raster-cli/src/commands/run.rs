@@ -240,7 +240,7 @@ pub fn run(
         }
     } else if audit_flag.is_some() {
         let commit_path = audit_flag.expect("Commitment path was provided");
-        let verification_result = verify(&trace, commit_path);
+        let verification_result = verify(&trace, commit_path, &cfs);
 
         match verification_result {
             VerificationResult::Ok => println!("Verification Success"),
@@ -330,11 +330,10 @@ pub fn commit(trace: &Trace, commit_path: &str) {
         .expect("Failed to save commitment");
 }
 
-pub fn verify(trace: &Trace, commit_path: &str) -> VerificationResult {
+pub fn verify(trace: &Trace, commit_path: &str, cfs: &ControlFlowSchema) -> VerificationResult {
     let trace_commitment = read_trace_commitment(commit_path);
 
-    let mut trace_verifier: TraceVerifier =
-        TraceVerifier::new(trace_commitment, &EMPTY_TRIE_NODES[0]);
+    let mut trace_verifier = TraceVerifier::new(trace_commitment, &EMPTY_TRIE_NODES[0], cfs);
 
     let verification_result = trace_verifier.verify_trace(trace);
 

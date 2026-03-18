@@ -4,6 +4,7 @@
 //! commitments to execution traces using incremental Merkle trees.
 
 use bridgetree::{Hashable, Level, NonEmptyFrontier};
+use raster_core::cfs::ControlFlowSchema;
 use raster_core::fingerprint::{Fingerprint, FingerprintAccumulator};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -274,8 +275,9 @@ impl<T: Clone> Window<T> {
     }
 }
 
-pub struct TraceVerifier {
+pub struct TraceVerifier<'a> {
     pub trace_commitment: TraceCommitment,
+    pub cfs: &'a ControlFlowSchema,
 
     pub fingerprint_acc: FingerprintAccumulator,
     pub latest_frontier: TraceTreeFrontier,
@@ -289,8 +291,8 @@ pub enum VerificationResult {
     Fraud(TraceWindow),
 }
 
-impl TraceVerifier {
-    pub fn new(trace_commitment: TraceCommitment, seed: &[u8]) -> Self {
+impl<'a> TraceVerifier<'a> {
+    pub fn new(trace_commitment: TraceCommitment, seed: &[u8], cfs: &'a ControlFlowSchema) -> Self {
         let mut trace_tree = TraceTree::new(1);
         trace_tree.append(Bytes(seed.to_vec()));
 
@@ -306,6 +308,7 @@ impl TraceVerifier {
 
         Self {
             trace_commitment,
+            cfs,
 
             fingerprint_acc,
             latest_frontier: init_frontier,
@@ -535,7 +538,9 @@ mod tests {
     fn test_verify_trace_returns_ok_for_matching_trace() {
         let trace = Trace((0..5).map(|i| make_tile_trace_item(i, i)).collect());
         let trace_commitment = TraceCommitment::from(&trace, &precomputed::EMPTY_TRIE_NODES[0]);
-        let mut trace_verifier = TraceVerifier::new(trace_commitment, &precomputed::EMPTY_TRIE_NODES[0]);
+        let cfs = ControlFlowSchema::new("test");
+        let mut trace_verifier =
+            TraceVerifier::new(trace_commitment, &precomputed::EMPTY_TRIE_NODES[0], &cfs);
 
         let verification_result = trace_verifier.verify_trace(&trace);
         assert!(matches!(verification_result, VerificationResult::Ok));
@@ -549,7 +554,9 @@ mod tests {
 
         let trace_commitment =
             TraceCommitment::from(&committed_trace, &precomputed::EMPTY_TRIE_NODES[0]);
-        let mut trace_verifier = TraceVerifier::new(trace_commitment, &precomputed::EMPTY_TRIE_NODES[0]);
+        let cfs = ControlFlowSchema::new("test");
+        let mut trace_verifier =
+            TraceVerifier::new(trace_commitment, &precomputed::EMPTY_TRIE_NODES[0], &cfs);
 
         let verification_result = trace_verifier.verify_trace(&runtime_trace);
         assert!(matches!(
