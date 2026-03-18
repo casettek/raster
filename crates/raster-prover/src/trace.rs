@@ -375,6 +375,16 @@ impl TraceVerifier {
 
         VerificationResult::Ok
     }
+
+    pub fn verify_trace(&mut self, trace: &Trace) -> VerificationResult {
+        for item in trace.iter() {
+            if let VerificationResult::Fraud(fraud_window) = self.verify(item) {
+                return VerificationResult::Fraud(fraud_window);
+            }
+        }
+
+        VerificationResult::Ok
+    }
 }
 
 #[cfg(test)]
@@ -390,8 +400,8 @@ mod tests {
         StepRecord::TileExec(TileExecRecord {
             exec_index: input,
             sequence_id: "test_sequence".to_string(),
-            intra_sequence_index: input,
-            coordinates: CfsCoordinates([0]),
+            intra_sequence_index: input as u32,
+            coordinates: CfsCoordinates(vec![0]),
             fn_call_record: FnCallRecord {
                 fn_name: format!("test_tile_{}", input),
                 desc: None,
@@ -408,21 +418,21 @@ mod tests {
 
     #[test]
     fn trace_should_be_not_equal() {
-        let items: Vec<StepRecord> = vec![
+        let items = Trace(vec![
             make_tile_trace_item(0, 0),
             make_tile_trace_item(1, 1),
             make_tile_trace_item(2, 2),
             make_tile_trace_item(3, 3),
             make_tile_trace_item(4, 4),
-        ];
+        ]);
 
-        let ref_items: Vec<StepRecord> = vec![
+        let ref_items = Trace(vec![
             make_tile_trace_item(0, 0),
             make_tile_trace_item(1, 1),
             make_tile_trace_item(5, 5), // Different
             make_tile_trace_item(3, 3),
             make_tile_trace_item(4, 4),
-        ];
+        ]);
 
         let binded_trace = TraceCommitment::from(&items, &precomputed::EMPTY_TRIE_NODES[0]);
         let ref_binded_trace = TraceCommitment::from(&ref_items, &precomputed::EMPTY_TRIE_NODES[0]);
@@ -440,7 +450,7 @@ mod tests {
 
     #[test]
     fn test_try_from_empty_trace() {
-        let items: Vec<StepRecord> = vec![];
+        let items = Trace::new();
         let result = TraceCommitment::try_from(&items, &precomputed::EMPTY_TRIE_NODES[0]);
         assert!(matches!(result, Err(BitPackerError::EmptyTrace)));
     }
@@ -519,5 +529,32 @@ mod tests {
                 i + 1
             );
         }
+    }
+
+    #[test]
+    fn test_verify_trace_returns_ok_for_matching_trace() {
+        let trace = Trace((0..5).map(|i| make_tile_trace_item(i, i)).collect());
+        let trace_commitment = TraceCommitment::from(&trace, &precomputed::EMPTY_TRIE_NODES[0]);
+        let mut trace_verifier = TraceVerifier::new(trace_commitment, &precomputed::EMPTY_TRIE_NODES[0]);
+
+        let verification_result = trace_verifier.verify_trace(&trace);
+        assert!(matches!(verification_result, VerificationResult::Ok));
+    }
+
+    #[test]
+    fn test_verify_trace_returns_fraud_for_mismatched_trace() {
+        let committed_trace = Trace((0..5).map(|i| make_tile_trace_item(i, i)).collect());
+        let mut runtime_trace = committed_trace.clone();
+        runtime_trace[2] = make_tile_trace_item(2, 999);
+
+        let trace_commitment =
+            TraceCommitment::from(&committed_trace, &precomputed::EMPTY_TRIE_NODES[0]);
+        let mut trace_verifier = TraceVerifier::new(trace_commitment, &precomputed::EMPTY_TRIE_NODES[0]);
+
+        let verification_result = trace_verifier.verify_trace(&runtime_trace);
+        assert!(matches!(
+            verification_result,
+            VerificationResult::Fraud(_)
+        ));
     }
 }

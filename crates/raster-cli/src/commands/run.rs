@@ -333,16 +333,14 @@ pub fn commit(trace: &Trace, commit_path: &str) {
 pub fn verify(trace: &Trace, commit_path: &str) -> VerificationResult {
     let trace_commitment = read_trace_commitment(commit_path);
 
-    let actual_trace_commitment = TraceCommitment::from(trace, &EMPTY_TRIE_NODES[0]);
-
     let mut trace_verifier: TraceVerifier =
         TraceVerifier::new(trace_commitment, &EMPTY_TRIE_NODES[0]);
 
-    for step_record in trace.iter() {
-        if let VerificationResult::Fraud(fraud_window) = trace_verifier.verify(step_record) {
-            println!("verification result: \nfraud: {:?}", fraud_window);
-            return VerificationResult::Fraud(fraud_window);
-        }
+    let verification_result = trace_verifier.verify_trace(trace);
+
+    if let VerificationResult::Fraud(fraud_window) = verification_result {
+        println!("verification result: \nfraud: {:?}", fraud_window);
+        return VerificationResult::Fraud(fraud_window);
     }
 
     VerificationResult::Ok
