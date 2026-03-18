@@ -298,7 +298,6 @@ impl CallVisitor {
 
 impl<'ast> Visit<'ast> for CallVisitor {
     fn visit_local(&mut self, node: &'ast Local) {
-        // Extract the binding name from the let pattern
         let binding_name = Self::extract_binding_name(&node.pat);
 
         // Set the current binding context before visiting the initializer

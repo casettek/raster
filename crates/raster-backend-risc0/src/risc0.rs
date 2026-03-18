@@ -1,16 +1,18 @@
 //! RISC0 zkVM backend implementation.
 
+use rayon::prelude::*;
+
 use crate::guest_builder::GuestBuilder;
+use raster_backend::backend::HexString;
 use raster_backend::{
     ArtifactStore, Backend, CompilationArtifact, ExecutionMode, ResourceEstimate,
     TileExecutionResult,
 };
 use raster_core::postcard;
-use risc0_zkvm::{default_executor, ExecutorEnv, ProverOpts};
+use risc0_zkvm::{default_executor, ExecutorEnv};
 use serde::{Deserialize, Serialize};
 use std::any::Any;
 use std::fs;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use raster_core::{tile::TileMetadata, Error, Result};
@@ -21,11 +23,9 @@ pub struct Risc0CompilationArtifact {
     /// The compiled guest ELF binary.
     pub elf: Vec<u8>,
     /// The image ID for the compiled tile.
-    pub image_id: Vec<u8>,
+    pub image_id: HexString,
     /// The tile ID this executable is for.
     pub tile_id: String,
-    /// Path where artifacts were written (if applicable).
-    pub artifact_dir: Option<PathBuf>,
 }
 
 impl CompilationArtifact for Risc0CompilationArtifact {
@@ -33,12 +33,8 @@ impl CompilationArtifact for Risc0CompilationArtifact {
         &self.tile_id
     }
 
-    fn artifact_id(&self) -> Vec<u8> {
+    fn artifact_id(&self) -> HexString {
         self.image_id.clone()
-    }
-
-    fn path(&self) -> &Path {
-        self.artifact_dir.as_ref().unwrap()
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -54,8 +50,7 @@ impl CompilationArtifact for Risc0CompilationArtifact {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Risc0Manifest {
     tile_id: String,
-    method_id: String,
-    elf_size: usize,
+    image_id: String,
     source_hash: Option<String>,
 }
 
@@ -63,7 +58,6 @@ struct Risc0Manifest {
 pub struct Risc0ArtifactStore;
 
 impl Risc0ArtifactStore {
-    /// Create a new RISC0 artifact store.
     pub fn new() -> Self {
         Self
     }
@@ -78,32 +72,34 @@ impl Default for Risc0ArtifactStore {
 impl ArtifactStore for Risc0ArtifactStore {
     fn save(
         &self,
-        executable: &dyn CompilationArtifact,
+        artifact: &dyn CompilationArtifact,
         output_dir: &Path,
-        source_hash: Option<&str>,
+        source_hash: Option<String>,
     ) -> Result<PathBuf> {
-        let risc0 = executable
+        let risc0_artifact = artifact
             .as_any()
             .downcast_ref::<Risc0CompilationArtifact>()
-            .ok_or_else(|| Error::Other("Invalid executable type for Risc0ArtifactStore".into()))?;
+            .ok_or_else(|| Error::Other("Invalid artifact type for Risc0ArtifactStore".into()))?;
 
-        let artifact_dir = output_dir.join("tiles").join(&risc0.tile_id).join("risc0");
+        let artifact_dir = output_dir
+            .join("tiles")
+            .join(&risc0_artifact.tile_id)
+            .join("risc0");
 
         fs::create_dir_all(&artifact_dir).map_err(Error::Io)?;
 
-        // Write ELF
-        fs::write(artifact_dir.join("guest.elf"), &risc0.elf).map_err(Error::Io)?;
+        let image_id = &risc0_artifact.image_id;
 
-        // Write method ID (hex encoded)
-        fs::write(artifact_dir.join("method_id"), hex::encode(&risc0.image_id))
+        fs::write(artifact_dir.join(format!("{}.elf", source_hash.as_deref().unwrap_or("none"))), &risc0_artifact.elf)
             .map_err(Error::Io)?;
+
+        fs::write(artifact_dir.join("image_id"), image_id).map_err(Error::Io)?;
 
         // Write manifest
         let manifest = Risc0Manifest {
-            tile_id: risc0.tile_id.clone(),
-            method_id: hex::encode(&risc0.image_id),
-            elf_size: risc0.elf.len(),
-            source_hash: source_hash.map(String::from),
+            tile_id: risc0_artifact.tile_id.clone(),
+            image_id: image_id.clone(),
+            source_hash,
         };
         let manifest_json = serde_json::to_string_pretty(&manifest)
             .map_err(|e| Error::Serialization(e.to_string()))?;
@@ -117,36 +113,38 @@ impl ArtifactStore for Risc0ArtifactStore {
         &self,
         tile_id: &str,
         output_dir: &Path,
-        source_hash: Option<&str>,
+        source_hash: Option<String>,
     ) -> Option<Box<dyn CompilationArtifact>> {
         let artifact_dir = output_dir.join("tiles").join(tile_id).join("risc0");
 
         let manifest_content = fs::read_to_string(artifact_dir.join("manifest.json")).ok()?;
         let manifest: Risc0Manifest = serde_json::from_str(&manifest_content).ok()?;
 
+        let elf_path = fs::read_dir(&artifact_dir)
+            .ok()?
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| path.is_file() && path.extension().is_some_and(|ext| ext == "elf"))?;
+
+        let elf_name = elf_path.file_name()?.to_str().map(String::from);
+        let elf = fs::read(elf_path).ok()?;
+
+        let compiled_source_hash = elf_name;
+
         // Validate source hash
-        if manifest.source_hash.as_deref() != source_hash {
+        // TODO: no additional manifest required for validating source hash just check file name
+        if manifest.source_hash != source_hash {
+            return None;
+        }
+        if compiled_source_hash != source_hash {
             return None;
         }
 
-        let elf = fs::read(artifact_dir.join("guest.elf")).ok()?;
-        let method_id = hex::decode(&manifest.method_id).ok()?;
-
         Some(Box::new(Risc0CompilationArtifact {
             elf,
-            image_id: method_id,
+            image_id: manifest.image_id,
             tile_id: tile_id.to_string(),
-            artifact_dir: Some(artifact_dir),
         }))
-    }
-
-    fn needs_recompilation(
-        &self,
-        tile_id: &str,
-        output_dir: &Path,
-        source_hash: Option<&str>,
-    ) -> bool {
-        self.load(tile_id, output_dir, source_hash).is_none()
     }
 }
 
@@ -209,15 +207,13 @@ impl Backend for Risc0Backend {
     fn compile_tile(
         &self,
         metadata: &TileMetadata,
-        content_hash: Option<&str>,
+        content_hash: Option<String>,
     ) -> Result<Box<dyn CompilationArtifact>> {
         let tile_id = &metadata.id.0;
 
-        // TODO: move content hashing to the artifact store
-        // Check cache first - RISC0 builds are expensive, so caching is important
-        if let Some(cached) = self
-            .artifact_store
-            .load(tile_id, &self.output_dir, content_hash)
+        if let Some(cached) =
+            self.artifact_store
+                .load(tile_id, &self.output_dir, content_hash.clone())
         {
             return Ok(cached);
         }
@@ -246,28 +242,21 @@ impl Backend for Risc0Backend {
             fs::read(&elf_path).map_err(|e| Error::Other(format!("Failed to read ELF: {}", e)))?;
 
         // Compute the image ID (method ID)
-        let method_id = risc0_zkvm::compute_image_id(&elf)
+        let image_id = risc0_zkvm::compute_image_id(&elf)
             .map_err(|e| Error::Other(format!("Failed to compute image ID: {}", e)))?;
 
-        // Create the artifact
+        let image_id = hex::encode(image_id);
+
         let artifact = Risc0CompilationArtifact {
             elf,
-            image_id: method_id.as_bytes().to_vec(),
+            image_id,
             tile_id: tile_id.to_string(),
-            artifact_dir: None, // Will be set after saving
         };
 
-        // Save to cache for future builds
-        let artifact_dir = self
-            .artifact_store
+        self.artifact_store
             .save(&artifact, &self.output_dir, content_hash)?;
 
-        Ok(Box::new(Risc0CompilationArtifact {
-            elf: artifact.elf,
-            image_id: artifact.image_id,
-            tile_id: artifact.tile_id,
-            artifact_dir: Some(artifact_dir),
-        }))
+        Ok(Box::new(artifact))
     }
 
     fn execute_tile(
@@ -355,11 +344,11 @@ impl Backend for Risc0Backend {
 
     fn verify_receipt(
         &self,
-        executable: &dyn CompilationArtifact,
+        artifact: &dyn CompilationArtifact,
         receipt_bytes: &[u8],
     ) -> Result<bool> {
         // Downcast to Risc0Executable
-        let risc0 = executable
+        let risc0 = artifact
             .as_any()
             .downcast_ref::<Risc0CompilationArtifact>()
             .ok_or_else(|| Error::Other("Expected Risc0Executable".into()))?;

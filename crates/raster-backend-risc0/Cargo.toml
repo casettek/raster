@@ -22,6 +22,7 @@ thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 bincode.workspace = true
+rayon.workspace = true
 
 # RISC0 zkVM dependencies
 risc0-zkvm = { version = "1.2", default-features = false, features = ["prove", "std"] }

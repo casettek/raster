@@ -10,66 +10,21 @@ use std::cmp::Ordering;
 use bridgetree::{Hashable, Level, NonEmptyFrontier, Position};
 use risc0_zkvm::guest::env;
 
+use raster_core::cfs::{CfsCoordinates, CfsCursor, ControlFlowSchema};
 use raster_core::fingerprint::{Fingerprint, FingerprintAccumulator};
-
 use raster_core::trace::StepRecord;
+use raster_core::transition::{
+    SerializableFrontier, Transition, TransitionInput, TransitionJournal, TransitionState,
+};
 
 use serde::{Deserialize, Serialize};
 
 use sha2::{Digest, Sha256};
 
-// ============================================================================
-// Wire-format types (same layout as host for postcard compatibility)
-// ============================================================================
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Bytes(pub Vec<u8>);
 
 pub type TraceBridgeTree = bridgetree::BridgeTree<Bytes, u64, 32>;
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct SerializableFrontier {
-    pub position: u64,
-    pub leaf: Vec<u8>,
-    pub ommers: Vec<Vec<u8>>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TransitionInput {
-    pub trace_item: StepRecord,
-
-    pub replay_image_id: Vec<u8>,
-}
-
-#[derive(Clone, Serialize, Deserialize, PartialEq)]
-pub struct Transition {
-    pub frontier: SerializableFrontier,
-    pub actual_fingerprint_acc: FingerprintAccumulator,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-pub struct InitTransitionState {
-    pub init_frontier: SerializableFrontier,
-    pub fingerprint: Fingerprint,
-    // TODO: Init Transition should verify proof of inclusion of reference fingerprint
-    // pub ref_fingerprint_inclusion_proof: Vec<u8>,
-    // TODO: Init Transition should contain reference to CFS
-    // pub cfs: Vec<u8>,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-pub enum TransitionState {
-    Init(InitTransitionState),
-    Next(Transition),
-    Finished,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-pub struct TransitionJournal {
-    pub init_state: InitTransitionState,
-    pub current_state: TransitionState,
-
-    pub self_image_id: Vec<u8>,
-}
 
 // ============================================================================
 // Bytes + Hashable for bridgetree (matches prover's empty leaf and combine)
@@ -118,25 +73,23 @@ impl Hashable for Bytes {
 }
 
 // ============================================================================
-// SerializableFrontier <-> NonEmptyFrontier<Bytes>
+// SerializableFrontier <-> NonEmptyFrontier<Bytes> (guest-local conversion)
 // ============================================================================
 
-impl SerializableFrontier {
-    fn to_frontier(&self) -> Option<NonEmptyFrontier<Bytes>> {
-        NonEmptyFrontier::from_parts(
-            Position::from(self.position),
-            Bytes(self.leaf.clone()),
-            self.ommers.iter().map(|o| Bytes(o.clone())).collect(),
-        )
-        .ok()
-    }
+fn ser_frontier_to_frontier(ser: &SerializableFrontier) -> Option<NonEmptyFrontier<Bytes>> {
+    NonEmptyFrontier::from_parts(
+        Position::from(ser.position),
+        Bytes(ser.leaf.clone()),
+        ser.ommers.iter().map(|o| Bytes(o.clone())).collect(),
+    )
+    .ok()
+}
 
-    fn from_frontier(frontier: &NonEmptyFrontier<Bytes>) -> Self {
-        Self {
-            position: frontier.position().into(),
-            leaf: frontier.leaf().0.clone(),
-            ommers: frontier.ommers().iter().map(|o| o.0.clone()).collect(),
-        }
+fn frontier_to_ser_frontier(frontier: &NonEmptyFrontier<Bytes>) -> SerializableFrontier {
+    SerializableFrontier {
+        position: frontier.position().into(),
+        leaf: frontier.leaf().0.clone(),
+        ommers: frontier.ommers().iter().map(|o| o.0.clone()).collect(),
     }
 }
 
@@ -144,54 +97,109 @@ impl SerializableFrontier {
 // Hashing
 // ============================================================================
 
-/// Hash a StepRecord using SHA256 of its postcard-serialized form.
+/// Hash a TileExecRecord using SHA256 of its postcard-serialized form.
 fn hash_trace_item(item: &StepRecord) -> Vec<u8> {
-    let data = postcard::to_allocvec(item).expect("Failed to serialize StepRecord");
+    let data = postcard::to_allocvec(item).expect("Failed to serialize TileExecRecord");
     let mut hasher = Sha256::new();
     hasher.update(&data);
     hasher.finalize().to_vec()
 }
 
+fn step_coordinates(step: &StepRecord) -> &CfsCoordinates {
+    match step {
+        StepRecord::TileExec(tile_exec_record) => &tile_exec_record.coordinates,
+        StepRecord::SequenceStart(seq_start_record) => &seq_start_record.coordinates,
+        StepRecord::SequenceEnd(seq_end_record) => &seq_end_record.coordinates,
+    }
+}
+
+fn verify_step_record(step: &StepRecord, replay_image_id: Option<&Vec<u8>>) {
+    match step {
+        StepRecord::TileExec(tile_exec_record) => {
+            let replay_image_id = replay_image_id
+                .expect("replay image id should be provided for tile execution should ");
+            let replay_image_id_digest = risc0_zkvm::sha::Digest::try_from(replay_image_id.as_slice())
+                .expect("image_id must be 32 bytes");
+
+            env::verify(
+                replay_image_id_digest,
+                &tile_exec_record.fn_call_record.output_data,
+            )
+            .expect("Failed to verify trace replay image id");
+        }
+        StepRecord::SequenceStart(_) => {}
+        StepRecord::SequenceEnd(_) => {}
+    }
+}
+
+fn advance_expected_next_coordinates(
+    cfs_cursor: &CfsCursor,
+    step: &StepRecord,
+    expected: Option<&Vec<CfsCoordinates>>,
+) -> Vec<CfsCoordinates> {
+    let coordinates = step_coordinates(step);
+    if let Some(expected_next_coordinates) = expected {
+        assert!(
+            expected_next_coordinates.contains(coordinates),
+            "Step coordinates are not in expected next coordinates"
+        );
+    }
+
+    cfs_cursor
+        .try_get_next_coordinates(coordinates)
+        .expect("Wrong tile coordinates")
+}
+
+fn advance_frontier_root_fingerprint(
+    frontier: &mut NonEmptyFrontier<Bytes>,
+    step_record: &StepRecord,
+    fingerprint_acc: &mut FingerprintAccumulator,
+) -> SerializableFrontier {
+    let item_hash = hash_trace_item(step_record);
+    frontier.append(Bytes(item_hash));
+
+    let tree = TraceBridgeTree::from_frontier(1, frontier.clone());
+    let Some(tree_root) = tree.root(0) else {
+        panic!("Can't get tree root");
+    };
+    fingerprint_acc.append(&tree_root.0);
+
+    frontier_to_ser_frontier(frontier)
+}
+
 // ============================================================================
 // Main
 // ============================================================================
-
 fn main() {
+    let cfs: ControlFlowSchema = env::read();
     let self_image_id: Vec<u8> = env::read();
 
     let input: TransitionInput = env::read();
     let state: TransitionState = env::read();
 
+    let cfs_cursor = CfsCursor::new(cfs);
+
     match state {
         TransitionState::Init(init_transition) => {
-            let mut init_frontier = init_transition
-                .init_frontier
-                .to_frontier()
+            let mut init_frontier = ser_frontier_to_frontier(&init_transition.init_frontier)
                 .expect("Invalid frontier in input");
 
-            let replay_image_id_digest =
-                risc0_zkvm::sha::Digest::try_from(input.replay_image_id.as_slice())
-                    .expect("image_id must be 32 bytes");
-            env::verify(replay_image_id_digest, &input.trace_item.fn_call_record.output_data)
-                .expect("Failed to verify trace replay image id");
-
-            let item_hash = hash_trace_item(&input.trace_item);
-            init_frontier.append(Bytes(item_hash.clone()));
-
-            let tree = TraceBridgeTree::from_frontier(1, init_frontier.clone());
-            let Some(tree_root) = tree.root(0) else {
-                panic!("Can't get tree root");
-            };
+            verify_step_record(&input.step_record, input.replay_image_id.as_ref());
+            let expected_next_coordinates =
+                advance_expected_next_coordinates(&cfs_cursor, &input.step_record, None);
 
             let mut actual_fingerprint_acc =
-                FingerprintAccumulator::new(init_transition.fingerprint.bits_packer.clone());
-            actual_fingerprint_acc.append(&tree_root.0);
-
-            let new_frontier = SerializableFrontier::from_frontier(&init_frontier);
+                FingerprintAccumulator::new(init_transition.fingerprint.bits_packer);
+            let new_frontier = advance_frontier_root_fingerprint(
+                &mut init_frontier,
+                &input.step_record,
+                &mut actual_fingerprint_acc,
+            );
 
             let current_state = TransitionState::Next(Transition {
                 frontier: new_frontier,
                 actual_fingerprint_acc,
+                expected_next_coordinates,
             });
 
             let journal = TransitionJournal {
@@ -227,30 +235,22 @@ fn main() {
                 "Transition Expected to be the same as the previous journal Transition"
             );
 
-            let mut current_frontier = transition
-                .frontier
-                .to_frontier()
-                .expect("Invalid frontier in input");
+            let mut current_frontier =
+                ser_frontier_to_frontier(&transition.frontier).expect("Invalid frontier in input");
 
-            let replay_image_id_digest =
-                risc0_zkvm::sha::Digest::try_from(input.replay_image_id.as_slice())
-                    .expect("image_id must be 32 bytes");
-            // TODO: Maybe replay guest should have full trace item as output journal
-            env::verify(replay_image_id_digest, &input.trace_item.fn_call_record.output_data)
-                .expect("Failed to verify trace replay image id");
-
-            let item_hash = hash_trace_item(&input.trace_item);
-            current_frontier.append(Bytes(item_hash.clone()));
-
-            let tree = TraceBridgeTree::from_frontier(1, current_frontier.clone());
-            let Some(tree_root) = tree.root(0) else {
-                panic!("Can't get tree root");
-            };
+            verify_step_record(&input.step_record, input.replay_image_id.as_ref());
+            let expected_next_coordinates = advance_expected_next_coordinates(
+                &cfs_cursor,
+                &input.step_record,
+                Some(&transition.expected_next_coordinates),
+            );
 
             let mut actual_fingerprint_acc = transition.actual_fingerprint_acc.clone();
-            actual_fingerprint_acc.append(&tree_root.0);
-
-            let new_frontier = SerializableFrontier::from_frontier(&current_frontier);
+            let new_frontier = advance_frontier_root_fingerprint(
+                &mut current_frontier,
+                &input.step_record,
+                &mut actual_fingerprint_acc,
+            );
 
             let actual_fingerprint: Fingerprint = actual_fingerprint_acc.into_fingerprint();
 
@@ -271,6 +271,7 @@ fn main() {
                     TransitionState::Next(Transition {
                         frontier: new_frontier,
                         actual_fingerprint_acc: FingerprintAccumulator::from(actual_fingerprint),
+                        expected_next_coordinates,
                     })
                 };
             let journal = TransitionJournal {

@@ -1,22 +1,18 @@
 //! Build orchestration for Raster projects.
+use raster_core::Error;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use raster_core::Error;
 
-use crate::{
-    backend::BackendImpl,
-    tile::TileDiscovery,
-    Project,
-};
-use raster_backend::{
-    Backend, CompilationArtifact, ExecutionMode, TileExecutionResult,
-};
-use raster_core::{
-    Result, manifest::Manifest, registry::{TileRegistration, iter_tiles} 
-};
 use crate::tile::Tile;
+use crate::{backend::BackendImpl, tile::TileDiscovery, Project};
+use raster_backend::{Backend, CompilationArtifact, ExecutionMode, TileExecutionResult};
+use raster_core::{
+    manifest::Manifest,
+    registry::{iter_tiles, TileRegistration},
+    Result,
+};
 /// Orchestrates the build process for a Raster project.
 pub struct Builder<'ast, 'b> {
     /// The backend to use for compilation (shared via Arc for TileRunner).
@@ -25,19 +21,14 @@ pub struct Builder<'ast, 'b> {
     project: &'ast Project,
 }
 
-
 pub trait TileBuilder<'ast> {
     fn build(&self, tile_id: &str) -> Result<TileArtifact>;
 }
 
 impl<'ast, 'b> Builder<'ast, 'b> {
     pub fn new(project: &'ast Project, backend: &'b BackendImpl) -> Self {
-        Self {
-            backend,
-            project,
-        }
+        Self { backend, project }
     }
-
 
     pub fn backend_name(&self) -> &'static str {
         self.backend.name()
@@ -51,92 +42,90 @@ impl<'ast, 'b> Builder<'ast, 'b> {
         iter_tiles().collect()
     }
 
-    /// Build all tiles discovered from source files.
-    ///
-    /// This is the preferred method for CLI usage since it doesn't require
-    /// the tiles to be linked into the CLI binary.
-    pub fn build_from_source(&self) -> Result<BuildOutput> {
-        let tile_discovery = TileDiscovery::new(&self.project);
+    // /// Build all tiles discovered from source files.
+    // ///
+    // /// This is the preferred method for CLI usage since it doesn't require
+    // /// the tiles to be linked into the CLI binary.
+    // pub fn build_from_source(&self) -> Result<BuildOutput> {
+    //     let tile_discovery = TileDiscovery::new(&self.project);
+    //
+    //     let tiles = tile_discovery.tiles;
+    //     if tiles.is_empty() {
+    //         return Ok(BuildOutput {
+    //             tiles_compiled: 0,
+    //             skipped_cached: 0,
+    //             schemas_generated: 0,
+    //             artifacts: HashMap::new(),
+    //             backend: self.backend.name().to_string(),
+    //         });
+    //     }
+    //
+    //     let mut artifacts = HashMap::new();
+    //     let mut compiled = 0;
+    //
+    //     for tile in tiles {
+    //         let tile_id = tile.id().to_string();
+    //
+    //         let metadata = tile.to_metadata();
+    //         let content_hash = tile.to_content_hash();
+    //
+    //         match self.backend.compile_tile(&metadata, content_hash) {
+    //             Ok(executable) => {
+    //                 let artifact = TileArtifact {
+    //                     tile_id: tile_id.clone(),
+    //                     artifact_dir: executable.path().to_path_buf(),
+    //                 };
+    //                 artifacts.insert(tile_id.clone(), artifact);
+    //                 compiled += 1;
+    //             }
+    //             Err(e) => {
+    //                 eprintln!("Warning: Failed to compile tile '{}': {}", tile_id, e);
+    //             }
+    //         }
+    //     }
+    //
+    //     Ok(BuildOutput {
+    //         tiles_compiled: compiled,
+    //         skipped_cached: 0, // Backend handles caching internally now
+    //         schemas_generated: 0,
+    //         artifacts,
+    //         backend: self.backend.name().to_string(),
+    //     })
+    // }
+    //
 
-        let tiles = tile_discovery.tiles;
-        if tiles.is_empty() {
-            return Ok(BuildOutput {
-                tiles_compiled: 0,
-                skipped_cached: 0,
-                schemas_generated: 0,
-                artifacts: HashMap::new(),
-                backend: self.backend.name().to_string(),
-            });
-        }
-
-        let mut artifacts = HashMap::new();
-        let mut compiled = 0;
-
-        for tile in tiles {
-            let tile_id = tile.id().to_string();
-            
-            let metadata = tile.to_metadata();
-            let content_hash = tile.to_content_hash();
-
-            match self.backend.compile_tile(&metadata, content_hash.as_deref()) {
-                Ok(executable) => {
-                    let artifact = TileArtifact {
-                        tile_id: tile_id.clone(),
-                        artifact_dir: executable.path().to_path_buf()
-                    };
-                    artifacts.insert(tile_id.clone(), artifact);
-                    compiled += 1;
-                }
-                Err(e) => {
-                    eprintln!("Warning: Failed to compile tile '{}': {}", tile_id, e);
-                }
-            }
-        }
-
-        Ok(BuildOutput {
-            tiles_compiled: compiled,
-            skipped_cached: 0, // Backend handles caching internally now
-            schemas_generated: 0,
-            artifacts,
-            backend: self.backend.name().to_string(),
-        })
-    }
-
-
-    /// Build all tiles and schemas from a manifest.
-    pub fn build(&self, manifest: &Manifest) -> Result<BuildOutput> {
-        let mut artifacts = HashMap::new();
-        let mut compiled = 0;
-
-        for tile_meta in &manifest.tiles {
-            let tile_id = &tile_meta.id.0;
-            // Compile tile - backend handles caching internally
-            // TODO: fix caching with content hash
-            match self.backend.compile_tile(tile_meta, None) {
-                Ok(executable) => {
-                    let artifact = TileArtifact {
-                        tile_id: tile_id.clone(),
-                        artifact_dir: executable
-                            .path()
-                            .to_path_buf(),
-                    };
-                    artifacts.insert(tile_id.clone(), artifact);
-                    compiled += 1;
-                }
-                Err(e) => {
-                    eprintln!("Warning: Failed to compile tile '{}': {}", tile_id, e);
-                }
-            }
-        }
-
-        Ok(BuildOutput {
-            tiles_compiled: compiled,
-            skipped_cached: 0,
-            schemas_generated: manifest.sequences.len(),
-            artifacts,
-            backend: self.backend.name().to_string(),
-        })
-    }
+    // /// Build all tiles and schemas from a manifest.
+    // pub fn build(&self, manifest: &Manifest) -> Result<BuildOutput> {
+    //     let mut artifacts = HashMap::new();
+    //     let mut compiled = 0;
+    //
+    //     for tile_meta in &manifest.tiles {
+    //         let tile_id = &tile_meta.id.0;
+    //         // Compile tile - backend handles caching internally
+    //         // TODO: fix caching with content hash
+    //         match self.backend.compile_tile(tile_meta, None) {
+    //             Ok(executable) => {
+    //                 let artifact = TileArtifact {
+    //                     tile_id: tile_id.clone(),
+    //                     artifact_dir: executable.path().to_path_buf(),
+    //                 };
+    //                 artifacts.insert(tile_id.clone(), artifact);
+    //                 compiled += 1;
+    //             }
+    //             Err(e) => {
+    //                 eprintln!("Warning: Failed to compile tile '{}': {}", tile_id, e);
+    //             }
+    //         }
+    //     }
+    //
+    //     Ok(BuildOutput {
+    //         tiles_compiled: compiled,
+    //         skipped_cached: 0,
+    //         schemas_generated: manifest.sequences.len(),
+    //         artifacts,
+    //         backend: self.backend.name().to_string(),
+    //     })
+    // }
 
     /// Build a tile and return the executable directly.
     ///
@@ -145,14 +134,11 @@ impl<'ast, 'b> Builder<'ast, 'b> {
     ///
     /// Returns (executable, artifact_dir, was_cached).
     /// Note: was_cached is always false now since caching is internal to the backend.
-    pub fn build_tile(
-        &self,
-        tile: &Tile<'ast>,
-    ) -> Result<Box<dyn CompilationArtifact>> {
+    pub fn build_tile(&self, tile: &Tile<'ast>) -> Result<Box<dyn CompilationArtifact>> {
         let metadata = tile.to_metadata();
         let content_hash = tile.to_content_hash();
-            // Compile tile - backend handles caching internally
-        let artifact = self.backend.compile_tile(&metadata, content_hash.as_deref())?;
+        // Compile tile - backend handles caching internally
+        let artifact = self.backend.compile_tile(&metadata, content_hash)?;
 
         return Ok(artifact);
     }
@@ -163,8 +149,7 @@ impl<'ast, 'b> Builder<'ast, 'b> {
     /// Uses `build_tile_executable` internally to get the executable directly,
     /// avoiding the unnecessary reload pattern.
     pub fn build_tile_runner<'a>(&self, tile: &'a Tile<'a>) -> Result<TileRunner<'a, 'b>> {
-        let artifact =
-            self.build_tile(tile)?;
+        let artifact = self.build_tile(tile)?;
 
         Ok(TileRunner {
             backend: &self.backend,
@@ -301,8 +286,7 @@ impl<'ast, 'b> TileRunner<'ast, 'b> {
             (0, Some(_)) => Err(Error::Other(format!(
                 "Tile '{}' takes no arguments, but --input was provided.\n\
                  Signature: {}",
-                tile_function.name,
-                tile_function.signature
+                tile_function.name, tile_function.signature
             ))),
 
             // Inputs expected, none provided
@@ -318,8 +302,8 @@ impl<'ast, 'b> TileRunner<'ast, 'b> {
 
             // Both present - validate structure
             (n, Some(input_json)) => {
-                let value: serde_json::Value =
-                    serde_json::from_str(input_json).map_err(|e| Error::Other(format!("Failed to parse input JSON: {}", e)))?;
+                let value: serde_json::Value = serde_json::from_str(input_json)
+                    .map_err(|e| Error::Other(format!("Failed to parse input JSON: {}", e)))?;
 
                 if n == 1 {
                     // Single argument - validate it's not an array (unless type is array)
@@ -424,7 +408,6 @@ impl<'ast, 'b> TileRunner<'ast, 'b> {
         }
     }
 }
-
 
 /// A compiled sequence ready to run.
 ///

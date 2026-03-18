@@ -1,17 +1,26 @@
 //! Run command: build and execute the user program as a whole.
 
-use std::collections::BTreeMap;
+use rand::seq::IndexedMutRandom;
+use raster_backend::backend::HexString;
+use rayon::prelude::*;
+
+use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
+use std::thread;
 
-use raster_backend::ExecutionMode;
+use raster_backend::{Backend, ExecutionMode};
 use raster_backend_risc0::Risc0Backend;
 
-use raster_compiler::Project;
+use raster_compiler::tile::TileDiscovery;
+use raster_compiler::{CfsBuilder, Project};
 
-use raster_core::trace::{StepRecord, TraceWindow};
+use raster_core::cfs::{CfsCoordinates, CfsCursor, ControlFlowSchema};
+use raster_core::tile::TileId;
+use raster_core::trace::{SequenceStartRecord, StepRecord, TileExecRecord, Trace, TraceWindow};
+use raster_core::transition::TransitionJournal;
 use raster_core::{Error, Result};
 
 use raster_prover::precomputed::EMPTY_TRIE_NODES;
@@ -19,17 +28,16 @@ use raster_prover::replay::{ReplayResult, Replayer};
 use raster_prover::trace::{
     SerializableFrontier, TraceCommitment, TraceVerifier, VerificationResult,
 };
-use raster_prover::transition::{replay_transitions, TransitionJournal};
+use raster_prover::transition::step_transitions;
 
 use crate::BackendType;
-
-pub struct Trace(Vec<StepRecord>);
 
 pub fn run(
     backend_type: BackendType,
     input: Option<&str>,
     commit_flag: Option<&str>,
     audit_flag: Option<&str>,
+    verbose: bool,
 ) -> Result<()> {
     if backend_type != BackendType::Native {
         return Err(Error::Other(
@@ -41,6 +49,12 @@ pub fn run(
 
     let project_path = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let project = Project::new(project_path).expect("Failed to read project");
+
+    println!("Control Flow Schema build..");
+    let cfs_builder = CfsBuilder::new(&project);
+    let cfs = cfs_builder
+        .build()
+        .map_err(|e| Error::Other(format!("Failed to build CFS: {}", e)))?;
 
     println!("Building project...");
 
@@ -79,11 +93,11 @@ pub fn run(
 
     let mut child = cmd.spawn()?;
 
-    let mut trace: Arc<Mutex<Vec<StepRecord>>> = Arc::new(Mutex::new(Vec::new()));
-    let mut log = Arc::new(Mutex::new(Vec::new()));
+    let mut trace: Arc<Mutex<Trace>> = Arc::new(Mutex::new(Trace::new()));
+    let mut reader_trace = Arc::clone(&trace);
 
-    let reader_trace = Arc::clone(&trace);
-    let reader_log = Arc::clone(&log);
+    let mut log = Arc::new(Mutex::new(Vec::new()));
+    let mut reader_log = Arc::clone(&log);
 
     let stdout = child.stdout.take().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::Other, "Could not capture stdout")
@@ -147,18 +161,71 @@ pub fn run(
         .into_inner()
         .unwrap();
 
-    for log_line in log {
-        println!("{log_line}");
+    if verbose {
+        if !log.is_empty() {
+            println!("Verbose log:");
+            for log_line in log {
+                println!("{log_line}");
+            }
+        }
     }
 
-    for error_line in errors {
-        println!("{error_line}");
+    if !errors.is_empty() {
+        println!("Error:");
+        for error_line in errors {
+            println!("{error_line}");
+        }
     }
 
     let mut trace = Arc::try_unwrap(trace)
         .expect("Cant move list out of Mutex. Some thread still holding copy of Arc")
         .into_inner()
         .unwrap();
+
+    // Build all project tiles with Risc0
+    // TODO: Risc0 build can be perfomed in parallel to native user program execution
+
+    println!("Build Risc0 artifacts...");
+    let backend =
+        Risc0Backend::new(project.output_dir.clone()).with_user_crate(project.root_dir.clone());
+
+    let mut cfs_cursor = CfsCursor::new(cfs.clone());
+
+    let mut trace_coordinates: Vec<CfsCoordinates> = Vec::new();
+    let mut current_coordinates: CfsCoordinates;
+    for step_record in trace.iter() {
+        match step_record {
+            StepRecord::TileExec(tile_record) => {
+                trace_coordinates.push(tile_record.coordinates.clone());
+            }
+            StepRecord::SequenceEnd(sequence_end_record) => {
+                trace_coordinates.push(sequence_end_record.coordinates.clone());
+            }
+            StepRecord::SequenceStart(sequence_start_record) => {
+                trace_coordinates.push(sequence_start_record.coordinates.clone());
+            }
+        }
+    }
+
+    // let tiles_discovery = TileDiscovery::new(&project);
+    // let tiles = tiles_discovery.tiles;
+    //
+    // let artifact_registry: HashMap<TileId, HexString> = tiles
+    //     .into_par_iter()
+    //     .map(|tile| {
+    //         let tile_metadata = tile.to_metadata();
+    //         let content_hash = tile.to_content_hash();
+    //
+    //         let artifact = backend.compile_tile(&tile_metadata, content_hash).unwrap();
+    //
+    //         // Return a tuple of (Key, Value)
+    //         (tile_metadata.id, artifact.artifact_id())
+    //     })
+    //     .collect();
+    //
+    // for (tile_id, image_id) in &artifact_registry {
+    //     println!("Registered: {:?}", tile_id);
+    // }
 
     if commit_flag.is_some() {
         let commit_path = commit_flag.expect("Commitment path was provided");
@@ -178,43 +245,71 @@ pub fn run(
         match verification_result {
             VerificationResult::Ok => println!("Verification Success"),
             VerificationResult::Fraud(fraud_window) => {
-                let backend = Risc0Backend::new(project.output_dir.clone())
-                    .with_user_crate(project.root_dir.clone());
-
                 let replayer = Replayer::new(&backend, &project);
-                let _fraud_proof = prove(fraud_window, &replayer);
+                let _fraud_proof = prove(fraud_window, &cfs, &replayer);
+                println!("Faurd proof generated");
             }
         }
     } else {
         // TODO: in case of just simple execution did printing out trace items is enough or save
         // them to file
-        //
 
         for step_record in trace {
-            let padding = "\t".repeat(step_record.sequence_callstack_depth.try_into().unwrap());
-            println!("\n{padding}exec_index: {}", step_record.exec_index);
-            println!("{padding}sequence_id: {}", step_record.sequence_id);
-            println!(
-                "{padding}sequence_coordinates: {:?}",
-                step_record.sequence_coordinates,
-            );
+            match step_record {
+                StepRecord::TileExec(tile_exec_record) => {
+                    println!("\nexec_index: {}", tile_exec_record.exec_index);
+                    println!("sequence_id: {}", tile_exec_record.sequence_id);
+                    println!("tile_coordinates: {:?}", tile_exec_record.coordinates,);
 
-            println!("{padding}tile_id: {}", step_record.fn_call_record.fn_name);
+                    println!("tile_id: {}", tile_exec_record.fn_call_record.fn_name);
+                }
+                StepRecord::SequenceStart(sequence_start_record) => {
+                    println!(
+                        "[sequence start] sequence id: {}",
+                        sequence_start_record.sequence_id
+                    );
+                    println!(
+                        "sequence coordinates: {:?}",
+                        sequence_start_record.coordinates
+                    );
+                }
+                StepRecord::SequenceEnd(sequence_end_record) => {
+                    println!(
+                        "[sequence end] sequence id: {}",
+                        sequence_end_record.sequence_id
+                    );
+                    println!(
+                        "sequence coordinates: {:?}",
+                        sequence_end_record.coordinates
+                    );
+                }
+            }
         }
     }
 
     Ok(())
 }
 
-pub fn fraud(trace_items: &mut [StepRecord], commit_path: &str) {
+pub fn fraud(trace: &mut Trace, commit_path: &str) {
     let mut commitment_file =
         std::fs::File::create(commit_path).expect("Failed to create commitemt file");
 
-    if let Some(fraud_step) = trace_items.last_mut() {
-        fraud_step.fn_call_record.output_data = vec![0u8, 1u8];
+    let mut rng = rand::rng();
+    if let Some(fraud_step) = trace.choose_mut(&mut rng) {
+        match fraud_step {
+            StepRecord::TileExec(tile_exec_record) => {
+                tile_exec_record.fn_call_record.output_data = vec![0u8, 1u8];
+            }
+            StepRecord::SequenceStart(sequence_start_record) => {
+                sequence_start_record.input_data.push(0);
+            }
+            StepRecord::SequenceEnd(sequence_end_record) => {
+                sequence_end_record.output_data.push(0);
+            }
+        }
     };
 
-    let trace_commitment = TraceCommitment::from(trace_items, &EMPTY_TRIE_NODES[0]);
+    let trace_commitment = TraceCommitment::from(trace, &EMPTY_TRIE_NODES[0]);
 
     let bytes = postcard::to_allocvec(&trace_commitment).unwrap();
 
@@ -223,11 +318,11 @@ pub fn fraud(trace_items: &mut [StepRecord], commit_path: &str) {
         .expect("Failed to save commitment");
 }
 
-pub fn commit(trace_items: &[StepRecord], commit_path: &str) {
+pub fn commit(trace: &Trace, commit_path: &str) {
     let mut commitment_file =
         std::fs::File::create(commit_path).expect("Failed to create commitemt file");
 
-    let trace_commitment = TraceCommitment::from(trace_items, &EMPTY_TRIE_NODES[0]);
+    let trace_commitment = TraceCommitment::from(trace, &EMPTY_TRIE_NODES[0]);
     let bytes = postcard::to_allocvec(&trace_commitment).unwrap();
 
     commitment_file
@@ -235,16 +330,16 @@ pub fn commit(trace_items: &[StepRecord], commit_path: &str) {
         .expect("Failed to save commitment");
 }
 
-pub fn verify(trace_items: &[StepRecord], commit_path: &str) -> VerificationResult {
+pub fn verify(trace: &Trace, commit_path: &str) -> VerificationResult {
     let trace_commitment = read_trace_commitment(commit_path);
 
-    let actual_trace_commitment = TraceCommitment::from(trace_items, &EMPTY_TRIE_NODES[0]);
+    let actual_trace_commitment = TraceCommitment::from(trace, &EMPTY_TRIE_NODES[0]);
 
     let mut trace_verifier: TraceVerifier =
         TraceVerifier::new(trace_commitment, &EMPTY_TRIE_NODES[0]);
 
-    for trace_item in trace_items {
-        if let VerificationResult::Fraud(fraud_window) = trace_verifier.verify(trace_item) {
+    for step_record in trace.iter() {
+        if let VerificationResult::Fraud(fraud_window) = trace_verifier.verify(step_record) {
             println!("verification result: \nfraud: {:?}", fraud_window);
             return VerificationResult::Fraud(fraud_window);
         }
@@ -253,20 +348,27 @@ pub fn verify(trace_items: &[StepRecord], commit_path: &str) -> VerificationResu
     VerificationResult::Ok
 }
 
-pub fn prove(fraud_window: TraceWindow, replayer: &Replayer) -> risc0_zkvm::Receipt {
+pub fn prove(
+    fraud_window: TraceWindow,
+    cfs: &ControlFlowSchema,
+    replayer: &Replayer,
+) -> risc0_zkvm::Receipt {
     let mode = ExecutionMode::prove_and_verify();
 
     let mut replayed_results: BTreeMap<String, ReplayResult> = BTreeMap::new();
 
-    for (i, item) in fraud_window.items.iter().enumerate() {
-        print!("  [{}] {} ... ", i, item.fn_call_record.fn_name);
-
-        match replayer.replay(item, mode) {
-            Ok(replay_result) => {
-                replayed_results.insert(item.fn_call_record.fn_name.clone(), replay_result.clone());
-            }
-            Err(e) => {
-                println!("FAILED: {}", e);
+    for (i, step_record) in fraud_window.items.iter().enumerate() {
+        if let StepRecord::TileExec(tile_exec) = step_record {
+            match replayer.replay(tile_exec, mode) {
+                Ok(replay_result) => {
+                    replayed_results.insert(
+                        tile_exec.fn_call_record.fn_name.clone(),
+                        replay_result.clone(),
+                    );
+                }
+                Err(e) => {
+                    println!("FAILED to replay: {}", e);
+                }
             }
         }
     }
@@ -275,10 +377,11 @@ pub fn prove(fraud_window: TraceWindow, replayer: &Replayer) -> risc0_zkvm::Rece
         println!();
         println!("Replaying transition frontier with transition guest...");
 
-        let Some(receipt) = replay_transitions(
+        let Some(receipt) = step_transitions(
             &frontier,
             &fraud_window.items,
             fraud_window.fingerprint,
+            &cfs,
             &replayed_results,
         ) else {
             panic!("Failed to generate fraud proof");

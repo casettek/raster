@@ -1,9 +1,12 @@
 use raster_backend_native::NativeBackend;
 use raster_backend_risc0::Risc0Backend;
 
-use raster_backend::{Backend, CompilationArtifact, ExecutionMode, TileExecutionResult, ArtifactStore,  ResourceEstimate};
+use raster_backend::{
+    ArtifactStore, Backend, CompilationArtifact, ExecutionMode, ResourceEstimate,
+    TileExecutionResult,
+};
 
-use raster_core::{Result, tile::TileMetadata};
+use raster_core::{tile::TileMetadata, Result};
 
 /// Enum of all available backends.
 pub enum BackendImpl {
@@ -19,7 +22,11 @@ impl Backend for BackendImpl {
         }
     }
 
-    fn compile_tile(&self, tile: &TileMetadata, content_hash: Option<&str>) -> Result<Box<dyn CompilationArtifact>> {
+    fn compile_tile(
+        &self,
+        tile: &TileMetadata,
+        content_hash: Option<String>,
+    ) -> Result<Box<dyn CompilationArtifact>> {
         match self {
             BackendImpl::Native(b) => b.compile_tile(tile, content_hash),
             BackendImpl::Risc0(b) => b.compile_tile(tile, content_hash),
@@ -59,3 +66,4 @@ impl Backend for BackendImpl {
         }
     }
 }
+

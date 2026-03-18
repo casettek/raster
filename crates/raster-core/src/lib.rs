@@ -27,6 +27,9 @@ pub mod schema;
 pub mod trace;
 
 #[cfg(feature = "std")]
+pub mod transition;
+
+#[cfg(feature = "std")]
 pub mod fingerprint;
 
 // The registry module uses linkme which doesn't support RISC-V targets

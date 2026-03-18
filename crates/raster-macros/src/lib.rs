@@ -317,7 +317,7 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
                 // Execute original body via closure to handle early returns
                 let __raster_result = (|| #fn_body)();
 
-                // Serialize output and emit TraceEvent::Tile
+                // Serialize output and emit TraceEvent::TileExec
                 let __raster_output_bytes = ::raster::core::postcard::to_allocvec(&__raster_result)
                     .unwrap_or_default();
 
@@ -339,7 +339,7 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
                     output_type: #trace_output_type_expr.map(|s: &str| ::alloc::string::String::from(s)),
                     output_data: __raster_output_bytes.clone(),
                 };
-                ::raster::emit_trace_event(::raster::core::trace::TraceEvent::Tile(
+                ::raster::emit_trace_event(::raster::core::trace::TraceEvent::TileExec(
                     __raster_tile_record,
                 ));
 

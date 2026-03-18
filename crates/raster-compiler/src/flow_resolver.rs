@@ -3,8 +3,7 @@
 //! This module resolves how data flows between tiles in a sequence by tracking
 //! variable bindings and mapping them to `InputSource` references.
 
-use raster_core::cfs::{InputBinding, InputSource, SequenceChild, SequenceItem, TileItem};
-use raster_core::tile::TileId;
+use raster_core::cfs::{InputBinding, InputSource, SequenceChildItem, SequenceItem, TileItem};
 use std::collections::HashMap;
 
 use crate::ast::{CallInfo, CallKind};
@@ -38,7 +37,7 @@ impl<'a, 'ast> FlowResolver<'a, 'ast> {
     }
 
     /// Resolve a discovered sequence into a list of `SequenceChild`s with input sources.
-    pub fn resolve(&mut self, sequence: &Sequence<'ast>) -> Vec<SequenceChild> {
+    pub fn resolve(&mut self, sequence: &Sequence<'ast>) -> Vec<SequenceChildItem> {
         // Reset state for this sequence
         self.bindings.clear();
         self.param_indices.clear();
@@ -75,11 +74,11 @@ impl<'a, 'ast> FlowResolver<'a, 'ast> {
 
             // Call kind directly determines item type — no name-matching needed.
             let item = match call.call_kind {
-                CallKind::Tile => SequenceChild::Tile(TileItem {
+                CallKind::Tile => SequenceChildItem::Tile(TileItem {
                     id: call.callee.clone(),
                     sources: input_sources,
                 }),
-                CallKind::Sequence => SequenceChild::Sequence(SequenceItem {
+                CallKind::Sequence => SequenceChildItem::Sequence(SequenceItem {
                     id: call.callee.clone(),
                     sources: input_sources,
                 }),
@@ -263,7 +262,7 @@ mod tests {
 
         // First item: greet(name) where name is seq_input[0]
         match &items[0] {
-            SequenceChild::Tile(tile_item) => {
+            SequenceChildItem::Tile(tile_item) => {
                 assert_eq!(tile_item.id, "greet");
                 assert_eq!(tile_item.sources.len(), 1);
                 match &tile_item.sources[0].source {
@@ -276,7 +275,7 @@ mod tests {
 
         // Second item: exclaim(greeting) where greeting is item_output[0][0]
         match &items[1] {
-            SequenceChild::Tile(tile_item) => {
+            SequenceChildItem::Tile(tile_item) => {
                 assert_eq!(tile_item.id, "exclaim");
                 assert_eq!(tile_item.sources.len(), 1);
                 match &tile_item.sources[0].source {

@@ -1,6 +1,7 @@
 //! Trace types (requires std feature).
 
 use serde::{Deserialize, Serialize};
+use std::ops::{Deref, DerefMut};
 use std::string::String;
 use std::vec::Vec;
 
@@ -37,13 +38,75 @@ pub struct FnCallRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StepRecord {
+pub struct TileExecRecord {
     pub exec_index: u64,
+
     pub sequence_id: String,
-    pub intra_sequence_index: u64,
-    pub sequence_callstack_depth: u64,
-    pub sequence_coordinates: CfsCoordinates,
+    pub coordinates: CfsCoordinates,
+
+    pub intra_sequence_index: u32,
     pub fn_call_record: FnCallRecord,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SequenceStartRecord {
+    pub exec_index: u64,
+
+    pub sequence_id: String,
+    pub coordinates: CfsCoordinates,
+
+    pub inputs: Vec<FnInputParam>,
+    pub input_data: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SequenceEndRecord {
+    pub exec_index: u64,
+
+    pub sequence_id: String,
+    pub coordinates: CfsCoordinates,
+
+    pub output_type: Option<String>,
+    pub output_data: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum StepRecord {
+    SequenceStart(SequenceStartRecord),
+    SequenceEnd(SequenceEndRecord),
+    TileExec(TileExecRecord),
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Trace(pub Vec<StepRecord>);
+
+impl Trace {
+    pub fn new() -> Self {
+        Trace(Vec::new())
+    }
+}
+
+impl Deref for Trace {
+    type Target = Vec<StepRecord>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for Trace {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl IntoIterator for Trace {
+    type Item = StepRecord;
+    type IntoIter = std::vec::IntoIter<StepRecord>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
 }
 
 // TODO: after extracting logic from user process, this should be moved out of core
@@ -59,9 +122,10 @@ pub struct TraceWindow {
     pub items: Vec<StepRecord>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TraceEvent {
     SequenceStart(FnCallRecord),
     SequenceEnd(FnCallRecord),
 
-    Tile(FnCallRecord),
+    TileExec(FnCallRecord),
 }

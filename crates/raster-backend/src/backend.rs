@@ -45,26 +45,7 @@ impl ExecutionMode {
     }
 }
 
-/// Result of compiling a tile.
-///
-/// NOTE: This struct is deprecated and will be removed. Use the Executable trait instead.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TileExecDescriptor {
-    /// The compiled guest ELF binary.
-    pub elf: Vec<u8>,
-
-    /// The method ID (image ID) for the compiled tile.
-    /// This is a unique identifier derived from the ELF.
-    pub method_id: Vec<u8>,
-
-    /// The tile ID this compilation is for.
-    #[serde(default)]
-    pub tile_id: String,
-
-    /// Path where artifacts were written (if applicable).
-    pub artifact_dir: Option<PathBuf>,
-    pub exec_path: Option<PathBuf>,
-}
+pub type HexString = String;
 
 /// Opaque executable descriptor - each backend defines its own concrete type.
 ///
@@ -77,10 +58,7 @@ pub trait CompilationArtifact: Send + Sync + Any {
 
     // TODO: currently acrifact id is exposed just to get image_id for Risc0 artifact
     /// Get artifact ID
-    fn artifact_id(&self) -> Vec<u8>;
-
-    /// Get the artifact directory (if persisted).
-    fn path(&self) -> &Path;
+    fn artifact_id(&self) -> HexString;
 
     /// Downcast to concrete type (for backend internal use).
     fn as_any(&self) -> &dyn Any;
@@ -108,7 +86,7 @@ pub trait ArtifactStore: Send + Sync {
         &self,
         artifact: &dyn CompilationArtifact,
         output_dir: &Path,
-        source_hash: Option<&str>,
+        source_hash: Option<String>,
     ) -> Result<PathBuf>;
 
     /// Load a cached executable if valid.
@@ -124,19 +102,8 @@ pub trait ArtifactStore: Send + Sync {
         &self,
         id: &str,
         output_dir: &Path,
-        source_hash: Option<&str>,
+        source_hash: Option<String>,
     ) -> Option<Box<dyn CompilationArtifact>>;
-
-    /// Check if recompilation is needed.
-    ///
-    /// # Arguments
-    /// * `tile_id` - The tile ID to check
-    /// * `output_dir` - The base output directory
-    /// * `source_hash` - Optional hash to validate against cached artifacts
-    ///
-    /// # Returns
-    /// True if recompilation is needed, false if cache is valid.
-    fn needs_recompilation(&self, id: &str, output_dir: &Path, source_hash: Option<&str>) -> bool;
 }
 
 /// RISC0's minimum segment size for proving (2^16).
@@ -224,7 +191,7 @@ pub trait Backend: Send + Sync {
     fn compile_tile(
         &self,
         tile: &TileMetadata,
-        content_hash: Option<&str>,
+        content_hash: Option<String>,
     ) -> Result<Box<dyn CompilationArtifact>>;
 
     /// Execute a tile with the given input.

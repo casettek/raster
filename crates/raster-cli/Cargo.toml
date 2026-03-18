@@ -35,3 +35,5 @@ serde_json.workspace = true
 postcard.workspace = true
 bincode.workspace = true
 hex = "0.4"
+rayon.workspace = true
+rand.workspace = true
