@@ -105,14 +105,6 @@ fn hash_trace_item(item: &StepRecord) -> Vec<u8> {
     hasher.finalize().to_vec()
 }
 
-fn step_coordinates(step: &StepRecord) -> &CfsCoordinates {
-    match step {
-        StepRecord::TileExec(tile_exec_record) => &tile_exec_record.coordinates,
-        StepRecord::SequenceStart(seq_start_record) => &seq_start_record.coordinates,
-        StepRecord::SequenceEnd(seq_end_record) => &seq_end_record.coordinates,
-    }
-}
-
 fn verify_step_record(step: &StepRecord, replay_image_id: Option<&Vec<u8>>) {
     match step {
         StepRecord::TileExec(tile_exec_record) => {
@@ -137,7 +129,7 @@ fn advance_expected_next_coordinates(
     step: &StepRecord,
     expected: Option<&Vec<CfsCoordinates>>,
 ) -> Vec<CfsCoordinates> {
-    let coordinates = step_coordinates(step);
+    let coordinates = step.coordinates();
     if let Some(expected_next_coordinates) = expected {
         assert!(
             expected_next_coordinates.contains(coordinates),

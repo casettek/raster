@@ -419,12 +419,9 @@ pub enum SequenceChildItem {
     Tile(TileItem),
 }
 
-/// An item within a sequence (either a tile or a nested sequence).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SequenceItem {
-    /// ID of the sequence being invoked.
     pub id: SequenceId,
-    /// Sources for each input to this item.
     pub sources: Vec<InputBinding>,
 }
 
@@ -437,19 +434,14 @@ impl From<SequenceDef> for SequenceItem {
     }
 }
 
-/// An item within a sequence (either a tile or a nested sequence).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TileItem {
-    /// ID of the tile being invoked.
     pub id: TileId,
-    /// Sources for each input to this item.
     pub sources: Vec<InputBinding>,
 }
 
-/// A binding that specifies where an input value comes from.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InputBinding {
-    /// The source of this input.
     pub source: InputSource,
 }
 

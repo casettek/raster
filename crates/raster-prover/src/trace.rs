@@ -4,7 +4,7 @@
 //! commitments to execution traces using incremental Merkle trees.
 
 use bridgetree::{Hashable, Level, NonEmptyFrontier};
-use raster_core::cfs::ControlFlowSchema;
+use raster_core::cfs::{CfsCursor, ControlFlowSchema, SequenceChildItem};
 use raster_core::fingerprint::{Fingerprint, FingerprintAccumulator};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -380,8 +380,54 @@ impl<'a> TraceVerifier<'a> {
     }
 
     pub fn verify_trace(&mut self, trace: &Trace) -> VerificationResult {
-        for item in trace.iter() {
-            if let VerificationResult::Fraud(fraud_window) = self.verify(item) {
+        let cfs_cursor = CfsCursor::new(self.cfs.clone());
+
+        for step_record in trace.iter() {
+            if step_record.coordinates().is_empty() {
+                match step_record {
+                    StepRecord::SequenceStart(sequence_start_record) => assert_eq!(
+                        sequence_start_record.sequence_id, "main",
+                        "Empty coordinates must point to the main sequence"
+                    ),
+                    StepRecord::SequenceEnd(sequence_end_record) => assert_eq!(
+                        sequence_end_record.sequence_id, "main",
+                        "Empty coordinates must point to the main sequence"
+                    ),
+                    StepRecord::TileExec(_) => {
+                        panic!("TileExec record cannot have empty coordinates");
+                    }
+                }
+            } else {
+                let cfs_item = cfs_cursor
+                    .try_get_child_item(step_record.coordinates())
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "Failed to resolve cfs item for coordinates: {:?}",
+                            step_record.coordinates()
+                        )
+                    });
+
+                match (step_record, cfs_item) {
+                    (StepRecord::TileExec(_), SequenceChildItem::Tile(_)) => {}
+                    (StepRecord::SequenceStart(_), SequenceChildItem::Sequence(_)) => {}
+                    (StepRecord::SequenceEnd(_), SequenceChildItem::Sequence(_)) => {}
+                    (StepRecord::TileExec(_), _) => {
+                        panic!(
+                            "Coordinates {:?} should resolve to a tile cfs item",
+                            step_record.coordinates()
+                        );
+                    }
+                    (StepRecord::SequenceStart(_), _) | (StepRecord::SequenceEnd(_), _) => {
+                        panic!(
+                            "Coordinates {:?} should resolve to a sequence cfs item",
+                            step_record.coordinates()
+                        );
+                    }
+                }
+            }
+
+            if let VerificationResult::Fraud(fraud_window) = self.verify(step_record) {
                 return VerificationResult::Fraud(fraud_window);
             }
         }
@@ -392,7 +438,7 @@ impl<'a> TraceVerifier<'a> {
 
 #[cfg(test)]
 mod tests {
-    use raster_core::cfs::CfsCoordinates;
+    use raster_core::cfs::{CfsCoordinates, InputBinding, SequenceChildItem, SequenceDef, TileDef, TileItem};
     use raster_core::trace::{FnCallRecord, FnInputParam, TileExecRecord};
 
     use super::*;
@@ -417,6 +463,18 @@ mod tests {
                 output_data: output.to_le_bytes().to_vec(),
             },
         })
+    }
+
+    fn make_test_cfs() -> ControlFlowSchema {
+        let mut cfs = ControlFlowSchema::new("test");
+        cfs.tiles.push(TileDef::iter("test_tile", 1, 1));
+        let mut main = SequenceDef::new("main");
+        main.items.push(SequenceChildItem::Tile(TileItem {
+            id: "test_tile".to_string(),
+            sources: vec![InputBinding::external()],
+        }));
+        cfs.sequences.push(main);
+        cfs
     }
 
     #[test]
@@ -538,7 +596,7 @@ mod tests {
     fn test_verify_trace_returns_ok_for_matching_trace() {
         let trace = Trace((0..5).map(|i| make_tile_trace_item(i, i)).collect());
         let trace_commitment = TraceCommitment::from(&trace, &precomputed::EMPTY_TRIE_NODES[0]);
-        let cfs = ControlFlowSchema::new("test");
+        let cfs = make_test_cfs();
         let mut trace_verifier =
             TraceVerifier::new(trace_commitment, &precomputed::EMPTY_TRIE_NODES[0], &cfs);
 
@@ -554,7 +612,7 @@ mod tests {
 
         let trace_commitment =
             TraceCommitment::from(&committed_trace, &precomputed::EMPTY_TRIE_NODES[0]);
-        let cfs = ControlFlowSchema::new("test");
+        let cfs = make_test_cfs();
         let mut trace_verifier =
             TraceVerifier::new(trace_commitment, &precomputed::EMPTY_TRIE_NODES[0], &cfs);
 

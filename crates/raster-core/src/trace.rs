@@ -77,6 +77,16 @@ pub enum StepRecord {
     TileExec(TileExecRecord),
 }
 
+impl StepRecord {
+    pub fn coordinates(&self) -> &CfsCoordinates {
+        match self {
+            StepRecord::TileExec(tile_exec_record) => &tile_exec_record.coordinates,
+            StepRecord::SequenceStart(sequence_start_record) => &sequence_start_record.coordinates,
+            StepRecord::SequenceEnd(sequence_end_record) => &sequence_end_record.coordinates,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Trace(pub Vec<StepRecord>);
 
