@@ -1,5 +1,6 @@
 //! Run command: build and execute the user program as a whole.
 
+use rand::seq::IndexedMutRandom;
 use raster_backend::backend::HexString;
 use rayon::prelude::*;
 
@@ -293,7 +294,8 @@ pub fn fraud(trace: &mut Trace, commit_path: &str) {
     let mut commitment_file =
         std::fs::File::create(commit_path).expect("Failed to create commitemt file");
 
-    if let Some(fraud_step) = trace.last_mut() {
+    let mut rng = rand::rng();
+    if let Some(fraud_step) = trace.choose_mut(&mut rng) {
         match fraud_step {
             StepRecord::TileExec(tile_exec_record) => {
                 tile_exec_record.fn_call_record.output_data = vec![0u8, 1u8];

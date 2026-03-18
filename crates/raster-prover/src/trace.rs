@@ -98,7 +98,6 @@ pub fn serializable_frontier_from_trace_frontier(frontier: TraceTreeFrontier) ->
         leaf: frontier.leaf().clone().0,
         ommers: frontier
             .ommers()
-            .clone()
             .iter()
             .map(|o| o.clone().0)
             .collect(),
