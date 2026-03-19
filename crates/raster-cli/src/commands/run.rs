@@ -26,7 +26,7 @@ use raster_core::{Error, Result};
 use raster_prover::precomputed::EMPTY_TRIE_NODES;
 use raster_prover::replay::{ReplayResult, Replayer};
 use raster_prover::trace::{
-    SerializableFrontier, TraceCommitment, TraceVerifier, VerificationResult,
+    FraudEvidence, SerializableFrontier, TraceCommitment, TraceVerifier, VerificationResult,
 };
 use raster_prover::transition::step_transitions;
 
@@ -244,9 +244,9 @@ pub fn run(
 
         match verification_result {
             VerificationResult::Ok => println!("Verification Success"),
-            VerificationResult::Fraud(fraud_window) => {
+            VerificationResult::Fraud(fraud_evidence) => {
                 let replayer = Replayer::new(&backend, &project);
-                let _fraud_proof = prove(fraud_window, &cfs, &replayer);
+                let _fraud_proof = prove(fraud_evidence, &cfs, &replayer);
                 println!("Faurd proof generated");
             }
         }
@@ -335,22 +335,18 @@ pub fn verify(trace: &Trace, commit_path: &str, cfs: &ControlFlowSchema) -> Veri
 
     let mut trace_verifier = TraceVerifier::new(trace_commitment, &EMPTY_TRIE_NODES[0], cfs);
 
-    let verification_result = trace_verifier.verify_trace(trace);
+    let verification_result = trace_verifier.verify(trace);
 
-    if let VerificationResult::Fraud(fraud_window) = verification_result {
-        println!("verification result: \nfraud: {:?}", fraud_window);
-        return VerificationResult::Fraud(fraud_window);
+    if let VerificationResult::Fraud(fraud_evidence) = verification_result {
+        return VerificationResult::Fraud(fraud_evidence);
     }
 
     VerificationResult::Ok
 }
 
-pub fn prove(
-    fraud_window: TraceWindow,
-    cfs: &ControlFlowSchema,
-    replayer: &Replayer,
-) -> risc0_zkvm::Receipt {
+pub fn prove(fraud_evidence: FraudEvidence, cfs: &ControlFlowSchema, replayer: &Replayer) -> risc0_zkvm::Receipt {
     let mode = ExecutionMode::prove_and_verify();
+    let fraud_window: TraceWindow = fraud_evidence.window;
 
     let mut replayed_results: BTreeMap<String, ReplayResult> = BTreeMap::new();
 

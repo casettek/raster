@@ -381,14 +381,10 @@ pub enum SequenceChildId {
     Tile(TileId),
 }
 
-/// Definition of a sequence in the CFS.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SequenceDef {
-    /// Unique identifier for the sequence (function name).
     pub id: SequenceId,
-    /// Sources for the sequence's own inputs.
     pub input_sources: Vec<InputBinding>,
-    /// Ordered list of items (tiles or nested sequences) in this sequence.
     pub items: Vec<SequenceChildItem>,
 }
 
@@ -417,6 +413,15 @@ impl SequenceDef {
 pub enum SequenceChildItem {
     Sequence(SequenceItem),
     Tile(TileItem),
+}
+
+impl SequenceChildItem {
+    pub fn sources(&self) -> &[InputBinding] {
+        match self {
+            SequenceChildItem::Sequence(sequence_item) => &sequence_item.sources,
+            SequenceChildItem::Tile(tile_item) => &tile_item.sources,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

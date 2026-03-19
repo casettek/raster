@@ -4,7 +4,9 @@
 //! commitments to execution traces using incremental Merkle trees.
 
 use bridgetree::{Hashable, Level, NonEmptyFrontier};
-use raster_core::cfs::{CfsCursor, ControlFlowSchema, SequenceChildItem};
+use raster_core::cfs::{
+    CfsCoordinates, CfsCursor, ControlFlowSchema, InputBinding, InputSource, SequenceChildItem,
+};
 use raster_core::fingerprint::{Fingerprint, FingerprintAccumulator};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -93,15 +95,13 @@ impl Hashable for Bytes {
 pub use raster_core::transition::SerializableFrontier;
 
 /// Convert a trace tree frontier into a serializable form (for persistence/replay).
-pub fn serializable_frontier_from_trace_frontier(frontier: TraceTreeFrontier) -> SerializableFrontier {
+pub fn serializable_frontier_from_trace_frontier(
+    frontier: TraceTreeFrontier,
+) -> SerializableFrontier {
     SerializableFrontier {
         position: frontier.position().into(),
         leaf: frontier.leaf().clone().0,
-        ommers: frontier
-            .ommers()
-            .iter()
-            .map(|o| o.clone().0)
-            .collect(),
+        ommers: frontier.ommers().iter().map(|o| o.clone().0).collect(),
     }
 }
 
@@ -125,7 +125,6 @@ pub type TraceTreeFrontier = NonEmptyFrontier<Bytes>;
 pub const WINDOW_SIZE: u8 = 2;
 pub const BITS_PER_ITEM: usize = 16;
 
-/// Commitment to an execution trace using incremental Merkle roots.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TraceCommitment {
     pub fingerprint: Fingerprint,
@@ -275,6 +274,166 @@ impl<T: Clone> Window<T> {
     }
 }
 
+fn step_record_parent_frame(step_record: &StepRecord) -> Option<(CfsCoordinates, u32)> {
+    let coordinates = step_record.coordinates();
+    let (&current_child_index, parent_coords) = coordinates.split_last()?;
+
+    Some((CfsCoordinates(parent_coords.to_vec()), current_child_index))
+}
+
+fn resolve_input_source_records(
+    step_record: &StepRecord,
+    prior_trace: &[StepRecord],
+    cfs_cursor: &CfsCursor,
+    sources: &[InputBinding],
+) -> Vec<StepRecord> {
+    if sources
+        .iter()
+        .all(|binding| matches!(binding.source, InputSource::External))
+    {
+        return Vec::new();
+    }
+
+    let Some((parent_coords, current_child_index)) = step_record_parent_frame(step_record) else {
+        return Vec::new();
+    };
+
+    let frame_start_index = prior_trace
+        .iter()
+        .rposition(|record| {
+            matches!(
+                record,
+                StepRecord::SequenceStart(sequence_start_record)
+                    if sequence_start_record.coordinates == parent_coords
+            )
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "Failed to resolve active sequence invocation for step {:?} in frame {:?}",
+                step_record, parent_coords
+            )
+        });
+    let frame_trace = &prior_trace[frame_start_index..];
+
+    let mut producer_records = Vec::new();
+
+    for source in sources {
+        match &source.source {
+            InputSource::External => {}
+            InputSource::SeqInput { input_index } => {
+                let producer_record = frame_trace
+                    .first()
+                    .cloned()
+                    .and_then(|record| match record {
+                        StepRecord::SequenceStart(sequence_start_record)
+                            if sequence_start_record.coordinates == parent_coords =>
+                        {
+                            Some(StepRecord::SequenceStart(sequence_start_record))
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "Failed to resolve sequence input {input_index} for step {:?} in frame {:?}",
+                            step_record, parent_coords
+                        )
+                    });
+
+                producer_records.push(producer_record);
+            }
+            InputSource::ItemOutput {
+                item_index,
+                output_index,
+            } => {
+                if *item_index >= current_child_index as usize {
+                    panic!(
+                        "Step {:?} cannot depend on sibling item {} output {} from the same or a future index {}",
+                        step_record, item_index, output_index, current_child_index
+                    );
+                }
+
+                let mut producer_coordinates = parent_coords.clone();
+                producer_coordinates.push(
+                    (*item_index)
+                        .try_into()
+                        .expect("Producer item index exceeds CFS coordinate bounds"),
+                );
+
+                let producer_item = cfs_cursor
+                    .try_get_child_item(&producer_coordinates)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "Failed to resolve producer item {} for step {:?} in frame {:?}",
+                            item_index, step_record, parent_coords
+                        )
+                    });
+
+                let producer_record = frame_trace
+                    .iter()
+                    .rev()
+                    .find_map(|record| match (record, producer_item) {
+                        (StepRecord::TileExec(tile_exec_record), SequenceChildItem::Tile(_))
+                            if tile_exec_record.coordinates == producer_coordinates =>
+                        {
+                            Some(record.clone())
+                        }
+                        (StepRecord::SequenceEnd(sequence_end_record), SequenceChildItem::Sequence(_))
+                            if sequence_end_record.coordinates == producer_coordinates =>
+                        {
+                            Some(record.clone())
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "Failed to resolve producer record for step {:?} from source item {} output {} at {:?}",
+                            step_record, item_index, output_index, producer_coordinates
+                        )
+                    });
+
+                producer_records.push(producer_record);
+            }
+        }
+    }
+
+    producer_records
+}
+
+fn resolve_fraud_window_sources(
+    trace: &Trace,
+    window_end_index: usize,
+    fraud_window: &TraceWindow,
+    cfs_cursor: &CfsCursor,
+) -> Vec<StepRecord> {
+    let window_start_index = window_end_index + 1 - fraud_window.items.len();
+    let mut producer_records = Vec::new();
+
+    for (offset, step_record) in fraud_window.items.iter().enumerate() {
+        if step_record.coordinates().is_empty() {
+            continue;
+        }
+
+        let cfs_item = cfs_cursor
+            .try_get_child_item(step_record.coordinates())
+            .unwrap_or_else(|| {
+                panic!(
+                    "Failed to resolve cfs item for fraud window coordinates: {:?}",
+                    step_record.coordinates()
+                )
+            });
+        let sources = cfs_item.sources();
+        let step_index = window_start_index + offset;
+        producer_records.extend(resolve_input_source_records(
+            step_record,
+            &trace[..step_index],
+            cfs_cursor,
+            sources,
+        ));
+    }
+
+    producer_records
+}
+
 pub struct TraceVerifier<'a> {
     pub trace_commitment: TraceCommitment,
     pub cfs: &'a ControlFlowSchema,
@@ -286,9 +445,15 @@ pub struct TraceVerifier<'a> {
     pub window_items: Window<StepRecord>,
 }
 
+#[derive(Debug, Clone)]
+pub struct FraudEvidence {
+    pub window: TraceWindow,
+    pub producer_records: Vec<StepRecord>,
+}
+
 pub enum VerificationResult {
     Ok,
-    Fraud(TraceWindow),
+    Fraud(FraudEvidence),
 }
 
 impl<'a> TraceVerifier<'a> {
@@ -318,117 +483,71 @@ impl<'a> TraceVerifier<'a> {
         }
     }
 
-    pub fn verify(&mut self, item: &StepRecord) -> VerificationResult {
-        let item_frontier = self.latest_frontier.clone();
-
-        self.window_frontiers.push(item_frontier);
-        self.window_items.push(item.clone());
-
-        self.latest_frontier.append(Bytes(item.hash()));
-
-        let trace_tree = TraceTree::from_frontier(1, self.latest_frontier.clone());
-
-        let root = trace_tree
-            .root(0)
-            .expect("Failed to get Trace Merkle Tree root");
-
-        self.latest_frontier = trace_tree.frontier().unwrap().clone();
-        self.fingerprint_acc.append(&root.0);
-
-        let latest_fingerprint = self.fingerprint_acc.clone().into_fingerprint();
-
-        let index = latest_fingerprint.len() - 1;
-
-        if latest_fingerprint.bits_packer.diff_at_index(
-            index,
-            &latest_fingerprint.bits,
-            &self.trace_commitment.fingerprint.bits,
-        ) {
-            let diff_bits = self
-                .trace_commitment
-                .fingerprint
-                .bits_packer
-                .get_range(
-                    index.saturating_sub(WINDOW_SIZE.into()) + 1,
-                    index + 1,
-                    &self.trace_commitment.fingerprint.bits,
-                )
-                .unwrap();
-
-            let window_fingerprint = Fingerprint::from(
-                diff_bits,
-                self.trace_commitment.fingerprint.bits_packer,
-                WINDOW_SIZE.into(),
-            );
-
-            let window_frontier = self.window_frontiers.first().unwrap().clone();
-            let ser_window_frontier =
-                serializable_frontier_from_trace_frontier(window_frontier).to_bytes();
-
-            // TODO: consider renaming Window struct and TraceWindow have different behavior but
-            // similiar naming
-            let fraud_window = TraceWindow {
-                frontier: ser_window_frontier,
-                items: self.window_items.to_vec(),
-                fingerprint: window_fingerprint,
-            };
-
-            return VerificationResult::Fraud(fraud_window);
-        }
-
-        VerificationResult::Ok
-    }
-
-    pub fn verify_trace(&mut self, trace: &Trace) -> VerificationResult {
+    pub fn verify(&mut self, trace: &Trace) -> VerificationResult {
         let cfs_cursor = CfsCursor::new(self.cfs.clone());
 
-        for step_record in trace.iter() {
-            if step_record.coordinates().is_empty() {
-                match step_record {
-                    StepRecord::SequenceStart(sequence_start_record) => assert_eq!(
-                        sequence_start_record.sequence_id, "main",
-                        "Empty coordinates must point to the main sequence"
-                    ),
-                    StepRecord::SequenceEnd(sequence_end_record) => assert_eq!(
-                        sequence_end_record.sequence_id, "main",
-                        "Empty coordinates must point to the main sequence"
-                    ),
-                    StepRecord::TileExec(_) => {
-                        panic!("TileExec record cannot have empty coordinates");
-                    }
-                }
-            } else {
-                let cfs_item = cfs_cursor
-                    .try_get_child_item(step_record.coordinates())
-                    .cloned()
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "Failed to resolve cfs item for coordinates: {:?}",
-                            step_record.coordinates()
-                        )
-                    });
+        for (step_index, step_record) in trace.iter().enumerate() {
+            let item_frontier = self.latest_frontier.clone();
 
-                match (step_record, cfs_item) {
-                    (StepRecord::TileExec(_), SequenceChildItem::Tile(_)) => {}
-                    (StepRecord::SequenceStart(_), SequenceChildItem::Sequence(_)) => {}
-                    (StepRecord::SequenceEnd(_), SequenceChildItem::Sequence(_)) => {}
-                    (StepRecord::TileExec(_), _) => {
-                        panic!(
-                            "Coordinates {:?} should resolve to a tile cfs item",
-                            step_record.coordinates()
-                        );
-                    }
-                    (StepRecord::SequenceStart(_), _) | (StepRecord::SequenceEnd(_), _) => {
-                        panic!(
-                            "Coordinates {:?} should resolve to a sequence cfs item",
-                            step_record.coordinates()
-                        );
-                    }
-                }
-            }
+            self.window_frontiers.push(item_frontier);
+            self.window_items.push(step_record.clone());
 
-            if let VerificationResult::Fraud(fraud_window) = self.verify(step_record) {
-                return VerificationResult::Fraud(fraud_window);
+            self.latest_frontier.append(Bytes(step_record.hash()));
+
+            let trace_tree = TraceTree::from_frontier(1, self.latest_frontier.clone());
+
+            let root = trace_tree
+                .root(0)
+                .expect("Failed to get Trace Merkle Tree root");
+
+            self.latest_frontier = trace_tree.frontier().unwrap().clone();
+            self.fingerprint_acc.append(&root.0);
+
+            let latest_fingerprint = self.fingerprint_acc.clone().into_fingerprint();
+
+            let index = latest_fingerprint.len() - 1;
+
+            if latest_fingerprint.bits_packer.diff_at_index(
+                index,
+                &latest_fingerprint.bits,
+                &self.trace_commitment.fingerprint.bits,
+            ) {
+                let diff_bits = self
+                    .trace_commitment
+                    .fingerprint
+                    .bits_packer
+                    .get_range(
+                        index.saturating_sub(WINDOW_SIZE.into()) + 1,
+                        index + 1,
+                        &self.trace_commitment.fingerprint.bits,
+                    )
+                    .unwrap();
+
+                let window_fingerprint = Fingerprint::from(
+                    diff_bits,
+                    self.trace_commitment.fingerprint.bits_packer,
+                    WINDOW_SIZE.into(),
+                );
+
+                let window_frontier = self.window_frontiers.first().unwrap().clone();
+                let ser_window_frontier =
+                    serializable_frontier_from_trace_frontier(window_frontier).to_bytes();
+
+                // TODO: consider renaming Window struct and TraceWindow have different behavior but
+                // similiar naming
+                let fraud_window = TraceWindow {
+                    frontier: ser_window_frontier,
+                    items: self.window_items.to_vec(),
+                    fingerprint: window_fingerprint,
+                };
+
+                let producer_records =
+                    resolve_fraud_window_sources(trace, step_index, &fraud_window, &cfs_cursor);
+
+                return VerificationResult::Fraud(FraudEvidence {
+                    window: fraud_window,
+                    producer_records,
+                });
             }
         }
 
@@ -438,30 +557,91 @@ impl<'a> TraceVerifier<'a> {
 
 #[cfg(test)]
 mod tests {
-    use raster_core::cfs::{CfsCoordinates, InputBinding, SequenceChildItem, SequenceDef, TileDef, TileItem};
-    use raster_core::trace::{FnCallRecord, FnInputParam, TileExecRecord};
+    use raster_core::cfs::{
+        CfsCoordinates, InputBinding, SequenceChildItem, SequenceDef, SequenceItem, TileDef,
+        TileItem,
+    };
+    use raster_core::trace::{
+        FnCallRecord, FnInputParam, SequenceEndRecord, SequenceStartRecord, TileExecRecord,
+    };
 
     use super::*;
     use crate::precomputed;
 
     /// Helper function to create a step record for testing.
     fn make_tile_trace_item(input: u64, output: u64) -> StepRecord {
+        make_tile_trace_item_at(
+            input,
+            "test_sequence",
+            input as u32,
+            vec![0],
+            format!("test_tile_{input}"),
+            1,
+            output,
+        )
+    }
+
+    fn make_tile_trace_item_at(
+        exec_index: u64,
+        sequence_id: &str,
+        intra_sequence_index: u32,
+        coordinates: Vec<u32>,
+        fn_name: String,
+        input_count: usize,
+        output: u64,
+    ) -> StepRecord {
         StepRecord::TileExec(TileExecRecord {
-            exec_index: input,
-            sequence_id: "test_sequence".to_string(),
-            intra_sequence_index: input as u32,
-            coordinates: CfsCoordinates(vec![0]),
+            exec_index,
+            sequence_id: sequence_id.to_string(),
+            intra_sequence_index,
+            coordinates: CfsCoordinates(coordinates),
             fn_call_record: FnCallRecord {
-                fn_name: format!("test_tile_{}", input),
+                fn_name,
                 desc: None,
-                inputs: vec![FnInputParam {
-                    name: "input".to_string(),
-                    ty: "u64".to_string(),
-                }],
+                inputs: (0..input_count)
+                    .map(|index| FnInputParam {
+                        name: format!("input_{index}"),
+                        ty: "u64".to_string(),
+                    })
+                    .collect(),
                 input_data: Vec::new(),
                 output_type: Some("u64".to_string()),
                 output_data: output.to_le_bytes().to_vec(),
             },
+        })
+    }
+
+    fn make_sequence_start_record(
+        exec_index: u64,
+        sequence_id: &str,
+        coordinates: Vec<u32>,
+        input_count: usize,
+    ) -> StepRecord {
+        StepRecord::SequenceStart(SequenceStartRecord {
+            exec_index,
+            sequence_id: sequence_id.to_string(),
+            coordinates: CfsCoordinates(coordinates),
+            inputs: (0..input_count)
+                .map(|index| FnInputParam {
+                    name: format!("input_{index}"),
+                    ty: "u64".to_string(),
+                })
+                .collect(),
+            input_data: Vec::new(),
+        })
+    }
+
+    fn make_sequence_end_record(
+        exec_index: u64,
+        sequence_id: &str,
+        coordinates: Vec<u32>,
+    ) -> StepRecord {
+        StepRecord::SequenceEnd(SequenceEndRecord {
+            exec_index,
+            sequence_id: sequence_id.to_string(),
+            coordinates: CfsCoordinates(coordinates),
+            output_type: Some("u64".to_string()),
+            output_data: exec_index.to_le_bytes().to_vec(),
         })
     }
 
@@ -474,6 +654,58 @@ mod tests {
             sources: vec![InputBinding::external()],
         }));
         cfs.sequences.push(main);
+        cfs
+    }
+
+    fn make_item_output_dependency_cfs() -> ControlFlowSchema {
+        let mut cfs = ControlFlowSchema::new("test");
+        cfs.tiles.push(TileDef::iter("producer", 1, 1));
+        cfs.tiles.push(TileDef::iter("consumer", 1, 1));
+        cfs.tiles.push(TileDef::iter("tail", 1, 1));
+
+        let mut main = SequenceDef::new("main");
+        main.items.push(SequenceChildItem::Tile(TileItem {
+            id: "producer".to_string(),
+            sources: vec![InputBinding::external()],
+        }));
+        main.items.push(SequenceChildItem::Tile(TileItem {
+            id: "consumer".to_string(),
+            sources: vec![InputBinding::item_output(0, 0)],
+        }));
+        main.items.push(SequenceChildItem::Tile(TileItem {
+            id: "tail".to_string(),
+            sources: vec![InputBinding::external()],
+        }));
+
+        cfs.sequences.push(main);
+        cfs
+    }
+
+    fn make_sequence_input_dependency_cfs() -> ControlFlowSchema {
+        let mut cfs = ControlFlowSchema::new("test");
+        cfs.tiles.push(TileDef::iter("inner_tile", 1, 1));
+        cfs.tiles.push(TileDef::iter("tail", 1, 1));
+
+        let mut main = SequenceDef::new("main");
+        main.input_sources = vec![InputBinding::external()];
+        main.items.push(SequenceChildItem::Sequence(SequenceItem {
+            id: "inner".to_string(),
+            sources: vec![InputBinding::seq_input(0)],
+        }));
+        main.items.push(SequenceChildItem::Tile(TileItem {
+            id: "tail".to_string(),
+            sources: vec![InputBinding::external()],
+        }));
+
+        let mut inner = SequenceDef::new("inner");
+        inner.input_sources = vec![InputBinding::external()];
+        inner.items.push(SequenceChildItem::Tile(TileItem {
+            id: "inner_tile".to_string(),
+            sources: vec![InputBinding::external()],
+        }));
+
+        cfs.sequences.push(main);
+        cfs.sequences.push(inner);
         cfs
     }
 
@@ -600,7 +832,7 @@ mod tests {
         let mut trace_verifier =
             TraceVerifier::new(trace_commitment, &precomputed::EMPTY_TRIE_NODES[0], &cfs);
 
-        let verification_result = trace_verifier.verify_trace(&trace);
+        let verification_result = trace_verifier.verify(&trace);
         assert!(matches!(verification_result, VerificationResult::Ok));
     }
 
@@ -616,10 +848,68 @@ mod tests {
         let mut trace_verifier =
             TraceVerifier::new(trace_commitment, &precomputed::EMPTY_TRIE_NODES[0], &cfs);
 
-        let verification_result = trace_verifier.verify_trace(&runtime_trace);
-        assert!(matches!(
-            verification_result,
-            VerificationResult::Fraud(_)
-        ));
+        let verification_result = trace_verifier.verify(&runtime_trace);
+        assert!(matches!(verification_result, VerificationResult::Fraud(_)));
+    }
+
+    #[test]
+    fn test_verify_trace_returns_ok_for_item_output_dependency() {
+        let trace = Trace(vec![
+            make_sequence_start_record(1, "main", vec![], 0),
+            make_tile_trace_item_at(2, "main", 0, vec![0], "producer".to_string(), 1, 10),
+            make_tile_trace_item_at(3, "main", 1, vec![1], "consumer".to_string(), 1, 20),
+            make_tile_trace_item_at(4, "main", 2, vec![2], "tail".to_string(), 1, 30),
+            make_sequence_end_record(5, "main", vec![]),
+        ]);
+        let trace_commitment = TraceCommitment::from(&trace, &precomputed::EMPTY_TRIE_NODES[0]);
+        let cfs = make_item_output_dependency_cfs();
+        let mut trace_verifier =
+            TraceVerifier::new(trace_commitment, &precomputed::EMPTY_TRIE_NODES[0], &cfs);
+
+        let verification_result = trace_verifier.verify(&trace);
+        assert!(matches!(verification_result, VerificationResult::Ok));
+    }
+
+    #[test]
+    fn test_verify_trace_returns_ok_for_sequence_step_seq_input_dependency() {
+        let trace = Trace(vec![
+            make_sequence_start_record(1, "main", vec![], 1),
+            make_sequence_start_record(2, "inner", vec![0], 1),
+            make_tile_trace_item_at(3, "inner", 0, vec![0, 0], "inner_tile".to_string(), 1, 10),
+            make_sequence_end_record(4, "inner", vec![0]),
+            make_tile_trace_item_at(5, "main", 1, vec![1], "tail".to_string(), 1, 20),
+            make_sequence_end_record(6, "main", vec![]),
+        ]);
+        let trace_commitment = TraceCommitment::from(&trace, &precomputed::EMPTY_TRIE_NODES[0]);
+        let cfs = make_sequence_input_dependency_cfs();
+        let mut trace_verifier =
+            TraceVerifier::new(trace_commitment, &precomputed::EMPTY_TRIE_NODES[0], &cfs);
+
+        let verification_result = trace_verifier.verify(&trace);
+        assert!(matches!(verification_result, VerificationResult::Ok));
+    }
+
+    #[test]
+    #[should_panic(expected = "Failed to resolve producer record")]
+    fn test_verify_trace_returns_failure_for_unresolved_required_producer() {
+        let runtime_trace = Trace(vec![
+            make_sequence_start_record(1, "main", vec![], 0),
+            make_tile_trace_item_at(2, "main", 1, vec![1], "consumer".to_string(), 1, 20),
+            make_tile_trace_item_at(3, "main", 2, vec![2], "tail".to_string(), 1, 30),
+            make_sequence_end_record(4, "main", vec![]),
+        ]);
+        let committed_trace = Trace(vec![
+            make_sequence_start_record(1, "main", vec![], 0),
+            make_tile_trace_item_at(2, "main", 1, vec![1], "consumer".to_string(), 1, 999),
+            make_tile_trace_item_at(3, "main", 2, vec![2], "tail".to_string(), 1, 30),
+            make_sequence_end_record(4, "main", vec![]),
+        ]);
+        let trace_commitment =
+            TraceCommitment::from(&committed_trace, &precomputed::EMPTY_TRIE_NODES[0]);
+        let cfs = make_item_output_dependency_cfs();
+        let mut trace_verifier =
+            TraceVerifier::new(trace_commitment, &precomputed::EMPTY_TRIE_NODES[0], &cfs);
+
+        let _ = trace_verifier.verify(&runtime_trace);
     }
 }
