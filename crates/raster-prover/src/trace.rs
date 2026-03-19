@@ -492,15 +492,14 @@ impl<'a> TraceVerifier<'a> {
             self.window_frontiers.push(item_frontier);
             self.window_items.push(step_record.clone());
 
-            self.latest_frontier.append(Bytes(step_record.hash()));
+            let step_record_hash = step_record.hash();
+            self.latest_frontier.append(Bytes(step_record_hash));
 
-            let trace_tree = TraceTree::from_frontier(1, self.latest_frontier.clone());
-
-            let root = trace_tree
+            let root = self
+                .latest_frontier
                 .root(0)
                 .expect("Failed to get Trace Merkle Tree root");
 
-            self.latest_frontier = trace_tree.frontier().unwrap().clone();
             self.fingerprint_acc.append(&root.0);
 
             let latest_fingerprint = self.fingerprint_acc.clone().into_fingerprint();
