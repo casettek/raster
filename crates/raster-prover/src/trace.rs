@@ -315,15 +315,15 @@ struct IndexedStepRecord {
     record: StepRecord,
 }
 
-fn resolve_input_source_records(
+fn resolve_record_inputs(
     step_record: &StepRecord,
     trace: &[StepRecord],
     cfs_cursor: &CfsCursor,
-    sources: &[InputBinding],
+    step_inputs: &[InputBinding],
 ) -> Vec<IndexedStepRecord> {
-    if sources
+    if step_inputs 
         .iter()
-        .all(|binding| matches!(binding.source, InputSource::External))
+        .all(|input| matches!(input.source, InputSource::External))
     {
         return Vec::new();
     }
@@ -356,8 +356,8 @@ fn resolve_input_source_records(
 
     let mut producer_records = Vec::new();
 
-    for source in sources {
-        match &source.source {
+    for step_input in step_inputs {
+        match &step_input.source {
             InputSource::External => {}
             InputSource::SeqInput { input_index } => {
                 let producer_record = frame_trace
@@ -471,14 +471,13 @@ fn resolve_fraud_window_sources(
                     step_record.coordinates()
                 )
             });
-        let sources = cfs_item.sources();
         let step_index = window_start_index + offset;
 
-        for producer_record in resolve_input_source_records(
+        for producer_record in resolve_record_inputs(
             step_record,
             &trace[..step_index],
             cfs_cursor,
-            sources,
+            cfs_item.inputs(),
         ) {
             let trace_prefix = Trace(trace[..step_index].to_vec());
             let proof = TraceCommitment::witness(&trace_prefix, producer_record.index, seed)

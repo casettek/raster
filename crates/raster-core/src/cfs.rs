@@ -20,6 +20,12 @@ impl CfsCoordinates {
     pub fn new() -> Self {
         Self(Vec::new())
     }
+
+    pub fn try_parent(&self) -> Option<(CfsCoordinates, CfsCoordinate)> {
+        let (&current_child_index, parent_coords) = self.split_last()?;
+
+        Some((CfsCoordinates(parent_coords.to_vec()), current_child_index))
+    }
 }
 
 impl Default for CfsCoordinates {
@@ -416,7 +422,7 @@ pub enum SequenceChildItem {
 }
 
 impl SequenceChildItem {
-    pub fn sources(&self) -> &[InputBinding] {
+    pub fn inputs(&self) -> &[InputBinding] {
         match self {
             SequenceChildItem::Sequence(sequence_item) => &sequence_item.sources,
             SequenceChildItem::Tile(tile_item) => &tile_item.sources,

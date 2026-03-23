@@ -53,7 +53,7 @@ pub struct TransitionInput {
 pub struct Transition {
     pub frontier: SerializableFrontier,
     pub actual_fingerprint_acc: FingerprintAccumulator,
-    pub expected_next_coordinates: Vec<CfsCoordinates>,
+    pub next_expected_coordinates: Vec<CfsCoordinates>,
 }
 
 /// Initial transition (first step in a window).
