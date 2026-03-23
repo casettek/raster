@@ -20,6 +20,7 @@ use crate::precomputed::{EMPTY_TRIE_NODES, HASH_SIZE};
 
 use raster_core::fingerprint::BitPacker;
 use raster_core::trace::{StepRecord, Trace, TraceWindow};
+use raster_core::transition::StepRecordWitness;
 
 /// Trait for types that can be hashed to bytes.
 pub trait BytesHashable {
@@ -125,12 +126,6 @@ pub type TraceTreeFrontier = NonEmptyFrontier<Bytes>;
 
 pub const WINDOW_SIZE: u8 = 2;
 pub const BITS_PER_ITEM: usize = 16;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct StepRecordWitness {
-    position: u64,
-    path_elems: Vec<Vec<u8>>,
-}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TraceCommitment {
@@ -485,7 +480,8 @@ fn resolve_fraud_window_sources(
             cfs_cursor,
             sources,
         ) {
-            let proof = TraceCommitment::witness(trace, producer_record.index, seed)
+            let trace_prefix = Trace(trace[..step_index].to_vec());
+            let proof = TraceCommitment::witness(&trace_prefix, producer_record.index, seed)
                 .expect("Failed to derive witness proof for source record");
             let witness_bytes = postcard::to_allocvec(&StepRecordWitness {
                 position: u64::from(proof.position()),

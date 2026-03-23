@@ -74,6 +74,7 @@ pub fn step_transitions(
                     TransitionInput {
                         step_record: step_record.clone(),
                         replay_image_id: Some(replay_result.image_id.clone()),
+                        witness: _witness.clone(),
                     },
                     Some(replay_receipt),
                 )
@@ -82,6 +83,7 @@ pub fn step_transitions(
                 TransitionInput {
                     step_record: step_record.clone(),
                     replay_image_id: None,
+                    witness: _witness.clone(),
                 },
                 None,
             ),
