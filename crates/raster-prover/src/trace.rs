@@ -4,6 +4,7 @@
 //! commitments to execution traces using incremental Merkle trees.
 
 use bridgetree::{Hashable, Level, NonEmptyFrontier};
+use incrementalmerkletree::{MerklePath, Position};
 use raster_core::cfs::{
     CfsCoordinates, CfsCursor, ControlFlowSchema, InputBinding, InputSource, SequenceChildItem,
 };
@@ -11,7 +12,7 @@ use raster_core::fingerprint::{Fingerprint, FingerprintAccumulator};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fmt::Debug;
 
 use crate::error::{BitPackerError, Result};
@@ -125,6 +126,12 @@ pub type TraceTreeFrontier = NonEmptyFrontier<Bytes>;
 pub const WINDOW_SIZE: u8 = 2;
 pub const BITS_PER_ITEM: usize = 16;
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StepRecordWitness {
+    position: u64,
+    path_elems: Vec<Vec<u8>>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TraceCommitment {
     pub fingerprint: Fingerprint,
@@ -145,7 +152,7 @@ impl TraceCommitment {
         let mut trace_tree = TraceTree::new(BITS_PER_ITEM);
         trace_tree.append(Bytes(seed.to_vec()));
 
-        let mut fingerprint_acc = FingerprintAccumulator::new(BitPacker(33));
+        let mut fingerprint_acc = FingerprintAccumulator::new(BitPacker(BITS_PER_ITEM));
 
         for item_hash in &items_hashes {
             trace_tree.append(Bytes(item_hash.clone()));
@@ -184,6 +191,33 @@ impl TraceCommitment {
         }
 
         trace_tree.frontier().cloned()
+    }
+
+    pub fn witness(trace: &Trace, n: usize, seed: &[u8]) -> Option<MerklePath<Bytes, 32>> {
+        if n >= trace.len() {
+            return None;
+        }
+
+        let mut trace_tree = TraceTree::new(1);
+        trace_tree.append(Bytes(seed.to_vec()));
+
+        let mut marked_position = None;
+
+        for (idx, item) in trace.iter().enumerate() {
+            trace_tree.append(Bytes(item.hash()));
+
+            if idx == n {
+                // Trace item `n` is stored at Merkle position `n + 1` because
+                // position `0` is reserved for the seed leaf.
+                marked_position = trace_tree.mark();
+            }
+        }
+
+        let marked_position = marked_position?;
+        debug_assert_eq!(marked_position, Position::from(u64::try_from(n).ok()? + 1));
+
+        let auth_path = trace_tree.witness(marked_position, 0).ok()?;
+        MerklePath::from_parts(auth_path, marked_position).ok()
     }
 
     /// Try to get the frontier, returning an error on failure.
@@ -274,19 +308,24 @@ impl<T: Clone> Window<T> {
     }
 }
 
-fn step_record_parent_frame(step_record: &StepRecord) -> Option<(CfsCoordinates, u32)> {
+fn parent_coordinates(step_record: &StepRecord) -> Option<(CfsCoordinates, u32)> {
     let coordinates = step_record.coordinates();
     let (&current_child_index, parent_coords) = coordinates.split_last()?;
 
     Some((CfsCoordinates(parent_coords.to_vec()), current_child_index))
 }
 
+struct IndexedStepRecord {
+    index: usize,
+    record: StepRecord,
+}
+
 fn resolve_input_source_records(
     step_record: &StepRecord,
-    prior_trace: &[StepRecord],
+    trace: &[StepRecord],
     cfs_cursor: &CfsCursor,
     sources: &[InputBinding],
-) -> Vec<StepRecord> {
+) -> Vec<IndexedStepRecord> {
     if sources
         .iter()
         .all(|binding| matches!(binding.source, InputSource::External))
@@ -294,26 +333,31 @@ fn resolve_input_source_records(
         return Vec::new();
     }
 
-    let Some((parent_coords, current_child_index)) = step_record_parent_frame(step_record) else {
+    let Some((parent_sequence_coordinates, item_coordinate)) =
+        parent_coordinates(&step_record)
+    else {
+        // Entrypoint SequenceStart/SequenceEnd
         return Vec::new();
     };
 
-    let frame_start_index = prior_trace
+    // Find the parent sequence record start
+    let parent_sequence_index = trace
         .iter()
         .rposition(|record| {
             matches!(
                 record,
                 StepRecord::SequenceStart(sequence_start_record)
-                    if sequence_start_record.coordinates == parent_coords
+                    if sequence_start_record.coordinates == parent_sequence_coordinates
             )
         })
         .unwrap_or_else(|| {
             panic!(
                 "Failed to resolve active sequence invocation for step {:?} in frame {:?}",
-                step_record, parent_coords
+                step_record, parent_sequence_coordinates
             )
         });
-    let frame_trace = &prior_trace[frame_start_index..];
+
+    let frame_trace = &trace[parent_sequence_index..];
 
     let mut producer_records = Vec::new();
 
@@ -326,16 +370,19 @@ fn resolve_input_source_records(
                     .cloned()
                     .and_then(|record| match record {
                         StepRecord::SequenceStart(sequence_start_record)
-                            if sequence_start_record.coordinates == parent_coords =>
+                            if sequence_start_record.coordinates == parent_sequence_coordinates =>
                         {
-                            Some(StepRecord::SequenceStart(sequence_start_record))
+                            Some(IndexedStepRecord {
+                                index: parent_sequence_index,
+                                record: StepRecord::SequenceStart(sequence_start_record),
+                            })
                         }
                         _ => None,
                     })
                     .unwrap_or_else(|| {
                         panic!(
                             "Failed to resolve sequence input {input_index} for step {:?} in frame {:?}",
-                            step_record, parent_coords
+                            step_record, parent_sequence_coordinates 
                         )
                     });
 
@@ -345,14 +392,14 @@ fn resolve_input_source_records(
                 item_index,
                 output_index,
             } => {
-                if *item_index >= current_child_index as usize {
+                if *item_index >= item_coordinate as usize {
                     panic!(
                         "Step {:?} cannot depend on sibling item {} output {} from the same or a future index {}",
-                        step_record, item_index, output_index, current_child_index
+                        step_record, item_index, output_index, item_coordinate
                     );
                 }
 
-                let mut producer_coordinates = parent_coords.clone();
+                let mut producer_coordinates = parent_sequence_coordinates.clone();
                 producer_coordinates.push(
                     (*item_index)
                         .try_into()
@@ -364,23 +411,29 @@ fn resolve_input_source_records(
                     .unwrap_or_else(|| {
                         panic!(
                             "Failed to resolve producer item {} for step {:?} in frame {:?}",
-                            item_index, step_record, parent_coords
+                            item_index, step_record, parent_sequence_coordinates 
                         )
                     });
 
                 let producer_record = frame_trace
                     .iter()
-                    .rev()
-                    .find_map(|record| match (record, producer_item) {
+                    .enumerate()
+                    .find_map(|(frame_offset, record)| match (record, producer_item) {
                         (StepRecord::TileExec(tile_exec_record), SequenceChildItem::Tile(_))
                             if tile_exec_record.coordinates == producer_coordinates =>
                         {
-                            Some(record.clone())
+                            Some(IndexedStepRecord {
+                                index: parent_sequence_index + frame_offset,
+                                record: record.clone(),
+                            })
                         }
                         (StepRecord::SequenceEnd(sequence_end_record), SequenceChildItem::Sequence(_))
                             if sequence_end_record.coordinates == producer_coordinates =>
                         {
-                            Some(record.clone())
+                            Some(IndexedStepRecord {
+                                index: parent_sequence_index + frame_offset,
+                                record: record.clone(),
+                            })
                         }
                         _ => None,
                     })
@@ -404,12 +457,14 @@ fn resolve_fraud_window_sources(
     window_end_index: usize,
     fraud_window: &TraceWindow,
     cfs_cursor: &CfsCursor,
-) -> Vec<StepRecord> {
+    seed: &[u8],
+) -> HashMap<StepRecord, Vec<u8>> {
     let window_start_index = window_end_index + 1 - fraud_window.items.len();
-    let mut producer_records = Vec::new();
+    let mut witness: HashMap<StepRecord, Vec<u8>> = HashMap::new();
 
     for (offset, step_record) in fraud_window.items.iter().enumerate() {
         if step_record.coordinates().is_empty() {
+            // Empty coordinates mean SequenceStart/SequenceEnd of main function
             continue;
         }
 
@@ -423,20 +478,32 @@ fn resolve_fraud_window_sources(
             });
         let sources = cfs_item.sources();
         let step_index = window_start_index + offset;
-        producer_records.extend(resolve_input_source_records(
+
+        for producer_record in resolve_input_source_records(
             step_record,
             &trace[..step_index],
             cfs_cursor,
             sources,
-        ));
+        ) {
+            let proof = TraceCommitment::witness(trace, producer_record.index, seed)
+                .expect("Failed to derive witness proof for source record");
+            let witness_bytes = postcard::to_allocvec(&StepRecordWitness {
+                position: u64::from(proof.position()),
+                path_elems: proof.path_elems().iter().map(|elem| elem.0.clone()).collect(),
+            })
+            .expect("Failed to serialize source record witness");
+
+            witness.insert(producer_record.record, witness_bytes);
+        }
     }
 
-    producer_records
+    witness
 }
 
 pub struct TraceVerifier<'a> {
     pub trace_commitment: TraceCommitment,
     pub cfs: &'a ControlFlowSchema,
+    pub seed: Vec<u8>,
 
     pub fingerprint_acc: FingerprintAccumulator,
     pub latest_frontier: TraceTreeFrontier,
@@ -448,7 +515,7 @@ pub struct TraceVerifier<'a> {
 #[derive(Debug, Clone)]
 pub struct FraudEvidence {
     pub window: TraceWindow,
-    pub producer_records: Vec<StepRecord>,
+    pub witness: HashMap<StepRecord, Vec<u8>>,
 }
 
 pub enum VerificationResult {
@@ -464,7 +531,7 @@ impl<'a> TraceVerifier<'a> {
         let init_frontier = trace_tree.frontier().cloned().unwrap();
 
         let bit_packer = trace_commitment.fingerprint.bits_packer.clone();
-        let mut fingerprint_acc = FingerprintAccumulator::new(bit_packer);
+        let fingerprint_acc = FingerprintAccumulator::new(bit_packer);
 
         let mut window_frontiers: Window<TraceTreeFrontier> = Window::new(WINDOW_SIZE.into());
         let window_items: Window<StepRecord> = Window::new(WINDOW_SIZE.into());
@@ -474,6 +541,7 @@ impl<'a> TraceVerifier<'a> {
         Self {
             trace_commitment,
             cfs,
+            seed: seed.to_vec(),
 
             fingerprint_acc,
             latest_frontier: init_frontier,
@@ -497,8 +565,7 @@ impl<'a> TraceVerifier<'a> {
 
             let root = self
                 .latest_frontier
-                .root(0)
-                .expect("Failed to get Trace Merkle Tree root");
+                .root(Some(0.into()));
 
             self.fingerprint_acc.append(&root.0);
 
@@ -540,12 +607,17 @@ impl<'a> TraceVerifier<'a> {
                     fingerprint: window_fingerprint,
                 };
 
-                let producer_records =
-                    resolve_fraud_window_sources(trace, step_index, &fraud_window, &cfs_cursor);
+                let witness = resolve_fraud_window_sources(
+                    trace,
+                    step_index,
+                    &fraud_window,
+                    &cfs_cursor,
+                    &self.seed,
+                );
 
                 return VerificationResult::Fraud(FraudEvidence {
                     window: fraud_window,
-                    producer_records,
+                    witness,
                 });
             }
         }
@@ -821,6 +893,27 @@ mod tests {
                 i + 1
             );
         }
+    }
+
+    #[test]
+    fn test_wittnes_returns_proof_for_requested_trace_item() {
+        let seed = precomputed::EMPTY_TRIE_NODES[0];
+        let trace = Trace((0..6).map(|i| make_tile_trace_item(i, i)).collect());
+
+        let witness = TraceCommitment::witness(&trace, 2, &seed).expect("witness");
+
+        assert_eq!(u64::from(witness.position()), 3);
+
+        let mut tree = TraceTree::new(1);
+        tree.append(Bytes(seed.to_vec()));
+        for item in trace.iter() {
+            tree.append(Bytes(item.hash()));
+        }
+
+        let expected_root = tree.root(0).expect("root");
+        let witnessed_leaf = Bytes(trace[2].hash());
+
+        assert_eq!(witness.root(witnessed_leaf), expected_root);
     }
 
     #[test]

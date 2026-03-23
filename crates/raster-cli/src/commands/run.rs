@@ -346,7 +346,10 @@ pub fn verify(trace: &Trace, commit_path: &str, cfs: &ControlFlowSchema) -> Veri
 
 pub fn prove(fraud_evidence: FraudEvidence, cfs: &ControlFlowSchema, replayer: &Replayer) -> risc0_zkvm::Receipt {
     let mode = ExecutionMode::prove_and_verify();
-    let fraud_window: TraceWindow = fraud_evidence.window;
+    let FraudEvidence {
+        window: fraud_window,
+        witness,
+    } = fraud_evidence;
 
     let mut replayed_results: BTreeMap<String, ReplayResult> = BTreeMap::new();
 
@@ -375,6 +378,7 @@ pub fn prove(fraud_evidence: FraudEvidence, cfs: &ControlFlowSchema, replayer: &
             &fraud_window.items,
             fraud_window.fingerprint,
             &cfs,
+            &witness,
             &replayed_results,
         ) else {
             panic!("Failed to generate fraud proof");

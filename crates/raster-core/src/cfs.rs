@@ -13,7 +13,7 @@ use std::vec::Vec;
 
 pub type CfsCoordinate = u32;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct CfsCoordinates(pub Vec<CfsCoordinate>);
 
 impl CfsCoordinates {
