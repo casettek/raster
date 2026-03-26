@@ -11,7 +11,9 @@
 use raster_core::cfs::ControlFlowSchema;
 use raster_core::fingerprint::Fingerprint;
 use raster_core::trace::StepRecord;
-use raster_core::transition::{InitTransition, TransitionInput, TransitionJournal, TransitionState};
+use raster_core::transition::{
+    InitTransition, TransitionInput, TransitionJournal, TransitionState,
+};
 use std::collections::HashMap;
 
 use crate::replay::ReplayResult;
@@ -39,7 +41,7 @@ pub fn step_transitions(
     trace_window: &[StepRecord],
     fingerprint: Fingerprint,
     cfs: &ControlFlowSchema,
-    _witness: &HashMap<StepRecord, Vec<u8>>,
+    witness: &HashMap<StepRecord, Vec<u8>>,
     replayed_results: &std::collections::BTreeMap<String, ReplayResult>,
 ) -> Option<risc0_zkvm::Receipt> {
     let prover = risc0_zkvm::default_prover();
@@ -74,7 +76,7 @@ pub fn step_transitions(
                     TransitionInput {
                         step_record: step_record.clone(),
                         replay_image_id: Some(replay_result.image_id.clone()),
-                        witness: _witness.clone(),
+                        witness: witness.clone(),
                     },
                     Some(replay_receipt),
                 )
@@ -83,7 +85,7 @@ pub fn step_transitions(
                 TransitionInput {
                     step_record: step_record.clone(),
                     replay_image_id: None,
-                    witness: _witness.clone(),
+                    witness: witness.clone(),
                 },
                 None,
             ),
