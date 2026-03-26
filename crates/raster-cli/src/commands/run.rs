@@ -335,16 +335,14 @@ pub fn verify(trace: &Trace, commit_path: &str, cfs: &ControlFlowSchema) -> Veri
 
     let mut trace_verifier = TraceVerifier::new(trace_commitment, &EMPTY_TRIE_NODES[0], cfs);
 
-    let verification_result = trace_verifier.verify(trace);
-
-    if let VerificationResult::Fraud(fraud_evidence) = verification_result {
-        return VerificationResult::Fraud(fraud_evidence);
-    }
-
-    VerificationResult::Ok
+    trace_verifier.verify(trace);
 }
 
-pub fn prove(fraud_evidence: FraudEvidence, cfs: &ControlFlowSchema, replayer: &Replayer) -> risc0_zkvm::Receipt {
+pub fn prove(
+    fraud_evidence: FraudEvidence,
+    cfs: &ControlFlowSchema,
+    replayer: &Replayer,
+) -> risc0_zkvm::Receipt {
     let mode = ExecutionMode::prove_and_verify();
     let FraudEvidence {
         window: fraud_window,
