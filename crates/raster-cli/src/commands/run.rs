@@ -335,7 +335,7 @@ pub fn verify(trace: &Trace, commit_path: &str, cfs: &ControlFlowSchema) -> Veri
 
     let mut trace_verifier = TraceVerifier::new(trace_commitment, &EMPTY_TRIE_NODES[0], cfs);
 
-    trace_verifier.verify(trace);
+    trace_verifier.verify(trace)
 }
 
 pub fn prove(
