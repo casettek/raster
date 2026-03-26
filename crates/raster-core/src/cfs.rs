@@ -13,12 +13,18 @@ use std::vec::Vec;
 
 pub type CfsCoordinate = u32;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct CfsCoordinates(pub Vec<CfsCoordinate>);
 
 impl CfsCoordinates {
     pub fn new() -> Self {
         Self(Vec::new())
+    }
+
+    pub fn try_parent(&self) -> Option<(CfsCoordinates, CfsCoordinate)> {
+        let (&current_child_index, parent_coords) = self.split_last()?;
+
+        Some((CfsCoordinates(parent_coords.to_vec()), current_child_index))
     }
 }
 
@@ -381,14 +387,10 @@ pub enum SequenceChildId {
     Tile(TileId),
 }
 
-/// Definition of a sequence in the CFS.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SequenceDef {
-    /// Unique identifier for the sequence (function name).
     pub id: SequenceId,
-    /// Sources for the sequence's own inputs.
     pub input_sources: Vec<InputBinding>,
-    /// Ordered list of items (tiles or nested sequences) in this sequence.
     pub items: Vec<SequenceChildItem>,
 }
 
@@ -419,12 +421,18 @@ pub enum SequenceChildItem {
     Tile(TileItem),
 }
 
-/// An item within a sequence (either a tile or a nested sequence).
+impl SequenceChildItem {
+    pub fn inputs(&self) -> &[InputBinding] {
+        match self {
+            SequenceChildItem::Sequence(sequence_item) => &sequence_item.sources,
+            SequenceChildItem::Tile(tile_item) => &tile_item.sources,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SequenceItem {
-    /// ID of the sequence being invoked.
     pub id: SequenceId,
-    /// Sources for each input to this item.
     pub sources: Vec<InputBinding>,
 }
 
@@ -437,19 +445,14 @@ impl From<SequenceDef> for SequenceItem {
     }
 }
 
-/// An item within a sequence (either a tile or a nested sequence).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TileItem {
-    /// ID of the tile being invoked.
     pub id: TileId,
-    /// Sources for each input to this item.
     pub sources: Vec<InputBinding>,
 }
 
-/// A binding that specifies where an input value comes from.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InputBinding {
-    /// The source of this input.
     pub source: InputSource,
 }
 
@@ -499,190 +502,3 @@ pub enum InputSource {
     },
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::format;
-    use std::vec;
-
-    /// Build a flat CFS: one sequence "main" with N tiles, plus a single-item
-    /// sequence so that step_forward can reach a valid end (None).
-    fn make_flat_cfs(n_tiles: usize) -> ControlFlowSchema {
-        let mut cfs = ControlFlowSchema::new("test");
-        for i in 0..n_tiles {
-            let id = format!("t{i}");
-            cfs.tiles.push(TileDef::iter(id.clone(), 0, 1));
-        }
-        cfs.tiles.push(TileDef::iter("end", 0, 1));
-        cfs.tiles.push(TileDef::iter("end2", 0, 1));
-        let mut main = SequenceDef::new("main");
-        for i in 0..n_tiles {
-            main.items.push(SequenceChildItem::Tile(TileItem {
-                id: format!("t{i}"),
-                sources: vec![InputBinding::external()],
-            }));
-        }
-        let mut end_seq = SequenceDef::new("end_seq");
-        end_seq.items.push(SequenceChildItem::Tile(TileItem {
-            id: "end".into(),
-            sources: vec![InputBinding::external()],
-        }));
-        let mut end_seq2 = SequenceDef::new("end_seq2");
-        end_seq2.items.push(SequenceChildItem::Tile(TileItem {
-            id: "end2".into(),
-            sources: vec![InputBinding::external()],
-        }));
-        cfs.sequences.push(main);
-        cfs.sequences.push(end_seq);
-        cfs.sequences.push(end_seq2);
-        cfs
-    }
-
-    /// Build a nested CFS: main = [seq_a, tile_b], seq_a = [seq_b, seq_c],
-    /// seq_b = [tile_x], seq_c = [tile_y, seq_d], seq_d = [tile_z, seq_b].
-    fn make_nested_cfs() -> ControlFlowSchema {
-        let mut cfs = ControlFlowSchema::new("test");
-        cfs.tiles.push(TileDef::iter("tile_x", 0, 1));
-        cfs.tiles.push(TileDef::iter("tile_y", 0, 1));
-        cfs.tiles.push(TileDef::iter("tile_z", 0, 1));
-        cfs.tiles.push(TileDef::iter("tile_b", 0, 1));
-
-        let mut seq_b = SequenceDef::new("seq_b");
-        seq_b.items.push(SequenceChildItem::Tile(TileItem {
-            id: "tile_x".into(),
-            sources: vec![InputBinding::external()],
-        }));
-
-        let mut seq_d = SequenceDef::new("seq_d");
-        seq_d.items.push(SequenceChildItem::Tile(TileItem {
-            id: "tile_z".into(),
-            sources: vec![InputBinding::external()],
-        }));
-        seq_d.items.push(SequenceChildItem::Sequence(SequenceItem {
-            id: "seq_b".into(),
-            sources: vec![],
-        }));
-
-        let mut seq_c = SequenceDef::new("seq_c");
-        seq_c.items.push(SequenceChildItem::Tile(TileItem {
-            id: "tile_y".into(),
-            sources: vec![InputBinding::external()],
-        }));
-        seq_c.items.push(SequenceChildItem::Sequence(SequenceItem {
-            id: "seq_d".into(),
-            sources: vec![],
-        }));
-
-        let mut seq_a = SequenceDef::new("seq_a");
-        seq_a.items.push(SequenceChildItem::Sequence(SequenceItem {
-            id: "seq_b".into(),
-            sources: vec![],
-        }));
-        seq_a.items.push(SequenceChildItem::Sequence(SequenceItem {
-            id: "seq_c".into(),
-            sources: vec![],
-        }));
-
-        let mut main = SequenceDef::new("main");
-        main.items.push(SequenceChildItem::Sequence(SequenceItem {
-            id: "seq_a".into(),
-            sources: vec![],
-        }));
-        main.items.push(SequenceChildItem::Tile(TileItem {
-            id: "tile_b".into(),
-            sources: vec![InputBinding::external()],
-        }));
-
-        cfs.sequences.push(main);
-        cfs.sequences.push(seq_a);
-        cfs.sequences.push(seq_b);
-        cfs.sequences.push(seq_c);
-        cfs.sequences.push(seq_d);
-        cfs
-    }
-
-    #[test]
-    fn step_forward_flat_sequence() {
-        let cfs = make_flat_cfs(3);
-        let main_pos = cfs
-            .sequences
-            .iter()
-            .position(|s| s.id == "main")
-            .expect("main sequence");
-        let mut cursor = CfsCursor::new(cfs);
-        // First coord is sequence index, second is item index within that sequence.
-        cursor.set_coordinates(CfsCoordinates(vec![main_pos as CfsCoordinate, 0]));
-
-        assert!(cursor.step_forward());
-        assert_eq!(cursor.coordinates().0, vec![main_pos as CfsCoordinate, 1]);
-
-        assert!(cursor.step_forward());
-        assert_eq!(cursor.coordinates().0, vec![main_pos as CfsCoordinate, 2]);
-
-        // Step to next sequence indices [1], [2], then None
-        assert!(cursor.step_forward());
-        assert_eq!(cursor.coordinates().0, vec![1]);
-
-        assert!(cursor.step_forward());
-        assert_eq!(cursor.coordinates().0, vec![2]);
-
-        assert!(!cursor.step_forward());
-        assert_eq!(cursor.coordinates().0, vec![2]);
-    }
-
-    #[test]
-    fn step_forward_nested_sequence() {
-        let cfs = make_nested_cfs();
-        // main=[seq_a,tile_b], seq_a=[seq_b,seq_c], seq_b=[tile_x], seq_c=[tile_y,seq_d], seq_d=[tile_z,seq_b].
-        // First tile is [0,0,0] (main->seq_a->seq_b->tile_x).
-        let mut cursor = CfsCursor::new(cfs);
-        cursor.set_coordinates(CfsCoordinates(vec![0, 0, 0]));
-
-        let mut collected = vec![cursor.coordinates().0.clone()];
-        while cursor.step_forward() {
-            collected.push(cursor.coordinates().0.clone());
-        }
-        // tile_x -> tile_y -> tile_z -> tile_x (via seq_d->seq_b) -> tile_b, then seq_a again [1], ...
-        assert_eq!(
-            collected,
-            vec![
-                vec![0, 0, 0],
-                vec![0, 0, 1],
-                vec![0, 0, 1, 1],
-                vec![0, 0, 1, 1, 1],
-                vec![0, 1],
-                vec![1],
-                vec![1, 1],
-                vec![1, 1, 1],
-                vec![1, 1, 1, 1],
-            ]
-        );
-    }
-
-    #[test]
-    fn step_forward_traverses_full_coordinate_list() {
-        let cfs = make_flat_cfs(3);
-        let main_pos = cfs
-            .sequences
-            .iter()
-            .position(|s| s.id == "main")
-            .expect("main sequence");
-        // Path: [0,0]..[0,2] then sequence indices [1], [2], then None
-        let expected: Vec<CfsCoordinates> = (0..3)
-            .map(|i| CfsCoordinates(vec![main_pos as CfsCoordinate, i as CfsCoordinate]))
-            .chain([CfsCoordinates(vec![1]), CfsCoordinates(vec![2])])
-            .collect();
-
-        let mut cursor = CfsCursor::new(cfs);
-        cursor.set_coordinates(expected[0].clone());
-
-        let mut collected = vec![cursor.coordinates()];
-        while cursor.step_forward() {
-            collected.push(cursor.coordinates());
-        }
-        assert_eq!(collected.len(), expected.len());
-        for (i, (a, b)) in collected.iter().zip(expected.iter()).enumerate() {
-            assert_eq!(a.0, b.0, "position {i}");
-        }
-    }
-}

@@ -6,15 +6,19 @@
 //! 3. Returning the new frontier
 
 use std::cmp::Ordering;
+use std::collections::HashMap;
 
 use bridgetree::{Hashable, Level, NonEmptyFrontier, Position};
 use risc0_zkvm::guest::env;
 
-use raster_core::cfs::{CfsCoordinates, CfsCursor, ControlFlowSchema};
+use raster_core::cfs::{
+    CfsCoordinates, CfsCursor, ControlFlowSchema, InputSource, SequenceChildItem,
+};
 use raster_core::fingerprint::{Fingerprint, FingerprintAccumulator};
 use raster_core::trace::StepRecord;
 use raster_core::transition::{
-    SerializableFrontier, Transition, TransitionInput, TransitionJournal, TransitionState,
+    SerializableFrontier, StepRecordWitness, Transition, TransitionInput, TransitionJournal,
+    TransitionState,
 };
 
 use serde::{Deserialize, Serialize};
@@ -76,7 +80,7 @@ impl Hashable for Bytes {
 // SerializableFrontier <-> NonEmptyFrontier<Bytes> (guest-local conversion)
 // ============================================================================
 
-fn ser_frontier_to_frontier(ser: &SerializableFrontier) -> Option<NonEmptyFrontier<Bytes>> {
+fn deserialize_frontier(ser: &SerializableFrontier) -> Option<NonEmptyFrontier<Bytes>> {
     NonEmptyFrontier::from_parts(
         Position::from(ser.position),
         Bytes(ser.leaf.clone()),
@@ -85,7 +89,7 @@ fn ser_frontier_to_frontier(ser: &SerializableFrontier) -> Option<NonEmptyFronti
     .ok()
 }
 
-fn frontier_to_ser_frontier(frontier: &NonEmptyFrontier<Bytes>) -> SerializableFrontier {
+fn serialize_frontier(frontier: &NonEmptyFrontier<Bytes>) -> SerializableFrontier {
     SerializableFrontier {
         position: frontier.position().into(),
         leaf: frontier.leaf().0.clone(),
@@ -105,11 +109,147 @@ fn hash_trace_item(item: &StepRecord) -> Vec<u8> {
     hasher.finalize().to_vec()
 }
 
-fn step_coordinates(step: &StepRecord) -> &CfsCoordinates {
-    match step {
-        StepRecord::TileExec(tile_exec_record) => &tile_exec_record.coordinates,
-        StepRecord::SequenceStart(seq_start_record) => &seq_start_record.coordinates,
-        StepRecord::SequenceEnd(seq_end_record) => &seq_end_record.coordinates,
+fn decode_step_record_witness(bytes: &[u8]) -> StepRecordWitness {
+    let witness: StepRecordWitness =
+        postcard::from_bytes(bytes).expect("Failed to deserialize step record witness");
+
+    witness
+}
+
+fn verify_record_witness(record: &StepRecord, witness_bytes: &[u8], current_root: &Bytes) {
+    let witness = decode_step_record_witness(witness_bytes);
+    let witnessed_root = witness.path_elems.into_iter().zip(0u8..).fold(
+        Bytes(hash_trace_item(record)),
+        |root, (path_elem, level)| {
+            let sibling = Bytes(path_elem);
+            if (witness.position >> level) & 0x1 == 0 {
+                Bytes::combine(level.into(), &root, &sibling)
+            } else {
+                Bytes::combine(level.into(), &sibling, &root)
+            }
+        },
+    );
+
+    assert!(
+        &witnessed_root == current_root,
+        "Step record witness does not match current frontier root"
+    );
+}
+
+fn verify_step_record_inputs(
+    cfs_cursor: &CfsCursor,
+    frontier: &NonEmptyFrontier<Bytes>,
+    step_record: &StepRecord,
+    witness: &HashMap<StepRecord, Vec<u8>>,
+) {
+    // TODO: SequenceStart/SequenceEnd case. In case of SequenceStart input is External Kind from
+    // cli or from file. SequenceEnd just binding latest executed tile output.
+    if step_record.coordinates().is_empty() {
+        return;
+    }
+
+    let cfs_item = cfs_cursor
+        .try_get_child_item(step_record.coordinates())
+        .unwrap_or_else(|| {
+            panic!(
+                "Failed to resolve cfs item for step record {:?}",
+                step_record
+            )
+        });
+    let step_inputs = cfs_item.inputs();
+
+    // TODO: External Kind of input source not_implemented
+    if step_inputs
+        .iter()
+        .all(|input| matches!(input.source, InputSource::External))
+    {
+        return;
+    }
+
+    let trace_tree = TraceBridgeTree::from_frontier(1, frontier.clone());
+    let current_root = trace_tree.root(0).expect("Can't get current frontier root");
+
+    // TODO: SequenceEnd/SequenceStart case
+    let Some((parent_sequence_coordinates, item_coordinate)) =
+        step_record.coordinates().try_parent()
+    else {
+        return;
+    };
+
+    for step_input in step_inputs {
+        match step_input.source {
+            InputSource::External => {
+                todo!("External input source")
+            }
+            InputSource::SeqInput { .. } => {
+                let (producer_record, witness_bytes) = witness
+                    .iter()
+                    .find(|(record, _)| {
+                        matches!(
+                            record,
+                            StepRecord::SequenceStart(sequence_start_record)
+                                if sequence_start_record.coordinates == parent_sequence_coordinates
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "Missing sequence input witness for step record {:?}",
+                            step_record
+                        )
+                    });
+
+                verify_record_witness(producer_record, witness_bytes, &current_root);
+            }
+            InputSource::ItemOutput {
+                item_index,
+                output_index: _,
+            } => {
+                assert!(
+                    item_index < item_coordinate as usize,
+                    "Step {:?} cannot depend on source item {} from the same or a future position {}",
+                    step_record,
+                    item_index,
+                    item_coordinate
+                );
+
+                let mut producer_coordinates = parent_sequence_coordinates.clone();
+                producer_coordinates.push(
+                    item_index
+                        .try_into()
+                        .expect("Producer item index exceeds CFS coordinate bounds"),
+                );
+
+                let producer_item = cfs_cursor
+                    .try_get_child_item(&producer_coordinates)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "Failed to resolve producer item {} for step {:?}",
+                            item_index, step_record
+                        )
+                    });
+
+                let (producer_record, witness_bytes) = witness
+                    .iter()
+                    .find(|(record, _)| match (record, producer_item) {
+                        (StepRecord::TileExec(tile_exec_record), SequenceChildItem::Tile(_)) => {
+                            tile_exec_record.coordinates == producer_coordinates
+                        }
+                        (
+                            StepRecord::SequenceEnd(sequence_end_record),
+                            SequenceChildItem::Sequence(_),
+                        ) => sequence_end_record.coordinates == producer_coordinates,
+                        _ => false,
+                    })
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "Missing item-output witness for step record {:?}",
+                            step_record
+                        )
+                    });
+
+                verify_record_witness(producer_record, witness_bytes, &current_root);
+            }
+        }
     }
 }
 
@@ -118,8 +258,9 @@ fn verify_step_record(step: &StepRecord, replay_image_id: Option<&Vec<u8>>) {
         StepRecord::TileExec(tile_exec_record) => {
             let replay_image_id = replay_image_id
                 .expect("replay image id should be provided for tile execution should ");
-            let replay_image_id_digest = risc0_zkvm::sha::Digest::try_from(replay_image_id.as_slice())
-                .expect("image_id must be 32 bytes");
+            let replay_image_id_digest =
+                risc0_zkvm::sha::Digest::try_from(replay_image_id.as_slice())
+                    .expect("image_id must be 32 bytes");
 
             env::verify(
                 replay_image_id_digest,
@@ -132,15 +273,17 @@ fn verify_step_record(step: &StepRecord, replay_image_id: Option<&Vec<u8>>) {
     }
 }
 
-fn advance_expected_next_coordinates(
+// Verify that current step record corrdinates are in preveious expected next coordinates and with
+// CfsCursor iterate to next expected coordiantes
+fn get_next_expected_coordinates(
     cfs_cursor: &CfsCursor,
     step: &StepRecord,
-    expected: Option<&Vec<CfsCoordinates>>,
+    current_expected_coordinates: Option<&Vec<CfsCoordinates>>,
 ) -> Vec<CfsCoordinates> {
-    let coordinates = step_coordinates(step);
-    if let Some(expected_next_coordinates) = expected {
+    let coordinates = step.coordinates();
+    if let Some(current_expected_coordinates) = current_expected_coordinates {
         assert!(
-            expected_next_coordinates.contains(coordinates),
+            current_expected_coordinates.contains(coordinates),
             "Step coordinates are not in expected next coordinates"
         );
     }
@@ -150,7 +293,7 @@ fn advance_expected_next_coordinates(
         .expect("Wrong tile coordinates")
 }
 
-fn advance_frontier_root_fingerprint(
+fn next_frontier(
     frontier: &mut NonEmptyFrontier<Bytes>,
     step_record: &StepRecord,
     fingerprint_acc: &mut FingerprintAccumulator,
@@ -164,7 +307,7 @@ fn advance_frontier_root_fingerprint(
     };
     fingerprint_acc.append(&tree_root.0);
 
-    frontier_to_ser_frontier(frontier)
+    serialize_frontier(frontier)
 }
 
 // ============================================================================
@@ -181,16 +324,22 @@ fn main() {
 
     match state {
         TransitionState::Init(init_transition) => {
-            let mut init_frontier = ser_frontier_to_frontier(&init_transition.init_frontier)
+            let mut init_frontier = deserialize_frontier(&init_transition.init_frontier)
                 .expect("Invalid frontier in input");
 
+            verify_step_record_inputs(
+                &cfs_cursor,
+                &init_frontier,
+                &input.step_record,
+                &input.witness,
+            );
             verify_step_record(&input.step_record, input.replay_image_id.as_ref());
-            let expected_next_coordinates =
-                advance_expected_next_coordinates(&cfs_cursor, &input.step_record, None);
+            let next_expected_coordinates =
+                get_next_expected_coordinates(&cfs_cursor, &input.step_record, None);
 
             let mut actual_fingerprint_acc =
                 FingerprintAccumulator::new(init_transition.fingerprint.bits_packer);
-            let new_frontier = advance_frontier_root_fingerprint(
+            let new_frontier = next_frontier(
                 &mut init_frontier,
                 &input.step_record,
                 &mut actual_fingerprint_acc,
@@ -199,7 +348,7 @@ fn main() {
             let current_state = TransitionState::Next(Transition {
                 frontier: new_frontier,
                 actual_fingerprint_acc,
-                expected_next_coordinates,
+                next_expected_coordinates,
             });
 
             let journal = TransitionJournal {
@@ -215,7 +364,6 @@ fn main() {
 
             let self_image_id_digest = risc0_zkvm::sha::Digest::try_from(self_image_id.as_slice())
                 .expect("image_id must be 32 bytes");
-            // TODO: Did as_bytes actually available?
             env::verify(
                 self_image_id_digest,
                 &risc0_zkvm::serde::to_vec(&prev_journal).unwrap(),
@@ -236,17 +384,23 @@ fn main() {
             );
 
             let mut current_frontier =
-                ser_frontier_to_frontier(&transition.frontier).expect("Invalid frontier in input");
+                deserialize_frontier(&transition.frontier).expect("Invalid frontier in input");
 
+            verify_step_record_inputs(
+                &cfs_cursor,
+                &current_frontier,
+                &input.step_record,
+                &input.witness,
+            );
             verify_step_record(&input.step_record, input.replay_image_id.as_ref());
-            let expected_next_coordinates = advance_expected_next_coordinates(
+            let next_expected_coordinates = get_next_expected_coordinates(
                 &cfs_cursor,
                 &input.step_record,
-                Some(&transition.expected_next_coordinates),
+                Some(&transition.next_expected_coordinates),
             );
 
             let mut actual_fingerprint_acc = transition.actual_fingerprint_acc.clone();
-            let new_frontier = advance_frontier_root_fingerprint(
+            let new_frontier = next_frontier(
                 &mut current_frontier,
                 &input.step_record,
                 &mut actual_fingerprint_acc,
@@ -271,7 +425,7 @@ fn main() {
                     TransitionState::Next(Transition {
                         frontier: new_frontier,
                         actual_fingerprint_acc: FingerprintAccumulator::from(actual_fingerprint),
-                        expected_next_coordinates,
+                        next_expected_coordinates,
                     })
                 };
             let journal = TransitionJournal {

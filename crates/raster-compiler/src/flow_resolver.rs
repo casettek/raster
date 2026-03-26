@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use crate::ast::{CallInfo, CallKind};
 use crate::sequence::{Sequence, SequenceDiscovery};
 use crate::tile::TileDiscovery;
+
 /// Resolves data flow within a sequence, producing `SequenceItem`s with
 /// correctly bound input sources.
 pub struct FlowResolver<'a, 'ast> {

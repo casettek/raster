@@ -26,7 +26,7 @@ use raster_core::{Error, Result};
 use raster_prover::precomputed::EMPTY_TRIE_NODES;
 use raster_prover::replay::{ReplayResult, Replayer};
 use raster_prover::trace::{
-    SerializableFrontier, TraceCommitment, TraceVerifier, VerificationResult,
+    FraudEvidence, SerializableFrontier, TraceCommitment, TraceVerifier, VerificationResult,
 };
 use raster_prover::transition::step_transitions;
 
@@ -240,13 +240,13 @@ pub fn run(
         }
     } else if audit_flag.is_some() {
         let commit_path = audit_flag.expect("Commitment path was provided");
-        let verification_result = verify(&trace, commit_path);
+        let verification_result = verify(&trace, commit_path, &cfs);
 
         match verification_result {
             VerificationResult::Ok => println!("Verification Success"),
-            VerificationResult::Fraud(fraud_window) => {
+            VerificationResult::Fraud(fraud_evidence) => {
                 let replayer = Replayer::new(&backend, &project);
-                let _fraud_proof = prove(fraud_window, &cfs, &replayer);
+                let _fraud_proof = prove(fraud_evidence, &cfs, &replayer);
                 println!("Faurd proof generated");
             }
         }
@@ -330,30 +330,24 @@ pub fn commit(trace: &Trace, commit_path: &str) {
         .expect("Failed to save commitment");
 }
 
-pub fn verify(trace: &Trace, commit_path: &str) -> VerificationResult {
+pub fn verify(trace: &Trace, commit_path: &str, cfs: &ControlFlowSchema) -> VerificationResult {
     let trace_commitment = read_trace_commitment(commit_path);
 
-    let actual_trace_commitment = TraceCommitment::from(trace, &EMPTY_TRIE_NODES[0]);
+    let mut trace_verifier = TraceVerifier::new(trace_commitment, &EMPTY_TRIE_NODES[0], cfs);
 
-    let mut trace_verifier: TraceVerifier =
-        TraceVerifier::new(trace_commitment, &EMPTY_TRIE_NODES[0]);
-
-    for step_record in trace.iter() {
-        if let VerificationResult::Fraud(fraud_window) = trace_verifier.verify(step_record) {
-            println!("verification result: \nfraud: {:?}", fraud_window);
-            return VerificationResult::Fraud(fraud_window);
-        }
-    }
-
-    VerificationResult::Ok
+    trace_verifier.verify(trace)
 }
 
 pub fn prove(
-    fraud_window: TraceWindow,
+    fraud_evidence: FraudEvidence,
     cfs: &ControlFlowSchema,
     replayer: &Replayer,
 ) -> risc0_zkvm::Receipt {
     let mode = ExecutionMode::prove_and_verify();
+    let FraudEvidence {
+        window: fraud_window,
+        witness,
+    } = fraud_evidence;
 
     let mut replayed_results: BTreeMap<String, ReplayResult> = BTreeMap::new();
 
@@ -382,6 +376,7 @@ pub fn prove(
             &fraud_window.items,
             fraud_window.fingerprint,
             &cfs,
+            &witness,
             &replayed_results,
         ) else {
             panic!("Failed to generate fraud proof");

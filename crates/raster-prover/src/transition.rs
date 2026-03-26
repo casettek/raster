@@ -9,11 +9,12 @@
 //! the types used in the RISC0 guest program.
 
 use raster_core::cfs::ControlFlowSchema;
-use raster_core::fingerprint::{BitPacker, Fingerprint};
+use raster_core::fingerprint::Fingerprint;
 use raster_core::trace::StepRecord;
 use raster_core::transition::{
-    InitTransition, Transition, TransitionInput, TransitionJournal, TransitionState,
+    InitTransition, TransitionInput, TransitionJournal, TransitionState,
 };
+use std::collections::HashMap;
 
 use crate::replay::ReplayResult;
 use crate::trace::SerializableFrontier;
@@ -40,6 +41,7 @@ pub fn step_transitions(
     trace_window: &[StepRecord],
     fingerprint: Fingerprint,
     cfs: &ControlFlowSchema,
+    witness: &HashMap<StepRecord, Vec<u8>>,
     replayed_results: &std::collections::BTreeMap<String, ReplayResult>,
 ) -> Option<risc0_zkvm::Receipt> {
     let prover = risc0_zkvm::default_prover();
@@ -74,6 +76,7 @@ pub fn step_transitions(
                     TransitionInput {
                         step_record: step_record.clone(),
                         replay_image_id: Some(replay_result.image_id.clone()),
+                        witness: witness.clone(),
                     },
                     Some(replay_receipt),
                 )
@@ -82,6 +85,7 @@ pub fn step_transitions(
                 TransitionInput {
                     step_record: step_record.clone(),
                     replay_image_id: None,
+                    witness: witness.clone(),
                 },
                 None,
             ),

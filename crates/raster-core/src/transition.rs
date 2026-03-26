@@ -4,6 +4,7 @@
 //! They live in raster-core to avoid circular dependencies (guest cannot depend on prover).
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::vec::Vec;
 
 use crate::cfs::CfsCoordinates;
@@ -33,11 +34,18 @@ impl SerializableFrontier {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StepRecordWitness {
+    pub position: u64,
+    pub path_elems: Vec<Vec<u8>>,
+}
+
 /// Input for a single transition step (passed into the transition guest).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransitionInput {
     pub step_record: StepRecord,
     pub replay_image_id: Option<Vec<u8>>,
+    pub witness: HashMap<StepRecord, Vec<u8>>,
 }
 
 /// Result of applying one transition (new frontier and fingerprint state).
@@ -45,7 +53,7 @@ pub struct TransitionInput {
 pub struct Transition {
     pub frontier: SerializableFrontier,
     pub actual_fingerprint_acc: FingerprintAccumulator,
-    pub expected_next_coordinates: Vec<CfsCoordinates>,
+    pub next_expected_coordinates: Vec<CfsCoordinates>,
 }
 
 /// Initial transition (first step in a window).

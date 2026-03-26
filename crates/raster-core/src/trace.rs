@@ -9,7 +9,7 @@ use crate::cfs::CfsCoordinates;
 use crate::fingerprint::Fingerprint;
 
 /// Describes an input parameter for a tile function.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct FnInputParam {
     /// Parameter name from the function signature
     pub name: String,
@@ -21,7 +21,7 @@ pub struct FnInputParam {
 ///
 /// This captures the tile's function signature metadata along with
 /// the serialized input/output data for complete traceability.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct FnCallRecord {
     /// The tile function name/identifier
     pub fn_name: String,
@@ -37,7 +37,7 @@ pub struct FnCallRecord {
     pub output_data: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct TileExecRecord {
     pub exec_index: u64,
 
@@ -48,7 +48,7 @@ pub struct TileExecRecord {
     pub fn_call_record: FnCallRecord,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct SequenceStartRecord {
     pub exec_index: u64,
 
@@ -59,7 +59,7 @@ pub struct SequenceStartRecord {
     pub input_data: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct SequenceEndRecord {
     pub exec_index: u64,
 
@@ -70,11 +70,21 @@ pub struct SequenceEndRecord {
     pub output_data: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum StepRecord {
     SequenceStart(SequenceStartRecord),
     SequenceEnd(SequenceEndRecord),
     TileExec(TileExecRecord),
+}
+
+impl StepRecord {
+    pub fn coordinates(&self) -> &CfsCoordinates {
+        match self {
+            StepRecord::TileExec(tile_exec_record) => &tile_exec_record.coordinates,
+            StepRecord::SequenceStart(sequence_start_record) => &sequence_start_record.coordinates,
+            StepRecord::SequenceEnd(sequence_end_record) => &sequence_end_record.coordinates,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
