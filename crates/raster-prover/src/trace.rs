@@ -628,7 +628,8 @@ mod tests {
         TileItem,
     };
     use raster_core::trace::{
-        FnCallRecord, FnInputParam, SequenceEndRecord, SequenceStartRecord, TileExecRecord,
+        FnCallRecord, FnInput, FnInputArgs, FnOutput, SequenceEndRecord, SequenceStartRecord,
+        TileExecRecord,
     };
 
     use super::*;
@@ -663,16 +664,16 @@ mod tests {
             coordinates: CfsCoordinates(coordinates),
             fn_call_record: FnCallRecord {
                 fn_name,
-                desc: None,
-                inputs: (0..input_count)
-                    .map(|index| FnInputParam {
-                        name: format!("input_{index}"),
-                        ty: "u64".to_string(),
-                    })
-                    .collect(),
-                input_data: Vec::new(),
-                output_type: Some("u64".to_string()),
-                output_data: output.to_le_bytes().to_vec(),
+                input: Some(FnInput::new(
+                    Vec::new(),
+                    (0..input_count)
+                        .map(|index| FnInputArgs {
+                            name: format!("input_{index}"),
+                            ty: "u64".to_string(),
+                        })
+                        .collect(),
+                )),
+                output: Some(FnOutput::new(output.to_le_bytes().to_vec(), "u64")),
             },
         })
     }
@@ -687,13 +688,15 @@ mod tests {
             exec_index,
             sequence_id: sequence_id.to_string(),
             coordinates: CfsCoordinates(coordinates),
-            inputs: (0..input_count)
-                .map(|index| FnInputParam {
-                    name: format!("input_{index}"),
-                    ty: "u64".to_string(),
-                })
-                .collect(),
-            input_data: Vec::new(),
+            input: Some(FnInput::new(
+                Vec::new(),
+                (0..input_count)
+                    .map(|index| FnInputArgs {
+                        name: format!("input_{index}"),
+                        ty: "u64".to_string(),
+                    })
+                    .collect(),
+            )),
         })
     }
 
@@ -706,8 +709,7 @@ mod tests {
             exec_index,
             sequence_id: sequence_id.to_string(),
             coordinates: CfsCoordinates(coordinates),
-            output_type: Some("u64".to_string()),
-            output_data: exec_index.to_le_bytes().to_vec(),
+            output: Some(FnOutput::new(exec_index.to_le_bytes().to_vec(), "u64")),
         })
     }
 

@@ -65,8 +65,7 @@ pub fn step_transitions(
     for step_record in trace_window {
         let (input, replay_receipt_assumption) = match step_record {
             StepRecord::TileExec(record) => {
-                let Some(replay_result) = replayed_results.get(&record.fn_call_record.fn_name)
-                else {
+                let Some(replay_result) = replayed_results.get(&record.tile_id) else {
                     panic!("Replayed IMAGE ID not found");
                 };
                 let replay_receipt: risc0_zkvm::Receipt =

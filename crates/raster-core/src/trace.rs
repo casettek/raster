@@ -10,11 +10,54 @@ use crate::fingerprint::Fingerprint;
 
 /// Describes an input parameter for a tile function.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub struct FnInputParam {
+pub struct FnInputArgs {
     /// Parameter name from the function signature
     pub name: String,
     /// Type name as a string (e.g., "u64", "String")
     pub ty: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct FnInput {
+    pub data: Vec<u8>,
+    pub args: Vec<FnInputArgs>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct FnOutput {
+    pub data: Vec<u8>,
+    pub ty: String,
+}
+
+impl FnInput {
+    pub fn new(data: Vec<u8>, args: Vec<FnInputArgs>) -> Self {
+        Self { data, args }
+    }
+
+    pub fn data(&self) -> &[u8] {
+        &self.data
+    }
+
+    pub fn args(&self) -> &[FnInputArgs] {
+        &self.args
+    }
+}
+
+impl FnOutput {
+    pub fn new(data: Vec<u8>, ty: impl Into<String>) -> Self {
+        Self {
+            data,
+            ty: ty.into(),
+        }
+    }
+
+    pub fn data(&self) -> &[u8] {
+        &self.data
+    }
+
+    pub fn ty(&self) -> &str {
+        &self.ty
+    }
 }
 
 /// A structured trace item emitted during tile execution.
@@ -23,29 +66,37 @@ pub struct FnInputParam {
 /// the serialized input/output data for complete traceability.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct FnCallRecord {
-    /// The tile function name/identifier
     pub fn_name: String,
-    /// Optional human-readable description
-    pub desc: Option<String>,
-    /// Input parameter metadata (name and type for each parameter)
-    pub inputs: Vec<FnInputParam>,
-    /// Postcard-serialized input data
-    pub input_data: Vec<u8>,
-    /// The return type as a string (e.g., "String", "Result<u64, Error>")
-    pub output_type: Option<String>,
-    /// Postcard-serialized output data
-    pub output_data: Vec<u8>,
+    pub input: Option<FnInput>,
+    pub output: Option<FnOutput>,
+}
+
+impl FnCallRecord {
+    pub fn input_data(&self) -> Option<&[u8]> {
+        self.input.as_ref().map(FnInput::data)
+    }
+
+    pub fn output_data(&self) -> Option<&[u8]> {
+        self.output.as_ref().map(FnOutput::data)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct TileExecRecord {
     pub exec_index: u64,
 
+    pub tile_id: String,
+
     pub sequence_id: String,
     pub coordinates: CfsCoordinates,
 
     pub intra_sequence_index: u32,
-    pub fn_call_record: FnCallRecord,
+
+    pub input_commitment: Vec<u8>,
+    pub input: Option<FnInput>,
+
+    pub output_commitment: Vec<u8>,
+    pub output: Option<FnOutput>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -55,8 +106,8 @@ pub struct SequenceStartRecord {
     pub sequence_id: String,
     pub coordinates: CfsCoordinates,
 
-    pub inputs: Vec<FnInputParam>,
-    pub input_data: Vec<u8>,
+    pub input_commitment: Vec<u8>,
+    pub input: Option<FnInput>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -66,8 +117,8 @@ pub struct SequenceEndRecord {
     pub sequence_id: String,
     pub coordinates: CfsCoordinates,
 
-    pub output_type: Option<String>,
-    pub output_data: Vec<u8>,
+    pub output_commitment: Vec<u8>,
+    pub output: Option<FnOutput>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -83,6 +134,24 @@ impl StepRecord {
             StepRecord::TileExec(tile_exec_record) => &tile_exec_record.coordinates,
             StepRecord::SequenceStart(sequence_start_record) => &sequence_start_record.coordinates,
             StepRecord::SequenceEnd(sequence_end_record) => &sequence_end_record.coordinates,
+        }
+    }
+
+    pub fn input(&self) -> Option<&FnInput> {
+        match self {
+            StepRecord::TileExec(tile_exec_record) => tile_exec_record.input.as_ref(),
+            StepRecord::SequenceStart(sequence_start_record) => {
+                sequence_start_record.input.as_ref()
+            }
+            StepRecord::SequenceEnd(_) => None,
+        }
+    }
+
+    pub fn output(&self) -> Option<&FnOutput> {
+        match self {
+            StepRecord::TileExec(tile_exec_record) => tile_exec_record.output.as_ref(),
+            StepRecord::SequenceStart(_) => None,
+            StepRecord::SequenceEnd(sequence_end_record) => sequence_end_record.output.as_ref(),
         }
     }
 }

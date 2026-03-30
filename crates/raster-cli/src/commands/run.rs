@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -19,7 +20,7 @@ use raster_compiler::{CfsBuilder, Project};
 
 use raster_core::cfs::{CfsCoordinates, CfsCursor, ControlFlowSchema};
 use raster_core::tile::TileId;
-use raster_core::trace::{SequenceStartRecord, StepRecord, TileExecRecord, Trace, TraceWindow};
+use raster_core::trace::{StepRecord, Trace, TraceEvent, TraceWindow};
 use raster_core::transition::TransitionJournal;
 use raster_core::{Error, Result};
 
@@ -29,6 +30,7 @@ use raster_prover::trace::{
     FraudEvidence, SerializableFrontier, TraceCommitment, TraceVerifier, VerificationResult,
 };
 use raster_prover::transition::step_transitions;
+use raster_runtime::{TraceAssembler, TRACE_EVENT_PREFIX};
 
 use crate::BackendType;
 
@@ -109,28 +111,28 @@ pub fn run(
 
     let mut handles = Vec::new();
 
+    let stdout_cfs = cfs.clone();
     let stdout_handle = std::thread::spawn(move || {
         let stdout_reader = BufReader::new(stdout);
+        let mut assembler = TraceAssembler::new(stdout_cfs);
 
         for line in stdout_reader.lines() {
             if let Ok(line_str) = line {
-                if let Some(parsed) = line_str
-                    .strip_prefix("[trace]")
-                    .map(serde_json::from_str::<StepRecord>)
-                {
-                    if let Ok(step_record) = parsed {
-                        let mut trace_lock = reader_trace.lock().unwrap();
-                        trace_lock.push(step_record);
+                let mut trace_lock = reader_trace.lock().unwrap();
+                let mut log_lock = reader_log.lock().unwrap();
+                if let Some(raw_event) = line_str.strip_prefix(TRACE_EVENT_PREFIX) {
+                    if let Ok(trace_event) = serde_json::from_str::<TraceEvent>(raw_event) {
+                        trace_lock.push(assembler.process(trace_event));
                     }
                 }
                 if let Some(debug_line) = line_str.strip_prefix("[debug]") {
-                    let mut log_lock = reader_log.lock().unwrap();
                     log_lock.push(debug_line.to_string());
                 }
             }
         }
     });
     handles.push(stdout_handle);
+
 
     let mut errors = Arc::new(Mutex::new(Vec::new()));
     let mut thread_errors = Arc::clone(&errors);
@@ -261,7 +263,7 @@ pub fn run(
                     println!("sequence_id: {}", tile_exec_record.sequence_id);
                     println!("tile_coordinates: {:?}", tile_exec_record.coordinates,);
 
-                    println!("tile_id: {}", tile_exec_record.fn_call_record.fn_name);
+                    println!("tile_id: {}", tile_exec_record.tile_id);
                 }
                 StepRecord::SequenceStart(sequence_start_record) => {
                     println!(
@@ -298,13 +300,22 @@ pub fn fraud(trace: &mut Trace, commit_path: &str) {
     if let Some(fraud_step) = trace.choose_mut(&mut rng) {
         match fraud_step {
             StepRecord::TileExec(tile_exec_record) => {
-                tile_exec_record.fn_call_record.output_data = vec![0u8, 1u8];
+                let output = tile_exec_record
+                    .output
+                    .get_or_insert_with(|| raster_core::trace::FnOutput::new(Vec::new(), "()"));
+                output.data = vec![0u8, 1u8];
             }
             StepRecord::SequenceStart(sequence_start_record) => {
-                sequence_start_record.input_data.push(0);
+                let input = sequence_start_record
+                    .input
+                    .get_or_insert_with(|| raster_core::trace::FnInput::new(Vec::new(), Vec::new()));
+                input.data.push(0);
             }
             StepRecord::SequenceEnd(sequence_end_record) => {
-                sequence_end_record.output_data.push(0);
+                let output = sequence_end_record
+                    .output
+                    .get_or_insert_with(|| raster_core::trace::FnOutput::new(Vec::new(), "()"));
+                output.data.push(0);
             }
         }
     };
@@ -356,7 +367,7 @@ pub fn prove(
             match replayer.replay(tile_exec, mode) {
                 Ok(replay_result) => {
                     replayed_results.insert(
-                        tile_exec.fn_call_record.fn_name.clone(),
+                        tile_exec.tile_id.clone(),
                         replay_result.clone(),
                     );
                 }

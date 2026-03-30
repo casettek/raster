@@ -261,12 +261,14 @@ fn verify_step_record(step: &StepRecord, replay_image_id: Option<&Vec<u8>>) {
             let replay_image_id_digest =
                 risc0_zkvm::sha::Digest::try_from(replay_image_id.as_slice())
                     .expect("image_id must be 32 bytes");
+            let output_bytes = tile_exec_record
+                .output
+                .as_ref()
+                .map(|output| output.data.as_slice())
+                .unwrap_or(&[]);
 
-            env::verify(
-                replay_image_id_digest,
-                &tile_exec_record.fn_call_record.output_data,
-            )
-            .expect("Failed to verify trace replay image id");
+            env::verify(replay_image_id_digest, output_bytes)
+                .expect("Failed to verify trace replay image id");
         }
         StepRecord::SequenceStart(_) => {}
         StepRecord::SequenceEnd(_) => {}
