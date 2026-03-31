@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::ops::{Deref, DerefMut};
 use std::string::String;
 use std::vec::Vec;
+use std::hash::Hash;
 
 use crate::cfs::CfsCoordinates;
 use crate::fingerprint::Fingerprint;
@@ -23,11 +24,6 @@ pub struct FnInput {
     pub args: Vec<FnInputArgs>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub struct FnOutput {
-    pub data: Vec<u8>,
-    pub ty: String,
-}
 
 impl FnInput {
     pub fn new(data: Vec<u8>, args: Vec<FnInputArgs>) -> Self {
@@ -41,6 +37,11 @@ impl FnInput {
     pub fn args(&self) -> &[FnInputArgs] {
         &self.args
     }
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct FnOutput {
+    pub data: Vec<u8>,
+    pub ty: String,
 }
 
 impl FnOutput {
@@ -93,10 +94,7 @@ pub struct TileExecRecord {
     pub intra_sequence_index: u32,
 
     pub input_commitment: Vec<u8>,
-    pub input: Option<FnInput>,
-
     pub output_commitment: Vec<u8>,
-    pub output: Option<FnOutput>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -107,7 +105,6 @@ pub struct SequenceStartRecord {
     pub coordinates: CfsCoordinates,
 
     pub input_commitment: Vec<u8>,
-    pub input: Option<FnInput>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -118,7 +115,6 @@ pub struct SequenceEndRecord {
     pub coordinates: CfsCoordinates,
 
     pub output_commitment: Vec<u8>,
-    pub output: Option<FnOutput>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]

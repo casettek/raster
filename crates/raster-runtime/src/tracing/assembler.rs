@@ -5,6 +5,8 @@ use raster_core::trace::{
 
 use std::collections::{HashMap, VecDeque};
 
+use crate::tracing::commitment::Sha256Commitment;
+
 pub type SequenceId = String;
 
 #[derive(Debug, Clone)]
@@ -136,33 +138,44 @@ impl TraceAssembler {
         let exec_index = self.exec_index;
 
         let step_record = match event.clone() {
-            TraceEvent::SequenceStart(trace_item) => {
+            TraceEvent::SequenceStart(fn_call_record) => {
                 self.sequence_callstack
-                    .push(trace_item.fn_name.clone(), &self.cfs_cursor);
+                    .push(fn_call_record.fn_name.clone(), &self.cfs_cursor);
 
                 let coordinates = self.sequence_callstack.current_sequence_coordinates.clone();
+
+                let input = fn_call_record.input;
+                let input_commitment = input
+                    .as_ref()
+                    .map(|output| Sha256Commitment::from(output).into())
+                    .unwrap_or_default();
+
                 let record = SequenceStartRecord {
                     exec_index,
-                    sequence_id: trace_item.fn_name.clone(),
+                    sequence_id: fn_call_record.fn_name.clone(),
                     coordinates: coordinates.clone(),
-                    input: trace_item.input,
-                    input_commitment: vec![],
+                    input_commitment,
                 };
 
                 self.io_store.insert(coordinates, event.clone());
 
                 StepRecord::SequenceStart(record)
             }
-            TraceEvent::SequenceEnd(trace_item) => {
+            TraceEvent::SequenceEnd(fn_call_record) => {
                 let sequence_coordinates =
                     self.sequence_callstack.current_sequence_coordinates.clone();
+
+                let output = fn_call_record.output;
+                let output_commitment = output
+                    .as_ref()
+                    .map(|output| Sha256Commitment::from(output).into())
+                    .unwrap_or_default();
 
                 let record = SequenceEndRecord {
                     exec_index,
                     coordinates: sequence_coordinates.clone(),
-                    sequence_id: trace_item.fn_name.clone(),
-                    output: trace_item.output,
-                    output_commitment: vec![],
+                    sequence_id: fn_call_record.fn_name.clone(),
+                    output_commitment,
                 };
 
                 self.sequence_callstack
@@ -173,7 +186,7 @@ impl TraceAssembler {
 
                 StepRecord::SequenceEnd(record)
             }
-            TraceEvent::TileExec(trace_event) => {
+            TraceEvent::TileExec(fn_call_record) => {
                 let sequence_coordinates =
                     self.sequence_callstack.current_sequence_coordinates.clone();
                 let current_sequence_state = self
@@ -187,21 +200,31 @@ impl TraceAssembler {
                 let tile_coordinates = self.cfs_cursor.get_child_coordinates(
                     &sequence_coordinates,
                     parent_current_index,
-                    SequenceChildId::Tile(trace_event.fn_name.clone()),
+                    SequenceChildId::Tile(fn_call_record.fn_name.clone()),
                 );
 
                 current_sequence_state.current_index += 1;
 
+                let input = fn_call_record.input;
+                let input_commitment = input
+                    .as_ref()
+                    .map(|input| Sha256Commitment::from(input).into())
+                    .unwrap_or_default();
+
+                let output = fn_call_record.output;
+                let output_commitment = output
+                    .as_ref()
+                    .map(|output| Sha256Commitment::from(output).into())
+                    .unwrap_or_default();
+
                 let record = TileExecRecord {
                     exec_index,
-                    tile_id: trace_event.fn_name,
+                    tile_id: fn_call_record.fn_name,
                     sequence_id,
                     intra_sequence_index: parent_current_index,
                     coordinates: tile_coordinates.clone(),
-                    input: trace_event.input,
-                    input_commitment: vec![],
-                    output: trace_event.output,
-                    output_commitment: vec![],
+                    input_commitment,
+                    output_commitment,
                 };
 
                 self.io_store.insert(tile_coordinates, event.clone());

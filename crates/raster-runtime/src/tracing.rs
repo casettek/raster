@@ -1,5 +1,6 @@
 pub mod assembler;
 pub mod publisher;
+pub mod commitment;
 
 use raster_core::trace::TraceEvent;
 
