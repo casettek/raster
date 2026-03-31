@@ -7,7 +7,7 @@
 
 #![no_std]
 
-extern crate alloc;
+pub extern crate alloc;
 
 #[cfg(feature = "std")]
 extern crate std;

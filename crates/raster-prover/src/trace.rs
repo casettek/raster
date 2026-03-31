@@ -662,19 +662,19 @@ mod tests {
             sequence_id: sequence_id.to_string(),
             intra_sequence_index,
             coordinates: CfsCoordinates(coordinates),
-            fn_call_record: FnCallRecord {
-                fn_name,
-                input: Some(FnInput::new(
-                    Vec::new(),
-                    (0..input_count)
-                        .map(|index| FnInputArgs {
-                            name: format!("input_{index}"),
-                            ty: "u64".to_string(),
-                        })
-                        .collect(),
-                )),
-                output: Some(FnOutput::new(output.to_le_bytes().to_vec(), "u64")),
-            },
+            tile_id: fn_name.to_string(),
+            input_commitment: Vec::new(),
+            input: Some(FnInput::new(
+                Vec::new(),
+                (0..input_count)
+                    .map(|index| FnInputArgs {
+                        name: format!("input_{index}"),
+                        ty: "u64".to_string(),
+                    })
+                    .collect(),
+            )),
+            output_commitment: Vec::new(),
+            output: Some(FnOutput::new(output.to_le_bytes().to_vec(), "u64")),
         })
     }
 
@@ -697,6 +697,7 @@ mod tests {
                     })
                     .collect(),
             )),
+            input_commitment: Vec::new(),
         })
     }
 
@@ -710,6 +711,7 @@ mod tests {
             sequence_id: sequence_id.to_string(),
             coordinates: CfsCoordinates(coordinates),
             output: Some(FnOutput::new(exec_index.to_le_bytes().to_vec(), "u64")),
+            output_commitment: Vec::new(),
         })
     }
 
