@@ -7,10 +7,7 @@
 
 use proc_macro::TokenStream;
 use quote::{format_ident, quote, ToTokens};
-use syn::{
-    parse_macro_input, visit::Visit, Block, Expr, ExprCall, ExprPath, FnArg, ItemFn, Pat,
-    ReturnType, Type,
-};
+use syn::{parse_macro_input, FnArg, ItemFn, Pat, ReturnType, Type};
 
 /// Extract input types and parameter names from a function signature.
 fn extract_inputs(input: &ItemFn) -> (Vec<&Type>, Vec<&syn::Ident>) {
@@ -52,14 +49,14 @@ fn gen_inputs_deserialization(input: &ItemFn) -> proc_macro2::TokenStream {
         let name = input_names[0];
         quote! {
             let #name: #ty = ::raster::core::postcard::from_bytes(input)
-                .map_err(|e| ::raster::core::Error::Serialization(::alloc::format!("Failed to deserialize input: {}", e)))?;
+                .map_err(|e| ::raster::core::Error::Serialization(::raster::alloc::format!("Failed to deserialize input: {}", e)))?;
         }
     } else {
         // Multiple arguments - deserialize as tuple
         let tuple_type = quote! { (#(#input_types),*) };
         quote! {
             let (#(#input_names),*): #tuple_type = ::raster::core::postcard::from_bytes(input)
-                .map_err(|e| ::raster::core::Error::Serialization(::alloc::format!("Failed to deserialize input: {}", e)))?;
+                .map_err(|e| ::raster::core::Error::Serialization(::raster::alloc::format!("Failed to deserialize input: {}", e)))?;
         }
     }
 }
@@ -70,18 +67,30 @@ fn gen_inputs_deserialization(input: &ItemFn) -> proc_macro2::TokenStream {
 fn gen_output_serialization(_input: &ItemFn) -> proc_macro2::TokenStream {
     quote! {
         let output = ::raster::core::postcard::to_allocvec(&result)
-            .map_err(|e| ::raster::core::Error::Serialization(::alloc::format!("Failed to serialize output: {}", e)))?;
+            .map_err(|e| ::raster::core::Error::Serialization(::raster::alloc::format!("Failed to serialize output: {}", e)))?;
     }
 }
 
 /// Generate input serialization code for tracing in the original function.
 ///
 /// This serializes the typed input parameters to bytes for the trace emission.
-fn gen_trace_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream {
+fn gen_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream {
     let (input_types, input_names) = extract_inputs(input);
 
-    if input_types.is_empty() {
-        quote! { let __raster_input_bytes: ::alloc::vec::Vec<u8> = ::alloc::vec::Vec::new(); }
+    let input_param_tuples: Vec<_> = input_names
+        .iter()
+        .zip(input_types.iter())
+        .map(|(name, ty)| {
+            let name_str = name.to_string();
+            let ty_str = ty.to_token_stream().to_string();
+            quote! { (#name_str, #ty_str) }
+        })
+        .collect();
+
+    let input_bytes = if input_types.is_empty() {
+        quote! {
+            let __raster_input_bytes: ::raster::alloc::vec::Vec<u8> = ::raster::alloc::vec::Vec::new();
+        }
     } else if input_types.len() == 1 {
         let name = input_names[0];
         quote! {
@@ -93,6 +102,25 @@ fn gen_trace_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream {
             let __raster_input_bytes = ::raster::core::postcard::to_allocvec(&(#(&#input_names),*))
                 .unwrap_or_default();
         }
+    };
+
+    quote! {
+        let __raster_input_args: ::raster::alloc::vec::Vec<::raster::core::trace::FnInputArgs> = [
+                #(#input_param_tuples),*
+            ]
+                .iter()
+                .map(|(n, t)| ::raster::core::trace::FnInputArgs {
+                    name: ::raster::alloc::string::String::from(*n),
+                    ty: ::raster::alloc::string::String::from(*t),
+                })
+                .collect();
+
+        #input_bytes
+
+        let __raster_input = ::core::option::Option::Some(::raster::core::trace::FnInput {
+            data: __raster_input_bytes,
+            args: __raster_input_args,
+        });
     }
 }
 
@@ -220,30 +248,18 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
     let fn_attrs = &input_fn.attrs;
     let fn_body = &input_fn.block;
 
-    let function_wrapper_name = format_ident!("__raster_tile_entry_{}", fn_name);
-    let registration_name = format_ident!(
-        "__RASTER_TILE_REGISTRATION_{}",
-        fn_name.to_string().to_uppercase()
-    );
+    let function_wrapper_name = format_ident!("__raster_tile_entry_{}", fn_name_str);
 
     let attrs = TileAttrs::parse(attr);
 
     // Generate optional metadata fields
-    let estimated_cycles_expr = match attrs.estimated_cycles {
+    let _estimated_cycles_expr = match attrs.estimated_cycles {
         Some(cycles) => quote! { ::core::option::Option::Some(#cycles) },
         None => quote! { ::core::option::Option::None },
     };
 
-    let max_memory_expr = match attrs.max_memory {
+    let _max_memory_expr = match attrs.max_memory {
         Some(memory) => quote! { ::core::option::Option::Some(#memory) },
-        None => quote! { ::core::option::Option::None },
-    };
-
-    let description_expr = match &attrs.description {
-        Some(desc) => {
-            let desc_str = desc.as_str();
-            quote! { ::core::option::Option::Some(#desc_str) }
-        }
         None => quote! { ::core::option::Option::None },
     };
 
@@ -253,7 +269,7 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
     let output_serialization = gen_output_serialization(&input_fn);
 
     // For recursive tiles, also generate a macro with the same name that allows `tile_name!(args)` syntax
-    let recursive_macro = if attrs.tile_type == "recur" {
+    let _recursive_macro = if attrs.tile_type == "recur" {
         let macro_name = format_ident!("{}", fn_name);
         quote! {
             /// Macro wrapper for recursive tile invocation.
@@ -272,38 +288,17 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! {}
     };
 
-    // Generate input parameter metadata for tracing: &[("name", "Type"), ...]
-    let (input_types, input_names) = extract_inputs(&input_fn);
-    let input_param_tuples: Vec<_> = input_names
-        .iter()
-        .zip(input_types.iter())
-        .map(|(name, ty)| {
-            let name_str = name.to_string();
-            let ty_str = ty.to_token_stream().to_string();
-            quote! { (#name_str, #ty_str) }
-        })
-        .collect();
-
-    // Generate trace description expression (Option<&str>)
-    let trace_desc_expr = match &attrs.description {
-        Some(desc) => {
-            let desc_str = desc.as_str();
-            quote! { ::core::option::Option::Some(#desc_str) }
-        }
-        None => quote! { ::core::option::Option::None },
-    };
-
-    // Generate output type expression (Option<&str>)
-    let trace_output_type_expr = match &input_fn.sig.output {
-        ReturnType::Default => quote! { ::core::option::Option::None },
+    // Generate output type expression
+    let output_type_expr = match &input_fn.sig.output {
+        ReturnType::Default => quote! { "()" },
         ReturnType::Type(_, ty) => {
             let ty_str = ty.to_token_stream().to_string();
-            quote! { ::core::option::Option::Some(#ty_str) }
+            quote! { #ty_str }
         }
     };
 
     // Generate input serialization code for tracing
-    let trace_input_serialization = gen_trace_input_serialization(&input_fn);
+    let input_serialization = gen_input_serialization(&input_fn);
 
     let original_function = quote! {
         #(#fn_attrs)*
@@ -312,7 +307,7 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
             #[cfg(all(feature = "std", not(target_arch = "riscv32")))]
             {
                 // Serialize inputs for tracing
-                #trace_input_serialization
+                #input_serialization
 
                 // Execute original body via closure to handle early returns
                 let __raster_result = (|| #fn_body)();
@@ -321,26 +316,20 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
                 let __raster_output_bytes = ::raster::core::postcard::to_allocvec(&__raster_result)
                     .unwrap_or_default();
 
-                let __raster_inputs: ::alloc::vec::Vec<::raster::core::trace::FnInputParam> = [
-                    #(#input_param_tuples),*
-                ]
-                    .iter()
-                    .map(|(n, t)| ::raster::core::trace::FnInputParam {
-                        name: ::alloc::string::String::from(*n),
-                        ty: ::alloc::string::String::from(*t),
-                    })
-                    .collect();
+                let __raster_output = ::core::option::Option::Some(
+                    ::raster::core::trace::FnOutput {
+                        data: __raster_output_bytes,
+                        ty: ::alloc::string::String::from(#output_type_expr),
+                    }
+                );
 
-                let __raster_tile_record = ::raster::core::trace::FnCallRecord {
+                let __raster_record = ::raster::core::trace::FnCallRecord {
                     fn_name: ::alloc::string::String::from(#fn_name_str),
-                    desc: #trace_desc_expr.map(|s: &str| ::alloc::string::String::from(s)),
-                    inputs: __raster_inputs,
-                    input_data: __raster_input_bytes.clone(),
-                    output_type: #trace_output_type_expr.map(|s: &str| ::alloc::string::String::from(s)),
-                    output_data: __raster_output_bytes.clone(),
+                    input: __raster_input,
+                    output: __raster_output,
                 };
-                ::raster::emit_trace_event(::raster::core::trace::TraceEvent::TileExec(
-                    __raster_tile_record,
+                ::raster::publish_trace_event(::raster::core::trace::TraceEvent::TileExec(
+                    __raster_record,
                 ));
 
                 return __raster_result;
@@ -357,7 +346,7 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
         #original_function
 
         // Generate the ABI wrapper function (available on all platforms, no_std compatible)
-        pub fn #function_wrapper_name(input: &[u8]) -> ::raster::core::Result<::alloc::vec::Vec<u8>> {
+        pub fn #function_wrapper_name(input: &[u8]) -> ::raster::core::Result<::raster::alloc::vec::Vec<u8>> {
             #inputs_deserialization
 
             #function_call
@@ -366,21 +355,6 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
 
             Ok(output)
         }
-
-        #[cfg(all(feature = "std", not(target_arch = "riscv32")))]
-        #[::raster::core::linkme::distributed_slice(::raster::core::registry::TILE_REGISTRY)]
-        #[linkme(crate = ::raster::core::linkme)]
-        static #registration_name: ::raster::core::registry::TileRegistration =
-        ::raster::core::registry::TileRegistration::new(
-            ::raster::core::tile::TileMetadataStatic::new(
-                #fn_name_str,
-                #fn_name_str,
-                #description_expr,
-                #estimated_cycles_expr,
-                #max_memory_expr
-            ),
-            #function_wrapper_name,
-        );
     })
 }
 
@@ -421,27 +395,41 @@ impl SequenceAttrs {
 /// Generates the sequence-wrapped body: either tracing (SequenceStart/body/SequenceEnd) or plain body depending on cfg.
 fn gen_sequence_wrapped_body(
     fn_name_str: &str,
-    sequence_desc_expr: proc_macro2::TokenStream,
-    sequence_output_type_expr: proc_macro2::TokenStream,
-    body: &Block,
+    item_fn: &ItemFn,
 ) -> proc_macro2::TokenStream {
+    let body = &item_fn.block;
+    let input_serialization = gen_input_serialization(&item_fn);
+
+    let output_type_expr = match &item_fn.sig.output {
+        ReturnType::Default => quote! { "()" },
+        ReturnType::Type(_, ty) => {
+            let ty_str = ty.to_token_stream().to_string();
+            quote! { #ty_str }
+        }
+    };
+
     quote! {
         #[cfg(all(feature = "std", not(target_arch = "riscv32")))]
         {
-            let __raster_seq_record = ::raster::core::trace::FnCallRecord {
-                fn_name: String::from(#fn_name_str),
-                desc: #sequence_desc_expr.map(|s: &str| String::from(s)),
-                inputs: Vec::new(),
-                input_data: Vec::new(),
-                output_type: #sequence_output_type_expr.map(|s: &str| String::from(s)),
-                output_data: Vec::new(),
+            #input_serialization
+
+            let mut __raster_record = ::raster::core::trace::FnCallRecord {
+                fn_name: ::raster::alloc::string::String::from(#fn_name_str),
+                input: __raster_input,
+                output: ::core::option::Option::None,
             };
-            ::raster::emit_trace_event(::raster::core::trace::TraceEvent::SequenceStart(
-                __raster_seq_record.clone(),
+            ::raster::publish_trace_event(::raster::core::trace::TraceEvent::SequenceStart(
+                __raster_record.clone(),
             ));
             let __raster_result = (|| #body)();
-            ::raster::emit_trace_event(::raster::core::trace::TraceEvent::SequenceEnd(
-                __raster_seq_record,
+            let __raster_output_bytes = ::raster::core::postcard::to_allocvec(&__raster_result)
+                .unwrap_or_default();
+            __raster_record.output = ::core::option::Option::Some(::raster::core::trace::FnOutput::new(
+                __raster_output_bytes,
+                ::raster::alloc::string::String::from(#output_type_expr),
+            ));
+            ::raster::publish_trace_event(::raster::core::trace::TraceEvent::SequenceEnd(
+                __raster_record,
             ));
             __raster_result
         }
@@ -482,37 +470,18 @@ fn gen_sequence_wrapped_body(
 /// ```
 #[proc_macro_attribute]
 pub fn sequence(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let input_fn = parse_macro_input!(item as ItemFn);
-    let fn_name_str = input_fn.sig.ident.to_string();
+    let item_fn = parse_macro_input!(item as ItemFn);
+    let fn_name_str = item_fn.sig.ident.to_string();
 
-    let fn_vis = &input_fn.vis;
-    let fn_sig = &input_fn.sig;
-    let fn_attrs = &input_fn.attrs;
-    let fn_body = &input_fn.block;
+    let fn_vis = &item_fn.vis;
+    let fn_sig = &item_fn.sig;
+    let fn_attrs = &item_fn.attrs;
+    let _attrs = SequenceAttrs::parse(attr);
 
-    let attrs = SequenceAttrs::parse(attr);
 
-    let sequence_desc_expr = match &attrs.description {
-        Some(desc) => {
-            let desc_str = desc.as_str();
-            quote! { ::core::option::Option::Some(#desc_str) }
-        }
-        None => quote! { ::core::option::Option::None },
-    };
-
-    let sequence_output_type_expr = match &input_fn.sig.output {
-        ReturnType::Default => quote! { ::core::option::Option::None },
-        ReturnType::Type(_, ty) => {
-            let ty_str = ty.to_token_stream().to_string();
-            quote! { ::core::option::Option::Some(#ty_str) }
-        }
-    };
-
-    let none_expr = quote! { ::core::option::Option::None };
-
-    let expanded = if input_fn.sig.ident == "main" {
+    let expanded = if item_fn.sig.ident == "main" {
         // Entry point: replace with fn main() { init(); input_parsing; wrapped_body; finish(); }
-        let params: Vec<_> = input_fn.sig.inputs.iter().collect();
+        let params: Vec<_> = item_fn.sig.inputs.iter().collect();
         let input_parsing = if params.is_empty() {
             quote! {}
         } else if params.len() == 1 {
@@ -553,7 +522,7 @@ pub fn sequence(attr: TokenStream, item: TokenStream) -> TokenStream {
                     .expect("Failed to parse --input argument. Usage: --input '[val1, val2, ...]'");
             }
         };
-        let body = gen_sequence_wrapped_body("main", none_expr.clone(), none_expr, &input_fn.block);
+        let body = gen_sequence_wrapped_body("main",  &item_fn);
         quote! {
             #(#fn_attrs)*
             fn main() {
@@ -568,12 +537,7 @@ pub fn sequence(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     } else {
         // Normal sequence: keep signature, wrap body
-        let body = gen_sequence_wrapped_body(
-            &fn_name_str,
-            sequence_desc_expr,
-            sequence_output_type_expr,
-            fn_body,
-        );
+        let body = gen_sequence_wrapped_body(&fn_name_str, &item_fn);
         quote! {
             #(#fn_attrs)*
             #fn_vis #fn_sig {

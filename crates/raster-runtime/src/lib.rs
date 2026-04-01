@@ -7,6 +7,9 @@
 
 pub mod tracing;
 pub use tracing::{
-    emit_trace_event, finish, init, init_with,
-    subscriber::{ExecutionSubscriber, Subscriber},
+    recorder::TraceRecorder,
+    commitment::Sha256Commitment,
+    publish_trace_event, finish, init, init_with,
+    publisher::{Publisher, TraceEventPublisher},
+    TRACE_EVENT_PREFIX,
 };

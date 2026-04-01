@@ -7,7 +7,7 @@
 
 #![no_std]
 
-extern crate alloc;
+pub extern crate alloc;
 
 #[cfg(feature = "std")]
 extern crate std;
@@ -17,7 +17,7 @@ pub use raster_macros::{sequence, tile};
 
 // Runtime is only available with std feature
 #[cfg(feature = "std")]
-pub use raster_runtime::{emit_trace_event, finish, init, init_with, ExecutionSubscriber};
+pub use raster_runtime::{publish_trace_event, finish, init, init_with};
 
 #[cfg(feature = "std")]
 pub mod utils;
@@ -93,7 +93,7 @@ pub mod prelude {
     pub use crate::core::{
         manifest::Manifest,
         schema::{ControlFlow, SequenceSchema},
-        trace::{FnCallRecord, FnInputParam, TileExecRecord},
+        trace::{FnCallRecord, FnInput, FnInputArgs, FnOutput, TileExecRecord},
     };
 
     // Registry is only available with std and on platforms that support linkme

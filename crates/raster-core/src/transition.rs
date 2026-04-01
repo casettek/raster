@@ -45,6 +45,8 @@ pub struct StepRecordWitness {
 pub struct TransitionInput {
     pub step_record: StepRecord,
     pub replay_image_id: Option<Vec<u8>>,
+    pub recorded_input: Option<Vec<u8>>,
+    pub recorded_output: Option<Vec<u8>>,
     pub witness: HashMap<StepRecord, Vec<u8>>,
 }
 

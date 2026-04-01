@@ -20,6 +20,50 @@ use crate::replay::ReplayResult;
 use crate::trace::SerializableFrontier;
 use crate::{TRANSITION_GUEST_ELF, TRANSITION_GUEST_ID};
 
+type RecordedStepIo = HashMap<StepRecord, (Option<Vec<u8>>, Option<Vec<u8>>)>;
+
+fn lookup_recorded_io(
+    step_record: &StepRecord,
+    recorded_step_io: &RecordedStepIo,
+) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+    recorded_step_io
+        .get(step_record)
+        .cloned()
+        .unwrap_or_else(|| panic!("Missing recorded I/O for transition step {:?}", step_record))
+}
+
+fn build_transition_input(
+    step_record: &StepRecord,
+    witness: &HashMap<StepRecord, Vec<u8>>,
+    recorded_step_io: &RecordedStepIo,
+    replayed_results: &HashMap<StepRecord, ReplayResult>,
+) -> TransitionInput {
+    let (recorded_input, recorded_output) = lookup_recorded_io(step_record, recorded_step_io);
+
+    match step_record {
+        StepRecord::TileExec(_) => {
+            let Some(replay_result) = replayed_results.get(step_record) else {
+                panic!("Replayed result not found for transition step {:?}", step_record);
+            };
+
+            TransitionInput {
+                step_record: step_record.clone(),
+                replay_image_id: Some(replay_result.image_id.clone()),
+                recorded_input,
+                recorded_output,
+                witness: witness.clone(),
+            }
+        }
+        StepRecord::SequenceStart(_) | StepRecord::SequenceEnd(_) => TransitionInput {
+            step_record: step_record.clone(),
+            replay_image_id: None,
+            recorded_input,
+            recorded_output,
+            witness: witness.clone(),
+        },
+    }
+}
+
 /// Replay trace transitions using the transition guest to prove merkle tree state transitions.
 ///
 /// For each trace item in the window:
@@ -42,7 +86,8 @@ pub fn step_transitions(
     fingerprint: Fingerprint,
     cfs: &ControlFlowSchema,
     witness: &HashMap<StepRecord, Vec<u8>>,
-    replayed_results: &std::collections::BTreeMap<String, ReplayResult>,
+    recorded_step_io: &RecordedStepIo,
+    replayed_results: &HashMap<StepRecord, ReplayResult>,
 ) -> Option<risc0_zkvm::Receipt> {
     let prover = risc0_zkvm::default_prover();
     let cfs = cfs.clone();
@@ -63,32 +108,21 @@ pub fn step_transitions(
     let mut current_state = TransitionState::Init(init_transition);
 
     for step_record in trace_window {
-        let (input, replay_receipt_assumption) = match step_record {
-            StepRecord::TileExec(record) => {
-                let Some(replay_result) = replayed_results.get(&record.fn_call_record.fn_name)
-                else {
-                    panic!("Replayed IMAGE ID not found");
-                };
-                let replay_receipt: risc0_zkvm::Receipt =
-                    postcard::from_bytes(&replay_result.receipt).unwrap();
-
-                (
-                    TransitionInput {
-                        step_record: step_record.clone(),
-                        replay_image_id: Some(replay_result.image_id.clone()),
-                        witness: witness.clone(),
-                    },
-                    Some(replay_receipt),
-                )
+        let input = build_transition_input(
+            step_record,
+            witness,
+            recorded_step_io,
+            replayed_results,
+        );
+        let replay_receipt_assumption: Option<risc0_zkvm::Receipt>= match step_record {
+            StepRecord::TileExec(_) => {
+                let replay_result = replayed_results.get(step_record).unwrap_or_else(|| {
+                    panic!("Replayed receipt not found for transition step {:?}", step_record)
+                });
+                let receipt: risc0_zkvm::Receipt = postcard::from_bytes(&replay_result.receipt).unwrap();
+                Some(receipt)
             }
-            StepRecord::SequenceStart(_) | StepRecord::SequenceEnd(_) => (
-                TransitionInput {
-                    step_record: step_record.clone(),
-                    replay_image_id: None,
-                    witness: witness.clone(),
-                },
-                None,
-            ),
+            StepRecord::SequenceStart(_) | StepRecord::SequenceEnd(_) => None,
         };
 
         let mut builder = risc0_zkvm::ExecutorEnv::builder();
@@ -119,4 +153,108 @@ pub fn step_transitions(
     }
 
     transition_receipt
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use raster_core::cfs::CfsCoordinates;
+    use raster_core::trace::{SequenceEndRecord, SequenceStartRecord, TileExecRecord};
+
+    fn make_tile_step(exec_index: u64, coordinates: Vec<u32>) -> StepRecord {
+        StepRecord::TileExec(TileExecRecord {
+            exec_index,
+            tile_id: "shared_tile".to_string(),
+            sequence_id: "main".to_string(),
+            coordinates: CfsCoordinates(coordinates),
+            intra_sequence_index: 0,
+            input_commitment: vec![exec_index as u8],
+            output_commitment: vec![exec_index as u8 + 1],
+        })
+    }
+
+    #[test]
+    fn build_transition_input_uses_step_record_key_for_repeated_tiles() {
+        let first_step = make_tile_step(1, vec![0]);
+        let second_step = make_tile_step(2, vec![1]);
+
+        let recorded_step_io = HashMap::from([
+            (first_step.clone(), (Some(vec![1]), Some(vec![11]))),
+            (second_step.clone(), (Some(vec![2]), Some(vec![22]))),
+        ]);
+        let replayed_results = HashMap::from([
+            (
+                first_step.clone(),
+                ReplayResult {
+                    fn_name: "shared_tile".to_string(),
+                    receipt: vec![],
+                    image_id: vec![9; 32],
+                    input: vec![1],
+                    output: vec![11],
+                },
+            ),
+            (
+                second_step.clone(),
+                ReplayResult {
+                    fn_name: "shared_tile".to_string(),
+                    receipt: vec![],
+                    image_id: vec![7; 32],
+                    input: vec![2],
+                    output: vec![22],
+                },
+            ),
+        ]);
+
+        let input = build_transition_input(
+            &second_step,
+            &HashMap::new(),
+            &recorded_step_io,
+            &replayed_results,
+        );
+
+        assert_eq!(input.replay_image_id, Some(vec![7; 32]));
+        assert_eq!(input.recorded_input, Some(vec![2]));
+        assert_eq!(input.recorded_output, Some(vec![22]));
+    }
+
+    #[test]
+    fn build_transition_input_preserves_recorded_io_for_sequence_steps() {
+        let sequence_start = StepRecord::SequenceStart(SequenceStartRecord {
+            exec_index: 1,
+            sequence_id: "main".to_string(),
+            coordinates: CfsCoordinates(vec![]),
+            input_commitment: vec![1; 32],
+        });
+        let sequence_end = StepRecord::SequenceEnd(SequenceEndRecord {
+            exec_index: 2,
+            sequence_id: "main".to_string(),
+            coordinates: CfsCoordinates(vec![]),
+            output_commitment: vec![2; 32],
+        });
+        let recorded_step_io = HashMap::from([
+            (sequence_start.clone(), (Some(vec![3, 4]), None)),
+            (sequence_end.clone(), (None, Some(vec![5, 6]))),
+        ]);
+
+        let start_input = build_transition_input(
+            &sequence_start,
+            &HashMap::new(),
+            &recorded_step_io,
+            &HashMap::new(),
+        );
+        let end_input = build_transition_input(
+            &sequence_end,
+            &HashMap::new(),
+            &recorded_step_io,
+            &HashMap::new(),
+        );
+
+        assert_eq!(start_input.replay_image_id, None);
+        assert_eq!(start_input.recorded_input, Some(vec![3, 4]));
+        assert_eq!(start_input.recorded_output, None);
+
+        assert_eq!(end_input.replay_image_id, None);
+        assert_eq!(end_input.recorded_input, None);
+        assert_eq!(end_input.recorded_output, Some(vec![5, 6]));
+    }
 }

@@ -1,30 +1,33 @@
-pub mod subscriber;
-
+pub mod recorder;
+pub mod publisher;
+pub mod commitment;
 
 use raster_core::trace::TraceEvent;
 
-use crate::tracing::subscriber::ExecutionSubscriber;
-use crate::tracing::subscriber::{Subscriber, GLOBAL_SUBSCRIBER};
+use crate::tracing::publisher::TraceEventPublisher;
+use crate::tracing::publisher::{Publisher, GLOBAL_PUBLISHER};
+
+pub const TRACE_EVENT_PREFIX: &str = "[trace-event]";
 
 /// Initializes the global subscriber with a JSON subscriber that writes to stdout.
 ///
 /// This function should be called once at the start of your program.
 /// Subsequent calls will have no effect.
 pub fn init() {
-    init_with(ExecutionSubscriber::new(std::io::stdout()));
+    init_with(TraceEventPublisher::new(std::io::stdout()));
 }
 
 /// Initializes the global sub:scriber with a custom subscriber.
 ///
 /// This function should be called once at the start of your program.
 /// Subsequent calls will have no effect.
-pub fn init_with<S: Subscriber + 'static>(subscriber: S) {
-    let _ = GLOBAL_SUBSCRIBER.set(Box::new(subscriber));
+pub fn init_with<P: Publisher + 'static>(publisher: P) {
+    let _ = GLOBAL_PUBLISHER.set(Box::new(publisher));
 }
 
 pub fn finish() {
-    if let Some(subscriber) = GLOBAL_SUBSCRIBER.get() {
-        subscriber.on_complete();
+    if let Some(publisher) = GLOBAL_PUBLISHER.get() {
+        publisher.finish();
     }
 }
 
@@ -32,8 +35,8 @@ pub fn finish() {
 // This is not part of the public API.
 
 #[doc(hidden)]
-pub fn emit_trace_event(event: TraceEvent) {
-    if let Some(subscriber) = GLOBAL_SUBSCRIBER.get() {
-        subscriber.on_trace(event);
+pub fn publish_trace_event(event: TraceEvent) {
+    if let Some(publisher) = GLOBAL_PUBLISHER.get() {
+        publisher.publish(event);
     }
 }

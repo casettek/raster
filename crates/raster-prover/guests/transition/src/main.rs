@@ -142,14 +142,14 @@ fn verify_step_record_inputs(
     step_record: &StepRecord,
     witness: &HashMap<StepRecord, Vec<u8>>,
 ) {
-    // TODO: SequenceStart/SequenceEnd case. In case of SequenceStart input is External Kind from
+    // TODO: SequenceStart/SequenceEnd entrypoint case. In case of SequenceStart input is External Kind from
     // cli or from file. SequenceEnd just binding latest executed tile output.
     if step_record.coordinates().is_empty() {
         return;
     }
 
     let cfs_item = cfs_cursor
-        .try_get_child_item(step_record.coordinates())
+        .try_get_item(step_record.coordinates())
         .unwrap_or_else(|| {
             panic!(
                 "Failed to resolve cfs item for step record {:?}",
@@ -220,7 +220,7 @@ fn verify_step_record_inputs(
                 );
 
                 let producer_item = cfs_cursor
-                    .try_get_child_item(&producer_coordinates)
+                    .try_get_item(&producer_coordinates)
                     .unwrap_or_else(|| {
                         panic!(
                             "Failed to resolve producer item {} for step {:?}",
@@ -253,23 +253,64 @@ fn verify_step_record_inputs(
     }
 }
 
-fn verify_step_record(step: &StepRecord, replay_image_id: Option<&Vec<u8>>) {
+fn verify_step_commitments(
+    step: &StepRecord,
+    recorded_input: Option<&Vec<u8>>,
+    recorded_output: Option<&Vec<u8>>,
+) {
+    let commitment_for = |bytes: Option<&Vec<u8>>| -> Vec<u8> {
+        bytes
+            .map(|bytes| Sha256::digest(bytes).to_vec())
+            .unwrap_or_default()
+    };
+
     match step {
         StepRecord::TileExec(tile_exec_record) => {
-            let replay_image_id = replay_image_id
-                .expect("replay image id should be provided for tile execution should ");
-            let replay_image_id_digest =
-                risc0_zkvm::sha::Digest::try_from(replay_image_id.as_slice())
-                    .expect("image_id must be 32 bytes");
-
-            env::verify(
-                replay_image_id_digest,
-                &tile_exec_record.fn_call_record.output_data,
-            )
-            .expect("Failed to verify trace replay image id");
+            assert_eq!(
+                tile_exec_record.input_commitment,
+                commitment_for(recorded_input),
+                "Tile input commitment does not match recorded input bytes",
+            );
+            assert_eq!(
+                tile_exec_record.output_commitment,
+                commitment_for(recorded_output),
+                "Tile output commitment does not match recorded output bytes",
+            );
         }
-        StepRecord::SequenceStart(_) => {}
-        StepRecord::SequenceEnd(_) => {}
+        StepRecord::SequenceStart(sequence_start_record) => {
+            assert_eq!(
+                sequence_start_record.input_commitment,
+                commitment_for(recorded_input),
+                "Sequence start input commitment does not match recorded input bytes",
+            );
+        }
+        StepRecord::SequenceEnd(sequence_end_record) => {
+            assert_eq!(
+                sequence_end_record.output_commitment,
+                commitment_for(recorded_output),
+                "Sequence end output commitment does not match recorded output bytes",
+            );
+        }
+    }
+}
+
+fn verify_step_record(
+    step: &StepRecord,
+    replay_image_id: Option<&Vec<u8>>,
+    recorded_input: Option<&Vec<u8>>,
+    recorded_output: Option<&Vec<u8>>,
+) {
+    verify_step_commitments(step, recorded_input, recorded_output);
+
+    if let StepRecord::TileExec(_) = step {
+        let replay_image_id = replay_image_id
+            .expect("replay image id should be provided for tile execution should ");
+        let replay_image_id_digest = risc0_zkvm::sha::Digest::try_from(replay_image_id.as_slice())
+            .expect("image_id must be 32 bytes");
+        let output_bytes = recorded_output.map(Vec::as_slice).unwrap_or(&[]);
+
+        env::verify(replay_image_id_digest, output_bytes)
+            .expect("Failed to verify trace replay image id");
     }
 }
 
@@ -333,7 +374,12 @@ fn main() {
                 &input.step_record,
                 &input.witness,
             );
-            verify_step_record(&input.step_record, input.replay_image_id.as_ref());
+            verify_step_record(
+                &input.step_record,
+                input.replay_image_id.as_ref(),
+                input.recorded_input.as_ref(),
+                input.recorded_output.as_ref(),
+            );
             let next_expected_coordinates =
                 get_next_expected_coordinates(&cfs_cursor, &input.step_record, None);
 
@@ -392,7 +438,12 @@ fn main() {
                 &input.step_record,
                 &input.witness,
             );
-            verify_step_record(&input.step_record, input.replay_image_id.as_ref());
+            verify_step_record(
+                &input.step_record,
+                input.replay_image_id.as_ref(),
+                input.recorded_input.as_ref(),
+                input.recorded_output.as_ref(),
+            );
             let next_expected_coordinates = get_next_expected_coordinates(
                 &cfs_cursor,
                 &input.step_record,
@@ -440,5 +491,66 @@ fn main() {
         TransitionState::Finished => {
             panic!("Finished Transition");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use raster_core::cfs::CfsCoordinates;
+    use raster_core::trace::{SequenceEndRecord, SequenceStartRecord, TileExecRecord};
+
+    fn sha(bytes: &[u8]) -> Vec<u8> {
+        Sha256::digest(bytes).to_vec()
+    }
+
+    #[test]
+    fn verify_tile_commitments_accept_matching_recorded_io() {
+        let step = StepRecord::TileExec(TileExecRecord {
+            exec_index: 1,
+            tile_id: "tile".to_string(),
+            sequence_id: "main".to_string(),
+            coordinates: CfsCoordinates(vec![0]),
+            intra_sequence_index: 0,
+            input_commitment: sha(b"in"),
+            output_commitment: sha(b"out"),
+        });
+
+        verify_step_commitments(&step, Some(&b"in".to_vec()), Some(&b"out".to_vec()));
+    }
+
+    #[test]
+    #[should_panic(expected = "Tile input commitment does not match recorded input bytes")]
+    fn verify_tile_commitments_reject_mismatched_input() {
+        let step = StepRecord::TileExec(TileExecRecord {
+            exec_index: 1,
+            tile_id: "tile".to_string(),
+            sequence_id: "main".to_string(),
+            coordinates: CfsCoordinates(vec![0]),
+            intra_sequence_index: 0,
+            input_commitment: sha(b"expected"),
+            output_commitment: sha(b"out"),
+        });
+
+        verify_step_commitments(&step, Some(&b"actual".to_vec()), Some(&b"out".to_vec()));
+    }
+
+    #[test]
+    fn verify_sequence_boundary_commitments_accept_matching_recorded_io() {
+        let start = StepRecord::SequenceStart(SequenceStartRecord {
+            exec_index: 1,
+            sequence_id: "main".to_string(),
+            coordinates: CfsCoordinates(vec![]),
+            input_commitment: sha(b"sequence-in"),
+        });
+        let end = StepRecord::SequenceEnd(SequenceEndRecord {
+            exec_index: 2,
+            sequence_id: "main".to_string(),
+            coordinates: CfsCoordinates(vec![]),
+            output_commitment: sha(b"sequence-out"),
+        });
+
+        verify_step_commitments(&start, Some(&b"sequence-in".to_vec()), None);
+        verify_step_commitments(&end, None, Some(&b"sequence-out".to_vec()));
     }
 }
