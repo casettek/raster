@@ -14,6 +14,8 @@ pub struct ReplayResult {
     pub receipt: Vec<u8>,
 
     pub image_id: Vec<u8>,
+    pub input: Vec<u8>,
+    pub output: Vec<u8>,
 }
 
 /// Result of replaying a trace item.
@@ -55,7 +57,12 @@ impl<'a> Replayer<'a> {
     ///
     /// # Returns
     /// A `ReplayResult` containing the execution result and optional output comparison.
-    pub fn replay(&self, record: &TileExecRecord, mode: ExecutionMode) -> Result<ReplayResult> {
+    pub fn replay(
+        &self,
+        record: &TileExecRecord,
+        input_bytes: &[u8],
+        mode: ExecutionMode,
+    ) -> Result<ReplayResult> {
         let discovery = TileDiscovery::new(self.project);
 
         let tile = discovery.get(&record.tile_id).ok_or_else(|| {
@@ -68,12 +75,6 @@ impl<'a> Replayer<'a> {
             .compile_tile(&tile.to_metadata(), content_hash)?;
 
         let image_id = artifact.artifact_id();
-        let input_bytes = record
-            .input
-            .as_ref()
-            .map(|input| input.data.as_slice())
-            .unwrap_or(&[]);
-
         let exec_result = self
             .backend
             .execute_tile(artifact.as_ref(), input_bytes, mode)?;
@@ -83,6 +84,8 @@ impl<'a> Replayer<'a> {
             fn_name: record.tile_id.clone(),
             receipt: exec_result.receipt.unwrap(),
             image_id,
+            input: input_bytes.to_vec(),
+            output: exec_result.output,
         })
     }
 }

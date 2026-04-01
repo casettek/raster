@@ -4,7 +4,7 @@ use rand::seq::IndexedMutRandom;
 use raster_backend::backend::HexString;
 use rayon::prelude::*;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -30,7 +30,7 @@ use raster_prover::trace::{
     FraudEvidence, SerializableFrontier, TraceCommitment, TraceVerifier, VerificationResult,
 };
 use raster_prover::transition::step_transitions;
-use raster_runtime::{TraceAssembler, TRACE_EVENT_PREFIX};
+use raster_runtime::{TraceRecorder, TRACE_EVENT_PREFIX};
 
 use crate::BackendType;
 
@@ -111,21 +111,25 @@ pub fn run(
 
     let mut handles = Vec::new();
 
-    let stdout_cfs = cfs.clone();
+    let trace_recorder = Arc::new(Mutex::new(TraceRecorder::new(cfs.clone())));
+    let stdout_trace_recorder = Arc::clone(&trace_recorder);
     let stdout_handle = std::thread::spawn(move || {
         let stdout_reader = BufReader::new(stdout);
-        let mut assembler = TraceAssembler::new(stdout_cfs);
 
         for line in stdout_reader.lines() {
             if let Ok(line_str) = line {
-                let mut trace_lock = reader_trace.lock().unwrap();
-                let mut log_lock = reader_log.lock().unwrap();
                 if let Some(raw_event) = line_str.strip_prefix(TRACE_EVENT_PREFIX) {
                     if let Ok(trace_event) = serde_json::from_str::<TraceEvent>(raw_event) {
-                        trace_lock.push(assembler.process(trace_event));
+                        let step_record = {
+                            let mut trace_recorder = stdout_trace_recorder.lock().unwrap();
+                            trace_recorder.record(trace_event)
+                        };
+                        let mut trace_lock = reader_trace.lock().unwrap();
+                        trace_lock.push(step_record);
                     }
                 }
                 if let Some(debug_line) = line_str.strip_prefix("[debug]") {
+                    let mut log_lock = reader_log.lock().unwrap();
                     log_lock.push(debug_line.to_string());
                 }
             }
@@ -159,6 +163,11 @@ pub fn run(
         .unwrap();
 
     let log = Arc::try_unwrap(log)
+        .expect("Cant move list out of Mutex. Some thread still holding copy of Arc")
+        .into_inner()
+        .unwrap();
+
+    let trace_recorder = Arc::try_unwrap(trace_recorder)
         .expect("Cant move list out of Mutex. Some thread still holding copy of Arc")
         .into_inner()
         .unwrap();
@@ -248,7 +257,7 @@ pub fn run(
             VerificationResult::Ok => println!("Verification Success"),
             VerificationResult::Fraud(fraud_evidence) => {
                 let replayer = Replayer::new(&backend, &project);
-                let _fraud_proof = prove(fraud_evidence, &cfs, &replayer);
+                let _fraud_proof = prove(fraud_evidence, &cfs, &trace_recorder, &replayer);
                 println!("Faurd proof generated");
             }
         }
@@ -300,22 +309,13 @@ pub fn fraud(trace: &mut Trace, commit_path: &str) {
     if let Some(fraud_step) = trace.choose_mut(&mut rng) {
         match fraud_step {
             StepRecord::TileExec(tile_exec_record) => {
-                let output = tile_exec_record
-                    .output
-                    .get_or_insert_with(|| raster_core::trace::FnOutput::new(Vec::new(), "()"));
-                output.data = vec![0u8, 1u8];
+                tile_exec_record.output_commitment = vec![0u8, 1u8];
             }
             StepRecord::SequenceStart(sequence_start_record) => {
-                let input = sequence_start_record
-                    .input
-                    .get_or_insert_with(|| raster_core::trace::FnInput::new(Vec::new(), Vec::new()));
-                input.data.push(0);
+                sequence_start_record.input_commitment.push(0);
             }
             StepRecord::SequenceEnd(sequence_end_record) => {
-                let output = sequence_end_record
-                    .output
-                    .get_or_insert_with(|| raster_core::trace::FnOutput::new(Vec::new(), "()"));
-                output.data.push(0);
+                sequence_end_record.output_commitment.push(0);
             }
         }
     };
@@ -352,6 +352,7 @@ pub fn verify(trace: &Trace, commit_path: &str, cfs: &ControlFlowSchema) -> Veri
 pub fn prove(
     fraud_evidence: FraudEvidence,
     cfs: &ControlFlowSchema,
+    trace_recorder: &TraceRecorder,
     replayer: &Replayer,
 ) -> risc0_zkvm::Receipt {
     let mode = ExecutionMode::prove_and_verify();
@@ -360,16 +361,27 @@ pub fn prove(
         witness,
     } = fraud_evidence;
 
-    let mut replayed_results: BTreeMap<String, ReplayResult> = BTreeMap::new();
+    let mut replayed_results: HashMap<StepRecord, ReplayResult> = HashMap::new();
+    let mut recorded_step_io: HashMap<StepRecord, (Option<Vec<u8>>, Option<Vec<u8>>)> =
+        HashMap::new();
 
-    for (i, step_record) in fraud_window.items.iter().enumerate() {
+    for step_record in &fraud_window.items {
+        let recorded_io = trace_recorder
+            .io_data_at(step_record.coordinates())
+            .unwrap_or_else(|| {
+                panic!(
+                    "Missing recorded I/O for fraud window step at coordinates {:?}",
+                    step_record.coordinates()
+                )
+            });
+        let recorded_input = recorded_io.0.clone();
+        recorded_step_io.insert(step_record.clone(), recorded_io);
+
         if let StepRecord::TileExec(tile_exec) = step_record {
-            match replayer.replay(tile_exec, mode) {
+            let replay_input = recorded_input.unwrap_or_default();
+            match replayer.replay(tile_exec, replay_input.as_slice(), mode) {
                 Ok(replay_result) => {
-                    replayed_results.insert(
-                        tile_exec.tile_id.clone(),
-                        replay_result.clone(),
-                    );
+                    replayed_results.insert(step_record.clone(), replay_result);
                 }
                 Err(e) => {
                     println!("FAILED to replay: {}", e);
@@ -388,6 +400,7 @@ pub fn prove(
             fraud_window.fingerprint,
             &cfs,
             &witness,
+            &recorded_step_io,
             &replayed_results,
         ) else {
             panic!("Failed to generate fraud proof");

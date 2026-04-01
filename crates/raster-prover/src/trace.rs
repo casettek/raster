@@ -402,7 +402,7 @@ fn resolve_record_inputs(
                 );
 
                 let producer_item = cfs_cursor
-                    .try_get_child_item(&producer_coordinates)
+                    .try_get_item(&producer_coordinates)
                     .unwrap_or_else(|| {
                         panic!(
                             "Failed to resolve producer item {} for step {:?} in frame {:?}",
@@ -464,7 +464,7 @@ fn resolve_fraud_window_sources(
         }
 
         let cfs_item = cfs_cursor
-            .try_get_child_item(step_record.coordinates())
+            .try_get_item(step_record.coordinates())
             .unwrap_or_else(|| {
                 panic!(
                     "Failed to resolve cfs item for fraud window coordinates: {:?}",
@@ -480,11 +480,11 @@ fn resolve_fraud_window_sources(
             cfs_item.inputs(),
         ) {
             let trace_prefix = Trace(trace[..step_index].to_vec());
-            let proof = TraceCommitment::witness(&trace_prefix, producer_record.index, seed)
-                .expect("Failed to derive witness proof for source record");
+            let merkle_path = TraceCommitment::witness(&trace_prefix, producer_record.index, seed)
+                .expect("Failed to derive merkle path for source record");
             let witness_bytes = postcard::to_allocvec(&StepRecordWitness {
-                position: u64::from(proof.position()),
-                path_elems: proof.path_elems().iter().map(|elem| elem.0.clone()).collect(),
+                position: u64::from(merkle_path.position()),
+                path_elems: merkle_path.path_elems().iter().map(|elem| elem.0.clone()).collect(),
             })
             .expect("Failed to serialize source record witness");
 
@@ -664,17 +664,7 @@ mod tests {
             coordinates: CfsCoordinates(coordinates),
             tile_id: fn_name.to_string(),
             input_commitment: Vec::new(),
-            input: Some(FnInput::new(
-                Vec::new(),
-                (0..input_count)
-                    .map(|index| FnInputArgs {
-                        name: format!("input_{index}"),
-                        ty: "u64".to_string(),
-                    })
-                    .collect(),
-            )),
             output_commitment: Vec::new(),
-            output: Some(FnOutput::new(output.to_le_bytes().to_vec(), "u64")),
         })
     }
 
@@ -688,15 +678,6 @@ mod tests {
             exec_index,
             sequence_id: sequence_id.to_string(),
             coordinates: CfsCoordinates(coordinates),
-            input: Some(FnInput::new(
-                Vec::new(),
-                (0..input_count)
-                    .map(|index| FnInputArgs {
-                        name: format!("input_{index}"),
-                        ty: "u64".to_string(),
-                    })
-                    .collect(),
-            )),
             input_commitment: Vec::new(),
         })
     }
@@ -710,7 +691,6 @@ mod tests {
             exec_index,
             sequence_id: sequence_id.to_string(),
             coordinates: CfsCoordinates(coordinates),
-            output: Some(FnOutput::new(exec_index.to_le_bytes().to_vec(), "u64")),
             output_commitment: Vec::new(),
         })
     }

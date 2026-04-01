@@ -76,7 +76,7 @@ pub struct TraceIO {
     output_data: Option<Vec<u8>>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct TraceIOStore(HashMap<CfsCoordinates, TraceIO>);
 
 impl TraceIOStore {
@@ -116,14 +116,15 @@ impl TraceIOStore {
     }
 }
 
-pub struct TraceAssembler {
+#[derive(Debug, Clone)]
+pub struct TraceRecorder {
     exec_index: u64,
     sequence_callstack: SequenceCallstack,
     cfs_cursor: CfsCursor,
     io_store: TraceIOStore,
 }
 
-impl TraceAssembler {
+impl TraceRecorder {
     pub fn new(cfs: ControlFlowSchema) -> Self {
         Self {
             exec_index: 0,
@@ -133,7 +134,31 @@ impl TraceAssembler {
         }
     }
 
-    pub fn process(&mut self, event: TraceEvent) -> StepRecord {
+    pub fn input_data_at(&self, coordinates: &CfsCoordinates) -> Option<Option<Vec<u8>>> {
+        self.io_store
+            .get(coordinates)
+            .map(|trace_io| trace_io.input_data.clone())
+    }
+
+    pub fn output_data_at(&self, coordinates: &CfsCoordinates) -> Option<Option<Vec<u8>>> {
+        self.io_store
+            .get(coordinates)
+            .map(|trace_io| trace_io.output_data.clone())
+    }
+
+    pub fn io_data_at(
+        &self,
+        coordinates: &CfsCoordinates,
+    ) -> Option<(Option<Vec<u8>>, Option<Vec<u8>>)> {
+        self.io_store.get(coordinates).map(|trace_io| {
+            (
+                trace_io.input_data.clone(),
+                trace_io.output_data.clone(),
+            )
+        })
+    }
+
+    pub fn record(&mut self, event: TraceEvent) -> StepRecord {
         self.exec_index += 1;
         let exec_index = self.exec_index;
 

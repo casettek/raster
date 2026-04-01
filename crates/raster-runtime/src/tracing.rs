@@ -1,4 +1,4 @@
-pub mod assembler;
+pub mod recorder;
 pub mod publisher;
 pub mod commitment;
 

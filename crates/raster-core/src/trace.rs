@@ -134,21 +134,11 @@ impl StepRecord {
     }
 
     pub fn input(&self) -> Option<&FnInput> {
-        match self {
-            StepRecord::TileExec(tile_exec_record) => tile_exec_record.input.as_ref(),
-            StepRecord::SequenceStart(sequence_start_record) => {
-                sequence_start_record.input.as_ref()
-            }
-            StepRecord::SequenceEnd(_) => None,
-        }
+        None
     }
 
     pub fn output(&self) -> Option<&FnOutput> {
-        match self {
-            StepRecord::TileExec(tile_exec_record) => tile_exec_record.output.as_ref(),
-            StepRecord::SequenceStart(_) => None,
-            StepRecord::SequenceEnd(sequence_end_record) => sequence_end_record.output.as_ref(),
-        }
+        None
     }
 }
 

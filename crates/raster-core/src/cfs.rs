@@ -48,6 +48,7 @@ impl DerefMut for CfsCoordinates {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct CfsCursor {
     cfs: ControlFlowSchema,
     entrypoint_coordinate: CfsCoordinate,
@@ -138,7 +139,7 @@ impl CfsCursor {
                             let mut next_coordinates = parent_sequence_coordinates.clone();
                             next_coordinates.push(*current_sequence_coordinate + 1);
 
-                            if self.try_get_child_item(&next_coordinates).is_some() {
+                            if self.try_get_item(&next_coordinates).is_some() {
                                 return Some(Vec::from([next_coordinates]));
                             }
 
@@ -161,7 +162,7 @@ impl CfsCursor {
                     let mut next_coordinates = current_coordinates.clone();
 
                     next_coordinates.push(0);
-                    if self.try_get_child_item(&next_coordinates).is_some() {
+                    if self.try_get_item(&next_coordinates).is_some() {
                         next_coordinates_options.push(next_coordinates);
                     }
 
@@ -185,7 +186,7 @@ impl CfsCursor {
                         let mut next_coordinates = parent_sequence_coordinates.clone();
                         next_coordinates.push(*current_sequence_coordinate + 1);
 
-                        if self.try_get_child_item(&next_coordinates).is_some() {
+                        if self.try_get_item(&next_coordinates).is_some() {
                             next_coordinates_options.push(next_coordinates);
                         }
                     } else {
@@ -233,7 +234,7 @@ impl CfsCursor {
         (current_sequence, sequence_item_coord)
     }
 
-    pub fn try_get_child_item(&self, coordinates: &CfsCoordinates) -> Option<&SequenceChildItem> {
+    pub fn try_get_item(&self, coordinates: &CfsCoordinates) -> Option<&SequenceChildItem> {
         let mut current_sequence = self.cfs.sequences.get(self.entrypoint_coordinate as usize);
         let mut current_child_item: Option<&SequenceChildItem> = None;
 
