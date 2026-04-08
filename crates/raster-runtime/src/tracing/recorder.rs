@@ -150,12 +150,9 @@ impl TraceRecorder {
         &self,
         coordinates: &CfsCoordinates,
     ) -> Option<(Option<Vec<u8>>, Option<Vec<u8>>)> {
-        self.io_store.get(coordinates).map(|trace_io| {
-            (
-                trace_io.input_data.clone(),
-                trace_io.output_data.clone(),
-            )
-        })
+        self.io_store
+            .get(coordinates)
+            .map(|trace_io| (trace_io.input_data.clone(), trace_io.output_data.clone()))
     }
 
     pub fn record(&mut self, event: TraceEvent) -> StepRecord {

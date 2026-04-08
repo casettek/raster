@@ -137,7 +137,6 @@ pub fn run(
     });
     handles.push(stdout_handle);
 
-
     let mut errors = Arc::new(Mutex::new(Vec::new()));
     let mut thread_errors = Arc::clone(&errors);
     let stderr_handle = std::thread::spawn(move || {

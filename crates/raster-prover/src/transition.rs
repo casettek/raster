@@ -43,7 +43,10 @@ fn build_transition_input(
     match step_record {
         StepRecord::TileExec(_) => {
             let Some(replay_result) = replayed_results.get(step_record) else {
-                panic!("Replayed result not found for transition step {:?}", step_record);
+                panic!(
+                    "Replayed result not found for transition step {:?}",
+                    step_record
+                );
             };
 
             TransitionInput {
@@ -108,18 +111,18 @@ pub fn step_transitions(
     let mut current_state = TransitionState::Init(init_transition);
 
     for step_record in trace_window {
-        let input = build_transition_input(
-            step_record,
-            witness,
-            recorded_step_io,
-            replayed_results,
-        );
-        let replay_receipt_assumption: Option<risc0_zkvm::Receipt>= match step_record {
+        let input =
+            build_transition_input(step_record, witness, recorded_step_io, replayed_results);
+        let replay_receipt_assumption: Option<risc0_zkvm::Receipt> = match step_record {
             StepRecord::TileExec(_) => {
                 let replay_result = replayed_results.get(step_record).unwrap_or_else(|| {
-                    panic!("Replayed receipt not found for transition step {:?}", step_record)
+                    panic!(
+                        "Replayed receipt not found for transition step {:?}",
+                        step_record
+                    )
                 });
-                let receipt: risc0_zkvm::Receipt = postcard::from_bytes(&replay_result.receipt).unwrap();
+                let receipt: risc0_zkvm::Receipt =
+                    postcard::from_bytes(&replay_result.receipt).unwrap();
                 Some(receipt)
             }
             StepRecord::SequenceStart(_) | StepRecord::SequenceEnd(_) => None,

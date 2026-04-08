@@ -24,7 +24,9 @@ pub struct TraceEventPublisher<W: Write + Send> {
 
 impl<W: Write + Send> TraceEventPublisher<W> {
     pub fn new(writer: W) -> Self {
-        Self { writer: Mutex::new(writer) }
+        Self {
+            writer: Mutex::new(writer),
+        }
     }
 }
 

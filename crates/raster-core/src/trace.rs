@@ -1,10 +1,10 @@
 //! Trace types (requires std feature).
 
 use serde::{Deserialize, Serialize};
+use std::hash::Hash;
 use std::ops::{Deref, DerefMut};
 use std::string::String;
 use std::vec::Vec;
-use std::hash::Hash;
 
 use crate::cfs::CfsCoordinates;
 use crate::fingerprint::Fingerprint;
@@ -16,6 +16,10 @@ pub struct FnInputArgs {
     pub name: String,
     /// Type name as a string (e.g., "u64", "String")
     pub ty: String,
+    #[serde(default)]
+    pub external_name: Option<String>,
+    #[serde(default)]
+    pub external_data_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -23,7 +27,6 @@ pub struct FnInput {
     pub data: Vec<u8>,
     pub args: Vec<FnInputArgs>,
 }
-
 
 impl FnInput {
     pub fn new(data: Vec<u8>, args: Vec<FnInputArgs>) -> Self {

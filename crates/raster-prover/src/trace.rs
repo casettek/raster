@@ -321,15 +321,14 @@ fn resolve_record_inputs(
     cfs_cursor: &CfsCursor,
     step_inputs: &[InputBinding],
 ) -> Vec<IndexedStepRecord> {
-    if step_inputs 
+    if step_inputs
         .iter()
         .all(|input| matches!(input.source, InputSource::External))
     {
         return Vec::new();
     }
 
-    let Some((parent_sequence_coordinates, item_coordinate)) =
-        parent_coordinates(&step_record)
+    let Some((parent_sequence_coordinates, item_coordinate)) = parent_coordinates(&step_record)
     else {
         // Entrypoint SequenceStart/SequenceEnd
         return Vec::new();
@@ -406,7 +405,7 @@ fn resolve_record_inputs(
                     .unwrap_or_else(|| {
                         panic!(
                             "Failed to resolve producer item {} for step {:?} in frame {:?}",
-                            item_index, step_record, parent_sequence_coordinates 
+                            item_index, step_record, parent_sequence_coordinates
                         )
                     });
 
@@ -484,7 +483,11 @@ fn resolve_fraud_window_sources(
                 .expect("Failed to derive merkle path for source record");
             let witness_bytes = postcard::to_allocvec(&StepRecordWitness {
                 position: u64::from(merkle_path.position()),
-                path_elems: merkle_path.path_elems().iter().map(|elem| elem.0.clone()).collect(),
+                path_elems: merkle_path
+                    .path_elems()
+                    .iter()
+                    .map(|elem| elem.0.clone())
+                    .collect(),
             })
             .expect("Failed to serialize source record witness");
 
@@ -558,9 +561,7 @@ impl<'a> TraceVerifier<'a> {
             let step_record_hash = step_record.hash();
             self.latest_frontier.append(Bytes(step_record_hash));
 
-            let root = self
-                .latest_frontier
-                .root(Some(0.into()));
+            let root = self.latest_frontier.root(Some(0.into()));
 
             self.fingerprint_acc.append(&root.0);
 

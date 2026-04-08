@@ -9,7 +9,7 @@ description = "Rust-based developer toolchain for tile-based execution"
 
 [features]
 default = ["std"]
-std = ["raster-core/std", "raster-runtime", "serde", "serde_json"]
+std = ["raster-core/std", "raster-runtime", "serde_json", "sha2"]
 alloc = ["raster-core/alloc"]
 
 [dependencies]
@@ -20,6 +20,8 @@ raster-macros.workspace = true
 raster-runtime = { workspace = true, optional = true }
 
 
-# Serde and serde_json for input parsing (std only)
-serde = { workspace = true, optional = true }
+# Serde is used for typed input bounds in both std and no_std builds
+serde.workspace = true
+# serde_json for input parsing (std only)
 serde_json = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
