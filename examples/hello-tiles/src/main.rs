@@ -1,6 +1,6 @@
 use raster::prelude::*;
 
-use hello_tiles::{current_wish, exclaim, greet, raster_wish};
+use hello_tiles::{current_wish, exclaim, greet, input::PersonalData, personal_greet, raster_wish};
 
 /// The main sequence that greets and adds emphasis.
 ///
@@ -14,6 +14,7 @@ use hello_tiles::{current_wish, exclaim, greet, raster_wish};
 /// Or: `cargo raster preview --input '"Raster"'`
 #[sequence]
 fn greet_sequence(name: String) -> String {
+    call!(personal_greet, external!("personal_data"));
     let greeting = call!(greet, name);
     let e1 = call!(exclaim, greeting);
     let e2 = call!(exclaim, e1);
@@ -40,8 +41,8 @@ fn placeholder_sequence(placeholder: String) -> String {
 /// The `name` parameter is parsed from `--input` CLI argument.
 /// Run with: `cargo run -- --input '"YourName"'`
 #[sequence]
-fn main(name: String) {
+fn main(#[external(name = "personal_data")] personal_data: External<PersonalData>) {
     call_seq!(greet_sequence, "Rust".to_string());
-    let name_2 = call_seq!(placeholder_sequence, name);
+    let name_2 = call_seq!(placeholder_sequence, personal_data.name);
     let _result = call_seq!(greet_sequence, name_2);
 }

@@ -12,8 +12,6 @@ risc0-zkvm = "1.2"
 
 serde = { version = "1.0", features = ["derive"] }
 postcard = { version = "1.0", features = ["alloc"] }
-
-sha2 = "0.10"
 hex-literal = "1.1.0"
 
 bridgetree = "0.7"

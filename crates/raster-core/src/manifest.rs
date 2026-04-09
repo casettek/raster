@@ -1,10 +1,11 @@
 //! Manifest types (requires std feature).
 
+use crate::schema::SequenceSchema;
+use crate::tile::TileMetadata;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::string::String;
 use std::vec::Vec;
-use serde::{Deserialize, Serialize};
-use crate::tile::TileMetadata;
-use crate::schema::SequenceSchema;
 
 /// Project-level manifest describing all tiles and sequences.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -25,3 +26,17 @@ impl Manifest {
         }
     }
 }
+
+/// A file-backed external input declared inside the user input document.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExternalInputEntry {
+    pub path: String,
+    #[serde(default)]
+    pub data_hash: Option<String>,
+}
+
+/// A JSON input document used by the native whole-program runner.
+///
+/// Each top-level field may be either a plain JSON value or a file-backed external
+/// reference described by `ExternalInputEntry`.
+pub type InputDocument = BTreeMap<String, serde_json::Value>;

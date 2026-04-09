@@ -120,7 +120,7 @@ enum Commands {
         #[arg(long, short, value_enum, default_value = "native")]
         backend: BackendType,
 
-        /// Input data as JSON string
+        /// Input as inline JSON or a path to a JSON file
         #[arg(long)]
         input: Option<String>,
 

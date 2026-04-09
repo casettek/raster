@@ -76,4 +76,3 @@ impl DisplayBinary for Vec<u64> {
             .join("\n")
     }
 }
-

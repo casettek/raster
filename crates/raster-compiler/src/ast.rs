@@ -66,15 +66,15 @@ impl ProjectAst {
     pub fn new(project_root: &Path) -> Result<Self> {
         let cargo_toml_path = project_root.join("Cargo.toml");
 
-        let manifest = Manifest::from_path(&cargo_toml_path).unwrap();
+        let cargo_manifest = Manifest::from_path(&cargo_toml_path).unwrap();
 
-        let package = manifest.package.as_ref().unwrap();
+        let package = cargo_manifest.package.as_ref().unwrap();
 
         let files_paths = Self::find_all_rs_files(project_root);
 
         let functions = files_paths
             .iter()
-            .flat_map(|path| Self::parse_file(&path))
+            .flat_map(|path| Self::parse_file(path))
             .collect::<Vec<FunctionAstItem>>();
 
         Ok(Self {
@@ -87,9 +87,7 @@ impl ProjectAst {
     fn parse_file(path: &Path) -> Vec<FunctionAstItem> {
         let content = std::fs::read_to_string(path).unwrap();
         let ast = parse_file(&content).unwrap();
-        let functions = Self::parse_functions(&ast, path.to_path_buf());
-
-        functions
+        Self::parse_functions(&ast, path.to_path_buf())
     }
 
     fn find_all_rs_files(project_root: &Path) -> Vec<PathBuf> {
@@ -98,7 +96,7 @@ impl ProjectAst {
         WalkDir::new(&src_dir)
             .into_iter()
             .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().map_or(false, |ext| ext == "rs"))
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "rs"))
             .filter(|e| e.path().file_name().unwrap_or_default() != "mod.rs")
             .map(|e| e.path().to_path_buf())
             .collect()
@@ -115,7 +113,7 @@ impl ProjectAst {
                     .attrs
                     .iter()
                     .filter(|attr| !attr.path().is_ident("doc")) // Skip doc attributes
-                    .map(|attr| Self::parse_macro(attr))
+                    .map(Self::parse_macro)
                     .collect();
 
                 let (input_names, inputs): (Vec<String>, Vec<String>) = func

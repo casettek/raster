@@ -1,6 +1,6 @@
-pub mod recorder;
-pub mod publisher;
 pub mod commitment;
+pub mod publisher;
+pub mod recorder;
 
 use raster_core::trace::TraceEvent;
 

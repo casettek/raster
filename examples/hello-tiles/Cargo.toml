@@ -3,9 +3,15 @@ name = "hello-tiles"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "gen_input"
+path = "bin/gen_input.rs"
+
 [features]
 default = ["std"]
 std = ["raster/std"]
 
 [dependencies]
 raster = { path = "../../crates/raster", default-features = false }
+serde.workspace = true
+sha2.workspace = true

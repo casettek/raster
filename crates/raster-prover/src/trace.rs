@@ -36,17 +36,13 @@ pub trait BytesHashable {
 impl BytesHashable for StepRecord {
     fn hash(&self) -> Vec<u8> {
         let data = postcard::to_allocvec(self).expect("Failed to serialize for hashing");
-        let mut hasher = Sha256::new();
-        hasher.update(&data);
-        hasher.finalize().to_vec()
+        sha256_bytes(&data)
     }
 
     fn try_hash(&self) -> Result<Vec<u8>> {
         let data = postcard::to_allocvec(self)
             .map_err(|e| BitPackerError::SerializationError(e.to_string()))?;
-        let mut hasher = Sha256::new();
-        hasher.update(&data);
-        Ok(hasher.finalize().to_vec())
+        Ok(sha256_bytes(&data))
     }
 }
 
@@ -86,11 +82,12 @@ impl Hashable for Bytes {
         data.extend_from_slice(&a.0);
         data.extend_from_slice(&b.0);
 
-        let mut hasher = Sha256::new();
-        hasher.update(&data);
-
-        Bytes(hasher.finalize().to_vec())
+        Bytes(sha256_bytes(&data))
     }
+}
+
+fn sha256_bytes(bytes: &[u8]) -> Vec<u8> {
+    Sha256::digest(bytes).to_vec()
 }
 
 /// Re-export from raster-core; conversion to/from TraceTreeFrontier via functions below.
@@ -144,7 +141,7 @@ impl TraceCommitment {
 
         let items_hashes: Vec<Vec<u8>> = trace.iter().map(|item| item.hash()).collect();
 
-        let mut trace_tree = TraceTree::new(BITS_PER_ITEM);
+        let mut trace_tree = TraceTree::new(1);
         trace_tree.append(Bytes(seed.to_vec()));
 
         let mut fingerprint_acc = FingerprintAccumulator::new(BitPacker(BITS_PER_ITEM));
@@ -321,15 +318,14 @@ fn resolve_record_inputs(
     cfs_cursor: &CfsCursor,
     step_inputs: &[InputBinding],
 ) -> Vec<IndexedStepRecord> {
-    if step_inputs 
+    if step_inputs
         .iter()
         .all(|input| matches!(input.source, InputSource::External))
     {
         return Vec::new();
     }
 
-    let Some((parent_sequence_coordinates, item_coordinate)) =
-        parent_coordinates(&step_record)
+    let Some((parent_sequence_coordinates, item_coordinate)) = parent_coordinates(&step_record)
     else {
         // Entrypoint SequenceStart/SequenceEnd
         return Vec::new();
@@ -377,7 +373,7 @@ fn resolve_record_inputs(
                     .unwrap_or_else(|| {
                         panic!(
                             "Failed to resolve sequence input {input_index} for step {:?} in frame {:?}",
-                            step_record, parent_sequence_coordinates 
+                            step_record, parent_sequence_coordinates
                         )
                     });
 
@@ -406,7 +402,7 @@ fn resolve_record_inputs(
                     .unwrap_or_else(|| {
                         panic!(
                             "Failed to resolve producer item {} for step {:?} in frame {:?}",
-                            item_index, step_record, parent_sequence_coordinates 
+                            item_index, step_record, parent_sequence_coordinates
                         )
                     });
 
@@ -484,7 +480,11 @@ fn resolve_fraud_window_sources(
                 .expect("Failed to derive merkle path for source record");
             let witness_bytes = postcard::to_allocvec(&StepRecordWitness {
                 position: u64::from(merkle_path.position()),
-                path_elems: merkle_path.path_elems().iter().map(|elem| elem.0.clone()).collect(),
+                path_elems: merkle_path
+                    .path_elems()
+                    .iter()
+                    .map(|elem| elem.0.clone())
+                    .collect(),
             })
             .expect("Failed to serialize source record witness");
 
@@ -558,9 +558,9 @@ impl<'a> TraceVerifier<'a> {
             let step_record_hash = step_record.hash();
             self.latest_frontier.append(Bytes(step_record_hash));
 
-            let root = self
-                .latest_frontier
-                .root(Some(0.into()));
+            let root = TraceTree::from_frontier(1, self.latest_frontier.clone())
+                .root(0)
+                .expect("Failed to derive current trace root from frontier");
 
             self.fingerprint_acc.append(&root.0);
 
@@ -627,10 +627,7 @@ mod tests {
         CfsCoordinates, InputBinding, SequenceChildItem, SequenceDef, SequenceItem, TileDef,
         TileItem,
     };
-    use raster_core::trace::{
-        FnCallRecord, FnInput, FnInputArgs, FnOutput, SequenceEndRecord, SequenceStartRecord,
-        TileExecRecord,
-    };
+    use raster_core::trace::{SequenceEndRecord, SequenceStartRecord, TileExecRecord};
 
     use super::*;
     use crate::precomputed;
@@ -654,7 +651,7 @@ mod tests {
         intra_sequence_index: u32,
         coordinates: Vec<u32>,
         fn_name: String,
-        input_count: usize,
+        _input_count: usize,
         output: u64,
     ) -> StepRecord {
         StepRecord::TileExec(TileExecRecord {
@@ -664,7 +661,8 @@ mod tests {
             coordinates: CfsCoordinates(coordinates),
             tile_id: fn_name.to_string(),
             input_commitment: Vec::new(),
-            output_commitment: Vec::new(),
+            external_input_commitment: Vec::new(),
+            output_commitment: output.to_le_bytes().to_vec(),
         })
     }
 
@@ -672,13 +670,14 @@ mod tests {
         exec_index: u64,
         sequence_id: &str,
         coordinates: Vec<u32>,
-        input_count: usize,
+        _input_count: usize,
     ) -> StepRecord {
         StepRecord::SequenceStart(SequenceStartRecord {
             exec_index,
             sequence_id: sequence_id.to_string(),
             coordinates: CfsCoordinates(coordinates),
             input_commitment: Vec::new(),
+            external_input_commitment: Vec::new(),
         })
     }
 
@@ -814,9 +813,7 @@ mod tests {
             data.push(level);
             data.extend_from_slice(left);
             data.extend_from_slice(right);
-            let mut hasher = sha2::Sha256::new();
-            hasher.update(&data);
-            hasher.finalize().to_vec()
+            sha256_bytes(&data)
         }
 
         fn compute_root_guest(position: u64, leaf: &[u8], ommers: &[Vec<u8>]) -> Vec<u8> {

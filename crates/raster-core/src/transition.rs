@@ -4,12 +4,13 @@
 //! They live in raster-core to avoid circular dependencies (guest cannot depend on prover).
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::string::String;
 use std::vec::Vec;
 
 use crate::cfs::CfsCoordinates;
 use crate::fingerprint::{Fingerprint, FingerprintAccumulator};
-use crate::trace::StepRecord;
+use crate::trace::{ExternalInput, StepRecord};
 
 /// Serializable representation of a Merkle frontier (position, leaf, ommers).
 ///
@@ -40,6 +41,11 @@ pub struct StepRecordWitness {
     pub path_elems: Vec<Vec<u8>>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuthorizedExternalInputs {
+    pub commitments: BTreeMap<String, Vec<u8>>,
+}
+
 /// Input for a single transition step (passed into the transition guest).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransitionInput {
@@ -47,6 +53,8 @@ pub struct TransitionInput {
     pub replay_image_id: Option<Vec<u8>>,
     pub recorded_input: Option<Vec<u8>>,
     pub recorded_output: Option<Vec<u8>>,
+    pub external_input: ExternalInput,
+    pub authorized_external_inputs: AuthorizedExternalInputs,
     pub witness: HashMap<StepRecord, Vec<u8>>,
 }
 
