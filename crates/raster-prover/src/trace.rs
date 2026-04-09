@@ -9,8 +9,8 @@ use raster_core::cfs::{
     CfsCoordinates, CfsCursor, ControlFlowSchema, InputBinding, InputSource, SequenceChildItem,
 };
 use raster_core::fingerprint::{Fingerprint, FingerprintAccumulator};
+use raster_core::hashing::sha256_bytes;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Debug;
@@ -36,17 +36,13 @@ pub trait BytesHashable {
 impl BytesHashable for StepRecord {
     fn hash(&self) -> Vec<u8> {
         let data = postcard::to_allocvec(self).expect("Failed to serialize for hashing");
-        let mut hasher = Sha256::new();
-        hasher.update(&data);
-        hasher.finalize().to_vec()
+        sha256_bytes(&data)
     }
 
     fn try_hash(&self) -> Result<Vec<u8>> {
         let data = postcard::to_allocvec(self)
             .map_err(|e| BitPackerError::SerializationError(e.to_string()))?;
-        let mut hasher = Sha256::new();
-        hasher.update(&data);
-        Ok(hasher.finalize().to_vec())
+        Ok(sha256_bytes(&data))
     }
 }
 
@@ -86,10 +82,7 @@ impl Hashable for Bytes {
         data.extend_from_slice(&a.0);
         data.extend_from_slice(&b.0);
 
-        let mut hasher = Sha256::new();
-        hasher.update(&data);
-
-        Bytes(hasher.finalize().to_vec())
+        Bytes(sha256_bytes(&data))
     }
 }
 
@@ -816,9 +809,7 @@ mod tests {
             data.push(level);
             data.extend_from_slice(left);
             data.extend_from_slice(right);
-            let mut hasher = sha2::Sha256::new();
-            hasher.update(&data);
-            hasher.finalize().to_vec()
+            sha256_bytes(&data)
         }
 
         fn compute_root_guest(position: u64, leaf: &[u8], ommers: &[Vec<u8>]) -> Vec<u8> {

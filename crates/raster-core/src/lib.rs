@@ -15,6 +15,7 @@ extern crate std;
 
 pub mod error;
 pub mod external;
+pub mod hashing;
 pub mod tile;
 
 // These modules are only available with std (they use serde_json for complex serialization)

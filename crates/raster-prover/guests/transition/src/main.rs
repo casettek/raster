@@ -15,6 +15,7 @@ use raster_core::cfs::{
     CfsCoordinates, CfsCursor, ControlFlowSchema, InputSource, SequenceChildItem,
 };
 use raster_core::fingerprint::{Fingerprint, FingerprintAccumulator};
+use raster_core::hashing::sha256_bytes;
 use raster_core::trace::{
     external_input_commitment as compute_external_input_commitment, ExternalInput, StepRecord,
 };
@@ -24,8 +25,6 @@ use raster_core::transition::{
 };
 
 use serde::{Deserialize, Serialize};
-
-use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Bytes(pub Vec<u8>);
@@ -72,9 +71,7 @@ impl Hashable for Bytes {
         data.push(u8::from(level));
         data.extend_from_slice(&a.0);
         data.extend_from_slice(&b.0);
-        let mut hasher = Sha256::new();
-        hasher.update(&data);
-        Bytes(hasher.finalize().to_vec())
+        Bytes(sha256_bytes(&data))
     }
 }
 
@@ -106,9 +103,7 @@ fn serialize_frontier(frontier: &NonEmptyFrontier<Bytes>) -> SerializableFrontie
 /// Hash a TileExecRecord using SHA256 of its postcard-serialized form.
 fn hash_trace_item(item: &StepRecord) -> Vec<u8> {
     let data = postcard::to_allocvec(item).expect("Failed to serialize TileExecRecord");
-    let mut hasher = Sha256::new();
-    hasher.update(&data);
-    hasher.finalize().to_vec()
+    sha256_bytes(&data)
 }
 
 fn decode_step_record_witness(bytes: &[u8]) -> StepRecordWitness {
@@ -261,9 +256,7 @@ fn verify_step_commitments(
     recorded_output: Option<&Vec<u8>>,
 ) {
     let commitment_for = |bytes: Option<&Vec<u8>>| -> Vec<u8> {
-        bytes
-            .map(|bytes| Sha256::digest(bytes).to_vec())
-            .unwrap_or_default()
+        bytes.map(|bytes| sha256_bytes(bytes)).unwrap_or_default()
     };
 
     match step {
@@ -560,7 +553,7 @@ mod tests {
     };
 
     fn sha(bytes: &[u8]) -> Vec<u8> {
-        Sha256::digest(bytes).to_vec()
+        sha256_bytes(bytes)
     }
 
     fn external_input(binding_name: &str, commitment: &[u8]) -> ExternalInput {
