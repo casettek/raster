@@ -175,9 +175,14 @@ mod tests {
     use super::*;
     use raster_core::cfs::CfsCoordinates;
     use raster_core::trace::{
-        external_input_commitment, ExternalBindingMeta, SequenceEndRecord, SequenceStartRecord,
-        TileExecRecord,
+        ExternalBindingMeta, SequenceEndRecord, SequenceStartRecord, TileExecRecord,
     };
+    use sha2::{Digest, Sha256};
+
+    fn external_input_commitment(external_input: &ExternalInput) -> Vec<u8> {
+        let bytes = raster_core::postcard::to_allocvec(external_input).unwrap_or_default();
+        Sha256::digest(bytes).to_vec()
+    }
 
     fn make_external_input(binding_name: &str, commitment: &[u8]) -> ExternalInput {
         HashMap::from([(

@@ -10,15 +10,13 @@ use std::collections::HashMap;
 
 use bridgetree::{Hashable, Level, NonEmptyFrontier, Position};
 use risc0_zkvm::guest::env;
+use risc0_zkvm::sha::{Impl as Risc0Sha256, Sha256 as _};
 
 use raster_core::cfs::{
     CfsCoordinates, CfsCursor, ControlFlowSchema, InputSource, SequenceChildItem,
 };
 use raster_core::fingerprint::{Fingerprint, FingerprintAccumulator};
-use raster_core::hashing::sha256_bytes;
-use raster_core::trace::{
-    external_input_commitment as compute_external_input_commitment, ExternalInput, StepRecord,
-};
+use raster_core::trace::{ExternalInput, StepRecord};
 use raster_core::transition::{
     AuthorizedExternalInputs, SerializableFrontier, StepRecordWitness, Transition, TransitionInput,
     TransitionJournal, TransitionState,
@@ -104,6 +102,15 @@ fn serialize_frontier(frontier: &NonEmptyFrontier<Bytes>) -> SerializableFrontie
 fn hash_trace_item(item: &StepRecord) -> Vec<u8> {
     let data = postcard::to_allocvec(item).expect("Failed to serialize TileExecRecord");
     sha256_bytes(&data)
+}
+
+fn sha256_bytes(bytes: &[u8]) -> Vec<u8> {
+    Risc0Sha256::hash_bytes(bytes).as_bytes().to_vec()
+}
+
+fn external_input_commitment(external_input: &ExternalInput) -> Vec<u8> {
+    let bytes = postcard::to_allocvec(external_input).unwrap_or_default();
+    sha256_bytes(&bytes)
 }
 
 fn decode_step_record_witness(bytes: &[u8]) -> StepRecordWitness {
@@ -294,7 +301,7 @@ fn verify_external_input_commitments(
     external_input: &ExternalInput,
     authorized_external_inputs: &AuthorizedExternalInputs,
 ) {
-    let computed_commitment = compute_external_input_commitment(external_input);
+    let computed_commitment = external_input_commitment(external_input);
 
     match step {
         StepRecord::TileExec(tile_exec_record) => {
@@ -548,8 +555,7 @@ mod tests {
     use super::*;
     use raster_core::cfs::CfsCoordinates;
     use raster_core::trace::{
-        external_input_commitment, ExternalBindingMeta, SequenceEndRecord, SequenceStartRecord,
-        TileExecRecord,
+        ExternalBindingMeta, SequenceEndRecord, SequenceStartRecord, TileExecRecord,
     };
 
     fn sha(bytes: &[u8]) -> Vec<u8> {

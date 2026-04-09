@@ -1,8 +1,8 @@
 use raster_core::cfs::{CfsCoordinates, CfsCursor, ControlFlowSchema, SequenceChildId};
 use raster_core::trace::{
-    external_input_commitment, ExternalInput, SequenceEndRecord, SequenceStartRecord, StepRecord,
-    TileExecRecord, TraceEvent,
+    ExternalInput, SequenceEndRecord, SequenceStartRecord, StepRecord, TileExecRecord, TraceEvent,
 };
+use sha2::{Digest, Sha256};
 
 use std::collections::{HashMap, VecDeque};
 
@@ -129,6 +129,11 @@ impl TraceIOStore {
     pub fn get(&self, coordinates: &CfsCoordinates) -> Option<&TraceIO> {
         self.0.get(coordinates)
     }
+}
+
+fn external_input_commitment(external_input: &ExternalInput) -> Vec<u8> {
+    let bytes = raster_core::postcard::to_allocvec(external_input).unwrap_or_default();
+    Sha256::digest(bytes).to_vec()
 }
 
 #[derive(Debug, Clone)]

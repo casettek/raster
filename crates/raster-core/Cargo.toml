@@ -25,7 +25,3 @@ bincode = { workspace = true, optional = true }
 # linkme is only available on platforms that support it (not RISC-V zkVM)
 [target.'cfg(not(target_arch = "riscv32"))'.dependencies]
 linkme.workspace = true
-sha2.workspace = true
-
-[target.'cfg(target_os = "zkvm")'.dependencies]
-risc0-zkvm = { version = "1.2", default-features = false }

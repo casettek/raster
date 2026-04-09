@@ -9,8 +9,8 @@ use raster_core::cfs::{
     CfsCoordinates, CfsCursor, ControlFlowSchema, InputBinding, InputSource, SequenceChildItem,
 };
 use raster_core::fingerprint::{Fingerprint, FingerprintAccumulator};
-use raster_core::hashing::sha256_bytes;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Debug;
@@ -84,6 +84,10 @@ impl Hashable for Bytes {
 
         Bytes(sha256_bytes(&data))
     }
+}
+
+fn sha256_bytes(bytes: &[u8]) -> Vec<u8> {
+    Sha256::digest(bytes).to_vec()
 }
 
 /// Re-export from raster-core; conversion to/from TraceTreeFrontier via functions below.

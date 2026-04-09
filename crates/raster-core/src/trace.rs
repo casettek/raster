@@ -9,7 +9,6 @@ use std::vec::Vec;
 
 use crate::cfs::CfsCoordinates;
 use crate::fingerprint::Fingerprint;
-use crate::hashing::sha256_bytes;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct FnInputArg {
@@ -47,11 +46,6 @@ impl FnInput {
     pub fn external(&self) -> &ExternalInput {
         &self.external
     }
-}
-
-pub fn external_input_commitment(external_input: &ExternalInput) -> Vec<u8> {
-    let bytes = crate::postcard::to_allocvec(external_input).unwrap_or_default();
-    sha256_bytes(&bytes)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
