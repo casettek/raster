@@ -144,7 +144,7 @@ impl TraceCommitment {
 
         let items_hashes: Vec<Vec<u8>> = trace.iter().map(|item| item.hash()).collect();
 
-        let mut trace_tree = TraceTree::new(BITS_PER_ITEM);
+        let mut trace_tree = TraceTree::new(1);
         trace_tree.append(Bytes(seed.to_vec()));
 
         let mut fingerprint_acc = FingerprintAccumulator::new(BitPacker(BITS_PER_ITEM));
@@ -376,7 +376,7 @@ fn resolve_record_inputs(
                     .unwrap_or_else(|| {
                         panic!(
                             "Failed to resolve sequence input {input_index} for step {:?} in frame {:?}",
-                            step_record, parent_sequence_coordinates 
+                            step_record, parent_sequence_coordinates
                         )
                     });
 
@@ -561,7 +561,9 @@ impl<'a> TraceVerifier<'a> {
             let step_record_hash = step_record.hash();
             self.latest_frontier.append(Bytes(step_record_hash));
 
-            let root = self.latest_frontier.root(Some(0.into()));
+            let root = TraceTree::from_frontier(1, self.latest_frontier.clone())
+                .root(0)
+                .expect("Failed to derive current trace root from frontier");
 
             self.fingerprint_acc.append(&root.0);
 
@@ -628,10 +630,7 @@ mod tests {
         CfsCoordinates, InputBinding, SequenceChildItem, SequenceDef, SequenceItem, TileDef,
         TileItem,
     };
-    use raster_core::trace::{
-        FnCallRecord, FnInput, FnInputArgs, FnOutput, SequenceEndRecord, SequenceStartRecord,
-        TileExecRecord,
-    };
+    use raster_core::trace::{SequenceEndRecord, SequenceStartRecord, TileExecRecord};
 
     use super::*;
     use crate::precomputed;
@@ -655,7 +654,7 @@ mod tests {
         intra_sequence_index: u32,
         coordinates: Vec<u32>,
         fn_name: String,
-        input_count: usize,
+        _input_count: usize,
         output: u64,
     ) -> StepRecord {
         StepRecord::TileExec(TileExecRecord {
@@ -665,7 +664,8 @@ mod tests {
             coordinates: CfsCoordinates(coordinates),
             tile_id: fn_name.to_string(),
             input_commitment: Vec::new(),
-            output_commitment: Vec::new(),
+            external_input_commitment: Vec::new(),
+            output_commitment: output.to_le_bytes().to_vec(),
         })
     }
 
@@ -673,13 +673,14 @@ mod tests {
         exec_index: u64,
         sequence_id: &str,
         coordinates: Vec<u32>,
-        input_count: usize,
+        _input_count: usize,
     ) -> StepRecord {
         StepRecord::SequenceStart(SequenceStartRecord {
             exec_index,
             sequence_id: sequence_id.to_string(),
             coordinates: CfsCoordinates(coordinates),
             input_commitment: Vec::new(),
+            external_input_commitment: Vec::new(),
         })
     }
 

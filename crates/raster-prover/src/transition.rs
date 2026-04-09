@@ -10,9 +10,9 @@
 
 use raster_core::cfs::ControlFlowSchema;
 use raster_core::fingerprint::Fingerprint;
-use raster_core::trace::StepRecord;
+use raster_core::trace::{ExternalInput, StepRecord};
 use raster_core::transition::{
-    InitTransition, TransitionInput, TransitionJournal, TransitionState,
+    AuthorizedExternalInputs, InitTransition, TransitionInput, TransitionJournal, TransitionState,
 };
 use std::collections::HashMap;
 
@@ -20,12 +20,12 @@ use crate::replay::ReplayResult;
 use crate::trace::SerializableFrontier;
 use crate::{TRANSITION_GUEST_ELF, TRANSITION_GUEST_ID};
 
-type RecordedStepIo = HashMap<StepRecord, (Option<Vec<u8>>, Option<Vec<u8>>)>;
+type RecordedStepIo = HashMap<StepRecord, (Option<Vec<u8>>, Option<Vec<u8>>, ExternalInput)>;
 
 fn lookup_recorded_io(
     step_record: &StepRecord,
     recorded_step_io: &RecordedStepIo,
-) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+) -> (Option<Vec<u8>>, Option<Vec<u8>>, ExternalInput) {
     recorded_step_io
         .get(step_record)
         .cloned()
@@ -37,8 +37,10 @@ fn build_transition_input(
     witness: &HashMap<StepRecord, Vec<u8>>,
     recorded_step_io: &RecordedStepIo,
     replayed_results: &HashMap<StepRecord, ReplayResult>,
+    authorized_external_inputs: &AuthorizedExternalInputs,
 ) -> TransitionInput {
-    let (recorded_input, recorded_output) = lookup_recorded_io(step_record, recorded_step_io);
+    let (recorded_input, recorded_output, external_input) =
+        lookup_recorded_io(step_record, recorded_step_io);
 
     match step_record {
         StepRecord::TileExec(_) => {
@@ -54,6 +56,8 @@ fn build_transition_input(
                 replay_image_id: Some(replay_result.image_id.clone()),
                 recorded_input,
                 recorded_output,
+                external_input,
+                authorized_external_inputs: authorized_external_inputs.clone(),
                 witness: witness.clone(),
             }
         }
@@ -62,6 +66,8 @@ fn build_transition_input(
             replay_image_id: None,
             recorded_input,
             recorded_output,
+            external_input,
+            authorized_external_inputs: authorized_external_inputs.clone(),
             witness: witness.clone(),
         },
     }
@@ -91,6 +97,7 @@ pub fn step_transitions(
     witness: &HashMap<StepRecord, Vec<u8>>,
     recorded_step_io: &RecordedStepIo,
     replayed_results: &HashMap<StepRecord, ReplayResult>,
+    authorized_external_inputs: &AuthorizedExternalInputs,
 ) -> Option<risc0_zkvm::Receipt> {
     let prover = risc0_zkvm::default_prover();
     let cfs = cfs.clone();
@@ -111,8 +118,13 @@ pub fn step_transitions(
     let mut current_state = TransitionState::Init(init_transition);
 
     for step_record in trace_window {
-        let input =
-            build_transition_input(step_record, witness, recorded_step_io, replayed_results);
+        let input = build_transition_input(
+            step_record,
+            witness,
+            recorded_step_io,
+            replayed_results,
+            authorized_external_inputs,
+        );
         let replay_receipt_assumption: Option<risc0_zkvm::Receipt> = match step_record {
             StepRecord::TileExec(_) => {
                 let replay_result = replayed_results.get(step_record).unwrap_or_else(|| {
@@ -162,7 +174,22 @@ pub fn step_transitions(
 mod tests {
     use super::*;
     use raster_core::cfs::CfsCoordinates;
-    use raster_core::trace::{SequenceEndRecord, SequenceStartRecord, TileExecRecord};
+    use raster_core::trace::{
+        external_input_commitment, ExternalBindingMeta, SequenceEndRecord, SequenceStartRecord,
+        TileExecRecord,
+    };
+
+    fn make_external_input(binding_name: &str, commitment: &[u8]) -> ExternalInput {
+        HashMap::from([(
+            "arg".to_string(),
+            ExternalBindingMeta {
+                name: binding_name.to_string(),
+                data_commitment: commitment.to_vec(),
+            },
+        )])
+        .into_iter()
+        .collect()
+    }
 
     fn make_tile_step(exec_index: u64, coordinates: Vec<u32>) -> StepRecord {
         StepRecord::TileExec(TileExecRecord {
@@ -172,6 +199,7 @@ mod tests {
             coordinates: CfsCoordinates(coordinates),
             intra_sequence_index: 0,
             input_commitment: vec![exec_index as u8],
+            external_input_commitment: Vec::new(),
             output_commitment: vec![exec_index as u8 + 1],
         })
     }
@@ -182,8 +210,18 @@ mod tests {
         let second_step = make_tile_step(2, vec![1]);
 
         let recorded_step_io = HashMap::from([
-            (first_step.clone(), (Some(vec![1]), Some(vec![11]))),
-            (second_step.clone(), (Some(vec![2]), Some(vec![22]))),
+            (
+                first_step.clone(),
+                (Some(vec![1]), Some(vec![11]), ExternalInput::new()),
+            ),
+            (
+                second_step.clone(),
+                (
+                    Some(vec![2]),
+                    Some(vec![22]),
+                    make_external_input("personal_data", b"hash-2"),
+                ),
+            ),
         ]);
         let replayed_results = HashMap::from([
             (
@@ -213,11 +251,20 @@ mod tests {
             &HashMap::new(),
             &recorded_step_io,
             &replayed_results,
+            &AuthorizedExternalInputs {
+                commitments: [("personal_data".to_string(), b"hash-2".to_vec())]
+                    .into_iter()
+                    .collect(),
+            },
         );
 
         assert_eq!(input.replay_image_id, Some(vec![7; 32]));
         assert_eq!(input.recorded_input, Some(vec![2]));
         assert_eq!(input.recorded_output, Some(vec![22]));
+        assert_eq!(
+            input.external_input,
+            make_external_input("personal_data", b"hash-2")
+        );
     }
 
     #[test]
@@ -227,6 +274,7 @@ mod tests {
             sequence_id: "main".to_string(),
             coordinates: CfsCoordinates(vec![]),
             input_commitment: vec![1; 32],
+            external_input_commitment: external_input_commitment(&ExternalInput::new()),
         });
         let sequence_end = StepRecord::SequenceEnd(SequenceEndRecord {
             exec_index: 2,
@@ -235,8 +283,14 @@ mod tests {
             output_commitment: vec![2; 32],
         });
         let recorded_step_io = HashMap::from([
-            (sequence_start.clone(), (Some(vec![3, 4]), None)),
-            (sequence_end.clone(), (None, Some(vec![5, 6]))),
+            (
+                sequence_start.clone(),
+                (Some(vec![3, 4]), None, ExternalInput::new()),
+            ),
+            (
+                sequence_end.clone(),
+                (None, Some(vec![5, 6]), ExternalInput::new()),
+            ),
         ]);
 
         let start_input = build_transition_input(
@@ -244,20 +298,24 @@ mod tests {
             &HashMap::new(),
             &recorded_step_io,
             &HashMap::new(),
+            &AuthorizedExternalInputs::default(),
         );
         let end_input = build_transition_input(
             &sequence_end,
             &HashMap::new(),
             &recorded_step_io,
             &HashMap::new(),
+            &AuthorizedExternalInputs::default(),
         );
 
         assert_eq!(start_input.replay_image_id, None);
         assert_eq!(start_input.recorded_input, Some(vec![3, 4]));
         assert_eq!(start_input.recorded_output, None);
+        assert!(start_input.external_input.is_empty());
 
         assert_eq!(end_input.replay_image_id, None);
         assert_eq!(end_input.recorded_input, None);
         assert_eq!(end_input.recorded_output, Some(vec![5, 6]));
+        assert!(end_input.external_input.is_empty());
     }
 }

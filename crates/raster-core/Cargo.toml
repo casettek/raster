@@ -9,7 +9,7 @@ description = "Core types and schemas for the Raster toolchain"
 
 [features]
 default = ["std"]
-std = ["serde/std", "serde_json", "bincode"]
+std = ["serde/std", "serde_json", "bincode", "sha2"]
 alloc = []
 
 [dependencies]

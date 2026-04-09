@@ -5,7 +5,9 @@ use raster_backend::backend::HexString;
 use rayon::prelude::*;
 
 use std::collections::HashMap;
+use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
+use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -19,9 +21,10 @@ use raster_compiler::tile::TileDiscovery;
 use raster_compiler::{CfsBuilder, Project};
 
 use raster_core::cfs::{CfsCoordinates, CfsCursor, ControlFlowSchema};
+use raster_core::manifest::{ExternalInputEntry, InputDocument};
 use raster_core::tile::TileId;
-use raster_core::trace::{StepRecord, Trace, TraceEvent, TraceWindow};
-use raster_core::transition::TransitionJournal;
+use raster_core::trace::{ExternalInput, StepRecord, Trace, TraceEvent, TraceWindow};
+use raster_core::transition::{AuthorizedExternalInputs, TransitionJournal};
 use raster_core::{Error, Result};
 
 use raster_prover::precomputed::EMPTY_TRIE_NODES;
@@ -33,6 +36,41 @@ use raster_prover::transition::step_transitions;
 use raster_runtime::{TraceRecorder, TRACE_EVENT_PREFIX};
 
 use crate::BackendType;
+
+fn authorized_external_inputs(input: Option<&str>) -> Result<AuthorizedExternalInputs> {
+    let Some(raw_input) = input else {
+        return Ok(AuthorizedExternalInputs::default());
+    };
+
+    let input_json = if Path::new(raw_input).is_file() {
+        fs::read_to_string(raw_input).map_err(|e| {
+            Error::Other(format!(
+                "Failed to read authorized external input source '{}': {}",
+                raw_input, e
+            ))
+        })?
+    } else {
+        raw_input.to_string()
+    };
+
+    let document: InputDocument = serde_json::from_str(&input_json).map_err(|e| {
+        Error::Serialization(format!(
+            "Failed to parse authorized external input source as JSON: {}",
+            e
+        ))
+    })?;
+
+    let commitments = document
+        .into_iter()
+        .filter_map(|(name, value)| {
+            let entry: ExternalInputEntry = serde_json::from_value(value).ok()?;
+            let data_hash = entry.data_hash?;
+            Some((name, data_hash.into_bytes()))
+        })
+        .collect();
+
+    Ok(AuthorizedExternalInputs { commitments })
+}
 
 pub fn run(
     backend_type: BackendType,
@@ -256,7 +294,7 @@ pub fn run(
             VerificationResult::Ok => println!("Verification Success"),
             VerificationResult::Fraud(fraud_evidence) => {
                 let replayer = Replayer::new(&backend, &project);
-                let _fraud_proof = prove(fraud_evidence, &cfs, &trace_recorder, &replayer);
+                let _fraud_proof = prove(fraud_evidence, &cfs, &trace_recorder, &replayer, input);
                 println!("Faurd proof generated");
             }
         }
@@ -353,19 +391,24 @@ pub fn prove(
     cfs: &ControlFlowSchema,
     trace_recorder: &TraceRecorder,
     replayer: &Replayer,
+    input: Option<&str>,
 ) -> risc0_zkvm::Receipt {
     let mode = ExecutionMode::prove_and_verify();
     let FraudEvidence {
         window: fraud_window,
         witness,
     } = fraud_evidence;
+    let authorized_external_inputs = authorized_external_inputs(input)
+        .unwrap_or_else(|e| panic!("Failed to load authorized external commitments: {}", e));
 
     let mut replayed_results: HashMap<StepRecord, ReplayResult> = HashMap::new();
-    let mut recorded_step_io: HashMap<StepRecord, (Option<Vec<u8>>, Option<Vec<u8>>)> =
-        HashMap::new();
+    let mut recorded_step_io: HashMap<
+        StepRecord,
+        (Option<Vec<u8>>, Option<Vec<u8>>, ExternalInput),
+    > = HashMap::new();
 
     for step_record in &fraud_window.items {
-        let recorded_io = trace_recorder
+        let (recorded_input, recorded_output, external_input) = trace_recorder
             .io_data_at(step_record.coordinates())
             .unwrap_or_else(|| {
                 panic!(
@@ -373,12 +416,15 @@ pub fn prove(
                     step_record.coordinates()
                 )
             });
-        let recorded_input = recorded_io.0.clone();
-        recorded_step_io.insert(step_record.clone(), recorded_io);
+        let recorded_input = recorded_input.clone();
+        recorded_step_io.insert(
+            step_record.clone(),
+            (recorded_input.clone(), recorded_output, external_input),
+        );
 
-        if let StepRecord::TileExec(tile_exec) = step_record {
+        if let StepRecord::TileExec(record) = step_record {
             let replay_input = recorded_input.unwrap_or_default();
-            match replayer.replay(tile_exec, replay_input.as_slice(), mode) {
+            match replayer.replay(record, replay_input.as_slice(), mode) {
                 Ok(replay_result) => {
                     replayed_results.insert(step_record.clone(), replay_result);
                 }
@@ -401,6 +447,7 @@ pub fn prove(
             &witness,
             &recorded_step_io,
             &replayed_results,
+            &authorized_external_inputs,
         ) else {
             panic!("Failed to generate fraud proof");
         };

@@ -1,6 +1,8 @@
 //! Trace types (requires std feature).
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::hash::Hash;
 use std::ops::{Deref, DerefMut};
 use std::string::String;
@@ -9,38 +11,49 @@ use std::vec::Vec;
 use crate::cfs::CfsCoordinates;
 use crate::fingerprint::Fingerprint;
 
-/// Describes an input parameter for a tile function.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub struct FnInputArgs {
+pub struct FnInputArg {
     /// Parameter name from the function signature
     pub name: String,
     /// Type name as a string (e.g., "u64", "String")
     pub ty: String,
-    #[serde(default)]
-    pub external_name: Option<String>,
-    #[serde(default)]
-    pub external_data_hash: Option<String>,
 }
 
+/// Describes an external input parameter for a tile function.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct FnInput {
     pub data: Vec<u8>,
-    pub args: Vec<FnInputArgs>,
+    pub args: Vec<FnInputArg>,
+    pub external: ExternalInput,
+}
+
+pub type ExternalInput = BTreeMap<String, ExternalBindingMeta>;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct ExternalBindingMeta {
+    pub name: String,
+    pub data_commitment: Vec<u8>,
 }
 
 impl FnInput {
-    pub fn new(data: Vec<u8>, args: Vec<FnInputArgs>) -> Self {
-        Self { data, args }
-    }
-
     pub fn data(&self) -> &[u8] {
         &self.data
     }
 
-    pub fn args(&self) -> &[FnInputArgs] {
+    pub fn args(&self) -> &[FnInputArg] {
         &self.args
     }
+
+    pub fn external(&self) -> &ExternalInput {
+        &self.external
+    }
 }
+
+pub fn external_input_commitment(external_input: &ExternalInput) -> Vec<u8> {
+    let bytes = crate::postcard::to_allocvec(external_input).unwrap_or_default();
+    Sha256::digest(bytes).to_vec()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct FnOutput {
     pub data: Vec<u8>,
@@ -97,6 +110,7 @@ pub struct TileExecRecord {
     pub intra_sequence_index: u32,
 
     pub input_commitment: Vec<u8>,
+    pub external_input_commitment: Vec<u8>,
     pub output_commitment: Vec<u8>,
 }
 
@@ -108,6 +122,7 @@ pub struct SequenceStartRecord {
     pub coordinates: CfsCoordinates,
 
     pub input_commitment: Vec<u8>,
+    pub external_input_commitment: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]

@@ -130,7 +130,7 @@ pub mod prelude {
     pub use crate::core::{
         manifest::Manifest,
         schema::{ControlFlow, SequenceSchema},
-        trace::{FnCallRecord, FnInput, FnInputArgs, FnOutput, TileExecRecord},
+        trace::{FnCallRecord, FnInput, FnInputArg, FnOutput, TileExecRecord},
     };
 
     // Registry is only available with std and on platforms that support linkme

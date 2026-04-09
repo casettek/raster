@@ -15,10 +15,12 @@ use raster_core::cfs::{
     CfsCoordinates, CfsCursor, ControlFlowSchema, InputSource, SequenceChildItem,
 };
 use raster_core::fingerprint::{Fingerprint, FingerprintAccumulator};
-use raster_core::trace::StepRecord;
+use raster_core::trace::{
+    external_input_commitment as compute_external_input_commitment, ExternalInput, StepRecord,
+};
 use raster_core::transition::{
-    SerializableFrontier, StepRecordWitness, Transition, TransitionInput, TransitionJournal,
-    TransitionState,
+    AuthorizedExternalInputs, SerializableFrontier, StepRecordWitness, Transition, TransitionInput,
+    TransitionJournal, TransitionState,
 };
 
 use serde::{Deserialize, Serialize};
@@ -294,17 +296,67 @@ fn verify_step_commitments(
     }
 }
 
+fn verify_external_input_commitments(
+    step: &StepRecord,
+    external_input: &ExternalInput,
+    authorized_external_inputs: &AuthorizedExternalInputs,
+) {
+    let computed_commitment = compute_external_input_commitment(external_input);
+
+    match step {
+        StepRecord::TileExec(tile_exec_record) => {
+            assert_eq!(
+                tile_exec_record.external_input_commitment, computed_commitment,
+                "Tile external input commitment does not match transported external input",
+            );
+        }
+        StepRecord::SequenceStart(sequence_start_record) => {
+            assert_eq!(
+                sequence_start_record.external_input_commitment,
+                computed_commitment,
+                "Sequence start external input commitment does not match transported external input",
+            );
+        }
+        StepRecord::SequenceEnd(_) => {
+            assert!(
+                external_input.is_empty(),
+                "Sequence end must not carry external input metadata",
+            );
+        }
+    }
+
+    for meta in external_input.values() {
+        let authorized_commitment = authorized_external_inputs
+            .commitments
+            .get(&meta.name)
+            .unwrap_or_else(|| {
+                panic!(
+                    "Missing authorized commitment for external input '{}'",
+                    meta.name
+                )
+            });
+        assert_eq!(
+            authorized_commitment, &meta.data_commitment,
+            "External input '{}' commitment does not match authorized source",
+            meta.name,
+        );
+    }
+}
+
 fn verify_step_record(
     step: &StepRecord,
     replay_image_id: Option<&Vec<u8>>,
     recorded_input: Option<&Vec<u8>>,
     recorded_output: Option<&Vec<u8>>,
+    external_input: &ExternalInput,
+    authorized_external_inputs: &AuthorizedExternalInputs,
 ) {
     verify_step_commitments(step, recorded_input, recorded_output);
+    verify_external_input_commitments(step, external_input, authorized_external_inputs);
 
     if let StepRecord::TileExec(_) = step {
-        let replay_image_id = replay_image_id
-            .expect("replay image id should be provided for tile execution should ");
+        let replay_image_id =
+            replay_image_id.expect("replay image id should be provided for tile execution should ");
         let replay_image_id_digest = risc0_zkvm::sha::Digest::try_from(replay_image_id.as_slice())
             .expect("image_id must be 32 bytes");
         let output_bytes = recorded_output.map(Vec::as_slice).unwrap_or(&[]);
@@ -379,6 +431,8 @@ fn main() {
                 input.replay_image_id.as_ref(),
                 input.recorded_input.as_ref(),
                 input.recorded_output.as_ref(),
+                &input.external_input,
+                &input.authorized_external_inputs,
             );
             let next_expected_coordinates =
                 get_next_expected_coordinates(&cfs_cursor, &input.step_record, None);
@@ -443,6 +497,8 @@ fn main() {
                 input.replay_image_id.as_ref(),
                 input.recorded_input.as_ref(),
                 input.recorded_output.as_ref(),
+                &input.external_input,
+                &input.authorized_external_inputs,
             );
             let next_expected_coordinates = get_next_expected_coordinates(
                 &cfs_cursor,
@@ -498,14 +554,30 @@ fn main() {
 mod tests {
     use super::*;
     use raster_core::cfs::CfsCoordinates;
-    use raster_core::trace::{SequenceEndRecord, SequenceStartRecord, TileExecRecord};
+    use raster_core::trace::{
+        external_input_commitment, ExternalBindingMeta, SequenceEndRecord, SequenceStartRecord,
+        TileExecRecord,
+    };
 
     fn sha(bytes: &[u8]) -> Vec<u8> {
         Sha256::digest(bytes).to_vec()
     }
 
+    fn external_input(binding_name: &str, commitment: &[u8]) -> ExternalInput {
+        [(
+            "arg".to_string(),
+            ExternalBindingMeta {
+                name: binding_name.to_string(),
+                data_commitment: commitment.to_vec(),
+            },
+        )]
+        .into_iter()
+        .collect()
+    }
+
     #[test]
     fn verify_tile_commitments_accept_matching_recorded_io() {
+        let ext = ExternalInput::new();
         let step = StepRecord::TileExec(TileExecRecord {
             exec_index: 1,
             tile_id: "tile".to_string(),
@@ -513,15 +585,18 @@ mod tests {
             coordinates: CfsCoordinates(vec![0]),
             intra_sequence_index: 0,
             input_commitment: sha(b"in"),
+            external_input_commitment: external_input_commitment(&ext),
             output_commitment: sha(b"out"),
         });
 
         verify_step_commitments(&step, Some(&b"in".to_vec()), Some(&b"out".to_vec()));
+        verify_external_input_commitments(&step, &ext, &AuthorizedExternalInputs::default());
     }
 
     #[test]
     #[should_panic(expected = "Tile input commitment does not match recorded input bytes")]
     fn verify_tile_commitments_reject_mismatched_input() {
+        let ext = ExternalInput::new();
         let step = StepRecord::TileExec(TileExecRecord {
             exec_index: 1,
             tile_id: "tile".to_string(),
@@ -529,6 +604,7 @@ mod tests {
             coordinates: CfsCoordinates(vec![0]),
             intra_sequence_index: 0,
             input_commitment: sha(b"expected"),
+            external_input_commitment: external_input_commitment(&ext),
             output_commitment: sha(b"out"),
         });
 
@@ -537,11 +613,13 @@ mod tests {
 
     #[test]
     fn verify_sequence_boundary_commitments_accept_matching_recorded_io() {
+        let ext = ExternalInput::new();
         let start = StepRecord::SequenceStart(SequenceStartRecord {
             exec_index: 1,
             sequence_id: "main".to_string(),
             coordinates: CfsCoordinates(vec![]),
             input_commitment: sha(b"sequence-in"),
+            external_input_commitment: external_input_commitment(&ext),
         });
         let end = StepRecord::SequenceEnd(SequenceEndRecord {
             exec_index: 2,
@@ -552,5 +630,82 @@ mod tests {
 
         verify_step_commitments(&start, Some(&b"sequence-in".to_vec()), None);
         verify_step_commitments(&end, None, Some(&b"sequence-out".to_vec()));
+        verify_external_input_commitments(&start, &ext, &AuthorizedExternalInputs::default());
+        verify_external_input_commitments(
+            &end,
+            &ExternalInput::new(),
+            &AuthorizedExternalInputs::default(),
+        );
+    }
+
+    #[test]
+    fn verify_external_input_commitments_accept_matching_authorized_binding() {
+        let ext = external_input("personal_data", b"hash");
+        let step = StepRecord::TileExec(TileExecRecord {
+            exec_index: 1,
+            tile_id: "tile".to_string(),
+            sequence_id: "main".to_string(),
+            coordinates: CfsCoordinates(vec![0]),
+            intra_sequence_index: 0,
+            input_commitment: sha(b"in"),
+            external_input_commitment: external_input_commitment(&ext),
+            output_commitment: sha(b"out"),
+        });
+
+        verify_external_input_commitments(
+            &step,
+            &ext,
+            &AuthorizedExternalInputs {
+                commitments: [("personal_data".to_string(), b"hash".to_vec())]
+                    .into_iter()
+                    .collect(),
+            },
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "Missing authorized commitment for external input 'personal_data'")]
+    fn verify_external_input_commitments_reject_missing_authorized_binding() {
+        let ext = external_input("personal_data", b"hash");
+        let step = StepRecord::TileExec(TileExecRecord {
+            exec_index: 1,
+            tile_id: "tile".to_string(),
+            sequence_id: "main".to_string(),
+            coordinates: CfsCoordinates(vec![0]),
+            intra_sequence_index: 0,
+            input_commitment: sha(b"in"),
+            external_input_commitment: external_input_commitment(&ext),
+            output_commitment: sha(b"out"),
+        });
+
+        verify_external_input_commitments(&step, &ext, &AuthorizedExternalInputs::default());
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "External input 'personal_data' commitment does not match authorized source"
+    )]
+    fn verify_external_input_commitments_reject_mismatched_authorized_binding() {
+        let ext = external_input("personal_data", b"hash");
+        let step = StepRecord::TileExec(TileExecRecord {
+            exec_index: 1,
+            tile_id: "tile".to_string(),
+            sequence_id: "main".to_string(),
+            coordinates: CfsCoordinates(vec![0]),
+            intra_sequence_index: 0,
+            input_commitment: sha(b"in"),
+            external_input_commitment: external_input_commitment(&ext),
+            output_commitment: sha(b"out"),
+        });
+
+        verify_external_input_commitments(
+            &step,
+            &ext,
+            &AuthorizedExternalInputs {
+                commitments: [("personal_data".to_string(), b"wrong".to_vec())]
+                    .into_iter()
+                    .collect(),
+            },
+        );
     }
 }

@@ -265,6 +265,7 @@ fn gen_output_serialization(_input: &ItemFn) -> proc_macro2::TokenStream {
 /// This serializes the typed input parameters to bytes for the trace emission.
 fn gen_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream {
     let params = extract_inputs(input);
+    let has_external_inputs = params.iter().any(|param| param.external_name.is_some());
 
     let input_arg_defs: Vec<_> = params
         .iter()
@@ -277,26 +278,33 @@ fn gen_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream {
                 param.ty.clone()
             };
             let ty_str = ty.to_token_stream().to_string();
-            if let Some(external_name) = &param.external_name {
-                let hash_ident = external_hash_ident(param);
-                quote! {
-                    ::raster::core::trace::FnInputArgs {
-                        name: ::raster::alloc::string::String::from(#name_str),
-                        ty: ::raster::alloc::string::String::from(#ty_str),
-                        external_name: ::core::option::Option::Some(::raster::alloc::string::String::from(#external_name)),
-                        external_data_hash: #hash_ident.clone(),
-                    }
-                }
-            } else {
-                quote! {
-                    ::raster::core::trace::FnInputArgs {
-                        name: ::raster::alloc::string::String::from(#name_str),
-                        ty: ::raster::alloc::string::String::from(#ty_str),
-                        external_name: ::core::option::Option::None,
-                        external_data_hash: ::core::option::Option::None,
-                    }
+            quote! {
+                ::raster::core::trace::FnInputArg {
+                    name: ::raster::alloc::string::String::from(#name_str),
+                    ty: ::raster::alloc::string::String::from(#ty_str),
                 }
             }
+        })
+        .collect();
+
+    let external_meta_entries: Vec<_> = params
+        .iter()
+        .filter_map(|param| {
+            let external_name = param.external_name.as_ref()?;
+            let name_str = param.ident.to_string();
+            let hash_ident = external_hash_ident(param);
+            Some(quote! {
+                (
+                    ::raster::alloc::string::String::from(#name_str),
+                    ::raster::core::trace::ExternalBindingMeta {
+                        name: ::raster::alloc::string::String::from(#external_name),
+                        data_commitment: #hash_ident
+                            .clone()
+                            .map(|value| value.into_bytes())
+                            .unwrap_or_default(),
+                    }
+                )
+            })
         })
         .collect();
 
@@ -350,16 +358,28 @@ fn gen_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream {
     };
 
     quote! {
-        let __raster_input_args: ::raster::alloc::vec::Vec<::raster::core::trace::FnInputArgs> = ::raster::alloc::vec![
+        let __raster_input_args: ::raster::alloc::vec::Vec<::raster::core::trace::FnInputArg> = ::raster::alloc::vec![
             #(#input_arg_defs),*
         ];
 
         #input_bytes
 
-        let __raster_input = ::core::option::Option::Some(::raster::core::trace::FnInput {
-            data: __raster_input_bytes,
-            args: __raster_input_args,
-        });
+        let __raster_input = ::core::option::Option::Some(
+            ::raster::core::trace::FnInput {
+                data: __raster_input_bytes,
+                args: __raster_input_args,
+                external: if #has_external_inputs {
+                    [#(#external_meta_entries),*]
+                        .into_iter()
+                        .collect::<::raster::alloc::collections::BTreeMap<
+                            ::raster::alloc::string::String,
+                            ::raster::core::trace::ExternalBindingMeta,
+                        >>()
+                } else {
+                    ::raster::alloc::collections::BTreeMap::new()
+                },
+            }
+        );
     }
 }
 
