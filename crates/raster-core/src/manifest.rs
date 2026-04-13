@@ -27,16 +27,17 @@ impl Manifest {
     }
 }
 
-/// A file-backed external input declared inside the user input document.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ExternalInputEntry {
-    pub path: String,
-    #[serde(default)]
-    pub data_hash: Option<String>,
-}
+/// A private file-backed external input declared inside `input.json`.
+pub type ExternalInputPathEntry = String;
 
-/// A JSON input document used by the native whole-program runner.
+/// A public external input commitment declared inside `input_manifest.json`.
+pub type ExternalInputManifestEntry = String;
+
+/// A private JSON input document used by the native whole-program runner.
 ///
-/// Each top-level field may be either a plain JSON value or a file-backed external
-/// reference described by `ExternalInputEntry`.
+/// Each top-level field may be either a plain JSON value or a string path
+/// described by `ExternalInputPathEntry`.
 pub type InputDocument = BTreeMap<String, serde_json::Value>;
+
+/// A public JSON manifest document that describes the commitments for externals.
+pub type InputManifestDocument = BTreeMap<String, serde_json::Value>;

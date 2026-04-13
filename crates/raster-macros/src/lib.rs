@@ -142,6 +142,10 @@ fn external_hash_ident(param: &ParamInfo) -> syn::Ident {
     format_ident!("__raster_external_hash_{}", param.ident)
 }
 
+fn external_bytes_ident(param: &ParamInfo) -> syn::Ident {
+    format_ident!("__raster_external_bytes_{}", param.ident)
+}
+
 fn gen_external_resolution(input: &ItemFn) -> proc_macro2::TokenStream {
     let params = extract_inputs(input);
     let is_result = returns_result(input);
@@ -152,6 +156,7 @@ fn gen_external_resolution(input: &ItemFn) -> proc_macro2::TokenStream {
             let name = &param.ident;
             let resolved_ty = resolved_external_param_ty(&param.ty);
             let hash_ident = external_hash_ident(param);
+            let bytes_ident = external_bytes_ident(param);
             let resolve = if is_result {
                 quote! {
                     ::raster::resolve_external_value::<#resolved_ty>(#name, #external_name)?
@@ -164,7 +169,8 @@ fn gen_external_resolution(input: &ItemFn) -> proc_macro2::TokenStream {
             };
             Some(quote! {
                 let __raster_external_value = #resolve;
-                let #hash_ident = __raster_external_value.data_hash.clone();
+                let #hash_ident = __raster_external_value.commitment.clone();
+                let #bytes_ident = __raster_external_value.payload_bytes.clone();
                 let #name: #resolved_ty = __raster_external_value.into_inner();
             })
         })
@@ -293,6 +299,7 @@ fn gen_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream {
             let external_name = param.external_name.as_ref()?;
             let name_str = param.ident.to_string();
             let hash_ident = external_hash_ident(param);
+            let bytes_ident = external_bytes_ident(param);
             Some(quote! {
                 (
                     ::raster::alloc::string::String::from(#name_str),
@@ -302,6 +309,7 @@ fn gen_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream {
                             .clone()
                             .map(|value| value.into_bytes())
                             .unwrap_or_default(),
+                        payload_bytes: #bytes_ident.clone(),
                     }
                 )
             })
@@ -317,10 +325,12 @@ fn gen_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream {
         let name = &param.ident;
         if let Some(external_name) = &param.external_name {
             let hash_ident = external_hash_ident(param);
+            let bytes_ident = external_bytes_ident(param);
             quote! {
                 let __raster_external_payload = ::raster::core::external::ExternalValue::new(
                     #external_name,
                     #hash_ident.clone(),
+                    #bytes_ident.clone(),
                     &#name,
                 );
                 let __raster_input_bytes = ::raster::core::postcard::to_allocvec(&__raster_external_payload)
@@ -339,10 +349,12 @@ fn gen_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream {
                 let name = &param.ident;
                 if let Some(external_name) = &param.external_name {
                     let hash_ident = external_hash_ident(param);
+                    let bytes_ident = external_bytes_ident(param);
                     quote! {
                         ::raster::core::external::ExternalValue::new(
                             #external_name,
                             #hash_ident.clone(),
+                            #bytes_ident.clone(),
                             &#name,
                         )
                     }
@@ -777,7 +789,7 @@ pub fn sequence(attr: TokenStream, item: TokenStream) -> TokenStream {
                     }
                 } else {
                     quote! {
-                        let #name: #ty = ::raster::parse_main_input_value(::core::option::Option::Some(#field_name))
+                        let #name: #ty = ::raster::parse_program_input_value(::core::option::Option::Some(#field_name))
                             .expect("Failed to parse --input argument. Use inline JSON or a JSON file path.");
                     }
                 }

@@ -27,7 +27,7 @@ pub fn resolve_external_value<T: DeserializeOwned + Serialize>(
 ) -> raster_core::Result<raster_core::external::ExternalValue<T>> {
     #[cfg(feature = "std")]
     {
-        return utils::input::resolve_external_value(reference, expected_name);
+        return raster_runtime::resolve_external_value(reference, expected_name);
     }
 
     #[cfg(not(feature = "std"))]
@@ -42,12 +42,12 @@ pub fn resolve_external_value<T: DeserializeOwned + Serialize>(
 
 // Runtime is only available with std feature
 #[cfg(feature = "std")]
-pub use raster_runtime::{finish, init, init_with, publish_trace_event};
+pub use raster_runtime::{
+    finish, init, init_with, parse_program_input_value, publish_trace_event,
+};
 
 #[cfg(feature = "std")]
 pub mod utils;
-#[cfg(feature = "std")]
-pub use utils::input::parse_main_input_value;
 
 /// Canonical call primitive for invoking a tile inside a sequence.
 ///
@@ -147,5 +147,5 @@ pub mod prelude {
     // pub use crate::{Executor, Tracer, FileTracer, NoOpTracer};
 
     #[cfg(feature = "std")]
-    pub use crate::{parse_main_input_value, resolve_external_value};
+    pub use crate::{parse_program_input_value, resolve_external_value};
 }

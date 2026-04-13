@@ -1,5 +1,5 @@
 use raster_core::external::{External, ExternalValue};
-use raster_core::manifest::ExternalInputEntry;
+use raster_core::manifest::{ExternalInputManifestEntry, ExternalInputPathEntry};
 use raster_core::{Error, Result};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -15,14 +15,15 @@ use std::vec::Vec;
 
 #[derive(Debug, Clone)]
 struct ResolvedExternal {
-    data_hash: Option<String>,
+    commitment: String,
     bytes: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
 struct InputContext {
-    root: Value,
-    base_dir: PathBuf,
+    private_root: Value,
+    manifest_root: Value,
+    private_base_dir: PathBuf,
     externals: HashMap<String, ResolvedExternal>,
 }
 
@@ -34,9 +35,23 @@ fn context_cell() -> &'static Mutex<Option<InputContext>> {
 
 fn load_from_args() -> Option<Result<InputContext>> {
     let args: Vec<String> = std::env::args().collect();
-    let input_pos = args.iter().position(|a| a == "--input")?;
-    let raw_input = args.get(input_pos + 1)?.clone();
-    Some(InputContext::from_input_arg(&raw_input))
+    let raw_input = args
+        .iter()
+        .position(|a| a == "--input")
+        .and_then(|pos| args.get(pos + 1))
+        .cloned();
+    let raw_manifest = args
+        .iter()
+        .position(|a| a == "--input-manifest")
+        .and_then(|pos| args.get(pos + 1))
+        .cloned();
+    if raw_input.is_none() && raw_manifest.is_none() {
+        return None;
+    }
+    Some(InputContext::from_input_args(
+        raw_input.as_deref(),
+        raw_manifest.as_deref(),
+    ))
 }
 
 fn ensure_context() -> Result<InputContext> {
@@ -50,8 +65,9 @@ fn ensure_context() -> Result<InputContext> {
     let ctx = match load_from_args() {
         Some(result) => result?,
         None => InputContext {
-            root: Value::Null,
-            base_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            private_root: Value::Null,
+            manifest_root: Value::Null,
+            private_base_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             externals: HashMap::new(),
         },
     };
@@ -61,19 +77,27 @@ fn ensure_context() -> Result<InputContext> {
 }
 
 impl InputContext {
-    fn from_input_arg(raw_input: &str) -> Result<Self> {
+    fn parse_json_source(raw_input: Option<&str>, label: &str) -> Result<(Value, PathBuf)> {
+        let Some(raw_input) = raw_input else {
+            return Ok((
+                Value::Null,
+                std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            ));
+        };
         let path = Path::new(raw_input);
-        let (root, base_dir) = if path.is_file() {
+        if path.is_file() {
             let contents = fs::read_to_string(path).map_err(|e| {
                 Error::Other(format!(
-                    "Failed to read input file '{}': {}",
+                    "Failed to read {} file '{}': {}",
+                    label,
                     path.display(),
                     e
                 ))
             })?;
-            let root: Value = serde_json::from_str(&contents).map_err(|e| {
+            let root = serde_json::from_str(&contents).map_err(|e| {
                 Error::Serialization(format!(
-                    "Failed to parse input file '{}' as JSON: {}",
+                    "Failed to parse {} file '{}' as JSON: {}",
+                    label,
                     path.display(),
                     e
                 ))
@@ -82,31 +106,44 @@ impl InputContext {
                 .parent()
                 .map(Path::to_path_buf)
                 .unwrap_or_else(|| PathBuf::from("."));
-            (root, base_dir)
+            Ok((root, base_dir))
         } else {
-            let root: Value = serde_json::from_str(raw_input).map_err(|e| {
-                Error::Serialization(format!("Failed to parse --input as JSON: {}", e))
+            let root = serde_json::from_str(raw_input).map_err(|e| {
+                Error::Serialization(format!("Failed to parse {} argument as JSON: {}", label, e))
             })?;
-            let base_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-            (root, base_dir)
-        };
+            Ok((
+                root,
+                std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            ))
+        }
+    }
+
+    fn from_input_args(raw_input: Option<&str>, raw_manifest: Option<&str>) -> Result<Self> {
+        let (private_root, private_base_dir) = Self::parse_json_source(raw_input, "input")?;
+        let (manifest_root, _manifest_base_dir) =
+            Self::parse_json_source(raw_manifest, "input manifest")?;
 
         Ok(Self {
-            root,
-            base_dir,
+            private_root,
+            manifest_root,
+            private_base_dir,
             externals: HashMap::new(),
         })
     }
 
     fn root_value(&self) -> &Value {
-        &self.root
+        &self.private_root
     }
 
     fn get_named_value(&self, name: &str) -> Option<&Value> {
         self.root_value().as_object().and_then(|obj| obj.get(name))
     }
 
-    fn read_external_entry(&self, name: &str) -> Result<ExternalInputEntry> {
+    fn get_manifest_value(&self, name: &str) -> Option<&Value> {
+        self.manifest_root.as_object().and_then(|obj| obj.get(name))
+    }
+
+    fn read_external_entry(&self, name: &str) -> Result<ExternalInputPathEntry> {
         let raw = self.get_named_value(name).ok_or_else(|| {
             Error::Other(format!(
                 "Missing external input '{}'. Expected a top-level input document field.",
@@ -117,6 +154,22 @@ impl InputContext {
         serde_json::from_value(raw.clone()).map_err(|e| {
             Error::Serialization(format!(
                 "Failed to parse external input '{}' descriptor: {}",
+                name, e
+            ))
+        })
+    }
+
+    fn read_manifest_entry(&self, name: &str) -> Result<ExternalInputManifestEntry> {
+        let raw = self.get_manifest_value(name).ok_or_else(|| {
+            Error::Other(format!(
+                "Missing public manifest entry for external input '{}'. Expected a top-level field in input_manifest.json.",
+                name
+            ))
+        })?;
+
+        serde_json::from_value(raw.clone()).map_err(|e| {
+            Error::Serialization(format!(
+                "Failed to parse public manifest entry '{}' as a commitment string: {}",
                 name, e
             ))
         })
@@ -136,11 +189,14 @@ fn normalize_hash(hash: &str) -> String {
     hash.trim().to_ascii_lowercase()
 }
 
-pub fn parse_main_input<T: DeserializeOwned>() -> Option<T> {
-    parse_main_input_value(None)
+/// Parse the private program input from `--input` and deserialize the full value.
+pub fn parse_program_input<T: DeserializeOwned>() -> Option<T> {
+    parse_program_input_value(None)
 }
 
-pub fn parse_main_input_value<T: DeserializeOwned>(name: Option<&str>) -> Option<T> {
+/// Parse either a named top-level field from the private `input.json` document,
+/// or the full document when `name` is `None`.
+pub fn parse_program_input_value<T: DeserializeOwned>(name: Option<&str>) -> Option<T> {
     let ctx = ensure_context().ok()?;
 
     if let Some(name) = name {
@@ -170,8 +226,9 @@ pub fn resolve_external_value<T: DeserializeOwned + Serialize>(
         *guard = Some(match load_from_args() {
             Some(result) => result?,
             None => InputContext {
-                root: Value::Null,
-                base_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+                private_root: Value::Null,
+                manifest_root: Value::Null,
+                private_base_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
                 externals: HashMap::new(),
             },
         });
@@ -181,7 +238,7 @@ pub fn resolve_external_value<T: DeserializeOwned + Serialize>(
 
     if !ctx.externals.contains_key(expected_name) {
         let entry = ctx.read_external_entry(expected_name)?;
-        let path = ctx.base_dir.join(&entry.path);
+        let path = ctx.private_base_dir.join(&entry);
         let bytes = fs::read(&path).map_err(|e| {
             Error::Other(format!(
                 "Failed to read external input '{}' from '{}': {}",
@@ -191,20 +248,19 @@ pub fn resolve_external_value<T: DeserializeOwned + Serialize>(
             ))
         })?;
 
-        if let Some(expected_hash) = entry.data_hash.as_deref() {
-            let actual_hash = sha256_hex(&bytes);
-            if normalize_hash(expected_hash) != actual_hash {
-                return Err(Error::Other(format!(
-                    "External input '{}' failed integrity check. Expected SHA256 {}, got {}",
-                    expected_name, expected_hash, actual_hash
-                )));
-            }
+        let expected_commitment = ctx.read_manifest_entry(expected_name)?;
+        let actual_hash = sha256_hex(&bytes);
+        if normalize_hash(&expected_commitment) != actual_hash {
+            return Err(Error::Other(format!(
+                "External input '{}' failed integrity check. Expected SHA256 {}, got {}",
+                expected_name, expected_commitment, actual_hash
+            )));
         }
 
         ctx.externals.insert(
             expected_name.to_string(),
             ResolvedExternal {
-                data_hash: entry.data_hash,
+                commitment: expected_commitment,
                 bytes,
             },
         );
@@ -223,14 +279,18 @@ pub fn resolve_external_value<T: DeserializeOwned + Serialize>(
         ))
     })?;
 
-    Ok(ExternalValue::new(expected_name, resolved.data_hash, value))
+    Ok(ExternalValue::new(
+        expected_name,
+        Some(resolved.commitment),
+        resolved.bytes,
+        value,
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde::{Deserialize, Serialize};
-    use std::format;
     use std::time::{SystemTime, UNIX_EPOCH};
     use std::vec;
 
@@ -260,18 +320,16 @@ mod tests {
         let hash = sha256_hex(&bytes);
 
         let input_path = dir.join("input.json");
-        fs::write(
-            &input_path,
-            format!(
-                r#"{{"flight_data":{{"path":"flights.bin","data_hash":"{}"}}}}"#,
-                hash
-            ),
-        )
-        .unwrap();
+        fs::write(&input_path, r#"{"flight_data":"flights.bin"}"#).unwrap();
 
-        let ctx = InputContext::from_input_arg(input_path.to_str().unwrap()).unwrap();
+        let manifest_path = dir.join("input_manifest.json");
+        fs::write(&manifest_path, format!(r#"{{"flight_data":"{}"}}"#, hash.clone())).unwrap();
+
+        let ctx =
+            InputContext::from_input_args(input_path.to_str(), manifest_path.to_str()).unwrap();
         let entry = ctx.read_external_entry("flight_data").unwrap();
-        assert_eq!(entry.path, "flights.bin");
+        assert_eq!(entry, "flights.bin");
+        assert_eq!(ctx.read_manifest_entry("flight_data").unwrap(), hash);
 
         fs::remove_dir_all(&dir).unwrap();
     }

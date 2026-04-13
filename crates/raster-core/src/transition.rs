@@ -46,6 +46,25 @@ pub struct AuthorizedExternalInputs {
     pub commitments: BTreeMap<String, Vec<u8>>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuthorizationInput {
+    pub manifest_bytes: Vec<u8>,
+    pub payload_witnesses: BTreeMap<String, Vec<u8>>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuthorizationJournal {
+    pub authorized_external_inputs: AuthorizedExternalInputs,
+    pub authorized_payloads: BTreeMap<String, Vec<u8>>,
+    pub manifest_commitment: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuthorizationAssumption {
+    pub image_id: Vec<u8>,
+    pub journal: AuthorizationJournal,
+}
+
 /// Input for a single transition step (passed into the transition guest).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransitionInput {
@@ -54,7 +73,7 @@ pub struct TransitionInput {
     pub recorded_input: Option<Vec<u8>>,
     pub recorded_output: Option<Vec<u8>>,
     pub external_input: ExternalInput,
-    pub authorized_external_inputs: AuthorizedExternalInputs,
+    pub authorization: AuthorizationAssumption,
     pub witness: HashMap<StepRecord, Vec<u8>>,
 }
 
@@ -87,4 +106,5 @@ pub struct TransitionJournal {
     pub init_state: InitTransition,
     pub current_state: TransitionState,
     pub self_image_id: Vec<u8>,
+    pub manifest_commitment: Vec<u8>,
 }

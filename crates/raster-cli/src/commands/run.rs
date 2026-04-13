@@ -5,26 +5,18 @@ use raster_backend::backend::HexString;
 use rayon::prelude::*;
 
 use std::collections::HashMap;
-use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
-use std::thread;
 
 use raster_backend::{Backend, ExecutionMode};
 use raster_backend_risc0::Risc0Backend;
 
-use raster_compiler::tile::TileDiscovery;
 use raster_compiler::{CfsBuilder, Project};
 
 use raster_core::cfs::{CfsCoordinates, CfsCursor, ControlFlowSchema};
-use raster_core::manifest::{ExternalInputEntry, InputDocument};
-use raster_core::tile::TileId;
 use raster_core::trace::{ExternalInput, StepRecord, Trace, TraceEvent, TraceWindow};
-use raster_core::transition::{AuthorizedExternalInputs, TransitionJournal};
 use raster_core::{Error, Result};
 
 use raster_prover::precomputed::EMPTY_TRIE_NODES;
@@ -35,46 +27,13 @@ use raster_prover::trace::{
 use raster_prover::transition::step_transitions;
 use raster_runtime::{TraceRecorder, TRACE_EVENT_PREFIX};
 
+use crate::utils::authorization::{authorization_input, collect_payload_witnesses};
 use crate::BackendType;
-
-fn authorized_external_inputs(input: Option<&str>) -> Result<AuthorizedExternalInputs> {
-    let Some(raw_input) = input else {
-        return Ok(AuthorizedExternalInputs::default());
-    };
-
-    let input_json = if Path::new(raw_input).is_file() {
-        fs::read_to_string(raw_input).map_err(|e| {
-            Error::Other(format!(
-                "Failed to read authorized external input source '{}': {}",
-                raw_input, e
-            ))
-        })?
-    } else {
-        raw_input.to_string()
-    };
-
-    let document: InputDocument = serde_json::from_str(&input_json).map_err(|e| {
-        Error::Serialization(format!(
-            "Failed to parse authorized external input source as JSON: {}",
-            e
-        ))
-    })?;
-
-    let commitments = document
-        .into_iter()
-        .filter_map(|(name, value)| {
-            let entry: ExternalInputEntry = serde_json::from_value(value).ok()?;
-            let data_hash = entry.data_hash?;
-            Some((name, data_hash.into_bytes()))
-        })
-        .collect();
-
-    Ok(AuthorizedExternalInputs { commitments })
-}
 
 pub fn run(
     backend_type: BackendType,
     input: Option<&str>,
+    input_manifest: Option<&str>,
     commit_flag: Option<&str>,
     audit_flag: Option<&str>,
     verbose: bool,
@@ -127,6 +86,9 @@ pub fn run(
     cmd.current_dir(&project.root_dir);
     if let Some(input_json) = input {
         cmd.args(["--input", input_json]);
+    }
+    if let Some(manifest_json) = input_manifest {
+        cmd.args(["--input-manifest", manifest_json]);
     }
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
@@ -294,7 +256,13 @@ pub fn run(
             VerificationResult::Ok => println!("Verification Success"),
             VerificationResult::Fraud(fraud_evidence) => {
                 let replayer = Replayer::new(&backend, &project);
-                let _fraud_proof = prove(fraud_evidence, &cfs, &trace_recorder, &replayer, input);
+                let _fraud_proof = prove(
+                    fraud_evidence,
+                    &cfs,
+                    &trace_recorder,
+                    &replayer,
+                    input_manifest,
+                );
                 println!("Faurd proof generated");
             }
         }
@@ -391,16 +359,13 @@ pub fn prove(
     cfs: &ControlFlowSchema,
     trace_recorder: &TraceRecorder,
     replayer: &Replayer,
-    input: Option<&str>,
+    input_manifest: Option<&str>,
 ) -> risc0_zkvm::Receipt {
     let mode = ExecutionMode::prove_and_verify();
     let FraudEvidence {
         window: fraud_window,
         witness,
     } = fraud_evidence;
-    let authorized_external_inputs = authorized_external_inputs(input)
-        .unwrap_or_else(|e| panic!("Failed to load authorized external commitments: {}", e));
-
     let mut replayed_results: HashMap<StepRecord, ReplayResult> = HashMap::new();
     let mut recorded_step_io: HashMap<
         StepRecord,
@@ -435,6 +400,10 @@ pub fn prove(
         }
     }
 
+    let authorization_input =
+        authorization_input(input_manifest, collect_payload_witnesses(&recorded_step_io))
+            .unwrap_or_else(|e| panic!("Failed to load authorization source: {}", e));
+
     if let Some(frontier) = SerializableFrontier::from_bytes(&fraud_window.frontier) {
         println!();
         println!("Replaying transition frontier with transition guest...");
@@ -447,7 +416,7 @@ pub fn prove(
             &witness,
             &recorded_step_io,
             &replayed_results,
-            &authorized_external_inputs,
+            &authorization_input,
         ) else {
             panic!("Failed to generate fraud proof");
         };

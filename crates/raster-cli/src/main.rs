@@ -124,6 +124,10 @@ enum Commands {
         #[arg(long)]
         input: Option<String>,
 
+        /// Public manifest as inline JSON or a path to a JSON file
+        #[arg(long = "input-manifest")]
+        input_manifest: Option<String>,
+
         /// Write trace to file (mutually exclusive with --audit)
         #[arg(long, conflicts_with = "audit")]
         commit: Option<String>,
@@ -176,12 +180,14 @@ fn main() -> Result<()> {
         Commands::Run {
             backend,
             input,
+            input_manifest,
             commit,
             audit,
             verbose,
         } => commands::run::run(
             backend,
             input.as_deref(),
+            input_manifest.as_deref(),
             commit.as_deref(),
             audit.as_deref(),
             verbose,

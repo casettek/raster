@@ -1,6 +1,7 @@
 //! External input marker and resolved value types.
 
 use alloc::string::String;
+use alloc::vec::Vec;
 use core::marker::PhantomData;
 use serde::{Deserialize, Serialize};
 
@@ -49,20 +50,32 @@ impl<T> External<T> {
 pub struct ExternalValue<T> {
     pub name: String,
     #[serde(default)]
-    pub data_hash: Option<String>,
+    pub commitment: Option<String>,
+    #[serde(default)]
+    pub payload_bytes: Vec<u8>,
     pub value: T,
 }
 
 impl<T> ExternalValue<T> {
-    pub fn new(name: impl Into<String>, data_hash: Option<String>, value: T) -> Self {
+    pub fn new(
+        name: impl Into<String>,
+        commitment: Option<String>,
+        payload_bytes: Vec<u8>,
+        value: T,
+    ) -> Self {
         Self {
             name: name.into(),
-            data_hash,
+            commitment,
+            payload_bytes,
             value,
         }
     }
 
     pub fn into_inner(self) -> T {
         self.value
+    }
+
+    pub fn payload_bytes(&self) -> &[u8] {
+        &self.payload_bytes
     }
 }

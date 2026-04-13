@@ -26,6 +26,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let hash = sha256_hex(&bytes);
     let bin_path = out_dir.join("personal_data.bin");
     let input_path = out_dir.join("input.json");
+    let manifest_path = out_dir.join("input_manifest.json");
 
     fs::create_dir_all(&out_dir)?;
     fs::write(&bin_path, bytes)?;
@@ -34,10 +35,17 @@ fn main() -> Result<(), Box<dyn Error>> {
         format!(
             concat!(
                 "{{\n",
-                "  \"personal_data\": {{\n",
-                "    \"path\": \"personal_data.bin\",\n",
-                "    \"data_hash\": \"{}\"\n",
-                "  }}\n",
+                "  \"personal_data\": \"personal_data.bin\"\n",
+                "}}\n"
+            ),
+        ),
+    )?;
+    fs::write(
+        &manifest_path,
+        format!(
+            concat!(
+                "{{\n",
+                "  \"personal_data\": \"{}\"\n",
                 "}}\n"
             ),
             hash
@@ -46,6 +54,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     println!("Wrote {}", bin_path.display());
     println!("Wrote {}", input_path.display());
+    println!("Wrote {}", manifest_path.display());
 
     Ok(())
 }
