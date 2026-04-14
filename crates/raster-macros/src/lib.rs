@@ -170,7 +170,7 @@ fn gen_external_resolution(input: &ItemFn) -> proc_macro2::TokenStream {
             Some(quote! {
                 let __raster_external_value = #resolve;
                 let #hash_ident = __raster_external_value.commitment.clone();
-                let #bytes_ident = __raster_external_value.payload_bytes.clone();
+                let #bytes_ident = __raster_external_value.bytes.clone();
                 let #name: #resolved_ty = __raster_external_value.into_inner();
             })
         })
@@ -309,7 +309,7 @@ fn gen_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream {
                             .clone()
                             .map(|value| value.into_bytes())
                             .unwrap_or_default(),
-                        payload_bytes: #bytes_ident.clone(),
+                        bytes: #bytes_ident.clone(),
                     }
                 )
             })

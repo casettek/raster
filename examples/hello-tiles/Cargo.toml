@@ -2,16 +2,19 @@
 name = "hello-tiles"
 version = "0.1.0"
 edition = "2021"
+default-run = "hello-tiles"
 
 [[bin]]
 name = "gen_input"
 path = "bin/gen_input.rs"
+required-features = ["gen-input"]
 
 [features]
 default = ["std"]
 std = ["raster/std"]
+gen-input = ["dep:sha2"]
 
 [dependencies]
 raster = { path = "../../crates/raster", default-features = false }
 serde.workspace = true
-sha2.workspace = true
+sha2 = { version = "0.10.9", default-features = false, optional = true }

@@ -11,7 +11,7 @@ use hello_tiles::{current_wish, exclaim, greet, input::PersonalData, personal_gr
 /// 4. Invokes nested sequences for further processing
 ///
 /// Run with: `cargo run -- --input '"Raster"'`
-/// Or: `cargo raster preview --input '"Raster"'`
+/// Or: `cargo raster run --input '"Raster"'`
 #[sequence]
 fn greet_sequence(name: String) -> String {
     call!(personal_greet, external!("personal_data"));
@@ -39,6 +39,8 @@ fn placeholder_sequence(placeholder: String) -> String {
 /// Entry point that runs the greet sequence natively.
 ///
 /// The `name` parameter is parsed from `--input` CLI argument.
+/// When using the generated example files, also pass `--input-manifest input_manifest.json`
+/// so external inputs can be authorized against the public commitment.
 /// Run with: `cargo run -- --input '"YourName"'`
 #[sequence]
 fn main(#[external(name = "personal_data")] personal_data: External<PersonalData>) {

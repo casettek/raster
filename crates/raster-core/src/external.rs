@@ -52,7 +52,7 @@ pub struct ExternalValue<T> {
     #[serde(default)]
     pub commitment: Option<String>,
     #[serde(default)]
-    pub payload_bytes: Vec<u8>,
+    pub bytes: Vec<u8>,
     pub value: T,
 }
 
@@ -60,13 +60,13 @@ impl<T> ExternalValue<T> {
     pub fn new(
         name: impl Into<String>,
         commitment: Option<String>,
-        payload_bytes: Vec<u8>,
+        bytes: Vec<u8>,
         value: T,
     ) -> Self {
         Self {
             name: name.into(),
             commitment,
-            payload_bytes,
+            bytes,
             value,
         }
     }
@@ -75,7 +75,7 @@ impl<T> ExternalValue<T> {
         self.value
     }
 
-    pub fn payload_bytes(&self) -> &[u8] {
-        &self.payload_bytes
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
     }
 }

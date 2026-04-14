@@ -8,42 +8,33 @@
 //! The types in this module are designed to be serialization-compatible with
 //! the types used in the RISC0 guest program.
 
+use raster_core::authorization::AuthorizationJournal;
 use raster_core::cfs::ControlFlowSchema;
 use raster_core::fingerprint::Fingerprint;
 use raster_core::trace::{ExternalInput, StepRecord};
 use raster_core::transition::{
-    AuthorizationAssumption, AuthorizationInput, AuthorizationJournal, InitTransition,
-    TransitionInput, TransitionJournal, TransitionState,
+    InitTransition, TransitionInput, TransitionJournal, TransitionState,
 };
 use std::collections::HashMap;
 
+use crate::authorization::authorization_guest_image_id;
 use crate::replay::ReplayResult;
 use crate::trace::SerializableFrontier;
-use crate::{
-    AUTHORIZATION_GUEST_ELF, AUTHORIZATION_GUEST_ID, TRANSITION_GUEST_ELF, TRANSITION_GUEST_ID,
-};
+use crate::{TRANSITION_GUEST_ELF, TRANSITION_GUEST_ID};
 
 type RecordedStepIo = HashMap<StepRecord, (Option<Vec<u8>>, Option<Vec<u8>>, ExternalInput)>;
 
-fn lookup_recorded_io(
-    step_record: &StepRecord,
-    recorded_step_io: &RecordedStepIo,
-) -> (Option<Vec<u8>>, Option<Vec<u8>>, ExternalInput) {
-    recorded_step_io
-        .get(step_record)
-        .cloned()
-        .unwrap_or_else(|| panic!("Missing recorded I/O for transition step {:?}", step_record))
-}
-
 fn build_transition_input(
     step_record: &StepRecord,
-    witness: &HashMap<StepRecord, Vec<u8>>,
+    input_sources_witnesses: &HashMap<StepRecord, Vec<u8>>,
     recorded_step_io: &RecordedStepIo,
     replayed_results: &HashMap<StepRecord, ReplayResult>,
-    authorization: &AuthorizationAssumption,
+    authorization: &AuthorizationJournal,
 ) -> TransitionInput {
-    let (recorded_input, recorded_output, external_input) =
-        lookup_recorded_io(step_record, recorded_step_io);
+    let (input_witness, output_witness, external_input) = recorded_step_io
+        .get(step_record)
+        .cloned()
+        .unwrap_or_else(|| panic!("Missing recorded I/O for transition step {:?}", step_record));
 
     match step_record {
         StepRecord::TileExec(_) => {
@@ -56,22 +47,24 @@ fn build_transition_input(
 
             TransitionInput {
                 step_record: step_record.clone(),
+                authorization_image_id: authorization_guest_image_id(),
                 replay_image_id: Some(replay_result.image_id.clone()),
-                recorded_input,
-                recorded_output,
+                input_witness,
+                output_witness,
                 external_input,
                 authorization: authorization.clone(),
-                witness: witness.clone(),
+                input_sources_witnesses: input_sources_witnesses.clone(),
             }
         }
         StepRecord::SequenceStart(_) | StepRecord::SequenceEnd(_) => TransitionInput {
             step_record: step_record.clone(),
+            authorization_image_id: authorization_guest_image_id(),
             replay_image_id: None,
-            recorded_input,
-            recorded_output,
+            input_witness,
+            output_witness,
             external_input,
             authorization: authorization.clone(),
-            witness: witness.clone(),
+            input_sources_witnesses: input_sources_witnesses.clone(),
         },
     }
 }
@@ -81,25 +74,6 @@ fn image_id_bytes(image_id: [u32; 8]) -> Vec<u8> {
         .into_iter()
         .flat_map(|val| val.to_le_bytes())
         .collect()
-}
-
-fn prove_authorization(
-    authorization_input: &AuthorizationInput,
-) -> (risc0_zkvm::Receipt, AuthorizationAssumption) {
-    let prover = risc0_zkvm::default_prover();
-    let mut builder = risc0_zkvm::ExecutorEnv::builder();
-    builder.write(authorization_input).unwrap();
-    let env = builder.build().unwrap();
-    let receipt = prover.prove(env, &AUTHORIZATION_GUEST_ELF).unwrap().receipt;
-    let journal: AuthorizationJournal = receipt.journal.decode().unwrap();
-
-    (
-        receipt,
-        AuthorizationAssumption {
-            image_id: image_id_bytes(AUTHORIZATION_GUEST_ID),
-            journal,
-        },
-    )
 }
 
 /// Replay trace transitions using the transition guest to prove merkle tree state transitions.
@@ -123,14 +97,13 @@ pub fn step_transitions(
     trace_window: &[StepRecord],
     fingerprint: Fingerprint,
     cfs: &ControlFlowSchema,
-    witness: &HashMap<StepRecord, Vec<u8>>,
+    input_sources_witnesses: &HashMap<StepRecord, Vec<u8>>,
     recorded_step_io: &RecordedStepIo,
     replayed_results: &HashMap<StepRecord, ReplayResult>,
-    authorization_input: &AuthorizationInput,
+    authorization: &AuthorizationJournal,
+    authorization_receipt: &risc0_zkvm::Receipt,
 ) -> Option<risc0_zkvm::Receipt> {
     let prover = risc0_zkvm::default_prover();
-    let cfs = cfs.clone();
-    let (authorization_receipt, authorization) = prove_authorization(authorization_input);
 
     let self_image_id = image_id_bytes(TRANSITION_GUEST_ID);
 
@@ -147,10 +120,10 @@ pub fn step_transitions(
     for step_record in trace_window {
         let input = build_transition_input(
             step_record,
-            witness,
+            input_sources_witnesses,
             recorded_step_io,
             replayed_results,
-            &authorization,
+            authorization,
         );
         let replay_receipt_assumption: Option<risc0_zkvm::Receipt> = match step_record {
             StepRecord::TileExec(_) => {
@@ -201,12 +174,13 @@ pub fn step_transitions(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::authorization::authorize_external_inputs;
+    use raster_core::authorization::{AuthorizationJournal, ManifestedInputs};
     use raster_core::cfs::{CfsCoordinates, ControlFlowSchema, SequenceDef};
     use raster_core::fingerprint::{BitPacker, Fingerprint};
     use raster_core::trace::{
         ExternalBindingMeta, SequenceEndRecord, SequenceStartRecord, TileExecRecord,
     };
-    use raster_core::transition::AuthorizationJournal;
     use sha2::{Digest, Sha256};
 
     fn external_input_commitment(external_input: &ExternalInput) -> Vec<u8> {
@@ -214,13 +188,13 @@ mod tests {
         Sha256::digest(bytes).to_vec()
     }
 
-    fn make_external_input(binding_name: &str, commitment: &[u8], payload_bytes: &[u8]) -> ExternalInput {
+    fn make_external_input(binding_name: &str, commitment: &[u8], bytes: &[u8]) -> ExternalInput {
         HashMap::from([(
             "arg".to_string(),
             ExternalBindingMeta {
                 name: binding_name.to_string(),
                 data_commitment: commitment.to_vec(),
-                payload_bytes: payload_bytes.to_vec(),
+                bytes: bytes.to_vec(),
             },
         )])
         .into_iter()
@@ -240,33 +214,32 @@ mod tests {
         })
     }
 
-    fn make_authorization_input() -> AuthorizationInput {
-        AuthorizationInput {
+    fn make_manifested_inputs() -> ManifestedInputs {
+        ManifestedInputs {
             manifest_bytes: br#"{"personal_data":"239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"}"#
                 .to_vec(),
-            payload_witnesses: [("personal_data".to_string(), b"payload".to_vec())]
+            external_inputs_bytes: [("personal_data".to_string(), b"payload".to_vec())]
                 .into_iter()
                 .collect(),
         }
     }
 
-    fn make_authorization_assumption() -> AuthorizationAssumption {
-        AuthorizationAssumption {
-            image_id: vec![3; 32],
-            journal: AuthorizationJournal {
-                authorized_external_inputs: raster_core::transition::AuthorizedExternalInputs {
-                    commitments: [(
-                        "personal_data".to_string(),
-                        b"239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5".to_vec()
-                    )]
-                        .into_iter()
-                        .collect(),
-                },
-                authorized_payloads: [("personal_data".to_string(), b"payload".to_vec())]
-                    .into_iter()
-                    .collect(),
-                manifest_commitment: vec![4; 32],
+    fn make_authorization_journal() -> AuthorizationJournal {
+        AuthorizationJournal {
+            authorized_external_inputs: raster_core::authorization::AuthorizedExternalInputs {
+                entries: [(
+                    "personal_data".to_string(),
+                    raster_core::authorization::AuthorizedExternalInput {
+                        commitment:
+                            b"239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"
+                                .to_vec(),
+                        bytes: b"payload".to_vec(),
+                    },
+                )]
+                .into_iter()
+                .collect(),
             },
+            manifest_commitment: vec![4; 32],
         }
     }
 
@@ -321,12 +294,12 @@ mod tests {
             &HashMap::new(),
             &recorded_step_io,
             &replayed_results,
-            &make_authorization_assumption(),
+            &make_authorization_journal(),
         );
 
         assert_eq!(input.replay_image_id, Some(vec![7; 32]));
-        assert_eq!(input.recorded_input, Some(vec![2]));
-        assert_eq!(input.recorded_output, Some(vec![22]));
+        assert_eq!(input.input_witness, Some(vec![2]));
+        assert_eq!(input.output_witness, Some(vec![22]));
         assert_eq!(
             input.external_input,
             make_external_input(
@@ -335,7 +308,7 @@ mod tests {
                 b"payload",
             )
         );
-        assert_eq!(input.authorization, make_authorization_assumption());
+        assert_eq!(input.authorization, make_authorization_journal());
     }
 
     #[test]
@@ -369,46 +342,46 @@ mod tests {
             &HashMap::new(),
             &recorded_step_io,
             &HashMap::new(),
-            &make_authorization_assumption(),
+            &make_authorization_journal(),
         );
         let end_input = build_transition_input(
             &sequence_end,
             &HashMap::new(),
             &recorded_step_io,
             &HashMap::new(),
-            &make_authorization_assumption(),
+            &make_authorization_journal(),
         );
 
         assert_eq!(start_input.replay_image_id, None);
-        assert_eq!(start_input.recorded_input, Some(vec![3, 4]));
-        assert_eq!(start_input.recorded_output, None);
+        assert_eq!(start_input.input_witness, Some(vec![3, 4]));
+        assert_eq!(start_input.output_witness, None);
         assert!(start_input.external_input.is_empty());
 
         assert_eq!(end_input.replay_image_id, None);
-        assert_eq!(end_input.recorded_input, None);
-        assert_eq!(end_input.recorded_output, Some(vec![5, 6]));
+        assert_eq!(end_input.input_witness, None);
+        assert_eq!(end_input.output_witness, Some(vec![5, 6]));
         assert!(end_input.external_input.is_empty());
     }
 
     #[test]
-    fn prove_authorization_returns_expected_journal() {
-        let (_receipt, authorization) = prove_authorization(&make_authorization_input());
+    fn authorize_external_inputs_returns_expected_journal() {
+        let (_receipt, authorization) = authorize_external_inputs(&make_manifested_inputs());
 
         assert_eq!(
             authorization
-                .journal
                 .authorized_external_inputs
-                .commitments
+                .entries
                 .get("personal_data"),
-            Some(
-                &b"239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5".to_vec()
-            )
+            Some(&raster_core::authorization::AuthorizedExternalInput {
+                commitment: b"239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"
+                    .to_vec(),
+                bytes: b"payload".to_vec(),
+            })
         );
         assert_eq!(
-            authorization.journal.authorized_payloads.get("personal_data"),
-            Some(&b"payload".to_vec())
+            authorization_guest_image_id(),
+            image_id_bytes(crate::AUTHORIZATION_GUEST_ID)
         );
-        assert_eq!(authorization.image_id, image_id_bytes(AUTHORIZATION_GUEST_ID));
     }
 
     fn make_init_frontier() -> SerializableFrontier {
@@ -437,18 +410,19 @@ mod tests {
     }
 
     fn prove_single_transition_with_authorization(
-        authorization: AuthorizationAssumption,
+        authorization: AuthorizationJournal,
         authorization_receipt: Option<risc0_zkvm::Receipt>,
     ) -> risc0_zkvm::Result<risc0_zkvm::ProveInfo> {
         let prover = risc0_zkvm::default_prover();
         let input = TransitionInput {
             step_record: make_sequence_start_step(),
+            authorization_image_id: authorization_guest_image_id(),
             replay_image_id: None,
-            recorded_input: Some(b"sequence-in".to_vec()),
-            recorded_output: None,
+            input_witness: Some(b"sequence-in".to_vec()),
+            output_witness: None,
             external_input: ExternalInput::new(),
             authorization,
-            witness: HashMap::new(),
+            input_sources_witnesses: HashMap::new(),
         };
         let state = TransitionState::Init(InitTransition {
             init_frontier: make_init_frontier(),
@@ -470,38 +444,42 @@ mod tests {
 
     #[test]
     fn transition_guest_accepts_valid_authorization_receipt_assumption() {
-        let (authorization_receipt, authorization) = prove_authorization(&AuthorizationInput {
+        let (authorization_receipt, authorization) = authorize_external_inputs(&ManifestedInputs {
             manifest_bytes: Vec::new(),
-            payload_witnesses: std::collections::BTreeMap::new(),
+            external_inputs_bytes: std::collections::BTreeMap::new(),
         });
 
-        assert!(
-            prove_single_transition_with_authorization(authorization, Some(authorization_receipt))
-                .is_ok()
-        );
+        assert!(prove_single_transition_with_authorization(
+            authorization,
+            Some(authorization_receipt)
+        )
+        .is_ok());
     }
 
     #[test]
     fn transition_guest_rejects_missing_authorization_receipt_assumption() {
-        let (_authorization_receipt, authorization) = prove_authorization(&AuthorizationInput {
-            manifest_bytes: Vec::new(),
-            payload_witnesses: std::collections::BTreeMap::new(),
-        });
+        let (_authorization_receipt, authorization) =
+            authorize_external_inputs(&ManifestedInputs {
+                manifest_bytes: Vec::new(),
+                external_inputs_bytes: std::collections::BTreeMap::new(),
+            });
 
         assert!(prove_single_transition_with_authorization(authorization, None).is_err());
     }
 
     #[test]
     fn transition_guest_rejects_tampered_authorization_journal() {
-        let (authorization_receipt, mut authorization) = prove_authorization(&AuthorizationInput {
-            manifest_bytes: Vec::new(),
-            payload_witnesses: std::collections::BTreeMap::new(),
-        });
-        authorization.journal.manifest_commitment = vec![9; 32];
+        let (authorization_receipt, mut authorization) =
+            authorize_external_inputs(&ManifestedInputs {
+                manifest_bytes: Vec::new(),
+                external_inputs_bytes: std::collections::BTreeMap::new(),
+            });
+        authorization.manifest_commitment = vec![9; 32];
 
-        assert!(
-            prove_single_transition_with_authorization(authorization, Some(authorization_receipt))
-                .is_err()
-        );
+        assert!(prove_single_transition_with_authorization(
+            authorization,
+            Some(authorization_receipt)
+        )
+        .is_err());
     }
 }

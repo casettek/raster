@@ -19,6 +19,8 @@ pub mod tile;
 
 // These modules are only available with std (they use serde_json for complex serialization)
 #[cfg(feature = "std")]
+pub mod authorization;
+#[cfg(feature = "std")]
 pub mod cfs;
 #[cfg(feature = "std")]
 pub mod manifest;

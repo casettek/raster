@@ -300,24 +300,19 @@ impl<T: Clone> Window<T> {
     }
 }
 
-fn parent_coordinates(step_record: &StepRecord) -> Option<(CfsCoordinates, u32)> {
+fn sequence_coordinates(step_record: &StepRecord) -> Option<(CfsCoordinates, u32)> {
     let coordinates = step_record.coordinates();
     let (&current_child_index, parent_coords) = coordinates.split_last()?;
 
     Some((CfsCoordinates(parent_coords.to_vec()), current_child_index))
 }
 
-struct IndexedStepRecord {
-    index: usize,
-    record: StepRecord,
-}
-
-fn resolve_record_inputs(
+fn resolve_inputs_sources(
     step_record: &StepRecord,
     trace: &[StepRecord],
     cfs_cursor: &CfsCursor,
     step_inputs: &[InputBinding],
-) -> Vec<IndexedStepRecord> {
+) -> Vec<(usize, StepRecord)> {
     if step_inputs
         .iter()
         .all(|input| matches!(input.source, InputSource::External))
@@ -325,59 +320,59 @@ fn resolve_record_inputs(
         return Vec::new();
     }
 
-    let Some((parent_sequence_coordinates, item_coordinate)) = parent_coordinates(&step_record)
+    let Some((sequence_coordinates, item_coordinate)) = sequence_coordinates(&step_record)
     else {
         // Entrypoint SequenceStart/SequenceEnd
         return Vec::new();
     };
 
     // Find the parent sequence record start
-    let parent_sequence_index = trace
+    let current_sequence_start_index = trace
         .iter()
         .rposition(|record| {
             matches!(
                 record,
                 StepRecord::SequenceStart(sequence_start_record)
-                    if sequence_start_record.coordinates == parent_sequence_coordinates
+                    if sequence_start_record.coordinates == sequence_coordinates
             )
         })
         .unwrap_or_else(|| {
             panic!(
                 "Failed to resolve active sequence invocation for step {:?} in frame {:?}",
-                step_record, parent_sequence_coordinates
+                step_record, sequence_coordinates
             )
         });
 
-    let frame_trace = &trace[parent_sequence_index..];
+    let current_sequence_trace_suffix = &trace[current_sequence_start_index..];
 
-    let mut producer_records = Vec::new();
+    let mut source_records = Vec::new();
 
     for step_input in step_inputs {
         match &step_input.source {
             InputSource::External => {}
             InputSource::SeqInput { input_index } => {
-                let producer_record = frame_trace
+                let (parent_index, source_record)= current_sequence_trace_suffix 
                     .first()
                     .cloned()
                     .and_then(|record| match record {
                         StepRecord::SequenceStart(sequence_start_record)
-                            if sequence_start_record.coordinates == parent_sequence_coordinates =>
+                            if sequence_start_record.coordinates == sequence_coordinates =>
                         {
-                            Some(IndexedStepRecord {
-                                index: parent_sequence_index,
-                                record: StepRecord::SequenceStart(sequence_start_record),
-                            })
+                            Some((
+                                current_sequence_start_index,
+                                StepRecord::SequenceStart(sequence_start_record),
+                            ))
                         }
                         _ => None,
                     })
                     .unwrap_or_else(|| {
                         panic!(
                             "Failed to resolve sequence input {input_index} for step {:?} in frame {:?}",
-                            step_record, parent_sequence_coordinates
+                            step_record, sequence_coordinates
                         )
                     });
 
-                producer_records.push(producer_record);
+                source_records.push((parent_index, source_record));
             }
             InputSource::ItemOutput {
                 item_index,
@@ -390,60 +385,60 @@ fn resolve_record_inputs(
                     );
                 }
 
-                let mut producer_coordinates = parent_sequence_coordinates.clone();
-                producer_coordinates.push(
+                let mut source_record_coordinates = sequence_coordinates.clone();
+                source_record_coordinates.push(
                     (*item_index)
                         .try_into()
                         .expect("Producer item index exceeds CFS coordinate bounds"),
                 );
 
-                let producer_item = cfs_cursor
-                    .try_get_item(&producer_coordinates)
+                let source_record_cfs_item = cfs_cursor
+                    .try_get_item(&source_record_coordinates)
                     .unwrap_or_else(|| {
                         panic!(
                             "Failed to resolve producer item {} for step {:?} in frame {:?}",
-                            item_index, step_record, parent_sequence_coordinates
+                            item_index, step_record, sequence_coordinates
                         )
                     });
 
-                let producer_record = frame_trace
+                let source_record = current_sequence_trace_suffix 
                     .iter()
                     .enumerate()
-                    .find_map(|(frame_offset, record)| match (record, producer_item) {
+                    .find_map(|(intra_sequence_offset, record)| match (record, source_record_cfs_item) {
                         (StepRecord::TileExec(tile_exec_record), SequenceChildItem::Tile(_))
-                            if tile_exec_record.coordinates == producer_coordinates =>
+                            if tile_exec_record.coordinates == source_record_coordinates =>
                         {
-                            Some(IndexedStepRecord {
-                                index: parent_sequence_index + frame_offset,
-                                record: record.clone(),
-                            })
+                            Some((
+                                current_sequence_start_index + intra_sequence_offset,
+                                record.clone(),
+                            ))
                         }
                         (StepRecord::SequenceEnd(sequence_end_record), SequenceChildItem::Sequence(_))
-                            if sequence_end_record.coordinates == producer_coordinates =>
+                            if sequence_end_record.coordinates == source_record_coordinates =>
                         {
-                            Some(IndexedStepRecord {
-                                index: parent_sequence_index + frame_offset,
-                                record: record.clone(),
-                            })
+                            Some((
+                                current_sequence_start_index + intra_sequence_offset,
+                                record.clone(),
+                            ))
                         }
                         _ => None,
                     })
                     .unwrap_or_else(|| {
                         panic!(
-                            "Failed to resolve producer record for step {:?} from source item {} output {} at {:?}",
-                            step_record, item_index, output_index, producer_coordinates
+                            "Failed to resolve source record for step {:?} from source item {} output {} at {:?}",
+                            step_record, item_index, output_index, source_record_coordinates 
                         )
                     });
 
-                producer_records.push(producer_record);
+                source_records.push(source_record);
             }
         }
     }
 
-    producer_records
+    source_records
 }
 
-fn resolve_fraud_window_sources(
+fn witness_record_inputs(
     trace: &Trace,
     window_end_index: usize,
     fraud_window: &TraceWindow,
@@ -451,7 +446,7 @@ fn resolve_fraud_window_sources(
     seed: &[u8],
 ) -> HashMap<StepRecord, Vec<u8>> {
     let window_start_index = window_end_index + 1 - fraud_window.items.len();
-    let mut witness: HashMap<StepRecord, Vec<u8>> = HashMap::new();
+    let mut source_records_witnesses: HashMap<StepRecord, Vec<u8>> = HashMap::new();
 
     for (offset, step_record) in fraud_window.items.iter().enumerate() {
         if step_record.coordinates().is_empty() {
@@ -469,14 +464,14 @@ fn resolve_fraud_window_sources(
             });
         let step_index = window_start_index + offset;
 
-        for producer_record in resolve_record_inputs(
+        for (trace_index, source_record) in resolve_inputs_sources(
             step_record,
             &trace[..step_index],
             cfs_cursor,
             cfs_item.inputs(),
         ) {
             let trace_prefix = Trace(trace[..step_index].to_vec());
-            let merkle_path = TraceCommitment::witness(&trace_prefix, producer_record.index, seed)
+            let merkle_path = TraceCommitment::witness(&trace_prefix, trace_index, seed)
                 .expect("Failed to derive merkle path for source record");
             let witness_bytes = postcard::to_allocvec(&StepRecordWitness {
                 position: u64::from(merkle_path.position()),
@@ -488,11 +483,11 @@ fn resolve_fraud_window_sources(
             })
             .expect("Failed to serialize source record witness");
 
-            witness.insert(producer_record.record, witness_bytes);
+            source_records_witnesses.insert(source_record, witness_bytes);
         }
     }
 
-    witness
+    source_records_witnesses
 }
 
 pub struct TraceVerifier<'a> {
@@ -510,7 +505,7 @@ pub struct TraceVerifier<'a> {
 #[derive(Debug, Clone)]
 pub struct FraudEvidence {
     pub window: TraceWindow,
-    pub witness: HashMap<StepRecord, Vec<u8>>,
+    pub input_sources_witnesses: HashMap<StepRecord, Vec<u8>>,
 }
 
 pub enum VerificationResult {
@@ -602,7 +597,7 @@ impl<'a> TraceVerifier<'a> {
                     fingerprint: window_fingerprint,
                 };
 
-                let witness = resolve_fraud_window_sources(
+                let input_sources_witnesses = witness_record_inputs(
                     trace,
                     step_index,
                     &fraud_window,
@@ -612,7 +607,7 @@ impl<'a> TraceVerifier<'a> {
 
                 return VerificationResult::Fraud(FraudEvidence {
                     window: fraud_window,
-                    witness,
+                    input_sources_witnesses,
                 });
             }
         }

@@ -19,6 +19,7 @@ use raster_core::cfs::{CfsCoordinates, CfsCursor, ControlFlowSchema};
 use raster_core::trace::{ExternalInput, StepRecord, Trace, TraceEvent, TraceWindow};
 use raster_core::{Error, Result};
 
+use raster_prover::authorization::authorize_external_inputs;
 use raster_prover::precomputed::EMPTY_TRIE_NODES;
 use raster_prover::replay::{ReplayResult, Replayer};
 use raster_prover::trace::{
@@ -27,7 +28,7 @@ use raster_prover::trace::{
 use raster_prover::transition::step_transitions;
 use raster_runtime::{TraceRecorder, TRACE_EVENT_PREFIX};
 
-use crate::utils::authorization::{authorization_input, collect_payload_witnesses};
+use crate::utils::authorization::{build_manifested_inputs, read_external_inputs};
 use crate::BackendType;
 
 pub fn run(
@@ -364,7 +365,7 @@ pub fn prove(
     let mode = ExecutionMode::prove_and_verify();
     let FraudEvidence {
         window: fraud_window,
-        witness,
+        input_sources_witnesses,
     } = fraud_evidence;
     let mut replayed_results: HashMap<StepRecord, ReplayResult> = HashMap::new();
     let mut recorded_step_io: HashMap<
@@ -373,7 +374,7 @@ pub fn prove(
     > = HashMap::new();
 
     for step_record in &fraud_window.items {
-        let (recorded_input, recorded_output, external_input) = trace_recorder
+        let (input_witness, output_witness, external_input) = trace_recorder
             .io_data_at(step_record.coordinates())
             .unwrap_or_else(|| {
                 panic!(
@@ -381,14 +382,14 @@ pub fn prove(
                     step_record.coordinates()
                 )
             });
-        let recorded_input = recorded_input.clone();
+        let input_witness = input_witness.clone();
         recorded_step_io.insert(
             step_record.clone(),
-            (recorded_input.clone(), recorded_output, external_input),
+            (input_witness.clone(), output_witness, external_input),
         );
 
         if let StepRecord::TileExec(record) = step_record {
-            let replay_input = recorded_input.unwrap_or_default();
+            let replay_input = input_witness.unwrap_or_default();
             match replayer.replay(record, replay_input.as_slice(), mode) {
                 Ok(replay_result) => {
                     replayed_results.insert(step_record.clone(), replay_result);
@@ -400,23 +401,26 @@ pub fn prove(
         }
     }
 
-    let authorization_input =
-        authorization_input(input_manifest, collect_payload_witnesses(&recorded_step_io))
+    let manifested_inputs =
+        build_manifested_inputs(input_manifest, read_external_inputs(&recorded_step_io))
             .unwrap_or_else(|e| panic!("Failed to load authorization source: {}", e));
 
     if let Some(frontier) = SerializableFrontier::from_bytes(&fraud_window.frontier) {
         println!();
         println!("Replaying transition frontier with transition guest...");
 
+        let (authorization_receipt, authorization) = authorize_external_inputs(&manifested_inputs);
+
         let Some(receipt) = step_transitions(
             &frontier,
             &fraud_window.items,
             fraud_window.fingerprint,
             &cfs,
-            &witness,
+            &input_sources_witnesses,
             &recorded_step_io,
             &replayed_results,
-            &authorization_input,
+            &authorization,
+            &authorization_receipt,
         ) else {
             panic!("Failed to generate fraud proof");
         };

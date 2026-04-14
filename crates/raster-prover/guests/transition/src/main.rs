@@ -12,14 +12,15 @@ use bridgetree::{Hashable, Level, NonEmptyFrontier, Position};
 use risc0_zkvm::guest::env;
 use risc0_zkvm::sha::{Impl as Risc0Sha256, Sha256 as _};
 
+use raster_core::authorization::{AuthorizationJournal, AuthorizedExternalInputs};
 use raster_core::cfs::{
     CfsCoordinates, CfsCursor, ControlFlowSchema, InputSource, SequenceChildItem,
 };
 use raster_core::fingerprint::{Fingerprint, FingerprintAccumulator};
 use raster_core::trace::{ExternalInput, StepRecord};
 use raster_core::transition::{
-    AuthorizationAssumption, AuthorizationJournal, AuthorizedExternalInputs, SerializableFrontier,
-    StepRecordWitness, Transition, TransitionInput, TransitionJournal, TransitionState,
+    SerializableFrontier, StepRecordWitness, Transition, TransitionInput, TransitionJournal,
+    TransitionState,
 };
 
 use serde::{Deserialize, Serialize};
@@ -156,7 +157,7 @@ fn verify_step_record_inputs(
     cfs_cursor: &CfsCursor,
     frontier: &NonEmptyFrontier<Bytes>,
     step_record: &StepRecord,
-    witness: &HashMap<StepRecord, Vec<u8>>,
+    input_sources_witnesses: &HashMap<StepRecord, Vec<u8>>,
 ) {
     // TODO: SequenceStart/SequenceEnd entrypoint case. In case of SequenceStart input is External Kind from
     // cli or from file. SequenceEnd just binding latest executed tile output.
@@ -198,7 +199,7 @@ fn verify_step_record_inputs(
                 todo!("External input source")
             }
             InputSource::SeqInput { .. } => {
-                let (producer_record, witness_bytes) = witness
+                let (source_record, witness_bytes) = input_sources_witnesses
                     .iter()
                     .find(|(record, _)| {
                         matches!(
@@ -214,7 +215,7 @@ fn verify_step_record_inputs(
                         )
                     });
 
-                verify_record_witness(producer_record, witness_bytes, &current_root);
+                verify_record_witness(source_record, witness_bytes, &current_root);
             }
             InputSource::ItemOutput {
                 item_index,
@@ -228,32 +229,33 @@ fn verify_step_record_inputs(
                     item_coordinate
                 );
 
-                let mut producer_coordinates = parent_sequence_coordinates.clone();
-                producer_coordinates.push(
+                let mut source_coordinates = parent_sequence_coordinates.clone();
+                source_coordinates.push(
                     item_index
                         .try_into()
                         .expect("Producer item index exceeds CFS coordinate bounds"),
                 );
 
-                let producer_item = cfs_cursor
-                    .try_get_item(&producer_coordinates)
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "Failed to resolve producer item {} for step {:?}",
-                            item_index, step_record
-                        )
-                    });
+                let source_cfs_item =
+                    cfs_cursor
+                        .try_get_item(&source_coordinates)
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "Failed to resolve producer item {} for step {:?}",
+                                item_index, step_record
+                            )
+                        });
 
-                let (producer_record, witness_bytes) = witness
+                let (source_record, witness_bytes) = input_sources_witnesses
                     .iter()
-                    .find(|(record, _)| match (record, producer_item) {
+                    .find(|(record, _)| match (record, source_cfs_item) {
                         (StepRecord::TileExec(tile_exec_record), SequenceChildItem::Tile(_)) => {
-                            tile_exec_record.coordinates == producer_coordinates
+                            tile_exec_record.coordinates == source_coordinates
                         }
                         (
                             StepRecord::SequenceEnd(sequence_end_record),
                             SequenceChildItem::Sequence(_),
-                        ) => sequence_end_record.coordinates == producer_coordinates,
+                        ) => sequence_end_record.coordinates == source_coordinates,
                         _ => false,
                     })
                     .unwrap_or_else(|| {
@@ -263,45 +265,45 @@ fn verify_step_record_inputs(
                         )
                     });
 
-                verify_record_witness(producer_record, witness_bytes, &current_root);
+                verify_record_witness(source_record, witness_bytes, &current_root);
             }
         }
     }
 }
 
-fn verify_step_commitments(
-    step: &StepRecord,
-    recorded_input: Option<&Vec<u8>>,
-    recorded_output: Option<&Vec<u8>>,
+fn verify_io_witness(
+    step_record: &StepRecord,
+    input_witness: Option<&Vec<u8>>,
+    output_witness: Option<&Vec<u8>>,
 ) {
     let commitment_for = |bytes: Option<&Vec<u8>>| -> Vec<u8> {
         bytes.map(|bytes| sha256_bytes(bytes)).unwrap_or_default()
     };
 
-    match step {
-        StepRecord::TileExec(tile_exec_record) => {
+    match step_record {
+        StepRecord::TileExec(record) => {
             assert_eq!(
-                tile_exec_record.input_commitment,
-                commitment_for(recorded_input),
+                record.input_commitment,
+                commitment_for(input_witness),
                 "Tile input commitment does not match recorded input bytes",
             );
             assert_eq!(
-                tile_exec_record.output_commitment,
-                commitment_for(recorded_output),
+                record.output_commitment,
+                commitment_for(output_witness),
                 "Tile output commitment does not match recorded output bytes",
             );
         }
-        StepRecord::SequenceStart(sequence_start_record) => {
+        StepRecord::SequenceStart(record) => {
             assert_eq!(
-                sequence_start_record.input_commitment,
-                commitment_for(recorded_input),
+                record.input_commitment,
+                commitment_for(input_witness),
                 "Sequence start input commitment does not match recorded input bytes",
             );
         }
-        StepRecord::SequenceEnd(sequence_end_record) => {
+        StepRecord::SequenceEnd(record) => {
             assert_eq!(
-                sequence_end_record.output_commitment,
-                commitment_for(recorded_output),
+                record.output_commitment,
+                commitment_for(output_witness),
                 "Sequence end output commitment does not match recorded output bytes",
             );
         }
@@ -311,20 +313,20 @@ fn verify_step_commitments(
 fn verify_external_input_commitments(
     step: &StepRecord,
     external_input: &ExternalInput,
-    authorization_journal: &AuthorizationJournal,
+    authorized_external_inputs: &AuthorizedExternalInputs,
 ) {
     let computed_commitment = external_input_commitment(external_input);
 
     match step {
-        StepRecord::TileExec(tile_exec_record) => {
+        StepRecord::TileExec(record) => {
             assert_eq!(
-                tile_exec_record.external_input_commitment, computed_commitment,
+                record.external_input_commitment, computed_commitment,
                 "Tile external input commitment does not match transported external input",
             );
         }
-        StepRecord::SequenceStart(sequence_start_record) => {
+        StepRecord::SequenceStart(record) => {
             assert_eq!(
-                sequence_start_record.external_input_commitment,
+                record.external_input_commitment,
                 computed_commitment,
                 "Sequence start external input commitment does not match transported external input",
             );
@@ -338,9 +340,8 @@ fn verify_external_input_commitments(
     }
 
     for meta in external_input.values() {
-        let authorized_commitment = authorization_journal
-            .authorized_external_inputs
-            .commitments
+        let authorized_external_input = authorized_external_inputs
+            .entries
             .get(&meta.name)
             .unwrap_or_else(|| {
                 panic!(
@@ -349,26 +350,17 @@ fn verify_external_input_commitments(
                 )
             });
         assert_eq!(
-            authorized_commitment, &meta.data_commitment,
+            &authorized_external_input.commitment, &meta.data_commitment,
             "External input '{}' commitment does not match authorized source",
             meta.name,
         );
-        let authorized_payload = authorization_journal
-            .authorized_payloads
-            .get(&meta.name)
-            .unwrap_or_else(|| {
-                panic!(
-                    "Missing authorized payload for external input '{}'",
-                    meta.name
-                )
-            });
         assert_eq!(
-            authorized_payload, &meta.payload_bytes,
+            &authorized_external_input.bytes, &meta.bytes,
             "External input '{}' payload does not match the authorized payload",
             meta.name,
         );
         assert_eq!(
-            sha256_hex(&meta.payload_bytes),
+            sha256_hex(&meta.bytes),
             meta.data_commitment,
             "External input '{}' payload does not match the transported commitment",
             meta.name,
@@ -376,37 +368,40 @@ fn verify_external_input_commitments(
     }
 }
 
-fn verify_authorization_assumption(
-    authorization: &AuthorizationAssumption,
-) -> &AuthorizationJournal {
-    let image_id_digest = risc0_zkvm::sha::Digest::try_from(authorization.image_id.as_slice())
+fn verify_authorization_assumption<'a>(
+    authorization: &'a AuthorizationJournal,
+    authorization_image_id: &[u8],
+) -> &'a AuthorizationJournal {
+    let image_id_digest = risc0_zkvm::sha::Digest::try_from(authorization_image_id)
         .expect("authorization image id must be 32 bytes");
-    let journal_bytes = risc0_zkvm::serde::to_vec(&authorization.journal)
+    let journal_bytes = risc0_zkvm::serde::to_vec(authorization)
         .expect("Failed to serialize authorization journal");
 
     env::verify(image_id_digest, &journal_bytes)
         .expect("Failed to verify authorization guest receipt");
 
-    &authorization.journal
+    authorization
 }
 
 fn verify_step_record(
-    step: &StepRecord,
+    step_record: &StepRecord,
     replay_image_id: Option<&Vec<u8>>,
-    recorded_input: Option<&Vec<u8>>,
-    recorded_output: Option<&Vec<u8>>,
-    external_input: &ExternalInput,
-    authorization_journal: &AuthorizationJournal,
-) {
-    verify_step_commitments(step, recorded_input, recorded_output);
-    verify_external_input_commitments(step, external_input, authorization_journal);
 
-    if let StepRecord::TileExec(_) = step {
+    input_witness_bytes: Option<&Vec<u8>>,
+    output_witness_bytes: Option<&Vec<u8>>,
+
+    external_input: &ExternalInput,
+    authorized_external_inputs: &AuthorizedExternalInputs,
+) {
+    verify_io_witness(step_record, input_witness_bytes, output_witness_bytes);
+    verify_external_input_commitments(step_record, external_input, authorized_external_inputs);
+
+    if let StepRecord::TileExec(_) = step_record {
         let replay_image_id =
             replay_image_id.expect("replay image id should be provided for tile execution should ");
         let replay_image_id_digest = risc0_zkvm::sha::Digest::try_from(replay_image_id.as_slice())
             .expect("image_id must be 32 bytes");
-        let output_bytes = recorded_output.map(Vec::as_slice).unwrap_or(&[]);
+        let output_bytes = output_witness_bytes.map(Vec::as_slice).unwrap_or(&[]);
 
         env::verify(replay_image_id_digest, output_bytes)
             .expect("Failed to verify trace replay image id");
@@ -461,7 +456,8 @@ fn main() {
     let state: TransitionState = env::read();
 
     let cfs_cursor = CfsCursor::new(cfs);
-    let authorization_journal = verify_authorization_assumption(&input.authorization);
+    let authorization_journal =
+        verify_authorization_assumption(&input.authorization, &input.authorization_image_id);
 
     match state {
         TransitionState::Init(init_transition) => {
@@ -472,15 +468,15 @@ fn main() {
                 &cfs_cursor,
                 &init_frontier,
                 &input.step_record,
-                &input.witness,
+                &input.input_sources_witnesses,
             );
             verify_step_record(
                 &input.step_record,
                 input.replay_image_id.as_ref(),
-                input.recorded_input.as_ref(),
-                input.recorded_output.as_ref(),
+                input.input_witness.as_ref(),
+                input.output_witness.as_ref(),
                 &input.external_input,
-                authorization_journal,
+                &authorization_journal.authorized_external_inputs,
             );
             let next_expected_coordinates =
                 get_next_expected_coordinates(&cfs_cursor, &input.step_record, None);
@@ -543,15 +539,15 @@ fn main() {
                 &cfs_cursor,
                 &current_frontier,
                 &input.step_record,
-                &input.witness,
+                &input.input_sources_witnesses,
             );
             verify_step_record(
                 &input.step_record,
                 input.replay_image_id.as_ref(),
-                input.recorded_input.as_ref(),
-                input.recorded_output.as_ref(),
+                input.input_witness.as_ref(),
+                input.output_witness.as_ref(),
                 &input.external_input,
-                authorization_journal,
+                &authorization_journal.authorized_external_inputs,
             );
             let next_expected_coordinates = get_next_expected_coordinates(
                 &cfs_cursor,
@@ -616,29 +612,40 @@ mod tests {
         sha256_bytes(bytes)
     }
 
-    fn external_input(binding_name: &str, commitment: &[u8], payload_bytes: &[u8]) -> ExternalInput {
+    fn external_input(
+        binding_name: &str,
+        commitment: &[u8],
+        payload_bytes: &[u8],
+    ) -> ExternalInput {
         [(
             "arg".to_string(),
             ExternalBindingMeta {
                 name: binding_name.to_string(),
                 data_commitment: commitment.to_vec(),
-                payload_bytes: payload_bytes.to_vec(),
+                bytes: bytes.to_vec(),
             },
         )]
         .into_iter()
         .collect()
     }
 
-    fn authorization_journal(binding_name: &str, commitment: &[u8], payload_bytes: &[u8]) -> AuthorizationJournal {
+    fn authorization_journal(
+        binding_name: &str,
+        commitment: &[u8],
+        payload_bytes: &[u8],
+    ) -> AuthorizationJournal {
         AuthorizationJournal {
             authorized_external_inputs: AuthorizedExternalInputs {
-                commitments: [(binding_name.to_string(), commitment.to_vec())]
-                    .into_iter()
-                    .collect(),
-            },
-            authorized_payloads: [(binding_name.to_string(), payload_bytes.to_vec())]
+                entries: [(
+                    binding_name.to_string(),
+                    raster_core::authorization::AuthorizedExternalInput {
+                        commitment: commitment.to_vec(),
+                        bytes: payload_bytes.to_vec(),
+                    },
+                )]
                 .into_iter()
                 .collect(),
+            },
             manifest_commitment: vec![7; 32],
         }
     }
@@ -663,7 +670,6 @@ mod tests {
             &ext,
             &AuthorizationJournal {
                 authorized_external_inputs: AuthorizedExternalInputs::default(),
-                authorized_payloads: HashMap::new().into_iter().collect(),
                 manifest_commitment: vec![0; 32],
             },
         );
@@ -711,7 +717,6 @@ mod tests {
             &ext,
             &AuthorizationJournal {
                 authorized_external_inputs: AuthorizedExternalInputs::default(),
-                authorized_payloads: HashMap::new().into_iter().collect(),
                 manifest_commitment: vec![0; 32],
             },
         );
@@ -720,7 +725,6 @@ mod tests {
             &ExternalInput::new(),
             &AuthorizationJournal {
                 authorized_external_inputs: AuthorizedExternalInputs::default(),
-                authorized_payloads: HashMap::new().into_iter().collect(),
                 manifest_commitment: vec![0; 32],
             },
         );
@@ -728,7 +732,11 @@ mod tests {
 
     #[test]
     fn verify_external_input_commitments_accept_matching_authorized_binding() {
-        let ext = external_input("personal_data", sha256_hex(b"payload").as_slice(), b"payload");
+        let ext = external_input(
+            "personal_data",
+            sha256_hex(b"payload").as_slice(),
+            b"payload",
+        );
         let step = StepRecord::TileExec(TileExecRecord {
             exec_index: 1,
             tile_id: "tile".to_string(),
@@ -754,7 +762,11 @@ mod tests {
     #[test]
     #[should_panic(expected = "Missing authorized commitment for external input 'personal_data'")]
     fn verify_external_input_commitments_reject_missing_authorized_binding() {
-        let ext = external_input("personal_data", sha256_hex(b"payload").as_slice(), b"payload");
+        let ext = external_input(
+            "personal_data",
+            sha256_hex(b"payload").as_slice(),
+            b"payload",
+        );
         let step = StepRecord::TileExec(TileExecRecord {
             exec_index: 1,
             tile_id: "tile".to_string(),
@@ -771,7 +783,6 @@ mod tests {
             &ext,
             &AuthorizationJournal {
                 authorized_external_inputs: AuthorizedExternalInputs::default(),
-                authorized_payloads: HashMap::new().into_iter().collect(),
                 manifest_commitment: vec![0; 32],
             },
         );
@@ -782,7 +793,11 @@ mod tests {
         expected = "External input 'personal_data' commitment does not match authorized source"
     )]
     fn verify_external_input_commitments_reject_mismatched_authorized_binding() {
-        let ext = external_input("personal_data", sha256_hex(b"payload").as_slice(), b"payload");
+        let ext = external_input(
+            "personal_data",
+            sha256_hex(b"payload").as_slice(),
+            b"payload",
+        );
         let step = StepRecord::TileExec(TileExecRecord {
             exec_index: 1,
             tile_id: "tile".to_string(),

@@ -4,10 +4,10 @@
 //! They live in raster-core to avoid circular dependencies (guest cannot depend on prover).
 
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
-use std::string::String;
+use std::collections::HashMap;
 use std::vec::Vec;
 
+use crate::authorization::AuthorizationJournal;
 use crate::cfs::CfsCoordinates;
 use crate::fingerprint::{Fingerprint, FingerprintAccumulator};
 use crate::trace::{ExternalInput, StepRecord};
@@ -41,40 +41,17 @@ pub struct StepRecordWitness {
     pub path_elems: Vec<Vec<u8>>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AuthorizedExternalInputs {
-    pub commitments: BTreeMap<String, Vec<u8>>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AuthorizationInput {
-    pub manifest_bytes: Vec<u8>,
-    pub payload_witnesses: BTreeMap<String, Vec<u8>>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AuthorizationJournal {
-    pub authorized_external_inputs: AuthorizedExternalInputs,
-    pub authorized_payloads: BTreeMap<String, Vec<u8>>,
-    pub manifest_commitment: Vec<u8>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AuthorizationAssumption {
-    pub image_id: Vec<u8>,
-    pub journal: AuthorizationJournal,
-}
-
 /// Input for a single transition step (passed into the transition guest).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransitionInput {
     pub step_record: StepRecord,
+    pub authorization_image_id: Vec<u8>,
     pub replay_image_id: Option<Vec<u8>>,
-    pub recorded_input: Option<Vec<u8>>,
-    pub recorded_output: Option<Vec<u8>>,
+    pub input_witness: Option<Vec<u8>>,
+    pub output_witness: Option<Vec<u8>>,
     pub external_input: ExternalInput,
-    pub authorization: AuthorizationAssumption,
-    pub witness: HashMap<StepRecord, Vec<u8>>,
+    pub authorization: AuthorizationJournal,
+    pub input_sources_witnesses: HashMap<StepRecord, Vec<u8>>,
 }
 
 /// Result of applying one transition (new frontier and fingerprint state).

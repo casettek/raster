@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::Path;
 
+use raster_core::authorization::ManifestedInputs;
 use raster_core::trace::{ExternalInput, StepRecord};
-use raster_core::transition::AuthorizationInput;
 use raster_core::{Error, Result};
 
 pub fn read_json_source(raw_input: Option<&str>, label: &str) -> Result<Vec<u8>> {
@@ -12,30 +12,25 @@ pub fn read_json_source(raw_input: Option<&str>, label: &str) -> Result<Vec<u8>>
     };
 
     if Path::new(raw_input).is_file() {
-        fs::read(raw_input).map_err(|e| {
-            Error::Other(format!(
-                "Failed to read {} '{}': {}",
-                label, raw_input, e
-            ))
-        })
+        fs::read(raw_input)
+            .map_err(|e| Error::Other(format!("Failed to read {} '{}': {}", label, raw_input, e)))
     } else {
         Ok(raw_input.as_bytes().to_vec())
     }
 }
 
-pub fn collect_payload_witnesses(
+pub fn read_external_inputs(
     recorded_step_io: &HashMap<StepRecord, (Option<Vec<u8>>, Option<Vec<u8>>, ExternalInput)>,
 ) -> BTreeMap<String, Vec<u8>> {
-    let mut payload_witnesses = BTreeMap::new();
+    let mut external_inputs_bytes = BTreeMap::new();
 
     for (_step, (_input, _output, external_input)) in recorded_step_io {
         for meta in external_input.values() {
             if let Some(previous) =
-                payload_witnesses.insert(meta.name.clone(), meta.payload_bytes.clone())
+                external_inputs_bytes.insert(meta.name.clone(), meta.bytes.clone())
             {
                 assert_eq!(
-                    previous,
-                    meta.payload_bytes,
+                    previous, meta.bytes,
                     "Conflicting payload bytes recorded for external input '{}'",
                     meta.name
                 );
@@ -43,14 +38,14 @@ pub fn collect_payload_witnesses(
         }
     }
 
-    payload_witnesses
+    external_inputs_bytes
 }
 
-pub fn authorization_input(
+pub fn build_manifested_inputs(
     input_manifest: Option<&str>,
-    payload_witnesses: BTreeMap<String, Vec<u8>>,
-) -> Result<AuthorizationInput> {
-    let manifest_bytes = if payload_witnesses.is_empty() {
+    external_inputs_bytes: BTreeMap<String, Vec<u8>>,
+) -> Result<ManifestedInputs> {
+    let manifest_bytes = if external_inputs_bytes.is_empty() {
         read_json_source(input_manifest, "authorization manifest")?
     } else {
         let Some(input_manifest) = input_manifest else {
@@ -62,8 +57,8 @@ pub fn authorization_input(
         read_json_source(Some(input_manifest), "authorization manifest")?
     };
 
-    Ok(AuthorizationInput {
+    Ok(ManifestedInputs {
         manifest_bytes,
-        payload_witnesses,
+        external_inputs_bytes,
     })
 }

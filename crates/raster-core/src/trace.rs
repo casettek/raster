@@ -33,7 +33,7 @@ pub type ExternalInput = BTreeMap<InternalBindingName, ExternalBindingMeta>;
 pub struct ExternalBindingMeta {
     pub name: String,
     pub data_commitment: Vec<u8>,
-    pub payload_bytes: Vec<u8>,
+    pub bytes: Vec<u8>,
 }
 
 impl FnInput {
