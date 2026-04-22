@@ -28,17 +28,13 @@ pub mod utils;
 
 #[doc(hidden)]
 pub mod __private {
+    #[cfg(feature = "std")]
     pub fn emit_debug(args: core::fmt::Arguments<'_>) {
-        #[cfg(feature = "std")]
-        {
-            std::println!("[debug] {}", args);
-        }
-
-        #[cfg(not(feature = "std"))]
-        {
-            let _ = args;
-        }
+        std::println!("[debug] {}", args);
     }
+
+    #[cfg(not(feature = "std"))]
+    pub fn emit_debug(_: core::fmt::Arguments<'_>) {}
 }
 
 /// Canonical call primitive for invoking a tile inside a sequence.
