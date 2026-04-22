@@ -30,7 +30,7 @@ pub fn personal_greet(
     #[external(name = "personal_data")] personal_data: External<PersonalData>,
 ) -> String {
     let greet = format!("Hello, {}!!!!", personal_data.name);
-    println!("greet: {}", greet);
+    debug!("greet: {}", greet);
 
     greet
 }

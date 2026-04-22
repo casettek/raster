@@ -264,10 +264,7 @@ pub fn parse_program_input_value<T: DeserializeOwned + core::fmt::Debug>(
         }
     }
 
-    let value = serde_json::from_value(sources.project_input_document()).ok();
-    println!("[debug] external value: {:?}", value);
-
-    value
+    serde_json::from_value(sources.project_input_document()).ok()
 }
 
 pub fn resolve_external_value<T: DeserializeOwned + Serialize>(

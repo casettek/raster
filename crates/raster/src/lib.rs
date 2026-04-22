@@ -26,6 +26,21 @@ pub use raster_runtime::{finish, init, init_with, publish_trace_event};
 #[cfg(feature = "std")]
 pub mod utils;
 
+#[doc(hidden)]
+pub mod __private {
+    pub fn emit_debug(args: core::fmt::Arguments<'_>) {
+        #[cfg(feature = "std")]
+        {
+            std::println!("[debug] {}", args);
+        }
+
+        #[cfg(not(feature = "std"))]
+        {
+            let _ = args;
+        }
+    }
+}
+
 /// Canonical call primitive for invoking a tile inside a sequence.
 ///
 /// `call!` is the explicit "step boundary" — use it instead of bare function calls
@@ -94,6 +109,17 @@ macro_rules! call_seq {
     };
 }
 
+/// Emits a Raster debug line that `cargo raster run --verbose` will surface.
+///
+/// Use this instead of `println!` in Raster user code, especially in `no_std`
+/// tile/sequence crates where the standard print macros are unavailable.
+#[macro_export]
+macro_rules! debug {
+    ($($arg:tt)*) => {{
+        $crate::__private::emit_debug(::core::format_args!($($arg)*));
+    }};
+}
+
 /// Prelude module for convenient imports.
 pub mod prelude {
     pub use crate::core::{
@@ -117,7 +143,7 @@ pub mod prelude {
         tile_count, SequenceMetadataStatic, SequenceRegistration, TileRegistration,
     };
 
-    pub use crate::{call, call_seq, external, sequence, tile};
+    pub use crate::{call, call_seq, debug, external, sequence, tile};
 
     // TODO: Re-enable once Executor/Tracer types are implemented
     // #[cfg(feature = "std")]
