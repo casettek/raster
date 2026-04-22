@@ -29,7 +29,7 @@ fn build_transition_input(
     input_sources_witnesses: &HashMap<StepRecord, Vec<u8>>,
     recorded_step_io: &RecordedStepIo,
     replayed_results: &HashMap<StepRecord, ReplayResult>,
-    authorization: &AuthorizationJournal,
+    authorization_journal: &AuthorizationJournal,
 ) -> TransitionInput {
     let (input_witness, output_witness, external_input) = recorded_step_io
         .get(step_record)
@@ -52,7 +52,7 @@ fn build_transition_input(
                 input_witness,
                 output_witness,
                 external_input,
-                authorization: authorization.clone(),
+                authorization_journal: authorization_journal.clone(),
                 input_sources_witnesses: input_sources_witnesses.clone(),
             }
         }
@@ -63,7 +63,7 @@ fn build_transition_input(
             input_witness,
             output_witness,
             external_input,
-            authorization: authorization.clone(),
+            authorization_journal: authorization_journal.clone(),
             input_sources_witnesses: input_sources_witnesses.clone(),
         },
     }
@@ -100,12 +100,12 @@ pub fn step_transitions(
     input_sources_witnesses: &HashMap<StepRecord, Vec<u8>>,
     recorded_step_io: &RecordedStepIo,
     replayed_results: &HashMap<StepRecord, ReplayResult>,
-    authorization: &AuthorizationJournal,
+    authorization_journal: &AuthorizationJournal,
     authorization_receipt: &risc0_zkvm::Receipt,
 ) -> Option<risc0_zkvm::Receipt> {
     let prover = risc0_zkvm::default_prover();
 
-    let self_image_id = image_id_bytes(TRANSITION_GUEST_ID);
+    let transition_image_id = image_id_bytes(TRANSITION_GUEST_ID);
 
     let init_transition = InitTransition {
         init_frontier: initial_frontier.clone(),
@@ -123,7 +123,7 @@ pub fn step_transitions(
             input_sources_witnesses,
             recorded_step_io,
             replayed_results,
-            authorization,
+            authorization_journal,
         );
         let replay_receipt_assumption: Option<risc0_zkvm::Receipt> = match step_record {
             StepRecord::TileExec(_) => {
@@ -152,7 +152,7 @@ pub fn step_transitions(
             builder.add_assumption(transition_receipt);
         }
         builder.write(&cfs).unwrap();
-        builder.write(&self_image_id).unwrap();
+        builder.write(&transition_image_id).unwrap();
         builder.write(&input).unwrap();
         builder.write(&current_state).unwrap();
         if let Some(previous_journal) = current_journal {
@@ -179,7 +179,7 @@ mod tests {
     use raster_core::cfs::{CfsCoordinates, ControlFlowSchema, SequenceDef};
     use raster_core::fingerprint::{BitPacker, Fingerprint};
     use raster_core::trace::{
-        ExternalBindingMeta, SequenceEndRecord, SequenceStartRecord, TileExecRecord,
+        ExternalBinding, SequenceEndRecord, SequenceStartRecord, TileExecRecord,
     };
     use sha2::{Digest, Sha256};
 
@@ -191,9 +191,9 @@ mod tests {
     fn make_external_input(binding_name: &str, commitment: &[u8], bytes: &[u8]) -> ExternalInput {
         HashMap::from([(
             "arg".to_string(),
-            ExternalBindingMeta {
+            ExternalBinding {
                 name: binding_name.to_string(),
-                data_commitment: commitment.to_vec(),
+                commitment: commitment.to_vec(),
                 bytes: bytes.to_vec(),
             },
         )])
@@ -216,7 +216,7 @@ mod tests {
 
     fn make_manifested_inputs() -> ManifestedInputs {
         ManifestedInputs {
-            manifest_bytes: br#"{"personal_data":"239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"}"#
+            manifest_bytes: br#"{"personal_data":{"external_commitment":"239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"}}"#
                 .to_vec(),
             external_inputs_bytes: [("personal_data".to_string(), b"payload".to_vec())]
                 .into_iter()

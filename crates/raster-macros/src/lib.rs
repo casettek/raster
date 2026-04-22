@@ -222,7 +222,7 @@ fn gen_inputs_deserialization(input: &ItemFn) -> proc_macro2::TokenStream {
         let decode_ty = if let Some(_external_name) = &param.external_name {
             let ty = resolved_external_param_ty(&param.ty);
             quote! {
-                ::raster::core::external::ExternalValue<#ty>
+                ::raster::core::input::ExternalValue<#ty>
             }
         } else {
             let ty = &param.ty;
@@ -240,7 +240,7 @@ fn gen_inputs_deserialization(input: &ItemFn) -> proc_macro2::TokenStream {
             .map(|param| {
                 if param.external_name.is_some() {
                     let ty = resolved_external_param_ty(&param.ty);
-                    quote! { ::raster::core::external::ExternalValue<#ty> }
+                    quote! { ::raster::core::input::ExternalValue<#ty> }
                 } else {
                     let ty = &param.ty;
                     quote! { #ty }
@@ -303,9 +303,9 @@ fn gen_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream {
             Some(quote! {
                 (
                     ::raster::alloc::string::String::from(#name_str),
-                    ::raster::core::trace::ExternalBindingMeta {
+                    ::raster::core::trace::ExternalBinding {
                         name: ::raster::alloc::string::String::from(#external_name),
-                        data_commitment: #hash_ident
+                        commitment: #hash_ident
                             .clone()
                             .map(|value| value.into_bytes())
                             .unwrap_or_default(),
@@ -327,13 +327,13 @@ fn gen_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream {
             let hash_ident = external_hash_ident(param);
             let bytes_ident = external_bytes_ident(param);
             quote! {
-                let __raster_external_payload = ::raster::core::external::ExternalValue::new(
+                let __raster_input_payload = ::raster::core::input::ExternalValue::new(
                     #external_name,
                     #hash_ident.clone(),
                     #bytes_ident.clone(),
                     &#name,
                 );
-                let __raster_input_bytes = ::raster::core::postcard::to_allocvec(&__raster_external_payload)
+                let __raster_input_bytes = ::raster::core::postcard::to_allocvec(&__raster_input_payload)
                     .unwrap_or_default();
             }
         } else {
@@ -351,7 +351,7 @@ fn gen_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream {
                     let hash_ident = external_hash_ident(param);
                     let bytes_ident = external_bytes_ident(param);
                     quote! {
-                        ::raster::core::external::ExternalValue::new(
+                        ::raster::core::input::ExternalValue::new(
                             #external_name,
                             #hash_ident.clone(),
                             #bytes_ident.clone(),
@@ -385,7 +385,7 @@ fn gen_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream {
                         .into_iter()
                         .collect::<::raster::alloc::collections::BTreeMap<
                             ::raster::alloc::string::String,
-                            ::raster::core::trace::ExternalBindingMeta,
+                            ::raster::core::trace::ExternalBinding,
                         >>()
                 } else {
                     ::raster::alloc::collections::BTreeMap::new()
@@ -789,7 +789,7 @@ pub fn sequence(attr: TokenStream, item: TokenStream) -> TokenStream {
                     }
                 } else {
                     quote! {
-                        let #name: #ty = ::raster::parse_program_input_value(::core::option::Option::Some(#field_name))
+                        let #name: #ty = ::raster::input::parse_program_input_value(::core::option::Option::Some(#field_name))
                             .expect("Failed to parse --input argument. Use inline JSON or a JSON file path.");
                     }
                 }

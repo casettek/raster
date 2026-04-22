@@ -1,7 +1,7 @@
-use raster_core::manifest::{ExternalInputManifestEntry, InputManifestDocument};
 use raster_core::authorization::{
     AuthorizationJournal, AuthorizedExternalInput, AuthorizedExternalInputs, ManifestedInputs,
 };
+use raster_core::input::{InputManifestDocument, InputManifestEntry};
 use risc0_zkvm::guest::env;
 use risc0_zkvm::sha::{Impl as Risc0Sha256, Sha256 as _};
 use std::collections::BTreeMap;
@@ -22,60 +22,50 @@ fn sha256_hex(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
-fn normalize_commitment(commitment: &str) -> Vec<u8> {
+fn normalize_hash_string(commitment: &str) -> Vec<u8> {
     commitment.trim().to_ascii_lowercase().into_bytes()
 }
 
-fn parse_manifest_commitment(value: serde_json::Value) -> Option<Vec<u8>> {
-    let commitment = serde_json::from_value::<ExternalInputManifestEntry>(value).ok()?;
-    Some(normalize_commitment(&commitment))
+fn parse_manifest_commitment(entry: InputManifestEntry) -> Option<Vec<u8>> {
+    let commitment = entry.as_external_commitment()?;
+    Some(normalize_hash_string(commitment))
 }
 
-fn parse_authorized_external_inputs(manifest_bytes: &[u8]) -> AuthorizedExternalInputs {
+fn parse_external_input_commitments(manifest_bytes: &[u8]) -> BTreeMap<String, Vec<u8>> {
     if manifest_bytes.is_empty() {
-        return AuthorizedExternalInputs::default();
+        return BTreeMap::new();
     }
 
     let document: InputManifestDocument = serde_json::from_slice(manifest_bytes)
         .expect("Failed to parse authorization manifest as JSON");
 
-    let entries = document
+    document
         .into_iter()
         .filter_map(|(name, value)| {
             let commitment = parse_manifest_commitment(value)?;
-            Some((
-                name,
-                AuthorizedExternalInput {
-                    commitment,
-                    bytes: Vec::new(),
-                },
-            ))
+            Some((name, commitment))
         })
-        .collect();
-
-    AuthorizedExternalInputs { entries }
+        .collect()
 }
 
 fn build_authorization_journal(input: &ManifestedInputs) -> AuthorizationJournal {
-    let authorized_external_inputs = parse_authorized_external_inputs(&input.manifest_bytes);
+    let external_input_commitments = parse_external_input_commitments(&input.manifest_bytes);
 
     let entries = input
         .external_inputs_bytes
         .iter()
         .map(|(name, bytes)| {
-            let authorized = authorized_external_inputs
-                .entries
-                .get(name)
-                .unwrap_or_else(|| {
+            let external_input_commitment =
+                external_input_commitments.get(name).unwrap_or_else(|| {
                     panic!(
-                        "External input '{}' is present in execution but missing from public manifest",
-                        name
-                    )
+                    "External input '{}' is present in execution but missing from public manifest",
+                    name
+                )
                 });
             let actual_commitment = sha256_hex(bytes);
 
             assert_eq!(
-                &actual_commitment, &authorized.commitment,
+                &actual_commitment, external_input_commitment,
                 "External input '{}' payload does not match the public manifest commitment",
                 name
             );
@@ -83,7 +73,7 @@ fn build_authorization_journal(input: &ManifestedInputs) -> AuthorizationJournal
             (
                 name.clone(),
                 AuthorizedExternalInput {
-                    commitment: authorized.commitment.clone(),
+                    commitment: external_input_commitment.clone(),
                     bytes: bytes.clone(),
                 },
             )
@@ -110,7 +100,9 @@ mod tests {
     fn parses_authorized_external_inputs_from_json_source() {
         let input = ManifestedInputs {
             manifest_bytes: br#"{
-                "personal_data": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+                "personal_data": {
+                    "external_commitment": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+                },
                 "inline_value": 7
             }"#
             .to_vec(),
@@ -143,7 +135,11 @@ mod tests {
         let payload = b"\n".to_vec();
         let payload_commitment = String::from_utf8(sha256_hex(&payload)).unwrap();
         let input = ManifestedInputs {
-            manifest_bytes: format!(r#"{{"personal_data":"{}"}}"#, payload_commitment).into_bytes(),
+            manifest_bytes: format!(
+                r#"{{"personal_data":{{"external_commitment":"{}"}}}}"#,
+                payload_commitment
+            )
+            .into_bytes(),
             external_inputs_bytes: [("personal_data".to_string(), payload)]
                 .into_iter()
                 .collect(),
@@ -161,7 +157,7 @@ mod tests {
         let payload_commitment = String::from_utf8(sha256_hex(&payload)).unwrap();
         let input = ManifestedInputs {
             manifest_bytes: format!(
-                r#"{{"personal_data":"{}","unused_data":"deadbeef"}}"#,
+                r#"{{"personal_data":{{"external_commitment":"{}"}},"unused_data":"deadbeef"}}"#,
                 payload_commitment
             )
             .into_bytes(),

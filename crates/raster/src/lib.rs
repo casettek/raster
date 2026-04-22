@@ -8,43 +8,20 @@
 #![no_std]
 
 pub extern crate alloc;
-use serde::{de::DeserializeOwned, Serialize};
 
 #[cfg(feature = "std")]
 extern crate std;
 
 pub use raster_core as core;
-pub use raster_core::external::{External, ExternalRef};
+
+pub mod input;
+pub use input::{external, resolve_external_value, External, ExternalRef};
+
 pub use raster_macros::{sequence, tile};
-
-pub fn external<T>(name: &str) -> External<T> {
-    External::new(name)
-}
-
-pub fn resolve_external_value<T: DeserializeOwned + Serialize>(
-    reference: External<T>,
-    expected_name: &str,
-) -> raster_core::Result<raster_core::external::ExternalValue<T>> {
-    #[cfg(feature = "std")]
-    {
-        return raster_runtime::resolve_external_value(reference, expected_name);
-    }
-
-    #[cfg(not(feature = "std"))]
-    {
-        let _ = reference;
-        let _ = expected_name;
-        Err(raster_core::Error::Other(alloc::format!(
-            "External input resolution requires the `std` feature"
-        )))
-    }
-}
 
 // Runtime is only available with std feature
 #[cfg(feature = "std")]
-pub use raster_runtime::{
-    finish, init, init_with, parse_program_input_value, publish_trace_event,
-};
+pub use raster_runtime::{finish, init, init_with, publish_trace_event};
 
 #[cfg(feature = "std")]
 pub mod utils;
@@ -120,7 +97,7 @@ macro_rules! call_seq {
 /// Prelude module for convenient imports.
 pub mod prelude {
     pub use crate::core::{
-        external::{External, ExternalRef},
+        input::{External, ExternalRef},
         tile::{TileId, TileIdStatic, TileMetadata, TileMetadataStatic},
         Result,
     };
@@ -147,5 +124,8 @@ pub mod prelude {
     // pub use crate::{Executor, Tracer, FileTracer, NoOpTracer};
 
     #[cfg(feature = "std")]
-    pub use crate::{parse_program_input_value, resolve_external_value};
+    pub use crate::{resolve_external_value};
+
+    #[cfg(feature = "std")]
+    pub use crate::input::parse_program_input_value;
 }

@@ -310,7 +310,7 @@ fn verify_io_witness(
     }
 }
 
-fn verify_external_input_commitments(
+fn verify_external_inputs(
     step: &StepRecord,
     external_input: &ExternalInput,
     authorized_external_inputs: &AuthorizedExternalInputs,
@@ -321,20 +321,19 @@ fn verify_external_input_commitments(
         StepRecord::TileExec(record) => {
             assert_eq!(
                 record.external_input_commitment, computed_commitment,
-                "Tile external input commitment does not match transported external input",
+                "TileExec external input not authorized",
             );
         }
         StepRecord::SequenceStart(record) => {
             assert_eq!(
-                record.external_input_commitment,
-                computed_commitment,
-                "Sequence start external input commitment does not match transported external input",
+                record.external_input_commitment, computed_commitment,
+                "SequenceStart external input not authorized",
             );
         }
         StepRecord::SequenceEnd(_) => {
             assert!(
                 external_input.is_empty(),
-                "Sequence end must not carry external input metadata",
+                "SequenceEnd must not carry external input metadata",
             );
         }
     }
@@ -350,7 +349,7 @@ fn verify_external_input_commitments(
                 )
             });
         assert_eq!(
-            &authorized_external_input.commitment, &meta.data_commitment,
+            &authorized_external_input.commitment, &meta.commitment,
             "External input '{}' commitment does not match authorized source",
             meta.name,
         );
@@ -361,26 +360,24 @@ fn verify_external_input_commitments(
         );
         assert_eq!(
             sha256_hex(&meta.bytes),
-            meta.data_commitment,
+            meta.commitment,
             "External input '{}' payload does not match the transported commitment",
             meta.name,
         );
     }
 }
 
-fn verify_authorization_assumption<'a>(
-    authorization: &'a AuthorizationJournal,
+fn verify_authorization_journal<'a>(
+    authorization_journal: &'a AuthorizationJournal,
     authorization_image_id: &[u8],
-) -> &'a AuthorizationJournal {
+) -> bool {
     let image_id_digest = risc0_zkvm::sha::Digest::try_from(authorization_image_id)
         .expect("authorization image id must be 32 bytes");
-    let journal_bytes = risc0_zkvm::serde::to_vec(authorization)
+
+    let journal_bytes = risc0_zkvm::serde::to_vec(authorization_journal)
         .expect("Failed to serialize authorization journal");
 
-    env::verify(image_id_digest, &journal_bytes)
-        .expect("Failed to verify authorization guest receipt");
-
-    authorization
+    env::verify(image_id_digest, &journal_bytes).is_ok()
 }
 
 fn verify_step_record(
@@ -390,11 +387,11 @@ fn verify_step_record(
     input_witness_bytes: Option<&Vec<u8>>,
     output_witness_bytes: Option<&Vec<u8>>,
 
-    external_input: &ExternalInput,
+    external_inputs: &ExternalInput,
     authorized_external_inputs: &AuthorizedExternalInputs,
 ) {
     verify_io_witness(step_record, input_witness_bytes, output_witness_bytes);
-    verify_external_input_commitments(step_record, external_input, authorized_external_inputs);
+    verify_external_inputs(step_record, external_inputs, authorized_external_inputs);
 
     if let StepRecord::TileExec(_) = step_record {
         let replay_image_id =
@@ -450,14 +447,17 @@ fn next_frontier(
 // ============================================================================
 fn main() {
     let cfs: ControlFlowSchema = env::read();
-    let self_image_id: Vec<u8> = env::read();
+    let transition_image_id: Vec<u8> = env::read();
 
     let input: TransitionInput = env::read();
     let state: TransitionState = env::read();
 
     let cfs_cursor = CfsCursor::new(cfs);
-    let authorization_journal =
-        verify_authorization_assumption(&input.authorization, &input.authorization_image_id);
+
+    assert!(verify_authorization_journal(
+        &input.authorization_journal,
+        &input.authorization_image_id
+    ));
 
     match state {
         TransitionState::Init(init_transition) => {
@@ -476,7 +476,7 @@ fn main() {
                 input.input_witness.as_ref(),
                 input.output_witness.as_ref(),
                 &input.external_input,
-                &authorization_journal.authorized_external_inputs,
+                &input.authorization_journal.authorized_external_inputs,
             );
             let next_expected_coordinates =
                 get_next_expected_coordinates(&cfs_cursor, &input.step_record, None);
@@ -498,8 +498,9 @@ fn main() {
             let journal = TransitionJournal {
                 init_state: init_transition,
                 current_state,
-                self_image_id,
-                manifest_commitment: authorization_journal.manifest_commitment.clone(),
+                transition_image_id,
+                authorization_image_id: input.authorization_image_id.clone(),
+                manifest_commitment: input.authorization_journal.manifest_commitment.clone(),
             };
 
             env::commit(&journal);
@@ -507,29 +508,30 @@ fn main() {
         TransitionState::Next(transition) => {
             let prev_journal: TransitionJournal = env::read();
 
-            let self_image_id_digest = risc0_zkvm::sha::Digest::try_from(self_image_id.as_slice())
-                .expect("image_id must be 32 bytes");
+            let transition_image_id_digest =
+                risc0_zkvm::sha::Digest::try_from(transition_image_id.as_slice())
+                    .expect("image_id must be 32 bytes");
             env::verify(
-                self_image_id_digest,
+                transition_image_id_digest,
                 &risc0_zkvm::serde::to_vec(&prev_journal).unwrap(),
             )
-            .expect("Failed to verify trace replay image id");
-
+            .expect("Failed to verify previous transation journal");
             assert!(
-                self_image_id == prev_journal.self_image_id,
-                "Self image id does not match"
-            );
-            assert!(
-                authorization_journal.manifest_commitment == prev_journal.manifest_commitment,
-                "Manifest commitment does not match"
+                transition_image_id == prev_journal.transition_image_id,
+                "The transition image ID is not the same within the fraud proof"
             );
 
             let TransitionState::Next(prev_transition) = prev_journal.current_state else {
-                panic!("Provided Transition in Next State does not match the expected Transition State in Journal");
+                panic!("Provided Transition state does not allign to fraud proof state");
             };
             assert!(
                 prev_transition == transition.clone(),
-                "Transition Expected to be the same as the previous journal Transition"
+                "Transition mismatch: the provided transition does not align with the fraud proof"
+            );
+
+            assert!(
+                input.authorization_journal.manifest_commitment == prev_journal.manifest_commitment,
+                "Manifest commitment does not match"
             );
 
             let mut current_frontier =
@@ -547,7 +549,7 @@ fn main() {
                 input.input_witness.as_ref(),
                 input.output_witness.as_ref(),
                 &input.external_input,
-                &authorization_journal.authorized_external_inputs,
+                &input.authorization_journal.authorized_external_inputs,
             );
             let next_expected_coordinates = get_next_expected_coordinates(
                 &cfs_cursor,
@@ -587,8 +589,9 @@ fn main() {
             let journal = TransitionJournal {
                 init_state: prev_journal.init_state,
                 current_state,
-                self_image_id,
-                manifest_commitment: authorization_journal.manifest_commitment.clone(),
+                transition_image_id,
+                authorization_image_id: input.authorization_image_id.clone(),
+                manifest_commitment: input.authorization_journal.manifest_commitment.clone(),
             };
 
             env::commit(&journal);
@@ -605,7 +608,7 @@ mod tests {
     use super::*;
     use raster_core::cfs::CfsCoordinates;
     use raster_core::trace::{
-        ExternalBindingMeta, SequenceEndRecord, SequenceStartRecord, TileExecRecord,
+        ExternalBinding, SequenceEndRecord, SequenceStartRecord, TileExecRecord,
     };
 
     fn sha(bytes: &[u8]) -> Vec<u8> {
@@ -619,10 +622,10 @@ mod tests {
     ) -> ExternalInput {
         [(
             "arg".to_string(),
-            ExternalBindingMeta {
+            ExternalBinding {
                 name: binding_name.to_string(),
-                data_commitment: commitment.to_vec(),
-                bytes: bytes.to_vec(),
+                commitment: commitment.to_vec(),
+                bytes: payload_bytes.to_vec(),
             },
         )]
         .into_iter()
@@ -664,14 +667,15 @@ mod tests {
             output_commitment: sha(b"out"),
         });
 
-        verify_step_commitments(&step, Some(&b"in".to_vec()), Some(&b"out".to_vec()));
-        verify_external_input_commitments(
+        verify_io_witness(&step, Some(&b"in".to_vec()), Some(&b"out".to_vec()));
+        verify_external_inputs(
             &step,
             &ext,
             &AuthorizationJournal {
                 authorized_external_inputs: AuthorizedExternalInputs::default(),
                 manifest_commitment: vec![0; 32],
-            },
+            }
+            .authorized_external_inputs,
         );
     }
 
@@ -690,7 +694,7 @@ mod tests {
             output_commitment: sha(b"out"),
         });
 
-        verify_step_commitments(&step, Some(&b"actual".to_vec()), Some(&b"out".to_vec()));
+        verify_io_witness(&step, Some(&b"actual".to_vec()), Some(&b"out".to_vec()));
     }
 
     #[test]
@@ -710,28 +714,30 @@ mod tests {
             output_commitment: sha(b"sequence-out"),
         });
 
-        verify_step_commitments(&start, Some(&b"sequence-in".to_vec()), None);
-        verify_step_commitments(&end, None, Some(&b"sequence-out".to_vec()));
-        verify_external_input_commitments(
+        verify_io_witness(&start, Some(&b"sequence-in".to_vec()), None);
+        verify_io_witness(&end, None, Some(&b"sequence-out".to_vec()));
+        verify_external_inputs(
             &start,
             &ext,
             &AuthorizationJournal {
                 authorized_external_inputs: AuthorizedExternalInputs::default(),
                 manifest_commitment: vec![0; 32],
-            },
+            }
+            .authorized_external_inputs,
         );
-        verify_external_input_commitments(
+        verify_external_inputs(
             &end,
             &ExternalInput::new(),
             &AuthorizationJournal {
                 authorized_external_inputs: AuthorizedExternalInputs::default(),
                 manifest_commitment: vec![0; 32],
-            },
+            }
+            .authorized_external_inputs,
         );
     }
 
     #[test]
-    fn verify_external_input_commitments_accept_matching_authorized_binding() {
+    fn verify_external_inputs_accept_matching_authorized_binding() {
         let ext = external_input(
             "personal_data",
             sha256_hex(b"payload").as_slice(),
@@ -748,20 +754,17 @@ mod tests {
             output_commitment: sha(b"out"),
         });
 
-        verify_external_input_commitments(
-            &step,
-            &ext,
-            &authorization_journal(
-                "personal_data",
-                sha256_hex(b"payload").as_slice(),
-                b"payload",
-            ),
+        let authorization = authorization_journal(
+            "personal_data",
+            sha256_hex(b"payload").as_slice(),
+            b"payload",
         );
+        verify_external_inputs(&step, &ext, &authorization.authorized_external_inputs);
     }
 
     #[test]
     #[should_panic(expected = "Missing authorized commitment for external input 'personal_data'")]
-    fn verify_external_input_commitments_reject_missing_authorized_binding() {
+    fn verify_external_inputs_reject_missing_authorized_binding() {
         let ext = external_input(
             "personal_data",
             sha256_hex(b"payload").as_slice(),
@@ -778,13 +781,14 @@ mod tests {
             output_commitment: sha(b"out"),
         });
 
-        verify_external_input_commitments(
+        verify_external_inputs(
             &step,
             &ext,
             &AuthorizationJournal {
                 authorized_external_inputs: AuthorizedExternalInputs::default(),
                 manifest_commitment: vec![0; 32],
-            },
+            }
+            .authorized_external_inputs,
         );
     }
 
@@ -792,7 +796,7 @@ mod tests {
     #[should_panic(
         expected = "External input 'personal_data' commitment does not match authorized source"
     )]
-    fn verify_external_input_commitments_reject_mismatched_authorized_binding() {
+    fn verify_external_inputs_reject_mismatched_authorized_binding() {
         let ext = external_input(
             "personal_data",
             sha256_hex(b"payload").as_slice(),
@@ -809,10 +813,7 @@ mod tests {
             output_commitment: sha(b"out"),
         });
 
-        verify_external_input_commitments(
-            &step,
-            &ext,
-            &authorization_journal("personal_data", b"wrong", b"payload"),
-        );
+        let authorization = authorization_journal("personal_data", b"wrong", b"payload");
+        verify_external_inputs(&step, &ext, &authorization.authorized_external_inputs);
     }
 }

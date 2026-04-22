@@ -45,13 +45,16 @@ pub struct StepRecordWitness {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransitionInput {
     pub step_record: StepRecord,
-    pub authorization_image_id: Vec<u8>,
     pub replay_image_id: Option<Vec<u8>>,
+
     pub input_witness: Option<Vec<u8>>,
     pub output_witness: Option<Vec<u8>>,
     pub external_input: ExternalInput,
-    pub authorization: AuthorizationJournal,
+
     pub input_sources_witnesses: HashMap<StepRecord, Vec<u8>>,
+
+    pub authorization_image_id: Vec<u8>,
+    pub authorization_journal: AuthorizationJournal,
 }
 
 /// Result of applying one transition (new frontier and fingerprint state).
@@ -82,6 +85,7 @@ pub enum TransitionState {
 pub struct TransitionJournal {
     pub init_state: InitTransition,
     pub current_state: TransitionState,
-    pub self_image_id: Vec<u8>,
+    pub transition_image_id: Vec<u8>,
+    pub authorization_image_id: Vec<u8>,
     pub manifest_commitment: Vec<u8>,
 }

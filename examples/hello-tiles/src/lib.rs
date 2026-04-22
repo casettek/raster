@@ -29,7 +29,10 @@ pub fn greet(name: String) -> String {
 pub fn personal_greet(
     #[external(name = "personal_data")] personal_data: External<PersonalData>,
 ) -> String {
-    format!("Hello, {}!!!!", personal_data.name)
+    let greet = format!("Hello, {}!!!!", personal_data.name);
+    println!("greet: {}", greet);
+
+    greet
 }
 
 /// A tile that adds emphasis to a message.

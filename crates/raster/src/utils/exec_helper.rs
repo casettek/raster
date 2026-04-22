@@ -31,6 +31,6 @@ use raster_runtime::input;
 ///
 /// Returns `Some(T)` if the `--input` argument was found and successfully deserialized.
 /// Returns `None` if no `--input` argument was found or deserialization failed.
-pub fn parse_program_input<T: DeserializeOwned>() -> Option<T> {
+pub fn parse_program_input<T: DeserializeOwned + core::fmt::Debug>() -> Option<T> {
     input::parse_program_input()
 }

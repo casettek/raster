@@ -405,11 +405,12 @@ pub fn prove(
         build_manifested_inputs(input_manifest, read_external_inputs(&recorded_step_io))
             .unwrap_or_else(|e| panic!("Failed to load authorization source: {}", e));
 
+    let (authorization_receipt, authorization_journal) =
+        authorize_external_inputs(&manifested_inputs);
+
     if let Some(frontier) = SerializableFrontier::from_bytes(&fraud_window.frontier) {
         println!();
         println!("Replaying transition frontier with transition guest...");
-
-        let (authorization_receipt, authorization) = authorize_external_inputs(&manifested_inputs);
 
         let Some(receipt) = step_transitions(
             &frontier,
@@ -419,7 +420,7 @@ pub fn prove(
             &input_sources_witnesses,
             &recorded_step_io,
             &replayed_results,
-            &authorization,
+            &authorization_journal,
             &authorization_receipt,
         ) else {
             panic!("Failed to generate fraud proof");

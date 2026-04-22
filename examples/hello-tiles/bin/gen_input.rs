@@ -35,7 +35,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         format!(
             concat!(
                 "{{\n",
-                "  \"personal_data\": \"personal_data.bin\"\n",
+                "  \"personal_data\": {{ \"path\": \"personal_data.bin\" }},\n",
+                "  \"seed\": 123\n",
                 "}}\n"
             ),
         ),
@@ -45,7 +46,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         format!(
             concat!(
                 "{{\n",
-                "  \"personal_data\": \"{}\"\n",
+                "  \"personal_data\": {{ \"external_commitment\": \"{}\" }}\n",
                 "}}\n"
             ),
             hash

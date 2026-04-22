@@ -3,7 +3,6 @@
 use crate::schema::SequenceSchema;
 use crate::tile::TileMetadata;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 use std::string::String;
 use std::vec::Vec;
 
@@ -26,18 +25,3 @@ impl Manifest {
         }
     }
 }
-
-/// A private file-backed external input declared inside `input.json`.
-pub type ExternalInputPathEntry = String;
-
-/// A public external input commitment declared inside `input_manifest.json`.
-pub type ExternalInputManifestEntry = String;
-
-/// A private JSON input document used by the native whole-program runner.
-///
-/// Each top-level field may be either a plain JSON value or a string path
-/// described by `ExternalInputPathEntry`.
-pub type InputDocument = BTreeMap<String, serde_json::Value>;
-
-/// A public JSON manifest document that describes the commitments for externals.
-pub type InputManifestDocument = BTreeMap<String, serde_json::Value>;

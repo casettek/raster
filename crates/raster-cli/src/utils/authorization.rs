@@ -24,15 +24,15 @@ pub fn read_external_inputs(
 ) -> BTreeMap<String, Vec<u8>> {
     let mut external_inputs_bytes = BTreeMap::new();
 
-    for (_step, (_input, _output, external_input)) in recorded_step_io {
-        for meta in external_input.values() {
+    for (_step, (_input, _output, external_inputs)) in recorded_step_io {
+        for binding in external_inputs.values() {
             if let Some(previous) =
-                external_inputs_bytes.insert(meta.name.clone(), meta.bytes.clone())
+                external_inputs_bytes.insert(binding.name.clone(), binding.bytes.clone())
             {
                 assert_eq!(
-                    previous, meta.bytes,
+                    previous, binding.bytes,
                     "Conflicting payload bytes recorded for external input '{}'",
-                    meta.name
+                    binding.name
                 );
             }
         }
