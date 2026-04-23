@@ -216,7 +216,7 @@ mod tests {
 
     fn make_manifested_inputs() -> ManifestedInputs {
         ManifestedInputs {
-            manifest_bytes: br#"{"personal_data":{"external_commitment":"239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"}}"#
+            manifest_bytes: br#"{"personal_data":{"type":"sha256","commitment":"239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"}}"#
                 .to_vec(),
             external_inputs_bytes: [("personal_data".to_string(), b"payload".to_vec())]
                 .into_iter()
@@ -308,7 +308,7 @@ mod tests {
                 b"payload",
             )
         );
-        assert_eq!(input.authorization, make_authorization_journal());
+        assert_eq!(input.authorization_journal, make_authorization_journal());
     }
 
     #[test]
@@ -421,7 +421,7 @@ mod tests {
             input_witness: Some(b"sequence-in".to_vec()),
             output_witness: None,
             external_input: ExternalInput::new(),
-            authorization,
+            authorization_journal: authorization,
             input_sources_witnesses: HashMap::new(),
         };
         let state = TransitionState::Init(InitTransition {

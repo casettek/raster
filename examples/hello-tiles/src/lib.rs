@@ -35,6 +35,19 @@ pub fn personal_greet(
     greet
 }
 
+/// A greeting tile that resolves both committed example inputs:
+/// file-backed `personal_data` and inline `seed`.
+#[tile(kind=iter)]
+pub fn personal_greet_with_seed(
+    #[external(name = "personal_data")] personal_data: External<PersonalData>,
+    #[external(name = "seed")] seed: External<u64>,
+) -> String {
+    let greet = format!("Hello, {}!!!! (seed: {})", personal_data.name, seed);
+    debug!("seeded greet: {}", greet);
+
+    greet
+}
+
 /// A tile that adds emphasis to a message.
 ///
 /// This tile takes a String and returns it with exclamation marks.

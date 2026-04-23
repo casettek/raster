@@ -15,9 +15,27 @@ use std::sync::{Mutex, OnceLock};
 use std::vec::Vec;
 
 #[derive(Debug, Clone)]
-struct ResolvedExternal {
-    commitment: String,
-    bytes: Vec<u8>,
+enum ResolvedExternalInput {
+    File { commitment: String, bytes: Vec<u8> },
+    InlineJson {
+        commitment: String,
+        bytes: Vec<u8>,
+        value: Value,
+    },
+}
+
+impl ResolvedExternalInput {
+    fn commitment(&self) -> &str {
+        match self {
+            Self::File { commitment, .. } | Self::InlineJson { commitment, .. } => commitment,
+        }
+    }
+
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::File { bytes, .. } | Self::InlineJson { bytes, .. } => bytes,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -27,9 +45,10 @@ struct ExternalInputSources {
     input_base_dir: PathBuf,
 }
 
-static RESOLVED_EXTERNALS: OnceLock<Mutex<HashMap<String, ResolvedExternal>>> = OnceLock::new();
+static RESOLVED_EXTERNALS: OnceLock<Mutex<HashMap<String, ResolvedExternalInput>>> =
+    OnceLock::new();
 
-fn external_cache() -> &'static Mutex<HashMap<String, ResolvedExternal>> {
+fn external_cache() -> &'static Mutex<HashMap<String, ResolvedExternalInput>> {
     RESOLVED_EXTERNALS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -134,7 +153,7 @@ impl ExternalInputSources {
             ))
         })?;
 
-        entry.as_external_path().map(str::to_owned).ok_or_else(|| {
+        entry.as_path().map(str::to_owned).ok_or_else(|| {
             Error::Serialization(format!(
                 "Expected external input '{}' to use {{\"path\": \"...\"}}",
                 name
@@ -151,11 +170,11 @@ impl ExternalInputSources {
         })?;
 
         entry
-            .as_external_commitment()
+            .as_sha256_commitment()
             .map(str::to_owned)
             .ok_or_else(|| {
                 Error::Serialization(format!(
-                    "Expected public manifest entry '{}' to use {{\"external_commitment\": \"...\"}}",
+                    "Expected public manifest entry '{}' to use {{\"type\": \"sha256\", \"commitment\": \"...\"}}",
                     name
                 ))
             })
@@ -177,34 +196,47 @@ impl ExternalInputSources {
     }
 }
 
-fn resolve_cached_external(name: &str, sources: &ExternalInputSources) -> Result<ResolvedExternal> {
+fn resolve_cached_external(
+    name: &str,
+    sources: &ExternalInputSources,
+) -> Result<ResolvedExternalInput> {
     if let Some(resolved) = external_cache().lock().unwrap().get(name).cloned() {
         return Ok(resolved);
     }
 
-    let entry = sources.read_external_path_entry(name)?;
-    let path = sources.input_base_dir.join(&entry);
-    let bytes = fs::read(&path).map_err(|e| {
-        Error::Other(format!(
-            "Failed to read external input '{}' from '{}': {}",
-            name,
-            path.display(),
-            e
-        ))
-    })?;
-
     let expected_commitment = sources.read_external_commitment_entry(name)?;
-    let actual_hash = sha256_hex(&bytes);
-    if normalize_hash(&expected_commitment) != actual_hash {
-        return Err(Error::Other(format!(
-            "External input '{}' failed integrity check. Expected SHA256 {}, got {}",
-            name, expected_commitment, actual_hash
-        )));
-    }
-
-    let resolved = ResolvedExternal {
-        commitment: expected_commitment,
-        bytes,
+    let resolved = match sources.get_input_entry(name).ok_or_else(|| {
+        Error::Other(format!(
+            "Missing external input '{}'. Expected a top-level input document field.",
+            name
+        ))
+    })? {
+        InputDocumentEntry::Path { .. } => {
+            let entry = sources.read_external_path_entry(name)?;
+            let path = sources.input_base_dir.join(&entry);
+            let bytes = fs::read(&path).map_err(|e| {
+                Error::Other(format!(
+                    "Failed to read external input '{}' from '{}': {}",
+                    name,
+                    path.display(),
+                    e
+                ))
+            })?;
+            verify_input_commitment(name, &bytes, &expected_commitment)?;
+            ResolvedExternalInput::File {
+                commitment: expected_commitment,
+                bytes,
+            }
+        }
+        InputDocumentEntry::Inline(value) => {
+            let bytes = canonical_json_bytes(value)?;
+            verify_input_commitment(name, &bytes, &expected_commitment)?;
+            ResolvedExternalInput::InlineJson {
+                commitment: expected_commitment,
+                bytes,
+                value: value.clone(),
+            }
+        }
     };
 
     let mut guard = external_cache().lock().unwrap();
@@ -216,19 +248,33 @@ fn resolve_cached_external(name: &str, sources: &ExternalInputSources) -> Result
 
 fn deserialize_external_value<T: DeserializeOwned>(
     name: &str,
-    resolved: ResolvedExternal,
+    resolved: ResolvedExternalInput,
 ) -> Result<ExternalValue<T>> {
-    let value = raster_core::postcard::from_bytes(&resolved.bytes).map_err(|e| {
-        Error::Serialization(format!(
-            "Failed to deserialize external input '{}' from postcard bytes: {}",
-            name, e
-        ))
-    })?;
+    let commitment = resolved.commitment().to_string();
+    let bytes = resolved.bytes().to_vec();
+    let value = match resolved {
+        ResolvedExternalInput::File { bytes, .. } => {
+            raster_core::postcard::from_bytes(&bytes).map_err(|e| {
+                Error::Serialization(format!(
+                    "Failed to deserialize external input '{}' from postcard bytes: {}",
+                    name, e
+                ))
+            })?
+        }
+        ResolvedExternalInput::InlineJson { value, .. } => {
+            serde_json::from_value(value).map_err(|e| {
+                Error::Serialization(format!(
+                    "Failed to deserialize inline external input '{}' from JSON value: {}",
+                    name, e
+                ))
+            })?
+        }
+    };
 
     Ok(ExternalValue::new(
         name,
-        Some(resolved.commitment),
-        resolved.bytes,
+        Some(commitment),
+        bytes,
         value,
     ))
 }
@@ -246,16 +292,53 @@ fn normalize_hash(hash: &str) -> String {
     hash.trim().to_ascii_lowercase()
 }
 
+fn canonicalize_json_value(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut entries: Vec<_> = map.iter().collect();
+            entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+            let mut out = serde_json::Map::new();
+            for (key, value) in entries {
+                out.insert(key.clone(), canonicalize_json_value(value));
+            }
+
+            Value::Object(out)
+        }
+        Value::Array(values) => Value::Array(values.iter().map(canonicalize_json_value).collect()),
+        other => other.clone(),
+    }
+}
+
+fn canonical_json_bytes(value: &Value) -> Result<Vec<u8>> {
+    serde_json::to_vec(&canonicalize_json_value(value)).map_err(|e| {
+        Error::Serialization(format!(
+            "Failed to encode inline input as canonical JSON bytes: {}",
+            e
+        ))
+    })
+}
+
+fn verify_input_commitment(name: &str, bytes: &[u8], expected_commitment: &str) -> Result<()> {
+    let actual_hash = sha256_hex(bytes);
+    if normalize_hash(expected_commitment) != actual_hash {
+        return Err(Error::Other(format!(
+            "External input '{}' failed integrity check. Expected SHA256 {}, got {}",
+            name, expected_commitment, actual_hash
+        )));
+    }
+
+    Ok(())
+}
+
 /// Parse the private program input from `--input` and deserialize the full value.
-pub fn parse_program_input<T: DeserializeOwned + core::fmt::Debug>() -> Option<T> {
+pub fn parse_program_input<T: DeserializeOwned>() -> Option<T> {
     parse_program_input_value(None)
 }
 
 /// Parse either a named top-level field from the private `input.json` document,
 /// or the full document when `name` is `None`.
-pub fn parse_program_input_value<T: DeserializeOwned + core::fmt::Debug>(
-    name: Option<&str>,
-) -> Option<T> {
+pub fn parse_program_input_value<T: DeserializeOwned>(name: Option<&str>) -> Option<T> {
     let sources = load_external_input_sources().ok()??;
 
     if let Some(name) = name {
@@ -340,6 +423,7 @@ mod tests {
     #[test]
     fn reads_file_backed_input_and_resolves_relative_external() {
         clear_external_cache();
+        let input_name = "flight_data_relative";
         let dir = unique_dir();
         fs::create_dir_all(&dir).unwrap();
 
@@ -352,19 +436,17 @@ mod tests {
         let (input_path, manifest_path) = write_external_documents(
             &dir,
             &hash,
-            r#"{"flight_data":{"path":"flights.bin"}}"#,
-            r#"{"flight_data":{"external_commitment":"{hash}"}}"#,
+            r#"{"flight_data_relative":{"path":"flights.bin"}}"#,
+            r#"{"flight_data_relative":{"type":"sha256","commitment":"{hash}"}}"#,
         );
 
         let sources =
             ExternalInputSources::from_input_args(input_path.to_str(), manifest_path.to_str())
                 .unwrap();
-        let entry = sources.read_external_path_entry("flight_data").unwrap();
+        let entry = sources.read_external_path_entry(input_name).unwrap();
         assert_eq!(entry, "flights.bin");
         assert_eq!(
-            sources
-                .read_external_commitment_entry("flight_data")
-                .unwrap(),
+            sources.read_external_commitment_entry(input_name).unwrap(),
             hash
         );
 
@@ -404,6 +486,7 @@ mod tests {
     #[test]
     fn caches_resolved_external_bytes_by_name() {
         clear_external_cache();
+        let input_name = "flight_data_cached";
         let dir = unique_dir();
         fs::create_dir_all(&dir).unwrap();
 
@@ -416,25 +499,25 @@ mod tests {
         let (input_path, manifest_path) = write_external_documents(
             &dir,
             &hash,
-            r#"{"flight_data":{"path":"flights.bin"}}"#,
-            r#"{"flight_data":{"external_commitment":"{hash}"}}"#,
+            r#"{"flight_data_cached":{"path":"flights.bin"}}"#,
+            r#"{"flight_data_cached":{"type":"sha256","commitment":"{hash}"}}"#,
         );
 
         let sources =
             ExternalInputSources::from_input_args(input_path.to_str(), manifest_path.to_str())
                 .unwrap();
-        let first = resolve_cached_external("flight_data", &sources).unwrap();
+        let first = resolve_cached_external(input_name, &sources).unwrap();
 
         let changed_bytes =
             raster_core::postcard::to_allocvec(&vec![Flight { id: 9, seats: 42 }]).unwrap();
         fs::write(&data_path, &changed_bytes).unwrap();
 
-        let second = resolve_cached_external("flight_data", &sources).unwrap();
+        let second = resolve_cached_external(input_name, &sources).unwrap();
 
-        assert_eq!(first.bytes, bytes);
-        assert_eq!(second.bytes, bytes);
-        assert_eq!(first.commitment, hash);
-        assert_eq!(second.commitment, hash);
+        assert_eq!(first.bytes(), bytes.as_slice());
+        assert_eq!(second.bytes(), bytes.as_slice());
+        assert_eq!(first.commitment(), hash);
+        assert_eq!(second.commitment(), hash);
 
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -442,6 +525,7 @@ mod tests {
     #[test]
     fn rejects_external_inputs_with_wrong_manifest_commitment() {
         clear_external_cache();
+        let input_name = "flight_data_bad_manifest";
         let dir = unique_dir();
         fs::create_dir_all(&dir).unwrap();
 
@@ -453,18 +537,47 @@ mod tests {
         let (input_path, manifest_path) = write_external_documents(
             &dir,
             "deadbeef",
-            r#"{"flight_data":{"path":"flights.bin"}}"#,
-            r#"{"flight_data":{"external_commitment":"{hash}"}}"#,
+            r#"{"flight_data_bad_manifest":{"path":"flights.bin"}}"#,
+            r#"{"flight_data_bad_manifest":{"type":"sha256","commitment":"{hash}"}}"#,
         );
 
         let sources =
             ExternalInputSources::from_input_args(input_path.to_str(), manifest_path.to_str())
                 .unwrap();
-        let err = resolve_cached_external("flight_data", &sources).expect_err("hash mismatch");
+        let err = resolve_cached_external(input_name, &sources).expect_err("hash mismatch");
 
         assert!(err
             .to_string()
-            .contains("External input 'flight_data' failed integrity check"));
+            .contains("External input 'flight_data_bad_manifest' failed integrity check"));
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn resolves_inline_inputs_through_external_value_path() {
+        clear_external_cache();
+        let dir = unique_dir();
+        fs::create_dir_all(&dir).unwrap();
+
+        let inline_bytes = canonical_json_bytes(&serde_json::json!(123)).unwrap();
+        let hash = sha256_hex(&inline_bytes);
+        let (input_path, manifest_path) = write_external_documents(
+            &dir,
+            &hash,
+            r#"{"seed":123}"#,
+            r#"{"seed":{"type":"sha256","commitment":"{hash}"}}"#,
+        );
+
+        let sources =
+            ExternalInputSources::from_input_args(input_path.to_str(), manifest_path.to_str())
+                .unwrap();
+        let resolved = resolve_cached_external("seed", &sources).unwrap();
+        let value = deserialize_external_value::<u64>("seed", resolved.clone()).unwrap();
+
+        assert_eq!(resolved.bytes(), inline_bytes.as_slice());
+        assert_eq!(resolved.commitment(), hash);
+        assert_eq!(value.value, 123);
+        assert_eq!(value.bytes, inline_bytes);
 
         fs::remove_dir_all(&dir).unwrap();
     }

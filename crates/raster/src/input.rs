@@ -6,9 +6,7 @@ pub fn external<T>(name: &str) -> External<T> {
     External::new(name)
 }
 
-pub fn parse_program_input_value<T: DeserializeOwned + core::fmt::Debug>(
-    name: Option<&str>,
-) -> Option<T> {
+pub fn parse_program_input_value<T: DeserializeOwned>(name: Option<&str>) -> Option<T> {
     #[cfg(feature = "std")]
     {
         return raster_runtime::parse_program_input_value(name);

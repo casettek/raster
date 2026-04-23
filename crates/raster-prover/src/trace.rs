@@ -953,7 +953,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Failed to resolve producer record")]
+    #[should_panic(expected = "Failed to resolve source record")]
     fn test_verify_trace_returns_failure_for_unresolved_required_producer() {
         let runtime_trace = Trace(vec![
             make_sequence_start_record(1, "main", vec![], 0),

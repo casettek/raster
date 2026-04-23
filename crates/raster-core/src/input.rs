@@ -3,7 +3,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::marker::PhantomData;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 #[cfg(feature = "std")]
 use std::collections::BTreeMap;
@@ -95,26 +95,54 @@ pub type ExternalInputManifestEntry = String;
 /// - an inline JSON value, or
 /// - an external path entry encoded as `{ "path": "..." }`
 #[cfg(feature = "std")]
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum InputDocumentEntry {
-    ExternalPath { path: ExternalInputPathEntry },
+    Path { path: ExternalInputPathEntry },
     Inline(serde_json::Value),
 }
 
 #[cfg(feature = "std")]
 impl InputDocumentEntry {
-    pub fn as_external_path(&self) -> Option<&str> {
+    pub fn as_path(&self) -> Option<&str> {
         match self {
-            Self::ExternalPath { path } => Some(path.as_str()),
+            Self::Path { path } => Some(path.as_str()),
             Self::Inline(_) => None,
+        }
+    }
+
+    pub fn as_inline_value(&self) -> Option<&serde_json::Value> {
+        match self {
+            Self::Path { .. } => None,
+            Self::Inline(value) => Some(value),
         }
     }
 
     pub fn to_json_value(&self) -> serde_json::Value {
         match self {
-            Self::ExternalPath { path } => serde_json::Value::String(path.clone()),
+            Self::Path { path } => serde_json::Value::String(path.clone()),
             Self::Inline(value) => value.clone(),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl<'de> Deserialize<'de> for InputDocumentEntry {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        match value {
+            serde_json::Value::Object(map) => {
+                if map.len() == 1 {
+                    if let Some(serde_json::Value::String(path)) = map.get("path") {
+                        return Ok(Self::Path { path: path.clone() });
+                    }
+                }
+                Ok(Self::Inline(serde_json::Value::Object(map)))
+            }
+            other => Ok(Self::Inline(other)),
         }
     }
 }
@@ -124,27 +152,28 @@ pub type InputDocument = BTreeMap<String, InputDocumentEntry>;
 
 /// A public JSON manifest document that describes the commitments for externals.
 ///
-/// Each top-level field may be either:
-/// - an inline JSON value, or
-/// - an external commitment entry encoded as `{ "external_commitment": "..." }`
+/// Each top-level field is a structured commitment entry encoded as:
+/// `{ "type": "sha256", "commitment": "..." }`
 #[cfg(feature = "std")]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(untagged)]
-pub enum InputManifestEntry {
-    ExternalCommitment {
-        external_commitment: ExternalInputManifestEntry,
-    },
-    Inline(serde_json::Value),
+#[serde(rename_all = "snake_case")]
+pub enum InputCommitmentType {
+    Sha256,
+}
+
+#[cfg(feature = "std")]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InputManifestEntry {
+    #[serde(rename = "type")]
+    pub commitment_type: InputCommitmentType,
+    pub commitment: ExternalInputManifestEntry,
 }
 
 #[cfg(feature = "std")]
 impl InputManifestEntry {
-    pub fn as_external_commitment(&self) -> Option<&str> {
-        match self {
-            Self::ExternalCommitment {
-                external_commitment,
-            } => Some(external_commitment.as_str()),
-            Self::Inline(_) => None,
+    pub fn as_sha256_commitment(&self) -> Option<&str> {
+        match self.commitment_type {
+            InputCommitmentType::Sha256 => Some(self.commitment.as_str()),
         }
     }
 }
@@ -168,7 +197,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            document.get("payload").and_then(InputDocumentEntry::as_external_path),
+            document.get("payload").and_then(InputDocumentEntry::as_path),
             Some("payload.bin")
         );
         assert_eq!(
@@ -182,13 +211,13 @@ mod tests {
     }
 
     #[test]
-    fn parses_mixed_manifest_document_entries() {
+    fn parses_structured_manifest_entries() {
         let document: InputManifestDocument = serde_json::from_str(
             r#"{
                 "payload": {
-                    "external_commitment": "abc123"
-                },
-                "inline_value": 7
+                    "type": "sha256",
+                    "commitment": "abc123"
+                }
             }"#,
         )
         .unwrap();
@@ -196,12 +225,8 @@ mod tests {
         assert_eq!(
             document
                 .get("payload")
-                .and_then(InputManifestEntry::as_external_commitment),
+                .and_then(InputManifestEntry::as_sha256_commitment),
             Some("abc123")
         );
-        assert!(matches!(
-            document.get("inline_value"),
-            Some(InputManifestEntry::Inline(value)) if value == &serde_json::json!(7)
-        ));
     }
 }

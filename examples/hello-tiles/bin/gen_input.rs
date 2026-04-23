@@ -1,5 +1,6 @@
 use hello_tiles::input::PersonalData;
 use raster::core::postcard;
+use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::error::Error;
 use std::fs;
@@ -24,6 +25,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let bytes = postcard::to_allocvec(&data)?;
     let hash = sha256_hex(&bytes);
+    let seed_bytes = serde_json::to_vec(&json!(123u64))?;
+    let seed_hash = sha256_hex(&seed_bytes);
     let bin_path = out_dir.join("personal_data.bin");
     let input_path = out_dir.join("input.json");
     let manifest_path = out_dir.join("input_manifest.json");
@@ -46,10 +49,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         format!(
             concat!(
                 "{{\n",
-                "  \"personal_data\": {{ \"external_commitment\": \"{}\" }}\n",
+                "  \"personal_data\": {{ \"type\": \"sha256\", \"commitment\": \"{}\" }},\n",
+                "  \"seed\": {{ \"type\": \"sha256\", \"commitment\": \"{}\" }}\n",
                 "}}\n"
             ),
-            hash
+            hash, seed_hash
         ),
     )?;
 

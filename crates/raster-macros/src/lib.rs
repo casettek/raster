@@ -775,23 +775,26 @@ pub fn sequence(attr: TokenStream, item: TokenStream) -> TokenStream {
     rewrite_exposed_external_inputs(&mut sequence_sig, &params);
 
     let expanded = if item_fn.sig.ident == "main" {
+        if let Some(param) = params.iter().find(|param| param.external_name.is_none()) {
+            panic!(
+                "All #[sequence] main inputs must use #[external(name = \"...\")] so committed inputs resolve through External<T>. Missing attribute on '{}'.",
+                param.ident
+            );
+        }
+
         // Entry point: replace with fn main() { init(); input_parsing; wrapped_body; finish(); }
         let input_parsing: Vec<_> = params
             .iter()
             .map(|param| {
                 let name = &param.ident;
                 let ty = &param.ty;
-                let field_name = name.to_string();
-                if let Some(external_name) = &param.external_name {
-                    let ty = exposed_external_param_ty(ty);
-                    quote! {
-                        let #name: #ty = ::raster::external(#external_name);
-                    }
-                } else {
-                    quote! {
-                        let #name: #ty = ::raster::input::parse_program_input_value(::core::option::Option::Some(#field_name))
-                            .expect("Failed to parse --input argument. Use inline JSON or a JSON file path.");
-                    }
+                let external_name = param
+                    .external_name
+                    .as_ref()
+                    .expect("main inputs were validated above");
+                let ty = exposed_external_param_ty(ty);
+                quote! {
+                    let #name: #ty = ::raster::external(#external_name);
                 }
             })
             .collect();

@@ -26,9 +26,12 @@ fn normalize_hash_string(commitment: &str) -> Vec<u8> {
     commitment.trim().to_ascii_lowercase().into_bytes()
 }
 
-fn parse_manifest_commitment(entry: InputManifestEntry) -> Option<Vec<u8>> {
-    let commitment = entry.as_external_commitment()?;
-    Some(normalize_hash_string(commitment))
+fn parse_manifest_commitment(entry: InputManifestEntry) -> Vec<u8> {
+    normalize_hash_string(
+        entry
+            .as_sha256_commitment()
+            .expect("Expected manifest entry to use {\"type\":\"sha256\",\"commitment\":\"...\"}"),
+    )
 }
 
 fn parse_external_input_commitments(manifest_bytes: &[u8]) -> BTreeMap<String, Vec<u8>> {
@@ -41,10 +44,7 @@ fn parse_external_input_commitments(manifest_bytes: &[u8]) -> BTreeMap<String, V
 
     document
         .into_iter()
-        .filter_map(|(name, value)| {
-            let commitment = parse_manifest_commitment(value)?;
-            Some((name, commitment))
-        })
+        .map(|(name, value)| (name, parse_manifest_commitment(value)))
         .collect()
 }
 
@@ -101,9 +101,9 @@ mod tests {
         let input = ManifestedInputs {
             manifest_bytes: br#"{
                 "personal_data": {
-                    "external_commitment": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-                },
-                "inline_value": 7
+                    "type": "sha256",
+                    "commitment": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+                }
             }"#
             .to_vec(),
             external_inputs_bytes: [("personal_data".to_string(), b"abc".to_vec())]
@@ -124,10 +124,6 @@ mod tests {
                 bytes: b"abc".to_vec(),
             })
         );
-        assert!(!journal
-            .authorized_external_inputs
-            .entries
-            .contains_key("inline_value"));
     }
 
     #[test]
@@ -136,7 +132,7 @@ mod tests {
         let payload_commitment = String::from_utf8(sha256_hex(&payload)).unwrap();
         let input = ManifestedInputs {
             manifest_bytes: format!(
-                r#"{{"personal_data":{{"external_commitment":"{}"}}}}"#,
+                r#"{{"personal_data":{{"type":"sha256","commitment":"{}"}}}}"#,
                 payload_commitment
             )
             .into_bytes(),
@@ -157,7 +153,7 @@ mod tests {
         let payload_commitment = String::from_utf8(sha256_hex(&payload)).unwrap();
         let input = ManifestedInputs {
             manifest_bytes: format!(
-                r#"{{"personal_data":{{"external_commitment":"{}"}},"unused_data":"deadbeef"}}"#,
+                r#"{{"personal_data":{{"type":"sha256","commitment":"{}"}},"unused_data":{{"type":"sha256","commitment":"deadbeef"}}}}"#,
                 payload_commitment
             )
             .into_bytes(),
