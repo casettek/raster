@@ -27,10 +27,10 @@ pub fn read_external_inputs(
     for (_step, (_input, _output, external_inputs)) in recorded_step_io {
         for binding in external_inputs.values() {
             if let Some(previous) =
-                external_inputs_bytes.insert(binding.name.clone(), binding.bytes.clone())
+                external_inputs_bytes.insert(binding.name.clone(), binding.data.clone())
             {
                 assert_eq!(
-                    previous, binding.bytes,
+                    previous, binding.data,
                     "Conflicting payload bytes recorded for external input '{}'",
                     binding.name
                 );

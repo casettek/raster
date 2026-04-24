@@ -6,13 +6,13 @@
 //! 3. Returning the new frontier
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use bridgetree::{Hashable, Level, NonEmptyFrontier, Position};
 use risc0_zkvm::guest::env;
 use risc0_zkvm::sha::{Impl as Risc0Sha256, Sha256 as _};
 
-use raster_core::authorization::{AuthorizationJournal, AuthorizedExternalInputs};
+use raster_core::authorization::AuthorizationJournal;
 use raster_core::cfs::{
     CfsCoordinates, CfsCursor, ControlFlowSchema, InputSource, SequenceChildItem,
 };
@@ -313,7 +313,7 @@ fn verify_io_witness(
 fn verify_external_inputs(
     step: &StepRecord,
     external_input: &ExternalInput,
-    authorized_external_inputs: &AuthorizedExternalInputs,
+    external_inputs_commitments: &BTreeMap<String, Vec<u8>>,
 ) {
     let computed_commitment = external_input_commitment(external_input);
 
@@ -339,8 +339,7 @@ fn verify_external_inputs(
     }
 
     for meta in external_input.values() {
-        let authorized_external_input = authorized_external_inputs
-            .entries
+        let authorized_commitment = external_inputs_commitments
             .get(&meta.name)
             .unwrap_or_else(|| {
                 panic!(
@@ -349,17 +348,12 @@ fn verify_external_inputs(
                 )
             });
         assert_eq!(
-            &authorized_external_input.commitment, &meta.commitment,
+            authorized_commitment, &meta.commitment,
             "External input '{}' commitment does not match authorized source",
             meta.name,
         );
         assert_eq!(
-            &authorized_external_input.bytes, &meta.bytes,
-            "External input '{}' payload does not match the authorized payload",
-            meta.name,
-        );
-        assert_eq!(
-            sha256_hex(&meta.bytes),
+            sha256_hex(&meta.data),
             meta.commitment,
             "External input '{}' payload does not match the transported commitment",
             meta.name,
@@ -388,10 +382,10 @@ fn verify_step_record(
     output_witness_bytes: Option<&Vec<u8>>,
 
     external_inputs: &ExternalInput,
-    authorized_external_inputs: &AuthorizedExternalInputs,
+    external_inputs_commitments: &BTreeMap<String, Vec<u8>>,
 ) {
     verify_io_witness(step_record, input_witness_bytes, output_witness_bytes);
-    verify_external_inputs(step_record, external_inputs, authorized_external_inputs);
+    verify_external_inputs(step_record, external_inputs, external_inputs_commitments);
 
     if let StepRecord::TileExec(_) = step_record {
         let replay_image_id =
@@ -476,7 +470,7 @@ fn main() {
                 input.input_witness.as_ref(),
                 input.output_witness.as_ref(),
                 &input.external_input,
-                &input.authorization_journal.authorized_external_inputs,
+                &input.authorization_journal.external_inputs_commitments,
             );
             let next_expected_coordinates =
                 get_next_expected_coordinates(&cfs_cursor, &input.step_record, None);
@@ -549,7 +543,7 @@ fn main() {
                 input.input_witness.as_ref(),
                 input.output_witness.as_ref(),
                 &input.external_input,
-                &input.authorization_journal.authorized_external_inputs,
+                &input.authorization_journal.external_inputs_commitments,
             );
             let next_expected_coordinates = get_next_expected_coordinates(
                 &cfs_cursor,
@@ -618,14 +612,14 @@ mod tests {
     fn external_input(
         binding_name: &str,
         commitment: &[u8],
-        payload_bytes: &[u8],
+        payload_data: &[u8],
     ) -> ExternalInput {
         [(
             "arg".to_string(),
             ExternalBinding {
                 name: binding_name.to_string(),
                 commitment: commitment.to_vec(),
-                bytes: payload_bytes.to_vec(),
+                data: payload_data.to_vec(),
             },
         )]
         .into_iter()
@@ -635,20 +629,11 @@ mod tests {
     fn authorization_journal(
         binding_name: &str,
         commitment: &[u8],
-        payload_bytes: &[u8],
     ) -> AuthorizationJournal {
         AuthorizationJournal {
-            authorized_external_inputs: AuthorizedExternalInputs {
-                entries: [(
-                    binding_name.to_string(),
-                    raster_core::authorization::AuthorizedExternalInput {
-                        commitment: commitment.to_vec(),
-                        bytes: payload_bytes.to_vec(),
-                    },
-                )]
+            external_inputs_commitments: [(binding_name.to_string(), commitment.to_vec())]
                 .into_iter()
                 .collect(),
-            },
             manifest_commitment: vec![7; 32],
         }
     }
@@ -672,10 +657,10 @@ mod tests {
             &step,
             &ext,
             &AuthorizationJournal {
-                authorized_external_inputs: AuthorizedExternalInputs::default(),
+                external_inputs_commitments: BTreeMap::new(),
                 manifest_commitment: vec![0; 32],
             }
-            .authorized_external_inputs,
+            .external_inputs_commitments,
         );
     }
 
@@ -720,19 +705,19 @@ mod tests {
             &start,
             &ext,
             &AuthorizationJournal {
-                authorized_external_inputs: AuthorizedExternalInputs::default(),
+                external_inputs_commitments: BTreeMap::new(),
                 manifest_commitment: vec![0; 32],
             }
-            .authorized_external_inputs,
+            .external_inputs_commitments,
         );
         verify_external_inputs(
             &end,
             &ExternalInput::new(),
             &AuthorizationJournal {
-                authorized_external_inputs: AuthorizedExternalInputs::default(),
+                external_inputs_commitments: BTreeMap::new(),
                 manifest_commitment: vec![0; 32],
             }
-            .authorized_external_inputs,
+            .external_inputs_commitments,
         );
     }
 
@@ -757,9 +742,8 @@ mod tests {
         let authorization = authorization_journal(
             "personal_data",
             sha256_hex(b"payload").as_slice(),
-            b"payload",
         );
-        verify_external_inputs(&step, &ext, &authorization.authorized_external_inputs);
+        verify_external_inputs(&step, &ext, &authorization.external_inputs_commitments);
     }
 
     #[test]
@@ -785,10 +769,10 @@ mod tests {
             &step,
             &ext,
             &AuthorizationJournal {
-                authorized_external_inputs: AuthorizedExternalInputs::default(),
+                external_inputs_commitments: BTreeMap::new(),
                 manifest_commitment: vec![0; 32],
             }
-            .authorized_external_inputs,
+            .external_inputs_commitments,
         );
     }
 
@@ -813,7 +797,7 @@ mod tests {
             output_commitment: sha(b"out"),
         });
 
-        let authorization = authorization_journal("personal_data", b"wrong", b"payload");
-        verify_external_inputs(&step, &ext, &authorization.authorized_external_inputs);
+        let authorization = authorization_journal("personal_data", b"wrong");
+        verify_external_inputs(&step, &ext, &authorization.external_inputs_commitments);
     }
 }

@@ -293,7 +293,7 @@ fn gen_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream {
         })
         .collect();
 
-    let external_meta_entries: Vec<_> = params
+    let external_binding_entries: Vec<_> = params
         .iter()
         .filter_map(|param| {
             let external_name = param.external_name.as_ref()?;
@@ -309,7 +309,7 @@ fn gen_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream {
                             .clone()
                             .map(|value| value.into_bytes())
                             .unwrap_or_default(),
-                        bytes: #bytes_ident.clone(),
+                        data: #bytes_ident.clone(),
                     }
                 )
             })
@@ -381,7 +381,7 @@ fn gen_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream {
                 data: __raster_input_bytes,
                 args: __raster_input_args,
                 external: if #has_external_inputs {
-                    [#(#external_meta_entries),*]
+                    [#(#external_binding_entries),*]
                         .into_iter()
                         .collect::<::raster::alloc::collections::BTreeMap<
                             ::raster::alloc::string::String,

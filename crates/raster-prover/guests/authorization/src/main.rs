@@ -1,6 +1,4 @@
-use raster_core::authorization::{
-    AuthorizationJournal, AuthorizedExternalInput, AuthorizedExternalInputs, ManifestedInputs,
-};
+use raster_core::authorization::{AuthorizationJournal, ManifestedInputs};
 use raster_core::input::{InputManifestDocument, InputManifestEntry};
 use risc0_zkvm::guest::env;
 use risc0_zkvm::sha::{Impl as Risc0Sha256, Sha256 as _};
@@ -51,7 +49,7 @@ fn parse_external_input_commitments(manifest_bytes: &[u8]) -> BTreeMap<String, V
 fn build_authorization_journal(input: &ManifestedInputs) -> AuthorizationJournal {
     let external_input_commitments = parse_external_input_commitments(&input.manifest_bytes);
 
-    let entries = input
+    let external_inputs_commitments = input
         .external_inputs_bytes
         .iter()
         .map(|(name, bytes)| {
@@ -70,18 +68,12 @@ fn build_authorization_journal(input: &ManifestedInputs) -> AuthorizationJournal
                 name
             );
 
-            (
-                name.clone(),
-                AuthorizedExternalInput {
-                    commitment: external_input_commitment.clone(),
-                    bytes: bytes.clone(),
-                },
-            )
+            (name.clone(), external_input_commitment.clone())
         })
         .collect();
 
     AuthorizationJournal {
-        authorized_external_inputs: AuthorizedExternalInputs { entries },
+        external_inputs_commitments,
         manifest_commitment: sha256_bytes(&input.manifest_bytes),
     }
 }
@@ -97,7 +89,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_authorized_external_inputs_from_json_source() {
+    fn parses_external_input_commitments_from_json_source() {
         let input = ManifestedInputs {
             manifest_bytes: br#"{
                 "personal_data": {
@@ -115,14 +107,9 @@ mod tests {
 
         assert_eq!(
             journal
-                .authorized_external_inputs
-                .entries
+                .external_inputs_commitments
                 .get("personal_data"),
-            Some(&AuthorizedExternalInput {
-                commitment: b"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-                    .to_vec(),
-                bytes: b"abc".to_vec(),
-            })
+            Some(&b"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".to_vec())
         );
     }
 
@@ -165,12 +152,10 @@ mod tests {
         let journal = build_authorization_journal(&input);
 
         assert!(journal
-            .authorized_external_inputs
-            .entries
+            .external_inputs_commitments
             .contains_key("personal_data"));
         assert!(!journal
-            .authorized_external_inputs
-            .entries
+            .external_inputs_commitments
             .contains_key("unused_data"));
     }
 }

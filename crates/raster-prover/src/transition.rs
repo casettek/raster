@@ -188,13 +188,13 @@ mod tests {
         Sha256::digest(bytes).to_vec()
     }
 
-    fn make_external_input(binding_name: &str, commitment: &[u8], bytes: &[u8]) -> ExternalInput {
+    fn make_external_input(binding_name: &str, commitment: &[u8], data: &[u8]) -> ExternalInput {
         HashMap::from([(
             "arg".to_string(),
             ExternalBinding {
                 name: binding_name.to_string(),
                 commitment: commitment.to_vec(),
-                bytes: bytes.to_vec(),
+                data: data.to_vec(),
             },
         )])
         .into_iter()
@@ -226,19 +226,12 @@ mod tests {
 
     fn make_authorization_journal() -> AuthorizationJournal {
         AuthorizationJournal {
-            authorized_external_inputs: raster_core::authorization::AuthorizedExternalInputs {
-                entries: [(
-                    "personal_data".to_string(),
-                    raster_core::authorization::AuthorizedExternalInput {
-                        commitment:
-                            b"239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"
-                                .to_vec(),
-                        bytes: b"payload".to_vec(),
-                    },
-                )]
+            external_inputs_commitments: [(
+                "personal_data".to_string(),
+                b"239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5".to_vec(),
+            )]
                 .into_iter()
                 .collect(),
-            },
             manifest_commitment: vec![4; 32],
         }
     }
@@ -369,14 +362,9 @@ mod tests {
 
         assert_eq!(
             authorization
-                .authorized_external_inputs
-                .entries
+                .external_inputs_commitments
                 .get("personal_data"),
-            Some(&raster_core::authorization::AuthorizedExternalInput {
-                commitment: b"239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"
-                    .to_vec(),
-                bytes: b"payload".to_vec(),
-            })
+            Some(&b"239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5".to_vec())
         );
         assert_eq!(
             authorization_guest_image_id(),

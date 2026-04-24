@@ -32,7 +32,7 @@ pub type ExternalInput = BTreeMap<InternalBindingName, ExternalBinding>;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct ExternalBinding {
     pub name: String,
-    pub bytes: Vec<u8>,
+    pub data: Vec<u8>,
     pub commitment: Vec<u8>,
 }
 
@@ -101,13 +101,14 @@ pub struct TileExecRecord {
     pub tile_id: String,
 
     pub sequence_id: String,
-    pub coordinates: CfsCoordinates,
-
     pub intra_sequence_index: u32,
 
+    pub coordinates: CfsCoordinates,
+
     pub input_commitment: Vec<u8>,
-    pub external_input_commitment: Vec<u8>,
     pub output_commitment: Vec<u8>,
+
+    pub external_input_commitment: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -115,6 +116,7 @@ pub struct SequenceStartRecord {
     pub exec_index: u64,
 
     pub sequence_id: String,
+
     pub coordinates: CfsCoordinates,
 
     pub input_commitment: Vec<u8>,
@@ -126,6 +128,7 @@ pub struct SequenceEndRecord {
     pub exec_index: u64,
 
     pub sequence_id: String,
+
     pub coordinates: CfsCoordinates,
 
     pub output_commitment: Vec<u8>,

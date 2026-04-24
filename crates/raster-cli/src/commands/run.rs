@@ -1,6 +1,6 @@
 //! Run command: build and execute the user program as a whole.
 
-use rand::seq::IndexedMutRandom;
+use rand::seq::IteratorRandom;
 use raster_backend::backend::HexString;
 use rayon::prelude::*;
 
@@ -257,14 +257,18 @@ pub fn run(
             VerificationResult::Ok => println!("Verification Success"),
             VerificationResult::Fraud(fraud_evidence) => {
                 let replayer = Replayer::new(&backend, &project);
-                let _fraud_proof = prove(
+                let fraud_proof = prove(
                     fraud_evidence,
                     &cfs,
                     &trace_recorder,
                     &replayer,
                     input_manifest,
                 );
-                println!("Faurd proof generated");
+                let fraud_proof_path = write_fraud_proof(&fraud_proof, commit_path);
+                println!(
+                    "Fraud proof generated: {}",
+                    fraud_proof_path.display()
+                );
             }
         }
     } else {
@@ -312,7 +316,17 @@ pub fn fraud(trace: &mut Trace, commit_path: &str) {
         std::fs::File::create(commit_path).expect("Failed to create commitemt file");
 
     let mut rng = rand::rng();
-    if let Some(fraud_step) = trace.choose_mut(&mut rng) {
+    if let Some(fraud_step) = trace
+        .iter_mut()
+        .filter(|step_record| {
+            matches!(
+                step_record,
+                StepRecord::TileExec(tile_exec_record)
+                    if !tile_exec_record.external_input_commitment.is_empty()
+            )
+        })
+        .choose(&mut rng)
+    {
         match fraud_step {
             StepRecord::TileExec(tile_exec_record) => {
                 tile_exec_record.output_commitment = vec![0u8, 1u8];
@@ -353,6 +367,29 @@ pub fn verify(trace: &Trace, commit_path: &str, cfs: &ControlFlowSchema) -> Veri
     let mut trace_verifier = TraceVerifier::new(trace_commitment, &EMPTY_TRIE_NODES[0], cfs);
 
     trace_verifier.verify(trace)
+}
+
+pub fn fraud_proof_path(commit_path: &str) -> PathBuf {
+    let path = PathBuf::from(commit_path);
+    let mut file_name = path
+        .file_name()
+        .map(|name| name.to_os_string())
+        .unwrap_or_else(|| std::ffi::OsString::from("fraud-proof"));
+    file_name.push(".fraud-proof");
+    path.with_file_name(file_name)
+}
+
+pub fn write_fraud_proof(receipt: &risc0_zkvm::Receipt, commit_path: &str) -> PathBuf {
+    let proof_path = fraud_proof_path(commit_path);
+    let mut proof_file =
+        std::fs::File::create(&proof_path).expect("Failed to create fraud proof file");
+    let bytes = postcard::to_allocvec(receipt).expect("Failed to serialize fraud proof");
+
+    proof_file
+        .write_all(&bytes)
+        .expect("Failed to save fraud proof");
+
+    proof_path
 }
 
 pub fn prove(
