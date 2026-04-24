@@ -103,8 +103,13 @@ impl TraceIOStore {
                 );
             }
             TraceEvent::SequenceEnd(trace_item) => {
-                self.0.get_mut(&coordinates).unwrap().output_data =
-                    trace_item.output.as_ref().map(|output| output.data.clone());
+                let trace_io = self.0.get_mut(&coordinates).unwrap_or_else(|| {
+                    panic!(
+                        "Missing TraceIO entry for SequenceEnd at coordinates {:?}. Expected a matching SequenceStart to be recorded first.",
+                        coordinates
+                    )
+                });
+                trace_io.output_data = trace_item.output.as_ref().map(|output| output.data.clone());
             }
             TraceEvent::TileExec(trace_item) => {
                 self.0.insert(
@@ -290,5 +295,27 @@ impl TraceRecorder {
         };
 
         step_record
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use raster_core::trace::FnCallRecord;
+
+    #[test]
+    #[should_panic(
+        expected = "Missing TraceIO entry for SequenceEnd at coordinates CfsCoordinates([]). Expected a matching SequenceStart to be recorded first."
+    )]
+    fn sequence_end_without_matching_start_reports_coordinates() {
+        let mut store = TraceIOStore::new();
+        store.insert(
+            CfsCoordinates(vec![]),
+            TraceEvent::SequenceEnd(FnCallRecord {
+                fn_name: "main".to_string(),
+                input: None,
+                output: None,
+            }),
+        );
     }
 }

@@ -149,14 +149,6 @@ impl StepRecord {
             StepRecord::SequenceEnd(sequence_end_record) => &sequence_end_record.coordinates,
         }
     }
-
-    pub fn input(&self) -> Option<&FnInput> {
-        None
-    }
-
-    pub fn output(&self) -> Option<&FnOutput> {
-        None
-    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
