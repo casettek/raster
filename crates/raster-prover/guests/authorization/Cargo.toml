@@ -1,5 +1,5 @@
 [package]
-name = "transition-guest"
+name = "authorization-guest"
 version = "0.1.0"
 edition = "2021"
 
@@ -11,10 +11,7 @@ raster-core = { path = "../../../raster-core", features = ["std"] }
 risc0-zkvm = "1.2"
 
 serde = { version = "1.0", features = ["derive"] }
-postcard = { version = "1.0", features = ["alloc"] }
-hex-literal = "1.1.0"
-
-bridgetree = "0.7"
+serde_json = "1.0"
 
 [profile.release]
 opt-level = 3

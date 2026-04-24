@@ -7,22 +7,35 @@
 
 #![no_std]
 
-extern crate alloc;
+pub extern crate alloc;
 
 #[cfg(feature = "std")]
 extern crate std;
 
 pub use raster_core as core;
+
+pub mod input;
+pub use input::{external, resolve_external_value, External, ExternalRef};
+
 pub use raster_macros::{sequence, tile};
 
 // Runtime is only available with std feature
 #[cfg(feature = "std")]
-pub use raster_runtime::{emit_trace_event, finish, init, init_with, ExecutionSubscriber};
+pub use raster_runtime::{finish, init, init_with, publish_trace_event};
 
 #[cfg(feature = "std")]
 pub mod utils;
-#[cfg(feature = "std")]
-pub use utils::exec_helper::{parse_main_input, try_execute_tile_from_args};
+
+#[doc(hidden)]
+pub mod __private {
+    #[cfg(feature = "std")]
+    pub fn emit_debug(args: core::fmt::Arguments<'_>) {
+        std::println!("[debug] {}", args);
+    }
+
+    #[cfg(not(feature = "std"))]
+    pub fn emit_debug(_: core::fmt::Arguments<'_>) {}
+}
 
 /// Canonical call primitive for invoking a tile inside a sequence.
 ///
@@ -49,6 +62,17 @@ macro_rules! call {
     };
     ($tile:ident, $($args:expr),+ $(,)?) => {
         $tile($($args),+)
+    };
+}
+
+/// Creates a typed external-input reference for `#[external(...)]` parameters.
+#[macro_export]
+macro_rules! external {
+    ($name:literal) => {
+        $crate::external($name)
+    };
+    ($name:expr) => {
+        $crate::external($name)
     };
 }
 
@@ -81,9 +105,21 @@ macro_rules! call_seq {
     };
 }
 
+/// Emits a Raster debug line that `cargo raster run --verbose` will surface.
+///
+/// Use this instead of `println!` in Raster user code, especially in `no_std`
+/// tile/sequence crates where the standard print macros are unavailable.
+#[macro_export]
+macro_rules! debug {
+    ($($arg:tt)*) => {{
+        $crate::__private::emit_debug(::core::format_args!($($arg)*));
+    }};
+}
+
 /// Prelude module for convenient imports.
 pub mod prelude {
     pub use crate::core::{
+        input::{External, ExternalRef},
         tile::{TileId, TileIdStatic, TileMetadata, TileMetadataStatic},
         Result,
     };
@@ -93,7 +129,7 @@ pub mod prelude {
     pub use crate::core::{
         manifest::Manifest,
         schema::{ControlFlow, SequenceSchema},
-        trace::{FnCallRecord, FnInputParam, TileExecRecord},
+        trace::{FnCallRecord, FnInput, FnInputArg, FnOutput, TileExecRecord},
     };
 
     // Registry is only available with std and on platforms that support linkme
@@ -103,13 +139,15 @@ pub mod prelude {
         tile_count, SequenceMetadataStatic, SequenceRegistration, TileRegistration,
     };
 
-    pub use crate::{call, call_seq, sequence, tile};
+    pub use crate::{call, call_seq, debug, external, sequence, tile};
 
     // TODO: Re-enable once Executor/Tracer types are implemented
     // #[cfg(feature = "std")]
     // pub use crate::{Executor, Tracer, FileTracer, NoOpTracer};
 
-    // Tile execution helper for native backend
-    #[cfg(all(feature = "std", not(target_arch = "riscv32")))]
-    pub use crate::try_execute_tile_from_args;
+    #[cfg(feature = "std")]
+    pub use crate::{resolve_external_value};
+
+    #[cfg(feature = "std")]
+    pub use crate::input::parse_program_input_value;
 }

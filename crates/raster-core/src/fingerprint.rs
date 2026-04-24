@@ -694,7 +694,8 @@ mod tests {
         ];
         let bp = BitPacker::new(8);
         let expected = bp.pack(&items);
-        let fingerprint = FingerprintAccumulator::from(Fingerprint::from(expected.clone(), bp, items.len()));
+        let fingerprint =
+            FingerprintAccumulator::from(Fingerprint::from(expected.clone(), bp, items.len()));
 
         let mut acc = FingerprintAccumulator::new(bp);
         for item in &items {
@@ -1286,7 +1287,8 @@ mod tests {
             }
 
             assert_eq!(
-                fingerprint_accumulator.fingerprint().bits, expected_packed,
+                fingerprint_accumulator.fingerprint().bits,
+                expected_packed,
                 "Mismatch for bits_per_item={}",
                 bits_per_item
             );
@@ -1386,10 +1388,22 @@ mod tests {
     #[test]
     fn iterative_bits_per_item_accessor() {
         let fingerprint_accumulator = FingerprintAccumulator::new(BitPacker(9));
-        assert_eq!(fingerprint_accumulator.fingerprint().bits_packer.bits_per_item(), 9);
+        assert_eq!(
+            fingerprint_accumulator
+                .fingerprint()
+                .bits_packer
+                .bits_per_item(),
+            9
+        );
 
         let fingerprint_accumulator2 = FingerprintAccumulator::new(BitPacker(16));
-        assert_eq!(fingerprint_accumulator2.fingerprint().bits_packer.bits_per_item(), 16);
+        assert_eq!(
+            fingerprint_accumulator2
+                .fingerprint()
+                .bits_packer
+                .bits_per_item(),
+            16
+        );
     }
 
     #[test]

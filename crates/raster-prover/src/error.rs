@@ -7,7 +7,11 @@ pub enum BitPackerError {
     /// BitPacker index is out of bounds.
     IndexOutOfBounds { index: usize, max: usize },
     /// Invalid range for BitPacker operations.
-    InvalidRange { start: usize, end: usize, max: usize },
+    InvalidRange {
+        start: usize,
+        end: usize,
+        max: usize,
+    },
     /// Arrays have different lengths in comparison.
     LengthMismatch { expected: usize, actual: usize },
     /// Failed to serialize data.

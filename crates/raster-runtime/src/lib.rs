@@ -5,8 +5,13 @@
 //! - Optional execution tracing
 //! - Trace capture and storage
 
+pub mod input;
 pub mod tracing;
+pub use input::{parse_program_input, parse_program_input_value, resolve_external_value};
 pub use tracing::{
-    emit_trace_event, finish, init, init_with,
-    subscriber::{ExecutionSubscriber, Subscriber},
+    commitment::Sha256Commitment,
+    finish, init, init_with, publish_trace_event,
+    publisher::{Publisher, TraceEventPublisher},
+    recorder::TraceRecorder,
+    TRACE_EVENT_PREFIX,
 };

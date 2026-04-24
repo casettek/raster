@@ -29,6 +29,6 @@ postcard.workspace = true
 risc0-zkvm = { version = "1.2", default-features = false, features = ["prove", "std"] }
 
 [package.metadata.risc0]
-methods = ["guests/transition"]
+methods = ["guests/transition", "guests/authorization"]
 
 

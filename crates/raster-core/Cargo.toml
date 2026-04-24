@@ -21,6 +21,7 @@ postcard.workspace = true
 serde_json = { workspace = true, optional = true }
 bincode = { workspace = true, optional = true }
 
+
 # linkme is only available on platforms that support it (not RISC-V zkVM)
 [target.'cfg(not(target_arch = "riscv32"))'.dependencies]
 linkme.workspace = true

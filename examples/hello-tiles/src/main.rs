@@ -1,19 +1,13 @@
 use raster::prelude::*;
 
-use hello_tiles::{current_wish, exclaim, greet, raster_wish};
+use hello_tiles::{
+    current_wish, exclaim, greet, input::PersonalData, personal_greet, personal_greet_with_seed,
+    raster_wish,
+};
 
-/// The main sequence that greets and adds emphasis.
-///
-/// This sequence:
-/// 1. Takes a name as input
-/// 2. Generates a greeting with `greet`
-/// 3. Adds emphasis with `exclaim`
-/// 4. Invokes nested sequences for further processing
-///
-/// Run with: `cargo run -- --input '"Raster"'`
-/// Or: `cargo raster preview --input '"Raster"'`
 #[sequence]
 fn greet_sequence(name: String) -> String {
+    call!(personal_greet, external!("personal_data"));
     let greeting = call!(greet, name);
     let e1 = call!(exclaim, greeting);
     let e2 = call!(exclaim, e1);
@@ -37,11 +31,22 @@ fn placeholder_sequence(placeholder: String) -> String {
 
 /// Entry point that runs the greet sequence natively.
 ///
-/// The `name` parameter is parsed from `--input` CLI argument.
-/// Run with: `cargo run -- --input '"YourName"'`
+/// This example resolves committed external inputs from `input.json`:
+/// - `personal_data` is loaded from `personal_data.bin`
+/// - `seed` is provided inline in the JSON document
+///
+/// Each input must have a matching public commitment in `input_manifest.json`.
+/// Run with generated fixtures:
+/// `cargo run -- --input input.json --input-manifest input_manifest.json`
 #[sequence]
-fn main(name: String) {
+fn main() {
     call_seq!(greet_sequence, "Rust".to_string());
-    let name_2 = call_seq!(placeholder_sequence, name);
-    let _result = call_seq!(greet_sequence, name_2);
+    call!(
+        personal_greet_with_seed,
+        external!("personal_data"),
+        external!("seed")
+    );
+    let name_2 = call_seq!(placeholder_sequence, "Placeholder".to_string());
+    let result = call_seq!(greet_sequence, name_2);
+    debug!("main result: {}", result);
 }

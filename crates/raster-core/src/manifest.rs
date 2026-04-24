@@ -1,10 +1,10 @@
 //! Manifest types (requires std feature).
 
+use crate::schema::SequenceSchema;
+use crate::tile::TileMetadata;
+use serde::{Deserialize, Serialize};
 use std::string::String;
 use std::vec::Vec;
-use serde::{Deserialize, Serialize};
-use crate::tile::TileMetadata;
-use crate::schema::SequenceSchema;
 
 /// Project-level manifest describing all tiles and sequences.
 #[derive(Debug, Clone, Serialize, Deserialize)]

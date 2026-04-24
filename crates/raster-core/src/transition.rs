@@ -7,9 +7,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::vec::Vec;
 
+use crate::authorization::AuthorizationJournal;
 use crate::cfs::CfsCoordinates;
 use crate::fingerprint::{Fingerprint, FingerprintAccumulator};
-use crate::trace::StepRecord;
+use crate::trace::{ExternalInput, StepRecord};
 
 /// Serializable representation of a Merkle frontier (position, leaf, ommers).
 ///
@@ -45,7 +46,15 @@ pub struct StepRecordWitness {
 pub struct TransitionInput {
     pub step_record: StepRecord,
     pub replay_image_id: Option<Vec<u8>>,
-    pub witness: HashMap<StepRecord, Vec<u8>>,
+
+    pub input_witness: Option<Vec<u8>>,
+    pub output_witness: Option<Vec<u8>>,
+    pub external_input: ExternalInput,
+
+    pub input_sources_witnesses: HashMap<StepRecord, Vec<u8>>,
+
+    pub authorization_image_id: Vec<u8>,
+    pub authorization_journal: AuthorizationJournal,
 }
 
 /// Result of applying one transition (new frontier and fingerprint state).
@@ -76,5 +85,7 @@ pub enum TransitionState {
 pub struct TransitionJournal {
     pub init_state: InitTransition,
     pub current_state: TransitionState,
-    pub self_image_id: Vec<u8>,
+    pub transition_image_id: Vec<u8>,
+    pub authorization_image_id: Vec<u8>,
+    pub manifest_commitment: Vec<u8>,
 }
