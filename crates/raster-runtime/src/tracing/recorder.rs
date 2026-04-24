@@ -1,7 +1,8 @@
 use raster_core::cfs::{CfsCoordinates, CfsCursor, ControlFlowSchema, SequenceChildId};
 use raster_core::trace::{
-    SequenceEndRecord, SequenceStartRecord, StepRecord, TileExecRecord, TraceEvent,
+    ExternalInput, SequenceEndRecord, SequenceStartRecord, StepRecord, TileExecRecord, TraceEvent,
 };
+use sha2::{Digest, Sha256};
 
 use std::collections::{HashMap, VecDeque};
 
@@ -74,6 +75,7 @@ impl SequenceCallstack {
 pub struct TraceIO {
     input_data: Option<Vec<u8>>,
     output_data: Option<Vec<u8>>,
+    external_input: ExternalInput,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -90,8 +92,13 @@ impl TraceIOStore {
                 self.0.insert(
                     coordinates,
                     TraceIO {
-                        input_data: trace_item.input.as_ref().map(|input| input.data.clone()),
+                        input_data: trace_item.input.as_ref().map(|input| input.data().to_vec()),
                         output_data: None,
+                        external_input: trace_item
+                            .input
+                            .as_ref()
+                            .map(|input| input.external().clone())
+                            .unwrap_or_default(),
                     },
                 );
             }
@@ -103,8 +110,16 @@ impl TraceIOStore {
                 self.0.insert(
                     coordinates,
                     TraceIO {
-                        input_data: trace_item.input.as_ref().map(|input| input.data.clone()),
-                        output_data: trace_item.output.as_ref().map(|output| output.data.clone()),
+                        input_data: trace_item.input.as_ref().map(|input| input.data().to_vec()),
+                        output_data: trace_item
+                            .output
+                            .as_ref()
+                            .map(|output| output.data().to_vec()),
+                        external_input: trace_item
+                            .input
+                            .as_ref()
+                            .map(|input| input.external().clone())
+                            .unwrap_or_default(),
                     },
                 );
             }
@@ -114,6 +129,11 @@ impl TraceIOStore {
     pub fn get(&self, coordinates: &CfsCoordinates) -> Option<&TraceIO> {
         self.0.get(coordinates)
     }
+}
+
+fn external_input_commitment(external_input: &ExternalInput) -> Vec<u8> {
+    let bytes = raster_core::postcard::to_allocvec(external_input).unwrap_or_default();
+    Sha256::digest(bytes).to_vec()
 }
 
 #[derive(Debug, Clone)]
@@ -149,11 +169,12 @@ impl TraceRecorder {
     pub fn io_data_at(
         &self,
         coordinates: &CfsCoordinates,
-    ) -> Option<(Option<Vec<u8>>, Option<Vec<u8>>)> {
+    ) -> Option<(Option<Vec<u8>>, Option<Vec<u8>>, ExternalInput)> {
         self.io_store.get(coordinates).map(|trace_io| {
             (
                 trace_io.input_data.clone(),
                 trace_io.output_data.clone(),
+                trace_io.external_input.clone(),
             )
         })
     }
@@ -174,12 +195,17 @@ impl TraceRecorder {
                     .as_ref()
                     .map(|output| Sha256Commitment::from(output).into())
                     .unwrap_or_default();
+                let external_input_commitment = input
+                    .as_ref()
+                    .map(|input| external_input_commitment(input.external()))
+                    .unwrap_or_default();
 
                 let record = SequenceStartRecord {
                     exec_index,
                     sequence_id: fn_call_record.fn_name.clone(),
                     coordinates: coordinates.clone(),
                     input_commitment,
+                    external_input_commitment,
                 };
 
                 self.io_store.insert(coordinates, event.clone());
@@ -235,6 +261,10 @@ impl TraceRecorder {
                     .as_ref()
                     .map(|input| Sha256Commitment::from(input).into())
                     .unwrap_or_default();
+                let external_input_commitment = input
+                    .as_ref()
+                    .map(|input| external_input_commitment(input.external()))
+                    .unwrap_or_default();
 
                 let output = fn_call_record.output;
                 let output_commitment = output
@@ -249,6 +279,7 @@ impl TraceRecorder {
                     intra_sequence_index: parent_current_index,
                     coordinates: tile_coordinates.clone(),
                     input_commitment,
+                    external_input_commitment,
                     output_commitment,
                 };
 

@@ -20,7 +20,6 @@ postcard.workspace = true
 # Optional std-only dependencies
 serde_json = { workspace = true, optional = true }
 bincode = { workspace = true, optional = true }
-sha2 = { workspace = true, optional = true }
 
 
 # linkme is only available on platforms that support it (not RISC-V zkVM)

@@ -13,12 +13,39 @@ use alloc::format;
 use alloc::string::String;
 use raster::prelude::*;
 
+use crate::input::PersonalData;
+
+pub mod input;
+
 /// A simple tile that greets a user by name.
 ///
 /// This tile takes a String input and returns a greeting.
 #[tile(kind = iter)]
 pub fn greet(name: String) -> String {
     format!("Hello, {}!!!!", name)
+}
+
+#[tile(kind=iter)]
+pub fn personal_greet(
+    #[external(name = "personal_data")] personal_data: External<PersonalData>,
+) -> String {
+    let greet = format!("Hello, {}!!!!", personal_data.name);
+    debug!("greet: {}", greet);
+
+    greet
+}
+
+/// A greeting tile that resolves both committed example inputs:
+/// file-backed `personal_data` and inline `seed`.
+#[tile(kind=iter)]
+pub fn personal_greet_with_seed(
+    #[external(name = "personal_data")] personal_data: External<PersonalData>,
+    #[external(name = "seed")] seed: External<u64>,
+) -> String {
+    let greet = format!("Hello, {}!!!! (seed: {})", personal_data.name, seed);
+    debug!("seeded greet: {}", greet);
+
+    greet
 }
 
 /// A tile that adds emphasis to a message.

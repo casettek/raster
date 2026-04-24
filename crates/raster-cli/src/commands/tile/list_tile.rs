@@ -1,7 +1,7 @@
-use raster_core::Result;
-use raster_compiler::Project;
-use raster_compiler::tile::TileDiscovery;
 use crate::commands::project_path;
+use raster_compiler::tile::TileDiscovery;
+use raster_compiler::Project;
+use raster_core::Result;
 
 /// List command: show all registered tiles.
 pub fn list_tiles() -> Result<()> {
@@ -25,4 +25,3 @@ pub fn list_tiles() -> Result<()> {
 
     Ok(())
 }
-

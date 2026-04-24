@@ -1,6 +1,6 @@
 //! Run command: build and execute the user program as a whole.
 
-use rand::seq::IndexedMutRandom;
+use rand::seq::IteratorRandom;
 use raster_backend::backend::HexString;
 use rayon::prelude::*;
 
@@ -8,22 +8,18 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
-use std::thread;
 
 use raster_backend::{Backend, ExecutionMode};
 use raster_backend_risc0::Risc0Backend;
 
-use raster_compiler::tile::TileDiscovery;
 use raster_compiler::{CfsBuilder, Project};
 
 use raster_core::cfs::{CfsCoordinates, CfsCursor, ControlFlowSchema};
-use raster_core::tile::TileId;
-use raster_core::trace::{StepRecord, Trace, TraceEvent, TraceWindow};
-use raster_core::transition::TransitionJournal;
+use raster_core::trace::{ExternalInput, StepRecord, Trace, TraceEvent, TraceWindow};
 use raster_core::{Error, Result};
 
+use raster_prover::authorization::authorize_external_inputs;
 use raster_prover::precomputed::EMPTY_TRIE_NODES;
 use raster_prover::replay::{ReplayResult, Replayer};
 use raster_prover::trace::{
@@ -32,11 +28,13 @@ use raster_prover::trace::{
 use raster_prover::transition::step_transitions;
 use raster_runtime::{TraceRecorder, TRACE_EVENT_PREFIX};
 
+use crate::utils::authorization::{build_manifested_inputs, read_external_inputs};
 use crate::BackendType;
 
 pub fn run(
     backend_type: BackendType,
     input: Option<&str>,
+    input_manifest: Option<&str>,
     commit_flag: Option<&str>,
     audit_flag: Option<&str>,
     verbose: bool,
@@ -90,6 +88,9 @@ pub fn run(
     if let Some(input_json) = input {
         cmd.args(["--input", input_json]);
     }
+    if let Some(manifest_json) = input_manifest {
+        cmd.args(["--input-manifest", manifest_json]);
+    }
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
@@ -136,7 +137,6 @@ pub fn run(
         }
     });
     handles.push(stdout_handle);
-
 
     let mut errors = Arc::new(Mutex::new(Vec::new()));
     let mut thread_errors = Arc::clone(&errors);
@@ -257,8 +257,18 @@ pub fn run(
             VerificationResult::Ok => println!("Verification Success"),
             VerificationResult::Fraud(fraud_evidence) => {
                 let replayer = Replayer::new(&backend, &project);
-                let _fraud_proof = prove(fraud_evidence, &cfs, &trace_recorder, &replayer);
-                println!("Faurd proof generated");
+                let fraud_proof = prove(
+                    fraud_evidence,
+                    &cfs,
+                    &trace_recorder,
+                    &replayer,
+                    input_manifest,
+                );
+                let fraud_proof_path = write_fraud_proof(&fraud_proof, commit_path);
+                println!(
+                    "Fraud proof generated: {}",
+                    fraud_proof_path.display()
+                );
             }
         }
     } else {
@@ -306,7 +316,17 @@ pub fn fraud(trace: &mut Trace, commit_path: &str) {
         std::fs::File::create(commit_path).expect("Failed to create commitemt file");
 
     let mut rng = rand::rng();
-    if let Some(fraud_step) = trace.choose_mut(&mut rng) {
+    if let Some(fraud_step) = trace
+        .iter_mut()
+        .filter(|step_record| {
+            matches!(
+                step_record,
+                StepRecord::TileExec(tile_exec_record)
+                    if !tile_exec_record.external_input_commitment.is_empty()
+            )
+        })
+        .choose(&mut rng)
+    {
         match fraud_step {
             StepRecord::TileExec(tile_exec_record) => {
                 tile_exec_record.output_commitment = vec![0u8, 1u8];
@@ -349,24 +369,49 @@ pub fn verify(trace: &Trace, commit_path: &str, cfs: &ControlFlowSchema) -> Veri
     trace_verifier.verify(trace)
 }
 
+pub fn fraud_proof_path(commit_path: &str) -> PathBuf {
+    let path = PathBuf::from(commit_path);
+    let mut file_name = path
+        .file_name()
+        .map(|name| name.to_os_string())
+        .unwrap_or_else(|| std::ffi::OsString::from("fraud-proof"));
+    file_name.push(".fraud-proof");
+    path.with_file_name(file_name)
+}
+
+pub fn write_fraud_proof(receipt: &risc0_zkvm::Receipt, commit_path: &str) -> PathBuf {
+    let proof_path = fraud_proof_path(commit_path);
+    let mut proof_file =
+        std::fs::File::create(&proof_path).expect("Failed to create fraud proof file");
+    let bytes = postcard::to_allocvec(receipt).expect("Failed to serialize fraud proof");
+
+    proof_file
+        .write_all(&bytes)
+        .expect("Failed to save fraud proof");
+
+    proof_path
+}
+
 pub fn prove(
     fraud_evidence: FraudEvidence,
     cfs: &ControlFlowSchema,
     trace_recorder: &TraceRecorder,
     replayer: &Replayer,
+    input_manifest: Option<&str>,
 ) -> risc0_zkvm::Receipt {
     let mode = ExecutionMode::prove_and_verify();
     let FraudEvidence {
         window: fraud_window,
-        witness,
+        input_sources_witnesses,
     } = fraud_evidence;
-
     let mut replayed_results: HashMap<StepRecord, ReplayResult> = HashMap::new();
-    let mut recorded_step_io: HashMap<StepRecord, (Option<Vec<u8>>, Option<Vec<u8>>)> =
-        HashMap::new();
+    let mut recorded_step_io: HashMap<
+        StepRecord,
+        (Option<Vec<u8>>, Option<Vec<u8>>, ExternalInput),
+    > = HashMap::new();
 
     for step_record in &fraud_window.items {
-        let recorded_io = trace_recorder
+        let (input_witness, output_witness, external_input) = trace_recorder
             .io_data_at(step_record.coordinates())
             .unwrap_or_else(|| {
                 panic!(
@@ -374,12 +419,15 @@ pub fn prove(
                     step_record.coordinates()
                 )
             });
-        let recorded_input = recorded_io.0.clone();
-        recorded_step_io.insert(step_record.clone(), recorded_io);
+        let input_witness = input_witness.clone();
+        recorded_step_io.insert(
+            step_record.clone(),
+            (input_witness.clone(), output_witness, external_input),
+        );
 
-        if let StepRecord::TileExec(tile_exec) = step_record {
-            let replay_input = recorded_input.unwrap_or_default();
-            match replayer.replay(tile_exec, replay_input.as_slice(), mode) {
+        if let StepRecord::TileExec(record) = step_record {
+            let replay_input = input_witness.unwrap_or_default();
+            match replayer.replay(record, replay_input.as_slice(), mode) {
                 Ok(replay_result) => {
                     replayed_results.insert(step_record.clone(), replay_result);
                 }
@@ -390,6 +438,13 @@ pub fn prove(
         }
     }
 
+    let manifested_inputs =
+        build_manifested_inputs(input_manifest, read_external_inputs(&recorded_step_io))
+            .unwrap_or_else(|e| panic!("Failed to load authorization source: {}", e));
+
+    let (authorization_receipt, authorization_journal) =
+        authorize_external_inputs(&manifested_inputs);
+
     if let Some(frontier) = SerializableFrontier::from_bytes(&fraud_window.frontier) {
         println!();
         println!("Replaying transition frontier with transition guest...");
@@ -399,9 +454,11 @@ pub fn prove(
             &fraud_window.items,
             fraud_window.fingerprint,
             &cfs,
-            &witness,
+            &input_sources_witnesses,
             &recorded_step_io,
             &replayed_results,
+            &authorization_journal,
+            &authorization_receipt,
         ) else {
             panic!("Failed to generate fraud proof");
         };

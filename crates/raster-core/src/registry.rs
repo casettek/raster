@@ -6,10 +6,10 @@
 //!
 //! This module requires the `std` feature.
 
-use std::vec::Vec;
 use crate::tile::{TileId, TileIdStatic, TileMetadata, TileMetadataStatic};
 use crate::Result;
 use linkme::distributed_slice;
+use std::vec::Vec;
 
 /// The function signature for a tile's ABI entry point.
 ///
@@ -80,9 +80,7 @@ pub fn iter_tiles() -> impl Iterator<Item = &'static TileRegistration> {
 
 /// Find a tile by its ID.
 pub fn find_tile(id: &TileId) -> Option<&'static TileRegistration> {
-    TILE_REGISTRY
-        .iter()
-        .find(|reg| reg.metadata.id.0 == id.0)
+    TILE_REGISTRY.iter().find(|reg| reg.metadata.id.0 == id.0)
 }
 
 /// Find a tile by its static ID.
@@ -133,8 +131,16 @@ pub struct SequenceMetadataStatic {
 
 impl SequenceMetadataStatic {
     /// Create new static sequence metadata.
-    pub const fn new(id: &'static str, name: &'static str, description: Option<&'static str>) -> Self {
-        Self { id, name, description }
+    pub const fn new(
+        id: &'static str,
+        name: &'static str,
+        description: Option<&'static str>,
+    ) -> Self {
+        Self {
+            id,
+            name,
+            description,
+        }
     }
 }
 
