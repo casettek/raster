@@ -1,13 +1,13 @@
 use raster::prelude::*;
 
 use hello_tiles::{
-    current_wish, exclaim, greet, input::PersonalData, personal_greet, personal_greet_with_seed,
+    current_wish, exclaim, greet, greet_address_line, personal_greet, personal_greet_with_seed,
     raster_wish,
 };
 
 #[sequence]
 fn greet_sequence(name: String) -> String {
-    call!(personal_greet, external!("personal_data"));
+    call!(personal_greet, external!("personal_data", select!("name")));
     let greeting = call!(greet, name);
     let e1 = call!(exclaim, greeting);
     let e2 = call!(exclaim, e1);
@@ -32,7 +32,7 @@ fn placeholder_sequence(placeholder: String) -> String {
 /// Entry point that runs the greet sequence natively.
 ///
 /// This example resolves committed external inputs from `input.json`:
-/// - `personal_data` is loaded from `personal_data.bin`
+/// - `personal_data.name` and `personal_data.address_lines[0]` are selected from inline JSON
 /// - `seed` is provided inline in the JSON document
 ///
 /// Each input must have a matching public commitment in `input_manifest.json`.
@@ -43,8 +43,12 @@ fn main() {
     call_seq!(greet_sequence, "Rust".to_string());
     call!(
         personal_greet_with_seed,
-        external!("personal_data"),
+        external!("personal_data", select!("name")),
         external!("seed")
+    );
+    call!(
+        greet_address_line,
+        external!("personal_data", select!("address_lines", 0))
     );
     let name_2 = call_seq!(placeholder_sequence, "Placeholder".to_string());
     let result = call_seq!(greet_sequence, name_2);

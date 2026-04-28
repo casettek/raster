@@ -1,5 +1,4 @@
 use hello_tiles::input::PersonalData;
-use raster::core::postcard;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::error::Error;
@@ -21,27 +20,28 @@ fn main() -> Result<(), Box<dyn Error>> {
     let data = PersonalData {
         age: 25,
         name: "John".to_string(),
+        address_lines: vec!["221B Baker Street".to_string(), "Flat B".to_string()],
     };
 
-    let bytes = postcard::to_allocvec(&data)?;
+    let personal_data_json = serde_json::to_value(&data)?;
+    let bytes = serde_json::to_vec(&personal_data_json)?;
     let hash = sha256_hex(&bytes);
     let seed_bytes = serde_json::to_vec(&json!(123u64))?;
     let seed_hash = sha256_hex(&seed_bytes);
-    let bin_path = out_dir.join("personal_data.bin");
     let input_path = out_dir.join("input.json");
     let manifest_path = out_dir.join("input_manifest.json");
 
     fs::create_dir_all(&out_dir)?;
-    fs::write(&bin_path, bytes)?;
     fs::write(
         &input_path,
         format!(
             concat!(
                 "{{\n",
-                "  \"personal_data\": {{ \"path\": \"personal_data.bin\" }},\n",
+                "  \"personal_data\": {},\n",
                 "  \"seed\": 123\n",
                 "}}\n"
             ),
+            serde_json::to_string_pretty(&personal_data_json)?,
         ),
     )?;
     fs::write(
@@ -57,7 +57,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         ),
     )?;
 
-    println!("Wrote {}", bin_path.display());
     println!("Wrote {}", input_path.display());
     println!("Wrote {}", manifest_path.display());
 

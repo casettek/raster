@@ -620,6 +620,7 @@ mod tests {
                 name: binding_name.to_string(),
                 commitment: commitment.to_vec(),
                 data: payload_data.to_vec(),
+                selector: Default::default(),
             },
         )]
         .into_iter()

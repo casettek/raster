@@ -15,7 +15,11 @@ extern crate std;
 pub use raster_core as core;
 
 pub mod input;
-pub use input::{external, resolve_external_value, External, ExternalRef};
+pub use input::{
+    external, external_with_selector, into_resolved_arg, resolve_external_value, select, ArgKind,
+    External, ExternalArg, ExternalArgInfo, ExternalRef, ExternalSelection, IntoResolvedArg, ResolvedArg,
+    SelectorPath, SelectorSegment,
+};
 
 pub use raster_macros::{sequence, tile};
 
@@ -73,6 +77,23 @@ macro_rules! external {
     };
     ($name:expr) => {
         $crate::external($name)
+    };
+    ($name:expr, $selector:expr) => {
+        $crate::external_with_selector($name, $selector)
+    };
+    ($name:literal, $selector:expr) => {
+        $crate::external_with_selector($name, $selector)
+    };
+}
+
+#[macro_export]
+macro_rules! select {
+    ($($segment:expr),+ $(,)?) => {
+        $crate::select($crate::alloc::vec![
+            $(
+                $crate::SelectorSegment::from($segment),
+            )*
+        ])
     };
 }
 
@@ -139,7 +160,11 @@ pub mod prelude {
         tile_count, SequenceMetadataStatic, SequenceRegistration, TileRegistration,
     };
 
-    pub use crate::{call, call_seq, debug, external, sequence, tile};
+    pub use crate::{
+        call, call_seq, debug, external, select, sequence, tile, ArgKind, ExternalArg,
+        ExternalArgInfo, ExternalSelection, IntoResolvedArg, ResolvedArg, SelectorPath,
+        SelectorSegment,
+    };
 
     // TODO: Re-enable once Executor/Tracer types are implemented
     // #[cfg(feature = "std")]

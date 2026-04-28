@@ -1,6 +1,7 @@
 use raster_core::input::{
-    External, ExternalInputManifestEntry, ExternalInputPathEntry, ExternalValue, InputDocument,
-    InputDocumentEntry, InputManifestDocument, InputManifestEntry,
+    ExternalInputManifestEntry, ExternalInputPathEntry, ExternalSelection, ExternalValue,
+    InputDocument, InputDocumentEntry, InputManifestDocument, InputManifestEntry, SelectorPath,
+    SelectorSegment,
 };
 use raster_core::{Error, Result};
 use serde::{de::DeserializeOwned, Serialize};
@@ -248,6 +249,7 @@ fn resolve_cached_external(
 
 fn deserialize_external_value<T: DeserializeOwned>(
     name: &str,
+    selector: SelectorPath,
     resolved: ResolvedExternalInput,
 ) -> Result<ExternalValue<T>> {
     let commitment = resolved.commitment().to_string();
@@ -273,10 +275,37 @@ fn deserialize_external_value<T: DeserializeOwned>(
 
     Ok(ExternalValue::new(
         name,
+        selector,
         Some(commitment),
         bytes,
         value,
     ))
+}
+
+fn select_json_value(root: &Value, selector: &SelectorPath) -> Result<Value> {
+    let mut current = root;
+
+    for segment in &selector.segments {
+        current = match segment {
+            SelectorSegment::Field(field) => current.get(field).ok_or_else(|| {
+                Error::Other(format!(
+                    "Selector field '{}' was not found in inline external input",
+                    field
+                ))
+            })?,
+            SelectorSegment::Index(index) => current
+                .as_array()
+                .and_then(|items| items.get(*index as usize))
+                .ok_or_else(|| {
+                    Error::Other(format!(
+                        "Selector index '{}' was not found in inline external input",
+                        index
+                    ))
+                })?,
+        };
+    }
+
+    Ok(current.clone())
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -351,15 +380,17 @@ pub fn parse_program_input_value<T: DeserializeOwned>(name: Option<&str>) -> Opt
 }
 
 pub fn resolve_external_value<T: DeserializeOwned + Serialize>(
-    reference: External<T>,
-    expected_name: &str,
+    reference: ExternalSelection,
+    expected_name: Option<&str>,
 ) -> Result<ExternalValue<T>> {
-    if reference.name() != expected_name {
-        return Err(Error::Other(format!(
-            "External input mismatch: tile expected '{}', but call site provided '{}'",
-            expected_name,
-            reference.name()
-        )));
+    if let Some(expected_name) = expected_name {
+        if reference.name() != expected_name {
+            return Err(Error::Other(format!(
+                "External input mismatch: tile expected '{}', but call site provided '{}'",
+                expected_name,
+                reference.name()
+            )));
+        }
     }
 
     let sources = load_external_input_sources()?.ok_or_else(|| {
@@ -369,8 +400,38 @@ pub fn resolve_external_value<T: DeserializeOwned + Serialize>(
         )
     })?;
 
-    let resolved = resolve_cached_external(expected_name, &sources)?;
-    deserialize_external_value(expected_name, resolved)
+    let resolved = resolve_cached_external(reference.name(), &sources)?;
+    if reference.selector().is_empty() {
+        return deserialize_external_value(reference.name(), reference.selector().clone(), resolved);
+    }
+
+    match sources.get_input_entry(reference.name()) {
+        Some(InputDocumentEntry::Inline(value)) => {
+            let selected_value = select_json_value(value, reference.selector())?;
+            let selected: T = serde_json::from_value(selected_value).map_err(|e| {
+                Error::Serialization(format!(
+                    "Failed to deserialize selected external input '{}' from JSON value: {}",
+                    reference.name(),
+                    e
+                ))
+            })?;
+            Ok(ExternalValue::new(
+                reference.name(),
+                reference.selector().clone(),
+                Some(resolved.commitment().to_string()),
+                resolved.bytes().to_vec(),
+                selected,
+            ))
+        }
+        Some(InputDocumentEntry::Path { .. }) => Err(Error::Other(format!(
+            "External selector for '{}' currently requires an inline JSON input source",
+            reference.name()
+        ))),
+        None => Err(Error::Other(format!(
+            "Missing external input '{}'. Expected a top-level input document field.",
+            reference.name()
+        ))),
+    }
 }
 
 #[cfg(test)]
@@ -572,7 +633,9 @@ mod tests {
             ExternalInputSources::from_input_args(input_path.to_str(), manifest_path.to_str())
                 .unwrap();
         let resolved = resolve_cached_external("seed", &sources).unwrap();
-        let value = deserialize_external_value::<u64>("seed", resolved.clone()).unwrap();
+        let value =
+            deserialize_external_value::<u64>("seed", SelectorPath::default(), resolved.clone())
+                .unwrap();
 
         assert_eq!(resolved.bytes(), inline_bytes.as_slice());
         assert_eq!(resolved.commitment(), hash);
@@ -591,8 +654,9 @@ mod tests {
 
     #[test]
     fn resolve_external_value_errors_without_cli_context() {
-        let err = resolve_external_value::<Flight>(External::new("flight_data"), "flight_data")
-            .expect_err("missing CLI context should fail");
+        let err =
+            resolve_external_value::<Flight>(ExternalSelection::new("flight_data"), Some("flight_data"))
+                .expect_err("missing CLI context should fail");
 
         assert_eq!(
             err.to_string(),

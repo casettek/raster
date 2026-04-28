@@ -6,4 +6,5 @@ use serde::{Deserialize, Serialize};
 pub struct PersonalData {
     pub age: usize,
     pub name: String,
+    pub address_lines: alloc::vec::Vec<String>,
 }

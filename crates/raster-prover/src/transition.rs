@@ -195,6 +195,7 @@ mod tests {
                 name: binding_name.to_string(),
                 commitment: commitment.to_vec(),
                 data: data.to_vec(),
+                selector: Default::default(),
             },
         )])
         .into_iter()

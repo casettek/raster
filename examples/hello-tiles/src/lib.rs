@@ -13,8 +13,6 @@ use alloc::format;
 use alloc::string::String;
 use raster::prelude::*;
 
-use crate::input::PersonalData;
-
 pub mod input;
 
 /// A simple tile that greets a user by name.
@@ -26,24 +24,27 @@ pub fn greet(name: String) -> String {
 }
 
 #[tile(kind=iter)]
-pub fn personal_greet(
-    #[external(name = "personal_data")] personal_data: External<PersonalData>,
-) -> String {
-    let greet = format!("Hello, {}!!!!", personal_data.name);
+pub fn personal_greet(name: String) -> String {
+    let greet = format!("Hello, {}!!!!", name);
     debug!("greet: {}", greet);
 
     greet
 }
 
 /// A greeting tile that resolves both committed example inputs:
-/// file-backed `personal_data` and inline `seed`.
+/// inline-selected `personal_data.name` and inline `seed`.
 #[tile(kind=iter)]
-pub fn personal_greet_with_seed(
-    #[external(name = "personal_data")] personal_data: External<PersonalData>,
-    #[external(name = "seed")] seed: External<u64>,
-) -> String {
-    let greet = format!("Hello, {}!!!! (seed: {})", personal_data.name, seed);
+pub fn personal_greet_with_seed(name: String, seed: u64) -> String {
+    let greet = format!("Hello, {}!!!! (seed: {})", name, seed);
     debug!("seeded greet: {}", greet);
+
+    greet
+}
+
+#[tile(kind=iter)]
+pub fn greet_address_line(address_line: String) -> String {
+    let greet = format!("Address line: {}", address_line);
+    debug!("address line: {}", greet);
 
     greet
 }

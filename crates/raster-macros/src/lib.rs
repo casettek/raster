@@ -63,10 +63,6 @@ fn filter_external_attrs(attrs: &[Attribute]) -> Vec<Attribute> {
         .collect()
 }
 
-fn external_param_ty(ty: &Type) -> Type {
-    syn::parse2(quote! { ::raster::External<#ty> }).expect("external wrapper type should parse")
-}
-
 fn extract_external_payload_ty(ty: &Type) -> Option<Type> {
     let Type::Path(type_path) = ty else {
         return None;
@@ -85,16 +81,17 @@ fn extract_external_payload_ty(ty: &Type) -> Option<Type> {
     Some(inner_ty.clone())
 }
 
-fn exposed_external_param_ty(ty: &Type) -> Type {
-    extract_external_payload_ty(ty)
-        .map_or_else(|| external_param_ty(ty), |inner| external_param_ty(&inner))
-}
-
 fn resolved_external_param_ty(ty: &Type) -> Type {
     extract_external_payload_ty(ty).unwrap_or_else(|| ty.clone())
 }
 
-fn rewrite_exposed_external_inputs(sig: &mut syn::Signature, params: &[ParamInfo]) {
+fn call_boundary_param_ty(ty: &Type) -> Type {
+    let resolved_ty = resolved_external_param_ty(ty);
+    syn::parse2(quote! { impl ::raster::IntoResolvedArg<#resolved_ty> })
+        .expect("call boundary type should parse")
+}
+
+fn rewrite_call_boundary_inputs(sig: &mut syn::Signature, params: &[ParamInfo]) {
     for arg in sig.inputs.iter_mut() {
         if let FnArg::Typed(pat_type) = arg {
             pat_type.attrs = filter_external_attrs(&pat_type.attrs);
@@ -102,13 +99,11 @@ fn rewrite_exposed_external_inputs(sig: &mut syn::Signature, params: &[ParamInfo
     }
 
     for param in params {
-        if param.external_name.is_some() {
-            for arg in sig.inputs.iter_mut() {
-                if let FnArg::Typed(pat_type) = arg {
-                    if let Pat::Ident(pat_ident) = &*pat_type.pat {
-                        if pat_ident.ident == param.ident {
-                            pat_type.ty = Box::new(exposed_external_param_ty(&param.ty));
-                        }
+        for arg in sig.inputs.iter_mut() {
+            if let FnArg::Typed(pat_type) = arg {
+                if let Pat::Ident(pat_ident) = &*pat_type.pat {
+                    if pat_ident.ident == param.ident {
+                        pat_type.ty = Box::new(call_boundary_param_ty(&param.ty));
                     }
                 }
             }
@@ -138,65 +133,43 @@ fn rewrite_resolved_external_inputs(sig: &mut syn::Signature, params: &[ParamInf
     }
 }
 
-fn external_hash_ident(param: &ParamInfo) -> syn::Ident {
-    format_ident!("__raster_external_hash_{}", param.ident)
+fn external_info_ident(param: &ParamInfo) -> syn::Ident {
+    format_ident!("__raster_external_info_{}", param.ident)
 }
 
-fn external_bytes_ident(param: &ParamInfo) -> syn::Ident {
-    format_ident!("__raster_external_bytes_{}", param.ident)
-}
-
-fn gen_external_resolution(input: &ItemFn) -> proc_macro2::TokenStream {
+fn gen_arg_resolution(input: &ItemFn) -> proc_macro2::TokenStream {
     let params = extract_inputs(input);
     let is_result = returns_result(input);
     let resolutions: Vec<_> = params
         .iter()
-        .filter_map(|param| {
-            let external_name = param.external_name.as_ref()?;
+        .map(|param| {
             let name = &param.ident;
             let resolved_ty = resolved_external_param_ty(&param.ty);
-            let hash_ident = external_hash_ident(param);
-            let bytes_ident = external_bytes_ident(param);
+            let external_info_ident = external_info_ident(param);
+            let expected_name = match param.external_name.as_ref() {
+                Some(name) => quote! { ::core::option::Option::Some(#name) },
+                None => quote! { ::core::option::Option::None },
+            };
             let resolve = if is_result {
                 quote! {
-                    ::raster::resolve_external_value::<#resolved_ty>(#name, #external_name)?
+                    ::raster::into_resolved_arg::<#resolved_ty, _>(#name, #expected_name)?
                 }
             } else {
                 quote! {
-                    ::raster::resolve_external_value::<#resolved_ty>(#name, #external_name)
-                        .unwrap_or_else(|e| panic!("Failed to resolve external input '{}': {}", #external_name, e))
+                    ::raster::into_resolved_arg::<#resolved_ty, _>(#name, #expected_name)
+                        .unwrap_or_else(|e| panic!("Failed to resolve call argument '{}': {}", stringify!(#name), e))
                 }
             };
-            Some(quote! {
-                let __raster_external_value = #resolve;
-                let #hash_ident = __raster_external_value.commitment.clone();
-                let #bytes_ident = __raster_external_value.bytes.clone();
-                let #name: #resolved_ty = __raster_external_value.into_inner();
-            })
+            quote! {
+                let __raster_resolved_arg = #resolve;
+                let #external_info_ident = __raster_resolved_arg.external_info().cloned();
+                let #name: #resolved_ty = __raster_resolved_arg.into_inner();
+            }
         })
         .collect();
 
     quote! {
         #(#resolutions)*
-    }
-}
-
-fn gen_wrapper_external_unpack(input: &ItemFn) -> proc_macro2::TokenStream {
-    let unpack_steps: Vec<_> = extract_inputs(input)
-        .into_iter()
-        .filter_map(|param| {
-            let external_name = param.external_name?;
-            let name = param.ident;
-            let ty = resolved_external_param_ty(&param.ty);
-            let _ = external_name;
-            Some(quote! {
-                let #name: #ty = #name.into_inner();
-            })
-        })
-        .collect();
-
-    quote! {
-        #(#unpack_steps)*
     }
 }
 
@@ -219,15 +192,7 @@ fn gen_inputs_deserialization(input: &ItemFn) -> proc_macro2::TokenStream {
     } else if params.len() == 1 {
         // Single argument - deserialize directly
         let param = &params[0];
-        let decode_ty = if let Some(_external_name) = &param.external_name {
-            let ty = resolved_external_param_ty(&param.ty);
-            quote! {
-                ::raster::core::input::ExternalValue<#ty>
-            }
-        } else {
-            let ty = &param.ty;
-            quote! { #ty }
-        };
+        let decode_ty = resolved_external_param_ty(&param.ty);
         let name = &param.ident;
         quote! {
             let #name: #decode_ty = ::raster::core::postcard::from_bytes(input)
@@ -238,13 +203,8 @@ fn gen_inputs_deserialization(input: &ItemFn) -> proc_macro2::TokenStream {
         let decode_types: Vec<_> = params
             .iter()
             .map(|param| {
-                if param.external_name.is_some() {
-                    let ty = resolved_external_param_ty(&param.ty);
-                    quote! { ::raster::core::input::ExternalValue<#ty> }
-                } else {
-                    let ty = &param.ty;
-                    quote! { #ty }
-                }
+                let ty = resolved_external_param_ty(&param.ty);
+                quote! { #ty }
             })
             .collect();
         let names: Vec<_> = params.iter().map(|param| &param.ident).collect();
@@ -271,18 +231,13 @@ fn gen_output_serialization(_input: &ItemFn) -> proc_macro2::TokenStream {
 /// This serializes the typed input parameters to bytes for the trace emission.
 fn gen_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream {
     let params = extract_inputs(input);
-    let has_external_inputs = params.iter().any(|param| param.external_name.is_some());
 
     let input_arg_defs: Vec<_> = params
         .iter()
         .map(|param| {
             let name = &param.ident;
             let name_str = name.to_string();
-            let ty = if param.external_name.is_some() {
-                resolved_external_param_ty(&param.ty)
-            } else {
-                param.ty.clone()
-            };
+            let ty = resolved_external_param_ty(&param.ty);
             let ty_str = ty.to_token_stream().to_string();
             quote! {
                 ::raster::core::trace::FnInputArg {
@@ -295,24 +250,25 @@ fn gen_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream {
 
     let external_binding_entries: Vec<_> = params
         .iter()
-        .filter_map(|param| {
-            let external_name = param.external_name.as_ref()?;
+        .map(|param| {
             let name_str = param.ident.to_string();
-            let hash_ident = external_hash_ident(param);
-            let bytes_ident = external_bytes_ident(param);
-            Some(quote! {
-                (
-                    ::raster::alloc::string::String::from(#name_str),
-                    ::raster::core::trace::ExternalBinding {
-                        name: ::raster::alloc::string::String::from(#external_name),
-                        commitment: #hash_ident
-                            .clone()
-                            .map(|value| value.into_bytes())
-                            .unwrap_or_default(),
-                        data: #bytes_ident.clone(),
-                    }
-                )
-            })
+            let external_info_ident = external_info_ident(param);
+            quote! {
+                if let ::core::option::Option::Some(__raster_external_info) = #external_info_ident.clone() {
+                    __raster_external.insert(
+                        ::raster::alloc::string::String::from(#name_str),
+                        ::raster::core::trace::ExternalBinding {
+                            name: __raster_external_info.name,
+                            data: __raster_external_info.bytes,
+                            commitment: __raster_external_info
+                                .commitment
+                                .map(|value| value.into_bytes())
+                                .unwrap_or_default(),
+                            selector: __raster_external_info.selector,
+                        }
+                    );
+                }
+            }
         })
         .collect();
 
@@ -323,44 +279,16 @@ fn gen_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream {
     } else if params.len() == 1 {
         let param = &params[0];
         let name = &param.ident;
-        if let Some(external_name) = &param.external_name {
-            let hash_ident = external_hash_ident(param);
-            let bytes_ident = external_bytes_ident(param);
-            quote! {
-                let __raster_input_payload = ::raster::core::input::ExternalValue::new(
-                    #external_name,
-                    #hash_ident.clone(),
-                    #bytes_ident.clone(),
-                    &#name,
-                );
-                let __raster_input_bytes = ::raster::core::postcard::to_allocvec(&__raster_input_payload)
-                    .unwrap_or_default();
-            }
-        } else {
-            quote! {
-                let __raster_input_bytes = ::raster::core::postcard::to_allocvec(&#name)
-                    .unwrap_or_default();
-            }
+        quote! {
+            let __raster_input_bytes = ::raster::core::postcard::to_allocvec(&#name)
+                .unwrap_or_default();
         }
     } else {
         let payloads: Vec<_> = params
             .iter()
             .map(|param| {
                 let name = &param.ident;
-                if let Some(external_name) = &param.external_name {
-                    let hash_ident = external_hash_ident(param);
-                    let bytes_ident = external_bytes_ident(param);
-                    quote! {
-                        ::raster::core::input::ExternalValue::new(
-                            #external_name,
-                            #hash_ident.clone(),
-                            #bytes_ident.clone(),
-                            &#name,
-                        )
-                    }
-                } else {
-                    quote! { &#name }
-                }
+                quote! { &#name }
             })
             .collect();
         quote! {
@@ -376,20 +304,14 @@ fn gen_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream {
 
         #input_bytes
 
+        let mut __raster_external = ::raster::alloc::collections::BTreeMap::new();
+        #(#external_binding_entries)*
+
         let __raster_input = ::core::option::Option::Some(
             ::raster::core::trace::FnInput {
                 data: __raster_input_bytes,
                 args: __raster_input_args,
-                external: if #has_external_inputs {
-                    [#(#external_binding_entries),*]
-                        .into_iter()
-                        .collect::<::raster::alloc::collections::BTreeMap<
-                            ::raster::alloc::string::String,
-                            ::raster::core::trace::ExternalBinding,
-                        >>()
-                } else {
-                    ::raster::alloc::collections::BTreeMap::new()
-                },
+                external: __raster_external,
             }
         );
     }
@@ -541,11 +463,10 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
     let inputs_deserialization = gen_inputs_deserialization(&input_fn);
     let function_call = gen_function_call(&implementation_name, &input_fn);
     let output_serialization = gen_output_serialization(&input_fn);
-    let external_resolution = gen_external_resolution(&input_fn);
-    let wrapper_external_unpack = gen_wrapper_external_unpack(&input_fn);
+    let arg_resolution = gen_arg_resolution(&input_fn);
 
     let mut exposed_sig = input_fn.sig.clone();
-    rewrite_exposed_external_inputs(&mut exposed_sig, &params);
+    rewrite_call_boundary_inputs(&mut exposed_sig, &params);
 
     let mut implementation_sig = input_fn.sig.clone();
     implementation_sig.ident = implementation_name.clone();
@@ -590,7 +511,7 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
     let original_function = quote! {
         #(#fn_attrs)*
         #fn_vis #exposed_sig {
-            #external_resolution
+            #arg_resolution
 
             // On std + non-riscv32: wrap body in closure for tracing
             #[cfg(all(feature = "std", not(target_arch = "riscv32")))]
@@ -641,7 +562,6 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
         // Generate the ABI wrapper function (available on all platforms, no_std compatible)
         pub fn #function_wrapper_name(input: &[u8]) -> ::raster::core::Result<::raster::alloc::vec::Vec<u8>> {
             #inputs_deserialization
-            #wrapper_external_unpack
 
             #function_call
 
@@ -689,7 +609,7 @@ impl SequenceAttrs {
 /// Generates the sequence-wrapped body: either tracing (SequenceStart/body/SequenceEnd) or plain body depending on cfg.
 fn gen_sequence_wrapped_body(fn_name_str: &str, item_fn: &ItemFn) -> proc_macro2::TokenStream {
     let body = &item_fn.block;
-    let external_resolution = gen_external_resolution(item_fn);
+    let arg_resolution = gen_arg_resolution(item_fn);
     let input_serialization = gen_input_serialization(&item_fn);
 
     let output_type_expr = match &item_fn.sig.output {
@@ -701,7 +621,7 @@ fn gen_sequence_wrapped_body(fn_name_str: &str, item_fn: &ItemFn) -> proc_macro2
     };
 
     quote! {
-        #external_resolution
+        #arg_resolution
 
         #[cfg(all(feature = "std", not(target_arch = "riscv32")))]
         {
@@ -772,7 +692,7 @@ pub fn sequence(attr: TokenStream, item: TokenStream) -> TokenStream {
     let fn_attrs = &item_fn.attrs;
     let _attrs = SequenceAttrs::parse(attr);
     let mut sequence_sig = item_fn.sig.clone();
-    rewrite_exposed_external_inputs(&mut sequence_sig, &params);
+    rewrite_call_boundary_inputs(&mut sequence_sig, &params);
 
     let expanded = if item_fn.sig.ident == "main" {
         if let Some(param) = params.iter().find(|param| param.external_name.is_none()) {
@@ -787,14 +707,12 @@ pub fn sequence(attr: TokenStream, item: TokenStream) -> TokenStream {
             .iter()
             .map(|param| {
                 let name = &param.ident;
-                let ty = &param.ty;
                 let external_name = param
                     .external_name
                     .as_ref()
                     .expect("main inputs were validated above");
-                let ty = exposed_external_param_ty(ty);
                 quote! {
-                    let #name: #ty = ::raster::external(#external_name);
+                    let #name = ::raster::external(#external_name);
                 }
             })
             .collect();

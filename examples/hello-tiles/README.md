@@ -1,13 +1,14 @@
 # Hello Tiles Example
 
-A minimal example demonstrating tile, sequence, and external input usage.
+A minimal example demonstrating tile, sequence, caller-owned external selectors, and committed external input usage.
 
 ## Structure
 
 - `greet`: Creates a greeting from a string
-- `personal_greet`: Resolves `PersonalData` from an external postcard file
+- `personal_greet`: Selects `personal_data.name` at the call site
+- `greet_address_line`: Selects `personal_data.address_lines[0]` at the call site
 - `greet_sequence`: Chains tiles and nested sequences
-- `bin/gen_input.rs`: Generates `personal_data.bin`, `input.json`, and `input_manifest.json`
+- `bin/gen_input.rs`: Generates `input.json` and `input_manifest.json`
 
 ## Running
 

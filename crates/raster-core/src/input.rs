@@ -12,11 +12,126 @@ use std::collections::BTreeMap;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct ExternalRef {
     pub name: String,
+    #[serde(default)]
+    pub selector: SelectorPath,
 }
 
 impl ExternalRef {
     pub fn new(name: impl Into<String>) -> Self {
-        Self { name: name.into() }
+        Self {
+            name: name.into(),
+            selector: SelectorPath::default(),
+        }
+    }
+
+    pub fn with_selector(name: impl Into<String>, selector: SelectorPath) -> Self {
+        Self {
+            name: name.into(),
+            selector,
+        }
+    }
+}
+
+/// A structured path describing a selected sub-value inside an external input.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct SelectorPath {
+    #[serde(default)]
+    pub segments: Vec<SelectorSegment>,
+}
+
+impl SelectorPath {
+    pub fn new(segments: Vec<SelectorSegment>) -> Self {
+        Self { segments }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.segments.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum SelectorSegment {
+    Field(String),
+    Index(u64),
+}
+
+impl From<&str> for SelectorSegment {
+    fn from(value: &str) -> Self {
+        Self::Field(value.into())
+    }
+}
+
+impl From<String> for SelectorSegment {
+    fn from(value: String) -> Self {
+        Self::Field(value)
+    }
+}
+
+impl From<usize> for SelectorSegment {
+    fn from(value: usize) -> Self {
+        Self::Index(value as u64)
+    }
+}
+
+impl From<u64> for SelectorSegment {
+    fn from(value: u64) -> Self {
+        Self::Index(value)
+    }
+}
+
+impl From<u32> for SelectorSegment {
+    fn from(value: u32) -> Self {
+        Self::Index(value as u64)
+    }
+}
+
+impl From<u16> for SelectorSegment {
+    fn from(value: u16) -> Self {
+        Self::Index(value as u64)
+    }
+}
+
+impl From<u8> for SelectorSegment {
+    fn from(value: u8) -> Self {
+        Self::Index(value as u64)
+    }
+}
+
+impl From<i32> for SelectorSegment {
+    fn from(value: i32) -> Self {
+        Self::Index(value as u64)
+    }
+}
+
+/// A caller-owned external selection passed through `external!(...)`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ExternalSelection {
+    pub reference: ExternalRef,
+}
+
+impl ExternalSelection {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            reference: ExternalRef::new(name),
+        }
+    }
+
+    pub fn with_selector(name: impl Into<String>, selector: SelectorPath) -> Self {
+        Self {
+            reference: ExternalRef::with_selector(name, selector),
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.reference.name
+    }
+
+    pub fn selector(&self) -> &SelectorPath {
+        &self.reference.selector
+    }
+
+    pub fn into_ref(self) -> ExternalRef {
+        self.reference
     }
 }
 
@@ -43,8 +158,66 @@ impl<T> External<T> {
         &self.reference.name
     }
 
+    pub fn selector(&self) -> &SelectorPath {
+        &self.reference.selector
+    }
+
     pub fn into_ref(self) -> ExternalRef {
         self.reference
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct ExternalArgInfo {
+    pub name: String,
+    #[serde(default)]
+    pub selector: SelectorPath,
+    #[serde(default)]
+    pub commitment: Option<String>,
+    #[serde(default)]
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum ArgKind {
+    Inline,
+    External(ExternalArgInfo),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct ResolvedArg<T> {
+    pub value: T,
+    pub kind: ArgKind,
+}
+
+impl<T> ResolvedArg<T> {
+    pub fn inline(value: T) -> Self {
+        Self {
+            value,
+            kind: ArgKind::Inline,
+        }
+    }
+
+    pub fn external(value: T, info: ExternalArgInfo) -> Self {
+        Self {
+            value,
+            kind: ArgKind::External(info),
+        }
+    }
+
+    pub fn kind(&self) -> &ArgKind {
+        &self.kind
+    }
+
+    pub fn into_inner(self) -> T {
+        self.value
+    }
+
+    pub fn external_info(&self) -> Option<&ExternalArgInfo> {
+        match &self.kind {
+            ArgKind::Inline => None,
+            ArgKind::External(info) => Some(info),
+        }
     }
 }
 
@@ -52,6 +225,8 @@ impl<T> External<T> {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct ExternalValue<T> {
     pub name: String,
+    #[serde(default)]
+    pub selector: SelectorPath,
     #[serde(default)]
     pub commitment: Option<String>,
     #[serde(default)]
@@ -62,12 +237,14 @@ pub struct ExternalValue<T> {
 impl<T> ExternalValue<T> {
     pub fn new(
         name: impl Into<String>,
+        selector: SelectorPath,
         commitment: Option<String>,
         bytes: Vec<u8>,
         value: T,
     ) -> Self {
         Self {
             name: name.into(),
+            selector,
             commitment,
             bytes,
             value,
