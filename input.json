@@ -1,0 +1,12 @@
+{
+  "personal_data": {
+  "address_lines": [
+    "221B Baker Street",
+    "Flat B"
+  ],
+  "age": 25,
+  "name": "John"
+},
+  "personal_data_bin": { "path": "personal_data.bin" },
+  "seed": 123
+}

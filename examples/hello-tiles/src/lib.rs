@@ -13,6 +13,8 @@ use alloc::format;
 use alloc::string::String;
 use raster::prelude::*;
 
+use crate::input::PersonalData;
+
 pub mod input;
 
 /// A simple tile that greets a user by name.
@@ -27,6 +29,16 @@ pub fn greet(name: String) -> String {
 pub fn personal_greet(name: String) -> String {
     let greet = format!("Hello, {}!!!!", name);
     debug!("greet: {}", greet);
+
+    greet
+}
+
+#[tile(kind=iter)]
+pub fn personal_greet_from_object(
+    #[external(name = "personal_data_bin")] personal_data: External<PersonalData>,
+) -> String {
+    let greet = format!("Hello from object, {}!!!!", personal_data.name);
+    debug!("object greet: {}", greet);
 
     greet
 }

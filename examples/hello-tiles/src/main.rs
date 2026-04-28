@@ -1,8 +1,8 @@
 use raster::prelude::*;
 
 use hello_tiles::{
-    current_wish, exclaim, greet, greet_address_line, personal_greet, personal_greet_with_seed,
-    raster_wish,
+    current_wish, exclaim, greet, greet_address_line, personal_greet,
+    personal_greet_from_object, personal_greet_with_seed, raster_wish,
 };
 
 #[sequence]
@@ -33,6 +33,7 @@ fn placeholder_sequence(placeholder: String) -> String {
 ///
 /// This example resolves committed external inputs from `input.json`:
 /// - `personal_data.name` and `personal_data.address_lines[0]` are selected from inline JSON
+/// - `personal_data_bin` is loaded from a binary postcard file into `External<PersonalData>`
 /// - `seed` is provided inline in the JSON document
 ///
 /// Each input must have a matching public commitment in `input_manifest.json`.
@@ -50,6 +51,7 @@ fn main() {
         greet_address_line,
         external!("personal_data", select!("address_lines", 0))
     );
+    call!(personal_greet_from_object, external!("personal_data_bin"));
     let name_2 = call_seq!(placeholder_sequence, "Placeholder".to_string());
     let result = call_seq!(greet_sequence, name_2);
     debug!("main result: {}", result);
