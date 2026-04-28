@@ -34,9 +34,7 @@ pub fn personal_greet(name: String) -> String {
 }
 
 #[tile(kind=iter)]
-pub fn personal_greet_from_object(
-    #[external(name = "personal_data_bin")] personal_data: External<PersonalData>,
-) -> String {
+pub fn personal_greet_from_object(personal_data: PersonalData) -> String {
     let greet = format!("Hello from object, {}!!!!", personal_data.name);
     debug!("object greet: {}", greet);
 
