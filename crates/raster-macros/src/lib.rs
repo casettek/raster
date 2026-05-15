@@ -232,9 +232,8 @@ fn gen_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream {
                 if let ::core::option::Option::Some(__raster_external_info) = #external_info_ident.clone() {
                     __raster_external.insert(
                         ::raster::alloc::string::String::from(#name_str),
-                        ::raster::core::trace::ExternalBinding {
+                        ::raster::core::trace::ExternalData {
                             name: __raster_external_info.name,
-                            data: __raster_external_info.bytes,
                             commitment: __raster_external_info
                                 .commitment
                                 .map(|value| value.into_bytes())
@@ -645,7 +644,7 @@ fn gen_sequence_wrapped_body(fn_name_str: &str, item_fn: &ItemFn) -> proc_macro2
 /// ```ignore
 /// #[raster::sequence]
 /// fn main() {
-///     let name = raster::external!("name");
+///     let name = raster::select!(raster::external!("name"));
 ///     let result = greet_sequence(name);
 ///     println!("{}", result);
 /// }
@@ -740,9 +739,6 @@ fn split_selector_expr(expr: Expr) -> (Expr, Vec<proc_macro2::TokenStream>) {
 pub fn select(item: TokenStream) -> TokenStream {
     let expr = parse_macro_input!(item as Expr);
     let (base_expr, segments) = split_selector_expr(expr);
-    if segments.is_empty() {
-        panic!("select! expects a source expression followed by .field or [index] segments");
-    }
 
     TokenStream::from(quote! {
         ::raster::select_source(

@@ -353,14 +353,7 @@ fn verify_external_inputs(
             "External input '{}' commitment does not match authorized source",
             meta.name,
         );
-        assert_eq!(
-            sha256_hex(&meta.data),
-            meta.commitment,
-            "External input '{}' payload does not match the transported commitment",
-            meta.name,
-        );
-
-        if !meta.selector.is_empty() {
+        if !meta.selector.is_empty() || !meta.selected.bytes.is_empty() {
             assert!(
                 !meta.selected.bytes.is_empty(),
                 "External input '{}' selector is missing selected payload bytes",
@@ -615,9 +608,7 @@ fn main() {
 mod tests {
     use super::*;
     use raster_core::cfs::CfsCoordinates;
-    use raster_core::trace::{
-        ExternalBinding, SequenceEndRecord, SequenceStartRecord, TileExecRecord,
-    };
+    use raster_core::trace::{ExternalData, SequenceEndRecord, SequenceStartRecord, TileExecRecord};
 
     fn sha(bytes: &[u8]) -> Vec<u8> {
         sha256_bytes(bytes)
@@ -626,16 +617,18 @@ mod tests {
     fn external_input(
         binding_name: &str,
         commitment: &[u8],
-        payload_data: &[u8],
+        selected_bytes: &[u8],
     ) -> ExternalInput {
         [(
             "arg".to_string(),
-            ExternalBinding {
+            ExternalData {
                 name: binding_name.to_string(),
                 commitment: commitment.to_vec(),
-                data: payload_data.to_vec(),
                 selector: Default::default(),
-                selected: Default::default(),
+                selected: raster_core::input::SelectedPayload {
+                    bytes: selected_bytes.to_vec(),
+                    ..Default::default()
+                },
             },
         )]
         .into_iter()
@@ -742,7 +735,7 @@ mod tests {
         let ext = external_input(
             "personal_data",
             sha256_hex(b"payload").as_slice(),
-            b"payload",
+            b"",
         );
         let step = StepRecord::TileExec(TileExecRecord {
             exec_index: 1,
@@ -768,7 +761,7 @@ mod tests {
         let ext = external_input(
             "personal_data",
             sha256_hex(b"payload").as_slice(),
-            b"payload",
+            b"",
         );
         let step = StepRecord::TileExec(TileExecRecord {
             exec_index: 1,
@@ -800,7 +793,7 @@ mod tests {
         let ext = external_input(
             "personal_data",
             sha256_hex(b"payload").as_slice(),
-            b"payload",
+            b"",
         );
         let step = StepRecord::TileExec(TileExecRecord {
             exec_index: 1,

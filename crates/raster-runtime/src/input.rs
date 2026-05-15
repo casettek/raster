@@ -252,39 +252,77 @@ fn resolve_cached_external(
         .clone())
 }
 
-fn deserialize_external_value<T: DeserializeOwned>(
+fn deserialize_resolved_value<T: DeserializeOwned>(
     name: &str,
-    selector: SelectorPath,
-    resolved: ResolvedExternalInput,
-) -> Result<ExternalValue<T>> {
-    let commitment = resolved.commitment().to_string();
-    let bytes = resolved.bytes().to_vec();
-    let value = match resolved {
-        ResolvedExternalInput::File { bytes, .. } => raster_core::postcard::from_bytes(&bytes)
+    resolved: &ResolvedExternalInput,
+) -> Result<T> {
+    match resolved {
+        ResolvedExternalInput::File { bytes, .. } => raster_core::postcard::from_bytes(bytes)
             .map_err(|e| {
                 Error::Serialization(format!(
                     "Failed to deserialize external input '{}' from postcard bytes: {}",
                     name, e
                 ))
-            })?,
+            }),
         ResolvedExternalInput::InlineJson { value, .. } => {
-            serde_json::from_value(value).map_err(|e| {
+            serde_json::from_value(value.clone()).map_err(|e| {
                 Error::Serialization(format!(
                     "Failed to deserialize inline external input '{}' from JSON value: {}",
                     name, e
                 ))
-            })?
+            })
         }
-    };
+    }
+}
 
-    Ok(ExternalValue::new(
+fn dynamic_selected_payload<T: Serialize>(name: &str, value: &T, selector: &SelectorPath) -> Result<SelectedPayload> {
+    let root_value = serde_json::to_value(value).map_err(|e| {
+        Error::Serialization(format!(
+            "Failed to project external input '{}' into JSON for selection proof: {}",
+            name, e
+        ))
+    })?;
+    prove_dynamic_selection(&root_value, selector)
+}
+
+fn typed_selected_payload<Root: Serialize + Selectable>(
+    name: &str,
+    value: &Root,
+    selector: &SelectorPath,
+) -> Result<SelectedPayload> {
+    let root_value = serde_json::to_value(value).map_err(|e| {
+        Error::Serialization(format!(
+            "Failed to project external input '{}' into JSON for merkle selection: {}",
+            name, e
+        ))
+    })?;
+    let proven = prove_selection(&Root::schema(), &root_value, &selector.segments)?;
+
+    Ok(SelectedPayload {
+        bytes: proven.selected_bytes,
+        proof: SelectionProof {
+            path: selector.clone(),
+            root_hash: proven.root_hash,
+            steps: proven.steps,
+        },
+    })
+}
+
+fn external_value_from_parts<T>(
+    name: &str,
+    selector: SelectorPath,
+    resolved: ResolvedExternalInput,
+    selected: SelectedPayload,
+    value: T,
+) -> ExternalValue<T> {
+    ExternalValue::new(
         name,
         selector,
-        Some(commitment),
-        bytes,
-        SelectedPayload::default(),
+        Some(resolved.commitment().to_string()),
+        resolved.bytes().to_vec(),
+        selected,
         value,
-    ))
+    )
 }
 
 fn select_json_value(root: &Value, selector: &SelectorPath) -> Result<Value> {
@@ -719,11 +757,15 @@ pub fn resolve_external_value<T: DeserializeOwned + Serialize>(
 
     let resolved = resolve_cached_external(reference.name(), &sources)?;
     if reference.selector().is_empty() {
-        return deserialize_external_value(
+        let value = deserialize_resolved_value(reference.name(), &resolved)?;
+        let selected = dynamic_selected_payload(reference.name(), &value, reference.selector())?;
+        return Ok(external_value_from_parts(
             reference.name(),
             reference.selector().clone(),
             resolved,
-        );
+            selected,
+            value,
+        ));
     }
 
     match sources.get_input_entry(reference.name()) {
@@ -737,11 +779,10 @@ pub fn resolve_external_value<T: DeserializeOwned + Serialize>(
                     e
                 ))
             })?;
-            Ok(ExternalValue::new(
+            Ok(external_value_from_parts(
                 reference.name(),
                 reference.selector().clone(),
-                Some(resolved.commitment().to_string()),
-                resolved.bytes().to_vec(),
+                resolved,
                 selected_payload,
                 selected_value,
             ))
@@ -772,32 +813,7 @@ where
     })?;
 
     let resolved = resolve_cached_external(reference.name(), &sources)?;
-    if reference.selector().is_empty() {
-        return deserialize_external_value(
-            reference.name(),
-            reference.selector().clone(),
-            resolved,
-        );
-    }
-
-    let root: Root = match &resolved {
-        ResolvedExternalInput::File { bytes, .. } => raster_core::postcard::from_bytes(bytes)
-            .map_err(|e| {
-                Error::Serialization(format!(
-                    "Failed to deserialize external input '{}' from postcard bytes: {}",
-                    reference.name(),
-                    e
-                ))
-            })?,
-        ResolvedExternalInput::InlineJson { value, .. } => serde_json::from_value(value.clone())
-            .map_err(|e| {
-                Error::Serialization(format!(
-                    "Failed to deserialize inline external input '{}' from JSON value: {}",
-                    reference.name(),
-                    e
-                ))
-            })?,
-    };
+    let root: Root = deserialize_resolved_value(reference.name(), &resolved)?;
     let root_value = serde_json::to_value(&root).map_err(|e| {
         Error::Serialization(format!(
             "Failed to project external input '{}' into JSON for merkle selection: {}",
@@ -813,20 +829,13 @@ where
             e
         ))
     })?;
+    let selected = typed_selected_payload(reference.name(), &root, reference.selector())?;
 
-    Ok(ExternalValue::new(
+    Ok(external_value_from_parts(
         reference.name(),
         reference.selector().clone(),
-        Some(resolved.commitment().to_string()),
-        resolved.bytes().to_vec(),
-        SelectedPayload {
-            bytes: proven.selected_bytes,
-            proof: SelectionProof {
-                path: reference.selector().clone(),
-                root_hash: proven.root_hash,
-                steps: proven.steps,
-            },
-        },
+        resolved,
+        selected,
         typed_selected,
     ))
 }
@@ -1079,16 +1088,25 @@ mod tests {
             ExternalInputSources::from_input_args(input_path.to_str(), manifest_path.to_str())
                 .unwrap();
         let resolved = resolve_cached_external("seed", &sources).unwrap();
-        let value =
-            deserialize_external_value::<u64>("seed", SelectorPath::default(), resolved.clone())
-                .unwrap();
+        let value = deserialize_resolved_value::<u64>("seed", &resolved).unwrap();
+        let selected = dynamic_selected_payload("seed", &value, &SelectorPath::default()).unwrap();
 
         assert_eq!(resolved.bytes(), inline_bytes.as_slice());
         assert_eq!(resolved.commitment(), hash);
-        assert_eq!(value.value, 123);
-        assert_eq!(value.bytes, inline_bytes);
+        assert_eq!(value, 123);
+        assert_eq!(selected.bytes, inline_bytes);
+        assert!(verify_selection_proof(&selected.bytes, &selected.proof));
 
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn whole_value_dynamic_selection_produces_verifiable_payload() {
+        let selected = dynamic_selected_payload("seed", &123u64, &SelectorPath::default()).unwrap();
+
+        assert_eq!(selected.bytes, canonical_json_bytes(&serde_json::json!(123)).unwrap());
+        assert!(selected.proof.path.is_empty());
+        assert!(verify_selection_proof(&selected.bytes, &selected.proof));
     }
 
     #[test]
@@ -1163,5 +1181,24 @@ mod tests {
         );
         assert!(verify_selection_proof(&selected.bytes, &selected.proof));
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn whole_value_typed_selection_produces_verifiable_payload() {
+        let root = PersonalData {
+            age: 25,
+            name: "John".to_string(),
+            addresses: vec![Address {
+                lines: vec!["221B Baker Street".to_string()],
+                indexes: vec![7],
+            }],
+        };
+
+        let selected =
+            typed_selected_payload::<PersonalData>("personal_data", &root, &SelectorPath::default())
+                .unwrap();
+
+        assert!(selected.proof.path.is_empty());
+        assert!(verify_selection_proof(&selected.bytes, &selected.proof));
     }
 }

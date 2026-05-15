@@ -178,9 +178,7 @@ mod tests {
     use raster_core::authorization::{AuthorizationJournal, ManifestedInputs};
     use raster_core::cfs::{CfsCoordinates, ControlFlowSchema, SequenceDef};
     use raster_core::fingerprint::{BitPacker, Fingerprint};
-    use raster_core::trace::{
-        ExternalBinding, SequenceEndRecord, SequenceStartRecord, TileExecRecord,
-    };
+    use raster_core::trace::{ExternalData, SequenceEndRecord, SequenceStartRecord, TileExecRecord};
     use sha2::{Digest, Sha256};
 
     fn external_input_commitment(external_input: &ExternalInput) -> Vec<u8> {
@@ -188,13 +186,12 @@ mod tests {
         Sha256::digest(bytes).to_vec()
     }
 
-    fn make_external_input(binding_name: &str, commitment: &[u8], data: &[u8]) -> ExternalInput {
+    fn make_external_input(binding_name: &str, commitment: &[u8]) -> ExternalInput {
         HashMap::from([(
             "arg".to_string(),
-            ExternalBinding {
+            ExternalData {
                 name: binding_name.to_string(),
                 commitment: commitment.to_vec(),
-                data: data.to_vec(),
                 selector: Default::default(),
                 selected: Default::default(),
             },
@@ -220,7 +217,10 @@ mod tests {
         ManifestedInputs {
             manifest_bytes: br#"{"personal_data":{"type":"sha256","commitment":"239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"}}"#
                 .to_vec(),
-            external_inputs_bytes: [("personal_data".to_string(), b"payload".to_vec())]
+            external_inputs_commitments: [(
+                "personal_data".to_string(),
+                b"239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5".to_vec(),
+            )]
                 .into_iter()
                 .collect(),
         }
@@ -256,7 +256,6 @@ mod tests {
                     make_external_input(
                         "personal_data",
                         b"239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5",
-                        b"payload",
                     ),
                 ),
             ),
@@ -300,7 +299,6 @@ mod tests {
             make_external_input(
                 "personal_data",
                 b"239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5",
-                b"payload",
             )
         );
         assert_eq!(input.authorization_journal, make_authorization_journal());
@@ -436,7 +434,7 @@ mod tests {
     fn transition_guest_accepts_valid_authorization_receipt_assumption() {
         let (authorization_receipt, authorization) = authorize_external_inputs(&ManifestedInputs {
             manifest_bytes: Vec::new(),
-            external_inputs_bytes: std::collections::BTreeMap::new(),
+            external_inputs_commitments: std::collections::BTreeMap::new(),
         });
 
         assert!(prove_single_transition_with_authorization(
@@ -451,7 +449,7 @@ mod tests {
         let (_authorization_receipt, authorization) =
             authorize_external_inputs(&ManifestedInputs {
                 manifest_bytes: Vec::new(),
-                external_inputs_bytes: std::collections::BTreeMap::new(),
+                external_inputs_commitments: std::collections::BTreeMap::new(),
             });
 
         assert!(prove_single_transition_with_authorization(authorization, None).is_err());
@@ -462,7 +460,7 @@ mod tests {
         let (authorization_receipt, mut authorization) =
             authorize_external_inputs(&ManifestedInputs {
                 manifest_bytes: Vec::new(),
-                external_inputs_bytes: std::collections::BTreeMap::new(),
+                external_inputs_commitments: std::collections::BTreeMap::new(),
             });
         authorization.manifest_commitment = vec![9; 32];
 

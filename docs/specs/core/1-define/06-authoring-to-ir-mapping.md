@@ -277,7 +277,7 @@ fn greet_sequence(name: String) -> String {
 
 #[sequence(description = "Entry point")]
 fn main() {
-    let name = external!("name");
+    let name = select!(external!("name"));
     call_seq!(greet_sequence, name);
 }
 ```

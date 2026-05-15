@@ -28,7 +28,7 @@ use raster_prover::trace::{
 use raster_prover::transition::step_transitions;
 use raster_runtime::{TraceRecorder, TRACE_EVENT_PREFIX};
 
-use crate::utils::authorization::{build_manifested_inputs, read_external_inputs};
+use crate::utils::authorization::{build_manifested_inputs, collect_external_input_commitments};
 use crate::BackendType;
 
 pub fn run(
@@ -265,10 +265,7 @@ pub fn run(
                     input_manifest,
                 );
                 let fraud_proof_path = write_fraud_proof(&fraud_proof, commit_path);
-                println!(
-                    "Fraud proof generated: {}",
-                    fraud_proof_path.display()
-                );
+                println!("Fraud proof generated: {}", fraud_proof_path.display());
             }
         }
     } else {
@@ -438,9 +435,11 @@ pub fn prove(
         }
     }
 
-    let manifested_inputs =
-        build_manifested_inputs(input_manifest, read_external_inputs(&recorded_step_io))
-            .unwrap_or_else(|e| panic!("Failed to load authorization source: {}", e));
+    let manifested_inputs = build_manifested_inputs(
+        input_manifest,
+        collect_external_input_commitments(&recorded_step_io),
+    )
+    .unwrap_or_else(|e| panic!("Failed to load authorization source: {}", e));
 
     let (authorization_receipt, authorization_journal) =
         authorize_external_inputs(&manifested_inputs);

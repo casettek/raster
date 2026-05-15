@@ -8,18 +8,6 @@ fn sha256_bytes(bytes: &[u8]) -> Vec<u8> {
     Risc0Sha256::hash_bytes(bytes).as_bytes().to_vec()
 }
 
-fn sha256_hex(bytes: &[u8]) -> Vec<u8> {
-    let digest = sha256_bytes(bytes);
-    let mut out = Vec::with_capacity(digest.len() * 2);
-    for byte in digest {
-        let hi = (byte >> 4) & 0x0f;
-        let lo = byte & 0x0f;
-        out.push(if hi < 10 { b'0' + hi } else { b'a' + (hi - 10) });
-        out.push(if lo < 10 { b'0' + lo } else { b'a' + (lo - 10) });
-    }
-    out
-}
-
 fn normalize_hash_string(commitment: &str) -> Vec<u8> {
     commitment.trim().to_ascii_lowercase().into_bytes()
 }
@@ -50,9 +38,9 @@ fn build_authorization_journal(input: &ManifestedInputs) -> AuthorizationJournal
     let external_input_commitments = parse_external_input_commitments(&input.manifest_bytes);
 
     let external_inputs_commitments = input
-        .external_inputs_bytes
+        .external_inputs_commitments
         .iter()
-        .map(|(name, bytes)| {
+        .map(|(name, witnessed_commitment)| {
             let external_input_commitment =
                 external_input_commitments.get(name).unwrap_or_else(|| {
                     panic!(
@@ -60,11 +48,10 @@ fn build_authorization_journal(input: &ManifestedInputs) -> AuthorizationJournal
                     name
                 )
                 });
-            let actual_commitment = sha256_hex(bytes);
 
             assert_eq!(
-                &actual_commitment, external_input_commitment,
-                "External input '{}' payload does not match the public manifest commitment",
+                witnessed_commitment, external_input_commitment,
+                "External input '{}' commitment does not match the public manifest commitment",
                 name
             );
 
@@ -98,7 +85,10 @@ mod tests {
                 }
             }"#
             .to_vec(),
-            external_inputs_bytes: [("personal_data".to_string(), b"abc".to_vec())]
+            external_inputs_commitments: [(
+                "personal_data".to_string(),
+                b"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".to_vec(),
+            )]
                 .into_iter()
                 .collect(),
         };
@@ -115,15 +105,17 @@ mod tests {
 
     #[test]
     fn manifest_commitment_is_deterministic_for_same_source_bytes() {
-        let payload = b"\n".to_vec();
-        let payload_commitment = String::from_utf8(sha256_hex(&payload)).unwrap();
+        let payload_commitment = "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b";
         let input = ManifestedInputs {
             manifest_bytes: format!(
                 r#"{{"personal_data":{{"type":"sha256","commitment":"{}"}}}}"#,
                 payload_commitment
             )
             .into_bytes(),
-            external_inputs_bytes: [("personal_data".to_string(), payload)]
+            external_inputs_commitments: [(
+                "personal_data".to_string(),
+                payload_commitment.as_bytes().to_vec(),
+            )]
                 .into_iter()
                 .collect(),
         };
@@ -136,15 +128,17 @@ mod tests {
 
     #[test]
     fn ignores_manifested_external_inputs_that_are_not_witnessed() {
-        let payload = b"abc".to_vec();
-        let payload_commitment = String::from_utf8(sha256_hex(&payload)).unwrap();
+        let payload_commitment = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
         let input = ManifestedInputs {
             manifest_bytes: format!(
                 r#"{{"personal_data":{{"type":"sha256","commitment":"{}"}},"unused_data":{{"type":"sha256","commitment":"deadbeef"}}}}"#,
                 payload_commitment
             )
             .into_bytes(),
-            external_inputs_bytes: [("personal_data".to_string(), payload)]
+            external_inputs_commitments: [(
+                "personal_data".to_string(),
+                payload_commitment.as_bytes().to_vec(),
+            )]
                 .into_iter()
                 .collect(),
         };

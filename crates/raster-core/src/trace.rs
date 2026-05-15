@@ -28,12 +28,11 @@ pub struct FnInput {
 }
 
 pub type InternalBindingName = String;
-pub type ExternalInput = BTreeMap<InternalBindingName, ExternalBinding>;
+pub type ExternalInput = BTreeMap<InternalBindingName, ExternalData>;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub struct ExternalBinding {
+pub struct ExternalData {
     pub name: String,
-    pub data: Vec<u8>,
     pub commitment: Vec<u8>,
     #[serde(default)]
     pub selector: SelectorPath,

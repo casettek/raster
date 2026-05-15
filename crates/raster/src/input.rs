@@ -11,25 +11,25 @@ pub use raster_core::input::{
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ExternalArg {
+pub struct ExternalBinding {
     name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct TypedExternal<Root> {
+pub struct TypedExternalBinding<Root> {
     name: String,
     marker: PhantomData<fn() -> Root>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct SelectedExternalArg {
-    source: ExternalArg,
+pub struct SelectedExternalBinding {
+    source: ExternalBinding,
     selector: SelectorPath,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct TypedSelectedExternal<Root> {
-    source: TypedExternal<Root>,
+pub struct TypedSelectedExternalBinding<Root> {
+    source: TypedExternalBinding<Root>,
     selector: SelectorPath,
 }
 
@@ -39,7 +39,7 @@ pub trait CanSelectPath {
     fn with_selector(self, selector: SelectorPath) -> Self::Output;
 }
 
-impl ExternalArg {
+impl ExternalBinding {
     pub fn new(name: &str) -> Self {
         Self { name: name.into() }
     }
@@ -49,7 +49,7 @@ impl ExternalArg {
     }
 }
 
-impl<Root> TypedExternal<Root> {
+impl<Root> TypedExternalBinding<Root> {
     pub fn new(name: &str) -> Self {
         Self {
             name: name.into(),
@@ -62,34 +62,34 @@ impl<Root> TypedExternal<Root> {
     }
 }
 
-impl CanSelectPath for ExternalArg {
-    type Output = SelectedExternalArg;
+impl CanSelectPath for ExternalBinding {
+    type Output = SelectedExternalBinding;
 
     fn with_selector(self, selector: SelectorPath) -> Self::Output {
-        SelectedExternalArg {
+        SelectedExternalBinding {
             source: self,
             selector,
         }
     }
 }
 
-impl<Root> CanSelectPath for TypedExternal<Root> {
-    type Output = TypedSelectedExternal<Root>;
+impl<Root> CanSelectPath for TypedExternalBinding<Root> {
+    type Output = TypedSelectedExternalBinding<Root>;
 
     fn with_selector(self, selector: SelectorPath) -> Self::Output {
-        TypedSelectedExternal {
+        TypedSelectedExternalBinding {
             source: self,
             selector,
         }
     }
 }
 
-pub fn external(name: &str) -> ExternalArg {
-    ExternalArg::new(name)
+pub fn external(name: &str) -> ExternalBinding {
+    ExternalBinding::new(name)
 }
 
-pub fn typed_external<Root>(name: &str) -> TypedExternal<Root> {
-    TypedExternal::new(name)
+pub fn typed_external<Root>(name: &str) -> TypedExternalBinding<Root> {
+    TypedExternalBinding::new(name)
 }
 
 pub fn select_source<S>(source: S, selector: SelectorPath) -> S::Output
@@ -116,7 +116,7 @@ where
     }
 }
 
-impl<T> IntoResolvedArg<T> for ExternalArg
+impl<T> IntoResolvedArg<T> for ExternalBinding
 where
     T: DeserializeOwned + Serialize,
 {
@@ -136,7 +136,7 @@ where
     }
 }
 
-impl<T> IntoResolvedArg<T> for SelectedExternalArg
+impl<T> IntoResolvedArg<T> for SelectedExternalBinding
 where
     T: DeserializeOwned + Serialize,
 {
@@ -163,20 +163,20 @@ where
     T: DeserializeOwned + Serialize,
 {
     fn into_resolved_arg(self) -> raster_core::Result<ResolvedArg<T>> {
-        ExternalArg::new(self.name()).into_resolved_arg()
+        ExternalBinding::new(self.name()).into_resolved_arg()
     }
 }
 
-impl<Root> IntoResolvedArg<Root> for TypedExternal<Root>
+impl<Root> IntoResolvedArg<Root> for TypedExternalBinding<Root>
 where
     Root: DeserializeOwned + Serialize,
 {
     fn into_resolved_arg(self) -> raster_core::Result<ResolvedArg<Root>> {
-        ExternalArg::new(&self.name).into_resolved_arg()
+        ExternalBinding::new(&self.name).into_resolved_arg()
     }
 }
 
-impl<Root, T> IntoResolvedArg<T> for TypedSelectedExternal<Root>
+impl<Root, T> IntoResolvedArg<T> for TypedSelectedExternalBinding<Root>
 where
     Root: DeserializeOwned + Serialize + Selectable + Merklized,
     T: DeserializeOwned + Serialize,

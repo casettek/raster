@@ -210,7 +210,7 @@ fn greet(name: String) -> String {
 
 #[sequence]
 fn main() -> String {
-    let name = external!("name");
+    let name = select!(external!("name"));
     greet(name)
 }
 ```

@@ -17,10 +17,11 @@ pub use raster_core as core;
 pub mod input;
 pub use input::{
     external, into_resolved_arg, resolve_external_value, resolve_typed_external_value,
-    select_source, selector_path, typed_external, ArgKind, External, ExternalArg, ExternalArgInfo,
-    ExternalRef, ExternalSelection, IntoResolvedArg, ListProofDirection, ListProofSibling,
-    Merklized, ResolvedArg, SchemaField, SchemaNode, Selectable, SelectedPayload, SelectionProof,
-    SelectionProofStep, SelectorPath, SelectorSegment, StructProofSibling, TypedExternal,
+    select_source, selector_path, typed_external, ArgKind, External, ExternalArgInfo,
+    ExternalBinding, ExternalRef, ExternalSelection, IntoResolvedArg, ListProofDirection,
+    ListProofSibling, Merklized, ResolvedArg, SchemaField, SchemaNode, Selectable,
+    SelectedExternalBinding, SelectedPayload, SelectionProof, SelectionProofStep, SelectorPath,
+    SelectorSegment, StructProofSibling, TypedExternalBinding, TypedSelectedExternalBinding,
 };
 
 pub use raster_macros::{select, sequence, tile, Merklized, Selectable};
@@ -152,11 +153,12 @@ pub mod prelude {
     };
 
     pub use crate::{
-        call, call_seq, debug, external, select, sequence, tile, ArgKind, ExternalArg,
-        ExternalArgInfo, ExternalSelection, IntoResolvedArg, ListProofDirection, ListProofSibling,
-        Merklized, ResolvedArg, SchemaField, SchemaNode, Selectable, SelectedPayload,
-        SelectionProof, SelectionProofStep, SelectorPath, SelectorSegment, StructProofSibling,
-        TypedExternal,
+        call, call_seq, debug, external, select, sequence, tile, ArgKind, ExternalArgInfo,
+        ExternalBinding, ExternalSelection, IntoResolvedArg, ListProofDirection,
+        ListProofSibling, Merklized, ResolvedArg, SchemaField, SchemaNode, Selectable,
+        SelectedExternalBinding, SelectedPayload, SelectionProof, SelectionProofStep,
+        SelectorPath, SelectorSegment, StructProofSibling, TypedExternalBinding,
+        TypedSelectedExternalBinding,
     };
 
     // TODO: Re-enable once Executor/Tracer types are implemented
