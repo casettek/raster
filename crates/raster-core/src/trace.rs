@@ -9,7 +9,7 @@ use std::vec::Vec;
 
 use crate::cfs::CfsCoordinates;
 use crate::fingerprint::Fingerprint;
-use crate::input::SelectorPath;
+use crate::input::{SelectedPayload, SelectorPath};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct FnInputArg {
@@ -37,6 +37,8 @@ pub struct ExternalBinding {
     pub commitment: Vec<u8>,
     #[serde(default)]
     pub selector: SelectorPath,
+    #[serde(default)]
+    pub selected: SelectedPayload,
 }
 
 impl FnInput {

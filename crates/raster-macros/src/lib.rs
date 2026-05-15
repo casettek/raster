@@ -3,17 +3,19 @@
 //! This crate provides:
 //! - `#[tile]` - Marks a function as a tile and registers it in the global registry
 //! - `#[sequence]` - Declares tile ordering and control flow. When the function is named `main`,
-//!   it is the program entry point and gets init, `--input` parsing, and finish automatically.
+//!   it is the program entry point and gets init and finish automatically.
 
 use proc_macro::TokenStream;
 use quote::{format_ident, quote, ToTokens};
-use syn::{parse_macro_input, Attribute, FnArg, ItemFn, Pat, ReturnType, Type};
+use syn::{
+    parse_macro_input, Attribute, Expr, ExprField, ExprIndex, FnArg, ItemFn, LitInt, Pat,
+    ReturnType, Type,
+};
 
 #[derive(Clone)]
 struct ParamInfo {
     ident: syn::Ident,
     ty: Type,
-    external_name: Option<String>,
 }
 
 fn extract_inputs(input: &ItemFn) -> Vec<ParamInfo> {
@@ -26,7 +28,6 @@ fn extract_inputs(input: &ItemFn) -> Vec<ParamInfo> {
                 Pat::Ident(pat_ident) => Some(ParamInfo {
                     ident: pat_ident.ident.clone(),
                     ty: (*pat_type.ty).clone(),
-                    external_name: parse_external_attr(&pat_type.attrs),
                 }),
                 _ => None,
             },
@@ -35,32 +36,24 @@ fn extract_inputs(input: &ItemFn) -> Vec<ParamInfo> {
         .collect()
 }
 
-fn parse_external_attr(attrs: &[Attribute]) -> Option<String> {
+fn parse_schema_tag(attrs: &[Attribute]) -> Option<u32> {
     attrs.iter().find_map(|attr| {
-        if !attr.path().is_ident("external") {
+        if !attr.path().is_ident("schema") {
             return None;
         }
 
-        let mut external_name = None;
+        let mut tag = None;
         let _ = attr.parse_nested_meta(|meta| {
-            if meta.path.is_ident("name") {
+            if meta.path.is_ident("tag") {
                 let value = meta.value()?;
-                let lit: syn::LitStr = value.parse()?;
-                external_name = Some(lit.value());
+                let lit: syn::LitInt = value.parse()?;
+                tag = lit.base10_parse().ok();
             }
             Ok(())
         });
 
-        external_name
+        tag
     })
-}
-
-fn filter_external_attrs(attrs: &[Attribute]) -> Vec<Attribute> {
-    attrs
-        .iter()
-        .filter(|attr| !attr.path().is_ident("external"))
-        .cloned()
-        .collect()
 }
 
 fn extract_external_payload_ty(ty: &Type) -> Option<Type> {
@@ -92,12 +85,6 @@ fn call_boundary_param_ty(ty: &Type) -> Type {
 }
 
 fn rewrite_call_boundary_inputs(sig: &mut syn::Signature, params: &[ParamInfo]) {
-    for arg in sig.inputs.iter_mut() {
-        if let FnArg::Typed(pat_type) = arg {
-            pat_type.attrs = filter_external_attrs(&pat_type.attrs);
-        }
-    }
-
     for param in params {
         for arg in sig.inputs.iter_mut() {
             if let FnArg::Typed(pat_type) = arg {
@@ -112,20 +99,12 @@ fn rewrite_call_boundary_inputs(sig: &mut syn::Signature, params: &[ParamInfo]) 
 }
 
 fn rewrite_resolved_external_inputs(sig: &mut syn::Signature, params: &[ParamInfo]) {
-    for arg in sig.inputs.iter_mut() {
-        if let FnArg::Typed(pat_type) = arg {
-            pat_type.attrs = filter_external_attrs(&pat_type.attrs);
-        }
-    }
-
     for param in params {
-        if param.external_name.is_some() {
-            for arg in sig.inputs.iter_mut() {
-                if let FnArg::Typed(pat_type) = arg {
-                    if let Pat::Ident(pat_ident) = &*pat_type.pat {
-                        if pat_ident.ident == param.ident {
-                            pat_type.ty = Box::new(resolved_external_param_ty(&param.ty));
-                        }
+        for arg in sig.inputs.iter_mut() {
+            if let FnArg::Typed(pat_type) = arg {
+                if let Pat::Ident(pat_ident) = &*pat_type.pat {
+                    if pat_ident.ident == param.ident {
+                        pat_type.ty = Box::new(resolved_external_param_ty(&param.ty));
                     }
                 }
             }
@@ -146,17 +125,13 @@ fn gen_arg_resolution(input: &ItemFn) -> proc_macro2::TokenStream {
             let name = &param.ident;
             let resolved_ty = resolved_external_param_ty(&param.ty);
             let external_info_ident = external_info_ident(param);
-            let expected_name = match param.external_name.as_ref() {
-                Some(name) => quote! { ::core::option::Option::Some(#name) },
-                None => quote! { ::core::option::Option::None },
-            };
             let resolve = if is_result {
                 quote! {
-                    ::raster::into_resolved_arg::<#resolved_ty, _>(#name, #expected_name)?
+                    ::raster::into_resolved_arg::<#resolved_ty, _>(#name)?
                 }
             } else {
                 quote! {
-                    ::raster::into_resolved_arg::<#resolved_ty, _>(#name, #expected_name)
+                    ::raster::into_resolved_arg::<#resolved_ty, _>(#name)
                         .unwrap_or_else(|e| panic!("Failed to resolve call argument '{}': {}", stringify!(#name), e))
                 }
             };
@@ -265,6 +240,7 @@ fn gen_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream {
                                 .map(|value| value.into_bytes())
                                 .unwrap_or_default(),
                             selector: __raster_external_info.selector,
+                            selected: __raster_external_info.selected,
                         }
                     );
                 }
@@ -660,8 +636,7 @@ fn gen_sequence_wrapped_body(fn_name_str: &str, item_fn: &ItemFn) -> proc_macro2
 /// and the sequence is registered for use with `cargo raster preview`.
 ///
 /// When the function is named **`main`**, it is the program entry point: the macro expands to
-/// `fn main() { init(); input_parsing; sequence_wrapped_body; finish(); }`. The `--input` CLI
-/// argument is parsed into the original function's parameters.
+/// `fn main() { init(); sequence_wrapped_body; finish(); }`.
 ///
 /// # Attributes
 /// - `description = "..."` - Human-readable description of the sequence
@@ -669,7 +644,8 @@ fn gen_sequence_wrapped_body(fn_name_str: &str, item_fn: &ItemFn) -> proc_macro2
 /// # Example (entry point)
 /// ```ignore
 /// #[raster::sequence]
-/// fn main(name: String) {
+/// fn main() {
+///     let name = raster::external!("name");
 ///     let result = greet_sequence(name);
 ///     println!("{}", result);
 /// }
@@ -695,34 +671,18 @@ pub fn sequence(attr: TokenStream, item: TokenStream) -> TokenStream {
     rewrite_call_boundary_inputs(&mut sequence_sig, &params);
 
     let expanded = if item_fn.sig.ident == "main" {
-        if let Some(param) = params.iter().find(|param| param.external_name.is_none()) {
+        if !params.is_empty() {
             panic!(
-                "All #[sequence] main inputs must use #[external(name = \"...\")] so committed inputs resolve through External<T>. Missing attribute on '{}'.",
-                param.ident
+                "`#[sequence] fn main` must not declare parameters. Bind committed inputs explicitly inside the body with external!(...)."
             );
         }
 
-        // Entry point: replace with fn main() { init(); input_parsing; wrapped_body; finish(); }
-        let input_parsing: Vec<_> = params
-            .iter()
-            .map(|param| {
-                let name = &param.ident;
-                let external_name = param
-                    .external_name
-                    .as_ref()
-                    .expect("main inputs were validated above");
-                quote! {
-                    let #name = ::raster::external(#external_name);
-                }
-            })
-            .collect();
+        // Entry point: replace with fn main() { init(); wrapped_body; finish(); }
         let body = gen_sequence_wrapped_body("main", &item_fn);
         quote! {
             #(#fn_attrs)*
             fn main() {
                 ::raster::init();
-
-                #(#input_parsing)*
 
                 #body
 
@@ -741,4 +701,111 @@ pub fn sequence(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     TokenStream::from(expanded)
+}
+
+fn split_selector_expr(expr: Expr) -> (Expr, Vec<proc_macro2::TokenStream>) {
+    match expr {
+        Expr::Field(ExprField { base, member, .. }) => {
+            let (base_expr, mut segments) = split_selector_expr(*base);
+            let segment = match member {
+                syn::Member::Named(ident) => {
+                    let name = ident.to_string();
+                    quote! { ::raster::SelectorSegment::Field(::raster::alloc::string::String::from(#name)) }
+                }
+                syn::Member::Unnamed(index) => {
+                    let value = index.index;
+                    quote! { ::raster::SelectorSegment::Index(#value as u64) }
+                }
+            };
+            segments.push(segment);
+            (base_expr, segments)
+        }
+        Expr::Index(ExprIndex { expr, index, .. }) => {
+            let (base_expr, mut segments) = split_selector_expr(*expr);
+            let Expr::Lit(expr_lit) = *index else {
+                panic!("select! only supports integer literal indexes");
+            };
+            let syn::Lit::Int(LitInt { .. }) = &expr_lit.lit else {
+                panic!("select! only supports integer literal indexes");
+            };
+            let value = expr_lit.lit.to_token_stream();
+            segments.push(quote! { ::raster::SelectorSegment::Index((#value) as u64) });
+            (base_expr, segments)
+        }
+        other => (other, Vec::new()),
+    }
+}
+
+#[proc_macro]
+pub fn select(item: TokenStream) -> TokenStream {
+    let expr = parse_macro_input!(item as Expr);
+    let (base_expr, segments) = split_selector_expr(expr);
+    if segments.is_empty() {
+        panic!("select! expects a source expression followed by .field or [index] segments");
+    }
+
+    TokenStream::from(quote! {
+        ::raster::select_source(
+            #base_expr,
+            ::raster::SelectorPath::new(::raster::alloc::vec![#(#segments),*]),
+        )
+    })
+}
+
+#[proc_macro_derive(Selectable, attributes(schema))]
+pub fn derive_selectable(item: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(item as syn::DeriveInput);
+    let ident = &input.ident;
+    let generics = input.generics.clone();
+    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
+
+    let fields = match &input.data {
+        syn::Data::Struct(data) => match &data.fields {
+            syn::Fields::Named(fields) => fields.named.iter().collect::<Vec<_>>(),
+            _ => panic!("Selectable can only be derived for structs with named fields"),
+        },
+        _ => panic!("Selectable can only be derived for structs"),
+    };
+
+    let schema_fields: Vec<_> = fields
+        .iter()
+        .map(|field| {
+            let field_ident = field.ident.as_ref().expect("named field");
+            let field_ty = &field.ty;
+            let field_name = field_ident.to_string();
+            let label = parse_schema_tag(&field.attrs)
+                .map(|tag| tag.to_string())
+                .unwrap_or_else(|| field_name.clone());
+            quote! {
+                ::raster::core::input::SchemaField::new(
+                    #field_name,
+                    #label,
+                    <#field_ty as ::raster::core::input::Selectable>::schema(),
+                )
+            }
+        })
+        .collect();
+
+    TokenStream::from(quote! {
+        impl #impl_generics ::raster::core::input::Selectable for #ident #ty_generics #where_clause {
+            fn schema() -> ::raster::core::input::SchemaNode {
+                ::raster::core::input::SchemaNode::Struct {
+                    type_name: ::raster::alloc::string::String::from(stringify!(#ident)),
+                    fields: ::raster::alloc::vec![#(#schema_fields),*],
+                }
+            }
+        }
+    })
+}
+
+#[proc_macro_derive(Merklized)]
+pub fn derive_merklized(item: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(item as syn::DeriveInput);
+    let ident = &input.ident;
+    let generics = input.generics.clone();
+    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
+
+    TokenStream::from(quote! {
+        impl #impl_generics ::raster::core::input::Merklized for #ident #ty_generics #where_clause {}
+    })
 }

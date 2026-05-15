@@ -179,7 +179,7 @@ Raster also defines a tile I/O “trace item” record used by runtime subscribe
 
 #### Implemented today (tile I/O trace + commitments)
 
-When a program uses `#[raster::sequence] fn main(...)` as its entry point:
+When a program uses `#[raster::sequence] fn main()` as its entry point:
 
 - By default, it initializes a `JsonSubscriber` that writes serialized `TraceItem`s to stdout.
 - With `--commit <path>`, it initializes a `CommitSubscriber` that writes packed commitment blocks to the given file.

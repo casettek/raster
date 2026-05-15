@@ -1,4 +1,4 @@
-use hello_tiles::input::PersonalData;
+use hello_tiles::input::{Address, PersonalData};
 use raster::core::postcard;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -21,7 +21,16 @@ fn main() -> Result<(), Box<dyn Error>> {
     let data = PersonalData {
         age: 25,
         name: "John".to_string(),
-        address_lines: vec!["221B Baker Street".to_string(), "Flat B".to_string()],
+        addresses: vec![
+            Address {
+                lines: vec!["221B Baker Street".to_string(), "Flat B".to_string()],
+                indexes: vec![7, 42],
+            },
+            Address {
+                lines: vec!["Main Plaza".to_string()],
+                indexes: vec![3],
+            },
+        ],
     };
 
     let personal_data_json = serde_json::to_value(&data)?;

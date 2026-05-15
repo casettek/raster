@@ -183,7 +183,7 @@ Given:
 
 Given:
 
-- `#[sequence] fn main(name: String) -> String { ... }`
+- `#[sequence] fn main() -> String { ... }`
 
 Then:
 

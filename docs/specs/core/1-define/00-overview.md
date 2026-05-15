@@ -116,8 +116,9 @@ fn double(x: u64) -> u64 {
 }
 
 #[sequence(description = "Entry sequence")]
-fn main(x: u64) -> u64 {
-    double(x)
+fn main() -> u64 {
+    let x = external!("x");
+    call!(double, x)
 }
 ```
 

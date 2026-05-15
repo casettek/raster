@@ -17,6 +17,7 @@ use raster_core::cfs::{
     CfsCoordinates, CfsCursor, ControlFlowSchema, InputSource, SequenceChildItem,
 };
 use raster_core::fingerprint::{Fingerprint, FingerprintAccumulator};
+use raster_core::input::verify_selection_proof;
 use raster_core::trace::{ExternalInput, StepRecord};
 use raster_core::transition::{
     SerializableFrontier, StepRecordWitness, Transition, TransitionInput, TransitionJournal,
@@ -358,6 +359,19 @@ fn verify_external_inputs(
             "External input '{}' payload does not match the transported commitment",
             meta.name,
         );
+
+        if !meta.selector.is_empty() {
+            assert!(
+                !meta.selected.bytes.is_empty(),
+                "External input '{}' selector is missing selected payload bytes",
+                meta.name,
+            );
+            assert!(
+                verify_selection_proof(&meta.selected.bytes, &meta.selected.proof),
+                "External input '{}' selection proof is invalid",
+                meta.name,
+            );
+        }
     }
 }
 
@@ -621,6 +635,7 @@ mod tests {
                 commitment: commitment.to_vec(),
                 data: payload_data.to_vec(),
                 selector: Default::default(),
+                selected: Default::default(),
             },
         )]
         .into_iter()

@@ -182,7 +182,7 @@ fn exclaim(s: String) -> String {
 }
 
 #[sequence(description = "Greet and add punctuation")]
-fn main(name: String) -> String {
+fn greet_sequence(name: String) -> String {
     let greeting = greet(name);
     exclaim(greeting)
 }

@@ -1,13 +1,17 @@
 use raster::prelude::*;
 
+use hello_tiles::input::PersonalData;
 use hello_tiles::{
-    current_wish, exclaim, greet, greet_address_line, personal_greet,
-    personal_greet_from_object, personal_greet_with_seed, raster_wish,
+    current_wish, exclaim, greet, greet_address_line, personal_greet, personal_greet_from_object,
+    personal_greet_with_seed, raster_wish,
 };
 
 #[sequence]
 fn greet_sequence(name: String) -> String {
-    call!(personal_greet, external!("personal_data", select!("name")));
+    call!(
+        personal_greet,
+        select!(external!(PersonalData, "personal_data").name)
+    );
     let greeting = call!(greet, name);
     let e1 = call!(exclaim, greeting);
     let e2 = call!(exclaim, e1);
@@ -32,24 +36,29 @@ fn placeholder_sequence(placeholder: String) -> String {
 /// Entry point that runs the greet sequence natively.
 ///
 /// This example resolves committed external inputs from `input.json`:
-/// - `personal_data.name` and `personal_data.address_lines[0]` are selected from inline JSON
-/// - `personal_data_bin` is loaded from a binary postcard file into `External<PersonalData>`
+/// - `personal_data.name` is selected from inline JSON using schema-driven DSL paths
+/// - `personal_data_bin.addresses[0].lines[0]` is selected from a postcard-encoded struct file
+/// - `personal_data_bin` is also loaded as a whole `PersonalData` object
 /// - `seed` is provided inline in the JSON document
 ///
 /// Each input must have a matching public commitment in `input_manifest.json`.
 /// Run with generated fixtures:
 /// `cargo run -- --input input.json --input-manifest input_manifest.json`
+///
 #[sequence]
 fn main() {
     call_seq!(greet_sequence, "Rust".to_string());
-    call!(
-        personal_greet_with_seed,
-        external!("personal_data", select!("name")),
-        external!("seed")
-    );
+
+    let personal_data = external!(PersonalData, "personal_data");
+    let name = select!(personal_data.name);
+
+    let seed = external!("seed");
+
+    call!(personal_greet_with_seed, name, seed);
+
     call!(
         greet_address_line,
-        external!("personal_data", select!("address_lines", 0))
+        select!(external!(PersonalData, "personal_data_bin").addresses[0].lines[0])
     );
     call!(personal_greet_from_object, external!("personal_data_bin"));
     let name_2 = call_seq!(placeholder_sequence, "Placeholder".to_string());

@@ -1,9 +1,11 @@
 //! External input marker and resolved value types.
 
+use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::marker::PhantomData;
 use serde::{Deserialize, Deserializer, Serialize};
+use sha2::{Digest, Sha256};
 
 #[cfg(feature = "std")]
 use std::collections::BTreeMap;
@@ -53,6 +55,145 @@ impl SelectorPath {
 pub enum SelectorSegment {
     Field(String),
     Index(u64),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum SchemaNode {
+    Leaf {
+        type_name: String,
+    },
+    Struct {
+        type_name: String,
+        fields: Vec<SchemaField>,
+    },
+    List {
+        type_name: String,
+        element: Box<SchemaNode>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct SchemaField {
+    pub name: String,
+    pub label: String,
+    pub schema: Box<SchemaNode>,
+}
+
+impl SchemaField {
+    pub fn new(name: impl Into<String>, label: impl Into<String>, schema: SchemaNode) -> Self {
+        Self {
+            name: name.into(),
+            label: label.into(),
+            schema: Box::new(schema),
+        }
+    }
+}
+
+pub trait Selectable {
+    fn schema() -> SchemaNode;
+}
+
+pub trait Merklized: Selectable + Serialize {}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct StructProofSibling {
+    pub label: String,
+    pub hash: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum ListProofDirection {
+    Left,
+    Right,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct ListProofSibling {
+    pub direction: ListProofDirection,
+    pub hash: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum SelectionProofStep {
+    Struct {
+        label: String,
+        siblings: Vec<StructProofSibling>,
+    },
+    List {
+        index: u64,
+        len: u64,
+        siblings: Vec<ListProofSibling>,
+    },
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct SelectionProof {
+    pub path: SelectorPath,
+    pub root_hash: Vec<u8>,
+    pub steps: Vec<SelectionProofStep>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct SelectedPayload {
+    #[serde(default)]
+    pub bytes: Vec<u8>,
+    #[serde(default)]
+    pub proof: SelectionProof,
+}
+
+fn selection_hash(parts: &[&[u8]]) -> Vec<u8> {
+    let mut hasher = Sha256::new();
+    for part in parts {
+        hasher.update(part);
+    }
+    hasher.finalize().to_vec()
+}
+
+pub fn verify_selection_proof(selected_bytes: &[u8], proof: &SelectionProof) -> bool {
+    let mut current_hash = selection_hash(&[b"leaf", selected_bytes]);
+    for step in proof.steps.iter().rev() {
+        current_hash = match step {
+            SelectionProofStep::Struct { label, siblings } => {
+                let mut parts: Vec<Vec<u8>> = Vec::with_capacity(siblings.len() + 2);
+                parts.push(b"struct".to_vec());
+                let mut inserted = false;
+                for sibling in siblings {
+                    if !inserted && label <= &sibling.label {
+                        parts.push(label.as_bytes().to_vec());
+                        parts.push(current_hash.clone());
+                        inserted = true;
+                    }
+                    parts.push(sibling.label.as_bytes().to_vec());
+                    parts.push(sibling.hash.clone());
+                }
+                if !inserted {
+                    parts.push(label.as_bytes().to_vec());
+                    parts.push(current_hash.clone());
+                }
+                let refs: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
+                selection_hash(&refs)
+            }
+            SelectionProofStep::List {
+                index: _,
+                len,
+                siblings,
+            } => {
+                let mut hash = current_hash;
+                for sibling in siblings {
+                    hash = match sibling.direction {
+                        ListProofDirection::Left => {
+                            selection_hash(&[b"list-node", sibling.hash.as_slice(), hash.as_slice()])
+                        }
+                        ListProofDirection::Right => {
+                            selection_hash(&[b"list-node", hash.as_slice(), sibling.hash.as_slice()])
+                        }
+                    };
+                }
+                selection_hash(&[b"list-root", &len.to_le_bytes(), hash.as_slice()])
+            }
+        };
+    }
+    current_hash == proof.root_hash
 }
 
 impl From<&str> for SelectorSegment {
@@ -176,6 +317,8 @@ pub struct ExternalArgInfo {
     pub commitment: Option<String>,
     #[serde(default)]
     pub bytes: Vec<u8>,
+    #[serde(default)]
+    pub selected: SelectedPayload,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -231,6 +374,8 @@ pub struct ExternalValue<T> {
     pub commitment: Option<String>,
     #[serde(default)]
     pub bytes: Vec<u8>,
+    #[serde(default)]
+    pub selected: SelectedPayload,
     pub value: T,
 }
 
@@ -240,6 +385,7 @@ impl<T> ExternalValue<T> {
         selector: SelectorPath,
         commitment: Option<String>,
         bytes: Vec<u8>,
+        selected: SelectedPayload,
         value: T,
     ) -> Self {
         Self {
@@ -247,6 +393,7 @@ impl<T> ExternalValue<T> {
             selector,
             commitment,
             bytes,
+            selected,
             value,
         }
     }
@@ -258,7 +405,55 @@ impl<T> ExternalValue<T> {
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
     }
+
+    pub fn selected(&self) -> &SelectedPayload {
+        &self.selected
+    }
 }
+
+macro_rules! impl_leaf_schema {
+    ($($ty:ty => $name:expr),+ $(,)?) => {
+        $(
+            impl Selectable for $ty {
+                fn schema() -> SchemaNode {
+                    SchemaNode::Leaf {
+                        type_name: $name.into(),
+                    }
+                }
+            }
+
+            impl Merklized for $ty {}
+        )+
+    };
+}
+
+impl_leaf_schema!(
+    bool => "bool",
+    String => "String",
+    usize => "usize",
+    u64 => "u64",
+    u32 => "u32",
+    u16 => "u16",
+    u8 => "u8",
+    i64 => "i64",
+    i32 => "i32",
+    i16 => "i16",
+    i8 => "i8"
+);
+
+impl<T> Selectable for Vec<T>
+where
+    T: Selectable,
+{
+    fn schema() -> SchemaNode {
+        SchemaNode::List {
+            type_name: "Vec".into(),
+            element: Box::new(T::schema()),
+        }
+    }
+}
+
+impl<T> Merklized for Vec<T> where T: Merklized {}
 
 /// A private file-backed external input declared inside `input.json`.
 pub type ExternalInputPathEntry = String;

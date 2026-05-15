@@ -196,6 +196,7 @@ mod tests {
                 commitment: commitment.to_vec(),
                 data: data.to_vec(),
                 selector: Default::default(),
+                selected: Default::default(),
             },
         )])
         .into_iter()

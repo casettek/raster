@@ -276,7 +276,8 @@ fn greet_sequence(name: String) -> String {
 }
 
 #[sequence(description = "Entry point")]
-fn main(name: String) {
+fn main() {
+    let name = external!("name");
     call_seq!(greet_sequence, name);
 }
 ```
@@ -290,8 +291,8 @@ fn main(name: String) {
   - `greet_sequence` → calls: `[call!(greet, name) → Tile, call!(exclaim, greeting) → Tile]`
     - `name` resolves to `seq_input(0)`
     - `greeting` resolves to `item_output(0, 0)` (output of `greet`)
-  - `main` → calls: `[call_seq!(greet_sequence, name) → Sequence]`
-    - `name` resolves to `seq_input(0)`
+- `main` → calls: `[call_seq!(greet_sequence, name) → Sequence]`
+    - `name` resolves to `external`
 
 ### Expected CFS (informative JSON shape)
 
