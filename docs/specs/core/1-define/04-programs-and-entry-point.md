@@ -71,6 +71,12 @@ This document specifies how Raster “programs” are defined for the Core toolc
 
 - At the Core ABI boundary for tiles, external inputs MUST be represented as an opaque byte string that is decoded using the Postcard encoding (`postcard::from_bytes`).
 
+- The private `input.json` document maps external names to serialized files only. Each value MUST be an object of the form `{ "path": "...", "load_preference": "read|mmap" }`; inline objects, arrays, strings, numbers, and booleans are not valid external payloads.
+
+- Referenced external files MUST contain Postcard-serialized values. The public `input_manifest.json` commitment is the SHA-256 hash of the raw file bytes.
+
+- Selecting a sub-value from a Postcard external requires a typed root binding (for example `external!(RootType, "name")`) so the runtime can decode the root value before applying the selector.
+
 #### External inputs to tiles (tile ABI rules)
 
 Given a tile function \(f\) annotated with `#[tile(...)]`:
@@ -210,7 +216,7 @@ fn greet(name: String) -> String {
 
 #[sequence]
 fn main() -> String {
-    let name = select!(external!("name"));
+    let name = select!(String, external!(String, "name"));
     greet(name)
 }
 ```

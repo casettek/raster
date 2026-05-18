@@ -16,12 +16,12 @@ pub use raster_core as core;
 
 pub mod input;
 pub use input::{
-    external, into_resolved_arg, resolve_external_value, resolve_typed_external_value,
-    select_source, selector_path, typed_external, ArgKind, External, ExternalArgInfo,
-    ExternalBinding, ExternalRef, ExternalSelection, IntoResolvedArg, ListProofDirection,
-    ListProofSibling, Merklized, ResolvedArg, SchemaField, SchemaNode, Selectable,
-    SelectedExternalBinding, SelectedPayload, SelectionProof, SelectionProofStep, SelectorPath,
-    SelectorSegment, StructProofSibling, TypedExternalBinding, TypedSelectedExternalBinding,
+    into_resolved_arg, resolve_external_value, resolve_typed_external_value, select_source,
+    selector_path, typed_external, typed_selector_path, ExternalArg, ExternalRef,
+    ExternalSelection, IntoResolvedArg, ListProofDirection, ListProofSibling, Merklized,
+    ResolvedArg, SchemaField, SchemaNode, Selectable, SelectedPayload, SelectionProof,
+    SelectionProofStep, SelectorPath, SelectorSegment, StructProofSibling, TypedExternalBinding,
+    TypedSelectedExternalBinding, TypedSelectorPath,
 };
 
 pub use raster_macros::{select, sequence, tile, Merklized, Selectable};
@@ -72,7 +72,7 @@ macro_rules! call {
     };
 }
 
-/// Creates an external-input reference for explicit call-site bindings.
+/// Creates a typed external-input reference for explicit call-site bindings.
 #[macro_export]
 macro_rules! external {
     ($ty:ty, $name:literal) => {
@@ -80,12 +80,6 @@ macro_rules! external {
     };
     ($ty:ty, $name:expr) => {
         $crate::typed_external::<$ty>($name)
-    };
-    ($name:literal) => {
-        $crate::external($name)
-    };
-    ($name:expr) => {
-        $crate::external($name)
     };
 }
 
@@ -132,7 +126,7 @@ macro_rules! debug {
 /// Prelude module for convenient imports.
 pub mod prelude {
     pub use crate::core::{
-        input::{External, ExternalRef},
+        input::ExternalRef,
         tile::{TileId, TileIdStatic, TileMetadata, TileMetadataStatic},
         Result,
     };
@@ -153,12 +147,11 @@ pub mod prelude {
     };
 
     pub use crate::{
-        call, call_seq, debug, external, select, sequence, tile, ArgKind, ExternalArgInfo,
-        ExternalBinding, ExternalSelection, IntoResolvedArg, ListProofDirection,
-        ListProofSibling, Merklized, ResolvedArg, SchemaField, SchemaNode, Selectable,
-        SelectedExternalBinding, SelectedPayload, SelectionProof, SelectionProofStep,
+        call, call_seq, debug, external, select, sequence, tile, ExternalArg, ExternalSelection,
+        IntoResolvedArg, ListProofDirection, ListProofSibling, Merklized, ResolvedArg,
+        SchemaField, SchemaNode, Selectable, SelectedPayload, SelectionProof, SelectionProofStep,
         SelectorPath, SelectorSegment, StructProofSibling, TypedExternalBinding,
-        TypedSelectedExternalBinding,
+        TypedSelectedExternalBinding, TypedSelectorPath,
     };
 
     // TODO: Re-enable once Executor/Tracer types are implemented
@@ -167,7 +160,4 @@ pub mod prelude {
 
     #[cfg(feature = "std")]
     pub use crate::{resolve_external_value, resolve_typed_external_value};
-
-    #[cfg(feature = "std")]
-    pub use crate::input::parse_program_input_value;
 }

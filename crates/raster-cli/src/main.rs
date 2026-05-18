@@ -120,11 +120,11 @@ enum Commands {
         #[arg(long, short, value_enum, default_value = "native")]
         backend: BackendType,
 
-        /// Input as inline JSON or a path to a JSON file
+        /// Input as path to a JSON file
         #[arg(long)]
         input: Option<String>,
 
-        /// Public manifest as inline JSON or a path to a JSON file
+        /// Public manifest as path to a JSON file
         #[arg(long = "input-manifest")]
         input_manifest: Option<String>,
 

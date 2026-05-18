@@ -19,28 +19,6 @@ pub fn read_json_source(raw_input: Option<&str>, label: &str) -> Result<Vec<u8>>
     }
 }
 
-pub fn read_external_inputs(
-    recorded_step_io: &HashMap<StepRecord, (Option<Vec<u8>>, Option<Vec<u8>>, ExternalInput)>,
-) -> BTreeMap<String, Vec<u8>> {
-    let mut external_input_commitments = BTreeMap::new();
-
-    for (_step, (_input, _output, external_input)) in recorded_step_io {
-        for external_data in external_input.values() {
-            if let Some(previous) = external_input_commitments
-                .insert(external_data.name.clone(), external_data.commitment.clone())
-            {
-                assert_eq!(
-                    previous, external_data.commitment,
-                    "Conflicting commitments recorded for external input '{}'",
-                    external_data.name
-                );
-            }
-        }
-    }
-
-    external_input_commitments
-}
-
 pub fn collect_external_input_commitments(
     recorded_step_io: &HashMap<StepRecord, (Option<Vec<u8>>, Option<Vec<u8>>, ExternalInput)>,
 ) -> BTreeMap<String, Vec<u8>> {
@@ -62,6 +40,7 @@ pub fn collect_external_input_commitments(
             }
         }
     }
+
     commitments_by_name
 }
 

@@ -17,6 +17,8 @@ Cargo.lock
 *.trace
 *.raster
 
+*.bin
+
 # Testing
 coverage/
 *.profraw

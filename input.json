@@ -1,12 +1,5 @@
 {
-  "personal_data": {
-  "address_lines": [
-    "221B Baker Street",
-    "Flat B"
-  ],
-  "age": 25,
-  "name": "John"
-},
-  "personal_data_bin": { "path": "personal_data.bin" },
-  "seed": 123
+  "personal_data": { "path": "personal_data.bin", "load_preference": "read" },
+  "personal_data_bin": { "path": "personal_data.bin", "load_preference": "mmap" },
+  "seed": { "path": "seed.bin", "load_preference": "read" }
 }

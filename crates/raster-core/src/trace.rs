@@ -34,9 +34,7 @@ pub type ExternalInput = BTreeMap<InternalBindingName, ExternalData>;
 pub struct ExternalData {
     pub name: String,
     pub commitment: Vec<u8>,
-    #[serde(default)]
     pub selector: SelectorPath,
-    #[serde(default)]
     pub selected: SelectedPayload,
 }
 

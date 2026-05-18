@@ -8,8 +8,9 @@
 use proc_macro::TokenStream;
 use quote::{format_ident, quote, ToTokens};
 use syn::{
+    parse::{Parse, ParseStream},
     parse_macro_input, Attribute, Expr, ExprField, ExprIndex, FnArg, ItemFn, LitInt, Pat,
-    ReturnType, Type,
+    ReturnType, Token, Type,
 };
 
 #[derive(Clone)]
@@ -18,7 +19,7 @@ struct ParamInfo {
     ty: Type,
 }
 
-fn extract_inputs(input: &ItemFn) -> Vec<ParamInfo> {
+fn extract_params(input: &ItemFn) -> Vec<ParamInfo> {
     input
         .sig
         .inputs
@@ -56,58 +57,11 @@ fn parse_schema_tag(attrs: &[Attribute]) -> Option<u32> {
     })
 }
 
-fn extract_external_payload_ty(ty: &Type) -> Option<Type> {
-    let Type::Path(type_path) = ty else {
-        return None;
-    };
-    let segment = type_path.path.segments.last()?;
-    if segment.ident != "External" {
-        return None;
-    }
-    let syn::PathArguments::AngleBracketed(args) = &segment.arguments else {
-        return None;
-    };
-    let first = args.args.first()?;
-    let syn::GenericArgument::Type(inner_ty) = first else {
-        return None;
-    };
-    Some(inner_ty.clone())
-}
-
-fn resolved_external_param_ty(ty: &Type) -> Type {
-    extract_external_payload_ty(ty).unwrap_or_else(|| ty.clone())
-}
-
-fn call_boundary_param_ty(ty: &Type) -> Type {
-    let resolved_ty = resolved_external_param_ty(ty);
-    syn::parse2(quote! { impl ::raster::IntoResolvedArg<#resolved_ty> })
-        .expect("call boundary type should parse")
-}
-
-fn rewrite_call_boundary_inputs(sig: &mut syn::Signature, params: &[ParamInfo]) {
-    for param in params {
-        for arg in sig.inputs.iter_mut() {
-            if let FnArg::Typed(pat_type) = arg {
-                if let Pat::Ident(pat_ident) = &*pat_type.pat {
-                    if pat_ident.ident == param.ident {
-                        pat_type.ty = Box::new(call_boundary_param_ty(&param.ty));
-                    }
-                }
-            }
-        }
-    }
-}
-
-fn rewrite_resolved_external_inputs(sig: &mut syn::Signature, params: &[ParamInfo]) {
-    for param in params {
-        for arg in sig.inputs.iter_mut() {
-            if let FnArg::Typed(pat_type) = arg {
-                if let Pat::Ident(pat_ident) = &*pat_type.pat {
-                    if pat_ident.ident == param.ident {
-                        pat_type.ty = Box::new(resolved_external_param_ty(&param.ty));
-                    }
-                }
-            }
+fn rewrite_into_resolved_args(sig: &mut syn::Signature) {
+    for arg in sig.inputs.iter_mut() {
+        if let FnArg::Typed(pat_type) = arg {
+            let ty = &pat_type.ty;
+            pat_type.ty = syn::parse_quote!(impl ::raster::IntoResolvedArg<#ty>);
         }
     }
 }
@@ -117,13 +71,13 @@ fn external_info_ident(param: &ParamInfo) -> syn::Ident {
 }
 
 fn gen_arg_resolution(input: &ItemFn) -> proc_macro2::TokenStream {
-    let params = extract_inputs(input);
+    let params = extract_params(input);
     let is_result = returns_result(input);
     let resolutions: Vec<_> = params
         .iter()
         .map(|param| {
             let name = &param.ident;
-            let resolved_ty = resolved_external_param_ty(&param.ty);
+            let resolved_ty = &param.ty;
             let external_info_ident = external_info_ident(param);
             let resolve = if is_result {
                 quote! {
@@ -137,7 +91,7 @@ fn gen_arg_resolution(input: &ItemFn) -> proc_macro2::TokenStream {
             };
             quote! {
                 let __raster_resolved_arg = #resolve;
-                let #external_info_ident = __raster_resolved_arg.external_info().cloned();
+                let #external_info_ident = __raster_resolved_arg.as_external().cloned();
                 let #name: #resolved_ty = __raster_resolved_arg.into_inner();
             }
         })
@@ -160,14 +114,14 @@ fn returns_result(input: &ItemFn) -> bool {
 ///
 /// Returns a TokenStream that deserializes input bytes into the appropriate variables.
 fn gen_inputs_deserialization(input: &ItemFn) -> proc_macro2::TokenStream {
-    let params = extract_inputs(input);
+    let params = extract_params(input);
     if params.is_empty() {
         // No arguments - no deserialization needed
         quote! {}
     } else if params.len() == 1 {
         // Single argument - deserialize directly
         let param = &params[0];
-        let decode_ty = resolved_external_param_ty(&param.ty);
+        let decode_ty = &param.ty;
         let name = &param.ident;
         quote! {
             let #name: #decode_ty = ::raster::core::postcard::from_bytes(input)
@@ -178,7 +132,7 @@ fn gen_inputs_deserialization(input: &ItemFn) -> proc_macro2::TokenStream {
         let decode_types: Vec<_> = params
             .iter()
             .map(|param| {
-                let ty = resolved_external_param_ty(&param.ty);
+                let ty = &param.ty;
                 quote! { #ty }
             })
             .collect();
@@ -205,14 +159,14 @@ fn gen_output_serialization(_input: &ItemFn) -> proc_macro2::TokenStream {
 ///
 /// This serializes the typed input parameters to bytes for the trace emission.
 fn gen_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream {
-    let params = extract_inputs(input);
+    let params = extract_params(input);
 
     let input_arg_defs: Vec<_> = params
         .iter()
         .map(|param| {
             let name = &param.ident;
             let name_str = name.to_string();
-            let ty = resolved_external_param_ty(&param.ty);
+            let ty = &param.ty;
             let ty_str = ty.to_token_stream().to_string();
             quote! {
                 ::raster::core::trace::FnInputArg {
@@ -296,13 +250,13 @@ fn gen_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream {
 ///
 /// Returns a TokenStream that calls the function and stores the result.
 fn gen_function_call(target_fn: &syn::Ident, input: &ItemFn) -> proc_macro2::TokenStream {
-    let input_names: Vec<_> = extract_inputs(input)
+    let param_names: Vec<syn::Ident> = extract_params(input)
         .into_iter()
         .map(|param| param.ident)
         .collect();
     let is_result = returns_result(input);
 
-    if input_names.is_empty() {
+    if param_names.is_empty() {
         if is_result {
             quote! { let result = #target_fn()?; }
         } else {
@@ -310,9 +264,9 @@ fn gen_function_call(target_fn: &syn::Ident, input: &ItemFn) -> proc_macro2::Tok
         }
     } else {
         if is_result {
-            quote! { let result = #target_fn(#(#input_names),*)?; }
+            quote! { let result = #target_fn(#(#param_names),*)?; }
         } else {
-            quote! { let result = #target_fn(#(#input_names),*); }
+            quote! { let result = #target_fn(#(#param_names),*); }
         }
     }
 }
@@ -411,7 +365,6 @@ impl TileAttrs {
 pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
     let input_fn = parse_macro_input!(item as ItemFn);
     let fn_name_str = input_fn.sig.ident.to_string();
-    let params = extract_inputs(&input_fn);
 
     let fn_name = &input_fn.sig.ident;
     let fn_vis = &input_fn.vis;
@@ -441,11 +394,10 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
     let arg_resolution = gen_arg_resolution(&input_fn);
 
     let mut exposed_sig = input_fn.sig.clone();
-    rewrite_call_boundary_inputs(&mut exposed_sig, &params);
+    rewrite_into_resolved_args(&mut exposed_sig);
 
     let mut implementation_sig = input_fn.sig.clone();
     implementation_sig.ident = implementation_name.clone();
-    rewrite_resolved_external_inputs(&mut implementation_sig, &params);
 
     // For recursive tiles, also generate a macro with the same name that allows `tile_name!(args)` syntax
     let _recursive_macro = if attrs.tile_type == "recur" {
@@ -644,7 +596,7 @@ fn gen_sequence_wrapped_body(fn_name_str: &str, item_fn: &ItemFn) -> proc_macro2
 /// ```ignore
 /// #[raster::sequence]
 /// fn main() {
-///     let name = raster::select!(raster::external!("name"));
+///     let name = raster::select!(String, raster::external!(String, "name"));
 ///     let result = greet_sequence(name);
 ///     println!("{}", result);
 /// }
@@ -661,13 +613,14 @@ fn gen_sequence_wrapped_body(fn_name_str: &str, item_fn: &ItemFn) -> proc_macro2
 pub fn sequence(attr: TokenStream, item: TokenStream) -> TokenStream {
     let item_fn = parse_macro_input!(item as ItemFn);
     let fn_name_str = item_fn.sig.ident.to_string();
-    let params = extract_inputs(&item_fn);
+    let params = extract_params(&item_fn);
 
     let fn_vis = &item_fn.vis;
     let fn_attrs = &item_fn.attrs;
     let _attrs = SequenceAttrs::parse(attr);
+
     let mut sequence_sig = item_fn.sig.clone();
-    rewrite_call_boundary_inputs(&mut sequence_sig, &params);
+    rewrite_into_resolved_args(&mut sequence_sig);
 
     let expanded = if item_fn.sig.ident == "main" {
         if !params.is_empty() {
@@ -735,15 +688,34 @@ fn split_selector_expr(expr: Expr) -> (Expr, Vec<proc_macro2::TokenStream>) {
     }
 }
 
+struct SelectInput {
+    selected_ty: Type,
+    expr: Expr,
+}
+
+impl Parse for SelectInput {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        Ok(Self {
+            selected_ty: input.parse()?,
+            expr: {
+                input.parse::<Token![,]>()?;
+                input.parse()?
+            },
+        })
+    }
+}
+
 #[proc_macro]
 pub fn select(item: TokenStream) -> TokenStream {
-    let expr = parse_macro_input!(item as Expr);
+    let SelectInput { selected_ty, expr } = parse_macro_input!(item as SelectInput);
     let (base_expr, segments) = split_selector_expr(expr);
 
     TokenStream::from(quote! {
         ::raster::select_source(
             #base_expr,
-            ::raster::SelectorPath::new(::raster::alloc::vec![#(#segments),*]),
+            ::raster::typed_selector_path::<_, #selected_ty>(
+                ::raster::SelectorPath::new(::raster::alloc::vec![#(#segments),*]),
+            ),
         )
     })
 }

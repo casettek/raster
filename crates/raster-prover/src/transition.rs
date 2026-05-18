@@ -178,7 +178,9 @@ mod tests {
     use raster_core::authorization::{AuthorizationJournal, ManifestedInputs};
     use raster_core::cfs::{CfsCoordinates, ControlFlowSchema, SequenceDef};
     use raster_core::fingerprint::{BitPacker, Fingerprint};
-    use raster_core::trace::{ExternalData, SequenceEndRecord, SequenceStartRecord, TileExecRecord};
+    use raster_core::trace::{
+        ExternalData, SequenceEndRecord, SequenceStartRecord, TileExecRecord,
+    };
     use sha2::{Digest, Sha256};
 
     fn external_input_commitment(external_input: &ExternalInput) -> Vec<u8> {
@@ -232,8 +234,8 @@ mod tests {
                 "personal_data".to_string(),
                 b"239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5".to_vec(),
             )]
-                .into_iter()
-                .collect(),
+            .into_iter()
+            .collect(),
             manifest_commitment: vec![4; 32],
         }
     }

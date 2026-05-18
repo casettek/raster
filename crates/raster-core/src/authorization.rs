@@ -16,4 +16,3 @@ pub struct AuthorizationJournal {
     pub external_inputs_commitments: BTreeMap<String, Vec<u8>>,
     pub manifest_commitment: Vec<u8>,
 }
-

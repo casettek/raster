@@ -41,8 +41,8 @@ pub fn personal_greet_from_object(personal_data: PersonalData) -> String {
     greet
 }
 
-/// A greeting tile that resolves both committed example inputs:
-/// schema-selected `personal_data.name` and inline `seed`.
+/// A greeting tile that resolves both committed postcard-encoded example inputs:
+/// schema-selected `personal_data.name` and `seed`.
 #[tile(kind=iter)]
 pub fn personal_greet_with_seed(name: String, seed: u64) -> String {
     let greet = format!("Hello, {}!!!! (seed: {})", name, seed);

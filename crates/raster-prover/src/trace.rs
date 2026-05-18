@@ -320,8 +320,7 @@ fn resolve_inputs_sources(
         return Vec::new();
     }
 
-    let Some((sequence_coordinates, item_coordinate)) = sequence_coordinates(&step_record)
-    else {
+    let Some((sequence_coordinates, item_coordinate)) = sequence_coordinates(&step_record) else {
         // Entrypoint SequenceStart/SequenceEnd
         return Vec::new();
     };

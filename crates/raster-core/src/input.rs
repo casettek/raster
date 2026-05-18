@@ -3,8 +3,7 @@
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::marker::PhantomData;
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 #[cfg(feature = "std")]
@@ -37,7 +36,6 @@ impl ExternalRef {
 /// A structured path describing a selected sub-value inside an external input.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct SelectorPath {
-    #[serde(default)]
     pub segments: Vec<SelectorSegment>,
 }
 
@@ -135,9 +133,7 @@ pub struct SelectionProof {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct SelectedPayload {
-    #[serde(default)]
     pub bytes: Vec<u8>,
-    #[serde(default)]
     pub proof: SelectionProof,
 }
 
@@ -181,12 +177,16 @@ pub fn verify_selection_proof(selected_bytes: &[u8], proof: &SelectionProof) -> 
                 let mut hash = current_hash;
                 for sibling in siblings {
                     hash = match sibling.direction {
-                        ListProofDirection::Left => {
-                            selection_hash(&[b"list-node", sibling.hash.as_slice(), hash.as_slice()])
-                        }
-                        ListProofDirection::Right => {
-                            selection_hash(&[b"list-node", hash.as_slice(), sibling.hash.as_slice()])
-                        }
+                        ListProofDirection::Left => selection_hash(&[
+                            b"list-node",
+                            sibling.hash.as_slice(),
+                            hash.as_slice(),
+                        ]),
+                        ListProofDirection::Right => selection_hash(&[
+                            b"list-node",
+                            hash.as_slice(),
+                            sibling.hash.as_slice(),
+                        ]),
                     };
                 }
                 selection_hash(&[b"list-root", &len.to_le_bytes(), hash.as_slice()])
@@ -276,115 +276,51 @@ impl ExternalSelection {
     }
 }
 
-/// A typed external input reference used at user-facing function boundaries.
-///
-/// The generic parameter ties the reference to the payload type that will be
-/// resolved later, allowing Raster to enforce serde trait bounds on external
-/// inputs through the type system.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct External<T> {
-    pub reference: ExternalRef,
-    marker: PhantomData<fn() -> T>,
-}
-
-impl<T> External<T> {
-    pub fn new(name: impl Into<String>) -> Self {
-        Self {
-            reference: ExternalRef::new(name),
-            marker: PhantomData,
-        }
-    }
-
-    pub fn name(&self) -> &str {
-        &self.reference.name
-    }
-
-    pub fn selector(&self) -> &SelectorPath {
-        &self.reference.selector
-    }
-
-    pub fn into_ref(self) -> ExternalRef {
-        self.reference
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub struct ExternalArgInfo {
-    pub name: String,
-    #[serde(default)]
-    pub selector: SelectorPath,
-    #[serde(default)]
-    pub commitment: Option<String>,
-    #[serde(default)]
-    pub bytes: Vec<u8>,
-    #[serde(default)]
-    pub selected: SelectedPayload,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub enum ArgKind {
-    Inline,
-    External(ExternalArgInfo),
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub struct ResolvedArg<T> {
-    pub value: T,
-    pub kind: ArgKind,
+pub enum ResolvedArg<T> {
+    External(ExternalArg<T>),
+    Inline(T),
 }
 
 impl<T> ResolvedArg<T> {
     pub fn inline(value: T) -> Self {
-        Self {
-            value,
-            kind: ArgKind::Inline,
-        }
+        Self::Inline(value)
     }
 
-    pub fn external(value: T, info: ExternalArgInfo) -> Self {
-        Self {
-            value,
-            kind: ArgKind::External(info),
-        }
-    }
-
-    pub fn kind(&self) -> &ArgKind {
-        &self.kind
+    pub fn external(value: ExternalArg<T>) -> Self {
+        Self::External(value)
     }
 
     pub fn into_inner(self) -> T {
-        self.value
+        match self {
+            Self::External(external) => external.value,
+            Self::Inline(value) => value,
+        }
     }
 
-    pub fn external_info(&self) -> Option<&ExternalArgInfo> {
-        match &self.kind {
-            ArgKind::Inline => None,
-            ArgKind::External(info) => Some(info),
+    pub fn as_external(&self) -> Option<&ExternalArg<T>> {
+        match self {
+            Self::External(external) => Some(external),
+            Self::Inline(_) => None,
         }
     }
 }
 
 /// A resolved external input carrying both identity metadata and the typed value.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub struct ExternalValue<T> {
+pub struct ExternalArg<T> {
     pub name: String,
-    #[serde(default)]
     pub selector: SelectorPath,
-    #[serde(default)]
     pub commitment: Option<String>,
-    #[serde(default)]
-    pub bytes: Vec<u8>,
-    #[serde(default)]
     pub selected: SelectedPayload,
     pub value: T,
 }
 
-impl<T> ExternalValue<T> {
+impl<T> ExternalArg<T> {
     pub fn new(
         name: impl Into<String>,
         selector: SelectorPath,
         commitment: Option<String>,
-        bytes: Vec<u8>,
         selected: SelectedPayload,
         value: T,
     ) -> Self {
@@ -392,7 +328,6 @@ impl<T> ExternalValue<T> {
             name: name.into(),
             selector,
             commitment,
-            bytes,
             selected,
             value,
         }
@@ -403,7 +338,7 @@ impl<T> ExternalValue<T> {
     }
 
     pub fn bytes(&self) -> &[u8] {
-        &self.bytes
+        &self.selected.bytes
     }
 
     pub fn selected(&self) -> &SelectedPayload {
@@ -458,64 +393,39 @@ impl<T> Merklized for Vec<T> where T: Merklized {}
 /// A private file-backed external input declared inside `input.json`.
 pub type ExternalInputPathEntry = String;
 
+/// How the runtime should back a resolved external file in memory.
+#[cfg(feature = "std")]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalLoadPreference {
+    Read,
+    Mmap,
+}
+
 /// A public external input commitment declared inside `input_manifest.json`.
 pub type ExternalInputManifestEntry = String;
 
-/// A private JSON input document used by the native whole-program runner.
+/// A private input document that binds external names to serialized files.
 ///
-/// Each top-level field may be either:
-/// - an inline JSON value, or
-/// - an external path entry encoded as `{ "path": "..." }`
+/// Each top-level field must be an external path entry encoded as
+/// `{ "path": "...", "load_preference": "read|mmap" }`. The referenced file is
+/// decoded by the runtime using Raster's Postcard tile ABI codec.
 #[cfg(feature = "std")]
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-#[serde(untagged)]
-pub enum InputDocumentEntry {
-    Path { path: ExternalInputPathEntry },
-    Inline(serde_json::Value),
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct InputDocumentEntry {
+    pub path: ExternalInputPathEntry,
+    pub load_preference: ExternalLoadPreference,
 }
 
 #[cfg(feature = "std")]
 impl InputDocumentEntry {
-    pub fn as_path(&self) -> Option<&str> {
-        match self {
-            Self::Path { path } => Some(path.as_str()),
-            Self::Inline(_) => None,
-        }
+    pub fn path(&self) -> &str {
+        self.path.as_str()
     }
 
-    pub fn as_inline_value(&self) -> Option<&serde_json::Value> {
-        match self {
-            Self::Path { .. } => None,
-            Self::Inline(value) => Some(value),
-        }
-    }
-
-    pub fn to_json_value(&self) -> serde_json::Value {
-        match self {
-            Self::Path { path } => serde_json::Value::String(path.clone()),
-            Self::Inline(value) => value.clone(),
-        }
-    }
-}
-
-#[cfg(feature = "std")]
-impl<'de> Deserialize<'de> for InputDocumentEntry {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let value = serde_json::Value::deserialize(deserializer)?;
-        match value {
-            serde_json::Value::Object(map) => {
-                if map.len() == 1 {
-                    if let Some(serde_json::Value::String(path)) = map.get("path") {
-                        return Ok(Self::Path { path: path.clone() });
-                    }
-                }
-                Ok(Self::Inline(serde_json::Value::Object(map)))
-            }
-            other => Ok(Self::Inline(other)),
-        }
+    pub fn load_preference(&self) -> ExternalLoadPreference {
+        self.load_preference
     }
 }
 
@@ -556,30 +466,58 @@ pub type InputManifestDocument = BTreeMap<String, InputManifestEntry>;
 #[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
+    use alloc::string::ToString;
 
     #[test]
-    fn parses_mixed_input_document_entries() {
+    fn parses_external_input_entries_with_per_file_load_preference() {
         let document: InputDocument = serde_json::from_str(
             r#"{
-                "count": 7,
-                "user": "alice",
-                "payload": { "path": "payload.bin" }
+                "payload": {
+                    "path": "payload.bin",
+                    "load_preference": "mmap"
+                }
             }"#,
         )
         .unwrap();
 
         assert_eq!(
-            document.get("payload").and_then(InputDocumentEntry::as_path),
+            document.get("payload").map(InputDocumentEntry::path),
             Some("payload.bin")
         );
         assert_eq!(
-            document.get("count").map(InputDocumentEntry::to_json_value),
-            Some(serde_json::json!(7))
+            document
+                .get("payload")
+                .map(InputDocumentEntry::load_preference),
+            Some(ExternalLoadPreference::Mmap)
         );
-        assert_eq!(
-            document.get("user").map(InputDocumentEntry::to_json_value),
-            Some(serde_json::json!("alice"))
-        );
+    }
+
+    #[test]
+    fn rejects_input_document_entries_without_load_preference() {
+        let err = serde_json::from_str::<InputDocument>(
+            r#"{
+                "payload": { "path": "payload.bin" }
+            }"#,
+        )
+        .expect_err("load preference is required");
+
+        assert!(err.to_string().contains("missing field `load_preference`"));
+    }
+
+    #[test]
+    fn rejects_input_document_entries_with_unknown_fields() {
+        let err = serde_json::from_str::<InputDocument>(
+            r#"{
+                "payload": {
+                    "path": "payload.bin",
+                    "load_preference": "read",
+                    "unexpected": true
+                }
+            }"#,
+        )
+        .expect_err("unknown input fields should be rejected");
+
+        assert!(err.to_string().contains("unknown field `unexpected`"));
     }
 
     #[test]
@@ -600,5 +538,38 @@ mod tests {
                 .and_then(InputManifestEntry::as_sha256_commitment),
             Some("abc123")
         );
+    }
+
+    #[test]
+    fn resolved_arg_helpers_preserve_inline_values() {
+        let arg = ResolvedArg::inline(7u64);
+
+        assert!(arg.as_external().is_none());
+        assert_eq!(arg.into_inner(), 7);
+    }
+
+    #[test]
+    fn resolved_arg_helpers_preserve_external_metadata() {
+        let selected = SelectedPayload {
+            bytes: alloc::vec![1, 2, 3],
+            proof: SelectionProof {
+                path: SelectorPath::default(),
+                root_hash: alloc::vec![4, 5, 6],
+                steps: alloc::vec![],
+            },
+        };
+        let arg = ResolvedArg::external(ExternalArg::new(
+            "payload",
+            SelectorPath::default(),
+            Some("abc123".to_string()),
+            selected.clone(),
+            9u64,
+        ));
+
+        let external = arg.as_external().expect("expected external metadata");
+        assert_eq!(external.name, "payload");
+        assert_eq!(external.commitment.as_deref(), Some("abc123"));
+        assert_eq!(external.selected, selected);
+        assert_eq!(arg.into_inner(), 9);
     }
 }
