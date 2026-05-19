@@ -375,8 +375,8 @@ mod tests {
 
         assert_eq!(read.bytes(), bytes.as_slice());
         assert_eq!(mapped.bytes(), bytes.as_slice());
-        assert!(matches!(read.data, ExternalFile::Read(_)));
-        assert!(matches!(mapped.data, ExternalFile::Mmap(_)));
+        assert!(matches!(read.file, ExternalFile::Read(_)));
+        assert!(matches!(mapped.file, ExternalFile::Mmap(_)));
 
         fs::remove_dir_all(&dir).unwrap();
     }

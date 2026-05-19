@@ -340,17 +340,23 @@ fn verify_external_inputs(
     }
 
     for meta in external_input.values() {
-        let authorized_commitment = external_inputs_commitments
-            .get(&meta.name)
-            .unwrap_or_else(|| {
-                panic!(
-                    "Missing authorized commitment for external input '{}'",
-                    meta.name
-                )
-            });
+        let authorized_commitment =
+            external_inputs_commitments
+                .get(&meta.name)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "Missing authorized commitment for external input '{}'",
+                        meta.name
+                    )
+                });
         assert_eq!(
             authorized_commitment, &meta.commitment,
             "External input '{}' commitment does not match authorized source",
+            meta.name,
+        );
+        assert_eq!(
+            meta.tree_root, meta.selected.proof.root_hash,
+            "External input '{}' tree root does not match selection proof root",
             meta.name,
         );
         if !meta.selector.is_empty() || !meta.selected.bytes.is_empty() {
@@ -608,7 +614,9 @@ fn main() {
 mod tests {
     use super::*;
     use raster_core::cfs::CfsCoordinates;
-    use raster_core::trace::{ExternalData, SequenceEndRecord, SequenceStartRecord, TileExecRecord};
+    use raster_core::trace::{
+        ExternalData, SequenceEndRecord, SequenceStartRecord, TileExecRecord,
+    };
 
     fn sha(bytes: &[u8]) -> Vec<u8> {
         sha256_bytes(bytes)
@@ -624,6 +632,7 @@ mod tests {
             ExternalData {
                 name: binding_name.to_string(),
                 commitment: commitment.to_vec(),
+                tree_root: Vec::new(),
                 selector: Default::default(),
                 selected: raster_core::input::SelectedPayload {
                     bytes: selected_bytes.to_vec(),
@@ -635,10 +644,7 @@ mod tests {
         .collect()
     }
 
-    fn authorization_journal(
-        binding_name: &str,
-        commitment: &[u8],
-    ) -> AuthorizationJournal {
+    fn authorization_journal(binding_name: &str, commitment: &[u8]) -> AuthorizationJournal {
         AuthorizationJournal {
             external_inputs_commitments: [(binding_name.to_string(), commitment.to_vec())]
                 .into_iter()
@@ -732,11 +738,7 @@ mod tests {
 
     #[test]
     fn verify_external_inputs_accept_matching_authorized_binding() {
-        let ext = external_input(
-            "personal_data",
-            sha256_hex(b"payload").as_slice(),
-            b"",
-        );
+        let ext = external_input("personal_data", sha256_hex(b"payload").as_slice(), b"");
         let step = StepRecord::TileExec(TileExecRecord {
             exec_index: 1,
             tile_id: "tile".to_string(),
@@ -748,21 +750,15 @@ mod tests {
             output_commitment: sha(b"out"),
         });
 
-        let authorization = authorization_journal(
-            "personal_data",
-            sha256_hex(b"payload").as_slice(),
-        );
+        let authorization =
+            authorization_journal("personal_data", sha256_hex(b"payload").as_slice());
         verify_external_inputs(&step, &ext, &authorization.external_inputs_commitments);
     }
 
     #[test]
     #[should_panic(expected = "Missing authorized commitment for external input 'personal_data'")]
     fn verify_external_inputs_reject_missing_authorized_binding() {
-        let ext = external_input(
-            "personal_data",
-            sha256_hex(b"payload").as_slice(),
-            b"",
-        );
+        let ext = external_input("personal_data", sha256_hex(b"payload").as_slice(), b"");
         let step = StepRecord::TileExec(TileExecRecord {
             exec_index: 1,
             tile_id: "tile".to_string(),
@@ -790,11 +786,7 @@ mod tests {
         expected = "External input 'personal_data' commitment does not match authorized source"
     )]
     fn verify_external_inputs_reject_mismatched_authorized_binding() {
-        let ext = external_input(
-            "personal_data",
-            sha256_hex(b"payload").as_slice(),
-            b"",
-        );
+        let ext = external_input("personal_data", sha256_hex(b"payload").as_slice(), b"");
         let step = StepRecord::TileExec(TileExecRecord {
             exec_index: 1,
             tile_id: "tile".to_string(),

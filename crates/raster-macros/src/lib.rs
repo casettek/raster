@@ -192,6 +192,7 @@ fn gen_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream {
                                 .commitment
                                 .map(|value| value.into_bytes())
                                 .unwrap_or_default(),
+                            tree_root: __raster_external_info.selected.proof.root_hash.clone(),
                             selector: __raster_external_info.selector,
                             selected: __raster_external_info.selected,
                         }
@@ -763,17 +764,5 @@ pub fn derive_selectable(item: TokenStream) -> TokenStream {
                 }
             }
         }
-    })
-}
-
-#[proc_macro_derive(Merklized)]
-pub fn derive_merklized(item: TokenStream) -> TokenStream {
-    let input = parse_macro_input!(item as syn::DeriveInput);
-    let ident = &input.ident;
-    let generics = input.generics.clone();
-    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
-
-    TokenStream::from(quote! {
-        impl #impl_generics ::raster::core::input::Merklized for #ident #ty_generics #where_clause {}
     })
 }

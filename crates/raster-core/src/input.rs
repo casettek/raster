@@ -91,14 +91,6 @@ pub trait Selectable {
     fn schema() -> SchemaNode;
 }
 
-pub trait Merklized: Selectable + Serialize {}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub struct StructProofSibling {
-    pub label: String,
-    pub hash: Vec<u8>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum ListProofDirection {
     Left,
@@ -114,8 +106,9 @@ pub struct ListProofSibling {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum SelectionProofStep {
     Struct {
-        label: String,
-        siblings: Vec<StructProofSibling>,
+        field_index: u64,
+        field_count: u64,
+        siblings: Vec<Vec<u8>>,
     },
     List {
         index: u64,
@@ -145,35 +138,148 @@ fn selection_hash(parts: &[&[u8]]) -> Vec<u8> {
     hasher.finalize().to_vec()
 }
 
+fn parse_u64(bytes: &[u8], offset: &mut usize) -> Option<u64> {
+    let end = offset.checked_add(8)?;
+    let slice = bytes.get(*offset..end)?;
+    let value = u64::from_le_bytes(slice.try_into().ok()?);
+    *offset = end;
+    Some(value)
+}
+
+fn list_root_from_hashes(hashes: &[Vec<u8>], len: u64) -> Vec<u8> {
+    if hashes.is_empty() {
+        return selection_hash(&[b"list-root", &len.to_le_bytes(), b"empty"]);
+    }
+
+    let mut level = hashes.to_vec();
+    while level.len() > 1 {
+        if level.len() % 2 == 1 {
+            let last = level.last().cloned().unwrap();
+            level.push(last);
+        }
+
+        let mut next = Vec::with_capacity(level.len() / 2);
+        for pair in level.chunks(2) {
+            next.push(selection_hash(&[
+                b"list-node",
+                pair[0].as_slice(),
+                pair[1].as_slice(),
+            ]));
+        }
+        level = next;
+    }
+
+    selection_hash(&[b"list-root", &len.to_le_bytes(), level[0].as_slice()])
+}
+
+fn parse_subtree_root(bytes: &[u8], offset: &mut usize) -> Option<Vec<u8>> {
+    let kind = *bytes.get(*offset)?;
+    *offset += 1;
+
+    match kind {
+        0x00 => {
+            let len = parse_u64(bytes, offset)? as usize;
+            let end = offset.checked_add(len)?;
+            let leaf_bytes = bytes.get(*offset..end)?;
+            *offset = end;
+            Some(selection_hash(&[b"leaf", leaf_bytes]))
+        }
+        0x01 => {
+            let field_count = parse_u64(bytes, offset)? as usize;
+            let mut child_roots = Vec::with_capacity(field_count);
+            for _ in 0..field_count {
+                let child_len = parse_u64(bytes, offset)? as usize;
+                let end = offset.checked_add(child_len)?;
+                let child_bytes = bytes.get(*offset..end)?;
+                let mut child_offset = 0;
+                let child_root = parse_subtree_root(child_bytes, &mut child_offset)?;
+                if child_offset != child_bytes.len() {
+                    return None;
+                }
+                *offset = end;
+                child_roots.push(child_root);
+            }
+
+            let mut parts: Vec<&[u8]> = Vec::with_capacity(child_roots.len() + 1);
+            parts.push(b"struct");
+            for root in &child_roots {
+                parts.push(root.as_slice());
+            }
+            Some(selection_hash(&parts))
+        }
+        0x02 => {
+            let len = parse_u64(bytes, offset)?;
+            let element_count = len as usize;
+            let mut child_roots = Vec::with_capacity(element_count);
+            for _ in 0..element_count {
+                let child_len = parse_u64(bytes, offset)? as usize;
+                let end = offset.checked_add(child_len)?;
+                let child_bytes = bytes.get(*offset..end)?;
+                let mut child_offset = 0;
+                let child_root = parse_subtree_root(child_bytes, &mut child_offset)?;
+                if child_offset != child_bytes.len() {
+                    return None;
+                }
+                *offset = end;
+                child_roots.push(child_root);
+            }
+
+            Some(list_root_from_hashes(&child_roots, len))
+        }
+        _ => None,
+    }
+}
+
 pub fn verify_selection_proof(selected_bytes: &[u8], proof: &SelectionProof) -> bool {
-    let mut current_hash = selection_hash(&[b"leaf", selected_bytes]);
+    let mut offset = 0;
+    let Some(mut current_hash) = parse_subtree_root(selected_bytes, &mut offset) else {
+        return false;
+    };
+    if offset != selected_bytes.len() {
+        return false;
+    }
+
     for step in proof.steps.iter().rev() {
         current_hash = match step {
-            SelectionProofStep::Struct { label, siblings } => {
-                let mut parts: Vec<Vec<u8>> = Vec::with_capacity(siblings.len() + 2);
-                parts.push(b"struct".to_vec());
-                let mut inserted = false;
-                for sibling in siblings {
-                    if !inserted && label <= &sibling.label {
-                        parts.push(label.as_bytes().to_vec());
-                        parts.push(current_hash.clone());
-                        inserted = true;
+            SelectionProofStep::Struct {
+                field_index,
+                field_count,
+                siblings,
+            } => {
+                let field_index = *field_index as usize;
+                let field_count = *field_count as usize;
+                if field_index >= field_count || siblings.len() + 1 != field_count {
+                    return false;
+                }
+
+                let mut child_roots = Vec::with_capacity(field_count);
+                let mut sibling_iter = siblings.iter();
+                for idx in 0..field_count {
+                    if idx == field_index {
+                        child_roots.push(current_hash.clone());
+                    } else if let Some(sibling) = sibling_iter.next() {
+                        child_roots.push(sibling.clone());
+                    } else {
+                        return false;
                     }
-                    parts.push(sibling.label.as_bytes().to_vec());
-                    parts.push(sibling.hash.clone());
                 }
-                if !inserted {
-                    parts.push(label.as_bytes().to_vec());
-                    parts.push(current_hash.clone());
+
+                let mut parts: Vec<&[u8]> = Vec::with_capacity(child_roots.len() + 1);
+                parts.push(b"struct");
+                for root in &child_roots {
+                    parts.push(root.as_slice());
                 }
-                let refs: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
-                selection_hash(&refs)
+                selection_hash(&parts)
             }
             SelectionProofStep::List {
-                index: _,
+                index,
                 len,
                 siblings,
             } => {
+                if *len == 0 || *index >= *len {
+                    return false;
+                }
+
                 let mut hash = current_hash;
                 for sibling in siblings {
                     hash = match sibling.direction {
@@ -356,8 +462,6 @@ macro_rules! impl_leaf_schema {
                     }
                 }
             }
-
-            impl Merklized for $ty {}
         )+
     };
 }
@@ -387,8 +491,6 @@ where
         }
     }
 }
-
-impl<T> Merklized for Vec<T> where T: Merklized {}
 
 /// A private file-backed external input declared inside `input.json`.
 pub type ExternalInputPathEntry = String;

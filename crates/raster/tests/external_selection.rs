@@ -1,7 +1,7 @@
 use raster::prelude::*;
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Deserialize, Serialize, Selectable, Merklized)]
+#[derive(Clone, Debug, Deserialize, Serialize, Selectable)]
 struct PersonalData {
     name: String,
 }

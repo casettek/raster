@@ -4,10 +4,9 @@ use core::marker::PhantomData;
 use serde::{de::DeserializeOwned, Serialize};
 
 pub use raster_core::input::{
-    verify_selection_proof, ExternalArg, ExternalRef, ExternalSelection,
-    ListProofDirection, ListProofSibling, Merklized, ResolvedArg, SchemaField, SchemaNode,
-    Selectable, SelectedPayload, SelectionProof, SelectionProofStep, SelectorPath, SelectorSegment,
-    StructProofSibling,
+    verify_selection_proof, ExternalArg, ExternalRef, ExternalSelection, ListProofDirection,
+    ListProofSibling, ResolvedArg, SchemaField, SchemaNode, Selectable, SelectedPayload,
+    SelectionProof, SelectionProofStep, SelectorPath, SelectorSegment,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -104,7 +103,7 @@ where
 
 impl<Root, Selected> IntoResolvedArg<Selected> for TypedSelectedExternalBinding<Root, Selected>
 where
-    Root: DeserializeOwned + Serialize + Selectable + Merklized,
+    Root: DeserializeOwned + Serialize + Selectable,
     Selected: DeserializeOwned + Serialize,
 {
     fn into_resolved_arg(self) -> raster_core::Result<ResolvedArg<Selected>> {
@@ -143,7 +142,7 @@ pub fn resolve_typed_external_value<Root, T>(
     reference: ExternalSelection,
 ) -> raster_core::Result<raster_core::input::ExternalArg<T>>
 where
-    Root: DeserializeOwned + Serialize + Selectable + Merklized,
+    Root: DeserializeOwned + Serialize + Selectable,
     T: DeserializeOwned + Serialize,
 {
     #[cfg(feature = "std")]

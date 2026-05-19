@@ -194,6 +194,7 @@ mod tests {
             ExternalData {
                 name: binding_name.to_string(),
                 commitment: commitment.to_vec(),
+                tree_root: Vec::new(),
                 selector: Default::default(),
                 selected: Default::default(),
             },
