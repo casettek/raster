@@ -19,9 +19,9 @@ pub use input::{
     into_resolved_arg, resolve_external_value, resolve_typed_external_value, select_source,
     selector_path, typed_external, typed_selector_path, ExternalArg, ExternalRef,
     ExternalSelection, IntoResolvedArg, ListProofDirection, ListProofSibling, ResolvedArg,
-    SchemaField, SchemaNode, Selectable, SelectedPayload, SelectionProof, SelectionProofStep,
-    SelectorPath, SelectorSegment, TypedExternalBinding, TypedSelectedExternalBinding,
-    TypedSelectorPath,
+    SchemaField, SchemaNode, SelectSource, Selectable, SelectedPayload, SelectionProof,
+    SelectionProofStep, SelectorPath, SelectorSegment, TypedExternalBinding,
+    TypedSelectedExternalBinding, TypedSelectorPath,
 };
 
 #[cfg(feature = "std")]
@@ -152,8 +152,9 @@ pub mod prelude {
     pub use crate::{
         call, call_seq, debug, external, select, sequence, tile, ExternalArg, ExternalSelection,
         IntoResolvedArg, ListProofDirection, ListProofSibling, ResolvedArg, SchemaField,
-        SchemaNode, Selectable, SelectedPayload, SelectionProof, SelectionProofStep, SelectorPath,
-        SelectorSegment, TypedExternalBinding, TypedSelectedExternalBinding, TypedSelectorPath,
+        SchemaNode, SelectSource, Selectable, SelectedPayload, SelectionProof, SelectionProofStep,
+        SelectorPath, SelectorSegment, TypedExternalBinding, TypedSelectedExternalBinding,
+        TypedSelectorPath,
     };
 
     // TODO: Re-enable once Executor/Tracer types are implemented

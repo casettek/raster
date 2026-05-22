@@ -1,6 +1,6 @@
 use raster::prelude::*;
 
-use hello_tiles::input::PersonalData;
+use hello_tiles::input::{Address, PersonalData};
 use hello_tiles::{
     current_wish, exclaim, greet, greet_address_line, personal_greet, personal_greet_from_object,
     personal_greet_with_seed, raster_wish,
@@ -50,12 +50,17 @@ fn main() {
     call_seq!(greet_sequence, "Rust".to_string());
 
     let personal_data_binding = external!(PersonalData, "personal_data");
-    let name = select!(String, personal_data_binding.name);
+    let name = select!(String, personal_data_binding.clone().name);
 
     let seed_binding = external!(u64, "seed");
     let seed = select!(u64, seed_binding);
 
     call!(personal_greet_with_seed, name, seed);
+
+    let addresses = select!(Vec<Address>, personal_data_binding.addresses);
+    let address = select!(Address, addresses[1]);
+    let address_line = select!(String, address.lines[0]);
+    call!(greet_address_line, address_line);
 
     call!(
         greet_address_line,

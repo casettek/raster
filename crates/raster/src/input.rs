@@ -67,11 +67,50 @@ pub struct TypedSelectedExternalBinding<Root, Selected> {
     selector: TypedSelectorPath<Root, Selected>,
 }
 
-pub fn select_source<Root, Selected>(
-    source: TypedExternalBinding<Root>,
-    selector: TypedSelectorPath<Root, Selected>,
-) -> TypedSelectedExternalBinding<Root, Selected> {
+pub trait SelectSource {
+    type Root;
+    type Current;
+
+    fn into_source_and_selector(self) -> (TypedExternalBinding<Self::Root>, SelectorPath);
+}
+
+impl<Root> SelectSource for TypedExternalBinding<Root> {
+    type Root = Root;
+    type Current = Root;
+
+    fn into_source_and_selector(self) -> (TypedExternalBinding<Self::Root>, SelectorPath) {
+        (self, SelectorPath::default())
+    }
+}
+
+impl<Root, Current> SelectSource for TypedSelectedExternalBinding<Root, Current> {
+    type Root = Root;
+    type Current = Current;
+
+    fn into_source_and_selector(self) -> (TypedExternalBinding<Self::Root>, SelectorPath) {
+        (self.source, self.selector.into_path())
+    }
+}
+
+pub fn select_source<Source, Selected>(
+    source: Source,
+    selector: TypedSelectorPath<Source::Current, Selected>,
+) -> TypedSelectedExternalBinding<Source::Root, Selected>
+where
+    Source: SelectSource,
+{
+    let (source, existing_selector) = source.into_source_and_selector();
+    let selector = TypedSelectorPath::new(compose_selector_paths(
+        existing_selector,
+        selector.into_path(),
+    ));
     TypedSelectedExternalBinding { source, selector }
+}
+
+fn compose_selector_paths(prefix: SelectorPath, suffix: SelectorPath) -> SelectorPath {
+    let mut segments = prefix.segments;
+    segments.extend(suffix.segments);
+    SelectorPath::new(segments)
 }
 
 pub fn selector_path(segments: Vec<SelectorSegment>) -> SelectorPath {
