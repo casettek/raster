@@ -24,6 +24,9 @@ pub use input::{
     TypedSelectorPath,
 };
 
+#[cfg(feature = "std")]
+pub use input::{encode_raster_value, write_raster_files};
+
 pub use raster_macros::{select, sequence, tile, Selectable};
 
 // Runtime is only available with std feature

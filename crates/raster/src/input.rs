@@ -4,9 +4,9 @@ use core::marker::PhantomData;
 use serde::{de::DeserializeOwned, Serialize};
 
 pub use raster_core::input::{
-    verify_selection_proof, ExternalArg, ExternalRef, ExternalSelection, ListProofDirection,
-    ListProofSibling, ResolvedArg, SchemaField, SchemaNode, Selectable, SelectedPayload,
-    SelectionProof, SelectionProofStep, SelectorPath, SelectorSegment,
+    verify_selection_proof, ExternalArg, ExternalEncoding, ExternalRef, ExternalSelection,
+    ListProofDirection, ListProofSibling, ResolvedArg, SchemaField, SchemaNode, Selectable,
+    SelectedPayload, SelectionProof, SelectionProofStep, SelectorPath, SelectorSegment,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -157,4 +157,20 @@ where
             "Typed external resolution requires the `std` feature"
         )))
     }
+}
+
+#[cfg(feature = "std")]
+pub fn encode_raster_value<T: Serialize>(
+    value: &T,
+) -> raster_core::Result<(Vec<u8>, Vec<u8>, String)> {
+    raster_runtime::encode_raster_value(value)
+}
+
+#[cfg(feature = "std")]
+pub fn write_raster_files<T: Serialize>(
+    value: &T,
+    data_path: &std::path::Path,
+    index_path: &std::path::Path,
+) -> raster_core::Result<String> {
+    raster_runtime::write_raster_files(value, data_path, index_path)
 }

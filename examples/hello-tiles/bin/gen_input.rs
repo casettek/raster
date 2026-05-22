@@ -59,9 +59,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         format!(
             concat!(
                 "{{\n",
-                "  \"personal_data\": {{ \"type\": \"sha256\", \"commitment\": \"{}\" }},\n",
-                "  \"personal_data_bin\": {{ \"type\": \"sha256\", \"commitment\": \"{}\" }},\n",
-                "  \"seed\": {{ \"type\": \"sha256\", \"commitment\": \"{}\" }}\n",
+                "  \"personal_data\": {{ \"type\": \"sha256\", \"encoding\": \"postcard\", \"commitment\": \"{}\" }},\n",
+                "  \"personal_data_bin\": {{ \"type\": \"sha256\", \"encoding\": \"postcard\", \"commitment\": \"{}\" }},\n",
+                "  \"seed\": {{ \"type\": \"sha256\", \"encoding\": \"postcard\", \"commitment\": \"{}\" }}\n",
                 "}}\n"
             ),
             postcard_hash, postcard_hash, seed_hash

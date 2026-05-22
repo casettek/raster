@@ -12,7 +12,9 @@ members = [
     "crates/raster-cli",
     "crates/raster-prover",
     "crates/raster-backend-native",
+
     "examples/hello-tiles",
+    "examples/tokenizer",
 ]
 
 [workspace.package]

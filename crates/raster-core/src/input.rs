@@ -146,6 +146,14 @@ fn parse_u64(bytes: &[u8], offset: &mut usize) -> Option<u64> {
     Some(value)
 }
 
+fn parse_utf8(bytes: &[u8], offset: &mut usize) -> Option<Vec<u8>> {
+    let len = parse_u64(bytes, offset)? as usize;
+    let end = offset.checked_add(len)?;
+    let slice = bytes.get(*offset..end)?;
+    *offset = end;
+    Some(slice.to_vec())
+}
+
 fn list_root_from_hashes(hashes: &[Vec<u8>], len: u64) -> Vec<u8> {
     if hashes.is_empty() {
         return selection_hash(&[b"list-root", &len.to_le_bytes(), b"empty"]);
@@ -225,6 +233,116 @@ fn parse_subtree_root(bytes: &[u8], offset: &mut usize) -> Option<Vec<u8>> {
             }
 
             Some(list_root_from_hashes(&child_roots, len))
+        }
+        0x03 => Some(selection_hash(&[b"unit"])),
+        0x04 => {
+            let len = parse_u64(bytes, offset)?;
+            let entry_count = len as usize;
+            let len_bytes = len.to_le_bytes();
+            let mut entry_roots = Vec::with_capacity(entry_count * 2);
+            for _ in 0..entry_count {
+                let key_len = parse_u64(bytes, offset)? as usize;
+                let key_end = offset.checked_add(key_len)?;
+                let key_bytes = bytes.get(*offset..key_end)?;
+                let mut key_offset = 0;
+                let key_root = parse_subtree_root(key_bytes, &mut key_offset)?;
+                if key_offset != key_bytes.len() {
+                    return None;
+                }
+                *offset = key_end;
+
+                let value_len = parse_u64(bytes, offset)? as usize;
+                let value_end = offset.checked_add(value_len)?;
+                let value_bytes = bytes.get(*offset..value_end)?;
+                let mut value_offset = 0;
+                let value_root = parse_subtree_root(value_bytes, &mut value_offset)?;
+                if value_offset != value_bytes.len() {
+                    return None;
+                }
+                *offset = value_end;
+
+                entry_roots.push(key_root);
+                entry_roots.push(value_root);
+            }
+
+            let mut parts: Vec<&[u8]> = Vec::with_capacity(entry_roots.len() + 2);
+            parts.push(b"map");
+            parts.push(&len_bytes);
+            for root in &entry_roots {
+                parts.push(root.as_slice());
+            }
+            Some(selection_hash(&parts))
+        }
+        0x05 => {
+            let variant = parse_utf8(bytes, offset)?;
+            Some(selection_hash(&[b"enum-unit", variant.as_slice()]))
+        }
+        0x06 => {
+            let variant = parse_utf8(bytes, offset)?;
+            let child_len = parse_u64(bytes, offset)? as usize;
+            let end = offset.checked_add(child_len)?;
+            let child_bytes = bytes.get(*offset..end)?;
+            let mut child_offset = 0;
+            let child_root = parse_subtree_root(child_bytes, &mut child_offset)?;
+            if child_offset != child_bytes.len() {
+                return None;
+            }
+            *offset = end;
+            Some(selection_hash(&[
+                b"enum-newtype",
+                variant.as_slice(),
+                child_root.as_slice(),
+            ]))
+        }
+        0x07 => {
+            let variant = parse_utf8(bytes, offset)?;
+            let len = parse_u64(bytes, offset)? as usize;
+            let mut child_roots = Vec::with_capacity(len);
+            for _ in 0..len {
+                let child_len = parse_u64(bytes, offset)? as usize;
+                let end = offset.checked_add(child_len)?;
+                let child_bytes = bytes.get(*offset..end)?;
+                let mut child_offset = 0;
+                let child_root = parse_subtree_root(child_bytes, &mut child_offset)?;
+                if child_offset != child_bytes.len() {
+                    return None;
+                }
+                *offset = end;
+                child_roots.push(child_root);
+            }
+
+            let mut parts: Vec<&[u8]> = Vec::with_capacity(child_roots.len() + 2);
+            parts.push(b"enum-tuple");
+            parts.push(variant.as_slice());
+            for root in &child_roots {
+                parts.push(root.as_slice());
+            }
+            Some(selection_hash(&parts))
+        }
+        0x08 => {
+            let variant = parse_utf8(bytes, offset)?;
+            let len = parse_u64(bytes, offset)? as usize;
+            let mut child_roots = Vec::with_capacity(len);
+            for _ in 0..len {
+                let child_len = parse_u64(bytes, offset)? as usize;
+                let end = offset.checked_add(child_len)?;
+                let child_bytes = bytes.get(*offset..end)?;
+                let mut child_offset = 0;
+                let child_root = parse_subtree_root(child_bytes, &mut child_offset)?;
+                if child_offset != child_bytes.len() {
+                    return None;
+                }
+                *offset = end;
+                child_roots.push(child_root);
+            }
+
+            let mut parts: Vec<&[u8]> = Vec::with_capacity(child_roots.len() + 2);
+            parts.push(b"enum-struct");
+            parts.push(variant.as_slice());
+            for root in &child_roots {
+                parts.push(root.as_slice());
+            }
+            Some(selection_hash(&parts))
         }
         _ => None,
     }
@@ -495,6 +613,14 @@ where
 /// A private file-backed external input declared inside `input.json`.
 pub type ExternalInputPathEntry = String;
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalEncoding {
+    #[default]
+    Postcard,
+    Raster,
+}
+
 /// How the runtime should back a resolved external file in memory.
 #[cfg(feature = "std")]
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -510,13 +636,16 @@ pub type ExternalInputManifestEntry = String;
 /// A private input document that binds external names to serialized files.
 ///
 /// Each top-level field must be an external path entry encoded as
-/// `{ "path": "...", "load_preference": "read|mmap" }`. The referenced file is
-/// decoded by the runtime using Raster's Postcard tile ABI codec.
+/// `{ "path": "...", "load_preference": "read|mmap" }` for postcard-backed
+/// inputs or `{ "path": "...", "index_path": "...", "load_preference":
+/// "read|mmap" }` for `raster`-encoded inputs.
 #[cfg(feature = "std")]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct InputDocumentEntry {
     pub path: ExternalInputPathEntry,
+    #[serde(default)]
+    pub index_path: Option<ExternalInputPathEntry>,
     pub load_preference: ExternalLoadPreference,
 }
 
@@ -524,6 +653,10 @@ pub struct InputDocumentEntry {
 impl InputDocumentEntry {
     pub fn path(&self) -> &str {
         self.path.as_str()
+    }
+
+    pub fn index_path(&self) -> Option<&str> {
+        self.index_path.as_deref()
     }
 
     pub fn load_preference(&self) -> ExternalLoadPreference {
@@ -537,7 +670,7 @@ pub type InputDocument = BTreeMap<String, InputDocumentEntry>;
 /// A public JSON manifest document that describes the commitments for externals.
 ///
 /// Each top-level field is a structured commitment entry encoded as:
-/// `{ "type": "sha256", "commitment": "..." }`
+/// `{ "type": "sha256", "encoding": "postcard|raster", "commitment": "..." }`
 #[cfg(feature = "std")]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -550,6 +683,8 @@ pub enum InputCommitmentType {
 pub struct InputManifestEntry {
     #[serde(rename = "type")]
     pub commitment_type: InputCommitmentType,
+    #[serde(default)]
+    pub encoding: ExternalEncoding,
     pub commitment: ExternalInputManifestEntry,
 }
 
@@ -559,6 +694,10 @@ impl InputManifestEntry {
         match self.commitment_type {
             InputCommitmentType::Sha256 => Some(self.commitment.as_str()),
         }
+    }
+
+    pub fn encoding(&self) -> ExternalEncoding {
+        self.encoding
     }
 }
 
@@ -591,6 +730,37 @@ mod tests {
                 .get("payload")
                 .map(InputDocumentEntry::load_preference),
             Some(ExternalLoadPreference::Mmap)
+        );
+        assert_eq!(
+            document
+                .get("payload")
+                .and_then(InputDocumentEntry::index_path),
+            None
+        );
+    }
+
+    #[test]
+    fn parses_raster_input_entries_with_index_path() {
+        let document: InputDocument = serde_json::from_str(
+            r#"{
+                "payload": {
+                    "path": "payload.rastered",
+                    "index_path": "payload.rindex",
+                    "load_preference": "read"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            document.get("payload").map(InputDocumentEntry::path),
+            Some("payload.rastered")
+        );
+        assert_eq!(
+            document
+                .get("payload")
+                .and_then(InputDocumentEntry::index_path),
+            Some("payload.rindex")
         );
     }
 
@@ -639,6 +809,29 @@ mod tests {
                 .get("payload")
                 .and_then(InputManifestEntry::as_sha256_commitment),
             Some("abc123")
+        );
+        assert_eq!(
+            document.get("payload").map(InputManifestEntry::encoding),
+            Some(ExternalEncoding::Postcard)
+        );
+    }
+
+    #[test]
+    fn parses_raster_manifest_entries() {
+        let document: InputManifestDocument = serde_json::from_str(
+            r#"{
+                "payload": {
+                    "type": "sha256",
+                    "encoding": "raster",
+                    "commitment": "abc123"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            document.get("payload").map(InputManifestEntry::encoding),
+            Some(ExternalEncoding::Raster)
         );
     }
 

@@ -81,6 +81,7 @@ mod tests {
             manifest_bytes: br#"{
                 "personal_data": {
                     "type": "sha256",
+                    "encoding": "raster",
                     "commitment": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
                 }
             }"#
@@ -89,16 +90,14 @@ mod tests {
                 "personal_data".to_string(),
                 b"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".to_vec(),
             )]
-                .into_iter()
-                .collect(),
+            .into_iter()
+            .collect(),
         };
 
         let journal = build_authorization_journal(&input);
 
         assert_eq!(
-            journal
-                .external_inputs_commitments
-                .get("personal_data"),
+            journal.external_inputs_commitments.get("personal_data"),
             Some(&b"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".to_vec())
         );
     }
@@ -116,8 +115,8 @@ mod tests {
                 "personal_data".to_string(),
                 payload_commitment.as_bytes().to_vec(),
             )]
-                .into_iter()
-                .collect(),
+            .into_iter()
+            .collect(),
         };
 
         let first = build_authorization_journal(&input);

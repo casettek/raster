@@ -7,8 +7,11 @@
 
 mod external_storage;
 pub mod input;
+mod raster_index;
 pub mod tracing;
-pub use input::{resolve_external_value, resolve_typed_external_value};
+pub use input::{
+    encode_raster_value, resolve_external_value, resolve_typed_external_value, write_raster_files,
+};
 pub use tracing::{
     commitment::Sha256Commitment,
     finish, init, init_with, publish_trace_event,

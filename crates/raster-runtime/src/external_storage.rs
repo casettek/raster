@@ -1,7 +1,7 @@
 use memmap2::Mmap;
 use raster_core::input::{
-    ExternalInputManifestEntry, ExternalLoadPreference, InputDocument, InputDocumentEntry,
-    InputManifestDocument, InputManifestEntry,
+    ExternalEncoding, ExternalInputManifestEntry, ExternalLoadPreference, InputDocument,
+    InputDocumentEntry, InputManifestDocument, InputManifestEntry,
 };
 use raster_core::{Error, Result};
 use serde::de::DeserializeOwned;
@@ -13,6 +13,8 @@ use std::path::{Path, PathBuf};
 use std::string::String;
 use std::sync::{Arc, Mutex};
 use std::vec::Vec;
+
+use crate::raster_index::RasterIndex;
 
 #[derive(Debug, Clone)]
 pub(crate) enum ExternalFile {
@@ -31,7 +33,9 @@ impl ExternalFile {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct SourceKey {
+    encoding: ExternalEncoding,
     path: PathBuf,
+    index_path: Option<PathBuf>,
     commitment: String,
     load_preference: ExternalLoadPreference,
 }
@@ -110,27 +114,63 @@ impl ExternalFileRegistry {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct ResolvedExternalData {
-    commitment: String,
-    file: ExternalFile,
+pub(crate) enum ResolvedExternalData {
+    Postcard {
+        commitment: String,
+        file: ExternalFile,
+    },
+    Raster {
+        commitment: String,
+        data_file: ExternalFile,
+        _index_file: ExternalFile,
+        index: Arc<RasterIndex>,
+    },
 }
 
 impl ResolvedExternalData {
     pub(crate) fn commitment(&self) -> &str {
-        &self.commitment
+        match self {
+            Self::Postcard { commitment, .. } | Self::Raster { commitment, .. } => commitment,
+        }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn bytes(&self) -> &[u8] {
-        self.file.bytes()
+        match self {
+            Self::Postcard { file, .. } => file.bytes(),
+            Self::Raster { data_file, .. } => data_file.bytes(),
+        }
     }
 
     pub(crate) fn deserialize<T: DeserializeOwned>(&self) -> Result<T> {
-        raster_core::postcard::from_bytes(self.bytes()).map_err(|e| {
-            Error::Serialization(format!(
-                "Failed to deserialize external data from postcard bytes: {}",
-                e
-            ))
-        })
+        match self {
+            Self::Postcard { file, .. } => {
+                raster_core::postcard::from_bytes(file.bytes()).map_err(|e| {
+                    Error::Serialization(format!(
+                        "Failed to deserialize external data from postcard bytes: {}",
+                        e
+                    ))
+                })
+            }
+            Self::Raster { .. } => Err(Error::Other(
+                "Raster-encoded external data must be resolved through selection-tree payloads"
+                    .into(),
+            )),
+        }
+    }
+
+    pub(crate) fn raster_index(&self) -> Option<&RasterIndex> {
+        match self {
+            Self::Raster { index, .. } => Some(index.as_ref()),
+            Self::Postcard { .. } => None,
+        }
+    }
+
+    pub(crate) fn raster_bytes(&self) -> Option<&[u8]> {
+        match self {
+            Self::Raster { data_file, .. } => Some(data_file.bytes()),
+            Self::Postcard { .. } => None,
+        }
     }
 }
 
@@ -175,14 +215,41 @@ impl ExternalStorageManager {
 
     pub(crate) fn resolve(&self, name: &str) -> Result<ResolvedExternalData> {
         let input_entry = self.read_input_entry(name)?;
-        let expected_commitment = self.read_external_commitment_entry(name)?;
+        let manifest_entry = self.read_manifest_entry(name)?;
+        let expected_commitment = manifest_entry
+            .as_sha256_commitment()
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                Error::Serialization(format!(
+                    "Expected public manifest entry '{}' to use {{\"type\": \"sha256\", \"commitment\": \"...\"}}",
+                    name
+                ))
+            })?;
         let path = self.registry.base_dir.join(input_entry.path());
-        self.resolve_file(
-            name,
-            &path,
-            expected_commitment,
-            input_entry.load_preference(),
-        )
+
+        match manifest_entry.encoding() {
+            ExternalEncoding::Postcard => self.resolve_postcard_file(
+                name,
+                &path,
+                expected_commitment,
+                input_entry.load_preference(),
+            ),
+            ExternalEncoding::Raster => {
+                let index_path = input_entry.index_path().ok_or_else(|| {
+                    Error::Other(format!(
+                        "External input '{}' uses raster encoding but is missing `index_path` in input.json",
+                        name
+                    ))
+                })?;
+                self.resolve_raster_files(
+                    name,
+                    &path,
+                    &self.registry.base_dir.join(index_path),
+                    expected_commitment,
+                    input_entry.load_preference(),
+                )
+            }
+        }
     }
 
     fn read_input_entry(&self, name: &str) -> Result<&InputDocumentEntry> {
@@ -194,26 +261,16 @@ impl ExternalStorageManager {
         })
     }
 
-    fn read_external_commitment_entry(&self, name: &str) -> Result<ExternalInputManifestEntry> {
-        let entry = self.registry.get_manifest_entry(name).ok_or_else(|| {
+    fn read_manifest_entry(&self, name: &str) -> Result<&InputManifestEntry> {
+        self.registry.get_manifest_entry(name).ok_or_else(|| {
             Error::Other(format!(
                 "Missing public manifest entry for external input '{}'. Expected a top-level field in input_manifest.json.",
                 name
             ))
-        })?;
-
-        entry
-            .as_sha256_commitment()
-            .map(str::to_owned)
-            .ok_or_else(|| {
-                Error::Serialization(format!(
-                    "Expected public manifest entry '{}' to use {{\"type\": \"sha256\", \"commitment\": \"...\"}}",
-                    name
-                ))
-            })
+        })
     }
 
-    fn resolve_file(
+    fn resolve_postcard_file(
         &self,
         name: &str,
         path: &Path,
@@ -229,7 +286,9 @@ impl ExternalStorageManager {
             ))
         })?;
         let key = SourceKey {
+            encoding: ExternalEncoding::Postcard,
             path: canonical_path.clone(),
+            index_path: None,
             commitment: normalize_hash(&expected_commitment),
             load_preference,
         };
@@ -245,9 +304,75 @@ impl ExternalStorageManager {
             }
         };
         verify_input_commitment(name, storage.bytes(), &expected_commitment)?;
-        let resolved = ResolvedExternalData {
+        let resolved = ResolvedExternalData::Postcard {
             commitment: expected_commitment,
             file: storage,
+        };
+
+        let mut guard = self.cache.lock().unwrap();
+        Ok(guard.entry(key).or_insert_with(|| resolved.clone()).clone())
+    }
+
+    fn resolve_raster_files(
+        &self,
+        name: &str,
+        data_path: &Path,
+        index_path: &Path,
+        expected_commitment: ExternalInputManifestEntry,
+        load_preference: ExternalLoadPreference,
+    ) -> Result<ResolvedExternalData> {
+        let canonical_data_path = fs::canonicalize(data_path).map_err(|e| {
+            Error::Other(format!(
+                "Failed to resolve raster input '{}' path '{}': {}",
+                name,
+                data_path.display(),
+                e
+            ))
+        })?;
+        let canonical_index_path = fs::canonicalize(index_path).map_err(|e| {
+            Error::Other(format!(
+                "Failed to resolve raster index '{}' path '{}': {}",
+                name,
+                index_path.display(),
+                e
+            ))
+        })?;
+        let key = SourceKey {
+            encoding: ExternalEncoding::Raster,
+            path: canonical_data_path.clone(),
+            index_path: Some(canonical_index_path.clone()),
+            commitment: normalize_hash(&expected_commitment),
+            load_preference,
+        };
+
+        if let Some(resolved) = self.cache.lock().unwrap().get(&key).cloned() {
+            return Ok(resolved);
+        }
+
+        let data_file = match load_preference {
+            ExternalLoadPreference::Read => read_file(name, &canonical_data_path)?,
+            ExternalLoadPreference::Mmap => mmap_file(name, &canonical_data_path)
+                .or_else(|_| read_file(name, &canonical_data_path))?,
+        };
+        let index_file = match load_preference {
+            ExternalLoadPreference::Read => read_file(name, &canonical_index_path)?,
+            ExternalLoadPreference::Mmap => mmap_file(name, &canonical_index_path)
+                .or_else(|_| read_file(name, &canonical_index_path))?,
+        };
+        let index = Arc::new(RasterIndex::from_bytes(index_file.bytes())?);
+        let actual_commitment = index.root_commitment_hex();
+        if normalize_hash(&expected_commitment) != normalize_hash(&actual_commitment) {
+            return Err(Error::Other(format!(
+                "Raster input '{}' failed integrity check. Expected root commitment {}, got {}",
+                name, expected_commitment, actual_commitment
+            )));
+        }
+
+        let resolved = ResolvedExternalData::Raster {
+            commitment: expected_commitment,
+            data_file,
+            _index_file: index_file,
+            index,
         };
 
         let mut guard = self.cache.lock().unwrap();
@@ -318,14 +443,22 @@ fn normalize_hash(hash: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::raster_index::{RasterIndex, RasterNode, RasterNodeKind};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static UNIQUE_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn unique_dir() -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!("raster-external-storage-test-{}", nanos))
+        let counter = UNIQUE_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "raster-external-storage-test-{}-{}",
+            nanos, counter
+        ))
     }
 
     fn write_external_documents(
@@ -340,6 +473,29 @@ mod tests {
         fs::write(&manifest_path, manifest_body).unwrap();
 
         (input_path, manifest_path)
+    }
+
+    fn selection_hash(parts: &[&[u8]]) -> Vec<u8> {
+        let mut hasher = Sha256::new();
+        for part in parts {
+            hasher.update(part);
+        }
+        hasher.finalize().to_vec()
+    }
+
+    fn hex_string(bytes: &[u8]) -> String {
+        let mut out = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            out.push_str(&format!("{:02x}", byte));
+        }
+        out
+    }
+
+    fn leaf_payload_u64(value: u64) -> Vec<u8> {
+        let mut payload = vec![0x00];
+        payload.extend_from_slice(&(8u64).to_le_bytes());
+        payload.extend_from_slice(&value.to_le_bytes());
+        payload
     }
 
     #[test]
@@ -375,8 +531,20 @@ mod tests {
 
         assert_eq!(read.bytes(), bytes.as_slice());
         assert_eq!(mapped.bytes(), bytes.as_slice());
-        assert!(matches!(read.file, ExternalFile::Read(_)));
-        assert!(matches!(mapped.file, ExternalFile::Mmap(_)));
+        assert!(matches!(
+            read,
+            ResolvedExternalData::Postcard {
+                file: ExternalFile::Read(_),
+                ..
+            }
+        ));
+        assert!(matches!(
+            mapped,
+            ResolvedExternalData::Postcard {
+                file: ExternalFile::Mmap(_),
+                ..
+            }
+        ));
 
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -441,6 +609,51 @@ mod tests {
         assert!(err
             .to_string()
             .contains("External input 'flight_data_bad_manifest' failed integrity check"));
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn resolves_raster_external_inputs_against_index_root_commitment() {
+        let dir = unique_dir();
+        fs::create_dir_all(&dir).unwrap();
+
+        let payload = leaf_payload_u64(123);
+        let root_hash = selection_hash(&[b"leaf", &123u64.to_le_bytes()]);
+        let index = RasterIndex::new(
+            0,
+            root_hash.clone(),
+            vec![RasterNode {
+                offset: 0,
+                len: payload.len() as u64,
+                root_hash: root_hash.clone(),
+                kind: RasterNodeKind::Leaf {
+                    type_name: "u64".into(),
+                },
+            }],
+        );
+        let data_path = dir.join("payload.rastered");
+        let index_path = dir.join("payload.rindex");
+        fs::write(&data_path, &payload).unwrap();
+        fs::write(&index_path, index.encode().unwrap()).unwrap();
+
+        let (input_path, manifest_path) = write_external_documents(
+            &dir,
+            r#"{"payload":{"path":"payload.rastered","index_path":"payload.rindex","load_preference":"mmap"}}"#,
+            &format!(
+                r#"{{"payload":{{"type":"sha256","encoding":"raster","commitment":"{}"}}}}"#,
+                hex_string(&root_hash)
+            ),
+        );
+        let manager =
+            ExternalStorageManager::from_input_args(input_path.to_str(), manifest_path.to_str())
+                .unwrap();
+
+        let resolved = manager.resolve("payload").unwrap();
+
+        assert_eq!(resolved.bytes(), payload.as_slice());
+        assert_eq!(resolved.commitment(), hex_string(&root_hash));
+        assert!(matches!(resolved, ResolvedExternalData::Raster { .. }));
 
         fs::remove_dir_all(&dir).unwrap();
     }
