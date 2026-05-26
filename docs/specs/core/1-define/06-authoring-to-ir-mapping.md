@@ -16,11 +16,10 @@ This spec is written to match the code as it exists today. Where the implementat
   - `crates/raster-macros/src/lib.rs`
     - `#[tile(...)]` macro expands:
       - ABI wrapper `__raster_tile_entry_<fn>`
-      - `linkme` registration in `raster_core::registry::TILE_REGISTRY` (host-only cfg gate)
       - (for `recur`) a `macro_rules! <tile_name> { ... }` wrapper enabling `<tile_name>!(...)` syntax
     - `#[sequence(...)]` macro expands:
-      - `linkme` registration in `raster_core::registry::SEQUENCE_REGISTRY`
-      - extracts a *flat list of call identifiers* using a `syn` visitor (no bindings, no dataflow)
+      - execution/tracing wrapper code around the authored sequence body
+      - does not emit a registry entry
 
 - **Actual IR used by the CLI/compiler today (AST-based, not macro output)**:
   - `crates/raster-compiler/src/ast.rs`

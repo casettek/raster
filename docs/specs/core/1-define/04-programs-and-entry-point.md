@@ -13,8 +13,8 @@ This document specifies how Raster “programs” are defined for the Core toolc
 - **How tiles and sequences become “part of a program” (registration vs source discovery)**
   - `crates/raster-macros/src/lib.rs`
     - `#[tile]`: generates a byte-oriented ABI entry (`__raster_tile_entry_*`) using `postcard::{from_bytes,to_allocvec}`.
-    - `#[sequence]`: registers a sequence ID and a static list of callees extracted from the function body (simple call extraction).
-  - `crates/raster-core/src/registry.rs`: `TILE_REGISTRY`, `SEQUENCE_REGISTRY`, and lookup helpers such as `find_tile_by_str`, `find_sequence`.
+    - `#[sequence]`: generates sequence wrapper code for native tracing and entrypoint handling.
+  - `crates/raster-compiler/src/sequence.rs`: `SequenceDiscovery` discovers sequences from parsed source.
 
 - **How “main” / entry is selected today**
   - `crates/raster-cli/src/main.rs`: `cargo raster preview` defaults `--sequence` to `"main"`.
@@ -41,7 +41,7 @@ This document specifies how Raster “programs” are defined for the Core toolc
   - A set of **sequence definitions** (named compositions that invoke tiles and/or other sequences).
 
 - A program MAY be represented in two (currently coexisting) ways:
-  - **In-process representation (linked program)**: tiles and sequences are present in a Rust binary that links them, and they are discoverable through the global registries (`TILE_REGISTRY`, `SEQUENCE_REGISTRY`) on supported targets.
+  - **In-process representation (linked program)**: tiles and sequences are present in a Rust binary that links them; tiles expose generated ABI wrapper symbols, and sequence functions remain directly callable as Rust functions.
   - **Out-of-process representation (described program)**: tiles and sequences are described by a serialized schema (currently `ControlFlowSchema` / “CFS”), and tile artifacts are stored on disk for backend execution.
 
 - A program MUST treat **IDs** as the primary identity keys:

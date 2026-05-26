@@ -3,7 +3,7 @@ use raster_compiler::tile::TileDiscovery;
 use raster_compiler::Project;
 use raster_core::Result;
 
-/// List command: show all registered tiles.
+/// List command: show all tiles discovered in the project.
 pub fn list_tiles() -> Result<()> {
     let project = Project::new(project_path())?;
     let tile_explorer = TileDiscovery::new(&project);

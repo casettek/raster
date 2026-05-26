@@ -1,7 +1,7 @@
 //! Procedural macros for the Raster toolchain.
 //!
 //! This crate provides:
-//! - `#[tile]` - Marks a function as a tile and registers it in the global registry
+//! - `#[tile]` - Marks a function as a tile and generates its ABI wrapper
 //! - `#[sequence]` - Declares tile ordering and control flow. When the function is named `main`,
 //!   it is the program entry point and gets init and finish automatically.
 
@@ -471,8 +471,7 @@ impl TileAttrs {
 ///
 /// This macro:
 /// 1. Injects tracing code into the original function (for std targets)
-/// 2. Generates an ABI wrapper that handles bincode serialization/deserialization
-/// 3. Registers the tile in the global `TILE_REGISTRY` distributed slice
+/// 2. Generates an ABI wrapper that handles postcard serialization/deserialization
 ///
 /// # Attributes
 /// - `kind = iter` - Standard iterative tile (default if not specified)

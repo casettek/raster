@@ -8,11 +8,7 @@ This document defines **sequences**: author-authored, ordered compositions of ti
   - `crates/raster-macros/src/lib.rs`
     - `#[proc_macro_attribute] pub fn sequence(...)`
     - `TileCallExtractor` and `is_excluded_function(...)`
-    - What it registers: a `SequenceRegistration` containing **only** an ordered `&[&str]` list of call names.
-- **Runtime registry shape**
-  - `crates/raster-core/src/registry.rs`
-    - `SequenceMetadataStatic`, `SequenceRegistration`, `SEQUENCE_REGISTRY`
-    - `iter_sequences()`, `find_sequence(...)`
+    - What it generates: wrapper code for sequence invocation/tracing.
 - **Compiler-time sequence discovery (bindings + args)**
   - `crates/raster-compiler/src/ast.rs`
     - `ProjectAst::new(...)` (walks `src/**/*.rs`, parses with `syn`)
@@ -77,12 +73,11 @@ As implemented today, a call contributes a `CallInfo` (and therefore can become 
 
 Calls are collected in source order and become a linear list of items after filtering to only those callees that match a discovered tile or sequence.
 
-#### 2.3 Runtime registry vs compiler discovery (important distinction)
+#### 2.3 Wrapper generation vs compiler discovery (important distinction)
 
-The `#[sequence]` proc-macro registers sequences in the runtime `SEQUENCE_REGISTRY` with an ordered list of callee names. This registry list:
+The `#[sequence]` proc-macro is responsible for making the sequence callable as a Rust function and for injecting native tracing/entrypoint behavior.
 
-- MUST be treated as **best-effort metadata** suitable for host-side introspection and “preview” workflows.
-- MUST NOT be treated as the source of truth for compilation, because it does not include bindings, argument sources, or nested-sequence structure.
+It is **not** the source of truth for sequence compilation metadata.
 
 The compiler’s CFS builder derives sequence items from the parsed project AST and extracted `CallInfo`s, and then resolves dataflow in `crates/raster-compiler/src/flow_resolver.rs`.
 

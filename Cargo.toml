@@ -58,8 +58,7 @@ proc-macro2 = "1.0"
 # CLI dependencies
 clap = { version = "4.5", features = ["derive"] }
 
-# Registry and ABI dependencies
-linkme = "0.3"
+# ABI dependencies
 # postcard is no_std compatible, used for serialization in tiles
 postcard = { version = "1.0", default-features = false, features = ["alloc"] }
 # bincode is used by std-only code (CLI, backend)

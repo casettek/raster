@@ -6,13 +6,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::tile::Tile;
-use crate::{backend::BackendImpl, tile::TileDiscovery, Project};
+use crate::{backend::BackendImpl, Project};
 use raster_backend::{Backend, CompilationArtifact, ExecutionMode, TileExecutionResult};
-use raster_core::{
-    manifest::Manifest,
-    registry::{iter_tiles, TileRegistration},
-    Result,
-};
+use raster_core::Result;
 /// Orchestrates the build process for a Raster project.
 pub struct Builder<'ast, 'b> {
     /// The backend to use for compilation (shared via Arc for TileRunner).
@@ -32,14 +28,6 @@ impl<'ast, 'b> Builder<'ast, 'b> {
 
     pub fn backend_name(&self) -> &'static str {
         self.backend.name()
-    }
-
-    /// Discover all registered tiles from the in-process registry.
-    ///
-    /// This uses the tile registry populated by the `#[tile]` macro.
-    /// Note: This only works when the tiles are linked into the same binary.
-    pub fn discover_tiles(&self) -> Vec<&'static TileRegistration> {
-        iter_tiles().collect()
     }
 
     // /// Build all tiles discovered from source files.

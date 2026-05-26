@@ -35,15 +35,7 @@ pub mod transition;
 #[cfg(feature = "std")]
 pub mod fingerprint;
 
-// The registry module uses linkme which doesn't support RISC-V targets
-#[cfg(all(feature = "std", not(target_arch = "riscv32")))]
-pub mod registry;
-
 pub use error::{Error, Result, TileOutputEnvelope};
-
-// Re-export linkme for use by the macro-generated code (not available on RISC-V)
-#[cfg(all(feature = "std", not(target_arch = "riscv32")))]
-pub use linkme;
 
 // Re-export postcard for tile ABI serialization (no_std compatible)
 pub use postcard;

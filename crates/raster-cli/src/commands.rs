@@ -154,24 +154,7 @@ fn double(x: u64) -> u64 {
 fn main() {
     println!("Raster Project");
     println!();
-
-    // Show registered tiles
-    println!("Registered tiles: {}", tile_count());
-    for tile in iter_tiles() {
-        println!("  - {}", tile.id_str());
-    }
-
-    // Execute directly
-    println!();
     println!("double(21) = {}", double(21));
-
-    // Execute via registry
-    if let Some(tile) = find_tile_by_str("double") {
-        let input = raster::core::postcard::to_allocvec(&42u64).unwrap();
-        let output = tile.execute(&input).unwrap();
-        let result: u64 = raster::core::postcard::from_bytes(&output).unwrap();
-        println!("double(42) via registry = {}", result);
-    }
 }
 "#;
     std::fs::write(src_dir.join("main.rs"), main_rs)?;

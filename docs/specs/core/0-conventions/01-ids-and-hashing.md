@@ -7,10 +7,9 @@ This document specifies **identifier** and **hash / digest** conventions used by
 - **Tile IDs**
   - **`TileId` type**: `crates/raster-core/src/tile.rs`
   - **Derivation (macro emits the ID as the function name)**: `crates/raster-macros/src/lib.rs` (`#[tile]`)
-  - **Registry matching/equality semantics**: `crates/raster-core/src/registry.rs`
 - **Sequence IDs**
   - **Derivation (macro emits the ID as the function name)**: `crates/raster-macros/src/lib.rs` (`#[sequence]`)
-  - **Registry**: `crates/raster-core/src/registry.rs`
+  - **Discovery / lookup use**: `crates/raster-compiler/src/sequence.rs`
   - **Schema uses sequence IDs**: `crates/raster-core/src/schema.rs`, `crates/raster-core/src/cfs.rs`
 - **Backend “method ID” / “image ID”**
   - **RISC0 image ID derivation** (cryptographic, delegated to RISC0): `crates/raster-backend-risc0/src/risc0.rs` (`risc0_zkvm::compute_image_id(&elf)`)

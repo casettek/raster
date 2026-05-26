@@ -2,7 +2,7 @@ use raster_core::trace::TraceEvent;
 
 use std::sync::OnceLock;
 
-// TODO: consider adding linkme here
+// TODO: consider pluggable publisher registration here
 /// The global subscriber instance.
 pub(crate) static GLOBAL_PUBLISHER: OnceLock<Box<dyn Publisher>> = OnceLock::new();
 

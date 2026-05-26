@@ -154,13 +154,6 @@ pub mod prelude {
         trace::{FnCallRecord, FnInput, FnInputArg, FnOutput, TileExecRecord},
     };
 
-    // Registry is only available with std and on platforms that support linkme
-    #[cfg(all(feature = "std", not(target_arch = "riscv32")))]
-    pub use crate::core::registry::{
-        find_sequence, find_tile, find_tile_by_str, iter_sequences, iter_tiles, sequence_count,
-        tile_count, SequenceMetadataStatic, SequenceRegistration, TileRegistration,
-    };
-
     pub use crate::{
         call, call_seq, debug, external, into_sequence_arg, select, sequence, tile, ExternalArg,
         ExternalSelection, IntoResolvedArg, IntoSequenceArg, ListProofDirection, ListProofSibling,

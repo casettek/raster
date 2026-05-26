@@ -54,7 +54,7 @@ enum Commands {
         verify: bool,
     },
 
-    /// List all registered tiles
+    /// List all project tiles
     List,
 
     /// Analyze execution traces
