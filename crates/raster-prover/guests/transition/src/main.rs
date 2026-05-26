@@ -179,7 +179,7 @@ fn verify_step_record_inputs(
     // TODO: External Kind of input source not_implemented
     if step_inputs
         .iter()
-        .all(|input| matches!(input.source, InputSource::External))
+        .all(|input| matches!(input.source, InputSource::External | InputSource::Inline))
     {
         return;
     }
@@ -199,6 +199,7 @@ fn verify_step_record_inputs(
             InputSource::External => {
                 todo!("External input source")
             }
+            InputSource::Inline => {}
             InputSource::SeqInput { .. } => {
                 let (source_record, witness_bytes) = input_sources_witnesses
                     .iter()

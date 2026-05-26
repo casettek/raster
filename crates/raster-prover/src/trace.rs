@@ -315,7 +315,7 @@ fn resolve_inputs_sources(
 ) -> Vec<(usize, StepRecord)> {
     if step_inputs
         .iter()
-        .all(|input| matches!(input.source, InputSource::External))
+        .all(|input| matches!(input.source, InputSource::External | InputSource::Inline))
     {
         return Vec::new();
     }
@@ -348,9 +348,9 @@ fn resolve_inputs_sources(
 
     for step_input in step_inputs {
         match &step_input.source {
-            InputSource::External => {}
+            InputSource::External | InputSource::Inline => {}
             InputSource::SeqInput { input_index } => {
-                let (parent_index, source_record)= current_sequence_trace_suffix 
+                let (parent_index, source_record) = current_sequence_trace_suffix
                     .first()
                     .cloned()
                     .and_then(|record| match record {
@@ -400,7 +400,7 @@ fn resolve_inputs_sources(
                         )
                     });
 
-                let source_record = current_sequence_trace_suffix 
+                let source_record = current_sequence_trace_suffix
                     .iter()
                     .enumerate()
                     .find_map(|(intra_sequence_offset, record)| match (record, source_record_cfs_item) {
@@ -425,7 +425,7 @@ fn resolve_inputs_sources(
                     .unwrap_or_else(|| {
                         panic!(
                             "Failed to resolve source record for step {:?} from source item {} output {} at {:?}",
-                            step_record, item_index, output_index, source_record_coordinates 
+                            step_record, item_index, output_index, source_record_coordinates
                         )
                     });
 

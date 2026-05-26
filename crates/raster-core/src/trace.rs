@@ -39,6 +39,12 @@ pub struct ExternalData {
     pub selected: SelectedPayload,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum FnInputValue {
+    Inline(Vec<u8>),
+    ExternalBinding,
+}
+
 impl FnInput {
     pub fn data(&self) -> &[u8] {
         &self.data

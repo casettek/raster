@@ -468,6 +468,11 @@ impl InputBinding {
         Self::new(InputSource::External)
     }
 
+    /// Create an inline input binding.
+    pub fn inline() -> Self {
+        Self::new(InputSource::Inline)
+    }
+
     /// Create a sequence input binding.
     pub fn seq_input(input_index: usize) -> Self {
         Self::new(InputSource::SeqInput { input_index })
@@ -487,6 +492,9 @@ impl InputBinding {
 pub enum InputSource {
     /// Input comes from outside the sequence (runtime-provided).
     External,
+
+    /// Input is materialized inline in the sequence body.
+    Inline,
 
     /// Input comes from one of the sequence's declared inputs.
     SeqInput {

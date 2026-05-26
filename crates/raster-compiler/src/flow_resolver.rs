@@ -6,7 +6,7 @@
 use raster_core::cfs::{InputBinding, InputSource, SequenceChildItem, SequenceItem, TileItem};
 use std::collections::HashMap;
 
-use crate::ast::{CallInfo, CallKind};
+use crate::ast::{CallArgumentKind, CallInfo, CallKind};
 use crate::sequence::{Sequence, SequenceDiscovery};
 use crate::tile::TileDiscovery;
 
@@ -101,12 +101,13 @@ impl<'a, 'ast> FlowResolver<'a, 'ast> {
     fn resolve_call_inputs(&self, call: &CallInfo) -> Vec<InputBinding> {
         call.arguments
             .iter()
-            .map(|arg| self.resolve_argument(arg))
+            .zip(call.argument_kinds.iter())
+            .map(|(arg, kind)| self.resolve_argument(arg, kind))
             .collect()
     }
 
     /// Resolve a single argument to its input source.
-    fn resolve_argument(&self, arg: &str) -> InputBinding {
+    fn resolve_argument(&self, arg: &str, kind: &CallArgumentKind) -> InputBinding {
         let arg = arg.trim();
 
         // Check if it's a sequence parameter
@@ -119,11 +120,11 @@ impl<'a, 'ast> FlowResolver<'a, 'ast> {
             return InputBinding::item_output(item_index, output_index);
         }
 
-        // If we can't resolve it, treat it as coming from a sequence input
-        // This handles cases like literals or complex expressions
-        // For now, we'll use external as a fallback
-        // In a more complete implementation, we might want to handle this differently
-        InputBinding::new(InputSource::External)
+        match kind {
+            CallArgumentKind::ExternalBinding => InputBinding::external(),
+            CallArgumentKind::Inline | CallArgumentKind::Other => InputBinding::inline(),
+            CallArgumentKind::Identifier => InputBinding::external(),
+        }
     }
 }
 
@@ -236,12 +237,14 @@ mod tests {
                     callee: "greet".to_string(),
                     result_binding: Some("greeting".to_string()),
                     arguments: vec!["name".to_string()],
+                    argument_kinds: vec![CallArgumentKind::Identifier],
                     call_kind: CallKind::Tile,
                 },
                 CallInfo {
                     callee: "exclaim".to_string(),
                     result_binding: None,
                     arguments: vec!["greeting".to_string()],
+                    argument_kinds: vec![CallArgumentKind::Identifier],
                     call_kind: CallKind::Tile,
                 },
             ],
@@ -290,6 +293,56 @@ mod tests {
                     _ => panic!("Expected ItemOutput"),
                 }
             }
+            _ => panic!("Expected Tile item"),
+        }
+    }
+
+    #[test]
+    fn test_resolve_inline_argument_as_inline_source() {
+        let project = make_mock_project();
+        let greet_func = make_tile_function("greet", vec!["name"], true);
+        let tile = Tile {
+            function: &greet_func,
+            tile_type: "iter".to_string(),
+            estimated_cycles: None,
+            max_memory: None,
+            description: None,
+        };
+        let tile_discovery = TileDiscovery {
+            project: &project,
+            tiles: vec![tile],
+        };
+        let sequence_discovery = SequenceDiscovery {
+            project: &project,
+            sequences: vec![],
+        };
+
+        let seq_func = make_sequence_function(
+            "main",
+            vec![],
+            vec![CallInfo {
+                callee: "greet".to_string(),
+                result_binding: None,
+                arguments: vec!["\"Raster\".to_string()".to_string()],
+                argument_kinds: vec![CallArgumentKind::Other],
+                call_kind: CallKind::Tile,
+            }],
+        );
+
+        let sequence = Sequence {
+            function: &seq_func,
+            steps: vec![SequenceStep::Tile(&tile_discovery.tiles[0])],
+            description: None,
+        };
+
+        let mut resolver = FlowResolver::new(&tile_discovery, &sequence_discovery);
+        let items = resolver.resolve(&sequence);
+
+        match &items[0] {
+            SequenceChildItem::Tile(tile_item) => match &tile_item.sources[0].source {
+                InputSource::Inline => {}
+                other => panic!("Expected Inline source, got {:?}", other),
+            },
             _ => panic!("Expected Tile item"),
         }
     }

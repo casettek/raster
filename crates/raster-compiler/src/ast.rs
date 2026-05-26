@@ -28,6 +28,14 @@ pub enum CallKind {
     Sequence,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallArgumentKind {
+    Identifier,
+    ExternalBinding,
+    Inline,
+    Other,
+}
+
 /// Captures detailed information about a function call within a function body.
 #[derive(Debug, Clone)]
 pub struct CallInfo {
@@ -35,6 +43,8 @@ pub struct CallInfo {
     pub callee: String,
     /// The arguments passed to the function (as string representations)
     pub arguments: Vec<String>,
+    /// Lightweight classification of each argument expression.
+    pub argument_kinds: Vec<CallArgumentKind>,
     /// The variable name this call result is bound to, if any (e.g., `let x = foo()` -> Some("x"))
     pub result_binding: Option<String>,
     /// How the call was made: via `call!`, `call_seq!`, or a bare function call.
@@ -252,7 +262,9 @@ impl CallVisitor {
     ///
     /// The macro syntax is `call!(callee_fn, arg1, arg2, ...)`. The token stream
     /// is a comma-separated list; the first token is the callee identifier.
-    fn parse_call_macro_args(mac: &syn::Macro) -> Option<(String, Vec<String>)> {
+    fn parse_call_macro_args(
+        mac: &syn::Macro,
+    ) -> Option<(String, Vec<String>, Vec<CallArgumentKind>)> {
         // Parse the macro tokens as a punctuated sequence of expressions.
         let args: syn::punctuated::Punctuated<Expr, syn::Token![,]> = mac
             .parse_body_with(syn::punctuated::Punctuated::parse_terminated)
@@ -268,9 +280,42 @@ impl CallVisitor {
         };
 
         // Remaining arguments are the call arguments.
-        let arguments: Vec<String> = iter.map(Self::expr_to_string).collect();
+        let rest: Vec<&Expr> = iter.collect();
+        let arguments: Vec<String> = rest.iter().map(|expr| Self::expr_to_string(expr)).collect();
+        let argument_kinds: Vec<CallArgumentKind> = rest
+            .iter()
+            .map(|expr| Self::classify_argument(expr))
+            .collect();
 
-        Some((callee, arguments))
+        Some((callee, arguments, argument_kinds))
+    }
+
+    fn classify_argument(expr: &Expr) -> CallArgumentKind {
+        match expr {
+            Expr::Path(path) if path.path.get_ident().is_some() => CallArgumentKind::Identifier,
+            Expr::Macro(expr_macro) if Self::is_external_binding_macro(&expr_macro.mac) => {
+                CallArgumentKind::ExternalBinding
+            }
+            Expr::Lit(_) => CallArgumentKind::Inline,
+            _ => CallArgumentKind::Other,
+        }
+    }
+
+    fn is_external_binding_macro(mac: &syn::Macro) -> bool {
+        let segments: Vec<String> = mac
+            .path
+            .segments
+            .iter()
+            .map(|s| s.ident.to_string())
+            .collect();
+
+        match segments.as_slice() {
+            [name] if name == "external" || name == "select" => true,
+            [prefix, name] if prefix == "raster" && (name == "external" || name == "select") => {
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Check if a macro path matches one of the canonical call primitive names.
@@ -313,11 +358,14 @@ impl<'ast> Visit<'ast> for CallVisitor {
 
     fn visit_expr_macro(&mut self, node: &'ast ExprMacro) {
         if let Some(call_kind) = Self::macro_call_kind(&node.mac) {
-            if let Some((callee, arguments)) = Self::parse_call_macro_args(&node.mac) {
+            if let Some((callee, arguments, argument_kinds)) =
+                Self::parse_call_macro_args(&node.mac)
+            {
                 let result_binding = self.current_binding.take();
                 self.call_infos.push(CallInfo {
                     callee,
                     arguments,
+                    argument_kinds,
                     result_binding,
                     call_kind,
                 });
@@ -336,11 +384,14 @@ impl<'ast> Visit<'ast> for CallVisitor {
         // which does NOT trigger `visit_expr_macro`. We handle them here so that statement-
         // position `call!` and `call_seq!` invocations are captured without a binding.
         if let Some(call_kind) = Self::macro_call_kind(&node.mac) {
-            if let Some((callee, arguments)) = Self::parse_call_macro_args(&node.mac) {
+            if let Some((callee, arguments, argument_kinds)) =
+                Self::parse_call_macro_args(&node.mac)
+            {
                 // current_binding is None here — bare statements have no let binding.
                 self.call_infos.push(CallInfo {
                     callee,
                     arguments,
+                    argument_kinds,
                     result_binding: None,
                     call_kind,
                 });
@@ -382,6 +433,7 @@ mod tests {
         assert_eq!(calls[0].call_kind, CallKind::Tile);
         assert_eq!(calls[0].result_binding.as_deref(), Some("greeting"));
         assert_eq!(calls[0].arguments, vec!["name"]);
+        assert_eq!(calls[0].argument_kinds, vec![CallArgumentKind::Identifier]);
     }
 
     #[test]
@@ -392,6 +444,7 @@ mod tests {
         assert_eq!(calls[0].call_kind, CallKind::Sequence);
         assert_eq!(calls[0].result_binding.as_deref(), Some("result"));
         assert_eq!(calls[0].arguments, vec!["greeting"]);
+        assert_eq!(calls[0].argument_kinds, vec![CallArgumentKind::Identifier]);
     }
 
     #[test]
@@ -410,6 +463,26 @@ mod tests {
         assert_eq!(calls[0].callee, "tile_fn");
         assert_eq!(calls[0].call_kind, CallKind::Tile);
         assert_eq!(calls[0].arguments.len(), 3);
+        assert_eq!(
+            calls[0].argument_kinds,
+            vec![
+                CallArgumentKind::Identifier,
+                CallArgumentKind::Identifier,
+                CallArgumentKind::Identifier,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_external_and_inline_argument_classification() {
+        let calls = parse_calls(
+            r#"fn seq() { let r = call_seq!(next, select!(String, source.name), "x"); }"#,
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].argument_kinds,
+            vec![CallArgumentKind::ExternalBinding, CallArgumentKind::Inline]
+        );
     }
 
     #[test]

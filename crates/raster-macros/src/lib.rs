@@ -70,6 +70,14 @@ fn external_info_ident(param: &ParamInfo) -> syn::Ident {
     format_ident!("__raster_external_info_{}", param.ident)
 }
 
+fn sequence_root_ident(index: usize) -> syn::Ident {
+    format_ident!("__RasterRoot{}", index)
+}
+
+fn sequence_arg_ident(index: usize) -> syn::Ident {
+    format_ident!("__RasterArg{}", index)
+}
+
 fn gen_arg_resolution(input: &ItemFn) -> proc_macro2::TokenStream {
     let params = extract_params(input);
     let is_result = returns_result(input);
@@ -99,6 +107,97 @@ fn gen_arg_resolution(input: &ItemFn) -> proc_macro2::TokenStream {
 
     quote! {
         #(#resolutions)*
+    }
+}
+
+fn gen_sequence_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream {
+    let params = extract_params(input);
+    let is_result = returns_result(input);
+
+    let trace_defs: Vec<_> = params
+        .iter()
+        .map(|param| {
+            let name = &param.ident;
+            let trace_value_ident = format_ident!("__raster_input_value_{}", name);
+            let external_info_ident = external_info_ident(param);
+            let trace = if is_result {
+                quote! {
+                    ::raster::sequence_arg_trace(&#name)?
+                }
+            } else {
+                quote! {
+                    ::raster::sequence_arg_trace(&#name)
+                        .unwrap_or_else(|e| panic!("Failed to trace sequence argument '{}': {}", stringify!(#name), e))
+                }
+            };
+            quote! {
+                let (#trace_value_ident, #external_info_ident) = #trace;
+            }
+        })
+        .collect();
+
+    let input_arg_defs: Vec<_> = params
+        .iter()
+        .map(|param| {
+            let name = &param.ident;
+            let name_str = name.to_string();
+            let ty = &param.ty;
+            let ty_str = ty.to_token_stream().to_string();
+            quote! {
+                ::raster::core::trace::FnInputArg {
+                    name: ::raster::alloc::string::String::from(#name_str),
+                    ty: ::raster::alloc::string::String::from(#ty_str),
+                }
+            }
+        })
+        .collect();
+
+    let trace_values: Vec<_> = params
+        .iter()
+        .map(|param| {
+            let name = &param.ident;
+            let trace_value_ident = format_ident!("__raster_input_value_{}", name);
+            quote! { #trace_value_ident }
+        })
+        .collect();
+
+    let external_binding_entries: Vec<_> = params
+        .iter()
+        .map(|param| {
+            let name_str = param.ident.to_string();
+            let external_info_ident = external_info_ident(param);
+            quote! {
+                if let ::core::option::Option::Some(__raster_external_info) = #external_info_ident.clone() {
+                    __raster_external.insert(
+                        ::raster::alloc::string::String::from(#name_str),
+                        __raster_external_info,
+                    );
+                }
+            }
+        })
+        .collect();
+
+    quote! {
+        #(#trace_defs)*
+
+        let __raster_input_args: ::raster::alloc::vec::Vec<::raster::core::trace::FnInputArg> = ::raster::alloc::vec![
+            #(#input_arg_defs),*
+        ];
+
+        let __raster_input_bytes = ::raster::core::postcard::to_allocvec(
+            &::raster::alloc::vec![#(#trace_values),*]
+        ).unwrap_or_default();
+
+        let mut __raster_external = ::raster::alloc::collections::BTreeMap::new();
+        #(#external_binding_entries)*
+
+        let __raster_input = ::core::option::Option::Some(
+            ::raster::core::trace::FnInput {
+                data: __raster_input_bytes,
+                args: __raster_input_args,
+                external: __raster_external,
+            }
+        );
     }
 }
 
@@ -456,12 +555,12 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
                 let __raster_output = ::core::option::Option::Some(
                     ::raster::core::trace::FnOutput {
                         data: __raster_output_bytes,
-                        ty: ::alloc::string::String::from(#output_type_expr),
+                        ty: ::raster::alloc::string::String::from(#output_type_expr),
                     }
                 );
 
                 let __raster_record = ::raster::core::trace::FnCallRecord {
-                    fn_name: ::alloc::string::String::from(#fn_name_str),
+                    fn_name: ::raster::alloc::string::String::from(#fn_name_str),
                     input: __raster_input,
                     output: __raster_output,
                 };
@@ -537,8 +636,7 @@ impl SequenceAttrs {
 /// Generates the sequence-wrapped body: either tracing (SequenceStart/body/SequenceEnd) or plain body depending on cfg.
 fn gen_sequence_wrapped_body(fn_name_str: &str, item_fn: &ItemFn) -> proc_macro2::TokenStream {
     let body = &item_fn.block;
-    let arg_resolution = gen_arg_resolution(item_fn);
-    let input_serialization = gen_input_serialization(&item_fn);
+    let input_serialization = gen_sequence_input_serialization(&item_fn);
 
     let output_type_expr = match &item_fn.sig.output {
         ReturnType::Default => quote! { "()" },
@@ -549,8 +647,6 @@ fn gen_sequence_wrapped_body(fn_name_str: &str, item_fn: &ItemFn) -> proc_macro2
     };
 
     quote! {
-        #arg_resolution
-
         #[cfg(all(feature = "std", not(target_arch = "riscv32")))]
         {
             #input_serialization
@@ -620,9 +716,6 @@ pub fn sequence(attr: TokenStream, item: TokenStream) -> TokenStream {
     let fn_attrs = &item_fn.attrs;
     let _attrs = SequenceAttrs::parse(attr);
 
-    let mut sequence_sig = item_fn.sig.clone();
-    rewrite_into_resolved_args(&mut sequence_sig);
-
     let expanded = if item_fn.sig.ident == "main" {
         if !params.is_empty() {
             panic!(
@@ -643,13 +736,101 @@ pub fn sequence(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         }
     } else {
-        // Normal sequence: keep signature, wrap body
+        let fn_name = &item_fn.sig.ident;
+        let impl_name = format_ident!("__raster_sequence_impl_{}", fn_name_str);
         let body = gen_sequence_wrapped_body(&fn_name_str, &item_fn);
-        quote! {
-            #(#fn_attrs)*
-            #fn_vis #sequence_sig {
-                #body
+        let output = &item_fn.sig.output;
+        let root_idents: Vec<_> = params
+            .iter()
+            .enumerate()
+            .map(|(index, _)| sequence_root_ident(index))
+            .collect();
+        let arg_idents: Vec<_> = params
+            .iter()
+            .enumerate()
+            .map(|(index, _)| sequence_arg_ident(index))
+            .collect();
+        let wrapper_params: Vec<_> = params
+            .iter()
+            .zip(arg_idents.iter())
+            .map(|(param, arg_ident)| {
+                let name = &param.ident;
+                quote! { #name: #arg_ident }
+            })
+            .collect();
+        let wrapper_where: Vec<_> = params
+            .iter()
+            .zip(arg_idents.iter())
+            .map(|(param, arg_ident)| {
+                let ty = &param.ty;
+                quote! {
+                    #arg_ident: ::raster::IntoSequenceArg<#ty>,
+                    <#arg_ident as ::raster::IntoSequenceArg<#ty>>::Root: ::raster::TypedSequenceRoot
+                }
+            })
+            .collect();
+        let root_where: Vec<_> = root_idents
+            .iter()
+            .map(|root_ident| quote! { #root_ident: ::raster::TypedSequenceRoot })
+            .collect();
+        let impl_params: Vec<_> = params
+            .iter()
+            .zip(root_idents.iter())
+            .map(|(param, root_ident)| {
+                let name = &param.ident;
+                let ty = &param.ty;
+                quote! { #name: ::raster::SequenceArg<#root_ident, #ty> }
+            })
+            .collect();
+        let param_names: Vec<_> = params.iter().map(|param| &param.ident).collect();
+        let conversions: Vec<_> = params
+            .iter()
+            .map(|param| {
+                let name = &param.ident;
+                let ty = &param.ty;
+                quote! {
+                    let #name = ::raster::into_sequence_arg::<#ty, _>(#name);
+                }
+            })
+            .collect();
+        let impl_fn = if params.is_empty() {
+            quote! {
+                fn #impl_name() #output {
+                    #body
+                }
             }
+        } else {
+            quote! {
+                fn #impl_name<#(#root_idents),*>(#(#impl_params),*) #output
+                where
+                    #(#root_where),*
+                {
+                    #body
+                }
+            }
+        };
+        let wrapper_fn = if params.is_empty() {
+            quote! {
+                #(#fn_attrs)*
+                #fn_vis fn #fn_name() #output {
+                    #impl_name()
+                }
+            }
+        } else {
+            quote! {
+                #(#fn_attrs)*
+                #fn_vis fn #fn_name<#(#arg_idents),*>(#(#wrapper_params),*) #output
+                where
+                    #(#wrapper_where),*
+                {
+                    #(#conversions)*
+                    #impl_name(#(#param_names),*)
+                }
+            }
+        };
+        quote! {
+            #impl_fn
+            #wrapper_fn
         }
     };
 

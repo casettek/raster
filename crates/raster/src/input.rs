@@ -8,6 +8,7 @@ pub use raster_core::input::{
     ListProofDirection, ListProofSibling, ResolvedArg, SchemaField, SchemaNode, Selectable,
     SelectedPayload, SelectionProof, SelectionProofStep, SelectorPath, SelectorSegment,
 };
+use raster_core::trace::{ExternalData as TraceExternalData, FnInputValue};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TypedExternalBinding<Root> {
@@ -67,44 +68,126 @@ pub struct TypedSelectedExternalBinding<Root, Selected> {
     selector: TypedSelectorPath<Root, Selected>,
 }
 
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct DeferredExternal<Root, Current> {
+    name: String,
+    selector: SelectorPath,
+    resolve: fn(ExternalSelection) -> raster_core::Result<ExternalArg<Current>>,
+    marker: PhantomData<fn() -> (Root, Current)>,
+}
+
+#[derive(Debug, Clone)]
+pub enum SequenceArg<Root, Current> {
+    Inline(Current),
+    External(DeferredExternal<Root, Current>),
+}
+
+pub trait IntoSequenceArg<Current> {
+    type Root;
+
+    fn into_sequence_arg(self) -> SequenceArg<Self::Root, Current>;
+}
+
+pub trait TypedSequenceRoot: DeserializeOwned + Serialize + Selectable {}
+
+impl<T> TypedSequenceRoot for T where T: DeserializeOwned + Serialize + Selectable {}
+
 pub trait SelectSource {
     type Root;
     type Current;
+    type Selected<Selected>;
 
-    fn into_source_and_selector(self) -> (TypedExternalBinding<Self::Root>, SelectorPath);
+    fn select<Selected>(
+        self,
+        selector: TypedSelectorPath<Self::Current, Selected>,
+    ) -> Self::Selected<Selected>
+    where
+        Selected: DeserializeOwned + Serialize;
 }
 
 impl<Root> SelectSource for TypedExternalBinding<Root> {
     type Root = Root;
     type Current = Root;
+    type Selected<Selected> = TypedSelectedExternalBinding<Root, Selected>;
 
-    fn into_source_and_selector(self) -> (TypedExternalBinding<Self::Root>, SelectorPath) {
-        (self, SelectorPath::default())
+    fn select<Selected>(
+        self,
+        selector: TypedSelectorPath<Self::Current, Selected>,
+    ) -> Self::Selected<Selected>
+    where
+        Selected: DeserializeOwned + Serialize,
+    {
+        TypedSelectedExternalBinding {
+            source: self,
+            selector,
+        }
     }
 }
 
 impl<Root, Current> SelectSource for TypedSelectedExternalBinding<Root, Current> {
     type Root = Root;
     type Current = Current;
+    type Selected<Selected> = TypedSelectedExternalBinding<Root, Selected>;
 
-    fn into_source_and_selector(self) -> (TypedExternalBinding<Self::Root>, SelectorPath) {
-        (self.source, self.selector.into_path())
+    fn select<Selected>(
+        self,
+        selector: TypedSelectorPath<Self::Current, Selected>,
+    ) -> Self::Selected<Selected>
+    where
+        Selected: DeserializeOwned + Serialize,
+    {
+        let selector = TypedSelectorPath::new(compose_selector_paths(
+            self.selector.into_path(),
+            selector.into_path(),
+        ));
+        TypedSelectedExternalBinding {
+            source: self.source,
+            selector,
+        }
+    }
+}
+
+impl<Root, Current> SelectSource for SequenceArg<Root, Current>
+where
+    Root: TypedSequenceRoot,
+{
+    type Root = Root;
+    type Current = Current;
+    type Selected<Selected> = SequenceArg<Root, Selected>;
+
+    fn select<Selected>(
+        self,
+        selector: TypedSelectorPath<Self::Current, Selected>,
+    ) -> Self::Selected<Selected>
+    where
+        Selected: DeserializeOwned + Serialize,
+    {
+        match self {
+            SequenceArg::Inline(_) => {
+                panic!(
+                    "select! on inline sequence values is not supported; only external bindings can be refined inside sequences"
+                )
+            }
+            SequenceArg::External(binding) => SequenceArg::External(DeferredExternal {
+                name: binding.name,
+                selector: compose_selector_paths(binding.selector, selector.into_path()),
+                resolve: resolve_typed_external_value::<Root, Selected>,
+                marker: PhantomData,
+            }),
+        }
     }
 }
 
 pub fn select_source<Source, Selected>(
     source: Source,
     selector: TypedSelectorPath<Source::Current, Selected>,
-) -> TypedSelectedExternalBinding<Source::Root, Selected>
+) -> Source::Selected<Selected>
 where
     Source: SelectSource,
+    Selected: DeserializeOwned + Serialize,
 {
-    let (source, existing_selector) = source.into_source_and_selector();
-    let selector = TypedSelectorPath::new(compose_selector_paths(
-        existing_selector,
-        selector.into_path(),
-    ));
-    TypedSelectedExternalBinding { source, selector }
+    source.select(selector)
 }
 
 fn compose_selector_paths(prefix: SelectorPath, suffix: SelectorPath) -> SelectorPath {
@@ -115,6 +198,65 @@ fn compose_selector_paths(prefix: SelectorPath, suffix: SelectorPath) -> Selecto
 
 pub fn selector_path(segments: Vec<SelectorSegment>) -> SelectorPath {
     SelectorPath::new(segments)
+}
+
+impl<T> IntoSequenceArg<T> for T
+where
+    T: Serialize,
+{
+    type Root = T;
+
+    fn into_sequence_arg(self) -> SequenceArg<Self::Root, T> {
+        SequenceArg::Inline(self)
+    }
+}
+
+impl<Root> IntoSequenceArg<Root> for TypedExternalBinding<Root>
+where
+    Root: DeserializeOwned + Serialize,
+{
+    type Root = Root;
+
+    fn into_sequence_arg(self) -> SequenceArg<Self::Root, Root> {
+        SequenceArg::External(DeferredExternal {
+            name: self.name,
+            selector: SelectorPath::default(),
+            resolve: resolve_external_value::<Root>,
+            marker: PhantomData,
+        })
+    }
+}
+
+impl<Root, Current> IntoSequenceArg<Current> for TypedSelectedExternalBinding<Root, Current>
+where
+    Root: DeserializeOwned + Serialize + Selectable,
+    Current: DeserializeOwned + Serialize,
+{
+    type Root = Root;
+
+    fn into_sequence_arg(self) -> SequenceArg<Self::Root, Current> {
+        SequenceArg::External(DeferredExternal {
+            name: self.source.name,
+            selector: self.selector.into_path(),
+            resolve: resolve_typed_external_value::<Root, Current>,
+            marker: PhantomData,
+        })
+    }
+}
+
+impl<Root, Current> IntoSequenceArg<Current> for SequenceArg<Root, Current> {
+    type Root = Root;
+
+    fn into_sequence_arg(self) -> SequenceArg<Self::Root, Current> {
+        self
+    }
+}
+
+pub fn into_sequence_arg<T, A>(arg: A) -> SequenceArg<A::Root, T>
+where
+    A: IntoSequenceArg<T>,
+{
+    arg.into_sequence_arg()
 }
 
 pub trait IntoResolvedArg<T> {
@@ -153,11 +295,62 @@ where
     }
 }
 
+impl<Root, Current> IntoResolvedArg<Current> for SequenceArg<Root, Current>
+where
+    Current: Serialize,
+{
+    fn into_resolved_arg(self) -> raster_core::Result<ResolvedArg<Current>> {
+        match self {
+            SequenceArg::Inline(value) => Ok(ResolvedArg::inline(value)),
+            SequenceArg::External(binding) => {
+                let value = (binding.resolve)(ExternalSelection::with_selector(
+                    binding.name,
+                    binding.selector,
+                ))?;
+                Ok(ResolvedArg::external(value))
+            }
+        }
+    }
+}
+
 pub fn into_resolved_arg<T, A>(arg: A) -> raster_core::Result<ResolvedArg<T>>
 where
     A: IntoResolvedArg<T>,
 {
     arg.into_resolved_arg()
+}
+
+pub fn sequence_arg_trace<Root, T>(
+    arg: &SequenceArg<Root, T>,
+) -> raster_core::Result<(FnInputValue, Option<TraceExternalData>)>
+where
+    T: Serialize,
+{
+    match arg {
+        SequenceArg::Inline(value) => Ok((
+            FnInputValue::Inline(raster_core::postcard::to_allocvec(value).unwrap_or_default()),
+            None,
+        )),
+        SequenceArg::External(binding) => {
+            let resolved = (binding.resolve)(ExternalSelection::with_selector(
+                binding.name.clone(),
+                binding.selector.clone(),
+            ))?;
+            Ok((
+                FnInputValue::ExternalBinding,
+                Some(TraceExternalData {
+                    name: resolved.name,
+                    commitment: resolved
+                        .commitment
+                        .map(|value| value.into_bytes())
+                        .unwrap_or_default(),
+                    tree_root: resolved.selected.proof.root_hash.clone(),
+                    selector: resolved.selector,
+                    selected: resolved.selected,
+                }),
+            ))
+        }
+    }
 }
 
 pub fn resolve_external_value<T: DeserializeOwned + Serialize>(
