@@ -2,7 +2,7 @@
 //!
 //! This crate defines the foundational data structures used across the entire
 //! Raster system. It contains no logic—only type definitions, serialization
-//! formats, and error types.
+//! formats, and internal runtime/protocol error types.
 //!
 //! This crate is `no_std` compatible when the `std` feature is disabled.
 
@@ -39,7 +39,7 @@ pub mod fingerprint;
 #[cfg(all(feature = "std", not(target_arch = "riscv32")))]
 pub mod registry;
 
-pub use error::{Error, Result};
+pub use error::{Error, Result, TileOutputEnvelope};
 
 // Re-export linkme for use by the macro-generated code (not available on RISC-V)
 #[cfg(all(feature = "std", not(target_arch = "riscv32")))]

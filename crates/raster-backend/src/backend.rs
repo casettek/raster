@@ -118,10 +118,23 @@ pub fn calculate_proof_cycles(actual_cycles: u64) -> u64 {
     }
 }
 
+/// Host-facing distinction between user-defined failures and runtime failures.
+#[derive(Debug)]
+pub enum ExecutionFailure<E> {
+    /// The user program returned its own error value.
+    User(E),
+    /// Raster failed to execute the program due to an internal runtime failure.
+    Runtime(raster_core::Error),
+}
+
 /// Result of executing a tile.
 #[derive(Debug, Clone)]
 pub struct TileExecutionResult {
-    /// The serialized output of the tile execution.
+    /// The serialized user-facing output of the tile execution.
+    ///
+    /// For tiles that return `Result<T, E>`, this buffer contains the serialized
+    /// user `Result` value. Internal runtime failures are reported through the
+    /// executor/backend `Result` instead.
     pub output: Vec<u8>,
 
     /// Actual cycle count for the execution (if available).

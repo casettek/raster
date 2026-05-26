@@ -13,8 +13,9 @@ use std::vec::Vec;
 
 /// The function signature for a tile's ABI entry point.
 ///
-/// This wrapper function handles bincode deserialization of inputs,
-/// calls the actual tile function, and serializes the output.
+/// This wrapper function handles deserialization of inputs, calls the actual
+/// tile function, and serializes the full user-facing output. The `Result`
+/// return here is reserved for Raster runtime/protocol failures only.
 pub type TileEntryFn = fn(&[u8]) -> Result<Vec<u8>>;
 
 /// A registration entry for a tile in the global registry.
@@ -26,7 +27,7 @@ pub type TileEntryFn = fn(&[u8]) -> Result<Vec<u8>>;
 pub struct TileRegistration {
     /// Static metadata describing the tile (id, name, description, resource hints).
     pub metadata: TileMetadataStatic,
-    /// The ABI wrapper function that handles serialization/deserialization.
+    /// The ABI wrapper function that handles runtime input/output processing.
     pub entry: TileEntryFn,
 }
 
@@ -37,6 +38,9 @@ impl TileRegistration {
     }
 
     /// Execute the tile with the given input bytes.
+    ///
+    /// Successful execution returns serialized user output bytes. Runtime
+    /// failures are returned through the wrapper's `Result`.
     pub fn execute(&self, input: &[u8]) -> Result<Vec<u8>> {
         (self.entry)(input)
     }

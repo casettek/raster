@@ -1,11 +1,11 @@
-use raster_backend::ExecutionMode;
+use raster_backend::{ExecutionFailure, ExecutionMode};
 use raster_compiler::builder::Builder;
 use raster_compiler::tile::TileDiscovery;
 use raster_compiler::Project;
 /// Run command: execute a tile with the specified backend.
 use raster_core::Result;
 
-use crate::utils::encode::{decode_output, encode_input};
+use crate::utils::encode::{decode_execution_output, encode_input};
 use crate::{
     commands::{create_backend, project_path},
     BackendType,
@@ -40,13 +40,12 @@ pub fn run_tile(
     let input_bytes = encode_input(input)?;
     let result = tile_runner.run(&input_bytes, mode)?;
 
-    let output_display = decode_output(
-        tile.function.output.as_deref().unwrap_or("()"),
-        &result.output,
-    );
-
     println!();
-    println!("  Output: {}", output_display);
+    match decode_execution_output(tile.function.output.as_deref().unwrap_or("()"), &result.output) {
+        Ok(output_display) => println!("  Output: {}", output_display),
+        Err(ExecutionFailure::User(user_error)) => println!("  User error: {}", user_error),
+        Err(ExecutionFailure::Runtime(err)) => return Err(err),
+    }
     println!("Execution complete!");
     if let Some(cycles) = result.cycles {
         println!("  Compute Cycles: {}", cycles);

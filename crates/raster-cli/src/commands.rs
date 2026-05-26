@@ -2,10 +2,10 @@
 pub mod run;
 pub mod tile;
 
-use crate::utils::encode::{decode_output, encode_input};
+use crate::utils::encode::{decode_execution_output, encode_input};
 
 use crate::BackendType;
-use raster_backend::{Backend, ExecutionMode};
+use raster_backend::{Backend, ExecutionFailure, ExecutionMode};
 use raster_backend_native::NativeBackend;
 use raster_backend_risc0::Risc0Backend;
 use raster_compiler::sequence::{FlattenedStep, SequenceDiscovery};
@@ -235,11 +235,16 @@ pub fn run_sequence(
                 tile_runner.validate_input(input)?;
                 let input_bytes = encode_input(input)?;
                 let result = tile_runner.run(&input_bytes, mode)?;
-                let output_display = decode_output(
+                match decode_execution_output(
                     tile.function.output.as_deref().unwrap_or("()"),
                     &result.output,
-                );
-                println!("  Output: {}", output_display);
+                ) {
+                    Ok(output_display) => println!("  Output: {}", output_display),
+                    Err(ExecutionFailure::User(user_error)) => {
+                        println!("  User error: {}", user_error)
+                    }
+                    Err(ExecutionFailure::Runtime(err)) => return Err(err),
+                }
             }
             FlattenedStep::Sequence(seq) => {
                 println!("  Entering sequence '{}'...", seq.function.name);

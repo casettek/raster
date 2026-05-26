@@ -151,7 +151,14 @@ pub enum BackendType {
     Risc0,
 }
 
-fn main() -> Result<()> {
+fn main() {
+    if let Err(err) = try_main() {
+        eprintln!("Runtime error: {}", err);
+        std::process::exit(1);
+    }
+}
+
+fn try_main() -> Result<()> {
     let Cli::Raster(cmd) = Cli::parse();
 
     match cmd {

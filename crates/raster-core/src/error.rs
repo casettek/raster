@@ -1,11 +1,13 @@
-//! Error types for the Raster toolchain.
+//! Internal runtime/protocol errors for the Raster toolchain.
 //!
 //! This module provides `no_std` compatible error types.
 
 use alloc::string::String;
+use alloc::vec::Vec;
 use core::fmt;
+use serde::{Deserialize, Serialize};
 
-/// Error type for Raster operations.
+/// Internal error type for Raster runtime/protocol operations.
 #[derive(Debug)]
 pub enum Error {
     /// Invalid tile ID.
@@ -62,5 +64,14 @@ impl From<serde_json::Error> for Error {
     }
 }
 
-/// Result type for Raster operations.
+/// Serialized ABI envelope for tile execution output.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum TileOutputEnvelope {
+    /// Serialized bytes for a successful user-facing output value.
+    Success(Vec<u8>),
+    /// Serialized bytes and display text for a user-defined error.
+    UserError { bytes: Vec<u8>, display: String },
+}
+
+/// Result type for Raster runtime/protocol operations.
 pub type Result<T> = core::result::Result<T, Error>;

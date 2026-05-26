@@ -13,7 +13,7 @@ use alloc::format;
 use alloc::string::String;
 use raster::prelude::*;
 
-use crate::input::PersonalData;
+use crate::input::{Error, PersonalData, Result};
 
 pub mod input;
 
@@ -59,12 +59,26 @@ pub fn greet_address_line(address_line: String) -> String {
     greet
 }
 
+#[tile(kind = iter)]
+pub fn maybe_echo_name(name: String) -> Result<String> {
+    if name.is_empty() {
+        Err(Error::MissingName)
+    } else {
+        Ok(name)
+    }
+}
+
 /// A tile that adds emphasis to a message.
 ///
 /// This tile takes a String and returns it with exclamation marks.
 #[tile(kind = iter)]
 pub fn exclaim(message: String) -> String {
     format!("{}!!!!", message)
+}
+
+#[tile(kind = iter)]
+pub fn concat_messages(message1: String, message2: String) -> String {
+    format!("{} {}", message1, message2)
 }
 
 #[tile]

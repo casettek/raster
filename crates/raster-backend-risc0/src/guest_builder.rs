@@ -107,7 +107,7 @@ impl GuestBuilder {
     /// The generated guest program:
     /// 1. Reads input bytes from the zkVM environment
     /// 2. Calls the tile's ABI wrapper function directly
-    /// 3. Commits the output to the journal
+    /// 3. Commits the serialized user output to the journal
     pub fn generate_guest_main(&self, tile_id: &str) -> String {
         // Convert tile_id to a valid Rust identifier (replace hyphens with underscores)
         let fn_name = tile_id.replace('-', "_");
@@ -143,8 +143,8 @@ impl GuestBuilder {
                 let mut input = alloc::vec![0u8; input_len as usize];
                 risc0_zkvm::guest::env::read_slice(&mut input);
 
-                // Call the tile's ABI wrapper (handles deserialization/serialization)
-                let output = {wrapper_name}(&input).expect("Tile execution failed");
+                // Call the tile's ABI wrapper (runtime failures trap here).
+                let output = {wrapper_name}(&input).expect("Tile runtime failure");
 
                 // Commit output to the journal
                 risc0_zkvm::guest::env::commit_slice(&output);

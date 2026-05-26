@@ -1,17 +1,30 @@
 use raster::prelude::*;
+use serde::{Deserialize, Serialize};
 
-use hello_tiles::input::{Address, PersonalData};
+use hello_tiles::input::{Address, PersonalData, Result};
+
 use hello_tiles::{
-    current_wish, exclaim, greet, greet_address_line, personal_greet, personal_greet_from_object,
-    personal_greet_with_seed, raster_wish,
+    concat_messages, current_wish, exclaim, greet, greet_address_line, maybe_echo_name,
+    personal_greet, personal_greet_from_object, personal_greet_with_seed, raster_wish,
 };
 
 #[sequence]
-fn personal_greet_seq(personal_data: PersonalData) -> String {
+fn personal_greet_seq(personal_data: PersonalData) -> Result<String> {
+    let name = call!(maybe_echo_name, select!(String, personal_data.clone().name))?;
+
     let addresses = select!(Vec<Address>, personal_data.addresses);
     let address = select!(Address, addresses[1]);
     let address_line = select!(String, address.lines[0]);
-    call!(greet_address_line, address_line)
+
+    let greet_address_line_result = call!(greet_address_line, address_line);
+
+    let result = call!(concat_messages, name, greet_address_line_result);
+
+    debug!("personal_greet_seq result: {}", result);
+
+    // call!(maybe_echo_name, String::from(""))?;
+
+    Ok(result)
 }
 
 #[sequence]
@@ -65,7 +78,8 @@ fn main() {
 
     call!(personal_greet_with_seed, name, seed);
 
-    call_seq!(personal_greet_seq, personal_data_binding);
+    let personal_greet_seq_result =
+        call_seq!(personal_greet_seq, personal_data_binding).expect("wrong personal data");
 
     call!(
         greet_address_line,

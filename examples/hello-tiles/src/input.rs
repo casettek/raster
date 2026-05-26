@@ -1,6 +1,15 @@
 extern crate alloc;
+
 use alloc::string::String;
+use core::result;
 use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Error {
+    MissingName,
+}
+
+pub type Result<T> = result::Result<T, Error>;
 
 #[derive(Debug, Clone, Serialize, Deserialize, raster::Selectable)]
 pub struct Address {

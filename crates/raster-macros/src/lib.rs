@@ -80,25 +80,15 @@ fn sequence_arg_ident(index: usize) -> syn::Ident {
 
 fn gen_arg_resolution(input: &ItemFn) -> proc_macro2::TokenStream {
     let params = extract_params(input);
-    let is_result = returns_result(input);
     let resolutions: Vec<_> = params
         .iter()
         .map(|param| {
             let name = &param.ident;
             let resolved_ty = &param.ty;
             let external_info_ident = external_info_ident(param);
-            let resolve = if is_result {
-                quote! {
-                    ::raster::into_resolved_arg::<#resolved_ty, _>(#name)?
-                }
-            } else {
-                quote! {
-                    ::raster::into_resolved_arg::<#resolved_ty, _>(#name)
-                        .unwrap_or_else(|e| panic!("Failed to resolve call argument '{}': {}", stringify!(#name), e))
-                }
-            };
             quote! {
-                let __raster_resolved_arg = #resolve;
+                let __raster_resolved_arg = ::raster::into_resolved_arg::<#resolved_ty, _>(#name)
+                    .unwrap_or_else(|e| panic!("Failed to resolve call argument '{}': {}", stringify!(#name), e));
                 let #external_info_ident = __raster_resolved_arg.as_external().cloned();
                 let #name: #resolved_ty = __raster_resolved_arg.into_inner();
             }
@@ -112,7 +102,6 @@ fn gen_arg_resolution(input: &ItemFn) -> proc_macro2::TokenStream {
 
 fn gen_sequence_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream {
     let params = extract_params(input);
-    let is_result = returns_result(input);
 
     let trace_defs: Vec<_> = params
         .iter()
@@ -120,18 +109,9 @@ fn gen_sequence_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream 
             let name = &param.ident;
             let trace_value_ident = format_ident!("__raster_input_value_{}", name);
             let external_info_ident = external_info_ident(param);
-            let trace = if is_result {
-                quote! {
-                    ::raster::sequence_arg_trace(&#name)?
-                }
-            } else {
-                quote! {
-                    ::raster::sequence_arg_trace(&#name)
-                        .unwrap_or_else(|e| panic!("Failed to trace sequence argument '{}': {}", stringify!(#name), e))
-                }
-            };
             quote! {
-                let (#trace_value_ident, #external_info_ident) = #trace;
+                let (#trace_value_ident, #external_info_ident) = ::raster::sequence_arg_trace(&#name)
+                    .unwrap_or_else(|e| panic!("Failed to trace sequence argument '{}': {}", stringify!(#name), e));
             }
         })
         .collect();
@@ -211,7 +191,7 @@ fn gen_sequence_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream 
     }
 }
 
-/// Check if the function returns a Result type.
+/// Check if the function returns a `Result`.
 fn returns_result(input: &ItemFn) -> bool {
     matches!(&input.sig.output, ReturnType::Type(_, ty) if {
         let ty_str = ty.to_token_stream().to_string();
@@ -254,13 +234,69 @@ fn gen_inputs_deserialization(input: &ItemFn) -> proc_macro2::TokenStream {
     }
 }
 
-/// Add output serialization to the code pipeline.
+fn gen_tile_trace_output_serialization(input: &ItemFn) -> proc_macro2::TokenStream {
+    if returns_result(input) {
+        quote! {
+            let __raster_output_envelope = match &result {
+                ::core::result::Result::Ok(value) => ::raster::core::TileOutputEnvelope::Success(
+                    ::raster::core::postcard::to_allocvec(value)
+                        .unwrap_or_else(|e| panic!("Failed to serialize tile output: {}", e)),
+                ),
+                ::core::result::Result::Err(err) => ::raster::core::TileOutputEnvelope::UserError {
+                    bytes: ::raster::core::postcard::to_allocvec(err)
+                        .unwrap_or_else(|e| panic!("Failed to serialize user error output: {}", e)),
+                    display: ::raster::alloc::format!("{:?}", err),
+                },
+            };
+            let __raster_output_bytes = ::raster::core::postcard::to_allocvec(&__raster_output_envelope)
+                .unwrap_or_else(|e| panic!("Failed to serialize tile output envelope: {}", e));
+        }
+    } else {
+        quote! {
+            let __raster_output_envelope = ::raster::core::TileOutputEnvelope::Success(
+                ::raster::core::postcard::to_allocvec(&result)
+                    .unwrap_or_else(|e| panic!("Failed to serialize tile output: {}", e)),
+            );
+            let __raster_output_bytes = ::raster::core::postcard::to_allocvec(&__raster_output_envelope)
+                .unwrap_or_else(|e| panic!("Failed to serialize tile output envelope: {}", e));
+        }
+    }
+}
+
+/// Add ABI output serialization to the code pipeline.
 ///
-/// Wraps the provided code with serialization of `result` to `output`.
-fn gen_output_serialization(_input: &ItemFn) -> proc_macro2::TokenStream {
-    quote! {
-        let output = ::raster::core::postcard::to_allocvec(&result)
-            .map_err(|e| ::raster::core::Error::Serialization(::raster::alloc::format!("Failed to serialize output: {}", e)))?;
+/// Wraps the provided code with serialization of the user-facing output into a
+/// runtime-facing tile envelope.
+fn gen_output_serialization(input: &ItemFn) -> proc_macro2::TokenStream {
+    if returns_result(input) {
+        quote! {
+            let __raster_output_envelope = match result {
+                ::core::result::Result::Ok(value) => {
+                    let __raster_output_bytes = ::raster::core::postcard::to_allocvec(&value)
+                        .map_err(|e| ::raster::core::Error::Serialization(::raster::alloc::format!("Failed to serialize output: {}", e)))?;
+                    ::raster::core::TileOutputEnvelope::Success(__raster_output_bytes)
+                }
+                ::core::result::Result::Err(err) => {
+                    let __raster_error_bytes = ::raster::core::postcard::to_allocvec(&err)
+                        .map_err(|e| ::raster::core::Error::Serialization(::raster::alloc::format!("Failed to serialize user error output: {}", e)))?;
+                    ::raster::core::TileOutputEnvelope::UserError {
+                        bytes: __raster_error_bytes,
+                        display: ::raster::alloc::format!("{:?}", &err),
+                    }
+                }
+            };
+            let output = ::raster::core::postcard::to_allocvec(&__raster_output_envelope)
+                .map_err(|e| ::raster::core::Error::Serialization(::raster::alloc::format!("Failed to serialize tile output envelope: {}", e)))?;
+        }
+    } else {
+        quote! {
+            let __raster_output_envelope = ::raster::core::TileOutputEnvelope::Success(
+                ::raster::core::postcard::to_allocvec(&result)
+                    .map_err(|e| ::raster::core::Error::Serialization(::raster::alloc::format!("Failed to serialize output: {}", e)))?,
+            );
+            let output = ::raster::core::postcard::to_allocvec(&__raster_output_envelope)
+                .map_err(|e| ::raster::core::Error::Serialization(::raster::alloc::format!("Failed to serialize tile output envelope: {}", e)))?;
+        }
     }
 }
 
@@ -364,20 +400,11 @@ fn gen_function_call(target_fn: &syn::Ident, input: &ItemFn) -> proc_macro2::Tok
         .into_iter()
         .map(|param| param.ident)
         .collect();
-    let is_result = returns_result(input);
 
     if param_names.is_empty() {
-        if is_result {
-            quote! { let result = #target_fn()?; }
-        } else {
-            quote! { let result = #target_fn(); }
-        }
+        quote! { let result = #target_fn(); }
     } else {
-        if is_result {
-            quote! { let result = #target_fn(#(#param_names),*)?; }
-        } else {
-            quote! { let result = #target_fn(#(#param_names),*); }
-        }
+        quote! { let result = #target_fn(#(#param_names),*); }
     }
 }
 
@@ -501,6 +528,7 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
     let inputs_deserialization = gen_inputs_deserialization(&input_fn);
     let function_call = gen_function_call(&implementation_name, &input_fn);
     let output_serialization = gen_output_serialization(&input_fn);
+    let trace_output_serialization = gen_tile_trace_output_serialization(&input_fn);
     let arg_resolution = gen_arg_resolution(&input_fn);
 
     let mut exposed_sig = input_fn.sig.clone();
@@ -559,8 +587,7 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
                 #function_call
 
                 // Serialize output and emit TraceEvent::TileExec
-                let __raster_output_bytes = ::raster::core::postcard::to_allocvec(&result)
-                    .unwrap_or_default();
+                #trace_output_serialization
 
                 let __raster_output = ::core::option::Option::Some(
                     ::raster::core::trace::FnOutput {
@@ -596,7 +623,8 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
         // Original function with tracing injected
         #original_function
 
-        // Generate the ABI wrapper function (available on all platforms, no_std compatible)
+        // Generate the ABI wrapper function (available on all platforms, no_std compatible).
+        // Its Result channel is reserved for Raster runtime/protocol failures.
         pub fn #function_wrapper_name(input: &[u8]) -> ::raster::core::Result<::raster::alloc::vec::Vec<u8>> {
             #inputs_deserialization
 

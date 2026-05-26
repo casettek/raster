@@ -30,7 +30,16 @@ pub use input::{encode_raster_value, write_raster_files};
 
 pub use raster_macros::{select, sequence, tile, Selectable};
 
-// Runtime is only available with std feature
+/// Internal runtime/protocol surface.
+///
+/// User-authored tile and sequence code should define its own `Error` / `Result`
+/// types. Raster-internal execution failures remain available here so hosts and
+/// executor layers can distinguish runtime failures from user-defined ones.
+pub mod runtime {
+    pub use crate::core::error::{Error, Result};
+}
+
+// Runtime helpers are only available with std feature.
 #[cfg(feature = "std")]
 pub use raster_runtime::{finish, init, init_with, publish_trace_event};
 
@@ -128,11 +137,13 @@ macro_rules! debug {
 }
 
 /// Prelude module for convenient imports.
+///
+/// User-authored code is expected to define its own `Error` / `Result` types.
+/// Raster runtime failures are available separately under `raster::runtime`.
 pub mod prelude {
     pub use crate::core::{
         input::ExternalRef,
         tile::{TileId, TileIdStatic, TileMetadata, TileMetadataStatic},
-        Result,
     };
 
     // These modules require std

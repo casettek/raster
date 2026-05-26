@@ -1,4 +1,5 @@
-use raster_core::{Error, Result};
+use raster_backend::ExecutionFailure;
+use raster_core::{Error, Result, TileOutputEnvelope};
 
 /// Validate that the provided input matches the tile's expected inputs.
 pub fn encode_input(input: Option<&str>) -> Result<Vec<u8>> {
@@ -70,7 +71,9 @@ pub fn decode_output(output_type: &str, output: &[u8]) -> String {
             .unwrap_or_else(|_| format!("<{} bytes>", output.len())),
 
         // Unit type
-        "()" => "()".to_string(),
+        "()" => postcard::from_bytes::<()>(output)
+            .map(|_| "()".to_string())
+            .unwrap_or_else(|_| "()".to_string()),
 
         // Vec types - try to decode as JSON value for display
         t if t.starts_with("Vec<") || t.starts_with("Vec <") => {
@@ -87,27 +90,82 @@ pub fn decode_output(output_type: &str, output: &[u8]) -> String {
             }
         }
 
-        // Result types - unwrap if possible
-        t if t.starts_with("Result<") || t.starts_with("Result <") => {
-            // Try common inner types
-            if let Ok(s) = postcard::from_bytes::<std::result::Result<String, String>>(output) {
-                match s {
-                    Ok(v) => format!("Ok(\"{}\")", v),
-                    Err(e) => format!("Err(\"{}\")", e),
-                }
-            } else if let Ok(n) = postcard::from_bytes::<std::result::Result<u64, String>>(output) {
-                match n {
-                    Ok(v) => format!("Ok({})", v),
-                    Err(e) => format!("Err(\"{}\")", e),
-                }
-            } else {
-                format!("<Result: {} bytes>", output.len())
-            }
-        }
-
         // Unknown types - try serde_json::Value as fallback
         _ => postcard::from_bytes::<serde_json::Value>(output)
             .map(|v| v.to_string())
             .unwrap_or_else(|_| format!("<{}: {} bytes>", output_type, output.len())),
+    }
+}
+
+fn normalize_type_name(output_type: &str) -> String {
+    output_type.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+fn extract_result_ok_type(output_type: &str) -> Option<String> {
+    let normalized = normalize_type_name(output_type);
+    let marker = "Result<";
+    let result_start = normalized.find(marker)?;
+    let inner = normalized.get(result_start + marker.len()..normalized.len() - 1)?;
+
+    let mut depth = 0usize;
+    for (idx, ch) in inner.char_indices() {
+        match ch {
+            '<' => depth += 1,
+            '>' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => return Some(inner[..idx].to_string()),
+            _ => {}
+        }
+    }
+
+    None
+}
+
+pub fn decode_execution_output(
+    output_type: &str,
+    output: &[u8],
+) -> std::result::Result<String, ExecutionFailure<String>> {
+    let envelope = postcard::from_bytes::<TileOutputEnvelope>(output).map_err(|e| {
+        ExecutionFailure::Runtime(Error::Serialization(format!(
+            "Failed to decode tile output envelope '{}': {}",
+            output_type, e
+        )))
+    })?;
+
+    match envelope {
+        TileOutputEnvelope::Success(bytes) => {
+            let success_type =
+                extract_result_ok_type(output_type).unwrap_or_else(|| output_type.to_string());
+            Ok(decode_output(&success_type, &bytes))
+        }
+        TileOutputEnvelope::UserError { display, .. } => Err(ExecutionFailure::User(display)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_execution_output_reports_user_error() {
+        let output = postcard::to_allocvec(&TileOutputEnvelope::UserError {
+            bytes: postcard::to_allocvec(&"denied".to_string()).unwrap(),
+            display: "denied".to_string(),
+        })
+        .unwrap();
+
+        match decode_execution_output("Result<(), Error>", &output) {
+            Err(ExecutionFailure::User(err)) => assert_eq!(err, "denied"),
+            other => panic!("expected user error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn decode_execution_output_reports_success_value() {
+        let output =
+            postcard::to_allocvec(&TileOutputEnvelope::Success(postcard::to_allocvec(&42u64).unwrap()))
+                .unwrap();
+
+        let decoded = decode_execution_output("Result<u64, Error>", &output).unwrap();
+        assert_eq!(decoded, "42");
     }
 }

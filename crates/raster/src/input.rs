@@ -10,13 +10,13 @@ pub use raster_core::input::{
 };
 use raster_core::trace::{ExternalData as TraceExternalData, FnInputValue};
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct TypedExternalBinding<Root> {
     name: String,
     marker: PhantomData<fn() -> Root>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct TypedSelectorPath<Root, Selected> {
     path: SelectorPath,
     marker: PhantomData<fn() -> (Root, Selected)>,
@@ -62,14 +62,14 @@ pub fn typed_selector_path<Root, Selected>(
     TypedSelectorPath::new(path)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct TypedSelectedExternalBinding<Root, Selected> {
     source: TypedExternalBinding<Root>,
     selector: TypedSelectorPath<Root, Selected>,
 }
 
 #[doc(hidden)]
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct DeferredExternal<Root, Current> {
     name: String,
     selector: SelectorPath,
@@ -77,10 +77,60 @@ pub struct DeferredExternal<Root, Current> {
     marker: PhantomData<fn() -> (Root, Current)>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum SequenceArg<Root, Current> {
     Inline(Current),
     External(DeferredExternal<Root, Current>),
+}
+
+impl<Root> Clone for TypedExternalBinding<Root> {
+    fn clone(&self) -> Self {
+        Self {
+            name: self.name.clone(),
+            marker: PhantomData,
+        }
+    }
+}
+
+impl<Root, Selected> Clone for TypedSelectorPath<Root, Selected> {
+    fn clone(&self) -> Self {
+        Self {
+            path: self.path.clone(),
+            marker: PhantomData,
+        }
+    }
+}
+
+impl<Root, Selected> Clone for TypedSelectedExternalBinding<Root, Selected> {
+    fn clone(&self) -> Self {
+        Self {
+            source: self.source.clone(),
+            selector: self.selector.clone(),
+        }
+    }
+}
+
+impl<Root, Current> Clone for DeferredExternal<Root, Current> {
+    fn clone(&self) -> Self {
+        Self {
+            name: self.name.clone(),
+            selector: self.selector.clone(),
+            resolve: self.resolve,
+            marker: PhantomData,
+        }
+    }
+}
+
+impl<Root, Current> Clone for SequenceArg<Root, Current>
+where
+    Current: Clone,
+{
+    fn clone(&self) -> Self {
+        match self {
+            Self::Inline(value) => Self::Inline(value.clone()),
+            Self::External(binding) => Self::External(binding.clone()),
+        }
+    }
 }
 
 pub trait IntoSequenceArg<Current> {
