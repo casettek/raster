@@ -161,6 +161,18 @@ fn gen_sequence_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream 
         })
         .collect();
 
+    let input_bytes = if params.is_empty() {
+        quote! {
+            let __raster_input_bytes: ::raster::alloc::vec::Vec<u8> = ::raster::alloc::vec::Vec::new();
+        }
+    } else {
+        quote! {
+            let __raster_input_bytes = ::raster::core::postcard::to_allocvec(
+                &::raster::alloc::vec![#(#trace_values),*]
+            ).unwrap_or_default();
+        }
+    };
+
     let external_binding_entries: Vec<_> = params
         .iter()
         .map(|param| {
@@ -184,9 +196,7 @@ fn gen_sequence_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream 
             #(#input_arg_defs),*
         ];
 
-        let __raster_input_bytes = ::raster::core::postcard::to_allocvec(
-            &::raster::alloc::vec![#(#trace_values),*]
-        ).unwrap_or_default();
+        #input_bytes
 
         let mut __raster_external = ::raster::alloc::collections::BTreeMap::new();
         #(#external_binding_entries)*

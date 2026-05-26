@@ -7,13 +7,11 @@ use hello_tiles::{
 };
 
 #[sequence]
-fn personal_greet_seq(personal_data: PersonalData) -> Result<String> {
+fn personal_greet_seq(personal_data: PersonalData) -> String {
     let addresses = select!(Vec<Address>, personal_data.addresses);
     let address = select!(Address, addresses[1]);
     let address_line = select!(String, address.lines[0]);
-    let greet_with_address_lint = call!(greet_address_line, address_line);
-
-    Ok(greet_with_address_lint)
+    call!(greet_address_line, address_line)
 }
 
 #[sequence]

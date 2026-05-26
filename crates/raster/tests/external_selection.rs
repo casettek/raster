@@ -38,6 +38,11 @@ fn forward_personal_binding(personal: PersonalData) -> String {
     call_seq!(select_name_from_personal, personal)
 }
 
+#[sequence]
+fn zero_arg_sequence() {
+    let _ = call!(echo_name, "Raster".to_string());
+}
+
 #[test]
 fn select_accepts_identity_typed_external() {
     takes_typed_binding(select!(
@@ -80,4 +85,9 @@ fn tile_wrapper_accepts_inline_arguments() {
 #[test]
 fn sequence_wrapper_accepts_inline_arguments() {
     assert_eq!(echo_sequence("Raster".to_string()), "Raster");
+}
+
+#[test]
+fn zero_arg_sequence_wrapper_accepts_no_arguments() {
+    zero_arg_sequence();
 }
