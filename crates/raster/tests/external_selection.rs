@@ -1,13 +1,40 @@
+use raster::core::trace::TraceEvent;
 use raster::prelude::*;
-use raster_core::{postcard, TileOutputEnvelope};
+use raster_core::postcard;
+use raster_runtime::{init_with, Publisher};
 use serde::{Deserialize, Serialize};
+use std::sync::{Mutex, Once};
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-enum Error {
-    MissingName,
+fn missing_name_error() -> String {
+    String::from("MissingName")
 }
 
-type Result<T> = std::result::Result<T, Error>;
+static TRACE_CAPTURE_LOCK: Mutex<()> = Mutex::new(());
+static TRACE_INIT: Once = Once::new();
+static TRACE_EVENTS: Mutex<Vec<TraceEvent>> = Mutex::new(Vec::new());
+
+struct TestPublisher;
+
+impl Publisher for TestPublisher {
+    fn publish(&self, event: TraceEvent) {
+        TRACE_EVENTS.lock().unwrap().push(event);
+    }
+
+    fn finish(&self) {}
+}
+
+fn capture_trace_events<F, T>(f: F) -> (T, Vec<TraceEvent>)
+where
+    F: FnOnce() -> T,
+{
+    let _guard = TRACE_CAPTURE_LOCK.lock().unwrap();
+    TRACE_INIT.call_once(|| init_with(TestPublisher));
+    TRACE_EVENTS.lock().unwrap().clear();
+
+    let result = f();
+    let events = TRACE_EVENTS.lock().unwrap().clone();
+    (result, events)
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize, Selectable)]
 struct Address {
@@ -33,7 +60,7 @@ fn echo_name(name: String) -> String {
 #[tile(kind = iter)]
 fn maybe_echo_name(name: String) -> Result<String> {
     if name.is_empty() {
-        Err(Error::MissingName)
+        Err(missing_name_error())
     } else {
         Ok(name)
     }
@@ -46,7 +73,8 @@ fn echo_sequence(name: String) -> String {
 
 #[sequence]
 fn maybe_echo_sequence(name: String) -> Result<String> {
-    call!(maybe_echo_name, name)
+    let echoed = call!(maybe_echo_name, name)?;
+    Ok(echoed)
 }
 
 #[sequence]
@@ -63,6 +91,20 @@ fn forward_personal_binding(personal: PersonalData) -> String {
 #[sequence]
 fn zero_arg_sequence() {
     let _ = call!(echo_name, "Raster".to_string());
+}
+
+#[sequence]
+fn traced_error_inner(name: String) -> Result<String> {
+    let echoed = call!(echo_name, name);
+    let _ = call!(maybe_echo_name, String::new())?;
+    Ok(echoed)
+}
+
+#[sequence]
+fn traced_error_outer(name: String) -> Result<String> {
+    let echoed = call!(echo_name, name);
+    let inner = call_seq!(traced_error_inner, echoed)?;
+    Ok(inner)
 }
 
 #[test]
@@ -122,7 +164,7 @@ fn tile_wrapper_preserves_user_result() {
         maybe_echo_name("Raster".to_string()),
         Ok("Raster".to_string())
     );
-    assert_eq!(maybe_echo_name(String::new()), Err(Error::MissingName));
+    assert_eq!(maybe_echo_name(String::new()), Err(missing_name_error()));
 }
 
 #[test]
@@ -131,21 +173,93 @@ fn sequence_wrapper_preserves_user_result() {
         maybe_echo_sequence("Raster".to_string()),
         Ok("Raster".to_string())
     );
-    assert_eq!(maybe_echo_sequence(String::new()), Err(Error::MissingName));
+    assert_eq!(
+        maybe_echo_sequence(String::new()),
+        Err(missing_name_error())
+    );
 }
 
 #[test]
 fn tile_abi_wrapper_serializes_user_error_result() {
     let input = postcard::to_allocvec(&String::new()).unwrap();
     let output = __raster_tile_entry_maybe_echo_name(&input).unwrap();
-    let decoded: TileOutputEnvelope = postcard::from_bytes(&output).unwrap();
-    match decoded {
-        TileOutputEnvelope::UserError { bytes, display } => {
-            let decoded_error: Error = postcard::from_bytes(&bytes).unwrap();
-            assert_eq!(decoded_error, Error::MissingName);
-            assert!(display.contains("MissingName"));
+    let decoded: raster::exec::Result<String> = postcard::from_bytes(&output).unwrap();
+    assert_eq!(decoded, Err(missing_name_error()));
+}
+
+#[test]
+fn nested_sequence_trace_records_terminal_err_outputs() {
+    let (result, events) = capture_trace_events(|| traced_error_outer("Raster".to_string()));
+    let events: Vec<_> = events
+        .into_iter()
+        .filter(|event| match event {
+            TraceEvent::SequenceStart(record) | TraceEvent::SequenceEnd(record) => {
+                matches!(
+                    record.fn_name.as_str(),
+                    "traced_error_outer" | "traced_error_inner"
+                )
+            }
+            TraceEvent::TileExec(record) => {
+                matches!(record.fn_name.as_str(), "echo_name" | "maybe_echo_name")
+            }
+        })
+        .collect();
+
+    fn matches_expected_shape(event: &TraceEvent, index: usize) -> bool {
+        match (index, event) {
+            (0, TraceEvent::SequenceStart(record)) => record.fn_name == "traced_error_outer",
+            (1, TraceEvent::TileExec(record)) => record.fn_name == "echo_name",
+            (2, TraceEvent::SequenceStart(record)) => record.fn_name == "traced_error_inner",
+            (3, TraceEvent::TileExec(record)) => record.fn_name == "echo_name",
+            (4, TraceEvent::TileExec(record)) => record.fn_name == "maybe_echo_name",
+            (5, TraceEvent::SequenceEnd(record)) => record.fn_name == "traced_error_inner",
+            (6, TraceEvent::SequenceEnd(record)) => record.fn_name == "traced_error_outer",
+            _ => false,
         }
-        other => panic!("expected user error envelope, got {:?}", other),
+    }
+
+    let start_idx = events
+        .windows(7)
+        .position(|window| {
+            window
+                .iter()
+                .enumerate()
+                .all(|(idx, event)| matches_expected_shape(event, idx))
+        })
+        .expect("expected traced error path in captured events");
+    let events = events[start_idx..start_idx + 7].to_vec();
+
+    assert_eq!(result, Err(missing_name_error()));
+    assert_eq!(events.len(), 7);
+
+    match &events[4] {
+        TraceEvent::TileExec(record) => {
+            assert_eq!(record.fn_name, "maybe_echo_name");
+            let output = record.output.as_ref().unwrap();
+            let decoded: raster::exec::Result<String> = postcard::from_bytes(&output.data).unwrap();
+            assert_eq!(decoded, Err(missing_name_error()));
+        }
+        other => panic!("expected failing tile event, got {:?}", other),
+    }
+
+    match &events[5] {
+        TraceEvent::SequenceEnd(record) => {
+            assert_eq!(record.fn_name, "traced_error_inner");
+            let output = record.output.as_ref().unwrap();
+            let decoded: raster::exec::Result<String> = postcard::from_bytes(&output.data).unwrap();
+            assert_eq!(decoded, Err(missing_name_error()));
+        }
+        other => panic!("expected inner sequence end, got {:?}", other),
+    }
+
+    match &events[6] {
+        TraceEvent::SequenceEnd(record) => {
+            assert_eq!(record.fn_name, "traced_error_outer");
+            let output = record.output.as_ref().unwrap();
+            let decoded: raster::exec::Result<String> = postcard::from_bytes(&output.data).unwrap();
+            assert_eq!(decoded, Err(missing_name_error()));
+        }
+        other => panic!("expected outer sequence end, got {:?}", other),
     }
 }
 

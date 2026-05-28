@@ -13,7 +13,7 @@ use alloc::format;
 use alloc::string::String;
 use raster::prelude::*;
 
-use crate::input::{Error, PersonalData, Result};
+use crate::input::PersonalData;
 
 pub mod input;
 
@@ -62,7 +62,7 @@ pub fn greet_address_line(address_line: String) -> String {
 #[tile(kind = iter)]
 pub fn maybe_echo_name(name: String) -> Result<String> {
     if name.is_empty() {
-        Err(Error::MissingName)
+        Err(String::from("MissingName"))
     } else {
         Ok(name)
     }

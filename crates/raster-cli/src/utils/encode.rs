@@ -1,5 +1,5 @@
 use raster_backend::ExecutionFailure;
-use raster_core::{Error, Result, TileOutputEnvelope};
+use raster_core::{Error, Result};
 
 /// Validate that the provided input matches the tile's expected inputs.
 pub fn encode_input(input: Option<&str>) -> Result<Vec<u8>> {
@@ -117,27 +117,52 @@ fn extract_result_ok_type(output_type: &str) -> Option<String> {
         }
     }
 
-    None
+    Some(inner.to_string())
+}
+
+fn decode_fallible_execution_output(
+    output_type: &str,
+    output: &[u8],
+) -> std::result::Result<String, ExecutionFailure<String>> {
+    let success_type = extract_result_ok_type(output_type).ok_or_else(|| {
+        ExecutionFailure::Runtime(Error::Serialization(format!(
+            "Failed to determine Result success type for '{}'",
+            output_type
+        )))
+    })?;
+    let (variant_idx, payload) = postcard::take_from_bytes::<u32>(output).map_err(|e| {
+        ExecutionFailure::Runtime(Error::Serialization(format!(
+            "Failed to decode Result output '{}': {}",
+            output_type, e
+        )))
+    })?;
+
+    match variant_idx {
+        0 => Ok(decode_output(&success_type, payload)),
+        1 => {
+            let display = postcard::from_bytes::<String>(payload).map_err(|e| {
+                ExecutionFailure::Runtime(Error::Serialization(format!(
+                    "Failed to decode Result error output '{}': {}",
+                    output_type, e
+                )))
+            })?;
+            Err(ExecutionFailure::User(display))
+        }
+        other => Err(ExecutionFailure::Runtime(Error::Serialization(format!(
+            "Unexpected Result variant index '{}' for '{}'",
+            other, output_type
+        )))),
+    }
 }
 
 pub fn decode_execution_output(
     output_type: &str,
     output: &[u8],
 ) -> std::result::Result<String, ExecutionFailure<String>> {
-    let envelope = postcard::from_bytes::<TileOutputEnvelope>(output).map_err(|e| {
-        ExecutionFailure::Runtime(Error::Serialization(format!(
-            "Failed to decode tile output envelope '{}': {}",
-            output_type, e
-        )))
-    })?;
-
-    match envelope {
-        TileOutputEnvelope::Success(bytes) => {
-            let success_type =
-                extract_result_ok_type(output_type).unwrap_or_else(|| output_type.to_string());
-            Ok(decode_output(&success_type, &bytes))
-        }
-        TileOutputEnvelope::UserError { display, .. } => Err(ExecutionFailure::User(display)),
+    if extract_result_ok_type(output_type).is_some() {
+        decode_fallible_execution_output(output_type, output)
+    } else {
+        Ok(decode_output(output_type, output))
     }
 }
 
@@ -147,13 +172,9 @@ mod tests {
 
     #[test]
     fn decode_execution_output_reports_user_error() {
-        let output = postcard::to_allocvec(&TileOutputEnvelope::UserError {
-            bytes: postcard::to_allocvec(&"denied".to_string()).unwrap(),
-            display: "denied".to_string(),
-        })
-        .unwrap();
+        let output = postcard::to_allocvec(&Err::<(), String>("denied".to_string())).unwrap();
 
-        match decode_execution_output("Result<(), Error>", &output) {
+        match decode_execution_output("Result<(), String>", &output) {
             Err(ExecutionFailure::User(err)) => assert_eq!(err, "denied"),
             other => panic!("expected user error, got {:?}", other),
         }
@@ -161,11 +182,9 @@ mod tests {
 
     #[test]
     fn decode_execution_output_reports_success_value() {
-        let output =
-            postcard::to_allocvec(&TileOutputEnvelope::Success(postcard::to_allocvec(&42u64).unwrap()))
-                .unwrap();
+        let output = postcard::to_allocvec(&Ok::<u64, String>(42u64)).unwrap();
 
-        let decoded = decode_execution_output("Result<u64, Error>", &output).unwrap();
+        let decoded = decode_execution_output("Result<u64, String>", &output).unwrap();
         assert_eq!(decoded, "42");
     }
 }

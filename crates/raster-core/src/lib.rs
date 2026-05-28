@@ -35,7 +35,7 @@ pub mod transition;
 #[cfg(feature = "std")]
 pub mod fingerprint;
 
-pub use error::{Error, Result, TileOutputEnvelope};
+pub use error::{Error, Result};
 
 // Re-export postcard for tile ABI serialization (no_std compatible)
 pub use postcard;

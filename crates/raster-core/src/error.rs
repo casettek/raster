@@ -3,9 +3,7 @@
 //! This module provides `no_std` compatible error types.
 
 use alloc::string::String;
-use alloc::vec::Vec;
 use core::fmt;
-use serde::{Deserialize, Serialize};
 
 /// Internal error type for Raster runtime/protocol operations.
 #[derive(Debug)]
@@ -62,15 +60,6 @@ impl From<serde_json::Error> for Error {
     fn from(e: serde_json::Error) -> Self {
         Error::Serialization(alloc::format!("{}", e))
     }
-}
-
-/// Serialized ABI envelope for tile execution output.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum TileOutputEnvelope {
-    /// Serialized bytes for a successful user-facing output value.
-    Success(Vec<u8>),
-    /// Serialized bytes and display text for a user-defined error.
-    UserError { bytes: Vec<u8>, display: String },
 }
 
 /// Result type for Raster runtime/protocol operations.

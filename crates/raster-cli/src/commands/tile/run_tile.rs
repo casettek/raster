@@ -41,7 +41,10 @@ pub fn run_tile(
     let result = tile_runner.run(&input_bytes, mode)?;
 
     println!();
-    match decode_execution_output(tile.function.output.as_deref().unwrap_or("()"), &result.output) {
+    match decode_execution_output(
+        tile.function.output.as_deref().unwrap_or("()"),
+        &result.output,
+    ) {
         Ok(output_display) => println!("  Output: {}", output_display),
         Err(ExecutionFailure::User(user_error)) => println!("  User error: {}", user_error),
         Err(ExecutionFailure::Runtime(err)) => return Err(err),

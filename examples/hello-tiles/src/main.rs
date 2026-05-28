@@ -1,7 +1,7 @@
 use raster::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use hello_tiles::input::{Address, PersonalData, Result};
+use hello_tiles::input::{Address, PersonalData};
 
 use hello_tiles::{
     concat_messages, current_wish, exclaim, greet, greet_address_line, maybe_echo_name,

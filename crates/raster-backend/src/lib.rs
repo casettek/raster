@@ -7,6 +7,5 @@ pub mod backend;
 
 pub use backend::{
     calculate_proof_cycles, ArtifactStore, Backend, CompilationArtifact, ExecutionFailure,
-    ExecutionMode,
-    ResourceEstimate, TileExecutionResult, MIN_PROOF_SEGMENT_CYCLES,
+    ExecutionMode, ResourceEstimate, TileExecutionResult, MIN_PROOF_SEGMENT_CYCLES,
 };

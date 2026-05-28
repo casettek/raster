@@ -308,6 +308,43 @@ mod tests {
     }
 
     #[test]
+    fn build_transition_input_preserves_error_output_bytes_for_tile_steps() {
+        let tile_step = make_tile_step(1, vec![0]);
+        let error_output =
+            raster_core::postcard::to_allocvec(&Err::<u64, String>("denied".to_string())).unwrap();
+        let recorded_step_io = HashMap::from([(
+            tile_step.clone(),
+            (
+                Some(vec![9]),
+                Some(error_output.clone()),
+                ExternalInput::new(),
+            ),
+        )]);
+        let replayed_results = HashMap::from([(
+            tile_step.clone(),
+            ReplayResult {
+                fn_name: "shared_tile".to_string(),
+                receipt: vec![],
+                image_id: vec![5; 32],
+                input: vec![9],
+                output: error_output.clone(),
+            },
+        )]);
+
+        let input = build_transition_input(
+            &tile_step,
+            &HashMap::new(),
+            &recorded_step_io,
+            &replayed_results,
+            &make_authorization_journal(),
+        );
+
+        assert_eq!(input.replay_image_id, Some(vec![5; 32]));
+        assert_eq!(input.input_witness, Some(vec![9]));
+        assert_eq!(input.output_witness, Some(error_output));
+    }
+
+    #[test]
     fn build_transition_input_preserves_recorded_io_for_sequence_steps() {
         let sequence_start = StepRecord::SequenceStart(SequenceStartRecord {
             exec_index: 1,

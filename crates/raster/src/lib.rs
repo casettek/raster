@@ -30,11 +30,16 @@ pub use input::{encode_raster_value, write_raster_files};
 
 pub use raster_macros::{select, sequence, tile, Selectable};
 
+/// User-facing execution result contract for fallible tiles and sequences.
+pub mod exec {
+    pub type Result<T> = core::result::Result<T, crate::alloc::string::String>;
+}
+
 /// Internal runtime/protocol surface.
 ///
-/// User-authored tile and sequence code should define its own `Error` / `Result`
-/// types. Raster-internal execution failures remain available here so hosts and
-/// executor layers can distinguish runtime failures from user-defined ones.
+/// Raster-internal execution failures remain available here so hosts and
+/// executor layers can distinguish infrastructure/runtime failures from
+/// user-defined terminal outcomes.
 pub mod runtime {
     pub use crate::core::error::{Error, Result};
 }
@@ -67,6 +72,7 @@ pub mod __private {
 /// ```ignore
 /// let greeting = call!(greet, name);
 /// let result = call!(exclaim, greeting);
+/// let checked = call!(maybe_echo_name, result)?;
 /// ```
 ///
 /// On `std` + non-riscv32 targets, the underlying tile function's `#[tile]` wrapper
@@ -104,6 +110,7 @@ macro_rules! external {
 /// # Usage
 /// ```ignore
 /// let result = call_seq!(wish_sequence, greeting);
+/// let checked = call_seq!(verify_sequence, result)?;
 /// ```
 ///
 /// Semantically distinct from `call!`: invoking a sequence means the callee will
@@ -138,8 +145,9 @@ macro_rules! debug {
 
 /// Prelude module for convenient imports.
 ///
-/// User-authored code is expected to define its own `Error` / `Result` types.
-/// Raster runtime failures are available separately under `raster::runtime`.
+/// Importing `raster::prelude::*` makes bare `Result<T>` refer to Raster's
+/// terminal execution result type. Raster runtime failures remain available
+/// separately under `raster::runtime`.
 pub mod prelude {
     pub use crate::core::{
         input::ExternalRef,
@@ -154,6 +162,7 @@ pub mod prelude {
         trace::{FnCallRecord, FnInput, FnInputArg, FnOutput, TileExecRecord},
     };
 
+    pub use crate::exec::Result;
     pub use crate::{
         call, call_seq, debug, external, into_sequence_arg, select, sequence, tile, ExternalArg,
         ExternalSelection, IntoResolvedArg, IntoSequenceArg, ListProofDirection, ListProofSibling,
