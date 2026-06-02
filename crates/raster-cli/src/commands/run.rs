@@ -16,6 +16,7 @@ use raster_backend_risc0::Risc0Backend;
 use raster_compiler::{CfsBuilder, Project};
 
 use raster_core::cfs::{CfsCoordinates, CfsCursor, ControlFlowSchema};
+use raster_core::transition::InternalStoreWriteWitness;
 use raster_core::trace::{ExternalInput, StepRecord, Trace, TraceEvent, TraceWindow};
 use raster_core::{Error, Result};
 
@@ -26,7 +27,7 @@ use raster_prover::trace::{
     FraudEvidence, SerializableFrontier, TraceCommitment, TraceVerifier, VerificationResult,
 };
 use raster_prover::transition::step_transitions;
-use raster_runtime::{TraceRecorder, TRACE_EVENT_PREFIX};
+use raster_runtime::{internal_write_witness, TraceRecorder, TRACE_EVENT_PREFIX};
 
 use crate::utils::authorization::{build_manifested_inputs, collect_external_input_commitments};
 use crate::BackendType;
@@ -404,22 +405,38 @@ pub fn prove(
     let mut replayed_results: HashMap<StepRecord, ReplayResult> = HashMap::new();
     let mut recorded_step_io: HashMap<
         StepRecord,
-        (Option<Vec<u8>>, Option<Vec<u8>>, ExternalInput),
+        (
+            Option<Vec<u8>>,
+            Option<Vec<u8>>,
+            ExternalInput,
+            Option<InternalStoreWriteWitness>,
+        ),
     > = HashMap::new();
 
     for step_record in &fraud_window.items {
-        let (input_witness, output_witness, external_input) = trace_recorder
-            .io_data_at(step_record.coordinates())
+        let step_witness = trace_recorder
+            .step_witness_at(step_record.coordinates())
             .unwrap_or_else(|| {
                 panic!(
                     "Missing recorded I/O for fraud window step at coordinates {:?}",
                     step_record.coordinates()
                 )
             });
-        let input_witness = input_witness.clone();
+        let input_witness = step_witness.input_data();
+        let output_witness = step_witness.output_data();
+        let external_input = step_witness.external_input();
+        let internal_store_witness = step_witness
+            .internal_write()
+            .as_ref()
+            .map(internal_write_witness);
         recorded_step_io.insert(
             step_record.clone(),
-            (input_witness.clone(), output_witness, external_input),
+            (
+                input_witness.clone(),
+                output_witness,
+                external_input,
+                internal_store_witness,
+            ),
         );
 
         if let StepRecord::TileExec(record) = step_record {

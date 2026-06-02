@@ -33,6 +33,22 @@ impl ExternalRef {
     }
 }
 
+/// A lightweight reference to an immutable internal store object.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct InternalRef {
+    pub write_index: u64,
+    pub commitment: Vec<u8>,
+}
+
+impl InternalRef {
+    pub fn new(write_index: u64, commitment: Vec<u8>) -> Self {
+        Self {
+            write_index,
+            commitment,
+        }
+    }
+}
+
 /// A structured path describing a selected sub-value inside an external input.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct SelectorPath {
@@ -503,6 +519,7 @@ impl ExternalSelection {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum ResolvedArg<T> {
     External(ExternalArg<T>),
+    Internal(InternalArg<T>),
     Inline(T),
 }
 
@@ -515,9 +532,14 @@ impl<T> ResolvedArg<T> {
         Self::External(value)
     }
 
+    pub fn internal(value: InternalArg<T>) -> Self {
+        Self::Internal(value)
+    }
+
     pub fn into_inner(self) -> T {
         match self {
             Self::External(external) => external.value,
+            Self::Internal(internal) => internal.value,
             Self::Inline(value) => value,
         }
     }
@@ -526,6 +548,14 @@ impl<T> ResolvedArg<T> {
         match self {
             Self::External(external) => Some(external),
             Self::Inline(_) => None,
+            Self::Internal(_) => None,
+        }
+    }
+
+    pub fn as_internal(&self) -> Option<&InternalArg<T>> {
+        match self {
+            Self::Internal(internal) => Some(internal),
+            Self::External(_) | Self::Inline(_) => None,
         }
     }
 }
@@ -567,6 +597,39 @@ impl<T> ExternalArg<T> {
 
     pub fn selected(&self) -> &SelectedPayload {
         &self.selected
+    }
+}
+
+/// A resolved internal store value carrying both identity metadata and the typed value.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct InternalArg<T> {
+    pub reference: InternalRef,
+    pub store_root: Vec<u8>,
+    pub bytes: Vec<u8>,
+    pub value: T,
+}
+
+impl<T> InternalArg<T> {
+    pub fn new(
+        reference: InternalRef,
+        store_root: Vec<u8>,
+        bytes: Vec<u8>,
+        value: T,
+    ) -> Self {
+        Self {
+            reference,
+            store_root,
+            bytes,
+            value,
+        }
+    }
+
+    pub fn into_inner(self) -> T {
+        self.value
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
     }
 }
 

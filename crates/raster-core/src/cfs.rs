@@ -485,6 +485,14 @@ impl InputBinding {
             output_index,
         })
     }
+
+    /// Create an internal-store binding sourced from a prior item's committed output.
+    pub fn internal_store(item_index: usize, output_index: usize) -> Self {
+        Self::new(InputSource::InternalStore {
+            item_index,
+            output_index,
+        })
+    }
 }
 
 /// Source of an input value in the data flow schema.
@@ -505,6 +513,14 @@ pub enum InputSource {
     /// Input comes from a previous item's output.
     ItemOutput {
         /// Index of the item in the sequence (0-based).
+        item_index: usize,
+        /// Index of the output from that item (0-based).
+        output_index: usize,
+    },
+
+    /// Input is sourced from the internal store entry produced by a prior item.
+    InternalStore {
+        /// Index of the producer item in the sequence (0-based).
         item_index: usize,
         /// Index of the output from that item (0-based).
         output_index: usize,

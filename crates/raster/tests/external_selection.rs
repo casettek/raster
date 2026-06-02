@@ -3,7 +3,9 @@ use raster::prelude::*;
 use raster_core::postcard;
 use raster_runtime::{init_with, Publisher};
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, Once};
+use std::thread::ThreadId;
 
 fn missing_name_error() -> String {
     String::from("MissingName")
@@ -12,12 +14,18 @@ fn missing_name_error() -> String {
 static TRACE_CAPTURE_LOCK: Mutex<()> = Mutex::new(());
 static TRACE_INIT: Once = Once::new();
 static TRACE_EVENTS: Mutex<Vec<TraceEvent>> = Mutex::new(Vec::new());
+static TRACE_CAPTURE_ACTIVE: AtomicBool = AtomicBool::new(false);
+static TRACE_CAPTURE_THREAD: Mutex<Option<ThreadId>> = Mutex::new(None);
 
 struct TestPublisher;
 
 impl Publisher for TestPublisher {
     fn publish(&self, event: TraceEvent) {
-        TRACE_EVENTS.lock().unwrap().push(event);
+        let current_thread = std::thread::current().id();
+        let capture_thread = TRACE_CAPTURE_THREAD.lock().unwrap().clone();
+        if TRACE_CAPTURE_ACTIVE.load(Ordering::SeqCst) && capture_thread == Some(current_thread) {
+            TRACE_EVENTS.lock().unwrap().push(event);
+        }
     }
 
     fn finish(&self) {}
@@ -30,9 +38,13 @@ where
     let _guard = TRACE_CAPTURE_LOCK.lock().unwrap();
     TRACE_INIT.call_once(|| init_with(TestPublisher));
     TRACE_EVENTS.lock().unwrap().clear();
+    *TRACE_CAPTURE_THREAD.lock().unwrap() = Some(std::thread::current().id());
+    TRACE_CAPTURE_ACTIVE.store(true, Ordering::SeqCst);
 
     let result = f();
     let events = TRACE_EVENTS.lock().unwrap().clone();
+    TRACE_CAPTURE_ACTIVE.store(false, Ordering::SeqCst);
+    *TRACE_CAPTURE_THREAD.lock().unwrap() = None;
     (result, events)
 }
 

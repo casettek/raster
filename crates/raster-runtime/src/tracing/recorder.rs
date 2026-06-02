@@ -6,6 +6,7 @@ use sha2::{Digest, Sha256};
 
 use std::collections::{HashMap, VecDeque};
 
+use crate::internal_storage::{InternalStorageManager, InternalWriteRecord};
 use crate::tracing::commitment::Sha256Commitment;
 
 pub type SequenceId = String;
@@ -72,26 +73,50 @@ impl SequenceCallstack {
 }
 
 #[derive(Debug, Clone)]
-pub struct TraceIO {
+pub struct StepWitnessData {
     input_data: Option<Vec<u8>>,
     output_data: Option<Vec<u8>>,
     external_input: ExternalInput,
+    internal_write: Option<InternalWriteRecord>,
+}
+
+impl StepWitnessData {
+    pub fn input_data(&self) -> Option<Vec<u8>> {
+        self.input_data.clone()
+    }
+
+    pub fn output_data(&self) -> Option<Vec<u8>> {
+        self.output_data.clone()
+    }
+
+    pub fn external_input(&self) -> ExternalInput {
+        self.external_input.clone()
+    }
+
+    pub fn internal_write(&self) -> Option<InternalWriteRecord> {
+        self.internal_write.clone()
+    }
 }
 
 #[derive(Debug, Default, Clone)]
-pub struct TraceIOStore(HashMap<CfsCoordinates, TraceIO>);
+pub struct StepWitnessStore(HashMap<CfsCoordinates, StepWitnessData>);
 
-impl TraceIOStore {
+impl StepWitnessStore {
     fn new() -> Self {
-        TraceIOStore(HashMap::new())
+        StepWitnessStore(HashMap::new())
     }
 
-    pub fn insert(&mut self, coordinates: CfsCoordinates, event: TraceEvent) {
+    pub fn insert(
+        &mut self,
+        coordinates: CfsCoordinates,
+        event: TraceEvent,
+        internal_write: Option<InternalWriteRecord>,
+    ) {
         match event {
             TraceEvent::SequenceStart(trace_item) => {
                 self.0.insert(
                     coordinates,
-                    TraceIO {
+                    StepWitnessData {
                         input_data: trace_item.input.as_ref().map(|input| input.data().to_vec()),
                         output_data: None,
                         external_input: trace_item
@@ -99,22 +124,24 @@ impl TraceIOStore {
                             .as_ref()
                             .map(|input| input.external().clone())
                             .unwrap_or_default(),
+                        internal_write,
                     },
                 );
             }
             TraceEvent::SequenceEnd(trace_item) => {
                 let trace_io = self.0.get_mut(&coordinates).unwrap_or_else(|| {
                     panic!(
-                        "Missing TraceIO entry for SequenceEnd at coordinates {:?}. Expected a matching SequenceStart to be recorded first.",
+                        "Missing step witness entry for SequenceEnd at coordinates {:?}. Expected a matching SequenceStart to be recorded first.",
                         coordinates
                     )
                 });
                 trace_io.output_data = trace_item.output.as_ref().map(|output| output.data.clone());
+                trace_io.internal_write = internal_write;
             }
             TraceEvent::TileExec(trace_item) => {
                 self.0.insert(
                     coordinates,
-                    TraceIO {
+                    StepWitnessData {
                         input_data: trace_item.input.as_ref().map(|input| input.data().to_vec()),
                         output_data: trace_item
                             .output
@@ -125,13 +152,14 @@ impl TraceIOStore {
                             .as_ref()
                             .map(|input| input.external().clone())
                             .unwrap_or_default(),
+                        internal_write,
                     },
                 );
             }
         }
     }
 
-    pub fn get(&self, coordinates: &CfsCoordinates) -> Option<&TraceIO> {
+    pub fn get(&self, coordinates: &CfsCoordinates) -> Option<&StepWitnessData> {
         self.0.get(coordinates)
     }
 }
@@ -146,7 +174,8 @@ pub struct TraceRecorder {
     exec_index: u64,
     sequence_callstack: SequenceCallstack,
     cfs_cursor: CfsCursor,
-    io_store: TraceIOStore,
+    witness_store: StepWitnessStore,
+    internal_storage: InternalStorageManager,
 }
 
 impl TraceRecorder {
@@ -155,27 +184,32 @@ impl TraceRecorder {
             exec_index: 0,
             sequence_callstack: SequenceCallstack::new(),
             cfs_cursor: CfsCursor::new(cfs),
-            io_store: TraceIOStore::new(),
+            witness_store: StepWitnessStore::new(),
+            internal_storage: InternalStorageManager::new(),
         }
     }
 
     pub fn input_data_at(&self, coordinates: &CfsCoordinates) -> Option<Option<Vec<u8>>> {
-        self.io_store
+        self.witness_store
             .get(coordinates)
             .map(|trace_io| trace_io.input_data.clone())
     }
 
     pub fn output_data_at(&self, coordinates: &CfsCoordinates) -> Option<Option<Vec<u8>>> {
-        self.io_store
+        self.witness_store
             .get(coordinates)
             .map(|trace_io| trace_io.output_data.clone())
+    }
+
+    pub fn step_witness_at(&self, coordinates: &CfsCoordinates) -> Option<StepWitnessData> {
+        self.witness_store.get(coordinates).cloned()
     }
 
     pub fn io_data_at(
         &self,
         coordinates: &CfsCoordinates,
     ) -> Option<(Option<Vec<u8>>, Option<Vec<u8>>, ExternalInput)> {
-        self.io_store.get(coordinates).map(|trace_io| {
+        self.witness_store.get(coordinates).map(|trace_io| {
             (
                 trace_io.input_data.clone(),
                 trace_io.output_data.clone(),
@@ -213,7 +247,7 @@ impl TraceRecorder {
                     external_input_commitment,
                 };
 
-                self.io_store.insert(coordinates, event.clone());
+                self.witness_store.insert(coordinates, event.clone(), None);
 
                 StepRecord::SequenceStart(record)
             }
@@ -238,7 +272,7 @@ impl TraceRecorder {
                     .pop()
                     .expect("Corrupted sequence stack");
 
-                self.io_store.insert(sequence_coordinates, event);
+                self.witness_store.insert(sequence_coordinates, event, None);
 
                 StepRecord::SequenceEnd(record)
             }
@@ -276,6 +310,9 @@ impl TraceRecorder {
                     .as_ref()
                     .map(|output| Sha256Commitment::from(output).into())
                     .unwrap_or_default();
+                let internal_write = output
+                    .as_ref()
+                    .map(|output| self.internal_storage.append_serialized_bytes(&output.data));
 
                 let record = TileExecRecord {
                     exec_index,
@@ -284,11 +321,24 @@ impl TraceRecorder {
                     intra_sequence_index: parent_current_index,
                     coordinates: tile_coordinates.clone(),
                     input_commitment,
-                    external_input_commitment,
                     output_commitment,
+                    external_input_commitment,
+                    internal_store_root_before: internal_write
+                        .as_ref()
+                        .map(|write| write.store_root_before.clone())
+                        .unwrap_or_else(|| self.internal_storage.snapshot().root),
+                    internal_store_root_after: internal_write
+                        .as_ref()
+                        .map(|write| write.store_root_after.clone())
+                        .unwrap_or_else(|| self.internal_storage.snapshot().root),
+                    internal_write_commitment: internal_write
+                        .as_ref()
+                        .map(|write| write.object_commitment.clone())
+                        .unwrap_or_default(),
                 };
 
-                self.io_store.insert(tile_coordinates, event.clone());
+                self.witness_store
+                    .insert(tile_coordinates, event.clone(), internal_write);
 
                 StepRecord::TileExec(record)
             }
@@ -305,10 +355,10 @@ mod tests {
 
     #[test]
     #[should_panic(
-        expected = "Missing TraceIO entry for SequenceEnd at coordinates CfsCoordinates([]). Expected a matching SequenceStart to be recorded first."
+        expected = "Missing step witness entry for SequenceEnd at coordinates CfsCoordinates([]). Expected a matching SequenceStart to be recorded first."
     )]
     fn sequence_end_without_matching_start_reports_coordinates() {
-        let mut store = TraceIOStore::new();
+        let mut store = StepWitnessStore::new();
         store.insert(
             CfsCoordinates(vec![]),
             TraceEvent::SequenceEnd(FnCallRecord {
@@ -316,6 +366,7 @@ mod tests {
                 input: None,
                 output: None,
             }),
+            None,
         );
     }
 }

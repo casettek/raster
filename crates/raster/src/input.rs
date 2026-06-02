@@ -5,14 +5,23 @@ use serde::{de::DeserializeOwned, Serialize};
 
 pub use raster_core::input::{
     verify_selection_proof, ExternalArg, ExternalEncoding, ExternalRef, ExternalSelection,
-    ListProofDirection, ListProofSibling, ResolvedArg, SchemaField, SchemaNode, Selectable,
-    SelectedPayload, SelectionProof, SelectionProofStep, SelectorPath, SelectorSegment,
+    InternalArg, InternalRef, ListProofDirection, ListProofSibling, ResolvedArg, SchemaField,
+    SchemaNode, Selectable, SelectedPayload, SelectionProof, SelectionProofStep, SelectorPath,
+    SelectorSegment,
 };
-use raster_core::trace::{ExternalData as TraceExternalData, FnInputValue};
+use raster_core::trace::{
+    ExternalData as TraceExternalData, FnInputValue, InternalData as TraceInternalData,
+};
 
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct TypedExternalBinding<Root> {
     name: String,
+    marker: PhantomData<fn() -> Root>,
+}
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct TypedInternalBinding<Root> {
+    reference: InternalRef,
     marker: PhantomData<fn() -> Root>,
 }
 
@@ -32,6 +41,19 @@ impl<Root> TypedExternalBinding<Root> {
 
     pub fn into_selection(self) -> ExternalSelection {
         ExternalSelection::new(self.name)
+    }
+}
+
+impl<Root> TypedInternalBinding<Root> {
+    pub fn new(reference: InternalRef) -> Self {
+        Self {
+            reference,
+            marker: PhantomData,
+        }
+    }
+
+    pub fn reference(&self) -> &InternalRef {
+        &self.reference
     }
 }
 
@@ -56,6 +78,10 @@ pub fn typed_external<Root>(name: &str) -> TypedExternalBinding<Root> {
     TypedExternalBinding::new(name)
 }
 
+pub fn typed_internal<Root>(reference: InternalRef) -> TypedInternalBinding<Root> {
+    TypedInternalBinding::new(reference)
+}
+
 pub fn typed_selector_path<Root, Selected>(
     path: SelectorPath,
 ) -> TypedSelectorPath<Root, Selected> {
@@ -77,16 +103,34 @@ pub struct DeferredExternal<Root, Current> {
     marker: PhantomData<fn() -> (Root, Current)>,
 }
 
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct DeferredInternal<Root, Current> {
+    reference: InternalRef,
+    resolve: fn(InternalRef) -> raster_core::Result<InternalArg<Current>>,
+    marker: PhantomData<fn() -> (Root, Current)>,
+}
+
 #[derive(Debug)]
 pub enum SequenceArg<Root, Current> {
     Inline(Current),
     External(DeferredExternal<Root, Current>),
+    Internal(DeferredInternal<Root, Current>),
 }
 
 impl<Root> Clone for TypedExternalBinding<Root> {
     fn clone(&self) -> Self {
         Self {
             name: self.name.clone(),
+            marker: PhantomData,
+        }
+    }
+}
+
+impl<Root> Clone for TypedInternalBinding<Root> {
+    fn clone(&self) -> Self {
+        Self {
+            reference: self.reference.clone(),
             marker: PhantomData,
         }
     }
@@ -121,6 +165,16 @@ impl<Root, Current> Clone for DeferredExternal<Root, Current> {
     }
 }
 
+impl<Root, Current> Clone for DeferredInternal<Root, Current> {
+    fn clone(&self) -> Self {
+        Self {
+            reference: self.reference.clone(),
+            resolve: self.resolve,
+            marker: PhantomData,
+        }
+    }
+}
+
 impl<Root, Current> Clone for SequenceArg<Root, Current>
 where
     Current: Clone,
@@ -129,6 +183,7 @@ where
         match self {
             Self::Inline(value) => Self::Inline(value.clone()),
             Self::External(binding) => Self::External(binding.clone()),
+            Self::Internal(binding) => Self::Internal(binding.clone()),
         }
     }
 }
@@ -216,7 +271,7 @@ where
         match self {
             SequenceArg::Inline(_) => {
                 panic!(
-                    "select! on inline sequence values is not supported; only external bindings can be refined inside sequences"
+                    "select! on inline or internal sequence values is not supported; only external bindings can be refined inside sequences"
                 )
             }
             SequenceArg::External(binding) => SequenceArg::External(DeferredExternal {
@@ -225,6 +280,9 @@ where
                 resolve: resolve_typed_external_value::<Root, Selected>,
                 marker: PhantomData,
             }),
+            SequenceArg::Internal(_) => {
+                panic!("select! on internal sequence bindings is not supported")
+            }
         }
     }
 }
@@ -272,6 +330,21 @@ where
             name: self.name,
             selector: SelectorPath::default(),
             resolve: resolve_external_value::<Root>,
+            marker: PhantomData,
+        })
+    }
+}
+
+impl<Root> IntoSequenceArg<Root> for TypedInternalBinding<Root>
+where
+    Root: DeserializeOwned + Serialize,
+{
+    type Root = Root;
+
+    fn into_sequence_arg(self) -> SequenceArg<Self::Root, Root> {
+        SequenceArg::Internal(DeferredInternal {
+            reference: self.reference,
+            resolve: resolve_internal_value::<Root>,
             marker: PhantomData,
         })
     }
@@ -332,6 +405,16 @@ where
     }
 }
 
+impl<Root> IntoResolvedArg<Root> for TypedInternalBinding<Root>
+where
+    Root: DeserializeOwned + Serialize,
+{
+    fn into_resolved_arg(self) -> raster_core::Result<ResolvedArg<Root>> {
+        let value = resolve_internal_value::<Root>(self.reference)?;
+        Ok(ResolvedArg::internal(value))
+    }
+}
+
 impl<Root, Selected> IntoResolvedArg<Selected> for TypedSelectedExternalBinding<Root, Selected>
 where
     Root: DeserializeOwned + Serialize + Selectable,
@@ -347,7 +430,7 @@ where
 
 impl<Root, Current> IntoResolvedArg<Current> for SequenceArg<Root, Current>
 where
-    Current: Serialize,
+    Current: Serialize + DeserializeOwned,
 {
     fn into_resolved_arg(self) -> raster_core::Result<ResolvedArg<Current>> {
         match self {
@@ -358,6 +441,10 @@ where
                     binding.selector,
                 ))?;
                 Ok(ResolvedArg::external(value))
+            }
+            SequenceArg::Internal(binding) => {
+                let value = (binding.resolve)(binding.reference)?;
+                Ok(ResolvedArg::internal(value))
             }
         }
     }
@@ -372,13 +459,18 @@ where
 
 pub fn sequence_arg_trace<Root, T>(
     arg: &SequenceArg<Root, T>,
-) -> raster_core::Result<(FnInputValue, Option<TraceExternalData>)>
+) -> raster_core::Result<(
+    FnInputValue,
+    Option<TraceExternalData>,
+    Option<TraceInternalData>,
+)>
 where
-    T: Serialize,
+    T: Serialize + DeserializeOwned,
 {
     match arg {
         SequenceArg::Inline(value) => Ok((
             FnInputValue::Inline(raster_core::postcard::to_allocvec(value).unwrap_or_default()),
+            None,
             None,
         )),
         SequenceArg::External(binding) => {
@@ -397,6 +489,19 @@ where
                     tree_root: resolved.selected.proof.root_hash.clone(),
                     selector: resolved.selector,
                     selected: resolved.selected,
+                }),
+                None,
+            ))
+        }
+        SequenceArg::Internal(binding) => {
+            let resolved = (binding.resolve)(binding.reference.clone())?;
+            Ok((
+                FnInputValue::InternalBinding,
+                None,
+                Some(TraceInternalData {
+                    write_index: resolved.reference.write_index,
+                    commitment: resolved.reference.commitment,
+                    store_root: resolved.store_root,
                 }),
             ))
         }
@@ -439,6 +544,28 @@ where
             "Typed external resolution requires the `std` feature"
         )))
     }
+}
+
+pub fn resolve_internal_value<T: DeserializeOwned + Serialize>(
+    reference: InternalRef,
+) -> raster_core::Result<raster_core::input::InternalArg<T>> {
+    #[cfg(feature = "std")]
+    {
+        return raster_runtime::resolve_internal_value(&reference);
+    }
+
+    #[cfg(not(feature = "std"))]
+    {
+        let _ = reference;
+        Err(raster_core::Error::Other(alloc::format!(
+            "Internal input resolution requires the `std` feature"
+        )))
+    }
+}
+
+#[cfg(feature = "std")]
+pub fn store_internal_value<T: Serialize>(value: &T) -> raster_core::Result<InternalRef> {
+    raster_runtime::store_internal_value(value)
 }
 
 #[cfg(feature = "std")]

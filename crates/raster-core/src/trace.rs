@@ -25,10 +25,12 @@ pub struct FnInput {
     pub data: Vec<u8>,
     pub args: Vec<FnInputArg>,
     pub external: ExternalInput,
+    pub internal: InternalInput,
 }
 
 pub type InternalBindingName = String;
 pub type ExternalInput = BTreeMap<InternalBindingName, ExternalData>;
+pub type InternalInput = BTreeMap<InternalBindingName, InternalData>;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct ExternalData {
@@ -40,9 +42,17 @@ pub struct ExternalData {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct InternalData {
+    pub write_index: u64,
+    pub commitment: Vec<u8>,
+    pub store_root: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum FnInputValue {
     Inline(Vec<u8>),
     ExternalBinding,
+    InternalBinding,
 }
 
 impl FnInput {
@@ -56,6 +66,10 @@ impl FnInput {
 
     pub fn external(&self) -> &ExternalInput {
         &self.external
+    }
+
+    pub fn internal(&self) -> &InternalInput {
+        &self.internal
     }
 }
 
@@ -118,6 +132,9 @@ pub struct TileExecRecord {
     pub output_commitment: Vec<u8>,
 
     pub external_input_commitment: Vec<u8>,
+    pub internal_store_root_before: Vec<u8>,
+    pub internal_store_root_after: Vec<u8>,
+    pub internal_write_commitment: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]

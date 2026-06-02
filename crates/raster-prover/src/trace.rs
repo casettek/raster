@@ -376,6 +376,10 @@ fn resolve_inputs_sources(
             InputSource::ItemOutput {
                 item_index,
                 output_index,
+            }
+            | InputSource::InternalStore {
+                item_index,
+                output_index,
             } => {
                 if *item_index >= item_coordinate as usize {
                     panic!(
@@ -657,6 +661,9 @@ mod tests {
             input_commitment: Vec::new(),
             external_input_commitment: Vec::new(),
             output_commitment: output.to_le_bytes().to_vec(),
+            internal_store_root_before: Vec::new(),
+            internal_store_root_after: Vec::new(),
+            internal_write_commitment: Vec::new(),
         })
     }
 

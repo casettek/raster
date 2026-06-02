@@ -20,8 +20,8 @@ use raster_core::fingerprint::{Fingerprint, FingerprintAccumulator};
 use raster_core::input::verify_selection_proof;
 use raster_core::trace::{ExternalInput, StepRecord};
 use raster_core::transition::{
-    SerializableFrontier, StepRecordWitness, Transition, TransitionInput, TransitionJournal,
-    TransitionState,
+    InternalStoreWriteWitness, SerializableFrontier, StepRecordWitness, Transition,
+    TransitionInput, TransitionJournal, TransitionState,
 };
 
 use serde::{Deserialize, Serialize};
@@ -110,6 +110,13 @@ fn sha256_bytes(bytes: &[u8]) -> Vec<u8> {
     Risc0Sha256::hash_bytes(bytes).as_bytes().to_vec()
 }
 
+fn frontier_root(frontier: &NonEmptyFrontier<Bytes>) -> Vec<u8> {
+    TraceBridgeTree::from_frontier(1, frontier.clone())
+        .root(0)
+        .expect("Can't get current frontier root")
+        .0
+}
+
 fn sha256_hex(bytes: &[u8]) -> Vec<u8> {
     let digest = sha256_bytes(bytes);
     let mut out = Vec::with_capacity(digest.len() * 2);
@@ -176,7 +183,6 @@ fn verify_step_record_inputs(
         });
     let step_inputs = cfs_item.inputs();
 
-    // TODO: External Kind of input source not_implemented
     if step_inputs
         .iter()
         .all(|input| matches!(input.source, InputSource::External | InputSource::Inline))
@@ -220,6 +226,10 @@ fn verify_step_record_inputs(
                 verify_record_witness(source_record, witness_bytes, &current_root);
             }
             InputSource::ItemOutput {
+                item_index,
+                output_index: _,
+            }
+            | InputSource::InternalStore {
                 item_index,
                 output_index: _,
             } => {
@@ -413,6 +423,54 @@ fn verify_step_record(
     }
 }
 
+fn verify_internal_store_transition(
+    step_record: &StepRecord,
+    output_witness_bytes: Option<&Vec<u8>>,
+    internal_store_witness: Option<&InternalStoreWriteWitness>,
+    frontier: &mut NonEmptyFrontier<Bytes>,
+) -> SerializableFrontier {
+    match step_record {
+        StepRecord::TileExec(record) => {
+            let current_root = frontier_root(frontier);
+            assert_eq!(
+                record.internal_store_root_before, current_root,
+                "TileExec internal store root before does not match current internal store root",
+            );
+
+            let output_bytes = output_witness_bytes
+                .expect("TileExec internal store transition requires output bytes");
+            let object_commitment = sha256_bytes(output_bytes);
+            assert_eq!(
+                record.internal_write_commitment, object_commitment,
+                "TileExec internal write commitment does not match output bytes",
+            );
+
+            let internal_store_witness =
+                internal_store_witness.expect("TileExec internal store witness is missing");
+            assert_eq!(
+                internal_store_witness.object_commitment, object_commitment,
+                "Internal store witness commitment does not match tile output commitment",
+            );
+
+            frontier.append(Bytes(object_commitment));
+            let next_root = frontier_root(frontier);
+            assert_eq!(
+                record.internal_store_root_after, next_root,
+                "TileExec internal store root after does not match appended internal store root",
+            );
+
+            serialize_frontier(frontier)
+        }
+        StepRecord::SequenceStart(_) | StepRecord::SequenceEnd(_) => {
+            assert!(
+                internal_store_witness.is_none(),
+                "Only tile steps may carry internal store write witnesses",
+            );
+            serialize_frontier(frontier)
+        }
+    }
+}
+
 // Verify that current step record corrdinates are in preveious expected next coordinates and with
 // CfsCursor iterate to next expected coordiantes
 fn get_next_expected_coordinates(
@@ -471,6 +529,14 @@ fn main() {
         TransitionState::Init(init_transition) => {
             let mut init_frontier = deserialize_frontier(&init_transition.init_frontier)
                 .expect("Invalid frontier in input");
+            let mut init_internal_store_frontier =
+                deserialize_frontier(&init_transition.init_internal_store_frontier)
+                    .expect("Invalid internal store frontier in input");
+            assert_eq!(
+                frontier_root(&init_internal_store_frontier),
+                init_transition.init_internal_store_root,
+                "Initial internal store root does not match initial internal store frontier",
+            );
 
             verify_step_record_inputs(
                 &cfs_cursor,
@@ -486,6 +552,12 @@ fn main() {
                 &input.external_input,
                 &input.authorization_journal.external_inputs_commitments,
             );
+            let new_internal_store_frontier = verify_internal_store_transition(
+                &input.step_record,
+                input.output_witness.as_ref(),
+                input.internal_store_witness.as_ref(),
+                &mut init_internal_store_frontier,
+            );
             let next_expected_coordinates =
                 get_next_expected_coordinates(&cfs_cursor, &input.step_record, None);
 
@@ -499,6 +571,8 @@ fn main() {
 
             let current_state = TransitionState::Next(Transition {
                 frontier: new_frontier,
+                internal_store_root: frontier_root(&init_internal_store_frontier),
+                internal_store_frontier: new_internal_store_frontier,
                 actual_fingerprint_acc,
                 next_expected_coordinates,
             });
@@ -544,6 +618,14 @@ fn main() {
 
             let mut current_frontier =
                 deserialize_frontier(&transition.frontier).expect("Invalid frontier in input");
+            let mut current_internal_store_frontier =
+                deserialize_frontier(&transition.internal_store_frontier)
+                    .expect("Invalid internal store frontier in input");
+            assert_eq!(
+                frontier_root(&current_internal_store_frontier),
+                transition.internal_store_root,
+                "Transition internal store root does not match transition internal store frontier",
+            );
 
             verify_step_record_inputs(
                 &cfs_cursor,
@@ -558,6 +640,12 @@ fn main() {
                 input.output_witness.as_ref(),
                 &input.external_input,
                 &input.authorization_journal.external_inputs_commitments,
+            );
+            let new_internal_store_frontier = verify_internal_store_transition(
+                &input.step_record,
+                input.output_witness.as_ref(),
+                input.internal_store_witness.as_ref(),
+                &mut current_internal_store_frontier,
             );
             let next_expected_coordinates = get_next_expected_coordinates(
                 &cfs_cursor,
@@ -590,6 +678,8 @@ fn main() {
 
                     TransitionState::Next(Transition {
                         frontier: new_frontier,
+                        internal_store_root: frontier_root(&current_internal_store_frontier),
+                        internal_store_frontier: new_internal_store_frontier,
                         actual_fingerprint_acc: FingerprintAccumulator::from(actual_fingerprint),
                         next_expected_coordinates,
                     })
@@ -666,6 +756,9 @@ mod tests {
             input_commitment: sha(b"in"),
             external_input_commitment: external_input_commitment(&ext),
             output_commitment: sha(b"out"),
+            internal_store_root_before: vec![0; 32],
+            internal_store_root_after: vec![0; 32],
+            internal_write_commitment: vec![],
         });
 
         verify_io_witness(&step, Some(&b"in".to_vec()), Some(&b"out".to_vec()));
@@ -693,6 +786,9 @@ mod tests {
             input_commitment: sha(b"expected"),
             external_input_commitment: external_input_commitment(&ext),
             output_commitment: sha(b"out"),
+            internal_store_root_before: vec![0; 32],
+            internal_store_root_after: vec![0; 32],
+            internal_write_commitment: vec![],
         });
 
         verify_io_witness(&step, Some(&b"actual".to_vec()), Some(&b"out".to_vec()));
@@ -749,6 +845,9 @@ mod tests {
             input_commitment: sha(b"in"),
             external_input_commitment: external_input_commitment(&ext),
             output_commitment: sha(b"out"),
+            internal_store_root_before: vec![0; 32],
+            internal_store_root_after: vec![0; 32],
+            internal_write_commitment: vec![],
         });
 
         let authorization =
@@ -769,6 +868,9 @@ mod tests {
             input_commitment: sha(b"in"),
             external_input_commitment: external_input_commitment(&ext),
             output_commitment: sha(b"out"),
+            internal_store_root_before: vec![0; 32],
+            internal_store_root_after: vec![0; 32],
+            internal_write_commitment: vec![],
         });
 
         verify_external_inputs(
@@ -797,6 +899,9 @@ mod tests {
             input_commitment: sha(b"in"),
             external_input_commitment: external_input_commitment(&ext),
             output_commitment: sha(b"out"),
+            internal_store_root_before: vec![0; 32],
+            internal_store_root_after: vec![0; 32],
+            internal_write_commitment: vec![],
         });
 
         let authorization = authorization_journal("personal_data", b"wrong");

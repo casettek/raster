@@ -117,7 +117,7 @@ impl<'a, 'ast> FlowResolver<'a, 'ast> {
 
         // Check if it's a bound variable from a previous item
         if let Some(&(item_index, output_index)) = self.bindings.get(arg) {
-            return InputBinding::item_output(item_index, output_index);
+            return InputBinding::internal_store(item_index, output_index);
         }
 
         match kind {
@@ -277,20 +277,20 @@ mod tests {
             _ => panic!("Expected Tile item"),
         }
 
-        // Second item: exclaim(greeting) where greeting is item_output[0][0]
+        // Second item: exclaim(greeting) where greeting is internal_store[0][0]
         match &items[1] {
             SequenceChildItem::Tile(tile_item) => {
                 assert_eq!(tile_item.id, "exclaim");
                 assert_eq!(tile_item.sources.len(), 1);
                 match &tile_item.sources[0].source {
-                    InputSource::ItemOutput {
+                    InputSource::InternalStore {
                         item_index,
                         output_index,
                     } => {
                         assert_eq!(*item_index, 0);
                         assert_eq!(*output_index, 0);
                     }
-                    _ => panic!("Expected ItemOutput"),
+                    _ => panic!("Expected InternalStore"),
                 }
             }
             _ => panic!("Expected Tile item"),

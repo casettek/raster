@@ -3,6 +3,7 @@ use std::fs;
 use std::path::Path;
 
 use raster_core::authorization::ManifestedInputs;
+use raster_core::transition::InternalStoreWriteWitness;
 use raster_core::trace::{ExternalInput, StepRecord};
 use raster_core::{Error, Result};
 
@@ -20,10 +21,20 @@ pub fn read_json_source(raw_input: Option<&str>, label: &str) -> Result<Vec<u8>>
 }
 
 pub fn collect_external_input_commitments(
-    recorded_step_io: &HashMap<StepRecord, (Option<Vec<u8>>, Option<Vec<u8>>, ExternalInput)>,
+    recorded_step_io: &HashMap<
+        StepRecord,
+        (
+            Option<Vec<u8>>,
+            Option<Vec<u8>>,
+            ExternalInput,
+            Option<InternalStoreWriteWitness>,
+        ),
+    >,
 ) -> BTreeMap<String, Vec<u8>> {
     let mut commitments_by_name = BTreeMap::new();
-    for (_step_record, (_recorded_input, _recorded_output, external_input)) in recorded_step_io {
+    for (_step_record, (_recorded_input, _recorded_output, external_input, _internal_store)) in
+        recorded_step_io
+    {
         for external_data in external_input.values() {
             match commitments_by_name.get(&external_data.name) {
                 None => {

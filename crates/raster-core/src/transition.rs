@@ -41,6 +41,12 @@ pub struct StepRecordWitness {
     pub path_elems: Vec<Vec<u8>>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InternalStoreWriteWitness {
+    pub write_index: u64,
+    pub object_commitment: Vec<u8>,
+}
+
 /// Input for a single transition step (passed into the transition guest).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransitionInput {
@@ -50,6 +56,7 @@ pub struct TransitionInput {
     pub input_witness: Option<Vec<u8>>,
     pub output_witness: Option<Vec<u8>>,
     pub external_input: ExternalInput,
+    pub internal_store_witness: Option<InternalStoreWriteWitness>,
 
     pub input_sources_witnesses: HashMap<StepRecord, Vec<u8>>,
 
@@ -61,6 +68,8 @@ pub struct TransitionInput {
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct Transition {
     pub frontier: SerializableFrontier,
+    pub internal_store_frontier: SerializableFrontier,
+    pub internal_store_root: Vec<u8>,
     pub actual_fingerprint_acc: FingerprintAccumulator,
     pub next_expected_coordinates: Vec<CfsCoordinates>,
 }
@@ -69,6 +78,8 @@ pub struct Transition {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct InitTransition {
     pub init_frontier: SerializableFrontier,
+    pub init_internal_store_frontier: SerializableFrontier,
+    pub init_internal_store_root: Vec<u8>,
     pub fingerprint: Fingerprint,
 }
 

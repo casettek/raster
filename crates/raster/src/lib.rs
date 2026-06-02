@@ -16,17 +16,18 @@ pub use raster_core as core;
 
 pub mod input;
 pub use input::{
-    into_resolved_arg, into_sequence_arg, resolve_external_value, resolve_typed_external_value,
-    select_source, selector_path, sequence_arg_trace, typed_external, typed_selector_path,
-    ExternalArg, ExternalRef, ExternalSelection, IntoResolvedArg, IntoSequenceArg,
+    into_resolved_arg, into_sequence_arg, resolve_external_value, resolve_internal_value,
+    resolve_typed_external_value, select_source, selector_path, sequence_arg_trace,
+    typed_external, typed_internal, typed_selector_path, ExternalArg, ExternalRef,
+    ExternalSelection, InternalArg, InternalRef, IntoResolvedArg, IntoSequenceArg,
     ListProofDirection, ListProofSibling, ResolvedArg, SchemaField, SchemaNode, SelectSource,
     Selectable, SelectedPayload, SelectionProof, SelectionProofStep, SelectorPath, SelectorSegment,
-    SequenceArg, TypedExternalBinding, TypedSelectedExternalBinding, TypedSelectorPath,
-    TypedSequenceRoot,
+    SequenceArg, TypedExternalBinding, TypedInternalBinding, TypedSelectedExternalBinding,
+    TypedSelectorPath, TypedSequenceRoot,
 };
 
 #[cfg(feature = "std")]
-pub use input::{encode_raster_value, write_raster_files};
+pub use input::{encode_raster_value, store_internal_value, write_raster_files};
 
 pub use raster_macros::{select, sequence, tile, Selectable};
 
@@ -102,6 +103,14 @@ macro_rules! external {
     };
 }
 
+/// Creates a typed internal-store reference for explicit call-site bindings.
+#[macro_export]
+macro_rules! internal {
+    ($ty:ty, $reference:expr) => {
+        $crate::typed_internal::<$ty>($reference)
+    };
+}
+
 /// Canonical call primitive for invoking a sub-sequence inside a sequence.
 ///
 /// `call_seq!` is the explicit "sequence call boundary" — use it instead of bare
@@ -164,11 +173,12 @@ pub mod prelude {
 
     pub use crate::exec::Result;
     pub use crate::{
-        call, call_seq, debug, external, into_sequence_arg, select, sequence, tile, ExternalArg,
-        ExternalSelection, IntoResolvedArg, IntoSequenceArg, ListProofDirection, ListProofSibling,
-        ResolvedArg, SchemaField, SchemaNode, SelectSource, Selectable, SelectedPayload,
-        SelectionProof, SelectionProofStep, SelectorPath, SelectorSegment, SequenceArg,
-        TypedExternalBinding, TypedSelectedExternalBinding, TypedSelectorPath, TypedSequenceRoot,
+        call, call_seq, debug, external, internal, into_sequence_arg, select, sequence, tile,
+        ExternalArg, ExternalSelection, InternalArg, InternalRef, IntoResolvedArg, IntoSequenceArg,
+        ListProofDirection, ListProofSibling, ResolvedArg, SchemaField, SchemaNode, SelectSource,
+        Selectable, SelectedPayload, SelectionProof, SelectionProofStep, SelectorPath,
+        SelectorSegment, SequenceArg, TypedExternalBinding, TypedInternalBinding,
+        TypedSelectedExternalBinding, TypedSelectorPath, TypedSequenceRoot,
     };
 
     // TODO: Re-enable once Executor/Tracer types are implemented
@@ -176,5 +186,8 @@ pub mod prelude {
     // pub use crate::{Executor, Tracer, FileTracer, NoOpTracer};
 
     #[cfg(feature = "std")]
-    pub use crate::{resolve_external_value, resolve_typed_external_value};
+    pub use crate::{
+        resolve_external_value, resolve_internal_value, resolve_typed_external_value,
+        store_internal_value,
+    };
 }
