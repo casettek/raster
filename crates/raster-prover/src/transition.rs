@@ -245,7 +245,6 @@ mod tests {
             output_commitment: vec![exec_index as u8 + 1],
             internal_store_root_before: EMPTY_TRIE_NODES[0].to_vec(),
             internal_store_root_after: EMPTY_TRIE_NODES[0].to_vec(),
-            internal_write_commitment: vec![],
         })
     }
 
