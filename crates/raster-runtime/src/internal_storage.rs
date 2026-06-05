@@ -1,44 +1,57 @@
+use raster_core::cfs::CfsCoordinates;
+use raster_core::coordinate_index::coordinate_index_root;
 use raster_core::input::{InternalArg, InternalRef};
-use raster_core::transition::{InternalStoreWriteWitness, SerializableFrontier};
+use raster_core::transition::{InternalStoreEntry, InternalStoreIndexValue, SerializableFrontier};
 use raster_core::{Error, Result};
 use raster_prover::precomputed::EMPTY_TRIE_NODES;
 use raster_prover::trace::{
-    serializable_frontier_from_trace_frontier, Bytes, TraceTree,
+    serializable_frontier_from_trace_frontier, Bytes, TraceTree, TraceTreeFrontier,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::sync::{Mutex, OnceLock};
 use std::vec::Vec;
 
+use crate::Sha256Commitment;
+
 #[derive(Debug, Clone)]
 pub struct StoredInternalObject {
     pub reference: InternalRef,
+    pub log_position: u64,
     pub bytes: Vec<u8>,
-    pub store_root: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
 pub struct InternalStoreSnapshot {
     pub frontier: SerializableFrontier,
     pub root: Vec<u8>,
+    pub index_root: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
 pub struct InternalWriteRecord {
-    pub write_index: u64,
-    pub object_commitment: Vec<u8>,
+    pub entry: InternalStoreEntry,
+    pub log_position: u64,
     pub store_root_before: Vec<u8>,
     pub store_root_after: Vec<u8>,
+    pub index_root_before: Vec<u8>,
+    pub index_root_after: Vec<u8>,
     pub frontier_after: SerializableFrontier,
 }
 
 #[derive(Debug, Clone)]
 pub struct InternalStorageManager {
-    next_write_index: u64,
-    frontier: raster_prover::trace::TraceTreeFrontier,
-    objects: BTreeMap<u64, StoredInternalObject>,
+    frontier: TraceTreeFrontier,
+    objects: BTreeMap<CfsCoordinates, StoredInternalObject>,
+    coordinate_index: BTreeMap<CfsCoordinates, InternalStoreIndexValue>,
+}
+
+fn frontier_root(frontier: &TraceTreeFrontier) -> Vec<u8> {
+    TraceTree::from_frontier(1, frontier.clone())
+        .root(0)
+        .expect("internal store root should exist")
+        .0
 }
 
 impl InternalStorageManager {
@@ -50,9 +63,9 @@ impl InternalStorageManager {
             .cloned()
             .expect("internal store frontier should exist after seed append");
         Self {
-            next_write_index: 0,
             frontier,
             objects: BTreeMap::new(),
+            coordinate_index: BTreeMap::new(),
         }
     }
 
@@ -60,72 +73,97 @@ impl InternalStorageManager {
         InternalStoreSnapshot {
             frontier: serializable_frontier_from_trace_frontier(self.frontier.clone()),
             root: self.current_root(),
+            index_root: self.current_index_root(),
         }
     }
 
     pub fn current_root(&self) -> Vec<u8> {
-        TraceTree::from_frontier(1, self.frontier.clone())
-            .root(0)
-            .expect("internal store root should exist")
-            .0
+        frontier_root(&self.frontier)
     }
 
-    pub fn append_serialized_bytes(&mut self, bytes: &[u8]) -> InternalWriteRecord {
-        let store_root_before = self.current_root();
-        let object_commitment = sha256_bytes(bytes);
-        let write_index = self.next_write_index;
-        self.next_write_index += 1;
+    pub fn current_index_root(&self) -> Vec<u8> {
+        coordinate_index_root(&self.coordinate_index)
+    }
 
-        self.frontier.append(Bytes(object_commitment.clone()));
-        let store_root_after = self.current_root();
-        let reference = InternalRef::new(write_index, object_commitment.clone());
+    pub fn append_serialized_bytes(
+        &mut self,
+        bytes: &[u8],
+        coordinates: CfsCoordinates,
+    ) -> InternalWriteRecord {
+        assert!(
+            !self.coordinate_index.contains_key(&coordinates),
+            "Duplicate internal store write at coordinates {:?}",
+            coordinates
+        );
+
+        let store_root_before = self.current_root();
+        let index_root_before = self.current_index_root();
+        let object_commitment = Sha256Commitment::from(bytes);
+        let entry = InternalStoreEntry {
+            coordinates: coordinates.clone(),
+            object_commitment: object_commitment.into(),
+        };
+        let leaf_hash: Vec<u8> = Sha256Commitment::from(entry.to_bytes().as_slice()).into();
+
+        self.frontier.append(Bytes(leaf_hash));
+        let log_position: u64 = self.frontier.position().into();
+        let index_value = InternalStoreIndexValue {
+            log_position,
+            object_commitment: entry.object_commitment.clone(),
+        };
+        self.coordinate_index
+            .insert(coordinates.clone(), index_value);
+
+        let reference = InternalRef::new(coordinates.clone(), entry.object_commitment.clone());
+
         self.objects.insert(
-            write_index,
+            coordinates,
             StoredInternalObject {
                 reference,
+                log_position,
                 bytes: bytes.to_vec(),
-                store_root: store_root_after.clone(),
             },
         );
 
         InternalWriteRecord {
-            write_index,
-            object_commitment,
+            entry,
+            log_position,
             store_root_before,
-            store_root_after,
+            store_root_after: self.current_root(),
+            index_root_before,
+            index_root_after: self.current_index_root(),
             frontier_after: serializable_frontier_from_trace_frontier(self.frontier.clone()),
         }
     }
 
     pub fn resolve<T: DeserializeOwned>(&self, reference: &InternalRef) -> Result<InternalArg<T>> {
-        let stored = self.objects.get(&reference.write_index).ok_or_else(|| {
+        let stored = self.objects.get(&reference.coordinates).ok_or_else(|| {
             Error::Other(format!(
-                "Missing internal store object at write index {}",
-                reference.write_index
+                "Missing internal store object at coordinates {:?}",
+                reference.coordinates
             ))
         })?;
         if stored.reference.commitment != reference.commitment {
             return Err(Error::Other(format!(
-                "Internal store commitment mismatch at write index {}",
-                reference.write_index
+                "Internal store commitment mismatch at coordinates {:?}",
+                reference.coordinates
             )));
         }
-        let actual_commitment = sha256_bytes(&stored.bytes);
+        let actual_commitment: Vec<u8> = Sha256Commitment::from(stored.bytes.as_slice()).into();
         if actual_commitment != reference.commitment {
             return Err(Error::Other(format!(
-                "Internal store object {} failed integrity check",
-                reference.write_index
+                "Internal store object at coordinates {:?} failed integrity check",
+                reference.coordinates
             )));
         }
         let value = raster_core::postcard::from_bytes(&stored.bytes).map_err(|e| {
             Error::Serialization(format!(
-                "Failed to deserialize internal store object {}: {}",
-                reference.write_index, e
+                "Failed to deserialize internal store object at coordinates {:?}: {}",
+                reference.coordinates, e
             ))
         })?;
         Ok(InternalArg::new(
             reference.clone(),
-            stored.store_root.clone(),
             stored.bytes.clone(),
             value,
         ))
@@ -136,17 +174,6 @@ impl Default for InternalStorageManager {
     fn default() -> Self {
         Self::new()
     }
-}
-
-pub fn internal_write_witness(record: &InternalWriteRecord) -> InternalStoreWriteWitness {
-    InternalStoreWriteWitness {
-        write_index: record.write_index,
-        object_commitment: record.object_commitment.clone(),
-    }
-}
-
-pub fn sha256_bytes(bytes: &[u8]) -> Vec<u8> {
-    Sha256::digest(bytes).to_vec()
 }
 
 static GLOBAL_INTERNAL_STORAGE: OnceLock<Mutex<InternalStorageManager>> = OnceLock::new();
@@ -160,16 +187,30 @@ pub fn global_internal_store_snapshot() -> InternalStoreSnapshot {
 }
 
 pub fn store_internal_value<T: Serialize>(value: &T) -> Result<InternalRef> {
-    let bytes = raster_core::postcard::to_allocvec(value).map_err(|e| {
-        Error::Serialization(format!("Failed to serialize internal store value: {}", e))
-    })?;
-    let mut manager = global_manager().lock().unwrap();
-    let record = manager.append_serialized_bytes(&bytes);
-    Ok(InternalRef::new(record.write_index, record.object_commitment))
+    let _ = value;
+    Err(Error::Other(
+        "Standalone internal-store writes require execution coordinates".into(),
+    ))
 }
 
-pub fn resolve_internal_value<T: DeserializeOwned>(reference: &InternalRef) -> Result<InternalArg<T>> {
+pub fn resolve_internal_value<T: DeserializeOwned>(
+    reference: &InternalRef,
+) -> Result<InternalArg<T>> {
     let manager = global_manager().lock().unwrap();
     manager.resolve(reference)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[should_panic(expected = "Duplicate internal store write at coordinates")]
+    fn rejects_duplicate_coordinate_writes() {
+        let mut manager = InternalStorageManager::new();
+        let coordinates = CfsCoordinates(vec![1, 2, 3]);
+
+        manager.append_serialized_bytes(b"first", coordinates.clone());
+        manager.append_serialized_bytes(b"second", coordinates);
+    }
+}

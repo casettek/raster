@@ -29,7 +29,7 @@ In the current implementation, the CFS is emitted as **pretty-printed JSON** by 
 - **Data-flow binding resolution**
   - `crates/raster-compiler/src/flow_resolver.rs`
     - `FlowResolver::resolve` / `resolve_argument`
-    - Binding model: `SeqInput` vs `ItemOutput` vs fallback `External`
+    - Binding model: `SequenceScope` vs `ProducerOutput` vs direct semantic sources (`External` / `Internal` / `Inline`)
     - Tests: `test_resolve_simple_sequence`
 - **JSON serialization and file emission**
   - `crates/raster-cli/src/commands.rs`
@@ -143,10 +143,10 @@ Example:
 
 #### `SequenceDef.input_sources`
 
-`input_sources[i]` describes where the \(i\)-th sequence input value comes from.
+`input_sources[i]` reserves a slot for the \(i\)-th sequence input value.
 
 - Producers MUST emit one `InputBinding` per sequence parameter (0-based index).
-- In the current implementation, **all sequence inputs are marked as `external`**.
+- In the current implementation, **all sequence inputs are direct `External` bindings**. The runtime resolves the concrete semantic source for each invocation via the traced `FnInput` witness.
 
 ### `SequenceItem`
 
@@ -163,7 +163,7 @@ Example:
   "item_type": "tile",
   "item_id": "exclaim",
   "input_sources": [
-    { "source": { "type": "item_output", "item_index": 0, "output_index": 0 } }
+    { "ProducerOutput": { "item_index": 0, "output_index": 0 } }
   ]
 }
 ```
@@ -180,64 +180,49 @@ Consumers MUST NOT assume that `item_type` is fully validated or correct in the 
 
 ### `InputBinding`
 
-An `InputBinding` MUST be an object with:
+`InputBinding` is an enum with three cases:
 
-- `source` (object): an `InputSource`
+- `Direct(InputSource)` for direct semantic sources
+- `SequenceScope { input_index }` for references to the current sequence invocation scope
+- `ProducerOutput { item_index, output_index }` for references to prior item outputs
 
-Example:
+`ProducerOutput` is structural CFS metadata, not a storage offset. During execution and verification it resolves to the internal-store entry keyed by the producer item's execution coordinates.
+
+Representative JSON encodings under Serde’s default enum representation are:
 
 ```json
-{ "source": { "type": "seq_input", "input_index": 0 } }
+{ "Direct": "External" }
+```
+
+```json
+{ "SequenceScope": { "input_index": 0 } }
+```
+
+```json
+{ "ProducerOutput": { "item_index": 3, "output_index": 0 } }
 ```
 
 ### `InputSource`
 
-`InputSource` is encoded as an object with a string tag field `type`.
+`InputSource` is the semantic source kind carried by `InputBinding::Direct`.
 
 Supported variants in the current schema:
 
-#### External
-
-```json
-{ "type": "external" }
-```
-
-Meaning:
-
-- The value is provided externally at runtime (e.g., as a sequence input), or
-- The compiler could not resolve the argument to a sequence parameter or prior binding and fell back to `external`.
-
-#### Sequence input reference
-
-```json
-{ "type": "seq_input", "input_index": 0 }
-```
-
-Meaning:
-
-- The value is the `input_index`-th input to the surrounding sequence (0-based).
-
-#### Prior item output reference
-
-```json
-{ "type": "item_output", "item_index": 3, "output_index": 0 }
-```
-
-Meaning:
-
-- The value is `output_index` from the item at position `item_index` within the same `SequenceDef.items` array (both 0-based).
+- `External`
+- `Internal`
+- `Inline`
 
 ## Binding resolution behavior (as produced today)
 
 The compiler-side resolver constructs bindings as follows:
 
-- If an argument token exactly matches a sequence parameter name, it MUST be encoded as `seq_input` with that parameter’s index.
-- Else if it matches a previously bound variable name, it MUST be encoded as `item_output` pointing at the producing item and output index.
-- Else it MUST be encoded as `external` (fallback).
+- If an argument token exactly matches a sequence parameter name, it MUST be encoded as `SequenceScope { input_index }`.
+- Else if it matches a previously bound variable name, it MUST be encoded as `ProducerOutput { item_index, output_index }`.
+- Else it MUST be encoded as `Direct(External)` (fallback).
 
 The current resolver binds only a single result name per call:
 
-- If a call is of the form `let x = callee(...);`, then `x` is recorded as coming from `item_output { item_index = <this call>, output_index = 0 }`.
+- If a call is of the form `let x = callee(...);`, then `x` is recorded as coming from `ProducerOutput { item_index = <this call>, output_index = 0 }`.
 
 ## Recursion representation
 
@@ -270,19 +255,19 @@ The following invariants describe the CFS produced by the current implementation
 
 Note: uniqueness and ordering are not currently validated or canonicalized by the implementation.
 
-### Index invariants for `InputSource`
+### Index invariants for `InputBinding`
 
 If a consumer validates bindings, it SHOULD enforce:
 
-- For `seq_input`:
+- For `SequenceScope`:
   - `input_index` MUST be `< SequenceDef.input_sources.len()`.
-- For `item_output`:
+- For `ProducerOutput`:
   - `item_index` MUST be `< current_item_index` (must refer to an earlier item).
   - `output_index` MUST be `< outputs(item_index)` where `outputs(item_index)` is the callee’s output arity.
 
 Implementation notes:
 
-- The current resolver only produces `item_output` references to previously-seen bindings, so `item_index < current_item_index` holds for produced CFS.
+- The current resolver only produces `ProducerOutput` references to previously-seen bindings, so `item_index < current_item_index` holds for produced CFS.
 - The current resolver always uses `output_index = 0` for bindings, regardless of actual multi-output arity (see “Known gaps”).
 
 ## Known gaps and mismatches (implementation vs intended)
@@ -295,7 +280,7 @@ These are places where the current code either does not encode the desired infor
   - Tiles can report `outputs > 1` via signature parsing, but the binding resolver records only a single named binding per call and always maps it to `output_index = 0`.
 - **Call extraction and binding resolution are intentionally narrow**
   - Source parsing uses `syn`, but the call extractor only records calls whose callee is a bare identifier (no `::` paths, no method calls, no macro invocations).
-  - Binding resolution is based on exact string equality between an argument’s stringified token form and known parameter/binding names; complex expressions and literals typically become `external` bindings.
+  - Binding resolution is based on exact string equality between an argument’s stringified token form and known parameter/binding names; complex expressions and literals typically become `Direct(External)` bindings.
 - **Discovery scope**
   - The CLI discovery scans only `root/src/**.rs` under the selected project root directory.
 - **Ordering is not canonicalized**
@@ -324,8 +309,8 @@ If a consumer validates or deserializes a CFS, it SHOULD reject inputs that are 
 - Invalid JSON (syntax errors, non-UTF-8 bytes).
 - Missing required fields (`version`, `project`, `encoding`, `tiles`, `sequences`).
 - Wrong JSON types for required fields.
-- Unknown `InputSource.type` variants.
-- Out-of-range indices in `seq_input` / `item_output` references.
+- Unknown `InputBinding` / `InputSource` variants.
+- Out-of-range indices in `SequenceScope` / `ProducerOutput` references.
 
 ## End-to-end example
 
@@ -344,21 +329,21 @@ Example CFS JSON for a simple sequence:
     {
       "id": "main",
       "input_sources": [
-        { "source": { "type": "external" } }
+        { "Direct": "External" }
       ],
       "items": [
         {
           "item_type": "tile",
           "item_id": "greet",
           "input_sources": [
-            { "source": { "type": "seq_input", "input_index": 0 } }
+            { "SequenceScope": { "input_index": 0 } }
           ]
         },
         {
           "item_type": "tile",
           "item_id": "exclaim",
           "input_sources": [
-            { "source": { "type": "item_output", "item_index": 0, "output_index": 0 } }
+            { "ProducerOutput": { "item_index": 0, "output_index": 0 } }
           ]
         }
       ]

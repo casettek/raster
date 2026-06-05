@@ -11,16 +11,18 @@
 use raster_core::authorization::AuthorizationJournal;
 use raster_core::cfs::ControlFlowSchema;
 use raster_core::fingerprint::Fingerprint;
-use raster_core::trace::{ExternalInput, StepRecord};
+use raster_core::trace::{ExternalInput, FnInput, StepRecord};
 use raster_core::transition::{
-    InitTransition, InternalStoreWriteWitness, TransitionInput, TransitionJournal, TransitionState,
+    InitTransition, InternalStoreWitness, TransitionInput, TransitionJournal, TransitionState,
 };
 use std::collections::HashMap;
 
 use crate::authorization::authorization_guest_image_id;
 use crate::precomputed::EMPTY_TRIE_NODES;
 use crate::replay::ReplayResult;
-use crate::trace::{serializable_frontier_into_trace_frontier, SerializableFrontier, TraceTree};
+use crate::trace::{
+    serializable_frontier_into_trace_frontier, SerializableFrontier, TraceTree,
+};
 use crate::{TRANSITION_GUEST_ELF, TRANSITION_GUEST_ID};
 
 type RecordedStepIo = HashMap<
@@ -28,8 +30,10 @@ type RecordedStepIo = HashMap<
     (
         Option<Vec<u8>>,
         Option<Vec<u8>>,
+        Option<FnInput>,
+        Option<FnInput>,
         ExternalInput,
-        Option<InternalStoreWriteWitness>,
+        Option<InternalStoreWitness>,
     ),
 >;
 
@@ -40,10 +44,16 @@ fn build_transition_input(
     replayed_results: &HashMap<StepRecord, ReplayResult>,
     authorization_journal: &AuthorizationJournal,
 ) -> TransitionInput {
-    let (input_witness, output_witness, external_input, internal_store_witness) = recorded_step_io
-        .get(step_record)
-        .cloned()
-        .unwrap_or_else(|| panic!("Missing recorded I/O for transition step {:?}", step_record));
+    let (
+        input_witness,
+        output_witness,
+        input_source_witness,
+        sequence_scope_witness,
+        external_input,
+        internal_store_witness,
+    ) = recorded_step_io.get(step_record).cloned().unwrap_or_else(|| {
+        panic!("Missing recorded I/O for transition step {:?}", step_record)
+    });
 
     match step_record {
         StepRecord::TileExec(_) => {
@@ -60,6 +70,8 @@ fn build_transition_input(
                 replay_image_id: Some(replay_result.image_id.clone()),
                 input_witness,
                 output_witness,
+                input_source_witness,
+                sequence_scope_witness,
                 external_input,
                 internal_store_witness,
                 authorization_journal: authorization_journal.clone(),
@@ -72,6 +84,8 @@ fn build_transition_input(
             replay_image_id: None,
             input_witness,
             output_witness,
+            input_source_witness,
+            sequence_scope_witness,
             external_input,
             internal_store_witness,
             authorization_journal: authorization_journal.clone(),
@@ -95,12 +109,12 @@ fn empty_internal_store_frontier() -> SerializableFrontier {
     }
 }
 
-fn empty_internal_store_root() -> Vec<u8> {
-    let frontier = serializable_frontier_into_trace_frontier(empty_internal_store_frontier())
-        .expect("empty internal store frontier should deserialize");
+fn internal_store_root(frontier: &SerializableFrontier) -> Vec<u8> {
+    let frontier = serializable_frontier_into_trace_frontier(frontier.clone())
+        .expect("internal store frontier should deserialize");
     TraceTree::from_frontier(1, frontier)
         .root(0)
-        .expect("empty internal store root should exist")
+        .expect("internal store root should exist")
         .0
 }
 
@@ -122,6 +136,8 @@ fn empty_internal_store_root() -> Vec<u8> {
 /// A `TransitionReplayResult` with details about success or failure
 pub fn step_transitions(
     initial_frontier: &SerializableFrontier,
+    initial_internal_store_frontier: &SerializableFrontier,
+    initial_internal_store_index_root: &[u8],
     trace_window: &[StepRecord],
     fingerprint: Fingerprint,
     cfs: &ControlFlowSchema,
@@ -137,8 +153,9 @@ pub fn step_transitions(
 
     let init_transition = InitTransition {
         init_frontier: initial_frontier.clone(),
-        init_internal_store_frontier: empty_internal_store_frontier(),
-        init_internal_store_root: empty_internal_store_root(),
+        init_internal_store_frontier: initial_internal_store_frontier.clone(),
+        init_internal_store_root: internal_store_root(initial_internal_store_frontier),
+        init_internal_store_index_root: initial_internal_store_index_root.to_vec(),
         fingerprint,
     };
 
@@ -205,11 +222,13 @@ pub fn step_transitions(
 mod tests {
     use super::*;
     use crate::authorization::authorize_external_inputs;
+    use crate::precomputed::EMPTY_TRIE_NODES;
+    use raster_core::coordinate_index::coordinate_index_root;
     use raster_core::authorization::{AuthorizationJournal, ManifestedInputs};
     use raster_core::cfs::{CfsCoordinates, ControlFlowSchema, SequenceDef};
     use raster_core::fingerprint::{BitPacker, Fingerprint};
     use raster_core::trace::{
-        ExternalData, SequenceEndRecord, SequenceStartRecord, TileExecRecord,
+        ExternalData, FnInput, SequenceEndRecord, SequenceStartRecord, TileExecRecord,
     };
     use sha2::{Digest, Sha256};
 
@@ -241,10 +260,13 @@ mod tests {
             coordinates: CfsCoordinates(coordinates),
             intra_sequence_index: 0,
             input_commitment: vec![exec_index as u8],
+            input_source_commitment: Vec::new(),
             external_input_commitment: Vec::new(),
             output_commitment: vec![exec_index as u8 + 1],
             internal_store_root_before: EMPTY_TRIE_NODES[0].to_vec(),
             internal_store_root_after: EMPTY_TRIE_NODES[0].to_vec(),
+            internal_store_index_root_before: Vec::new(),
+            internal_store_index_root_after: Vec::new(),
         })
     }
 
@@ -273,6 +295,16 @@ mod tests {
         }
     }
 
+    fn empty_input_source_witness() -> FnInput {
+        FnInput {
+            data: Vec::new(),
+            values: Vec::new(),
+            args: Vec::new(),
+            external: ExternalInput::new(),
+            internal: Default::default(),
+        }
+    }
+
     #[test]
     fn build_transition_input_uses_step_record_key_for_repeated_tiles() {
         let first_step = make_tile_step(1, vec![0]);
@@ -281,13 +313,22 @@ mod tests {
         let recorded_step_io = HashMap::from([
             (
                 first_step.clone(),
-                (Some(vec![1]), Some(vec![11]), ExternalInput::new(), None),
+                (
+                    Some(vec![1]),
+                    Some(vec![11]),
+                    None,
+                    None,
+                    ExternalInput::new(),
+                    None,
+                ),
             ),
             (
                 second_step.clone(),
                 (
                     Some(vec![2]),
                     Some(vec![22]),
+                    None,
+                    None,
                     make_external_input(
                         "personal_data",
                         b"239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5",
@@ -350,6 +391,8 @@ mod tests {
             (
                 Some(vec![9]),
                 Some(error_output.clone()),
+                None,
+                None,
                 ExternalInput::new(),
                 None,
             ),
@@ -385,6 +428,7 @@ mod tests {
             sequence_id: "main".to_string(),
             coordinates: CfsCoordinates(vec![]),
             input_commitment: vec![1; 32],
+            input_source_commitment: Vec::new(),
             external_input_commitment: external_input_commitment(&ExternalInput::new()),
         });
         let sequence_end = StepRecord::SequenceEnd(SequenceEndRecord {
@@ -396,11 +440,11 @@ mod tests {
         let recorded_step_io = HashMap::from([
             (
                 sequence_start.clone(),
-                (Some(vec![3, 4]), None, ExternalInput::new(), None),
+                (Some(vec![3, 4]), None, None, None, ExternalInput::new(), None),
             ),
             (
                 sequence_end.clone(),
-                (None, Some(vec![5, 6]), ExternalInput::new(), None),
+                (None, Some(vec![5, 6]), None, None, ExternalInput::new(), None),
             ),
         ]);
 
@@ -467,6 +511,10 @@ mod tests {
             sequence_id: "main".to_string(),
             coordinates: CfsCoordinates(vec![]),
             input_commitment: Sha256::digest(b"sequence-in").to_vec(),
+            input_source_commitment: Sha256::digest(
+                empty_input_source_witness().source_witness_bytes(),
+            )
+            .to_vec(),
             external_input_commitment: external_input_commitment(&external_input),
         })
     }
@@ -482,6 +530,8 @@ mod tests {
             replay_image_id: None,
             input_witness: Some(b"sequence-in".to_vec()),
             output_witness: None,
+            input_source_witness: Some(empty_input_source_witness()),
+            sequence_scope_witness: None,
             external_input: ExternalInput::new(),
             internal_store_witness: None,
             authorization_journal: authorization,
@@ -489,8 +539,9 @@ mod tests {
         };
         let state = TransitionState::Init(InitTransition {
             init_frontier: make_init_frontier(),
-            init_internal_store_frontier: empty_internal_store_frontier(),
-            init_internal_store_root: empty_internal_store_root(),
+            init_internal_store_frontier: make_init_frontier(),
+            init_internal_store_root: internal_store_root(&make_init_frontier()),
+            init_internal_store_index_root: coordinate_index_root(&std::collections::BTreeMap::new()),
             fingerprint: Fingerprint::from(vec![0], BitPacker::new(64), 1),
         });
 

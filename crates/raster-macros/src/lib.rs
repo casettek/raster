@@ -155,7 +155,7 @@ fn gen_sequence_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream 
     } else {
         quote! {
             let __raster_input_bytes = ::raster::core::postcard::to_allocvec(
-                &::raster::alloc::vec![#(#trace_values),*]
+                &::raster::alloc::vec![#(#trace_values.clone()),*]
             ).unwrap_or_default();
         }
     };
@@ -209,6 +209,7 @@ fn gen_sequence_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream 
         let __raster_input = ::core::option::Option::Some(
             ::raster::core::trace::FnInput {
                 data: __raster_input_bytes,
+                values: ::raster::alloc::vec![#(#trace_values.clone()),*],
                 args: __raster_input_args,
                 external: __raster_external,
                 internal: __raster_internal,
@@ -374,6 +375,27 @@ fn gen_output_serialization() -> proc_macro2::TokenStream {
 fn gen_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream {
     let params = extract_params(input);
 
+    let trace_value_defs: Vec<_> = params
+        .iter()
+        .map(|param| {
+            let name = &param.ident;
+            let trace_value_ident = format_ident!("__raster_input_value_{}", name);
+            let external_info_ident = external_info_ident(param);
+            let internal_info_ident = internal_info_ident(param);
+            quote! {
+                let #trace_value_ident = if #external_info_ident.is_some() {
+                    ::raster::core::trace::FnInputValue::ExternalBinding
+                } else if #internal_info_ident.is_some() {
+                    ::raster::core::trace::FnInputValue::InternalBinding
+                } else {
+                    ::raster::core::trace::FnInputValue::Inline(
+                        ::raster::core::postcard::to_allocvec(&#name).unwrap_or_default()
+                    )
+                };
+            }
+        })
+        .collect();
+
     let input_arg_defs: Vec<_> = params
         .iter()
         .map(|param| {
@@ -387,6 +409,15 @@ fn gen_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream {
                     ty: ::raster::alloc::string::String::from(#ty_str),
                 }
             }
+        })
+        .collect();
+
+    let trace_values: Vec<_> = params
+        .iter()
+        .map(|param| {
+            let name = &param.ident;
+            let trace_value_ident = format_ident!("__raster_input_value_{}", name);
+            quote! { #trace_value_ident }
         })
         .collect();
 
@@ -425,9 +456,8 @@ fn gen_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream {
                     __raster_internal.insert(
                         ::raster::alloc::string::String::from(#name_str),
                         ::raster::core::trace::InternalData {
-                            write_index: __raster_internal_info.reference.write_index,
+                            coordinates: __raster_internal_info.reference.coordinates,
                             commitment: __raster_internal_info.reference.commitment,
-                            store_root: __raster_internal_info.store_root,
                         }
                     );
                 }
@@ -461,6 +491,8 @@ fn gen_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream {
     };
 
     quote! {
+        #(#trace_value_defs)*
+
         let __raster_input_args: ::raster::alloc::vec::Vec<::raster::core::trace::FnInputArg> = ::raster::alloc::vec![
             #(#input_arg_defs),*
         ];
@@ -475,6 +507,7 @@ fn gen_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream {
         let __raster_input = ::core::option::Option::Some(
             ::raster::core::trace::FnInput {
                 data: __raster_input_bytes,
+                values: ::raster::alloc::vec![#(#trace_values),*],
                 args: __raster_input_args,
                 external: __raster_external,
                 internal: __raster_internal,

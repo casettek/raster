@@ -15,8 +15,7 @@ pub use input::{
 };
 pub use internal_storage::{
     global_internal_store_snapshot, resolve_internal_value, store_internal_value,
-    internal_write_witness, InternalStorageManager, InternalStoreSnapshot, InternalWriteRecord,
-    StoredInternalObject,
+    InternalStorageManager, InternalStoreSnapshot, InternalWriteRecord, StoredInternalObject,
 };
 pub use tracing::{
     commitment::Sha256Commitment,

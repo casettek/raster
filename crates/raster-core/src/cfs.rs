@@ -13,7 +13,7 @@ use std::vec::Vec;
 
 pub type CfsCoordinate = u32;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CfsCoordinates(pub Vec<CfsCoordinate>);
 
 impl CfsCoordinates {
@@ -453,14 +453,21 @@ pub struct TileItem {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct InputBinding {
-    pub source: InputSource,
+pub enum InputBinding {
+    Direct(InputSource),
+    SequenceScope {
+        input_index: usize,
+    },
+    ProducerOutput {
+        item_index: usize,
+        output_index: usize,
+    },
 }
 
 impl InputBinding {
-    /// Create a binding from an input source.
+    /// Create a binding from a direct semantic source.
     pub fn new(source: InputSource) -> Self {
-        Self { source }
+        Self::Direct(source)
     }
 
     /// Create an external input binding.
@@ -473,29 +480,34 @@ impl InputBinding {
         Self::new(InputSource::Inline)
     }
 
-    /// Create a sequence input binding.
-    pub fn seq_input(input_index: usize) -> Self {
-        Self::new(InputSource::SeqInput { input_index })
+    /// Create a direct internal input binding.
+    pub fn internal() -> Self {
+        Self::new(InputSource::Internal)
     }
 
-    /// Create an item output binding.
+    /// Create a sequence-scope binding.
+    pub fn seq_input(input_index: usize) -> Self {
+        Self::SequenceScope { input_index }
+    }
+
+    /// Create a producer-output binding.
     pub fn item_output(item_index: usize, output_index: usize) -> Self {
-        Self::new(InputSource::ItemOutput {
+        Self::ProducerOutput {
             item_index,
             output_index,
-        })
+        }
     }
 
     /// Create an internal-store binding sourced from a prior item's committed output.
     pub fn internal_store(item_index: usize, output_index: usize) -> Self {
-        Self::new(InputSource::InternalStore {
+        Self::ProducerOutput {
             item_index,
             output_index,
-        })
+        }
     }
 }
 
-/// Source of an input value in the data flow schema.
+/// Semantic source of an input value in the data flow schema.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum InputSource {
     /// Input comes from outside the sequence (runtime-provided).
@@ -504,25 +516,6 @@ pub enum InputSource {
     /// Input is materialized inline in the sequence body.
     Inline,
 
-    /// Input comes from one of the sequence's declared inputs.
-    SeqInput {
-        /// Index of the sequence input (0-based).
-        input_index: usize,
-    },
-
-    /// Input comes from a previous item's output.
-    ItemOutput {
-        /// Index of the item in the sequence (0-based).
-        item_index: usize,
-        /// Index of the output from that item (0-based).
-        output_index: usize,
-    },
-
-    /// Input is sourced from the internal store entry produced by a prior item.
-    InternalStore {
-        /// Index of the producer item in the sequence (0-based).
-        item_index: usize,
-        /// Index of the output from that item (0-based).
-        output_index: usize,
-    },
+    /// Input is resolved from internal storage.
+    Internal,
 }

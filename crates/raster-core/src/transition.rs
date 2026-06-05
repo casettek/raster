@@ -10,7 +10,7 @@ use std::vec::Vec;
 use crate::authorization::AuthorizationJournal;
 use crate::cfs::CfsCoordinates;
 use crate::fingerprint::{Fingerprint, FingerprintAccumulator};
-use crate::trace::{ExternalInput, StepRecord};
+use crate::trace::{ExternalInput, FnInput, StepRecord};
 
 /// Serializable representation of a Merkle frontier (position, leaf, ommers).
 ///
@@ -42,9 +42,60 @@ pub struct StepRecordWitness {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct InternalStoreWriteWitness {
-    pub write_index: u64,
+pub struct InternalStoreEntry {
+    pub coordinates: CfsCoordinates,
     pub object_commitment: Vec<u8>,
+}
+
+impl InternalStoreEntry {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        postcard::to_allocvec(self).unwrap_or_default()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InternalStoreIndexValue {
+    pub log_position: u64,
+    pub object_commitment: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CoordinateIndexMembershipProof {
+    pub coordinates: CfsCoordinates,
+    pub value: InternalStoreIndexValue,
+    pub siblings: Vec<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CoordinateIndexNonMembershipProof {
+    pub coordinates: CfsCoordinates,
+    pub siblings: Vec<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InternalStoreLogWitness {
+    pub position: u64,
+    pub path_elems: Vec<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InternalStoreReadWitness {
+    pub entry: InternalStoreEntry,
+    pub log_witness: InternalStoreLogWitness,
+    pub index_witness: CoordinateIndexMembershipProof,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InternalStoreWriteWitness {
+    pub entry: InternalStoreEntry,
+    pub index_non_membership_witness: CoordinateIndexNonMembershipProof,
+    pub index_membership_witness: CoordinateIndexMembershipProof,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InternalStoreWitness {
+    pub reads: Vec<InternalStoreReadWitness>,
+    pub write: Option<InternalStoreWriteWitness>,
 }
 
 /// Input for a single transition step (passed into the transition guest).
@@ -55,8 +106,10 @@ pub struct TransitionInput {
 
     pub input_witness: Option<Vec<u8>>,
     pub output_witness: Option<Vec<u8>>,
+    pub input_source_witness: Option<FnInput>,
+    pub sequence_scope_witness: Option<FnInput>,
     pub external_input: ExternalInput,
-    pub internal_store_witness: Option<InternalStoreWriteWitness>,
+    pub internal_store_witness: Option<InternalStoreWitness>,
 
     pub input_sources_witnesses: HashMap<StepRecord, Vec<u8>>,
 
@@ -70,6 +123,7 @@ pub struct Transition {
     pub frontier: SerializableFrontier,
     pub internal_store_frontier: SerializableFrontier,
     pub internal_store_root: Vec<u8>,
+    pub internal_store_index_root: Vec<u8>,
     pub actual_fingerprint_acc: FingerprintAccumulator,
     pub next_expected_coordinates: Vec<CfsCoordinates>,
 }
@@ -80,6 +134,7 @@ pub struct InitTransition {
     pub init_frontier: SerializableFrontier,
     pub init_internal_store_frontier: SerializableFrontier,
     pub init_internal_store_root: Vec<u8>,
+    pub init_internal_store_index_root: Vec<u8>,
     pub fingerprint: Fingerprint,
 }
 

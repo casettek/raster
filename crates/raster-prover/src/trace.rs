@@ -315,7 +315,7 @@ fn resolve_inputs_sources(
 ) -> Vec<(usize, StepRecord)> {
     if step_inputs
         .iter()
-        .all(|input| matches!(input.source, InputSource::External | InputSource::Inline))
+        .all(|input| matches!(input, InputBinding::Direct(InputSource::External | InputSource::Inline)))
     {
         return Vec::new();
     }
@@ -347,9 +347,12 @@ fn resolve_inputs_sources(
     let mut source_records = Vec::new();
 
     for step_input in step_inputs {
-        match &step_input.source {
-            InputSource::External | InputSource::Inline => {}
-            InputSource::SeqInput { input_index } => {
+        match step_input {
+            InputBinding::Direct(InputSource::External | InputSource::Inline) => {}
+            InputBinding::Direct(InputSource::Internal) => {
+                panic!("Direct internal bindings are not yet supported in trace source resolution");
+            }
+            InputBinding::SequenceScope { input_index } => {
                 let (parent_index, source_record) = current_sequence_trace_suffix
                     .first()
                     .cloned()
@@ -373,11 +376,7 @@ fn resolve_inputs_sources(
 
                 source_records.push((parent_index, source_record));
             }
-            InputSource::ItemOutput {
-                item_index,
-                output_index,
-            }
-            | InputSource::InternalStore {
+            InputBinding::ProducerOutput {
                 item_index,
                 output_index,
             } => {
@@ -659,11 +658,13 @@ mod tests {
             coordinates: CfsCoordinates(coordinates),
             tile_id: fn_name.to_string(),
             input_commitment: Vec::new(),
+            input_source_commitment: Vec::new(),
             external_input_commitment: Vec::new(),
             output_commitment: output.to_le_bytes().to_vec(),
             internal_store_root_before: Vec::new(),
             internal_store_root_after: Vec::new(),
-            internal_write_commitment: Vec::new(),
+            internal_store_index_root_before: Vec::new(),
+            internal_store_index_root_after: Vec::new(),
         })
     }
 
@@ -678,6 +679,7 @@ mod tests {
             sequence_id: sequence_id.to_string(),
             coordinates: CfsCoordinates(coordinates),
             input_commitment: Vec::new(),
+            input_source_commitment: Vec::new(),
             external_input_commitment: Vec::new(),
         })
     }
@@ -745,6 +747,34 @@ mod tests {
         main.items.push(SequenceChildItem::Tile(TileItem {
             id: "tail".to_string(),
             sources: vec![InputBinding::external()],
+        }));
+
+        let mut inner = SequenceDef::new("inner");
+        inner.input_sources = vec![InputBinding::external()];
+        inner.items.push(SequenceChildItem::Tile(TileItem {
+            id: "inner_tile".to_string(),
+            sources: vec![InputBinding::external()],
+        }));
+
+        cfs.sequences.push(main);
+        cfs.sequences.push(inner);
+        cfs
+    }
+
+    fn make_nested_sequence_output_dependency_cfs() -> ControlFlowSchema {
+        let mut cfs = ControlFlowSchema::new("test");
+        cfs.tiles.push(TileDef::iter("inner_tile", 1, 1));
+        cfs.tiles.push(TileDef::iter("tail", 1, 1));
+
+        let mut main = SequenceDef::new("main");
+        main.input_sources = vec![InputBinding::external()];
+        main.items.push(SequenceChildItem::Sequence(SequenceItem {
+            id: "inner".to_string(),
+            sources: vec![InputBinding::seq_input(0)],
+        }));
+        main.items.push(SequenceChildItem::Tile(TileItem {
+            id: "tail".to_string(),
+            sources: vec![InputBinding::item_output(0, 0)],
         }));
 
         let mut inner = SequenceDef::new("inner");
@@ -951,6 +981,25 @@ mod tests {
         ]);
         let trace_commitment = TraceCommitment::from(&trace, &precomputed::EMPTY_TRIE_NODES[0]);
         let cfs = make_sequence_input_dependency_cfs();
+        let mut trace_verifier =
+            TraceVerifier::new(trace_commitment, &precomputed::EMPTY_TRIE_NODES[0], &cfs);
+
+        let verification_result = trace_verifier.verify(&trace);
+        assert!(matches!(verification_result, VerificationResult::Ok));
+    }
+
+    #[test]
+    fn test_verify_trace_returns_ok_for_nested_sequence_output_dependency() {
+        let trace = Trace(vec![
+            make_sequence_start_record(1, "main", vec![], 1),
+            make_sequence_start_record(2, "inner", vec![0], 1),
+            make_tile_trace_item_at(3, "inner", 0, vec![0, 0], "inner_tile".to_string(), 1, 10),
+            make_sequence_end_record(4, "inner", vec![0]),
+            make_tile_trace_item_at(5, "main", 1, vec![1], "tail".to_string(), 1, 20),
+            make_sequence_end_record(6, "main", vec![]),
+        ]);
+        let trace_commitment = TraceCommitment::from(&trace, &precomputed::EMPTY_TRIE_NODES[0]);
+        let cfs = make_nested_sequence_output_dependency_cfs();
         let mut trace_verifier =
             TraceVerifier::new(trace_commitment, &precomputed::EMPTY_TRIE_NODES[0], &cfs);
 

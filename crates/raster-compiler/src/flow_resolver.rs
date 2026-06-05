@@ -3,7 +3,7 @@
 //! This module resolves how data flows between tiles in a sequence by tracking
 //! variable bindings and mapping them to `InputSource` references.
 
-use raster_core::cfs::{InputBinding, InputSource, SequenceChildItem, SequenceItem, TileItem};
+use raster_core::cfs::{InputBinding, SequenceChildItem, SequenceItem, TileItem};
 use std::collections::HashMap;
 
 use crate::ast::{CallArgumentKind, CallInfo, CallKind};
@@ -137,6 +137,7 @@ mod tests {
     use crate::sequence::SequenceStep;
     use crate::tile::Tile;
     use crate::Project;
+    use raster_core::cfs::InputSource;
     use std::collections::HashMap;
     use std::path::PathBuf;
 
@@ -269,9 +270,9 @@ mod tests {
             SequenceChildItem::Tile(tile_item) => {
                 assert_eq!(tile_item.id, "greet");
                 assert_eq!(tile_item.sources.len(), 1);
-                match &tile_item.sources[0].source {
-                    InputSource::SeqInput { input_index } => assert_eq!(*input_index, 0),
-                    _ => panic!("Expected SeqInput"),
+                match &tile_item.sources[0] {
+                    InputBinding::SequenceScope { input_index } => assert_eq!(*input_index, 0),
+                    _ => panic!("Expected SequenceScope"),
                 }
             }
             _ => panic!("Expected Tile item"),
@@ -282,15 +283,15 @@ mod tests {
             SequenceChildItem::Tile(tile_item) => {
                 assert_eq!(tile_item.id, "exclaim");
                 assert_eq!(tile_item.sources.len(), 1);
-                match &tile_item.sources[0].source {
-                    InputSource::InternalStore {
+                match &tile_item.sources[0] {
+                    InputBinding::ProducerOutput {
                         item_index,
                         output_index,
                     } => {
                         assert_eq!(*item_index, 0);
                         assert_eq!(*output_index, 0);
                     }
-                    _ => panic!("Expected InternalStore"),
+                    _ => panic!("Expected ProducerOutput"),
                 }
             }
             _ => panic!("Expected Tile item"),
@@ -339,8 +340,8 @@ mod tests {
         let items = resolver.resolve(&sequence);
 
         match &items[0] {
-            SequenceChildItem::Tile(tile_item) => match &tile_item.sources[0].source {
-                InputSource::Inline => {}
+            SequenceChildItem::Tile(tile_item) => match &tile_item.sources[0] {
+                InputBinding::Direct(InputSource::Inline) => {}
                 other => panic!("Expected Inline source, got {:?}", other),
             },
             _ => panic!("Expected Tile item"),

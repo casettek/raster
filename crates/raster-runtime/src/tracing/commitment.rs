@@ -27,6 +27,12 @@ impl From<[u8; 32]> for Sha256Commitment {
     }
 }
 
+impl From<&[u8]> for Sha256Commitment {
+    fn from(bytes: &[u8]) -> Self {
+        Sha256Commitment(Sha256::digest(bytes).into())
+    }
+}
+
 impl From<Sha256Commitment> for Vec<u8> {
     fn from(commitment: Sha256Commitment) -> Vec<u8> {
         commitment.0.to_vec()
@@ -35,12 +41,12 @@ impl From<Sha256Commitment> for Vec<u8> {
 
 impl From<&FnInput> for Sha256Commitment {
     fn from(input: &FnInput) -> Self {
-        Sha256Commitment(Sha256::digest(input.data()).into())
+        Sha256Commitment::from(input.data())
     }
 }
 
 impl From<&FnOutput> for Sha256Commitment {
     fn from(output: &FnOutput) -> Self {
-        Sha256Commitment(Sha256::digest(output.data()).into())
+        Sha256Commitment::from(output.data())
     }
 }

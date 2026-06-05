@@ -499,9 +499,8 @@ where
                 FnInputValue::InternalBinding,
                 None,
                 Some(TraceInternalData {
-                    write_index: resolved.reference.write_index,
+                    coordinates: resolved.reference.coordinates,
                     commitment: resolved.reference.commitment,
-                    store_root: resolved.store_root,
                 }),
             ))
         }

@@ -23,6 +23,7 @@ pub struct FnInputArg {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct FnInput {
     pub data: Vec<u8>,
+    pub values: Vec<FnInputValue>,
     pub args: Vec<FnInputArg>,
     pub external: ExternalInput,
     pub internal: InternalInput,
@@ -43,9 +44,8 @@ pub struct ExternalData {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct InternalData {
-    pub write_index: u64,
+    pub coordinates: CfsCoordinates,
     pub commitment: Vec<u8>,
-    pub store_root: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -64,12 +64,21 @@ impl FnInput {
         &self.args
     }
 
+    pub fn values(&self) -> &[FnInputValue] {
+        &self.values
+    }
+
     pub fn external(&self) -> &ExternalInput {
         &self.external
     }
 
     pub fn internal(&self) -> &InternalInput {
         &self.internal
+    }
+
+    pub fn source_witness_bytes(&self) -> Vec<u8> {
+        postcard::to_allocvec(&(self.values.clone(), self.external.clone(), self.internal.clone()))
+            .unwrap_or_default()
     }
 }
 
@@ -129,12 +138,14 @@ pub struct TileExecRecord {
     pub coordinates: CfsCoordinates,
 
     pub input_commitment: Vec<u8>,
+    pub input_source_commitment: Vec<u8>,
     pub output_commitment: Vec<u8>,
 
     pub external_input_commitment: Vec<u8>,
     pub internal_store_root_before: Vec<u8>,
     pub internal_store_root_after: Vec<u8>,
-    pub internal_write_commitment: Vec<u8>,
+    pub internal_store_index_root_before: Vec<u8>,
+    pub internal_store_index_root_after: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -146,6 +157,7 @@ pub struct SequenceStartRecord {
     pub coordinates: CfsCoordinates,
 
     pub input_commitment: Vec<u8>,
+    pub input_source_commitment: Vec<u8>,
     pub external_input_commitment: Vec<u8>,
 }
 

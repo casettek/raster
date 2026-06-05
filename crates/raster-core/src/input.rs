@@ -6,6 +6,8 @@ use alloc::vec::Vec;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::cfs::CfsCoordinates;
+
 #[cfg(feature = "std")]
 use std::collections::BTreeMap;
 
@@ -36,14 +38,14 @@ impl ExternalRef {
 /// A lightweight reference to an immutable internal store object.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct InternalRef {
-    pub write_index: u64,
+    pub coordinates: CfsCoordinates,
     pub commitment: Vec<u8>,
 }
 
 impl InternalRef {
-    pub fn new(write_index: u64, commitment: Vec<u8>) -> Self {
+    pub fn new(coordinates: CfsCoordinates, commitment: Vec<u8>) -> Self {
         Self {
-            write_index,
+            coordinates,
             commitment,
         }
     }
@@ -604,7 +606,6 @@ impl<T> ExternalArg<T> {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct InternalArg<T> {
     pub reference: InternalRef,
-    pub store_root: Vec<u8>,
     pub bytes: Vec<u8>,
     pub value: T,
 }
@@ -612,13 +613,11 @@ pub struct InternalArg<T> {
 impl<T> InternalArg<T> {
     pub fn new(
         reference: InternalRef,
-        store_root: Vec<u8>,
         bytes: Vec<u8>,
         value: T,
     ) -> Self {
         Self {
             reference,
-            store_root,
             bytes,
             value,
         }

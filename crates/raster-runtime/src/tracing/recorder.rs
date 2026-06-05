@@ -1,6 +1,7 @@
 use raster_core::cfs::{CfsCoordinates, CfsCursor, ControlFlowSchema, SequenceChildId};
 use raster_core::trace::{
-    ExternalInput, SequenceEndRecord, SequenceStartRecord, StepRecord, TileExecRecord, TraceEvent,
+    ExternalInput, FnInput, InternalInput, SequenceEndRecord, SequenceStartRecord, StepRecord,
+    TileExecRecord, TraceEvent,
 };
 use sha2::{Digest, Sha256};
 
@@ -75,8 +76,10 @@ impl SequenceCallstack {
 #[derive(Debug, Clone)]
 pub struct StepWitnessData {
     input_data: Option<Vec<u8>>,
+    input_source_witness: Option<FnInput>,
     output_data: Option<Vec<u8>>,
     external_input: ExternalInput,
+    internal_input: InternalInput,
     internal_write: Option<InternalWriteRecord>,
 }
 
@@ -89,8 +92,16 @@ impl StepWitnessData {
         self.output_data.clone()
     }
 
+    pub fn input_source_witness(&self) -> Option<FnInput> {
+        self.input_source_witness.clone()
+    }
+
     pub fn external_input(&self) -> ExternalInput {
         self.external_input.clone()
+    }
+
+    pub fn internal_input(&self) -> InternalInput {
+        self.internal_input.clone()
     }
 
     pub fn internal_write(&self) -> Option<InternalWriteRecord> {
@@ -118,11 +129,17 @@ impl StepWitnessStore {
                     coordinates,
                     StepWitnessData {
                         input_data: trace_item.input.as_ref().map(|input| input.data().to_vec()),
+                        input_source_witness: trace_item.input.clone(),
                         output_data: None,
                         external_input: trace_item
                             .input
                             .as_ref()
                             .map(|input| input.external().clone())
+                            .unwrap_or_default(),
+                        internal_input: trace_item
+                            .input
+                            .as_ref()
+                            .map(|input| input.internal().clone())
                             .unwrap_or_default(),
                         internal_write,
                     },
@@ -143,6 +160,7 @@ impl StepWitnessStore {
                     coordinates,
                     StepWitnessData {
                         input_data: trace_item.input.as_ref().map(|input| input.data().to_vec()),
+                        input_source_witness: trace_item.input.clone(),
                         output_data: trace_item
                             .output
                             .as_ref()
@@ -151,6 +169,11 @@ impl StepWitnessStore {
                             .input
                             .as_ref()
                             .map(|input| input.external().clone())
+                            .unwrap_or_default(),
+                        internal_input: trace_item
+                            .input
+                            .as_ref()
+                            .map(|input| input.internal().clone())
                             .unwrap_or_default(),
                         internal_write,
                     },
@@ -167,6 +190,10 @@ impl StepWitnessStore {
 fn external_input_commitment(external_input: &ExternalInput) -> Vec<u8> {
     let bytes = raster_core::postcard::to_allocvec(external_input).unwrap_or_default();
     Sha256::digest(bytes).to_vec()
+}
+
+fn input_source_commitment(input: &FnInput) -> Vec<u8> {
+    Sha256::digest(input.source_witness_bytes()).to_vec()
 }
 
 #[derive(Debug, Clone)]
@@ -205,6 +232,10 @@ impl TraceRecorder {
         self.witness_store.get(coordinates).cloned()
     }
 
+    pub fn internal_store_snapshot(&self) -> crate::internal_storage::InternalStoreSnapshot {
+        self.internal_storage.snapshot()
+    }
+
     pub fn io_data_at(
         &self,
         coordinates: &CfsCoordinates,
@@ -238,12 +269,17 @@ impl TraceRecorder {
                     .as_ref()
                     .map(|input| external_input_commitment(input.external()))
                     .unwrap_or_default();
+                let input_source_commitment = input
+                    .as_ref()
+                    .map(input_source_commitment)
+                    .unwrap_or_default();
 
                 let record = SequenceStartRecord {
                     exec_index,
                     sequence_id: fn_call_record.fn_name.clone(),
                     coordinates: coordinates.clone(),
                     input_commitment,
+                    input_source_commitment,
                     external_input_commitment,
                 };
 
@@ -304,15 +340,22 @@ impl TraceRecorder {
                     .as_ref()
                     .map(|input| external_input_commitment(input.external()))
                     .unwrap_or_default();
+                let input_source_commitment = input
+                    .as_ref()
+                    .map(input_source_commitment)
+                    .unwrap_or_default();
 
                 let output = fn_call_record.output;
-                let output_commitment = output
-                    .as_ref()
-                    .map(|output| Sha256Commitment::from(output).into())
-                    .unwrap_or_default();
                 let internal_write = output
                     .as_ref()
-                    .map(|output| self.internal_storage.append_serialized_bytes(&output.data));
+                    .map(|output| {
+                        self.internal_storage
+                            .append_serialized_bytes(&output.data, tile_coordinates.clone())
+                    });
+                let output_commitment = internal_write
+                    .as_ref()
+                    .map(|write| write.entry.object_commitment.clone())
+                    .unwrap_or_default();
 
                 let record = TileExecRecord {
                     exec_index,
@@ -321,6 +364,7 @@ impl TraceRecorder {
                     intra_sequence_index: parent_current_index,
                     coordinates: tile_coordinates.clone(),
                     input_commitment,
+                    input_source_commitment,
                     output_commitment,
                     external_input_commitment,
                     internal_store_root_before: internal_write
@@ -331,10 +375,14 @@ impl TraceRecorder {
                         .as_ref()
                         .map(|write| write.store_root_after.clone())
                         .unwrap_or_else(|| self.internal_storage.snapshot().root),
-                    internal_write_commitment: internal_write
+                    internal_store_index_root_before: internal_write
                         .as_ref()
-                        .map(|write| write.object_commitment.clone())
-                        .unwrap_or_default(),
+                        .map(|write| write.index_root_before.clone())
+                        .unwrap_or_else(|| self.internal_storage.snapshot().index_root),
+                    internal_store_index_root_after: internal_write
+                        .as_ref()
+                        .map(|write| write.index_root_after.clone())
+                        .unwrap_or_else(|| self.internal_storage.snapshot().index_root),
                 };
 
                 self.witness_store

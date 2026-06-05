@@ -23,6 +23,8 @@ pub mod authorization;
 #[cfg(feature = "std")]
 pub mod cfs;
 #[cfg(feature = "std")]
+pub mod coordinate_index;
+#[cfg(feature = "std")]
 pub mod manifest;
 #[cfg(feature = "std")]
 pub mod schema;
