@@ -9,8 +9,8 @@ use raster_prover::trace::{
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
+use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::sync::{Mutex, OnceLock};
 use std::vec::Vec;
 
 use crate::Sha256Commitment;
@@ -176,28 +176,123 @@ impl Default for InternalStorageManager {
     }
 }
 
-static GLOBAL_INTERNAL_STORAGE: OnceLock<Mutex<InternalStorageManager>> = OnceLock::new();
+#[derive(Debug, Clone)]
+struct SequenceFrame {
+    coordinates: CfsCoordinates,
+    next_child_index: u32,
+}
 
-fn global_manager() -> &'static Mutex<InternalStorageManager> {
-    GLOBAL_INTERNAL_STORAGE.get_or_init(|| Mutex::new(InternalStorageManager::new()))
+#[derive(Debug, Default, Clone)]
+struct SequenceExecutionContext {
+    stack: Vec<SequenceFrame>,
+}
+
+impl SequenceExecutionContext {
+    fn enter_sequence(&mut self) {
+        let coordinates = if let Some(parent) = self.stack.last_mut() {
+            let mut coordinates = parent.coordinates.clone();
+            coordinates.push(parent.next_child_index);
+            parent.next_child_index += 1;
+            coordinates
+        } else {
+            CfsCoordinates::new()
+        };
+
+        self.stack.push(SequenceFrame {
+            coordinates,
+            next_child_index: 0,
+        });
+    }
+
+    fn exit_sequence(&mut self) {
+        self.stack
+            .pop()
+            .expect("Corrupted sequence execution context");
+    }
+
+    fn reserve_tile_coordinates(&mut self) -> Result<CfsCoordinates> {
+        let frame = self.stack.last_mut().ok_or_else(|| {
+            Error::Other("Internal-store writes require active sequence context".into())
+        })?;
+        let mut coordinates = frame.coordinates.clone();
+        coordinates.push(frame.next_child_index);
+        frame.next_child_index += 1;
+        Ok(coordinates)
+    }
+}
+
+std::thread_local! {
+    static THREAD_INTERNAL_STORAGE: RefCell<InternalStorageManager> =
+        RefCell::new(InternalStorageManager::new());
+    static THREAD_SEQUENCE_CONTEXT: RefCell<SequenceExecutionContext> =
+        RefCell::new(SequenceExecutionContext::default());
+}
+
+fn reset_thread_storage() {
+    THREAD_INTERNAL_STORAGE.with(|storage| {
+        *storage.borrow_mut() = InternalStorageManager::new();
+    });
+}
+
+pub fn enter_sequence_scope(_sequence_id: &str) {
+    THREAD_SEQUENCE_CONTEXT.with(|context| {
+        let mut context = context.borrow_mut();
+        if context.stack.is_empty() {
+            reset_thread_storage();
+        }
+        context.enter_sequence();
+    });
+}
+
+pub fn exit_sequence_scope() {
+    THREAD_SEQUENCE_CONTEXT.with(|context| {
+        context.borrow_mut().exit_sequence();
+    });
 }
 
 pub fn global_internal_store_snapshot() -> InternalStoreSnapshot {
-    global_manager().lock().unwrap().snapshot()
+    THREAD_INTERNAL_STORAGE.with(|storage| storage.borrow().snapshot())
 }
 
 pub fn store_internal_value<T: Serialize>(value: &T) -> Result<InternalRef> {
-    let _ = value;
-    Err(Error::Other(
-        "Standalone internal-store writes require execution coordinates".into(),
-    ))
+    let bytes = raster_core::postcard::to_allocvec(value).map_err(|error| {
+        Error::Serialization(format!(
+            "Failed to serialize internal store object for current sequence step: {}",
+            error
+        ))
+    })?;
+    let coordinates =
+        THREAD_SEQUENCE_CONTEXT.with(|context| context.borrow_mut().reserve_tile_coordinates())?;
+    THREAD_INTERNAL_STORAGE.with(|storage| {
+        let write = storage
+            .borrow_mut()
+            .append_serialized_bytes(&bytes, coordinates.clone());
+        Ok(InternalRef::new(coordinates, write.entry.object_commitment))
+    })
 }
 
 pub fn resolve_internal_value<T: DeserializeOwned>(
     reference: &InternalRef,
 ) -> Result<InternalArg<T>> {
-    let manager = global_manager().lock().unwrap();
-    manager.resolve(reference)
+    THREAD_INTERNAL_STORAGE.with(|storage| storage.borrow().resolve(reference))
+}
+
+pub fn resolve_internal_ok_value<T: DeserializeOwned>(
+    reference: &InternalRef,
+) -> Result<InternalArg<T>> {
+    let resolved: InternalArg<std::result::Result<T, String>> = resolve_internal_value(reference)?;
+    let InternalArg {
+        reference,
+        bytes,
+        value,
+    } = resolved;
+    match value {
+        Ok(value) => Ok(InternalArg::new(reference, bytes, value)),
+        Err(error) => Err(Error::Other(format!(
+            "Stored tile result at coordinates {:?} resolved to error: {}",
+            reference.coordinates, error
+        ))),
+    }
 }
 
 #[cfg(test)]

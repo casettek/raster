@@ -19,9 +19,10 @@ pub struct TypedExternalBinding<Root> {
     marker: PhantomData<fn() -> Root>,
 }
 
-#[derive(Debug, PartialEq, Eq, Hash)]
+#[derive(Debug)]
 pub struct TypedInternalBinding<Root> {
     reference: InternalRef,
+    resolve: fn(InternalRef) -> raster_core::Result<InternalArg<Root>>,
     marker: PhantomData<fn() -> Root>,
 }
 
@@ -44,10 +45,26 @@ impl<Root> TypedExternalBinding<Root> {
     }
 }
 
-impl<Root> TypedInternalBinding<Root> {
+impl<Root> TypedInternalBinding<Root>
+where
+    Root: DeserializeOwned + Serialize,
+{
     pub fn new(reference: InternalRef) -> Self {
         Self {
             reference,
+            resolve: resolve_internal_value::<Root>,
+            marker: PhantomData,
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn with_resolver(
+        reference: InternalRef,
+        resolve: fn(InternalRef) -> raster_core::Result<InternalArg<Root>>,
+    ) -> Self {
+        Self {
+            reference,
+            resolve,
             marker: PhantomData,
         }
     }
@@ -78,8 +95,22 @@ pub fn typed_external<Root>(name: &str) -> TypedExternalBinding<Root> {
     TypedExternalBinding::new(name)
 }
 
-pub fn typed_internal<Root>(reference: InternalRef) -> TypedInternalBinding<Root> {
+pub fn typed_internal<Root>(reference: InternalRef) -> TypedInternalBinding<Root>
+where
+    Root: DeserializeOwned + Serialize,
+{
     TypedInternalBinding::new(reference)
+}
+
+#[doc(hidden)]
+pub fn typed_internal_with_resolver<Root>(
+    reference: InternalRef,
+    resolve: fn(InternalRef) -> raster_core::Result<InternalArg<Root>>,
+) -> TypedInternalBinding<Root>
+where
+    Root: DeserializeOwned + Serialize,
+{
+    TypedInternalBinding::with_resolver(reference, resolve)
 }
 
 pub fn typed_selector_path<Root, Selected>(
@@ -131,8 +162,23 @@ impl<Root> Clone for TypedInternalBinding<Root> {
     fn clone(&self) -> Self {
         Self {
             reference: self.reference.clone(),
+            resolve: self.resolve,
             marker: PhantomData,
         }
+    }
+}
+
+impl<Root> PartialEq for TypedInternalBinding<Root> {
+    fn eq(&self, other: &Self) -> bool {
+        self.reference == other.reference
+    }
+}
+
+impl<Root> Eq for TypedInternalBinding<Root> {}
+
+impl<Root> core::hash::Hash for TypedInternalBinding<Root> {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        self.reference.hash(state);
     }
 }
 
@@ -344,7 +390,7 @@ where
     fn into_sequence_arg(self) -> SequenceArg<Self::Root, Root> {
         SequenceArg::Internal(DeferredInternal {
             reference: self.reference,
-            resolve: resolve_internal_value::<Root>,
+            resolve: self.resolve,
             marker: PhantomData,
         })
     }
@@ -410,7 +456,7 @@ where
     Root: DeserializeOwned + Serialize,
 {
     fn into_resolved_arg(self) -> raster_core::Result<ResolvedArg<Root>> {
-        let value = resolve_internal_value::<Root>(self.reference)?;
+        let value = (self.resolve)(self.reference)?;
         Ok(ResolvedArg::internal(value))
     }
 }
@@ -562,9 +608,36 @@ pub fn resolve_internal_value<T: DeserializeOwned + Serialize>(
     }
 }
 
+pub fn resolve_internal_ok_value<T: DeserializeOwned + Serialize>(
+    reference: InternalRef,
+) -> raster_core::Result<raster_core::input::InternalArg<T>> {
+    #[cfg(feature = "std")]
+    {
+        return raster_runtime::resolve_internal_ok_value(&reference);
+    }
+
+    #[cfg(not(feature = "std"))]
+    {
+        let _ = reference;
+        Err(raster_core::Error::Other(alloc::format!(
+            "Result-backed internal input resolution requires the `std` feature"
+        )))
+    }
+}
+
 #[cfg(feature = "std")]
 pub fn store_internal_value<T: Serialize>(value: &T) -> raster_core::Result<InternalRef> {
     raster_runtime::store_internal_value(value)
+}
+
+pub fn materialize<T, A>(arg: A) -> T
+where
+    T: DeserializeOwned + Serialize,
+    A: IntoResolvedArg<T>,
+{
+    into_resolved_arg::<T, _>(arg)
+        .unwrap_or_else(|error| panic!("Failed to materialize Raster binding: {}", error))
+        .into_inner()
 }
 
 #[cfg(feature = "std")]

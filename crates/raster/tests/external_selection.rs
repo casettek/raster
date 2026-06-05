@@ -1,7 +1,7 @@
 use raster::core::trace::TraceEvent;
 use raster::prelude::*;
 use raster_core::postcard;
-use raster_runtime::{init_with, Publisher};
+use raster_runtime::{init_with, Publisher, Sha256Commitment};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, Once};
@@ -80,19 +80,19 @@ fn maybe_echo_name(name: String) -> Result<String> {
 
 #[sequence]
 fn echo_sequence(name: String) -> String {
-    call!(echo_name, name)
+    materialize!(String, call!(echo_name, name))
 }
 
 #[sequence]
 fn maybe_echo_sequence(name: String) -> Result<String> {
     let echoed = call!(maybe_echo_name, name)?;
-    Ok(echoed)
+    Ok(materialize!(String, echoed))
 }
 
 #[sequence]
 fn select_name_from_personal(personal: PersonalData) -> String {
     let name = select!(String, personal.name);
-    call!(echo_name, name)
+    materialize!(String, call!(echo_name, name))
 }
 
 #[sequence]
@@ -109,7 +109,7 @@ fn zero_arg_sequence() {
 fn traced_error_inner(name: String) -> Result<String> {
     let echoed = call!(echo_name, name);
     let _ = call!(maybe_echo_name, String::new())?;
-    Ok(echoed)
+    Ok(materialize!(String, echoed))
 }
 
 #[sequence]
@@ -117,6 +117,18 @@ fn traced_error_outer(name: String) -> Result<String> {
     let echoed = call!(echo_name, name);
     let inner = call_seq!(traced_error_inner, echoed)?;
     Ok(inner)
+}
+
+#[sequence]
+fn capture_echo_reference(name: String) -> InternalRef {
+    let echoed = call!(echo_name, name);
+    echoed.reference().clone()
+}
+
+#[sequence]
+fn capture_success_reference(name: String) -> Result<InternalRef> {
+    let echoed = call!(maybe_echo_name, name)?;
+    Ok(echoed.reference().clone())
 }
 
 #[test]
@@ -188,6 +200,66 @@ fn sequence_wrapper_preserves_user_result() {
     assert_eq!(
         maybe_echo_sequence(String::new()),
         Err(missing_name_error())
+    );
+}
+
+#[test]
+fn infallible_call_binding_uses_tile_output_commitment() {
+    let (reference, events) = capture_trace_events(|| capture_echo_reference("Raster".to_string()));
+    let tile_event = events
+        .into_iter()
+        .find(
+            |event| matches!(event, TraceEvent::TileExec(record) if record.fn_name == "echo_name"),
+        )
+        .expect("expected echo_name tile event");
+
+    let TraceEvent::TileExec(record) = tile_event else {
+        panic!("expected tile event");
+    };
+    let output = record.output.expect("tile output should be recorded");
+
+    assert_eq!(
+        reference.coordinates,
+        raster::core::cfs::CfsCoordinates(vec![0])
+    );
+    assert_eq!(
+        reference.commitment,
+        Into::<Vec<u8>>::into(Sha256Commitment::from(output.data.as_slice()))
+    );
+    assert_eq!(materialize!(String, internal!(String, reference)), "Raster");
+}
+
+#[test]
+fn fallible_call_binding_resolves_ok_payload_from_stored_result() {
+    let (reference, events) =
+        capture_trace_events(|| capture_success_reference("Raster".to_string()).unwrap());
+    let tile_event = events
+        .into_iter()
+        .find(
+            |event| matches!(event, TraceEvent::TileExec(record) if record.fn_name == "maybe_echo_name"),
+        )
+        .expect("expected maybe_echo_name tile event");
+
+    let TraceEvent::TileExec(record) = tile_event else {
+        panic!("expected tile event");
+    };
+    let output = record.output.expect("tile output should be recorded");
+    let decoded: raster::exec::Result<String> = postcard::from_bytes(&output.data).unwrap();
+
+    assert_eq!(decoded, Ok("Raster".to_string()));
+    assert_eq!(
+        reference.coordinates,
+        raster::core::cfs::CfsCoordinates(vec![0])
+    );
+    assert_eq!(
+        reference.commitment,
+        Into::<Vec<u8>>::into(Sha256Commitment::from(output.data.as_slice()))
+    );
+    assert_eq!(
+        raster::resolve_internal_ok_value::<String>(reference)
+            .unwrap()
+            .into_inner(),
+        "Raster"
     );
 }
 

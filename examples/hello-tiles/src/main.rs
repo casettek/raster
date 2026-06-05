@@ -1,5 +1,4 @@
 use raster::prelude::*;
-use serde::{Deserialize, Serialize};
 
 use hello_tiles::input::{Address, PersonalData};
 
@@ -19,6 +18,8 @@ fn personal_greet_seq(personal_data: PersonalData) -> Result<String> {
     let greet_address_line_result = call!(greet_address_line, address_line);
 
     let result = call!(concat_messages, name, greet_address_line_result);
+
+    let result = materialize!(String, result);
 
     debug!("personal_greet_seq result: {}", result);
 
@@ -51,7 +52,7 @@ fn wish_sequence(name: String) -> String {
 
 #[sequence]
 fn placeholder_sequence(placeholder: String) -> String {
-    call!(exclaim, placeholder)
+    materialize!(String, call!(exclaim, placeholder))
 }
 
 /// Entry point that runs the greet sequence natively.
@@ -78,7 +79,7 @@ fn main() {
 
     call!(personal_greet_with_seed, name, seed);
 
-    let personal_greet_seq_result =
+    let _personal_greet_seq_result =
         call_seq!(personal_greet_seq, personal_data_binding).expect("wrong personal data");
 
     call!(

@@ -532,6 +532,168 @@ fn gen_function_call(target_fn: &syn::Ident, input: &ItemFn) -> proc_macro2::Tok
     }
 }
 
+fn is_call_macro(expr_macro: &syn::ExprMacro) -> bool {
+    expr_macro.mac.path.is_ident("call")
+}
+
+fn rewrite_sequence_stmt(stmt: &mut syn::Stmt) {
+    match stmt {
+        syn::Stmt::Local(local) => {
+            if let Some(init) = &mut local.init {
+                rewrite_sequence_expr(&mut init.expr);
+                if let Some((_, diverge)) = &mut init.diverge {
+                    rewrite_sequence_expr(diverge);
+                }
+            }
+        }
+        syn::Stmt::Item(_) => {}
+        syn::Stmt::Macro(_) => {}
+        syn::Stmt::Expr(expr, _) => rewrite_sequence_expr(expr),
+    }
+}
+
+fn rewrite_sequence_block(block: &mut syn::Block) {
+    for stmt in block.stmts.iter_mut() {
+        rewrite_sequence_stmt(stmt);
+    }
+}
+
+fn rewrite_sequence_expr(expr: &mut Expr) {
+    match expr {
+        Expr::Array(expr_array) => {
+            for element in expr_array.elems.iter_mut() {
+                rewrite_sequence_expr(element);
+            }
+        }
+        Expr::Assign(expr_assign) => {
+            rewrite_sequence_expr(&mut expr_assign.left);
+            rewrite_sequence_expr(&mut expr_assign.right);
+        }
+        Expr::Async(expr_async) => rewrite_sequence_block(&mut expr_async.block),
+        Expr::Await(expr_await) => rewrite_sequence_expr(&mut expr_await.base),
+        Expr::Binary(expr_binary) => {
+            rewrite_sequence_expr(&mut expr_binary.left);
+            rewrite_sequence_expr(&mut expr_binary.right);
+        }
+        Expr::Block(expr_block) => rewrite_sequence_block(&mut expr_block.block),
+        Expr::Break(expr_break) => {
+            if let Some(value) = &mut expr_break.expr {
+                rewrite_sequence_expr(value);
+            }
+        }
+        Expr::Call(expr_call) => {
+            rewrite_sequence_expr(&mut expr_call.func);
+            for argument in expr_call.args.iter_mut() {
+                rewrite_sequence_expr(argument);
+            }
+        }
+        Expr::Cast(expr_cast) => rewrite_sequence_expr(&mut expr_cast.expr),
+        Expr::Closure(expr_closure) => rewrite_sequence_expr(&mut expr_closure.body),
+        Expr::Field(expr_field) => rewrite_sequence_expr(&mut expr_field.base),
+        Expr::ForLoop(expr_for_loop) => {
+            rewrite_sequence_expr(&mut expr_for_loop.expr);
+            rewrite_sequence_block(&mut expr_for_loop.body);
+        }
+        Expr::Group(expr_group) => rewrite_sequence_expr(&mut expr_group.expr),
+        Expr::If(expr_if) => {
+            rewrite_sequence_expr(&mut expr_if.cond);
+            rewrite_sequence_block(&mut expr_if.then_branch);
+            if let Some((_, else_branch)) = &mut expr_if.else_branch {
+                rewrite_sequence_expr(else_branch);
+            }
+        }
+        Expr::Index(expr_index) => {
+            rewrite_sequence_expr(&mut expr_index.expr);
+            rewrite_sequence_expr(&mut expr_index.index);
+        }
+        Expr::Infer(_) => {}
+        Expr::Let(expr_let) => rewrite_sequence_expr(&mut expr_let.expr),
+        Expr::Lit(_) => {}
+        Expr::Loop(expr_loop) => rewrite_sequence_block(&mut expr_loop.body),
+        Expr::Macro(expr_macro) => {
+            if is_call_macro(expr_macro) {
+                let original = expr.clone();
+                *expr = syn::parse_quote! {
+                    ::raster::__private::bind_infallible_call(#original)
+                };
+            }
+        }
+        Expr::Match(expr_match) => {
+            rewrite_sequence_expr(&mut expr_match.expr);
+            for arm in expr_match.arms.iter_mut() {
+                if let Some((_, guard)) = &mut arm.guard {
+                    rewrite_sequence_expr(guard);
+                }
+                rewrite_sequence_expr(&mut arm.body);
+            }
+        }
+        Expr::MethodCall(expr_method_call) => {
+            rewrite_sequence_expr(&mut expr_method_call.receiver);
+            for argument in expr_method_call.args.iter_mut() {
+                rewrite_sequence_expr(argument);
+            }
+        }
+        Expr::Paren(expr_paren) => rewrite_sequence_expr(&mut expr_paren.expr),
+        Expr::Path(_) => {}
+        Expr::Range(expr_range) => {
+            if let Some(from) = &mut expr_range.start {
+                rewrite_sequence_expr(from);
+            }
+            if let Some(to) = &mut expr_range.end {
+                rewrite_sequence_expr(to);
+            }
+        }
+        Expr::Reference(expr_reference) => rewrite_sequence_expr(&mut expr_reference.expr),
+        Expr::Repeat(expr_repeat) => {
+            rewrite_sequence_expr(&mut expr_repeat.expr);
+            rewrite_sequence_expr(&mut expr_repeat.len);
+        }
+        Expr::Return(expr_return) => {
+            if let Some(value) = &mut expr_return.expr {
+                rewrite_sequence_expr(value);
+            }
+        }
+        Expr::Struct(expr_struct) => {
+            for field in expr_struct.fields.iter_mut() {
+                rewrite_sequence_expr(&mut field.expr);
+            }
+            if let Some(rest) = &mut expr_struct.rest {
+                rewrite_sequence_expr(rest);
+            }
+        }
+        Expr::Try(expr_try) => {
+            if let Expr::Macro(expr_macro) = expr_try.expr.as_ref() {
+                if is_call_macro(expr_macro) {
+                    let original = expr_try.expr.as_ref().clone();
+                    expr_try.expr = Box::new(syn::parse_quote! {
+                        ::raster::__private::bind_fallible_call(#original)
+                    });
+                    return;
+                }
+            }
+            rewrite_sequence_expr(&mut expr_try.expr);
+        }
+        Expr::TryBlock(expr_try_block) => rewrite_sequence_block(&mut expr_try_block.block),
+        Expr::Tuple(expr_tuple) => {
+            for element in expr_tuple.elems.iter_mut() {
+                rewrite_sequence_expr(element);
+            }
+        }
+        Expr::Unary(expr_unary) => rewrite_sequence_expr(&mut expr_unary.expr),
+        Expr::Unsafe(expr_unsafe) => rewrite_sequence_block(&mut expr_unsafe.block),
+        Expr::While(expr_while) => {
+            rewrite_sequence_expr(&mut expr_while.cond);
+            rewrite_sequence_block(&mut expr_while.body);
+        }
+        Expr::Yield(expr_yield) => {
+            if let Some(value) = &mut expr_yield.expr {
+                rewrite_sequence_expr(value);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Parses tile attributes from the macro invocation.
 ///
 /// Uses named argument `kind` for tile type: `#[tile(kind = iter)]` or `#[tile(kind = recur)]`.
@@ -811,6 +973,8 @@ fn gen_sequence_wrapped_body(fn_name_str: &str, item_fn: &ItemFn) -> proc_macro2
     quote! {
         #[cfg(all(feature = "std", not(target_arch = "riscv32")))]
         {
+            let __raster_sequence_scope_guard =
+                ::raster::__private::SequenceScopeGuard::enter(#fn_name_str);
             #input_serialization
 
             let mut __raster_record = ::raster::core::trace::FnCallRecord {
@@ -835,7 +999,11 @@ fn gen_sequence_wrapped_body(fn_name_str: &str, item_fn: &ItemFn) -> proc_macro2
         }
 
         #[cfg(not(all(feature = "std", not(target_arch = "riscv32"))))]
-        #body
+        {
+            let __raster_sequence_scope_guard =
+                ::raster::__private::SequenceScopeGuard::enter(#fn_name_str);
+            #body
+        }
     }
 }
 
@@ -870,7 +1038,8 @@ fn gen_sequence_wrapped_body(fn_name_str: &str, item_fn: &ItemFn) -> proc_macro2
 /// ```
 #[proc_macro_attribute]
 pub fn sequence(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let item_fn = parse_macro_input!(item as ItemFn);
+    let mut item_fn = parse_macro_input!(item as ItemFn);
+    rewrite_sequence_block(&mut item_fn.block);
     let fn_name_str = item_fn.sig.ident.to_string();
     validate_protocol_return_type(&item_fn);
     let params = extract_params(&item_fn);

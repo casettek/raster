@@ -16,12 +16,13 @@ pub use raster_core as core;
 
 pub mod input;
 pub use input::{
-    into_resolved_arg, into_sequence_arg, resolve_external_value, resolve_internal_value,
-    resolve_typed_external_value, select_source, selector_path, sequence_arg_trace,
-    typed_external, typed_internal, typed_selector_path, ExternalArg, ExternalRef,
-    ExternalSelection, InternalArg, InternalRef, IntoResolvedArg, IntoSequenceArg,
-    ListProofDirection, ListProofSibling, ResolvedArg, SchemaField, SchemaNode, SelectSource,
-    Selectable, SelectedPayload, SelectionProof, SelectionProofStep, SelectorPath, SelectorSegment,
+    into_resolved_arg, into_sequence_arg, materialize, resolve_external_value,
+    resolve_internal_ok_value, resolve_internal_value, resolve_typed_external_value, select_source,
+    selector_path, sequence_arg_trace, typed_external, typed_internal,
+    typed_internal_with_resolver, typed_selector_path, ExternalArg, ExternalRef, ExternalSelection,
+    InternalArg, InternalRef, IntoResolvedArg, IntoSequenceArg, ListProofDirection,
+    ListProofSibling, ResolvedArg, SchemaField, SchemaNode, SelectSource, Selectable,
+    SelectedPayload, SelectionProof, SelectionProofStep, SelectorPath, SelectorSegment,
     SequenceArg, TypedExternalBinding, TypedInternalBinding, TypedSelectedExternalBinding,
     TypedSelectorPath, TypedSequenceRoot,
 };
@@ -61,6 +62,76 @@ pub mod __private {
 
     #[cfg(not(feature = "std"))]
     pub fn emit_debug(_: core::fmt::Arguments<'_>) {}
+
+    #[doc(hidden)]
+    pub struct SequenceScopeGuard;
+
+    impl SequenceScopeGuard {
+        pub fn enter(sequence_id: &str) -> Self {
+            #[cfg(feature = "std")]
+            {
+                raster_runtime::enter_sequence_scope(sequence_id);
+            }
+
+            #[cfg(not(feature = "std"))]
+            {
+                let _ = sequence_id;
+            }
+
+            Self
+        }
+    }
+
+    impl Drop for SequenceScopeGuard {
+        fn drop(&mut self) {
+            #[cfg(feature = "std")]
+            {
+                raster_runtime::exit_sequence_scope();
+            }
+        }
+    }
+
+    #[cfg(feature = "std")]
+    pub fn bind_infallible_call<T>(result: T) -> crate::TypedInternalBinding<T>
+    where
+        T: serde::Serialize + serde::de::DeserializeOwned,
+    {
+        let reference = crate::store_internal_value(&result).unwrap_or_else(|error| {
+            panic!("Failed to store tile output in internal storage: {}", error)
+        });
+        crate::typed_internal::<T>(reference)
+    }
+
+    #[cfg(not(feature = "std"))]
+    pub fn bind_infallible_call<T>(_: T) -> crate::TypedInternalBinding<T> {
+        panic!("Sequence call bindings require the `std` feature")
+    }
+
+    #[cfg(feature = "std")]
+    pub fn bind_fallible_call<T>(
+        result: core::result::Result<T, crate::alloc::string::String>,
+    ) -> core::result::Result<crate::TypedInternalBinding<T>, crate::alloc::string::String>
+    where
+        T: serde::Serialize + serde::de::DeserializeOwned,
+    {
+        let reference = crate::store_internal_value(&result).unwrap_or_else(|error| {
+            panic!("Failed to store tile output in internal storage: {}", error)
+        });
+        match result {
+            Ok(_) => Ok(crate::typed_internal_with_resolver::<T>(
+                reference,
+                crate::resolve_internal_ok_value::<T>,
+            )),
+            Err(error) => Err(error),
+        }
+    }
+
+    #[cfg(not(feature = "std"))]
+    pub fn bind_fallible_call<T>(
+        _: core::result::Result<T, crate::alloc::string::String>,
+    ) -> core::result::Result<crate::TypedInternalBinding<T>, crate::alloc::string::String> {
+        panic!("Sequence call bindings require the `std` feature")
+    }
 }
 
 /// Canonical call primitive for invoking a tile inside a sequence.
@@ -108,6 +179,14 @@ macro_rules! external {
 macro_rules! internal {
     ($ty:ty, $reference:expr) => {
         $crate::typed_internal::<$ty>($reference)
+    };
+}
+
+/// Resolves a Raster binding into its plain Rust value.
+#[macro_export]
+macro_rules! materialize {
+    ($ty:ty, $expr:expr $(,)?) => {
+        $crate::materialize::<$ty, _>($expr)
     };
 }
 
@@ -173,11 +252,11 @@ pub mod prelude {
 
     pub use crate::exec::Result;
     pub use crate::{
-        call, call_seq, debug, external, internal, into_sequence_arg, select, sequence, tile,
-        ExternalArg, ExternalSelection, InternalArg, InternalRef, IntoResolvedArg, IntoSequenceArg,
-        ListProofDirection, ListProofSibling, ResolvedArg, SchemaField, SchemaNode, SelectSource,
-        Selectable, SelectedPayload, SelectionProof, SelectionProofStep, SelectorPath,
-        SelectorSegment, SequenceArg, TypedExternalBinding, TypedInternalBinding,
+        call, call_seq, debug, external, internal, into_sequence_arg, materialize, select,
+        sequence, tile, ExternalArg, ExternalSelection, InternalArg, InternalRef, IntoResolvedArg,
+        IntoSequenceArg, ListProofDirection, ListProofSibling, ResolvedArg, SchemaField,
+        SchemaNode, SelectSource, Selectable, SelectedPayload, SelectionProof, SelectionProofStep,
+        SelectorPath, SelectorSegment, SequenceArg, TypedExternalBinding, TypedInternalBinding,
         TypedSelectedExternalBinding, TypedSelectorPath, TypedSequenceRoot,
     };
 
