@@ -16,15 +16,16 @@ pub use raster_core as core;
 
 pub mod input;
 pub use input::{
-    into_resolved_arg, into_sequence_arg, materialize, resolve_external_value,
+    auth_ref_result_trace, auth_ref_trace, into_auth_ref, into_resolved_arg, into_sequence_arg,
+    materialize, materialize_auth_result, materialize_auth_return, resolve_external_value,
     resolve_internal_ok_value, resolve_internal_value, resolve_typed_external_value, select_source,
-    selector_path, sequence_arg_trace, typed_external, typed_internal,
-    typed_internal_with_resolver, typed_selector_path, ExternalArg, ExternalRef, ExternalSelection,
-    InternalArg, InternalRef, IntoResolvedArg, IntoSequenceArg, ListProofDirection,
-    ListProofSibling, ResolvedArg, SchemaField, SchemaNode, SelectSource, Selectable,
-    SelectedPayload, SelectionProof, SelectionProofStep, SelectorPath, SelectorSegment,
-    SequenceArg, TypedExternalBinding, TypedInternalBinding, TypedSelectedExternalBinding,
-    TypedSelectorPath, TypedSequenceRoot,
+    selector_path, sequence_arg_trace, typed_external, typed_internal, typed_internal_with_resolver,
+    typed_selector_path, AuthRef, AuthRefTrace, ExternalArg, ExternalRef, ExternalSelection,
+    InternalArg, InternalRef, IntoAuthRef, IntoResolvedArg, IntoSequenceArg,
+    ListProofDirection, ListProofSibling, ResolvedArg, SchemaField, SchemaNode, SelectSource,
+    Selectable, SelectedPayload, SelectionProof, SelectionProofStep, SelectorPath,
+    SelectorSegment, SequenceArg, TypedExternalBinding, TypedInternalBinding,
+    TypedSelectedExternalBinding, TypedSelectorPath, TypedSequenceRoot,
 };
 
 #[cfg(feature = "std")]
@@ -92,25 +93,25 @@ pub mod __private {
     }
 
     #[cfg(feature = "std")]
-    pub fn bind_infallible_call<T>(result: T) -> crate::TypedInternalBinding<T>
+    pub fn bind_infallible_call<T>(result: T) -> crate::AuthRef<T>
     where
         T: serde::Serialize + serde::de::DeserializeOwned,
     {
         let reference = crate::store_internal_value(&result).unwrap_or_else(|error| {
             panic!("Failed to store tile output in internal storage: {}", error)
         });
-        crate::typed_internal::<T>(reference)
+        crate::into_auth_ref::<T, _>(crate::typed_internal::<T>(reference))
     }
 
     #[cfg(not(feature = "std"))]
-    pub fn bind_infallible_call<T>(_: T) -> crate::TypedInternalBinding<T> {
+    pub fn bind_infallible_call<T>(_: T) -> crate::AuthRef<T> {
         panic!("Sequence call bindings require the `std` feature")
     }
 
     #[cfg(feature = "std")]
     pub fn bind_fallible_call<T>(
         result: core::result::Result<T, crate::alloc::string::String>,
-    ) -> core::result::Result<crate::TypedInternalBinding<T>, crate::alloc::string::String>
+    ) -> core::result::Result<crate::AuthRef<T>, crate::alloc::string::String>
     where
         T: serde::Serialize + serde::de::DeserializeOwned,
     {
@@ -118,10 +119,10 @@ pub mod __private {
             panic!("Failed to store tile output in internal storage: {}", error)
         });
         match result {
-            Ok(_) => Ok(crate::typed_internal_with_resolver::<T>(
+            Ok(_) => Ok(crate::into_auth_ref::<T, _>(crate::typed_internal_with_resolver::<T>(
                 reference,
                 crate::resolve_internal_ok_value::<T>,
-            )),
+            ))),
             Err(error) => Err(error),
         }
     }
@@ -129,7 +130,7 @@ pub mod __private {
     #[cfg(not(feature = "std"))]
     pub fn bind_fallible_call<T>(
         _: core::result::Result<T, crate::alloc::string::String>,
-    ) -> core::result::Result<crate::TypedInternalBinding<T>, crate::alloc::string::String> {
+    ) -> core::result::Result<crate::AuthRef<T>, crate::alloc::string::String> {
         panic!("Sequence call bindings require the `std` feature")
     }
 }
@@ -252,12 +253,13 @@ pub mod prelude {
 
     pub use crate::exec::Result;
     pub use crate::{
-        call, call_seq, debug, external, internal, into_sequence_arg, materialize, select,
-        sequence, tile, ExternalArg, ExternalSelection, InternalArg, InternalRef, IntoResolvedArg,
+        call, call_seq, debug, external, internal, into_auth_ref, into_sequence_arg, materialize,
+        materialize_auth_result, materialize_auth_return, select, sequence, tile, AuthRef,
+        ExternalArg, ExternalSelection, InternalArg, InternalRef, IntoAuthRef, IntoResolvedArg,
         IntoSequenceArg, ListProofDirection, ListProofSibling, ResolvedArg, SchemaField,
-        SchemaNode, SelectSource, Selectable, SelectedPayload, SelectionProof, SelectionProofStep,
-        SelectorPath, SelectorSegment, SequenceArg, TypedExternalBinding, TypedInternalBinding,
-        TypedSelectedExternalBinding, TypedSelectorPath, TypedSequenceRoot,
+        SchemaNode, SelectSource, Selectable, SelectedPayload, SelectionProof,
+        SelectionProofStep, SelectorPath, SelectorSegment, SequenceArg, TypedExternalBinding,
+        TypedInternalBinding, TypedSelectedExternalBinding, TypedSelectorPath, TypedSequenceRoot,
     };
 
     // TODO: Re-enable once Executor/Tracer types are implemented

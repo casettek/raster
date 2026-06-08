@@ -1670,6 +1670,32 @@ fn external_value_from_parts<T>(
     )
 }
 
+pub fn select_external_arg<Root, T>(
+    value: &ExternalArg<Root>,
+    selector: &SelectorPath,
+    full_selector: &SelectorPath,
+) -> CoreResult<ExternalArg<T>>
+where
+    Root: DeserializeOwned + Serialize + Selectable,
+    T: DeserializeOwned + Serialize,
+{
+    let proven = typed_proven_selection(&value.value, selector)?;
+    let typed_selected = typed_value_from_tree::<T>(&proven.selected_value).map_err(|e| {
+        Error::Serialization(format!(
+            "Failed to deserialize selected external input '{}' from nested selection tree: {}",
+            value.name, e
+        ))
+    })?;
+    let selected = selected_payload_from_proven(selector, proven);
+    Ok(ExternalArg::new(
+        value.name.clone(),
+        full_selector.clone(),
+        value.commitment.clone(),
+        selected,
+        typed_selected,
+    ))
+}
+
 fn infer_leaf_type_name(value: &TreeValue) -> CoreResult<String> {
     match value {
         TreeValue::Bool(_) => Ok("bool".into()),

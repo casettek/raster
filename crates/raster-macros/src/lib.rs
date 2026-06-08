@@ -117,8 +117,11 @@ fn gen_sequence_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream 
             let external_info_ident = external_info_ident(param);
             let internal_info_ident = internal_info_ident(param);
             quote! {
-                let (#trace_value_ident, #external_info_ident, #internal_info_ident) = ::raster::sequence_arg_trace(&#name)
+                let __raster_auth_trace = ::raster::auth_ref_trace(&#name)
                     .unwrap_or_else(|e| panic!("Failed to trace sequence argument '{}': {}", stringify!(#name), e));
+                let #trace_value_ident = __raster_auth_trace.value;
+                let #external_info_ident = __raster_auth_trace.external;
+                let #internal_info_ident = __raster_auth_trace.internal;
             }
         })
         .collect();
@@ -315,6 +318,105 @@ fn validate_protocol_return_type(input: &ItemFn) {
     }
 
     panic!("{}", fallible_result_message());
+}
+
+#[derive(Clone)]
+enum ProtocolReturnKind {
+    Unit,
+    Value(Type),
+    Fallible(Type),
+}
+
+fn protocol_return_kind(output: &ReturnType) -> ProtocolReturnKind {
+    let ReturnType::Type(_, ty) = output else {
+        return ProtocolReturnKind::Unit;
+    };
+
+    let Type::Path(type_path) = &**ty else {
+        return ProtocolReturnKind::Value((**ty).clone());
+    };
+
+    let Some(segment) = type_path.path.segments.last() else {
+        return ProtocolReturnKind::Value((**ty).clone());
+    };
+
+    if segment.ident != "Result" {
+        return ProtocolReturnKind::Value((**ty).clone());
+    }
+
+    let PathArguments::AngleBracketed(args) = &segment.arguments else {
+        return ProtocolReturnKind::Value((**ty).clone());
+    };
+
+    let ok_type = args.args.iter().find_map(|arg| match arg {
+        GenericArgument::Type(ty) => Some(ty.clone()),
+        _ => None,
+    });
+
+    ok_type
+        .map(ProtocolReturnKind::Fallible)
+        .unwrap_or_else(|| ProtocolReturnKind::Value((**ty).clone()))
+}
+
+fn auth_return_type(kind: &ProtocolReturnKind) -> proc_macro2::TokenStream {
+    match kind {
+        ProtocolReturnKind::Unit => quote! { () },
+        ProtocolReturnKind::Value(ty) => quote! { ::raster::AuthRef<#ty> },
+        ProtocolReturnKind::Fallible(ty) => quote! { ::raster::exec::Result<::raster::AuthRef<#ty>> },
+    }
+}
+
+fn auth_result_binding(kind: &ProtocolReturnKind, body: &syn::Block) -> proc_macro2::TokenStream {
+    match kind {
+        ProtocolReturnKind::Unit => quote! {
+            let __raster_result: () = (|| #body)();
+        },
+        ProtocolReturnKind::Value(ty) => quote! {
+            let __raster_body_result = (|| #body)();
+            let __raster_result: ::raster::AuthRef<#ty> =
+                ::raster::into_auth_ref::<#ty, _>(__raster_body_result);
+        },
+        ProtocolReturnKind::Fallible(ty) => quote! {
+            let __raster_body_result = (|| #body)();
+            let __raster_result: ::raster::exec::Result<::raster::AuthRef<#ty>> =
+                __raster_body_result.map(|value| ::raster::into_auth_ref::<#ty, _>(value));
+        },
+    }
+}
+
+fn trace_output_binding(kind: &ProtocolReturnKind) -> proc_macro2::TokenStream {
+    match kind {
+        ProtocolReturnKind::Unit => quote! {
+            let __raster_output_bytes = ::raster::core::postcard::to_allocvec(&())
+                .unwrap_or_default();
+        },
+        ProtocolReturnKind::Value(_) => quote! {
+            let __raster_output_trace = ::raster::auth_ref_trace(&__raster_result)
+                .unwrap_or_else(|e| panic!("Failed to trace sequence output: {}", e));
+            let __raster_output_bytes = ::raster::core::postcard::to_allocvec(&__raster_output_trace)
+                .unwrap_or_default();
+        },
+        ProtocolReturnKind::Fallible(_) => quote! {
+            let __raster_output_trace = ::raster::auth_ref_result_trace(&__raster_result)
+                .unwrap_or_else(|e| panic!("Failed to trace sequence output: {}", e));
+            let __raster_output_bytes = ::raster::core::postcard::to_allocvec(&__raster_output_trace)
+                .unwrap_or_default();
+        },
+    }
+}
+
+fn materialize_main_result(kind: &ProtocolReturnKind) -> proc_macro2::TokenStream {
+    match kind {
+        ProtocolReturnKind::Unit => quote! { let __raster_result = __raster_auth_result; },
+        ProtocolReturnKind::Value(ty) => quote! {
+            let __raster_result: #ty =
+                ::raster::materialize_auth_return::<#ty, _>(__raster_auth_result);
+        },
+        ProtocolReturnKind::Fallible(ty) => quote! {
+            let __raster_result: ::raster::exec::Result<#ty> =
+                ::raster::materialize_auth_result::<#ty, _>(__raster_auth_result);
+        },
+    }
 }
 
 fn gen_tile_trace_output_serialization() -> proc_macro2::TokenStream {
@@ -536,6 +638,37 @@ fn is_call_macro(expr_macro: &syn::ExprMacro) -> bool {
     expr_macro.mac.path.is_ident("call")
 }
 
+fn is_call_seq_macro(expr_macro: &syn::ExprMacro) -> bool {
+    expr_macro.mac.path.is_ident("call_seq")
+}
+
+struct SequenceCallInput {
+    callee: syn::Ident,
+    args: syn::punctuated::Punctuated<Expr, Token![,]>,
+}
+
+impl Parse for SequenceCallInput {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let callee: syn::Ident = input.parse()?;
+        let mut args = syn::punctuated::Punctuated::new();
+        if input.parse::<Option<Token![,]>>()?.is_some() {
+            args = syn::punctuated::Punctuated::parse_terminated(input)?;
+        }
+        Ok(Self { callee, args })
+    }
+}
+
+fn rewrite_call_seq_macro(expr_macro: &syn::ExprMacro) -> Expr {
+    let input = syn::parse2::<SequenceCallInput>(expr_macro.mac.tokens.clone()).unwrap_or_else(|_| {
+        panic!("call_seq! expects an identifier callee followed by zero or more arguments")
+    });
+    let hidden = format_ident!("__raster_sequence_auth_{}", input.callee);
+    let args = input.args;
+    syn::parse_quote! {
+        #hidden(#args)
+    }
+}
+
 fn rewrite_sequence_stmt(stmt: &mut syn::Stmt) {
     match stmt {
         syn::Stmt::Local(local) => {
@@ -547,7 +680,23 @@ fn rewrite_sequence_stmt(stmt: &mut syn::Stmt) {
             }
         }
         syn::Stmt::Item(_) => {}
-        syn::Stmt::Macro(_) => {}
+        syn::Stmt::Macro(stmt_macro) => {
+            let expr_macro = syn::ExprMacro {
+                attrs: Vec::new(),
+                mac: stmt_macro.mac.clone(),
+            };
+            if is_call_macro(&expr_macro) {
+                let original = Expr::Macro(expr_macro);
+                *stmt = syn::parse_quote! {
+                    ::raster::__private::bind_infallible_call(#original);
+                };
+            } else if is_call_seq_macro(&expr_macro) {
+                let rewritten = rewrite_call_seq_macro(&expr_macro);
+                *stmt = syn::parse_quote! {
+                    #rewritten;
+                };
+            }
+        }
         syn::Stmt::Expr(expr, _) => rewrite_sequence_expr(expr),
     }
 }
@@ -616,6 +765,8 @@ fn rewrite_sequence_expr(expr: &mut Expr) {
                 *expr = syn::parse_quote! {
                     ::raster::__private::bind_infallible_call(#original)
                 };
+            } else if is_call_seq_macro(expr_macro) {
+                *expr = rewrite_call_seq_macro(expr_macro);
             }
         }
         Expr::Match(expr_match) => {
@@ -668,6 +819,9 @@ fn rewrite_sequence_expr(expr: &mut Expr) {
                     expr_try.expr = Box::new(syn::parse_quote! {
                         ::raster::__private::bind_fallible_call(#original)
                     });
+                    return;
+                } else if is_call_seq_macro(expr_macro) {
+                    expr_try.expr = Box::new(rewrite_call_seq_macro(expr_macro));
                     return;
                 }
             }
@@ -958,9 +1112,15 @@ impl SequenceAttrs {
 }
 
 /// Generates the sequence-wrapped body: either tracing (SequenceStart/body/SequenceEnd) or plain body depending on cfg.
-fn gen_sequence_wrapped_body(fn_name_str: &str, item_fn: &ItemFn) -> proc_macro2::TokenStream {
+fn gen_sequence_wrapped_body(
+    fn_name_str: &str,
+    item_fn: &ItemFn,
+    return_kind: &ProtocolReturnKind,
+) -> proc_macro2::TokenStream {
     let body = &item_fn.block;
     let input_serialization = gen_sequence_input_serialization(&item_fn);
+    let auth_result_binding = auth_result_binding(return_kind, body);
+    let trace_output_binding = trace_output_binding(return_kind);
 
     let output_type_expr = match &item_fn.sig.output {
         ReturnType::Default => quote! { "()" },
@@ -985,9 +1145,8 @@ fn gen_sequence_wrapped_body(fn_name_str: &str, item_fn: &ItemFn) -> proc_macro2
             ::raster::publish_trace_event(::raster::core::trace::TraceEvent::SequenceStart(
                 __raster_record.clone(),
             ));
-            let __raster_result = (|| #body)();
-            let __raster_output_bytes = ::raster::core::postcard::to_allocvec(&__raster_result)
-                .unwrap_or_default();
+            #auth_result_binding
+            #trace_output_binding
             __raster_record.output = ::core::option::Option::Some(::raster::core::trace::FnOutput::new(
                 __raster_output_bytes,
                 ::raster::alloc::string::String::from(#output_type_expr),
@@ -1002,7 +1161,8 @@ fn gen_sequence_wrapped_body(fn_name_str: &str, item_fn: &ItemFn) -> proc_macro2
         {
             let __raster_sequence_scope_guard =
                 ::raster::__private::SequenceScopeGuard::enter(#fn_name_str);
-            #body
+            #auth_result_binding
+            __raster_result
         }
     }
 }
@@ -1047,6 +1207,7 @@ pub fn sequence(attr: TokenStream, item: TokenStream) -> TokenStream {
     let fn_vis = &item_fn.vis;
     let fn_attrs = &item_fn.attrs;
     let _attrs = SequenceAttrs::parse(attr);
+    let return_kind = protocol_return_kind(&item_fn.sig.output);
 
     let expanded = if item_fn.sig.ident == "main" {
         if !params.is_empty() {
@@ -1056,28 +1217,30 @@ pub fn sequence(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
 
         let output = &item_fn.sig.output;
-        let body = gen_sequence_wrapped_body("main", &item_fn);
+        let auth_name = format_ident!("__raster_sequence_auth_main");
+        let auth_output = auth_return_type(&return_kind);
+        let body = gen_sequence_wrapped_body("main", &item_fn, &return_kind);
+        let materialize_result = materialize_main_result(&return_kind);
         quote! {
+            fn #auth_name() -> #auth_output {
+                #body
+            }
+
             #(#fn_attrs)*
             fn main() #output {
                 ::raster::init();
 
-                let __raster_result = { #body };
+                let __raster_auth_result = #auth_name();
+                #materialize_result
 
                 ::raster::finish();
                 __raster_result
             }
         }
     } else {
-        let fn_name = &item_fn.sig.ident;
-        let impl_name = format_ident!("__raster_sequence_impl_{}", fn_name_str);
-        let body = gen_sequence_wrapped_body(&fn_name_str, &item_fn);
-        let output = &item_fn.sig.output;
-        let root_idents: Vec<_> = params
-            .iter()
-            .enumerate()
-            .map(|(index, _)| sequence_root_ident(index))
-            .collect();
+        let auth_name = format_ident!("__raster_sequence_auth_{}", fn_name_str);
+        let auth_output = auth_return_type(&return_kind);
+        let body = gen_sequence_wrapped_body(&fn_name_str, &item_fn, &return_kind);
         let arg_idents: Vec<_> = params
             .iter()
             .enumerate()
@@ -1096,74 +1259,38 @@ pub fn sequence(attr: TokenStream, item: TokenStream) -> TokenStream {
             .zip(arg_idents.iter())
             .map(|(param, arg_ident)| {
                 let ty = &param.ty;
-                quote! {
-                    #arg_ident: ::raster::IntoSequenceArg<#ty>,
-                    <#arg_ident as ::raster::IntoSequenceArg<#ty>>::Root: ::raster::TypedSequenceRoot
-                }
+                quote! { #arg_ident: ::raster::IntoAuthRef<#ty> }
             })
             .collect();
-        let root_where: Vec<_> = root_idents
-            .iter()
-            .map(|root_ident| quote! { #root_ident: ::raster::TypedSequenceRoot })
-            .collect();
-        let impl_params: Vec<_> = params
-            .iter()
-            .zip(root_idents.iter())
-            .map(|(param, root_ident)| {
-                let name = &param.ident;
-                let ty = &param.ty;
-                quote! { #name: ::raster::SequenceArg<#root_ident, #ty> }
-            })
-            .collect();
-        let param_names: Vec<_> = params.iter().map(|param| &param.ident).collect();
         let conversions: Vec<_> = params
             .iter()
             .map(|param| {
                 let name = &param.ident;
                 let ty = &param.ty;
                 quote! {
-                    let #name = ::raster::into_sequence_arg::<#ty, _>(#name);
+                    let #name = ::raster::into_auth_ref::<#ty, _>(#name);
                 }
             })
             .collect();
-        let impl_fn = if params.is_empty() {
+
+        if params.is_empty() {
             quote! {
-                fn #impl_name() #output {
+                #(#fn_attrs)*
+                #fn_vis fn #auth_name() -> #auth_output {
                     #body
                 }
             }
         } else {
             quote! {
-                fn #impl_name<#(#root_idents),*>(#(#impl_params),*) #output
-                where
-                    #(#root_where),*
-                {
-                    #body
-                }
-            }
-        };
-        let wrapper_fn = if params.is_empty() {
-            quote! {
                 #(#fn_attrs)*
-                #fn_vis fn #fn_name() #output {
-                    #impl_name()
-                }
-            }
-        } else {
-            quote! {
-                #(#fn_attrs)*
-                #fn_vis fn #fn_name<#(#arg_idents),*>(#(#wrapper_params),*) #output
+                #fn_vis fn #auth_name<#(#arg_idents),*>(#(#wrapper_params),*) -> #auth_output
                 where
                     #(#wrapper_where),*
                 {
                     #(#conversions)*
-                    #impl_name(#(#param_names),*)
+                    #body
                 }
             }
-        };
-        quote! {
-            #impl_fn
-            #wrapper_fn
         }
     };
 

@@ -19,9 +19,7 @@ fn personal_greet_seq(personal_data: PersonalData) -> Result<String> {
 
     let result = call!(concat_messages, name, greet_address_line_result);
 
-    let result = materialize!(String, result);
-
-    debug!("personal_greet_seq result: {}", result);
+    debug!("personal_greet_seq result ref: {:?}", result.reference());
 
     // call!(maybe_echo_name, String::from(""))?;
 
@@ -52,7 +50,7 @@ fn wish_sequence(name: String) -> String {
 
 #[sequence]
 fn placeholder_sequence(placeholder: String) -> String {
-    materialize!(String, call!(exclaim, placeholder))
+    call!(exclaim, placeholder)
 }
 
 /// Entry point that runs the greet sequence natively.
@@ -96,5 +94,5 @@ fn main() {
 
     let name_2 = call_seq!(placeholder_sequence, "Placeholder".to_string());
     let result = call_seq!(greet_sequence, name_2);
-    debug!("main result: {}", result);
+    debug!("main result ref: {:?}", result.reference());
 }

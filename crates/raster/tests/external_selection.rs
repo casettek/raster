@@ -131,6 +131,41 @@ fn capture_success_reference(name: String) -> Result<InternalRef> {
     Ok(echoed.reference().clone())
 }
 
+fn run_echo_sequence<A>(name: A) -> String
+where
+    A: IntoAuthRef<String>,
+{
+    materialize_auth_return::<String, _>(__raster_sequence_auth_echo_sequence(name))
+}
+
+fn run_maybe_echo_sequence<A>(name: A) -> Result<String>
+where
+    A: IntoAuthRef<String>,
+{
+    materialize_auth_result::<String, _>(__raster_sequence_auth_maybe_echo_sequence(name))
+}
+
+fn run_capture_echo_reference<A>(name: A) -> InternalRef
+where
+    A: IntoAuthRef<String>,
+{
+    materialize_auth_return::<InternalRef, _>(__raster_sequence_auth_capture_echo_reference(name))
+}
+
+fn run_capture_success_reference<A>(name: A) -> Result<InternalRef>
+where
+    A: IntoAuthRef<String>,
+{
+    materialize_auth_result::<InternalRef, _>(__raster_sequence_auth_capture_success_reference(name))
+}
+
+fn run_traced_error_outer<A>(name: A) -> Result<String>
+where
+    A: IntoAuthRef<String>,
+{
+    materialize_auth_result::<String, _>(__raster_sequence_auth_traced_error_outer(name))
+}
+
 #[test]
 fn select_accepts_identity_typed_external() {
     takes_typed_binding(select!(
@@ -179,7 +214,7 @@ fn tile_wrapper_accepts_inline_arguments() {
 
 #[test]
 fn sequence_wrapper_accepts_inline_arguments() {
-    assert_eq!(echo_sequence("Raster".to_string()), "Raster");
+    assert_eq!(run_echo_sequence("Raster".to_string()), "Raster");
 }
 
 #[test]
@@ -194,18 +229,18 @@ fn tile_wrapper_preserves_user_result() {
 #[test]
 fn sequence_wrapper_preserves_user_result() {
     assert_eq!(
-        maybe_echo_sequence("Raster".to_string()),
+        run_maybe_echo_sequence("Raster".to_string()),
         Ok("Raster".to_string())
     );
     assert_eq!(
-        maybe_echo_sequence(String::new()),
+        run_maybe_echo_sequence(String::new()),
         Err(missing_name_error())
     );
 }
 
 #[test]
 fn infallible_call_binding_uses_tile_output_commitment() {
-    let (reference, events) = capture_trace_events(|| capture_echo_reference("Raster".to_string()));
+    let (reference, events) = capture_trace_events(|| run_capture_echo_reference("Raster".to_string()));
     let tile_event = events
         .into_iter()
         .find(
@@ -232,7 +267,7 @@ fn infallible_call_binding_uses_tile_output_commitment() {
 #[test]
 fn fallible_call_binding_resolves_ok_payload_from_stored_result() {
     let (reference, events) =
-        capture_trace_events(|| capture_success_reference("Raster".to_string()).unwrap());
+        capture_trace_events(|| run_capture_success_reference("Raster".to_string()).unwrap());
     let tile_event = events
         .into_iter()
         .find(
@@ -273,7 +308,7 @@ fn tile_abi_wrapper_serializes_user_error_result() {
 
 #[test]
 fn nested_sequence_trace_records_terminal_err_outputs() {
-    let (result, events) = capture_trace_events(|| traced_error_outer("Raster".to_string()));
+    let (result, events) = capture_trace_events(|| run_traced_error_outer("Raster".to_string()));
     let events: Vec<_> = events
         .into_iter()
         .filter(|event| match event {
@@ -356,10 +391,10 @@ fn tile_wrapper_panics_on_runtime_resolution_failure() {
 #[test]
 #[should_panic(expected = "Failed to trace sequence argument 'name'")]
 fn sequence_wrapper_panics_on_runtime_trace_failure() {
-    let _ = maybe_echo_sequence(external!(String, "missing_name"));
+    let _ = run_maybe_echo_sequence(external!(String, "missing_name"));
 }
 
 #[test]
 fn zero_arg_sequence_wrapper_accepts_no_arguments() {
-    zero_arg_sequence();
+    __raster_sequence_auth_zero_arg_sequence();
 }

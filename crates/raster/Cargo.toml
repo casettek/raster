@@ -22,3 +22,6 @@ raster-runtime = { workspace = true, optional = true }
 
 # Serde is used for typed input bounds in both std and no_std builds
 serde.workspace = true
+
+[dev-dependencies]
+trybuild = "1.0.116"
