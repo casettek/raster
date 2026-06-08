@@ -1,5 +1,6 @@
 use raster::core::trace::TraceEvent;
 use raster::prelude::*;
+use raster::selector_path;
 use raster_core::postcard;
 use raster_runtime::{init_with, Publisher, Sha256Commitment};
 use serde::{Deserialize, Serialize};
@@ -59,10 +60,8 @@ struct PersonalData {
     address: Address,
 }
 
-fn takes_typed_binding(_: TypedSelectedExternalBinding<PersonalData, PersonalData>) {}
-fn takes_name_binding(_: TypedSelectedExternalBinding<PersonalData, String>) {}
-fn takes_sequence_binding<Root>(_: SequenceArg<Root, PersonalData>) {}
-fn takes_sequence_name_binding<Root>(_: SequenceArg<Root, String>) {}
+fn takes_auth_binding(_: AuthRef<PersonalData>) {}
+fn takes_auth_name_binding(_: AuthRef<String>) {}
 
 #[tile(kind = iter)]
 fn echo_name(name: String) -> String {
@@ -80,19 +79,19 @@ fn maybe_echo_name(name: String) -> Result<String> {
 
 #[sequence]
 fn echo_sequence(name: String) -> String {
-    materialize!(String, call!(echo_name, name))
+    call!(echo_name, name)
 }
 
 #[sequence]
 fn maybe_echo_sequence(name: String) -> Result<String> {
     let echoed = call!(maybe_echo_name, name)?;
-    Ok(materialize!(String, echoed))
+    Ok(echoed)
 }
 
 #[sequence]
 fn select_name_from_personal(personal: PersonalData) -> String {
     let name = select!(String, personal.name);
-    materialize!(String, call!(echo_name, name))
+    call!(echo_name, name)
 }
 
 #[sequence]
@@ -109,7 +108,7 @@ fn zero_arg_sequence() {
 fn traced_error_inner(name: String) -> Result<String> {
     let echoed = call!(echo_name, name);
     let _ = call!(maybe_echo_name, String::new())?;
-    Ok(materialize!(String, echoed))
+    Ok(echoed)
 }
 
 #[sequence]
@@ -168,7 +167,7 @@ where
 
 #[test]
 fn select_accepts_identity_typed_external() {
-    takes_typed_binding(select!(
+    takes_auth_binding(select!(
         PersonalData,
         external!(PersonalData, "personal_data")
     ));
@@ -177,34 +176,89 @@ fn select_accepts_identity_typed_external() {
 #[test]
 fn select_accepts_nested_identity_selected_external() {
     let whole = select!(PersonalData, external!(PersonalData, "personal_data"));
-    takes_name_binding(select!(String, whole.name));
+    takes_auth_name_binding(select!(String, whole.name));
 }
 
 #[test]
 fn select_accepts_nested_selected_external() {
     let address = select!(Address, external!(PersonalData, "personal_data").address);
-    takes_name_binding(select!(String, address.line));
+    takes_auth_name_binding(select!(String, address.line));
 }
 
 #[test]
-fn sequence_carrier_preserves_external_binding() {
-    takes_sequence_binding(into_sequence_arg::<PersonalData, _>(external!(
+fn auth_ref_preserves_external_binding() {
+    takes_auth_binding(into_auth_ref::<PersonalData, _>(external!(
         PersonalData,
         "personal_data"
     )));
 }
 
 #[test]
-fn select_accepts_sequence_preserved_binding() {
-    let personal = into_sequence_arg::<PersonalData, _>(external!(PersonalData, "personal_data"));
-    takes_sequence_name_binding(select!(String, personal.name));
+fn select_accepts_auth_ref_binding() {
+    let personal = into_auth_ref::<PersonalData, _>(external!(PersonalData, "personal_data"));
+    takes_auth_name_binding(select!(String, personal.name));
 }
 
 #[test]
-fn select_accepts_cloned_sequence_preserved_binding() {
-    let personal = into_sequence_arg::<PersonalData, _>(external!(PersonalData, "personal_data"));
-    takes_sequence_name_binding(select!(String, personal.clone().name));
-    takes_sequence_binding(personal);
+fn select_accepts_cloned_auth_ref_binding() {
+    let personal = into_auth_ref::<PersonalData, _>(external!(PersonalData, "personal_data"));
+    takes_auth_name_binding(select!(String, personal.clone().name));
+    takes_auth_binding(personal);
+}
+
+#[test]
+fn nested_auth_ref_selection_matches_direct_external_selection_trace() {
+    let personal = PersonalData {
+        name: "Raster".to_string(),
+        address: Address {
+            line: "Main Street".to_string(),
+        },
+    };
+    let root_hash = vec![1, 2, 3, 4];
+    let whole = ExternalValue::new(
+        "personal_data",
+        SelectorPath::default(),
+        Some("commitment".to_string()),
+        SelectedPayload {
+            bytes: postcard::to_allocvec(&personal).unwrap(),
+            proof: SelectionProof {
+                path: SelectorPath::default(),
+                root_hash: root_hash.clone(),
+                steps: Vec::new(),
+            },
+        },
+        personal,
+    );
+    let address_selector = selector_path(vec![SelectorSegment::Field("address".to_string())]);
+    let line_selector = selector_path(vec![SelectorSegment::Field("line".to_string())]);
+    let full_selector = selector_path(vec![
+        SelectorSegment::Field("address".to_string()),
+        SelectorSegment::Field("line".to_string()),
+    ]);
+
+    let address = raster::input::select_external_value::<PersonalData, Address>(
+        &whole,
+        &address_selector,
+        &address_selector,
+    )
+    .unwrap();
+    let nested = raster::input::select_external_value::<Address, String>(
+        &address,
+        &line_selector,
+        &full_selector,
+    )
+    .unwrap();
+    let direct = raster::input::select_external_value::<PersonalData, String>(
+        &whole,
+        &full_selector,
+        &full_selector,
+    )
+    .unwrap();
+
+    assert_eq!(nested.selector, direct.selector);
+    assert_eq!(nested.selected, direct.selected);
+    assert_eq!(nested.value, direct.value);
+    assert_eq!(nested.selected.proof.root_hash, root_hash);
 }
 
 #[test]
@@ -261,7 +315,12 @@ fn infallible_call_binding_uses_tile_output_commitment() {
         reference.commitment,
         Into::<Vec<u8>>::into(Sha256Commitment::from(output.data.as_slice()))
     );
-    assert_eq!(materialize!(String, internal!(String, reference)), "Raster");
+    assert_eq!(
+        raster::resolve_internal_value::<String>(reference)
+            .unwrap()
+            .into_inner(),
+        "Raster"
+    );
 }
 
 #[test]
@@ -383,7 +442,7 @@ fn nested_sequence_trace_records_terminal_err_outputs() {
 }
 
 #[test]
-#[should_panic(expected = "Failed to resolve call argument 'name'")]
+#[should_panic(expected = "Failed to materialize auth value for argument 'name'")]
 fn tile_wrapper_panics_on_runtime_resolution_failure() {
     let _ = maybe_echo_name(external!(String, "missing_name"));
 }

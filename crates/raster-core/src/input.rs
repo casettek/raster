@@ -519,22 +519,22 @@ impl ExternalSelection {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub enum ResolvedArg<T> {
-    External(ExternalArg<T>),
-    Internal(InternalArg<T>),
+pub enum AuthValue<T> {
+    External(ExternalValue<T>),
+    Internal(InternalValue<T>),
     Inline(T),
 }
 
-impl<T> ResolvedArg<T> {
+impl<T> AuthValue<T> {
     pub fn inline(value: T) -> Self {
         Self::Inline(value)
     }
 
-    pub fn external(value: ExternalArg<T>) -> Self {
+    pub fn external(value: ExternalValue<T>) -> Self {
         Self::External(value)
     }
 
-    pub fn internal(value: InternalArg<T>) -> Self {
+    pub fn internal(value: InternalValue<T>) -> Self {
         Self::Internal(value)
     }
 
@@ -546,7 +546,7 @@ impl<T> ResolvedArg<T> {
         }
     }
 
-    pub fn as_external(&self) -> Option<&ExternalArg<T>> {
+    pub fn as_external(&self) -> Option<&ExternalValue<T>> {
         match self {
             Self::External(external) => Some(external),
             Self::Inline(_) => None,
@@ -554,7 +554,7 @@ impl<T> ResolvedArg<T> {
         }
     }
 
-    pub fn as_internal(&self) -> Option<&InternalArg<T>> {
+    pub fn as_internal(&self) -> Option<&InternalValue<T>> {
         match self {
             Self::Internal(internal) => Some(internal),
             Self::External(_) | Self::Inline(_) => None,
@@ -562,9 +562,9 @@ impl<T> ResolvedArg<T> {
     }
 }
 
-/// A resolved external input carrying both identity metadata and the typed value.
+/// A resolved external value carrying both identity metadata and the typed value.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub struct ExternalArg<T> {
+pub struct ExternalValue<T> {
     pub name: String,
     pub selector: SelectorPath,
     pub commitment: Option<String>,
@@ -572,7 +572,7 @@ pub struct ExternalArg<T> {
     pub value: T,
 }
 
-impl<T> ExternalArg<T> {
+impl<T> ExternalValue<T> {
     pub fn new(
         name: impl Into<String>,
         selector: SelectorPath,
@@ -602,15 +602,15 @@ impl<T> ExternalArg<T> {
     }
 }
 
-/// A resolved internal store value carrying both identity metadata and the typed value.
+/// A resolved internal value carrying both identity metadata and the typed value.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub struct InternalArg<T> {
+pub struct InternalValue<T> {
     pub reference: InternalRef,
     pub bytes: Vec<u8>,
     pub value: T,
 }
 
-impl<T> InternalArg<T> {
+impl<T> InternalValue<T> {
     pub fn new(
         reference: InternalRef,
         bytes: Vec<u8>,
@@ -898,15 +898,15 @@ mod tests {
     }
 
     #[test]
-    fn resolved_arg_helpers_preserve_inline_values() {
-        let arg = ResolvedArg::inline(7u64);
+    fn auth_value_helpers_preserve_inline_values() {
+        let arg = AuthValue::inline(7u64);
 
         assert!(arg.as_external().is_none());
         assert_eq!(arg.into_inner(), 7);
     }
 
     #[test]
-    fn resolved_arg_helpers_preserve_external_metadata() {
+    fn auth_value_helpers_preserve_external_metadata() {
         let selected = SelectedPayload {
             bytes: alloc::vec![1, 2, 3],
             proof: SelectionProof {
@@ -915,7 +915,7 @@ mod tests {
                 steps: alloc::vec![],
             },
         };
-        let arg = ResolvedArg::external(ExternalArg::new(
+        let arg = AuthValue::external(ExternalValue::new(
             "payload",
             SelectorPath::default(),
             Some("abc123".to_string()),

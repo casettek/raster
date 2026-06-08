@@ -1,6 +1,6 @@
 use raster_core::cfs::CfsCoordinates;
 use raster_core::coordinate_index::coordinate_index_root;
-use raster_core::input::{InternalArg, InternalRef};
+use raster_core::input::{InternalValue, InternalRef};
 use raster_core::transition::{InternalStoreEntry, InternalStoreIndexValue, SerializableFrontier};
 use raster_core::{Error, Result};
 use raster_prover::precomputed::EMPTY_TRIE_NODES;
@@ -136,7 +136,7 @@ impl InternalStorageManager {
         }
     }
 
-    pub fn resolve<T: DeserializeOwned>(&self, reference: &InternalRef) -> Result<InternalArg<T>> {
+    pub fn resolve<T: DeserializeOwned>(&self, reference: &InternalRef) -> Result<InternalValue<T>> {
         let stored = self.objects.get(&reference.coordinates).ok_or_else(|| {
             Error::Other(format!(
                 "Missing internal store object at coordinates {:?}",
@@ -162,7 +162,7 @@ impl InternalStorageManager {
                 reference.coordinates, e
             ))
         })?;
-        Ok(InternalArg::new(
+        Ok(InternalValue::new(
             reference.clone(),
             stored.bytes.clone(),
             value,
@@ -273,21 +273,21 @@ pub fn store_internal_value<T: Serialize>(value: &T) -> Result<InternalRef> {
 
 pub fn resolve_internal_value<T: DeserializeOwned>(
     reference: &InternalRef,
-) -> Result<InternalArg<T>> {
+) -> Result<InternalValue<T>> {
     THREAD_INTERNAL_STORAGE.with(|storage| storage.borrow().resolve(reference))
 }
 
 pub fn resolve_internal_ok_value<T: DeserializeOwned>(
     reference: &InternalRef,
-) -> Result<InternalArg<T>> {
-    let resolved: InternalArg<std::result::Result<T, String>> = resolve_internal_value(reference)?;
-    let InternalArg {
+) -> Result<InternalValue<T>> {
+    let resolved: InternalValue<std::result::Result<T, String>> = resolve_internal_value(reference)?;
+    let InternalValue {
         reference,
         bytes,
         value,
     } = resolved;
     match value {
-        Ok(value) => Ok(InternalArg::new(reference, bytes, value)),
+        Ok(value) => Ok(InternalValue::new(reference, bytes, value)),
         Err(error) => Err(Error::Other(format!(
             "Stored tile result at coordinates {:?} resolved to error: {}",
             reference.coordinates, error

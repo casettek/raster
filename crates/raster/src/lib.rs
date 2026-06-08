@@ -16,16 +16,15 @@ pub use raster_core as core;
 
 pub mod input;
 pub use input::{
-    auth_ref_result_trace, auth_ref_trace, into_auth_ref, into_resolved_arg, into_sequence_arg,
-    materialize, materialize_auth_result, materialize_auth_return, resolve_external_value,
-    resolve_internal_ok_value, resolve_internal_value, resolve_typed_external_value, select_source,
-    selector_path, sequence_arg_trace, typed_external, typed_internal, typed_internal_with_resolver,
-    typed_selector_path, AuthRef, AuthRefTrace, ExternalArg, ExternalRef, ExternalSelection,
-    InternalArg, InternalRef, IntoAuthRef, IntoResolvedArg, IntoSequenceArg,
-    ListProofDirection, ListProofSibling, ResolvedArg, SchemaField, SchemaNode, SelectSource,
-    Selectable, SelectedPayload, SelectionProof, SelectionProofStep, SelectorPath,
-    SelectorSegment, SequenceArg, TypedExternalBinding, TypedInternalBinding,
-    TypedSelectedExternalBinding, TypedSelectorPath, TypedSequenceRoot,
+    auth_ref_result_trace, auth_ref_trace, into_auth_ref, into_auth_value,
+    materialize_auth_result, materialize_auth_return, resolve_external_value,
+    resolve_internal_ok_value, resolve_internal_value, resolve_typed_external_value,
+    select_source, selector_path, typed_external, typed_internal, typed_internal_with_resolver,
+    typed_selector_path, AuthRef, AuthRefTrace, ExternalValue, ExternalRef, ExternalSelection,
+    InternalValue, InternalRef, IntoAuthRef, IntoAuthValue, ListProofDirection,
+    ListProofSibling, AuthValue, SchemaField, SchemaNode, SelectSource, Selectable,
+    SelectedPayload, SelectionProof, SelectionProofStep, SelectorPath, SelectorSegment,
+    TypedExternalBinding, TypedInternalBinding, TypedSelectorPath,
 };
 
 #[cfg(feature = "std")]
@@ -183,14 +182,6 @@ macro_rules! internal {
     };
 }
 
-/// Resolves a Raster binding into its plain Rust value.
-#[macro_export]
-macro_rules! materialize {
-    ($ty:ty, $expr:expr $(,)?) => {
-        $crate::materialize::<$ty, _>($expr)
-    };
-}
-
 /// Canonical call primitive for invoking a sub-sequence inside a sequence.
 ///
 /// `call_seq!` is the explicit "sequence call boundary" — use it instead of bare
@@ -253,13 +244,12 @@ pub mod prelude {
 
     pub use crate::exec::Result;
     pub use crate::{
-        call, call_seq, debug, external, internal, into_auth_ref, into_sequence_arg, materialize,
-        materialize_auth_result, materialize_auth_return, select, sequence, tile, AuthRef,
-        ExternalArg, ExternalSelection, InternalArg, InternalRef, IntoAuthRef, IntoResolvedArg,
-        IntoSequenceArg, ListProofDirection, ListProofSibling, ResolvedArg, SchemaField,
-        SchemaNode, SelectSource, Selectable, SelectedPayload, SelectionProof,
-        SelectionProofStep, SelectorPath, SelectorSegment, SequenceArg, TypedExternalBinding,
-        TypedInternalBinding, TypedSelectedExternalBinding, TypedSelectorPath, TypedSequenceRoot,
+        call, call_seq, debug, external, internal, into_auth_ref, materialize_auth_result,
+        materialize_auth_return, select, sequence, tile, AuthRef,
+        ExternalValue, ExternalSelection, InternalValue, InternalRef, IntoAuthRef, IntoAuthValue,
+        ListProofDirection, ListProofSibling, AuthValue, SchemaField, SchemaNode, SelectSource,
+        Selectable, SelectedPayload, SelectionProof, SelectionProofStep, SelectorPath,
+        SelectorSegment, TypedExternalBinding, TypedInternalBinding, TypedSelectorPath,
     };
 
     // TODO: Re-enable once Executor/Tracer types are implemented

@@ -57,11 +57,11 @@ fn parse_schema_tag(attrs: &[Attribute]) -> Option<u32> {
     })
 }
 
-fn rewrite_into_resolved_args(sig: &mut syn::Signature) {
+fn rewrite_into_auth_value_args(sig: &mut syn::Signature) {
     for arg in sig.inputs.iter_mut() {
         if let FnArg::Typed(pat_type) = arg {
             let ty = &pat_type.ty;
-            pat_type.ty = syn::parse_quote!(impl ::raster::IntoResolvedArg<#ty>);
+            pat_type.ty = syn::parse_quote!(impl ::raster::IntoAuthValue<#ty>);
         }
     }
 }
@@ -82,21 +82,21 @@ fn sequence_arg_ident(index: usize) -> syn::Ident {
     format_ident!("__RasterArg{}", index)
 }
 
-fn gen_arg_resolution(input: &ItemFn) -> proc_macro2::TokenStream {
+fn gen_auth_value_materialization(input: &ItemFn) -> proc_macro2::TokenStream {
     let params = extract_params(input);
     let resolutions: Vec<_> = params
         .iter()
         .map(|param| {
             let name = &param.ident;
-            let resolved_ty = &param.ty;
+            let value_ty = &param.ty;
             let external_info_ident = external_info_ident(param);
             let internal_info_ident = internal_info_ident(param);
             quote! {
-                let __raster_resolved_arg = ::raster::into_resolved_arg::<#resolved_ty, _>(#name)
-                    .unwrap_or_else(|e| panic!("Failed to resolve call argument '{}': {}", stringify!(#name), e));
-                let #external_info_ident = __raster_resolved_arg.as_external().cloned();
-                let #internal_info_ident = __raster_resolved_arg.as_internal().cloned();
-                let #name: #resolved_ty = __raster_resolved_arg.into_inner();
+                let __raster_auth_value = ::raster::into_auth_value::<#value_ty, _>(#name)
+                    .unwrap_or_else(|e| panic!("Failed to materialize auth value for argument '{}': {}", stringify!(#name), e));
+                let #external_info_ident = __raster_auth_value.as_external().cloned();
+                let #internal_info_ident = __raster_auth_value.as_internal().cloned();
+                let #name: #value_ty = __raster_auth_value.into_inner();
             }
         })
         .collect();
@@ -969,10 +969,10 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
     let function_call = gen_function_call(&implementation_name, &input_fn);
     let output_serialization = gen_output_serialization();
     let trace_output_serialization = gen_tile_trace_output_serialization();
-    let arg_resolution = gen_arg_resolution(&input_fn);
+    let auth_value_materialization = gen_auth_value_materialization(&input_fn);
 
     let mut exposed_sig = input_fn.sig.clone();
-    rewrite_into_resolved_args(&mut exposed_sig);
+    rewrite_into_auth_value_args(&mut exposed_sig);
 
     let mut implementation_sig = input_fn.sig.clone();
     implementation_sig.ident = implementation_name.clone();
@@ -1016,7 +1016,7 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
     let original_function = quote! {
         #(#fn_attrs)*
         #fn_vis #exposed_sig {
-            #arg_resolution
+            #auth_value_materialization
 
             // On std + non-riscv32: wrap body in closure for tracing
             #[cfg(all(feature = "std", not(target_arch = "riscv32")))]

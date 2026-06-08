@@ -1,5 +1,5 @@
 use raster_core::input::{
-    ExternalArg, ExternalSelection, ListProofDirection, ListProofSibling, SchemaNode, Selectable,
+    ExternalValue, ExternalSelection, ListProofDirection, ListProofSibling, SchemaNode, Selectable,
     SelectedPayload, SelectionProof, SelectionProofStep, SelectorPath, SelectorSegment,
 };
 use raster_core::{Error, Result as CoreResult};
@@ -1660,8 +1660,8 @@ fn external_value_from_parts<T>(
     resolved: ResolvedExternalData,
     selected: SelectedPayload,
     value: T,
-) -> ExternalArg<T> {
-    ExternalArg::new(
+) -> ExternalValue<T> {
+    ExternalValue::new(
         name,
         selector,
         Some(resolved.commitment().to_string()),
@@ -1671,10 +1671,10 @@ fn external_value_from_parts<T>(
 }
 
 pub fn select_external_arg<Root, T>(
-    value: &ExternalArg<Root>,
+    value: &ExternalValue<Root>,
     selector: &SelectorPath,
     full_selector: &SelectorPath,
-) -> CoreResult<ExternalArg<T>>
+) -> CoreResult<ExternalValue<T>>
 where
     Root: DeserializeOwned + Serialize + Selectable,
     T: DeserializeOwned + Serialize,
@@ -1686,8 +1686,17 @@ where
             value.name, e
         ))
     })?;
-    let selected = selected_payload_from_proven(selector, proven);
-    Ok(ExternalArg::new(
+    let mut steps = value.selected.proof.steps.clone();
+    steps.extend(proven.steps);
+    let selected = SelectedPayload {
+        bytes: proven.selected_bytes,
+        proof: SelectionProof {
+            path: full_selector.clone(),
+            root_hash: value.selected.proof.root_hash.clone(),
+            steps,
+        },
+    };
+    Ok(ExternalValue::new(
         value.name.clone(),
         full_selector.clone(),
         value.commitment.clone(),
@@ -1916,7 +1925,7 @@ pub fn write_raster_files<T: Serialize>(
 
 pub fn resolve_external_value<T: DeserializeOwned + Serialize>(
     reference: ExternalSelection,
-) -> CoreResult<ExternalArg<T>> {
+) -> CoreResult<ExternalValue<T>> {
     let storage = load_external_storage()?.ok_or_else(|| {
         Error::Other(
             "External input resolution requires CLI input context from --input and --input-manifest"
@@ -1961,7 +1970,7 @@ pub fn resolve_external_value<T: DeserializeOwned + Serialize>(
 
 pub fn resolve_typed_external_value<Root, T>(
     reference: ExternalSelection,
-) -> CoreResult<ExternalArg<T>>
+) -> CoreResult<ExternalValue<T>>
 where
     Root: DeserializeOwned + Serialize + Selectable,
     T: DeserializeOwned + Serialize,

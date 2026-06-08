@@ -5,8 +5,8 @@ use core::marker::PhantomData;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 pub use raster_core::input::{
-    verify_selection_proof, ExternalArg, ExternalEncoding, ExternalRef, ExternalSelection,
-    InternalArg, InternalRef, ListProofDirection, ListProofSibling, ResolvedArg, SchemaField,
+    verify_selection_proof, ExternalValue, ExternalEncoding, ExternalRef, ExternalSelection,
+    InternalValue, InternalRef, ListProofDirection, ListProofSibling, AuthValue, SchemaField,
     SchemaNode, Selectable, SelectedPayload, SelectionProof, SelectionProofStep, SelectorPath,
     SelectorSegment,
 };
@@ -23,7 +23,7 @@ pub struct TypedExternalBinding<Root> {
 #[derive(Debug)]
 pub struct TypedInternalBinding<Root> {
     reference: InternalRef,
-    resolve: fn(InternalRef) -> raster_core::Result<InternalArg<Root>>,
+    resolve: fn(InternalRef) -> raster_core::Result<InternalValue<Root>>,
     marker: PhantomData<fn() -> Root>,
 }
 
@@ -61,7 +61,7 @@ where
     #[doc(hidden)]
     pub fn with_resolver(
         reference: InternalRef,
-        resolve: fn(InternalRef) -> raster_core::Result<InternalArg<Root>>,
+        resolve: fn(InternalRef) -> raster_core::Result<InternalValue<Root>>,
     ) -> Self {
         Self {
             reference,
@@ -106,7 +106,7 @@ where
 #[doc(hidden)]
 pub fn typed_internal_with_resolver<Root>(
     reference: InternalRef,
-    resolve: fn(InternalRef) -> raster_core::Result<InternalArg<Root>>,
+    resolve: fn(InternalRef) -> raster_core::Result<InternalValue<Root>>,
 ) -> TypedInternalBinding<Root>
 where
     Root: DeserializeOwned + Serialize,
@@ -120,50 +120,22 @@ pub fn typed_selector_path<Root, Selected>(
     TypedSelectorPath::new(path)
 }
 
-#[derive(Debug, PartialEq, Eq, Hash)]
-pub struct TypedSelectedExternalBinding<Root, Selected> {
-    source: TypedExternalBinding<Root>,
-    selector: TypedSelectorPath<Root, Selected>,
-}
-
-#[doc(hidden)]
-#[derive(Debug)]
-pub struct DeferredExternal<Root, Current> {
-    name: String,
-    selector: SelectorPath,
-    resolve: fn(ExternalSelection) -> raster_core::Result<ExternalArg<Current>>,
-    marker: PhantomData<fn() -> (Root, Current)>,
-}
-
-#[doc(hidden)]
-#[derive(Debug)]
-pub struct DeferredInternal<Root, Current> {
-    reference: InternalRef,
-    resolve: fn(InternalRef) -> raster_core::Result<InternalArg<Current>>,
-    marker: PhantomData<fn() -> (Root, Current)>,
-}
-
 type ExternalResolveFn<Current> =
-    Rc<dyn Fn(ExternalSelection) -> raster_core::Result<ExternalArg<Current>>>;
+    Rc<dyn Fn(ExternalSelection) -> raster_core::Result<ExternalValue<Current>>>;
 
+#[doc(hidden)]
 pub struct DeferredAuthExternal<Current> {
     name: String,
     selector: SelectorPath,
     resolve: ExternalResolveFn<Current>,
 }
 
+#[doc(hidden)]
 #[derive(Debug)]
 pub struct DeferredAuthInternal<Current> {
     reference: InternalRef,
-    resolve: fn(InternalRef) -> raster_core::Result<InternalArg<Current>>,
+    resolve: fn(InternalRef) -> raster_core::Result<InternalValue<Current>>,
     marker: PhantomData<fn() -> Current>,
-}
-
-#[derive(Debug)]
-pub enum SequenceArg<Root, Current> {
-    Inline(Current),
-    External(DeferredExternal<Root, Current>),
-    Internal(DeferredInternal<Root, Current>),
 }
 
 pub enum AuthRef<Current> {
@@ -232,36 +204,6 @@ impl<Root, Selected> Clone for TypedSelectorPath<Root, Selected> {
     }
 }
 
-impl<Root, Selected> Clone for TypedSelectedExternalBinding<Root, Selected> {
-    fn clone(&self) -> Self {
-        Self {
-            source: self.source.clone(),
-            selector: self.selector.clone(),
-        }
-    }
-}
-
-impl<Root, Current> Clone for DeferredExternal<Root, Current> {
-    fn clone(&self) -> Self {
-        Self {
-            name: self.name.clone(),
-            selector: self.selector.clone(),
-            resolve: self.resolve,
-            marker: PhantomData,
-        }
-    }
-}
-
-impl<Root, Current> Clone for DeferredInternal<Root, Current> {
-    fn clone(&self) -> Self {
-        Self {
-            reference: self.reference.clone(),
-            resolve: self.resolve,
-            marker: PhantomData,
-        }
-    }
-}
-
 impl<Current> Clone for DeferredAuthExternal<Current> {
     fn clone(&self) -> Self {
         Self {
@@ -287,19 +229,6 @@ impl<Current> Clone for DeferredAuthInternal<Current> {
             reference: self.reference.clone(),
             resolve: self.resolve,
             marker: PhantomData,
-        }
-    }
-}
-
-impl<Root, Current> Clone for SequenceArg<Root, Current>
-where
-    Current: Clone,
-{
-    fn clone(&self) -> Self {
-        match self {
-            Self::Inline(value) => Self::Inline(value.clone()),
-            Self::External(binding) => Self::External(binding.clone()),
-            Self::Internal(binding) => Self::Internal(binding.clone()),
         }
     }
 }
@@ -330,19 +259,9 @@ where
     }
 }
 
-pub trait IntoSequenceArg<Current> {
-    type Root;
-
-    fn into_sequence_arg(self) -> SequenceArg<Self::Root, Current>;
-}
-
 pub trait IntoAuthRef<Current> {
     fn into_auth_ref(self) -> AuthRef<Current>;
 }
-
-pub trait TypedSequenceRoot: DeserializeOwned + Serialize + Selectable {}
-
-impl<T> TypedSequenceRoot for T where T: DeserializeOwned + Serialize + Selectable {}
 
 pub trait SelectSource {
     type Root;
@@ -357,55 +276,13 @@ pub trait SelectSource {
         Selected: DeserializeOwned + Serialize;
 }
 
-impl<Root> SelectSource for TypedExternalBinding<Root> {
-    type Root = Root;
-    type Current = Root;
-    type Selected<Selected> = TypedSelectedExternalBinding<Root, Selected>;
-
-    fn select<Selected>(
-        self,
-        selector: TypedSelectorPath<Self::Current, Selected>,
-    ) -> Self::Selected<Selected>
-    where
-        Selected: DeserializeOwned + Serialize,
-    {
-        TypedSelectedExternalBinding {
-            source: self,
-            selector,
-        }
-    }
-}
-
-impl<Root, Current> SelectSource for TypedSelectedExternalBinding<Root, Current> {
-    type Root = Root;
-    type Current = Current;
-    type Selected<Selected> = TypedSelectedExternalBinding<Root, Selected>;
-
-    fn select<Selected>(
-        self,
-        selector: TypedSelectorPath<Self::Current, Selected>,
-    ) -> Self::Selected<Selected>
-    where
-        Selected: DeserializeOwned + Serialize,
-    {
-        let selector = TypedSelectorPath::new(compose_selector_paths(
-            self.selector.into_path(),
-            selector.into_path(),
-        ));
-        TypedSelectedExternalBinding {
-            source: self.source,
-            selector,
-        }
-    }
-}
-
-impl<Root, Current> SelectSource for SequenceArg<Root, Current>
+impl<Root> SelectSource for TypedExternalBinding<Root>
 where
-    Root: TypedSequenceRoot,
+    Root: DeserializeOwned + Serialize + Selectable + 'static,
 {
     type Root = Root;
-    type Current = Current;
-    type Selected<Selected> = SequenceArg<Root, Selected>;
+    type Current = Root;
+    type Selected<Selected> = AuthRef<Selected>;
 
     fn select<Selected>(
         self,
@@ -414,22 +291,13 @@ where
     where
         Selected: DeserializeOwned + Serialize,
     {
-        match self {
-            SequenceArg::Inline(_) => {
-                panic!(
-                    "select! on inline or internal sequence values is not supported; only external bindings can be refined inside sequences"
-                )
-            }
-            SequenceArg::External(binding) => SequenceArg::External(DeferredExternal {
-                name: binding.name,
-                selector: compose_selector_paths(binding.selector, selector.into_path()),
-                resolve: resolve_typed_external_value::<Root, Selected>,
-                marker: PhantomData,
-            }),
-            SequenceArg::Internal(_) => {
-                panic!("select! on internal sequence bindings is not supported")
-            }
-        }
+        let name = self.name;
+        let selector = selector.into_path();
+        AuthRef::External(DeferredAuthExternal {
+            name: name.clone(),
+            selector: selector.clone(),
+            resolve: Rc::new(move |reference| resolve_typed_external_value::<Root, Selected>(reference)),
+        })
     }
 }
 
@@ -505,39 +373,12 @@ pub fn selector_path(segments: Vec<SelectorSegment>) -> SelectorPath {
     SelectorPath::new(segments)
 }
 
-impl<T> IntoSequenceArg<T> for T
-where
-    T: Serialize,
-{
-    type Root = T;
-
-    fn into_sequence_arg(self) -> SequenceArg<Self::Root, T> {
-        SequenceArg::Inline(self)
-    }
-}
-
 impl<T> IntoAuthRef<T> for T
 where
     T: Serialize,
 {
     fn into_auth_ref(self) -> AuthRef<T> {
         AuthRef::Inline(self)
-    }
-}
-
-impl<Root> IntoSequenceArg<Root> for TypedExternalBinding<Root>
-where
-    Root: DeserializeOwned + Serialize,
-{
-    type Root = Root;
-
-    fn into_sequence_arg(self) -> SequenceArg<Self::Root, Root> {
-        SequenceArg::External(DeferredExternal {
-            name: self.name,
-            selector: SelectorPath::default(),
-            resolve: resolve_external_value::<Root>,
-            marker: PhantomData,
-        })
     }
 }
 
@@ -555,21 +396,6 @@ where
     }
 }
 
-impl<Root> IntoSequenceArg<Root> for TypedInternalBinding<Root>
-where
-    Root: DeserializeOwned + Serialize,
-{
-    type Root = Root;
-
-    fn into_sequence_arg(self) -> SequenceArg<Self::Root, Root> {
-        SequenceArg::Internal(DeferredInternal {
-            reference: self.reference,
-            resolve: self.resolve,
-            marker: PhantomData,
-        })
-    }
-}
-
 impl<Root> IntoAuthRef<Root> for TypedInternalBinding<Root>
 where
     Root: DeserializeOwned + Serialize,
@@ -583,87 +409,10 @@ where
     }
 }
 
-impl<Root, Current> IntoSequenceArg<Current> for TypedSelectedExternalBinding<Root, Current>
-where
-    Root: DeserializeOwned + Serialize + Selectable,
-    Current: DeserializeOwned + Serialize,
-{
-    type Root = Root;
-
-    fn into_sequence_arg(self) -> SequenceArg<Self::Root, Current> {
-        SequenceArg::External(DeferredExternal {
-            name: self.source.name,
-            selector: self.selector.into_path(),
-            resolve: resolve_typed_external_value::<Root, Current>,
-            marker: PhantomData,
-        })
-    }
-}
-
-impl<Root, Current> IntoAuthRef<Current> for TypedSelectedExternalBinding<Root, Current>
-where
-    Root: DeserializeOwned + Serialize + Selectable + 'static,
-    Current: DeserializeOwned + Serialize + 'static,
-{
-    fn into_auth_ref(self) -> AuthRef<Current> {
-        let name = self.source.name;
-        let selector = self.selector.into_path();
-        AuthRef::External(DeferredAuthExternal {
-            name: name.clone(),
-            selector: selector.clone(),
-            resolve: Rc::new(move |reference| resolve_typed_external_value::<Root, Current>(reference)),
-        })
-    }
-}
-
-impl<Root, Current> IntoSequenceArg<Current> for SequenceArg<Root, Current> {
-    type Root = Root;
-
-    fn into_sequence_arg(self) -> SequenceArg<Self::Root, Current> {
-        self
-    }
-}
-
-impl<Root, Current> IntoAuthRef<Current> for SequenceArg<Root, Current>
-where
-    Current: Serialize + 'static,
-{
-    fn into_auth_ref(self) -> AuthRef<Current> {
-        match self {
-            SequenceArg::Inline(value) => AuthRef::Inline(value),
-            SequenceArg::External(binding) => {
-                let DeferredExternal {
-                    name,
-                    selector,
-                    resolve,
-                    ..
-                } = binding;
-                AuthRef::External(DeferredAuthExternal {
-                    name,
-                    selector,
-                    resolve: Rc::new(move |reference| resolve(reference)),
-                })
-            }
-            SequenceArg::Internal(binding) => AuthRef::Internal(DeferredAuthInternal {
-                reference: binding.reference,
-                resolve: binding.resolve,
-                marker: PhantomData,
-            }),
-        }
-    }
-}
-
 impl<Current> IntoAuthRef<Current> for AuthRef<Current> {
     fn into_auth_ref(self) -> AuthRef<Current> {
         self
     }
-}
-
-pub fn into_sequence_arg<T, A>(arg: A) -> SequenceArg<A::Root, T>
-where
-    A: IntoSequenceArg<T>,
-{
-    arg.into_sequence_arg()
 }
 
 pub fn into_auth_ref<T, A>(arg: A) -> AuthRef<T>
@@ -673,101 +422,66 @@ where
     arg.into_auth_ref()
 }
 
-pub trait IntoResolvedArg<T> {
-    fn into_resolved_arg(self) -> raster_core::Result<ResolvedArg<T>>;
+pub trait IntoAuthValue<T> {
+    fn into_auth_value(self) -> raster_core::Result<AuthValue<T>>;
 }
 
-impl<T> IntoResolvedArg<T> for T
+impl<T> IntoAuthValue<T> for T
 where
     T: Serialize,
 {
-    fn into_resolved_arg(self) -> raster_core::Result<ResolvedArg<T>> {
-        Ok(ResolvedArg::inline(self))
+    fn into_auth_value(self) -> raster_core::Result<AuthValue<T>> {
+        Ok(AuthValue::inline(self))
     }
 }
 
-impl<Root> IntoResolvedArg<Root> for TypedExternalBinding<Root>
+impl<Root> IntoAuthValue<Root> for TypedExternalBinding<Root>
 where
     Root: DeserializeOwned + Serialize,
 {
-    fn into_resolved_arg(self) -> raster_core::Result<ResolvedArg<Root>> {
+    fn into_auth_value(self) -> raster_core::Result<AuthValue<Root>> {
         let value = resolve_external_value::<Root>(self.into_selection())?;
-        Ok(ResolvedArg::external(value))
+        Ok(AuthValue::external(value))
     }
 }
 
-impl<Root> IntoResolvedArg<Root> for TypedInternalBinding<Root>
+impl<Root> IntoAuthValue<Root> for TypedInternalBinding<Root>
 where
     Root: DeserializeOwned + Serialize,
 {
-    fn into_resolved_arg(self) -> raster_core::Result<ResolvedArg<Root>> {
+    fn into_auth_value(self) -> raster_core::Result<AuthValue<Root>> {
         let value = (self.resolve)(self.reference)?;
-        Ok(ResolvedArg::internal(value))
+        Ok(AuthValue::internal(value))
     }
 }
 
-impl<Root, Selected> IntoResolvedArg<Selected> for TypedSelectedExternalBinding<Root, Selected>
-where
-    Root: DeserializeOwned + Serialize + Selectable,
-    Selected: DeserializeOwned + Serialize,
-{
-    fn into_resolved_arg(self) -> raster_core::Result<ResolvedArg<Selected>> {
-        let value = resolve_typed_external_value::<Root, Selected>(
-            ExternalSelection::with_selector(self.source.name, self.selector.into_path()),
-        )?;
-        Ok(ResolvedArg::external(value))
-    }
-}
-
-impl<Root, Current> IntoResolvedArg<Current> for SequenceArg<Root, Current>
-where
-    Current: Serialize + DeserializeOwned,
-{
-    fn into_resolved_arg(self) -> raster_core::Result<ResolvedArg<Current>> {
-        match self {
-            SequenceArg::Inline(value) => Ok(ResolvedArg::inline(value)),
-            SequenceArg::External(binding) => {
-                let value = (binding.resolve)(ExternalSelection::with_selector(
-                    binding.name,
-                    binding.selector,
-                ))?;
-                Ok(ResolvedArg::external(value))
-            }
-            SequenceArg::Internal(binding) => {
-                let value = (binding.resolve)(binding.reference)?;
-                Ok(ResolvedArg::internal(value))
-            }
-        }
-    }
-}
-
-impl<Current> IntoResolvedArg<Current> for AuthRef<Current>
+impl<Current> IntoAuthValue<Current> for AuthRef<Current>
 where
     Current: Serialize,
 {
-    fn into_resolved_arg(self) -> raster_core::Result<ResolvedArg<Current>> {
+    fn into_auth_value(self) -> raster_core::Result<AuthValue<Current>> {
         match self {
-            AuthRef::Inline(value) => Ok(ResolvedArg::inline(value)),
+            AuthRef::Inline(value) => Ok(AuthValue::inline(value)),
             AuthRef::External(binding) => {
                 let value = (binding.resolve.as_ref())(ExternalSelection::with_selector(
                     binding.name,
                     binding.selector,
                 ))?;
-                Ok(ResolvedArg::external(value))
+                Ok(AuthValue::external(value))
             }
             AuthRef::Internal(binding) => {
                 let value = (binding.resolve)(binding.reference)?;
-                Ok(ResolvedArg::internal(value))
+                Ok(AuthValue::internal(value))
             }
         }
     }
 }
 
-pub fn into_resolved_arg<T, A>(arg: A) -> raster_core::Result<ResolvedArg<T>>
+pub fn into_auth_value<T, A>(arg: A) -> raster_core::Result<AuthValue<T>>
 where
-    A: IntoResolvedArg<T>,
+    A: IntoAuthValue<T>,
 {
-    arg.into_resolved_arg()
+    arg.into_auth_value()
 }
 
 pub fn auth_ref_trace<T>(arg: &AuthRef<T>) -> raster_core::Result<AuthRefTrace>
@@ -826,61 +540,11 @@ where
     }
 }
 
-pub fn sequence_arg_trace<Root, T>(
-    arg: &SequenceArg<Root, T>,
-) -> raster_core::Result<(
-    FnInputValue,
-    Option<TraceExternalData>,
-    Option<TraceInternalData>,
-)>
-where
-    T: Serialize + DeserializeOwned,
-{
-    match arg {
-        SequenceArg::Inline(value) => Ok((
-            FnInputValue::Inline(raster_core::postcard::to_allocvec(value).unwrap_or_default()),
-            None,
-            None,
-        )),
-        SequenceArg::External(binding) => {
-            let resolved = (binding.resolve)(ExternalSelection::with_selector(
-                binding.name.clone(),
-                binding.selector.clone(),
-            ))?;
-            Ok((
-                FnInputValue::ExternalBinding,
-                Some(TraceExternalData {
-                    name: resolved.name,
-                    commitment: resolved
-                        .commitment
-                        .map(|value| value.into_bytes())
-                        .unwrap_or_default(),
-                    tree_root: resolved.selected.proof.root_hash.clone(),
-                    selector: resolved.selector,
-                    selected: resolved.selected,
-                }),
-                None,
-            ))
-        }
-        SequenceArg::Internal(binding) => {
-            let resolved = (binding.resolve)(binding.reference.clone())?;
-            Ok((
-                FnInputValue::InternalBinding,
-                None,
-                Some(TraceInternalData {
-                    coordinates: resolved.reference.coordinates,
-                    commitment: resolved.reference.commitment,
-                }),
-            ))
-        }
-    }
-}
-
 pub fn select_external_value<Root, T>(
-    value: &ExternalArg<Root>,
+    value: &ExternalValue<Root>,
     selector: &SelectorPath,
     full_selector: &SelectorPath,
-) -> raster_core::Result<ExternalArg<T>>
+) -> raster_core::Result<ExternalValue<T>>
 where
     Root: DeserializeOwned + Serialize + Selectable,
     T: DeserializeOwned + Serialize,
@@ -903,7 +567,7 @@ where
 
 pub fn resolve_external_value<T: DeserializeOwned + Serialize>(
     reference: ExternalSelection,
-) -> raster_core::Result<raster_core::input::ExternalArg<T>> {
+) -> raster_core::Result<raster_core::input::ExternalValue<T>> {
     #[cfg(feature = "std")]
     {
         return raster_runtime::resolve_external_value(reference);
@@ -920,7 +584,7 @@ pub fn resolve_external_value<T: DeserializeOwned + Serialize>(
 
 pub fn resolve_typed_external_value<Root, T>(
     reference: ExternalSelection,
-) -> raster_core::Result<raster_core::input::ExternalArg<T>>
+) -> raster_core::Result<raster_core::input::ExternalValue<T>>
 where
     Root: DeserializeOwned + Serialize + Selectable,
     T: DeserializeOwned + Serialize,
@@ -941,7 +605,7 @@ where
 
 pub fn resolve_internal_value<T: DeserializeOwned + Serialize>(
     reference: InternalRef,
-) -> raster_core::Result<raster_core::input::InternalArg<T>> {
+) -> raster_core::Result<raster_core::input::InternalValue<T>> {
     #[cfg(feature = "std")]
     {
         return raster_runtime::resolve_internal_value(&reference);
@@ -958,7 +622,7 @@ pub fn resolve_internal_value<T: DeserializeOwned + Serialize>(
 
 pub fn resolve_internal_ok_value<T: DeserializeOwned + Serialize>(
     reference: InternalRef,
-) -> raster_core::Result<raster_core::input::InternalArg<T>> {
+) -> raster_core::Result<raster_core::input::InternalValue<T>> {
     #[cfg(feature = "std")]
     {
         return raster_runtime::resolve_internal_ok_value(&reference);
@@ -978,22 +642,14 @@ pub fn store_internal_value<T: Serialize>(value: &T) -> raster_core::Result<Inte
     raster_runtime::store_internal_value(value)
 }
 
-pub fn materialize<T, A>(arg: A) -> T
-where
-    T: DeserializeOwned + Serialize,
-    A: IntoResolvedArg<T>,
-{
-    into_resolved_arg::<T, _>(arg)
-        .unwrap_or_else(|error| panic!("Failed to materialize Raster binding: {}", error))
-        .into_inner()
-}
-
 pub fn materialize_auth_return<T, A>(value: A) -> T
 where
     T: DeserializeOwned + Serialize,
-    A: IntoResolvedArg<T>,
+    A: IntoAuthValue<T>,
 {
-    materialize::<T, _>(value)
+    into_auth_value::<T, _>(value)
+        .unwrap_or_else(|error| panic!("Failed to materialize Raster auth return: {}", error))
+        .into_inner()
 }
 
 pub fn materialize_auth_result<T, A>(
@@ -1001,9 +657,13 @@ pub fn materialize_auth_result<T, A>(
 ) -> core::result::Result<T, String>
 where
     T: DeserializeOwned + Serialize,
-    A: IntoResolvedArg<T>,
+    A: IntoAuthValue<T>,
 {
-    value.map(materialize::<T, A>)
+    value.map(|arg| {
+        into_auth_value::<T, A>(arg)
+            .unwrap_or_else(|error| panic!("Failed to materialize Raster auth result: {}", error))
+            .into_inner()
+    })
 }
 
 #[cfg(feature = "std")]

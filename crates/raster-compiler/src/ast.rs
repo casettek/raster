@@ -290,26 +290,6 @@ impl CallVisitor {
         Some((callee, arguments, argument_kinds))
     }
 
-    fn parse_materialize_macro_expr(mac: &syn::Macro) -> Option<Expr> {
-        struct MaterializeInput {
-            _ty: syn::Type,
-            _comma: syn::Token![,],
-            expr: Expr,
-        }
-
-        impl syn::parse::Parse for MaterializeInput {
-            fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
-                Ok(Self {
-                    _ty: input.parse()?,
-                    _comma: input.parse()?,
-                    expr: input.parse()?,
-                })
-            }
-        }
-
-        mac.parse_body::<MaterializeInput>().ok().map(|input| input.expr)
-    }
-
     fn classify_argument(expr: &Expr) -> CallArgumentKind {
         match expr {
             Expr::Path(path) if path.path.get_ident().is_some() => CallArgumentKind::Identifier,
@@ -358,52 +338,6 @@ impl CallVisitor {
         }
     }
 
-    fn is_materialize_macro(mac: &syn::Macro) -> bool {
-        let segments: Vec<String> = mac
-            .path
-            .segments
-            .iter()
-            .map(|s| s.ident.to_string())
-            .collect();
-
-        match segments.as_slice() {
-            [name] if name == "materialize" => true,
-            [prefix, name] if prefix == "raster" && name == "materialize" => true,
-            _ => false,
-        }
-    }
-
-    fn collect_wrapped_expr(&mut self, expr: &Expr) {
-        match expr {
-            Expr::Macro(expr_macro) => {
-                if let Some(call_kind) = Self::macro_call_kind(&expr_macro.mac) {
-                    if let Some((callee, arguments, argument_kinds)) =
-                        Self::parse_call_macro_args(&expr_macro.mac)
-                    {
-                        let result_binding = self.current_binding.take();
-                        self.call_infos.push(CallInfo {
-                            callee,
-                            arguments,
-                            argument_kinds,
-                            result_binding,
-                            call_kind,
-                        });
-                    }
-                    return;
-                }
-
-                if Self::is_materialize_macro(&expr_macro.mac) {
-                    if let Some(inner_expr) = Self::parse_materialize_macro_expr(&expr_macro.mac) {
-                        self.collect_wrapped_expr(&inner_expr);
-                    }
-                }
-            }
-            Expr::Try(expr_try) => self.collect_wrapped_expr(&expr_try.expr),
-            Expr::Paren(expr_paren) => self.collect_wrapped_expr(&expr_paren.expr),
-            Expr::Group(expr_group) => self.collect_wrapped_expr(&expr_group.expr),
-            _ => {}
-        }
-    }
 }
 
 impl<'ast> Visit<'ast> for CallVisitor {
@@ -437,12 +371,6 @@ impl<'ast> Visit<'ast> for CallVisitor {
                     call_kind,
                 });
                 // Do not recurse into the macro body — arguments are already captured above.
-                return;
-            }
-        }
-        if Self::is_materialize_macro(&node.mac) {
-            if let Some(inner_expr) = Self::parse_materialize_macro_expr(&node.mac) {
-                self.collect_wrapped_expr(&inner_expr);
                 return;
             }
         }
@@ -637,23 +565,4 @@ mod tests {
         assert_eq!(calls[0].result_binding.as_deref(), Some("x"));
     }
 
-    #[test]
-    fn test_materialize_wrapped_call_extraction() {
-        let calls = parse_calls("fn seq() { let x = materialize!(String, call!(greet, name)); }");
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].callee, "greet");
-        assert_eq!(calls[0].call_kind, CallKind::Tile);
-        assert_eq!(calls[0].result_binding.as_deref(), Some("x"));
-        assert_eq!(calls[0].arguments, vec!["name"]);
-    }
-
-    #[test]
-    fn test_materialize_wrapped_fallible_call_extraction() {
-        let calls = parse_calls("fn seq() { let x = materialize!(String, call!(greet, name)?); }");
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].callee, "greet");
-        assert_eq!(calls[0].call_kind, CallKind::Tile);
-        assert_eq!(calls[0].result_binding.as_deref(), Some("x"));
-        assert_eq!(calls[0].arguments, vec!["name"]);
-    }
 }
