@@ -172,6 +172,22 @@ fn call_recur_finalizes_to_selectable_internal_ref() {
 }
 
 #[test]
+fn debug_formats_materialized_internal_auth_ref() {
+    let reference = run_build_lines_reference();
+    let auth = into_auth_ref::<LineBundle, _>(internal!(LineBundle, reference));
+
+    let rendered = format!("{auth:?}");
+
+    assert!(rendered.contains("AuthRef"));
+    assert!(rendered.contains("storage: \"internal\""));
+    assert!(rendered.contains("coordinates: \""));
+    assert!(rendered.contains("commitment_len"));
+    assert!(rendered.contains("stored_bytes_len"));
+    assert!(rendered.contains("title: \"collected\""));
+    assert!(rendered.contains("items: [\"first\", \"second\", \"third\"]"));
+}
+
+#[test]
 fn call_recur_breaks_early_and_still_finalizes() {
     let result = run_find_first_match("beta".to_string());
 

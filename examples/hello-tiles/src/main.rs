@@ -1,4 +1,3 @@
-use raster::into_auth_value;
 use raster::prelude::*;
 
 use hello_tiles::input::{Address, CollectiveGreeting, PersonalData};
@@ -16,9 +15,7 @@ fn personal_greet_seq(personal_data: PersonalData) -> Result<String> {
 
     let result = call!(concat_messages, name, greet_address_line_result);
 
-    debug!("personal_greet_seq result ref: {:?}", result.reference());
-
-    // call!(maybe_echo_name, String::from(""))?;
+    debug!("personal_greet_seq result ref: {:?}", result);
 
     Ok(result)
 }
@@ -106,15 +103,7 @@ fn main() {
         draft
     );
     let draft_greeting = finalize(draft);
-    let draft_greeting_value =
-        into_auth_value::<CollectiveGreeting, _>(select!(CollectiveGreeting, draft_greeting.clone()))
-            .expect("draft greeting should materialize")
-            .into_inner();
-    debug!(
-        "draft greeting ref: {:?}, value: {:?}",
-        draft_greeting.reference(),
-        draft_greeting_value
-    );
+    debug!("draft greeting: {:?}", draft_greeting);
     let draft_title = select!(String, draft_greeting.clone().title);
     let first_draft_line = select!(String, draft_greeting.lines[0]);
     call!(concat_messages, draft_title, first_draft_line);
@@ -129,20 +118,12 @@ fn main() {
         output = new!(CollectiveGreeting),
         args = ("Recur-built greeting".to_string(),)
     );
-    let recur_greeting_value =
-        into_auth_value::<CollectiveGreeting, _>(select!(CollectiveGreeting, recur_greeting.clone()))
-            .expect("recur greeting should materialize")
-            .into_inner();
-    debug!(
-        "recur greeting ref: {:?}, value: {:?}",
-        recur_greeting.reference(),
-        recur_greeting_value
-    );
+    debug!("recur greeting: {:?}", recur_greeting);
     let recur_title = select!(String, recur_greeting.clone().title);
     let recur_first_line = select!(String, recur_greeting.lines[0]);
     call!(concat_messages, recur_title, recur_first_line);
 
     let name_2 = call_seq!(placeholder_sequence, "Placeholder".to_string());
     let result = call_seq!(greet_sequence, name_2);
-    debug!("main result ref: {:?}", result.reference());
+    debug!("main result: {:?}", result);
 }

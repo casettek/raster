@@ -481,15 +481,106 @@ where
     }
 }
 
+fn summarize_selector_path(selector: &SelectorPath) -> String {
+    if selector.is_empty() {
+        return "<root>".into();
+    }
+
+    let mut summary = String::new();
+    for segment in &selector.segments {
+        match segment {
+            SelectorSegment::Field(name) => {
+                if !summary.is_empty() {
+                    summary.push('.');
+                }
+                summary.push_str(name);
+            }
+            SelectorSegment::Index(index) => {
+                summary.push('[');
+                summary.push_str(&alloc::format!("{}", index));
+                summary.push(']');
+            }
+        }
+    }
+
+    summary
+}
+
+fn summarize_coordinates(coordinates: &raster_core::cfs::CfsCoordinates) -> String {
+    if coordinates.is_empty() {
+        return "<root>".into();
+    }
+
+    let mut summary = String::new();
+    for (index, coordinate) in coordinates.iter().enumerate() {
+        if index > 0 {
+            summary.push('/');
+        }
+        summary.push_str(&alloc::format!("{}", coordinate));
+    }
+
+    summary
+}
+
 impl<Current> core::fmt::Debug for AuthRef<Current>
 where
     Current: core::fmt::Debug,
 {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::Inline(value) => f.debug_tuple("Inline").field(value).finish(),
-            Self::External(binding) => f.debug_tuple("External").field(binding).finish(),
-            Self::Internal(binding) => f.debug_tuple("Internal").field(binding).finish(),
+            Self::Inline(value) => f
+                .debug_struct("AuthRef")
+                .field("storage", &"inline")
+                .field("value", value)
+                .finish(),
+            Self::External(binding) => {
+                let selector = summarize_selector_path(&binding.selector);
+                match (binding.resolve.as_ref())(ExternalSelection::with_selector(
+                    binding.name.clone(),
+                    binding.selector.clone(),
+                )) {
+                    Ok(resolved) => f
+                        .debug_struct("AuthRef")
+                        .field("storage", &"external")
+                        .field("name", &resolved.name)
+                        .field("selector", &summarize_selector_path(&resolved.selector))
+                        .field("commitment_present", &resolved.commitment.is_some())
+                        .field("proof_root_len", &resolved.selected.proof.root_hash.len())
+                        .field("selected_bytes_len", &resolved.selected.bytes.len())
+                        .field("value", &resolved.value)
+                        .finish(),
+                    Err(error) => f
+                        .debug_struct("AuthRef")
+                        .field("storage", &"external")
+                        .field("name", &binding.name)
+                        .field("selector", &selector)
+                        .field("materialization_error", &alloc::format!("{}", error))
+                        .finish(),
+                }
+            }
+            Self::Internal(binding) => match (binding.resolve.as_ref())(binding.reference.clone()) {
+                Ok(resolved) => f
+                    .debug_struct("AuthRef")
+                    .field("storage", &"internal")
+                    .field(
+                        "coordinates",
+                        &summarize_coordinates(&resolved.reference.coordinates),
+                    )
+                    .field("commitment_len", &resolved.reference.commitment.len())
+                    .field("stored_bytes_len", &resolved.bytes.len())
+                    .field("value", &resolved.value)
+                    .finish(),
+                Err(error) => f
+                    .debug_struct("AuthRef")
+                    .field("storage", &"internal")
+                    .field(
+                        "coordinates",
+                        &summarize_coordinates(&binding.reference.coordinates),
+                    )
+                    .field("commitment_len", &binding.reference.commitment.len())
+                    .field("materialization_error", &alloc::format!("{}", error))
+                    .finish(),
+            },
         }
     }
 }
