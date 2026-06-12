@@ -16,14 +16,16 @@ pub use raster_core as core;
 
 pub mod input;
 pub use input::{
-    auth_ref_result_trace, auth_ref_trace, into_auth_ref, into_auth_value,
-    materialize_auth_result, materialize_auth_return, resolve_external_value,
+    auth_ref_result_trace, auth_ref_trace, finalize, into_auth_ref, into_auth_value,
+    materialize_auth_result, materialize_auth_return, new_draft, resolve_external_value,
     resolve_internal_ok_value, resolve_internal_value, resolve_typed_external_value,
-    select_source, selector_path, typed_external, typed_internal, typed_internal_with_resolver,
-    typed_selector_path, AuthRef, AuthRefTrace, ExternalValue, ExternalRef, ExternalSelection,
-    InternalValue, InternalRef, IntoAuthRef, IntoAuthValue, ListProofDirection,
-    ListProofSibling, AuthValue, SchemaField, SchemaNode, SelectSource, Selectable,
-    SelectedPayload, SelectionProof, SelectionProofStep, SelectorPath, SelectorSegment,
+    run_recur_list, run_recur_list_with_state, select_source, selector_path, typed_external,
+    typed_internal, typed_internal_with_resolver, typed_selector_path, Anchor, AuthRef,
+    AuthRefTrace, AuthValue, Draft, DraftAppendField, DraftSetField, ExternalRef,
+    ExternalSelection, ExternalValue, InternalRef, InternalValue, IntoAuthRef, IntoAuthValue,
+    IntoRecurControl, ListProofDirection, ListProofSibling, Op, RecurControl, RecurInput,
+    RecurOutput, RecurState, Schema, SchemaField, SchemaFieldMode, SchemaNode, SelectSource,
+    Selectable, SelectedPayload, SelectionProof, SelectionProofStep, SelectorPath, SelectorSegment,
     TypedExternalBinding, TypedInternalBinding, TypedSelectorPath,
 };
 
@@ -94,7 +96,7 @@ pub mod __private {
     #[cfg(feature = "std")]
     pub fn bind_infallible_call<T>(result: T) -> crate::AuthRef<T>
     where
-        T: serde::Serialize + serde::de::DeserializeOwned,
+        T: serde::Serialize + serde::de::DeserializeOwned + 'static,
     {
         let reference = crate::store_internal_value(&result).unwrap_or_else(|error| {
             panic!("Failed to store tile output in internal storage: {}", error)
@@ -112,16 +114,18 @@ pub mod __private {
         result: core::result::Result<T, crate::alloc::string::String>,
     ) -> core::result::Result<crate::AuthRef<T>, crate::alloc::string::String>
     where
-        T: serde::Serialize + serde::de::DeserializeOwned,
+        T: serde::Serialize + serde::de::DeserializeOwned + 'static,
     {
         let reference = crate::store_internal_value(&result).unwrap_or_else(|error| {
             panic!("Failed to store tile output in internal storage: {}", error)
         });
         match result {
-            Ok(_) => Ok(crate::into_auth_ref::<T, _>(crate::typed_internal_with_resolver::<T>(
-                reference,
-                crate::resolve_internal_ok_value::<T>,
-            ))),
+            Ok(_) => Ok(crate::into_auth_ref::<T, _>(
+                crate::typed_internal_with_resolver::<T>(
+                    reference,
+                    crate::resolve_internal_ok_value::<T>,
+                ),
+            )),
             Err(error) => Err(error),
         }
     }
@@ -131,6 +135,36 @@ pub mod __private {
         _: core::result::Result<T, crate::alloc::string::String>,
     ) -> core::result::Result<crate::AuthRef<T>, crate::alloc::string::String> {
         panic!("Sequence call bindings require the `std` feature")
+    }
+
+    pub trait TileCallBinding<Return> {
+        type Output;
+
+        fn bind(result: Return) -> Self::Output;
+    }
+
+    pub fn bind_tile_call<Marker, Return>(
+        result: Return,
+    ) -> <Marker as TileCallBinding<Return>>::Output
+    where
+        Marker: TileCallBinding<Return>,
+    {
+        Marker::bind(result)
+    }
+
+    pub trait TryTileCallBinding<Return> {
+        type Output;
+
+        fn bind(result: Return) -> Self::Output;
+    }
+
+    pub fn bind_tile_try_call<Marker, Return>(
+        result: Return,
+    ) -> <Marker as TryTileCallBinding<Return>>::Output
+    where
+        Marker: TryTileCallBinding<Return>,
+    {
+        Marker::bind(result)
     }
 }
 
@@ -182,6 +216,13 @@ macro_rules! internal {
     };
 }
 
+#[macro_export]
+macro_rules! new {
+    ($ty:ty) => {
+        $crate::new_draft::<$ty>()
+    };
+}
+
 /// Canonical call primitive for invoking a sub-sequence inside a sequence.
 ///
 /// `call_seq!` is the explicit "sequence call boundary" — use it instead of bare
@@ -209,6 +250,18 @@ macro_rules! call_seq {
     };
     ($seq:ident, $($args:expr),+ $(,)?) => {
         $seq($($args),+)
+    };
+}
+
+/// Canonical recursive list-call primitive for invoking a recur tile inside a sequence.
+///
+/// `call_recur!` is only valid inside `#[sequence]` functions, where the sequence macro
+/// rewrites it into a hidden driver that iterates a selectable list source, threads a
+/// `Draft<_>` through each item, and finalizes the draft once the run ends.
+#[macro_export]
+macro_rules! call_recur {
+    ($($tt:tt)*) => {
+        compile_error!("call_recur! can only be used inside #[sequence] functions")
     };
 }
 
@@ -244,12 +297,14 @@ pub mod prelude {
 
     pub use crate::exec::Result;
     pub use crate::{
-        call, call_seq, debug, external, internal, into_auth_ref, materialize_auth_result,
-        materialize_auth_return, select, sequence, tile, AuthRef,
-        ExternalValue, ExternalSelection, InternalValue, InternalRef, IntoAuthRef, IntoAuthValue,
-        ListProofDirection, ListProofSibling, AuthValue, SchemaField, SchemaNode, SelectSource,
-        Selectable, SelectedPayload, SelectionProof, SelectionProofStep, SelectorPath,
-        SelectorSegment, TypedExternalBinding, TypedInternalBinding, TypedSelectorPath,
+        call, call_recur, call_seq, debug, external, finalize, internal, into_auth_ref,
+        materialize_auth_result, materialize_auth_return, new, select, sequence, tile, Anchor,
+        AuthRef, AuthValue, Draft, ExternalSelection, ExternalValue, InternalRef, InternalValue,
+        IntoAuthRef, IntoAuthValue, ListProofDirection, ListProofSibling, Op, RecurControl,
+        RecurInput, RecurOutput, RecurState, Schema, SchemaField, SchemaFieldMode, SchemaNode,
+        SelectSource, Selectable, SelectedPayload, SelectionProof, SelectionProofStep,
+        SelectorPath, SelectorSegment, TypedExternalBinding, TypedInternalBinding,
+        TypedSelectorPath,
     };
 
     // TODO: Re-enable once Executor/Tracer types are implemented

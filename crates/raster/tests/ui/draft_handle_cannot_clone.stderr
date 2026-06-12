@@ -1,0 +1,5 @@
+error[E0599]: no method named `clone` found for struct `Draft<S>` in the current scope
+  --> tests/ui/draft_handle_cannot_clone.rs:11:23
+   |
+11 |     let _copy = draft.clone();
+   |                       ^^^^^ method not found in `Draft<Account>`

@@ -86,12 +86,12 @@ impl<'ast> SequenceDiscovery<'ast> {
             .filter_map(|call_info| {
                 match call_info.call_kind {
                     // Canonical call!: callee must be a registered tile.
-                    CallKind::Tile => {
+                    CallKind::Tile | CallKind::Recursive => {
                         match tile_discovery.get(&call_info.callee) {
                             Some(tile) => Some(SequenceStep::Tile(tile)),
                             None => {
                                 eprintln!(
-                                    "error[raster]: `call!` in sequence `{}` refers to unknown tile `{}`; \
+                                    "error[raster]: tile call in sequence `{}` refers to unknown tile `{}`; \
                                      it is not registered in tile discovery. \
                                      Check the spelling or ensure `#[tile]` is applied.",
                                     func.name, call_info.callee

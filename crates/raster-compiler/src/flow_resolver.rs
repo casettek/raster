@@ -75,7 +75,7 @@ impl<'a, 'ast> FlowResolver<'a, 'ast> {
 
             // Call kind directly determines item type — no name-matching needed.
             let item = match call.call_kind {
-                CallKind::Tile => SequenceChildItem::Tile(TileItem {
+                CallKind::Tile | CallKind::Recursive => SequenceChildItem::Tile(TileItem {
                     id: call.callee.clone(),
                     sources: input_sources,
                 }),

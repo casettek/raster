@@ -155,7 +155,9 @@ fn run_capture_success_reference<A>(name: A) -> Result<InternalRef>
 where
     A: IntoAuthRef<String>,
 {
-    materialize_auth_result::<InternalRef, _>(__raster_sequence_auth_capture_success_reference(name))
+    materialize_auth_result::<InternalRef, _>(__raster_sequence_auth_capture_success_reference(
+        name,
+    ))
 }
 
 fn run_traced_error_outer<A>(name: A) -> Result<String>
@@ -294,7 +296,8 @@ fn sequence_wrapper_preserves_user_result() {
 
 #[test]
 fn infallible_call_binding_uses_tile_output_commitment() {
-    let (reference, events) = capture_trace_events(|| run_capture_echo_reference("Raster".to_string()));
+    let (reference, events) =
+        capture_trace_events(|| run_capture_echo_reference("Raster".to_string()));
     let tile_event = events
         .into_iter()
         .find(

@@ -346,12 +346,10 @@ impl TraceRecorder {
                     .unwrap_or_default();
 
                 let output = fn_call_record.output;
-                let internal_write = output
-                    .as_ref()
-                    .map(|output| {
-                        self.internal_storage
-                            .append_serialized_bytes(&output.data, tile_coordinates.clone())
-                    });
+                let internal_write = output.as_ref().map(|output| {
+                    self.internal_storage
+                        .append_serialized_bytes(&output.data, tile_coordinates.clone())
+                });
                 let output_commitment = internal_write
                     .as_ref()
                     .map(|write| write.entry.object_commitment.clone())

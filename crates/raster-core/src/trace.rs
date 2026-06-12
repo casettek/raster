@@ -77,8 +77,12 @@ impl FnInput {
     }
 
     pub fn source_witness_bytes(&self) -> Vec<u8> {
-        postcard::to_allocvec(&(self.values.clone(), self.external.clone(), self.internal.clone()))
-            .unwrap_or_default()
+        postcard::to_allocvec(&(
+            self.values.clone(),
+            self.external.clone(),
+            self.internal.clone(),
+        ))
+        .unwrap_or_default()
     }
 }
 

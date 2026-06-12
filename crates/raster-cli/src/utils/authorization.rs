@@ -3,8 +3,8 @@ use std::fs;
 use std::path::Path;
 
 use raster_core::authorization::ManifestedInputs;
-use raster_core::transition::InternalStoreWitness;
 use raster_core::trace::{ExternalInput, FnInput, StepRecord};
+use raster_core::transition::InternalStoreWitness;
 use raster_core::{Error, Result};
 
 pub fn read_json_source(raw_input: Option<&str>, label: &str) -> Result<Vec<u8>> {

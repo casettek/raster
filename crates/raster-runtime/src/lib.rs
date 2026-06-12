@@ -12,12 +12,13 @@ mod raster_index;
 pub mod tracing;
 pub use input::{
     encode_raster_value, resolve_external_value, resolve_typed_external_value, select_external_arg,
-    write_raster_files,
+    select_internal_value, write_raster_files,
 };
 pub use internal_storage::{
-    enter_sequence_scope, exit_sequence_scope, global_internal_store_snapshot,
-    resolve_internal_ok_value, resolve_internal_value, store_internal_value,
-    InternalStorageManager, InternalStoreSnapshot, InternalWriteRecord, StoredInternalObject,
+    apply_draft_push, apply_draft_set, create_draft, enter_sequence_scope, exit_sequence_scope,
+    finalize_draft, global_internal_store_snapshot, resolve_internal_ok_value,
+    resolve_internal_value, store_internal_value, InternalStorageManager, InternalStoreSnapshot,
+    InternalWriteRecord, StoredInternalObject,
 };
 pub use tracing::{
     commitment::Sha256Commitment,

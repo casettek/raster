@@ -13,7 +13,7 @@ use alloc::format;
 use alloc::string::String;
 use raster::prelude::*;
 
-use crate::input::PersonalData;
+use crate::input::{CollectiveGreeting, CollectiveGreetingDraftExt, PersonalData};
 
 pub mod input;
 
@@ -81,6 +81,40 @@ pub fn concat_messages(message1: String, message2: String) -> String {
     format!("{} {}", message1, message2)
 }
 
+#[tile(kind = iter)]
+pub fn set_draft_greeting_title(
+    title: String,
+    draft: Draft<CollectiveGreeting>,
+) -> Draft<CollectiveGreeting> {
+    let mut draft = draft;
+    draft.title().set(title);
+    draft
+}
+
+#[tile(kind = iter)]
+pub fn push_draft_greeting_line(
+    line: String,
+    draft: Draft<CollectiveGreeting>,
+) -> Draft<CollectiveGreeting> {
+    let mut draft = draft;
+    draft.lines().push(line);
+    draft
+}
+
+#[tile(kind = recur)]
+pub fn build_recur_draft_greeting(
+    input: RecurInput<String>,
+    output: RecurOutput<CollectiveGreeting>,
+    title: String,
+) -> RecurOutput<CollectiveGreeting> {
+    let mut output = output;
+    if input.is_first() {
+        output.title().set(title);
+    }
+    output.lines().push(input.into_value());
+    output
+}
+
 #[tile]
 pub fn raster_wish(message: String) -> String {
     format!("{}\nHope you  will have fun with Raster!", message)
@@ -119,7 +153,7 @@ pub fn fibonacci(n: u64) -> u64 {
 ///          count_to(1, 3) -> (false, 2, 3)  
 ///          count_to(2, 3) -> (false, 3, 3)  
 ///          count_to(3, 3) -> (true, 3, 3)   <- done! reached the goal
-#[tile(kind = recur)]
+#[tile(kind = iter)]
 pub fn count_to(current: u64, goal: u64) -> (bool, u64, u64) {
     if current >= goal {
         // Goal reached, we're done

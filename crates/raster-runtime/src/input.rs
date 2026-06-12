@@ -1,6 +1,7 @@
 use raster_core::input::{
-    ExternalValue, ExternalSelection, ListProofDirection, ListProofSibling, SchemaNode, Selectable,
-    SelectedPayload, SelectionProof, SelectionProofStep, SelectorPath, SelectorSegment,
+    ExternalSelection, ExternalValue, InternalValue, ListProofDirection, ListProofSibling,
+    SchemaNode, Selectable, SelectedPayload, SelectionProof, SelectionProofStep, SelectorPath,
+    SelectorSegment,
 };
 use raster_core::{Error, Result as CoreResult};
 use serde::de::{
@@ -27,7 +28,7 @@ fn load_external_storage() -> CoreResult<Option<ExternalStorageManager>> {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-enum TreeValue {
+pub(crate) enum TreeValue {
     Unit,
     Bool(bool),
     U8(u8),
@@ -922,7 +923,7 @@ impl<'de> de::Deserializer<'de> for TreeValueDeserializer<'de> {
     }
 }
 
-fn tree_value_from_serialize<T: Serialize>(value: &T) -> CoreResult<TreeValue> {
+pub(crate) fn tree_value_from_serialize<T: Serialize>(value: &T) -> CoreResult<TreeValue> {
     value.serialize(TreeValueSerializer).map_err(|e| {
         Error::Serialization(format!(
             "Failed to encode external input into selection tree: {}",
@@ -931,7 +932,7 @@ fn tree_value_from_serialize<T: Serialize>(value: &T) -> CoreResult<TreeValue> {
     })
 }
 
-fn typed_value_from_tree<T: DeserializeOwned>(value: &TreeValue) -> CoreResult<T> {
+pub(crate) fn typed_value_from_tree<T: DeserializeOwned>(value: &TreeValue) -> CoreResult<T> {
     T::deserialize(TreeValueDeserializer::new(value)).map_err(|e| {
         Error::Serialization(format!(
             "Failed to deserialize selected external input from selection tree: {}",
@@ -1200,7 +1201,7 @@ fn encode_leaf_bytes(value: &TreeValue) -> CoreResult<Vec<u8>> {
     Ok(out)
 }
 
-fn subtree_payload_and_root(value: &TreeValue) -> CoreResult<(Vec<u8>, Vec<u8>)> {
+pub(crate) fn subtree_payload_and_root(value: &TreeValue) -> CoreResult<(Vec<u8>, Vec<u8>)> {
     match value {
         TreeValue::Unit => Ok((vec![0x03], selection_hash(&[b"unit"]))),
         TreeValue::Struct(fields) => {
@@ -1701,6 +1702,28 @@ where
         full_selector.clone(),
         value.commitment.clone(),
         selected,
+        typed_selected,
+    ))
+}
+
+pub fn select_internal_value<Root, T>(
+    value: &InternalValue<Root>,
+    selector: &SelectorPath,
+) -> CoreResult<InternalValue<T>>
+where
+    Root: DeserializeOwned + Serialize + Selectable,
+    T: DeserializeOwned + Serialize,
+{
+    let proven = typed_proven_selection(&value.value, selector)?;
+    let typed_selected = typed_value_from_tree::<T>(&proven.selected_value).map_err(|e| {
+        Error::Serialization(format!(
+            "Failed to deserialize selected internal input from selection tree: {}",
+            e
+        ))
+    })?;
+    Ok(InternalValue::new(
+        value.reference.clone(),
+        proven.selected_bytes,
         typed_selected,
     ))
 }

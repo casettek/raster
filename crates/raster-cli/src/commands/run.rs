@@ -20,11 +20,11 @@ use raster_core::cfs::{CfsCoordinates, CfsCursor, ControlFlowSchema};
 use raster_core::coordinate_index::{
     coordinate_index_membership_proof, coordinate_index_non_membership_proof, coordinate_index_root,
 };
+use raster_core::trace::{ExternalInput, FnInput, StepRecord, Trace, TraceEvent, TraceWindow};
 use raster_core::transition::{
     InternalStoreEntry, InternalStoreIndexValue, InternalStoreLogWitness, InternalStoreReadWitness,
     InternalStoreWitness, InternalStoreWriteWitness,
 };
-use raster_core::trace::{ExternalInput, FnInput, StepRecord, Trace, TraceEvent, TraceWindow};
 use raster_core::{Error, Result};
 
 use raster_prover::authorization::authorize_external_inputs;
@@ -518,7 +518,11 @@ pub fn prove(
     let window_start_index = fraud_window
         .items
         .first()
-        .and_then(|first_item| trace.iter().position(|step_record| step_record == first_item))
+        .and_then(|first_item| {
+            trace
+                .iter()
+                .position(|step_record| step_record == first_item)
+        })
         .unwrap_or(trace.len());
     let mut current_internal_store_state =
         internal_store_state_from_prefix(&trace[..window_start_index], trace_recorder);
@@ -536,14 +540,15 @@ pub fn prove(
         let input_witness = step_witness.input_data();
         let output_witness = step_witness.output_data();
         let input_source_witness = step_witness.input_source_witness();
-        let sequence_scope_witness = step_record
-            .coordinates()
-            .try_parent()
-            .and_then(|(parent_coordinates, _)| {
-                trace_recorder
-                    .step_witness_at(&parent_coordinates)
-                    .and_then(|witness| witness.input_source_witness())
-            });
+        let sequence_scope_witness =
+            step_record
+                .coordinates()
+                .try_parent()
+                .and_then(|(parent_coordinates, _)| {
+                    trace_recorder
+                        .step_witness_at(&parent_coordinates)
+                        .and_then(|witness| witness.input_source_witness())
+                });
         let external_input = step_witness.external_input();
         let before_state = current_internal_store_state.clone();
         let mut internal_read_witnesses = Vec::new();
@@ -589,11 +594,9 @@ pub fn prove(
                     object_commitment: entry.object_commitment.clone(),
                 },
             );
-            let index_membership_witness = coordinate_index_membership_proof(
-                &after_index,
-                &entry.coordinates,
-            )
-            .expect("Missing coordinate-index membership proof after write");
+            let index_membership_witness =
+                coordinate_index_membership_proof(&after_index, &entry.coordinates)
+                    .expect("Missing coordinate-index membership proof after write");
             internal_write_witness = Some(InternalStoreWriteWitness {
                 entry,
                 index_non_membership_witness,

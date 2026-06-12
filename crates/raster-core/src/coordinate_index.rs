@@ -31,12 +31,7 @@ fn empty_hashes() -> Vec<Vec<u8>> {
 }
 
 fn combine_node_hash(depth: usize, left: &[u8], right: &[u8]) -> Vec<u8> {
-    sha256(&[
-        NODE_DOMAIN,
-        &(depth as u16).to_le_bytes(),
-        left,
-        right,
-    ])
+    sha256(&[NODE_DOMAIN, &(depth as u16).to_le_bytes(), left, right])
 }
 
 fn coordinates_key(coordinates: &CfsCoordinates) -> Vec<u8> {
@@ -66,7 +61,11 @@ fn indexed_entries<'a>(
         .collect()
 }
 
-fn subtree_hash(entries: &[(&CfsCoordinates, Vec<u8>, &InternalStoreIndexValue)], depth: usize, empty: &[Vec<u8>]) -> Vec<u8> {
+fn subtree_hash(
+    entries: &[(&CfsCoordinates, Vec<u8>, &InternalStoreIndexValue)],
+    depth: usize,
+    empty: &[Vec<u8>],
+) -> Vec<u8> {
     if entries.is_empty() {
         return empty[depth].clone();
     }
@@ -241,6 +240,9 @@ mod tests {
             coordinate_index_non_membership_proof(&entries, &CfsCoordinates(vec![9, 9]));
 
         assert!(verify_coordinate_index_membership(&root, &membership));
-        assert!(verify_coordinate_index_non_membership(&root, &non_membership));
+        assert!(verify_coordinate_index_non_membership(
+            &root,
+            &non_membership
+        ));
     }
 }

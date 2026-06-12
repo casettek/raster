@@ -92,14 +92,36 @@ pub enum SchemaNode {
 pub struct SchemaField {
     pub name: String,
     pub label: String,
+    pub mode: SchemaFieldMode,
     pub schema: Box<SchemaNode>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum SchemaFieldMode {
+    SetOnce,
+    AppendOnlyVec,
 }
 
 impl SchemaField {
     pub fn new(name: impl Into<String>, label: impl Into<String>, schema: SchemaNode) -> Self {
+        let mode = match &schema {
+            SchemaNode::List { .. } => SchemaFieldMode::AppendOnlyVec,
+            _ => SchemaFieldMode::SetOnce,
+        };
+        Self::with_mode(name, label, mode, schema)
+    }
+
+    pub fn with_mode(
+        name: impl Into<String>,
+        label: impl Into<String>,
+        mode: SchemaFieldMode,
+        schema: SchemaNode,
+    ) -> Self {
         Self {
             name: name.into(),
             label: label.into(),
+            mode,
             schema: Box::new(schema),
         }
     }
@@ -107,6 +129,23 @@ impl SchemaField {
 
 pub trait Selectable {
     fn schema() -> SchemaNode;
+}
+
+pub trait Schema: Selectable {
+    fn schema_hash() -> [u8; 32] {
+        let schema = postcard::to_allocvec(&Self::schema()).unwrap_or_default();
+        let mut hasher = Sha256::new();
+        hasher.update(schema);
+        hasher.finalize().into()
+    }
+}
+
+impl<T> Schema for T where T: Selectable {}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum Op {
+    Set { field: String, value_bytes: Vec<u8> },
+    Push { field: String, value_bytes: Vec<u8> },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -611,11 +650,7 @@ pub struct InternalValue<T> {
 }
 
 impl<T> InternalValue<T> {
-    pub fn new(
-        reference: InternalRef,
-        bytes: Vec<u8>,
-        value: T,
-    ) -> Self {
+    pub fn new(reference: InternalRef, bytes: Vec<u8>, value: T) -> Self {
         Self {
             reference,
             bytes,

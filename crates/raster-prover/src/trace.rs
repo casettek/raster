@@ -313,10 +313,12 @@ fn resolve_inputs_sources(
     cfs_cursor: &CfsCursor,
     step_inputs: &[InputBinding],
 ) -> Vec<(usize, StepRecord)> {
-    if step_inputs
-        .iter()
-        .all(|input| matches!(input, InputBinding::Direct(InputSource::External | InputSource::Inline)))
-    {
+    if step_inputs.iter().all(|input| {
+        matches!(
+            input,
+            InputBinding::Direct(InputSource::External | InputSource::Inline)
+        )
+    }) {
         return Vec::new();
     }
 

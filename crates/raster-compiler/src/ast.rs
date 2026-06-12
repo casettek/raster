@@ -2,8 +2,10 @@ use cargo_toml::Manifest;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use syn::{
-    parse_file, visit::Visit, Attribute, Expr, ExprLit, ExprMacro, FnArg, Lit, Local, Meta, Pat,
-    StmtMacro,
+    parse::{Parse, ParseStream},
+    parse_file,
+    visit::Visit,
+    Attribute, Expr, ExprLit, ExprMacro, FnArg, Lit, Local, Meta, Pat, StmtMacro, Token,
 };
 use walkdir::WalkDir;
 
@@ -26,6 +28,8 @@ pub enum CallKind {
     Tile,
     /// Invoked via `call_seq!(seq_fn, args...)` — caller declares this is a sequence call.
     Sequence,
+    /// Invoked via `call_recur!(tile_fn, args...)` — caller declares this is a recursive tile step.
+    Recursive,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -258,13 +262,17 @@ impl CallVisitor {
         quote::quote!(#expr).to_string()
     }
 
-    /// Parse a `call!` or `call_seq!` macro token stream into (callee, arguments).
+    /// Parse a canonical call macro token stream into (callee, arguments).
     ///
     /// The macro syntax is `call!(callee_fn, arg1, arg2, ...)`. The token stream
     /// is a comma-separated list; the first token is the callee identifier.
     fn parse_call_macro_args(
         mac: &syn::Macro,
     ) -> Option<(String, Vec<String>, Vec<CallArgumentKind>)> {
+        if matches!(Self::macro_call_kind(mac), Some(CallKind::Recursive)) {
+            return Self::parse_recur_call_macro_args(mac);
+        }
+
         // Parse the macro tokens as a punctuated sequence of expressions.
         let args: syn::punctuated::Punctuated<Expr, syn::Token![,]> = mac
             .parse_body_with(syn::punctuated::Punctuated::parse_terminated)
@@ -288,6 +296,94 @@ impl CallVisitor {
             .collect();
 
         Some((callee, arguments, argument_kinds))
+    }
+
+    fn parse_recur_call_macro_args(
+        mac: &syn::Macro,
+    ) -> Option<(String, Vec<String>, Vec<CallArgumentKind>)> {
+        struct RecurCallInput {
+            tile: syn::Ident,
+            input: Expr,
+            state: Option<Expr>,
+            output: Expr,
+            args: syn::punctuated::Punctuated<Expr, Token![,]>,
+        }
+
+        fn parse_named_key(input: ParseStream, expected: &str) -> syn::Result<()> {
+            let ident: syn::Ident = input.parse()?;
+            if ident != expected {
+                return Err(syn::Error::new(
+                    ident.span(),
+                    format!("expected `{}` key", expected),
+                ));
+            }
+            input.parse::<Token![=]>()?;
+            Ok(())
+        }
+
+        impl Parse for RecurCallInput {
+            fn parse(input: ParseStream) -> syn::Result<Self> {
+                parse_named_key(input, "tile")?;
+                let tile: syn::Ident = input.parse()?;
+                input.parse::<Token![,]>()?;
+
+                parse_named_key(input, "input")?;
+                let input_expr: Expr = input.parse()?;
+                input.parse::<Token![,]>()?;
+
+                let state = if input.peek(syn::Ident) {
+                    let fork = input.fork();
+                    let ident: syn::Ident = fork.parse()?;
+                    if ident == "state" {
+                        parse_named_key(input, "state")?;
+                        let state_expr: Expr = input.parse()?;
+                        input.parse::<Token![,]>()?;
+                        Some(state_expr)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                parse_named_key(input, "output")?;
+                let output: Expr = input.parse()?;
+                input.parse::<Token![,]>()?;
+
+                parse_named_key(input, "args")?;
+                let content;
+                syn::parenthesized!(content in input);
+                let args = syn::punctuated::Punctuated::parse_terminated(&content)?;
+                let _ = input.parse::<Option<Token![,]>>()?;
+
+                Ok(Self {
+                    tile,
+                    input: input_expr,
+                    state,
+                    output,
+                    args,
+                })
+            }
+        }
+
+        let parsed = syn::parse2::<RecurCallInput>(mac.tokens.clone()).ok()?;
+        let mut arguments = vec![Self::expr_to_string(&parsed.input)];
+        let mut argument_kinds = vec![Self::classify_argument(&parsed.input)];
+
+        if let Some(state) = parsed.state {
+            arguments.push(Self::expr_to_string(&state));
+            argument_kinds.push(Self::classify_argument(&state));
+        }
+
+        arguments.push(Self::expr_to_string(&parsed.output));
+        argument_kinds.push(Self::classify_argument(&parsed.output));
+
+        for expr in parsed.args {
+            arguments.push(Self::expr_to_string(&expr));
+            argument_kinds.push(Self::classify_argument(&expr));
+        }
+
+        Some((parsed.tile.to_string(), arguments, argument_kinds))
     }
 
     fn classify_argument(expr: &Expr) -> CallArgumentKind {
@@ -320,7 +416,7 @@ impl CallVisitor {
 
     /// Check if a macro path matches one of the canonical call primitive names.
     ///
-    /// Matches: `call`, `call_seq`, `raster::call`, `raster::call_seq`.
+    /// Matches: `call`, `call_seq`, `call_recur`, and `raster::*` qualified variants.
     fn macro_call_kind(mac: &syn::Macro) -> Option<CallKind> {
         let segments: Vec<String> = mac
             .path
@@ -334,10 +430,13 @@ impl CallVisitor {
             [prefix, name] if prefix == "raster" && name == "call" => Some(CallKind::Tile),
             [name] if name == "call_seq" => Some(CallKind::Sequence),
             [prefix, name] if prefix == "raster" && name == "call_seq" => Some(CallKind::Sequence),
+            [name] if name == "call_recur" => Some(CallKind::Recursive),
+            [prefix, name] if prefix == "raster" && name == "call_recur" => {
+                Some(CallKind::Recursive)
+            }
             _ => None,
         }
     }
-
 }
 
 impl<'ast> Visit<'ast> for CallVisitor {
@@ -446,6 +545,18 @@ mod tests {
         assert_eq!(calls[0].result_binding.as_deref(), Some("result"));
         assert_eq!(calls[0].arguments, vec!["greeting"]);
         assert_eq!(calls[0].argument_kinds, vec![CallArgumentKind::Identifier]);
+    }
+
+    #[test]
+    fn test_call_recur_macro_extraction() {
+        let calls = parse_calls(
+            "fn seq() { let result = call_recur!(tile = build, input = items, output = new!(Doc), args = (needle,)); }",
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].callee, "build");
+        assert_eq!(calls[0].call_kind, CallKind::Recursive);
+        assert_eq!(calls[0].result_binding.as_deref(), Some("result"));
+        assert_eq!(calls[0].arguments.len(), 3);
     }
 
     #[test]
@@ -564,5 +675,4 @@ mod tests {
         assert_eq!(calls[0].call_kind, CallKind::Sequence);
         assert_eq!(calls[0].result_binding.as_deref(), Some("x"));
     }
-
 }

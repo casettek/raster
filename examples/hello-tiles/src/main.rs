@@ -1,11 +1,8 @@
+use raster::into_auth_value;
 use raster::prelude::*;
 
-use hello_tiles::input::{Address, PersonalData};
-
-use hello_tiles::{
-    concat_messages, current_wish, exclaim, greet, greet_address_line, maybe_echo_name,
-    personal_greet, personal_greet_from_object, personal_greet_with_seed, raster_wish,
-};
+use hello_tiles::input::{Address, CollectiveGreeting, PersonalData};
+use hello_tiles::*;
 
 #[sequence]
 fn personal_greet_seq(personal_data: PersonalData) -> Result<String> {
@@ -91,6 +88,59 @@ fn main() {
     let personal_data_bin = external!(PersonalData, "personal_data_bin");
     let selected_personal_data_bin = select!(PersonalData, personal_data_bin);
     call!(personal_greet_from_object, selected_personal_data_bin);
+
+    let draft = new!(CollectiveGreeting);
+    let draft = call!(
+        set_draft_greeting_title,
+        "Draft-built greeting".to_string(),
+        draft
+    );
+    let draft = call!(
+        push_draft_greeting_line,
+        "Hello from a Draft object".to_string(),
+        draft
+    );
+    let draft = call!(
+        push_draft_greeting_line,
+        "This line was appended in a second tile".to_string(),
+        draft
+    );
+    let draft_greeting = finalize(draft);
+    let draft_greeting_value =
+        into_auth_value::<CollectiveGreeting, _>(select!(CollectiveGreeting, draft_greeting.clone()))
+            .expect("draft greeting should materialize")
+            .into_inner();
+    debug!(
+        "draft greeting ref: {:?}, value: {:?}",
+        draft_greeting.reference(),
+        draft_greeting_value
+    );
+    let draft_title = select!(String, draft_greeting.clone().title);
+    let first_draft_line = select!(String, draft_greeting.lines[0]);
+    call!(concat_messages, draft_title, first_draft_line);
+
+    let address_lines = select!(
+        Vec<String>,
+        external!(PersonalData, "personal_data_bin").addresses[0].lines
+    );
+    let recur_greeting = call_recur!(
+        tile = build_recur_draft_greeting,
+        input = address_lines,
+        output = new!(CollectiveGreeting),
+        args = ("Recur-built greeting".to_string(),)
+    );
+    let recur_greeting_value =
+        into_auth_value::<CollectiveGreeting, _>(select!(CollectiveGreeting, recur_greeting.clone()))
+            .expect("recur greeting should materialize")
+            .into_inner();
+    debug!(
+        "recur greeting ref: {:?}, value: {:?}",
+        recur_greeting.reference(),
+        recur_greeting_value
+    );
+    let recur_title = select!(String, recur_greeting.clone().title);
+    let recur_first_line = select!(String, recur_greeting.lines[0]);
+    call!(concat_messages, recur_title, recur_first_line);
 
     let name_2 = call_seq!(placeholder_sequence, "Placeholder".to_string());
     let result = call_seq!(greet_sequence, name_2);

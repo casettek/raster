@@ -15,3 +15,9 @@ pub struct PersonalData {
     pub name: String,
     pub addresses: alloc::vec::Vec<Address>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, raster::Selectable)]
+pub struct CollectiveGreeting {
+    pub title: String,
+    pub lines: alloc::vec::Vec<String>,
+}

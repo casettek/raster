@@ -1,14 +1,14 @@
+use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec::Vec;
-use alloc::rc::Rc;
 use core::marker::PhantomData;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 pub use raster_core::input::{
-    verify_selection_proof, ExternalValue, ExternalEncoding, ExternalRef, ExternalSelection,
-    InternalValue, InternalRef, ListProofDirection, ListProofSibling, AuthValue, SchemaField,
-    SchemaNode, Selectable, SelectedPayload, SelectionProof, SelectionProofStep, SelectorPath,
-    SelectorSegment,
+    verify_selection_proof, AuthValue, ExternalEncoding, ExternalRef, ExternalSelection,
+    ExternalValue, InternalRef, InternalValue, ListProofDirection, ListProofSibling, Op, Schema,
+    SchemaField, SchemaFieldMode, SchemaNode, Selectable, SelectedPayload, SelectionProof,
+    SelectionProofStep, SelectorPath, SelectorSegment,
 };
 use raster_core::trace::{
     ExternalData as TraceExternalData, FnInputValue, InternalData as TraceInternalData,
@@ -31,6 +31,133 @@ pub struct TypedInternalBinding<Root> {
 pub struct TypedSelectorPath<Root, Selected> {
     path: SelectorPath,
     marker: PhantomData<fn() -> (Root, Selected)>,
+}
+
+pub type Anchor = [u8; 32];
+
+#[derive(Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Draft<S: Schema> {
+    anchor: Anchor,
+    current_root: [u8; 32],
+    _schema: PhantomData<fn() -> S>,
+}
+
+#[derive(Debug)]
+pub struct DraftSetField<'a, S: Schema, Value> {
+    draft: &'a mut Draft<S>,
+    field: &'static str,
+    marker: PhantomData<fn() -> Value>,
+}
+
+#[derive(Debug)]
+pub struct DraftAppendField<'a, S: Schema, Value> {
+    draft: &'a mut Draft<S>,
+    field: &'static str,
+    marker: PhantomData<fn() -> Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum RecurControl<T> {
+    Continue(T),
+    Break(T),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RecurInput<T> {
+    value: T,
+    index: u64,
+    len: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RecurState<T> {
+    inner: T,
+}
+
+pub type RecurOutput<S> = Draft<S>;
+
+pub trait IntoRecurControl<T> {
+    fn into_recur_control(self) -> RecurControl<T>;
+}
+
+impl<T> IntoRecurControl<T> for RecurControl<T> {
+    fn into_recur_control(self) -> RecurControl<T> {
+        self
+    }
+}
+
+impl<T> IntoRecurControl<T> for T {
+    fn into_recur_control(self) -> RecurControl<T> {
+        RecurControl::Continue(self)
+    }
+}
+
+impl<T> RecurInput<T> {
+    pub fn new(value: T, index: u64, len: u64) -> Self {
+        Self { value, index, len }
+    }
+
+    pub fn value(&self) -> &T {
+        &self.value
+    }
+
+    pub fn into_value(self) -> T {
+        self.value
+    }
+
+    pub fn index(&self) -> u64 {
+        self.index
+    }
+
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    pub fn is_first(&self) -> bool {
+        self.index == 0
+    }
+
+    pub fn is_last(&self) -> bool {
+        self.index + 1 == self.len
+    }
+}
+
+impl<T> RecurState<T> {
+    pub fn new(inner: T) -> Self {
+        Self { inner }
+    }
+
+    pub fn get(&self) -> &T {
+        &self.inner
+    }
+
+    pub fn get_mut(&mut self) -> &mut T {
+        &mut self.inner
+    }
+
+    pub fn into_inner(self) -> T {
+        self.inner
+    }
+}
+
+impl<T> From<T> for RecurState<T> {
+    fn from(value: T) -> Self {
+        Self::new(value)
+    }
+}
+
+impl<T> core::ops::Deref for RecurState<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        self.get()
+    }
+}
+
+impl<T> core::ops::DerefMut for RecurState<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.get_mut()
+    }
 }
 
 impl<Root> TypedExternalBinding<Root> {
@@ -92,6 +219,105 @@ impl<Root, Selected> TypedSelectorPath<Root, Selected> {
     }
 }
 
+impl<S: Schema> Draft<S> {
+    pub fn new(anchor: Anchor, current_root: [u8; 32]) -> Self {
+        Self {
+            anchor,
+            current_root,
+            _schema: PhantomData,
+        }
+    }
+
+    pub fn anchor(&self) -> &Anchor {
+        &self.anchor
+    }
+
+    pub fn current_root(&self) -> &[u8; 32] {
+        &self.current_root
+    }
+
+    #[doc(hidden)]
+    pub fn set_current_root(&mut self, current_root: [u8; 32]) {
+        self.current_root = current_root;
+    }
+
+    #[doc(hidden)]
+    pub fn set_field<Value>(&mut self, field: &'static str) -> DraftSetField<'_, S, Value> {
+        DraftSetField {
+            draft: self,
+            field,
+            marker: PhantomData,
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn append_field<Value>(&mut self, field: &'static str) -> DraftAppendField<'_, S, Value> {
+        DraftAppendField {
+            draft: self,
+            field,
+            marker: PhantomData,
+        }
+    }
+}
+
+impl<'a, S, Value> DraftSetField<'a, S, Value>
+where
+    S: Schema,
+    Value: Serialize,
+{
+    pub fn set(self, value: Value) {
+        #[cfg(feature = "std")]
+        {
+            let expected_root = *self.draft.current_root();
+            let next_root = raster_runtime::apply_draft_set::<S, Value>(
+                self.draft.anchor(),
+                &expected_root,
+                self.field,
+                &value,
+            )
+            .unwrap_or_else(|error| {
+                panic!("Failed to set draft field '{}': {}", self.field, error)
+            });
+            self.draft.set_current_root(next_root);
+        }
+
+        #[cfg(not(feature = "std"))]
+        {
+            let _ = value;
+            panic!("Draft field writes require the `std` feature")
+        }
+    }
+}
+
+impl<'a, S, Value> DraftAppendField<'a, S, Value>
+where
+    S: Schema,
+    Value: Serialize,
+{
+    pub fn push(self, value: Value) {
+        #[cfg(feature = "std")]
+        {
+            let expected_root = *self.draft.current_root();
+            let next_root = raster_runtime::apply_draft_push::<S, Value>(
+                self.draft.anchor(),
+                &expected_root,
+                self.field,
+                &value,
+            )
+            .unwrap_or_else(|error| {
+                panic!("Failed to push draft field '{}': {}", self.field, error)
+            });
+            self.draft.set_current_root(next_root);
+        }
+
+        #[cfg(not(feature = "std"))]
+        {
+            let _ = value;
+            panic!("Draft field writes require the `std` feature")
+        }
+    }
+}
+
 pub fn typed_external<Root>(name: &str) -> TypedExternalBinding<Root> {
     TypedExternalBinding::new(name)
 }
@@ -122,6 +348,8 @@ pub fn typed_selector_path<Root, Selected>(
 
 type ExternalResolveFn<Current> =
     Rc<dyn Fn(ExternalSelection) -> raster_core::Result<ExternalValue<Current>>>;
+type InternalResolveFn<Current> =
+    Rc<dyn Fn(InternalRef) -> raster_core::Result<InternalValue<Current>>>;
 
 #[doc(hidden)]
 pub struct DeferredAuthExternal<Current> {
@@ -131,10 +359,9 @@ pub struct DeferredAuthExternal<Current> {
 }
 
 #[doc(hidden)]
-#[derive(Debug)]
 pub struct DeferredAuthInternal<Current> {
     reference: InternalRef,
-    resolve: fn(InternalRef) -> raster_core::Result<InternalValue<Current>>,
+    resolve: InternalResolveFn<Current>,
     marker: PhantomData<fn() -> Current>,
 }
 
@@ -227,9 +454,17 @@ impl<Current> Clone for DeferredAuthInternal<Current> {
     fn clone(&self) -> Self {
         Self {
             reference: self.reference.clone(),
-            resolve: self.resolve,
+            resolve: self.resolve.clone(),
             marker: PhantomData,
         }
+    }
+}
+
+impl<Current> core::fmt::Debug for DeferredAuthInternal<Current> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("DeferredAuthInternal")
+            .field("reference", &self.reference)
+            .finish()
     }
 }
 
@@ -296,7 +531,38 @@ where
         AuthRef::External(DeferredAuthExternal {
             name: name.clone(),
             selector: selector.clone(),
-            resolve: Rc::new(move |reference| resolve_typed_external_value::<Root, Selected>(reference)),
+            resolve: Rc::new(move |reference| {
+                resolve_typed_external_value::<Root, Selected>(reference)
+            }),
+        })
+    }
+}
+
+impl<Root> SelectSource for TypedInternalBinding<Root>
+where
+    Root: DeserializeOwned + Serialize + Selectable + 'static,
+{
+    type Root = Root;
+    type Current = Root;
+    type Selected<Selected> = AuthRef<Selected>;
+
+    fn select<Selected>(
+        self,
+        selector: TypedSelectorPath<Self::Current, Selected>,
+    ) -> Self::Selected<Selected>
+    where
+        Selected: DeserializeOwned + Serialize,
+    {
+        let reference = self.reference.clone();
+        let selector = selector.into_path();
+        let resolve = self.resolve;
+        AuthRef::Internal(DeferredAuthInternal {
+            reference,
+            resolve: Rc::new(move |reference| {
+                let current = resolve(reference.clone())?;
+                select_internal_value::<Root, Selected>(&current, &selector)
+            }),
+            marker: PhantomData,
         })
     }
 }
@@ -319,11 +585,8 @@ where
         match self {
             AuthRef::Inline(_) => {
                 panic!(
-                    "select! on inline or internal sequence values is not supported; only external bindings can be refined inside sequences"
+                    "select! on inline sequence values is not supported; use committed external or internal bindings instead"
                 )
-            }
-            AuthRef::Internal(_) => {
-                panic!("select! on internal sequence bindings is not supported")
             }
             AuthRef::External(binding) => {
                 let relative_selector = selector.into_path();
@@ -346,6 +609,19 @@ where
                             &full_selector,
                         )
                     }),
+                })
+            }
+            AuthRef::Internal(binding) => {
+                let relative_selector = selector.into_path();
+                let reference = binding.reference.clone();
+                let resolve_current = binding.resolve.clone();
+                AuthRef::Internal(DeferredAuthInternal {
+                    reference: reference.clone(),
+                    resolve: Rc::new(move |reference| {
+                        let current = (resolve_current.as_ref())(reference.clone())?;
+                        select_internal_value::<Current, Selected>(&current, &relative_selector)
+                    }),
+                    marker: PhantomData,
                 })
             }
         }
@@ -373,6 +649,92 @@ pub fn selector_path(segments: Vec<SelectorSegment>) -> SelectorPath {
     SelectorPath::new(segments)
 }
 
+#[doc(hidden)]
+pub fn recur_list_len<T>(source: &AuthRef<Vec<T>>) -> raster_core::Result<u64>
+where
+    T: DeserializeOwned + Serialize,
+{
+    match source {
+        AuthRef::Inline(_) => Err(raster_core::Error::Other(
+            "call_recur! requires a selectable external or internal list source".into(),
+        )),
+        AuthRef::External(binding) => {
+            let current = (binding.resolve.as_ref())(ExternalSelection::with_selector(
+                binding.name.clone(),
+                binding.selector.clone(),
+            ))?;
+            Ok(current.value.len() as u64)
+        }
+        AuthRef::Internal(binding) => {
+            let current = (binding.resolve.as_ref())(binding.reference.clone())?;
+            Ok(current.value.len() as u64)
+        }
+    }
+}
+
+#[doc(hidden)]
+pub fn select_recur_list_item<T>(
+    source: &AuthRef<Vec<T>>,
+    index: u64,
+) -> raster_core::Result<AuthRef<T>>
+where
+    T: DeserializeOwned + Serialize + Selectable + 'static,
+{
+    let relative_selector = selector_path(Vec::from([SelectorSegment::Index(index)]));
+
+    match source {
+        AuthRef::Inline(_) => Err(raster_core::Error::Other(
+            "call_recur! requires a selectable external or internal list source".into(),
+        )),
+        AuthRef::External(binding) => {
+            let current_name = binding.name.clone();
+            let current_selector = binding.selector.clone();
+            let full_selector =
+                compose_selector_paths(current_selector.clone(), relative_selector.clone());
+            let resolve_current = binding.resolve.clone();
+
+            Ok(AuthRef::External(DeferredAuthExternal {
+                name: current_name.clone(),
+                selector: full_selector.clone(),
+                resolve: Rc::new(move |_| {
+                    let current = resolve_current(ExternalSelection::with_selector(
+                        current_name.clone(),
+                        current_selector.clone(),
+                    ))?;
+                    select_external_value::<Vec<T>, T>(&current, &relative_selector, &full_selector)
+                }),
+            }))
+        }
+        AuthRef::Internal(binding) => {
+            let reference = binding.reference.clone();
+            let resolve_current = binding.resolve.clone();
+            let relative_selector = relative_selector.clone();
+
+            Ok(AuthRef::Internal(DeferredAuthInternal {
+                reference: reference.clone(),
+                resolve: Rc::new(move |reference| {
+                    let current = (resolve_current.as_ref())(reference.clone())?;
+                    select_internal_value::<Vec<T>, T>(&current, &relative_selector)
+                }),
+                marker: PhantomData,
+            }))
+        }
+    }
+}
+
+#[doc(hidden)]
+pub fn build_recur_input<T>(
+    item: AuthRef<T>,
+    index: u64,
+    len: u64,
+) -> raster_core::Result<RecurInput<T>>
+where
+    T: DeserializeOwned + Serialize,
+{
+    let value = into_auth_value::<T, _>(item)?.into_inner();
+    Ok(RecurInput::new(value, index, len))
+}
+
 impl<T> IntoAuthRef<T> for T
 where
     T: Serialize,
@@ -398,12 +760,14 @@ where
 
 impl<Root> IntoAuthRef<Root> for TypedInternalBinding<Root>
 where
-    Root: DeserializeOwned + Serialize,
+    Root: DeserializeOwned + Serialize + 'static,
 {
     fn into_auth_ref(self) -> AuthRef<Root> {
+        let reference = self.reference;
+        let resolve = self.resolve;
         AuthRef::Internal(DeferredAuthInternal {
-            reference: self.reference,
-            resolve: self.resolve,
+            reference,
+            resolve: Rc::new(move |reference| (resolve)(reference)),
             marker: PhantomData,
         })
     }
@@ -470,7 +834,7 @@ where
                 Ok(AuthValue::external(value))
             }
             AuthRef::Internal(binding) => {
-                let value = (binding.resolve)(binding.reference)?;
+                let value = (binding.resolve.as_ref())(binding.reference)?;
                 Ok(AuthValue::internal(value))
             }
         }
@@ -490,7 +854,9 @@ where
 {
     match arg {
         AuthRef::Inline(value) => Ok(AuthRefTrace {
-            value: FnInputValue::Inline(raster_core::postcard::to_allocvec(value).unwrap_or_default()),
+            value: FnInputValue::Inline(
+                raster_core::postcard::to_allocvec(value).unwrap_or_default(),
+            ),
             external: None,
             internal: None,
         }),
@@ -515,7 +881,7 @@ where
             })
         }
         AuthRef::Internal(binding) => {
-            let resolved = (binding.resolve)(binding.reference.clone())?;
+            let resolved = (binding.resolve.as_ref())(binding.reference.clone())?;
             Ok(AuthRefTrace {
                 value: FnInputValue::InternalBinding,
                 external: None,
@@ -561,6 +927,29 @@ where
         let _ = full_selector;
         Err(raster_core::Error::Other(format!(
             "External selection refinement requires the `std` feature"
+        )))
+    }
+}
+
+pub fn select_internal_value<Root, T>(
+    value: &InternalValue<Root>,
+    selector: &SelectorPath,
+) -> raster_core::Result<InternalValue<T>>
+where
+    Root: DeserializeOwned + Serialize + Selectable,
+    T: DeserializeOwned + Serialize,
+{
+    #[cfg(feature = "std")]
+    {
+        return raster_runtime::select_internal_value::<Root, T>(value, selector);
+    }
+
+    #[cfg(not(feature = "std"))]
+    {
+        let _ = value;
+        let _ = selector;
+        Err(raster_core::Error::Other(format!(
+            "Internal selection refinement requires the `std` feature"
         )))
     }
 }
@@ -634,6 +1023,169 @@ pub fn resolve_internal_ok_value<T: DeserializeOwned + Serialize>(
         Err(raster_core::Error::Other(alloc::format!(
             "Result-backed internal input resolution requires the `std` feature"
         )))
+    }
+}
+
+pub fn new_draft<S>() -> Draft<S>
+where
+    S: Schema,
+{
+    #[cfg(feature = "std")]
+    {
+        let (anchor, current_root) = raster_runtime::create_draft::<S>().unwrap_or_else(|error| {
+            panic!(
+                "Failed to create draft '{}': {}",
+                core::any::type_name::<S>(),
+                error
+            )
+        });
+        return Draft::new(anchor, current_root);
+    }
+
+    #[cfg(not(feature = "std"))]
+    {
+        panic!("Draft creation requires the `std` feature")
+    }
+}
+
+pub fn finalize<S>(draft: Draft<S>) -> AuthRef<S>
+where
+    S: Schema + DeserializeOwned + Serialize + 'static,
+{
+    #[cfg(feature = "std")]
+    {
+        let reference = raster_runtime::finalize_draft::<S>(draft.anchor(), draft.current_root())
+            .unwrap_or_else(|error| {
+                panic!(
+                    "Failed to finalize draft '{}': {}",
+                    core::any::type_name::<S>(),
+                    error
+                )
+            });
+        return into_auth_ref::<S, _>(typed_internal::<S>(reference));
+    }
+
+    #[cfg(not(feature = "std"))]
+    {
+        let _ = draft;
+        panic!("Draft finalization requires the `std` feature")
+    }
+}
+
+#[doc(hidden)]
+pub fn run_recur_list<T, S, Step, Output>(
+    source: AuthRef<Vec<T>>,
+    output: Draft<S>,
+    mut step: Step,
+) -> AuthRef<S>
+where
+    T: DeserializeOwned + Serialize + Selectable + 'static,
+    S: Schema + DeserializeOwned + Serialize + 'static,
+    Step: FnMut(RecurInput<T>, RecurOutput<S>) -> Output,
+    Output: IntoRecurControl<RecurOutput<S>>,
+{
+    #[cfg(feature = "std")]
+    {
+        let len = recur_list_len(&source)
+            .unwrap_or_else(|error| panic!("Failed to resolve recursive list source: {}", error));
+        let mut output = output;
+
+        for index in 0..len {
+            let item = select_recur_list_item(&source, index).unwrap_or_else(|error| {
+                panic!(
+                    "Failed to select recursive list item at index {}: {}",
+                    index, error
+                )
+            });
+            let input = build_recur_input(item, index, len).unwrap_or_else(|error| {
+                panic!(
+                    "Failed to materialize recursive list item at index {}: {}",
+                    index, error
+                )
+            });
+
+            match step(input, output).into_recur_control() {
+                RecurControl::Continue(next) => {
+                    output = next;
+                }
+                RecurControl::Break(done) => {
+                    output = done;
+                    break;
+                }
+            }
+        }
+
+        return finalize(output);
+    }
+
+    #[cfg(not(feature = "std"))]
+    {
+        let _ = source;
+        let _ = output;
+        let _ = step;
+        panic!("Recursive list execution requires the `std` feature")
+    }
+}
+
+#[doc(hidden)]
+pub fn run_recur_list_with_state<T, State, S, Step, Output>(
+    source: AuthRef<Vec<T>>,
+    state: RecurState<State>,
+    output: Draft<S>,
+    mut step: Step,
+) -> AuthRef<S>
+where
+    T: DeserializeOwned + Serialize + Selectable + 'static,
+    State: DeserializeOwned + Serialize + 'static,
+    S: Schema + DeserializeOwned + Serialize + 'static,
+    Step: FnMut(RecurInput<T>, RecurState<State>, RecurOutput<S>) -> Output,
+    Output: IntoRecurControl<(RecurState<State>, RecurOutput<S>)>,
+{
+    #[cfg(feature = "std")]
+    {
+        let len = recur_list_len(&source)
+            .unwrap_or_else(|error| panic!("Failed to resolve recursive list source: {}", error));
+        let mut state = state;
+        let mut output = output;
+
+        for index in 0..len {
+            let item = select_recur_list_item(&source, index).unwrap_or_else(|error| {
+                panic!(
+                    "Failed to select recursive list item at index {}: {}",
+                    index, error
+                )
+            });
+            let input = build_recur_input(item, index, len).unwrap_or_else(|error| {
+                panic!(
+                    "Failed to materialize recursive list item at index {}: {}",
+                    index, error
+                )
+            });
+
+            match step(input, state, output).into_recur_control() {
+                RecurControl::Continue((next_state, next_output)) => {
+                    state = next_state;
+                    output = next_output;
+                }
+                RecurControl::Break((done_state, done_output)) => {
+                    state = done_state;
+                    output = done_output;
+                    break;
+                }
+            }
+        }
+
+        let _ = state;
+        return finalize(output);
+    }
+
+    #[cfg(not(feature = "std"))]
+    {
+        let _ = source;
+        let _ = state;
+        let _ = output;
+        let _ = step;
+        panic!("Recursive list execution requires the `std` feature")
     }
 }
 

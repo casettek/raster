@@ -20,9 +20,7 @@ use std::collections::HashMap;
 use crate::authorization::authorization_guest_image_id;
 use crate::precomputed::EMPTY_TRIE_NODES;
 use crate::replay::ReplayResult;
-use crate::trace::{
-    serializable_frontier_into_trace_frontier, SerializableFrontier, TraceTree,
-};
+use crate::trace::{serializable_frontier_into_trace_frontier, SerializableFrontier, TraceTree};
 use crate::{TRANSITION_GUEST_ELF, TRANSITION_GUEST_ID};
 
 type RecordedStepIo = HashMap<
@@ -51,9 +49,10 @@ fn build_transition_input(
         sequence_scope_witness,
         external_input,
         internal_store_witness,
-    ) = recorded_step_io.get(step_record).cloned().unwrap_or_else(|| {
-        panic!("Missing recorded I/O for transition step {:?}", step_record)
-    });
+    ) = recorded_step_io
+        .get(step_record)
+        .cloned()
+        .unwrap_or_else(|| panic!("Missing recorded I/O for transition step {:?}", step_record));
 
     match step_record {
         StepRecord::TileExec(_) => {
@@ -223,9 +222,9 @@ mod tests {
     use super::*;
     use crate::authorization::authorize_external_inputs;
     use crate::precomputed::EMPTY_TRIE_NODES;
-    use raster_core::coordinate_index::coordinate_index_root;
     use raster_core::authorization::{AuthorizationJournal, ManifestedInputs};
     use raster_core::cfs::{CfsCoordinates, ControlFlowSchema, SequenceDef};
+    use raster_core::coordinate_index::coordinate_index_root;
     use raster_core::fingerprint::{BitPacker, Fingerprint};
     use raster_core::trace::{
         ExternalData, FnInput, SequenceEndRecord, SequenceStartRecord, TileExecRecord,
@@ -440,11 +439,25 @@ mod tests {
         let recorded_step_io = HashMap::from([
             (
                 sequence_start.clone(),
-                (Some(vec![3, 4]), None, None, None, ExternalInput::new(), None),
+                (
+                    Some(vec![3, 4]),
+                    None,
+                    None,
+                    None,
+                    ExternalInput::new(),
+                    None,
+                ),
             ),
             (
                 sequence_end.clone(),
-                (None, Some(vec![5, 6]), None, None, ExternalInput::new(), None),
+                (
+                    None,
+                    Some(vec![5, 6]),
+                    None,
+                    None,
+                    ExternalInput::new(),
+                    None,
+                ),
             ),
         ]);
 
@@ -541,7 +554,9 @@ mod tests {
             init_frontier: make_init_frontier(),
             init_internal_store_frontier: make_init_frontier(),
             init_internal_store_root: internal_store_root(&make_init_frontier()),
-            init_internal_store_index_root: coordinate_index_root(&std::collections::BTreeMap::new()),
+            init_internal_store_index_root: coordinate_index_root(
+                &std::collections::BTreeMap::new(),
+            ),
             fingerprint: Fingerprint::from(vec![0], BitPacker::new(64), 1),
         });
 

@@ -1,0 +1,7 @@
+error: custom attribute panicked
+ --> tests/ui/recur_tile_missing_draft.rs:9:1
+  |
+9 | #[tile(kind = recur)]
+  | ^^^^^^^^^^^^^^^^^^^^^
+  |
+  = help: message: `#[tile(kind = recur)]` tiles must accept at least `(input, output)`
