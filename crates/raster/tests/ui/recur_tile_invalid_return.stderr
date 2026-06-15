@@ -4,4 +4,4 @@ error: custom attribute panicked
 9 | #[tile(kind = recur)]
   | ^^^^^^^^^^^^^^^^^^^^^
   |
-  = help: message: `#[tile(kind = recur)]` tiles must return `RecurOutput<S>` or `RecurControl<RecurOutput<S>>`
+  = help: message: `#[tile(kind = recur)]` output-only tiles must return `RecurOutput<S>` or `RecurControl<RecurOutput<S>>`

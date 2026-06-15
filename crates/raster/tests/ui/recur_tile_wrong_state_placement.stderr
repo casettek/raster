@@ -4,4 +4,4 @@ error: custom attribute panicked
 14 | #[tile(kind = recur)]
    | ^^^^^^^^^^^^^^^^^^^^^
    |
-   = help: message: `#[tile(kind = recur)]` only supports `args...` after `output: RecurOutput<S>`
+   = help: message: `#[tile(kind = recur)]` tiles must place `state: RecurState<S>` before `output: RecurOutput<T>`

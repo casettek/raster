@@ -154,6 +154,10 @@ fn recur_control_recur_output_inner_type(ty: &Type) -> Option<Type> {
     recur_control_inner_type(ty).and_then(|inner| recur_output_inner_type(&inner))
 }
 
+fn recur_control_recur_state_inner_type(ty: &Type) -> Option<Type> {
+    recur_control_inner_type(ty).and_then(|inner| recur_state_inner_type(&inner))
+}
+
 fn recur_state_output_parts(ty: &Type) -> Option<(Type, Type)> {
     let Type::Tuple(tuple) = ty else {
         return None;
@@ -524,6 +528,8 @@ enum ProtocolReturnKind {
     RecurControlDraft(Type),
     RecurOutput(Type),
     RecurControlRecurOutput(Type),
+    RecurState(Type),
+    RecurControlRecurState(Type),
     RecurStateOutput(Type),
     RecurControlRecurStateOutput(Type),
 }
@@ -547,6 +553,14 @@ fn protocol_return_kind(output: &ReturnType) -> ProtocolReturnKind {
 
     if recur_control_recur_output_inner_type(ty).is_some() {
         return ProtocolReturnKind::RecurControlRecurOutput((**ty).clone());
+    }
+
+    if recur_state_inner_type(ty).is_some() {
+        return ProtocolReturnKind::RecurState((**ty).clone());
+    }
+
+    if recur_control_recur_state_inner_type(ty).is_some() {
+        return ProtocolReturnKind::RecurControlRecurState((**ty).clone());
     }
 
     if recur_state_output_parts(ty).is_some() {
@@ -602,6 +616,12 @@ fn auth_return_type(kind: &ProtocolReturnKind) -> proc_macro2::TokenStream {
         ProtocolReturnKind::RecurControlRecurOutput(_) => {
             panic!("`#[sequence]` functions must finalize recur outputs before returning")
         }
+        ProtocolReturnKind::RecurState(_) => {
+            panic!("`#[sequence]` functions must finalize recur states before returning")
+        }
+        ProtocolReturnKind::RecurControlRecurState(_) => {
+            panic!("`#[sequence]` functions must finalize recur states before returning")
+        }
         ProtocolReturnKind::RecurStateOutput(_) => {
             panic!("`#[sequence]` functions must finalize recur outputs before returning")
         }
@@ -637,6 +657,12 @@ fn auth_result_binding(kind: &ProtocolReturnKind, body: &syn::Block) -> proc_mac
         }
         ProtocolReturnKind::RecurControlRecurOutput(_) => {
             panic!("`#[sequence]` functions must finalize recur outputs before returning")
+        }
+        ProtocolReturnKind::RecurState(_) => {
+            panic!("`#[sequence]` functions must finalize recur states before returning")
+        }
+        ProtocolReturnKind::RecurControlRecurState(_) => {
+            panic!("`#[sequence]` functions must finalize recur states before returning")
         }
         ProtocolReturnKind::RecurStateOutput(_) => {
             panic!("`#[sequence]` functions must finalize recur outputs before returning")
@@ -677,6 +703,12 @@ fn trace_output_binding(kind: &ProtocolReturnKind) -> proc_macro2::TokenStream {
         ProtocolReturnKind::RecurControlRecurOutput(_) => {
             panic!("`#[sequence]` functions must finalize recur outputs before returning")
         }
+        ProtocolReturnKind::RecurState(_) => {
+            panic!("`#[sequence]` functions must finalize recur states before returning")
+        }
+        ProtocolReturnKind::RecurControlRecurState(_) => {
+            panic!("`#[sequence]` functions must finalize recur states before returning")
+        }
         ProtocolReturnKind::RecurStateOutput(_) => {
             panic!("`#[sequence]` functions must finalize recur outputs before returning")
         }
@@ -708,6 +740,12 @@ fn materialize_main_result(kind: &ProtocolReturnKind) -> proc_macro2::TokenStrea
         }
         ProtocolReturnKind::RecurControlRecurOutput(_) => {
             panic!("`#[sequence]` functions must finalize recur outputs before returning")
+        }
+        ProtocolReturnKind::RecurState(_) => {
+            panic!("`#[sequence]` functions must finalize recur states before returning")
+        }
+        ProtocolReturnKind::RecurControlRecurState(_) => {
+            panic!("`#[sequence]` functions must finalize recur states before returning")
         }
         ProtocolReturnKind::RecurStateOutput(_) => {
             panic!("`#[sequence]` functions must finalize recur outputs before returning")
@@ -767,6 +805,8 @@ fn gen_tile_call_binding_marker(
         | ProtocolReturnKind::RecurControlDraft(_)
         | ProtocolReturnKind::RecurOutput(_)
         | ProtocolReturnKind::RecurControlRecurOutput(_)
+        | ProtocolReturnKind::RecurState(_)
+        | ProtocolReturnKind::RecurControlRecurState(_)
         | ProtocolReturnKind::RecurStateOutput(_)
         | ProtocolReturnKind::RecurControlRecurStateOutput(_) => quote! {
             #[doc(hidden)]
@@ -784,19 +824,27 @@ fn gen_tile_call_binding_marker(
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RecurTileMode {
+    OutputOnly,
+    StateOnly,
+    StateOutput,
+}
+
 #[derive(Clone)]
 struct RecurTileShape {
+    mode: RecurTileMode,
     input_param: ParamInfo,
     state_param: Option<ParamInfo>,
+    state_inner: Option<Type>,
     extra_params: Vec<ParamInfo>,
-    output_param: ParamInfo,
-    output_schema: Type,
+    output_schema: Option<Type>,
 }
 
 fn validate_recur_tile_shape(input: &ItemFn, return_kind: &ProtocolReturnKind) -> RecurTileShape {
     let params = extract_params(input);
     if params.len() < 2 {
-        panic!("`#[tile(kind = recur)]` tiles must accept at least `(input, output)`");
+        panic!("`#[tile(kind = recur)]` tiles must accept at least `(input, state)` or `(input, output)`");
     }
 
     let input_param = params.first().cloned().expect("recur tile input param");
@@ -804,94 +852,170 @@ fn validate_recur_tile_shape(input: &ItemFn, return_kind: &ProtocolReturnKind) -
         panic!("`#[tile(kind = recur)]` tiles must start with `input: RecurInput<T>`")
     });
 
-    let (state_param, output_index) =
-        if params.len() >= 3 && recur_state_inner_type(&params[1].ty).is_some() {
-            (Some(params[1].clone()), 2)
-        } else {
-            (None, 1)
-        };
-
-    let output_param = params.get(output_index).cloned().unwrap_or_else(|| {
-        panic!(
-            "`#[tile(kind = recur)]` tiles must place `output: RecurOutput<S>` after input/state"
-        )
-    });
-    let output_schema = recur_output_inner_type(&output_param.ty).unwrap_or_else(|| {
-        if state_param.is_some() && output_index + 1 < params.len() && recur_state_inner_type(&params[output_index + 1].ty).is_some() {
+    let second_param = params.get(1).cloned().expect("recur tile second param");
+    let (mode, state_param, state_inner, output_param, output_schema, extra_start) = if let Some(
+        output_schema,
+    ) =
+        recur_output_inner_type(&second_param.ty)
+    {
+        if params
+            .get(2)
+            .is_some_and(|param| recur_state_inner_type(&param.ty).is_some())
+        {
             panic!("`#[tile(kind = recur)]` tiles must place `state: RecurState<S>` before `output: RecurOutput<T>`");
         }
-        panic!("`#[tile(kind = recur)]` tiles must place `output: RecurOutput<S>` after input/state")
-    });
-    let extra_params = params[output_index + 1..].to_vec();
+        (
+            RecurTileMode::OutputOnly,
+            None,
+            None,
+            Some(second_param),
+            Some(output_schema),
+            2usize,
+        )
+    } else if let Some(state_inner) = recur_state_inner_type(&second_param.ty) {
+        if let Some(third_param) = params.get(2).cloned() {
+            if let Some(output_schema) = recur_output_inner_type(&third_param.ty) {
+                (
+                    RecurTileMode::StateOutput,
+                    Some(second_param),
+                    Some(state_inner),
+                    Some(third_param),
+                    Some(output_schema),
+                    3usize,
+                )
+            } else {
+                (
+                    RecurTileMode::StateOnly,
+                    Some(second_param),
+                    Some(state_inner),
+                    None,
+                    None,
+                    2usize,
+                )
+            }
+        } else {
+            (
+                RecurTileMode::StateOnly,
+                Some(second_param),
+                Some(state_inner),
+                None,
+                None,
+                2usize,
+            )
+        }
+    } else {
+        panic!("`#[tile(kind = recur)]` tiles must place `state: RecurState<S>` or `output: RecurOutput<T>` after `input`");
+    };
+
+    let extra_params = params[extra_start..].to_vec();
 
     if extra_params.iter().any(|param| {
         recur_state_inner_type(&param.ty).is_some()
             || recur_output_inner_type(&param.ty).is_some()
             || recur_input_inner_type(&param.ty).is_some()
     }) {
-        panic!("`#[tile(kind = recur)]` only supports `args...` after `output: RecurOutput<S>`");
+        panic!("`#[tile(kind = recur)]` only supports plain `args...` after recur state/output parameters");
     }
 
-    match (&state_param, return_kind) {
-        (None, ProtocolReturnKind::RecurOutput(return_ty)) => {
-            if !types_equivalent(return_ty, &output_param.ty) {
-                panic!(
-                    "`#[tile(kind = recur)]` tiles must return the same `RecurOutput<S>` type as their output parameter"
-                );
+    match mode {
+        RecurTileMode::OutputOnly => {
+            let output_param = output_param.as_ref().expect("output-only output param");
+            match return_kind {
+                ProtocolReturnKind::RecurOutput(return_ty) => {
+                    if !types_equivalent(return_ty, &output_param.ty) {
+                        panic!(
+                            "`#[tile(kind = recur)]` output-only tiles must return the same `RecurOutput<S>` type as their output parameter"
+                        );
+                    }
+                }
+                ProtocolReturnKind::RecurControlRecurOutput(return_ty) => {
+                    let inner_output_ty = recur_control_inner_type(return_ty)
+                        .expect("validated recur control output inner type");
+                    if !types_equivalent(&inner_output_ty, &output_param.ty) {
+                        panic!(
+                            "`#[tile(kind = recur)]` output-only tiles must return the same `RecurOutput<S>` type as their output parameter"
+                        );
+                    }
+                }
+                _ => {
+                    panic!(
+                        "`#[tile(kind = recur)]` output-only tiles must return `RecurOutput<S>` or `RecurControl<RecurOutput<S>>`"
+                    )
+                }
             }
         }
-        (None, ProtocolReturnKind::RecurControlRecurOutput(return_ty)) => {
-            let inner_output_ty = recur_control_inner_type(return_ty)
-                .expect("validated recur control output inner type");
-            if !types_equivalent(&inner_output_ty, &output_param.ty) {
-                panic!(
-                    "`#[tile(kind = recur)]` tiles must return the same `RecurOutput<S>` type as their output parameter"
-                );
+        RecurTileMode::StateOnly => {
+            let state_param = state_param.as_ref().expect("state-only state param");
+            match return_kind {
+                ProtocolReturnKind::RecurState(return_ty) => {
+                    if !types_equivalent(return_ty, &state_param.ty) {
+                        panic!(
+                            "`#[tile(kind = recur)]` state-only tiles must return the same `RecurState<S>` type as their state parameter"
+                        );
+                    }
+                }
+                ProtocolReturnKind::RecurControlRecurState(return_ty) => {
+                    let inner_state_ty = recur_control_inner_type(return_ty)
+                        .expect("validated recur control state inner type");
+                    if !types_equivalent(&inner_state_ty, &state_param.ty) {
+                        panic!(
+                            "`#[tile(kind = recur)]` state-only tiles must return the same `RecurState<S>` type as their state parameter"
+                        );
+                    }
+                }
+                _ => {
+                    panic!(
+                        "`#[tile(kind = recur)]` state-only tiles must return `RecurState<S>` or `RecurControl<RecurState<S>>`"
+                    )
+                }
             }
         }
-        (Some(state_param), ProtocolReturnKind::RecurStateOutput(return_ty)) => {
-            let (return_state_ty, return_output_ty) =
-                recur_state_output_parts(return_ty).expect("validated recur state output tuple");
-            let state_inner =
-                recur_state_inner_type(&state_param.ty).expect("recur state inner type");
-            if !types_equivalent(&return_state_ty, &state_inner)
-                || !types_equivalent(&return_output_ty, &output_param.ty)
-            {
-                panic!(
-                    "`#[tile(kind = recur)]` stateful tiles must return `(RecurState<S>, RecurOutput<T>)` matching their parameters"
-                );
+        RecurTileMode::StateOutput => {
+            let state_param = state_param.as_ref().expect("state+output state param");
+            let output_param = output_param.as_ref().expect("state+output output param");
+            match return_kind {
+                ProtocolReturnKind::RecurStateOutput(return_ty) => {
+                    let (return_state_ty, return_output_ty) = recur_state_output_parts(return_ty)
+                        .expect("validated recur state output tuple");
+                    let state_inner =
+                        recur_state_inner_type(&state_param.ty).expect("recur state inner type");
+                    if !types_equivalent(&return_state_ty, &state_inner)
+                        || !types_equivalent(&return_output_ty, &output_param.ty)
+                    {
+                        panic!(
+                            "`#[tile(kind = recur)]` state+output tiles must return `(RecurState<S>, RecurOutput<T>)` matching their parameters"
+                        );
+                    }
+                }
+                ProtocolReturnKind::RecurControlRecurStateOutput(return_ty) => {
+                    let (return_state_ty, return_output_ty) =
+                        recur_control_state_output_parts(return_ty)
+                            .expect("validated recur control state output tuple");
+                    let state_inner =
+                        recur_state_inner_type(&state_param.ty).expect("recur state inner type");
+                    if !types_equivalent(&return_state_ty, &state_inner)
+                        || !types_equivalent(&return_output_ty, &output_param.ty)
+                    {
+                        panic!(
+                            "`#[tile(kind = recur)]` state+output tiles must return `(RecurState<S>, RecurOutput<T>)` matching their parameters"
+                        );
+                    }
+                }
+                _ => {
+                    panic!(
+                        "`#[tile(kind = recur)]` state+output tiles must return `(RecurState<S>, RecurOutput<T>)` or `RecurControl<(RecurState<S>, RecurOutput<T>)>`"
+                    )
+                }
             }
-        }
-        (Some(state_param), ProtocolReturnKind::RecurControlRecurStateOutput(return_ty)) => {
-            let (return_state_ty, return_output_ty) = recur_control_state_output_parts(return_ty)
-                .expect("validated recur control state output tuple");
-            let state_inner =
-                recur_state_inner_type(&state_param.ty).expect("recur state inner type");
-            if !types_equivalent(&return_state_ty, &state_inner)
-                || !types_equivalent(&return_output_ty, &output_param.ty)
-            {
-                panic!(
-                    "`#[tile(kind = recur)]` stateful tiles must return `(RecurState<S>, RecurOutput<T>)` matching their parameters"
-                );
-            }
-        }
-        (None, _) => {
-            panic!(
-                "`#[tile(kind = recur)]` tiles must return `RecurOutput<S>` or `RecurControl<RecurOutput<S>>`"
-            )
-        }
-        (Some(_), _) => {
-            panic!(
-                "`#[tile(kind = recur)]` stateful tiles must return `(RecurState<S>, RecurOutput<T>)` or `RecurControl<(RecurState<S>, RecurOutput<T>)>`"
-            )
         }
     }
 
     RecurTileShape {
+        mode,
         input_param,
         state_param,
+        state_inner,
         extra_params,
-        output_param,
         output_schema,
     }
 }
@@ -905,8 +1029,12 @@ fn gen_recur_driver_function(
     let source_ident = format_ident!("__RasterRecurSource");
     let item_ty =
         recur_input_inner_type(&shape.input_param.ty).expect("validated recur input type");
-    let output_schema = &shape.output_schema;
-    let output_type_expr = output_schema.to_token_stream().to_string();
+    let result_ty = shape
+        .output_schema
+        .as_ref()
+        .or(shape.state_inner.as_ref())
+        .expect("recur caller-visible result type");
+    let result_type_expr = result_ty.to_token_stream().to_string();
     let extra_generic_idents: Vec<_> = shape
         .extra_params
         .iter()
@@ -1041,20 +1169,25 @@ fn gen_recur_driver_function(
             }
         })
         .collect();
-    let call_expr = if shape.state_param.is_some() {
-        quote! {
-            {
-                #(#extra_arg_materialization)*
-                #implementation_name(input, state, output, #(#extra_materialized_idents),*)
-            }
-        }
-    } else {
-        quote! {
+    let call_expr = match shape.mode {
+        RecurTileMode::OutputOnly => quote! {
             {
                 #(#extra_arg_materialization)*
                 #implementation_name(input, output, #(#extra_materialized_idents),*)
             }
-        }
+        },
+        RecurTileMode::StateOnly => quote! {
+            {
+                #(#extra_arg_materialization)*
+                #implementation_name(input, state, #(#extra_materialized_idents),*)
+            }
+        },
+        RecurTileMode::StateOutput => quote! {
+            {
+                #(#extra_arg_materialization)*
+                #implementation_name(input, state, output, #(#extra_materialized_idents),*)
+            }
+        },
     };
     let state_wrapper = shape.state_param.as_ref().map(|param| {
         let state_ident = &param.ident;
@@ -1068,23 +1201,56 @@ fn gen_recur_driver_function(
         let state_inner = recur_state_inner_type(&param.ty).expect("validated recur state type");
         quote! { #state_ident: impl ::core::convert::Into<::raster::RecurState<#state_inner>>, }
     });
-    let run_driver = if let Some(param) = &shape.state_param {
-        let state_ident = &param.ident;
-        quote! {
-            ::raster::run_recur_list_with_state::<#item_ty, _, #output_schema, _, _>(
-                input,
-                #state_ident,
-                output,
-                move |input, state, output| #call_expr,
-            )
+    let output_param = shape.output_schema.as_ref().map(|output_schema| {
+        quote! { output: ::raster::Draft<#output_schema>, }
+    });
+    let run_driver = match shape.mode {
+        RecurTileMode::OutputOnly => {
+            let output_schema = shape
+                .output_schema
+                .as_ref()
+                .expect("output-only output schema");
+            quote! {
+                ::raster::run_recur_list::<#item_ty, #output_schema, _, _>(
+                    input,
+                    output,
+                    move |input, output| #call_expr,
+                )
+            }
         }
-    } else {
-        quote! {
-            ::raster::run_recur_list::<#item_ty, #output_schema, _, _>(
-                input,
-                output,
-                move |input, output| #call_expr,
-            )
+        RecurTileMode::StateOnly => {
+            let state_ident = &shape
+                .state_param
+                .as_ref()
+                .expect("state-only state param")
+                .ident;
+            let state_inner = shape.state_inner.as_ref().expect("state-only state inner");
+            quote! {
+                ::raster::run_recur_list_state::<#item_ty, #state_inner, _, _>(
+                    input,
+                    #state_ident,
+                    move |input, state| #call_expr,
+                )
+            }
+        }
+        RecurTileMode::StateOutput => {
+            let state_ident = &shape
+                .state_param
+                .as_ref()
+                .expect("state+output state param")
+                .ident;
+            let output_schema = shape
+                .output_schema
+                .as_ref()
+                .expect("state+output output schema");
+            quote! {
+                ::raster::run_recur_list_with_state::<#item_ty, _, #output_schema, _, _>(
+                    input,
+                    #state_ident,
+                    output,
+                    move |input, state, output| #call_expr,
+                )
+            }
         }
     };
     let state_trace_arg = shape.state_param.as_ref().map(|param| {
@@ -1101,6 +1267,20 @@ fn gen_recur_driver_function(
                 ty: ::raster::alloc::string::String::from(#state_ty_str),
             });
             __raster_trace_values.push(__raster_input_value_state.clone());
+        }
+    });
+    let output_trace_arg = shape.output_schema.as_ref().map(|output_schema| {
+        quote! {
+            let __raster_input_value_output = ::raster::core::trace::FnInputValue::Inline(
+                ::raster::core::postcard::to_allocvec(&output).unwrap_or_default()
+            );
+            __raster_input_args.push(::raster::core::trace::FnInputArg {
+                name: ::raster::alloc::string::String::from("output"),
+                ty: ::raster::alloc::string::String::from(
+                    stringify!(::raster::Draft<#output_schema>)
+                ),
+            });
+            __raster_trace_values.push(__raster_input_value_output.clone());
         }
     });
     let extra_trace_args: Vec<_> = shape
@@ -1130,9 +1310,9 @@ fn gen_recur_driver_function(
         pub fn #hidden_name #wrapper_generics (
             input: #source_ident,
             #state_param
-            output: ::raster::Draft<#output_schema>,
+            #output_param
             #(#extra_wrapper_params,)*
-        ) -> ::raster::AuthRef<#output_schema>
+        ) -> ::raster::AuthRef<#result_ty>
         where
             #source_ident: ::raster::IntoAuthRef<::raster::alloc::vec::Vec<#item_ty>>,
             #(#extra_where,)*
@@ -1148,9 +1328,6 @@ fn gen_recur_driver_function(
                 #(#extra_arg_trace_value_defs)*
 
                 let __raster_input_value_input = __raster_input_trace.value;
-                let __raster_input_value_output = ::raster::core::trace::FnInputValue::Inline(
-                    ::raster::core::postcard::to_allocvec(&output).unwrap_or_default()
-                );
                 let mut __raster_input_args: ::raster::alloc::vec::Vec<::raster::core::trace::FnInputArg> = ::raster::alloc::vec![
                     ::raster::core::trace::FnInputArg {
                         name: ::raster::alloc::string::String::from("input"),
@@ -1158,17 +1335,11 @@ fn gen_recur_driver_function(
                             stringify!(::raster::AuthRef<::raster::alloc::vec::Vec<#item_ty>>)
                         ),
                     },
-                    ::raster::core::trace::FnInputArg {
-                        name: ::raster::alloc::string::String::from("output"),
-                        ty: ::raster::alloc::string::String::from(
-                            stringify!(::raster::Draft<#output_schema>)
-                        ),
-                    },
                 ];
                 let mut __raster_trace_values: ::raster::alloc::vec::Vec<::raster::core::trace::FnInputValue> = ::raster::alloc::vec![
                     __raster_input_value_input.clone(),
-                    __raster_input_value_output.clone(),
                 ];
+                #output_trace_arg
                 #state_trace_arg
                 #(#extra_trace_args)*
 
@@ -1202,14 +1373,14 @@ fn gen_recur_driver_function(
                 });
 
                 let __raster_result = #run_driver;
-                let __raster_materialized_output: #output_schema =
-                    ::raster::materialize_auth_return::<#output_schema, _>(__raster_result.clone());
-                let __raster_output_bytes = ::raster::core::postcard::to_allocvec(&__raster_materialized_output)
-                    .unwrap_or_else(|e| panic!("Failed to serialize recur output: {}", e));
+                let __raster_materialized_result: #result_ty =
+                    ::raster::materialize_auth_return::<#result_ty, _>(__raster_result.clone());
+                let __raster_output_bytes = ::raster::core::postcard::to_allocvec(&__raster_materialized_result)
+                    .unwrap_or_else(|e| panic!("Failed to serialize recur result: {}", e));
 
                 let __raster_output = ::core::option::Option::Some(::raster::core::trace::FnOutput {
                     data: __raster_output_bytes,
-                    ty: ::raster::alloc::string::String::from(#output_type_expr),
+                    ty: ::raster::alloc::string::String::from(#result_type_expr),
                 });
 
                 let __raster_record = ::raster::core::trace::FnCallRecord {
@@ -1480,7 +1651,7 @@ struct RecurCallInput {
     tile: syn::Ident,
     input: Expr,
     state: Option<Expr>,
-    output: Expr,
+    output: Option<Expr>,
     args: syn::punctuated::Punctuated<Expr, Token![,]>,
 }
 
@@ -1522,9 +1693,27 @@ impl Parse for RecurCallInput {
             None
         };
 
-        parse_named_key(input, "output")?;
-        let output: Expr = input.parse()?;
-        input.parse::<Token![,]>()?;
+        let output = if input.peek(syn::Ident) {
+            let fork = input.fork();
+            let ident: syn::Ident = fork.parse()?;
+            if ident == "output" {
+                parse_named_key(input, "output")?;
+                let output_expr: Expr = input.parse()?;
+                input.parse::<Token![,]>()?;
+                Some(output_expr)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if state.is_none() && output.is_none() {
+            return Err(syn::Error::new(
+                input.span(),
+                "call_recur! requires `state = ...` and/or `output = ...` before `args = (...)`",
+            ));
+        }
 
         parse_named_key(input, "args")?;
         let content;
@@ -1557,7 +1746,7 @@ fn rewrite_call_seq_macro(expr_macro: &syn::ExprMacro) -> Expr {
 fn rewrite_call_recur_macro(expr_macro: &syn::ExprMacro) -> Expr {
     let input = syn::parse2::<RecurCallInput>(expr_macro.mac.tokens.clone()).unwrap_or_else(|_| {
         panic!(
-            "call_recur! expects `tile = ...`, `input = ...`, optional `state = ...`, `output = ...`, and `args = (...)`"
+            "call_recur! expects `tile = ...`, `input = ...`, optional `state = ...`, optional `output = ...`, and `args = (...)`"
         )
     });
     let hidden = format_ident!("__raster_recur_auth_{}", input.tile);
@@ -1566,12 +1755,22 @@ fn rewrite_call_recur_macro(expr_macro: &syn::ExprMacro) -> Expr {
     let output_expr = input.output;
     let args: Vec<_> = input.args.into_iter().collect();
     if let Some(state_expr) = state_expr {
+        if let Some(output_expr) = output_expr {
+            syn::parse_quote! {
+                #hidden(#input_expr, #state_expr, #output_expr #(, #args)*)
+            }
+        } else {
+            syn::parse_quote! {
+                #hidden(#input_expr, #state_expr #(, #args)*)
+            }
+        }
+    } else if let Some(output_expr) = output_expr {
         syn::parse_quote! {
-            #hidden(#input_expr, #state_expr, #output_expr #(, #args)*)
+            #hidden(#input_expr, #output_expr #(, #args)*)
         }
     } else {
         syn::parse_quote! {
-            #hidden(#input_expr, #output_expr #(, #args)*)
+            compile_error!("call_recur! requires `state = ...` and/or `output = ...`")
         }
     }
 }

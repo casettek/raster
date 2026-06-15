@@ -114,14 +114,36 @@ fn main() {
     );
     let recur_greeting = call_recur!(
         tile = build_recur_draft_greeting,
-        input = address_lines,
+        input = address_lines.clone(),
         output = new!(CollectiveGreeting),
         args = ("Recur-built greeting".to_string(),)
     );
-    debug!("recur greeting: {:?}", recur_greeting);
+    debug!("output-only recur greeting: {:?}", recur_greeting);
     let recur_title = select!(String, recur_greeting.clone().title);
     let recur_first_line = select!(String, recur_greeting.lines[0]);
     call!(concat_messages, recur_title, recur_first_line);
+
+    let recur_line_stats = call_recur!(
+        tile = compute_recur_max_line_len,
+        input = address_lines.clone(),
+        state = LineLengthStats { max_len: 0 },
+        args = ()
+    );
+    debug!("state-only recur stats: {:?}", recur_line_stats);
+    let recur_max_line_len = select!(u64, recur_line_stats.max_len);
+    call!(fibonacci, recur_max_line_len);
+
+    let limited_recur_greeting = call_recur!(
+        tile = build_limited_recur_greeting,
+        input = address_lines,
+        state = GreetingLimitState { seen: 0 },
+        output = new!(CollectiveGreeting),
+        args = ("State+output recur greeting".to_string(), 2)
+    );
+    debug!("state+output recur greeting: {:?}", limited_recur_greeting);
+    let limited_title = select!(String, limited_recur_greeting.clone().title);
+    let limited_first_line = select!(String, limited_recur_greeting.lines[0]);
+    call!(concat_messages, limited_title, limited_first_line);
 
     let name_2 = call_seq!(placeholder_sequence, "Placeholder".to_string());
     let result = call_seq!(greet_sequence, name_2);

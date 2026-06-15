@@ -4,4 +4,4 @@ error: custom attribute panicked
 9 | #[tile(kind = recur)]
   | ^^^^^^^^^^^^^^^^^^^^^
   |
-  = help: message: `#[tile(kind = recur)]` tiles must accept at least `(input, output)`
+  = help: message: `#[tile(kind = recur)]` tiles must accept at least `(input, state)` or `(input, output)`

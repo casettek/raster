@@ -558,29 +558,31 @@ where
                         .finish(),
                 }
             }
-            Self::Internal(binding) => match (binding.resolve.as_ref())(binding.reference.clone()) {
-                Ok(resolved) => f
-                    .debug_struct("AuthRef")
-                    .field("storage", &"internal")
-                    .field(
-                        "coordinates",
-                        &summarize_coordinates(&resolved.reference.coordinates),
-                    )
-                    .field("commitment_len", &resolved.reference.commitment.len())
-                    .field("stored_bytes_len", &resolved.bytes.len())
-                    .field("value", &resolved.value)
-                    .finish(),
-                Err(error) => f
-                    .debug_struct("AuthRef")
-                    .field("storage", &"internal")
-                    .field(
-                        "coordinates",
-                        &summarize_coordinates(&binding.reference.coordinates),
-                    )
-                    .field("commitment_len", &binding.reference.commitment.len())
-                    .field("materialization_error", &alloc::format!("{}", error))
-                    .finish(),
-            },
+            Self::Internal(binding) => {
+                match (binding.resolve.as_ref())(binding.reference.clone()) {
+                    Ok(resolved) => f
+                        .debug_struct("AuthRef")
+                        .field("storage", &"internal")
+                        .field(
+                            "coordinates",
+                            &summarize_coordinates(&resolved.reference.coordinates),
+                        )
+                        .field("commitment_len", &resolved.reference.commitment.len())
+                        .field("stored_bytes_len", &resolved.bytes.len())
+                        .field("value", &resolved.value)
+                        .finish(),
+                    Err(error) => f
+                        .debug_struct("AuthRef")
+                        .field("storage", &"internal")
+                        .field(
+                            "coordinates",
+                            &summarize_coordinates(&binding.reference.coordinates),
+                        )
+                        .field("commitment_len", &binding.reference.commitment.len())
+                        .field("materialization_error", &alloc::format!("{}", error))
+                        .finish(),
+                }
+            }
         }
     }
 }
@@ -1213,6 +1215,61 @@ where
     {
         let _ = source;
         let _ = output;
+        let _ = step;
+        panic!("Recursive list execution requires the `std` feature")
+    }
+}
+
+#[doc(hidden)]
+pub fn run_recur_list_state<T, State, Step, Output>(
+    source: AuthRef<Vec<T>>,
+    state: RecurState<State>,
+    mut step: Step,
+) -> AuthRef<State>
+where
+    T: DeserializeOwned + Serialize + Selectable + 'static,
+    State: DeserializeOwned + Serialize + 'static,
+    Step: FnMut(RecurInput<T>, RecurState<State>) -> Output,
+    Output: IntoRecurControl<RecurState<State>>,
+{
+    #[cfg(feature = "std")]
+    {
+        let len = recur_list_len(&source)
+            .unwrap_or_else(|error| panic!("Failed to resolve recursive list source: {}", error));
+        let mut state = state;
+
+        for index in 0..len {
+            let item = select_recur_list_item(&source, index).unwrap_or_else(|error| {
+                panic!(
+                    "Failed to select recursive list item at index {}: {}",
+                    index, error
+                )
+            });
+            let input = build_recur_input(item, index, len).unwrap_or_else(|error| {
+                panic!(
+                    "Failed to materialize recursive list item at index {}: {}",
+                    index, error
+                )
+            });
+
+            match step(input, state).into_recur_control() {
+                RecurControl::Continue(next_state) => {
+                    state = next_state;
+                }
+                RecurControl::Break(done_state) => {
+                    state = done_state;
+                    break;
+                }
+            }
+        }
+
+        return crate::__private::bind_infallible_call(state.into_inner());
+    }
+
+    #[cfg(not(feature = "std"))]
+    {
+        let _ = source;
+        let _ = state;
         let _ = step;
         panic!("Recursive list execution requires the `std` feature")
     }

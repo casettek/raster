@@ -27,6 +27,11 @@ struct LimitState {
     seen: u64,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, Selectable)]
+struct MaxLenState {
+    max_len: u64,
+}
+
 #[tile(kind = recur)]
 fn collect_lines(
     input: RecurInput<String>,
@@ -127,6 +132,36 @@ fn collect_until_limit(
     }
 }
 
+#[tile(kind = recur)]
+fn track_max_len(
+    input: RecurInput<String>,
+    state: RecurState<MaxLenState>,
+) -> RecurState<MaxLenState> {
+    let mut state = state;
+    let len = input.value().len() as u64;
+    if len > state.max_len {
+        state.max_len = len;
+    }
+    state
+}
+
+#[tile(kind = recur)]
+fn count_until_limit_state_only(
+    input: RecurInput<String>,
+    state: RecurState<LimitState>,
+    limit: u64,
+) -> RecurControl<RecurState<LimitState>> {
+    let _ = input;
+    let mut state = state;
+    state.seen += 1;
+
+    if state.seen >= limit {
+        RecurControl::Break(state)
+    } else {
+        RecurControl::Continue(state)
+    }
+}
+
 #[sequence]
 fn collect_two_items(limit: u64) -> LimitedBundle {
     let source = raster::store_internal_value(&vec![
@@ -145,8 +180,90 @@ fn collect_two_items(limit: u64) -> LimitedBundle {
     )
 }
 
+#[sequence]
+fn compute_max_len() -> MaxLenState {
+    let source = raster::store_internal_value(&vec![
+        "a".to_string(),
+        "alphabet".to_string(),
+        "rust".to_string(),
+    ])
+    .expect("list source should store");
+
+    call_recur!(
+        tile = track_max_len,
+        input = internal!(Vec<String>, source),
+        state = MaxLenState { max_len: 0 },
+        args = ()
+    )
+}
+
+#[sequence]
+fn compute_max_len_field() -> u64 {
+    let source = raster::store_internal_value(&vec![
+        "a".to_string(),
+        "alphabet".to_string(),
+        "rust".to_string(),
+    ])
+    .expect("list source should store");
+
+    let stats = call_recur!(
+        tile = track_max_len,
+        input = internal!(Vec<String>, source),
+        state = MaxLenState { max_len: 0 },
+        args = ()
+    );
+
+    select!(u64, stats.max_len)
+}
+
+#[sequence]
+fn count_seen_until_limit(limit: u64) -> LimitState {
+    let source = raster::store_internal_value(&vec![
+        "one".to_string(),
+        "two".to_string(),
+        "three".to_string(),
+    ])
+    .expect("list source should store");
+
+    call_recur!(
+        tile = count_until_limit_state_only,
+        input = internal!(Vec<String>, source),
+        state = LimitState { seen: 0 },
+        args = (limit,)
+    )
+}
+
+#[sequence]
+fn state_only_empty_input() -> MaxLenState {
+    let source =
+        raster::store_internal_value(&Vec::<String>::new()).expect("list source should store");
+
+    call_recur!(
+        tile = track_max_len,
+        input = internal!(Vec<String>, source),
+        state = MaxLenState { max_len: 0 },
+        args = ()
+    )
+}
+
 fn run_collect_two_items(limit: u64) -> LimitedBundle {
     materialize_auth_return::<LimitedBundle, _>(__raster_sequence_auth_collect_two_items(limit))
+}
+
+fn run_compute_max_len() -> MaxLenState {
+    materialize_auth_return::<MaxLenState, _>(__raster_sequence_auth_compute_max_len())
+}
+
+fn run_compute_max_len_field() -> u64 {
+    materialize_auth_return::<u64, _>(__raster_sequence_auth_compute_max_len_field())
+}
+
+fn run_count_seen_until_limit(limit: u64) -> LimitState {
+    materialize_auth_return::<LimitState, _>(__raster_sequence_auth_count_seen_until_limit(limit))
+}
+
+fn run_state_only_empty_input() -> MaxLenState {
+    materialize_auth_return::<MaxLenState, _>(__raster_sequence_auth_state_only_empty_input())
 }
 
 #[test]
@@ -202,4 +319,32 @@ fn call_recur_threads_state_and_finalizes() {
     assert_eq!(result.limit, 2);
     assert_eq!(result.stopped_after, 2);
     assert_eq!(result.items, vec!["one".to_string(), "two".to_string()]);
+}
+
+#[test]
+fn call_recur_can_return_state_only_results() {
+    let result = run_compute_max_len();
+
+    assert_eq!(result.max_len, 8);
+}
+
+#[test]
+fn call_recur_state_only_results_can_be_selected() {
+    let result = run_compute_max_len_field();
+
+    assert_eq!(result, 8);
+}
+
+#[test]
+fn call_recur_state_only_break_returns_final_state() {
+    let result = run_count_seen_until_limit(2);
+
+    assert_eq!(result.seen, 2);
+}
+
+#[test]
+fn call_recur_state_only_empty_input_returns_initial_state() {
+    let result = run_state_only_empty_input();
+
+    assert_eq!(result.max_len, 0);
 }

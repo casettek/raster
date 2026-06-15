@@ -12,6 +12,7 @@ extern crate alloc;
 use alloc::format;
 use alloc::string::String;
 use raster::prelude::*;
+use serde::{Deserialize, Serialize};
 
 use crate::input::{CollectiveGreeting, CollectiveGreetingDraftExt, PersonalData};
 
@@ -113,6 +114,60 @@ pub fn build_recur_draft_greeting(
     }
     output.lines().push(input.into_value());
     output
+}
+
+/// State returned from a state-only recur tile.
+#[derive(Clone, Debug, Deserialize, Serialize, Selectable)]
+pub struct LineLengthStats {
+    pub max_len: u64,
+}
+
+/// Internal state used by a state+output recur tile.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct GreetingLimitState {
+    pub seen: u64,
+}
+
+/// State-only recur: reduce a list of lines down to a single summary value.
+#[tile(kind = recur)]
+pub fn compute_recur_max_line_len(
+    input: RecurInput<String>,
+    state: RecurState<LineLengthStats>,
+) -> RecurState<LineLengthStats> {
+    let mut state = state;
+    let len = input.value().len() as u64;
+    if len > state.max_len {
+        state.max_len = len;
+    }
+    state
+}
+
+/// State+output recur: use loop-carried state to stop building output early.
+#[tile(kind = recur)]
+pub fn build_limited_recur_greeting(
+    input: RecurInput<String>,
+    state: RecurState<GreetingLimitState>,
+    output: RecurOutput<CollectiveGreeting>,
+    title: String,
+    limit: u64,
+) -> RecurControl<(
+    RecurState<GreetingLimitState>,
+    RecurOutput<CollectiveGreeting>,
+)> {
+    let mut state = state;
+    let mut output = output;
+    if input.is_first() {
+        output.title().set(title);
+    }
+
+    state.seen += 1;
+    output.lines().push(input.into_value());
+
+    if state.seen >= limit {
+        RecurControl::Break((state, output))
+    } else {
+        RecurControl::Continue((state, output))
+    }
 }
 
 #[tile]

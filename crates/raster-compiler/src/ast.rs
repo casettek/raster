@@ -305,7 +305,7 @@ impl CallVisitor {
             tile: syn::Ident,
             input: Expr,
             state: Option<Expr>,
-            output: Expr,
+            output: Option<Expr>,
             args: syn::punctuated::Punctuated<Expr, Token![,]>,
         }
 
@@ -346,9 +346,20 @@ impl CallVisitor {
                     None
                 };
 
-                parse_named_key(input, "output")?;
-                let output: Expr = input.parse()?;
-                input.parse::<Token![,]>()?;
+                let output = if input.peek(syn::Ident) {
+                    let fork = input.fork();
+                    let ident: syn::Ident = fork.parse()?;
+                    if ident == "output" {
+                        parse_named_key(input, "output")?;
+                        let output_expr: Expr = input.parse()?;
+                        input.parse::<Token![,]>()?;
+                        Some(output_expr)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
 
                 parse_named_key(input, "args")?;
                 let content;
@@ -375,8 +386,10 @@ impl CallVisitor {
             argument_kinds.push(Self::classify_argument(&state));
         }
 
-        arguments.push(Self::expr_to_string(&parsed.output));
-        argument_kinds.push(Self::classify_argument(&parsed.output));
+        if let Some(output) = parsed.output {
+            arguments.push(Self::expr_to_string(&output));
+            argument_kinds.push(Self::classify_argument(&output));
+        }
 
         for expr in parsed.args {
             arguments.push(Self::expr_to_string(&expr));
@@ -554,6 +567,18 @@ mod tests {
         );
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].callee, "build");
+        assert_eq!(calls[0].call_kind, CallKind::Recursive);
+        assert_eq!(calls[0].result_binding.as_deref(), Some("result"));
+        assert_eq!(calls[0].arguments.len(), 3);
+    }
+
+    #[test]
+    fn test_call_recur_state_only_macro_extraction() {
+        let calls = parse_calls(
+            "fn seq() { let result = call_recur!(tile = reduce, input = items, state = Stats { max_len: 0 }, args = (needle,)); }",
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].callee, "reduce");
         assert_eq!(calls[0].call_kind, CallKind::Recursive);
         assert_eq!(calls[0].result_binding.as_deref(), Some("result"));
         assert_eq!(calls[0].arguments.len(), 3);
