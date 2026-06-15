@@ -104,3 +104,13 @@ fn finalize_requires_all_set_once_fields() {
     let draft = push_tx("tx-only".to_string(), draft);
     let _ = finalize(draft);
 }
+
+#[test]
+fn serialized_draft_handles_cannot_be_deserialized() {
+    let _guard = raster::__private::SequenceScopeGuard::enter("draft_serde_roundtrip");
+
+    let draft = new!(Account);
+    let bytes = raster::core::postcard::to_allocvec(&draft).expect("draft marker should serialize");
+
+    assert!(raster::core::postcard::from_bytes::<Draft<Account>>(&bytes).is_err());
+}

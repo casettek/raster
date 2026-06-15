@@ -113,7 +113,7 @@ impl GuestBuilder {
         let fn_name = tile_id.replace('-', "_");
 
         // The wrapper function name follows the pattern from the #[tile] macro
-        let wrapper_name = format!("__raster_tile_entry_{}", fn_name);
+        let wrapper_name = format!("__raster_tile_replay_entry_{}", fn_name);
 
         // Get the crate name for the import
         let crate_name = self

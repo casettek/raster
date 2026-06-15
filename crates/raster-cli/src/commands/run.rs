@@ -20,6 +20,7 @@ use raster_core::cfs::{CfsCoordinates, CfsCursor, ControlFlowSchema};
 use raster_core::coordinate_index::{
     coordinate_index_membership_proof, coordinate_index_non_membership_proof, coordinate_index_root,
 };
+use raster_core::draft::DraftTransitionWitness;
 use raster_core::trace::{ExternalInput, FnInput, StepRecord, Trace, TraceEvent, TraceWindow};
 use raster_core::transition::{
     InternalStoreEntry, InternalStoreIndexValue, InternalStoreLogWitness, InternalStoreReadWitness,
@@ -513,6 +514,7 @@ pub fn prove(
             Option<FnInput>,
             ExternalInput,
             Option<InternalStoreWitness>,
+            Option<DraftTransitionWitness>,
         ),
     > = HashMap::new();
     let window_start_index = fraud_window
@@ -550,6 +552,7 @@ pub fn prove(
                         .and_then(|witness| witness.input_source_witness())
                 });
         let external_input = step_witness.external_input();
+        let draft_transition_witness = step_witness.draft_transition_witness();
         let before_state = current_internal_store_state.clone();
         let mut internal_read_witnesses = Vec::new();
         if let Some(input_source_witness_ref) = input_source_witness.as_ref() {
@@ -622,6 +625,7 @@ pub fn prove(
                 sequence_scope_witness,
                 external_input,
                 internal_store_witness,
+                draft_transition_witness,
             ),
         );
 

@@ -1,4 +1,5 @@
 use raster_core::cfs::{CfsCoordinates, CfsCursor, ControlFlowSchema, SequenceChildId};
+use raster_core::draft::DraftTransitionWitness;
 use raster_core::trace::{
     ExternalInput, FnInput, InternalInput, SequenceEndRecord, SequenceStartRecord, StepRecord,
     TileExecRecord, TraceEvent,
@@ -81,6 +82,7 @@ pub struct StepWitnessData {
     external_input: ExternalInput,
     internal_input: InternalInput,
     internal_write: Option<InternalWriteRecord>,
+    draft_transition_witness: Option<DraftTransitionWitness>,
 }
 
 impl StepWitnessData {
@@ -106,6 +108,10 @@ impl StepWitnessData {
 
     pub fn internal_write(&self) -> Option<InternalWriteRecord> {
         self.internal_write.clone()
+    }
+
+    pub fn draft_transition_witness(&self) -> Option<DraftTransitionWitness> {
+        self.draft_transition_witness.clone()
     }
 }
 
@@ -142,6 +148,7 @@ impl StepWitnessStore {
                             .map(|input| input.internal().clone())
                             .unwrap_or_default(),
                         internal_write,
+                        draft_transition_witness: trace_item.draft_transition_witness,
                     },
                 );
             }
@@ -154,6 +161,7 @@ impl StepWitnessStore {
                 });
                 trace_io.output_data = trace_item.output.as_ref().map(|output| output.data.clone());
                 trace_io.internal_write = internal_write;
+                trace_io.draft_transition_witness = trace_item.draft_transition_witness;
             }
             TraceEvent::TileExec(trace_item) => {
                 self.0.insert(
@@ -176,6 +184,7 @@ impl StepWitnessStore {
                             .map(|input| input.internal().clone())
                             .unwrap_or_default(),
                         internal_write,
+                        draft_transition_witness: trace_item.draft_transition_witness,
                     },
                 );
             }
@@ -411,6 +420,7 @@ mod tests {
                 fn_name: "main".to_string(),
                 input: None,
                 output: None,
+                draft_transition_witness: None,
             }),
             None,
         );

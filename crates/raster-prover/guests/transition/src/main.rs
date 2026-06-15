@@ -19,6 +19,10 @@ use raster_core::cfs::{
 use raster_core::coordinate_index::{
     verify_coordinate_index_membership, verify_coordinate_index_non_membership,
 };
+use raster_core::draft::{
+    apply_draft_ops, schema_hash as compute_schema_hash, verify_witness_root, DraftReplayTransition,
+    DraftTransitionWitness, TileReplayJournal, TrackedDraftState,
+};
 use raster_core::fingerprint::{Fingerprint, FingerprintAccumulator};
 use raster_core::input::verify_selection_proof;
 use raster_core::trace::{ExternalData, ExternalInput, FnInput, FnInputValue, InternalData, StepRecord};
@@ -543,6 +547,7 @@ fn verify_authorization_journal<'a>(
 fn verify_step_record(
     step_record: &StepRecord,
     replay_image_id: Option<&Vec<u8>>,
+    replay_journal: Option<&raster_core::draft::TileReplayJournal>,
 
     input_witness_bytes: Option<&Vec<u8>>,
     output_witness_bytes: Option<&Vec<u8>>,
@@ -583,12 +588,20 @@ fn verify_step_record(
     if let StepRecord::TileExec(_) = step_record {
         let replay_image_id =
             replay_image_id.expect("replay image id should be provided for tile execution should ");
+        let replay_journal =
+            replay_journal.expect("tile execution should provide a replay journal witness");
         let replay_image_id_digest = risc0_zkvm::sha::Digest::try_from(replay_image_id.as_slice())
             .expect("image_id must be 32 bytes");
-        let output_bytes = output_witness_bytes.map(Vec::as_slice).unwrap_or(&[]);
-
-        env::verify(replay_image_id_digest, output_bytes)
+        let replay_journal_bytes = postcard::to_allocvec(replay_journal)
+            .expect("Failed to encode replay journal for receipt verification");
+        env::verify(replay_image_id_digest, &replay_journal_bytes)
             .expect("Failed to verify trace replay image id");
+        let output_bytes = output_witness_bytes.map(Vec::as_slice).unwrap_or(&[]);
+        assert_eq!(
+            replay_journal.output_bytes.as_slice(),
+            output_bytes,
+            "Replay journal output bytes do not match recorded tile output witness",
+        );
     }
 }
 
@@ -710,6 +723,85 @@ fn verify_internal_store_transition(
     }
 }
 
+fn verify_draft_transition(
+    step_record: &StepRecord,
+    replay_journal: Option<&TileReplayJournal>,
+    draft_transition_witness: Option<&DraftTransitionWitness>,
+    active_drafts: &mut BTreeMap<[u8; 32], TrackedDraftState>,
+) {
+    let StepRecord::TileExec(_) = step_record else {
+        assert!(
+            replay_journal.is_none(),
+            "Only tile steps may carry replay journals",
+        );
+        assert!(
+            draft_transition_witness.is_none(),
+            "Only tile steps may carry draft transition witnesses",
+        );
+        return;
+    };
+
+    let Some(replay_journal) = replay_journal else {
+        panic!("TileExec replay journal is missing");
+    };
+    let Some(DraftReplayTransition {
+        draft_id,
+        schema_hash,
+        root_before,
+        ops,
+    }) = replay_journal.draft_transition.as_ref()
+    else {
+        assert!(
+            draft_transition_witness.is_none(),
+            "TileExec without replay-emitted draft transition must not carry draft witnesses",
+        );
+        return;
+    };
+
+    let witness = draft_transition_witness
+        .expect("TileExec with replay-emitted draft transition must carry draft witness");
+    let witness_schema_hash = compute_schema_hash(&witness.pre_state.schema);
+    assert_eq!(
+        &witness_schema_hash, schema_hash,
+        "Draft witness schema hash does not match replay journal schema hash",
+    );
+    verify_witness_root(&witness.pre_state, root_before)
+        .expect("Draft witness root must match replay journal root_before");
+
+    if let Some(native_transition) = witness.native_transition.as_ref() {
+        assert_eq!(
+            native_transition.schema_hash, *schema_hash,
+            "Native draft capture schema hash does not match replay journal",
+        );
+        assert_eq!(
+            native_transition.root_before, *root_before,
+            "Native draft capture root_before does not match replay journal",
+        );
+    }
+
+    if let Some(tracked_state) = active_drafts.get(draft_id) {
+        assert_eq!(
+            tracked_state.schema_hash, *schema_hash,
+            "Tracked draft schema hash changed within a draft chain",
+        );
+        assert_eq!(
+            tracked_state.root, *root_before,
+            "Replay journal root_before does not match tracked draft root",
+        );
+    }
+
+    let (_, root_after) = apply_draft_ops(&witness.pre_state, ops)
+        .expect("Draft replay ops must apply to authenticated pre-state witness");
+
+    active_drafts.insert(
+        *draft_id,
+        TrackedDraftState {
+            schema_hash: *schema_hash,
+            root: root_after,
+        },
+    );
+}
+
 // Verify that current step record corrdinates are in preveious expected next coordinates and with
 // CfsCursor iterate to next expected coordiantes
 fn get_next_expected_coordinates(
@@ -786,6 +878,7 @@ fn main() {
             verify_step_record(
                 &input.step_record,
                 input.replay_image_id.as_ref(),
+                input.replay_journal.as_ref(),
                 input.input_witness.as_ref(),
                 input.output_witness.as_ref(),
                 input.input_source_witness.as_ref(),
@@ -806,6 +899,13 @@ fn main() {
             );
             let next_expected_coordinates =
                 get_next_expected_coordinates(&cfs_cursor, &input.step_record, None);
+            let mut active_drafts = init_transition.active_drafts.clone();
+            verify_draft_transition(
+                &input.step_record,
+                input.replay_journal.as_ref(),
+                input.draft_transition_witness.as_ref(),
+                &mut active_drafts,
+            );
 
             let mut actual_fingerprint_acc =
                 FingerprintAccumulator::new(init_transition.fingerprint.bits_packer);
@@ -820,6 +920,7 @@ fn main() {
                 internal_store_frontier: new_internal_store_frontier,
                 internal_store_root: new_internal_store_root,
                 internal_store_index_root: new_internal_store_index_root,
+                active_drafts,
                 actual_fingerprint_acc,
                 next_expected_coordinates,
             });
@@ -883,6 +984,7 @@ fn main() {
             verify_step_record(
                 &input.step_record,
                 input.replay_image_id.as_ref(),
+                input.replay_journal.as_ref(),
                 input.input_witness.as_ref(),
                 input.output_witness.as_ref(),
                 input.input_source_witness.as_ref(),
@@ -905,6 +1007,13 @@ fn main() {
                 &cfs_cursor,
                 &input.step_record,
                 Some(&transition.next_expected_coordinates),
+            );
+            let mut active_drafts = transition.active_drafts.clone();
+            verify_draft_transition(
+                &input.step_record,
+                input.replay_journal.as_ref(),
+                input.draft_transition_witness.as_ref(),
+                &mut active_drafts,
             );
 
             let mut actual_fingerprint_acc = transition.actual_fingerprint_acc.clone();
@@ -935,6 +1044,7 @@ fn main() {
                         internal_store_frontier: new_internal_store_frontier,
                         internal_store_root: new_internal_store_root,
                         internal_store_index_root: new_internal_store_index_root,
+                        active_drafts,
                         actual_fingerprint_acc: FingerprintAccumulator::from(actual_fingerprint),
                         next_expected_coordinates,
                     })
@@ -964,6 +1074,11 @@ mod tests {
         coordinate_index_membership_proof, coordinate_index_non_membership_proof,
         coordinate_index_root,
     };
+    use raster_core::draft::{
+        draft_root_from_witness, DraftFieldValue, DraftOp, DraftReplayTransition, DraftStateWitness,
+        DraftTransitionWitness, TileReplayJournal,
+    };
+    use raster_core::input::{SchemaField, SchemaFieldMode, SchemaNode, Selectable};
     use raster_core::trace::{
         ExternalData, FnInputArg, FnInputValue, InternalData, SequenceEndRecord,
         SequenceStartRecord, TileExecRecord,
@@ -971,6 +1086,55 @@ mod tests {
 
     fn sha(bytes: &[u8]) -> Vec<u8> {
         sha256_bytes(bytes)
+    }
+
+    struct DemoDraft;
+
+    impl Selectable for DemoDraft {
+        fn schema() -> SchemaNode {
+            SchemaNode::Struct {
+                type_name: "DemoDraft".into(),
+                fields: vec![
+                    SchemaField {
+                        name: "title".into(),
+                        label: "Title".into(),
+                        mode: SchemaFieldMode::SetOnce,
+                        schema: Box::new(SchemaNode::Leaf {
+                            type_name: "String".into(),
+                        }),
+                    },
+                    SchemaField {
+                        name: "items".into(),
+                        label: "Items".into(),
+                        mode: SchemaFieldMode::AppendOnlyVec,
+                        schema: Box::new(SchemaNode::List {
+                            type_name: "Vec<String>".into(),
+                            element: Box::new(SchemaNode::Leaf {
+                                type_name: "String".into(),
+                            }),
+                        }),
+                    },
+                ],
+            }
+        }
+    }
+
+    fn draft_tile_step(exec_index: u64) -> StepRecord {
+        StepRecord::TileExec(TileExecRecord {
+            exec_index,
+            tile_id: "collect_lines".into(),
+            sequence_id: "main".into(),
+            intra_sequence_index: exec_index as u32,
+            coordinates: CfsCoordinates(vec![exec_index as u32]),
+            input_commitment: vec![exec_index as u8; 32],
+            input_source_commitment: vec![0; 32],
+            output_commitment: vec![1; 32],
+            external_input_commitment: Vec::new(),
+            internal_store_root_before: EMPTY_LEAF.to_vec(),
+            internal_store_root_after: EMPTY_LEAF.to_vec(),
+            internal_store_index_root_before: Vec::new(),
+            internal_store_index_root_after: Vec::new(),
+        })
     }
 
     fn external_input(
@@ -1578,5 +1742,181 @@ mod tests {
 
         assert_eq!(next_root, root_after);
         assert_eq!(next_index_root, index_root_after);
+    }
+
+    #[test]
+    fn verify_draft_transition_tracks_multi_step_chain() {
+        let empty_witness = DraftStateWitness {
+            schema: DemoDraft::schema(),
+            fields: Vec::new(),
+        };
+        let empty_root = draft_root_from_witness(&empty_witness.schema, &BTreeMap::new(), false).unwrap();
+        let schema_hash = compute_schema_hash(&empty_witness.schema);
+        let draft_id = [7; 32];
+        let mut active_drafts = BTreeMap::new();
+
+        let step_one = TileReplayJournal {
+            output_bytes: Vec::new(),
+            draft_transition: Some(DraftReplayTransition {
+                draft_id,
+                schema_hash,
+                root_before: empty_root,
+                ops: vec![
+                    DraftOp::Set {
+                        field: "title".into(),
+                        value: raster_core::draft::DraftValue::String("collected".into()),
+                    },
+                    DraftOp::Push {
+                        field: "items".into(),
+                        value: raster_core::draft::DraftValue::String("first".into()),
+                    },
+                ],
+            }),
+        };
+        verify_draft_transition(
+            &draft_tile_step(1),
+            Some(&step_one),
+            Some(&DraftTransitionWitness {
+                pre_state: empty_witness.clone(),
+                native_transition: step_one.draft_transition.clone(),
+            }),
+            &mut active_drafts,
+        );
+        let step_one_root = active_drafts.get(&draft_id).unwrap().root;
+
+        let step_two_witness = DraftStateWitness {
+            schema: empty_witness.schema.clone(),
+            fields: vec![
+                (
+                    "title".into(),
+                    DraftFieldValue::Set(raster_core::draft::DraftValue::String("collected".into())),
+                ),
+                (
+                    "items".into(),
+                    DraftFieldValue::Append(vec![raster_core::draft::DraftValue::String("first".into())]),
+                ),
+            ],
+        };
+        let step_two = TileReplayJournal {
+            output_bytes: Vec::new(),
+            draft_transition: Some(DraftReplayTransition {
+                draft_id,
+                schema_hash,
+                root_before: step_one_root,
+                ops: vec![DraftOp::Push {
+                    field: "items".into(),
+                    value: raster_core::draft::DraftValue::String("second".into()),
+                }],
+            }),
+        };
+        verify_draft_transition(
+            &draft_tile_step(2),
+            Some(&step_two),
+            Some(&DraftTransitionWitness {
+                pre_state: step_two_witness,
+                native_transition: step_two.draft_transition.clone(),
+            }),
+            &mut active_drafts,
+        );
+
+        assert_ne!(active_drafts.get(&draft_id).unwrap().root, step_one_root);
+    }
+
+    #[test]
+    #[should_panic(expected = "root_before does not match tracked draft root")]
+    fn verify_draft_transition_rejects_wrong_root_before() {
+        let witness = DraftStateWitness {
+            schema: DemoDraft::schema(),
+            fields: Vec::new(),
+        };
+        let empty_root = draft_root_from_witness(&witness.schema, &BTreeMap::new(), false).unwrap();
+        let schema_hash = compute_schema_hash(&witness.schema);
+        let draft_id = [9; 32];
+        let mut active_drafts = BTreeMap::from([(
+            draft_id,
+            TrackedDraftState {
+                schema_hash,
+                root: [1; 32],
+            },
+        )]);
+
+        verify_draft_transition(
+            &draft_tile_step(1),
+            Some(&TileReplayJournal {
+                output_bytes: Vec::new(),
+                draft_transition: Some(DraftReplayTransition {
+                    draft_id,
+                    schema_hash,
+                    root_before: empty_root,
+                    ops: Vec::new(),
+                }),
+            }),
+            Some(&DraftTransitionWitness {
+                pre_state: witness,
+                native_transition: None,
+            }),
+            &mut active_drafts,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "schema hash")]
+    fn verify_draft_transition_rejects_wrong_schema_hash() {
+        let witness = DraftStateWitness {
+            schema: DemoDraft::schema(),
+            fields: Vec::new(),
+        };
+        let empty_root = draft_root_from_witness(&witness.schema, &BTreeMap::new(), false).unwrap();
+        let mut active_drafts = BTreeMap::new();
+
+        verify_draft_transition(
+            &draft_tile_step(1),
+            Some(&TileReplayJournal {
+                output_bytes: Vec::new(),
+                draft_transition: Some(DraftReplayTransition {
+                    draft_id: [3; 32],
+                    schema_hash: [4; 32],
+                    root_before: empty_root,
+                    ops: Vec::new(),
+                }),
+            }),
+            Some(&DraftTransitionWitness {
+                pre_state: witness,
+                native_transition: None,
+            }),
+            &mut active_drafts,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "witness root")]
+    fn verify_draft_transition_rejects_tampered_pre_state_witness() {
+        let empty_root =
+            draft_root_from_witness(&DemoDraft::schema(), &BTreeMap::new(), false).unwrap();
+        let mut active_drafts = BTreeMap::new();
+
+        verify_draft_transition(
+            &draft_tile_step(1),
+            Some(&TileReplayJournal {
+                output_bytes: Vec::new(),
+                draft_transition: Some(DraftReplayTransition {
+                    draft_id: [6; 32],
+                    schema_hash: compute_schema_hash(&DemoDraft::schema()),
+                    root_before: empty_root,
+                    ops: Vec::new(),
+                }),
+            }),
+            Some(&DraftTransitionWitness {
+                pre_state: DraftStateWitness {
+                    schema: DemoDraft::schema(),
+                    fields: vec![(
+                        "title".into(),
+                        DraftFieldValue::Set(raster_core::draft::DraftValue::String("tampered".into())),
+                    )],
+                },
+                native_transition: None,
+            }),
+            &mut active_drafts,
+        );
     }
 }

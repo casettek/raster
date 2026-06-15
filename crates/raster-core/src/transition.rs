@@ -5,10 +5,12 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::vec::Vec;
 
 use crate::authorization::AuthorizationJournal;
 use crate::cfs::CfsCoordinates;
+use crate::draft::{DraftId, DraftTransitionWitness, TileReplayJournal, TrackedDraftState};
 use crate::fingerprint::{Fingerprint, FingerprintAccumulator};
 use crate::trace::{ExternalInput, FnInput, StepRecord};
 
@@ -103,6 +105,7 @@ pub struct InternalStoreWitness {
 pub struct TransitionInput {
     pub step_record: StepRecord,
     pub replay_image_id: Option<Vec<u8>>,
+    pub replay_journal: Option<TileReplayJournal>,
 
     pub input_witness: Option<Vec<u8>>,
     pub output_witness: Option<Vec<u8>>,
@@ -110,6 +113,7 @@ pub struct TransitionInput {
     pub sequence_scope_witness: Option<FnInput>,
     pub external_input: ExternalInput,
     pub internal_store_witness: Option<InternalStoreWitness>,
+    pub draft_transition_witness: Option<DraftTransitionWitness>,
 
     pub input_sources_witnesses: HashMap<StepRecord, Vec<u8>>,
 
@@ -124,6 +128,7 @@ pub struct Transition {
     pub internal_store_frontier: SerializableFrontier,
     pub internal_store_root: Vec<u8>,
     pub internal_store_index_root: Vec<u8>,
+    pub active_drafts: BTreeMap<DraftId, TrackedDraftState>,
     pub actual_fingerprint_acc: FingerprintAccumulator,
     pub next_expected_coordinates: Vec<CfsCoordinates>,
 }
@@ -135,6 +140,7 @@ pub struct InitTransition {
     pub init_internal_store_frontier: SerializableFrontier,
     pub init_internal_store_root: Vec<u8>,
     pub init_internal_store_index_root: Vec<u8>,
+    pub active_drafts: BTreeMap<DraftId, TrackedDraftState>,
     pub fingerprint: Fingerprint,
 }
 

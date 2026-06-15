@@ -10,6 +10,7 @@
 
 use raster_core::authorization::AuthorizationJournal;
 use raster_core::cfs::ControlFlowSchema;
+use raster_core::draft::DraftTransitionWitness;
 use raster_core::fingerprint::Fingerprint;
 use raster_core::trace::{ExternalInput, FnInput, StepRecord};
 use raster_core::transition::{
@@ -32,6 +33,7 @@ type RecordedStepIo = HashMap<
         Option<FnInput>,
         ExternalInput,
         Option<InternalStoreWitness>,
+        Option<DraftTransitionWitness>,
     ),
 >;
 
@@ -49,6 +51,7 @@ fn build_transition_input(
         sequence_scope_witness,
         external_input,
         internal_store_witness,
+        draft_transition_witness,
     ) = recorded_step_io
         .get(step_record)
         .cloned()
@@ -67,12 +70,14 @@ fn build_transition_input(
                 step_record: step_record.clone(),
                 authorization_image_id: authorization_guest_image_id(),
                 replay_image_id: Some(replay_result.image_id.clone()),
+                replay_journal: Some(replay_result.replay_journal.clone()),
                 input_witness,
                 output_witness,
                 input_source_witness,
                 sequence_scope_witness,
                 external_input,
                 internal_store_witness,
+                draft_transition_witness,
                 authorization_journal: authorization_journal.clone(),
                 input_sources_witnesses: input_sources_witnesses.clone(),
             }
@@ -81,12 +86,14 @@ fn build_transition_input(
             step_record: step_record.clone(),
             authorization_image_id: authorization_guest_image_id(),
             replay_image_id: None,
+            replay_journal: None,
             input_witness,
             output_witness,
             input_source_witness,
             sequence_scope_witness,
             external_input,
             internal_store_witness,
+            draft_transition_witness,
             authorization_journal: authorization_journal.clone(),
             input_sources_witnesses: input_sources_witnesses.clone(),
         },
@@ -155,6 +162,7 @@ pub fn step_transitions(
         init_internal_store_frontier: initial_internal_store_frontier.clone(),
         init_internal_store_root: internal_store_root(initial_internal_store_frontier),
         init_internal_store_index_root: initial_internal_store_index_root.to_vec(),
+        active_drafts: Default::default(),
         fingerprint,
     };
 
@@ -225,6 +233,7 @@ mod tests {
     use raster_core::authorization::{AuthorizationJournal, ManifestedInputs};
     use raster_core::cfs::{CfsCoordinates, ControlFlowSchema, SequenceDef};
     use raster_core::coordinate_index::coordinate_index_root;
+    use raster_core::draft::TileReplayJournal;
     use raster_core::fingerprint::{BitPacker, Fingerprint};
     use raster_core::trace::{
         ExternalData, FnInput, SequenceEndRecord, SequenceStartRecord, TileExecRecord,
@@ -319,6 +328,7 @@ mod tests {
                     None,
                     ExternalInput::new(),
                     None,
+                    None,
                 ),
             ),
             (
@@ -333,6 +343,7 @@ mod tests {
                         b"239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5",
                     ),
                     None,
+                    None,
                 ),
             ),
         ]);
@@ -345,6 +356,10 @@ mod tests {
                     image_id: vec![9; 32],
                     input: vec![1],
                     output: vec![11],
+                    replay_journal: TileReplayJournal {
+                        output_bytes: vec![11],
+                        draft_transition: None,
+                    },
                 },
             ),
             (
@@ -355,6 +370,10 @@ mod tests {
                     image_id: vec![7; 32],
                     input: vec![2],
                     output: vec![22],
+                    replay_journal: TileReplayJournal {
+                        output_bytes: vec![22],
+                        draft_transition: None,
+                    },
                 },
             ),
         ]);
@@ -394,6 +413,7 @@ mod tests {
                 None,
                 ExternalInput::new(),
                 None,
+                None,
             ),
         )]);
         let replayed_results = HashMap::from([(
@@ -404,6 +424,10 @@ mod tests {
                 image_id: vec![5; 32],
                 input: vec![9],
                 output: error_output.clone(),
+                replay_journal: TileReplayJournal {
+                    output_bytes: error_output.clone(),
+                    draft_transition: None,
+                },
             },
         )]);
 
@@ -446,6 +470,7 @@ mod tests {
                     None,
                     ExternalInput::new(),
                     None,
+                    None,
                 ),
             ),
             (
@@ -456,6 +481,7 @@ mod tests {
                     None,
                     None,
                     ExternalInput::new(),
+                    None,
                     None,
                 ),
             ),
@@ -541,12 +567,14 @@ mod tests {
             step_record: make_sequence_start_step(),
             authorization_image_id: authorization_guest_image_id(),
             replay_image_id: None,
+            replay_journal: None,
             input_witness: Some(b"sequence-in".to_vec()),
             output_witness: None,
             input_source_witness: Some(empty_input_source_witness()),
             sequence_scope_witness: None,
             external_input: ExternalInput::new(),
             internal_store_witness: None,
+            draft_transition_witness: None,
             authorization_journal: authorization,
             input_sources_witnesses: HashMap::new(),
         };
@@ -557,6 +585,7 @@ mod tests {
             init_internal_store_index_root: coordinate_index_root(
                 &std::collections::BTreeMap::new(),
             ),
+            active_drafts: Default::default(),
             fingerprint: Fingerprint::from(vec![0], BitPacker::new(64), 1),
         });
 

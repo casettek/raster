@@ -15,10 +15,11 @@ pub use input::{
     select_internal_value, write_raster_files,
 };
 pub use internal_storage::{
-    apply_draft_push, apply_draft_set, create_draft, enter_sequence_scope, exit_sequence_scope,
-    finalize_draft, global_internal_store_snapshot, resolve_internal_ok_value,
-    resolve_internal_value, store_internal_value, InternalStorageManager, InternalStoreSnapshot,
-    InternalWriteRecord, StoredInternalObject,
+    apply_draft_push, apply_draft_set, begin_draft_step_capture, create_draft,
+    enter_sequence_scope, exit_sequence_scope, finalize_draft, finalize_empty_draft,
+    finish_draft_step_capture, global_internal_store_snapshot, resolve_internal_ok_value,
+    resolve_internal_value, store_internal_value, DraftCaptureSnapshot, InternalStorageManager,
+    InternalStoreSnapshot, InternalWriteRecord, StoredInternalObject,
 };
 pub use tracing::{
     commitment::Sha256Commitment,

@@ -14,6 +14,7 @@ extern crate alloc;
 extern crate std;
 
 pub mod error;
+pub mod draft;
 pub mod input;
 pub mod tile;
 

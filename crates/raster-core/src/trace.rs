@@ -8,6 +8,7 @@ use std::string::String;
 use std::vec::Vec;
 
 use crate::cfs::CfsCoordinates;
+use crate::draft::DraftTransitionWitness;
 use crate::fingerprint::Fingerprint;
 use crate::input::{SelectedPayload, SelectorPath};
 
@@ -118,6 +119,7 @@ pub struct FnCallRecord {
     pub fn_name: String,
     pub input: Option<FnInput>,
     pub output: Option<FnOutput>,
+    pub draft_transition_witness: Option<DraftTransitionWitness>,
 }
 
 impl FnCallRecord {

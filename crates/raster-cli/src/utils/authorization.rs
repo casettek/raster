@@ -3,6 +3,7 @@ use std::fs;
 use std::path::Path;
 
 use raster_core::authorization::ManifestedInputs;
+use raster_core::draft::DraftTransitionWitness;
 use raster_core::trace::{ExternalInput, FnInput, StepRecord};
 use raster_core::transition::InternalStoreWitness;
 use raster_core::{Error, Result};
@@ -30,6 +31,7 @@ pub fn collect_external_input_commitments(
             Option<FnInput>,
             ExternalInput,
             Option<InternalStoreWitness>,
+            Option<DraftTransitionWitness>,
         ),
     >,
 ) -> BTreeMap<String, Vec<u8>> {
@@ -43,6 +45,7 @@ pub fn collect_external_input_commitments(
             _sequence_scope_witness,
             external_input,
             _internal_store,
+            _draft_transition,
         ),
     ) in recorded_step_io
     {

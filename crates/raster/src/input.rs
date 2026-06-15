@@ -2,8 +2,14 @@ use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::marker::PhantomData;
+use core::{hash::Hash, hash::Hasher};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
+#[cfg(not(feature = "std"))]
+use alloc::format;
+use raster_core::draft::{replay_handle_for_schema, DraftReplayHandle, DraftReplayTransition};
+#[cfg(not(feature = "std"))]
+use raster_core::draft::{draft_value_from_serialize, DraftOp};
 pub use raster_core::input::{
     verify_selection_proof, AuthValue, ExternalEncoding, ExternalRef, ExternalSelection,
     ExternalValue, InternalRef, InternalValue, ListProofDirection, ListProofSibling, Op, Schema,
@@ -35,11 +41,38 @@ pub struct TypedSelectorPath<Root, Selected> {
 
 pub type Anchor = [u8; 32];
 
-#[derive(Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// Live draft handle backed by thread-local runtime state.
+///
+/// Serialized forms are trace-only markers and cannot be deserialized back into
+/// a reusable draft handle.
 pub struct Draft<S: Schema> {
     anchor: Anchor,
     current_root: [u8; 32],
+    #[cfg(not(feature = "std"))]
+    replay_state: ReplayDraftState,
     _schema: PhantomData<fn() -> S>,
+}
+
+#[cfg(not(feature = "std"))]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum ReplayDraftFieldValue {
+    Set,
+    Append,
+}
+
+#[cfg(not(feature = "std"))]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ReplayDraftState {
+    schema_hash: [u8; 32],
+    ops: Vec<DraftOp>,
+    fields: Vec<(String, ReplayDraftFieldValue)>,
+}
+
+#[derive(Debug, Serialize)]
+struct DraftTraceMarker {
+    kind: &'static str,
+    schema: &'static str,
+    reusable: bool,
 }
 
 #[derive(Debug)]
@@ -140,6 +173,75 @@ impl<T> RecurState<T> {
     }
 }
 
+fn draft_trace_marker<S: Schema>() -> DraftTraceMarker {
+    DraftTraceMarker {
+        kind: "raster::Draft",
+        schema: core::any::type_name::<S>(),
+        reusable: false,
+    }
+}
+
+impl<S> Serialize for Draft<S>
+where
+    S: Schema,
+{
+    fn serialize<Ser>(&self, serializer: Ser) -> Result<Ser::Ok, Ser::Error>
+    where
+        Ser: serde::Serializer,
+    {
+        let _ = self;
+        draft_trace_marker::<S>().serialize(serializer)
+    }
+}
+
+impl<S> core::fmt::Debug for Draft<S>
+where
+    S: Schema,
+{
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Draft")
+            .field("anchor", &self.anchor)
+            .field("current_root", &self.current_root)
+            .finish()
+    }
+}
+
+impl<S> PartialEq for Draft<S>
+where
+    S: Schema,
+{
+    fn eq(&self, other: &Self) -> bool {
+        self.anchor == other.anchor && self.current_root == other.current_root
+    }
+}
+
+impl<S> Eq for Draft<S> where S: Schema {}
+
+impl<S> Hash for Draft<S>
+where
+    S: Schema,
+{
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.anchor.hash(state);
+        self.current_root.hash(state);
+    }
+}
+
+impl<'de, S> Deserialize<'de> for Draft<S>
+where
+    S: Schema,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let _ = serde::de::IgnoredAny::deserialize(deserializer)?;
+        Err(serde::de::Error::custom(
+            "Serialized Draft values are trace-only and cannot be deserialized into a live draft",
+        ))
+    }
+}
+
 impl<T> From<T> for RecurState<T> {
     fn from(value: T) -> Self {
         Self::new(value)
@@ -224,6 +326,12 @@ impl<S: Schema> Draft<S> {
         Self {
             anchor,
             current_root,
+            #[cfg(not(feature = "std"))]
+            replay_state: ReplayDraftState {
+                schema_hash: S::schema_hash(),
+                ops: Vec::new(),
+                fields: Vec::new(),
+            },
             _schema: PhantomData,
         }
     }
@@ -239,6 +347,16 @@ impl<S: Schema> Draft<S> {
     #[doc(hidden)]
     pub fn set_current_root(&mut self, current_root: [u8; 32]) {
         self.current_root = current_root;
+    }
+
+    #[cfg(not(feature = "std"))]
+    fn replay_state(&self) -> &ReplayDraftState {
+        &self.replay_state
+    }
+
+    #[cfg(not(feature = "std"))]
+    fn replay_state_mut(&mut self) -> &mut ReplayDraftState {
+        &mut self.replay_state
     }
 
     #[doc(hidden)]
@@ -258,6 +376,178 @@ impl<S: Schema> Draft<S> {
             marker: PhantomData,
         }
     }
+}
+
+#[cfg(not(feature = "std"))]
+fn schema_struct_fields(schema: &SchemaNode) -> raster_core::Result<&[SchemaField]> {
+    match schema {
+        SchemaNode::Struct { fields, .. } => Ok(fields.as_slice()),
+        _ => Err(raster_core::Error::Other(
+            "Drafts currently support only struct schemas at the root".into(),
+        )),
+    }
+}
+
+#[cfg(not(feature = "std"))]
+fn locate_schema_field<S: Schema>(field: &str) -> raster_core::Result<SchemaField> {
+    let schema = S::schema();
+    schema_struct_fields(&schema)?
+        .iter()
+        .find(|schema_field| schema_field.name == field)
+        .cloned()
+        .ok_or_else(|| raster_core::Error::Other(format!("Unknown draft field '{}'", field)))
+}
+
+#[cfg(not(feature = "std"))]
+fn record_replay_set<S: Schema, Value: Serialize>(
+    draft: &mut Draft<S>,
+    field: &'static str,
+    value: &Value,
+) -> raster_core::Result<()> {
+    let schema_field = locate_schema_field::<S>(field)?;
+    if schema_field.mode != SchemaFieldMode::SetOnce {
+        return Err(raster_core::Error::Other(format!(
+            "Draft field '{}' does not support set; use push",
+            field
+        )));
+    }
+    let replay_state = draft.replay_state_mut();
+    if replay_state.fields.iter().any(|(name, _)| name == field) {
+        return Err(raster_core::Error::Other(format!(
+            "Draft field '{}' can only be written once",
+            field
+        )));
+    }
+    replay_state.fields.push((field.into(), ReplayDraftFieldValue::Set));
+    replay_state.ops.push(DraftOp::Set {
+        field: field.into(),
+        value: draft_value_from_serialize(value)?,
+    });
+    Ok(())
+}
+
+#[cfg(not(feature = "std"))]
+fn record_replay_push<S: Schema, Value: Serialize>(
+    draft: &mut Draft<S>,
+    field: &'static str,
+    value: &Value,
+) -> raster_core::Result<()> {
+    let schema_field = locate_schema_field::<S>(field)?;
+    if schema_field.mode != SchemaFieldMode::AppendOnlyVec {
+        return Err(raster_core::Error::Other(format!(
+            "Draft field '{}' does not support push; use set",
+            field
+        )));
+    }
+    let replay_state = draft.replay_state_mut();
+    match replay_state.fields.iter_mut().find(|(name, _)| name == field) {
+        Some((_, ReplayDraftFieldValue::Set)) => {
+            return Err(raster_core::Error::Other(format!(
+                "Draft field '{}' is not appendable",
+                field
+            )))
+        }
+        Some((_, ReplayDraftFieldValue::Append)) => {}
+        None => replay_state
+            .fields
+            .push((field.into(), ReplayDraftFieldValue::Append)),
+    }
+    replay_state.ops.push(DraftOp::Push {
+        field: field.into(),
+        value: draft_value_from_serialize(value)?,
+    });
+    Ok(())
+}
+
+pub fn draft_replay_handle<S>(draft: &Draft<S>) -> DraftReplayHandle
+where
+    S: Schema,
+{
+    replay_handle_for_schema::<S>(*draft.anchor(), *draft.current_root())
+}
+
+pub fn serialize_draft_replay_handle<S>(draft: &Draft<S>) -> Vec<u8>
+where
+    S: Schema,
+{
+    raster_core::postcard::to_allocvec(&draft_replay_handle(draft)).unwrap_or_default()
+}
+
+pub fn restore_draft_from_replay_handle<S>(handle: DraftReplayHandle) -> Draft<S>
+where
+    S: Schema,
+{
+    let draft = Draft::new(handle.draft_id, handle.root_before);
+    #[cfg(not(feature = "std"))]
+    {
+        let mut draft = draft;
+        draft.replay_state.schema_hash = handle.schema_hash;
+        return draft;
+    }
+    #[cfg(feature = "std")]
+    {
+        draft
+    }
+}
+
+pub fn draft_replay_transition<S>(draft: &Draft<S>) -> Option<DraftReplayTransition>
+where
+    S: Schema,
+{
+    #[cfg(not(feature = "std"))]
+    {
+        return Some(DraftReplayTransition {
+            draft_id: *draft.anchor(),
+            schema_hash: draft.replay_state().schema_hash,
+            root_before: *draft.current_root(),
+            ops: draft.replay_state().ops.clone(),
+        });
+    }
+
+    #[cfg(feature = "std")]
+    {
+        let _ = draft;
+        None
+    }
+}
+
+#[cfg(feature = "std")]
+#[doc(hidden)]
+pub fn begin_draft_transition_capture<S>(draft: &Draft<S>) -> Option<raster_runtime::DraftCaptureSnapshot>
+where
+    S: Schema,
+{
+    Some(
+        raster_runtime::begin_draft_step_capture::<S>(draft.anchor(), draft.current_root())
+            .unwrap_or_else(|error| {
+                panic!(
+                    "Failed to start draft transition capture '{}': {}",
+                    core::any::type_name::<S>(),
+                    error
+                )
+            }),
+    )
+}
+
+#[cfg(feature = "std")]
+#[doc(hidden)]
+pub fn finish_draft_transition_capture<S>(
+    snapshot: raster_runtime::DraftCaptureSnapshot,
+    draft: &Draft<S>,
+) -> Option<raster_core::draft::DraftTransitionWitness>
+where
+    S: Schema,
+{
+    Some(
+        raster_runtime::finish_draft_step_capture::<S>(snapshot, draft.current_root())
+            .unwrap_or_else(|error| {
+                panic!(
+                    "Failed to finish draft transition capture '{}': {}",
+                    core::any::type_name::<S>(),
+                    error
+                )
+            }),
+    )
 }
 
 impl<'a, S, Value> DraftSetField<'a, S, Value>
@@ -283,8 +573,9 @@ where
 
         #[cfg(not(feature = "std"))]
         {
-            let _ = value;
-            panic!("Draft field writes require the `std` feature")
+            record_replay_set::<S, Value>(self.draft, self.field, &value).unwrap_or_else(|error| {
+                panic!("Failed to set draft field '{}': {}", self.field, error)
+            });
         }
     }
 }
@@ -312,8 +603,9 @@ where
 
         #[cfg(not(feature = "std"))]
         {
-            let _ = value;
-            panic!("Draft field writes require the `std` feature")
+            record_replay_push::<S, Value>(self.draft, self.field, &value).unwrap_or_else(
+                |error| panic!("Failed to push draft field '{}': {}", self.field, error),
+            );
         }
     }
 }
@@ -743,6 +1035,15 @@ pub fn selector_path(segments: Vec<SelectorSegment>) -> SelectorPath {
 }
 
 #[doc(hidden)]
+pub fn serialize_draft_trace<S>(draft: &Draft<S>) -> Vec<u8>
+where
+    S: Schema,
+{
+    let _ = draft;
+    raster_core::postcard::to_allocvec(&draft_trace_marker::<S>()).unwrap_or_default()
+}
+
+#[doc(hidden)]
 pub fn recur_list_len<T>(source: &AuthRef<Vec<T>>) -> raster_core::Result<u64>
 where
     T: DeserializeOwned + Serialize,
@@ -826,6 +1127,28 @@ where
 {
     let value = into_auth_value::<T, _>(item)?.into_inner();
     Ok(RecurInput::new(value, index, len))
+}
+
+fn resolve_recur_list<T>(source: &AuthRef<Vec<T>>) -> raster_core::Result<Vec<T>>
+where
+    T: DeserializeOwned + Serialize,
+{
+    match source {
+        AuthRef::Inline(_) => Err(raster_core::Error::Other(
+            "call_recur! requires a selectable external or internal list source".into(),
+        )),
+        AuthRef::External(binding) => {
+            let current = (binding.resolve.as_ref())(ExternalSelection::with_selector(
+                binding.name.clone(),
+                binding.selector.clone(),
+            ))?;
+            Ok(current.value)
+        }
+        AuthRef::Internal(binding) => {
+            let current = (binding.resolve.as_ref())(binding.reference.clone())?;
+            Ok(current.value)
+        }
+    }
 }
 
 impl<T> IntoAuthRef<T> for T
@@ -1165,6 +1488,35 @@ where
     }
 }
 
+fn finalize_recur_output<S>(draft: Draft<S>, allow_partial: bool) -> AuthRef<S>
+where
+    S: Schema + DeserializeOwned + Serialize + 'static,
+{
+    #[cfg(feature = "std")]
+    {
+        let reference = if allow_partial {
+            raster_runtime::finalize_empty_draft::<S>(draft.anchor(), draft.current_root())
+        } else {
+            raster_runtime::finalize_draft::<S>(draft.anchor(), draft.current_root())
+        }
+        .unwrap_or_else(|error| {
+            panic!(
+                "Failed to finalize draft '{}': {}",
+                core::any::type_name::<S>(),
+                error
+            )
+        });
+        return into_auth_ref::<S, _>(typed_internal::<S>(reference));
+    }
+
+    #[cfg(not(feature = "std"))]
+    {
+        let _ = draft;
+        let _ = allow_partial;
+        panic!("Draft finalization requires the `std` feature")
+    }
+}
+
 #[doc(hidden)]
 pub fn run_recur_list<T, S, Step, Output>(
     source: AuthRef<Vec<T>>,
@@ -1179,23 +1531,16 @@ where
 {
     #[cfg(feature = "std")]
     {
-        let len = recur_list_len(&source)
+        let items = resolve_recur_list(&source)
             .unwrap_or_else(|error| panic!("Failed to resolve recursive list source: {}", error));
+        let len = items.len() as u64;
+        if len == 0 {
+            return finalize_recur_output(output, true);
+        }
         let mut output = output;
 
-        for index in 0..len {
-            let item = select_recur_list_item(&source, index).unwrap_or_else(|error| {
-                panic!(
-                    "Failed to select recursive list item at index {}: {}",
-                    index, error
-                )
-            });
-            let input = build_recur_input(item, index, len).unwrap_or_else(|error| {
-                panic!(
-                    "Failed to materialize recursive list item at index {}: {}",
-                    index, error
-                )
-            });
+        for (index, value) in items.into_iter().enumerate() {
+            let input = RecurInput::new(value, index as u64, len);
 
             match step(input, output).into_recur_control() {
                 RecurControl::Continue(next) => {
@@ -1208,7 +1553,7 @@ where
             }
         }
 
-        return finalize(output);
+        return finalize_recur_output(output, false);
     }
 
     #[cfg(not(feature = "std"))]
@@ -1234,23 +1579,13 @@ where
 {
     #[cfg(feature = "std")]
     {
-        let len = recur_list_len(&source)
+        let items = resolve_recur_list(&source)
             .unwrap_or_else(|error| panic!("Failed to resolve recursive list source: {}", error));
+        let len = items.len() as u64;
         let mut state = state;
 
-        for index in 0..len {
-            let item = select_recur_list_item(&source, index).unwrap_or_else(|error| {
-                panic!(
-                    "Failed to select recursive list item at index {}: {}",
-                    index, error
-                )
-            });
-            let input = build_recur_input(item, index, len).unwrap_or_else(|error| {
-                panic!(
-                    "Failed to materialize recursive list item at index {}: {}",
-                    index, error
-                )
-            });
+        for (index, value) in items.into_iter().enumerate() {
+            let input = RecurInput::new(value, index as u64, len);
 
             match step(input, state).into_recur_control() {
                 RecurControl::Continue(next_state) => {
@@ -1291,24 +1626,18 @@ where
 {
     #[cfg(feature = "std")]
     {
-        let len = recur_list_len(&source)
+        let items = resolve_recur_list(&source)
             .unwrap_or_else(|error| panic!("Failed to resolve recursive list source: {}", error));
+        let len = items.len() as u64;
+        if len == 0 {
+            let _ = state;
+            return finalize_recur_output(output, true);
+        }
         let mut state = state;
         let mut output = output;
 
-        for index in 0..len {
-            let item = select_recur_list_item(&source, index).unwrap_or_else(|error| {
-                panic!(
-                    "Failed to select recursive list item at index {}: {}",
-                    index, error
-                )
-            });
-            let input = build_recur_input(item, index, len).unwrap_or_else(|error| {
-                panic!(
-                    "Failed to materialize recursive list item at index {}: {}",
-                    index, error
-                )
-            });
+        for (index, value) in items.into_iter().enumerate() {
+            let input = RecurInput::new(value, index as u64, len);
 
             match step(input, state, output).into_recur_control() {
                 RecurControl::Continue((next_state, next_output)) => {
@@ -1324,7 +1653,7 @@ where
         }
 
         let _ = state;
-        return finalize(output);
+        return finalize_recur_output(output, false);
     }
 
     #[cfg(not(feature = "std"))]

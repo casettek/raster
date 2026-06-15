@@ -1,6 +1,11 @@
 use raster_core::cfs::CfsCoordinates;
 use raster_core::coordinate_index::coordinate_index_root;
-use raster_core::input::{InternalRef, InternalValue, Op, Schema, SchemaFieldMode, SchemaNode};
+use raster_core::draft::{
+    draft_root_from_witness, draft_tree_from_witness, draft_value_from_serialize,
+    schema_hash as compute_schema_hash, DraftFieldValue, DraftOp, DraftReplayTransition,
+    DraftStateWitness, DraftTransitionWitness,
+};
+use raster_core::input::{InternalRef, InternalValue, Schema, SchemaFieldMode, SchemaNode};
 use raster_core::transition::{InternalStoreEntry, InternalStoreIndexValue, SerializableFrontier};
 use raster_core::{Error, Result};
 use raster_prover::precomputed::EMPTY_TRIE_NODES;
@@ -14,25 +19,26 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::vec::Vec;
 
-use crate::input::{
-    subtree_payload_and_root, tree_value_from_serialize, typed_value_from_tree, TreeValue,
-};
+use crate::input::{typed_value_from_tree, TreeValue};
 use crate::Sha256Commitment;
 
 type Anchor = [u8; 32];
-
-#[derive(Debug, Clone)]
-enum DraftFieldValue {
-    Set(TreeValue),
-    Append(Vec<TreeValue>),
-}
 
 #[derive(Debug, Clone)]
 struct DraftRuntimeState {
     schema: SchemaNode,
     current_root: [u8; 32],
     fields: BTreeMap<String, DraftFieldValue>,
-    ops: Vec<Op>,
+    ops: Vec<DraftOp>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DraftCaptureSnapshot {
+    anchor: Anchor,
+    schema_hash: [u8; 32],
+    root_before: [u8; 32],
+    pre_state: DraftStateWitness,
+    op_count_before: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -91,43 +97,59 @@ fn schema_struct_fields(schema: &SchemaNode) -> Result<&[raster_core::input::Sch
     }
 }
 
+fn runtime_tree_value(value: &raster_core::draft::DraftValue) -> TreeValue {
+    match value {
+        raster_core::draft::DraftValue::Unit => TreeValue::Unit,
+        raster_core::draft::DraftValue::Bool(value) => TreeValue::Bool(*value),
+        raster_core::draft::DraftValue::U8(value) => TreeValue::U8(*value),
+        raster_core::draft::DraftValue::U16(value) => TreeValue::U16(*value),
+        raster_core::draft::DraftValue::U32(value) => TreeValue::U32(*value),
+        raster_core::draft::DraftValue::U64(value) => TreeValue::U64(*value),
+        raster_core::draft::DraftValue::I8(value) => TreeValue::I8(*value),
+        raster_core::draft::DraftValue::I16(value) => TreeValue::I16(*value),
+        raster_core::draft::DraftValue::I32(value) => TreeValue::I32(*value),
+        raster_core::draft::DraftValue::I64(value) => TreeValue::I64(*value),
+        raster_core::draft::DraftValue::String(value) => TreeValue::String(value.clone()),
+        raster_core::draft::DraftValue::Struct(fields) => TreeValue::Struct(
+            fields
+                .iter()
+                .map(|(name, child)| (name.clone(), runtime_tree_value(child)))
+                .collect(),
+        ),
+        raster_core::draft::DraftValue::List(values) => {
+            TreeValue::List(values.iter().map(runtime_tree_value).collect())
+        }
+        raster_core::draft::DraftValue::Map(entries) => TreeValue::Map(
+            entries
+                .iter()
+                .map(|(key, value)| (runtime_tree_value(key), runtime_tree_value(value)))
+                .collect(),
+        ),
+        raster_core::draft::DraftValue::EnumUnit(variant) => TreeValue::EnumUnit(variant.clone()),
+        raster_core::draft::DraftValue::EnumNewtype(variant, value) => {
+            TreeValue::EnumNewtype(variant.clone(), Box::new(runtime_tree_value(value)))
+        }
+        raster_core::draft::DraftValue::EnumTuple(variant, values) => TreeValue::EnumTuple(
+            variant.clone(),
+            values.iter().map(runtime_tree_value).collect(),
+        ),
+        raster_core::draft::DraftValue::EnumStruct(variant, fields) => TreeValue::EnumStruct(
+            variant.clone(),
+            fields
+                .iter()
+                .map(|(name, child)| (name.clone(), runtime_tree_value(child)))
+                .collect(),
+        ),
+    }
+}
+
 fn build_draft_tree(
     schema: &SchemaNode,
     fields: &BTreeMap<String, DraftFieldValue>,
     require_complete: bool,
 ) -> Result<TreeValue> {
-    let schema_fields = schema_struct_fields(schema)?;
-    let mut values = Vec::with_capacity(schema_fields.len());
-    for field in schema_fields {
-        let value = match (field.mode, fields.get(&field.name)) {
-            (SchemaFieldMode::SetOnce, Some(DraftFieldValue::Set(value))) => value.clone(),
-            (SchemaFieldMode::SetOnce, Some(DraftFieldValue::Append(_))) => {
-                return Err(Error::Other(format!(
-                    "Draft field '{}' expected a set-once value, found append log",
-                    field.name
-                )))
-            }
-            (SchemaFieldMode::SetOnce, None) if require_complete => {
-                return Err(Error::Other(format!(
-                    "Draft field '{}' must be written before finalize",
-                    field.name
-                )))
-            }
-            (SchemaFieldMode::SetOnce, None) => TreeValue::Unit,
-            (SchemaFieldMode::AppendOnlyVec, Some(DraftFieldValue::Append(values))) => {
-                TreeValue::List(values.clone())
-            }
-            (SchemaFieldMode::AppendOnlyVec, Some(DraftFieldValue::Set(_))) => {
-                return Err(Error::Other(format!(
-                    "Draft field '{}' expected an append-only vector, found scalar value",
-                    field.name
-                )))
-            }
-            (SchemaFieldMode::AppendOnlyVec, None) => TreeValue::List(Vec::new()),
-        };
-        values.push((field.name.clone(), value));
-    }
-    Ok(TreeValue::Struct(values))
+    let tree = draft_tree_from_witness(schema, fields, require_complete)?;
+    Ok(runtime_tree_value(&tree))
 }
 
 fn draft_root(
@@ -135,11 +157,7 @@ fn draft_root(
     fields: &BTreeMap<String, DraftFieldValue>,
     require_complete: bool,
 ) -> Result<[u8; 32]> {
-    let tree = build_draft_tree(schema, fields, require_complete)?;
-    let (_, root) = subtree_payload_and_root(&tree)?;
-    root.as_slice()
-        .try_into()
-        .map_err(|_| Error::Other("Draft root must be 32 bytes".into()))
+    draft_root_from_witness(schema, fields, require_complete)
 }
 
 fn locate_schema_field<'a>(
@@ -150,6 +168,49 @@ fn locate_schema_field<'a>(
         .iter()
         .find(|field| field.name == name)
         .ok_or_else(|| Error::Other(format!("Unknown draft field '{}'", name)))
+}
+
+fn first_unset_set_once_field<'a>(
+    schema: &'a SchemaNode,
+    fields: &BTreeMap<String, DraftFieldValue>,
+) -> Result<Option<&'a str>> {
+    for field in schema_struct_fields(schema)? {
+        if field.mode == SchemaFieldMode::SetOnce && !fields.contains_key(&field.name) {
+            return Ok(Some(field.name.as_str()));
+        }
+    }
+    Ok(None)
+}
+
+fn take_draft_state(
+    anchor: &Anchor,
+    expected_root: &[u8; 32],
+    operation: &str,
+) -> Result<DraftRuntimeState> {
+    THREAD_DRAFT_STORAGE.with(|drafts| {
+        let mut drafts = drafts.borrow_mut();
+        let state = drafts
+            .remove(anchor)
+            .ok_or_else(|| Error::Other("Unknown draft anchor".into()))?;
+        if state.current_root != *expected_root {
+            return Err(Error::Other(format!(
+                "Draft root mismatch during {}: expected {:?}, found {:?}",
+                operation, expected_root, state.current_root
+            )));
+        }
+        Ok(state)
+    })
+}
+
+fn draft_state_witness(state: &DraftRuntimeState) -> DraftStateWitness {
+    DraftStateWitness {
+        schema: state.schema.clone(),
+        fields: state
+            .fields
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect(),
+    }
 }
 
 impl InternalStorageManager {
@@ -383,6 +444,66 @@ where
     Ok((anchor, current_root))
 }
 
+pub fn begin_draft_step_capture<S>(
+    anchor: &Anchor,
+    expected_root: &[u8; 32],
+) -> Result<DraftCaptureSnapshot>
+where
+    S: Schema,
+{
+    THREAD_DRAFT_STORAGE.with(|drafts| {
+        let drafts = drafts.borrow();
+        let state = drafts
+            .get(anchor)
+            .ok_or_else(|| Error::Other("Unknown draft anchor".into()))?;
+        if state.current_root != *expected_root {
+            return Err(Error::Other(format!(
+                "Draft root mismatch during step capture start: expected {:?}, found {:?}",
+                expected_root, state.current_root
+            )));
+        }
+        Ok(DraftCaptureSnapshot {
+            anchor: *anchor,
+            schema_hash: compute_schema_hash(&state.schema),
+            root_before: *expected_root,
+            pre_state: draft_state_witness(state),
+            op_count_before: state.ops.len(),
+        })
+    })
+}
+
+pub fn finish_draft_step_capture<S>(
+    snapshot: DraftCaptureSnapshot,
+    expected_root: &[u8; 32],
+) -> Result<DraftTransitionWitness>
+where
+    S: Schema,
+{
+    let native_transition = THREAD_DRAFT_STORAGE.with(|drafts| {
+        let drafts = drafts.borrow();
+        let state = drafts
+            .get(&snapshot.anchor)
+            .ok_or_else(|| Error::Other("Unknown draft anchor".into()))?;
+        if state.current_root != *expected_root {
+            return Err(Error::Other(format!(
+                "Draft root mismatch during step capture finish: expected {:?}, found {:?}",
+                expected_root, state.current_root
+            )));
+        }
+        Ok(DraftReplayTransition {
+            draft_id: snapshot.anchor,
+            schema_hash: snapshot.schema_hash,
+            root_before: snapshot.root_before,
+            ops: state.ops[snapshot.op_count_before..].to_vec(),
+        })
+    })?;
+
+    Ok(DraftTransitionWitness {
+        pre_state: snapshot.pre_state,
+        native_transition: Some(native_transition),
+    })
+}
+
 pub fn apply_draft_set<S, T>(
     anchor: &Anchor,
     expected_root: &[u8; 32],
@@ -393,13 +514,7 @@ where
     S: Schema,
     T: Serialize,
 {
-    let tree = tree_value_from_serialize(value)?;
-    let value_bytes = raster_core::postcard::to_allocvec(value).map_err(|error| {
-        Error::Serialization(format!(
-            "Failed to encode draft set op for field '{}': {}",
-            field, error
-        ))
-    })?;
+    let tree = draft_value_from_serialize(value)?;
     THREAD_DRAFT_STORAGE.with(|drafts| {
         let mut drafts = drafts.borrow_mut();
         let state = drafts
@@ -427,9 +542,9 @@ where
         state
             .fields
             .insert(field.to_string(), DraftFieldValue::Set(tree));
-        state.ops.push(Op::Set {
+        state.ops.push(DraftOp::Set {
             field: field.to_string(),
-            value_bytes,
+            value: draft_value_from_serialize(value)?,
         });
         state.current_root = draft_root(&state.schema, &state.fields, false)?;
         Ok(state.current_root)
@@ -446,13 +561,7 @@ where
     S: Schema,
     T: Serialize,
 {
-    let tree = tree_value_from_serialize(value)?;
-    let value_bytes = raster_core::postcard::to_allocvec(value).map_err(|error| {
-        Error::Serialization(format!(
-            "Failed to encode draft push op for field '{}': {}",
-            field, error
-        ))
-    })?;
+    let tree = draft_value_from_serialize(value)?;
     THREAD_DRAFT_STORAGE.with(|drafts| {
         let mut drafts = drafts.borrow_mut();
         let state = drafts
@@ -485,9 +594,9 @@ where
                 }
             },
         }
-        state.ops.push(Op::Push {
+        state.ops.push(DraftOp::Push {
             field: field.to_string(),
-            value_bytes,
+            value: draft_value_from_serialize(value)?,
         });
         state.current_root = draft_root(&state.schema, &state.fields, false)?;
         Ok(state.current_root)
@@ -515,30 +624,40 @@ pub fn finalize_draft<S>(anchor: &Anchor, expected_root: &[u8; 32]) -> Result<In
 where
     S: Schema + DeserializeOwned + Serialize,
 {
-    let value = THREAD_DRAFT_STORAGE.with(|drafts| {
-        let drafts = drafts.borrow();
-        let state = drafts
-            .get(anchor)
-            .ok_or_else(|| Error::Other("Unknown draft anchor".into()))?;
-        if state.current_root != *expected_root {
-            return Err(Error::Other(format!(
-                "Draft root mismatch during finalize: expected {:?}, found {:?}",
-                expected_root, state.current_root
-            )));
-        }
-        let tree = build_draft_tree(&state.schema, &state.fields, true)?;
-        typed_value_from_tree::<S>(&tree).map_err(|error| {
-            Error::Serialization(format!(
-                "Failed to materialize finalized draft value: {}",
-                error
-            ))
-        })
+    let state = take_draft_state(anchor, expected_root, "finalize")?;
+    let tree = build_draft_tree(&state.schema, &state.fields, true)?;
+    let value = typed_value_from_tree::<S>(&tree).map_err(|error| {
+        Error::Serialization(format!(
+            "Failed to materialize finalized draft value: {}",
+            error
+        ))
     })?;
 
     let reference = store_internal_value(&value)?;
-    THREAD_DRAFT_STORAGE.with(|drafts| {
-        drafts.borrow_mut().remove(anchor);
-    });
+    Ok(reference)
+}
+
+pub fn finalize_empty_draft<S>(anchor: &Anchor, expected_root: &[u8; 32]) -> Result<InternalRef>
+where
+    S: Schema + DeserializeOwned + Serialize,
+{
+    let state = take_draft_state(anchor, expected_root, "empty finalize")?;
+    let tree = build_draft_tree(&state.schema, &state.fields, false)?;
+    let value = typed_value_from_tree::<S>(&tree).map_err(|error| {
+        if let Ok(Some(field)) = first_unset_set_once_field(&state.schema, &state.fields) {
+            return Error::Other(format!(
+                "Empty recur input cannot finalize draft '{}': field '{}' was never written and the schema cannot materialize a default value",
+                core::any::type_name::<S>(),
+                field
+            ));
+        }
+        Error::Serialization(format!(
+            "Failed to materialize finalized empty draft value: {}",
+            error
+        ))
+    })?;
+
+    let reference = store_internal_value(&value)?;
     Ok(reference)
 }
 
@@ -570,6 +689,43 @@ pub fn resolve_internal_ok_value<T: DeserializeOwned>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use raster_core::input::{SchemaField, SchemaNode, Selectable};
+    use serde::{Deserialize, Serialize};
+
+    struct SequenceScopeGuard;
+
+    impl SequenceScopeGuard {
+        fn enter(sequence_id: &str) -> Self {
+            enter_sequence_scope(sequence_id);
+            Self
+        }
+    }
+
+    impl Drop for SequenceScopeGuard {
+        fn drop(&mut self) {
+            exit_sequence_scope();
+        }
+    }
+
+    #[derive(Debug, Deserialize, Serialize)]
+    struct RequiredFieldDraft {
+        value: u64,
+    }
+
+    impl Selectable for RequiredFieldDraft {
+        fn schema() -> SchemaNode {
+            SchemaNode::Struct {
+                type_name: "RequiredFieldDraft".into(),
+                fields: vec![SchemaField::new(
+                    "value",
+                    "value",
+                    SchemaNode::Leaf {
+                        type_name: "u64".into(),
+                    },
+                )],
+            }
+        }
+    }
 
     #[test]
     #[should_panic(expected = "Duplicate internal store write at coordinates")]
@@ -579,5 +735,21 @@ mod tests {
 
         manager.append_serialized_bytes(b"first", coordinates.clone());
         manager.append_serialized_bytes(b"second", coordinates);
+    }
+
+    #[test]
+    fn failed_finalize_removes_draft_anchor() {
+        let _guard = SequenceScopeGuard::enter("failed_finalize_removes_draft_anchor");
+        let (anchor, current_root) =
+            create_draft::<RequiredFieldDraft>().expect("draft should be created");
+
+        assert!(THREAD_DRAFT_STORAGE.with(|drafts| drafts.borrow().contains_key(&anchor)));
+
+        let error = finalize_draft::<RequiredFieldDraft>(&anchor, &current_root)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("must be written before finalize"));
+        assert!(THREAD_DRAFT_STORAGE.with(|drafts| !drafts.borrow().contains_key(&anchor)));
     }
 }

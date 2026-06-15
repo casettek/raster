@@ -13,24 +13,30 @@ pub extern crate alloc;
 extern crate std;
 
 pub use raster_core as core;
+pub use raster_core::draft;
 
 pub mod input;
 pub use input::{
-    auth_ref_result_trace, auth_ref_trace, finalize, into_auth_ref, into_auth_value,
-    materialize_auth_result, materialize_auth_return, new_draft, resolve_external_value,
-    resolve_internal_ok_value, resolve_internal_value, resolve_typed_external_value,
-    run_recur_list, run_recur_list_state, run_recur_list_with_state, select_source, selector_path,
-    typed_external, typed_internal, typed_internal_with_resolver, typed_selector_path, Anchor,
-    AuthRef, AuthRefTrace, AuthValue, Draft, DraftAppendField, DraftSetField, ExternalRef,
-    ExternalSelection, ExternalValue, InternalRef, InternalValue, IntoAuthRef, IntoAuthValue,
-    IntoRecurControl, ListProofDirection, ListProofSibling, Op, RecurControl, RecurInput,
-    RecurOutput, RecurState, Schema, SchemaField, SchemaFieldMode, SchemaNode, SelectSource,
-    Selectable, SelectedPayload, SelectionProof, SelectionProofStep, SelectorPath, SelectorSegment,
-    TypedExternalBinding, TypedInternalBinding, TypedSelectorPath,
+    auth_ref_result_trace, auth_ref_trace, draft_replay_handle, draft_replay_transition, finalize,
+    into_auth_ref, into_auth_value, materialize_auth_result, materialize_auth_return, new_draft,
+    resolve_external_value, resolve_internal_ok_value, resolve_internal_value,
+    resolve_typed_external_value, restore_draft_from_replay_handle, run_recur_list,
+    run_recur_list_state, run_recur_list_with_state, select_source, selector_path,
+    serialize_draft_replay_handle, serialize_draft_trace, typed_external, typed_internal,
+    typed_internal_with_resolver, typed_selector_path, Anchor, AuthRef, AuthRefTrace, AuthValue,
+    Draft, DraftAppendField, DraftSetField, ExternalRef, ExternalSelection, ExternalValue,
+    InternalRef, InternalValue, IntoAuthRef, IntoAuthValue, IntoRecurControl, ListProofDirection,
+    ListProofSibling, Op, RecurControl, RecurInput, RecurOutput, RecurState, Schema, SchemaField,
+    SchemaFieldMode, SchemaNode, SelectSource, Selectable, SelectedPayload, SelectionProof,
+    SelectionProofStep, SelectorPath, SelectorSegment, TypedExternalBinding, TypedInternalBinding,
+    TypedSelectorPath,
 };
 
 #[cfg(feature = "std")]
-pub use input::{encode_raster_value, store_internal_value, write_raster_files};
+pub use input::{
+    begin_draft_transition_capture, encode_raster_value, finish_draft_transition_capture,
+    store_internal_value, write_raster_files,
+};
 
 pub use raster_macros::{select, sequence, tile, Selectable};
 
@@ -258,6 +264,9 @@ macro_rules! call_seq {
 /// `call_recur!` is only valid inside `#[sequence]` functions, where the sequence macro
 /// rewrites it into a hidden driver that iterates a selectable list source, threads a
 /// `Draft<_>` through each item, and finalizes the draft once the run ends.
+///
+/// Empty inputs skip the step function entirely. They only finalize successfully when the
+/// untouched output schema can still be materialized without any set-once writes.
 #[macro_export]
 macro_rules! call_recur {
     ($($tt:tt)*) => {
