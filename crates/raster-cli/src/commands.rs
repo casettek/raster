@@ -2,10 +2,10 @@
 pub mod run;
 pub mod tile;
 
-use crate::utils::encode::{decode_output, encode_input};
+use crate::utils::encode::{decode_execution_output, encode_input};
 
 use crate::BackendType;
-use raster_backend::{Backend, ExecutionMode};
+use raster_backend::{Backend, ExecutionFailure, ExecutionMode};
 use raster_backend_native::NativeBackend;
 use raster_backend_risc0::Risc0Backend;
 use raster_compiler::sequence::{FlattenedStep, SequenceDiscovery};
@@ -154,24 +154,7 @@ fn double(x: u64) -> u64 {
 fn main() {
     println!("Raster Project");
     println!();
-
-    // Show registered tiles
-    println!("Registered tiles: {}", tile_count());
-    for tile in iter_tiles() {
-        println!("  - {}", tile.id_str());
-    }
-
-    // Execute directly
-    println!();
     println!("double(21) = {}", double(21));
-
-    // Execute via registry
-    if let Some(tile) = find_tile_by_str("double") {
-        let input = raster::core::postcard::to_allocvec(&42u64).unwrap();
-        let output = tile.execute(&input).unwrap();
-        let result: u64 = raster::core::postcard::from_bytes(&output).unwrap();
-        println!("double(42) via registry = {}", result);
-    }
 }
 "#;
     std::fs::write(src_dir.join("main.rs"), main_rs)?;
@@ -235,11 +218,19 @@ pub fn run_sequence(
                 tile_runner.validate_input(input)?;
                 let input_bytes = encode_input(input)?;
                 let result = tile_runner.run(&input_bytes, mode)?;
-                let output_display = decode_output(
+                match decode_execution_output(
                     tile.function.output.as_deref().unwrap_or("()"),
                     &result.output,
-                );
-                println!("  Output: {}", output_display);
+                ) {
+                    Ok(output_display) => println!("  Output: {}", output_display),
+                    Err(ExecutionFailure::User(user_error)) => {
+                        println!("  User error: {}", user_error)
+                    }
+                    Err(ExecutionFailure::Runtime(err)) => return Err(err),
+                }
+            }
+            FlattenedStep::Recur(tile) => {
+                println!("  Recur tile '{}' is not supported in preview mode", tile.function.name);
             }
             FlattenedStep::Sequence(seq) => {
                 println!("  Entering sequence '{}'...", seq.function.name);
@@ -406,8 +397,11 @@ pub fn cfs(output: Option<String>) -> Result<()> {
                 raster_core::cfs::SequenceChildItem::Tile(item) => {
                     println!("      [{}] {} '{}'", idx, "tile", item.id)
                 }
+                raster_core::cfs::SequenceChildItem::Recur(item) => {
+                    println!("      [{}] {} '{}'", idx, "recur", item.id)
+                }
                 raster_core::cfs::SequenceChildItem::Sequence(item) => {
-                    println!("      [{}] {} '{}'", idx, "tile", item.id)
+                    println!("      [{}] {} '{}'", idx, "sequence", item.id)
                 }
             }
         }

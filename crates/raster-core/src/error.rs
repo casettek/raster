@@ -1,11 +1,11 @@
-//! Error types for the Raster toolchain.
+//! Internal runtime/protocol errors for the Raster toolchain.
 //!
 //! This module provides `no_std` compatible error types.
 
 use alloc::string::String;
 use core::fmt;
 
-/// Error type for Raster operations.
+/// Internal error type for Raster runtime/protocol operations.
 #[derive(Debug)]
 pub enum Error {
     /// Invalid tile ID.
@@ -62,5 +62,5 @@ impl From<serde_json::Error> for Error {
     }
 }
 
-/// Result type for Raster operations.
+/// Result type for Raster runtime/protocol operations.
 pub type Result<T> = core::result::Result<T, Error>;

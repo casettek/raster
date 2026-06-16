@@ -1,0 +1,5 @@
+error[E0425]: cannot find function `child` in this scope
+  --> tests/ui/non_main_sequence_native_call.rs:14:13
+   |
+14 |     let _ = child("Raster".to_string());
+   |             ^^^^^ not found in this scope

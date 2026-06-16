@@ -14,7 +14,8 @@ It is written to match the current codebase. Where the intended behavior is not 
     - `TileDef` (`id`, `type`, `inputs`, `outputs`)
     - `SequenceDef` (`id`, `input_sources`, `items`)
     - `SequenceItem` (`item_type`, `item_id`, `input_sources`)
-    - `InputBinding`, `InputSource::{External, SeqInput, ItemOutput}`
+    - `InputBinding::{Direct, SequenceScope, ProducerOutput}`
+    - `InputSource::{External, Internal, Inline}`
 - **How CFS is produced (binding resolution rules that determine what a verifier will see)**
   - `crates/raster-compiler/src/cfs_builder.rs`
     - `CfsBuilder::build` (emits `encoding = "postcard"`)
@@ -24,9 +25,9 @@ It is written to match the current codebase. Where the intended behavior is not 
     - Note: macro invocations like `callee!(...)` are not extracted as calls by the current visitor
   - `crates/raster-compiler/src/flow_resolver.rs`
     - `resolve_argument(...)` mapping:
-      - exact param name → `SeqInput { input_index }`
-      - exact bound name → `ItemOutput { item_index, output_index }` (currently always `0`)
-      - otherwise → `External` fallback
+      - exact param name → `SequenceScope { input_index }`
+      - exact bound name → `ProducerOutput { item_index, output_index }` (currently always `0`)
+      - otherwise → direct `External` fallback
     - Note: binding resolution is based on exact string equality against parameter/binding names; complex expressions typically fall back to `External`.
 - **Recursive-tile authoring signal**
   - `crates/raster-macros/src/lib.rs`
@@ -34,7 +35,19 @@ It is written to match the current codebase. Where the intended behavior is not 
     - Docstring states the `!` syntax “signals to the CFS compiler” recursive execution intent
 - **Trace data model currently available**
   - `crates/raster-core/src/trace.rs`
-    - `TraceEvent::{TileStart, TileEnd, SequenceStart, SequenceEnd}` (no committed input/output bytes today)
+    - `StepRecord::{TileExec, SequenceStart, SequenceEnd}`
+    - `TileExecRecord.input_source_commitment` / `SequenceStartRecord.input_source_commitment`
+    - `FnInput.values`, `FnInput.external`, `FnInput.internal`
+- **Internal storage provenance**
+  - `crates/raster-core/src/transition.rs`
+    - `InternalStoreEntry { coordinates, object_commitment }`
+    - `InternalStoreWitness { reads, write }`
+    - `InternalStoreLogWitness`
+    - coordinate-index membership / non-membership proofs
+  - `crates/raster-runtime/src/internal_storage.rs`
+    - raw bytes are keyed by execution coordinates
+    - the committed internal-store log root comes from an append-only incremental Merkle frontier
+    - a separate authenticated coordinate index maps `coordinates -> { log_position, object_commitment }`
 - **Runtime/verification implementation status**
   - There is no schema-driven runtime/executor in this workspace that consumes `SequenceSchema` or enforces CFS determinism at runtime.
   - No verifier-side API exists today that consumes a CFS + committed step outputs and enforces “next step” determinism.
@@ -69,7 +82,10 @@ Given the same CFS, the same external inputs, and the same committed prior resul
 
 To derive next-step inputs mechanically, a verifier needs committed per-step I/O bytes.
 
-**Current gap:** `raster_core::trace::Trace` does not contain tile input/output bytes, and no other “step record” type exists in `raster-core` today. As a result, the algorithm below is not implementable purely from `raster_core::trace` as currently defined.
+The current implementation carries the minimum proof boundary in two layers:
+
+- `StepRecord` commits the step ordering, I/O commitments, external-input commitment, input-source commitment, and internal-store roots.
+- `TransitionInput` carries replay bytes plus structured input-source witnesses (`FnInput`) and optional internal-store read/write witnesses.
 
 Minimum required record per tile execution (including each recursion iteration) is:
 
@@ -111,8 +127,8 @@ A verifier MUST validate the following before attempting next-step derivation:
   - If `item_type == "sequence"`, the number of `SequenceItem.input_sources` MUST equal the referenced `SequenceDef.input_sources.len()` (its parameter count).
     - **Current gap:** `SequenceDef.input_sources` is always `external` today, but the length is still meaningful as the parameter count.
 - **Index safety for bindings**
-  - For `InputSource::SeqInput { input_index }`, `input_index` MUST be within the current sequence invocation’s input vector.
-  - For `InputSource::ItemOutput { item_index, output_index }`:
+  - For `InputBinding::SequenceScope { input_index }`, `input_index` MUST be within the current sequence invocation’s input vector.
+  - For `InputBinding::ProducerOutput { item_index, output_index }`:
     - `item_index` MUST be `< current_item_index` (no forward references).
     - `output_index` MUST be `< outputs_of(item_index)`.
       - For `item_type=="tile"`, `outputs_of(i) = TileDef.outputs`.
@@ -120,25 +136,25 @@ A verifier MUST validate the following before attempting next-step derivation:
 
 #### 2.3 External inputs restrictions
 
-In a fraud-provable setting, any `InputSource::External` appearing inside a sequence item MUST be treated as a hard failure unless it can be satisfied by the invocation’s explicitly committed external inputs.
+In a fraud-provable setting, any direct `InputBinding::Direct(InputSource::External)` appearing inside a sequence item MUST be treated as a hard failure unless it can be satisfied by the invocation’s explicitly committed external inputs.
 
 Minimum rule set:
 
-- For the entry invocation of `"main"`, `External` MAY be used only to reference explicitly committed entry inputs.
-- For non-entry sequences, `External` SHOULD NOT appear in item arguments; all arguments SHOULD be derivable from `SeqInput` or `ItemOutput`.
+- For the entry invocation of `"main"`, direct `External` MAY be used only to reference explicitly committed entry inputs.
+- For non-entry sequences, direct `External` SHOULD NOT appear in item arguments; all arguments SHOULD be derivable from `SequenceScope` or `ProducerOutput`.
 
-**Current producer behavior:** unresolved arguments (literals, expressions) are encoded as `External` by the compiler’s flow resolver. Verifiers MUST treat such CFS instances as not mechanically verifiable unless an out-of-band rule is provided to supply those values.
+**Current producer behavior:** unresolved arguments (literals, expressions) are encoded as direct `External` bindings by the compiler’s flow resolver. Verifiers MUST treat such CFS instances as not mechanically verifiable unless an out-of-band rule is provided to supply those values.
 
 #### 2.4 Nested sequence outputs (gap)
 
-To support `InputSource::ItemOutput` that references a prior item whose `item_type == "sequence"`, a verifier needs:
+To support `InputBinding::ProducerOutput` that references a prior item whose `item_type == "sequence"`, a verifier needs:
 
 - the output arity of the nested sequence invocation, and
 - a defined rule for how those outputs are produced.
 
 **Current gap:** `raster_core::cfs` does not model sequence output arity, and the compiler currently assumes a single output (`output_index = 0`) when binding `let x = callee(...)` regardless of callee kind.
 
-Until a sequence-output model exists, verifiers MUST reject any CFS/trace pair that requires selecting outputs from a nested sequence invocation via `ItemOutput`.
+Until a sequence-output model exists, verifiers MUST reject any CFS/trace pair that requires selecting outputs from a nested sequence invocation via `ProducerOutput`.
 
 ---
 
@@ -171,15 +187,19 @@ The verifier also has access to the committed prior results to validate that any
 
 ### 4) Deriving required inputs for a call
 
-Given a sequence frame with inputs `seq_inputs[]` (each element is a canonical-encoded value), and having access to prior item outputs `item_outputs[item_index][output_index]` (canonical-encoded values), the required input for a callee argument is derived as:
+Given a sequence frame with inputs `seq_inputs[]` (each element is a resolved source descriptor plus canonical bytes), and having access to prior item outputs `item_outputs[item_index][output_index]` (canonical-encoded values) plus the committed internal-write log, the required input for a callee argument is derived as:
 
-- If `source == SeqInput { input_index }`:
+- If `binding == SequenceScope { input_index }`:
   - required value is `seq_inputs[input_index]`.
-- If `source == ItemOutput { item_index, output_index }`:
+- If `binding == ProducerOutput { item_index, output_index }`:
   - required value is `item_outputs[item_index][output_index]`.
-- If `source == External`:
+- If `binding == Direct(External)`:
   - required value MUST come from a committed external input channel associated with the current sequence invocation.
   - If no such committed value exists, verification MUST fail.
+- If `binding == Direct(Inline)`:
+  - required value is the inline value committed by the current step’s input-source witness.
+- If `binding == Direct(Internal)`:
+  - required value MUST resolve through an `InternalRef` whose committed coordinates are consistent with the current sequence scope and the keyed internal-store state.
 
 #### 4.1 Tile ABI input bytes
 
@@ -277,17 +297,17 @@ Given this CFS excerpt:
   "sequences": [
     {
       "id": "main",
-      "input_sources": [ { "source": { "type": "external" } } ],
+      "input_sources": [ "Direct(External)" ],
       "items": [
         {
           "item_type": "tile",
           "item_id": "greet",
-          "input_sources": [ { "source": { "type": "seq_input", "input_index": 0 } } ]
+          "input_sources": [ "SequenceScope(0)" ]
         },
         {
           "item_type": "tile",
           "item_id": "exclaim",
-          "input_sources": [ { "source": { "type": "item_output", "item_index": 0, "output_index": 0 } } ]
+          "input_sources": [ "ProducerOutput(0,0)" ]
         }
       ]
     }
@@ -299,8 +319,8 @@ Let the committed external input for `main` be a single value `name` (canonicall
 
 Derivation:
 
-- At start, `next_item_index = 0`, so the next required action is tile `greet` with input derived from `SeqInput[0]`.
-- After `greet` executes, the next required action is tile `exclaim` with its sole argument derived from `ItemOutput(0,0)`, i.e. the output of `greet`.
+- At start, `next_item_index = 0`, so the next required action is tile `greet` with input derived from `SequenceScope(0)`.
+- After `greet` executes, the next required action is tile `exclaim` with its sole argument derived from `ProducerOutput(0,0)`, i.e. the output of `greet`.
 
 #### 7.2 External fallback in arguments (not mechanically verifiable)
 
@@ -310,7 +330,7 @@ For a sequence containing:
 let y = add_one(x + 1);
 ```
 
-the compiler will treat `"x + 1"` as an unresolved argument string and encode it as `InputSource::External`.
+the compiler will treat `"x + 1"` as an unresolved argument string and encode it as a direct `External` binding.
 
 A verifier MUST reject attempts to mechanically derive the next step unless an explicit, committed external value is provided for that argument (and the rules allowing it are defined).
 

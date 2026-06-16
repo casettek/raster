@@ -8,6 +8,7 @@ use raster_backend::{
     ArtifactStore, Backend, CompilationArtifact, ExecutionMode, ResourceEstimate,
     TileExecutionResult,
 };
+use raster_core::draft::TileReplayJournal;
 use raster_core::postcard;
 use risc0_zkvm::{default_executor, ExecutorEnv};
 use serde::{Deserialize, Serialize};
@@ -293,7 +294,9 @@ impl Backend for Risc0Backend {
                     .map_err(|e| Error::Other(format!("Execution failed: {}", e)))?;
 
                 // Get the journal (output)
-                let output = session.journal.bytes.clone();
+                let replay_output: TileReplayJournal = postcard::from_bytes(&session.journal.bytes)
+                    .map_err(|e| Error::Other(format!("Failed to decode replay journal: {}", e)))?;
+                let output = replay_output.output_bytes;
                 let cycles = session.cycles();
 
                 Ok(TileExecutionResult::estimate(output, cycles))
@@ -305,7 +308,9 @@ impl Backend for Risc0Backend {
                     .map_err(|e| Error::Other(format!("Proving failed: {}", e)))?;
 
                 let receipt = prove_info.receipt;
-                let output = receipt.journal.bytes.clone();
+                let replay_output: TileReplayJournal = postcard::from_bytes(&receipt.journal.bytes)
+                    .map_err(|e| Error::Other(format!("Failed to decode replay journal: {}", e)))?;
+                let output = replay_output.output_bytes;
 
                 // Get cycle count from the receipt if available
                 let cycles = prove_info.stats.total_cycles;

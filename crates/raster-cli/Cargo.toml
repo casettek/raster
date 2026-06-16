@@ -37,3 +37,4 @@ bincode.workspace = true
 hex = "0.4"
 rayon.workspace = true
 rand.workspace = true
+sha2.workspace = true

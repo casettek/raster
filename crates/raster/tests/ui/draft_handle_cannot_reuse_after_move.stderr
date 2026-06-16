@@ -1,0 +1,17 @@
+error[E0382]: use of moved value: `draft`
+  --> tests/ui/draft_handle_cannot_reuse_after_move.rs:14:13
+   |
+12 |     let draft = new!(Account);
+   |         ----- move occurs because `draft` has type `raster::Draft<Account>`, which does not implement the `Copy` trait
+13 |     consume(draft);
+   |             ----- value moved here
+14 |     consume(draft);
+   |             ^^^^^ value used here after move
+   |
+note: consider changing this parameter type in function `consume` to borrow instead if owning the value isn't necessary
+  --> tests/ui/draft_handle_cannot_reuse_after_move.rs:9:15
+   |
+ 9 | fn consume(_: Draft<Account>) {}
+   |    -------    ^^^^^^^^^^^^^^ this parameter takes ownership of the value
+   |    |
+   |    in this function

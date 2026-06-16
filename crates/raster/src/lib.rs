@@ -13,13 +13,48 @@ pub extern crate alloc;
 extern crate std;
 
 pub use raster_core as core;
+pub use raster_core::draft;
 
 pub mod input;
-pub use input::{external, resolve_external_value, External, ExternalRef};
+pub use input::{
+    auth_ref_result_trace, auth_ref_trace, draft_replay_handle, draft_replay_transition, finalize,
+    into_auth_ref, into_auth_value, materialize_auth_result, materialize_auth_return, new_draft,
+    resolve_external_value, resolve_internal_ok_value, resolve_internal_value,
+    resolve_typed_external_value, restore_draft_from_replay_handle, run_recur_list,
+    run_recur_list_state, run_recur_list_with_state, select_source, selector_path,
+    serialize_draft_replay_handle, serialize_draft_trace, typed_external, typed_internal,
+    typed_internal_with_resolver, typed_selector_path, Anchor, AuthRef, AuthRefTrace, AuthValue,
+    Draft, DraftAppendField, DraftSetField, ExternalRef, ExternalSelection, ExternalValue,
+    InternalRef, InternalValue, IntoAuthRef, IntoAuthValue, IntoRecurControl, ListProofDirection,
+    ListProofSibling, Op, RecurControl, RecurInput, RecurOutput, RecurState, Schema, SchemaField,
+    SchemaFieldMode, SchemaNode, SelectSource, Selectable, SelectedPayload, SelectionProof,
+    SelectionProofStep, SelectorPath, SelectorSegment, TypedExternalBinding, TypedInternalBinding,
+    TypedSelectorPath,
+};
 
-pub use raster_macros::{sequence, tile};
+#[cfg(feature = "std")]
+pub use input::{
+    begin_draft_transition_capture, encode_raster_value, finish_draft_transition_capture,
+    store_internal_value, write_raster_files,
+};
 
-// Runtime is only available with std feature
+pub use raster_macros::{select, sequence, tile, Selectable};
+
+/// User-facing execution result contract for fallible tiles and sequences.
+pub mod exec {
+    pub type Result<T> = core::result::Result<T, crate::alloc::string::String>;
+}
+
+/// Internal runtime/protocol surface.
+///
+/// Raster-internal execution failures remain available here so hosts and
+/// executor layers can distinguish infrastructure/runtime failures from
+/// user-defined terminal outcomes.
+pub mod runtime {
+    pub use crate::core::error::{Error, Result};
+}
+
+// Runtime helpers are only available with std feature.
 #[cfg(feature = "std")]
 pub use raster_runtime::{finish, init, init_with, publish_trace_event};
 
@@ -35,6 +70,224 @@ pub mod __private {
 
     #[cfg(not(feature = "std"))]
     pub fn emit_debug(_: core::fmt::Arguments<'_>) {}
+
+    #[doc(hidden)]
+    pub struct SequenceScopeGuard;
+
+    impl SequenceScopeGuard {
+        pub fn enter(sequence_id: &str) -> Self {
+            #[cfg(feature = "std")]
+            {
+                raster_runtime::enter_sequence_scope(sequence_id);
+            }
+
+            #[cfg(not(feature = "std"))]
+            {
+                let _ = sequence_id;
+            }
+
+            Self
+        }
+    }
+
+    impl Drop for SequenceScopeGuard {
+        fn drop(&mut self) {
+            #[cfg(feature = "std")]
+            {
+                raster_runtime::exit_sequence_scope();
+            }
+        }
+    }
+
+    #[doc(hidden)]
+    pub struct TileExecutionScopeGuard {
+        #[cfg(feature = "std")]
+        inner: Option<raster_runtime::TileExecutionScopeGuard>,
+    }
+
+    impl TileExecutionScopeGuard {
+        pub fn enter() -> Self {
+            #[cfg(feature = "std")]
+            {
+                return Self {
+                    inner: Some(
+                        raster_runtime::TileExecutionScopeGuard::enter().unwrap_or_else(|error| {
+                            panic!("Failed to enter tile execution scope: {}", error)
+                        }),
+                    ),
+                };
+            }
+
+            #[cfg(not(feature = "std"))]
+            {
+                Self {}
+            }
+        }
+
+        pub fn coordinates(&self) -> &crate::core::cfs::CfsCoordinates {
+            #[cfg(feature = "std")]
+            {
+                return self
+                    .inner
+                    .as_ref()
+                    .expect("Tile execution scope guard is missing runtime state")
+                    .coordinates();
+            }
+
+            #[cfg(not(feature = "std"))]
+            {
+                panic!("Tile execution coordinates require the `std` feature")
+            }
+        }
+    }
+
+    impl Drop for TileExecutionScopeGuard {
+        fn drop(&mut self) {
+            #[cfg(feature = "std")]
+            {
+                self.inner.take();
+            }
+        }
+    }
+
+    #[cfg(feature = "std")]
+    pub fn publish_tile_output_coordinates(coordinates: crate::core::cfs::CfsCoordinates) {
+        raster_runtime::publish_pending_output_coordinates(coordinates);
+    }
+
+    #[cfg(not(feature = "std"))]
+    pub fn publish_tile_output_coordinates(_: crate::core::cfs::CfsCoordinates) {
+        panic!("Tile output coordinates require the `std` feature")
+    }
+
+    #[doc(hidden)]
+    pub struct RecurSiteScopeGuard;
+
+    impl RecurSiteScopeGuard {
+        pub fn enter() -> Self {
+            #[cfg(feature = "std")]
+            {
+                raster_runtime::enter_recur_site_scope()
+                    .unwrap_or_else(|error| panic!("Failed to enter recur site scope: {}", error));
+            }
+
+            Self
+        }
+    }
+
+    impl Drop for RecurSiteScopeGuard {
+        fn drop(&mut self) {
+            #[cfg(feature = "std")]
+            {
+                raster_runtime::exit_recur_site_scope();
+            }
+        }
+    }
+
+    #[doc(hidden)]
+    pub struct RecurTraceScopeGuard {
+        #[cfg(feature = "std")]
+        inner: Option<raster_runtime::RecurTraceScopeGuard>,
+    }
+
+    impl RecurTraceScopeGuard {
+        pub fn enter() -> Self {
+            #[cfg(feature = "std")]
+            {
+                return Self {
+                    inner: Some(raster_runtime::RecurTraceScopeGuard::enter()),
+                };
+            }
+
+            #[cfg(not(feature = "std"))]
+            {
+                Self {}
+            }
+        }
+    }
+
+    impl Drop for RecurTraceScopeGuard {
+        fn drop(&mut self) {
+            #[cfg(feature = "std")]
+            {
+                self.inner.take();
+            }
+        }
+    }
+
+    #[cfg(feature = "std")]
+    pub fn bind_infallible_call<T>(result: T) -> crate::AuthRef<T>
+    where
+        T: serde::Serialize + serde::de::DeserializeOwned + 'static,
+    {
+        let reference = raster_runtime::store_execution_output_value(&result).unwrap_or_else(|error| {
+            panic!("Failed to store tile output in internal storage: {}", error)
+        });
+        crate::into_auth_ref::<T, _>(crate::typed_internal::<T>(reference))
+    }
+
+    #[cfg(not(feature = "std"))]
+    pub fn bind_infallible_call<T>(_: T) -> crate::AuthRef<T> {
+        panic!("Sequence call bindings require the `std` feature")
+    }
+
+    #[cfg(feature = "std")]
+    pub fn bind_fallible_call<T>(
+        result: core::result::Result<T, crate::alloc::string::String>,
+    ) -> core::result::Result<crate::AuthRef<T>, crate::alloc::string::String>
+    where
+        T: serde::Serialize + serde::de::DeserializeOwned + 'static,
+    {
+        let reference = raster_runtime::store_execution_output_value(&result).unwrap_or_else(|error| {
+            panic!("Failed to store tile output in internal storage: {}", error)
+        });
+        match result {
+            Ok(_) => Ok(crate::into_auth_ref::<T, _>(
+                crate::typed_internal_with_resolver::<T>(
+                    reference,
+                    crate::resolve_internal_ok_value::<T>,
+                ),
+            )),
+            Err(error) => Err(error),
+        }
+    }
+
+    #[cfg(not(feature = "std"))]
+    pub fn bind_fallible_call<T>(
+        _: core::result::Result<T, crate::alloc::string::String>,
+    ) -> core::result::Result<crate::AuthRef<T>, crate::alloc::string::String> {
+        panic!("Sequence call bindings require the `std` feature")
+    }
+
+    pub trait TileCallBinding<Return> {
+        type Output;
+
+        fn bind(result: Return) -> Self::Output;
+    }
+
+    pub fn bind_tile_call<Marker, Return>(
+        result: Return,
+    ) -> <Marker as TileCallBinding<Return>>::Output
+    where
+        Marker: TileCallBinding<Return>,
+    {
+        Marker::bind(result)
+    }
+
+    pub trait TryTileCallBinding<Return> {
+        type Output;
+
+        fn bind(result: Return) -> Self::Output;
+    }
+
+    pub fn bind_tile_try_call<Marker, Return>(
+        result: Return,
+    ) -> <Marker as TryTileCallBinding<Return>>::Output
+    where
+        Marker: TryTileCallBinding<Return>,
+    {
+        Marker::bind(result)
+    }
 }
 
 /// Canonical call primitive for invoking a tile inside a sequence.
@@ -47,6 +300,7 @@ pub mod __private {
 /// ```ignore
 /// let greeting = call!(greet, name);
 /// let result = call!(exclaim, greeting);
+/// let checked = call!(maybe_echo_name, result)?;
 /// ```
 ///
 /// On `std` + non-riscv32 targets, the underlying tile function's `#[tile]` wrapper
@@ -65,14 +319,29 @@ macro_rules! call {
     };
 }
 
-/// Creates a typed external-input reference for `#[external(...)]` parameters.
+/// Creates a typed external-input reference for explicit call-site bindings.
 #[macro_export]
 macro_rules! external {
-    ($name:literal) => {
-        $crate::external($name)
+    ($ty:ty, $name:literal) => {
+        $crate::typed_external::<$ty>($name)
     };
-    ($name:expr) => {
-        $crate::external($name)
+    ($ty:ty, $name:expr) => {
+        $crate::typed_external::<$ty>($name)
+    };
+}
+
+/// Creates a typed internal-store reference for explicit call-site bindings.
+#[macro_export]
+macro_rules! internal {
+    ($ty:ty, $reference:expr) => {
+        $crate::typed_internal::<$ty>($reference)
+    };
+}
+
+#[macro_export]
+macro_rules! new {
+    ($ty:ty) => {
+        $crate::new_draft::<$ty>()
     };
 }
 
@@ -84,6 +353,7 @@ macro_rules! external {
 /// # Usage
 /// ```ignore
 /// let result = call_seq!(wish_sequence, greeting);
+/// let checked = call_seq!(verify_sequence, result)?;
 /// ```
 ///
 /// Semantically distinct from `call!`: invoking a sequence means the callee will
@@ -105,6 +375,21 @@ macro_rules! call_seq {
     };
 }
 
+/// Canonical recursive list-call primitive for invoking a recur tile inside a sequence.
+///
+/// `call_recur!` is only valid inside `#[sequence]` functions, where the sequence macro
+/// rewrites it into a hidden driver that iterates a selectable list source, threads a
+/// `Draft<_>` through each item, and finalizes the draft once the run ends.
+///
+/// Empty inputs skip the step function entirely. They only finalize successfully when the
+/// untouched output schema can still be materialized without any set-once writes.
+#[macro_export]
+macro_rules! call_recur {
+    ($($tt:tt)*) => {
+        compile_error!("call_recur! can only be used inside #[sequence] functions")
+    };
+}
+
 /// Emits a Raster debug line that `cargo raster run --verbose` will surface.
 ///
 /// Use this instead of `println!` in Raster user code, especially in `no_std`
@@ -117,11 +402,14 @@ macro_rules! debug {
 }
 
 /// Prelude module for convenient imports.
+///
+/// Importing `raster::prelude::*` makes bare `Result<T>` refer to Raster's
+/// terminal execution result type. Raster runtime failures remain available
+/// separately under `raster::runtime`.
 pub mod prelude {
     pub use crate::core::{
-        input::{External, ExternalRef},
+        input::ExternalRef,
         tile::{TileId, TileIdStatic, TileMetadata, TileMetadataStatic},
-        Result,
     };
 
     // These modules require std
@@ -132,22 +420,25 @@ pub mod prelude {
         trace::{FnCallRecord, FnInput, FnInputArg, FnOutput, TileExecRecord},
     };
 
-    // Registry is only available with std and on platforms that support linkme
-    #[cfg(all(feature = "std", not(target_arch = "riscv32")))]
-    pub use crate::core::registry::{
-        find_sequence, find_tile, find_tile_by_str, iter_sequences, iter_tiles, sequence_count,
-        tile_count, SequenceMetadataStatic, SequenceRegistration, TileRegistration,
+    pub use crate::exec::Result;
+    pub use crate::{
+        call, call_recur, call_seq, debug, external, finalize, internal, into_auth_ref,
+        materialize_auth_result, materialize_auth_return, new, select, sequence, tile, Anchor,
+        AuthRef, AuthValue, Draft, ExternalSelection, ExternalValue, InternalRef, InternalValue,
+        IntoAuthRef, IntoAuthValue, ListProofDirection, ListProofSibling, Op, RecurControl,
+        RecurInput, RecurOutput, RecurState, Schema, SchemaField, SchemaFieldMode, SchemaNode,
+        SelectSource, Selectable, SelectedPayload, SelectionProof, SelectionProofStep,
+        SelectorPath, SelectorSegment, TypedExternalBinding, TypedInternalBinding,
+        TypedSelectorPath,
     };
-
-    pub use crate::{call, call_seq, debug, external, sequence, tile};
 
     // TODO: Re-enable once Executor/Tracer types are implemented
     // #[cfg(feature = "std")]
     // pub use crate::{Executor, Tracer, FileTracer, NoOpTracer};
 
     #[cfg(feature = "std")]
-    pub use crate::{resolve_external_value};
-
-    #[cfg(feature = "std")]
-    pub use crate::input::parse_program_input_value;
+    pub use crate::{
+        resolve_external_value, resolve_internal_value, resolve_typed_external_value,
+        store_internal_value,
+    };
 }

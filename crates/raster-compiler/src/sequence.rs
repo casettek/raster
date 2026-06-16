@@ -23,6 +23,7 @@ impl<'ast> Sequence<'ast> {
 #[derive(Debug, Clone)]
 pub enum SequenceStep<'ast> {
     Tile(&'ast Tile<'ast>), // Reference to tile
+    Recur(&'ast Tile<'ast>),
     Sequence(String),       // Sequence name (resolved later if needed)
 }
 
@@ -91,7 +92,7 @@ impl<'ast> SequenceDiscovery<'ast> {
                             Some(tile) => Some(SequenceStep::Tile(tile)),
                             None => {
                                 eprintln!(
-                                    "error[raster]: `call!` in sequence `{}` refers to unknown tile `{}`; \
+                                    "error[raster]: tile call in sequence `{}` refers to unknown tile `{}`; \
                                      it is not registered in tile discovery. \
                                      Check the spelling or ensure `#[tile]` is applied.",
                                     func.name, call_info.callee
@@ -100,6 +101,18 @@ impl<'ast> SequenceDiscovery<'ast> {
                             }
                         }
                     }
+                    CallKind::Recursive => match tile_discovery.get(&call_info.callee) {
+                        Some(tile) => Some(SequenceStep::Recur(tile)),
+                        None => {
+                            eprintln!(
+                                "error[raster]: recursive tile call in sequence `{}` refers to unknown tile `{}`; \
+                                 it is not registered in tile discovery. \
+                                 Check the spelling or ensure `#[tile]` is applied.",
+                                func.name, call_info.callee
+                            );
+                            None
+                        }
+                    },
                     // Canonical call_seq!: callee must be a registered sequence.
                     CallKind::Sequence => {
                         if sequence_names.contains(&call_info.callee) {
@@ -162,6 +175,7 @@ impl<'ast> Sequence<'ast> {
 #[derive(Debug, Clone)]
 pub enum FlattenedStep<'a, 'ast> {
     Tile(&'a Tile<'ast>),
+    Recur(&'a Tile<'ast>),
     Sequence(&'a Sequence<'ast>),
 }
 /// Iterator that yields flattened steps from a sequence, expanding nested sequences inline.
@@ -191,6 +205,7 @@ impl<'a, 'ast> Iterator for SequenceStepIter<'a, 'ast> {
         while let Some(current_iter) = self.stack.last_mut() {
             match current_iter.next() {
                 Some(SequenceStep::Tile(tile)) => return Some(FlattenedStep::Tile(tile)),
+                Some(SequenceStep::Recur(tile)) => return Some(FlattenedStep::Recur(tile)),
                 Some(SequenceStep::Sequence(name)) => {
                     // Check for cycles - skip if already visited
                     if self.visited.contains(name) {

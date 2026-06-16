@@ -364,13 +364,13 @@ Given a sequence:
 
 ```rust
 #[sequence]
-fn main(name: String) -> String {
+fn greet_sequence(name: String) -> String {
     let greeting = greet(name);
     exclaim(greeting)
 }
 ```
 
-the generated CFS items for `main` will bind:
+the generated CFS items for `greet_sequence` will bind:
 
 - `greet`’s input to `seq_input(0)` (because `name` matches the first parameter name)
 - `exclaim`’s input to `item_output(0, 0)` (because `greeting` is bound to the first call’s output)

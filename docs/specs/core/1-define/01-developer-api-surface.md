@@ -13,12 +13,11 @@ The primary entry point for applications is the `raster` crate. Other crates (`r
   - `crates/raster/Cargo.toml`: feature flags (`std`, `alloc`) and what they gate.
 
 - **Macros (authoring surface)**
-  - `crates/raster-macros/src/lib.rs`: `#[tile]` and `#[sequence]` proc macros; generated wrapper functions/macros; registry integration; ABI serialization via `postcard`.
+  - `crates/raster-macros/src/lib.rs`: `#[tile]` and `#[sequence]` proc macros; generated wrapper functions/macros; ABI serialization via `postcard`.
 
 - **Core data types and registries**
-  - `crates/raster-core/src/lib.rs`: module gating by features/targets; re-exports (`Error`, `Result`, `postcard`, `linkme`).
+  - `crates/raster-core/src/lib.rs`: module gating by features/targets; re-exports (`Error`, `Result`, `postcard`).
   - `crates/raster-core/src/tile.rs`: `TileId`, `TileMetadata`, and static variants used for registration.
-  - `crates/raster-core/src/registry.rs`: `TileRegistration`, `SequenceRegistration`, and discovery helpers (`iter_tiles`, `find_tile_*`, etc.).
   - `crates/raster-core/src/schema.rs`: `SequenceSchema` and `ControlFlow` (note: schema generation is currently not implemented).
   - `crates/raster-core/src/cfs.rs`: `ControlFlowSchema` (CFS) and its JSON shape.
   - `crates/raster-core/src/manifest.rs`: `Manifest` type.
@@ -75,9 +74,6 @@ From `raster::prelude`:
   - `raster::core::manifest::Manifest`
   - `raster::core::trace::{Trace, TraceEvent}`
 
-- **Registry (only when `std` and not `target_arch = "riscv32"`)**
-  - `raster::core::registry::{TileRegistration, iter_tiles, find_tile, find_tile_by_str, tile_count, SequenceRegistration, SequenceMetadataStatic, iter_sequences, find_sequence, sequence_count}`
-
 ### `raster-macros` (proc macros; used via `raster`)
 
 From `crates/raster-macros/src/lib.rs`:
@@ -108,22 +104,6 @@ From `crates/raster-core/src/lib.rs` and modules:
   - `pub struct Trace`
   - `pub enum TraceEvent`
 
-- **Std + non-RISC-V registry**
-  - `pub type TileEntryFn`
-  - `pub struct TileRegistration`
-  - `pub fn iter_tiles() -> impl Iterator<Item = &'static TileRegistration>`
-  - `pub fn find_tile(...) -> Option<&'static TileRegistration>`
-  - `pub fn find_tile_static(...) -> Option<&'static TileRegistration>`
-  - `pub fn find_tile_by_str(...) -> Option<&'static TileRegistration>`
-  - `pub fn tile_count() -> usize`
-  - `pub fn all_tile_ids() -> Vec<TileId>`
-  - `pub fn all_tile_metadata() -> Vec<TileMetadata>`
-  - `pub struct SequenceMetadataStatic`
-  - `pub struct SequenceRegistration`
-  - `pub fn iter_sequences() -> impl Iterator<Item = &'static SequenceRegistration>`
-  - `pub fn find_sequence(id: &str) -> Option<&'static SequenceRegistration>`
-  - `pub fn sequence_count() -> usize`
-
 - **Control Flow Schema (CFS) types** (used by the compiler and CLI)
   - `pub struct ControlFlowSchema`
   - `pub struct TileDef`
@@ -135,7 +115,6 @@ From `crates/raster-core/src/lib.rs` and modules:
 - **Re-exports used by macro-generated code**
   - `pub use postcard` (always)
   - `pub use bincode` (only with `std`)
-  - `pub use linkme` (only when `std` and not `target_arch = "riscv32"`)
 
 ### `raster-compiler` (tooling/library compilation APIs)
 
@@ -245,7 +224,7 @@ This section classifies the developer-facing surface by intended stability **bas
   - The generated wrapper function `__raster_tile_entry_<fn_name>` and registration statics are implementation details and MUST NOT be referenced by user code.
 
 - **Direct registry/linker details**
-  - `linkme`-specific distributed slice wiring is an implementation detail (even though registry helper functions are public on supported targets).
+- Sequence tooling is driven by AST/source discovery rather than link-time registration.
 
 ---
 
@@ -317,10 +296,10 @@ It encodes the output bytes as:
 
 - `postcard` encoding of the returned value (after unwrapping `Result` if applicable).
 
-#### Registration behavior
+#### Wrapper generation behavior
 
-- When compiled with `std` and not on `target_arch = "riscv32"`, `#[tile]` MUST register the tile into `raster::core::registry::TILE_REGISTRY`.
-- Otherwise, registration MUST be omitted (the tile remains callable as a normal Rust function).
+- `#[tile]` MUST generate a byte-oriented ABI wrapper named `__raster_tile_entry_<tile_name>`.
+- The wrapper remains available as a normal Rust function on all supported targets.
 
 #### Recursive tiles (`recur`)
 
@@ -331,7 +310,7 @@ It encodes the output bytes as:
 ### `#[sequence]` attribute macro
 
 - `#[sequence]` MAY be applied to a free function to declare a sequence.
-- On supported host targets (`std` and not `riscv32`), it MUST register the sequence in `raster::core::registry::SEQUENCE_REGISTRY` along with an ordered list of called identifiers extracted from the function body.
+- `#[sequence]` MUST generate wrapper code for native tracing and direct Rust invocation.
 - The macro currently extracts **simple function call expressions** and does not model Rust control flow in a sound way; developers SHOULD treat it as a tooling annotation, not as a behavioral guarantee.
 
 ---
@@ -349,7 +328,7 @@ fn double(x: u64) -> u64 {
 }
 ```
 
-### Execute via registry (host-only)
+### Execute via generated ABI wrapper
 
 ```rust
 use raster::prelude::*;
@@ -358,11 +337,16 @@ use raster::prelude::*;
 fn double(x: u64) -> u64 { x * 2 }
 
 fn main() {
-    // Registry APIs require: feature `std` and not target_arch = "riscv32"
-    let tile = find_tile_by_str("double").expect("tile registered");
     let input = raster::core::postcard::to_allocvec(&42u64).unwrap();
-    let output = tile.execute(&input).unwrap();
-    let result: u64 = raster::core::postcard::from_bytes(&output).unwrap();
+    let envelope = __raster_tile_entry_double(&input).unwrap();
+    let envelope: raster::core::TileOutputEnvelope =
+        raster::core::postcard::from_bytes(&envelope).unwrap();
+    let result: u64 = match envelope {
+        raster::core::TileOutputEnvelope::Success(bytes) => {
+            raster::core::postcard::from_bytes(&bytes).unwrap()
+        }
+        raster::core::TileOutputEnvelope::UserError { display, .. } => panic!("{display}"),
+    };
     assert_eq!(result, 84);
 }
 ```
@@ -396,11 +380,11 @@ fn main_sequence(name: String) -> String {
 
 - **Serialization format inconsistencies in comments and tooling**
   - The tile wrapper generated by `#[tile]` uses `postcard` for both input and output.
-  - Comments in `raster-core::registry` and docs in `raster-backend::Backend` mention “bincode” for inputs; those are not aligned with the wrapper implementation.
+  - Some older comments and docs in backend-facing code still mention “bincode” for inputs; those are not aligned with the wrapper implementation.
   - The CLI `run` command serializes a `serde_json::Value` via `postcard`, which generally will not match the concrete Rust argument type expected by the tile; tooling MUST serialize values in the ABI shape described above (unit / value / tuple) for the tile’s real Rust types.
 
 - **Execution stack is not wired end-to-end**
-  - `raster-backend::NativeBackend::execute_tile` is a stub and does not execute via the registry.
+  - `raster-backend::NativeBackend::execute_tile` is a stub and does not execute via the generated tile ABI wrapper.
   - The CLI “whole program” runner (`cargo raster run`) executes the user binary as a subprocess; tracing/commitment capture is handled by the `#[sequence] fn main` entry point + `raster-runtime` subscribers rather than an `Executor`.
 
 - **Sequence schema generation is not implemented**

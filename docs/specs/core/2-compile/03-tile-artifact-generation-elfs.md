@@ -52,7 +52,7 @@ Today, the only backend that produces a real guest ELF is the **RISC0 backend**.
 #### Native backend (does not produce a guest ELF) — gap
 
 - The native backend currently returns an empty `elf` in `CompilationOutput` and does not compile a standalone guest program.
-- The native backend’s `execute_tile` currently returns a placeholder result and does not dispatch through the tile registry.
+- The native backend’s `execute_tile` currently returns a placeholder result and does not dispatch through the generated tile ABI wrapper.
 
 This document still specifies the expected artifact layout for the native backend (because the builder writes manifests/method IDs), but there is currently **no ELF** to execute.
 

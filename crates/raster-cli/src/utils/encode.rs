@@ -1,3 +1,4 @@
+use raster_backend::ExecutionFailure;
 use raster_core::{Error, Result};
 
 /// Validate that the provided input matches the tile's expected inputs.
@@ -70,7 +71,9 @@ pub fn decode_output(output_type: &str, output: &[u8]) -> String {
             .unwrap_or_else(|_| format!("<{} bytes>", output.len())),
 
         // Unit type
-        "()" => "()".to_string(),
+        "()" => postcard::from_bytes::<()>(output)
+            .map(|_| "()".to_string())
+            .unwrap_or_else(|_| "()".to_string()),
 
         // Vec types - try to decode as JSON value for display
         t if t.starts_with("Vec<") || t.starts_with("Vec <") => {
@@ -87,27 +90,101 @@ pub fn decode_output(output_type: &str, output: &[u8]) -> String {
             }
         }
 
-        // Result types - unwrap if possible
-        t if t.starts_with("Result<") || t.starts_with("Result <") => {
-            // Try common inner types
-            if let Ok(s) = postcard::from_bytes::<std::result::Result<String, String>>(output) {
-                match s {
-                    Ok(v) => format!("Ok(\"{}\")", v),
-                    Err(e) => format!("Err(\"{}\")", e),
-                }
-            } else if let Ok(n) = postcard::from_bytes::<std::result::Result<u64, String>>(output) {
-                match n {
-                    Ok(v) => format!("Ok({})", v),
-                    Err(e) => format!("Err(\"{}\")", e),
-                }
-            } else {
-                format!("<Result: {} bytes>", output.len())
-            }
-        }
-
         // Unknown types - try serde_json::Value as fallback
         _ => postcard::from_bytes::<serde_json::Value>(output)
             .map(|v| v.to_string())
             .unwrap_or_else(|_| format!("<{}: {} bytes>", output_type, output.len())),
+    }
+}
+
+fn normalize_type_name(output_type: &str) -> String {
+    output_type.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+fn extract_result_ok_type(output_type: &str) -> Option<String> {
+    let normalized = normalize_type_name(output_type);
+    let marker = "Result<";
+    let result_start = normalized.find(marker)?;
+    let inner = normalized.get(result_start + marker.len()..normalized.len() - 1)?;
+
+    let mut depth = 0usize;
+    for (idx, ch) in inner.char_indices() {
+        match ch {
+            '<' => depth += 1,
+            '>' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => return Some(inner[..idx].to_string()),
+            _ => {}
+        }
+    }
+
+    Some(inner.to_string())
+}
+
+fn decode_fallible_execution_output(
+    output_type: &str,
+    output: &[u8],
+) -> std::result::Result<String, ExecutionFailure<String>> {
+    let success_type = extract_result_ok_type(output_type).ok_or_else(|| {
+        ExecutionFailure::Runtime(Error::Serialization(format!(
+            "Failed to determine Result success type for '{}'",
+            output_type
+        )))
+    })?;
+    let (variant_idx, payload) = postcard::take_from_bytes::<u32>(output).map_err(|e| {
+        ExecutionFailure::Runtime(Error::Serialization(format!(
+            "Failed to decode Result output '{}': {}",
+            output_type, e
+        )))
+    })?;
+
+    match variant_idx {
+        0 => Ok(decode_output(&success_type, payload)),
+        1 => {
+            let display = postcard::from_bytes::<String>(payload).map_err(|e| {
+                ExecutionFailure::Runtime(Error::Serialization(format!(
+                    "Failed to decode Result error output '{}': {}",
+                    output_type, e
+                )))
+            })?;
+            Err(ExecutionFailure::User(display))
+        }
+        other => Err(ExecutionFailure::Runtime(Error::Serialization(format!(
+            "Unexpected Result variant index '{}' for '{}'",
+            other, output_type
+        )))),
+    }
+}
+
+pub fn decode_execution_output(
+    output_type: &str,
+    output: &[u8],
+) -> std::result::Result<String, ExecutionFailure<String>> {
+    if extract_result_ok_type(output_type).is_some() {
+        decode_fallible_execution_output(output_type, output)
+    } else {
+        Ok(decode_output(output_type, output))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_execution_output_reports_user_error() {
+        let output = postcard::to_allocvec(&Err::<(), String>("denied".to_string())).unwrap();
+
+        match decode_execution_output("Result<(), String>", &output) {
+            Err(ExecutionFailure::User(err)) => assert_eq!(err, "denied"),
+            other => panic!("expected user error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn decode_execution_output_reports_success_value() {
+        let output = postcard::to_allocvec(&Ok::<u64, String>(42u64)).unwrap();
+
+        let decoded = decode_execution_output("Result<u64, String>", &output).unwrap();
+        assert_eq!(decoded, "42");
     }
 }

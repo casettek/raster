@@ -81,7 +81,7 @@ For RISC0, outputs include journal bytes, optional receipt bytes, cycles, and op
 ### Whole-program execution (`cargo raster run`)
 
 `run` currently supports native backend only and executes the built project binary as a subprocess.
-`#[raster::sequence] fn main(...)` configures runtime behavior:
+`#[raster::sequence] fn main()` configures runtime behavior:
 
 - default: JSON `TraceItem` stream to stdout
 - `--commit <path>`: write packed commitment stream

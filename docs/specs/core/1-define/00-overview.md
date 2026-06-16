@@ -25,7 +25,7 @@ For details, see:
 - **Core types used by authored code**
   - `crates/raster-core/src/lib.rs`
     - `no_std` posture, and which modules only exist with `std`
-    - Re-exports used by macro-generated code (`postcard`, and `linkme` when available)
+    - Re-exports used by macro-generated code (`postcard`)
   - `crates/raster-core/src/tile.rs`
     - `TileId`, `TileMetadata`, and static variants used during registration
   - `crates/raster-core/src/error.rs`
@@ -37,17 +37,17 @@ For details, see:
   - `#[tile(...)]` attribute:
     - Attribute parsing (`TileAttrs::parse`)
     - ABI wrapper generation (`__raster_tile_entry_<fn_name>`)
-    - Optional `#[cfg]`-gated registry registration via distributed slices
+    - Byte-oriented ABI wrapper generation (`__raster_tile_entry_*`)
     - Recursive tile `tile_name!(...)` macro emission (for `recur` tiles only)
   - `#[sequence(...)]` attribute:
     - Call extraction visitor (`TileCallExtractor`) and exclusion list (`is_excluded_function`)
-    - Sequence registration shape (a static list of callee names only)
+    - Sequence wrapper generation for native tracing and `main` entry handling
 
-### Registry/discovery model (host builds)
+### Discovery model (host builds)
 
-- `crates/raster-core/src/registry.rs` (only when `std` and not `target_arch = "riscv32"`)
-  - `TILE_REGISTRY`, `SEQUENCE_REGISTRY`
-  - Lookup helpers: `iter_tiles`, `find_tile_*`, `iter_sequences`, `find_sequence`
+- `crates/raster-compiler/src/sequence.rs`
+  - `SequenceDiscovery` scans parsed source for `#[sequence]` functions
+  - Nested sequence relationships are resolved from extracted call sites
 
 ### Tooling entry selection (convention)
 
@@ -68,7 +68,7 @@ Raster programs are authored against the `raster` crate.
 Feature/target gates that affect what can be imported:
 
 - When the `raster` crate is built **without** the `std` feature, std-only runtime helpers (e.g., tracing subscriber types and `init/finish`) MUST NOT be assumed to exist.
-- When compiling for `target_arch = "riscv32"`, the host registries backed by `linkme` MUST NOT be assumed to exist (they are not compiled on that target). Tooling that relies on registry discovery MUST run in a host build.
+- When compiling for `target_arch = "riscv32"`, host-only tooling modules such as AST discovery and JSON-backed schemas MUST NOT be assumed to exist inside the guest. Tooling that relies on source discovery MUST run in a host build.
 
 ### 2) What annotations exist (macros/attributes)
 
@@ -116,8 +116,9 @@ fn double(x: u64) -> u64 {
 }
 
 #[sequence(description = "Entry sequence")]
-fn main(x: u64) -> u64 {
-    double(x)
+fn main() -> u64 {
+    let x = select!(u64, external!(u64, "x"));
+    call!(double, x)
 }
 ```
 

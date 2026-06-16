@@ -12,8 +12,9 @@ extern crate alloc;
 use alloc::format;
 use alloc::string::String;
 use raster::prelude::*;
+use serde::{Deserialize, Serialize};
 
-use crate::input::PersonalData;
+use crate::input::{CollectiveGreeting, CollectiveGreetingDraftExt, PersonalData};
 
 pub mod input;
 
@@ -26,26 +27,46 @@ pub fn greet(name: String) -> String {
 }
 
 #[tile(kind=iter)]
-pub fn personal_greet(
-    #[external(name = "personal_data")] personal_data: External<PersonalData>,
-) -> String {
-    let greet = format!("Hello, {}!!!!", personal_data.name);
+pub fn personal_greet(name: String) -> String {
+    let greet = format!("Hello, {}!!!!", name);
     debug!("greet: {}", greet);
 
     greet
 }
 
-/// A greeting tile that resolves both committed example inputs:
-/// file-backed `personal_data` and inline `seed`.
 #[tile(kind=iter)]
-pub fn personal_greet_with_seed(
-    #[external(name = "personal_data")] personal_data: External<PersonalData>,
-    #[external(name = "seed")] seed: External<u64>,
-) -> String {
-    let greet = format!("Hello, {}!!!! (seed: {})", personal_data.name, seed);
+pub fn personal_greet_from_object(personal_data: PersonalData) -> String {
+    let greet = format!("Hello from object, {}!!!!", personal_data.name);
+    debug!("object greet: {}", greet);
+
+    greet
+}
+
+/// A greeting tile that resolves both committed postcard-encoded example inputs:
+/// schema-selected `personal_data.name` and `seed`.
+#[tile(kind=iter)]
+pub fn personal_greet_with_seed(name: String, seed: u64) -> String {
+    let greet = format!("Hello, {}!!!! (seed: {})", name, seed);
     debug!("seeded greet: {}", greet);
 
     greet
+}
+
+#[tile(kind=iter)]
+pub fn greet_address_line(address_line: String) -> String {
+    let greet = format!("Address line: {}", address_line);
+    debug!("address line: {}", greet);
+
+    greet
+}
+
+#[tile(kind = iter)]
+pub fn maybe_echo_name(name: String) -> Result<String> {
+    if name.is_empty() {
+        Err(String::from("MissingName"))
+    } else {
+        Ok(name)
+    }
 }
 
 /// A tile that adds emphasis to a message.
@@ -54,6 +75,99 @@ pub fn personal_greet_with_seed(
 #[tile(kind = iter)]
 pub fn exclaim(message: String) -> String {
     format!("{}!!!!", message)
+}
+
+#[tile(kind = iter)]
+pub fn concat_messages(message1: String, message2: String) -> String {
+    format!("{} {}", message1, message2)
+}
+
+#[tile(kind = iter)]
+pub fn set_draft_greeting_title(
+    title: String,
+    draft: Draft<CollectiveGreeting>,
+) -> Draft<CollectiveGreeting> {
+    let mut draft = draft;
+    draft.title().set(title);
+    draft
+}
+
+#[tile(kind = iter)]
+pub fn push_draft_greeting_line(
+    line: String,
+    draft: Draft<CollectiveGreeting>,
+) -> Draft<CollectiveGreeting> {
+    let mut draft = draft;
+    draft.lines().push(line);
+    draft
+}
+
+#[tile(kind = recur)]
+pub fn build_recur_draft_greeting(
+    input: RecurInput<String>,
+    output: RecurOutput<CollectiveGreeting>,
+    title: String,
+) -> RecurOutput<CollectiveGreeting> {
+    let mut output = output;
+    if input.is_first() {
+        output.title().set(title);
+    }
+    output.lines().push(input.into_value());
+    output
+}
+
+/// State returned from a state-only recur tile.
+#[derive(Clone, Debug, Deserialize, Serialize, Selectable)]
+pub struct LineLengthStats {
+    pub max_len: u64,
+}
+
+/// Internal state used by a state+output recur tile.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct GreetingLimitState {
+    pub seen: u64,
+}
+
+/// State-only recur: reduce a list of lines down to a single summary value.
+#[tile(kind = recur)]
+pub fn compute_recur_max_line_len(
+    input: RecurInput<String>,
+    state: RecurState<LineLengthStats>,
+) -> RecurState<LineLengthStats> {
+    let mut state = state;
+    let len = input.value().len() as u64;
+    if len > state.max_len {
+        state.max_len = len;
+    }
+    state
+}
+
+/// State+output recur: use loop-carried state to stop building output early.
+#[tile(kind = recur)]
+pub fn build_limited_recur_greeting(
+    input: RecurInput<String>,
+    state: RecurState<GreetingLimitState>,
+    output: RecurOutput<CollectiveGreeting>,
+    title: String,
+    limit: u64,
+) -> RecurControl<(
+    RecurState<GreetingLimitState>,
+    RecurOutput<CollectiveGreeting>,
+)> {
+    let mut state = state;
+    let mut output = output;
+    if input.is_first() {
+        output.title().set(title);
+    }
+
+    state.seen += 1;
+    output.lines().push(input.into_value());
+
+    if state.seen >= limit {
+        RecurControl::Break((state, output))
+    } else {
+        RecurControl::Continue((state, output))
+    }
 }
 
 #[tile]
@@ -94,7 +208,7 @@ pub fn fibonacci(n: u64) -> u64 {
 ///          count_to(1, 3) -> (false, 2, 3)  
 ///          count_to(2, 3) -> (false, 3, 3)  
 ///          count_to(3, 3) -> (true, 3, 3)   <- done! reached the goal
-#[tile(kind = recur)]
+#[tile(kind = iter)]
 pub fn count_to(current: u64, goal: u64) -> (bool, u64, u64) {
     if current >= goal {
         // Goal reached, we're done

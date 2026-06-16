@@ -100,7 +100,7 @@ This means “prove+verify” is informational today; it does not enforce an “
 
 ### 1b) Trace-commitment auditing (native whole-program runs)
 
-When a program uses `#[raster::sequence] fn main(...)` as its entry point, it can be run in one of three tracing postures:
+When a program uses `#[raster::sequence] fn main()` as its entry point, it can be run in one of three tracing postures:
 
 - Default: stdout JSON subscriber (`raster_runtime::JsonSubscriber`) emits `TraceItem`s.
 - `--commit <path>`: commitment subscriber (`raster_runtime::CommitSubscriber`) writes a packed commitment stream to `path`.

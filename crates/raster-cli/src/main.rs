@@ -54,7 +54,7 @@ enum Commands {
         verify: bool,
     },
 
-    /// List all registered tiles
+    /// List all project tiles
     List,
 
     /// Analyze execution traces
@@ -120,11 +120,11 @@ enum Commands {
         #[arg(long, short, value_enum, default_value = "native")]
         backend: BackendType,
 
-        /// Input as inline JSON or a path to a JSON file
+        /// Input as path to a JSON file
         #[arg(long)]
         input: Option<String>,
 
-        /// Public manifest as inline JSON or a path to a JSON file
+        /// Public manifest as path to a JSON file
         #[arg(long = "input-manifest")]
         input_manifest: Option<String>,
 
@@ -151,7 +151,14 @@ pub enum BackendType {
     Risc0,
 }
 
-fn main() -> Result<()> {
+fn main() {
+    if let Err(err) = try_main() {
+        eprintln!("Runtime error: {}", err);
+        std::process::exit(1);
+    }
+}
+
+fn try_main() -> Result<()> {
     let Cli::Raster(cmd) = Cli::parse();
 
     match cmd {

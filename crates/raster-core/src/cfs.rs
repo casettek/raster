@@ -7,13 +7,13 @@
 //! - Data flow bindings between tiles, sequences, and external inputs
 
 use serde::{Deserialize, Serialize};
-use std::ops::{Deref, DerefMut};
-use std::string::{String, ToString};
-use std::vec::Vec;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
+use core::ops::{Deref, DerefMut};
 
 pub type CfsCoordinate = u32;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CfsCoordinates(pub Vec<CfsCoordinate>);
 
 impl CfsCoordinates {
@@ -94,6 +94,15 @@ impl CfsCursor {
         &self,
         coordinates: &CfsCoordinates,
     ) -> Option<Vec<CfsCoordinates>> {
+        if let Some((site_coordinates, iteration_index)) =
+            self.try_get_recur_iteration_coordinates(coordinates)
+        {
+            let mut next_iteration_coordinates = site_coordinates.clone();
+            next_iteration_coordinates.push(iteration_index + 1);
+
+            return Some(Vec::from([next_iteration_coordinates, site_coordinates]));
+        }
+
         let mut current_coordinates = coordinates.clone();
         loop {
             let (current_sequence, current_item_coordinate) =
@@ -123,7 +132,7 @@ impl CfsCursor {
                             }
                         }
 
-                        return Some(Vec::from([next_coordinates]));
+                        return Some(self.expand_recur_entry_coordinates(next_coordinates));
                     } else if current_item_coordinate as usize == sequence_last_coordinate {
                         let (current_sequence_coordinate, parent_sequence_coordinates) =
                             current_coordinates.split_last().expect("Empty coordinates");
@@ -140,7 +149,7 @@ impl CfsCursor {
                             next_coordinates.push(*current_sequence_coordinate + 1);
 
                             if self.try_get_item(&next_coordinates).is_some() {
-                                return Some(Vec::from([next_coordinates]));
+                                return Some(self.expand_recur_entry_coordinates(next_coordinates));
                             }
 
                             return None;
@@ -163,7 +172,8 @@ impl CfsCursor {
 
                     next_coordinates.push(0);
                     if self.try_get_item(&next_coordinates).is_some() {
-                        next_coordinates_options.push(next_coordinates);
+                        next_coordinates_options
+                            .extend(self.expand_recur_entry_coordinates(next_coordinates));
                     }
 
                     let Some((current_sequence_coordinate, parent_sequence_coordinates)) =
@@ -187,7 +197,8 @@ impl CfsCursor {
                         next_coordinates.push(*current_sequence_coordinate + 1);
 
                         if self.try_get_item(&next_coordinates).is_some() {
-                            next_coordinates_options.push(next_coordinates);
+                            next_coordinates_options
+                                .extend(self.expand_recur_entry_coordinates(next_coordinates));
                         }
                     } else {
                         let mut next_coordinates = current_coordinates.clone();
@@ -210,7 +221,7 @@ impl CfsCursor {
 
         let mut sequence_item_coord: Option<CfsCoordinate> = None;
 
-        for &coord in coords.iter() {
+        for (depth, &coord) in coords.iter().enumerate() {
             let child_item = current_sequence
                 .items
                 .get(coord as usize)
@@ -226,6 +237,15 @@ impl CfsCursor {
                         .expect("Wrong cfs coordinates");
                 }
                 SequenceChildItem::Tile(_tile_item) => {
+                    if depth + 1 != coords.len() {
+                        panic!("Tile coordinates cannot have nested child coordinates");
+                    }
+                    sequence_item_coord = Some(coord);
+                }
+                SequenceChildItem::Recur(_recur_item) => {
+                    if depth + 2 < coords.len() {
+                        panic!("Recur iteration coordinates can only extend by one index");
+                    }
                     sequence_item_coord = Some(coord);
                 }
             }
@@ -235,6 +255,10 @@ impl CfsCursor {
     }
 
     pub fn try_get_item(&self, coordinates: &CfsCoordinates) -> Option<&SequenceChildItem> {
+        if let Some((site_coordinates, _)) = self.try_get_recur_iteration_coordinates(coordinates) {
+            return self.try_get_item(&site_coordinates);
+        }
+
         let mut current_sequence = self.cfs.sequences.get(self.entrypoint_coordinate as usize);
         let mut current_child_item: Option<&SequenceChildItem> = None;
 
@@ -281,6 +305,9 @@ impl CfsCursor {
                     SequenceChildItem::Tile(tile_item) => {
                         SequenceChildId::Tile(tile_item.id.clone())
                     }
+                    SequenceChildItem::Recur(recur_item) => {
+                        SequenceChildId::Recur(recur_item.id.clone())
+                    }
                 };
 
                 id == child_id && index >= parent_current_index as usize
@@ -299,6 +326,7 @@ impl CfsCursor {
                         .map(|item| match item {
                             SequenceChildItem::Sequence(item) => item.id,
                             SequenceChildItem::Tile(item) => item.id,
+                            SequenceChildItem::Recur(item) => item.id,
                         })
                         .collect::<Vec<_>>()
                 )
@@ -312,6 +340,29 @@ impl CfsCursor {
         );
 
         current_coords
+    }
+
+    pub fn try_get_recur_iteration_coordinates(
+        &self,
+        coordinates: &CfsCoordinates,
+    ) -> Option<(CfsCoordinates, CfsCoordinate)> {
+        let (&iteration_index, site_prefix) = coordinates.split_last()?;
+        let site_coordinates = CfsCoordinates(site_prefix.to_vec());
+        matches!(self.try_get_item(&site_coordinates), Some(SequenceChildItem::Recur(_)))
+            .then_some((site_coordinates, iteration_index))
+    }
+
+    fn expand_recur_entry_coordinates(
+        &self,
+        coordinates: CfsCoordinates,
+    ) -> Vec<CfsCoordinates> {
+        if matches!(self.try_get_item(&coordinates), Some(SequenceChildItem::Recur(_))) {
+            let mut iteration_coordinates = coordinates.clone();
+            iteration_coordinates.push(0);
+            Vec::from([coordinates, iteration_coordinates])
+        } else {
+            Vec::from([coordinates])
+        }
     }
 }
 
@@ -386,6 +437,7 @@ pub type TileId = String;
 pub enum SequenceChildId {
     Sequence(SequenceId),
     Tile(TileId),
+    Recur(TileId),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -410,6 +462,7 @@ impl SequenceDef {
             .iter()
             .filter_map(|item| match item {
                 SequenceChildItem::Tile(_) => None,
+                SequenceChildItem::Recur(_) => None,
                 SequenceChildItem::Sequence(sequence) => Some(sequence.clone()),
             })
             .collect()
@@ -420,6 +473,7 @@ impl SequenceDef {
 pub enum SequenceChildItem {
     Sequence(SequenceItem),
     Tile(TileItem),
+    Recur(RecurItem),
 }
 
 impl SequenceChildItem {
@@ -427,6 +481,7 @@ impl SequenceChildItem {
         match self {
             SequenceChildItem::Sequence(sequence_item) => &sequence_item.sources,
             SequenceChildItem::Tile(tile_item) => &tile_item.sources,
+            SequenceChildItem::Recur(recur_item) => &recur_item.sources,
         }
     }
 }
@@ -453,14 +508,27 @@ pub struct TileItem {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct InputBinding {
-    pub source: InputSource,
+pub struct RecurItem {
+    pub id: TileId,
+    pub sources: Vec<InputBinding>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum InputBinding {
+    Direct(InputSource),
+    SequenceScope {
+        input_index: usize,
+    },
+    ProducerOutput {
+        item_index: usize,
+        output_index: usize,
+    },
 }
 
 impl InputBinding {
-    /// Create a binding from an input source.
+    /// Create a binding from a direct semantic source.
     pub fn new(source: InputSource) -> Self {
-        Self { source }
+        Self::Direct(source)
     }
 
     /// Create an external input binding.
@@ -468,37 +536,124 @@ impl InputBinding {
         Self::new(InputSource::External)
     }
 
-    /// Create a sequence input binding.
-    pub fn seq_input(input_index: usize) -> Self {
-        Self::new(InputSource::SeqInput { input_index })
+    /// Create an inline input binding.
+    pub fn inline() -> Self {
+        Self::new(InputSource::Inline)
     }
 
-    /// Create an item output binding.
+    /// Create a direct internal input binding.
+    pub fn internal() -> Self {
+        Self::new(InputSource::Internal)
+    }
+
+    /// Create a sequence-scope binding.
+    pub fn seq_input(input_index: usize) -> Self {
+        Self::SequenceScope { input_index }
+    }
+
+    /// Create a producer-output binding.
     pub fn item_output(item_index: usize, output_index: usize) -> Self {
-        Self::new(InputSource::ItemOutput {
+        Self::ProducerOutput {
             item_index,
             output_index,
-        })
+        }
+    }
+
+    /// Create an internal-store binding sourced from a prior item's committed output.
+    pub fn internal_store(item_index: usize, output_index: usize) -> Self {
+        Self::ProducerOutput {
+            item_index,
+            output_index,
+        }
     }
 }
 
-/// Source of an input value in the data flow schema.
+/// Semantic source of an input value in the data flow schema.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum InputSource {
     /// Input comes from outside the sequence (runtime-provided).
     External,
 
-    /// Input comes from one of the sequence's declared inputs.
-    SeqInput {
-        /// Index of the sequence input (0-based).
-        input_index: usize,
-    },
+    /// Input is materialized inline in the sequence body.
+    Inline,
 
-    /// Input comes from a previous item's output.
-    ItemOutput {
-        /// Index of the item in the sequence (0-based).
-        item_index: usize,
-        /// Index of the output from that item (0-based).
-        output_index: usize,
-    },
+    /// Input is resolved from internal storage.
+    Internal,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::vec;
+
+    fn recur_cursor() -> CfsCursor {
+        CfsCursor::new(ControlFlowSchema {
+            version: "1.0".to_string(),
+            project: "test".to_string(),
+            encoding: "postcard".to_string(),
+            tiles: vec![
+                TileDef::iter("before", 0, 0),
+                TileDef::iter("recur", 0, 0),
+                TileDef::iter("after", 0, 0),
+            ],
+            sequences: vec![SequenceDef {
+                id: "main".to_string(),
+                input_sources: vec![],
+                items: vec![
+                    SequenceChildItem::Tile(TileItem {
+                        id: "before".to_string(),
+                        sources: vec![],
+                    }),
+                    SequenceChildItem::Recur(RecurItem {
+                        id: "recur".to_string(),
+                        sources: vec![],
+                    }),
+                    SequenceChildItem::Tile(TileItem {
+                        id: "after".to_string(),
+                        sources: vec![],
+                    }),
+                ],
+            }],
+        })
+    }
+
+    #[test]
+    fn recur_site_entry_offers_site_and_first_iteration_coordinates() {
+        let cursor = recur_cursor();
+        let next = cursor
+            .try_get_next_coordinates(&CfsCoordinates(vec![0]))
+            .expect("next coordinates should exist");
+
+        assert_eq!(
+            next,
+            vec![CfsCoordinates(vec![1]), CfsCoordinates(vec![1, 0])]
+        );
+    }
+
+    #[test]
+    fn recur_iteration_advances_or_returns_to_site() {
+        let cursor = recur_cursor();
+        let next = cursor
+            .try_get_next_coordinates(&CfsCoordinates(vec![1, 0]))
+            .expect("next coordinates should exist");
+
+        assert_eq!(
+            next,
+            vec![CfsCoordinates(vec![1, 1]), CfsCoordinates(vec![1])]
+        );
+        assert_eq!(
+            cursor.try_get_item(&CfsCoordinates(vec![1, 4])).map(|item| matches!(item, SequenceChildItem::Recur(_))),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn recur_site_completion_moves_to_next_sibling() {
+        let cursor = recur_cursor();
+        let next = cursor
+            .try_get_next_coordinates(&CfsCoordinates(vec![1]))
+            .expect("next coordinates should exist");
+
+        assert_eq!(next, vec![CfsCoordinates(vec![2])]);
+    }
 }

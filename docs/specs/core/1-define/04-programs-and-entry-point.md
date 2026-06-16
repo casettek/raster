@@ -13,8 +13,8 @@ This document specifies how Raster “programs” are defined for the Core toolc
 - **How tiles and sequences become “part of a program” (registration vs source discovery)**
   - `crates/raster-macros/src/lib.rs`
     - `#[tile]`: generates a byte-oriented ABI entry (`__raster_tile_entry_*`) using `postcard::{from_bytes,to_allocvec}`.
-    - `#[sequence]`: registers a sequence ID and a static list of callees extracted from the function body (simple call extraction).
-  - `crates/raster-core/src/registry.rs`: `TILE_REGISTRY`, `SEQUENCE_REGISTRY`, and lookup helpers such as `find_tile_by_str`, `find_sequence`.
+    - `#[sequence]`: generates sequence wrapper code for native tracing and entrypoint handling.
+  - `crates/raster-compiler/src/sequence.rs`: `SequenceDiscovery` discovers sequences from parsed source.
 
 - **How “main” / entry is selected today**
   - `crates/raster-cli/src/main.rs`: `cargo raster preview` defaults `--sequence` to `"main"`.
@@ -41,7 +41,7 @@ This document specifies how Raster “programs” are defined for the Core toolc
   - A set of **sequence definitions** (named compositions that invoke tiles and/or other sequences).
 
 - A program MAY be represented in two (currently coexisting) ways:
-  - **In-process representation (linked program)**: tiles and sequences are present in a Rust binary that links them, and they are discoverable through the global registries (`TILE_REGISTRY`, `SEQUENCE_REGISTRY`) on supported targets.
+  - **In-process representation (linked program)**: tiles and sequences are present in a Rust binary that links them; tiles expose generated ABI wrapper symbols, and sequence functions remain directly callable as Rust functions.
   - **Out-of-process representation (described program)**: tiles and sequences are described by a serialized schema (currently `ControlFlowSchema` / “CFS”), and tile artifacts are stored on disk for backend execution.
 
 - A program MUST treat **IDs** as the primary identity keys:
@@ -66,10 +66,16 @@ This document specifies how Raster “programs” are defined for the Core toolc
 #### External inputs (what they are)
 
 - External inputs are values provided by the execution environment (CLI, host application, test harness) to satisfy:
-  - The **parameters of the entry sequence**, and/or
+  - Explicit external references requested from user code (for example via `external!(...)`), and/or
   - Any **unbound** arguments within a sequence’s call graph (see “Current gaps” for how this is handled today).
 
 - At the Core ABI boundary for tiles, external inputs MUST be represented as an opaque byte string that is decoded using the Postcard encoding (`postcard::from_bytes`).
+
+- The private `input.json` document maps external names to serialized files only. Each value MUST be an object of the form `{ "path": "...", "load_preference": "read|mmap" }`; inline objects, arrays, strings, numbers, and booleans are not valid external payloads.
+
+- Referenced external files MUST contain Postcard-serialized values. The public `input_manifest.json` commitment is the SHA-256 hash of the raw file bytes.
+
+- Selecting a sub-value from a Postcard external requires a typed root binding (for example `external!(RootType, "name")`) so the runtime can decode the root value before applying the selector.
 
 #### External inputs to tiles (tile ABI rules)
 
@@ -89,7 +95,7 @@ Given a tile function \(f\) annotated with `#[tile(...)]`:
 
 - A sequence is a Rust function annotated with `#[sequence]` that is intended to be used as a composition unit.
 - Core currently does not define a byte-level ABI for sequences (there is no generated “sequence entry” wrapper that performs serialization/deserialization).
-- Runners/tools that execute sequences MUST define how sequence parameters are sourced from external inputs.
+- Runners/tools that execute sequences MUST define how explicit external references are sourced from execution inputs.
 
 #### Program packaging (what’s produced today)
 
@@ -189,7 +195,7 @@ These are behaviors that the surrounding toolchain currently does not fully impl
   - As a result, CLI-provided input bytes will only decode successfully if the tile’s input type is compatible with Postcard decoding of `serde_json::Value` (typically: the tile takes `serde_json::Value`), which is not the common authoring style.
 
 - **“main” is a convention only**
-  - Tools default to `--sequence main`, but nothing enforces that a `#[sequence] fn main(...)` exists.
+  - Tools default to `--sequence main`, but nothing enforces that a `#[sequence] fn main()` exists.
   - Example projects may define an entry sequence with a different ID, requiring explicit `--sequence`.
 
 - **Uniqueness and type/arity checks are not enforced**
@@ -209,7 +215,8 @@ fn greet(name: String) -> String {
 }
 
 #[sequence]
-fn main(name: String) -> String {
+fn main() -> String {
+    let name = select!(String, external!(String, "name"));
     greet(name)
 }
 ```

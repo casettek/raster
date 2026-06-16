@@ -15,11 +15,6 @@ This document describes the tile authoring rules and the tile ABI contract as im
   - `crates/raster-core/src/tile.rs` (`TileId`, `TileMetadata`, and their `*_Static` forms)
   - `crates/raster-core/src/error.rs` (`Error::Serialization` and propagation behavior)
   - `crates/raster-core/src/lib.rs` (re-export of `postcard` and `no_std`/`alloc` posture)
-- **Host-side registry (std-only, non-RISC-V)**
-  - `crates/raster-core/src/registry.rs`
-    - `TileEntryFn` signature (`fn(&[u8]) -> Result<Vec<u8>>`)
-    - `TileRegistration::execute`
-    - `TILE_REGISTRY` distributed slice + `find_tile_by_str`
 - **Compiler-side discovery and representation**
   - `crates/raster-compiler/src/ast.rs`
     - `ProjectAst` + `CallInfo` extraction (parsed via `syn`)
@@ -32,6 +27,7 @@ This document describes the tile authoring rules and the tile ABI contract as im
     - Note: `outputs` is currently only `0` or `1` (no tuple/multi-output arity detection), and there is no per-call recursion marker in CFS today.
 - **zkVM integration (RISC0)**
   - `crates/raster-backend-risc0/src/guest_builder.rs`
+    - Imports and calls the generated tile ABI wrapper directly by symbol name
     - Guest `main` reads `u32` length then raw input bytes
     - Guest calls the tile ABI wrapper directly and commits the raw output bytes
   - `crates/raster-backend-risc0/src/risc0.rs`
@@ -86,8 +82,8 @@ For every `#[tile(...)] fn <name>(...) -> ...` declaration, the macro generates 
 
 This wrapper is the cross-backend execution entry point:
 
-- Host registry execution (`TileRegistration::execute`) calls this wrapper.
-- RISC0 guest programs call this wrapper directly.
+- Host-side runners call this wrapper directly.
+- RISC0 guest programs import and call this wrapper directly.
 
 ### Input encoding
 

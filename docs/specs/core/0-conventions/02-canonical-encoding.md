@@ -17,7 +17,6 @@ Where the current codebase does not fully enforce the desired properties (e.g. d
   - **Macro-generated ABI wrapper**: `crates/raster-macros/src/lib.rs` (`#[tile]` emits `__raster_tile_entry_<name>`)
     - `postcard::from_bytes(input)` for decoding tile parameters
     - `postcard::to_allocvec(&result)` for encoding tile return value
-  - **Registry ABI surface**: `crates/raster-core/src/registry.rs` (`TileEntryFn = fn(&[u8]) -> Result<Vec<u8>>`)
   - **Core re-exports**: `crates/raster-core/src/lib.rs` (`pub use postcard;`)
 - **External input handling**
   - **CFS “external” bindings**: `crates/raster-core/src/cfs.rs` (`InputSource::External`)

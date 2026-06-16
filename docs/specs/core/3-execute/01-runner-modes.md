@@ -141,7 +141,7 @@ Native mode means “execute without a zkVM” and without proof generation.
 
 - **`NativeBackend::execute_tile` is a stub.**
   - It returns an empty output and a simulated cycle count (default: 1000) in estimate mode.
-  - It does not call into the tile registry to run the tile.
+  - It does not call the generated tile ABI wrapper to run the tile.
 
 #### Trace behavior
 
@@ -159,11 +159,20 @@ The following pattern matches the current ABI implementation (postcard-encoded i
 ```rust
 use raster::prelude::*;
 
+#[tile]
+fn my_tile(x: u64) -> u64 { x * 2 }
+
 fn main() {
-    let tile = find_tile_by_str("my_tile").expect("tile not found");
     let input = raster::core::postcard::to_allocvec(&123u64).unwrap();
-    let output_bytes = tile.execute(&input).unwrap();
-    let output: u64 = raster::core::postcard::from_bytes(&output_bytes).unwrap();
+    let envelope_bytes = __raster_tile_entry_my_tile(&input).unwrap();
+    let envelope: raster::core::TileOutputEnvelope =
+        raster::core::postcard::from_bytes(&envelope_bytes).unwrap();
+    let output = match envelope {
+        raster::core::TileOutputEnvelope::Success(bytes) => {
+            raster::core::postcard::from_bytes::<u64>(&bytes).unwrap()
+        }
+        raster::core::TileOutputEnvelope::UserError { display, .. } => panic!("{display}"),
+    };
     println!("output = {output}");
 }
 ```

@@ -1,11 +1,17 @@
 # Hello Tiles Example
 
-A minimal example demonstrating tile, sequence, and external input usage.
+A minimal example demonstrating tile, sequence, schema-driven selection DSL, and file-backed committed externals.
+
+The entrypoint uses `#[sequence] fn main()` and follows a two-step external flow:
+`external!(...)` creates a binding, then `select!(SelectedType, ...)` resolves either a nested field
+or the whole value passed into a tile.
 
 ## Structure
 
 - `greet`: Creates a greeting from a string
-- `personal_greet`: Resolves `PersonalData` from an external postcard file
+- `personal_greet`: Selects `personal_data.name` with `select!(String, external!(PersonalData, "personal_data").name)`
+- `personal_greet_from_object`: Resolves a file-backed `PersonalData` via `select!(PersonalData, external!(PersonalData, "personal_data_bin"))`
+- `greet_address_line`: Selects `personal_data_bin.addresses[0].lines[0]` from postcard-backed structured data
 - `greet_sequence`: Chains tiles and nested sequences
 - `bin/gen_input.rs`: Generates `personal_data.bin`, `input.json`, and `input_manifest.json`
 

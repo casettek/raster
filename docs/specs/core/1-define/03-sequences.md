@@ -8,11 +8,7 @@ This document defines **sequences**: author-authored, ordered compositions of ti
   - `crates/raster-macros/src/lib.rs`
     - `#[proc_macro_attribute] pub fn sequence(...)`
     - `TileCallExtractor` and `is_excluded_function(...)`
-    - What it registers: a `SequenceRegistration` containing **only** an ordered `&[&str]` list of call names.
-- **Runtime registry shape**
-  - `crates/raster-core/src/registry.rs`
-    - `SequenceMetadataStatic`, `SequenceRegistration`, `SEQUENCE_REGISTRY`
-    - `iter_sequences()`, `find_sequence(...)`
+    - What it generates: wrapper code for sequence invocation/tracing.
 - **Compiler-time sequence discovery (bindings + args)**
   - `crates/raster-compiler/src/ast.rs`
     - `ProjectAst::new(...)` (walks `src/**/*.rs`, parses with `syn`)
@@ -22,7 +18,7 @@ This document defines **sequences**: author-authored, ordered compositions of ti
 - **Compiler-time dataflow binding resolution**
   - `crates/raster-compiler/src/flow_resolver.rs`
     - `FlowResolver::resolve(...)`
-    - `resolve_argument(...)` mapping to `InputSource::{SeqInput, ItemOutput, External}`
+    - `resolve_argument(...)` mapping to `InputBinding::{SequenceScope, ProducerOutput, Direct(..)}`
     - Item classification: `item_type` becomes `"tile"` vs `"sequence"` based on discovered IDs.
 - **CFS representation of sequences**
   - `crates/raster-core/src/cfs.rs`
@@ -77,12 +73,11 @@ As implemented today, a call contributes a `CallInfo` (and therefore can become 
 
 Calls are collected in source order and become a linear list of items after filtering to only those callees that match a discovered tile or sequence.
 
-#### 2.3 Runtime registry vs compiler discovery (important distinction)
+#### 2.3 Wrapper generation vs compiler discovery (important distinction)
 
-The `#[sequence]` proc-macro registers sequences in the runtime `SEQUENCE_REGISTRY` with an ordered list of callee names. This registry list:
+The `#[sequence]` proc-macro is responsible for making the sequence callable as a Rust function and for injecting native tracing/entrypoint behavior.
 
-- MUST be treated as **best-effort metadata** suitable for host-side introspection and “preview” workflows.
-- MUST NOT be treated as the source of truth for compilation, because it does not include bindings, argument sources, or nested-sequence structure.
+It is **not** the source of truth for sequence compilation metadata.
 
 The compiler’s CFS builder derives sequence items from the parsed project AST and extracted `CallInfo`s, and then resolves dataflow in `crates/raster-compiler/src/flow_resolver.rs`.
 
@@ -95,7 +90,7 @@ In the current codebase, this corresponds to:
 
 ### 3) Binding model and dataflow
 
-This section defines how sequence parameters and intermediate results are bound into the CFS. It matches the current compiler implementation.
+This section defines how sequence parameters and intermediate results are bound into the CFS. It matches the current compiler implementation after the semantic-source cleanup: the semantic source kinds are `External`, `Internal`, and `Inline`, while sequence-scope and prior-item references are represented as explicit binding forms.
 
 #### 3.1 Sequence inputs (parameters)
 
@@ -110,7 +105,7 @@ As implemented today:
 In the emitted CFS:
 
 - `SequenceDef.input_sources` MUST contain one `InputBinding::external()` per sequence parameter, in parameter order.
-- References to sequence parameters inside item arguments MUST resolve to `InputSource::SeqInput { input_index }` (0-based parameter index).
+- References to sequence parameters inside item arguments MUST resolve to `InputBinding::SequenceScope { input_index }` (0-based parameter index).
 
 #### 3.2 Result bindings from `let` statements
 
@@ -134,16 +129,17 @@ Each call’s arguments are recorded as a list of strings captured from the pars
 
 For each argument string `arg`, input-source resolution proceeds as follows:
 
-- If `arg` exactly matches a sequence parameter name, it MUST resolve to `InputSource::SeqInput { input_index }`.
-- Else if `arg` exactly matches a previously-recorded `let` binding name, it MUST resolve to `InputSource::ItemOutput { item_index, output_index }`.
+- If `arg` exactly matches a sequence parameter name, it MUST resolve to `InputBinding::SequenceScope { input_index }`.
+- Else if `arg` exactly matches a previously-recorded `let` binding name, it MUST resolve to `InputBinding::ProducerOutput { item_index, output_index }`.
   - `output_index` is currently always `0` (single-output assumption; see “Gaps and divergences”).
-- Otherwise, it MUST resolve to `InputSource::External`.
+  - At runtime/proof time, a `ProducerOutput` binding is satisfied by resolving the producing item's execution coordinates through the authenticated internal-store coordinate index, then checking the referenced append-log entry in the incremental internal-store frontier.
+- Otherwise, it MUST resolve to `InputBinding::external()`.
 
 Implications:
 
 - Arguments SHOULD be written as bare identifiers that refer either to a sequence parameter or to a prior `let` binding.
-- Literal arguments (e.g. `0`, `"hi"`) and complex expressions (e.g. `x + 1`) are currently treated as `External` inputs in the CFS.
-- Arguments that are macro expressions (e.g., `vec![1, 2]`) are captured as strings but will typically not resolve to `seq_input`/`item_output`, so they also fall back to `External`.
+- Literal arguments (e.g. `0`, `"hi"`) and complex expressions (e.g. `x + 1`) are currently treated as direct `External` inputs in the CFS.
+- Arguments that are macro expressions (e.g., `vec![1, 2]`) are captured as strings but will typically not resolve to `SequenceScope`/`ProducerOutput`, so they also fall back to direct `External`.
 
 ### 4) Item typing: tile vs nested sequence
 
@@ -182,7 +178,7 @@ fn exclaim(s: String) -> String {
 }
 
 #[sequence(description = "Greet and add punctuation")]
-fn main(name: String) -> String {
+fn greet_sequence(name: String) -> String {
     let greeting = greet(name);
     exclaim(greeting)
 }
@@ -190,8 +186,8 @@ fn main(name: String) -> String {
 
 Expected CFS-level dataflow:
 
-- `greet(name)` consumes `SeqInput[0]`
-- `exclaim(greeting)` consumes `ItemOutput(item_index=0, output_index=0)`
+- `greet(name)` consumes `SequenceScope { input_index = 0 }`
+- `exclaim(greeting)` consumes `ProducerOutput { item_index = 0, output_index = 0 }`
 
 #### 7.2 Nested sequences (sequence calling another sequence)
 

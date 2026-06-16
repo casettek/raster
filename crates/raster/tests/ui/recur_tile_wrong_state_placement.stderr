@@ -1,0 +1,7 @@
+error: custom attribute panicked
+  --> tests/ui/recur_tile_wrong_state_placement.rs:14:1
+   |
+14 | #[tile(kind = recur)]
+   | ^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: message: `#[tile(kind = recur)]` tiles must place `state: RecurState<S>` before `output: RecurOutput<T>`

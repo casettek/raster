@@ -24,10 +24,8 @@ Use this section as the “map” from spec concepts to code locations.
 
 - **Tile macro and ABI wrapper generation**
   - `crates/raster-macros/src/lib.rs` (`#[tile]`: generates `__raster_tile_entry_<name>(input: &[u8]) -> Result<Vec<u8>>`)
-- **Sequence macro (registration only; not full control-flow)**
-  - `crates/raster-macros/src/lib.rs` (`#[sequence]`: registers ordered tile *names* extracted from AST)
-- **Registries**
-  - `crates/raster-core/src/registry.rs` (link-time distributed slices via `linkme`; not available on `riscv32`)
+- **Sequence macro wrapper generation**
+  - `crates/raster-macros/src/lib.rs` (`#[sequence]`: generates sequence wrapper code for tracing and entrypoint handling)
 - **Tile identity/metadata types**
   - `crates/raster-core/src/tile.rs` (`TileId`, `TileMetadata`, static variants)
 
@@ -67,7 +65,7 @@ Use this section as the “map” from spec concepts to code locations.
 ### A.6 Existing docs
 
 - `README.md` (workspace crate breakdown + stated design principles)
-- `docs/architecture.md` (artifact layout, backend overview, registry overview)
+- `docs/architecture.md` (artifact layout, backend overview)
 - `PROGRAM_STRUCTURE.md` (broader intended semantics; exceeds what current code enforces)
 
 ---
@@ -91,9 +89,9 @@ Raster Core code and generated code is not uniformly available on all targets:
 
 - `raster-core` is `no_std` at the crate level (`#![no_std]`) and uses `alloc`.
 - `raster-core` modules `cfs`, `manifest`, `schema`, and `trace` are **only available when the `std` feature is enabled**.
-- `raster-core::registry` is only available when `std` is enabled **and** the target is **not** `riscv32` (because the current registry mechanism uses `linkme`).
+- Host-side discovery and JSON-backed tooling types are only available when `std` is enabled.
 
-These constraints matter because zkVM guests commonly target `riscv32`, so host-only features (registry + JSON-bearing types) may be unavailable inside guests.
+These constraints matter because zkVM guests commonly target `riscv32`, so host-only features (source discovery + JSON-bearing types) may be unavailable inside guests.
 
 ---
 

@@ -1,0 +1,5 @@
+{
+  "personal_data": { "type": "sha256", "commitment": "856324b6f4169ea4901ccbc81b7c5c289aa74a100eda8f8c508f7782c7331e95" },
+  "personal_data_bin": { "type": "sha256", "commitment": "856324b6f4169ea4901ccbc81b7c5c289aa74a100eda8f8c508f7782c7331e95" },
+  "seed": { "type": "sha256", "commitment": "021fb596db81e6d02bf3d2586ee3981fe519f275c0ac9ca76bbcf2ebb4097d96" }
+}

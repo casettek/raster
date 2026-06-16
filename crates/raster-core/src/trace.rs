@@ -1,14 +1,16 @@
 //! Trace types (requires std feature).
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
-use std::hash::Hash;
-use std::ops::{Deref, DerefMut};
-use std::string::String;
-use std::vec::Vec;
+use alloc::collections::BTreeMap;
+use alloc::string::String;
+use alloc::vec::Vec;
+use core::hash::Hash;
+use core::ops::{Deref, DerefMut};
 
 use crate::cfs::CfsCoordinates;
+use crate::draft::DraftTransitionWitness;
 use crate::fingerprint::Fingerprint;
+use crate::input::{SelectedPayload, SelectorPath};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct FnInputArg {
@@ -22,18 +24,36 @@ pub struct FnInputArg {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct FnInput {
     pub data: Vec<u8>,
+    pub values: Vec<FnInputValue>,
     pub args: Vec<FnInputArg>,
     pub external: ExternalInput,
+    pub internal: InternalInput,
 }
 
 pub type InternalBindingName = String;
-pub type ExternalInput = BTreeMap<InternalBindingName, ExternalBinding>;
+pub type ExternalInput = BTreeMap<InternalBindingName, ExternalData>;
+pub type InternalInput = BTreeMap<InternalBindingName, InternalData>;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub struct ExternalBinding {
+pub struct ExternalData {
     pub name: String,
-    pub data: Vec<u8>,
     pub commitment: Vec<u8>,
+    pub tree_root: Vec<u8>,
+    pub selector: SelectorPath,
+    pub selected: SelectedPayload,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct InternalData {
+    pub coordinates: CfsCoordinates,
+    pub commitment: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum FnInputValue {
+    Inline(Vec<u8>),
+    ExternalBinding,
+    InternalBinding,
 }
 
 impl FnInput {
@@ -45,8 +65,25 @@ impl FnInput {
         &self.args
     }
 
+    pub fn values(&self) -> &[FnInputValue] {
+        &self.values
+    }
+
     pub fn external(&self) -> &ExternalInput {
         &self.external
+    }
+
+    pub fn internal(&self) -> &InternalInput {
+        &self.internal
+    }
+
+    pub fn source_witness_bytes(&self) -> Vec<u8> {
+        postcard::to_allocvec(&(
+            self.values.clone(),
+            self.external.clone(),
+            self.internal.clone(),
+        ))
+        .unwrap_or_default()
     }
 }
 
@@ -82,6 +119,7 @@ pub struct FnCallRecord {
     pub fn_name: String,
     pub input: Option<FnInput>,
     pub output: Option<FnOutput>,
+    pub draft_transition_witness: Option<DraftTransitionWitness>,
 }
 
 impl FnCallRecord {
@@ -106,9 +144,36 @@ pub struct TileExecRecord {
     pub coordinates: CfsCoordinates,
 
     pub input_commitment: Vec<u8>,
+    pub input_source_commitment: Vec<u8>,
     pub output_commitment: Vec<u8>,
 
     pub external_input_commitment: Vec<u8>,
+    pub internal_store_root_before: Vec<u8>,
+    pub internal_store_root_after: Vec<u8>,
+    pub internal_store_index_root_before: Vec<u8>,
+    pub internal_store_index_root_after: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct RecurExecRecord {
+    pub exec_index: u64,
+
+    pub recur_id: String,
+
+    pub sequence_id: String,
+    pub intra_sequence_index: u32,
+
+    pub coordinates: CfsCoordinates,
+
+    pub input_commitment: Vec<u8>,
+    pub input_source_commitment: Vec<u8>,
+    pub output_commitment: Vec<u8>,
+
+    pub external_input_commitment: Vec<u8>,
+    pub internal_store_root_before: Vec<u8>,
+    pub internal_store_root_after: Vec<u8>,
+    pub internal_store_index_root_before: Vec<u8>,
+    pub internal_store_index_root_after: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -120,6 +185,7 @@ pub struct SequenceStartRecord {
     pub coordinates: CfsCoordinates,
 
     pub input_commitment: Vec<u8>,
+    pub input_source_commitment: Vec<u8>,
     pub external_input_commitment: Vec<u8>,
 }
 
@@ -139,15 +205,81 @@ pub enum StepRecord {
     SequenceStart(SequenceStartRecord),
     SequenceEnd(SequenceEndRecord),
     TileExec(TileExecRecord),
+    RecurExec(RecurExecRecord),
 }
 
 impl StepRecord {
     pub fn coordinates(&self) -> &CfsCoordinates {
         match self {
             StepRecord::TileExec(tile_exec_record) => &tile_exec_record.coordinates,
+            StepRecord::RecurExec(recur_exec_record) => &recur_exec_record.coordinates,
             StepRecord::SequenceStart(sequence_start_record) => &sequence_start_record.coordinates,
             StepRecord::SequenceEnd(sequence_end_record) => &sequence_end_record.coordinates,
         }
+    }
+
+    pub fn input_commitment(&self) -> Option<&Vec<u8>> {
+        match self {
+            StepRecord::TileExec(record) => Some(&record.input_commitment),
+            StepRecord::RecurExec(record) => Some(&record.input_commitment),
+            StepRecord::SequenceStart(record) => Some(&record.input_commitment),
+            StepRecord::SequenceEnd(_) => None,
+        }
+    }
+
+    pub fn output_commitment(&self) -> Option<&Vec<u8>> {
+        match self {
+            StepRecord::TileExec(record) => Some(&record.output_commitment),
+            StepRecord::RecurExec(record) => Some(&record.output_commitment),
+            StepRecord::SequenceStart(_) => None,
+            StepRecord::SequenceEnd(record) => Some(&record.output_commitment),
+        }
+    }
+
+    pub fn input_source_commitment(&self) -> Option<&Vec<u8>> {
+        match self {
+            StepRecord::TileExec(record) => Some(&record.input_source_commitment),
+            StepRecord::RecurExec(record) => Some(&record.input_source_commitment),
+            StepRecord::SequenceStart(record) => Some(&record.input_source_commitment),
+            StepRecord::SequenceEnd(_) => None,
+        }
+    }
+
+    pub fn external_input_commitment(&self) -> Option<&Vec<u8>> {
+        match self {
+            StepRecord::TileExec(record) => Some(&record.external_input_commitment),
+            StepRecord::RecurExec(record) => Some(&record.external_input_commitment),
+            StepRecord::SequenceStart(record) => Some(&record.external_input_commitment),
+            StepRecord::SequenceEnd(_) => None,
+        }
+    }
+
+    pub fn internal_store_roots(
+        &self,
+    ) -> Option<(&Vec<u8>, &Vec<u8>, &Vec<u8>, &Vec<u8>)> {
+        match self {
+            StepRecord::TileExec(record) => Some((
+                &record.internal_store_root_before,
+                &record.internal_store_root_after,
+                &record.internal_store_index_root_before,
+                &record.internal_store_index_root_after,
+            )),
+            StepRecord::RecurExec(record) => Some((
+                &record.internal_store_root_before,
+                &record.internal_store_root_after,
+                &record.internal_store_index_root_before,
+                &record.internal_store_index_root_after,
+            )),
+            StepRecord::SequenceStart(_) | StepRecord::SequenceEnd(_) => None,
+        }
+    }
+
+    pub fn is_execution_step(&self) -> bool {
+        matches!(self, StepRecord::TileExec(_) | StepRecord::RecurExec(_))
+    }
+
+    pub fn requires_replay_proof(&self) -> bool {
+        matches!(self, StepRecord::TileExec(_))
     }
 }
 
@@ -176,7 +308,7 @@ impl DerefMut for Trace {
 
 impl IntoIterator for Trace {
     type Item = StepRecord;
-    type IntoIter = std::vec::IntoIter<StepRecord>;
+    type IntoIter = alloc::vec::IntoIter<StepRecord>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.0.into_iter()
@@ -202,4 +334,6 @@ pub enum TraceEvent {
     SequenceEnd(FnCallRecord),
 
     TileExec(FnCallRecord),
+    RecurTileExec(FnCallRecord),
+    RecurExec(FnCallRecord),
 }
