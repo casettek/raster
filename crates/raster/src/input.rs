@@ -7,9 +7,9 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 #[cfg(not(feature = "std"))]
 use alloc::format;
-use raster_core::draft::{replay_handle_for_schema, DraftReplayHandle, DraftReplayTransition};
 #[cfg(not(feature = "std"))]
 use raster_core::draft::{draft_value_from_serialize, DraftOp};
+use raster_core::draft::{replay_handle_for_schema, DraftReplayHandle, DraftReplayTransition};
 pub use raster_core::input::{
     verify_selection_proof, AuthValue, ExternalEncoding, ExternalRef, ExternalSelection,
     ExternalValue, InternalRef, InternalValue, ListProofDirection, ListProofSibling, Op, Schema,
@@ -418,7 +418,9 @@ fn record_replay_set<S: Schema, Value: Serialize>(
             field
         )));
     }
-    replay_state.fields.push((field.into(), ReplayDraftFieldValue::Set));
+    replay_state
+        .fields
+        .push((field.into(), ReplayDraftFieldValue::Set));
     replay_state.ops.push(DraftOp::Set {
         field: field.into(),
         value: draft_value_from_serialize(value)?,
@@ -440,7 +442,11 @@ fn record_replay_push<S: Schema, Value: Serialize>(
         )));
     }
     let replay_state = draft.replay_state_mut();
-    match replay_state.fields.iter_mut().find(|(name, _)| name == field) {
+    match replay_state
+        .fields
+        .iter_mut()
+        .find(|(name, _)| name == field)
+    {
         Some((_, ReplayDraftFieldValue::Set)) => {
             return Err(raster_core::Error::Other(format!(
                 "Draft field '{}' is not appendable",
@@ -513,7 +519,9 @@ where
 
 #[cfg(feature = "std")]
 #[doc(hidden)]
-pub fn begin_draft_transition_capture<S>(draft: &Draft<S>) -> Option<raster_runtime::DraftCaptureSnapshot>
+pub fn begin_draft_transition_capture<S>(
+    draft: &Draft<S>,
+) -> Option<raster_runtime::DraftCaptureSnapshot>
 where
     S: Schema,
 {

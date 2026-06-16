@@ -1,11 +1,11 @@
 //! Trace types (requires std feature).
 
-use serde::{Deserialize, Serialize};
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::hash::Hash;
 use core::ops::{Deref, DerefMut};
+use serde::{Deserialize, Serialize};
 
 use crate::cfs::CfsCoordinates;
 use crate::draft::DraftTransitionWitness;
@@ -254,9 +254,7 @@ impl StepRecord {
         }
     }
 
-    pub fn internal_store_roots(
-        &self,
-    ) -> Option<(&Vec<u8>, &Vec<u8>, &Vec<u8>, &Vec<u8>)> {
+    pub fn internal_store_roots(&self) -> Option<(&Vec<u8>, &Vec<u8>, &Vec<u8>, &Vec<u8>)> {
         match self {
             StepRecord::TileExec(record) => Some((
                 &record.internal_store_root_before,

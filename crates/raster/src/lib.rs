@@ -71,6 +71,30 @@ pub mod __private {
     #[cfg(not(feature = "std"))]
     pub fn emit_debug(_: core::fmt::Arguments<'_>) {}
 
+    #[cfg(feature = "std")]
+    pub type ProfileInstant = std::time::Instant;
+
+    #[cfg(feature = "std")]
+    pub fn profile_now() -> ProfileInstant {
+        std::time::Instant::now()
+    }
+
+    #[cfg(not(feature = "std"))]
+    #[derive(Clone, Copy)]
+    pub struct ProfileInstant;
+
+    #[cfg(not(feature = "std"))]
+    impl ProfileInstant {
+        pub fn elapsed(&self) -> core::time::Duration {
+            core::time::Duration::from_secs(0)
+        }
+    }
+
+    #[cfg(not(feature = "std"))]
+    pub fn profile_now() -> ProfileInstant {
+        ProfileInstant
+    }
+
     #[doc(hidden)]
     pub struct SequenceScopeGuard;
 
@@ -151,6 +175,62 @@ pub mod __private {
     }
 
     #[cfg(feature = "std")]
+    pub fn begin_sequence_profile(sequence_id: &str) {
+        raster_runtime::begin_sequence_profile(sequence_id);
+    }
+
+    #[cfg(not(feature = "std"))]
+    pub fn begin_sequence_profile(_: &str) {}
+
+    #[cfg(feature = "std")]
+    pub fn finish_sequence_profile(sequence_id: &str, total_duration_ns: u64) {
+        raster_runtime::finish_sequence_profile(sequence_id, total_duration_ns);
+    }
+
+    #[cfg(not(feature = "std"))]
+    pub fn finish_sequence_profile(_: &str, _: u64) {}
+
+    #[cfg(feature = "std")]
+    pub fn record_tile_profile(
+        tile_id: &str,
+        coordinates: crate::core::cfs::CfsCoordinates,
+        total_duration_ns: u64,
+        user_duration_ns: u64,
+        external_input_resolve_ns: u64,
+        internal_input_resolve_ns: u64,
+        trace_serialize_ns: u64,
+        draft_capture_ns: u64,
+    ) {
+        raster_runtime::record_tile_profile(
+            tile_id,
+            coordinates,
+            total_duration_ns,
+            user_duration_ns,
+            raster_runtime::TileProfileOverheadBreakdown {
+                external_input_resolve_ns,
+                internal_input_resolve_ns,
+                output_store_ns: 0,
+                trace_serialize_ns,
+                draft_capture_ns,
+                other_wrapper_ns: 0,
+            },
+        );
+    }
+
+    #[cfg(not(feature = "std"))]
+    pub fn record_tile_profile(
+        _: &str,
+        _: crate::core::cfs::CfsCoordinates,
+        _: u64,
+        _: u64,
+        _: u64,
+        _: u64,
+        _: u64,
+        _: u64,
+    ) {
+    }
+
+    #[cfg(feature = "std")]
     pub fn publish_tile_output_coordinates(coordinates: crate::core::cfs::CfsCoordinates) {
         raster_runtime::publish_pending_output_coordinates(coordinates);
     }
@@ -220,9 +300,14 @@ pub mod __private {
     where
         T: serde::Serialize + serde::de::DeserializeOwned + 'static,
     {
-        let reference = raster_runtime::store_execution_output_value(&result).unwrap_or_else(|error| {
-            panic!("Failed to store tile output in internal storage: {}", error)
-        });
+        let output_store_start = profile_now();
+        let reference =
+            raster_runtime::store_execution_output_value(&result).unwrap_or_else(|error| {
+                panic!("Failed to store tile output in internal storage: {}", error)
+            });
+        let output_store_duration_ns =
+            u64::try_from(output_store_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        raster_runtime::record_tile_output_store_profile(output_store_duration_ns);
         crate::into_auth_ref::<T, _>(crate::typed_internal::<T>(reference))
     }
 
@@ -238,9 +323,14 @@ pub mod __private {
     where
         T: serde::Serialize + serde::de::DeserializeOwned + 'static,
     {
-        let reference = raster_runtime::store_execution_output_value(&result).unwrap_or_else(|error| {
-            panic!("Failed to store tile output in internal storage: {}", error)
-        });
+        let output_store_start = profile_now();
+        let reference =
+            raster_runtime::store_execution_output_value(&result).unwrap_or_else(|error| {
+                panic!("Failed to store tile output in internal storage: {}", error)
+            });
+        let output_store_duration_ns =
+            u64::try_from(output_store_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        raster_runtime::record_tile_output_store_profile(output_store_duration_ns);
         match result {
             Ok(_) => Ok(crate::into_auth_ref::<T, _>(
                 crate::typed_internal_with_resolver::<T>(

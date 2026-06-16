@@ -24,7 +24,7 @@ impl<'ast> Sequence<'ast> {
 pub enum SequenceStep<'ast> {
     Tile(&'ast Tile<'ast>), // Reference to tile
     Recur(&'ast Tile<'ast>),
-    Sequence(String),       // Sequence name (resolved later if needed)
+    Sequence(String), // Sequence name (resolved later if needed)
 }
 
 #[derive(Debug, Clone)]

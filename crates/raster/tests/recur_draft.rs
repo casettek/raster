@@ -525,8 +525,8 @@ fn recur_trace_serializes_non_reusable_draft_markers() {
         Some(FnInputValue::Inline(bytes)) => bytes.clone(),
         other => panic!("expected traced output draft marker, found {:?}", other),
     };
-    let replay_handle: DraftReplayHandle =
-        raster::core::postcard::from_bytes(&draft_bytes).expect("draft trace should encode replay handle");
+    let replay_handle: DraftReplayHandle = raster::core::postcard::from_bytes(&draft_bytes)
+        .expect("draft trace should encode replay handle");
 
     assert!(raster::core::postcard::from_bytes::<Draft<LineBundle>>(&draft_bytes).is_err());
     assert_eq!(replay_handle.schema_hash, LineBundle::schema_hash());
@@ -551,8 +551,8 @@ fn recur_trace_threads_verified_roots_between_steps() {
             Some(FnInputValue::Inline(bytes)) => bytes.clone(),
             other => panic!("expected traced draft replay handle, found {:?}", other),
         };
-        let handle: DraftReplayHandle =
-            raster::core::postcard::from_bytes(&handle_bytes).expect("draft handle should deserialize");
+        let handle: DraftReplayHandle = raster::core::postcard::from_bytes(&handle_bytes)
+            .expect("draft handle should deserialize");
         let witness = record
             .draft_transition_witness
             .expect("tile trace should include draft witness");
@@ -587,6 +587,12 @@ fn recur_trace_emits_site_completion_event() {
 
     assert_eq!(site_events.len(), 1);
     let site_event = &site_events[0];
-    assert!(site_event.input.is_some(), "recur site should capture input trace");
-    assert!(site_event.output.is_some(), "recur site should capture finalized output");
+    assert!(
+        site_event.input.is_some(),
+        "recur site should capture input trace"
+    );
+    assert!(
+        site_event.output.is_some(),
+        "recur site should capture finalized output"
+    );
 }

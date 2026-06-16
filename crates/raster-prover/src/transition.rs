@@ -58,30 +58,30 @@ fn build_transition_input(
         .unwrap_or_else(|| panic!("Missing recorded I/O for transition step {:?}", step_record));
 
     if step_record.requires_replay_proof() {
-            let Some(replay_result) = replayed_results.get(step_record) else {
-                panic!(
-                    "Replayed result not found for transition step {:?}",
-                    step_record
-                );
-            };
+        let Some(replay_result) = replayed_results.get(step_record) else {
+            panic!(
+                "Replayed result not found for transition step {:?}",
+                step_record
+            );
+        };
 
-            TransitionInput {
-                step_record: step_record.clone(),
-                authorization_image_id: authorization_guest_image_id(),
-                replay_image_id: Some(replay_result.image_id.clone()),
-                replay_journal: Some(replay_result.replay_journal.clone()),
-                input_witness,
-                output_witness,
-                input_source_witness,
-                sequence_scope_witness,
-                external_input,
-                internal_store_witness,
-                draft_transition_witness,
-                authorization_journal: authorization_journal.clone(),
-                input_sources_witnesses: input_sources_witnesses.clone(),
-            }
-        } else {
-            TransitionInput {
+        TransitionInput {
+            step_record: step_record.clone(),
+            authorization_image_id: authorization_guest_image_id(),
+            replay_image_id: Some(replay_result.image_id.clone()),
+            replay_journal: Some(replay_result.replay_journal.clone()),
+            input_witness,
+            output_witness,
+            input_source_witness,
+            sequence_scope_witness,
+            external_input,
+            internal_store_witness,
+            draft_transition_witness,
+            authorization_journal: authorization_journal.clone(),
+            input_sources_witnesses: input_sources_witnesses.clone(),
+        }
+    } else {
+        TransitionInput {
             step_record: step_record.clone(),
             authorization_image_id: authorization_guest_image_id(),
             replay_image_id: None,
@@ -95,7 +95,7 @@ fn build_transition_input(
             draft_transition_witness,
             authorization_journal: authorization_journal.clone(),
             input_sources_witnesses: input_sources_witnesses.clone(),
-            }
+        }
     }
 }
 

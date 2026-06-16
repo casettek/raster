@@ -1,26 +1,261 @@
 use crate::metrics::Metrics;
+use crate::metrics::{SequenceMetrics, TileMetrics};
 use raster_core::Result;
+use raster_runtime::{ExecutionProfile, ProfileRecord};
+use std::fs;
+use std::path::Path;
 
 /// Analyzes execution traces to extract performance metrics.
-pub struct Analyzer {}
+pub struct Analyzer {
+    profile: ExecutionProfile,
+}
 
 impl Analyzer {
-    pub fn new() -> Self {
-        Self {}
+    pub fn new(profile: ExecutionProfile) -> Self {
+        Self { profile }
     }
 
-    /// Analyze a trace and produce metrics.
+    pub fn from_path(path: impl AsRef<Path>) -> Result<Self> {
+        let profile = Self::load_profile(path)?;
+        Ok(Self::new(profile))
+    }
+
+    pub fn load_profile(path: impl AsRef<Path>) -> Result<ExecutionProfile> {
+        let path = path.as_ref();
+        let bytes = fs::read(path).map_err(raster_core::Error::Io)?;
+        serde_json::from_slice(&bytes).map_err(|error| {
+            raster_core::Error::Serialization(format!(
+                "Failed to decode execution profile '{}': {}",
+                path.display(),
+                error
+            ))
+        })
+    }
+
+    /// Analyze an execution profile and produce metrics.
     pub fn analyze(&self) -> Result<Metrics> {
-        // TODO: Implement trace analysis
-        // - Calculate tile execution times
-        // - Identify bottlenecks
-        // - Estimate zkVM costs
-        Ok(Metrics::default())
+        let mut metrics = Metrics {
+            total_duration_ns: self.profile.program_total_duration_ns.unwrap_or_default(),
+            program_total_known: self.profile.program_total_duration_ns.is_some(),
+            ..Metrics::default()
+        };
+
+        for record in &self.profile.records {
+            ingest_record(&mut metrics, record);
+        }
+
+        finalize_tile_averages(&mut metrics.tile_metrics);
+        finalize_sequence_averages(&mut metrics.sequence_metrics);
+
+        Ok(metrics)
     }
 }
 
 impl Default for Analyzer {
     fn default() -> Self {
-        Self::new()
+        Self::new(ExecutionProfile::new(Vec::new(), None))
+    }
+}
+
+fn ingest_record(metrics: &mut Metrics, record: &ProfileRecord) {
+    match record {
+        ProfileRecord::Tile(record) => ingest_tile_record(metrics, record),
+        ProfileRecord::Sequence(record) => ingest_sequence_record(metrics, record),
+    }
+}
+
+fn ingest_tile_record(metrics: &mut Metrics, record: &raster_runtime::TileProfileRecord) {
+    metrics.total_tile_duration_ns = metrics
+        .total_tile_duration_ns
+        .saturating_add(record.total_duration_ns);
+    metrics.total_tile_user_duration_ns = metrics
+        .total_tile_user_duration_ns
+        .saturating_add(record.user_duration_ns);
+    metrics.total_tile_raster_overhead_ns = metrics
+        .total_tile_raster_overhead_ns
+        .saturating_add(record.raster_overhead_ns);
+    metrics.total_tile_external_input_resolve_ns = metrics
+        .total_tile_external_input_resolve_ns
+        .saturating_add(record.external_input_resolve_ns);
+    metrics.total_tile_internal_input_resolve_ns = metrics
+        .total_tile_internal_input_resolve_ns
+        .saturating_add(record.internal_input_resolve_ns);
+    metrics.total_tile_output_store_ns = metrics
+        .total_tile_output_store_ns
+        .saturating_add(record.output_store_ns);
+    metrics.total_tile_trace_serialize_ns = metrics
+        .total_tile_trace_serialize_ns
+        .saturating_add(record.trace_serialize_ns);
+    metrics.total_tile_draft_capture_ns = metrics
+        .total_tile_draft_capture_ns
+        .saturating_add(record.draft_capture_ns);
+    metrics.total_tile_other_wrapper_ns = metrics
+        .total_tile_other_wrapper_ns
+        .saturating_add(record.other_wrapper_ns);
+
+    let tile_metrics = metrics
+        .tile_metrics
+        .entry(raster_core::tile::TileId::new(record.tile_id.clone()))
+        .or_default();
+    tile_metrics.invocations += 1;
+    tile_metrics.total_duration_ns = tile_metrics
+        .total_duration_ns
+        .saturating_add(record.total_duration_ns);
+    tile_metrics.total_user_duration_ns = tile_metrics
+        .total_user_duration_ns
+        .saturating_add(record.user_duration_ns);
+    tile_metrics.total_raster_overhead_ns = tile_metrics
+        .total_raster_overhead_ns
+        .saturating_add(record.raster_overhead_ns);
+    tile_metrics.total_external_input_resolve_ns = tile_metrics
+        .total_external_input_resolve_ns
+        .saturating_add(record.external_input_resolve_ns);
+    tile_metrics.total_internal_input_resolve_ns = tile_metrics
+        .total_internal_input_resolve_ns
+        .saturating_add(record.internal_input_resolve_ns);
+    tile_metrics.total_output_store_ns = tile_metrics
+        .total_output_store_ns
+        .saturating_add(record.output_store_ns);
+    tile_metrics.total_trace_serialize_ns = tile_metrics
+        .total_trace_serialize_ns
+        .saturating_add(record.trace_serialize_ns);
+    tile_metrics.total_draft_capture_ns = tile_metrics
+        .total_draft_capture_ns
+        .saturating_add(record.draft_capture_ns);
+    tile_metrics.total_other_wrapper_ns = tile_metrics
+        .total_other_wrapper_ns
+        .saturating_add(record.other_wrapper_ns);
+}
+
+fn ingest_sequence_record(metrics: &mut Metrics, record: &raster_runtime::SequenceProfileRecord) {
+    metrics.total_sequence_self_duration_ns = metrics
+        .total_sequence_self_duration_ns
+        .saturating_add(record.self_duration_ns);
+
+    let sequence_metrics = metrics
+        .sequence_metrics
+        .entry(record.sequence_id.clone())
+        .or_default();
+    sequence_metrics.invocations += 1;
+    sequence_metrics.total_duration_ns = sequence_metrics
+        .total_duration_ns
+        .saturating_add(record.total_duration_ns);
+    sequence_metrics.total_self_duration_ns = sequence_metrics
+        .total_self_duration_ns
+        .saturating_add(record.self_duration_ns);
+    sequence_metrics.total_child_duration_ns = sequence_metrics
+        .total_child_duration_ns
+        .saturating_add(record.child_duration_ns);
+}
+
+fn finalize_tile_averages(
+    tile_metrics: &mut std::collections::HashMap<raster_core::tile::TileId, TileMetrics>,
+) {
+    for metrics in tile_metrics.values_mut() {
+        if metrics.invocations == 0 {
+            continue;
+        }
+        metrics.avg_duration_ns = metrics.total_duration_ns / metrics.invocations;
+        metrics.avg_user_duration_ns = metrics.total_user_duration_ns / metrics.invocations;
+        metrics.avg_raster_overhead_ns = metrics.total_raster_overhead_ns / metrics.invocations;
+        metrics.avg_external_input_resolve_ns =
+            metrics.total_external_input_resolve_ns / metrics.invocations;
+        metrics.avg_internal_input_resolve_ns =
+            metrics.total_internal_input_resolve_ns / metrics.invocations;
+        metrics.avg_output_store_ns = metrics.total_output_store_ns / metrics.invocations;
+        metrics.avg_trace_serialize_ns = metrics.total_trace_serialize_ns / metrics.invocations;
+        metrics.avg_draft_capture_ns = metrics.total_draft_capture_ns / metrics.invocations;
+        metrics.avg_other_wrapper_ns = metrics.total_other_wrapper_ns / metrics.invocations;
+    }
+}
+
+fn finalize_sequence_averages(
+    sequence_metrics: &mut std::collections::HashMap<String, SequenceMetrics>,
+) {
+    for metrics in sequence_metrics.values_mut() {
+        if metrics.invocations == 0 {
+            continue;
+        }
+        metrics.avg_duration_ns = metrics.total_duration_ns / metrics.invocations;
+        metrics.avg_self_duration_ns = metrics.total_self_duration_ns / metrics.invocations;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use raster_runtime::{
+        ExecutionProfile, ProfileRecord, SequenceProfileRecord, TileProfileRecord,
+    };
+
+    #[test]
+    fn aggregates_tile_and_sequence_metrics() {
+        let profile = ExecutionProfile::new(
+            vec![
+                ProfileRecord::Tile(TileProfileRecord {
+                    invocation_index: 1,
+                    tile_id: "alpha".to_string(),
+                    depth: 1,
+                    coordinates: raster_core::cfs::CfsCoordinates(vec![0]),
+                    total_duration_ns: 20,
+                    user_duration_ns: 12,
+                    raster_overhead_ns: 8,
+                    external_input_resolve_ns: 3,
+                    internal_input_resolve_ns: 1,
+                    output_store_ns: 2,
+                    trace_serialize_ns: 1,
+                    draft_capture_ns: 0,
+                    other_wrapper_ns: 1,
+                }),
+                ProfileRecord::Tile(TileProfileRecord {
+                    invocation_index: 2,
+                    tile_id: "alpha".to_string(),
+                    depth: 1,
+                    coordinates: raster_core::cfs::CfsCoordinates(vec![1]),
+                    total_duration_ns: 10,
+                    user_duration_ns: 6,
+                    raster_overhead_ns: 4,
+                    external_input_resolve_ns: 1,
+                    internal_input_resolve_ns: 0,
+                    output_store_ns: 1,
+                    trace_serialize_ns: 1,
+                    draft_capture_ns: 1,
+                    other_wrapper_ns: 0,
+                }),
+                ProfileRecord::Sequence(SequenceProfileRecord {
+                    invocation_index: 3,
+                    sequence_id: "main".to_string(),
+                    depth: 0,
+                    total_duration_ns: 40,
+                    self_duration_ns: 10,
+                    child_duration_ns: 30,
+                }),
+            ],
+            Some(40),
+        );
+
+        let analyzer = Analyzer::new(profile);
+        let metrics = analyzer.analyze().unwrap();
+
+        let tile_metrics = metrics
+            .tile_metrics
+            .get(&raster_core::tile::TileId::from("alpha"))
+            .unwrap();
+        assert_eq!(metrics.total_duration_ns, 40);
+        assert_eq!(metrics.total_tile_duration_ns, 30);
+        assert_eq!(metrics.total_tile_user_duration_ns, 18);
+        assert_eq!(metrics.total_tile_raster_overhead_ns, 12);
+        assert_eq!(metrics.total_tile_external_input_resolve_ns, 4);
+        assert_eq!(metrics.total_tile_internal_input_resolve_ns, 1);
+        assert_eq!(metrics.total_tile_output_store_ns, 3);
+        assert_eq!(tile_metrics.invocations, 2);
+        assert_eq!(tile_metrics.avg_duration_ns, 15);
+        assert_eq!(tile_metrics.avg_user_duration_ns, 9);
+        assert_eq!(tile_metrics.avg_raster_overhead_ns, 6);
+        assert_eq!(tile_metrics.avg_output_store_ns, 1);
+
+        let sequence_metrics = metrics.sequence_metrics.get("main").unwrap();
+        assert_eq!(sequence_metrics.total_self_duration_ns, 10);
+        assert_eq!(sequence_metrics.total_child_duration_ns, 30);
     }
 }

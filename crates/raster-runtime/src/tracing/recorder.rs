@@ -1,8 +1,8 @@
 use raster_core::cfs::{CfsCoordinates, CfsCursor, ControlFlowSchema, SequenceChildId};
 use raster_core::draft::DraftTransitionWitness;
 use raster_core::trace::{
-    ExternalInput, FnInput, InternalInput, RecurExecRecord, SequenceEndRecord,
-    SequenceStartRecord, StepRecord, TileExecRecord, TraceEvent,
+    ExternalInput, FnInput, InternalInput, RecurExecRecord, SequenceEndRecord, SequenceStartRecord,
+    StepRecord, TileExecRecord, TraceEvent,
 };
 use sha2::{Digest, Sha256};
 

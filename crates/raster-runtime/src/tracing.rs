@@ -27,12 +27,18 @@ pub fn init() {
 /// This function should be called once at the start of your program.
 /// Subsequent calls will have no effect.
 pub fn init_with<P: Publisher + 'static>(publisher: P) {
-    let _ = GLOBAL_PUBLISHER.set(Box::new(publisher));
+    if GLOBAL_PUBLISHER.get().is_none() {
+        crate::profiling::init_from_env();
+        let _ = GLOBAL_PUBLISHER.set(Box::new(publisher));
+    }
 }
 
 pub fn finish() {
     if let Some(publisher) = GLOBAL_PUBLISHER.get() {
         publisher.finish();
+    }
+    if let Err(error) = crate::profiling::finish() {
+        panic!("Failed to write Raster execution profile: {}", error);
     }
 }
 

@@ -6,10 +6,10 @@
 //! - All sequences and their item composition
 //! - Data flow bindings between tiles, sequences, and external inputs
 
-use serde::{Deserialize, Serialize};
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::ops::{Deref, DerefMut};
+use serde::{Deserialize, Serialize};
 
 pub type CfsCoordinate = u32;
 
@@ -348,15 +348,18 @@ impl CfsCursor {
     ) -> Option<(CfsCoordinates, CfsCoordinate)> {
         let (&iteration_index, site_prefix) = coordinates.split_last()?;
         let site_coordinates = CfsCoordinates(site_prefix.to_vec());
-        matches!(self.try_get_item(&site_coordinates), Some(SequenceChildItem::Recur(_)))
-            .then_some((site_coordinates, iteration_index))
+        matches!(
+            self.try_get_item(&site_coordinates),
+            Some(SequenceChildItem::Recur(_))
+        )
+        .then_some((site_coordinates, iteration_index))
     }
 
-    fn expand_recur_entry_coordinates(
-        &self,
-        coordinates: CfsCoordinates,
-    ) -> Vec<CfsCoordinates> {
-        if matches!(self.try_get_item(&coordinates), Some(SequenceChildItem::Recur(_))) {
+    fn expand_recur_entry_coordinates(&self, coordinates: CfsCoordinates) -> Vec<CfsCoordinates> {
+        if matches!(
+            self.try_get_item(&coordinates),
+            Some(SequenceChildItem::Recur(_))
+        ) {
             let mut iteration_coordinates = coordinates.clone();
             iteration_coordinates.push(0);
             Vec::from([coordinates, iteration_coordinates])
@@ -642,7 +645,9 @@ mod tests {
             vec![CfsCoordinates(vec![1, 1]), CfsCoordinates(vec![1])]
         );
         assert_eq!(
-            cursor.try_get_item(&CfsCoordinates(vec![1, 4])).map(|item| matches!(item, SequenceChildItem::Recur(_))),
+            cursor
+                .try_get_item(&CfsCoordinates(vec![1, 4]))
+                .map(|item| matches!(item, SequenceChildItem::Recur(_))),
             Some(true)
         );
     }

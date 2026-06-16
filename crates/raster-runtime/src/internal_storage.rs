@@ -441,7 +441,9 @@ impl SequenceExecutionContext {
         } else {
             self.stack
                 .last()
-                .ok_or_else(|| Error::Other("Internal-store writes require active sequence context".into()))?
+                .ok_or_else(|| {
+                    Error::Other("Internal-store writes require active sequence context".into())
+                })?
                 .coordinates
                 .clone()
         };
@@ -512,9 +514,8 @@ where
     S: Schema,
 {
     let schema = S::schema();
-    let coordinates = THREAD_SEQUENCE_CONTEXT.with(|context| {
-        context.borrow_mut().reserve_synthetic_coordinates()
-    })?;
+    let coordinates = THREAD_SEQUENCE_CONTEXT
+        .with(|context| context.borrow_mut().reserve_synthetic_coordinates())?;
     let anchor = anchor_for_schema(&coordinates, S::schema_hash());
     let current_root = draft_root(&schema, &BTreeMap::new(), false)?;
     THREAD_DRAFT_STORAGE.with(|drafts| {
@@ -709,9 +710,8 @@ fn store_internal_value_at_coordinates<T: Serialize>(
 }
 
 pub fn store_internal_value<T: Serialize>(value: &T) -> Result<InternalRef> {
-    let coordinates = THREAD_SEQUENCE_CONTEXT.with(|context| {
-        context.borrow_mut().reserve_synthetic_coordinates()
-    })?;
+    let coordinates = THREAD_SEQUENCE_CONTEXT
+        .with(|context| context.borrow_mut().reserve_synthetic_coordinates())?;
     store_internal_value_at_coordinates(value, coordinates)
 }
 
@@ -742,9 +742,8 @@ pub struct TileExecutionScopeGuard {
 
 impl TileExecutionScopeGuard {
     pub fn enter() -> Result<Self> {
-        let coordinates = THREAD_SEQUENCE_CONTEXT.with(|context| {
-            context.borrow_mut().reserve_execution_coordinates()
-        })?;
+        let coordinates = THREAD_SEQUENCE_CONTEXT
+            .with(|context| context.borrow_mut().reserve_execution_coordinates())?;
         THREAD_ACTIVE_EXECUTION_COORDINATES.with(|active| {
             active.borrow_mut().push(coordinates.clone());
         });

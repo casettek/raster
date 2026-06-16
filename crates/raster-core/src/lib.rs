@@ -13,9 +13,9 @@ extern crate alloc;
 #[cfg(feature = "std")]
 extern crate std;
 
-pub mod error;
 pub mod cfs;
 pub mod draft;
+pub mod error;
 pub mod fingerprint;
 pub mod input;
 pub mod tile;

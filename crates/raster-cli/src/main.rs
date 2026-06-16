@@ -59,8 +59,20 @@ enum Commands {
 
     /// Analyze execution traces
     Analyze {
-        /// Path to trace file (optional, uses most recent if not specified)
-        trace_path: Option<String>,
+        /// Path to profile file (optional, uses most recent if not specified)
+        profile_path: Option<String>,
+
+        /// Follow a live NDJSON profile stream (optional path, uses default if omitted)
+        #[arg(long, num_args = 0..=1, default_missing_value = "__default__")]
+        follow: Option<String>,
+
+        /// Refresh interval for follow mode, in milliseconds
+        #[arg(long, default_value_t = 500)]
+        refresh_ms: u64,
+
+        /// Report output format
+        #[arg(long, value_enum, default_value = "text")]
+        format: AnalyzeFormat,
     },
 
     /// Initialize a new Raster project
@@ -139,7 +151,17 @@ enum Commands {
         /// Read and verify trace from file (mutually exclusive with --commit)
         #[arg(long)]
         verbose: bool,
+
+        /// Write a live profile stream (optional path, uses default if omitted)
+        #[arg(long = "profile-stream", num_args = 0..=1, default_missing_value = "__default__")]
+        profile_stream: Option<String>,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum AnalyzeFormat {
+    Text,
+    Json,
 }
 
 /// Available backends for compilation and execution.
@@ -171,7 +193,12 @@ fn try_main() -> Result<()> {
             verify,
         } => commands::tile::run_tile::run_tile(backend, &tile, input.as_deref(), prove, verify),
         Commands::List => commands::tile::list_tile::list_tiles(),
-        Commands::Analyze { trace_path } => commands::analyze(trace_path),
+        Commands::Analyze {
+            profile_path,
+            follow,
+            refresh_ms,
+            format,
+        } => commands::analyze(profile_path, follow, refresh_ms, format),
         Commands::Init { name } => commands::init(name),
         // Commands::Preview { sequence, input, gpu } => {
         //     commands::preview(&sequence, input.as_deref(), gpu)
@@ -191,6 +218,7 @@ fn try_main() -> Result<()> {
             commit,
             audit,
             verbose,
+            profile_stream,
         } => commands::run::run(
             backend,
             input.as_deref(),
@@ -198,6 +226,7 @@ fn try_main() -> Result<()> {
             commit.as_deref(),
             audit.as_deref(),
             verbose,
+            profile_stream.as_deref(),
         ),
     }
 }

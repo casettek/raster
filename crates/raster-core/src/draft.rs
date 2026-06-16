@@ -175,13 +175,19 @@ impl Serializer for DraftValueSerializer {
         Ok(DraftValue::U64(value))
     }
     fn serialize_f32(self, _value: f32) -> DraftSerdeResult<Self::Ok> {
-        Err(DraftSerdeError("f32 is not supported by draft transitions".into()))
+        Err(DraftSerdeError(
+            "f32 is not supported by draft transitions".into(),
+        ))
     }
     fn serialize_f64(self, _value: f64) -> DraftSerdeResult<Self::Ok> {
-        Err(DraftSerdeError("f64 is not supported by draft transitions".into()))
+        Err(DraftSerdeError(
+            "f64 is not supported by draft transitions".into(),
+        ))
     }
     fn serialize_char(self, _value: char) -> DraftSerdeResult<Self::Ok> {
-        Err(DraftSerdeError("char is not supported by draft transitions".into()))
+        Err(DraftSerdeError(
+            "char is not supported by draft transitions".into(),
+        ))
     }
     fn serialize_str(self, value: &str) -> DraftSerdeResult<Self::Ok> {
         Ok(DraftValue::String(value.into()))
@@ -418,7 +424,8 @@ impl SerializeStructVariant for DraftVariantStructSerializer {
 }
 
 pub fn draft_value_from_serialize<T: Serialize>(value: &T) -> Result<DraftValue> {
-    value.serialize(DraftValueSerializer)
+    value
+        .serialize(DraftValueSerializer)
         .map_err(|e| Error::Serialization(format!("Failed to serialize draft value: {}", e)))
 }
 
@@ -479,7 +486,11 @@ fn list_root_from_hashes(hashes: &[Vec<u8>]) -> Vec<u8> {
         }
         let mut next = Vec::with_capacity(level.len() / 2);
         for pair in level.chunks(2) {
-            next.push(selection_hash(&[b"list-node", pair[0].as_slice(), pair[1].as_slice()]));
+            next.push(selection_hash(&[
+                b"list-node",
+                pair[0].as_slice(),
+                pair[1].as_slice(),
+            ]));
         }
         level = next;
     }
@@ -690,7 +701,9 @@ pub fn draft_tree_from_witness(
     Ok(DraftValue::Struct(values))
 }
 
-pub fn witness_fields_map(fields: &[(String, DraftFieldValue)]) -> BTreeMap<String, DraftFieldValue> {
+pub fn witness_fields_map(
+    fields: &[(String, DraftFieldValue)],
+) -> BTreeMap<String, DraftFieldValue> {
     fields.iter().cloned().collect()
 }
 
@@ -738,15 +751,17 @@ pub fn apply_draft_ops(
                     alloc::collections::btree_map::Entry::Vacant(entry) => {
                         entry.insert(DraftFieldValue::Append(vec![value.clone()]));
                     }
-                    alloc::collections::btree_map::Entry::Occupied(mut entry) => match entry.get_mut() {
-                        DraftFieldValue::Append(values) => values.push(value.clone()),
-                        DraftFieldValue::Set(_) => {
-                            return Err(Error::Other(format!(
-                                "Draft field '{}' is not appendable",
-                                field
-                            )))
+                    alloc::collections::btree_map::Entry::Occupied(mut entry) => {
+                        match entry.get_mut() {
+                            DraftFieldValue::Append(values) => values.push(value.clone()),
+                            DraftFieldValue::Set(_) => {
+                                return Err(Error::Other(format!(
+                                    "Draft field '{}' is not appendable",
+                                    field
+                                )))
+                            }
                         }
-                    },
+                    }
                 }
             }
         }
@@ -774,7 +789,10 @@ pub fn verify_witness_root(witness: &DraftStateWitness, expected_root: &DraftRoo
     Ok(())
 }
 
-pub fn replay_handle_for_schema<S: Schema>(draft_id: DraftId, root_before: DraftRoot) -> DraftReplayHandle {
+pub fn replay_handle_for_schema<S: Schema>(
+    draft_id: DraftId,
+    root_before: DraftRoot,
+) -> DraftReplayHandle {
     DraftReplayHandle {
         draft_id,
         schema_hash: S::schema_hash(),

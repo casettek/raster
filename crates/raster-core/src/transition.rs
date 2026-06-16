@@ -4,8 +4,8 @@
 //! They live in raster-core to avoid circular dependencies (guest cannot depend on prover).
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::vec::Vec;
 
 use crate::authorization::AuthorizationJournal;

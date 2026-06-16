@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
+use raster_analysis::{Analyzer, Report};
 use raster_backend::{Backend, ExecutionMode};
 use raster_backend_risc0::Risc0Backend;
 
@@ -38,6 +39,7 @@ use raster_prover::trace::{
 use raster_prover::transition::step_transitions;
 use raster_runtime::{TraceRecorder, TRACE_EVENT_PREFIX};
 
+use crate::commands::{default_profile_path, default_profile_stream_path};
 use crate::utils::authorization::{build_manifested_inputs, collect_external_input_commitments};
 use crate::BackendType;
 
@@ -48,6 +50,7 @@ pub fn run(
     commit_flag: Option<&str>,
     audit_flag: Option<&str>,
     verbose: bool,
+    profile_stream: Option<&str>,
 ) -> Result<()> {
     if backend_type != BackendType::Native {
         return Err(Error::Other(
@@ -93,8 +96,41 @@ pub fn run(
     println!("Running {}...", &project.name);
     println!();
 
+    let profile_path = default_profile_path();
+    let profile_stream_path = profile_stream.map(|raw| {
+        if raw.is_empty() || raw == "__default__" {
+            default_profile_stream_path()
+        } else {
+            PathBuf::from(raw)
+        }
+    });
+    if let Some(parent) = profile_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if profile_path.exists() {
+        std::fs::remove_file(&profile_path)?;
+    }
+    if let Some(stream_path) = &profile_stream_path {
+        if let Some(parent) = stream_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        if stream_path.exists() {
+            std::fs::remove_file(stream_path)?;
+        }
+    }
+
     let mut cmd = Command::new(&binary_path);
     cmd.current_dir(&project.root_dir);
+    cmd.env(raster_runtime::PROFILE_PATH_ENV, &profile_path);
+    if let Some(stream_path) = &profile_stream_path {
+        cmd.env(raster_runtime::PROFILE_STREAM_PATH_ENV, stream_path);
+        println!("Live profile stream enabled: {}", stream_path.display());
+        println!(
+            "Follow with: cargo raster analyze --follow {}",
+            stream_path.display()
+        );
+        println!();
+    }
     if let Some(input_json) = input {
         cmd.args(["--input", input_json]);
     }
@@ -130,8 +166,10 @@ pub fn run(
         for line in stdout_reader.lines() {
             if let Ok(line_str) = line {
                 if let Some(raw_event) = line_str.strip_prefix(TRACE_EVENT_PREFIX) {
-                    let trace_event = serde_json::from_str::<TraceEvent>(raw_event)
-                        .unwrap_or_else(|error| panic!("Failed to decode trace event: {error}: {raw_event}"));
+                    let trace_event =
+                        serde_json::from_str::<TraceEvent>(raw_event).unwrap_or_else(|error| {
+                            panic!("Failed to decode trace event: {error}: {raw_event}")
+                        });
                     let step_record = {
                         let mut trace_recorder = stdout_trace_recorder.lock().unwrap();
                         trace_recorder.record(trace_event)
@@ -324,6 +362,16 @@ pub fn run(
                 }
             }
         }
+    }
+
+    if profile_path.exists() {
+        println!();
+        println!("Execution profile saved to: {}", profile_path.display());
+        let analyzer = Analyzer::from_path(&profile_path)?;
+        let metrics = analyzer.analyze()?;
+        let report = Report::new(metrics);
+        println!();
+        println!("{}", report.to_text());
     }
 
     Ok(())

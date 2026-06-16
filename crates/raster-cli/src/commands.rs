@@ -4,7 +4,8 @@ pub mod tile;
 
 use crate::utils::encode::{decode_execution_output, encode_input};
 
-use crate::BackendType;
+use crate::{AnalyzeFormat, BackendType};
+use raster_analysis::{Analyzer, Report};
 use raster_backend::{Backend, ExecutionFailure, ExecutionMode};
 use raster_backend_native::NativeBackend;
 use raster_backend_risc0::Risc0Backend;
@@ -14,11 +15,15 @@ use raster_core::{Error, Result};
 
 use raster_compiler::Project;
 use raster_compiler::{Builder, CfsBuilder};
+use raster_runtime::{ExecutionProfile, ProfileRecord, ProfileStreamEvent};
 
 use raster_compiler::backend::BackendImpl;
 use std::env;
 use std::fs;
+use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
+use std::thread;
+use std::time::Duration;
 
 /// Get the output directory for artifacts.
 fn output_dir() -> PathBuf {
@@ -26,6 +31,14 @@ fn output_dir() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("."))
         .join("target")
         .join("raster")
+}
+
+pub(crate) fn default_profile_path() -> PathBuf {
+    output_dir().join("profiles").join("latest.json")
+}
+
+pub(crate) fn default_profile_stream_path() -> PathBuf {
+    output_dir().join("profiles").join("latest.ndjson")
 }
 
 /// Get the project path (current directory).
@@ -106,16 +119,139 @@ pub fn build(backend_type: BackendType, tile: Option<String>) -> Result<()> {
     Ok(())
 }
 
-/// Analyze command: analyze execution traces.
-pub fn analyze(trace_path: Option<String>) -> Result<()> {
-    match trace_path {
-        Some(path) => println!("Analyzing trace: {}", path),
-        None => println!("Analyzing most recent trace..."),
+/// Analyze command: analyze execution profiles.
+pub fn analyze(
+    profile_path: Option<String>,
+    follow: Option<String>,
+    refresh_ms: u64,
+    format: AnalyzeFormat,
+) -> Result<()> {
+    if let Some(stream_path) = follow {
+        return follow_profile_stream(resolve_stream_path(stream_path), refresh_ms, format);
     }
+
+    let profile_path = profile_path
+        .map(PathBuf::from)
+        .unwrap_or_else(default_profile_path);
+    println!("Analyzing profile: {}", profile_path.display());
     println!();
-    println!("Trace analysis not yet implemented.");
-    // TODO: Implement trace analysis
+
+    let analyzer = Analyzer::from_path(&profile_path)?;
+    let metrics = analyzer.analyze()?;
+    let report = Report::new(metrics);
+    println!("{}", render_report(&report, format)?);
+
     Ok(())
+}
+
+fn resolve_stream_path(raw_path: String) -> PathBuf {
+    if raw_path.is_empty() || raw_path == "__default__" {
+        default_profile_stream_path()
+    } else {
+        PathBuf::from(raw_path)
+    }
+}
+
+fn render_report(report: &Report, format: AnalyzeFormat) -> Result<String> {
+    match format {
+        AnalyzeFormat::Text => Ok(report.to_text()),
+        AnalyzeFormat::Json => report.to_json(),
+    }
+}
+
+fn follow_profile_stream(path: PathBuf, refresh_ms: u64, format: AnalyzeFormat) -> Result<()> {
+    println!("Following profile stream: {}", path.display());
+    println!();
+
+    let mut reader = loop {
+        match fs::File::open(&path) {
+            Ok(file) => break BufReader::new(file),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                thread::sleep(Duration::from_millis(refresh_ms.max(50)));
+            }
+            Err(error) => return Err(raster_core::Error::Io(error)),
+        }
+    };
+
+    let mut profile = ExecutionProfile::new(Vec::new(), None);
+    let mut saw_finish = false;
+    let mut dirty = true;
+
+    loop {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) => {
+                if dirty {
+                    redraw_live_report(&profile, format)?;
+                    dirty = false;
+                }
+                if saw_finish {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(refresh_ms.max(50)));
+            }
+            Ok(_) => {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let event: ProfileStreamEvent = serde_json::from_str(trimmed).map_err(|error| {
+                    raster_core::Error::Serialization(format!(
+                        "Failed to decode profile stream event '{}': {}",
+                        trimmed, error
+                    ))
+                })?;
+                saw_finish |= apply_stream_event(&mut profile, event);
+                dirty = true;
+            }
+            Err(error) => return Err(raster_core::Error::Io(error)),
+        }
+    }
+
+    Ok(())
+}
+
+fn redraw_live_report(profile: &ExecutionProfile, format: AnalyzeFormat) -> Result<()> {
+    let analyzer = Analyzer::new(profile.clone());
+    let metrics = analyzer.analyze()?;
+    let report = Report::new(metrics);
+    print!("\x1B[2J\x1B[H");
+    println!("{}", render_report(&report, format)?);
+    std::io::stdout().flush().map_err(raster_core::Error::Io)?;
+    Ok(())
+}
+
+fn apply_stream_event(profile: &mut ExecutionProfile, event: ProfileStreamEvent) -> bool {
+    match event {
+        ProfileStreamEvent::RunStarted { .. } => false,
+        ProfileStreamEvent::Record(record) => {
+            profile.records.push(record);
+            false
+        }
+        ProfileStreamEvent::TileOutputStore {
+            invocation_index,
+            output_store_ns,
+        } => {
+            if let Some(ProfileRecord::Tile(record)) = profile
+                .records
+                .iter_mut()
+                .rev()
+                .find(|record| matches!(record, ProfileRecord::Tile(tile) if tile.invocation_index == invocation_index))
+            {
+                record.total_duration_ns = record.total_duration_ns.saturating_add(output_store_ns);
+                record.raster_overhead_ns = record.raster_overhead_ns.saturating_add(output_store_ns);
+                record.output_store_ns = record.output_store_ns.saturating_add(output_store_ns);
+            }
+            false
+        }
+        ProfileStreamEvent::RunFinished {
+            program_total_duration_ns,
+            ..
+        } => {
+            profile.program_total_duration_ns = program_total_duration_ns;
+            true
+        }
+    }
 }
 
 /// Init command: initialize a new Raster project.
@@ -230,7 +366,10 @@ pub fn run_sequence(
                 }
             }
             FlattenedStep::Recur(tile) => {
-                println!("  Recur tile '{}' is not supported in preview mode", tile.function.name);
+                println!(
+                    "  Recur tile '{}' is not supported in preview mode",
+                    tile.function.name
+                );
             }
             FlattenedStep::Sequence(seq) => {
                 println!("  Entering sequence '{}'...", seq.function.name);

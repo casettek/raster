@@ -8,6 +8,7 @@
 mod external_storage;
 pub mod input;
 mod internal_storage;
+pub mod profiling;
 mod raster_index;
 pub mod tracing;
 pub use input::{
@@ -18,15 +19,21 @@ pub use internal_storage::{
     apply_draft_push, apply_draft_set, begin_draft_step_capture, create_draft,
     enter_recur_site_scope, enter_sequence_scope, exit_recur_site_scope, exit_sequence_scope,
     finalize_draft, finalize_empty_draft, finish_draft_step_capture,
-    global_internal_store_snapshot, resolve_internal_ok_value, resolve_internal_value,
-    publish_pending_output_coordinates, store_execution_output_value, store_internal_value,
+    global_internal_store_snapshot, publish_pending_output_coordinates, resolve_internal_ok_value,
+    resolve_internal_value, store_execution_output_value, store_internal_value,
     DraftCaptureSnapshot, InternalStorageManager, InternalStoreSnapshot, InternalWriteRecord,
     StoredInternalObject, TileExecutionScopeGuard,
 };
+pub use profiling::{
+    begin_sequence_profile, finish_sequence_profile, record_tile_output_store_profile,
+    record_tile_profile, ExecutionProfile, ProfileRecord, ProfileStreamEvent,
+    SequenceProfileRecord, TileProfileOverheadBreakdown, TileProfileRecord, PROFILE_PATH_ENV,
+    PROFILE_STREAM_PATH_ENV,
+};
 pub use tracing::{
     commitment::Sha256Commitment,
-    finish, init, init_with, publish_trace_event, RecurTraceScopeGuard,
+    finish, init, init_with, publish_trace_event,
     publisher::{Publisher, TraceEventPublisher},
     recorder::TraceRecorder,
-    TRACE_EVENT_PREFIX,
+    RecurTraceScopeGuard, TRACE_EVENT_PREFIX,
 };

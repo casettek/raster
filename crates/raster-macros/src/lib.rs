@@ -264,8 +264,19 @@ fn gen_auth_value_materialization(input: &ItemFn) -> proc_macro2::TokenStream {
             let internal_info_ident = internal_info_ident(param);
             match protocol_kind {
                 ParamProtocolKind::AuthValue(value_ty) => quote! {
+                    let __raster_auth_value_start = ::raster::__private::profile_now();
                     let __raster_auth_value = ::raster::into_auth_value::<#value_ty, _>(#name)
                         .unwrap_or_else(|e| panic!("Failed to materialize auth value for argument '{}': {}", stringify!(#name), e));
+                    let __raster_auth_value_duration_ns =
+                        ::core::primitive::u64::try_from(__raster_auth_value_start.elapsed().as_nanos())
+                            .unwrap_or(::core::primitive::u64::MAX);
+                    if __raster_auth_value.as_external().is_some() {
+                        __raster_external_input_resolve_ns = __raster_external_input_resolve_ns
+                            .saturating_add(__raster_auth_value_duration_ns);
+                    } else if __raster_auth_value.as_internal().is_some() {
+                        __raster_internal_input_resolve_ns = __raster_internal_input_resolve_ns
+                            .saturating_add(__raster_auth_value_duration_ns);
+                    }
                     let #external_info_ident = __raster_auth_value.as_external().cloned();
                     let #internal_info_ident = __raster_auth_value.as_internal().cloned();
                     let #name: #value_ty = __raster_auth_value.into_inner();
@@ -2234,7 +2245,9 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
     let (native_draft_capture_start, native_draft_capture_finish) =
         gen_native_draft_capture(&input_fn, &return_kind);
     let publish_output_coordinates = match return_kind {
-        ProtocolReturnKind::Unit | ProtocolReturnKind::Value(_) | ProtocolReturnKind::Fallible(_) => {
+        ProtocolReturnKind::Unit
+        | ProtocolReturnKind::Value(_)
+        | ProtocolReturnKind::Fallible(_) => {
             quote! {
                 ::raster::__private::publish_tile_output_coordinates(
                     __raster_tile_execution_scope.coordinates().clone(),
@@ -2276,24 +2289,53 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
     let original_function = quote! {
         #(#fn_attrs)*
         #fn_vis #exposed_sig {
+            let mut __raster_external_input_resolve_ns: ::core::primitive::u64 = 0;
+            let mut __raster_internal_input_resolve_ns: ::core::primitive::u64 = 0;
             #auth_value_materialization
 
             // On std + non-riscv32: wrap body in closure for tracing
             #[cfg(all(feature = "std", not(target_arch = "riscv32")))]
             {
+                let __raster_wrapper_start = ::raster::__private::profile_now();
                 let __raster_tile_execution_scope = ::raster::__private::TileExecutionScopeGuard::enter();
+                let mut __raster_trace_serialize_ns: ::core::primitive::u64 = 0;
+                let mut __raster_draft_capture_ns: ::core::primitive::u64 = 0;
 
                 // Serialize inputs for tracing
+                let __raster_trace_input_start = ::raster::__private::profile_now();
                 #input_serialization
+                __raster_trace_serialize_ns = __raster_trace_serialize_ns.saturating_add(
+                    ::core::primitive::u64::try_from(__raster_trace_input_start.elapsed().as_nanos())
+                        .unwrap_or(::core::primitive::u64::MAX)
+                );
 
+                let __raster_draft_capture_start_timer = ::raster::__private::profile_now();
                 #native_draft_capture_start
+                __raster_draft_capture_ns = __raster_draft_capture_ns.saturating_add(
+                    ::core::primitive::u64::try_from(__raster_draft_capture_start_timer.elapsed().as_nanos())
+                        .unwrap_or(::core::primitive::u64::MAX)
+                );
 
+                let __raster_user_start = ::raster::__private::profile_now();
                 #function_call
+                let __raster_user_duration_ns =
+                    ::core::primitive::u64::try_from(__raster_user_start.elapsed().as_nanos())
+                        .unwrap_or(::core::primitive::u64::MAX);
 
+                let __raster_draft_capture_finish_timer = ::raster::__private::profile_now();
                 #native_draft_capture_finish
+                __raster_draft_capture_ns = __raster_draft_capture_ns.saturating_add(
+                    ::core::primitive::u64::try_from(__raster_draft_capture_finish_timer.elapsed().as_nanos())
+                        .unwrap_or(::core::primitive::u64::MAX)
+                );
 
                 // Serialize output and emit TraceEvent::TileExec
+                let __raster_trace_output_start = ::raster::__private::profile_now();
                 #trace_output_serialization
+                __raster_trace_serialize_ns = __raster_trace_serialize_ns.saturating_add(
+                    ::core::primitive::u64::try_from(__raster_trace_output_start.elapsed().as_nanos())
+                        .unwrap_or(::core::primitive::u64::MAX)
+                );
 
                 let __raster_output = ::core::option::Option::Some(
                     ::raster::core::trace::FnOutput {
@@ -2313,6 +2355,22 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
                 ));
 
                 #publish_output_coordinates
+                let __raster_wrapper_duration_ns =
+                    ::core::primitive::u64::try_from(__raster_wrapper_start.elapsed().as_nanos())
+                        .unwrap_or(::core::primitive::u64::MAX);
+                let __raster_total_duration_ns = __raster_wrapper_duration_ns
+                    .saturating_add(__raster_external_input_resolve_ns)
+                    .saturating_add(__raster_internal_input_resolve_ns);
+                ::raster::__private::record_tile_profile(
+                    #fn_name_str,
+                    __raster_tile_execution_scope.coordinates().clone(),
+                    __raster_total_duration_ns,
+                    __raster_user_duration_ns,
+                    __raster_external_input_resolve_ns,
+                    __raster_internal_input_resolve_ns,
+                    __raster_trace_serialize_ns,
+                    __raster_draft_capture_ns,
+                );
                 let _ = &__raster_tile_execution_scope;
                 return result;
             }
@@ -2415,8 +2473,10 @@ fn gen_sequence_wrapped_body(
     quote! {
         #[cfg(all(feature = "std", not(target_arch = "riscv32")))]
         {
+            let __raster_sequence_profile_start = ::raster::__private::profile_now();
             let __raster_sequence_scope_guard =
                 ::raster::__private::SequenceScopeGuard::enter(#fn_name_str);
+            ::raster::__private::begin_sequence_profile(#fn_name_str);
             #input_serialization
 
             let mut __raster_record = ::raster::core::trace::FnCallRecord {
@@ -2437,6 +2497,13 @@ fn gen_sequence_wrapped_body(
             ::raster::publish_trace_event(::raster::core::trace::TraceEvent::SequenceEnd(
                 __raster_record,
             ));
+            let __raster_sequence_total_duration_ns =
+                ::core::primitive::u64::try_from(__raster_sequence_profile_start.elapsed().as_nanos())
+                    .unwrap_or(::core::primitive::u64::MAX);
+            ::raster::__private::finish_sequence_profile(
+                #fn_name_str,
+                __raster_sequence_total_duration_ns,
+            );
             __raster_result
         }
 
