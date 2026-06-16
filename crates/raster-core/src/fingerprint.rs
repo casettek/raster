@@ -3,11 +3,11 @@
 //! This module provides the `BitPacker` type for packing hash bits into
 //! compact fingerprints that can be efficiently compared.
 
-use std::fmt;
-use std::result::Result;
-use std::string::String;
-use std::vec;
-use std::vec::Vec;
+use alloc::string::String;
+use alloc::vec;
+use alloc::vec::Vec;
+use core::fmt;
+use core::result::Result;
 
 use serde::{Deserialize, Serialize};
 
@@ -484,7 +484,7 @@ pub struct Fingerprint {
     pub len: usize,
 }
 
-impl std::fmt::Display for Fingerprint {
+impl fmt::Display for Fingerprint {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         for bit in self.bits.iter() {
             write!(f, "{:064b}", bit)?;
@@ -493,7 +493,7 @@ impl std::fmt::Display for Fingerprint {
     }
 }
 
-impl std::fmt::Debug for Fingerprint {
+impl fmt::Debug for Fingerprint {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         for bit in self.bits.iter() {
             write!(f, "{:064b}", bit)?;

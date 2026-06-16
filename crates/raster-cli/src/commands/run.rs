@@ -130,14 +130,14 @@ pub fn run(
         for line in stdout_reader.lines() {
             if let Ok(line_str) = line {
                 if let Some(raw_event) = line_str.strip_prefix(TRACE_EVENT_PREFIX) {
-                    if let Ok(trace_event) = serde_json::from_str::<TraceEvent>(raw_event) {
-                        let step_record = {
-                            let mut trace_recorder = stdout_trace_recorder.lock().unwrap();
-                            trace_recorder.record(trace_event)
-                        };
-                        let mut trace_lock = reader_trace.lock().unwrap();
-                        trace_lock.push(step_record);
-                    }
+                    let trace_event = serde_json::from_str::<TraceEvent>(raw_event)
+                        .unwrap_or_else(|error| panic!("Failed to decode trace event: {error}: {raw_event}"));
+                    let step_record = {
+                        let mut trace_recorder = stdout_trace_recorder.lock().unwrap();
+                        trace_recorder.record(trace_event)
+                    };
+                    let mut trace_lock = reader_trace.lock().unwrap();
+                    trace_lock.push(step_record);
                 }
                 if let Some(debug_line) = line_str.strip_prefix("[debug]") {
                     let mut log_lock = reader_log.lock().unwrap();
@@ -219,6 +219,9 @@ pub fn run(
             StepRecord::TileExec(tile_record) => {
                 trace_coordinates.push(tile_record.coordinates.clone());
             }
+            StepRecord::RecurExec(recur_record) => {
+                trace_coordinates.push(recur_record.coordinates.clone());
+            }
             StepRecord::SequenceEnd(sequence_end_record) => {
                 trace_coordinates.push(sequence_end_record.coordinates.clone());
             }
@@ -292,6 +295,13 @@ pub fn run(
 
                     println!("tile_id: {}", tile_exec_record.tile_id);
                 }
+                StepRecord::RecurExec(recur_exec_record) => {
+                    println!("\nexec_index: {}", recur_exec_record.exec_index);
+                    println!("sequence_id: {}", recur_exec_record.sequence_id);
+                    println!("recur_coordinates: {:?}", recur_exec_record.coordinates,);
+
+                    println!("recur_id: {}", recur_exec_record.recur_id);
+                }
                 StepRecord::SequenceStart(sequence_start_record) => {
                     println!(
                         "[sequence start] sequence id: {}",
@@ -326,18 +336,23 @@ pub fn fraud(trace: &mut Trace, commit_path: &str) {
     let mut rng = rand::rng();
     if let Some(fraud_step) = trace
         .iter_mut()
-        .filter(|step_record| {
-            matches!(
-                step_record,
-                StepRecord::TileExec(tile_exec_record)
-                    if !tile_exec_record.external_input_commitment.is_empty()
-            )
+        .filter(|step_record| match step_record {
+            StepRecord::TileExec(tile_exec_record) => {
+                !tile_exec_record.external_input_commitment.is_empty()
+            }
+            StepRecord::RecurExec(recur_exec_record) => {
+                !recur_exec_record.external_input_commitment.is_empty()
+            }
+            StepRecord::SequenceStart(_) | StepRecord::SequenceEnd(_) => false,
         })
         .choose(&mut rng)
     {
         match fraud_step {
             StepRecord::TileExec(tile_exec_record) => {
                 tile_exec_record.output_commitment = vec![0u8, 1u8];
+            }
+            StepRecord::RecurExec(recur_exec_record) => {
+                recur_exec_record.output_commitment = vec![0u8, 1u8];
             }
             StepRecord::SequenceStart(sequence_start_record) => {
                 sequence_start_record.input_commitment.push(0);

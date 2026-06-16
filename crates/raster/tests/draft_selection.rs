@@ -22,6 +22,11 @@ fn push_tx(tx: String, draft: Draft<Account>) -> Draft<Account> {
     draft
 }
 
+#[tile(kind = iter)]
+fn echo_label(label: String) -> String {
+    label
+}
+
 #[sequence]
 fn build_account_reference(balance: u64, first_tx: String, second_tx: String) -> InternalRef {
     let draft = new!(Account);
@@ -35,6 +40,34 @@ fn run_build_account_reference(balance: u64, first_tx: String, second_tx: String
     materialize_auth_return::<InternalRef, _>(__raster_sequence_auth_build_account_reference(
         balance, first_tx, second_tx,
     ))
+}
+
+#[sequence]
+fn reference_after_new_does_not_shift_tile(label: String) -> InternalRef {
+    let _draft = new!(Account);
+    let echoed = call!(echo_label, label);
+    echoed.reference().clone()
+}
+
+#[sequence]
+fn reference_after_finalize_does_not_shift_tile(label: String) -> InternalRef {
+    let draft = new!(Account);
+    let draft = call!(set_balance, 7, draft);
+    let _account = finalize(draft);
+    let echoed = call!(echo_label, label);
+    echoed.reference().clone()
+}
+
+fn run_reference_after_new(label: String) -> InternalRef {
+    materialize_auth_return::<InternalRef, _>(__raster_sequence_auth_reference_after_new_does_not_shift_tile(
+        label,
+    ))
+}
+
+fn run_reference_after_finalize(label: String) -> InternalRef {
+    materialize_auth_return::<InternalRef, _>(
+        __raster_sequence_auth_reference_after_finalize_does_not_shift_tile(label),
+    )
 }
 
 #[test]
@@ -83,6 +116,18 @@ fn finalized_internal_refs_support_select() {
             .into_inner(),
         "second"
     );
+}
+
+#[test]
+fn draft_creation_does_not_shift_later_tile_coordinates() {
+    let reference = run_reference_after_new("after-new".to_string());
+    assert_eq!(reference.coordinates, raster::core::cfs::CfsCoordinates(vec![0]));
+}
+
+#[test]
+fn finalize_does_not_shift_later_tile_coordinates() {
+    let reference = run_reference_after_finalize("after-finalize".to_string());
+    assert_eq!(reference.coordinates, raster::core::cfs::CfsCoordinates(vec![1]));
 }
 
 #[test]

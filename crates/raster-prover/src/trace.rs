@@ -313,6 +313,13 @@ fn resolve_inputs_sources(
     cfs_cursor: &CfsCursor,
     step_inputs: &[InputBinding],
 ) -> Vec<(usize, StepRecord)> {
+    if cfs_cursor
+        .try_get_recur_iteration_coordinates(step_record.coordinates())
+        .is_some()
+    {
+        return Vec::new();
+    }
+
     if step_inputs.iter().all(|input| {
         matches!(
             input,
@@ -419,6 +426,14 @@ fn resolve_inputs_sources(
                         }
                         (StepRecord::SequenceEnd(sequence_end_record), SequenceChildItem::Sequence(_))
                             if sequence_end_record.coordinates == source_record_coordinates =>
+                        {
+                            Some((
+                                current_sequence_start_index + intra_sequence_offset,
+                                record.clone(),
+                            ))
+                        }
+                        (StepRecord::RecurExec(recur_exec_record), SequenceChildItem::Recur(_))
+                            if recur_exec_record.coordinates == source_record_coordinates =>
                         {
                             Some((
                                 current_sequence_start_index + intra_sequence_offset,

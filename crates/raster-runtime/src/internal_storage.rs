@@ -342,11 +342,19 @@ impl Default for InternalStorageManager {
 struct SequenceFrame {
     coordinates: CfsCoordinates,
     next_child_index: u32,
+    next_synthetic_index: u32,
+}
+
+#[derive(Debug, Clone)]
+struct RecurFrame {
+    site_coordinates: CfsCoordinates,
+    next_iteration_index: u32,
 }
 
 #[derive(Debug, Default, Clone)]
 struct SequenceExecutionContext {
     stack: Vec<SequenceFrame>,
+    recur_stack: Vec<RecurFrame>,
 }
 
 impl SequenceExecutionContext {
@@ -363,22 +371,82 @@ impl SequenceExecutionContext {
         self.stack.push(SequenceFrame {
             coordinates,
             next_child_index: 0,
+            next_synthetic_index: 0,
         });
     }
 
     fn exit_sequence(&mut self) {
+        assert!(
+            self.recur_stack.is_empty(),
+            "Cannot exit a sequence while a recur site is still active"
+        );
         self.stack
             .pop()
             .expect("Corrupted sequence execution context");
     }
 
-    fn reserve_tile_coordinates(&mut self) -> Result<CfsCoordinates> {
+    fn enter_recur_site(&mut self) -> Result<()> {
+        let frame = self.stack.last_mut().ok_or_else(|| {
+            Error::Other("Recursive execution requires active sequence context".into())
+        })?;
+        let mut site_coordinates = frame.coordinates.clone();
+        site_coordinates.push(frame.next_child_index);
+        frame.next_child_index += 1;
+        self.recur_stack.push(RecurFrame {
+            site_coordinates,
+            next_iteration_index: 0,
+        });
+        Ok(())
+    }
+
+    fn exit_recur_site(&mut self) {
+        self.recur_stack
+            .pop()
+            .expect("Corrupted recur execution context");
+    }
+
+    fn reserve_execution_coordinates(&mut self) -> Result<CfsCoordinates> {
+        if let Some(recur_frame) = self.recur_stack.last_mut() {
+            let mut coordinates = recur_frame.site_coordinates.clone();
+            coordinates.push(recur_frame.next_iteration_index);
+            recur_frame.next_iteration_index += 1;
+            return Ok(coordinates);
+        }
+
         let frame = self.stack.last_mut().ok_or_else(|| {
             Error::Other("Internal-store writes require active sequence context".into())
         })?;
         let mut coordinates = frame.coordinates.clone();
         coordinates.push(frame.next_child_index);
         frame.next_child_index += 1;
+        Ok(coordinates)
+    }
+
+    fn reserve_synthetic_coordinates(&mut self) -> Result<CfsCoordinates> {
+        let synthetic_index = {
+            let frame = self.stack.last_mut().ok_or_else(|| {
+                Error::Other("Internal-store writes require active sequence context".into())
+            })?;
+            let synthetic_index = frame.next_synthetic_index;
+            frame.next_synthetic_index += 1;
+            synthetic_index
+        };
+
+        let mut coordinates = if let Some(active_coordinates) =
+            THREAD_ACTIVE_EXECUTION_COORDINATES.with(|stack| stack.borrow().last().cloned())
+        {
+            active_coordinates
+        } else if let Some(recur_frame) = self.recur_stack.last() {
+            recur_frame.site_coordinates.clone()
+        } else {
+            self.stack
+                .last()
+                .ok_or_else(|| Error::Other("Internal-store writes require active sequence context".into()))?
+                .coordinates
+                .clone()
+        };
+        coordinates.push(u32::MAX);
+        coordinates.push(synthetic_index);
         Ok(coordinates)
     }
 }
@@ -388,6 +456,8 @@ std::thread_local! {
         RefCell::new(InternalStorageManager::new());
     static THREAD_SEQUENCE_CONTEXT: RefCell<SequenceExecutionContext> =
         RefCell::new(SequenceExecutionContext::default());
+    static THREAD_ACTIVE_EXECUTION_COORDINATES: RefCell<Vec<CfsCoordinates>> = RefCell::new(Vec::new());
+    static THREAD_PENDING_OUTPUT_COORDINATES: RefCell<Option<CfsCoordinates>> = const { RefCell::new(None) };
     static THREAD_DRAFT_STORAGE: RefCell<BTreeMap<Anchor, DraftRuntimeState>> =
         RefCell::new(BTreeMap::new());
 }
@@ -395,6 +465,12 @@ std::thread_local! {
 fn reset_thread_storage() {
     THREAD_INTERNAL_STORAGE.with(|storage| {
         *storage.borrow_mut() = InternalStorageManager::new();
+    });
+    THREAD_ACTIVE_EXECUTION_COORDINATES.with(|coordinates| {
+        coordinates.borrow_mut().clear();
+    });
+    THREAD_PENDING_OUTPUT_COORDINATES.with(|coordinates| {
+        coordinates.borrow_mut().take();
     });
     THREAD_DRAFT_STORAGE.with(|drafts| {
         drafts.borrow_mut().clear();
@@ -417,6 +493,16 @@ pub fn exit_sequence_scope() {
     });
 }
 
+pub fn enter_recur_site_scope() -> Result<()> {
+    THREAD_SEQUENCE_CONTEXT.with(|context| context.borrow_mut().enter_recur_site())
+}
+
+pub fn exit_recur_site_scope() {
+    THREAD_SEQUENCE_CONTEXT.with(|context| {
+        context.borrow_mut().exit_recur_site();
+    });
+}
+
 pub fn global_internal_store_snapshot() -> InternalStoreSnapshot {
     THREAD_INTERNAL_STORAGE.with(|storage| storage.borrow().snapshot())
 }
@@ -426,8 +512,9 @@ where
     S: Schema,
 {
     let schema = S::schema();
-    let coordinates =
-        THREAD_SEQUENCE_CONTEXT.with(|context| context.borrow_mut().reserve_tile_coordinates())?;
+    let coordinates = THREAD_SEQUENCE_CONTEXT.with(|context| {
+        context.borrow_mut().reserve_synthetic_coordinates()
+    })?;
     let anchor = anchor_for_schema(&coordinates, S::schema_hash());
     let current_root = draft_root(&schema, &BTreeMap::new(), false)?;
     THREAD_DRAFT_STORAGE.with(|drafts| {
@@ -603,21 +690,94 @@ where
     })
 }
 
-pub fn store_internal_value<T: Serialize>(value: &T) -> Result<InternalRef> {
+fn store_internal_value_at_coordinates<T: Serialize>(
+    value: &T,
+    coordinates: CfsCoordinates,
+) -> Result<InternalRef> {
     let bytes = raster_core::postcard::to_allocvec(value).map_err(|error| {
         Error::Serialization(format!(
             "Failed to serialize internal store object for current sequence step: {}",
             error
         ))
     })?;
-    let coordinates =
-        THREAD_SEQUENCE_CONTEXT.with(|context| context.borrow_mut().reserve_tile_coordinates())?;
     THREAD_INTERNAL_STORAGE.with(|storage| {
         let write = storage
             .borrow_mut()
             .append_serialized_bytes(&bytes, coordinates.clone());
         Ok(InternalRef::new(coordinates, write.entry.object_commitment))
     })
+}
+
+pub fn store_internal_value<T: Serialize>(value: &T) -> Result<InternalRef> {
+    let coordinates = THREAD_SEQUENCE_CONTEXT.with(|context| {
+        context.borrow_mut().reserve_synthetic_coordinates()
+    })?;
+    store_internal_value_at_coordinates(value, coordinates)
+}
+
+pub fn store_execution_output_value<T: Serialize>(value: &T) -> Result<InternalRef> {
+    let coordinates = THREAD_PENDING_OUTPUT_COORDINATES
+        .with(|coordinates| coordinates.borrow_mut().take())
+        .or_else(current_recur_site_coordinates)
+        .ok_or_else(|| {
+            Error::Other("Missing pending execution output coordinates for tile output".into())
+        })?;
+    store_internal_value_at_coordinates(value, coordinates)
+}
+
+fn current_recur_site_coordinates() -> Option<CfsCoordinates> {
+    THREAD_SEQUENCE_CONTEXT.with(|context| {
+        context
+            .borrow()
+            .recur_stack
+            .last()
+            .map(|frame| frame.site_coordinates.clone())
+    })
+}
+
+#[derive(Debug, Clone)]
+pub struct TileExecutionScopeGuard {
+    coordinates: CfsCoordinates,
+}
+
+impl TileExecutionScopeGuard {
+    pub fn enter() -> Result<Self> {
+        let coordinates = THREAD_SEQUENCE_CONTEXT.with(|context| {
+            context.borrow_mut().reserve_execution_coordinates()
+        })?;
+        THREAD_ACTIVE_EXECUTION_COORDINATES.with(|active| {
+            active.borrow_mut().push(coordinates.clone());
+        });
+        THREAD_PENDING_OUTPUT_COORDINATES.with(|pending| {
+            pending.borrow_mut().take();
+        });
+        Ok(Self { coordinates })
+    }
+
+    pub fn coordinates(&self) -> &CfsCoordinates {
+        &self.coordinates
+    }
+}
+
+impl Drop for TileExecutionScopeGuard {
+    fn drop(&mut self) {
+        THREAD_ACTIVE_EXECUTION_COORDINATES.with(|active| {
+            let mut active = active.borrow_mut();
+            let popped = active
+                .pop()
+                .expect("Corrupted active execution coordinate stack");
+            assert_eq!(
+                popped, self.coordinates,
+                "Mismatched execution coordinate scope teardown"
+            );
+        });
+    }
+}
+
+pub fn publish_pending_output_coordinates(coordinates: CfsCoordinates) {
+    THREAD_PENDING_OUTPUT_COORDINATES.with(|pending| {
+        *pending.borrow_mut() = Some(coordinates);
+    });
 }
 
 pub fn finalize_draft<S>(anchor: &Anchor, expected_root: &[u8; 32]) -> Result<InternalRef>
@@ -633,7 +793,11 @@ where
         ))
     })?;
 
-    let reference = store_internal_value(&value)?;
+    let reference = if let Some(coordinates) = current_recur_site_coordinates() {
+        store_internal_value_at_coordinates(&value, coordinates)?
+    } else {
+        store_internal_value(&value)?
+    };
     Ok(reference)
 }
 
@@ -657,7 +821,11 @@ where
         ))
     })?;
 
-    let reference = store_internal_value(&value)?;
+    let reference = if let Some(coordinates) = current_recur_site_coordinates() {
+        store_internal_value_at_coordinates(&value, coordinates)?
+    } else {
+        store_internal_value(&value)?
+    };
     Ok(reference)
 }
 

@@ -316,6 +316,14 @@ fn assert_same_source(left: ResolvedSource<'_>, right: ResolvedSource<'_>) {
     }
 }
 
+fn has_coordinate_prefix(coordinates: &CfsCoordinates, prefix: &CfsCoordinates) -> bool {
+    coordinates.len() >= prefix.len()
+        && coordinates
+            .iter()
+            .zip(prefix.iter())
+            .all(|(coordinate, expected)| coordinate == expected)
+}
+
 fn verify_step_record_inputs(
     cfs_cursor: &CfsCursor,
     step_record: &StepRecord,
@@ -325,6 +333,13 @@ fn verify_step_record_inputs(
     // TODO: SequenceStart/SequenceEnd entrypoint case. In case of SequenceStart input is External Kind from
     // cli or from file. SequenceEnd just binding latest executed tile output.
     if step_record.coordinates().is_empty() {
+        return;
+    }
+
+    if cfs_cursor
+        .try_get_recur_iteration_coordinates(step_record.coordinates())
+        .is_some()
+    {
         return;
     }
 
@@ -420,10 +435,24 @@ fn verify_step_record_inputs(
                         )
                     }
                 };
-                assert_eq!(
-                    internal_meta.coordinates, source_coordinates,
-                    "Internal input producer coordinates do not match expected CFS source",
-                );
+                match cfs_cursor
+                    .try_get_item(&source_coordinates)
+                    .expect("Expected producer item coordinates to resolve in CFS")
+                {
+                    raster_core::cfs::SequenceChildItem::Sequence(_) => {
+                        assert!(
+                            has_coordinate_prefix(&internal_meta.coordinates, &source_coordinates),
+                            "Internal input producer coordinates do not descend from expected sequence source",
+                        );
+                    }
+                    raster_core::cfs::SequenceChildItem::Tile(_)
+                    | raster_core::cfs::SequenceChildItem::Recur(_) => {
+                        assert_eq!(
+                            internal_meta.coordinates, source_coordinates,
+                            "Internal input producer coordinates do not match expected CFS source",
+                        );
+                    }
+                }
             }
         }
     }
@@ -438,33 +467,19 @@ fn verify_io_witness(
         bytes.map(|bytes| sha256_bytes(bytes)).unwrap_or_default()
     };
 
-    match step_record {
-        StepRecord::TileExec(record) => {
-            assert_eq!(
-                record.input_commitment,
-                commitment_for(input_witness),
-                "Tile input commitment does not match recorded input bytes",
-            );
-            assert_eq!(
-                record.output_commitment,
-                commitment_for(output_witness),
-                "Tile output commitment does not match recorded output bytes",
-            );
-        }
-        StepRecord::SequenceStart(record) => {
-            assert_eq!(
-                record.input_commitment,
-                commitment_for(input_witness),
-                "Sequence start input commitment does not match recorded input bytes",
-            );
-        }
-        StepRecord::SequenceEnd(record) => {
-            assert_eq!(
-                record.output_commitment,
-                commitment_for(output_witness),
-                "Sequence end output commitment does not match recorded output bytes",
-            );
-        }
+    if let Some(input_commitment) = step_record.input_commitment() {
+        assert_eq!(
+            input_commitment,
+            &commitment_for(input_witness),
+            "Step input commitment does not match recorded input bytes",
+        );
+    }
+    if let Some(output_commitment) = step_record.output_commitment() {
+        assert_eq!(
+            output_commitment,
+            &commitment_for(output_witness),
+            "Step output commitment does not match recorded output bytes",
+        );
     }
 }
 
@@ -475,25 +490,16 @@ fn verify_external_inputs(
 ) {
     let computed_commitment = external_input_commitment(external_input);
 
-    match step {
-        StepRecord::TileExec(record) => {
-            assert_eq!(
-                record.external_input_commitment, computed_commitment,
-                "TileExec external input not authorized",
-            );
-        }
-        StepRecord::SequenceStart(record) => {
-            assert_eq!(
-                record.external_input_commitment, computed_commitment,
-                "SequenceStart external input not authorized",
-            );
-        }
-        StepRecord::SequenceEnd(_) => {
-            assert!(
-                external_input.is_empty(),
-                "SequenceEnd must not carry external input metadata",
-            );
-        }
+    if let Some(external_commitment) = step.external_input_commitment() {
+        assert_eq!(
+            external_commitment, &computed_commitment,
+            "Step external input commitment does not match authorized inputs",
+        );
+    } else {
+        assert!(
+            external_input.is_empty(),
+            "SequenceEnd must not carry external input metadata",
+        );
     }
 
     for meta in external_input.values() {
@@ -557,35 +563,23 @@ fn verify_step_record(
     external_inputs_commitments: &BTreeMap<String, Vec<u8>>,
 ) {
     verify_io_witness(step_record, input_witness_bytes, output_witness_bytes);
-    match step_record {
-        StepRecord::TileExec(record) => {
-            let input_source_witness =
-                input_source_witness.expect("TileExec input source witness is missing");
-            assert_eq!(
-                record.input_source_commitment,
-                input_source_commitment(input_source_witness),
-                "TileExec input source witness does not match recorded source commitment",
-            );
-        }
-        StepRecord::SequenceStart(record) => {
-            let input_source_witness =
-                input_source_witness.expect("SequenceStart input source witness is missing");
-            assert_eq!(
-                record.input_source_commitment,
-                input_source_commitment(input_source_witness),
-                "SequenceStart input source witness does not match recorded source commitment",
-            );
-        }
-        StepRecord::SequenceEnd(_) => {
-            assert!(
-                input_source_witness.is_none(),
-                "SequenceEnd must not carry input source witness",
-            );
-        }
+    if let Some(expected_input_source_commitment) = step_record.input_source_commitment() {
+        let input_source_witness =
+            input_source_witness.expect("Step input source witness is missing");
+        assert_eq!(
+            expected_input_source_commitment,
+            &input_source_commitment(input_source_witness),
+            "Step input source witness does not match recorded source commitment",
+        );
+    } else {
+        assert!(
+            input_source_witness.is_none(),
+            "SequenceEnd must not carry input source witness",
+        );
     }
     verify_external_inputs(step_record, external_inputs, external_inputs_commitments);
 
-    if let StepRecord::TileExec(_) = step_record {
+    if step_record.requires_replay_proof() {
         let replay_image_id =
             replay_image_id.expect("replay image id should be provided for tile execution should ");
         let replay_journal =
@@ -613,113 +607,119 @@ fn verify_internal_store_transition(
     current_frontier: &mut NonEmptyFrontier<Bytes>,
     current_index_root: &[u8],
 ) -> (SerializableFrontier, Vec<u8>, Vec<u8>) {
-    match step_record {
-        StepRecord::TileExec(record) => {
-            let current_root = frontier_root(current_frontier);
-            assert_eq!(
-                record.internal_store_root_before, current_root,
-                "TileExec internal store root before does not match current internal store root",
-            );
-            assert_eq!(
-                record.internal_store_index_root_before, current_index_root,
-                "TileExec internal store index root before does not match current index root",
-            );
+    if let Some((
+        internal_store_root_before,
+        internal_store_root_after,
+        internal_store_index_root_before,
+        internal_store_index_root_after,
+    )) = step_record.internal_store_roots()
+    {
+        let current_root = frontier_root(current_frontier);
+        assert_eq!(
+            internal_store_root_before, &current_root,
+            "Execution-step internal store root before does not match current internal store root",
+        );
+        assert_eq!(
+            internal_store_index_root_before, &current_index_root,
+            "Execution-step internal store index root before does not match current index root",
+        );
 
-            if let Some(input_source_witness) = input_source_witness {
-                for internal_meta in input_source_witness.internal().values() {
-                    let read_witness = internal_store_witness
-                        .and_then(|witness| {
-                            witness.reads.iter().find(|read| {
-                                read.entry.coordinates == internal_meta.coordinates
-                                    && read.entry.object_commitment == internal_meta.commitment
-                            })
+        if let Some(input_source_witness) = input_source_witness {
+            for internal_meta in input_source_witness.internal().values() {
+                let read_witness = internal_store_witness
+                    .and_then(|witness| {
+                        witness.reads.iter().find(|read| {
+                            read.entry.coordinates == internal_meta.coordinates
+                                && read.entry.object_commitment == internal_meta.commitment
                         })
-                        .unwrap_or_else(|| {
-                            panic!(
-                                "Missing internal store read witness for coordinates {:?}",
-                                internal_meta.coordinates
-                            )
-                        });
-                    verify_internal_store_read_witness(
-                        read_witness,
-                        &current_root,
-                        current_index_root,
-                        &internal_meta.coordinates,
-                        &internal_meta.commitment,
-                    );
-                }
-            }
-
-            let write_witness = internal_store_witness.and_then(|witness| witness.write.as_ref());
-
-            match (output_witness_bytes, write_witness) {
-                (Some(output_bytes), Some(write_witness)) => {
-                    let object_commitment = record.output_commitment.clone();
-                    assert_eq!(
-                        object_commitment,
-                        sha256_bytes(output_bytes),
-                        "Tile output commitment does not match output bytes during internal store transition",
-                    );
-
-                    let expected_entry = InternalStoreEntry {
-                        coordinates: record.coordinates.clone(),
-                        object_commitment,
-                    };
-                    current_frontier.append(Bytes(internal_store_leaf_hash(&expected_entry)));
-                    let next_root = frontier_root(current_frontier);
-                    let next_position: u64 = current_frontier.position().into();
-                    verify_internal_store_write_witness(
-                        write_witness,
-                        current_index_root,
-                        &record.internal_store_index_root_after,
-                        &expected_entry,
-                        next_position,
-                    );
-                    assert_eq!(
-                        record.internal_store_root_after, next_root,
-                        "TileExec internal store root after does not match appended internal store root",
-                    );
-
-                    (
-                        serialize_frontier(current_frontier),
-                        next_root,
-                        record.internal_store_index_root_after.clone(),
-                    )
-                }
-                (None, None) => {
-                    assert_eq!(
-                        record.internal_store_root_before, record.internal_store_root_after,
-                        "TileExec without internal store write must leave append-log root unchanged",
-                    );
-                    assert_eq!(
-                        record.internal_store_index_root_before, record.internal_store_index_root_after,
-                        "TileExec without internal store write must leave index root unchanged",
-                    );
-                    (
-                        serialize_frontier(current_frontier),
-                        current_root,
-                        current_index_root.to_vec(),
-                    )
-                }
-                (Some(_), None) => {
-                    panic!("TileExec write is missing internal store write witness");
-                }
-                (None, Some(_)) => {
-                    panic!("TileExec without output bytes must not carry internal store write witness");
-                }
+                    })
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "Missing internal store read witness for coordinates {:?}",
+                            internal_meta.coordinates
+                        )
+                    });
+                verify_internal_store_read_witness(
+                    read_witness,
+                    &current_root,
+                    current_index_root,
+                    &internal_meta.coordinates,
+                    &internal_meta.commitment,
+                );
             }
         }
-        StepRecord::SequenceStart(_) | StepRecord::SequenceEnd(_) => {
-            assert!(
-                internal_store_witness.is_none(),
-                "Only tile steps may carry internal store witnesses",
-            );
-            (
-                serialize_frontier(current_frontier),
-                frontier_root(current_frontier),
-                current_index_root.to_vec(),
-            )
+
+        let write_witness = internal_store_witness.and_then(|witness| witness.write.as_ref());
+
+        match (output_witness_bytes, write_witness) {
+            (Some(output_bytes), Some(write_witness)) => {
+                let object_commitment = step_record
+                    .output_commitment()
+                    .expect("Execution step must expose output commitment")
+                    .clone();
+                assert_eq!(
+                    object_commitment,
+                    sha256_bytes(output_bytes),
+                    "Execution-step output commitment does not match output bytes during internal store transition",
+                );
+
+                let expected_entry = InternalStoreEntry {
+                    coordinates: step_record.coordinates().clone(),
+                    object_commitment,
+                };
+                current_frontier.append(Bytes(internal_store_leaf_hash(&expected_entry)));
+                let next_root = frontier_root(current_frontier);
+                let next_position: u64 = current_frontier.position().into();
+                verify_internal_store_write_witness(
+                    write_witness,
+                    current_index_root,
+                    internal_store_index_root_after,
+                    &expected_entry,
+                    next_position,
+                );
+                assert_eq!(
+                    internal_store_root_after, &next_root,
+                    "Execution-step internal store root after does not match appended internal store root",
+                );
+
+                (
+                    serialize_frontier(current_frontier),
+                    next_root,
+                    internal_store_index_root_after.clone(),
+                )
+            }
+            (None, None) => {
+                assert_eq!(
+                    internal_store_root_before, internal_store_root_after,
+                    "Execution-step without internal store write must leave append-log root unchanged",
+                );
+                assert_eq!(
+                    internal_store_index_root_before, internal_store_index_root_after,
+                    "Execution-step without internal store write must leave index root unchanged",
+                );
+                (
+                    serialize_frontier(current_frontier),
+                    current_root,
+                    current_index_root.to_vec(),
+                )
+            }
+            (Some(_), None) => {
+                panic!("Execution-step write is missing internal store write witness");
+            }
+            (None, Some(_)) => {
+                panic!("Execution-step without output bytes must not carry internal store write witness");
+            }
         }
+    } else {
+        assert!(
+            internal_store_witness.is_none(),
+            "Only execution steps may carry internal store witnesses",
+        );
+        (
+            serialize_frontier(current_frontier),
+            frontier_root(current_frontier),
+            current_index_root.to_vec(),
+        )
     }
 }
 
@@ -729,7 +729,7 @@ fn verify_draft_transition(
     draft_transition_witness: Option<&DraftTransitionWitness>,
     active_drafts: &mut BTreeMap<[u8; 32], TrackedDraftState>,
 ) {
-    let StepRecord::TileExec(_) = step_record else {
+    if !step_record.requires_replay_proof() {
         assert!(
             replay_journal.is_none(),
             "Only tile steps may carry replay journals",
@@ -739,7 +739,7 @@ fn verify_draft_transition(
             "Only tile steps may carry draft transition witnesses",
         );
         return;
-    };
+    }
 
     let Some(replay_journal) = replay_journal else {
         panic!("TileExec replay journal is missing");
@@ -1069,7 +1069,10 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use raster_core::cfs::CfsCoordinates;
+    use raster_core::cfs::{
+        CfsCoordinates, ControlFlowSchema, InputBinding, InputSource, SequenceChildItem, SequenceDef,
+        SequenceItem, TileDef, TileItem,
+    };
     use raster_core::coordinate_index::{
         coordinate_index_membership_proof, coordinate_index_non_membership_proof,
         coordinate_index_root,
@@ -1189,6 +1192,42 @@ mod tests {
         }
     }
 
+    fn producer_sequence_cfs() -> CfsCursor {
+        CfsCursor::new(ControlFlowSchema {
+            version: "1.0".into(),
+            project: "test".into(),
+            encoding: "postcard".into(),
+            tiles: vec![TileDef::iter("producer", 0, 1), TileDef::iter("consumer", 1, 1)],
+            sequences: vec![
+                SequenceDef {
+                    id: "main".into(),
+                    input_sources: vec![],
+                    items: vec![
+                        SequenceChildItem::Sequence(SequenceItem {
+                            id: "sub".into(),
+                            sources: vec![],
+                        }),
+                        SequenceChildItem::Tile(TileItem {
+                            id: "consumer".into(),
+                            sources: vec![InputBinding::ProducerOutput {
+                                item_index: 0,
+                                output_index: 0,
+                            }],
+                        }),
+                    ],
+                },
+                SequenceDef {
+                    id: "sub".into(),
+                    input_sources: vec![],
+                    items: vec![SequenceChildItem::Tile(TileItem {
+                        id: "producer".into(),
+                        sources: vec![InputBinding::Direct(InputSource::Inline)],
+                    })],
+                },
+            ],
+        })
+    }
+
     #[test]
     fn verify_tile_commitments_accept_matching_recorded_io() {
         let ext = ExternalInput::new();
@@ -1218,6 +1257,30 @@ mod tests {
             }
             .external_inputs_commitments,
         );
+    }
+
+    #[test]
+    fn verify_step_record_inputs_accepts_sequence_descendant_producer_coordinates() {
+        let cfs_cursor = producer_sequence_cfs();
+        let step_record = StepRecord::TileExec(TileExecRecord {
+            exec_index: 1,
+            tile_id: "consumer".into(),
+            sequence_id: "main".into(),
+            coordinates: CfsCoordinates(vec![1]),
+            intra_sequence_index: 1,
+            input_commitment: Vec::new(),
+            input_source_commitment: Vec::new(),
+            output_commitment: Vec::new(),
+            external_input_commitment: Vec::new(),
+            internal_store_root_before: Vec::new(),
+            internal_store_root_after: Vec::new(),
+            internal_store_index_root_before: Vec::new(),
+            internal_store_index_root_after: Vec::new(),
+        });
+        let input_source_witness =
+            internal_input_witness(CfsCoordinates(vec![0, 0]), sha(b"producer-output"));
+
+        verify_step_record_inputs(&cfs_cursor, &step_record, Some(&input_source_witness), None);
     }
 
     #[test]

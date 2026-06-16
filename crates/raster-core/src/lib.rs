@@ -14,15 +14,16 @@ extern crate alloc;
 extern crate std;
 
 pub mod error;
+pub mod cfs;
 pub mod draft;
+pub mod fingerprint;
 pub mod input;
 pub mod tile;
+pub mod trace;
 
 // These modules are only available with std (they use serde_json for complex serialization)
 #[cfg(feature = "std")]
 pub mod authorization;
-#[cfg(feature = "std")]
-pub mod cfs;
 #[cfg(feature = "std")]
 pub mod coordinate_index;
 #[cfg(feature = "std")]
@@ -30,13 +31,7 @@ pub mod manifest;
 #[cfg(feature = "std")]
 pub mod schema;
 #[cfg(feature = "std")]
-pub mod trace;
-
-#[cfg(feature = "std")]
 pub mod transition;
-
-#[cfg(feature = "std")]
-pub mod fingerprint;
 
 pub use error::{Error, Result};
 

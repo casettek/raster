@@ -99,12 +99,128 @@ pub mod __private {
         }
     }
 
+    #[doc(hidden)]
+    pub struct TileExecutionScopeGuard {
+        #[cfg(feature = "std")]
+        inner: Option<raster_runtime::TileExecutionScopeGuard>,
+    }
+
+    impl TileExecutionScopeGuard {
+        pub fn enter() -> Self {
+            #[cfg(feature = "std")]
+            {
+                return Self {
+                    inner: Some(
+                        raster_runtime::TileExecutionScopeGuard::enter().unwrap_or_else(|error| {
+                            panic!("Failed to enter tile execution scope: {}", error)
+                        }),
+                    ),
+                };
+            }
+
+            #[cfg(not(feature = "std"))]
+            {
+                Self {}
+            }
+        }
+
+        pub fn coordinates(&self) -> &crate::core::cfs::CfsCoordinates {
+            #[cfg(feature = "std")]
+            {
+                return self
+                    .inner
+                    .as_ref()
+                    .expect("Tile execution scope guard is missing runtime state")
+                    .coordinates();
+            }
+
+            #[cfg(not(feature = "std"))]
+            {
+                panic!("Tile execution coordinates require the `std` feature")
+            }
+        }
+    }
+
+    impl Drop for TileExecutionScopeGuard {
+        fn drop(&mut self) {
+            #[cfg(feature = "std")]
+            {
+                self.inner.take();
+            }
+        }
+    }
+
+    #[cfg(feature = "std")]
+    pub fn publish_tile_output_coordinates(coordinates: crate::core::cfs::CfsCoordinates) {
+        raster_runtime::publish_pending_output_coordinates(coordinates);
+    }
+
+    #[cfg(not(feature = "std"))]
+    pub fn publish_tile_output_coordinates(_: crate::core::cfs::CfsCoordinates) {
+        panic!("Tile output coordinates require the `std` feature")
+    }
+
+    #[doc(hidden)]
+    pub struct RecurSiteScopeGuard;
+
+    impl RecurSiteScopeGuard {
+        pub fn enter() -> Self {
+            #[cfg(feature = "std")]
+            {
+                raster_runtime::enter_recur_site_scope()
+                    .unwrap_or_else(|error| panic!("Failed to enter recur site scope: {}", error));
+            }
+
+            Self
+        }
+    }
+
+    impl Drop for RecurSiteScopeGuard {
+        fn drop(&mut self) {
+            #[cfg(feature = "std")]
+            {
+                raster_runtime::exit_recur_site_scope();
+            }
+        }
+    }
+
+    #[doc(hidden)]
+    pub struct RecurTraceScopeGuard {
+        #[cfg(feature = "std")]
+        inner: Option<raster_runtime::RecurTraceScopeGuard>,
+    }
+
+    impl RecurTraceScopeGuard {
+        pub fn enter() -> Self {
+            #[cfg(feature = "std")]
+            {
+                return Self {
+                    inner: Some(raster_runtime::RecurTraceScopeGuard::enter()),
+                };
+            }
+
+            #[cfg(not(feature = "std"))]
+            {
+                Self {}
+            }
+        }
+    }
+
+    impl Drop for RecurTraceScopeGuard {
+        fn drop(&mut self) {
+            #[cfg(feature = "std")]
+            {
+                self.inner.take();
+            }
+        }
+    }
+
     #[cfg(feature = "std")]
     pub fn bind_infallible_call<T>(result: T) -> crate::AuthRef<T>
     where
         T: serde::Serialize + serde::de::DeserializeOwned + 'static,
     {
-        let reference = crate::store_internal_value(&result).unwrap_or_else(|error| {
+        let reference = raster_runtime::store_execution_output_value(&result).unwrap_or_else(|error| {
             panic!("Failed to store tile output in internal storage: {}", error)
         });
         crate::into_auth_ref::<T, _>(crate::typed_internal::<T>(reference))
@@ -122,7 +238,7 @@ pub mod __private {
     where
         T: serde::Serialize + serde::de::DeserializeOwned + 'static,
     {
-        let reference = crate::store_internal_value(&result).unwrap_or_else(|error| {
+        let reference = raster_runtime::store_execution_output_value(&result).unwrap_or_else(|error| {
             panic!("Failed to store tile output in internal storage: {}", error)
         });
         match result {

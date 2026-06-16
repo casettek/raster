@@ -1,11 +1,11 @@
 //! Trace types (requires std feature).
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
-use std::hash::Hash;
-use std::ops::{Deref, DerefMut};
-use std::string::String;
-use std::vec::Vec;
+use alloc::collections::BTreeMap;
+use alloc::string::String;
+use alloc::vec::Vec;
+use core::hash::Hash;
+use core::ops::{Deref, DerefMut};
 
 use crate::cfs::CfsCoordinates;
 use crate::draft::DraftTransitionWitness;
@@ -155,6 +155,28 @@ pub struct TileExecRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct RecurExecRecord {
+    pub exec_index: u64,
+
+    pub recur_id: String,
+
+    pub sequence_id: String,
+    pub intra_sequence_index: u32,
+
+    pub coordinates: CfsCoordinates,
+
+    pub input_commitment: Vec<u8>,
+    pub input_source_commitment: Vec<u8>,
+    pub output_commitment: Vec<u8>,
+
+    pub external_input_commitment: Vec<u8>,
+    pub internal_store_root_before: Vec<u8>,
+    pub internal_store_root_after: Vec<u8>,
+    pub internal_store_index_root_before: Vec<u8>,
+    pub internal_store_index_root_after: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct SequenceStartRecord {
     pub exec_index: u64,
 
@@ -183,15 +205,81 @@ pub enum StepRecord {
     SequenceStart(SequenceStartRecord),
     SequenceEnd(SequenceEndRecord),
     TileExec(TileExecRecord),
+    RecurExec(RecurExecRecord),
 }
 
 impl StepRecord {
     pub fn coordinates(&self) -> &CfsCoordinates {
         match self {
             StepRecord::TileExec(tile_exec_record) => &tile_exec_record.coordinates,
+            StepRecord::RecurExec(recur_exec_record) => &recur_exec_record.coordinates,
             StepRecord::SequenceStart(sequence_start_record) => &sequence_start_record.coordinates,
             StepRecord::SequenceEnd(sequence_end_record) => &sequence_end_record.coordinates,
         }
+    }
+
+    pub fn input_commitment(&self) -> Option<&Vec<u8>> {
+        match self {
+            StepRecord::TileExec(record) => Some(&record.input_commitment),
+            StepRecord::RecurExec(record) => Some(&record.input_commitment),
+            StepRecord::SequenceStart(record) => Some(&record.input_commitment),
+            StepRecord::SequenceEnd(_) => None,
+        }
+    }
+
+    pub fn output_commitment(&self) -> Option<&Vec<u8>> {
+        match self {
+            StepRecord::TileExec(record) => Some(&record.output_commitment),
+            StepRecord::RecurExec(record) => Some(&record.output_commitment),
+            StepRecord::SequenceStart(_) => None,
+            StepRecord::SequenceEnd(record) => Some(&record.output_commitment),
+        }
+    }
+
+    pub fn input_source_commitment(&self) -> Option<&Vec<u8>> {
+        match self {
+            StepRecord::TileExec(record) => Some(&record.input_source_commitment),
+            StepRecord::RecurExec(record) => Some(&record.input_source_commitment),
+            StepRecord::SequenceStart(record) => Some(&record.input_source_commitment),
+            StepRecord::SequenceEnd(_) => None,
+        }
+    }
+
+    pub fn external_input_commitment(&self) -> Option<&Vec<u8>> {
+        match self {
+            StepRecord::TileExec(record) => Some(&record.external_input_commitment),
+            StepRecord::RecurExec(record) => Some(&record.external_input_commitment),
+            StepRecord::SequenceStart(record) => Some(&record.external_input_commitment),
+            StepRecord::SequenceEnd(_) => None,
+        }
+    }
+
+    pub fn internal_store_roots(
+        &self,
+    ) -> Option<(&Vec<u8>, &Vec<u8>, &Vec<u8>, &Vec<u8>)> {
+        match self {
+            StepRecord::TileExec(record) => Some((
+                &record.internal_store_root_before,
+                &record.internal_store_root_after,
+                &record.internal_store_index_root_before,
+                &record.internal_store_index_root_after,
+            )),
+            StepRecord::RecurExec(record) => Some((
+                &record.internal_store_root_before,
+                &record.internal_store_root_after,
+                &record.internal_store_index_root_before,
+                &record.internal_store_index_root_after,
+            )),
+            StepRecord::SequenceStart(_) | StepRecord::SequenceEnd(_) => None,
+        }
+    }
+
+    pub fn is_execution_step(&self) -> bool {
+        matches!(self, StepRecord::TileExec(_) | StepRecord::RecurExec(_))
+    }
+
+    pub fn requires_replay_proof(&self) -> bool {
+        matches!(self, StepRecord::TileExec(_))
     }
 }
 
@@ -220,7 +308,7 @@ impl DerefMut for Trace {
 
 impl IntoIterator for Trace {
     type Item = StepRecord;
-    type IntoIter = std::vec::IntoIter<StepRecord>;
+    type IntoIter = alloc::vec::IntoIter<StepRecord>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.0.into_iter()
@@ -246,4 +334,6 @@ pub enum TraceEvent {
     SequenceEnd(FnCallRecord),
 
     TileExec(FnCallRecord),
+    RecurTileExec(FnCallRecord),
+    RecurExec(FnCallRecord),
 }

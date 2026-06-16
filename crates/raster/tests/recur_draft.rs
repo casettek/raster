@@ -514,7 +514,7 @@ fn recur_trace_serializes_non_reusable_draft_markers() {
     let collect_lines_event = events
         .into_iter()
         .find_map(|event| match event {
-            TraceEvent::TileExec(record) if record.fn_name == "collect_lines" => Some(record),
+            TraceEvent::RecurTileExec(record) if record.fn_name == "collect_lines" => Some(record),
             _ => None,
         })
         .expect("collect_lines trace should be recorded");
@@ -538,7 +538,7 @@ fn recur_trace_threads_verified_roots_between_steps() {
     let collect_lines_events: Vec<_> = events
         .into_iter()
         .filter_map(|event| match event {
-            TraceEvent::TileExec(record) if record.fn_name == "collect_lines" => Some(record),
+            TraceEvent::RecurTileExec(record) if record.fn_name == "collect_lines" => Some(record),
             _ => None,
         })
         .collect();
@@ -572,4 +572,21 @@ fn recur_trace_threads_verified_roots_between_steps() {
             apply_draft_ops(&witness.pre_state, &native_transition.ops).expect("ops should apply");
         prior_root_after = Some(root_after);
     }
+}
+
+#[test]
+fn recur_trace_emits_site_completion_event() {
+    let (_reference, events) = capture_trace_events(run_build_lines_reference);
+    let site_events: Vec<_> = events
+        .into_iter()
+        .filter_map(|event| match event {
+            TraceEvent::RecurExec(record) if record.fn_name == "collect_lines" => Some(record),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(site_events.len(), 1);
+    let site_event = &site_events[0];
+    assert!(site_event.input.is_some(), "recur site should capture input trace");
+    assert!(site_event.output.is_some(), "recur site should capture finalized output");
 }

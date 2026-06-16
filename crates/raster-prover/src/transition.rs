@@ -57,8 +57,7 @@ fn build_transition_input(
         .cloned()
         .unwrap_or_else(|| panic!("Missing recorded I/O for transition step {:?}", step_record));
 
-    match step_record {
-        StepRecord::TileExec(_) => {
+    if step_record.requires_replay_proof() {
             let Some(replay_result) = replayed_results.get(step_record) else {
                 panic!(
                     "Replayed result not found for transition step {:?}",
@@ -81,8 +80,8 @@ fn build_transition_input(
                 authorization_journal: authorization_journal.clone(),
                 input_sources_witnesses: input_sources_witnesses.clone(),
             }
-        }
-        StepRecord::SequenceStart(_) | StepRecord::SequenceEnd(_) => TransitionInput {
+        } else {
+            TransitionInput {
             step_record: step_record.clone(),
             authorization_image_id: authorization_guest_image_id(),
             replay_image_id: None,
@@ -96,7 +95,7 @@ fn build_transition_input(
             draft_transition_witness,
             authorization_journal: authorization_journal.clone(),
             input_sources_witnesses: input_sources_witnesses.clone(),
-        },
+            }
     }
 }
 
@@ -179,8 +178,8 @@ pub fn step_transitions(
             replayed_results,
             authorization_journal,
         );
-        let replay_receipt_assumption: Option<risc0_zkvm::Receipt> = match step_record {
-            StepRecord::TileExec(_) => {
+        let replay_receipt_assumption: Option<risc0_zkvm::Receipt> =
+            if step_record.requires_replay_proof() {
                 let replay_result = replayed_results.get(step_record).unwrap_or_else(|| {
                     panic!(
                         "Replayed receipt not found for transition step {:?}",
@@ -190,9 +189,9 @@ pub fn step_transitions(
                 let receipt: risc0_zkvm::Receipt =
                     postcard::from_bytes(&replay_result.receipt).unwrap();
                 Some(receipt)
-            }
-            StepRecord::SequenceStart(_) | StepRecord::SequenceEnd(_) => None,
-        };
+            } else {
+                None
+            };
 
         let mut builder = risc0_zkvm::ExecutorEnv::builder();
         builder.add_assumption(authorization_receipt.clone());

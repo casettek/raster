@@ -1038,6 +1038,7 @@ fn gen_recur_driver_function(
     fn_name: &syn::Ident,
     shape: &RecurTileShape,
 ) -> proc_macro2::TokenStream {
+    let fn_name_str = fn_name.to_string();
     let hidden_name = format_ident!("__raster_recur_auth_{}", fn_name);
     let source_ident = format_ident!("__RasterRecurSource");
     let item_ty =
@@ -1180,6 +1181,96 @@ fn gen_recur_driver_function(
     } else {
         quote! { <#source_ident, #(#extra_generic_idents),*> }
     };
+    let state_trace_capture = shape
+        .state_param
+        .as_ref()
+        .map(|param| {
+            let state_ident = &param.ident;
+            let state_ty = &param.ty;
+            let state_ty_str = state_ty.to_token_stream().to_string();
+            quote! {
+                __raster_trace_values.push(::raster::core::trace::FnInputValue::Inline(
+                    ::raster::core::postcard::to_allocvec(&#state_ident).unwrap_or_default()
+                ));
+                __raster_trace_args.push(::raster::core::trace::FnInputArg {
+                    name: ::raster::alloc::string::String::from(stringify!(#state_ident)),
+                    ty: ::raster::alloc::string::String::from(#state_ty_str),
+                });
+            }
+        })
+        .unwrap_or_else(|| quote! {});
+    let output_trace_capture = shape
+        .output_schema
+        .as_ref()
+        .map(|output_schema| {
+            let output_ty = quote! { ::raster::Draft<#output_schema> }.to_string();
+            quote! {
+                __raster_trace_values.push(::raster::core::trace::FnInputValue::Inline(
+                    ::raster::serialize_draft_replay_handle::<#output_schema>(&output)
+                ));
+                __raster_trace_args.push(::raster::core::trace::FnInputArg {
+                    name: ::raster::alloc::string::String::from("output"),
+                    ty: ::raster::alloc::string::String::from(#output_ty),
+                });
+            }
+        })
+        .unwrap_or_else(|| quote! {});
+    let extra_trace_capture: Vec<_> = shape
+        .extra_params
+        .iter()
+        .enumerate()
+        .map(|(index, param)| {
+            let trace_ident = format_ident!("__raster_recur_trace_arg_{}", index);
+            let name = &param.ident;
+            let name_str = name.to_string();
+            let ty = &param.ty;
+            let ty_str = ty.to_token_stream().to_string();
+            quote! {
+                let #trace_ident = ::raster::into_auth_value::<#ty, _>(#name.clone())
+                    .unwrap_or_else(|e| panic!("Failed to materialize auth value for recur argument '{}': {}", stringify!(#name), e));
+                let __raster_trace_value = match #trace_ident {
+                    ::raster::AuthValue::External(__raster_external_value) => {
+                        __raster_external.insert(
+                            ::raster::alloc::string::String::from(#name_str),
+                            ::raster::core::trace::ExternalData {
+                                name: __raster_external_value.name.clone(),
+                                commitment: __raster_external_value
+                                    .commitment
+                                    .clone()
+                                    .map(|value| value.into_bytes())
+                                    .unwrap_or_default(),
+                                tree_root: __raster_external_value.selected.proof.root_hash.clone(),
+                                selector: __raster_external_value.selector.clone(),
+                                selected: __raster_external_value.selected.clone(),
+                            }
+                        );
+                        ::raster::core::trace::FnInputValue::ExternalBinding
+                    }
+                    ::raster::AuthValue::Internal(__raster_internal_value) => {
+                        __raster_internal.insert(
+                            ::raster::alloc::string::String::from(#name_str),
+                            ::raster::core::trace::InternalData {
+                                coordinates: __raster_internal_value.reference.coordinates.clone(),
+                                commitment: __raster_internal_value.reference.commitment.clone(),
+                            }
+                        );
+                        ::raster::core::trace::FnInputValue::InternalBinding
+                    }
+                    ::raster::AuthValue::Inline(__raster_inline_value) => {
+                        ::raster::core::trace::FnInputValue::Inline(
+                            ::raster::core::postcard::to_allocvec(&__raster_inline_value)
+                                .unwrap_or_default()
+                        )
+                    }
+                };
+                __raster_trace_values.push(__raster_trace_value);
+                __raster_trace_args.push(::raster::core::trace::FnInputArg {
+                    name: ::raster::alloc::string::String::from(#name_str),
+                    ty: ::raster::alloc::string::String::from(#ty_str),
+                });
+            }
+        })
+        .collect();
 
     quote! {
         #[doc(hidden)]
@@ -1195,7 +1286,80 @@ fn gen_recur_driver_function(
         {
             let input = ::raster::into_auth_ref::<::raster::alloc::vec::Vec<#item_ty>, _>(input);
             #state_wrapper
-            #run_driver
+
+            #[cfg(all(feature = "std", not(target_arch = "riscv32")))]
+            {
+                let __raster_input_trace = ::raster::auth_ref_trace(&input)
+                    .unwrap_or_else(|e| panic!("Failed to build recur input trace: {}", e));
+                let mut __raster_trace_values = ::raster::alloc::vec::Vec::new();
+                let mut __raster_trace_args = ::raster::alloc::vec::Vec::new();
+                let mut __raster_external = ::raster::alloc::collections::BTreeMap::new();
+                let mut __raster_internal = ::raster::alloc::collections::BTreeMap::new();
+
+                __raster_trace_values.push(__raster_input_trace.value);
+                __raster_trace_args.push(::raster::core::trace::FnInputArg {
+                    name: ::raster::alloc::string::String::from("input"),
+                    ty: ::raster::alloc::string::String::from(stringify!(::raster::AuthRef<::raster::alloc::vec::Vec<#item_ty>>)),
+                });
+                if let ::core::option::Option::Some(__raster_external_info) = __raster_input_trace.external {
+                    __raster_external.insert(
+                        ::raster::alloc::string::String::from("input"),
+                        __raster_external_info,
+                    );
+                }
+                if let ::core::option::Option::Some(__raster_internal_info) = __raster_input_trace.internal {
+                    __raster_internal.insert(
+                        ::raster::alloc::string::String::from("input"),
+                        __raster_internal_info,
+                    );
+                }
+                #state_trace_capture
+                #output_trace_capture
+                #(#extra_trace_capture)*
+                let __raster_input_bytes = ::raster::core::postcard::to_allocvec(&(
+                    __raster_trace_values.clone(),
+                    __raster_external.clone(),
+                    __raster_internal.clone(),
+                ))
+                .unwrap_or_default();
+                let __raster_input = ::core::option::Option::Some(::raster::core::trace::FnInput {
+                    data: __raster_input_bytes,
+                    values: __raster_trace_values,
+                    args: __raster_trace_args,
+                    external: __raster_external,
+                    internal: __raster_internal,
+                });
+
+                let __raster_recur_trace_scope = ::raster::__private::RecurTraceScopeGuard::enter();
+                let result = #run_driver;
+                drop(__raster_recur_trace_scope);
+
+                let __raster_output_bytes = ::raster::resolve_internal_value::<#result_ty>(result.reference().clone())
+                    .unwrap_or_else(|e| panic!("Failed to resolve recur output for trace: {}", e))
+                    .bytes
+                    .clone();
+                let __raster_output = ::core::option::Option::Some(
+                    ::raster::core::trace::FnOutput::new(
+                        __raster_output_bytes,
+                        stringify!(::raster::AuthRef<#result_ty>),
+                    )
+                );
+                ::raster::publish_trace_event(::raster::core::trace::TraceEvent::RecurExec(
+                    ::raster::core::trace::FnCallRecord {
+                        fn_name: ::raster::alloc::string::String::from(#fn_name_str),
+                        input: __raster_input,
+                        output: __raster_output,
+                        draft_transition_witness: ::core::option::Option::None,
+                    }
+                ));
+
+                return result;
+            }
+
+            #[cfg(not(all(feature = "std", not(target_arch = "riscv32"))))]
+            {
+                #run_driver
+            }
         }
     }
 }
@@ -1699,16 +1863,31 @@ fn rewrite_call_recur_macro(expr_macro: &syn::ExprMacro) -> Expr {
     if let Some(state_expr) = state_expr {
         if let Some(output_expr) = output_expr {
             syn::parse_quote! {
-                #hidden(#input_expr, #state_expr, #output_expr #(, #args)*)
+                {
+                    let __raster_recur_site_scope = ::raster::__private::RecurSiteScopeGuard::enter();
+                    let __raster_recur_result = #hidden(#input_expr, #state_expr, #output_expr #(, #args)*);
+                    let _ = &__raster_recur_site_scope;
+                    __raster_recur_result
+                }
             }
         } else {
             syn::parse_quote! {
-                #hidden(#input_expr, #state_expr #(, #args)*)
+                {
+                    let __raster_recur_site_scope = ::raster::__private::RecurSiteScopeGuard::enter();
+                    let __raster_recur_result = #hidden(#input_expr, #state_expr #(, #args)*);
+                    let _ = &__raster_recur_site_scope;
+                    __raster_recur_result
+                }
             }
         }
     } else if let Some(output_expr) = output_expr {
         syn::parse_quote! {
-            #hidden(#input_expr, #output_expr #(, #args)*)
+            {
+                let __raster_recur_site_scope = ::raster::__private::RecurSiteScopeGuard::enter();
+                let __raster_recur_result = #hidden(#input_expr, #output_expr #(, #args)*);
+                let _ = &__raster_recur_site_scope;
+                __raster_recur_result
+            }
         }
     } else {
         syn::parse_quote! {
@@ -2054,6 +2233,16 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
     let trace_output_serialization = gen_tile_trace_output_serialization();
     let (native_draft_capture_start, native_draft_capture_finish) =
         gen_native_draft_capture(&input_fn, &return_kind);
+    let publish_output_coordinates = match return_kind {
+        ProtocolReturnKind::Unit | ProtocolReturnKind::Value(_) | ProtocolReturnKind::Fallible(_) => {
+            quote! {
+                ::raster::__private::publish_tile_output_coordinates(
+                    __raster_tile_execution_scope.coordinates().clone(),
+                );
+            }
+        }
+        _ => quote! {},
+    };
     let auth_value_materialization = gen_auth_value_materialization(&input_fn);
     let tile_call_binding =
         gen_tile_call_binding_marker(&call_binding_marker, &return_kind, &input_fn.sig.output);
@@ -2092,6 +2281,8 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
             // On std + non-riscv32: wrap body in closure for tracing
             #[cfg(all(feature = "std", not(target_arch = "riscv32")))]
             {
+                let __raster_tile_execution_scope = ::raster::__private::TileExecutionScopeGuard::enter();
+
                 // Serialize inputs for tracing
                 #input_serialization
 
@@ -2121,6 +2312,8 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
                     __raster_record,
                 ));
 
+                #publish_output_coordinates
+                let _ = &__raster_tile_execution_scope;
                 return result;
             }
 
