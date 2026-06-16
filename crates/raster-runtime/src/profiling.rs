@@ -65,6 +65,14 @@ pub struct TileProfileRecord {
     #[serde(default)]
     pub draft_capture_ns: u64,
     #[serde(default)]
+    pub scope_enter_ns: u64,
+    #[serde(default)]
+    pub output_record_build_ns: u64,
+    #[serde(default)]
+    pub trace_event_publish_ns: u64,
+    #[serde(default)]
+    pub output_coordinate_publish_ns: u64,
+    #[serde(default)]
     pub other_wrapper_ns: u64,
 }
 
@@ -75,6 +83,10 @@ pub struct TileProfileOverheadBreakdown {
     pub output_store_ns: u64,
     pub trace_serialize_ns: u64,
     pub draft_capture_ns: u64,
+    pub scope_enter_ns: u64,
+    pub output_record_build_ns: u64,
+    pub trace_event_publish_ns: u64,
+    pub output_coordinate_publish_ns: u64,
     pub other_wrapper_ns: u64,
 }
 
@@ -85,6 +97,10 @@ impl TileProfileOverheadBreakdown {
             .saturating_add(self.output_store_ns)
             .saturating_add(self.trace_serialize_ns)
             .saturating_add(self.draft_capture_ns)
+            .saturating_add(self.scope_enter_ns)
+            .saturating_add(self.output_record_build_ns)
+            .saturating_add(self.trace_event_publish_ns)
+            .saturating_add(self.output_coordinate_publish_ns)
             .saturating_add(self.other_wrapper_ns)
     }
 
@@ -336,6 +352,10 @@ pub fn record_tile_profile(
             output_store_ns: overhead_breakdown.output_store_ns,
             trace_serialize_ns: overhead_breakdown.trace_serialize_ns,
             draft_capture_ns: overhead_breakdown.draft_capture_ns,
+            scope_enter_ns: overhead_breakdown.scope_enter_ns,
+            output_record_build_ns: overhead_breakdown.output_record_build_ns,
+            trace_event_publish_ns: overhead_breakdown.trace_event_publish_ns,
+            output_coordinate_publish_ns: overhead_breakdown.output_coordinate_publish_ns,
             other_wrapper_ns: overhead_breakdown.other_wrapper_ns,
         });
         state.records.push(record.clone());

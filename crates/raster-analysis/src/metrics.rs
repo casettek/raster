@@ -1,3 +1,4 @@
+use raster_core::cfs::CfsCoordinates;
 use raster_core::tile::TileId;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -8,6 +9,8 @@ pub struct Metrics {
     pub total_duration_ns: u64,
     #[serde(default)]
     pub program_total_known: bool,
+    #[serde(default)]
+    pub total_tile_invocations: u64,
     pub total_tile_duration_ns: u64,
     pub total_tile_user_duration_ns: u64,
     pub total_tile_raster_overhead_ns: u64,
@@ -22,10 +25,40 @@ pub struct Metrics {
     #[serde(default)]
     pub total_tile_draft_capture_ns: u64,
     #[serde(default)]
+    pub total_tile_scope_enter_ns: u64,
+    #[serde(default)]
+    pub total_tile_output_record_build_ns: u64,
+    #[serde(default)]
+    pub total_tile_trace_event_publish_ns: u64,
+    #[serde(default)]
+    pub total_tile_output_coordinate_publish_ns: u64,
+    #[serde(default)]
     pub total_tile_other_wrapper_ns: u64,
     pub total_sequence_self_duration_ns: u64,
+    #[serde(default)]
+    pub latest_tile_stats: Option<LatestTileStats>,
     pub tile_metrics: HashMap<TileId, TileMetrics>,
     pub sequence_metrics: HashMap<String, SequenceMetrics>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LatestTileStats {
+    pub invocation_index: u64,
+    pub tile_id: String,
+    pub coordinates: CfsCoordinates,
+    pub total_duration_ns: u64,
+    pub user_duration_ns: u64,
+    pub raster_overhead_ns: u64,
+    pub external_input_resolve_ns: u64,
+    pub internal_input_resolve_ns: u64,
+    pub output_store_ns: u64,
+    pub trace_serialize_ns: u64,
+    pub draft_capture_ns: u64,
+    pub scope_enter_ns: u64,
+    pub output_record_build_ns: u64,
+    pub trace_event_publish_ns: u64,
+    pub output_coordinate_publish_ns: u64,
+    pub other_wrapper_ns: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -57,6 +90,22 @@ pub struct TileMetrics {
     pub total_draft_capture_ns: u64,
     #[serde(default)]
     pub avg_draft_capture_ns: u64,
+    #[serde(default)]
+    pub total_scope_enter_ns: u64,
+    #[serde(default)]
+    pub avg_scope_enter_ns: u64,
+    #[serde(default)]
+    pub total_output_record_build_ns: u64,
+    #[serde(default)]
+    pub avg_output_record_build_ns: u64,
+    #[serde(default)]
+    pub total_trace_event_publish_ns: u64,
+    #[serde(default)]
+    pub avg_trace_event_publish_ns: u64,
+    #[serde(default)]
+    pub total_output_coordinate_publish_ns: u64,
+    #[serde(default)]
+    pub avg_output_coordinate_publish_ns: u64,
     #[serde(default)]
     pub total_other_wrapper_ns: u64,
     #[serde(default)]

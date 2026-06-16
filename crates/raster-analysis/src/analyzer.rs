@@ -1,5 +1,5 @@
 use crate::metrics::Metrics;
-use crate::metrics::{SequenceMetrics, TileMetrics};
+use crate::metrics::{LatestTileStats, SequenceMetrics, TileMetrics};
 use raster_core::Result;
 use raster_runtime::{ExecutionProfile, ProfileRecord};
 use std::fs;
@@ -65,6 +65,7 @@ fn ingest_record(metrics: &mut Metrics, record: &ProfileRecord) {
 }
 
 fn ingest_tile_record(metrics: &mut Metrics, record: &raster_runtime::TileProfileRecord) {
+    metrics.total_tile_invocations += 1;
     metrics.total_tile_duration_ns = metrics
         .total_tile_duration_ns
         .saturating_add(record.total_duration_ns);
@@ -89,9 +90,39 @@ fn ingest_tile_record(metrics: &mut Metrics, record: &raster_runtime::TileProfil
     metrics.total_tile_draft_capture_ns = metrics
         .total_tile_draft_capture_ns
         .saturating_add(record.draft_capture_ns);
+    metrics.total_tile_scope_enter_ns = metrics
+        .total_tile_scope_enter_ns
+        .saturating_add(record.scope_enter_ns);
+    metrics.total_tile_output_record_build_ns = metrics
+        .total_tile_output_record_build_ns
+        .saturating_add(record.output_record_build_ns);
+    metrics.total_tile_trace_event_publish_ns = metrics
+        .total_tile_trace_event_publish_ns
+        .saturating_add(record.trace_event_publish_ns);
+    metrics.total_tile_output_coordinate_publish_ns = metrics
+        .total_tile_output_coordinate_publish_ns
+        .saturating_add(record.output_coordinate_publish_ns);
     metrics.total_tile_other_wrapper_ns = metrics
         .total_tile_other_wrapper_ns
         .saturating_add(record.other_wrapper_ns);
+    metrics.latest_tile_stats = Some(LatestTileStats {
+        invocation_index: record.invocation_index,
+        tile_id: record.tile_id.clone(),
+        coordinates: record.coordinates.clone(),
+        total_duration_ns: record.total_duration_ns,
+        user_duration_ns: record.user_duration_ns,
+        raster_overhead_ns: record.raster_overhead_ns,
+        external_input_resolve_ns: record.external_input_resolve_ns,
+        internal_input_resolve_ns: record.internal_input_resolve_ns,
+        output_store_ns: record.output_store_ns,
+        trace_serialize_ns: record.trace_serialize_ns,
+        draft_capture_ns: record.draft_capture_ns,
+        scope_enter_ns: record.scope_enter_ns,
+        output_record_build_ns: record.output_record_build_ns,
+        trace_event_publish_ns: record.trace_event_publish_ns,
+        output_coordinate_publish_ns: record.output_coordinate_publish_ns,
+        other_wrapper_ns: record.other_wrapper_ns,
+    });
 
     let tile_metrics = metrics
         .tile_metrics
@@ -122,6 +153,18 @@ fn ingest_tile_record(metrics: &mut Metrics, record: &raster_runtime::TileProfil
     tile_metrics.total_draft_capture_ns = tile_metrics
         .total_draft_capture_ns
         .saturating_add(record.draft_capture_ns);
+    tile_metrics.total_scope_enter_ns = tile_metrics
+        .total_scope_enter_ns
+        .saturating_add(record.scope_enter_ns);
+    tile_metrics.total_output_record_build_ns = tile_metrics
+        .total_output_record_build_ns
+        .saturating_add(record.output_record_build_ns);
+    tile_metrics.total_trace_event_publish_ns = tile_metrics
+        .total_trace_event_publish_ns
+        .saturating_add(record.trace_event_publish_ns);
+    tile_metrics.total_output_coordinate_publish_ns = tile_metrics
+        .total_output_coordinate_publish_ns
+        .saturating_add(record.output_coordinate_publish_ns);
     tile_metrics.total_other_wrapper_ns = tile_metrics
         .total_other_wrapper_ns
         .saturating_add(record.other_wrapper_ns);
@@ -165,6 +208,13 @@ fn finalize_tile_averages(
         metrics.avg_output_store_ns = metrics.total_output_store_ns / metrics.invocations;
         metrics.avg_trace_serialize_ns = metrics.total_trace_serialize_ns / metrics.invocations;
         metrics.avg_draft_capture_ns = metrics.total_draft_capture_ns / metrics.invocations;
+        metrics.avg_scope_enter_ns = metrics.total_scope_enter_ns / metrics.invocations;
+        metrics.avg_output_record_build_ns =
+            metrics.total_output_record_build_ns / metrics.invocations;
+        metrics.avg_trace_event_publish_ns =
+            metrics.total_trace_event_publish_ns / metrics.invocations;
+        metrics.avg_output_coordinate_publish_ns =
+            metrics.total_output_coordinate_publish_ns / metrics.invocations;
         metrics.avg_other_wrapper_ns = metrics.total_other_wrapper_ns / metrics.invocations;
     }
 }
@@ -205,6 +255,10 @@ mod tests {
                     output_store_ns: 2,
                     trace_serialize_ns: 1,
                     draft_capture_ns: 0,
+                    scope_enter_ns: 1,
+                    output_record_build_ns: 1,
+                    trace_event_publish_ns: 0,
+                    output_coordinate_publish_ns: 0,
                     other_wrapper_ns: 1,
                 }),
                 ProfileRecord::Tile(TileProfileRecord {
@@ -220,6 +274,10 @@ mod tests {
                     output_store_ns: 1,
                     trace_serialize_ns: 1,
                     draft_capture_ns: 1,
+                    scope_enter_ns: 0,
+                    output_record_build_ns: 0,
+                    trace_event_publish_ns: 1,
+                    output_coordinate_publish_ns: 0,
                     other_wrapper_ns: 0,
                 }),
                 ProfileRecord::Sequence(SequenceProfileRecord {
@@ -243,16 +301,25 @@ mod tests {
             .unwrap();
         assert_eq!(metrics.total_duration_ns, 40);
         assert_eq!(metrics.total_tile_duration_ns, 30);
+        assert_eq!(metrics.total_tile_invocations, 2);
         assert_eq!(metrics.total_tile_user_duration_ns, 18);
         assert_eq!(metrics.total_tile_raster_overhead_ns, 12);
         assert_eq!(metrics.total_tile_external_input_resolve_ns, 4);
         assert_eq!(metrics.total_tile_internal_input_resolve_ns, 1);
         assert_eq!(metrics.total_tile_output_store_ns, 3);
+        assert_eq!(metrics.total_tile_scope_enter_ns, 1);
+        assert_eq!(metrics.total_tile_output_record_build_ns, 1);
+        assert_eq!(metrics.total_tile_trace_event_publish_ns, 1);
         assert_eq!(tile_metrics.invocations, 2);
         assert_eq!(tile_metrics.avg_duration_ns, 15);
         assert_eq!(tile_metrics.avg_user_duration_ns, 9);
         assert_eq!(tile_metrics.avg_raster_overhead_ns, 6);
         assert_eq!(tile_metrics.avg_output_store_ns, 1);
+        assert_eq!(tile_metrics.avg_trace_event_publish_ns, 0);
+        let latest_tile_stats = metrics.latest_tile_stats.as_ref().unwrap();
+        assert_eq!(latest_tile_stats.invocation_index, 2);
+        assert_eq!(latest_tile_stats.tile_id, "alpha");
+        assert_eq!(latest_tile_stats.total_duration_ns, 10);
 
         let sequence_metrics = metrics.sequence_metrics.get("main").unwrap();
         assert_eq!(sequence_metrics.total_self_duration_ns, 10);

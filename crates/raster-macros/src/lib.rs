@@ -2297,7 +2297,11 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
             #[cfg(all(feature = "std", not(target_arch = "riscv32")))]
             {
                 let __raster_wrapper_start = ::raster::__private::profile_now();
+                let __raster_scope_enter_start = ::raster::__private::profile_now();
                 let __raster_tile_execution_scope = ::raster::__private::TileExecutionScopeGuard::enter();
+                let __raster_scope_enter_ns =
+                    ::core::primitive::u64::try_from(__raster_scope_enter_start.elapsed().as_nanos())
+                        .unwrap_or(::core::primitive::u64::MAX);
                 let mut __raster_trace_serialize_ns: ::core::primitive::u64 = 0;
                 let mut __raster_draft_capture_ns: ::core::primitive::u64 = 0;
 
@@ -2337,6 +2341,7 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
                         .unwrap_or(::core::primitive::u64::MAX)
                 );
 
+                let __raster_output_record_build_start = ::raster::__private::profile_now();
                 let __raster_output = ::core::option::Option::Some(
                     ::raster::core::trace::FnOutput {
                         data: __raster_output_bytes,
@@ -2350,11 +2355,22 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
                     output: __raster_output,
                     draft_transition_witness: __raster_draft_transition_witness,
                 };
+                let __raster_output_record_build_ns =
+                    ::core::primitive::u64::try_from(__raster_output_record_build_start.elapsed().as_nanos())
+                        .unwrap_or(::core::primitive::u64::MAX);
+                let __raster_trace_event_publish_start = ::raster::__private::profile_now();
                 ::raster::publish_trace_event(::raster::core::trace::TraceEvent::TileExec(
                     __raster_record,
                 ));
+                let __raster_trace_event_publish_ns =
+                    ::core::primitive::u64::try_from(__raster_trace_event_publish_start.elapsed().as_nanos())
+                        .unwrap_or(::core::primitive::u64::MAX);
 
+                let __raster_output_coordinate_publish_start = ::raster::__private::profile_now();
                 #publish_output_coordinates
+                let __raster_output_coordinate_publish_ns =
+                    ::core::primitive::u64::try_from(__raster_output_coordinate_publish_start.elapsed().as_nanos())
+                        .unwrap_or(::core::primitive::u64::MAX);
                 let __raster_wrapper_duration_ns =
                     ::core::primitive::u64::try_from(__raster_wrapper_start.elapsed().as_nanos())
                         .unwrap_or(::core::primitive::u64::MAX);
@@ -2370,6 +2386,10 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
                     __raster_internal_input_resolve_ns,
                     __raster_trace_serialize_ns,
                     __raster_draft_capture_ns,
+                    __raster_scope_enter_ns,
+                    __raster_output_record_build_ns,
+                    __raster_trace_event_publish_ns,
+                    __raster_output_coordinate_publish_ns,
                 );
                 let _ = &__raster_tile_execution_scope;
                 return result;

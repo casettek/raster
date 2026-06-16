@@ -200,6 +200,10 @@ pub mod __private {
         internal_input_resolve_ns: u64,
         trace_serialize_ns: u64,
         draft_capture_ns: u64,
+        scope_enter_ns: u64,
+        output_record_build_ns: u64,
+        trace_event_publish_ns: u64,
+        output_coordinate_publish_ns: u64,
     ) {
         raster_runtime::record_tile_profile(
             tile_id,
@@ -212,6 +216,10 @@ pub mod __private {
                 output_store_ns: 0,
                 trace_serialize_ns,
                 draft_capture_ns,
+                scope_enter_ns,
+                output_record_build_ns,
+                trace_event_publish_ns,
+                output_coordinate_publish_ns,
                 other_wrapper_ns: 0,
             },
         );
@@ -221,6 +229,10 @@ pub mod __private {
     pub fn record_tile_profile(
         _: &str,
         _: crate::core::cfs::CfsCoordinates,
+        _: u64,
+        _: u64,
+        _: u64,
+        _: u64,
         _: u64,
         _: u64,
         _: u64,
