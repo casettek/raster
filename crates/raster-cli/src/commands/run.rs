@@ -39,7 +39,7 @@ use raster_prover::trace::{
 use raster_prover::transition::step_transitions;
 use raster_runtime::TraceRecorder;
 
-use crate::commands::{default_profile_path, default_profile_stream_path, default_trace_path};
+use crate::commands::create_run_artifacts;
 use crate::utils::authorization::{build_manifested_inputs, collect_external_input_commitments};
 use crate::BackendType;
 
@@ -50,7 +50,9 @@ pub fn run(
     commit_flag: Option<&str>,
     audit_flag: Option<&str>,
     verbose: bool,
-    profile_stream: Option<&str>,
+    features: &[String],
+    all_features: bool,
+    no_default_features: bool,
 ) -> Result<()> {
     if backend_type != BackendType::Native {
         return Err(Error::Other(
@@ -71,10 +73,22 @@ pub fn run(
 
     println!("Building project...");
 
-    // Build the project with cargo build --release
-    let build_status = Command::new("cargo")
+    let mut build_command = Command::new("cargo");
+    build_command
         .current_dir(&project.root_dir)
-        .args(["build", "--release"])
+        .args(["build", "--release"]);
+    if no_default_features {
+        build_command.arg("--no-default-features");
+    }
+    if all_features {
+        build_command.arg("--all-features");
+    }
+    if !features.is_empty() {
+        build_command.arg("--features");
+        build_command.arg(features.join(","));
+    }
+
+    let build_status = build_command
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .status()
@@ -96,49 +110,26 @@ pub fn run(
     println!("Running {}...", &project.name);
     println!();
 
-    let trace_path = default_trace_path();
-    let profile_path = default_profile_path();
-    let profile_stream_path = profile_stream.map(|raw| {
-        if raw.is_empty() || raw == "__default__" {
-            default_profile_stream_path()
-        } else {
-            PathBuf::from(raw)
-        }
-    });
-    if let Some(parent) = trace_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    if trace_path.exists() {
-        std::fs::remove_file(&trace_path)?;
-    }
-    if let Some(parent) = profile_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    if profile_path.exists() {
-        std::fs::remove_file(&profile_path)?;
-    }
-    if let Some(stream_path) = &profile_stream_path {
-        if let Some(parent) = stream_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        if stream_path.exists() {
-            std::fs::remove_file(stream_path)?;
-        }
-    }
+    let artifacts = create_run_artifacts()?;
+    let trace_path = artifacts.trace_path.clone();
+    let profile_path = artifacts.profile_path.clone();
+    let profile_stream_path = artifacts.profile_stream_path.clone();
+    println!("Run ID: {}", artifacts.run_id);
+    println!("Run artifacts dir: {}", artifacts.run_dir.display());
+    println!("Trace path: {}", trace_path.display());
+    println!("Profile path: {}", profile_path.display());
+    println!("Profile stream path: {}", profile_stream_path.display());
+    println!();
 
     let mut cmd = Command::new(&binary_path);
     cmd.current_dir(&project.root_dir);
     cmd.env(raster_runtime::TRACE_PATH_ENV, &trace_path);
     cmd.env(raster_runtime::PROFILE_PATH_ENV, &profile_path);
-    if let Some(stream_path) = &profile_stream_path {
-        cmd.env(raster_runtime::PROFILE_STREAM_PATH_ENV, stream_path);
-        println!("Live profile stream enabled: {}", stream_path.display());
-        println!(
-            "Follow with: cargo raster analyze --follow {}",
-            stream_path.display()
-        );
-        println!();
-    }
+    cmd.env(
+        raster_runtime::PROFILE_STREAM_PATH_ENV,
+        &profile_stream_path,
+    );
+    cmd.env(raster_runtime::PROFILE_RUN_ID_ENV, &artifacts.run_id);
     if let Some(input_json) = input {
         cmd.args(["--input", input_json]);
     }
@@ -348,6 +339,17 @@ pub fn run(
     }
 
     if profile_path.exists() {
+        if profile_stream_path.exists() {
+            println!();
+            println!(
+                "Live profile stream saved to: {}",
+                profile_stream_path.display()
+            );
+            println!(
+                "Follow with: cargo raster analyze --follow {}",
+                profile_stream_path.display()
+            );
+        }
         println!();
         println!("Execution profile saved to: {}", profile_path.display());
         let analyzer = Analyzer::from_path(&profile_path)?;

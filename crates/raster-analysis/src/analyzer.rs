@@ -53,7 +53,7 @@ impl Analyzer {
 
 impl Default for Analyzer {
     fn default() -> Self {
-        Self::new(ExecutionProfile::new(Vec::new(), None))
+        Self::new(ExecutionProfile::new(Vec::new(), None, None))
     }
 }
 
@@ -171,9 +171,34 @@ fn ingest_tile_record(metrics: &mut Metrics, record: &raster_runtime::TileProfil
 }
 
 fn ingest_sequence_record(metrics: &mut Metrics, record: &raster_runtime::SequenceProfileRecord) {
+    metrics.total_sequence_invocations += 1;
     metrics.total_sequence_self_duration_ns = metrics
         .total_sequence_self_duration_ns
         .saturating_add(record.self_duration_ns);
+    metrics.total_sequence_body_self_ns = metrics
+        .total_sequence_body_self_ns
+        .saturating_add(record.self_breakdown.body_self_ns);
+    metrics.total_sequence_scope_enter_ns = metrics
+        .total_sequence_scope_enter_ns
+        .saturating_add(record.self_breakdown.scope_enter_ns);
+    metrics.total_sequence_synthetic_coordinate_alloc_ns = metrics
+        .total_sequence_synthetic_coordinate_alloc_ns
+        .saturating_add(record.self_breakdown.synthetic_coordinate_alloc_ns);
+    metrics.total_sequence_input_trace_ns = metrics
+        .total_sequence_input_trace_ns
+        .saturating_add(record.self_breakdown.input_trace_ns);
+    metrics.total_sequence_start_event_publish_ns = metrics
+        .total_sequence_start_event_publish_ns
+        .saturating_add(record.self_breakdown.start_event_publish_ns);
+    metrics.total_sequence_output_trace_ns = metrics
+        .total_sequence_output_trace_ns
+        .saturating_add(record.self_breakdown.output_trace_ns);
+    metrics.total_sequence_end_event_publish_ns = metrics
+        .total_sequence_end_event_publish_ns
+        .saturating_add(record.self_breakdown.end_event_publish_ns);
+    metrics.total_sequence_other_wrapper_ns = metrics
+        .total_sequence_other_wrapper_ns
+        .saturating_add(record.self_breakdown.other_wrapper_ns);
 
     let sequence_metrics = metrics
         .sequence_metrics
@@ -189,6 +214,30 @@ fn ingest_sequence_record(metrics: &mut Metrics, record: &raster_runtime::Sequen
     sequence_metrics.total_child_duration_ns = sequence_metrics
         .total_child_duration_ns
         .saturating_add(record.child_duration_ns);
+    sequence_metrics.total_body_self_ns = sequence_metrics
+        .total_body_self_ns
+        .saturating_add(record.self_breakdown.body_self_ns);
+    sequence_metrics.total_scope_enter_ns = sequence_metrics
+        .total_scope_enter_ns
+        .saturating_add(record.self_breakdown.scope_enter_ns);
+    sequence_metrics.total_synthetic_coordinate_alloc_ns = sequence_metrics
+        .total_synthetic_coordinate_alloc_ns
+        .saturating_add(record.self_breakdown.synthetic_coordinate_alloc_ns);
+    sequence_metrics.total_input_trace_ns = sequence_metrics
+        .total_input_trace_ns
+        .saturating_add(record.self_breakdown.input_trace_ns);
+    sequence_metrics.total_start_event_publish_ns = sequence_metrics
+        .total_start_event_publish_ns
+        .saturating_add(record.self_breakdown.start_event_publish_ns);
+    sequence_metrics.total_output_trace_ns = sequence_metrics
+        .total_output_trace_ns
+        .saturating_add(record.self_breakdown.output_trace_ns);
+    sequence_metrics.total_end_event_publish_ns = sequence_metrics
+        .total_end_event_publish_ns
+        .saturating_add(record.self_breakdown.end_event_publish_ns);
+    sequence_metrics.total_other_wrapper_ns = sequence_metrics
+        .total_other_wrapper_ns
+        .saturating_add(record.self_breakdown.other_wrapper_ns);
 }
 
 fn finalize_tile_averages(
@@ -228,6 +277,16 @@ fn finalize_sequence_averages(
         }
         metrics.avg_duration_ns = metrics.total_duration_ns / metrics.invocations;
         metrics.avg_self_duration_ns = metrics.total_self_duration_ns / metrics.invocations;
+        metrics.avg_body_self_ns = metrics.total_body_self_ns / metrics.invocations;
+        metrics.avg_scope_enter_ns = metrics.total_scope_enter_ns / metrics.invocations;
+        metrics.avg_synthetic_coordinate_alloc_ns =
+            metrics.total_synthetic_coordinate_alloc_ns / metrics.invocations;
+        metrics.avg_input_trace_ns = metrics.total_input_trace_ns / metrics.invocations;
+        metrics.avg_start_event_publish_ns =
+            metrics.total_start_event_publish_ns / metrics.invocations;
+        metrics.avg_output_trace_ns = metrics.total_output_trace_ns / metrics.invocations;
+        metrics.avg_end_event_publish_ns = metrics.total_end_event_publish_ns / metrics.invocations;
+        metrics.avg_other_wrapper_ns = metrics.total_other_wrapper_ns / metrics.invocations;
     }
 }
 
@@ -235,7 +294,8 @@ fn finalize_sequence_averages(
 mod tests {
     use super::*;
     use raster_runtime::{
-        ExecutionProfile, ProfileRecord, SequenceProfileRecord, TileProfileRecord,
+        ExecutionProfile, ProfileRecord, SequenceProfileRecord, SequenceProfileSelfBreakdown,
+        TileProfileRecord,
     };
 
     #[test]
@@ -287,9 +347,20 @@ mod tests {
                     total_duration_ns: 40,
                     self_duration_ns: 10,
                     child_duration_ns: 30,
+                    self_breakdown: SequenceProfileSelfBreakdown {
+                        body_self_ns: 4,
+                        scope_enter_ns: 1,
+                        synthetic_coordinate_alloc_ns: 2,
+                        input_trace_ns: 1,
+                        start_event_publish_ns: 1,
+                        output_trace_ns: 1,
+                        end_event_publish_ns: 0,
+                        other_wrapper_ns: 0,
+                    },
                 }),
             ],
             Some(40),
+            None,
         );
 
         let analyzer = Analyzer::new(profile);
@@ -324,5 +395,9 @@ mod tests {
         let sequence_metrics = metrics.sequence_metrics.get("main").unwrap();
         assert_eq!(sequence_metrics.total_self_duration_ns, 10);
         assert_eq!(sequence_metrics.total_child_duration_ns, 30);
+        assert_eq!(metrics.total_sequence_invocations, 1);
+        assert_eq!(metrics.total_sequence_body_self_ns, 4);
+        assert_eq!(metrics.total_sequence_synthetic_coordinate_alloc_ns, 2);
+        assert_eq!(sequence_metrics.avg_input_trace_ns, 1);
     }
 }

@@ -255,6 +255,7 @@ fn tile_call_binding_marker_ident(fn_name: &syn::Ident) -> syn::Ident {
 
 fn gen_auth_value_materialization(input: &ItemFn) -> proc_macro2::TokenStream {
     let params = extract_params(input);
+    let profiling_enabled = cfg!(feature = "profiling");
     let resolutions: Vec<_> = params
         .iter()
         .map(|param| {
@@ -263,24 +264,36 @@ fn gen_auth_value_materialization(input: &ItemFn) -> proc_macro2::TokenStream {
             let external_info_ident = external_info_ident(param);
             let internal_info_ident = internal_info_ident(param);
             match protocol_kind {
-                ParamProtocolKind::AuthValue(value_ty) => quote! {
-                    let __raster_auth_value_start = ::raster::__private::profile_now();
-                    let __raster_auth_value = ::raster::into_auth_value::<#value_ty, _>(#name)
-                        .unwrap_or_else(|e| panic!("Failed to materialize auth value for argument '{}': {}", stringify!(#name), e));
-                    let __raster_auth_value_duration_ns =
-                        ::core::primitive::u64::try_from(__raster_auth_value_start.elapsed().as_nanos())
-                            .unwrap_or(::core::primitive::u64::MAX);
-                    if __raster_auth_value.as_external().is_some() {
-                        __raster_external_input_resolve_ns = __raster_external_input_resolve_ns
-                            .saturating_add(__raster_auth_value_duration_ns);
-                    } else if __raster_auth_value.as_internal().is_some() {
-                        __raster_internal_input_resolve_ns = __raster_internal_input_resolve_ns
-                            .saturating_add(__raster_auth_value_duration_ns);
+                ParamProtocolKind::AuthValue(value_ty) => {
+                    if profiling_enabled {
+                        quote! {
+                            let __raster_auth_value_start = ::raster::__private::profile_now();
+                            let __raster_auth_value = ::raster::into_auth_value::<#value_ty, _>(#name)
+                                .unwrap_or_else(|e| panic!("Failed to materialize auth value for argument '{}': {}", stringify!(#name), e));
+                            let __raster_auth_value_duration_ns =
+                                ::core::primitive::u64::try_from(__raster_auth_value_start.elapsed().as_nanos())
+                                    .unwrap_or(::core::primitive::u64::MAX);
+                            if __raster_auth_value.as_external().is_some() {
+                                __raster_external_input_resolve_ns = __raster_external_input_resolve_ns
+                                    .saturating_add(__raster_auth_value_duration_ns);
+                            } else if __raster_auth_value.as_internal().is_some() {
+                                __raster_internal_input_resolve_ns = __raster_internal_input_resolve_ns
+                                    .saturating_add(__raster_auth_value_duration_ns);
+                            }
+                            let #external_info_ident = __raster_auth_value.as_external().cloned();
+                            let #internal_info_ident = __raster_auth_value.as_internal().cloned();
+                            let #name: #value_ty = __raster_auth_value.into_inner();
+                        }
+                    } else {
+                        quote! {
+                            let __raster_auth_value = ::raster::into_auth_value::<#value_ty, _>(#name)
+                                .unwrap_or_else(|e| panic!("Failed to materialize auth value for argument '{}': {}", stringify!(#name), e));
+                            let #external_info_ident = __raster_auth_value.as_external().cloned();
+                            let #internal_info_ident = __raster_auth_value.as_internal().cloned();
+                            let #name: #value_ty = __raster_auth_value.into_inner();
+                        }
                     }
-                    let #external_info_ident = __raster_auth_value.as_external().cloned();
-                    let #internal_info_ident = __raster_auth_value.as_internal().cloned();
-                    let #name: #value_ty = __raster_auth_value.into_inner();
-                },
+                }
                 ParamProtocolKind::Draft(value_ty) | ParamProtocolKind::RecurOutput(value_ty) => quote! {
                     let #external_info_ident: ::core::option::Option<::raster::ExternalValue<#value_ty>> = ::core::option::Option::None;
                     let #internal_info_ident: ::core::option::Option<::raster::InternalValue<#value_ty>> = ::core::option::Option::None;
@@ -2286,120 +2299,160 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
         #implementation_sig #fn_body
     };
 
-    let original_function = quote! {
-        #(#fn_attrs)*
-        #fn_vis #exposed_sig {
-            let mut __raster_external_input_resolve_ns: ::core::primitive::u64 = 0;
-            let mut __raster_internal_input_resolve_ns: ::core::primitive::u64 = 0;
-            #auth_value_materialization
+    let original_function = if cfg!(feature = "profiling") {
+        quote! {
+            #(#fn_attrs)*
+            #fn_vis #exposed_sig {
+                let mut __raster_external_input_resolve_ns: ::core::primitive::u64 = 0;
+                let mut __raster_internal_input_resolve_ns: ::core::primitive::u64 = 0;
+                #auth_value_materialization
 
-            // On std + non-riscv32: wrap body in closure for tracing
-            #[cfg(all(feature = "std", not(target_arch = "riscv32")))]
-            {
-                let __raster_wrapper_start = ::raster::__private::profile_now();
-                let __raster_scope_enter_start = ::raster::__private::profile_now();
-                let __raster_tile_execution_scope = ::raster::__private::TileExecutionScopeGuard::enter();
-                let __raster_scope_enter_ns =
-                    ::core::primitive::u64::try_from(__raster_scope_enter_start.elapsed().as_nanos())
-                        .unwrap_or(::core::primitive::u64::MAX);
-                let mut __raster_trace_serialize_ns: ::core::primitive::u64 = 0;
-                let mut __raster_draft_capture_ns: ::core::primitive::u64 = 0;
+                #[cfg(all(feature = "std", not(target_arch = "riscv32")))]
+                {
+                    let __raster_wrapper_start = ::raster::__private::profile_now();
+                    let __raster_scope_enter_start = ::raster::__private::profile_now();
+                    let __raster_tile_execution_scope = ::raster::__private::TileExecutionScopeGuard::enter();
+                    let __raster_scope_enter_ns =
+                        ::core::primitive::u64::try_from(__raster_scope_enter_start.elapsed().as_nanos())
+                            .unwrap_or(::core::primitive::u64::MAX);
+                    let mut __raster_trace_serialize_ns: ::core::primitive::u64 = 0;
+                    let mut __raster_draft_capture_ns: ::core::primitive::u64 = 0;
 
-                // Serialize inputs for tracing
-                let __raster_trace_input_start = ::raster::__private::profile_now();
-                #input_serialization
-                __raster_trace_serialize_ns = __raster_trace_serialize_ns.saturating_add(
-                    ::core::primitive::u64::try_from(__raster_trace_input_start.elapsed().as_nanos())
-                        .unwrap_or(::core::primitive::u64::MAX)
-                );
+                    let __raster_trace_input_start = ::raster::__private::profile_now();
+                    #input_serialization
+                    __raster_trace_serialize_ns = __raster_trace_serialize_ns.saturating_add(
+                        ::core::primitive::u64::try_from(__raster_trace_input_start.elapsed().as_nanos())
+                            .unwrap_or(::core::primitive::u64::MAX)
+                    );
 
-                let __raster_draft_capture_start_timer = ::raster::__private::profile_now();
-                #native_draft_capture_start
-                __raster_draft_capture_ns = __raster_draft_capture_ns.saturating_add(
-                    ::core::primitive::u64::try_from(__raster_draft_capture_start_timer.elapsed().as_nanos())
-                        .unwrap_or(::core::primitive::u64::MAX)
-                );
+                    let __raster_draft_capture_start_timer = ::raster::__private::profile_now();
+                    #native_draft_capture_start
+                    __raster_draft_capture_ns = __raster_draft_capture_ns.saturating_add(
+                        ::core::primitive::u64::try_from(__raster_draft_capture_start_timer.elapsed().as_nanos())
+                            .unwrap_or(::core::primitive::u64::MAX)
+                    );
 
-                let __raster_user_start = ::raster::__private::profile_now();
-                #function_call
-                let __raster_user_duration_ns =
-                    ::core::primitive::u64::try_from(__raster_user_start.elapsed().as_nanos())
-                        .unwrap_or(::core::primitive::u64::MAX);
+                    let __raster_user_start = ::raster::__private::profile_now();
+                    #function_call
+                    let __raster_user_duration_ns =
+                        ::core::primitive::u64::try_from(__raster_user_start.elapsed().as_nanos())
+                            .unwrap_or(::core::primitive::u64::MAX);
 
-                let __raster_draft_capture_finish_timer = ::raster::__private::profile_now();
-                #native_draft_capture_finish
-                __raster_draft_capture_ns = __raster_draft_capture_ns.saturating_add(
-                    ::core::primitive::u64::try_from(__raster_draft_capture_finish_timer.elapsed().as_nanos())
-                        .unwrap_or(::core::primitive::u64::MAX)
-                );
+                    let __raster_draft_capture_finish_timer = ::raster::__private::profile_now();
+                    #native_draft_capture_finish
+                    __raster_draft_capture_ns = __raster_draft_capture_ns.saturating_add(
+                        ::core::primitive::u64::try_from(__raster_draft_capture_finish_timer.elapsed().as_nanos())
+                            .unwrap_or(::core::primitive::u64::MAX)
+                    );
 
-                // Serialize output and emit TraceEvent::TileExec
-                let __raster_trace_output_start = ::raster::__private::profile_now();
-                #trace_output_serialization
-                __raster_trace_serialize_ns = __raster_trace_serialize_ns.saturating_add(
-                    ::core::primitive::u64::try_from(__raster_trace_output_start.elapsed().as_nanos())
-                        .unwrap_or(::core::primitive::u64::MAX)
-                );
+                    let __raster_trace_output_start = ::raster::__private::profile_now();
+                    #trace_output_serialization
+                    __raster_trace_serialize_ns = __raster_trace_serialize_ns.saturating_add(
+                        ::core::primitive::u64::try_from(__raster_trace_output_start.elapsed().as_nanos())
+                            .unwrap_or(::core::primitive::u64::MAX)
+                    );
 
-                let __raster_output_record_build_start = ::raster::__private::profile_now();
-                let __raster_output = ::core::option::Option::Some(
-                    ::raster::core::trace::FnOutput {
-                        data: __raster_output_bytes,
-                        ty: ::raster::alloc::string::String::from(#output_type_expr),
-                    }
-                );
+                    let __raster_output_record_build_start = ::raster::__private::profile_now();
+                    let __raster_output = ::core::option::Option::Some(
+                        ::raster::core::trace::FnOutput {
+                            data: __raster_output_bytes,
+                            ty: ::raster::alloc::string::String::from(#output_type_expr),
+                        }
+                    );
 
-                let __raster_record = ::raster::core::trace::FnCallRecord {
-                    fn_name: ::raster::alloc::string::String::from(#fn_name_str),
-                    input: __raster_input,
-                    output: __raster_output,
-                    draft_transition_witness: __raster_draft_transition_witness,
-                };
-                let __raster_output_record_build_ns =
-                    ::core::primitive::u64::try_from(__raster_output_record_build_start.elapsed().as_nanos())
-                        .unwrap_or(::core::primitive::u64::MAX);
-                let __raster_trace_event_publish_start = ::raster::__private::profile_now();
-                ::raster::publish_trace_event(::raster::core::trace::TraceEvent::TileExec(
-                    __raster_record,
-                ));
-                let __raster_trace_event_publish_ns =
-                    ::core::primitive::u64::try_from(__raster_trace_event_publish_start.elapsed().as_nanos())
-                        .unwrap_or(::core::primitive::u64::MAX);
+                    let __raster_record = ::raster::core::trace::FnCallRecord {
+                        fn_name: ::raster::alloc::string::String::from(#fn_name_str),
+                        input: __raster_input,
+                        output: __raster_output,
+                        draft_transition_witness: __raster_draft_transition_witness,
+                    };
+                    let __raster_output_record_build_ns =
+                        ::core::primitive::u64::try_from(__raster_output_record_build_start.elapsed().as_nanos())
+                            .unwrap_or(::core::primitive::u64::MAX);
+                    let __raster_trace_event_publish_start = ::raster::__private::profile_now();
+                    ::raster::publish_trace_event(::raster::core::trace::TraceEvent::TileExec(
+                        __raster_record,
+                    ));
+                    let __raster_trace_event_publish_ns =
+                        ::core::primitive::u64::try_from(__raster_trace_event_publish_start.elapsed().as_nanos())
+                            .unwrap_or(::core::primitive::u64::MAX);
 
-                let __raster_output_coordinate_publish_start = ::raster::__private::profile_now();
-                #publish_output_coordinates
-                let __raster_output_coordinate_publish_ns =
-                    ::core::primitive::u64::try_from(__raster_output_coordinate_publish_start.elapsed().as_nanos())
-                        .unwrap_or(::core::primitive::u64::MAX);
-                let __raster_wrapper_duration_ns =
-                    ::core::primitive::u64::try_from(__raster_wrapper_start.elapsed().as_nanos())
-                        .unwrap_or(::core::primitive::u64::MAX);
-                let __raster_total_duration_ns = __raster_wrapper_duration_ns
-                    .saturating_add(__raster_external_input_resolve_ns)
-                    .saturating_add(__raster_internal_input_resolve_ns);
-                ::raster::__private::record_tile_profile(
-                    #fn_name_str,
-                    __raster_tile_execution_scope.coordinates().clone(),
-                    __raster_total_duration_ns,
-                    __raster_user_duration_ns,
-                    __raster_external_input_resolve_ns,
-                    __raster_internal_input_resolve_ns,
-                    __raster_trace_serialize_ns,
-                    __raster_draft_capture_ns,
-                    __raster_scope_enter_ns,
-                    __raster_output_record_build_ns,
-                    __raster_trace_event_publish_ns,
-                    __raster_output_coordinate_publish_ns,
-                );
-                let _ = &__raster_tile_execution_scope;
-                return result;
+                    let __raster_output_coordinate_publish_start = ::raster::__private::profile_now();
+                    #publish_output_coordinates
+                    let __raster_output_coordinate_publish_ns =
+                        ::core::primitive::u64::try_from(__raster_output_coordinate_publish_start.elapsed().as_nanos())
+                            .unwrap_or(::core::primitive::u64::MAX);
+                    let __raster_wrapper_duration_ns =
+                        ::core::primitive::u64::try_from(__raster_wrapper_start.elapsed().as_nanos())
+                            .unwrap_or(::core::primitive::u64::MAX);
+                    let __raster_total_duration_ns = __raster_wrapper_duration_ns
+                        .saturating_add(__raster_external_input_resolve_ns)
+                        .saturating_add(__raster_internal_input_resolve_ns);
+                    ::raster::__private::record_tile_profile(
+                        #fn_name_str,
+                        __raster_tile_execution_scope.coordinates().clone(),
+                        __raster_total_duration_ns,
+                        __raster_user_duration_ns,
+                        __raster_external_input_resolve_ns,
+                        __raster_internal_input_resolve_ns,
+                        __raster_trace_serialize_ns,
+                        __raster_draft_capture_ns,
+                        __raster_scope_enter_ns,
+                        __raster_output_record_build_ns,
+                        __raster_trace_event_publish_ns,
+                        __raster_output_coordinate_publish_ns,
+                    );
+                    let _ = &__raster_tile_execution_scope;
+                    return result;
+                }
+
+                #[cfg(not(all(feature = "std", not(target_arch = "riscv32"))))]
+                {
+                    #function_call
+                    result
+                }
             }
+        }
+    } else {
+        quote! {
+            #(#fn_attrs)*
+            #fn_vis #exposed_sig {
+                #auth_value_materialization
 
-            // On riscv32 or no-std: just execute original body directly
-            #[cfg(not(all(feature = "std", not(target_arch = "riscv32"))))]
-            {
-                #function_call
-                result
+                #[cfg(all(feature = "std", not(target_arch = "riscv32")))]
+                {
+                    let __raster_tile_execution_scope = ::raster::__private::TileExecutionScopeGuard::enter();
+                    #input_serialization
+                    #native_draft_capture_start
+                    #function_call
+                    #native_draft_capture_finish
+                    #trace_output_serialization
+                    let __raster_output = ::core::option::Option::Some(
+                        ::raster::core::trace::FnOutput {
+                            data: __raster_output_bytes,
+                            ty: ::raster::alloc::string::String::from(#output_type_expr),
+                        }
+                    );
+
+                    let __raster_record = ::raster::core::trace::FnCallRecord {
+                        fn_name: ::raster::alloc::string::String::from(#fn_name_str),
+                        input: __raster_input,
+                        output: __raster_output,
+                        draft_transition_witness: __raster_draft_transition_witness,
+                    };
+                    ::raster::publish_trace_event(::raster::core::trace::TraceEvent::TileExec(
+                        __raster_record,
+                    ));
+                    #publish_output_coordinates
+                    let _ = &__raster_tile_execution_scope;
+                    return result;
+                }
+
+                #[cfg(not(all(feature = "std", not(target_arch = "riscv32"))))]
+                {
+                    #function_call
+                    result
+                }
             }
         }
     };
@@ -2490,49 +2543,116 @@ fn gen_sequence_wrapped_body(
         }
     };
 
-    quote! {
-        #[cfg(all(feature = "std", not(target_arch = "riscv32")))]
-        {
-            let __raster_sequence_profile_start = ::raster::__private::profile_now();
-            let __raster_sequence_scope_guard =
-                ::raster::__private::SequenceScopeGuard::enter(#fn_name_str);
-            ::raster::__private::begin_sequence_profile(#fn_name_str);
-            #input_serialization
+    if cfg!(feature = "profiling") {
+        quote! {
+            #[cfg(all(feature = "std", not(target_arch = "riscv32")))]
+            {
+                let __raster_sequence_profile_start = ::raster::__private::profile_now();
+                let __raster_sequence_scope_enter_start = ::raster::__private::profile_now();
+                let __raster_sequence_scope_guard =
+                    ::raster::__private::SequenceScopeGuard::enter(#fn_name_str);
+                ::raster::__private::begin_sequence_profile(#fn_name_str);
+                let __raster_sequence_scope_enter_ns =
+                    ::core::primitive::u64::try_from(__raster_sequence_scope_enter_start.elapsed().as_nanos())
+                        .unwrap_or(::core::primitive::u64::MAX);
+                let __raster_sequence_input_trace_start = ::raster::__private::profile_now();
+                #input_serialization
+                let __raster_sequence_input_trace_ns =
+                    ::core::primitive::u64::try_from(__raster_sequence_input_trace_start.elapsed().as_nanos())
+                        .unwrap_or(::core::primitive::u64::MAX);
 
-            let mut __raster_record = ::raster::core::trace::FnCallRecord {
-                fn_name: ::raster::alloc::string::String::from(#fn_name_str),
-                input: __raster_input,
-                output: ::core::option::Option::None,
-                draft_transition_witness: ::core::option::Option::None,
-            };
-            ::raster::publish_trace_event(::raster::core::trace::TraceEvent::SequenceStart(
-                __raster_record.clone(),
-            ));
-            #auth_result_binding
-            #trace_output_binding
-            __raster_record.output = ::core::option::Option::Some(::raster::core::trace::FnOutput::new(
-                __raster_output_bytes,
-                ::raster::alloc::string::String::from(#output_type_expr),
-            ));
-            ::raster::publish_trace_event(::raster::core::trace::TraceEvent::SequenceEnd(
-                __raster_record,
-            ));
-            let __raster_sequence_total_duration_ns =
-                ::core::primitive::u64::try_from(__raster_sequence_profile_start.elapsed().as_nanos())
+                let __raster_sequence_start_event_publish_start = ::raster::__private::profile_now();
+                let mut __raster_record = ::raster::core::trace::FnCallRecord {
+                    fn_name: ::raster::alloc::string::String::from(#fn_name_str),
+                    input: __raster_input,
+                    output: ::core::option::Option::None,
+                    draft_transition_witness: ::core::option::Option::None,
+                };
+                ::raster::publish_trace_event(::raster::core::trace::TraceEvent::SequenceStart(
+                    __raster_record.clone(),
+                ));
+                let __raster_sequence_start_event_publish_ns =
+                    ::core::primitive::u64::try_from(
+                        __raster_sequence_start_event_publish_start.elapsed().as_nanos()
+                    )
                     .unwrap_or(::core::primitive::u64::MAX);
-            ::raster::__private::finish_sequence_profile(
-                #fn_name_str,
-                __raster_sequence_total_duration_ns,
-            );
-            __raster_result
-        }
+                #auth_result_binding
+                let __raster_sequence_output_trace_start = ::raster::__private::profile_now();
+                #trace_output_binding
+                let __raster_sequence_output_trace_ns =
+                    ::core::primitive::u64::try_from(__raster_sequence_output_trace_start.elapsed().as_nanos())
+                        .unwrap_or(::core::primitive::u64::MAX);
+                let __raster_sequence_end_event_publish_start = ::raster::__private::profile_now();
+                __raster_record.output = ::core::option::Option::Some(::raster::core::trace::FnOutput::new(
+                    __raster_output_bytes,
+                    ::raster::alloc::string::String::from(#output_type_expr),
+                ));
+                ::raster::publish_trace_event(::raster::core::trace::TraceEvent::SequenceEnd(
+                    __raster_record,
+                ));
+                let __raster_sequence_end_event_publish_ns =
+                    ::core::primitive::u64::try_from(
+                        __raster_sequence_end_event_publish_start.elapsed().as_nanos()
+                    )
+                    .unwrap_or(::core::primitive::u64::MAX);
+                let __raster_sequence_total_duration_ns =
+                    ::core::primitive::u64::try_from(__raster_sequence_profile_start.elapsed().as_nanos())
+                        .unwrap_or(::core::primitive::u64::MAX);
+                ::raster::__private::finish_sequence_profile(
+                    #fn_name_str,
+                    __raster_sequence_total_duration_ns,
+                    __raster_sequence_scope_enter_ns,
+                    __raster_sequence_input_trace_ns,
+                    __raster_sequence_start_event_publish_ns,
+                    __raster_sequence_output_trace_ns,
+                    __raster_sequence_end_event_publish_ns,
+                );
+                __raster_result
+            }
 
-        #[cfg(not(all(feature = "std", not(target_arch = "riscv32"))))]
-        {
-            let __raster_sequence_scope_guard =
-                ::raster::__private::SequenceScopeGuard::enter(#fn_name_str);
-            #auth_result_binding
-            __raster_result
+            #[cfg(not(all(feature = "std", not(target_arch = "riscv32"))))]
+            {
+                let __raster_sequence_scope_guard =
+                    ::raster::__private::SequenceScopeGuard::enter(#fn_name_str);
+                #auth_result_binding
+                __raster_result
+            }
+        }
+    } else {
+        quote! {
+            #[cfg(all(feature = "std", not(target_arch = "riscv32")))]
+            {
+                let __raster_sequence_scope_guard =
+                    ::raster::__private::SequenceScopeGuard::enter(#fn_name_str);
+                #input_serialization
+                let mut __raster_record = ::raster::core::trace::FnCallRecord {
+                    fn_name: ::raster::alloc::string::String::from(#fn_name_str),
+                    input: __raster_input,
+                    output: ::core::option::Option::None,
+                    draft_transition_witness: ::core::option::Option::None,
+                };
+                ::raster::publish_trace_event(::raster::core::trace::TraceEvent::SequenceStart(
+                    __raster_record.clone(),
+                ));
+                #auth_result_binding
+                #trace_output_binding
+                __raster_record.output = ::core::option::Option::Some(::raster::core::trace::FnOutput::new(
+                    __raster_output_bytes,
+                    ::raster::alloc::string::String::from(#output_type_expr),
+                ));
+                ::raster::publish_trace_event(::raster::core::trace::TraceEvent::SequenceEnd(
+                    __raster_record,
+                ));
+                __raster_result
+            }
+
+            #[cfg(not(all(feature = "std", not(target_arch = "riscv32"))))]
+            {
+                let __raster_sequence_scope_guard =
+                    ::raster::__private::SequenceScopeGuard::enter(#fn_name_str);
+                #auth_result_binding
+                __raster_result
+            }
         }
     }
 }

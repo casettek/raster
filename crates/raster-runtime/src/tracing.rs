@@ -21,8 +21,10 @@ std::thread_local! {
 /// Subsequent calls will have no effect.
 pub fn init() {
     if let Some(trace_path) = std::env::var_os(TRACE_PATH_ENV) {
-        let publisher = BinaryTraceEventPublisher::from_path(trace_path.into())
-            .unwrap_or_else(|error| panic!("Failed to initialize binary trace publisher: {}", error));
+        let publisher =
+            BinaryTraceEventPublisher::from_path(trace_path.into()).unwrap_or_else(|error| {
+                panic!("Failed to initialize binary trace publisher: {}", error)
+            });
         init_with(publisher);
     } else {
         init_with(TraceEventPublisher::new(std::io::stdout()));

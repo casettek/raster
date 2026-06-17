@@ -18,6 +18,10 @@ impl Report {
             self.metrics.total_tile_raster_overhead_ns,
             self.metrics.total_tile_invocations,
         );
+        let avg_sequence_self = average_duration(
+            self.metrics.total_sequence_self_duration_ns,
+            self.metrics.total_sequence_invocations,
+        );
         let program_total = if self.metrics.program_total_known {
             format_duration(self.metrics.total_duration_ns)
         } else {
@@ -42,6 +46,12 @@ impl Report {
             "Sequence self time: {}",
             format_duration(self.metrics.total_sequence_self_duration_ns)
         ));
+        if let Some(avg_sequence_self) = avg_sequence_self {
+            lines.push(format!(
+                "Avg sequence self: {}",
+                format_duration(avg_sequence_self)
+            ));
+        }
         if self.metrics.total_tile_raster_overhead_ns > 0 {
             lines.push(String::from("Tile overhead breakdown:"));
             lines.push(format_bucket_line(
@@ -93,6 +103,49 @@ impl Report {
                 "other wrapper",
                 self.metrics.total_tile_other_wrapper_ns,
                 self.metrics.total_tile_invocations,
+            ));
+        }
+        if self.metrics.total_sequence_self_duration_ns > 0 {
+            lines.push(String::from("Sequence self breakdown:"));
+            lines.push(format_bucket_line(
+                "body self",
+                self.metrics.total_sequence_body_self_ns,
+                self.metrics.total_sequence_invocations,
+            ));
+            lines.push(format_bucket_line(
+                "scope enter",
+                self.metrics.total_sequence_scope_enter_ns,
+                self.metrics.total_sequence_invocations,
+            ));
+            lines.push(format_bucket_line(
+                "synthetic coordinate alloc",
+                self.metrics.total_sequence_synthetic_coordinate_alloc_ns,
+                self.metrics.total_sequence_invocations,
+            ));
+            lines.push(format_bucket_line(
+                "input trace",
+                self.metrics.total_sequence_input_trace_ns,
+                self.metrics.total_sequence_invocations,
+            ));
+            lines.push(format_bucket_line(
+                "sequence start publish",
+                self.metrics.total_sequence_start_event_publish_ns,
+                self.metrics.total_sequence_invocations,
+            ));
+            lines.push(format_bucket_line(
+                "output trace",
+                self.metrics.total_sequence_output_trace_ns,
+                self.metrics.total_sequence_invocations,
+            ));
+            lines.push(format_bucket_line(
+                "sequence end publish",
+                self.metrics.total_sequence_end_event_publish_ns,
+                self.metrics.total_sequence_invocations,
+            ));
+            lines.push(format_bucket_line(
+                "other wrapper",
+                self.metrics.total_sequence_other_wrapper_ns,
+                self.metrics.total_sequence_invocations,
             ));
         }
 
@@ -150,6 +203,17 @@ impl Report {
                     format_duration(metrics.total_child_duration_ns),
                     metrics.invocations
                 ));
+                lines.push(format!(
+                    "  self parts: body {}, scope {}, coords {}, in-trace {}, start {}, out-trace {}, end {}, other {}",
+                    format_duration(metrics.total_body_self_ns),
+                    format_duration(metrics.total_scope_enter_ns),
+                    format_duration(metrics.total_synthetic_coordinate_alloc_ns),
+                    format_duration(metrics.total_input_trace_ns),
+                    format_duration(metrics.total_start_event_publish_ns),
+                    format_duration(metrics.total_output_trace_ns),
+                    format_duration(metrics.total_end_event_publish_ns),
+                    format_duration(metrics.total_other_wrapper_ns),
+                ));
             }
         }
 
@@ -191,7 +255,7 @@ fn format_duration(duration_ns: u64) -> String {
 }
 
 fn average_duration(total_ns: u64, invocations: u64) -> Option<u64> {
-    (invocations > 0).then_some(total_ns / invocations)
+    (invocations > 0).then(|| total_ns / invocations)
 }
 
 fn format_bucket_line(label: &str, total_ns: u64, invocations: u64) -> String {
@@ -203,5 +267,62 @@ fn format_bucket_line(label: &str, total_ns: u64, invocations: u64) -> String {
             format_duration(avg_ns)
         ),
         None => format!("  {}: {}", label, format_duration(total_ns)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::metrics::{Metrics, SequenceMetrics};
+
+    #[test]
+    fn text_report_includes_sequence_self_breakdown() {
+        let mut metrics = Metrics {
+            total_duration_ns: 100,
+            program_total_known: true,
+            total_sequence_invocations: 2,
+            total_sequence_self_duration_ns: 20,
+            total_sequence_body_self_ns: 8,
+            total_sequence_scope_enter_ns: 2,
+            total_sequence_synthetic_coordinate_alloc_ns: 3,
+            total_sequence_input_trace_ns: 2,
+            total_sequence_start_event_publish_ns: 1,
+            total_sequence_output_trace_ns: 2,
+            total_sequence_end_event_publish_ns: 1,
+            total_sequence_other_wrapper_ns: 1,
+            ..Metrics::default()
+        };
+        metrics.sequence_metrics.insert(
+            "main".to_string(),
+            SequenceMetrics {
+                invocations: 2,
+                total_duration_ns: 100,
+                avg_duration_ns: 50,
+                total_self_duration_ns: 20,
+                avg_self_duration_ns: 10,
+                total_child_duration_ns: 80,
+                total_body_self_ns: 8,
+                avg_body_self_ns: 4,
+                total_scope_enter_ns: 2,
+                avg_scope_enter_ns: 1,
+                total_synthetic_coordinate_alloc_ns: 3,
+                avg_synthetic_coordinate_alloc_ns: 1,
+                total_input_trace_ns: 2,
+                avg_input_trace_ns: 1,
+                total_start_event_publish_ns: 1,
+                avg_start_event_publish_ns: 0,
+                total_output_trace_ns: 2,
+                avg_output_trace_ns: 1,
+                total_end_event_publish_ns: 1,
+                avg_end_event_publish_ns: 0,
+                total_other_wrapper_ns: 1,
+                avg_other_wrapper_ns: 0,
+            },
+        );
+
+        let text = Report::new(metrics).to_text();
+        assert!(text.contains("Sequence self breakdown:"));
+        assert!(text.contains("synthetic coordinate alloc"));
+        assert!(text.contains("self parts: body"));
     }
 }

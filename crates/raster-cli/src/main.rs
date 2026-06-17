@@ -59,11 +59,11 @@ enum Commands {
 
     /// Analyze execution traces
     Analyze {
-        /// Path to profile file (optional, uses most recent if not specified)
+        /// Path to a run-scoped profile file emitted by `cargo raster run`
         profile_path: Option<String>,
 
-        /// Follow a live NDJSON profile stream (optional path, uses default if omitted)
-        #[arg(long, num_args = 0..=1, default_missing_value = "__default__")]
+        /// Follow a live run-scoped NDJSON profile stream emitted by `cargo raster run`
+        #[arg(long)]
         follow: Option<String>,
 
         /// Refresh interval for follow mode, in milliseconds
@@ -152,9 +152,17 @@ enum Commands {
         #[arg(long)]
         verbose: bool,
 
-        /// Write a live profile stream (optional path, uses default if omitted)
-        #[arg(long = "profile-stream", num_args = 0..=1, default_missing_value = "__default__")]
-        profile_stream: Option<String>,
+        /// Space- or comma-separated Cargo features for building the target project
+        #[arg(long, value_delimiter = ',', action = clap::ArgAction::Append)]
+        features: Vec<String>,
+
+        /// Enable all Cargo features when building the target project
+        #[arg(long)]
+        all_features: bool,
+
+        /// Disable default Cargo features when building the target project
+        #[arg(long)]
+        no_default_features: bool,
     },
 }
 
@@ -218,7 +226,9 @@ fn try_main() -> Result<()> {
             commit,
             audit,
             verbose,
-            profile_stream,
+            features,
+            all_features,
+            no_default_features,
         } => commands::run::run(
             backend,
             input.as_deref(),
@@ -226,7 +236,9 @@ fn try_main() -> Result<()> {
             commit.as_deref(),
             audit.as_deref(),
             verbose,
-            profile_stream.as_deref(),
+            &features,
+            all_features,
+            no_default_features,
         ),
     }
 }

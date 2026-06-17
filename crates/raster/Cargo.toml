@@ -9,8 +9,9 @@ description = "Rust-based developer toolchain for tile-based execution"
 
 [features]
 default = ["std"]
-std = ["raster-core/std", "raster-runtime"]
+std = ["raster-core/std", "dep:raster-runtime", "raster-runtime/tracing"]
 alloc = ["raster-core/alloc"]
+profiling = ["std", "raster-runtime/profiling", "raster-macros/profiling"]
 
 [dependencies]
 raster-core = { workspace = true, default-features = false }

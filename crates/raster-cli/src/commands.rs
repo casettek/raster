@@ -22,8 +22,10 @@ use std::env;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Get the output directory for artifacts.
 fn output_dir() -> PathBuf {
@@ -33,16 +35,48 @@ fn output_dir() -> PathBuf {
         .join("raster")
 }
 
-pub(crate) fn default_profile_path() -> PathBuf {
-    output_dir().join("profiles").join("latest.json")
+#[derive(Debug, Clone)]
+pub(crate) struct RunArtifacts {
+    pub run_id: String,
+    pub run_dir: PathBuf,
+    pub trace_path: PathBuf,
+    pub profile_path: PathBuf,
+    pub profile_stream_path: PathBuf,
 }
 
-pub(crate) fn default_profile_stream_path() -> PathBuf {
-    output_dir().join("profiles").join("latest.ndjson")
+impl RunArtifacts {
+    fn new(run_id: String) -> Self {
+        let run_dir = output_dir().join("runs").join(&run_id);
+        Self {
+            trace_path: run_dir.join("trace.bin"),
+            profile_path: run_dir.join("profile.json"),
+            profile_stream_path: run_dir.join("profile.ndjson"),
+            run_dir,
+            run_id,
+        }
+    }
 }
 
-pub(crate) fn default_trace_path() -> PathBuf {
-    output_dir().join("traces").join("latest.bin")
+pub(crate) fn create_run_artifacts() -> Result<RunArtifacts> {
+    let run_id = generate_run_id();
+    let artifacts = RunArtifacts::new(run_id);
+    fs::create_dir_all(&artifacts.run_dir)?;
+    Ok(artifacts)
+}
+
+fn generate_run_id() -> String {
+    static RUN_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let sequence = RUN_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!(
+        "{:020}-{:09}-pid{}-{:06}",
+        timestamp.as_secs(),
+        timestamp.subsec_nanos(),
+        std::process::id(),
+        sequence
+    )
 }
 
 /// Get the project path (current directory).
@@ -131,12 +165,14 @@ pub fn analyze(
     format: AnalyzeFormat,
 ) -> Result<()> {
     if let Some(stream_path) = follow {
-        return follow_profile_stream(resolve_stream_path(stream_path), refresh_ms, format);
+        return follow_profile_stream(PathBuf::from(stream_path), refresh_ms, format);
     }
 
-    let profile_path = profile_path
-        .map(PathBuf::from)
-        .unwrap_or_else(default_profile_path);
+    let Some(profile_path) = profile_path.map(PathBuf::from) else {
+        return Err(Error::Other(
+            "Provide a profile path, or use `cargo raster analyze --follow <path>`.".into(),
+        ));
+    };
     println!("Analyzing profile: {}", profile_path.display());
     println!();
 
@@ -146,14 +182,6 @@ pub fn analyze(
     println!("{}", render_report(&report, format)?);
 
     Ok(())
-}
-
-fn resolve_stream_path(raw_path: String) -> PathBuf {
-    if raw_path.is_empty() || raw_path == "__default__" {
-        default_profile_stream_path()
-    } else {
-        PathBuf::from(raw_path)
-    }
 }
 
 fn render_report(report: &Report, format: AnalyzeFormat) -> Result<String> {
@@ -177,7 +205,7 @@ fn follow_profile_stream(path: PathBuf, refresh_ms: u64, format: AnalyzeFormat) 
         }
     };
 
-    let mut profile = ExecutionProfile::new(Vec::new(), None);
+    let mut profile = ExecutionProfile::new(Vec::new(), None, None);
     let mut saw_finish = false;
     let mut dirty = true;
 
@@ -276,8 +304,13 @@ name = "{name}"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = ["std"]
+std = ["raster/std"]
+profiling = ["raster/profiling"]
+
 [dependencies]
-raster = {{ path = "../path/to/raster/crates/raster" }}
+raster = {{ path = "../path/to/raster/crates/raster", default-features = false }}
 serde = {{ version = "1.0", features = ["derive"] }}
 "#
     );
@@ -553,4 +586,50 @@ pub fn cfs(output: Option<String>) -> Result<()> {
     println!("CFS written to: {}", output_path.display());
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn create_run_artifacts_returns_unique_run_scoped_paths() {
+        let first = create_run_artifacts().expect("first artifact allocation should succeed");
+        let second = create_run_artifacts().expect("second artifact allocation should succeed");
+
+        assert_ne!(first.run_id, second.run_id);
+        assert_ne!(first.run_dir, second.run_dir);
+        assert_eq!(first.trace_path, first.run_dir.join("trace.bin"));
+        assert_eq!(first.profile_path, first.run_dir.join("profile.json"));
+        assert_eq!(
+            first.profile_stream_path,
+            first.run_dir.join("profile.ndjson")
+        );
+        assert!(first.run_dir.exists());
+        assert!(second.run_dir.exists());
+    }
+
+    #[test]
+    fn create_run_artifacts_stays_unique_across_concurrent_allocations() {
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    create_run_artifacts().expect("artifact allocation should succeed")
+                })
+            })
+            .collect();
+
+        let artifacts: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().expect("thread should complete"))
+            .collect();
+
+        let unique_run_dirs: HashSet<_> =
+            artifacts.iter().map(|item| item.run_dir.clone()).collect();
+        let unique_run_ids: HashSet<_> = artifacts.iter().map(|item| item.run_id.clone()).collect();
+
+        assert_eq!(unique_run_dirs.len(), artifacts.len());
+        assert_eq!(unique_run_ids.len(), artifacts.len());
+    }
 }

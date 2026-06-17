@@ -3,8 +3,8 @@ use raster_core::trace::TraceEvent;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
-use std::sync::OnceLock;
 use std::sync::mpsc::{self, SyncSender};
+use std::sync::OnceLock;
 use std::thread::JoinHandle;
 
 // TODO: consider pluggable publisher registration here
@@ -128,8 +128,9 @@ impl Publisher for BinaryTraceEventPublisher {
             .take();
         if let Some(join_handle) = join_handle {
             match join_handle.join() {
-                Ok(result) => result
-                    .unwrap_or_else(|error| panic!("Failed to flush binary trace writer: {}", error)),
+                Ok(result) => result.unwrap_or_else(|error| {
+                    panic!("Failed to flush binary trace writer: {}", error)
+                }),
                 Err(_) => panic!("Binary trace writer thread panicked"),
             }
         }

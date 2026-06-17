@@ -12,6 +12,7 @@ required-features = ["gen-input"]
 [features]
 default = ["std"]
 std = ["raster/std"]
+profiling = ["raster/profiling"]
 gen-input = ["dep:serde_json", "dep:sha2"]
 
 [dependencies]

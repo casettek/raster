@@ -34,7 +34,25 @@ pub struct Metrics {
     pub total_tile_output_coordinate_publish_ns: u64,
     #[serde(default)]
     pub total_tile_other_wrapper_ns: u64,
+    #[serde(default)]
+    pub total_sequence_invocations: u64,
     pub total_sequence_self_duration_ns: u64,
+    #[serde(default)]
+    pub total_sequence_body_self_ns: u64,
+    #[serde(default)]
+    pub total_sequence_scope_enter_ns: u64,
+    #[serde(default)]
+    pub total_sequence_synthetic_coordinate_alloc_ns: u64,
+    #[serde(default)]
+    pub total_sequence_input_trace_ns: u64,
+    #[serde(default)]
+    pub total_sequence_start_event_publish_ns: u64,
+    #[serde(default)]
+    pub total_sequence_output_trace_ns: u64,
+    #[serde(default)]
+    pub total_sequence_end_event_publish_ns: u64,
+    #[serde(default)]
+    pub total_sequence_other_wrapper_ns: u64,
     #[serde(default)]
     pub latest_tile_stats: Option<LatestTileStats>,
     pub tile_metrics: HashMap<TileId, TileMetrics>,
@@ -121,4 +139,36 @@ pub struct SequenceMetrics {
     pub total_self_duration_ns: u64,
     pub avg_self_duration_ns: u64,
     pub total_child_duration_ns: u64,
+    #[serde(default)]
+    pub total_body_self_ns: u64,
+    #[serde(default)]
+    pub avg_body_self_ns: u64,
+    #[serde(default)]
+    pub total_scope_enter_ns: u64,
+    #[serde(default)]
+    pub avg_scope_enter_ns: u64,
+    #[serde(default)]
+    pub total_synthetic_coordinate_alloc_ns: u64,
+    #[serde(default)]
+    pub avg_synthetic_coordinate_alloc_ns: u64,
+    #[serde(default)]
+    pub total_input_trace_ns: u64,
+    #[serde(default)]
+    pub avg_input_trace_ns: u64,
+    #[serde(default)]
+    pub total_start_event_publish_ns: u64,
+    #[serde(default)]
+    pub avg_start_event_publish_ns: u64,
+    #[serde(default)]
+    pub total_output_trace_ns: u64,
+    #[serde(default)]
+    pub avg_output_trace_ns: u64,
+    #[serde(default)]
+    pub total_end_event_publish_ns: u64,
+    #[serde(default)]
+    pub avg_end_event_publish_ns: u64,
+    #[serde(default)]
+    pub total_other_wrapper_ns: u64,
+    #[serde(default)]
+    pub avg_other_wrapper_ns: u64,
 }

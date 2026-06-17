@@ -176,19 +176,54 @@ pub mod __private {
 
     #[cfg(feature = "std")]
     pub fn begin_sequence_profile(sequence_id: &str) {
+        #[cfg(feature = "profiling")]
         raster_runtime::begin_sequence_profile(sequence_id);
+        #[cfg(not(feature = "profiling"))]
+        let _ = sequence_id;
     }
 
     #[cfg(not(feature = "std"))]
     pub fn begin_sequence_profile(_: &str) {}
 
     #[cfg(feature = "std")]
-    pub fn finish_sequence_profile(sequence_id: &str, total_duration_ns: u64) {
-        raster_runtime::finish_sequence_profile(sequence_id, total_duration_ns);
+    pub fn finish_sequence_profile(
+        sequence_id: &str,
+        total_duration_ns: u64,
+        scope_enter_ns: u64,
+        input_trace_ns: u64,
+        start_event_publish_ns: u64,
+        output_trace_ns: u64,
+        end_event_publish_ns: u64,
+    ) {
+        #[cfg(feature = "profiling")]
+        raster_runtime::finish_sequence_profile(
+            sequence_id,
+            total_duration_ns,
+            raster_runtime::SequenceProfileSelfBreakdown {
+                body_self_ns: 0,
+                scope_enter_ns,
+                synthetic_coordinate_alloc_ns: 0,
+                input_trace_ns,
+                start_event_publish_ns,
+                output_trace_ns,
+                end_event_publish_ns,
+                other_wrapper_ns: 0,
+            },
+        );
+        #[cfg(not(feature = "profiling"))]
+        let _ = (
+            sequence_id,
+            total_duration_ns,
+            scope_enter_ns,
+            input_trace_ns,
+            start_event_publish_ns,
+            output_trace_ns,
+            end_event_publish_ns,
+        );
     }
 
     #[cfg(not(feature = "std"))]
-    pub fn finish_sequence_profile(_: &str, _: u64) {}
+    pub fn finish_sequence_profile(_: &str, _: u64, _: u64, _: u64, _: u64, _: u64, _: u64) {}
 
     #[cfg(feature = "std")]
     pub fn record_tile_profile(
@@ -205,6 +240,7 @@ pub mod __private {
         trace_event_publish_ns: u64,
         output_coordinate_publish_ns: u64,
     ) {
+        #[cfg(feature = "profiling")]
         raster_runtime::record_tile_profile(
             tile_id,
             coordinates,
@@ -222,6 +258,21 @@ pub mod __private {
                 output_coordinate_publish_ns,
                 other_wrapper_ns: 0,
             },
+        );
+        #[cfg(not(feature = "profiling"))]
+        let _ = (
+            tile_id,
+            coordinates,
+            total_duration_ns,
+            user_duration_ns,
+            external_input_resolve_ns,
+            internal_input_resolve_ns,
+            trace_serialize_ns,
+            draft_capture_ns,
+            scope_enter_ns,
+            output_record_build_ns,
+            trace_event_publish_ns,
+            output_coordinate_publish_ns,
         );
     }
 
@@ -312,13 +363,16 @@ pub mod __private {
     where
         T: serde::Serialize + serde::de::DeserializeOwned + 'static,
     {
+        #[cfg(feature = "profiling")]
         let output_store_start = profile_now();
         let reference =
             raster_runtime::store_execution_output_value(&result).unwrap_or_else(|error| {
                 panic!("Failed to store tile output in internal storage: {}", error)
             });
+        #[cfg(feature = "profiling")]
         let output_store_duration_ns =
             u64::try_from(output_store_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        #[cfg(feature = "profiling")]
         raster_runtime::record_tile_output_store_profile(output_store_duration_ns);
         crate::into_auth_ref::<T, _>(crate::typed_internal::<T>(reference))
     }
@@ -335,13 +389,16 @@ pub mod __private {
     where
         T: serde::Serialize + serde::de::DeserializeOwned + 'static,
     {
+        #[cfg(feature = "profiling")]
         let output_store_start = profile_now();
         let reference =
             raster_runtime::store_execution_output_value(&result).unwrap_or_else(|error| {
                 panic!("Failed to store tile output in internal storage: {}", error)
             });
+        #[cfg(feature = "profiling")]
         let output_store_duration_ns =
             u64::try_from(output_store_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        #[cfg(feature = "profiling")]
         raster_runtime::record_tile_output_store_profile(output_store_duration_ns);
         match result {
             Ok(_) => Ok(crate::into_auth_ref::<T, _>(
