@@ -4,11 +4,12 @@ pub mod recorder;
 
 use raster_core::trace::TraceEvent;
 
-use crate::tracing::publisher::TraceEventPublisher;
+use crate::tracing::publisher::{BinaryTraceEventPublisher, TraceEventPublisher};
 use crate::tracing::publisher::{Publisher, GLOBAL_PUBLISHER};
 use std::cell::Cell;
 
 pub const TRACE_EVENT_PREFIX: &str = "[trace-event]";
+pub const TRACE_PATH_ENV: &str = "RASTER_TRACE_PATH";
 
 std::thread_local! {
     static RECUR_TRACE_DEPTH: Cell<u32> = const { Cell::new(0) };
@@ -19,7 +20,13 @@ std::thread_local! {
 /// This function should be called once at the start of your program.
 /// Subsequent calls will have no effect.
 pub fn init() {
-    init_with(TraceEventPublisher::new(std::io::stdout()));
+    if let Some(trace_path) = std::env::var_os(TRACE_PATH_ENV) {
+        let publisher = BinaryTraceEventPublisher::from_path(trace_path.into())
+            .unwrap_or_else(|error| panic!("Failed to initialize binary trace publisher: {}", error));
+        init_with(publisher);
+    } else {
+        init_with(TraceEventPublisher::new(std::io::stdout()));
+    }
 }
 
 /// Initializes the global sub:scriber with a custom subscriber.

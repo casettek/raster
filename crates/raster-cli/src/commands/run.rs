@@ -37,9 +37,9 @@ use raster_prover::trace::{
     VerificationResult,
 };
 use raster_prover::transition::step_transitions;
-use raster_runtime::{TraceRecorder, TRACE_EVENT_PREFIX};
+use raster_runtime::TraceRecorder;
 
-use crate::commands::{default_profile_path, default_profile_stream_path};
+use crate::commands::{default_profile_path, default_profile_stream_path, default_trace_path};
 use crate::utils::authorization::{build_manifested_inputs, collect_external_input_commitments};
 use crate::BackendType;
 
@@ -96,6 +96,7 @@ pub fn run(
     println!("Running {}...", &project.name);
     println!();
 
+    let trace_path = default_trace_path();
     let profile_path = default_profile_path();
     let profile_stream_path = profile_stream.map(|raw| {
         if raw.is_empty() || raw == "__default__" {
@@ -104,6 +105,12 @@ pub fn run(
             PathBuf::from(raw)
         }
     });
+    if let Some(parent) = trace_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if trace_path.exists() {
+        std::fs::remove_file(&trace_path)?;
+    }
     if let Some(parent) = profile_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -121,6 +128,7 @@ pub fn run(
 
     let mut cmd = Command::new(&binary_path);
     cmd.current_dir(&project.root_dir);
+    cmd.env(raster_runtime::TRACE_PATH_ENV, &trace_path);
     cmd.env(raster_runtime::PROFILE_PATH_ENV, &profile_path);
     if let Some(stream_path) = &profile_stream_path {
         cmd.env(raster_runtime::PROFILE_STREAM_PATH_ENV, stream_path);
@@ -142,9 +150,6 @@ pub fn run(
 
     let mut child = cmd.spawn()?;
 
-    let mut trace: Arc<Mutex<Trace>> = Arc::new(Mutex::new(Trace::new()));
-    let mut reader_trace = Arc::clone(&trace);
-
     let mut log = Arc::new(Mutex::new(Vec::new()));
     let mut reader_log = Arc::clone(&log);
 
@@ -158,25 +163,11 @@ pub fn run(
 
     let mut handles = Vec::new();
 
-    let trace_recorder = Arc::new(Mutex::new(TraceRecorder::new(cfs.clone())));
-    let stdout_trace_recorder = Arc::clone(&trace_recorder);
     let stdout_handle = std::thread::spawn(move || {
         let stdout_reader = BufReader::new(stdout);
 
         for line in stdout_reader.lines() {
             if let Ok(line_str) = line {
-                if let Some(raw_event) = line_str.strip_prefix(TRACE_EVENT_PREFIX) {
-                    let trace_event =
-                        serde_json::from_str::<TraceEvent>(raw_event).unwrap_or_else(|error| {
-                            panic!("Failed to decode trace event: {error}: {raw_event}")
-                        });
-                    let step_record = {
-                        let mut trace_recorder = stdout_trace_recorder.lock().unwrap();
-                        trace_recorder.record(trace_event)
-                    };
-                    let mut trace_lock = reader_trace.lock().unwrap();
-                    trace_lock.push(step_record);
-                }
                 if let Some(debug_line) = line_str.strip_prefix("[debug]") {
                     let mut log_lock = reader_log.lock().unwrap();
                     log_lock.push(debug_line.to_string());
@@ -215,11 +206,6 @@ pub fn run(
         .into_inner()
         .unwrap();
 
-    let trace_recorder = Arc::try_unwrap(trace_recorder)
-        .expect("Cant move list out of Mutex. Some thread still holding copy of Arc")
-        .into_inner()
-        .unwrap();
-
     if verbose {
         if !log.is_empty() {
             println!("Verbose log:");
@@ -236,10 +222,7 @@ pub fn run(
         }
     }
 
-    let mut trace = Arc::try_unwrap(trace)
-        .expect("Cant move list out of Mutex. Some thread still holding copy of Arc")
-        .into_inner()
-        .unwrap();
+    let (mut trace, trace_recorder) = load_trace_from_file(&trace_path, &cfs)?;
 
     // Build all project tiles with Risc0
     // TODO: Risc0 build can be perfomed in parallel to native user program execution
@@ -375,6 +358,61 @@ pub fn run(
     }
 
     Ok(())
+}
+
+fn load_trace_from_file(
+    trace_path: &PathBuf,
+    cfs: &ControlFlowSchema,
+) -> Result<(Trace, TraceRecorder)> {
+    let mut file = std::fs::File::open(trace_path).map_err(raster_core::Error::Io)?;
+    let mut trace = Trace::new();
+    let mut trace_recorder = TraceRecorder::new(cfs.clone());
+
+    loop {
+        let mut len_buf = [0u8; 4];
+        let mut header_bytes_read = 0usize;
+        let mut reached_clean_eof = false;
+        while header_bytes_read < len_buf.len() {
+            match file.read(&mut len_buf[header_bytes_read..]) {
+                Ok(0) if header_bytes_read == 0 => {
+                    reached_clean_eof = true;
+                    break;
+                }
+                Ok(0) => {
+                    return Err(raster_core::Error::Other(
+                        "Trace stream ended with a partial frame header".into(),
+                    ))
+                }
+                Ok(bytes_read) => header_bytes_read += bytes_read,
+                Err(error) => return Err(raster_core::Error::Io(error)),
+            }
+        }
+        if reached_clean_eof {
+            break;
+        }
+
+        let frame_len = u32::from_le_bytes(len_buf) as usize;
+        let mut frame = vec![0u8; frame_len];
+        file.read_exact(&mut frame).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::UnexpectedEof {
+                raster_core::Error::Other("Trace stream ended with a partial frame payload".into())
+            } else {
+                raster_core::Error::Io(error)
+            }
+        })?;
+
+        let event: TraceEvent = postcard::from_bytes(&frame).map_err(|error| {
+            raster_core::Error::Serialization(format!(
+                "Failed to decode binary trace event '{}': {}",
+                trace_path.display(),
+                error
+            ))
+        })?;
+        let step_record = trace_recorder.record(event);
+        trace.push(step_record);
+    }
+
+    Ok((trace, trace_recorder))
 }
 
 pub fn fraud(trace: &mut Trace, commit_path: &str) {

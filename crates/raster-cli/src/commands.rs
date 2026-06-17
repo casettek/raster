@@ -41,6 +41,10 @@ pub(crate) fn default_profile_stream_path() -> PathBuf {
     output_dir().join("profiles").join("latest.ndjson")
 }
 
+pub(crate) fn default_trace_path() -> PathBuf {
+    output_dir().join("traces").join("latest.bin")
+}
+
 /// Get the project path (current directory).
 fn project_path() -> PathBuf {
     env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
