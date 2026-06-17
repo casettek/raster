@@ -1,5 +1,5 @@
 use raster_core::cfs::CfsCoordinates;
-use raster_core::coordinate_index::coordinate_index_root;
+use raster_core::coordinate_index::IncrementalCoordinateIndex;
 use raster_core::draft::{
     draft_root_from_witness, draft_tree_from_witness, draft_value_from_serialize,
     schema_hash as compute_schema_hash, DraftFieldValue, DraftOp, DraftReplayTransition,
@@ -70,7 +70,7 @@ pub struct InternalWriteRecord {
 pub struct InternalStorageManager {
     frontier: TraceTreeFrontier,
     objects: BTreeMap<CfsCoordinates, StoredInternalObject>,
-    coordinate_index: BTreeMap<CfsCoordinates, InternalStoreIndexValue>,
+    coordinate_index: IncrementalCoordinateIndex,
 }
 
 fn frontier_root(frontier: &TraceTreeFrontier) -> Vec<u8> {
@@ -224,7 +224,7 @@ impl InternalStorageManager {
         Self {
             frontier,
             objects: BTreeMap::new(),
-            coordinate_index: BTreeMap::new(),
+            coordinate_index: IncrementalCoordinateIndex::new(),
         }
     }
 
@@ -241,7 +241,7 @@ impl InternalStorageManager {
     }
 
     pub fn current_index_root(&self) -> Vec<u8> {
-        coordinate_index_root(&self.coordinate_index)
+        self.coordinate_index.root()
     }
 
     pub fn append_serialized_bytes(

@@ -5,7 +5,7 @@ use raster_backend::backend::HexString;
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -18,9 +18,7 @@ use raster_backend_risc0::Risc0Backend;
 use raster_compiler::{CfsBuilder, Project};
 
 use raster_core::cfs::{CfsCoordinates, CfsCursor, ControlFlowSchema};
-use raster_core::coordinate_index::{
-    coordinate_index_membership_proof, coordinate_index_non_membership_proof, coordinate_index_root,
-};
+use raster_core::coordinate_index::IncrementalCoordinateIndex;
 use raster_core::draft::DraftTransitionWitness;
 use raster_core::trace::{ExternalInput, FnInput, StepRecord, Trace, TraceEvent, TraceWindow};
 use raster_core::transition::{
@@ -507,7 +505,7 @@ pub fn write_fraud_proof(receipt: &risc0_zkvm::Receipt, commit_path: &str) -> Pa
 struct ProofInternalStoreState {
     frontier: SerializableFrontier,
     append_entries: Vec<InternalStoreEntry>,
-    coordinate_index: BTreeMap<CfsCoordinates, InternalStoreIndexValue>,
+    coordinate_index: IncrementalCoordinateIndex,
 }
 
 fn empty_internal_store_frontier() -> SerializableFrontier {
@@ -559,17 +557,12 @@ fn apply_internal_write_to_state(
 ) {
     state.frontier = internal_write.frontier_after.clone();
     state.append_entries.push(internal_write.entry.clone());
-    let previous = state.coordinate_index.insert(
+    state.coordinate_index.insert(
         internal_write.entry.coordinates.clone(),
         InternalStoreIndexValue {
             log_position: internal_write.log_position,
             object_commitment: internal_write.entry.object_commitment.clone(),
         },
-    );
-    assert!(
-        previous.is_none(),
-        "Duplicate internal store coordinates {:?} while building proof witness",
-        internal_write.entry.coordinates
     );
 }
 
@@ -580,7 +573,7 @@ fn internal_store_state_from_prefix(
     let mut state = ProofInternalStoreState {
         frontier: empty_internal_store_frontier(),
         append_entries: Vec::new(),
-        coordinate_index: BTreeMap::new(),
+        coordinate_index: IncrementalCoordinateIndex::new(),
     };
     for step_record in trace {
         if let Some(internal_write) = trace_recorder
@@ -660,16 +653,15 @@ pub fn prove(
         let mut internal_read_witnesses = Vec::new();
         if let Some(input_source_witness_ref) = input_source_witness.as_ref() {
             for internal_meta in input_source_witness_ref.internal().values() {
-                let index_witness = coordinate_index_membership_proof(
-                    &before_state.coordinate_index,
-                    &internal_meta.coordinates,
-                )
-                .unwrap_or_else(|| {
-                    panic!(
-                        "Missing coordinate-index witness for internal input at {:?}",
-                        internal_meta.coordinates
-                    )
-                });
+                let index_witness = before_state
+                    .coordinate_index
+                    .membership_proof(&internal_meta.coordinates)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "Missing coordinate-index witness for internal input at {:?}",
+                            internal_meta.coordinates
+                        )
+                    });
                 let entry = InternalStoreEntry {
                     coordinates: internal_meta.coordinates.clone(),
                     object_commitment: internal_meta.commitment.clone(),
@@ -688,27 +680,19 @@ pub fn prove(
         let mut internal_write_witness = None;
         if let Some(internal_write) = step_witness.internal_write() {
             let entry = internal_write.entry.clone();
-            let index_non_membership_witness = coordinate_index_non_membership_proof(
-                &before_state.coordinate_index,
-                &entry.coordinates,
-            );
-            let mut after_index = before_state.coordinate_index.clone();
-            after_index.insert(
-                entry.coordinates.clone(),
-                InternalStoreIndexValue {
-                    log_position: internal_write.log_position,
-                    object_commitment: entry.object_commitment.clone(),
-                },
-            );
-            let index_membership_witness =
-                coordinate_index_membership_proof(&after_index, &entry.coordinates)
-                    .expect("Missing coordinate-index membership proof after write");
+            let index_non_membership_witness = before_state
+                .coordinate_index
+                .non_membership_proof(&entry.coordinates);
+            apply_internal_write_to_state(&mut current_internal_store_state, &internal_write);
+            let index_membership_witness = current_internal_store_state
+                .coordinate_index
+                .membership_proof(&entry.coordinates)
+                .expect("Missing coordinate-index membership proof after write");
             internal_write_witness = Some(InternalStoreWriteWitness {
                 entry,
                 index_non_membership_witness,
                 index_membership_witness,
             });
-            apply_internal_write_to_state(&mut current_internal_store_state, &internal_write);
         }
         let internal_store_witness =
             if internal_read_witnesses.is_empty() && internal_write_witness.is_none() {
@@ -761,7 +745,7 @@ pub fn prove(
         let Some(receipt) = step_transitions(
             &frontier,
             &initial_internal_store_state.frontier,
-            &coordinate_index_root(&initial_internal_store_state.coordinate_index),
+            &initial_internal_store_state.coordinate_index.root(),
             &fraud_window.items,
             fraud_window.fingerprint,
             &cfs,
