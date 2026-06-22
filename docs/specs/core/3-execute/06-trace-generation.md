@@ -28,7 +28,6 @@ This spec is written to match the code as it exists. Where the runtime does not 
   - `trait Publisher::{publish, finish}`
   - `BinaryTraceEventPublisher` (writes length-prefixed `postcard(TraceEvent)` frames to the CLI trace file)
   - `JsonTraceEventPublisher` (writes newline-delimited JSON trace events)
-  - `TraceEventPublisher` (compatibility alias for the JSON publisher)
 
 ### “Step record” required fields (where they come from in today’s code)
 
@@ -122,7 +121,7 @@ In addition to the coarse `TraceEvent` model, Raster defines a tile I/O transcri
 
 - `raster_core::trace::TraceItem` (includes `fn_name`, signature metadata, and base64 `postcard` input/output bytes).
 
-The default CLI path writes length-prefixed binary frames: `u32` little-endian frame length followed by `postcard(TraceEvent)`. `cargo raster run --trace-format json` writes one `serde_json(TraceEvent)` object per line instead. Setting `RASTER_TRACE_STDOUT=1` opts into a stdout publisher that writes `[trace-event]`-prefixed JSON lines for debugging/custom tooling.
+The default CLI path writes length-prefixed binary frames: `u32` little-endian frame length followed by `postcard(TraceEvent)`. `cargo raster run --trace-format json` writes one `serde_json(TraceEvent)` object per line instead.
 
 ---
 
@@ -247,7 +246,7 @@ Implementations that add step records **SHOULD** add one of:
 - Trace container and event variants exist for sequence, tile, and recur execution.
 - There is an implemented **trace publisher** surface for `TraceEvent`, including:
   - binary file capture for CLI runs (`BinaryTraceEventPublisher`),
-  - JSON file capture and opt-in/custom stdout JSON emission (`JsonTraceEventPublisher` / `TraceEventPublisher`), and
+  - JSON file capture (`JsonTraceEventPublisher`), and
   - custom embedders via `init_with`.
 - The spec-required step record fields (artifact identity, input bytes, output bytes) are **available in other subsystems** (`Backend::execute_tile`, `CompilationOutput.method_id`, `TileExecution.output`) but are **not representable** in `TraceEvent` yet.
 - Failure and iteration/recursion recording are **not representable** in `TraceEvent` yet.

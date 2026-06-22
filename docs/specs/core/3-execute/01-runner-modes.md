@@ -145,7 +145,7 @@ Native mode means “execute without a zkVM” and without proof generation.
 
 #### Trace behavior
 
-- Whole-program native runs launched by `cargo raster run` capture trace events through `RASTER_TRACE_PATH`. The default `--trace-format binary` stores length-prefixed `postcard` frames; `--trace-format json` stores readable newline-delimited JSON. Direct plain Rust runs stay quiet unless `RASTER_TRACE_STDOUT=1` is set for opt-in stdout JSON debugging.
+- Whole-program native runs launched by `cargo raster run` capture trace events through `RASTER_TRACE_PATH`. The default `--trace-format binary` stores length-prefixed `postcard` frames; `--trace-format json` stores readable newline-delimited JSON. Direct plain Rust runs stay quiet by default.
 
 #### Errors and diagnostics
 

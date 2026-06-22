@@ -8,14 +8,11 @@ use crate::tracing::publishers::{
     BinaryTraceEventPublisher, JsonTraceEventPublisher, Publisher, GLOBAL_PUBLISHER,
 };
 use std::cell::Cell;
-use std::ffi::OsStr;
 use std::str::FromStr;
 use std::sync::Once;
 
-pub const TRACE_EVENT_PREFIX: &str = "[trace-event]";
 pub const TRACE_FORMAT_ENV: &str = "RASTER_TRACE_FORMAT";
 pub const TRACE_PATH_ENV: &str = "RASTER_TRACE_PATH";
-pub const TRACE_STDOUT_ENV: &str = "RASTER_TRACE_STDOUT";
 
 static RUNTIME_INIT: Once = Once::new();
 
@@ -62,8 +59,7 @@ impl FromStr for TraceFormat {
 ///
 /// `cargo raster run` sets `RASTER_TRACE_PATH`, which enables trace capture
 /// for the CLI. `RASTER_TRACE_FORMAT` selects the file format and defaults to
-/// `binary`. Plain Rust runs stay quiet by default. Set `RASTER_TRACE_STDOUT=1`
-/// to opt into stdout JSON trace emission.
+/// `binary`. Plain Rust runs stay quiet by default.
 ///
 /// This function should be called once at the start of your program.
 /// Subsequent calls will have no effect.
@@ -90,11 +86,6 @@ pub fn init() {
                 install_publisher(publisher);
             }
         }
-    } else if stdout_trace_enabled() {
-        install_publisher(JsonTraceEventPublisher::with_prefix(
-            std::io::stdout(),
-            TRACE_EVENT_PREFIX,
-        ));
     }
 }
 
@@ -125,24 +116,6 @@ fn trace_format_from_env() -> TraceFormat {
         .to_str()
         .unwrap_or_else(|| panic!("{TRACE_FORMAT_ENV} must be valid UTF-8"));
     TraceFormat::from_str(value).unwrap_or_else(|error| panic!("{error}"))
-}
-
-fn stdout_trace_enabled() -> bool {
-    std::env::var_os(TRACE_STDOUT_ENV)
-        .as_deref()
-        .is_some_and(stdout_trace_value_enabled)
-}
-
-fn stdout_trace_value_enabled(value: &OsStr) -> bool {
-    value
-        .to_str()
-        .map(|value| {
-            matches!(
-                value.to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
 }
 
 pub fn finish() {
@@ -198,21 +171,6 @@ impl Drop for RecurTraceScopeGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::OsStr;
-
-    #[test]
-    fn stdout_trace_opt_in_accepts_common_truthy_values() {
-        for value in ["1", "true", "TRUE", "yes", "on"] {
-            assert!(stdout_trace_value_enabled(OsStr::new(value)));
-        }
-    }
-
-    #[test]
-    fn stdout_trace_opt_in_rejects_missing_or_false_values() {
-        for value in ["", "0", "false", "no", "off", "anything-else"] {
-            assert!(!stdout_trace_value_enabled(OsStr::new(value)));
-        }
-    }
 
     #[test]
     fn trace_format_parses_supported_values() {

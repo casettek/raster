@@ -183,11 +183,9 @@ When a program uses `#[raster::sequence] fn main()` as its entry point:
 
 - `cargo raster run` sets `RASTER_TRACE_PATH` and `RASTER_TRACE_FORMAT`, causing the runtime to write trace events to a CLI-owned trace file. The default format is length-prefixed `postcard` frames; `--trace-format json` writes newline-delimited JSON.
 - Plain Rust execution does not install a trace publisher by default, so trace events are dropped instead of being written to the user's terminal.
-- Setting `RASTER_TRACE_STDOUT=1` opts into the legacy stdout publisher, which writes `[trace-event]`-prefixed JSON lines for manual debugging/custom tooling.
 
 #### Important gaps (trace)
 
-- The stdout JSON publisher is an opt-in debug transport; normal CLI runs should consume the selected trace file instead.
 - The binary trace file format is implemented as `u32` little-endian frame length followed by `postcard(TraceEvent)`.
 - The JSON trace file format is implemented as one `serde_json(TraceEvent)` object per line.
 

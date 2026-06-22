@@ -103,7 +103,7 @@ This means “prove+verify” is informational today; it does not enforce an “
 When a program uses `#[raster::sequence] fn main()` as its entry point, it can be run in these tracing postures:
 
 - `cargo raster run`: sets `RASTER_TRACE_PATH` and `RASTER_TRACE_FORMAT`, so the runtime writes either default length-prefixed `postcard(TraceEvent)` frames or `--trace-format json` newline-delimited JSON to a CLI-owned trace file.
-- Plain Rust execution: installs no trace publisher by default; set `RASTER_TRACE_STDOUT=1` for opt-in stdout JSON debugging.
+- Plain Rust execution: installs no trace publisher by default.
 - `--commit <path>` / `--audit <path>`: CLI-side commitment/audit handling operates on the recorded trace after the child process exits.
 
 This is the closest implemented mechanism to “audit” in the sense of *rejecting* inconsistent executions, but it applies only to the trace-commitment stream and does not enforce CFS legality.

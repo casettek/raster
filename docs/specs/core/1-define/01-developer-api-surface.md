@@ -60,7 +60,7 @@ From `crates/raster/src/lib.rs`:
 
 - **Runtime (only when `raster` is built with feature `std`)**
   - `pub use raster_runtime::{init, init_with, finish, publish_trace_event}`
-  - `pub use raster_runtime::{BinaryTraceEventPublisher, JsonTraceEventPublisher, TraceEventPublisher, Publisher}`
+  - `pub use raster_runtime::{BinaryTraceEventPublisher, JsonTraceEventPublisher, Publisher}`
 
 From `raster::prelude`:
 
@@ -187,7 +187,6 @@ From `crates/raster-runtime/src/lib.rs`:
   - `pub trait Publisher`
   - `pub struct BinaryTraceEventPublisher`
   - `pub struct JsonTraceEventPublisher<W>`
-  - `pub struct TraceEventPublisher<W>`
 
 ---
 
@@ -210,7 +209,7 @@ This section classifies the developer-facing surface by intended stability **bas
   - `raster-core::schema::{SequenceSchema, ControlFlow}` exists, but generation is not implemented (`SchemaGenerator::generate` is `todo!()`).
 
 - **Runtime execution and tracing**
-  - `raster-runtime` provides **trace publishers** (binary or JSON file capture for CLI runs, opt-in stdout JSON, and custom publishers), but it does not provide a sequence/program executor.
+  - `raster-runtime` provides **trace publishers** (binary or JSON file capture for CLI runs, plus custom publishers), but it does not provide a sequence/program executor.
 
 - **Compilation orchestration APIs**
   - `raster-compiler::{Builder, CfsBuilder, ...}` are public and used by the CLI, but their artifact hashing/caching and compilation assumptions are still evolving.

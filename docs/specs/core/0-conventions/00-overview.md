@@ -59,7 +59,6 @@ Use this section as the “map” from spec concepts to code locations.
   - `crates/raster-runtime/src/tracing/publishers/mod.rs` (publisher trait + globals)
     - `BinaryTraceEventPublisher` (writes length-prefixed `postcard(TraceEvent)` frames)
     - `JsonTraceEventPublisher` (writes newline-delimited JSON trace events)
-    - `TraceEventPublisher` (compatibility alias for the JSON publisher)
 
 ### A.6 Existing docs
 

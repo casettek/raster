@@ -40,7 +40,6 @@ fn run_hello_tiles_directly() -> Output {
         .current_dir(hello_tiles_dir())
         .env_remove(raster_runtime::TRACE_PATH_ENV)
         .env_remove(raster_runtime::TRACE_FORMAT_ENV)
-        .env_remove(raster_runtime::TRACE_STDOUT_ENV)
         .args([
             "run",
             "--release",
@@ -110,7 +109,7 @@ fn direct_hello_tiles_run_does_not_emit_trace_events_to_stdout() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        !stdout.contains(raster_runtime::TRACE_EVENT_PREFIX),
+        !stdout.contains("SequenceStart") && !stdout.contains("TileExec"),
         "plain cargo run should not emit trace events to stdout:\n{stdout}"
     );
 }
