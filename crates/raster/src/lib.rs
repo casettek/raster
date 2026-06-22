@@ -580,7 +580,6 @@ pub mod prelude {
     };
 
     pub use crate::exec::Result;
-    pub use crate::println;
     pub use crate::{
         call, call_recur, call_seq, external, finalize, internal, into_auth_ref,
         materialize_auth_result, materialize_auth_return, new, select, sequence, tile, Anchor,
