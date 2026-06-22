@@ -155,10 +155,32 @@ pub struct TileExecRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub struct RecurExecRecord {
+pub struct RecurTileExecRecord {
     pub exec_index: u64,
 
-    pub recur_id: String,
+    pub recur_tile_id: String,
+
+    pub sequence_id: String,
+    pub intra_sequence_index: u32,
+
+    pub coordinates: CfsCoordinates,
+
+    pub input_commitment: Vec<u8>,
+    pub input_source_commitment: Vec<u8>,
+    pub output_commitment: Vec<u8>,
+
+    pub external_input_commitment: Vec<u8>,
+    pub internal_store_root_before: Vec<u8>,
+    pub internal_store_root_after: Vec<u8>,
+    pub internal_store_index_root_before: Vec<u8>,
+    pub internal_store_index_root_after: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct RecurSequenceExecRecord {
+    pub exec_index: u64,
+
+    pub recur_sequence_id: String,
 
     pub sequence_id: String,
     pub intra_sequence_index: u32,
@@ -205,14 +227,18 @@ pub enum StepRecord {
     SequenceStart(SequenceStartRecord),
     SequenceEnd(SequenceEndRecord),
     TileExec(TileExecRecord),
-    RecurExec(RecurExecRecord),
+    RecurTileExec(RecurTileExecRecord),
+    RecurSequenceExec(RecurSequenceExecRecord),
 }
 
 impl StepRecord {
     pub fn coordinates(&self) -> &CfsCoordinates {
         match self {
             StepRecord::TileExec(tile_exec_record) => &tile_exec_record.coordinates,
-            StepRecord::RecurExec(recur_exec_record) => &recur_exec_record.coordinates,
+            StepRecord::RecurTileExec(recur_exec_record) => &recur_exec_record.coordinates,
+            StepRecord::RecurSequenceExec(recur_sequence_exec_record) => {
+                &recur_sequence_exec_record.coordinates
+            }
             StepRecord::SequenceStart(sequence_start_record) => &sequence_start_record.coordinates,
             StepRecord::SequenceEnd(sequence_end_record) => &sequence_end_record.coordinates,
         }
@@ -221,7 +247,8 @@ impl StepRecord {
     pub fn input_commitment(&self) -> Option<&Vec<u8>> {
         match self {
             StepRecord::TileExec(record) => Some(&record.input_commitment),
-            StepRecord::RecurExec(record) => Some(&record.input_commitment),
+            StepRecord::RecurTileExec(record) => Some(&record.input_commitment),
+            StepRecord::RecurSequenceExec(record) => Some(&record.input_commitment),
             StepRecord::SequenceStart(record) => Some(&record.input_commitment),
             StepRecord::SequenceEnd(_) => None,
         }
@@ -230,7 +257,8 @@ impl StepRecord {
     pub fn output_commitment(&self) -> Option<&Vec<u8>> {
         match self {
             StepRecord::TileExec(record) => Some(&record.output_commitment),
-            StepRecord::RecurExec(record) => Some(&record.output_commitment),
+            StepRecord::RecurTileExec(record) => Some(&record.output_commitment),
+            StepRecord::RecurSequenceExec(record) => Some(&record.output_commitment),
             StepRecord::SequenceStart(_) => None,
             StepRecord::SequenceEnd(record) => Some(&record.output_commitment),
         }
@@ -239,7 +267,8 @@ impl StepRecord {
     pub fn input_source_commitment(&self) -> Option<&Vec<u8>> {
         match self {
             StepRecord::TileExec(record) => Some(&record.input_source_commitment),
-            StepRecord::RecurExec(record) => Some(&record.input_source_commitment),
+            StepRecord::RecurTileExec(record) => Some(&record.input_source_commitment),
+            StepRecord::RecurSequenceExec(record) => Some(&record.input_source_commitment),
             StepRecord::SequenceStart(record) => Some(&record.input_source_commitment),
             StepRecord::SequenceEnd(_) => None,
         }
@@ -248,7 +277,8 @@ impl StepRecord {
     pub fn external_input_commitment(&self) -> Option<&Vec<u8>> {
         match self {
             StepRecord::TileExec(record) => Some(&record.external_input_commitment),
-            StepRecord::RecurExec(record) => Some(&record.external_input_commitment),
+            StepRecord::RecurTileExec(record) => Some(&record.external_input_commitment),
+            StepRecord::RecurSequenceExec(record) => Some(&record.external_input_commitment),
             StepRecord::SequenceStart(record) => Some(&record.external_input_commitment),
             StepRecord::SequenceEnd(_) => None,
         }
@@ -262,7 +292,13 @@ impl StepRecord {
                 &record.internal_store_index_root_before,
                 &record.internal_store_index_root_after,
             )),
-            StepRecord::RecurExec(record) => Some((
+            StepRecord::RecurTileExec(record) => Some((
+                &record.internal_store_root_before,
+                &record.internal_store_root_after,
+                &record.internal_store_index_root_before,
+                &record.internal_store_index_root_after,
+            )),
+            StepRecord::RecurSequenceExec(record) => Some((
                 &record.internal_store_root_before,
                 &record.internal_store_root_after,
                 &record.internal_store_index_root_before,
@@ -273,7 +309,12 @@ impl StepRecord {
     }
 
     pub fn is_execution_step(&self) -> bool {
-        matches!(self, StepRecord::TileExec(_) | StepRecord::RecurExec(_))
+        matches!(
+            self,
+            StepRecord::TileExec(_)
+                | StepRecord::RecurTileExec(_)
+                | StepRecord::RecurSequenceExec(_)
+        )
     }
 
     pub fn requires_replay_proof(&self) -> bool {
@@ -330,8 +371,11 @@ pub struct TraceWindow {
 pub enum TraceEvent {
     SequenceStart(FnCallRecord),
     SequenceEnd(FnCallRecord),
+    RecurSequenceStart(FnCallRecord),
+    RecurSequenceEnd(FnCallRecord),
 
     TileExec(FnCallRecord),
+    RecurTileIterationExec(FnCallRecord),
     RecurTileExec(FnCallRecord),
-    RecurExec(FnCallRecord),
+    RecurSequenceExec(FnCallRecord),
 }

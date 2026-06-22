@@ -1,0 +1,7 @@
+error: custom attribute panicked
+ --> tests/ui/recur_sequence_rejects_tile_handles.rs:9:1
+  |
+9 | #[sequence(kind = recur)]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = help: message: `#[sequence(kind = recur)]` functions must start with `input: RecurSequenceInput<T>`

@@ -268,12 +268,28 @@ pub fn run(
 
                     println!("tile_id: {}", tile_exec_record.tile_id);
                 }
-                StepRecord::RecurExec(recur_exec_record) => {
+                StepRecord::RecurTileExec(recur_exec_record) => {
                     println!("\nexec_index: {}", recur_exec_record.exec_index);
                     println!("sequence_id: {}", recur_exec_record.sequence_id);
-                    println!("recur_coordinates: {:?}", recur_exec_record.coordinates,);
+                    println!(
+                        "recur_tile_coordinates: {:?}",
+                        recur_exec_record.coordinates,
+                    );
 
-                    println!("recur_id: {}", recur_exec_record.recur_id);
+                    println!("recur_tile_id: {}", recur_exec_record.recur_tile_id);
+                }
+                StepRecord::RecurSequenceExec(recur_sequence_exec_record) => {
+                    println!("\nexec_index: {}", recur_sequence_exec_record.exec_index);
+                    println!("sequence_id: {}", recur_sequence_exec_record.sequence_id);
+                    println!(
+                        "recur_sequence_coordinates: {:?}",
+                        recur_sequence_exec_record.coordinates,
+                    );
+
+                    println!(
+                        "recur_sequence_id: {}",
+                        recur_sequence_exec_record.recur_sequence_id
+                    );
                 }
                 StepRecord::SequenceStart(sequence_start_record) => {
                     println!(
@@ -449,8 +465,13 @@ pub fn fraud(trace: &mut Trace, commit_path: &str) {
             StepRecord::TileExec(tile_exec_record) => {
                 !tile_exec_record.external_input_commitment.is_empty()
             }
-            StepRecord::RecurExec(recur_exec_record) => {
+            StepRecord::RecurTileExec(recur_exec_record) => {
                 !recur_exec_record.external_input_commitment.is_empty()
+            }
+            StepRecord::RecurSequenceExec(recur_sequence_exec_record) => {
+                !recur_sequence_exec_record
+                    .external_input_commitment
+                    .is_empty()
             }
             StepRecord::SequenceStart(_) | StepRecord::SequenceEnd(_) => false,
         })
@@ -460,8 +481,11 @@ pub fn fraud(trace: &mut Trace, commit_path: &str) {
             StepRecord::TileExec(tile_exec_record) => {
                 tile_exec_record.output_commitment = vec![0u8, 1u8];
             }
-            StepRecord::RecurExec(recur_exec_record) => {
+            StepRecord::RecurTileExec(recur_exec_record) => {
                 recur_exec_record.output_commitment = vec![0u8, 1u8];
+            }
+            StepRecord::RecurSequenceExec(recur_sequence_exec_record) => {
+                recur_sequence_exec_record.output_commitment = vec![0u8, 1u8];
             }
             StepRecord::SequenceStart(sequence_start_record) => {
                 sequence_start_record.input_commitment.push(0);

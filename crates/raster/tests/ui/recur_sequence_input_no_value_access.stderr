@@ -1,0 +1,10 @@
+error[E0599]: no method named `into_value` found for struct `raster::RecurSequenceInput<T>` in the current scope
+  --> tests/ui/recur_sequence_input_no_value_access.rs:14:24
+   |
+14 |     let _value = input.into_value();
+   |                        ^^^^^^^^^^
+   |
+help: there is a method `into_auth_value` with a similar name
+   |
+14 |     let _value = input.into_auth_value();
+   |                             +++++

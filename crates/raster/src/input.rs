@@ -109,6 +109,41 @@ pub struct RecurState<T> {
 
 pub type RecurOutput<S> = Draft<S>;
 
+/// Opaque recursive-sequence view of the current item.
+///
+/// Recursive sequences are orchestration-only: they may pass this handle to
+/// normal tiles, but they cannot inspect item values or iteration position.
+pub struct RecurSequenceInput<T> {
+    item: AuthRef<T>,
+    index: u64,
+    len: u64,
+}
+
+/// Opaque recursive-sequence view of threaded inline state.
+///
+/// State transitions must happen in normal tiles, not directly in sequence
+/// bodies, so this type intentionally exposes no mutation accessors.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RecurSequenceState<T> {
+    inner: T,
+}
+
+/// Opaque recursive-sequence view of threaded draft output.
+///
+/// Draft mutations must happen in normal tiles, not directly in sequence bodies.
+#[derive(Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RecurSequenceOutput<S: Schema> {
+    inner: RecurOutput<S>,
+}
+
+#[derive(Debug, Serialize)]
+struct RecurSequenceInputTraceMarker {
+    kind: &'static str,
+    index: u64,
+    len: u64,
+    item: FnInputValue,
+}
+
 pub trait IntoRecurControl<T> {
     fn into_recur_control(self) -> RecurControl<T>;
 }
@@ -170,6 +205,100 @@ impl<T> RecurState<T> {
 
     pub fn into_inner(self) -> T {
         self.inner
+    }
+}
+
+impl<T> RecurSequenceInput<T> {
+    #[doc(hidden)]
+    pub fn __raster_from_auth_ref(item: AuthRef<T>, index: u64, len: u64) -> Self {
+        Self { item, index, len }
+    }
+
+    #[doc(hidden)]
+    pub fn __raster_as_auth_ref(&self) -> &AuthRef<T> {
+        &self.item
+    }
+}
+
+impl<T> RecurSequenceInput<T>
+where
+    T: Serialize + DeserializeOwned,
+{
+    #[doc(hidden)]
+    pub fn __raster_auth_trace(&self) -> raster_core::Result<AuthRefTrace> {
+        let item_trace = auth_ref_trace(&self.item)?;
+        let marker = RecurSequenceInputTraceMarker {
+            kind: "raster::RecurSequenceInput",
+            index: self.index,
+            len: self.len,
+            item: item_trace.value.clone(),
+        };
+        Ok(AuthRefTrace {
+            value: FnInputValue::Inline(
+                raster_core::postcard::to_allocvec(&marker).unwrap_or_default(),
+            ),
+            external: item_trace.external,
+            internal: item_trace.internal,
+        })
+    }
+}
+
+impl<T> RecurSequenceState<T> {
+    #[doc(hidden)]
+    pub fn __raster_from_recur_state(inner: RecurState<T>) -> Self {
+        Self {
+            inner: inner.into_inner(),
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn __raster_into_recur_state(self) -> RecurState<T> {
+        RecurState::new(self.inner)
+    }
+}
+
+impl<S> RecurSequenceOutput<S>
+where
+    S: Schema,
+{
+    #[doc(hidden)]
+    pub fn __raster_from_recur_output(inner: RecurOutput<S>) -> Self {
+        Self { inner }
+    }
+
+    #[doc(hidden)]
+    pub fn __raster_into_recur_output(self) -> RecurOutput<S> {
+        self.inner
+    }
+
+    #[doc(hidden)]
+    pub fn __raster_serialize_replay_handle(&self) -> Vec<u8> {
+        serialize_draft_replay_handle(&self.inner)
+    }
+}
+
+impl<T> Serialize for RecurSequenceInput<T>
+where
+    T: Serialize,
+{
+    fn serialize<Ser>(&self, serializer: Ser) -> Result<Ser::Ok, Ser::Error>
+    where
+        Ser: serde::Serializer,
+    {
+        let item = match &self.item {
+            AuthRef::Inline(value) => {
+                FnInputValue::Inline(raster_core::postcard::to_allocvec(value).unwrap_or_default())
+            }
+            AuthRef::External(_) => FnInputValue::ExternalBinding,
+            AuthRef::Internal(_) => FnInputValue::InternalBinding,
+        };
+        RecurSequenceInputTraceMarker {
+            kind: "raster::RecurSequenceInput",
+            index: self.index,
+            len: self.len,
+            item,
+        }
+        .serialize(serializer)
     }
 }
 
@@ -1214,6 +1343,36 @@ pub trait IntoAuthValue<T> {
     fn into_auth_value(self) -> raster_core::Result<AuthValue<T>>;
 }
 
+pub trait IntoDraft<S: Schema> {
+    fn into_draft(self) -> Draft<S>;
+}
+
+impl<S> IntoDraft<S> for Draft<S>
+where
+    S: Schema,
+{
+    fn into_draft(self) -> Draft<S> {
+        self
+    }
+}
+
+impl<S> IntoDraft<S> for RecurSequenceOutput<S>
+where
+    S: Schema,
+{
+    fn into_draft(self) -> Draft<S> {
+        self.inner
+    }
+}
+
+pub fn into_draft<S, D>(draft: D) -> Draft<S>
+where
+    S: Schema,
+    D: IntoDraft<S>,
+{
+    draft.into_draft()
+}
+
 impl<T> IntoAuthValue<T> for T
 where
     T: Serialize,
@@ -1262,6 +1421,63 @@ where
                 Ok(AuthValue::internal(value))
             }
         }
+    }
+}
+
+impl<T> IntoAuthRef<T> for RecurSequenceInput<T> {
+    fn into_auth_ref(self) -> AuthRef<T> {
+        self.item
+    }
+}
+
+impl<T> IntoAuthValue<T> for RecurSequenceInput<T>
+where
+    T: Serialize,
+{
+    fn into_auth_value(self) -> raster_core::Result<AuthValue<T>> {
+        self.item.into_auth_value()
+    }
+}
+
+impl<T> IntoAuthValue<T> for RecurSequenceState<T>
+where
+    T: Serialize,
+{
+    fn into_auth_value(self) -> raster_core::Result<AuthValue<T>> {
+        Ok(AuthValue::inline(self.inner))
+    }
+}
+
+impl<T> From<T> for RecurSequenceState<T> {
+    fn from(value: T) -> Self {
+        Self { inner: value }
+    }
+}
+
+impl<T> From<AuthRef<T>> for RecurSequenceState<T>
+where
+    T: DeserializeOwned + Serialize,
+{
+    fn from(value: AuthRef<T>) -> Self {
+        Self {
+            inner: into_auth_value::<T, _>(value)
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "Failed to materialize recursive sequence state from tile output: {}",
+                        error
+                    )
+                })
+                .into_inner(),
+        }
+    }
+}
+
+impl<S> From<Draft<S>> for RecurSequenceOutput<S>
+where
+    S: Schema,
+{
+    fn from(value: Draft<S>) -> Self {
+        Self { inner: value }
     }
 }
 
@@ -1671,6 +1887,154 @@ where
         let _ = output;
         let _ = step;
         panic!("Recursive list execution requires the `std` feature")
+    }
+}
+
+#[doc(hidden)]
+pub fn run_recur_sequence_list<T, S, Step, Output>(
+    source: AuthRef<Vec<T>>,
+    output: Draft<S>,
+    mut step: Step,
+) -> AuthRef<S>
+where
+    T: DeserializeOwned + Serialize + Selectable + 'static,
+    S: Schema + DeserializeOwned + Serialize + 'static,
+    Step: FnMut(RecurSequenceInput<T>, RecurSequenceOutput<S>) -> Output,
+    Output: Into<RecurSequenceOutput<S>>,
+{
+    #[cfg(feature = "std")]
+    {
+        let len = recur_list_len(&source).unwrap_or_else(|error| {
+            panic!(
+                "Failed to resolve recursive sequence list length: {}",
+                error
+            )
+        });
+        if len == 0 {
+            return finalize_recur_output(output, true);
+        }
+
+        let mut output = output;
+        for index in 0..len {
+            let item = select_recur_list_item(&source, index).unwrap_or_else(|error| {
+                panic!("Failed to select recursive sequence list item: {}", error)
+            });
+            let input = RecurSequenceInput::__raster_from_auth_ref(item, index, len);
+            let sequence_output = RecurSequenceOutput::__raster_from_recur_output(output);
+            output = step(input, sequence_output)
+                .into()
+                .__raster_into_recur_output();
+        }
+
+        return finalize_recur_output(output, false);
+    }
+
+    #[cfg(not(feature = "std"))]
+    {
+        let _ = source;
+        let _ = output;
+        let _ = step;
+        panic!("Recursive sequence list execution requires the `std` feature")
+    }
+}
+
+#[doc(hidden)]
+pub fn run_recur_sequence_list_state<T, State, Step, Output>(
+    source: AuthRef<Vec<T>>,
+    state: RecurState<State>,
+    mut step: Step,
+) -> AuthRef<State>
+where
+    T: DeserializeOwned + Serialize + Selectable + 'static,
+    State: DeserializeOwned + Serialize + 'static,
+    Step: FnMut(RecurSequenceInput<T>, RecurSequenceState<State>) -> Output,
+    Output: Into<RecurSequenceState<State>>,
+{
+    #[cfg(feature = "std")]
+    {
+        let len = recur_list_len(&source).unwrap_or_else(|error| {
+            panic!(
+                "Failed to resolve recursive sequence list length: {}",
+                error
+            )
+        });
+        let mut state = state;
+
+        for index in 0..len {
+            let item = select_recur_list_item(&source, index).unwrap_or_else(|error| {
+                panic!("Failed to select recursive sequence list item: {}", error)
+            });
+            let input = RecurSequenceInput::__raster_from_auth_ref(item, index, len);
+            let sequence_state = RecurSequenceState::__raster_from_recur_state(state);
+            state = step(input, sequence_state)
+                .into()
+                .__raster_into_recur_state();
+        }
+
+        return crate::__private::bind_infallible_call(state.into_inner());
+    }
+
+    #[cfg(not(feature = "std"))]
+    {
+        let _ = source;
+        let _ = state;
+        let _ = step;
+        panic!("Recursive sequence list execution requires the `std` feature")
+    }
+}
+
+#[doc(hidden)]
+pub fn run_recur_sequence_list_with_state<T, State, S, Step, Output>(
+    source: AuthRef<Vec<T>>,
+    state: RecurState<State>,
+    output: Draft<S>,
+    mut step: Step,
+) -> AuthRef<S>
+where
+    T: DeserializeOwned + Serialize + Selectable + 'static,
+    State: DeserializeOwned + Serialize + 'static,
+    S: Schema + DeserializeOwned + Serialize + 'static,
+    Step: FnMut(RecurSequenceInput<T>, RecurSequenceState<State>, RecurSequenceOutput<S>) -> Output,
+    Output: Into<(RecurSequenceState<State>, RecurSequenceOutput<S>)>,
+{
+    #[cfg(feature = "std")]
+    {
+        let len = recur_list_len(&source).unwrap_or_else(|error| {
+            panic!(
+                "Failed to resolve recursive sequence list length: {}",
+                error
+            )
+        });
+        if len == 0 {
+            let _ = state;
+            return finalize_recur_output(output, true);
+        }
+
+        let mut state = state;
+        let mut output = output;
+        for index in 0..len {
+            let item = select_recur_list_item(&source, index).unwrap_or_else(|error| {
+                panic!("Failed to select recursive sequence list item: {}", error)
+            });
+            let input = RecurSequenceInput::__raster_from_auth_ref(item, index, len);
+            let sequence_state = RecurSequenceState::__raster_from_recur_state(state);
+            let sequence_output = RecurSequenceOutput::__raster_from_recur_output(output);
+            let (next_state, next_output) = step(input, sequence_state, sequence_output).into();
+            state = next_state.__raster_into_recur_state();
+            output = next_output.__raster_into_recur_output();
+        }
+
+        let _ = state;
+        return finalize_recur_output(output, false);
+    }
+
+    #[cfg(not(feature = "std"))]
+    {
+        let _ = source;
+        let _ = state;
+        let _ = output;
+        let _ = step;
+        panic!("Recursive sequence list execution requires the `std` feature")
     }
 }
 

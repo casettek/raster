@@ -17,7 +17,8 @@ pub use input::{
 };
 pub use internal_storage::{
     apply_draft_push, apply_draft_set, begin_draft_step_capture, create_draft,
-    enter_recur_site_scope, enter_sequence_scope, exit_recur_site_scope, exit_sequence_scope,
+    enter_recur_sequence_iteration_scope, enter_recur_site_scope, enter_sequence_scope,
+    exit_recur_sequence_iteration_scope, exit_recur_site_scope, exit_sequence_scope,
     finalize_draft, finalize_empty_draft, finish_draft_step_capture,
     global_internal_store_snapshot, publish_pending_output_coordinates, resolve_internal_ok_value,
     resolve_internal_value, store_execution_output_value, store_internal_value,

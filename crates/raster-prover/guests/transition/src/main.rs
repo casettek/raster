@@ -439,14 +439,15 @@ fn verify_step_record_inputs(
                     .try_get_item(&source_coordinates)
                     .expect("Expected producer item coordinates to resolve in CFS")
                 {
-                    raster_core::cfs::SequenceChildItem::Sequence(_) => {
+                    raster_core::cfs::SequenceChildItem::Sequence(_)
+                    | raster_core::cfs::SequenceChildItem::RecurSequence(_) => {
                         assert!(
                             has_coordinate_prefix(&internal_meta.coordinates, &source_coordinates),
                             "Internal input producer coordinates do not descend from expected sequence source",
                         );
                     }
                     raster_core::cfs::SequenceChildItem::Tile(_)
-                    | raster_core::cfs::SequenceChildItem::Recur(_) => {
+                    | raster_core::cfs::SequenceChildItem::RecurTile(_) => {
                         assert_eq!(
                             internal_meta.coordinates, source_coordinates,
                             "Internal input producer coordinates do not match expected CFS source",

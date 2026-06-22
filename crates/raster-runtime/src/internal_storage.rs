@@ -399,6 +399,27 @@ impl SequenceExecutionContext {
         Ok(())
     }
 
+    fn enter_recur_sequence_iteration(&mut self) -> Result<()> {
+        let recur_frame = self.recur_stack.last_mut().ok_or_else(|| {
+            Error::Other("Recursive sequence iteration requires active recur site context".into())
+        })?;
+        let mut coordinates = recur_frame.site_coordinates.clone();
+        coordinates.push(recur_frame.next_iteration_index);
+        recur_frame.next_iteration_index += 1;
+        self.stack.push(SequenceFrame {
+            coordinates,
+            next_child_index: 0,
+            next_synthetic_index: 0,
+        });
+        Ok(())
+    }
+
+    fn exit_recur_sequence_iteration(&mut self) {
+        self.stack
+            .pop()
+            .expect("Corrupted recur sequence iteration context");
+    }
+
     fn exit_recur_site(&mut self) {
         self.recur_stack
             .pop()
@@ -512,6 +533,16 @@ pub fn enter_recur_site_scope() -> Result<()> {
 pub fn exit_recur_site_scope() {
     THREAD_SEQUENCE_CONTEXT.with(|context| {
         context.borrow_mut().exit_recur_site();
+    });
+}
+
+pub fn enter_recur_sequence_iteration_scope() -> Result<()> {
+    THREAD_SEQUENCE_CONTEXT.with(|context| context.borrow_mut().enter_recur_sequence_iteration())
+}
+
+pub fn exit_recur_sequence_iteration_scope() {
+    THREAD_SEQUENCE_CONTEXT.with(|context| {
+        context.borrow_mut().exit_recur_sequence_iteration();
     });
 }
 

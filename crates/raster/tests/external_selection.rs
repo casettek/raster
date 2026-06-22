@@ -383,7 +383,7 @@ fn nested_sequence_trace_records_terminal_err_outputs() {
             TraceEvent::TileExec(record) => {
                 matches!(record.fn_name.as_str(), "echo_name" | "maybe_echo_name")
             }
-            TraceEvent::RecurTileExec(_) | TraceEvent::RecurExec(_) => false,
+            TraceEvent::RecurTileIterationExec(_) | TraceEvent::RecurTileExec(_) => false,
         })
         .collect();
 

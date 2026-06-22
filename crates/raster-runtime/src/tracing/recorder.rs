@@ -1,8 +1,8 @@
 use raster_core::cfs::{CfsCoordinates, CfsCursor, ControlFlowSchema, SequenceChildId};
 use raster_core::draft::DraftTransitionWitness;
 use raster_core::trace::{
-    ExternalInput, FnInput, InternalInput, RecurExecRecord, SequenceEndRecord, SequenceStartRecord,
-    StepRecord, TileExecRecord, TraceEvent,
+    ExternalInput, FnInput, InternalInput, RecurSequenceExecRecord, RecurTileExecRecord,
+    SequenceEndRecord, SequenceStartRecord, StepRecord, TileExecRecord, TraceEvent,
 };
 use sha2::{Digest, Sha256};
 
@@ -78,6 +78,14 @@ impl SequenceCallstack {
         self.callstack.pop_back()
     }
 
+    fn push_at_coordinates(&mut self, sequence_id: SequenceId, coordinates: CfsCoordinates) {
+        self.current_sequence_coordinates = coordinates;
+        self.callstack.push_back(SequenceState {
+            id: sequence_id,
+            current_index: 0,
+        });
+    }
+
     fn last_mut(&mut self) -> Option<&mut SequenceState> {
         self.callstack.iter_mut().last()
     }
@@ -139,7 +147,7 @@ impl StepWitnessStore {
         internal_write: Option<InternalWriteRecord>,
     ) {
         match event {
-            TraceEvent::SequenceStart(trace_item) => {
+            TraceEvent::SequenceStart(trace_item) | TraceEvent::RecurSequenceStart(trace_item) => {
                 self.0.insert(
                     coordinates,
                     StepWitnessData {
@@ -161,7 +169,7 @@ impl StepWitnessStore {
                     },
                 );
             }
-            TraceEvent::SequenceEnd(trace_item) => {
+            TraceEvent::SequenceEnd(trace_item) | TraceEvent::RecurSequenceEnd(trace_item) => {
                 let trace_io = self.0.get_mut(&coordinates).unwrap_or_else(|| {
                     panic!(
                         "Missing step witness entry for SequenceEnd at coordinates {:?}. Expected a matching SequenceStart to be recorded first.",
@@ -197,7 +205,9 @@ impl StepWitnessStore {
                     },
                 );
             }
-            TraceEvent::RecurTileExec(trace_item) | TraceEvent::RecurExec(trace_item) => {
+            TraceEvent::RecurTileIterationExec(trace_item)
+            | TraceEvent::RecurTileExec(trace_item)
+            | TraceEvent::RecurSequenceExec(trace_item) => {
                 self.0.insert(
                     coordinates,
                     StepWitnessData {
@@ -244,6 +254,7 @@ pub struct TraceRecorder {
     exec_index: u64,
     sequence_callstack: SequenceCallstack,
     active_recur: Option<RecurExecutionState>,
+    active_recur_sequence: Option<RecurExecutionState>,
     cfs_cursor: CfsCursor,
     witness_store: StepWitnessStore,
     internal_storage: InternalStorageManager,
@@ -255,6 +266,7 @@ impl TraceRecorder {
             exec_index: 0,
             sequence_callstack: SequenceCallstack::new(),
             active_recur: None,
+            active_recur_sequence: None,
             cfs_cursor: CfsCursor::new(cfs),
             witness_store: StepWitnessStore::new(),
             internal_storage: InternalStorageManager::new(),
@@ -335,7 +347,11 @@ impl TraceRecorder {
             TraceEvent::SequenceEnd(fn_call_record) => {
                 assert!(
                     self.active_recur.is_none(),
-                    "Sequence ended while recur site trace was still active"
+                    "Sequence ended while RecurTile site trace was still active"
+                );
+                assert!(
+                    self.active_recur_sequence.is_none(),
+                    "Sequence ended while RecurSequence site trace was still active"
                 );
                 let sequence_coordinates =
                     self.sequence_callstack.current_sequence_coordinates.clone();
@@ -361,6 +377,104 @@ impl TraceRecorder {
 
                 StepRecord::SequenceEnd(record)
             }
+            TraceEvent::RecurSequenceStart(fn_call_record) => {
+                let parent_sequence_coordinates =
+                    self.sequence_callstack.current_sequence_coordinates.clone();
+                let parent_current_index = self
+                    .sequence_callstack
+                    .last_mut()
+                    .expect("RecurSequence can't start without sequence context")
+                    .current_index;
+
+                let recur_state = self.active_recur_sequence.get_or_insert_with(|| {
+                    let site_coordinates = self.cfs_cursor.get_child_coordinates(
+                        &parent_sequence_coordinates,
+                        parent_current_index,
+                        SequenceChildId::RecurSequence(fn_call_record.fn_name.clone()),
+                    );
+                    RecurExecutionState {
+                        site_id: fn_call_record.fn_name.clone(),
+                        sequence_coordinates: parent_sequence_coordinates.clone(),
+                        site_coordinates,
+                        intra_sequence_index: parent_current_index,
+                        next_iteration_index: 0,
+                    }
+                });
+                assert_eq!(
+                    recur_state.sequence_coordinates, parent_sequence_coordinates,
+                    "RecurSequence iteration switched parent sequence coordinates mid-stream",
+                );
+                assert_eq!(
+                    recur_state.site_id, fn_call_record.fn_name,
+                    "RecurSequence iteration switched site id mid-stream",
+                );
+
+                let mut iteration_coordinates = recur_state.site_coordinates.clone();
+                iteration_coordinates.push(recur_state.next_iteration_index);
+                recur_state.next_iteration_index += 1;
+                self.sequence_callstack.push_at_coordinates(
+                    fn_call_record.fn_name.clone(),
+                    iteration_coordinates.clone(),
+                );
+
+                let input = fn_call_record.input;
+                let input_commitment = input
+                    .as_ref()
+                    .map(|output| Sha256Commitment::from(output).into())
+                    .unwrap_or_default();
+                let external_input_commitment = input
+                    .as_ref()
+                    .map(|input| external_input_commitment(input.external()))
+                    .unwrap_or_default();
+                let input_source_commitment = input
+                    .as_ref()
+                    .map(input_source_commitment)
+                    .unwrap_or_default();
+
+                let record = SequenceStartRecord {
+                    exec_index,
+                    sequence_id: fn_call_record.fn_name.clone(),
+                    coordinates: iteration_coordinates.clone(),
+                    input_commitment,
+                    input_source_commitment,
+                    external_input_commitment,
+                };
+
+                self.witness_store
+                    .insert(iteration_coordinates, event.clone(), None);
+
+                StepRecord::SequenceStart(record)
+            }
+            TraceEvent::RecurSequenceEnd(fn_call_record) => {
+                assert!(
+                    self.active_recur.is_none(),
+                    "RecurSequence iteration ended while RecurTile trace was still active"
+                );
+                let sequence_coordinates =
+                    self.sequence_callstack.current_sequence_coordinates.clone();
+
+                let output = fn_call_record.output;
+                let output_commitment = output
+                    .as_ref()
+                    .map(|output| Sha256Commitment::from(output).into())
+                    .unwrap_or_default();
+
+                let record = SequenceEndRecord {
+                    exec_index,
+                    coordinates: sequence_coordinates.clone(),
+                    sequence_id: fn_call_record.fn_name.clone(),
+                    output_commitment,
+                };
+
+                self.sequence_callstack
+                    .pop()
+                    .expect("Corrupted recur sequence stack");
+
+                self.witness_store
+                    .insert(sequence_coordinates, event.clone(), None);
+
+                StepRecord::SequenceEnd(record)
+            }
             TraceEvent::TileExec(fn_call_record) => {
                 assert!(
                     self.active_recur.is_none(),
@@ -376,10 +490,25 @@ impl TraceRecorder {
                 let sequence_id = current_sequence_state.id.clone();
                 let parent_current_index = current_sequence_state.current_index;
 
+                let mut candidate_coordinates = sequence_coordinates.clone();
+                candidate_coordinates.push(
+                    parent_current_index
+                        .try_into()
+                        .expect("Sequence coordinate out of bound u8"),
+                );
+                let child_id = match self.cfs_cursor.try_get_item(&candidate_coordinates) {
+                    Some(raster_core::cfs::SequenceChildItem::RecurTile(item))
+                        if item.id == fn_call_record.fn_name =>
+                    {
+                        SequenceChildId::RecurTile(fn_call_record.fn_name.clone())
+                    }
+                    _ => SequenceChildId::Tile(fn_call_record.fn_name.clone()),
+                };
+
                 let tile_coordinates = self.cfs_cursor.get_child_coordinates(
                     &sequence_coordinates,
                     parent_current_index,
-                    SequenceChildId::Tile(fn_call_record.fn_name.clone()),
+                    child_id,
                 );
 
                 current_sequence_state.current_index += 1;
@@ -441,13 +570,13 @@ impl TraceRecorder {
 
                 StepRecord::TileExec(record)
             }
-            TraceEvent::RecurTileExec(fn_call_record) => {
+            TraceEvent::RecurTileIterationExec(fn_call_record) => {
                 let sequence_coordinates =
                     self.sequence_callstack.current_sequence_coordinates.clone();
                 let current_sequence_state = self
                     .sequence_callstack
                     .last_mut()
-                    .expect("Recur tile can't be called without sequence context");
+                    .expect("RecurTile can't be called without sequence context");
 
                 let sequence_id = current_sequence_state.id.clone();
                 let recur_state = self.active_recur.get_or_insert_with(|| {
@@ -455,7 +584,7 @@ impl TraceRecorder {
                     let site_coordinates = self.cfs_cursor.get_child_coordinates(
                         &sequence_coordinates,
                         parent_current_index,
-                        SequenceChildId::Recur(fn_call_record.fn_name.clone()),
+                        SequenceChildId::RecurTile(fn_call_record.fn_name.clone()),
                     );
                     RecurExecutionState {
                         site_id: fn_call_record.fn_name.clone(),
@@ -467,11 +596,11 @@ impl TraceRecorder {
                 });
                 assert_eq!(
                     recur_state.sequence_coordinates, sequence_coordinates,
-                    "Recur iteration switched parent sequence coordinates mid-stream",
+                    "RecurTile iteration switched parent sequence coordinates mid-stream",
                 );
                 assert_eq!(
                     recur_state.site_id, fn_call_record.fn_name,
-                    "Recur iteration switched site id mid-stream",
+                    "RecurTile iteration switched site id mid-stream",
                 );
 
                 let mut tile_coordinates = recur_state.site_coordinates.clone();
@@ -535,13 +664,13 @@ impl TraceRecorder {
 
                 StepRecord::TileExec(record)
             }
-            TraceEvent::RecurExec(fn_call_record) => {
+            TraceEvent::RecurTileExec(fn_call_record) => {
                 let sequence_coordinates =
                     self.sequence_callstack.current_sequence_coordinates.clone();
                 let current_sequence_state = self
                     .sequence_callstack
                     .last_mut()
-                    .expect("Recur site can't be recorded without sequence context");
+                    .expect("RecurTile site can't be recorded without sequence context");
                 let sequence_id = current_sequence_state.id.clone();
                 let parent_current_index = current_sequence_state.current_index;
 
@@ -549,7 +678,7 @@ impl TraceRecorder {
                     let site_coordinates = self.cfs_cursor.get_child_coordinates(
                         &sequence_coordinates,
                         parent_current_index,
-                        SequenceChildId::Recur(fn_call_record.fn_name.clone()),
+                        SequenceChildId::RecurTile(fn_call_record.fn_name.clone()),
                     );
                     RecurExecutionState {
                         site_id: fn_call_record.fn_name.clone(),
@@ -562,11 +691,11 @@ impl TraceRecorder {
 
                 assert_eq!(
                     recur_state.sequence_coordinates, sequence_coordinates,
-                    "Recur completion switched parent sequence coordinates mid-stream",
+                    "RecurTile completion switched parent sequence coordinates mid-stream",
                 );
                 assert_eq!(
                     recur_state.site_id, fn_call_record.fn_name,
-                    "Recur completion site id does not match active recur stream",
+                    "RecurTile completion site id does not match active RecurTile stream",
                 );
 
                 current_sequence_state.current_index += 1;
@@ -595,9 +724,9 @@ impl TraceRecorder {
                     .map(|write| write.entry.object_commitment.clone())
                     .unwrap_or_default();
 
-                let record = RecurExecRecord {
+                let record = RecurTileExecRecord {
                     exec_index,
-                    recur_id: fn_call_record.fn_name,
+                    recur_tile_id: fn_call_record.fn_name,
                     sequence_id,
                     intra_sequence_index: recur_state.intra_sequence_index,
                     coordinates: recur_state.site_coordinates.clone(),
@@ -629,7 +758,103 @@ impl TraceRecorder {
                     internal_write,
                 );
 
-                StepRecord::RecurExec(record)
+                StepRecord::RecurTileExec(record)
+            }
+            TraceEvent::RecurSequenceExec(fn_call_record) => {
+                let sequence_coordinates =
+                    self.sequence_callstack.current_sequence_coordinates.clone();
+                let current_sequence_state = self
+                    .sequence_callstack
+                    .last_mut()
+                    .expect("RecurSequence site can't be recorded without sequence context");
+                let sequence_id = current_sequence_state.id.clone();
+                let parent_current_index = current_sequence_state.current_index;
+
+                let recur_state = self.active_recur_sequence.take().unwrap_or_else(|| {
+                    let site_coordinates = self.cfs_cursor.get_child_coordinates(
+                        &sequence_coordinates,
+                        parent_current_index,
+                        SequenceChildId::RecurSequence(fn_call_record.fn_name.clone()),
+                    );
+                    RecurExecutionState {
+                        site_id: fn_call_record.fn_name.clone(),
+                        sequence_coordinates: sequence_coordinates.clone(),
+                        site_coordinates,
+                        intra_sequence_index: parent_current_index,
+                        next_iteration_index: 0,
+                    }
+                });
+
+                assert_eq!(
+                    recur_state.sequence_coordinates, sequence_coordinates,
+                    "RecurSequence completion switched parent sequence coordinates mid-stream",
+                );
+                assert_eq!(
+                    recur_state.site_id, fn_call_record.fn_name,
+                    "RecurSequence completion site id does not match active RecurSequence stream",
+                );
+
+                current_sequence_state.current_index += 1;
+
+                let input = fn_call_record.input;
+                let input_commitment = input
+                    .as_ref()
+                    .map(|input| Sha256Commitment::from(input).into())
+                    .unwrap_or_default();
+                let external_input_commitment = input
+                    .as_ref()
+                    .map(|input| external_input_commitment(input.external()))
+                    .unwrap_or_default();
+                let input_source_commitment = input
+                    .as_ref()
+                    .map(input_source_commitment)
+                    .unwrap_or_default();
+
+                let output = fn_call_record.output;
+                let internal_write = output.as_ref().map(|output| {
+                    self.internal_storage
+                        .append_serialized_bytes(&output.data, recur_state.site_coordinates.clone())
+                });
+                let output_commitment = internal_write
+                    .as_ref()
+                    .map(|write| write.entry.object_commitment.clone())
+                    .unwrap_or_default();
+
+                let record = RecurSequenceExecRecord {
+                    exec_index,
+                    recur_sequence_id: fn_call_record.fn_name,
+                    sequence_id,
+                    intra_sequence_index: recur_state.intra_sequence_index,
+                    coordinates: recur_state.site_coordinates.clone(),
+                    input_commitment,
+                    input_source_commitment,
+                    output_commitment,
+                    external_input_commitment,
+                    internal_store_root_before: internal_write
+                        .as_ref()
+                        .map(|write| write.store_root_before.clone())
+                        .unwrap_or_else(|| self.internal_storage.snapshot().root),
+                    internal_store_root_after: internal_write
+                        .as_ref()
+                        .map(|write| write.store_root_after.clone())
+                        .unwrap_or_else(|| self.internal_storage.snapshot().root),
+                    internal_store_index_root_before: internal_write
+                        .as_ref()
+                        .map(|write| write.index_root_before.clone())
+                        .unwrap_or_else(|| self.internal_storage.snapshot().index_root),
+                    internal_store_index_root_after: internal_write
+                        .as_ref()
+                        .map(|write| write.index_root_after.clone())
+                        .unwrap_or_else(|| self.internal_storage.snapshot().index_root),
+                };
+
+                self.witness_store.insert(
+                    recur_state.site_coordinates.clone(),
+                    event.clone(),
+                    internal_write,
+                );
+
+                StepRecord::RecurSequenceExec(record)
             }
         };
 
@@ -640,7 +865,7 @@ impl TraceRecorder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use raster_core::cfs::{RecurItem, SequenceChildItem, SequenceDef, TileDef, TileItem};
+    use raster_core::cfs::{RecurTileItem, SequenceChildItem, SequenceDef, TileDef, TileItem};
     use raster_core::trace::FnCallRecord;
 
     fn recorder_with_recur_site() -> TraceRecorder {
@@ -653,7 +878,7 @@ mod tests {
                 id: "main".to_string(),
                 input_sources: vec![],
                 items: vec![
-                    SequenceChildItem::Recur(RecurItem {
+                    SequenceChildItem::RecurTile(RecurTileItem {
                         id: "recur".to_string(),
                         sources: vec![],
                     }),
@@ -694,19 +919,19 @@ mod tests {
             draft_transition_witness: None,
         }));
 
-        let iter0 = recorder.record(TraceEvent::RecurTileExec(FnCallRecord {
+        let iter0 = recorder.record(TraceEvent::RecurTileIterationExec(FnCallRecord {
             fn_name: "recur".to_string(),
             input: None,
             output: None,
             draft_transition_witness: None,
         }));
-        let iter1 = recorder.record(TraceEvent::RecurTileExec(FnCallRecord {
+        let iter1 = recorder.record(TraceEvent::RecurTileIterationExec(FnCallRecord {
             fn_name: "recur".to_string(),
             input: None,
             output: None,
             draft_transition_witness: None,
         }));
-        let site = recorder.record(TraceEvent::RecurExec(FnCallRecord {
+        let site = recorder.record(TraceEvent::RecurTileExec(FnCallRecord {
             fn_name: "recur".to_string(),
             input: None,
             output: None,
