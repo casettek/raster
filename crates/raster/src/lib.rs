@@ -64,12 +64,36 @@ pub mod utils;
 #[doc(hidden)]
 pub mod __private {
     #[cfg(feature = "std")]
-    pub fn emit_debug(args: core::fmt::Arguments<'_>) {
-        std::println!("[debug] {}", args);
+    pub fn emit_output(args: core::fmt::Arguments<'_>) {
+        std::println!("[output] {}", args);
     }
 
     #[cfg(not(feature = "std"))]
-    pub fn emit_debug(_: core::fmt::Arguments<'_>) {}
+    pub fn emit_output(_: core::fmt::Arguments<'_>) {}
+
+    #[cfg(feature = "std")]
+    pub type ProfileInstant = std::time::Instant;
+
+    #[cfg(feature = "std")]
+    pub fn profile_now() -> ProfileInstant {
+        std::time::Instant::now()
+    }
+
+    #[cfg(not(feature = "std"))]
+    #[derive(Clone, Copy)]
+    pub struct ProfileInstant;
+
+    #[cfg(not(feature = "std"))]
+    impl ProfileInstant {
+        pub fn elapsed(&self) -> core::time::Duration {
+            core::time::Duration::from_secs(0)
+        }
+    }
+
+    #[cfg(not(feature = "std"))]
+    pub fn profile_now() -> ProfileInstant {
+        ProfileInstant
+    }
 
     #[doc(hidden)]
     pub struct SequenceScopeGuard;
@@ -151,6 +175,125 @@ pub mod __private {
     }
 
     #[cfg(feature = "std")]
+    pub fn begin_sequence_profile(sequence_id: &str) {
+        #[cfg(feature = "profiling")]
+        raster_runtime::begin_sequence_profile(sequence_id);
+        #[cfg(not(feature = "profiling"))]
+        let _ = sequence_id;
+    }
+
+    #[cfg(not(feature = "std"))]
+    pub fn begin_sequence_profile(_: &str) {}
+
+    #[cfg(feature = "std")]
+    pub fn finish_sequence_profile(
+        sequence_id: &str,
+        total_duration_ns: u64,
+        scope_enter_ns: u64,
+        input_trace_ns: u64,
+        start_event_publish_ns: u64,
+        output_trace_ns: u64,
+        end_event_publish_ns: u64,
+    ) {
+        #[cfg(feature = "profiling")]
+        raster_runtime::finish_sequence_profile(
+            sequence_id,
+            total_duration_ns,
+            raster_runtime::SequenceProfileSelfBreakdown {
+                body_self_ns: 0,
+                scope_enter_ns,
+                synthetic_coordinate_alloc_ns: 0,
+                input_trace_ns,
+                start_event_publish_ns,
+                output_trace_ns,
+                end_event_publish_ns,
+                other_wrapper_ns: 0,
+            },
+        );
+        #[cfg(not(feature = "profiling"))]
+        let _ = (
+            sequence_id,
+            total_duration_ns,
+            scope_enter_ns,
+            input_trace_ns,
+            start_event_publish_ns,
+            output_trace_ns,
+            end_event_publish_ns,
+        );
+    }
+
+    #[cfg(not(feature = "std"))]
+    pub fn finish_sequence_profile(_: &str, _: u64, _: u64, _: u64, _: u64, _: u64, _: u64) {}
+
+    #[cfg(feature = "std")]
+    pub fn record_tile_profile(
+        tile_id: &str,
+        coordinates: crate::core::cfs::CfsCoordinates,
+        total_duration_ns: u64,
+        user_duration_ns: u64,
+        external_input_resolve_ns: u64,
+        internal_input_resolve_ns: u64,
+        trace_serialize_ns: u64,
+        draft_capture_ns: u64,
+        scope_enter_ns: u64,
+        output_record_build_ns: u64,
+        trace_event_publish_ns: u64,
+        output_coordinate_publish_ns: u64,
+    ) {
+        #[cfg(feature = "profiling")]
+        raster_runtime::record_tile_profile(
+            tile_id,
+            coordinates,
+            total_duration_ns,
+            user_duration_ns,
+            raster_runtime::TileProfileOverheadBreakdown {
+                external_input_resolve_ns,
+                internal_input_resolve_ns,
+                output_store_ns: 0,
+                trace_serialize_ns,
+                draft_capture_ns,
+                scope_enter_ns,
+                output_record_build_ns,
+                trace_event_publish_ns,
+                output_coordinate_publish_ns,
+                other_wrapper_ns: 0,
+            },
+        );
+        #[cfg(not(feature = "profiling"))]
+        let _ = (
+            tile_id,
+            coordinates,
+            total_duration_ns,
+            user_duration_ns,
+            external_input_resolve_ns,
+            internal_input_resolve_ns,
+            trace_serialize_ns,
+            draft_capture_ns,
+            scope_enter_ns,
+            output_record_build_ns,
+            trace_event_publish_ns,
+            output_coordinate_publish_ns,
+        );
+    }
+
+    #[cfg(not(feature = "std"))]
+    pub fn record_tile_profile(
+        _: &str,
+        _: crate::core::cfs::CfsCoordinates,
+        _: u64,
+        _: u64,
+        _: u64,
+        _: u64,
+        _: u64,
+        _: u64,
+        _: u64,
+        _: u64,
+        _: u64,
+        _: u64,
+    ) {
+    }
+
+    #[cfg(feature = "std")]
     pub fn publish_tile_output_coordinates(coordinates: crate::core::cfs::CfsCoordinates) {
         raster_runtime::publish_pending_output_coordinates(coordinates);
     }
@@ -220,9 +363,17 @@ pub mod __private {
     where
         T: serde::Serialize + serde::de::DeserializeOwned + 'static,
     {
-        let reference = raster_runtime::store_execution_output_value(&result).unwrap_or_else(|error| {
-            panic!("Failed to store tile output in internal storage: {}", error)
-        });
+        #[cfg(feature = "profiling")]
+        let output_store_start = profile_now();
+        let reference =
+            raster_runtime::store_execution_output_value(&result).unwrap_or_else(|error| {
+                panic!("Failed to store tile output in internal storage: {}", error)
+            });
+        #[cfg(feature = "profiling")]
+        let output_store_duration_ns =
+            u64::try_from(output_store_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        #[cfg(feature = "profiling")]
+        raster_runtime::record_tile_output_store_profile(output_store_duration_ns);
         crate::into_auth_ref::<T, _>(crate::typed_internal::<T>(reference))
     }
 
@@ -238,9 +389,17 @@ pub mod __private {
     where
         T: serde::Serialize + serde::de::DeserializeOwned + 'static,
     {
-        let reference = raster_runtime::store_execution_output_value(&result).unwrap_or_else(|error| {
-            panic!("Failed to store tile output in internal storage: {}", error)
-        });
+        #[cfg(feature = "profiling")]
+        let output_store_start = profile_now();
+        let reference =
+            raster_runtime::store_execution_output_value(&result).unwrap_or_else(|error| {
+                panic!("Failed to store tile output in internal storage: {}", error)
+            });
+        #[cfg(feature = "profiling")]
+        let output_store_duration_ns =
+            u64::try_from(output_store_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        #[cfg(feature = "profiling")]
+        raster_runtime::record_tile_output_store_profile(output_store_duration_ns);
         match result {
             Ok(_) => Ok(crate::into_auth_ref::<T, _>(
                 crate::typed_internal_with_resolver::<T>(
@@ -390,14 +549,14 @@ macro_rules! call_recur {
     };
 }
 
-/// Emits a Raster debug line that `cargo raster run --verbose` will surface.
+/// Emits a Raster-controlled output line that `cargo raster run` will surface.
 ///
-/// Use this instead of `println!` in Raster user code, especially in `no_std`
-/// tile/sequence crates where the standard print macros are unavailable.
+/// Use this instead of `std::println!` in Raster user code. The CLI captures
+/// this output and displays it under the `Output:` section.
 #[macro_export]
-macro_rules! debug {
+macro_rules! println {
     ($($arg:tt)*) => {{
-        $crate::__private::emit_debug(::core::format_args!($($arg)*));
+        $crate::__private::emit_output(::core::format_args!($($arg)*));
     }};
 }
 
@@ -422,7 +581,7 @@ pub mod prelude {
 
     pub use crate::exec::Result;
     pub use crate::{
-        call, call_recur, call_seq, debug, external, finalize, internal, into_auth_ref,
+        call, call_recur, call_seq, external, finalize, internal, into_auth_ref,
         materialize_auth_result, materialize_auth_return, new, select, sequence, tile, Anchor,
         AuthRef, AuthValue, Draft, ExternalSelection, ExternalValue, InternalRef, InternalValue,
         IntoAuthRef, IntoAuthValue, ListProofDirection, ListProofSibling, Op, RecurControl,

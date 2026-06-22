@@ -59,9 +59,9 @@ fn reference_after_finalize_does_not_shift_tile(label: String) -> InternalRef {
 }
 
 fn run_reference_after_new(label: String) -> InternalRef {
-    materialize_auth_return::<InternalRef, _>(__raster_sequence_auth_reference_after_new_does_not_shift_tile(
-        label,
-    ))
+    materialize_auth_return::<InternalRef, _>(
+        __raster_sequence_auth_reference_after_new_does_not_shift_tile(label),
+    )
 }
 
 fn run_reference_after_finalize(label: String) -> InternalRef {
@@ -121,13 +121,19 @@ fn finalized_internal_refs_support_select() {
 #[test]
 fn draft_creation_does_not_shift_later_tile_coordinates() {
     let reference = run_reference_after_new("after-new".to_string());
-    assert_eq!(reference.coordinates, raster::core::cfs::CfsCoordinates(vec![0]));
+    assert_eq!(
+        reference.coordinates,
+        raster::core::cfs::CfsCoordinates(vec![0])
+    );
 }
 
 #[test]
 fn finalize_does_not_shift_later_tile_coordinates() {
     let reference = run_reference_after_finalize("after-finalize".to_string());
-    assert_eq!(reference.coordinates, raster::core::cfs::CfsCoordinates(vec![1]));
+    assert_eq!(
+        reference.coordinates,
+        raster::core::cfs::CfsCoordinates(vec![1])
+    );
 }
 
 #[test]

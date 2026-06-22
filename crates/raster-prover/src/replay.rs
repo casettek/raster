@@ -82,14 +82,14 @@ impl<'a> Replayer<'a> {
             .execute_tile(artifact.as_ref(), input_bytes, mode)?;
 
         let image_id = hex::decode(image_id).unwrap();
-        let receipt_bytes = exec_result
-            .receipt
-            .clone()
-            .ok_or_else(|| Error::Other("Replay requires a proof receipt to recover the replay journal".into()))?;
+        let receipt_bytes = exec_result.receipt.clone().ok_or_else(|| {
+            Error::Other("Replay requires a proof receipt to recover the replay journal".into())
+        })?;
         let receipt: risc0_zkvm::Receipt = raster_core::postcard::from_bytes(&receipt_bytes)
             .map_err(|e| Error::Other(format!("Failed to decode replay receipt: {}", e)))?;
-        let replay_journal: TileReplayJournal = raster_core::postcard::from_bytes(&receipt.journal.bytes)
-            .map_err(|e| Error::Other(format!("Failed to decode replay journal: {}", e)))?;
+        let replay_journal: TileReplayJournal =
+            raster_core::postcard::from_bytes(&receipt.journal.bytes)
+                .map_err(|e| Error::Other(format!("Failed to decode replay journal: {}", e)))?;
         Ok(ReplayResult {
             fn_name: record.tile_id.clone(),
             receipt: receipt_bytes,

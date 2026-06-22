@@ -59,8 +59,8 @@ From `crates/raster/src/lib.rs`:
   - `pub use raster_macros::{tile, sequence}` (proc macro attributes)
 
 - **Runtime (only when `raster` is built with feature `std`)**
-  - `pub use raster_runtime::{init, init_with, finish, __emit_trace}`
-  - `pub use raster_runtime::{JsonSubscriber, CommitSubscriber, AuditSubscriber, Subscriber}`
+  - `pub use raster_runtime::{init, init_with, finish, publish_trace_event}`
+  - `pub use raster_runtime::{BinaryTraceEventPublisher, JsonTraceEventPublisher, Publisher}`
 
 From `raster::prelude`:
 
@@ -179,15 +179,14 @@ From `crates/raster-runtime/src/lib.rs`:
 
 - **Tracing lifecycle**
   - `pub fn init()`
-  - `pub fn init_with<S: Subscriber>(subscriber: S)`
+  - `pub fn init_with<P: Publisher>(publisher: P)`
   - `pub fn finish()`
-  - `pub fn __emit_trace(...)` (used by macro-generated code; not intended as a user entrypoint)
+  - `pub fn publish_trace_event(...)` (used by macro-generated code; not intended as a user entrypoint)
 
-- **Subscriber API**
-  - `pub trait Subscriber`
-  - `pub struct JsonSubscriber<W>`
-  - `pub struct CommitSubscriber<W>`
-  - `pub struct AuditSubscriber`
+- **Publisher API**
+  - `pub trait Publisher`
+  - `pub struct BinaryTraceEventPublisher`
+  - `pub struct JsonTraceEventPublisher<W>`
 
 ---
 
@@ -210,7 +209,7 @@ This section classifies the developer-facing surface by intended stability **bas
   - `raster-core::schema::{SequenceSchema, ControlFlow}` exists, but generation is not implemented (`SchemaGenerator::generate` is `todo!()`).
 
 - **Runtime execution and tracing**
-  - `raster-runtime` provides **trace subscribers** (stdout JSON, commitment file writing, and commitment auditing), but it does not provide a sequence/program executor.
+  - `raster-runtime` provides **trace publishers** (binary or JSON file capture for CLI runs, plus custom publishers), but it does not provide a sequence/program executor.
 
 - **Compilation orchestration APIs**
   - `raster-compiler::{Builder, CfsBuilder, ...}` are public and used by the CLI, but their artifact hashing/caching and compilation assumptions are still evolving.

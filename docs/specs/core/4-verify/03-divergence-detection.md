@@ -29,7 +29,7 @@ Where this document specifies those behaviors, it explicitly marks them as a **G
   - `crates/raster-core/src/trace.rs` (`TraceItem`)
   - `crates/raster-prover/src/trace.rs` (per-item hash + incremental commitment stream)
   - `crates/raster-prover/src/bit_packer.rs` (`BitPacker::diff` first-diff locator on packed streams)
-  - `crates/raster-runtime/src/tracing/subscriber/audit.rs` (`AuditSubscriber` compares a recomputed packed stream against an expected file)
+  - `crates/raster-cli/src/commands/run.rs` (`--audit` compares recomputed trace commitments against an expected file)
 - **Downstream analysis plumbing (stubbed)**
   - `crates/raster-analysis/src/analyzer.rs` (accepts `Trace`, analysis is `TODO`)
   - `crates/raster-cli/src/commands.rs` (`analyze` currently prints “not yet implemented”)

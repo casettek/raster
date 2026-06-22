@@ -1,5 +1,5 @@
 use raster_core::cfs::CfsCoordinates;
-use raster_core::coordinate_index::coordinate_index_root;
+use raster_core::coordinate_index::IncrementalCoordinateIndex;
 use raster_core::draft::{
     draft_root_from_witness, draft_tree_from_witness, draft_value_from_serialize,
     schema_hash as compute_schema_hash, DraftFieldValue, DraftOp, DraftReplayTransition,
@@ -70,7 +70,7 @@ pub struct InternalWriteRecord {
 pub struct InternalStorageManager {
     frontier: TraceTreeFrontier,
     objects: BTreeMap<CfsCoordinates, StoredInternalObject>,
-    coordinate_index: BTreeMap<CfsCoordinates, InternalStoreIndexValue>,
+    coordinate_index: IncrementalCoordinateIndex,
 }
 
 fn frontier_root(frontier: &TraceTreeFrontier) -> Vec<u8> {
@@ -224,7 +224,7 @@ impl InternalStorageManager {
         Self {
             frontier,
             objects: BTreeMap::new(),
-            coordinate_index: BTreeMap::new(),
+            coordinate_index: IncrementalCoordinateIndex::new(),
         }
     }
 
@@ -241,7 +241,7 @@ impl InternalStorageManager {
     }
 
     pub fn current_index_root(&self) -> Vec<u8> {
-        coordinate_index_root(&self.coordinate_index)
+        self.coordinate_index.root()
     }
 
     pub fn append_serialized_bytes(
@@ -423,6 +423,10 @@ impl SequenceExecutionContext {
     }
 
     fn reserve_synthetic_coordinates(&mut self) -> Result<CfsCoordinates> {
+        let profiling_enabled = crate::profiling::profiling_enabled();
+        let synthetic_coordinate_alloc_start = profiling_enabled.then(std::time::Instant::now);
+        let should_record_sequence_overhead =
+            THREAD_ACTIVE_EXECUTION_COORDINATES.with(|stack| stack.borrow().is_empty());
         let synthetic_index = {
             let frame = self.stack.last_mut().ok_or_else(|| {
                 Error::Other("Internal-store writes require active sequence context".into())
@@ -441,12 +445,20 @@ impl SequenceExecutionContext {
         } else {
             self.stack
                 .last()
-                .ok_or_else(|| Error::Other("Internal-store writes require active sequence context".into()))?
+                .ok_or_else(|| {
+                    Error::Other("Internal-store writes require active sequence context".into())
+                })?
                 .coordinates
                 .clone()
         };
         coordinates.push(u32::MAX);
         coordinates.push(synthetic_index);
+        if should_record_sequence_overhead {
+            if let Some(start) = synthetic_coordinate_alloc_start {
+                let duration_ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                crate::profiling::record_sequence_synthetic_coordinate_alloc(duration_ns);
+            }
+        }
         Ok(coordinates)
     }
 }
@@ -512,9 +524,8 @@ where
     S: Schema,
 {
     let schema = S::schema();
-    let coordinates = THREAD_SEQUENCE_CONTEXT.with(|context| {
-        context.borrow_mut().reserve_synthetic_coordinates()
-    })?;
+    let coordinates = THREAD_SEQUENCE_CONTEXT
+        .with(|context| context.borrow_mut().reserve_synthetic_coordinates())?;
     let anchor = anchor_for_schema(&coordinates, S::schema_hash());
     let current_root = draft_root(&schema, &BTreeMap::new(), false)?;
     THREAD_DRAFT_STORAGE.with(|drafts| {
@@ -709,9 +720,8 @@ fn store_internal_value_at_coordinates<T: Serialize>(
 }
 
 pub fn store_internal_value<T: Serialize>(value: &T) -> Result<InternalRef> {
-    let coordinates = THREAD_SEQUENCE_CONTEXT.with(|context| {
-        context.borrow_mut().reserve_synthetic_coordinates()
-    })?;
+    let coordinates = THREAD_SEQUENCE_CONTEXT
+        .with(|context| context.borrow_mut().reserve_synthetic_coordinates())?;
     store_internal_value_at_coordinates(value, coordinates)
 }
 
@@ -742,9 +752,8 @@ pub struct TileExecutionScopeGuard {
 
 impl TileExecutionScopeGuard {
     pub fn enter() -> Result<Self> {
-        let coordinates = THREAD_SEQUENCE_CONTEXT.with(|context| {
-            context.borrow_mut().reserve_execution_coordinates()
-        })?;
+        let coordinates = THREAD_SEQUENCE_CONTEXT
+            .with(|context| context.borrow_mut().reserve_execution_coordinates())?;
         THREAD_ACTIVE_EXECUTION_COORDINATES.with(|active| {
             active.borrow_mut().push(coordinates.clone());
         });

@@ -1,27 +1,24 @@
 //! Run command: build and execute the user program as a whole.
 
 use rand::seq::IteratorRandom;
-use raster_backend::backend::HexString;
-use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
-use raster_backend::{Backend, ExecutionMode};
+use raster_analysis::{Analyzer, Report};
+use raster_backend::ExecutionMode;
 use raster_backend_risc0::Risc0Backend;
 
 use raster_compiler::{CfsBuilder, Project};
 
-use raster_core::cfs::{CfsCoordinates, CfsCursor, ControlFlowSchema};
-use raster_core::coordinate_index::{
-    coordinate_index_membership_proof, coordinate_index_non_membership_proof, coordinate_index_root,
-};
+use raster_core::cfs::ControlFlowSchema;
+use raster_core::coordinate_index::IncrementalCoordinateIndex;
 use raster_core::draft::DraftTransitionWitness;
-use raster_core::trace::{ExternalInput, FnInput, StepRecord, Trace, TraceEvent, TraceWindow};
+use raster_core::trace::{ExternalInput, FnInput, StepRecord, Trace, TraceEvent};
 use raster_core::transition::{
     InternalStoreEntry, InternalStoreIndexValue, InternalStoreLogWitness, InternalStoreReadWitness,
     InternalStoreWitness, InternalStoreWriteWitness,
@@ -36,10 +33,11 @@ use raster_prover::trace::{
     VerificationResult,
 };
 use raster_prover::transition::step_transitions;
-use raster_runtime::{TraceRecorder, TRACE_EVENT_PREFIX};
+use raster_runtime::TraceRecorder;
 
+use crate::commands::create_run_artifacts;
 use crate::utils::authorization::{build_manifested_inputs, collect_external_input_commitments};
-use crate::BackendType;
+use crate::{BackendType, TraceFormat};
 
 pub fn run(
     backend_type: BackendType,
@@ -47,7 +45,11 @@ pub fn run(
     input_manifest: Option<&str>,
     commit_flag: Option<&str>,
     audit_flag: Option<&str>,
-    verbose: bool,
+    _verbose: bool,
+    trace_format: TraceFormat,
+    features: &[String],
+    all_features: bool,
+    no_default_features: bool,
 ) -> Result<()> {
     if backend_type != BackendType::Native {
         return Err(Error::Other(
@@ -68,10 +70,22 @@ pub fn run(
 
     println!("Building project...");
 
-    // Build the project with cargo build --release
-    let build_status = Command::new("cargo")
+    let mut build_command = Command::new("cargo");
+    build_command
         .current_dir(&project.root_dir)
-        .args(["build", "--release"])
+        .args(["build", "--release"]);
+    if no_default_features {
+        build_command.arg("--no-default-features");
+    }
+    if all_features {
+        build_command.arg("--all-features");
+    }
+    if !features.is_empty() {
+        build_command.arg("--features");
+        build_command.arg(features.join(","));
+    }
+
+    let build_status = build_command
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .status()
@@ -89,12 +103,41 @@ pub fn run(
             binary_path.display()
         )));
     }
+    let artifacts = create_run_artifacts(trace_format)?;
+    let trace_path = artifacts.trace_path.clone();
+    let profile_path = artifacts.profile_path.clone();
+    let profile_stream_path = artifacts.profile_stream_path.clone();
     println!();
-    println!("Running {}...", &project.name);
+    println!("Raster Run");
+    println!("  Project: {}", &project.name);
+    println!("  Run ID: {}", artifacts.run_id);
+    println!("  Run artifacts dir: {}", artifacts.run_dir.display());
+    println!("  Trace path: {}", trace_path.display());
+    if profiling_enabled(features, all_features) {
+        println!(
+            "  Expected live profile stream: {}",
+            profile_stream_path.display()
+        );
+        println!(
+            "  Follow with: cargo raster analyze --follow {}",
+            profile_stream_path.display()
+        );
+    }
     println!();
 
     let mut cmd = Command::new(&binary_path);
     cmd.current_dir(&project.root_dir);
+    cmd.env(raster_runtime::TRACE_PATH_ENV, &trace_path);
+    cmd.env(
+        raster_runtime::TRACE_FORMAT_ENV,
+        trace_format.as_runtime_str(),
+    );
+    cmd.env(raster_runtime::PROFILE_PATH_ENV, &profile_path);
+    cmd.env(
+        raster_runtime::PROFILE_STREAM_PATH_ENV,
+        &profile_stream_path,
+    );
+    cmd.env(raster_runtime::PROFILE_RUN_ID_ENV, &artifacts.run_id);
     if let Some(input_json) = input {
         cmd.args(["--input", input_json]);
     }
@@ -106,11 +149,8 @@ pub fn run(
 
     let mut child = cmd.spawn()?;
 
-    let mut trace: Arc<Mutex<Trace>> = Arc::new(Mutex::new(Trace::new()));
-    let mut reader_trace = Arc::clone(&trace);
-
-    let mut log = Arc::new(Mutex::new(Vec::new()));
-    let mut reader_log = Arc::clone(&log);
+    let user_output = Arc::new(Mutex::new(Vec::new()));
+    let reader_user_output = Arc::clone(&user_output);
 
     let stdout = child.stdout.take().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::Other, "Could not capture stdout")
@@ -122,34 +162,22 @@ pub fn run(
 
     let mut handles = Vec::new();
 
-    let trace_recorder = Arc::new(Mutex::new(TraceRecorder::new(cfs.clone())));
-    let stdout_trace_recorder = Arc::clone(&trace_recorder);
     let stdout_handle = std::thread::spawn(move || {
         let stdout_reader = BufReader::new(stdout);
 
         for line in stdout_reader.lines() {
             if let Ok(line_str) = line {
-                if let Some(raw_event) = line_str.strip_prefix(TRACE_EVENT_PREFIX) {
-                    let trace_event = serde_json::from_str::<TraceEvent>(raw_event)
-                        .unwrap_or_else(|error| panic!("Failed to decode trace event: {error}: {raw_event}"));
-                    let step_record = {
-                        let mut trace_recorder = stdout_trace_recorder.lock().unwrap();
-                        trace_recorder.record(trace_event)
-                    };
-                    let mut trace_lock = reader_trace.lock().unwrap();
-                    trace_lock.push(step_record);
-                }
-                if let Some(debug_line) = line_str.strip_prefix("[debug]") {
-                    let mut log_lock = reader_log.lock().unwrap();
-                    log_lock.push(debug_line.to_string());
+                if let Some(output_line) = line_str.strip_prefix("[output]") {
+                    let mut output_lock = reader_user_output.lock().unwrap();
+                    output_lock.push(output_line.trim_start().to_string());
                 }
             }
         }
     });
     handles.push(stdout_handle);
 
-    let mut errors = Arc::new(Mutex::new(Vec::new()));
-    let mut thread_errors = Arc::clone(&errors);
+    let errors = Arc::new(Mutex::new(Vec::new()));
+    let thread_errors = Arc::clone(&errors);
     let stderr_handle = std::thread::spawn(move || {
         let stderr_reader = BufReader::new(stderr);
         for line in stderr_reader.lines() {
@@ -172,22 +200,16 @@ pub fn run(
         .into_inner()
         .unwrap();
 
-    let log = Arc::try_unwrap(log)
+    let user_output = Arc::try_unwrap(user_output)
         .expect("Cant move list out of Mutex. Some thread still holding copy of Arc")
         .into_inner()
         .unwrap();
 
-    let trace_recorder = Arc::try_unwrap(trace_recorder)
-        .expect("Cant move list out of Mutex. Some thread still holding copy of Arc")
-        .into_inner()
-        .unwrap();
-
-    if verbose {
-        if !log.is_empty() {
-            println!("Verbose log:");
-            for log_line in log {
-                println!("{log_line}");
-            }
+    if !user_output.is_empty() {
+        println!();
+        println!("Output:");
+        for output_line in user_output {
+            println!("  {output_line}");
         }
     }
 
@@ -198,58 +220,7 @@ pub fn run(
         }
     }
 
-    let mut trace = Arc::try_unwrap(trace)
-        .expect("Cant move list out of Mutex. Some thread still holding copy of Arc")
-        .into_inner()
-        .unwrap();
-
-    // Build all project tiles with Risc0
-    // TODO: Risc0 build can be perfomed in parallel to native user program execution
-
-    println!("Build Risc0 artifacts...");
-    let backend =
-        Risc0Backend::new(project.output_dir.clone()).with_user_crate(project.root_dir.clone());
-
-    let mut cfs_cursor = CfsCursor::new(cfs.clone());
-
-    let mut trace_coordinates: Vec<CfsCoordinates> = Vec::new();
-    let mut current_coordinates: CfsCoordinates;
-    for step_record in trace.iter() {
-        match step_record {
-            StepRecord::TileExec(tile_record) => {
-                trace_coordinates.push(tile_record.coordinates.clone());
-            }
-            StepRecord::RecurExec(recur_record) => {
-                trace_coordinates.push(recur_record.coordinates.clone());
-            }
-            StepRecord::SequenceEnd(sequence_end_record) => {
-                trace_coordinates.push(sequence_end_record.coordinates.clone());
-            }
-            StepRecord::SequenceStart(sequence_start_record) => {
-                trace_coordinates.push(sequence_start_record.coordinates.clone());
-            }
-        }
-    }
-
-    // let tiles_discovery = TileDiscovery::new(&project);
-    // let tiles = tiles_discovery.tiles;
-    //
-    // let artifact_registry: HashMap<TileId, HexString> = tiles
-    //     .into_par_iter()
-    //     .map(|tile| {
-    //         let tile_metadata = tile.to_metadata();
-    //         let content_hash = tile.to_content_hash();
-    //
-    //         let artifact = backend.compile_tile(&tile_metadata, content_hash).unwrap();
-    //
-    //         // Return a tuple of (Key, Value)
-    //         (tile_metadata.id, artifact.artifact_id())
-    //     })
-    //     .collect();
-    //
-    // for (tile_id, image_id) in &artifact_registry {
-    //     println!("Registered: {:?}", tile_id);
-    // }
+    let (mut trace, trace_recorder) = load_trace_from_file(&trace_path, trace_format, &cfs)?;
 
     if commit_flag.is_some() {
         let commit_path = commit_flag.expect("Commitment path was provided");
@@ -269,6 +240,8 @@ pub fn run(
         match verification_result {
             VerificationResult::Ok => println!("Verification Success"),
             VerificationResult::Fraud(fraud_evidence) => {
+                let backend = Risc0Backend::new(project.output_dir.clone())
+                    .with_user_crate(project.root_dir.clone());
                 let replayer = Replayer::new(&backend, &project);
                 let fraud_proof = prove(
                     fraud_evidence,
@@ -326,7 +299,143 @@ pub fn run(
         }
     }
 
+    if profile_path.exists() {
+        println!();
+        println!("Profiling");
+        if profile_stream_path.exists() {
+            println!(
+                "  Live profile stream saved to: {}",
+                profile_stream_path.display()
+            );
+            println!(
+                "  Follow with: cargo raster analyze --follow {}",
+                profile_stream_path.display()
+            );
+        }
+        println!("  Execution profile saved to: {}", profile_path.display());
+        let analyzer = Analyzer::from_path(&profile_path)?;
+        let metrics = analyzer.analyze()?;
+        let report = Report::new(metrics);
+        println!();
+        println!("{}", report.to_text());
+    }
+
     Ok(())
+}
+
+fn profiling_enabled(features: &[String], all_features: bool) -> bool {
+    all_features
+        || features.iter().any(|feature| {
+            feature
+                .split(|ch: char| ch == ',' || ch.is_whitespace())
+                .any(|part| part == "profiling" || part.ends_with("/profiling"))
+        })
+}
+
+fn load_trace_from_file(
+    trace_path: &PathBuf,
+    trace_format: TraceFormat,
+    cfs: &ControlFlowSchema,
+) -> Result<(Trace, TraceRecorder)> {
+    let mut trace = Trace::new();
+    let mut trace_recorder = TraceRecorder::new(cfs.clone());
+
+    match trace_format {
+        TraceFormat::Binary => {
+            load_binary_trace_from_file(trace_path, &mut trace, &mut trace_recorder)?
+        }
+        TraceFormat::Json => {
+            load_json_trace_from_file(trace_path, &mut trace, &mut trace_recorder)?
+        }
+    }
+
+    Ok((trace, trace_recorder))
+}
+
+fn load_binary_trace_from_file(
+    trace_path: &PathBuf,
+    trace: &mut Trace,
+    trace_recorder: &mut TraceRecorder,
+) -> Result<()> {
+    let mut file = std::fs::File::open(trace_path).map_err(raster_core::Error::Io)?;
+
+    loop {
+        let mut len_buf = [0u8; 4];
+        let mut header_bytes_read = 0usize;
+        let mut reached_clean_eof = false;
+        while header_bytes_read < len_buf.len() {
+            match file.read(&mut len_buf[header_bytes_read..]) {
+                Ok(0) if header_bytes_read == 0 => {
+                    reached_clean_eof = true;
+                    break;
+                }
+                Ok(0) => {
+                    return Err(raster_core::Error::Other(
+                        "Trace stream ended with a partial frame header".into(),
+                    ))
+                }
+                Ok(bytes_read) => header_bytes_read += bytes_read,
+                Err(error) => return Err(raster_core::Error::Io(error)),
+            }
+        }
+        if reached_clean_eof {
+            break;
+        }
+
+        let frame_len = u32::from_le_bytes(len_buf) as usize;
+        let mut frame = vec![0u8; frame_len];
+        file.read_exact(&mut frame).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::UnexpectedEof {
+                raster_core::Error::Other("Trace stream ended with a partial frame payload".into())
+            } else {
+                raster_core::Error::Io(error)
+            }
+        })?;
+
+        let event: TraceEvent = postcard::from_bytes(&frame).map_err(|error| {
+            raster_core::Error::Serialization(format!(
+                "Failed to decode binary trace event '{}': {}",
+                trace_path.display(),
+                error
+            ))
+        })?;
+        record_trace_event(trace, trace_recorder, event);
+    }
+
+    Ok(())
+}
+
+fn load_json_trace_from_file(
+    trace_path: &PathBuf,
+    trace: &mut Trace,
+    trace_recorder: &mut TraceRecorder,
+) -> Result<()> {
+    let file = std::fs::File::open(trace_path).map_err(raster_core::Error::Io)?;
+    let reader = BufReader::new(file);
+
+    for (line_index, line) in reader.lines().enumerate() {
+        let line = line.map_err(raster_core::Error::Io)?;
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let event: TraceEvent = serde_json::from_str(&line).map_err(|error| {
+            raster_core::Error::Serialization(format!(
+                "Failed to decode JSON trace event '{}' at line {}: {}",
+                trace_path.display(),
+                line_index + 1,
+                error
+            ))
+        })?;
+        record_trace_event(trace, trace_recorder, event);
+    }
+
+    Ok(())
+}
+
+fn record_trace_event(trace: &mut Trace, trace_recorder: &mut TraceRecorder, event: TraceEvent) {
+    let step_record = trace_recorder.record(event);
+    trace.push(step_record);
 }
 
 pub fn fraud(trace: &mut Trace, commit_path: &str) {
@@ -419,7 +528,7 @@ pub fn write_fraud_proof(receipt: &risc0_zkvm::Receipt, commit_path: &str) -> Pa
 struct ProofInternalStoreState {
     frontier: SerializableFrontier,
     append_entries: Vec<InternalStoreEntry>,
-    coordinate_index: BTreeMap<CfsCoordinates, InternalStoreIndexValue>,
+    coordinate_index: IncrementalCoordinateIndex,
 }
 
 fn empty_internal_store_frontier() -> SerializableFrontier {
@@ -471,17 +580,12 @@ fn apply_internal_write_to_state(
 ) {
     state.frontier = internal_write.frontier_after.clone();
     state.append_entries.push(internal_write.entry.clone());
-    let previous = state.coordinate_index.insert(
+    state.coordinate_index.insert(
         internal_write.entry.coordinates.clone(),
         InternalStoreIndexValue {
             log_position: internal_write.log_position,
             object_commitment: internal_write.entry.object_commitment.clone(),
         },
-    );
-    assert!(
-        previous.is_none(),
-        "Duplicate internal store coordinates {:?} while building proof witness",
-        internal_write.entry.coordinates
     );
 }
 
@@ -492,7 +596,7 @@ fn internal_store_state_from_prefix(
     let mut state = ProofInternalStoreState {
         frontier: empty_internal_store_frontier(),
         append_entries: Vec::new(),
-        coordinate_index: BTreeMap::new(),
+        coordinate_index: IncrementalCoordinateIndex::new(),
     };
     for step_record in trace {
         if let Some(internal_write) = trace_recorder
@@ -572,16 +676,15 @@ pub fn prove(
         let mut internal_read_witnesses = Vec::new();
         if let Some(input_source_witness_ref) = input_source_witness.as_ref() {
             for internal_meta in input_source_witness_ref.internal().values() {
-                let index_witness = coordinate_index_membership_proof(
-                    &before_state.coordinate_index,
-                    &internal_meta.coordinates,
-                )
-                .unwrap_or_else(|| {
-                    panic!(
-                        "Missing coordinate-index witness for internal input at {:?}",
-                        internal_meta.coordinates
-                    )
-                });
+                let index_witness = before_state
+                    .coordinate_index
+                    .membership_proof(&internal_meta.coordinates)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "Missing coordinate-index witness for internal input at {:?}",
+                            internal_meta.coordinates
+                        )
+                    });
                 let entry = InternalStoreEntry {
                     coordinates: internal_meta.coordinates.clone(),
                     object_commitment: internal_meta.commitment.clone(),
@@ -600,27 +703,19 @@ pub fn prove(
         let mut internal_write_witness = None;
         if let Some(internal_write) = step_witness.internal_write() {
             let entry = internal_write.entry.clone();
-            let index_non_membership_witness = coordinate_index_non_membership_proof(
-                &before_state.coordinate_index,
-                &entry.coordinates,
-            );
-            let mut after_index = before_state.coordinate_index.clone();
-            after_index.insert(
-                entry.coordinates.clone(),
-                InternalStoreIndexValue {
-                    log_position: internal_write.log_position,
-                    object_commitment: entry.object_commitment.clone(),
-                },
-            );
-            let index_membership_witness =
-                coordinate_index_membership_proof(&after_index, &entry.coordinates)
-                    .expect("Missing coordinate-index membership proof after write");
+            let index_non_membership_witness = before_state
+                .coordinate_index
+                .non_membership_proof(&entry.coordinates);
+            apply_internal_write_to_state(&mut current_internal_store_state, &internal_write);
+            let index_membership_witness = current_internal_store_state
+                .coordinate_index
+                .membership_proof(&entry.coordinates)
+                .expect("Missing coordinate-index membership proof after write");
             internal_write_witness = Some(InternalStoreWriteWitness {
                 entry,
                 index_non_membership_witness,
                 index_membership_witness,
             });
-            apply_internal_write_to_state(&mut current_internal_store_state, &internal_write);
         }
         let internal_store_witness =
             if internal_read_witnesses.is_empty() && internal_write_witness.is_none() {
@@ -673,7 +768,7 @@ pub fn prove(
         let Some(receipt) = step_transitions(
             &frontier,
             &initial_internal_store_state.frontier,
-            &coordinate_index_root(&initial_internal_store_state.coordinate_index),
+            &initial_internal_store_state.coordinate_index.root(),
             &fraud_window.items,
             fraud_window.fingerprint,
             &cfs,
@@ -712,4 +807,18 @@ pub fn read_trace_commitment(commit_path: &str) -> TraceCommitment {
         postcard::from_bytes(&bytes).expect("Failed to deserialize Trace Commitment");
 
     trace_commitment
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn profiling_enabled_detects_feature_flags() {
+        assert!(profiling_enabled(&[], true));
+        assert!(profiling_enabled(&["profiling".to_string()], false));
+        assert!(profiling_enabled(&["raster/profiling".to_string()], false));
+        assert!(profiling_enabled(&["foo,profiling".to_string()], false));
+        assert!(!profiling_enabled(&["foo".to_string()], false));
+    }
 }

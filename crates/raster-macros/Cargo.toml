@@ -10,6 +10,10 @@ description = "Procedural macros for the Raster toolchain"
 [lib]
 proc-macro = true
 
+[features]
+default = []
+profiling = []
+
 [dependencies]
 raster-core = { workspace = true, features = ["std"] }
 

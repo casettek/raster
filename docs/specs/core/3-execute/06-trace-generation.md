@@ -23,15 +23,11 @@ This spec is written to match the code as it exists. Where the runtime does not 
 ### Runtime tracing hook points (tile I/O trace items + commitments)
 
 - `crates/raster-runtime/src/tracing.rs`
-  - `init`, `init_with`, `finish`, `__emit_trace`
-- `crates/raster-runtime/src/tracing/subscriber.rs`
-  - `trait Subscriber::{on_trace, on_complete}`
-- `crates/raster-runtime/src/tracing/subscriber/json.rs`
-  - `JsonSubscriber` (serializes `raster_core::trace::TraceItem` to a writer; stdout by default)
-- `crates/raster-runtime/src/tracing/subscriber/commit.rs`
-  - `CommitSubscriber` (writes packed commitment blocks to a writer)
-- `crates/raster-runtime/src/tracing/subscriber/audit.rs`
-  - `AuditSubscriber` (compares recomputed packed blocks against an expected file and reports the first mismatch)
+  - `init`, `init_with`, `finish`, `publish_trace_event`
+- `crates/raster-runtime/src/tracing/publishers/mod.rs`
+  - `trait Publisher::{publish, finish}`
+  - `BinaryTraceEventPublisher` (writes length-prefixed `postcard(TraceEvent)` frames to the CLI trace file)
+  - `JsonTraceEventPublisher` (writes newline-delimited JSON trace events)
 
 ### “Step record” required fields (where they come from in today’s code)
 
@@ -117,17 +113,15 @@ When the `std` feature is enabled and the target is not `riscv32`:
 - The **`#[tile]`** macro wraps the function body so that on return it builds a `FnCallRecord` and calls `emit_trace_event(TraceEvent::Tile(record))`, so each tile execution produces a single `TraceEvent::Tile` event.
 - The **`#[sequence]`** macro wraps the function body so that it emits `TraceEvent::SequenceStart(record)` before running the body and `TraceEvent::SequenceEnd(record)` after. Event order is therefore SequenceStart → (zero or more Tile events from tiles called in the body) → SequenceEnd.
 
-The runtime API `emit_trace_event(TraceEvent)` dispatches to the global subscriber; the default `JsonSubscriber` handles `SequenceStart`, `SequenceEnd`, and `Tile` and writes step records for tiles (see “`TraceItem` JSON emission” below).
+The runtime API `emit_trace_event(TraceEvent)` dispatches to the global publisher when one is installed. `cargo raster run` installs a file publisher via `RASTER_TRACE_PATH` and `RASTER_TRACE_FORMAT`; plain Rust execution installs no publisher by default and drops trace events.
 
-## `TraceItem` JSON emission (implemented; delimiter caveat)
+## Trace event emission (implemented)
 
 In addition to the coarse `TraceEvent` model, Raster defines a tile I/O transcript record:
 
 - `raster_core::trace::TraceItem` (includes `fn_name`, signature metadata, and base64 `postcard` input/output bytes).
 
-The default runtime subscriber (`raster_runtime::JsonSubscriber`) serializes each `TraceItem` using `serde_json::to_writer` onto the configured writer (stdout by default).
-
-**Delimiter caveat (important)**: the current implementation does not write an explicit delimiter (e.g., newline) between items. Consumers MUST treat this as a raw JSON stream rather than line-delimited JSON.
+The default CLI path writes length-prefixed binary frames: `u32` little-endian frame length followed by `postcard(TraceEvent)`. `cargo raster run --trace-format json` writes one `serde_json(TraceEvent)` object per line instead.
 
 ---
 
@@ -249,11 +243,10 @@ Implementations that add step records **SHOULD** add one of:
 
 ## Implementation status summary (what exists vs what’s required here)
 
-- Trace container and four event marker variants exist (`TileStart/TileEnd/SequenceStart/SequenceEnd`).
-- There is currently **no event-trace emitter/persistence** implementation in this workspace for `TraceEvent`s.
-- There is an implemented **tile I/O trace subscriber** surface (`TraceItem`), including:
-  - stdout JSON emission (`JsonSubscriber`),
-  - a packed commitment file writer (`CommitSubscriber`), and
-  - a packed commitment checker (`AuditSubscriber`).
+- Trace container and event variants exist for sequence, tile, and recur execution.
+- There is an implemented **trace publisher** surface for `TraceEvent`, including:
+  - binary file capture for CLI runs (`BinaryTraceEventPublisher`),
+  - JSON file capture (`JsonTraceEventPublisher`), and
+  - custom embedders via `init_with`.
 - The spec-required step record fields (artifact identity, input bytes, output bytes) are **available in other subsystems** (`Backend::execute_tile`, `CompilationOutput.method_id`, `TileExecution.output`) but are **not representable** in `TraceEvent` yet.
 - Failure and iteration/recursion recording are **not representable** in `TraceEvent` yet.

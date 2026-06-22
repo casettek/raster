@@ -4,7 +4,8 @@ pub mod tile;
 
 use crate::utils::encode::{decode_execution_output, encode_input};
 
-use crate::BackendType;
+use crate::{AnalyzeFormat, BackendType, TraceFormat};
+use raster_analysis::{Analyzer, Report};
 use raster_backend::{Backend, ExecutionFailure, ExecutionMode};
 use raster_backend_native::NativeBackend;
 use raster_backend_risc0::Risc0Backend;
@@ -14,11 +15,17 @@ use raster_core::{Error, Result};
 
 use raster_compiler::Project;
 use raster_compiler::{Builder, CfsBuilder};
+use raster_runtime::{ExecutionProfile, ProfileRecord, ProfileStreamEvent};
 
 use raster_compiler::backend::BackendImpl;
 use std::env;
 use std::fs;
+use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
+use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Get the output directory for artifacts.
 fn output_dir() -> PathBuf {
@@ -26,6 +33,50 @@ fn output_dir() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("."))
         .join("target")
         .join("raster")
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RunArtifacts {
+    pub run_id: String,
+    pub run_dir: PathBuf,
+    pub trace_path: PathBuf,
+    pub profile_path: PathBuf,
+    pub profile_stream_path: PathBuf,
+}
+
+impl RunArtifacts {
+    fn new(run_id: String, trace_format: TraceFormat) -> Self {
+        let run_dir = output_dir().join("runs").join(&run_id);
+        Self {
+            trace_path: run_dir.join(trace_format.trace_file_name()),
+            profile_path: run_dir.join("profile.json"),
+            profile_stream_path: run_dir.join("profile.ndjson"),
+            run_dir,
+            run_id,
+        }
+    }
+}
+
+pub(crate) fn create_run_artifacts(trace_format: TraceFormat) -> Result<RunArtifacts> {
+    let run_id = generate_run_id();
+    let artifacts = RunArtifacts::new(run_id, trace_format);
+    fs::create_dir_all(&artifacts.run_dir)?;
+    Ok(artifacts)
+}
+
+fn generate_run_id() -> String {
+    static RUN_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let sequence = RUN_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!(
+        "{:020}-{:09}-pid{}-{:06}",
+        timestamp.as_secs(),
+        timestamp.subsec_nanos(),
+        std::process::id(),
+        sequence
+    )
 }
 
 /// Get the project path (current directory).
@@ -106,16 +157,133 @@ pub fn build(backend_type: BackendType, tile: Option<String>) -> Result<()> {
     Ok(())
 }
 
-/// Analyze command: analyze execution traces.
-pub fn analyze(trace_path: Option<String>) -> Result<()> {
-    match trace_path {
-        Some(path) => println!("Analyzing trace: {}", path),
-        None => println!("Analyzing most recent trace..."),
+/// Analyze command: analyze execution profiles.
+pub fn analyze(
+    profile_path: Option<String>,
+    follow: Option<String>,
+    refresh_ms: u64,
+    format: AnalyzeFormat,
+) -> Result<()> {
+    if let Some(stream_path) = follow {
+        return follow_profile_stream(PathBuf::from(stream_path), refresh_ms, format);
     }
+
+    let Some(profile_path) = profile_path.map(PathBuf::from) else {
+        return Err(Error::Other(
+            "Provide a profile path, or use `cargo raster analyze --follow <path>`.".into(),
+        ));
+    };
+    println!("Analyzing profile: {}", profile_path.display());
     println!();
-    println!("Trace analysis not yet implemented.");
-    // TODO: Implement trace analysis
+
+    let analyzer = Analyzer::from_path(&profile_path)?;
+    let metrics = analyzer.analyze()?;
+    let report = Report::new(metrics);
+    println!("{}", render_report(&report, format)?);
+
     Ok(())
+}
+
+fn render_report(report: &Report, format: AnalyzeFormat) -> Result<String> {
+    match format {
+        AnalyzeFormat::Text => Ok(report.to_text()),
+        AnalyzeFormat::Json => report.to_json(),
+    }
+}
+
+fn follow_profile_stream(path: PathBuf, refresh_ms: u64, format: AnalyzeFormat) -> Result<()> {
+    println!("Following profile stream: {}", path.display());
+    println!();
+
+    let mut reader = loop {
+        match fs::File::open(&path) {
+            Ok(file) => break BufReader::new(file),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                thread::sleep(Duration::from_millis(refresh_ms.max(50)));
+            }
+            Err(error) => return Err(raster_core::Error::Io(error)),
+        }
+    };
+
+    let mut profile = ExecutionProfile::new(Vec::new(), None, None);
+    let mut saw_finish = false;
+    let mut dirty = true;
+
+    loop {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) => {
+                if dirty {
+                    redraw_live_report(&profile, format)?;
+                    dirty = false;
+                }
+                if saw_finish {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(refresh_ms.max(50)));
+            }
+            Ok(_) => {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let event: ProfileStreamEvent = serde_json::from_str(trimmed).map_err(|error| {
+                    raster_core::Error::Serialization(format!(
+                        "Failed to decode profile stream event '{}': {}",
+                        trimmed, error
+                    ))
+                })?;
+                saw_finish |= apply_stream_event(&mut profile, event);
+                dirty = true;
+            }
+            Err(error) => return Err(raster_core::Error::Io(error)),
+        }
+    }
+
+    Ok(())
+}
+
+fn redraw_live_report(profile: &ExecutionProfile, format: AnalyzeFormat) -> Result<()> {
+    let analyzer = Analyzer::new(profile.clone());
+    let metrics = analyzer.analyze()?;
+    let report = Report::new(metrics);
+    print!("\x1B[2J\x1B[H");
+    println!("{}", render_report(&report, format)?);
+    std::io::stdout().flush().map_err(raster_core::Error::Io)?;
+    Ok(())
+}
+
+fn apply_stream_event(profile: &mut ExecutionProfile, event: ProfileStreamEvent) -> bool {
+    match event {
+        ProfileStreamEvent::RunStarted { .. } => false,
+        ProfileStreamEvent::Record(record) => {
+            profile.records.push(record);
+            false
+        }
+        ProfileStreamEvent::TileOutputStore {
+            invocation_index,
+            output_store_ns,
+        } => {
+            if let Some(ProfileRecord::Tile(record)) = profile
+                .records
+                .iter_mut()
+                .rev()
+                .find(|record| matches!(record, ProfileRecord::Tile(tile) if tile.invocation_index == invocation_index))
+            {
+                record.total_duration_ns = record.total_duration_ns.saturating_add(output_store_ns);
+                record.raster_overhead_ns = record.raster_overhead_ns.saturating_add(output_store_ns);
+                record.output_store_ns = record.output_store_ns.saturating_add(output_store_ns);
+            }
+            false
+        }
+        ProfileStreamEvent::RunFinished {
+            program_total_duration_ns,
+            ..
+        } => {
+            profile.program_total_duration_ns = program_total_duration_ns;
+            true
+        }
+    }
 }
 
 /// Init command: initialize a new Raster project.
@@ -136,8 +304,13 @@ name = "{name}"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = ["std"]
+std = ["raster/std"]
+profiling = ["raster/profiling"]
+
 [dependencies]
-raster = {{ path = "../path/to/raster/crates/raster" }}
+raster = {{ path = "../path/to/raster/crates/raster", default-features = false }}
 serde = {{ version = "1.0", features = ["derive"] }}
 "#
     );
@@ -230,7 +403,10 @@ pub fn run_sequence(
                 }
             }
             FlattenedStep::Recur(tile) => {
-                println!("  Recur tile '{}' is not supported in preview mode", tile.function.name);
+                println!(
+                    "  Recur tile '{}' is not supported in preview mode",
+                    tile.function.name
+                );
             }
             FlattenedStep::Sequence(seq) => {
                 println!("  Entering sequence '{}'...", seq.function.name);
@@ -410,4 +586,54 @@ pub fn cfs(output: Option<String>) -> Result<()> {
     println!("CFS written to: {}", output_path.display());
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn create_run_artifacts_returns_unique_run_scoped_paths() {
+        let first = create_run_artifacts(TraceFormat::Binary)
+            .expect("first artifact allocation should succeed");
+        let second = create_run_artifacts(TraceFormat::Json)
+            .expect("second artifact allocation should succeed");
+
+        assert_ne!(first.run_id, second.run_id);
+        assert_ne!(first.run_dir, second.run_dir);
+        assert_eq!(first.trace_path, first.run_dir.join("trace.bin"));
+        assert_eq!(second.trace_path, second.run_dir.join("trace.ndjson"));
+        assert_eq!(first.profile_path, first.run_dir.join("profile.json"));
+        assert_eq!(
+            first.profile_stream_path,
+            first.run_dir.join("profile.ndjson")
+        );
+        assert!(first.run_dir.exists());
+        assert!(second.run_dir.exists());
+    }
+
+    #[test]
+    fn create_run_artifacts_stays_unique_across_concurrent_allocations() {
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    create_run_artifacts(TraceFormat::Binary)
+                        .expect("artifact allocation should succeed")
+                })
+            })
+            .collect();
+
+        let artifacts: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().expect("thread should complete"))
+            .collect();
+
+        let unique_run_dirs: HashSet<_> =
+            artifacts.iter().map(|item| item.run_dir.clone()).collect();
+        let unique_run_ids: HashSet<_> = artifacts.iter().map(|item| item.run_id.clone()).collect();
+
+        assert_eq!(unique_run_dirs.len(), artifacts.len());
+        assert_eq!(unique_run_ids.len(), artifacts.len());
+    }
 }

@@ -59,8 +59,20 @@ enum Commands {
 
     /// Analyze execution traces
     Analyze {
-        /// Path to trace file (optional, uses most recent if not specified)
-        trace_path: Option<String>,
+        /// Path to a run-scoped profile file emitted by `cargo raster run`
+        profile_path: Option<String>,
+
+        /// Follow a live run-scoped NDJSON profile stream emitted by `cargo raster run`
+        #[arg(long)]
+        follow: Option<String>,
+
+        /// Refresh interval for follow mode, in milliseconds
+        #[arg(long, default_value_t = 500)]
+        refresh_ms: u64,
+
+        /// Report output format
+        #[arg(long, value_enum, default_value = "text")]
+        format: AnalyzeFormat,
     },
 
     /// Initialize a new Raster project
@@ -139,7 +151,29 @@ enum Commands {
         /// Read and verify trace from file (mutually exclusive with --commit)
         #[arg(long)]
         verbose: bool,
+
+        /// Trace transport format used between the user process and Raster CLI
+        #[arg(long = "trace-format", value_enum, default_value = "binary")]
+        trace_format: TraceFormat,
+
+        /// Space- or comma-separated Cargo features for building the target project
+        #[arg(long, value_delimiter = ',', action = clap::ArgAction::Append)]
+        features: Vec<String>,
+
+        /// Enable all Cargo features when building the target project
+        #[arg(long)]
+        all_features: bool,
+
+        /// Disable default Cargo features when building the target project
+        #[arg(long)]
+        no_default_features: bool,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum AnalyzeFormat {
+    Text,
+    Json,
 }
 
 /// Available backends for compilation and execution.
@@ -149,6 +183,30 @@ pub enum BackendType {
     Native,
     /// RISC0 zkVM backend with optional proving
     Risc0,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum TraceFormat {
+    /// Length-prefixed postcard-encoded TraceEvent frames
+    Binary,
+    /// Newline-delimited JSON TraceEvent records
+    Json,
+}
+
+impl TraceFormat {
+    pub fn as_runtime_str(self) -> &'static str {
+        match self {
+            Self::Binary => raster_runtime::TraceFormat::Binary.as_str(),
+            Self::Json => raster_runtime::TraceFormat::Json.as_str(),
+        }
+    }
+
+    pub fn trace_file_name(self) -> &'static str {
+        match self {
+            Self::Binary => "trace.bin",
+            Self::Json => "trace.ndjson",
+        }
+    }
 }
 
 fn main() {
@@ -171,7 +229,12 @@ fn try_main() -> Result<()> {
             verify,
         } => commands::tile::run_tile::run_tile(backend, &tile, input.as_deref(), prove, verify),
         Commands::List => commands::tile::list_tile::list_tiles(),
-        Commands::Analyze { trace_path } => commands::analyze(trace_path),
+        Commands::Analyze {
+            profile_path,
+            follow,
+            refresh_ms,
+            format,
+        } => commands::analyze(profile_path, follow, refresh_ms, format),
         Commands::Init { name } => commands::init(name),
         // Commands::Preview { sequence, input, gpu } => {
         //     commands::preview(&sequence, input.as_deref(), gpu)
@@ -191,6 +254,10 @@ fn try_main() -> Result<()> {
             commit,
             audit,
             verbose,
+            trace_format,
+            features,
+            all_features,
+            no_default_features,
         } => commands::run::run(
             backend,
             input.as_deref(),
@@ -198,6 +265,10 @@ fn try_main() -> Result<()> {
             commit.as_deref(),
             audit.as_deref(),
             verbose,
+            trace_format,
+            &features,
+            all_features,
+            no_default_features,
         ),
     }
 }

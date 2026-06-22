@@ -145,7 +145,7 @@ Native mode means “execute without a zkVM” and without proof generation.
 
 #### Trace behavior
 
-- Whole-program native runs can emit **tile I/O trace items** (stdout JSON) or write/check **packed commitment streams** (`--commit` / `--audit`) via `raster-runtime` subscribers initialized by the `#[sequence] fn main` entry point.
+- Whole-program native runs launched by `cargo raster run` capture trace events through `RASTER_TRACE_PATH`. The default `--trace-format binary` stores length-prefixed `postcard` frames; `--trace-format json` stores readable newline-delimited JSON. Direct plain Rust runs stay quiet by default.
 
 #### Errors and diagnostics
 
@@ -189,7 +189,7 @@ Audit mode is intended to mean “execute while collecting artifacts suitable fo
 
 Raster does not implement “audit execution” as a schema-enforcing runner, but it does implement an **audit posture for trace commitments** for whole-program runs:
 
-- `cargo raster run --audit <path>` initializes an `AuditSubscriber` that recomputes and checks packed commitments against a provided file.
+- `cargo raster run --audit <path>` captures the selected trace file, recomputes trace commitments, and checks them against a provided file.
 
 #### What to rely on today
 

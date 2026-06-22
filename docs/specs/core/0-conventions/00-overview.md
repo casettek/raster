@@ -56,11 +56,9 @@ Use this section as the “map” from spec concepts to code locations.
   - `crates/raster-core/src/trace.rs`
 - **Runtime tracing plumbing (tile I/O tracing)**
   - `crates/raster-runtime/src/tracing.rs` (init/finish + global subscriber)
-  - `crates/raster-runtime/src/tracing/subscriber.rs` (subscriber trait + globals)
-  - `crates/raster-runtime/src/tracing/subscriber/{json,commit,audit}.rs`
-    - `JsonSubscriber` (writes JSON `TraceItem`s to a writer)
-    - `CommitSubscriber` (writes packed commitment blocks to a writer)
-    - `AuditSubscriber` (compares packed commitment blocks against an expected file and reports the first mismatch)
+  - `crates/raster-runtime/src/tracing/publishers/mod.rs` (publisher trait + globals)
+    - `BinaryTraceEventPublisher` (writes length-prefixed `postcard(TraceEvent)` frames)
+    - `JsonTraceEventPublisher` (writes newline-delimited JSON trace events)
 
 ### A.6 Existing docs
 
