@@ -181,14 +181,14 @@ Raster also defines a tile I/O “trace item” record used by runtime subscribe
 
 When a program uses `#[raster::sequence] fn main()` as its entry point:
 
-- By default, it initializes a `JsonSubscriber` that writes serialized `TraceItem`s to stdout.
-- With `--commit <path>`, it initializes a `CommitSubscriber` that writes packed commitment blocks to the given file.
-- With `--audit <path>`, it initializes an `AuditSubscriber` that recomputes packed commitment blocks and compares them against the given file, panicking on the first mismatch.
+- `cargo raster run` sets `RASTER_TRACE_PATH`, causing the runtime to write length-prefixed `postcard`-encoded `TraceEvent` frames to a trace file consumed by the CLI.
+- Plain Rust execution does not install a trace publisher by default, so trace events are dropped instead of being written to the user's terminal.
+- Setting `RASTER_TRACE_STDOUT=1` opts into the legacy stdout publisher, which writes `[trace-event]`-prefixed JSON lines for manual debugging/custom tooling.
 
 #### Important gaps (trace)
 
-- The stdout JSON subscriber currently writes a stream of JSON objects without an explicit delimiter (newline/prefix), so downstream tools must not assume line-delimited JSON.
-- The CLI `cargo raster run` trace pretty-printing logic currently expects a `RASTER_TRACE:` line prefix; this does not match the current subscriber output format (gap/mismatch).
+- The stdout JSON publisher is an opt-in debug transport; normal CLI runs should consume the binary trace file instead.
+- The binary trace file format is implemented as `u32` little-endian frame length followed by `postcard(TraceEvent)`.
 
 ## Execution modes and their guarantees
 

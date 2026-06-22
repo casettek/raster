@@ -35,5 +35,5 @@ pub use tracing::{
     finish, init, init_with, publish_trace_event,
     publisher::{BinaryTraceEventPublisher, Publisher, TraceEventPublisher},
     recorder::TraceRecorder,
-    RecurTraceScopeGuard, TRACE_EVENT_PREFIX, TRACE_PATH_ENV,
+    RecurTraceScopeGuard, TRACE_EVENT_PREFIX, TRACE_PATH_ENV, TRACE_STDOUT_ENV,
 };

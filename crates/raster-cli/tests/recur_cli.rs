@@ -35,6 +35,24 @@ fn run_hello_tiles(extra_args: &[&str]) -> Output {
         .expect("hello-tiles command should execute")
 }
 
+fn run_hello_tiles_directly() -> Output {
+    Command::new("cargo")
+        .current_dir(hello_tiles_dir())
+        .env_remove(raster_runtime::TRACE_PATH_ENV)
+        .env_remove(raster_runtime::TRACE_STDOUT_ENV)
+        .args([
+            "run",
+            "--release",
+            "--",
+            "--input",
+            "input.json",
+            "--input-manifest",
+            "input_manifest.json",
+        ])
+        .output()
+        .expect("plain hello-tiles command should execute")
+}
+
 fn unique_commit_path() -> String {
     let suffix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -77,6 +95,23 @@ fn hello_tiles_run_reports_recur_iteration_coordinates() {
     assert!(stdout.contains("recur_coordinates: CfsCoordinates([9])"));
     assert!(stdout.contains("tile_coordinates: CfsCoordinates([11, 0])"));
     assert!(stdout.contains("recur_coordinates: CfsCoordinates([11])"));
+}
+
+#[test]
+fn direct_hello_tiles_run_does_not_emit_trace_events_to_stdout() {
+    let output = run_hello_tiles_directly();
+    assert!(
+        output.status.success(),
+        "plain cargo run should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains(raster_runtime::TRACE_EVENT_PREFIX),
+        "plain cargo run should not emit trace events to stdout:\n{stdout}"
+    );
 }
 
 #[test]

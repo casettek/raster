@@ -29,7 +29,7 @@ The toolchain supports both tile-level execution (`run-tile`) and whole-program 
 
 ### Runtime, proving, and tooling crates
 
-- `raster-runtime`: std-only runtime subscriber plumbing (`JsonSubscriber`, `CommitSubscriber`, `AuditSubscriber`).
+- `raster-runtime`: std-only runtime publisher plumbing for CLI binary traces, opt-in stdout JSON, and custom trace consumers.
 - `raster-prover`: trace-item commitment primitives (incremental Merkle roots, replay helpers).
 - `raster-analysis`: trace metrics and reporting helpers.
 - `raster-cli`: `cargo raster` commands.
@@ -120,10 +120,9 @@ Guest reads the framed bytes, calls the generated tile entry wrapper, and commit
 Raster currently has two trace-related layers:
 
 - `Trace` / `TraceEvent` model in `raster-core` (coarse event model)
-- `TraceItem` stream with commitment/audit tooling (implemented and used by runtime subscribers)
+- Runtime trace publishers in `raster-runtime` that emit `TraceEvent` data to a CLI trace file or an explicit custom/stdout sink
 
-`raster-prover` hashes each `TraceItem` as `SHA-256(postcard(TraceItem))` and builds incremental commitment roots using a bridge tree.
-`CommitSubscriber` writes packed commitments; `AuditSubscriber` replays and finds first mismatch.
+`raster-prover` hashes step/witness data with `postcard`-encoded structures and builds incremental commitment roots using a bridge tree. The CLI performs commit/audit handling from the captured trace after the user process exits.
 
 ## Dependency View
 
@@ -147,9 +146,9 @@ raster-core
 
 Implement `raster-backend::Backend` in a new crate and plug it through CLI/backend selection.
 
-### Runtime subscribers
+### Runtime publishers
 
-Implement `raster_runtime::Subscriber` for custom sink/processing behavior.
+Implement `raster_runtime::Publisher` for custom sink/processing behavior and install it with `raster_runtime::init_with`.
 
 ### Compiler/tooling integration
 
