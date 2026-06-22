@@ -29,7 +29,7 @@ The toolchain supports both tile-level execution (`run-tile`) and whole-program 
 
 ### Runtime, proving, and tooling crates
 
-- `raster-runtime`: std-only runtime publisher plumbing for CLI binary traces, opt-in stdout JSON, and custom trace consumers.
+- `raster-runtime`: std-only runtime publisher plumbing for CLI binary/JSON traces, opt-in stdout JSON, and custom trace consumers.
 - `raster-prover`: trace-item commitment primitives (incremental Merkle roots, replay helpers).
 - `raster-analysis`: trace metrics and reporting helpers.
 - `raster-cli`: `cargo raster` commands.

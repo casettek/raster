@@ -39,6 +39,7 @@ fn run_hello_tiles_directly() -> Output {
     Command::new("cargo")
         .current_dir(hello_tiles_dir())
         .env_remove(raster_runtime::TRACE_PATH_ENV)
+        .env_remove(raster_runtime::TRACE_FORMAT_ENV)
         .env_remove(raster_runtime::TRACE_STDOUT_ENV)
         .args([
             "run",
@@ -170,6 +171,37 @@ fn hello_tiles_run_uses_distinct_run_scoped_artifact_dirs() {
     assert!(PathBuf::from(&second_trace_path).exists());
     assert!(first_trace_path.ends_with("trace.bin"));
     assert!(second_trace_path.ends_with("trace.bin"));
+}
+
+#[test]
+fn hello_tiles_run_can_use_json_trace_format() {
+    let output = run_hello_tiles(&["--trace-format", "json"]);
+    assert!(
+        output.status.success(),
+        "json trace run should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let trace_path = extract_stdout_path(&stdout, "Trace path: ");
+    assert!(trace_path.ends_with("trace.ndjson"));
+
+    let trace_contents =
+        fs::read_to_string(&trace_path).expect("json trace file should be readable text");
+    let first_line = trace_contents
+        .lines()
+        .next()
+        .expect("json trace should contain at least one event");
+    let parsed: serde_json::Value =
+        serde_json::from_str(first_line).expect("json trace line should parse as JSON");
+    assert!(
+        parsed.get("SequenceStart").is_some()
+            || parsed.get("TileExec").is_some()
+            || parsed.get("RecurExec").is_some()
+            || parsed.get("SequenceEnd").is_some(),
+        "json trace line should be a trace event: {first_line}"
+    );
 }
 
 #[test]

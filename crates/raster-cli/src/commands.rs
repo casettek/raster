@@ -4,7 +4,7 @@ pub mod tile;
 
 use crate::utils::encode::{decode_execution_output, encode_input};
 
-use crate::{AnalyzeFormat, BackendType};
+use crate::{AnalyzeFormat, BackendType, TraceFormat};
 use raster_analysis::{Analyzer, Report};
 use raster_backend::{Backend, ExecutionFailure, ExecutionMode};
 use raster_backend_native::NativeBackend;
@@ -45,10 +45,10 @@ pub(crate) struct RunArtifacts {
 }
 
 impl RunArtifacts {
-    fn new(run_id: String) -> Self {
+    fn new(run_id: String, trace_format: TraceFormat) -> Self {
         let run_dir = output_dir().join("runs").join(&run_id);
         Self {
-            trace_path: run_dir.join("trace.bin"),
+            trace_path: run_dir.join(trace_format.trace_file_name()),
             profile_path: run_dir.join("profile.json"),
             profile_stream_path: run_dir.join("profile.ndjson"),
             run_dir,
@@ -57,9 +57,9 @@ impl RunArtifacts {
     }
 }
 
-pub(crate) fn create_run_artifacts() -> Result<RunArtifacts> {
+pub(crate) fn create_run_artifacts(trace_format: TraceFormat) -> Result<RunArtifacts> {
     let run_id = generate_run_id();
-    let artifacts = RunArtifacts::new(run_id);
+    let artifacts = RunArtifacts::new(run_id, trace_format);
     fs::create_dir_all(&artifacts.run_dir)?;
     Ok(artifacts)
 }
@@ -595,12 +595,15 @@ mod tests {
 
     #[test]
     fn create_run_artifacts_returns_unique_run_scoped_paths() {
-        let first = create_run_artifacts().expect("first artifact allocation should succeed");
-        let second = create_run_artifacts().expect("second artifact allocation should succeed");
+        let first = create_run_artifacts(TraceFormat::Binary)
+            .expect("first artifact allocation should succeed");
+        let second = create_run_artifacts(TraceFormat::Json)
+            .expect("second artifact allocation should succeed");
 
         assert_ne!(first.run_id, second.run_id);
         assert_ne!(first.run_dir, second.run_dir);
         assert_eq!(first.trace_path, first.run_dir.join("trace.bin"));
+        assert_eq!(second.trace_path, second.run_dir.join("trace.ndjson"));
         assert_eq!(first.profile_path, first.run_dir.join("profile.json"));
         assert_eq!(
             first.profile_stream_path,
@@ -615,7 +618,8 @@ mod tests {
         let threads: Vec<_> = (0..4)
             .map(|_| {
                 std::thread::spawn(|| {
-                    create_run_artifacts().expect("artifact allocation should succeed")
+                    create_run_artifacts(TraceFormat::Binary)
+                        .expect("artifact allocation should succeed")
                 })
             })
             .collect();

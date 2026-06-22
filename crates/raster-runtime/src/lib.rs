@@ -33,7 +33,10 @@ pub use profiling::{
 pub use tracing::{
     commitment::Sha256Commitment,
     finish, init, init_with, publish_trace_event,
-    publisher::{BinaryTraceEventPublisher, Publisher, TraceEventPublisher},
+    publishers::{
+        BinaryTraceEventPublisher, JsonTraceEventPublisher, Publisher, TraceEventPublisher,
+    },
     recorder::TraceRecorder,
-    RecurTraceScopeGuard, TRACE_EVENT_PREFIX, TRACE_PATH_ENV, TRACE_STDOUT_ENV,
+    RecurTraceScopeGuard, TraceFormat, TRACE_EVENT_PREFIX, TRACE_FORMAT_ENV, TRACE_PATH_ENV,
+    TRACE_STDOUT_ENV,
 };

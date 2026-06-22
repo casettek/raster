@@ -56,9 +56,10 @@ Use this section as the “map” from spec concepts to code locations.
   - `crates/raster-core/src/trace.rs`
 - **Runtime tracing plumbing (tile I/O tracing)**
   - `crates/raster-runtime/src/tracing.rs` (init/finish + global subscriber)
-  - `crates/raster-runtime/src/tracing/publisher.rs` (publisher trait + globals)
+  - `crates/raster-runtime/src/tracing/publishers/mod.rs` (publisher trait + globals)
     - `BinaryTraceEventPublisher` (writes length-prefixed `postcard(TraceEvent)` frames)
-    - `TraceEventPublisher` (opt-in/custom JSON publisher)
+    - `JsonTraceEventPublisher` (writes newline-delimited JSON trace events)
+    - `TraceEventPublisher` (compatibility alias for the JSON publisher)
 
 ### A.6 Existing docs
 

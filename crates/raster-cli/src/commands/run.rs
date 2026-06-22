@@ -39,7 +39,7 @@ use raster_runtime::TraceRecorder;
 
 use crate::commands::create_run_artifacts;
 use crate::utils::authorization::{build_manifested_inputs, collect_external_input_commitments};
-use crate::BackendType;
+use crate::{BackendType, TraceFormat};
 
 pub fn run(
     backend_type: BackendType,
@@ -48,6 +48,7 @@ pub fn run(
     commit_flag: Option<&str>,
     audit_flag: Option<&str>,
     verbose: bool,
+    trace_format: TraceFormat,
     features: &[String],
     all_features: bool,
     no_default_features: bool,
@@ -108,7 +109,7 @@ pub fn run(
     println!("Running {}...", &project.name);
     println!();
 
-    let artifacts = create_run_artifacts()?;
+    let artifacts = create_run_artifacts(trace_format)?;
     let trace_path = artifacts.trace_path.clone();
     let profile_path = artifacts.profile_path.clone();
     let profile_stream_path = artifacts.profile_stream_path.clone();
@@ -122,6 +123,10 @@ pub fn run(
     let mut cmd = Command::new(&binary_path);
     cmd.current_dir(&project.root_dir);
     cmd.env(raster_runtime::TRACE_PATH_ENV, &trace_path);
+    cmd.env(
+        raster_runtime::TRACE_FORMAT_ENV,
+        trace_format.as_runtime_str(),
+    );
     cmd.env(raster_runtime::PROFILE_PATH_ENV, &profile_path);
     cmd.env(
         raster_runtime::PROFILE_STREAM_PATH_ENV,
@@ -211,7 +216,7 @@ pub fn run(
         }
     }
 
-    let (mut trace, trace_recorder) = load_trace_from_file(&trace_path, &cfs)?;
+    let (mut trace, trace_recorder) = load_trace_from_file(&trace_path, trace_format, &cfs)?;
 
     // Build all project tiles with Risc0
     // TODO: Risc0 build can be perfomed in parallel to native user program execution
@@ -362,11 +367,30 @@ pub fn run(
 
 fn load_trace_from_file(
     trace_path: &PathBuf,
+    trace_format: TraceFormat,
     cfs: &ControlFlowSchema,
 ) -> Result<(Trace, TraceRecorder)> {
-    let mut file = std::fs::File::open(trace_path).map_err(raster_core::Error::Io)?;
     let mut trace = Trace::new();
     let mut trace_recorder = TraceRecorder::new(cfs.clone());
+
+    match trace_format {
+        TraceFormat::Binary => {
+            load_binary_trace_from_file(trace_path, &mut trace, &mut trace_recorder)?
+        }
+        TraceFormat::Json => {
+            load_json_trace_from_file(trace_path, &mut trace, &mut trace_recorder)?
+        }
+    }
+
+    Ok((trace, trace_recorder))
+}
+
+fn load_binary_trace_from_file(
+    trace_path: &PathBuf,
+    trace: &mut Trace,
+    trace_recorder: &mut TraceRecorder,
+) -> Result<()> {
+    let mut file = std::fs::File::open(trace_path).map_err(raster_core::Error::Io)?;
 
     loop {
         let mut len_buf = [0u8; 4];
@@ -408,11 +432,43 @@ fn load_trace_from_file(
                 error
             ))
         })?;
-        let step_record = trace_recorder.record(event);
-        trace.push(step_record);
+        record_trace_event(trace, trace_recorder, event);
     }
 
-    Ok((trace, trace_recorder))
+    Ok(())
+}
+
+fn load_json_trace_from_file(
+    trace_path: &PathBuf,
+    trace: &mut Trace,
+    trace_recorder: &mut TraceRecorder,
+) -> Result<()> {
+    let file = std::fs::File::open(trace_path).map_err(raster_core::Error::Io)?;
+    let reader = BufReader::new(file);
+
+    for (line_index, line) in reader.lines().enumerate() {
+        let line = line.map_err(raster_core::Error::Io)?;
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let event: TraceEvent = serde_json::from_str(&line).map_err(|error| {
+            raster_core::Error::Serialization(format!(
+                "Failed to decode JSON trace event '{}' at line {}: {}",
+                trace_path.display(),
+                line_index + 1,
+                error
+            ))
+        })?;
+        record_trace_event(trace, trace_recorder, event);
+    }
+
+    Ok(())
+}
+
+fn record_trace_event(trace: &mut Trace, trace_recorder: &mut TraceRecorder, event: TraceEvent) {
+    let step_record = trace_recorder.record(event);
+    trace.push(step_record);
 }
 
 pub fn fraud(trace: &mut Trace, commit_path: &str) {

@@ -152,6 +152,10 @@ enum Commands {
         #[arg(long)]
         verbose: bool,
 
+        /// Trace transport format used between the user process and Raster CLI
+        #[arg(long = "trace-format", value_enum, default_value = "binary")]
+        trace_format: TraceFormat,
+
         /// Space- or comma-separated Cargo features for building the target project
         #[arg(long, value_delimiter = ',', action = clap::ArgAction::Append)]
         features: Vec<String>,
@@ -179,6 +183,30 @@ pub enum BackendType {
     Native,
     /// RISC0 zkVM backend with optional proving
     Risc0,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum TraceFormat {
+    /// Length-prefixed postcard-encoded TraceEvent frames
+    Binary,
+    /// Newline-delimited JSON TraceEvent records
+    Json,
+}
+
+impl TraceFormat {
+    pub fn as_runtime_str(self) -> &'static str {
+        match self {
+            Self::Binary => raster_runtime::TraceFormat::Binary.as_str(),
+            Self::Json => raster_runtime::TraceFormat::Json.as_str(),
+        }
+    }
+
+    pub fn trace_file_name(self) -> &'static str {
+        match self {
+            Self::Binary => "trace.bin",
+            Self::Json => "trace.ndjson",
+        }
+    }
 }
 
 fn main() {
@@ -226,6 +254,7 @@ fn try_main() -> Result<()> {
             commit,
             audit,
             verbose,
+            trace_format,
             features,
             all_features,
             no_default_features,
@@ -236,6 +265,7 @@ fn try_main() -> Result<()> {
             commit.as_deref(),
             audit.as_deref(),
             verbose,
+            trace_format,
             &features,
             all_features,
             no_default_features,

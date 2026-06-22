@@ -24,10 +24,11 @@ This spec is written to match the code as it exists. Where the runtime does not 
 
 - `crates/raster-runtime/src/tracing.rs`
   - `init`, `init_with`, `finish`, `publish_trace_event`
-- `crates/raster-runtime/src/tracing/publisher.rs`
+- `crates/raster-runtime/src/tracing/publishers/mod.rs`
   - `trait Publisher::{publish, finish}`
   - `BinaryTraceEventPublisher` (writes length-prefixed `postcard(TraceEvent)` frames to the CLI trace file)
-  - `TraceEventPublisher` (opt-in/custom stdout JSON publisher)
+  - `JsonTraceEventPublisher` (writes newline-delimited JSON trace events)
+  - `TraceEventPublisher` (compatibility alias for the JSON publisher)
 
 ### “Step record” required fields (where they come from in today’s code)
 
@@ -113,7 +114,7 @@ When the `std` feature is enabled and the target is not `riscv32`:
 - The **`#[tile]`** macro wraps the function body so that on return it builds a `FnCallRecord` and calls `emit_trace_event(TraceEvent::Tile(record))`, so each tile execution produces a single `TraceEvent::Tile` event.
 - The **`#[sequence]`** macro wraps the function body so that it emits `TraceEvent::SequenceStart(record)` before running the body and `TraceEvent::SequenceEnd(record)` after. Event order is therefore SequenceStart → (zero or more Tile events from tiles called in the body) → SequenceEnd.
 
-The runtime API `emit_trace_event(TraceEvent)` dispatches to the global publisher when one is installed. `cargo raster run` installs a binary file publisher via `RASTER_TRACE_PATH`; plain Rust execution installs no publisher by default and drops trace events.
+The runtime API `emit_trace_event(TraceEvent)` dispatches to the global publisher when one is installed. `cargo raster run` installs a file publisher via `RASTER_TRACE_PATH` and `RASTER_TRACE_FORMAT`; plain Rust execution installs no publisher by default and drops trace events.
 
 ## Trace event emission (implemented)
 
@@ -121,7 +122,7 @@ In addition to the coarse `TraceEvent` model, Raster defines a tile I/O transcri
 
 - `raster_core::trace::TraceItem` (includes `fn_name`, signature metadata, and base64 `postcard` input/output bytes).
 
-The normal CLI path writes length-prefixed binary frames: `u32` little-endian frame length followed by `postcard(TraceEvent)`. Setting `RASTER_TRACE_STDOUT=1` opts into a stdout publisher that writes `[trace-event]`-prefixed JSON lines for debugging/custom tooling.
+The default CLI path writes length-prefixed binary frames: `u32` little-endian frame length followed by `postcard(TraceEvent)`. `cargo raster run --trace-format json` writes one `serde_json(TraceEvent)` object per line instead. Setting `RASTER_TRACE_STDOUT=1` opts into a stdout publisher that writes `[trace-event]`-prefixed JSON lines for debugging/custom tooling.
 
 ---
 
@@ -246,7 +247,7 @@ Implementations that add step records **SHOULD** add one of:
 - Trace container and event variants exist for sequence, tile, and recur execution.
 - There is an implemented **trace publisher** surface for `TraceEvent`, including:
   - binary file capture for CLI runs (`BinaryTraceEventPublisher`),
-  - opt-in/custom stdout JSON emission (`TraceEventPublisher`), and
+  - JSON file capture and opt-in/custom stdout JSON emission (`JsonTraceEventPublisher` / `TraceEventPublisher`), and
   - custom embedders via `init_with`.
 - The spec-required step record fields (artifact identity, input bytes, output bytes) are **available in other subsystems** (`Backend::execute_tile`, `CompilationOutput.method_id`, `TileExecution.output`) but are **not representable** in `TraceEvent` yet.
 - Failure and iteration/recursion recording are **not representable** in `TraceEvent` yet.
