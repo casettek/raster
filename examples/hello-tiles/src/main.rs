@@ -15,7 +15,7 @@ fn personal_greet_seq(personal_data: PersonalData) -> Result<String> {
 
     let result = call!(concat_messages, name, greet_address_line_result);
 
-    debug!("personal_greet_seq result ref: {:?}", result);
+    println!("personal_greet_seq result ref: {:?}", result);
 
     Ok(result)
 }
@@ -103,7 +103,7 @@ fn main() {
         draft
     );
     let draft_greeting = finalize(draft);
-    debug!("draft greeting: {:?}", draft_greeting);
+    println!("draft greeting: {:?}", draft_greeting);
     let draft_title = select!(String, draft_greeting.clone().title);
     let first_draft_line = select!(String, draft_greeting.lines[0]);
     call!(concat_messages, draft_title, first_draft_line);
@@ -118,7 +118,7 @@ fn main() {
         output = new!(CollectiveGreeting),
         args = ("Recur-built greeting".to_string(),)
     );
-    debug!("output-only recur greeting: {:?}", recur_greeting);
+    println!("output-only recur greeting: {:?}", recur_greeting);
     let recur_title = select!(String, recur_greeting.clone().title);
     let recur_first_line = select!(String, recur_greeting.lines[0]);
     call!(concat_messages, recur_title, recur_first_line);
@@ -129,7 +129,7 @@ fn main() {
         state = LineLengthStats { max_len: 0 },
         args = ()
     );
-    debug!("state-only recur stats: {:?}", recur_line_stats);
+    println!("state-only recur stats: {:?}", recur_line_stats);
     let recur_max_line_len = select!(u64, recur_line_stats.max_len);
     call!(fibonacci, recur_max_line_len);
 
@@ -140,12 +140,12 @@ fn main() {
         output = new!(CollectiveGreeting),
         args = ("State+output recur greeting".to_string(), 2)
     );
-    debug!("state+output recur greeting: {:?}", limited_recur_greeting);
+    println!("state+output recur greeting: {:?}", limited_recur_greeting);
     let limited_title = select!(String, limited_recur_greeting.clone().title);
     let limited_first_line = select!(String, limited_recur_greeting.lines[0]);
     call!(concat_messages, limited_title, limited_first_line);
 
     let name_2 = call_seq!(placeholder_sequence, "Placeholder".to_string());
     let result = call_seq!(greet_sequence, name_2);
-    debug!("main result: {:?}", result);
+    println!("main result: {:?}", result);
 }

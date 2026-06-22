@@ -64,12 +64,12 @@ pub mod utils;
 #[doc(hidden)]
 pub mod __private {
     #[cfg(feature = "std")]
-    pub fn emit_debug(args: core::fmt::Arguments<'_>) {
-        std::println!("[debug] {}", args);
+    pub fn emit_output(args: core::fmt::Arguments<'_>) {
+        std::println!("[output] {}", args);
     }
 
     #[cfg(not(feature = "std"))]
-    pub fn emit_debug(_: core::fmt::Arguments<'_>) {}
+    pub fn emit_output(_: core::fmt::Arguments<'_>) {}
 
     #[cfg(feature = "std")]
     pub type ProfileInstant = std::time::Instant;
@@ -549,14 +549,14 @@ macro_rules! call_recur {
     };
 }
 
-/// Emits a Raster debug line that `cargo raster run --verbose` will surface.
+/// Emits a Raster-controlled output line that `cargo raster run` will surface.
 ///
-/// Use this instead of `println!` in Raster user code, especially in `no_std`
-/// tile/sequence crates where the standard print macros are unavailable.
+/// Use this instead of `std::println!` in Raster user code. The CLI captures
+/// this output and displays it under the `Output:` section.
 #[macro_export]
-macro_rules! debug {
+macro_rules! println {
     ($($arg:tt)*) => {{
-        $crate::__private::emit_debug(::core::format_args!($($arg)*));
+        $crate::__private::emit_output(::core::format_args!($($arg)*));
     }};
 }
 
@@ -580,8 +580,9 @@ pub mod prelude {
     };
 
     pub use crate::exec::Result;
+    pub use crate::println;
     pub use crate::{
-        call, call_recur, call_seq, debug, external, finalize, internal, into_auth_ref,
+        call, call_recur, call_seq, external, finalize, internal, into_auth_ref,
         materialize_auth_result, materialize_auth_return, new, select, sequence, tile, Anchor,
         AuthRef, AuthValue, Draft, ExternalSelection, ExternalValue, InternalRef, InternalValue,
         IntoAuthRef, IntoAuthValue, ListProofDirection, ListProofSibling, Op, RecurControl,

@@ -35,12 +35,15 @@ impl Analyzer {
     /// Analyze an execution profile and produce metrics.
     pub fn analyze(&self) -> Result<Metrics> {
         let mut metrics = Metrics {
+            run_id: self.profile.run_id.clone(),
             total_duration_ns: self.profile.program_total_duration_ns.unwrap_or_default(),
             program_total_known: self.profile.program_total_duration_ns.is_some(),
+            profile_record_count: u64::try_from(self.profile.records.len()).unwrap_or(u64::MAX),
             ..Metrics::default()
         };
 
         for record in &self.profile.records {
+            metrics.max_nesting_depth = metrics.max_nesting_depth.max(record_depth(record));
             ingest_record(&mut metrics, record);
         }
 
@@ -61,6 +64,13 @@ fn ingest_record(metrics: &mut Metrics, record: &ProfileRecord) {
     match record {
         ProfileRecord::Tile(record) => ingest_tile_record(metrics, record),
         ProfileRecord::Sequence(record) => ingest_sequence_record(metrics, record),
+    }
+}
+
+fn record_depth(record: &ProfileRecord) -> u32 {
+    match record {
+        ProfileRecord::Tile(record) => record.depth,
+        ProfileRecord::Sequence(record) => record.depth,
     }
 }
 
@@ -324,7 +334,7 @@ mod tests {
                 ProfileRecord::Tile(TileProfileRecord {
                     invocation_index: 2,
                     tile_id: "alpha".to_string(),
-                    depth: 1,
+                    depth: 2,
                     coordinates: raster_core::cfs::CfsCoordinates(vec![1]),
                     total_duration_ns: 10,
                     user_duration_ns: 6,
@@ -360,7 +370,7 @@ mod tests {
                 }),
             ],
             Some(40),
-            None,
+            Some("run-1".to_string()),
         );
 
         let analyzer = Analyzer::new(profile);
@@ -371,6 +381,9 @@ mod tests {
             .get(&raster_core::tile::TileId::from("alpha"))
             .unwrap();
         assert_eq!(metrics.total_duration_ns, 40);
+        assert_eq!(metrics.run_id.as_deref(), Some("run-1"));
+        assert_eq!(metrics.profile_record_count, 3);
+        assert_eq!(metrics.max_nesting_depth, 2);
         assert_eq!(metrics.total_tile_duration_ns, 30);
         assert_eq!(metrics.total_tile_invocations, 2);
         assert_eq!(metrics.total_tile_user_duration_ns, 18);

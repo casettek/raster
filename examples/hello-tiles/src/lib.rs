@@ -29,7 +29,7 @@ pub fn greet(name: String) -> String {
 #[tile(kind=iter)]
 pub fn personal_greet(name: String) -> String {
     let greet = format!("Hello, {}!!!!", name);
-    debug!("greet: {}", greet);
+    println!("greet: {}", greet);
 
     greet
 }
@@ -37,7 +37,7 @@ pub fn personal_greet(name: String) -> String {
 #[tile(kind=iter)]
 pub fn personal_greet_from_object(personal_data: PersonalData) -> String {
     let greet = format!("Hello from object, {}!!!!", personal_data.name);
-    debug!("object greet: {}", greet);
+    println!("object greet: {}", greet);
 
     greet
 }
@@ -47,7 +47,7 @@ pub fn personal_greet_from_object(personal_data: PersonalData) -> String {
 #[tile(kind=iter)]
 pub fn personal_greet_with_seed(name: String, seed: u64) -> String {
     let greet = format!("Hello, {}!!!! (seed: {})", name, seed);
-    debug!("seeded greet: {}", greet);
+    println!("seeded greet: {}", greet);
 
     greet
 }
@@ -55,7 +55,7 @@ pub fn personal_greet_with_seed(name: String, seed: u64) -> String {
 #[tile(kind=iter)]
 pub fn greet_address_line(address_line: String) -> String {
     let greet = format!("Address line: {}", address_line);
-    debug!("address line: {}", greet);
+    println!("address line: {}", greet);
 
     greet
 }

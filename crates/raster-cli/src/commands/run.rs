@@ -1,8 +1,6 @@
 //! Run command: build and execute the user program as a whole.
 
 use rand::seq::IteratorRandom;
-use raster_backend::backend::HexString;
-use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 
 use std::collections::HashMap;
@@ -12,15 +10,15 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
 use raster_analysis::{Analyzer, Report};
-use raster_backend::{Backend, ExecutionMode};
+use raster_backend::ExecutionMode;
 use raster_backend_risc0::Risc0Backend;
 
 use raster_compiler::{CfsBuilder, Project};
 
-use raster_core::cfs::{CfsCoordinates, CfsCursor, ControlFlowSchema};
+use raster_core::cfs::ControlFlowSchema;
 use raster_core::coordinate_index::IncrementalCoordinateIndex;
 use raster_core::draft::DraftTransitionWitness;
-use raster_core::trace::{ExternalInput, FnInput, StepRecord, Trace, TraceEvent, TraceWindow};
+use raster_core::trace::{ExternalInput, FnInput, StepRecord, Trace, TraceEvent};
 use raster_core::transition::{
     InternalStoreEntry, InternalStoreIndexValue, InternalStoreLogWitness, InternalStoreReadWitness,
     InternalStoreWitness, InternalStoreWriteWitness,
@@ -47,7 +45,7 @@ pub fn run(
     input_manifest: Option<&str>,
     commit_flag: Option<&str>,
     audit_flag: Option<&str>,
-    verbose: bool,
+    _verbose: bool,
     trace_format: TraceFormat,
     features: &[String],
     all_features: bool,
@@ -105,19 +103,26 @@ pub fn run(
             binary_path.display()
         )));
     }
-    println!();
-    println!("Running {}...", &project.name);
-    println!();
-
     let artifacts = create_run_artifacts(trace_format)?;
     let trace_path = artifacts.trace_path.clone();
     let profile_path = artifacts.profile_path.clone();
     let profile_stream_path = artifacts.profile_stream_path.clone();
-    println!("Run ID: {}", artifacts.run_id);
-    println!("Run artifacts dir: {}", artifacts.run_dir.display());
-    println!("Trace path: {}", trace_path.display());
-    println!("Profile path: {}", profile_path.display());
-    println!("Profile stream path: {}", profile_stream_path.display());
+    println!();
+    println!("Raster Run");
+    println!("  Project: {}", &project.name);
+    println!("  Run ID: {}", artifacts.run_id);
+    println!("  Run artifacts dir: {}", artifacts.run_dir.display());
+    println!("  Trace path: {}", trace_path.display());
+    if profiling_enabled(features, all_features) {
+        println!(
+            "  Expected live profile stream: {}",
+            profile_stream_path.display()
+        );
+        println!(
+            "  Follow with: cargo raster analyze --follow {}",
+            profile_stream_path.display()
+        );
+    }
     println!();
 
     let mut cmd = Command::new(&binary_path);
@@ -144,8 +149,8 @@ pub fn run(
 
     let mut child = cmd.spawn()?;
 
-    let mut log = Arc::new(Mutex::new(Vec::new()));
-    let mut reader_log = Arc::clone(&log);
+    let user_output = Arc::new(Mutex::new(Vec::new()));
+    let reader_user_output = Arc::clone(&user_output);
 
     let stdout = child.stdout.take().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::Other, "Could not capture stdout")
@@ -162,17 +167,17 @@ pub fn run(
 
         for line in stdout_reader.lines() {
             if let Ok(line_str) = line {
-                if let Some(debug_line) = line_str.strip_prefix("[debug]") {
-                    let mut log_lock = reader_log.lock().unwrap();
-                    log_lock.push(debug_line.to_string());
+                if let Some(output_line) = line_str.strip_prefix("[output]") {
+                    let mut output_lock = reader_user_output.lock().unwrap();
+                    output_lock.push(output_line.trim_start().to_string());
                 }
             }
         }
     });
     handles.push(stdout_handle);
 
-    let mut errors = Arc::new(Mutex::new(Vec::new()));
-    let mut thread_errors = Arc::clone(&errors);
+    let errors = Arc::new(Mutex::new(Vec::new()));
+    let thread_errors = Arc::clone(&errors);
     let stderr_handle = std::thread::spawn(move || {
         let stderr_reader = BufReader::new(stderr);
         for line in stderr_reader.lines() {
@@ -195,17 +200,16 @@ pub fn run(
         .into_inner()
         .unwrap();
 
-    let log = Arc::try_unwrap(log)
+    let user_output = Arc::try_unwrap(user_output)
         .expect("Cant move list out of Mutex. Some thread still holding copy of Arc")
         .into_inner()
         .unwrap();
 
-    if verbose {
-        if !log.is_empty() {
-            println!("Verbose log:");
-            for log_line in log {
-                println!("{log_line}");
-            }
+    if !user_output.is_empty() {
+        println!();
+        println!("Output:");
+        for output_line in user_output {
+            println!("  {output_line}");
         }
     }
 
@@ -217,54 +221,6 @@ pub fn run(
     }
 
     let (mut trace, trace_recorder) = load_trace_from_file(&trace_path, trace_format, &cfs)?;
-
-    // Build all project tiles with Risc0
-    // TODO: Risc0 build can be perfomed in parallel to native user program execution
-
-    println!("Build Risc0 artifacts...");
-    let backend =
-        Risc0Backend::new(project.output_dir.clone()).with_user_crate(project.root_dir.clone());
-
-    let mut cfs_cursor = CfsCursor::new(cfs.clone());
-
-    let mut trace_coordinates: Vec<CfsCoordinates> = Vec::new();
-    let mut current_coordinates: CfsCoordinates;
-    for step_record in trace.iter() {
-        match step_record {
-            StepRecord::TileExec(tile_record) => {
-                trace_coordinates.push(tile_record.coordinates.clone());
-            }
-            StepRecord::RecurExec(recur_record) => {
-                trace_coordinates.push(recur_record.coordinates.clone());
-            }
-            StepRecord::SequenceEnd(sequence_end_record) => {
-                trace_coordinates.push(sequence_end_record.coordinates.clone());
-            }
-            StepRecord::SequenceStart(sequence_start_record) => {
-                trace_coordinates.push(sequence_start_record.coordinates.clone());
-            }
-        }
-    }
-
-    // let tiles_discovery = TileDiscovery::new(&project);
-    // let tiles = tiles_discovery.tiles;
-    //
-    // let artifact_registry: HashMap<TileId, HexString> = tiles
-    //     .into_par_iter()
-    //     .map(|tile| {
-    //         let tile_metadata = tile.to_metadata();
-    //         let content_hash = tile.to_content_hash();
-    //
-    //         let artifact = backend.compile_tile(&tile_metadata, content_hash).unwrap();
-    //
-    //         // Return a tuple of (Key, Value)
-    //         (tile_metadata.id, artifact.artifact_id())
-    //     })
-    //     .collect();
-    //
-    // for (tile_id, image_id) in &artifact_registry {
-    //     println!("Registered: {:?}", tile_id);
-    // }
 
     if commit_flag.is_some() {
         let commit_path = commit_flag.expect("Commitment path was provided");
@@ -284,6 +240,8 @@ pub fn run(
         match verification_result {
             VerificationResult::Ok => println!("Verification Success"),
             VerificationResult::Fraud(fraud_evidence) => {
+                let backend = Risc0Backend::new(project.output_dir.clone())
+                    .with_user_crate(project.root_dir.clone());
                 let replayer = Replayer::new(&backend, &project);
                 let fraud_proof = prove(
                     fraud_evidence,
@@ -342,19 +300,19 @@ pub fn run(
     }
 
     if profile_path.exists() {
+        println!();
+        println!("Profiling");
         if profile_stream_path.exists() {
-            println!();
             println!(
-                "Live profile stream saved to: {}",
+                "  Live profile stream saved to: {}",
                 profile_stream_path.display()
             );
             println!(
-                "Follow with: cargo raster analyze --follow {}",
+                "  Follow with: cargo raster analyze --follow {}",
                 profile_stream_path.display()
             );
         }
-        println!();
-        println!("Execution profile saved to: {}", profile_path.display());
+        println!("  Execution profile saved to: {}", profile_path.display());
         let analyzer = Analyzer::from_path(&profile_path)?;
         let metrics = analyzer.analyze()?;
         let report = Report::new(metrics);
@@ -363,6 +321,15 @@ pub fn run(
     }
 
     Ok(())
+}
+
+fn profiling_enabled(features: &[String], all_features: bool) -> bool {
+    all_features
+        || features.iter().any(|feature| {
+            feature
+                .split(|ch: char| ch == ',' || ch.is_whitespace())
+                .any(|part| part == "profiling" || part.ends_with("/profiling"))
+        })
 }
 
 fn load_trace_from_file(
@@ -840,4 +807,18 @@ pub fn read_trace_commitment(commit_path: &str) -> TraceCommitment {
         postcard::from_bytes(&bytes).expect("Failed to deserialize Trace Commitment");
 
     trace_commitment
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn profiling_enabled_detects_feature_flags() {
+        assert!(profiling_enabled(&[], true));
+        assert!(profiling_enabled(&["profiling".to_string()], false));
+        assert!(profiling_enabled(&["raster/profiling".to_string()], false));
+        assert!(profiling_enabled(&["foo,profiling".to_string()], false));
+        assert!(!profiling_enabled(&["foo".to_string()], false));
+    }
 }

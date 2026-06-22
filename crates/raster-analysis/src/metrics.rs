@@ -6,9 +6,15 @@ use std::collections::HashMap;
 /// Performance metrics extracted from execution traces.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Metrics {
+    #[serde(default)]
+    pub run_id: Option<String>,
     pub total_duration_ns: u64,
     #[serde(default)]
     pub program_total_known: bool,
+    #[serde(default)]
+    pub profile_record_count: u64,
+    #[serde(default)]
+    pub max_nesting_depth: u32,
     #[serde(default)]
     pub total_tile_invocations: u64,
     pub total_tile_duration_ns: u64,

@@ -1,4 +1,4 @@
-use crate::metrics::{Metrics, SequenceMetrics, TileMetrics};
+use crate::metrics::{Metrics, TileMetrics};
 use raster_core::Result;
 
 /// Generates human-readable and machine-readable reports.
@@ -14,208 +14,56 @@ impl Report {
     /// Generate a human-readable text report.
     pub fn to_text(&self) -> String {
         let mut lines = Vec::new();
-        let avg_tile_overhead = average_duration(
-            self.metrics.total_tile_raster_overhead_ns,
-            self.metrics.total_tile_invocations,
-        );
-        let avg_sequence_self = average_duration(
-            self.metrics.total_sequence_self_duration_ns,
-            self.metrics.total_sequence_invocations,
-        );
         let program_total = if self.metrics.program_total_known {
             format_duration(self.metrics.total_duration_ns)
         } else {
             String::from("pending")
         };
-        lines.push(format!("Program total: {}", program_total));
+
+        lines.push(String::from("Profile Summary"));
         lines.push(format!(
-            "Tile user time: {}",
-            format_duration(self.metrics.total_tile_user_duration_ns)
+            "  Run: {}",
+            self.metrics.run_id.as_deref().unwrap_or("unknown")
+        ));
+        lines.push(format!("  Program total: {}", program_total));
+        lines.push(format!(
+            "  Tiles executed: {} calls",
+            format_count(self.metrics.total_tile_invocations)
         ));
         lines.push(format!(
-            "Raster overhead: {}",
+            "  Tile execution: {} user, {} raster",
+            format_duration(self.metrics.total_tile_user_duration_ns),
             format_duration(self.metrics.total_tile_raster_overhead_ns)
         ));
-        if let Some(avg_tile_overhead) = avg_tile_overhead {
-            lines.push(format!(
-                "Avg tile overhead: {}",
-                format_duration(avg_tile_overhead)
-            ));
-        }
         lines.push(format!(
-            "Sequence self time: {}",
+            "  Sequences: {} calls, {}",
+            format_count(self.metrics.total_sequence_invocations),
             format_duration(self.metrics.total_sequence_self_duration_ns)
         ));
-        if let Some(avg_sequence_self) = avg_sequence_self {
-            lines.push(format!(
-                "Avg sequence self: {}",
-                format_duration(avg_sequence_self)
-            ));
-        }
-        if self.metrics.total_tile_raster_overhead_ns > 0 {
-            lines.push(String::from("Tile overhead breakdown:"));
-            lines.push(format_bucket_line(
-                "external input resolve",
-                self.metrics.total_tile_external_input_resolve_ns,
-                self.metrics.total_tile_invocations,
-            ));
-            lines.push(format_bucket_line(
-                "internal input resolve",
-                self.metrics.total_tile_internal_input_resolve_ns,
-                self.metrics.total_tile_invocations,
-            ));
-            lines.push(format_bucket_line(
-                "output store",
-                self.metrics.total_tile_output_store_ns,
-                self.metrics.total_tile_invocations,
-            ));
-            lines.push(format_bucket_line(
-                "trace serialization",
-                self.metrics.total_tile_trace_serialize_ns,
-                self.metrics.total_tile_invocations,
-            ));
-            lines.push(format_bucket_line(
-                "draft capture",
-                self.metrics.total_tile_draft_capture_ns,
-                self.metrics.total_tile_invocations,
-            ));
-            lines.push(format_bucket_line(
-                "scope enter",
-                self.metrics.total_tile_scope_enter_ns,
-                self.metrics.total_tile_invocations,
-            ));
-            lines.push(format_bucket_line(
-                "output record build",
-                self.metrics.total_tile_output_record_build_ns,
-                self.metrics.total_tile_invocations,
-            ));
-            lines.push(format_bucket_line(
-                "trace event publish",
-                self.metrics.total_tile_trace_event_publish_ns,
-                self.metrics.total_tile_invocations,
-            ));
-            lines.push(format_bucket_line(
-                "output coordinate publish",
-                self.metrics.total_tile_output_coordinate_publish_ns,
-                self.metrics.total_tile_invocations,
-            ));
-            lines.push(format_bucket_line(
-                "other wrapper",
-                self.metrics.total_tile_other_wrapper_ns,
-                self.metrics.total_tile_invocations,
-            ));
-        }
-        if self.metrics.total_sequence_self_duration_ns > 0 {
-            lines.push(String::from("Sequence self breakdown:"));
-            lines.push(format_bucket_line(
-                "body self",
-                self.metrics.total_sequence_body_self_ns,
-                self.metrics.total_sequence_invocations,
-            ));
-            lines.push(format_bucket_line(
-                "scope enter",
-                self.metrics.total_sequence_scope_enter_ns,
-                self.metrics.total_sequence_invocations,
-            ));
-            lines.push(format_bucket_line(
-                "synthetic coordinate alloc",
-                self.metrics.total_sequence_synthetic_coordinate_alloc_ns,
-                self.metrics.total_sequence_invocations,
-            ));
-            lines.push(format_bucket_line(
-                "input trace",
-                self.metrics.total_sequence_input_trace_ns,
-                self.metrics.total_sequence_invocations,
-            ));
-            lines.push(format_bucket_line(
-                "sequence start publish",
-                self.metrics.total_sequence_start_event_publish_ns,
-                self.metrics.total_sequence_invocations,
-            ));
-            lines.push(format_bucket_line(
-                "output trace",
-                self.metrics.total_sequence_output_trace_ns,
-                self.metrics.total_sequence_invocations,
-            ));
-            lines.push(format_bucket_line(
-                "sequence end publish",
-                self.metrics.total_sequence_end_event_publish_ns,
-                self.metrics.total_sequence_invocations,
-            ));
-            lines.push(format_bucket_line(
-                "other wrapper",
-                self.metrics.total_sequence_other_wrapper_ns,
-                self.metrics.total_sequence_invocations,
-            ));
-        }
 
-        if let Some(latest_tile) = &self.metrics.latest_tile_stats {
-            lines.push(String::new());
-            lines.push(String::from("Latest Tile:"));
-            lines.push(format!(
-                "  {} @ {:?}: total {}, user {}, overhead {}, invocation {}",
-                latest_tile.tile_id,
-                latest_tile.coordinates,
-                format_duration(latest_tile.total_duration_ns),
-                format_duration(latest_tile.user_duration_ns),
-                format_duration(latest_tile.raster_overhead_ns),
-                latest_tile.invocation_index
-            ));
-            lines.push(format!(
-                "  overhead parts: ext {}, int {}, store {}, trace {}, draft {}, scope {}, record {}, publish {}, coords {}, other {}",
-                format_duration(latest_tile.external_input_resolve_ns),
-                format_duration(latest_tile.internal_input_resolve_ns),
-                format_duration(latest_tile.output_store_ns),
-                format_duration(latest_tile.trace_serialize_ns),
-                format_duration(latest_tile.draft_capture_ns),
-                format_duration(latest_tile.scope_enter_ns),
-                format_duration(latest_tile.output_record_build_ns),
-                format_duration(latest_tile.trace_event_publish_ns),
-                format_duration(latest_tile.output_coordinate_publish_ns),
-                format_duration(latest_tile.other_wrapper_ns),
-            ));
-        }
-
-        if !self.metrics.tile_metrics.is_empty() {
-            lines.push(String::new());
-            lines.push(String::from("Tiles:"));
-            for (tile_id, metrics) in sorted_tiles(&self.metrics.tile_metrics) {
+        let hot_tiles = sorted_tiles(&self.metrics.tile_metrics);
+        if !hot_tiles.is_empty() {
+            lines.push(String::from("  Hot Tiles"));
+            for (tile_id, metrics) in hot_tiles.into_iter().take(3) {
                 lines.push(format!(
-                    "  {}: total {}, user {}, overhead {}, calls {}",
+                    "    {}: total {}, avg {}, calls {}",
                     tile_id.0,
                     format_duration(metrics.total_duration_ns),
-                    format_duration(metrics.total_user_duration_ns),
-                    format_duration(metrics.total_raster_overhead_ns),
-                    metrics.invocations
+                    format_duration(metrics.avg_duration_ns),
+                    format_count(metrics.invocations)
                 ));
             }
         }
 
-        if !self.metrics.sequence_metrics.is_empty() {
-            lines.push(String::new());
-            lines.push(String::from("Sequences:"));
-            for (sequence_id, metrics) in sorted_sequences(&self.metrics.sequence_metrics) {
-                lines.push(format!(
-                    "  {}: total {}, self {}, child {}, calls {}",
-                    sequence_id,
-                    format_duration(metrics.total_duration_ns),
-                    format_duration(metrics.total_self_duration_ns),
-                    format_duration(metrics.total_child_duration_ns),
-                    metrics.invocations
-                ));
-                lines.push(format!(
-                    "  self parts: body {}, scope {}, coords {}, in-trace {}, start {}, out-trace {}, end {}, other {}",
-                    format_duration(metrics.total_body_self_ns),
-                    format_duration(metrics.total_scope_enter_ns),
-                    format_duration(metrics.total_synthetic_coordinate_alloc_ns),
-                    format_duration(metrics.total_input_trace_ns),
-                    format_duration(metrics.total_start_event_publish_ns),
-                    format_duration(metrics.total_output_trace_ns),
-                    format_duration(metrics.total_end_event_publish_ns),
-                    format_duration(metrics.total_other_wrapper_ns),
-                ));
-            }
-        }
+        lines.push(String::from("  Execution Shape"));
+        lines.push(format!(
+            "    Max nesting depth: {}",
+            self.metrics.max_nesting_depth
+        ));
+        lines.push(format!(
+            "    Profile records: {}",
+            format_count(self.metrics.profile_record_count)
+        ));
 
         lines.join("\n")
     }
@@ -230,15 +78,13 @@ fn sorted_tiles(
     tile_metrics: &std::collections::HashMap<raster_core::tile::TileId, TileMetrics>,
 ) -> Vec<(&raster_core::tile::TileId, &TileMetrics)> {
     let mut entries: Vec<_> = tile_metrics.iter().collect();
-    entries.sort_by(|left, right| right.1.total_duration_ns.cmp(&left.1.total_duration_ns));
-    entries
-}
-
-fn sorted_sequences(
-    sequence_metrics: &std::collections::HashMap<String, SequenceMetrics>,
-) -> Vec<(&String, &SequenceMetrics)> {
-    let mut entries: Vec<_> = sequence_metrics.iter().collect();
-    entries.sort_by(|left, right| right.1.total_duration_ns.cmp(&left.1.total_duration_ns));
+    entries.sort_by(|left, right| {
+        right
+            .1
+            .total_duration_ns
+            .cmp(&left.1.total_duration_ns)
+            .then_with(|| left.0 .0.cmp(&right.0 .0))
+    });
     entries
 }
 
@@ -254,75 +100,91 @@ fn format_duration(duration_ns: u64) -> String {
     }
 }
 
-fn average_duration(total_ns: u64, invocations: u64) -> Option<u64> {
-    (invocations > 0).then(|| total_ns / invocations)
-}
-
-fn format_bucket_line(label: &str, total_ns: u64, invocations: u64) -> String {
-    match average_duration(total_ns, invocations) {
-        Some(avg_ns) => format!(
-            "  {}: {} avg {}",
-            label,
-            format_duration(total_ns),
-            format_duration(avg_ns)
-        ),
-        None => format!("  {}: {}", label, format_duration(total_ns)),
+fn format_count(count: u64) -> String {
+    let value = count.to_string();
+    let mut formatted = String::with_capacity(value.len() + value.len() / 3);
+    for (index, ch) in value.chars().rev().enumerate() {
+        if index > 0 && index % 3 == 0 {
+            formatted.push(',');
+        }
+        formatted.push(ch);
     }
+    formatted.chars().rev().collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metrics::{Metrics, SequenceMetrics};
+    use raster_core::tile::TileId;
 
     #[test]
-    fn text_report_includes_sequence_self_breakdown() {
+    fn text_report_uses_compact_profile_summary() {
         let mut metrics = Metrics {
-            total_duration_ns: 100,
+            run_id: Some("run-1".to_string()),
+            total_duration_ns: 183_420_000,
             program_total_known: true,
-            total_sequence_invocations: 2,
-            total_sequence_self_duration_ns: 20,
-            total_sequence_body_self_ns: 8,
-            total_sequence_scope_enter_ns: 2,
-            total_sequence_synthetic_coordinate_alloc_ns: 3,
-            total_sequence_input_trace_ns: 2,
-            total_sequence_start_event_publish_ns: 1,
-            total_sequence_output_trace_ns: 2,
-            total_sequence_end_event_publish_ns: 1,
-            total_sequence_other_wrapper_ns: 1,
+            profile_record_count: 1_251,
+            max_nesting_depth: 2,
+            total_tile_invocations: 1_248,
+            total_tile_user_duration_ns: 151_300_000,
+            total_tile_raster_overhead_ns: 18_240_000,
+            total_sequence_invocations: 3,
+            total_sequence_self_duration_ns: 13_880_000,
             ..Metrics::default()
         };
-        metrics.sequence_metrics.insert(
-            "main".to_string(),
-            SequenceMetrics {
+
+        metrics.tile_metrics.insert(
+            TileId::from("merge_tokens"),
+            TileMetrics {
+                invocations: 15,
+                total_duration_ns: 21_740_000,
+                avg_duration_ns: 1_449_333,
+                ..TileMetrics::default()
+            },
+        );
+        metrics.tile_metrics.insert(
+            TileId::from("tokenize_chunk"),
+            TileMetrics {
+                invocations: 1_090,
+                total_duration_ns: 122_410_000,
+                avg_duration_ns: 112_302,
+                ..TileMetrics::default()
+            },
+        );
+        metrics.tile_metrics.insert(
+            TileId::from("normalize"),
+            TileMetrics {
+                invocations: 141,
+                total_duration_ns: 7_150_000,
+                avg_duration_ns: 50_709,
+                ..TileMetrics::default()
+            },
+        );
+        metrics.tile_metrics.insert(
+            TileId::from("cold_tile"),
+            TileMetrics {
                 invocations: 2,
-                total_duration_ns: 100,
-                avg_duration_ns: 50,
-                total_self_duration_ns: 20,
-                avg_self_duration_ns: 10,
-                total_child_duration_ns: 80,
-                total_body_self_ns: 8,
-                avg_body_self_ns: 4,
-                total_scope_enter_ns: 2,
-                avg_scope_enter_ns: 1,
-                total_synthetic_coordinate_alloc_ns: 3,
-                avg_synthetic_coordinate_alloc_ns: 1,
-                total_input_trace_ns: 2,
-                avg_input_trace_ns: 1,
-                total_start_event_publish_ns: 1,
-                avg_start_event_publish_ns: 0,
-                total_output_trace_ns: 2,
-                avg_output_trace_ns: 1,
-                total_end_event_publish_ns: 1,
-                avg_end_event_publish_ns: 0,
-                total_other_wrapper_ns: 1,
-                avg_other_wrapper_ns: 0,
+                total_duration_ns: 1_000,
+                avg_duration_ns: 500,
+                ..TileMetrics::default()
             },
         );
 
         let text = Report::new(metrics).to_text();
-        assert!(text.contains("Sequence self breakdown:"));
-        assert!(text.contains("synthetic coordinate alloc"));
-        assert!(text.contains("self parts: body"));
+
+        assert!(text.contains("Profile Summary"));
+        assert!(text.contains("  Run: run-1"));
+        assert!(text.contains("  Program total: 183.420 ms"));
+        assert!(text.contains("  Tiles executed: 1,248 calls"));
+        assert!(text.contains("  Tile execution: 151.300 ms user, 18.240 ms raster"));
+        assert!(text.contains("  Sequences: 3 calls, 13.880 ms"));
+        assert!(text.contains("  Hot Tiles"));
+        assert!(text.contains("    tokenize_chunk: total 122.410 ms, avg 112.302 us, calls 1,090"));
+        assert!(text.contains("    merge_tokens: total 21.740 ms, avg 1.449 ms, calls 15"));
+        assert!(text.contains("    normalize: total 7.150 ms, avg 50.709 us, calls 141"));
+        assert!(!text.contains("cold_tile"));
+        assert!(text.contains("  Execution Shape"));
+        assert!(text.contains("    Max nesting depth: 2"));
+        assert!(text.contains("    Profile records: 1,251"));
     }
 }
