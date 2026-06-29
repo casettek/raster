@@ -24,6 +24,7 @@ pub struct SequenceCallstack {
 pub struct SequenceState {
     id: SequenceId,
     current_index: u32,
+    parent_coordinates: CfsCoordinates,
 }
 
 #[derive(Debug, Clone)]
@@ -65,25 +66,24 @@ impl SequenceCallstack {
         let sequence_execution_state = SequenceState {
             id: sequence_id,
             current_index: 0,
+            parent_coordinates: parent_sequence_coords,
         };
         self.callstack.push_back(sequence_execution_state);
     }
 
     fn pop(&mut self) -> Option<SequenceState> {
-        let mut parent_sequence_coordinates =
-            VecDeque::from(self.current_sequence_coordinates.0.clone());
-
-        parent_sequence_coordinates.pop_back();
-        self.current_sequence_coordinates = CfsCoordinates(parent_sequence_coordinates.into());
-
-        self.callstack.pop_back()
+        let popped = self.callstack.pop_back()?;
+        self.current_sequence_coordinates = popped.parent_coordinates.clone();
+        Some(popped)
     }
 
     fn push_at_coordinates(&mut self, sequence_id: SequenceId, coordinates: CfsCoordinates) {
+        let parent_coordinates = self.current_sequence_coordinates.clone();
         self.current_sequence_coordinates = coordinates;
         self.callstack.push_back(SequenceState {
             id: sequence_id,
             current_index: 0,
+            parent_coordinates,
         });
     }
 
@@ -255,7 +255,7 @@ pub struct TraceRecorder {
     exec_index: u64,
     sequence_callstack: SequenceCallstack,
     active_recur: Option<RecurExecutionState>,
-    active_recur_sequence: Option<RecurExecutionState>,
+    active_recur_sequence: HashMap<(CfsCoordinates, String), RecurExecutionState>,
     cfs_cursor: CfsCursor,
     witness_store: StepWitnessStore,
     internal_storage: InternalStorageManager,
@@ -267,7 +267,7 @@ impl TraceRecorder {
             exec_index: 0,
             sequence_callstack: SequenceCallstack::new(),
             active_recur: None,
-            active_recur_sequence: None,
+            active_recur_sequence: HashMap::new(),
             cfs_cursor: CfsCursor::new(cfs),
             witness_store: StepWitnessStore::new(),
             internal_storage: InternalStorageManager::new(),
@@ -354,16 +354,19 @@ impl TraceRecorder {
                 StepRecord::SequenceStart(record)
             }
             TraceEvent::SequenceEnd(fn_call_record) => {
+                let sequence_coordinates =
+                    self.sequence_callstack.current_sequence_coordinates.clone();
                 assert!(
                     self.active_recur.is_none(),
                     "Sequence ended while RecurTile site trace was still active"
                 );
                 assert!(
-                    self.active_recur_sequence.is_none(),
+                    !self
+                        .active_recur_sequence
+                        .keys()
+                        .any(|(coordinates, _)| coordinates == &sequence_coordinates),
                     "Sequence ended while RecurSequence site trace was still active"
                 );
-                let sequence_coordinates =
-                    self.sequence_callstack.current_sequence_coordinates.clone();
 
                 let output = fn_call_record.output;
                 let output_commitment = output
@@ -395,20 +398,28 @@ impl TraceRecorder {
                     .expect("RecurSequence can't start without sequence context")
                     .current_index;
 
-                let recur_state = self.active_recur_sequence.get_or_insert_with(|| {
+                let recur_key = (
+                    parent_sequence_coordinates.clone(),
+                    fn_call_record.fn_name.clone(),
+                );
+                if !self.active_recur_sequence.contains_key(&recur_key) {
                     let site_coordinates = self.cfs_cursor.get_child_coordinates(
                         &parent_sequence_coordinates,
                         parent_current_index,
                         SequenceChildId::RecurSequence(fn_call_record.fn_name.clone()),
                     );
-                    RecurExecutionState {
+                    self.active_recur_sequence.insert(recur_key.clone(), RecurExecutionState {
                         site_id: fn_call_record.fn_name.clone(),
                         sequence_coordinates: parent_sequence_coordinates.clone(),
                         site_coordinates,
                         intra_sequence_index: parent_current_index,
                         next_iteration_index: 0,
-                    }
-                });
+                    });
+                }
+                let recur_state = self
+                    .active_recur_sequence
+                    .get_mut(&recur_key)
+                    .expect("RecurSequence state should exist after insertion");
                 assert_eq!(
                     recur_state.sequence_coordinates, parent_sequence_coordinates,
                     "RecurSequence iteration switched parent sequence coordinates mid-stream",
@@ -788,7 +799,11 @@ impl TraceRecorder {
                 let sequence_id = current_sequence_state.id.clone();
                 let parent_current_index = current_sequence_state.current_index;
 
-                let recur_state = self.active_recur_sequence.take().unwrap_or_else(|| {
+                let recur_key = (
+                    sequence_coordinates.clone(),
+                    fn_call_record.fn_name.clone(),
+                );
+                let recur_state = self.active_recur_sequence.remove(&recur_key).unwrap_or_else(|| {
                     let site_coordinates = self.cfs_cursor.get_child_coordinates(
                         &sequence_coordinates,
                         parent_current_index,
@@ -886,7 +901,9 @@ impl TraceRecorder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use raster_core::cfs::{RecurTileItem, SequenceChildItem, SequenceDef, TileDef, TileItem};
+    use raster_core::cfs::{
+        RecurSequenceItem, RecurTileItem, SequenceChildItem, SequenceDef, TileDef, TileItem,
+    };
     use raster_core::trace::FnCallRecord;
 
     fn recorder_with_recur_site() -> TraceRecorder {
@@ -909,6 +926,39 @@ mod tests {
                     }),
                 ],
             }],
+        })
+    }
+
+    fn recorder_with_recur_sequence_site() -> TraceRecorder {
+        TraceRecorder::new(ControlFlowSchema {
+            version: "1.0".to_string(),
+            project: "test".to_string(),
+            encoding: "postcard".to_string(),
+            tiles: vec![TileDef::iter("inner", 0, 0), TileDef::iter("after", 0, 0)],
+            sequences: vec![
+                SequenceDef {
+                    id: "main".to_string(),
+                    input_sources: vec![],
+                    items: vec![
+                        SequenceChildItem::RecurSequence(RecurSequenceItem {
+                            id: "child".to_string(),
+                            sources: vec![],
+                        }),
+                        SequenceChildItem::Tile(TileItem {
+                            id: "after".to_string(),
+                            sources: vec![],
+                        }),
+                    ],
+                },
+                SequenceDef {
+                    id: "child".to_string(),
+                    input_sources: vec![],
+                    items: vec![SequenceChildItem::Tile(TileItem {
+                        id: "inner".to_string(),
+                        sources: vec![],
+                    })],
+                },
+            ],
         })
     }
 
@@ -967,6 +1017,75 @@ mod tests {
 
         assert_eq!(iter0.coordinates(), &CfsCoordinates(vec![0, 0]));
         assert_eq!(iter1.coordinates(), &CfsCoordinates(vec![0, 1]));
+        assert_eq!(site.coordinates(), &CfsCoordinates(vec![0]));
+        assert_eq!(after.coordinates(), &CfsCoordinates(vec![1]));
+    }
+
+    #[test]
+    fn recur_sequence_iterations_restore_parent_coordinates_before_site_completion() {
+        let mut recorder = recorder_with_recur_sequence_site();
+        recorder.record(TraceEvent::SequenceStart(FnCallRecord {
+            fn_name: "main".to_string(),
+            input: None,
+            output: None,
+            draft_transition_witness: None,
+        }));
+
+        let iter0_start = recorder.record(TraceEvent::RecurSequenceStart(FnCallRecord {
+            fn_name: "child".to_string(),
+            input: None,
+            output: None,
+            draft_transition_witness: None,
+        }));
+        let iter0_inner = recorder.record(TraceEvent::TileExec(FnCallRecord {
+            fn_name: "inner".to_string(),
+            input: None,
+            output: None,
+            draft_transition_witness: None,
+        }));
+        let iter0_end = recorder.record(TraceEvent::RecurSequenceEnd(FnCallRecord {
+            fn_name: "child".to_string(),
+            input: None,
+            output: None,
+            draft_transition_witness: None,
+        }));
+        let iter1_start = recorder.record(TraceEvent::RecurSequenceStart(FnCallRecord {
+            fn_name: "child".to_string(),
+            input: None,
+            output: None,
+            draft_transition_witness: None,
+        }));
+        let iter1_inner = recorder.record(TraceEvent::TileExec(FnCallRecord {
+            fn_name: "inner".to_string(),
+            input: None,
+            output: None,
+            draft_transition_witness: None,
+        }));
+        let iter1_end = recorder.record(TraceEvent::RecurSequenceEnd(FnCallRecord {
+            fn_name: "child".to_string(),
+            input: None,
+            output: None,
+            draft_transition_witness: None,
+        }));
+        let site = recorder.record(TraceEvent::RecurSequenceExec(FnCallRecord {
+            fn_name: "child".to_string(),
+            input: None,
+            output: None,
+            draft_transition_witness: None,
+        }));
+        let after = recorder.record(TraceEvent::TileExec(FnCallRecord {
+            fn_name: "after".to_string(),
+            input: None,
+            output: None,
+            draft_transition_witness: None,
+        }));
+
+        assert_eq!(iter0_start.coordinates(), &CfsCoordinates(vec![0, 0]));
+        assert_eq!(iter0_inner.coordinates(), &CfsCoordinates(vec![0, 0, 0]));
+        assert_eq!(iter0_end.coordinates(), &CfsCoordinates(vec![0, 0]));
+        assert_eq!(iter1_start.coordinates(), &CfsCoordinates(vec![0, 1]));
+        assert_eq!(iter1_inner.coordinates(), &CfsCoordinates(vec![0, 1, 0]));
+        assert_eq!(iter1_end.coordinates(), &CfsCoordinates(vec![0, 1]));
         assert_eq!(site.coordinates(), &CfsCoordinates(vec![0]));
         assert_eq!(after.coordinates(), &CfsCoordinates(vec![1]));
     }

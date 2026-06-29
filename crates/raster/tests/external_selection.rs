@@ -1,8 +1,9 @@
 use raster::core::trace::TraceEvent;
+use raster::SelectionCommitment;
 use raster::prelude::*;
 use raster::selector_path;
 use raster_core::postcard;
-use raster_runtime::{init_with, Publisher, Sha256Commitment};
+use raster_runtime::{init_with, Publisher};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, Once};
@@ -317,7 +318,11 @@ fn infallible_call_binding_uses_tile_output_commitment() {
     );
     assert_eq!(
         reference.commitment,
-        Into::<Vec<u8>>::into(Sha256Commitment::from(output.data.as_slice()))
+        output
+            .raster
+            .as_ref()
+            .expect("tile output should include raster payload")
+            .root_hash
     );
     assert_eq!(
         raster::resolve_internal_value::<String>(reference)
@@ -351,7 +356,11 @@ fn fallible_call_binding_resolves_ok_payload_from_stored_result() {
     );
     assert_eq!(
         reference.commitment,
-        Into::<Vec<u8>>::into(Sha256Commitment::from(output.data.as_slice()))
+        output
+            .raster
+            .as_ref()
+            .expect("tile output should include raster payload")
+            .root_hash
     );
     assert_eq!(
         raster::resolve_internal_ok_value::<String>(reference)
@@ -384,7 +393,11 @@ fn nested_sequence_trace_records_terminal_err_outputs() {
             TraceEvent::TileExec(record) => {
                 matches!(record.fn_name.as_str(), "echo_name" | "maybe_echo_name")
             }
-            TraceEvent::RecurTileIterationExec(_) | TraceEvent::RecurTileExec(_) => false,
+            TraceEvent::RecurTileIterationExec(_)
+            | TraceEvent::RecurTileExec(_)
+            | TraceEvent::RecurSequenceStart(_)
+            | TraceEvent::RecurSequenceEnd(_)
+            | TraceEvent::RecurSequenceExec(_) => false,
         })
         .collect();
 

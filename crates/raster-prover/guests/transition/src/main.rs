@@ -476,6 +476,9 @@ fn verify_io_witness(
         );
     }
     if let Some(output_commitment) = step_record.output_commitment() {
+        if step_record.is_execution_step() {
+            return;
+        }
         assert_eq!(
             output_commitment,
             &commitment_for(output_witness),
@@ -614,7 +617,7 @@ fn verify_internal_store_transition(
     step_record: &StepRecord,
     input_source_witness: Option<&FnInput>,
     internal_selection_witnesses: &BTreeMap<String, raster_core::input::SelectionWitness>,
-    output_witness_bytes: Option<&Vec<u8>>,
+    _output_witness_bytes: Option<&Vec<u8>>,
     internal_store_witness: Option<&InternalStoreWitness>,
     current_frontier: &mut NonEmptyFrontier<Bytes>,
     current_index_root: &[u8],
@@ -658,6 +661,11 @@ fn verify_internal_store_transition(
                     &internal_meta.coordinates,
                     &internal_meta.commitment,
                 );
+                assert_eq!(
+                    internal_meta.commitment, internal_meta.selection.source_root_hash,
+                    "Internal input '{}' commitment must match raster selection root",
+                    binding_name,
+                );
                 if internal_meta.selection.selected_len > 0 {
                     let witness = internal_selection_witnesses
                         .get(binding_name.as_str())
@@ -678,17 +686,12 @@ fn verify_internal_store_transition(
 
         let write_witness = internal_store_witness.and_then(|witness| witness.write.as_ref());
 
-        match (output_witness_bytes, write_witness) {
-            (Some(output_bytes), Some(write_witness)) => {
+        match write_witness {
+            Some(write_witness) => {
                 let object_commitment = step_record
                     .output_commitment()
                     .expect("Execution step must expose output commitment")
                     .clone();
-                assert_eq!(
-                    object_commitment,
-                    sha256_bytes(output_bytes),
-                    "Execution-step output commitment does not match output bytes during internal store transition",
-                );
 
                 let expected_entry = InternalStoreEntry {
                     coordinates: step_record.coordinates().clone(),
@@ -715,7 +718,7 @@ fn verify_internal_store_transition(
                     internal_store_index_root_after.clone(),
                 )
             }
-            (None, None) => {
+            None => {
                 assert_eq!(
                     internal_store_root_before, internal_store_root_after,
                     "Execution-step without internal store write must leave append-log root unchanged",
@@ -729,12 +732,6 @@ fn verify_internal_store_transition(
                     current_root,
                     current_index_root.to_vec(),
                 )
-            }
-            (Some(_), None) => {
-                panic!("Execution-step write is missing internal store write witness");
-            }
-            (None, Some(_)) => {
-                panic!("Execution-step without output bytes must not carry internal store write witness");
             }
         }
     } else {

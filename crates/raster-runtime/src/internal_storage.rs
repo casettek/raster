@@ -24,8 +24,8 @@ use std::collections::BTreeMap;
 use std::vec::Vec;
 
 use crate::input::{
-    encode_raster_value, selected_payload_from_raster_selection,
-    selection_witness_from_raster_selection, tree_value_from_raster_selection,
+    encode_raster_value, selected_payload_from_raster_location,
+    selection_witness_from_raster_selection, tree_value_from_raster_location,
     typed_value_from_tree, TreeValue,
 };
 use crate::raster_index::RasterIndex;
@@ -115,6 +115,12 @@ fn raster_payload_for_value<T: Serialize>(value: &T) -> Result<RasterPayload> {
         index_bytes,
         root_hash: decode_hex_bytes(&root_hex)?,
     })
+}
+
+fn internal_object_commitment(bytes: &[u8], raster: Option<&RasterPayload>) -> Vec<u8> {
+    raster
+        .map(|payload| payload.root_hash.clone())
+        .unwrap_or_else(|| Sha256Commitment::from(bytes).into())
 }
 
 fn anchor_for_schema(coordinates: &CfsCoordinates, schema_hash: [u8; 32]) -> Anchor {
@@ -295,10 +301,10 @@ impl InternalStorageManager {
 
         let store_root_before = self.current_root();
         let index_root_before = self.current_index_root();
-        let object_commitment = Sha256Commitment::from(bytes);
+        let object_commitment = internal_object_commitment(bytes, raster.as_ref());
         let entry = InternalStoreEntry {
             coordinates: coordinates.clone(),
-            object_commitment: object_commitment.into(),
+            object_commitment,
         };
         let leaf_hash: Vec<u8> = Sha256Commitment::from(entry.to_bytes().as_slice()).into();
 
@@ -350,43 +356,69 @@ impl InternalStorageManager {
                 reference.coordinates
             )));
         }
-        let actual_commitment: Vec<u8> = Sha256Commitment::from(stored.bytes.as_slice()).into();
+        let actual_commitment =
+            internal_object_commitment(stored.bytes.as_slice(), stored.raster.as_ref());
         if actual_commitment != reference.commitment {
             return Err(Error::Other(format!(
                 "Internal store object at coordinates {:?} failed integrity check",
                 reference.coordinates
             )));
         }
-        let value = raster_core::postcard::from_bytes(&stored.bytes).map_err(|e| {
-            Error::Serialization(format!(
-                "Failed to deserialize internal store object at coordinates {:?}: {}",
-                reference.coordinates, e
-            ))
-        })?;
-        let selection = stored
-            .raster
-            .as_ref()
-            .map(|raster| SelectionCommitment {
-                path: SelectorPath::default(),
-                source_root_hash: raster.root_hash.clone(),
-                selected_hash: raster_core::input::selection_payload_hash(&raster.bytes),
-                selected_len: raster.bytes.len() as u64,
-            })
-            .unwrap_or_default();
+        let (bytes, selection, value) = if let Some(raster) = stored.raster.as_ref() {
+            let index = RasterIndex::from_bytes(&raster.index_bytes)?;
+            let location = index.root_location()?;
+            let tree = tree_value_from_raster_location(&index, &raster.bytes, &location)?;
+            let value = typed_value_from_tree(&tree)?;
+            (
+                raster.bytes.clone(),
+                SelectionCommitment {
+                    path: SelectorPath::default(),
+                    source_root_hash: raster.root_hash.clone(),
+                    selected_hash: raster_core::input::selection_payload_hash(&raster.bytes),
+                    selected_len: raster.bytes.len() as u64,
+                },
+                value,
+            )
+        } else {
+            let value = raster_core::postcard::from_bytes(&stored.bytes).map_err(|e| {
+                Error::Serialization(format!(
+                    "Failed to deserialize internal store object at coordinates {:?}: {}",
+                    reference.coordinates, e
+                ))
+            })?;
+            (
+                stored.bytes.clone(),
+                SelectionCommitment {
+                    path: SelectorPath::default(),
+                    source_root_hash: Vec::new(),
+                    selected_hash: Vec::new(),
+                    selected_len: 0,
+                },
+                value,
+            )
+        };
         Ok(InternalValue::new_with_selection(
             reference.clone(),
-            stored.bytes.clone(),
+            bytes,
             SelectorPath::default(),
             selection,
             value,
         ))
     }
 
-    pub fn selection_witness(
-        &self,
-        reference: &InternalRef,
-        selector: &SelectorPath,
-    ) -> Result<SelectionWitness> {
+    fn require_raster<'a>(
+        stored: &'a StoredInternalObject,
+        coordinates: &CfsCoordinates,
+    ) -> Result<&'a RasterPayload> {
+        stored.raster.as_ref().ok_or_else(|| {
+            Error::Other(format!(
+                "Internal store object at coordinates {:?} is missing raster selection metadata",
+                coordinates
+            ))
+        })
+    }
+
+    fn verify_reference(&self, reference: &InternalRef) -> Result<&StoredInternalObject> {
         let stored = self.objects.get(&reference.coordinates).ok_or_else(|| {
             Error::Other(format!(
                 "Missing internal store object at coordinates {:?}",
@@ -399,12 +431,24 @@ impl InternalStorageManager {
                 reference.coordinates
             )));
         }
-        let raster = stored.raster.as_ref().ok_or_else(|| {
-            Error::Other(format!(
-                "Internal store object at coordinates {:?} is missing raster selection metadata",
+        let actual_commitment =
+            internal_object_commitment(stored.bytes.as_slice(), stored.raster.as_ref());
+        if actual_commitment != reference.commitment {
+            return Err(Error::Other(format!(
+                "Internal store object at coordinates {:?} failed integrity check",
                 reference.coordinates
-            ))
-        })?;
+            )));
+        }
+        Ok(stored)
+    }
+
+    pub fn selection_witness(
+        &self,
+        reference: &InternalRef,
+        selector: &SelectorPath,
+    ) -> Result<SelectionWitness> {
+        let stored = self.verify_reference(reference)?;
+        let raster = Self::require_raster(stored, &reference.coordinates)?;
         let index = RasterIndex::from_bytes(&raster.index_bytes)?;
         let selection = index.select(selector)?;
         selection_witness_from_raster_selection(&raster.bytes, selector, selection)
@@ -415,28 +459,18 @@ impl InternalStorageManager {
         reference: &InternalRef,
         selector: &SelectorPath,
     ) -> Result<InternalValue<T>> {
-        let stored = self.objects.get(&reference.coordinates).ok_or_else(|| {
-            Error::Other(format!(
-                "Missing internal store object at coordinates {:?}",
-                reference.coordinates
-            ))
-        })?;
-        if stored.reference.commitment != reference.commitment {
+        let stored = self.verify_reference(reference)?;
+        let raster = Self::require_raster(stored, &reference.coordinates)?;
+        let index = RasterIndex::from_bytes(&raster.index_bytes)?;
+        let selection = index.locate(selector)?;
+        let tree = tree_value_from_raster_location(&index, &raster.bytes, &selection)?;
+        let selected = selected_payload_from_raster_location(&raster.bytes, selector, selection)?;
+        if selected.commitment.source_root_hash != reference.commitment {
             return Err(Error::Other(format!(
-                "Internal store commitment mismatch at coordinates {:?}",
+                "Internal selection root mismatch at coordinates {:?}",
                 reference.coordinates
             )));
         }
-        let raster = stored.raster.as_ref().ok_or_else(|| {
-            Error::Other(format!(
-                "Internal store object at coordinates {:?} is missing raster selection metadata",
-                reference.coordinates
-            ))
-        })?;
-        let index = RasterIndex::from_bytes(&raster.index_bytes)?;
-        let selection = index.select(selector)?;
-        let tree = tree_value_from_raster_selection(&index, &raster.bytes, &selection)?;
-        let selected = selected_payload_from_raster_selection(&raster.bytes, selector, selection)?;
         let value = typed_value_from_tree(&tree)?;
         Ok(InternalValue::new_with_selection(
             reference.clone(),
@@ -1073,6 +1107,18 @@ mod tests {
 
         manager.append_serialized_bytes(b"first", coordinates.clone(), None);
         manager.append_serialized_bytes(b"second", coordinates, None);
+    }
+
+    #[test]
+    fn stored_internal_reference_commits_to_raster_root() {
+        reset_thread_storage();
+        let _guard = SequenceScopeGuard::enter("stored_internal_reference_commits_to_raster_root");
+        let reference = store_internal_value(&vec!["alpha".to_string(), "beta".to_string()])
+            .expect("value should store");
+        let resolved: InternalValue<Vec<String>> =
+            resolve_internal_value(&reference).expect("value should resolve");
+
+        assert_eq!(reference.commitment, resolved.selection.source_root_hash);
     }
 
     #[test]

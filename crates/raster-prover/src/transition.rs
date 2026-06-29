@@ -352,6 +352,8 @@ mod tests {
                         "personal_data",
                         b"239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5",
                     ),
+                    BTreeMap::new(),
+                    BTreeMap::new(),
                     None,
                     None,
                 ),

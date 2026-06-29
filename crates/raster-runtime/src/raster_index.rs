@@ -78,6 +78,14 @@ pub(crate) struct RasterMerkleLevel {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RasterSelectionLocation {
+    pub node_id: u64,
+    pub offset: u64,
+    pub len: u64,
+    pub root_hash: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RasterSelection {
     pub node_id: u64,
     pub offset: u64,
@@ -126,14 +134,88 @@ impl RasterIndex {
         hex_string(&self.root_commitment)
     }
 
-    pub(crate) fn root_selection(&self) -> Result<RasterSelection> {
+    pub(crate) fn root_location(&self) -> Result<RasterSelectionLocation> {
         let node = self.node(self.root_node)?;
-        Ok(RasterSelection {
+        Ok(RasterSelectionLocation {
             node_id: self.root_node,
             offset: node.offset,
             len: node.len,
             root_hash: self.root_commitment.clone(),
+        })
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn root_selection(&self) -> Result<RasterSelection> {
+        let location = self.root_location()?;
+        Ok(RasterSelection {
+            node_id: location.node_id,
+            offset: location.offset,
+            len: location.len,
+            root_hash: location.root_hash,
             steps: Vec::new(),
+        })
+    }
+
+    pub(crate) fn locate(&self, selector: &SelectorPath) -> Result<RasterSelectionLocation> {
+        if selector.is_empty() {
+            return self.root_location();
+        }
+
+        let mut current_id = self.root_node;
+
+        for segment in &selector.segments {
+            let node = self.node(current_id)?;
+            match (segment, &node.kind) {
+                (SelectorSegment::Field(field_name), RasterNodeKind::Struct { fields }) => {
+                    let target = fields
+                        .iter()
+                        .find(|field| field.name == *field_name)
+                        .ok_or_else(|| {
+                            Error::Other(format!(
+                                "Selector field '{}' was not found in raster index",
+                                field_name
+                            ))
+                        })?;
+                    current_id = target.child;
+                }
+                (
+                    SelectorSegment::Index(index),
+                    RasterNodeKind::List { len, elements, .. },
+                ) => {
+                    if *index >= *len {
+                        return Err(Error::Other(format!(
+                            "Selector index '{}' was not found in raster index",
+                            index
+                        )));
+                    }
+                    current_id = *elements.get(*index as usize).ok_or_else(|| {
+                        Error::Serialization(format!(
+                            "Malformed raster index: missing list element {}",
+                            index
+                        ))
+                    })?;
+                }
+                (SelectorSegment::Field(field_name), _) => {
+                    return Err(Error::Other(format!(
+                        "Selector field '{}' was not found in selected value",
+                        field_name
+                    )));
+                }
+                (SelectorSegment::Index(index), _) => {
+                    return Err(Error::Other(format!(
+                        "Selector index '{}' was not found in selected value",
+                        index
+                    )));
+                }
+            }
+        }
+
+        let node = self.node(current_id)?;
+        Ok(RasterSelectionLocation {
+            node_id: current_id,
+            offset: node.offset,
+            len: node.len,
+            root_hash: self.root_commitment.clone(),
         })
     }
 

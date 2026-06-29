@@ -21,7 +21,7 @@ use std::string::{String, ToString};
 use std::vec::Vec;
 
 use crate::external_storage::{ExternalStorageManager, ResolvedExternalData};
-use crate::raster_index::{RasterIndex, RasterNodeKind, RasterSelection};
+use crate::raster_index::{RasterIndex, RasterNodeKind, RasterSelection, RasterSelectionLocation};
 
 fn load_external_storage() -> CoreResult<Option<ExternalStorageManager>> {
     ExternalStorageManager::from_cli_args()
@@ -1030,6 +1030,14 @@ pub(crate) fn tree_value_from_raster_selection(
     tree_value_from_raster_node(index, data_bytes, selection.node_id)
 }
 
+pub(crate) fn tree_value_from_raster_location(
+    index: &RasterIndex,
+    data_bytes: &[u8],
+    selection: &RasterSelectionLocation,
+) -> CoreResult<TreeValue> {
+    tree_value_from_raster_node(index, data_bytes, selection.node_id)
+}
+
 fn tree_value_from_raster_node(
     index: &RasterIndex,
     data_bytes: &[u8],
@@ -1603,6 +1611,25 @@ pub(crate) fn selected_payload_from_raster_selection(
     })
 }
 
+pub(crate) fn selected_payload_from_raster_location(
+    data_bytes: &[u8],
+    selector: &SelectorPath,
+    selection: RasterSelectionLocation,
+) -> CoreResult<SelectedPayload> {
+    let bytes = raster_subtree_bytes(data_bytes, selection.offset, selection.len)?.to_vec();
+    let selected_hash = selection_payload_hash(&bytes);
+    let selected_len = bytes.len() as u64;
+    Ok(SelectedPayload {
+        bytes,
+        commitment: SelectionCommitment {
+            path: selector.clone(),
+            source_root_hash: selection.root_hash,
+            selected_hash,
+            selected_len,
+        },
+    })
+}
+
 pub(crate) fn selection_witness_from_raster_selection(
     data_bytes: &[u8],
     selector: &SelectorPath,
@@ -1625,12 +1652,12 @@ fn raster_typed_value_from_selection<T: DeserializeOwned>(
     let index = resolved
         .raster_index()
         .ok_or_else(|| Error::Serialization("Expected raster index metadata".into()))?;
-    let selection = index.select(selector)?;
+    let selection = index.locate(selector)?;
     let data_bytes = resolved
         .raster_bytes()
         .ok_or_else(|| Error::Serialization("Expected raster data bytes".into()))?;
-    let tree = tree_value_from_raster_selection(index, data_bytes, &selection)?;
-    let selected = selected_payload_from_raster_selection(data_bytes, selector, selection)?;
+    let tree = tree_value_from_raster_location(index, data_bytes, &selection)?;
+    let selected = selected_payload_from_raster_location(data_bytes, selector, selection)?;
     let value = typed_value_from_tree(&tree).map_err(|e| {
         Error::Serialization(format!(
             "Failed to deserialize selected raster external input from selection tree: {}",
