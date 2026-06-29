@@ -223,10 +223,11 @@ fn nested_auth_ref_selection_matches_direct_external_selection_trace() {
         Some("commitment".to_string()),
         SelectedPayload {
             bytes: postcard::to_allocvec(&personal).unwrap(),
-            proof: SelectionProof {
+            commitment: SelectionCommitment {
                 path: SelectorPath::default(),
-                root_hash: root_hash.clone(),
-                steps: Vec::new(),
+                source_root_hash: root_hash.clone(),
+                selected_hash: Vec::new(),
+                selected_len: 0,
             },
         },
         personal,
@@ -260,7 +261,7 @@ fn nested_auth_ref_selection_matches_direct_external_selection_trace() {
     assert_eq!(nested.selector, direct.selector);
     assert_eq!(nested.selected, direct.selected);
     assert_eq!(nested.value, direct.value);
-    assert_eq!(nested.selected.proof.root_hash, root_hash);
+    assert_eq!(nested.selected.commitment.source_root_hash, root_hash);
 }
 
 #[test]

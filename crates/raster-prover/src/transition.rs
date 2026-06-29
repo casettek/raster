@@ -12,11 +12,12 @@ use raster_core::authorization::AuthorizationJournal;
 use raster_core::cfs::ControlFlowSchema;
 use raster_core::draft::DraftTransitionWitness;
 use raster_core::fingerprint::Fingerprint;
+use raster_core::input::SelectionWitness;
 use raster_core::trace::{ExternalInput, FnInput, StepRecord};
 use raster_core::transition::{
     InitTransition, InternalStoreWitness, TransitionInput, TransitionJournal, TransitionState,
 };
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::authorization::authorization_guest_image_id;
 use crate::precomputed::EMPTY_TRIE_NODES;
@@ -32,6 +33,8 @@ type RecordedStepIo = HashMap<
         Option<FnInput>,
         Option<FnInput>,
         ExternalInput,
+        BTreeMap<String, SelectionWitness>,
+        BTreeMap<String, SelectionWitness>,
         Option<InternalStoreWitness>,
         Option<DraftTransitionWitness>,
     ),
@@ -50,6 +53,8 @@ fn build_transition_input(
         input_source_witness,
         sequence_scope_witness,
         external_input,
+        external_selection_witnesses,
+        internal_selection_witnesses,
         internal_store_witness,
         draft_transition_witness,
     ) = recorded_step_io
@@ -75,6 +80,8 @@ fn build_transition_input(
             input_source_witness,
             sequence_scope_witness,
             external_input,
+            external_selection_witnesses,
+            internal_selection_witnesses,
             internal_store_witness,
             draft_transition_witness,
             authorization_journal: authorization_journal.clone(),
@@ -91,6 +98,8 @@ fn build_transition_input(
             input_source_witness,
             sequence_scope_witness,
             external_input,
+            external_selection_witnesses,
+            internal_selection_witnesses,
             internal_store_witness,
             draft_transition_witness,
             authorization_journal: authorization_journal.clone(),
@@ -252,7 +261,7 @@ mod tests {
                 commitment: commitment.to_vec(),
                 tree_root: Vec::new(),
                 selector: Default::default(),
-                selected: Default::default(),
+                selection: Default::default(),
             },
         )])
         .into_iter()
@@ -326,6 +335,8 @@ mod tests {
                     None,
                     None,
                     ExternalInput::new(),
+                    BTreeMap::new(),
+                    BTreeMap::new(),
                     None,
                     None,
                 ),
@@ -411,6 +422,8 @@ mod tests {
                 None,
                 None,
                 ExternalInput::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
                 None,
                 None,
             ),
@@ -468,6 +481,8 @@ mod tests {
                     None,
                     None,
                     ExternalInput::new(),
+                    BTreeMap::new(),
+                    BTreeMap::new(),
                     None,
                     None,
                 ),
@@ -480,6 +495,8 @@ mod tests {
                     None,
                     None,
                     ExternalInput::new(),
+                    BTreeMap::new(),
+                    BTreeMap::new(),
                     None,
                     None,
                 ),
@@ -572,6 +589,8 @@ mod tests {
             input_source_witness: Some(empty_input_source_witness()),
             sequence_scope_witness: None,
             external_input: ExternalInput::new(),
+            external_selection_witnesses: BTreeMap::new(),
+            internal_selection_witnesses: BTreeMap::new(),
             internal_store_witness: None,
             draft_transition_witness: None,
             authorization_journal: authorization,

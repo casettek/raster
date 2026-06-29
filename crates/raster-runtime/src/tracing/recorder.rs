@@ -1,5 +1,6 @@
 use raster_core::cfs::{CfsCoordinates, CfsCursor, ControlFlowSchema, SequenceChildId};
 use raster_core::draft::DraftTransitionWitness;
+use raster_core::input::{InternalRef, SelectionWitness, SelectorPath};
 use raster_core::trace::{
     ExternalInput, FnInput, InternalInput, RecurSequenceExecRecord, RecurTileExecRecord,
     SequenceEndRecord, SequenceStartRecord, StepRecord, TileExecRecord, TraceEvent,
@@ -293,6 +294,14 @@ impl TraceRecorder {
         self.internal_storage.snapshot()
     }
 
+    pub fn internal_selection_witness(
+        &self,
+        reference: &InternalRef,
+        selector: &SelectorPath,
+    ) -> raster_core::Result<SelectionWitness> {
+        self.internal_storage.selection_witness(reference, selector)
+    }
+
     pub fn io_data_at(
         &self,
         coordinates: &CfsCoordinates,
@@ -529,8 +538,11 @@ impl TraceRecorder {
 
                 let output = fn_call_record.output;
                 let internal_write = output.as_ref().map(|output| {
-                    self.internal_storage
-                        .append_serialized_bytes(&output.data, tile_coordinates.clone())
+                    self.internal_storage.append_serialized_bytes(
+                        &output.data,
+                        tile_coordinates.clone(),
+                        output.raster.clone(),
+                    )
                 });
                 let output_commitment = internal_write
                     .as_ref()
@@ -623,8 +635,11 @@ impl TraceRecorder {
 
                 let output = fn_call_record.output;
                 let internal_write = output.as_ref().map(|output| {
-                    self.internal_storage
-                        .append_serialized_bytes(&output.data, tile_coordinates.clone())
+                    self.internal_storage.append_serialized_bytes(
+                        &output.data,
+                        tile_coordinates.clone(),
+                        output.raster.clone(),
+                    )
                 });
                 let output_commitment = internal_write
                     .as_ref()
@@ -716,8 +731,11 @@ impl TraceRecorder {
 
                 let output = fn_call_record.output;
                 let internal_write = output.as_ref().map(|output| {
-                    self.internal_storage
-                        .append_serialized_bytes(&output.data, recur_state.site_coordinates.clone())
+                    self.internal_storage.append_serialized_bytes(
+                        &output.data,
+                        recur_state.site_coordinates.clone(),
+                        output.raster.clone(),
+                    )
                 });
                 let output_commitment = internal_write
                     .as_ref()
@@ -812,8 +830,11 @@ impl TraceRecorder {
 
                 let output = fn_call_record.output;
                 let internal_write = output.as_ref().map(|output| {
-                    self.internal_storage
-                        .append_serialized_bytes(&output.data, recur_state.site_coordinates.clone())
+                    self.internal_storage.append_serialized_bytes(
+                        &output.data,
+                        recur_state.site_coordinates.clone(),
+                        output.raster.clone(),
+                    )
                 });
                 let output_commitment = internal_write
                     .as_ref()

@@ -182,9 +182,29 @@ pub struct SelectionProof {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub struct SelectedPayload {
+pub struct SelectionCommitment {
+    pub path: SelectorPath,
+    pub source_root_hash: Vec<u8>,
+    pub selected_hash: Vec<u8>,
+    pub selected_len: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct SelectionWitness {
     pub bytes: Vec<u8>,
     pub proof: SelectionProof,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct SelectedPayload {
+    pub bytes: Vec<u8>,
+    pub commitment: SelectionCommitment,
+}
+
+impl SelectedPayload {
+    pub fn new(bytes: Vec<u8>, commitment: SelectionCommitment) -> Self {
+        Self { bytes, commitment }
+    }
 }
 
 fn selection_hash(parts: &[&[u8]]) -> Vec<u8> {
@@ -477,6 +497,25 @@ pub fn verify_selection_proof(selected_bytes: &[u8], proof: &SelectionProof) -> 
     current_hash == proof.root_hash
 }
 
+pub fn selection_payload_hash(selected_bytes: &[u8]) -> Vec<u8> {
+    Sha256::digest(selected_bytes).to_vec()
+}
+
+pub fn verify_selection_witness(
+    commitment: &SelectionCommitment,
+    witness: &SelectionWitness,
+) -> bool {
+    if witness.proof.path != commitment.path
+        || witness.proof.root_hash != commitment.source_root_hash
+        || witness.bytes.len() as u64 != commitment.selected_len
+        || selection_payload_hash(&witness.bytes) != commitment.selected_hash
+    {
+        return false;
+    }
+
+    verify_selection_proof(&witness.bytes, &witness.proof)
+}
+
 impl From<&str> for SelectorSegment {
     fn from(value: &str) -> Self {
         Self::Field(value.into())
@@ -646,14 +685,34 @@ impl<T> ExternalValue<T> {
 pub struct InternalValue<T> {
     pub reference: InternalRef,
     pub bytes: Vec<u8>,
+    pub selector: SelectorPath,
+    pub selection: SelectionCommitment,
     pub value: T,
 }
 
 impl<T> InternalValue<T> {
     pub fn new(reference: InternalRef, bytes: Vec<u8>, value: T) -> Self {
+        Self::new_with_selection(
+            reference,
+            bytes,
+            SelectorPath::default(),
+            SelectionCommitment::default(),
+            value,
+        )
+    }
+
+    pub fn new_with_selection(
+        reference: InternalRef,
+        bytes: Vec<u8>,
+        selector: SelectorPath,
+        selection: SelectionCommitment,
+        value: T,
+    ) -> Self {
         Self {
             reference,
             bytes,
+            selector,
+            selection,
             value,
         }
     }
@@ -944,10 +1003,11 @@ mod tests {
     fn auth_value_helpers_preserve_external_metadata() {
         let selected = SelectedPayload {
             bytes: alloc::vec![1, 2, 3],
-            proof: SelectionProof {
+            commitment: SelectionCommitment {
                 path: SelectorPath::default(),
-                root_hash: alloc::vec![4, 5, 6],
-                steps: alloc::vec![],
+                source_root_hash: alloc::vec![4, 5, 6],
+                selected_hash: alloc::vec![7, 8, 9],
+                selected_len: 3,
             },
         };
         let arg = AuthValue::external(ExternalValue::new(

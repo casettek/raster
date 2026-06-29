@@ -1635,9 +1635,9 @@ fn gen_recur_driver_function(
                                     .clone()
                                     .map(|value| value.into_bytes())
                                     .unwrap_or_default(),
-                                tree_root: __raster_external_value.selected.proof.root_hash.clone(),
+                                tree_root: __raster_external_value.selected.commitment.source_root_hash.clone(),
                                 selector: __raster_external_value.selector.clone(),
-                                selected: __raster_external_value.selected.clone(),
+                                selection: __raster_external_value.selected.commitment.clone(),
                             }
                         );
                         ::raster::core::trace::FnInputValue::ExternalBinding
@@ -1648,6 +1648,8 @@ fn gen_recur_driver_function(
                             ::raster::core::trace::InternalData {
                                 coordinates: __raster_internal_value.reference.coordinates.clone(),
                                 commitment: __raster_internal_value.reference.commitment.clone(),
+                                selector: __raster_internal_value.selector.clone(),
+                                selection: __raster_internal_value.selection.clone(),
                             }
                         );
                         ::raster::core::trace::FnInputValue::InternalBinding
@@ -1730,14 +1732,16 @@ fn gen_recur_driver_function(
                 let result = #run_driver;
                 drop(__raster_recur_trace_scope);
 
-                let __raster_output_bytes = ::raster::resolve_internal_value::<#result_ty>(result.reference().clone())
-                    .unwrap_or_else(|e| panic!("Failed to resolve recur output for trace: {}", e))
-                    .bytes
-                    .clone();
+                let __raster_resolved_output = ::raster::resolve_internal_value::<#result_ty>(result.reference().clone())
+                    .unwrap_or_else(|e| panic!("Failed to resolve recur output for trace: {}", e));
+                let __raster_output_bytes = __raster_resolved_output.bytes.clone();
                 let __raster_output = ::core::option::Option::Some(
                     ::raster::core::trace::FnOutput::new(
                         __raster_output_bytes,
                         stringify!(::raster::AuthRef<#result_ty>),
+                    ).with_raster(
+                        ::raster::raster_trace_payload(&__raster_resolved_output.value)
+                            .unwrap_or_else(|e| panic!("Failed to build raster recur output payload: {}", e))
                     )
                 );
                 ::raster::publish_trace_event(::raster::core::trace::TraceEvent::RecurTileExec(
@@ -2073,14 +2077,16 @@ fn gen_recur_sequence_driver_function(
 
                 let result = #run_driver;
 
-                let __raster_output_bytes = ::raster::resolve_internal_value::<#result_ty>(result.reference().clone())
-                    .unwrap_or_else(|e| panic!("Failed to resolve recur sequence output for trace: {}", e))
-                    .bytes
-                    .clone();
+                let __raster_resolved_output = ::raster::resolve_internal_value::<#result_ty>(result.reference().clone())
+                    .unwrap_or_else(|e| panic!("Failed to resolve recur sequence output for trace: {}", e));
+                let __raster_output_bytes = __raster_resolved_output.bytes.clone();
                 let __raster_output = ::core::option::Option::Some(
                     ::raster::core::trace::FnOutput::new(
                         __raster_output_bytes,
                         stringify!(::raster::AuthRef<#result_ty>),
+                    ).with_raster(
+                        ::raster::raster_trace_payload(&__raster_resolved_output.value)
+                            .unwrap_or_else(|e| panic!("Failed to build raster recur sequence output payload: {}", e))
                     )
                 );
                 ::raster::publish_trace_event(::raster::core::trace::TraceEvent::RecurSequenceExec(
@@ -2354,9 +2360,9 @@ fn gen_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream {
                                 .clone()
                                 .map(|value| value.into_bytes())
                                 .unwrap_or_default(),
-                            tree_root: __raster_external_info.selected.proof.root_hash.clone(),
+                            tree_root: __raster_external_info.selected.commitment.source_root_hash.clone(),
                             selector: __raster_external_info.selector.clone(),
-                            selected: __raster_external_info.selected.clone(),
+                            selection: __raster_external_info.selected.commitment.clone(),
                         }
                     );
                 }
@@ -2376,6 +2382,8 @@ fn gen_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream {
                         ::raster::core::trace::InternalData {
                             coordinates: __raster_internal_info.reference.coordinates.clone(),
                             commitment: __raster_internal_info.reference.commitment.clone(),
+                            selector: __raster_internal_info.selector.clone(),
+                            selection: __raster_internal_info.selection.clone(),
                         }
                     );
                 }
@@ -3202,10 +3210,13 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                     let __raster_output_record_build_start = ::raster::__private::profile_now();
                     let __raster_output = ::core::option::Option::Some(
-                        ::raster::core::trace::FnOutput {
-                            data: __raster_output_bytes,
-                            ty: ::raster::alloc::string::String::from(#output_type_expr),
-                        }
+                        ::raster::core::trace::FnOutput::new(
+                            __raster_output_bytes,
+                            ::raster::alloc::string::String::from(#output_type_expr),
+                        ).with_raster(
+                            ::raster::raster_trace_payload(&result)
+                                .unwrap_or_else(|e| panic!("Failed to build raster output payload: {}", e))
+                        )
                     );
 
                     let __raster_record = ::raster::core::trace::FnCallRecord {
@@ -3276,10 +3287,13 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
                     #native_draft_capture_finish
                     #trace_output_serialization
                     let __raster_output = ::core::option::Option::Some(
-                        ::raster::core::trace::FnOutput {
-                            data: __raster_output_bytes,
-                            ty: ::raster::alloc::string::String::from(#output_type_expr),
-                        }
+                        ::raster::core::trace::FnOutput::new(
+                            __raster_output_bytes,
+                            ::raster::alloc::string::String::from(#output_type_expr),
+                        ).with_raster(
+                            ::raster::raster_trace_payload(&result)
+                                .unwrap_or_else(|e| panic!("Failed to build raster output payload: {}", e))
+                        )
                     );
 
                     let __raster_record = ::raster::core::trace::FnCallRecord {

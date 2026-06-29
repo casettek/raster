@@ -13,8 +13,8 @@ use raster_core::draft::{replay_handle_for_schema, DraftReplayHandle, DraftRepla
 pub use raster_core::input::{
     verify_selection_proof, AuthValue, ExternalEncoding, ExternalRef, ExternalSelection,
     ExternalValue, InternalRef, InternalValue, ListProofDirection, ListProofSibling, Op, Schema,
-    SchemaField, SchemaFieldMode, SchemaNode, Selectable, SelectedPayload, SelectionProof,
-    SelectionProofStep, SelectorPath, SelectorSegment,
+    SchemaField, SchemaFieldMode, SchemaNode, Selectable, SelectedPayload, SelectionCommitment,
+    SelectionProof, SelectionProofStep, SelectionWitness, SelectorPath, SelectorSegment,
 };
 use raster_core::trace::{
     ExternalData as TraceExternalData, FnInputValue, InternalData as TraceInternalData,
@@ -974,7 +974,10 @@ where
                         .field("name", &resolved.name)
                         .field("selector", &summarize_selector_path(&resolved.selector))
                         .field("commitment_present", &resolved.commitment.is_some())
-                        .field("proof_root_len", &resolved.selected.proof.root_hash.len())
+                        .field(
+                            "selection_root_len",
+                            &resolved.selected.commitment.source_root_hash.len(),
+                        )
                         .field("selected_bytes_len", &resolved.selected.bytes.len())
                         .field("value", &resolved.value)
                         .finish(),
@@ -1121,6 +1124,14 @@ where
                     name: current_name.clone(),
                     selector: full_selector.clone(),
                     resolve: Rc::new(move |_| {
+                        if let Ok(selected) =
+                            resolve_external_value::<Selected>(ExternalSelection::with_selector(
+                                current_name.clone(),
+                                full_selector.clone(),
+                            ))
+                        {
+                            return Ok(selected);
+                        }
                         let current = resolve_current(ExternalSelection::with_selector(
                             current_name.clone(),
                             current_selector.clone(),
@@ -1140,6 +1151,11 @@ where
                 AuthRef::Internal(DeferredAuthInternal {
                     reference: reference.clone(),
                     resolve: Rc::new(move |reference| {
+                        if let Ok(selected) =
+                            select_stored_internal_value::<Selected>(&reference, &relative_selector)
+                        {
+                            return Ok(selected);
+                        }
                         let current = (resolve_current.as_ref())(reference.clone())?;
                         select_internal_value::<Current, Selected>(&current, &relative_selector)
                     }),
@@ -1180,8 +1196,28 @@ where
     raster_core::postcard::to_allocvec(&draft_trace_marker::<S>()).unwrap_or_default()
 }
 
+/// A recursive-sequence list source resolved exactly once.
+///
+/// The parent list value is cached behind an `Rc` so that counting the list
+/// and selecting each item are O(1) on the source: per-item `AuthRef`s select
+/// out of this cached value rather than re-resolving the whole parent list.
 #[doc(hidden)]
-pub fn recur_list_len<T>(source: &AuthRef<Vec<T>>) -> raster_core::Result<u64>
+enum ResolvedRecurList<T> {
+    External {
+        name: String,
+        selector: SelectorPath,
+        value: Rc<ExternalValue<Vec<T>>>,
+    },
+    Internal {
+        reference: InternalRef,
+        value: Rc<InternalValue<Vec<T>>>,
+    },
+}
+
+#[doc(hidden)]
+fn resolve_recur_list_source<T>(
+    source: &AuthRef<Vec<T>>,
+) -> raster_core::Result<ResolvedRecurList<T>>
 where
     T: DeserializeOwned + Serialize,
 {
@@ -1190,65 +1226,88 @@ where
             "call_recur! requires a selectable external or internal list source".into(),
         )),
         AuthRef::External(binding) => {
-            let current = (binding.resolve.as_ref())(ExternalSelection::with_selector(
+            let value = (binding.resolve.as_ref())(ExternalSelection::with_selector(
                 binding.name.clone(),
                 binding.selector.clone(),
             ))?;
-            Ok(current.value.len() as u64)
+            Ok(ResolvedRecurList::External {
+                name: binding.name.clone(),
+                selector: binding.selector.clone(),
+                value: Rc::new(value),
+            })
         }
         AuthRef::Internal(binding) => {
-            let current = (binding.resolve.as_ref())(binding.reference.clone())?;
-            Ok(current.value.len() as u64)
+            let value = (binding.resolve.as_ref())(binding.reference.clone())?;
+            Ok(ResolvedRecurList::Internal {
+                reference: binding.reference.clone(),
+                value: Rc::new(value),
+            })
         }
     }
 }
 
-#[doc(hidden)]
-pub fn select_recur_list_item<T>(
-    source: &AuthRef<Vec<T>>,
-    index: u64,
-) -> raster_core::Result<AuthRef<T>>
-where
-    T: DeserializeOwned + Serialize + Selectable + 'static,
-{
-    let relative_selector = selector_path(Vec::from([SelectorSegment::Index(index)]));
-
-    match source {
-        AuthRef::Inline(_) => Err(raster_core::Error::Other(
-            "call_recur! requires a selectable external or internal list source".into(),
-        )),
-        AuthRef::External(binding) => {
-            let current_name = binding.name.clone();
-            let current_selector = binding.selector.clone();
-            let full_selector =
-                compose_selector_paths(current_selector.clone(), relative_selector.clone());
-            let resolve_current = binding.resolve.clone();
-
-            Ok(AuthRef::External(DeferredAuthExternal {
-                name: current_name.clone(),
-                selector: full_selector.clone(),
-                resolve: Rc::new(move |_| {
-                    let current = resolve_current(ExternalSelection::with_selector(
-                        current_name.clone(),
-                        current_selector.clone(),
-                    ))?;
-                    select_external_value::<Vec<T>, T>(&current, &relative_selector, &full_selector)
-                }),
-            }))
+impl<T> ResolvedRecurList<T> {
+    fn len(&self) -> u64 {
+        match self {
+            ResolvedRecurList::External { value, .. } => value.value.len() as u64,
+            ResolvedRecurList::Internal { value, .. } => value.value.len() as u64,
         }
-        AuthRef::Internal(binding) => {
-            let reference = binding.reference.clone();
-            let resolve_current = binding.resolve.clone();
-            let relative_selector = relative_selector.clone();
+    }
 
-            Ok(AuthRef::Internal(DeferredAuthInternal {
-                reference: reference.clone(),
-                resolve: Rc::new(move |reference| {
-                    let current = (resolve_current.as_ref())(reference.clone())?;
-                    select_internal_value::<Vec<T>, T>(&current, &relative_selector)
-                }),
-                marker: PhantomData,
-            }))
+    fn select_item(&self, index: u64) -> raster_core::Result<AuthRef<T>>
+    where
+        T: DeserializeOwned + Serialize + Selectable + 'static,
+    {
+        let relative_selector = selector_path(Vec::from([SelectorSegment::Index(index)]));
+
+        match self {
+            ResolvedRecurList::External {
+                name,
+                selector,
+                value,
+            } => {
+                let full_selector =
+                    compose_selector_paths(selector.clone(), relative_selector.clone());
+                let parent = value.clone();
+                let external_name = name.clone();
+
+                Ok(AuthRef::External(DeferredAuthExternal {
+                    name: external_name.clone(),
+                    selector: full_selector.clone(),
+                    resolve: Rc::new(move |_| {
+                        if let Ok(selected) =
+                            resolve_external_value::<T>(ExternalSelection::with_selector(
+                                external_name.clone(),
+                                full_selector.clone(),
+                            ))
+                        {
+                            return Ok(selected);
+                        }
+                        select_external_value::<Vec<T>, T>(
+                            parent.as_ref(),
+                            &relative_selector,
+                            &full_selector,
+                        )
+                    }),
+                }))
+            }
+            ResolvedRecurList::Internal { reference, value } => {
+                let parent = value.clone();
+                let item_selector = relative_selector.clone();
+
+                Ok(AuthRef::Internal(DeferredAuthInternal {
+                    reference: reference.clone(),
+                    resolve: Rc::new(move |_| {
+                        if let Ok(selected) =
+                            select_stored_internal_value::<T>(&parent.reference, &item_selector)
+                        {
+                            return Ok(selected);
+                        }
+                        select_internal_value::<Vec<T>, T>(parent.as_ref(), &relative_selector)
+                    }),
+                    marker: PhantomData,
+                }))
+            }
         }
     }
 }
@@ -1513,9 +1572,9 @@ where
                         .commitment
                         .map(|value| value.into_bytes())
                         .unwrap_or_default(),
-                    tree_root: resolved.selected.proof.root_hash.clone(),
+                    tree_root: resolved.selected.commitment.source_root_hash.clone(),
                     selector: resolved.selector,
-                    selected: resolved.selected,
+                    selection: resolved.selected.commitment,
                 }),
                 internal: None,
             })
@@ -1528,6 +1587,8 @@ where
                 internal: Some(TraceInternalData {
                     coordinates: resolved.reference.coordinates,
                     commitment: resolved.reference.commitment,
+                    selector: resolved.selector,
+                    selection: resolved.selection,
                 }),
             })
         }
@@ -1544,6 +1605,44 @@ where
         Ok(value) => Ok(Ok(auth_ref_trace(value)?)),
         Err(error) => Ok(Err(error.clone())),
     }
+}
+
+#[cfg(feature = "std")]
+pub fn raster_trace_payload<T: Serialize>(
+    value: &T,
+) -> raster_core::Result<raster_core::trace::RasterPayload> {
+    let (bytes, index_bytes, commitment) = raster_runtime::encode_raster_value(value)?;
+    let mut root_hash = Vec::with_capacity(commitment.len() / 2);
+    let chars: Vec<char> = commitment.chars().collect();
+    for pair in chars.chunks(2) {
+        if pair.len() != 2 {
+            return Err(raster_core::Error::Serialization(
+                "Malformed raster commitment hex".into(),
+            ));
+        }
+        let hi = pair[0].to_digit(16).ok_or_else(|| {
+            raster_core::Error::Serialization("Malformed raster commitment hex".into())
+        })?;
+        let lo = pair[1].to_digit(16).ok_or_else(|| {
+            raster_core::Error::Serialization("Malformed raster commitment hex".into())
+        })?;
+        root_hash.push(((hi << 4) | lo) as u8);
+    }
+
+    Ok(raster_core::trace::RasterPayload {
+        bytes,
+        index_bytes,
+        root_hash,
+    })
+}
+
+#[cfg(not(feature = "std"))]
+pub fn raster_trace_payload<T: Serialize>(
+    _value: &T,
+) -> raster_core::Result<raster_core::trace::RasterPayload> {
+    Err(raster_core::Error::Other(
+        "Raster trace payload generation requires the `std` feature".into(),
+    ))
 }
 
 pub fn select_external_value<Root, T>(
@@ -1590,6 +1689,28 @@ where
         let _ = selector;
         Err(raster_core::Error::Other(format!(
             "Internal selection refinement requires the `std` feature"
+        )))
+    }
+}
+
+pub fn select_stored_internal_value<T>(
+    reference: &InternalRef,
+    selector: &SelectorPath,
+) -> raster_core::Result<InternalValue<T>>
+where
+    T: DeserializeOwned + Serialize,
+{
+    #[cfg(feature = "std")]
+    {
+        return raster_runtime::select_stored_internal_value::<T>(reference, selector);
+    }
+
+    #[cfg(not(feature = "std"))]
+    {
+        let _ = reference;
+        let _ = selector;
+        Err(raster_core::Error::Other(alloc::format!(
+            "Internal raster selection requires the `std` feature"
         )))
     }
 }
@@ -1904,19 +2025,20 @@ where
 {
     #[cfg(feature = "std")]
     {
-        let len = recur_list_len(&source).unwrap_or_else(|error| {
+        let resolved = resolve_recur_list_source(&source).unwrap_or_else(|error| {
             panic!(
-                "Failed to resolve recursive sequence list length: {}",
+                "Failed to resolve recursive sequence list source: {}",
                 error
             )
         });
+        let len = resolved.len();
         if len == 0 {
             return finalize_recur_output(output, true);
         }
 
         let mut output = output;
         for index in 0..len {
-            let item = select_recur_list_item(&source, index).unwrap_or_else(|error| {
+            let item = resolved.select_item(index).unwrap_or_else(|error| {
                 panic!("Failed to select recursive sequence list item: {}", error)
             });
             let input = RecurSequenceInput::__raster_from_auth_ref(item, index, len);
@@ -1952,16 +2074,17 @@ where
 {
     #[cfg(feature = "std")]
     {
-        let len = recur_list_len(&source).unwrap_or_else(|error| {
+        let resolved = resolve_recur_list_source(&source).unwrap_or_else(|error| {
             panic!(
-                "Failed to resolve recursive sequence list length: {}",
+                "Failed to resolve recursive sequence list source: {}",
                 error
             )
         });
+        let len = resolved.len();
         let mut state = state;
 
         for index in 0..len {
-            let item = select_recur_list_item(&source, index).unwrap_or_else(|error| {
+            let item = resolved.select_item(index).unwrap_or_else(|error| {
                 panic!("Failed to select recursive sequence list item: {}", error)
             });
             let input = RecurSequenceInput::__raster_from_auth_ref(item, index, len);
@@ -1999,12 +2122,13 @@ where
 {
     #[cfg(feature = "std")]
     {
-        let len = recur_list_len(&source).unwrap_or_else(|error| {
+        let resolved = resolve_recur_list_source(&source).unwrap_or_else(|error| {
             panic!(
-                "Failed to resolve recursive sequence list length: {}",
+                "Failed to resolve recursive sequence list source: {}",
                 error
             )
         });
+        let len = resolved.len();
         if len == 0 {
             let _ = state;
             return finalize_recur_output(output, true);
@@ -2013,7 +2137,7 @@ where
         let mut state = state;
         let mut output = output;
         for index in 0..len {
-            let item = select_recur_list_item(&source, index).unwrap_or_else(|error| {
+            let item = resolved.select_item(index).unwrap_or_else(|error| {
                 panic!("Failed to select recursive sequence list item: {}", error)
             });
             let input = RecurSequenceInput::__raster_from_auth_ref(item, index, len);

@@ -6,12 +6,14 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::string::String;
 use std::vec::Vec;
 
 use crate::authorization::AuthorizationJournal;
 use crate::cfs::CfsCoordinates;
 use crate::draft::{DraftId, DraftTransitionWitness, TileReplayJournal, TrackedDraftState};
 use crate::fingerprint::{Fingerprint, FingerprintAccumulator};
+use crate::input::SelectionWitness;
 use crate::trace::{ExternalInput, FnInput, StepRecord};
 
 /// Serializable representation of a Merkle frontier (position, leaf, ommers).
@@ -112,6 +114,8 @@ pub struct TransitionInput {
     pub input_source_witness: Option<FnInput>,
     pub sequence_scope_witness: Option<FnInput>,
     pub external_input: ExternalInput,
+    pub external_selection_witnesses: BTreeMap<String, SelectionWitness>,
+    pub internal_selection_witnesses: BTreeMap<String, SelectionWitness>,
     pub internal_store_witness: Option<InternalStoreWitness>,
     pub draft_transition_witness: Option<DraftTransitionWitness>,
 

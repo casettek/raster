@@ -5,7 +5,11 @@ use raster_core::draft::{
     schema_hash as compute_schema_hash, DraftFieldValue, DraftOp, DraftReplayTransition,
     DraftStateWitness, DraftTransitionWitness,
 };
-use raster_core::input::{InternalRef, InternalValue, Schema, SchemaFieldMode, SchemaNode};
+use raster_core::input::{
+    InternalRef, InternalValue, Schema, SchemaFieldMode, SchemaNode, SelectionCommitment,
+    SelectionWitness, SelectorPath,
+};
+use raster_core::trace::RasterPayload;
 use raster_core::transition::{InternalStoreEntry, InternalStoreIndexValue, SerializableFrontier};
 use raster_core::{Error, Result};
 use raster_prover::precomputed::EMPTY_TRIE_NODES;
@@ -19,7 +23,12 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::vec::Vec;
 
-use crate::input::{typed_value_from_tree, TreeValue};
+use crate::input::{
+    encode_raster_value, selected_payload_from_raster_selection,
+    selection_witness_from_raster_selection, tree_value_from_raster_selection,
+    typed_value_from_tree, TreeValue,
+};
+use crate::raster_index::RasterIndex;
 use crate::Sha256Commitment;
 
 type Anchor = [u8; 32];
@@ -46,6 +55,7 @@ pub struct StoredInternalObject {
     pub reference: InternalRef,
     pub log_position: u64,
     pub bytes: Vec<u8>,
+    pub raster: Option<RasterPayload>,
 }
 
 #[derive(Debug, Clone)]
@@ -78,6 +88,33 @@ fn frontier_root(frontier: &TraceTreeFrontier) -> Vec<u8> {
         .root(0)
         .expect("internal store root should exist")
         .0
+}
+
+fn decode_hex_bytes(input: &str) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(input.len() / 2);
+    let chars: Vec<char> = input.chars().collect();
+    for pair in chars.chunks(2) {
+        if pair.len() != 2 {
+            return Err(Error::Serialization("Malformed raster root hex".into()));
+        }
+        let hi = pair[0]
+            .to_digit(16)
+            .ok_or_else(|| Error::Serialization("Malformed raster root hex".into()))?;
+        let lo = pair[1]
+            .to_digit(16)
+            .ok_or_else(|| Error::Serialization("Malformed raster root hex".into()))?;
+        out.push(((hi << 4) | lo) as u8);
+    }
+    Ok(out)
+}
+
+fn raster_payload_for_value<T: Serialize>(value: &T) -> Result<RasterPayload> {
+    let (bytes, index_bytes, root_hex) = encode_raster_value(value)?;
+    Ok(RasterPayload {
+        bytes,
+        index_bytes,
+        root_hash: decode_hex_bytes(&root_hex)?,
+    })
 }
 
 fn anchor_for_schema(coordinates: &CfsCoordinates, schema_hash: [u8; 32]) -> Anchor {
@@ -248,6 +285,7 @@ impl InternalStorageManager {
         &mut self,
         bytes: &[u8],
         coordinates: CfsCoordinates,
+        raster: Option<RasterPayload>,
     ) -> InternalWriteRecord {
         assert!(
             !self.coordinate_index.contains_key(&coordinates),
@@ -281,6 +319,7 @@ impl InternalStorageManager {
                 reference,
                 log_position,
                 bytes: bytes.to_vec(),
+                raster,
             },
         );
 
@@ -324,9 +363,86 @@ impl InternalStorageManager {
                 reference.coordinates, e
             ))
         })?;
-        Ok(InternalValue::new(
+        let selection = stored
+            .raster
+            .as_ref()
+            .map(|raster| SelectionCommitment {
+                path: SelectorPath::default(),
+                source_root_hash: raster.root_hash.clone(),
+                selected_hash: raster_core::input::selection_payload_hash(&raster.bytes),
+                selected_len: raster.bytes.len() as u64,
+            })
+            .unwrap_or_default();
+        Ok(InternalValue::new_with_selection(
             reference.clone(),
             stored.bytes.clone(),
+            SelectorPath::default(),
+            selection,
+            value,
+        ))
+    }
+
+    pub fn selection_witness(
+        &self,
+        reference: &InternalRef,
+        selector: &SelectorPath,
+    ) -> Result<SelectionWitness> {
+        let stored = self.objects.get(&reference.coordinates).ok_or_else(|| {
+            Error::Other(format!(
+                "Missing internal store object at coordinates {:?}",
+                reference.coordinates
+            ))
+        })?;
+        if stored.reference.commitment != reference.commitment {
+            return Err(Error::Other(format!(
+                "Internal store commitment mismatch at coordinates {:?}",
+                reference.coordinates
+            )));
+        }
+        let raster = stored.raster.as_ref().ok_or_else(|| {
+            Error::Other(format!(
+                "Internal store object at coordinates {:?} is missing raster selection metadata",
+                reference.coordinates
+            ))
+        })?;
+        let index = RasterIndex::from_bytes(&raster.index_bytes)?;
+        let selection = index.select(selector)?;
+        selection_witness_from_raster_selection(&raster.bytes, selector, selection)
+    }
+
+    pub fn select<T: DeserializeOwned>(
+        &self,
+        reference: &InternalRef,
+        selector: &SelectorPath,
+    ) -> Result<InternalValue<T>> {
+        let stored = self.objects.get(&reference.coordinates).ok_or_else(|| {
+            Error::Other(format!(
+                "Missing internal store object at coordinates {:?}",
+                reference.coordinates
+            ))
+        })?;
+        if stored.reference.commitment != reference.commitment {
+            return Err(Error::Other(format!(
+                "Internal store commitment mismatch at coordinates {:?}",
+                reference.coordinates
+            )));
+        }
+        let raster = stored.raster.as_ref().ok_or_else(|| {
+            Error::Other(format!(
+                "Internal store object at coordinates {:?} is missing raster selection metadata",
+                reference.coordinates
+            ))
+        })?;
+        let index = RasterIndex::from_bytes(&raster.index_bytes)?;
+        let selection = index.select(selector)?;
+        let tree = tree_value_from_raster_selection(&index, &raster.bytes, &selection)?;
+        let selected = selected_payload_from_raster_selection(&raster.bytes, selector, selection)?;
+        let value = typed_value_from_tree(&tree)?;
+        Ok(InternalValue::new_with_selection(
+            reference.clone(),
+            selected.bytes,
+            selector.clone(),
+            selected.commitment,
             value,
         ))
     }
@@ -742,10 +858,13 @@ fn store_internal_value_at_coordinates<T: Serialize>(
             error
         ))
     })?;
+    let raster_payload = Some(raster_payload_for_value(value)?);
     THREAD_INTERNAL_STORAGE.with(|storage| {
-        let write = storage
-            .borrow_mut()
-            .append_serialized_bytes(&bytes, coordinates.clone());
+        let write = storage.borrow_mut().append_serialized_bytes(
+            &bytes,
+            coordinates.clone(),
+            raster_payload,
+        );
         Ok(InternalRef::new(coordinates, write.entry.object_commitment))
     })
 }
@@ -875,6 +994,13 @@ pub fn resolve_internal_value<T: DeserializeOwned>(
     THREAD_INTERNAL_STORAGE.with(|storage| storage.borrow().resolve(reference))
 }
 
+pub fn select_stored_internal_value<T: DeserializeOwned>(
+    reference: &InternalRef,
+    selector: &SelectorPath,
+) -> Result<InternalValue<T>> {
+    THREAD_INTERNAL_STORAGE.with(|storage| storage.borrow().select(reference, selector))
+}
+
 pub fn resolve_internal_ok_value<T: DeserializeOwned>(
     reference: &InternalRef,
 ) -> Result<InternalValue<T>> {
@@ -883,10 +1009,14 @@ pub fn resolve_internal_ok_value<T: DeserializeOwned>(
     let InternalValue {
         reference,
         bytes,
+        selector,
+        selection,
         value,
     } = resolved;
     match value {
-        Ok(value) => Ok(InternalValue::new(reference, bytes, value)),
+        Ok(value) => Ok(InternalValue::new_with_selection(
+            reference, bytes, selector, selection, value,
+        )),
         Err(error) => Err(Error::Other(format!(
             "Stored tile result at coordinates {:?} resolved to error: {}",
             reference.coordinates, error
@@ -941,8 +1071,8 @@ mod tests {
         let mut manager = InternalStorageManager::new();
         let coordinates = CfsCoordinates(vec![1, 2, 3]);
 
-        manager.append_serialized_bytes(b"first", coordinates.clone());
-        manager.append_serialized_bytes(b"second", coordinates);
+        manager.append_serialized_bytes(b"first", coordinates.clone(), None);
+        manager.append_serialized_bytes(b"second", coordinates, None);
     }
 
     #[test]

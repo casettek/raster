@@ -24,7 +24,7 @@ use raster_core::draft::{
     DraftTransitionWitness, TileReplayJournal, TrackedDraftState,
 };
 use raster_core::fingerprint::{Fingerprint, FingerprintAccumulator};
-use raster_core::input::verify_selection_proof;
+use raster_core::input::verify_selection_witness;
 use raster_core::trace::{ExternalData, ExternalInput, FnInput, FnInputValue, InternalData, StepRecord};
 use raster_core::transition::{
     InternalStoreEntry, InternalStoreLogWitness, InternalStoreReadWitness, InternalStoreWitness,
@@ -487,6 +487,7 @@ fn verify_io_witness(
 fn verify_external_inputs(
     step: &StepRecord,
     external_input: &ExternalInput,
+    external_selection_witnesses: &BTreeMap<String, raster_core::input::SelectionWitness>,
     external_inputs_commitments: &BTreeMap<String, Vec<u8>>,
 ) {
     let computed_commitment = external_input_commitment(external_input);
@@ -503,7 +504,7 @@ fn verify_external_inputs(
         );
     }
 
-    for meta in external_input.values() {
+    for (binding_name, meta) in external_input {
         let authorized_commitment =
             external_inputs_commitments
                 .get(&meta.name)
@@ -519,19 +520,22 @@ fn verify_external_inputs(
             meta.name,
         );
         assert_eq!(
-            meta.tree_root, meta.selected.proof.root_hash,
-            "External input '{}' tree root does not match selection proof root",
+            meta.tree_root, meta.selection.source_root_hash,
+            "External input '{}' tree root does not match selection commitment root",
             meta.name,
         );
-        if !meta.selector.is_empty() || !meta.selected.bytes.is_empty() {
+        if !meta.selector.is_empty() || meta.selection.selected_len > 0 {
+            let witness = external_selection_witnesses
+                .get(binding_name.as_str())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "Missing external selection witness for binding '{}'",
+                        binding_name
+                    )
+                });
             assert!(
-                !meta.selected.bytes.is_empty(),
-                "External input '{}' selector is missing selected payload bytes",
-                meta.name,
-            );
-            assert!(
-                verify_selection_proof(&meta.selected.bytes, &meta.selected.proof),
-                "External input '{}' selection proof is invalid",
+                verify_selection_witness(&meta.selection, witness),
+                "External input '{}' selection witness is invalid",
                 meta.name,
             );
         }
@@ -561,6 +565,7 @@ fn verify_step_record(
     input_source_witness: Option<&FnInput>,
 
     external_inputs: &ExternalInput,
+    external_selection_witnesses: &BTreeMap<String, raster_core::input::SelectionWitness>,
     external_inputs_commitments: &BTreeMap<String, Vec<u8>>,
 ) {
     verify_io_witness(step_record, input_witness_bytes, output_witness_bytes);
@@ -578,7 +583,12 @@ fn verify_step_record(
             "SequenceEnd must not carry input source witness",
         );
     }
-    verify_external_inputs(step_record, external_inputs, external_inputs_commitments);
+    verify_external_inputs(
+        step_record,
+        external_inputs,
+        external_selection_witnesses,
+        external_inputs_commitments,
+    );
 
     if step_record.requires_replay_proof() {
         let replay_image_id =
@@ -603,6 +613,7 @@ fn verify_step_record(
 fn verify_internal_store_transition(
     step_record: &StepRecord,
     input_source_witness: Option<&FnInput>,
+    internal_selection_witnesses: &BTreeMap<String, raster_core::input::SelectionWitness>,
     output_witness_bytes: Option<&Vec<u8>>,
     internal_store_witness: Option<&InternalStoreWitness>,
     current_frontier: &mut NonEmptyFrontier<Bytes>,
@@ -626,7 +637,7 @@ fn verify_internal_store_transition(
         );
 
         if let Some(input_source_witness) = input_source_witness {
-            for internal_meta in input_source_witness.internal().values() {
+            for (binding_name, internal_meta) in input_source_witness.internal() {
                 let read_witness = internal_store_witness
                     .and_then(|witness| {
                         witness.reads.iter().find(|read| {
@@ -647,6 +658,21 @@ fn verify_internal_store_transition(
                     &internal_meta.coordinates,
                     &internal_meta.commitment,
                 );
+                if internal_meta.selection.selected_len > 0 {
+                    let witness = internal_selection_witnesses
+                        .get(binding_name.as_str())
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "Missing internal selection witness for binding '{}'",
+                                binding_name
+                            )
+                        });
+                    assert!(
+                        verify_selection_witness(&internal_meta.selection, witness),
+                        "Internal input '{}' selection witness is invalid",
+                        binding_name,
+                    );
+                }
             }
         }
 
@@ -884,6 +910,7 @@ fn main() {
                 input.output_witness.as_ref(),
                 input.input_source_witness.as_ref(),
                 &input.external_input,
+                &input.external_selection_witnesses,
                 &input.authorization_journal.external_inputs_commitments,
             );
             let (
@@ -893,6 +920,7 @@ fn main() {
             ) = verify_internal_store_transition(
                 &input.step_record,
                 input.input_source_witness.as_ref(),
+                &input.internal_selection_witnesses,
                 input.output_witness.as_ref(),
                 input.internal_store_witness.as_ref(),
                 &mut init_internal_store_frontier,
@@ -990,6 +1018,7 @@ fn main() {
                 input.output_witness.as_ref(),
                 input.input_source_witness.as_ref(),
                 &input.external_input,
+                &input.external_selection_witnesses,
                 &input.authorization_journal.external_inputs_commitments,
             );
             let (
@@ -999,6 +1028,7 @@ fn main() {
             ) = verify_internal_store_transition(
                 &input.step_record,
                 input.input_source_witness.as_ref(),
+                &input.internal_selection_witnesses,
                 input.output_witness.as_ref(),
                 input.internal_store_witness.as_ref(),
                 &mut current_internal_store_frontier,
@@ -1153,8 +1183,9 @@ mod tests {
                 commitment: commitment.to_vec(),
                 tree_root: Vec::new(),
                 selector: Default::default(),
-                selected: raster_core::input::SelectedPayload {
-                    bytes: selected_bytes.to_vec(),
+                selection: raster_core::input::SelectionCommitment {
+                    selected_hash: sha(selected_bytes),
+                    selected_len: selected_bytes.len() as u64,
                     ..Default::default()
                 },
             },
@@ -1186,6 +1217,8 @@ mod tests {
                 InternalData {
                     coordinates,
                     commitment,
+                    selector: Default::default(),
+                    selection: Default::default(),
                 },
             )]
             .into_iter()
@@ -1252,6 +1285,7 @@ mod tests {
         verify_external_inputs(
             &step,
             &ext,
+            &BTreeMap::new(),
             &AuthorizationJournal {
                 external_inputs_commitments: BTreeMap::new(),
                 manifest_commitment: vec![0; 32],
@@ -1330,6 +1364,7 @@ mod tests {
         verify_external_inputs(
             &start,
             &ext,
+            &BTreeMap::new(),
             &AuthorizationJournal {
                 external_inputs_commitments: BTreeMap::new(),
                 manifest_commitment: vec![0; 32],
@@ -1339,6 +1374,7 @@ mod tests {
         verify_external_inputs(
             &end,
             &ExternalInput::new(),
+            &BTreeMap::new(),
             &AuthorizationJournal {
                 external_inputs_commitments: BTreeMap::new(),
                 manifest_commitment: vec![0; 32],
@@ -1368,7 +1404,12 @@ mod tests {
 
         let authorization =
             authorization_journal("personal_data", sha256_hex(b"payload").as_slice());
-        verify_external_inputs(&step, &ext, &authorization.external_inputs_commitments);
+        verify_external_inputs(
+            &step,
+            &ext,
+            &BTreeMap::new(),
+            &authorization.external_inputs_commitments,
+        );
     }
 
     #[test]
@@ -1394,6 +1435,7 @@ mod tests {
         verify_external_inputs(
             &step,
             &ext,
+            &BTreeMap::new(),
             &AuthorizationJournal {
                 external_inputs_commitments: BTreeMap::new(),
                 manifest_commitment: vec![0; 32],
@@ -1425,7 +1467,12 @@ mod tests {
         });
 
         let authorization = authorization_journal("personal_data", b"wrong");
-        verify_external_inputs(&step, &ext, &authorization.external_inputs_commitments);
+        verify_external_inputs(
+            &step,
+            &ext,
+            &BTreeMap::new(),
+            &authorization.external_inputs_commitments,
+        );
     }
 
     fn empty_internal_store_frontier_for_test() -> NonEmptyFrontier<Bytes> {
@@ -1584,6 +1631,7 @@ mod tests {
         let (_next_frontier, next_root, next_index_root) = verify_internal_store_transition(
             &step,
             None,
+            &BTreeMap::new(),
             Some(&b"out".to_vec()),
             Some(&witness),
             &mut before_frontier,
@@ -1635,6 +1683,7 @@ mod tests {
         let _ = verify_internal_store_transition(
             &step,
             None,
+            &BTreeMap::new(),
             Some(&b"out".to_vec()),
             Some(&witness),
             &mut before_frontier,
@@ -1677,6 +1726,7 @@ mod tests {
         let _ = verify_internal_store_transition(
             &step,
             Some(&input_source_witness),
+            &BTreeMap::new(),
             Some(&b"out".to_vec()),
             Some(&witness),
             &mut before_frontier,
@@ -1719,6 +1769,7 @@ mod tests {
         let _ = verify_internal_store_transition(
             &step,
             None,
+            &BTreeMap::new(),
             Some(&b"out".to_vec()),
             Some(&witness),
             &mut stale_frontier,
@@ -1755,6 +1806,7 @@ mod tests {
         let _ = verify_internal_store_transition(
             &step,
             None,
+            &BTreeMap::new(),
             Some(&b"out".to_vec()),
             Some(&witness),
             &mut before_frontier,
@@ -1798,6 +1850,7 @@ mod tests {
         let (_next_frontier, next_root, next_index_root) = verify_internal_store_transition(
             &step,
             Some(&input_source_witness),
+            &BTreeMap::new(),
             Some(&b"next".to_vec()),
             Some(&witness),
             &mut before_frontier,

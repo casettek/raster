@@ -1,7 +1,7 @@
 use raster_core::input::{
-    ExternalSelection, ExternalValue, InternalValue, ListProofDirection, ListProofSibling,
-    SchemaNode, Selectable, SelectedPayload, SelectionProof, SelectionProofStep, SelectorPath,
-    SelectorSegment,
+    selection_payload_hash, ExternalSelection, ExternalValue, InternalValue, ListProofDirection,
+    ListProofSibling, SchemaNode, Selectable, SelectedPayload, SelectionCommitment, SelectionProof,
+    SelectionProofStep, SelectionWitness, SelectorPath, SelectorSegment,
 };
 use raster_core::{Error, Result as CoreResult};
 use serde::de::{
@@ -1022,7 +1022,7 @@ fn parse_leaf_value(type_name: &str, subtree_bytes: &[u8]) -> CoreResult<TreeVal
     }
 }
 
-fn tree_value_from_raster_selection(
+pub(crate) fn tree_value_from_raster_selection(
     index: &RasterIndex,
     data_bytes: &[u8],
     selection: &RasterSelection,
@@ -1094,7 +1094,7 @@ fn tree_value_from_raster_node(
     }
 }
 
-fn raster_subtree_bytes(data_bytes: &[u8], offset: u64, len: u64) -> CoreResult<&[u8]> {
+pub(crate) fn raster_subtree_bytes(data_bytes: &[u8], offset: u64, len: u64) -> CoreResult<&[u8]> {
     let start = usize::try_from(offset)
         .map_err(|_| Error::Serialization("Raster subtree offset does not fit in usize".into()))?;
     let len = usize::try_from(len)
@@ -1571,28 +1571,44 @@ fn selected_payload_from_proven(
     selector: &SelectorPath,
     proven: ProvenSelection,
 ) -> SelectedPayload {
+    let selected_hash = selection_payload_hash(&proven.selected_bytes);
+    let selected_len = proven.selected_bytes.len() as u64;
     SelectedPayload {
         bytes: proven.selected_bytes,
-        proof: SelectionProof {
+        commitment: SelectionCommitment {
             path: selector.clone(),
-            root_hash: proven.root_hash,
-            steps: proven.steps,
+            source_root_hash: proven.root_hash,
+            selected_hash,
+            selected_len,
         },
     }
 }
 
-fn selected_payload_from_raster(
-    resolved: &ResolvedExternalData,
+pub(crate) fn selected_payload_from_raster_selection(
+    data_bytes: &[u8],
     selector: &SelectorPath,
+    selection: RasterSelection,
 ) -> CoreResult<SelectedPayload> {
-    let index = resolved
-        .raster_index()
-        .ok_or_else(|| Error::Serialization("Expected raster index metadata".into()))?;
-    let selection = index.select(selector)?;
-    let data_bytes = resolved
-        .raster_bytes()
-        .ok_or_else(|| Error::Serialization("Expected raster data bytes".into()))?;
+    let bytes = raster_subtree_bytes(data_bytes, selection.offset, selection.len)?.to_vec();
+    let selected_hash = selection_payload_hash(&bytes);
+    let selected_len = bytes.len() as u64;
     Ok(SelectedPayload {
+        bytes,
+        commitment: SelectionCommitment {
+            path: selector.clone(),
+            source_root_hash: selection.root_hash,
+            selected_hash,
+            selected_len,
+        },
+    })
+}
+
+pub(crate) fn selection_witness_from_raster_selection(
+    data_bytes: &[u8],
+    selector: &SelectorPath,
+    selection: RasterSelection,
+) -> CoreResult<SelectionWitness> {
+    Ok(SelectionWitness {
         bytes: raster_subtree_bytes(data_bytes, selection.offset, selection.len)?.to_vec(),
         proof: SelectionProof {
             path: selector.clone(),
@@ -1614,7 +1630,7 @@ fn raster_typed_value_from_selection<T: DeserializeOwned>(
         .raster_bytes()
         .ok_or_else(|| Error::Serialization("Expected raster data bytes".into()))?;
     let tree = tree_value_from_raster_selection(index, data_bytes, &selection)?;
-    let selected = selected_payload_from_raster(resolved, selector)?;
+    let selected = selected_payload_from_raster_selection(data_bytes, selector, selection)?;
     let value = typed_value_from_tree(&tree).map_err(|e| {
         Error::Serialization(format!(
             "Failed to deserialize selected raster external input from selection tree: {}",
@@ -1622,6 +1638,27 @@ fn raster_typed_value_from_selection<T: DeserializeOwned>(
         ))
     })?;
     Ok((selected, value))
+}
+
+pub fn external_selection_witness(
+    name: &str,
+    selector: &SelectorPath,
+) -> CoreResult<SelectionWitness> {
+    let storage = load_external_storage()?.ok_or_else(|| {
+        Error::Other(
+            "External selection witness generation requires CLI input context from --input and --input-manifest"
+                .into(),
+        )
+    })?;
+    let resolved = storage.resolve(name)?;
+    let index = resolved
+        .raster_index()
+        .ok_or_else(|| Error::Serialization("Expected raster index metadata".into()))?;
+    let selection = index.select(selector)?;
+    let data_bytes = resolved
+        .raster_bytes()
+        .ok_or_else(|| Error::Serialization("Expected raster data bytes".into()))?;
+    selection_witness_from_raster_selection(data_bytes, selector, selection)
 }
 
 fn dynamic_selected_payload<T: Serialize>(
@@ -1671,6 +1708,12 @@ fn external_value_from_parts<T>(
     )
 }
 
+fn extend_selector_path(prefix: &SelectorPath, suffix: &SelectorPath) -> SelectorPath {
+    let mut segments = prefix.segments.clone();
+    segments.extend(suffix.segments.clone());
+    SelectorPath::new(segments)
+}
+
 pub fn select_external_arg<Root, T>(
     value: &ExternalValue<Root>,
     selector: &SelectorPath,
@@ -1687,14 +1730,15 @@ where
             value.name, e
         ))
     })?;
-    let mut steps = value.selected.proof.steps.clone();
-    steps.extend(proven.steps);
+    let selected_hash = selection_payload_hash(&proven.selected_bytes);
+    let selected_len = proven.selected_bytes.len() as u64;
     let selected = SelectedPayload {
         bytes: proven.selected_bytes,
-        proof: SelectionProof {
+        commitment: SelectionCommitment {
             path: full_selector.clone(),
-            root_hash: value.selected.proof.root_hash.clone(),
-            steps,
+            source_root_hash: value.selected.commitment.source_root_hash.clone(),
+            selected_hash,
+            selected_len,
         },
     };
     Ok(ExternalValue::new(
@@ -1721,9 +1765,19 @@ where
             e
         ))
     })?;
-    Ok(InternalValue::new(
+    let full_selector = extend_selector_path(&value.selector, selector);
+    let selected_hash = selection_payload_hash(&proven.selected_bytes);
+    let selected_len = proven.selected_bytes.len() as u64;
+    Ok(InternalValue::new_with_selection(
         value.reference.clone(),
         proven.selected_bytes,
+        full_selector.clone(),
+        SelectionCommitment {
+            path: full_selector,
+            source_root_hash: value.selection.source_root_hash.clone(),
+            selected_hash,
+            selected_len,
+        },
         typed_selected,
     ))
 }
@@ -2305,7 +2359,6 @@ mod tests {
         assert_eq!(resolved.commitment(), hash);
         assert_eq!(value, 123);
         assert_eq!(selected.bytes, leaf_payload(&123u64.to_le_bytes()));
-        assert!(verify_selection_proof(&selected.bytes, &selected.proof));
 
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -2315,8 +2368,7 @@ mod tests {
         let selected = dynamic_selected_payload("seed", &123u64, &SelectorPath::default()).unwrap();
 
         assert_eq!(selected.bytes, leaf_payload(&123u64.to_le_bytes()));
-        assert!(selected.proof.path.is_empty());
-        assert!(verify_selection_proof(&selected.bytes, &selected.proof));
+        assert!(selected.commitment.path.is_empty());
     }
 
     #[test]
@@ -2364,7 +2416,7 @@ mod tests {
         ]);
         let proven = typed_proven_selection(&root, &selector).unwrap();
 
-        let selected = SelectedPayload {
+        let witness = SelectionWitness {
             bytes: proven.selected_bytes.clone(),
             proof: SelectionProof {
                 path: selector,
@@ -2377,7 +2429,7 @@ mod tests {
             typed_value_from_tree::<String>(&proven.selected_value).unwrap(),
             "Flat B"
         );
-        assert!(verify_selection_proof(&selected.bytes, &selected.proof));
+        assert!(verify_selection_proof(&witness.bytes, &witness.proof));
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -2397,8 +2449,7 @@ mod tests {
             typed_proven_selection(&root, &SelectorPath::default()).unwrap(),
         );
 
-        assert!(selected.proof.path.is_empty());
-        assert!(verify_selection_proof(&selected.bytes, &selected.proof));
+        assert!(selected.commitment.path.is_empty());
     }
 
     #[test]
@@ -2435,9 +2486,19 @@ mod tests {
         let resolved = storage.resolve("personal_data").unwrap();
         let (selected, typed_selected): (SelectedPayload, String) =
             raster_typed_value_from_selection(&resolved, &selector).unwrap();
+        let index = resolved.raster_index().unwrap();
+        let witness = selection_witness_from_raster_selection(
+            resolved.raster_bytes().unwrap(),
+            &selector,
+            index.select(&selector).unwrap(),
+        )
+        .unwrap();
 
         assert_eq!(typed_selected, "Flat B");
-        assert!(verify_selection_proof(&selected.bytes, &selected.proof));
+        assert!(raster_core::input::verify_selection_witness(
+            &selected.commitment,
+            &witness
+        ));
 
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -2476,9 +2537,19 @@ mod tests {
         ]);
         let (selected, typed_selected): (SelectedPayload, u32) =
             raster_typed_value_from_selection(&resolved, &selector).unwrap();
+        let index = resolved.raster_index().unwrap();
+        let witness = selection_witness_from_raster_selection(
+            resolved.raster_bytes().unwrap(),
+            &selector,
+            index.select(&selector).unwrap(),
+        )
+        .unwrap();
 
         assert_eq!(typed_selected, 42);
-        assert!(verify_selection_proof(&selected.bytes, &selected.proof));
+        assert!(raster_core::input::verify_selection_witness(
+            &selected.commitment,
+            &witness
+        ));
 
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -2500,8 +2571,19 @@ mod tests {
         let selection = index.root_selection().unwrap();
         let tree = tree_value_from_raster_selection(&index, &data_bytes, &selection).unwrap();
         let decoded: ComplexSerdeValue = typed_value_from_tree(&tree).unwrap();
-        let selected = SelectedPayload {
-            bytes: data_bytes,
+        let selected_hash = raster_core::input::selection_payload_hash(&data_bytes);
+        let selected_len = data_bytes.len() as u64;
+        let selected = SelectedPayload::new(
+            data_bytes,
+            SelectionCommitment {
+                path: SelectorPath::default(),
+                source_root_hash: selection.root_hash.clone(),
+                selected_hash,
+                selected_len,
+            },
+        );
+        let witness = SelectionWitness {
+            bytes: selected.bytes.clone(),
             proof: SelectionProof {
                 path: SelectorPath::default(),
                 root_hash: selection.root_hash,
@@ -2510,6 +2592,6 @@ mod tests {
         };
 
         assert_eq!(decoded, value);
-        assert!(verify_selection_proof(&selected.bytes, &selected.proof));
+        assert!(verify_selection_proof(&witness.bytes, &witness.proof));
     }
 }

@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::cfs::CfsCoordinates;
 use crate::draft::DraftTransitionWitness;
 use crate::fingerprint::Fingerprint;
-use crate::input::{SelectedPayload, SelectorPath};
+use crate::input::{SelectionCommitment, SelectorPath};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct FnInputArg {
@@ -40,13 +40,15 @@ pub struct ExternalData {
     pub commitment: Vec<u8>,
     pub tree_root: Vec<u8>,
     pub selector: SelectorPath,
-    pub selected: SelectedPayload,
+    pub selection: SelectionCommitment,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct InternalData {
     pub coordinates: CfsCoordinates,
     pub commitment: Vec<u8>,
+    pub selector: SelectorPath,
+    pub selection: SelectionCommitment,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -88,9 +90,17 @@ impl FnInput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct RasterPayload {
+    pub bytes: Vec<u8>,
+    pub index_bytes: Vec<u8>,
+    pub root_hash: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct FnOutput {
     pub data: Vec<u8>,
     pub ty: String,
+    pub raster: Option<RasterPayload>,
 }
 
 impl FnOutput {
@@ -98,7 +108,13 @@ impl FnOutput {
         Self {
             data,
             ty: ty.into(),
+            raster: None,
         }
+    }
+
+    pub fn with_raster(mut self, raster: RasterPayload) -> Self {
+        self.raster = Some(raster);
+        self
     }
 
     pub fn data(&self) -> &[u8] {

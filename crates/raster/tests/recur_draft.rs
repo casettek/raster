@@ -76,6 +76,14 @@ struct UnitLineBundle {
     items: Vec<String>,
 }
 
+// Output schema with no required scalar fields, so a recur sequence can
+// finalize without the step body writing anything (used by the resolve-count
+// guard, where the step only materializes items).
+#[derive(Clone, Debug, Deserialize, Serialize, Selectable)]
+struct ItemsOnlyBundle {
+    items: Vec<String>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, Selectable)]
 struct LimitedBundle {
     limit: u64,
@@ -576,6 +584,37 @@ fn call_recur_resolves_internal_list_once_per_invocation() {
 
     assert_eq!(result.title, "collected");
     assert_eq!(result.items.len(), 3);
+    assert_eq!(RECUR_RESOLVE_COUNT.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn recur_sequence_resolves_internal_list_once_per_invocation() {
+    let _guard = raster::__private::SequenceScopeGuard::enter("recur_sequence_single_list_resolve");
+    let reference = raster::store_internal_value(&vec![
+        "first".to_string(),
+        "second".to_string(),
+        "third".to_string(),
+    ])
+    .expect("list source should store");
+    let source = into_auth_ref::<Vec<String>, _>(
+        raster::typed_internal_with_resolver::<Vec<String>>(reference, resolve_counted_string_list),
+    );
+
+    RECUR_RESOLVE_COUNT.store(0, Ordering::SeqCst);
+    // Materialize every item the way the trace pipeline does. With a per-item
+    // re-resolve this would be O(n) source resolutions (plus the length probe);
+    // the cached parent keeps it to a single resolve for the whole sequence.
+    let _auth = raster::run_recur_sequence_list::<String, ItemsOnlyBundle, _, _>(
+        source,
+        new!(ItemsOnlyBundle),
+        |input, output| {
+            input
+                .__raster_auth_trace()
+                .expect("sequence item should resolve");
+            output
+        },
+    );
+
     assert_eq!(RECUR_RESOLVE_COUNT.load(Ordering::SeqCst), 1);
 }
 
