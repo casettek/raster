@@ -1581,7 +1581,7 @@ where
                         .commitment
                         .map(|value| value.into_bytes())
                         .unwrap_or_default(),
-                    tree_root: resolved.selected.commitment.source_root_hash.clone(),
+                    tree_root: resolved.selected.commitment.source_root_hash.to_vec(),
                     selector: resolved.selector,
                     selection: resolved.selected.commitment,
                 }),
@@ -1637,6 +1637,10 @@ pub fn raster_trace_payload<T: Serialize>(
         })?;
         root_hash.push(((hi << 4) | lo) as u8);
     }
+
+    let root_hash = root_hash.try_into().map_err(|_| {
+        raster_core::Error::Serialization("Malformed raster commitment hash length".into())
+    })?;
 
     Ok(raster_core::trace::RasterPayload {
         bytes,

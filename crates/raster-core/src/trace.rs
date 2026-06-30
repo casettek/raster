@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::cfs::CfsCoordinates;
 use crate::draft::DraftTransitionWitness;
 use crate::fingerprint::Fingerprint;
-use crate::input::{SelectionCommitment, SelectorPath};
+use crate::input::{Hash32, SelectionCommitment, SelectorPath};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct FnInputArg {
@@ -93,7 +93,7 @@ impl FnInput {
 pub struct RasterPayload {
     pub bytes: Vec<u8>,
     pub index_bytes: Vec<u8>,
-    pub root_hash: Vec<u8>,
+    pub root_hash: Hash32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]

@@ -1,5 +1,5 @@
 use raster_core::input::{
-    ListProofDirection, ListProofSibling, SelectionProofStep, SelectorPath, SelectorSegment,
+    Hash32, ListProofDirection, ListProofSibling, SelectionProofStep, SelectorPath, SelectorSegment,
 };
 use raster_core::{Error, Result};
 use serde::{Deserialize, Serialize};
@@ -14,7 +14,7 @@ const RINDEX_VERSION: u32 = 1;
 pub(crate) struct RasterIndex {
     pub version: u32,
     pub root_node: u64,
-    pub root_commitment: Vec<u8>,
+    pub root_commitment: Hash32,
     pub nodes: Vec<RasterNode>,
 }
 
@@ -22,7 +22,7 @@ pub(crate) struct RasterIndex {
 pub(crate) struct RasterNode {
     pub offset: u64,
     pub len: u64,
-    pub root_hash: Vec<u8>,
+    pub root_hash: Hash32,
     pub kind: RasterNodeKind,
 }
 
@@ -74,7 +74,7 @@ pub(crate) struct RasterMapEntry {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct RasterMerkleLevel {
-    pub hashes: Vec<Vec<u8>>,
+    pub hashes: Vec<Hash32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,7 +82,7 @@ pub(crate) struct RasterSelectionLocation {
     pub node_id: u64,
     pub offset: u64,
     pub len: u64,
-    pub root_hash: Vec<u8>,
+    pub root_hash: Hash32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,13 +90,13 @@ pub(crate) struct RasterSelection {
     pub node_id: u64,
     pub offset: u64,
     pub len: u64,
-    pub root_hash: Vec<u8>,
+    pub root_hash: Hash32,
     pub steps: Vec<SelectionProofStep>,
 }
 
 impl RasterIndex {
     #[allow(dead_code)]
-    pub(crate) fn new(root_node: u64, root_commitment: Vec<u8>, nodes: Vec<RasterNode>) -> Self {
+    pub(crate) fn new(root_node: u64, root_commitment: Hash32, nodes: Vec<RasterNode>) -> Self {
         Self {
             version: RINDEX_VERSION,
             root_node,
@@ -108,7 +108,7 @@ impl RasterIndex {
     pub(crate) fn from_bytes(bytes: &[u8]) -> Result<Self> {
         if bytes.len() < RINDEX_MAGIC.len() || &bytes[..RINDEX_MAGIC.len()] != RINDEX_MAGIC {
             return Err(Error::Serialization(
-                "Failed to parse raster index: missing rindex01 header".into(),
+                "Failed to parse raster index: missing rindex02 header".into(),
             ));
         }
 
@@ -240,7 +240,7 @@ impl RasterIndex {
                     let mut siblings = Vec::with_capacity(fields.len().saturating_sub(1));
                     for (idx, field) in fields.iter().enumerate() {
                         if idx != target_index {
-                            siblings.push(self.node(field.child)?.root_hash.clone());
+                            siblings.push(self.node(field.child)?.root_hash);
                         }
                     }
                     steps.push(SelectionProofStep::Struct {

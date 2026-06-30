@@ -108,18 +108,25 @@ fn decode_hex_bytes(input: &str) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+fn decode_hex_hash(input: &str) -> Result<[u8; 32]> {
+    let bytes = decode_hex_bytes(input)?;
+    bytes
+        .try_into()
+        .map_err(|_| Error::Serialization("Malformed raster root hash length".into()))
+}
+
 fn raster_payload_for_value<T: Serialize>(value: &T) -> Result<RasterPayload> {
     let (bytes, index_bytes, root_hex) = encode_raster_value(value)?;
     Ok(RasterPayload {
         bytes,
         index_bytes,
-        root_hash: decode_hex_bytes(&root_hex)?,
+        root_hash: decode_hex_hash(&root_hex)?,
     })
 }
 
 fn internal_object_commitment(bytes: &[u8], raster: Option<&RasterPayload>) -> Vec<u8> {
     raster
-        .map(|payload| payload.root_hash.clone())
+        .map(|payload| payload.root_hash.to_vec())
         .unwrap_or_else(|| Sha256Commitment::from(bytes).into())
 }
 
@@ -390,8 +397,8 @@ impl InternalStorageManager {
                 stored.bytes.clone(),
                 SelectionCommitment {
                     path: SelectorPath::default(),
-                    source_root_hash: Vec::new(),
-                    selected_hash: Vec::new(),
+                    source_root_hash: [0; 32],
+                    selected_hash: [0; 32],
                     selected_len: 0,
                 },
                 value,
@@ -465,7 +472,7 @@ impl InternalStorageManager {
         let selection = index.locate(selector)?;
         let tree = tree_value_from_raster_location(&index, &raster.bytes, &selection)?;
         let selected = selected_payload_from_raster_location(&raster.bytes, selector, selection)?;
-        if selected.commitment.source_root_hash != reference.commitment {
+        if selected.commitment.source_root_hash.to_vec() != reference.commitment {
             return Err(Error::Other(format!(
                 "Internal selection root mismatch at coordinates {:?}",
                 reference.coordinates

@@ -1,7 +1,8 @@
 use raster_core::input::{
-    selection_payload_hash, ExternalSelection, ExternalValue, InternalValue, ListProofDirection,
-    ListProofSibling, SchemaNode, Selectable, SelectedPayload, SelectionCommitment, SelectionProof,
-    SelectionProofStep, SelectionWitness, SelectorPath, SelectorSegment,
+    selection_payload_hash, ExternalSelection, ExternalValue, Hash32, InternalValue,
+    ListProofDirection, ListProofSibling, SchemaNode, Selectable, SelectedPayload,
+    SelectionCommitment, SelectionProof, SelectionProofStep, SelectionWitness, SelectorPath,
+    SelectorSegment,
 };
 use raster_core::trace::ExternalData as TraceExternalData;
 use raster_core::{Error, Result as CoreResult};
@@ -1158,12 +1159,12 @@ fn read_fixed_i64(bytes: &[u8], type_name: &str) -> CoreResult<i64> {
     Ok(i64::from_le_bytes(array))
 }
 
-fn selection_hash(parts: &[&[u8]]) -> Vec<u8> {
+fn selection_hash(parts: &[&[u8]]) -> Hash32 {
     let mut hasher = Sha256::new();
     for part in parts {
         hasher.update(part);
     }
-    hasher.finalize().to_vec()
+    hasher.finalize().into()
 }
 
 fn push_u64(out: &mut Vec<u8>, value: u64) {
@@ -1210,7 +1211,7 @@ fn encode_leaf_bytes(value: &TreeValue) -> CoreResult<Vec<u8>> {
     Ok(out)
 }
 
-pub(crate) fn subtree_payload_and_root(value: &TreeValue) -> CoreResult<(Vec<u8>, Vec<u8>)> {
+pub(crate) fn subtree_payload_and_root(value: &TreeValue) -> CoreResult<(Vec<u8>, Hash32)> {
     match value {
         TreeValue::Unit => Ok((vec![0x03], selection_hash(&[b"unit"]))),
         TreeValue::Struct(fields) => {
@@ -1356,7 +1357,7 @@ pub(crate) fn subtree_payload_and_root(value: &TreeValue) -> CoreResult<(Vec<u8>
     }
 }
 
-fn list_root_from_hashes(hashes: &[Vec<u8>]) -> Vec<u8> {
+fn list_root_from_hashes(hashes: &[Hash32]) -> Hash32 {
     let len = hashes.len() as u64;
     if hashes.is_empty() {
         return selection_hash(&[b"list-root", &len.to_le_bytes(), b"empty"]);
@@ -1384,9 +1385,9 @@ fn list_root_from_hashes(hashes: &[Vec<u8>]) -> Vec<u8> {
 }
 
 fn list_root_and_proof(
-    hashes: &[Vec<u8>],
+    hashes: &[Hash32],
     index: usize,
-) -> CoreResult<(Vec<u8>, Vec<ListProofSibling>)> {
+) -> CoreResult<(Hash32, Vec<ListProofSibling>)> {
     if index >= hashes.len() {
         return Err(Error::Other(format!(
             "Selector index '{}' was not found in external input",
@@ -1418,7 +1419,7 @@ fn list_root_and_proof(
             } else {
                 ListProofDirection::Left
             },
-            hash: level[sibling_index].clone(),
+            hash: level[sibling_index],
         });
 
         let mut next = Vec::with_capacity(level.len() / 2);
@@ -1449,7 +1450,7 @@ fn find_struct_field<'a>(entries: &'a [(String, TreeValue)], name: &str) -> Opti
 struct ProvenSelection {
     selected_value: TreeValue,
     selected_bytes: Vec<u8>,
-    root_hash: Vec<u8>,
+    root_hash: Hash32,
     steps: Vec<SelectionProofStep>,
 }
 
@@ -1503,7 +1504,7 @@ fn prove_selection(
                             ))
                         })?;
                     let (_, sibling_root) = subtree_payload_and_root(sibling_value)?;
-                    siblings.push(sibling_root.clone());
+                    siblings.push(sibling_root);
                     child_roots.push(sibling_root);
                 }
             }
@@ -1714,7 +1715,7 @@ fn trace_raster_external_binding_from_storage(
     Ok(Some(TraceExternalData {
         name: name.into(),
         commitment: resolved.commitment().as_bytes().to_vec(),
-        tree_root: selected.commitment.source_root_hash.clone(),
+        tree_root: selected.commitment.source_root_hash.to_vec(),
         selector: selector.clone(),
         selection: selected.commitment,
     }))
@@ -1878,7 +1879,7 @@ fn hex_string(bytes: &[u8]) -> String {
     out
 }
 
-fn merkle_levels_from_hashes(hashes: &[Vec<u8>]) -> Vec<crate::raster_index::RasterMerkleLevel> {
+fn merkle_levels_from_hashes(hashes: &[Hash32]) -> Vec<crate::raster_index::RasterMerkleLevel> {
     use crate::raster_index::RasterMerkleLevel;
 
     if hashes.is_empty() {
@@ -1915,7 +1916,7 @@ fn build_raster_index_node(
     nodes: &mut Vec<crate::raster_index::RasterNode>,
     value: &TreeValue,
     offset: u64,
-) -> CoreResult<(u64, Vec<u8>)> {
+) -> CoreResult<(u64, Hash32)> {
     use crate::raster_index::{RasterMapEntry, RasterNode, RasterNodeKind, RasterStructField};
 
     let (payload, root_hash) = subtree_payload_and_root(value)?;
@@ -2293,7 +2294,7 @@ mod tests {
         out
     }
 
-    fn merkle_levels_from_hashes(hashes: &[Vec<u8>]) -> Vec<RasterMerkleLevel> {
+    fn merkle_levels_from_hashes(hashes: &[Hash32]) -> Vec<RasterMerkleLevel> {
         if hashes.is_empty() {
             return Vec::new();
         }
@@ -2329,7 +2330,7 @@ mod tests {
         value: &TreeValue,
         schema: &SchemaNode,
         offset: u64,
-    ) -> (u64, Vec<u8>) {
+    ) -> (u64, Hash32) {
         let (payload, root_hash) = subtree_payload_and_root(value).unwrap();
         let node_id = nodes.len() as u64;
         nodes.push(RasterNode {
@@ -2490,7 +2491,7 @@ mod tests {
             bytes: proven.selected_bytes.clone(),
             proof: SelectionProof {
                 path: selector,
-                root_hash: proven.root_hash.clone(),
+                root_hash: proven.root_hash,
                 steps: proven.steps.clone(),
             },
         };
@@ -2744,7 +2745,7 @@ mod tests {
             data_bytes,
             SelectionCommitment {
                 path: SelectorPath::default(),
-                source_root_hash: selection.root_hash.clone(),
+                source_root_hash: selection.root_hash,
                 selected_hash,
                 selected_len,
             },

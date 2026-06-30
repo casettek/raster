@@ -1635,7 +1635,7 @@ fn gen_recur_driver_function(
                                     .clone()
                                     .map(|value| value.into_bytes())
                                     .unwrap_or_default(),
-                                tree_root: __raster_external_value.selected.commitment.source_root_hash.clone(),
+                                tree_root: __raster_external_value.selected.commitment.source_root_hash.to_vec(),
                                 selector: __raster_external_value.selector.clone(),
                                 selection: __raster_external_value.selected.commitment.clone(),
                             }
@@ -2360,7 +2360,7 @@ fn gen_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream {
                                 .clone()
                                 .map(|value| value.into_bytes())
                                 .unwrap_or_default(),
-                            tree_root: __raster_external_info.selected.commitment.source_root_hash.clone(),
+                            tree_root: __raster_external_info.selected.commitment.source_root_hash.to_vec(),
                             selector: __raster_external_info.selector.clone(),
                             selection: __raster_external_info.selected.commitment.clone(),
                         }

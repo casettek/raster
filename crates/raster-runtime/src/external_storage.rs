@@ -497,12 +497,12 @@ mod tests {
         (input_path, manifest_path)
     }
 
-    fn selection_hash(parts: &[&[u8]]) -> Vec<u8> {
+    fn selection_hash(parts: &[&[u8]]) -> [u8; 32] {
         let mut hasher = Sha256::new();
         for part in parts {
             hasher.update(part);
         }
-        hasher.finalize().to_vec()
+        hasher.finalize().into()
     }
 
     fn hex_string(bytes: &[u8]) -> String {

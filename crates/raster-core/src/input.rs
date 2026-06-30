@@ -11,6 +11,8 @@ use crate::cfs::CfsCoordinates;
 #[cfg(feature = "std")]
 use std::collections::BTreeMap;
 
+pub type Hash32 = [u8; 32];
+
 /// A lightweight reference to a named external input.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct ExternalRef {
@@ -157,7 +159,7 @@ pub enum ListProofDirection {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct ListProofSibling {
     pub direction: ListProofDirection,
-    pub hash: Vec<u8>,
+    pub hash: Hash32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -165,7 +167,7 @@ pub enum SelectionProofStep {
     Struct {
         field_index: u64,
         field_count: u64,
-        siblings: Vec<Vec<u8>>,
+        siblings: Vec<Hash32>,
     },
     List {
         index: u64,
@@ -177,15 +179,15 @@ pub enum SelectionProofStep {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct SelectionProof {
     pub path: SelectorPath,
-    pub root_hash: Vec<u8>,
+    pub root_hash: Hash32,
     pub steps: Vec<SelectionProofStep>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct SelectionCommitment {
     pub path: SelectorPath,
-    pub source_root_hash: Vec<u8>,
-    pub selected_hash: Vec<u8>,
+    pub source_root_hash: Hash32,
+    pub selected_hash: Hash32,
     pub selected_len: u64,
 }
 
@@ -207,12 +209,12 @@ impl SelectedPayload {
     }
 }
 
-fn selection_hash(parts: &[&[u8]]) -> Vec<u8> {
+fn selection_hash(parts: &[&[u8]]) -> Hash32 {
     let mut hasher = Sha256::new();
     for part in parts {
         hasher.update(part);
     }
-    hasher.finalize().to_vec()
+    hasher.finalize().into()
 }
 
 fn parse_u64(bytes: &[u8], offset: &mut usize) -> Option<u64> {
@@ -231,7 +233,7 @@ fn parse_utf8(bytes: &[u8], offset: &mut usize) -> Option<Vec<u8>> {
     Some(slice.to_vec())
 }
 
-fn list_root_from_hashes(hashes: &[Vec<u8>], len: u64) -> Vec<u8> {
+fn list_root_from_hashes(hashes: &[Hash32], len: u64) -> Hash32 {
     if hashes.is_empty() {
         return selection_hash(&[b"list-root", &len.to_le_bytes(), b"empty"]);
     }
@@ -257,7 +259,7 @@ fn list_root_from_hashes(hashes: &[Vec<u8>], len: u64) -> Vec<u8> {
     selection_hash(&[b"list-root", &len.to_le_bytes(), level[0].as_slice()])
 }
 
-fn parse_subtree_root(bytes: &[u8], offset: &mut usize) -> Option<Vec<u8>> {
+fn parse_subtree_root(bytes: &[u8], offset: &mut usize) -> Option<Hash32> {
     let kind = *bytes.get(*offset)?;
     *offset += 1;
 
@@ -497,8 +499,8 @@ pub fn verify_selection_proof(selected_bytes: &[u8], proof: &SelectionProof) -> 
     current_hash == proof.root_hash
 }
 
-pub fn selection_payload_hash(selected_bytes: &[u8]) -> Vec<u8> {
-    Sha256::digest(selected_bytes).to_vec()
+pub fn selection_payload_hash(selected_bytes: &[u8]) -> Hash32 {
+    Sha256::digest(selected_bytes).into()
 }
 
 pub fn verify_selection_witness(
@@ -1005,8 +1007,8 @@ mod tests {
             bytes: alloc::vec![1, 2, 3],
             commitment: SelectionCommitment {
                 path: SelectorPath::default(),
-                source_root_hash: alloc::vec![4, 5, 6],
-                selected_hash: alloc::vec![7, 8, 9],
+                source_root_hash: [4; 32],
+                selected_hash: [7; 32],
                 selected_len: 3,
             },
         };

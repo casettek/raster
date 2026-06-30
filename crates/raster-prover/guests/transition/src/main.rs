@@ -1181,7 +1181,7 @@ mod tests {
                 tree_root: Vec::new(),
                 selector: Default::default(),
                 selection: raster_core::input::SelectionCommitment {
-                    selected_hash: sha(selected_bytes),
+                    selected_hash: raster_core::input::selection_payload_hash(selected_bytes),
                     selected_len: selected_bytes.len() as u64,
                     ..Default::default()
                 },

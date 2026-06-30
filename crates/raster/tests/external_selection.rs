@@ -217,7 +217,7 @@ fn nested_auth_ref_selection_matches_direct_external_selection_trace() {
             line: "Main Street".to_string(),
         },
     };
-    let root_hash = vec![1, 2, 3, 4];
+    let root_hash = [1; 32];
     let whole = ExternalValue::new(
         "personal_data",
         SelectorPath::default(),
@@ -226,8 +226,8 @@ fn nested_auth_ref_selection_matches_direct_external_selection_trace() {
             bytes: postcard::to_allocvec(&personal).unwrap(),
             commitment: SelectionCommitment {
                 path: SelectorPath::default(),
-                source_root_hash: root_hash.clone(),
-                selected_hash: Vec::new(),
+                source_root_hash: root_hash,
+                selected_hash: [0; 32],
                 selected_len: 0,
             },
         },
