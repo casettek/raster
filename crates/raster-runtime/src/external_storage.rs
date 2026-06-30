@@ -11,7 +11,7 @@ use std::format;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::string::String;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::vec::Vec;
 
 use crate::raster_index::RasterIndex;
@@ -180,6 +180,8 @@ pub(crate) struct ExternalStorageManager {
     cache: Arc<Mutex<HashMap<SourceKey, ResolvedExternalData>>>,
 }
 
+static CLI_EXTERNAL_STORAGE: OnceLock<Option<ExternalStorageManager>> = OnceLock::new();
+
 impl ExternalStorageManager {
     pub(crate) fn from_input_args(
         raw_input: Option<&str>,
@@ -211,6 +213,16 @@ impl ExternalStorageManager {
             raw_input.as_deref(),
             raw_manifest.as_deref(),
         )?))
+    }
+
+    pub(crate) fn cached_from_cli_args() -> Result<Option<Self>> {
+        if let Some(storage) = CLI_EXTERNAL_STORAGE.get() {
+            return Ok(storage.clone());
+        }
+
+        let storage = Self::from_cli_args()?;
+        let _ = CLI_EXTERNAL_STORAGE.set(storage);
+        Ok(CLI_EXTERNAL_STORAGE.get().cloned().unwrap_or(None))
     }
 
     pub(crate) fn resolve(&self, name: &str) -> Result<ResolvedExternalData> {
@@ -250,6 +262,13 @@ impl ExternalStorageManager {
                 )
             }
         }
+    }
+
+    pub(crate) fn is_raster_encoded(&self, name: &str) -> Result<bool> {
+        Ok(matches!(
+            self.read_manifest_entry(name)?.encoding(),
+            ExternalEncoding::Raster
+        ))
     }
 
     fn read_input_entry(&self, name: &str) -> Result<&InputDocumentEntry> {
@@ -444,7 +463,10 @@ fn normalize_hash(hash: &str) -> String {
 mod tests {
     use super::*;
     use crate::raster_index::{RasterIndex, RasterNode, RasterNodeKind};
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    };
     use std::time::{SystemTime, UNIX_EPOCH};
 
     static UNIQUE_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -654,6 +676,63 @@ mod tests {
         assert_eq!(resolved.bytes(), payload.as_slice());
         assert_eq!(resolved.commitment(), hex_string(&root_hash));
         assert!(matches!(resolved, ResolvedExternalData::Raster { .. }));
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn cloned_managers_share_cached_raster_indexes() {
+        let dir = unique_dir();
+        fs::create_dir_all(&dir).unwrap();
+
+        let payload = leaf_payload_u64(123);
+        let root_hash = selection_hash(&[b"leaf", &123u64.to_le_bytes()]);
+        let index = RasterIndex::new(
+            0,
+            root_hash.clone(),
+            vec![RasterNode {
+                offset: 0,
+                len: payload.len() as u64,
+                root_hash: root_hash.clone(),
+                kind: RasterNodeKind::Leaf {
+                    type_name: "u64".into(),
+                },
+            }],
+        );
+        let data_path = dir.join("payload.rastered");
+        let index_path = dir.join("payload.rindex");
+        fs::write(&data_path, &payload).unwrap();
+        fs::write(&index_path, index.encode().unwrap()).unwrap();
+
+        let (input_path, manifest_path) = write_external_documents(
+            &dir,
+            r#"{"payload_cached":{"path":"payload.rastered","index_path":"payload.rindex","load_preference":"mmap"}}"#,
+            &format!(
+                r#"{{"payload_cached":{{"type":"sha256","encoding":"raster","commitment":"{}"}}}}"#,
+                hex_string(&root_hash)
+            ),
+        );
+        let manager =
+            ExternalStorageManager::from_input_args(input_path.to_str(), manifest_path.to_str())
+                .unwrap();
+
+        let first = manager.resolve("payload_cached").unwrap();
+        fs::write(&index_path, b"not a raster index").unwrap();
+        let second = manager.clone().resolve("payload_cached").unwrap();
+
+        match (&first, &second) {
+            (
+                ResolvedExternalData::Raster {
+                    index: first_index, ..
+                },
+                ResolvedExternalData::Raster {
+                    index: second_index,
+                    ..
+                },
+            ) => assert!(Arc::ptr_eq(first_index, second_index)),
+            _ => panic!("expected cached raster data"),
+        }
+        assert_eq!(second.bytes(), payload.as_slice());
 
         fs::remove_dir_all(&dir).unwrap();
     }

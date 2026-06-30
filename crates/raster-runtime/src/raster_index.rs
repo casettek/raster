@@ -178,10 +178,7 @@ impl RasterIndex {
                         })?;
                     current_id = target.child;
                 }
-                (
-                    SelectorSegment::Index(index),
-                    RasterNodeKind::List { len, elements, .. },
-                ) => {
+                (SelectorSegment::Index(index), RasterNodeKind::List { len, elements, .. }) => {
                     if *index >= *len {
                         return Err(Error::Other(format!(
                             "Selector index '{}' was not found in raster index",

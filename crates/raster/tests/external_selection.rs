@@ -1,7 +1,7 @@
 use raster::core::trace::TraceEvent;
-use raster::SelectionCommitment;
 use raster::prelude::*;
 use raster::selector_path;
+use raster::SelectionCommitment;
 use raster_core::postcard;
 use raster_runtime::{init_with, Publisher};
 use serde::{Deserialize, Serialize};

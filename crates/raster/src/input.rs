@@ -1560,6 +1560,15 @@ where
             internal: None,
         }),
         AuthRef::External(binding) => {
+            if let Some(external) = trace_raster_external_binding(&binding.name, &binding.selector)?
+            {
+                return Ok(AuthRefTrace {
+                    value: FnInputValue::ExternalBinding,
+                    external: Some(external),
+                    internal: None,
+                });
+            }
+
             let resolved = (binding.resolve.as_ref())(ExternalSelection::with_selector(
                 binding.name.clone(),
                 binding.selector.clone(),
@@ -1750,6 +1759,23 @@ where
         Err(raster_core::Error::Other(alloc::format!(
             "Typed external resolution requires the `std` feature"
         )))
+    }
+}
+
+pub fn trace_raster_external_binding(
+    name: &str,
+    selector: &SelectorPath,
+) -> raster_core::Result<Option<TraceExternalData>> {
+    #[cfg(feature = "std")]
+    {
+        return raster_runtime::trace_raster_external_binding(name, selector);
+    }
+
+    #[cfg(not(feature = "std"))]
+    {
+        let _ = name;
+        let _ = selector;
+        Ok(None)
     }
 }
 

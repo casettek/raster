@@ -408,13 +408,16 @@ impl TraceRecorder {
                         parent_current_index,
                         SequenceChildId::RecurSequence(fn_call_record.fn_name.clone()),
                     );
-                    self.active_recur_sequence.insert(recur_key.clone(), RecurExecutionState {
-                        site_id: fn_call_record.fn_name.clone(),
-                        sequence_coordinates: parent_sequence_coordinates.clone(),
-                        site_coordinates,
-                        intra_sequence_index: parent_current_index,
-                        next_iteration_index: 0,
-                    });
+                    self.active_recur_sequence.insert(
+                        recur_key.clone(),
+                        RecurExecutionState {
+                            site_id: fn_call_record.fn_name.clone(),
+                            sequence_coordinates: parent_sequence_coordinates.clone(),
+                            site_coordinates,
+                            intra_sequence_index: parent_current_index,
+                            next_iteration_index: 0,
+                        },
+                    );
                 }
                 let recur_state = self
                     .active_recur_sequence
@@ -799,24 +802,24 @@ impl TraceRecorder {
                 let sequence_id = current_sequence_state.id.clone();
                 let parent_current_index = current_sequence_state.current_index;
 
-                let recur_key = (
-                    sequence_coordinates.clone(),
-                    fn_call_record.fn_name.clone(),
-                );
-                let recur_state = self.active_recur_sequence.remove(&recur_key).unwrap_or_else(|| {
-                    let site_coordinates = self.cfs_cursor.get_child_coordinates(
-                        &sequence_coordinates,
-                        parent_current_index,
-                        SequenceChildId::RecurSequence(fn_call_record.fn_name.clone()),
-                    );
-                    RecurExecutionState {
-                        site_id: fn_call_record.fn_name.clone(),
-                        sequence_coordinates: sequence_coordinates.clone(),
-                        site_coordinates,
-                        intra_sequence_index: parent_current_index,
-                        next_iteration_index: 0,
-                    }
-                });
+                let recur_key = (sequence_coordinates.clone(), fn_call_record.fn_name.clone());
+                let recur_state = self
+                    .active_recur_sequence
+                    .remove(&recur_key)
+                    .unwrap_or_else(|| {
+                        let site_coordinates = self.cfs_cursor.get_child_coordinates(
+                            &sequence_coordinates,
+                            parent_current_index,
+                            SequenceChildId::RecurSequence(fn_call_record.fn_name.clone()),
+                        );
+                        RecurExecutionState {
+                            site_id: fn_call_record.fn_name.clone(),
+                            sequence_coordinates: sequence_coordinates.clone(),
+                            site_coordinates,
+                            intra_sequence_index: parent_current_index,
+                            next_iteration_index: 0,
+                        }
+                    });
 
                 assert_eq!(
                     recur_state.sequence_coordinates, sequence_coordinates,

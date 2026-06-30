@@ -3,6 +3,7 @@ use raster_core::input::{
     ListProofSibling, SchemaNode, Selectable, SelectedPayload, SelectionCommitment, SelectionProof,
     SelectionProofStep, SelectionWitness, SelectorPath, SelectorSegment,
 };
+use raster_core::trace::ExternalData as TraceExternalData;
 use raster_core::{Error, Result as CoreResult};
 use serde::de::{
     self, DeserializeOwned, DeserializeSeed, IntoDeserializer, MapAccess, SeqAccess, Visitor,
@@ -24,7 +25,7 @@ use crate::external_storage::{ExternalStorageManager, ResolvedExternalData};
 use crate::raster_index::{RasterIndex, RasterNodeKind, RasterSelection, RasterSelectionLocation};
 
 fn load_external_storage() -> CoreResult<Option<ExternalStorageManager>> {
-    ExternalStorageManager::from_cli_args()
+    ExternalStorageManager::cached_from_cli_args()
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1688,6 +1689,48 @@ pub fn external_selection_witness(
     selection_witness_from_raster_selection(data_bytes, selector, selection)
 }
 
+fn trace_raster_external_binding_from_storage(
+    storage: &ExternalStorageManager,
+    name: &str,
+    selector: &SelectorPath,
+) -> CoreResult<Option<TraceExternalData>> {
+    if !storage.is_raster_encoded(name)? {
+        return Ok(None);
+    }
+
+    let resolved = storage.resolve(name)?;
+    let ResolvedExternalData::Raster { .. } = &resolved else {
+        return Ok(None);
+    };
+    let index = resolved
+        .raster_index()
+        .ok_or_else(|| Error::Serialization("Expected raster index metadata".into()))?;
+    let selection = index.locate(selector)?;
+    let data_bytes = resolved
+        .raster_bytes()
+        .ok_or_else(|| Error::Serialization("Expected raster data bytes".into()))?;
+    let selected = selected_payload_from_raster_location(data_bytes, selector, selection)?;
+
+    Ok(Some(TraceExternalData {
+        name: name.into(),
+        commitment: resolved.commitment().as_bytes().to_vec(),
+        tree_root: selected.commitment.source_root_hash.clone(),
+        selector: selector.clone(),
+        selection: selected.commitment,
+    }))
+}
+
+pub fn trace_raster_external_binding(
+    name: &str,
+    selector: &SelectorPath,
+) -> CoreResult<Option<TraceExternalData>> {
+    let Some(storage) = load_external_storage()? else {
+        return Ok(None);
+    };
+
+    trace_raster_external_binding_from_storage(&storage, name, selector)
+}
+
 fn dynamic_selected_payload<T: Serialize>(
     name: &str,
     value: &T,
@@ -2526,6 +2569,103 @@ mod tests {
             &selected.commitment,
             &witness
         ));
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn raster_trace_external_binding_matches_resolved_metadata() {
+        let dir = unique_dir();
+        fs::create_dir_all(&dir).unwrap();
+
+        let data = PersonalData {
+            age: 25,
+            name: "John".to_string(),
+            addresses: vec![Address {
+                lines: vec!["221B Baker Street".to_string(), "Flat B".to_string()],
+                indexes: vec![7, 42],
+            }],
+        };
+        let (payload, index_bytes, root_commitment) =
+            raster_fixture_for_value(&data, PersonalData::schema());
+        fs::write(dir.join("personal_data.rastered"), &payload).unwrap();
+        fs::write(dir.join("personal_data.rindex"), &index_bytes).unwrap();
+        let (input_path, manifest_path) = write_external_documents(
+            &dir,
+            &root_commitment,
+            r#"{"personal_data":{"path":"personal_data.rastered","index_path":"personal_data.rindex","load_preference":"read"}}"#,
+            r#"{"personal_data":{"type":"sha256","encoding":"raster","commitment":"{hash}"}}"#,
+        );
+
+        let selector = SelectorPath::new(vec![
+            SelectorSegment::from("addresses"),
+            SelectorSegment::from(0usize),
+            SelectorSegment::from("lines"),
+            SelectorSegment::from(1usize),
+        ]);
+        let storage = storage_manager(&input_path, &manifest_path);
+        let trace =
+            trace_raster_external_binding_from_storage(&storage, "personal_data", &selector)
+                .unwrap()
+                .expect("raster input should produce trace metadata");
+        let resolved = storage.resolve("personal_data").unwrap();
+        let (selected, typed_selected): (SelectedPayload, String) =
+            raster_typed_value_from_selection(&resolved, &selector).unwrap();
+
+        assert_eq!(typed_selected, "Flat B");
+        assert_eq!(trace.name, "personal_data");
+        assert_eq!(trace.commitment, root_commitment.into_bytes());
+        assert_eq!(trace.tree_root, selected.commitment.source_root_hash);
+        assert_eq!(trace.selector, selector);
+        assert_eq!(trace.selection, selected.commitment);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn raster_trace_external_binding_does_not_materialize_selected_type() {
+        let dir = unique_dir();
+        fs::create_dir_all(&dir).unwrap();
+
+        let data = PersonalData {
+            age: 25,
+            name: "John".to_string(),
+            addresses: vec![Address {
+                lines: vec!["221B Baker Street".to_string(), "Flat B".to_string()],
+                indexes: vec![7, 42],
+            }],
+        };
+        let (payload, index_bytes, root_commitment) =
+            raster_fixture_for_value(&data, PersonalData::schema());
+        fs::write(dir.join("personal_data.rastered"), &payload).unwrap();
+        fs::write(dir.join("personal_data.rindex"), &index_bytes).unwrap();
+        let (input_path, manifest_path) = write_external_documents(
+            &dir,
+            &root_commitment,
+            r#"{"personal_data":{"path":"personal_data.rastered","index_path":"personal_data.rindex","load_preference":"read"}}"#,
+            r#"{"personal_data":{"type":"sha256","encoding":"raster","commitment":"{hash}"}}"#,
+        );
+
+        let selector = SelectorPath::new(vec![
+            SelectorSegment::from("addresses"),
+            SelectorSegment::from(0usize),
+            SelectorSegment::from("lines"),
+            SelectorSegment::from(1usize),
+        ]);
+        let storage = storage_manager(&input_path, &manifest_path);
+        let trace =
+            trace_raster_external_binding_from_storage(&storage, "personal_data", &selector)
+                .unwrap()
+                .expect("raster input should produce trace metadata");
+        let resolved = storage.resolve("personal_data").unwrap();
+        let typed_error = raster_typed_value_from_selection::<u64>(&resolved, &selector)
+            .expect_err("typed materialization should fail for a selected string");
+
+        assert!(trace.selection.selected_len > 0);
+        assert!(
+            typed_error.to_string().contains("Failed to deserialize")
+                || typed_error.to_string().contains("invalid type")
+        );
 
         fs::remove_dir_all(&dir).unwrap();
     }
