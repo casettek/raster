@@ -1,8 +1,9 @@
 use raster::core::trace::TraceEvent;
 use raster::prelude::*;
 use raster::selector_path;
+use raster::SelectionCommitment;
 use raster_core::postcard;
-use raster_runtime::{init_with, Publisher, Sha256Commitment};
+use raster_runtime::{init_with, Publisher};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, Once};
@@ -216,17 +217,18 @@ fn nested_auth_ref_selection_matches_direct_external_selection_trace() {
             line: "Main Street".to_string(),
         },
     };
-    let root_hash = vec![1, 2, 3, 4];
+    let root_hash = [1; 32];
     let whole = ExternalValue::new(
         "personal_data",
         SelectorPath::default(),
         Some("commitment".to_string()),
         SelectedPayload {
             bytes: postcard::to_allocvec(&personal).unwrap(),
-            proof: SelectionProof {
+            commitment: SelectionCommitment {
                 path: SelectorPath::default(),
-                root_hash: root_hash.clone(),
-                steps: Vec::new(),
+                source_root_hash: root_hash,
+                selected_hash: [0; 32],
+                selected_len: 0,
             },
         },
         personal,
@@ -260,7 +262,7 @@ fn nested_auth_ref_selection_matches_direct_external_selection_trace() {
     assert_eq!(nested.selector, direct.selector);
     assert_eq!(nested.selected, direct.selected);
     assert_eq!(nested.value, direct.value);
-    assert_eq!(nested.selected.proof.root_hash, root_hash);
+    assert_eq!(nested.selected.commitment.source_root_hash, root_hash);
 }
 
 #[test]
@@ -316,7 +318,11 @@ fn infallible_call_binding_uses_tile_output_commitment() {
     );
     assert_eq!(
         reference.commitment,
-        Into::<Vec<u8>>::into(Sha256Commitment::from(output.data.as_slice()))
+        output
+            .raster
+            .as_ref()
+            .expect("tile output should include raster payload")
+            .root_hash
     );
     assert_eq!(
         raster::resolve_internal_value::<String>(reference)
@@ -350,7 +356,11 @@ fn fallible_call_binding_resolves_ok_payload_from_stored_result() {
     );
     assert_eq!(
         reference.commitment,
-        Into::<Vec<u8>>::into(Sha256Commitment::from(output.data.as_slice()))
+        output
+            .raster
+            .as_ref()
+            .expect("tile output should include raster payload")
+            .root_hash
     );
     assert_eq!(
         raster::resolve_internal_ok_value::<String>(reference)
@@ -383,7 +393,11 @@ fn nested_sequence_trace_records_terminal_err_outputs() {
             TraceEvent::TileExec(record) => {
                 matches!(record.fn_name.as_str(), "echo_name" | "maybe_echo_name")
             }
-            TraceEvent::RecurTileExec(_) | TraceEvent::RecurExec(_) => false,
+            TraceEvent::RecurTileIterationExec(_)
+            | TraceEvent::RecurTileExec(_)
+            | TraceEvent::RecurSequenceStart(_)
+            | TraceEvent::RecurSequenceEnd(_)
+            | TraceEvent::RecurSequenceExec(_) => false,
         })
         .collect();
 

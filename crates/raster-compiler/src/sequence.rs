@@ -23,7 +23,8 @@ impl<'ast> Sequence<'ast> {
 #[derive(Debug, Clone)]
 pub enum SequenceStep<'ast> {
     Tile(&'ast Tile<'ast>), // Reference to tile
-    Recur(&'ast Tile<'ast>),
+    RecurTile(&'ast Tile<'ast>),
+    RecurSequence(String),
     Sequence(String), // Sequence name (resolved later if needed)
 }
 
@@ -101,8 +102,8 @@ impl<'ast> SequenceDiscovery<'ast> {
                             }
                         }
                     }
-                    CallKind::Recursive => match tile_discovery.get(&call_info.callee) {
-                        Some(tile) => Some(SequenceStep::Recur(tile)),
+                    CallKind::RecursiveTile => match tile_discovery.get(&call_info.callee) {
+                        Some(tile) => Some(SequenceStep::RecurTile(tile)),
                         None => {
                             eprintln!(
                                 "error[raster]: recursive tile call in sequence `{}` refers to unknown tile `{}`; \
@@ -113,6 +114,19 @@ impl<'ast> SequenceDiscovery<'ast> {
                             None
                         }
                     },
+                    CallKind::RecursiveSequence => {
+                        if sequence_names.contains(&call_info.callee) {
+                            Some(SequenceStep::RecurSequence(call_info.callee.clone()))
+                        } else {
+                            eprintln!(
+                                "error[raster]: recursive sequence call in sequence `{}` refers to unknown sequence `{}`; \
+                                 it is not registered in sequence discovery. \
+                                 Check the spelling or ensure `#[sequence]` is applied.",
+                                func.name, call_info.callee
+                            );
+                            None
+                        }
+                    }
                     // Canonical call_seq!: callee must be a registered sequence.
                     CallKind::Sequence => {
                         if sequence_names.contains(&call_info.callee) {
@@ -175,7 +189,8 @@ impl<'ast> Sequence<'ast> {
 #[derive(Debug, Clone)]
 pub enum FlattenedStep<'a, 'ast> {
     Tile(&'a Tile<'ast>),
-    Recur(&'a Tile<'ast>),
+    RecurTile(&'a Tile<'ast>),
+    RecurSequence(&'a Sequence<'ast>),
     Sequence(&'a Sequence<'ast>),
 }
 /// Iterator that yields flattened steps from a sequence, expanding nested sequences inline.
@@ -205,7 +220,12 @@ impl<'a, 'ast> Iterator for SequenceStepIter<'a, 'ast> {
         while let Some(current_iter) = self.stack.last_mut() {
             match current_iter.next() {
                 Some(SequenceStep::Tile(tile)) => return Some(FlattenedStep::Tile(tile)),
-                Some(SequenceStep::Recur(tile)) => return Some(FlattenedStep::Recur(tile)),
+                Some(SequenceStep::RecurTile(tile)) => return Some(FlattenedStep::RecurTile(tile)),
+                Some(SequenceStep::RecurSequence(name)) => {
+                    if let Some(nested_seq) = self.discovery.get(name) {
+                        return Some(FlattenedStep::RecurSequence(nested_seq));
+                    }
+                }
                 Some(SequenceStep::Sequence(name)) => {
                     // Check for cycles - skip if already visited
                     if self.visited.contains(name) {

@@ -136,7 +136,7 @@ pub fn publish_trace_event(event: TraceEvent) {
         let event = RECUR_TRACE_DEPTH.with(|depth| {
             if depth.get() > 0 {
                 match event {
-                    TraceEvent::TileExec(record) => TraceEvent::RecurTileExec(record),
+                    TraceEvent::TileExec(record) => TraceEvent::RecurTileIterationExec(record),
                     other => other,
                 }
             } else {

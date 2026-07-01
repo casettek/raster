@@ -12,6 +12,7 @@ extern crate alloc;
 use alloc::format;
 use alloc::string::String;
 use raster::prelude::*;
+use raster::println;
 use serde::{Deserialize, Serialize};
 
 use crate::input::{CollectiveGreeting, CollectiveGreetingDraftExt, PersonalData};

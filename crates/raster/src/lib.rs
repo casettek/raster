@@ -18,17 +18,20 @@ pub use raster_core::draft;
 pub mod input;
 pub use input::{
     auth_ref_result_trace, auth_ref_trace, draft_replay_handle, draft_replay_transition, finalize,
-    into_auth_ref, into_auth_value, materialize_auth_result, materialize_auth_return, new_draft,
-    resolve_external_value, resolve_internal_ok_value, resolve_internal_value,
-    resolve_typed_external_value, restore_draft_from_replay_handle, run_recur_list,
-    run_recur_list_state, run_recur_list_with_state, select_source, selector_path,
-    serialize_draft_replay_handle, serialize_draft_trace, typed_external, typed_internal,
-    typed_internal_with_resolver, typed_selector_path, Anchor, AuthRef, AuthRefTrace, AuthValue,
-    Draft, DraftAppendField, DraftSetField, ExternalRef, ExternalSelection, ExternalValue,
-    InternalRef, InternalValue, IntoAuthRef, IntoAuthValue, IntoRecurControl, ListProofDirection,
-    ListProofSibling, Op, RecurControl, RecurInput, RecurOutput, RecurState, Schema, SchemaField,
-    SchemaFieldMode, SchemaNode, SelectSource, Selectable, SelectedPayload, SelectionProof,
-    SelectionProofStep, SelectorPath, SelectorSegment, TypedExternalBinding, TypedInternalBinding,
+    into_auth_ref, into_auth_value, into_draft, materialize_auth_result, materialize_auth_return,
+    new_draft, raster_trace_payload, resolve_external_value, resolve_internal_ok_value,
+    resolve_internal_value, resolve_typed_external_value, restore_draft_from_replay_handle,
+    run_recur_list, run_recur_list_state, run_recur_list_with_state, run_recur_sequence_list,
+    run_recur_sequence_list_state, run_recur_sequence_list_with_state, select_source,
+    select_stored_internal_value, selector_path, serialize_draft_replay_handle,
+    serialize_draft_trace, typed_external, typed_internal, typed_internal_with_resolver,
+    typed_selector_path, Anchor, AuthRef, AuthRefTrace, AuthValue, Draft, DraftAppendField,
+    DraftSetField, ExternalRef, ExternalSelection, ExternalValue, InternalRef, InternalValue,
+    IntoAuthRef, IntoAuthValue, IntoDraft, IntoRecurControl, ListProofDirection, ListProofSibling,
+    Op, RecurControl, RecurInput, RecurOutput, RecurSequenceInput, RecurSequenceOutput,
+    RecurSequenceState, RecurState, Schema, SchemaField, SchemaFieldMode, SchemaNode, SelectSource,
+    Selectable, SelectedPayload, SelectionCommitment, SelectionProof, SelectionProofStep,
+    SelectionWitness, SelectorPath, SelectorSegment, TypedExternalBinding, TypedInternalBinding,
     TypedSelectorPath,
 };
 
@@ -328,6 +331,34 @@ pub mod __private {
     }
 
     #[doc(hidden)]
+    pub struct RecurSequenceIterationScopeGuard;
+
+    impl RecurSequenceIterationScopeGuard {
+        pub fn enter() -> Self {
+            #[cfg(feature = "std")]
+            {
+                raster_runtime::enter_recur_sequence_iteration_scope().unwrap_or_else(|error| {
+                    panic!(
+                        "Failed to enter recursive sequence iteration scope: {}",
+                        error
+                    )
+                });
+            }
+
+            Self
+        }
+    }
+
+    impl Drop for RecurSequenceIterationScopeGuard {
+        fn drop(&mut self) {
+            #[cfg(feature = "std")]
+            {
+                raster_runtime::exit_recur_sequence_iteration_scope();
+            }
+        }
+    }
+
+    #[doc(hidden)]
     pub struct RecurTraceScopeGuard {
         #[cfg(feature = "std")]
         inner: Option<raster_runtime::RecurTraceScopeGuard>,
@@ -549,6 +580,18 @@ macro_rules! call_recur {
     };
 }
 
+/// Canonical recursive list-call primitive for invoking a recur sequence inside a sequence.
+///
+/// `call_recur_seq!` is only valid inside `#[sequence]` functions, where the
+/// sequence macro rewrites it into a hidden driver that iterates a selectable
+/// list source while preserving tiles inside each iteration as replay units.
+#[macro_export]
+macro_rules! call_recur_seq {
+    ($($tt:tt)*) => {
+        compile_error!("call_recur_seq! can only be used inside #[sequence] functions")
+    };
+}
+
 /// Emits a Raster-controlled output line that `cargo raster run` will surface.
 ///
 /// Use this instead of `std::println!` in Raster user code. The CLI captures
@@ -581,11 +624,12 @@ pub mod prelude {
 
     pub use crate::exec::Result;
     pub use crate::{
-        call, call_recur, call_seq, external, finalize, internal, into_auth_ref,
-        materialize_auth_result, materialize_auth_return, new, select, sequence, tile, Anchor,
-        AuthRef, AuthValue, Draft, ExternalSelection, ExternalValue, InternalRef, InternalValue,
-        IntoAuthRef, IntoAuthValue, ListProofDirection, ListProofSibling, Op, RecurControl,
-        RecurInput, RecurOutput, RecurState, Schema, SchemaField, SchemaFieldMode, SchemaNode,
+        call, call_recur, call_recur_seq, call_seq, external, finalize, internal, into_auth_ref,
+        into_draft, materialize_auth_result, materialize_auth_return, new, select, sequence, tile,
+        Anchor, AuthRef, AuthValue, Draft, ExternalSelection, ExternalValue, InternalRef,
+        InternalValue, IntoAuthRef, IntoAuthValue, IntoDraft, ListProofDirection, ListProofSibling,
+        Op, RecurControl, RecurInput, RecurOutput, RecurSequenceInput, RecurSequenceOutput,
+        RecurSequenceState, RecurState, Schema, SchemaField, SchemaFieldMode, SchemaNode,
         SelectSource, Selectable, SelectedPayload, SelectionProof, SelectionProofStep,
         SelectorPath, SelectorSegment, TypedExternalBinding, TypedInternalBinding,
         TypedSelectorPath,

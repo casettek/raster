@@ -92,9 +92,9 @@ fn hello_tiles_run_reports_recur_iteration_coordinates() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("tile_coordinates: CfsCoordinates([9, 0])"));
     assert!(stdout.contains("tile_coordinates: CfsCoordinates([9, 1])"));
-    assert!(stdout.contains("recur_coordinates: CfsCoordinates([9])"));
+    assert!(stdout.contains("recur_tile_coordinates: CfsCoordinates([9])"));
     assert!(stdout.contains("tile_coordinates: CfsCoordinates([11, 0])"));
-    assert!(stdout.contains("recur_coordinates: CfsCoordinates([11])"));
+    assert!(stdout.contains("recur_tile_coordinates: CfsCoordinates([11])"));
 }
 
 #[test]
@@ -197,7 +197,7 @@ fn hello_tiles_run_can_use_json_trace_format() {
     assert!(
         parsed.get("SequenceStart").is_some()
             || parsed.get("TileExec").is_some()
-            || parsed.get("RecurExec").is_some()
+            || parsed.get("RecurTileExec").is_some()
             || parsed.get("SequenceEnd").is_some(),
         "json trace line should be a trace event: {first_line}"
     );

@@ -3,7 +3,7 @@
 use rand::seq::IteratorRandom;
 use sha2::{Digest, Sha256};
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -18,6 +18,7 @@ use raster_compiler::{CfsBuilder, Project};
 use raster_core::cfs::ControlFlowSchema;
 use raster_core::coordinate_index::IncrementalCoordinateIndex;
 use raster_core::draft::DraftTransitionWitness;
+use raster_core::input::{InternalRef, SelectionWitness};
 use raster_core::trace::{ExternalInput, FnInput, StepRecord, Trace, TraceEvent};
 use raster_core::transition::{
     InternalStoreEntry, InternalStoreIndexValue, InternalStoreLogWitness, InternalStoreReadWitness,
@@ -268,12 +269,28 @@ pub fn run(
 
                     println!("tile_id: {}", tile_exec_record.tile_id);
                 }
-                StepRecord::RecurExec(recur_exec_record) => {
+                StepRecord::RecurTileExec(recur_exec_record) => {
                     println!("\nexec_index: {}", recur_exec_record.exec_index);
                     println!("sequence_id: {}", recur_exec_record.sequence_id);
-                    println!("recur_coordinates: {:?}", recur_exec_record.coordinates,);
+                    println!(
+                        "recur_tile_coordinates: {:?}",
+                        recur_exec_record.coordinates,
+                    );
 
-                    println!("recur_id: {}", recur_exec_record.recur_id);
+                    println!("recur_tile_id: {}", recur_exec_record.recur_tile_id);
+                }
+                StepRecord::RecurSequenceExec(recur_sequence_exec_record) => {
+                    println!("\nexec_index: {}", recur_sequence_exec_record.exec_index);
+                    println!("sequence_id: {}", recur_sequence_exec_record.sequence_id);
+                    println!(
+                        "recur_sequence_coordinates: {:?}",
+                        recur_sequence_exec_record.coordinates,
+                    );
+
+                    println!(
+                        "recur_sequence_id: {}",
+                        recur_sequence_exec_record.recur_sequence_id
+                    );
                 }
                 StepRecord::SequenceStart(sequence_start_record) => {
                     println!(
@@ -449,8 +466,13 @@ pub fn fraud(trace: &mut Trace, commit_path: &str) {
             StepRecord::TileExec(tile_exec_record) => {
                 !tile_exec_record.external_input_commitment.is_empty()
             }
-            StepRecord::RecurExec(recur_exec_record) => {
+            StepRecord::RecurTileExec(recur_exec_record) => {
                 !recur_exec_record.external_input_commitment.is_empty()
+            }
+            StepRecord::RecurSequenceExec(recur_sequence_exec_record) => {
+                !recur_sequence_exec_record
+                    .external_input_commitment
+                    .is_empty()
             }
             StepRecord::SequenceStart(_) | StepRecord::SequenceEnd(_) => false,
         })
@@ -460,8 +482,11 @@ pub fn fraud(trace: &mut Trace, commit_path: &str) {
             StepRecord::TileExec(tile_exec_record) => {
                 tile_exec_record.output_commitment = vec![0u8, 1u8];
             }
-            StepRecord::RecurExec(recur_exec_record) => {
+            StepRecord::RecurTileExec(recur_exec_record) => {
                 recur_exec_record.output_commitment = vec![0u8, 1u8];
+            }
+            StepRecord::RecurSequenceExec(recur_sequence_exec_record) => {
+                recur_sequence_exec_record.output_commitment = vec![0u8, 1u8];
             }
             StepRecord::SequenceStart(sequence_start_record) => {
                 sequence_start_record.input_commitment.push(0);
@@ -610,6 +635,61 @@ fn internal_store_state_from_prefix(
     state
 }
 
+fn build_external_selection_witnesses(
+    external_input: &ExternalInput,
+) -> BTreeMap<String, SelectionWitness> {
+    external_input
+        .iter()
+        .filter_map(|(binding_name, external)| {
+            if external.selection.selected_len == 0 {
+                return None;
+            }
+            Some((
+                binding_name.clone(),
+                raster_runtime::external_selection_witness(&external.name, &external.selector)
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "Failed to build external selection witness for '{}': {}",
+                            binding_name, error
+                        )
+                    }),
+            ))
+        })
+        .collect()
+}
+
+fn build_internal_selection_witnesses(
+    input_source_witness: Option<&FnInput>,
+    trace_recorder: &TraceRecorder,
+) -> BTreeMap<String, SelectionWitness> {
+    let Some(input_source_witness) = input_source_witness else {
+        return BTreeMap::new();
+    };
+
+    input_source_witness
+        .internal()
+        .iter()
+        .filter_map(|(binding_name, internal)| {
+            if internal.selection.selected_len == 0 {
+                return None;
+            }
+            let reference =
+                InternalRef::new(internal.coordinates.clone(), internal.commitment.clone());
+            Some((
+                binding_name.clone(),
+                trace_recorder
+                    .internal_selection_witness(&reference, &internal.selector)
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "Failed to build internal selection witness for '{}': {}",
+                            binding_name, error
+                        )
+                    }),
+            ))
+        })
+        .collect()
+}
+
 pub fn prove(
     fraud_evidence: FraudEvidence,
     trace: &Trace,
@@ -632,6 +712,8 @@ pub fn prove(
             Option<FnInput>,
             Option<FnInput>,
             ExternalInput,
+            BTreeMap<String, SelectionWitness>,
+            BTreeMap<String, SelectionWitness>,
             Option<InternalStoreWitness>,
             Option<DraftTransitionWitness>,
         ),
@@ -671,6 +753,9 @@ pub fn prove(
                         .and_then(|witness| witness.input_source_witness())
                 });
         let external_input = step_witness.external_input();
+        let external_selection_witnesses = build_external_selection_witnesses(&external_input);
+        let internal_selection_witnesses =
+            build_internal_selection_witnesses(input_source_witness.as_ref(), trace_recorder);
         let draft_transition_witness = step_witness.draft_transition_witness();
         let before_state = current_internal_store_state.clone();
         let mut internal_read_witnesses = Vec::new();
@@ -734,6 +819,8 @@ pub fn prove(
                 input_source_witness,
                 sequence_scope_witness,
                 external_input,
+                external_selection_witnesses,
+                internal_selection_witnesses,
                 internal_store_witness,
                 draft_transition_witness,
             ),

@@ -416,7 +416,10 @@ fn resolve_inputs_sources(
                     .iter()
                     .enumerate()
                     .find_map(|(intra_sequence_offset, record)| match (record, source_record_cfs_item) {
-                        (StepRecord::TileExec(tile_exec_record), SequenceChildItem::Tile(_))
+                        (
+                            StepRecord::TileExec(tile_exec_record),
+                            SequenceChildItem::Tile(_) | SequenceChildItem::RecurTile(_),
+                        )
                             if tile_exec_record.coordinates == source_record_coordinates =>
                         {
                             Some((
@@ -432,9 +435,21 @@ fn resolve_inputs_sources(
                                 record.clone(),
                             ))
                         }
-                        (StepRecord::RecurExec(recur_exec_record), SequenceChildItem::Recur(_))
+                        (
+                            StepRecord::RecurTileExec(recur_exec_record),
+                            SequenceChildItem::RecurTile(_),
+                        )
                             if recur_exec_record.coordinates == source_record_coordinates =>
                         {
+                            Some((
+                                current_sequence_start_index + intra_sequence_offset,
+                                record.clone(),
+                            ))
+                        }
+                        (
+                            StepRecord::RecurSequenceExec(recur_sequence_exec_record),
+                            SequenceChildItem::RecurSequence(_),
+                        ) if recur_sequence_exec_record.coordinates == source_record_coordinates => {
                             Some((
                                 current_sequence_start_index + intra_sequence_offset,
                                 record.clone(),

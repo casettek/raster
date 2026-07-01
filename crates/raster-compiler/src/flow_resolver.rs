@@ -3,7 +3,9 @@
 //! This module resolves how data flows between tiles in a sequence by tracking
 //! variable bindings and mapping them to `InputSource` references.
 
-use raster_core::cfs::{InputBinding, RecurItem, SequenceChildItem, SequenceItem, TileItem};
+use raster_core::cfs::{
+    InputBinding, RecurSequenceItem, RecurTileItem, SequenceChildItem, SequenceItem, TileItem,
+};
 use std::collections::HashMap;
 
 use crate::ast::{CallArgumentKind, CallInfo, CallKind};
@@ -59,7 +61,8 @@ impl<'a, 'ast> FlowResolver<'a, 'ast> {
             .iter()
             .map(|step| match step {
                 crate::sequence::SequenceStep::Tile(tile) => tile.function.name.as_str(),
-                crate::sequence::SequenceStep::Recur(tile) => tile.function.name.as_str(),
+                crate::sequence::SequenceStep::RecurTile(tile) => tile.function.name.as_str(),
+                crate::sequence::SequenceStep::RecurSequence(name) => name.as_str(),
                 crate::sequence::SequenceStep::Sequence(name) => name.as_str(),
             })
             .collect();
@@ -80,10 +83,16 @@ impl<'a, 'ast> FlowResolver<'a, 'ast> {
                     id: call.callee.clone(),
                     sources: input_sources,
                 }),
-                CallKind::Recursive => SequenceChildItem::Recur(RecurItem {
+                CallKind::RecursiveTile => SequenceChildItem::RecurTile(RecurTileItem {
                     id: call.callee.clone(),
                     sources: input_sources,
                 }),
+                CallKind::RecursiveSequence => {
+                    SequenceChildItem::RecurSequence(RecurSequenceItem {
+                        id: call.callee.clone(),
+                        sources: input_sources,
+                    })
+                }
                 CallKind::Sequence => SequenceChildItem::Sequence(SequenceItem {
                     id: call.callee.clone(),
                     sources: input_sources,

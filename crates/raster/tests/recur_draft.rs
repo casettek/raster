@@ -76,6 +76,14 @@ struct UnitLineBundle {
     items: Vec<String>,
 }
 
+// Output schema with no required scalar fields, so a recur sequence can
+// finalize without the step body writing anything (used by the resolve-count
+// guard, where the step only materializes items).
+#[derive(Clone, Debug, Deserialize, Serialize, Selectable)]
+struct ItemsOnlyBundle {
+    items: Vec<String>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, Selectable)]
 struct LimitedBundle {
     limit: u64,
@@ -274,6 +282,35 @@ fn count_until_limit_state_only(
     }
 }
 
+#[tile]
+fn prefix_line(line: String, prefix: String) -> String {
+    format!("{}{}", prefix, line)
+}
+
+#[tile]
+fn init_prefixed_bundle(output: Draft<LineBundle>) -> Draft<LineBundle> {
+    let mut output = output;
+    output.title().set("prefixed".to_string());
+    output
+}
+
+#[tile]
+fn append_prefixed_line(output: Draft<LineBundle>, line: String) -> Draft<LineBundle> {
+    let mut output = output;
+    output.items().push(line);
+    output
+}
+
+#[sequence(kind = recur)]
+fn collect_prefixed_lines(
+    input: RecurSequenceInput<String>,
+    output: RecurSequenceOutput<LineBundle>,
+    prefix: String,
+) -> RecurSequenceOutput<LineBundle> {
+    let line = call!(prefix_line, input, prefix);
+    call!(append_prefixed_line, output, line)
+}
+
 #[sequence]
 fn collect_two_items(limit: u64) -> LimitedBundle {
     let source = raster::store_internal_value(&vec![
@@ -358,6 +395,27 @@ fn state_only_empty_input() -> MaxLenState {
     )
 }
 
+#[sequence]
+fn build_prefixed_lines_with_recur_sequence() -> LineBundle {
+    let source = raster::store_internal_value(&vec![
+        "one".to_string(),
+        "two".to_string(),
+        "three".to_string(),
+    ])
+    .expect("list source should store");
+    let prefix_source =
+        raster::store_internal_value(&"line: ".to_string()).expect("prefix source should store");
+
+    let output = call!(init_prefixed_bundle, new!(LineBundle));
+
+    call_recur_seq!(
+        sequence = collect_prefixed_lines,
+        input = internal!(Vec<String>, source),
+        output = output,
+        args = (internal!(String, prefix_source),)
+    )
+}
+
 fn run_collect_two_items(limit: u64) -> LimitedBundle {
     materialize_auth_return::<LimitedBundle, _>(__raster_sequence_auth_collect_two_items(limit))
 }
@@ -376,6 +434,12 @@ fn run_count_seen_until_limit(limit: u64) -> LimitState {
 
 fn run_state_only_empty_input() -> MaxLenState {
     materialize_auth_return::<MaxLenState, _>(__raster_sequence_auth_state_only_empty_input())
+}
+
+fn run_build_prefixed_lines_with_recur_sequence() -> LineBundle {
+    materialize_auth_return::<LineBundle, _>(
+        __raster_sequence_auth_build_prefixed_lines_with_recur_sequence(),
+    )
 }
 
 fn resolve_counted_string_list(
@@ -483,6 +547,21 @@ fn call_recur_state_only_empty_input_returns_initial_state() {
 }
 
 #[test]
+fn call_recur_seq_orchestrates_tiles_per_item() {
+    let result = run_build_prefixed_lines_with_recur_sequence();
+
+    assert_eq!(result.title, "prefixed");
+    assert_eq!(
+        result.items,
+        vec![
+            "line: one".to_string(),
+            "line: two".to_string(),
+            "line: three".to_string(),
+        ]
+    );
+}
+
+#[test]
 fn call_recur_resolves_internal_list_once_per_invocation() {
     let _guard = raster::__private::SequenceScopeGuard::enter("recur_single_list_resolve");
     let reference = raster::store_internal_value(&vec![
@@ -509,12 +588,45 @@ fn call_recur_resolves_internal_list_once_per_invocation() {
 }
 
 #[test]
+fn recur_sequence_resolves_internal_list_once_per_invocation() {
+    let _guard = raster::__private::SequenceScopeGuard::enter("recur_sequence_single_list_resolve");
+    let reference = raster::store_internal_value(&vec![
+        "first".to_string(),
+        "second".to_string(),
+        "third".to_string(),
+    ])
+    .expect("list source should store");
+    let source = into_auth_ref::<Vec<String>, _>(
+        raster::typed_internal_with_resolver::<Vec<String>>(reference, resolve_counted_string_list),
+    );
+
+    RECUR_RESOLVE_COUNT.store(0, Ordering::SeqCst);
+    // Materialize every item the way the trace pipeline does. With a per-item
+    // re-resolve this would be O(n) source resolutions (plus the length probe);
+    // the cached parent keeps it to a single resolve for the whole sequence.
+    let _auth = raster::run_recur_sequence_list::<String, ItemsOnlyBundle, _, _>(
+        source,
+        new!(ItemsOnlyBundle),
+        |input, output| {
+            input
+                .__raster_auth_trace()
+                .expect("sequence item should resolve");
+            output
+        },
+    );
+
+    assert_eq!(RECUR_RESOLVE_COUNT.load(Ordering::SeqCst), 1);
+}
+
+#[test]
 fn recur_trace_serializes_non_reusable_draft_markers() {
     let (_reference, events) = capture_trace_events(run_build_lines_reference);
     let collect_lines_event = events
         .into_iter()
         .find_map(|event| match event {
-            TraceEvent::RecurTileExec(record) if record.fn_name == "collect_lines" => Some(record),
+            TraceEvent::RecurTileIterationExec(record) if record.fn_name == "collect_lines" => {
+                Some(record)
+            }
             _ => None,
         })
         .expect("collect_lines trace should be recorded");
@@ -538,7 +650,9 @@ fn recur_trace_threads_verified_roots_between_steps() {
     let collect_lines_events: Vec<_> = events
         .into_iter()
         .filter_map(|event| match event {
-            TraceEvent::RecurTileExec(record) if record.fn_name == "collect_lines" => Some(record),
+            TraceEvent::RecurTileIterationExec(record) if record.fn_name == "collect_lines" => {
+                Some(record)
+            }
             _ => None,
         })
         .collect();
@@ -580,7 +694,7 @@ fn recur_trace_emits_site_completion_event() {
     let site_events: Vec<_> = events
         .into_iter()
         .filter_map(|event| match event {
-            TraceEvent::RecurExec(record) if record.fn_name == "collect_lines" => Some(record),
+            TraceEvent::RecurTileExec(record) if record.fn_name == "collect_lines" => Some(record),
             _ => None,
         })
         .collect();
@@ -595,4 +709,75 @@ fn recur_trace_emits_site_completion_event() {
         site_event.output.is_some(),
         "recur site should capture finalized output"
     );
+}
+
+#[test]
+fn recur_sequence_trace_keeps_inner_tiles_replayable() {
+    let (_result, events) = capture_trace_events(run_build_prefixed_lines_with_recur_sequence);
+
+    #[derive(Debug, Deserialize)]
+    struct RecurSequenceInputTrace {
+        kind: String,
+        index: u64,
+        len: u64,
+        item: FnInputValue,
+    }
+
+    let iteration_start_records = events
+        .iter()
+        .filter_map(|event| {
+            if let TraceEvent::RecurSequenceStart(record) = event {
+                (record.fn_name == "collect_prefixed_lines").then_some(record)
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    let inner_tile_execs = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                TraceEvent::TileExec(record) if record.fn_name == "append_prefixed_line"
+            )
+        })
+        .count();
+    let site_completions = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                TraceEvent::RecurSequenceExec(record)
+                    if record.fn_name == "collect_prefixed_lines"
+            )
+        })
+        .count();
+
+    assert_eq!(iteration_start_records.len(), 3);
+    assert_eq!(inner_tile_execs, 3);
+    assert_eq!(site_completions, 1);
+
+    for (expected_index, record) in iteration_start_records.iter().enumerate() {
+        let input = record
+            .input
+            .as_ref()
+            .expect("start event should have input");
+        assert!(
+            input.internal.contains_key("input"),
+            "selected item metadata should be keyed by the input parameter name"
+        );
+        assert!(
+            input.internal.contains_key("prefix"),
+            "recursive sequence extra args should remain auth refs in iteration traces"
+        );
+        let FnInputValue::Inline(bytes) = &input.values[0] else {
+            panic!("recur sequence input marker should be inline");
+        };
+        let marker: RecurSequenceInputTrace =
+            raster::core::postcard::from_bytes(bytes).expect("marker should decode");
+        assert_eq!(marker.kind, "raster::RecurSequenceInput");
+        assert_eq!(marker.index, expected_index as u64);
+        assert_eq!(marker.len, 3);
+        assert_eq!(marker.item, FnInputValue::InternalBinding);
+    }
 }

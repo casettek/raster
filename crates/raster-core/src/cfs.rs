@@ -212,6 +212,14 @@ impl CfsCursor {
         }
     }
 
+    fn sequence_by_id(&self, id: &str) -> &SequenceDef {
+        self.cfs
+            .sequences
+            .iter()
+            .find(|sequence| sequence.id == id)
+            .expect("Wrong cfs coordinates")
+    }
+
     fn get_sequence(&self, coords: &CfsCoordinates) -> (&SequenceDef, Option<CfsCoordinate>) {
         let mut current_sequence = self
             .cfs
@@ -220,8 +228,10 @@ impl CfsCursor {
             .expect("Wrong cfs entrypoint coordinates");
 
         let mut sequence_item_coord: Option<CfsCoordinate> = None;
+        let mut depth = 0usize;
 
-        for (depth, &coord) in coords.iter().enumerate() {
+        while depth < coords.len() {
+            let coord = coords[depth];
             let child_item = current_sequence
                 .items
                 .get(coord as usize)
@@ -229,24 +239,35 @@ impl CfsCursor {
 
             match child_item {
                 SequenceChildItem::Sequence(sequence_item) => {
-                    current_sequence = self
-                        .cfs
-                        .sequences
-                        .iter()
-                        .find(|sequence| *sequence.id == *sequence_item.id)
-                        .expect("Wrong cfs coordinates");
+                    current_sequence = self.sequence_by_id(&sequence_item.id);
+                    depth += 1;
                 }
                 SequenceChildItem::Tile(_tile_item) => {
                     if depth + 1 != coords.len() {
                         panic!("Tile coordinates cannot have nested child coordinates");
                     }
                     sequence_item_coord = Some(coord);
+                    depth += 1;
                 }
-                SequenceChildItem::Recur(_recur_item) => {
+                SequenceChildItem::RecurTile(_recur_item) => {
                     if depth + 2 < coords.len() {
-                        panic!("Recur iteration coordinates can only extend by one index");
+                        panic!("RecurTile iteration coordinates can only extend by one index");
                     }
                     sequence_item_coord = Some(coord);
+                    depth = coords.len();
+                }
+                SequenceChildItem::RecurSequence(recur_sequence_item) => {
+                    if depth + 1 == coords.len() {
+                        sequence_item_coord = Some(coord);
+                        depth += 1;
+                    } else {
+                        if depth + 2 > coords.len() {
+                            panic!("RecurSequence coordinates require an iteration index");
+                        }
+                        current_sequence = self.sequence_by_id(&recur_sequence_item.id);
+                        sequence_item_coord = None;
+                        depth += 2;
+                    }
                 }
             }
         }
@@ -262,7 +283,9 @@ impl CfsCursor {
         let mut current_sequence = self.cfs.sequences.get(self.entrypoint_coordinate as usize);
         let mut current_child_item: Option<&SequenceChildItem> = None;
 
-        for &coord in coordinates.iter() {
+        let mut depth = 0usize;
+        while depth < coordinates.len() {
+            let coord = coordinates[depth];
             let sequence = current_sequence?;
             let child = sequence.items.get(coord as usize)?;
             current_child_item = Some(child);
@@ -270,9 +293,21 @@ impl CfsCursor {
             match child {
                 SequenceChildItem::Sequence(item) => {
                     current_sequence = self.cfs.sequences.iter().find(|seq| seq.id == item.id);
+                    depth += 1;
+                }
+                SequenceChildItem::RecurSequence(item) => {
+                    if depth + 1 == coordinates.len() {
+                        current_sequence = None;
+                        depth += 1;
+                    } else {
+                        current_sequence = self.cfs.sequences.iter().find(|seq| seq.id == item.id);
+                        current_child_item = None;
+                        depth += 2;
+                    }
                 }
                 _ => {
                     current_sequence = None;
+                    depth += 1;
                 }
             }
         }
@@ -305,8 +340,11 @@ impl CfsCursor {
                     SequenceChildItem::Tile(tile_item) => {
                         SequenceChildId::Tile(tile_item.id.clone())
                     }
-                    SequenceChildItem::Recur(recur_item) => {
-                        SequenceChildId::Recur(recur_item.id.clone())
+                    SequenceChildItem::RecurTile(recur_item) => {
+                        SequenceChildId::RecurTile(recur_item.id.clone())
+                    }
+                    SequenceChildItem::RecurSequence(recur_sequence_item) => {
+                        SequenceChildId::RecurSequence(recur_sequence_item.id.clone())
                     }
                 };
 
@@ -326,7 +364,8 @@ impl CfsCursor {
                         .map(|item| match item {
                             SequenceChildItem::Sequence(item) => item.id,
                             SequenceChildItem::Tile(item) => item.id,
-                            SequenceChildItem::Recur(item) => item.id,
+                            SequenceChildItem::RecurTile(item) => item.id,
+                            SequenceChildItem::RecurSequence(item) => item.id,
                         })
                         .collect::<Vec<_>>()
                 )
@@ -350,7 +389,7 @@ impl CfsCursor {
         let site_coordinates = CfsCoordinates(site_prefix.to_vec());
         matches!(
             self.try_get_item(&site_coordinates),
-            Some(SequenceChildItem::Recur(_))
+            Some(SequenceChildItem::RecurTile(_))
         )
         .then_some((site_coordinates, iteration_index))
     }
@@ -358,7 +397,7 @@ impl CfsCursor {
     fn expand_recur_entry_coordinates(&self, coordinates: CfsCoordinates) -> Vec<CfsCoordinates> {
         if matches!(
             self.try_get_item(&coordinates),
-            Some(SequenceChildItem::Recur(_))
+            Some(SequenceChildItem::RecurTile(_) | SequenceChildItem::RecurSequence(_))
         ) {
             let mut iteration_coordinates = coordinates.clone();
             iteration_coordinates.push(0);
@@ -440,7 +479,8 @@ pub type TileId = String;
 pub enum SequenceChildId {
     Sequence(SequenceId),
     Tile(TileId),
-    Recur(TileId),
+    RecurTile(TileId),
+    RecurSequence(SequenceId),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -465,7 +505,8 @@ impl SequenceDef {
             .iter()
             .filter_map(|item| match item {
                 SequenceChildItem::Tile(_) => None,
-                SequenceChildItem::Recur(_) => None,
+                SequenceChildItem::RecurTile(_) => None,
+                SequenceChildItem::RecurSequence(_) => None,
                 SequenceChildItem::Sequence(sequence) => Some(sequence.clone()),
             })
             .collect()
@@ -476,7 +517,8 @@ impl SequenceDef {
 pub enum SequenceChildItem {
     Sequence(SequenceItem),
     Tile(TileItem),
-    Recur(RecurItem),
+    RecurTile(RecurTileItem),
+    RecurSequence(RecurSequenceItem),
 }
 
 impl SequenceChildItem {
@@ -484,7 +526,8 @@ impl SequenceChildItem {
         match self {
             SequenceChildItem::Sequence(sequence_item) => &sequence_item.sources,
             SequenceChildItem::Tile(tile_item) => &tile_item.sources,
-            SequenceChildItem::Recur(recur_item) => &recur_item.sources,
+            SequenceChildItem::RecurTile(recur_item) => &recur_item.sources,
+            SequenceChildItem::RecurSequence(recur_sequence_item) => &recur_sequence_item.sources,
         }
     }
 }
@@ -511,8 +554,14 @@ pub struct TileItem {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RecurItem {
+pub struct RecurTileItem {
     pub id: TileId,
+    pub sources: Vec<InputBinding>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecurSequenceItem {
+    pub id: SequenceId,
     pub sources: Vec<InputBinding>,
 }
 
@@ -607,7 +656,7 @@ mod tests {
                         id: "before".to_string(),
                         sources: vec![],
                     }),
-                    SequenceChildItem::Recur(RecurItem {
+                    SequenceChildItem::RecurTile(RecurTileItem {
                         id: "recur".to_string(),
                         sources: vec![],
                     }),
@@ -647,7 +696,7 @@ mod tests {
         assert_eq!(
             cursor
                 .try_get_item(&CfsCoordinates(vec![1, 4]))
-                .map(|item| matches!(item, SequenceChildItem::Recur(_))),
+                .map(|item| matches!(item, SequenceChildItem::RecurTile(_))),
             Some(true)
         );
     }

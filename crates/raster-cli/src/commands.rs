@@ -402,10 +402,16 @@ pub fn run_sequence(
                     Err(ExecutionFailure::Runtime(err)) => return Err(err),
                 }
             }
-            FlattenedStep::Recur(tile) => {
+            FlattenedStep::RecurTile(tile) => {
                 println!(
-                    "  Recur tile '{}' is not supported in preview mode",
+                    "  RecurTile '{}' is not supported in preview mode",
                     tile.function.name
+                );
+            }
+            FlattenedStep::RecurSequence(seq) => {
+                println!(
+                    "  RecurSequence '{}' is not supported in preview mode",
+                    seq.function.name
                 );
             }
             FlattenedStep::Sequence(seq) => {
@@ -573,8 +579,11 @@ pub fn cfs(output: Option<String>) -> Result<()> {
                 raster_core::cfs::SequenceChildItem::Tile(item) => {
                     println!("      [{}] {} '{}'", idx, "tile", item.id)
                 }
-                raster_core::cfs::SequenceChildItem::Recur(item) => {
-                    println!("      [{}] {} '{}'", idx, "recur", item.id)
+                raster_core::cfs::SequenceChildItem::RecurTile(item) => {
+                    println!("      [{}] {} '{}'", idx, "recur_tile", item.id)
+                }
+                raster_core::cfs::SequenceChildItem::RecurSequence(item) => {
+                    println!("      [{}] {} '{}'", idx, "recur_sequence", item.id)
                 }
                 raster_core::cfs::SequenceChildItem::Sequence(item) => {
                     println!("      [{}] {} '{}'", idx, "sequence", item.id)
