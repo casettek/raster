@@ -7,8 +7,8 @@ use std::format;
 use std::string::String;
 use std::vec::Vec;
 
-const RINDEX_MAGIC: &[u8; 8] = b"rindex01";
-const RINDEX_VERSION: u32 = 1;
+const RINDEX_MAGIC: &[u8; 8] = b"rindex02";
+const RINDEX_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct RasterIndex {

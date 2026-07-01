@@ -1211,49 +1211,73 @@ fn encode_leaf_bytes(value: &TreeValue) -> CoreResult<Vec<u8>> {
     Ok(out)
 }
 
-pub(crate) fn subtree_payload_and_root(value: &TreeValue) -> CoreResult<(Vec<u8>, Hash32)> {
+/// Direct children of a `TreeValue`, in the order their payloads/roots are laid
+/// out by [`assemble_subtree`]. Used to drive an explicit-stack post-order
+/// traversal instead of recursing (which overflows the stack on deeply nested
+/// recur-sequence values).
+fn subtree_children(value: &TreeValue) -> Vec<&TreeValue> {
     match value {
-        TreeValue::Unit => Ok((vec![0x03], selection_hash(&[b"unit"]))),
-        TreeValue::Struct(fields) => {
+        TreeValue::Struct(fields) => fields.iter().map(|(_, child)| child).collect(),
+        TreeValue::List(values) => values.iter().collect(),
+        TreeValue::Map(entries) => {
+            let mut children = Vec::with_capacity(entries.len() * 2);
+            for (key, value) in entries {
+                children.push(key);
+                children.push(value);
+            }
+            children
+        }
+        TreeValue::EnumNewtype(_, child) => vec![child.as_ref()],
+        TreeValue::EnumTuple(_, values) => values.iter().collect(),
+        TreeValue::EnumStruct(_, fields) => fields.iter().map(|(_, child)| child).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Combine a node's already-computed child `(payload, root)` results into the
+/// node's own `(payload, root)`. `children` must be in [`subtree_children`]
+/// order. Byte-for-byte identical to the previous recursive implementation.
+fn assemble_subtree(
+    value: &TreeValue,
+    children: Vec<(Vec<u8>, Hash32)>,
+) -> CoreResult<(Vec<u8>, Hash32)> {
+    let result = match value {
+        TreeValue::Unit => (vec![0x03], selection_hash(&[b"unit"])),
+        TreeValue::Struct(_) => {
             let mut payload = Vec::new();
             payload.push(0x01);
-            push_u64(&mut payload, fields.len() as u64);
-
-            let mut child_roots = Vec::with_capacity(fields.len());
-            for (_, child) in fields {
-                let (child_payload, child_root) = subtree_payload_and_root(child)?;
+            push_u64(&mut payload, children.len() as u64);
+            for (child_payload, _) in &children {
                 push_u64(&mut payload, child_payload.len() as u64);
-                payload.extend_from_slice(&child_payload);
-                child_roots.push(child_root);
+                payload.extend_from_slice(child_payload);
             }
 
-            let mut parts: Vec<&[u8]> = Vec::with_capacity(child_roots.len() + 1);
+            let mut parts: Vec<&[u8]> = Vec::with_capacity(children.len() + 1);
             parts.push(b"struct");
-            for root in &child_roots {
-                parts.push(root.as_slice());
+            for (_, child_root) in &children {
+                parts.push(child_root.as_slice());
             }
-            Ok((payload, selection_hash(&parts)))
+            (payload, selection_hash(&parts))
         }
-        TreeValue::List(values) => {
+        TreeValue::List(_) => {
             let mut payload = Vec::new();
             payload.push(0x02);
-            push_u64(&mut payload, values.len() as u64);
-
-            let mut child_roots = Vec::with_capacity(values.len());
-            for child in values {
-                let (child_payload, child_root) = subtree_payload_and_root(child)?;
+            push_u64(&mut payload, children.len() as u64);
+            for (child_payload, _) in &children {
                 push_u64(&mut payload, child_payload.len() as u64);
-                payload.extend_from_slice(&child_payload);
-                child_roots.push(child_root);
+                payload.extend_from_slice(child_payload);
             }
 
-            Ok((payload, list_root_from_hashes(&child_roots)))
+            let child_roots: Vec<Hash32> = children.iter().map(|(_, root)| *root).collect();
+            (payload, list_root_from_hashes(&child_roots))
         }
-        TreeValue::Map(entries) => {
-            let mut entries_with_payloads = Vec::with_capacity(entries.len());
-            for (key, value) in entries {
-                let (key_payload, key_root) = subtree_payload_and_root(key)?;
-                let (value_payload, value_root) = subtree_payload_and_root(value)?;
+        TreeValue::Map(_) => {
+            // `children` is [key0, value0, key1, value1, ...]; re-pair before sorting.
+            let mut entries_with_payloads = Vec::with_capacity(children.len() / 2);
+            let mut iter = children.into_iter();
+            while let (Some((key_payload, key_root)), Some((value_payload, value_root))) =
+                (iter.next(), iter.next())
+            {
                 entries_with_payloads.push((key_payload, key_root, value_payload, value_root));
             }
             entries_with_payloads.sort_by(|left, right| left.0.cmp(&right.0));
@@ -1277,73 +1301,65 @@ pub(crate) fn subtree_payload_and_root(value: &TreeValue) -> CoreResult<(Vec<u8>
                 parts.push(key_root.as_slice());
                 parts.push(value_root.as_slice());
             }
-            Ok((payload, selection_hash(&parts)))
+            (payload, selection_hash(&parts))
         }
         TreeValue::EnumUnit(variant) => {
             let mut payload = Vec::new();
             payload.push(0x05);
             push_u64(&mut payload, variant.len() as u64);
             payload.extend_from_slice(variant.as_bytes());
-            Ok((payload, selection_hash(&[b"enum-unit", variant.as_bytes()])))
+            (payload, selection_hash(&[b"enum-unit", variant.as_bytes()]))
         }
-        TreeValue::EnumNewtype(variant, value) => {
-            let (child_payload, child_root) = subtree_payload_and_root(value)?;
+        TreeValue::EnumNewtype(variant, _) => {
+            let (child_payload, child_root) = &children[0];
             let mut payload = Vec::new();
             payload.push(0x06);
             push_u64(&mut payload, variant.len() as u64);
             payload.extend_from_slice(variant.as_bytes());
             push_u64(&mut payload, child_payload.len() as u64);
-            payload.extend_from_slice(&child_payload);
-            Ok((
+            payload.extend_from_slice(child_payload);
+            (
                 payload,
                 selection_hash(&[b"enum-newtype", variant.as_bytes(), child_root.as_slice()]),
-            ))
+            )
         }
-        TreeValue::EnumTuple(variant, values) => {
+        TreeValue::EnumTuple(variant, _) => {
             let mut payload = Vec::new();
             payload.push(0x07);
             push_u64(&mut payload, variant.len() as u64);
             payload.extend_from_slice(variant.as_bytes());
-            push_u64(&mut payload, values.len() as u64);
-
-            let mut child_roots = Vec::with_capacity(values.len());
-            for child in values {
-                let (child_payload, child_root) = subtree_payload_and_root(child)?;
+            push_u64(&mut payload, children.len() as u64);
+            for (child_payload, _) in &children {
                 push_u64(&mut payload, child_payload.len() as u64);
-                payload.extend_from_slice(&child_payload);
-                child_roots.push(child_root);
+                payload.extend_from_slice(child_payload);
             }
 
-            let mut parts: Vec<&[u8]> = Vec::with_capacity(child_roots.len() + 2);
+            let mut parts: Vec<&[u8]> = Vec::with_capacity(children.len() + 2);
             parts.push(b"enum-tuple");
             parts.push(variant.as_bytes());
-            for root in &child_roots {
-                parts.push(root.as_slice());
+            for (_, child_root) in &children {
+                parts.push(child_root.as_slice());
             }
-            Ok((payload, selection_hash(&parts)))
+            (payload, selection_hash(&parts))
         }
-        TreeValue::EnumStruct(variant, fields) => {
+        TreeValue::EnumStruct(variant, _) => {
             let mut payload = Vec::new();
             payload.push(0x08);
             push_u64(&mut payload, variant.len() as u64);
             payload.extend_from_slice(variant.as_bytes());
-            push_u64(&mut payload, fields.len() as u64);
-
-            let mut child_roots = Vec::with_capacity(fields.len());
-            for (_, child) in fields {
-                let (child_payload, child_root) = subtree_payload_and_root(child)?;
+            push_u64(&mut payload, children.len() as u64);
+            for (child_payload, _) in &children {
                 push_u64(&mut payload, child_payload.len() as u64);
-                payload.extend_from_slice(&child_payload);
-                child_roots.push(child_root);
+                payload.extend_from_slice(child_payload);
             }
 
-            let mut parts: Vec<&[u8]> = Vec::with_capacity(child_roots.len() + 2);
+            let mut parts: Vec<&[u8]> = Vec::with_capacity(children.len() + 2);
             parts.push(b"enum-struct");
             parts.push(variant.as_bytes());
-            for root in &child_roots {
-                parts.push(root.as_slice());
+            for (_, child_root) in &children {
+                parts.push(child_root.as_slice());
             }
-            Ok((payload, selection_hash(&parts)))
+            (payload, selection_hash(&parts))
         }
         _ => {
             let leaf_bytes = encode_leaf_bytes(value)?;
@@ -1352,9 +1368,62 @@ pub(crate) fn subtree_payload_and_root(value: &TreeValue) -> CoreResult<(Vec<u8>
             push_u64(&mut payload, leaf_bytes.len() as u64);
             payload.extend_from_slice(&leaf_bytes);
             let root = selection_hash(&[b"leaf", leaf_bytes.as_slice()]);
-            Ok((payload, root))
+            (payload, root)
+        }
+    };
+    Ok(result)
+}
+
+pub(crate) fn subtree_payload_and_root(root: &TreeValue) -> CoreResult<(Vec<u8>, Hash32)> {
+    // Iterative post-order traversal with an explicit heap stack, so nesting
+    // depth no longer consumes the call stack. Each frame collects its
+    // children's results (in order) before assembling its own.
+    struct Frame<'a> {
+        value: &'a TreeValue,
+        children: Vec<&'a TreeValue>,
+        next: usize,
+        results: Vec<(Vec<u8>, Hash32)>,
+    }
+
+    let mut stack: Vec<Frame> = vec![Frame {
+        value: root,
+        children: subtree_children(root),
+        next: 0,
+        results: Vec::new(),
+    }];
+    // Result of the most recently completed subtree, handed up to its parent.
+    let mut completed: Option<(Vec<u8>, Hash32)> = None;
+
+    while !stack.is_empty() {
+        let next_child = {
+            let frame = stack.last_mut().unwrap();
+            if let Some(result) = completed.take() {
+                frame.results.push(result);
+            }
+            if frame.next < frame.children.len() {
+                let child = frame.children[frame.next];
+                frame.next += 1;
+                Some(child)
+            } else {
+                None
+            }
+        };
+
+        match next_child {
+            Some(child) => stack.push(Frame {
+                value: child,
+                children: subtree_children(child),
+                next: 0,
+                results: Vec::new(),
+            }),
+            None => {
+                let frame = stack.pop().unwrap();
+                completed = Some(assemble_subtree(frame.value, frame.results)?);
+            }
         }
     }
+
+    completed.ok_or_else(|| Error::Serialization("empty selection tree".into()))
 }
 
 fn list_root_from_hashes(hashes: &[Hash32]) -> Hash32 {
@@ -1912,55 +1981,63 @@ fn merkle_levels_from_hashes(hashes: &[Hash32]) -> Vec<crate::raster_index::Rast
     levels
 }
 
-fn build_raster_index_node(
-    nodes: &mut Vec<crate::raster_index::RasterNode>,
-    value: &TreeValue,
+/// A child to be turned into a raster node, with its precomputed byte offset
+/// inside the parent's payload.
+#[derive(Clone, Copy)]
+struct RasterChildPlan<'a> {
+    value: &'a TreeValue,
+    node_offset: u64,
+}
+
+/// In-progress node on the explicit build stack (replaces a recursive frame).
+struct RasterFrame<'a> {
+    value: &'a TreeValue,
+    node_id: u64,
+    root_hash: Hash32,
+    children: RasterChildren<'a>,
+    next: usize,
+    /// Node ids of children, accumulated in `children` order as they complete.
+    child_ids: Vec<u64>,
+}
+
+struct RasterChildren<'a> {
+    plans: Vec<RasterChildPlan<'a>>,
+    /// Child root hashes in element order (only consumed by `List` nodes).
+    hashes: Vec<Hash32>,
+}
+
+/// Compute the ordered children of `value` together with the byte offset each
+/// child node occupies inside `value`'s payload. The offset arithmetic and the
+/// `Map` ordering match the previous recursive implementation exactly.
+fn prepare_raster_children<'a>(
+    value: &'a TreeValue,
     offset: u64,
-) -> CoreResult<(u64, Hash32)> {
-    use crate::raster_index::{RasterMapEntry, RasterNode, RasterNodeKind, RasterStructField};
-
-    let (payload, root_hash) = subtree_payload_and_root(value)?;
-    let node_id = nodes.len() as u64;
-    nodes.push(RasterNode {
-        offset,
-        len: payload.len() as u64,
-        root_hash: root_hash.clone(),
-        kind: RasterNodeKind::Unit,
-    });
-
-    let kind = match value {
-        TreeValue::Unit => RasterNodeKind::Unit,
+) -> CoreResult<RasterChildren<'a>> {
+    let mut plans = Vec::new();
+    let mut hashes = Vec::new();
+    match value {
         TreeValue::Struct(fields) => {
-            let mut raster_fields = Vec::with_capacity(fields.len());
             let mut child_offset = offset + 1 + 8;
-            for (name, child) in fields {
-                let (child_payload, _) = subtree_payload_and_root(child)?;
-                let child_id = build_raster_index_node(nodes, child, child_offset + 8)?.0;
-                raster_fields.push(RasterStructField {
-                    name: name.clone(),
-                    child: child_id,
+            for (_, child) in fields {
+                let (child_payload, child_hash) = subtree_payload_and_root(child)?;
+                plans.push(RasterChildPlan {
+                    value: child,
+                    node_offset: child_offset + 8,
                 });
+                hashes.push(child_hash);
                 child_offset += 8 + child_payload.len() as u64;
-            }
-            RasterNodeKind::Struct {
-                fields: raster_fields,
             }
         }
         TreeValue::List(values) => {
             let mut child_offset = offset + 1 + 8;
-            let mut elements = Vec::with_capacity(values.len());
-            let mut hashes = Vec::with_capacity(values.len());
-            for value in values {
-                let (child_payload, child_hash) = subtree_payload_and_root(value)?;
-                let child_id = build_raster_index_node(nodes, value, child_offset + 8)?.0;
-                elements.push(child_id);
+            for child in values {
+                let (child_payload, child_hash) = subtree_payload_and_root(child)?;
+                plans.push(RasterChildPlan {
+                    value: child,
+                    node_offset: child_offset + 8,
+                });
                 hashes.push(child_hash);
                 child_offset += 8 + child_payload.len() as u64;
-            }
-            RasterNodeKind::List {
-                len: values.len() as u64,
-                elements,
-                merkle_levels: merkle_levels_from_hashes(&hashes),
             }
         }
         TreeValue::Map(entries) => {
@@ -1972,71 +2049,195 @@ fn build_raster_index_node(
             }
             records.sort_by(|left, right| left.2.cmp(&right.2).then_with(|| left.3.cmp(&right.3)));
 
-            let mut raster_entries = Vec::with_capacity(records.len());
             let mut child_offset = offset + 1 + 8;
-            for (key, value, key_payload, value_payload) in records {
-                let key_id = build_raster_index_node(nodes, key, child_offset + 8)?.0;
-                child_offset += 8 + key_payload.len() as u64;
-                let value_id = build_raster_index_node(nodes, value, child_offset + 8)?.0;
-                child_offset += 8 + value_payload.len() as u64;
-                raster_entries.push(RasterMapEntry {
-                    key: key_id,
-                    value: value_id,
+            for (key, value, key_payload, value_payload) in &records {
+                plans.push(RasterChildPlan {
+                    value: *key,
+                    node_offset: child_offset + 8,
                 });
-            }
-            RasterNodeKind::Map {
-                entries: raster_entries,
+                child_offset += 8 + key_payload.len() as u64;
+                plans.push(RasterChildPlan {
+                    value: *value,
+                    node_offset: child_offset + 8,
+                });
+                child_offset += 8 + value_payload.len() as u64;
             }
         }
-        TreeValue::EnumUnit(variant) => RasterNodeKind::EnumUnit {
-            variant: variant.clone(),
-        },
         TreeValue::EnumNewtype(variant, child) => {
             let child_offset = offset + 1 + 8 + variant.len() as u64 + 8;
-            let child_id = build_raster_index_node(nodes, child.as_ref(), child_offset)?.0;
-            RasterNodeKind::EnumNewtype {
-                variant: variant.clone(),
-                child: child_id,
-            }
+            plans.push(RasterChildPlan {
+                value: child.as_ref(),
+                node_offset: child_offset,
+            });
         }
         TreeValue::EnumTuple(variant, values) => {
             let mut child_offset = offset + 1 + 8 + variant.len() as u64 + 8;
-            let mut elements = Vec::with_capacity(values.len());
-            for value in values {
-                let (child_payload, _) = subtree_payload_and_root(value)?;
-                let child_id = build_raster_index_node(nodes, value, child_offset + 8)?.0;
-                elements.push(child_id);
+            for child in values {
+                let (child_payload, child_hash) = subtree_payload_and_root(child)?;
+                plans.push(RasterChildPlan {
+                    value: child,
+                    node_offset: child_offset + 8,
+                });
+                hashes.push(child_hash);
                 child_offset += 8 + child_payload.len() as u64;
-            }
-            RasterNodeKind::EnumTuple {
-                variant: variant.clone(),
-                elements,
             }
         }
         TreeValue::EnumStruct(variant, fields) => {
             let mut child_offset = offset + 1 + 8 + variant.len() as u64 + 8;
-            let mut raster_fields = Vec::with_capacity(fields.len());
-            for (name, child) in fields {
-                let (child_payload, _) = subtree_payload_and_root(child)?;
-                let child_id = build_raster_index_node(nodes, child, child_offset + 8)?.0;
-                raster_fields.push(RasterStructField {
-                    name: name.clone(),
-                    child: child_id,
+            for (_, child) in fields {
+                let (child_payload, child_hash) = subtree_payload_and_root(child)?;
+                plans.push(RasterChildPlan {
+                    value: child,
+                    node_offset: child_offset + 8,
                 });
+                hashes.push(child_hash);
                 child_offset += 8 + child_payload.len() as u64;
             }
-            RasterNodeKind::EnumStruct {
-                variant: variant.clone(),
-                fields: raster_fields,
-            }
         }
+        _ => {}
+    }
+    Ok(RasterChildren { plans, hashes })
+}
+
+/// Build a node's `RasterNodeKind` from its completed children. `child_ids` is
+/// in [`prepare_raster_children`] order; for `Map` that is the sorted
+/// [key0, value0, key1, value1, ...] sequence.
+fn finalize_raster_kind(
+    value: &TreeValue,
+    child_ids: &[u64],
+    child_hashes: &[Hash32],
+) -> CoreResult<crate::raster_index::RasterNodeKind> {
+    use crate::raster_index::{RasterMapEntry, RasterNodeKind, RasterStructField};
+
+    let kind = match value {
+        TreeValue::Unit => RasterNodeKind::Unit,
+        TreeValue::Struct(fields) => RasterNodeKind::Struct {
+            fields: fields
+                .iter()
+                .zip(child_ids)
+                .map(|((name, _), &child)| RasterStructField {
+                    name: name.clone(),
+                    child,
+                })
+                .collect(),
+        },
+        TreeValue::List(values) => RasterNodeKind::List {
+            len: values.len() as u64,
+            elements: child_ids.to_vec(),
+            merkle_levels: merkle_levels_from_hashes(child_hashes),
+        },
+        TreeValue::Map(_) => RasterNodeKind::Map {
+            entries: child_ids
+                .chunks(2)
+                .map(|pair| RasterMapEntry {
+                    key: pair[0],
+                    value: pair[1],
+                })
+                .collect(),
+        },
+        TreeValue::EnumUnit(variant) => RasterNodeKind::EnumUnit {
+            variant: variant.clone(),
+        },
+        TreeValue::EnumNewtype(variant, _) => RasterNodeKind::EnumNewtype {
+            variant: variant.clone(),
+            child: child_ids[0],
+        },
+        TreeValue::EnumTuple(variant, _) => RasterNodeKind::EnumTuple {
+            variant: variant.clone(),
+            elements: child_ids.to_vec(),
+        },
+        TreeValue::EnumStruct(variant, fields) => RasterNodeKind::EnumStruct {
+            variant: variant.clone(),
+            fields: fields
+                .iter()
+                .zip(child_ids)
+                .map(|((name, _), &child)| RasterStructField {
+                    name: name.clone(),
+                    child,
+                })
+                .collect(),
+        },
         leaf => RasterNodeKind::Leaf {
             type_name: infer_leaf_type_name(leaf)?,
         },
     };
+    Ok(kind)
+}
 
-    nodes[node_id as usize].kind = kind;
-    Ok((node_id, root_hash))
+/// Reserve a node slot for `value` (pre-order id assignment) and prepare its
+/// children for the build stack.
+fn enter_raster_frame<'a>(
+    nodes: &mut Vec<crate::raster_index::RasterNode>,
+    value: &'a TreeValue,
+    offset: u64,
+) -> CoreResult<RasterFrame<'a>> {
+    use crate::raster_index::{RasterNode, RasterNodeKind};
+
+    let (payload, root_hash) = subtree_payload_and_root(value)?;
+    let node_id = nodes.len() as u64;
+    nodes.push(RasterNode {
+        offset,
+        len: payload.len() as u64,
+        root_hash,
+        kind: RasterNodeKind::Unit,
+    });
+    let children = prepare_raster_children(value, offset)?;
+    Ok(RasterFrame {
+        value,
+        node_id,
+        root_hash,
+        children,
+        next: 0,
+        child_ids: Vec::new(),
+    })
+}
+
+fn build_raster_index_node(
+    nodes: &mut Vec<crate::raster_index::RasterNode>,
+    root_value: &TreeValue,
+    root_offset: u64,
+) -> CoreResult<(u64, Hash32)> {
+    // Iterative pre-order build with an explicit heap stack. Node ids are still
+    // assigned in pre-order (parent before its children, children left to
+    // right), so the on-disk layout is unchanged; only the call stack is gone.
+    let root_frame = enter_raster_frame(nodes, root_value, root_offset)?;
+    let root_id = root_frame.node_id;
+    let root_hash = root_frame.root_hash;
+    let mut stack: Vec<RasterFrame> = vec![root_frame];
+    // Node id of the child that just finished, to be recorded by its parent.
+    let mut completed_child: Option<u64> = None;
+
+    while !stack.is_empty() {
+        let next_child = {
+            let frame = stack.last_mut().unwrap();
+            if let Some(id) = completed_child.take() {
+                frame.child_ids.push(id);
+            }
+            if frame.next < frame.children.plans.len() {
+                let plan = frame.children.plans[frame.next];
+                frame.next += 1;
+                Some(plan)
+            } else {
+                None
+            }
+        };
+
+        match next_child {
+            Some(plan) => {
+                let child_frame = enter_raster_frame(nodes, plan.value, plan.node_offset)?;
+                stack.push(child_frame);
+            }
+            None => {
+                let frame = stack.pop().unwrap();
+                let kind =
+                    finalize_raster_kind(frame.value, &frame.child_ids, &frame.children.hashes)?;
+                nodes[frame.node_id as usize].kind = kind;
+                completed_child = Some(frame.node_id);
+            }
+        }
+    }
+
+    Ok((root_id, root_hash))
 }
 
 pub fn encode_raster_value<T: Serialize>(value: &T) -> CoreResult<(Vec<u8>, Vec<u8>, String)> {
