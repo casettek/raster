@@ -224,7 +224,8 @@ impl TraceCommitment {
         }
     }
 
-    /// Try to create a commitment from items, returning an error if the trace is empty.
+    /// Try to create a commitment from items, returning an error if the trace
+    /// is empty or too short for the fraud-proof window.
     pub fn try_from(
         trace: &Trace,
         seed: &[u8],
@@ -233,12 +234,72 @@ impl TraceCommitment {
         if trace.is_empty() {
             return Err(BitPackerError::EmptyTrace);
         }
+        if trace.len() <= window_config.window_size {
+            return Err(BitPackerError::InvalidWindow(format!(
+                "Trace has {} steps but fraud proof window size {} requires at least {}; \
+                 use a smaller window size",
+                trace.len(),
+                window_config.window_size,
+                window_config.window_size + 1
+            )));
+        }
         Ok(Self::from(trace, seed, window_config))
     }
 
     /// Fraud-proof window size this commitment was built with.
     pub fn window_size(&self) -> usize {
         self.revealed_items.len()
+    }
+
+    /// Check structural consistency of a (possibly untrusted) deserialized
+    /// commitment, so the verifier can reject a malformed file instead of
+    /// panicking on it.
+    ///
+    /// This does not prove the commitment is honest — catching wrong hashes
+    /// or fingerprints is verification's job — only that its fields are
+    /// consistent with each other.
+    pub fn validate(&self) -> Result<()> {
+        let bits_per_item = self.fingerprint.bits_per_item();
+        if !(MIN_BITS_PER_ITEM..=MAX_BITS_PER_ITEM).contains(&bits_per_item) {
+            return Err(BitPackerError::InvalidCommitment(format!(
+                "Fingerprint claims {} bits per item, expected between {} and {}",
+                bits_per_item, MIN_BITS_PER_ITEM, MAX_BITS_PER_ITEM
+            )));
+        }
+
+        let window_size = self.window_size();
+        if window_size == 0 || window_size > MAX_FRAUD_PROOF_WINDOW_SIZE {
+            return Err(BitPackerError::InvalidCommitment(format!(
+                "Commitment reveals {} items, expected between 1 and {}",
+                window_size, MAX_FRAUD_PROOF_WINDOW_SIZE
+            )));
+        }
+
+        // The fingerprint holds one entry per trace step and a valid
+        // commitment requires the trace to be strictly longer than the
+        // window, so the window can never outgrow the fingerprint.
+        if self.fingerprint.len() <= window_size {
+            return Err(BitPackerError::InvalidCommitment(format!(
+                "Fingerprint covers {} trace steps but the fraud-proof window \
+                 reveals {} items and requires at least {}",
+                self.fingerprint.len(),
+                window_size,
+                window_size + 1
+            )));
+        }
+
+        let expected_blocks = (self.fingerprint.len() * bits_per_item).div_ceil(64);
+        if self.fingerprint.bits.len() != expected_blocks {
+            return Err(BitPackerError::InvalidCommitment(format!(
+                "Fingerprint claims {} items of {} bits ({} packed blocks) but holds {} blocks",
+                self.fingerprint.len(),
+                bits_per_item,
+                expected_blocks,
+                self.fingerprint.bits.len()
+            )));
+        }
+
+        Ok(())
     }
 
     /// Get the frontier (partial Merkle path) at position n.
@@ -621,7 +682,13 @@ pub enum VerificationResult {
 }
 
 impl<'a> TraceVerifier<'a> {
-    pub fn new(trace_commitment: TraceCommitment, seed: &[u8], cfs: &'a ControlFlowSchema) -> Self {
+    pub fn new(
+        trace_commitment: TraceCommitment,
+        seed: &[u8],
+        cfs: &'a ControlFlowSchema,
+    ) -> Result<Self> {
+        trace_commitment.validate()?;
+
         let mut trace_tree = TraceTree::new(1);
         trace_tree.append(Bytes(seed.to_vec()));
 
@@ -640,7 +707,7 @@ impl<'a> TraceVerifier<'a> {
 
         window_frontiers.push(init_frontier.clone());
 
-        Self {
+        Ok(Self {
             trace_commitment,
             cfs,
             seed: seed.to_vec(),
@@ -651,7 +718,7 @@ impl<'a> TraceVerifier<'a> {
 
             window_frontiers,
             window_items,
-        }
+        })
     }
 
     pub fn verify(&mut self, trace: &Trace) -> VerificationResult {
@@ -980,6 +1047,21 @@ mod tests {
         assert!(matches!(result, Err(BitPackerError::EmptyTrace)));
     }
 
+    #[test]
+    fn test_try_from_trace_shorter_than_window() {
+        // The trace must be strictly longer than the window, so both a
+        // shorter and an equal-length trace are rejected.
+        for trace_len in [1, 2] {
+            let items = Trace((0..trace_len).map(|i| make_tile_trace_item(i, i)).collect());
+            let result = TraceCommitment::try_from(
+                &items,
+                &precomputed::EMPTY_TRIE_NODES[0],
+                test_window_config(),
+            );
+            assert!(matches!(result, Err(BitPackerError::InvalidWindow(_))));
+        }
+    }
+
     /// Test that guest-style compute_root matches bridgetree's root for various frontiers.
     #[test]
     fn test_compute_root_matches_bridgetree() {
@@ -1085,7 +1167,8 @@ mod tests {
         );
         let cfs = make_test_cfs();
         let mut trace_verifier =
-            TraceVerifier::new(trace_commitment, &precomputed::EMPTY_TRIE_NODES[0], &cfs);
+            TraceVerifier::new(trace_commitment, &precomputed::EMPTY_TRIE_NODES[0], &cfs)
+                .expect("valid commitment");
 
         let verification_result = trace_verifier.verify(&trace);
         assert!(matches!(verification_result, VerificationResult::Ok));
@@ -1104,10 +1187,50 @@ mod tests {
         );
         let cfs = make_test_cfs();
         let mut trace_verifier =
-            TraceVerifier::new(trace_commitment, &precomputed::EMPTY_TRIE_NODES[0], &cfs);
+            TraceVerifier::new(trace_commitment, &precomputed::EMPTY_TRIE_NODES[0], &cfs)
+                .expect("valid commitment");
 
         let verification_result = trace_verifier.verify(&runtime_trace);
         assert!(matches!(verification_result, VerificationResult::Fraud(_)));
+    }
+
+    #[test]
+    fn test_verifier_rejects_structurally_malformed_commitment() {
+        let trace = Trace((0..5).map(|i| make_tile_trace_item(i, i)).collect());
+        let cfs = make_test_cfs();
+        let valid = TraceCommitment::from(
+            &trace,
+            &precomputed::EMPTY_TRIE_NODES[0],
+            test_window_config(),
+        );
+
+        // More revealed items than the fingerprint covers.
+        let mut oversized_window = valid.clone();
+        oversized_window.revealed_items = trace.iter().cloned().collect();
+
+        // No revealed items at all.
+        let mut empty_window = valid.clone();
+        empty_window.revealed_items.clear();
+
+        // Bit packer outside the supported u64 block range.
+        let mut bad_bit_packer = valid.clone();
+        bad_bit_packer.fingerprint.bits_packer = BitPacker(65);
+
+        // Fingerprint claims more items than its bits actually hold.
+        let mut truncated_bits = valid.clone();
+        truncated_bits.fingerprint.bits.pop();
+
+        for malformed in [
+            oversized_window,
+            empty_window,
+            bad_bit_packer,
+            truncated_bits,
+        ] {
+            assert!(matches!(
+                TraceVerifier::new(malformed, &precomputed::EMPTY_TRIE_NODES[0], &cfs),
+                Err(BitPackerError::InvalidCommitment(_))
+            ));
+        }
     }
 
     #[test]
@@ -1126,7 +1249,8 @@ mod tests {
         );
         let cfs = make_item_output_dependency_cfs();
         let mut trace_verifier =
-            TraceVerifier::new(trace_commitment, &precomputed::EMPTY_TRIE_NODES[0], &cfs);
+            TraceVerifier::new(trace_commitment, &precomputed::EMPTY_TRIE_NODES[0], &cfs)
+                .expect("valid commitment");
 
         let verification_result = trace_verifier.verify(&trace);
         assert!(matches!(verification_result, VerificationResult::Ok));
@@ -1149,7 +1273,8 @@ mod tests {
         );
         let cfs = make_sequence_input_dependency_cfs();
         let mut trace_verifier =
-            TraceVerifier::new(trace_commitment, &precomputed::EMPTY_TRIE_NODES[0], &cfs);
+            TraceVerifier::new(trace_commitment, &precomputed::EMPTY_TRIE_NODES[0], &cfs)
+                .expect("valid commitment");
 
         let verification_result = trace_verifier.verify(&trace);
         assert!(matches!(verification_result, VerificationResult::Ok));
@@ -1172,7 +1297,8 @@ mod tests {
         );
         let cfs = make_nested_sequence_output_dependency_cfs();
         let mut trace_verifier =
-            TraceVerifier::new(trace_commitment, &precomputed::EMPTY_TRIE_NODES[0], &cfs);
+            TraceVerifier::new(trace_commitment, &precomputed::EMPTY_TRIE_NODES[0], &cfs)
+                .expect("valid commitment");
 
         let verification_result = trace_verifier.verify(&trace);
         assert!(matches!(verification_result, VerificationResult::Ok));
@@ -1200,7 +1326,8 @@ mod tests {
         );
         let cfs = make_item_output_dependency_cfs();
         let mut trace_verifier =
-            TraceVerifier::new(trace_commitment, &precomputed::EMPTY_TRIE_NODES[0], &cfs);
+            TraceVerifier::new(trace_commitment, &precomputed::EMPTY_TRIE_NODES[0], &cfs)
+                .expect("valid commitment");
 
         let _ = trace_verifier.verify(&runtime_trace);
     }

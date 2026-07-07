@@ -233,13 +233,13 @@ pub fn run(
         // prefix file with fraud_{NAME}
         //
         if commit_path.starts_with("fraud_") {
-            fraud(&mut trace, commit_path, window_config)
+            fraud(&mut trace, commit_path, window_config)?;
         } else {
-            commit(&trace, commit_path, window_config);
+            commit(&trace, commit_path, window_config)?;
         }
     } else if audit_flag.is_some() {
         let commit_path = audit_flag.expect("Commitment path was provided");
-        let verification_result = verify(&trace, commit_path, &cfs);
+        let verification_result = verify(&trace, commit_path, &cfs)?;
 
         match verification_result {
             VerificationResult::Ok => println!("Verification Success"),
@@ -458,10 +458,11 @@ fn record_trace_event(trace: &mut Trace, trace_recorder: &mut TraceRecorder, eve
     trace.push(step_record);
 }
 
-pub fn fraud(trace: &mut Trace, commit_path: &str, window_config: FraudProofWindowConfig) {
-    let mut commitment_file =
-        std::fs::File::create(commit_path).expect("Failed to create commitemt file");
-
+pub fn fraud(
+    trace: &mut Trace,
+    commit_path: &str,
+    window_config: FraudProofWindowConfig,
+) -> Result<()> {
     let mut rng = rand::rng();
     if let Some(fraud_step) = trace
         .iter_mut()
@@ -500,33 +501,49 @@ pub fn fraud(trace: &mut Trace, commit_path: &str, window_config: FraudProofWind
         }
     };
 
-    let trace_commitment = TraceCommitment::from(trace, &EMPTY_TRIE_NODES[0], window_config);
+    let trace_commitment = TraceCommitment::try_from(trace, &EMPTY_TRIE_NODES[0], window_config)
+        .map_err(|e| Error::Other(e.to_string()))?;
 
     let bytes = postcard::to_allocvec(&trace_commitment).unwrap();
 
-    commitment_file
-        .write_all(&bytes)
-        .expect("Failed to save commitment");
-}
-
-pub fn commit(trace: &Trace, commit_path: &str, window_config: FraudProofWindowConfig) {
     let mut commitment_file =
         std::fs::File::create(commit_path).expect("Failed to create commitemt file");
-
-    let trace_commitment = TraceCommitment::from(trace, &EMPTY_TRIE_NODES[0], window_config);
-    let bytes = postcard::to_allocvec(&trace_commitment).unwrap();
-
     commitment_file
         .write_all(&bytes)
         .expect("Failed to save commitment");
+
+    Ok(())
 }
 
-pub fn verify(trace: &Trace, commit_path: &str, cfs: &ControlFlowSchema) -> VerificationResult {
-    let trace_commitment = read_trace_commitment(commit_path);
+pub fn commit(
+    trace: &Trace,
+    commit_path: &str,
+    window_config: FraudProofWindowConfig,
+) -> Result<()> {
+    let trace_commitment = TraceCommitment::try_from(trace, &EMPTY_TRIE_NODES[0], window_config)
+        .map_err(|e| Error::Other(e.to_string()))?;
+    let bytes = postcard::to_allocvec(&trace_commitment).unwrap();
 
-    let mut trace_verifier = TraceVerifier::new(trace_commitment, &EMPTY_TRIE_NODES[0], cfs);
+    let mut commitment_file =
+        std::fs::File::create(commit_path).expect("Failed to create commitemt file");
+    commitment_file
+        .write_all(&bytes)
+        .expect("Failed to save commitment");
 
-    trace_verifier.verify(trace)
+    Ok(())
+}
+
+pub fn verify(
+    trace: &Trace,
+    commit_path: &str,
+    cfs: &ControlFlowSchema,
+) -> Result<VerificationResult> {
+    let trace_commitment = read_trace_commitment(commit_path)?;
+
+    let mut trace_verifier = TraceVerifier::new(trace_commitment, &EMPTY_TRIE_NODES[0], cfs)
+        .map_err(|e| Error::Other(e.to_string()))?;
+
+    Ok(trace_verifier.verify(trace))
 }
 
 pub fn fraud_proof_path(commit_path: &str) -> PathBuf {
@@ -877,26 +894,30 @@ pub fn prove(
     panic!("Failed to generate fraud proof");
 }
 
-pub fn read_trace_commitment(commit_path: &str) -> TraceCommitment {
-    let mut file = std::fs::File::open(commit_path).unwrap_or_else(|e| {
-        panic!(
+pub fn read_trace_commitment(commit_path: &str) -> Result<TraceCommitment> {
+    let mut file = std::fs::File::open(commit_path).map_err(|e| {
+        Error::Other(format!(
             "Failed to open expected commitment file '{}': {}",
             commit_path, e
-        )
-    });
+        ))
+    })?;
 
     let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes).unwrap_or_else(|e| {
-        panic!(
+    file.read_to_end(&mut bytes).map_err(|e| {
+        Error::Other(format!(
             "Failed to read expected commitment file '{}': {}",
             commit_path, e
-        )
-    });
+        ))
+    })?;
 
-    let trace_commitment: TraceCommitment =
-        postcard::from_bytes(&bytes).expect("Failed to deserialize Trace Commitment");
+    let trace_commitment: TraceCommitment = postcard::from_bytes(&bytes).map_err(|e| {
+        Error::Other(format!(
+            "Failed to deserialize trace commitment from '{}': {}",
+            commit_path, e
+        ))
+    })?;
 
-    trace_commitment
+    Ok(trace_commitment)
 }
 
 #[cfg(test)]
