@@ -20,6 +20,8 @@ pub enum BitPackerError {
     HashError(String),
     /// Invalid window parameters.
     InvalidWindow(String),
+    /// Structurally inconsistent trace commitment (e.g. from an untrusted file).
+    InvalidCommitment(String),
     /// Trace is empty.
     EmptyTrace,
     /// IO error.
@@ -48,6 +50,9 @@ impl fmt::Display for BitPackerError {
             }
             BitPackerError::InvalidWindow(msg) => {
                 write!(f, "Invalid window: {}", msg)
+            }
+            BitPackerError::InvalidCommitment(msg) => {
+                write!(f, "Invalid commitment: {}", msg)
             }
             BitPackerError::EmptyTrace => {
                 write!(f, "Trace is empty")
