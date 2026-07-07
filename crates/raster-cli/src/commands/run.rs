@@ -30,8 +30,8 @@ use raster_prover::authorization::authorize_external_inputs;
 use raster_prover::precomputed::EMPTY_TRIE_NODES;
 use raster_prover::replay::{ReplayResult, Replayer};
 use raster_prover::trace::{
-    Bytes, FraudEvidence, SerializableFrontier, TraceCommitment, TraceTree, TraceVerifier,
-    VerificationResult,
+    Bytes, FraudEvidence, FraudProofWindowConfig, SerializableFrontier, TraceCommitment, TraceTree,
+    TraceVerifier, VerificationResult,
 };
 use raster_prover::transition::step_transitions;
 use raster_runtime::TraceRecorder;
@@ -45,6 +45,7 @@ pub fn run(
     input: Option<&str>,
     input_manifest: Option<&str>,
     commit_flag: Option<&str>,
+    fraud_proof_window_config: Option<FraudProofWindowConfig>,
     audit_flag: Option<&str>,
     _verbose: bool,
     trace_format: TraceFormat,
@@ -225,14 +226,16 @@ pub fn run(
 
     if commit_flag.is_some() {
         let commit_path = commit_flag.expect("Commitment path was provided");
+        let window_config = fraud_proof_window_config
+            .expect("--fraud-proof-window-size is required alongside --commit");
 
         // TODO: temprorary way to generate "fraud" trace commitment
         // prefix file with fraud_{NAME}
         //
         if commit_path.starts_with("fraud_") {
-            fraud(&mut trace, commit_path)
+            fraud(&mut trace, commit_path, window_config)
         } else {
-            commit(&trace, commit_path);
+            commit(&trace, commit_path, window_config);
         }
     } else if audit_flag.is_some() {
         let commit_path = audit_flag.expect("Commitment path was provided");
@@ -455,7 +458,7 @@ fn record_trace_event(trace: &mut Trace, trace_recorder: &mut TraceRecorder, eve
     trace.push(step_record);
 }
 
-pub fn fraud(trace: &mut Trace, commit_path: &str) {
+pub fn fraud(trace: &mut Trace, commit_path: &str, window_config: FraudProofWindowConfig) {
     let mut commitment_file =
         std::fs::File::create(commit_path).expect("Failed to create commitemt file");
 
@@ -497,7 +500,7 @@ pub fn fraud(trace: &mut Trace, commit_path: &str) {
         }
     };
 
-    let trace_commitment = TraceCommitment::from(trace, &EMPTY_TRIE_NODES[0]);
+    let trace_commitment = TraceCommitment::from(trace, &EMPTY_TRIE_NODES[0], window_config);
 
     let bytes = postcard::to_allocvec(&trace_commitment).unwrap();
 
@@ -506,11 +509,11 @@ pub fn fraud(trace: &mut Trace, commit_path: &str) {
         .expect("Failed to save commitment");
 }
 
-pub fn commit(trace: &Trace, commit_path: &str) {
+pub fn commit(trace: &Trace, commit_path: &str, window_config: FraudProofWindowConfig) {
     let mut commitment_file =
         std::fs::File::create(commit_path).expect("Failed to create commitemt file");
 
-    let trace_commitment = TraceCommitment::from(trace, &EMPTY_TRIE_NODES[0]);
+    let trace_commitment = TraceCommitment::from(trace, &EMPTY_TRIE_NODES[0], window_config);
     let bytes = postcard::to_allocvec(&trace_commitment).unwrap();
 
     commitment_file
