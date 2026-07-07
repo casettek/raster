@@ -30,7 +30,7 @@ use raster_prover::authorization::authorize_external_inputs;
 use raster_prover::precomputed::EMPTY_TRIE_NODES;
 use raster_prover::replay::{ReplayResult, Replayer};
 use raster_prover::trace::{
-    Bytes, FraudEvidence, FraudProofWindowConfig, SerializableFrontier, TraceCommitment, TraceTree,
+    Bytes, FraudEvidence, FraudProofConfig, SerializableFrontier, TraceCommitment, TraceTree,
     TraceVerifier, VerificationResult,
 };
 use raster_prover::transition::step_transitions;
@@ -45,7 +45,7 @@ pub fn run(
     input: Option<&str>,
     input_manifest: Option<&str>,
     commit_flag: Option<&str>,
-    fraud_proof_window_config: Option<FraudProofWindowConfig>,
+    fraud_proof_config: Option<FraudProofConfig>,
     audit_flag: Option<&str>,
     _verbose: bool,
     trace_format: TraceFormat,
@@ -226,16 +226,16 @@ pub fn run(
 
     if commit_flag.is_some() {
         let commit_path = commit_flag.expect("Commitment path was provided");
-        let window_config = fraud_proof_window_config
+        let fraud_proof_config = fraud_proof_config
             .expect("--fraud-proof-window-size is required alongside --commit");
 
         // TODO: temprorary way to generate "fraud" trace commitment
         // prefix file with fraud_{NAME}
         //
         if commit_path.starts_with("fraud_") {
-            fraud(&mut trace, commit_path, window_config)?;
+            fraud(&mut trace, commit_path, fraud_proof_config)?;
         } else {
-            commit(&trace, commit_path, window_config)?;
+            commit(&trace, commit_path, fraud_proof_config)?;
         }
     } else if audit_flag.is_some() {
         let commit_path = audit_flag.expect("Commitment path was provided");
@@ -461,7 +461,7 @@ fn record_trace_event(trace: &mut Trace, trace_recorder: &mut TraceRecorder, eve
 pub fn fraud(
     trace: &mut Trace,
     commit_path: &str,
-    window_config: FraudProofWindowConfig,
+    fraud_proof_config: FraudProofConfig,
 ) -> Result<()> {
     let mut rng = rand::rng();
     if let Some(fraud_step) = trace
@@ -501,7 +501,7 @@ pub fn fraud(
         }
     };
 
-    let trace_commitment = TraceCommitment::try_from(trace, &EMPTY_TRIE_NODES[0], window_config)
+    let trace_commitment = TraceCommitment::try_from(trace, &EMPTY_TRIE_NODES[0], fraud_proof_config)
         .map_err(|e| Error::Other(e.to_string()))?;
 
     let bytes = postcard::to_allocvec(&trace_commitment).unwrap();
@@ -518,9 +518,9 @@ pub fn fraud(
 pub fn commit(
     trace: &Trace,
     commit_path: &str,
-    window_config: FraudProofWindowConfig,
+    fraud_proof_config: FraudProofConfig,
 ) -> Result<()> {
-    let trace_commitment = TraceCommitment::try_from(trace, &EMPTY_TRIE_NODES[0], window_config)
+    let trace_commitment = TraceCommitment::try_from(trace, &EMPTY_TRIE_NODES[0], fraud_proof_config)
         .map_err(|e| Error::Other(e.to_string()))?;
     let bytes = postcard::to_allocvec(&trace_commitment).unwrap();
 

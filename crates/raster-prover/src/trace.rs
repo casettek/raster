@@ -139,12 +139,12 @@ pub const MAX_FRAUD_PROOF_WINDOW_SIZE: usize = 1024;
 
 /// Parameters of the fraud-proof window a trace commitment is built with.
 #[derive(Debug, Clone, Copy)]
-pub struct FraudProofWindowConfig {
+pub struct FraudProofConfig {
     pub window_size: usize,
     pub bits_per_item: usize,
 }
 
-impl FraudProofWindowConfig {
+impl FraudProofConfig {
     /// Derive the config from the CLI-provided fraud-proof window size.
     ///
     /// The window size must be a power of two no greater than
@@ -192,14 +192,14 @@ impl TraceCommitment {
     pub fn from(
         trace: &Trace,
         seed: &[u8],
-        window_config: FraudProofWindowConfig,
+        fraud_proof_config: FraudProofConfig,
     ) -> TraceCommitment {
         assert!(
-            trace.len() > window_config.window_size,
+            trace.len() > fraud_proof_config.window_size,
             "Trace length can't be less than verification window"
         );
 
-        let revealed_items = trace[..window_config.window_size].to_vec();
+        let revealed_items = trace[..fraud_proof_config.window_size].to_vec();
 
         let items_hashes: Vec<Vec<u8>> = trace.iter().map(|item| item.hash()).collect();
 
@@ -207,7 +207,7 @@ impl TraceCommitment {
         trace_tree.append(Bytes(seed.to_vec()));
 
         let mut fingerprint_acc =
-            FingerprintAccumulator::new(BitPacker(window_config.bits_per_item));
+            FingerprintAccumulator::new(BitPacker(fraud_proof_config.bits_per_item));
 
         for item_hash in &items_hashes {
             trace_tree.append(Bytes(item_hash.clone()));
@@ -229,21 +229,21 @@ impl TraceCommitment {
     pub fn try_from(
         trace: &Trace,
         seed: &[u8],
-        window_config: FraudProofWindowConfig,
+        fraud_proof_config: FraudProofConfig,
     ) -> Result<TraceCommitment> {
         if trace.is_empty() {
             return Err(BitPackerError::EmptyTrace);
         }
-        if trace.len() <= window_config.window_size {
+        if trace.len() <= fraud_proof_config.window_size {
             return Err(BitPackerError::InvalidWindow(format!(
                 "Trace has {} steps but fraud proof window size {} requires at least {}; \
                  use a smaller window size",
                 trace.len(),
-                window_config.window_size,
-                window_config.window_size + 1
+                fraud_proof_config.window_size,
+                fraud_proof_config.window_size + 1
             )));
         }
-        Ok(Self::from(trace, seed, window_config))
+        Ok(Self::from(trace, seed, fraud_proof_config))
     }
 
     /// Fraud-proof window size this commitment was built with.
@@ -809,17 +809,17 @@ mod tests {
 
     /// Window config used by the tests: wide enough fingerprint bits to make
     /// fraud detection deterministic on the small fixed traces below.
-    fn test_window_config() -> FraudProofWindowConfig {
-        FraudProofWindowConfig {
+    fn test_fraud_proof_config() -> FraudProofConfig {
+        FraudProofConfig {
             window_size: 2,
             bits_per_item: 16,
         }
     }
 
     #[test]
-    fn test_fraud_proof_window_config_from_window_size() {
+    fn test_fraud_proof_config_from_window_size() {
         for (window_size, expected_bits) in [(2, 64), (32, 4), (128, 1), (256, 1), (1024, 1)] {
-            let config = FraudProofWindowConfig::from_window_size(window_size)
+            let config = FraudProofConfig::from_window_size(window_size)
                 .expect("power-of-two window size within limit");
             assert_eq!(config.window_size, window_size);
             assert_eq!(config.bits_per_item, expected_bits);
@@ -830,7 +830,7 @@ mod tests {
         // bit packer's u64 blocks.
         for window_size in [0, 1, 3, 100, 2048] {
             assert!(matches!(
-                FraudProofWindowConfig::from_window_size(window_size),
+                FraudProofConfig::from_window_size(window_size),
                 Err(BitPackerError::InvalidWindow(_))
             ));
         }
@@ -1017,12 +1017,12 @@ mod tests {
         let binded_trace = TraceCommitment::from(
             &items,
             &precomputed::EMPTY_TRIE_NODES[0],
-            test_window_config(),
+            test_fraud_proof_config(),
         );
         let ref_binded_trace = TraceCommitment::from(
             &ref_items,
             &precomputed::EMPTY_TRIE_NODES[0],
-            test_window_config(),
+            test_fraud_proof_config(),
         );
 
         // Check that different items produce different commitments
@@ -1042,7 +1042,7 @@ mod tests {
         let result = TraceCommitment::try_from(
             &items,
             &precomputed::EMPTY_TRIE_NODES[0],
-            test_window_config(),
+            test_fraud_proof_config(),
         );
         assert!(matches!(result, Err(BitPackerError::EmptyTrace)));
     }
@@ -1056,7 +1056,7 @@ mod tests {
             let result = TraceCommitment::try_from(
                 &items,
                 &precomputed::EMPTY_TRIE_NODES[0],
-                test_window_config(),
+                test_fraud_proof_config(),
             );
             assert!(matches!(result, Err(BitPackerError::InvalidWindow(_))));
         }
@@ -1163,7 +1163,7 @@ mod tests {
         let trace_commitment = TraceCommitment::from(
             &trace,
             &precomputed::EMPTY_TRIE_NODES[0],
-            test_window_config(),
+            test_fraud_proof_config(),
         );
         let cfs = make_test_cfs();
         let mut trace_verifier =
@@ -1183,7 +1183,7 @@ mod tests {
         let trace_commitment = TraceCommitment::from(
             &committed_trace,
             &precomputed::EMPTY_TRIE_NODES[0],
-            test_window_config(),
+            test_fraud_proof_config(),
         );
         let cfs = make_test_cfs();
         let mut trace_verifier =
@@ -1201,7 +1201,7 @@ mod tests {
         let valid = TraceCommitment::from(
             &trace,
             &precomputed::EMPTY_TRIE_NODES[0],
-            test_window_config(),
+            test_fraud_proof_config(),
         );
 
         // More revealed items than the fingerprint covers.
@@ -1245,7 +1245,7 @@ mod tests {
         let trace_commitment = TraceCommitment::from(
             &trace,
             &precomputed::EMPTY_TRIE_NODES[0],
-            test_window_config(),
+            test_fraud_proof_config(),
         );
         let cfs = make_item_output_dependency_cfs();
         let mut trace_verifier =
@@ -1269,7 +1269,7 @@ mod tests {
         let trace_commitment = TraceCommitment::from(
             &trace,
             &precomputed::EMPTY_TRIE_NODES[0],
-            test_window_config(),
+            test_fraud_proof_config(),
         );
         let cfs = make_sequence_input_dependency_cfs();
         let mut trace_verifier =
@@ -1293,7 +1293,7 @@ mod tests {
         let trace_commitment = TraceCommitment::from(
             &trace,
             &precomputed::EMPTY_TRIE_NODES[0],
-            test_window_config(),
+            test_fraud_proof_config(),
         );
         let cfs = make_nested_sequence_output_dependency_cfs();
         let mut trace_verifier =
@@ -1322,7 +1322,7 @@ mod tests {
         let trace_commitment = TraceCommitment::from(
             &committed_trace,
             &precomputed::EMPTY_TRIE_NODES[0],
-            test_window_config(),
+            test_fraud_proof_config(),
         );
         let cfs = make_item_output_dependency_cfs();
         let mut trace_verifier =

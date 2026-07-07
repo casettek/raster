@@ -7,7 +7,7 @@ mod utils;
 
 use clap::{Parser, ValueEnum};
 use raster_core::Result;
-use raster_prover::trace::FraudProofWindowConfig;
+use raster_prover::trace::FraudProofConfig;
 
 #[derive(Parser)]
 #[command(name = "cargo-raster")]
@@ -142,7 +142,7 @@ enum Commands {
         input_manifest: Option<String>,
 
         /// Write trace to file (mutually exclusive with --audit)
-        #[arg(long, conflicts_with = "audit", requires = "fraud_proof_window_size")]
+        #[arg(long, conflicts_with = "audit", requires = "fraud_proof_config")]
         commit: Option<String>,
 
         /// Number of trace items covered by a fraud-proof window; must be a
@@ -152,10 +152,10 @@ enum Commands {
         /// derive it from the commitment file.
         #[arg(
             long = "fraud-proof-window-size",
-            value_parser = parse_fraud_proof_window_size,
+            value_parser = parse_fraud_proof_config,
             requires = "commit"
         )]
-        fraud_proof_window_size: Option<FraudProofWindowConfig>,
+        fraud_proof_config: Option<FraudProofConfig>,
 
         /// Read and verify trace from file (mutually exclusive with --commit)
         #[arg(long, conflicts_with = "commit")]
@@ -185,13 +185,13 @@ enum Commands {
 
 /// Parse and validate the --fraud-proof-window-size argument into the
 /// fraud-proof window parameters used for building trace commitments.
-fn parse_fraud_proof_window_size(
+fn parse_fraud_proof_config(
     value: &str,
-) -> std::result::Result<FraudProofWindowConfig, String> {
+) -> std::result::Result<FraudProofConfig, String> {
     let window_size: usize = value
         .parse()
         .map_err(|_| format!("'{value}' is not a valid window size"))?;
-    FraudProofWindowConfig::from_window_size(window_size).map_err(|e| e.to_string())
+    FraudProofConfig::from_window_size(window_size).map_err(|e| e.to_string())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -276,7 +276,7 @@ fn try_main() -> Result<()> {
             input,
             input_manifest,
             commit,
-            fraud_proof_window_size,
+            fraud_proof_config,
             audit,
             verbose,
             trace_format,
@@ -288,7 +288,7 @@ fn try_main() -> Result<()> {
             input.as_deref(),
             input_manifest.as_deref(),
             commit.as_deref(),
-            fraud_proof_window_size,
+            fraud_proof_config,
             audit.as_deref(),
             verbose,
             trace_format,
