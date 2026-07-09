@@ -22,18 +22,16 @@ fn resolved_source_at<'a>(input: &'a FnInput, index: usize) -> ResolvedSource<'a
 
     match value {
         FnInputValue::Inline(bytes) => ResolvedSource::Inline(bytes),
-        FnInputValue::ExternalBinding => ResolvedSource::External(
-            input
-                .external()
-                .get(&arg.name)
-                .unwrap_or_else(|| panic!("Missing external input metadata for arg '{}'", arg.name)),
-        ),
-        FnInputValue::InternalBinding => ResolvedSource::Internal(
-            input
-                .internal()
-                .get(&arg.name)
-                .unwrap_or_else(|| panic!("Missing internal input metadata for arg '{}'", arg.name)),
-        ),
+        FnInputValue::ExternalBinding => {
+            ResolvedSource::External(input.external().get(&arg.name).unwrap_or_else(|| {
+                panic!("Missing external input metadata for arg '{}'", arg.name)
+            }))
+        }
+        FnInputValue::InternalBinding => {
+            ResolvedSource::Internal(input.internal().get(&arg.name).unwrap_or_else(|| {
+                panic!("Missing internal input metadata for arg '{}'", arg.name)
+            }))
+        }
     }
 }
 
@@ -205,7 +203,7 @@ pub fn verify_step_record_inputs(
     }
 }
 
-// Verify that current step record corrdinates are in preveious expected next coordinates and with
+// Verify that current step record coordinates are in previous expected next coordinates and with
 // CfsCursor iterate to next expected coordiantes
 pub fn get_next_expected_coordinates(
     cfs_cursor: &CfsCursor,

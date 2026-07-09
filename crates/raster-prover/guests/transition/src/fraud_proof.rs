@@ -2,7 +2,7 @@
 //!
 //! A fraud-proof window is proven one step per guest execution:
 //!
-//! 1. [`FraudProofWindowContenxt::establish`] attaches the step to the chain — either a
+//! 1. [`FraudProofWindowContext::establish`] attaches the step to the chain — either a
 //!    genesis state (`Init`) or a recursively verified previous journal
 //!    (`Next`) — and yields the [`LiveTransition`] to advance.
 //! 2. [`LiveTransition::apply_verified_step`] verifies every recorded aspect
@@ -116,7 +116,7 @@ fn verify_previous_journal(prev_journal: &TransitionJournal, transition_image_id
         transition_image_id_digest,
         &risc0_zkvm::serde::to_vec(prev_journal).unwrap(),
     )
-    .expect("Failed to verify previous transation journal");
+    .expect("Failed to verify previous transition journal");
     assert!(
         transition_image_id == prev_journal.transition_image_id,
         "The transition image ID is not the same within the fraud proof"
@@ -126,7 +126,7 @@ fn verify_previous_journal(prev_journal: &TransitionJournal, transition_image_id
 /// The state we resume from must be exactly the previous journal's output.
 fn assert_state_continuity(prev_journal: &TransitionJournal, transition: &Transition) {
     let TransitionState::Next(prev_transition) = &prev_journal.current_state else {
-        panic!("Provided Transition state does not allign to fraud proof state");
+        panic!("Provided Transition state does not align to fraud proof state");
     };
     assert!(
         prev_transition == transition,
