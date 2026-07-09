@@ -2672,12 +2672,23 @@ fn rewrite_call_recur_macro(expr_macro: &syn::ExprMacro) -> Expr {
     let hidden = format_ident!("__raster_recur_auth_{}", input.tile);
     let source_expr = input.input;
     let input_expr = match input.chunk {
-        Some(chunk_expr) => quote! {
-            ::raster::chunk_auth_ref(
-                ::raster::into_auth_ref(#source_expr),
-                (#chunk_expr) as usize,
-            )
-        },
+        Some(chunk_expr) => {
+            // The chunk size is pinned into the CFS by static discovery, so it
+            // must be an integer literal — anything dynamic would let the
+            // executed chunking diverge from the declared schema.
+            if !matches!(
+                &chunk_expr,
+                Expr::Lit(expr_lit) if matches!(&expr_lit.lit, syn::Lit::Int(_))
+            ) {
+                panic!("call_recur! `chunk = ...` must be an integer literal so it can be pinned in the CFS");
+            }
+            quote! {
+                ::raster::chunk_auth_ref(
+                    ::raster::into_auth_ref(#source_expr),
+                    (#chunk_expr) as usize,
+                )
+            }
+        }
         None => quote! { #source_expr },
     };
     let state_expr = input.state;

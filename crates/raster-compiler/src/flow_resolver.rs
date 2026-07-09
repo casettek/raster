@@ -74,6 +74,7 @@ impl FlowResolver {
                 CallKind::RecursiveTile => SequenceChildItem::RecurTile(RecurTileItem {
                     id: call.callee.clone(),
                     sources: input_sources,
+                    chunk: call.chunk,
                 }),
                 CallKind::RecursiveSequence => {
                     SequenceChildItem::RecurSequence(RecurSequenceItem {
@@ -237,6 +238,7 @@ mod tests {
                     arguments: vec!["name".to_string()],
                     argument_kinds: vec![CallArgumentKind::Identifier],
                     call_kind: CallKind::Tile,
+                    chunk: None,
                 },
                 CallInfo {
                     callee: "exclaim".to_string(),
@@ -244,6 +246,7 @@ mod tests {
                     arguments: vec!["greeting".to_string()],
                     argument_kinds: vec![CallArgumentKind::Identifier],
                     call_kind: CallKind::Tile,
+                    chunk: None,
                 },
             ],
         );
@@ -318,6 +321,7 @@ mod tests {
                 arguments: vec!["\"Raster\".to_string()".to_string()],
                 argument_kinds: vec![CallArgumentKind::Other],
                 call_kind: CallKind::Tile,
+                chunk: None,
             }],
         );
 
