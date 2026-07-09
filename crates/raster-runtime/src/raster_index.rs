@@ -204,6 +204,12 @@ impl RasterIndex {
                         index
                     )));
                 }
+                (SelectorSegment::Range { start, end }, _) => {
+                    return Err(Error::Other(format!(
+                        "Selector range '{}..{}' is not supported for raster-encoded inputs yet",
+                        start, end
+                    )));
+                }
             }
         }
 
@@ -288,6 +294,12 @@ impl RasterIndex {
                     return Err(Error::Other(format!(
                         "Selector index '{}' was not found in selected value",
                         index
+                    )));
+                }
+                (SelectorSegment::Range { start, end }, _) => {
+                    return Err(Error::Other(format!(
+                        "Selector range '{}..{}' is not supported for raster-encoded inputs yet",
+                        start, end
                     )));
                 }
             }

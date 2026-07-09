@@ -2507,6 +2507,7 @@ impl Parse for SequenceCallInput {
 struct RecurCallInput {
     tile: syn::Ident,
     input: Expr,
+    chunk: Option<Expr>,
     state: Option<Expr>,
     output: Option<Expr>,
     args: syn::punctuated::Punctuated<Expr, Token![,]>,
@@ -2532,6 +2533,23 @@ fn parse_named_key(input: ParseStream, expected: &str) -> syn::Result<()> {
     Ok(())
 }
 
+/// Parse an optional `<name> = <expr>,` entry, consuming it only when the next
+/// token is exactly the expected key identifier.
+fn parse_optional_named_expr(input: ParseStream, expected: &str) -> syn::Result<Option<Expr>> {
+    if !input.peek(syn::Ident) {
+        return Ok(None);
+    }
+    let fork = input.fork();
+    let ident: syn::Ident = fork.parse()?;
+    if ident != expected {
+        return Ok(None);
+    }
+    parse_named_key(input, expected)?;
+    let expr: Expr = input.parse()?;
+    input.parse::<Token![,]>()?;
+    Ok(Some(expr))
+}
+
 impl Parse for RecurCallInput {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         parse_named_key(input, "tile")?;
@@ -2542,36 +2560,9 @@ impl Parse for RecurCallInput {
         let input_expr: Expr = input.parse()?;
         input.parse::<Token![,]>()?;
 
-        let lookahead = input.lookahead1();
-        let state = if lookahead.peek(syn::Ident) {
-            let fork = input.fork();
-            let ident: syn::Ident = fork.parse()?;
-            if ident == "state" {
-                parse_named_key(input, "state")?;
-                let state_expr: Expr = input.parse()?;
-                input.parse::<Token![,]>()?;
-                Some(state_expr)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        let output = if input.peek(syn::Ident) {
-            let fork = input.fork();
-            let ident: syn::Ident = fork.parse()?;
-            if ident == "output" {
-                parse_named_key(input, "output")?;
-                let output_expr: Expr = input.parse()?;
-                input.parse::<Token![,]>()?;
-                Some(output_expr)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        let chunk = parse_optional_named_expr(input, "chunk")?;
+        let state = parse_optional_named_expr(input, "state")?;
+        let output = parse_optional_named_expr(input, "output")?;
 
         if state.is_none() && output.is_none() {
             return Err(syn::Error::new(
@@ -2589,6 +2580,7 @@ impl Parse for RecurCallInput {
         Ok(Self {
             tile,
             input: input_expr,
+            chunk,
             state,
             output,
             args,
@@ -2678,7 +2670,16 @@ fn rewrite_call_recur_macro(expr_macro: &syn::ExprMacro) -> Expr {
         )
     });
     let hidden = format_ident!("__raster_recur_auth_{}", input.tile);
-    let input_expr = input.input;
+    let source_expr = input.input;
+    let input_expr = match input.chunk {
+        Some(chunk_expr) => quote! {
+            ::raster::chunk_auth_ref(
+                ::raster::into_auth_ref(#source_expr),
+                (#chunk_expr) as usize,
+            )
+        },
+        None => quote! { #source_expr },
+    };
     let state_expr = input.state;
     let output_expr = input.output;
     let args: Vec<_> = input.args.into_iter().collect();
@@ -3696,14 +3697,31 @@ fn split_selector_expr(expr: Expr) -> (Expr, Vec<proc_macro2::TokenStream>) {
         }
         Expr::Index(ExprIndex { expr, index, .. }) => {
             let (base_expr, mut segments) = split_selector_expr(*expr);
-            let Expr::Lit(expr_lit) = *index else {
-                panic!("select! only supports integer literal indexes");
-            };
-            let syn::Lit::Int(LitInt { .. }) = &expr_lit.lit else {
-                panic!("select! only supports integer literal indexes");
-            };
-            let value = expr_lit.lit.to_token_stream();
-            segments.push(quote! { ::raster::SelectorSegment::Index((#value) as u64) });
+            match *index {
+                Expr::Lit(expr_lit) => {
+                    let syn::Lit::Int(LitInt { .. }) = &expr_lit.lit else {
+                        panic!("select! only supports integer literal indexes");
+                    };
+                    let value = expr_lit.lit.to_token_stream();
+                    segments
+                        .push(quote! { ::raster::SelectorSegment::Index((#value) as u64) });
+                }
+                Expr::Range(expr_range) => {
+                    let syn::RangeLimits::HalfOpen(_) = expr_range.limits else {
+                        panic!("select! range selectors must use half-open `start..end` syntax");
+                    };
+                    let (Some(start), Some(end)) = (expr_range.start, expr_range.end) else {
+                        panic!("select! range selectors require explicit `start..end` bounds");
+                    };
+                    segments.push(quote! {
+                        ::raster::SelectorSegment::Range {
+                            start: (#start) as u64,
+                            end: (#end) as u64,
+                        }
+                    });
+                }
+                _ => panic!("select! only supports integer literal indexes or `start..end` ranges"),
+            }
             (base_expr, segments)
         }
         other => (other, Vec::new()),

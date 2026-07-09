@@ -929,6 +929,11 @@ fn summarize_selector_path(selector: &SelectorPath) -> String {
                 summary.push_str(&alloc::format!("{}", index));
                 summary.push(']');
             }
+            SelectorSegment::Range { start, end } => {
+                summary.push('[');
+                summary.push_str(&alloc::format!("{}..{}", start, end));
+                summary.push(']');
+            }
         }
     }
 
@@ -1343,6 +1348,80 @@ where
         AuthRef::Internal(binding) => {
             let current = (binding.resolve.as_ref())(binding.reference.clone())?;
             Ok(current.value)
+        }
+    }
+}
+
+fn group_into_chunks<T>(items: Vec<T>, chunk: usize) -> Vec<Vec<T>> {
+    let chunk = chunk.max(1);
+    let mut chunks = Vec::with_capacity(items.len().div_ceil(chunk));
+    let mut current = Vec::with_capacity(chunk);
+    for item in items {
+        current.push(item);
+        if current.len() == chunk {
+            chunks.push(core::mem::replace(&mut current, Vec::with_capacity(chunk)));
+        }
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
+/// Adapt a flat list source `AuthRef<Vec<T>>` into a chunked source
+/// `AuthRef<Vec<Vec<T>>>` for `call_recur! { ..., chunk = N }`.
+///
+/// The underlying source binding (name/selector/commitment for external,
+/// reference for internal) is preserved unchanged, so the trace still records a
+/// single authenticated binding for the whole collection. Only the resolved
+/// value is regrouped into contiguous chunks of `chunk` items (the final chunk
+/// may be shorter), turning per-element iteration into per-chunk iteration.
+#[doc(hidden)]
+pub fn chunk_auth_ref<T>(source: AuthRef<Vec<T>>, chunk: usize) -> AuthRef<Vec<Vec<T>>>
+where
+    T: DeserializeOwned + Serialize + 'static,
+{
+    match source {
+        AuthRef::Inline(items) => AuthRef::Inline(group_into_chunks(items, chunk)),
+        AuthRef::External(binding) => {
+            let name = binding.name.clone();
+            let selector = binding.selector.clone();
+            let inner = binding.resolve.clone();
+            AuthRef::External(DeferredAuthExternal {
+                name: binding.name,
+                selector: binding.selector,
+                resolve: Rc::new(move |_| {
+                    let resolved = (inner.as_ref())(ExternalSelection::with_selector(
+                        name.clone(),
+                        selector.clone(),
+                    ))?;
+                    Ok(ExternalValue::new(
+                        resolved.name,
+                        resolved.selector,
+                        resolved.commitment,
+                        resolved.selected,
+                        group_into_chunks(resolved.value, chunk),
+                    ))
+                }),
+            })
+        }
+        AuthRef::Internal(binding) => {
+            let reference = binding.reference.clone();
+            let inner = binding.resolve.clone();
+            AuthRef::Internal(DeferredAuthInternal {
+                reference: binding.reference,
+                resolve: Rc::new(move |_| {
+                    let resolved = (inner.as_ref())(reference.clone())?;
+                    Ok(InternalValue::new_with_selection(
+                        resolved.reference,
+                        resolved.bytes,
+                        resolved.selector,
+                        resolved.selection,
+                        group_into_chunks(resolved.value, chunk),
+                    ))
+                }),
+                marker: PhantomData,
+            })
         }
     }
 }
