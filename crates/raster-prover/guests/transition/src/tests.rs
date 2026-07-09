@@ -160,9 +160,8 @@ fn producer_sequence_cfs() -> CfsCursor {
                     }),
                     SequenceChildItem::Tile(TileItem {
                         id: "consumer".into(),
-                        sources: vec![InputBinding::ProducerOutput {
-                            item_index: 0,
-                            output_index: 0,
+                        sources: vec![InputBinding::PriorItemOutput {
+                            intra_sequence_item_index: 0,
                         }],
                     }),
                 ],

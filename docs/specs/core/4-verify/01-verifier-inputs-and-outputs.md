@@ -146,7 +146,7 @@ Input bindings use a tagged enum shape:
 - `InputSource` is encoded as an object with `"type"` plus fields:
   - `{ "type": "external" }`
   - `{ "type": "seq_input", "input_index": <usize> }`
-  - `{ "type": "item_output", "item_index": <usize>, "output_index": <usize> }`
+  - `{ "type": "prior_item_output", "intra_sequence_item_index": <usize> }`
 
 **Gap (verifier integration)**:
 - No verifier consumes the CFS today. There is no implemented algorithm that uses CFS dataflow to determine what must run next, or to validate a trace against the CFS.

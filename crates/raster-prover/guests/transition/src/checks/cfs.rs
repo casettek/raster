@@ -155,23 +155,22 @@ pub fn verify_step_record_inputs(
                 let scope_source = resolved_source_at(sequence_scope_witness, *input_index);
                 assert_same_source(resolved_source, scope_source);
             }
-            InputBinding::ProducerOutput {
-                item_index,
-                output_index: _,
+            InputBinding::PriorItemOutput {
+                intra_sequence_item_index,
             } => {
                 assert!(
-                    *item_index < item_coordinate as usize,
+                    *intra_sequence_item_index < item_coordinate as usize,
                     "Step {:?} cannot depend on source item {} from the same or a future position {}",
                     step_record,
-                    item_index,
+                    intra_sequence_item_index,
                     item_coordinate
                 );
 
                 let mut source_coordinates = parent_sequence_coordinates.clone();
                 source_coordinates.push(
-                    (*item_index)
+                    (*intra_sequence_item_index)
                         .try_into()
-                        .expect("Producer item index exceeds CFS coordinate bounds"),
+                        .expect("Prior item output index exceeds CFS coordinate bounds"),
                 );
                 let internal_meta = match resolved_source {
                     ResolvedSource::Internal(meta) => meta,
@@ -184,20 +183,20 @@ pub fn verify_step_record_inputs(
                 };
                 match cfs_cursor
                     .try_get_item(&source_coordinates)
-                    .expect("Expected producer item coordinates to resolve in CFS")
+                    .expect("Expected prior item output coordinates to resolve in CFS")
                 {
                     raster_core::cfs::SequenceChildItem::Sequence(_)
                     | raster_core::cfs::SequenceChildItem::RecurSequence(_) => {
                         assert!(
                             has_coordinate_prefix(&internal_meta.coordinates, &source_coordinates),
-                            "Internal input producer coordinates do not descend from expected sequence source",
+                            "Internal input prior-item-output coordinates do not descend from expected sequence source",
                         );
                     }
                     raster_core::cfs::SequenceChildItem::Tile(_)
                     | raster_core::cfs::SequenceChildItem::RecurTile(_) => {
                         assert_eq!(
                             internal_meta.coordinates, source_coordinates,
-                            "Internal input producer coordinates do not match expected CFS source",
+                            "Internal input prior-item-output coordinates do not match expected CFS source",
                         );
                     }
                 }

@@ -117,7 +117,7 @@ The discovery step extracts:
 
 - `tile_id`: the Rust function name
 - `input_count`: the number of parameters in the parsed signature (`syn`)
-- `output_count`: `0` if there is no return type, otherwise `1` (current limitation: no tuple/multi-output arity detection)
+- `output_count`: `0` if there is no return type, otherwise `1` (a has-return flag; a tuple return is a single output object whose elements are selector-addressed)
 - `tile_type`: parsed from `kind = iter|recur` if present, otherwise defaults to `"iter"`
 - optional metadata: `description`, `estimated_cycles`, `max_memory` (if present as key/value pairs in `#[tile(...)]`)
 
@@ -133,7 +133,7 @@ The discovery step extracts:
 #### Implementation gaps / caveats
 
 - Tile kind is read only from the `kind = ...` key/value form. Positional forms like `#[tile(recur)]` are not interpreted as setting the kind.
-- Output arity is currently modeled only as `0` vs `1` (no tuple/multi-output arity detection).
+- Output arity is modeled as `0` vs `1`: a has-return flag. There is no output-slot concept; a tuple return commits as one object and consumers select elements via selector paths.
 
 ### Stage B: Parse/collect sequences (source discovery)
 
@@ -181,7 +181,7 @@ Today, the compiler/CFS builder does **not** fully validate:
 
 - that every referenced `callee` in a sequence is a known tile or sequence,
 - that argument counts match tile/sequence input arity,
-- that result bindings correctly handle multi-output tiles (currently treated as single-output),
+- that result bindings handle destructuring patterns (only single named bindings like `let x = callee(...)` are extracted),
 - that unresolved expressions are representable (unresolved args are treated as “external” inputs).
 
 Tools consuming the CFS MUST treat it as a best-effort, compiler-produced description rather than a fully typechecked program.
@@ -224,7 +224,7 @@ For each discovered sequence:
 - The builder MUST compute `SequenceDef.items` by applying `FlowResolver`:
   - For each call, inputs are resolved as:
     - `seq_input(i)` if the argument string matches a parameter name
-    - `item_output(j, 0)` if the argument string matches a previously bound variable (single-output assumption)
+    - `prior_item_output(j)` if the argument string matches a previously bound variable
     - otherwise `external`
   - `SequenceItem.item_type` MUST be `"tile"` if the callee matches a discovered tile, `"sequence"` if it matches a discovered sequence, otherwise `"tile"` (fallback).
 
@@ -373,6 +373,6 @@ fn greet_sequence(name: String) -> String {
 the generated CFS items for `greet_sequence` will bind:
 
 - `greet`’s input to `seq_input(0)` (because `name` matches the first parameter name)
-- `exclaim`’s input to `item_output(0, 0)` (because `greeting` is bound to the first call’s output)
+- `exclaim`’s input to `prior_item_output(0)` (because `greeting` is bound to the first call’s output)
 
 If an argument cannot be resolved (e.g., a literal or expression), it will be treated as `external`.

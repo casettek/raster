@@ -9,38 +9,26 @@ use raster_core::cfs::{
 use std::collections::HashMap;
 
 use crate::ast::{CallArgumentKind, CallInfo, CallKind};
-use crate::sequence::{Sequence, SequenceDiscovery};
-use crate::tile::TileDiscovery;
+use crate::sequence::Sequence;
 
 /// Resolves data flow within a sequence, producing `SequenceItem`s with
 /// correctly bound input sources.
-pub struct FlowResolver<'a, 'ast> {
-    /// Map of variable names to their source (item_index, output_index).
-    bindings: HashMap<String, (usize, usize)>,
+#[derive(Default)]
+pub struct FlowResolver {
+    /// Map of variable names to the item index that produced them.
+    bindings: HashMap<String, usize>,
     /// Sequence parameter names mapped to their input index.
     param_indices: HashMap<String, usize>,
-    /// Known tiles for looking up output counts.
-    tile_discovery: &'a TileDiscovery<'ast>,
-    /// Known sequences for looking up output counts (for nested sequences).
-    sequence_discovery: &'a SequenceDiscovery<'ast>,
 }
 
-impl<'a, 'ast> FlowResolver<'a, 'ast> {
+impl FlowResolver {
     /// Create a new flow resolver.
-    pub fn new(
-        tile_discovery: &'a TileDiscovery<'ast>,
-        sequence_discovery: &'a SequenceDiscovery<'ast>,
-    ) -> Self {
-        Self {
-            bindings: HashMap::new(),
-            param_indices: HashMap::new(),
-            tile_discovery,
-            sequence_discovery,
-        }
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Resolve a discovered sequence into a list of `SequenceChild`s with input sources.
-    pub fn resolve(&mut self, sequence: &Sequence<'ast>) -> Vec<SequenceChildItem> {
+    pub fn resolve(&mut self, sequence: &Sequence<'_>) -> Vec<SequenceChildItem> {
         // Reset state for this sequence
         self.bindings.clear();
         self.param_indices.clear();
@@ -103,8 +91,7 @@ impl<'a, 'ast> FlowResolver<'a, 'ast> {
 
             // If this call has a result binding, record it
             if let Some(ref binding_name) = call.result_binding {
-                // For now, assume single output (output_index = 0)
-                self.bindings.insert(binding_name.clone(), (item_index, 0));
+                self.bindings.insert(binding_name.clone(), item_index);
             }
         }
 
@@ -130,8 +117,8 @@ impl<'a, 'ast> FlowResolver<'a, 'ast> {
         }
 
         // Check if it's a bound variable from a previous item
-        if let Some(&(item_index, output_index)) = self.bindings.get(arg) {
-            return InputBinding::internal_store(item_index, output_index);
+        if let Some(&item_index) = self.bindings.get(arg) {
+            return InputBinding::prior_item_output(item_index);
         }
 
         match kind {
@@ -149,7 +136,7 @@ mod tests {
     use crate::ast::MacroAstItem;
     use crate::ast::ProjectAst;
     use crate::sequence::SequenceStep;
-    use crate::tile::Tile;
+    use crate::tile::{Tile, TileDiscovery};
     use crate::Project;
     use raster_core::cfs::InputSource;
     use std::collections::HashMap;
@@ -238,10 +225,6 @@ mod tests {
             project: &project,
             tiles: vec![greet_tile, exclaim_tile],
         };
-        let sequence_discovery = SequenceDiscovery {
-            project: &project,
-            sequences: vec![],
-        };
 
         // Create sequence function with call infos
         let seq_func = make_sequence_function(
@@ -274,7 +257,7 @@ mod tests {
             description: None,
         };
 
-        let mut resolver = FlowResolver::new(&tile_discovery, &sequence_discovery);
+        let mut resolver = FlowResolver::new();
         let items = resolver.resolve(&sequence);
 
         assert_eq!(items.len(), 2);
@@ -292,20 +275,18 @@ mod tests {
             _ => panic!("Expected Tile item"),
         }
 
-        // Second item: exclaim(greeting) where greeting is internal_store[0][0]
+        // Second item: exclaim(greeting) where greeting is item 0's output
         match &items[1] {
             SequenceChildItem::Tile(tile_item) => {
                 assert_eq!(tile_item.id, "exclaim");
                 assert_eq!(tile_item.sources.len(), 1);
                 match &tile_item.sources[0] {
-                    InputBinding::ProducerOutput {
-                        item_index,
-                        output_index,
+                    InputBinding::PriorItemOutput {
+                        intra_sequence_item_index,
                     } => {
-                        assert_eq!(*item_index, 0);
-                        assert_eq!(*output_index, 0);
+                        assert_eq!(*intra_sequence_item_index, 0);
                     }
-                    _ => panic!("Expected ProducerOutput"),
+                    _ => panic!("Expected PriorItemOutput"),
                 }
             }
             _ => panic!("Expected Tile item"),
@@ -327,10 +308,6 @@ mod tests {
             project: &project,
             tiles: vec![tile],
         };
-        let sequence_discovery = SequenceDiscovery {
-            project: &project,
-            sequences: vec![],
-        };
 
         let seq_func = make_sequence_function(
             "main",
@@ -350,7 +327,7 @@ mod tests {
             description: None,
         };
 
-        let mut resolver = FlowResolver::new(&tile_discovery, &sequence_discovery);
+        let mut resolver = FlowResolver::new();
         let items = resolver.resolve(&sequence);
 
         match &items[0] {

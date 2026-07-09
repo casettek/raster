@@ -43,7 +43,6 @@ It is written to match the current codebase. Where the intended behavior (CFS en
   - `crates/raster-compiler/src/flow_resolver.rs`
     - `FlowResolver::resolve_argument`
     - **Current gap**: unresolved arguments fall back to `InputSource::External` instead of producing a validation error.
-    - **Current gap**: output bindings assume `output_index = 0` unconditionally.
 
 ### Artifact identity and zkVM verification
 
@@ -77,7 +76,7 @@ It is written to match the current codebase. Where the intended behavior (CFS en
   - any requested proof verification.
 - **Audit failure**: a condition that MUST cause audit execution to be rejected (see below). In a future implementation, audit failures should surface as structured errors; today they may only be observable as `verified = false` or as backend errors (gaps noted).
 - **Artifact identity / method ID**: in the RISC0 backend, the **method ID** is the image ID computed from an ELF via `risc0_zkvm::compute_image_id(&elf)`.
-- **Binding**: how each input to a tile/sequence call is sourced: external input, a sequence input, or a previous item’s output (`InputSource::{External, SeqInput, ItemOutput}`).
+- **Binding**: how each input to a tile/sequence call is sourced: a direct semantic source, a sequence input, or a previous item’s output (`InputBinding::{Direct, SequenceScope, PriorItemOutput}`).
 
 ---
 
@@ -159,16 +158,15 @@ For each `SequenceItem`, audit execution MUST validate each `InputBinding` befor
 - If the binding is `External`, the runner MUST require the caller to provide that input value at runtime.
 - If the binding is `SeqInput { input_index }`:
   - `input_index` MUST be in-range for the current sequence’s declared inputs.
-- If the binding is `ItemOutput { item_index, output_index }`:
-  - `item_index` MUST refer to a prior item (`item_index < current_item_index`).
-  - `output_index` MUST be in-range for the referenced item’s output arity.
+- If the binding is `PriorItemOutput { intra_sequence_item_index }`:
+  - `intra_sequence_item_index` MUST refer to a prior item (`intra_sequence_item_index < current_item_index`).
+  - The binding resolves to the referenced item's single committed output object; sub-value access is addressed by selector paths verified via selection commitments.
 
 If any of these conditions fail, audit execution MUST fail.
 
 **Current gap**:
 
 - `FlowResolver::resolve_argument` falls back to `External` when it cannot resolve an argument, which can silently turn an unbound variable or expression into an “external input”.
-- The compiler path currently assumes a single output (`output_index = 0`) for all bindings.
 
 ### C) Artifact identity checks
 
@@ -209,8 +207,8 @@ The artifact writer emits a `manifest.json` of the form:
 
 ### Example: audit failure conditions (illustrative)
 
-- **Invalid binding**: a `SequenceItem` refers to `ItemOutput { item_index: 5, output_index: 0 }` while executing item 3.
-  - Audit execution fails because `item_index < current_item_index` is violated.
+- **Invalid binding**: a `SequenceItem` refers to `PriorItemOutput { intra_sequence_item_index: 5 }` while executing item 3.
+  - Audit execution fails because `intra_sequence_item_index < current_item_index` is violated.
 - **Artifact mismatch**: `method_id` file says `abcd...` but `compute_image_id(guest.elf)` yields `0123...`.
   - Audit execution fails due to artifact identity mismatch.
 - **Invalid proof**: receipt verification fails for the ELF’s computed image ID.

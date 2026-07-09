@@ -24,7 +24,7 @@ This document describes the tile authoring rules and the tile ABI contract as im
     - `SequenceDiscovery` (discovers `#[sequence]`; records only bare-identifier calls like `foo(...)`)
   - `crates/raster-compiler/src/cfs_builder.rs` and `crates/raster-core/src/cfs.rs`
     - `TileDef { type: "iter" | "recur", inputs, outputs }`
-    - Note: `outputs` is currently only `0` or `1` (no tuple/multi-output arity detection), and there is no per-call recursion marker in CFS today.
+    - Note: `outputs` is a has-return flag (`0` or `1`); a tuple return is one committed output object whose elements are selector-addressed. There is no per-call recursion marker in CFS today.
 - **zkVM integration (RISC0)**
   - `crates/raster-backend-risc0/src/guest_builder.rs`
     - Imports and calls the generated tile ABI wrapper directly by symbol name

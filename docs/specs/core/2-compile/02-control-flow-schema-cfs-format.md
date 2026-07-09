@@ -29,7 +29,7 @@ In the current implementation, the CFS is emitted as **pretty-printed JSON** by 
 - **Data-flow binding resolution**
   - `crates/raster-compiler/src/flow_resolver.rs`
     - `FlowResolver::resolve` / `resolve_argument`
-    - Binding model: `SequenceScope` vs `ProducerOutput` vs direct semantic sources (`External` / `Internal` / `Inline`)
+    - Binding model: `SequenceScope` vs `PriorItemOutput` vs direct semantic sources (`External` / `Internal` / `Inline`)
     - Tests: `test_resolve_simple_sequence`
 - **JSON serialization and file emission**
   - `crates/raster-cli/src/commands.rs`
@@ -163,7 +163,7 @@ Example:
   "item_type": "tile",
   "item_id": "exclaim",
   "input_sources": [
-    { "ProducerOutput": { "item_index": 0, "output_index": 0 } }
+    { "PriorItemOutput": { "intra_sequence_item_index": 0 } }
   ]
 }
 ```
@@ -184,9 +184,11 @@ Consumers MUST NOT assume that `item_type` is fully validated or correct in the 
 
 - `Direct(InputSource)` for direct semantic sources
 - `SequenceScope { input_index }` for references to the current sequence invocation scope
-- `ProducerOutput { item_index, output_index }` for references to prior item outputs
+- `PriorItemOutput { intra_sequence_item_index }` for references to a prior item's output
 
-`ProducerOutput` is structural CFS metadata, not a storage offset. During execution and verification it resolves to the internal-store entry keyed by the producer item's execution coordinates.
+`PriorItemOutput` is structural CFS metadata, not a storage offset. During execution and verification it resolves to the internal-store entry keyed by the prior item's execution coordinates.
+
+There is deliberately no output-slot index on `PriorItemOutput`. A prior item commits exactly one internal-store object per execution (keyed by its coordinates); consumers that need a sub-value of that object address it with a selector path into the committed encoding, verified via selection commitments. A tile that logically produces several values returns them as one struct/tuple and each consumer selects the piece it needs; output slots would duplicate that addressing.
 
 Representative JSON encodings under Serde’s default enum representation are:
 
@@ -199,7 +201,7 @@ Representative JSON encodings under Serde’s default enum representation are:
 ```
 
 ```json
-{ "ProducerOutput": { "item_index": 3, "output_index": 0 } }
+{ "PriorItemOutput": { "intra_sequence_item_index": 3 } }
 ```
 
 ### `InputSource`
@@ -217,12 +219,12 @@ Supported variants in the current schema:
 The compiler-side resolver constructs bindings as follows:
 
 - If an argument token exactly matches a sequence parameter name, it MUST be encoded as `SequenceScope { input_index }`.
-- Else if it matches a previously bound variable name, it MUST be encoded as `ProducerOutput { item_index, output_index }`.
+- Else if it matches a previously bound variable name, it MUST be encoded as `PriorItemOutput { intra_sequence_item_index }`.
 - Else it MUST be encoded as `Direct(External)` (fallback).
 
 The current resolver binds only a single result name per call:
 
-- If a call is of the form `let x = callee(...);`, then `x` is recorded as coming from `ProducerOutput { item_index = <this call>, output_index = 0 }`.
+- If a call is of the form `let x = callee(...);`, then `x` is recorded as coming from `PriorItemOutput { intra_sequence_item_index = <this call> }`.
 
 ## Recursion representation
 
@@ -261,14 +263,12 @@ If a consumer validates bindings, it SHOULD enforce:
 
 - For `SequenceScope`:
   - `input_index` MUST be `< SequenceDef.input_sources.len()`.
-- For `ProducerOutput`:
-  - `item_index` MUST be `< current_item_index` (must refer to an earlier item).
-  - `output_index` MUST be `< outputs(item_index)` where `outputs(item_index)` is the callee’s output arity.
+- For `PriorItemOutput`:
+  - `intra_sequence_item_index` MUST be `< current_item_index` (must refer to an earlier item).
 
 Implementation notes:
 
-- The current resolver only produces `ProducerOutput` references to previously-seen bindings, so `item_index < current_item_index` holds for produced CFS.
-- The current resolver always uses `output_index = 0` for bindings, regardless of actual multi-output arity (see “Known gaps”).
+- The current resolver only produces `PriorItemOutput` references to previously-seen bindings, so `intra_sequence_item_index < current_item_index` holds for produced CFS.
 
 ## Known gaps and mismatches (implementation vs intended)
 
@@ -276,8 +276,8 @@ These are places where the current code either does not encode the desired infor
 
 - **No recursive-call intent is encoded**
   - There is no `is_recursive` (or similar) field in `SequenceItem`, and the compiler does not currently extract `callee!(...)` macro invocations as calls.
-- **Multi-output bindings are not modeled**
-  - Tiles can report `outputs > 1` via signature parsing, but the binding resolver records only a single named binding per call and always maps it to `output_index = 0`.
+- **Destructuring bindings are not modeled**
+  - The binding resolver records only a single named binding per call (`let x = callee(...)`). Patterns like `let (a, b) = callee(...)` are not extracted; supporting them means binding each name to a selector path into the prior item's single committed output, not adding output slots to `PriorItemOutput`.
 - **Call extraction and binding resolution are intentionally narrow**
   - Source parsing uses `syn`, but the call extractor only records calls whose callee is a bare identifier (no `::` paths, no method calls, no macro invocations).
   - Binding resolution is based on exact string equality between an argument’s stringified token form and known parameter/binding names; complex expressions and literals typically become `Direct(External)` bindings.
@@ -310,7 +310,7 @@ If a consumer validates or deserializes a CFS, it SHOULD reject inputs that are 
 - Missing required fields (`version`, `project`, `encoding`, `tiles`, `sequences`).
 - Wrong JSON types for required fields.
 - Unknown `InputBinding` / `InputSource` variants.
-- Out-of-range indices in `SequenceScope` / `ProducerOutput` references.
+- Out-of-range indices in `SequenceScope` / `PriorItemOutput` references.
 
 ## End-to-end example
 
@@ -343,7 +343,7 @@ Example CFS JSON for a simple sequence:
           "item_type": "tile",
           "item_id": "exclaim",
           "input_sources": [
-            { "ProducerOutput": { "item_index": 0, "output_index": 0 } }
+            { "PriorItemOutput": { "intra_sequence_item_index": 0 } }
           ]
         }
       ]
