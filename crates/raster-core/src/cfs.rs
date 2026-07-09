@@ -571,9 +571,8 @@ pub enum InputBinding {
     SequenceScope {
         input_index: usize,
     },
-    ProducerOutput {
-        item_index: usize,
-        output_index: usize,
+    PriorItemOutput {
+        intra_sequence_item_index: usize,
     },
 }
 
@@ -603,19 +602,10 @@ impl InputBinding {
         Self::SequenceScope { input_index }
     }
 
-    /// Create a producer-output binding.
-    pub fn item_output(item_index: usize, output_index: usize) -> Self {
-        Self::ProducerOutput {
-            item_index,
-            output_index,
-        }
-    }
-
-    /// Create an internal-store binding sourced from a prior item's committed output.
-    pub fn internal_store(item_index: usize, output_index: usize) -> Self {
-        Self::ProducerOutput {
-            item_index,
-            output_index,
+    /// Create a binding sourced from a prior item's committed output.
+    pub fn prior_item_output(intra_sequence_item_index: usize) -> Self {
+        Self::PriorItemOutput {
+            intra_sequence_item_index,
         }
     }
 }

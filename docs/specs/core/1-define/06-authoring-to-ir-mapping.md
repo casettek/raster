@@ -117,7 +117,7 @@ Each item has:
 - **input_sources**: list of `InputBinding`, one per argument, where each binding wraps an `InputSource`:
   - `external`
   - `seq_input { input_index }`
-  - `item_output { item_index, output_index }`
+  - `prior_item_output { intra_sequence_item_index }`
 
 ## Lowering rules (authoring → discovery IR)
 
@@ -177,7 +177,7 @@ Each discovered tile (`raster_compiler::tile::Tile<'ast>`) lowers to one `TileDe
 - `TileDef.inputs` MUST be the number of parameters in the function signature.
 - `TileDef.outputs` MUST be:
   - `0` when the function has no return type, else
-  - `1` (current limitation: no tuple/multi-output arity detection).
+  - `1` (a has-return flag; a tuple return is a single output object whose elements are selector-addressed).
 
 ### Sequence lowering
 
@@ -201,17 +201,17 @@ For a given sequence:
 
 - A mapping `param_indices` is constructed from `param_names[i] -> i`.
 - A mapping `bindings` is constructed as the sequence is processed left-to-right:
-  - if a call has `result_binding = Some(name)`, then `bindings[name] = (item_index, 0)`
+  - if a call has `result_binding = Some(name)`, then `bindings[name] = intra_sequence_item_index`
 
 For each argument string `arg` in a call’s `arguments`, the compiler binds it as:
 
 - If `arg` matches a parameter name in `param_indices`, it MUST produce `seq_input { input_index }`.
-- Else if `arg` matches a previous `result_binding` in `bindings`, it MUST produce `item_output { item_index, output_index }`.
+- Else if `arg` matches a previous `result_binding` in `bindings`, it MUST produce `prior_item_output { intra_sequence_item_index }`.
 - Else it MUST produce `external`.
 
 **Gaps (dataflow fidelity)**:
 
-- Only output index `0` is used for bindings, even if a tile returns a tuple.
+- Destructuring bindings (`let (a, b) = callee(...)`) are not extracted; a tile returning a tuple commits it as one object, and consumers of individual elements would need selector-path bindings (not yet modeled).
 - Literals and complex expressions are treated as `external` rather than “constant” inputs.
 
 ### Recursive calls
@@ -289,7 +289,7 @@ fn main() {
 - Sequence discovery + call extraction records:
   - `greet_sequence` → calls: `[call!(greet, name) → Tile, call!(exclaim, greeting) → Tile]`
     - `name` resolves to `seq_input(0)`
-    - `greeting` resolves to `item_output(0, 0)` (output of `greet`)
+    - `greeting` resolves to `prior_item_output(0)` (output of `greet`)
 - `main` → calls: `[call_seq!(greet_sequence, name) → Sequence]`
     - `name` resolves to `external`
 
@@ -320,7 +320,7 @@ The CLI emits JSON for `ControlFlowSchema`. The relevant structure looks like:
         {
           "Tile": {
             "id": "exclaim",
-            "sources": [{ "source": { "type": "item_output", "item_index": 0, "output_index": 0 } }]
+            "sources": [{ "source": { "type": "prior_item_output", "intra_sequence_item_index": 0 } }]
           }
         }
       ]
@@ -346,5 +346,5 @@ The CLI emits JSON for `ControlFlowSchema`. The relevant structure looks like:
 - Implement deterministic discovery ordering (sort directory entries and/or sort final `tiles`/`sequences` lists before emitting CFS).
 - Path-qualified calls (e.g., `foo::bar(...)`) and method calls are not extracted — explicitly out of scope for the current call surface.
 - Recursive tile execution (`kind = recur`) is out of scope for `call!` in this round. The `call!` macro expands to a plain function call for `recur` tiles. A dedicated follow-up initiative will add orchestration-driven loop semantics when recursive execution is implemented.
-- Extend dataflow bindings to support tuple outputs (`output_index > 0`) and destructuring bindings.
+- Extend dataflow bindings to support destructuring bindings (`let (a, b) = callee(...)`) by binding each name to a selector path into the prior item's single committed output object; there is no output-slot index in the binding model.
 - Complex argument expressions (literals, compound expressions) fall back to `external` bindings — not modeled as constants.

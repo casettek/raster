@@ -14,7 +14,7 @@ It is written to match the current codebase. Where the intended behavior is not 
     - `TileDef` (`id`, `type`, `inputs`, `outputs`)
     - `SequenceDef` (`id`, `input_sources`, `items`)
     - `SequenceItem` (`item_type`, `item_id`, `input_sources`)
-    - `InputBinding::{Direct, SequenceScope, ProducerOutput}`
+    - `InputBinding::{Direct, SequenceScope, PriorItemOutput}`
     - `InputSource::{External, Internal, Inline}`
 - **How CFS is produced (binding resolution rules that determine what a verifier will see)**
   - `crates/raster-compiler/src/cfs_builder.rs`
@@ -26,7 +26,7 @@ It is written to match the current codebase. Where the intended behavior is not 
   - `crates/raster-compiler/src/flow_resolver.rs`
     - `resolve_argument(...)` mapping:
       - exact param name → `SequenceScope { input_index }`
-      - exact bound name → `ProducerOutput { item_index, output_index }` (currently always `0`)
+    - exact bound name → `PriorItemOutput { intra_sequence_item_index }`
       - otherwise → direct `External` fallback
     - Note: binding resolution is based on exact string equality against parameter/binding names; complex expressions typically fall back to `External`.
 - **Recursive-tile authoring signal**
@@ -128,11 +128,10 @@ A verifier MUST validate the following before attempting next-step derivation:
     - **Current gap:** `SequenceDef.input_sources` is always `external` today, but the length is still meaningful as the parameter count.
 - **Index safety for bindings**
   - For `InputBinding::SequenceScope { input_index }`, `input_index` MUST be within the current sequence invocation’s input vector.
-  - For `InputBinding::ProducerOutput { item_index, output_index }`:
-    - `item_index` MUST be `< current_item_index` (no forward references).
-    - `output_index` MUST be `< outputs_of(item_index)`.
-      - For `item_type=="tile"`, `outputs_of(i) = TileDef.outputs`.
-      - For `item_type=="sequence"`, see §2.4 (gap).
+  - For `InputBinding::PriorItemOutput { intra_sequence_item_index }`:
+    - `intra_sequence_item_index` MUST be `< current_item_index` (no forward references).
+    - The referenced item MUST produce an output (for `item_type=="tile"`, `TileDef.outputs` MUST be non-zero; for `item_type=="sequence"`, see §2.4).
+    - A `PriorItemOutput` binding identifies the prior item only; it resolves to that item's single committed internal-store object (keyed by execution coordinates). Sub-value access is addressed by selector paths verified via selection commitments, not by the binding itself.
 
 #### 2.3 External inputs restrictions
 
@@ -141,20 +140,20 @@ In a fraud-provable setting, any direct `InputBinding::Direct(InputSource::Exter
 Minimum rule set:
 
 - For the entry invocation of `"main"`, direct `External` MAY be used only to reference explicitly committed entry inputs.
-- For non-entry sequences, direct `External` SHOULD NOT appear in item arguments; all arguments SHOULD be derivable from `SequenceScope` or `ProducerOutput`.
+- For non-entry sequences, direct `External` SHOULD NOT appear in item arguments; all arguments SHOULD be derivable from `SequenceScope` or `PriorItemOutput`.
 
 **Current producer behavior:** unresolved arguments (literals, expressions) are encoded as direct `External` bindings by the compiler’s flow resolver. Verifiers MUST treat such CFS instances as not mechanically verifiable unless an out-of-band rule is provided to supply those values.
 
 #### 2.4 Nested sequence outputs (gap)
 
-To support `InputBinding::ProducerOutput` that references a prior item whose `item_type == "sequence"`, a verifier needs:
+To support `InputBinding::PriorItemOutput` that references a prior item whose `item_type == "sequence"`, a verifier needs:
 
 - the output arity of the nested sequence invocation, and
 - a defined rule for how those outputs are produced.
 
-**Current gap:** `raster_core::cfs` does not model sequence output arity, and the compiler currently assumes a single output (`output_index = 0`) when binding `let x = callee(...)` regardless of callee kind.
+**Current gap:** `raster_core::cfs` does not model sequence output arity; the compiler binds `let x = callee(...)` to the prior item without distinguishing callee kind.
 
-Until a sequence-output model exists, verifiers MUST reject any CFS/trace pair that requires selecting outputs from a nested sequence invocation via `ProducerOutput`.
+Until a sequence-output model exists, verifiers MUST reject any CFS/trace pair that requires selecting outputs from a nested sequence invocation via `PriorItemOutput`.
 
 ---
 
@@ -187,12 +186,12 @@ The verifier also has access to the committed prior results to validate that any
 
 ### 4) Deriving required inputs for a call
 
-Given a sequence frame with inputs `seq_inputs[]` (each element is a resolved source descriptor plus canonical bytes), and having access to prior item outputs `item_outputs[item_index][output_index]` (canonical-encoded values) plus the committed internal-write log, the required input for a callee argument is derived as:
+Given a sequence frame with inputs `seq_inputs[]` (each element is a resolved source descriptor plus canonical bytes), and having access to prior item outputs `item_outputs[intra_sequence_item_index]` (each prior item's single canonical-encoded committed value) plus the committed internal-write log, the required input for a callee argument is derived as:
 
 - If `binding == SequenceScope { input_index }`:
   - required value is `seq_inputs[input_index]`.
-- If `binding == ProducerOutput { item_index, output_index }`:
-  - required value is `item_outputs[item_index][output_index]`.
+- If `binding == PriorItemOutput { intra_sequence_item_index }`:
+  - required value is `item_outputs[intra_sequence_item_index]` (or a selector-committed sub-value of it, when the consumer's witness carries a selection proof).
 - If `binding == Direct(External)`:
   - required value MUST come from a committed external input channel associated with the current sequence invocation.
   - If no such committed value exists, verification MUST fail.
@@ -307,7 +306,7 @@ Given this CFS excerpt:
         {
           "item_type": "tile",
           "item_id": "exclaim",
-          "input_sources": [ "ProducerOutput(0,0)" ]
+          "input_sources": [ "PriorItemOutput(0)" ]
         }
       ]
     }
@@ -320,7 +319,7 @@ Let the committed external input for `main` be a single value `name` (canonicall
 Derivation:
 
 - At start, `next_item_index = 0`, so the next required action is tile `greet` with input derived from `SequenceScope(0)`.
-- After `greet` executes, the next required action is tile `exclaim` with its sole argument derived from `ProducerOutput(0,0)`, i.e. the output of `greet`.
+- After `greet` executes, the next required action is tile `exclaim` with its sole argument derived from `PriorItemOutput(0)`, i.e. the output of `greet`.
 
 #### 7.2 External fallback in arguments (not mechanically verifiable)
 

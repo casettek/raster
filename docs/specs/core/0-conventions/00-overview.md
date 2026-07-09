@@ -167,7 +167,7 @@ Input bindings:
 - `source` is an `InputSource` enum tagged with a `type` field and one of:
   - `{ "type": "external" }`
   - `{ "type": "seq_input", "input_index": <usize> }`
-  - `{ "type": "item_output", "item_index": <usize>, "output_index": <usize> }`
+  - `{ "type": "prior_item_output", "intra_sequence_item_index": <usize> }`
 
 #### C.3.2 CFS generation rules (current compiler behavior)
 
@@ -181,7 +181,7 @@ When `raster-compiler` builds a CFS from source:
   - and it ignores method calls and path-qualified calls.
 - For dataflow between calls, it **MUST**:
   - map a sequence parameter name to `seq_input(input_index)`
-  - map a previously bound variable name to `item_output(item_index, 0)` (single-output assumption)
+  - map a previously bound variable name to `prior_item_output(intra_sequence_item_index)`
   - otherwise fall back to `external`
 
 #### C.3.3 Example CFS JSON
@@ -211,7 +211,7 @@ Example for a simple “pipeline” sequence:
           "item_type": "tile",
           "item_id": "exclaim",
           "input_sources": [
-            { "source": { "type": "item_output", "item_index": 0, "output_index": 0 } }
+            { "source": { "type": "prior_item_output", "intra_sequence_item_index": 0 } }
           ]
         }
       ]
@@ -305,13 +305,11 @@ The broader specs restrict “external inputs” to the entry sequence. The curr
 
 Downstream consumers **MUST** treat `external` bindings as “unknown provenance” in today’s schemas; they are not yet a reliable indicator of entry-point-only inputs.
 
-### E.4 Multi-output tiles and tuple bindings are not modeled
+### E.4 Prior-item outputs are single committed objects; sub-values are selector-addressed
 
-The source-based flow resolver currently assumes a single output when recording bindings:
+There is no output-slot concept in the CFS or the runtime. Each prior item commits exactly one internal-store object per execution, keyed by its execution coordinates, and `prior_item_output` bindings identify that prior item only. A tile that logically produces several values returns them as one struct/tuple; consumers address sub-values with selector paths into the committed encoding, verified via selection commitments.
 
-- `result_binding` is always mapped to `(item_index, 0)`.
-
-Schemas may therefore be incorrect for tiles that return tuples, and verifiers/runners should not rely on `output_index` semantics beyond the single-output case today.
+Tuple *destructuring bindings* (`let (a, b) = callee(...)`) are not yet extracted by the flow resolver; supporting them means binding each name to a selector path into the prior item's committed output.
 
 ### E.5 Recursive tiles are not fully represented in the CFS
 

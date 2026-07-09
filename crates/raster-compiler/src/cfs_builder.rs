@@ -49,7 +49,7 @@ impl<'a> CfsBuilder<'a> {
         // Build sequence definitions with resolved data flow
         let mut sequences = Vec::new();
         for seq in &sequence_discovery.sequences {
-            let seq_def = self.build_sequence_def(seq, &tile_discovery, &sequence_discovery)?;
+            let seq_def = self.build_sequence_def(seq)?;
             sequences.push(seq_def);
         }
 
@@ -63,12 +63,7 @@ impl<'a> CfsBuilder<'a> {
     }
 
     /// Build a sequence definition from a discovered sequence.
-    fn build_sequence_def<'ast>(
-        &self,
-        seq: &Sequence<'ast>,
-        tile_discovery: &TileDiscovery<'ast>,
-        sequence_discovery: &SequenceDiscovery<'ast>,
-    ) -> Result<SequenceDef> {
+    fn build_sequence_def(&self, seq: &Sequence<'_>) -> Result<SequenceDef> {
         // Create input sources for the sequence's parameters
         // All sequence inputs come from external sources
         let input_count = seq.function.inputs.len();
@@ -76,7 +71,7 @@ impl<'a> CfsBuilder<'a> {
             (0..input_count).map(|_| InputBinding::external()).collect();
 
         // Resolve data flow for the sequence items
-        let mut resolver = FlowResolver::new(tile_discovery, sequence_discovery);
+        let mut resolver = FlowResolver::new();
         let items = resolver.resolve(seq);
 
         Ok(SequenceDef {

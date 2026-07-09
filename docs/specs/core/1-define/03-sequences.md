@@ -18,7 +18,7 @@ This document defines **sequences**: author-authored, ordered compositions of ti
 - **Compiler-time dataflow binding resolution**
   - `crates/raster-compiler/src/flow_resolver.rs`
     - `FlowResolver::resolve(...)`
-    - `resolve_argument(...)` mapping to `InputBinding::{SequenceScope, ProducerOutput, Direct(..)}`
+    - `resolve_argument(...)` mapping to `InputBinding::{SequenceScope, PriorItemOutput, Direct(..)}`
     - Item classification: `item_type` becomes `"tile"` vs `"sequence"` based on discovered IDs.
 - **CFS representation of sequences**
   - `crates/raster-core/src/cfs.rs`
@@ -130,16 +130,16 @@ Each call’s arguments are recorded as a list of strings captured from the pars
 For each argument string `arg`, input-source resolution proceeds as follows:
 
 - If `arg` exactly matches a sequence parameter name, it MUST resolve to `InputBinding::SequenceScope { input_index }`.
-- Else if `arg` exactly matches a previously-recorded `let` binding name, it MUST resolve to `InputBinding::ProducerOutput { item_index, output_index }`.
-  - `output_index` is currently always `0` (single-output assumption; see “Gaps and divergences”).
-  - At runtime/proof time, a `ProducerOutput` binding is satisfied by resolving the producing item's execution coordinates through the authenticated internal-store coordinate index, then checking the referenced append-log entry in the incremental internal-store frontier.
+- Else if `arg` exactly matches a previously-recorded `let` binding name, it MUST resolve to `InputBinding::PriorItemOutput { intra_sequence_item_index }`.
+  - The binding identifies the prior item only; each item commits exactly one internal-store object per execution. Consumers that need a sub-value of that output address it with a selector path verified via selection commitments, not through the binding.
+  - At runtime/proof time, a `PriorItemOutput` binding is satisfied by resolving the referenced item's execution coordinates through the authenticated internal-store coordinate index, then checking the referenced append-log entry in the incremental internal-store frontier.
 - Otherwise, it MUST resolve to `InputBinding::external()`.
 
 Implications:
 
 - Arguments SHOULD be written as bare identifiers that refer either to a sequence parameter or to a prior `let` binding.
 - Literal arguments (e.g. `0`, `"hi"`) and complex expressions (e.g. `x + 1`) are currently treated as direct `External` inputs in the CFS.
-- Arguments that are macro expressions (e.g., `vec![1, 2]`) are captured as strings but will typically not resolve to `SequenceScope`/`ProducerOutput`, so they also fall back to direct `External`.
+- Arguments that are macro expressions (e.g., `vec![1, 2]`) are captured as strings but will typically not resolve to `SequenceScope`/`PriorItemOutput`, so they also fall back to direct `External`.
 
 ### 4) Item typing: tile vs nested sequence
 
@@ -187,7 +187,7 @@ fn greet_sequence(name: String) -> String {
 Expected CFS-level dataflow:
 
 - `greet(name)` consumes `SequenceScope { input_index = 0 }`
-- `exclaim(greeting)` consumes `ProducerOutput { item_index = 0, output_index = 0 }`
+- `exclaim(greeting)` consumes `PriorItemOutput { intra_sequence_item_index = 0 }`
 
 #### 7.2 Nested sequences (sequence calling another sequence)
 
@@ -237,6 +237,6 @@ This SHOULD be avoided until the compiler’s binding parser is strengthened.
 
 - **No structured control flow in CFS sequences**: `raster_core::schema::ControlFlow` contains variants like `Conditional` and `Loop`, but the current compiler path emits only a linear `cfs::SequenceDef.items` list and does not encode conditionals/loops.
 - **`SequenceSchema` generation is not implemented**: `crates/raster-compiler/src/schema_gen.rs` is stubbed and does not currently generate `raster_core::schema::SequenceSchema` from source.
-- **Multi-output tiles are not supported in sequence bindings**: the flow resolver currently assumes a single output (`output_index = 0`) for any bound result and does not model destructuring or selecting specific tuple elements.
+- **Destructuring bindings are not supported**: the flow resolver records only a single named binding per call (`let x = callee(...)`) and does not model patterns like `let (a, b) = callee(...)`. Tiles that logically produce several values return them as one struct/tuple committed as a single internal-store object; supporting destructuring means binding each name to a selector path into that object.
 - **No “bang call” / recursion marker in schemas**: the compiler call extractor does not treat `callee!(...)` macro invocations as calls, so there is no recursion marker to propagate into the CFS today.
 - **`cargo raster preview` is not CFS execution**: the preview command walks a discovered sequence (expanding nested sequences inline) and executes tiles in that flattened order, but it does not use CFS bindings as an execution plan and currently feeds the same CLI `--input` bytes to each tile runner.

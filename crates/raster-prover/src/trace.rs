@@ -518,30 +518,29 @@ fn resolve_inputs_sources(
 
                 source_records.push((parent_index, source_record));
             }
-            InputBinding::ProducerOutput {
-                item_index,
-                output_index,
+            InputBinding::PriorItemOutput {
+                intra_sequence_item_index,
             } => {
-                if *item_index >= item_coordinate as usize {
+                if *intra_sequence_item_index >= item_coordinate as usize {
                     panic!(
-                        "Step {:?} cannot depend on sibling item {} output {} from the same or a future index {}",
-                        step_record, item_index, output_index, item_coordinate
+                        "Step {:?} cannot depend on sibling item {} from the same or a future index {}",
+                        step_record, intra_sequence_item_index, item_coordinate
                     );
                 }
 
                 let mut source_record_coordinates = sequence_coordinates.clone();
                 source_record_coordinates.push(
-                    (*item_index)
+                    (*intra_sequence_item_index)
                         .try_into()
-                        .expect("Producer item index exceeds CFS coordinate bounds"),
+                        .expect("Prior item output index exceeds CFS coordinate bounds"),
                 );
 
                 let source_record_cfs_item = cfs_cursor
                     .try_get_item(&source_record_coordinates)
                     .unwrap_or_else(|| {
                         panic!(
-                            "Failed to resolve producer item {} for step {:?} in frame {:?}",
-                            item_index, step_record, sequence_coordinates
+                            "Failed to resolve prior item output {} for step {:?} in frame {:?}",
+                            intra_sequence_item_index, step_record, sequence_coordinates
                         )
                     });
 
@@ -592,8 +591,10 @@ fn resolve_inputs_sources(
                     })
                     .unwrap_or_else(|| {
                         panic!(
-                            "Failed to resolve source record for step {:?} from source item {} output {} at {:?}",
-                            step_record, item_index, output_index, source_record_coordinates
+                            "Failed to resolve source record for step {:?} from source item {} at {:?}",
+                            step_record,
+                            intra_sequence_item_index,
+                            source_record_coordinates
                         )
                     });
 
@@ -916,7 +917,7 @@ mod tests {
         cfs
     }
 
-    fn make_item_output_dependency_cfs() -> ControlFlowSchema {
+    fn make_producer_dependency_cfs() -> ControlFlowSchema {
         let mut cfs = ControlFlowSchema::new("test");
         cfs.tiles.push(TileDef::iter("producer", 1, 1));
         cfs.tiles.push(TileDef::iter("consumer", 1, 1));
@@ -929,7 +930,7 @@ mod tests {
         }));
         main.items.push(SequenceChildItem::Tile(TileItem {
             id: "consumer".to_string(),
-            sources: vec![InputBinding::item_output(0, 0)],
+            sources: vec![InputBinding::prior_item_output(0)],
         }));
         main.items.push(SequenceChildItem::Tile(TileItem {
             id: "tail".to_string(),
@@ -981,7 +982,7 @@ mod tests {
         }));
         main.items.push(SequenceChildItem::Tile(TileItem {
             id: "tail".to_string(),
-            sources: vec![InputBinding::item_output(0, 0)],
+            sources: vec![InputBinding::prior_item_output(0)],
         }));
 
         let mut inner = SequenceDef::new("inner");
@@ -1234,7 +1235,7 @@ mod tests {
     }
 
     #[test]
-    fn test_verify_trace_returns_ok_for_item_output_dependency() {
+    fn test_verify_trace_returns_ok_for_producer_dependency() {
         let trace = Trace(vec![
             make_sequence_start_record(1, "main", vec![], 0),
             make_tile_trace_item_at(2, "main", 0, vec![0], "producer".to_string(), 1, 10),
@@ -1247,7 +1248,7 @@ mod tests {
             &precomputed::EMPTY_TRIE_NODES[0],
             test_fraud_proof_config(),
         );
-        let cfs = make_item_output_dependency_cfs();
+        let cfs = make_producer_dependency_cfs();
         let mut trace_verifier =
             TraceVerifier::new(trace_commitment, &precomputed::EMPTY_TRIE_NODES[0], &cfs)
                 .expect("valid commitment");
@@ -1306,7 +1307,7 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "Failed to resolve source record")]
-    fn test_verify_trace_returns_failure_for_unresolved_required_producer() {
+    fn test_verify_trace_returns_failure_for_unresolved_required_prior_item_output() {
         let runtime_trace = Trace(vec![
             make_sequence_start_record(1, "main", vec![], 0),
             make_tile_trace_item_at(2, "main", 1, vec![1], "consumer".to_string(), 1, 20),
@@ -1324,7 +1325,7 @@ mod tests {
             &precomputed::EMPTY_TRIE_NODES[0],
             test_fraud_proof_config(),
         );
-        let cfs = make_item_output_dependency_cfs();
+        let cfs = make_producer_dependency_cfs();
         let mut trace_verifier =
             TraceVerifier::new(trace_commitment, &precomputed::EMPTY_TRIE_NODES[0], &cfs)
                 .expect("valid commitment");

@@ -1,5 +1,3 @@
-//! Trace types (requires std feature).
-
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
