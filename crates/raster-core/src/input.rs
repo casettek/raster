@@ -73,6 +73,9 @@ impl SelectorPath {
 pub enum SelectorSegment {
     Field(String),
     Index(u64),
+    /// Contiguous list slice `[start, end)`. Only valid as the final segment
+    /// of a selector path, and only against a list node.
+    Range { start: u64, end: u64 },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -171,6 +174,15 @@ pub enum SelectionProofStep {
     },
     List {
         index: u64,
+        len: u64,
+        siblings: Vec<ListProofSibling>,
+    },
+    /// Proof that the selected payload is the contiguous slice `[start, start + k)`
+    /// of a list of `len` elements, where `k` is the payload's own element count.
+    /// `siblings` are boundary hashes consumed level by level (left boundary
+    /// before right boundary). Only valid as the final (deepest) proof step.
+    ListRange {
+        start: u64,
         len: u64,
         siblings: Vec<ListProofSibling>,
     },
@@ -427,16 +439,136 @@ fn parse_subtree_root(bytes: &[u8], offset: &mut usize) -> Option<Hash32> {
     }
 }
 
-pub fn verify_selection_proof(selected_bytes: &[u8], proof: &SelectionProof) -> bool {
+/// Parse a list-encoded payload (kind 0x02) into its element subtree roots.
+/// Returns `None` when the payload is not a list or its length field does not
+/// match the number of encoded children.
+fn parse_list_child_roots(bytes: &[u8]) -> Option<Vec<Hash32>> {
     let mut offset = 0;
-    let Some(mut current_hash) = parse_subtree_root(selected_bytes, &mut offset) else {
-        return false;
-    };
-    if offset != selected_bytes.len() {
-        return false;
+    if *bytes.first()? != 0x02 {
+        return None;
+    }
+    offset += 1;
+
+    let len = parse_u64(bytes, &mut offset)? as usize;
+    let mut child_roots = Vec::with_capacity(len);
+    for _ in 0..len {
+        let child_len = parse_u64(bytes, &mut offset)? as usize;
+        let end = offset.checked_add(child_len)?;
+        let child_bytes = bytes.get(offset..end)?;
+        let mut child_offset = 0;
+        let child_root = parse_subtree_root(child_bytes, &mut child_offset)?;
+        if child_offset != child_bytes.len() {
+            return None;
+        }
+        offset = end;
+        child_roots.push(child_root);
+    }
+    if offset != bytes.len() {
+        return None;
+    }
+    Some(child_roots)
+}
+
+/// Fold the element roots of slice `[start, start + roots.len())` up to the
+/// root of a list of `len` elements, consuming boundary `siblings` level by
+/// level. Mirrors `list_root_from_hashes` exactly, including the duplication
+/// of the last node at odd-width levels.
+fn fold_list_range(
+    roots: &[Hash32],
+    start: u64,
+    len: u64,
+    siblings: &[ListProofSibling],
+) -> Option<Hash32> {
+    let count = roots.len() as u64;
+    if count == 0 || start.checked_add(count)? > len {
+        return None;
     }
 
-    for step in proof.steps.iter().rev() {
+    let mut nodes: Vec<Hash32> = roots.to_vec();
+    let mut lo = start as usize;
+    let mut hi = (start + count) as usize;
+    let mut width = len as usize;
+    let mut sibling_iter = siblings.iter();
+
+    while width > 1 {
+        if lo % 2 == 1 {
+            let sibling = sibling_iter.next()?;
+            if sibling.direction != ListProofDirection::Left {
+                return None;
+            }
+            nodes.insert(0, sibling.hash);
+            lo -= 1;
+        }
+        if hi % 2 == 1 {
+            if hi == width {
+                // Odd-width level: the last node pairs with a duplicate of itself.
+                let last = *nodes.last()?;
+                nodes.push(last);
+            } else {
+                let sibling = sibling_iter.next()?;
+                if sibling.direction != ListProofDirection::Right {
+                    return None;
+                }
+                nodes.push(sibling.hash);
+            }
+            hi += 1;
+        }
+
+        let mut next = Vec::with_capacity(nodes.len() / 2);
+        for pair in nodes.chunks(2) {
+            next.push(selection_hash(&[
+                b"list-node",
+                pair[0].as_slice(),
+                pair[1].as_slice(),
+            ]));
+        }
+        nodes = next;
+        lo /= 2;
+        hi /= 2;
+        width = width / 2 + width % 2;
+    }
+
+    if sibling_iter.next().is_some() || nodes.len() != 1 {
+        return None;
+    }
+    Some(selection_hash(&[
+        b"list-root",
+        &len.to_le_bytes(),
+        nodes[0].as_slice(),
+    ]))
+}
+
+pub fn verify_selection_proof(selected_bytes: &[u8], proof: &SelectionProof) -> bool {
+    // A ListRange step may only appear as the final (deepest) proof step; it
+    // derives the starting hash from the payload's element roots instead of
+    // the payload's own subtree root.
+    let mut steps = proof.steps.as_slice();
+    let mut current_hash = if let Some(SelectionProofStep::ListRange {
+        start,
+        len,
+        siblings,
+    }) = steps.last()
+    {
+        steps = &steps[..steps.len() - 1];
+        let Some(child_roots) = parse_list_child_roots(selected_bytes) else {
+            return false;
+        };
+        let Some(hash) = fold_list_range(&child_roots, *start, *len, siblings) else {
+            return false;
+        };
+        hash
+    } else {
+        let mut offset = 0;
+        let Some(hash) = parse_subtree_root(selected_bytes, &mut offset) else {
+            return false;
+        };
+        if offset != selected_bytes.len() {
+            return false;
+        }
+        hash
+    };
+
+    for step in steps.iter().rev() {
         current_hash = match step {
             SelectionProofStep::Struct {
                 field_index,
@@ -494,6 +626,9 @@ pub fn verify_selection_proof(selected_bytes: &[u8], proof: &SelectionProof) -> 
                 }
                 selection_hash(&[b"list-root", &len.to_le_bytes(), hash.as_slice()])
             }
+            // A range step is only valid as the final step, which was consumed
+            // before this loop.
+            SelectionProofStep::ListRange { .. } => return false,
         };
     }
     current_hash == proof.root_hash
@@ -1025,5 +1160,175 @@ mod tests {
         assert_eq!(external.commitment.as_deref(), Some("abc123"));
         assert_eq!(external.selected, selected);
         assert_eq!(arg.into_inner(), 9);
+    }
+
+    fn encode_leaf(bytes: &[u8]) -> Vec<u8> {
+        let mut out = alloc::vec![0x00u8];
+        out.extend((bytes.len() as u64).to_le_bytes());
+        out.extend_from_slice(bytes);
+        out
+    }
+
+    fn encode_list(children: &[Vec<u8>]) -> Vec<u8> {
+        let mut out = alloc::vec![0x02u8];
+        out.extend((children.len() as u64).to_le_bytes());
+        for child in children {
+            out.extend((child.len() as u64).to_le_bytes());
+            out.extend_from_slice(child);
+        }
+        out
+    }
+
+    fn leaf_root(bytes: &[u8]) -> Hash32 {
+        selection_hash(&[b"leaf", bytes])
+    }
+
+    /// Reference sibling builder mirroring `fold_list_range` with full tree
+    /// knowledge; the runtime prover follows the same consumption order.
+    fn build_range_siblings(
+        element_roots: &[Hash32],
+        start: usize,
+        end: usize,
+    ) -> Vec<ListProofSibling> {
+        let mut level: Vec<Hash32> = element_roots.to_vec();
+        let mut lo = start;
+        let mut hi = end;
+        let mut siblings = Vec::new();
+
+        while level.len() > 1 {
+            let width = level.len();
+            if lo % 2 == 1 {
+                siblings.push(ListProofSibling {
+                    direction: ListProofDirection::Left,
+                    hash: level[lo - 1],
+                });
+                lo -= 1;
+            }
+            if hi % 2 == 1 {
+                if hi < width {
+                    siblings.push(ListProofSibling {
+                        direction: ListProofDirection::Right,
+                        hash: level[hi],
+                    });
+                }
+                hi += 1;
+            }
+
+            let mut padded = level.clone();
+            if padded.len() % 2 == 1 {
+                padded.push(*padded.last().unwrap());
+            }
+            level = padded
+                .chunks(2)
+                .map(|pair| selection_hash(&[b"list-node", &pair[0], &pair[1]]))
+                .collect();
+            lo /= 2;
+            hi /= 2;
+        }
+        siblings
+    }
+
+    fn range_fixture(len: usize, start: usize, end: usize) -> (Vec<u8>, SelectionProof) {
+        let element_bytes: Vec<Vec<u8>> = (0..len)
+            .map(|value| alloc::vec![value as u8, 0xAB])
+            .collect();
+        let element_roots: Vec<Hash32> =
+            element_bytes.iter().map(|bytes| leaf_root(bytes)).collect();
+        let encoded_children: Vec<Vec<u8>> = element_bytes[start..end]
+            .iter()
+            .map(|bytes| encode_leaf(bytes))
+            .collect();
+        let payload = encode_list(&encoded_children);
+        let proof = SelectionProof {
+            path: SelectorPath::new(alloc::vec![SelectorSegment::Range {
+                start: start as u64,
+                end: end as u64,
+            }]),
+            root_hash: list_root_from_hashes(&element_roots, len as u64),
+            steps: alloc::vec![SelectionProofStep::ListRange {
+                start: start as u64,
+                len: len as u64,
+                siblings: build_range_siblings(&element_roots, start, end),
+            }],
+        };
+        (payload, proof)
+    }
+
+    #[test]
+    fn range_proofs_roundtrip_for_all_ranges_and_odd_widths() {
+        for len in 1..=12usize {
+            for start in 0..len {
+                for end in (start + 1)..=len {
+                    let (payload, proof) = range_fixture(len, start, end);
+                    assert!(
+                        verify_selection_proof(&payload, &proof),
+                        "range [{start}, {end}) of len {len} should verify",
+                    );
+                }
+            }
+        }
+        // A larger case crossing several duplicated (odd-width) levels.
+        let (payload, proof) = range_fixture(33, 30, 33);
+        assert!(verify_selection_proof(&payload, &proof));
+    }
+
+    #[test]
+    fn range_proof_rejects_shifted_start() {
+        let (payload, mut proof) = range_fixture(9, 2, 5);
+        let SelectionProofStep::ListRange { start, .. } = &mut proof.steps[0] else {
+            unreachable!();
+        };
+        *start += 1;
+        assert!(!verify_selection_proof(&payload, &proof));
+    }
+
+    #[test]
+    fn range_proof_rejects_tampered_element() {
+        let (mut payload, proof) = range_fixture(9, 2, 5);
+        // Flip a byte inside the first element's leaf payload.
+        let last = payload.len() - 1;
+        payload[last] ^= 0x01;
+        assert!(!verify_selection_proof(&payload, &proof));
+    }
+
+    #[test]
+    fn range_proof_rejects_wrong_total_len() {
+        let (payload, mut proof) = range_fixture(9, 2, 5);
+        let SelectionProofStep::ListRange { len, .. } = &mut proof.steps[0] else {
+            unreachable!();
+        };
+        *len += 1;
+        assert!(!verify_selection_proof(&payload, &proof));
+    }
+
+    #[test]
+    fn range_proof_rejects_non_terminal_range_step() {
+        let (payload, mut proof) = range_fixture(9, 2, 5);
+        // Root→leaf step order: appending a List step after ListRange makes
+        // the range step non-terminal.
+        proof.steps.push(SelectionProofStep::List {
+            index: 0,
+            len: 1,
+            siblings: alloc::vec![],
+        });
+        assert!(!verify_selection_proof(&payload, &proof));
+    }
+
+    #[test]
+    fn range_proof_composes_under_struct_step() {
+        let (payload, mut proof) = range_fixture(9, 2, 5);
+        let list_root = proof.root_hash;
+        let sibling_root = leaf_root(b"other-field");
+        let struct_root = selection_hash(&[b"struct", &list_root, &sibling_root]);
+        proof.steps.insert(
+            0,
+            SelectionProofStep::Struct {
+                field_index: 0,
+                field_count: 2,
+                siblings: alloc::vec![sibling_root],
+            },
+        );
+        proof.root_hash = struct_root;
+        assert!(verify_selection_proof(&payload, &proof));
     }
 }

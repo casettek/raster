@@ -1509,6 +1509,72 @@ fn list_root_and_proof(
     ))
 }
 
+/// Root and boundary siblings for the contiguous slice `[start, end)`.
+/// Sibling consumption order (left boundary before right boundary, level by
+/// level) must match `fold_list_range` in raster-core.
+fn list_root_and_range_proof(
+    hashes: &[Hash32],
+    start: usize,
+    end: usize,
+) -> CoreResult<(Hash32, Vec<ListProofSibling>)> {
+    if start >= end || end > hashes.len() {
+        return Err(Error::Other(format!(
+            "Selector range '{}..{}' is out of bounds for list of length {}",
+            start,
+            end,
+            hashes.len()
+        )));
+    }
+
+    let len = hashes.len() as u64;
+    let mut siblings = Vec::new();
+    let mut lo = start;
+    let mut hi = end;
+    let mut level = hashes.to_vec();
+    while level.len() > 1 {
+        let width = level.len();
+        if lo % 2 == 1 {
+            siblings.push(ListProofSibling {
+                direction: ListProofDirection::Left,
+                hash: level[lo - 1],
+            });
+            lo -= 1;
+        }
+        if hi % 2 == 1 {
+            if hi < width {
+                siblings.push(ListProofSibling {
+                    direction: ListProofDirection::Right,
+                    hash: level[hi],
+                });
+            }
+            // hi == width: odd-width duplication, the verifier derives the
+            // partner from its own last node — no witness data.
+            hi += 1;
+        }
+
+        if level.len() % 2 == 1 {
+            let last = level.last().cloned().unwrap();
+            level.push(last);
+        }
+        let mut next = Vec::with_capacity(level.len() / 2);
+        for pair in level.chunks(2) {
+            next.push(selection_hash(&[
+                b"list-node",
+                pair[0].as_slice(),
+                pair[1].as_slice(),
+            ]));
+        }
+        level = next;
+        lo /= 2;
+        hi /= 2;
+    }
+
+    Ok((
+        selection_hash(&[b"list-root", &len.to_le_bytes(), level[0].as_slice()]),
+        siblings,
+    ))
+}
+
 fn find_struct_field<'a>(entries: &'a [(String, TreeValue)], name: &str) -> Option<&'a TreeValue> {
     entries
         .iter()
@@ -1635,6 +1701,47 @@ fn prove_selection(
                 steps,
             })
         }
+        (
+            SelectorSegment::Range { start, end },
+            SchemaNode::List { .. },
+            TreeValue::List(values),
+        ) => {
+            if segments.len() > 1 {
+                return Err(Error::Other(
+                    "Range selector segment must be the final segment".into(),
+                ));
+            }
+            let start_idx = *start as usize;
+            let end_idx = *end as usize;
+            if start_idx >= end_idx || end_idx > values.len() {
+                return Err(Error::Other(format!(
+                    "Selector range '{}..{}' is out of bounds for list of length {}",
+                    start,
+                    end,
+                    values.len()
+                )));
+            }
+
+            let sub_list = TreeValue::List(values[start_idx..end_idx].to_vec());
+            let (selected_bytes, _) = subtree_payload_and_root(&sub_list)?;
+
+            let mut hashes = Vec::with_capacity(values.len());
+            for item in values {
+                hashes.push(subtree_payload_and_root(item)?.1);
+            }
+            let (root_hash, siblings) = list_root_and_range_proof(&hashes, start_idx, end_idx)?;
+
+            Ok(ProvenSelection {
+                selected_value: sub_list,
+                selected_bytes,
+                root_hash,
+                steps: vec![SelectionProofStep::ListRange {
+                    start: *start,
+                    len: values.len() as u64,
+                    siblings,
+                }],
+            })
+        }
         (SelectorSegment::Field(field_name), _, _) => Err(Error::Other(format!(
             "Selector field '{}' was not found in selected value",
             field_name
@@ -1642,6 +1749,10 @@ fn prove_selection(
         (SelectorSegment::Index(index), _, _) => Err(Error::Other(format!(
             "Selector index '{}' was not found in selected value",
             index
+        ))),
+        (SelectorSegment::Range { start, end }, _, _) => Err(Error::Other(format!(
+            "Selector range '{}..{}' requires a list value",
+            start, end
         ))),
     }
 }
@@ -2703,6 +2814,66 @@ mod tests {
         );
         assert!(verify_selection_proof(&witness.bytes, &witness.proof));
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn range_typed_selection_produces_verifiable_slice_payload() {
+        let root = Address {
+            lines: vec![
+                "a".to_string(),
+                "b".to_string(),
+                "c".to_string(),
+                "d".to_string(),
+                "e".to_string(),
+            ],
+            indexes: vec![1, 2, 3, 4, 5],
+        };
+        let selector = SelectorPath::new(vec![
+            SelectorSegment::from("lines"),
+            SelectorSegment::Range { start: 1, end: 4 },
+        ]);
+        let proven = typed_proven_selection(&root, &selector).unwrap();
+
+        assert_eq!(
+            typed_value_from_tree::<Vec<String>>(&proven.selected_value).unwrap(),
+            vec!["b".to_string(), "c".to_string(), "d".to_string()]
+        );
+
+        let witness = SelectionWitness {
+            bytes: proven.selected_bytes.clone(),
+            proof: SelectionProof {
+                path: selector,
+                root_hash: proven.root_hash,
+                steps: proven.steps,
+            },
+        };
+        assert!(verify_selection_proof(&witness.bytes, &witness.proof));
+
+        // The slice proof anchors to the same source root as a whole-value
+        // selection of the same object.
+        let whole = typed_proven_selection(&root, &SelectorPath::default()).unwrap();
+        assert_eq!(whole.root_hash, witness.proof.root_hash);
+    }
+
+    #[test]
+    fn range_selection_rejects_out_of_bounds_and_non_terminal_segments() {
+        let root = Address {
+            lines: vec!["a".to_string(), "b".to_string()],
+            indexes: vec![],
+        };
+
+        let out_of_bounds = SelectorPath::new(vec![
+            SelectorSegment::from("lines"),
+            SelectorSegment::Range { start: 1, end: 3 },
+        ]);
+        assert!(typed_proven_selection(&root, &out_of_bounds).is_err());
+
+        let non_terminal = SelectorPath::new(vec![
+            SelectorSegment::from("lines"),
+            SelectorSegment::Range { start: 0, end: 1 },
+            SelectorSegment::from(0usize),
+        ]);
+        assert!(typed_proven_selection(&root, &non_terminal).is_err());
     }
 
     #[test]

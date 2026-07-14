@@ -69,11 +69,55 @@ fn has_coordinate_prefix(coordinates: &CfsCoordinates, prefix: &CfsCoordinates) 
             .all(|(coordinate, expected)| coordinate == expected)
 }
 
+/// For an iteration of a recur site with a CFS-declared chunk size, verify the
+/// iteration consumed a chunk of `1..=declared` elements. The chunk length is
+/// the leading varint of the iteration's canonical input bytes (the first tile
+/// argument is `RecurInput<Vec<T>>`, whose first field is the chunk vector);
+/// those bytes are pinned by `input_commitment` and executed by the replay
+/// proof, so the prefix cannot lie about the payload.
+fn verify_recur_iteration_chunking(
+    cfs_cursor: &CfsCursor,
+    step_record: &StepRecord,
+    site_coordinates: &CfsCoordinates,
+    input_witness: Option<&Vec<u8>>,
+) {
+    let Some(raster_core::cfs::SequenceChildItem::RecurTile(item)) =
+        cfs_cursor.try_get_item(site_coordinates)
+    else {
+        return;
+    };
+    let Some(declared) = item.chunk else {
+        return;
+    };
+
+    let input_witness = input_witness.unwrap_or_else(|| {
+        panic!(
+            "Chunked recur iteration {:?} is missing its input witness",
+            step_record
+        )
+    });
+    let chunk_len = raster_core::chunking::iteration_chunk_len(input_witness)
+        .unwrap_or_else(|| {
+            panic!(
+                "Chunked recur iteration {:?} input does not carry a chunk length",
+                step_record
+            )
+        });
+    if let Err(violation) = raster_core::chunking::check_iteration_chunk_len(declared, chunk_len)
+    {
+        panic!(
+            "Recur chunking violation at step {:?}: {}",
+            step_record, violation
+        );
+    }
+}
+
 pub fn verify_step_record_inputs(
     cfs_cursor: &CfsCursor,
     step_record: &StepRecord,
     input_source_witness: Option<&FnInput>,
     sequence_scope_witness: Option<&FnInput>,
+    input_witness: Option<&Vec<u8>>,
 ) {
     // TODO: SequenceStart/SequenceEnd entrypoint case. In case of SequenceStart input is External Kind from
     // cli or from file. SequenceEnd just binding latest executed tile output.
@@ -81,10 +125,15 @@ pub fn verify_step_record_inputs(
         return;
     }
 
-    if cfs_cursor
-        .try_get_recur_iteration_coordinates(step_record.coordinates())
-        .is_some()
+    if let Some((site_coordinates, _)) =
+        cfs_cursor.try_get_recur_iteration_coordinates(step_record.coordinates())
     {
+        verify_recur_iteration_chunking(
+            cfs_cursor,
+            step_record,
+            &site_coordinates,
+            input_witness,
+        );
         return;
     }
 

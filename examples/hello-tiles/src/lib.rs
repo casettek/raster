@@ -61,6 +61,42 @@ pub fn greet_address_line(address_line: String) -> String {
     greet
 }
 
+/// Consumes a whole slice of address lines as a *single* authenticated input.
+///
+/// The caller selects `...lines[0..2]` via `select!`, which produces one
+/// `SelectionCommitment` for the contiguous slice, so this tile records a
+/// single external binding instead of one per line.
+#[tile(kind = iter)]
+pub fn join_address_lines(lines: alloc::vec::Vec<String>) -> String {
+    let joined = lines.join(" | ");
+    println!("joined slice ({} lines): {}", lines.len(), joined);
+
+    joined
+}
+
+/// Recur tile whose iteration element is a *chunk* of lines rather than a single
+/// line. Paired with `call_recur! { ..., chunk = N }`, each invocation receives
+/// up to `N` lines and indexes them inline.
+#[tile(kind = recur)]
+pub fn collect_line_chunk(
+    input: RecurInput<alloc::vec::Vec<String>>,
+    output: RecurOutput<CollectiveGreeting>,
+    title: String,
+) -> RecurOutput<CollectiveGreeting> {
+    let mut output = output;
+    if input.is_first() {
+        output.title().set(title);
+    }
+
+    let chunk_index = input.index();
+    let chunk = input.into_value();
+    output
+        .lines()
+        .push(format!("chunk {}: {}", chunk_index, chunk.join(", ")));
+
+    output
+}
+
 #[tile(kind = iter)]
 pub fn maybe_echo_name(name: String) -> Result<String> {
     if name.is_empty() {

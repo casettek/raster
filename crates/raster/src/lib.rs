@@ -17,7 +17,8 @@ pub use raster_core::draft;
 
 pub mod input;
 pub use input::{
-    auth_ref_result_trace, auth_ref_trace, draft_replay_handle, draft_replay_transition, finalize,
+    auth_ref_result_trace, auth_ref_trace, chunk_auth_ref, draft_replay_handle,
+    draft_replay_transition, finalize,
     into_auth_ref, into_auth_value, into_draft, materialize_auth_result, materialize_auth_return,
     new_draft, raster_trace_payload, resolve_external_value, resolve_internal_ok_value,
     resolve_internal_value, resolve_typed_external_value, restore_draft_from_replay_handle,

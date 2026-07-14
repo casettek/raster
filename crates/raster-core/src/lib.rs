@@ -14,6 +14,7 @@ extern crate alloc;
 extern crate std;
 
 pub mod cfs;
+pub mod chunking;
 pub mod draft;
 pub mod error;
 pub mod fingerprint;
