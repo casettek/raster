@@ -5,7 +5,7 @@ use core::hash::Hash;
 use core::ops::{Deref, DerefMut};
 use serde::{Deserialize, Serialize};
 
-use crate::cfs::CfsCoordinates;
+use crate::cfs::{CfsCoordinates, SequenceId, TileId};
 use crate::draft::DraftTransitionWitness;
 use crate::fingerprint::Fingerprint;
 use crate::input::{Hash32, SelectionCommitment, SelectorPath};
@@ -125,96 +125,46 @@ impl FnCallRecord {
     }
 }
 
+/// The internal-store roots either side of a step that may write to it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub struct TileExecRecord {
-    pub exec_index: u64,
+pub struct InternalStoreRoots {
+    pub root_before: Vec<u8>,
+    pub root_after: Vec<u8>,
+    pub index_root_before: Vec<u8>,
+    pub index_root_after: Vec<u8>,
+}
 
-    pub tile_id: String,
+/// What an [`ExecStep`] ran. The distinction is not cosmetic: it decides how
+/// the step's output is verified (only `Tile` carries a replay proof) and
+/// which CFS item kind the step may occupy.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum ExecTarget {
+    Tile(TileId),
+    RecurTile(TileId),
+    RecurSequence(SequenceId),
+}
 
-    pub sequence_id: String,
+/// A step that ran something and committed to what it consumed and produced.
+///
+/// The three targets share one shape deliberately: they commit to exactly
+/// the same things and differ only in what ran, so a field added here cannot
+/// be added to two of them and forgotten on the third.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct ExecStep {
+    pub target: ExecTarget,
     pub intra_sequence_index: u32,
 
-    pub coordinates: CfsCoordinates,
-
     pub input_commitment: Vec<u8>,
     pub input_source_commitment: Vec<u8>,
     pub output_commitment: Vec<u8>,
 
-    pub internal_store_root_before: Vec<u8>,
-    pub internal_store_root_after: Vec<u8>,
-    pub internal_store_index_root_before: Vec<u8>,
-    pub internal_store_index_root_after: Vec<u8>,
+    pub internal_store: InternalStoreRoots,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub struct RecurTileExecRecord {
-    pub exec_index: u64,
-
-    pub recur_tile_id: String,
-
-    pub sequence_id: String,
-    pub intra_sequence_index: u32,
-
-    pub coordinates: CfsCoordinates,
-
-    pub input_commitment: Vec<u8>,
-    pub input_source_commitment: Vec<u8>,
-    pub output_commitment: Vec<u8>,
-
-    pub internal_store_root_before: Vec<u8>,
-    pub internal_store_root_after: Vec<u8>,
-    pub internal_store_index_root_before: Vec<u8>,
-    pub internal_store_index_root_after: Vec<u8>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub struct RecurSequenceExecRecord {
-    pub exec_index: u64,
-
-    pub recur_sequence_id: String,
-
-    pub sequence_id: String,
-    pub intra_sequence_index: u32,
-
-    pub coordinates: CfsCoordinates,
-
-    pub input_commitment: Vec<u8>,
-    pub input_source_commitment: Vec<u8>,
-    pub output_commitment: Vec<u8>,
-
-    pub internal_store_root_before: Vec<u8>,
-    pub internal_store_root_after: Vec<u8>,
-    pub internal_store_index_root_before: Vec<u8>,
-    pub internal_store_index_root_after: Vec<u8>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub struct SequenceStartRecord {
-    pub exec_index: u64,
-
-    pub sequence_id: String,
-
-    pub coordinates: CfsCoordinates,
-
-    pub input_commitment: Vec<u8>,
-    pub input_source_commitment: Vec<u8>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub struct SequenceEndRecord {
-    pub exec_index: u64,
-
-    pub sequence_id: String,
-
-    pub coordinates: CfsCoordinates,
-
-    pub output_commitment: Vec<u8>,
-}
-
-/// What kind of entry-time preparation an `EntrypointRecord` performs.
+/// What kind of entry-time preparation an [`EntrypointStep`] performs.
 /// Currently only one op exists; new entry-time-authorized preparations
 /// (checked against the authorization journal rather than a replay proof)
-/// can be added here without growing `StepRecord` again.
+/// can be added here without growing [`StepKind`] again.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum EntrypointOp {
     /// Binds `main`'s declared external arguments, in CFS declaration
@@ -227,129 +177,106 @@ pub enum EntrypointOp {
 /// emitted for `main`; currently only `main`'s declared external-argument
 /// binding uses this.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub struct EntrypointRecord {
-    pub exec_index: u64,
-
-    pub sequence_id: String,
-
-    pub coordinates: CfsCoordinates,
-
+pub struct EntrypointStep {
     pub op: EntrypointOp,
 
     pub input_source_commitment: Vec<u8>,
     pub output_commitment: Vec<u8>,
 
-    pub internal_store_root_before: Vec<u8>,
-    pub internal_store_root_after: Vec<u8>,
-    pub internal_store_index_root_before: Vec<u8>,
-    pub internal_store_index_root_after: Vec<u8>,
+    pub internal_store: InternalStoreRoots,
 }
 
+/// What a step did, and the commitments that go with it.
+///
+/// Each kind carries exactly the commitments it makes — no more, and none of
+/// them optional. That is what lets the guest's checks be total: an absent
+/// commitment is a kind that does not make one, never a kind that failed to.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub enum StepRecord {
-    SequenceStart(SequenceStartRecord),
-    SequenceEnd(SequenceEndRecord),
-    TileExec(TileExecRecord),
-    RecurTileExec(RecurTileExecRecord),
-    RecurSequenceExec(RecurSequenceExecRecord),
-    Entrypoint(EntrypointRecord),
+pub enum StepKind {
+    SequenceStart {
+        input_commitment: Vec<u8>,
+        input_source_commitment: Vec<u8>,
+    },
+    SequenceEnd {
+        output_commitment: Vec<u8>,
+    },
+    Exec(ExecStep),
+    Entrypoint(EntrypointStep),
+}
+
+/// One step of a trace: where it sits, and what it did.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct StepRecord {
+    pub exec_index: u64,
+    pub sequence_id: String,
+    pub coordinates: CfsCoordinates,
+    pub kind: StepKind,
 }
 
 impl StepRecord {
     pub fn coordinates(&self) -> &CfsCoordinates {
-        match self {
-            StepRecord::TileExec(tile_exec_record) => &tile_exec_record.coordinates,
-            StepRecord::RecurTileExec(recur_exec_record) => &recur_exec_record.coordinates,
-            StepRecord::RecurSequenceExec(recur_sequence_exec_record) => {
-                &recur_sequence_exec_record.coordinates
-            }
-            StepRecord::SequenceStart(sequence_start_record) => &sequence_start_record.coordinates,
-            StepRecord::SequenceEnd(sequence_end_record) => &sequence_end_record.coordinates,
-            StepRecord::Entrypoint(entrypoint_record) => &entrypoint_record.coordinates,
-        }
+        &self.coordinates
     }
 
+    /// The step's own serialized input bytes, for kinds that consume any.
     pub fn input_commitment(&self) -> Option<&Vec<u8>> {
-        match self {
-            StepRecord::TileExec(record) => Some(&record.input_commitment),
-            StepRecord::RecurTileExec(record) => Some(&record.input_commitment),
-            StepRecord::RecurSequenceExec(record) => Some(&record.input_commitment),
-            StepRecord::SequenceStart(record) => Some(&record.input_commitment),
-            StepRecord::SequenceEnd(_) => None,
-            // No serialized "input" analogous to a tile's ABI bytes — this
-            // step declares bindings, it does not consume any.
-            StepRecord::Entrypoint(_) => None,
+        match &self.kind {
+            StepKind::SequenceStart {
+                input_commitment, ..
+            } => Some(input_commitment),
+            StepKind::Exec(exec) => Some(&exec.input_commitment),
+            // An entrypoint declares bindings rather than consuming an
+            // input, and a sequence end only reports what it produced.
+            StepKind::SequenceEnd { .. } | StepKind::Entrypoint(_) => None,
         }
     }
 
     pub fn output_commitment(&self) -> Option<&Vec<u8>> {
-        match self {
-            StepRecord::TileExec(record) => Some(&record.output_commitment),
-            StepRecord::RecurTileExec(record) => Some(&record.output_commitment),
-            StepRecord::RecurSequenceExec(record) => Some(&record.output_commitment),
-            StepRecord::SequenceStart(_) => None,
-            StepRecord::SequenceEnd(record) => Some(&record.output_commitment),
-            StepRecord::Entrypoint(record) => Some(&record.output_commitment),
+        match &self.kind {
+            StepKind::SequenceEnd { output_commitment } => Some(output_commitment),
+            StepKind::Exec(exec) => Some(&exec.output_commitment),
+            StepKind::Entrypoint(entrypoint) => Some(&entrypoint.output_commitment),
+            StepKind::SequenceStart { .. } => None,
         }
     }
 
     pub fn input_source_commitment(&self) -> Option<&Vec<u8>> {
-        match self {
-            StepRecord::TileExec(record) => Some(&record.input_source_commitment),
-            StepRecord::RecurTileExec(record) => Some(&record.input_source_commitment),
-            StepRecord::RecurSequenceExec(record) => Some(&record.input_source_commitment),
-            StepRecord::SequenceStart(record) => Some(&record.input_source_commitment),
-            StepRecord::SequenceEnd(_) => None,
-            StepRecord::Entrypoint(record) => Some(&record.input_source_commitment),
+        match &self.kind {
+            StepKind::SequenceStart {
+                input_source_commitment,
+                ..
+            } => Some(input_source_commitment),
+            StepKind::Exec(exec) => Some(&exec.input_source_commitment),
+            StepKind::Entrypoint(entrypoint) => Some(&entrypoint.input_source_commitment),
+            StepKind::SequenceEnd { .. } => None,
         }
     }
 
-    pub fn internal_store_roots(&self) -> Option<(&Vec<u8>, &Vec<u8>, &Vec<u8>, &Vec<u8>)> {
-        match self {
-            StepRecord::TileExec(record) => Some((
-                &record.internal_store_root_before,
-                &record.internal_store_root_after,
-                &record.internal_store_index_root_before,
-                &record.internal_store_index_root_after,
-            )),
-            StepRecord::RecurTileExec(record) => Some((
-                &record.internal_store_root_before,
-                &record.internal_store_root_after,
-                &record.internal_store_index_root_before,
-                &record.internal_store_index_root_after,
-            )),
-            StepRecord::RecurSequenceExec(record) => Some((
-                &record.internal_store_root_before,
-                &record.internal_store_root_after,
-                &record.internal_store_index_root_before,
-                &record.internal_store_index_root_after,
-            )),
-            StepRecord::Entrypoint(record) => Some((
-                &record.internal_store_root_before,
-                &record.internal_store_root_after,
-                &record.internal_store_index_root_before,
-                &record.internal_store_index_root_after,
-            )),
-            StepRecord::SequenceStart(_) | StepRecord::SequenceEnd(_) => None,
+    /// The internal-store roots this step claims, for kinds that may write.
+    /// Sequence boundaries never touch the store, so they have none.
+    pub fn internal_store_roots(&self) -> Option<&InternalStoreRoots> {
+        match &self.kind {
+            StepKind::Exec(exec) => Some(&exec.internal_store),
+            StepKind::Entrypoint(entrypoint) => Some(&entrypoint.internal_store),
+            StepKind::SequenceStart { .. } | StepKind::SequenceEnd { .. } => None,
         }
     }
 
     /// Whether this step's `output_commitment` is verified through a
     /// mechanism other than a direct byte-witness comparison: a replay
-    /// proof for `TileExec`/`RecurTileExec`/`RecurSequenceExec`, or the
-    /// authorization journal for `Entrypoint`.
+    /// proof for a tile, or the authorization journal for an entrypoint.
     pub fn is_execution_step(&self) -> bool {
-        matches!(
-            self,
-            StepRecord::TileExec(_)
-                | StepRecord::RecurTileExec(_)
-                | StepRecord::RecurSequenceExec(_)
-                | StepRecord::Entrypoint(_)
-        )
+        matches!(self.kind, StepKind::Exec(_) | StepKind::Entrypoint(_))
     }
 
     pub fn requires_replay_proof(&self) -> bool {
-        matches!(self, StepRecord::TileExec(_))
+        matches!(
+            &self.kind,
+            StepKind::Exec(ExecStep {
+                target: ExecTarget::Tile(_),
+                ..
+            })
+        )
     }
 }
 

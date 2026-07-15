@@ -23,7 +23,7 @@
 use raster_core::authorization::AuthorizationJournal;
 use raster_core::cfs::{CfsCoordinates, CfsCursor};
 use raster_core::input::struct_commitments_root;
-use raster_core::trace::{EntrypointOp, EntrypointRecord};
+use raster_core::trace::{EntrypointOp, EntrypointStep, StepRecord};
 use raster_core::transition::{EntrypointAuthorization, InternalStoreReadWitness};
 
 use crate::checks::store::verify_internal_store_read_witness;
@@ -69,13 +69,14 @@ pub fn combined_root(names: &[String], authorization_journal: &AuthorizationJour
 /// verified it.
 pub fn verify_step(
     cfs_cursor: &CfsCursor,
-    record: &EntrypointRecord,
+    record: &StepRecord,
+    entrypoint: &EntrypointStep,
     authorization_journal: &AuthorizationJournal,
 ) -> EntrypointAuthorization {
     let declared_names = cfs_cursor.main_entrypoint_names().unwrap_or_else(|| {
         panic!("Entrypoint step recorded for a CFS that declares no main entry arguments")
     });
-    let EntrypointOp::BindEntryArguments { names } = &record.op;
+    let EntrypointOp::BindEntryArguments { names } = &entrypoint.op;
     assert_eq!(
         names.as_slice(),
         declared_names,
@@ -89,7 +90,7 @@ pub fn verify_step(
 
     let expected = combined_root(declared_names, authorization_journal);
     assert_eq!(
-        record.output_commitment, expected,
+        entrypoint.output_commitment, expected,
         "Entrypoint binding does not match the authorized entry-argument commitments",
     );
 

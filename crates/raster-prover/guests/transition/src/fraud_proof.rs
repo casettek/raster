@@ -19,7 +19,7 @@ use risc0_zkvm::guest::env;
 use raster_core::cfs::{CfsCoordinates, CfsCursor, ControlFlowSchema};
 use raster_core::draft::{DraftId, TrackedDraftState};
 use raster_core::fingerprint::{Fingerprint, FingerprintAccumulator};
-use raster_core::trace::StepRecord;
+use raster_core::trace::{StepKind, StepRecord};
 use raster_core::transition::{
     EntrypointAuthorization, InitTransition, Transition, TransitionInput, TransitionJournal,
     TransitionState,
@@ -250,9 +250,13 @@ impl LiveTransition {
             input.input_source_witness.as_ref(),
             input.sequence_scope_witness.as_ref(),
         );
-        if let StepRecord::Entrypoint(record) = &input.step_record {
-            self.entrypoint_authorization =
-                checks::entrypoint::verify_step(cfs_cursor, record, &input.authorization_journal);
+        if let StepKind::Entrypoint(entrypoint) = &input.step_record.kind {
+            self.entrypoint_authorization = checks::entrypoint::verify_step(
+                cfs_cursor,
+                &input.step_record,
+                entrypoint,
+                &input.authorization_journal,
+            );
         }
         checks::io::verify_step_record(
             &input.step_record,

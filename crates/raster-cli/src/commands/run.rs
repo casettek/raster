@@ -18,7 +18,9 @@ use raster_compiler::{CfsBuilder, Project};
 use raster_core::cfs::{CfsCoordinates, CfsCursor, ControlFlowSchema};
 use raster_core::coordinate_index::IncrementalCoordinateIndex;
 use raster_core::input::{InternalRef, SelectionWitness};
-use raster_core::trace::{FnInput, StepRecord, Trace, TraceEvent};
+use raster_core::trace::{
+    ExecStep, ExecTarget, FnInput, StepKind, StepRecord, Trace, TraceEvent,
+};
 use raster_core::transition::{
     InternalStoreEntry, InternalStoreIndexValue, InternalStoreLogWitness, InternalStoreReadWitness,
     InternalStoreWitness, InternalStoreWriteWitness,
@@ -263,64 +265,16 @@ pub fn run(
         // them to file
 
         for step_record in trace {
-            match step_record {
-                StepRecord::TileExec(tile_exec_record) => {
-                    println!("\nexec_index: {}", tile_exec_record.exec_index);
-                    println!("sequence_id: {}", tile_exec_record.sequence_id);
-                    println!("tile_coordinates: {:?}", tile_exec_record.coordinates,);
-
-                    println!("tile_id: {}", tile_exec_record.tile_id);
-                }
-                StepRecord::RecurTileExec(recur_exec_record) => {
-                    println!("\nexec_index: {}", recur_exec_record.exec_index);
-                    println!("sequence_id: {}", recur_exec_record.sequence_id);
-                    println!(
-                        "recur_tile_coordinates: {:?}",
-                        recur_exec_record.coordinates,
-                    );
-
-                    println!("recur_tile_id: {}", recur_exec_record.recur_tile_id);
-                }
-                StepRecord::RecurSequenceExec(recur_sequence_exec_record) => {
-                    println!("\nexec_index: {}", recur_sequence_exec_record.exec_index);
-                    println!("sequence_id: {}", recur_sequence_exec_record.sequence_id);
-                    println!(
-                        "recur_sequence_coordinates: {:?}",
-                        recur_sequence_exec_record.coordinates,
-                    );
-
-                    println!(
-                        "recur_sequence_id: {}",
-                        recur_sequence_exec_record.recur_sequence_id
-                    );
-                }
-                StepRecord::SequenceStart(sequence_start_record) => {
-                    println!(
-                        "[sequence start] sequence id: {}",
-                        sequence_start_record.sequence_id
-                    );
-                    println!(
-                        "sequence coordinates: {:?}",
-                        sequence_start_record.coordinates
-                    );
-                }
-                StepRecord::SequenceEnd(sequence_end_record) => {
-                    println!(
-                        "[sequence end] sequence id: {}",
-                        sequence_end_record.sequence_id
-                    );
-                    println!(
-                        "sequence coordinates: {:?}",
-                        sequence_end_record.coordinates
-                    );
-                }
-                StepRecord::Entrypoint(entrypoint_record) => {
-                    println!(
-                        "[entrypoint] sequence id: {}",
-                        entrypoint_record.sequence_id
-                    );
-                    println!("coordinates: {:?}", entrypoint_record.coordinates);
-                }
+            println!();
+            println!("exec_index: {}", step_record.exec_index);
+            println!("sequence_id: {}", step_record.sequence_id);
+            println!(
+                "{}: {:?}",
+                step_coordinate_label(&step_record.kind),
+                step_record.coordinates
+            );
+            if let Some(target_id) = step_target_id(&step_record.kind) {
+                println!("id: {}", target_id);
             }
         }
     }
@@ -347,6 +301,31 @@ pub fn run(
     }
 
     Ok(())
+}
+
+/// What a step's coordinates are called in the trace printout. The label is
+/// how a reader tells a recur site apart from one of its iterations, which
+/// share an id and differ only in coordinates.
+fn step_coordinate_label(kind: &StepKind) -> &'static str {
+    match kind {
+        StepKind::SequenceStart { .. } | StepKind::SequenceEnd { .. } => "sequence_coordinates",
+        StepKind::Entrypoint(_) => "entrypoint_coordinates",
+        StepKind::Exec(exec) => match exec.target {
+            ExecTarget::Tile(_) => "tile_coordinates",
+            ExecTarget::RecurTile(_) => "recur_tile_coordinates",
+            ExecTarget::RecurSequence(_) => "recur_sequence_coordinates",
+        },
+    }
+}
+
+/// What the step ran, for kinds that ran something.
+fn step_target_id(kind: &StepKind) -> Option<&str> {
+    match kind {
+        StepKind::Exec(exec) => Some(match &exec.target {
+            ExecTarget::Tile(id) | ExecTarget::RecurTile(id) | ExecTarget::RecurSequence(id) => id,
+        }),
+        _ => None,
+    }
 }
 
 fn profiling_enabled(features: &[String], all_features: bool) -> bool {
@@ -470,45 +449,18 @@ pub fn fraud(
     fraud_proof_config: FraudProofConfig,
 ) -> Result<()> {
     let mut rng = rand::rng();
+    // Only steps that actually ran something are worth corrupting: a
+    // sequence boundary or an entrypoint has no replayed output to
+    // contradict.
     if let Some(fraud_step) = trace
         .iter_mut()
-        .filter(|step_record| match step_record {
-            StepRecord::TileExec(tile_exec_record) => {
-                !tile_exec_record.input_commitment.is_empty()
-            }
-            StepRecord::RecurTileExec(recur_exec_record) => {
-                !recur_exec_record.input_commitment.is_empty()
-            }
-            StepRecord::RecurSequenceExec(recur_sequence_exec_record) => {
-                !recur_sequence_exec_record.input_commitment.is_empty()
-            }
-            StepRecord::SequenceStart(_) | StepRecord::SequenceEnd(_) => false,
-            // Not an execution step with an input commitment of its own;
-            // excluded from this fraud pool like SequenceStart/End.
-            StepRecord::Entrypoint(_) => false,
+        .filter_map(|step_record| match &mut step_record.kind {
+            StepKind::Exec(exec) if !exec.input_commitment.is_empty() => Some(exec),
+            _ => None,
         })
         .choose(&mut rng)
     {
-        match fraud_step {
-            StepRecord::TileExec(tile_exec_record) => {
-                tile_exec_record.output_commitment = vec![0u8, 1u8];
-            }
-            StepRecord::RecurTileExec(recur_exec_record) => {
-                recur_exec_record.output_commitment = vec![0u8, 1u8];
-            }
-            StepRecord::RecurSequenceExec(recur_sequence_exec_record) => {
-                recur_sequence_exec_record.output_commitment = vec![0u8, 1u8];
-            }
-            StepRecord::SequenceStart(sequence_start_record) => {
-                sequence_start_record.input_commitment.push(0);
-            }
-            StepRecord::SequenceEnd(sequence_end_record) => {
-                sequence_end_record.output_commitment.push(0);
-            }
-            StepRecord::Entrypoint(entrypoint_record) => {
-                entrypoint_record.output_commitment.push(0);
-            }
-        }
+        fraud_step.output_commitment = vec![0u8, 1u8];
     };
 
     let trace_commitment = TraceCommitment::try_from(trace, &EMPTY_TRIE_NODES[0], fraud_proof_config)
@@ -843,9 +795,15 @@ pub fn prove(
             },
         );
 
-        if let StepRecord::TileExec(record) = step_record {
+        // Only a tile is replayed: it is the only step whose output is
+        // verified by re-running it (see `StepRecord::requires_replay_proof`).
+        if let StepKind::Exec(ExecStep {
+            target: ExecTarget::Tile(tile_id),
+            ..
+        }) = &step_record.kind
+        {
             let replay_input = input_witness.unwrap_or_default();
-            match replayer.replay(record, replay_input.as_slice(), mode) {
+            match replayer.replay(tile_id, replay_input.as_slice(), mode) {
                 Ok(replay_result) => {
                     replayed_results.insert(step_record.clone(), replay_result);
                 }

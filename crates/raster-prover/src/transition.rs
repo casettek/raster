@@ -244,10 +244,17 @@ mod tests {
     use raster_core::coordinate_index::coordinate_index_root;
     use raster_core::draft::TileReplayJournal;
     use raster_core::fingerprint::{BitPacker, Fingerprint};
-    use raster_core::trace::{
-        FnInput, SequenceEndRecord, SequenceStartRecord, TileExecRecord,
-    };
+    use raster_core::trace::{ExecStep, ExecTarget, FnInput, InternalStoreRoots, StepKind};
     use sha2::{Digest, Sha256};
+
+    fn empty_store_roots() -> InternalStoreRoots {
+        InternalStoreRoots {
+            root_before: EMPTY_TRIE_NODES[0].to_vec(),
+            root_after: EMPTY_TRIE_NODES[0].to_vec(),
+            index_root_before: Vec::new(),
+            index_root_after: Vec::new(),
+        }
+    }
 
     /// A step whose only recorded witnesses are its input/output bytes.
     fn io_witnesses(input_witness: Option<Vec<u8>>, output_witness: Option<Vec<u8>>) -> StepIo {
@@ -259,20 +266,19 @@ mod tests {
     }
 
     fn make_tile_step(exec_index: u64, coordinates: Vec<u32>) -> StepRecord {
-        StepRecord::TileExec(TileExecRecord {
+        StepRecord {
             exec_index,
-            tile_id: "shared_tile".to_string(),
             sequence_id: "main".to_string(),
             coordinates: CfsCoordinates(coordinates),
-            intra_sequence_index: 0,
-            input_commitment: vec![exec_index as u8],
-            input_source_commitment: Vec::new(),
-            output_commitment: vec![exec_index as u8 + 1],
-            internal_store_root_before: EMPTY_TRIE_NODES[0].to_vec(),
-            internal_store_root_after: EMPTY_TRIE_NODES[0].to_vec(),
-            internal_store_index_root_before: Vec::new(),
-            internal_store_index_root_after: Vec::new(),
-        })
+            kind: StepKind::Exec(ExecStep {
+                target: ExecTarget::Tile("shared_tile".to_string()),
+                intra_sequence_index: 0,
+                input_commitment: vec![exec_index as u8],
+                input_source_commitment: Vec::new(),
+                output_commitment: vec![exec_index as u8 + 1],
+                internal_store: empty_store_roots(),
+            }),
+        }
     }
 
     fn make_manifested_inputs() -> ManifestedInputs {
@@ -404,19 +410,23 @@ mod tests {
 
     #[test]
     fn build_transition_input_preserves_recorded_io_for_sequence_steps() {
-        let sequence_start = StepRecord::SequenceStart(SequenceStartRecord {
+        let sequence_start = StepRecord {
             exec_index: 1,
             sequence_id: "main".to_string(),
             coordinates: CfsCoordinates(vec![]),
-            input_commitment: vec![1; 32],
-            input_source_commitment: Vec::new(),
-        });
-        let sequence_end = StepRecord::SequenceEnd(SequenceEndRecord {
+            kind: StepKind::SequenceStart {
+                input_commitment: vec![1; 32],
+                input_source_commitment: Vec::new(),
+            },
+        };
+        let sequence_end = StepRecord {
             exec_index: 2,
             sequence_id: "main".to_string(),
             coordinates: CfsCoordinates(vec![]),
-            output_commitment: vec![2; 32],
-        });
+            kind: StepKind::SequenceEnd {
+                output_commitment: vec![2; 32],
+            },
+        };
         let recorded_step_io = HashMap::from([
             (
                 sequence_start.clone(),
@@ -485,16 +495,18 @@ mod tests {
     }
 
     fn make_sequence_start_step() -> StepRecord {
-        StepRecord::SequenceStart(SequenceStartRecord {
+        StepRecord {
             exec_index: 1,
             sequence_id: "main".to_string(),
             coordinates: CfsCoordinates(vec![]),
-            input_commitment: Sha256::digest(b"sequence-in").to_vec(),
-            input_source_commitment: Sha256::digest(
-                empty_input_source_witness().source_witness_bytes(),
-            )
-            .to_vec(),
-        })
+            kind: StepKind::SequenceStart {
+                input_commitment: Sha256::digest(b"sequence-in").to_vec(),
+                input_source_commitment: Sha256::digest(
+                    empty_input_source_witness().source_witness_bytes(),
+                )
+                .to_vec(),
+            },
+        }
     }
 
     fn prove_single_transition_with_authorization(

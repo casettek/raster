@@ -606,7 +606,7 @@ pub mod prelude {
     pub use crate::core::{
         manifest::Manifest,
         schema::{ControlFlow, SequenceSchema},
-        trace::{FnCallRecord, FnInput, FnInputArg, FnOutput, TileExecRecord},
+        trace::{ExecStep, ExecTarget, FnCallRecord, FnInput, FnInputArg, FnOutput, StepKind},
     };
 
     pub use crate::exec::Result;

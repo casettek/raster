@@ -2,8 +2,8 @@ use raster_core::cfs::{CfsCoordinates, CfsCursor, ControlFlowSchema, SequenceChi
 use raster_core::draft::DraftTransitionWitness;
 use raster_core::input::{InternalRef, SelectionWitness, SelectorPath};
 use raster_core::trace::{
-    FnInput, InternalInput, RecurSequenceExecRecord, RecurTileExecRecord,
-    SequenceEndRecord, SequenceStartRecord, StepRecord, TileExecRecord, TraceEvent,
+    EntrypointStep, ExecStep, ExecTarget, FnInput, InternalInput, InternalStoreRoots, StepKind,
+    StepRecord, TraceEvent,
 };
 use sha2::{Digest, Sha256};
 
@@ -309,6 +309,56 @@ impl TraceRecorder {
         })
     }
 
+    /// The internal-store roots to record for a step that did (or did not)
+    /// write. A step without a write leaves the store where it found it, so
+    /// both sides are the current roots.
+    fn internal_store_roots(
+        &self,
+        internal_write: Option<&InternalWriteRecord>,
+    ) -> InternalStoreRoots {
+        match internal_write {
+            Some(write) => InternalStoreRoots {
+                root_before: write.store_root_before.clone(),
+                root_after: write.store_root_after.clone(),
+                index_root_before: write.index_root_before.clone(),
+                index_root_after: write.index_root_after.clone(),
+            },
+            None => {
+                let snapshot = self.internal_storage.snapshot();
+                InternalStoreRoots {
+                    root_before: snapshot.root.clone(),
+                    root_after: snapshot.root,
+                    index_root_before: snapshot.index_root.clone(),
+                    index_root_after: snapshot.index_root,
+                }
+            }
+        }
+    }
+
+    /// The commitments an execution step makes. Every exec target commits to
+    /// the same things, so they are computed in exactly one place — a target
+    /// cannot end up committing to less than its siblings.
+    fn exec_step(
+        &self,
+        target: ExecTarget,
+        intra_sequence_index: u32,
+        input: Option<&FnInput>,
+        internal_write: Option<&InternalWriteRecord>,
+    ) -> ExecStep {
+        ExecStep {
+            target,
+            intra_sequence_index,
+            input_commitment: input
+                .map(|input| Sha256Commitment::from(input).into())
+                .unwrap_or_default(),
+            input_source_commitment: input.map(input_source_commitment).unwrap_or_default(),
+            output_commitment: internal_write
+                .map(|write| write.entry.object_commitment.clone())
+                .unwrap_or_default(),
+            internal_store: self.internal_store_roots(internal_write),
+        }
+    }
+
     pub fn record(&mut self, event: TraceEvent) -> StepRecord {
         self.exec_index += 1;
         let exec_index = self.exec_index;
@@ -330,17 +380,19 @@ impl TraceRecorder {
                     .map(input_source_commitment)
                     .unwrap_or_default();
 
-                let record = SequenceStartRecord {
+                let record = StepRecord {
                     exec_index,
                     sequence_id: fn_call_record.fn_name.clone(),
                     coordinates: coordinates.clone(),
-                    input_commitment,
-                    input_source_commitment,
+                    kind: StepKind::SequenceStart {
+                        input_commitment,
+                        input_source_commitment,
+                    },
                 };
 
                 self.witness_store.insert(coordinates, event.clone(), None);
 
-                StepRecord::SequenceStart(record)
+                record
             }
             TraceEvent::SequenceEnd(fn_call_record) => {
                 let sequence_coordinates =
@@ -363,11 +415,11 @@ impl TraceRecorder {
                     .map(|output| Sha256Commitment::from(output).into())
                     .unwrap_or_default();
 
-                let record = SequenceEndRecord {
+                let record = StepRecord {
                     exec_index,
                     coordinates: sequence_coordinates.clone(),
                     sequence_id: fn_call_record.fn_name.clone(),
-                    output_commitment,
+                    kind: StepKind::SequenceEnd { output_commitment },
                 };
 
                 self.sequence_callstack
@@ -376,7 +428,7 @@ impl TraceRecorder {
 
                 self.witness_store.insert(sequence_coordinates, event, None);
 
-                StepRecord::SequenceEnd(record)
+                record
             }
             TraceEvent::RecurSequenceStart(fn_call_record) => {
                 let parent_sequence_coordinates =
@@ -439,18 +491,20 @@ impl TraceRecorder {
                     .map(input_source_commitment)
                     .unwrap_or_default();
 
-                let record = SequenceStartRecord {
+                let record = StepRecord {
                     exec_index,
                     sequence_id: fn_call_record.fn_name.clone(),
                     coordinates: iteration_coordinates.clone(),
-                    input_commitment,
-                    input_source_commitment,
+                    kind: StepKind::SequenceStart {
+                        input_commitment,
+                        input_source_commitment,
+                    },
                 };
 
                 self.witness_store
                     .insert(iteration_coordinates, event.clone(), None);
 
-                StepRecord::SequenceStart(record)
+                record
             }
             TraceEvent::RecurSequenceEnd(fn_call_record) => {
                 assert!(
@@ -466,11 +520,11 @@ impl TraceRecorder {
                     .map(|output| Sha256Commitment::from(output).into())
                     .unwrap_or_default();
 
-                let record = SequenceEndRecord {
+                let record = StepRecord {
                     exec_index,
                     coordinates: sequence_coordinates.clone(),
                     sequence_id: fn_call_record.fn_name.clone(),
-                    output_commitment,
+                    kind: StepKind::SequenceEnd { output_commitment },
                 };
 
                 self.sequence_callstack
@@ -480,7 +534,7 @@ impl TraceRecorder {
                 self.witness_store
                     .insert(sequence_coordinates, event.clone(), None);
 
-                StepRecord::SequenceEnd(record)
+                record
             }
             TraceEvent::TileExec(fn_call_record) => {
                 assert!(
@@ -521,15 +575,6 @@ impl TraceRecorder {
                 current_sequence_state.current_index += 1;
 
                 let input = fn_call_record.input;
-                let input_commitment = input
-                    .as_ref()
-                    .map(|input| Sha256Commitment::from(input).into())
-                    .unwrap_or_default();
-                let input_source_commitment = input
-                    .as_ref()
-                    .map(input_source_commitment)
-                    .unwrap_or_default();
-
                 let output = fn_call_record.output;
                 let internal_write = output.as_ref().map(|output| {
                     self.internal_storage.append_serialized_bytes(
@@ -538,42 +583,23 @@ impl TraceRecorder {
                         output.raster.clone(),
                     )
                 });
-                let output_commitment = internal_write
-                    .as_ref()
-                    .map(|write| write.entry.object_commitment.clone())
-                    .unwrap_or_default();
 
-                let record = TileExecRecord {
+                let record = StepRecord {
                     exec_index,
-                    tile_id: fn_call_record.fn_name,
                     sequence_id,
-                    intra_sequence_index: parent_current_index,
                     coordinates: tile_coordinates.clone(),
-                    input_commitment,
-                    input_source_commitment,
-                    output_commitment,
-                    internal_store_root_before: internal_write
-                        .as_ref()
-                        .map(|write| write.store_root_before.clone())
-                        .unwrap_or_else(|| self.internal_storage.snapshot().root),
-                    internal_store_root_after: internal_write
-                        .as_ref()
-                        .map(|write| write.store_root_after.clone())
-                        .unwrap_or_else(|| self.internal_storage.snapshot().root),
-                    internal_store_index_root_before: internal_write
-                        .as_ref()
-                        .map(|write| write.index_root_before.clone())
-                        .unwrap_or_else(|| self.internal_storage.snapshot().index_root),
-                    internal_store_index_root_after: internal_write
-                        .as_ref()
-                        .map(|write| write.index_root_after.clone())
-                        .unwrap_or_else(|| self.internal_storage.snapshot().index_root),
+                    kind: StepKind::Exec(self.exec_step(
+                        ExecTarget::Tile(fn_call_record.fn_name),
+                        parent_current_index,
+                        input.as_ref(),
+                        internal_write.as_ref(),
+                    )),
                 };
 
                 self.witness_store
                     .insert(tile_coordinates, event.clone(), internal_write);
 
-                StepRecord::TileExec(record)
+                record
             }
             TraceEvent::RecurTileIterationExec(fn_call_record) => {
                 let sequence_coordinates =
@@ -611,17 +637,9 @@ impl TraceRecorder {
                 let mut tile_coordinates = recur_state.site_coordinates.clone();
                 tile_coordinates.push(recur_state.next_iteration_index);
                 recur_state.next_iteration_index += 1;
+                let intra_sequence_index = recur_state.intra_sequence_index;
 
                 let input = fn_call_record.input;
-                let input_commitment = input
-                    .as_ref()
-                    .map(|input| Sha256Commitment::from(input).into())
-                    .unwrap_or_default();
-                let input_source_commitment = input
-                    .as_ref()
-                    .map(input_source_commitment)
-                    .unwrap_or_default();
-
                 let output = fn_call_record.output;
                 let internal_write = output.as_ref().map(|output| {
                     self.internal_storage.append_serialized_bytes(
@@ -630,42 +648,25 @@ impl TraceRecorder {
                         output.raster.clone(),
                     )
                 });
-                let output_commitment = internal_write
-                    .as_ref()
-                    .map(|write| write.entry.object_commitment.clone())
-                    .unwrap_or_default();
 
-                let record = TileExecRecord {
+                // An iteration of a recur site is an ordinary tile run: it is
+                // replayed and verified exactly like one.
+                let record = StepRecord {
                     exec_index,
-                    tile_id: fn_call_record.fn_name,
                     sequence_id,
-                    intra_sequence_index: recur_state.intra_sequence_index,
                     coordinates: tile_coordinates.clone(),
-                    input_commitment,
-                    input_source_commitment,
-                    output_commitment,
-                    internal_store_root_before: internal_write
-                        .as_ref()
-                        .map(|write| write.store_root_before.clone())
-                        .unwrap_or_else(|| self.internal_storage.snapshot().root),
-                    internal_store_root_after: internal_write
-                        .as_ref()
-                        .map(|write| write.store_root_after.clone())
-                        .unwrap_or_else(|| self.internal_storage.snapshot().root),
-                    internal_store_index_root_before: internal_write
-                        .as_ref()
-                        .map(|write| write.index_root_before.clone())
-                        .unwrap_or_else(|| self.internal_storage.snapshot().index_root),
-                    internal_store_index_root_after: internal_write
-                        .as_ref()
-                        .map(|write| write.index_root_after.clone())
-                        .unwrap_or_else(|| self.internal_storage.snapshot().index_root),
+                    kind: StepKind::Exec(self.exec_step(
+                        ExecTarget::Tile(fn_call_record.fn_name),
+                        intra_sequence_index,
+                        input.as_ref(),
+                        internal_write.as_ref(),
+                    )),
                 };
 
                 self.witness_store
                     .insert(tile_coordinates, event.clone(), internal_write);
 
-                StepRecord::TileExec(record)
+                record
             }
             TraceEvent::RecurTileExec(fn_call_record) => {
                 let sequence_coordinates =
@@ -703,63 +704,35 @@ impl TraceRecorder {
 
                 current_sequence_state.current_index += 1;
 
-                let input = fn_call_record.input;
-                let input_commitment = input
-                    .as_ref()
-                    .map(|input| Sha256Commitment::from(input).into())
-                    .unwrap_or_default();
-                let input_source_commitment = input
-                    .as_ref()
-                    .map(input_source_commitment)
-                    .unwrap_or_default();
+                let site_coordinates = recur_state.site_coordinates.clone();
+                let intra_sequence_index = recur_state.intra_sequence_index;
 
+                let input = fn_call_record.input;
                 let output = fn_call_record.output;
                 let internal_write = output.as_ref().map(|output| {
                     self.internal_storage.append_serialized_bytes(
                         &output.data,
-                        recur_state.site_coordinates.clone(),
+                        site_coordinates.clone(),
                         output.raster.clone(),
                     )
                 });
-                let output_commitment = internal_write
-                    .as_ref()
-                    .map(|write| write.entry.object_commitment.clone())
-                    .unwrap_or_default();
 
-                let record = RecurTileExecRecord {
+                let record = StepRecord {
                     exec_index,
-                    recur_tile_id: fn_call_record.fn_name,
                     sequence_id,
-                    intra_sequence_index: recur_state.intra_sequence_index,
-                    coordinates: recur_state.site_coordinates.clone(),
-                    input_commitment,
-                    input_source_commitment,
-                    output_commitment,
-                    internal_store_root_before: internal_write
-                        .as_ref()
-                        .map(|write| write.store_root_before.clone())
-                        .unwrap_or_else(|| self.internal_storage.snapshot().root),
-                    internal_store_root_after: internal_write
-                        .as_ref()
-                        .map(|write| write.store_root_after.clone())
-                        .unwrap_or_else(|| self.internal_storage.snapshot().root),
-                    internal_store_index_root_before: internal_write
-                        .as_ref()
-                        .map(|write| write.index_root_before.clone())
-                        .unwrap_or_else(|| self.internal_storage.snapshot().index_root),
-                    internal_store_index_root_after: internal_write
-                        .as_ref()
-                        .map(|write| write.index_root_after.clone())
-                        .unwrap_or_else(|| self.internal_storage.snapshot().index_root),
+                    coordinates: site_coordinates.clone(),
+                    kind: StepKind::Exec(self.exec_step(
+                        ExecTarget::RecurTile(fn_call_record.fn_name),
+                        intra_sequence_index,
+                        input.as_ref(),
+                        internal_write.as_ref(),
+                    )),
                 };
 
-                self.witness_store.insert(
-                    recur_state.site_coordinates.clone(),
-                    event.clone(),
-                    internal_write,
-                );
+                self.witness_store
+                    .insert(site_coordinates, event.clone(), internal_write);
 
-                StepRecord::RecurTileExec(record)
+                record
             }
             TraceEvent::RecurSequenceExec(fn_call_record) => {
                 let sequence_coordinates =
@@ -801,63 +774,35 @@ impl TraceRecorder {
 
                 current_sequence_state.current_index += 1;
 
-                let input = fn_call_record.input;
-                let input_commitment = input
-                    .as_ref()
-                    .map(|input| Sha256Commitment::from(input).into())
-                    .unwrap_or_default();
-                let input_source_commitment = input
-                    .as_ref()
-                    .map(input_source_commitment)
-                    .unwrap_or_default();
+                let site_coordinates = recur_state.site_coordinates.clone();
+                let intra_sequence_index = recur_state.intra_sequence_index;
 
+                let input = fn_call_record.input;
                 let output = fn_call_record.output;
                 let internal_write = output.as_ref().map(|output| {
                     self.internal_storage.append_serialized_bytes(
                         &output.data,
-                        recur_state.site_coordinates.clone(),
+                        site_coordinates.clone(),
                         output.raster.clone(),
                     )
                 });
-                let output_commitment = internal_write
-                    .as_ref()
-                    .map(|write| write.entry.object_commitment.clone())
-                    .unwrap_or_default();
 
-                let record = RecurSequenceExecRecord {
+                let record = StepRecord {
                     exec_index,
-                    recur_sequence_id: fn_call_record.fn_name,
                     sequence_id,
-                    intra_sequence_index: recur_state.intra_sequence_index,
-                    coordinates: recur_state.site_coordinates.clone(),
-                    input_commitment,
-                    input_source_commitment,
-                    output_commitment,
-                    internal_store_root_before: internal_write
-                        .as_ref()
-                        .map(|write| write.store_root_before.clone())
-                        .unwrap_or_else(|| self.internal_storage.snapshot().root),
-                    internal_store_root_after: internal_write
-                        .as_ref()
-                        .map(|write| write.store_root_after.clone())
-                        .unwrap_or_else(|| self.internal_storage.snapshot().root),
-                    internal_store_index_root_before: internal_write
-                        .as_ref()
-                        .map(|write| write.index_root_before.clone())
-                        .unwrap_or_else(|| self.internal_storage.snapshot().index_root),
-                    internal_store_index_root_after: internal_write
-                        .as_ref()
-                        .map(|write| write.index_root_after.clone())
-                        .unwrap_or_else(|| self.internal_storage.snapshot().index_root),
+                    coordinates: site_coordinates.clone(),
+                    kind: StepKind::Exec(self.exec_step(
+                        ExecTarget::RecurSequence(fn_call_record.fn_name),
+                        intra_sequence_index,
+                        input.as_ref(),
+                        internal_write.as_ref(),
+                    )),
                 };
 
-                self.witness_store.insert(
-                    recur_state.site_coordinates.clone(),
-                    event.clone(),
-                    internal_write,
-                );
+                self.witness_store
+                    .insert(site_coordinates, event.clone(), internal_write);
 
-                StepRecord::RecurSequenceExec(record)
+                record
             }
             TraceEvent::EntrypointBind(bind_event) => {
                 let sequence_coordinates =
@@ -948,22 +893,22 @@ impl TraceRecorder {
                     internal: InternalInput::new(),
                 });
 
-                let record = raster_core::trace::EntrypointRecord {
+                let record = StepRecord {
                     exec_index,
                     sequence_id,
                     coordinates: coordinates.clone(),
-                    op: raster_core::trace::EntrypointOp::BindEntryArguments { names },
-                    input_source_commitment: empty_input_source_commitment,
-                    output_commitment,
-                    internal_store_root_before: write.store_root_before.clone(),
-                    internal_store_root_after: write.store_root_after.clone(),
-                    internal_store_index_root_before: write.index_root_before.clone(),
-                    internal_store_index_root_after: write.index_root_after.clone(),
+                    kind: StepKind::Entrypoint(EntrypointStep {
+                        op: raster_core::trace::EntrypointOp::BindEntryArguments { names },
+                        input_source_commitment: empty_input_source_commitment,
+                        output_commitment,
+                        internal_store: self.internal_store_roots(Some(&write)),
+                    }),
                 };
 
-                self.witness_store.insert(coordinates, event.clone(), Some(write));
+                self.witness_store
+                    .insert(coordinates, event.clone(), Some(write));
 
-                StepRecord::Entrypoint(record)
+                record
             }
         };
 

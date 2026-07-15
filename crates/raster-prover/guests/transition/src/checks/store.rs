@@ -12,7 +12,7 @@ use raster_core::coordinate_index::{
     verify_coordinate_index_membership, verify_coordinate_index_non_membership,
 };
 use raster_core::input::verify_selection_witness;
-use raster_core::trace::{FnInput, StepRecord};
+use raster_core::trace::{FnInput, InternalStoreRoots, StepRecord};
 use raster_core::transition::{
     InternalStoreEntry, InternalStoreLogWitness, InternalStoreReadWitness, InternalStoreWitness,
     InternalStoreWriteWitness, SerializableFrontier,
@@ -146,12 +146,12 @@ pub fn verify_internal_store_transition(
     current_frontier: &mut NonEmptyFrontier<Bytes>,
     current_index_root: &[u8],
 ) -> (SerializableFrontier, Vec<u8>, Vec<u8>) {
-    if let Some((
-        internal_store_root_before,
-        internal_store_root_after,
-        internal_store_index_root_before,
-        internal_store_index_root_after,
-    )) = step_record.internal_store_roots()
+    if let Some(InternalStoreRoots {
+        root_before: internal_store_root_before,
+        root_after: internal_store_root_after,
+        index_root_before: internal_store_index_root_before,
+        index_root_after: internal_store_index_root_after,
+    }) = step_record.internal_store_roots()
     {
         let current_root = frontier_root(current_frontier);
         assert_eq!(

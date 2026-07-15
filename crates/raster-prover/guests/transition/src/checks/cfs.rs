@@ -4,7 +4,9 @@
 //! follow the schema's ordering.
 
 use raster_core::cfs::{CfsCoordinates, CfsCursor, InputBinding, InputSource, SequenceChildItem};
-use raster_core::trace::{FnInput, FnInputValue, InternalData, StepRecord};
+use raster_core::trace::{
+    ExecStep, ExecTarget, FnInput, FnInputValue, InternalData, StepKind, StepRecord,
+};
 
 enum ResolvedSource<'a> {
     Inline(&'a Vec<u8>),
@@ -68,15 +70,33 @@ fn has_coordinate_prefix(coordinates: &CfsCoordinates, prefix: &CfsCoordinates) 
 /// authorization journal. Without this, a record could take a coordinate
 /// whose verification rules are weaker than its own.
 fn record_matches_item(step_record: &StepRecord, cfs_item: &SequenceChildItem) -> bool {
-    match (step_record, cfs_item) {
-        (StepRecord::TileExec(_), SequenceChildItem::Tile(_)) => true,
-        (StepRecord::RecurTileExec(_), SequenceChildItem::RecurTile(_)) => true,
-        (StepRecord::RecurSequenceExec(_), SequenceChildItem::RecurSequence(_)) => true,
-        (StepRecord::Entrypoint(_), SequenceChildItem::Entrypoint(_)) => true,
+    match (&step_record.kind, cfs_item) {
+        (
+            StepKind::Exec(ExecStep {
+                target: ExecTarget::Tile(_),
+                ..
+            }),
+            SequenceChildItem::Tile(_),
+        ) => true,
+        (
+            StepKind::Exec(ExecStep {
+                target: ExecTarget::RecurTile(_),
+                ..
+            }),
+            SequenceChildItem::RecurTile(_),
+        ) => true,
+        (
+            StepKind::Exec(ExecStep {
+                target: ExecTarget::RecurSequence(_),
+                ..
+            }),
+            SequenceChildItem::RecurSequence(_),
+        ) => true,
+        (StepKind::Entrypoint(_), SequenceChildItem::Entrypoint(_)) => true,
         // A nested sequence is entered and left at its own item coordinate,
         // whether it is an ordinary or a recur sequence.
         (
-            StepRecord::SequenceStart(_) | StepRecord::SequenceEnd(_),
+            StepKind::SequenceStart { .. } | StepKind::SequenceEnd { .. },
             SequenceChildItem::Sequence(_) | SequenceChildItem::RecurSequence(_),
         ) => true,
         _ => false,

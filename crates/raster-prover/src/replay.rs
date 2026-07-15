@@ -5,7 +5,6 @@ use raster_compiler::tile::TileDiscovery;
 use raster_compiler::Project;
 
 use raster_core::draft::TileReplayJournal;
-use raster_core::trace::TileExecRecord;
 use raster_core::{Error, Result};
 
 #[derive(Debug, Clone)]
@@ -61,14 +60,14 @@ impl<'a> Replayer<'a> {
     /// A `ReplayResult` containing the execution result and optional output comparison.
     pub fn replay(
         &self,
-        record: &TileExecRecord,
+        tile_id: &str,
         input_bytes: &[u8],
         mode: ExecutionMode,
     ) -> Result<ReplayResult> {
         let discovery = TileDiscovery::new(self.project);
 
-        let tile = discovery.get(&record.tile_id).ok_or_else(|| {
-            Error::InvalidTileId(format!("Tile '{}' not found in project", record.tile_id))
+        let tile = discovery.get(tile_id).ok_or_else(|| {
+            Error::InvalidTileId(format!("Tile '{}' not found in project", tile_id))
         })?;
 
         let content_hash = tile.to_content_hash();
@@ -91,7 +90,7 @@ impl<'a> Replayer<'a> {
             raster_core::postcard::from_bytes(&receipt.journal.bytes)
                 .map_err(|e| Error::Other(format!("Failed to decode replay journal: {}", e)))?;
         Ok(ReplayResult {
-            fn_name: record.tile_id.clone(),
+            fn_name: tile_id.to_string(),
             receipt: receipt_bytes,
             image_id,
             input: input_bytes.to_vec(),
