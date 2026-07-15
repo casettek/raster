@@ -823,6 +823,7 @@ fn verify_draft_transition_rejects_tampered_pre_state_witness() {
 use crate::checks::entrypoint::{combined_root, verify_genesis_authorization, verify_step};
 use raster_core::cfs::EntrypointItem;
 use raster_core::trace::{EntrypointOp, EntrypointRecord};
+use raster_core::transition::EntrypointAuthorization;
 
 fn entrypoint_cfs(names: Vec<String>) -> CfsCursor {
     CfsCursor::new(ControlFlowSchema {
@@ -863,6 +864,21 @@ fn two_arg_authorization_journal(
     }
 }
 
+fn entrypoint_record(names: Vec<String>, output_commitment: Vec<u8>) -> EntrypointRecord {
+    EntrypointRecord {
+        exec_index: 0,
+        sequence_id: "main".to_string(),
+        coordinates: CfsCoordinates(vec![0]),
+        op: EntrypointOp::BindEntryArguments { names },
+        input_source_commitment: vec![0; 32],
+        output_commitment,
+        internal_store_root_before: EMPTY_LEAF.to_vec(),
+        internal_store_root_after: EMPTY_LEAF.to_vec(),
+        internal_store_index_root_before: Vec::new(),
+        internal_store_index_root_after: Vec::new(),
+    }
+}
+
 #[test]
 fn combined_root_matches_struct_hash_convention_over_declared_commitments() {
     let commitment_a = sha(b"personal_data-file");
@@ -874,10 +890,14 @@ fn combined_root_matches_struct_hash_convention_over_declared_commitments() {
         &journal,
     );
 
-    let mut expected_input = b"struct".to_vec();
-    expected_input.extend_from_slice(&commitment_a);
-    expected_input.extend_from_slice(&commitment_b);
-    let expected = sha(&expected_input);
+    // The binding is an ordinary struct node over (name, commitment) pairs —
+    // the same convention the selection tree uses, which is what lets a
+    // selection into one argument be one ordinary proof step.
+    let expected = raster_core::input::struct_commitments_root([
+        ("personal_data", commitment_a.as_slice()),
+        ("seed", commitment_b.as_slice()),
+    ])
+    .to_vec();
 
     assert_eq!(actual, expected);
 
@@ -891,27 +911,18 @@ fn combined_root_matches_struct_hash_convention_over_declared_commitments() {
 }
 
 #[test]
-fn verify_step_accepts_matching_binding_and_rejects_tampered_one() {
+fn verify_step_accepts_matching_binding_and_establishes_authorization() {
     let commitment_a = sha(b"personal_data-file");
     let commitment_b = sha(b"seed-file");
     let journal = two_arg_authorization_journal(&commitment_a, &commitment_b);
     let names = vec!["personal_data".to_string(), "seed".to_string()];
-    let expected_root = combined_root(&names, &journal);
+    let cfs_cursor = entrypoint_cfs(names.clone());
+    let record = entrypoint_record(names.clone(), combined_root(&names, &journal));
 
-    let record = EntrypointRecord {
-        exec_index: 0,
-        sequence_id: "main".to_string(),
-        coordinates: CfsCoordinates(vec![0]),
-        op: EntrypointOp::BindEntryArguments { names: names.clone() },
-        input_source_commitment: vec![0; 32],
-        output_commitment: expected_root,
-        internal_store_root_before: EMPTY_LEAF.to_vec(),
-        internal_store_root_after: EMPTY_LEAF.to_vec(),
-        internal_store_index_root_before: Vec::new(),
-        internal_store_index_root_after: Vec::new(),
-    };
-
-    verify_step(&record, &journal);
+    assert_eq!(
+        verify_step(&cfs_cursor, &record, &journal),
+        EntrypointAuthorization::Established,
+    );
 }
 
 #[test]
@@ -921,32 +932,63 @@ fn verify_step_rejects_tampered_output_commitment() {
     let commitment_b = sha(b"seed-file");
     let journal = two_arg_authorization_journal(&commitment_a, &commitment_b);
     let names = vec!["personal_data".to_string(), "seed".to_string()];
+    let cfs_cursor = entrypoint_cfs(names.clone());
+    let record = entrypoint_record(names, vec![0xff; 32]);
 
-    let record = EntrypointRecord {
-        exec_index: 0,
-        sequence_id: "main".to_string(),
-        coordinates: CfsCoordinates(vec![0]),
-        op: EntrypointOp::BindEntryArguments { names },
-        input_source_commitment: vec![0; 32],
-        output_commitment: vec![0xff; 32],
-        internal_store_root_before: EMPTY_LEAF.to_vec(),
-        internal_store_root_after: EMPTY_LEAF.to_vec(),
-        internal_store_index_root_before: Vec::new(),
-        internal_store_index_root_after: Vec::new(),
-    };
-
-    verify_step(&record, &journal);
+    verify_step(&cfs_cursor, &record, &journal);
 }
 
 #[test]
-fn genesis_authorization_is_vacuously_true_when_cfs_declares_no_entry_arguments() {
+#[should_panic(expected = "binds different entry arguments than the CFS declares")]
+fn verify_step_rejects_binding_a_subset_of_the_declared_entry_arguments() {
+    // Every individual commitment here is authorized — the manifest declares
+    // both — so only the CFS can say that dropping `seed` from the binding
+    // makes it a different program than the one being proven.
+    let commitment_a = sha(b"personal_data-file");
+    let commitment_b = sha(b"seed-file");
+    let journal = two_arg_authorization_journal(&commitment_a, &commitment_b);
+    let cfs_cursor = entrypoint_cfs(vec!["personal_data".to_string(), "seed".to_string()]);
+
+    let subset = vec!["personal_data".to_string()];
+    let record = entrypoint_record(subset.clone(), combined_root(&subset, &journal));
+
+    verify_step(&cfs_cursor, &record, &journal);
+}
+
+#[test]
+#[should_panic(expected = "binds different entry arguments than the CFS declares")]
+fn verify_step_rejects_reordered_entry_arguments() {
+    let commitment_a = sha(b"personal_data-file");
+    let commitment_b = sha(b"seed-file");
+    let journal = two_arg_authorization_journal(&commitment_a, &commitment_b);
+    let cfs_cursor = entrypoint_cfs(vec!["personal_data".to_string(), "seed".to_string()]);
+
+    let swapped = vec!["seed".to_string(), "personal_data".to_string()];
+    let record = entrypoint_record(swapped.clone(), combined_root(&swapped, &journal));
+
+    verify_step(&cfs_cursor, &record, &journal);
+}
+
+#[test]
+#[should_panic(expected = "CFS that declares no main entry arguments")]
+fn verify_step_rejects_entrypoint_record_when_cfs_declares_none() {
+    let journal = two_arg_authorization_journal(&sha(b"a"), &sha(b"b"));
+    let cfs_cursor = no_entrypoint_cfs();
+    let names = vec!["personal_data".to_string()];
+    let record = entrypoint_record(names.clone(), combined_root(&names, &journal));
+
+    verify_step(&cfs_cursor, &record, &journal);
+}
+
+#[test]
+fn genesis_authorization_is_not_required_when_cfs_declares_no_entry_arguments() {
     let cfs_cursor = no_entrypoint_cfs();
     let journal = two_arg_authorization_journal(&sha(b"a"), &sha(b"b"));
 
-    let authorized =
-        verify_genesis_authorization(&cfs_cursor, &EMPTY_LEAF, &[], &journal, None);
-
-    assert!(authorized);
+    assert_eq!(
+        verify_genesis_authorization(&cfs_cursor, &EMPTY_LEAF, &[], &journal, None),
+        EntrypointAuthorization::NotRequired,
+    );
 }
 
 #[test]
@@ -979,21 +1021,39 @@ fn genesis_authorization_accepts_valid_trace_inclusion_witness() {
     let (_frontier, root, _index, index_root) = build_internal_store_context(&[entry.clone()]);
     let witness = build_read_witness(&[entry.clone()], &entry);
 
-    let authorized =
-        verify_genesis_authorization(&cfs_cursor, &root, &index_root, &journal, Some(&witness));
-
-    assert!(authorized);
+    assert_eq!(
+        verify_genesis_authorization(&cfs_cursor, &root, &index_root, &journal, Some(&witness)),
+        EntrypointAuthorization::Established,
+    );
 }
 
 #[test]
-#[should_panic(expected = "Missing entrypoint membership witness")]
-fn genesis_authorization_rejects_missing_witness_when_entry_arguments_declared() {
+fn genesis_authorization_is_pending_without_a_witness_so_a_window_may_open_at_genesis() {
+    // A window whose trace starts at the beginning has an empty initial
+    // store: no membership witness can exist, because the binding has not
+    // happened yet. That must leave a debt, not fail — the `Entrypoint` step
+    // inside the window is what pays it.
     let names = vec!["personal_data".to_string(), "seed".to_string()];
     let journal =
         two_arg_authorization_journal(&sha(b"personal_data-file"), &sha(b"seed-file"));
     let cfs_cursor = entrypoint_cfs(names);
 
-    verify_genesis_authorization(&cfs_cursor, &EMPTY_LEAF, &[], &journal, None);
+    assert_eq!(
+        verify_genesis_authorization(&cfs_cursor, &EMPTY_LEAF, &[], &journal, None),
+        EntrypointAuthorization::Pending,
+    );
+}
+
+#[test]
+#[should_panic(expected = "entry-argument binding was never authorized")]
+fn pending_authorization_may_not_reach_the_end_of_a_chain() {
+    EntrypointAuthorization::Pending.assert_discharged();
+}
+
+#[test]
+fn discharged_authorization_states_may_conclude_a_chain() {
+    EntrypointAuthorization::Established.assert_discharged();
+    EntrypointAuthorization::NotRequired.assert_discharged();
 }
 
 #[test]

@@ -19,6 +19,8 @@ pub struct FlowResolver {
     bindings: HashMap<String, usize>,
     /// Sequence parameter names mapped to their input index.
     param_indices: HashMap<String, usize>,
+    /// `let name = select!(T, root...)` locals, mapping `name` to `root`.
+    selection_aliases: HashMap<String, String>,
 }
 
 impl FlowResolver {
@@ -51,6 +53,12 @@ impl FlowResolver {
         // Reset state for this sequence
         self.bindings.clear();
         self.param_indices.clear();
+        self.selection_aliases = sequence
+            .function
+            .selection_aliases
+            .iter()
+            .cloned()
+            .collect();
 
         let item_index_offset = if entry_argument_names.is_empty() { 0 } else { 1 };
 
@@ -129,32 +137,58 @@ impl FlowResolver {
 
     /// Resolve input sources for a function call's arguments.
     fn resolve_call_inputs(&self, call: &CallInfo) -> Vec<InputBinding> {
-        call.arguments
+        call.argument_kinds
             .iter()
-            .zip(call.argument_kinds.iter())
-            .map(|(arg, kind)| self.resolve_argument(arg, kind))
+            .map(|kind| self.resolve_argument(kind))
             .collect()
     }
 
-    /// Resolve a single argument to its input source.
-    fn resolve_argument(&self, arg: &str, kind: &CallArgumentKind) -> InputBinding {
-        let arg = arg.trim();
+    /// Follow `let x = select!(T, y...)` chains back to the name that
+    /// actually carries provenance.
+    ///
+    /// The iteration bound is load-bearing, not defensive: shadowing makes
+    /// self-referential aliases ordinary. `let seed = select!(u64, seed)`
+    /// records `seed -> seed`, where the right-hand `seed` is the entry
+    /// argument and the left-hand one is the narrowed local. Following that
+    /// unboundedly would not terminate; following it a bounded number of
+    /// times lands on the same name either way, which is the right answer.
+    fn resolve_alias<'a>(&'a self, name: &'a str) -> &'a str {
+        let mut current = name;
+        for _ in 0..self.selection_aliases.len() {
+            match self.selection_aliases.get(current) {
+                Some(root) if root != current => current = root.as_str(),
+                _ => break,
+            }
+        }
+        current
+    }
 
-        // Check if it's a sequence parameter
-        if let Some(&idx) = self.param_indices.get(arg) {
+    /// Resolve a single argument to its input source.
+    ///
+    /// Everything reachable from a name — a sequence parameter, a prior
+    /// item's output, an entry argument — binds to that name's source, so
+    /// that the guest can hold the recorded step to it. Only values with no
+    /// upstream at all are `Inline`.
+    fn resolve_argument(&self, kind: &CallArgumentKind) -> InputBinding {
+        let CallArgumentKind::Rooted { root } = kind else {
+            return InputBinding::inline();
+        };
+        let root = self.resolve_alias(root.trim());
+
+        // A sequence parameter: supplied by the caller's scope.
+        if let Some(&idx) = self.param_indices.get(root) {
             return InputBinding::seq_input(idx);
         }
 
-        // Check if it's a bound variable from a previous item
-        if let Some(&item_index) = self.bindings.get(arg) {
+        // A value produced by an earlier item of this sequence — including
+        // `main`'s entry arguments, which all bind to the leading Entrypoint
+        // item.
+        if let Some(&item_index) = self.bindings.get(root) {
             return InputBinding::prior_item_output(item_index);
         }
 
-        match kind {
-            CallArgumentKind::ExternalBinding => InputBinding::external(),
-            CallArgumentKind::Inline | CallArgumentKind::Other => InputBinding::inline(),
-            CallArgumentKind::Identifier => InputBinding::external(),
-        }
+        // A local with no upstream: materialized in the body.
+        InputBinding::inline()
     }
 }
 
@@ -202,6 +236,7 @@ mod tests {
                 None
             },
             signature: format!("fn {}()", name),
+            selection_aliases: vec![],
         }
     }
 
@@ -209,6 +244,15 @@ mod tests {
         name: &str,
         input_names: Vec<&str>,
         call_infos: Vec<CallInfo>,
+    ) -> FunctionAstItem {
+        make_sequence_function_with_aliases(name, input_names, call_infos, vec![])
+    }
+
+    fn make_sequence_function_with_aliases(
+        name: &str,
+        input_names: Vec<&str>,
+        call_infos: Vec<CallInfo>,
+        selection_aliases: Vec<(String, String)>,
     ) -> FunctionAstItem {
         FunctionAstItem {
             name: name.to_string(),
@@ -222,6 +266,7 @@ mod tests {
             inputs: input_names.iter().map(|_| "String".to_string()).collect(),
             output: Some("String".to_string()),
             signature: format!("fn {}()", name),
+            selection_aliases,
         }
     }
 
@@ -264,14 +309,18 @@ mod tests {
                     callee: "greet".to_string(),
                     result_binding: Some("greeting".to_string()),
                     arguments: vec!["name".to_string()],
-                    argument_kinds: vec![CallArgumentKind::Identifier],
+                    argument_kinds: vec![CallArgumentKind::Rooted {
+                        root: "name".to_string(),
+                    }],
                     call_kind: CallKind::Tile,
                 },
                 CallInfo {
                     callee: "exclaim".to_string(),
                     result_binding: None,
                     arguments: vec!["greeting".to_string()],
-                    argument_kinds: vec![CallArgumentKind::Identifier],
+                    argument_kinds: vec![CallArgumentKind::Rooted {
+                        root: "greeting".to_string(),
+                    }],
                     call_kind: CallKind::Tile,
                 },
             ],
@@ -345,7 +394,7 @@ mod tests {
                 callee: "greet".to_string(),
                 result_binding: None,
                 arguments: vec!["\"Raster\".to_string()".to_string()],
-                argument_kinds: vec![CallArgumentKind::Other],
+                argument_kinds: vec![CallArgumentKind::Inline],
                 call_kind: CallKind::Tile,
             }],
         );
@@ -407,14 +456,18 @@ mod tests {
                     callee: "greet".to_string(),
                     result_binding: Some("greeting".to_string()),
                     arguments: vec!["personal_data".to_string()],
-                    argument_kinds: vec![CallArgumentKind::Identifier],
+                    argument_kinds: vec![CallArgumentKind::Rooted {
+                        root: "personal_data".to_string(),
+                    }],
                     call_kind: CallKind::Tile,
                 },
                 CallInfo {
                     callee: "exclaim".to_string(),
                     result_binding: None,
                     arguments: vec!["greeting".to_string()],
-                    argument_kinds: vec![CallArgumentKind::Identifier],
+                    argument_kinds: vec![CallArgumentKind::Rooted {
+                        root: "greeting".to_string(),
+                    }],
                     call_kind: CallKind::Tile,
                 },
             ],
@@ -459,6 +512,159 @@ mod tests {
                 } => assert_eq!(*intra_sequence_item_index, 1),
                 other => panic!("Expected PriorItemOutput{{1}}, got {:?}", other),
             },
+            _ => panic!("Expected Tile item"),
+        }
+    }
+
+    #[test]
+    fn selected_entry_arguments_bind_to_their_source_not_to_inline() {
+        // `let name = select!(String, personal_data.name); call!(greet, name);`
+        // — `name` is committed data reached through a selection, so it must
+        // bind to the entry-argument item. Binding it as `Inline` would let a
+        // claimed trace substitute arbitrary bytes for it and still verify.
+        let project = make_mock_project();
+        let greet_func = make_tile_function("greet", vec!["input"], true);
+        let greet_tile = Tile {
+            function: &greet_func,
+            tile_type: "iter".to_string(),
+            estimated_cycles: None,
+            max_memory: None,
+            description: None,
+        };
+        let tile_discovery = TileDiscovery {
+            project: &project,
+            tiles: vec![greet_tile],
+        };
+
+        let seq_func = make_sequence_function_with_aliases(
+            "main",
+            vec![],
+            vec![CallInfo {
+                callee: "greet".to_string(),
+                result_binding: None,
+                arguments: vec!["name".to_string()],
+                argument_kinds: vec![CallArgumentKind::Rooted {
+                    root: "name".to_string(),
+                }],
+                call_kind: CallKind::Tile,
+            }],
+            vec![("name".to_string(), "personal_data".to_string())],
+        );
+        let sequence = Sequence {
+            function: &seq_func,
+            steps: vec![SequenceStep::Tile(&tile_discovery.tiles[0])],
+            description: None,
+        };
+
+        let mut resolver = FlowResolver::new();
+        let items = resolver
+            .resolve_with_entry_arguments(&sequence, &["personal_data".to_string()]);
+
+        match &items[0] {
+            SequenceChildItem::Tile(tile_item) => match &tile_item.sources[0] {
+                InputBinding::PriorItemOutput {
+                    intra_sequence_item_index,
+                } => assert_eq!(*intra_sequence_item_index, 0),
+                other => panic!("Expected PriorItemOutput{{0}}, got {:?}", other),
+            },
+            _ => panic!("Expected Tile item"),
+        }
+    }
+
+    #[test]
+    fn self_shadowing_selection_aliases_resolve_to_the_entry_argument() {
+        // `let seed = select!(u64, seed);` — the local shadows the entry
+        // argument it narrows, recording `seed -> seed`. It must still bind
+        // to the entry argument (and must terminate).
+        let project = make_mock_project();
+        let greet_func = make_tile_function("greet", vec!["input"], true);
+        let greet_tile = Tile {
+            function: &greet_func,
+            tile_type: "iter".to_string(),
+            estimated_cycles: None,
+            max_memory: None,
+            description: None,
+        };
+        let tile_discovery = TileDiscovery {
+            project: &project,
+            tiles: vec![greet_tile],
+        };
+
+        let seq_func = make_sequence_function_with_aliases(
+            "main",
+            vec![],
+            vec![CallInfo {
+                callee: "greet".to_string(),
+                result_binding: None,
+                arguments: vec!["seed".to_string()],
+                argument_kinds: vec![CallArgumentKind::Rooted {
+                    root: "seed".to_string(),
+                }],
+                call_kind: CallKind::Tile,
+            }],
+            vec![("seed".to_string(), "seed".to_string())],
+        );
+        let sequence = Sequence {
+            function: &seq_func,
+            steps: vec![SequenceStep::Tile(&tile_discovery.tiles[0])],
+            description: None,
+        };
+
+        let mut resolver = FlowResolver::new();
+        let items = resolver.resolve_with_entry_arguments(&sequence, &["seed".to_string()]);
+
+        match &items[0] {
+            SequenceChildItem::Tile(tile_item) => match &tile_item.sources[0] {
+                InputBinding::PriorItemOutput {
+                    intra_sequence_item_index,
+                } => assert_eq!(*intra_sequence_item_index, 0),
+                other => panic!("Expected PriorItemOutput{{0}}, got {:?}", other),
+            },
+            _ => panic!("Expected Tile item"),
+        }
+    }
+
+    #[test]
+    fn locals_with_no_upstream_bind_as_inline() {
+        let project = make_mock_project();
+        let greet_func = make_tile_function("greet", vec!["input"], true);
+        let greet_tile = Tile {
+            function: &greet_func,
+            tile_type: "iter".to_string(),
+            estimated_cycles: None,
+            max_memory: None,
+            description: None,
+        };
+        let tile_discovery = TileDiscovery {
+            project: &project,
+            tiles: vec![greet_tile],
+        };
+
+        let seq_func = make_sequence_function(
+            "main",
+            vec![],
+            vec![CallInfo {
+                callee: "greet".to_string(),
+                result_binding: None,
+                arguments: vec!["\"Rust\".to_string()".to_string()],
+                argument_kinds: vec![CallArgumentKind::Inline],
+                call_kind: CallKind::Tile,
+            }],
+        );
+        let sequence = Sequence {
+            function: &seq_func,
+            steps: vec![SequenceStep::Tile(&tile_discovery.tiles[0])],
+            description: None,
+        };
+
+        let mut resolver = FlowResolver::new();
+        let items = resolver.resolve(&sequence);
+
+        match &items[0] {
+            SequenceChildItem::Tile(tile_item) => assert!(matches!(
+                &tile_item.sources[0],
+                InputBinding::Direct(InputSource::Inline)
+            )),
             _ => panic!("Expected Tile item"),
         }
     }

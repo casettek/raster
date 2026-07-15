@@ -21,7 +21,8 @@ use raster_core::draft::{DraftId, TrackedDraftState};
 use raster_core::fingerprint::{Fingerprint, FingerprintAccumulator};
 use raster_core::trace::StepRecord;
 use raster_core::transition::{
-    InitTransition, Transition, TransitionInput, TransitionJournal, TransitionState,
+    EntrypointAuthorization, InitTransition, Transition, TransitionInput, TransitionJournal,
+    TransitionState,
 };
 
 use crate::checks;
@@ -62,24 +63,19 @@ pub enum StepPosition {
 pub struct FraudProofWindowContext {
     pub init_state: InitTransition,
     pub position: StepPosition,
-    /// Whether `main`'s entry-argument binding has been proven authorized
-    /// *somewhere* in this chain — established fresh at `Init` via a
-    /// trace-inclusion witness, inherited unchanged at `Next`. See
-    /// `checks::entrypoint`.
-    pub entrypoint_authorized: bool,
 }
 
 impl FraudProofWindowContext {
     /// Attach the step to the fraud proof window context.
     ///
     /// - `Init`: start from the genesis state carried in the transition,
-    ///   and independently establish entry-argument authorization from a
-    ///   trace-inclusion witness — the guest never trusts a host-supplied
-    ///   claim about the window's initial internal-store contents.
+    ///   and independently decide what the chain owes for entry-argument
+    ///   authorization — the guest never trusts a host-supplied claim about
+    ///   the window's initial internal-store contents.
     /// - `Next`: read the previous journal, recursively verify its receipt
     ///   against our own image id, and require state and manifest
-    ///   continuity. Entry-argument authorization is inherited unchanged
-    ///   from the previous (recursively verified) journal.
+    ///   continuity. Entry-argument authorization is inherited from the
+    ///   previous (recursively verified) journal.
     pub fn proceed(
         params: &PublicParams,
         input: &TransitionInput,
@@ -87,19 +83,18 @@ impl FraudProofWindowContext {
     ) -> (Self, LiveTransition) {
         match state {
             TransitionState::Init(init_transition) => {
-                let live = LiveTransition::genesis(&init_transition);
-                let entrypoint_authorized = checks::entrypoint::verify_genesis_authorization(
+                let entrypoint_authorization = checks::entrypoint::verify_genesis_authorization(
                     &params.cfs_cursor,
                     &init_transition.init_internal_store_root,
                     &init_transition.init_internal_store_index_root,
                     &input.authorization_journal,
                     input.entrypoint_membership_witness.as_ref(),
                 );
+                let live = LiveTransition::genesis(&init_transition, entrypoint_authorization);
                 (
                     Self {
                         init_state: init_transition,
                         position: StepPosition::First,
-                        entrypoint_authorized,
                     },
                     live,
                 )
@@ -110,12 +105,11 @@ impl FraudProofWindowContext {
                 assert_state_continuity(&prev_journal, &transition);
                 assert_manifest_continuity(&prev_journal, input);
 
-                let live = LiveTransition::resume(&transition);
+                let live = LiveTransition::resume(&transition, prev_journal.entrypoint_authorization);
                 (
                     Self {
                         init_state: prev_journal.init_state,
                         position: StepPosition::Subsequent,
-                        entrypoint_authorized: prev_journal.entrypoint_authorized,
                     },
                     live,
                 )
@@ -171,11 +165,18 @@ pub struct LiveTransition {
     fingerprint_acc: FingerprintAccumulator,
     /// `None` only for the genesis state, where no coordinates are expected yet.
     next_expected_coordinates: Option<Vec<CfsCoordinates>>,
+    /// How far this chain has got in tying `main`'s entry arguments to the
+    /// authorization journal. Advances at most once, `Pending` ->
+    /// `Established`, when an `Entrypoint` step is verified in this window.
+    entrypoint_authorization: EntrypointAuthorization,
 }
 
 impl LiveTransition {
     /// Genesis state for the first step of the window.
-    fn genesis(init_transition: &InitTransition) -> Self {
+    fn genesis(
+        init_transition: &InitTransition,
+        entrypoint_authorization: EntrypointAuthorization,
+    ) -> Self {
         let frontier = deserialize_frontier(&init_transition.init_frontier)
             .expect("Invalid frontier in input");
         let internal_store_frontier =
@@ -194,11 +195,15 @@ impl LiveTransition {
             active_drafts: init_transition.active_drafts.clone(),
             fingerprint_acc: FingerprintAccumulator::new(init_transition.fingerprint.bits_packer),
             next_expected_coordinates: None,
+            entrypoint_authorization,
         }
     }
 
     /// Resume from the state carried over from the previous (verified) step.
-    fn resume(transition: &Transition) -> Self {
+    fn resume(
+        transition: &Transition,
+        entrypoint_authorization: EntrypointAuthorization,
+    ) -> Self {
         let frontier =
             deserialize_frontier(&transition.frontier).expect("Invalid frontier in input");
         let internal_store_frontier = deserialize_frontier(&transition.internal_store_frontier)
@@ -216,12 +221,22 @@ impl LiveTransition {
             active_drafts: transition.active_drafts.clone(),
             fingerprint_acc: transition.actual_fingerprint_acc.clone(),
             next_expected_coordinates: Some(transition.next_expected_coordinates.clone()),
+            entrypoint_authorization,
         }
+    }
+
+    /// What this chain has established so far — read by `main` to commit the
+    /// journal the next step inherits.
+    pub fn entrypoint_authorization(&self) -> EntrypointAuthorization {
+        self.entrypoint_authorization
     }
 
     /// Verify every recorded aspect of one step and advance the state:
     ///
     /// - the step's inputs obey the CFS bindings at its coordinates,
+    /// - an `Entrypoint` step binds exactly the CFS-declared entry arguments
+    ///   to their authorized commitments, discharging any authorization the
+    ///   chain still owes,
     /// - recorded IO commitments match the witnesses, and tile steps carry
     ///   a verified replay proof,
     /// - the internal store transition is consistent with the recorded roots,
@@ -236,7 +251,8 @@ impl LiveTransition {
             input.sequence_scope_witness.as_ref(),
         );
         if let StepRecord::Entrypoint(record) = &input.step_record {
-            checks::entrypoint::verify_step(record, &input.authorization_journal);
+            self.entrypoint_authorization =
+                checks::entrypoint::verify_step(cfs_cursor, record, &input.authorization_journal);
         }
         checks::io::verify_step_record(
             &input.step_record,
@@ -286,6 +302,11 @@ impl LiveTransition {
     /// step must match the committed fingerprint at its index — except the
     /// final window item, which must diverge: that divergence is the fraud
     /// being proven, and it transitions the machine to `Finished`.
+    ///
+    /// `Finished` is the chain's last word, so it is also the deadline for
+    /// any entry-argument authorization the chain still owes: a trace whose
+    /// `Entrypoint` step never appeared has nothing tying it to the public
+    /// manifest, and must not be able to conclude.
     pub fn finalize(
         self,
         committed_fingerprint: &Fingerprint,
@@ -301,6 +322,7 @@ impl LiveTransition {
 
                 if actual_fingerprint.len() == committed_fingerprint.len() {
                     assert!(diverges);
+                    self.entrypoint_authorization.assert_discharged();
                     TransitionState::Finished
                 } else {
                     assert!(!diverges);
@@ -336,7 +358,7 @@ pub fn commit_journal(
     current_state: TransitionState,
     transition_image_id: Vec<u8>,
     input: &TransitionInput,
-    entrypoint_authorized: bool,
+    entrypoint_authorization: EntrypointAuthorization,
 ) {
     let journal = TransitionJournal {
         init_state,
@@ -344,7 +366,7 @@ pub fn commit_journal(
         transition_image_id,
         authorization_image_id: input.authorization_image_id.clone(),
         manifest_commitment: input.authorization_journal.manifest_commitment.clone(),
-        entrypoint_authorized,
+        entrypoint_authorization,
     };
 
     env::commit(&journal);

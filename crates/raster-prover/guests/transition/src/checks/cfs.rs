@@ -1,7 +1,9 @@
-//! Checks that a step record matches the control flow schema: coordinate
-//! ordering and per-argument input bindings.
+//! Checks that a step record matches the control flow schema: that the
+//! record's kind matches the item declared at its coordinates, that its
+//! per-argument input bindings are honoured, and that its coordinates
+//! follow the schema's ordering.
 
-use raster_core::cfs::{CfsCoordinates, CfsCursor, InputBinding, InputSource};
+use raster_core::cfs::{CfsCoordinates, CfsCursor, InputBinding, InputSource, SequenceChildItem};
 use raster_core::trace::{FnInput, FnInputValue, InternalData, StepRecord};
 
 enum ResolvedSource<'a> {
@@ -57,6 +59,30 @@ fn has_coordinate_prefix(coordinates: &CfsCoordinates, prefix: &CfsCoordinates) 
             .all(|(coordinate, expected)| coordinate == expected)
 }
 
+/// Whether a step record of this kind may occupy a CFS item of this kind.
+///
+/// Input bindings alone cannot tell these apart: an item declaring no inputs
+/// (`Entrypoint`) vacuously satisfies the binding checks at *any*
+/// zero-input coordinate, and the kinds differ in how their output is
+/// verified — a tile's by replay proof, an entrypoint's against the
+/// authorization journal. Without this, a record could take a coordinate
+/// whose verification rules are weaker than its own.
+fn record_matches_item(step_record: &StepRecord, cfs_item: &SequenceChildItem) -> bool {
+    match (step_record, cfs_item) {
+        (StepRecord::TileExec(_), SequenceChildItem::Tile(_)) => true,
+        (StepRecord::RecurTileExec(_), SequenceChildItem::RecurTile(_)) => true,
+        (StepRecord::RecurSequenceExec(_), SequenceChildItem::RecurSequence(_)) => true,
+        (StepRecord::Entrypoint(_), SequenceChildItem::Entrypoint(_)) => true,
+        // A nested sequence is entered and left at its own item coordinate,
+        // whether it is an ordinary or a recur sequence.
+        (
+            StepRecord::SequenceStart(_) | StepRecord::SequenceEnd(_),
+            SequenceChildItem::Sequence(_) | SequenceChildItem::RecurSequence(_),
+        ) => true,
+        _ => false,
+    }
+}
+
 pub fn verify_step_record_inputs(
     cfs_cursor: &CfsCursor,
     step_record: &StepRecord,
@@ -84,6 +110,11 @@ pub fn verify_step_record_inputs(
                 step_record
             )
         });
+    assert!(
+        record_matches_item(step_record, cfs_item),
+        "Step record kind does not match the CFS item kind at its coordinates: {:?}",
+        step_record,
+    );
     let step_inputs = cfs_item.inputs();
 
     let input_source_witness = input_source_witness.unwrap_or_else(|| {
@@ -107,15 +138,6 @@ pub fn verify_step_record_inputs(
     for (input_index, step_input) in step_inputs.iter().enumerate() {
         let resolved_source = resolved_source_at(input_source_witness, input_index);
         match step_input {
-            InputBinding::Direct(InputSource::External) => {
-                // The compiler emits `Direct(External)` for arguments its
-                // static data-flow analysis cannot resolve to a prior item
-                // or sequence parameter (e.g. locally `select!`ed values).
-                // With per-use external bindings removed, there is no
-                // specific witness shape to pin down here; the value is
-                // still covered by the input/input-source commitments.
-                let _ = &resolved_source;
-            }
             InputBinding::Direct(InputSource::Inline) => {
                 assert!(
                     matches!(resolved_source, ResolvedSource::Inline(_)),

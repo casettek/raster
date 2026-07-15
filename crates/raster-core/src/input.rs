@@ -141,8 +141,16 @@ pub struct ListProofSibling {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum SelectionProofStep {
     Struct {
+        /// Which of `field_names` this step descends into. The selected
+        /// child's root is the hash carried in from the step below; the
+        /// other fields' roots are `siblings`, in ascending position order
+        /// with `field_index` skipped.
         field_index: u64,
-        field_count: u64,
+        /// Every field of the struct, in declaration order — names
+        /// included, because they are part of the struct commitment (see
+        /// [`struct_commitments_root`]) and are what binds this step to a
+        /// selector path segment.
+        field_names: Vec<String>,
         siblings: Vec<Hash32>,
     },
     List {
@@ -189,6 +197,35 @@ fn selection_hash(parts: &[&[u8]]) -> Hash32 {
     let mut hasher = Sha256::new();
     for part in parts {
         hasher.update(part);
+    }
+    hasher.finalize().into()
+}
+
+/// The one definition of a struct node's commitment: the `b"struct"` domain
+/// tag followed by each field's `(name, child_root)`, in declaration order.
+///
+/// Every producer and verifier of a selection tree must agree on this
+/// byte-for-byte — the selection-tree assembler, the draft value hasher, the
+/// selection prover, the proof verifier, and `main`'s entry-argument
+/// binding all commit to structs, and a divergence between any two of them
+/// is a silent verification failure. It lives here, in the crate every side
+/// already depends on, so there is nothing to keep in sync.
+///
+/// Field names are part of the hash (length-prefixed, so `("ab", "c")` and
+/// `("a", "bc")` cannot collide). That is what makes a selection path
+/// structural rather than advisory: a proof recombining a child through a
+/// *different* field's position yields a different root, so
+/// `verify_selection_proof` can hold a claimed path to the positions its
+/// steps actually prove.
+pub fn struct_commitments_root<'a>(
+    fields: impl IntoIterator<Item = (&'a str, &'a [u8])>,
+) -> Hash32 {
+    let mut hasher = Sha256::new();
+    hasher.update(b"struct");
+    for (name, child_root) in fields {
+        hasher.update((name.len() as u64).to_le_bytes());
+        hasher.update(name.as_bytes());
+        hasher.update(child_root);
     }
     hasher.finalize().into()
 }
@@ -249,8 +286,9 @@ fn parse_subtree_root(bytes: &[u8], offset: &mut usize) -> Option<Hash32> {
         }
         0x01 => {
             let field_count = parse_u64(bytes, offset)? as usize;
-            let mut child_roots = Vec::with_capacity(field_count);
+            let mut fields = Vec::with_capacity(field_count);
             for _ in 0..field_count {
+                let name = parse_utf8(bytes, offset)?;
                 let child_len = parse_u64(bytes, offset)? as usize;
                 let end = offset.checked_add(child_len)?;
                 let child_bytes = bytes.get(*offset..end)?;
@@ -260,15 +298,12 @@ fn parse_subtree_root(bytes: &[u8], offset: &mut usize) -> Option<Hash32> {
                     return None;
                 }
                 *offset = end;
-                child_roots.push(child_root);
+                fields.push((String::from_utf8(name).ok()?, child_root));
             }
 
-            let mut parts: Vec<&[u8]> = Vec::with_capacity(child_roots.len() + 1);
-            parts.push(b"struct");
-            for root in &child_roots {
-                parts.push(root.as_slice());
-            }
-            Some(selection_hash(&parts))
+            Some(struct_commitments_root(
+                fields.iter().map(|(name, root)| (name.as_str(), root.as_slice())),
+            ))
         }
         0x02 => {
             let len = parse_u64(bytes, offset)?;
@@ -403,6 +438,33 @@ fn parse_subtree_root(bytes: &[u8], offset: &mut usize) -> Option<Hash32> {
     }
 }
 
+/// Check that `step` proves exactly the descent `segment` names.
+///
+/// Recombining hashes only proves that *some* child sits under the root; it
+/// says nothing about which one the caller claimed. Since a
+/// `SelectionCommitment` is trusted elsewhere by its `path` (that is how a
+/// consumer knows which value it is looking at), each step must be pinned
+/// to its path segment, or a witness could prove the bytes at one field
+/// while claiming the path of another.
+fn step_proves_segment(step: &SelectionProofStep, segment: &SelectorSegment) -> bool {
+    match (step, segment) {
+        (
+            SelectionProofStep::Struct {
+                field_index,
+                field_names,
+                ..
+            },
+            SelectorSegment::Field(name),
+        ) => field_names
+            .get(*field_index as usize)
+            .is_some_and(|proven| proven == name),
+        (SelectionProofStep::List { index, .. }, SelectorSegment::Index(claimed)) => {
+            index == claimed
+        }
+        _ => false,
+    }
+}
+
 pub fn verify_selection_proof(selected_bytes: &[u8], proof: &SelectionProof) -> bool {
     let mut offset = 0;
     let Some(mut current_hash) = parse_subtree_root(selected_bytes, &mut offset) else {
@@ -412,15 +474,29 @@ pub fn verify_selection_proof(selected_bytes: &[u8], proof: &SelectionProof) -> 
         return false;
     }
 
+    // One step per path segment, outermost first in both — anything else is
+    // a proof that does not describe the path it claims.
+    if proof.steps.len() != proof.path.segments.len() {
+        return false;
+    }
+    if !proof
+        .steps
+        .iter()
+        .zip(proof.path.segments.iter())
+        .all(|(step, segment)| step_proves_segment(step, segment))
+    {
+        return false;
+    }
+
     for step in proof.steps.iter().rev() {
         current_hash = match step {
             SelectionProofStep::Struct {
                 field_index,
-                field_count,
+                field_names,
                 siblings,
             } => {
                 let field_index = *field_index as usize;
-                let field_count = *field_count as usize;
+                let field_count = field_names.len();
                 if field_index >= field_count || siblings.len() + 1 != field_count {
                     return false;
                 }
@@ -429,20 +505,20 @@ pub fn verify_selection_proof(selected_bytes: &[u8], proof: &SelectionProof) -> 
                 let mut sibling_iter = siblings.iter();
                 for idx in 0..field_count {
                     if idx == field_index {
-                        child_roots.push(current_hash.clone());
+                        child_roots.push(current_hash);
                     } else if let Some(sibling) = sibling_iter.next() {
-                        child_roots.push(sibling.clone());
+                        child_roots.push(*sibling);
                     } else {
                         return false;
                     }
                 }
 
-                let mut parts: Vec<&[u8]> = Vec::with_capacity(child_roots.len() + 1);
-                parts.push(b"struct");
-                for root in &child_roots {
-                    parts.push(root.as_slice());
-                }
-                selection_hash(&parts)
+                struct_commitments_root(
+                    field_names
+                        .iter()
+                        .map(String::as_str)
+                        .zip(child_roots.iter().map(Hash32::as_slice)),
+                )
             }
             SelectionProofStep::List {
                 index,

@@ -88,11 +88,12 @@ impl<'a> CfsBuilder<'a> {
             });
         }
 
-        // Create input sources for the sequence's parameters
-        // All sequence inputs come from external sources
+        // A sequence definition's own parameters are supplied by whoever
+        // calls it: parameter `i` is sequence-scope slot `i`. (Callers'
+        // arguments are resolved separately, at each call site.)
         let input_count = seq.function.inputs.len();
         let input_sources: Vec<InputBinding> =
-            (0..input_count).map(|_| InputBinding::external()).collect();
+            (0..input_count).map(InputBinding::seq_input).collect();
 
         // Resolve data flow for the sequence items
         let items = resolver.resolve(seq);
@@ -141,6 +142,7 @@ mod tests {
             inputs: vec!["String".to_string()],
             output: Some("String".to_string()),
             signature: format!("fn {}()", name),
+            selection_aliases: vec![],
         }
     }
 
@@ -157,6 +159,7 @@ mod tests {
             inputs: input_names.iter().map(|_| "PersonalData".to_string()).collect(),
             output: None,
             signature: "fn main()".to_string(),
+            selection_aliases: vec![],
         }
     }
 
@@ -178,7 +181,9 @@ mod tests {
                 callee: "greet".to_string(),
                 result_binding: Some("greeting".to_string()),
                 arguments: vec!["personal_data".to_string()],
-                argument_kinds: vec![CallArgumentKind::Identifier],
+                argument_kinds: vec![CallArgumentKind::Rooted {
+                    root: "personal_data".to_string(),
+                }],
                 call_kind: CallKind::Tile,
             }],
         );
@@ -236,7 +241,7 @@ mod tests {
                 callee: "greet".to_string(),
                 result_binding: None,
                 arguments: vec!["\"Raster\".to_string()".to_string()],
-                argument_kinds: vec![CallArgumentKind::Other],
+                argument_kinds: vec![CallArgumentKind::Inline],
                 call_kind: CallKind::Tile,
             }],
         );

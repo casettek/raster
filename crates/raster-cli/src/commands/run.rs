@@ -15,9 +15,8 @@ use raster_backend_risc0::Risc0Backend;
 
 use raster_compiler::{CfsBuilder, Project};
 
-use raster_core::cfs::ControlFlowSchema;
+use raster_core::cfs::{CfsCoordinates, CfsCursor, ControlFlowSchema};
 use raster_core::coordinate_index::IncrementalCoordinateIndex;
-use raster_core::draft::DraftTransitionWitness;
 use raster_core::input::{InternalRef, SelectionWitness};
 use raster_core::trace::{FnInput, StepRecord, Trace, TraceEvent};
 use raster_core::transition::{
@@ -33,7 +32,7 @@ use raster_prover::trace::{
     Bytes, FraudEvidence, FraudProofConfig, SerializableFrontier, TraceCommitment, TraceTree,
     TraceVerifier, VerificationResult,
 };
-use raster_prover::transition::step_transitions;
+use raster_prover::transition::{step_transitions, StepIo};
 use raster_runtime::TraceRecorder;
 
 use crate::commands::create_run_artifacts;
@@ -666,6 +665,33 @@ fn internal_store_state_from_prefix(
     state
 }
 
+/// Prove that `main`'s entry-argument binding is already present at
+/// coordinate `[0]` of the window's *initial* internal-store state, so a
+/// window that opens after the binding step can still tie its execution to
+/// the public manifest (see `checks::entrypoint` in the transition guest).
+///
+/// `None` when the binding is not in the initial state — which is the normal
+/// case for a window covering the start of the trace, where the `Entrypoint`
+/// step is replayed inside the window and authorizes itself. The guest
+/// decides which of those two it is; this only supplies the witness when one
+/// exists.
+fn build_entrypoint_membership_witness(
+    state: &ProofInternalStoreState,
+) -> Option<InternalStoreReadWitness> {
+    let coordinates = CfsCoordinates(vec![0]);
+    let index_witness = state.coordinate_index.membership_proof(&coordinates)?;
+    let log_witness =
+        build_internal_store_log_witness(&state.append_entries, index_witness.value.log_position);
+    Some(InternalStoreReadWitness {
+        entry: InternalStoreEntry {
+            coordinates,
+            object_commitment: index_witness.value.object_commitment.clone(),
+        },
+        log_witness,
+        index_witness,
+    })
+}
+
 fn build_internal_selection_witnesses(
     input_source_witness: Option<&FnInput>,
     trace_recorder: &TraceRecorder,
@@ -712,18 +738,7 @@ pub fn prove(
         input_sources_witnesses,
     } = fraud_evidence;
     let mut replayed_results: HashMap<StepRecord, ReplayResult> = HashMap::new();
-    let mut recorded_step_io: HashMap<
-        StepRecord,
-        (
-            Option<Vec<u8>>,
-            Option<Vec<u8>>,
-            Option<FnInput>,
-            Option<FnInput>,
-            BTreeMap<String, SelectionWitness>,
-            Option<InternalStoreWitness>,
-            Option<DraftTransitionWitness>,
-        ),
-    > = HashMap::new();
+    let mut recorded_step_io: HashMap<StepRecord, StepIo> = HashMap::new();
     let window_start_index = fraud_window
         .items
         .first()
@@ -817,15 +832,15 @@ pub fn prove(
             };
         recorded_step_io.insert(
             step_record.clone(),
-            (
-                input_witness.clone(),
+            StepIo {
+                input_witness: input_witness.clone(),
                 output_witness,
                 input_source_witness,
                 sequence_scope_witness,
                 internal_selection_witnesses,
                 internal_store_witness,
                 draft_transition_witness,
-            ),
+            },
         );
 
         if let StepRecord::TileExec(record) = step_record {
@@ -847,6 +862,15 @@ pub fn prove(
     let (authorization_receipt, authorization_journal) =
         authorize_external_inputs(&manifested_inputs);
 
+    // Only meaningful when `main` declares entry arguments at all; without a
+    // declaration the guest requires no witness (and rejects one, since
+    // coordinate `[0]` would then be an ordinary item, not a binding).
+    let entrypoint_membership_witness = CfsCursor::new(cfs.clone())
+        .main_entrypoint_names()
+        .is_some()
+        .then(|| build_entrypoint_membership_witness(&initial_internal_store_state))
+        .flatten();
+
     if let Some(frontier) = SerializableFrontier::from_bytes(&fraud_window.frontier) {
         println!();
         println!("Replaying transition frontier with transition guest...");
@@ -863,6 +887,7 @@ pub fn prove(
             &replayed_results,
             &authorization_journal,
             &authorization_receipt,
+            entrypoint_membership_witness.as_ref(),
         ) else {
             panic!("Failed to generate fraud proof");
         };

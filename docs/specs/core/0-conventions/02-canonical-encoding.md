@@ -19,7 +19,7 @@ Where the current codebase does not fully enforce the desired properties (e.g. d
     - `postcard::to_allocvec(&result)` for encoding tile return value
   - **Core re-exports**: `crates/raster-core/src/lib.rs` (`pub use postcard;`)
 - **External input handling**
-  - **CFS “external” bindings**: `crates/raster-core/src/cfs.rs` (`InputSource::External`)
+  - **`main` entry arguments**: `crates/raster-core/src/cfs.rs` (`SequenceChildItem::Entrypoint`) — the single place data enters a program
   - **CFS builder uses encoding label**: `crates/raster-compiler/src/cfs_builder.rs` (`encoding: "postcard"`)
   - **CLI input path**: `crates/raster-cli/src/commands.rs` (`run`, `preview`) for JSON input parsing and byte serialization
 - **Encoding identifier handling**
@@ -115,7 +115,7 @@ Raster tooling currently sets:
 
 **Meaning**:
 
-- `ControlFlowSchema.encoding` MUST identify the encoding used for **tile ABI input and output bytes** throughout the program described by the CFS, including bytes bound from `InputSource::External`.
+- `ControlFlowSchema.encoding` MUST identify the encoding used for **tile ABI input and output bytes** throughout the program described by the CFS, including bytes bound from `main`'s entry arguments.
 
 **GAP (validation/versioning)**:
 
@@ -124,10 +124,10 @@ Raster tooling currently sets:
 
 #### 3.3 External inputs in the CFS
 
-In the CFS dataflow model, `InputSource::External` indicates that a value is supplied by the runtime environment (not produced by a previous item).
+There is no "external" input source in the CFS dataflow model. Data enters a program only as `main`'s declared entry arguments, which the leading `SequenceChildItem::Entrypoint` item binds — once — into internal storage; every use of them is an ordinary `InputBinding::PriorItemOutput` reference to that item. This is what makes entering data verifiable: the binding is checked against the authorization journal exactly once per proof chain, and each later use is held to the internal store like any other committed value.
 
-- **Rule**: Any runtime that executes a CFS MUST supply external inputs as **raw bytes** encoded using the codec named by `ControlFlowSchema.encoding`.
-- **Rule**: The shape/type of those external inputs is not represented in the current CFS; it is an out-of-band contract between the caller and the tile’s Rust type signature.
+- **Rule**: Any runtime that executes a CFS MUST supply entry arguments as **raw bytes** encoded using the codec named by `ControlFlowSchema.encoding`.
+- **Rule**: The shape/type of those entry arguments is not represented in the current CFS; it is an out-of-band contract between the caller and `main`'s Rust type signature.
 
 **GAP (type information)**: CFS records only arities (`inputs`, `outputs`) and bindings, not Rust types or schemas. There is no machine-checkable way to know what bytes to provide for an external input beyond “must match the tile’s `postcard` decoding”.
 

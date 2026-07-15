@@ -245,7 +245,7 @@ impl RasterIndex {
                     }
                     steps.push(SelectionProofStep::Struct {
                         field_index: target_index as u64,
-                        field_count: fields.len() as u64,
+                        field_names: fields.iter().map(|field| field.name.clone()).collect(),
                         siblings,
                     });
                     current_id = fields[target_index].child;

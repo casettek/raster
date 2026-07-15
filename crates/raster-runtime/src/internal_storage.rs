@@ -6,9 +6,9 @@ use raster_core::draft::{
     DraftStateWitness, DraftTransitionWitness,
 };
 use raster_core::input::{
-    ExternalEncoding, Hash32, InternalRef, InternalValue, Schema, SchemaFieldMode, SchemaNode,
-    SelectedPayload, SelectionCommitment, SelectionProof, SelectionProofStep, SelectionWitness,
-    SelectorPath, SelectorSegment,
+    struct_commitments_root, ExternalEncoding, Hash32, InternalRef, InternalValue, Schema,
+    SchemaFieldMode, SchemaNode, SelectedPayload, SelectionCommitment, SelectionProof,
+    SelectionProofStep, SelectionWitness, SelectorPath, SelectorSegment,
 };
 use raster_core::trace::RasterPayload;
 use raster_core::transition::{InternalStoreEntry, InternalStoreIndexValue, SerializableFrontier};
@@ -106,20 +106,19 @@ impl std::fmt::Debug for ReferencedSourceKind {
 
 impl ReferencedObject {
     /// The struct-of-commitments root over all declared sources, in
-    /// declaration order — mirrors `assemble_subtree`'s `TreeValue::Struct`
-    /// hash convention (`b"struct"` tag + concatenated child roots) so a
-    /// selection into one argument composes as one ordinary selection
-    /// proof. Must match `checks::entrypoint::combined_root` in the guest
-    /// byte-for-byte.
+    /// declaration order. Uses the shared `TreeValue::Struct` convention, so
+    /// the combined entry object is an ordinary struct node as far as
+    /// selection is concerned — selecting one argument out of it composes as
+    /// one ordinary proof step rather than a special case — and the guest's
+    /// `checks::entrypoint::combined_root` recomputes the identical bytes by
+    /// calling the same function.
     pub fn combined_root(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(
-            6 + self.sources.iter().map(|s| s.commitment.len()).sum::<usize>(),
-        );
-        buf.extend_from_slice(b"struct");
-        for source in &self.sources {
-            buf.extend_from_slice(&source.commitment);
-        }
-        Sha256::digest(&buf).to_vec()
+        struct_commitments_root(
+            self.sources
+                .iter()
+                .map(|source| (source.name.as_str(), source.commitment.as_slice())),
+        )
+        .to_vec()
     }
 
     fn find_source(&self, selector: &SelectorPath) -> Result<(&ReferencedSource, SelectorPath)> {
@@ -158,11 +157,12 @@ impl ReferencedObject {
         Ok(())
     }
 
-    /// Sibling commitments for the outer struct proof step over the named
-    /// source: `(field_index, field_count, siblings)`, siblings in
-    /// ascending position order, skipping `field_index` — the exact shape
+    /// The outer struct proof step over the named source: its position among
+    /// the declared arguments, every argument's name, and the other
+    /// arguments' already-public commitments as siblings (ascending position
+    /// order, `field_index` skipped) — the exact shape
     /// `SelectionProofStep::Struct` expects.
-    fn struct_step(&self, name: &str) -> Result<(u64, u64, Vec<Hash32>)> {
+    fn struct_step(&self, name: &str) -> Result<SelectionProofStep> {
         let index = self
             .sources
             .iter()
@@ -182,7 +182,15 @@ impl ReferencedObject {
                 })
             })
             .collect::<Result<Vec<Hash32>>>()?;
-        Ok((index as u64, self.sources.len() as u64, siblings))
+        Ok(SelectionProofStep::Struct {
+            field_index: index as u64,
+            field_names: self
+                .sources
+                .iter()
+                .map(|source| source.name.clone())
+                .collect(),
+            siblings,
+        })
     }
 
     /// Resolve `selector` (must start with `Field(name)`) against the named
@@ -305,20 +313,12 @@ impl ReferencedObject {
             }
         };
 
-        let (field_index, field_count, siblings) = self.struct_step(&source.name)?;
         let mut steps = inner.proof.steps;
         // `verify_selection_proof` walks `steps` via `.rev()`, from the leaf
         // outward — so the outermost step (combining this source's own root
         // with its siblings into the combined root) must be the *first*
         // element, not appended after the source's own (more inner) steps.
-        steps.insert(
-            0,
-            SelectionProofStep::Struct {
-                field_index,
-                field_count,
-                siblings,
-            },
-        );
+        steps.insert(0, self.struct_step(&source.name)?);
         Ok(SelectionWitness {
             bytes: inner.bytes,
             proof: SelectionProof {
@@ -1764,16 +1764,41 @@ mod tests {
     }
 
     #[test]
-    fn combined_root_matches_manual_struct_hash_convention() {
+    fn combined_root_uses_the_shared_struct_commitment_convention() {
         let (referenced, _resolver) = referenced_object_fixture();
 
-        let mut buf = b"struct".to_vec();
-        for source in &referenced.sources {
-            buf.extend_from_slice(&source.commitment);
-        }
-        let expected = Sha256::digest(&buf).to_vec();
+        // Deliberately not a hand-rolled hash: the whole point of sharing
+        // `struct_commitments_root` is that the guest recomputes this by
+        // calling the same function, so a local re-implementation here would
+        // only test that two copies agree, not that there is one.
+        let expected = struct_commitments_root(
+            referenced
+                .sources
+                .iter()
+                .map(|source| (source.name.as_str(), source.commitment.as_slice())),
+        )
+        .to_vec();
 
         assert_eq!(referenced.combined_root(), expected);
+    }
+
+    #[test]
+    fn combined_root_distinguishes_entry_arguments_by_name() {
+        let (referenced, _resolver) = referenced_object_fixture();
+        let renamed = ReferencedObject {
+            sources: referenced
+                .sources
+                .iter()
+                .enumerate()
+                .map(|(index, source)| ReferencedSource {
+                    name: format!("renamed_{}", index),
+                    commitment: source.commitment.clone(),
+                    kind: source.kind.clone(),
+                })
+                .collect(),
+        };
+
+        assert_ne!(referenced.combined_root(), renamed.combined_root());
     }
 
     #[test]

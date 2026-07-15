@@ -453,12 +453,10 @@ fn resolve_inputs_sources(
         return Vec::new();
     }
 
-    if step_inputs.iter().all(|input| {
-        matches!(
-            input,
-            InputBinding::Direct(InputSource::External | InputSource::Inline)
-        )
-    }) {
+    if step_inputs
+        .iter()
+        .all(|input| matches!(input, InputBinding::Direct(InputSource::Inline)))
+    {
         return Vec::new();
     }
 
@@ -490,7 +488,7 @@ fn resolve_inputs_sources(
 
     for step_input in step_inputs {
         match step_input {
-            InputBinding::Direct(InputSource::External | InputSource::Inline) => {}
+            InputBinding::Direct(InputSource::Inline) => {}
             InputBinding::Direct(InputSource::Internal) => {
                 panic!("Direct internal bindings are not yet supported in trace source resolution");
             }
@@ -909,7 +907,7 @@ mod tests {
         let mut main = SequenceDef::new("main");
         main.items.push(SequenceChildItem::Tile(TileItem {
             id: "test_tile".to_string(),
-            sources: vec![InputBinding::external()],
+            sources: vec![InputBinding::inline()],
         }));
         cfs.sequences.push(main);
         cfs
@@ -924,7 +922,7 @@ mod tests {
         let mut main = SequenceDef::new("main");
         main.items.push(SequenceChildItem::Tile(TileItem {
             id: "producer".to_string(),
-            sources: vec![InputBinding::external()],
+            sources: vec![InputBinding::inline()],
         }));
         main.items.push(SequenceChildItem::Tile(TileItem {
             id: "consumer".to_string(),
@@ -932,7 +930,7 @@ mod tests {
         }));
         main.items.push(SequenceChildItem::Tile(TileItem {
             id: "tail".to_string(),
-            sources: vec![InputBinding::external()],
+            sources: vec![InputBinding::inline()],
         }));
 
         cfs.sequences.push(main);
@@ -945,21 +943,21 @@ mod tests {
         cfs.tiles.push(TileDef::iter("tail", 1, 1));
 
         let mut main = SequenceDef::new("main");
-        main.input_sources = vec![InputBinding::external()];
+        main.input_sources = vec![InputBinding::inline()];
         main.items.push(SequenceChildItem::Sequence(SequenceItem {
             id: "inner".to_string(),
             sources: vec![InputBinding::seq_input(0)],
         }));
         main.items.push(SequenceChildItem::Tile(TileItem {
             id: "tail".to_string(),
-            sources: vec![InputBinding::external()],
+            sources: vec![InputBinding::inline()],
         }));
 
         let mut inner = SequenceDef::new("inner");
-        inner.input_sources = vec![InputBinding::external()];
+        inner.input_sources = vec![InputBinding::inline()];
         inner.items.push(SequenceChildItem::Tile(TileItem {
             id: "inner_tile".to_string(),
-            sources: vec![InputBinding::external()],
+            sources: vec![InputBinding::inline()],
         }));
 
         cfs.sequences.push(main);
@@ -973,7 +971,7 @@ mod tests {
         cfs.tiles.push(TileDef::iter("tail", 1, 1));
 
         let mut main = SequenceDef::new("main");
-        main.input_sources = vec![InputBinding::external()];
+        main.input_sources = vec![InputBinding::inline()];
         main.items.push(SequenceChildItem::Sequence(SequenceItem {
             id: "inner".to_string(),
             sources: vec![InputBinding::seq_input(0)],
@@ -984,10 +982,10 @@ mod tests {
         }));
 
         let mut inner = SequenceDef::new("inner");
-        inner.input_sources = vec![InputBinding::external()];
+        inner.input_sources = vec![InputBinding::inline()];
         inner.items.push(SequenceChildItem::Tile(TileItem {
             id: "inner_tile".to_string(),
-            sources: vec![InputBinding::external()],
+            sources: vec![InputBinding::inline()],
         }));
 
         cfs.sequences.push(main);

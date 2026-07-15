@@ -15,7 +15,8 @@ use raster_core::fingerprint::Fingerprint;
 use raster_core::input::SelectionWitness;
 use raster_core::trace::{FnInput, StepRecord};
 use raster_core::transition::{
-    InitTransition, InternalStoreWitness, TransitionInput, TransitionJournal, TransitionState,
+    InitTransition, InternalStoreReadWitness, InternalStoreWitness, TransitionInput,
+    TransitionJournal, TransitionState,
 };
 use std::collections::{BTreeMap, HashMap};
 
@@ -25,18 +26,20 @@ use crate::replay::ReplayResult;
 use crate::trace::{serializable_frontier_into_trace_frontier, SerializableFrontier, TraceTree};
 use crate::{TRANSITION_GUEST_ELF, TRANSITION_GUEST_ID};
 
-type RecordedStepIo = HashMap<
-    StepRecord,
-    (
-        Option<Vec<u8>>,
-        Option<Vec<u8>>,
-        Option<FnInput>,
-        Option<FnInput>,
-        BTreeMap<String, SelectionWitness>,
-        Option<InternalStoreWitness>,
-        Option<DraftTransitionWitness>,
-    ),
->;
+/// Everything the host recorded about one executed step, to be handed to the
+/// guest as that step's witnesses.
+#[derive(Debug, Clone, Default)]
+pub struct StepIo {
+    pub input_witness: Option<Vec<u8>>,
+    pub output_witness: Option<Vec<u8>>,
+    pub input_source_witness: Option<FnInput>,
+    pub sequence_scope_witness: Option<FnInput>,
+    pub internal_selection_witnesses: BTreeMap<String, SelectionWitness>,
+    pub internal_store_witness: Option<InternalStoreWitness>,
+    pub draft_transition_witness: Option<DraftTransitionWitness>,
+}
+
+type RecordedStepIo = HashMap<StepRecord, StepIo>;
 
 fn build_transition_input(
     step_record: &StepRecord,
@@ -44,8 +47,9 @@ fn build_transition_input(
     recorded_step_io: &RecordedStepIo,
     replayed_results: &HashMap<StepRecord, ReplayResult>,
     authorization_journal: &AuthorizationJournal,
+    entrypoint_membership_witness: Option<&InternalStoreReadWitness>,
 ) -> TransitionInput {
-    let (
+    let StepIo {
         input_witness,
         output_witness,
         input_source_witness,
@@ -53,55 +57,41 @@ fn build_transition_input(
         internal_selection_witnesses,
         internal_store_witness,
         draft_transition_witness,
-    ) = recorded_step_io
+    } = recorded_step_io
         .get(step_record)
         .cloned()
         .unwrap_or_else(|| panic!("Missing recorded I/O for transition step {:?}", step_record));
 
-    if step_record.requires_replay_proof() {
-        let Some(replay_result) = replayed_results.get(step_record) else {
+    let (replay_image_id, replay_journal) = if step_record.requires_replay_proof() {
+        let replay_result = replayed_results.get(step_record).unwrap_or_else(|| {
             panic!(
                 "Replayed result not found for transition step {:?}",
                 step_record
-            );
-        };
-
-        TransitionInput {
-            step_record: step_record.clone(),
-            authorization_image_id: authorization_guest_image_id(),
-            replay_image_id: Some(replay_result.image_id.clone()),
-            replay_journal: Some(replay_result.replay_journal.clone()),
-            input_witness,
-            output_witness,
-            input_source_witness,
-            sequence_scope_witness,
-            internal_selection_witnesses,
-            internal_store_witness,
-            draft_transition_witness,
-            authorization_journal: authorization_journal.clone(),
-            input_sources_witnesses: input_sources_witnesses.clone(),
-            // Only ever populated for the step that establishes a fresh
-            // `TransitionState::Init` on a CFS declaring `main` entry
-            // arguments — see `step_transitions`.
-            entrypoint_membership_witness: None,
-        }
+            )
+        });
+        (
+            Some(replay_result.image_id.clone()),
+            Some(replay_result.replay_journal.clone()),
+        )
     } else {
-        TransitionInput {
-            step_record: step_record.clone(),
-            authorization_image_id: authorization_guest_image_id(),
-            replay_image_id: None,
-            replay_journal: None,
-            input_witness,
-            output_witness,
-            input_source_witness,
-            sequence_scope_witness,
-            internal_selection_witnesses,
-            internal_store_witness,
-            draft_transition_witness,
-            authorization_journal: authorization_journal.clone(),
-            input_sources_witnesses: input_sources_witnesses.clone(),
-            entrypoint_membership_witness: None,
-        }
+        (None, None)
+    };
+
+    TransitionInput {
+        step_record: step_record.clone(),
+        authorization_image_id: authorization_guest_image_id(),
+        replay_image_id,
+        replay_journal,
+        input_witness,
+        output_witness,
+        input_source_witness,
+        sequence_scope_witness,
+        internal_selection_witnesses,
+        internal_store_witness,
+        draft_transition_witness,
+        authorization_journal: authorization_journal.clone(),
+        input_sources_witnesses: input_sources_witnesses.clone(),
+        entrypoint_membership_witness: entrypoint_membership_witness.cloned(),
     }
 }
 
@@ -142,6 +132,12 @@ fn internal_store_root(frontier: &SerializableFrontier) -> Vec<u8> {
 /// * `fingerprint` - The packed fingerprint u64s for verification
 /// * `window_start_position` - The starting position in the fingerprint for the first item
 /// * `bits_per_item` - Bits per fingerprint item
+/// * `entrypoint_membership_witness` - Proof that `main`'s entry-argument
+///   binding already exists at coordinate `[0]` of the window's initial
+///   internal store. Supply it whenever the window opens *after* the binding
+///   step; pass `None` when the window contains the binding step itself, in
+///   which case that step discharges the authorization instead. See
+///   `checks::entrypoint` in the transition guest.
 ///
 /// # Returns
 /// A `TransitionReplayResult` with details about success or failure
@@ -157,6 +153,7 @@ pub fn step_transitions(
     replayed_results: &HashMap<StepRecord, ReplayResult>,
     authorization_journal: &AuthorizationJournal,
     authorization_receipt: &risc0_zkvm::Receipt,
+    entrypoint_membership_witness: Option<&InternalStoreReadWitness>,
 ) -> Option<risc0_zkvm::Receipt> {
     let prover = risc0_zkvm::default_prover();
 
@@ -183,6 +180,13 @@ pub fn step_transitions(
             recorded_step_io,
             replayed_results,
             authorization_journal,
+            // Only the `Init` step proves anything about the window's
+            // *initial* store state; later steps inherit the established
+            // fact from the previous journal and never read this.
+            current_journal
+                .is_none()
+                .then_some(entrypoint_membership_witness)
+                .flatten(),
         );
         let replay_receipt_assumption: Option<risc0_zkvm::Receipt> =
             if step_record.requires_replay_proof() {
@@ -245,6 +249,15 @@ mod tests {
     };
     use sha2::{Digest, Sha256};
 
+    /// A step whose only recorded witnesses are its input/output bytes.
+    fn io_witnesses(input_witness: Option<Vec<u8>>, output_witness: Option<Vec<u8>>) -> StepIo {
+        StepIo {
+            input_witness,
+            output_witness,
+            ..StepIo::default()
+        }
+    }
+
     fn make_tile_step(exec_index: u64, coordinates: Vec<u32>) -> StepRecord {
         StepRecord::TileExec(TileExecRecord {
             exec_index,
@@ -298,27 +311,11 @@ mod tests {
         let recorded_step_io = HashMap::from([
             (
                 first_step.clone(),
-                (
-                    Some(vec![1]),
-                    Some(vec![11]),
-                    None,
-                    None,
-                    BTreeMap::new(),
-                    None,
-                    None,
-                ),
+                io_witnesses(Some(vec![1]), Some(vec![11])),
             ),
             (
                 second_step.clone(),
-                (
-                    Some(vec![2]),
-                    Some(vec![22]),
-                    None,
-                    None,
-                    BTreeMap::new(),
-                    None,
-                    None,
-                ),
+                io_witnesses(Some(vec![2]), Some(vec![22])),
             ),
         ]);
         let replayed_results = HashMap::from([
@@ -358,6 +355,7 @@ mod tests {
             &recorded_step_io,
             &replayed_results,
             &make_authorization_journal(),
+            None,
         );
 
         assert_eq!(input.replay_image_id, Some(vec![7; 32]));
@@ -373,15 +371,7 @@ mod tests {
             raster_core::postcard::to_allocvec(&Err::<u64, String>("denied".to_string())).unwrap();
         let recorded_step_io = HashMap::from([(
             tile_step.clone(),
-            (
-                Some(vec![9]),
-                Some(error_output.clone()),
-                None,
-                None,
-                BTreeMap::new(),
-                None,
-                None,
-            ),
+            io_witnesses(Some(vec![9]), Some(error_output.clone())),
         )]);
         let replayed_results = HashMap::from([(
             tile_step.clone(),
@@ -404,6 +394,7 @@ mod tests {
             &recorded_step_io,
             &replayed_results,
             &make_authorization_journal(),
+            None,
         );
 
         assert_eq!(input.replay_image_id, Some(vec![5; 32]));
@@ -429,27 +420,11 @@ mod tests {
         let recorded_step_io = HashMap::from([
             (
                 sequence_start.clone(),
-                (
-                    Some(vec![3, 4]),
-                    None,
-                    None,
-                    None,
-                    BTreeMap::new(),
-                    None,
-                    None,
-                ),
+                io_witnesses(Some(vec![3, 4]), None),
             ),
             (
                 sequence_end.clone(),
-                (
-                    None,
-                    Some(vec![5, 6]),
-                    None,
-                    None,
-                    BTreeMap::new(),
-                    None,
-                    None,
-                ),
+                io_witnesses(None, Some(vec![5, 6])),
             ),
         ]);
 
@@ -459,6 +434,7 @@ mod tests {
             &recorded_step_io,
             &HashMap::new(),
             &make_authorization_journal(),
+            None,
         );
         let end_input = build_transition_input(
             &sequence_end,
@@ -466,6 +442,7 @@ mod tests {
             &recorded_step_io,
             &HashMap::new(),
             &make_authorization_journal(),
+            None,
         );
 
         assert_eq!(start_input.replay_image_id, None);

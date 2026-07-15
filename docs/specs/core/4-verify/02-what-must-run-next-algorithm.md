@@ -135,12 +135,12 @@ A verifier MUST validate the following before attempting next-step derivation:
 
 #### 2.3 External inputs restrictions
 
-In a fraud-provable setting, any direct `InputBinding::Direct(InputSource::External)` appearing inside a sequence item MUST be treated as a hard failure unless it can be satisfied by the invocation’s explicitly committed external inputs.
+There is no direct "external" binding: in a fraud-provable setting every argument MUST be derivable from `SequenceScope`, `PriorItemOutput`, or be `InputSource::Inline`.
 
 Minimum rule set:
 
-- For the entry invocation of `"main"`, direct `External` MAY be used only to reference explicitly committed entry inputs.
-- For non-entry sequences, direct `External` SHOULD NOT appear in item arguments; all arguments SHOULD be derivable from `SequenceScope` or `PriorItemOutput`.
+- Committed data enters only through `main`'s entry arguments. The leading `SequenceChildItem::Entrypoint` item binds them into internal storage, and every use is a `PriorItemOutput` reference to that item — so uses are checked against the internal store, and the binding itself is checked against the authorization journal (see `checks::entrypoint`).
+- `InputSource::Inline` MUST be used only for values materialized in the sequence body itself (literals, constructed values). An argument derived — however indirectly, through field access, indexing, cloning, or `select!` — from an entry argument, a sequence parameter, or a prior item's output MUST NOT be bound as `Inline`: that would leave its bytes unanchored, and a claimed trace could substitute any value for it.
 
 **Current producer behavior:** unresolved arguments (literals, expressions) are encoded as direct `External` bindings by the compiler’s flow resolver. Verifiers MUST treat such CFS instances as not mechanically verifiable unless an out-of-band rule is provided to supply those values.
 

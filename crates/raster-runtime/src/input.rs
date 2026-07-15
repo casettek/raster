@@ -1,6 +1,6 @@
 use raster_core::input::{
-    selection_payload_hash, Hash32, InternalValue, ListProofDirection, ListProofSibling,
-    SchemaNode, Selectable, SelectedPayload, SelectionCommitment, SelectionProof,
+    selection_payload_hash, struct_commitments_root, Hash32, InternalValue, ListProofDirection,
+    ListProofSibling, SchemaNode, Selectable, SelectedPayload, SelectionCommitment, SelectionProof,
     SelectionProofStep, SelectionWitness, SelectorPath, SelectorSegment,
 };
 use raster_core::{Error, Result as CoreResult};
@@ -1228,21 +1228,29 @@ fn assemble_subtree(
 ) -> CoreResult<(Vec<u8>, Hash32)> {
     let result = match value {
         TreeValue::Unit => (vec![0x03], selection_hash(&[b"unit"])),
-        TreeValue::Struct(_) => {
+        TreeValue::Struct(fields) => {
+            if fields.len() != children.len() {
+                return Err(Error::Serialization(
+                    "Struct child count does not match its field count".into(),
+                ));
+            }
             let mut payload = Vec::new();
             payload.push(0x01);
             push_u64(&mut payload, children.len() as u64);
-            for (child_payload, _) in &children {
+            for ((name, _), (child_payload, _)) in fields.iter().zip(children.iter()) {
+                push_u64(&mut payload, name.len() as u64);
+                payload.extend_from_slice(name.as_bytes());
                 push_u64(&mut payload, child_payload.len() as u64);
                 payload.extend_from_slice(child_payload);
             }
 
-            let mut parts: Vec<&[u8]> = Vec::with_capacity(children.len() + 1);
-            parts.push(b"struct");
-            for (_, child_root) in &children {
-                parts.push(child_root.as_slice());
-            }
-            (payload, selection_hash(&parts))
+            let root = struct_commitments_root(
+                fields
+                    .iter()
+                    .map(|(name, _)| name.as_str())
+                    .zip(children.iter().map(|(_, root)| root.as_slice())),
+            );
+            (payload, root)
         }
         TreeValue::List(_) => {
             let mut payload = Vec::new();
@@ -1563,16 +1571,17 @@ pub(crate) fn prove_selection(
                 }
             }
 
-            let mut parts: Vec<&[u8]> = Vec::with_capacity(child_roots.len() + 1);
-            parts.push(b"struct");
-            for root in &child_roots {
-                parts.push(root.as_slice());
-            }
+            let root_hash = struct_commitments_root(
+                fields
+                    .iter()
+                    .map(|field| field.name.as_str())
+                    .zip(child_roots.iter().map(Hash32::as_slice)),
+            );
 
             let mut steps = Vec::with_capacity(child.steps.len() + 1);
             steps.push(SelectionProofStep::Struct {
                 field_index: target_index as u64,
-                field_count: fields.len() as u64,
+                field_names: fields.iter().map(|field| field.name.clone()).collect(),
                 siblings,
             });
             steps.extend(child.steps);
@@ -1580,7 +1589,7 @@ pub(crate) fn prove_selection(
             Ok(ProvenSelection {
                 selected_value: child.selected_value,
                 selected_bytes: child.selected_bytes,
-                root_hash: selection_hash(&parts),
+                root_hash,
                 steps,
             })
         }
@@ -1823,15 +1832,19 @@ fn prepare_raster_children<'a>(
     let mut hashes = Vec::new();
     match value {
         TreeValue::Struct(fields) => {
+            // Each field is laid out by `assemble_subtree` as
+            // `(u64 name_len)(name)(u64 payload_len)(payload)`, so a child's
+            // own payload starts past both length prefixes and the name.
             let mut child_offset = offset + 1 + 8;
-            for (_, child) in fields {
+            for (name, child) in fields {
                 let (child_payload, child_hash) = subtree_payload_and_root(child)?;
+                let name_len = name.len() as u64;
                 plans.push(RasterChildPlan {
                     value: child,
-                    node_offset: child_offset + 8,
+                    node_offset: child_offset + 8 + name_len + 8,
                 });
                 hashes.push(child_hash);
-                child_offset += 8 + child_payload.len() as u64;
+                child_offset += 8 + name_len + 8 + child_payload.len() as u64;
             }
         }
         TreeValue::List(values) => {

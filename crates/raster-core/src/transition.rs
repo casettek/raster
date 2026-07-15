@@ -123,11 +123,15 @@ pub struct TransitionInput {
     pub authorization_journal: AuthorizationJournal,
 
     /// Membership witness for `main`'s entry-argument coordinate (`[0]`)
-    /// against the window's *initial* internal-store state. Only present —
-    /// and only required — on the step that establishes a fresh
-    /// `TransitionState::Init`, and only when the CFS declares `main`
-    /// entry arguments at all. `Next` steps never carry this: the fact it
-    /// establishes is inherited from the previous journal instead.
+    /// against the window's *initial* internal-store state, proving the
+    /// binding already existed when this window opened.
+    ///
+    /// Only ever read on the step that establishes a fresh
+    /// `TransitionState::Init`; `Next` steps inherit the fact from the
+    /// previous journal instead. `None` at `Init` is not a failure: it means
+    /// the window opens at or before the binding itself, leaving the chain
+    /// [`EntrypointAuthorization::Pending`] until an `Entrypoint` step
+    /// inside the window discharges it.
     pub entrypoint_membership_witness: Option<InternalStoreReadWitness>,
 }
 
@@ -162,6 +166,45 @@ pub enum TransitionState {
     Finished,
 }
 
+/// Whether `main`'s entry-argument binding has been tied to the authorization
+/// journal within a proof chain.
+///
+/// A window may legitimately open *before* the binding exists (its trace
+/// starts at genesis, with an empty internal store, and replays the
+/// `Entrypoint` step itself) or *after* it (the binding is already in the
+/// window's initial internal-store state). Those two cases establish the
+/// same fact by different means, so the chain carries this as a state rather
+/// than a bool: `Pending` is a debt that a later step in the same chain must
+/// discharge, and [`EntrypointAuthorization::assert_discharged`] is what
+/// makes it enforceable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EntrypointAuthorization {
+    /// The CFS declares no `main` entry arguments — there is nothing to
+    /// bind, and no `Entrypoint` step may appear at all.
+    NotRequired,
+    /// The window opened before the binding existed: no trace-inclusion
+    /// witness could exist at `Init`, so an `Entrypoint` step inside this
+    /// chain must still establish the binding before the chain finishes.
+    Pending,
+    /// The binding has been tied to the authorization journal in this chain
+    /// — either by a trace-inclusion witness at `Init`, or by an
+    /// `Entrypoint` step verified within the chain.
+    Established,
+}
+
+impl EntrypointAuthorization {
+    /// A chain must not finish while it still owes an entry-argument
+    /// binding: without this, `Pending` would be indistinguishable from
+    /// `Established` to any consumer of the final journal, and a trace that
+    /// never binds its entry arguments at all would verify.
+    pub fn assert_discharged(&self) {
+        assert!(
+            *self != EntrypointAuthorization::Pending,
+            "Fraud proof chain finished while main's entry-argument binding was never authorized",
+        );
+    }
+}
+
 /// Journal produced by the transition guest (init state + current state + image id).
 #[derive(Clone, Serialize, Deserialize)]
 pub struct TransitionJournal {
@@ -171,13 +214,10 @@ pub struct TransitionJournal {
     pub authorization_image_id: Vec<u8>,
     pub manifest_commitment: Vec<u8>,
 
-    /// Whether `main`'s entry-argument binding (if the CFS declares one)
-    /// has been verified against the authorization journal *somewhere* in
-    /// this proof chain — established fresh via a trace-inclusion witness
-    /// at the chain's `Init` step, then inherited unchanged by every
-    /// `Next` step from `prev_journal.entrypoint_authorized`. Vacuously
-    /// `true` when the CFS declares no `main` entry arguments at all.
-    /// A window that resumes from `Next` without this having been proven
-    /// true at its chain's genesis must not be trusted.
-    pub entrypoint_authorized: bool,
+    /// How far this chain has got in tying `main`'s entry-argument binding
+    /// to the authorization journal — established at `Init` from a
+    /// trace-inclusion witness, or by an `Entrypoint` step replayed inside
+    /// the chain, and inherited by every `Next` step from the previous
+    /// (recursively verified) journal. See [`EntrypointAuthorization`].
+    pub entrypoint_authorization: EntrypointAuthorization,
 }

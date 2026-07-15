@@ -623,11 +623,6 @@ impl InputBinding {
         Self::Direct(source)
     }
 
-    /// Create an external input binding.
-    pub fn external() -> Self {
-        Self::new(InputSource::External)
-    }
-
     /// Create an inline input binding.
     pub fn inline() -> Self {
         Self::new(InputSource::Inline)
@@ -652,11 +647,14 @@ impl InputBinding {
 }
 
 /// Semantic source of an input value in the data flow schema.
+///
+/// Note there is no "external" source: data entering a program does so as
+/// `main`'s entry arguments, which are bound once into internal storage by
+/// the leading `Entrypoint` item and reached from there like any other
+/// committed value (`PriorItemOutput`). A source here is only about values
+/// with no upstream item to bind to.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum InputSource {
-    /// Input comes from outside the sequence (runtime-provided).
-    External,
-
     /// Input is materialized inline in the sequence body.
     Inline,
 
