@@ -4,24 +4,23 @@
 //! tied to the commitment the public manifest declares for it, and the whole
 //! set is committed as a single struct-of-commitments object at coordinate
 //! `[0]` of `main` (see `ReferencedObject`). Everything downstream reaches
-//! those arguments through the internal store, so this module is what the
+//! those arguments through storage, so this module is what the
 //! transition guest's `checks::entrypoint` verifies against the
 //! authorization journal.
 
 use std::sync::Arc;
 
-use raster_core::input::{ExternalEncoding, InternalRef, SchemaNode};
+use raster_core::input::{ExternalEncoding, SchemaNode, StorageRef};
 use raster_core::{Error, Result};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
-use crate::external_storage::ExternalStorageManager;
+use crate::backing::ReferencedSourceKind;
 use crate::input::{tree_value_from_serialize, TreeValue};
-use crate::backing::{
-    ExternalSourceResolver, ReferencedObject, ReferencedSource, ReferencedSourceKind,
-};
-use crate::internal_storage::{
-    decode_hex_bytes, THREAD_INTERNAL_STORAGE, THREAD_SEQUENCE_CONTEXT,
+use crate::source::{FileInputSourceResolver, SourceResolver};
+use crate::storage::{
+    decode_hex_bytes, AuthorizedSource, AuthorizedSourceLoad, THREAD_SEQUENCE_CONTEXT,
+    THREAD_STORAGE,
 };
 
 /// Opaque, per-argument spec for `bind_entry_arguments` — carries whatever
@@ -37,7 +36,9 @@ pub struct EntryArgumentSpec {
     schema: fn() -> SchemaNode,
 }
 
-pub(crate) fn postcard_bytes_to_tree<T: DeserializeOwned + Serialize>(bytes: &[u8]) -> Result<TreeValue> {
+pub(crate) fn postcard_bytes_to_tree<T: DeserializeOwned + Serialize>(
+    bytes: &[u8],
+) -> Result<TreeValue> {
     let value: T = raster_core::postcard::from_bytes(bytes).map_err(|e| {
         Error::Serialization(format!(
             "Failed to deserialize entry argument from postcard bytes: {}",
@@ -62,28 +63,28 @@ where
 }
 
 /// The result of [`bind_entry_arguments`]: the coordinate-`[0]` reference
-/// (for building each argument's `AuthRef::Internal`), plus enough per-
+/// (for building each argument's storage-backed `AuthRef`), plus enough per-
 /// argument metadata for the caller to publish a matching
 /// `TraceEvent::EntrypointBind`.
 pub struct EntryArgumentsBinding {
-    pub reference: InternalRef,
+    pub reference: StorageRef,
     pub arguments: Vec<raster_core::trace::EntrypointArgumentBinding>,
 }
 
-/// Binds `main`'s declared external arguments into a single internal-store
-/// object at the first coordinate reserved in the current sequence frame —
+/// Loads `main`'s declared arguments into a single authorized storage object
+/// at the first coordinate reserved in the current sequence frame —
 /// must be called before any other write in `main`'s scope, since it's the
 /// only place coordinate `[0]` can legitimately come from. Reads each
 /// argument's `(encoding, commitment)` straight from the manifest — no file
 /// bytes are touched — computes the combined struct-of-commitments root,
-/// and configures the store's `ExternalSourceResolver` so later `select!`
+/// and relies on the store's `SourceResolver` so later `select!`
 /// calls into these arguments resolve lazily, one source at a time.
 pub fn bind_entry_arguments(args: &[EntryArgumentSpec]) -> Result<EntryArgumentsBinding> {
     // The resolver is installed once, by `init` (see
-    // `install_default_external_resolver`) — this is a consumer of the
+    // `install_default_source_resolver`) — this is a consumer of the
     // runtime's input context, not a second place that decides what it is.
-    let resolver = THREAD_INTERNAL_STORAGE
-        .with(|storage| storage.borrow().external_resolver())
+    let resolver = THREAD_STORAGE
+        .with(|storage| storage.borrow().source_resolver())
         .ok_or_else(|| {
             Error::Other(
                 "Program declares main entry arguments but no --input/--input-manifest was provided"
@@ -108,23 +109,24 @@ pub fn bind_entry_arguments(args: &[EntryArgumentSpec]) -> Result<EntryArguments
             encoding,
             commitment: commitment.clone(),
         });
-        sources.push(ReferencedSource {
+        sources.push(AuthorizedSource {
             name: spec.name.to_string(),
+            encoding,
             commitment,
             kind,
         });
     }
 
-    let referenced = ReferencedObject { sources };
+    let load = AuthorizedSourceLoad { sources };
     let coordinates = THREAD_SEQUENCE_CONTEXT
         .with(|context| context.borrow_mut().reserve_execution_coordinates())?;
 
-    THREAD_INTERNAL_STORAGE.with(|storage| {
+    THREAD_STORAGE.with(|storage| {
         let write = storage
             .borrow_mut()
-            .append_referenced_object(referenced, coordinates.clone());
+            .load_authorized_sources(load, coordinates.clone());
         Ok(EntryArgumentsBinding {
-            reference: InternalRef::new(coordinates, write.entry.object_commitment),
+            reference: StorageRef::new(coordinates, write.entry.object_commitment),
             arguments: bindings,
         })
     })
@@ -138,11 +140,11 @@ pub fn bind_entry_arguments(args: &[EntryArgumentSpec]) -> Result<EntryArguments
 /// trace recorder consume that decision rather than each re-deriving it from
 /// `std::env::args`. A program run without those arguments installs nothing,
 /// which is only an error if it goes on to declare entry arguments.
-pub fn install_default_external_resolver() -> Result<()> {
-    let Some(manager) = ExternalStorageManager::from_cli_args()? else {
+pub fn install_default_source_resolver() -> Result<()> {
+    let Some(manager) = FileInputSourceResolver::from_cli_args()? else {
         return Ok(());
     };
-    let resolver: Arc<dyn ExternalSourceResolver> = Arc::new(manager);
-    THREAD_INTERNAL_STORAGE.with(|storage| storage.borrow_mut().set_external_resolver(resolver));
+    let resolver: Arc<dyn SourceResolver> = Arc::new(manager);
+    THREAD_STORAGE.with(|storage| storage.borrow_mut().set_source_resolver(resolver));
     Ok(())
 }

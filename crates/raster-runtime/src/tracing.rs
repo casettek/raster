@@ -103,7 +103,7 @@ pub fn init_with<P: Publisher + 'static>(publisher: P) {
 fn init_runtime_state() {
     RUNTIME_INIT.call_once(|| {
         crate::profiling::init_from_env();
-        crate::entry_arguments::install_default_external_resolver()
+        crate::entry_arguments::install_default_source_resolver()
             .unwrap_or_else(|error| panic!("Failed to read --input/--input-manifest: {}", error));
     });
 }

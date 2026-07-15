@@ -4,7 +4,7 @@
 //!   schema's input bindings.
 //! - [`io`]: recorded input/output/external commitments match the provided
 //!   witnesses, and tile steps carry a verified replay proof.
-//! - [`store`]: the internal store transition (reads, optional write, roots)
+//! - [`store`]: the storage transition (reads, optional write, roots)
 //!   is consistent with the recorded before/after roots.
 //! - [`drafts`]: draft transitions chain correctly across tile steps.
 //! - [`entrypoint`]: `main`'s entry-argument binding is authorized against

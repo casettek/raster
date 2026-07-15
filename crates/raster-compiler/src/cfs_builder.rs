@@ -109,7 +109,9 @@ impl<'a> CfsBuilder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::{CallArgumentKind, CallInfo, CallKind, FunctionAstItem, MacroAstItem, ProjectAst};
+    use crate::ast::{
+        CallArgumentKind, CallInfo, CallKind, FunctionAstItem, MacroAstItem, ProjectAst,
+    };
     use crate::sequence::SequenceStep;
     use crate::tile::Tile;
     use std::collections::HashMap;
@@ -146,7 +148,10 @@ mod tests {
         }
     }
 
-    fn main_function_with_params(input_names: Vec<&str>, call_infos: Vec<CallInfo>) -> FunctionAstItem {
+    fn main_function_with_params(
+        input_names: Vec<&str>,
+        call_infos: Vec<CallInfo>,
+    ) -> FunctionAstItem {
         FunctionAstItem {
             name: "main".to_string(),
             path: PathBuf::from("test.rs"),
@@ -156,7 +161,10 @@ mod tests {
                 args: HashMap::new(),
             }],
             input_names: input_names.iter().map(|s| s.to_string()).collect(),
-            inputs: input_names.iter().map(|_| "PersonalData".to_string()).collect(),
+            inputs: input_names
+                .iter()
+                .map(|_| "PersonalData".to_string())
+                .collect(),
             output: None,
             signature: "fn main()".to_string(),
             selection_aliases: vec![],
@@ -204,7 +212,10 @@ mod tests {
 
         match &seq_def.items[0] {
             SequenceChildItem::Entrypoint(item) => {
-                assert_eq!(item.names, vec!["personal_data".to_string(), "seed".to_string()]);
+                assert_eq!(
+                    item.names,
+                    vec!["personal_data".to_string(), "seed".to_string()]
+                );
             }
             other => panic!("Expected a leading Entrypoint item, got {:?}", other),
         }
@@ -254,7 +265,10 @@ mod tests {
         let builder = CfsBuilder::new(&project);
         let seq_def = builder.build_sequence_def(&sequence).unwrap();
 
-        assert!(seq_def.input_sources.is_empty(), "main declared zero parameters");
+        assert!(
+            seq_def.input_sources.is_empty(),
+            "main declared zero parameters"
+        );
         assert_eq!(seq_def.items.len(), 1, "no Entrypoint item should be added");
         assert!(matches!(seq_def.items[0], SequenceChildItem::Tile(_)));
     }

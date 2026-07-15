@@ -298,7 +298,7 @@ No artifact identity is present in the CFS today.
 
 ### E.3 External inputs are scoped to `main`'s entry arguments
 
-External inputs enter a program only as `main`'s declared parameters (its *entry arguments*). When `main` declares any, its CFS definition carries a leading `SequenceChildItem::Entrypoint` item (item 0, listing the argument names in declaration order) with empty `input_sources`; every other item's `prior_item_output` addressing shifts by one to make room. At startup the runtime binds the whole set as one internal-store object at coordinate `[0]` whose commitment is the struct-hash combined root of the manifest-declared per-argument commitments, and the fraud-proof pipeline authorizes that binding against the manifest commitment (see `checks::entrypoint` in the transition guest).
+External inputs enter a program only as `main`'s declared parameters (its *entry arguments*). When `main` declares any, its CFS definition carries a leading `SequenceChildItem::Entrypoint` item (item 0, listing the argument names in declaration order) with empty `input_sources`; every other item's `prior_item_output` addressing shifts by one to make room. At startup the runtime binds the whole set as one storage object at coordinate `[0]` whose commitment is the struct-hash combined root of the manifest-declared per-argument commitments, and the fraud-proof pipeline authorizes that binding against the manifest commitment (see `checks::entrypoint` in the transition guest).
 
 Two caveats remain for other uses of the `external` binding kind:
 
@@ -309,7 +309,7 @@ Downstream consumers **MUST** treat those residual `external` bindings as “unk
 
 ### E.4 Prior-item outputs are single committed objects; sub-values are selector-addressed
 
-There is no output-slot concept in the CFS or the runtime. Each prior item commits exactly one internal-store object per execution, keyed by its execution coordinates, and `prior_item_output` bindings identify that prior item only. A tile that logically produces several values returns them as one struct/tuple; consumers address sub-values with selector paths into the committed encoding, verified via selection commitments.
+There is no output-slot concept in the CFS or the runtime. Each prior item commits exactly one storage object per execution, keyed by its execution coordinates, and `prior_item_output` bindings identify that prior item only. A tile that logically produces several values returns them as one struct/tuple; consumers address sub-values with selector paths into the committed encoding, verified via selection commitments.
 
 Tuple *destructuring bindings* (`let (a, b) = callee(...)`) are not yet extracted by the flow resolver; supporting them means binding each name to a selector path into the prior item's committed output.
 

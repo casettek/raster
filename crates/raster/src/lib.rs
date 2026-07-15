@@ -17,26 +17,27 @@ pub use raster_core::draft;
 
 pub mod input;
 pub use input::{
-    auth_ref_result_trace, auth_ref_trace, draft_replay_handle, draft_replay_transition, finalize,
+    auth_ref_result_trace, auth_ref_trace, draft_replay_handle, draft_replay_transition,
+    entry_argument_auth_ref, finalize,
     into_auth_ref, into_auth_value, into_draft, materialize_auth_result, materialize_auth_return,
-    new_draft, raster_trace_payload, resolve_internal_ok_value, resolve_internal_value,
+    new_draft, raster_trace_payload, resolve_storage_ok_value, resolve_storage_value,
     restore_draft_from_replay_handle, run_recur_list, run_recur_list_state,
     run_recur_list_with_state, run_recur_sequence_list, run_recur_sequence_list_state,
-    run_recur_sequence_list_with_state, select_source, select_stored_internal_value,
-    selector_path, serialize_draft_replay_handle, serialize_draft_trace, typed_internal,
-    typed_internal_with_resolver, typed_selector_path, Anchor, AuthRef, AuthRefTrace, AuthValue,
-    Draft, DraftAppendField, DraftSetField, InternalRef, InternalValue, IntoAuthRef, IntoAuthValue,
-    IntoDraft, IntoRecurControl, ListProofDirection, ListProofSibling, Op, RecurControl,
-    RecurInput, RecurOutput, RecurSequenceInput, RecurSequenceOutput, RecurSequenceState,
-    RecurState, Schema, SchemaField, SchemaFieldMode, SchemaNode, SelectSource, Selectable,
-    SelectedPayload, SelectionCommitment, SelectionProof, SelectionProofStep, SelectionWitness,
-    SelectorPath, SelectorSegment, TypedInternalBinding, TypedSelectorPath,
+    run_recur_sequence_list_with_state, select_source, select_stored_value, selector_path,
+    serialize_draft_replay_handle, serialize_draft_trace, typed_selector_path, typed_storage,
+    typed_storage_with_resolver, Anchor, AuthRef, AuthRefTrace, AuthValue, Draft, DraftAppendField,
+    DraftSetField, IntoAuthRef, IntoAuthValue, IntoDraft, IntoRecurControl, ListProofDirection,
+    ListProofSibling, Op, RecurControl, RecurInput, RecurOutput, RecurSequenceInput,
+    RecurSequenceOutput, RecurSequenceState, RecurState, Schema, SchemaField, SchemaFieldMode,
+    SchemaNode, SelectSource, Selectable, SelectedPayload, SelectionCommitment, SelectionProof,
+    SelectionProofStep, SelectionWitness, SelectorPath, SelectorSegment, StorageRef, StorageValue,
+    TypedSelectorPath, TypedStorageBinding,
 };
 
 #[cfg(feature = "std")]
 pub use input::{
     begin_draft_transition_capture, encode_raster_value, finish_draft_transition_capture,
-    postcard_structural_commitment, store_internal_value, write_raster_files,
+    postcard_structural_commitment, store_value, write_raster_files,
 };
 
 pub use raster_macros::{select, sequence, tile, Selectable};
@@ -59,7 +60,7 @@ pub mod runtime {
 #[cfg(feature = "std")]
 pub use raster_runtime::{
     bind_entry_arguments, entry_argument_spec, finish, init, init_with, publish_trace_event,
-    EntryArgumentsBinding, EntryArgumentSpec,
+    EntryArgumentSpec, EntryArgumentsBinding,
 };
 
 #[cfg(feature = "std")]
@@ -236,7 +237,7 @@ pub mod __private {
         total_duration_ns: u64,
         user_duration_ns: u64,
         external_input_resolve_ns: u64,
-        internal_input_resolve_ns: u64,
+        storage_input_resolve_ns: u64,
         trace_serialize_ns: u64,
         draft_capture_ns: u64,
         scope_enter_ns: u64,
@@ -252,7 +253,7 @@ pub mod __private {
             user_duration_ns,
             raster_runtime::TileProfileOverheadBreakdown {
                 external_input_resolve_ns,
-                internal_input_resolve_ns,
+                storage_input_resolve_ns,
                 output_store_ns: 0,
                 trace_serialize_ns,
                 draft_capture_ns,
@@ -270,7 +271,7 @@ pub mod __private {
             total_duration_ns,
             user_duration_ns,
             external_input_resolve_ns,
-            internal_input_resolve_ns,
+            storage_input_resolve_ns,
             trace_serialize_ns,
             draft_capture_ns,
             scope_enter_ns,
@@ -397,16 +398,14 @@ pub mod __private {
     {
         #[cfg(feature = "profiling")]
         let output_store_start = profile_now();
-        let reference =
-            raster_runtime::store_execution_output_value(&result).unwrap_or_else(|error| {
-                panic!("Failed to store tile output in internal storage: {}", error)
-            });
+        let reference = raster_runtime::store_execution_output_value(&result)
+            .unwrap_or_else(|error| panic!("Failed to store tile output in storage: {}", error));
         #[cfg(feature = "profiling")]
         let output_store_duration_ns =
             u64::try_from(output_store_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
         #[cfg(feature = "profiling")]
         raster_runtime::record_tile_output_store_profile(output_store_duration_ns);
-        crate::into_auth_ref::<T, _>(crate::typed_internal::<T>(reference))
+        crate::into_auth_ref::<T, _>(crate::typed_storage::<T>(reference))
     }
 
     #[cfg(not(feature = "std"))]
@@ -423,10 +422,8 @@ pub mod __private {
     {
         #[cfg(feature = "profiling")]
         let output_store_start = profile_now();
-        let reference =
-            raster_runtime::store_execution_output_value(&result).unwrap_or_else(|error| {
-                panic!("Failed to store tile output in internal storage: {}", error)
-            });
+        let reference = raster_runtime::store_execution_output_value(&result)
+            .unwrap_or_else(|error| panic!("Failed to store tile output in storage: {}", error));
         #[cfg(feature = "profiling")]
         let output_store_duration_ns =
             u64::try_from(output_store_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
@@ -434,9 +431,9 @@ pub mod __private {
         raster_runtime::record_tile_output_store_profile(output_store_duration_ns);
         match result {
             Ok(_) => Ok(crate::into_auth_ref::<T, _>(
-                crate::typed_internal_with_resolver::<T>(
+                crate::typed_storage_with_resolver::<T>(
                     reference,
-                    crate::resolve_internal_ok_value::<T>,
+                    crate::resolve_storage_ok_value::<T>,
                 ),
             )),
             Err(error) => Err(error),
@@ -510,11 +507,11 @@ macro_rules! call {
     };
 }
 
-/// Creates a typed internal-store reference for explicit call-site bindings.
+/// Creates a typed storage reference for explicit call-site bindings.
 #[macro_export]
-macro_rules! internal {
+macro_rules! storage {
     ($ty:ty, $reference:expr) => {
-        $crate::typed_internal::<$ty>($reference)
+        $crate::typed_storage::<$ty>($reference)
     };
 }
 
@@ -611,14 +608,14 @@ pub mod prelude {
 
     pub use crate::exec::Result;
     pub use crate::{
-        call, call_recur, call_recur_seq, call_seq, finalize, internal, into_auth_ref, into_draft,
-        materialize_auth_result, materialize_auth_return, new, select, sequence, tile, Anchor,
-        AuthRef, AuthValue, Draft, InternalRef, InternalValue, IntoAuthRef, IntoAuthValue,
-        IntoDraft, ListProofDirection, ListProofSibling, Op, RecurControl, RecurInput, RecurOutput,
+        call, call_recur, call_recur_seq, call_seq, finalize, into_auth_ref, into_draft,
+        materialize_auth_result, materialize_auth_return, new, select, sequence, storage, tile,
+        Anchor, AuthRef, AuthValue, Draft, IntoAuthRef, IntoAuthValue, IntoDraft,
+        ListProofDirection, ListProofSibling, Op, RecurControl, RecurInput, RecurOutput,
         RecurSequenceInput, RecurSequenceOutput, RecurSequenceState, RecurState, Schema,
         SchemaField, SchemaFieldMode, SchemaNode, SelectSource, Selectable, SelectedPayload,
-        SelectionProof, SelectionProofStep, SelectorPath, SelectorSegment, TypedInternalBinding,
-        TypedSelectorPath,
+        SelectionProof, SelectionProofStep, SelectorPath, SelectorSegment, StorageRef,
+        StorageValue, TypedSelectorPath, TypedStorageBinding,
     };
 
     // TODO: Re-enable once Executor/Tracer types are implemented
@@ -626,5 +623,5 @@ pub mod prelude {
     // pub use crate::{Executor, Tracer, FileTracer, NoOpTracer};
 
     #[cfg(feature = "std")]
-    pub use crate::{resolve_internal_value, store_internal_value};
+    pub use crate::{resolve_storage_value, store_value};
 }

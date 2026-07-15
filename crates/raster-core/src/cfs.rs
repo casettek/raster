@@ -87,7 +87,10 @@ impl CfsCursor {
     /// coordinate `[0]`). `None` means `main` declares no external
     /// arguments at all — there is nothing to authorize at entry.
     pub fn main_entrypoint_names(&self) -> Option<&[String]> {
-        let main = self.cfs.sequences.get(self.entrypoint_coordinate as usize)?;
+        let main = self
+            .cfs
+            .sequences
+            .get(self.entrypoint_coordinate as usize)?;
         match main.items.first()? {
             SequenceChildItem::Entrypoint(item) => Some(item.names.as_slice()),
             _ => None,
@@ -544,7 +547,7 @@ pub enum SequenceChildItem {
     RecurTile(RecurTileItem),
     RecurSequence(RecurSequenceItem),
     /// Leading item of `main`'s item list when `main` declares external
-    /// arguments. Binds a single internal-store object at this item's
+    /// arguments. Loads a single storage object at this item's
     /// coordinate to a struct-of-commitments over the named entry
     /// arguments (see `EntrypointOp::BindEntryArguments`). Never appears
     /// outside `main`, and declares no input bindings of its own.
@@ -552,7 +555,7 @@ pub enum SequenceChildItem {
 }
 
 /// Declares the ordered set of external arguments `main` binds as a single
-/// internal-store object. `names` is the CFS-canonical declaration order,
+/// storage object. `names` is the CFS-canonical declaration order,
 /// used both to recompute the struct-of-commitments root and to resolve
 /// each argument's `PriorItemOutput` binding to this same item's coordinate.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -609,12 +612,8 @@ pub struct RecurSequenceItem {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum InputBinding {
     Direct(InputSource),
-    SequenceScope {
-        input_index: usize,
-    },
-    PriorItemOutput {
-        intra_sequence_item_index: usize,
-    },
+    SequenceScope { input_index: usize },
+    PriorItemOutput { intra_sequence_item_index: usize },
 }
 
 impl InputBinding {
@@ -628,9 +627,9 @@ impl InputBinding {
         Self::new(InputSource::Inline)
     }
 
-    /// Create a direct internal input binding.
-    pub fn internal() -> Self {
-        Self::new(InputSource::Internal)
+    /// Create a direct storage input binding.
+    pub fn storage() -> Self {
+        Self::new(InputSource::Storage)
     }
 
     /// Create a sequence-scope binding.
@@ -649,7 +648,7 @@ impl InputBinding {
 /// Semantic source of an input value in the data flow schema.
 ///
 /// Note there is no "external" source: data entering a program does so as
-/// `main`'s entry arguments, which are bound once into internal storage by
+/// `main`'s entry arguments, which are loaded once into storage by
 /// the leading `Entrypoint` item and reached from there like any other
 /// committed value (`PriorItemOutput`). A source here is only about values
 /// with no upstream item to bind to.
@@ -658,8 +657,8 @@ pub enum InputSource {
     /// Input is materialized inline in the sequence body.
     Inline,
 
-    /// Input is resolved from internal storage.
-    Internal,
+    /// Input is resolved from storage.
+    Storage,
 }
 
 #[cfg(test)]

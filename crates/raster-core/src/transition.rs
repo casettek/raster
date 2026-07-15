@@ -46,19 +46,19 @@ pub struct StepRecordWitness {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct InternalStoreEntry {
+pub struct StorageEntry {
     pub coordinates: CfsCoordinates,
     pub object_commitment: Vec<u8>,
 }
 
-impl InternalStoreEntry {
+impl StorageEntry {
     pub fn to_bytes(&self) -> Vec<u8> {
         postcard::to_allocvec(self).unwrap_or_default()
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct InternalStoreIndexValue {
+pub struct StorageIndexValue {
     pub log_position: u64,
     pub object_commitment: Vec<u8>,
 }
@@ -66,7 +66,7 @@ pub struct InternalStoreIndexValue {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CoordinateIndexMembershipProof {
     pub coordinates: CfsCoordinates,
-    pub value: InternalStoreIndexValue,
+    pub value: StorageIndexValue,
     pub siblings: Vec<Vec<u8>>,
 }
 
@@ -77,29 +77,29 @@ pub struct CoordinateIndexNonMembershipProof {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct InternalStoreLogWitness {
+pub struct StorageLogWitness {
     pub position: u64,
     pub path_elems: Vec<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct InternalStoreReadWitness {
-    pub entry: InternalStoreEntry,
-    pub log_witness: InternalStoreLogWitness,
+pub struct StorageReadWitness {
+    pub entry: StorageEntry,
+    pub log_witness: StorageLogWitness,
     pub index_witness: CoordinateIndexMembershipProof,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct InternalStoreWriteWitness {
-    pub entry: InternalStoreEntry,
+pub struct StorageWriteWitness {
+    pub entry: StorageEntry,
     pub index_non_membership_witness: CoordinateIndexNonMembershipProof,
     pub index_membership_witness: CoordinateIndexMembershipProof,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct InternalStoreWitness {
-    pub reads: Vec<InternalStoreReadWitness>,
-    pub write: Option<InternalStoreWriteWitness>,
+pub struct StorageWitness {
+    pub reads: Vec<StorageReadWitness>,
+    pub write: Option<StorageWriteWitness>,
 }
 
 /// Input for a single transition step (passed into the transition guest).
@@ -113,8 +113,8 @@ pub struct TransitionInput {
     pub output_witness: Option<Vec<u8>>,
     pub input_source_witness: Option<FnInput>,
     pub sequence_scope_witness: Option<FnInput>,
-    pub internal_selection_witnesses: BTreeMap<String, SelectionWitness>,
-    pub internal_store_witness: Option<InternalStoreWitness>,
+    pub storage_selection_witnesses: BTreeMap<String, SelectionWitness>,
+    pub storage_witness: Option<StorageWitness>,
     pub draft_transition_witness: Option<DraftTransitionWitness>,
 
     pub input_sources_witnesses: HashMap<StepRecord, Vec<u8>>,
@@ -123,7 +123,7 @@ pub struct TransitionInput {
     pub authorization_journal: AuthorizationJournal,
 
     /// Membership witness for `main`'s entry-argument coordinate (`[0]`)
-    /// against the window's *initial* internal-store state, proving the
+    /// against the window's *initial* storage state, proving the
     /// binding already existed when this window opened.
     ///
     /// Only ever read on the step that establishes a fresh
@@ -132,16 +132,16 @@ pub struct TransitionInput {
     /// the window opens at or before the binding itself, leaving the chain
     /// [`EntrypointAuthorization::Pending`] until an `Entrypoint` step
     /// inside the window discharges it.
-    pub entrypoint_membership_witness: Option<InternalStoreReadWitness>,
+    pub entrypoint_membership_witness: Option<StorageReadWitness>,
 }
 
 /// Result of applying one transition (new frontier and fingerprint state).
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct Transition {
     pub frontier: SerializableFrontier,
-    pub internal_store_frontier: SerializableFrontier,
-    pub internal_store_root: Vec<u8>,
-    pub internal_store_index_root: Vec<u8>,
+    pub storage_frontier: SerializableFrontier,
+    pub storage_root: Vec<u8>,
+    pub storage_index_root: Vec<u8>,
     pub active_drafts: BTreeMap<DraftId, TrackedDraftState>,
     pub actual_fingerprint_acc: FingerprintAccumulator,
     pub next_expected_coordinates: Vec<CfsCoordinates>,
@@ -151,9 +151,9 @@ pub struct Transition {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct InitTransition {
     pub init_frontier: SerializableFrontier,
-    pub init_internal_store_frontier: SerializableFrontier,
-    pub init_internal_store_root: Vec<u8>,
-    pub init_internal_store_index_root: Vec<u8>,
+    pub init_storage_frontier: SerializableFrontier,
+    pub init_storage_root: Vec<u8>,
+    pub init_storage_index_root: Vec<u8>,
     pub active_drafts: BTreeMap<DraftId, TrackedDraftState>,
     pub fingerprint: Fingerprint,
 }
@@ -170,9 +170,9 @@ pub enum TransitionState {
 /// journal within a proof chain.
 ///
 /// A window may legitimately open *before* the binding exists (its trace
-/// starts at genesis, with an empty internal store, and replays the
+/// starts at genesis, with an empty storage state, and replays the
 /// `Entrypoint` step itself) or *after* it (the binding is already in the
-/// window's initial internal-store state). Those two cases establish the
+/// window's initial storage state). Those two cases establish the
 /// same fact by different means, so the chain carries this as a state rather
 /// than a bool: `Pending` is a debt that a later step in the same chain must
 /// discharge, and [`EntrypointAuthorization::assert_discharged`] is what

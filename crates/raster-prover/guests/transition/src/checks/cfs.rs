@@ -5,12 +5,12 @@
 
 use raster_core::cfs::{CfsCoordinates, CfsCursor, InputBinding, InputSource, SequenceChildItem};
 use raster_core::trace::{
-    ExecStep, ExecTarget, FnInput, FnInputValue, InternalData, StepKind, StepRecord,
+    ExecStep, ExecTarget, FnInput, FnInputValue, StepKind, StepRecord, StorageData,
 };
 
 enum ResolvedSource<'a> {
     Inline(&'a Vec<u8>),
-    Internal(&'a InternalData),
+    Storage(&'a StorageData),
 }
 
 fn resolved_source_at<'a>(input: &'a FnInput, index: usize) -> ResolvedSource<'a> {
@@ -25,9 +25,9 @@ fn resolved_source_at<'a>(input: &'a FnInput, index: usize) -> ResolvedSource<'a
 
     match value {
         FnInputValue::Inline(bytes) => ResolvedSource::Inline(bytes),
-        FnInputValue::InternalBinding => {
-            ResolvedSource::Internal(input.internal().get(&arg.name).unwrap_or_else(|| {
-                panic!("Missing internal input metadata for arg '{}'", arg.name)
+        FnInputValue::StorageBinding => {
+            ResolvedSource::Storage(input.storage().get(&arg.name).unwrap_or_else(|| {
+                panic!("Missing storage input metadata for arg '{}'", arg.name)
             }))
         }
     }
@@ -41,10 +41,10 @@ fn assert_same_source(left: ResolvedSource<'_>, right: ResolvedSource<'_>) {
                 "Inline sequence scope input does not match consumer binding",
             );
         }
-        (ResolvedSource::Internal(left_meta), ResolvedSource::Internal(right_meta)) => {
+        (ResolvedSource::Storage(left_meta), ResolvedSource::Storage(right_meta)) => {
             assert_eq!(
                 left_meta, right_meta,
-                "Internal sequence scope input does not match consumer binding",
+                "Storage sequence scope input does not match consumer binding",
             );
         }
         _ => {
@@ -166,10 +166,10 @@ pub fn verify_step_record_inputs(
                     input_index,
                 );
             }
-            InputBinding::Direct(InputSource::Internal) => {
+            InputBinding::Direct(InputSource::Storage) => {
                 assert!(
-                    matches!(resolved_source, ResolvedSource::Internal(_)),
-                    "Expected internal input source for step {:?} arg {}",
+                    matches!(resolved_source, ResolvedSource::Storage(_)),
+                    "Expected storage input source for step {:?} arg {}",
                     step_record,
                     input_index,
                 );
@@ -201,11 +201,11 @@ pub fn verify_step_record_inputs(
                         .try_into()
                         .expect("Prior item output index exceeds CFS coordinate bounds"),
                 );
-                let internal_meta = match resolved_source {
-                    ResolvedSource::Internal(meta) => meta,
+                let storage_meta = match resolved_source {
+                    ResolvedSource::Storage(meta) => meta,
                     _ => {
                         panic!(
-                            "Expected internal input source for step {:?} arg {}",
+                            "Expected storage input source for step {:?} arg {}",
                             step_record, input_index
                         )
                     }
@@ -217,16 +217,16 @@ pub fn verify_step_record_inputs(
                     raster_core::cfs::SequenceChildItem::Sequence(_)
                     | raster_core::cfs::SequenceChildItem::RecurSequence(_) => {
                         assert!(
-                            has_coordinate_prefix(&internal_meta.coordinates, &source_coordinates),
-                            "Internal input prior-item-output coordinates do not descend from expected sequence source",
+                            has_coordinate_prefix(&storage_meta.coordinates, &source_coordinates),
+                            "Storage input prior-item-output coordinates do not descend from expected sequence source",
                         );
                     }
                     raster_core::cfs::SequenceChildItem::Tile(_)
                     | raster_core::cfs::SequenceChildItem::RecurTile(_)
                     | raster_core::cfs::SequenceChildItem::Entrypoint(_) => {
                         assert_eq!(
-                            internal_meta.coordinates, source_coordinates,
-                            "Internal input prior-item-output coordinates do not match expected CFS source",
+                            storage_meta.coordinates, source_coordinates,
+                            "Storage input prior-item-output coordinates do not match expected CFS source",
                         );
                     }
                 }

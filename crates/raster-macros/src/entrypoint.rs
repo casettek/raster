@@ -5,19 +5,19 @@
 //! the code that binds them: one `bind_entry_arguments` call up front, then
 //! one binding per parameter that reads back out of the single combined
 //! object it produced. Everything downstream then treats them as ordinary
-//! internal-store values.
+//! storage values.
 
-use quote::{format_ident, quote};
+use quote::quote;
 
 use crate::ParamInfo;
 
 /// Generates the leading statements that bind `main`'s declared parameters
 /// to `main`'s entry arguments: one `bind_entry_arguments` call up front,
-/// then one `TypedInternalBinding<T>` local per parameter, each resolving
-/// through a field-selector into the single combined entry object (see
-/// `raster_runtime::bind_entry_arguments`) — usable directly as a tile
-/// argument or narrowed further with `select!`, same as any other
-/// internal-store binding.
+/// then one `AuthRef<T>` local per parameter — the same binding type a
+/// sequence body sees for its own parameters — carrying `Field(name)` as
+/// its selector prefix into the single combined entry object (see
+/// `raster_runtime::bind_entry_arguments`). Nested `select!`s compose onto
+/// that prefix, so no argument materializes until a tile consumes it.
 /// Only meaningful on native (std, non-riscv32) execution — main never
 /// actually runs on a tile's riscv32 guest target, but its code still gets
 /// compiled there as part of the user crate, so every binding needs a
@@ -55,37 +55,15 @@ fn gen_main_entry_argument_prelude(params: &[ParamInfo]) -> proc_macro2::TokenSt
             let ident = &param.ident;
             let ty = &param.ty;
             let name_str = ident.to_string();
-            let resolver_fn = format_ident!("__raster_resolve_entry_{}", ident);
             quote! {
-                // A plain `fn` item, not a closure: `typed_internal_with_resolver`
-                // takes a bare fn pointer, so the field name has to be baked in
-                // as a literal rather than captured. This resolver *is* the
-                // field-select — there is no whole-value type for the combined
-                // entry object, so `typed_internal::<#ty>(reference).select(...)`
-                // (resolve-whole-then-select) doesn't apply here; this goes
-                // straight through `select_stored_internal_value`, exactly like
-                // any other selector-based internal read.
                 #[cfg(all(feature = "std", not(target_arch = "riscv32")))]
-                fn #resolver_fn(
-                    reference: ::raster::InternalRef,
-                ) -> ::raster::runtime::Result<::raster::InternalValue<#ty>> {
-                    ::raster::select_stored_internal_value::<#ty>(
-                        &reference,
-                        &::raster::SelectorPath::new(::raster::alloc::vec![
-                            ::raster::SelectorSegment::Field(
-                                ::raster::alloc::string::String::from(#name_str)
-                            )
-                        ]),
-                    )
-                }
-                #[cfg(all(feature = "std", not(target_arch = "riscv32")))]
-                let #ident: ::raster::TypedInternalBinding<#ty> =
-                    ::raster::typed_internal_with_resolver::<#ty>(
+                let #ident: ::raster::AuthRef<#ty> =
+                    ::raster::entry_argument_auth_ref::<#ty>(
                         __raster_entry_binding.reference.clone(),
-                        #resolver_fn,
+                        #name_str,
                     );
                 #[cfg(not(all(feature = "std", not(target_arch = "riscv32"))))]
-                let #ident: ::raster::TypedInternalBinding<#ty> = ::core::unreachable!(
+                let #ident: ::raster::AuthRef<#ty> = ::core::unreachable!(
                     "main entry arguments are only bound on native (std, non-riscv32) execution"
                 );
             }

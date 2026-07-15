@@ -124,7 +124,7 @@ Raster tooling currently sets:
 
 #### 3.3 External inputs in the CFS
 
-There is no "external" input source in the CFS dataflow model. Data enters a program only as `main`'s declared entry arguments, which the leading `SequenceChildItem::Entrypoint` item binds — once — into internal storage; every use of them is an ordinary `InputBinding::PriorItemOutput` reference to that item. This is what makes entering data verifiable: the binding is checked against the authorization journal exactly once per proof chain, and each later use is held to the internal store like any other committed value.
+There is no "external" input source in the CFS dataflow model. Data enters a program only as `main`'s declared entry arguments, which the leading `SequenceChildItem::Entrypoint` item binds — once — into storage; every use of them is an ordinary `InputBinding::PriorItemOutput` reference to that item. This is what makes entering data verifiable: the binding is checked against the authorization journal exactly once per proof chain, and each later use is held to the storage like any other committed value.
 
 - **Rule**: Any runtime that executes a CFS MUST supply entry arguments as **raw bytes** encoded using the codec named by `ControlFlowSchema.encoding`.
 - **Rule**: The shape/type of those entry arguments is not represented in the current CFS; it is an out-of-band contract between the caller and `main`'s Rust type signature.

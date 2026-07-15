@@ -6,11 +6,11 @@ use raster_core::draft::{
     DraftStateWitness, DraftTransitionWitness,
 };
 use raster_core::input::{
-    InternalRef, InternalValue, Schema,
-    SchemaFieldMode, SchemaNode, SelectionWitness, SelectorPath,
+    ExternalEncoding, Schema, SchemaFieldMode, SchemaNode, SelectionWitness, SelectorPath,
+    StorageRef, StorageValue,
 };
 use raster_core::trace::RasterPayload;
-use raster_core::transition::{InternalStoreEntry, InternalStoreIndexValue, SerializableFrontier};
+use raster_core::transition::{SerializableFrontier, StorageEntry, StorageIndexValue};
 use raster_core::{Error, Result};
 use raster_prover::precomputed::EMPTY_TRIE_NODES;
 use raster_prover::trace::{
@@ -25,18 +25,18 @@ use std::sync::Arc;
 use std::vec::Vec;
 
 use crate::backing::{
-    ExternalSourceResolver, ObjectBacking, OwnedObject, ReferencedObject,
+    ObjectBacking, OwnedObject, ReferencedObject, ReferencedSource, ReferencedSourceKind,
 };
 use crate::input::{
-    encode_raster_value,
-    selected_payload_from_raster_location, selection_witness_from_raster_selection, tree_value_from_raster_location,
+    encode_raster_value, selected_payload_from_raster_location,
+    selection_witness_from_raster_selection, tree_value_from_raster_location,
     typed_value_from_tree, TreeValue,
 };
 use crate::raster_index::RasterIndex;
+use crate::source::SourceResolver;
 use crate::Sha256Commitment;
 
 type Anchor = [u8; 32];
-
 
 #[derive(Debug, Clone)]
 struct DraftRuntimeState {
@@ -56,22 +56,22 @@ pub struct DraftCaptureSnapshot {
 }
 
 #[derive(Debug, Clone)]
-pub struct StoredInternalObject {
-    pub reference: InternalRef,
+pub struct StoredObject {
+    pub reference: StorageRef,
     pub log_position: u64,
     pub(crate) backing: ObjectBacking,
 }
 
 #[derive(Debug, Clone)]
-pub struct InternalStoreSnapshot {
+pub struct StorageSnapshot {
     pub frontier: SerializableFrontier,
     pub root: Vec<u8>,
     pub index_root: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
-pub struct InternalWriteRecord {
-    pub entry: InternalStoreEntry,
+pub struct StorageWriteRecord {
+    pub entry: StorageEntry,
     pub log_position: u64,
     pub store_root_before: Vec<u8>,
     pub store_root_after: Vec<u8>,
@@ -80,22 +80,35 @@ pub struct InternalWriteRecord {
     pub frontier_after: SerializableFrontier,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct AuthorizedSource {
+    pub name: String,
+    pub encoding: ExternalEncoding,
+    pub commitment: Vec<u8>,
+    pub kind: ReferencedSourceKind,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct AuthorizedSourceLoad {
+    pub sources: Vec<AuthorizedSource>,
+}
+
 #[derive(Clone)]
-pub struct InternalStorageManager {
+pub struct StorageManager {
     frontier: TraceTreeFrontier,
-    objects: BTreeMap<CfsCoordinates, StoredInternalObject>,
+    objects: BTreeMap<CfsCoordinates, StoredObject>,
     coordinate_index: IncrementalCoordinateIndex,
     /// Set once (via `bind_entry_arguments`) for programs that declare
     /// `main` entry arguments; `None` otherwise, and never consulted unless
     /// a `Referenced` object actually needs resolving.
-    external_resolver: Option<Arc<dyn ExternalSourceResolver>>,
+    source_resolver: Option<Arc<dyn SourceResolver>>,
 }
 
-impl std::fmt::Debug for InternalStorageManager {
+impl std::fmt::Debug for StorageManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("InternalStorageManager")
+        f.debug_struct("StorageManager")
             .field("objects", &self.objects)
-            .field("has_external_resolver", &self.external_resolver.is_some())
+            .field("has_source_resolver", &self.source_resolver.is_some())
             .finish()
     }
 }
@@ -103,7 +116,7 @@ impl std::fmt::Debug for InternalStorageManager {
 fn frontier_root(frontier: &TraceTreeFrontier) -> Vec<u8> {
     TraceTree::from_frontier(1, frontier.clone())
         .root(0)
-        .expect("internal store root should exist")
+        .expect("storage root should exist")
         .0
 }
 
@@ -280,37 +293,37 @@ fn draft_state_witness(state: &DraftRuntimeState) -> DraftStateWitness {
     }
 }
 
-impl InternalStorageManager {
+impl StorageManager {
     pub fn new() -> Self {
         let mut tree = TraceTree::new(1);
         tree.append(Bytes(EMPTY_TRIE_NODES[0].to_vec()));
         let frontier = tree
             .frontier()
             .cloned()
-            .expect("internal store frontier should exist after seed append");
+            .expect("storage frontier should exist after seed append");
         Self {
             frontier,
             objects: BTreeMap::new(),
             coordinate_index: IncrementalCoordinateIndex::new(),
-            external_resolver: None,
+            source_resolver: None,
         }
     }
 
     /// Injects the resolver a `Referenced` object dispatches to. Set once
-    /// per runtime — by `install_default_external_resolver` in production, or
+    /// per runtime — by runtime initialization in production, or
     /// directly by a caller that supplies its own input context (the trace
     /// recorder, tests).
-    pub(crate) fn set_external_resolver(&mut self, resolver: Arc<dyn ExternalSourceResolver>) {
-        self.external_resolver = Some(resolver);
+    pub(crate) fn set_source_resolver(&mut self, resolver: Arc<dyn SourceResolver>) {
+        self.source_resolver = Some(resolver);
     }
 
     /// The installed input context, if this runtime has one.
-    pub(crate) fn external_resolver(&self) -> Option<Arc<dyn ExternalSourceResolver>> {
-        self.external_resolver.clone()
+    pub(crate) fn source_resolver(&self) -> Option<Arc<dyn SourceResolver>> {
+        self.source_resolver.clone()
     }
 
-    pub fn snapshot(&self) -> InternalStoreSnapshot {
-        InternalStoreSnapshot {
+    pub fn snapshot(&self) -> StorageSnapshot {
+        StorageSnapshot {
             frontier: serializable_frontier_from_trace_frontier(self.frontier.clone()),
             root: self.current_root(),
             index_root: self.current_index_root(),
@@ -325,16 +338,21 @@ impl InternalStorageManager {
         self.coordinate_index.root()
     }
 
-    fn append(&mut self, backing: ObjectBacking, object_commitment: Vec<u8>, coordinates: CfsCoordinates) -> InternalWriteRecord {
+    fn append(
+        &mut self,
+        backing: ObjectBacking,
+        object_commitment: Vec<u8>,
+        coordinates: CfsCoordinates,
+    ) -> StorageWriteRecord {
         assert!(
             !self.coordinate_index.contains_key(&coordinates),
-            "Duplicate internal store write at coordinates {:?}",
+            "Duplicate storage write at coordinates {:?}",
             coordinates
         );
 
         let store_root_before = self.current_root();
         let index_root_before = self.current_index_root();
-        let entry = InternalStoreEntry {
+        let entry = StorageEntry {
             coordinates: coordinates.clone(),
             object_commitment,
         };
@@ -342,25 +360,25 @@ impl InternalStorageManager {
 
         self.frontier.append(Bytes(leaf_hash));
         let log_position: u64 = self.frontier.position().into();
-        let index_value = InternalStoreIndexValue {
+        let index_value = StorageIndexValue {
             log_position,
             object_commitment: entry.object_commitment.clone(),
         };
         self.coordinate_index
             .insert(coordinates.clone(), index_value);
 
-        let reference = InternalRef::new(coordinates.clone(), entry.object_commitment.clone());
+        let reference = StorageRef::new(coordinates.clone(), entry.object_commitment.clone());
 
         self.objects.insert(
             coordinates,
-            StoredInternalObject {
+            StoredObject {
                 reference,
                 log_position,
                 backing,
             },
         );
 
-        InternalWriteRecord {
+        StorageWriteRecord {
             entry,
             log_position,
             store_root_before,
@@ -376,7 +394,7 @@ impl InternalStorageManager {
         bytes: &[u8],
         coordinates: CfsCoordinates,
         raster: Option<RasterPayload>,
-    ) -> InternalWriteRecord {
+    ) -> StorageWriteRecord {
         let object_commitment = internal_object_commitment(bytes, raster.as_ref());
         let owned = OwnedObject {
             bytes: bytes.to_vec(),
@@ -385,27 +403,41 @@ impl InternalStorageManager {
         self.append(ObjectBacking::Owned(owned), object_commitment, coordinates)
     }
 
-    /// Writes `main`'s entry-argument binding — a single `Referenced`
-    /// object whose commitment is `referenced.combined_root()`. Called
-    /// exactly once per program, by `bind_entry_arguments`.
-    pub(crate) fn append_referenced_object(
+    /// Loads an authorized set of named sources as one storage object. Today
+    /// this is called only for `main`'s entrypoint binding at coordinate `[0]`.
+    pub(crate) fn load_authorized_sources(
         &mut self,
-        referenced: ReferencedObject,
+        load: AuthorizedSourceLoad,
         coordinates: CfsCoordinates,
-    ) -> InternalWriteRecord {
+    ) -> StorageWriteRecord {
+        let referenced = ReferencedObject {
+            sources: load
+                .sources
+                .into_iter()
+                .map(|source| ReferencedSource {
+                    name: source.name,
+                    commitment: source.commitment,
+                    kind: {
+                        let _authorized_encoding = source.encoding;
+                        source.kind
+                    },
+                })
+                .collect(),
+        };
         let combined_root = referenced.combined_root();
-        self.append(ObjectBacking::Referenced(referenced), combined_root, coordinates)
+        self.append(
+            ObjectBacking::Referenced(referenced),
+            combined_root,
+            coordinates,
+        )
     }
 
-    pub fn resolve<T: DeserializeOwned>(
-        &self,
-        reference: &InternalRef,
-    ) -> Result<InternalValue<T>> {
+    pub fn resolve<T: DeserializeOwned>(&self, reference: &StorageRef) -> Result<StorageValue<T>> {
         let stored = self.verify_reference(reference)?;
         match &stored.backing {
             ObjectBacking::Owned(owned) => {
                 let (bytes, selection, value) = owned.resolve_whole::<T>(&reference.coordinates)?;
-                Ok(InternalValue::new_with_selection(
+                Ok(StorageValue::new_with_selection(
                     reference.clone(),
                     bytes,
                     SelectorPath::default(),
@@ -426,22 +458,22 @@ impl InternalStorageManager {
     ) -> Result<&'a RasterPayload> {
         owned.raster.as_ref().ok_or_else(|| {
             Error::Other(format!(
-                "Internal store object at coordinates {:?} is missing raster selection metadata",
+                "Storage object at coordinates {:?} is missing raster selection metadata",
                 coordinates
             ))
         })
     }
 
-    fn verify_reference(&self, reference: &InternalRef) -> Result<&StoredInternalObject> {
+    fn verify_reference(&self, reference: &StorageRef) -> Result<&StoredObject> {
         let stored = self.objects.get(&reference.coordinates).ok_or_else(|| {
             Error::Other(format!(
-                "Missing internal store object at coordinates {:?}",
+                "Missing storage object at coordinates {:?}",
                 reference.coordinates
             ))
         })?;
         if stored.reference.commitment != reference.commitment {
             return Err(Error::Other(format!(
-                "Internal store commitment mismatch at coordinates {:?}",
+                "Storage commitment mismatch at coordinates {:?}",
                 reference.coordinates
             )));
         }
@@ -454,7 +486,7 @@ impl InternalStorageManager {
                 internal_object_commitment(owned.bytes.as_slice(), owned.raster.as_ref());
             if actual_commitment != reference.commitment {
                 return Err(Error::Other(format!(
-                    "Internal store object at coordinates {:?} failed integrity check",
+                    "Storage object at coordinates {:?} failed integrity check",
                     reference.coordinates
                 )));
             }
@@ -464,7 +496,7 @@ impl InternalStorageManager {
 
     pub fn selection_witness(
         &self,
-        reference: &InternalRef,
+        reference: &StorageRef,
         selector: &SelectorPath,
     ) -> Result<SelectionWitness> {
         let stored = self.verify_reference(reference)?;
@@ -476,10 +508,9 @@ impl InternalStorageManager {
                 selection_witness_from_raster_selection(&raster.bytes, selector, selection)
             }
             ObjectBacking::Referenced(referenced) => {
-                let resolver = self.external_resolver.as_deref().ok_or_else(|| {
+                let resolver = self.source_resolver.as_deref().ok_or_else(|| {
                     Error::Other(
-                        "Internal store has a Referenced object but no external resolver configured"
-                            .into(),
+                        "Storage has a referenced object but no source resolver configured".into(),
                     )
                 })?;
                 referenced.selection_witness(selector, resolver)
@@ -489,9 +520,9 @@ impl InternalStorageManager {
 
     pub fn select<T: DeserializeOwned>(
         &self,
-        reference: &InternalRef,
+        reference: &StorageRef,
         selector: &SelectorPath,
-    ) -> Result<InternalValue<T>> {
+    ) -> Result<StorageValue<T>> {
         let stored = self.verify_reference(reference)?;
         match &stored.backing {
             ObjectBacking::Owned(owned) => {
@@ -503,12 +534,12 @@ impl InternalStorageManager {
                     selected_payload_from_raster_location(&raster.bytes, selector, selection)?;
                 if selected.commitment.source_root_hash.to_vec() != reference.commitment {
                     return Err(Error::Other(format!(
-                        "Internal selection root mismatch at coordinates {:?}",
+                        "Storage selection root mismatch at coordinates {:?}",
                         reference.coordinates
                     )));
                 }
                 let value = typed_value_from_tree(&tree)?;
-                Ok(InternalValue::new_with_selection(
+                Ok(StorageValue::new_with_selection(
                     reference.clone(),
                     selected.bytes,
                     selector.clone(),
@@ -517,15 +548,14 @@ impl InternalStorageManager {
                 ))
             }
             ObjectBacking::Referenced(referenced) => {
-                let resolver = self.external_resolver.as_deref().ok_or_else(|| {
+                let resolver = self.source_resolver.as_deref().ok_or_else(|| {
                     Error::Other(
-                        "Internal store has a Referenced object but no external resolver configured"
-                            .into(),
+                        "Storage has a referenced object but no source resolver configured".into(),
                     )
                 })?;
                 let (tree, selected) = referenced.select(selector, resolver)?;
                 let value = typed_value_from_tree::<T>(&tree)?;
-                Ok(InternalValue::new_with_selection(
+                Ok(StorageValue::new_with_selection(
                     reference.clone(),
                     selected.bytes,
                     selector.clone(),
@@ -537,8 +567,7 @@ impl InternalStorageManager {
     }
 }
 
-
-impl Default for InternalStorageManager {
+impl Default for StorageManager {
     fn default() -> Self {
         Self::new()
     }
@@ -640,9 +669,10 @@ impl SequenceExecutionContext {
             return Ok(coordinates);
         }
 
-        let frame = self.stack.last_mut().ok_or_else(|| {
-            Error::Other("Internal-store writes require active sequence context".into())
-        })?;
+        let frame = self
+            .stack
+            .last_mut()
+            .ok_or_else(|| Error::Other("Storage writes require active sequence context".into()))?;
         let mut coordinates = frame.coordinates.clone();
         coordinates.push(frame.next_child_index);
         frame.next_child_index += 1;
@@ -656,7 +686,7 @@ impl SequenceExecutionContext {
             THREAD_ACTIVE_EXECUTION_COORDINATES.with(|stack| stack.borrow().is_empty());
         let synthetic_index = {
             let frame = self.stack.last_mut().ok_or_else(|| {
-                Error::Other("Internal-store writes require active sequence context".into())
+                Error::Other("Storage writes require active sequence context".into())
             })?;
             let synthetic_index = frame.next_synthetic_index;
             frame.next_synthetic_index += 1;
@@ -673,7 +703,7 @@ impl SequenceExecutionContext {
             self.stack
                 .last()
                 .ok_or_else(|| {
-                    Error::Other("Internal-store writes require active sequence context".into())
+                    Error::Other("Storage writes require active sequence context".into())
                 })?
                 .coordinates
                 .clone()
@@ -691,8 +721,8 @@ impl SequenceExecutionContext {
 }
 
 std::thread_local! {
-    pub(crate) static THREAD_INTERNAL_STORAGE: RefCell<InternalStorageManager> =
-        RefCell::new(InternalStorageManager::new());
+    pub(crate) static THREAD_STORAGE: RefCell<StorageManager> =
+        RefCell::new(StorageManager::new());
     pub(crate) static THREAD_SEQUENCE_CONTEXT: RefCell<SequenceExecutionContext> =
         RefCell::new(SequenceExecutionContext::default());
     static THREAD_ACTIVE_EXECUTION_COORDINATES: RefCell<Vec<CfsCoordinates>> = RefCell::new(Vec::new());
@@ -702,16 +732,16 @@ std::thread_local! {
 }
 
 fn reset_thread_storage() {
-    THREAD_INTERNAL_STORAGE.with(|storage| {
+    THREAD_STORAGE.with(|storage| {
         let mut storage = storage.borrow_mut();
         // Where the process's inputs come from is a property of how it was
         // started, not of the execution being reset: it is installed once by
         // `init`, before any sequence runs, and must outlive the store it was
         // installed into.
-        let external_resolver = storage.external_resolver();
-        *storage = InternalStorageManager::new();
-        if let Some(resolver) = external_resolver {
-            storage.set_external_resolver(resolver);
+        let source_resolver = storage.source_resolver();
+        *storage = StorageManager::new();
+        if let Some(resolver) = source_resolver {
+            storage.set_source_resolver(resolver);
         }
     });
     THREAD_ACTIVE_EXECUTION_COORDINATES.with(|coordinates| {
@@ -761,8 +791,8 @@ pub fn exit_recur_sequence_iteration_scope() {
     });
 }
 
-pub fn global_internal_store_snapshot() -> InternalStoreSnapshot {
-    THREAD_INTERNAL_STORAGE.with(|storage| storage.borrow().snapshot())
+pub fn global_storage_snapshot() -> StorageSnapshot {
+    THREAD_STORAGE.with(|storage| storage.borrow().snapshot())
 }
 
 pub fn create_draft<S>() -> Result<(Anchor, [u8; 32])>
@@ -947,42 +977,41 @@ where
     })
 }
 
-fn store_internal_value_at_coordinates<T: Serialize>(
+fn store_value_at_coordinates<T: Serialize>(
     value: &T,
     coordinates: CfsCoordinates,
-) -> Result<InternalRef> {
+) -> Result<StorageRef> {
     let bytes = raster_core::postcard::to_allocvec(value).map_err(|error| {
         Error::Serialization(format!(
-            "Failed to serialize internal store object for current sequence step: {}",
+            "Failed to serialize storage object for current sequence step: {}",
             error
         ))
     })?;
     let raster_payload = Some(raster_payload_for_value(value)?);
-    THREAD_INTERNAL_STORAGE.with(|storage| {
+    THREAD_STORAGE.with(|storage| {
         let write = storage.borrow_mut().append_serialized_bytes(
             &bytes,
             coordinates.clone(),
             raster_payload,
         );
-        Ok(InternalRef::new(coordinates, write.entry.object_commitment))
+        Ok(StorageRef::new(coordinates, write.entry.object_commitment))
     })
 }
 
-
-pub fn store_internal_value<T: Serialize>(value: &T) -> Result<InternalRef> {
+pub fn store_value<T: Serialize>(value: &T) -> Result<StorageRef> {
     let coordinates = THREAD_SEQUENCE_CONTEXT
         .with(|context| context.borrow_mut().reserve_synthetic_coordinates())?;
-    store_internal_value_at_coordinates(value, coordinates)
+    store_value_at_coordinates(value, coordinates)
 }
 
-pub fn store_execution_output_value<T: Serialize>(value: &T) -> Result<InternalRef> {
+pub fn store_execution_output_value<T: Serialize>(value: &T) -> Result<StorageRef> {
     let coordinates = THREAD_PENDING_OUTPUT_COORDINATES
         .with(|coordinates| coordinates.borrow_mut().take())
         .or_else(current_recur_site_coordinates)
         .ok_or_else(|| {
             Error::Other("Missing pending execution output coordinates for tile output".into())
         })?;
-    store_internal_value_at_coordinates(value, coordinates)
+    store_value_at_coordinates(value, coordinates)
 }
 
 fn current_recur_site_coordinates() -> Option<CfsCoordinates> {
@@ -1039,7 +1068,7 @@ pub fn publish_pending_output_coordinates(coordinates: CfsCoordinates) {
     });
 }
 
-pub fn finalize_draft<S>(anchor: &Anchor, expected_root: &[u8; 32]) -> Result<InternalRef>
+pub fn finalize_draft<S>(anchor: &Anchor, expected_root: &[u8; 32]) -> Result<StorageRef>
 where
     S: Schema + DeserializeOwned + Serialize,
 {
@@ -1053,14 +1082,14 @@ where
     })?;
 
     let reference = if let Some(coordinates) = current_recur_site_coordinates() {
-        store_internal_value_at_coordinates(&value, coordinates)?
+        store_value_at_coordinates(&value, coordinates)?
     } else {
-        store_internal_value(&value)?
+        store_value(&value)?
     };
     Ok(reference)
 }
 
-pub fn finalize_empty_draft<S>(anchor: &Anchor, expected_root: &[u8; 32]) -> Result<InternalRef>
+pub fn finalize_empty_draft<S>(anchor: &Anchor, expected_root: &[u8; 32]) -> Result<StorageRef>
 where
     S: Schema + DeserializeOwned + Serialize,
 {
@@ -1081,32 +1110,31 @@ where
     })?;
 
     let reference = if let Some(coordinates) = current_recur_site_coordinates() {
-        store_internal_value_at_coordinates(&value, coordinates)?
+        store_value_at_coordinates(&value, coordinates)?
     } else {
-        store_internal_value(&value)?
+        store_value(&value)?
     };
     Ok(reference)
 }
 
-pub fn resolve_internal_value<T: DeserializeOwned>(
-    reference: &InternalRef,
-) -> Result<InternalValue<T>> {
-    THREAD_INTERNAL_STORAGE.with(|storage| storage.borrow().resolve(reference))
+pub fn resolve_storage_value<T: DeserializeOwned>(
+    reference: &StorageRef,
+) -> Result<StorageValue<T>> {
+    THREAD_STORAGE.with(|storage| storage.borrow().resolve(reference))
 }
 
-pub fn select_stored_internal_value<T: DeserializeOwned>(
-    reference: &InternalRef,
+pub fn select_stored_value<T: DeserializeOwned>(
+    reference: &StorageRef,
     selector: &SelectorPath,
-) -> Result<InternalValue<T>> {
-    THREAD_INTERNAL_STORAGE.with(|storage| storage.borrow().select(reference, selector))
+) -> Result<StorageValue<T>> {
+    THREAD_STORAGE.with(|storage| storage.borrow().select(reference, selector))
 }
 
-pub fn resolve_internal_ok_value<T: DeserializeOwned>(
-    reference: &InternalRef,
-) -> Result<InternalValue<T>> {
-    let resolved: InternalValue<std::result::Result<T, String>> =
-        resolve_internal_value(reference)?;
-    let InternalValue {
+pub fn resolve_storage_ok_value<T: DeserializeOwned>(
+    reference: &StorageRef,
+) -> Result<StorageValue<T>> {
+    let resolved: StorageValue<std::result::Result<T, String>> = resolve_storage_value(reference)?;
+    let StorageValue {
         reference,
         bytes,
         selector,
@@ -1114,7 +1142,7 @@ pub fn resolve_internal_ok_value<T: DeserializeOwned>(
         value,
     } = resolved;
     match value {
-        Ok(value) => Ok(InternalValue::new_with_selection(
+        Ok(value) => Ok(StorageValue::new_with_selection(
             reference, bytes, selector, selection, value,
         )),
         Err(error) => Err(Error::Other(format!(
@@ -1127,9 +1155,10 @@ pub fn resolve_internal_ok_value<T: DeserializeOwned>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    
-    
-    use raster_core::input::{SchemaField, SchemaNode, Selectable};
+
+    use raster_core::input::{
+        struct_commitments_root, ExternalEncoding, SchemaField, SchemaNode, Selectable,
+    };
     use serde::{Deserialize, Serialize};
 
     struct SequenceScopeGuard;
@@ -1168,22 +1197,60 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Duplicate internal store write at coordinates")]
+    #[should_panic(expected = "Duplicate storage write at coordinates")]
     fn rejects_duplicate_coordinate_writes() {
-        let mut manager = InternalStorageManager::new();
+        let mut manager = StorageManager::new();
         let coordinates = CfsCoordinates(vec![1, 2, 3]);
 
         manager.append_serialized_bytes(b"first", coordinates.clone(), None);
         manager.append_serialized_bytes(b"second", coordinates, None);
     }
+
+    #[test]
+    fn authorized_source_load_commits_to_declared_sources_in_order() {
+        let mut manager = StorageManager::new();
+        let alpha_commitment = vec![1; 32];
+        let beta_commitment = vec![2; 32];
+        let coordinates = CfsCoordinates(vec![0]);
+
+        let write = manager.load_authorized_sources(
+            AuthorizedSourceLoad {
+                sources: vec![
+                    AuthorizedSource {
+                        name: "alpha".into(),
+                        encoding: ExternalEncoding::Raster,
+                        commitment: alpha_commitment.clone(),
+                        kind: ReferencedSourceKind::Raster,
+                    },
+                    AuthorizedSource {
+                        name: "beta".into(),
+                        encoding: ExternalEncoding::Raster,
+                        commitment: beta_commitment.clone(),
+                        kind: ReferencedSourceKind::Raster,
+                    },
+                ],
+            },
+            coordinates.clone(),
+        );
+
+        let expected = struct_commitments_root([
+            ("alpha", alpha_commitment.as_slice()),
+            ("beta", beta_commitment.as_slice()),
+        ])
+        .to_vec();
+
+        assert_eq!(write.entry.coordinates, coordinates);
+        assert_eq!(write.entry.object_commitment, expected);
+    }
+
     #[test]
     fn stored_internal_reference_commits_to_raster_root() {
         reset_thread_storage();
         let _guard = SequenceScopeGuard::enter("stored_internal_reference_commits_to_raster_root");
-        let reference = store_internal_value(&vec!["alpha".to_string(), "beta".to_string()])
+        let reference = store_value(&vec!["alpha".to_string(), "beta".to_string()])
             .expect("value should store");
-        let resolved: InternalValue<Vec<String>> =
-            resolve_internal_value(&reference).expect("value should resolve");
+        let resolved: StorageValue<Vec<String>> =
+            resolve_storage_value(&reference).expect("value should resolve");
 
         assert_eq!(reference.commitment, resolved.selection.source_root_hash);
     }

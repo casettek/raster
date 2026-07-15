@@ -117,12 +117,8 @@ fn direct_hello_tiles_run_does_not_emit_trace_events_to_stdout() {
 #[test]
 fn hello_tiles_audit_accepts_recur_trace_commitment() {
     let commit_path = unique_commit_path();
-    let commit_output = run_hello_tiles(&[
-        "--commit",
-        &commit_path,
-        "--fraud-proof-window-size",
-        "8",
-    ]);
+    let commit_output =
+        run_hello_tiles(&["--commit", &commit_path, "--fraud-proof-window-size", "8"]);
     assert!(
         commit_output.status.success(),
         "commit run should succeed\nstdout:\n{}\nstderr:\n{}",

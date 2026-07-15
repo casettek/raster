@@ -185,9 +185,7 @@ enum Commands {
 
 /// Parse and validate the --fraud-proof-window-size argument into the
 /// fraud-proof window parameters used for building trace commitments.
-fn parse_fraud_proof_config(
-    value: &str,
-) -> std::result::Result<FraudProofConfig, String> {
+fn parse_fraud_proof_config(value: &str) -> std::result::Result<FraudProofConfig, String> {
     let window_size: usize = value
         .parse()
         .map_err(|_| format!("'{value}' is not a valid window size"))?;

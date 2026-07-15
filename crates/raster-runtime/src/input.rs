@@ -1,7 +1,7 @@
 use raster_core::input::{
-    selection_payload_hash, struct_commitments_root, Hash32, InternalValue, ListProofDirection,
-    ListProofSibling, SchemaNode, Selectable, SelectedPayload, SelectionCommitment, SelectionProof,
-    SelectionProofStep, SelectionWitness, SelectorPath, SelectorSegment,
+    selection_payload_hash, struct_commitments_root, Hash32, ListProofDirection, ListProofSibling,
+    SchemaNode, Selectable, SelectedPayload, SelectionCommitment, SelectionProof,
+    SelectionProofStep, SelectionWitness, SelectorPath, SelectorSegment, StorageValue,
 };
 use raster_core::{Error, Result as CoreResult};
 use serde::de::{
@@ -1705,10 +1705,10 @@ fn extend_selector_path(prefix: &SelectorPath, suffix: &SelectorPath) -> Selecto
     SelectorPath::new(segments)
 }
 
-pub fn select_internal_value<Root, T>(
-    value: &InternalValue<Root>,
+pub fn select_storage_value<Root, T>(
+    value: &StorageValue<Root>,
     selector: &SelectorPath,
-) -> CoreResult<InternalValue<T>>
+) -> CoreResult<StorageValue<T>>
 where
     Root: DeserializeOwned + Serialize + Selectable,
     T: DeserializeOwned + Serialize,
@@ -1716,14 +1716,14 @@ where
     let proven = typed_proven_selection(&value.value, selector)?;
     let typed_selected = typed_value_from_tree::<T>(&proven.selected_value).map_err(|e| {
         Error::Serialization(format!(
-            "Failed to deserialize selected internal input from selection tree: {}",
+            "Failed to deserialize selected storage input from selection tree: {}",
             e
         ))
     })?;
     let full_selector = extend_selector_path(&value.selector, selector);
     let selected_hash = selection_payload_hash(&proven.selected_bytes);
     let selected_len = proven.selected_bytes.len() as u64;
-    Ok(InternalValue::new_with_selection(
+    Ok(StorageValue::new_with_selection(
         value.reference.clone(),
         proven.selected_bytes,
         full_selector.clone(),
@@ -2106,8 +2106,8 @@ pub fn postcard_structural_commitment<T: Serialize>(value: &T) -> CoreResult<Str
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::external_storage::{sha256_hex, ExternalStorageManager};
     use crate::raster_index::RasterIndex;
+    use crate::source::{sha256_hex, FileInputSourceResolver};
     use raster_core::input::{verify_selection_proof, SchemaField, SchemaNode, Selectable};
     use serde::{Deserialize, Serialize};
     use std::collections::BTreeMap;
@@ -2186,8 +2186,8 @@ mod tests {
         std::env::temp_dir().join(format!("raster-input-test-{}-{}", nanos, counter))
     }
 
-    fn storage_manager(input_path: &Path, manifest_path: &Path) -> ExternalStorageManager {
-        ExternalStorageManager::from_input_args(input_path.to_str(), manifest_path.to_str())
+    fn storage_manager(input_path: &Path, manifest_path: &Path) -> FileInputSourceResolver {
+        FileInputSourceResolver::from_input_args(input_path.to_str(), manifest_path.to_str())
             .unwrap()
     }
 

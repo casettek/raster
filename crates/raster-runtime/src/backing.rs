@@ -1,4 +1,4 @@
-//! What backs the bytes committed at an internal-store coordinate.
+//! What backs the bytes committed at a storage coordinate.
 //!
 //! An object at a coordinate is either `Owned` — bytes this run computed,
 //! held in memory — or `Referenced`: no bytes at all, just a
@@ -11,49 +11,22 @@ use std::vec::Vec;
 
 use raster_core::cfs::CfsCoordinates;
 use raster_core::input::{
-    struct_commitments_root, ExternalEncoding, Hash32, SchemaNode, SelectedPayload,
-    SelectionCommitment, SelectionProof, SelectionProofStep, SelectionWitness, SelectorPath,
-    SelectorSegment,
+    struct_commitments_root, Hash32, SchemaNode, SelectedPayload, SelectionCommitment,
+    SelectionProof, SelectionProofStep, SelectionWitness, SelectorPath, SelectorSegment,
 };
 use raster_core::trace::RasterPayload;
 use raster_core::{Error, Result};
 use serde::de::DeserializeOwned;
 
-use crate::external_storage::{ExternalStorageManager, ResolvedExternalData};
 use crate::input::{
     hex_string, prove_selection, selected_payload_from_proven,
     selected_payload_from_raster_location, selection_witness_from_raster_selection,
     subtree_payload_and_root, tree_value_from_raster_location, typed_value_from_tree, TreeValue,
 };
 use crate::raster_index::RasterIndex;
+use crate::source::{ResolvedSourceData, SourceResolver};
 
-/// Everything entry-argument binding needs from outside the process: what
-/// the public manifest declares about a source, and the source's bytes.
-///
-/// `ExternalStorageManager` is the only real implementation; tests swap in a
-/// fixture-backed one instead of touching the filesystem. It is a trait
-/// rather than a concrete type so that *where inputs come from* is decided
-/// once, by whoever wires up the runtime, and not rediscovered from ambient
-/// CLI state by each consumer.
-pub(crate) trait ExternalSourceResolver: Send + Sync {
-    /// The declared `(encoding, commitment)` for a named source, read from
-    /// the manifest without touching the source's bytes.
-    fn manifest_commitment_metadata(&self, name: &str) -> Result<(ExternalEncoding, String)>;
-
-    fn resolve(&self, name: &str) -> Result<ResolvedExternalData>;
-}
-
-impl ExternalSourceResolver for ExternalStorageManager {
-    fn manifest_commitment_metadata(&self, name: &str) -> Result<(ExternalEncoding, String)> {
-        ExternalStorageManager::manifest_commitment_metadata(self, name)
-    }
-
-    fn resolve(&self, name: &str) -> Result<ResolvedExternalData> {
-        ExternalStorageManager::resolve(self, name)
-    }
-}
-
-/// What backs the bytes committed at an internal-store coordinate.
+/// What backs the bytes committed at a storage coordinate.
 #[derive(Debug, Clone)]
 pub(crate) enum ObjectBacking {
     /// Bytes were computed this run (tile output, finalized draft, recur
@@ -146,7 +119,7 @@ impl ReferencedObject {
 
     fn verify_source_commitment(
         source: &ReferencedSource,
-        resolved: &ResolvedExternalData,
+        resolved: &ResolvedSourceData,
     ) -> Result<()> {
         if !resolved
             .commitment()
@@ -202,7 +175,7 @@ impl ReferencedObject {
     pub fn select(
         &self,
         selector: &SelectorPath,
-        resolver: &dyn ExternalSourceResolver,
+        resolver: &dyn SourceResolver,
     ) -> Result<(TreeValue, SelectedPayload)> {
         let (source, remaining) = self.find_source(selector)?;
         let resolved = resolver.resolve(&source.name)?;
@@ -222,10 +195,10 @@ impl ReferencedObject {
         &self,
         source: &ReferencedSource,
         remaining: &SelectorPath,
-        resolved: &ResolvedExternalData,
+        resolved: &ResolvedSourceData,
     ) -> Result<(TreeValue, SelectedPayload)> {
         match (&source.kind, resolved) {
-            (ReferencedSourceKind::Raster, ResolvedExternalData::Raster { .. }) => {
+            (ReferencedSourceKind::Raster, ResolvedSourceData::Raster { .. }) => {
                 let index = resolved
                     .raster_index()
                     .ok_or_else(|| Error::Other("Expected raster index metadata".into()))?;
@@ -239,7 +212,7 @@ impl ReferencedObject {
             }
             (
                 ReferencedSourceKind::Postcard { to_tree, schema },
-                ResolvedExternalData::Postcard { .. },
+                ResolvedSourceData::Postcard { .. },
             ) => {
                 let tree = to_tree(resolved.bytes())?;
                 let (_, root_hash) = subtree_payload_and_root(&tree)?;
@@ -269,14 +242,14 @@ impl ReferencedObject {
     pub fn selection_witness(
         &self,
         selector: &SelectorPath,
-        resolver: &dyn ExternalSourceResolver,
+        resolver: &dyn SourceResolver,
     ) -> Result<SelectionWitness> {
         let (source, remaining) = self.find_source(selector)?;
         let resolved = resolver.resolve(&source.name)?;
         Self::verify_source_commitment(source, &resolved)?;
 
         let inner = match (&source.kind, &resolved) {
-            (ReferencedSourceKind::Raster, ResolvedExternalData::Raster { .. }) => {
+            (ReferencedSourceKind::Raster, ResolvedSourceData::Raster { .. }) => {
                 let index = resolved
                     .raster_index()
                     .ok_or_else(|| Error::Other("Expected raster index metadata".into()))?;
@@ -288,7 +261,7 @@ impl ReferencedObject {
             }
             (
                 ReferencedSourceKind::Postcard { to_tree, schema },
-                ResolvedExternalData::Postcard { .. },
+                ResolvedSourceData::Postcard { .. },
             ) => {
                 let tree = to_tree(resolved.bytes())?;
                 let (_, root_hash) = subtree_payload_and_root(&tree)?;
@@ -371,7 +344,7 @@ impl OwnedObject {
         } else {
             let value = raster_core::postcard::from_bytes(&self.bytes).map_err(|e| {
                 Error::Serialization(format!(
-                    "Failed to deserialize internal store object at coordinates {:?}: {}",
+                    "Failed to deserialize storage object at coordinates {:?}: {}",
                     coordinates, e
                 ))
             })?;
@@ -394,11 +367,10 @@ mod tests {
     use super::*;
     use crate::entry_arguments::postcard_bytes_to_tree;
     use crate::input::tree_value_from_serialize;
-    use raster_core::input::{SchemaField, Selectable};
+    use raster_core::input::{ExternalEncoding, SchemaField, Selectable};
     use serde::{Deserialize, Serialize};
     use std::collections::BTreeMap;
     use std::sync::Arc;
-
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
     struct EntryA {
@@ -444,7 +416,7 @@ mod tests {
         files: BTreeMap<String, (Vec<u8>, String)>,
     }
 
-    impl ExternalSourceResolver for FakeResolver {
+    impl SourceResolver for FakeResolver {
         fn manifest_commitment_metadata(&self, name: &str) -> Result<(ExternalEncoding, String)> {
             let (_, commitment) = self
                 .files
@@ -454,17 +426,15 @@ mod tests {
             Ok((ExternalEncoding::Postcard, commitment))
         }
 
-        fn resolve(&self, name: &str) -> Result<ResolvedExternalData> {
+        fn resolve(&self, name: &str) -> Result<ResolvedSourceData> {
             let (bytes, commitment) = self
                 .files
                 .get(name)
                 .cloned()
                 .ok_or_else(|| Error::Other(format!("no fixture for '{}'", name)))?;
-            Ok(ResolvedExternalData::Postcard {
+            Ok(ResolvedSourceData::Postcard {
                 commitment,
-                file: crate::external_storage::ExternalFile::Read(Arc::from(
-                    bytes.into_boxed_slice(),
-                )),
+                file: crate::source::SourceFile::Read(Arc::from(bytes.into_boxed_slice())),
             })
         }
     }
@@ -476,8 +446,10 @@ mod tests {
         };
         let a_bytes = raster_core::postcard::to_allocvec(&a).unwrap();
         let b_bytes = raster_core::postcard::to_allocvec(&b).unwrap();
-        let (_, a_root) = subtree_payload_and_root(&tree_value_from_serialize(&a).unwrap()).unwrap();
-        let (_, b_root) = subtree_payload_and_root(&tree_value_from_serialize(&b).unwrap()).unwrap();
+        let (_, a_root) =
+            subtree_payload_and_root(&tree_value_from_serialize(&a).unwrap()).unwrap();
+        let (_, b_root) =
+            subtree_payload_and_root(&tree_value_from_serialize(&b).unwrap()).unwrap();
 
         let sources = vec![
             ReferencedSource {
@@ -561,7 +533,9 @@ mod tests {
 
         let err = referenced.select(&selector, &resolver).unwrap_err();
 
-        assert!(err.to_string().contains("failed structural integrity check"));
+        assert!(err
+            .to_string()
+            .contains("failed structural integrity check"));
     }
 
     #[test]
@@ -601,5 +575,4 @@ mod tests {
 
         assert_ne!(referenced.combined_root(), renamed.combined_root());
     }
-
 }

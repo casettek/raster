@@ -71,7 +71,7 @@ impl FraudProofWindowContext {
     /// - `Init`: start from the genesis state carried in the transition,
     ///   and independently decide what the chain owes for entry-argument
     ///   authorization — the guest never trusts a host-supplied claim about
-    ///   the window's initial internal-store contents.
+    ///   the window's initial storage contents.
     /// - `Next`: read the previous journal, recursively verify its receipt
     ///   against our own image id, and require state and manifest
     ///   continuity. Entry-argument authorization is inherited from the
@@ -85,8 +85,8 @@ impl FraudProofWindowContext {
             TransitionState::Init(init_transition) => {
                 let entrypoint_authorization = checks::entrypoint::verify_genesis_authorization(
                     &params.cfs_cursor,
-                    &init_transition.init_internal_store_root,
-                    &init_transition.init_internal_store_index_root,
+                    &init_transition.init_storage_root,
+                    &init_transition.init_storage_index_root,
                     &input.authorization_journal,
                     input.entrypoint_membership_witness.as_ref(),
                 );
@@ -159,8 +159,8 @@ fn assert_manifest_continuity(prev_journal: &TransitionJournal, input: &Transiti
 /// by applying one verified step.
 pub struct LiveTransition {
     frontier: NonEmptyFrontier<Bytes>,
-    internal_store_frontier: NonEmptyFrontier<Bytes>,
-    internal_store_index_root: Vec<u8>,
+    storage_frontier: NonEmptyFrontier<Bytes>,
+    storage_index_root: Vec<u8>,
     active_drafts: BTreeMap<DraftId, TrackedDraftState>,
     fingerprint_acc: FingerprintAccumulator,
     /// `None` only for the genesis state, where no coordinates are expected yet.
@@ -179,19 +179,19 @@ impl LiveTransition {
     ) -> Self {
         let frontier = deserialize_frontier(&init_transition.init_frontier)
             .expect("Invalid frontier in input");
-        let internal_store_frontier =
-            deserialize_frontier(&init_transition.init_internal_store_frontier)
-                .expect("Invalid internal store frontier in input");
+        let storage_frontier =
+            deserialize_frontier(&init_transition.init_storage_frontier)
+                .expect("Invalid storage frontier in input");
         assert_eq!(
-            frontier_root(&internal_store_frontier),
-            init_transition.init_internal_store_root,
-            "Initial internal store root does not match initial internal store frontier",
+            frontier_root(&storage_frontier),
+            init_transition.init_storage_root,
+            "Initial storage root does not match initial storage frontier",
         );
 
         Self {
             frontier,
-            internal_store_frontier,
-            internal_store_index_root: init_transition.init_internal_store_index_root.clone(),
+            storage_frontier,
+            storage_index_root: init_transition.init_storage_index_root.clone(),
             active_drafts: init_transition.active_drafts.clone(),
             fingerprint_acc: FingerprintAccumulator::new(init_transition.fingerprint.bits_packer),
             next_expected_coordinates: None,
@@ -206,18 +206,18 @@ impl LiveTransition {
     ) -> Self {
         let frontier =
             deserialize_frontier(&transition.frontier).expect("Invalid frontier in input");
-        let internal_store_frontier = deserialize_frontier(&transition.internal_store_frontier)
-            .expect("Invalid internal store frontier in input");
+        let storage_frontier = deserialize_frontier(&transition.storage_frontier)
+            .expect("Invalid storage frontier in input");
         assert_eq!(
-            frontier_root(&internal_store_frontier),
-            transition.internal_store_root,
-            "Transition internal store root does not match transition internal store frontier",
+            frontier_root(&storage_frontier),
+            transition.storage_root,
+            "Transition storage root does not match transition storage frontier",
         );
 
         Self {
             frontier,
-            internal_store_frontier,
-            internal_store_index_root: transition.internal_store_index_root.clone(),
+            storage_frontier,
+            storage_index_root: transition.storage_index_root.clone(),
             active_drafts: transition.active_drafts.clone(),
             fingerprint_acc: transition.actual_fingerprint_acc.clone(),
             next_expected_coordinates: Some(transition.next_expected_coordinates.clone()),
@@ -239,7 +239,7 @@ impl LiveTransition {
     ///   chain still owes,
     /// - recorded IO commitments match the witnesses, and tile steps carry
     ///   a verified replay proof,
-    /// - the internal store transition is consistent with the recorded roots,
+    /// - the storage transition is consistent with the recorded roots,
     /// - the step's coordinates are among the expected next coordinates,
     /// - the draft chain stays continuous,
     /// - the step record is appended to the trace frontier and fingerprint.
@@ -266,16 +266,16 @@ impl LiveTransition {
             input.output_witness.as_ref(),
             input.input_source_witness.as_ref(),
         );
-        let (_, _, next_index_root) = checks::store::verify_internal_store_transition(
+        let (_, _, next_index_root) = checks::store::verify_storage_transition(
             &input.step_record,
             input.input_source_witness.as_ref(),
-            &input.internal_selection_witnesses,
+            &input.storage_selection_witnesses,
             input.output_witness.as_ref(),
-            input.internal_store_witness.as_ref(),
-            &mut self.internal_store_frontier,
-            &self.internal_store_index_root,
+            input.storage_witness.as_ref(),
+            &mut self.storage_frontier,
+            &self.storage_index_root,
         );
-        self.internal_store_index_root = next_index_root;
+        self.storage_index_root = next_index_root;
         self.next_expected_coordinates = Some(checks::cfs::get_next_expected_coordinates(
             cfs_cursor,
             &input.step_record,
@@ -343,9 +343,9 @@ impl LiveTransition {
     fn into_transition(self) -> Transition {
         Transition {
             frontier: serialize_frontier(&self.frontier),
-            internal_store_frontier: serialize_frontier(&self.internal_store_frontier),
-            internal_store_root: frontier_root(&self.internal_store_frontier),
-            internal_store_index_root: self.internal_store_index_root,
+            storage_frontier: serialize_frontier(&self.storage_frontier),
+            storage_root: frontier_root(&self.storage_frontier),
+            storage_index_root: self.storage_index_root,
             active_drafts: self.active_drafts,
             actual_fingerprint_acc: self.fingerprint_acc,
             next_expected_coordinates: self

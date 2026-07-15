@@ -17,18 +17,18 @@ use raster_core::draft::{
 };
 use raster_core::input::{SchemaField, SchemaFieldMode, SchemaNode, Selectable};
 use raster_core::trace::{
-    FnInput, FnInputArg, FnInputValue, InternalData, SequenceEndRecord, SequenceStartRecord,
+    FnInput, FnInputArg, FnInputValue, StorageData, SequenceEndRecord, SequenceStartRecord,
     StepRecord, TileExecRecord,
 };
 use raster_core::transition::{
-    InternalStoreEntry, InternalStoreLogWitness, InternalStoreReadWitness, InternalStoreWitness,
-    InternalStoreWriteWitness, SerializableFrontier,
+    StorageEntry, StorageLogWitness, StorageReadWitness, StorageWitness,
+    StorageWriteWitness, SerializableFrontier,
 };
 
 use crate::checks::cfs::verify_step_record_inputs;
 use crate::checks::drafts::verify_draft_transition;
 use crate::checks::io::{input_source_commitment, verify_io_witness};
-use crate::checks::store::{internal_store_leaf_hash, verify_internal_store_transition};
+use crate::checks::store::{storage_leaf_hash, verify_storage_transition};
 use crate::merkle_tree::{
     deserialize_frontier, frontier_root, sha256_bytes, sha256_hex, Bytes, TraceBridgeTree,
     EMPTY_LEAF,
@@ -79,10 +79,10 @@ fn draft_tile_step(exec_index: u64) -> StepRecord {
         input_commitment: vec![exec_index as u8; 32],
         input_source_commitment: vec![0; 32],
         output_commitment: vec![1; 32],
-        internal_store_root_before: EMPTY_LEAF.to_vec(),
-        internal_store_root_after: EMPTY_LEAF.to_vec(),
-        internal_store_index_root_before: Vec::new(),
-        internal_store_index_root_after: Vec::new(),
+        storage_root_before: EMPTY_LEAF.to_vec(),
+        storage_root_after: EMPTY_LEAF.to_vec(),
+        storage_index_root_before: Vec::new(),
+        storage_index_root_after: Vec::new(),
     })
 }
 
@@ -95,8 +95,8 @@ fn authorization_journal(binding_name: &str, commitment: &[u8]) -> Authorization
     }
 }
 
-fn internal_input_witness(coordinates: CfsCoordinates, commitment: Vec<u8>) -> FnInput {
-    // A whole-object internal binding's commitment *is* its raster selection
+fn storage_input_witness(coordinates: CfsCoordinates, commitment: Vec<u8>) -> FnInput {
+    // A whole-object storage binding's commitment *is* its raster selection
     // root (see `checks::store`'s structural-consistency assertion), so the
     // fixture mirrors that invariant.
     let source_root_hash: [u8; 32] = commitment
@@ -105,14 +105,14 @@ fn internal_input_witness(coordinates: CfsCoordinates, commitment: Vec<u8>) -> F
         .expect("test commitments are 32 bytes");
     FnInput {
         data: Vec::new(),
-        values: vec![FnInputValue::InternalBinding],
+        values: vec![FnInputValue::StorageBinding],
         args: vec![FnInputArg {
             name: "arg".to_string(),
             ty: "Vec<u8>".to_string(),
         }],
-        internal: [(
+        storage: [(
             "arg".to_string(),
-            InternalData {
+            StorageData {
                 coordinates,
                 commitment,
                 selector: Default::default(),
@@ -176,10 +176,10 @@ fn verify_tile_commitments_accept_matching_recorded_io() {
         input_commitment: sha(b"in"),
         input_source_commitment: Vec::new(),
         output_commitment: sha(b"out"),
-        internal_store_root_before: vec![0; 32],
-        internal_store_root_after: vec![0; 32],
-        internal_store_index_root_before: Vec::new(),
-        internal_store_index_root_after: Vec::new(),
+        storage_root_before: vec![0; 32],
+        storage_root_after: vec![0; 32],
+        storage_index_root_before: Vec::new(),
+        storage_index_root_after: Vec::new(),
     });
 
     verify_io_witness(&step, Some(&b"in".to_vec()), Some(&b"out".to_vec()));
@@ -197,13 +197,13 @@ fn verify_step_record_inputs_accepts_sequence_descendant_producer_coordinates() 
         input_commitment: Vec::new(),
         input_source_commitment: Vec::new(),
         output_commitment: Vec::new(),
-        internal_store_root_before: Vec::new(),
-        internal_store_root_after: Vec::new(),
-        internal_store_index_root_before: Vec::new(),
-        internal_store_index_root_after: Vec::new(),
+        storage_root_before: Vec::new(),
+        storage_root_after: Vec::new(),
+        storage_index_root_before: Vec::new(),
+        storage_index_root_after: Vec::new(),
     });
     let input_source_witness =
-        internal_input_witness(CfsCoordinates(vec![0, 0]), sha(b"producer-output"));
+        storage_input_witness(CfsCoordinates(vec![0, 0]), sha(b"producer-output"));
 
     verify_step_record_inputs(&cfs_cursor, &step_record, Some(&input_source_witness), None);
 }
@@ -220,10 +220,10 @@ fn verify_tile_commitments_reject_mismatched_input() {
         input_commitment: sha(b"expected"),
         input_source_commitment: Vec::new(),
         output_commitment: sha(b"out"),
-        internal_store_root_before: vec![0; 32],
-        internal_store_root_after: vec![0; 32],
-        internal_store_index_root_before: Vec::new(),
-        internal_store_index_root_after: Vec::new(),
+        storage_root_before: vec![0; 32],
+        storage_root_after: vec![0; 32],
+        storage_index_root_before: Vec::new(),
+        storage_index_root_after: Vec::new(),
     });
 
     verify_io_witness(&step, Some(&b"actual".to_vec()), Some(&b"out".to_vec()));
@@ -249,31 +249,31 @@ fn verify_sequence_boundary_commitments_accept_matching_recorded_io() {
     verify_io_witness(&end, None, Some(&b"sequence-out".to_vec()));
 }
 
-fn empty_internal_store_frontier_for_test() -> NonEmptyFrontier<Bytes> {
+fn empty_storage_frontier_for_test() -> NonEmptyFrontier<Bytes> {
     deserialize_frontier(&SerializableFrontier {
         position: 0,
         leaf: EMPTY_LEAF.to_vec(),
         ommers: Vec::new(),
     })
-    .expect("empty internal store frontier should deserialize")
+    .expect("empty storage frontier should deserialize")
 }
 
-fn build_internal_store_context(
-    entries: &[InternalStoreEntry],
+fn build_storage_context(
+    entries: &[StorageEntry],
 ) -> (
     NonEmptyFrontier<Bytes>,
     Vec<u8>,
-    BTreeMap<CfsCoordinates, raster_core::transition::InternalStoreIndexValue>,
+    BTreeMap<CfsCoordinates, raster_core::transition::StorageIndexValue>,
     Vec<u8>,
 ) {
-    let mut frontier = empty_internal_store_frontier_for_test();
+    let mut frontier = empty_storage_frontier_for_test();
     let mut index = BTreeMap::new();
     for entry in entries {
-        frontier.append(Bytes(internal_store_leaf_hash(entry)));
+        frontier.append(Bytes(storage_leaf_hash(entry)));
         let log_position: u64 = frontier.position().into();
         index.insert(
             entry.coordinates.clone(),
-            raster_core::transition::InternalStoreIndexValue {
+            raster_core::transition::StorageIndexValue {
                 log_position,
                 object_commitment: entry.object_commitment.clone(),
             },
@@ -284,15 +284,15 @@ fn build_internal_store_context(
     (frontier, root, index, index_root)
 }
 
-fn build_internal_store_log_witness_for_entries(
-    entries: &[InternalStoreEntry],
+fn build_storage_log_witness_for_entries(
+    entries: &[StorageEntry],
     log_position: u64,
-) -> InternalStoreLogWitness {
+) -> StorageLogWitness {
     let mut tree = TraceBridgeTree::new(1);
     tree.append(Bytes(EMPTY_LEAF.to_vec()));
     let mut marked_position = None;
     for (index, entry) in entries.iter().enumerate() {
-        tree.append(Bytes(internal_store_leaf_hash(entry)));
+        tree.append(Bytes(storage_leaf_hash(entry)));
         if u64::try_from(index).expect("index overflow") + 1 == log_position {
             marked_position = tree.mark();
         }
@@ -301,22 +301,22 @@ fn build_internal_store_log_witness_for_entries(
     let auth_path = tree
         .witness(marked_position, 0)
         .expect("append-log witness should exist");
-    InternalStoreLogWitness {
+    StorageLogWitness {
         position: u64::from(marked_position),
         path_elems: auth_path.iter().map(|elem| elem.0.clone()).collect(),
     }
 }
 
 fn build_read_witness(
-    entries: &[InternalStoreEntry],
-    entry: &InternalStoreEntry,
-) -> InternalStoreReadWitness {
-    let (_frontier, _root, index, _index_root) = build_internal_store_context(entries);
+    entries: &[StorageEntry],
+    entry: &StorageEntry,
+) -> StorageReadWitness {
+    let (_frontier, _root, index, _index_root) = build_storage_context(entries);
     let index_witness = coordinate_index_membership_proof(&index, &entry.coordinates)
         .expect("membership proof should exist");
     let log_witness =
-        build_internal_store_log_witness_for_entries(entries, index_witness.value.log_position);
-    InternalStoreReadWitness {
+        build_storage_log_witness_for_entries(entries, index_witness.value.log_position);
+    StorageReadWitness {
         entry: entry.clone(),
         log_witness,
         index_witness,
@@ -324,16 +324,16 @@ fn build_read_witness(
 }
 
 fn build_write_witness(
-    before_entries: &[InternalStoreEntry],
-    new_entry: &InternalStoreEntry,
-) -> InternalStoreWriteWitness {
+    before_entries: &[StorageEntry],
+    new_entry: &StorageEntry,
+) -> StorageWriteWitness {
     let (_frontier, _root, before_index, _before_index_root) =
-        build_internal_store_context(before_entries);
+        build_storage_context(before_entries);
     let mut after_entries = before_entries.to_vec();
     after_entries.push(new_entry.clone());
     let (_frontier, _root, after_index, _after_index_root) =
-        build_internal_store_context(&after_entries);
-    InternalStoreWriteWitness {
+        build_storage_context(&after_entries);
+    StorageWriteWitness {
         entry: new_entry.clone(),
         index_non_membership_witness: coordinate_index_non_membership_proof(
             &before_index,
@@ -366,24 +366,24 @@ fn tile_step_with_store_roots(
         input_commitment: Vec::new(),
         input_source_commitment,
         output_commitment,
-        internal_store_root_before: root_before,
-        internal_store_root_after: root_after,
-        internal_store_index_root_before: index_root_before,
-        internal_store_index_root_after: index_root_after,
+        storage_root_before: root_before,
+        storage_root_after: root_after,
+        storage_index_root_before: index_root_before,
+        storage_index_root_after: index_root_after,
     })
 }
 
 #[test]
-fn verify_internal_store_transition_uses_output_commitment_as_keyed_entry() {
+fn verify_storage_transition_uses_output_commitment_as_keyed_entry() {
     let output_commitment = sha(b"out");
-    let new_entry = InternalStoreEntry {
+    let new_entry = StorageEntry {
         coordinates: CfsCoordinates(vec![0]),
         object_commitment: output_commitment.clone(),
     };
     let (mut before_frontier, root_before, _before_index, index_root_before) =
-        build_internal_store_context(&[]);
+        build_storage_context(&[]);
     let (_after_frontier, root_after, _after_index, index_root_after) =
-        build_internal_store_context(&[new_entry.clone()]);
+        build_storage_context(&[new_entry.clone()]);
     let step = tile_step_with_store_roots(
         1,
         new_entry.coordinates.clone(),
@@ -394,12 +394,12 @@ fn verify_internal_store_transition_uses_output_commitment_as_keyed_entry() {
         index_root_before.clone(),
         index_root_after.clone(),
     );
-    let witness = InternalStoreWitness {
+    let witness = StorageWitness {
         reads: Vec::new(),
         write: Some(build_write_witness(&[], &new_entry)),
     };
 
-    let (_next_frontier, next_root, next_index_root) = verify_internal_store_transition(
+    let (_next_frontier, next_root, next_index_root) = verify_storage_transition(
         &step,
         None,
         &BTreeMap::new(),
@@ -415,13 +415,13 @@ fn verify_internal_store_transition_uses_output_commitment_as_keyed_entry() {
 
 #[test]
 #[should_panic(expected = "Coordinate-index non-membership proof is invalid before write")]
-fn verify_internal_store_transition_rejects_duplicate_coordinates() {
-    let existing_entry = InternalStoreEntry {
+fn verify_storage_transition_rejects_duplicate_coordinates() {
+    let existing_entry = StorageEntry {
         coordinates: CfsCoordinates(vec![0]),
         object_commitment: sha(b"existing"),
     };
     let (mut before_frontier, root_before, before_index, index_root_before) =
-        build_internal_store_context(&[existing_entry.clone()]);
+        build_storage_context(&[existing_entry.clone()]);
     let step = tile_step_with_store_roots(
         1,
         existing_entry.coordinates.clone(),
@@ -432,10 +432,10 @@ fn verify_internal_store_transition_rejects_duplicate_coordinates() {
         index_root_before.clone(),
         index_root_before.clone(),
     );
-    let witness = InternalStoreWitness {
+    let witness = StorageWitness {
         reads: Vec::new(),
-        write: Some(InternalStoreWriteWitness {
-            entry: InternalStoreEntry {
+        write: Some(StorageWriteWitness {
+            entry: StorageEntry {
                 coordinates: existing_entry.coordinates.clone(),
                 object_commitment: sha(b"out"),
             },
@@ -452,7 +452,7 @@ fn verify_internal_store_transition_rejects_duplicate_coordinates() {
         }),
     };
 
-    let _ = verify_internal_store_transition(
+    let _ = verify_storage_transition(
         &step,
         None,
         &BTreeMap::new(),
@@ -465,22 +465,22 @@ fn verify_internal_store_transition_rejects_duplicate_coordinates() {
 
 #[test]
 #[should_panic(
-    expected = "Missing internal store read witness for coordinates CfsCoordinates([0])"
+    expected = "Missing storage read witness for coordinates CfsCoordinates([0])"
 )]
-fn verify_internal_store_transition_rejects_wrong_coordinates_with_correct_bytes() {
-    let prior_entry = InternalStoreEntry {
+fn verify_storage_transition_rejects_wrong_coordinates_with_correct_bytes() {
+    let prior_entry = StorageEntry {
         coordinates: CfsCoordinates(vec![9]),
         object_commitment: sha(b"shared"),
     };
-    let new_entry = InternalStoreEntry {
+    let new_entry = StorageEntry {
         coordinates: CfsCoordinates(vec![1]),
         object_commitment: sha(b"out"),
     };
     let (mut before_frontier, root_before, _before_index, index_root_before) =
-        build_internal_store_context(&[prior_entry.clone()]);
+        build_storage_context(&[prior_entry.clone()]);
     let (_after_frontier, root_after, _after_index, index_root_after) =
-        build_internal_store_context(&[prior_entry.clone(), new_entry.clone()]);
-    let input_source_witness = internal_input_witness(
+        build_storage_context(&[prior_entry.clone(), new_entry.clone()]);
+    let input_source_witness = storage_input_witness(
         CfsCoordinates(vec![0]),
         prior_entry.object_commitment.clone(),
     );
@@ -494,12 +494,12 @@ fn verify_internal_store_transition_rejects_wrong_coordinates_with_correct_bytes
         index_root_before.clone(),
         index_root_after,
     );
-    let witness = InternalStoreWitness {
+    let witness = StorageWitness {
         reads: vec![build_read_witness(&[prior_entry.clone()], &prior_entry)],
         write: Some(build_write_witness(&[prior_entry], &new_entry)),
     };
 
-    let _ = verify_internal_store_transition(
+    let _ = verify_storage_transition(
         &step,
         Some(&input_source_witness),
         &BTreeMap::new(),
@@ -512,17 +512,17 @@ fn verify_internal_store_transition_rejects_wrong_coordinates_with_correct_bytes
 
 #[test]
 #[should_panic(
-    expected = "Execution-step internal store root before does not match current internal store root"
+    expected = "Execution-step storage root before does not match current storage root"
 )]
-fn verify_internal_store_transition_rejects_stale_root() {
-    let new_entry = InternalStoreEntry {
+fn verify_storage_transition_rejects_stale_root() {
+    let new_entry = StorageEntry {
         coordinates: CfsCoordinates(vec![0]),
         object_commitment: sha(b"out"),
     };
     let (_before_frontier, root_before, _before_index, index_root_before) =
-        build_internal_store_context(&[]);
+        build_storage_context(&[]);
     let (_after_frontier, root_after, _after_index, index_root_after) =
-        build_internal_store_context(&[new_entry.clone()]);
+        build_storage_context(&[new_entry.clone()]);
     let step = tile_step_with_store_roots(
         3,
         new_entry.coordinates.clone(),
@@ -533,18 +533,18 @@ fn verify_internal_store_transition_rejects_stale_root() {
         index_root_before.clone(),
         index_root_after,
     );
-    let stale_entry = InternalStoreEntry {
+    let stale_entry = StorageEntry {
         coordinates: CfsCoordinates(vec![99]),
         object_commitment: sha(b"stale"),
     };
     let (mut stale_frontier, _stale_root, _stale_index, _stale_index_root) =
-        build_internal_store_context(&[stale_entry]);
-    let witness = InternalStoreWitness {
+        build_storage_context(&[stale_entry]);
+    let witness = StorageWitness {
         reads: Vec::new(),
         write: Some(build_write_witness(&[], &new_entry)),
     };
 
-    let _ = verify_internal_store_transition(
+    let _ = verify_storage_transition(
         &step,
         None,
         &BTreeMap::new(),
@@ -557,17 +557,17 @@ fn verify_internal_store_transition_rejects_stale_root() {
 
 #[test]
 #[should_panic(
-    expected = "Execution-step internal store index root before does not match current index root"
+    expected = "Execution-step storage index root before does not match current index root"
 )]
-fn verify_internal_store_transition_rejects_stale_index_root() {
-    let new_entry = InternalStoreEntry {
+fn verify_storage_transition_rejects_stale_index_root() {
+    let new_entry = StorageEntry {
         coordinates: CfsCoordinates(vec![0]),
         object_commitment: sha(b"out"),
     };
     let (mut before_frontier, root_before, _before_index, index_root_before) =
-        build_internal_store_context(&[]);
+        build_storage_context(&[]);
     let (_after_frontier, root_after, _after_index, index_root_after) =
-        build_internal_store_context(&[new_entry.clone()]);
+        build_storage_context(&[new_entry.clone()]);
     let step = tile_step_with_store_roots(
         33,
         new_entry.coordinates.clone(),
@@ -578,12 +578,12 @@ fn verify_internal_store_transition_rejects_stale_index_root() {
         index_root_before.clone(),
         index_root_after,
     );
-    let witness = InternalStoreWitness {
+    let witness = StorageWitness {
         reads: Vec::new(),
         write: Some(build_write_witness(&[], &new_entry)),
     };
 
-    let _ = verify_internal_store_transition(
+    let _ = verify_storage_transition(
         &step,
         None,
         &BTreeMap::new(),
@@ -595,20 +595,20 @@ fn verify_internal_store_transition_rejects_stale_index_root() {
 }
 
 #[test]
-fn verify_internal_store_transition_accepts_non_empty_initial_state() {
-    let prior_entry = InternalStoreEntry {
+fn verify_storage_transition_accepts_non_empty_initial_state() {
+    let prior_entry = StorageEntry {
         coordinates: CfsCoordinates(vec![0]),
         object_commitment: sha(b"prior"),
     };
-    let new_entry = InternalStoreEntry {
+    let new_entry = StorageEntry {
         coordinates: CfsCoordinates(vec![1]),
         object_commitment: sha(b"next"),
     };
     let (mut before_frontier, root_before, _before_index, index_root_before) =
-        build_internal_store_context(&[prior_entry.clone()]);
+        build_storage_context(&[prior_entry.clone()]);
     let (_after_frontier, root_after, _after_index, index_root_after) =
-        build_internal_store_context(&[prior_entry.clone(), new_entry.clone()]);
-    let input_source_witness = internal_input_witness(
+        build_storage_context(&[prior_entry.clone(), new_entry.clone()]);
+    let input_source_witness = storage_input_witness(
         prior_entry.coordinates.clone(),
         prior_entry.object_commitment.clone(),
     );
@@ -622,12 +622,12 @@ fn verify_internal_store_transition_accepts_non_empty_initial_state() {
         index_root_before.clone(),
         index_root_after.clone(),
     );
-    let witness = InternalStoreWitness {
+    let witness = StorageWitness {
         reads: vec![build_read_witness(&[prior_entry.clone()], &prior_entry)],
         write: Some(build_write_witness(&[prior_entry], &new_entry)),
     };
 
-    let (_next_frontier, next_root, next_index_root) = verify_internal_store_transition(
+    let (_next_frontier, next_root, next_index_root) = verify_storage_transition(
         &step,
         Some(&input_source_witness),
         &BTreeMap::new(),
@@ -872,10 +872,10 @@ fn entrypoint_record(names: Vec<String>, output_commitment: Vec<u8>) -> Entrypoi
         op: EntrypointOp::BindEntryArguments { names },
         input_source_commitment: vec![0; 32],
         output_commitment,
-        internal_store_root_before: EMPTY_LEAF.to_vec(),
-        internal_store_root_after: EMPTY_LEAF.to_vec(),
-        internal_store_index_root_before: Vec::new(),
-        internal_store_index_root_after: Vec::new(),
+        storage_root_before: EMPTY_LEAF.to_vec(),
+        storage_root_after: EMPTY_LEAF.to_vec(),
+        storage_index_root_before: Vec::new(),
+        storage_index_root_after: Vec::new(),
     }
 }
 
@@ -996,7 +996,7 @@ fn genesis_authorization_is_not_required_when_cfs_declares_no_entry_arguments() 
 fn genesis_authorization_rejects_unnecessary_witness_when_no_entry_arguments_declared() {
     let cfs_cursor = no_entrypoint_cfs();
     let journal = two_arg_authorization_journal(&sha(b"a"), &sha(b"b"));
-    let entry = InternalStoreEntry {
+    let entry = StorageEntry {
         coordinates: CfsCoordinates(vec![0]),
         object_commitment: sha(b"unused"),
     };
@@ -1014,11 +1014,11 @@ fn genesis_authorization_accepts_valid_trace_inclusion_witness() {
     let cfs_cursor = entrypoint_cfs(names.clone());
     let expected_root = combined_root(&names, &journal);
 
-    let entry = InternalStoreEntry {
+    let entry = StorageEntry {
         coordinates: CfsCoordinates(vec![0]),
         object_commitment: expected_root,
     };
-    let (_frontier, root, _index, index_root) = build_internal_store_context(&[entry.clone()]);
+    let (_frontier, root, _index, index_root) = build_storage_context(&[entry.clone()]);
     let witness = build_read_witness(&[entry.clone()], &entry);
 
     assert_eq!(
@@ -1069,12 +1069,12 @@ fn genesis_authorization_rejects_forged_coordinate_zero_commitment() {
 
     // Forge an entry at coordinates [0] whose commitment was never
     // authorized against the journal.
-    let forged_entry = InternalStoreEntry {
+    let forged_entry = StorageEntry {
         coordinates: CfsCoordinates(vec![0]),
         object_commitment: sha(b"forged-combined-root"),
     };
     let (_frontier, root, _index, index_root) =
-        build_internal_store_context(&[forged_entry.clone()]);
+        build_storage_context(&[forged_entry.clone()]);
     let witness = build_read_witness(&[forged_entry.clone()], &forged_entry);
 
     verify_genesis_authorization(&cfs_cursor, &root, &index_root, &journal, Some(&witness));

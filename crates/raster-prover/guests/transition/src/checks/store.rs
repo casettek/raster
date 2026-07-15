@@ -1,4 +1,4 @@
-//! Checks the internal store transition of an execution step: read witnesses
+//! Checks the storage transition of an execution step: read witnesses
 //! (append-log path + coordinate-index membership + selection witnesses) and
 //! the optional write witness (non-membership before, membership after),
 //! against the recorded before/after roots.
@@ -12,25 +12,25 @@ use raster_core::coordinate_index::{
     verify_coordinate_index_membership, verify_coordinate_index_non_membership,
 };
 use raster_core::input::verify_selection_witness;
-use raster_core::trace::{FnInput, InternalStoreRoots, StepRecord};
+use raster_core::trace::{FnInput, StepRecord, StorageRoots};
 use raster_core::transition::{
-    InternalStoreEntry, InternalStoreLogWitness, InternalStoreReadWitness, InternalStoreWitness,
-    InternalStoreWriteWitness, SerializableFrontier,
+    SerializableFrontier, StorageEntry, StorageLogWitness, StorageReadWitness, StorageWitness,
+    StorageWriteWitness,
 };
 
 use crate::merkle_tree::{
     combine_merkle_level, frontier_root, serialize_frontier, sha256_bytes, Bytes,
 };
 
-pub fn internal_store_leaf_hash(entry: &InternalStoreEntry) -> Vec<u8> {
+pub fn storage_leaf_hash(entry: &StorageEntry) -> Vec<u8> {
     sha256_bytes(&entry.to_bytes())
 }
 
 fn append_log_root_from_witness(
-    entry: &InternalStoreEntry,
-    witness: &InternalStoreLogWitness,
+    entry: &StorageEntry,
+    witness: &StorageLogWitness,
 ) -> Vec<u8> {
-    let mut current = internal_store_leaf_hash(entry);
+    let mut current = storage_leaf_hash(entry);
     for (level, sibling) in witness.path_elems.iter().enumerate() {
         current = if ((witness.position >> level) & 1) == 0 {
             combine_merkle_level(level, &current, sibling)
@@ -44,11 +44,11 @@ fn append_log_root_from_witness(
 /// Verify a trace-inclusion (append-log + coordinate-index membership) proof
 /// that `coordinates` commits to `commitment` in the store rooted at
 /// `current_log_root`/`current_index_root`. Shared by ordinary per-step
-/// internal-store reads and by the fraud-proof genesis check that a
-/// window's initial internal-store state really contains an authorized
+/// storage reads and by the fraud-proof genesis check that a
+/// window's initial storage state really contains an authorized
 /// entry-argument binding (see `checks::entrypoint`).
-pub(crate) fn verify_internal_store_read_witness(
-    read_witness: &InternalStoreReadWitness,
+pub(crate) fn verify_storage_read_witness(
+    read_witness: &StorageReadWitness,
     current_log_root: &[u8],
     current_index_root: &[u8],
     coordinates: &CfsCoordinates,
@@ -56,23 +56,23 @@ pub(crate) fn verify_internal_store_read_witness(
 ) {
     assert_eq!(
         read_witness.entry.coordinates, *coordinates,
-        "Internal store read witness coordinates do not match requested coordinates",
+        "Storage read witness coordinates do not match requested coordinates",
     );
     assert_eq!(
         read_witness.entry.object_commitment, commitment,
-        "Internal store read witness commitment does not match requested commitment",
+        "Storage read witness commitment does not match requested commitment",
     );
     assert!(
         verify_coordinate_index_membership(current_index_root, &read_witness.index_witness),
-        "Internal store coordinate-index membership proof is invalid",
+        "Storage coordinate-index membership proof is invalid",
     );
     assert_eq!(
         read_witness.index_witness.coordinates, *coordinates,
-        "Coordinate-index witness coordinates do not match internal input",
+        "Coordinate-index witness coordinates do not match storage input",
     );
     assert_eq!(
         read_witness.index_witness.value.object_commitment, commitment,
-        "Coordinate-index witness commitment does not match internal input commitment",
+        "Coordinate-index witness commitment does not match storage input commitment",
     );
     assert_eq!(
         read_witness.index_witness.value.log_position, read_witness.log_witness.position,
@@ -81,20 +81,20 @@ pub(crate) fn verify_internal_store_read_witness(
     assert_eq!(
         append_log_root_from_witness(&read_witness.entry, &read_witness.log_witness),
         current_log_root,
-        "Append-log witness does not match current internal store root",
+        "Append-log witness does not match current storage root",
     );
 }
 
-fn verify_internal_store_write_witness(
-    write_witness: &InternalStoreWriteWitness,
+fn verify_storage_write_witness(
+    write_witness: &StorageWriteWitness,
     current_index_root: &[u8],
     next_index_root: &[u8],
-    expected_entry: &InternalStoreEntry,
+    expected_entry: &StorageEntry,
     expected_log_position: u64,
 ) {
     assert_eq!(
         write_witness.entry, *expected_entry,
-        "Internal store write witness entry does not match expected append entry",
+        "Storage write witness entry does not match expected append entry",
     );
     assert_eq!(
         write_witness.index_non_membership_witness.coordinates, expected_entry.coordinates,
@@ -137,78 +137,78 @@ fn verify_internal_store_write_witness(
     );
 }
 
-pub fn verify_internal_store_transition(
+pub fn verify_storage_transition(
     step_record: &StepRecord,
     input_source_witness: Option<&FnInput>,
-    internal_selection_witnesses: &BTreeMap<String, raster_core::input::SelectionWitness>,
+    storage_selection_witnesses: &BTreeMap<String, raster_core::input::SelectionWitness>,
     _output_witness_bytes: Option<&Vec<u8>>,
-    internal_store_witness: Option<&InternalStoreWitness>,
+    storage_witness: Option<&StorageWitness>,
     current_frontier: &mut NonEmptyFrontier<Bytes>,
     current_index_root: &[u8],
 ) -> (SerializableFrontier, Vec<u8>, Vec<u8>) {
-    if let Some(InternalStoreRoots {
-        root_before: internal_store_root_before,
-        root_after: internal_store_root_after,
-        index_root_before: internal_store_index_root_before,
-        index_root_after: internal_store_index_root_after,
-    }) = step_record.internal_store_roots()
+    if let Some(StorageRoots {
+        root_before: storage_root_before,
+        root_after: storage_root_after,
+        index_root_before: storage_index_root_before,
+        index_root_after: storage_index_root_after,
+    }) = step_record.storage_roots()
     {
         let current_root = frontier_root(current_frontier);
         assert_eq!(
-            internal_store_root_before, &current_root,
-            "Execution-step internal store root before does not match current internal store root",
+            storage_root_before, &current_root,
+            "Execution-step storage root before does not match current storage root",
         );
         assert_eq!(
-            internal_store_index_root_before, &current_index_root,
-            "Execution-step internal store index root before does not match current index root",
+            storage_index_root_before, &current_index_root,
+            "Execution-step storage index root before does not match current index root",
         );
 
         if let Some(input_source_witness) = input_source_witness {
-            for (binding_name, internal_meta) in input_source_witness.internal() {
-                let read_witness = internal_store_witness
+            for (binding_name, storage_meta) in input_source_witness.storage() {
+                let read_witness = storage_witness
                     .and_then(|witness| {
                         witness.reads.iter().find(|read| {
-                            read.entry.coordinates == internal_meta.coordinates
-                                && read.entry.object_commitment == internal_meta.commitment
+                            read.entry.coordinates == storage_meta.coordinates
+                                && read.entry.object_commitment == storage_meta.commitment
                         })
                     })
                     .unwrap_or_else(|| {
                         panic!(
-                            "Missing internal store read witness for coordinates {:?}",
-                            internal_meta.coordinates
+                            "Missing storage read witness for coordinates {:?}",
+                            storage_meta.coordinates
                         )
                     });
-                verify_internal_store_read_witness(
+                verify_storage_read_witness(
                     read_witness,
                     &current_root,
                     current_index_root,
-                    &internal_meta.coordinates,
-                    &internal_meta.commitment,
+                    &storage_meta.coordinates,
+                    &storage_meta.commitment,
                 );
                 assert_eq!(
-                    internal_meta.commitment, internal_meta.selection.source_root_hash,
-                    "Internal input '{}' commitment must match raster selection root",
+                    storage_meta.commitment, storage_meta.selection.source_root_hash,
+                    "Storage input '{}' commitment must match raster selection root",
                     binding_name,
                 );
-                if internal_meta.selection.selected_len > 0 {
-                    let witness = internal_selection_witnesses
+                if storage_meta.selection.selected_len > 0 {
+                    let witness = storage_selection_witnesses
                         .get(binding_name.as_str())
                         .unwrap_or_else(|| {
                             panic!(
-                                "Missing internal selection witness for binding '{}'",
+                                "Missing storage selection witness for binding '{}'",
                                 binding_name
                             )
                         });
                     assert!(
-                        verify_selection_witness(&internal_meta.selection, witness),
-                        "Internal input '{}' selection witness is invalid",
+                        verify_selection_witness(&storage_meta.selection, witness),
+                        "Storage input '{}' selection witness is invalid",
                         binding_name,
                     );
                 }
             }
         }
 
-        let write_witness = internal_store_witness.and_then(|witness| witness.write.as_ref());
+        let write_witness = storage_witness.and_then(|witness| witness.write.as_ref());
 
         match write_witness {
             Some(write_witness) => {
@@ -217,39 +217,39 @@ pub fn verify_internal_store_transition(
                     .expect("Execution step must expose output commitment")
                     .clone();
 
-                let expected_entry = InternalStoreEntry {
+                let expected_entry = StorageEntry {
                     coordinates: step_record.coordinates().clone(),
                     object_commitment,
                 };
-                current_frontier.append(Bytes(internal_store_leaf_hash(&expected_entry)));
+                current_frontier.append(Bytes(storage_leaf_hash(&expected_entry)));
                 let next_root = frontier_root(current_frontier);
                 let next_position: u64 = current_frontier.position().into();
-                verify_internal_store_write_witness(
+                verify_storage_write_witness(
                     write_witness,
                     current_index_root,
-                    internal_store_index_root_after,
+                    storage_index_root_after,
                     &expected_entry,
                     next_position,
                 );
                 assert_eq!(
-                    internal_store_root_after, &next_root,
-                    "Execution-step internal store root after does not match appended internal store root",
+                    storage_root_after, &next_root,
+                    "Execution-step storage root after does not match appended storage root",
                 );
 
                 (
                     serialize_frontier(current_frontier),
                     next_root,
-                    internal_store_index_root_after.clone(),
+                    storage_index_root_after.clone(),
                 )
             }
             None => {
                 assert_eq!(
-                    internal_store_root_before, internal_store_root_after,
-                    "Execution-step without internal store write must leave append-log root unchanged",
+                    storage_root_before, storage_root_after,
+                    "Execution-step without storage write must leave append-log root unchanged",
                 );
                 assert_eq!(
-                    internal_store_index_root_before, internal_store_index_root_after,
-                    "Execution-step without internal store write must leave index root unchanged",
+                    storage_index_root_before, storage_index_root_after,
+                    "Execution-step without storage write must leave index root unchanged",
                 );
                 (
                     serialize_frontier(current_frontier),
@@ -260,8 +260,8 @@ pub fn verify_internal_store_transition(
         }
     } else {
         assert!(
-            internal_store_witness.is_none(),
-            "Only execution steps may carry internal store witnesses",
+            storage_witness.is_none(),
+            "Only execution steps may carry storage witnesses",
         );
         (
             serialize_frontier(current_frontier),

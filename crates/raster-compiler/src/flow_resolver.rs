@@ -60,7 +60,11 @@ impl FlowResolver {
             .cloned()
             .collect();
 
-        let item_index_offset = if entry_argument_names.is_empty() { 0 } else { 1 };
+        let item_index_offset = if entry_argument_names.is_empty() {
+            0
+        } else {
+            1
+        };
 
         if entry_argument_names.is_empty() {
             // Map sequence parameters to their indices
@@ -557,8 +561,8 @@ mod tests {
         };
 
         let mut resolver = FlowResolver::new();
-        let items = resolver
-            .resolve_with_entry_arguments(&sequence, &["personal_data".to_string()]);
+        let items =
+            resolver.resolve_with_entry_arguments(&sequence, &["personal_data".to_string()]);
 
         match &items[0] {
             SequenceChildItem::Tile(tile_item) => match &tile_item.sources[0] {

@@ -345,18 +345,18 @@ fn gen_auth_value_materialization(input: &ItemFn) -> proc_macro2::TokenStream {
                             let __raster_auth_value_duration_ns =
                                 ::core::primitive::u64::try_from(__raster_auth_value_start.elapsed().as_nanos())
                                     .unwrap_or(::core::primitive::u64::MAX);
-                            if __raster_auth_value.as_internal().is_some() {
-                                __raster_internal_input_resolve_ns = __raster_internal_input_resolve_ns
+                            if __raster_auth_value.as_storage().is_some() {
+                                __raster_storage_input_resolve_ns = __raster_storage_input_resolve_ns
                                     .saturating_add(__raster_auth_value_duration_ns);
                             }
-                            let #internal_info_ident = __raster_auth_value.as_internal().cloned();
+                            let #internal_info_ident = __raster_auth_value.as_storage().cloned();
                             let #name: #value_ty = __raster_auth_value.into_inner();
                         }
                     } else {
                         quote! {
                             let __raster_auth_value = ::raster::into_auth_value::<#value_ty, _>(#name)
                                 .unwrap_or_else(|e| panic!("Failed to materialize auth value for argument '{}': {}", stringify!(#name), e));
-                            let #internal_info_ident = __raster_auth_value.as_internal().cloned();
+                            let #internal_info_ident = __raster_auth_value.as_storage().cloned();
                             let #name: #value_ty = __raster_auth_value.into_inner();
                         }
                     }
@@ -365,7 +365,7 @@ fn gen_auth_value_materialization(input: &ItemFn) -> proc_macro2::TokenStream {
                     let schema_ty = draft_param_schema(param).expect("draft schema type");
                     quote! {
                         let #name: #value_ty = ::raster::into_draft::<#schema_ty, _>(#name);
-                        let #internal_info_ident: ::core::option::Option<::raster::InternalValue<#value_ty>> = ::core::option::Option::None;
+                        let #internal_info_ident: ::core::option::Option<::raster::StorageValue<#value_ty>> = ::core::option::Option::None;
                     }
                 },
             }
@@ -390,7 +390,7 @@ fn gen_sequence_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream 
                 let __raster_auth_trace = ::raster::auth_ref_trace(&#name)
                     .unwrap_or_else(|e| panic!("Failed to trace sequence argument '{}': {}", stringify!(#name), e));
                 let #trace_value_ident = __raster_auth_trace.value;
-                let #internal_info_ident = __raster_auth_trace.internal;
+                let #internal_info_ident = __raster_auth_trace.storage;
             }
         })
         .collect();
@@ -465,7 +465,7 @@ fn gen_sequence_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream 
                 data: __raster_input_bytes,
                 values: ::raster::alloc::vec![#(#trace_values.clone()),*],
                 args: __raster_input_args,
-                internal: __raster_internal,
+                storage: __raster_internal,
             }
         );
     }
@@ -500,14 +500,14 @@ fn gen_recur_sequence_input_serialization(input: &ItemFn) -> proc_macro2::TokenS
                     let __raster_auth_trace = #name.__raster_auth_trace()
                         .unwrap_or_else(|e| panic!("Failed to trace recursive sequence input '{}': {}", stringify!(#name), e));
                     let #trace_value_ident = __raster_auth_trace.value;
-                    let #internal_info_ident = __raster_auth_trace.internal;
+                    let #internal_info_ident = __raster_auth_trace.storage;
                 }
             } else if let Some(schema_ty) = draft_param_schema(param) {
                 quote! {
                     let #trace_value_ident = ::raster::core::trace::FnInputValue::Inline(
                         ::raster::serialize_draft_replay_handle::<#schema_ty>(&#name)
                     );
-                    let #internal_info_ident: ::core::option::Option<::raster::core::trace::InternalData> =
+                    let #internal_info_ident: ::core::option::Option<::raster::core::trace::StorageData> =
                         ::core::option::Option::None;
                 }
             } else if recur_sequence_output_inner_type(&param.ty).is_some() {
@@ -515,7 +515,7 @@ fn gen_recur_sequence_input_serialization(input: &ItemFn) -> proc_macro2::TokenS
                     let #trace_value_ident = ::raster::core::trace::FnInputValue::Inline(
                         #name.__raster_serialize_replay_handle()
                     );
-                    let #internal_info_ident: ::core::option::Option<::raster::core::trace::InternalData> =
+                    let #internal_info_ident: ::core::option::Option<::raster::core::trace::StorageData> =
                         ::core::option::Option::None;
                 }
             } else if recur_sequence_state_inner_type(&param.ty).is_some() {
@@ -523,7 +523,7 @@ fn gen_recur_sequence_input_serialization(input: &ItemFn) -> proc_macro2::TokenS
                     let #trace_value_ident = ::raster::core::trace::FnInputValue::Inline(
                         ::raster::core::postcard::to_allocvec(&#name).unwrap_or_default()
                     );
-                    let #internal_info_ident: ::core::option::Option<::raster::core::trace::InternalData> =
+                    let #internal_info_ident: ::core::option::Option<::raster::core::trace::StorageData> =
                         ::core::option::Option::None;
                 }
             } else {
@@ -531,7 +531,7 @@ fn gen_recur_sequence_input_serialization(input: &ItemFn) -> proc_macro2::TokenS
                     let __raster_auth_trace = ::raster::auth_ref_trace(&#name)
                         .unwrap_or_else(|e| panic!("Failed to trace recursive sequence argument '{}': {}", stringify!(#name), e));
                     let #trace_value_ident = __raster_auth_trace.value;
-                    let #internal_info_ident = __raster_auth_trace.internal;
+                    let #internal_info_ident = __raster_auth_trace.storage;
                 }
             }
         })
@@ -591,7 +591,7 @@ fn gen_recur_sequence_input_serialization(input: &ItemFn) -> proc_macro2::TokenS
                 data: __raster_input_bytes,
                 values: ::raster::alloc::vec![#(#trace_values.clone()),*],
                 args: __raster_input_args,
-                internal: __raster_internal,
+                storage: __raster_internal,
             }
         );
     }
@@ -1225,7 +1225,7 @@ fn gen_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream {
             match param_protocol_kind(&param.ty) {
                 ParamProtocolKind::AuthValue(_) => quote! {
                     let #trace_value_ident = if #internal_info_ident.is_some() {
-                        ::raster::core::trace::FnInputValue::InternalBinding
+                        ::raster::core::trace::FnInputValue::StorageBinding
                     } else {
                         ::raster::core::trace::FnInputValue::Inline(
                             ::raster::core::postcard::to_allocvec(&#name).unwrap_or_default()
@@ -1278,7 +1278,7 @@ fn gen_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream {
                 if let ::core::option::Option::Some(__raster_internal_info) = &#internal_info_ident {
                     __raster_internal.insert(
                         ::raster::alloc::string::String::from(#name_str),
-                        ::raster::core::trace::InternalData {
+                        ::raster::core::trace::StorageData {
                             coordinates: __raster_internal_info.reference.coordinates.clone(),
                             commitment: __raster_internal_info.reference.commitment.clone(),
                             selector: __raster_internal_info.selector.clone(),
@@ -1346,7 +1346,7 @@ fn gen_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream {
                 data: __raster_input_bytes,
                 values: ::raster::alloc::vec![#(#trace_values),*],
                 args: __raster_input_args,
-                internal: __raster_internal,
+                storage: __raster_internal,
             }
         );
     }
@@ -2056,7 +2056,7 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
             #(#fn_attrs)*
             #fn_vis #exposed_sig {
                 let mut __raster_external_input_resolve_ns: ::core::primitive::u64 = 0;
-                let mut __raster_internal_input_resolve_ns: ::core::primitive::u64 = 0;
+                let mut __raster_storage_input_resolve_ns: ::core::primitive::u64 = 0;
                 #auth_value_materialization
 
                 #[cfg(all(feature = "std", not(target_arch = "riscv32")))]
@@ -2142,14 +2142,14 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
                             .unwrap_or(::core::primitive::u64::MAX);
                     let __raster_total_duration_ns = __raster_wrapper_duration_ns
                         .saturating_add(__raster_external_input_resolve_ns)
-                        .saturating_add(__raster_internal_input_resolve_ns);
+                        .saturating_add(__raster_storage_input_resolve_ns);
                     ::raster::__private::record_tile_profile(
                         #fn_name_str,
                         __raster_tile_execution_scope.coordinates().clone(),
                         __raster_total_duration_ns,
                         __raster_user_duration_ns,
                         __raster_external_input_resolve_ns,
-                        __raster_internal_input_resolve_ns,
+                        __raster_storage_input_resolve_ns,
                         __raster_trace_serialize_ns,
                         __raster_draft_capture_ns,
                         __raster_scope_enter_ns,
@@ -2428,7 +2428,6 @@ fn gen_sequence_wrapped_body(
         }
     }
 }
-
 
 /// Declares a sequence of tiles with linear control flow.
 ///

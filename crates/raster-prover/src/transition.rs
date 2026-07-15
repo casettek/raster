@@ -15,8 +15,8 @@ use raster_core::fingerprint::Fingerprint;
 use raster_core::input::SelectionWitness;
 use raster_core::trace::{FnInput, StepRecord};
 use raster_core::transition::{
-    InitTransition, InternalStoreReadWitness, InternalStoreWitness, TransitionInput,
-    TransitionJournal, TransitionState,
+    InitTransition, StorageReadWitness, StorageWitness, TransitionInput, TransitionJournal,
+    TransitionState,
 };
 use std::collections::{BTreeMap, HashMap};
 
@@ -34,8 +34,8 @@ pub struct StepIo {
     pub output_witness: Option<Vec<u8>>,
     pub input_source_witness: Option<FnInput>,
     pub sequence_scope_witness: Option<FnInput>,
-    pub internal_selection_witnesses: BTreeMap<String, SelectionWitness>,
-    pub internal_store_witness: Option<InternalStoreWitness>,
+    pub storage_selection_witnesses: BTreeMap<String, SelectionWitness>,
+    pub storage_witness: Option<StorageWitness>,
     pub draft_transition_witness: Option<DraftTransitionWitness>,
 }
 
@@ -47,15 +47,15 @@ fn build_transition_input(
     recorded_step_io: &RecordedStepIo,
     replayed_results: &HashMap<StepRecord, ReplayResult>,
     authorization_journal: &AuthorizationJournal,
-    entrypoint_membership_witness: Option<&InternalStoreReadWitness>,
+    entrypoint_membership_witness: Option<&StorageReadWitness>,
 ) -> TransitionInput {
     let StepIo {
         input_witness,
         output_witness,
         input_source_witness,
         sequence_scope_witness,
-        internal_selection_witnesses,
-        internal_store_witness,
+        storage_selection_witnesses,
+        storage_witness,
         draft_transition_witness,
     } = recorded_step_io
         .get(step_record)
@@ -86,8 +86,8 @@ fn build_transition_input(
         output_witness,
         input_source_witness,
         sequence_scope_witness,
-        internal_selection_witnesses,
-        internal_store_witness,
+        storage_selection_witnesses,
+        storage_witness,
         draft_transition_witness,
         authorization_journal: authorization_journal.clone(),
         input_sources_witnesses: input_sources_witnesses.clone(),
@@ -102,7 +102,7 @@ fn image_id_bytes(image_id: [u32; 8]) -> Vec<u8> {
         .collect()
 }
 
-fn empty_internal_store_frontier() -> SerializableFrontier {
+fn empty_storage_frontier() -> SerializableFrontier {
     SerializableFrontier {
         position: 0,
         leaf: EMPTY_TRIE_NODES[0].to_vec(),
@@ -110,12 +110,12 @@ fn empty_internal_store_frontier() -> SerializableFrontier {
     }
 }
 
-fn internal_store_root(frontier: &SerializableFrontier) -> Vec<u8> {
+fn storage_root(frontier: &SerializableFrontier) -> Vec<u8> {
     let frontier = serializable_frontier_into_trace_frontier(frontier.clone())
-        .expect("internal store frontier should deserialize");
+        .expect("storage frontier should deserialize");
     TraceTree::from_frontier(1, frontier)
         .root(0)
-        .expect("internal store root should exist")
+        .expect("storage root should exist")
         .0
 }
 
@@ -134,7 +134,7 @@ fn internal_store_root(frontier: &SerializableFrontier) -> Vec<u8> {
 /// * `bits_per_item` - Bits per fingerprint item
 /// * `entrypoint_membership_witness` - Proof that `main`'s entry-argument
 ///   binding already exists at coordinate `[0]` of the window's initial
-///   internal store. Supply it whenever the window opens *after* the binding
+///   storage. Supply it whenever the window opens *after* the binding
 ///   step; pass `None` when the window contains the binding step itself, in
 ///   which case that step discharges the authorization instead. See
 ///   `checks::entrypoint` in the transition guest.
@@ -143,8 +143,8 @@ fn internal_store_root(frontier: &SerializableFrontier) -> Vec<u8> {
 /// A `TransitionReplayResult` with details about success or failure
 pub fn step_transitions(
     initial_frontier: &SerializableFrontier,
-    initial_internal_store_frontier: &SerializableFrontier,
-    initial_internal_store_index_root: &[u8],
+    initial_storage_frontier: &SerializableFrontier,
+    initial_storage_index_root: &[u8],
     trace_window: &[StepRecord],
     fingerprint: Fingerprint,
     cfs: &ControlFlowSchema,
@@ -153,7 +153,7 @@ pub fn step_transitions(
     replayed_results: &HashMap<StepRecord, ReplayResult>,
     authorization_journal: &AuthorizationJournal,
     authorization_receipt: &risc0_zkvm::Receipt,
-    entrypoint_membership_witness: Option<&InternalStoreReadWitness>,
+    entrypoint_membership_witness: Option<&StorageReadWitness>,
 ) -> Option<risc0_zkvm::Receipt> {
     let prover = risc0_zkvm::default_prover();
 
@@ -161,9 +161,9 @@ pub fn step_transitions(
 
     let init_transition = InitTransition {
         init_frontier: initial_frontier.clone(),
-        init_internal_store_frontier: initial_internal_store_frontier.clone(),
-        init_internal_store_root: internal_store_root(initial_internal_store_frontier),
-        init_internal_store_index_root: initial_internal_store_index_root.to_vec(),
+        init_storage_frontier: initial_storage_frontier.clone(),
+        init_storage_root: storage_root(initial_storage_frontier),
+        init_storage_index_root: initial_storage_index_root.to_vec(),
         active_drafts: Default::default(),
         fingerprint,
     };
@@ -244,11 +244,11 @@ mod tests {
     use raster_core::coordinate_index::coordinate_index_root;
     use raster_core::draft::TileReplayJournal;
     use raster_core::fingerprint::{BitPacker, Fingerprint};
-    use raster_core::trace::{ExecStep, ExecTarget, FnInput, InternalStoreRoots, StepKind};
+    use raster_core::trace::{ExecStep, ExecTarget, FnInput, StepKind, StorageRoots};
     use sha2::{Digest, Sha256};
 
-    fn empty_store_roots() -> InternalStoreRoots {
-        InternalStoreRoots {
+    fn empty_store_roots() -> StorageRoots {
+        StorageRoots {
             root_before: EMPTY_TRIE_NODES[0].to_vec(),
             root_after: EMPTY_TRIE_NODES[0].to_vec(),
             index_root_before: Vec::new(),
@@ -276,7 +276,7 @@ mod tests {
                 input_commitment: vec![exec_index as u8],
                 input_source_commitment: Vec::new(),
                 output_commitment: vec![exec_index as u8 + 1],
-                internal_store: empty_store_roots(),
+                storage: empty_store_roots(),
             }),
         }
     }
@@ -305,7 +305,7 @@ mod tests {
             data: Vec::new(),
             values: Vec::new(),
             args: Vec::new(),
-            internal: Default::default(),
+            storage: Default::default(),
         }
     }
 
@@ -428,14 +428,8 @@ mod tests {
             },
         };
         let recorded_step_io = HashMap::from([
-            (
-                sequence_start.clone(),
-                io_witnesses(Some(vec![3, 4]), None),
-            ),
-            (
-                sequence_end.clone(),
-                io_witnesses(None, Some(vec![5, 6])),
-            ),
+            (sequence_start.clone(), io_witnesses(Some(vec![3, 4]), None)),
+            (sequence_end.clone(), io_witnesses(None, Some(vec![5, 6]))),
         ]);
 
         let start_input = build_transition_input(
@@ -523,8 +517,8 @@ mod tests {
             output_witness: None,
             input_source_witness: Some(empty_input_source_witness()),
             sequence_scope_witness: None,
-            internal_selection_witnesses: BTreeMap::new(),
-            internal_store_witness: None,
+            storage_selection_witnesses: BTreeMap::new(),
+            storage_witness: None,
             draft_transition_witness: None,
             authorization_journal: authorization,
             input_sources_witnesses: HashMap::new(),
@@ -532,11 +526,9 @@ mod tests {
         };
         let state = TransitionState::Init(InitTransition {
             init_frontier: make_init_frontier(),
-            init_internal_store_frontier: make_init_frontier(),
-            init_internal_store_root: internal_store_root(&make_init_frontier()),
-            init_internal_store_index_root: coordinate_index_root(
-                &std::collections::BTreeMap::new(),
-            ),
+            init_storage_frontier: make_init_frontier(),
+            init_storage_root: storage_root(&make_init_frontier()),
+            init_storage_index_root: coordinate_index_root(&std::collections::BTreeMap::new()),
             active_drafts: Default::default(),
             fingerprint: Fingerprint::from(vec![0], BitPacker::new(64), 1),
         });

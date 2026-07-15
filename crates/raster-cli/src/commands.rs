@@ -589,10 +589,7 @@ pub fn cfs(output: Option<String>) -> Result<()> {
                     println!("      [{}] {} '{}'", idx, "sequence", item.id)
                 }
                 raster_core::cfs::SequenceChildItem::Entrypoint(item) => {
-                    println!(
-                        "      [{}] {} {:?}",
-                        idx, "entrypoint", item.names
-                    )
+                    println!("      [{}] {} {:?}", idx, "entrypoint", item.names)
                 }
             }
         }

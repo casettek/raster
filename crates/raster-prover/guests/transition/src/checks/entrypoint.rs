@@ -1,7 +1,7 @@
 //! Verifies `main`'s entry-argument binding against the authorization
 //! journal.
 //!
-//! `main`'s declared external arguments are bound to a single internal-store
+//! `main`'s declared external arguments are loaded into a single storage
 //! object whose commitment is a struct-of-commitments root over each
 //! argument's individually-authorized commitment (see
 //! `EntrypointOp::BindEntryArguments`). Because that binding is the *only*
@@ -12,7 +12,7 @@
 //!   itself, so the binding is verified directly as it is replayed.
 //! - [`verify_genesis_authorization`]: the window opened *after* the
 //!   binding, so a trace-inclusion witness proves the window's initial
-//!   internal-store state already contains it at coordinates `[0]`.
+//!   storage state already contains it at coordinates `[0]`.
 //!
 //! Which route applies is not the host's choice to declare — the guest
 //! derives it from the CFS and the supplied witness, and
@@ -24,9 +24,9 @@ use raster_core::authorization::AuthorizationJournal;
 use raster_core::cfs::{CfsCoordinates, CfsCursor};
 use raster_core::input::struct_commitments_root;
 use raster_core::trace::{EntrypointOp, EntrypointStep, StepRecord};
-use raster_core::transition::{EntrypointAuthorization, InternalStoreReadWitness};
+use raster_core::transition::{EntrypointAuthorization, StorageReadWitness};
 
-use crate::checks::store::verify_internal_store_read_witness;
+use crate::checks::store::verify_storage_read_witness;
 
 /// The coordinate `main`'s entry-argument binding always occupies: the
 /// leading item of `main`'s item list (see `CfsBuilder`, which prepends the
@@ -104,14 +104,14 @@ pub fn verify_step(
 /// - No witness supplied: `Pending` — the window opens at or before the
 ///   binding, and an `Entrypoint` step inside it must discharge this.
 /// - Witness supplied: it must prove coordinates `[0]` of the window's
-///   initial internal-store state commits to the authorized combined root,
+///   initial storage state commits to the authorized combined root,
 ///   yielding `Established`.
 pub fn verify_genesis_authorization(
     cfs_cursor: &CfsCursor,
-    init_internal_store_root: &[u8],
-    init_internal_store_index_root: &[u8],
+    init_storage_root: &[u8],
+    init_storage_index_root: &[u8],
     authorization_journal: &AuthorizationJournal,
-    membership_witness: Option<&InternalStoreReadWitness>,
+    membership_witness: Option<&StorageReadWitness>,
 ) -> EntrypointAuthorization {
     let Some(names) = cfs_cursor.main_entrypoint_names() else {
         assert!(
@@ -126,10 +126,10 @@ pub fn verify_genesis_authorization(
     };
 
     let expected = combined_root(names, authorization_journal);
-    verify_internal_store_read_witness(
+    verify_storage_read_witness(
         witness,
-        init_internal_store_root,
-        init_internal_store_index_root,
+        init_storage_root,
+        init_storage_index_root,
         &entrypoint_coordinates(),
         &expected,
     );

@@ -147,8 +147,8 @@ fn collect_optional_lines(
 }
 
 #[sequence]
-fn build_lines_reference() -> InternalRef {
-    let source = raster::store_internal_value(&vec![
+fn build_lines_reference() -> StorageRef {
+    let source = raster::store_value(&vec![
         "first".to_string(),
         "second".to_string(),
         "third".to_string(),
@@ -157,7 +157,7 @@ fn build_lines_reference() -> InternalRef {
 
     call_recur!(
         tile = collect_lines,
-        input = internal!(Vec<String>, source),
+        input = storage!(Vec<String>, source),
         output = new!(LineBundle),
         args = ()
     )
@@ -165,13 +165,13 @@ fn build_lines_reference() -> InternalRef {
     .clone()
 }
 
-fn run_build_lines_reference() -> InternalRef {
-    materialize_auth_return::<InternalRef, _>(__raster_sequence_auth_build_lines_reference())
+fn run_build_lines_reference() -> StorageRef {
+    materialize_auth_return::<StorageRef, _>(__raster_sequence_auth_build_lines_reference())
 }
 
 #[sequence]
 fn find_first_match(needle: String) -> SearchBundle {
-    let source = raster::store_internal_value(&vec![
+    let source = raster::store_value(&vec![
         "alpha".to_string(),
         "beta".to_string(),
         "gamma".to_string(),
@@ -180,7 +180,7 @@ fn find_first_match(needle: String) -> SearchBundle {
 
     call_recur!(
         tile = collect_first_match,
-        input = internal!(Vec<String>, source),
+        input = storage!(Vec<String>, source),
         output = new!(SearchBundle),
         args = (needle,)
     )
@@ -188,12 +188,11 @@ fn find_first_match(needle: String) -> SearchBundle {
 
 #[sequence]
 fn collect_optional_lines_from_empty() -> UnitLineBundle {
-    let source =
-        raster::store_internal_value(&Vec::<String>::new()).expect("list source should store");
+    let source = raster::store_value(&Vec::<String>::new()).expect("list source should store");
 
     call_recur!(
         tile = collect_optional_lines,
-        input = internal!(Vec<String>, source),
+        input = storage!(Vec<String>, source),
         output = new!(UnitLineBundle),
         args = ()
     )
@@ -201,12 +200,11 @@ fn collect_optional_lines_from_empty() -> UnitLineBundle {
 
 #[sequence]
 fn collect_required_lines_from_empty() -> LineBundle {
-    let source =
-        raster::store_internal_value(&Vec::<String>::new()).expect("list source should store");
+    let source = raster::store_value(&Vec::<String>::new()).expect("list source should store");
 
     call_recur!(
         tile = collect_lines,
-        input = internal!(Vec<String>, source),
+        input = storage!(Vec<String>, source),
         output = new!(LineBundle),
         args = ()
     )
@@ -313,7 +311,7 @@ fn collect_prefixed_lines(
 
 #[sequence]
 fn collect_two_items(limit: u64) -> LimitedBundle {
-    let source = raster::store_internal_value(&vec![
+    let source = raster::store_value(&vec![
         "one".to_string(),
         "two".to_string(),
         "three".to_string(),
@@ -322,7 +320,7 @@ fn collect_two_items(limit: u64) -> LimitedBundle {
 
     call_recur!(
         tile = collect_until_limit,
-        input = internal!(Vec<String>, source),
+        input = storage!(Vec<String>, source),
         state = LimitState { seen: 0 },
         output = new!(LimitedBundle),
         args = (limit,)
@@ -331,7 +329,7 @@ fn collect_two_items(limit: u64) -> LimitedBundle {
 
 #[sequence]
 fn compute_max_len() -> MaxLenState {
-    let source = raster::store_internal_value(&vec![
+    let source = raster::store_value(&vec![
         "a".to_string(),
         "alphabet".to_string(),
         "rust".to_string(),
@@ -340,7 +338,7 @@ fn compute_max_len() -> MaxLenState {
 
     call_recur!(
         tile = track_max_len,
-        input = internal!(Vec<String>, source),
+        input = storage!(Vec<String>, source),
         state = MaxLenState { max_len: 0 },
         args = ()
     )
@@ -348,7 +346,7 @@ fn compute_max_len() -> MaxLenState {
 
 #[sequence]
 fn compute_max_len_field() -> u64 {
-    let source = raster::store_internal_value(&vec![
+    let source = raster::store_value(&vec![
         "a".to_string(),
         "alphabet".to_string(),
         "rust".to_string(),
@@ -357,7 +355,7 @@ fn compute_max_len_field() -> u64 {
 
     let stats = call_recur!(
         tile = track_max_len,
-        input = internal!(Vec<String>, source),
+        input = storage!(Vec<String>, source),
         state = MaxLenState { max_len: 0 },
         args = ()
     );
@@ -367,7 +365,7 @@ fn compute_max_len_field() -> u64 {
 
 #[sequence]
 fn count_seen_until_limit(limit: u64) -> LimitState {
-    let source = raster::store_internal_value(&vec![
+    let source = raster::store_value(&vec![
         "one".to_string(),
         "two".to_string(),
         "three".to_string(),
@@ -376,7 +374,7 @@ fn count_seen_until_limit(limit: u64) -> LimitState {
 
     call_recur!(
         tile = count_until_limit_state_only,
-        input = internal!(Vec<String>, source),
+        input = storage!(Vec<String>, source),
         state = LimitState { seen: 0 },
         args = (limit,)
     )
@@ -384,12 +382,11 @@ fn count_seen_until_limit(limit: u64) -> LimitState {
 
 #[sequence]
 fn state_only_empty_input() -> MaxLenState {
-    let source =
-        raster::store_internal_value(&Vec::<String>::new()).expect("list source should store");
+    let source = raster::store_value(&Vec::<String>::new()).expect("list source should store");
 
     call_recur!(
         tile = track_max_len,
-        input = internal!(Vec<String>, source),
+        input = storage!(Vec<String>, source),
         state = MaxLenState { max_len: 0 },
         args = ()
     )
@@ -397,22 +394,22 @@ fn state_only_empty_input() -> MaxLenState {
 
 #[sequence]
 fn build_prefixed_lines_with_recur_sequence() -> LineBundle {
-    let source = raster::store_internal_value(&vec![
+    let source = raster::store_value(&vec![
         "one".to_string(),
         "two".to_string(),
         "three".to_string(),
     ])
     .expect("list source should store");
     let prefix_source =
-        raster::store_internal_value(&"line: ".to_string()).expect("prefix source should store");
+        raster::store_value(&"line: ".to_string()).expect("prefix source should store");
 
     let output = call!(init_prefixed_bundle, new!(LineBundle));
 
     call_recur_seq!(
         sequence = collect_prefixed_lines,
-        input = internal!(Vec<String>, source),
+        input = storage!(Vec<String>, source),
         output = output,
-        args = (internal!(String, prefix_source),)
+        args = (storage!(String, prefix_source),)
     )
 }
 
@@ -443,19 +440,19 @@ fn run_build_prefixed_lines_with_recur_sequence() -> LineBundle {
 }
 
 fn resolve_counted_string_list(
-    reference: InternalRef,
-) -> raster::core::Result<InternalValue<Vec<String>>> {
+    reference: StorageRef,
+) -> raster::core::Result<StorageValue<Vec<String>>> {
     RECUR_RESOLVE_COUNT.fetch_add(1, Ordering::SeqCst);
-    raster::resolve_internal_value::<Vec<String>>(reference)
+    raster::resolve_storage_value::<Vec<String>>(reference)
 }
 
 #[test]
 fn call_recur_finalizes_to_selectable_internal_ref() {
     let reference = run_build_lines_reference();
 
-    let title = select!(String, internal!(LineBundle, reference.clone()).title);
-    let first = select!(String, internal!(LineBundle, reference.clone()).items[0]);
-    let third = select!(String, internal!(LineBundle, reference).items[2]);
+    let title = select!(String, storage!(LineBundle, reference.clone()).title);
+    let first = select!(String, storage!(LineBundle, reference.clone()).items[0]);
+    let third = select!(String, storage!(LineBundle, reference).items[2]);
 
     assert_eq!(
         into_auth_value::<String, _>(title).unwrap().into_inner(),
@@ -474,12 +471,12 @@ fn call_recur_finalizes_to_selectable_internal_ref() {
 #[test]
 fn debug_formats_materialized_internal_auth_ref() {
     let reference = run_build_lines_reference();
-    let auth = into_auth_ref::<LineBundle, _>(internal!(LineBundle, reference));
+    let auth = into_auth_ref::<LineBundle, _>(storage!(LineBundle, reference));
 
     let rendered = format!("{auth:?}");
 
     assert!(rendered.contains("AuthRef"));
-    assert!(rendered.contains("storage: \"internal\""));
+    assert!(rendered.contains("storage: \"storage\""));
     assert!(rendered.contains("coordinates: \""));
     assert!(rendered.contains("commitment_len"));
     assert!(rendered.contains("stored_bytes_len"));
@@ -564,14 +561,14 @@ fn call_recur_seq_orchestrates_tiles_per_item() {
 #[test]
 fn call_recur_resolves_internal_list_once_per_invocation() {
     let _guard = raster::__private::SequenceScopeGuard::enter("recur_single_list_resolve");
-    let reference = raster::store_internal_value(&vec![
+    let reference = raster::store_value(&vec![
         "first".to_string(),
         "second".to_string(),
         "third".to_string(),
     ])
     .expect("list source should store");
     let source = into_auth_ref::<Vec<String>, _>(
-        raster::typed_internal_with_resolver::<Vec<String>>(reference, resolve_counted_string_list),
+        raster::typed_storage_with_resolver::<Vec<String>>(reference, resolve_counted_string_list),
     );
 
     RECUR_RESOLVE_COUNT.store(0, Ordering::SeqCst);
@@ -590,14 +587,14 @@ fn call_recur_resolves_internal_list_once_per_invocation() {
 #[test]
 fn recur_sequence_resolves_internal_list_once_per_invocation() {
     let _guard = raster::__private::SequenceScopeGuard::enter("recur_sequence_single_list_resolve");
-    let reference = raster::store_internal_value(&vec![
+    let reference = raster::store_value(&vec![
         "first".to_string(),
         "second".to_string(),
         "third".to_string(),
     ])
     .expect("list source should store");
     let source = into_auth_ref::<Vec<String>, _>(
-        raster::typed_internal_with_resolver::<Vec<String>>(reference, resolve_counted_string_list),
+        raster::typed_storage_with_resolver::<Vec<String>>(reference, resolve_counted_string_list),
     );
 
     RECUR_RESOLVE_COUNT.store(0, Ordering::SeqCst);
@@ -763,11 +760,11 @@ fn recur_sequence_trace_keeps_inner_tiles_replayable() {
             .as_ref()
             .expect("start event should have input");
         assert!(
-            input.internal.contains_key("input"),
+            input.storage.contains_key("input"),
             "selected item metadata should be keyed by the input parameter name"
         );
         assert!(
-            input.internal.contains_key("prefix"),
+            input.storage.contains_key("prefix"),
             "recursive sequence extra args should remain auth refs in iteration traces"
         );
         let FnInputValue::Inline(bytes) = &input.values[0] else {
@@ -778,6 +775,6 @@ fn recur_sequence_trace_keeps_inner_tiles_replayable() {
         assert_eq!(marker.kind, "raster::RecurSequenceInput");
         assert_eq!(marker.index, expected_index as u64);
         assert_eq!(marker.len, 3);
-        assert_eq!(marker.item, FnInputValue::InternalBinding);
+        assert_eq!(marker.item, FnInputValue::StorageBinding);
     }
 }

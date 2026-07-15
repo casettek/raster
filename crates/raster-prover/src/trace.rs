@@ -519,8 +519,8 @@ fn resolve_inputs_sources(
     for step_input in step_inputs {
         match step_input {
             InputBinding::Direct(InputSource::Inline) => {}
-            InputBinding::Direct(InputSource::Internal) => {
-                panic!("Direct internal bindings are not yet supported in trace source resolution");
+            InputBinding::Direct(InputSource::Storage) => {
+                panic!("Direct storage bindings are not yet supported in trace source resolution");
             }
             InputBinding::SequenceScope { input_index } => {
                 let (parent_index, source_record) = current_sequence_trace_suffix
@@ -792,7 +792,7 @@ mod tests {
         CfsCoordinates, InputBinding, SequenceChildItem, SequenceDef, SequenceItem, TileDef,
         TileItem,
     };
-    use raster_core::trace::InternalStoreRoots;
+    use raster_core::trace::StorageRoots;
 
     use super::*;
     use crate::precomputed;
@@ -858,13 +858,13 @@ mod tests {
                 input_commitment: Vec::new(),
                 input_source_commitment: Vec::new(),
                 output_commitment: output.to_le_bytes().to_vec(),
-                internal_store: empty_internal_store_roots(),
+                storage: empty_storage_roots(),
             }),
         }
     }
 
-    fn empty_internal_store_roots() -> InternalStoreRoots {
-        InternalStoreRoots {
+    fn empty_storage_roots() -> StorageRoots {
+        StorageRoots {
             root_before: Vec::new(),
             root_after: Vec::new(),
             index_root_before: Vec::new(),

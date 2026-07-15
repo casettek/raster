@@ -13,14 +13,14 @@ use std::collections::BTreeMap;
 
 pub type Hash32 = [u8; 32];
 
-/// A lightweight reference to an immutable internal store object.
+/// A lightweight reference to an immutable storage object.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub struct InternalRef {
+pub struct StorageRef {
     pub coordinates: CfsCoordinates,
     pub commitment: Vec<u8>,
 }
 
-impl InternalRef {
+impl StorageRef {
     pub fn new(coordinates: CfsCoordinates, commitment: Vec<u8>) -> Self {
         Self {
             coordinates,
@@ -302,7 +302,9 @@ fn parse_subtree_root(bytes: &[u8], offset: &mut usize) -> Option<Hash32> {
             }
 
             Some(struct_commitments_root(
-                fields.iter().map(|(name, root)| (name.as_str(), root.as_slice())),
+                fields
+                    .iter()
+                    .map(|(name, root)| (name.as_str(), root.as_slice())),
             ))
         }
         0x02 => {
@@ -620,7 +622,7 @@ impl From<i32> for SelectorSegment {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum AuthValue<T> {
-    Internal(InternalValue<T>),
+    Storage(StorageValue<T>),
     Inline(T),
 }
 
@@ -629,37 +631,37 @@ impl<T> AuthValue<T> {
         Self::Inline(value)
     }
 
-    pub fn internal(value: InternalValue<T>) -> Self {
-        Self::Internal(value)
+    pub fn storage(value: StorageValue<T>) -> Self {
+        Self::Storage(value)
     }
 
     pub fn into_inner(self) -> T {
         match self {
-            Self::Internal(internal) => internal.value,
+            Self::Storage(storage) => storage.value,
             Self::Inline(value) => value,
         }
     }
 
-    pub fn as_internal(&self) -> Option<&InternalValue<T>> {
+    pub fn as_storage(&self) -> Option<&StorageValue<T>> {
         match self {
-            Self::Internal(internal) => Some(internal),
+            Self::Storage(storage) => Some(storage),
             Self::Inline(_) => None,
         }
     }
 }
 
-/// A resolved internal value carrying both identity metadata and the typed value.
+/// A resolved storage value carrying both identity metadata and the typed value.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub struct InternalValue<T> {
-    pub reference: InternalRef,
+pub struct StorageValue<T> {
+    pub reference: StorageRef,
     pub bytes: Vec<u8>,
     pub selector: SelectorPath,
     pub selection: SelectionCommitment,
     pub value: T,
 }
 
-impl<T> InternalValue<T> {
-    pub fn new(reference: InternalRef, bytes: Vec<u8>, value: T) -> Self {
+impl<T> StorageValue<T> {
+    pub fn new(reference: StorageRef, bytes: Vec<u8>, value: T) -> Self {
         Self::new_with_selection(
             reference,
             bytes,
@@ -670,7 +672,7 @@ impl<T> InternalValue<T> {
     }
 
     pub fn new_with_selection(
-        reference: InternalRef,
+        reference: StorageRef,
         bytes: Vec<u8>,
         selector: SelectorPath,
         selection: SelectionCommitment,
@@ -963,17 +965,21 @@ mod tests {
     fn auth_value_helpers_preserve_inline_values() {
         let arg = AuthValue::inline(7u64);
 
-        assert!(arg.as_internal().is_none());
+        assert!(arg.as_storage().is_none());
         assert_eq!(arg.into_inner(), 7);
     }
 
     #[test]
-    fn auth_value_helpers_preserve_internal_metadata() {
-        let reference = InternalRef::new(CfsCoordinates(alloc::vec![0]), alloc::vec![4; 32]);
-        let arg = AuthValue::internal(InternalValue::new(reference.clone(), alloc::vec![1, 2, 3], 9u64));
+    fn auth_value_helpers_preserve_storage_metadata() {
+        let reference = StorageRef::new(CfsCoordinates(alloc::vec![0]), alloc::vec![4; 32]);
+        let arg = AuthValue::storage(StorageValue::new(
+            reference.clone(),
+            alloc::vec![1, 2, 3],
+            9u64,
+        ));
 
-        let internal = arg.as_internal().expect("expected internal metadata");
-        assert_eq!(internal.reference, reference);
+        let storage = arg.as_storage().expect("expected storage metadata");
+        assert_eq!(storage.reference, reference);
         assert_eq!(arg.into_inner(), 9);
     }
 }

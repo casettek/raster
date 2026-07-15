@@ -23,7 +23,7 @@ pub struct Metrics {
     #[serde(default)]
     pub total_tile_external_input_resolve_ns: u64,
     #[serde(default)]
-    pub total_tile_internal_input_resolve_ns: u64,
+    pub total_tile_storage_input_resolve_ns: u64,
     #[serde(default)]
     pub total_tile_output_store_ns: u64,
     #[serde(default)]
@@ -74,7 +74,7 @@ pub struct LatestTileStats {
     pub user_duration_ns: u64,
     pub raster_overhead_ns: u64,
     pub external_input_resolve_ns: u64,
-    pub internal_input_resolve_ns: u64,
+    pub storage_input_resolve_ns: u64,
     pub output_store_ns: u64,
     pub trace_serialize_ns: u64,
     pub draft_capture_ns: u64,
@@ -99,9 +99,9 @@ pub struct TileMetrics {
     #[serde(default)]
     pub avg_external_input_resolve_ns: u64,
     #[serde(default)]
-    pub total_internal_input_resolve_ns: u64,
+    pub total_storage_input_resolve_ns: u64,
     #[serde(default)]
-    pub avg_internal_input_resolve_ns: u64,
+    pub avg_storage_input_resolve_ns: u64,
     #[serde(default)]
     pub total_output_store_ns: u64,
     #[serde(default)]

@@ -17,13 +17,11 @@ use raster_compiler::{CfsBuilder, Project};
 
 use raster_core::cfs::{CfsCoordinates, CfsCursor, ControlFlowSchema};
 use raster_core::coordinate_index::IncrementalCoordinateIndex;
-use raster_core::input::{InternalRef, SelectionWitness};
-use raster_core::trace::{
-    ExecStep, ExecTarget, FnInput, StepKind, StepRecord, Trace, TraceEvent,
-};
+use raster_core::input::{SelectionWitness, StorageRef};
+use raster_core::trace::{ExecStep, ExecTarget, FnInput, StepKind, StepRecord, Trace, TraceEvent};
 use raster_core::transition::{
-    InternalStoreEntry, InternalStoreIndexValue, InternalStoreLogWitness, InternalStoreReadWitness,
-    InternalStoreWitness, InternalStoreWriteWitness,
+    StorageEntry, StorageIndexValue, StorageLogWitness, StorageReadWitness, StorageWitness,
+    StorageWriteWitness,
 };
 use raster_core::{Error, Result};
 
@@ -228,8 +226,8 @@ pub fn run(
 
     if commit_flag.is_some() {
         let commit_path = commit_flag.expect("Commitment path was provided");
-        let fraud_proof_config = fraud_proof_config
-            .expect("--fraud-proof-window-size is required alongside --commit");
+        let fraud_proof_config =
+            fraud_proof_config.expect("--fraud-proof-window-size is required alongside --commit");
 
         // TODO: temprorary way to generate "fraud" trace commitment
         // prefix file with fraud_{NAME}
@@ -472,8 +470,9 @@ pub fn fraud(
         fraud_step.output_commitment = vec![0u8, 1u8];
     };
 
-    let trace_commitment = TraceCommitment::try_from(trace, &EMPTY_TRIE_NODES[0], fraud_proof_config)
-        .map_err(|e| Error::Other(e.to_string()))?;
+    let trace_commitment =
+        TraceCommitment::try_from(trace, &EMPTY_TRIE_NODES[0], fraud_proof_config)
+            .map_err(|e| Error::Other(e.to_string()))?;
 
     let bytes = postcard::to_allocvec(&trace_commitment).unwrap();
 
@@ -491,8 +490,9 @@ pub fn commit(
     commit_path: &str,
     fraud_proof_config: FraudProofConfig,
 ) -> Result<()> {
-    let trace_commitment = TraceCommitment::try_from(trace, &EMPTY_TRIE_NODES[0], fraud_proof_config)
-        .map_err(|e| Error::Other(e.to_string()))?;
+    let trace_commitment =
+        TraceCommitment::try_from(trace, &EMPTY_TRIE_NODES[0], fraud_proof_config)
+            .map_err(|e| Error::Other(e.to_string()))?;
     let bytes = postcard::to_allocvec(&trace_commitment).unwrap();
 
     let mut commitment_file =
@@ -541,13 +541,13 @@ pub fn write_fraud_proof(receipt: &risc0_zkvm::Receipt, commit_path: &str) -> Pa
 }
 
 #[derive(Debug, Clone)]
-struct ProofInternalStoreState {
+struct ProofStorageState {
     frontier: SerializableFrontier,
-    append_entries: Vec<InternalStoreEntry>,
+    append_entries: Vec<StorageEntry>,
     coordinate_index: IncrementalCoordinateIndex,
 }
 
-fn empty_internal_store_frontier() -> SerializableFrontier {
+fn empty_storage_frontier() -> SerializableFrontier {
     SerializableFrontier {
         position: 0,
         leaf: EMPTY_TRIE_NODES[0].to_vec(),
@@ -555,20 +555,20 @@ fn empty_internal_store_frontier() -> SerializableFrontier {
     }
 }
 
-fn internal_store_leaf_hash(entry: &InternalStoreEntry) -> Vec<u8> {
+fn storage_leaf_hash(entry: &StorageEntry) -> Vec<u8> {
     Sha256::digest(entry.to_bytes()).to_vec()
 }
 
-fn build_internal_store_log_witness(
-    append_entries: &[InternalStoreEntry],
+fn build_storage_log_witness(
+    append_entries: &[StorageEntry],
     log_position: u64,
-) -> InternalStoreLogWitness {
+) -> StorageLogWitness {
     let mut tree = TraceTree::new(1);
     tree.append(Bytes(EMPTY_TRIE_NODES[0].to_vec()));
     let mut marked_position = None;
 
     for (index, entry) in append_entries.iter().enumerate() {
-        tree.append(Bytes(internal_store_leaf_hash(entry)));
+        tree.append(Bytes(storage_leaf_hash(entry)));
         if u64::try_from(index).expect("append entry index overflow") + 1 == log_position {
             marked_position = tree.mark();
         }
@@ -576,50 +576,50 @@ fn build_internal_store_log_witness(
 
     let marked_position = marked_position.unwrap_or_else(|| {
         panic!(
-            "Missing append-log position {} while building internal store log witness",
+            "Missing append-log position {} while building storage log witness",
             log_position
         )
     });
     let auth_path = tree
         .witness(marked_position, 0)
-        .expect("Failed to build internal store log witness");
+        .expect("Failed to build storage log witness");
 
-    InternalStoreLogWitness {
+    StorageLogWitness {
         position: u64::from(marked_position),
         path_elems: auth_path.iter().map(|elem| elem.0.clone()).collect(),
     }
 }
 
-fn apply_internal_write_to_state(
-    state: &mut ProofInternalStoreState,
-    internal_write: &raster_runtime::InternalWriteRecord,
+fn apply_storage_write_to_state(
+    state: &mut ProofStorageState,
+    storage_write: &raster_runtime::StorageWriteRecord,
 ) {
-    state.frontier = internal_write.frontier_after.clone();
-    state.append_entries.push(internal_write.entry.clone());
+    state.frontier = storage_write.frontier_after.clone();
+    state.append_entries.push(storage_write.entry.clone());
     state.coordinate_index.insert(
-        internal_write.entry.coordinates.clone(),
-        InternalStoreIndexValue {
-            log_position: internal_write.log_position,
-            object_commitment: internal_write.entry.object_commitment.clone(),
+        storage_write.entry.coordinates.clone(),
+        StorageIndexValue {
+            log_position: storage_write.log_position,
+            object_commitment: storage_write.entry.object_commitment.clone(),
         },
     );
 }
 
-fn internal_store_state_from_prefix(
+fn storage_state_from_prefix(
     trace: &[StepRecord],
     trace_recorder: &TraceRecorder,
-) -> ProofInternalStoreState {
-    let mut state = ProofInternalStoreState {
-        frontier: empty_internal_store_frontier(),
+) -> ProofStorageState {
+    let mut state = ProofStorageState {
+        frontier: empty_storage_frontier(),
         append_entries: Vec::new(),
         coordinate_index: IncrementalCoordinateIndex::new(),
     };
     for step_record in trace {
-        if let Some(internal_write) = trace_recorder
+        if let Some(storage_write) = trace_recorder
             .step_witness_at(step_record.coordinates())
-            .and_then(|witness| witness.internal_write())
+            .and_then(|witness| witness.storage_write())
         {
-            apply_internal_write_to_state(&mut state, &internal_write);
+            apply_storage_write_to_state(&mut state, &storage_write);
         }
     }
 
@@ -627,7 +627,7 @@ fn internal_store_state_from_prefix(
 }
 
 /// Prove that `main`'s entry-argument binding is already present at
-/// coordinate `[0]` of the window's *initial* internal-store state, so a
+/// coordinate `[0]` of the window's *initial* storage state, so a
 /// window that opens after the binding step can still tie its execution to
 /// the public manifest (see `checks::entrypoint` in the transition guest).
 ///
@@ -636,15 +636,13 @@ fn internal_store_state_from_prefix(
 /// step is replayed inside the window and authorizes itself. The guest
 /// decides which of those two it is; this only supplies the witness when one
 /// exists.
-fn build_entrypoint_membership_witness(
-    state: &ProofInternalStoreState,
-) -> Option<InternalStoreReadWitness> {
+fn build_entrypoint_membership_witness(state: &ProofStorageState) -> Option<StorageReadWitness> {
     let coordinates = CfsCoordinates(vec![0]);
     let index_witness = state.coordinate_index.membership_proof(&coordinates)?;
     let log_witness =
-        build_internal_store_log_witness(&state.append_entries, index_witness.value.log_position);
-    Some(InternalStoreReadWitness {
-        entry: InternalStoreEntry {
+        build_storage_log_witness(&state.append_entries, index_witness.value.log_position);
+    Some(StorageReadWitness {
+        entry: StorageEntry {
             coordinates,
             object_commitment: index_witness.value.object_commitment.clone(),
         },
@@ -653,7 +651,7 @@ fn build_entrypoint_membership_witness(
     })
 }
 
-fn build_internal_selection_witnesses(
+fn build_storage_selection_witnesses(
     input_source_witness: Option<&FnInput>,
     trace_recorder: &TraceRecorder,
 ) -> BTreeMap<String, SelectionWitness> {
@@ -662,21 +660,21 @@ fn build_internal_selection_witnesses(
     };
 
     input_source_witness
-        .internal()
+        .storage()
         .iter()
-        .filter_map(|(binding_name, internal)| {
-            if internal.selection.selected_len == 0 {
+        .filter_map(|(binding_name, storage)| {
+            if storage.selection.selected_len == 0 {
                 return None;
             }
             let reference =
-                InternalRef::new(internal.coordinates.clone(), internal.commitment.clone());
+                StorageRef::new(storage.coordinates.clone(), storage.commitment.clone());
             Some((
                 binding_name.clone(),
                 trace_recorder
-                    .internal_selection_witness(&reference, &internal.selector)
+                    .storage_selection_witness(&reference, &storage.selector)
                     .unwrap_or_else(|error| {
                         panic!(
-                            "Failed to build internal selection witness for '{}': {}",
+                            "Failed to build storage selection witness for '{}': {}",
                             binding_name, error
                         )
                     }),
@@ -709,9 +707,9 @@ pub fn prove(
                 .position(|step_record| step_record == first_item)
         })
         .unwrap_or(trace.len());
-    let mut current_internal_store_state =
-        internal_store_state_from_prefix(&trace[..window_start_index], trace_recorder);
-    let initial_internal_store_state = current_internal_store_state.clone();
+    let mut current_storage_state =
+        storage_state_from_prefix(&trace[..window_start_index], trace_recorder);
+    let initial_storage_state = current_storage_state.clone();
 
     for step_record in &fraud_window.items {
         let step_witness = trace_recorder
@@ -734,61 +732,61 @@ pub fn prove(
                         .step_witness_at(&parent_coordinates)
                         .and_then(|witness| witness.input_source_witness())
                 });
-        let internal_selection_witnesses =
-            build_internal_selection_witnesses(input_source_witness.as_ref(), trace_recorder);
+        let storage_selection_witnesses =
+            build_storage_selection_witnesses(input_source_witness.as_ref(), trace_recorder);
         let draft_transition_witness = step_witness.draft_transition_witness();
-        let before_state = current_internal_store_state.clone();
-        let mut internal_read_witnesses = Vec::new();
+        let before_state = current_storage_state.clone();
+        let mut storage_read_witnesses = Vec::new();
         if let Some(input_source_witness_ref) = input_source_witness.as_ref() {
-            for internal_meta in input_source_witness_ref.internal().values() {
+            for storage_meta in input_source_witness_ref.storage().values() {
                 let index_witness = before_state
                     .coordinate_index
-                    .membership_proof(&internal_meta.coordinates)
+                    .membership_proof(&storage_meta.coordinates)
                     .unwrap_or_else(|| {
                         panic!(
-                            "Missing coordinate-index witness for internal input at {:?}",
-                            internal_meta.coordinates
+                            "Missing coordinate-index witness for storage input at {:?}",
+                            storage_meta.coordinates
                         )
                     });
-                let entry = InternalStoreEntry {
-                    coordinates: internal_meta.coordinates.clone(),
-                    object_commitment: internal_meta.commitment.clone(),
+                let entry = StorageEntry {
+                    coordinates: storage_meta.coordinates.clone(),
+                    object_commitment: storage_meta.commitment.clone(),
                 };
-                let log_witness = build_internal_store_log_witness(
+                let log_witness = build_storage_log_witness(
                     &before_state.append_entries,
                     index_witness.value.log_position,
                 );
-                internal_read_witnesses.push(InternalStoreReadWitness {
+                storage_read_witnesses.push(StorageReadWitness {
                     entry,
                     log_witness,
                     index_witness,
                 });
             }
         }
-        let mut internal_write_witness = None;
-        if let Some(internal_write) = step_witness.internal_write() {
-            let entry = internal_write.entry.clone();
+        let mut storage_write_witness = None;
+        if let Some(storage_write) = step_witness.storage_write() {
+            let entry = storage_write.entry.clone();
             let index_non_membership_witness = before_state
                 .coordinate_index
                 .non_membership_proof(&entry.coordinates);
-            apply_internal_write_to_state(&mut current_internal_store_state, &internal_write);
-            let index_membership_witness = current_internal_store_state
+            apply_storage_write_to_state(&mut current_storage_state, &storage_write);
+            let index_membership_witness = current_storage_state
                 .coordinate_index
                 .membership_proof(&entry.coordinates)
                 .expect("Missing coordinate-index membership proof after write");
-            internal_write_witness = Some(InternalStoreWriteWitness {
+            storage_write_witness = Some(StorageWriteWitness {
                 entry,
                 index_non_membership_witness,
                 index_membership_witness,
             });
         }
-        let internal_store_witness =
-            if internal_read_witnesses.is_empty() && internal_write_witness.is_none() {
+        let storage_witness =
+            if storage_read_witnesses.is_empty() && storage_write_witness.is_none() {
                 None
             } else {
-                Some(InternalStoreWitness {
-                    reads: internal_read_witnesses,
-                    write: internal_write_witness,
+                Some(StorageWitness {
+                    reads: storage_read_witnesses,
+                    write: storage_write_witness,
                 })
             };
         recorded_step_io.insert(
@@ -798,8 +796,8 @@ pub fn prove(
                 output_witness,
                 input_source_witness,
                 sequence_scope_witness,
-                internal_selection_witnesses,
-                internal_store_witness,
+                storage_selection_witnesses,
+                storage_witness,
                 draft_transition_witness,
             },
         );
@@ -835,7 +833,7 @@ pub fn prove(
     let entrypoint_membership_witness = CfsCursor::new(cfs.clone())
         .main_entrypoint_names()
         .is_some()
-        .then(|| build_entrypoint_membership_witness(&initial_internal_store_state))
+        .then(|| build_entrypoint_membership_witness(&initial_storage_state))
         .flatten();
 
     if let Some(frontier) = SerializableFrontier::from_bytes(&fraud_window.frontier) {
@@ -844,8 +842,8 @@ pub fn prove(
 
         let Some(receipt) = step_transitions(
             &frontier,
-            &initial_internal_store_state.frontier,
-            &initial_internal_store_state.coordinate_index.root(),
+            &initial_storage_state.frontier,
+            &initial_storage_state.coordinate_index.root(),
             &fraud_window.items,
             fraud_window.fingerprint,
             &cfs,

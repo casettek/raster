@@ -24,14 +24,14 @@ pub struct FnInput {
     pub data: Vec<u8>,
     pub values: Vec<FnInputValue>,
     pub args: Vec<FnInputArg>,
-    pub internal: InternalInput,
+    pub storage: StorageInput,
 }
 
-pub type InternalBindingName = String;
-pub type InternalInput = BTreeMap<InternalBindingName, InternalData>;
+pub type StorageBindingName = String;
+pub type StorageInput = BTreeMap<StorageBindingName, StorageData>;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub struct InternalData {
+pub struct StorageData {
     pub coordinates: CfsCoordinates,
     pub commitment: Vec<u8>,
     pub selector: SelectorPath,
@@ -41,7 +41,7 @@ pub struct InternalData {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum FnInputValue {
     Inline(Vec<u8>),
-    InternalBinding,
+    StorageBinding,
 }
 
 impl FnInput {
@@ -57,12 +57,12 @@ impl FnInput {
         &self.values
     }
 
-    pub fn internal(&self) -> &InternalInput {
-        &self.internal
+    pub fn storage(&self) -> &StorageInput {
+        &self.storage
     }
 
     pub fn source_witness_bytes(&self) -> Vec<u8> {
-        postcard::to_allocvec(&(self.values.clone(), self.internal.clone())).unwrap_or_default()
+        postcard::to_allocvec(&(self.values.clone(), self.storage.clone())).unwrap_or_default()
     }
 }
 
@@ -125,9 +125,9 @@ impl FnCallRecord {
     }
 }
 
-/// The internal-store roots either side of a step that may write to it.
+/// The storage roots either side of a step that may write to it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub struct InternalStoreRoots {
+pub struct StorageRoots {
     pub root_before: Vec<u8>,
     pub root_after: Vec<u8>,
     pub index_root_before: Vec<u8>,
@@ -158,7 +158,7 @@ pub struct ExecStep {
     pub input_source_commitment: Vec<u8>,
     pub output_commitment: Vec<u8>,
 
-    pub internal_store: InternalStoreRoots,
+    pub storage: StorageRoots,
 }
 
 /// What kind of entry-time preparation an [`EntrypointStep`] performs.
@@ -168,7 +168,7 @@ pub struct ExecStep {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum EntrypointOp {
     /// Binds `main`'s declared external arguments, in CFS declaration
-    /// order, to a single internal-store object at this step's coordinates.
+    /// order, to a single storage object at this step's coordinates.
     BindEntryArguments { names: Vec<String> },
 }
 
@@ -183,7 +183,7 @@ pub struct EntrypointStep {
     pub input_source_commitment: Vec<u8>,
     pub output_commitment: Vec<u8>,
 
-    pub internal_store: InternalStoreRoots,
+    pub storage: StorageRoots,
 }
 
 /// What a step did, and the commitments that go with it.
@@ -252,12 +252,12 @@ impl StepRecord {
         }
     }
 
-    /// The internal-store roots this step claims, for kinds that may write.
+    /// The storage roots this step claims, for kinds that may write.
     /// Sequence boundaries never touch the store, so they have none.
-    pub fn internal_store_roots(&self) -> Option<&InternalStoreRoots> {
+    pub fn storage_roots(&self) -> Option<&StorageRoots> {
         match &self.kind {
-            StepKind::Exec(exec) => Some(&exec.internal_store),
-            StepKind::Entrypoint(entrypoint) => Some(&entrypoint.internal_store),
+            StepKind::Exec(exec) => Some(&exec.storage),
+            StepKind::Entrypoint(entrypoint) => Some(&entrypoint.storage),
             StepKind::SequenceStart { .. } | StepKind::SequenceEnd { .. } => None,
         }
     }
@@ -342,7 +342,7 @@ pub struct EntrypointArgumentBinding {
 /// Recorded once, at the top of `main`, when it declares external entry
 /// arguments — carries just enough for the recorder to rebuild the
 /// matching `Referenced` object and `EntrypointRecord` (the live write
-/// already happened in the internal store by the time this is published).
+/// already happened in storage by the time this is published).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EntrypointBindEvent {
     pub arguments: Vec<EntrypointArgumentBinding>,

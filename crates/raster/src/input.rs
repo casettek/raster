@@ -11,17 +11,17 @@ use alloc::format;
 use raster_core::draft::{draft_value_from_serialize, DraftOp};
 use raster_core::draft::{replay_handle_for_schema, DraftReplayHandle, DraftReplayTransition};
 pub use raster_core::input::{
-    verify_selection_proof, AuthValue, ExternalEncoding, InternalRef, InternalValue,
-    ListProofDirection, ListProofSibling, Op, Schema, SchemaField, SchemaFieldMode, SchemaNode,
-    Selectable, SelectedPayload, SelectionCommitment, SelectionProof, SelectionProofStep,
-    SelectionWitness, SelectorPath, SelectorSegment,
+    verify_selection_proof, AuthValue, ExternalEncoding, ListProofDirection, ListProofSibling, Op,
+    Schema, SchemaField, SchemaFieldMode, SchemaNode, Selectable, SelectedPayload,
+    SelectionCommitment, SelectionProof, SelectionProofStep, SelectionWitness, SelectorPath,
+    SelectorSegment, StorageRef, StorageValue,
 };
-use raster_core::trace::{FnInputValue, InternalData as TraceInternalData};
+use raster_core::trace::{FnInputValue, StorageData as TraceStorageData};
 
 #[derive(Debug)]
-pub struct TypedInternalBinding<Root> {
-    reference: InternalRef,
-    resolve: fn(InternalRef) -> raster_core::Result<InternalValue<Root>>,
+pub struct TypedStorageBinding<Root> {
+    reference: StorageRef,
+    resolve: fn(StorageRef) -> raster_core::Result<StorageValue<Root>>,
     marker: PhantomData<fn() -> Root>,
 }
 
@@ -229,7 +229,7 @@ where
             value: FnInputValue::Inline(
                 raster_core::postcard::to_allocvec(&marker).unwrap_or_default(),
             ),
-            internal: item_trace.internal,
+            storage: item_trace.storage,
         })
     }
 }
@@ -280,7 +280,7 @@ where
             AuthRef::Inline(value) => {
                 FnInputValue::Inline(raster_core::postcard::to_allocvec(value).unwrap_or_default())
             }
-            AuthRef::Internal(_) => FnInputValue::InternalBinding,
+            AuthRef::Storage(_) => FnInputValue::StorageBinding,
         };
         RecurSequenceInputTraceMarker {
             kind: "raster::RecurSequenceInput",
@@ -381,22 +381,22 @@ impl<T> core::ops::DerefMut for RecurState<T> {
     }
 }
 
-impl<Root> TypedInternalBinding<Root>
+impl<Root> TypedStorageBinding<Root>
 where
     Root: DeserializeOwned + Serialize,
 {
-    pub fn new(reference: InternalRef) -> Self {
+    pub fn new(reference: StorageRef) -> Self {
         Self {
             reference,
-            resolve: resolve_internal_value::<Root>,
+            resolve: resolve_storage_value::<Root>,
             marker: PhantomData,
         }
     }
 
     #[doc(hidden)]
     pub fn with_resolver(
-        reference: InternalRef,
-        resolve: fn(InternalRef) -> raster_core::Result<InternalValue<Root>>,
+        reference: StorageRef,
+        resolve: fn(StorageRef) -> raster_core::Result<StorageValue<Root>>,
     ) -> Self {
         Self {
             reference,
@@ -405,7 +405,7 @@ where
         }
     }
 
-    pub fn reference(&self) -> &InternalRef {
+    pub fn reference(&self) -> &StorageRef {
         &self.reference
     }
 }
@@ -724,22 +724,44 @@ where
     }
 }
 
-pub fn typed_internal<Root>(reference: InternalRef) -> TypedInternalBinding<Root>
+pub fn typed_storage<Root>(reference: StorageRef) -> TypedStorageBinding<Root>
 where
     Root: DeserializeOwned + Serialize,
 {
-    TypedInternalBinding::new(reference)
+    TypedStorageBinding::new(reference)
 }
 
 #[doc(hidden)]
-pub fn typed_internal_with_resolver<Root>(
-    reference: InternalRef,
-    resolve: fn(InternalRef) -> raster_core::Result<InternalValue<Root>>,
-) -> TypedInternalBinding<Root>
+pub fn typed_storage_with_resolver<Root>(
+    reference: StorageRef,
+    resolve: fn(StorageRef) -> raster_core::Result<StorageValue<Root>>,
+) -> TypedStorageBinding<Root>
 where
     Root: DeserializeOwned + Serialize,
 {
-    TypedInternalBinding::with_resolver(reference, resolve)
+    TypedStorageBinding::with_resolver(reference, resolve)
+}
+
+/// Binds one of `main`'s declared entry arguments as a storage-backed
+/// `AuthRef` rooted at the combined entry object: the argument's name is the
+/// binding's selector prefix, so nested `select!`s compose onto it and every
+/// read — whole value or field — reaches storage as a single indexed select.
+/// Nothing materializes at the binding boundary itself.
+#[doc(hidden)]
+pub fn entry_argument_auth_ref<T>(reference: StorageRef, name: &str) -> AuthRef<T>
+where
+    T: DeserializeOwned + Serialize + 'static,
+{
+    let selector = SelectorPath::new(Vec::from([SelectorSegment::Field(String::from(name))]));
+    let resolve_selector = selector.clone();
+    AuthRef::Storage(DeferredAuthStorage {
+        reference,
+        selector,
+        resolve: Rc::new(move |reference| {
+            select_stored_value::<T>(&reference, &resolve_selector)
+        }),
+        marker: PhantomData,
+    })
 }
 
 pub fn typed_selector_path<Root, Selected>(
@@ -748,27 +770,32 @@ pub fn typed_selector_path<Root, Selected>(
     TypedSelectorPath::new(path)
 }
 
-type InternalResolveFn<Current> =
-    Rc<dyn Fn(InternalRef) -> raster_core::Result<InternalValue<Current>>>;
+type StorageResolveFn<Current> =
+    Rc<dyn Fn(StorageRef) -> raster_core::Result<StorageValue<Current>>>;
 
 #[doc(hidden)]
-pub struct DeferredAuthInternal<Current> {
-    reference: InternalRef,
-    resolve: InternalResolveFn<Current>,
+pub struct DeferredAuthStorage<Current> {
+    reference: StorageRef,
+    /// Selector path from `reference`'s stored root down to this value.
+    /// Each `select` extends it, so a chain of selects composes into one
+    /// full path that storage can serve as a single indexed read — the
+    /// value this binding was selected out of never has to materialize.
+    selector: SelectorPath,
+    resolve: StorageResolveFn<Current>,
     marker: PhantomData<fn() -> Current>,
 }
 
 pub enum AuthRef<Current> {
     Inline(Current),
-    Internal(DeferredAuthInternal<Current>),
+    Storage(DeferredAuthStorage<Current>),
 }
 
 impl<Current> AuthRef<Current> {
-    pub fn reference(&self) -> &InternalRef {
+    pub fn reference(&self) -> &StorageRef {
         match self {
-            Self::Internal(binding) => &binding.reference,
+            Self::Storage(binding) => &binding.reference,
             Self::Inline(_) => {
-                panic!("AuthRef::reference() is only available for internal bindings")
+                panic!("AuthRef::reference() is only available for storage bindings")
             }
         }
     }
@@ -777,10 +804,10 @@ impl<Current> AuthRef<Current> {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct AuthRefTrace {
     pub value: FnInputValue,
-    pub internal: Option<TraceInternalData>,
+    pub storage: Option<TraceStorageData>,
 }
 
-impl<Root> Clone for TypedInternalBinding<Root> {
+impl<Root> Clone for TypedStorageBinding<Root> {
     fn clone(&self) -> Self {
         Self {
             reference: self.reference.clone(),
@@ -790,15 +817,15 @@ impl<Root> Clone for TypedInternalBinding<Root> {
     }
 }
 
-impl<Root> PartialEq for TypedInternalBinding<Root> {
+impl<Root> PartialEq for TypedStorageBinding<Root> {
     fn eq(&self, other: &Self) -> bool {
         self.reference == other.reference
     }
 }
 
-impl<Root> Eq for TypedInternalBinding<Root> {}
+impl<Root> Eq for TypedStorageBinding<Root> {}
 
-impl<Root> core::hash::Hash for TypedInternalBinding<Root> {
+impl<Root> core::hash::Hash for TypedStorageBinding<Root> {
     fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
         self.reference.hash(state);
     }
@@ -813,19 +840,20 @@ impl<Root, Selected> Clone for TypedSelectorPath<Root, Selected> {
     }
 }
 
-impl<Current> Clone for DeferredAuthInternal<Current> {
+impl<Current> Clone for DeferredAuthStorage<Current> {
     fn clone(&self) -> Self {
         Self {
             reference: self.reference.clone(),
+            selector: self.selector.clone(),
             resolve: self.resolve.clone(),
             marker: PhantomData,
         }
     }
 }
 
-impl<Current> core::fmt::Debug for DeferredAuthInternal<Current> {
+impl<Current> core::fmt::Debug for DeferredAuthStorage<Current> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("DeferredAuthInternal")
+        f.debug_struct("DeferredAuthStorage")
             .field("reference", &self.reference)
             .finish()
     }
@@ -838,7 +866,7 @@ where
     fn clone(&self) -> Self {
         match self {
             Self::Inline(value) => Self::Inline(value.clone()),
-            Self::Internal(binding) => Self::Internal(binding.clone()),
+            Self::Storage(binding) => Self::Storage(binding.clone()),
         }
     }
 }
@@ -870,31 +898,29 @@ where
                 .field("storage", &"inline")
                 .field("value", value)
                 .finish(),
-            Self::Internal(binding) => {
-                match (binding.resolve.as_ref())(binding.reference.clone()) {
-                    Ok(resolved) => f
-                        .debug_struct("AuthRef")
-                        .field("storage", &"internal")
-                        .field(
-                            "coordinates",
-                            &summarize_coordinates(&resolved.reference.coordinates),
-                        )
-                        .field("commitment_len", &resolved.reference.commitment.len())
-                        .field("stored_bytes_len", &resolved.bytes.len())
-                        .field("value", &resolved.value)
-                        .finish(),
-                    Err(error) => f
-                        .debug_struct("AuthRef")
-                        .field("storage", &"internal")
-                        .field(
-                            "coordinates",
-                            &summarize_coordinates(&binding.reference.coordinates),
-                        )
-                        .field("commitment_len", &binding.reference.commitment.len())
-                        .field("materialization_error", &alloc::format!("{}", error))
-                        .finish(),
-                }
-            }
+            Self::Storage(binding) => match (binding.resolve.as_ref())(binding.reference.clone()) {
+                Ok(resolved) => f
+                    .debug_struct("AuthRef")
+                    .field("storage", &"storage")
+                    .field(
+                        "coordinates",
+                        &summarize_coordinates(&resolved.reference.coordinates),
+                    )
+                    .field("commitment_len", &resolved.reference.commitment.len())
+                    .field("stored_bytes_len", &resolved.bytes.len())
+                    .field("value", &resolved.value)
+                    .finish(),
+                Err(error) => f
+                    .debug_struct("AuthRef")
+                    .field("storage", &"storage")
+                    .field(
+                        "coordinates",
+                        &summarize_coordinates(&binding.reference.coordinates),
+                    )
+                    .field("commitment_len", &binding.reference.commitment.len())
+                    .field("materialization_error", &alloc::format!("{}", error))
+                    .finish(),
+            },
         }
     }
 }
@@ -916,7 +942,7 @@ pub trait SelectSource {
         Selected: DeserializeOwned + Serialize;
 }
 
-impl<Root> SelectSource for TypedInternalBinding<Root>
+impl<Root> SelectSource for TypedStorageBinding<Root>
 where
     Root: DeserializeOwned + Serialize + Selectable + 'static,
 {
@@ -934,11 +960,13 @@ where
         let reference = self.reference.clone();
         let selector = selector.into_path();
         let resolve = self.resolve;
-        AuthRef::Internal(DeferredAuthInternal {
+        let resolve_selector = selector.clone();
+        AuthRef::Storage(DeferredAuthStorage {
             reference,
+            selector,
             resolve: Rc::new(move |reference| {
                 let current = resolve(reference.clone())?;
-                select_internal_value::<Root, Selected>(&current, &selector)
+                select_storage_value::<Root, Selected>(&current, &resolve_selector)
             }),
             marker: PhantomData,
         })
@@ -963,23 +991,35 @@ where
         match self {
             AuthRef::Inline(_) => {
                 panic!(
-                    "select! on inline sequence values is not supported; use committed internal bindings instead"
+                    "select! on inline sequence values is not supported; use committed storage bindings instead"
                 )
             }
-            AuthRef::Internal(binding) => {
+            AuthRef::Storage(binding) => {
                 let relative_selector = selector.into_path();
+                let mut full_selector = binding.selector.clone();
+                full_selector
+                    .segments
+                    .extend(relative_selector.segments.iter().cloned());
                 let reference = binding.reference.clone();
                 let resolve_current = binding.resolve.clone();
-                AuthRef::Internal(DeferredAuthInternal {
+                let resolve_selector = full_selector.clone();
+                AuthRef::Storage(DeferredAuthStorage {
                     reference: reference.clone(),
+                    selector: full_selector,
                     resolve: Rc::new(move |reference| {
+                        // The composed path is anchored to the stored root
+                        // `reference` names, so storage can serve the whole
+                        // select chain as one indexed read; only when the
+                        // root isn't path-addressable (e.g. behind a custom
+                        // resolver) does this fall back to materializing the
+                        // parent and selecting in memory.
                         if let Ok(selected) =
-                            select_stored_internal_value::<Selected>(&reference, &relative_selector)
+                            select_stored_value::<Selected>(&reference, &resolve_selector)
                         {
                             return Ok(selected);
                         }
                         let current = (resolve_current.as_ref())(reference.clone())?;
-                        select_internal_value::<Current, Selected>(&current, &relative_selector)
+                        select_storage_value::<Current, Selected>(&current, &relative_selector)
                     }),
                     marker: PhantomData,
                 })
@@ -1019,9 +1059,9 @@ where
 /// out of this cached value rather than re-resolving the whole parent list.
 #[doc(hidden)]
 enum ResolvedRecurList<T> {
-    Internal {
-        reference: InternalRef,
-        value: Rc<InternalValue<Vec<T>>>,
+    Storage {
+        reference: StorageRef,
+        value: Rc<StorageValue<Vec<T>>>,
     },
 }
 
@@ -1034,11 +1074,11 @@ where
 {
     match source {
         AuthRef::Inline(_) => Err(raster_core::Error::Other(
-            "call_recur! requires a selectable internal list source".into(),
+            "call_recur! requires a selectable storage list source".into(),
         )),
-        AuthRef::Internal(binding) => {
+        AuthRef::Storage(binding) => {
             let value = (binding.resolve.as_ref())(binding.reference.clone())?;
-            Ok(ResolvedRecurList::Internal {
+            Ok(ResolvedRecurList::Storage {
                 reference: binding.reference.clone(),
                 value: Rc::new(value),
             })
@@ -1049,7 +1089,7 @@ where
 impl<T> ResolvedRecurList<T> {
     fn len(&self) -> u64 {
         match self {
-            ResolvedRecurList::Internal { value, .. } => value.value.len() as u64,
+            ResolvedRecurList::Storage { value, .. } => value.value.len() as u64,
         }
     }
 
@@ -1060,19 +1100,24 @@ impl<T> ResolvedRecurList<T> {
         let relative_selector = selector_path(Vec::from([SelectorSegment::Index(index)]));
 
         match self {
-            ResolvedRecurList::Internal { reference, value } => {
+            ResolvedRecurList::Storage { reference, value } => {
                 let parent = value.clone();
-                let item_selector = relative_selector.clone();
+                let mut item_selector = parent.selector.clone();
+                item_selector
+                    .segments
+                    .extend(relative_selector.segments.iter().cloned());
+                let resolve_selector = item_selector.clone();
 
-                Ok(AuthRef::Internal(DeferredAuthInternal {
+                Ok(AuthRef::Storage(DeferredAuthStorage {
                     reference: reference.clone(),
+                    selector: item_selector,
                     resolve: Rc::new(move |_| {
                         if let Ok(selected) =
-                            select_stored_internal_value::<T>(&parent.reference, &item_selector)
+                            select_stored_value::<T>(&parent.reference, &resolve_selector)
                         {
                             return Ok(selected);
                         }
-                        select_internal_value::<Vec<T>, T>(parent.as_ref(), &relative_selector)
+                        select_storage_value::<Vec<T>, T>(parent.as_ref(), &relative_selector)
                     }),
                     marker: PhantomData,
                 }))
@@ -1100,9 +1145,9 @@ where
 {
     match source {
         AuthRef::Inline(_) => Err(raster_core::Error::Other(
-            "call_recur! requires a selectable internal list source".into(),
+            "call_recur! requires a selectable storage list source".into(),
         )),
-        AuthRef::Internal(binding) => {
+        AuthRef::Storage(binding) => {
             let current = (binding.resolve.as_ref())(binding.reference.clone())?;
             Ok(current.value)
         }
@@ -1118,15 +1163,16 @@ where
     }
 }
 
-impl<Root> IntoAuthRef<Root> for TypedInternalBinding<Root>
+impl<Root> IntoAuthRef<Root> for TypedStorageBinding<Root>
 where
     Root: DeserializeOwned + Serialize + 'static,
 {
     fn into_auth_ref(self) -> AuthRef<Root> {
         let reference = self.reference;
         let resolve = self.resolve;
-        AuthRef::Internal(DeferredAuthInternal {
+        AuthRef::Storage(DeferredAuthStorage {
             reference,
+            selector: SelectorPath::default(),
             resolve: Rc::new(move |reference| (resolve)(reference)),
             marker: PhantomData,
         })
@@ -1189,13 +1235,13 @@ where
     }
 }
 
-impl<Root> IntoAuthValue<Root> for TypedInternalBinding<Root>
+impl<Root> IntoAuthValue<Root> for TypedStorageBinding<Root>
 where
     Root: DeserializeOwned + Serialize,
 {
     fn into_auth_value(self) -> raster_core::Result<AuthValue<Root>> {
         let value = (self.resolve)(self.reference)?;
-        Ok(AuthValue::internal(value))
+        Ok(AuthValue::storage(value))
     }
 }
 
@@ -1206,9 +1252,9 @@ where
     fn into_auth_value(self) -> raster_core::Result<AuthValue<Current>> {
         match self {
             AuthRef::Inline(value) => Ok(AuthValue::inline(value)),
-            AuthRef::Internal(binding) => {
+            AuthRef::Storage(binding) => {
                 let value = (binding.resolve.as_ref())(binding.reference)?;
-                Ok(AuthValue::internal(value))
+                Ok(AuthValue::storage(value))
             }
         }
     }
@@ -1287,13 +1333,13 @@ where
             value: FnInputValue::Inline(
                 raster_core::postcard::to_allocvec(value).unwrap_or_default(),
             ),
-            internal: None,
+            storage: None,
         }),
-        AuthRef::Internal(binding) => {
+        AuthRef::Storage(binding) => {
             let resolved = (binding.resolve.as_ref())(binding.reference.clone())?;
             Ok(AuthRefTrace {
-                value: FnInputValue::InternalBinding,
-                internal: Some(TraceInternalData {
+                value: FnInputValue::StorageBinding,
+                storage: Some(TraceStorageData {
                     coordinates: resolved.reference.coordinates,
                     commitment: resolved.reference.commitment,
                     selector: resolved.selector,
@@ -1358,17 +1404,17 @@ pub fn raster_trace_payload<T: Serialize>(
     ))
 }
 
-pub fn select_internal_value<Root, T>(
-    value: &InternalValue<Root>,
+pub fn select_storage_value<Root, T>(
+    value: &StorageValue<Root>,
     selector: &SelectorPath,
-) -> raster_core::Result<InternalValue<T>>
+) -> raster_core::Result<StorageValue<T>>
 where
     Root: DeserializeOwned + Serialize + Selectable,
     T: DeserializeOwned + Serialize,
 {
     #[cfg(feature = "std")]
     {
-        return raster_runtime::select_internal_value::<Root, T>(value, selector);
+        return raster_runtime::select_storage_value::<Root, T>(value, selector);
     }
 
     #[cfg(not(feature = "std"))]
@@ -1376,21 +1422,21 @@ where
         let _ = value;
         let _ = selector;
         Err(raster_core::Error::Other(format!(
-            "Internal selection refinement requires the `std` feature"
+            "Storage selection refinement requires the `std` feature"
         )))
     }
 }
 
-pub fn select_stored_internal_value<T>(
-    reference: &InternalRef,
+pub fn select_stored_value<T>(
+    reference: &StorageRef,
     selector: &SelectorPath,
-) -> raster_core::Result<InternalValue<T>>
+) -> raster_core::Result<StorageValue<T>>
 where
     T: DeserializeOwned + Serialize,
 {
     #[cfg(feature = "std")]
     {
-        return raster_runtime::select_stored_internal_value::<T>(reference, selector);
+        return raster_runtime::select_stored_value::<T>(reference, selector);
     }
 
     #[cfg(not(feature = "std"))]
@@ -1398,41 +1444,41 @@ where
         let _ = reference;
         let _ = selector;
         Err(raster_core::Error::Other(alloc::format!(
-            "Internal raster selection requires the `std` feature"
+            "Storage raster selection requires the `std` feature"
         )))
     }
 }
 
-pub fn resolve_internal_value<T: DeserializeOwned + Serialize>(
-    reference: InternalRef,
-) -> raster_core::Result<raster_core::input::InternalValue<T>> {
+pub fn resolve_storage_value<T: DeserializeOwned + Serialize>(
+    reference: StorageRef,
+) -> raster_core::Result<raster_core::input::StorageValue<T>> {
     #[cfg(feature = "std")]
     {
-        return raster_runtime::resolve_internal_value(&reference);
+        return raster_runtime::resolve_storage_value(&reference);
     }
 
     #[cfg(not(feature = "std"))]
     {
         let _ = reference;
         Err(raster_core::Error::Other(alloc::format!(
-            "Internal input resolution requires the `std` feature"
+            "Storage input resolution requires the `std` feature"
         )))
     }
 }
 
-pub fn resolve_internal_ok_value<T: DeserializeOwned + Serialize>(
-    reference: InternalRef,
-) -> raster_core::Result<raster_core::input::InternalValue<T>> {
+pub fn resolve_storage_ok_value<T: DeserializeOwned + Serialize>(
+    reference: StorageRef,
+) -> raster_core::Result<raster_core::input::StorageValue<T>> {
     #[cfg(feature = "std")]
     {
-        return raster_runtime::resolve_internal_ok_value(&reference);
+        return raster_runtime::resolve_storage_ok_value(&reference);
     }
 
     #[cfg(not(feature = "std"))]
     {
         let _ = reference;
         Err(raster_core::Error::Other(alloc::format!(
-            "Result-backed internal input resolution requires the `std` feature"
+            "Result-backed storage input resolution requires the `std` feature"
         )))
     }
 }
@@ -1473,7 +1519,7 @@ where
                     error
                 )
             });
-        return into_auth_ref::<S, _>(typed_internal::<S>(reference));
+        return into_auth_ref::<S, _>(typed_storage::<S>(reference));
     }
 
     #[cfg(not(feature = "std"))]
@@ -1501,7 +1547,7 @@ where
                 error
             )
         });
-        return into_auth_ref::<S, _>(typed_internal::<S>(reference));
+        return into_auth_ref::<S, _>(typed_storage::<S>(reference));
     }
 
     #[cfg(not(feature = "std"))]
@@ -1813,8 +1859,8 @@ where
 }
 
 #[cfg(feature = "std")]
-pub fn store_internal_value<T: Serialize>(value: &T) -> raster_core::Result<InternalRef> {
-    raster_runtime::store_internal_value(value)
+pub fn store_value<T: Serialize>(value: &T) -> raster_core::Result<StorageRef> {
+    raster_runtime::store_value(value)
 }
 
 pub fn materialize_auth_return<T, A>(value: A) -> T

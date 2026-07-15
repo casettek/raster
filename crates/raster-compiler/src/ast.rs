@@ -840,8 +840,9 @@ mod tests {
 
     #[test]
     fn test_argument_classification_treats_constructed_values_as_inline() {
-        let calls =
-            parse_calls(r#"fn seq() { let r = call!(t, "lit".to_string(), Doc { id: 1 }, 2 + 2); }"#);
+        let calls = parse_calls(
+            r#"fn seq() { let r = call!(t, "lit".to_string(), Doc { id: 1 }, 2 + 2); }"#,
+        );
         assert_eq!(calls.len(), 1);
         assert_eq!(
             calls[0].argument_kinds,

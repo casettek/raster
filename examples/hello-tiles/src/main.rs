@@ -22,10 +22,7 @@ fn personal_greet_seq(personal_data: PersonalData) -> Result<String> {
 
 #[sequence]
 fn greet_sequence(name: String, personal_data: PersonalData) -> String {
-    call!(
-        personal_greet,
-        select!(String, personal_data.name)
-    );
+    call!(personal_greet, select!(String, personal_data.name));
     let greeting = call!(greet, name);
     let e1 = call!(exclaim, greeting);
     let e2 = call!(exclaim, e1);
@@ -67,11 +64,7 @@ fn placeholder_sequence(placeholder: String) -> String {
 ///
 #[sequence]
 fn main(personal_data: PersonalData, personal_data_bin: PersonalData, seed: u64) {
-    call_seq!(
-        greet_sequence,
-        "Rust".to_string(),
-        personal_data.clone()
-    );
+    call_seq!(greet_sequence, "Rust".to_string(), personal_data.clone());
 
     let name = select!(String, personal_data.clone().name);
     let seed = select!(u64, seed);

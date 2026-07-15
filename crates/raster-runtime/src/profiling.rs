@@ -75,7 +75,7 @@ pub struct TileProfileRecord {
     #[serde(default)]
     pub external_input_resolve_ns: u64,
     #[serde(default)]
-    pub internal_input_resolve_ns: u64,
+    pub storage_input_resolve_ns: u64,
     #[serde(default)]
     pub output_store_ns: u64,
     #[serde(default)]
@@ -150,7 +150,7 @@ impl SequenceProfileSelfBreakdown {
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct TileProfileOverheadBreakdown {
     pub external_input_resolve_ns: u64,
-    pub internal_input_resolve_ns: u64,
+    pub storage_input_resolve_ns: u64,
     pub output_store_ns: u64,
     pub trace_serialize_ns: u64,
     pub draft_capture_ns: u64,
@@ -165,7 +165,7 @@ impl TileProfileOverheadBreakdown {
     #[cfg(feature = "profiling")]
     fn measured_total_ns(&self) -> u64 {
         self.external_input_resolve_ns
-            .saturating_add(self.internal_input_resolve_ns)
+            .saturating_add(self.storage_input_resolve_ns)
             .saturating_add(self.output_store_ns)
             .saturating_add(self.trace_serialize_ns)
             .saturating_add(self.draft_capture_ns)
@@ -490,7 +490,7 @@ pub fn record_tile_profile(
             user_duration_ns,
             raster_overhead_ns,
             external_input_resolve_ns: overhead_breakdown.external_input_resolve_ns,
-            internal_input_resolve_ns: overhead_breakdown.internal_input_resolve_ns,
+            storage_input_resolve_ns: overhead_breakdown.storage_input_resolve_ns,
             output_store_ns: overhead_breakdown.output_store_ns,
             trace_serialize_ns: overhead_breakdown.trace_serialize_ns,
             draft_capture_ns: overhead_breakdown.draft_capture_ns,
@@ -635,9 +635,7 @@ fn spawn_stream_writer(path: PathBuf) -> std::io::Result<ProfileStreamHandle> {
 #[cfg(all(test, feature = "profiling"))]
 mod tests {
     use super::*;
-    use crate::internal_storage::{
-        enter_sequence_scope, exit_sequence_scope, store_internal_value,
-    };
+    use crate::storage::{enter_sequence_scope, exit_sequence_scope, store_value};
 
     fn reset_profiler() {
         PROFILER_STATE.with(|state| {
@@ -756,7 +754,7 @@ mod tests {
 
         enter_sequence_scope("main");
         begin_sequence_profile("main");
-        let _ = store_internal_value(&123u64).expect("store should allocate synthetic coordinates");
+        let _ = store_value(&123u64).expect("store should allocate synthetic coordinates");
         finish_sequence_profile(
             "main",
             1_000_000,

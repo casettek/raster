@@ -26,7 +26,7 @@ Relevant current gaps:
 
 - `#[tile(kind = recur)]` is metadata-only today; no recursive executor exists.
 - `select!` works for external bindings, but not for internal list references.
-- internal storage stores whole objects by coordinates and commitment; it does
+- storage stores whole objects by coordinates and commitment; it does
   not yet expose selector-aware collection references.
 
 ## Code audit tasks (where to look)
@@ -50,8 +50,8 @@ Relevant current gaps:
     - `SelectionProofStep::List`
 - **Current external raster selection implementation**
   - `crates/raster-runtime/src/raster_index.rs`
-- **Current internal storage model**
-  - `crates/raster-runtime/src/internal_storage.rs`
+- **Current storage model**
+  - `crates/raster-runtime/src/storage.rs`
 - **Current trace and transition witnesses**
   - `crates/raster-core/src/trace.rs`
   - `crates/raster-core/src/transition.rs`
@@ -337,9 +337,9 @@ Additionally, when the run is finalized, the transition layer should verify:
 - all indices `0..len-1` were written exactly once
 - the final output root matches the set of per-index writes
 
-## Internal storage model
+## Storage model
 
-The internal storage side should remain append-oriented.
+The storage side should remain append-oriented.
 
 Each step writes a small record that binds an output object commitment to a list
 slot, conceptually:
@@ -408,7 +408,7 @@ as `RecurListCtx` rather than exposing raw witness objects directly.
   - add source-index and output-slot binding metadata
 - `crates/raster-core/src/transition.rs`
   - add witnesses for output-slot writes and final manifest assembly
-- `crates/raster-runtime/src/internal_storage.rs`
+- `crates/raster-runtime/src/storage.rs`
   - add list-slot write records / manifest support
 - `crates/raster-runtime/src/tracing/recorder.rs`
   - record recur-list step metadata
@@ -422,7 +422,7 @@ This proposal does not define:
 - general recursive state machines
 - tree reductions or joins
 - output collections with different length than the input
-- selector-aware arbitrary `InternalRef`
+- selector-aware arbitrary `StorageRef`
 - final on-chain verifier format
 
 Those are follow-up layers. This document is only about the first recursive list

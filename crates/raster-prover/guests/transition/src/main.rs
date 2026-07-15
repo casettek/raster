@@ -5,7 +5,7 @@
 //! 1. Attach to the chain: genesis state (`Init`) or a recursively verified
 //!    previous transition journal (`Next`).
 //! 2. Verify the step against every recorded commitment (CFS bindings,
-//!    IO/replay, internal store, draft chain) and append it to the trace
+//!    IO/replay, storage, draft chain) and append it to the trace
 //!    frontier + fingerprint.
 //! 3. Compare the accumulated fingerprint with the committed one and commit
 //!    the resulting journal (`Next`, or `Finished` on the proven divergence).

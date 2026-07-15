@@ -14,12 +14,11 @@ use quote::{format_ident, quote, ToTokens};
 use syn::{FnArg, ItemFn, ReturnType, Type};
 
 use crate::{
-    extract_params, gen_recur_sequence_input_serialization,
-    recur_control_inner_type, recur_control_state_output_parts, recur_input_inner_type,
-    recur_output_inner_type, recur_sequence_state_inner_type,
+    extract_params, gen_recur_sequence_input_serialization, recur_control_inner_type,
+    recur_control_state_output_parts, recur_input_inner_type, recur_output_inner_type,
     recur_sequence_input_inner_type, recur_sequence_output_inner_type,
-    recur_sequence_state_output_parts, recur_state_inner_type, recur_state_output_parts,
-    types_equivalent, ParamInfo, ProtocolReturnKind,
+    recur_sequence_state_inner_type, recur_sequence_state_output_parts, recur_state_inner_type,
+    recur_state_output_parts, types_equivalent, ParamInfo, ProtocolReturnKind,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -49,7 +48,10 @@ pub(crate) struct RecurSequenceShape {
     output_schema: Option<Type>,
 }
 
-pub(crate) fn validate_recur_tile_shape(input: &ItemFn, return_kind: &ProtocolReturnKind) -> RecurTileShape {
+pub(crate) fn validate_recur_tile_shape(
+    input: &ItemFn,
+    return_kind: &ProtocolReturnKind,
+) -> RecurTileShape {
     let params = extract_params(input);
     if params.len() < 2 {
         panic!("`#[tile(kind = recur)]` tiles must accept at least `(input, state)` or `(input, output)`");
@@ -559,17 +561,17 @@ pub(crate) fn gen_recur_driver_function(
                 let #trace_ident = ::raster::into_auth_value::<#ty, _>(#name.clone())
                     .unwrap_or_else(|e| panic!("Failed to materialize auth value for recur argument '{}': {}", stringify!(#name), e));
                 let __raster_trace_value = match #trace_ident {
-                    ::raster::AuthValue::Internal(__raster_internal_value) => {
+                    ::raster::AuthValue::Storage(__raster_internal_value) => {
                         __raster_internal.insert(
                             ::raster::alloc::string::String::from(#name_str),
-                            ::raster::core::trace::InternalData {
+                            ::raster::core::trace::StorageData {
                                 coordinates: __raster_internal_value.reference.coordinates.clone(),
                                 commitment: __raster_internal_value.reference.commitment.clone(),
                                 selector: __raster_internal_value.selector.clone(),
                                 selection: __raster_internal_value.selection.clone(),
                             }
                         );
-                        ::raster::core::trace::FnInputValue::InternalBinding
+                        ::raster::core::trace::FnInputValue::StorageBinding
                     }
                     ::raster::AuthValue::Inline(__raster_inline_value) => {
                         ::raster::core::trace::FnInputValue::Inline(
@@ -615,7 +617,7 @@ pub(crate) fn gen_recur_driver_function(
                     name: ::raster::alloc::string::String::from("input"),
                     ty: ::raster::alloc::string::String::from(stringify!(::raster::AuthRef<::raster::alloc::vec::Vec<#item_ty>>)),
                 });
-                if let ::core::option::Option::Some(__raster_internal_info) = __raster_input_trace.internal {
+                if let ::core::option::Option::Some(__raster_internal_info) = __raster_input_trace.storage {
                     __raster_internal.insert(
                         ::raster::alloc::string::String::from("input"),
                         __raster_internal_info,
@@ -633,14 +635,14 @@ pub(crate) fn gen_recur_driver_function(
                     data: __raster_input_bytes,
                     values: __raster_trace_values,
                     args: __raster_trace_args,
-                    internal: __raster_internal,
+                    storage: __raster_internal,
                 });
 
                 let __raster_recur_trace_scope = ::raster::__private::RecurTraceScopeGuard::enter();
                 let result = #run_driver;
                 drop(__raster_recur_trace_scope);
 
-                let __raster_resolved_output = ::raster::resolve_internal_value::<#result_ty>(result.reference().clone())
+                let __raster_resolved_output = ::raster::resolve_storage_value::<#result_ty>(result.reference().clone())
                     .unwrap_or_else(|e| panic!("Failed to resolve recur output for trace: {}", e));
                 let __raster_output_bytes = __raster_resolved_output.bytes.clone();
                 let __raster_output = ::core::option::Option::Some(
@@ -971,7 +973,7 @@ pub(crate) fn gen_recur_sequence_driver_function(
                         name: ::raster::alloc::string::String::from("input"),
                         ty: ::raster::alloc::string::String::from(stringify!(::raster::AuthRef<::raster::alloc::vec::Vec<#item_ty>>)),
                     }],
-                    internal: __raster_input_trace.internal.map(|internal| {
+                    storage: __raster_input_trace.storage.map(|internal| {
                         let mut map = ::raster::alloc::collections::BTreeMap::new();
                         map.insert(::raster::alloc::string::String::from("input"), internal);
                         map
@@ -980,7 +982,7 @@ pub(crate) fn gen_recur_sequence_driver_function(
 
                 let result = #run_driver;
 
-                let __raster_resolved_output = ::raster::resolve_internal_value::<#result_ty>(result.reference().clone())
+                let __raster_resolved_output = ::raster::resolve_storage_value::<#result_ty>(result.reference().clone())
                     .unwrap_or_else(|e| panic!("Failed to resolve recur sequence output for trace: {}", e));
                 let __raster_output_bytes = __raster_resolved_output.bytes.clone();
                 let __raster_output = ::core::option::Option::Some(
@@ -1011,4 +1013,3 @@ pub(crate) fn gen_recur_sequence_driver_function(
         }
     }
 }
-
