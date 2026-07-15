@@ -82,6 +82,18 @@ impl CfsCursor {
         self.coordinates = coordinates;
     }
 
+    /// The declared entry-argument names, in canonical order, if `main`
+    /// declares any (i.e. its item list starts with an `Entrypoint` item at
+    /// coordinate `[0]`). `None` means `main` declares no external
+    /// arguments at all — there is nothing to authorize at entry.
+    pub fn main_entrypoint_names(&self) -> Option<&[String]> {
+        let main = self.cfs.sequences.get(self.entrypoint_coordinate as usize)?;
+        match main.items.first()? {
+            SequenceChildItem::Entrypoint(item) => Some(item.names.as_slice()),
+            _ => None,
+        }
+    }
+
     pub fn is_next_coordinates(&mut self, next_coordinates: &CfsCoordinates) -> bool {
         if let Some(next_coordinates_options) = self.try_get_next_coordinates(&self.coordinates()) {
             return next_coordinates_options.contains(next_coordinates);
@@ -269,6 +281,13 @@ impl CfsCursor {
                         depth += 2;
                     }
                 }
+                SequenceChildItem::Entrypoint(_) => {
+                    if depth + 1 != coords.len() {
+                        panic!("Entrypoint coordinates cannot have nested child coordinates");
+                    }
+                    sequence_item_coord = Some(coord);
+                    depth += 1;
+                }
             }
         }
 
@@ -346,6 +365,7 @@ impl CfsCursor {
                     SequenceChildItem::RecurSequence(recur_sequence_item) => {
                         SequenceChildId::RecurSequence(recur_sequence_item.id.clone())
                     }
+                    SequenceChildItem::Entrypoint(_) => SequenceChildId::Entrypoint,
                 };
 
                 id == child_id && index >= parent_current_index as usize
@@ -366,6 +386,7 @@ impl CfsCursor {
                             SequenceChildItem::Tile(item) => item.id,
                             SequenceChildItem::RecurTile(item) => item.id,
                             SequenceChildItem::RecurSequence(item) => item.id,
+                            SequenceChildItem::Entrypoint(_) => "__entrypoint".to_string(),
                         })
                         .collect::<Vec<_>>()
                 )
@@ -481,6 +502,8 @@ pub enum SequenceChildId {
     Tile(TileId),
     RecurTile(TileId),
     RecurSequence(SequenceId),
+    /// The single, main-only entry-argument binding item.
+    Entrypoint,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -507,6 +530,7 @@ impl SequenceDef {
                 SequenceChildItem::Tile(_) => None,
                 SequenceChildItem::RecurTile(_) => None,
                 SequenceChildItem::RecurSequence(_) => None,
+                SequenceChildItem::Entrypoint(_) => None,
                 SequenceChildItem::Sequence(sequence) => Some(sequence.clone()),
             })
             .collect()
@@ -519,6 +543,21 @@ pub enum SequenceChildItem {
     Tile(TileItem),
     RecurTile(RecurTileItem),
     RecurSequence(RecurSequenceItem),
+    /// Leading item of `main`'s item list when `main` declares external
+    /// arguments. Binds a single internal-store object at this item's
+    /// coordinate to a struct-of-commitments over the named entry
+    /// arguments (see `EntrypointOp::BindEntryArguments`). Never appears
+    /// outside `main`, and declares no input bindings of its own.
+    Entrypoint(EntrypointItem),
+}
+
+/// Declares the ordered set of external arguments `main` binds as a single
+/// internal-store object. `names` is the CFS-canonical declaration order,
+/// used both to recompute the struct-of-commitments root and to resolve
+/// each argument's `PriorItemOutput` binding to this same item's coordinate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EntrypointItem {
+    pub names: Vec<String>,
 }
 
 impl SequenceChildItem {
@@ -528,6 +567,8 @@ impl SequenceChildItem {
             SequenceChildItem::Tile(tile_item) => &tile_item.sources,
             SequenceChildItem::RecurTile(recur_item) => &recur_item.sources,
             SequenceChildItem::RecurSequence(recur_sequence_item) => &recur_sequence_item.sources,
+            // A declaration site, not a consumer — nothing to bind.
+            SequenceChildItem::Entrypoint(_) => &[],
         }
     }
 }

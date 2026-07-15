@@ -2,7 +2,7 @@ use raster_core::cfs::{CfsCoordinates, CfsCursor, ControlFlowSchema, SequenceChi
 use raster_core::draft::DraftTransitionWitness;
 use raster_core::input::{InternalRef, SelectionWitness, SelectorPath};
 use raster_core::trace::{
-    ExternalInput, FnInput, InternalInput, RecurSequenceExecRecord, RecurTileExecRecord,
+    FnInput, InternalInput, RecurSequenceExecRecord, RecurTileExecRecord,
     SequenceEndRecord, SequenceStartRecord, StepRecord, TileExecRecord, TraceEvent,
 };
 use sha2::{Digest, Sha256};
@@ -97,7 +97,6 @@ pub struct StepWitnessData {
     input_data: Option<Vec<u8>>,
     input_source_witness: Option<FnInput>,
     output_data: Option<Vec<u8>>,
-    external_input: ExternalInput,
     internal_input: InternalInput,
     internal_write: Option<InternalWriteRecord>,
     draft_transition_witness: Option<DraftTransitionWitness>,
@@ -114,10 +113,6 @@ impl StepWitnessData {
 
     pub fn input_source_witness(&self) -> Option<FnInput> {
         self.input_source_witness.clone()
-    }
-
-    pub fn external_input(&self) -> ExternalInput {
-        self.external_input.clone()
     }
 
     pub fn internal_input(&self) -> InternalInput {
@@ -155,11 +150,6 @@ impl StepWitnessStore {
                         input_data: trace_item.input.as_ref().map(|input| input.data().to_vec()),
                         input_source_witness: trace_item.input.clone(),
                         output_data: None,
-                        external_input: trace_item
-                            .input
-                            .as_ref()
-                            .map(|input| input.external().clone())
-                            .unwrap_or_default(),
                         internal_input: trace_item
                             .input
                             .as_ref()
@@ -191,11 +181,6 @@ impl StepWitnessStore {
                             .output
                             .as_ref()
                             .map(|output| output.data().to_vec()),
-                        external_input: trace_item
-                            .input
-                            .as_ref()
-                            .map(|input| input.external().clone())
-                            .unwrap_or_default(),
                         internal_input: trace_item
                             .input
                             .as_ref()
@@ -218,11 +203,6 @@ impl StepWitnessStore {
                             .output
                             .as_ref()
                             .map(|output| output.data().to_vec()),
-                        external_input: trace_item
-                            .input
-                            .as_ref()
-                            .map(|input| input.external().clone())
-                            .unwrap_or_default(),
                         internal_input: trace_item
                             .input
                             .as_ref()
@@ -233,17 +213,35 @@ impl StepWitnessStore {
                     },
                 );
             }
+            TraceEvent::EntrypointBind(_) => {
+                // A declaration, not a consumer: no CFS inputs, no input
+                // witness bytes of its own (see `EntrypointRecord`'s
+                // `input_source_commitment`, which commits to an empty
+                // `FnInput` — matching `SequenceChildItem::Entrypoint`'s
+                // empty `inputs()`).
+                self.0.insert(
+                    coordinates,
+                    StepWitnessData {
+                        input_data: None,
+                        input_source_witness: Some(FnInput {
+                            data: Vec::new(),
+                            values: Vec::new(),
+                            args: Vec::new(),
+                            internal: InternalInput::new(),
+                        }),
+                        output_data: None,
+                        internal_input: InternalInput::new(),
+                        internal_write,
+                        draft_transition_witness: None,
+                    },
+                );
+            }
         }
     }
 
     pub fn get(&self, coordinates: &CfsCoordinates) -> Option<&StepWitnessData> {
         self.0.get(coordinates)
     }
-}
-
-fn external_input_commitment(external_input: &ExternalInput) -> Vec<u8> {
-    let bytes = raster_core::postcard::to_allocvec(external_input).unwrap_or_default();
-    Sha256::digest(bytes).to_vec()
 }
 
 fn input_source_commitment(input: &FnInput) -> Vec<u8> {
@@ -305,13 +303,9 @@ impl TraceRecorder {
     pub fn io_data_at(
         &self,
         coordinates: &CfsCoordinates,
-    ) -> Option<(Option<Vec<u8>>, Option<Vec<u8>>, ExternalInput)> {
+    ) -> Option<(Option<Vec<u8>>, Option<Vec<u8>>)> {
         self.witness_store.get(coordinates).map(|trace_io| {
-            (
-                trace_io.input_data.clone(),
-                trace_io.output_data.clone(),
-                trace_io.external_input.clone(),
-            )
+            (trace_io.input_data.clone(), trace_io.output_data.clone())
         })
     }
 
@@ -331,10 +325,6 @@ impl TraceRecorder {
                     .as_ref()
                     .map(|output| Sha256Commitment::from(output).into())
                     .unwrap_or_default();
-                let external_input_commitment = input
-                    .as_ref()
-                    .map(|input| external_input_commitment(input.external()))
-                    .unwrap_or_default();
                 let input_source_commitment = input
                     .as_ref()
                     .map(input_source_commitment)
@@ -346,7 +336,6 @@ impl TraceRecorder {
                     coordinates: coordinates.clone(),
                     input_commitment,
                     input_source_commitment,
-                    external_input_commitment,
                 };
 
                 self.witness_store.insert(coordinates, event.clone(), None);
@@ -445,10 +434,6 @@ impl TraceRecorder {
                     .as_ref()
                     .map(|output| Sha256Commitment::from(output).into())
                     .unwrap_or_default();
-                let external_input_commitment = input
-                    .as_ref()
-                    .map(|input| external_input_commitment(input.external()))
-                    .unwrap_or_default();
                 let input_source_commitment = input
                     .as_ref()
                     .map(input_source_commitment)
@@ -460,7 +445,6 @@ impl TraceRecorder {
                     coordinates: iteration_coordinates.clone(),
                     input_commitment,
                     input_source_commitment,
-                    external_input_commitment,
                 };
 
                 self.witness_store
@@ -541,10 +525,6 @@ impl TraceRecorder {
                     .as_ref()
                     .map(|input| Sha256Commitment::from(input).into())
                     .unwrap_or_default();
-                let external_input_commitment = input
-                    .as_ref()
-                    .map(|input| external_input_commitment(input.external()))
-                    .unwrap_or_default();
                 let input_source_commitment = input
                     .as_ref()
                     .map(input_source_commitment)
@@ -572,7 +552,6 @@ impl TraceRecorder {
                     input_commitment,
                     input_source_commitment,
                     output_commitment,
-                    external_input_commitment,
                     internal_store_root_before: internal_write
                         .as_ref()
                         .map(|write| write.store_root_before.clone())
@@ -638,10 +617,6 @@ impl TraceRecorder {
                     .as_ref()
                     .map(|input| Sha256Commitment::from(input).into())
                     .unwrap_or_default();
-                let external_input_commitment = input
-                    .as_ref()
-                    .map(|input| external_input_commitment(input.external()))
-                    .unwrap_or_default();
                 let input_source_commitment = input
                     .as_ref()
                     .map(input_source_commitment)
@@ -669,7 +644,6 @@ impl TraceRecorder {
                     input_commitment,
                     input_source_commitment,
                     output_commitment,
-                    external_input_commitment,
                     internal_store_root_before: internal_write
                         .as_ref()
                         .map(|write| write.store_root_before.clone())
@@ -734,10 +708,6 @@ impl TraceRecorder {
                     .as_ref()
                     .map(|input| Sha256Commitment::from(input).into())
                     .unwrap_or_default();
-                let external_input_commitment = input
-                    .as_ref()
-                    .map(|input| external_input_commitment(input.external()))
-                    .unwrap_or_default();
                 let input_source_commitment = input
                     .as_ref()
                     .map(input_source_commitment)
@@ -765,7 +735,6 @@ impl TraceRecorder {
                     input_commitment,
                     input_source_commitment,
                     output_commitment,
-                    external_input_commitment,
                     internal_store_root_before: internal_write
                         .as_ref()
                         .map(|write| write.store_root_before.clone())
@@ -837,10 +806,6 @@ impl TraceRecorder {
                     .as_ref()
                     .map(|input| Sha256Commitment::from(input).into())
                     .unwrap_or_default();
-                let external_input_commitment = input
-                    .as_ref()
-                    .map(|input| external_input_commitment(input.external()))
-                    .unwrap_or_default();
                 let input_source_commitment = input
                     .as_ref()
                     .map(input_source_commitment)
@@ -868,7 +833,6 @@ impl TraceRecorder {
                     input_commitment,
                     input_source_commitment,
                     output_commitment,
-                    external_input_commitment,
                     internal_store_root_before: internal_write
                         .as_ref()
                         .map(|write| write.store_root_before.clone())
@@ -894,6 +858,112 @@ impl TraceRecorder {
                 );
 
                 StepRecord::RecurSequenceExec(record)
+            }
+            TraceEvent::EntrypointBind(bind_event) => {
+                let sequence_coordinates =
+                    self.sequence_callstack.current_sequence_coordinates.clone();
+                let current_sequence_state = self
+                    .sequence_callstack
+                    .last_mut()
+                    .expect("Entrypoint bind can't be recorded without sequence context");
+                let sequence_id = current_sequence_state.id.clone();
+                let parent_current_index = current_sequence_state.current_index;
+
+                let coordinates = self.cfs_cursor.get_child_coordinates(
+                    &sequence_coordinates,
+                    parent_current_index,
+                    SequenceChildId::Entrypoint,
+                );
+                current_sequence_state.current_index += 1;
+
+                let names: Vec<String> = bind_event
+                    .arguments
+                    .iter()
+                    .map(|argument| argument.name.clone())
+                    .collect();
+                let sources = bind_event
+                    .arguments
+                    .iter()
+                    .map(|argument| {
+                        let kind = match argument.encoding {
+                            raster_core::input::ExternalEncoding::Raster => {
+                                crate::internal_storage::ReferencedSourceKind::Raster
+                            }
+                            raster_core::input::ExternalEncoding::Postcard => {
+                                // `TraceRecorder` runs in `raster-cli`'s own
+                                // process (spawned generically, over any user
+                                // project — see `commands/run.rs`), never the
+                                // user program's. Postcard sources aren't
+                                // self-describing (unlike raster's
+                                // `.rindex`), so selecting into one requires
+                                // the argument's concrete Rust type — which a
+                                // generic, cross-process recorder cannot have.
+                                // This mirrors the pre-existing constraint on
+                                // ordinary internal objects (`OwnedObject::select`
+                                // requires a raster payload too) and on the
+                                // old `external!()` design
+                                // (`external_selection_witness` only ever
+                                // supported raster external inputs). Use
+                                // raster encoding in `input_manifest.json` for
+                                // any entry argument that needs a selection
+                                // witness built by the commit/audit pipeline;
+                                // postcard entry arguments remain fully usable
+                                // in-process (plain `cargo run`) or as whole
+                                // values.
+                                panic!(
+                                    "Cannot build a cross-process selection witness for postcard-encoded entry argument '{}': \
+                                     postcard sources are not self-describing and this recorder runs in a separate process from \
+                                     the one that resolved it. Use raster encoding in input_manifest.json for entry arguments \
+                                     that need --commit/--audit support.",
+                                    argument.name
+                                );
+                            }
+                        };
+                        crate::internal_storage::ReferencedSource {
+                            name: argument.name.clone(),
+                            commitment: argument.commitment.clone(),
+                            kind,
+                        }
+                    })
+                    .collect();
+
+                let resolver = crate::external_storage::ExternalStorageManager::from_cli_args()
+                    .expect("Failed to read --input/--input-manifest CLI context")
+                    .expect(
+                        "Entrypoint bind requires CLI input context from --input and --input-manifest",
+                    );
+                self.internal_storage
+                    .set_external_resolver(std::sync::Arc::new(resolver));
+
+                let write = self.internal_storage.append_referenced_object(
+                    crate::internal_storage::ReferencedObject { sources },
+                    coordinates.clone(),
+                );
+                let output_commitment = write.entry.object_commitment.clone();
+
+                let empty_input_source_commitment = input_source_commitment(&FnInput {
+                    data: Vec::new(),
+                    values: Vec::new(),
+                    args: Vec::new(),
+                    internal: InternalInput::new(),
+                });
+
+                let record = raster_core::trace::EntrypointRecord {
+                    exec_index,
+                    sequence_id,
+                    coordinates: coordinates.clone(),
+                    op: raster_core::trace::EntrypointOp::BindEntryArguments { names },
+                    input_source_commitment: empty_input_source_commitment,
+                    output_commitment,
+                    internal_store_root_before: write.store_root_before.clone(),
+                    internal_store_root_after: write.store_root_after.clone(),
+                    internal_store_index_root_before: write.index_root_before.clone(),
+                    internal_store_index_root_after: write.index_root_after.clone(),
+                };
+
+                self.witness_store.insert(coordinates, event.clone(), Some(write));
+
+                StepRecord::Entrypoint(record)
             }
         };
 

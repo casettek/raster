@@ -2,11 +2,10 @@
 //! ordering and per-argument input bindings.
 
 use raster_core::cfs::{CfsCoordinates, CfsCursor, InputBinding, InputSource};
-use raster_core::trace::{ExternalData, FnInput, FnInputValue, InternalData, StepRecord};
+use raster_core::trace::{FnInput, FnInputValue, InternalData, StepRecord};
 
 enum ResolvedSource<'a> {
     Inline(&'a Vec<u8>),
-    External(&'a ExternalData),
     Internal(&'a InternalData),
 }
 
@@ -22,11 +21,6 @@ fn resolved_source_at<'a>(input: &'a FnInput, index: usize) -> ResolvedSource<'a
 
     match value {
         FnInputValue::Inline(bytes) => ResolvedSource::Inline(bytes),
-        FnInputValue::ExternalBinding => {
-            ResolvedSource::External(input.external().get(&arg.name).unwrap_or_else(|| {
-                panic!("Missing external input metadata for arg '{}'", arg.name)
-            }))
-        }
         FnInputValue::InternalBinding => {
             ResolvedSource::Internal(input.internal().get(&arg.name).unwrap_or_else(|| {
                 panic!("Missing internal input metadata for arg '{}'", arg.name)
@@ -41,12 +35,6 @@ fn assert_same_source(left: ResolvedSource<'_>, right: ResolvedSource<'_>) {
             assert_eq!(
                 left_bytes, right_bytes,
                 "Inline sequence scope input does not match consumer binding",
-            );
-        }
-        (ResolvedSource::External(left_meta), ResolvedSource::External(right_meta)) => {
-            assert_eq!(
-                left_meta, right_meta,
-                "External sequence scope input does not match consumer binding",
             );
         }
         (ResolvedSource::Internal(left_meta), ResolvedSource::Internal(right_meta)) => {
@@ -120,12 +108,13 @@ pub fn verify_step_record_inputs(
         let resolved_source = resolved_source_at(input_source_witness, input_index);
         match step_input {
             InputBinding::Direct(InputSource::External) => {
-                assert!(
-                    matches!(resolved_source, ResolvedSource::External(_)),
-                    "Expected external input source for step {:?} arg {}",
-                    step_record,
-                    input_index,
-                );
+                // The compiler emits `Direct(External)` for arguments its
+                // static data-flow analysis cannot resolve to a prior item
+                // or sequence parameter (e.g. locally `select!`ed values).
+                // With per-use external bindings removed, there is no
+                // specific witness shape to pin down here; the value is
+                // still covered by the input/input-source commitments.
+                let _ = &resolved_source;
             }
             InputBinding::Direct(InputSource::Inline) => {
                 assert!(
@@ -191,7 +180,8 @@ pub fn verify_step_record_inputs(
                         );
                     }
                     raster_core::cfs::SequenceChildItem::Tile(_)
-                    | raster_core::cfs::SequenceChildItem::RecurTile(_) => {
+                    | raster_core::cfs::SequenceChildItem::RecurTile(_)
+                    | raster_core::cfs::SequenceChildItem::Entrypoint(_) => {
                         assert_eq!(
                             internal_meta.coordinates, source_coordinates,
                             "Internal input prior-item-output coordinates do not match expected CFS source",

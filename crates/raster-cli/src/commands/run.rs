@@ -19,7 +19,7 @@ use raster_core::cfs::ControlFlowSchema;
 use raster_core::coordinate_index::IncrementalCoordinateIndex;
 use raster_core::draft::DraftTransitionWitness;
 use raster_core::input::{InternalRef, SelectionWitness};
-use raster_core::trace::{ExternalInput, FnInput, StepRecord, Trace, TraceEvent};
+use raster_core::trace::{FnInput, StepRecord, Trace, TraceEvent};
 use raster_core::transition::{
     InternalStoreEntry, InternalStoreIndexValue, InternalStoreLogWitness, InternalStoreReadWitness,
     InternalStoreWitness, InternalStoreWriteWitness,
@@ -37,7 +37,7 @@ use raster_prover::transition::step_transitions;
 use raster_runtime::TraceRecorder;
 
 use crate::commands::create_run_artifacts;
-use crate::utils::authorization::{build_manifested_inputs, collect_external_input_commitments};
+use crate::utils::authorization::build_manifested_inputs;
 use crate::{BackendType, TraceFormat};
 
 pub fn run(
@@ -315,6 +315,13 @@ pub fn run(
                         sequence_end_record.coordinates
                     );
                 }
+                StepRecord::Entrypoint(entrypoint_record) => {
+                    println!(
+                        "[entrypoint] sequence id: {}",
+                        entrypoint_record.sequence_id
+                    );
+                    println!("coordinates: {:?}", entrypoint_record.coordinates);
+                }
             }
         }
     }
@@ -468,17 +475,18 @@ pub fn fraud(
         .iter_mut()
         .filter(|step_record| match step_record {
             StepRecord::TileExec(tile_exec_record) => {
-                !tile_exec_record.external_input_commitment.is_empty()
+                !tile_exec_record.input_commitment.is_empty()
             }
             StepRecord::RecurTileExec(recur_exec_record) => {
-                !recur_exec_record.external_input_commitment.is_empty()
+                !recur_exec_record.input_commitment.is_empty()
             }
             StepRecord::RecurSequenceExec(recur_sequence_exec_record) => {
-                !recur_sequence_exec_record
-                    .external_input_commitment
-                    .is_empty()
+                !recur_sequence_exec_record.input_commitment.is_empty()
             }
             StepRecord::SequenceStart(_) | StepRecord::SequenceEnd(_) => false,
+            // Not an execution step with an input commitment of its own;
+            // excluded from this fraud pool like SequenceStart/End.
+            StepRecord::Entrypoint(_) => false,
         })
         .choose(&mut rng)
     {
@@ -497,6 +505,9 @@ pub fn fraud(
             }
             StepRecord::SequenceEnd(sequence_end_record) => {
                 sequence_end_record.output_commitment.push(0);
+            }
+            StepRecord::Entrypoint(entrypoint_record) => {
+                entrypoint_record.output_commitment.push(0);
             }
         }
     };
@@ -655,29 +666,6 @@ fn internal_store_state_from_prefix(
     state
 }
 
-fn build_external_selection_witnesses(
-    external_input: &ExternalInput,
-) -> BTreeMap<String, SelectionWitness> {
-    external_input
-        .iter()
-        .filter_map(|(binding_name, external)| {
-            if external.selection.selected_len == 0 {
-                return None;
-            }
-            Some((
-                binding_name.clone(),
-                raster_runtime::external_selection_witness(&external.name, &external.selector)
-                    .unwrap_or_else(|error| {
-                        panic!(
-                            "Failed to build external selection witness for '{}': {}",
-                            binding_name, error
-                        )
-                    }),
-            ))
-        })
-        .collect()
-}
-
 fn build_internal_selection_witnesses(
     input_source_witness: Option<&FnInput>,
     trace_recorder: &TraceRecorder,
@@ -731,8 +719,6 @@ pub fn prove(
             Option<Vec<u8>>,
             Option<FnInput>,
             Option<FnInput>,
-            ExternalInput,
-            BTreeMap<String, SelectionWitness>,
             BTreeMap<String, SelectionWitness>,
             Option<InternalStoreWitness>,
             Option<DraftTransitionWitness>,
@@ -772,8 +758,6 @@ pub fn prove(
                         .step_witness_at(&parent_coordinates)
                         .and_then(|witness| witness.input_source_witness())
                 });
-        let external_input = step_witness.external_input();
-        let external_selection_witnesses = build_external_selection_witnesses(&external_input);
         let internal_selection_witnesses =
             build_internal_selection_witnesses(input_source_witness.as_ref(), trace_recorder);
         let draft_transition_witness = step_witness.draft_transition_witness();
@@ -838,8 +822,6 @@ pub fn prove(
                 output_witness,
                 input_source_witness,
                 sequence_scope_witness,
-                external_input,
-                external_selection_witnesses,
                 internal_selection_witnesses,
                 internal_store_witness,
                 draft_transition_witness,
@@ -859,11 +841,8 @@ pub fn prove(
         }
     }
 
-    let manifested_inputs = build_manifested_inputs(
-        input_manifest,
-        collect_external_input_commitments(&recorded_step_io),
-    )
-    .unwrap_or_else(|e| panic!("Failed to load authorization source: {}", e));
+    let manifested_inputs = build_manifested_inputs(input_manifest)
+        .unwrap_or_else(|e| panic!("Failed to load authorization source: {}", e));
 
     let (authorization_receipt, authorization_journal) =
         authorize_external_inputs(&manifested_inputs);

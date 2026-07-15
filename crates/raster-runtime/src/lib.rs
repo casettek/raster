@@ -12,18 +12,17 @@ pub mod profiling;
 mod raster_index;
 pub mod tracing;
 pub use input::{
-    encode_raster_value, external_selection_witness, resolve_external_value,
-    resolve_typed_external_value, select_external_arg, select_internal_value,
-    trace_raster_external_binding, write_raster_files,
+    encode_raster_value, postcard_structural_commitment, select_internal_value, write_raster_files,
 };
 pub use internal_storage::{
-    apply_draft_push, apply_draft_set, begin_draft_step_capture, create_draft,
-    enter_recur_sequence_iteration_scope, enter_recur_site_scope, enter_sequence_scope,
-    exit_recur_sequence_iteration_scope, exit_recur_site_scope, exit_sequence_scope,
-    finalize_draft, finalize_empty_draft, finish_draft_step_capture,
-    global_internal_store_snapshot, publish_pending_output_coordinates, resolve_internal_ok_value,
-    resolve_internal_value, select_stored_internal_value, store_execution_output_value,
-    store_internal_value, DraftCaptureSnapshot, InternalStorageManager, InternalStoreSnapshot,
+    apply_draft_push, apply_draft_set, begin_draft_step_capture, bind_entry_arguments,
+    create_draft, entry_argument_spec, enter_recur_sequence_iteration_scope,
+    enter_recur_site_scope, enter_sequence_scope, exit_recur_sequence_iteration_scope,
+    exit_recur_site_scope, exit_sequence_scope, finalize_draft, finalize_empty_draft,
+    finish_draft_step_capture, global_internal_store_snapshot, publish_pending_output_coordinates,
+    resolve_internal_ok_value, resolve_internal_value, select_stored_internal_value,
+    store_execution_output_value, store_internal_value, DraftCaptureSnapshot,
+    EntryArgumentsBinding, EntryArgumentSpec, InternalStorageManager, InternalStoreSnapshot,
     InternalWriteRecord, StoredInternalObject, TileExecutionScopeGuard,
 };
 pub use profiling::{

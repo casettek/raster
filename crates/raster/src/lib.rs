@@ -19,26 +19,24 @@ pub mod input;
 pub use input::{
     auth_ref_result_trace, auth_ref_trace, draft_replay_handle, draft_replay_transition, finalize,
     into_auth_ref, into_auth_value, into_draft, materialize_auth_result, materialize_auth_return,
-    new_draft, raster_trace_payload, resolve_external_value, resolve_internal_ok_value,
-    resolve_internal_value, resolve_typed_external_value, restore_draft_from_replay_handle,
-    run_recur_list, run_recur_list_state, run_recur_list_with_state, run_recur_sequence_list,
-    run_recur_sequence_list_state, run_recur_sequence_list_with_state, select_source,
-    select_stored_internal_value, selector_path, serialize_draft_replay_handle,
-    serialize_draft_trace, typed_external, typed_internal, typed_internal_with_resolver,
-    typed_selector_path, Anchor, AuthRef, AuthRefTrace, AuthValue, Draft, DraftAppendField,
-    DraftSetField, ExternalRef, ExternalSelection, ExternalValue, InternalRef, InternalValue,
-    IntoAuthRef, IntoAuthValue, IntoDraft, IntoRecurControl, ListProofDirection, ListProofSibling,
-    Op, RecurControl, RecurInput, RecurOutput, RecurSequenceInput, RecurSequenceOutput,
-    RecurSequenceState, RecurState, Schema, SchemaField, SchemaFieldMode, SchemaNode, SelectSource,
-    Selectable, SelectedPayload, SelectionCommitment, SelectionProof, SelectionProofStep,
-    SelectionWitness, SelectorPath, SelectorSegment, TypedExternalBinding, TypedInternalBinding,
-    TypedSelectorPath,
+    new_draft, raster_trace_payload, resolve_internal_ok_value, resolve_internal_value,
+    restore_draft_from_replay_handle, run_recur_list, run_recur_list_state,
+    run_recur_list_with_state, run_recur_sequence_list, run_recur_sequence_list_state,
+    run_recur_sequence_list_with_state, select_source, select_stored_internal_value,
+    selector_path, serialize_draft_replay_handle, serialize_draft_trace, typed_internal,
+    typed_internal_with_resolver, typed_selector_path, Anchor, AuthRef, AuthRefTrace, AuthValue,
+    Draft, DraftAppendField, DraftSetField, InternalRef, InternalValue, IntoAuthRef, IntoAuthValue,
+    IntoDraft, IntoRecurControl, ListProofDirection, ListProofSibling, Op, RecurControl,
+    RecurInput, RecurOutput, RecurSequenceInput, RecurSequenceOutput, RecurSequenceState,
+    RecurState, Schema, SchemaField, SchemaFieldMode, SchemaNode, SelectSource, Selectable,
+    SelectedPayload, SelectionCommitment, SelectionProof, SelectionProofStep, SelectionWitness,
+    SelectorPath, SelectorSegment, TypedInternalBinding, TypedSelectorPath,
 };
 
 #[cfg(feature = "std")]
 pub use input::{
     begin_draft_transition_capture, encode_raster_value, finish_draft_transition_capture,
-    store_internal_value, write_raster_files,
+    postcard_structural_commitment, store_internal_value, write_raster_files,
 };
 
 pub use raster_macros::{select, sequence, tile, Selectable};
@@ -59,7 +57,10 @@ pub mod runtime {
 
 // Runtime helpers are only available with std feature.
 #[cfg(feature = "std")]
-pub use raster_runtime::{finish, init, init_with, publish_trace_event};
+pub use raster_runtime::{
+    bind_entry_arguments, entry_argument_spec, finish, init, init_with, publish_trace_event,
+    EntryArgumentsBinding, EntryArgumentSpec,
+};
 
 #[cfg(feature = "std")]
 pub mod utils;
@@ -509,17 +510,6 @@ macro_rules! call {
     };
 }
 
-/// Creates a typed external-input reference for explicit call-site bindings.
-#[macro_export]
-macro_rules! external {
-    ($ty:ty, $name:literal) => {
-        $crate::typed_external::<$ty>($name)
-    };
-    ($ty:ty, $name:expr) => {
-        $crate::typed_external::<$ty>($name)
-    };
-}
-
 /// Creates a typed internal-store reference for explicit call-site bindings.
 #[macro_export]
 macro_rules! internal {
@@ -609,10 +599,7 @@ macro_rules! println {
 /// terminal execution result type. Raster runtime failures remain available
 /// separately under `raster::runtime`.
 pub mod prelude {
-    pub use crate::core::{
-        input::ExternalRef,
-        tile::{TileId, TileIdStatic, TileMetadata, TileMetadataStatic},
-    };
+    pub use crate::core::tile::{TileId, TileIdStatic, TileMetadata, TileMetadataStatic};
 
     // These modules require std
     #[cfg(feature = "std")]
@@ -624,14 +611,13 @@ pub mod prelude {
 
     pub use crate::exec::Result;
     pub use crate::{
-        call, call_recur, call_recur_seq, call_seq, external, finalize, internal, into_auth_ref,
-        into_draft, materialize_auth_result, materialize_auth_return, new, select, sequence, tile,
-        Anchor, AuthRef, AuthValue, Draft, ExternalSelection, ExternalValue, InternalRef,
-        InternalValue, IntoAuthRef, IntoAuthValue, IntoDraft, ListProofDirection, ListProofSibling,
-        Op, RecurControl, RecurInput, RecurOutput, RecurSequenceInput, RecurSequenceOutput,
-        RecurSequenceState, RecurState, Schema, SchemaField, SchemaFieldMode, SchemaNode,
-        SelectSource, Selectable, SelectedPayload, SelectionProof, SelectionProofStep,
-        SelectorPath, SelectorSegment, TypedExternalBinding, TypedInternalBinding,
+        call, call_recur, call_recur_seq, call_seq, finalize, internal, into_auth_ref, into_draft,
+        materialize_auth_result, materialize_auth_return, new, select, sequence, tile, Anchor,
+        AuthRef, AuthValue, Draft, InternalRef, InternalValue, IntoAuthRef, IntoAuthValue,
+        IntoDraft, ListProofDirection, ListProofSibling, Op, RecurControl, RecurInput, RecurOutput,
+        RecurSequenceInput, RecurSequenceOutput, RecurSequenceState, RecurState, Schema,
+        SchemaField, SchemaFieldMode, SchemaNode, SelectSource, Selectable, SelectedPayload,
+        SelectionProof, SelectionProofStep, SelectorPath, SelectorSegment, TypedInternalBinding,
         TypedSelectorPath,
     };
 
@@ -640,8 +626,5 @@ pub mod prelude {
     // pub use crate::{Executor, Tracer, FileTracer, NoOpTracer};
 
     #[cfg(feature = "std")]
-    pub use crate::{
-        resolve_external_value, resolve_internal_value, resolve_typed_external_value,
-        store_internal_value,
-    };
+    pub use crate::{resolve_internal_value, store_internal_value};
 }

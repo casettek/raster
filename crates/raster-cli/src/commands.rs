@@ -588,6 +588,12 @@ pub fn cfs(output: Option<String>) -> Result<()> {
                 raster_core::cfs::SequenceChildItem::Sequence(item) => {
                     println!("      [{}] {} '{}'", idx, "sequence", item.id)
                 }
+                raster_core::cfs::SequenceChildItem::Entrypoint(item) => {
+                    println!(
+                        "      [{}] {} {:?}",
+                        idx, "entrypoint", item.names
+                    )
+                }
             }
         }
     }

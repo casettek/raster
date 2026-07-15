@@ -5,13 +5,14 @@ use raster_core::input::{
 };
 use raster_core::{Error, Result};
 use serde::de::DeserializeOwned;
+#[cfg(test)]
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::format;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::string::String;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::vec::Vec;
 
 use crate::raster_index::RasterIndex;
@@ -142,23 +143,6 @@ impl ResolvedExternalData {
         }
     }
 
-    pub(crate) fn deserialize<T: DeserializeOwned>(&self) -> Result<T> {
-        match self {
-            Self::Postcard { file, .. } => {
-                raster_core::postcard::from_bytes(file.bytes()).map_err(|e| {
-                    Error::Serialization(format!(
-                        "Failed to deserialize external data from postcard bytes: {}",
-                        e
-                    ))
-                })
-            }
-            Self::Raster { .. } => Err(Error::Other(
-                "Raster-encoded external data must be resolved through selection-tree payloads"
-                    .into(),
-            )),
-        }
-    }
-
     pub(crate) fn raster_index(&self) -> Option<&RasterIndex> {
         match self {
             Self::Raster { index, .. } => Some(index.as_ref()),
@@ -179,8 +163,6 @@ pub(crate) struct ExternalStorageManager {
     registry: ExternalFileRegistry,
     cache: Arc<Mutex<HashMap<SourceKey, ResolvedExternalData>>>,
 }
-
-static CLI_EXTERNAL_STORAGE: OnceLock<Option<ExternalStorageManager>> = OnceLock::new();
 
 impl ExternalStorageManager {
     pub(crate) fn from_input_args(
@@ -213,16 +195,6 @@ impl ExternalStorageManager {
             raw_input.as_deref(),
             raw_manifest.as_deref(),
         )?))
-    }
-
-    pub(crate) fn cached_from_cli_args() -> Result<Option<Self>> {
-        if let Some(storage) = CLI_EXTERNAL_STORAGE.get() {
-            return Ok(storage.clone());
-        }
-
-        let storage = Self::from_cli_args()?;
-        let _ = CLI_EXTERNAL_STORAGE.set(storage);
-        Ok(CLI_EXTERNAL_STORAGE.get().cloned().unwrap_or(None))
     }
 
     pub(crate) fn resolve(&self, name: &str) -> Result<ResolvedExternalData> {
@@ -264,11 +236,22 @@ impl ExternalStorageManager {
         }
     }
 
-    pub(crate) fn is_raster_encoded(&self, name: &str) -> Result<bool> {
-        Ok(matches!(
-            self.read_manifest_entry(name)?.encoding(),
-            ExternalEncoding::Raster
-        ))
+    /// The declared `(encoding, commitment)` for a named external input,
+    /// read straight from the already-parsed manifest — no file bytes are
+    /// touched. Used by `bind_entry_arguments` to compute the combined
+    /// root without materializing any declared argument eagerly.
+    pub(crate) fn manifest_commitment_metadata(
+        &self,
+        name: &str,
+    ) -> Result<(ExternalEncoding, String)> {
+        let manifest_entry = self.read_manifest_entry(name)?;
+        let commitment = manifest_entry.as_sha256_commitment().ok_or_else(|| {
+            Error::Serialization(format!(
+                "Expected public manifest entry '{}' to use {{\"type\": \"sha256\", \"commitment\": \"...\"}}",
+                name
+            ))
+        })?;
+        Ok((manifest_entry.encoding(), commitment.to_string()))
     }
 
     fn read_input_entry(&self, name: &str) -> Result<&InputDocumentEntry> {
@@ -289,6 +272,17 @@ impl ExternalStorageManager {
         })
     }
 
+    /// Loads a postcard-encoded external file and pairs it with its
+    /// manifest-declared commitment, **without verifying it here**.
+    ///
+    /// Unlike raster (whose root commitment is verifiable directly from the
+    /// index, with no type information) a postcard commitment is now a
+    /// selection-tree structural root (see `docs` on `verify_selection_proof`
+    /// composition), which can only be computed by deserializing into the
+    /// value's concrete Rust type. That type isn't known at this layer —
+    /// callers that do know it (`ReferencedObject::select`, via the entry
+    /// argument's registered `to_tree`) are responsible for verifying
+    /// `resolved.commitment()` themselves before trusting the loaded bytes.
     fn resolve_postcard_file(
         &self,
         name: &str,
@@ -322,7 +316,6 @@ impl ExternalStorageManager {
                 mmap_file(name, &canonical_path).or_else(|_| read_file(name, &canonical_path))?
             }
         };
-        verify_input_commitment(name, storage.bytes(), &expected_commitment)?;
         let resolved = ResolvedExternalData::Postcard {
             commitment: expected_commitment,
             file: storage,
@@ -434,18 +427,7 @@ fn mmap_file(name: &str, path: &Path) -> Result<ExternalFile> {
     Ok(ExternalFile::Mmap(Arc::new(map)))
 }
 
-fn verify_input_commitment(name: &str, bytes: &[u8], expected_commitment: &str) -> Result<()> {
-    let actual_hash = sha256_hex(bytes);
-    if normalize_hash(expected_commitment) != actual_hash {
-        return Err(Error::Other(format!(
-            "External input '{}' failed integrity check. Expected SHA256 {}, got {}",
-            name, expected_commitment, actual_hash
-        )));
-    }
-
-    Ok(())
-}
-
+#[cfg(test)]
 pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     let mut out = String::with_capacity(digest.len() * 2);
@@ -608,7 +590,14 @@ mod tests {
     }
 
     #[test]
-    fn rejects_external_inputs_with_wrong_manifest_commitment() {
+    fn resolve_postcard_file_loads_bytes_without_verifying_commitment() {
+        // Postcard commitments are now selection-tree structural roots,
+        // which can only be checked once the value's concrete Rust type is
+        // known (see `ReferencedObject::verify_source_commitment` and the
+        // entry-argument `to_tree` machinery in `internal_storage.rs`).
+        // `ExternalStorageManager::resolve` itself only loads bytes for
+        // postcard sources; a mismatched manifest commitment is *not*
+        // rejected at this layer.
         let dir = unique_dir();
         fs::create_dir_all(&dir).unwrap();
 
@@ -624,13 +613,10 @@ mod tests {
             ExternalStorageManager::from_input_args(input_path.to_str(), manifest_path.to_str())
                 .unwrap();
 
-        let err = manager
+        let resolved = manager
             .resolve("flight_data_bad_manifest")
-            .expect_err("hash mismatch");
-
-        assert!(err
-            .to_string()
-            .contains("External input 'flight_data_bad_manifest' failed integrity check"));
+            .expect("resolve loads bytes regardless of the (unverified-here) commitment");
+        assert_eq!(resolved.bytes(), bytes.as_slice());
 
         fs::remove_dir_all(&dir).unwrap();
     }

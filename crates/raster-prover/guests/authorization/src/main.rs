@@ -35,32 +35,13 @@ fn parse_external_input_commitments(manifest_bytes: &[u8]) -> BTreeMap<String, V
 }
 
 fn build_authorization_journal(input: &ManifestedInputs) -> AuthorizationJournal {
-    let external_input_commitments = parse_external_input_commitments(&input.manifest_bytes);
-
-    let external_inputs_commitments = input
-        .external_inputs_commitments
-        .iter()
-        .map(|(name, witnessed_commitment)| {
-            let external_input_commitment =
-                external_input_commitments.get(name).unwrap_or_else(|| {
-                    panic!(
-                    "External input '{}' is present in execution but missing from public manifest",
-                    name
-                )
-                });
-
-            assert_eq!(
-                witnessed_commitment, external_input_commitment,
-                "External input '{}' commitment does not match the public manifest commitment",
-                name
-            );
-
-            (name.clone(), external_input_commitment.clone())
-        })
-        .collect();
-
+    // The journal authorizes every entry the public manifest declares. The
+    // transition guest cross-checks actual execution against these
+    // commitments (`checks::entrypoint`: the recorded entry-argument
+    // combined root must be recomputable from exactly the names the CFS
+    // declares), so unconsumed manifest entries are inert.
     AuthorizationJournal {
-        external_inputs_commitments,
+        external_inputs_commitments: parse_external_input_commitments(&input.manifest_bytes),
         manifest_commitment: sha256_bytes(&input.manifest_bytes),
     }
 }
@@ -86,12 +67,6 @@ mod tests {
                 }
             }"#
             .to_vec(),
-            external_inputs_commitments: [(
-                "personal_data".to_string(),
-                b"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".to_vec(),
-            )]
-            .into_iter()
-            .collect(),
         };
 
         let journal = build_authorization_journal(&input);
@@ -111,12 +86,6 @@ mod tests {
                 payload_commitment
             )
             .into_bytes(),
-            external_inputs_commitments: [(
-                "personal_data".to_string(),
-                payload_commitment.as_bytes().to_vec(),
-            )]
-            .into_iter()
-            .collect(),
         };
 
         let first = build_authorization_journal(&input);
@@ -126,20 +95,14 @@ mod tests {
     }
 
     #[test]
-    fn ignores_manifested_external_inputs_that_are_not_witnessed() {
+    fn authorizes_every_manifest_entry() {
         let payload_commitment = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
         let input = ManifestedInputs {
             manifest_bytes: format!(
-                r#"{{"personal_data":{{"type":"sha256","commitment":"{}"}},"unused_data":{{"type":"sha256","commitment":"deadbeef"}}}}"#,
+                r#"{{"personal_data":{{"type":"sha256","commitment":"{}"}},"other_data":{{"type":"sha256","commitment":"deadbeef"}}}}"#,
                 payload_commitment
             )
             .into_bytes(),
-            external_inputs_commitments: [(
-                "personal_data".to_string(),
-                payload_commitment.as_bytes().to_vec(),
-            )]
-                .into_iter()
-                .collect(),
         };
 
         let journal = build_authorization_journal(&input);
@@ -147,8 +110,8 @@ mod tests {
         assert!(journal
             .external_inputs_commitments
             .contains_key("personal_data"));
-        assert!(!journal
+        assert!(journal
             .external_inputs_commitments
-            .contains_key("unused_data"));
+            .contains_key("other_data"));
     }
 }

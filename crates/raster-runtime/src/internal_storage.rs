@@ -6,8 +6,9 @@ use raster_core::draft::{
     DraftStateWitness, DraftTransitionWitness,
 };
 use raster_core::input::{
-    InternalRef, InternalValue, Schema, SchemaFieldMode, SchemaNode, SelectionCommitment,
-    SelectionWitness, SelectorPath,
+    ExternalEncoding, Hash32, InternalRef, InternalValue, Schema, SchemaFieldMode, SchemaNode,
+    SelectedPayload, SelectionCommitment, SelectionProof, SelectionProofStep, SelectionWitness,
+    SelectorPath, SelectorSegment,
 };
 use raster_core::trace::RasterPayload;
 use raster_core::transition::{InternalStoreEntry, InternalStoreIndexValue, SerializableFrontier};
@@ -21,17 +22,323 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::vec::Vec;
 
+use crate::external_storage::{ExternalStorageManager, ResolvedExternalData};
 use crate::input::{
-    encode_raster_value, selected_payload_from_raster_location,
-    selection_witness_from_raster_selection, tree_value_from_raster_location,
+    encode_raster_value, hex_string, prove_selection, selected_payload_from_proven,
+    selected_payload_from_raster_location, selection_witness_from_raster_selection,
+    subtree_payload_and_root, tree_value_from_raster_location, tree_value_from_serialize,
     typed_value_from_tree, TreeValue,
 };
 use crate::raster_index::RasterIndex;
 use crate::Sha256Commitment;
 
 type Anchor = [u8; 32];
+
+/// Anything that can resolve a manifest-declared external source by name.
+/// `ExternalStorageManager` is the only real implementation; tests can
+/// swap in a fixture-backed one instead of touching the filesystem.
+pub(crate) trait ExternalSourceResolver {
+    fn resolve(&self, name: &str) -> Result<ResolvedExternalData>;
+}
+
+impl ExternalSourceResolver for ExternalStorageManager {
+    fn resolve(&self, name: &str) -> Result<ResolvedExternalData> {
+        ExternalStorageManager::resolve(self, name)
+    }
+}
+
+/// What backs the bytes committed at an internal-store coordinate.
+#[derive(Debug, Clone)]
+pub(crate) enum ObjectBacking {
+    /// Bytes were computed this run (tile output, finalized draft, recur
+    /// iteration, ...) and live in memory — reads are served directly.
+    Owned(OwnedObject),
+    /// This coordinate holds no bytes at all, only a struct-of-commitments
+    /// over `main`'s declared entry arguments. A selection must name which
+    /// argument it wants before anything can be resolved into it.
+    Referenced(ReferencedObject),
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct OwnedObject {
+    pub bytes: Vec<u8>,
+    pub raster: Option<RasterPayload>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ReferencedObject {
+    pub sources: Vec<ReferencedSource>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ReferencedSource {
+    pub name: String,
+    pub commitment: Vec<u8>,
+    pub kind: ReferencedSourceKind,
+}
+
+#[derive(Clone)]
+pub(crate) enum ReferencedSourceKind {
+    /// Self-describing on disk (an `.rindex` carries the schema), so no
+    /// type-specific hook is needed to select into it.
+    Raster,
+    /// Postcard bytes carry no schema of their own; the macro-generated
+    /// bind site supplies these two monomorphized, zero-capture function
+    /// pointers so this stays a plain `Clone` enum rather than a trait
+    /// object.
+    Postcard {
+        to_tree: fn(&[u8]) -> Result<TreeValue>,
+        schema: fn() -> SchemaNode,
+    },
+}
+
+impl std::fmt::Debug for ReferencedSourceKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Raster => f.write_str("Raster"),
+            Self::Postcard { .. } => f.write_str("Postcard"),
+        }
+    }
+}
+
+impl ReferencedObject {
+    /// The struct-of-commitments root over all declared sources, in
+    /// declaration order — mirrors `assemble_subtree`'s `TreeValue::Struct`
+    /// hash convention (`b"struct"` tag + concatenated child roots) so a
+    /// selection into one argument composes as one ordinary selection
+    /// proof. Must match `checks::entrypoint::combined_root` in the guest
+    /// byte-for-byte.
+    pub fn combined_root(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(
+            6 + self.sources.iter().map(|s| s.commitment.len()).sum::<usize>(),
+        );
+        buf.extend_from_slice(b"struct");
+        for source in &self.sources {
+            buf.extend_from_slice(&source.commitment);
+        }
+        Sha256::digest(&buf).to_vec()
+    }
+
+    fn find_source(&self, selector: &SelectorPath) -> Result<(&ReferencedSource, SelectorPath)> {
+        let Some((head, rest)) = selector.segments.split_first() else {
+            return Err(Error::Other(
+                "Referenced object requires a field selector naming a declared entry argument"
+                    .into(),
+            ));
+        };
+        let SelectorSegment::Field(name) = head else {
+            return Err(Error::Other(
+                "Referenced object selector must start with a named field".into(),
+            ));
+        };
+        let source = self
+            .sources
+            .iter()
+            .find(|source| &source.name == name)
+            .ok_or_else(|| Error::Other(format!("Unknown entry argument '{}'", name)))?;
+        Ok((source, SelectorPath::new(rest.to_vec())))
+    }
+
+    fn verify_source_commitment(
+        source: &ReferencedSource,
+        resolved: &ResolvedExternalData,
+    ) -> Result<()> {
+        if !resolved
+            .commitment()
+            .eq_ignore_ascii_case(&hex_string(&source.commitment))
+        {
+            return Err(Error::Other(format!(
+                "Entry argument '{}' resolved to a different commitment than authorized at bind time",
+                source.name
+            )));
+        }
+        Ok(())
+    }
+
+    /// Sibling commitments for the outer struct proof step over the named
+    /// source: `(field_index, field_count, siblings)`, siblings in
+    /// ascending position order, skipping `field_index` — the exact shape
+    /// `SelectionProofStep::Struct` expects.
+    fn struct_step(&self, name: &str) -> Result<(u64, u64, Vec<Hash32>)> {
+        let index = self
+            .sources
+            .iter()
+            .position(|source| source.name == name)
+            .ok_or_else(|| Error::Other(format!("Unknown entry argument '{}'", name)))?;
+        let siblings = self
+            .sources
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != index)
+            .map(|(_, source)| -> Result<Hash32> {
+                source.commitment.as_slice().try_into().map_err(|_| {
+                    Error::Other(format!(
+                        "Entry argument '{}' commitment is not 32 bytes",
+                        source.name
+                    ))
+                })
+            })
+            .collect::<Result<Vec<Hash32>>>()?;
+        Ok((index as u64, self.sources.len() as u64, siblings))
+    }
+
+    /// Resolve `selector` (must start with `Field(name)`) against the named
+    /// source, returning the selected tree value and its selection payload
+    /// anchored to the combined root.
+    pub fn select(
+        &self,
+        selector: &SelectorPath,
+        resolver: &dyn ExternalSourceResolver,
+    ) -> Result<(TreeValue, SelectedPayload)> {
+        let (source, remaining) = self.find_source(selector)?;
+        let resolved = resolver.resolve(&source.name)?;
+        Self::verify_source_commitment(source, &resolved)?;
+
+        let (tree, mut selected) = self.select_from_resolved(source, &remaining, &resolved)?;
+
+        selected.commitment.path = full_selector_path(&source.name, &remaining);
+        selected.commitment.source_root_hash = self
+            .combined_root()
+            .try_into()
+            .map_err(|_| Error::Other("Combined root is not 32 bytes".into()))?;
+        Ok((tree, selected))
+    }
+
+    fn select_from_resolved(
+        &self,
+        source: &ReferencedSource,
+        remaining: &SelectorPath,
+        resolved: &ResolvedExternalData,
+    ) -> Result<(TreeValue, SelectedPayload)> {
+        match (&source.kind, resolved) {
+            (ReferencedSourceKind::Raster, ResolvedExternalData::Raster { .. }) => {
+                let index = resolved
+                    .raster_index()
+                    .ok_or_else(|| Error::Other("Expected raster index metadata".into()))?;
+                let data = resolved
+                    .raster_bytes()
+                    .ok_or_else(|| Error::Other("Expected raster data bytes".into()))?;
+                let location = index.locate(remaining)?;
+                let tree = tree_value_from_raster_location(index, data, &location)?;
+                let selected = selected_payload_from_raster_location(data, remaining, location)?;
+                Ok((tree, selected))
+            }
+            (
+                ReferencedSourceKind::Postcard { to_tree, schema },
+                ResolvedExternalData::Postcard { .. },
+            ) => {
+                let tree = to_tree(resolved.bytes())?;
+                let (_, root_hash) = subtree_payload_and_root(&tree)?;
+                if root_hash.to_vec() != source.commitment {
+                    return Err(Error::Other(format!(
+                        "Entry argument '{}' failed structural integrity check",
+                        source.name
+                    )));
+                }
+                let proven = prove_selection(&schema(), &tree, &remaining.segments)?;
+                let selected_tree = proven.selected_value.clone();
+                let selected = selected_payload_from_proven(remaining, proven);
+                Ok((selected_tree, selected))
+            }
+            _ => Err(Error::Other(format!(
+                "Entry argument '{}' encoding does not match its declared kind",
+                source.name
+            ))),
+        }
+    }
+
+    /// Same resolution as `select`, but produces a full `SelectionWitness`
+    /// (with the recombination proof steps) for guest verification —
+    /// prepending the outer struct step over the other sources' already-
+    /// public commitments to whatever inner steps locate the value inside
+    /// the named source.
+    pub fn selection_witness(
+        &self,
+        selector: &SelectorPath,
+        resolver: &dyn ExternalSourceResolver,
+    ) -> Result<SelectionWitness> {
+        let (source, remaining) = self.find_source(selector)?;
+        let resolved = resolver.resolve(&source.name)?;
+        Self::verify_source_commitment(source, &resolved)?;
+
+        let inner = match (&source.kind, &resolved) {
+            (ReferencedSourceKind::Raster, ResolvedExternalData::Raster { .. }) => {
+                let index = resolved
+                    .raster_index()
+                    .ok_or_else(|| Error::Other("Expected raster index metadata".into()))?;
+                let data = resolved
+                    .raster_bytes()
+                    .ok_or_else(|| Error::Other("Expected raster data bytes".into()))?;
+                let selection = index.select(&remaining)?;
+                selection_witness_from_raster_selection(data, &remaining, selection)?
+            }
+            (
+                ReferencedSourceKind::Postcard { to_tree, schema },
+                ResolvedExternalData::Postcard { .. },
+            ) => {
+                let tree = to_tree(resolved.bytes())?;
+                let (_, root_hash) = subtree_payload_and_root(&tree)?;
+                if root_hash.to_vec() != source.commitment {
+                    return Err(Error::Other(format!(
+                        "Entry argument '{}' failed structural integrity check",
+                        source.name
+                    )));
+                }
+                let proven = prove_selection(&schema(), &tree, &remaining.segments)?;
+                SelectionWitness {
+                    bytes: proven.selected_bytes.clone(),
+                    proof: SelectionProof {
+                        path: remaining.clone(),
+                        root_hash: proven.root_hash,
+                        steps: proven.steps.clone(),
+                    },
+                }
+            }
+            _ => {
+                return Err(Error::Other(format!(
+                    "Entry argument '{}' encoding does not match its declared kind",
+                    source.name
+                )))
+            }
+        };
+
+        let (field_index, field_count, siblings) = self.struct_step(&source.name)?;
+        let mut steps = inner.proof.steps;
+        // `verify_selection_proof` walks `steps` via `.rev()`, from the leaf
+        // outward — so the outermost step (combining this source's own root
+        // with its siblings into the combined root) must be the *first*
+        // element, not appended after the source's own (more inner) steps.
+        steps.insert(
+            0,
+            SelectionProofStep::Struct {
+                field_index,
+                field_count,
+                siblings,
+            },
+        );
+        Ok(SelectionWitness {
+            bytes: inner.bytes,
+            proof: SelectionProof {
+                path: full_selector_path(&source.name, &remaining),
+                root_hash: self
+                    .combined_root()
+                    .try_into()
+                    .map_err(|_| Error::Other("Combined root is not 32 bytes".into()))?,
+                steps,
+            },
+        })
+    }
+}
+
+fn full_selector_path(name: &str, remaining: &SelectorPath) -> SelectorPath {
+    let mut segments = Vec::with_capacity(remaining.segments.len() + 1);
+    segments.push(SelectorSegment::Field(name.to_string()));
+    segments.extend(remaining.segments.iter().cloned());
+    SelectorPath::new(segments)
+}
 
 #[derive(Debug, Clone)]
 struct DraftRuntimeState {
@@ -54,8 +361,7 @@ pub struct DraftCaptureSnapshot {
 pub struct StoredInternalObject {
     pub reference: InternalRef,
     pub log_position: u64,
-    pub bytes: Vec<u8>,
-    pub raster: Option<RasterPayload>,
+    pub(crate) backing: ObjectBacking,
 }
 
 #[derive(Debug, Clone)]
@@ -76,11 +382,24 @@ pub struct InternalWriteRecord {
     pub frontier_after: SerializableFrontier,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct InternalStorageManager {
     frontier: TraceTreeFrontier,
     objects: BTreeMap<CfsCoordinates, StoredInternalObject>,
     coordinate_index: IncrementalCoordinateIndex,
+    /// Set once (via `bind_entry_arguments`) for programs that declare
+    /// `main` entry arguments; `None` otherwise, and never consulted unless
+    /// a `Referenced` object actually needs resolving.
+    external_resolver: Option<Arc<dyn ExternalSourceResolver>>,
+}
+
+impl std::fmt::Debug for InternalStorageManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InternalStorageManager")
+            .field("objects", &self.objects)
+            .field("has_external_resolver", &self.external_resolver.is_some())
+            .finish()
+    }
 }
 
 fn frontier_root(frontier: &TraceTreeFrontier) -> Vec<u8> {
@@ -275,7 +594,15 @@ impl InternalStorageManager {
             frontier,
             objects: BTreeMap::new(),
             coordinate_index: IncrementalCoordinateIndex::new(),
+            external_resolver: None,
         }
+    }
+
+    /// Injects the resolver a `Referenced` object dispatches to. Set once,
+    /// by `bind_entry_arguments`, for programs that declare `main` entry
+    /// arguments — never touched otherwise.
+    pub(crate) fn set_external_resolver(&mut self, resolver: Arc<dyn ExternalSourceResolver>) {
+        self.external_resolver = Some(resolver);
     }
 
     pub fn snapshot(&self) -> InternalStoreSnapshot {
@@ -294,12 +621,7 @@ impl InternalStorageManager {
         self.coordinate_index.root()
     }
 
-    pub fn append_serialized_bytes(
-        &mut self,
-        bytes: &[u8],
-        coordinates: CfsCoordinates,
-        raster: Option<RasterPayload>,
-    ) -> InternalWriteRecord {
+    fn append(&mut self, backing: ObjectBacking, object_commitment: Vec<u8>, coordinates: CfsCoordinates) -> InternalWriteRecord {
         assert!(
             !self.coordinate_index.contains_key(&coordinates),
             "Duplicate internal store write at coordinates {:?}",
@@ -308,7 +630,6 @@ impl InternalStorageManager {
 
         let store_root_before = self.current_root();
         let index_root_before = self.current_index_root();
-        let object_commitment = internal_object_commitment(bytes, raster.as_ref());
         let entry = InternalStoreEntry {
             coordinates: coordinates.clone(),
             object_commitment,
@@ -331,8 +652,7 @@ impl InternalStorageManager {
             StoredInternalObject {
                 reference,
                 log_position,
-                bytes: bytes.to_vec(),
-                raster,
+                backing,
             },
         );
 
@@ -347,77 +667,60 @@ impl InternalStorageManager {
         }
     }
 
+    pub fn append_serialized_bytes(
+        &mut self,
+        bytes: &[u8],
+        coordinates: CfsCoordinates,
+        raster: Option<RasterPayload>,
+    ) -> InternalWriteRecord {
+        let object_commitment = internal_object_commitment(bytes, raster.as_ref());
+        let owned = OwnedObject {
+            bytes: bytes.to_vec(),
+            raster,
+        };
+        self.append(ObjectBacking::Owned(owned), object_commitment, coordinates)
+    }
+
+    /// Writes `main`'s entry-argument binding — a single `Referenced`
+    /// object whose commitment is `referenced.combined_root()`. Called
+    /// exactly once per program, by `bind_entry_arguments`.
+    pub(crate) fn append_referenced_object(
+        &mut self,
+        referenced: ReferencedObject,
+        coordinates: CfsCoordinates,
+    ) -> InternalWriteRecord {
+        let combined_root = referenced.combined_root();
+        self.append(ObjectBacking::Referenced(referenced), combined_root, coordinates)
+    }
+
     pub fn resolve<T: DeserializeOwned>(
         &self,
         reference: &InternalRef,
     ) -> Result<InternalValue<T>> {
-        let stored = self.objects.get(&reference.coordinates).ok_or_else(|| {
-            Error::Other(format!(
-                "Missing internal store object at coordinates {:?}",
-                reference.coordinates
-            ))
-        })?;
-        if stored.reference.commitment != reference.commitment {
-            return Err(Error::Other(format!(
-                "Internal store commitment mismatch at coordinates {:?}",
-                reference.coordinates
-            )));
-        }
-        let actual_commitment =
-            internal_object_commitment(stored.bytes.as_slice(), stored.raster.as_ref());
-        if actual_commitment != reference.commitment {
-            return Err(Error::Other(format!(
-                "Internal store object at coordinates {:?} failed integrity check",
-                reference.coordinates
-            )));
-        }
-        let (bytes, selection, value) = if let Some(raster) = stored.raster.as_ref() {
-            let index = RasterIndex::from_bytes(&raster.index_bytes)?;
-            let location = index.root_location()?;
-            let tree = tree_value_from_raster_location(&index, &raster.bytes, &location)?;
-            let value = typed_value_from_tree(&tree)?;
-            (
-                raster.bytes.clone(),
-                SelectionCommitment {
-                    path: SelectorPath::default(),
-                    source_root_hash: raster.root_hash.clone(),
-                    selected_hash: raster_core::input::selection_payload_hash(&raster.bytes),
-                    selected_len: raster.bytes.len() as u64,
-                },
-                value,
-            )
-        } else {
-            let value = raster_core::postcard::from_bytes(&stored.bytes).map_err(|e| {
-                Error::Serialization(format!(
-                    "Failed to deserialize internal store object at coordinates {:?}: {}",
-                    reference.coordinates, e
+        let stored = self.verify_reference(reference)?;
+        match &stored.backing {
+            ObjectBacking::Owned(owned) => {
+                let (bytes, selection, value) = owned.resolve_whole::<T>(&reference.coordinates)?;
+                Ok(InternalValue::new_with_selection(
+                    reference.clone(),
+                    bytes,
+                    SelectorPath::default(),
+                    selection,
+                    value,
                 ))
-            })?;
-            (
-                stored.bytes.clone(),
-                SelectionCommitment {
-                    path: SelectorPath::default(),
-                    source_root_hash: [0; 32],
-                    selected_hash: [0; 32],
-                    selected_len: 0,
-                },
-                value,
-            )
-        };
-        Ok(InternalValue::new_with_selection(
-            reference.clone(),
-            bytes,
-            SelectorPath::default(),
-            selection,
-            value,
-        ))
+            }
+            ObjectBacking::Referenced(_) => Err(Error::Other(
+                "Referenced object requires a field selector naming a declared entry argument"
+                    .into(),
+            )),
+        }
     }
 
     fn require_raster<'a>(
-        stored: &'a StoredInternalObject,
+        owned: &'a OwnedObject,
         coordinates: &CfsCoordinates,
     ) -> Result<&'a RasterPayload> {
-        stored.raster.as_ref().ok_or_else(|| {
+        owned.raster.as_ref().ok_or_else(|| {
             Error::Other(format!(
                 "Internal store object at coordinates {:?} is missing raster selection metadata",
                 coordinates
@@ -438,13 +741,19 @@ impl InternalStorageManager {
                 reference.coordinates
             )));
         }
-        let actual_commitment =
-            internal_object_commitment(stored.bytes.as_slice(), stored.raster.as_ref());
-        if actual_commitment != reference.commitment {
-            return Err(Error::Other(format!(
-                "Internal store object at coordinates {:?} failed integrity check",
-                reference.coordinates
-            )));
+        // A `Referenced` object's commitment was fixed once at bind time
+        // from already-authorized manifest metadata — there are no raw
+        // bytes here to recompute it from. Only `Owned` objects hold bytes
+        // to double-check against.
+        if let ObjectBacking::Owned(owned) = &stored.backing {
+            let actual_commitment =
+                internal_object_commitment(owned.bytes.as_slice(), owned.raster.as_ref());
+            if actual_commitment != reference.commitment {
+                return Err(Error::Other(format!(
+                    "Internal store object at coordinates {:?} failed integrity check",
+                    reference.coordinates
+                )));
+            }
         }
         Ok(stored)
     }
@@ -455,10 +764,23 @@ impl InternalStorageManager {
         selector: &SelectorPath,
     ) -> Result<SelectionWitness> {
         let stored = self.verify_reference(reference)?;
-        let raster = Self::require_raster(stored, &reference.coordinates)?;
-        let index = RasterIndex::from_bytes(&raster.index_bytes)?;
-        let selection = index.select(selector)?;
-        selection_witness_from_raster_selection(&raster.bytes, selector, selection)
+        match &stored.backing {
+            ObjectBacking::Owned(owned) => {
+                let raster = Self::require_raster(owned, &reference.coordinates)?;
+                let index = RasterIndex::from_bytes(&raster.index_bytes)?;
+                let selection = index.select(selector)?;
+                selection_witness_from_raster_selection(&raster.bytes, selector, selection)
+            }
+            ObjectBacking::Referenced(referenced) => {
+                let resolver = self.external_resolver.as_deref().ok_or_else(|| {
+                    Error::Other(
+                        "Internal store has a Referenced object but no external resolver configured"
+                            .into(),
+                    )
+                })?;
+                referenced.selection_witness(selector, resolver)
+            }
+        }
     }
 
     pub fn select<T: DeserializeOwned>(
@@ -467,25 +789,93 @@ impl InternalStorageManager {
         selector: &SelectorPath,
     ) -> Result<InternalValue<T>> {
         let stored = self.verify_reference(reference)?;
-        let raster = Self::require_raster(stored, &reference.coordinates)?;
-        let index = RasterIndex::from_bytes(&raster.index_bytes)?;
-        let selection = index.locate(selector)?;
-        let tree = tree_value_from_raster_location(&index, &raster.bytes, &selection)?;
-        let selected = selected_payload_from_raster_location(&raster.bytes, selector, selection)?;
-        if selected.commitment.source_root_hash.to_vec() != reference.commitment {
-            return Err(Error::Other(format!(
-                "Internal selection root mismatch at coordinates {:?}",
-                reference.coordinates
-            )));
+        match &stored.backing {
+            ObjectBacking::Owned(owned) => {
+                let raster = Self::require_raster(owned, &reference.coordinates)?;
+                let index = RasterIndex::from_bytes(&raster.index_bytes)?;
+                let selection = index.locate(selector)?;
+                let tree = tree_value_from_raster_location(&index, &raster.bytes, &selection)?;
+                let selected =
+                    selected_payload_from_raster_location(&raster.bytes, selector, selection)?;
+                if selected.commitment.source_root_hash.to_vec() != reference.commitment {
+                    return Err(Error::Other(format!(
+                        "Internal selection root mismatch at coordinates {:?}",
+                        reference.coordinates
+                    )));
+                }
+                let value = typed_value_from_tree(&tree)?;
+                Ok(InternalValue::new_with_selection(
+                    reference.clone(),
+                    selected.bytes,
+                    selector.clone(),
+                    selected.commitment,
+                    value,
+                ))
+            }
+            ObjectBacking::Referenced(referenced) => {
+                let resolver = self.external_resolver.as_deref().ok_or_else(|| {
+                    Error::Other(
+                        "Internal store has a Referenced object but no external resolver configured"
+                            .into(),
+                    )
+                })?;
+                let (tree, selected) = referenced.select(selector, resolver)?;
+                let value = typed_value_from_tree::<T>(&tree)?;
+                Ok(InternalValue::new_with_selection(
+                    reference.clone(),
+                    selected.bytes,
+                    selector.clone(),
+                    selected.commitment,
+                    value,
+                ))
+            }
         }
-        let value = typed_value_from_tree(&tree)?;
-        Ok(InternalValue::new_with_selection(
-            reference.clone(),
-            selected.bytes,
-            selector.clone(),
-            selected.commitment,
-            value,
-        ))
+    }
+}
+
+impl OwnedObject {
+    /// Whole-value resolve (no selector): the raster case walks the same
+    /// path a selector-based read would with an empty selector; the
+    /// non-raster case deserializes directly (there is no selection tree
+    /// to prove against, hence the placeholder commitment — matches the
+    /// pre-refactor behavior exactly).
+    fn resolve_whole<T: DeserializeOwned>(
+        &self,
+        coordinates: &CfsCoordinates,
+    ) -> Result<(Vec<u8>, SelectionCommitment, T)> {
+        if let Some(raster) = self.raster.as_ref() {
+            let index = RasterIndex::from_bytes(&raster.index_bytes)?;
+            let location = index.root_location()?;
+            let tree = tree_value_from_raster_location(&index, &raster.bytes, &location)?;
+            let value = typed_value_from_tree(&tree)?;
+            Ok((
+                raster.bytes.clone(),
+                SelectionCommitment {
+                    path: SelectorPath::default(),
+                    source_root_hash: raster.root_hash,
+                    selected_hash: raster_core::input::selection_payload_hash(&raster.bytes),
+                    selected_len: raster.bytes.len() as u64,
+                },
+                value,
+            ))
+        } else {
+            let value = raster_core::postcard::from_bytes(&self.bytes).map_err(|e| {
+                Error::Serialization(format!(
+                    "Failed to deserialize internal store object at coordinates {:?}: {}",
+                    coordinates, e
+                ))
+            })?;
+            Ok((
+                self.bytes.clone(),
+                SelectionCommitment {
+                    path: SelectorPath::default(),
+                    source_root_hash: [0; 32],
+                    selected_hash: [0; 32],
+                    selected_len: 0,
+                },
+                value,
+            ))
+        }
     }
 }
 
@@ -910,6 +1300,108 @@ fn store_internal_value_at_coordinates<T: Serialize>(
     })
 }
 
+/// Opaque, per-argument spec for `bind_entry_arguments` — carries whatever
+/// a Postcard-encoded source would need to be deserialized (a monomorphized
+/// `to_tree`/`schema` pair, derived from the argument's Rust type), without
+/// exposing `TreeValue` or any other crate-internal type across the crate
+/// boundary. Built via [`entry_argument_spec`]; which encoding actually
+/// applies is a manifest fact, decided inside `bind_entry_arguments`, not
+/// something the caller commits to ahead of time.
+pub struct EntryArgumentSpec {
+    name: &'static str,
+    to_tree: fn(&[u8]) -> Result<TreeValue>,
+    schema: fn() -> SchemaNode,
+}
+
+fn postcard_bytes_to_tree<T: DeserializeOwned + Serialize>(bytes: &[u8]) -> Result<TreeValue> {
+    let value: T = raster_core::postcard::from_bytes(bytes).map_err(|e| {
+        Error::Serialization(format!(
+            "Failed to deserialize entry argument from postcard bytes: {}",
+            e
+        ))
+    })?;
+    tree_value_from_serialize(&value)
+}
+
+/// Build the spec for one declared `main` argument of type `T`. Macro
+/// codegen calls this once per declared parameter, in declaration order,
+/// before passing the resulting slice to `bind_entry_arguments`.
+pub fn entry_argument_spec<T>(name: &'static str) -> EntryArgumentSpec
+where
+    T: DeserializeOwned + Serialize + raster_core::input::Selectable,
+{
+    EntryArgumentSpec {
+        name,
+        to_tree: postcard_bytes_to_tree::<T>,
+        schema: T::schema,
+    }
+}
+
+/// The result of [`bind_entry_arguments`]: the coordinate-`[0]` reference
+/// (for building each argument's `AuthRef::Internal`), plus enough per-
+/// argument metadata for the caller to publish a matching
+/// `TraceEvent::EntrypointBind`.
+pub struct EntryArgumentsBinding {
+    pub reference: InternalRef,
+    pub arguments: Vec<raster_core::trace::EntrypointArgumentBinding>,
+}
+
+/// Binds `main`'s declared external arguments into a single internal-store
+/// object at the first coordinate reserved in the current sequence frame —
+/// must be called before any other write in `main`'s scope, since it's the
+/// only place coordinate `[0]` can legitimately come from. Reads each
+/// argument's `(encoding, commitment)` straight from the manifest — no file
+/// bytes are touched — computes the combined struct-of-commitments root,
+/// and configures the store's `ExternalSourceResolver` so later `select!`
+/// calls into these arguments resolve lazily, one source at a time.
+pub fn bind_entry_arguments(args: &[EntryArgumentSpec]) -> Result<EntryArgumentsBinding> {
+    let manager = ExternalStorageManager::from_cli_args()?.ok_or_else(|| {
+        Error::Other(
+            "Program declares main entry arguments but no --input/--input-manifest was provided"
+                .into(),
+        )
+    })?;
+
+    let mut sources = Vec::with_capacity(args.len());
+    let mut bindings = Vec::with_capacity(args.len());
+    for spec in args {
+        let (encoding, commitment_hex) = manager.manifest_commitment_metadata(spec.name)?;
+        let kind = match encoding {
+            ExternalEncoding::Raster => ReferencedSourceKind::Raster,
+            ExternalEncoding::Postcard => ReferencedSourceKind::Postcard {
+                to_tree: spec.to_tree,
+                schema: spec.schema,
+            },
+        };
+        let commitment = decode_hex_bytes(&commitment_hex)?;
+        bindings.push(raster_core::trace::EntrypointArgumentBinding {
+            name: spec.name.to_string(),
+            encoding,
+            commitment: commitment.clone(),
+        });
+        sources.push(ReferencedSource {
+            name: spec.name.to_string(),
+            commitment,
+            kind,
+        });
+    }
+
+    let referenced = ReferencedObject { sources };
+    let coordinates = THREAD_SEQUENCE_CONTEXT
+        .with(|context| context.borrow_mut().reserve_execution_coordinates())?;
+
+    let resolver: Arc<dyn ExternalSourceResolver> = Arc::new(manager);
+    THREAD_INTERNAL_STORAGE.with(|storage| {
+        let mut storage = storage.borrow_mut();
+        storage.set_external_resolver(resolver);
+        let write = storage.append_referenced_object(referenced, coordinates.clone());
+        Ok(EntryArgumentsBinding {
+            reference: InternalRef::new(coordinates, write.entry.object_commitment),
+            arguments: bindings,
+        })
+    })
+}
+
 pub fn store_internal_value<T: Serialize>(value: &T) -> Result<InternalRef> {
     let coordinates = THREAD_SEQUENCE_CONTEXT
         .with(|context| context.borrow_mut().reserve_synthetic_coordinates())?;
@@ -1114,6 +1606,174 @@ mod tests {
 
         manager.append_serialized_bytes(b"first", coordinates.clone(), None);
         manager.append_serialized_bytes(b"second", coordinates, None);
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    struct EntryA {
+        value: u64,
+    }
+
+    impl Selectable for EntryA {
+        fn schema() -> SchemaNode {
+            SchemaNode::Struct {
+                type_name: "EntryA".into(),
+                fields: vec![SchemaField::new(
+                    "value",
+                    "value",
+                    SchemaNode::Leaf {
+                        type_name: "u64".into(),
+                    },
+                )],
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    struct EntryB {
+        name: String,
+    }
+
+    impl Selectable for EntryB {
+        fn schema() -> SchemaNode {
+            SchemaNode::Struct {
+                type_name: "EntryB".into(),
+                fields: vec![SchemaField::new(
+                    "name",
+                    "name",
+                    SchemaNode::Leaf {
+                        type_name: "String".into(),
+                    },
+                )],
+            }
+        }
+    }
+
+    struct FakeResolver {
+        files: BTreeMap<String, (Vec<u8>, String)>,
+    }
+
+    impl ExternalSourceResolver for FakeResolver {
+        fn resolve(&self, name: &str) -> Result<ResolvedExternalData> {
+            let (bytes, commitment) = self
+                .files
+                .get(name)
+                .cloned()
+                .ok_or_else(|| Error::Other(format!("no fixture for '{}'", name)))?;
+            Ok(ResolvedExternalData::Postcard {
+                commitment,
+                file: crate::external_storage::ExternalFile::Read(Arc::from(
+                    bytes.into_boxed_slice(),
+                )),
+            })
+        }
+    }
+
+    fn referenced_object_fixture() -> (ReferencedObject, FakeResolver) {
+        let a = EntryA { value: 42 };
+        let b = EntryB {
+            name: "hello".into(),
+        };
+        let a_bytes = raster_core::postcard::to_allocvec(&a).unwrap();
+        let b_bytes = raster_core::postcard::to_allocvec(&b).unwrap();
+        let (_, a_root) = subtree_payload_and_root(&tree_value_from_serialize(&a).unwrap()).unwrap();
+        let (_, b_root) = subtree_payload_and_root(&tree_value_from_serialize(&b).unwrap()).unwrap();
+
+        let sources = vec![
+            ReferencedSource {
+                name: "entry_a".into(),
+                commitment: a_root.to_vec(),
+                kind: ReferencedSourceKind::Postcard {
+                    to_tree: postcard_bytes_to_tree::<EntryA>,
+                    schema: EntryA::schema,
+                },
+            },
+            ReferencedSource {
+                name: "entry_b".into(),
+                commitment: b_root.to_vec(),
+                kind: ReferencedSourceKind::Postcard {
+                    to_tree: postcard_bytes_to_tree::<EntryB>,
+                    schema: EntryB::schema,
+                },
+            },
+        ];
+        let referenced = ReferencedObject { sources };
+
+        let mut files = BTreeMap::new();
+        files.insert("entry_a".to_string(), (a_bytes, hex_string(&a_root)));
+        files.insert("entry_b".to_string(), (b_bytes, hex_string(&b_root)));
+        (referenced, FakeResolver { files })
+    }
+
+    #[test]
+    fn referenced_object_selects_named_source_field() {
+        let (referenced, resolver) = referenced_object_fixture();
+        let selector = SelectorPath::new(vec![
+            SelectorSegment::Field("entry_a".into()),
+            SelectorSegment::Field("value".into()),
+        ]);
+
+        let (tree, selected) = referenced.select(&selector, &resolver).unwrap();
+
+        assert_eq!(typed_value_from_tree::<u64>(&tree).unwrap(), 42);
+        assert_eq!(
+            selected.commitment.source_root_hash.to_vec(),
+            referenced.combined_root()
+        );
+    }
+
+    #[test]
+    fn referenced_object_selection_witness_verifies_against_combined_root() {
+        let (referenced, resolver) = referenced_object_fixture();
+        let selector = SelectorPath::new(vec![
+            SelectorSegment::Field("entry_b".into()),
+            SelectorSegment::Field("name".into()),
+        ]);
+
+        let (_, selected) = referenced.select(&selector, &resolver).unwrap();
+        let witness = referenced.selection_witness(&selector, &resolver).unwrap();
+
+        assert!(raster_core::input::verify_selection_witness(
+            &selected.commitment,
+            &witness
+        ));
+    }
+
+    #[test]
+    fn referenced_object_rejects_unknown_argument_name() {
+        let (referenced, resolver) = referenced_object_fixture();
+        let selector = SelectorPath::new(vec![SelectorSegment::Field("missing".into())]);
+
+        let err = referenced.select(&selector, &resolver).unwrap_err();
+
+        assert!(err.to_string().contains("Unknown entry argument"));
+    }
+
+    #[test]
+    fn referenced_object_rejects_tampered_source_bytes() {
+        let (referenced, mut resolver) = referenced_object_fixture();
+        resolver.files.get_mut("entry_a").unwrap().0 =
+            raster_core::postcard::to_allocvec(&EntryA { value: 999 }).unwrap();
+        let selector = SelectorPath::new(vec![
+            SelectorSegment::Field("entry_a".into()),
+            SelectorSegment::Field("value".into()),
+        ]);
+
+        let err = referenced.select(&selector, &resolver).unwrap_err();
+
+        assert!(err.to_string().contains("failed structural integrity check"));
+    }
+
+    #[test]
+    fn combined_root_matches_manual_struct_hash_convention() {
+        let (referenced, _resolver) = referenced_object_fixture();
+
+        let mut buf = b"struct".to_vec();
+        for source in &referenced.sources {
+            buf.extend_from_slice(&source.commitment);
+        }
+        let expected = Sha256::digest(&buf).to_vec();
+
+        assert_eq!(referenced.combined_root(), expected);
     }
 
     #[test]

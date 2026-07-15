@@ -17,8 +17,8 @@ use raster_core::draft::{
 };
 use raster_core::input::{SchemaField, SchemaFieldMode, SchemaNode, Selectable};
 use raster_core::trace::{
-    ExternalData, ExternalInput, FnInput, FnInputArg, FnInputValue, InternalData,
-    SequenceEndRecord, SequenceStartRecord, StepRecord, TileExecRecord,
+    FnInput, FnInputArg, FnInputValue, InternalData, SequenceEndRecord, SequenceStartRecord,
+    StepRecord, TileExecRecord,
 };
 use raster_core::transition::{
     InternalStoreEntry, InternalStoreLogWitness, InternalStoreReadWitness, InternalStoreWitness,
@@ -27,9 +27,7 @@ use raster_core::transition::{
 
 use crate::checks::cfs::verify_step_record_inputs;
 use crate::checks::drafts::verify_draft_transition;
-use crate::checks::io::{
-    external_input_commitment, input_source_commitment, verify_external_inputs, verify_io_witness,
-};
+use crate::checks::io::{input_source_commitment, verify_io_witness};
 use crate::checks::store::{internal_store_leaf_hash, verify_internal_store_transition};
 use crate::merkle_tree::{
     deserialize_frontier, frontier_root, sha256_bytes, sha256_hex, Bytes, TraceBridgeTree,
@@ -81,31 +79,11 @@ fn draft_tile_step(exec_index: u64) -> StepRecord {
         input_commitment: vec![exec_index as u8; 32],
         input_source_commitment: vec![0; 32],
         output_commitment: vec![1; 32],
-        external_input_commitment: Vec::new(),
         internal_store_root_before: EMPTY_LEAF.to_vec(),
         internal_store_root_after: EMPTY_LEAF.to_vec(),
         internal_store_index_root_before: Vec::new(),
         internal_store_index_root_after: Vec::new(),
     })
-}
-
-fn external_input(binding_name: &str, commitment: &[u8], selected_bytes: &[u8]) -> ExternalInput {
-    [(
-        "arg".to_string(),
-        ExternalData {
-            name: binding_name.to_string(),
-            commitment: commitment.to_vec(),
-            tree_root: Vec::new(),
-            selector: Default::default(),
-            selection: raster_core::input::SelectionCommitment {
-                selected_hash: raster_core::input::selection_payload_hash(selected_bytes),
-                selected_len: selected_bytes.len() as u64,
-                ..Default::default()
-            },
-        },
-    )]
-    .into_iter()
-    .collect()
 }
 
 fn authorization_journal(binding_name: &str, commitment: &[u8]) -> AuthorizationJournal {
@@ -118,6 +96,13 @@ fn authorization_journal(binding_name: &str, commitment: &[u8]) -> Authorization
 }
 
 fn internal_input_witness(coordinates: CfsCoordinates, commitment: Vec<u8>) -> FnInput {
+    // A whole-object internal binding's commitment *is* its raster selection
+    // root (see `checks::store`'s structural-consistency assertion), so the
+    // fixture mirrors that invariant.
+    let source_root_hash: [u8; 32] = commitment
+        .clone()
+        .try_into()
+        .expect("test commitments are 32 bytes");
     FnInput {
         data: Vec::new(),
         values: vec![FnInputValue::InternalBinding],
@@ -125,14 +110,16 @@ fn internal_input_witness(coordinates: CfsCoordinates, commitment: Vec<u8>) -> F
             name: "arg".to_string(),
             ty: "Vec<u8>".to_string(),
         }],
-        external: ExternalInput::new(),
         internal: [(
             "arg".to_string(),
             InternalData {
                 coordinates,
                 commitment,
                 selector: Default::default(),
-                selection: Default::default(),
+                selection: raster_core::input::SelectionCommitment {
+                    source_root_hash,
+                    ..Default::default()
+                },
             },
         )]
         .into_iter()
@@ -180,7 +167,6 @@ fn producer_sequence_cfs() -> CfsCursor {
 
 #[test]
 fn verify_tile_commitments_accept_matching_recorded_io() {
-    let ext = ExternalInput::new();
     let step = StepRecord::TileExec(TileExecRecord {
         exec_index: 1,
         tile_id: "tile".to_string(),
@@ -189,7 +175,6 @@ fn verify_tile_commitments_accept_matching_recorded_io() {
         intra_sequence_index: 0,
         input_commitment: sha(b"in"),
         input_source_commitment: Vec::new(),
-        external_input_commitment: external_input_commitment(&ext),
         output_commitment: sha(b"out"),
         internal_store_root_before: vec![0; 32],
         internal_store_root_after: vec![0; 32],
@@ -198,16 +183,6 @@ fn verify_tile_commitments_accept_matching_recorded_io() {
     });
 
     verify_io_witness(&step, Some(&b"in".to_vec()), Some(&b"out".to_vec()));
-    verify_external_inputs(
-        &step,
-        &ext,
-        &BTreeMap::new(),
-        &AuthorizationJournal {
-            external_inputs_commitments: BTreeMap::new(),
-            manifest_commitment: vec![0; 32],
-        }
-        .external_inputs_commitments,
-    );
 }
 
 #[test]
@@ -222,7 +197,6 @@ fn verify_step_record_inputs_accepts_sequence_descendant_producer_coordinates() 
         input_commitment: Vec::new(),
         input_source_commitment: Vec::new(),
         output_commitment: Vec::new(),
-        external_input_commitment: Vec::new(),
         internal_store_root_before: Vec::new(),
         internal_store_root_after: Vec::new(),
         internal_store_index_root_before: Vec::new(),
@@ -235,9 +209,8 @@ fn verify_step_record_inputs_accepts_sequence_descendant_producer_coordinates() 
 }
 
 #[test]
-#[should_panic(expected = "Tile input commitment does not match recorded input bytes")]
+#[should_panic(expected = "Step input commitment does not match recorded input bytes")]
 fn verify_tile_commitments_reject_mismatched_input() {
-    let ext = ExternalInput::new();
     let step = StepRecord::TileExec(TileExecRecord {
         exec_index: 1,
         tile_id: "tile".to_string(),
@@ -246,7 +219,6 @@ fn verify_tile_commitments_reject_mismatched_input() {
         intra_sequence_index: 0,
         input_commitment: sha(b"expected"),
         input_source_commitment: Vec::new(),
-        external_input_commitment: external_input_commitment(&ext),
         output_commitment: sha(b"out"),
         internal_store_root_before: vec![0; 32],
         internal_store_root_after: vec![0; 32],
@@ -259,14 +231,12 @@ fn verify_tile_commitments_reject_mismatched_input() {
 
 #[test]
 fn verify_sequence_boundary_commitments_accept_matching_recorded_io() {
-    let ext = ExternalInput::new();
     let start = StepRecord::SequenceStart(SequenceStartRecord {
         exec_index: 1,
         sequence_id: "main".to_string(),
         coordinates: CfsCoordinates(vec![]),
         input_commitment: sha(b"sequence-in"),
         input_source_commitment: Vec::new(),
-        external_input_commitment: external_input_commitment(&ext),
     });
     let end = StepRecord::SequenceEnd(SequenceEndRecord {
         exec_index: 2,
@@ -277,117 +247,6 @@ fn verify_sequence_boundary_commitments_accept_matching_recorded_io() {
 
     verify_io_witness(&start, Some(&b"sequence-in".to_vec()), None);
     verify_io_witness(&end, None, Some(&b"sequence-out".to_vec()));
-    verify_external_inputs(
-        &start,
-        &ext,
-        &BTreeMap::new(),
-        &AuthorizationJournal {
-            external_inputs_commitments: BTreeMap::new(),
-            manifest_commitment: vec![0; 32],
-        }
-        .external_inputs_commitments,
-    );
-    verify_external_inputs(
-        &end,
-        &ExternalInput::new(),
-        &BTreeMap::new(),
-        &AuthorizationJournal {
-            external_inputs_commitments: BTreeMap::new(),
-            manifest_commitment: vec![0; 32],
-        }
-        .external_inputs_commitments,
-    );
-}
-
-#[test]
-fn verify_external_inputs_accept_matching_authorized_binding() {
-    let ext = external_input("personal_data", sha256_hex(b"payload").as_slice(), b"");
-    let step = StepRecord::TileExec(TileExecRecord {
-        exec_index: 1,
-        tile_id: "tile".to_string(),
-        sequence_id: "main".to_string(),
-        coordinates: CfsCoordinates(vec![0]),
-        intra_sequence_index: 0,
-        input_commitment: sha(b"in"),
-        input_source_commitment: Vec::new(),
-        external_input_commitment: external_input_commitment(&ext),
-        output_commitment: sha(b"out"),
-        internal_store_root_before: vec![0; 32],
-        internal_store_root_after: vec![0; 32],
-        internal_store_index_root_before: Vec::new(),
-        internal_store_index_root_after: Vec::new(),
-    });
-
-    let authorization = authorization_journal("personal_data", sha256_hex(b"payload").as_slice());
-    verify_external_inputs(
-        &step,
-        &ext,
-        &BTreeMap::new(),
-        &authorization.external_inputs_commitments,
-    );
-}
-
-#[test]
-#[should_panic(expected = "Missing authorized commitment for external input 'personal_data'")]
-fn verify_external_inputs_reject_missing_authorized_binding() {
-    let ext = external_input("personal_data", sha256_hex(b"payload").as_slice(), b"");
-    let step = StepRecord::TileExec(TileExecRecord {
-        exec_index: 1,
-        tile_id: "tile".to_string(),
-        sequence_id: "main".to_string(),
-        coordinates: CfsCoordinates(vec![0]),
-        intra_sequence_index: 0,
-        input_commitment: sha(b"in"),
-        input_source_commitment: Vec::new(),
-        external_input_commitment: external_input_commitment(&ext),
-        output_commitment: sha(b"out"),
-        internal_store_root_before: vec![0; 32],
-        internal_store_root_after: vec![0; 32],
-        internal_store_index_root_before: Vec::new(),
-        internal_store_index_root_after: Vec::new(),
-    });
-
-    verify_external_inputs(
-        &step,
-        &ext,
-        &BTreeMap::new(),
-        &AuthorizationJournal {
-            external_inputs_commitments: BTreeMap::new(),
-            manifest_commitment: vec![0; 32],
-        }
-        .external_inputs_commitments,
-    );
-}
-
-#[test]
-#[should_panic(
-    expected = "External input 'personal_data' commitment does not match authorized source"
-)]
-fn verify_external_inputs_reject_mismatched_authorized_binding() {
-    let ext = external_input("personal_data", sha256_hex(b"payload").as_slice(), b"");
-    let step = StepRecord::TileExec(TileExecRecord {
-        exec_index: 1,
-        tile_id: "tile".to_string(),
-        sequence_id: "main".to_string(),
-        coordinates: CfsCoordinates(vec![0]),
-        intra_sequence_index: 0,
-        input_commitment: sha(b"in"),
-        input_source_commitment: Vec::new(),
-        external_input_commitment: external_input_commitment(&ext),
-        output_commitment: sha(b"out"),
-        internal_store_root_before: vec![0; 32],
-        internal_store_root_after: vec![0; 32],
-        internal_store_index_root_before: Vec::new(),
-        internal_store_index_root_after: Vec::new(),
-    });
-
-    let authorization = authorization_journal("personal_data", b"wrong");
-    verify_external_inputs(
-        &step,
-        &ext,
-        &BTreeMap::new(),
-        &authorization.external_inputs_commitments,
-    );
 }
 
 fn empty_internal_store_frontier_for_test() -> NonEmptyFrontier<Bytes> {
@@ -506,7 +365,6 @@ fn tile_step_with_store_roots(
         intra_sequence_index: 0,
         input_commitment: Vec::new(),
         input_source_commitment,
-        external_input_commitment: Vec::new(),
         output_commitment,
         internal_store_root_before: root_before,
         internal_store_root_after: root_after,
@@ -654,7 +512,7 @@ fn verify_internal_store_transition_rejects_wrong_coordinates_with_correct_bytes
 
 #[test]
 #[should_panic(
-    expected = "TileExec internal store root before does not match current internal store root"
+    expected = "Execution-step internal store root before does not match current internal store root"
 )]
 fn verify_internal_store_transition_rejects_stale_root() {
     let new_entry = InternalStoreEntry {
@@ -699,7 +557,7 @@ fn verify_internal_store_transition_rejects_stale_root() {
 
 #[test]
 #[should_panic(
-    expected = "TileExec internal store index root before does not match current index root"
+    expected = "Execution-step internal store index root before does not match current index root"
 )]
 fn verify_internal_store_transition_rejects_stale_index_root() {
     let new_entry = InternalStoreEntry {
@@ -960,4 +818,204 @@ fn verify_draft_transition_rejects_tampered_pre_state_witness() {
         }),
         &mut active_drafts,
     );
+}
+
+use crate::checks::entrypoint::{combined_root, verify_genesis_authorization, verify_step};
+use raster_core::cfs::EntrypointItem;
+use raster_core::trace::{EntrypointOp, EntrypointRecord};
+
+fn entrypoint_cfs(names: Vec<String>) -> CfsCursor {
+    CfsCursor::new(ControlFlowSchema {
+        version: "1.0".into(),
+        project: "test".into(),
+        encoding: "postcard".into(),
+        tiles: vec![],
+        sequences: vec![SequenceDef {
+            id: "main".into(),
+            input_sources: vec![],
+            items: vec![SequenceChildItem::Entrypoint(EntrypointItem { names })],
+        }],
+    })
+}
+
+fn no_entrypoint_cfs() -> CfsCursor {
+    CfsCursor::new(ControlFlowSchema {
+        version: "1.0".into(),
+        project: "test".into(),
+        encoding: "postcard".into(),
+        tiles: vec![],
+        sequences: vec![SequenceDef::new("main")],
+    })
+}
+
+fn two_arg_authorization_journal(
+    commitment_a: &[u8],
+    commitment_b: &[u8],
+) -> AuthorizationJournal {
+    AuthorizationJournal {
+        external_inputs_commitments: [
+            ("personal_data".to_string(), commitment_a.to_vec()),
+            ("seed".to_string(), commitment_b.to_vec()),
+        ]
+        .into_iter()
+        .collect(),
+        manifest_commitment: vec![7; 32],
+    }
+}
+
+#[test]
+fn combined_root_matches_struct_hash_convention_over_declared_commitments() {
+    let commitment_a = sha(b"personal_data-file");
+    let commitment_b = sha(b"seed-file");
+    let journal = two_arg_authorization_journal(&commitment_a, &commitment_b);
+
+    let actual = combined_root(
+        &["personal_data".to_string(), "seed".to_string()],
+        &journal,
+    );
+
+    let mut expected_input = b"struct".to_vec();
+    expected_input.extend_from_slice(&commitment_a);
+    expected_input.extend_from_slice(&commitment_b);
+    let expected = sha(&expected_input);
+
+    assert_eq!(actual, expected);
+
+    // Order matters: declaring the same two arguments in the opposite order
+    // must produce a different root.
+    let swapped = combined_root(
+        &["seed".to_string(), "personal_data".to_string()],
+        &journal,
+    );
+    assert_ne!(actual, swapped);
+}
+
+#[test]
+fn verify_step_accepts_matching_binding_and_rejects_tampered_one() {
+    let commitment_a = sha(b"personal_data-file");
+    let commitment_b = sha(b"seed-file");
+    let journal = two_arg_authorization_journal(&commitment_a, &commitment_b);
+    let names = vec!["personal_data".to_string(), "seed".to_string()];
+    let expected_root = combined_root(&names, &journal);
+
+    let record = EntrypointRecord {
+        exec_index: 0,
+        sequence_id: "main".to_string(),
+        coordinates: CfsCoordinates(vec![0]),
+        op: EntrypointOp::BindEntryArguments { names: names.clone() },
+        input_source_commitment: vec![0; 32],
+        output_commitment: expected_root,
+        internal_store_root_before: EMPTY_LEAF.to_vec(),
+        internal_store_root_after: EMPTY_LEAF.to_vec(),
+        internal_store_index_root_before: Vec::new(),
+        internal_store_index_root_after: Vec::new(),
+    };
+
+    verify_step(&record, &journal);
+}
+
+#[test]
+#[should_panic(expected = "does not match the authorized entry-argument commitments")]
+fn verify_step_rejects_tampered_output_commitment() {
+    let commitment_a = sha(b"personal_data-file");
+    let commitment_b = sha(b"seed-file");
+    let journal = two_arg_authorization_journal(&commitment_a, &commitment_b);
+    let names = vec!["personal_data".to_string(), "seed".to_string()];
+
+    let record = EntrypointRecord {
+        exec_index: 0,
+        sequence_id: "main".to_string(),
+        coordinates: CfsCoordinates(vec![0]),
+        op: EntrypointOp::BindEntryArguments { names },
+        input_source_commitment: vec![0; 32],
+        output_commitment: vec![0xff; 32],
+        internal_store_root_before: EMPTY_LEAF.to_vec(),
+        internal_store_root_after: EMPTY_LEAF.to_vec(),
+        internal_store_index_root_before: Vec::new(),
+        internal_store_index_root_after: Vec::new(),
+    };
+
+    verify_step(&record, &journal);
+}
+
+#[test]
+fn genesis_authorization_is_vacuously_true_when_cfs_declares_no_entry_arguments() {
+    let cfs_cursor = no_entrypoint_cfs();
+    let journal = two_arg_authorization_journal(&sha(b"a"), &sha(b"b"));
+
+    let authorized =
+        verify_genesis_authorization(&cfs_cursor, &EMPTY_LEAF, &[], &journal, None);
+
+    assert!(authorized);
+}
+
+#[test]
+#[should_panic(expected = "membership witness must not be provided")]
+fn genesis_authorization_rejects_unnecessary_witness_when_no_entry_arguments_declared() {
+    let cfs_cursor = no_entrypoint_cfs();
+    let journal = two_arg_authorization_journal(&sha(b"a"), &sha(b"b"));
+    let entry = InternalStoreEntry {
+        coordinates: CfsCoordinates(vec![0]),
+        object_commitment: sha(b"unused"),
+    };
+    let witness = build_read_witness(&[entry.clone()], &entry);
+
+    verify_genesis_authorization(&cfs_cursor, &EMPTY_LEAF, &[], &journal, Some(&witness));
+}
+
+#[test]
+fn genesis_authorization_accepts_valid_trace_inclusion_witness() {
+    let commitment_a = sha(b"personal_data-file");
+    let commitment_b = sha(b"seed-file");
+    let names = vec!["personal_data".to_string(), "seed".to_string()];
+    let journal = two_arg_authorization_journal(&commitment_a, &commitment_b);
+    let cfs_cursor = entrypoint_cfs(names.clone());
+    let expected_root = combined_root(&names, &journal);
+
+    let entry = InternalStoreEntry {
+        coordinates: CfsCoordinates(vec![0]),
+        object_commitment: expected_root,
+    };
+    let (_frontier, root, _index, index_root) = build_internal_store_context(&[entry.clone()]);
+    let witness = build_read_witness(&[entry.clone()], &entry);
+
+    let authorized =
+        verify_genesis_authorization(&cfs_cursor, &root, &index_root, &journal, Some(&witness));
+
+    assert!(authorized);
+}
+
+#[test]
+#[should_panic(expected = "Missing entrypoint membership witness")]
+fn genesis_authorization_rejects_missing_witness_when_entry_arguments_declared() {
+    let names = vec!["personal_data".to_string(), "seed".to_string()];
+    let journal =
+        two_arg_authorization_journal(&sha(b"personal_data-file"), &sha(b"seed-file"));
+    let cfs_cursor = entrypoint_cfs(names);
+
+    verify_genesis_authorization(&cfs_cursor, &EMPTY_LEAF, &[], &journal, None);
+}
+
+#[test]
+#[should_panic(
+    expected = "Internal store read witness commitment does not match requested commitment"
+)]
+fn genesis_authorization_rejects_forged_coordinate_zero_commitment() {
+    let commitment_a = sha(b"personal_data-file");
+    let commitment_b = sha(b"seed-file");
+    let names = vec!["personal_data".to_string(), "seed".to_string()];
+    let journal = two_arg_authorization_journal(&commitment_a, &commitment_b);
+    let cfs_cursor = entrypoint_cfs(names);
+
+    // Forge an entry at coordinates [0] whose commitment was never
+    // authorized against the journal.
+    let forged_entry = InternalStoreEntry {
+        coordinates: CfsCoordinates(vec![0]),
+        object_commitment: sha(b"forged-combined-root"),
+    };
+    let (_frontier, root, _index, index_root) =
+        build_internal_store_context(&[forged_entry.clone()]);
+    let witness = build_read_witness(&[forged_entry.clone()], &forged_entry);
+
+    verify_genesis_authorization(&cfs_cursor, &root, &index_root, &journal, Some(&witness));
 }

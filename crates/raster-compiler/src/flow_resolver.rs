@@ -28,14 +28,42 @@ impl FlowResolver {
     }
 
     /// Resolve a discovered sequence into a list of `SequenceChild`s with input sources.
+    ///
+    /// Equivalent to `resolve_with_entry_arguments(sequence, &[])` — every
+    /// non-entrypoint sequence (including `main` when it declares no
+    /// arguments) resolves exactly as before.
     pub fn resolve(&mut self, sequence: &Sequence<'_>) -> Vec<SequenceChildItem> {
+        self.resolve_with_entry_arguments(sequence, &[])
+    }
+
+    /// Resolve a sequence that declares `entry_argument_names` as `main`
+    /// entry arguments (see `SequenceChildItem::Entrypoint`). Every declared
+    /// name binds to item index `0` — the leading `Entrypoint` item the
+    /// caller (`CfsBuilder`) prepends separately — instead of to
+    /// `SequenceScope`, since `main` has no caller to supply them. Every
+    /// other resolved item's index is offset by one to leave that slot for
+    /// the `Entrypoint` item.
+    pub fn resolve_with_entry_arguments(
+        &mut self,
+        sequence: &Sequence<'_>,
+        entry_argument_names: &[String],
+    ) -> Vec<SequenceChildItem> {
         // Reset state for this sequence
         self.bindings.clear();
         self.param_indices.clear();
 
-        // Map sequence parameters to their indices
-        for (idx, name) in sequence.function.input_names.iter().enumerate() {
-            self.param_indices.insert(name.clone(), idx);
+        let item_index_offset = if entry_argument_names.is_empty() { 0 } else { 1 };
+
+        if entry_argument_names.is_empty() {
+            // Map sequence parameters to their indices
+            for (idx, name) in sequence.function.input_names.iter().enumerate() {
+                self.param_indices.insert(name.clone(), idx);
+            }
+        } else {
+            // All entry arguments live at the single Entrypoint item.
+            for name in entry_argument_names {
+                self.bindings.insert(name.clone(), 0);
+            }
         }
 
         let mut items = Vec::new();
@@ -62,7 +90,8 @@ impl FlowResolver {
             .filter(|call| step_callees.contains(&call.callee.as_str()))
             .collect();
 
-        for (item_index, call) in relevant_calls.iter().enumerate() {
+        for (call_index, call) in relevant_calls.iter().enumerate() {
+            let item_index = call_index + item_index_offset;
             let input_sources = self.resolve_call_inputs(call);
 
             // Call kind directly determines item type — no name-matching needed.
@@ -334,6 +363,101 @@ mod tests {
             SequenceChildItem::Tile(tile_item) => match &tile_item.sources[0] {
                 InputBinding::Direct(InputSource::Inline) => {}
                 other => panic!("Expected Inline source, got {:?}", other),
+            },
+            _ => panic!("Expected Tile item"),
+        }
+    }
+
+    #[test]
+    fn resolve_with_entry_arguments_binds_names_to_item_zero_and_offsets_the_rest() {
+        // The Entrypoint item itself is built by CfsBuilder, not the
+        // resolver — the resolver only needs to know the declared names so
+        // it can bind them, and that every other item's index leaves room
+        // for it at position 0.
+        let project = make_mock_project();
+        let greet_func = make_tile_function("greet", vec!["input"], true);
+        let exclaim_func = make_tile_function("exclaim", vec!["input"], true);
+        let greet_tile = Tile {
+            function: &greet_func,
+            tile_type: "iter".to_string(),
+            estimated_cycles: None,
+            max_memory: None,
+            description: None,
+        };
+        let exclaim_tile = Tile {
+            function: &exclaim_func,
+            tile_type: "iter".to_string(),
+            estimated_cycles: None,
+            max_memory: None,
+            description: None,
+        };
+        let tile_discovery = TileDiscovery {
+            project: &project,
+            tiles: vec![greet_tile, exclaim_tile],
+        };
+
+        // `main`'s own `input_names` no longer matter for entry-argument
+        // resolution — the caller passes them explicitly — so leave them
+        // empty here to prove that.
+        let seq_func = make_sequence_function(
+            "main",
+            vec![],
+            vec![
+                CallInfo {
+                    callee: "greet".to_string(),
+                    result_binding: Some("greeting".to_string()),
+                    arguments: vec!["personal_data".to_string()],
+                    argument_kinds: vec![CallArgumentKind::Identifier],
+                    call_kind: CallKind::Tile,
+                },
+                CallInfo {
+                    callee: "exclaim".to_string(),
+                    result_binding: None,
+                    arguments: vec!["greeting".to_string()],
+                    argument_kinds: vec![CallArgumentKind::Identifier],
+                    call_kind: CallKind::Tile,
+                },
+            ],
+        );
+        let sequence = Sequence {
+            function: &seq_func,
+            steps: vec![
+                SequenceStep::Tile(&tile_discovery.tiles[0]),
+                SequenceStep::Tile(&tile_discovery.tiles[1]),
+            ],
+            description: None,
+        };
+
+        let mut resolver = FlowResolver::new();
+        let entry_names = vec!["personal_data".to_string(), "seed".to_string()];
+        let items = resolver.resolve_with_entry_arguments(&sequence, &entry_names);
+
+        assert_eq!(items.len(), 2);
+
+        // greet(personal_data): personal_data is an entry argument, bound
+        // to item index 0 (the Entrypoint item), not SequenceScope.
+        match &items[0] {
+            SequenceChildItem::Tile(tile_item) => {
+                assert_eq!(tile_item.id, "greet");
+                match &tile_item.sources[0] {
+                    InputBinding::PriorItemOutput {
+                        intra_sequence_item_index,
+                    } => assert_eq!(*intra_sequence_item_index, 0),
+                    other => panic!("Expected PriorItemOutput{{0}}, got {:?}", other),
+                }
+            }
+            _ => panic!("Expected Tile item"),
+        }
+
+        // exclaim(greeting): greeting was produced by items[0] here, whose
+        // *overall* schema position is 1 (item 0 is the Entrypoint item
+        // CfsBuilder prepends), so the offset must land on 1, not 0.
+        match &items[1] {
+            SequenceChildItem::Tile(tile_item) => match &tile_item.sources[0] {
+                InputBinding::PriorItemOutput {
+                    intra_sequence_item_index,
+                } => assert_eq!(*intra_sequence_item_index, 1),
+                other => panic!("Expected PriorItemOutput{{1}}, got {:?}", other),
             },
             _ => panic!("Expected Tile item"),
         }

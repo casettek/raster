@@ -14,7 +14,7 @@ use crate::cfs::CfsCoordinates;
 use crate::draft::{DraftId, DraftTransitionWitness, TileReplayJournal, TrackedDraftState};
 use crate::fingerprint::{Fingerprint, FingerprintAccumulator};
 use crate::input::SelectionWitness;
-use crate::trace::{ExternalInput, FnInput, StepRecord};
+use crate::trace::{FnInput, StepRecord};
 
 /// Serializable representation of a Merkle frontier (position, leaf, ommers).
 ///
@@ -113,8 +113,6 @@ pub struct TransitionInput {
     pub output_witness: Option<Vec<u8>>,
     pub input_source_witness: Option<FnInput>,
     pub sequence_scope_witness: Option<FnInput>,
-    pub external_input: ExternalInput,
-    pub external_selection_witnesses: BTreeMap<String, SelectionWitness>,
     pub internal_selection_witnesses: BTreeMap<String, SelectionWitness>,
     pub internal_store_witness: Option<InternalStoreWitness>,
     pub draft_transition_witness: Option<DraftTransitionWitness>,
@@ -123,6 +121,14 @@ pub struct TransitionInput {
 
     pub authorization_image_id: Vec<u8>,
     pub authorization_journal: AuthorizationJournal,
+
+    /// Membership witness for `main`'s entry-argument coordinate (`[0]`)
+    /// against the window's *initial* internal-store state. Only present —
+    /// and only required — on the step that establishes a fresh
+    /// `TransitionState::Init`, and only when the CFS declares `main`
+    /// entry arguments at all. `Next` steps never carry this: the fact it
+    /// establishes is inherited from the previous journal instead.
+    pub entrypoint_membership_witness: Option<InternalStoreReadWitness>,
 }
 
 /// Result of applying one transition (new frontier and fingerprint state).
@@ -164,4 +170,14 @@ pub struct TransitionJournal {
     pub transition_image_id: Vec<u8>,
     pub authorization_image_id: Vec<u8>,
     pub manifest_commitment: Vec<u8>,
+
+    /// Whether `main`'s entry-argument binding (if the CFS declares one)
+    /// has been verified against the authorization journal *somewhere* in
+    /// this proof chain — established fresh via a trace-inclusion witness
+    /// at the chain's `Init` step, then inherited unchanged by every
+    /// `Next` step from `prev_journal.entrypoint_authorized`. Vacuously
+    /// `true` when the CFS declares no `main` entry arguments at all.
+    /// A window that resumes from `Next` without this having been proven
+    /// true at its chain's genesis must not be trusted.
+    pub entrypoint_authorized: bool,
 }

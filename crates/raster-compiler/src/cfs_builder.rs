@@ -4,8 +4,8 @@
 //! by combining tile discovery, sequence discovery, and data flow resolution.
 
 use raster_core::cfs::{
-    CfsCoordinate, CfsCoordinates, ControlFlowSchema, InputBinding, SequenceChildId,
-    SequenceChildItem, SequenceDef, SequenceId, SequenceItem, TileDef,
+    CfsCoordinate, CfsCoordinates, ControlFlowSchema, EntrypointItem, InputBinding,
+    SequenceChildId, SequenceChildItem, SequenceDef, SequenceId, SequenceItem, TileDef,
 };
 
 use crate::flow_resolver::FlowResolver;
@@ -63,7 +63,31 @@ impl<'a> CfsBuilder<'a> {
     }
 
     /// Build a sequence definition from a discovered sequence.
+    ///
+    /// `main`'s declared parameters are entry arguments (see
+    /// `SequenceChildItem::Entrypoint`), not caller-supplied `SequenceScope`
+    /// parameters — main has no caller. When `main` declares any, it gets a
+    /// leading `Entrypoint` item instead of the usual `external()`
+    /// `input_sources`, and every other item's `PriorItemOutput` addressing
+    /// shifts by one to make room for it. Every other sequence (including
+    /// `main` with no declared parameters) is built exactly as before.
     fn build_sequence_def(&self, seq: &Sequence<'_>) -> Result<SequenceDef> {
+        let mut resolver = FlowResolver::new();
+
+        if seq.function.name == "main" && !seq.function.input_names.is_empty() {
+            let entry_item = SequenceChildItem::Entrypoint(EntrypointItem {
+                names: seq.function.input_names.clone(),
+            });
+            let mut items = vec![entry_item];
+            items.extend(resolver.resolve_with_entry_arguments(seq, &seq.function.input_names));
+
+            return Ok(SequenceDef {
+                id: seq.function.name.clone(),
+                input_sources: Vec::new(),
+                items,
+            });
+        }
+
         // Create input sources for the sequence's parameters
         // All sequence inputs come from external sources
         let input_count = seq.function.inputs.len();
@@ -71,7 +95,6 @@ impl<'a> CfsBuilder<'a> {
             (0..input_count).map(|_| InputBinding::external()).collect();
 
         // Resolve data flow for the sequence items
-        let mut resolver = FlowResolver::new();
         let items = resolver.resolve(seq);
 
         Ok(SequenceDef {
@@ -79,5 +102,155 @@ impl<'a> CfsBuilder<'a> {
             input_sources,
             items,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ast::{CallArgumentKind, CallInfo, CallKind, FunctionAstItem, MacroAstItem, ProjectAst};
+    use crate::sequence::SequenceStep;
+    use crate::tile::Tile;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    fn mock_project() -> Project {
+        Project {
+            name: "test".to_string(),
+            ast: ProjectAst {
+                name: "test".to_string(),
+                root_path: PathBuf::from("/test"),
+                functions: vec![],
+            },
+            root_dir: PathBuf::from("/test"),
+            output_dir: PathBuf::from("/test/target/raster"),
+            target_dir: PathBuf::from("/test/target/"),
+        }
+    }
+
+    fn tile_function(name: &str) -> FunctionAstItem {
+        FunctionAstItem {
+            name: name.to_string(),
+            path: PathBuf::from("test.rs"),
+            call_infos: vec![],
+            macros: vec![MacroAstItem {
+                name: "tile".to_string(),
+                args: HashMap::new(),
+            }],
+            input_names: vec!["input".to_string()],
+            inputs: vec!["String".to_string()],
+            output: Some("String".to_string()),
+            signature: format!("fn {}()", name),
+        }
+    }
+
+    fn main_function_with_params(input_names: Vec<&str>, call_infos: Vec<CallInfo>) -> FunctionAstItem {
+        FunctionAstItem {
+            name: "main".to_string(),
+            path: PathBuf::from("test.rs"),
+            call_infos,
+            macros: vec![MacroAstItem {
+                name: "sequence".to_string(),
+                args: HashMap::new(),
+            }],
+            input_names: input_names.iter().map(|s| s.to_string()).collect(),
+            inputs: input_names.iter().map(|_| "PersonalData".to_string()).collect(),
+            output: None,
+            signature: "fn main()".to_string(),
+        }
+    }
+
+    #[test]
+    fn main_with_entry_arguments_gets_a_leading_entrypoint_item_and_empty_input_sources() {
+        let project = mock_project();
+        let greet_func = tile_function("greet");
+        let greet_tile = Tile {
+            function: &greet_func,
+            tile_type: "iter".to_string(),
+            estimated_cycles: None,
+            max_memory: None,
+            description: None,
+        };
+
+        let main_func = main_function_with_params(
+            vec!["personal_data", "seed"],
+            vec![CallInfo {
+                callee: "greet".to_string(),
+                result_binding: Some("greeting".to_string()),
+                arguments: vec!["personal_data".to_string()],
+                argument_kinds: vec![CallArgumentKind::Identifier],
+                call_kind: CallKind::Tile,
+            }],
+        );
+        let sequence = Sequence {
+            function: &main_func,
+            steps: vec![SequenceStep::Tile(&greet_tile)],
+            description: None,
+        };
+
+        let builder = CfsBuilder::new(&project);
+        let seq_def = builder.build_sequence_def(&sequence).unwrap();
+
+        assert!(
+            seq_def.input_sources.is_empty(),
+            "main's own input_sources must be empty once its parameters become an Entrypoint item"
+        );
+        assert_eq!(seq_def.items.len(), 2, "Entrypoint item + one tile item");
+
+        match &seq_def.items[0] {
+            SequenceChildItem::Entrypoint(item) => {
+                assert_eq!(item.names, vec!["personal_data".to_string(), "seed".to_string()]);
+            }
+            other => panic!("Expected a leading Entrypoint item, got {:?}", other),
+        }
+
+        match &seq_def.items[1] {
+            SequenceChildItem::Tile(tile_item) => {
+                assert_eq!(tile_item.id, "greet");
+                match &tile_item.sources[0] {
+                    InputBinding::PriorItemOutput {
+                        intra_sequence_item_index,
+                    } => assert_eq!(*intra_sequence_item_index, 0),
+                    other => panic!("Expected PriorItemOutput{{0}}, got {:?}", other),
+                }
+            }
+            other => panic!("Expected a Tile item, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn main_without_parameters_is_unaffected() {
+        let project = mock_project();
+        let greet_func = tile_function("greet");
+        let greet_tile = Tile {
+            function: &greet_func,
+            tile_type: "iter".to_string(),
+            estimated_cycles: None,
+            max_memory: None,
+            description: None,
+        };
+
+        let main_func = main_function_with_params(
+            vec![],
+            vec![CallInfo {
+                callee: "greet".to_string(),
+                result_binding: None,
+                arguments: vec!["\"Raster\".to_string()".to_string()],
+                argument_kinds: vec![CallArgumentKind::Other],
+                call_kind: CallKind::Tile,
+            }],
+        );
+        let sequence = Sequence {
+            function: &main_func,
+            steps: vec![SequenceStep::Tile(&greet_tile)],
+            description: None,
+        };
+
+        let builder = CfsBuilder::new(&project);
+        let seq_def = builder.build_sequence_def(&sequence).unwrap();
+
+        assert!(seq_def.input_sources.is_empty(), "main declared zero parameters");
+        assert_eq!(seq_def.items.len(), 1, "no Entrypoint item should be added");
+        assert!(matches!(seq_def.items[0], SequenceChildItem::Tile(_)));
     }
 }

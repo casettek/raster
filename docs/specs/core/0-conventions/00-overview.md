@@ -296,14 +296,16 @@ The broader specs require schemas to bind tile IDs to artifact identities (e.g.,
 
 No artifact identity is present in the CFS today.
 
-### E.3 External inputs are not scoped to the entry sequence
+### E.3 External inputs are scoped to `main`'s entry arguments
 
-The broader specs restrict “external inputs” to the entry sequence. The current CFS builder:
+External inputs enter a program only as `main`'s declared parameters (its *entry arguments*). When `main` declares any, its CFS definition carries a leading `SequenceChildItem::Entrypoint` item (item 0, listing the argument names in declaration order) with empty `input_sources`; every other item's `prior_item_output` addressing shifts by one to make room. At startup the runtime binds the whole set as one internal-store object at coordinate `[0]` whose commitment is the struct-hash combined root of the manifest-declared per-argument commitments, and the fraud-proof pipeline authorizes that binding against the manifest commitment (see `checks::entrypoint` in the transition guest).
 
-- sets `SequenceDef.input_sources` to `external` for **all** sequence parameters,
-- and the flow resolver falls back to `external` when it cannot resolve an argument (including literals and complex expressions).
+Two caveats remain for other uses of the `external` binding kind:
 
-Downstream consumers **MUST** treat `external` bindings as “unknown provenance” in today’s schemas; they are not yet a reliable indicator of entry-point-only inputs.
+- non-`main` sequences still set `SequenceDef.input_sources` to `external` for their parameters (they describe caller-supplied `SequenceScope` values, not environment inputs), and
+- the flow resolver still falls back to `external` when it cannot statically resolve an argument (including literals and complex expressions).
+
+Downstream consumers **MUST** treat those residual `external` bindings as “unknown provenance”; only the `Entrypoint` item indicates environment-provided input.
 
 ### E.4 Prior-item outputs are single committed objects; sub-values are selector-addressed
 

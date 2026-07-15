@@ -11,20 +11,12 @@ use alloc::format;
 use raster_core::draft::{draft_value_from_serialize, DraftOp};
 use raster_core::draft::{replay_handle_for_schema, DraftReplayHandle, DraftReplayTransition};
 pub use raster_core::input::{
-    verify_selection_proof, AuthValue, ExternalEncoding, ExternalRef, ExternalSelection,
-    ExternalValue, InternalRef, InternalValue, ListProofDirection, ListProofSibling, Op, Schema,
-    SchemaField, SchemaFieldMode, SchemaNode, Selectable, SelectedPayload, SelectionCommitment,
-    SelectionProof, SelectionProofStep, SelectionWitness, SelectorPath, SelectorSegment,
+    verify_selection_proof, AuthValue, ExternalEncoding, InternalRef, InternalValue,
+    ListProofDirection, ListProofSibling, Op, Schema, SchemaField, SchemaFieldMode, SchemaNode,
+    Selectable, SelectedPayload, SelectionCommitment, SelectionProof, SelectionProofStep,
+    SelectionWitness, SelectorPath, SelectorSegment,
 };
-use raster_core::trace::{
-    ExternalData as TraceExternalData, FnInputValue, InternalData as TraceInternalData,
-};
-
-#[derive(Debug, PartialEq, Eq, Hash)]
-pub struct TypedExternalBinding<Root> {
-    name: String,
-    marker: PhantomData<fn() -> Root>,
-}
+use raster_core::trace::{FnInputValue, InternalData as TraceInternalData};
 
 #[derive(Debug)]
 pub struct TypedInternalBinding<Root> {
@@ -237,7 +229,6 @@ where
             value: FnInputValue::Inline(
                 raster_core::postcard::to_allocvec(&marker).unwrap_or_default(),
             ),
-            external: item_trace.external,
             internal: item_trace.internal,
         })
     }
@@ -289,7 +280,6 @@ where
             AuthRef::Inline(value) => {
                 FnInputValue::Inline(raster_core::postcard::to_allocvec(value).unwrap_or_default())
             }
-            AuthRef::External(_) => FnInputValue::ExternalBinding,
             AuthRef::Internal(_) => FnInputValue::InternalBinding,
         };
         RecurSequenceInputTraceMarker {
@@ -388,19 +378,6 @@ impl<T> core::ops::Deref for RecurState<T> {
 impl<T> core::ops::DerefMut for RecurState<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.get_mut()
-    }
-}
-
-impl<Root> TypedExternalBinding<Root> {
-    pub fn new(name: &str) -> Self {
-        Self {
-            name: name.into(),
-            marker: PhantomData,
-        }
-    }
-
-    pub fn into_selection(self) -> ExternalSelection {
-        ExternalSelection::new(self.name)
     }
 }
 
@@ -747,10 +724,6 @@ where
     }
 }
 
-pub fn typed_external<Root>(name: &str) -> TypedExternalBinding<Root> {
-    TypedExternalBinding::new(name)
-}
-
 pub fn typed_internal<Root>(reference: InternalRef) -> TypedInternalBinding<Root>
 where
     Root: DeserializeOwned + Serialize,
@@ -775,17 +748,8 @@ pub fn typed_selector_path<Root, Selected>(
     TypedSelectorPath::new(path)
 }
 
-type ExternalResolveFn<Current> =
-    Rc<dyn Fn(ExternalSelection) -> raster_core::Result<ExternalValue<Current>>>;
 type InternalResolveFn<Current> =
     Rc<dyn Fn(InternalRef) -> raster_core::Result<InternalValue<Current>>>;
-
-#[doc(hidden)]
-pub struct DeferredAuthExternal<Current> {
-    name: String,
-    selector: SelectorPath,
-    resolve: ExternalResolveFn<Current>,
-}
 
 #[doc(hidden)]
 pub struct DeferredAuthInternal<Current> {
@@ -796,7 +760,6 @@ pub struct DeferredAuthInternal<Current> {
 
 pub enum AuthRef<Current> {
     Inline(Current),
-    External(DeferredAuthExternal<Current>),
     Internal(DeferredAuthInternal<Current>),
 }
 
@@ -804,7 +767,7 @@ impl<Current> AuthRef<Current> {
     pub fn reference(&self) -> &InternalRef {
         match self {
             Self::Internal(binding) => &binding.reference,
-            Self::Inline(_) | Self::External(_) => {
+            Self::Inline(_) => {
                 panic!("AuthRef::reference() is only available for internal bindings")
             }
         }
@@ -814,17 +777,7 @@ impl<Current> AuthRef<Current> {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct AuthRefTrace {
     pub value: FnInputValue,
-    pub external: Option<TraceExternalData>,
     pub internal: Option<TraceInternalData>,
-}
-
-impl<Root> Clone for TypedExternalBinding<Root> {
-    fn clone(&self) -> Self {
-        Self {
-            name: self.name.clone(),
-            marker: PhantomData,
-        }
-    }
 }
 
 impl<Root> Clone for TypedInternalBinding<Root> {
@@ -860,25 +813,6 @@ impl<Root, Selected> Clone for TypedSelectorPath<Root, Selected> {
     }
 }
 
-impl<Current> Clone for DeferredAuthExternal<Current> {
-    fn clone(&self) -> Self {
-        Self {
-            name: self.name.clone(),
-            selector: self.selector.clone(),
-            resolve: self.resolve.clone(),
-        }
-    }
-}
-
-impl<Current> core::fmt::Debug for DeferredAuthExternal<Current> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("DeferredAuthExternal")
-            .field("name", &self.name)
-            .field("selector", &self.selector)
-            .finish()
-    }
-}
-
 impl<Current> Clone for DeferredAuthInternal<Current> {
     fn clone(&self) -> Self {
         Self {
@@ -904,35 +838,9 @@ where
     fn clone(&self) -> Self {
         match self {
             Self::Inline(value) => Self::Inline(value.clone()),
-            Self::External(binding) => Self::External(binding.clone()),
             Self::Internal(binding) => Self::Internal(binding.clone()),
         }
     }
-}
-
-fn summarize_selector_path(selector: &SelectorPath) -> String {
-    if selector.is_empty() {
-        return "<root>".into();
-    }
-
-    let mut summary = String::new();
-    for segment in &selector.segments {
-        match segment {
-            SelectorSegment::Field(name) => {
-                if !summary.is_empty() {
-                    summary.push('.');
-                }
-                summary.push_str(name);
-            }
-            SelectorSegment::Index(index) => {
-                summary.push('[');
-                summary.push_str(&alloc::format!("{}", index));
-                summary.push(']');
-            }
-        }
-    }
-
-    summary
 }
 
 fn summarize_coordinates(coordinates: &raster_core::cfs::CfsCoordinates) -> String {
@@ -962,34 +870,6 @@ where
                 .field("storage", &"inline")
                 .field("value", value)
                 .finish(),
-            Self::External(binding) => {
-                let selector = summarize_selector_path(&binding.selector);
-                match (binding.resolve.as_ref())(ExternalSelection::with_selector(
-                    binding.name.clone(),
-                    binding.selector.clone(),
-                )) {
-                    Ok(resolved) => f
-                        .debug_struct("AuthRef")
-                        .field("storage", &"external")
-                        .field("name", &resolved.name)
-                        .field("selector", &summarize_selector_path(&resolved.selector))
-                        .field("commitment_present", &resolved.commitment.is_some())
-                        .field(
-                            "selection_root_len",
-                            &resolved.selected.commitment.source_root_hash.len(),
-                        )
-                        .field("selected_bytes_len", &resolved.selected.bytes.len())
-                        .field("value", &resolved.value)
-                        .finish(),
-                    Err(error) => f
-                        .debug_struct("AuthRef")
-                        .field("storage", &"external")
-                        .field("name", &binding.name)
-                        .field("selector", &selector)
-                        .field("materialization_error", &alloc::format!("{}", error))
-                        .finish(),
-                }
-            }
             Self::Internal(binding) => {
                 match (binding.resolve.as_ref())(binding.reference.clone()) {
                     Ok(resolved) => f
@@ -1034,33 +914,6 @@ pub trait SelectSource {
     ) -> Self::Selected<Selected>
     where
         Selected: DeserializeOwned + Serialize;
-}
-
-impl<Root> SelectSource for TypedExternalBinding<Root>
-where
-    Root: DeserializeOwned + Serialize + Selectable + 'static,
-{
-    type Root = Root;
-    type Current = Root;
-    type Selected<Selected> = AuthRef<Selected>;
-
-    fn select<Selected>(
-        self,
-        selector: TypedSelectorPath<Self::Current, Selected>,
-    ) -> Self::Selected<Selected>
-    where
-        Selected: DeserializeOwned + Serialize,
-    {
-        let name = self.name;
-        let selector = selector.into_path();
-        AuthRef::External(DeferredAuthExternal {
-            name: name.clone(),
-            selector: selector.clone(),
-            resolve: Rc::new(move |reference| {
-                resolve_typed_external_value::<Root, Selected>(reference)
-            }),
-        })
-    }
 }
 
 impl<Root> SelectSource for TypedInternalBinding<Root>
@@ -1110,39 +963,8 @@ where
         match self {
             AuthRef::Inline(_) => {
                 panic!(
-                    "select! on inline sequence values is not supported; use committed external or internal bindings instead"
+                    "select! on inline sequence values is not supported; use committed internal bindings instead"
                 )
-            }
-            AuthRef::External(binding) => {
-                let relative_selector = selector.into_path();
-                let full_selector =
-                    compose_selector_paths(binding.selector.clone(), relative_selector.clone());
-                let current_name = binding.name.clone();
-                let current_selector = binding.selector.clone();
-                let resolve_current = binding.resolve.clone();
-                AuthRef::External(DeferredAuthExternal {
-                    name: current_name.clone(),
-                    selector: full_selector.clone(),
-                    resolve: Rc::new(move |_| {
-                        if let Ok(selected) =
-                            resolve_external_value::<Selected>(ExternalSelection::with_selector(
-                                current_name.clone(),
-                                full_selector.clone(),
-                            ))
-                        {
-                            return Ok(selected);
-                        }
-                        let current = resolve_current(ExternalSelection::with_selector(
-                            current_name.clone(),
-                            current_selector.clone(),
-                        ))?;
-                        select_external_value::<Current, Selected>(
-                            &current,
-                            &relative_selector,
-                            &full_selector,
-                        )
-                    }),
-                })
             }
             AuthRef::Internal(binding) => {
                 let relative_selector = selector.into_path();
@@ -1177,12 +999,6 @@ where
     source.select(selector)
 }
 
-fn compose_selector_paths(prefix: SelectorPath, suffix: SelectorPath) -> SelectorPath {
-    let mut segments = prefix.segments;
-    segments.extend(suffix.segments);
-    SelectorPath::new(segments)
-}
-
 pub fn selector_path(segments: Vec<SelectorSegment>) -> SelectorPath {
     SelectorPath::new(segments)
 }
@@ -1203,11 +1019,6 @@ where
 /// out of this cached value rather than re-resolving the whole parent list.
 #[doc(hidden)]
 enum ResolvedRecurList<T> {
-    External {
-        name: String,
-        selector: SelectorPath,
-        value: Rc<ExternalValue<Vec<T>>>,
-    },
     Internal {
         reference: InternalRef,
         value: Rc<InternalValue<Vec<T>>>,
@@ -1223,19 +1034,8 @@ where
 {
     match source {
         AuthRef::Inline(_) => Err(raster_core::Error::Other(
-            "call_recur! requires a selectable external or internal list source".into(),
+            "call_recur! requires a selectable internal list source".into(),
         )),
-        AuthRef::External(binding) => {
-            let value = (binding.resolve.as_ref())(ExternalSelection::with_selector(
-                binding.name.clone(),
-                binding.selector.clone(),
-            ))?;
-            Ok(ResolvedRecurList::External {
-                name: binding.name.clone(),
-                selector: binding.selector.clone(),
-                value: Rc::new(value),
-            })
-        }
         AuthRef::Internal(binding) => {
             let value = (binding.resolve.as_ref())(binding.reference.clone())?;
             Ok(ResolvedRecurList::Internal {
@@ -1249,7 +1049,6 @@ where
 impl<T> ResolvedRecurList<T> {
     fn len(&self) -> u64 {
         match self {
-            ResolvedRecurList::External { value, .. } => value.value.len() as u64,
             ResolvedRecurList::Internal { value, .. } => value.value.len() as u64,
         }
     }
@@ -1261,36 +1060,6 @@ impl<T> ResolvedRecurList<T> {
         let relative_selector = selector_path(Vec::from([SelectorSegment::Index(index)]));
 
         match self {
-            ResolvedRecurList::External {
-                name,
-                selector,
-                value,
-            } => {
-                let full_selector =
-                    compose_selector_paths(selector.clone(), relative_selector.clone());
-                let parent = value.clone();
-                let external_name = name.clone();
-
-                Ok(AuthRef::External(DeferredAuthExternal {
-                    name: external_name.clone(),
-                    selector: full_selector.clone(),
-                    resolve: Rc::new(move |_| {
-                        if let Ok(selected) =
-                            resolve_external_value::<T>(ExternalSelection::with_selector(
-                                external_name.clone(),
-                                full_selector.clone(),
-                            ))
-                        {
-                            return Ok(selected);
-                        }
-                        select_external_value::<Vec<T>, T>(
-                            parent.as_ref(),
-                            &relative_selector,
-                            &full_selector,
-                        )
-                    }),
-                }))
-            }
             ResolvedRecurList::Internal { reference, value } => {
                 let parent = value.clone();
                 let item_selector = relative_selector.clone();
@@ -1331,15 +1100,8 @@ where
 {
     match source {
         AuthRef::Inline(_) => Err(raster_core::Error::Other(
-            "call_recur! requires a selectable external or internal list source".into(),
+            "call_recur! requires a selectable internal list source".into(),
         )),
-        AuthRef::External(binding) => {
-            let current = (binding.resolve.as_ref())(ExternalSelection::with_selector(
-                binding.name.clone(),
-                binding.selector.clone(),
-            ))?;
-            Ok(current.value)
-        }
         AuthRef::Internal(binding) => {
             let current = (binding.resolve.as_ref())(binding.reference.clone())?;
             Ok(current.value)
@@ -1353,20 +1115,6 @@ where
 {
     fn into_auth_ref(self) -> AuthRef<T> {
         AuthRef::Inline(self)
-    }
-}
-
-impl<Root> IntoAuthRef<Root> for TypedExternalBinding<Root>
-where
-    Root: DeserializeOwned + Serialize + 'static,
-{
-    fn into_auth_ref(self) -> AuthRef<Root> {
-        let name = self.name;
-        AuthRef::External(DeferredAuthExternal {
-            name: name.clone(),
-            selector: SelectorPath::default(),
-            resolve: Rc::new(move |reference| resolve_external_value::<Root>(reference)),
-        })
     }
 }
 
@@ -1441,16 +1189,6 @@ where
     }
 }
 
-impl<Root> IntoAuthValue<Root> for TypedExternalBinding<Root>
-where
-    Root: DeserializeOwned + Serialize,
-{
-    fn into_auth_value(self) -> raster_core::Result<AuthValue<Root>> {
-        let value = resolve_external_value::<Root>(self.into_selection())?;
-        Ok(AuthValue::external(value))
-    }
-}
-
 impl<Root> IntoAuthValue<Root> for TypedInternalBinding<Root>
 where
     Root: DeserializeOwned + Serialize,
@@ -1468,13 +1206,6 @@ where
     fn into_auth_value(self) -> raster_core::Result<AuthValue<Current>> {
         match self {
             AuthRef::Inline(value) => Ok(AuthValue::inline(value)),
-            AuthRef::External(binding) => {
-                let value = (binding.resolve.as_ref())(ExternalSelection::with_selector(
-                    binding.name,
-                    binding.selector,
-                ))?;
-                Ok(AuthValue::external(value))
-            }
             AuthRef::Internal(binding) => {
                 let value = (binding.resolve.as_ref())(binding.reference)?;
                 Ok(AuthValue::internal(value))
@@ -1556,43 +1287,12 @@ where
             value: FnInputValue::Inline(
                 raster_core::postcard::to_allocvec(value).unwrap_or_default(),
             ),
-            external: None,
             internal: None,
         }),
-        AuthRef::External(binding) => {
-            if let Some(external) = trace_raster_external_binding(&binding.name, &binding.selector)?
-            {
-                return Ok(AuthRefTrace {
-                    value: FnInputValue::ExternalBinding,
-                    external: Some(external),
-                    internal: None,
-                });
-            }
-
-            let resolved = (binding.resolve.as_ref())(ExternalSelection::with_selector(
-                binding.name.clone(),
-                binding.selector.clone(),
-            ))?;
-            Ok(AuthRefTrace {
-                value: FnInputValue::ExternalBinding,
-                external: Some(TraceExternalData {
-                    name: resolved.name,
-                    commitment: resolved
-                        .commitment
-                        .map(|value| value.into_bytes())
-                        .unwrap_or_default(),
-                    tree_root: resolved.selected.commitment.source_root_hash.to_vec(),
-                    selector: resolved.selector,
-                    selection: resolved.selected.commitment,
-                }),
-                internal: None,
-            })
-        }
         AuthRef::Internal(binding) => {
             let resolved = (binding.resolve.as_ref())(binding.reference.clone())?;
             Ok(AuthRefTrace {
                 value: FnInputValue::InternalBinding,
-                external: None,
                 internal: Some(TraceInternalData {
                     coordinates: resolved.reference.coordinates,
                     commitment: resolved.reference.commitment,
@@ -1658,31 +1358,6 @@ pub fn raster_trace_payload<T: Serialize>(
     ))
 }
 
-pub fn select_external_value<Root, T>(
-    value: &ExternalValue<Root>,
-    selector: &SelectorPath,
-    full_selector: &SelectorPath,
-) -> raster_core::Result<ExternalValue<T>>
-where
-    Root: DeserializeOwned + Serialize + Selectable,
-    T: DeserializeOwned + Serialize,
-{
-    #[cfg(feature = "std")]
-    {
-        return raster_runtime::select_external_arg::<Root, T>(value, selector, full_selector);
-    }
-
-    #[cfg(not(feature = "std"))]
-    {
-        let _ = value;
-        let _ = selector;
-        let _ = full_selector;
-        Err(raster_core::Error::Other(format!(
-            "External selection refinement requires the `std` feature"
-        )))
-    }
-}
-
 pub fn select_internal_value<Root, T>(
     value: &InternalValue<Root>,
     selector: &SelectorPath,
@@ -1725,61 +1400,6 @@ where
         Err(raster_core::Error::Other(alloc::format!(
             "Internal raster selection requires the `std` feature"
         )))
-    }
-}
-
-pub fn resolve_external_value<T: DeserializeOwned + Serialize>(
-    reference: ExternalSelection,
-) -> raster_core::Result<raster_core::input::ExternalValue<T>> {
-    #[cfg(feature = "std")]
-    {
-        return raster_runtime::resolve_external_value(reference);
-    }
-
-    #[cfg(not(feature = "std"))]
-    {
-        let _ = reference;
-        Err(raster_core::Error::Other(alloc::format!(
-            "External input resolution requires the `std` feature"
-        )))
-    }
-}
-
-pub fn resolve_typed_external_value<Root, T>(
-    reference: ExternalSelection,
-) -> raster_core::Result<raster_core::input::ExternalValue<T>>
-where
-    Root: DeserializeOwned + Serialize + Selectable,
-    T: DeserializeOwned + Serialize,
-{
-    #[cfg(feature = "std")]
-    {
-        return raster_runtime::resolve_typed_external_value::<Root, T>(reference);
-    }
-
-    #[cfg(not(feature = "std"))]
-    {
-        let _ = reference;
-        Err(raster_core::Error::Other(alloc::format!(
-            "Typed external resolution requires the `std` feature"
-        )))
-    }
-}
-
-pub fn trace_raster_external_binding(
-    name: &str,
-    selector: &SelectorPath,
-) -> raster_core::Result<Option<TraceExternalData>> {
-    #[cfg(feature = "std")]
-    {
-        return raster_runtime::trace_raster_external_binding(name, selector);
-    }
-
-    #[cfg(not(feature = "std"))]
-    {
-        let _ = name;
-        let _ = selector;
-        Ok(None)
     }
 }
 
@@ -2235,4 +1855,9 @@ pub fn write_raster_files<T: Serialize>(
     index_path: &std::path::Path,
 ) -> raster_core::Result<String> {
     raster_runtime::write_raster_files(value, data_path, index_path)
+}
+
+#[cfg(feature = "std")]
+pub fn postcard_structural_commitment<T: Serialize>(value: &T) -> raster_core::Result<String> {
+    raster_runtime::postcard_structural_commitment(value)
 }

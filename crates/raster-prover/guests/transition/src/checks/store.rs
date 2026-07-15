@@ -41,7 +41,13 @@ fn append_log_root_from_witness(
     current
 }
 
-fn verify_internal_store_read_witness(
+/// Verify a trace-inclusion (append-log + coordinate-index membership) proof
+/// that `coordinates` commits to `commitment` in the store rooted at
+/// `current_log_root`/`current_index_root`. Shared by ordinary per-step
+/// internal-store reads and by the fraud-proof genesis check that a
+/// window's initial internal-store state really contains an authorized
+/// entry-argument binding (see `checks::entrypoint`).
+pub(crate) fn verify_internal_store_read_witness(
     read_witness: &InternalStoreReadWitness,
     current_log_root: &[u8],
     current_index_root: &[u8],

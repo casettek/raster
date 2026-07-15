@@ -301,10 +301,6 @@ fn rewrite_into_auth_value_args(sig: &mut syn::Signature) {
     }
 }
 
-fn external_info_ident(param: &ParamInfo) -> syn::Ident {
-    format_ident!("__raster_external_info_{}", param.ident)
-}
-
 fn internal_info_ident(param: &ParamInfo) -> syn::Ident {
     format_ident!("__raster_internal_info_{}", param.ident)
 }
@@ -329,7 +325,6 @@ fn gen_auth_value_materialization(input: &ItemFn) -> proc_macro2::TokenStream {
         .map(|param| {
             let name = &param.ident;
             let protocol_kind = param_protocol_kind(&param.ty);
-            let external_info_ident = external_info_ident(param);
             let internal_info_ident = internal_info_ident(param);
             match protocol_kind {
                 ParamProtocolKind::AuthValue(value_ty) => {
@@ -341,14 +336,10 @@ fn gen_auth_value_materialization(input: &ItemFn) -> proc_macro2::TokenStream {
                             let __raster_auth_value_duration_ns =
                                 ::core::primitive::u64::try_from(__raster_auth_value_start.elapsed().as_nanos())
                                     .unwrap_or(::core::primitive::u64::MAX);
-                            if __raster_auth_value.as_external().is_some() {
-                                __raster_external_input_resolve_ns = __raster_external_input_resolve_ns
-                                    .saturating_add(__raster_auth_value_duration_ns);
-                            } else if __raster_auth_value.as_internal().is_some() {
+                            if __raster_auth_value.as_internal().is_some() {
                                 __raster_internal_input_resolve_ns = __raster_internal_input_resolve_ns
                                     .saturating_add(__raster_auth_value_duration_ns);
                             }
-                            let #external_info_ident = __raster_auth_value.as_external().cloned();
                             let #internal_info_ident = __raster_auth_value.as_internal().cloned();
                             let #name: #value_ty = __raster_auth_value.into_inner();
                         }
@@ -356,7 +347,6 @@ fn gen_auth_value_materialization(input: &ItemFn) -> proc_macro2::TokenStream {
                         quote! {
                             let __raster_auth_value = ::raster::into_auth_value::<#value_ty, _>(#name)
                                 .unwrap_or_else(|e| panic!("Failed to materialize auth value for argument '{}': {}", stringify!(#name), e));
-                            let #external_info_ident = __raster_auth_value.as_external().cloned();
                             let #internal_info_ident = __raster_auth_value.as_internal().cloned();
                             let #name: #value_ty = __raster_auth_value.into_inner();
                         }
@@ -366,7 +356,6 @@ fn gen_auth_value_materialization(input: &ItemFn) -> proc_macro2::TokenStream {
                     let schema_ty = draft_param_schema(param).expect("draft schema type");
                     quote! {
                         let #name: #value_ty = ::raster::into_draft::<#schema_ty, _>(#name);
-                        let #external_info_ident: ::core::option::Option<::raster::ExternalValue<#value_ty>> = ::core::option::Option::None;
                         let #internal_info_ident: ::core::option::Option<::raster::InternalValue<#value_ty>> = ::core::option::Option::None;
                     }
                 },
@@ -387,13 +376,11 @@ fn gen_sequence_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream 
         .map(|param| {
             let name = &param.ident;
             let trace_value_ident = format_ident!("__raster_input_value_{}", name);
-            let external_info_ident = external_info_ident(param);
             let internal_info_ident = internal_info_ident(param);
             quote! {
                 let __raster_auth_trace = ::raster::auth_ref_trace(&#name)
                     .unwrap_or_else(|e| panic!("Failed to trace sequence argument '{}': {}", stringify!(#name), e));
                 let #trace_value_ident = __raster_auth_trace.value;
-                let #external_info_ident = __raster_auth_trace.external;
                 let #internal_info_ident = __raster_auth_trace.internal;
             }
         })
@@ -436,22 +423,6 @@ fn gen_sequence_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream 
         }
     };
 
-    let external_binding_entries: Vec<_> = params
-        .iter()
-        .map(|param| {
-            let name_str = param.ident.to_string();
-            let external_info_ident = external_info_ident(param);
-            quote! {
-                if let ::core::option::Option::Some(__raster_external_info) = &#external_info_ident {
-                    __raster_external.insert(
-                        ::raster::alloc::string::String::from(#name_str),
-                        __raster_external_info.clone(),
-                    );
-                }
-            }
-        })
-        .collect();
-
     let internal_binding_entries: Vec<_> = params
         .iter()
         .map(|param| {
@@ -477,8 +448,6 @@ fn gen_sequence_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream 
 
         #input_bytes
 
-        let mut __raster_external = ::raster::alloc::collections::BTreeMap::new();
-        #(#external_binding_entries)*
         let mut __raster_internal = ::raster::alloc::collections::BTreeMap::new();
         #(#internal_binding_entries)*
 
@@ -487,7 +456,6 @@ fn gen_sequence_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream 
                 data: __raster_input_bytes,
                 values: ::raster::alloc::vec![#(#trace_values.clone()),*],
                 args: __raster_input_args,
-                external: __raster_external,
                 internal: __raster_internal,
             }
         );
@@ -517,14 +485,12 @@ fn gen_recur_sequence_input_serialization(input: &ItemFn) -> proc_macro2::TokenS
         .map(|param| {
             let name = &param.ident;
             let trace_value_ident = format_ident!("__raster_input_value_{}", name);
-            let external_info_ident = external_info_ident(param);
             let internal_info_ident = internal_info_ident(param);
             if recur_sequence_input_inner_type(&param.ty).is_some() {
                 quote! {
                     let __raster_auth_trace = #name.__raster_auth_trace()
                         .unwrap_or_else(|e| panic!("Failed to trace recursive sequence input '{}': {}", stringify!(#name), e));
                     let #trace_value_ident = __raster_auth_trace.value;
-                    let #external_info_ident = __raster_auth_trace.external;
                     let #internal_info_ident = __raster_auth_trace.internal;
                 }
             } else if let Some(schema_ty) = draft_param_schema(param) {
@@ -532,8 +498,6 @@ fn gen_recur_sequence_input_serialization(input: &ItemFn) -> proc_macro2::TokenS
                     let #trace_value_ident = ::raster::core::trace::FnInputValue::Inline(
                         ::raster::serialize_draft_replay_handle::<#schema_ty>(&#name)
                     );
-                    let #external_info_ident: ::core::option::Option<::raster::core::trace::ExternalData> =
-                        ::core::option::Option::None;
                     let #internal_info_ident: ::core::option::Option<::raster::core::trace::InternalData> =
                         ::core::option::Option::None;
                 }
@@ -542,8 +506,6 @@ fn gen_recur_sequence_input_serialization(input: &ItemFn) -> proc_macro2::TokenS
                     let #trace_value_ident = ::raster::core::trace::FnInputValue::Inline(
                         #name.__raster_serialize_replay_handle()
                     );
-                    let #external_info_ident: ::core::option::Option<::raster::core::trace::ExternalData> =
-                        ::core::option::Option::None;
                     let #internal_info_ident: ::core::option::Option<::raster::core::trace::InternalData> =
                         ::core::option::Option::None;
                 }
@@ -552,8 +514,6 @@ fn gen_recur_sequence_input_serialization(input: &ItemFn) -> proc_macro2::TokenS
                     let #trace_value_ident = ::raster::core::trace::FnInputValue::Inline(
                         ::raster::core::postcard::to_allocvec(&#name).unwrap_or_default()
                     );
-                    let #external_info_ident: ::core::option::Option<::raster::core::trace::ExternalData> =
-                        ::core::option::Option::None;
                     let #internal_info_ident: ::core::option::Option<::raster::core::trace::InternalData> =
                         ::core::option::Option::None;
                 }
@@ -562,7 +522,6 @@ fn gen_recur_sequence_input_serialization(input: &ItemFn) -> proc_macro2::TokenS
                     let __raster_auth_trace = ::raster::auth_ref_trace(&#name)
                         .unwrap_or_else(|e| panic!("Failed to trace recursive sequence argument '{}': {}", stringify!(#name), e));
                     let #trace_value_ident = __raster_auth_trace.value;
-                    let #external_info_ident = __raster_auth_trace.external;
                     let #internal_info_ident = __raster_auth_trace.internal;
                 }
             }
@@ -590,22 +549,6 @@ fn gen_recur_sequence_input_serialization(input: &ItemFn) -> proc_macro2::TokenS
         }
     };
 
-    let external_binding_entries: Vec<_> = params
-        .iter()
-        .map(|param| {
-            let name_str = param.ident.to_string();
-            let external_info_ident = external_info_ident(param);
-            quote! {
-                if let ::core::option::Option::Some(__raster_external_info) = &#external_info_ident {
-                    __raster_external.insert(
-                        ::raster::alloc::string::String::from(#name_str),
-                        __raster_external_info.clone(),
-                    );
-                }
-            }
-        })
-        .collect();
-
     let internal_binding_entries: Vec<_> = params
         .iter()
         .map(|param| {
@@ -631,8 +574,6 @@ fn gen_recur_sequence_input_serialization(input: &ItemFn) -> proc_macro2::TokenS
 
         #input_bytes
 
-        let mut __raster_external = ::raster::alloc::collections::BTreeMap::new();
-        #(#external_binding_entries)*
         let mut __raster_internal = ::raster::alloc::collections::BTreeMap::new();
         #(#internal_binding_entries)*
 
@@ -641,7 +582,6 @@ fn gen_recur_sequence_input_serialization(input: &ItemFn) -> proc_macro2::TokenS
                 data: __raster_input_bytes,
                 values: ::raster::alloc::vec![#(#trace_values.clone()),*],
                 args: __raster_input_args,
-                external: __raster_external,
                 internal: __raster_internal,
             }
         );
@@ -1625,23 +1565,6 @@ fn gen_recur_driver_function(
                 let #trace_ident = ::raster::into_auth_value::<#ty, _>(#name.clone())
                     .unwrap_or_else(|e| panic!("Failed to materialize auth value for recur argument '{}': {}", stringify!(#name), e));
                 let __raster_trace_value = match #trace_ident {
-                    ::raster::AuthValue::External(__raster_external_value) => {
-                        __raster_external.insert(
-                            ::raster::alloc::string::String::from(#name_str),
-                            ::raster::core::trace::ExternalData {
-                                name: __raster_external_value.name.clone(),
-                                commitment: __raster_external_value
-                                    .commitment
-                                    .clone()
-                                    .map(|value| value.into_bytes())
-                                    .unwrap_or_default(),
-                                tree_root: __raster_external_value.selected.commitment.source_root_hash.to_vec(),
-                                selector: __raster_external_value.selector.clone(),
-                                selection: __raster_external_value.selected.commitment.clone(),
-                            }
-                        );
-                        ::raster::core::trace::FnInputValue::ExternalBinding
-                    }
                     ::raster::AuthValue::Internal(__raster_internal_value) => {
                         __raster_internal.insert(
                             ::raster::alloc::string::String::from(#name_str),
@@ -1691,7 +1614,6 @@ fn gen_recur_driver_function(
                     .unwrap_or_else(|e| panic!("Failed to build recur input trace: {}", e));
                 let mut __raster_trace_values = ::raster::alloc::vec::Vec::new();
                 let mut __raster_trace_args = ::raster::alloc::vec::Vec::new();
-                let mut __raster_external = ::raster::alloc::collections::BTreeMap::new();
                 let mut __raster_internal = ::raster::alloc::collections::BTreeMap::new();
 
                 __raster_trace_values.push(__raster_input_trace.value);
@@ -1699,12 +1621,6 @@ fn gen_recur_driver_function(
                     name: ::raster::alloc::string::String::from("input"),
                     ty: ::raster::alloc::string::String::from(stringify!(::raster::AuthRef<::raster::alloc::vec::Vec<#item_ty>>)),
                 });
-                if let ::core::option::Option::Some(__raster_external_info) = __raster_input_trace.external {
-                    __raster_external.insert(
-                        ::raster::alloc::string::String::from("input"),
-                        __raster_external_info,
-                    );
-                }
                 if let ::core::option::Option::Some(__raster_internal_info) = __raster_input_trace.internal {
                     __raster_internal.insert(
                         ::raster::alloc::string::String::from("input"),
@@ -1716,7 +1632,6 @@ fn gen_recur_driver_function(
                 #(#extra_trace_capture)*
                 let __raster_input_bytes = ::raster::core::postcard::to_allocvec(&(
                     __raster_trace_values.clone(),
-                    __raster_external.clone(),
                     __raster_internal.clone(),
                 ))
                 .unwrap_or_default();
@@ -1724,7 +1639,6 @@ fn gen_recur_driver_function(
                     data: __raster_input_bytes,
                     values: __raster_trace_values,
                     args: __raster_trace_args,
-                    external: __raster_external,
                     internal: __raster_internal,
                 });
 
@@ -2063,11 +1977,6 @@ fn gen_recur_sequence_driver_function(
                         name: ::raster::alloc::string::String::from("input"),
                         ty: ::raster::alloc::string::String::from(stringify!(::raster::AuthRef<::raster::alloc::vec::Vec<#item_ty>>)),
                     }],
-                    external: __raster_input_trace.external.map(|external| {
-                        let mut map = ::raster::alloc::collections::BTreeMap::new();
-                        map.insert(::raster::alloc::string::String::from("input"), external);
-                        map
-                    }).unwrap_or_default(),
                     internal: __raster_input_trace.internal.map(|internal| {
                         let mut map = ::raster::alloc::collections::BTreeMap::new();
                         map.insert(::raster::alloc::string::String::from("input"), internal);
@@ -2293,13 +2202,10 @@ fn gen_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream {
         .map(|param| {
             let name = &param.ident;
             let trace_value_ident = format_ident!("__raster_input_value_{}", name);
-            let external_info_ident = external_info_ident(param);
             let internal_info_ident = internal_info_ident(param);
             match param_protocol_kind(&param.ty) {
                 ParamProtocolKind::AuthValue(_) => quote! {
-                    let #trace_value_ident = if #external_info_ident.is_some() {
-                        ::raster::core::trace::FnInputValue::ExternalBinding
-                    } else if #internal_info_ident.is_some() {
+                    let #trace_value_ident = if #internal_info_ident.is_some() {
                         ::raster::core::trace::FnInputValue::InternalBinding
                     } else {
                         ::raster::core::trace::FnInputValue::Inline(
@@ -2341,32 +2247,6 @@ fn gen_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream {
             let name = &param.ident;
             let trace_value_ident = format_ident!("__raster_input_value_{}", name);
             quote! { #trace_value_ident }
-        })
-        .collect();
-
-    let external_binding_entries: Vec<_> = params
-        .iter()
-        .map(|param| {
-            let name_str = param.ident.to_string();
-            let external_info_ident = external_info_ident(param);
-            quote! {
-                if let ::core::option::Option::Some(__raster_external_info) = &#external_info_ident {
-                    __raster_external.insert(
-                        ::raster::alloc::string::String::from(#name_str),
-                        ::raster::core::trace::ExternalData {
-                            name: __raster_external_info.name.clone(),
-                            commitment: __raster_external_info
-                                .commitment
-                                .clone()
-                                .map(|value| value.into_bytes())
-                                .unwrap_or_default(),
-                            tree_root: __raster_external_info.selected.commitment.source_root_hash.to_vec(),
-                            selector: __raster_external_info.selector.clone(),
-                            selection: __raster_external_info.selected.commitment.clone(),
-                        }
-                    );
-                }
-            }
         })
         .collect();
 
@@ -2439,8 +2319,6 @@ fn gen_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream {
 
         #input_bytes
 
-        let mut __raster_external = ::raster::alloc::collections::BTreeMap::new();
-        #(#external_binding_entries)*
         let mut __raster_internal = ::raster::alloc::collections::BTreeMap::new();
         #(#internal_binding_entries)*
 
@@ -2449,7 +2327,6 @@ fn gen_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream {
                 data: __raster_input_bytes,
                 values: ::raster::alloc::vec![#(#trace_values),*],
                 args: __raster_input_args,
-                external: __raster_external,
                 internal: __raster_internal,
             }
         );
@@ -3533,6 +3410,109 @@ fn gen_sequence_wrapped_body(
     }
 }
 
+/// Generates the leading statements that bind `main`'s declared parameters
+/// to `main`'s entry arguments: one `bind_entry_arguments` call up front,
+/// then one `TypedInternalBinding<T>` local per parameter, each resolving
+/// through a field-selector into the single combined entry object (see
+/// `raster_runtime::bind_entry_arguments`) — usable directly as a tile
+/// argument or narrowed further with `select!`, same as any other
+/// internal-store binding.
+/// Only meaningful on native (std, non-riscv32) execution — main never
+/// actually runs on a tile's riscv32 guest target, but its code still gets
+/// compiled there as part of the user crate, so every binding needs a
+/// same-typed, unreachable fallback on that path.
+fn gen_main_entry_argument_prelude(params: &[ParamInfo]) -> proc_macro2::TokenStream {
+    if params.is_empty() {
+        return quote! {};
+    }
+
+    let spec_exprs: Vec<_> = params
+        .iter()
+        .map(|param| {
+            let name_str = param.ident.to_string();
+            let ty = &param.ty;
+            quote! { ::raster::entry_argument_spec::<#ty>(#name_str) }
+        })
+        .collect();
+
+    let bind_stmts = quote! {
+        #[cfg(all(feature = "std", not(target_arch = "riscv32")))]
+        let __raster_entry_binding =
+            ::raster::bind_entry_arguments(&[ #(#spec_exprs),* ])
+                .expect("Failed to bind main entry arguments");
+        #[cfg(all(feature = "std", not(target_arch = "riscv32")))]
+        ::raster::publish_trace_event(::raster::core::trace::TraceEvent::EntrypointBind(
+            ::raster::core::trace::EntrypointBindEvent {
+                arguments: __raster_entry_binding.arguments.clone(),
+            },
+        ));
+    };
+
+    let param_bindings: Vec<_> = params
+        .iter()
+        .map(|param| {
+            let ident = &param.ident;
+            let ty = &param.ty;
+            let name_str = ident.to_string();
+            let resolver_fn = format_ident!("__raster_resolve_entry_{}", ident);
+            quote! {
+                // A plain `fn` item, not a closure: `typed_internal_with_resolver`
+                // takes a bare fn pointer, so the field name has to be baked in
+                // as a literal rather than captured. This resolver *is* the
+                // field-select — there is no whole-value type for the combined
+                // entry object, so `typed_internal::<#ty>(reference).select(...)`
+                // (resolve-whole-then-select) doesn't apply here; this goes
+                // straight through `select_stored_internal_value`, exactly like
+                // any other selector-based internal read.
+                #[cfg(all(feature = "std", not(target_arch = "riscv32")))]
+                fn #resolver_fn(
+                    reference: ::raster::InternalRef,
+                ) -> ::raster::runtime::Result<::raster::InternalValue<#ty>> {
+                    ::raster::select_stored_internal_value::<#ty>(
+                        &reference,
+                        &::raster::SelectorPath::new(::raster::alloc::vec![
+                            ::raster::SelectorSegment::Field(
+                                ::raster::alloc::string::String::from(#name_str)
+                            )
+                        ]),
+                    )
+                }
+                #[cfg(all(feature = "std", not(target_arch = "riscv32")))]
+                let #ident: ::raster::TypedInternalBinding<#ty> =
+                    ::raster::typed_internal_with_resolver::<#ty>(
+                        __raster_entry_binding.reference.clone(),
+                        #resolver_fn,
+                    );
+                #[cfg(not(all(feature = "std", not(target_arch = "riscv32"))))]
+                let #ident: ::raster::TypedInternalBinding<#ty> = ::core::unreachable!(
+                    "main entry arguments are only bound on native (std, non-riscv32) execution"
+                );
+            }
+        })
+        .collect();
+
+    quote! {
+        #bind_stmts
+        #(#param_bindings)*
+    }
+}
+
+/// Prepends `main`'s entry-argument prelude to its body, ahead of the
+/// user's own statements — must run after `rewrite_sequence_block` (so the
+/// injected calls are never mistaken for tile calls during extraction) and
+/// before the body is embedded into the wrapped sequence closure.
+fn prepend_entry_argument_prelude(block: &mut syn::Block, params: &[ParamInfo]) {
+    if params.is_empty() {
+        return;
+    }
+    let prelude_tokens = gen_main_entry_argument_prelude(params);
+    let prelude_block: syn::Block = syn::parse2(quote! { { #prelude_tokens } })
+        .expect("Failed to parse generated main entry-argument prelude");
+    let mut new_stmts = prelude_block.stmts;
+    new_stmts.append(&mut block.stmts);
+    block.stmts = new_stmts;
+}
+
 /// Declares a sequence of tiles with linear control flow.
 ///
 /// The `#[sequence]` macro parses the function body to extract tile calls
@@ -3540,7 +3520,9 @@ fn gen_sequence_wrapped_body(
 /// and the sequence is registered for use with `cargo raster preview`.
 ///
 /// When the function is named **`main`**, it is the program entry point: the macro expands to
-/// `fn main() { init(); sequence_wrapped_body; finish(); }`.
+/// `fn main() { init(); sequence_wrapped_body; finish(); }`. `main`'s declared parameters are
+/// its *entry arguments*: each is bound at startup from the manifest-declared external input
+/// of the same name (`--input`/`--input-manifest`) and arrives as an ordinary typed binding.
 ///
 /// # Attributes
 /// - `description = "..."` - Human-readable description of the sequence
@@ -3548,10 +3530,10 @@ fn gen_sequence_wrapped_body(
 /// # Example (entry point)
 /// ```ignore
 /// #[raster::sequence]
-/// fn main() {
-///     let name = raster::select!(String, raster::external!(String, "name"));
-///     let result = greet_sequence(name);
-///     println!("{}", result);
+/// fn main(name: String) {
+///     let name = raster::select!(String, name);
+///     let result = call_seq!(greet_sequence, name);
+///     println!("{:?}", result);
 /// }
 /// ```
 ///
@@ -3590,11 +3572,15 @@ pub fn sequence(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 
     let expanded = if item_fn.sig.ident == "main" {
-        if !params.is_empty() {
-            panic!(
-                "`#[sequence] fn main` must not declare parameters. Bind committed inputs explicitly inside the body with external!(...)."
-            );
-        }
+        prepend_entry_argument_prelude(&mut item_fn.block, &params);
+        // `main`'s declared parameters are entry arguments bound inside the
+        // body by the prelude above, not caller-supplied `SequenceScope`
+        // arguments — main has no caller. Clear the signature before
+        // building the wrapped body so `gen_sequence_input_serialization`
+        // (which traces real sequence-scope arguments for the SequenceStart
+        // event) sees no parameters, exactly as it did when `main` was
+        // required to take none.
+        item_fn.sig.inputs = syn::punctuated::Punctuated::new();
 
         let output = &item_fn.sig.output;
         let auth_name = format_ident!("__raster_sequence_auth_main");

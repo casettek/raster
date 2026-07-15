@@ -13,30 +13,6 @@ use std::collections::BTreeMap;
 
 pub type Hash32 = [u8; 32];
 
-/// A lightweight reference to a named external input.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub struct ExternalRef {
-    pub name: String,
-    #[serde(default)]
-    pub selector: SelectorPath,
-}
-
-impl ExternalRef {
-    pub fn new(name: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            selector: SelectorPath::default(),
-        }
-    }
-
-    pub fn with_selector(name: impl Into<String>, selector: SelectorPath) -> Self {
-        Self {
-            name: name.into(),
-            selector,
-        }
-    }
-}
-
 /// A lightweight reference to an immutable internal store object.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct InternalRef {
@@ -566,41 +542,8 @@ impl From<i32> for SelectorSegment {
     }
 }
 
-/// A caller-owned external selection passed through `external!(...)`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ExternalSelection {
-    pub reference: ExternalRef,
-}
-
-impl ExternalSelection {
-    pub fn new(name: impl Into<String>) -> Self {
-        Self {
-            reference: ExternalRef::new(name),
-        }
-    }
-
-    pub fn with_selector(name: impl Into<String>, selector: SelectorPath) -> Self {
-        Self {
-            reference: ExternalRef::with_selector(name, selector),
-        }
-    }
-
-    pub fn name(&self) -> &str {
-        &self.reference.name
-    }
-
-    pub fn selector(&self) -> &SelectorPath {
-        &self.reference.selector
-    }
-
-    pub fn into_ref(self) -> ExternalRef {
-        self.reference
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum AuthValue<T> {
-    External(ExternalValue<T>),
     Internal(InternalValue<T>),
     Inline(T),
 }
@@ -610,75 +553,22 @@ impl<T> AuthValue<T> {
         Self::Inline(value)
     }
 
-    pub fn external(value: ExternalValue<T>) -> Self {
-        Self::External(value)
-    }
-
     pub fn internal(value: InternalValue<T>) -> Self {
         Self::Internal(value)
     }
 
     pub fn into_inner(self) -> T {
         match self {
-            Self::External(external) => external.value,
             Self::Internal(internal) => internal.value,
             Self::Inline(value) => value,
-        }
-    }
-
-    pub fn as_external(&self) -> Option<&ExternalValue<T>> {
-        match self {
-            Self::External(external) => Some(external),
-            Self::Inline(_) => None,
-            Self::Internal(_) => None,
         }
     }
 
     pub fn as_internal(&self) -> Option<&InternalValue<T>> {
         match self {
             Self::Internal(internal) => Some(internal),
-            Self::External(_) | Self::Inline(_) => None,
+            Self::Inline(_) => None,
         }
-    }
-}
-
-/// A resolved external value carrying both identity metadata and the typed value.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub struct ExternalValue<T> {
-    pub name: String,
-    pub selector: SelectorPath,
-    pub commitment: Option<String>,
-    pub selected: SelectedPayload,
-    pub value: T,
-}
-
-impl<T> ExternalValue<T> {
-    pub fn new(
-        name: impl Into<String>,
-        selector: SelectorPath,
-        commitment: Option<String>,
-        selected: SelectedPayload,
-        value: T,
-    ) -> Self {
-        Self {
-            name: name.into(),
-            selector,
-            commitment,
-            selected,
-            value,
-        }
-    }
-
-    pub fn into_inner(self) -> T {
-        self.value
-    }
-
-    pub fn bytes(&self) -> &[u8] {
-        &self.selected.bytes
-    }
-
-    pub fn selected(&self) -> &SelectedPayload {
-        &self.selected
     }
 }
 
@@ -997,33 +887,17 @@ mod tests {
     fn auth_value_helpers_preserve_inline_values() {
         let arg = AuthValue::inline(7u64);
 
-        assert!(arg.as_external().is_none());
+        assert!(arg.as_internal().is_none());
         assert_eq!(arg.into_inner(), 7);
     }
 
     #[test]
-    fn auth_value_helpers_preserve_external_metadata() {
-        let selected = SelectedPayload {
-            bytes: alloc::vec![1, 2, 3],
-            commitment: SelectionCommitment {
-                path: SelectorPath::default(),
-                source_root_hash: [4; 32],
-                selected_hash: [7; 32],
-                selected_len: 3,
-            },
-        };
-        let arg = AuthValue::external(ExternalValue::new(
-            "payload",
-            SelectorPath::default(),
-            Some("abc123".to_string()),
-            selected.clone(),
-            9u64,
-        ));
+    fn auth_value_helpers_preserve_internal_metadata() {
+        let reference = InternalRef::new(CfsCoordinates(alloc::vec![0]), alloc::vec![4; 32]);
+        let arg = AuthValue::internal(InternalValue::new(reference.clone(), alloc::vec![1, 2, 3], 9u64));
 
-        let external = arg.as_external().expect("expected external metadata");
-        assert_eq!(external.name, "payload");
-        assert_eq!(external.commitment.as_deref(), Some("abc123"));
-        assert_eq!(external.selected, selected);
+        let internal = arg.as_internal().expect("expected internal metadata");
+        assert_eq!(internal.reference, reference);
         assert_eq!(arg.into_inner(), 9);
     }
 }

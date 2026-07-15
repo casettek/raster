@@ -13,7 +13,7 @@ use raster_core::cfs::ControlFlowSchema;
 use raster_core::draft::DraftTransitionWitness;
 use raster_core::fingerprint::Fingerprint;
 use raster_core::input::SelectionWitness;
-use raster_core::trace::{ExternalInput, FnInput, StepRecord};
+use raster_core::trace::{FnInput, StepRecord};
 use raster_core::transition::{
     InitTransition, InternalStoreWitness, TransitionInput, TransitionJournal, TransitionState,
 };
@@ -32,8 +32,6 @@ type RecordedStepIo = HashMap<
         Option<Vec<u8>>,
         Option<FnInput>,
         Option<FnInput>,
-        ExternalInput,
-        BTreeMap<String, SelectionWitness>,
         BTreeMap<String, SelectionWitness>,
         Option<InternalStoreWitness>,
         Option<DraftTransitionWitness>,
@@ -52,8 +50,6 @@ fn build_transition_input(
         output_witness,
         input_source_witness,
         sequence_scope_witness,
-        external_input,
-        external_selection_witnesses,
         internal_selection_witnesses,
         internal_store_witness,
         draft_transition_witness,
@@ -79,13 +75,15 @@ fn build_transition_input(
             output_witness,
             input_source_witness,
             sequence_scope_witness,
-            external_input,
-            external_selection_witnesses,
             internal_selection_witnesses,
             internal_store_witness,
             draft_transition_witness,
             authorization_journal: authorization_journal.clone(),
             input_sources_witnesses: input_sources_witnesses.clone(),
+            // Only ever populated for the step that establishes a fresh
+            // `TransitionState::Init` on a CFS declaring `main` entry
+            // arguments — see `step_transitions`.
+            entrypoint_membership_witness: None,
         }
     } else {
         TransitionInput {
@@ -97,13 +95,12 @@ fn build_transition_input(
             output_witness,
             input_source_witness,
             sequence_scope_witness,
-            external_input,
-            external_selection_witnesses,
             internal_selection_witnesses,
             internal_store_witness,
             draft_transition_witness,
             authorization_journal: authorization_journal.clone(),
             input_sources_witnesses: input_sources_witnesses.clone(),
+            entrypoint_membership_witness: None,
         }
     }
 }
@@ -244,29 +241,9 @@ mod tests {
     use raster_core::draft::TileReplayJournal;
     use raster_core::fingerprint::{BitPacker, Fingerprint};
     use raster_core::trace::{
-        ExternalData, FnInput, SequenceEndRecord, SequenceStartRecord, TileExecRecord,
+        FnInput, SequenceEndRecord, SequenceStartRecord, TileExecRecord,
     };
     use sha2::{Digest, Sha256};
-
-    fn external_input_commitment(external_input: &ExternalInput) -> Vec<u8> {
-        let bytes = raster_core::postcard::to_allocvec(external_input).unwrap_or_default();
-        Sha256::digest(bytes).to_vec()
-    }
-
-    fn make_external_input(binding_name: &str, commitment: &[u8]) -> ExternalInput {
-        HashMap::from([(
-            "arg".to_string(),
-            ExternalData {
-                name: binding_name.to_string(),
-                commitment: commitment.to_vec(),
-                tree_root: Vec::new(),
-                selector: Default::default(),
-                selection: Default::default(),
-            },
-        )])
-        .into_iter()
-        .collect()
-    }
 
     fn make_tile_step(exec_index: u64, coordinates: Vec<u32>) -> StepRecord {
         StepRecord::TileExec(TileExecRecord {
@@ -277,7 +254,6 @@ mod tests {
             intra_sequence_index: 0,
             input_commitment: vec![exec_index as u8],
             input_source_commitment: Vec::new(),
-            external_input_commitment: Vec::new(),
             output_commitment: vec![exec_index as u8 + 1],
             internal_store_root_before: EMPTY_TRIE_NODES[0].to_vec(),
             internal_store_root_after: EMPTY_TRIE_NODES[0].to_vec(),
@@ -290,12 +266,6 @@ mod tests {
         ManifestedInputs {
             manifest_bytes: br#"{"personal_data":{"type":"sha256","commitment":"239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"}}"#
                 .to_vec(),
-            external_inputs_commitments: [(
-                "personal_data".to_string(),
-                b"239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5".to_vec(),
-            )]
-                .into_iter()
-                .collect(),
         }
     }
 
@@ -316,7 +286,6 @@ mod tests {
             data: Vec::new(),
             values: Vec::new(),
             args: Vec::new(),
-            external: ExternalInput::new(),
             internal: Default::default(),
         }
     }
@@ -334,8 +303,6 @@ mod tests {
                     Some(vec![11]),
                     None,
                     None,
-                    ExternalInput::new(),
-                    BTreeMap::new(),
                     BTreeMap::new(),
                     None,
                     None,
@@ -348,11 +315,6 @@ mod tests {
                     Some(vec![22]),
                     None,
                     None,
-                    make_external_input(
-                        "personal_data",
-                        b"239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5",
-                    ),
-                    BTreeMap::new(),
                     BTreeMap::new(),
                     None,
                     None,
@@ -401,13 +363,6 @@ mod tests {
         assert_eq!(input.replay_image_id, Some(vec![7; 32]));
         assert_eq!(input.input_witness, Some(vec![2]));
         assert_eq!(input.output_witness, Some(vec![22]));
-        assert_eq!(
-            input.external_input,
-            make_external_input(
-                "personal_data",
-                b"239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5",
-            )
-        );
         assert_eq!(input.authorization_journal, make_authorization_journal());
     }
 
@@ -423,8 +378,6 @@ mod tests {
                 Some(error_output.clone()),
                 None,
                 None,
-                ExternalInput::new(),
-                BTreeMap::new(),
                 BTreeMap::new(),
                 None,
                 None,
@@ -466,7 +419,6 @@ mod tests {
             coordinates: CfsCoordinates(vec![]),
             input_commitment: vec![1; 32],
             input_source_commitment: Vec::new(),
-            external_input_commitment: external_input_commitment(&ExternalInput::new()),
         });
         let sequence_end = StepRecord::SequenceEnd(SequenceEndRecord {
             exec_index: 2,
@@ -482,8 +434,6 @@ mod tests {
                     None,
                     None,
                     None,
-                    ExternalInput::new(),
-                    BTreeMap::new(),
                     BTreeMap::new(),
                     None,
                     None,
@@ -496,8 +446,6 @@ mod tests {
                     Some(vec![5, 6]),
                     None,
                     None,
-                    ExternalInput::new(),
-                    BTreeMap::new(),
                     BTreeMap::new(),
                     None,
                     None,
@@ -523,12 +471,10 @@ mod tests {
         assert_eq!(start_input.replay_image_id, None);
         assert_eq!(start_input.input_witness, Some(vec![3, 4]));
         assert_eq!(start_input.output_witness, None);
-        assert!(start_input.external_input.is_empty());
 
         assert_eq!(end_input.replay_image_id, None);
         assert_eq!(end_input.input_witness, None);
         assert_eq!(end_input.output_witness, Some(vec![5, 6]));
-        assert!(end_input.external_input.is_empty());
     }
 
     #[test]
@@ -562,7 +508,6 @@ mod tests {
     }
 
     fn make_sequence_start_step() -> StepRecord {
-        let external_input = ExternalInput::new();
         StepRecord::SequenceStart(SequenceStartRecord {
             exec_index: 1,
             sequence_id: "main".to_string(),
@@ -572,7 +517,6 @@ mod tests {
                 empty_input_source_witness().source_witness_bytes(),
             )
             .to_vec(),
-            external_input_commitment: external_input_commitment(&external_input),
         })
     }
 
@@ -590,13 +534,12 @@ mod tests {
             output_witness: None,
             input_source_witness: Some(empty_input_source_witness()),
             sequence_scope_witness: None,
-            external_input: ExternalInput::new(),
-            external_selection_witnesses: BTreeMap::new(),
             internal_selection_witnesses: BTreeMap::new(),
             internal_store_witness: None,
             draft_transition_witness: None,
             authorization_journal: authorization,
             input_sources_witnesses: HashMap::new(),
+            entrypoint_membership_witness: None,
         };
         let state = TransitionState::Init(InitTransition {
             init_frontier: make_init_frontier(),
@@ -626,7 +569,6 @@ mod tests {
     fn transition_guest_accepts_valid_authorization_receipt_assumption() {
         let (authorization_receipt, authorization) = authorize_external_inputs(&ManifestedInputs {
             manifest_bytes: Vec::new(),
-            external_inputs_commitments: std::collections::BTreeMap::new(),
         });
 
         assert!(prove_single_transition_with_authorization(
@@ -641,7 +583,6 @@ mod tests {
         let (_authorization_receipt, authorization) =
             authorize_external_inputs(&ManifestedInputs {
                 manifest_bytes: Vec::new(),
-                external_inputs_commitments: std::collections::BTreeMap::new(),
             });
 
         assert!(prove_single_transition_with_authorization(authorization, None).is_err());
@@ -652,7 +593,6 @@ mod tests {
         let (authorization_receipt, mut authorization) =
             authorize_external_inputs(&ManifestedInputs {
                 manifest_bytes: Vec::new(),
-                external_inputs_commitments: std::collections::BTreeMap::new(),
             });
         authorization.manifest_commitment = vec![9; 32];
 

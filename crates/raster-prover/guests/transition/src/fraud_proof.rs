@@ -62,14 +62,24 @@ pub enum StepPosition {
 pub struct FraudProofWindowContext {
     pub init_state: InitTransition,
     pub position: StepPosition,
+    /// Whether `main`'s entry-argument binding has been proven authorized
+    /// *somewhere* in this chain — established fresh at `Init` via a
+    /// trace-inclusion witness, inherited unchanged at `Next`. See
+    /// `checks::entrypoint`.
+    pub entrypoint_authorized: bool,
 }
 
 impl FraudProofWindowContext {
     /// Attach the step to the fraud proof window context.
     ///
-    /// - `Init`: start from the genesis state carried in the transition.
+    /// - `Init`: start from the genesis state carried in the transition,
+    ///   and independently establish entry-argument authorization from a
+    ///   trace-inclusion witness — the guest never trusts a host-supplied
+    ///   claim about the window's initial internal-store contents.
     /// - `Next`: read the previous journal, recursively verify its receipt
-    ///   against our own image id, and require state and manifest continuity.
+    ///   against our own image id, and require state and manifest
+    ///   continuity. Entry-argument authorization is inherited unchanged
+    ///   from the previous (recursively verified) journal.
     pub fn proceed(
         params: &PublicParams,
         input: &TransitionInput,
@@ -78,10 +88,18 @@ impl FraudProofWindowContext {
         match state {
             TransitionState::Init(init_transition) => {
                 let live = LiveTransition::genesis(&init_transition);
+                let entrypoint_authorized = checks::entrypoint::verify_genesis_authorization(
+                    &params.cfs_cursor,
+                    &init_transition.init_internal_store_root,
+                    &init_transition.init_internal_store_index_root,
+                    &input.authorization_journal,
+                    input.entrypoint_membership_witness.as_ref(),
+                );
                 (
                     Self {
                         init_state: init_transition,
                         position: StepPosition::First,
+                        entrypoint_authorized,
                     },
                     live,
                 )
@@ -97,6 +115,7 @@ impl FraudProofWindowContext {
                     Self {
                         init_state: prev_journal.init_state,
                         position: StepPosition::Subsequent,
+                        entrypoint_authorized: prev_journal.entrypoint_authorized,
                     },
                     live,
                 )
@@ -203,8 +222,8 @@ impl LiveTransition {
     /// Verify every recorded aspect of one step and advance the state:
     ///
     /// - the step's inputs obey the CFS bindings at its coordinates,
-    /// - recorded IO/external commitments match the witnesses, and tile
-    ///   steps carry a verified replay proof,
+    /// - recorded IO commitments match the witnesses, and tile steps carry
+    ///   a verified replay proof,
     /// - the internal store transition is consistent with the recorded roots,
     /// - the step's coordinates are among the expected next coordinates,
     /// - the draft chain stays continuous,
@@ -216,6 +235,9 @@ impl LiveTransition {
             input.input_source_witness.as_ref(),
             input.sequence_scope_witness.as_ref(),
         );
+        if let StepRecord::Entrypoint(record) = &input.step_record {
+            checks::entrypoint::verify_step(record, &input.authorization_journal);
+        }
         checks::io::verify_step_record(
             &input.step_record,
             input.replay_image_id.as_ref(),
@@ -223,9 +245,6 @@ impl LiveTransition {
             input.input_witness.as_ref(),
             input.output_witness.as_ref(),
             input.input_source_witness.as_ref(),
-            &input.external_input,
-            &input.external_selection_witnesses,
-            &input.authorization_journal.external_inputs_commitments,
         );
         let (_, _, next_index_root) = checks::store::verify_internal_store_transition(
             &input.step_record,
@@ -317,6 +336,7 @@ pub fn commit_journal(
     current_state: TransitionState,
     transition_image_id: Vec<u8>,
     input: &TransitionInput,
+    entrypoint_authorized: bool,
 ) {
     let journal = TransitionJournal {
         init_state,
@@ -324,6 +344,7 @@ pub fn commit_journal(
         transition_image_id,
         authorization_image_id: input.authorization_image_id.clone(),
         manifest_commitment: input.authorization_journal.manifest_commitment.clone(),
+        entrypoint_authorized,
     };
 
     env::commit(&journal);

@@ -54,5 +54,6 @@ fn main() {
         current_state,
         params.transition_image_id,
         &input,
+        window_context.entrypoint_authorized,
     );
 }

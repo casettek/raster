@@ -18,28 +18,17 @@ pub struct FnInputArg {
     pub ty: String,
 }
 
-/// Describes an external input parameter for a tile function.
+/// Describes the input parameters for a tile function.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct FnInput {
     pub data: Vec<u8>,
     pub values: Vec<FnInputValue>,
     pub args: Vec<FnInputArg>,
-    pub external: ExternalInput,
     pub internal: InternalInput,
 }
 
 pub type InternalBindingName = String;
-pub type ExternalInput = BTreeMap<InternalBindingName, ExternalData>;
 pub type InternalInput = BTreeMap<InternalBindingName, InternalData>;
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub struct ExternalData {
-    pub name: String,
-    pub commitment: Vec<u8>,
-    pub tree_root: Vec<u8>,
-    pub selector: SelectorPath,
-    pub selection: SelectionCommitment,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct InternalData {
@@ -52,7 +41,6 @@ pub struct InternalData {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum FnInputValue {
     Inline(Vec<u8>),
-    ExternalBinding,
     InternalBinding,
 }
 
@@ -69,21 +57,12 @@ impl FnInput {
         &self.values
     }
 
-    pub fn external(&self) -> &ExternalInput {
-        &self.external
-    }
-
     pub fn internal(&self) -> &InternalInput {
         &self.internal
     }
 
     pub fn source_witness_bytes(&self) -> Vec<u8> {
-        postcard::to_allocvec(&(
-            self.values.clone(),
-            self.external.clone(),
-            self.internal.clone(),
-        ))
-        .unwrap_or_default()
+        postcard::to_allocvec(&(self.values.clone(), self.internal.clone())).unwrap_or_default()
     }
 }
 
@@ -161,7 +140,6 @@ pub struct TileExecRecord {
     pub input_source_commitment: Vec<u8>,
     pub output_commitment: Vec<u8>,
 
-    pub external_input_commitment: Vec<u8>,
     pub internal_store_root_before: Vec<u8>,
     pub internal_store_root_after: Vec<u8>,
     pub internal_store_index_root_before: Vec<u8>,
@@ -183,7 +161,6 @@ pub struct RecurTileExecRecord {
     pub input_source_commitment: Vec<u8>,
     pub output_commitment: Vec<u8>,
 
-    pub external_input_commitment: Vec<u8>,
     pub internal_store_root_before: Vec<u8>,
     pub internal_store_root_after: Vec<u8>,
     pub internal_store_index_root_before: Vec<u8>,
@@ -205,7 +182,6 @@ pub struct RecurSequenceExecRecord {
     pub input_source_commitment: Vec<u8>,
     pub output_commitment: Vec<u8>,
 
-    pub external_input_commitment: Vec<u8>,
     pub internal_store_root_before: Vec<u8>,
     pub internal_store_root_after: Vec<u8>,
     pub internal_store_index_root_before: Vec<u8>,
@@ -222,7 +198,6 @@ pub struct SequenceStartRecord {
 
     pub input_commitment: Vec<u8>,
     pub input_source_commitment: Vec<u8>,
-    pub external_input_commitment: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -236,6 +211,40 @@ pub struct SequenceEndRecord {
     pub output_commitment: Vec<u8>,
 }
 
+/// What kind of entry-time preparation an `EntrypointRecord` performs.
+/// Currently only one op exists; new entry-time-authorized preparations
+/// (checked against the authorization journal rather than a replay proof)
+/// can be added here without growing `StepRecord` again.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum EntrypointOp {
+    /// Binds `main`'s declared external arguments, in CFS declaration
+    /// order, to a single internal-store object at this step's coordinates.
+    BindEntryArguments { names: Vec<String> },
+}
+
+/// A step that authorizes something at sequence entry against the
+/// authorization journal, rather than against a replay proof. Only ever
+/// emitted for `main`; currently only `main`'s declared external-argument
+/// binding uses this.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct EntrypointRecord {
+    pub exec_index: u64,
+
+    pub sequence_id: String,
+
+    pub coordinates: CfsCoordinates,
+
+    pub op: EntrypointOp,
+
+    pub input_source_commitment: Vec<u8>,
+    pub output_commitment: Vec<u8>,
+
+    pub internal_store_root_before: Vec<u8>,
+    pub internal_store_root_after: Vec<u8>,
+    pub internal_store_index_root_before: Vec<u8>,
+    pub internal_store_index_root_after: Vec<u8>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum StepRecord {
     SequenceStart(SequenceStartRecord),
@@ -243,6 +252,7 @@ pub enum StepRecord {
     TileExec(TileExecRecord),
     RecurTileExec(RecurTileExecRecord),
     RecurSequenceExec(RecurSequenceExecRecord),
+    Entrypoint(EntrypointRecord),
 }
 
 impl StepRecord {
@@ -255,6 +265,7 @@ impl StepRecord {
             }
             StepRecord::SequenceStart(sequence_start_record) => &sequence_start_record.coordinates,
             StepRecord::SequenceEnd(sequence_end_record) => &sequence_end_record.coordinates,
+            StepRecord::Entrypoint(entrypoint_record) => &entrypoint_record.coordinates,
         }
     }
 
@@ -265,6 +276,9 @@ impl StepRecord {
             StepRecord::RecurSequenceExec(record) => Some(&record.input_commitment),
             StepRecord::SequenceStart(record) => Some(&record.input_commitment),
             StepRecord::SequenceEnd(_) => None,
+            // No serialized "input" analogous to a tile's ABI bytes — this
+            // step declares bindings, it does not consume any.
+            StepRecord::Entrypoint(_) => None,
         }
     }
 
@@ -275,6 +289,7 @@ impl StepRecord {
             StepRecord::RecurSequenceExec(record) => Some(&record.output_commitment),
             StepRecord::SequenceStart(_) => None,
             StepRecord::SequenceEnd(record) => Some(&record.output_commitment),
+            StepRecord::Entrypoint(record) => Some(&record.output_commitment),
         }
     }
 
@@ -285,16 +300,7 @@ impl StepRecord {
             StepRecord::RecurSequenceExec(record) => Some(&record.input_source_commitment),
             StepRecord::SequenceStart(record) => Some(&record.input_source_commitment),
             StepRecord::SequenceEnd(_) => None,
-        }
-    }
-
-    pub fn external_input_commitment(&self) -> Option<&Vec<u8>> {
-        match self {
-            StepRecord::TileExec(record) => Some(&record.external_input_commitment),
-            StepRecord::RecurTileExec(record) => Some(&record.external_input_commitment),
-            StepRecord::RecurSequenceExec(record) => Some(&record.external_input_commitment),
-            StepRecord::SequenceStart(record) => Some(&record.external_input_commitment),
-            StepRecord::SequenceEnd(_) => None,
+            StepRecord::Entrypoint(record) => Some(&record.input_source_commitment),
         }
     }
 
@@ -318,16 +324,27 @@ impl StepRecord {
                 &record.internal_store_index_root_before,
                 &record.internal_store_index_root_after,
             )),
+            StepRecord::Entrypoint(record) => Some((
+                &record.internal_store_root_before,
+                &record.internal_store_root_after,
+                &record.internal_store_index_root_before,
+                &record.internal_store_index_root_after,
+            )),
             StepRecord::SequenceStart(_) | StepRecord::SequenceEnd(_) => None,
         }
     }
 
+    /// Whether this step's `output_commitment` is verified through a
+    /// mechanism other than a direct byte-witness comparison: a replay
+    /// proof for `TileExec`/`RecurTileExec`/`RecurSequenceExec`, or the
+    /// authorization journal for `Entrypoint`.
     pub fn is_execution_step(&self) -> bool {
         matches!(
             self,
             StepRecord::TileExec(_)
                 | StepRecord::RecurTileExec(_)
                 | StepRecord::RecurSequenceExec(_)
+                | StepRecord::Entrypoint(_)
         )
     }
 
@@ -381,6 +398,29 @@ pub struct TraceWindow {
     pub items: Vec<StepRecord>,
 }
 
+/// One declared `main` entry argument, as bound at runtime — enough for
+/// the recorder to independently reconstruct the `Referenced` object's
+/// commitment without touching any file bytes. `encoding` says which
+/// selection mechanism applies; per-source deserialization capability for
+/// `Postcard` sources (which aren't self-describing) is looked up by name
+/// from the entry-argument kit registry populated by `bind_entry_arguments`
+/// — it can't travel through this event, since it isn't serializable data.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EntrypointArgumentBinding {
+    pub name: String,
+    pub encoding: crate::input::ExternalEncoding,
+    pub commitment: Vec<u8>,
+}
+
+/// Recorded once, at the top of `main`, when it declares external entry
+/// arguments — carries just enough for the recorder to rebuild the
+/// matching `Referenced` object and `EntrypointRecord` (the live write
+/// already happened in the internal store by the time this is published).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EntrypointBindEvent {
+    pub arguments: Vec<EntrypointArgumentBinding>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TraceEvent {
     SequenceStart(FnCallRecord),
@@ -392,4 +432,6 @@ pub enum TraceEvent {
     RecurTileIterationExec(FnCallRecord),
     RecurTileExec(FnCallRecord),
     RecurSequenceExec(FnCallRecord),
+
+    EntrypointBind(EntrypointBindEvent),
 }

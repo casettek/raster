@@ -867,7 +867,6 @@ mod tests {
             tile_id: fn_name.to_string(),
             input_commitment: Vec::new(),
             input_source_commitment: Vec::new(),
-            external_input_commitment: Vec::new(),
             output_commitment: output.to_le_bytes().to_vec(),
             internal_store_root_before: Vec::new(),
             internal_store_root_after: Vec::new(),
@@ -888,7 +887,6 @@ mod tests {
             coordinates: CfsCoordinates(coordinates),
             input_commitment: Vec::new(),
             input_source_commitment: Vec::new(),
-            external_input_commitment: Vec::new(),
         })
     }
 

@@ -150,8 +150,7 @@ conceptual surface is:
 
 ```rust
 #[sequence]
-fn main() {
-    let users = external!(Vec<User>, "users");
+fn main(users: Vec<User>) {
     let scores = call_recur_list!(process_item, users);
 
     let first_score = select!(Score, scores[0]);

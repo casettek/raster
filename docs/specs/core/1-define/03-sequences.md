@@ -104,8 +104,8 @@ As implemented today:
 
 In the emitted CFS:
 
-- `SequenceDef.input_sources` MUST contain one `InputBinding::external()` per sequence parameter, in parameter order.
-- References to sequence parameters inside item arguments MUST resolve to `InputBinding::SequenceScope { input_index }` (0-based parameter index).
+- For every sequence except `main`, `SequenceDef.input_sources` MUST contain one `InputBinding::external()` per sequence parameter, in parameter order, and references to sequence parameters inside item arguments MUST resolve to `InputBinding::SequenceScope { input_index }` (0-based parameter index).
+- `main` is special: its declared parameters are *entry arguments*, not caller-supplied values (main has no caller). When `main` declares any parameters, its `SequenceDef` MUST have empty `input_sources`, a leading `SequenceChildItem::Entrypoint` item at position 0 listing the parameter names in declaration order, and references to those parameters inside item arguments MUST resolve to `InputBinding::PriorItemOutput { intra_sequence_item_index: 0 }` (the Entrypoint binding). All other items' positions shift by one accordingly.
 
 #### 3.2 Result bindings from `let` statements
 
