@@ -223,7 +223,8 @@ pub fn run(
         }
     }
 
-    let (mut trace, trace_recorder) = load_trace_from_file(&trace_path, trace_format, &cfs)?;
+    let (mut trace, trace_recorder) =
+        load_trace_from_file(&trace_path, trace_format, &cfs, input, input_manifest)?;
 
     if commit_flag.is_some() {
         let commit_path = commit_flag.expect("Commitment path was provided");
@@ -341,9 +342,17 @@ fn load_trace_from_file(
     trace_path: &PathBuf,
     trace_format: TraceFormat,
     cfs: &ControlFlowSchema,
+    input: Option<&str>,
+    input_manifest: Option<&str>,
 ) -> Result<(Trace, TraceRecorder)> {
     let mut trace = Trace::new();
     let mut trace_recorder = TraceRecorder::new(cfs.clone());
+    // Replaying an entry-argument binding needs the same input context the
+    // traced run had; we already parsed it, so hand it over rather than
+    // letting the recorder go looking for it.
+    if input.is_some() || input_manifest.is_some() {
+        trace_recorder.set_external_input(input, input_manifest)?;
+    }
 
     match trace_format {
         TraceFormat::Binary => {

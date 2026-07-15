@@ -272,6 +272,27 @@ impl TraceRecorder {
         }
     }
 
+    /// Give the recorder the input context to resolve `main`'s entry
+    /// arguments against.
+    ///
+    /// The recorder runs in a different process from the one that executed
+    /// the trace, so it cannot inherit the runtime's resolver — but the
+    /// caller has already parsed the same `--input` / `--input-manifest`
+    /// arguments, so it passes them in rather than the recorder rediscovering
+    /// them from `std::env::args`. Required before replaying a trace whose
+    /// `main` declares entry arguments.
+    pub fn set_external_input(
+        &mut self,
+        raw_input: Option<&str>,
+        raw_manifest: Option<&str>,
+    ) -> raster_core::Result<()> {
+        let manager =
+            crate::external_storage::ExternalStorageManager::from_input_args(raw_input, raw_manifest)?;
+        self.internal_storage
+            .set_external_resolver(std::sync::Arc::new(manager));
+        Ok(())
+    }
+
     pub fn input_data_at(&self, coordinates: &CfsCoordinates) -> Option<Option<Vec<u8>>> {
         self.witness_store
             .get(coordinates)
@@ -832,7 +853,7 @@ impl TraceRecorder {
                     .map(|argument| {
                         let kind = match argument.encoding {
                             raster_core::input::ExternalEncoding::Raster => {
-                                crate::internal_storage::ReferencedSourceKind::Raster
+                                crate::backing::ReferencedSourceKind::Raster
                             }
                             raster_core::input::ExternalEncoding::Postcard => {
                                 // `TraceRecorder` runs in `raster-cli`'s own
@@ -864,7 +885,7 @@ impl TraceRecorder {
                                 );
                             }
                         };
-                        crate::internal_storage::ReferencedSource {
+                        crate::backing::ReferencedSource {
                             name: argument.name.clone(),
                             commitment: argument.commitment.clone(),
                             kind,
@@ -872,16 +893,15 @@ impl TraceRecorder {
                     })
                     .collect();
 
-                let resolver = crate::external_storage::ExternalStorageManager::from_cli_args()
-                    .expect("Failed to read --input/--input-manifest CLI context")
-                    .expect(
-                        "Entrypoint bind requires CLI input context from --input and --input-manifest",
-                    );
-                self.internal_storage
-                    .set_external_resolver(std::sync::Arc::new(resolver));
+                assert!(
+                    self.internal_storage.external_resolver().is_some(),
+                    "Replaying an entrypoint bind requires input context; call \
+                     TraceRecorder::set_external_input with the same --input/--input-manifest \
+                     the trace was produced with",
+                );
 
                 let write = self.internal_storage.append_referenced_object(
-                    crate::internal_storage::ReferencedObject { sources },
+                    crate::backing::ReferencedObject { sources },
                     coordinates.clone(),
                 );
                 let output_commitment = write.entry.object_commitment.clone();
