@@ -17,8 +17,8 @@ use raster_core::draft::{
 };
 use raster_core::input::{SchemaField, SchemaFieldMode, SchemaNode, Selectable};
 use raster_core::trace::{
-    FnInput, FnInputArg, FnInputValue, StorageData, SequenceEndRecord, SequenceStartRecord,
-    StepRecord, TileExecRecord,
+    ExecStep, ExecTarget, FnInput, FnInputArg, FnInputValue, StepKind, StorageData, StorageRoots,
+    StepRecord,
 };
 use raster_core::transition::{
     StorageEntry, StorageLogWitness, StorageReadWitness, StorageWitness,
@@ -70,20 +70,24 @@ impl Selectable for DemoDraft {
 }
 
 fn draft_tile_step(exec_index: u64) -> StepRecord {
-    StepRecord::TileExec(TileExecRecord {
+    StepRecord {
         exec_index,
-        tile_id: "collect_lines".into(),
         sequence_id: "main".into(),
-        intra_sequence_index: exec_index as u32,
         coordinates: CfsCoordinates(vec![exec_index as u32]),
-        input_commitment: vec![exec_index as u8; 32],
-        input_source_commitment: vec![0; 32],
-        output_commitment: vec![1; 32],
-        storage_root_before: EMPTY_LEAF.to_vec(),
-        storage_root_after: EMPTY_LEAF.to_vec(),
-        storage_index_root_before: Vec::new(),
-        storage_index_root_after: Vec::new(),
-    })
+        kind: StepKind::Exec(ExecStep {
+            target: ExecTarget::Tile("collect_lines".into()),
+            intra_sequence_index: exec_index as u32,
+            input_commitment: vec![exec_index as u8; 32],
+            input_source_commitment: vec![0; 32],
+            output_commitment: vec![1; 32],
+            storage: StorageRoots {
+                root_before: EMPTY_LEAF.to_vec(),
+                root_after: EMPTY_LEAF.to_vec(),
+                index_root_before: Vec::new(),
+                index_root_after: Vec::new(),
+            },
+        }),
+    }
 }
 
 fn authorization_journal(binding_name: &str, commitment: &[u8]) -> AuthorizationJournal {
@@ -171,20 +175,24 @@ fn producer_sequence_cfs() -> CfsCursor {
 
 #[test]
 fn verify_tile_commitments_accept_matching_recorded_io() {
-    let step = StepRecord::TileExec(TileExecRecord {
+    let step = StepRecord {
         exec_index: 1,
-        tile_id: "tile".to_string(),
         sequence_id: "main".to_string(),
         coordinates: CfsCoordinates(vec![0]),
-        intra_sequence_index: 0,
-        input_commitment: sha(b"in"),
-        input_source_commitment: Vec::new(),
-        output_commitment: sha(b"out"),
-        storage_root_before: vec![0; 32],
-        storage_root_after: vec![0; 32],
-        storage_index_root_before: Vec::new(),
-        storage_index_root_after: Vec::new(),
-    });
+        kind: StepKind::Exec(ExecStep {
+            target: ExecTarget::Tile("tile".to_string()),
+            intra_sequence_index: 0,
+            input_commitment: sha(b"in"),
+            input_source_commitment: Vec::new(),
+            output_commitment: sha(b"out"),
+            storage: StorageRoots {
+                root_before: vec![0; 32],
+                root_after: vec![0; 32],
+                index_root_before: Vec::new(),
+                index_root_after: Vec::new(),
+            },
+        }),
+    };
 
     verify_io_witness(&step, Some(&b"in".to_vec()), Some(&b"out".to_vec()));
 }
@@ -192,20 +200,24 @@ fn verify_tile_commitments_accept_matching_recorded_io() {
 #[test]
 fn verify_step_record_inputs_accepts_sequence_descendant_producer_coordinates() {
     let cfs_cursor = producer_sequence_cfs();
-    let step_record = StepRecord::TileExec(TileExecRecord {
+    let step_record = StepRecord {
         exec_index: 1,
-        tile_id: "consumer".into(),
         sequence_id: "main".into(),
         coordinates: CfsCoordinates(vec![1]),
-        intra_sequence_index: 1,
-        input_commitment: Vec::new(),
-        input_source_commitment: Vec::new(),
-        output_commitment: Vec::new(),
-        storage_root_before: Vec::new(),
-        storage_root_after: Vec::new(),
-        storage_index_root_before: Vec::new(),
-        storage_index_root_after: Vec::new(),
-    });
+        kind: StepKind::Exec(ExecStep {
+            target: ExecTarget::Tile("consumer".into()),
+            intra_sequence_index: 1,
+            input_commitment: Vec::new(),
+            input_source_commitment: Vec::new(),
+            output_commitment: Vec::new(),
+            storage: StorageRoots {
+                root_before: Vec::new(),
+                root_after: Vec::new(),
+                index_root_before: Vec::new(),
+                index_root_after: Vec::new(),
+            },
+        }),
+    };
     let input_source_witness =
         storage_input_witness(CfsCoordinates(vec![0, 0]), sha(b"producer-output"));
 
@@ -232,26 +244,31 @@ fn chunked_recur_cfs(chunk: Option<u64>) -> CfsCursor {
                 sources: vec![],
                 chunk,
             })],
+            entry_arguments: Vec::new(),
+            produces_output: false,
         }],
     })
 }
 
 fn recur_iteration_step(iteration: u32) -> StepRecord {
-    StepRecord::TileExec(TileExecRecord {
+    StepRecord {
         exec_index: 1,
-        tile_id: "collect".into(),
         sequence_id: "main".into(),
-        intra_sequence_index: 0,
         coordinates: CfsCoordinates(vec![0, iteration]),
-        input_commitment: Vec::new(),
-        input_source_commitment: Vec::new(),
-        output_commitment: Vec::new(),
-        external_input_commitment: Vec::new(),
-        internal_store_root_before: Vec::new(),
-        internal_store_root_after: Vec::new(),
-        internal_store_index_root_before: Vec::new(),
-        internal_store_index_root_after: Vec::new(),
-    })
+        kind: StepKind::Exec(ExecStep {
+            target: ExecTarget::RecurTile("collect".into()),
+            intra_sequence_index: 0,
+            input_commitment: Vec::new(),
+            input_source_commitment: Vec::new(),
+            output_commitment: Vec::new(),
+            storage: StorageRoots {
+                root_before: Vec::new(),
+                root_after: Vec::new(),
+                index_root_before: Vec::new(),
+                index_root_after: Vec::new(),
+            },
+        }),
+    }
 }
 
 /// ABI bytes of a chunked recur iteration input: the tuple leads with
@@ -323,39 +340,47 @@ fn verify_step_record_inputs_requires_witness_for_declared_chunk() {
 #[test]
 #[should_panic(expected = "Step input commitment does not match recorded input bytes")]
 fn verify_tile_commitments_reject_mismatched_input() {
-    let step = StepRecord::TileExec(TileExecRecord {
+    let step = StepRecord {
         exec_index: 1,
-        tile_id: "tile".to_string(),
         sequence_id: "main".to_string(),
         coordinates: CfsCoordinates(vec![0]),
-        intra_sequence_index: 0,
-        input_commitment: sha(b"expected"),
-        input_source_commitment: Vec::new(),
-        output_commitment: sha(b"out"),
-        storage_root_before: vec![0; 32],
-        storage_root_after: vec![0; 32],
-        storage_index_root_before: Vec::new(),
-        storage_index_root_after: Vec::new(),
-    });
+        kind: StepKind::Exec(ExecStep {
+            target: ExecTarget::Tile("tile".to_string()),
+            intra_sequence_index: 0,
+            input_commitment: sha(b"expected"),
+            input_source_commitment: Vec::new(),
+            output_commitment: sha(b"out"),
+            storage: StorageRoots {
+                root_before: vec![0; 32],
+                root_after: vec![0; 32],
+                index_root_before: Vec::new(),
+                index_root_after: Vec::new(),
+            },
+        }),
+    };
 
     verify_io_witness(&step, Some(&b"actual".to_vec()), Some(&b"out".to_vec()));
 }
 
 #[test]
 fn verify_sequence_boundary_commitments_accept_matching_recorded_io() {
-    let start = StepRecord::SequenceStart(SequenceStartRecord {
+    let start = StepRecord {
         exec_index: 1,
         sequence_id: "main".to_string(),
         coordinates: CfsCoordinates(vec![]),
-        input_commitment: sha(b"sequence-in"),
-        input_source_commitment: Vec::new(),
-    });
-    let end = StepRecord::SequenceEnd(SequenceEndRecord {
+        kind: StepKind::SequenceStart {
+            input_commitment: sha(b"sequence-in"),
+            input_source_commitment: Vec::new(),
+        },
+    };
+    let end = StepRecord {
         exec_index: 2,
         sequence_id: "main".to_string(),
         coordinates: CfsCoordinates(vec![]),
-        output_commitment: sha(b"sequence-out"),
-    });
+        kind: StepKind::SequenceEnd {
+            output_commitment: sha(b"sequence-out"),
+        },
+    };
 
     verify_io_witness(&start, Some(&b"sequence-in".to_vec()), None);
     verify_io_witness(&end, None, Some(&b"sequence-out".to_vec()));
@@ -469,20 +494,24 @@ fn tile_step_with_store_roots(
     index_root_before: Vec<u8>,
     index_root_after: Vec<u8>,
 ) -> StepRecord {
-    StepRecord::TileExec(TileExecRecord {
+    StepRecord {
         exec_index,
-        tile_id: "tile".to_string(),
         sequence_id: "main".to_string(),
         coordinates,
-        intra_sequence_index: 0,
-        input_commitment: Vec::new(),
-        input_source_commitment,
-        output_commitment,
-        storage_root_before: root_before,
-        storage_root_after: root_after,
-        storage_index_root_before: index_root_before,
-        storage_index_root_after: index_root_after,
-    })
+        kind: StepKind::Exec(ExecStep {
+            target: ExecTarget::Tile("tile".to_string()),
+            intra_sequence_index: 0,
+            input_commitment: Vec::new(),
+            input_source_commitment,
+            output_commitment,
+            storage: StorageRoots {
+                root_before,
+                root_after,
+                index_root_before,
+                index_root_after,
+            },
+        }),
+    }
 }
 
 #[test]
@@ -933,7 +962,7 @@ fn verify_draft_transition_rejects_tampered_pre_state_witness() {
 }
 
 use crate::checks::entrypoint::{combined_root, verify_genesis_authorization, verify_step};
-use raster_core::trace::{ProgramStartStep, StepKind, StorageRoots};
+use raster_core::trace::ProgramStartStep;
 use raster_core::transition::EntrypointAuthorization;
 
 fn entrypoint_cfs(names: Vec<String>) -> CfsCursor {
@@ -947,6 +976,7 @@ fn entrypoint_cfs(names: Vec<String>) -> CfsCursor {
             input_sources: vec![],
             items: vec![],
             entry_arguments: names,
+            produces_output: false,
         }],
     })
 }
@@ -1223,25 +1253,43 @@ fn genesis_authorization_rejects_a_late_window_missing_its_membership_witness() 
 }
 
 #[test]
-#[should_panic(
-    expected = "Internal store read witness commitment does not match requested commitment"
-)]
-fn genesis_authorization_rejects_forged_coordinate_zero_commitment() {
+#[should_panic(expected = "Storage read witness commitment does not match requested commitment")]
+fn genesis_authorization_rejects_forged_entry_object_commitment() {
     let commitment_a = sha(b"personal_data-file");
     let commitment_b = sha(b"seed-file");
     let names = vec!["personal_data".to_string(), "seed".to_string()];
     let journal = two_arg_authorization_journal(&commitment_a, &commitment_b);
     let cfs_cursor = entrypoint_cfs(names);
 
-    // Forge an entry at coordinates [0] whose commitment was never
-    // authorized against the journal.
+    // Forge the entry-argument object at coordinates [] with a commitment that
+    // is not the journal-authorized combined root. The genesis check reads []
+    // and compares against `combined_root`, so it rejects on commitment
+    // mismatch.
     let forged_entry = StorageEntry {
-        coordinates: CfsCoordinates(vec![0]),
+        coordinates: CfsCoordinates(vec![]),
         object_commitment: sha(b"forged-combined-root"),
     };
     let (_frontier, root, _index, index_root) =
         build_storage_context(&[forged_entry.clone()]);
     let witness = build_read_witness(&[forged_entry.clone()], &forged_entry);
 
-    verify_genesis_authorization(&cfs_cursor, &root, &index_root, &journal, Some(&witness));
+    // A membership witness is supplied, so the witness path is taken and
+    // `first_step` is not inspected; a placeholder suffices.
+    let first_step = StepRecord {
+        exec_index: 0,
+        sequence_id: "main".to_string(),
+        coordinates: CfsCoordinates(vec![]),
+        kind: StepKind::SequenceEnd {
+            output_commitment: Vec::new(),
+        },
+    };
+
+    verify_genesis_authorization(
+        &cfs_cursor,
+        &root,
+        &index_root,
+        &journal,
+        Some(&witness),
+        &first_step,
+    );
 }
