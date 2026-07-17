@@ -1362,6 +1362,66 @@ where
     }
 }
 
+/// Resolve `main`'s returned `AuthRef` to its committed storage binding and
+/// the materialized value in a single storage read — used by
+/// [`end_program_output`] to build both the `ProgramEnd` output binding and
+/// the output artifact.
+///
+/// Rejects an inline (non-storage) result: a program's output must be a
+/// committed value with provable lineage (a tile or `select!` result), never
+/// an arbitrary in-body literal.
+fn program_output_binding<T>(result: &AuthRef<T>) -> raster_core::Result<(TraceStorageData, T)>
+where
+    T: Serialize + DeserializeOwned,
+{
+    match result {
+        AuthRef::Inline(_) => Err(raster_core::Error::Other(
+            "program output must be a stored value (a tile or select! result), \
+             not an inline literal"
+                .into(),
+        )),
+        AuthRef::Storage(binding) => {
+            let resolved = (binding.resolve.as_ref())(binding.reference.clone())?;
+            let storage = TraceStorageData {
+                coordinates: resolved.reference.coordinates.clone(),
+                commitment: resolved.reference.commitment.clone(),
+                selector: resolved.selector.clone(),
+                selection: resolved.selection.clone(),
+            };
+            Ok((storage, resolved.value))
+        }
+    }
+}
+
+/// Emit the program's terminal `ProgramEnd` event for a `main` that returns
+/// unit — it produces no output artifact and binds no storage.
+#[cfg(feature = "std")]
+pub fn end_program_unit() {
+    raster_runtime::publish_trace_event(raster_core::trace::TraceEvent::ProgramEnd(
+        raster_core::trace::ProgramEndEvent { output: None },
+    ));
+}
+
+/// Emit the program's terminal `ProgramEnd` event for a `main` that returns a
+/// value, and export that value as the program's output artifact (see
+/// `raster_runtime::write_program_output_artifact`). The output must be a
+/// storage-backed `AuthRef`; an inline literal is rejected.
+#[cfg(feature = "std")]
+pub fn end_program_output<T>(result: &AuthRef<T>)
+where
+    T: Serialize + DeserializeOwned,
+{
+    let (storage, value) = program_output_binding(result)
+        .unwrap_or_else(|error| panic!("Failed to resolve program output: {}", error));
+    raster_runtime::write_program_output_artifact(&value)
+        .unwrap_or_else(|error| panic!("Failed to write program output artifact: {}", error));
+    raster_runtime::publish_trace_event(raster_core::trace::TraceEvent::ProgramEnd(
+        raster_core::trace::ProgramEndEvent {
+            output: Some(storage),
+        },
+    ));
+}
+
 #[cfg(feature = "std")]
 pub fn raster_trace_payload<T: Serialize>(
     value: &T,

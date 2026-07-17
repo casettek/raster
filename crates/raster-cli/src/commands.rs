@@ -574,6 +574,9 @@ pub fn cfs(output: Option<String>) -> Result<()> {
     println!("Sequences:");
     for seq in &cfs.sequences {
         println!("  - {} ({} items)", seq.id, seq.items.len());
+        if !seq.entry_arguments.is_empty() {
+            println!("      entry arguments: {:?}", seq.entry_arguments);
+        }
         for (idx, item) in seq.items.iter().enumerate() {
             match item {
                 raster_core::cfs::SequenceChildItem::Tile(item) => {
@@ -587,9 +590,6 @@ pub fn cfs(output: Option<String>) -> Result<()> {
                 }
                 raster_core::cfs::SequenceChildItem::Sequence(item) => {
                     println!("      [{}] {} '{}'", idx, "sequence", item.id)
-                }
-                raster_core::cfs::SequenceChildItem::Entrypoint(item) => {
-                    println!("      [{}] {} {:?}", idx, "entrypoint", item.names)
                 }
             }
         }

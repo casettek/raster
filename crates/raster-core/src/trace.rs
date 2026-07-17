@@ -161,28 +161,52 @@ pub struct ExecStep {
     pub storage: StorageRoots,
 }
 
-/// What kind of entry-time preparation an [`EntrypointStep`] performs.
-/// Currently only one op exists; new entry-time-authorized preparations
-/// (checked against the authorization journal rather than a replay proof)
-/// can be added here without growing [`StepKind`] again.
+/// The trace's first step: the program starts, and `main`'s declared
+/// external arguments (if any) are loaded into a single authorized storage
+/// object at the sequence root (coordinates `[]`).
+///
+/// This is the one step whose output is tied to the public manifest through
+/// the authorization journal rather than a replay proof (see the transition
+/// guest's `checks::entrypoint`). It is always emitted, even when `main`
+/// declares no entry arguments — in that case it binds nothing and touches
+/// no storage.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub enum EntrypointOp {
-    /// Binds `main`'s declared external arguments, in CFS declaration
-    /// order, to a single storage object at this step's coordinates.
-    BindEntryArguments { names: Vec<String> },
-}
+pub struct ProgramStartStep {
+    /// `main`'s declared entry-argument names, in CFS declaration order.
+    /// Empty when `main` declares none.
+    pub entry_arguments: Vec<String>,
 
-/// A step that authorizes something at sequence entry against the
-/// authorization journal, rather than against a replay proof. Only ever
-/// emitted for `main`; currently only `main`'s declared external-argument
-/// binding uses this.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub struct EntrypointStep {
-    pub op: EntrypointOp,
-
-    pub input_source_commitment: Vec<u8>,
+    /// The struct-of-commitments root over the authorized per-argument
+    /// commitments — the commitment of the combined entry object written at
+    /// coordinates `[]`. Empty when there are no arguments (no write).
     pub output_commitment: Vec<u8>,
 
+    /// Genesis roots -> roots containing the entry object, or unchanged when
+    /// there are no arguments.
+    pub storage: StorageRoots,
+}
+
+/// The trace's last step: `main` returned, and the program's output — a value
+/// that provably lives in committed storage — is committed as the authorized
+/// program output (see the transition guest's `checks::program`).
+///
+/// `main` must return either unit or a storage-backed value (a tile or
+/// `select!` result); an inline literal is rejected before this step is
+/// reached. A `main` that returned `Err` or panicked never produces a
+/// `ProgramEnd` at all — an incomplete trace is simply unattestable.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct ProgramEndStep {
+    /// Where the program output lives: its storage coordinates, the source
+    /// object's commitment, and the selection that narrows to the returned
+    /// value. `None` when `main` returns unit.
+    pub output: Option<StorageData>,
+
+    /// The committed program output: the `selected_hash` of `output`'s
+    /// selection. Empty when `main` returns unit.
+    pub output_commitment: Vec<u8>,
+
+    /// Storage roots — unchanged; a program end reads its output but writes
+    /// nothing.
     pub storage: StorageRoots,
 }
 
@@ -193,6 +217,12 @@ pub struct EntrypointStep {
 /// commitment is a kind that does not make one, never a kind that failed to.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum StepKind {
+    /// The trace's first step: starts the program and binds `main`'s entry
+    /// arguments (see [`ProgramStartStep`]). Always at coordinates `[]`.
+    ProgramStart(ProgramStartStep),
+    /// The trace's last step: commits `main`'s authorized output (see
+    /// [`ProgramEndStep`]). Always at coordinates `[]`.
+    ProgramEnd(ProgramEndStep),
     SequenceStart {
         input_commitment: Vec<u8>,
         input_source_commitment: Vec<u8>,
@@ -201,7 +231,6 @@ pub enum StepKind {
         output_commitment: Vec<u8>,
     },
     Exec(ExecStep),
-    Entrypoint(EntrypointStep),
 }
 
 /// One step of a trace: where it sits, and what it did.
@@ -225,9 +254,12 @@ impl StepRecord {
                 input_commitment, ..
             } => Some(input_commitment),
             StepKind::Exec(exec) => Some(&exec.input_commitment),
-            // An entrypoint declares bindings rather than consuming an
-            // input, and a sequence end only reports what it produced.
-            StepKind::SequenceEnd { .. } | StepKind::Entrypoint(_) => None,
+            // A program start binds authorized external data and a program end
+            // commits an authorized output rather than consuming a step input;
+            // a sequence end only reports what it produced.
+            StepKind::SequenceEnd { .. }
+            | StepKind::ProgramStart(_)
+            | StepKind::ProgramEnd(_) => None,
         }
     }
 
@@ -235,7 +267,8 @@ impl StepRecord {
         match &self.kind {
             StepKind::SequenceEnd { output_commitment } => Some(output_commitment),
             StepKind::Exec(exec) => Some(&exec.output_commitment),
-            StepKind::Entrypoint(entrypoint) => Some(&entrypoint.output_commitment),
+            StepKind::ProgramStart(program_start) => Some(&program_start.output_commitment),
+            StepKind::ProgramEnd(program_end) => Some(&program_end.output_commitment),
             StepKind::SequenceStart { .. } => None,
         }
     }
@@ -247,26 +280,46 @@ impl StepRecord {
                 ..
             } => Some(input_source_commitment),
             StepKind::Exec(exec) => Some(&exec.input_source_commitment),
-            StepKind::Entrypoint(entrypoint) => Some(&entrypoint.input_source_commitment),
-            StepKind::SequenceEnd { .. } => None,
+            // A program start makes no input commitment at all (its "input" is
+            // the outside world, authorized against the manifest journal), and
+            // a program end carries its output binding in the record itself
+            // rather than as a bound source witness.
+            StepKind::ProgramStart(_)
+            | StepKind::ProgramEnd(_)
+            | StepKind::SequenceEnd { .. } => None,
         }
     }
 
-    /// The storage roots this step claims, for kinds that may write.
-    /// Sequence boundaries never touch the store, so they have none.
+    /// The storage roots this step claims, for kinds that touch the store.
+    /// Sequence boundaries never touch it, so they have none. A program end
+    /// reads its output (roots unchanged) so it claims them too.
     pub fn storage_roots(&self) -> Option<&StorageRoots> {
         match &self.kind {
             StepKind::Exec(exec) => Some(&exec.storage),
-            StepKind::Entrypoint(entrypoint) => Some(&entrypoint.storage),
+            StepKind::ProgramStart(program_start) => Some(&program_start.storage),
+            StepKind::ProgramEnd(program_end) => Some(&program_end.storage),
             StepKind::SequenceStart { .. } | StepKind::SequenceEnd { .. } => None,
         }
     }
 
     /// Whether this step's `output_commitment` is verified through a
-    /// mechanism other than a direct byte-witness comparison: a replay
-    /// proof for a tile, or the authorization journal for an entrypoint.
+    /// mechanism other than a direct byte-witness comparison: a replay proof
+    /// for a tile, the authorization journal for a program start, or a
+    /// storage selection proof for a program end.
     pub fn is_execution_step(&self) -> bool {
-        matches!(self.kind, StepKind::Exec(_) | StepKind::Entrypoint(_))
+        matches!(
+            self.kind,
+            StepKind::Exec(_) | StepKind::ProgramStart(_) | StepKind::ProgramEnd(_)
+        )
+    }
+
+    /// Whether this step appends an object to storage, as opposed to only
+    /// reading it (`ProgramEnd`) or not touching it (sequence boundaries).
+    /// This decides which step owns the write recorded at a coordinate —
+    /// necessary because `ProgramStart` (append) and `ProgramEnd` (read-only)
+    /// share coordinates `[]` and thus a witness-store entry.
+    pub fn appends_to_storage(&self) -> bool {
+        matches!(self.kind, StepKind::Exec(_) | StepKind::ProgramStart(_))
     }
 
     pub fn requires_replay_proof(&self) -> bool {
@@ -330,7 +383,7 @@ pub struct TraceWindow {
 /// commitment without touching any file bytes. `encoding` says which
 /// selection mechanism applies; per-source deserialization capability for
 /// `Postcard` sources (which aren't self-describing) is looked up by name
-/// from the entry-argument kit registry populated by `bind_entry_arguments`
+/// from the entry-argument kit registry populated by `start_program`
 /// — it can't travel through this event, since it isn't serializable data.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EntrypointArgumentBinding {
@@ -339,17 +392,30 @@ pub struct EntrypointArgumentBinding {
     pub commitment: Vec<u8>,
 }
 
-/// Recorded once, at the top of `main`, when it declares external entry
-/// arguments — carries just enough for the recorder to rebuild the
-/// matching `Referenced` object and `EntrypointRecord` (the live write
-/// already happened in storage by the time this is published).
+/// Recorded once, as the program's first event: `main` starts, and its
+/// declared external entry arguments (if any) are bound. Carries just enough
+/// for the recorder to rebuild the matching `Referenced` object (the live
+/// write already happened in storage by the time this is published). The
+/// `arguments` list is empty when `main` declares no entry arguments.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EntrypointBindEvent {
+pub struct ProgramStartEvent {
     pub arguments: Vec<EntrypointArgumentBinding>,
+}
+
+/// Recorded once, as the program's last event: `main` returned its authorized
+/// output. `output` is the storage binding of the returned value (already
+/// committed in storage by a verified tile), or `None` when `main` returns
+/// unit. Only emitted on success — a failed `main` publishes nothing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProgramEndEvent {
+    pub output: Option<StorageData>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TraceEvent {
+    ProgramStart(ProgramStartEvent),
+    ProgramEnd(ProgramEndEvent),
+
     SequenceStart(FnCallRecord),
     SequenceEnd(FnCallRecord),
     RecurSequenceStart(FnCallRecord),
@@ -359,6 +425,4 @@ pub enum TraceEvent {
     RecurTileIterationExec(FnCallRecord),
     RecurTileExec(FnCallRecord),
     RecurSequenceExec(FnCallRecord),
-
-    EntrypointBind(EntrypointBindEvent),
 }

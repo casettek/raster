@@ -2,8 +2,8 @@ use raster_core::cfs::{CfsCoordinates, CfsCursor, ControlFlowSchema, SequenceChi
 use raster_core::draft::DraftTransitionWitness;
 use raster_core::input::{SelectionWitness, SelectorPath, StorageRef};
 use raster_core::trace::{
-    EntrypointStep, ExecStep, ExecTarget, FnInput, StepKind, StepRecord, StorageInput,
-    StorageRoots, TraceEvent,
+    ExecStep, ExecTarget, FnInput, ProgramEndStep, ProgramStartStep, StepKind, StepRecord,
+    StorageData, StorageInput, StorageRoots, TraceEvent,
 };
 use sha2::{Digest, Sha256};
 
@@ -170,7 +170,12 @@ impl StepWitnessStore {
                     )
                 });
                 trace_io.output_data = trace_item.output.as_ref().map(|output| output.data.clone());
-                trace_io.storage_write = storage_write;
+                // `main`'s `SequenceEnd` shares coordinates `[]` with the
+                // `ProgramStart` step; a sequence end never writes storage, so
+                // it must not clobber the entry-object write recorded there.
+                if let Some(storage_write) = storage_write {
+                    trace_io.storage_write = Some(storage_write);
+                }
                 trace_io.draft_transition_witness = trace_item.draft_transition_witness;
             }
             TraceEvent::TileExec(trace_item) => {
@@ -215,28 +220,29 @@ impl StepWitnessStore {
                     },
                 );
             }
-            TraceEvent::EntrypointBind(_) => {
-                // A declaration, not a consumer: no CFS inputs, no input
-                // witness bytes of its own (see `EntrypointRecord`'s
-                // `input_source_commitment`, which commits to an empty
-                // `FnInput` — matching `SequenceChildItem::Entrypoint`'s
-                // empty `inputs()`).
+            TraceEvent::ProgramStart(_) => {
+                // The program's first step binds authorized external data; it
+                // consumes no CFS inputs and makes no input commitment of its
+                // own (`StepRecord::input_source_commitment` is `None` for
+                // `ProgramStart`), so it carries no input source witness.
                 self.0.insert(
                     coordinates,
                     StepWitnessData {
                         input_data: None,
-                        input_source_witness: Some(FnInput {
-                            data: Vec::new(),
-                            values: Vec::new(),
-                            args: Vec::new(),
-                            storage: StorageInput::new(),
-                        }),
+                        input_source_witness: None,
                         output_data: None,
                         storage_input: StorageInput::new(),
                         storage_write,
                         draft_transition_witness: None,
                     },
                 );
+            }
+            TraceEvent::ProgramEnd(_) => {
+                // The program's last step shares coordinates `[]` with
+                // `ProgramStart`. Its output read is verified from the step
+                // record's `output` binding, not from a witness-store entry,
+                // so this leaves the `ProgramStart` entry (its storage write)
+                // untouched.
             }
         }
     }
@@ -447,6 +453,78 @@ impl TraceRecorder {
                     .expect("Corrupted sequence stack");
 
                 self.witness_store.insert(sequence_coordinates, event, None);
+
+                record
+            }
+            TraceEvent::ProgramEnd(end_event) => {
+                // The program's last step: `main` returned its authorized
+                // output. Recorded at `main`'s frame coordinates (`[]`); reads
+                // its output object but writes nothing.
+                let coordinates = self.sequence_callstack.current_sequence_coordinates.clone();
+                assert!(
+                    self.active_recur.is_none(),
+                    "Program ended while a RecurTile site trace was still active"
+                );
+                assert!(
+                    !self
+                        .active_recur_sequence
+                        .keys()
+                        .any(|(recur_coordinates, _)| recur_coordinates == &coordinates),
+                    "Program ended while a RecurSequence site trace was still active"
+                );
+                let sequence_id = self
+                    .sequence_callstack
+                    .last_mut()
+                    .expect("ProgramEnd requires main's sequence frame")
+                    .id
+                    .clone();
+
+                // Independently re-derive the output selection from our own
+                // storage replica, so the recorded output commitment reflects
+                // committed storage rather than a claim from the user process.
+                if let Some(output) = &end_event.output {
+                    let reference =
+                        StorageRef::new(output.coordinates.clone(), output.commitment.clone());
+                    let witness = self
+                        .storage
+                        .selection_witness(&reference, &output.selector)
+                        .unwrap_or_else(|error| {
+                            panic!("Failed to replay program output selection: {}", error)
+                        });
+                    let recomputed = raster_core::input::selection_payload_hash(&witness.bytes);
+                    assert_eq!(
+                        recomputed, output.selection.selected_hash,
+                        "Program output selection hash does not match the replayed selection",
+                    );
+                    assert_eq!(
+                        output.selection.source_root_hash.as_slice(),
+                        output.commitment.as_slice(),
+                        "Program output source-root hash does not match the output object commitment",
+                    );
+                }
+
+                let output: Option<StorageData> = end_event.output;
+                let output_commitment = output
+                    .as_ref()
+                    .map(|output| output.selection.selected_hash.to_vec())
+                    .unwrap_or_default();
+
+                let record = StepRecord {
+                    exec_index,
+                    sequence_id,
+                    coordinates: coordinates.clone(),
+                    kind: StepKind::ProgramEnd(ProgramEndStep {
+                        output,
+                        output_commitment,
+                        storage: self.storage_roots(None),
+                    }),
+                };
+
+                self.sequence_callstack
+                    .pop()
+                    .expect("Corrupted sequence stack");
+
+                self.witness_store.insert(coordinates, event.clone(), None);
 
                 record
             }
@@ -824,29 +902,26 @@ impl TraceRecorder {
 
                 record
             }
-            TraceEvent::EntrypointBind(bind_event) => {
-                let sequence_coordinates =
-                    self.sequence_callstack.current_sequence_coordinates.clone();
-                let current_sequence_state = self
+            TraceEvent::ProgramStart(start_event) => {
+                // The program's first step. It opens `main`'s frame (nothing
+                // else has yet) and binds its entry arguments at the sequence
+                // root coordinate `[]` — not a reserved child slot, so the
+                // frame's child index is left at 0 for the first real item.
+                self.sequence_callstack.push("main".to_string(), &self.cfs_cursor);
+                let coordinates = self.sequence_callstack.current_sequence_coordinates.clone();
+                let sequence_id = self
                     .sequence_callstack
                     .last_mut()
-                    .expect("Entrypoint bind can't be recorded without sequence context");
-                let sequence_id = current_sequence_state.id.clone();
-                let parent_current_index = current_sequence_state.current_index;
+                    .expect("ProgramStart just pushed main's frame")
+                    .id
+                    .clone();
 
-                let coordinates = self.cfs_cursor.get_child_coordinates(
-                    &sequence_coordinates,
-                    parent_current_index,
-                    SequenceChildId::Entrypoint,
-                );
-                current_sequence_state.current_index += 1;
-
-                let names: Vec<String> = bind_event
+                let names: Vec<String> = start_event
                     .arguments
                     .iter()
                     .map(|argument| argument.name.clone())
                     .collect();
-                let sources = bind_event
+                let sources: Vec<AuthorizedSource> = start_event
                     .arguments
                     .iter()
                     .map(|argument| {
@@ -893,39 +968,38 @@ impl TraceRecorder {
                     })
                     .collect();
 
-                assert!(
-                    self.storage.source_resolver().is_some(),
-                    "Replaying an entrypoint bind requires input context; call \
-                     TraceRecorder::set_external_input with the same --input/--input-manifest \
-                     the trace was produced with",
-                );
-
-                let write = self
-                    .storage
-                    .load_authorized_sources(AuthorizedSourceLoad { sources }, coordinates.clone());
-                let output_commitment = write.entry.object_commitment.clone();
-
-                let empty_input_source_commitment = input_source_commitment(&FnInput {
-                    data: Vec::new(),
-                    values: Vec::new(),
-                    args: Vec::new(),
-                    storage: StorageInput::new(),
-                });
+                // No arguments means no storage write and no manifest lookup:
+                // the program still starts, binding nothing.
+                let (storage_write, output_commitment) = if sources.is_empty() {
+                    (None, Vec::new())
+                } else {
+                    assert!(
+                        self.storage.source_resolver().is_some(),
+                        "Replaying a program start requires input context; call \
+                         TraceRecorder::set_external_input with the same --input/--input-manifest \
+                         the trace was produced with",
+                    );
+                    let write = self.storage.load_authorized_sources(
+                        AuthorizedSourceLoad { sources },
+                        coordinates.clone(),
+                    );
+                    let output_commitment = write.entry.object_commitment.clone();
+                    (Some(write), output_commitment)
+                };
 
                 let record = StepRecord {
                     exec_index,
                     sequence_id,
                     coordinates: coordinates.clone(),
-                    kind: StepKind::Entrypoint(EntrypointStep {
-                        op: raster_core::trace::EntrypointOp::BindEntryArguments { names },
-                        input_source_commitment: empty_input_source_commitment,
+                    kind: StepKind::ProgramStart(ProgramStartStep {
+                        entry_arguments: names,
                         output_commitment,
-                        storage: self.storage_roots(Some(&write)),
+                        storage: self.storage_roots(storage_write.as_ref()),
                     }),
                 };
 
                 self.witness_store
-                    .insert(coordinates, event.clone(), Some(write));
+                    .insert(coordinates, event.clone(), storage_write);
 
                 record
             }
@@ -962,6 +1036,8 @@ mod tests {
                         sources: vec![],
                     }),
                 ],
+                entry_arguments: vec![],
+                produces_output: false,
             }],
         })
     }
@@ -986,6 +1062,8 @@ mod tests {
                             sources: vec![],
                         }),
                     ],
+                    entry_arguments: vec![],
+                    produces_output: false,
                 },
                 SequenceDef {
                     id: "child".to_string(),
@@ -994,6 +1072,8 @@ mod tests {
                         id: "inner".to_string(),
                         sources: vec![],
                     })],
+                    entry_arguments: vec![],
+                    produces_output: false,
                 },
             ],
         })

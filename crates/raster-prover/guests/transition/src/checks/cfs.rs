@@ -63,12 +63,12 @@ fn has_coordinate_prefix(coordinates: &CfsCoordinates, prefix: &CfsCoordinates) 
 
 /// Whether a step record of this kind may occupy a CFS item of this kind.
 ///
-/// Input bindings alone cannot tell these apart: an item declaring no inputs
-/// (`Entrypoint`) vacuously satisfies the binding checks at *any*
-/// zero-input coordinate, and the kinds differ in how their output is
-/// verified — a tile's by replay proof, an entrypoint's against the
-/// authorization journal. Without this, a record could take a coordinate
-/// whose verification rules are weaker than its own.
+/// Input bindings alone cannot tell these apart, and the kinds differ in how
+/// their output is verified — a tile's by replay proof. Without this, a
+/// record could take a coordinate whose verification rules are weaker than
+/// its own. The program-boundary steps (`ProgramStart` and `main`'s
+/// `SequenceEnd`) never reach this check: they sit at the sequence root,
+/// which is not a CFS item.
 fn record_matches_item(step_record: &StepRecord, cfs_item: &SequenceChildItem) -> bool {
     match (&step_record.kind, cfs_item) {
         (
@@ -92,7 +92,6 @@ fn record_matches_item(step_record: &StepRecord, cfs_item: &SequenceChildItem) -
             }),
             SequenceChildItem::RecurSequence(_),
         ) => true,
-        (StepKind::Entrypoint(_), SequenceChildItem::Entrypoint(_)) => true,
         // A nested sequence is entered and left at its own item coordinate,
         // whether it is an ordinary or a recur sequence.
         (
@@ -109,8 +108,11 @@ pub fn verify_step_record_inputs(
     input_source_witness: Option<&FnInput>,
     sequence_scope_witness: Option<&FnInput>,
 ) {
-    // TODO: SequenceStart/SequenceEnd entrypoint case. In case of SequenceStart input is External Kind from
-    // cli or from file. SequenceEnd just binding latest executed tile output.
+    // The program-boundary steps sit at the sequence root `[]`, which is not
+    // itself a CFS item and binds no CFS inputs: `ProgramStart` binds
+    // authorized external data and `ProgramEnd` commits the authorized output,
+    // both checked in `checks::entrypoint` against storage/the journal rather
+    // than against CFS input bindings.
     if step_record.coordinates().is_empty() {
         return;
     }
@@ -174,6 +176,27 @@ pub fn verify_step_record_inputs(
                     input_index,
                 );
             }
+            InputBinding::EntryArgument => {
+                // One of `main`'s entry arguments: it must be sourced from
+                // the authorized entry object at the sequence root `[]` that
+                // the `ProgramStart` step bound. The selector into that
+                // object (and its selection proof) is verified separately by
+                // the storage checks; here we hold the binding to the one
+                // coordinate the entry object can legitimately come from.
+                let storage_meta = match resolved_source {
+                    ResolvedSource::Storage(meta) => meta,
+                    _ => panic!(
+                        "Expected storage input source for entry-argument step {:?} arg {}",
+                        step_record, input_index
+                    ),
+                };
+                assert!(
+                    storage_meta.coordinates.is_empty(),
+                    "Entry-argument input for step {:?} arg {} must come from the sequence root",
+                    step_record,
+                    input_index,
+                );
+            }
             InputBinding::SequenceScope { input_index } => {
                 let sequence_scope_witness = sequence_scope_witness.unwrap_or_else(|| {
                     panic!(
@@ -222,8 +245,7 @@ pub fn verify_step_record_inputs(
                         );
                     }
                     raster_core::cfs::SequenceChildItem::Tile(_)
-                    | raster_core::cfs::SequenceChildItem::RecurTile(_)
-                    | raster_core::cfs::SequenceChildItem::Entrypoint(_) => {
+                    | raster_core::cfs::SequenceChildItem::RecurTile(_) => {
                         assert_eq!(
                             storage_meta.coordinates, source_coordinates,
                             "Storage input prior-item-output coordinates do not match expected CFS source",

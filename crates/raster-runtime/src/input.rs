@@ -2091,8 +2091,66 @@ pub fn write_raster_files<T: Serialize>(
     Ok(commitment)
 }
 
+/// Where a program's output artifact was written.
+pub struct OutputArtifact {
+    pub data_path: std::path::PathBuf,
+    pub index_path: std::path::PathBuf,
+    pub manifest_path: std::path::PathBuf,
+    pub commitment: String,
+}
+
+/// Export `main`'s returned value as an output artifact, in the exact format
+/// external input data takes when a `ProgramStart` loads it: a raster-encoded
+/// `output.bin` + `output.rindex`, plus an `output_manifest.json` whose single
+/// entry mirrors an input-manifest entry (`type`/`encoding`/`commitment`). The
+/// artifact can therefore be handed to a following program as its
+/// `--input`/`--input-manifest`.
+///
+/// Writes only when `RASTER_OUTPUT_DIR` is set (by `cargo raster run`); a plain
+/// `cargo run` produces no files and returns `Ok(None)`.
+pub fn write_program_output_artifact<T: Serialize>(value: &T) -> CoreResult<Option<OutputArtifact>> {
+    let Some(dir) = std::env::var_os(crate::tracing::OUTPUT_DIR_ENV) else {
+        return Ok(None);
+    };
+    let dir = std::path::PathBuf::from(dir);
+    fs::create_dir_all(&dir).map_err(|e| {
+        Error::Other(format!(
+            "Failed to create output artifact directory '{}': {}",
+            dir.display(),
+            e
+        ))
+    })?;
+
+    let data_path = dir.join("output.bin");
+    let index_path = dir.join("output.rindex");
+    let manifest_path = dir.join("output_manifest.json");
+
+    let commitment = write_raster_files(value, &data_path, &index_path)?;
+
+    // Byte-for-byte the input-manifest entry shape (see input_manifest.json),
+    // so the artifact round-trips as a following program's external input.
+    let manifest = format!(
+        "{{\n  \"output\": {{ \"type\": \"sha256\", \"encoding\": \"raster\", \"commitment\": \"{}\" }}\n}}\n",
+        commitment
+    );
+    fs::write(&manifest_path, manifest).map_err(|e| {
+        Error::Other(format!(
+            "Failed to write output manifest '{}': {}",
+            manifest_path.display(),
+            e
+        ))
+    })?;
+
+    Ok(Some(OutputArtifact {
+        data_path,
+        index_path,
+        manifest_path,
+        commitment,
+    }))
+}
+
 /// Compute the manifest commitment for a Postcard-encoded entry argument:
-/// the same selection-tree structural root `bind_entry_arguments`/
+/// the same selection-tree structural root `start_program`/
 /// `verify_postcard_structural_commitment` check against at runtime, hex-
 /// encoded. Manifest-authoring tooling (e.g. a project's `gen_input`
 /// binary) calls this to produce `input_manifest.json`'s `commitment`

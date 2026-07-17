@@ -83,18 +83,30 @@ impl CfsCursor {
     }
 
     /// The declared entry-argument names, in canonical order, if `main`
-    /// declares any (i.e. its item list starts with an `Entrypoint` item at
-    /// coordinate `[0]`). `None` means `main` declares no external
-    /// arguments at all — there is nothing to authorize at entry.
+    /// declares any (`SequenceDef::entry_arguments`). `None` means `main`
+    /// declares no external arguments at all — there is nothing to authorize
+    /// at entry, and the program's `ProgramStart` step binds nothing.
     pub fn main_entrypoint_names(&self) -> Option<&[String]> {
         let main = self
             .cfs
             .sequences
             .get(self.entrypoint_coordinate as usize)?;
-        match main.items.first()? {
-            SequenceChildItem::Entrypoint(item) => Some(item.names.as_slice()),
-            _ => None,
+        if main.entry_arguments.is_empty() {
+            None
+        } else {
+            Some(main.entry_arguments.as_slice())
         }
+    }
+
+    /// Whether `main` declares a program output (`SequenceDef::produces_output`).
+    /// When `true`, the program's `ProgramEnd` step must bind a storage-backed
+    /// output; when `false`, it binds nothing (a unit program).
+    pub fn main_produces_output(&self) -> bool {
+        self.cfs
+            .sequences
+            .get(self.entrypoint_coordinate as usize)
+            .map(|main| main.produces_output)
+            .unwrap_or(false)
     }
 
     pub fn is_next_coordinates(&mut self, next_coordinates: &CfsCoordinates) -> bool {
@@ -284,13 +296,6 @@ impl CfsCursor {
                         depth += 2;
                     }
                 }
-                SequenceChildItem::Entrypoint(_) => {
-                    if depth + 1 != coords.len() {
-                        panic!("Entrypoint coordinates cannot have nested child coordinates");
-                    }
-                    sequence_item_coord = Some(coord);
-                    depth += 1;
-                }
             }
         }
 
@@ -368,7 +373,6 @@ impl CfsCursor {
                     SequenceChildItem::RecurSequence(recur_sequence_item) => {
                         SequenceChildId::RecurSequence(recur_sequence_item.id.clone())
                     }
-                    SequenceChildItem::Entrypoint(_) => SequenceChildId::Entrypoint,
                 };
 
                 id == child_id && index >= parent_current_index as usize
@@ -389,7 +393,6 @@ impl CfsCursor {
                             SequenceChildItem::Tile(item) => item.id,
                             SequenceChildItem::RecurTile(item) => item.id,
                             SequenceChildItem::RecurSequence(item) => item.id,
-                            SequenceChildItem::Entrypoint(_) => "__entrypoint".to_string(),
                         })
                         .collect::<Vec<_>>()
                 )
@@ -505,8 +508,6 @@ pub enum SequenceChildId {
     Tile(TileId),
     RecurTile(TileId),
     RecurSequence(SequenceId),
-    /// The single, main-only entry-argument binding item.
-    Entrypoint,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -514,6 +515,17 @@ pub struct SequenceDef {
     pub id: SequenceId,
     pub input_sources: Vec<InputBinding>,
     pub items: Vec<SequenceChildItem>,
+    /// `main`'s declared entry-argument names, in declaration order. Bound
+    /// once by the program's `ProgramStart` step into a single authorized
+    /// storage object at coordinates `[]`. Empty for every sequence other
+    /// than `main`, and for a `main` that declares no external arguments.
+    #[serde(default)]
+    pub entry_arguments: Vec<String>,
+    /// Whether `main` returns a program output (a non-unit value). When set,
+    /// the program's `ProgramEnd` step binds and authorizes that output.
+    /// Always `false` for sequences other than `main`.
+    #[serde(default)]
+    pub produces_output: bool,
 }
 
 impl SequenceDef {
@@ -523,6 +535,8 @@ impl SequenceDef {
             id: id.into(),
             input_sources: Vec::new(),
             items: Vec::new(),
+            entry_arguments: Vec::new(),
+            produces_output: false,
         }
     }
 
@@ -533,7 +547,6 @@ impl SequenceDef {
                 SequenceChildItem::Tile(_) => None,
                 SequenceChildItem::RecurTile(_) => None,
                 SequenceChildItem::RecurSequence(_) => None,
-                SequenceChildItem::Entrypoint(_) => None,
                 SequenceChildItem::Sequence(sequence) => Some(sequence.clone()),
             })
             .collect()
@@ -546,21 +559,6 @@ pub enum SequenceChildItem {
     Tile(TileItem),
     RecurTile(RecurTileItem),
     RecurSequence(RecurSequenceItem),
-    /// Leading item of `main`'s item list when `main` declares external
-    /// arguments. Loads a single storage object at this item's
-    /// coordinate to a struct-of-commitments over the named entry
-    /// arguments (see `EntrypointOp::BindEntryArguments`). Never appears
-    /// outside `main`, and declares no input bindings of its own.
-    Entrypoint(EntrypointItem),
-}
-
-/// Declares the ordered set of external arguments `main` binds as a single
-/// storage object. `names` is the CFS-canonical declaration order,
-/// used both to recompute the struct-of-commitments root and to resolve
-/// each argument's `PriorItemOutput` binding to this same item's coordinate.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EntrypointItem {
-    pub names: Vec<String>,
 }
 
 impl SequenceChildItem {
@@ -570,8 +568,6 @@ impl SequenceChildItem {
             SequenceChildItem::Tile(tile_item) => &tile_item.sources,
             SequenceChildItem::RecurTile(recur_item) => &recur_item.sources,
             SequenceChildItem::RecurSequence(recur_sequence_item) => &recur_sequence_item.sources,
-            // A declaration site, not a consumer — nothing to bind.
-            SequenceChildItem::Entrypoint(_) => &[],
         }
     }
 }
@@ -614,6 +610,12 @@ pub enum InputBinding {
     Direct(InputSource),
     SequenceScope { input_index: usize },
     PriorItemOutput { intra_sequence_item_index: usize },
+    /// One of `main`'s entry arguments, reached from the single authorized
+    /// entry object at the sequence root (coordinates `[]`) that the
+    /// `ProgramStart` step bound. `main` has no caller, so its arguments are
+    /// not `SequenceScope`; and the entry object sits at the sequence root
+    /// itself, which no `PriorItemOutput` index can name.
+    EntryArgument,
 }
 
 impl InputBinding {
@@ -643,15 +645,20 @@ impl InputBinding {
             intra_sequence_item_index,
         }
     }
+
+    /// Create a binding to one of `main`'s entry arguments.
+    pub fn entry_argument() -> Self {
+        Self::EntryArgument
+    }
 }
 
 /// Semantic source of an input value in the data flow schema.
 ///
 /// Note there is no "external" source: data entering a program does so as
-/// `main`'s entry arguments, which are loaded once into storage by
-/// the leading `Entrypoint` item and reached from there like any other
-/// committed value (`PriorItemOutput`). A source here is only about values
-/// with no upstream item to bind to.
+/// `main`'s entry arguments, which are loaded once into storage by the
+/// program's `ProgramStart` step and reached from there through
+/// `InputBinding::EntryArgument`. A source here is only about values with no
+/// upstream item to bind to.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum InputSource {
     /// Input is materialized inline in the sequence body.
@@ -693,6 +700,8 @@ mod tests {
                         sources: vec![],
                     }),
                 ],
+                entry_arguments: vec![],
+                produces_output: false,
             }],
         })
     }

@@ -90,11 +90,16 @@ fn hello_tiles_run_reports_recur_iteration_coordinates() {
     );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("tile_coordinates: CfsCoordinates([10, 0])"));
-    assert!(stdout.contains("tile_coordinates: CfsCoordinates([10, 1])"));
-    assert!(stdout.contains("recur_tile_coordinates: CfsCoordinates([10])"));
-    assert!(stdout.contains("tile_coordinates: CfsCoordinates([12, 0])"));
-    assert!(stdout.contains("recur_tile_coordinates: CfsCoordinates([12])"));
+    // The program opens with a single ProgramStart at the sequence root, and
+    // `main`'s declared entry arguments no longer shift item coordinates: the
+    // first real item is at `[0]`, so the recur sites sit one index lower
+    // than before the entrypoint merge.
+    assert!(stdout.contains("program_start_coordinates: CfsCoordinates([])"));
+    assert!(stdout.contains("tile_coordinates: CfsCoordinates([9, 0])"));
+    assert!(stdout.contains("tile_coordinates: CfsCoordinates([9, 1])"));
+    assert!(stdout.contains("recur_tile_coordinates: CfsCoordinates([9])"));
+    assert!(stdout.contains("tile_coordinates: CfsCoordinates([11, 0])"));
+    assert!(stdout.contains("recur_tile_coordinates: CfsCoordinates([11])"));
 }
 
 #[test]
@@ -196,7 +201,8 @@ fn hello_tiles_run_can_use_json_trace_format() {
     let parsed: serde_json::Value =
         serde_json::from_str(first_line).expect("json trace line should parse as JSON");
     assert!(
-        parsed.get("SequenceStart").is_some()
+        parsed.get("ProgramStart").is_some()
+            || parsed.get("SequenceStart").is_some()
             || parsed.get("TileExec").is_some()
             || parsed.get("RecurTileExec").is_some()
             || parsed.get("SequenceEnd").is_some(),

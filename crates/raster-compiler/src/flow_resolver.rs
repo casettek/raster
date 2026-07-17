@@ -6,7 +6,7 @@
 use raster_core::cfs::{
     InputBinding, RecurSequenceItem, RecurTileItem, SequenceChildItem, SequenceItem, TileItem,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::ast::{CallArgumentKind, CallInfo, CallKind};
 use crate::sequence::Sequence;
@@ -19,6 +19,8 @@ pub struct FlowResolver {
     bindings: HashMap<String, usize>,
     /// Sequence parameter names mapped to their input index.
     param_indices: HashMap<String, usize>,
+    /// `main`'s entry-argument names — resolved to `InputBinding::EntryArgument`.
+    entry_arguments: HashSet<String>,
     /// `let name = select!(T, root...)` locals, mapping `name` to `root`.
     selection_aliases: HashMap<String, String>,
 }
@@ -39,12 +41,11 @@ impl FlowResolver {
     }
 
     /// Resolve a sequence that declares `entry_argument_names` as `main`
-    /// entry arguments (see `SequenceChildItem::Entrypoint`). Every declared
-    /// name binds to item index `0` — the leading `Entrypoint` item the
-    /// caller (`CfsBuilder`) prepends separately — instead of to
-    /// `SequenceScope`, since `main` has no caller to supply them. Every
-    /// other resolved item's index is offset by one to leave that slot for
-    /// the `Entrypoint` item.
+    /// entry arguments. Every declared name resolves to
+    /// `InputBinding::EntryArgument` — reached from the single authorized
+    /// entry object at coordinates `[]` that the `ProgramStart` step binds —
+    /// instead of `SequenceScope`, since `main` has no caller to supply them.
+    /// There is no synthetic leading item, so item indices are not offset.
     pub fn resolve_with_entry_arguments(
         &mut self,
         sequence: &Sequence<'_>,
@@ -53,6 +54,7 @@ impl FlowResolver {
         // Reset state for this sequence
         self.bindings.clear();
         self.param_indices.clear();
+        self.entry_arguments.clear();
         self.selection_aliases = sequence
             .function
             .selection_aliases
@@ -60,21 +62,14 @@ impl FlowResolver {
             .cloned()
             .collect();
 
-        let item_index_offset = if entry_argument_names.is_empty() {
-            0
-        } else {
-            1
-        };
-
         if entry_argument_names.is_empty() {
             // Map sequence parameters to their indices
             for (idx, name) in sequence.function.input_names.iter().enumerate() {
                 self.param_indices.insert(name.clone(), idx);
             }
         } else {
-            // All entry arguments live at the single Entrypoint item.
             for name in entry_argument_names {
-                self.bindings.insert(name.clone(), 0);
+                self.entry_arguments.insert(name.clone());
             }
         }
 
@@ -102,8 +97,7 @@ impl FlowResolver {
             .filter(|call| step_callees.contains(&call.callee.as_str()))
             .collect();
 
-        for (call_index, call) in relevant_calls.iter().enumerate() {
-            let item_index = call_index + item_index_offset;
+        for (item_index, call) in relevant_calls.iter().enumerate() {
             let input_sources = self.resolve_call_inputs(call);
 
             // Call kind directly determines item type — no name-matching needed.
@@ -184,9 +178,13 @@ impl FlowResolver {
             return InputBinding::seq_input(idx);
         }
 
-        // A value produced by an earlier item of this sequence — including
-        // `main`'s entry arguments, which all bind to the leading Entrypoint
-        // item.
+        // One of `main`'s entry arguments: reached from the authorized entry
+        // object at coordinates `[]` bound by the `ProgramStart` step.
+        if self.entry_arguments.contains(root) {
+            return InputBinding::entry_argument();
+        }
+
+        // A value produced by an earlier item of this sequence.
         if let Some(&item_index) = self.bindings.get(root) {
             return InputBinding::prior_item_output(item_index);
         }
@@ -422,11 +420,9 @@ mod tests {
     }
 
     #[test]
-    fn resolve_with_entry_arguments_binds_names_to_item_zero_and_offsets_the_rest() {
-        // The Entrypoint item itself is built by CfsBuilder, not the
-        // resolver — the resolver only needs to know the declared names so
-        // it can bind them, and that every other item's index leaves room
-        // for it at position 0.
+    fn resolve_with_entry_arguments_binds_names_to_entry_argument_without_offset() {
+        // There is no synthetic leading item, so entry-argument names bind
+        // to `EntryArgument` and every real item keeps its natural index.
         let project = make_mock_project();
         let greet_func = make_tile_function("greet", vec!["input"], true);
         let exclaim_func = make_tile_function("exclaim", vec!["input"], true);
@@ -491,30 +487,27 @@ mod tests {
 
         assert_eq!(items.len(), 2);
 
-        // greet(personal_data): personal_data is an entry argument, bound
-        // to item index 0 (the Entrypoint item), not SequenceScope.
+        // greet(personal_data): personal_data is an entry argument, bound to
+        // `EntryArgument`, not SequenceScope.
         match &items[0] {
             SequenceChildItem::Tile(tile_item) => {
                 assert_eq!(tile_item.id, "greet");
                 match &tile_item.sources[0] {
-                    InputBinding::PriorItemOutput {
-                        intra_sequence_item_index,
-                    } => assert_eq!(*intra_sequence_item_index, 0),
-                    other => panic!("Expected PriorItemOutput{{0}}, got {:?}", other),
+                    InputBinding::EntryArgument => {}
+                    other => panic!("Expected EntryArgument, got {:?}", other),
                 }
             }
             _ => panic!("Expected Tile item"),
         }
 
-        // exclaim(greeting): greeting was produced by items[0] here, whose
-        // *overall* schema position is 1 (item 0 is the Entrypoint item
-        // CfsBuilder prepends), so the offset must land on 1, not 0.
+        // exclaim(greeting): greeting was produced by items[0], whose schema
+        // position is 0 now that there is no prepended item.
         match &items[1] {
             SequenceChildItem::Tile(tile_item) => match &tile_item.sources[0] {
                 InputBinding::PriorItemOutput {
                     intra_sequence_item_index,
-                } => assert_eq!(*intra_sequence_item_index, 1),
-                other => panic!("Expected PriorItemOutput{{1}}, got {:?}", other),
+                } => assert_eq!(*intra_sequence_item_index, 0),
+                other => panic!("Expected PriorItemOutput{{0}}, got {:?}", other),
             },
             _ => panic!("Expected Tile item"),
         }
@@ -566,10 +559,8 @@ mod tests {
 
         match &items[0] {
             SequenceChildItem::Tile(tile_item) => match &tile_item.sources[0] {
-                InputBinding::PriorItemOutput {
-                    intra_sequence_item_index,
-                } => assert_eq!(*intra_sequence_item_index, 0),
-                other => panic!("Expected PriorItemOutput{{0}}, got {:?}", other),
+                InputBinding::EntryArgument => {}
+                other => panic!("Expected EntryArgument, got {:?}", other),
             },
             _ => panic!("Expected Tile item"),
         }
@@ -619,10 +610,8 @@ mod tests {
 
         match &items[0] {
             SequenceChildItem::Tile(tile_item) => match &tile_item.sources[0] {
-                InputBinding::PriorItemOutput {
-                    intra_sequence_item_index,
-                } => assert_eq!(*intra_sequence_item_index, 0),
-                other => panic!("Expected PriorItemOutput{{0}}, got {:?}", other),
+                InputBinding::EntryArgument => {}
+                other => panic!("Expected EntryArgument, got {:?}", other),
             },
             _ => panic!("Expected Tile item"),
         }

@@ -63,7 +63,7 @@ fn placeholder_sequence(placeholder: String) -> String {
 /// `cargo run -- --input input.json --input-manifest input_manifest.json`
 ///
 #[sequence]
-fn main(personal_data: PersonalData, personal_data_bin: PersonalData, seed: u64) {
+fn main(personal_data: PersonalData, personal_data_bin: PersonalData, seed: u64) -> String {
     call_seq!(greet_sequence, "Rust".to_string(), personal_data.clone());
 
     let name = select!(String, personal_data.clone().name);
@@ -141,4 +141,8 @@ fn main(personal_data: PersonalData, personal_data_bin: PersonalData, seed: u64)
     let name_2 = call_seq!(placeholder_sequence, "Placeholder".to_string());
     let result = call_seq!(greet_sequence, name_2, personal_data_bin);
     println!("main result: {:?}", result);
+
+    // `main`'s return value is the program's authorized output: a
+    // storage-backed value exported as `output.bin`/`output_manifest.json`.
+    result
 }

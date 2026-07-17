@@ -13,6 +13,11 @@ use std::sync::Once;
 
 pub const TRACE_FORMAT_ENV: &str = "RASTER_TRACE_FORMAT";
 pub const TRACE_PATH_ENV: &str = "RASTER_TRACE_PATH";
+/// Directory the program's output artifact (`output.bin` / `output.rindex` /
+/// `output_manifest.json`) is written to on a successful, output-producing
+/// run. Set by `cargo raster run`; unset for a plain `cargo run`, which then
+/// produces no artifact files.
+pub const OUTPUT_DIR_ENV: &str = "RASTER_OUTPUT_DIR";
 
 static RUNTIME_INIT: Once = Once::new();
 

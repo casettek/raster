@@ -14,10 +14,11 @@ mod source;
 mod storage;
 pub mod tracing;
 pub use entry_arguments::{
-    bind_entry_arguments, entry_argument_spec, EntryArgumentSpec, EntryArgumentsBinding,
+    entry_argument_spec, start_program, EntryArgumentSpec, EntryArgumentsBinding,
 };
 pub use input::{
-    encode_raster_value, postcard_structural_commitment, select_storage_value, write_raster_files,
+    encode_raster_value, postcard_structural_commitment, select_storage_value,
+    write_program_output_artifact, write_raster_files, OutputArtifact,
 };
 pub use profiling::{
     begin_sequence_profile, finish_sequence_profile, record_tile_output_store_profile,
@@ -31,13 +32,14 @@ pub use storage::{
     exit_recur_sequence_iteration_scope, exit_recur_site_scope, exit_sequence_scope,
     finalize_draft, finalize_empty_draft, finish_draft_step_capture, global_storage_snapshot,
     publish_pending_output_coordinates, resolve_storage_ok_value, resolve_storage_value,
-    select_stored_value, store_execution_output_value, store_value, DraftCaptureSnapshot,
-    StorageManager, StorageSnapshot, StorageWriteRecord, StoredObject, TileExecutionScopeGuard,
+    select_stored_value, stash_pending_output_encoding, store_execution_output_value, store_value,
+    DraftCaptureSnapshot, StorageManager, StorageSnapshot, StorageWriteRecord, StoredObject,
+    TileExecutionScopeGuard,
 };
 pub use tracing::{
     commitment::Sha256Commitment,
     finish, init, init_with, publish_trace_event,
     publishers::{BinaryTraceEventPublisher, JsonTraceEventPublisher, Publisher},
     recorder::TraceRecorder,
-    RecurTraceScopeGuard, TraceFormat, TRACE_FORMAT_ENV, TRACE_PATH_ENV,
+    RecurTraceScopeGuard, TraceFormat, OUTPUT_DIR_ENV, TRACE_FORMAT_ENV, TRACE_PATH_ENV,
 };

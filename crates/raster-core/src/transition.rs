@@ -122,17 +122,23 @@ pub struct TransitionInput {
     pub authorization_image_id: Vec<u8>,
     pub authorization_journal: AuthorizationJournal,
 
-    /// Membership witness for `main`'s entry-argument coordinate (`[0]`)
-    /// against the window's *initial* storage state, proving the
-    /// binding already existed when this window opened.
+    /// Membership witness for `main`'s entry-argument coordinate (`[]`)
+    /// against the window's *initial* storage state, proving the binding
+    /// already existed when this window opened.
     ///
     /// Only ever read on the step that establishes a fresh
     /// `TransitionState::Init`; `Next` steps inherit the fact from the
-    /// previous journal instead. `None` at `Init` is not a failure: it means
-    /// the window opens at or before the binding itself, leaving the chain
-    /// [`EntrypointAuthorization::Pending`] until an `Entrypoint` step
-    /// inside the window discharges it.
+    /// previous journal instead. `None` at `Init` means the window opens at
+    /// genesis, so its first step is the `ProgramStart` that binds and
+    /// authorizes the entry arguments itself.
     pub entrypoint_membership_witness: Option<StorageReadWitness>,
+
+    /// For a `ProgramEnd` step: the trace-inclusion proof that the program
+    /// output object (`ProgramEndStep::output`) lives in the current storage
+    /// state, and the selection proof narrowing it to the returned value.
+    /// Both `None` for every other step and for a unit program's end.
+    pub program_output_read_witness: Option<StorageReadWitness>,
+    pub program_output_selection_witness: Option<SelectionWitness>,
 }
 
 /// Result of applying one transition (new frontier and fingerprint state).
@@ -169,40 +175,54 @@ pub enum TransitionState {
 /// Whether `main`'s entry-argument binding has been tied to the authorization
 /// journal within a proof chain.
 ///
-/// A window may legitimately open *before* the binding exists (its trace
-/// starts at genesis, with an empty storage state, and replays the
-/// `Entrypoint` step itself) or *after* it (the binding is already in the
-/// window's initial storage state). Those two cases establish the
-/// same fact by different means, so the chain carries this as a state rather
-/// than a bool: `Pending` is a debt that a later step in the same chain must
-/// discharge, and [`EntrypointAuthorization::assert_discharged`] is what
-/// makes it enforceable.
+/// Because the binding is now a single `ProgramStart` step at coordinates
+/// `[]` — always the trace's first step — a window can establish the fact one
+/// of two ways, both decided when the window opens (see the transition
+/// guest's `checks::entrypoint::verify_genesis_authorization`):
+///
+/// - the window opens at genesis, so its first step *is* `ProgramStart`,
+///   verified against the journal in the same guest run; or
+/// - the window opens later, so a trace-inclusion witness proves the binding
+///   is already at `[]` in the window's initial storage state.
+///
+/// Either way authorization is `Established` before any later step runs, so
+/// there is no deferred debt and no `Finished`-time discharge to enforce.
+/// The state is carried on the journal so every `Next` step inherits the
+/// established fact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EntrypointAuthorization {
-    /// The CFS declares no `main` entry arguments — there is nothing to
-    /// bind, and no `Entrypoint` step may appear at all.
+    /// The CFS declares no `main` entry arguments — there is nothing to bind.
     NotRequired,
-    /// The window opened before the binding existed: no trace-inclusion
-    /// witness could exist at `Init`, so an `Entrypoint` step inside this
-    /// chain must still establish the binding before the chain finishes.
-    Pending,
-    /// The binding has been tied to the authorization journal in this chain
-    /// — either by a trace-inclusion witness at `Init`, or by an
-    /// `Entrypoint` step verified within the chain.
+    /// The binding has been tied to the authorization journal in this chain.
     Established,
 }
 
-impl EntrypointAuthorization {
-    /// A chain must not finish while it still owes an entry-argument
-    /// binding: without this, `Pending` would be indistinguishable from
-    /// `Established` to any consumer of the final journal, and a trace that
-    /// never binds its entry arguments at all would verify.
-    pub fn assert_discharged(&self) {
-        assert!(
-            *self != EntrypointAuthorization::Pending,
-            "Fraud proof chain finished while main's entry-argument binding was never authorized",
-        );
-    }
+/// Whether the program's authorized output has been tied to committed storage
+/// within a proof chain.
+///
+/// The output is bound by the trace's *last* step, `ProgramEnd`, which proves
+/// the returned value is a selection out of a committed storage object (see
+/// the transition guest's `checks::program::verify_program_end`). Because it
+/// is the last step, no window can open *after* it, so — unlike
+/// [`EntrypointAuthorization`] — there is no membership-witness route and no
+/// genesis case: a chain is `Pending` until it verifies the `ProgramEnd` step,
+/// then `Established`.
+///
+/// This is not discharged at `Finished`: a fraud chain legitimately concludes
+/// at a mid-trace divergence, before any output exists, and must stay
+/// `Pending`. The invariant is enforced elsewhere — `ProgramEnd` is the unique
+/// terminal step bound into the fingerprint, host-side full-trace verification
+/// requires it, and any consumer accepting a completed-program journal requires
+/// `Established`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OutputAuthorization {
+    /// The CFS declares `main` returns no value — there is no output to bind.
+    NotRequired,
+    /// The chain has not yet reached (and verified) the program's end.
+    Pending,
+    /// A `ProgramEnd` step has been verified in this chain: the committed
+    /// output provably lives in committed storage.
+    Established,
 }
 
 /// Journal produced by the transition guest (init state + current state + image id).
@@ -214,10 +234,16 @@ pub struct TransitionJournal {
     pub authorization_image_id: Vec<u8>,
     pub manifest_commitment: Vec<u8>,
 
-    /// How far this chain has got in tying `main`'s entry-argument binding
-    /// to the authorization journal — established at `Init` from a
-    /// trace-inclusion witness, or by an `Entrypoint` step replayed inside
-    /// the chain, and inherited by every `Next` step from the previous
-    /// (recursively verified) journal. See [`EntrypointAuthorization`].
+    /// Whether this chain has tied `main`'s entry-argument binding to the
+    /// authorization journal — established when the window opens (from a
+    /// trace-inclusion witness, or by the `ProgramStart` step at genesis),
+    /// and inherited by every `Next` step from the previous (recursively
+    /// verified) journal. See [`EntrypointAuthorization`].
     pub entrypoint_authorization: EntrypointAuthorization,
+
+    /// Whether this chain has tied the program's output to committed storage —
+    /// `NotRequired` when `main` returns unit, `Pending` until a `ProgramEnd`
+    /// step is verified, `Established` after. Inherited across `Next` steps.
+    /// See [`OutputAuthorization`].
+    pub output_authorization: OutputAuthorization,
 }

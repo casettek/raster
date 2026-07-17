@@ -43,6 +43,7 @@ fn main() {
     // Verify every recorded aspect of the step and advance the state.
     let next = current.apply_verified_step(&params.cfs_cursor, &input);
     let entrypoint_authorization = next.entrypoint_authorization();
+    let output_authorization = next.output_authorization();
 
     // Continue the window, or finish on the proven fingerprint divergence.
     let current_state = next.finalize(
@@ -56,5 +57,6 @@ fn main() {
         params.transition_image_id,
         &input,
         entrypoint_authorization,
+        output_authorization,
     );
 }

@@ -1,12 +1,14 @@
-//! Binding `main`'s declared entry arguments.
+//! Starting a program and binding `main`'s declared entry arguments.
 //!
 //! This is the one place data enters a program: each declared parameter is
 //! tied to the commitment the public manifest declares for it, and the whole
-//! set is committed as a single struct-of-commitments object at coordinate
-//! `[0]` of `main` (see `ReferencedObject`). Everything downstream reaches
-//! those arguments through storage, so this module is what the
-//! transition guest's `checks::entrypoint` verifies against the
-//! authorization journal.
+//! set is committed as a single struct-of-commitments object at the sequence
+//! root coordinate `[]` of `main` (see `ReferencedObject`). Everything
+//! downstream reaches those arguments through storage, so this module is what
+//! the transition guest's `checks::entrypoint` verifies against the
+//! authorization journal. `start_program` runs once, as the program's first
+//! traced step, and is always emitted — even when `main` declares no entry
+//! arguments, in which case it binds nothing and touches no storage.
 
 use std::sync::Arc;
 
@@ -23,12 +25,12 @@ use crate::storage::{
     THREAD_STORAGE,
 };
 
-/// Opaque, per-argument spec for `bind_entry_arguments` — carries whatever
+/// Opaque, per-argument spec for `start_program` — carries whatever
 /// a Postcard-encoded source would need to be deserialized (a monomorphized
 /// `to_tree`/`schema` pair, derived from the argument's Rust type), without
 /// exposing `TreeValue` or any other crate-internal type across the crate
 /// boundary. Built via [`entry_argument_spec`]; which encoding actually
-/// applies is a manifest fact, decided inside `bind_entry_arguments`, not
+/// applies is a manifest fact, decided inside `start_program`, not
 /// something the caller commits to ahead of time.
 pub struct EntryArgumentSpec {
     name: &'static str,
@@ -50,7 +52,7 @@ pub(crate) fn postcard_bytes_to_tree<T: DeserializeOwned + Serialize>(
 
 /// Build the spec for one declared `main` argument of type `T`. Macro
 /// codegen calls this once per declared parameter, in declaration order,
-/// before passing the resulting slice to `bind_entry_arguments`.
+/// before passing the resulting slice to `start_program`.
 pub fn entry_argument_spec<T>(name: &'static str) -> EntryArgumentSpec
 where
     T: DeserializeOwned + Serialize + raster_core::input::Selectable,
@@ -62,24 +64,41 @@ where
     }
 }
 
-/// The result of [`bind_entry_arguments`]: the coordinate-`[0]` reference
-/// (for building each argument's storage-backed `AuthRef`), plus enough per-
-/// argument metadata for the caller to publish a matching
-/// `TraceEvent::EntrypointBind`.
+/// The result of [`start_program`]: the coordinate-`[]` reference (for
+/// building each argument's storage-backed `AuthRef`), plus enough
+/// per-argument metadata for the caller to publish a matching
+/// `TraceEvent::ProgramStart`. When `main` declares no entry arguments,
+/// `arguments` is empty and `reference` is a placeholder at `[]` that is
+/// never dereferenced (no `AuthRef` is built).
 pub struct EntryArgumentsBinding {
     pub reference: StorageRef,
     pub arguments: Vec<raster_core::trace::EntrypointArgumentBinding>,
 }
 
-/// Loads `main`'s declared arguments into a single authorized storage object
-/// at the first coordinate reserved in the current sequence frame —
-/// must be called before any other write in `main`'s scope, since it's the
-/// only place coordinate `[0]` can legitimately come from. Reads each
-/// argument's `(encoding, commitment)` straight from the manifest — no file
-/// bytes are touched — computes the combined struct-of-commitments root,
-/// and relies on the store's `SourceResolver` so later `select!`
-/// calls into these arguments resolve lazily, one source at a time.
-pub fn bind_entry_arguments(args: &[EntryArgumentSpec]) -> Result<EntryArgumentsBinding> {
+/// Starts the program: loads `main`'s declared arguments into a single
+/// authorized storage object at the sequence root coordinate `[]`, as the
+/// program's first traced step. Must be called before any other write in
+/// `main`'s scope, since `[]` is the sequence root and every later write
+/// takes a child coordinate. Reads each argument's `(encoding, commitment)`
+/// straight from the manifest — no file bytes are touched — computes the
+/// combined struct-of-commitments root, and relies on the store's
+/// `SourceResolver` so later `select!` calls into these arguments resolve
+/// lazily, one source at a time.
+///
+/// With no declared arguments this binds nothing and touches no storage; it
+/// still returns a placeholder binding so the caller uniformly publishes a
+/// `ProgramStart` event.
+pub fn start_program(args: &[EntryArgumentSpec]) -> Result<EntryArgumentsBinding> {
+    let coordinates = THREAD_SEQUENCE_CONTEXT
+        .with(|context| context.borrow().sequence_root_coordinates())?;
+
+    if args.is_empty() {
+        return Ok(EntryArgumentsBinding {
+            reference: StorageRef::new(coordinates, Vec::new()),
+            arguments: Vec::new(),
+        });
+    }
+
     // The resolver is installed once, by `init` (see
     // `install_default_source_resolver`) — this is a consumer of the
     // runtime's input context, not a second place that decides what it is.
@@ -118,8 +137,6 @@ pub fn bind_entry_arguments(args: &[EntryArgumentSpec]) -> Result<EntryArguments
     }
 
     let load = AuthorizedSourceLoad { sources };
-    let coordinates = THREAD_SEQUENCE_CONTEXT
-        .with(|context| context.borrow_mut().reserve_execution_coordinates())?;
 
     THREAD_STORAGE.with(|storage| {
         let write = storage
@@ -136,8 +153,8 @@ pub fn bind_entry_arguments(args: &[EntryArgumentSpec]) -> Result<EntryArguments
 /// `--input` / `--input-manifest` arguments it was started with.
 ///
 /// Called once from `init`. This is the only place production code decides
-/// where entry-argument bytes come from — `bind_entry_arguments` and the
-/// trace recorder consume that decision rather than each re-deriving it from
+/// where entry-argument bytes come from — `start_program` and the trace
+/// recorder consume that decision rather than each re-deriving it from
 /// `std::env::args`. A program run without those arguments installs nothing,
 /// which is only an error if it goes on to declare entry arguments.
 pub fn install_default_source_resolver() -> Result<()> {

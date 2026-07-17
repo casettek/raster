@@ -446,7 +446,8 @@ fn nested_sequence_trace_records_terminal_err_outputs() {
             | TraceEvent::RecurSequenceStart(_)
             | TraceEvent::RecurSequenceEnd(_)
             | TraceEvent::RecurSequenceExec(_)
-            | TraceEvent::EntrypointBind(_) => false,
+            | TraceEvent::ProgramStart(_)
+            | TraceEvent::ProgramEnd(_) => false,
         })
         .collect();
 

@@ -21,8 +21,8 @@ use raster_core::draft::{DraftId, TrackedDraftState};
 use raster_core::fingerprint::{Fingerprint, FingerprintAccumulator};
 use raster_core::trace::{StepKind, StepRecord};
 use raster_core::transition::{
-    EntrypointAuthorization, InitTransition, Transition, TransitionInput, TransitionJournal,
-    TransitionState,
+    EntrypointAuthorization, InitTransition, OutputAuthorization, Transition, TransitionInput,
+    TransitionJournal, TransitionState,
 };
 
 use crate::checks;
@@ -89,8 +89,22 @@ impl FraudProofWindowContext {
                     &init_transition.init_storage_index_root,
                     &input.authorization_journal,
                     input.entrypoint_membership_witness.as_ref(),
+                    &input.step_record,
                 );
-                let live = LiveTransition::genesis(&init_transition, entrypoint_authorization);
+                // The output is bound by the trace's last step, `ProgramEnd`,
+                // which no window can open after — so a fresh chain owes it
+                // (`Pending`) until that step is verified, with no genesis
+                // witness route.
+                let output_authorization = if params.cfs_cursor.main_produces_output() {
+                    OutputAuthorization::Pending
+                } else {
+                    OutputAuthorization::NotRequired
+                };
+                let live = LiveTransition::genesis(
+                    &init_transition,
+                    entrypoint_authorization,
+                    output_authorization,
+                );
                 (
                     Self {
                         init_state: init_transition,
@@ -105,7 +119,11 @@ impl FraudProofWindowContext {
                 assert_state_continuity(&prev_journal, &transition);
                 assert_manifest_continuity(&prev_journal, input);
 
-                let live = LiveTransition::resume(&transition, prev_journal.entrypoint_authorization);
+                let live = LiveTransition::resume(
+                    &transition,
+                    prev_journal.entrypoint_authorization,
+                    prev_journal.output_authorization,
+                );
                 (
                     Self {
                         init_state: prev_journal.init_state,
@@ -169,6 +187,10 @@ pub struct LiveTransition {
     /// authorization journal. Advances at most once, `Pending` ->
     /// `Established`, when an `Entrypoint` step is verified in this window.
     entrypoint_authorization: EntrypointAuthorization,
+    /// How far this chain has got in tying the program's output to committed
+    /// storage. Advances `Pending` -> `Established` when the `ProgramEnd` step
+    /// is verified in this window.
+    output_authorization: OutputAuthorization,
 }
 
 impl LiveTransition {
@@ -176,6 +198,7 @@ impl LiveTransition {
     fn genesis(
         init_transition: &InitTransition,
         entrypoint_authorization: EntrypointAuthorization,
+        output_authorization: OutputAuthorization,
     ) -> Self {
         let frontier = deserialize_frontier(&init_transition.init_frontier)
             .expect("Invalid frontier in input");
@@ -196,6 +219,7 @@ impl LiveTransition {
             fingerprint_acc: FingerprintAccumulator::new(init_transition.fingerprint.bits_packer),
             next_expected_coordinates: None,
             entrypoint_authorization,
+            output_authorization,
         }
     }
 
@@ -203,6 +227,7 @@ impl LiveTransition {
     fn resume(
         transition: &Transition,
         entrypoint_authorization: EntrypointAuthorization,
+        output_authorization: OutputAuthorization,
     ) -> Self {
         let frontier =
             deserialize_frontier(&transition.frontier).expect("Invalid frontier in input");
@@ -222,6 +247,7 @@ impl LiveTransition {
             fingerprint_acc: transition.actual_fingerprint_acc.clone(),
             next_expected_coordinates: Some(transition.next_expected_coordinates.clone()),
             entrypoint_authorization,
+            output_authorization,
         }
     }
 
@@ -231,12 +257,15 @@ impl LiveTransition {
         self.entrypoint_authorization
     }
 
+    pub fn output_authorization(&self) -> OutputAuthorization {
+        self.output_authorization
+    }
+
     /// Verify every recorded aspect of one step and advance the state:
     ///
     /// - the step's inputs obey the CFS bindings at its coordinates,
-    /// - an `Entrypoint` step binds exactly the CFS-declared entry arguments
-    ///   to their authorized commitments, discharging any authorization the
-    ///   chain still owes,
+    /// - a `ProgramStart` step binds exactly the CFS-declared entry arguments
+    ///   to their authorized commitments,
     /// - recorded IO commitments match the witnesses, and tile steps carry
     ///   a verified replay proof,
     /// - the storage transition is consistent with the recorded roots,
@@ -250,12 +279,27 @@ impl LiveTransition {
             input.input_source_witness.as_ref(),
             input.sequence_scope_witness.as_ref(),
         );
-        if let StepKind::Entrypoint(entrypoint) = &input.step_record.kind {
+        if let StepKind::ProgramStart(program_start) = &input.step_record.kind {
             self.entrypoint_authorization = checks::entrypoint::verify_step(
                 cfs_cursor,
                 &input.step_record,
-                entrypoint,
+                program_start,
                 &input.authorization_journal,
+            );
+        }
+        if let StepKind::ProgramEnd(program_end) = &input.step_record.kind {
+            // The output object lives in the current storage state (the
+            // frontier reflects every prior step's writes; `ProgramEnd` adds
+            // none), so verify the read against the current roots.
+            let current_storage_root = frontier_root(&self.storage_frontier);
+            self.output_authorization = checks::entrypoint::verify_program_end(
+                cfs_cursor,
+                &input.step_record,
+                program_end,
+                &current_storage_root,
+                &self.storage_index_root,
+                input.program_output_read_witness.as_ref(),
+                input.program_output_selection_witness.as_ref(),
             );
         }
         checks::io::verify_step_record(
@@ -276,11 +320,19 @@ impl LiveTransition {
             &self.storage_index_root,
         );
         self.storage_index_root = next_index_root;
-        self.next_expected_coordinates = Some(checks::cfs::get_next_expected_coordinates(
+        // `get_next_expected_coordinates` both checks this step was expected
+        // and computes the successors. `ProgramEnd` is the unique terminal
+        // step: it must be expected, but nothing may follow it.
+        let next_coordinates = checks::cfs::get_next_expected_coordinates(
             cfs_cursor,
             &input.step_record,
             self.next_expected_coordinates.as_ref(),
-        ));
+        );
+        self.next_expected_coordinates = Some(if matches!(input.step_record.kind, StepKind::ProgramEnd(_)) {
+            Vec::new()
+        } else {
+            next_coordinates
+        });
         checks::drafts::verify_draft_transition(
             &input.step_record,
             input.replay_journal.as_ref(),
@@ -307,10 +359,9 @@ impl LiveTransition {
     /// final window item, which must diverge: that divergence is the fraud
     /// being proven, and it transitions the machine to `Finished`.
     ///
-    /// `Finished` is the chain's last word, so it is also the deadline for
-    /// any entry-argument authorization the chain still owes: a trace whose
-    /// `Entrypoint` step never appeared has nothing tying it to the public
-    /// manifest, and must not be able to conclude.
+    /// Entry-argument authorization needs no deadline here: it is
+    /// `Established` (or `NotRequired`) from the moment the window opens, so
+    /// there is never an unauthorized chain able to reach `Finished`.
     pub fn finalize(
         self,
         committed_fingerprint: &Fingerprint,
@@ -326,7 +377,6 @@ impl LiveTransition {
 
                 if actual_fingerprint.len() == committed_fingerprint.len() {
                     assert!(diverges);
-                    self.entrypoint_authorization.assert_discharged();
                     TransitionState::Finished
                 } else {
                     assert!(!diverges);
@@ -363,6 +413,7 @@ pub fn commit_journal(
     transition_image_id: Vec<u8>,
     input: &TransitionInput,
     entrypoint_authorization: EntrypointAuthorization,
+    output_authorization: OutputAuthorization,
 ) {
     let journal = TransitionJournal {
         init_state,
@@ -371,6 +422,7 @@ pub fn commit_journal(
         authorization_image_id: input.authorization_image_id.clone(),
         manifest_commitment: input.authorization_journal.manifest_commitment.clone(),
         entrypoint_authorization,
+        output_authorization,
     };
 
     env::commit(&journal);

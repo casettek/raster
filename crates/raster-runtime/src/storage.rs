@@ -98,9 +98,9 @@ pub struct StorageManager {
     frontier: TraceTreeFrontier,
     objects: BTreeMap<CfsCoordinates, StoredObject>,
     coordinate_index: IncrementalCoordinateIndex,
-    /// Set once (via `bind_entry_arguments`) for programs that declare
-    /// `main` entry arguments; `None` otherwise, and never consulted unless
-    /// a `Referenced` object actually needs resolving.
+    /// Set once (via `start_program`) for programs that declare `main` entry
+    /// arguments; `None` otherwise, and never consulted unless a `Referenced`
+    /// object actually needs resolving.
     source_resolver: Option<Arc<dyn SourceResolver>>,
 }
 
@@ -661,6 +661,20 @@ impl SequenceExecutionContext {
             .expect("Corrupted recur execution context");
     }
 
+    /// The coordinates of the current sequence frame itself (`[]` for
+    /// `main`), where the program's `ProgramStart` step loads `main`'s entry
+    /// arguments — as opposed to a reserved child coordinate. Unlike
+    /// [`reserve_execution_coordinates`], this claims no child slot, so it
+    /// must only be used once, before any child of the frame is reserved.
+    pub(crate) fn sequence_root_coordinates(&self) -> Result<CfsCoordinates> {
+        self.stack
+            .last()
+            .map(|frame| frame.coordinates.clone())
+            .ok_or_else(|| {
+                Error::Other("Entry-argument binding requires active sequence context".into())
+            })
+    }
+
     pub(crate) fn reserve_execution_coordinates(&mut self) -> Result<CfsCoordinates> {
         if let Some(recur_frame) = self.recur_stack.last_mut() {
             let mut coordinates = recur_frame.site_coordinates.clone();
@@ -727,6 +741,7 @@ std::thread_local! {
         RefCell::new(SequenceExecutionContext::default());
     static THREAD_ACTIVE_EXECUTION_COORDINATES: RefCell<Vec<CfsCoordinates>> = RefCell::new(Vec::new());
     static THREAD_PENDING_OUTPUT_COORDINATES: RefCell<Option<CfsCoordinates>> = const { RefCell::new(None) };
+    static THREAD_PENDING_OUTPUT_ENCODING: RefCell<Option<PendingOutputEncoding>> = const { RefCell::new(None) };
     static THREAD_DRAFT_STORAGE: RefCell<BTreeMap<Anchor, DraftRuntimeState>> =
         RefCell::new(BTreeMap::new());
 }
@@ -1004,6 +1019,35 @@ pub fn store_value<T: Serialize>(value: &T) -> Result<StorageRef> {
     store_value_at_coordinates(value, coordinates)
 }
 
+/// One tile output's already-computed encoding, stashed by the tile wrapper
+/// (which encodes the value for the trace payload) for the immediately
+/// following `store_execution_output_value` in the caller's bind. The store
+/// only reuses `raster` when both its freshly serialized bytes and the
+/// stored value's type match the stash, so a broken pairing degrades to
+/// re-encoding, never to a wrong commitment. The type must participate
+/// because postcard is not self-describing: a transparent wrapper (e.g. a
+/// recur control/state) serializes to bytes identical to its inner value
+/// while its raster tree — and therefore its index and root — differs.
+pub struct PendingOutputEncoding {
+    pub type_name: &'static str,
+    pub bytes: Vec<u8>,
+    pub raster: RasterPayload,
+}
+
+pub fn stash_pending_output_encoding(
+    type_name: &'static str,
+    bytes: Vec<u8>,
+    raster: RasterPayload,
+) {
+    THREAD_PENDING_OUTPUT_ENCODING.with(|pending| {
+        *pending.borrow_mut() = Some(PendingOutputEncoding {
+            type_name,
+            bytes,
+            raster,
+        });
+    });
+}
+
 pub fn store_execution_output_value<T: Serialize>(value: &T) -> Result<StorageRef> {
     let coordinates = THREAD_PENDING_OUTPUT_COORDINATES
         .with(|coordinates| coordinates.borrow_mut().take())
@@ -1011,7 +1055,29 @@ pub fn store_execution_output_value<T: Serialize>(value: &T) -> Result<StorageRe
         .ok_or_else(|| {
             Error::Other("Missing pending execution output coordinates for tile output".into())
         })?;
-    store_value_at_coordinates(value, coordinates)
+    let bytes = raster_core::postcard::to_allocvec(value).map_err(|error| {
+        Error::Serialization(format!(
+            "Failed to serialize storage object for current sequence step: {}",
+            error
+        ))
+    })?;
+    let stashed = THREAD_PENDING_OUTPUT_ENCODING.with(|pending| pending.borrow_mut().take());
+    let raster_payload = match stashed {
+        Some(encoding)
+            if encoding.type_name == core::any::type_name::<T>() && encoding.bytes == bytes =>
+        {
+            encoding.raster
+        }
+        _ => raster_payload_for_value(value)?,
+    };
+    THREAD_STORAGE.with(|storage| {
+        let write = storage.borrow_mut().append_serialized_bytes(
+            &bytes,
+            coordinates.clone(),
+            Some(raster_payload),
+        );
+        Ok(StorageRef::new(coordinates, write.entry.object_commitment))
+    })
 }
 
 fn current_recur_site_coordinates() -> Option<CfsCoordinates> {

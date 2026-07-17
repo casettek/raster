@@ -37,6 +37,11 @@ pub struct StepIo {
     pub storage_selection_witnesses: BTreeMap<String, SelectionWitness>,
     pub storage_witness: Option<StorageWitness>,
     pub draft_transition_witness: Option<DraftTransitionWitness>,
+    /// For a `ProgramEnd` step: the read proof that the program output object
+    /// is present in the current storage state, and the selection proof
+    /// narrowing it to the returned value. `None` for every other step.
+    pub program_output_read_witness: Option<StorageReadWitness>,
+    pub program_output_selection_witness: Option<SelectionWitness>,
 }
 
 type RecordedStepIo = HashMap<StepRecord, StepIo>;
@@ -57,6 +62,8 @@ fn build_transition_input(
         storage_selection_witnesses,
         storage_witness,
         draft_transition_witness,
+        program_output_read_witness,
+        program_output_selection_witness,
     } = recorded_step_io
         .get(step_record)
         .cloned()
@@ -92,6 +99,8 @@ fn build_transition_input(
         authorization_journal: authorization_journal.clone(),
         input_sources_witnesses: input_sources_witnesses.clone(),
         entrypoint_membership_witness: entrypoint_membership_witness.cloned(),
+        program_output_read_witness,
+        program_output_selection_witness,
     }
 }
 
@@ -133,7 +142,7 @@ fn storage_root(frontier: &SerializableFrontier) -> Vec<u8> {
 /// * `window_start_position` - The starting position in the fingerprint for the first item
 /// * `bits_per_item` - Bits per fingerprint item
 /// * `entrypoint_membership_witness` - Proof that `main`'s entry-argument
-///   binding already exists at coordinate `[0]` of the window's initial
+///   binding already exists at coordinate `[]` of the window's initial
 ///   storage. Supply it whenever the window opens *after* the binding
 ///   step; pass `None` when the window contains the binding step itself, in
 ///   which case that step discharges the authorization instead. See
@@ -523,6 +532,8 @@ mod tests {
             authorization_journal: authorization,
             input_sources_witnesses: HashMap::new(),
             entrypoint_membership_witness: None,
+            program_output_read_witness: None,
+            program_output_selection_witness: None,
         };
         let state = TransitionState::Init(InitTransition {
             init_frontier: make_init_frontier(),

@@ -3,10 +3,7 @@
 //! This module orchestrates the generation of a CFS from a Raster project
 //! by combining tile discovery, sequence discovery, and data flow resolution.
 
-use raster_core::cfs::{
-    CfsCoordinate, CfsCoordinates, ControlFlowSchema, EntrypointItem, InputBinding,
-    SequenceChildId, SequenceChildItem, SequenceDef, SequenceId, SequenceItem, TileDef,
-};
+use raster_core::cfs::{ControlFlowSchema, InputBinding, SequenceDef, TileDef};
 
 use crate::flow_resolver::FlowResolver;
 use crate::sequence::{Sequence, SequenceDiscovery};
@@ -64,27 +61,31 @@ impl<'a> CfsBuilder<'a> {
 
     /// Build a sequence definition from a discovered sequence.
     ///
-    /// `main`'s declared parameters are entry arguments (see
-    /// `SequenceChildItem::Entrypoint`), not caller-supplied `SequenceScope`
-    /// parameters — main has no caller. When `main` declares any, it gets a
-    /// leading `Entrypoint` item instead of the usual `external()`
-    /// `input_sources`, and every other item's `PriorItemOutput` addressing
-    /// shifts by one to make room for it. Every other sequence (including
+    /// `main`'s declared parameters are entry arguments, not caller-supplied
+    /// `SequenceScope` parameters — main has no caller. When `main` declares
+    /// any, they are recorded in `SequenceDef::entry_arguments` (bound at
+    /// runtime by the program's `ProgramStart` step into one authorized
+    /// object at coordinates `[]`), and every consuming item resolves them
+    /// through `InputBinding::EntryArgument`. Every other sequence (including
     /// `main` with no declared parameters) is built exactly as before.
     fn build_sequence_def(&self, seq: &Sequence<'_>) -> Result<SequenceDef> {
         let mut resolver = FlowResolver::new();
 
+        // Only `main` produces a program output, and only when it returns a
+        // non-unit value — its declared return type is the program's output
+        // declaration (bound at runtime by the `ProgramEnd` step).
+        let produces_output =
+            seq.function.name == "main" && returns_non_unit(&seq.function.output);
+
         if seq.function.name == "main" && !seq.function.input_names.is_empty() {
-            let entry_item = SequenceChildItem::Entrypoint(EntrypointItem {
-                names: seq.function.input_names.clone(),
-            });
-            let mut items = vec![entry_item];
-            items.extend(resolver.resolve_with_entry_arguments(seq, &seq.function.input_names));
+            let items = resolver.resolve_with_entry_arguments(seq, &seq.function.input_names);
 
             return Ok(SequenceDef {
                 id: seq.function.name.clone(),
                 input_sources: Vec::new(),
                 items,
+                entry_arguments: seq.function.input_names.clone(),
+                produces_output,
             });
         }
 
@@ -102,13 +103,55 @@ impl<'a> CfsBuilder<'a> {
             id: seq.function.name.clone(),
             input_sources,
             items,
+            entry_arguments: Vec::new(),
+            produces_output,
         })
+    }
+}
+
+/// Whether a return-type string denotes a non-unit value. `None` (no return
+/// type) and unit — including `Result<()>` — are not outputs; every other
+/// parseable type is. Mirrors the macro's `Unit`/`Value`/`Fallible` split
+/// (see `raster-macros`), but from the parsed signature string.
+fn returns_non_unit(output: &Option<String>) -> bool {
+    let Some(output) = output else {
+        return false;
+    };
+    match syn::parse_str::<syn::Type>(output) {
+        Ok(ty) => !type_is_unit(&ty),
+        // Unparseable here should not happen (it parsed once already); treat a
+        // present return type conservatively as an output.
+        Err(_) => true,
+    }
+}
+
+fn type_is_unit(ty: &syn::Type) -> bool {
+    match ty {
+        syn::Type::Tuple(tuple) => tuple.elems.is_empty(),
+        syn::Type::Path(type_path) => {
+            let Some(segment) = type_path.path.segments.last() else {
+                return false;
+            };
+            if segment.ident != "Result" {
+                return false;
+            }
+            let syn::PathArguments::AngleBracketed(args) = &segment.arguments else {
+                return false;
+            };
+            match args.args.first() {
+                Some(syn::GenericArgument::Type(inner)) => type_is_unit(inner),
+                _ => false,
+            }
+        }
+        _ => false,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use raster_core::cfs::SequenceChildItem;
+
     use crate::ast::{
         CallArgumentKind, CallInfo, CallKind, FunctionAstItem, MacroAstItem, ProjectAst,
     };
@@ -172,7 +215,7 @@ mod tests {
     }
 
     #[test]
-    fn main_with_entry_arguments_gets_a_leading_entrypoint_item_and_empty_input_sources() {
+    fn main_with_entry_arguments_records_them_and_keeps_input_sources_empty() {
         let project = mock_project();
         let greet_func = tile_function("greet");
         let greet_tile = Tile {
@@ -206,28 +249,25 @@ mod tests {
 
         assert!(
             seq_def.input_sources.is_empty(),
-            "main's own input_sources must be empty once its parameters become an Entrypoint item"
+            "main's own input_sources must be empty once its parameters become entry arguments"
         );
-        assert_eq!(seq_def.items.len(), 2, "Entrypoint item + one tile item");
+        assert_eq!(
+            seq_def.entry_arguments,
+            vec!["personal_data".to_string(), "seed".to_string()],
+            "entry arguments are recorded on the sequence def in declaration order",
+        );
+        assert_eq!(
+            seq_def.items.len(),
+            1,
+            "no synthetic entrypoint item — the tile is the leading item at index 0"
+        );
 
         match &seq_def.items[0] {
-            SequenceChildItem::Entrypoint(item) => {
-                assert_eq!(
-                    item.names,
-                    vec!["personal_data".to_string(), "seed".to_string()]
-                );
-            }
-            other => panic!("Expected a leading Entrypoint item, got {:?}", other),
-        }
-
-        match &seq_def.items[1] {
             SequenceChildItem::Tile(tile_item) => {
                 assert_eq!(tile_item.id, "greet");
                 match &tile_item.sources[0] {
-                    InputBinding::PriorItemOutput {
-                        intra_sequence_item_index,
-                    } => assert_eq!(*intra_sequence_item_index, 0),
-                    other => panic!("Expected PriorItemOutput{{0}}, got {:?}", other),
+                    InputBinding::EntryArgument => {}
+                    other => panic!("Expected EntryArgument binding, got {:?}", other),
                 }
             }
             other => panic!("Expected a Tile item, got {:?}", other),
@@ -269,7 +309,11 @@ mod tests {
             seq_def.input_sources.is_empty(),
             "main declared zero parameters"
         );
-        assert_eq!(seq_def.items.len(), 1, "no Entrypoint item should be added");
+        assert!(
+            seq_def.entry_arguments.is_empty(),
+            "main declared no entry arguments"
+        );
+        assert_eq!(seq_def.items.len(), 1, "just the one tile item");
         assert!(matches!(seq_def.items[0], SequenceChildItem::Tile(_)));
     }
 }

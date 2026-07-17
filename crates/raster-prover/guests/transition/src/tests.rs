@@ -152,6 +152,8 @@ fn producer_sequence_cfs() -> CfsCursor {
                         }],
                     }),
                 ],
+                entry_arguments: vec![],
+                produces_output: false,
             },
             SequenceDef {
                 id: "sub".into(),
@@ -160,6 +162,8 @@ fn producer_sequence_cfs() -> CfsCursor {
                     id: "producer".into(),
                     sources: vec![InputBinding::Direct(InputSource::Inline)],
                 })],
+                entry_arguments: vec![],
+                produces_output: false,
             },
         ],
     })
@@ -821,8 +825,7 @@ fn verify_draft_transition_rejects_tampered_pre_state_witness() {
 }
 
 use crate::checks::entrypoint::{combined_root, verify_genesis_authorization, verify_step};
-use raster_core::cfs::EntrypointItem;
-use raster_core::trace::{EntrypointOp, EntrypointRecord};
+use raster_core::trace::{ProgramStartStep, StepKind, StorageRoots};
 use raster_core::transition::EntrypointAuthorization;
 
 fn entrypoint_cfs(names: Vec<String>) -> CfsCursor {
@@ -834,7 +837,8 @@ fn entrypoint_cfs(names: Vec<String>) -> CfsCursor {
         sequences: vec![SequenceDef {
             id: "main".into(),
             input_sources: vec![],
-            items: vec![SequenceChildItem::Entrypoint(EntrypointItem { names })],
+            items: vec![],
+            entry_arguments: names,
         }],
     })
 }
@@ -864,18 +868,29 @@ fn two_arg_authorization_journal(
     }
 }
 
-fn entrypoint_record(names: Vec<String>, output_commitment: Vec<u8>) -> EntrypointRecord {
-    EntrypointRecord {
-        exec_index: 0,
-        sequence_id: "main".to_string(),
-        coordinates: CfsCoordinates(vec![0]),
-        op: EntrypointOp::BindEntryArguments { names },
-        input_source_commitment: vec![0; 32],
+fn dummy_storage_roots() -> StorageRoots {
+    StorageRoots {
+        root_before: EMPTY_LEAF.to_vec(),
+        root_after: EMPTY_LEAF.to_vec(),
+        index_root_before: Vec::new(),
+        index_root_after: Vec::new(),
+    }
+}
+
+fn program_start_step(entry_arguments: Vec<String>, output_commitment: Vec<u8>) -> ProgramStartStep {
+    ProgramStartStep {
+        entry_arguments,
         output_commitment,
-        storage_root_before: EMPTY_LEAF.to_vec(),
-        storage_root_after: EMPTY_LEAF.to_vec(),
-        storage_index_root_before: Vec::new(),
-        storage_index_root_after: Vec::new(),
+        storage: dummy_storage_roots(),
+    }
+}
+
+fn program_start_record(program_start: ProgramStartStep) -> StepRecord {
+    StepRecord {
+        exec_index: 1,
+        sequence_id: "main".to_string(),
+        coordinates: CfsCoordinates(vec![]),
+        kind: StepKind::ProgramStart(program_start),
     }
 }
 
@@ -917,11 +932,25 @@ fn verify_step_accepts_matching_binding_and_establishes_authorization() {
     let journal = two_arg_authorization_journal(&commitment_a, &commitment_b);
     let names = vec!["personal_data".to_string(), "seed".to_string()];
     let cfs_cursor = entrypoint_cfs(names.clone());
-    let record = entrypoint_record(names.clone(), combined_root(&names, &journal));
+    let program_start = program_start_step(names.clone(), combined_root(&names, &journal));
+    let record = program_start_record(program_start.clone());
 
     assert_eq!(
-        verify_step(&cfs_cursor, &record, &journal),
+        verify_step(&cfs_cursor, &record, &program_start, &journal),
         EntrypointAuthorization::Established,
+    );
+}
+
+#[test]
+fn verify_step_establishes_nothing_required_when_no_entry_arguments_declared() {
+    let journal = two_arg_authorization_journal(&sha(b"a"), &sha(b"b"));
+    let cfs_cursor = no_entrypoint_cfs();
+    let program_start = program_start_step(Vec::new(), Vec::new());
+    let record = program_start_record(program_start.clone());
+
+    assert_eq!(
+        verify_step(&cfs_cursor, &record, &program_start, &journal),
+        EntrypointAuthorization::NotRequired,
     );
 }
 
@@ -933,9 +962,10 @@ fn verify_step_rejects_tampered_output_commitment() {
     let journal = two_arg_authorization_journal(&commitment_a, &commitment_b);
     let names = vec!["personal_data".to_string(), "seed".to_string()];
     let cfs_cursor = entrypoint_cfs(names.clone());
-    let record = entrypoint_record(names, vec![0xff; 32]);
+    let program_start = program_start_step(names, vec![0xff; 32]);
+    let record = program_start_record(program_start.clone());
 
-    verify_step(&cfs_cursor, &record, &journal);
+    verify_step(&cfs_cursor, &record, &program_start, &journal);
 }
 
 #[test]
@@ -950,9 +980,10 @@ fn verify_step_rejects_binding_a_subset_of_the_declared_entry_arguments() {
     let cfs_cursor = entrypoint_cfs(vec!["personal_data".to_string(), "seed".to_string()]);
 
     let subset = vec!["personal_data".to_string()];
-    let record = entrypoint_record(subset.clone(), combined_root(&subset, &journal));
+    let program_start = program_start_step(subset.clone(), combined_root(&subset, &journal));
+    let record = program_start_record(program_start.clone());
 
-    verify_step(&cfs_cursor, &record, &journal);
+    verify_step(&cfs_cursor, &record, &program_start, &journal);
 }
 
 #[test]
@@ -964,29 +995,32 @@ fn verify_step_rejects_reordered_entry_arguments() {
     let cfs_cursor = entrypoint_cfs(vec!["personal_data".to_string(), "seed".to_string()]);
 
     let swapped = vec!["seed".to_string(), "personal_data".to_string()];
-    let record = entrypoint_record(swapped.clone(), combined_root(&swapped, &journal));
+    let program_start = program_start_step(swapped.clone(), combined_root(&swapped, &journal));
+    let record = program_start_record(program_start.clone());
 
-    verify_step(&cfs_cursor, &record, &journal);
+    verify_step(&cfs_cursor, &record, &program_start, &journal);
 }
 
 #[test]
-#[should_panic(expected = "CFS that declares no main entry arguments")]
-fn verify_step_rejects_entrypoint_record_when_cfs_declares_none() {
+#[should_panic(expected = "binds entry arguments the CFS does not declare")]
+fn verify_step_rejects_program_start_binding_when_cfs_declares_none() {
     let journal = two_arg_authorization_journal(&sha(b"a"), &sha(b"b"));
     let cfs_cursor = no_entrypoint_cfs();
     let names = vec!["personal_data".to_string()];
-    let record = entrypoint_record(names.clone(), combined_root(&names, &journal));
+    let program_start = program_start_step(names.clone(), combined_root(&names, &journal));
+    let record = program_start_record(program_start.clone());
 
-    verify_step(&cfs_cursor, &record, &journal);
+    verify_step(&cfs_cursor, &record, &program_start, &journal);
 }
 
 #[test]
 fn genesis_authorization_is_not_required_when_cfs_declares_no_entry_arguments() {
     let cfs_cursor = no_entrypoint_cfs();
     let journal = two_arg_authorization_journal(&sha(b"a"), &sha(b"b"));
+    let first_step = program_start_record(program_start_step(Vec::new(), Vec::new()));
 
     assert_eq!(
-        verify_genesis_authorization(&cfs_cursor, &EMPTY_LEAF, &[], &journal, None),
+        verify_genesis_authorization(&cfs_cursor, &EMPTY_LEAF, &[], &journal, None, &first_step),
         EntrypointAuthorization::NotRequired,
     );
 }
@@ -997,12 +1031,13 @@ fn genesis_authorization_rejects_unnecessary_witness_when_no_entry_arguments_dec
     let cfs_cursor = no_entrypoint_cfs();
     let journal = two_arg_authorization_journal(&sha(b"a"), &sha(b"b"));
     let entry = StorageEntry {
-        coordinates: CfsCoordinates(vec![0]),
+        coordinates: CfsCoordinates(vec![]),
         object_commitment: sha(b"unused"),
     };
     let witness = build_read_witness(&[entry.clone()], &entry);
+    let first_step = program_start_record(program_start_step(Vec::new(), Vec::new()));
 
-    verify_genesis_authorization(&cfs_cursor, &EMPTY_LEAF, &[], &journal, Some(&witness));
+    verify_genesis_authorization(&cfs_cursor, &EMPTY_LEAF, &[], &journal, Some(&witness), &first_step);
 }
 
 #[test]
@@ -1015,45 +1050,68 @@ fn genesis_authorization_accepts_valid_trace_inclusion_witness() {
     let expected_root = combined_root(&names, &journal);
 
     let entry = StorageEntry {
-        coordinates: CfsCoordinates(vec![0]),
+        coordinates: CfsCoordinates(vec![]),
         object_commitment: expected_root,
     };
     let (_frontier, root, _index, index_root) = build_storage_context(&[entry.clone()]);
     let witness = build_read_witness(&[entry.clone()], &entry);
+    // Unused when a witness is supplied: the window opened after the start.
+    let first_step = program_start_record(program_start_step(names.clone(), Vec::new()));
 
     assert_eq!(
-        verify_genesis_authorization(&cfs_cursor, &root, &index_root, &journal, Some(&witness)),
+        verify_genesis_authorization(
+            &cfs_cursor,
+            &root,
+            &index_root,
+            &journal,
+            Some(&witness),
+            &first_step,
+        ),
         EntrypointAuthorization::Established,
     );
 }
 
 #[test]
-fn genesis_authorization_is_pending_without_a_witness_so_a_window_may_open_at_genesis() {
+fn genesis_authorization_is_established_at_genesis_when_first_step_is_program_start() {
     // A window whose trace starts at the beginning has an empty initial
-    // store: no membership witness can exist, because the binding has not
-    // happened yet. That must leave a debt, not fail — the `Entrypoint` step
-    // inside the window is what pays it.
+    // store, so no membership witness can exist. That is fine: its first step
+    // is the `ProgramStart` that binds and authorizes the entry arguments in
+    // the same guest run, so authorization is established immediately.
     let names = vec!["personal_data".to_string(), "seed".to_string()];
     let journal =
         two_arg_authorization_journal(&sha(b"personal_data-file"), &sha(b"seed-file"));
-    let cfs_cursor = entrypoint_cfs(names);
+    let cfs_cursor = entrypoint_cfs(names.clone());
+    let first_step = program_start_record(program_start_step(
+        names.clone(),
+        combined_root(&names, &journal),
+    ));
 
     assert_eq!(
-        verify_genesis_authorization(&cfs_cursor, &EMPTY_LEAF, &[], &journal, None),
-        EntrypointAuthorization::Pending,
+        verify_genesis_authorization(&cfs_cursor, &EMPTY_LEAF, &[], &journal, None, &first_step),
+        EntrypointAuthorization::Established,
     );
 }
 
 #[test]
-#[should_panic(expected = "entry-argument binding was never authorized")]
-fn pending_authorization_may_not_reach_the_end_of_a_chain() {
-    EntrypointAuthorization::Pending.assert_discharged();
-}
+#[should_panic(expected = "first step is not ProgramStart")]
+fn genesis_authorization_rejects_a_late_window_missing_its_membership_witness() {
+    // A window that opens *after* the start (its first step is not
+    // ProgramStart) must supply a membership witness; without one there is
+    // nothing tying its storage to the manifest.
+    let names = vec!["personal_data".to_string(), "seed".to_string()];
+    let journal =
+        two_arg_authorization_journal(&sha(b"personal_data-file"), &sha(b"seed-file"));
+    let cfs_cursor = entrypoint_cfs(names);
+    let first_step = StepRecord {
+        exec_index: 9,
+        sequence_id: "main".to_string(),
+        coordinates: CfsCoordinates(vec![0]),
+        kind: StepKind::SequenceEnd {
+            output_commitment: Vec::new(),
+        },
+    };
 
-#[test]
-fn discharged_authorization_states_may_conclude_a_chain() {
-    EntrypointAuthorization::Established.assert_discharged();
-    EntrypointAuthorization::NotRequired.assert_discharged();
+    verify_genesis_authorization(&cfs_cursor, &EMPTY_LEAF, &[], &journal, None, &first_step);
 }
 
 #[test]

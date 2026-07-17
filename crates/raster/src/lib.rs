@@ -36,8 +36,9 @@ pub use input::{
 
 #[cfg(feature = "std")]
 pub use input::{
-    begin_draft_transition_capture, encode_raster_value, finish_draft_transition_capture,
-    postcard_structural_commitment, store_value, write_raster_files,
+    begin_draft_transition_capture, encode_raster_value, end_program_output, end_program_unit,
+    finish_draft_transition_capture, postcard_structural_commitment, store_value,
+    write_raster_files,
 };
 
 pub use raster_macros::{select, sequence, tile, Selectable};
@@ -59,7 +60,7 @@ pub mod runtime {
 // Runtime helpers are only available with std feature.
 #[cfg(feature = "std")]
 pub use raster_runtime::{
-    bind_entry_arguments, entry_argument_spec, finish, init, init_with, publish_trace_event,
+    entry_argument_spec, finish, init, init_with, publish_trace_event, start_program,
     EntryArgumentSpec, EntryArgumentsBinding,
 };
 
@@ -445,6 +446,42 @@ pub mod __private {
         _: core::result::Result<T, crate::alloc::string::String>,
     ) -> core::result::Result<crate::AuthRef<T>, crate::alloc::string::String> {
         panic!("Sequence call bindings require the `std` feature")
+    }
+
+    /// Builds a tile output's trace payload and stashes a copy of the
+    /// encoding — keyed by `output_bytes`, the postcard serialization the
+    /// wrapper traced — for the caller's `bind_*_call` to reuse when it
+    /// stores the same value. Raster-Merkleizing a large output dominates a
+    /// tile call's cost; without the stash it runs twice per output (once
+    /// for the trace, once for storage).
+    #[cfg(feature = "std")]
+    pub fn tile_output_trace_payload<T>(
+        value: &T,
+        output_bytes: &[u8],
+    ) -> raster_core::Result<raster_core::trace::RasterPayload>
+    where
+        T: serde::Serialize,
+    {
+        let payload = crate::raster_trace_payload(value)?;
+        raster_runtime::stash_pending_output_encoding(
+            core::any::type_name::<T>(),
+            output_bytes.to_vec(),
+            payload.clone(),
+        );
+        Ok(payload)
+    }
+
+    #[cfg(not(feature = "std"))]
+    pub fn tile_output_trace_payload<T>(
+        _: &T,
+        _: &[u8],
+    ) -> raster_core::Result<raster_core::trace::RasterPayload>
+    where
+        T: serde::Serialize,
+    {
+        Err(raster_core::Error::Other(
+            "Raster trace payload generation requires the `std` feature".into(),
+        ))
     }
 
     pub trait TileCallBinding<Return> {

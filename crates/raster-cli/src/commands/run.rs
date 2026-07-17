@@ -139,6 +139,9 @@ pub fn run(
         &profile_stream_path,
     );
     cmd.env(raster_runtime::PROFILE_RUN_ID_ENV, &artifacts.run_id);
+    // Where a program that returns a value writes its output artifact
+    // (`output.bin` / `output.rindex` / `output_manifest.json`).
+    cmd.env(raster_runtime::OUTPUT_DIR_ENV, &artifacts.run_dir);
     if let Some(input_json) = input {
         cmd.args(["--input", input_json]);
     }
@@ -219,6 +222,18 @@ pub fn run(
         for error_line in errors {
             println!("{error_line}");
         }
+    }
+
+    // A program that returns a value writes its authorized output artifact to
+    // the run dir, in the same format external input takes — so it can be a
+    // following program's `--input`/`--input-manifest`.
+    let output_manifest_path = artifacts.run_dir.join("output_manifest.json");
+    if output_manifest_path.exists() {
+        println!();
+        println!("Program output artifact:");
+        println!("  {}", artifacts.run_dir.join("output.bin").display());
+        println!("  {}", artifacts.run_dir.join("output.rindex").display());
+        println!("  {}", output_manifest_path.display());
     }
 
     let (mut trace, trace_recorder) =
@@ -307,8 +322,9 @@ pub fn run(
 /// share an id and differ only in coordinates.
 fn step_coordinate_label(kind: &StepKind) -> &'static str {
     match kind {
+        StepKind::ProgramStart(_) => "program_start_coordinates",
+        StepKind::ProgramEnd(_) => "program_end_coordinates",
         StepKind::SequenceStart { .. } | StepKind::SequenceEnd { .. } => "sequence_coordinates",
-        StepKind::Entrypoint(_) => "entrypoint_coordinates",
         StepKind::Exec(exec) => match exec.target {
             ExecTarget::Tile(_) => "tile_coordinates",
             ExecTarget::RecurTile(_) => "recur_tile_coordinates",
@@ -457,7 +473,7 @@ pub fn fraud(
 ) -> Result<()> {
     let mut rng = rand::rng();
     // Only steps that actually ran something are worth corrupting: a
-    // sequence boundary or an entrypoint has no replayed output to
+    // sequence boundary or a program start has no replayed output to
     // contradict.
     if let Some(fraud_step) = trace
         .iter_mut()
@@ -615,6 +631,13 @@ fn storage_state_from_prefix(
         coordinate_index: IncrementalCoordinateIndex::new(),
     };
     for step_record in trace {
+        // Only a storage-appending step owns the write recorded at its
+        // coordinate. Gating on this keeps the entry-object write from being
+        // applied twice: `ProgramStart` (append) shares coordinates `[]` with
+        // the read-only `ProgramEnd` and `main`'s `SequenceEnd`.
+        if !step_record.appends_to_storage() {
+            continue;
+        }
         if let Some(storage_write) = trace_recorder
             .step_witness_at(step_record.coordinates())
             .and_then(|witness| witness.storage_write())
@@ -627,17 +650,18 @@ fn storage_state_from_prefix(
 }
 
 /// Prove that `main`'s entry-argument binding is already present at
-/// coordinate `[0]` of the window's *initial* storage state, so a
-/// window that opens after the binding step can still tie its execution to
-/// the public manifest (see `checks::entrypoint` in the transition guest).
+/// coordinate `[]` (the sequence root) of the window's *initial* storage
+/// state, so a window that opens after the program start can still tie its
+/// execution to the public manifest (see `checks::entrypoint` in the
+/// transition guest).
 ///
 /// `None` when the binding is not in the initial state — which is the normal
-/// case for a window covering the start of the trace, where the `Entrypoint`
-/// step is replayed inside the window and authorizes itself. The guest
-/// decides which of those two it is; this only supplies the witness when one
-/// exists.
+/// case for a window covering the start of the trace, where the
+/// `ProgramStart` step is replayed inside the window and authorizes itself.
+/// The guest decides which of those two it is; this only supplies the witness
+/// when one exists.
 fn build_entrypoint_membership_witness(state: &ProofStorageState) -> Option<StorageReadWitness> {
-    let coordinates = CfsCoordinates(vec![0]);
+    let coordinates = CfsCoordinates(vec![]);
     let index_witness = state.coordinate_index.membership_proof(&coordinates)?;
     let log_witness =
         build_storage_log_witness(&state.append_entries, index_witness.value.log_position);
@@ -764,21 +788,27 @@ pub fn prove(
             }
         }
         let mut storage_write_witness = None;
-        if let Some(storage_write) = step_witness.storage_write() {
-            let entry = storage_write.entry.clone();
-            let index_non_membership_witness = before_state
-                .coordinate_index
-                .non_membership_proof(&entry.coordinates);
-            apply_storage_write_to_state(&mut current_storage_state, &storage_write);
-            let index_membership_witness = current_storage_state
-                .coordinate_index
-                .membership_proof(&entry.coordinates)
-                .expect("Missing coordinate-index membership proof after write");
-            storage_write_witness = Some(StorageWriteWitness {
-                entry,
-                index_non_membership_witness,
-                index_membership_witness,
-            });
+        // Only a storage-appending step owns the write recorded at its
+        // coordinate. `ProgramEnd` shares coordinates `[]` (and thus a
+        // witness-store entry) with `ProgramStart`, so without this gate it
+        // would re-apply `ProgramStart`'s entry-object write.
+        if step_record.appends_to_storage() {
+            if let Some(storage_write) = step_witness.storage_write() {
+                let entry = storage_write.entry.clone();
+                let index_non_membership_witness = before_state
+                    .coordinate_index
+                    .non_membership_proof(&entry.coordinates);
+                apply_storage_write_to_state(&mut current_storage_state, &storage_write);
+                let index_membership_witness = current_storage_state
+                    .coordinate_index
+                    .membership_proof(&entry.coordinates)
+                    .expect("Missing coordinate-index membership proof after write");
+                storage_write_witness = Some(StorageWriteWitness {
+                    entry,
+                    index_non_membership_witness,
+                    index_membership_witness,
+                });
+            }
         }
         let storage_witness =
             if storage_read_witnesses.is_empty() && storage_write_witness.is_none() {
@@ -789,6 +819,63 @@ pub fn prove(
                     write: storage_write_witness,
                 })
             };
+
+        // A `ProgramEnd` step reads its output object from the current storage
+        // state (which already contains it) and proves the selection that
+        // narrows to the returned value — the same read + selection machinery
+        // tile inputs use. The witnesses come straight from the recorded
+        // output binding, not the shared `[]` witness-store entry.
+        let (program_output_read_witness, program_output_selection_witness) =
+            match &step_record.kind {
+                StepKind::ProgramEnd(program_end) => match &program_end.output {
+                    Some(output) => {
+                        let index_witness = before_state
+                            .coordinate_index
+                            .membership_proof(&output.coordinates)
+                            .unwrap_or_else(|| {
+                                panic!(
+                                    "Missing coordinate-index witness for program output at {:?}",
+                                    output.coordinates
+                                )
+                            });
+                        let entry = StorageEntry {
+                            coordinates: output.coordinates.clone(),
+                            object_commitment: output.commitment.clone(),
+                        };
+                        let log_witness = build_storage_log_witness(
+                            &before_state.append_entries,
+                            index_witness.value.log_position,
+                        );
+                        let read = StorageReadWitness {
+                            entry,
+                            log_witness,
+                            index_witness,
+                        };
+                        let selection = if output.selection.selected_len > 0 {
+                            let reference = StorageRef::new(
+                                output.coordinates.clone(),
+                                output.commitment.clone(),
+                            );
+                            Some(
+                                trace_recorder
+                                    .storage_selection_witness(&reference, &output.selector)
+                                    .unwrap_or_else(|error| {
+                                        panic!(
+                                            "Failed to build program output selection witness: {}",
+                                            error
+                                        )
+                                    }),
+                            )
+                        } else {
+                            None
+                        };
+                        (Some(read), selection)
+                    }
+                    None => (None, None),
+                },
+                _ => (None, None),
+            };
+
         recorded_step_io.insert(
             step_record.clone(),
             StepIo {
@@ -799,6 +886,8 @@ pub fn prove(
                 storage_selection_witnesses,
                 storage_witness,
                 draft_transition_witness,
+                program_output_read_witness,
+                program_output_selection_witness,
             },
         );
 

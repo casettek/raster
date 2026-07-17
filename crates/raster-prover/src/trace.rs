@@ -522,6 +522,22 @@ fn resolve_inputs_sources(
             InputBinding::Direct(InputSource::Storage) => {
                 panic!("Direct storage bindings are not yet supported in trace source resolution");
             }
+            InputBinding::EntryArgument => {
+                // The source is the program's `ProgramStart` step, which bound
+                // the authorized entry object at the sequence root `[]`.
+                let source = trace
+                    .iter()
+                    .enumerate()
+                    .find(|(_, record)| matches!(record.kind, StepKind::ProgramStart(_)))
+                    .map(|(index, record)| (index, record.clone()))
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "Failed to resolve ProgramStart source for entry-argument input of step {:?}",
+                            step_record
+                        )
+                    });
+                source_records.push(source);
+            }
             InputBinding::SequenceScope { input_index } => {
                 let (parent_index, source_record) = current_sequence_trace_suffix
                     .first()

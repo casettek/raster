@@ -931,44 +931,6 @@ fn trace_output_binding(kind: &ProtocolReturnKind) -> proc_macro2::TokenStream {
     }
 }
 
-fn materialize_main_result(kind: &ProtocolReturnKind) -> proc_macro2::TokenStream {
-    match kind {
-        ProtocolReturnKind::Unit => quote! { let __raster_result = __raster_auth_result; },
-        ProtocolReturnKind::Value(ty) => quote! {
-            let __raster_result: #ty =
-                ::raster::materialize_auth_return::<#ty, _>(__raster_auth_result);
-        },
-        ProtocolReturnKind::Fallible(ty) => quote! {
-            let __raster_result: ::raster::exec::Result<#ty> =
-                ::raster::materialize_auth_result::<#ty, _>(__raster_auth_result);
-        },
-        ProtocolReturnKind::Draft(_) => {
-            panic!("`#[sequence]` functions must finalize Draft handles before returning")
-        }
-        ProtocolReturnKind::RecurControlDraft(_) => {
-            panic!("`#[sequence]` functions must finalize Draft handles before returning")
-        }
-        ProtocolReturnKind::RecurOutput(_) => {
-            panic!("`#[sequence]` functions must finalize recur outputs before returning")
-        }
-        ProtocolReturnKind::RecurControlRecurOutput(_) => {
-            panic!("`#[sequence]` functions must finalize recur outputs before returning")
-        }
-        ProtocolReturnKind::RecurState(_) => {
-            panic!("`#[sequence]` functions must finalize recur states before returning")
-        }
-        ProtocolReturnKind::RecurControlRecurState(_) => {
-            panic!("`#[sequence]` functions must finalize recur states before returning")
-        }
-        ProtocolReturnKind::RecurStateOutput(_) => {
-            panic!("`#[sequence]` functions must finalize recur outputs before returning")
-        }
-        ProtocolReturnKind::RecurControlRecurStateOutput(_) => {
-            panic!("`#[sequence]` functions must finalize recur outputs before returning")
-        }
-    }
-}
-
 fn gen_tile_call_binding_marker(
     marker_ident: &syn::Ident,
     return_kind: &ProtocolReturnKind,
@@ -2105,14 +2067,14 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
                     );
 
                     let __raster_output_record_build_start = ::raster::__private::profile_now();
+                    let __raster_output_raster_payload =
+                        ::raster::__private::tile_output_trace_payload(&result, &__raster_output_bytes)
+                            .unwrap_or_else(|e| panic!("Failed to build raster output payload: {}", e));
                     let __raster_output = ::core::option::Option::Some(
                         ::raster::core::trace::FnOutput::new(
                             __raster_output_bytes,
                             ::raster::alloc::string::String::from(#output_type_expr),
-                        ).with_raster(
-                            ::raster::raster_trace_payload(&result)
-                                .unwrap_or_else(|e| panic!("Failed to build raster output payload: {}", e))
-                        )
+                        ).with_raster(__raster_output_raster_payload)
                     );
 
                     let __raster_record = ::raster::core::trace::FnCallRecord {
@@ -2182,14 +2144,14 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
                     #function_call
                     #native_draft_capture_finish
                     #trace_output_serialization
+                    let __raster_output_raster_payload =
+                        ::raster::__private::tile_output_trace_payload(&result, &__raster_output_bytes)
+                            .unwrap_or_else(|e| panic!("Failed to build raster output payload: {}", e));
                     let __raster_output = ::core::option::Option::Some(
                         ::raster::core::trace::FnOutput::new(
                             __raster_output_bytes,
                             ::raster::alloc::string::String::from(#output_type_expr),
-                        ).with_raster(
-                            ::raster::raster_trace_payload(&result)
-                                .unwrap_or_else(|e| panic!("Failed to build raster output payload: {}", e))
-                        )
+                        ).with_raster(__raster_output_raster_payload)
                     );
 
                     let __raster_record = ::raster::core::trace::FnCallRecord {
@@ -2296,16 +2258,32 @@ impl SequenceAttrs {
     }
 }
 
-/// Generates the sequence-wrapped body: either tracing (SequenceStart/body/SequenceEnd) or plain body depending on cfg.
+/// Generates the sequence-wrapped body for a *non-main* sequence: either
+/// tracing (SequenceStart/body/SequenceEnd) or a plain body depending on cfg.
+///
+/// `main` has its own generator ([`gen_main_wrapped_body`]): its boundaries
+/// are the program-level `ProgramStart`/`ProgramEnd` steps, not the sequence
+/// events this produces.
 fn gen_sequence_wrapped_body(
     fn_name_str: &str,
     item_fn: &ItemFn,
     return_kind: &ProtocolReturnKind,
 ) -> proc_macro2::TokenStream {
+    let is_main = fn_name_str == "main";
     let body = &item_fn.block;
     let input_serialization = gen_sequence_input_serialization(&item_fn);
     let auth_result_binding = auth_result_binding(return_kind, body);
     let trace_output_binding = trace_output_binding(return_kind);
+
+    let sequence_start_publish = if is_main {
+        quote! {}
+    } else {
+        quote! {
+            ::raster::publish_trace_event(::raster::core::trace::TraceEvent::SequenceStart(
+                __raster_record.clone(),
+            ));
+        }
+    };
 
     let output_type_expr = match &item_fn.sig.output {
         ReturnType::Default => quote! { "()" },
@@ -2340,9 +2318,7 @@ fn gen_sequence_wrapped_body(
                     output: ::core::option::Option::None,
                     draft_transition_witness: ::core::option::Option::None,
                 };
-                ::raster::publish_trace_event(::raster::core::trace::TraceEvent::SequenceStart(
-                    __raster_record.clone(),
-                ));
+                #sequence_start_publish
                 let __raster_sequence_start_event_publish_ns =
                     ::core::primitive::u64::try_from(
                         __raster_sequence_start_event_publish_start.elapsed().as_nanos()
@@ -2403,9 +2379,7 @@ fn gen_sequence_wrapped_body(
                     output: ::core::option::Option::None,
                     draft_transition_witness: ::core::option::Option::None,
                 };
-                ::raster::publish_trace_event(::raster::core::trace::TraceEvent::SequenceStart(
-                    __raster_record.clone(),
-                ));
+                #sequence_start_publish
                 #auth_result_binding
                 #trace_output_binding
                 __raster_record.output = ::core::option::Option::Some(::raster::core::trace::FnOutput::new(
@@ -2425,6 +2399,97 @@ fn gen_sequence_wrapped_body(
                 #auth_result_binding
                 __raster_result
             }
+        }
+    }
+}
+
+/// Whether a return type denotes unit — bare `()` or a `Result<(), _>`.
+/// Mirrors the CFS builder's `type_is_unit`, keeping the macro's
+/// output-emission decision in step with `SequenceDef::produces_output`.
+fn type_is_unit(ty: &Type) -> bool {
+    match ty {
+        Type::Tuple(tuple) => tuple.elems.is_empty(),
+        Type::Path(type_path) => {
+            let Some(segment) = type_path.path.segments.last() else {
+                return false;
+            };
+            if segment.ident != "Result" {
+                return false;
+            }
+            let PathArguments::AngleBracketed(args) = &segment.arguments else {
+                return false;
+            };
+            match args.args.first() {
+                Some(GenericArgument::Type(inner)) => type_is_unit(inner),
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+/// The statements that publish `main`'s terminal `ProgramEnd` event, given the
+/// `AuthRef` result bound as `__raster_result`. A non-unit output is exported
+/// as the program's output artifact and its storage binding committed; unit
+/// (or `Result<(), _>`) binds nothing; a fallible `main` that returned `Err`
+/// publishes nothing at all (its trace is left incomplete, hence unattestable).
+fn gen_main_end_publish(return_kind: &ProtocolReturnKind) -> proc_macro2::TokenStream {
+    match return_kind {
+        ProtocolReturnKind::Unit => quote! { ::raster::end_program_unit(); },
+        ProtocolReturnKind::Value(ty) => {
+            if type_is_unit(ty) {
+                quote! { ::raster::end_program_unit(); }
+            } else {
+                quote! { ::raster::end_program_output(&__raster_result); }
+            }
+        }
+        ProtocolReturnKind::Fallible(ty) => {
+            let ok_end = if type_is_unit(ty) {
+                quote! { ::raster::end_program_unit(); }
+            } else {
+                quote! { ::raster::end_program_output(__raster_ok_ref); }
+            };
+            quote! {
+                match &__raster_result {
+                    ::core::result::Result::Ok(__raster_ok_ref) => { #ok_end }
+                    // A failed run publishes no ProgramEnd: an incomplete trace
+                    // cannot be attested as a completed program execution.
+                    ::core::result::Result::Err(_) => {}
+                }
+            }
+        }
+        _ => panic!("`main` must return unit, a value, or a Result of one"),
+    }
+}
+
+/// Generates `main`'s wrapped body. Unlike an ordinary sequence, `main`'s
+/// boundaries are the program-level `ProgramStart` (published by the
+/// entry-argument prelude prepended to the body) and `ProgramEnd` (published
+/// here). It takes no sequence arguments and publishes no sequence events.
+fn gen_main_wrapped_body(
+    item_fn: &ItemFn,
+    return_kind: &ProtocolReturnKind,
+) -> proc_macro2::TokenStream {
+    let body = &item_fn.block;
+    let auth_result_binding = auth_result_binding(return_kind, body);
+    let end_publish = gen_main_end_publish(return_kind);
+
+    quote! {
+        #[cfg(all(feature = "std", not(target_arch = "riscv32")))]
+        {
+            let __raster_sequence_scope_guard =
+                ::raster::__private::SequenceScopeGuard::enter("main");
+            #auth_result_binding
+            #end_publish
+            __raster_result
+        }
+
+        #[cfg(not(all(feature = "std", not(target_arch = "riscv32"))))]
+        {
+            let __raster_sequence_scope_guard =
+                ::raster::__private::SequenceScopeGuard::enter("main");
+            #auth_result_binding
+            __raster_result
         }
     }
 }
@@ -2491,32 +2556,46 @@ pub fn sequence(attr: TokenStream, item: TokenStream) -> TokenStream {
         prepend_entry_argument_prelude(&mut item_fn.block, &params);
         // `main`'s declared parameters are entry arguments bound inside the
         // body by the prelude above, not caller-supplied `SequenceScope`
-        // arguments — main has no caller. Clear the signature before
-        // building the wrapped body so `gen_sequence_input_serialization`
-        // (which traces real sequence-scope arguments for the SequenceStart
-        // event) sees no parameters, exactly as it did when `main` was
-        // required to take none.
+        // arguments — main has no caller. Clear the signature so the wrapped
+        // body sees no parameters.
         item_fn.sig.inputs = syn::punctuated::Punctuated::new();
 
-        let output = &item_fn.sig.output;
         let auth_name = format_ident!("__raster_sequence_auth_main");
         let auth_output = auth_return_type(&return_kind);
-        let body = gen_sequence_wrapped_body("main", &item_fn, &return_kind);
-        let materialize_result = materialize_main_result(&return_kind);
+        let body = gen_main_wrapped_body(&item_fn, &return_kind);
+
+        // `main`'s declared return type is the program's *output declaration*,
+        // exported as an artifact by `ProgramEnd`, not the process return
+        // value: the generated `fn main` returns `()` (or `Result<(), _>` so a
+        // failed run still exits non-zero). See `gen_main_end_publish`.
+        let (main_output, main_tail) = match &return_kind {
+            ProtocolReturnKind::Fallible(_) => (
+                quote! { -> ::raster::exec::Result<()> },
+                quote! {
+                    let __raster_auth_result = #auth_name();
+                    ::raster::finish();
+                    __raster_auth_result.map(|_| ())
+                },
+            ),
+            // Unit and value returns: the value (if any) went to the artifact.
+            _ => (
+                quote! {},
+                quote! {
+                    let _ = #auth_name();
+                    ::raster::finish();
+                },
+            ),
+        };
+
         quote! {
             fn #auth_name() -> #auth_output {
                 #body
             }
 
             #(#fn_attrs)*
-            fn main() #output {
+            fn main() #main_output {
                 ::raster::init();
-
-                let __raster_auth_result = #auth_name();
-                #materialize_result
-
-                ::raster::finish();
-                __raster_result
+                #main_tail
             }
         }
     } else {
