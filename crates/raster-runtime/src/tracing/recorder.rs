@@ -1,4 +1,6 @@
-use raster_core::cfs::{CfsCoordinates, CfsCursor, ControlFlowSchema, SequenceChildId};
+use raster_core::cfs::{
+    CfsCoordinates, CfsCursor, ControlFlowSchema, SequenceChildId, SequenceChildItem,
+};
 use raster_core::draft::DraftTransitionWitness;
 use raster_core::input::{SelectionWitness, SelectorPath, StorageRef};
 use raster_core::trace::{
@@ -36,6 +38,11 @@ struct RecurExecutionState {
     site_coordinates: CfsCoordinates,
     intra_sequence_index: u32,
     next_iteration_index: u32,
+    /// CFS-declared chunk size for this site (`RecurTileItem::chunk`).
+    declared_chunk: Option<u64>,
+    /// Chunk length of the most recent iteration, used to enforce that only
+    /// the final chunk may be shorter than the declared size.
+    last_chunk_len: Option<u64>,
 }
 
 impl SequenceCallstack {
@@ -555,6 +562,9 @@ impl TraceRecorder {
                             site_coordinates,
                             intra_sequence_index: parent_current_index,
                             next_iteration_index: 0,
+                            // Chunking is not supported for recur sequences yet.
+                            declared_chunk: None,
+                            last_chunk_len: None,
                         },
                     );
                 }
@@ -715,12 +725,18 @@ impl TraceRecorder {
                         parent_current_index,
                         SequenceChildId::RecurTile(fn_call_record.fn_name.clone()),
                     );
+                    let declared_chunk = match self.cfs_cursor.try_get_item(&site_coordinates) {
+                        Some(SequenceChildItem::RecurTile(item)) => item.chunk,
+                        _ => None,
+                    };
                     RecurExecutionState {
                         site_id: fn_call_record.fn_name.clone(),
                         sequence_coordinates: sequence_coordinates.clone(),
                         site_coordinates,
                         intra_sequence_index: parent_current_index,
                         next_iteration_index: 0,
+                        declared_chunk,
+                        last_chunk_len: None,
                     }
                 });
                 assert_eq!(
@@ -736,6 +752,41 @@ impl TraceRecorder {
                 tile_coordinates.push(recur_state.next_iteration_index);
                 recur_state.next_iteration_index += 1;
                 let intra_sequence_index = recur_state.intra_sequence_index;
+
+                if let Some(declared) = recur_state.declared_chunk {
+                    let chunk_len = fn_call_record
+                        .input
+                        .as_ref()
+                        .map(|input| input.data())
+                        .and_then(raster_core::chunking::iteration_chunk_len)
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "Recur iteration at {:?} for '{}' has no decodable chunk length",
+                                tile_coordinates, recur_state.site_id
+                            )
+                        });
+                    if let Err(violation) =
+                        raster_core::chunking::check_iteration_chunk_len(declared, chunk_len)
+                    {
+                        panic!(
+                            "Recur chunking violation at {:?} for '{}': {}",
+                            tile_coordinates, recur_state.site_id, violation
+                        );
+                    }
+                    if let Some(previous) = recur_state.last_chunk_len {
+                        if let Err(violation) =
+                            raster_core::chunking::check_previous_chunk_was_full(
+                                declared, previous,
+                            )
+                        {
+                            panic!(
+                                "Recur chunking violation at {:?} for '{}': {}",
+                                tile_coordinates, recur_state.site_id, violation
+                            );
+                        }
+                    }
+                    recur_state.last_chunk_len = Some(chunk_len);
+                }
 
                 let input = fn_call_record.input;
                 let output = fn_call_record.output;
@@ -788,6 +839,8 @@ impl TraceRecorder {
                         site_coordinates,
                         intra_sequence_index: parent_current_index,
                         next_iteration_index: 0,
+                        declared_chunk: None,
+                        last_chunk_len: None,
                     }
                 });
 
@@ -858,6 +911,8 @@ impl TraceRecorder {
                             site_coordinates,
                             intra_sequence_index: parent_current_index,
                             next_iteration_index: 0,
+                            declared_chunk: None,
+                            last_chunk_len: None,
                         }
                     });
 
@@ -1030,6 +1085,7 @@ mod tests {
                     SequenceChildItem::RecurTile(RecurTileItem {
                         id: "recur".to_string(),
                         sources: vec![],
+                        chunk: None,
                     }),
                     SequenceChildItem::Tile(TileItem {
                         id: "after".to_string(),
@@ -1095,6 +1151,102 @@ mod tests {
             }),
             None,
         );
+    }
+
+    fn recorder_with_chunked_recur_site(chunk: u64) -> TraceRecorder {
+        TraceRecorder::new(ControlFlowSchema {
+            version: "1.0".to_string(),
+            project: "test".to_string(),
+            encoding: "postcard".to_string(),
+            tiles: vec![TileDef::iter("recur", 0, 0)],
+            sequences: vec![SequenceDef {
+                id: "main".to_string(),
+                input_sources: vec![],
+                items: vec![SequenceChildItem::RecurTile(RecurTileItem {
+                    id: "recur".to_string(),
+                    sources: vec![],
+                    chunk: Some(chunk),
+                })],
+                entry_arguments: Vec::new(),
+                produces_output: false,
+            }],
+        })
+    }
+
+    /// Iteration event whose input data mirrors the chunked recur ABI:
+    /// a tuple leading with `RecurInput<Vec<String>> { value, index, len }`.
+    fn chunked_iteration_event(elements: usize) -> TraceEvent {
+        let chunk: Vec<String> = (0..elements).map(|i| format!("line-{}", i)).collect();
+        let data =
+            raster_core::postcard::to_allocvec(&((chunk, 0u64, 2u64), "title".to_string()))
+                .unwrap();
+        TraceEvent::RecurTileIterationExec(FnCallRecord {
+            fn_name: "recur".to_string(),
+            input: Some(raster_core::trace::FnInput {
+                data,
+                values: vec![],
+                args: vec![],
+                storage: Default::default(),
+            }),
+            output: None,
+            draft_transition_witness: None,
+        })
+    }
+
+    fn start_main(recorder: &mut TraceRecorder) {
+        recorder.record(TraceEvent::SequenceStart(FnCallRecord {
+            fn_name: "main".to_string(),
+            input: None,
+            output: None,
+            draft_transition_witness: None,
+        }));
+    }
+
+    #[test]
+    fn chunked_recur_accepts_full_then_short_final_chunk() {
+        let mut recorder = recorder_with_chunked_recur_site(2);
+        start_main(&mut recorder);
+        recorder.record(chunked_iteration_event(2));
+        recorder.record(chunked_iteration_event(2));
+        recorder.record(chunked_iteration_event(1));
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds declared chunk size")]
+    fn chunked_recur_rejects_oversized_chunk() {
+        let mut recorder = recorder_with_chunked_recur_site(2);
+        start_main(&mut recorder);
+        recorder.record(chunked_iteration_event(3));
+    }
+
+    #[test]
+    #[should_panic(expected = "empty chunk")]
+    fn chunked_recur_rejects_empty_chunk() {
+        let mut recorder = recorder_with_chunked_recur_site(2);
+        start_main(&mut recorder);
+        recorder.record(chunked_iteration_event(0));
+    }
+
+    #[test]
+    #[should_panic(expected = "smaller than declared chunk size")]
+    fn chunked_recur_rejects_short_non_final_chunk() {
+        let mut recorder = recorder_with_chunked_recur_site(2);
+        start_main(&mut recorder);
+        recorder.record(chunked_iteration_event(1));
+        recorder.record(chunked_iteration_event(2));
+    }
+
+    #[test]
+    #[should_panic(expected = "no decodable chunk length")]
+    fn chunked_recur_rejects_missing_input() {
+        let mut recorder = recorder_with_chunked_recur_site(2);
+        start_main(&mut recorder);
+        recorder.record(TraceEvent::RecurTileIterationExec(FnCallRecord {
+            fn_name: "recur".to_string(),
+            input: None,
+            output: None,
+            draft_transition_witness: None,
+        }));
     }
 
     #[test]

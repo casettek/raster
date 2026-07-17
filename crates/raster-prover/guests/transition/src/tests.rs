@@ -4,8 +4,8 @@ use bridgetree::NonEmptyFrontier;
 
 use raster_core::authorization::AuthorizationJournal;
 use raster_core::cfs::{
-    CfsCoordinates, CfsCursor, ControlFlowSchema, InputBinding, InputSource, SequenceChildItem,
-    SequenceDef, SequenceItem, TileDef, TileItem,
+    CfsCoordinates, CfsCursor, ControlFlowSchema, InputBinding, InputSource, RecurTileItem,
+    SequenceChildItem, SequenceDef, SequenceItem, TileDef, TileItem,
 };
 use raster_core::coordinate_index::{
     coordinate_index_membership_proof, coordinate_index_non_membership_proof, coordinate_index_root,
@@ -209,7 +209,115 @@ fn verify_step_record_inputs_accepts_sequence_descendant_producer_coordinates() 
     let input_source_witness =
         storage_input_witness(CfsCoordinates(vec![0, 0]), sha(b"producer-output"));
 
-    verify_step_record_inputs(&cfs_cursor, &step_record, Some(&input_source_witness), None);
+    verify_step_record_inputs(
+        &cfs_cursor,
+        &step_record,
+        Some(&input_source_witness),
+        None,
+        None,
+    );
+}
+
+fn chunked_recur_cfs(chunk: Option<u64>) -> CfsCursor {
+    CfsCursor::new(ControlFlowSchema {
+        version: "1.0".into(),
+        project: "test".into(),
+        encoding: "postcard".into(),
+        tiles: vec![TileDef::iter("collect", 0, 1)],
+        sequences: vec![SequenceDef {
+            id: "main".into(),
+            input_sources: vec![],
+            items: vec![SequenceChildItem::RecurTile(RecurTileItem {
+                id: "collect".into(),
+                sources: vec![],
+                chunk,
+            })],
+        }],
+    })
+}
+
+fn recur_iteration_step(iteration: u32) -> StepRecord {
+    StepRecord::TileExec(TileExecRecord {
+        exec_index: 1,
+        tile_id: "collect".into(),
+        sequence_id: "main".into(),
+        intra_sequence_index: 0,
+        coordinates: CfsCoordinates(vec![0, iteration]),
+        input_commitment: Vec::new(),
+        input_source_commitment: Vec::new(),
+        output_commitment: Vec::new(),
+        external_input_commitment: Vec::new(),
+        internal_store_root_before: Vec::new(),
+        internal_store_root_after: Vec::new(),
+        internal_store_index_root_before: Vec::new(),
+        internal_store_index_root_after: Vec::new(),
+    })
+}
+
+/// ABI bytes of a chunked recur iteration input: the tuple leads with
+/// `RecurInput<Vec<String>> { value, index, len }`, so the first varint is the
+/// chunk element count.
+fn recur_iteration_input_bytes(elements: usize) -> Vec<u8> {
+    let chunk: Vec<String> = (0..elements).map(|i| format!("line-{}", i)).collect();
+    postcard::to_allocvec(&((chunk, 0u64, 2u64), "title".to_string())).unwrap()
+}
+
+#[test]
+fn verify_step_record_inputs_accepts_declared_chunk_sizes() {
+    let cfs_cursor = chunked_recur_cfs(Some(2));
+    // Full chunk and short (final) chunk are both valid per-step.
+    for elements in [2usize, 1] {
+        let witness = recur_iteration_input_bytes(elements);
+        verify_step_record_inputs(
+            &cfs_cursor,
+            &recur_iteration_step(0),
+            None,
+            None,
+            Some(&witness),
+        );
+    }
+}
+
+#[test]
+fn verify_step_record_inputs_ignores_chunking_when_not_declared() {
+    let cfs_cursor = chunked_recur_cfs(None);
+    // Without a declared chunk no witness is required for iteration steps.
+    verify_step_record_inputs(&cfs_cursor, &recur_iteration_step(0), None, None, None);
+}
+
+#[test]
+#[should_panic(expected = "exceeds declared chunk size")]
+fn verify_step_record_inputs_rejects_oversized_chunk() {
+    let cfs_cursor = chunked_recur_cfs(Some(2));
+    let witness = recur_iteration_input_bytes(3);
+    verify_step_record_inputs(
+        &cfs_cursor,
+        &recur_iteration_step(0),
+        None,
+        None,
+        Some(&witness),
+    );
+}
+
+#[test]
+#[should_panic(expected = "empty chunk")]
+fn verify_step_record_inputs_rejects_empty_chunk() {
+    let cfs_cursor = chunked_recur_cfs(Some(2));
+    let witness = recur_iteration_input_bytes(0);
+    verify_step_record_inputs(
+        &cfs_cursor,
+        &recur_iteration_step(0),
+        None,
+        None,
+        Some(&witness),
+    );
+}
+
+#[test]
+#[should_panic(expected = "missing its input witness")]
+fn verify_step_record_inputs_requires_witness_for_declared_chunk() {
+    let cfs_cursor = chunked_recur_cfs(Some(2));
+    verify_step_record_inputs(&cfs_cursor, &recur_iteration_step(0), None, None, None);
 }
 
 #[test]

@@ -62,6 +62,8 @@ pub struct CallInfo {
     pub result_binding: Option<String>,
     /// Which canonical call primitive produced this call.
     pub call_kind: CallKind,
+    /// Static chunk size from `call_recur! { ..., chunk = N }`, if declared.
+    pub chunk: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -312,7 +314,7 @@ impl CallVisitor {
     /// is a comma-separated list; the first token is the callee identifier.
     fn parse_call_macro_args(
         mac: &syn::Macro,
-    ) -> Option<(String, Vec<String>, Vec<CallArgumentKind>)> {
+    ) -> Option<(String, Vec<String>, Vec<CallArgumentKind>, Option<u64>)> {
         if matches!(Self::macro_call_kind(mac), Some(CallKind::RecursiveTile)) {
             return Self::parse_recur_call_macro_args(mac);
         }
@@ -320,7 +322,8 @@ impl CallVisitor {
             Self::macro_call_kind(mac),
             Some(CallKind::RecursiveSequence)
         ) {
-            return Self::parse_recur_sequence_call_macro_args(mac);
+            return Self::parse_recur_sequence_call_macro_args(mac)
+                .map(|(callee, args, kinds)| (callee, args, kinds, None));
         }
 
         // Parse the macro tokens as a punctuated sequence of expressions.
@@ -345,15 +348,19 @@ impl CallVisitor {
             .map(|expr| Self::classify_argument(expr))
             .collect();
 
-        Some((callee, arguments, argument_kinds))
+        Some((callee, arguments, argument_kinds, None))
     }
 
     fn parse_recur_call_macro_args(
         mac: &syn::Macro,
-    ) -> Option<(String, Vec<String>, Vec<CallArgumentKind>)> {
+    ) -> Option<(String, Vec<String>, Vec<CallArgumentKind>, Option<u64>)> {
         struct RecurCallInput {
             tile: syn::Ident,
             input: Expr,
+            // Chunk size is a call-site control parameter, not a tile input:
+            // it groups iterations but binds no data source, so it is pinned
+            // into the CFS item and excluded from the extracted arguments.
+            chunk: Option<Expr>,
             state: Option<Expr>,
             output: Option<Expr>,
             args: syn::punctuated::Punctuated<Expr, Token![,]>,
@@ -371,6 +378,24 @@ impl CallVisitor {
             Ok(())
         }
 
+        fn parse_optional_named_expr(
+            input: ParseStream,
+            expected: &str,
+        ) -> syn::Result<Option<Expr>> {
+            if !input.peek(syn::Ident) {
+                return Ok(None);
+            }
+            let fork = input.fork();
+            let ident: syn::Ident = fork.parse()?;
+            if ident != expected {
+                return Ok(None);
+            }
+            parse_named_key(input, expected)?;
+            let expr: Expr = input.parse()?;
+            input.parse::<Token![,]>()?;
+            Ok(Some(expr))
+        }
+
         impl Parse for RecurCallInput {
             fn parse(input: ParseStream) -> syn::Result<Self> {
                 parse_named_key(input, "tile")?;
@@ -381,35 +406,9 @@ impl CallVisitor {
                 let input_expr: Expr = input.parse()?;
                 input.parse::<Token![,]>()?;
 
-                let state = if input.peek(syn::Ident) {
-                    let fork = input.fork();
-                    let ident: syn::Ident = fork.parse()?;
-                    if ident == "state" {
-                        parse_named_key(input, "state")?;
-                        let state_expr: Expr = input.parse()?;
-                        input.parse::<Token![,]>()?;
-                        Some(state_expr)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-
-                let output = if input.peek(syn::Ident) {
-                    let fork = input.fork();
-                    let ident: syn::Ident = fork.parse()?;
-                    if ident == "output" {
-                        parse_named_key(input, "output")?;
-                        let output_expr: Expr = input.parse()?;
-                        input.parse::<Token![,]>()?;
-                        Some(output_expr)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
+                let chunk = parse_optional_named_expr(input, "chunk")?;
+                let state = parse_optional_named_expr(input, "state")?;
+                let output = parse_optional_named_expr(input, "output")?;
 
                 parse_named_key(input, "args")?;
                 let content;
@@ -420,6 +419,7 @@ impl CallVisitor {
                 Ok(Self {
                     tile,
                     input: input_expr,
+                    chunk,
                     state,
                     output,
                     args,
@@ -428,6 +428,21 @@ impl CallVisitor {
         }
 
         let parsed = syn::parse2::<RecurCallInput>(mac.tokens.clone()).ok()?;
+        // The chunk size lands in the CFS, so it must be statically known:
+        // only integer literals are accepted.
+        let chunk = parsed.chunk.map(|expr| match &expr {
+            Expr::Lit(expr_lit) => match &expr_lit.lit {
+                syn::Lit::Int(int_lit) => int_lit
+                    .base10_parse::<u64>()
+                    .expect("call_recur! chunk literal does not fit in u64"),
+                _ => panic!(
+                    "call_recur! `chunk = ...` must be an integer literal so it can be pinned in the CFS"
+                ),
+            },
+            _ => panic!(
+                "call_recur! `chunk = ...` must be an integer literal so it can be pinned in the CFS"
+            ),
+        });
         let mut arguments = vec![Self::expr_to_string(&parsed.input)];
         let mut argument_kinds = vec![Self::classify_argument(&parsed.input)];
 
@@ -446,7 +461,7 @@ impl CallVisitor {
             argument_kinds.push(Self::classify_argument(&expr));
         }
 
-        Some((parsed.tile.to_string(), arguments, argument_kinds))
+        Some((parsed.tile.to_string(), arguments, argument_kinds, chunk))
     }
 
     fn parse_recur_sequence_call_macro_args(
@@ -666,7 +681,7 @@ impl<'ast> Visit<'ast> for CallVisitor {
 
     fn visit_expr_macro(&mut self, node: &'ast ExprMacro) {
         if let Some(call_kind) = Self::macro_call_kind(&node.mac) {
-            if let Some((callee, arguments, argument_kinds)) =
+            if let Some((callee, arguments, argument_kinds, chunk)) =
                 Self::parse_call_macro_args(&node.mac)
             {
                 let result_binding = self.current_binding.take();
@@ -676,6 +691,7 @@ impl<'ast> Visit<'ast> for CallVisitor {
                     argument_kinds,
                     result_binding,
                     call_kind,
+                    chunk,
                 });
                 // Do not recurse into the macro body — arguments are already captured above.
                 return;
@@ -692,7 +708,7 @@ impl<'ast> Visit<'ast> for CallVisitor {
         // which does NOT trigger `visit_expr_macro`. We handle them here so that statement-
         // position `call!` and `call_seq!` invocations are captured without a binding.
         if let Some(call_kind) = Self::macro_call_kind(&node.mac) {
-            if let Some((callee, arguments, argument_kinds)) =
+            if let Some((callee, arguments, argument_kinds, chunk)) =
                 Self::parse_call_macro_args(&node.mac)
             {
                 // current_binding is None here — bare statements have no let binding.
@@ -702,6 +718,7 @@ impl<'ast> Visit<'ast> for CallVisitor {
                     argument_kinds,
                     result_binding: None,
                     call_kind,
+                    chunk,
                 });
                 return;
             }
@@ -783,6 +800,39 @@ mod tests {
         assert_eq!(calls[0].call_kind, CallKind::RecursiveTile);
         assert_eq!(calls[0].result_binding.as_deref(), Some("result"));
         assert_eq!(calls[0].arguments.len(), 3);
+    }
+
+    #[test]
+    fn test_call_recur_chunked_macro_extraction() {
+        // `chunk = N` is a control parameter: the call must still be
+        // discovered, chunk must not appear among the extracted arguments,
+        // and the literal value must be captured for CFS pinning.
+        let calls = parse_calls(
+            "fn seq() { let result = call_recur!(tile = collect, input = items, chunk = 2, output = new!(Doc), args = (title,)); }",
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].callee, "collect");
+        assert_eq!(calls[0].call_kind, CallKind::RecursiveTile);
+        assert_eq!(calls[0].result_binding.as_deref(), Some("result"));
+        assert_eq!(calls[0].arguments, vec!["items", "new ! (Doc)", "title"]);
+        assert_eq!(calls[0].chunk, Some(2));
+    }
+
+    #[test]
+    fn test_call_recur_without_chunk_has_no_chunk() {
+        let calls = parse_calls(
+            "fn seq() { let result = call_recur!(tile = build, input = items, output = new!(Doc), args = (needle,)); }",
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].chunk, None);
+    }
+
+    #[test]
+    #[should_panic(expected = "must be an integer literal")]
+    fn test_call_recur_rejects_non_literal_chunk() {
+        parse_calls(
+            "fn seq() { let result = call_recur!(tile = collect, input = items, chunk = size, output = new!(Doc), args = (title,)); }",
+        );
     }
 
     #[test]

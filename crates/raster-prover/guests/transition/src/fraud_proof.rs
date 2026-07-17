@@ -278,6 +278,7 @@ impl LiveTransition {
             &input.step_record,
             input.input_source_witness.as_ref(),
             input.sequence_scope_witness.as_ref(),
+            input.input_witness.as_ref(),
         );
         if let StepKind::ProgramStart(program_start) = &input.step_record.kind {
             self.entrypoint_authorization = checks::entrypoint::verify_step(

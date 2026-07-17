@@ -109,6 +109,7 @@ impl FlowResolver {
                 CallKind::RecursiveTile => SequenceChildItem::RecurTile(RecurTileItem {
                     id: call.callee.clone(),
                     sources: input_sources,
+                    chunk: call.chunk,
                 }),
                 CallKind::RecursiveSequence => {
                     SequenceChildItem::RecurSequence(RecurSequenceItem {
@@ -315,6 +316,7 @@ mod tests {
                         root: "name".to_string(),
                     }],
                     call_kind: CallKind::Tile,
+                    chunk: None,
                 },
                 CallInfo {
                     callee: "exclaim".to_string(),
@@ -324,6 +326,7 @@ mod tests {
                         root: "greeting".to_string(),
                     }],
                     call_kind: CallKind::Tile,
+                    chunk: None,
                 },
             ],
         );
@@ -398,6 +401,7 @@ mod tests {
                 arguments: vec!["\"Raster\".to_string()".to_string()],
                 argument_kinds: vec![CallArgumentKind::Inline],
                 call_kind: CallKind::Tile,
+                chunk: None,
             }],
         );
 
@@ -460,6 +464,7 @@ mod tests {
                         root: "personal_data".to_string(),
                     }],
                     call_kind: CallKind::Tile,
+                    chunk: None,
                 },
                 CallInfo {
                     callee: "exclaim".to_string(),
@@ -469,6 +474,7 @@ mod tests {
                         root: "greeting".to_string(),
                     }],
                     call_kind: CallKind::Tile,
+                    chunk: None,
                 },
             ],
         );
@@ -544,6 +550,7 @@ mod tests {
                     root: "name".to_string(),
                 }],
                 call_kind: CallKind::Tile,
+                chunk: None,
             }],
             vec![("name".to_string(), "personal_data".to_string())],
         );
@@ -596,6 +603,7 @@ mod tests {
                     root: "seed".to_string(),
                 }],
                 call_kind: CallKind::Tile,
+                chunk: None,
             }],
             vec![("seed".to_string(), "seed".to_string())],
         );
@@ -642,6 +650,7 @@ mod tests {
                 arguments: vec!["\"Rust\".to_string()".to_string()],
                 argument_kinds: vec![CallArgumentKind::Inline],
                 call_kind: CallKind::Tile,
+                chunk: None,
             }],
         );
         let sequence = Sequence {

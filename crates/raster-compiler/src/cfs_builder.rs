@@ -236,6 +236,7 @@ mod tests {
                     root: "personal_data".to_string(),
                 }],
                 call_kind: CallKind::Tile,
+                chunk: None,
             }],
         );
         let sequence = Sequence {
@@ -294,6 +295,7 @@ mod tests {
                 arguments: vec!["\"Raster\".to_string()".to_string()],
                 argument_kinds: vec![CallArgumentKind::Inline],
                 call_kind: CallKind::Tile,
+                chunk: None,
             }],
         );
         let sequence = Sequence {

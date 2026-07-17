@@ -105,6 +105,27 @@ fn main(personal_data: PersonalData, personal_data_bin: PersonalData, seed: u64)
     call!(concat_messages, draft_title, first_draft_line);
 
     let address_lines = select!(Vec<String>, personal_data_bin.clone().addresses[0].lines);
+
+    // Phase 1: select a contiguous slice of address lines as ONE authenticated
+    // input. `lines[0..2]` yields a single SelectionCommitment, so the tile
+    // records a single external binding for the whole slice.
+    let first_two_lines =
+        select!(Vec<String>, personal_data_bin.clone().addresses[0].lines[0..2]);
+    let joined_lines = call!(join_address_lines, first_two_lines);
+    println!("joined address slice: {:?}", joined_lines);
+
+    // Phase 1: iterate the flat line list in chunks of 2. Each recur iteration
+    // receives a `Vec<String>` chunk instead of a single line, so the loop runs
+    // ceil(len / 2) times while the source stays a single authenticated binding.
+    let chunked_greeting = call_recur!(
+        tile = collect_line_chunk,
+        input = address_lines.clone(),
+        chunk = 2,
+        output = new!(CollectiveGreeting),
+        args = ("Chunked greeting".to_string(),)
+    );
+    println!("chunked recur greeting: {:?}", chunked_greeting);
+
     let recur_greeting = call_recur!(
         tile = build_recur_draft_greeting,
         input = address_lines.clone(),

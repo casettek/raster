@@ -597,6 +597,11 @@ pub struct TileItem {
 pub struct RecurTileItem {
     pub id: TileId,
     pub sources: Vec<InputBinding>,
+    /// Static chunk size from `call_recur! { ..., chunk = N }`: each iteration
+    /// consumes a contiguous group of N source elements (the final group may be
+    /// shorter). `None` means per-element iteration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunk: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -694,6 +699,7 @@ mod tests {
                     SequenceChildItem::RecurTile(RecurTileItem {
                         id: "recur".to_string(),
                         sources: vec![],
+                        chunk: None,
                     }),
                     SequenceChildItem::Tile(TileItem {
                         id: "after".to_string(),
