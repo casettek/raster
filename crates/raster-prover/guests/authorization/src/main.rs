@@ -42,7 +42,7 @@ fn build_authorization_journal(input: &ManifestedInputs) -> AuthorizationJournal
     // declares), so unconsumed manifest entries are inert.
     AuthorizationJournal {
         external_inputs_commitments: parse_external_input_commitments(&input.manifest_bytes),
-        manifest_commitment: sha256_bytes(&input.manifest_bytes),
+        input_manifest_commitment: sha256_bytes(&input.manifest_bytes),
     }
 }
 
@@ -91,7 +91,7 @@ mod tests {
         let first = build_authorization_journal(&input);
         let second = build_authorization_journal(&input);
 
-        assert_eq!(first.manifest_commitment, second.manifest_commitment);
+        assert_eq!(first.input_manifest_commitment, second.input_manifest_commitment);
     }
 
     #[test]

@@ -9,7 +9,7 @@ use crate::flow_resolver::FlowResolver;
 use crate::sequence::{Sequence, SequenceDiscovery};
 use crate::tile::TileDiscovery;
 use crate::Project;
-use raster_core::Result;
+use raster_core::{Error, Result};
 
 /// Builds a control flow schema from a Raster project.
 pub struct CfsBuilder<'a> {
@@ -33,7 +33,7 @@ impl<'a> CfsBuilder<'a> {
         let sequence_discovery = SequenceDiscovery::new(self.project, &tile_discovery);
 
         // Build tile definitions
-        let tiles: Vec<TileDef> = tile_discovery
+        let mut tiles: Vec<TileDef> = tile_discovery
             .tiles
             .iter()
             .map(|t| {
@@ -49,6 +49,18 @@ impl<'a> CfsBuilder<'a> {
             let seq_def = self.build_sequence_def(seq)?;
             sequences.push(seq_def);
         }
+
+        // Canonicalize: the CFS is the control-flow half of a program's
+        // identity (see docs/proposals/program-identity.md), so its byte form
+        // must be reproducible regardless of the filesystem order in which
+        // tiles and sequences were discovered (`WalkDir` does not sort). Sort
+        // both by id and reject duplicate ids — a duplicate would make a name
+        // ambiguous in the identity registry. `SequenceDef::items` order is
+        // semantic (coordinates index into it) and is left untouched.
+        tiles.sort_by(|a, b| a.id.cmp(&b.id));
+        sequences.sort_by(|a, b| a.id.cmp(&b.id));
+        assert_unique_ids("tile", tiles.iter().map(|t| t.id.as_str()))?;
+        assert_unique_ids("sequence", sequences.iter().map(|s| s.id.as_str()))?;
 
         Ok(ControlFlowSchema {
             version: "1.0".to_string(),
@@ -107,6 +119,21 @@ impl<'a> CfsBuilder<'a> {
             produces_output,
         })
     }
+}
+
+/// Reject duplicate ids in a (already sorted) id sequence, naming the kind
+/// (`tile`/`sequence`) and the offending id in the error.
+fn assert_unique_ids<'a>(kind: &str, ids: impl Iterator<Item = &'a str>) -> Result<()> {
+    let mut prev: Option<&str> = None;
+    for id in ids {
+        if prev == Some(id) {
+            return Err(Error::Other(format!(
+                "duplicate {kind} id '{id}' — {kind} ids must be unique to form a program identity"
+            )));
+        }
+        prev = Some(id);
+    }
+    Ok(())
 }
 
 /// Whether a return-type string denotes a non-unit value. `None` (no return
@@ -273,6 +300,56 @@ mod tests {
             }
             other => panic!("Expected a Tile item, got {:?}", other),
         }
+    }
+
+    fn project_with_tile_functions(names: &[&str]) -> Project {
+        let functions = names
+            .iter()
+            .map(|name| tile_function(name))
+            .collect::<Vec<_>>();
+        Project {
+            name: "test".to_string(),
+            ast: ProjectAst {
+                name: "test".to_string(),
+                root_path: PathBuf::from("/test"),
+                functions,
+            },
+            root_dir: PathBuf::from("/test"),
+            output_dir: PathBuf::from("/test/target/raster"),
+            target_dir: PathBuf::from("/test/target/"),
+        }
+    }
+
+    #[test]
+    fn build_sorts_tiles_by_id_regardless_of_discovery_order() {
+        // Two projects whose tile functions are discovered in opposite orders
+        // (mimicking two filesystems' WalkDir orders) must produce byte-identical
+        // CFS tile lists — the reproducibility property program identity needs.
+        let forward = CfsBuilder::new(&project_with_tile_functions(&["alpha", "zeta", "mid"]))
+            .build()
+            .unwrap();
+        let reversed = CfsBuilder::new(&project_with_tile_functions(&["zeta", "mid", "alpha"]))
+            .build()
+            .unwrap();
+
+        let ids: Vec<&str> = forward.tiles.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, vec!["alpha", "mid", "zeta"], "tiles sorted by id");
+        assert_eq!(
+            forward.tiles.iter().map(|t| &t.id).collect::<Vec<_>>(),
+            reversed.tiles.iter().map(|t| &t.id).collect::<Vec<_>>(),
+            "discovery order must not affect the canonical tile order",
+        );
+    }
+
+    #[test]
+    fn build_rejects_duplicate_tile_ids() {
+        let err = CfsBuilder::new(&project_with_tile_functions(&["dup", "dup"]))
+            .build()
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("duplicate tile id 'dup'"),
+            "expected duplicate-id error, got: {err}"
+        );
     }
 
     #[test]

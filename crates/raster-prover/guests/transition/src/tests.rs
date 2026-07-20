@@ -95,7 +95,7 @@ fn authorization_journal(binding_name: &str, commitment: &[u8]) -> Authorization
         external_inputs_commitments: [(binding_name.to_string(), commitment.to_vec())]
             .into_iter()
             .collect(),
-        manifest_commitment: vec![7; 32],
+        input_manifest_commitment: vec![7; 32],
     }
 }
 
@@ -795,6 +795,7 @@ fn verify_draft_transition_tracks_multi_step_chain() {
     let mut active_drafts = BTreeMap::new();
 
     let step_one = TileReplayJournal {
+        input_commitment: [0u8; 32],
         output_bytes: Vec::new(),
         draft_transition: Some(DraftReplayTransition {
             draft_id,
@@ -839,6 +840,7 @@ fn verify_draft_transition_tracks_multi_step_chain() {
         ],
     };
     let step_two = TileReplayJournal {
+        input_commitment: [0u8; 32],
         output_bytes: Vec::new(),
         draft_transition: Some(DraftReplayTransition {
             draft_id,
@@ -884,6 +886,7 @@ fn verify_draft_transition_rejects_wrong_root_before() {
     verify_draft_transition(
         &draft_tile_step(1),
         Some(&TileReplayJournal {
+            input_commitment: [0u8; 32],
             output_bytes: Vec::new(),
             draft_transition: Some(DraftReplayTransition {
                 draft_id,
@@ -913,6 +916,7 @@ fn verify_draft_transition_rejects_wrong_schema_hash() {
     verify_draft_transition(
         &draft_tile_step(1),
         Some(&TileReplayJournal {
+            input_commitment: [0u8; 32],
             output_bytes: Vec::new(),
             draft_transition: Some(DraftReplayTransition {
                 draft_id: [3; 32],
@@ -939,6 +943,7 @@ fn verify_draft_transition_rejects_tampered_pre_state_witness() {
     verify_draft_transition(
         &draft_tile_step(1),
         Some(&TileReplayJournal {
+            input_commitment: [0u8; 32],
             output_bytes: Vec::new(),
             draft_transition: Some(DraftReplayTransition {
                 draft_id: [6; 32],
@@ -1002,7 +1007,7 @@ fn two_arg_authorization_journal(
         ]
         .into_iter()
         .collect(),
-        manifest_commitment: vec![7; 32],
+        input_manifest_commitment: vec![7; 32],
     }
 }
 

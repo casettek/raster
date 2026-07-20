@@ -16,10 +16,11 @@ use std::collections::BTreeMap;
 use bridgetree::NonEmptyFrontier;
 use risc0_zkvm::guest::env;
 
-use raster_core::cfs::{CfsCoordinates, CfsCursor, ControlFlowSchema};
+use raster_core::cfs::{CfsCoordinates, CfsCursor};
 use raster_core::draft::{DraftId, TrackedDraftState};
 use raster_core::fingerprint::{Fingerprint, FingerprintAccumulator};
-use raster_core::trace::{StepKind, StepRecord};
+use raster_core::program::{commitment_of_bytes, ImageId, ProgramDefinition};
+use raster_core::trace::{ExecStep, ExecTarget, StepKind, StepRecord};
 use raster_core::transition::{
     EntrypointAuthorization, InitTransition, OutputAuthorization, Transition, TransitionInput,
     TransitionJournal, TransitionState,
@@ -32,21 +33,58 @@ use crate::merkle_tree::{
 
 /// Public parameters every step of the fraud proof runs under.
 pub struct PublicParams {
+    /// The program being proven, decoded from its `program.bin` frame. Its
+    /// tile registry is the source of truth for each tile step's expected
+    /// image id (see `docs/proposals/program-identity.md`).
+    pub program: ProgramDefinition,
+    /// `sha256(domain || program.bin)` — derived from the exact frame bytes
+    /// this guest verifies against, committed to the journal, and asserted
+    /// continuous across the window.
+    pub program_commitment: Vec<u8>,
     pub cfs_cursor: CfsCursor,
     pub transition_image_id: Vec<u8>,
 }
 
 impl PublicParams {
-    /// Reads the leading host inputs. The host write order is: cfs,
-    /// transition image id, transition input, transition state, and — only
-    /// for `Next` steps — the previous journal (read in [`FraudProofWindowContext`]).
+    /// Reads the leading host inputs. The host write order is: the program
+    /// definition frame (`program.bin` bytes), transition image id, transition
+    /// input, transition state, and — only for `Next` steps — the previous
+    /// journal (read in [`FraudProofWindowContext`]).
+    ///
+    /// The frame is hashed *before* decoding, so the committed
+    /// `program_commitment` is bound to the exact bytes verified against — a
+    /// host cannot name one program and verify against another.
     pub fn read() -> Self {
-        let cfs: ControlFlowSchema = env::read();
+        let program_bytes: Vec<u8> = env::read();
+        let program_commitment = commitment_of_bytes(&program_bytes).to_vec();
+        let program = ProgramDefinition::decode(&program_bytes)
+            .expect("host must supply a valid ProgramDefinition frame");
         let transition_image_id: Vec<u8> = env::read();
+        let cfs_cursor = CfsCursor::new(program.cfs.clone());
         Self {
-            cfs_cursor: CfsCursor::new(cfs),
+            program,
+            program_commitment,
+            cfs_cursor,
             transition_image_id,
         }
+    }
+}
+
+/// The registry image id for a tile step, or `None` for a step that carries no
+/// replay proof. Panics if a tile step's id is absent from the program
+/// registry — an unregistered tile cannot be proven.
+fn expected_tile_image_id<'a>(
+    program: &'a ProgramDefinition,
+    step_record: &StepRecord,
+) -> Option<&'a ImageId> {
+    match &step_record.kind {
+        StepKind::Exec(ExecStep {
+            target: ExecTarget::Tile(name),
+            ..
+        }) => Some(program.tile_image_id(name).unwrap_or_else(|| {
+            panic!("tile '{name}' has no image id in the program registry")
+        })),
+        _ => None,
     }
 }
 
@@ -118,6 +156,7 @@ impl FraudProofWindowContext {
                 verify_previous_journal(&prev_journal, &params.transition_image_id);
                 assert_state_continuity(&prev_journal, &transition);
                 assert_manifest_continuity(&prev_journal, input);
+                assert_program_continuity(&prev_journal, params);
 
                 let live = LiveTransition::resume(
                     &transition,
@@ -168,8 +207,19 @@ fn assert_state_continuity(prev_journal: &TransitionJournal, transition: &Transi
 /// Every step of the fraud proof must be authorized against the same manifest.
 fn assert_manifest_continuity(prev_journal: &TransitionJournal, input: &TransitionInput) {
     assert!(
-        input.authorization_journal.manifest_commitment == prev_journal.manifest_commitment,
+        input.authorization_journal.input_manifest_commitment
+            == prev_journal.input_manifest_commitment,
         "Manifest commitment does not match"
+    );
+}
+
+/// Every step of the fraud proof must prove execution of the same program —
+/// the frame this step verifies against must hash to the previous journal's
+/// committed program identity.
+fn assert_program_continuity(prev_journal: &TransitionJournal, params: &PublicParams) {
+    assert!(
+        params.program_commitment == prev_journal.program_commitment,
+        "Program commitment does not match across the fraud-proof window"
     );
 }
 
@@ -272,7 +322,12 @@ impl LiveTransition {
     /// - the step's coordinates are among the expected next coordinates,
     /// - the draft chain stays continuous,
     /// - the step record is appended to the trace frontier and fingerprint.
-    pub fn apply_verified_step(mut self, cfs_cursor: &CfsCursor, input: &TransitionInput) -> Self {
+    pub fn apply_verified_step(
+        mut self,
+        program: &ProgramDefinition,
+        cfs_cursor: &CfsCursor,
+        input: &TransitionInput,
+    ) -> Self {
         checks::cfs::verify_step_record_inputs(
             cfs_cursor,
             &input.step_record,
@@ -305,7 +360,7 @@ impl LiveTransition {
         }
         checks::io::verify_step_record(
             &input.step_record,
-            input.replay_image_id.as_ref(),
+            expected_tile_image_id(program, &input.step_record),
             input.replay_journal.as_ref(),
             input.input_witness.as_ref(),
             input.output_witness.as_ref(),
@@ -412,6 +467,7 @@ pub fn commit_journal(
     init_state: InitTransition,
     current_state: TransitionState,
     transition_image_id: Vec<u8>,
+    program_commitment: Vec<u8>,
     input: &TransitionInput,
     entrypoint_authorization: EntrypointAuthorization,
     output_authorization: OutputAuthorization,
@@ -421,7 +477,8 @@ pub fn commit_journal(
         current_state,
         transition_image_id,
         authorization_image_id: input.authorization_image_id.clone(),
-        manifest_commitment: input.authorization_journal.manifest_commitment.clone(),
+        input_manifest_commitment: input.authorization_journal.input_manifest_commitment.clone(),
+        program_commitment,
         entrypoint_authorization,
         output_authorization,
     };

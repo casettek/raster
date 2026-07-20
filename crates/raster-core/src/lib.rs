@@ -19,6 +19,7 @@ pub mod draft;
 pub mod error;
 pub mod fingerprint;
 pub mod input;
+pub mod program;
 pub mod tile;
 pub mod trace;
 
@@ -38,6 +39,9 @@ pub use error::{Error, Result};
 
 // Re-export postcard for tile ABI serialization (no_std compatible)
 pub use postcard;
+
+// Re-export sha2 so generated tile code can commit its input hash (no_std)
+pub use sha2;
 
 // Re-export bincode for std-only code that needs it
 #[cfg(feature = "std")]

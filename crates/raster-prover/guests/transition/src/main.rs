@@ -41,7 +41,7 @@ fn main() {
     let (window_context, current) = FraudProofWindowContext::proceed(&params, &input, state);
 
     // Verify every recorded aspect of the step and advance the state.
-    let next = current.apply_verified_step(&params.cfs_cursor, &input);
+    let next = current.apply_verified_step(&params.program, &params.cfs_cursor, &input);
     let entrypoint_authorization = next.entrypoint_authorization();
     let output_authorization = next.output_authorization();
 
@@ -55,6 +55,7 @@ fn main() {
         window_context.init_state,
         current_state,
         params.transition_image_id,
+        params.program_commitment,
         &input,
         entrypoint_authorization,
         output_authorization,

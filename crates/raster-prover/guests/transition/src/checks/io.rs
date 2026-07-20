@@ -56,7 +56,7 @@ pub fn verify_authorization_journal(
 
 pub fn verify_step_record(
     step_record: &StepRecord,
-    replay_image_id: Option<&Vec<u8>>,
+    expected_image_id: Option<&[u8; 32]>,
     replay_journal: Option<&raster_core::draft::TileReplayJournal>,
 
     input_witness_bytes: Option<&Vec<u8>>,
@@ -80,11 +80,15 @@ pub fn verify_step_record(
     }
 
     if step_record.requires_replay_proof() {
-        let replay_image_id =
-            replay_image_id.expect("replay image id should be provided for tile execution should ");
+        // The expected image id comes from the program's committed tile
+        // registry (resolved by the caller from the step's tile id), never
+        // from a host-supplied field — this is what binds the replayed binary
+        // to the tile the step claims to run. See program-identity.md.
+        let expected_image_id =
+            expected_image_id.expect("tile step must resolve a registry image id");
         let replay_journal =
             replay_journal.expect("tile execution should provide a replay journal witness");
-        let replay_image_id_digest = risc0_zkvm::sha::Digest::try_from(replay_image_id.as_slice())
+        let replay_image_id_digest = risc0_zkvm::sha::Digest::try_from(expected_image_id.as_slice())
             .expect("image_id must be 32 bytes");
         let replay_journal_bytes = postcard::to_allocvec(replay_journal)
             .expect("Failed to encode replay journal for receipt verification");
@@ -95,6 +99,16 @@ pub fn verify_step_record(
             replay_journal.output_bytes.as_slice(),
             output_bytes,
             "Replay journal output bytes do not match recorded tile output witness",
+        );
+        // Bind the replay to the *recorded* input: the tile guest committed
+        // `sha256(its input)`, which must equal the hash of the recorded input
+        // witness. Without this the proof shows only that `output` is some
+        // output of the binary, not that `binary(recorded input) = output`.
+        let input_bytes = input_witness_bytes.map(Vec::as_slice).unwrap_or(&[]);
+        assert_eq!(
+            replay_journal.input_commitment.as_slice(),
+            sha256_bytes(input_bytes).as_slice(),
+            "Replay journal input commitment does not match recorded tile input witness",
         );
     }
 }

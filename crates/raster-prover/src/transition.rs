@@ -69,25 +69,23 @@ fn build_transition_input(
         .cloned()
         .unwrap_or_else(|| panic!("Missing recorded I/O for transition step {:?}", step_record));
 
-    let (replay_image_id, replay_journal) = if step_record.requires_replay_proof() {
+    // The expected image id is no longer shipped to the guest; it resolves the
+    // image id from the committed program registry keyed by the step's tile id.
+    let replay_journal = if step_record.requires_replay_proof() {
         let replay_result = replayed_results.get(step_record).unwrap_or_else(|| {
             panic!(
                 "Replayed result not found for transition step {:?}",
                 step_record
             )
         });
-        (
-            Some(replay_result.image_id.clone()),
-            Some(replay_result.replay_journal.clone()),
-        )
+        Some(replay_result.replay_journal.clone())
     } else {
-        (None, None)
+        None
     };
 
     TransitionInput {
         step_record: step_record.clone(),
         authorization_image_id: authorization_guest_image_id(),
-        replay_image_id,
         replay_journal,
         input_witness,
         output_witness,
@@ -156,7 +154,10 @@ pub fn step_transitions(
     initial_storage_index_root: &[u8],
     trace_window: &[StepRecord],
     fingerprint: Fingerprint,
-    cfs: &ControlFlowSchema,
+    // The canonical `program.bin` frame (bytes of the `ProgramDefinition`),
+    // written to the guest, which hashes it to derive `program_commitment` and
+    // decodes it for the CFS + tile registry. See program-identity.md.
+    program_frame: &[u8],
     input_sources_witnesses: &HashMap<StepRecord, Vec<u8>>,
     recorded_step_io: &RecordedStepIo,
     replayed_results: &HashMap<StepRecord, ReplayResult>,
@@ -223,7 +224,7 @@ pub fn step_transitions(
             });
             builder.add_assumption(transition_receipt);
         }
-        builder.write(&cfs).unwrap();
+        builder.write(&program_frame.to_vec()).unwrap();
         builder.write(&transition_image_id).unwrap();
         builder.write(&input).unwrap();
         builder.write(&current_state).unwrap();
@@ -305,7 +306,7 @@ mod tests {
             )]
             .into_iter()
             .collect(),
-            manifest_commitment: vec![4; 32],
+            input_manifest_commitment: vec![4; 32],
         }
     }
 
@@ -343,6 +344,7 @@ mod tests {
                     input: vec![1],
                     output: vec![11],
                     replay_journal: TileReplayJournal {
+                        input_commitment: [0u8; 32],
                         output_bytes: vec![11],
                         draft_transition: None,
                     },
@@ -357,6 +359,7 @@ mod tests {
                     input: vec![2],
                     output: vec![22],
                     replay_journal: TileReplayJournal {
+                        input_commitment: [0u8; 32],
                         output_bytes: vec![22],
                         draft_transition: None,
                     },
@@ -373,7 +376,11 @@ mod tests {
             None,
         );
 
-        assert_eq!(input.replay_image_id, Some(vec![7; 32]));
+        // The right replayed result is selected by step-record key.
+        assert_eq!(
+            input.replay_journal.as_ref().unwrap().output_bytes,
+            vec![22]
+        );
         assert_eq!(input.input_witness, Some(vec![2]));
         assert_eq!(input.output_witness, Some(vec![22]));
         assert_eq!(input.authorization_journal, make_authorization_journal());
@@ -397,6 +404,7 @@ mod tests {
                 input: vec![9],
                 output: error_output.clone(),
                 replay_journal: TileReplayJournal {
+                    input_commitment: [0u8; 32],
                     output_bytes: error_output.clone(),
                     draft_transition: None,
                 },
@@ -412,7 +420,10 @@ mod tests {
             None,
         );
 
-        assert_eq!(input.replay_image_id, Some(vec![5; 32]));
+        assert_eq!(
+            input.replay_journal.as_ref().unwrap().output_bytes,
+            error_output
+        );
         assert_eq!(input.input_witness, Some(vec![9]));
         assert_eq!(input.output_witness, Some(error_output));
     }
@@ -458,11 +469,11 @@ mod tests {
             None,
         );
 
-        assert_eq!(start_input.replay_image_id, None);
+        assert!(start_input.replay_journal.is_none());
         assert_eq!(start_input.input_witness, Some(vec![3, 4]));
         assert_eq!(start_input.output_witness, None);
 
-        assert_eq!(end_input.replay_image_id, None);
+        assert!(end_input.replay_journal.is_none());
         assert_eq!(end_input.input_witness, None);
         assert_eq!(end_input.output_witness, Some(vec![5, 6]));
     }
@@ -497,6 +508,23 @@ mod tests {
         cfs
     }
 
+    /// The `program.bin` frame for a minimal program (no tiles, unit main).
+    fn make_minimal_program_frame() -> Vec<u8> {
+        let manifest = raster_core::program::ProgramManifest {
+            name: "test".to_string(),
+            version: "0.0.0".to_string(),
+            inputs: Default::default(),
+            output: None,
+        };
+        raster_core::program::ProgramDefinition::assemble(
+            manifest,
+            make_minimal_cfs(),
+            Default::default(),
+        )
+        .expect("minimal program definition")
+        .canonical_bytes()
+    }
+
     fn make_sequence_start_step() -> StepRecord {
         StepRecord {
             exec_index: 1,
@@ -520,7 +548,6 @@ mod tests {
         let input = TransitionInput {
             step_record: make_sequence_start_step(),
             authorization_image_id: authorization_guest_image_id(),
-            replay_image_id: None,
             replay_journal: None,
             input_witness: Some(b"sequence-in".to_vec()),
             output_witness: None,
@@ -548,7 +575,7 @@ mod tests {
         if let Some(receipt) = authorization_receipt {
             builder.add_assumption(receipt);
         }
-        builder.write(&make_minimal_cfs()).unwrap();
+        builder.write(&make_minimal_program_frame()).unwrap();
         builder.write(&image_id_bytes(TRANSITION_GUEST_ID)).unwrap();
         builder.write(&input).unwrap();
         builder.write(&state).unwrap();
@@ -586,7 +613,7 @@ mod tests {
             authorize_external_inputs(&ManifestedInputs {
                 manifest_bytes: Vec::new(),
             });
-        authorization.manifest_commitment = vec![9; 32];
+        authorization.input_manifest_commitment = vec![9; 32];
 
         assert!(prove_single_transition_with_authorization(
             authorization,

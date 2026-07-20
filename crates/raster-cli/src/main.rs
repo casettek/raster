@@ -3,6 +3,7 @@
 //! Provides commands for building, running, and analyzing Raster tiles.
 
 mod commands;
+mod program;
 mod utils;
 
 use clap::{Parser, ValueEnum};
@@ -125,6 +126,13 @@ enum Commands {
         /// Output file path (default: target/raster/cfs.json)
         #[arg(long, short)]
         output: Option<String>,
+    },
+
+    /// Show the program's identity (commitment, interface, tile registry)
+    Program {
+        /// Recompute from source and check against Raster.lock
+        #[arg(long)]
+        verify: bool,
     },
 
     /// Run the user program
@@ -269,6 +277,7 @@ fn try_main() -> Result<()> {
             verify,
         } => commands::run_sequence(backend, &sequence, input.as_deref(), prove, verify),
         Commands::Cfs { output } => commands::cfs(output),
+        Commands::Program { verify } => commands::program(verify),
         Commands::Run {
             backend,
             input,

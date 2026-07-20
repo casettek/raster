@@ -152,8 +152,75 @@ pub fn build(backend_type: BackendType, tile: Option<String>) -> Result<()> {
     //     }
     // }
 
+    // For the risc0 backend, emit the program identity artifacts: the
+    // canonical `program.bin` frame and the `Raster.lock` claim (see
+    // docs/proposals/program-identity.md). The native backend has no image
+    // ids, so there is nothing to pin.
+    if matches!(backend_type, BackendType::Risc0) {
+        emit_program_artifacts(&project)?;
+    }
+
     println!();
     println!("Build complete!");
+    Ok(())
+}
+
+/// Assemble the program's `ProgramDefinition` and write `program.bin` +
+/// `Raster.lock`.
+fn emit_program_artifacts(project: &Project) -> Result<()> {
+    use raster_prover::replay::Replayer;
+
+    let cfs = CfsBuilder::new(project).build()?;
+    let risc0 = Risc0Backend::new(project.output_dir.clone())
+        .with_user_crate(project.root_dir.clone());
+    let replayer = Replayer::new(&risc0, project);
+    let program = crate::program::assemble_program(project, &cfs, &replayer)?;
+    let (bin_path, lock_path) =
+        crate::program::write_program_artifacts(project, &program, &project.output_dir)?;
+
+    println!();
+    println!("Program identity: {}", hex::encode(program.commitment()));
+    println!("  frame: {}", bin_path.display());
+    println!("  lock:  {}", lock_path.display());
+    Ok(())
+}
+
+/// Program command: assemble and print the program's identity; with `--verify`,
+/// recompute it from source and check it against `Raster.lock`.
+pub fn program(verify: bool) -> Result<()> {
+    use raster_prover::replay::Replayer;
+
+    let project = Project::new(project_path())?;
+    let cfs = CfsBuilder::new(&project).build()?;
+    let risc0 = Risc0Backend::new(project.output_dir.clone())
+        .with_user_crate(project.root_dir.clone());
+    let replayer = Replayer::new(&risc0, &project);
+
+    let program = if verify {
+        crate::program::reassemble_and_verify(&project, &cfs, &replayer)?
+    } else {
+        crate::program::assemble_program(&project, &cfs, &replayer)?
+    };
+
+    println!("Program:  {}", program.manifest.name);
+    println!("Version:  {}", program.manifest.version);
+    println!("Identity: {}", hex::encode(program.commitment()));
+    println!("Inputs:");
+    for (name, decl) in &program.manifest.inputs {
+        println!("  {name}: {} ({:?})", decl.type_path, decl.encoding);
+    }
+    match &program.manifest.output {
+        Some(out) => println!("Output:   {} ({:?})", out.type_path, out.encoding),
+        None => println!("Output:   (none)"),
+    }
+    println!("Tiles ({}):", program.tiles.len());
+    for (id, image_id) in &program.tiles {
+        println!("  {id}: {}", hex::encode(image_id));
+    }
+    if verify {
+        println!();
+        println!("Verified against Raster.lock ✓");
+    }
     Ok(())
 }
 

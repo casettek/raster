@@ -3,6 +3,9 @@
 Status: proposed (2026-07-17)
 Companion to: [`program-start.md`](./program-start.md), [`program-end.md`](./program-end.md)
 (both implemented)
+Depends on: [`program-identity.md`](./program-identity.md) (proposed) — supplies the
+`program_commitment` this proposal's checkpoints name; supersedes the CFS-hash sketch
+below (see the note under Design).
 
 ## Problem
 
@@ -129,11 +132,27 @@ Design decisions taken:
 
 ## Design
 
+> **Superseded by [`program-identity.md`](./program-identity.md).** This proposal
+> originally defined program identity as `sha256` of the canonical CFS bytes. That is
+> insufficient (the CFS is code-blind — it names tiles but commits no tile code) and
+> unsound as stated (the tile replay image id was host-supplied and unbound).
+> `program-identity.md` replaces it with `program_commitment = sha256("raster/program/v1"
+> || postcard(ProgramDefinition))`, where `ProgramDefinition { manifest, cfs, tiles }`
+> bundles the `Raster.toml` interface, the canonical CFS, and the tile image-id registry,
+> serialized to a `program.bin` artifact. Everywhere below that says "hash of the CFS" or
+> `ControlFlowSchema::commitment()`, read "hash of the `ProgramDefinition` bytes
+> (`program.bin`)". The byte-frame / hash-then-decode / `assert_program_continuity`
+> mechanics are unchanged — only the *contents* of the committed bytes grow. Identity
+> verification (below) accordingly has two modes: **light** (recompute one `sha256` over
+> a supplied `program.bin`) and **deep** (rebuild `ProgramDefinition` from source + the
+> pinned risc0 toolchain and byte-compare).
+
 ### 1. `raster-core`
 
-- `cfs.rs`: `ControlFlowSchema::canonical_bytes() -> Vec<u8>` (deterministic postcard
-  encoding — `CfsBuilder` already produces a canonical value per program) and
-  `commitment() -> Vec<u8>` (`sha256(canonical_bytes())`).
+- Program identity lives on `ProgramDefinition` (`program.rs`), per
+  `program-identity.md`: `canonical_bytes()` (the `program.bin` content) and
+  `commitment()` (`sha256(domain-prefix || canonical_bytes())`). The CFS is one of its
+  three parts; there is no standalone `ControlFlowSchema::commitment()`.
 - `input.rs`: promote `parse_subtree_root` to a small public wrapper,
   `pub fn payload_structural_root(bytes: &[u8]) -> Option<Hash32>`, so both the CLI's
   chain verifier and any external verifier can recompute the manifest-side hash from
@@ -144,33 +163,37 @@ Design decisions taken:
 ### 2. Transition guest (`crates/raster-prover/guests/transition`)
 
 - `PublicParams::read()` (`fraud_proof.rs`) changes from `env::read::<ControlFlowSchema>()`
-  to reading a raw byte frame, `sha256`-ing it to produce `program_commitment`, then
-  postcard-decoding the `ControlFlowSchema` from those same bytes — mirroring exactly
-  how the authorization guest derives `manifest_commitment` from `manifest_bytes`. This
-  means the journal commits to the actual bytes the guest verified against, not a
-  host-supplied claim.
+  to reading a raw byte frame (the `program.bin` bytes), `sha256`-ing it to produce
+  `program_commitment`, then postcard-decoding the `ProgramDefinition` (CFS + tile
+  registry + manifest) from those same bytes — mirroring exactly how the authorization
+  guest derives `manifest_commitment` from `manifest_bytes`. This means the journal
+  commits to the actual bytes the guest verified against, not a host-supplied claim. The
+  decoded tile registry is what closes the replay-image-id hole (see
+  `program-identity.md`).
 - `commit_journal` sets `TransitionJournal.program_commitment`.
 - `Next`-step verification gains `assert_program_continuity` (sibling of
   `assert_manifest_continuity`): `input`'s program bytes hash must equal
   `prev_journal.program_commitment`. A fraud receipt therefore names
-  `(program_commitment, manifest_commitment, init_state.fingerprint)` — enough to
+  `(program_commitment, input_manifest_commitment, init_state.fingerprint)` — enough to
   attribute it to exactly one stage of exactly one chain run.
 - Host side (`crates/raster-prover/src/transition.rs`): the CFS write to the guest
   environment changes from a typed `builder.write(&cfs)` to a byte-frame write of the
-  same canonical bytes `canonical_bytes()` produces, so host and guest agree on what was
-  hashed.
+  `program.bin` bytes `ProgramDefinition::canonical_bytes()` produces, so host and guest
+  agree on what was hashed.
 
 ### 3. `raster-prover` host (`src/trace.rs`, new `src/chain.rs`)
 
-- `TraceCommitment` gains `program_commitment: Vec<u8>` and `manifest_commitment: Vec<u8>`
-  (same values the journal now carries) — a commit file becomes self-naming: which
-  program, which authorized inputs, which trace.
+- `TraceCommitment` gains `program_commitment: Vec<u8>` and
+  `input_manifest_commitment: Vec<u8>` (same values the journal now carries;
+  `input_manifest_commitment` is the `manifest_commitment` rename from
+  `program-identity.md`) — a commit file becomes self-naming: which program, which
+  authorized inputs, which trace.
 - New `chain.rs`:
   ```rust
   pub struct StageCheckpoint {
       pub name: String,
       pub program_commitment: Vec<u8>,
-      pub manifest_commitment: Vec<u8>,
+      pub input_manifest_commitment: Vec<u8>,     // sha256(input_manifest bytes)
       pub input_bindings: BTreeMap<String, InputBindingSource>, // param -> External | Chained { stage }
       pub output_payload_commitment: Vec<u8>,     // sha256(output.bin) == ProgramEnd.output_commitment
       pub output_structural_commitment: Vec<u8>,  // payload_structural_root(output.bin)
@@ -188,10 +211,12 @@ Design decisions taken:
   `output_structural_commitment` catches an artifact that was swapped or corrupted after
   the stage ran (closes the "artifact written by an untrusted process" gap — the chain
   verifier never trusts the file, only recomputes from it).
-- Identity verification: `program_commitment` for stage N must equal
-  `ControlFlowSchema::commitment()` of the program declared for stage N in `chain.json`
-  (built the same way `cargo raster run` already builds a CFS for that project) — this
-  is what stops a chain from silently swapping in a different program at some stage.
+- Identity verification (per `program-identity.md`): `program_commitment` for stage N
+  must equal the identity of the program declared for stage N in `chain.json` — checked
+  in **light** mode (`sha256` over that stage's supplied `program.bin`) or **deep** mode
+  (reassemble `ProgramDefinition` from source + the pinned toolchain in the stage's
+  `Raster.lock`, and byte-compare). This is what stops a chain from silently swapping in
+  a different program at some stage.
 
 ### 4. `raster-cli`
 
@@ -259,9 +284,9 @@ ProgramEnd   []  -> output.bin  ─┐            ProgramEnd   []  -> output.bin
                     root ────────┘    (authorization-journal-verified)
 
 ChainCommitment = [
-  StageCheckpoint { name: "summarize", program_commitment, manifest_commitment,
+  StageCheckpoint { name: "summarize", program_commitment, input_manifest_commitment,
                      output_payload_commitment, output_structural_commitment, trace_commitment },
-  StageCheckpoint { name: "expand",    program_commitment, manifest_commitment,
+  StageCheckpoint { name: "expand",    program_commitment, input_manifest_commitment,
                      input_bindings: { summary: Chained("summarize"), ... }, ... },
 ]
 ```
@@ -286,7 +311,7 @@ Three distinguishable failure classes:
    given the program source, the same way link fraud is checkable given the artifact.
 3. **Intra-stage fraud** — the existing `FraudEvidence` window / transition-guest fraud
    proof, unchanged, now stage-attributable via `(program_commitment,
-   manifest_commitment, init_state.fingerprint)`.
+   input_manifest_commitment, init_state.fingerprint)`.
 
 What cannot be attested: a stage that errors or panics publishes no `ProgramEnd` and no
 artifact (unchanged `program-end.md` success-only decision) — the stage is simply
@@ -324,7 +349,7 @@ audited* trace, so this doesn't change.
 
 ## Implementation order
 
-1. `raster-core`: `ControlFlowSchema::canonical_bytes()`/`commitment()`; public
+1. `raster-core`: `ProgramDefinition` identity (`program-identity.md`); public
    `payload_structural_root`; `TransitionJournal.program_commitment`.
 2. `raster-prover` host: CFS byte-frame write; `TraceCommitment` naming fields.
 3. Transition guest: hash-then-decode `PublicParams::read`; `program_commitment` in
@@ -353,7 +378,7 @@ audited* trace, so this doesn't change.
 - Negative: tamper stage-1's `output.bin` after the run (link check fails, publicly, no
   proving needed); bit-flip a mid-stage step via the existing `random_bit_flip.sh`
   workflow (the existing fraud proof still concludes, and its journal's
-  `(program_commitment, manifest_commitment, fingerprint)` matches the stage checkpoint
+  `(program_commitment, input_manifest_commitment, fingerprint)` matches the stage checkpoint
   that named it); point a chain stage at a different program binary than the one its
   checkpoint claims (identity check fails); a chain stage whose `main` returns `()` but
   is not the last stage (rejected before execution, per `main_produces_output()` check).

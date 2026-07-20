@@ -70,34 +70,44 @@ fn has_coordinate_prefix(coordinates: &CfsCoordinates, prefix: &CfsCoordinates) 
 /// `SequenceEnd`) never reach this check: they sit at the sequence root,
 /// which is not a CFS item.
 fn record_matches_item(step_record: &StepRecord, cfs_item: &SequenceChildItem) -> bool {
+    // The trace carries names (fingerprinted, so tamper-evident) but the guest
+    // must also *bind* them: the recorded target name must equal the CFS item
+    // id at the step's coordinates. Without this the coordinate → tile-id
+    // resolution the registry lookup relies on could be steered by a
+    // mislabelled record. See program-identity.md.
     match (&step_record.kind, cfs_item) {
         (
             StepKind::Exec(ExecStep {
-                target: ExecTarget::Tile(_),
+                target: ExecTarget::Tile(name),
                 ..
             }),
-            SequenceChildItem::Tile(_),
-        ) => true,
+            SequenceChildItem::Tile(item),
+        ) => name == &item.id,
         (
             StepKind::Exec(ExecStep {
-                target: ExecTarget::RecurTile(_),
+                target: ExecTarget::RecurTile(name),
                 ..
             }),
-            SequenceChildItem::RecurTile(_),
-        ) => true,
+            SequenceChildItem::RecurTile(item),
+        ) => name == &item.id,
         (
             StepKind::Exec(ExecStep {
-                target: ExecTarget::RecurSequence(_),
+                target: ExecTarget::RecurSequence(name),
                 ..
             }),
-            SequenceChildItem::RecurSequence(_),
-        ) => true,
+            SequenceChildItem::RecurSequence(item),
+        ) => name == &item.id,
         // A nested sequence is entered and left at its own item coordinate,
-        // whether it is an ordinary or a recur sequence.
+        // whether it is an ordinary or a recur sequence. The entered
+        // sequence's name is carried on the step record.
         (
             StepKind::SequenceStart { .. } | StepKind::SequenceEnd { .. },
-            SequenceChildItem::Sequence(_) | SequenceChildItem::RecurSequence(_),
-        ) => true,
+            SequenceChildItem::Sequence(item),
+        ) => step_record.sequence_id == item.id,
+        (
+            StepKind::SequenceStart { .. } | StepKind::SequenceEnd { .. },
+            SequenceChildItem::RecurSequence(item),
+        ) => step_record.sequence_id == item.id,
         _ => false,
     }
 }

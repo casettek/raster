@@ -106,7 +106,10 @@ pub struct StorageWitness {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransitionInput {
     pub step_record: StepRecord,
-    pub replay_image_id: Option<Vec<u8>>,
+    /// The tile replay journal for an execution step. The expected image id is
+    /// no longer carried here (it was host-supplied and unbound); the guest
+    /// resolves it from the program registry keyed by the step's tile id. See
+    /// `docs/proposals/program-identity.md`.
     pub replay_journal: Option<TileReplayJournal>,
 
     pub input_witness: Option<Vec<u8>>,
@@ -232,7 +235,13 @@ pub struct TransitionJournal {
     pub current_state: TransitionState,
     pub transition_image_id: Vec<u8>,
     pub authorization_image_id: Vec<u8>,
-    pub manifest_commitment: Vec<u8>,
+    pub input_manifest_commitment: Vec<u8>,
+
+    /// `sha256(domain || program.bin)` — the identity of the program this
+    /// chain proves execution of. Derived in-guest from the `ProgramDefinition`
+    /// frame bytes, and asserted continuous across `Next` steps. See
+    /// `docs/proposals/program-identity.md`.
+    pub program_commitment: Vec<u8>,
 
     /// Whether this chain has tied `main`'s entry-argument binding to the
     /// authorization journal — established when the window opens (from a

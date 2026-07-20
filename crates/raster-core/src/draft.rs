@@ -36,6 +36,13 @@ pub struct DraftReplayTransition {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct TileReplayJournal {
+    /// `sha256` of the raw input bytes the tile was replayed on. Committed by
+    /// the tile guest so the replay proof self-certifies *what it ran on*: the
+    /// transition guest asserts this equals the hash of the recorded input
+    /// witness, binding the proof to `B(recorded input) = output` rather than
+    /// to `output` being merely some output of `B`. See
+    /// `docs/proposals/program-identity.md`.
+    pub input_commitment: [u8; 32],
     pub output_bytes: Vec<u8>,
     pub draft_transition: Option<DraftReplayTransition>,
 }

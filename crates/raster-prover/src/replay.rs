@@ -43,6 +43,29 @@ impl<'a> Replayer<'a> {
         Self { backend, project }
     }
 
+    /// The project this replayer resolves tiles against.
+    pub fn project(&self) -> &Project {
+        self.project
+    }
+
+    /// Compile a tile and return its 32-byte image id, without executing it.
+    /// Used to assemble the program's tile registry (see program-identity.md).
+    pub fn tile_image_id(&self, tile_id: &str) -> Result<[u8; 32]> {
+        let discovery = TileDiscovery::new(self.project);
+        let tile = discovery.get(tile_id).ok_or_else(|| {
+            Error::InvalidTileId(format!("Tile '{}' not found in project", tile_id))
+        })?;
+        let content_hash = tile.to_content_hash();
+        let artifact = self
+            .backend
+            .compile_tile(&tile.to_metadata(), content_hash)?;
+        let bytes = hex::decode(artifact.artifact_id())
+            .map_err(|e| Error::Other(format!("Tile image id is not valid hex: {e}")))?;
+        bytes
+            .try_into()
+            .map_err(|_| Error::Other("Tile image id must be 32 bytes".into()))
+    }
+
     /// Replay a single trace item.
     ///
     /// This method:

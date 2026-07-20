@@ -707,6 +707,18 @@ fn build_storage_selection_witnesses(
         .collect()
 }
 
+/// Assemble the canonical `program.bin` frame for the fraud-proof guest by
+/// reassembling the `ProgramDefinition` from source (CFS + compiled tile
+/// registry + `Raster.toml`/synthesized manifest) and verifying it against
+/// `Raster.lock` if present (the stale-lock drift check). Every window step
+/// uses this same frame, so `program_commitment` continuity holds by
+/// construction. See `docs/proposals/program-identity.md`.
+fn build_program_frame(cfs: &ControlFlowSchema, replayer: &Replayer) -> Vec<u8> {
+    crate::program::reassemble_and_verify(replayer.project(), cfs, replayer)
+        .unwrap_or_else(|e| panic!("Failed to assemble program definition: {e}"))
+        .canonical_bytes()
+}
+
 pub fn prove(
     fraud_evidence: FraudEvidence,
     trace: &Trace,
@@ -929,13 +941,15 @@ pub fn prove(
         println!();
         println!("Replaying transition frontier with transition guest...");
 
+        let program_frame = build_program_frame(cfs, replayer);
+
         let Some(receipt) = step_transitions(
             &frontier,
             &initial_storage_state.frontier,
             &initial_storage_state.coordinate_index.root(),
             &fraud_window.items,
             fraud_window.fingerprint,
-            &cfs,
+            &program_frame,
             &input_sources_witnesses,
             &recorded_step_io,
             &replayed_results,

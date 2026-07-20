@@ -1040,7 +1040,13 @@ fn gen_replay_output_serialization(kind: &ProtocolReturnKind) -> proc_macro2::To
         let __raster_output_bytes = ::raster::core::postcard::to_allocvec(&result)
             .map_err(|e| ::raster::core::Error::Serialization(::raster::alloc::format!("Failed to serialize output: {}", e)))?;
         #replay_transition_binding
+        let __raster_input_commitment: [u8; 32] =
+            <::raster::core::sha2::Sha256 as ::raster::core::sha2::Digest>::digest(
+                __raster_replay_input_bytes,
+            )
+            .into();
         let replay_output = ::raster::core::draft::TileReplayJournal {
+            input_commitment: __raster_input_commitment,
             output_bytes: __raster_output_bytes,
             draft_transition: __raster_draft_transition,
         };
@@ -2211,6 +2217,11 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         #[doc(hidden)]
         pub fn #function_replay_wrapper_name(input: &[u8]) -> ::raster::core::Result<::raster::alloc::vec::Vec<u8>> {
+            // Capture the raw input bytes before `#inputs_deserialization` may
+            // shadow `input` with a typed value: the replay journal commits
+            // `sha256` of exactly these bytes (see program-identity.md).
+            let __raster_replay_input_bytes: &[u8] = input;
+
             #inputs_deserialization
 
             #function_call
