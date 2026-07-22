@@ -1,21 +1,11 @@
 use hello_tiles::input::{Address, PersonalData};
-use raster::core::postcard;
-use sha2::{Digest, Sha256};
 use std::error::Error;
 use std::fs;
 use std::path::PathBuf;
 
-fn sha256_hex(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    let mut out = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        out.push_str(&format!("{:02x}", byte));
-    }
-    out
-}
-
 fn main() -> Result<(), Box<dyn Error>> {
     let out_dir = PathBuf::from(std::env::args().nth(1).unwrap_or_else(|| ".".to_string()));
+    fs::create_dir_all(&out_dir)?;
 
     let data = PersonalData {
         age: 25,
@@ -31,26 +21,35 @@ fn main() -> Result<(), Box<dyn Error>> {
             },
         ],
     };
+    let seed: u64 = 123;
 
-    let postcard_bytes = postcard::to_allocvec(&data)?;
-    let postcard_hash = sha256_hex(&postcard_bytes);
-    let bin_path = out_dir.join("personal_data.bin");
-    let seed_path = out_dir.join("seed.bin");
-    let seed_bytes = postcard::to_allocvec(&123u64)?;
-    let seed_hash = sha256_hex(&seed_bytes);
+    // `main`'s entry arguments here are selected into (fields, whole
+    // objects) both in-process and by the commit/audit pipeline's
+    // cross-process fraud-proof recorder — raster encoding is required for
+    // the latter, since its `.rindex` is self-describing (postcard entry
+    // arguments only support in-process selection; see
+    // `raster_runtime::tracing::recorder`).
+    let personal_data_commitment = raster::write_raster_files(
+        &data,
+        &out_dir.join("personal_data.rastered"),
+        &out_dir.join("personal_data.rindex"),
+    )?;
+    let seed_commitment = raster::write_raster_files(
+        &seed,
+        &out_dir.join("seed.rastered"),
+        &out_dir.join("seed.rindex"),
+    )?;
+
     let input_path = out_dir.join("input.json");
     let manifest_path = out_dir.join("input_manifest.json");
 
-    fs::create_dir_all(&out_dir)?;
-    fs::write(&bin_path, postcard_bytes)?;
-    fs::write(&seed_path, &seed_bytes)?;
     fs::write(
         &input_path,
         concat!(
             "{\n",
-            "  \"personal_data\": { \"path\": \"personal_data.bin\", \"load_preference\": \"read\" },\n",
-            "  \"personal_data_bin\": { \"path\": \"personal_data.bin\", \"load_preference\": \"mmap\" },\n",
-            "  \"seed\": { \"path\": \"seed.bin\", \"load_preference\": \"read\" }\n",
+            "  \"personal_data\": { \"path\": \"personal_data.rastered\", \"index_path\": \"personal_data.rindex\", \"load_preference\": \"read\" },\n",
+            "  \"personal_data_bin\": { \"path\": \"personal_data.rastered\", \"index_path\": \"personal_data.rindex\", \"load_preference\": \"mmap\" },\n",
+            "  \"seed\": { \"path\": \"seed.rastered\", \"index_path\": \"seed.rindex\", \"load_preference\": \"read\" }\n",
             "}\n"
         ),
     )?;
@@ -59,17 +58,17 @@ fn main() -> Result<(), Box<dyn Error>> {
         format!(
             concat!(
                 "{{\n",
-                "  \"personal_data\": {{ \"type\": \"sha256\", \"encoding\": \"postcard\", \"commitment\": \"{}\" }},\n",
-                "  \"personal_data_bin\": {{ \"type\": \"sha256\", \"encoding\": \"postcard\", \"commitment\": \"{}\" }},\n",
-                "  \"seed\": {{ \"type\": \"sha256\", \"encoding\": \"postcard\", \"commitment\": \"{}\" }}\n",
+                "  \"personal_data\": {{ \"type\": \"sha256\", \"encoding\": \"raster\", \"commitment\": \"{}\" }},\n",
+                "  \"personal_data_bin\": {{ \"type\": \"sha256\", \"encoding\": \"raster\", \"commitment\": \"{}\" }},\n",
+                "  \"seed\": {{ \"type\": \"sha256\", \"encoding\": \"raster\", \"commitment\": \"{}\" }}\n",
                 "}}\n"
             ),
-            postcard_hash, postcard_hash, seed_hash
+            personal_data_commitment, personal_data_commitment, seed_commitment
         ),
     )?;
 
-    println!("Wrote {}", bin_path.display());
-    println!("Wrote {}", seed_path.display());
+    println!("Wrote {}", out_dir.join("personal_data.rastered").display());
+    println!("Wrote {}", out_dir.join("seed.rastered").display());
     println!("Wrote {}", input_path.display());
     println!("Wrote {}", manifest_path.display());
 

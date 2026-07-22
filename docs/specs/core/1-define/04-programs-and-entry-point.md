@@ -65,9 +65,7 @@ This document specifies how Raster “programs” are defined for the Core toolc
 
 #### External inputs (what they are)
 
-- External inputs are values provided by the execution environment (CLI, host application, test harness) to satisfy:
-  - Explicit external references requested from user code (for example via `external!(...)`), and/or
-  - Any **unbound** arguments within a sequence’s call graph (see “Current gaps” for how this is handled today).
+- External inputs are values provided by the execution environment (CLI, host application, test harness) to satisfy the declared parameters of the `main` entry sequence (its *entry arguments*). There is no per-use external binding primitive: user code never references a named external input directly; it receives entry arguments as ordinary typed bindings on `main` and selects/forwards them like any other internal value.
 
 - At the Core ABI boundary for tiles, external inputs MUST be represented as an opaque byte string that is decoded using the Postcard encoding (`postcard::from_bytes`).
 
@@ -75,7 +73,7 @@ This document specifies how Raster “programs” are defined for the Core toolc
 
 - Referenced external files MUST contain Postcard-serialized values. The public `input_manifest.json` commitment is the SHA-256 hash of the raw file bytes.
 
-- Selecting a sub-value from a Postcard external requires a typed root binding (for example `external!(RootType, "name")`) so the runtime can decode the root value before applying the selector.
+- Selecting a sub-value from a Postcard entry argument requires the argument's declared Rust type on `main` so the runtime can decode the root value before applying the selector. Raster-encoded entry arguments are self-describing (`.rindex`) and additionally support cross-process selection witnesses in the commit/audit pipeline; Postcard entry arguments are limited to in-process use.
 
 #### External inputs to tiles (tile ABI rules)
 
@@ -215,13 +213,13 @@ fn greet(name: String) -> String {
 }
 
 #[sequence]
-fn main() -> String {
-    let name = select!(String, external!(String, "name"));
-    greet(name)
+fn main(name: String) {
+    let name = select!(String, name);
+    call!(greet, name);
 }
 ```
 
-In this model, the program entry point is the sequence ID `"main"` (the function name), not Rust’s `fn main()` host entry.
+In this model, the program entry point is the sequence ID `"main"` (the function name), not Rust’s `fn main()` host entry. `main`'s declared parameters are its entry arguments: each is bound at startup from the manifest-declared external inputs of the same name (see `SequenceChildItem::Entrypoint` in the CFS), and the binding is authorized against the manifest commitment in the fraud-proof pipeline.
 
 #### Example: tile external input encoding (single arg vs tuple)
 

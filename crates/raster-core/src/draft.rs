@@ -36,6 +36,13 @@ pub struct DraftReplayTransition {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct TileReplayJournal {
+    /// `sha256` of the raw input bytes the tile was replayed on. Committed by
+    /// the tile guest so the replay proof self-certifies *what it ran on*: the
+    /// transition guest asserts this equals the hash of the recorded input
+    /// witness, binding the proof to `B(recorded input) = output` rather than
+    /// to `output` being merely some output of `B`. See
+    /// `docs/proposals/program-identity.md`.
+    pub input_commitment: [u8; 32],
     pub output_bytes: Vec<u8>,
     pub draft_transition: Option<DraftReplayTransition>,
 }
@@ -501,22 +508,30 @@ pub fn draft_value_payload_and_root(value: &DraftValue) -> Result<(Vec<u8>, Vec<
     match value {
         DraftValue::Unit => Ok((vec![0x03], selection_hash(&[b"unit"]))),
         DraftValue::Struct(fields) => {
+            // Field names go into both the payload and the root hash: a
+            // draft's root must be indistinguishable from the selection-tree
+            // root of the same data (that equality is what lets a finalized
+            // draft be selected into like any other object), so this must
+            // track `input::assemble_subtree` exactly. Sharing
+            // `struct_commitments_root` is what keeps that true.
             let mut payload = Vec::new();
             payload.push(0x01);
             push_u64(&mut payload, fields.len() as u64);
             let mut child_roots = Vec::with_capacity(fields.len());
-            for (_, child) in fields {
+            for (name, child) in fields {
                 let (child_payload, child_root) = draft_value_payload_and_root(child)?;
+                push_u64(&mut payload, name.len() as u64);
+                payload.extend_from_slice(name.as_bytes());
                 push_u64(&mut payload, child_payload.len() as u64);
                 payload.extend_from_slice(&child_payload);
-                child_roots.push(child_root);
+                child_roots.push((name.as_str(), child_root));
             }
-            let mut parts: Vec<&[u8]> = Vec::with_capacity(child_roots.len() + 1);
-            parts.push(b"struct");
-            for root in &child_roots {
-                parts.push(root.as_slice());
-            }
-            Ok((payload, selection_hash(&parts)))
+            let root = crate::input::struct_commitments_root(
+                child_roots
+                    .iter()
+                    .map(|(name, root)| (*name, root.as_slice())),
+            );
+            Ok((payload, root.to_vec()))
         }
         DraftValue::List(values) => {
             let mut payload = Vec::new();

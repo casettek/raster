@@ -5,12 +5,21 @@
 //! - `#[sequence]` - Declares tile ordering and control flow. When the function is named `main`,
 //!   it is the program entry point and gets init and finish automatically.
 
+mod entrypoint;
+mod recur;
+
 use proc_macro::TokenStream;
 use quote::{format_ident, quote, ToTokens};
 use syn::{
     parse::{Parse, ParseStream},
     parse_macro_input, Attribute, Expr, ExprField, ExprIndex, FnArg, GenericArgument, ItemFn,
     LitInt, Pat, Path, PathArguments, ReturnType, Token, Type,
+};
+
+use crate::entrypoint::prepend_entry_argument_prelude;
+use crate::recur::{
+    gen_recur_driver_function, gen_recur_sequence_driver_function,
+    gen_recur_sequence_step_function, validate_recur_sequence_shape, validate_recur_tile_shape,
 };
 
 #[derive(Clone)]
@@ -301,10 +310,6 @@ fn rewrite_into_auth_value_args(sig: &mut syn::Signature) {
     }
 }
 
-fn external_info_ident(param: &ParamInfo) -> syn::Ident {
-    format_ident!("__raster_external_info_{}", param.ident)
-}
-
 fn internal_info_ident(param: &ParamInfo) -> syn::Ident {
     format_ident!("__raster_internal_info_{}", param.ident)
 }
@@ -329,7 +334,6 @@ fn gen_auth_value_materialization(input: &ItemFn) -> proc_macro2::TokenStream {
         .map(|param| {
             let name = &param.ident;
             let protocol_kind = param_protocol_kind(&param.ty);
-            let external_info_ident = external_info_ident(param);
             let internal_info_ident = internal_info_ident(param);
             match protocol_kind {
                 ParamProtocolKind::AuthValue(value_ty) => {
@@ -341,23 +345,18 @@ fn gen_auth_value_materialization(input: &ItemFn) -> proc_macro2::TokenStream {
                             let __raster_auth_value_duration_ns =
                                 ::core::primitive::u64::try_from(__raster_auth_value_start.elapsed().as_nanos())
                                     .unwrap_or(::core::primitive::u64::MAX);
-                            if __raster_auth_value.as_external().is_some() {
-                                __raster_external_input_resolve_ns = __raster_external_input_resolve_ns
-                                    .saturating_add(__raster_auth_value_duration_ns);
-                            } else if __raster_auth_value.as_internal().is_some() {
-                                __raster_internal_input_resolve_ns = __raster_internal_input_resolve_ns
+                            if __raster_auth_value.as_storage().is_some() {
+                                __raster_storage_input_resolve_ns = __raster_storage_input_resolve_ns
                                     .saturating_add(__raster_auth_value_duration_ns);
                             }
-                            let #external_info_ident = __raster_auth_value.as_external().cloned();
-                            let #internal_info_ident = __raster_auth_value.as_internal().cloned();
+                            let #internal_info_ident = __raster_auth_value.as_storage().cloned();
                             let #name: #value_ty = __raster_auth_value.into_inner();
                         }
                     } else {
                         quote! {
                             let __raster_auth_value = ::raster::into_auth_value::<#value_ty, _>(#name)
                                 .unwrap_or_else(|e| panic!("Failed to materialize auth value for argument '{}': {}", stringify!(#name), e));
-                            let #external_info_ident = __raster_auth_value.as_external().cloned();
-                            let #internal_info_ident = __raster_auth_value.as_internal().cloned();
+                            let #internal_info_ident = __raster_auth_value.as_storage().cloned();
                             let #name: #value_ty = __raster_auth_value.into_inner();
                         }
                     }
@@ -366,8 +365,7 @@ fn gen_auth_value_materialization(input: &ItemFn) -> proc_macro2::TokenStream {
                     let schema_ty = draft_param_schema(param).expect("draft schema type");
                     quote! {
                         let #name: #value_ty = ::raster::into_draft::<#schema_ty, _>(#name);
-                        let #external_info_ident: ::core::option::Option<::raster::ExternalValue<#value_ty>> = ::core::option::Option::None;
-                        let #internal_info_ident: ::core::option::Option<::raster::InternalValue<#value_ty>> = ::core::option::Option::None;
+                        let #internal_info_ident: ::core::option::Option<::raster::StorageValue<#value_ty>> = ::core::option::Option::None;
                     }
                 },
             }
@@ -387,14 +385,12 @@ fn gen_sequence_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream 
         .map(|param| {
             let name = &param.ident;
             let trace_value_ident = format_ident!("__raster_input_value_{}", name);
-            let external_info_ident = external_info_ident(param);
             let internal_info_ident = internal_info_ident(param);
             quote! {
                 let __raster_auth_trace = ::raster::auth_ref_trace(&#name)
                     .unwrap_or_else(|e| panic!("Failed to trace sequence argument '{}': {}", stringify!(#name), e));
                 let #trace_value_ident = __raster_auth_trace.value;
-                let #external_info_ident = __raster_auth_trace.external;
-                let #internal_info_ident = __raster_auth_trace.internal;
+                let #internal_info_ident = __raster_auth_trace.storage;
             }
         })
         .collect();
@@ -436,22 +432,6 @@ fn gen_sequence_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream 
         }
     };
 
-    let external_binding_entries: Vec<_> = params
-        .iter()
-        .map(|param| {
-            let name_str = param.ident.to_string();
-            let external_info_ident = external_info_ident(param);
-            quote! {
-                if let ::core::option::Option::Some(__raster_external_info) = &#external_info_ident {
-                    __raster_external.insert(
-                        ::raster::alloc::string::String::from(#name_str),
-                        __raster_external_info.clone(),
-                    );
-                }
-            }
-        })
-        .collect();
-
     let internal_binding_entries: Vec<_> = params
         .iter()
         .map(|param| {
@@ -477,8 +457,6 @@ fn gen_sequence_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream 
 
         #input_bytes
 
-        let mut __raster_external = ::raster::alloc::collections::BTreeMap::new();
-        #(#external_binding_entries)*
         let mut __raster_internal = ::raster::alloc::collections::BTreeMap::new();
         #(#internal_binding_entries)*
 
@@ -487,8 +465,7 @@ fn gen_sequence_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream 
                 data: __raster_input_bytes,
                 values: ::raster::alloc::vec![#(#trace_values.clone()),*],
                 args: __raster_input_args,
-                external: __raster_external,
-                internal: __raster_internal,
+                storage: __raster_internal,
             }
         );
     }
@@ -517,24 +494,20 @@ fn gen_recur_sequence_input_serialization(input: &ItemFn) -> proc_macro2::TokenS
         .map(|param| {
             let name = &param.ident;
             let trace_value_ident = format_ident!("__raster_input_value_{}", name);
-            let external_info_ident = external_info_ident(param);
             let internal_info_ident = internal_info_ident(param);
             if recur_sequence_input_inner_type(&param.ty).is_some() {
                 quote! {
                     let __raster_auth_trace = #name.__raster_auth_trace()
                         .unwrap_or_else(|e| panic!("Failed to trace recursive sequence input '{}': {}", stringify!(#name), e));
                     let #trace_value_ident = __raster_auth_trace.value;
-                    let #external_info_ident = __raster_auth_trace.external;
-                    let #internal_info_ident = __raster_auth_trace.internal;
+                    let #internal_info_ident = __raster_auth_trace.storage;
                 }
             } else if let Some(schema_ty) = draft_param_schema(param) {
                 quote! {
                     let #trace_value_ident = ::raster::core::trace::FnInputValue::Inline(
                         ::raster::serialize_draft_replay_handle::<#schema_ty>(&#name)
                     );
-                    let #external_info_ident: ::core::option::Option<::raster::core::trace::ExternalData> =
-                        ::core::option::Option::None;
-                    let #internal_info_ident: ::core::option::Option<::raster::core::trace::InternalData> =
+                    let #internal_info_ident: ::core::option::Option<::raster::core::trace::StorageData> =
                         ::core::option::Option::None;
                 }
             } else if recur_sequence_output_inner_type(&param.ty).is_some() {
@@ -542,9 +515,7 @@ fn gen_recur_sequence_input_serialization(input: &ItemFn) -> proc_macro2::TokenS
                     let #trace_value_ident = ::raster::core::trace::FnInputValue::Inline(
                         #name.__raster_serialize_replay_handle()
                     );
-                    let #external_info_ident: ::core::option::Option<::raster::core::trace::ExternalData> =
-                        ::core::option::Option::None;
-                    let #internal_info_ident: ::core::option::Option<::raster::core::trace::InternalData> =
+                    let #internal_info_ident: ::core::option::Option<::raster::core::trace::StorageData> =
                         ::core::option::Option::None;
                 }
             } else if recur_sequence_state_inner_type(&param.ty).is_some() {
@@ -552,9 +523,7 @@ fn gen_recur_sequence_input_serialization(input: &ItemFn) -> proc_macro2::TokenS
                     let #trace_value_ident = ::raster::core::trace::FnInputValue::Inline(
                         ::raster::core::postcard::to_allocvec(&#name).unwrap_or_default()
                     );
-                    let #external_info_ident: ::core::option::Option<::raster::core::trace::ExternalData> =
-                        ::core::option::Option::None;
-                    let #internal_info_ident: ::core::option::Option<::raster::core::trace::InternalData> =
+                    let #internal_info_ident: ::core::option::Option<::raster::core::trace::StorageData> =
                         ::core::option::Option::None;
                 }
             } else {
@@ -562,8 +531,7 @@ fn gen_recur_sequence_input_serialization(input: &ItemFn) -> proc_macro2::TokenS
                     let __raster_auth_trace = ::raster::auth_ref_trace(&#name)
                         .unwrap_or_else(|e| panic!("Failed to trace recursive sequence argument '{}': {}", stringify!(#name), e));
                     let #trace_value_ident = __raster_auth_trace.value;
-                    let #external_info_ident = __raster_auth_trace.external;
-                    let #internal_info_ident = __raster_auth_trace.internal;
+                    let #internal_info_ident = __raster_auth_trace.storage;
                 }
             }
         })
@@ -590,22 +558,6 @@ fn gen_recur_sequence_input_serialization(input: &ItemFn) -> proc_macro2::TokenS
         }
     };
 
-    let external_binding_entries: Vec<_> = params
-        .iter()
-        .map(|param| {
-            let name_str = param.ident.to_string();
-            let external_info_ident = external_info_ident(param);
-            quote! {
-                if let ::core::option::Option::Some(__raster_external_info) = &#external_info_ident {
-                    __raster_external.insert(
-                        ::raster::alloc::string::String::from(#name_str),
-                        __raster_external_info.clone(),
-                    );
-                }
-            }
-        })
-        .collect();
-
     let internal_binding_entries: Vec<_> = params
         .iter()
         .map(|param| {
@@ -631,8 +583,6 @@ fn gen_recur_sequence_input_serialization(input: &ItemFn) -> proc_macro2::TokenS
 
         #input_bytes
 
-        let mut __raster_external = ::raster::alloc::collections::BTreeMap::new();
-        #(#external_binding_entries)*
         let mut __raster_internal = ::raster::alloc::collections::BTreeMap::new();
         #(#internal_binding_entries)*
 
@@ -641,8 +591,7 @@ fn gen_recur_sequence_input_serialization(input: &ItemFn) -> proc_macro2::TokenS
                 data: __raster_input_bytes,
                 values: ::raster::alloc::vec![#(#trace_values.clone()),*],
                 args: __raster_input_args,
-                external: __raster_external,
-                internal: __raster_internal,
+                storage: __raster_internal,
             }
         );
     }
@@ -982,44 +931,6 @@ fn trace_output_binding(kind: &ProtocolReturnKind) -> proc_macro2::TokenStream {
     }
 }
 
-fn materialize_main_result(kind: &ProtocolReturnKind) -> proc_macro2::TokenStream {
-    match kind {
-        ProtocolReturnKind::Unit => quote! { let __raster_result = __raster_auth_result; },
-        ProtocolReturnKind::Value(ty) => quote! {
-            let __raster_result: #ty =
-                ::raster::materialize_auth_return::<#ty, _>(__raster_auth_result);
-        },
-        ProtocolReturnKind::Fallible(ty) => quote! {
-            let __raster_result: ::raster::exec::Result<#ty> =
-                ::raster::materialize_auth_result::<#ty, _>(__raster_auth_result);
-        },
-        ProtocolReturnKind::Draft(_) => {
-            panic!("`#[sequence]` functions must finalize Draft handles before returning")
-        }
-        ProtocolReturnKind::RecurControlDraft(_) => {
-            panic!("`#[sequence]` functions must finalize Draft handles before returning")
-        }
-        ProtocolReturnKind::RecurOutput(_) => {
-            panic!("`#[sequence]` functions must finalize recur outputs before returning")
-        }
-        ProtocolReturnKind::RecurControlRecurOutput(_) => {
-            panic!("`#[sequence]` functions must finalize recur outputs before returning")
-        }
-        ProtocolReturnKind::RecurState(_) => {
-            panic!("`#[sequence]` functions must finalize recur states before returning")
-        }
-        ProtocolReturnKind::RecurControlRecurState(_) => {
-            panic!("`#[sequence]` functions must finalize recur states before returning")
-        }
-        ProtocolReturnKind::RecurStateOutput(_) => {
-            panic!("`#[sequence]` functions must finalize recur outputs before returning")
-        }
-        ProtocolReturnKind::RecurControlRecurStateOutput(_) => {
-            panic!("`#[sequence]` functions must finalize recur outputs before returning")
-        }
-    }
-}
-
 fn gen_tile_call_binding_marker(
     marker_ident: &syn::Ident,
     return_kind: &ProtocolReturnKind,
@@ -1088,1027 +999,6 @@ fn gen_tile_call_binding_marker(
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum RecurTileMode {
-    OutputOnly,
-    StateOnly,
-    StateOutput,
-}
-
-#[derive(Clone)]
-struct RecurTileShape {
-    mode: RecurTileMode,
-    input_param: ParamInfo,
-    state_param: Option<ParamInfo>,
-    state_inner: Option<Type>,
-    extra_params: Vec<ParamInfo>,
-    output_schema: Option<Type>,
-}
-
-#[derive(Clone)]
-struct RecurSequenceShape {
-    mode: RecurTileMode,
-    input_param: ParamInfo,
-    state_param: Option<ParamInfo>,
-    state_inner: Option<Type>,
-    extra_params: Vec<ParamInfo>,
-    output_schema: Option<Type>,
-}
-
-fn validate_recur_tile_shape(input: &ItemFn, return_kind: &ProtocolReturnKind) -> RecurTileShape {
-    let params = extract_params(input);
-    if params.len() < 2 {
-        panic!("`#[tile(kind = recur)]` tiles must accept at least `(input, state)` or `(input, output)`");
-    }
-
-    let input_param = params.first().cloned().expect("recur tile input param");
-    recur_input_inner_type(&input_param.ty).unwrap_or_else(|| {
-        panic!("`#[tile(kind = recur)]` tiles must start with `input: RecurInput<T>`")
-    });
-
-    let second_param = params.get(1).cloned().expect("recur tile second param");
-    let (mode, state_param, state_inner, output_param, output_schema, extra_start) = if let Some(
-        output_schema,
-    ) =
-        recur_output_inner_type(&second_param.ty)
-    {
-        if params
-            .get(2)
-            .is_some_and(|param| recur_state_inner_type(&param.ty).is_some())
-        {
-            panic!("`#[tile(kind = recur)]` tiles must place `state: RecurState<S>` before `output: RecurOutput<T>`");
-        }
-        (
-            RecurTileMode::OutputOnly,
-            None,
-            None,
-            Some(second_param),
-            Some(output_schema),
-            2usize,
-        )
-    } else if let Some(state_inner) = recur_state_inner_type(&second_param.ty) {
-        if let Some(third_param) = params.get(2).cloned() {
-            if let Some(output_schema) = recur_output_inner_type(&third_param.ty) {
-                (
-                    RecurTileMode::StateOutput,
-                    Some(second_param),
-                    Some(state_inner),
-                    Some(third_param),
-                    Some(output_schema),
-                    3usize,
-                )
-            } else {
-                (
-                    RecurTileMode::StateOnly,
-                    Some(second_param),
-                    Some(state_inner),
-                    None,
-                    None,
-                    2usize,
-                )
-            }
-        } else {
-            (
-                RecurTileMode::StateOnly,
-                Some(second_param),
-                Some(state_inner),
-                None,
-                None,
-                2usize,
-            )
-        }
-    } else {
-        panic!("`#[tile(kind = recur)]` tiles must place `state: RecurState<S>` or `output: RecurOutput<T>` after `input`");
-    };
-
-    let extra_params = params[extra_start..].to_vec();
-
-    if extra_params.iter().any(|param| {
-        recur_state_inner_type(&param.ty).is_some()
-            || recur_output_inner_type(&param.ty).is_some()
-            || recur_input_inner_type(&param.ty).is_some()
-    }) {
-        panic!("`#[tile(kind = recur)]` only supports plain `args...` after recur state/output parameters");
-    }
-
-    match mode {
-        RecurTileMode::OutputOnly => {
-            let output_param = output_param.as_ref().expect("output-only output param");
-            match return_kind {
-                ProtocolReturnKind::RecurOutput(return_ty) => {
-                    if !types_equivalent(return_ty, &output_param.ty) {
-                        panic!(
-                            "`#[tile(kind = recur)]` output-only tiles must return the same `RecurOutput<S>` type as their output parameter"
-                        );
-                    }
-                }
-                ProtocolReturnKind::RecurControlRecurOutput(return_ty) => {
-                    let inner_output_ty = recur_control_inner_type(return_ty)
-                        .expect("validated recur control output inner type");
-                    if !types_equivalent(&inner_output_ty, &output_param.ty) {
-                        panic!(
-                            "`#[tile(kind = recur)]` output-only tiles must return the same `RecurOutput<S>` type as their output parameter"
-                        );
-                    }
-                }
-                _ => {
-                    panic!(
-                        "`#[tile(kind = recur)]` output-only tiles must return `RecurOutput<S>` or `RecurControl<RecurOutput<S>>`"
-                    )
-                }
-            }
-        }
-        RecurTileMode::StateOnly => {
-            let state_param = state_param.as_ref().expect("state-only state param");
-            match return_kind {
-                ProtocolReturnKind::RecurState(return_ty) => {
-                    if !types_equivalent(return_ty, &state_param.ty) {
-                        panic!(
-                            "`#[tile(kind = recur)]` state-only tiles must return the same `RecurState<S>` type as their state parameter"
-                        );
-                    }
-                }
-                ProtocolReturnKind::RecurControlRecurState(return_ty) => {
-                    let inner_state_ty = recur_control_inner_type(return_ty)
-                        .expect("validated recur control state inner type");
-                    if !types_equivalent(&inner_state_ty, &state_param.ty) {
-                        panic!(
-                            "`#[tile(kind = recur)]` state-only tiles must return the same `RecurState<S>` type as their state parameter"
-                        );
-                    }
-                }
-                _ => {
-                    panic!(
-                        "`#[tile(kind = recur)]` state-only tiles must return `RecurState<S>` or `RecurControl<RecurState<S>>`"
-                    )
-                }
-            }
-        }
-        RecurTileMode::StateOutput => {
-            let state_param = state_param.as_ref().expect("state+output state param");
-            let output_param = output_param.as_ref().expect("state+output output param");
-            match return_kind {
-                ProtocolReturnKind::RecurStateOutput(return_ty) => {
-                    let (return_state_ty, return_output_ty) = recur_state_output_parts(return_ty)
-                        .expect("validated recur state output tuple");
-                    let state_inner =
-                        recur_state_inner_type(&state_param.ty).expect("recur state inner type");
-                    if !types_equivalent(&return_state_ty, &state_inner)
-                        || !types_equivalent(&return_output_ty, &output_param.ty)
-                    {
-                        panic!(
-                            "`#[tile(kind = recur)]` state+output tiles must return `(RecurState<S>, RecurOutput<T>)` matching their parameters"
-                        );
-                    }
-                }
-                ProtocolReturnKind::RecurControlRecurStateOutput(return_ty) => {
-                    let (return_state_ty, return_output_ty) =
-                        recur_control_state_output_parts(return_ty)
-                            .expect("validated recur control state output tuple");
-                    let state_inner =
-                        recur_state_inner_type(&state_param.ty).expect("recur state inner type");
-                    if !types_equivalent(&return_state_ty, &state_inner)
-                        || !types_equivalent(&return_output_ty, &output_param.ty)
-                    {
-                        panic!(
-                            "`#[tile(kind = recur)]` state+output tiles must return `(RecurState<S>, RecurOutput<T>)` matching their parameters"
-                        );
-                    }
-                }
-                _ => {
-                    panic!(
-                        "`#[tile(kind = recur)]` state+output tiles must return `(RecurState<S>, RecurOutput<T>)` or `RecurControl<(RecurState<S>, RecurOutput<T>)>`"
-                    )
-                }
-            }
-        }
-    }
-
-    RecurTileShape {
-        mode,
-        input_param,
-        state_param,
-        state_inner,
-        extra_params,
-        output_schema,
-    }
-}
-
-fn validate_recur_sequence_shape(input: &ItemFn) -> RecurSequenceShape {
-    let params = extract_params(input);
-    if params.len() < 2 {
-        panic!("`#[sequence(kind = recur)]` functions must accept at least `(input, state)` or `(input, output)`");
-    }
-
-    let input_param = params.first().cloned().expect("recur sequence input param");
-    recur_sequence_input_inner_type(&input_param.ty).unwrap_or_else(|| {
-        panic!(
-            "`#[sequence(kind = recur)]` functions must start with `input: RecurSequenceInput<T>`"
-        )
-    });
-
-    let second_param = params.get(1).cloned().expect("recur sequence second param");
-    let (mode, state_param, state_inner, output_param, output_schema, extra_start) = if let Some(
-        output_schema,
-    ) =
-        recur_sequence_output_inner_type(&second_param.ty)
-    {
-        if params
-            .get(2)
-            .is_some_and(|param| recur_sequence_state_inner_type(&param.ty).is_some())
-        {
-            panic!("`#[sequence(kind = recur)]` functions must place `state: RecurSequenceState<S>` before `output: RecurSequenceOutput<T>`");
-        }
-        (
-            RecurTileMode::OutputOnly,
-            None,
-            None,
-            Some(second_param),
-            Some(output_schema),
-            2usize,
-        )
-    } else if let Some(state_inner) = recur_sequence_state_inner_type(&second_param.ty) {
-        if let Some(third_param) = params.get(2).cloned() {
-            if let Some(output_schema) = recur_sequence_output_inner_type(&third_param.ty) {
-                (
-                    RecurTileMode::StateOutput,
-                    Some(second_param),
-                    Some(state_inner),
-                    Some(third_param),
-                    Some(output_schema),
-                    3usize,
-                )
-            } else {
-                (
-                    RecurTileMode::StateOnly,
-                    Some(second_param),
-                    Some(state_inner),
-                    None,
-                    None,
-                    2usize,
-                )
-            }
-        } else {
-            (
-                RecurTileMode::StateOnly,
-                Some(second_param),
-                Some(state_inner),
-                None,
-                None,
-                2usize,
-            )
-        }
-    } else {
-        panic!("`#[sequence(kind = recur)]` functions must place `state: RecurSequenceState<S>` or `output: RecurSequenceOutput<T>` after `input`");
-    };
-
-    let extra_params = params[extra_start..].to_vec();
-    if extra_params.iter().any(|param| {
-        recur_sequence_state_inner_type(&param.ty).is_some()
-            || recur_sequence_output_inner_type(&param.ty).is_some()
-            || recur_sequence_input_inner_type(&param.ty).is_some()
-            || recur_state_inner_type(&param.ty).is_some()
-            || recur_output_inner_type(&param.ty).is_some()
-            || recur_input_inner_type(&param.ty).is_some()
-    }) {
-        panic!("`#[sequence(kind = recur)]` only supports plain `args...` after recur sequence state/output parameters");
-    }
-
-    let ReturnType::Type(_, return_ty) = &input.sig.output else {
-        panic!("`#[sequence(kind = recur)]` functions must return threaded recur sequence state/output handles");
-    };
-    if recur_control_inner_type(return_ty).is_some() {
-        panic!("`#[sequence(kind = recur)]` cannot return `RecurControl`; early termination must be decided inside recur tiles");
-    }
-
-    match mode {
-        RecurTileMode::OutputOnly => {
-            let output_param = output_param
-                .as_ref()
-                .expect("output-only recur sequence output param");
-            if !types_equivalent(return_ty, &output_param.ty) {
-                panic!("`#[sequence(kind = recur)]` output-only functions must return the same `RecurSequenceOutput<S>` type as their output parameter");
-            }
-        }
-        RecurTileMode::StateOnly => {
-            let state_param = state_param
-                .as_ref()
-                .expect("state-only recur sequence state param");
-            if !types_equivalent(return_ty, &state_param.ty) {
-                panic!("`#[sequence(kind = recur)]` state-only functions must return the same `RecurSequenceState<S>` type as their state parameter");
-            }
-        }
-        RecurTileMode::StateOutput => {
-            let state_param = state_param
-                .as_ref()
-                .expect("state+output recur sequence state param");
-            let output_param = output_param
-                .as_ref()
-                .expect("state+output recur sequence output param");
-            let (return_state_ty, return_output_ty) =
-                recur_sequence_state_output_parts(return_ty).unwrap_or_else(|| {
-                    panic!("`#[sequence(kind = recur)]` state+output functions must return `(RecurSequenceState<S>, RecurSequenceOutput<T>)` matching their parameters")
-                });
-            let state_inner = recur_sequence_state_inner_type(&state_param.ty)
-                .expect("recur sequence state inner type");
-            if !types_equivalent(&return_state_ty, &state_inner)
-                || !types_equivalent(&return_output_ty, &output_param.ty)
-            {
-                panic!("`#[sequence(kind = recur)]` state+output functions must return `(RecurSequenceState<S>, RecurSequenceOutput<T>)` matching their parameters");
-            }
-        }
-    }
-
-    RecurSequenceShape {
-        mode,
-        input_param,
-        state_param,
-        state_inner,
-        extra_params,
-        output_schema,
-    }
-}
-
-fn gen_recur_driver_function(
-    fn_name: &syn::Ident,
-    shape: &RecurTileShape,
-) -> proc_macro2::TokenStream {
-    let fn_name_str = fn_name.to_string();
-    let hidden_name = format_ident!("__raster_recur_auth_{}", fn_name);
-    let source_ident = format_ident!("__RasterRecurSource");
-    let item_ty =
-        recur_input_inner_type(&shape.input_param.ty).expect("validated recur input type");
-    let result_ty = shape
-        .output_schema
-        .as_ref()
-        .or(shape.state_inner.as_ref())
-        .expect("recur caller-visible result type");
-    let extra_generic_idents: Vec<_> = shape
-        .extra_params
-        .iter()
-        .enumerate()
-        .map(|(index, _)| format_ident!("__RasterRecurArg{}", index))
-        .collect();
-    let extra_materialized_idents: Vec<_> = shape
-        .extra_params
-        .iter()
-        .enumerate()
-        .map(|(index, _)| format_ident!("__raster_recur_materialized_arg_{}", index))
-        .collect();
-    let extra_wrapper_params: Vec<_> = shape
-        .extra_params
-        .iter()
-        .zip(extra_generic_idents.iter())
-        .map(|(param, generic)| {
-            let name = &param.ident;
-            quote! { #name: #generic }
-        })
-        .collect();
-    let extra_where: Vec<_> = shape
-        .extra_params
-        .iter()
-        .zip(extra_generic_idents.iter())
-        .map(|(param, generic)| {
-            let ty = &param.ty;
-            quote! { #generic: ::core::clone::Clone + ::raster::IntoAuthValue<#ty> }
-        })
-        .collect();
-    let extra_arg_materialization: Vec<_> = shape
-        .extra_params
-        .iter()
-        .zip(extra_materialized_idents.iter())
-        .map(|(param, materialized_ident)| {
-            let name = &param.ident;
-            let ty = &param.ty;
-            quote! {
-                let #materialized_ident: #ty = ::raster::into_auth_value::<#ty, _>(#name.clone())
-                    .unwrap_or_else(|e| panic!("Failed to materialize auth value for recur argument '{}': {}", stringify!(#name), e))
-                    .into_inner();
-            }
-        })
-        .collect();
-    let call_expr = match shape.mode {
-        RecurTileMode::OutputOnly => quote! {
-            {
-                #(#extra_arg_materialization)*
-                #fn_name(input, output, #(#extra_materialized_idents),*)
-            }
-        },
-        RecurTileMode::StateOnly => quote! {
-            {
-                #(#extra_arg_materialization)*
-                #fn_name(input, state, #(#extra_materialized_idents),*)
-            }
-        },
-        RecurTileMode::StateOutput => quote! {
-            {
-                #(#extra_arg_materialization)*
-                #fn_name(input, state, output, #(#extra_materialized_idents),*)
-            }
-        },
-    };
-    let state_wrapper = shape.state_param.as_ref().map(|param| {
-        let state_ident = &param.ident;
-        let state_inner = recur_state_inner_type(&param.ty).expect("validated recur state type");
-        quote! {
-            let #state_ident: ::raster::RecurState<#state_inner> =
-                ::core::convert::Into::into(#state_ident);
-        }
-    });
-    let state_param = shape.state_param.as_ref().map(|param| {
-        let state_ident = &param.ident;
-        let state_inner = recur_state_inner_type(&param.ty).expect("validated recur state type");
-        quote! { #state_ident: impl ::core::convert::Into<::raster::RecurState<#state_inner>>, }
-    });
-    let output_param = shape.output_schema.as_ref().map(|output_schema| {
-        quote! { output: ::raster::Draft<#output_schema>, }
-    });
-    let run_driver = match shape.mode {
-        RecurTileMode::OutputOnly => {
-            let output_schema = shape
-                .output_schema
-                .as_ref()
-                .expect("output-only output schema");
-            quote! {
-                ::raster::run_recur_list::<#item_ty, #output_schema, _, _>(
-                    input,
-                    output,
-                    move |input, output| #call_expr,
-                )
-            }
-        }
-        RecurTileMode::StateOnly => {
-            let state_ident = &shape
-                .state_param
-                .as_ref()
-                .expect("state-only state param")
-                .ident;
-            let state_inner = shape.state_inner.as_ref().expect("state-only state inner");
-            quote! {
-                ::raster::run_recur_list_state::<#item_ty, #state_inner, _, _>(
-                    input,
-                    #state_ident,
-                    move |input, state| #call_expr,
-                )
-            }
-        }
-        RecurTileMode::StateOutput => {
-            let state_ident = &shape
-                .state_param
-                .as_ref()
-                .expect("state+output state param")
-                .ident;
-            let output_schema = shape
-                .output_schema
-                .as_ref()
-                .expect("state+output output schema");
-            quote! {
-                ::raster::run_recur_list_with_state::<#item_ty, _, #output_schema, _, _>(
-                    input,
-                    #state_ident,
-                    output,
-                    move |input, state, output| #call_expr,
-                )
-            }
-        }
-    };
-    let wrapper_generics = if extra_generic_idents.is_empty() {
-        quote! { <#source_ident> }
-    } else {
-        quote! { <#source_ident, #(#extra_generic_idents),*> }
-    };
-    let state_trace_capture = shape
-        .state_param
-        .as_ref()
-        .map(|param| {
-            let state_ident = &param.ident;
-            let state_ty = &param.ty;
-            let state_ty_str = state_ty.to_token_stream().to_string();
-            quote! {
-                __raster_trace_values.push(::raster::core::trace::FnInputValue::Inline(
-                    ::raster::core::postcard::to_allocvec(&#state_ident).unwrap_or_default()
-                ));
-                __raster_trace_args.push(::raster::core::trace::FnInputArg {
-                    name: ::raster::alloc::string::String::from(stringify!(#state_ident)),
-                    ty: ::raster::alloc::string::String::from(#state_ty_str),
-                });
-            }
-        })
-        .unwrap_or_else(|| quote! {});
-    let output_trace_capture = shape
-        .output_schema
-        .as_ref()
-        .map(|output_schema| {
-            let output_ty = quote! { ::raster::Draft<#output_schema> }.to_string();
-            quote! {
-                __raster_trace_values.push(::raster::core::trace::FnInputValue::Inline(
-                    ::raster::serialize_draft_replay_handle::<#output_schema>(&output)
-                ));
-                __raster_trace_args.push(::raster::core::trace::FnInputArg {
-                    name: ::raster::alloc::string::String::from("output"),
-                    ty: ::raster::alloc::string::String::from(#output_ty),
-                });
-            }
-        })
-        .unwrap_or_else(|| quote! {});
-    let extra_trace_capture: Vec<_> = shape
-        .extra_params
-        .iter()
-        .enumerate()
-        .map(|(index, param)| {
-            let trace_ident = format_ident!("__raster_recur_trace_arg_{}", index);
-            let name = &param.ident;
-            let name_str = name.to_string();
-            let ty = &param.ty;
-            let ty_str = ty.to_token_stream().to_string();
-            quote! {
-                let #trace_ident = ::raster::into_auth_value::<#ty, _>(#name.clone())
-                    .unwrap_or_else(|e| panic!("Failed to materialize auth value for recur argument '{}': {}", stringify!(#name), e));
-                let __raster_trace_value = match #trace_ident {
-                    ::raster::AuthValue::External(__raster_external_value) => {
-                        __raster_external.insert(
-                            ::raster::alloc::string::String::from(#name_str),
-                            ::raster::core::trace::ExternalData {
-                                name: __raster_external_value.name.clone(),
-                                commitment: __raster_external_value
-                                    .commitment
-                                    .clone()
-                                    .map(|value| value.into_bytes())
-                                    .unwrap_or_default(),
-                                tree_root: __raster_external_value.selected.commitment.source_root_hash.to_vec(),
-                                selector: __raster_external_value.selector.clone(),
-                                selection: __raster_external_value.selected.commitment.clone(),
-                            }
-                        );
-                        ::raster::core::trace::FnInputValue::ExternalBinding
-                    }
-                    ::raster::AuthValue::Internal(__raster_internal_value) => {
-                        __raster_internal.insert(
-                            ::raster::alloc::string::String::from(#name_str),
-                            ::raster::core::trace::InternalData {
-                                coordinates: __raster_internal_value.reference.coordinates.clone(),
-                                commitment: __raster_internal_value.reference.commitment.clone(),
-                                selector: __raster_internal_value.selector.clone(),
-                                selection: __raster_internal_value.selection.clone(),
-                            }
-                        );
-                        ::raster::core::trace::FnInputValue::InternalBinding
-                    }
-                    ::raster::AuthValue::Inline(__raster_inline_value) => {
-                        ::raster::core::trace::FnInputValue::Inline(
-                            ::raster::core::postcard::to_allocvec(&__raster_inline_value)
-                                .unwrap_or_default()
-                        )
-                    }
-                };
-                __raster_trace_values.push(__raster_trace_value);
-                __raster_trace_args.push(::raster::core::trace::FnInputArg {
-                    name: ::raster::alloc::string::String::from(#name_str),
-                    ty: ::raster::alloc::string::String::from(#ty_str),
-                });
-            }
-        })
-        .collect();
-
-    quote! {
-        #[doc(hidden)]
-        pub fn #hidden_name #wrapper_generics (
-            input: #source_ident,
-            #state_param
-            #output_param
-            #(#extra_wrapper_params,)*
-        ) -> ::raster::AuthRef<#result_ty>
-        where
-            #source_ident: ::raster::IntoAuthRef<::raster::alloc::vec::Vec<#item_ty>>,
-            #(#extra_where,)*
-        {
-            let input = ::raster::into_auth_ref::<::raster::alloc::vec::Vec<#item_ty>, _>(input);
-            #state_wrapper
-
-            #[cfg(all(feature = "std", not(target_arch = "riscv32")))]
-            {
-                let __raster_input_trace = ::raster::auth_ref_trace(&input)
-                    .unwrap_or_else(|e| panic!("Failed to build recur input trace: {}", e));
-                let mut __raster_trace_values = ::raster::alloc::vec::Vec::new();
-                let mut __raster_trace_args = ::raster::alloc::vec::Vec::new();
-                let mut __raster_external = ::raster::alloc::collections::BTreeMap::new();
-                let mut __raster_internal = ::raster::alloc::collections::BTreeMap::new();
-
-                __raster_trace_values.push(__raster_input_trace.value);
-                __raster_trace_args.push(::raster::core::trace::FnInputArg {
-                    name: ::raster::alloc::string::String::from("input"),
-                    ty: ::raster::alloc::string::String::from(stringify!(::raster::AuthRef<::raster::alloc::vec::Vec<#item_ty>>)),
-                });
-                if let ::core::option::Option::Some(__raster_external_info) = __raster_input_trace.external {
-                    __raster_external.insert(
-                        ::raster::alloc::string::String::from("input"),
-                        __raster_external_info,
-                    );
-                }
-                if let ::core::option::Option::Some(__raster_internal_info) = __raster_input_trace.internal {
-                    __raster_internal.insert(
-                        ::raster::alloc::string::String::from("input"),
-                        __raster_internal_info,
-                    );
-                }
-                #state_trace_capture
-                #output_trace_capture
-                #(#extra_trace_capture)*
-                let __raster_input_bytes = ::raster::core::postcard::to_allocvec(&(
-                    __raster_trace_values.clone(),
-                    __raster_external.clone(),
-                    __raster_internal.clone(),
-                ))
-                .unwrap_or_default();
-                let __raster_input = ::core::option::Option::Some(::raster::core::trace::FnInput {
-                    data: __raster_input_bytes,
-                    values: __raster_trace_values,
-                    args: __raster_trace_args,
-                    external: __raster_external,
-                    internal: __raster_internal,
-                });
-
-                let __raster_recur_trace_scope = ::raster::__private::RecurTraceScopeGuard::enter();
-                let result = #run_driver;
-                drop(__raster_recur_trace_scope);
-
-                let __raster_resolved_output = ::raster::resolve_internal_value::<#result_ty>(result.reference().clone())
-                    .unwrap_or_else(|e| panic!("Failed to resolve recur output for trace: {}", e));
-                let __raster_output_bytes = __raster_resolved_output.bytes.clone();
-                let __raster_output = ::core::option::Option::Some(
-                    ::raster::core::trace::FnOutput::new(
-                        __raster_output_bytes,
-                        stringify!(::raster::AuthRef<#result_ty>),
-                    ).with_raster(
-                        ::raster::raster_trace_payload(&__raster_resolved_output.value)
-                            .unwrap_or_else(|e| panic!("Failed to build raster recur output payload: {}", e))
-                    )
-                );
-                ::raster::publish_trace_event(::raster::core::trace::TraceEvent::RecurTileExec(
-                    ::raster::core::trace::FnCallRecord {
-                        fn_name: ::raster::alloc::string::String::from(#fn_name_str),
-                        input: __raster_input,
-                        output: __raster_output,
-                        draft_transition_witness: ::core::option::Option::None,
-                    }
-                ));
-
-                return result;
-            }
-
-            #[cfg(not(all(feature = "std", not(target_arch = "riscv32"))))]
-            {
-                #run_driver
-            }
-        }
-    }
-}
-
-fn gen_recur_sequence_step_function(
-    fn_name: &syn::Ident,
-    item_fn: &ItemFn,
-    shape: &RecurSequenceShape,
-) -> proc_macro2::TokenStream {
-    let fn_name_str = fn_name.to_string();
-    let step_name = format_ident!("__raster_recur_sequence_step_{}", fn_name);
-    let mut step_sig = item_fn.sig.clone();
-    step_sig.ident = step_name;
-    for arg in step_sig.inputs.iter_mut() {
-        let FnArg::Typed(pat_type) = arg else {
-            continue;
-        };
-        let syn::Pat::Ident(pat_ident) = pat_type.pat.as_ref() else {
-            continue;
-        };
-        if let Some(param) = shape
-            .extra_params
-            .iter()
-            .find(|param| param.ident == pat_ident.ident)
-        {
-            let ty = &param.ty;
-            pat_type.ty = syn::parse_quote!(::raster::AuthRef<#ty>);
-        }
-    }
-    let body = &item_fn.block;
-    let input_serialization = gen_recur_sequence_input_serialization(item_fn);
-    let output_type_expr = match &item_fn.sig.output {
-        ReturnType::Default => quote! { "()" },
-        ReturnType::Type(_, ty) => {
-            let ty_str = ty.to_token_stream().to_string();
-            quote! { #ty_str }
-        }
-    };
-    let result_binding = match shape.mode {
-        RecurTileMode::OutputOnly => {
-            let output_schema = shape
-                .output_schema
-                .as_ref()
-                .expect("output-only recur sequence output schema");
-            quote! {
-                let result: ::raster::RecurSequenceOutput<#output_schema> =
-                    ::core::convert::Into::into((|| #body)());
-            }
-        }
-        RecurTileMode::StateOnly => {
-            let state_inner = shape
-                .state_inner
-                .as_ref()
-                .expect("state-only recur sequence state inner");
-            quote! {
-                let result: ::raster::RecurSequenceState<#state_inner> =
-                    ::core::convert::Into::into((|| #body)());
-            }
-        }
-        RecurTileMode::StateOutput => {
-            let state_inner = shape
-                .state_inner
-                .as_ref()
-                .expect("state+output recur sequence state inner");
-            let output_schema = shape
-                .output_schema
-                .as_ref()
-                .expect("state+output recur sequence output schema");
-            quote! {
-                let (__raster_recur_sequence_state_result, __raster_recur_sequence_output_result) =
-                    (|| #body)();
-                let result: (
-                    ::raster::RecurSequenceState<#state_inner>,
-                    ::raster::RecurSequenceOutput<#output_schema>,
-                ) = (
-                    ::core::convert::Into::into(__raster_recur_sequence_state_result),
-                    ::core::convert::Into::into(__raster_recur_sequence_output_result),
-                );
-            }
-        }
-    };
-
-    quote! {
-        #[doc(hidden)]
-        pub #step_sig {
-            #[cfg(all(feature = "std", not(target_arch = "riscv32")))]
-            {
-                let __raster_recur_sequence_iteration_scope =
-                    ::raster::__private::RecurSequenceIterationScopeGuard::enter();
-                #input_serialization
-                let mut __raster_record = ::raster::core::trace::FnCallRecord {
-                    fn_name: ::raster::alloc::string::String::from(#fn_name_str),
-                    input: __raster_input,
-                    output: ::core::option::Option::None,
-                    draft_transition_witness: ::core::option::Option::None,
-                };
-                ::raster::publish_trace_event(::raster::core::trace::TraceEvent::RecurSequenceStart(
-                    __raster_record.clone(),
-                ));
-                #result_binding
-                let __raster_output_bytes = ::raster::core::postcard::to_allocvec(&result)
-                    .unwrap_or_default();
-                __raster_record.output = ::core::option::Option::Some(
-                    ::raster::core::trace::FnOutput::new(
-                        __raster_output_bytes,
-                        ::raster::alloc::string::String::from(#output_type_expr),
-                    )
-                );
-                ::raster::publish_trace_event(::raster::core::trace::TraceEvent::RecurSequenceEnd(
-                    __raster_record,
-                ));
-                let _ = &__raster_recur_sequence_iteration_scope;
-                result
-            }
-
-            #[cfg(not(all(feature = "std", not(target_arch = "riscv32"))))]
-            {
-                #result_binding
-                result
-            }
-        }
-    }
-}
-
-fn gen_recur_sequence_driver_function(
-    fn_name: &syn::Ident,
-    shape: &RecurSequenceShape,
-) -> proc_macro2::TokenStream {
-    let fn_name_str = fn_name.to_string();
-    let hidden_name = format_ident!("__raster_recur_sequence_auth_{}", fn_name);
-    let step_name = format_ident!("__raster_recur_sequence_step_{}", fn_name);
-    let source_ident = format_ident!("__RasterRecurSequenceSource");
-    let item_ty = recur_sequence_input_inner_type(&shape.input_param.ty)
-        .expect("validated recur sequence input type");
-    let result_ty = shape
-        .output_schema
-        .as_ref()
-        .or(shape.state_inner.as_ref())
-        .expect("recur sequence caller-visible result type");
-    let extra_generic_idents: Vec<_> = shape
-        .extra_params
-        .iter()
-        .enumerate()
-        .map(|(index, _)| format_ident!("__RasterRecurSequenceArg{}", index))
-        .collect();
-    let extra_materialized_idents: Vec<_> = shape
-        .extra_params
-        .iter()
-        .enumerate()
-        .map(|(index, _)| format_ident!("__raster_recur_sequence_materialized_arg_{}", index))
-        .collect();
-    let extra_wrapper_params: Vec<_> = shape
-        .extra_params
-        .iter()
-        .zip(extra_generic_idents.iter())
-        .map(|(param, generic)| {
-            let name = &param.ident;
-            quote! { #name: #generic }
-        })
-        .collect();
-    let extra_where: Vec<_> = shape
-        .extra_params
-        .iter()
-        .zip(extra_generic_idents.iter())
-        .map(|(param, generic)| {
-            let ty = &param.ty;
-            quote! { #generic: ::core::clone::Clone + ::raster::IntoAuthRef<#ty> }
-        })
-        .collect();
-    let extra_arg_materialization: Vec<_> = shape
-        .extra_params
-        .iter()
-        .zip(extra_materialized_idents.iter())
-        .map(|(param, materialized_ident)| {
-            let name = &param.ident;
-            let ty = &param.ty;
-            quote! {
-                let #materialized_ident: ::raster::AuthRef<#ty> =
-                    ::raster::into_auth_ref::<#ty, _>(#name.clone());
-            }
-        })
-        .collect();
-    let call_expr = match shape.mode {
-        RecurTileMode::OutputOnly => quote! {
-            {
-                #(#extra_arg_materialization)*
-                #step_name(input, output, #(#extra_materialized_idents),*)
-            }
-        },
-        RecurTileMode::StateOnly => quote! {
-            {
-                #(#extra_arg_materialization)*
-                #step_name(input, state, #(#extra_materialized_idents),*)
-            }
-        },
-        RecurTileMode::StateOutput => quote! {
-            {
-                #(#extra_arg_materialization)*
-                #step_name(input, state, output, #(#extra_materialized_idents),*)
-            }
-        },
-    };
-    let state_wrapper = shape.state_param.as_ref().map(|param| {
-        let state_ident = &param.ident;
-        let state_inner = recur_sequence_state_inner_type(&param.ty)
-            .expect("validated recur sequence state type");
-        quote! {
-            let #state_ident: ::raster::RecurState<#state_inner> =
-                ::core::convert::Into::into(#state_ident);
-        }
-    });
-    let state_param = shape.state_param.as_ref().map(|param| {
-        let state_ident = &param.ident;
-        let state_inner = recur_sequence_state_inner_type(&param.ty)
-            .expect("validated recur sequence state type");
-        quote! { #state_ident: impl ::core::convert::Into<::raster::RecurState<#state_inner>>, }
-    });
-    let output_param = shape.output_schema.as_ref().map(|output_schema| {
-        quote! { output: ::raster::Draft<#output_schema>, }
-    });
-    let run_driver = match shape.mode {
-        RecurTileMode::OutputOnly => {
-            let output_schema = shape
-                .output_schema
-                .as_ref()
-                .expect("output-only output schema");
-            quote! {
-                ::raster::run_recur_sequence_list::<#item_ty, #output_schema, _, _>(
-                    input,
-                    output,
-                    move |input, output| #call_expr,
-                )
-            }
-        }
-        RecurTileMode::StateOnly => {
-            let state_ident = &shape
-                .state_param
-                .as_ref()
-                .expect("state-only state param")
-                .ident;
-            let state_inner = shape.state_inner.as_ref().expect("state-only state inner");
-            quote! {
-                ::raster::run_recur_sequence_list_state::<#item_ty, #state_inner, _, _>(
-                    input,
-                    #state_ident,
-                    move |input, state| #call_expr,
-                )
-            }
-        }
-        RecurTileMode::StateOutput => {
-            let state_ident = &shape
-                .state_param
-                .as_ref()
-                .expect("state+output state param")
-                .ident;
-            let output_schema = shape
-                .output_schema
-                .as_ref()
-                .expect("state+output output schema");
-            quote! {
-                ::raster::run_recur_sequence_list_with_state::<#item_ty, _, #output_schema, _, _>(
-                    input,
-                    #state_ident,
-                    output,
-                    move |input, state, output| #call_expr,
-                )
-            }
-        }
-    };
-    let wrapper_generics = if extra_generic_idents.is_empty() {
-        quote! { <#source_ident> }
-    } else {
-        quote! { <#source_ident, #(#extra_generic_idents),*> }
-    };
-
-    quote! {
-        #[doc(hidden)]
-        pub fn #hidden_name #wrapper_generics (
-            input: #source_ident,
-            #state_param
-            #output_param
-            #(#extra_wrapper_params,)*
-        ) -> ::raster::AuthRef<#result_ty>
-        where
-            #source_ident: ::raster::IntoAuthRef<::raster::alloc::vec::Vec<#item_ty>>,
-            #(#extra_where,)*
-        {
-            let input = ::raster::into_auth_ref::<::raster::alloc::vec::Vec<#item_ty>, _>(input);
-            #state_wrapper
-
-            #[cfg(all(feature = "std", not(target_arch = "riscv32")))]
-            {
-                let __raster_input_trace = ::raster::auth_ref_trace(&input)
-                    .unwrap_or_else(|e| panic!("Failed to build recur sequence input trace: {}", e));
-                let __raster_input_bytes = ::raster::core::postcard::to_allocvec(&__raster_input_trace.value)
-                    .unwrap_or_default();
-                let __raster_input = ::core::option::Option::Some(::raster::core::trace::FnInput {
-                    data: __raster_input_bytes,
-                    values: ::raster::alloc::vec![__raster_input_trace.value],
-                    args: ::raster::alloc::vec![::raster::core::trace::FnInputArg {
-                        name: ::raster::alloc::string::String::from("input"),
-                        ty: ::raster::alloc::string::String::from(stringify!(::raster::AuthRef<::raster::alloc::vec::Vec<#item_ty>>)),
-                    }],
-                    external: __raster_input_trace.external.map(|external| {
-                        let mut map = ::raster::alloc::collections::BTreeMap::new();
-                        map.insert(::raster::alloc::string::String::from("input"), external);
-                        map
-                    }).unwrap_or_default(),
-                    internal: __raster_input_trace.internal.map(|internal| {
-                        let mut map = ::raster::alloc::collections::BTreeMap::new();
-                        map.insert(::raster::alloc::string::String::from("input"), internal);
-                        map
-                    }).unwrap_or_default(),
-                });
-
-                let result = #run_driver;
-
-                let __raster_resolved_output = ::raster::resolve_internal_value::<#result_ty>(result.reference().clone())
-                    .unwrap_or_else(|e| panic!("Failed to resolve recur sequence output for trace: {}", e));
-                let __raster_output_bytes = __raster_resolved_output.bytes.clone();
-                let __raster_output = ::core::option::Option::Some(
-                    ::raster::core::trace::FnOutput::new(
-                        __raster_output_bytes,
-                        stringify!(::raster::AuthRef<#result_ty>),
-                    ).with_raster(
-                        ::raster::raster_trace_payload(&__raster_resolved_output.value)
-                            .unwrap_or_else(|e| panic!("Failed to build raster recur sequence output payload: {}", e))
-                    )
-                );
-                ::raster::publish_trace_event(::raster::core::trace::TraceEvent::RecurSequenceExec(
-                    ::raster::core::trace::FnCallRecord {
-                        fn_name: ::raster::alloc::string::String::from(#fn_name_str),
-                        input: __raster_input,
-                        output: __raster_output,
-                        draft_transition_witness: ::core::option::Option::None,
-                    }
-                ));
-
-                return result;
-            }
-
-            #[cfg(not(all(feature = "std", not(target_arch = "riscv32"))))]
-            {
-                #run_driver
-            }
-        }
-    }
-}
-
 fn gen_tile_trace_output_serialization() -> proc_macro2::TokenStream {
     quote! {
         let __raster_output_bytes = ::raster::core::postcard::to_allocvec(&result)
@@ -2150,7 +1040,13 @@ fn gen_replay_output_serialization(kind: &ProtocolReturnKind) -> proc_macro2::To
         let __raster_output_bytes = ::raster::core::postcard::to_allocvec(&result)
             .map_err(|e| ::raster::core::Error::Serialization(::raster::alloc::format!("Failed to serialize output: {}", e)))?;
         #replay_transition_binding
+        let __raster_input_commitment: [u8; 32] =
+            <::raster::core::sha2::Sha256 as ::raster::core::sha2::Digest>::digest(
+                __raster_replay_input_bytes,
+            )
+            .into();
         let replay_output = ::raster::core::draft::TileReplayJournal {
+            input_commitment: __raster_input_commitment,
             output_bytes: __raster_output_bytes,
             draft_transition: __raster_draft_transition,
         };
@@ -2293,14 +1189,11 @@ fn gen_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream {
         .map(|param| {
             let name = &param.ident;
             let trace_value_ident = format_ident!("__raster_input_value_{}", name);
-            let external_info_ident = external_info_ident(param);
             let internal_info_ident = internal_info_ident(param);
             match param_protocol_kind(&param.ty) {
                 ParamProtocolKind::AuthValue(_) => quote! {
-                    let #trace_value_ident = if #external_info_ident.is_some() {
-                        ::raster::core::trace::FnInputValue::ExternalBinding
-                    } else if #internal_info_ident.is_some() {
-                        ::raster::core::trace::FnInputValue::InternalBinding
+                    let #trace_value_ident = if #internal_info_ident.is_some() {
+                        ::raster::core::trace::FnInputValue::StorageBinding
                     } else {
                         ::raster::core::trace::FnInputValue::Inline(
                             ::raster::core::postcard::to_allocvec(&#name).unwrap_or_default()
@@ -2344,32 +1237,6 @@ fn gen_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream {
         })
         .collect();
 
-    let external_binding_entries: Vec<_> = params
-        .iter()
-        .map(|param| {
-            let name_str = param.ident.to_string();
-            let external_info_ident = external_info_ident(param);
-            quote! {
-                if let ::core::option::Option::Some(__raster_external_info) = &#external_info_ident {
-                    __raster_external.insert(
-                        ::raster::alloc::string::String::from(#name_str),
-                        ::raster::core::trace::ExternalData {
-                            name: __raster_external_info.name.clone(),
-                            commitment: __raster_external_info
-                                .commitment
-                                .clone()
-                                .map(|value| value.into_bytes())
-                                .unwrap_or_default(),
-                            tree_root: __raster_external_info.selected.commitment.source_root_hash.to_vec(),
-                            selector: __raster_external_info.selector.clone(),
-                            selection: __raster_external_info.selected.commitment.clone(),
-                        }
-                    );
-                }
-            }
-        })
-        .collect();
-
     let internal_binding_entries: Vec<_> = params
         .iter()
         .map(|param| {
@@ -2379,7 +1246,7 @@ fn gen_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream {
                 if let ::core::option::Option::Some(__raster_internal_info) = &#internal_info_ident {
                     __raster_internal.insert(
                         ::raster::alloc::string::String::from(#name_str),
-                        ::raster::core::trace::InternalData {
+                        ::raster::core::trace::StorageData {
                             coordinates: __raster_internal_info.reference.coordinates.clone(),
                             commitment: __raster_internal_info.reference.commitment.clone(),
                             selector: __raster_internal_info.selector.clone(),
@@ -2439,8 +1306,6 @@ fn gen_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream {
 
         #input_bytes
 
-        let mut __raster_external = ::raster::alloc::collections::BTreeMap::new();
-        #(#external_binding_entries)*
         let mut __raster_internal = ::raster::alloc::collections::BTreeMap::new();
         #(#internal_binding_entries)*
 
@@ -2449,8 +1314,7 @@ fn gen_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream {
                 data: __raster_input_bytes,
                 values: ::raster::alloc::vec![#(#trace_values),*],
                 args: __raster_input_args,
-                external: __raster_external,
-                internal: __raster_internal,
+                storage: __raster_internal,
             }
         );
     }
@@ -3172,7 +2036,7 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
             #(#fn_attrs)*
             #fn_vis #exposed_sig {
                 let mut __raster_external_input_resolve_ns: ::core::primitive::u64 = 0;
-                let mut __raster_internal_input_resolve_ns: ::core::primitive::u64 = 0;
+                let mut __raster_storage_input_resolve_ns: ::core::primitive::u64 = 0;
                 #auth_value_materialization
 
                 #[cfg(all(feature = "std", not(target_arch = "riscv32")))]
@@ -3221,14 +2085,14 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
                     );
 
                     let __raster_output_record_build_start = ::raster::__private::profile_now();
+                    let __raster_output_raster_payload =
+                        ::raster::__private::tile_output_trace_payload(&result, &__raster_output_bytes)
+                            .unwrap_or_else(|e| panic!("Failed to build raster output payload: {}", e));
                     let __raster_output = ::core::option::Option::Some(
                         ::raster::core::trace::FnOutput::new(
                             __raster_output_bytes,
                             ::raster::alloc::string::String::from(#output_type_expr),
-                        ).with_raster(
-                            ::raster::raster_trace_payload(&result)
-                                .unwrap_or_else(|e| panic!("Failed to build raster output payload: {}", e))
-                        )
+                        ).with_raster(__raster_output_raster_payload)
                     );
 
                     let __raster_record = ::raster::core::trace::FnCallRecord {
@@ -3258,14 +2122,14 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
                             .unwrap_or(::core::primitive::u64::MAX);
                     let __raster_total_duration_ns = __raster_wrapper_duration_ns
                         .saturating_add(__raster_external_input_resolve_ns)
-                        .saturating_add(__raster_internal_input_resolve_ns);
+                        .saturating_add(__raster_storage_input_resolve_ns);
                     ::raster::__private::record_tile_profile(
                         #fn_name_str,
                         __raster_tile_execution_scope.coordinates().clone(),
                         __raster_total_duration_ns,
                         __raster_user_duration_ns,
                         __raster_external_input_resolve_ns,
-                        __raster_internal_input_resolve_ns,
+                        __raster_storage_input_resolve_ns,
                         __raster_trace_serialize_ns,
                         __raster_draft_capture_ns,
                         __raster_scope_enter_ns,
@@ -3298,14 +2162,14 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
                     #function_call
                     #native_draft_capture_finish
                     #trace_output_serialization
+                    let __raster_output_raster_payload =
+                        ::raster::__private::tile_output_trace_payload(&result, &__raster_output_bytes)
+                            .unwrap_or_else(|e| panic!("Failed to build raster output payload: {}", e));
                     let __raster_output = ::core::option::Option::Some(
                         ::raster::core::trace::FnOutput::new(
                             __raster_output_bytes,
                             ::raster::alloc::string::String::from(#output_type_expr),
-                        ).with_raster(
-                            ::raster::raster_trace_payload(&result)
-                                .unwrap_or_else(|e| panic!("Failed to build raster output payload: {}", e))
-                        )
+                        ).with_raster(__raster_output_raster_payload)
                     );
 
                     let __raster_record = ::raster::core::trace::FnCallRecord {
@@ -3353,6 +2217,11 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         #[doc(hidden)]
         pub fn #function_replay_wrapper_name(input: &[u8]) -> ::raster::core::Result<::raster::alloc::vec::Vec<u8>> {
+            // Capture the raw input bytes before `#inputs_deserialization` may
+            // shadow `input` with a typed value: the replay journal commits
+            // `sha256` of exactly these bytes (see program-identity.md).
+            let __raster_replay_input_bytes: &[u8] = input;
+
             #inputs_deserialization
 
             #function_call
@@ -3412,16 +2281,32 @@ impl SequenceAttrs {
     }
 }
 
-/// Generates the sequence-wrapped body: either tracing (SequenceStart/body/SequenceEnd) or plain body depending on cfg.
+/// Generates the sequence-wrapped body for a *non-main* sequence: either
+/// tracing (SequenceStart/body/SequenceEnd) or a plain body depending on cfg.
+///
+/// `main` has its own generator ([`gen_main_wrapped_body`]): its boundaries
+/// are the program-level `ProgramStart`/`ProgramEnd` steps, not the sequence
+/// events this produces.
 fn gen_sequence_wrapped_body(
     fn_name_str: &str,
     item_fn: &ItemFn,
     return_kind: &ProtocolReturnKind,
 ) -> proc_macro2::TokenStream {
+    let is_main = fn_name_str == "main";
     let body = &item_fn.block;
     let input_serialization = gen_sequence_input_serialization(&item_fn);
     let auth_result_binding = auth_result_binding(return_kind, body);
     let trace_output_binding = trace_output_binding(return_kind);
+
+    let sequence_start_publish = if is_main {
+        quote! {}
+    } else {
+        quote! {
+            ::raster::publish_trace_event(::raster::core::trace::TraceEvent::SequenceStart(
+                __raster_record.clone(),
+            ));
+        }
+    };
 
     let output_type_expr = match &item_fn.sig.output {
         ReturnType::Default => quote! { "()" },
@@ -3456,9 +2341,7 @@ fn gen_sequence_wrapped_body(
                     output: ::core::option::Option::None,
                     draft_transition_witness: ::core::option::Option::None,
                 };
-                ::raster::publish_trace_event(::raster::core::trace::TraceEvent::SequenceStart(
-                    __raster_record.clone(),
-                ));
+                #sequence_start_publish
                 let __raster_sequence_start_event_publish_ns =
                     ::core::primitive::u64::try_from(
                         __raster_sequence_start_event_publish_start.elapsed().as_nanos()
@@ -3519,9 +2402,7 @@ fn gen_sequence_wrapped_body(
                     output: ::core::option::Option::None,
                     draft_transition_witness: ::core::option::Option::None,
                 };
-                ::raster::publish_trace_event(::raster::core::trace::TraceEvent::SequenceStart(
-                    __raster_record.clone(),
-                ));
+                #sequence_start_publish
                 #auth_result_binding
                 #trace_output_binding
                 __raster_record.output = ::core::option::Option::Some(::raster::core::trace::FnOutput::new(
@@ -3545,6 +2426,97 @@ fn gen_sequence_wrapped_body(
     }
 }
 
+/// Whether a return type denotes unit — bare `()` or a `Result<(), _>`.
+/// Mirrors the CFS builder's `type_is_unit`, keeping the macro's
+/// output-emission decision in step with `SequenceDef::produces_output`.
+fn type_is_unit(ty: &Type) -> bool {
+    match ty {
+        Type::Tuple(tuple) => tuple.elems.is_empty(),
+        Type::Path(type_path) => {
+            let Some(segment) = type_path.path.segments.last() else {
+                return false;
+            };
+            if segment.ident != "Result" {
+                return false;
+            }
+            let PathArguments::AngleBracketed(args) = &segment.arguments else {
+                return false;
+            };
+            match args.args.first() {
+                Some(GenericArgument::Type(inner)) => type_is_unit(inner),
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+/// The statements that publish `main`'s terminal `ProgramEnd` event, given the
+/// `AuthRef` result bound as `__raster_result`. A non-unit output is exported
+/// as the program's output artifact and its storage binding committed; unit
+/// (or `Result<(), _>`) binds nothing; a fallible `main` that returned `Err`
+/// publishes nothing at all (its trace is left incomplete, hence unattestable).
+fn gen_main_end_publish(return_kind: &ProtocolReturnKind) -> proc_macro2::TokenStream {
+    match return_kind {
+        ProtocolReturnKind::Unit => quote! { ::raster::end_program_unit(); },
+        ProtocolReturnKind::Value(ty) => {
+            if type_is_unit(ty) {
+                quote! { ::raster::end_program_unit(); }
+            } else {
+                quote! { ::raster::end_program_output(&__raster_result); }
+            }
+        }
+        ProtocolReturnKind::Fallible(ty) => {
+            let ok_end = if type_is_unit(ty) {
+                quote! { ::raster::end_program_unit(); }
+            } else {
+                quote! { ::raster::end_program_output(__raster_ok_ref); }
+            };
+            quote! {
+                match &__raster_result {
+                    ::core::result::Result::Ok(__raster_ok_ref) => { #ok_end }
+                    // A failed run publishes no ProgramEnd: an incomplete trace
+                    // cannot be attested as a completed program execution.
+                    ::core::result::Result::Err(_) => {}
+                }
+            }
+        }
+        _ => panic!("`main` must return unit, a value, or a Result of one"),
+    }
+}
+
+/// Generates `main`'s wrapped body. Unlike an ordinary sequence, `main`'s
+/// boundaries are the program-level `ProgramStart` (published by the
+/// entry-argument prelude prepended to the body) and `ProgramEnd` (published
+/// here). It takes no sequence arguments and publishes no sequence events.
+fn gen_main_wrapped_body(
+    item_fn: &ItemFn,
+    return_kind: &ProtocolReturnKind,
+) -> proc_macro2::TokenStream {
+    let body = &item_fn.block;
+    let auth_result_binding = auth_result_binding(return_kind, body);
+    let end_publish = gen_main_end_publish(return_kind);
+
+    quote! {
+        #[cfg(all(feature = "std", not(target_arch = "riscv32")))]
+        {
+            let __raster_sequence_scope_guard =
+                ::raster::__private::SequenceScopeGuard::enter("main");
+            #auth_result_binding
+            #end_publish
+            __raster_result
+        }
+
+        #[cfg(not(all(feature = "std", not(target_arch = "riscv32"))))]
+        {
+            let __raster_sequence_scope_guard =
+                ::raster::__private::SequenceScopeGuard::enter("main");
+            #auth_result_binding
+            __raster_result
+        }
+    }
+}
+
 /// Declares a sequence of tiles with linear control flow.
 ///
 /// The `#[sequence]` macro parses the function body to extract tile calls
@@ -3552,7 +2524,9 @@ fn gen_sequence_wrapped_body(
 /// and the sequence is registered for use with `cargo raster preview`.
 ///
 /// When the function is named **`main`**, it is the program entry point: the macro expands to
-/// `fn main() { init(); sequence_wrapped_body; finish(); }`.
+/// `fn main() { init(); sequence_wrapped_body; finish(); }`. `main`'s declared parameters are
+/// its *entry arguments*: each is bound at startup from the manifest-declared external input
+/// of the same name (`--input`/`--input-manifest`) and arrives as an ordinary typed binding.
 ///
 /// # Attributes
 /// - `description = "..."` - Human-readable description of the sequence
@@ -3560,10 +2534,10 @@ fn gen_sequence_wrapped_body(
 /// # Example (entry point)
 /// ```ignore
 /// #[raster::sequence]
-/// fn main() {
-///     let name = raster::select!(String, raster::external!(String, "name"));
-///     let result = greet_sequence(name);
-///     println!("{}", result);
+/// fn main(name: String) {
+///     let name = raster::select!(String, name);
+///     let result = call_seq!(greet_sequence, name);
+///     println!("{:?}", result);
 /// }
 /// ```
 ///
@@ -3602,31 +2576,49 @@ pub fn sequence(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 
     let expanded = if item_fn.sig.ident == "main" {
-        if !params.is_empty() {
-            panic!(
-                "`#[sequence] fn main` must not declare parameters. Bind committed inputs explicitly inside the body with external!(...)."
-            );
-        }
+        prepend_entry_argument_prelude(&mut item_fn.block, &params);
+        // `main`'s declared parameters are entry arguments bound inside the
+        // body by the prelude above, not caller-supplied `SequenceScope`
+        // arguments — main has no caller. Clear the signature so the wrapped
+        // body sees no parameters.
+        item_fn.sig.inputs = syn::punctuated::Punctuated::new();
 
-        let output = &item_fn.sig.output;
         let auth_name = format_ident!("__raster_sequence_auth_main");
         let auth_output = auth_return_type(&return_kind);
-        let body = gen_sequence_wrapped_body("main", &item_fn, &return_kind);
-        let materialize_result = materialize_main_result(&return_kind);
+        let body = gen_main_wrapped_body(&item_fn, &return_kind);
+
+        // `main`'s declared return type is the program's *output declaration*,
+        // exported as an artifact by `ProgramEnd`, not the process return
+        // value: the generated `fn main` returns `()` (or `Result<(), _>` so a
+        // failed run still exits non-zero). See `gen_main_end_publish`.
+        let (main_output, main_tail) = match &return_kind {
+            ProtocolReturnKind::Fallible(_) => (
+                quote! { -> ::raster::exec::Result<()> },
+                quote! {
+                    let __raster_auth_result = #auth_name();
+                    ::raster::finish();
+                    __raster_auth_result.map(|_| ())
+                },
+            ),
+            // Unit and value returns: the value (if any) went to the artifact.
+            _ => (
+                quote! {},
+                quote! {
+                    let _ = #auth_name();
+                    ::raster::finish();
+                },
+            ),
+        };
+
         quote! {
             fn #auth_name() -> #auth_output {
                 #body
             }
 
             #(#fn_attrs)*
-            fn main() #output {
+            fn main() #main_output {
                 ::raster::init();
-
-                let __raster_auth_result = #auth_name();
-                #materialize_result
-
-                ::raster::finish();
-                __raster_result
+                #main_tail
             }
         }
     } else {

@@ -5,13 +5,13 @@ use std::vec::Vec;
 
 use crate::cfs::CfsCoordinates;
 use crate::transition::{
-    CoordinateIndexMembershipProof, CoordinateIndexNonMembershipProof, InternalStoreIndexValue,
+    CoordinateIndexMembershipProof, CoordinateIndexNonMembershipProof, StorageIndexValue,
 };
 
 const INDEX_BITS: usize = 256;
-const EMPTY_LEAF_DOMAIN: &[u8] = b"raster-internal-index-empty";
-const LEAF_DOMAIN: &[u8] = b"raster-internal-index-leaf";
-const NODE_DOMAIN: &[u8] = b"raster-internal-index-node";
+const EMPTY_LEAF_DOMAIN: &[u8] = b"raster-storage-index-empty";
+const LEAF_DOMAIN: &[u8] = b"raster-storage-index-leaf";
+const NODE_DOMAIN: &[u8] = b"raster-storage-index-node";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct NodeKey {
@@ -21,7 +21,7 @@ struct NodeKey {
 
 #[derive(Debug, Clone)]
 pub struct IncrementalCoordinateIndex {
-    entries: BTreeMap<CfsCoordinates, InternalStoreIndexValue>,
+    entries: BTreeMap<CfsCoordinates, StorageIndexValue>,
     occupied_keys: HashMap<[u8; 32], CfsCoordinates>,
     node_hashes: HashMap<NodeKey, Vec<u8>>,
     empty_hashes: Vec<Vec<u8>>,
@@ -40,7 +40,7 @@ impl IncrementalCoordinateIndex {
         }
     }
 
-    pub fn from_entries(entries: &BTreeMap<CfsCoordinates, InternalStoreIndexValue>) -> Self {
+    pub fn from_entries(entries: &BTreeMap<CfsCoordinates, StorageIndexValue>) -> Self {
         let mut index = Self::new();
         for (coordinates, value) in entries {
             index.insert(coordinates.clone(), value.clone());
@@ -56,14 +56,14 @@ impl IncrementalCoordinateIndex {
         self.entries.contains_key(coordinates)
     }
 
-    pub fn get(&self, coordinates: &CfsCoordinates) -> Option<&InternalStoreIndexValue> {
+    pub fn get(&self, coordinates: &CfsCoordinates) -> Option<&StorageIndexValue> {
         self.entries.get(coordinates)
     }
 
-    pub fn insert(&mut self, coordinates: CfsCoordinates, value: InternalStoreIndexValue) {
+    pub fn insert(&mut self, coordinates: CfsCoordinates, value: StorageIndexValue) {
         assert!(
             !self.entries.contains_key(&coordinates),
-            "Duplicate internal store write at coordinates {:?}",
+            "Duplicate storage write at coordinates {:?}",
             coordinates
         );
 
@@ -71,7 +71,7 @@ impl IncrementalCoordinateIndex {
         if let Some(existing_coordinates) = self.occupied_keys.get(&key) {
             assert_eq!(
                 existing_coordinates, &coordinates,
-                "Coordinate index hash collision for internal store entries",
+                "Coordinate index hash collision for storage entries",
             );
         }
 
@@ -81,7 +81,7 @@ impl IncrementalCoordinateIndex {
         let previous = self.occupied_keys.insert(key, coordinates.clone());
         assert!(
             previous.is_none(),
-            "Coordinate index hash collision for internal store entries",
+            "Coordinate index hash collision for storage entries",
         );
 
         let mut current = leaf;
@@ -175,13 +175,13 @@ fn combine_node_hash(depth: usize, left: &[u8], right: &[u8]) -> Vec<u8> {
 
 fn coordinates_key(coordinates: &CfsCoordinates) -> [u8; 32] {
     let bytes = postcard::to_allocvec(coordinates).unwrap_or_default();
-    let key = sha256(&[b"raster-internal-index-key", &bytes]);
+    let key = sha256(&[b"raster-storage-index-key", &bytes]);
     let mut array = [0u8; 32];
     array.copy_from_slice(&key);
     array
 }
 
-fn leaf_hash(key: &[u8], value: &InternalStoreIndexValue) -> Vec<u8> {
+fn leaf_hash(key: &[u8], value: &StorageIndexValue) -> Vec<u8> {
     let value_bytes = postcard::to_allocvec(value).unwrap_or_default();
     sha256(&[LEAF_DOMAIN, key, &value_bytes])
 }
@@ -224,21 +224,19 @@ fn child_node_key(key: &[u8; 32], depth: usize, bit: bool) -> NodeKey {
     }
 }
 
-pub fn coordinate_index_root(
-    entries: &BTreeMap<CfsCoordinates, InternalStoreIndexValue>,
-) -> Vec<u8> {
+pub fn coordinate_index_root(entries: &BTreeMap<CfsCoordinates, StorageIndexValue>) -> Vec<u8> {
     IncrementalCoordinateIndex::from_entries(entries).root()
 }
 
 pub fn coordinate_index_membership_proof(
-    entries: &BTreeMap<CfsCoordinates, InternalStoreIndexValue>,
+    entries: &BTreeMap<CfsCoordinates, StorageIndexValue>,
     coordinates: &CfsCoordinates,
 ) -> Option<CoordinateIndexMembershipProof> {
     IncrementalCoordinateIndex::from_entries(entries).membership_proof(coordinates)
 }
 
 pub fn coordinate_index_non_membership_proof(
-    entries: &BTreeMap<CfsCoordinates, InternalStoreIndexValue>,
+    entries: &BTreeMap<CfsCoordinates, StorageIndexValue>,
     coordinates: &CfsCoordinates,
 ) -> CoordinateIndexNonMembershipProof {
     IncrementalCoordinateIndex::from_entries(entries).non_membership_proof(coordinates)
@@ -293,10 +291,10 @@ pub fn verify_coordinate_index_non_membership(
 mod tests {
     use super::*;
 
-    type IndexedEntries<'a> = Vec<(&'a CfsCoordinates, [u8; 32], &'a InternalStoreIndexValue)>;
+    type IndexedEntries<'a> = Vec<(&'a CfsCoordinates, [u8; 32], &'a StorageIndexValue)>;
 
     fn legacy_indexed_entries<'a>(
-        entries: &'a BTreeMap<CfsCoordinates, InternalStoreIndexValue>,
+        entries: &'a BTreeMap<CfsCoordinates, StorageIndexValue>,
     ) -> IndexedEntries<'a> {
         entries
             .iter()
@@ -305,7 +303,7 @@ mod tests {
     }
 
     fn legacy_subtree_hash(
-        entries: &[(&CfsCoordinates, [u8; 32], &InternalStoreIndexValue)],
+        entries: &[(&CfsCoordinates, [u8; 32], &StorageIndexValue)],
         depth: usize,
         empty: &[Vec<u8>],
     ) -> Vec<u8> {
@@ -316,7 +314,7 @@ mod tests {
             assert_eq!(
                 entries.len(),
                 1,
-                "Coordinate index hash collision for internal store entries",
+                "Coordinate index hash collision for storage entries",
             );
             let (_, key, value) = &entries[0];
             return leaf_hash(key, value);
@@ -338,7 +336,7 @@ mod tests {
     }
 
     fn legacy_collect_siblings(
-        entries: &[(&CfsCoordinates, [u8; 32], &InternalStoreIndexValue)],
+        entries: &[(&CfsCoordinates, [u8; 32], &StorageIndexValue)],
         key: &[u8; 32],
         depth: usize,
         empty: &[Vec<u8>],
@@ -367,13 +365,13 @@ mod tests {
         }
     }
 
-    fn legacy_root(entries: &BTreeMap<CfsCoordinates, InternalStoreIndexValue>) -> Vec<u8> {
+    fn legacy_root(entries: &BTreeMap<CfsCoordinates, StorageIndexValue>) -> Vec<u8> {
         let empty = empty_hashes();
         legacy_subtree_hash(&legacy_indexed_entries(entries), 0, &empty)
     }
 
     fn legacy_membership(
-        entries: &BTreeMap<CfsCoordinates, InternalStoreIndexValue>,
+        entries: &BTreeMap<CfsCoordinates, StorageIndexValue>,
         coordinates: &CfsCoordinates,
     ) -> Option<CoordinateIndexMembershipProof> {
         let value = entries.get(coordinates)?.clone();
@@ -395,7 +393,7 @@ mod tests {
     }
 
     fn legacy_non_membership(
-        entries: &BTreeMap<CfsCoordinates, InternalStoreIndexValue>,
+        entries: &BTreeMap<CfsCoordinates, StorageIndexValue>,
         coordinates: &CfsCoordinates,
     ) -> CoordinateIndexNonMembershipProof {
         let empty = empty_hashes();
@@ -414,25 +412,25 @@ mod tests {
         }
     }
 
-    fn sample_entries() -> BTreeMap<CfsCoordinates, InternalStoreIndexValue> {
+    fn sample_entries() -> BTreeMap<CfsCoordinates, StorageIndexValue> {
         let mut entries = BTreeMap::new();
         entries.insert(
             CfsCoordinates(vec![1]),
-            InternalStoreIndexValue {
+            StorageIndexValue {
                 log_position: 7,
                 object_commitment: vec![1; 32],
             },
         );
         entries.insert(
             CfsCoordinates(vec![2, 3]),
-            InternalStoreIndexValue {
+            StorageIndexValue {
                 log_position: 8,
                 object_commitment: vec![2; 32],
             },
         );
         entries.insert(
             CfsCoordinates(vec![4, 5, 6]),
-            InternalStoreIndexValue {
+            StorageIndexValue {
                 log_position: 9,
                 object_commitment: vec![3; 32],
             },
@@ -480,7 +478,7 @@ mod tests {
         let mut index = IncrementalCoordinateIndex::new();
         index.insert(
             CfsCoordinates(vec![1]),
-            InternalStoreIndexValue {
+            StorageIndexValue {
                 log_position: 1,
                 object_commitment: vec![7; 32],
             },
@@ -489,7 +487,7 @@ mod tests {
         let before = index.non_membership_proof(&coordinates);
         index.insert(
             coordinates.clone(),
-            InternalStoreIndexValue {
+            StorageIndexValue {
                 log_position: 2,
                 object_commitment: vec![8; 32],
             },

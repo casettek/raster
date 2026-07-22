@@ -13,38 +13,14 @@ use std::collections::BTreeMap;
 
 pub type Hash32 = [u8; 32];
 
-/// A lightweight reference to a named external input.
+/// A lightweight reference to an immutable storage object.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub struct ExternalRef {
-    pub name: String,
-    #[serde(default)]
-    pub selector: SelectorPath,
-}
-
-impl ExternalRef {
-    pub fn new(name: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            selector: SelectorPath::default(),
-        }
-    }
-
-    pub fn with_selector(name: impl Into<String>, selector: SelectorPath) -> Self {
-        Self {
-            name: name.into(),
-            selector,
-        }
-    }
-}
-
-/// A lightweight reference to an immutable internal store object.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub struct InternalRef {
+pub struct StorageRef {
     pub coordinates: CfsCoordinates,
     pub commitment: Vec<u8>,
 }
 
-impl InternalRef {
+impl StorageRef {
     pub fn new(coordinates: CfsCoordinates, commitment: Vec<u8>) -> Self {
         Self {
             coordinates,
@@ -168,8 +144,16 @@ pub struct ListProofSibling {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum SelectionProofStep {
     Struct {
+        /// Which of `field_names` this step descends into. The selected
+        /// child's root is the hash carried in from the step below; the
+        /// other fields' roots are `siblings`, in ascending position order
+        /// with `field_index` skipped.
         field_index: u64,
-        field_count: u64,
+        /// Every field of the struct, in declaration order — names
+        /// included, because they are part of the struct commitment (see
+        /// [`struct_commitments_root`]) and are what binds this step to a
+        /// selector path segment.
+        field_names: Vec<String>,
         siblings: Vec<Hash32>,
     },
     List {
@@ -225,6 +209,35 @@ fn selection_hash(parts: &[&[u8]]) -> Hash32 {
     let mut hasher = Sha256::new();
     for part in parts {
         hasher.update(part);
+    }
+    hasher.finalize().into()
+}
+
+/// The one definition of a struct node's commitment: the `b"struct"` domain
+/// tag followed by each field's `(name, child_root)`, in declaration order.
+///
+/// Every producer and verifier of a selection tree must agree on this
+/// byte-for-byte — the selection-tree assembler, the draft value hasher, the
+/// selection prover, the proof verifier, and `main`'s entry-argument
+/// binding all commit to structs, and a divergence between any two of them
+/// is a silent verification failure. It lives here, in the crate every side
+/// already depends on, so there is nothing to keep in sync.
+///
+/// Field names are part of the hash (length-prefixed, so `("ab", "c")` and
+/// `("a", "bc")` cannot collide). That is what makes a selection path
+/// structural rather than advisory: a proof recombining a child through a
+/// *different* field's position yields a different root, so
+/// `verify_selection_proof` can hold a claimed path to the positions its
+/// steps actually prove.
+pub fn struct_commitments_root<'a>(
+    fields: impl IntoIterator<Item = (&'a str, &'a [u8])>,
+) -> Hash32 {
+    let mut hasher = Sha256::new();
+    hasher.update(b"struct");
+    for (name, child_root) in fields {
+        hasher.update((name.len() as u64).to_le_bytes());
+        hasher.update(name.as_bytes());
+        hasher.update(child_root);
     }
     hasher.finalize().into()
 }
@@ -285,8 +298,9 @@ fn parse_subtree_root(bytes: &[u8], offset: &mut usize) -> Option<Hash32> {
         }
         0x01 => {
             let field_count = parse_u64(bytes, offset)? as usize;
-            let mut child_roots = Vec::with_capacity(field_count);
+            let mut fields = Vec::with_capacity(field_count);
             for _ in 0..field_count {
+                let name = parse_utf8(bytes, offset)?;
                 let child_len = parse_u64(bytes, offset)? as usize;
                 let end = offset.checked_add(child_len)?;
                 let child_bytes = bytes.get(*offset..end)?;
@@ -296,15 +310,14 @@ fn parse_subtree_root(bytes: &[u8], offset: &mut usize) -> Option<Hash32> {
                     return None;
                 }
                 *offset = end;
-                child_roots.push(child_root);
+                fields.push((String::from_utf8(name).ok()?, child_root));
             }
 
-            let mut parts: Vec<&[u8]> = Vec::with_capacity(child_roots.len() + 1);
-            parts.push(b"struct");
-            for root in &child_roots {
-                parts.push(root.as_slice());
-            }
-            Some(selection_hash(&parts))
+            Some(struct_commitments_root(
+                fields
+                    .iter()
+                    .map(|(name, root)| (name.as_str(), root.as_slice())),
+            ))
         }
         0x02 => {
             let len = parse_u64(bytes, offset)?;
@@ -439,6 +452,57 @@ fn parse_subtree_root(bytes: &[u8], offset: &mut usize) -> Option<Hash32> {
     }
 }
 
+/// Recompute the raster **structural root** of a canonical payload — the same
+/// hash a manifest entry commits for a value (`encode_raster_value`'s root) and
+/// the one `verify_selection_proof` walks a selection against. It is a pure,
+/// public function of the payload bytes alone (no index needed), so a chain
+/// verifier holding a program's `output.bin` can recompute the manifest-side
+/// link hash without any runtime-crate internals. Returns `None` if `bytes` is
+/// not a well-formed, fully-consumed payload. See `docs/proposals/program-chain.md`.
+pub fn payload_structural_root(bytes: &[u8]) -> Option<Hash32> {
+    let mut offset = 0;
+    let root = parse_subtree_root(bytes, &mut offset)?;
+    // A valid payload is consumed exactly; trailing bytes mean a malformed or
+    // truncated artifact, which must not silently produce a root.
+    if offset != bytes.len() {
+        return None;
+    }
+    Some(root)
+}
+
+/// Check that `step` proves exactly the descent `segment` names.
+///
+/// Recombining hashes only proves that *some* child sits under the root; it
+/// says nothing about which one the caller claimed. Since a
+/// `SelectionCommitment` is trusted elsewhere by its `path` (that is how a
+/// consumer knows which value it is looking at), each step must be pinned
+/// to its path segment, or a witness could prove the bytes at one field
+/// while claiming the path of another.
+fn step_proves_segment(step: &SelectionProofStep, segment: &SelectorSegment) -> bool {
+    match (step, segment) {
+        (
+            SelectionProofStep::Struct {
+                field_index,
+                field_names,
+                ..
+            },
+            SelectorSegment::Field(name),
+        ) => field_names
+            .get(*field_index as usize)
+            .is_some_and(|proven| proven == name),
+        (SelectionProofStep::List { index, .. }, SelectorSegment::Index(claimed)) => {
+            index == claimed
+        }
+        // A range step is pinned to a range segment by its start; the slice
+        // width is checked against the payload in `fold_list_range`.
+        (
+            SelectionProofStep::ListRange { start, .. },
+            SelectorSegment::Range { start: claimed, .. },
+        ) => start == claimed,
+        _ => false,
+    }
+}
+
 /// Parse a list-encoded payload (kind 0x02) into its element subtree roots.
 /// Returns `None` when the payload is not a list or its length field does not
 /// match the number of encoded children.
@@ -539,6 +603,20 @@ fn fold_list_range(
 }
 
 pub fn verify_selection_proof(selected_bytes: &[u8], proof: &SelectionProof) -> bool {
+    // One step per path segment, outermost first in both — anything else is
+    // a proof that does not describe the path it claims.
+    if proof.steps.len() != proof.path.segments.len() {
+        return false;
+    }
+    if !proof
+        .steps
+        .iter()
+        .zip(proof.path.segments.iter())
+        .all(|(step, segment)| step_proves_segment(step, segment))
+    {
+        return false;
+    }
+
     // A ListRange step may only appear as the final (deepest) proof step; it
     // derives the starting hash from the payload's element roots instead of
     // the payload's own subtree root.
@@ -572,11 +650,11 @@ pub fn verify_selection_proof(selected_bytes: &[u8], proof: &SelectionProof) -> 
         current_hash = match step {
             SelectionProofStep::Struct {
                 field_index,
-                field_count,
+                field_names,
                 siblings,
             } => {
                 let field_index = *field_index as usize;
-                let field_count = *field_count as usize;
+                let field_count = field_names.len();
                 if field_index >= field_count || siblings.len() + 1 != field_count {
                     return false;
                 }
@@ -585,20 +663,20 @@ pub fn verify_selection_proof(selected_bytes: &[u8], proof: &SelectionProof) -> 
                 let mut sibling_iter = siblings.iter();
                 for idx in 0..field_count {
                     if idx == field_index {
-                        child_roots.push(current_hash.clone());
+                        child_roots.push(current_hash);
                     } else if let Some(sibling) = sibling_iter.next() {
-                        child_roots.push(sibling.clone());
+                        child_roots.push(*sibling);
                     } else {
                         return false;
                     }
                 }
 
-                let mut parts: Vec<&[u8]> = Vec::with_capacity(child_roots.len() + 1);
-                parts.push(b"struct");
-                for root in &child_roots {
-                    parts.push(root.as_slice());
-                }
-                selection_hash(&parts)
+                struct_commitments_root(
+                    field_names
+                        .iter()
+                        .map(String::as_str)
+                        .zip(child_roots.iter().map(Hash32::as_slice)),
+                )
             }
             SelectionProofStep::List {
                 index,
@@ -701,42 +779,9 @@ impl From<i32> for SelectorSegment {
     }
 }
 
-/// A caller-owned external selection passed through `external!(...)`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ExternalSelection {
-    pub reference: ExternalRef,
-}
-
-impl ExternalSelection {
-    pub fn new(name: impl Into<String>) -> Self {
-        Self {
-            reference: ExternalRef::new(name),
-        }
-    }
-
-    pub fn with_selector(name: impl Into<String>, selector: SelectorPath) -> Self {
-        Self {
-            reference: ExternalRef::with_selector(name, selector),
-        }
-    }
-
-    pub fn name(&self) -> &str {
-        &self.reference.name
-    }
-
-    pub fn selector(&self) -> &SelectorPath {
-        &self.reference.selector
-    }
-
-    pub fn into_ref(self) -> ExternalRef {
-        self.reference
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum AuthValue<T> {
-    External(ExternalValue<T>),
-    Internal(InternalValue<T>),
+    Storage(StorageValue<T>),
     Inline(T),
 }
 
@@ -745,90 +790,37 @@ impl<T> AuthValue<T> {
         Self::Inline(value)
     }
 
-    pub fn external(value: ExternalValue<T>) -> Self {
-        Self::External(value)
-    }
-
-    pub fn internal(value: InternalValue<T>) -> Self {
-        Self::Internal(value)
+    pub fn storage(value: StorageValue<T>) -> Self {
+        Self::Storage(value)
     }
 
     pub fn into_inner(self) -> T {
         match self {
-            Self::External(external) => external.value,
-            Self::Internal(internal) => internal.value,
+            Self::Storage(storage) => storage.value,
             Self::Inline(value) => value,
         }
     }
 
-    pub fn as_external(&self) -> Option<&ExternalValue<T>> {
+    pub fn as_storage(&self) -> Option<&StorageValue<T>> {
         match self {
-            Self::External(external) => Some(external),
+            Self::Storage(storage) => Some(storage),
             Self::Inline(_) => None,
-            Self::Internal(_) => None,
-        }
-    }
-
-    pub fn as_internal(&self) -> Option<&InternalValue<T>> {
-        match self {
-            Self::Internal(internal) => Some(internal),
-            Self::External(_) | Self::Inline(_) => None,
         }
     }
 }
 
-/// A resolved external value carrying both identity metadata and the typed value.
+/// A resolved storage value carrying both identity metadata and the typed value.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub struct ExternalValue<T> {
-    pub name: String,
-    pub selector: SelectorPath,
-    pub commitment: Option<String>,
-    pub selected: SelectedPayload,
-    pub value: T,
-}
-
-impl<T> ExternalValue<T> {
-    pub fn new(
-        name: impl Into<String>,
-        selector: SelectorPath,
-        commitment: Option<String>,
-        selected: SelectedPayload,
-        value: T,
-    ) -> Self {
-        Self {
-            name: name.into(),
-            selector,
-            commitment,
-            selected,
-            value,
-        }
-    }
-
-    pub fn into_inner(self) -> T {
-        self.value
-    }
-
-    pub fn bytes(&self) -> &[u8] {
-        &self.selected.bytes
-    }
-
-    pub fn selected(&self) -> &SelectedPayload {
-        &self.selected
-    }
-}
-
-/// A resolved internal value carrying both identity metadata and the typed value.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub struct InternalValue<T> {
-    pub reference: InternalRef,
+pub struct StorageValue<T> {
+    pub reference: StorageRef,
     pub bytes: Vec<u8>,
     pub selector: SelectorPath,
     pub selection: SelectionCommitment,
     pub value: T,
 }
 
-impl<T> InternalValue<T> {
-    pub fn new(reference: InternalRef, bytes: Vec<u8>, value: T) -> Self {
+impl<T> StorageValue<T> {
+    pub fn new(reference: StorageRef, bytes: Vec<u8>, value: T) -> Self {
         Self::new_with_selection(
             reference,
             bytes,
@@ -839,7 +831,7 @@ impl<T> InternalValue<T> {
     }
 
     pub fn new_with_selection(
-        reference: InternalRef,
+        reference: StorageRef,
         bytes: Vec<u8>,
         selector: SelectorPath,
         selection: SelectionCommitment,
@@ -1132,33 +1124,21 @@ mod tests {
     fn auth_value_helpers_preserve_inline_values() {
         let arg = AuthValue::inline(7u64);
 
-        assert!(arg.as_external().is_none());
+        assert!(arg.as_storage().is_none());
         assert_eq!(arg.into_inner(), 7);
     }
 
     #[test]
-    fn auth_value_helpers_preserve_external_metadata() {
-        let selected = SelectedPayload {
-            bytes: alloc::vec![1, 2, 3],
-            commitment: SelectionCommitment {
-                path: SelectorPath::default(),
-                source_root_hash: [4; 32],
-                selected_hash: [7; 32],
-                selected_len: 3,
-            },
-        };
-        let arg = AuthValue::external(ExternalValue::new(
-            "payload",
-            SelectorPath::default(),
-            Some("abc123".to_string()),
-            selected.clone(),
+    fn auth_value_helpers_preserve_storage_metadata() {
+        let reference = StorageRef::new(CfsCoordinates(alloc::vec![0]), alloc::vec![4; 32]);
+        let arg = AuthValue::storage(StorageValue::new(
+            reference.clone(),
+            alloc::vec![1, 2, 3],
             9u64,
         ));
 
-        let external = arg.as_external().expect("expected external metadata");
-        assert_eq!(external.name, "payload");
-        assert_eq!(external.commitment.as_deref(), Some("abc123"));
-        assert_eq!(external.selected, selected);
+        let storage = arg.as_storage().expect("expected storage metadata");
+        assert_eq!(storage.reference, reference);
         assert_eq!(arg.into_inner(), 9);
     }
 
@@ -1319,15 +1299,27 @@ mod tests {
         let (payload, mut proof) = range_fixture(9, 2, 5);
         let list_root = proof.root_hash;
         let sibling_root = leaf_root(b"other-field");
-        let struct_root = selection_hash(&[b"struct", &list_root, &sibling_root]);
+        let field_names = alloc::vec!["slice".to_string(), "other".to_string()];
+        let struct_root = struct_commitments_root(
+            field_names
+                .iter()
+                .map(String::as_str)
+                .zip([list_root.as_slice(), sibling_root.as_slice()]),
+        );
         proof.steps.insert(
             0,
             SelectionProofStep::Struct {
                 field_index: 0,
-                field_count: 2,
+                field_names: field_names.clone(),
                 siblings: alloc::vec![sibling_root],
             },
         );
+        // The struct step must be pinned to a matching path segment; the range
+        // slice lives under field 0.
+        proof
+            .path
+            .segments
+            .insert(0, SelectorSegment::Field("slice".to_string()));
         proof.root_hash = struct_root;
         assert!(verify_selection_proof(&payload, &proof));
     }

@@ -5,7 +5,7 @@
 //! 1. Attach to the chain: genesis state (`Init`) or a recursively verified
 //!    previous transition journal (`Next`).
 //! 2. Verify the step against every recorded commitment (CFS bindings,
-//!    IO/replay, internal store, draft chain) and append it to the trace
+//!    IO/replay, storage, draft chain) and append it to the trace
 //!    frontier + fingerprint.
 //! 3. Compare the accumulated fingerprint with the committed one and commit
 //!    the resulting journal (`Next`, or `Finished` on the proven divergence).
@@ -41,7 +41,9 @@ fn main() {
     let (window_context, current) = FraudProofWindowContext::proceed(&params, &input, state);
 
     // Verify every recorded aspect of the step and advance the state.
-    let next = current.apply_verified_step(&params.cfs_cursor, &input);
+    let next = current.apply_verified_step(&params.program, &params.cfs_cursor, &input);
+    let entrypoint_authorization = next.entrypoint_authorization();
+    let output_authorization = next.output_authorization();
 
     // Continue the window, or finish on the proven fingerprint divergence.
     let current_state = next.finalize(
@@ -53,6 +55,9 @@ fn main() {
         window_context.init_state,
         current_state,
         params.transition_image_id,
+        params.program_commitment,
         &input,
+        entrypoint_authorization,
+        output_authorization,
     );
 }

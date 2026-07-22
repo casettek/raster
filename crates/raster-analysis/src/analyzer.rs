@@ -88,9 +88,9 @@ fn ingest_tile_record(metrics: &mut Metrics, record: &raster_runtime::TileProfil
     metrics.total_tile_external_input_resolve_ns = metrics
         .total_tile_external_input_resolve_ns
         .saturating_add(record.external_input_resolve_ns);
-    metrics.total_tile_internal_input_resolve_ns = metrics
-        .total_tile_internal_input_resolve_ns
-        .saturating_add(record.internal_input_resolve_ns);
+    metrics.total_tile_storage_input_resolve_ns = metrics
+        .total_tile_storage_input_resolve_ns
+        .saturating_add(record.storage_input_resolve_ns);
     metrics.total_tile_output_store_ns = metrics
         .total_tile_output_store_ns
         .saturating_add(record.output_store_ns);
@@ -123,7 +123,7 @@ fn ingest_tile_record(metrics: &mut Metrics, record: &raster_runtime::TileProfil
         user_duration_ns: record.user_duration_ns,
         raster_overhead_ns: record.raster_overhead_ns,
         external_input_resolve_ns: record.external_input_resolve_ns,
-        internal_input_resolve_ns: record.internal_input_resolve_ns,
+        storage_input_resolve_ns: record.storage_input_resolve_ns,
         output_store_ns: record.output_store_ns,
         trace_serialize_ns: record.trace_serialize_ns,
         draft_capture_ns: record.draft_capture_ns,
@@ -151,9 +151,9 @@ fn ingest_tile_record(metrics: &mut Metrics, record: &raster_runtime::TileProfil
     tile_metrics.total_external_input_resolve_ns = tile_metrics
         .total_external_input_resolve_ns
         .saturating_add(record.external_input_resolve_ns);
-    tile_metrics.total_internal_input_resolve_ns = tile_metrics
-        .total_internal_input_resolve_ns
-        .saturating_add(record.internal_input_resolve_ns);
+    tile_metrics.total_storage_input_resolve_ns = tile_metrics
+        .total_storage_input_resolve_ns
+        .saturating_add(record.storage_input_resolve_ns);
     tile_metrics.total_output_store_ns = tile_metrics
         .total_output_store_ns
         .saturating_add(record.output_store_ns);
@@ -262,8 +262,8 @@ fn finalize_tile_averages(
         metrics.avg_raster_overhead_ns = metrics.total_raster_overhead_ns / metrics.invocations;
         metrics.avg_external_input_resolve_ns =
             metrics.total_external_input_resolve_ns / metrics.invocations;
-        metrics.avg_internal_input_resolve_ns =
-            metrics.total_internal_input_resolve_ns / metrics.invocations;
+        metrics.avg_storage_input_resolve_ns =
+            metrics.total_storage_input_resolve_ns / metrics.invocations;
         metrics.avg_output_store_ns = metrics.total_output_store_ns / metrics.invocations;
         metrics.avg_trace_serialize_ns = metrics.total_trace_serialize_ns / metrics.invocations;
         metrics.avg_draft_capture_ns = metrics.total_draft_capture_ns / metrics.invocations;
@@ -321,7 +321,7 @@ mod tests {
                     user_duration_ns: 12,
                     raster_overhead_ns: 8,
                     external_input_resolve_ns: 3,
-                    internal_input_resolve_ns: 1,
+                    storage_input_resolve_ns: 1,
                     output_store_ns: 2,
                     trace_serialize_ns: 1,
                     draft_capture_ns: 0,
@@ -340,7 +340,7 @@ mod tests {
                     user_duration_ns: 6,
                     raster_overhead_ns: 4,
                     external_input_resolve_ns: 1,
-                    internal_input_resolve_ns: 0,
+                    storage_input_resolve_ns: 0,
                     output_store_ns: 1,
                     trace_serialize_ns: 1,
                     draft_capture_ns: 1,
@@ -389,7 +389,7 @@ mod tests {
         assert_eq!(metrics.total_tile_user_duration_ns, 18);
         assert_eq!(metrics.total_tile_raster_overhead_ns, 12);
         assert_eq!(metrics.total_tile_external_input_resolve_ns, 4);
-        assert_eq!(metrics.total_tile_internal_input_resolve_ns, 1);
+        assert_eq!(metrics.total_tile_storage_input_resolve_ns, 1);
         assert_eq!(metrics.total_tile_output_store_ns, 3);
         assert_eq!(metrics.total_tile_scope_enter_ns, 1);
         assert_eq!(metrics.total_tile_output_record_build_ns, 1);

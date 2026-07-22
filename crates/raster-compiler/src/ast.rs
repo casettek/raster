@@ -34,12 +34,19 @@ pub enum CallKind {
     RecursiveSequence,
 }
 
+/// Where a call argument's value comes from, as far as syntax can tell.
+///
+/// The parser's job is only to find the *name* an argument's value flows
+/// from; deciding what that name binds to (a sequence parameter, a prior
+/// item's output, or a local) needs the resolver's tables, not the AST.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CallArgumentKind {
-    Identifier,
-    ExternalBinding,
+    /// The value flows from `root`: a bare identifier, or any expression
+    /// rooted at one — `x.field[0]`, `x.clone()`, `select!(T, x.field)`.
+    Rooted { root: String },
+    /// A literal, or an expression with no identifier at its root: the value
+    /// is materialized in the sequence body itself.
     Inline,
-    Other,
 }
 
 /// Captures detailed information about a function call within a function body.
@@ -72,6 +79,10 @@ pub struct FunctionAstItem {
     pub inputs: Vec<String>,
     pub output: Option<String>,
     pub signature: String,
+    /// `let name = select!(T, root.field)` locals, as `(name, root)`. A
+    /// selection is a view of its source, so uses of `name` must bind to
+    /// whatever `root` binds to.
+    pub selection_aliases: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone)]
@@ -161,6 +172,7 @@ impl ProjectAst {
                 let mut visitor = CallVisitor::new();
                 visitor.visit_item_fn(func);
                 let call_infos = visitor.get_call_infos();
+                let selection_aliases = visitor.get_selection_aliases();
                 let function_info = FunctionAstItem {
                     name,
                     path: path.clone(),
@@ -170,6 +182,7 @@ impl ProjectAst {
                     inputs,
                     output,
                     signature,
+                    selection_aliases,
                 };
                 functions.push(function_info);
             }
@@ -234,10 +247,34 @@ impl ProjectAst {
     }
 }
 
+/// The body of a `select!(Type, expr)` — only `expr` matters here, since it
+/// is what the selection reads from.
+struct SelectionMacroArgs {
+    expr: Expr,
+}
+
+impl Parse for SelectionMacroArgs {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let _selected_ty: syn::Type = input.parse()?;
+        input.parse::<Token![,]>()?;
+        Ok(Self {
+            expr: input.parse()?,
+        })
+    }
+}
+
 pub struct CallVisitor {
     call_infos: Vec<CallInfo>,
     /// Tracks the current let binding name when visiting let statements
     current_binding: Option<String>,
+    /// `let name = select!(T, root.field)` — maps `name` to `root`.
+    ///
+    /// A selection's result carries its source's provenance, so a local
+    /// bound to one is not a fresh value: it must resolve to whatever its
+    /// root resolves to. Without this the resolver would see only an
+    /// unknown identifier and fall back to treating committed data as if it
+    /// were materialized in the body.
+    selection_aliases: Vec<(String, String)>,
 }
 
 impl CallVisitor {
@@ -245,11 +282,16 @@ impl CallVisitor {
         Self {
             call_infos: Vec::new(),
             current_binding: None,
+            selection_aliases: Vec::new(),
         }
     }
 
     fn get_call_infos(&self) -> Vec<CallInfo> {
         self.call_infos.clone()
+    }
+
+    fn get_selection_aliases(&self) -> Vec<(String, String)> {
+        self.selection_aliases.clone()
     }
 
     /// Extracts the binding name from a pattern (e.g., `x` from `let x = ...`)
@@ -524,17 +566,45 @@ impl CallVisitor {
     }
 
     fn classify_argument(expr: &Expr) -> CallArgumentKind {
-        match expr {
-            Expr::Path(path) if path.path.get_ident().is_some() => CallArgumentKind::Identifier,
-            Expr::Macro(expr_macro) if Self::is_external_binding_macro(&expr_macro.mac) => {
-                CallArgumentKind::ExternalBinding
-            }
-            Expr::Lit(_) => CallArgumentKind::Inline,
-            _ => CallArgumentKind::Other,
+        match Self::expr_root_ident(expr) {
+            Some(root) => CallArgumentKind::Rooted { root },
+            None => CallArgumentKind::Inline,
         }
     }
 
-    fn is_external_binding_macro(mac: &syn::Macro) -> bool {
+    /// The identifier whose value an expression ultimately derives from, if
+    /// any: `x` for all of `x`, `x.f[0]`, `x.clone()`, `&x`, `x?` and
+    /// `select!(T, x.f)`.
+    ///
+    /// Narrowing an argument — selecting a field out of it, cloning it,
+    /// indexing it — does not change where it came from, and the CFS binds
+    /// provenance, not shape. Anything not rooted at a name (a literal, a
+    /// constructor call, arithmetic) is materialized in the body itself and
+    /// has no upstream to bind to.
+    pub(crate) fn expr_root_ident(expr: &Expr) -> Option<String> {
+        match expr {
+            Expr::Path(path) => path.path.get_ident().map(|ident| ident.to_string()),
+            Expr::Field(field) => Self::expr_root_ident(&field.base),
+            Expr::Index(index) => Self::expr_root_ident(&index.expr),
+            Expr::MethodCall(call) => Self::expr_root_ident(&call.receiver),
+            Expr::Paren(paren) => Self::expr_root_ident(&paren.expr),
+            Expr::Reference(reference) => Self::expr_root_ident(&reference.expr),
+            Expr::Try(try_expr) => Self::expr_root_ident(&try_expr.expr),
+            Expr::Macro(expr_macro) if Self::is_selection_macro(&expr_macro.mac) => {
+                Self::selection_macro_root(&expr_macro.mac)
+            }
+            _ => None,
+        }
+    }
+
+    /// The root identifier of a `select!(Type, expr)`'s selector expression —
+    /// what the selection reads *from*.
+    fn selection_macro_root(mac: &syn::Macro) -> Option<String> {
+        let args = mac.parse_body_with(SelectionMacroArgs::parse).ok()?;
+        Self::expr_root_ident(&args.expr)
+    }
+
+    fn is_selection_macro(mac: &syn::Macro) -> bool {
         let segments: Vec<String> = mac
             .path
             .segments
@@ -543,10 +613,8 @@ impl CallVisitor {
             .collect();
 
         match segments.as_slice() {
-            [name] if name == "external" || name == "select" => true,
-            [prefix, name] if prefix == "raster" && (name == "external" || name == "select") => {
-                true
-            }
+            [name] => name == "select",
+            [prefix, name] => prefix == "raster" && name == "select",
             _ => false,
         }
     }
@@ -583,6 +651,20 @@ impl CallVisitor {
 impl<'ast> Visit<'ast> for CallVisitor {
     fn visit_local(&mut self, node: &'ast Local) {
         let binding_name = Self::extract_binding_name(&node.pat);
+
+        // `let name = select!(T, root.field)` binds a *view* of `root`, not a
+        // new value — record it so uses of `name` resolve to `root`'s
+        // binding. Call results are handled separately, through
+        // `current_binding` / `result_binding`.
+        if let (Some(name), Some(init)) = (binding_name.as_ref(), node.init.as_ref()) {
+            if let Expr::Macro(expr_macro) = init.expr.as_ref() {
+                if Self::is_selection_macro(&expr_macro.mac) {
+                    if let Some(root) = Self::selection_macro_root(&expr_macro.mac) {
+                        self.selection_aliases.push((name.clone(), root));
+                    }
+                }
+            }
+        }
 
         // Set the current binding context before visiting the initializer
         self.current_binding = binding_name;
@@ -661,6 +743,12 @@ mod tests {
         visitor.get_call_infos()
     }
 
+    fn rooted(root: &str) -> CallArgumentKind {
+        CallArgumentKind::Rooted {
+            root: root.to_string(),
+        }
+    }
+
     #[test]
     fn test_bare_call_not_extracted() {
         // Bare function calls (without call!/call_seq!) must NOT be extracted.
@@ -676,7 +764,7 @@ mod tests {
         assert_eq!(calls[0].call_kind, CallKind::Tile);
         assert_eq!(calls[0].result_binding.as_deref(), Some("greeting"));
         assert_eq!(calls[0].arguments, vec!["name"]);
-        assert_eq!(calls[0].argument_kinds, vec![CallArgumentKind::Identifier]);
+        assert_eq!(calls[0].argument_kinds, vec![rooted("name")]);
     }
 
     #[test]
@@ -687,7 +775,7 @@ mod tests {
         assert_eq!(calls[0].call_kind, CallKind::Sequence);
         assert_eq!(calls[0].result_binding.as_deref(), Some("result"));
         assert_eq!(calls[0].arguments, vec!["greeting"]);
-        assert_eq!(calls[0].argument_kinds, vec![CallArgumentKind::Identifier]);
+        assert_eq!(calls[0].argument_kinds, vec![rooted("greeting")]);
     }
 
     #[test]
@@ -765,23 +853,76 @@ mod tests {
         assert_eq!(calls[0].arguments.len(), 3);
         assert_eq!(
             calls[0].argument_kinds,
+            vec![rooted("a"), rooted("b"), rooted("c")]
+        );
+    }
+
+    #[test]
+    fn test_argument_classification_roots_selections_and_literals() {
+        let calls = parse_calls(
+            r#"fn seq() { let r = call_seq!(next, select!(String, source.name), "x"); }"#,
+        );
+        assert_eq!(calls.len(), 1);
+        // A selection is a view of `source`, so it carries `source`'s
+        // provenance; a literal has none.
+        assert_eq!(
+            calls[0].argument_kinds,
+            vec![rooted("source"), CallArgumentKind::Inline]
+        );
+    }
+
+    #[test]
+    fn test_argument_classification_sees_through_narrowing_expressions() {
+        let calls = parse_calls(
+            r#"fn seq() { let r = call!(t, data.clone(), other.rows[0].name, &third, select!(u64, nested.clone().id)); }"#,
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].argument_kinds,
             vec![
-                CallArgumentKind::Identifier,
-                CallArgumentKind::Identifier,
-                CallArgumentKind::Identifier,
+                rooted("data"),
+                rooted("other"),
+                rooted("third"),
+                rooted("nested"),
             ]
         );
     }
 
     #[test]
-    fn test_external_and_inline_argument_classification() {
+    fn test_argument_classification_treats_constructed_values_as_inline() {
         let calls = parse_calls(
-            r#"fn seq() { let r = call_seq!(next, select!(String, source.name), "x"); }"#,
+            r#"fn seq() { let r = call!(t, "lit".to_string(), Doc { id: 1 }, 2 + 2); }"#,
         );
         assert_eq!(calls.len(), 1);
         assert_eq!(
             calls[0].argument_kinds,
-            vec![CallArgumentKind::ExternalBinding, CallArgumentKind::Inline]
+            vec![
+                CallArgumentKind::Inline,
+                CallArgumentKind::Inline,
+                CallArgumentKind::Inline,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_selection_aliases_record_let_bound_selections() {
+        let file: syn::File = syn::parse_str(
+            r#"fn seq() {
+                let name = select!(String, personal_data.clone().name);
+                let seed = select!(u64, seed);
+                let plain = compute();
+            }"#,
+        )
+        .expect("Failed to parse test code");
+        let mut visitor = CallVisitor::new();
+        visitor.visit_file(&file);
+
+        assert_eq!(
+            visitor.get_selection_aliases(),
+            vec![
+                ("name".to_string(), "personal_data".to_string()),
+                ("seed".to_string(), "seed".to_string()),
+            ]
         );
     }
 

@@ -5,7 +5,7 @@ use core::hash::Hash;
 use core::ops::{Deref, DerefMut};
 use serde::{Deserialize, Serialize};
 
-use crate::cfs::CfsCoordinates;
+use crate::cfs::{CfsCoordinates, SequenceId, TileId};
 use crate::draft::DraftTransitionWitness;
 use crate::fingerprint::Fingerprint;
 use crate::input::{Hash32, SelectionCommitment, SelectorPath};
@@ -18,31 +18,20 @@ pub struct FnInputArg {
     pub ty: String,
 }
 
-/// Describes an external input parameter for a tile function.
+/// Describes the input parameters for a tile function.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct FnInput {
     pub data: Vec<u8>,
     pub values: Vec<FnInputValue>,
     pub args: Vec<FnInputArg>,
-    pub external: ExternalInput,
-    pub internal: InternalInput,
+    pub storage: StorageInput,
 }
 
-pub type InternalBindingName = String;
-pub type ExternalInput = BTreeMap<InternalBindingName, ExternalData>;
-pub type InternalInput = BTreeMap<InternalBindingName, InternalData>;
+pub type StorageBindingName = String;
+pub type StorageInput = BTreeMap<StorageBindingName, StorageData>;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub struct ExternalData {
-    pub name: String,
-    pub commitment: Vec<u8>,
-    pub tree_root: Vec<u8>,
-    pub selector: SelectorPath,
-    pub selection: SelectionCommitment,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub struct InternalData {
+pub struct StorageData {
     pub coordinates: CfsCoordinates,
     pub commitment: Vec<u8>,
     pub selector: SelectorPath,
@@ -52,8 +41,7 @@ pub struct InternalData {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum FnInputValue {
     Inline(Vec<u8>),
-    ExternalBinding,
-    InternalBinding,
+    StorageBinding,
 }
 
 impl FnInput {
@@ -69,21 +57,12 @@ impl FnInput {
         &self.values
     }
 
-    pub fn external(&self) -> &ExternalInput {
-        &self.external
-    }
-
-    pub fn internal(&self) -> &InternalInput {
-        &self.internal
+    pub fn storage(&self) -> &StorageInput {
+        &self.storage
     }
 
     pub fn source_witness_bytes(&self) -> Vec<u8> {
-        postcard::to_allocvec(&(
-            self.values.clone(),
-            self.external.clone(),
-            self.internal.clone(),
-        ))
-        .unwrap_or_default()
+        postcard::to_allocvec(&(self.values.clone(), self.storage.clone())).unwrap_or_default()
     }
 }
 
@@ -146,193 +125,211 @@ impl FnCallRecord {
     }
 }
 
+/// The storage roots either side of a step that may write to it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub struct TileExecRecord {
-    pub exec_index: u64,
+pub struct StorageRoots {
+    pub root_before: Vec<u8>,
+    pub root_after: Vec<u8>,
+    pub index_root_before: Vec<u8>,
+    pub index_root_after: Vec<u8>,
+}
 
-    pub tile_id: String,
+/// What an [`ExecStep`] ran. The distinction is not cosmetic: it decides how
+/// the step's output is verified (only `Tile` carries a replay proof) and
+/// which CFS item kind the step may occupy.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum ExecTarget {
+    Tile(TileId),
+    RecurTile(TileId),
+    RecurSequence(SequenceId),
+}
 
-    pub sequence_id: String,
+/// A step that ran something and committed to what it consumed and produced.
+///
+/// The three targets share one shape deliberately: they commit to exactly
+/// the same things and differ only in what ran, so a field added here cannot
+/// be added to two of them and forgotten on the third.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct ExecStep {
+    pub target: ExecTarget,
     pub intra_sequence_index: u32,
 
-    pub coordinates: CfsCoordinates,
-
     pub input_commitment: Vec<u8>,
     pub input_source_commitment: Vec<u8>,
     pub output_commitment: Vec<u8>,
 
-    pub external_input_commitment: Vec<u8>,
-    pub internal_store_root_before: Vec<u8>,
-    pub internal_store_root_after: Vec<u8>,
-    pub internal_store_index_root_before: Vec<u8>,
-    pub internal_store_index_root_after: Vec<u8>,
+    pub storage: StorageRoots,
 }
 
+/// The trace's first step: the program starts, and `main`'s declared
+/// external arguments (if any) are loaded into a single authorized storage
+/// object at the sequence root (coordinates `[]`).
+///
+/// This is the one step whose output is tied to the public manifest through
+/// the authorization journal rather than a replay proof (see the transition
+/// guest's `checks::entrypoint`). It is always emitted, even when `main`
+/// declares no entry arguments — in that case it binds nothing and touches
+/// no storage.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub struct RecurTileExecRecord {
-    pub exec_index: u64,
+pub struct ProgramStartStep {
+    /// `main`'s declared entry-argument names, in CFS declaration order.
+    /// Empty when `main` declares none.
+    pub entry_arguments: Vec<String>,
 
-    pub recur_tile_id: String,
-
-    pub sequence_id: String,
-    pub intra_sequence_index: u32,
-
-    pub coordinates: CfsCoordinates,
-
-    pub input_commitment: Vec<u8>,
-    pub input_source_commitment: Vec<u8>,
+    /// The struct-of-commitments root over the authorized per-argument
+    /// commitments — the commitment of the combined entry object written at
+    /// coordinates `[]`. Empty when there are no arguments (no write).
     pub output_commitment: Vec<u8>,
 
-    pub external_input_commitment: Vec<u8>,
-    pub internal_store_root_before: Vec<u8>,
-    pub internal_store_root_after: Vec<u8>,
-    pub internal_store_index_root_before: Vec<u8>,
-    pub internal_store_index_root_after: Vec<u8>,
+    /// Genesis roots -> roots containing the entry object, or unchanged when
+    /// there are no arguments.
+    pub storage: StorageRoots,
 }
 
+/// The trace's last step: `main` returned, and the program's output — a value
+/// that provably lives in committed storage — is committed as the authorized
+/// program output (see the transition guest's `checks::program`).
+///
+/// `main` must return either unit or a storage-backed value (a tile or
+/// `select!` result); an inline literal is rejected before this step is
+/// reached. A `main` that returned `Err` or panicked never produces a
+/// `ProgramEnd` at all — an incomplete trace is simply unattestable.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub struct RecurSequenceExecRecord {
-    pub exec_index: u64,
+pub struct ProgramEndStep {
+    /// Where the program output lives: its storage coordinates, the source
+    /// object's commitment, and the selection that narrows to the returned
+    /// value. `None` when `main` returns unit.
+    pub output: Option<StorageData>,
 
-    pub recur_sequence_id: String,
-
-    pub sequence_id: String,
-    pub intra_sequence_index: u32,
-
-    pub coordinates: CfsCoordinates,
-
-    pub input_commitment: Vec<u8>,
-    pub input_source_commitment: Vec<u8>,
+    /// The committed program output: the `selected_hash` of `output`'s
+    /// selection. Empty when `main` returns unit.
     pub output_commitment: Vec<u8>,
 
-    pub external_input_commitment: Vec<u8>,
-    pub internal_store_root_before: Vec<u8>,
-    pub internal_store_root_after: Vec<u8>,
-    pub internal_store_index_root_before: Vec<u8>,
-    pub internal_store_index_root_after: Vec<u8>,
+    /// Storage roots — unchanged; a program end reads its output but writes
+    /// nothing.
+    pub storage: StorageRoots,
 }
 
+/// What a step did, and the commitments that go with it.
+///
+/// Each kind carries exactly the commitments it makes — no more, and none of
+/// them optional. That is what lets the guest's checks be total: an absent
+/// commitment is a kind that does not make one, never a kind that failed to.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub struct SequenceStartRecord {
+pub enum StepKind {
+    /// The trace's first step: starts the program and binds `main`'s entry
+    /// arguments (see [`ProgramStartStep`]). Always at coordinates `[]`.
+    ProgramStart(ProgramStartStep),
+    /// The trace's last step: commits `main`'s authorized output (see
+    /// [`ProgramEndStep`]). Always at coordinates `[]`.
+    ProgramEnd(ProgramEndStep),
+    SequenceStart {
+        input_commitment: Vec<u8>,
+        input_source_commitment: Vec<u8>,
+    },
+    SequenceEnd {
+        output_commitment: Vec<u8>,
+    },
+    Exec(ExecStep),
+}
+
+/// One step of a trace: where it sits, and what it did.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct StepRecord {
     pub exec_index: u64,
-
     pub sequence_id: String,
-
     pub coordinates: CfsCoordinates,
-
-    pub input_commitment: Vec<u8>,
-    pub input_source_commitment: Vec<u8>,
-    pub external_input_commitment: Vec<u8>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub struct SequenceEndRecord {
-    pub exec_index: u64,
-
-    pub sequence_id: String,
-
-    pub coordinates: CfsCoordinates,
-
-    pub output_commitment: Vec<u8>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub enum StepRecord {
-    SequenceStart(SequenceStartRecord),
-    SequenceEnd(SequenceEndRecord),
-    TileExec(TileExecRecord),
-    RecurTileExec(RecurTileExecRecord),
-    RecurSequenceExec(RecurSequenceExecRecord),
+    pub kind: StepKind,
 }
 
 impl StepRecord {
     pub fn coordinates(&self) -> &CfsCoordinates {
-        match self {
-            StepRecord::TileExec(tile_exec_record) => &tile_exec_record.coordinates,
-            StepRecord::RecurTileExec(recur_exec_record) => &recur_exec_record.coordinates,
-            StepRecord::RecurSequenceExec(recur_sequence_exec_record) => {
-                &recur_sequence_exec_record.coordinates
-            }
-            StepRecord::SequenceStart(sequence_start_record) => &sequence_start_record.coordinates,
-            StepRecord::SequenceEnd(sequence_end_record) => &sequence_end_record.coordinates,
-        }
+        &self.coordinates
     }
 
+    /// The step's own serialized input bytes, for kinds that consume any.
     pub fn input_commitment(&self) -> Option<&Vec<u8>> {
-        match self {
-            StepRecord::TileExec(record) => Some(&record.input_commitment),
-            StepRecord::RecurTileExec(record) => Some(&record.input_commitment),
-            StepRecord::RecurSequenceExec(record) => Some(&record.input_commitment),
-            StepRecord::SequenceStart(record) => Some(&record.input_commitment),
-            StepRecord::SequenceEnd(_) => None,
+        match &self.kind {
+            StepKind::SequenceStart {
+                input_commitment, ..
+            } => Some(input_commitment),
+            StepKind::Exec(exec) => Some(&exec.input_commitment),
+            // A program start binds authorized external data and a program end
+            // commits an authorized output rather than consuming a step input;
+            // a sequence end only reports what it produced.
+            StepKind::SequenceEnd { .. }
+            | StepKind::ProgramStart(_)
+            | StepKind::ProgramEnd(_) => None,
         }
     }
 
     pub fn output_commitment(&self) -> Option<&Vec<u8>> {
-        match self {
-            StepRecord::TileExec(record) => Some(&record.output_commitment),
-            StepRecord::RecurTileExec(record) => Some(&record.output_commitment),
-            StepRecord::RecurSequenceExec(record) => Some(&record.output_commitment),
-            StepRecord::SequenceStart(_) => None,
-            StepRecord::SequenceEnd(record) => Some(&record.output_commitment),
+        match &self.kind {
+            StepKind::SequenceEnd { output_commitment } => Some(output_commitment),
+            StepKind::Exec(exec) => Some(&exec.output_commitment),
+            StepKind::ProgramStart(program_start) => Some(&program_start.output_commitment),
+            StepKind::ProgramEnd(program_end) => Some(&program_end.output_commitment),
+            StepKind::SequenceStart { .. } => None,
         }
     }
 
     pub fn input_source_commitment(&self) -> Option<&Vec<u8>> {
-        match self {
-            StepRecord::TileExec(record) => Some(&record.input_source_commitment),
-            StepRecord::RecurTileExec(record) => Some(&record.input_source_commitment),
-            StepRecord::RecurSequenceExec(record) => Some(&record.input_source_commitment),
-            StepRecord::SequenceStart(record) => Some(&record.input_source_commitment),
-            StepRecord::SequenceEnd(_) => None,
+        match &self.kind {
+            StepKind::SequenceStart {
+                input_source_commitment,
+                ..
+            } => Some(input_source_commitment),
+            StepKind::Exec(exec) => Some(&exec.input_source_commitment),
+            // A program start makes no input commitment at all (its "input" is
+            // the outside world, authorized against the manifest journal), and
+            // a program end carries its output binding in the record itself
+            // rather than as a bound source witness.
+            StepKind::ProgramStart(_)
+            | StepKind::ProgramEnd(_)
+            | StepKind::SequenceEnd { .. } => None,
         }
     }
 
-    pub fn external_input_commitment(&self) -> Option<&Vec<u8>> {
-        match self {
-            StepRecord::TileExec(record) => Some(&record.external_input_commitment),
-            StepRecord::RecurTileExec(record) => Some(&record.external_input_commitment),
-            StepRecord::RecurSequenceExec(record) => Some(&record.external_input_commitment),
-            StepRecord::SequenceStart(record) => Some(&record.external_input_commitment),
-            StepRecord::SequenceEnd(_) => None,
+    /// The storage roots this step claims, for kinds that touch the store.
+    /// Sequence boundaries never touch it, so they have none. A program end
+    /// reads its output (roots unchanged) so it claims them too.
+    pub fn storage_roots(&self) -> Option<&StorageRoots> {
+        match &self.kind {
+            StepKind::Exec(exec) => Some(&exec.storage),
+            StepKind::ProgramStart(program_start) => Some(&program_start.storage),
+            StepKind::ProgramEnd(program_end) => Some(&program_end.storage),
+            StepKind::SequenceStart { .. } | StepKind::SequenceEnd { .. } => None,
         }
     }
 
-    pub fn internal_store_roots(&self) -> Option<(&Vec<u8>, &Vec<u8>, &Vec<u8>, &Vec<u8>)> {
-        match self {
-            StepRecord::TileExec(record) => Some((
-                &record.internal_store_root_before,
-                &record.internal_store_root_after,
-                &record.internal_store_index_root_before,
-                &record.internal_store_index_root_after,
-            )),
-            StepRecord::RecurTileExec(record) => Some((
-                &record.internal_store_root_before,
-                &record.internal_store_root_after,
-                &record.internal_store_index_root_before,
-                &record.internal_store_index_root_after,
-            )),
-            StepRecord::RecurSequenceExec(record) => Some((
-                &record.internal_store_root_before,
-                &record.internal_store_root_after,
-                &record.internal_store_index_root_before,
-                &record.internal_store_index_root_after,
-            )),
-            StepRecord::SequenceStart(_) | StepRecord::SequenceEnd(_) => None,
-        }
-    }
-
+    /// Whether this step's `output_commitment` is verified through a
+    /// mechanism other than a direct byte-witness comparison: a replay proof
+    /// for a tile, the authorization journal for a program start, or a
+    /// storage selection proof for a program end.
     pub fn is_execution_step(&self) -> bool {
         matches!(
-            self,
-            StepRecord::TileExec(_)
-                | StepRecord::RecurTileExec(_)
-                | StepRecord::RecurSequenceExec(_)
+            self.kind,
+            StepKind::Exec(_) | StepKind::ProgramStart(_) | StepKind::ProgramEnd(_)
         )
     }
 
+    /// Whether this step appends an object to storage, as opposed to only
+    /// reading it (`ProgramEnd`) or not touching it (sequence boundaries).
+    /// This decides which step owns the write recorded at a coordinate —
+    /// necessary because `ProgramStart` (append) and `ProgramEnd` (read-only)
+    /// share coordinates `[]` and thus a witness-store entry.
+    pub fn appends_to_storage(&self) -> bool {
+        matches!(self.kind, StepKind::Exec(_) | StepKind::ProgramStart(_))
+    }
+
     pub fn requires_replay_proof(&self) -> bool {
-        matches!(self, StepRecord::TileExec(_))
+        matches!(
+            &self.kind,
+            StepKind::Exec(ExecStep {
+                target: ExecTarget::Tile(_),
+                ..
+            })
+        )
     }
 }
 
@@ -381,8 +378,44 @@ pub struct TraceWindow {
     pub items: Vec<StepRecord>,
 }
 
+/// One declared `main` entry argument, as bound at runtime — enough for
+/// the recorder to independently reconstruct the `Referenced` object's
+/// commitment without touching any file bytes. `encoding` says which
+/// selection mechanism applies; per-source deserialization capability for
+/// `Postcard` sources (which aren't self-describing) is looked up by name
+/// from the entry-argument kit registry populated by `start_program`
+/// — it can't travel through this event, since it isn't serializable data.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EntrypointArgumentBinding {
+    pub name: String,
+    pub encoding: crate::input::ExternalEncoding,
+    pub commitment: Vec<u8>,
+}
+
+/// Recorded once, as the program's first event: `main` starts, and its
+/// declared external entry arguments (if any) are bound. Carries just enough
+/// for the recorder to rebuild the matching `Referenced` object (the live
+/// write already happened in storage by the time this is published). The
+/// `arguments` list is empty when `main` declares no entry arguments.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProgramStartEvent {
+    pub arguments: Vec<EntrypointArgumentBinding>,
+}
+
+/// Recorded once, as the program's last event: `main` returned its authorized
+/// output. `output` is the storage binding of the returned value (already
+/// committed in storage by a verified tile), or `None` when `main` returns
+/// unit. Only emitted on success — a failed `main` publishes nothing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProgramEndEvent {
+    pub output: Option<StorageData>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TraceEvent {
+    ProgramStart(ProgramStartEvent),
+    ProgramEnd(ProgramEndEvent),
+
     SequenceStart(FnCallRecord),
     SequenceEnd(FnCallRecord),
     RecurSequenceStart(FnCallRecord),

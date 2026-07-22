@@ -19,7 +19,7 @@ use crate::error::{BitPackerError, Result};
 use crate::precomputed::{EMPTY_TRIE_NODES, HASH_SIZE};
 
 use raster_core::fingerprint::BitPacker;
-use raster_core::trace::{StepRecord, Trace, TraceWindow};
+use raster_core::trace::{ExecStep, ExecTarget, StepKind, StepRecord, Trace, TraceWindow};
 use raster_core::transition::StepRecordWitness;
 
 /// Trait for types that can be hashed to bytes.
@@ -440,6 +440,39 @@ fn sequence_coordinates(step_record: &StepRecord) -> Option<(CfsCoordinates, u32
     Some((CfsCoordinates(parent_coords.to_vec()), current_child_index))
 }
 
+/// Whether `record` is the step that produced `cfs_item`'s output — i.e.
+/// whether a `PriorItemOutput` binding on `cfs_item` resolves to it.
+fn record_produces_item(record: &StepRecord, cfs_item: &SequenceChildItem) -> bool {
+    match (&record.kind, cfs_item) {
+        // A tile run satisfies a recur-tile item too: an iteration of a
+        // recur site is recorded as an ordinary tile run.
+        (
+            StepKind::Exec(ExecStep {
+                target: ExecTarget::Tile(_),
+                ..
+            }),
+            SequenceChildItem::Tile(_) | SequenceChildItem::RecurTile(_),
+        ) => true,
+        (
+            StepKind::Exec(ExecStep {
+                target: ExecTarget::RecurTile(_),
+                ..
+            }),
+            SequenceChildItem::RecurTile(_),
+        ) => true,
+        (
+            StepKind::Exec(ExecStep {
+                target: ExecTarget::RecurSequence(_),
+                ..
+            }),
+            SequenceChildItem::RecurSequence(_),
+        ) => true,
+        // A nested sequence's output is what it reported on the way out.
+        (StepKind::SequenceEnd { .. }, SequenceChildItem::Sequence(_)) => true,
+        _ => false,
+    }
+}
+
 fn resolve_inputs_sources(
     step_record: &StepRecord,
     trace: &[StepRecord],
@@ -453,12 +486,10 @@ fn resolve_inputs_sources(
         return Vec::new();
     }
 
-    if step_inputs.iter().all(|input| {
-        matches!(
-            input,
-            InputBinding::Direct(InputSource::External | InputSource::Inline)
-        )
-    }) {
+    if step_inputs
+        .iter()
+        .all(|input| matches!(input, InputBinding::Direct(InputSource::Inline)))
+    {
         return Vec::new();
     }
 
@@ -471,11 +502,8 @@ fn resolve_inputs_sources(
     let current_sequence_start_index = trace
         .iter()
         .rposition(|record| {
-            matches!(
-                record,
-                StepRecord::SequenceStart(sequence_start_record)
-                    if sequence_start_record.coordinates == sequence_coordinates
-            )
+            matches!(record.kind, StepKind::SequenceStart { .. })
+                && record.coordinates == sequence_coordinates
         })
         .unwrap_or_else(|| {
             panic!(
@@ -490,25 +518,34 @@ fn resolve_inputs_sources(
 
     for step_input in step_inputs {
         match step_input {
-            InputBinding::Direct(InputSource::External | InputSource::Inline) => {}
-            InputBinding::Direct(InputSource::Internal) => {
-                panic!("Direct internal bindings are not yet supported in trace source resolution");
+            InputBinding::Direct(InputSource::Inline) => {}
+            InputBinding::Direct(InputSource::Storage) => {
+                panic!("Direct storage bindings are not yet supported in trace source resolution");
+            }
+            InputBinding::EntryArgument => {
+                // The source is the program's `ProgramStart` step, which bound
+                // the authorized entry object at the sequence root `[]`.
+                let source = trace
+                    .iter()
+                    .enumerate()
+                    .find(|(_, record)| matches!(record.kind, StepKind::ProgramStart(_)))
+                    .map(|(index, record)| (index, record.clone()))
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "Failed to resolve ProgramStart source for entry-argument input of step {:?}",
+                            step_record
+                        )
+                    });
+                source_records.push(source);
             }
             InputBinding::SequenceScope { input_index } => {
                 let (parent_index, source_record) = current_sequence_trace_suffix
                     .first()
-                    .cloned()
-                    .and_then(|record| match record {
-                        StepRecord::SequenceStart(sequence_start_record)
-                            if sequence_start_record.coordinates == sequence_coordinates =>
-                        {
-                            Some((
-                                current_sequence_start_index,
-                                StepRecord::SequenceStart(sequence_start_record),
-                            ))
-                        }
-                        _ => None,
+                    .filter(|record| {
+                        matches!(record.kind, StepKind::SequenceStart { .. })
+                            && record.coordinates == sequence_coordinates
                     })
+                    .map(|record| (current_sequence_start_index, record.clone()))
                     .unwrap_or_else(|| {
                         panic!(
                             "Failed to resolve sequence input {input_index} for step {:?} in frame {:?}",
@@ -547,47 +584,15 @@ fn resolve_inputs_sources(
                 let source_record = current_sequence_trace_suffix
                     .iter()
                     .enumerate()
-                    .find_map(|(intra_sequence_offset, record)| match (record, source_record_cfs_item) {
+                    .find(|(_, record)| {
+                        record.coordinates == source_record_coordinates
+                            && record_produces_item(record, source_record_cfs_item)
+                    })
+                    .map(|(intra_sequence_offset, record)| {
                         (
-                            StepRecord::TileExec(tile_exec_record),
-                            SequenceChildItem::Tile(_) | SequenceChildItem::RecurTile(_),
+                            current_sequence_start_index + intra_sequence_offset,
+                            record.clone(),
                         )
-                            if tile_exec_record.coordinates == source_record_coordinates =>
-                        {
-                            Some((
-                                current_sequence_start_index + intra_sequence_offset,
-                                record.clone(),
-                            ))
-                        }
-                        (StepRecord::SequenceEnd(sequence_end_record), SequenceChildItem::Sequence(_))
-                            if sequence_end_record.coordinates == source_record_coordinates =>
-                        {
-                            Some((
-                                current_sequence_start_index + intra_sequence_offset,
-                                record.clone(),
-                            ))
-                        }
-                        (
-                            StepRecord::RecurTileExec(recur_exec_record),
-                            SequenceChildItem::RecurTile(_),
-                        )
-                            if recur_exec_record.coordinates == source_record_coordinates =>
-                        {
-                            Some((
-                                current_sequence_start_index + intra_sequence_offset,
-                                record.clone(),
-                            ))
-                        }
-                        (
-                            StepRecord::RecurSequenceExec(recur_sequence_exec_record),
-                            SequenceChildItem::RecurSequence(_),
-                        ) if recur_sequence_exec_record.coordinates == source_record_coordinates => {
-                            Some((
-                                current_sequence_start_index + intra_sequence_offset,
-                                record.clone(),
-                            ))
-                        }
-                        _ => None,
                     })
                     .unwrap_or_else(|| {
                         panic!(
@@ -803,7 +808,7 @@ mod tests {
         CfsCoordinates, InputBinding, SequenceChildItem, SequenceDef, SequenceItem, TileDef,
         TileItem,
     };
-    use raster_core::trace::{SequenceEndRecord, SequenceStartRecord, TileExecRecord};
+    use raster_core::trace::StorageRoots;
 
     use super::*;
     use crate::precomputed;
@@ -859,21 +864,28 @@ mod tests {
         _input_count: usize,
         output: u64,
     ) -> StepRecord {
-        StepRecord::TileExec(TileExecRecord {
+        StepRecord {
             exec_index,
             sequence_id: sequence_id.to_string(),
-            intra_sequence_index,
             coordinates: CfsCoordinates(coordinates),
-            tile_id: fn_name.to_string(),
-            input_commitment: Vec::new(),
-            input_source_commitment: Vec::new(),
-            external_input_commitment: Vec::new(),
-            output_commitment: output.to_le_bytes().to_vec(),
-            internal_store_root_before: Vec::new(),
-            internal_store_root_after: Vec::new(),
-            internal_store_index_root_before: Vec::new(),
-            internal_store_index_root_after: Vec::new(),
-        })
+            kind: StepKind::Exec(ExecStep {
+                target: ExecTarget::Tile(fn_name.to_string()),
+                intra_sequence_index,
+                input_commitment: Vec::new(),
+                input_source_commitment: Vec::new(),
+                output_commitment: output.to_le_bytes().to_vec(),
+                storage: empty_storage_roots(),
+            }),
+        }
+    }
+
+    fn empty_storage_roots() -> StorageRoots {
+        StorageRoots {
+            root_before: Vec::new(),
+            root_after: Vec::new(),
+            index_root_before: Vec::new(),
+            index_root_after: Vec::new(),
+        }
     }
 
     fn make_sequence_start_record(
@@ -882,14 +894,15 @@ mod tests {
         coordinates: Vec<u32>,
         _input_count: usize,
     ) -> StepRecord {
-        StepRecord::SequenceStart(SequenceStartRecord {
+        StepRecord {
             exec_index,
             sequence_id: sequence_id.to_string(),
             coordinates: CfsCoordinates(coordinates),
-            input_commitment: Vec::new(),
-            input_source_commitment: Vec::new(),
-            external_input_commitment: Vec::new(),
-        })
+            kind: StepKind::SequenceStart {
+                input_commitment: Vec::new(),
+                input_source_commitment: Vec::new(),
+            },
+        }
     }
 
     fn make_sequence_end_record(
@@ -897,12 +910,14 @@ mod tests {
         sequence_id: &str,
         coordinates: Vec<u32>,
     ) -> StepRecord {
-        StepRecord::SequenceEnd(SequenceEndRecord {
+        StepRecord {
             exec_index,
             sequence_id: sequence_id.to_string(),
             coordinates: CfsCoordinates(coordinates),
-            output_commitment: Vec::new(),
-        })
+            kind: StepKind::SequenceEnd {
+                output_commitment: Vec::new(),
+            },
+        }
     }
 
     fn make_test_cfs() -> ControlFlowSchema {
@@ -911,7 +926,7 @@ mod tests {
         let mut main = SequenceDef::new("main");
         main.items.push(SequenceChildItem::Tile(TileItem {
             id: "test_tile".to_string(),
-            sources: vec![InputBinding::external()],
+            sources: vec![InputBinding::inline()],
         }));
         cfs.sequences.push(main);
         cfs
@@ -926,7 +941,7 @@ mod tests {
         let mut main = SequenceDef::new("main");
         main.items.push(SequenceChildItem::Tile(TileItem {
             id: "producer".to_string(),
-            sources: vec![InputBinding::external()],
+            sources: vec![InputBinding::inline()],
         }));
         main.items.push(SequenceChildItem::Tile(TileItem {
             id: "consumer".to_string(),
@@ -934,7 +949,7 @@ mod tests {
         }));
         main.items.push(SequenceChildItem::Tile(TileItem {
             id: "tail".to_string(),
-            sources: vec![InputBinding::external()],
+            sources: vec![InputBinding::inline()],
         }));
 
         cfs.sequences.push(main);
@@ -947,21 +962,21 @@ mod tests {
         cfs.tiles.push(TileDef::iter("tail", 1, 1));
 
         let mut main = SequenceDef::new("main");
-        main.input_sources = vec![InputBinding::external()];
+        main.input_sources = vec![InputBinding::inline()];
         main.items.push(SequenceChildItem::Sequence(SequenceItem {
             id: "inner".to_string(),
             sources: vec![InputBinding::seq_input(0)],
         }));
         main.items.push(SequenceChildItem::Tile(TileItem {
             id: "tail".to_string(),
-            sources: vec![InputBinding::external()],
+            sources: vec![InputBinding::inline()],
         }));
 
         let mut inner = SequenceDef::new("inner");
-        inner.input_sources = vec![InputBinding::external()];
+        inner.input_sources = vec![InputBinding::inline()];
         inner.items.push(SequenceChildItem::Tile(TileItem {
             id: "inner_tile".to_string(),
-            sources: vec![InputBinding::external()],
+            sources: vec![InputBinding::inline()],
         }));
 
         cfs.sequences.push(main);
@@ -975,7 +990,7 @@ mod tests {
         cfs.tiles.push(TileDef::iter("tail", 1, 1));
 
         let mut main = SequenceDef::new("main");
-        main.input_sources = vec![InputBinding::external()];
+        main.input_sources = vec![InputBinding::inline()];
         main.items.push(SequenceChildItem::Sequence(SequenceItem {
             id: "inner".to_string(),
             sources: vec![InputBinding::seq_input(0)],
@@ -986,10 +1001,10 @@ mod tests {
         }));
 
         let mut inner = SequenceDef::new("inner");
-        inner.input_sources = vec![InputBinding::external()];
+        inner.input_sources = vec![InputBinding::inline()];
         inner.items.push(SequenceChildItem::Tile(TileItem {
             id: "inner_tile".to_string(),
-            sources: vec![InputBinding::external()],
+            sources: vec![InputBinding::inline()],
         }));
 
         cfs.sequences.push(main);

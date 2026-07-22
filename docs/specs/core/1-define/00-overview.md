@@ -116,9 +116,9 @@ fn double(x: u64) -> u64 {
 }
 
 #[sequence(description = "Entry sequence")]
-fn main() -> u64 {
-    let x = select!(u64, external!(u64, "x"));
-    call!(double, x)
+fn main(x: u64) {
+    let x = select!(u64, x);
+    call!(double, x);
 }
 ```
 

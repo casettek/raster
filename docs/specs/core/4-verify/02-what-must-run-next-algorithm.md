@@ -38,15 +38,15 @@ It is written to match the current codebase. Where the intended behavior is not 
     - `StepRecord::{TileExec, SequenceStart, SequenceEnd}`
     - `TileExecRecord.input_source_commitment` / `SequenceStartRecord.input_source_commitment`
     - `FnInput.values`, `FnInput.external`, `FnInput.internal`
-- **Internal storage provenance**
+- **Storage provenance**
   - `crates/raster-core/src/transition.rs`
-    - `InternalStoreEntry { coordinates, object_commitment }`
-    - `InternalStoreWitness { reads, write }`
-    - `InternalStoreLogWitness`
+    - `StorageEntry { coordinates, object_commitment }`
+    - `StorageWitness { reads, write }`
+    - `StorageLogWitness`
     - coordinate-index membership / non-membership proofs
-  - `crates/raster-runtime/src/internal_storage.rs`
+  - `crates/raster-runtime/src/storage.rs`
     - raw bytes are keyed by execution coordinates
-    - the committed internal-store log root comes from an append-only incremental Merkle frontier
+    - the committed storage log root comes from an append-only incremental Merkle frontier
     - a separate authenticated coordinate index maps `coordinates -> { log_position, object_commitment }`
 - **Runtime/verification implementation status**
   - There is no schema-driven runtime/executor in this workspace that consumes `SequenceSchema` or enforces CFS determinism at runtime.
@@ -84,8 +84,8 @@ To derive next-step inputs mechanically, a verifier needs committed per-step I/O
 
 The current implementation carries the minimum proof boundary in two layers:
 
-- `StepRecord` commits the step ordering, I/O commitments, external-input commitment, input-source commitment, and internal-store roots.
-- `TransitionInput` carries replay bytes plus structured input-source witnesses (`FnInput`) and optional internal-store read/write witnesses.
+- `StepRecord` commits the step ordering, I/O commitments, external-input commitment, input-source commitment, and storage roots.
+- `TransitionInput` carries replay bytes plus structured input-source witnesses (`FnInput`) and optional storage read/write witnesses.
 
 Minimum required record per tile execution (including each recursion iteration) is:
 
@@ -131,16 +131,16 @@ A verifier MUST validate the following before attempting next-step derivation:
   - For `InputBinding::PriorItemOutput { intra_sequence_item_index }`:
     - `intra_sequence_item_index` MUST be `< current_item_index` (no forward references).
     - The referenced item MUST produce an output (for `item_type=="tile"`, `TileDef.outputs` MUST be non-zero; for `item_type=="sequence"`, see §2.4).
-    - A `PriorItemOutput` binding identifies the prior item only; it resolves to that item's single committed internal-store object (keyed by execution coordinates). Sub-value access is addressed by selector paths verified via selection commitments, not by the binding itself.
+    - A `PriorItemOutput` binding identifies the prior item only; it resolves to that item's single committed storage object (keyed by execution coordinates). Sub-value access is addressed by selector paths verified via selection commitments, not by the binding itself.
 
 #### 2.3 External inputs restrictions
 
-In a fraud-provable setting, any direct `InputBinding::Direct(InputSource::External)` appearing inside a sequence item MUST be treated as a hard failure unless it can be satisfied by the invocation’s explicitly committed external inputs.
+There is no direct "external" binding: in a fraud-provable setting every argument MUST be derivable from `SequenceScope`, `PriorItemOutput`, or be `InputSource::Inline`.
 
 Minimum rule set:
 
-- For the entry invocation of `"main"`, direct `External` MAY be used only to reference explicitly committed entry inputs.
-- For non-entry sequences, direct `External` SHOULD NOT appear in item arguments; all arguments SHOULD be derivable from `SequenceScope` or `PriorItemOutput`.
+- Committed data enters only through `main`'s entry arguments. The leading `SequenceChildItem::Entrypoint` item binds them into storage, and every use is a `PriorItemOutput` reference to that item — so uses are checked against the storage, and the binding itself is checked against the authorization journal (see `checks::entrypoint`).
+- `InputSource::Inline` MUST be used only for values materialized in the sequence body itself (literals, constructed values). An argument derived — however indirectly, through field access, indexing, cloning, or `select!` — from an entry argument, a sequence parameter, or a prior item's output MUST NOT be bound as `Inline`: that would leave its bytes unanchored, and a claimed trace could substitute any value for it.
 
 **Current producer behavior:** unresolved arguments (literals, expressions) are encoded as direct `External` bindings by the compiler’s flow resolver. Verifiers MUST treat such CFS instances as not mechanically verifiable unless an out-of-band rule is provided to supply those values.
 
@@ -198,7 +198,7 @@ Given a sequence frame with inputs `seq_inputs[]` (each element is a resolved so
 - If `binding == Direct(Inline)`:
   - required value is the inline value committed by the current step’s input-source witness.
 - If `binding == Direct(Internal)`:
-  - required value MUST resolve through an `InternalRef` whose committed coordinates are consistent with the current sequence scope and the keyed internal-store state.
+  - required value MUST resolve through an `StorageRef` whose committed coordinates are consistent with the current sequence scope and the keyed storage state.
 
 #### 4.1 Tile ABI input bytes
 
@@ -258,15 +258,15 @@ Before verifying recursion, a verifier MUST enforce:
 
 #### 6.2 Iteration step rule
 
-Let the recursive tile have input vector \(S_i\) (the “state”) and output vector \((done_i, S_{i+1})\).
+Let the recursive tile have input vector \(S*i\) (the “state”) and output vector \((done_i, S*{i+1})\).
 
 Rules:
 
 - Iteration 0 input \(S_0\) is derived from the sequence item’s input bindings (as in §4).
 - For iteration \(i \ge 0\):
   - The required tile execution input bytes for iteration \(i\) MUST be the tile ABI encoding of \(S_i\) (as in §4.1).
-  - The committed output bytes for iteration \(i\) MUST decode to a tuple whose first element is `done_i` and remaining elements are \(S_{i+1}\).
-  - If `done_i == false`, the next required action MUST be iteration \(i+1\) with input derived from \(S_{i+1}\).
+  - The committed output bytes for iteration \(i\) MUST decode to a tuple whose first element is `done_i` and remaining elements are \(S\_{i+1}\).
+  - If `done_i == false`, the next required action MUST be iteration \(i+1\) with input derived from \(S\_{i+1}\).
   - If `done_i == true`, the recursive invocation completes and control returns to the containing sequence item.
 
 #### 6.3 Termination and bounds
@@ -296,17 +296,17 @@ Given this CFS excerpt:
   "sequences": [
     {
       "id": "main",
-      "input_sources": [ "Direct(External)" ],
+      "input_sources": ["Direct(External)"],
       "items": [
         {
           "item_type": "tile",
           "item_id": "greet",
-          "input_sources": [ "SequenceScope(0)" ]
+          "input_sources": ["SequenceScope(0)"]
         },
         {
           "item_type": "tile",
           "item_id": "exclaim",
-          "input_sources": [ "PriorItemOutput(0)" ]
+          "input_sources": ["PriorItemOutput(0)"]
         }
       ]
     }
@@ -342,4 +342,3 @@ Then:
 - Iteration 0 input is derived from the sequence bindings.
 - Each subsequent iteration’s input MUST equal the prior iteration’s `next_state` encoded per the tile ABI.
 - The recursive call terminates on the first iteration whose decoded `done` is `true`.
-

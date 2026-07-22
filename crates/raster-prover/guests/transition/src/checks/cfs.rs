@@ -1,13 +1,16 @@
-//! Checks that a step record matches the control flow schema: coordinate
-//! ordering and per-argument input bindings.
+//! Checks that a step record matches the control flow schema: that the
+//! record's kind matches the item declared at its coordinates, that its
+//! per-argument input bindings are honoured, and that its coordinates
+//! follow the schema's ordering.
 
-use raster_core::cfs::{CfsCoordinates, CfsCursor, InputBinding, InputSource};
-use raster_core::trace::{ExternalData, FnInput, FnInputValue, InternalData, StepRecord};
+use raster_core::cfs::{CfsCoordinates, CfsCursor, InputBinding, InputSource, SequenceChildItem};
+use raster_core::trace::{
+    ExecStep, ExecTarget, FnInput, FnInputValue, StepKind, StepRecord, StorageData,
+};
 
 enum ResolvedSource<'a> {
     Inline(&'a Vec<u8>),
-    External(&'a ExternalData),
-    Internal(&'a InternalData),
+    Storage(&'a StorageData),
 }
 
 fn resolved_source_at<'a>(input: &'a FnInput, index: usize) -> ResolvedSource<'a> {
@@ -22,14 +25,9 @@ fn resolved_source_at<'a>(input: &'a FnInput, index: usize) -> ResolvedSource<'a
 
     match value {
         FnInputValue::Inline(bytes) => ResolvedSource::Inline(bytes),
-        FnInputValue::ExternalBinding => {
-            ResolvedSource::External(input.external().get(&arg.name).unwrap_or_else(|| {
-                panic!("Missing external input metadata for arg '{}'", arg.name)
-            }))
-        }
-        FnInputValue::InternalBinding => {
-            ResolvedSource::Internal(input.internal().get(&arg.name).unwrap_or_else(|| {
-                panic!("Missing internal input metadata for arg '{}'", arg.name)
+        FnInputValue::StorageBinding => {
+            ResolvedSource::Storage(input.storage().get(&arg.name).unwrap_or_else(|| {
+                panic!("Missing storage input metadata for arg '{}'", arg.name)
             }))
         }
     }
@@ -43,16 +41,10 @@ fn assert_same_source(left: ResolvedSource<'_>, right: ResolvedSource<'_>) {
                 "Inline sequence scope input does not match consumer binding",
             );
         }
-        (ResolvedSource::External(left_meta), ResolvedSource::External(right_meta)) => {
+        (ResolvedSource::Storage(left_meta), ResolvedSource::Storage(right_meta)) => {
             assert_eq!(
                 left_meta, right_meta,
-                "External sequence scope input does not match consumer binding",
-            );
-        }
-        (ResolvedSource::Internal(left_meta), ResolvedSource::Internal(right_meta)) => {
-            assert_eq!(
-                left_meta, right_meta,
-                "Internal sequence scope input does not match consumer binding",
+                "Storage sequence scope input does not match consumer binding",
             );
         }
         _ => {
@@ -67,6 +59,57 @@ fn has_coordinate_prefix(coordinates: &CfsCoordinates, prefix: &CfsCoordinates) 
             .iter()
             .zip(prefix.iter())
             .all(|(coordinate, expected)| coordinate == expected)
+}
+
+/// Whether a step record of this kind may occupy a CFS item of this kind.
+///
+/// Input bindings alone cannot tell these apart, and the kinds differ in how
+/// their output is verified — a tile's by replay proof. Without this, a
+/// record could take a coordinate whose verification rules are weaker than
+/// its own. The program-boundary steps (`ProgramStart` and `main`'s
+/// `SequenceEnd`) never reach this check: they sit at the sequence root,
+/// which is not a CFS item.
+fn record_matches_item(step_record: &StepRecord, cfs_item: &SequenceChildItem) -> bool {
+    // The trace carries names (fingerprinted, so tamper-evident) but the guest
+    // must also *bind* them: the recorded target name must equal the CFS item
+    // id at the step's coordinates. Without this the coordinate → tile-id
+    // resolution the registry lookup relies on could be steered by a
+    // mislabelled record. See program-identity.md.
+    match (&step_record.kind, cfs_item) {
+        (
+            StepKind::Exec(ExecStep {
+                target: ExecTarget::Tile(name),
+                ..
+            }),
+            SequenceChildItem::Tile(item),
+        ) => name == &item.id,
+        (
+            StepKind::Exec(ExecStep {
+                target: ExecTarget::RecurTile(name),
+                ..
+            }),
+            SequenceChildItem::RecurTile(item),
+        ) => name == &item.id,
+        (
+            StepKind::Exec(ExecStep {
+                target: ExecTarget::RecurSequence(name),
+                ..
+            }),
+            SequenceChildItem::RecurSequence(item),
+        ) => name == &item.id,
+        // A nested sequence is entered and left at its own item coordinate,
+        // whether it is an ordinary or a recur sequence. The entered
+        // sequence's name is carried on the step record.
+        (
+            StepKind::SequenceStart { .. } | StepKind::SequenceEnd { .. },
+            SequenceChildItem::Sequence(item),
+        ) => step_record.sequence_id == item.id,
+        (
+            StepKind::SequenceStart { .. } | StepKind::SequenceEnd { .. },
+            SequenceChildItem::RecurSequence(item),
+        ) => step_record.sequence_id == item.id,
+        _ => false,
+    }
 }
 
 /// For an iteration of a recur site with a CFS-declared chunk size, verify the
@@ -119,8 +162,11 @@ pub fn verify_step_record_inputs(
     sequence_scope_witness: Option<&FnInput>,
     input_witness: Option<&Vec<u8>>,
 ) {
-    // TODO: SequenceStart/SequenceEnd entrypoint case. In case of SequenceStart input is External Kind from
-    // cli or from file. SequenceEnd just binding latest executed tile output.
+    // The program-boundary steps sit at the sequence root `[]`, which is not
+    // itself a CFS item and binds no CFS inputs: `ProgramStart` binds
+    // authorized external data and `ProgramEnd` commits the authorized output,
+    // both checked in `checks::entrypoint` against storage/the journal rather
+    // than against CFS input bindings.
     if step_record.coordinates().is_empty() {
         return;
     }
@@ -145,6 +191,11 @@ pub fn verify_step_record_inputs(
                 step_record
             )
         });
+    assert!(
+        record_matches_item(step_record, cfs_item),
+        "Step record kind does not match the CFS item kind at its coordinates: {:?}",
+        step_record,
+    );
     let step_inputs = cfs_item.inputs();
 
     let input_source_witness = input_source_witness.unwrap_or_else(|| {
@@ -168,14 +219,6 @@ pub fn verify_step_record_inputs(
     for (input_index, step_input) in step_inputs.iter().enumerate() {
         let resolved_source = resolved_source_at(input_source_witness, input_index);
         match step_input {
-            InputBinding::Direct(InputSource::External) => {
-                assert!(
-                    matches!(resolved_source, ResolvedSource::External(_)),
-                    "Expected external input source for step {:?} arg {}",
-                    step_record,
-                    input_index,
-                );
-            }
             InputBinding::Direct(InputSource::Inline) => {
                 assert!(
                     matches!(resolved_source, ResolvedSource::Inline(_)),
@@ -184,10 +227,31 @@ pub fn verify_step_record_inputs(
                     input_index,
                 );
             }
-            InputBinding::Direct(InputSource::Internal) => {
+            InputBinding::Direct(InputSource::Storage) => {
                 assert!(
-                    matches!(resolved_source, ResolvedSource::Internal(_)),
-                    "Expected internal input source for step {:?} arg {}",
+                    matches!(resolved_source, ResolvedSource::Storage(_)),
+                    "Expected storage input source for step {:?} arg {}",
+                    step_record,
+                    input_index,
+                );
+            }
+            InputBinding::EntryArgument => {
+                // One of `main`'s entry arguments: it must be sourced from
+                // the authorized entry object at the sequence root `[]` that
+                // the `ProgramStart` step bound. The selector into that
+                // object (and its selection proof) is verified separately by
+                // the storage checks; here we hold the binding to the one
+                // coordinate the entry object can legitimately come from.
+                let storage_meta = match resolved_source {
+                    ResolvedSource::Storage(meta) => meta,
+                    _ => panic!(
+                        "Expected storage input source for entry-argument step {:?} arg {}",
+                        step_record, input_index
+                    ),
+                };
+                assert!(
+                    storage_meta.coordinates.is_empty(),
+                    "Entry-argument input for step {:?} arg {} must come from the sequence root",
                     step_record,
                     input_index,
                 );
@@ -219,11 +283,11 @@ pub fn verify_step_record_inputs(
                         .try_into()
                         .expect("Prior item output index exceeds CFS coordinate bounds"),
                 );
-                let internal_meta = match resolved_source {
-                    ResolvedSource::Internal(meta) => meta,
+                let storage_meta = match resolved_source {
+                    ResolvedSource::Storage(meta) => meta,
                     _ => {
                         panic!(
-                            "Expected internal input source for step {:?} arg {}",
+                            "Expected storage input source for step {:?} arg {}",
                             step_record, input_index
                         )
                     }
@@ -235,15 +299,15 @@ pub fn verify_step_record_inputs(
                     raster_core::cfs::SequenceChildItem::Sequence(_)
                     | raster_core::cfs::SequenceChildItem::RecurSequence(_) => {
                         assert!(
-                            has_coordinate_prefix(&internal_meta.coordinates, &source_coordinates),
-                            "Internal input prior-item-output coordinates do not descend from expected sequence source",
+                            has_coordinate_prefix(&storage_meta.coordinates, &source_coordinates),
+                            "Storage input prior-item-output coordinates do not descend from expected sequence source",
                         );
                     }
                     raster_core::cfs::SequenceChildItem::Tile(_)
                     | raster_core::cfs::SequenceChildItem::RecurTile(_) => {
                         assert_eq!(
-                            internal_meta.coordinates, source_coordinates,
-                            "Internal input prior-item-output coordinates do not match expected CFS source",
+                            storage_meta.coordinates, source_coordinates,
+                            "Storage input prior-item-output coordinates do not match expected CFS source",
                         );
                     }
                 }

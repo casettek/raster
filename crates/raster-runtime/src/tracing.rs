@@ -13,6 +13,11 @@ use std::sync::Once;
 
 pub const TRACE_FORMAT_ENV: &str = "RASTER_TRACE_FORMAT";
 pub const TRACE_PATH_ENV: &str = "RASTER_TRACE_PATH";
+/// Directory the program's output artifact (`output.bin` / `output.rindex` /
+/// `output_manifest.json`) is written to on a successful, output-producing
+/// run. Set by `cargo raster run`; unset for a plain `cargo run`, which then
+/// produces no artifact files.
+pub const OUTPUT_DIR_ENV: &str = "RASTER_OUTPUT_DIR";
 
 static RUNTIME_INIT: Once = Once::new();
 
@@ -101,7 +106,11 @@ pub fn init_with<P: Publisher + 'static>(publisher: P) {
 }
 
 fn init_runtime_state() {
-    RUNTIME_INIT.call_once(crate::profiling::init_from_env);
+    RUNTIME_INIT.call_once(|| {
+        crate::profiling::init_from_env();
+        crate::entry_arguments::install_default_source_resolver()
+            .unwrap_or_else(|error| panic!("Failed to read --input/--input-manifest: {}", error));
+    });
 }
 
 fn install_publisher<P: Publisher + 'static>(publisher: P) {

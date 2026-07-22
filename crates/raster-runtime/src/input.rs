@@ -1,10 +1,8 @@
 use raster_core::input::{
-    selection_payload_hash, ExternalSelection, ExternalValue, Hash32, InternalValue,
-    ListProofDirection, ListProofSibling, SchemaNode, Selectable, SelectedPayload,
-    SelectionCommitment, SelectionProof, SelectionProofStep, SelectionWitness, SelectorPath,
-    SelectorSegment,
+    selection_payload_hash, struct_commitments_root, Hash32, ListProofDirection, ListProofSibling,
+    SchemaNode, Selectable, SelectedPayload, SelectionCommitment, SelectionProof,
+    SelectionProofStep, SelectionWitness, SelectorPath, SelectorSegment, StorageValue,
 };
-use raster_core::trace::ExternalData as TraceExternalData;
 use raster_core::{Error, Result as CoreResult};
 use serde::de::{
     self, DeserializeOwned, DeserializeSeed, IntoDeserializer, MapAccess, SeqAccess, Visitor,
@@ -22,12 +20,7 @@ use std::path::Path;
 use std::string::{String, ToString};
 use std::vec::Vec;
 
-use crate::external_storage::{ExternalStorageManager, ResolvedExternalData};
 use crate::raster_index::{RasterIndex, RasterNodeKind, RasterSelection, RasterSelectionLocation};
-
-fn load_external_storage() -> CoreResult<Option<ExternalStorageManager>> {
-    ExternalStorageManager::cached_from_cli_args()
-}
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum TreeValue {
@@ -1024,14 +1017,6 @@ fn parse_leaf_value(type_name: &str, subtree_bytes: &[u8]) -> CoreResult<TreeVal
     }
 }
 
-pub(crate) fn tree_value_from_raster_selection(
-    index: &RasterIndex,
-    data_bytes: &[u8],
-    selection: &RasterSelection,
-) -> CoreResult<TreeValue> {
-    tree_value_from_raster_node(index, data_bytes, selection.node_id)
-}
-
 pub(crate) fn tree_value_from_raster_location(
     index: &RasterIndex,
     data_bytes: &[u8],
@@ -1243,21 +1228,29 @@ fn assemble_subtree(
 ) -> CoreResult<(Vec<u8>, Hash32)> {
     let result = match value {
         TreeValue::Unit => (vec![0x03], selection_hash(&[b"unit"])),
-        TreeValue::Struct(_) => {
+        TreeValue::Struct(fields) => {
+            if fields.len() != children.len() {
+                return Err(Error::Serialization(
+                    "Struct child count does not match its field count".into(),
+                ));
+            }
             let mut payload = Vec::new();
             payload.push(0x01);
             push_u64(&mut payload, children.len() as u64);
-            for (child_payload, _) in &children {
+            for ((name, _), (child_payload, _)) in fields.iter().zip(children.iter()) {
+                push_u64(&mut payload, name.len() as u64);
+                payload.extend_from_slice(name.as_bytes());
                 push_u64(&mut payload, child_payload.len() as u64);
                 payload.extend_from_slice(child_payload);
             }
 
-            let mut parts: Vec<&[u8]> = Vec::with_capacity(children.len() + 1);
-            parts.push(b"struct");
-            for (_, child_root) in &children {
-                parts.push(child_root.as_slice());
-            }
-            (payload, selection_hash(&parts))
+            let root = struct_commitments_root(
+                fields
+                    .iter()
+                    .map(|(name, _)| name.as_str())
+                    .zip(children.iter().map(|(_, root)| root.as_slice())),
+            );
+            (payload, root)
         }
         TreeValue::List(_) => {
             let mut payload = Vec::new();
@@ -1582,14 +1575,14 @@ fn find_struct_field<'a>(entries: &'a [(String, TreeValue)], name: &str) -> Opti
         .map(|(_, value)| value)
 }
 
-struct ProvenSelection {
-    selected_value: TreeValue,
-    selected_bytes: Vec<u8>,
-    root_hash: Hash32,
-    steps: Vec<SelectionProofStep>,
+pub(crate) struct ProvenSelection {
+    pub(crate) selected_value: TreeValue,
+    pub(crate) selected_bytes: Vec<u8>,
+    pub(crate) root_hash: Hash32,
+    pub(crate) steps: Vec<SelectionProofStep>,
 }
 
-fn prove_selection(
+pub(crate) fn prove_selection(
     schema: &SchemaNode,
     value: &TreeValue,
     segments: &[SelectorSegment],
@@ -1644,16 +1637,17 @@ fn prove_selection(
                 }
             }
 
-            let mut parts: Vec<&[u8]> = Vec::with_capacity(child_roots.len() + 1);
-            parts.push(b"struct");
-            for root in &child_roots {
-                parts.push(root.as_slice());
-            }
+            let root_hash = struct_commitments_root(
+                fields
+                    .iter()
+                    .map(|field| field.name.as_str())
+                    .zip(child_roots.iter().map(Hash32::as_slice)),
+            );
 
             let mut steps = Vec::with_capacity(child.steps.len() + 1);
             steps.push(SelectionProofStep::Struct {
                 field_index: target_index as u64,
-                field_count: fields.len() as u64,
+                field_names: fields.iter().map(|field| field.name.clone()).collect(),
                 siblings,
             });
             steps.extend(child.steps);
@@ -1661,7 +1655,7 @@ fn prove_selection(
             Ok(ProvenSelection {
                 selected_value: child.selected_value,
                 selected_bytes: child.selected_bytes,
-                root_hash: selection_hash(&parts),
+                root_hash,
                 steps,
             })
         }
@@ -1757,7 +1751,7 @@ fn prove_selection(
     }
 }
 
-fn selected_payload_from_proven(
+pub(crate) fn selected_payload_from_proven(
     selector: &SelectorPath,
     proven: ProvenSelection,
 ) -> SelectedPayload {
@@ -1772,25 +1766,6 @@ fn selected_payload_from_proven(
             selected_len,
         },
     }
-}
-
-pub(crate) fn selected_payload_from_raster_selection(
-    data_bytes: &[u8],
-    selector: &SelectorPath,
-    selection: RasterSelection,
-) -> CoreResult<SelectedPayload> {
-    let bytes = raster_subtree_bytes(data_bytes, selection.offset, selection.len)?.to_vec();
-    let selected_hash = selection_payload_hash(&bytes);
-    let selected_len = bytes.len() as u64;
-    Ok(SelectedPayload {
-        bytes,
-        commitment: SelectionCommitment {
-            path: selector.clone(),
-            source_root_hash: selection.root_hash,
-            selected_hash,
-            selected_len,
-        },
-    })
 }
 
 pub(crate) fn selected_payload_from_raster_location(
@@ -1827,114 +1802,6 @@ pub(crate) fn selection_witness_from_raster_selection(
     })
 }
 
-fn raster_typed_value_from_selection<T: DeserializeOwned>(
-    resolved: &ResolvedExternalData,
-    selector: &SelectorPath,
-) -> CoreResult<(SelectedPayload, T)> {
-    let index = resolved
-        .raster_index()
-        .ok_or_else(|| Error::Serialization("Expected raster index metadata".into()))?;
-    let selection = index.locate(selector)?;
-    let data_bytes = resolved
-        .raster_bytes()
-        .ok_or_else(|| Error::Serialization("Expected raster data bytes".into()))?;
-    let tree = tree_value_from_raster_location(index, data_bytes, &selection)?;
-    let selected = selected_payload_from_raster_location(data_bytes, selector, selection)?;
-    let value = typed_value_from_tree(&tree).map_err(|e| {
-        Error::Serialization(format!(
-            "Failed to deserialize selected raster external input from selection tree: {}",
-            e
-        ))
-    })?;
-    Ok((selected, value))
-}
-
-pub fn external_selection_witness(
-    name: &str,
-    selector: &SelectorPath,
-) -> CoreResult<SelectionWitness> {
-    let storage = load_external_storage()?.ok_or_else(|| {
-        Error::Other(
-            "External selection witness generation requires CLI input context from --input and --input-manifest"
-                .into(),
-        )
-    })?;
-    let resolved = storage.resolve(name)?;
-    let index = resolved
-        .raster_index()
-        .ok_or_else(|| Error::Serialization("Expected raster index metadata".into()))?;
-    let selection = index.select(selector)?;
-    let data_bytes = resolved
-        .raster_bytes()
-        .ok_or_else(|| Error::Serialization("Expected raster data bytes".into()))?;
-    selection_witness_from_raster_selection(data_bytes, selector, selection)
-}
-
-fn trace_raster_external_binding_from_storage(
-    storage: &ExternalStorageManager,
-    name: &str,
-    selector: &SelectorPath,
-) -> CoreResult<Option<TraceExternalData>> {
-    if !storage.is_raster_encoded(name)? {
-        return Ok(None);
-    }
-
-    let resolved = storage.resolve(name)?;
-    let ResolvedExternalData::Raster { .. } = &resolved else {
-        return Ok(None);
-    };
-    let index = resolved
-        .raster_index()
-        .ok_or_else(|| Error::Serialization("Expected raster index metadata".into()))?;
-    let selection = index.locate(selector)?;
-    let data_bytes = resolved
-        .raster_bytes()
-        .ok_or_else(|| Error::Serialization("Expected raster data bytes".into()))?;
-    let selected = selected_payload_from_raster_location(data_bytes, selector, selection)?;
-
-    Ok(Some(TraceExternalData {
-        name: name.into(),
-        commitment: resolved.commitment().as_bytes().to_vec(),
-        tree_root: selected.commitment.source_root_hash.to_vec(),
-        selector: selector.clone(),
-        selection: selected.commitment,
-    }))
-}
-
-pub fn trace_raster_external_binding(
-    name: &str,
-    selector: &SelectorPath,
-) -> CoreResult<Option<TraceExternalData>> {
-    let Some(storage) = load_external_storage()? else {
-        return Ok(None);
-    };
-
-    trace_raster_external_binding_from_storage(&storage, name, selector)
-}
-
-fn dynamic_selected_payload<T: Serialize>(
-    name: &str,
-    value: &T,
-    selector: &SelectorPath,
-) -> CoreResult<SelectedPayload> {
-    if !selector.is_empty() {
-        return Err(Error::Other(format!(
-            "External selector for '{}' requires typed_external<Root>(...) with postcard path inputs",
-            name
-        )));
-    }
-
-    let tree = tree_value_from_serialize(value)?;
-    let proven = prove_selection(
-        &SchemaNode::Leaf {
-            type_name: "DynamicRoot".into(),
-        },
-        &tree,
-        &[],
-    )?;
-    Ok(selected_payload_from_proven(selector, proven))
-}
-
 fn typed_proven_selection<Root: Serialize + Selectable>(
     value: &Root,
     selector: &SelectorPath,
@@ -1943,33 +1810,16 @@ fn typed_proven_selection<Root: Serialize + Selectable>(
     prove_selection(&Root::schema(), &root_tree, &selector.segments)
 }
 
-fn external_value_from_parts<T>(
-    name: &str,
-    selector: SelectorPath,
-    resolved: ResolvedExternalData,
-    selected: SelectedPayload,
-    value: T,
-) -> ExternalValue<T> {
-    ExternalValue::new(
-        name,
-        selector,
-        Some(resolved.commitment().to_string()),
-        selected,
-        value,
-    )
-}
-
 fn extend_selector_path(prefix: &SelectorPath, suffix: &SelectorPath) -> SelectorPath {
     let mut segments = prefix.segments.clone();
     segments.extend(suffix.segments.clone());
     SelectorPath::new(segments)
 }
 
-pub fn select_external_arg<Root, T>(
-    value: &ExternalValue<Root>,
+pub fn select_storage_value<Root, T>(
+    value: &StorageValue<Root>,
     selector: &SelectorPath,
-    full_selector: &SelectorPath,
-) -> CoreResult<ExternalValue<T>>
+) -> CoreResult<StorageValue<T>>
 where
     Root: DeserializeOwned + Serialize + Selectable,
     T: DeserializeOwned + Serialize,
@@ -1977,49 +1827,14 @@ where
     let proven = typed_proven_selection(&value.value, selector)?;
     let typed_selected = typed_value_from_tree::<T>(&proven.selected_value).map_err(|e| {
         Error::Serialization(format!(
-            "Failed to deserialize selected external input '{}' from nested selection tree: {}",
-            value.name, e
-        ))
-    })?;
-    let selected_hash = selection_payload_hash(&proven.selected_bytes);
-    let selected_len = proven.selected_bytes.len() as u64;
-    let selected = SelectedPayload {
-        bytes: proven.selected_bytes,
-        commitment: SelectionCommitment {
-            path: full_selector.clone(),
-            source_root_hash: value.selected.commitment.source_root_hash.clone(),
-            selected_hash,
-            selected_len,
-        },
-    };
-    Ok(ExternalValue::new(
-        value.name.clone(),
-        full_selector.clone(),
-        value.commitment.clone(),
-        selected,
-        typed_selected,
-    ))
-}
-
-pub fn select_internal_value<Root, T>(
-    value: &InternalValue<Root>,
-    selector: &SelectorPath,
-) -> CoreResult<InternalValue<T>>
-where
-    Root: DeserializeOwned + Serialize + Selectable,
-    T: DeserializeOwned + Serialize,
-{
-    let proven = typed_proven_selection(&value.value, selector)?;
-    let typed_selected = typed_value_from_tree::<T>(&proven.selected_value).map_err(|e| {
-        Error::Serialization(format!(
-            "Failed to deserialize selected internal input from selection tree: {}",
+            "Failed to deserialize selected storage input from selection tree: {}",
             e
         ))
     })?;
     let full_selector = extend_selector_path(&value.selector, selector);
     let selected_hash = selection_payload_hash(&proven.selected_bytes);
     let selected_len = proven.selected_bytes.len() as u64;
-    Ok(InternalValue::new_with_selection(
+    Ok(StorageValue::new_with_selection(
         value.reference.clone(),
         proven.selected_bytes,
         full_selector.clone(),
@@ -2051,7 +1866,7 @@ fn infer_leaf_type_name(value: &TreeValue) -> CoreResult<String> {
     }
 }
 
-fn hex_string(bytes: &[u8]) -> String {
+pub(crate) fn hex_string(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
         out.push_str(&format!("{:02x}", byte));
@@ -2128,15 +1943,19 @@ fn prepare_raster_children<'a>(
     let mut hashes = Vec::new();
     match value {
         TreeValue::Struct(fields) => {
+            // Each field is laid out by `assemble_subtree` as
+            // `(u64 name_len)(name)(u64 payload_len)(payload)`, so a child's
+            // own payload starts past both length prefixes and the name.
             let mut child_offset = offset + 1 + 8;
-            for (_, child) in fields {
+            for (name, child) in fields {
                 let (child_payload, child_hash) = subtree_payload_and_root(child)?;
+                let name_len = name.len() as u64;
                 plans.push(RasterChildPlan {
                     value: child,
-                    node_offset: child_offset + 8,
+                    node_offset: child_offset + 8 + name_len + 8,
                 });
                 hashes.push(child_hash);
-                child_offset += 8 + child_payload.len() as u64;
+                child_offset += 8 + name_len + 8 + child_payload.len() as u64;
             }
         }
         TreeValue::List(values) => {
@@ -2383,110 +2202,81 @@ pub fn write_raster_files<T: Serialize>(
     Ok(commitment)
 }
 
-pub fn resolve_external_value<T: DeserializeOwned + Serialize>(
-    reference: ExternalSelection,
-) -> CoreResult<ExternalValue<T>> {
-    let storage = load_external_storage()?.ok_or_else(|| {
-        Error::Other(
-            "External input resolution requires CLI input context from --input and --input-manifest"
-                .into(),
-        )
-    })?;
-
-    let resolved = storage.resolve(reference.name())?;
-    match &resolved {
-        ResolvedExternalData::Postcard { .. } => {
-            if reference.selector().is_empty() {
-                let value = resolved.deserialize()?;
-                let selected =
-                    dynamic_selected_payload(reference.name(), &value, reference.selector())?;
-                return Ok(external_value_from_parts(
-                    reference.name(),
-                    reference.selector().clone(),
-                    resolved,
-                    selected,
-                    value,
-                ));
-            }
-
-            Err(Error::Other(format!(
-                "External selector for '{}' requires typed_external<Root>(...) with postcard path inputs",
-                reference.name()
-            )))
-        }
-        ResolvedExternalData::Raster { .. } => {
-            let (selected, value) =
-                raster_typed_value_from_selection(&resolved, reference.selector())?;
-            Ok(external_value_from_parts(
-                reference.name(),
-                reference.selector().clone(),
-                resolved,
-                selected,
-                value,
-            ))
-        }
-    }
+/// Where a program's output artifact was written.
+pub struct OutputArtifact {
+    pub data_path: std::path::PathBuf,
+    pub index_path: std::path::PathBuf,
+    pub manifest_path: std::path::PathBuf,
+    pub commitment: String,
 }
 
-pub fn resolve_typed_external_value<Root, T>(
-    reference: ExternalSelection,
-) -> CoreResult<ExternalValue<T>>
-where
-    Root: DeserializeOwned + Serialize + Selectable,
-    T: DeserializeOwned + Serialize,
-{
-    let storage = load_external_storage()?.ok_or_else(|| {
-        Error::Other(
-            "External input resolution requires CLI input context from --input and --input-manifest"
-                .into(),
-        )
+/// Export `main`'s returned value as an output artifact, in the exact format
+/// external input data takes when a `ProgramStart` loads it: a raster-encoded
+/// `output.bin` + `output.rindex`, plus an `output_manifest.json` whose single
+/// entry mirrors an input-manifest entry (`type`/`encoding`/`commitment`). The
+/// artifact can therefore be handed to a following program as its
+/// `--input`/`--input-manifest`.
+///
+/// Writes only when `RASTER_OUTPUT_DIR` is set (by `cargo raster run`); a plain
+/// `cargo run` produces no files and returns `Ok(None)`.
+pub fn write_program_output_artifact<T: Serialize>(value: &T) -> CoreResult<Option<OutputArtifact>> {
+    let Some(dir) = std::env::var_os(crate::tracing::OUTPUT_DIR_ENV) else {
+        return Ok(None);
+    };
+    let dir = std::path::PathBuf::from(dir);
+    fs::create_dir_all(&dir).map_err(|e| {
+        Error::Other(format!(
+            "Failed to create output artifact directory '{}': {}",
+            dir.display(),
+            e
+        ))
     })?;
 
-    let resolved = storage.resolve(reference.name())?;
-    match &resolved {
-        ResolvedExternalData::Postcard { .. } => {
-            let root: Root = resolved.deserialize()?;
-            let proven = typed_proven_selection(&root, reference.selector())?;
+    let data_path = dir.join("output.bin");
+    let index_path = dir.join("output.rindex");
+    let manifest_path = dir.join("output_manifest.json");
 
-            let typed_selected =
-                typed_value_from_tree::<T>(&proven.selected_value).map_err(|e| {
-                    Error::Serialization(format!(
-                    "Failed to deserialize selected external input '{}' from selection tree: {}",
-                    reference.name(),
-                    e
-                ))
-                })?;
-            let selected = selected_payload_from_proven(reference.selector(), proven);
+    let commitment = write_raster_files(value, &data_path, &index_path)?;
 
-            Ok(external_value_from_parts(
-                reference.name(),
-                reference.selector().clone(),
-                resolved,
-                selected,
-                typed_selected,
-            ))
-        }
-        ResolvedExternalData::Raster { .. } => {
-            let (selected, typed_selected) =
-                raster_typed_value_from_selection(&resolved, reference.selector())?;
-            Ok(external_value_from_parts(
-                reference.name(),
-                reference.selector().clone(),
-                resolved,
-                selected,
-                typed_selected,
-            ))
-        }
-    }
+    // Byte-for-byte the input-manifest entry shape (see input_manifest.json),
+    // so the artifact round-trips as a following program's external input.
+    let manifest = format!(
+        "{{\n  \"output\": {{ \"type\": \"sha256\", \"encoding\": \"raster\", \"commitment\": \"{}\" }}\n}}\n",
+        commitment
+    );
+    fs::write(&manifest_path, manifest).map_err(|e| {
+        Error::Other(format!(
+            "Failed to write output manifest '{}': {}",
+            manifest_path.display(),
+            e
+        ))
+    })?;
+
+    Ok(Some(OutputArtifact {
+        data_path,
+        index_path,
+        manifest_path,
+        commitment,
+    }))
+}
+
+/// Compute the manifest commitment for a Postcard-encoded entry argument:
+/// the same selection-tree structural root `start_program`/
+/// `verify_postcard_structural_commitment` check against at runtime, hex-
+/// encoded. Manifest-authoring tooling (e.g. a project's `gen_input`
+/// binary) calls this to produce `input_manifest.json`'s `commitment`
+/// field for a Postcard source — it is *not* `sha256(postcard bytes)`.
+pub fn postcard_structural_commitment<T: Serialize>(value: &T) -> CoreResult<String> {
+    let tree = tree_value_from_serialize(value)?;
+    let (_, root_hash) = subtree_payload_and_root(&tree)?;
+    Ok(hex_string(&root_hash))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::external_storage::{sha256_hex, ExternalStorageManager};
-    use crate::raster_index::{
-        RasterIndex, RasterMerkleLevel, RasterNode, RasterNodeKind, RasterStructField,
-    };
+    use crate::raster_index::RasterIndex;
+    use crate::source::{sha256_hex, FileInputSourceResolver};
     use raster_core::input::{verify_selection_proof, SchemaField, SchemaNode, Selectable};
     use serde::{Deserialize, Serialize};
     use std::collections::BTreeMap;
@@ -2497,12 +2287,6 @@ mod tests {
     use std::vec;
 
     static UNIQUE_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    #[derive(Debug, Serialize, Deserialize, PartialEq)]
-    struct Flight {
-        id: u32,
-        seats: u16,
-    }
 
     #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
     struct Address {
@@ -2571,8 +2355,8 @@ mod tests {
         std::env::temp_dir().join(format!("raster-input-test-{}-{}", nanos, counter))
     }
 
-    fn storage_manager(input_path: &Path, manifest_path: &Path) -> ExternalStorageManager {
-        ExternalStorageManager::from_input_args(input_path.to_str(), manifest_path.to_str())
+    fn storage_manager(input_path: &Path, manifest_path: &Path) -> FileInputSourceResolver {
+        FileInputSourceResolver::from_input_args(input_path.to_str(), manifest_path.to_str())
             .unwrap()
     }
 
@@ -2589,180 +2373,6 @@ mod tests {
         fs::write(&manifest_path, manifest_body.replace("{hash}", hash)).unwrap();
 
         (input_path, manifest_path)
-    }
-
-    fn leaf_payload(body: &[u8]) -> Vec<u8> {
-        let mut out = vec![0x00];
-        out.extend_from_slice(&(body.len() as u64).to_le_bytes());
-        out.extend_from_slice(body);
-        out
-    }
-
-    fn hex_string(bytes: &[u8]) -> String {
-        let mut out = String::with_capacity(bytes.len() * 2);
-        for byte in bytes {
-            out.push_str(&format!("{:02x}", byte));
-        }
-        out
-    }
-
-    fn merkle_levels_from_hashes(hashes: &[Hash32]) -> Vec<RasterMerkleLevel> {
-        if hashes.is_empty() {
-            return Vec::new();
-        }
-
-        let mut levels = vec![RasterMerkleLevel {
-            hashes: hashes.to_vec(),
-        }];
-        let mut level = hashes.to_vec();
-        while level.len() > 1 {
-            let mut padded = level.clone();
-            if padded.len() % 2 == 1 {
-                padded.push(padded.last().cloned().unwrap());
-            }
-            let mut next = Vec::with_capacity(padded.len() / 2);
-            for pair in padded.chunks(2) {
-                next.push(selection_hash(&[
-                    b"list-node",
-                    pair[0].as_slice(),
-                    pair[1].as_slice(),
-                ]));
-            }
-            levels.push(RasterMerkleLevel {
-                hashes: next.clone(),
-            });
-            level = next;
-        }
-
-        levels
-    }
-
-    fn build_raster_index_node(
-        nodes: &mut Vec<RasterNode>,
-        value: &TreeValue,
-        schema: &SchemaNode,
-        offset: u64,
-    ) -> (u64, Hash32) {
-        let (payload, root_hash) = subtree_payload_and_root(value).unwrap();
-        let node_id = nodes.len() as u64;
-        nodes.push(RasterNode {
-            offset,
-            len: payload.len() as u64,
-            root_hash: root_hash.clone(),
-            kind: RasterNodeKind::Leaf {
-                type_name: "placeholder".into(),
-            },
-        });
-
-        let kind = match (value, schema) {
-            (TreeValue::Struct(entries), SchemaNode::Struct { fields, .. }) => {
-                let mut raster_fields = Vec::with_capacity(fields.len());
-                let mut child_offset = offset + 1 + 8;
-                for field in fields {
-                    let child_value = find_struct_field(entries, &field.name).unwrap();
-                    let (child_payload, _) = subtree_payload_and_root(child_value).unwrap();
-                    let child_id = build_raster_index_node(
-                        nodes,
-                        child_value,
-                        &field.schema,
-                        child_offset + 8,
-                    )
-                    .0;
-                    raster_fields.push(RasterStructField {
-                        name: field.name.clone(),
-                        child: child_id,
-                    });
-                    child_offset += 8 + child_payload.len() as u64;
-                }
-                RasterNodeKind::Struct {
-                    fields: raster_fields,
-                }
-            }
-            (TreeValue::List(values), SchemaNode::List { element, .. }) => {
-                let mut child_offset = offset + 1 + 8;
-                let mut elements = Vec::with_capacity(values.len());
-                let mut hashes = Vec::with_capacity(values.len());
-                for value in values {
-                    let (child_payload, child_hash) = subtree_payload_and_root(value).unwrap();
-                    let child_id =
-                        build_raster_index_node(nodes, value, element, child_offset + 8).0;
-                    elements.push(child_id);
-                    hashes.push(child_hash);
-                    child_offset += 8 + child_payload.len() as u64;
-                }
-                RasterNodeKind::List {
-                    len: values.len() as u64,
-                    elements,
-                    merkle_levels: merkle_levels_from_hashes(&hashes),
-                }
-            }
-            (_, SchemaNode::Leaf { type_name }) => RasterNodeKind::Leaf {
-                type_name: type_name.clone(),
-            },
-            _ => panic!("schema and tree shape diverged while building raster index"),
-        };
-
-        nodes[node_id as usize].kind = kind;
-        (node_id, root_hash)
-    }
-
-    fn raster_fixture_for_value<T>(value: &T, schema: SchemaNode) -> (Vec<u8>, Vec<u8>, String)
-    where
-        T: Serialize,
-    {
-        let tree = tree_value_from_serialize(value).unwrap();
-        let (payload, root_hash) = subtree_payload_and_root(&tree).unwrap();
-        let mut nodes = Vec::new();
-        let root_node = build_raster_index_node(&mut nodes, &tree, &schema, 0).0;
-        let index = RasterIndex::new(root_node, root_hash.clone(), nodes);
-        (payload, index.encode().unwrap(), hex_string(&root_hash))
-    }
-
-    #[test]
-    fn resolves_file_backed_seed_through_external_value_path() {
-        let dir = unique_dir();
-        fs::create_dir_all(&dir).unwrap();
-
-        let bytes = raster_core::postcard::to_allocvec(&123u64).unwrap();
-        fs::write(dir.join("seed.bin"), &bytes).unwrap();
-        let hash = sha256_hex(&bytes);
-        let (input_path, manifest_path) = write_external_documents(
-            &dir,
-            &hash,
-            r#"{"seed":{"path":"seed.bin","load_preference":"read"}}"#,
-            r#"{"seed":{"type":"sha256","commitment":"{hash}"}}"#,
-        );
-
-        let storage = storage_manager(&input_path, &manifest_path);
-        let resolved = storage.resolve("seed").unwrap();
-        let value: u64 = resolved.deserialize().unwrap();
-        let selected = dynamic_selected_payload("seed", &value, &SelectorPath::default()).unwrap();
-
-        assert_eq!(resolved.bytes(), bytes.as_slice());
-        assert_eq!(resolved.commitment(), hash);
-        assert_eq!(value, 123);
-        assert_eq!(selected.bytes, leaf_payload(&123u64.to_le_bytes()));
-
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn whole_value_dynamic_selection_produces_verifiable_payload() {
-        let selected = dynamic_selected_payload("seed", &123u64, &SelectorPath::default()).unwrap();
-
-        assert_eq!(selected.bytes, leaf_payload(&123u64.to_le_bytes()));
-        assert!(selected.commitment.path.is_empty());
-    }
-
-    #[test]
-    fn resolve_external_value_errors_without_cli_context() {
-        let err = resolve_external_value::<Flight>(ExternalSelection::new("flight_data"))
-            .expect_err("missing CLI context should fail");
-
-        assert_eq!(
-            err.to_string(),
-            "External input resolution requires CLI input context from --input and --input-manifest"
-        );
     }
 
     #[test]
@@ -2896,202 +2506,29 @@ mod tests {
     }
 
     #[test]
-    fn resolves_raster_nested_selection_with_merkle_proof() {
-        let dir = unique_dir();
-        fs::create_dir_all(&dir).unwrap();
-
-        let data = PersonalData {
-            age: 25,
-            name: "John".to_string(),
-            addresses: vec![Address {
-                lines: vec!["221B Baker Street".to_string(), "Flat B".to_string()],
-                indexes: vec![7, 42],
-            }],
+    fn payload_structural_root_recomputes_manifest_commitment() {
+        // The chain "bridge": a program's `output.bin` is exactly this payload,
+        // and `payload_structural_root` over those bytes alone must equal the
+        // structural root the manifest commits (`encode_raster_value`'s hex
+        // commitment) — the manifest-side link hash, recomputable with no index.
+        // See docs/proposals/program-chain.md.
+        let mut aliases = BTreeMap::new();
+        aliases.insert("one".to_string(), 1);
+        aliases.insert("two".to_string(), 2);
+        let value = ComplexSerdeValue {
+            maybe_name: Some("chain".to_string()),
+            pattern: Pattern::Pair(3, 9),
+            aliases,
+            nested: Some(Pattern::Sequence { len: 4 }),
         };
-        let (payload, index_bytes, root_commitment) =
-            raster_fixture_for_value(&data, PersonalData::schema());
-        fs::write(dir.join("personal_data.rastered"), &payload).unwrap();
-        fs::write(dir.join("personal_data.rindex"), &index_bytes).unwrap();
-        let (input_path, manifest_path) = write_external_documents(
-            &dir,
-            &root_commitment,
-            r#"{"personal_data":{"path":"personal_data.rastered","index_path":"personal_data.rindex","load_preference":"mmap"}}"#,
-            r#"{"personal_data":{"type":"sha256","encoding":"raster","commitment":"{hash}"}}"#,
-        );
 
-        let selector = SelectorPath::new(vec![
-            SelectorSegment::from("addresses"),
-            SelectorSegment::from(0usize),
-            SelectorSegment::from("lines"),
-            SelectorSegment::from(1usize),
-        ]);
-        let storage = storage_manager(&input_path, &manifest_path);
-        let resolved = storage.resolve("personal_data").unwrap();
-        let (selected, typed_selected): (SelectedPayload, String) =
-            raster_typed_value_from_selection(&resolved, &selector).unwrap();
-        let index = resolved.raster_index().unwrap();
-        let witness = selection_witness_from_raster_selection(
-            resolved.raster_bytes().unwrap(),
-            &selector,
-            index.select(&selector).unwrap(),
-        )
-        .unwrap();
+        let (payload, _index, commitment_hex) = encode_raster_value(&value).unwrap();
+        let root = raster_core::input::payload_structural_root(&payload)
+            .expect("payload is well-formed");
+        assert_eq!(super::hex_string(&root), commitment_hex);
 
-        assert_eq!(typed_selected, "Flat B");
-        assert!(raster_core::input::verify_selection_witness(
-            &selected.commitment,
-            &witness
-        ));
-
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn raster_trace_external_binding_matches_resolved_metadata() {
-        let dir = unique_dir();
-        fs::create_dir_all(&dir).unwrap();
-
-        let data = PersonalData {
-            age: 25,
-            name: "John".to_string(),
-            addresses: vec![Address {
-                lines: vec!["221B Baker Street".to_string(), "Flat B".to_string()],
-                indexes: vec![7, 42],
-            }],
-        };
-        let (payload, index_bytes, root_commitment) =
-            raster_fixture_for_value(&data, PersonalData::schema());
-        fs::write(dir.join("personal_data.rastered"), &payload).unwrap();
-        fs::write(dir.join("personal_data.rindex"), &index_bytes).unwrap();
-        let (input_path, manifest_path) = write_external_documents(
-            &dir,
-            &root_commitment,
-            r#"{"personal_data":{"path":"personal_data.rastered","index_path":"personal_data.rindex","load_preference":"read"}}"#,
-            r#"{"personal_data":{"type":"sha256","encoding":"raster","commitment":"{hash}"}}"#,
-        );
-
-        let selector = SelectorPath::new(vec![
-            SelectorSegment::from("addresses"),
-            SelectorSegment::from(0usize),
-            SelectorSegment::from("lines"),
-            SelectorSegment::from(1usize),
-        ]);
-        let storage = storage_manager(&input_path, &manifest_path);
-        let trace =
-            trace_raster_external_binding_from_storage(&storage, "personal_data", &selector)
-                .unwrap()
-                .expect("raster input should produce trace metadata");
-        let resolved = storage.resolve("personal_data").unwrap();
-        let (selected, typed_selected): (SelectedPayload, String) =
-            raster_typed_value_from_selection(&resolved, &selector).unwrap();
-
-        assert_eq!(typed_selected, "Flat B");
-        assert_eq!(trace.name, "personal_data");
-        assert_eq!(trace.commitment, root_commitment.into_bytes());
-        assert_eq!(trace.tree_root, selected.commitment.source_root_hash);
-        assert_eq!(trace.selector, selector);
-        assert_eq!(trace.selection, selected.commitment);
-
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn raster_trace_external_binding_does_not_materialize_selected_type() {
-        let dir = unique_dir();
-        fs::create_dir_all(&dir).unwrap();
-
-        let data = PersonalData {
-            age: 25,
-            name: "John".to_string(),
-            addresses: vec![Address {
-                lines: vec!["221B Baker Street".to_string(), "Flat B".to_string()],
-                indexes: vec![7, 42],
-            }],
-        };
-        let (payload, index_bytes, root_commitment) =
-            raster_fixture_for_value(&data, PersonalData::schema());
-        fs::write(dir.join("personal_data.rastered"), &payload).unwrap();
-        fs::write(dir.join("personal_data.rindex"), &index_bytes).unwrap();
-        let (input_path, manifest_path) = write_external_documents(
-            &dir,
-            &root_commitment,
-            r#"{"personal_data":{"path":"personal_data.rastered","index_path":"personal_data.rindex","load_preference":"read"}}"#,
-            r#"{"personal_data":{"type":"sha256","encoding":"raster","commitment":"{hash}"}}"#,
-        );
-
-        let selector = SelectorPath::new(vec![
-            SelectorSegment::from("addresses"),
-            SelectorSegment::from(0usize),
-            SelectorSegment::from("lines"),
-            SelectorSegment::from(1usize),
-        ]);
-        let storage = storage_manager(&input_path, &manifest_path);
-        let trace =
-            trace_raster_external_binding_from_storage(&storage, "personal_data", &selector)
-                .unwrap()
-                .expect("raster input should produce trace metadata");
-        let resolved = storage.resolve("personal_data").unwrap();
-        let typed_error = raster_typed_value_from_selection::<u64>(&resolved, &selector)
-            .expect_err("typed materialization should fail for a selected string");
-
-        assert!(trace.selection.selected_len > 0);
-        assert!(
-            typed_error.to_string().contains("Failed to deserialize")
-                || typed_error.to_string().contains("invalid type")
-        );
-
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn resolve_external_value_supports_raster_selectors_without_root_type() {
-        let dir = unique_dir();
-        fs::create_dir_all(&dir).unwrap();
-
-        let data = PersonalData {
-            age: 25,
-            name: "John".to_string(),
-            addresses: vec![Address {
-                lines: vec!["221B Baker Street".to_string()],
-                indexes: vec![7, 42],
-            }],
-        };
-        let (payload, index_bytes, root_commitment) =
-            raster_fixture_for_value(&data, PersonalData::schema());
-        fs::write(dir.join("personal_data.rastered"), &payload).unwrap();
-        fs::write(dir.join("personal_data.rindex"), &index_bytes).unwrap();
-        let (input_path, manifest_path) = write_external_documents(
-            &dir,
-            &root_commitment,
-            r#"{"personal_data":{"path":"personal_data.rastered","index_path":"personal_data.rindex","load_preference":"read"}}"#,
-            r#"{"personal_data":{"type":"sha256","encoding":"raster","commitment":"{hash}"}}"#,
-        );
-
-        let storage = storage_manager(&input_path, &manifest_path);
-        let resolved = storage.resolve("personal_data").unwrap();
-        let selector = SelectorPath::new(vec![
-            SelectorSegment::from("addresses"),
-            SelectorSegment::from(0usize),
-            SelectorSegment::from("indexes"),
-            SelectorSegment::from(1usize),
-        ]);
-        let (selected, typed_selected): (SelectedPayload, u32) =
-            raster_typed_value_from_selection(&resolved, &selector).unwrap();
-        let index = resolved.raster_index().unwrap();
-        let witness = selection_witness_from_raster_selection(
-            resolved.raster_bytes().unwrap(),
-            &selector,
-            index.select(&selector).unwrap(),
-        )
-        .unwrap();
-
-        assert_eq!(typed_selected, 42);
-        assert!(raster_core::input::verify_selection_witness(
-            &selected.commitment,
-            &witness
-        ));
-
-        fs::remove_dir_all(&dir).unwrap();
+        // A truncated artifact must not silently produce a root.
+        assert!(raster_core::input::payload_structural_root(&payload[..payload.len() - 1]).is_none());
     }
 
     #[test]
@@ -3109,7 +2546,7 @@ mod tests {
         let (data_bytes, index_bytes, _commitment) = encode_raster_value(&value).unwrap();
         let index = RasterIndex::from_bytes(&index_bytes).unwrap();
         let selection = index.root_selection().unwrap();
-        let tree = tree_value_from_raster_selection(&index, &data_bytes, &selection).unwrap();
+        let tree = tree_value_from_raster_node(&index, &data_bytes, selection.node_id).unwrap();
         let decoded: ComplexSerdeValue = typed_value_from_tree(&tree).unwrap();
         let selected_hash = raster_core::input::selection_payload_hash(&data_bytes);
         let selected_len = data_bytes.len() as u64;

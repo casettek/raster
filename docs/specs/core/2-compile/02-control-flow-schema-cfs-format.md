@@ -186,9 +186,9 @@ Consumers MUST NOT assume that `item_type` is fully validated or correct in the 
 - `SequenceScope { input_index }` for references to the current sequence invocation scope
 - `PriorItemOutput { intra_sequence_item_index }` for references to a prior item's output
 
-`PriorItemOutput` is structural CFS metadata, not a storage offset. During execution and verification it resolves to the internal-store entry keyed by the prior item's execution coordinates.
+`PriorItemOutput` is structural CFS metadata, not a storage offset. During execution and verification it resolves to the storage entry keyed by the prior item's execution coordinates.
 
-There is deliberately no output-slot index on `PriorItemOutput`. A prior item commits exactly one internal-store object per execution (keyed by its coordinates); consumers that need a sub-value of that object address it with a selector path into the committed encoding, verified via selection commitments. A tile that logically produces several values returns them as one struct/tuple and each consumer selects the piece it needs; output slots would duplicate that addressing.
+There is deliberately no output-slot index on `PriorItemOutput`. A prior item commits exactly one storage object per execution (keyed by its coordinates); consumers that need a sub-value of that object address it with a selector path into the committed encoding, verified via selection commitments. A tile that logically produces several values returns them as one struct/tuple and each consumer selects the piece it needs; output slots would duplicate that addressing.
 
 Representative JSON encodings under Serde’s default enum representation are:
 

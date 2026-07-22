@@ -3,16 +3,13 @@
 //! This module orchestrates the generation of a CFS from a Raster project
 //! by combining tile discovery, sequence discovery, and data flow resolution.
 
-use raster_core::cfs::{
-    CfsCoordinate, CfsCoordinates, ControlFlowSchema, InputBinding, SequenceChildId,
-    SequenceChildItem, SequenceDef, SequenceId, SequenceItem, TileDef,
-};
+use raster_core::cfs::{ControlFlowSchema, InputBinding, SequenceDef, TileDef};
 
 use crate::flow_resolver::FlowResolver;
 use crate::sequence::{Sequence, SequenceDiscovery};
 use crate::tile::TileDiscovery;
 use crate::Project;
-use raster_core::Result;
+use raster_core::{Error, Result};
 
 /// Builds a control flow schema from a Raster project.
 pub struct CfsBuilder<'a> {
@@ -36,7 +33,7 @@ impl<'a> CfsBuilder<'a> {
         let sequence_discovery = SequenceDiscovery::new(self.project, &tile_discovery);
 
         // Build tile definitions
-        let tiles: Vec<TileDef> = tile_discovery
+        let mut tiles: Vec<TileDef> = tile_discovery
             .tiles
             .iter()
             .map(|t| {
@@ -53,6 +50,18 @@ impl<'a> CfsBuilder<'a> {
             sequences.push(seq_def);
         }
 
+        // Canonicalize: the CFS is the control-flow half of a program's
+        // identity (see docs/proposals/program-identity.md), so its byte form
+        // must be reproducible regardless of the filesystem order in which
+        // tiles and sequences were discovered (`WalkDir` does not sort). Sort
+        // both by id and reject duplicate ids — a duplicate would make a name
+        // ambiguous in the identity registry. `SequenceDef::items` order is
+        // semantic (coordinates index into it) and is left untouched.
+        tiles.sort_by(|a, b| a.id.cmp(&b.id));
+        sequences.sort_by(|a, b| a.id.cmp(&b.id));
+        assert_unique_ids("tile", tiles.iter().map(|t| t.id.as_str()))?;
+        assert_unique_ids("sequence", sequences.iter().map(|s| s.id.as_str()))?;
+
         Ok(ControlFlowSchema {
             version: "1.0".to_string(),
             project: self.project.name.clone(),
@@ -63,21 +72,327 @@ impl<'a> CfsBuilder<'a> {
     }
 
     /// Build a sequence definition from a discovered sequence.
+    ///
+    /// `main`'s declared parameters are entry arguments, not caller-supplied
+    /// `SequenceScope` parameters — main has no caller. When `main` declares
+    /// any, they are recorded in `SequenceDef::entry_arguments` (bound at
+    /// runtime by the program's `ProgramStart` step into one authorized
+    /// object at coordinates `[]`), and every consuming item resolves them
+    /// through `InputBinding::EntryArgument`. Every other sequence (including
+    /// `main` with no declared parameters) is built exactly as before.
     fn build_sequence_def(&self, seq: &Sequence<'_>) -> Result<SequenceDef> {
-        // Create input sources for the sequence's parameters
-        // All sequence inputs come from external sources
+        let mut resolver = FlowResolver::new();
+
+        // Only `main` produces a program output, and only when it returns a
+        // non-unit value — its declared return type is the program's output
+        // declaration (bound at runtime by the `ProgramEnd` step).
+        let produces_output =
+            seq.function.name == "main" && returns_non_unit(&seq.function.output);
+
+        if seq.function.name == "main" && !seq.function.input_names.is_empty() {
+            let items = resolver.resolve_with_entry_arguments(seq, &seq.function.input_names);
+
+            return Ok(SequenceDef {
+                id: seq.function.name.clone(),
+                input_sources: Vec::new(),
+                items,
+                entry_arguments: seq.function.input_names.clone(),
+                produces_output,
+            });
+        }
+
+        // A sequence definition's own parameters are supplied by whoever
+        // calls it: parameter `i` is sequence-scope slot `i`. (Callers'
+        // arguments are resolved separately, at each call site.)
         let input_count = seq.function.inputs.len();
         let input_sources: Vec<InputBinding> =
-            (0..input_count).map(|_| InputBinding::external()).collect();
+            (0..input_count).map(InputBinding::seq_input).collect();
 
         // Resolve data flow for the sequence items
-        let mut resolver = FlowResolver::new();
         let items = resolver.resolve(seq);
 
         Ok(SequenceDef {
             id: seq.function.name.clone(),
             input_sources,
             items,
+            entry_arguments: Vec::new(),
+            produces_output,
         })
+    }
+}
+
+/// Reject duplicate ids in a (already sorted) id sequence, naming the kind
+/// (`tile`/`sequence`) and the offending id in the error.
+fn assert_unique_ids<'a>(kind: &str, ids: impl Iterator<Item = &'a str>) -> Result<()> {
+    let mut prev: Option<&str> = None;
+    for id in ids {
+        if prev == Some(id) {
+            return Err(Error::Other(format!(
+                "duplicate {kind} id '{id}' — {kind} ids must be unique to form a program identity"
+            )));
+        }
+        prev = Some(id);
+    }
+    Ok(())
+}
+
+/// Whether a return-type string denotes a non-unit value. `None` (no return
+/// type) and unit — including `Result<()>` — are not outputs; every other
+/// parseable type is. Mirrors the macro's `Unit`/`Value`/`Fallible` split
+/// (see `raster-macros`), but from the parsed signature string.
+fn returns_non_unit(output: &Option<String>) -> bool {
+    let Some(output) = output else {
+        return false;
+    };
+    match syn::parse_str::<syn::Type>(output) {
+        Ok(ty) => !type_is_unit(&ty),
+        // Unparseable here should not happen (it parsed once already); treat a
+        // present return type conservatively as an output.
+        Err(_) => true,
+    }
+}
+
+fn type_is_unit(ty: &syn::Type) -> bool {
+    match ty {
+        syn::Type::Tuple(tuple) => tuple.elems.is_empty(),
+        syn::Type::Path(type_path) => {
+            let Some(segment) = type_path.path.segments.last() else {
+                return false;
+            };
+            if segment.ident != "Result" {
+                return false;
+            }
+            let syn::PathArguments::AngleBracketed(args) = &segment.arguments else {
+                return false;
+            };
+            match args.args.first() {
+                Some(syn::GenericArgument::Type(inner)) => type_is_unit(inner),
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use raster_core::cfs::SequenceChildItem;
+
+    use crate::ast::{
+        CallArgumentKind, CallInfo, CallKind, FunctionAstItem, MacroAstItem, ProjectAst,
+    };
+    use crate::sequence::SequenceStep;
+    use crate::tile::Tile;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    fn mock_project() -> Project {
+        Project {
+            name: "test".to_string(),
+            ast: ProjectAst {
+                name: "test".to_string(),
+                root_path: PathBuf::from("/test"),
+                functions: vec![],
+            },
+            root_dir: PathBuf::from("/test"),
+            output_dir: PathBuf::from("/test/target/raster"),
+            target_dir: PathBuf::from("/test/target/"),
+        }
+    }
+
+    fn tile_function(name: &str) -> FunctionAstItem {
+        FunctionAstItem {
+            name: name.to_string(),
+            path: PathBuf::from("test.rs"),
+            call_infos: vec![],
+            macros: vec![MacroAstItem {
+                name: "tile".to_string(),
+                args: HashMap::new(),
+            }],
+            input_names: vec!["input".to_string()],
+            inputs: vec!["String".to_string()],
+            output: Some("String".to_string()),
+            signature: format!("fn {}()", name),
+            selection_aliases: vec![],
+        }
+    }
+
+    fn main_function_with_params(
+        input_names: Vec<&str>,
+        call_infos: Vec<CallInfo>,
+    ) -> FunctionAstItem {
+        FunctionAstItem {
+            name: "main".to_string(),
+            path: PathBuf::from("test.rs"),
+            call_infos,
+            macros: vec![MacroAstItem {
+                name: "sequence".to_string(),
+                args: HashMap::new(),
+            }],
+            input_names: input_names.iter().map(|s| s.to_string()).collect(),
+            inputs: input_names
+                .iter()
+                .map(|_| "PersonalData".to_string())
+                .collect(),
+            output: None,
+            signature: "fn main()".to_string(),
+            selection_aliases: vec![],
+        }
+    }
+
+    #[test]
+    fn main_with_entry_arguments_records_them_and_keeps_input_sources_empty() {
+        let project = mock_project();
+        let greet_func = tile_function("greet");
+        let greet_tile = Tile {
+            function: &greet_func,
+            tile_type: "iter".to_string(),
+            estimated_cycles: None,
+            max_memory: None,
+            description: None,
+        };
+
+        let main_func = main_function_with_params(
+            vec!["personal_data", "seed"],
+            vec![CallInfo {
+                callee: "greet".to_string(),
+                result_binding: Some("greeting".to_string()),
+                arguments: vec!["personal_data".to_string()],
+                argument_kinds: vec![CallArgumentKind::Rooted {
+                    root: "personal_data".to_string(),
+                }],
+                call_kind: CallKind::Tile,
+                chunk: None,
+            }],
+        );
+        let sequence = Sequence {
+            function: &main_func,
+            steps: vec![SequenceStep::Tile(&greet_tile)],
+            description: None,
+        };
+
+        let builder = CfsBuilder::new(&project);
+        let seq_def = builder.build_sequence_def(&sequence).unwrap();
+
+        assert!(
+            seq_def.input_sources.is_empty(),
+            "main's own input_sources must be empty once its parameters become entry arguments"
+        );
+        assert_eq!(
+            seq_def.entry_arguments,
+            vec!["personal_data".to_string(), "seed".to_string()],
+            "entry arguments are recorded on the sequence def in declaration order",
+        );
+        assert_eq!(
+            seq_def.items.len(),
+            1,
+            "no synthetic entrypoint item — the tile is the leading item at index 0"
+        );
+
+        match &seq_def.items[0] {
+            SequenceChildItem::Tile(tile_item) => {
+                assert_eq!(tile_item.id, "greet");
+                match &tile_item.sources[0] {
+                    InputBinding::EntryArgument => {}
+                    other => panic!("Expected EntryArgument binding, got {:?}", other),
+                }
+            }
+            other => panic!("Expected a Tile item, got {:?}", other),
+        }
+    }
+
+    fn project_with_tile_functions(names: &[&str]) -> Project {
+        let functions = names
+            .iter()
+            .map(|name| tile_function(name))
+            .collect::<Vec<_>>();
+        Project {
+            name: "test".to_string(),
+            ast: ProjectAst {
+                name: "test".to_string(),
+                root_path: PathBuf::from("/test"),
+                functions,
+            },
+            root_dir: PathBuf::from("/test"),
+            output_dir: PathBuf::from("/test/target/raster"),
+            target_dir: PathBuf::from("/test/target/"),
+        }
+    }
+
+    #[test]
+    fn build_sorts_tiles_by_id_regardless_of_discovery_order() {
+        // Two projects whose tile functions are discovered in opposite orders
+        // (mimicking two filesystems' WalkDir orders) must produce byte-identical
+        // CFS tile lists — the reproducibility property program identity needs.
+        let forward = CfsBuilder::new(&project_with_tile_functions(&["alpha", "zeta", "mid"]))
+            .build()
+            .unwrap();
+        let reversed = CfsBuilder::new(&project_with_tile_functions(&["zeta", "mid", "alpha"]))
+            .build()
+            .unwrap();
+
+        let ids: Vec<&str> = forward.tiles.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, vec!["alpha", "mid", "zeta"], "tiles sorted by id");
+        assert_eq!(
+            forward.tiles.iter().map(|t| &t.id).collect::<Vec<_>>(),
+            reversed.tiles.iter().map(|t| &t.id).collect::<Vec<_>>(),
+            "discovery order must not affect the canonical tile order",
+        );
+    }
+
+    #[test]
+    fn build_rejects_duplicate_tile_ids() {
+        let err = CfsBuilder::new(&project_with_tile_functions(&["dup", "dup"]))
+            .build()
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("duplicate tile id 'dup'"),
+            "expected duplicate-id error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn main_without_parameters_is_unaffected() {
+        let project = mock_project();
+        let greet_func = tile_function("greet");
+        let greet_tile = Tile {
+            function: &greet_func,
+            tile_type: "iter".to_string(),
+            estimated_cycles: None,
+            max_memory: None,
+            description: None,
+        };
+
+        let main_func = main_function_with_params(
+            vec![],
+            vec![CallInfo {
+                callee: "greet".to_string(),
+                result_binding: None,
+                arguments: vec!["\"Raster\".to_string()".to_string()],
+                argument_kinds: vec![CallArgumentKind::Inline],
+                call_kind: CallKind::Tile,
+                chunk: None,
+            }],
+        );
+        let sequence = Sequence {
+            function: &main_func,
+            steps: vec![SequenceStep::Tile(&greet_tile)],
+            description: None,
+        };
+
+        let builder = CfsBuilder::new(&project);
+        let seq_def = builder.build_sequence_def(&sequence).unwrap();
+
+        assert!(
+            seq_def.input_sources.is_empty(),
+            "main declared zero parameters"
+        );
+        assert!(
+            seq_def.entry_arguments.is_empty(),
+            "main declared no entry arguments"
+        );
+        assert_eq!(seq_def.items.len(), 1, "just the one tile item");
+        assert!(matches!(seq_def.items[0], SequenceChildItem::Tile(_)));
     }
 }

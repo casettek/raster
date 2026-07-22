@@ -82,6 +82,33 @@ impl CfsCursor {
         self.coordinates = coordinates;
     }
 
+    /// The declared entry-argument names, in canonical order, if `main`
+    /// declares any (`SequenceDef::entry_arguments`). `None` means `main`
+    /// declares no external arguments at all — there is nothing to authorize
+    /// at entry, and the program's `ProgramStart` step binds nothing.
+    pub fn main_entrypoint_names(&self) -> Option<&[String]> {
+        let main = self
+            .cfs
+            .sequences
+            .get(self.entrypoint_coordinate as usize)?;
+        if main.entry_arguments.is_empty() {
+            None
+        } else {
+            Some(main.entry_arguments.as_slice())
+        }
+    }
+
+    /// Whether `main` declares a program output (`SequenceDef::produces_output`).
+    /// When `true`, the program's `ProgramEnd` step must bind a storage-backed
+    /// output; when `false`, it binds nothing (a unit program).
+    pub fn main_produces_output(&self) -> bool {
+        self.cfs
+            .sequences
+            .get(self.entrypoint_coordinate as usize)
+            .map(|main| main.produces_output)
+            .unwrap_or(false)
+    }
+
     pub fn is_next_coordinates(&mut self, next_coordinates: &CfsCoordinates) -> bool {
         if let Some(next_coordinates_options) = self.try_get_next_coordinates(&self.coordinates()) {
             return next_coordinates_options.contains(next_coordinates);
@@ -488,6 +515,17 @@ pub struct SequenceDef {
     pub id: SequenceId,
     pub input_sources: Vec<InputBinding>,
     pub items: Vec<SequenceChildItem>,
+    /// `main`'s declared entry-argument names, in declaration order. Bound
+    /// once by the program's `ProgramStart` step into a single authorized
+    /// storage object at coordinates `[]`. Empty for every sequence other
+    /// than `main`, and for a `main` that declares no external arguments.
+    #[serde(default)]
+    pub entry_arguments: Vec<String>,
+    /// Whether `main` returns a program output (a non-unit value). When set,
+    /// the program's `ProgramEnd` step binds and authorizes that output.
+    /// Always `false` for sequences other than `main`.
+    #[serde(default)]
+    pub produces_output: bool,
 }
 
 impl SequenceDef {
@@ -497,6 +535,8 @@ impl SequenceDef {
             id: id.into(),
             input_sources: Vec::new(),
             items: Vec::new(),
+            entry_arguments: Vec::new(),
+            produces_output: false,
         }
     }
 
@@ -573,12 +613,14 @@ pub struct RecurSequenceItem {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum InputBinding {
     Direct(InputSource),
-    SequenceScope {
-        input_index: usize,
-    },
-    PriorItemOutput {
-        intra_sequence_item_index: usize,
-    },
+    SequenceScope { input_index: usize },
+    PriorItemOutput { intra_sequence_item_index: usize },
+    /// One of `main`'s entry arguments, reached from the single authorized
+    /// entry object at the sequence root (coordinates `[]`) that the
+    /// `ProgramStart` step bound. `main` has no caller, so its arguments are
+    /// not `SequenceScope`; and the entry object sits at the sequence root
+    /// itself, which no `PriorItemOutput` index can name.
+    EntryArgument,
 }
 
 impl InputBinding {
@@ -587,19 +629,14 @@ impl InputBinding {
         Self::Direct(source)
     }
 
-    /// Create an external input binding.
-    pub fn external() -> Self {
-        Self::new(InputSource::External)
-    }
-
     /// Create an inline input binding.
     pub fn inline() -> Self {
         Self::new(InputSource::Inline)
     }
 
-    /// Create a direct internal input binding.
-    pub fn internal() -> Self {
-        Self::new(InputSource::Internal)
+    /// Create a direct storage input binding.
+    pub fn storage() -> Self {
+        Self::new(InputSource::Storage)
     }
 
     /// Create a sequence-scope binding.
@@ -613,19 +650,27 @@ impl InputBinding {
             intra_sequence_item_index,
         }
     }
+
+    /// Create a binding to one of `main`'s entry arguments.
+    pub fn entry_argument() -> Self {
+        Self::EntryArgument
+    }
 }
 
 /// Semantic source of an input value in the data flow schema.
+///
+/// Note there is no "external" source: data entering a program does so as
+/// `main`'s entry arguments, which are loaded once into storage by the
+/// program's `ProgramStart` step and reached from there through
+/// `InputBinding::EntryArgument`. A source here is only about values with no
+/// upstream item to bind to.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum InputSource {
-    /// Input comes from outside the sequence (runtime-provided).
-    External,
-
     /// Input is materialized inline in the sequence body.
     Inline,
 
-    /// Input is resolved from internal storage.
-    Internal,
+    /// Input is resolved from storage.
+    Storage,
 }
 
 #[cfg(test)]
@@ -661,6 +706,8 @@ mod tests {
                         sources: vec![],
                     }),
                 ],
+                entry_arguments: vec![],
+                produces_output: false,
             }],
         })
     }

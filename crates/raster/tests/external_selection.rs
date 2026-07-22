@@ -64,6 +64,16 @@ struct PersonalData {
 fn takes_auth_binding(_: AuthRef<PersonalData>) {}
 fn takes_auth_name_binding(_: AuthRef<String>) {}
 
+/// Commits a `PersonalData` value to storage (as any tile output
+/// or `main` entry argument would be) and returns a binding to it. Must run
+/// inside an active sequence scope (see
+/// `raster::__private::SequenceScopeGuard`), since that's what
+/// `store_value` reserves a coordinate against.
+fn store_and_bind_personal_data(data: PersonalData) -> TypedStorageBinding<PersonalData> {
+    let reference = raster::store_value(&data).expect("store personal data");
+    raster::typed_storage::<PersonalData>(reference)
+}
+
 #[tile(kind = iter)]
 fn echo_name(name: String) -> String {
     name
@@ -120,13 +130,13 @@ fn traced_error_outer(name: String) -> Result<String> {
 }
 
 #[sequence]
-fn capture_echo_reference(name: String) -> InternalRef {
+fn capture_echo_reference(name: String) -> StorageRef {
     let echoed = call!(echo_name, name);
     echoed.reference().clone()
 }
 
 #[sequence]
-fn capture_success_reference(name: String) -> Result<InternalRef> {
+fn capture_success_reference(name: String) -> Result<StorageRef> {
     let echoed = call!(maybe_echo_name, name)?;
     Ok(echoed.reference().clone())
 }
@@ -145,20 +155,18 @@ where
     materialize_auth_result::<String, _>(__raster_sequence_auth_maybe_echo_sequence(name))
 }
 
-fn run_capture_echo_reference<A>(name: A) -> InternalRef
+fn run_capture_echo_reference<A>(name: A) -> StorageRef
 where
     A: IntoAuthRef<String>,
 {
-    materialize_auth_return::<InternalRef, _>(__raster_sequence_auth_capture_echo_reference(name))
+    materialize_auth_return::<StorageRef, _>(__raster_sequence_auth_capture_echo_reference(name))
 }
 
-fn run_capture_success_reference<A>(name: A) -> Result<InternalRef>
+fn run_capture_success_reference<A>(name: A) -> Result<StorageRef>
 where
     A: IntoAuthRef<String>,
 {
-    materialize_auth_result::<InternalRef, _>(__raster_sequence_auth_capture_success_reference(
-        name,
-    ))
+    materialize_auth_result::<StorageRef, _>(__raster_sequence_auth_capture_success_reference(name))
 }
 
 fn run_traced_error_outer<A>(name: A) -> Result<String>
@@ -169,48 +177,95 @@ where
 }
 
 #[test]
-fn select_accepts_identity_typed_external() {
+fn select_accepts_identity_typed_storage() {
+    let _guard =
+        raster::__private::SequenceScopeGuard::enter("select_accepts_identity_typed_storage");
+    let personal = PersonalData {
+        name: "Raster".to_string(),
+        address: Address {
+            line: "Main Street".to_string(),
+        },
+    };
     takes_auth_binding(select!(
         PersonalData,
-        external!(PersonalData, "personal_data")
+        store_and_bind_personal_data(personal)
     ));
 }
 
 #[test]
-fn select_accepts_nested_identity_selected_external() {
-    let whole = select!(PersonalData, external!(PersonalData, "personal_data"));
+fn select_accepts_nested_identity_selected_internal() {
+    let _guard = raster::__private::SequenceScopeGuard::enter(
+        "select_accepts_nested_identity_selected_internal",
+    );
+    let personal = PersonalData {
+        name: "Raster".to_string(),
+        address: Address {
+            line: "Main Street".to_string(),
+        },
+    };
+    let whole = select!(PersonalData, store_and_bind_personal_data(personal));
     takes_auth_name_binding(select!(String, whole.name));
 }
 
 #[test]
-fn select_accepts_nested_selected_external() {
-    let address = select!(Address, external!(PersonalData, "personal_data").address);
+fn select_accepts_nested_selected_internal() {
+    let _guard =
+        raster::__private::SequenceScopeGuard::enter("select_accepts_nested_selected_internal");
+    let personal = PersonalData {
+        name: "Raster".to_string(),
+        address: Address {
+            line: "Main Street".to_string(),
+        },
+    };
+    let address = select!(Address, store_and_bind_personal_data(personal).address);
     takes_auth_name_binding(select!(String, address.line));
 }
 
 #[test]
-fn auth_ref_preserves_external_binding() {
-    takes_auth_binding(into_auth_ref::<PersonalData, _>(external!(
-        PersonalData,
-        "personal_data"
-    )));
+fn auth_ref_preserves_internal_binding() {
+    let _guard =
+        raster::__private::SequenceScopeGuard::enter("auth_ref_preserves_internal_binding");
+    let personal = PersonalData {
+        name: "Raster".to_string(),
+        address: Address {
+            line: "Main Street".to_string(),
+        },
+    };
+    takes_auth_binding(into_auth_ref::<PersonalData, _>(
+        store_and_bind_personal_data(personal),
+    ));
 }
 
 #[test]
 fn select_accepts_auth_ref_binding() {
-    let personal = into_auth_ref::<PersonalData, _>(external!(PersonalData, "personal_data"));
+    let _guard = raster::__private::SequenceScopeGuard::enter("select_accepts_auth_ref_binding");
+    let personal = PersonalData {
+        name: "Raster".to_string(),
+        address: Address {
+            line: "Main Street".to_string(),
+        },
+    };
+    let personal = into_auth_ref::<PersonalData, _>(store_and_bind_personal_data(personal));
     takes_auth_name_binding(select!(String, personal.name));
 }
 
 #[test]
 fn select_accepts_cloned_auth_ref_binding() {
-    let personal = into_auth_ref::<PersonalData, _>(external!(PersonalData, "personal_data"));
+    let _guard =
+        raster::__private::SequenceScopeGuard::enter("select_accepts_cloned_auth_ref_binding");
+    let personal = PersonalData {
+        name: "Raster".to_string(),
+        address: Address {
+            line: "Main Street".to_string(),
+        },
+    };
+    let personal = into_auth_ref::<PersonalData, _>(store_and_bind_personal_data(personal));
     takes_auth_name_binding(select!(String, personal.clone().name));
     takes_auth_binding(personal);
 }
 
 #[test]
-fn nested_auth_ref_selection_matches_direct_external_selection_trace() {
+fn nested_auth_ref_selection_matches_direct_internal_selection_trace() {
     let personal = PersonalData {
         name: "Raster".to_string(),
         address: Address {
@@ -218,18 +273,18 @@ fn nested_auth_ref_selection_matches_direct_external_selection_trace() {
         },
     };
     let root_hash = [1; 32];
-    let whole = ExternalValue::new(
-        "personal_data",
+    let whole = StorageValue::new_with_selection(
+        StorageRef::new(
+            raster::core::cfs::CfsCoordinates(vec![0]),
+            root_hash.to_vec(),
+        ),
+        postcard::to_allocvec(&personal).unwrap(),
         SelectorPath::default(),
-        Some("commitment".to_string()),
-        SelectedPayload {
-            bytes: postcard::to_allocvec(&personal).unwrap(),
-            commitment: SelectionCommitment {
-                path: SelectorPath::default(),
-                source_root_hash: root_hash,
-                selected_hash: [0; 32],
-                selected_len: 0,
-            },
+        SelectionCommitment {
+            path: SelectorPath::default(),
+            source_root_hash: root_hash,
+            selected_hash: [0; 32],
+            selected_len: 0,
         },
         personal,
     );
@@ -240,33 +295,25 @@ fn nested_auth_ref_selection_matches_direct_external_selection_trace() {
         SelectorSegment::Field("line".to_string()),
     ]);
 
-    let address = raster::input::select_external_value::<PersonalData, Address>(
-        &whole,
-        &address_selector,
-        &address_selector,
-    )
-    .unwrap();
-    let nested = raster::input::select_external_value::<Address, String>(
-        &address,
-        &line_selector,
-        &full_selector,
-    )
-    .unwrap();
-    let direct = raster::input::select_external_value::<PersonalData, String>(
-        &whole,
-        &full_selector,
-        &full_selector,
-    )
-    .unwrap();
+    let address =
+        raster::input::select_storage_value::<PersonalData, Address>(&whole, &address_selector)
+            .unwrap();
+    let nested =
+        raster::input::select_storage_value::<Address, String>(&address, &line_selector).unwrap();
+    let direct =
+        raster::input::select_storage_value::<PersonalData, String>(&whole, &full_selector)
+            .unwrap();
 
     assert_eq!(nested.selector, direct.selector);
-    assert_eq!(nested.selected, direct.selected);
+    assert_eq!(nested.selection, direct.selection);
     assert_eq!(nested.value, direct.value);
-    assert_eq!(nested.selected.commitment.source_root_hash, root_hash);
+    assert_eq!(nested.selection.source_root_hash, root_hash);
 }
 
 #[test]
 fn tile_wrapper_accepts_inline_arguments() {
+    let _guard =
+        raster::__private::SequenceScopeGuard::enter("tile_wrapper_accepts_inline_arguments");
     assert_eq!(echo_name("Raster".to_string()), "Raster");
 }
 
@@ -277,6 +324,7 @@ fn sequence_wrapper_accepts_inline_arguments() {
 
 #[test]
 fn tile_wrapper_preserves_user_result() {
+    let _guard = raster::__private::SequenceScopeGuard::enter("tile_wrapper_preserves_user_result");
     assert_eq!(
         maybe_echo_name("Raster".to_string()),
         Ok("Raster".to_string())
@@ -325,7 +373,7 @@ fn infallible_call_binding_uses_tile_output_commitment() {
             .root_hash
     );
     assert_eq!(
-        raster::resolve_internal_value::<String>(reference)
+        raster::resolve_storage_value::<String>(reference)
             .unwrap()
             .into_inner(),
         "Raster"
@@ -363,7 +411,7 @@ fn fallible_call_binding_resolves_ok_payload_from_stored_result() {
             .root_hash
     );
     assert_eq!(
-        raster::resolve_internal_ok_value::<String>(reference)
+        raster::resolve_storage_ok_value::<String>(reference)
             .unwrap()
             .into_inner(),
         "Raster"
@@ -397,7 +445,9 @@ fn nested_sequence_trace_records_terminal_err_outputs() {
             | TraceEvent::RecurTileExec(_)
             | TraceEvent::RecurSequenceStart(_)
             | TraceEvent::RecurSequenceEnd(_)
-            | TraceEvent::RecurSequenceExec(_) => false,
+            | TraceEvent::RecurSequenceExec(_)
+            | TraceEvent::ProgramStart(_)
+            | TraceEvent::ProgramEnd(_) => false,
         })
         .collect();
 
@@ -462,13 +512,23 @@ fn nested_sequence_trace_records_terminal_err_outputs() {
 #[test]
 #[should_panic(expected = "Failed to materialize auth value for argument 'name'")]
 fn tile_wrapper_panics_on_runtime_resolution_failure() {
-    let _ = maybe_echo_name(external!(String, "missing_name"));
+    let _guard = raster::__private::SequenceScopeGuard::enter(
+        "tile_wrapper_panics_on_runtime_resolution_failure",
+    );
+    let bogus_reference =
+        StorageRef::new(raster::core::cfs::CfsCoordinates(vec![9999]), vec![0; 32]);
+    let _ = maybe_echo_name(raster::typed_storage::<String>(bogus_reference));
 }
 
 #[test]
 #[should_panic(expected = "Failed to trace sequence argument 'name'")]
 fn sequence_wrapper_panics_on_runtime_trace_failure() {
-    let _ = run_maybe_echo_sequence(external!(String, "missing_name"));
+    let _guard = raster::__private::SequenceScopeGuard::enter(
+        "sequence_wrapper_panics_on_runtime_trace_failure",
+    );
+    let bogus_reference =
+        StorageRef::new(raster::core::cfs::CfsCoordinates(vec![9999]), vec![0; 32]);
+    let _ = run_maybe_echo_sequence(raster::typed_storage::<String>(bogus_reference));
 }
 
 #[test]

@@ -124,25 +124,16 @@ impl ArtifactStore for Risc0ArtifactStore {
         let manifest_content = fs::read_to_string(artifact_dir.join("manifest.json")).ok()?;
         let manifest: Risc0Manifest = serde_json::from_str(&manifest_content).ok()?;
 
-        let elf_path = fs::read_dir(&artifact_dir)
-            .ok()?
-            .filter_map(std::result::Result::ok)
-            .map(|entry| entry.path())
-            .find(|path| path.is_file() && path.extension().is_some_and(|ext| ext == "elf"))?;
-
-        let elf_name = elf_path.file_name()?.to_str().map(String::from);
-        let elf = fs::read(elf_path).ok()?;
-
-        let compiled_source_hash = elf_name;
-
-        // Validate source hash
-        // TODO: no additional manifest required for validating source hash just check file name
+        // The cache is valid only when the key (tile source ⊕ build-recipe
+        // fingerprint) matches exactly — both in the manifest and as the ELF
+        // filename `save` wrote. Anything else is a stale artifact for a
+        // different source/template/toolchain and must be rebuilt.
         if manifest.source_hash != source_hash {
             return None;
         }
-        if compiled_source_hash != source_hash {
-            return None;
-        }
+        let elf_path =
+            artifact_dir.join(format!("{}.elf", source_hash.as_deref().unwrap_or("none")));
+        let elf = fs::read(&elf_path).ok()?;
 
         Some(Box::new(Risc0CompilationArtifact {
             elf,
@@ -215,15 +206,23 @@ impl Backend for Risc0Backend {
     ) -> Result<Box<dyn CompilationArtifact>> {
         let tile_id = &metadata.id.0;
 
+        // Not cached, need to build
+        let builder = self.guest_builder();
+
+        // Key the cache on the tile source *and* the build recipe (guest
+        // template + toolchain + macro ABI). Keying on source alone would serve
+        // a stale ELF/image id after a macro/template/toolchain change (see
+        // docs/proposals/program-identity.md).
+        let cache_key = content_hash
+            .as_ref()
+            .map(|src| format!("{src}-{}", builder.recipe_fingerprint()));
+
         if let Some(cached) =
             self.artifact_store
-                .load(tile_id, &self.output_dir, content_hash.clone())
+                .load(tile_id, &self.output_dir, cache_key.clone())
         {
             return Ok(cached);
         }
-
-        // Not cached, need to build
-        let builder = self.guest_builder();
 
         // Create a temporary directory for building
         let temp_dir = tempfile::tempdir()
@@ -258,7 +257,7 @@ impl Backend for Risc0Backend {
         };
 
         self.artifact_store
-            .save(&artifact, &self.output_dir, content_hash)?;
+            .save(&artifact, &self.output_dir, cache_key)?;
 
         Ok(Box::new(artifact))
     }

@@ -28,7 +28,7 @@ fn echo_label(label: String) -> String {
 }
 
 #[sequence]
-fn build_account_reference(balance: u64, first_tx: String, second_tx: String) -> InternalRef {
+fn build_account_reference(balance: u64, first_tx: String, second_tx: String) -> StorageRef {
     let draft = new!(Account);
     let draft = call!(set_balance, balance, draft);
     let draft = call!(push_tx, first_tx, draft);
@@ -36,21 +36,21 @@ fn build_account_reference(balance: u64, first_tx: String, second_tx: String) ->
     finalize(draft).reference().clone()
 }
 
-fn run_build_account_reference(balance: u64, first_tx: String, second_tx: String) -> InternalRef {
-    materialize_auth_return::<InternalRef, _>(__raster_sequence_auth_build_account_reference(
+fn run_build_account_reference(balance: u64, first_tx: String, second_tx: String) -> StorageRef {
+    materialize_auth_return::<StorageRef, _>(__raster_sequence_auth_build_account_reference(
         balance, first_tx, second_tx,
     ))
 }
 
 #[sequence]
-fn reference_after_new_does_not_shift_tile(label: String) -> InternalRef {
+fn reference_after_new_does_not_shift_tile(label: String) -> StorageRef {
     let _draft = new!(Account);
     let echoed = call!(echo_label, label);
     echoed.reference().clone()
 }
 
 #[sequence]
-fn reference_after_finalize_does_not_shift_tile(label: String) -> InternalRef {
+fn reference_after_finalize_does_not_shift_tile(label: String) -> StorageRef {
     let draft = new!(Account);
     let draft = call!(set_balance, 7, draft);
     let _account = finalize(draft);
@@ -58,14 +58,14 @@ fn reference_after_finalize_does_not_shift_tile(label: String) -> InternalRef {
     echoed.reference().clone()
 }
 
-fn run_reference_after_new(label: String) -> InternalRef {
-    materialize_auth_return::<InternalRef, _>(
+fn run_reference_after_new(label: String) -> StorageRef {
+    materialize_auth_return::<StorageRef, _>(
         __raster_sequence_auth_reference_after_new_does_not_shift_tile(label),
     )
 }
 
-fn run_reference_after_finalize(label: String) -> InternalRef {
-    materialize_auth_return::<InternalRef, _>(
+fn run_reference_after_finalize(label: String) -> StorageRef {
+    materialize_auth_return::<StorageRef, _>(
         __raster_sequence_auth_reference_after_finalize_does_not_shift_tile(label),
     )
 }
@@ -101,9 +101,9 @@ fn finalize_returns_selectable_internal_auth_ref() {
 fn finalized_internal_refs_support_select() {
     let reference = run_build_account_reference(11, "first".to_string(), "second".to_string());
 
-    let balance = select!(u64, internal!(Account, reference.clone()).balance);
-    let first_tx = select!(String, internal!(Account, reference.clone()).txs[0]);
-    let second_tx = select!(String, internal!(Account, reference).txs[1]);
+    let balance = select!(u64, storage!(Account, reference.clone()).balance);
+    let first_tx = select!(String, storage!(Account, reference.clone()).txs[0]);
+    let second_tx = select!(String, storage!(Account, reference).txs[1]);
 
     assert_eq!(into_auth_value::<u64, _>(balance).unwrap().into_inner(), 11);
     assert_eq!(

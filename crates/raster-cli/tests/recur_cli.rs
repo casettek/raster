@@ -74,7 +74,7 @@ fn unique_artifact_dir() -> PathBuf {
 fn extract_stdout_path(stdout: &str, prefix: &str) -> String {
     stdout
         .lines()
-        .find_map(|line| line.strip_prefix(prefix).map(str::trim))
+        .find_map(|line| line.trim_start().strip_prefix(prefix).map(str::trim))
         .unwrap_or_else(|| panic!("missing '{prefix}' in stdout:\n{stdout}"))
         .to_string()
 }
@@ -90,6 +90,11 @@ fn hello_tiles_run_reports_recur_iteration_coordinates() {
     );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
+    // The program opens with a single ProgramStart at the sequence root, and
+    // `main`'s declared entry arguments no longer shift item coordinates: the
+    // first real item is at `[0]`, so the recur sites sit one index lower
+    // than before the entrypoint merge.
+    assert!(stdout.contains("program_start_coordinates: CfsCoordinates([])"));
     assert!(stdout.contains("tile_coordinates: CfsCoordinates([9, 0])"));
     assert!(stdout.contains("tile_coordinates: CfsCoordinates([9, 1])"));
     assert!(stdout.contains("recur_tile_coordinates: CfsCoordinates([9])"));
@@ -117,7 +122,8 @@ fn direct_hello_tiles_run_does_not_emit_trace_events_to_stdout() {
 #[test]
 fn hello_tiles_audit_accepts_recur_trace_commitment() {
     let commit_path = unique_commit_path();
-    let commit_output = run_hello_tiles(&["--commit", &commit_path]);
+    let commit_output =
+        run_hello_tiles(&["--commit", &commit_path, "--fraud-proof-window-size", "8"]);
     assert!(
         commit_output.status.success(),
         "commit run should succeed\nstdout:\n{}\nstderr:\n{}",
@@ -195,7 +201,8 @@ fn hello_tiles_run_can_use_json_trace_format() {
     let parsed: serde_json::Value =
         serde_json::from_str(first_line).expect("json trace line should parse as JSON");
     assert!(
-        parsed.get("SequenceStart").is_some()
+        parsed.get("ProgramStart").is_some()
+            || parsed.get("SequenceStart").is_some()
             || parsed.get("TileExec").is_some()
             || parsed.get("RecurTileExec").is_some()
             || parsed.get("SequenceEnd").is_some(),
@@ -305,11 +312,9 @@ fn hello_tiles_run_forwards_requested_build_features() {
     );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let profile_path = extract_stdout_path(&stdout, "Profile path: ");
-    let profile_stream_path = extract_stdout_path(&stdout, "Profile stream path: ");
+    let profile_path = extract_stdout_path(&stdout, "Execution profile saved to: ");
+    let profile_stream_path = extract_stdout_path(&stdout, "Live profile stream saved to: ");
 
-    assert!(stdout.contains("Execution profile saved to:"));
-    assert!(stdout.contains("Live profile stream saved to:"));
     assert!(stdout.contains("Follow with: cargo raster analyze --follow"));
     assert!(PathBuf::from(profile_path).exists());
     assert!(PathBuf::from(profile_stream_path).exists());

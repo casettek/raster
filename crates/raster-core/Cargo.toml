@@ -16,7 +16,11 @@ alloc = []
 serde.workspace = true
 # postcard is no_std compatible for tile ABI serialization
 postcard.workspace = true
-sha2.workspace = true
+# `default-features = false` keeps `sha2`/`digest` from pulling in `std`. This
+# matters for the generated tile guest: it links raster-core's `sha2` (via the
+# `input_commitment` hash in the replay wrapper), and a std-enabled `digest`
+# collides with risc0-zkvm's no_std guest panic handler (duplicate `panic_impl`).
+sha2 = { workspace = true, default-features = false }
 
 # Optional std-only dependencies
 serde_json = { workspace = true, optional = true }

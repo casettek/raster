@@ -8,6 +8,16 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// Guest build recipe version. Bump when the guest ELF can change without the
+/// tile *source* changing — e.g. a change to the tile macro's replay-wrapper
+/// codegen (raster-macros) or to raster/raster-core code the guest links.
+/// It is folded into the artifact cache key, so a bump invalidates stale
+/// cached image ids (see docs/proposals/program-identity.md).
+///
+/// v2: replay wrapper now commits `sha256(input)` (`input_commitment`); guest
+/// manifest uses risc0-zkvm default features + resolver v2.
+const GUEST_BUILD_ABI: &str = "2";
+
 /// Configuration for building guest crates.
 pub struct GuestBuilder {
     /// Output directory for artifacts.
@@ -195,7 +205,14 @@ impl GuestBuilder {
             edition = "2021"
 
             [dependencies]
-            risc0-zkvm = {{ version = "1.2", default-features = false }}
+            # Use risc0-zkvm's default features (which include `std`), matching
+            # the transition guest. With `default-features = false`, risc0-zkvm
+            # provides its own no_std guest `panic_impl`, which collides with the
+            # `std` that transitively leaks in (e.g. `digest/std` via
+            # risc0-groth16 → ark) — a duplicate `panic_impl` (E0152). std is
+            # available for the riscv32im-risc0-zkvm-elf target, so deferring to
+            # it is the guest-safe choice.
+            risc0-zkvm = "1.2"
             raster = {{ path = "{raster_path}", default-features = false }}
             {user_crate_dep}
 
@@ -204,6 +221,7 @@ impl GuestBuilder {
             lto = true
 
             [workspace]
+            resolver = "2"
             "##,
             tile_id = tile_id,
             user_crate_dep = user_crate_dep,
@@ -212,6 +230,37 @@ impl GuestBuilder {
     }
 
     /// Find the RISC0 toolchain's cargo binary.
+    /// The risc0 toolchain identifier (its directory name, e.g.
+    /// `v1.91.1-rust-...`), or `"unknown"`.
+    fn toolchain_id() -> String {
+        Self::find_risc0_cargo()
+            .and_then(|cargo| {
+                cargo
+                    .parent()?
+                    .parent()?
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+            })
+            .unwrap_or_else(|| "unknown".to_string())
+    }
+
+    /// A short fingerprint of everything *besides the tile source* that
+    /// determines the guest ELF: the generated Cargo.toml + main.rs templates
+    /// (risc0-zkvm version, resolver, raster path, wrapper shape), the risc0
+    /// toolchain, and [`GUEST_BUILD_ABI`]. The artifact cache keys on this
+    /// together with the tile source hash, so a template/toolchain/macro change
+    /// invalidates stale image ids.
+    pub fn recipe_fingerprint(&self) -> String {
+        use raster_core::sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(GUEST_BUILD_ABI.as_bytes());
+        hasher.update(Self::toolchain_id().as_bytes());
+        // Tile-independent view of the templates (fixed placeholder id).
+        hasher.update(self.generate_guest_cargo_toml("__recipe__").as_bytes());
+        hasher.update(self.generate_guest_main("__recipe__").as_bytes());
+        hex::encode(&hasher.finalize()[..8])
+    }
+
     fn find_risc0_cargo() -> Option<PathBuf> {
         // Check for RISC0_RUST_TOOLCHAIN_PATH env var first
         if let Ok(path) = env::var("RISC0_RUST_TOOLCHAIN_PATH") {

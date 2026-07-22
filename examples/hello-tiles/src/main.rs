@@ -21,11 +21,8 @@ fn personal_greet_seq(personal_data: PersonalData) -> Result<String> {
 }
 
 #[sequence]
-fn greet_sequence(name: String) -> String {
-    call!(
-        personal_greet,
-        select!(String, external!(PersonalData, "personal_data").name)
-    );
+fn greet_sequence(name: String, personal_data: PersonalData) -> String {
+    call!(personal_greet, select!(String, personal_data.name));
     let greeting = call!(greet, name);
     let e1 = call!(exclaim, greeting);
     let e2 = call!(exclaim, e1);
@@ -49,41 +46,40 @@ fn placeholder_sequence(placeholder: String) -> String {
 
 /// Entry point that runs the greet sequence natively.
 ///
-/// This example resolves committed external inputs from `input.json`:
-/// - `personal_data.name` is selected from a postcard-encoded struct file using schema-driven DSL paths
-/// - `personal_data_bin.addresses[0].lines[0]` is selected from a postcard-encoded struct file
-/// - `personal_data_bin` is also selected as a whole `PersonalData` object
-/// - `seed` is selected as a whole postcard-encoded value
+/// This example binds its committed external inputs directly as declared
+/// `main` parameters (see `docs/specs`), each resolved lazily from
+/// `input.json`/`input_manifest.json` the first time it's actually
+/// selected or used:
+/// - `personal_data.name` is selected from a postcard-encoded struct using schema-driven DSL paths
+/// - `personal_data_bin.addresses[0].lines[0]` is selected from the same struct loaded via mmap
+/// - `personal_data_bin` is also used as a whole `PersonalData` object
+/// - `seed` is used as a whole postcard-encoded value
 ///
-/// Each input must have a matching public commitment in `input_manifest.json`.
+/// Each argument must have a matching public commitment in `input_manifest.json`
+/// (a selection-tree structural root for postcard-encoded arguments — see
+/// `raster::postcard_structural_commitment`, used by `bin/gen_input.rs`).
 /// Run with generated fixtures:
+/// `cargo run --features gen-input --bin gen_input -- .` then
 /// `cargo run -- --input input.json --input-manifest input_manifest.json`
 ///
 #[sequence]
-fn main() {
-    call_seq!(greet_sequence, "Rust".to_string());
+fn main(personal_data: PersonalData, personal_data_bin: PersonalData, seed: u64) -> String {
+    call_seq!(greet_sequence, "Rust".to_string(), personal_data.clone());
 
-    let personal_data_binding = external!(PersonalData, "personal_data");
-    let name = select!(String, personal_data_binding.clone().name);
-
-    let seed_binding = external!(u64, "seed");
-    let seed = select!(u64, seed_binding);
+    let name = select!(String, personal_data.clone().name);
+    let seed = select!(u64, seed);
 
     call!(personal_greet_with_seed, name, seed);
 
     let _personal_greet_seq_result =
-        call_seq!(personal_greet_seq, personal_data_binding).expect("wrong personal data");
+        call_seq!(personal_greet_seq, personal_data).expect("wrong personal data");
 
     call!(
         greet_address_line,
-        select!(
-            String,
-            external!(PersonalData, "personal_data_bin").addresses[0].lines[0]
-        )
+        select!(String, personal_data_bin.clone().addresses[0].lines[0])
     );
 
-    let personal_data_bin = external!(PersonalData, "personal_data_bin");
-    let selected_personal_data_bin = select!(PersonalData, personal_data_bin);
+    let selected_personal_data_bin = select!(PersonalData, personal_data_bin.clone());
     call!(personal_greet_from_object, selected_personal_data_bin);
 
     let draft = new!(CollectiveGreeting);
@@ -108,17 +104,13 @@ fn main() {
     let first_draft_line = select!(String, draft_greeting.lines[0]);
     call!(concat_messages, draft_title, first_draft_line);
 
-    let address_lines = select!(
-        Vec<String>,
-        external!(PersonalData, "personal_data_bin").addresses[0].lines
-    );
+    let address_lines = select!(Vec<String>, personal_data_bin.clone().addresses[0].lines);
+
     // Phase 1: select a contiguous slice of address lines as ONE authenticated
     // input. `lines[0..2]` yields a single SelectionCommitment, so the tile
     // records a single external binding for the whole slice.
-    let first_two_lines = select!(
-        Vec<String>,
-        external!(PersonalData, "personal_data_bin").addresses[0].lines[0..2]
-    );
+    let first_two_lines =
+        select!(Vec<String>, personal_data_bin.clone().addresses[0].lines[0..2]);
     let joined_lines = call!(join_address_lines, first_two_lines);
     println!("joined address slice: {:?}", joined_lines);
 
@@ -168,6 +160,10 @@ fn main() {
     call!(concat_messages, limited_title, limited_first_line);
 
     let name_2 = call_seq!(placeholder_sequence, "Placeholder".to_string());
-    let result = call_seq!(greet_sequence, name_2);
+    let result = call_seq!(greet_sequence, name_2, personal_data_bin);
     println!("main result: {:?}", result);
+
+    // `main`'s return value is the program's authorized output: a
+    // storage-backed value exported as `output.bin`/`output_manifest.json`.
+    result
 }
