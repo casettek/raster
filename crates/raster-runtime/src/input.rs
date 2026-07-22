@@ -2506,6 +2506,32 @@ mod tests {
     }
 
     #[test]
+    fn payload_structural_root_recomputes_manifest_commitment() {
+        // The chain "bridge": a program's `output.bin` is exactly this payload,
+        // and `payload_structural_root` over those bytes alone must equal the
+        // structural root the manifest commits (`encode_raster_value`'s hex
+        // commitment) — the manifest-side link hash, recomputable with no index.
+        // See docs/proposals/program-chain.md.
+        let mut aliases = BTreeMap::new();
+        aliases.insert("one".to_string(), 1);
+        aliases.insert("two".to_string(), 2);
+        let value = ComplexSerdeValue {
+            maybe_name: Some("chain".to_string()),
+            pattern: Pattern::Pair(3, 9),
+            aliases,
+            nested: Some(Pattern::Sequence { len: 4 }),
+        };
+
+        let (payload, _index, commitment_hex) = encode_raster_value(&value).unwrap();
+        let root = raster_core::input::payload_structural_root(&payload)
+            .expect("payload is well-formed");
+        assert_eq!(super::hex_string(&root), commitment_hex);
+
+        // A truncated artifact must not silently produce a root.
+        assert!(raster_core::input::payload_structural_root(&payload[..payload.len() - 1]).is_none());
+    }
+
+    #[test]
     fn raster_round_trip_supports_option_enum_and_map_values() {
         let mut aliases = BTreeMap::new();
         aliases.insert("one".to_string(), 1);

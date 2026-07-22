@@ -2,6 +2,7 @@
 //!
 //! Provides commands for building, running, and analyzing Raster tiles.
 
+mod chain;
 mod commands;
 mod program;
 mod utils;
@@ -135,6 +136,12 @@ enum Commands {
         verify: bool,
     },
 
+    /// Run or audit a multi-program chain (see docs/proposals/program-chain.md)
+    Chain {
+        #[command(subcommand)]
+        command: ChainCommand,
+    },
+
     /// Run the user program
     Run {
         /// Backend to use for execution
@@ -188,6 +195,30 @@ enum Commands {
         /// Disable default Cargo features when building the target project
         #[arg(long)]
         no_default_features: bool,
+    },
+}
+
+#[derive(Parser)]
+enum ChainCommand {
+    /// Run every stage in order, threading each output into the next, and write
+    /// a chain-commitment over the resulting checkpoints.
+    Run {
+        /// Path to the chain.json pipeline definition
+        chain: String,
+
+        /// Trace items covered by each stage's fraud-proof window (power of two,
+        /// 2..=1024); each stage is committed with this window.
+        #[arg(long = "fraud-proof-window-size", default_value_t = 2)]
+        fraud_proof_window_size: usize,
+    },
+
+    /// Verify a recorded chain's links and identities — public, no proving.
+    Audit {
+        /// Path to the chain.json pipeline definition
+        chain: String,
+
+        /// Path to the chain-commitment written by `chain run`
+        chain_commitment: String,
     },
 }
 
@@ -278,6 +309,16 @@ fn try_main() -> Result<()> {
         } => commands::run_sequence(backend, &sequence, input.as_deref(), prove, verify),
         Commands::Cfs { output } => commands::cfs(output),
         Commands::Program { verify } => commands::program(verify),
+        Commands::Chain { command } => match command {
+            ChainCommand::Run {
+                chain,
+                fraud_proof_window_size,
+            } => chain::run(&chain, fraud_proof_window_size),
+            ChainCommand::Audit {
+                chain,
+                chain_commitment,
+            } => chain::audit(&chain, &chain_commitment),
+        },
         Commands::Run {
             backend,
             input,

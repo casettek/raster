@@ -352,7 +352,7 @@ fn profiling_enabled(features: &[String], all_features: bool) -> bool {
         })
 }
 
-fn load_trace_from_file(
+pub(crate) fn load_trace_from_file(
     trace_path: &PathBuf,
     trace_format: TraceFormat,
     cfs: &ControlFlowSchema,

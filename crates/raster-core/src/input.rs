@@ -452,6 +452,24 @@ fn parse_subtree_root(bytes: &[u8], offset: &mut usize) -> Option<Hash32> {
     }
 }
 
+/// Recompute the raster **structural root** of a canonical payload — the same
+/// hash a manifest entry commits for a value (`encode_raster_value`'s root) and
+/// the one `verify_selection_proof` walks a selection against. It is a pure,
+/// public function of the payload bytes alone (no index needed), so a chain
+/// verifier holding a program's `output.bin` can recompute the manifest-side
+/// link hash without any runtime-crate internals. Returns `None` if `bytes` is
+/// not a well-formed, fully-consumed payload. See `docs/proposals/program-chain.md`.
+pub fn payload_structural_root(bytes: &[u8]) -> Option<Hash32> {
+    let mut offset = 0;
+    let root = parse_subtree_root(bytes, &mut offset)?;
+    // A valid payload is consumed exactly; trailing bytes mean a malformed or
+    // truncated artifact, which must not silently produce a root.
+    if offset != bytes.len() {
+        return None;
+    }
+    Some(root)
+}
+
 /// Check that `step` proves exactly the descent `segment` names.
 ///
 /// Recombining hashes only proves that *some* child sits under the root; it
