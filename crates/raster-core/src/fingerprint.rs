@@ -146,15 +146,27 @@ impl BitPacker {
     ///
     /// Returns an error if the index is out of bounds.
     pub fn try_get(&self, index: usize, packed: &[u64]) -> Result<u64, BitPackerError> {
+        self.try_get_at_bit_offset(index * self.0, packed)
+    }
+
+    /// Try to get a value starting at an arbitrary bit offset (not necessarily
+    /// item-aligned). Used when `packed` is a window of blocks cut out of a
+    /// larger packed array, so item boundaries land mid-block relative to the
+    /// window's own origin.
+    pub fn try_get_at_bit_offset(
+        &self,
+        bit_offset: usize,
+        packed: &[u64],
+    ) -> Result<u64, BitPackerError> {
         let bit_width = self.0;
 
-        let value_start_offset = index * bit_width;
+        let value_start_offset = bit_offset;
         let value_end_offset = value_start_offset + bit_width; // Exclusive end
         let max_bits = packed.len() * 64;
 
         if value_end_offset > max_bits {
             return Err(BitPackerError::IndexOutOfBounds {
-                index,
+                index: bit_offset / bit_width,
                 max: max_bits / bit_width,
             });
         }

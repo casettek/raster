@@ -22,13 +22,14 @@ use raster_core::fingerprint::{Fingerprint, FingerprintAccumulator};
 use raster_core::program::{commitment_of_bytes, ImageId, ProgramDefinition};
 use raster_core::trace::{ExecStep, ExecTarget, StepKind, StepRecord};
 use raster_core::transition::{
-    EntrypointAuthorization, InitTransition, OutputAuthorization, Transition, TransitionInput,
-    TransitionJournal, TransitionState,
+    EntrypointAuthorization, FingerprintSliceWitness, InitTransition, OutputAuthorization,
+    TraceCommitmentHeader, Transition, TransitionInput, TransitionJournal, TransitionState,
 };
 
 use crate::checks;
 use crate::merkle_tree::{
-    deserialize_frontier, frontier_root, hash_trace_item, serialize_frontier, Bytes,
+    combine_merkle_level, deserialize_frontier, frontier_root, hash_trace_item, serialize_frontier,
+    sha256_bytes, Bytes,
 };
 
 /// Public parameters every step of the fraud proof runs under.
@@ -101,6 +102,10 @@ pub enum StepPosition {
 pub struct FraudProofWindowContext {
     pub init_state: InitTransition,
     pub position: StepPosition,
+    /// `TraceCommitmentHeader::digest()` of the `commit.bin` this window
+    /// audits — derived at `Init` (after the slice check below), inherited
+    /// from the recursively verified previous journal at `Next`.
+    pub refuted_trace_commitment: Vec<u8>,
 }
 
 impl FraudProofWindowContext {
@@ -109,18 +114,32 @@ impl FraudProofWindowContext {
     /// - `Init`: start from the genesis state carried in the transition,
     ///   and independently decide what the chain owes for entry-argument
     ///   authorization — the guest never trusts a host-supplied claim about
-    ///   the window's initial storage contents.
+    ///   the window's initial storage contents. The window's committed
+    ///   fingerprint is bound to a named `commit.bin` here: the supplied
+    ///   header is hashed into `refuted_trace_commitment` only after the
+    ///   slice witness proves the window fingerprint occurs in that
+    ///   commitment at the offset the initial frontier fixes.
     /// - `Next`: read the previous journal, recursively verify its receipt
     ///   against our own image id, and require state and manifest
-    ///   continuity. Entry-argument authorization is inherited from the
-    ///   previous (recursively verified) journal.
+    ///   continuity. Entry-argument authorization and the refuted-commitment
+    ///   identity are inherited from the previous (recursively verified)
+    ///   journal.
     pub fn proceed(
         params: &PublicParams,
         input: &TransitionInput,
         state: TransitionState,
+        commitment_binding: Option<(TraceCommitmentHeader, FingerprintSliceWitness)>,
     ) -> (Self, LiveTransition) {
         match state {
             TransitionState::Init(init_transition) => {
+                let (commitment_header, slice_witness) = commitment_binding
+                    .expect("Init step requires the trace-commitment header and slice witness");
+                assert_window_is_commitment_slice(
+                    &init_transition,
+                    &commitment_header,
+                    &slice_witness,
+                );
+                let refuted_trace_commitment = commitment_header.digest();
                 let entrypoint_authorization = checks::entrypoint::verify_genesis_authorization(
                     &params.cfs_cursor,
                     &init_transition.init_storage_root,
@@ -147,6 +166,7 @@ impl FraudProofWindowContext {
                     Self {
                         init_state: init_transition,
                         position: StepPosition::First,
+                        refuted_trace_commitment,
                     },
                     live,
                 )
@@ -167,6 +187,7 @@ impl FraudProofWindowContext {
                     Self {
                         init_state: prev_journal.init_state,
                         position: StepPosition::Subsequent,
+                        refuted_trace_commitment: prev_journal.refuted_trace_commitment,
                     },
                     live,
                 )
@@ -175,6 +196,89 @@ impl FraudProofWindowContext {
                 panic!("Finished Transition");
             }
         }
+    }
+}
+
+/// Prove the window's committed fingerprint is a slice of the named
+/// commitment — closing the framing gap where a challenger supplies a
+/// "committed" window fingerprint that appears nowhere in the `commit.bin`
+/// the receipt ends up blamed on.
+///
+/// The offset is never host-claimed: the initial trace frontier holds the
+/// seed plus one leaf per pre-window step, so its position *is* the window's
+/// start index `s`. The witness must then cover exactly the packed blocks
+/// spanning items `[s, s + w)`, each proven against the header's
+/// `fingerprint_root` at its derived index, and every window item's
+/// fingerprint value must equal the value at its bit offset inside those
+/// proven blocks.
+pub(crate) fn assert_window_is_commitment_slice(
+    init_transition: &InitTransition,
+    header: &TraceCommitmentHeader,
+    slice_witness: &FingerprintSliceWitness,
+) {
+    let window_fingerprint = &init_transition.fingerprint;
+    assert!(
+        window_fingerprint.bits_packer == header.bits_packer,
+        "Window fingerprint bit packing does not match the committed fingerprint's"
+    );
+    let bits_per_item = header.bits_packer.bits_per_item();
+    let window_len = window_fingerprint.len();
+    assert!(window_len > 0, "Window fingerprint is empty");
+
+    let window_start = usize::try_from(init_transition.init_frontier.position)
+        .expect("Window start position overflows usize");
+    let fingerprint_len =
+        usize::try_from(header.fingerprint_len).expect("Fingerprint length overflows usize");
+    assert!(
+        window_start + window_len <= fingerprint_len,
+        "Window range exceeds the committed fingerprint"
+    );
+
+    // The covering block range is derived, not supplied; a witness for any
+    // other range fails here.
+    let first_block = (window_start * bits_per_item) / 64;
+    let last_block = ((window_start + window_len) * bits_per_item - 1) / 64;
+    assert!(
+        slice_witness.blocks.len() == last_block - first_block + 1,
+        "Fingerprint slice witness does not cover exactly the window's blocks"
+    );
+
+    let mut proven_blocks: Vec<u64> = Vec::with_capacity(slice_witness.blocks.len());
+    for (offset, block_witness) in slice_witness.blocks.iter().enumerate() {
+        let expected_position = (first_block + offset) as u64;
+        assert!(
+            block_witness.position == expected_position,
+            "Fingerprint block witness is at the wrong index"
+        );
+        let mut current = sha256_bytes(&block_witness.block.to_le_bytes());
+        for (level, sibling) in block_witness.path_elems.iter().enumerate() {
+            current = if ((block_witness.position >> level) & 1) == 0 {
+                combine_merkle_level(level, &current, sibling)
+            } else {
+                combine_merkle_level(level, sibling, &current)
+            };
+        }
+        assert!(
+            current == header.fingerprint_root,
+            "Fingerprint block inclusion proof is invalid"
+        );
+        proven_blocks.push(block_witness.block);
+    }
+
+    for item in 0..window_len {
+        let bit_offset = (window_start + item) * bits_per_item - first_block * 64;
+        let committed_value = header
+            .bits_packer
+            .try_get_at_bit_offset(bit_offset, &proven_blocks)
+            .expect("Window item exceeds the proven fingerprint blocks");
+        let window_value = window_fingerprint
+            .bits_packer
+            .try_get(item, &window_fingerprint.bits)
+            .expect("Window fingerprint is shorter than its declared length");
+        assert!(
+            committed_value == window_value,
+            "Window fingerprint diverges from the committed fingerprint slice"
+        );
     }
 }
 
@@ -468,6 +572,7 @@ pub fn commit_journal(
     current_state: TransitionState,
     transition_image_id: Vec<u8>,
     program_commitment: Vec<u8>,
+    refuted_trace_commitment: Vec<u8>,
     input: &TransitionInput,
     entrypoint_authorization: EntrypointAuthorization,
     output_authorization: OutputAuthorization,
@@ -479,6 +584,7 @@ pub fn commit_journal(
         authorization_image_id: input.authorization_image_id.clone(),
         input_manifest_commitment: input.authorization_journal.input_manifest_commitment.clone(),
         program_commitment,
+        refuted_trace_commitment,
         entrypoint_authorization,
         output_authorization,
     };

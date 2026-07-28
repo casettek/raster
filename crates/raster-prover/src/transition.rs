@@ -15,8 +15,8 @@ use raster_core::fingerprint::Fingerprint;
 use raster_core::input::SelectionWitness;
 use raster_core::trace::{FnInput, StepRecord};
 use raster_core::transition::{
-    InitTransition, StorageReadWitness, StorageWitness, TransitionInput, TransitionJournal,
-    TransitionState,
+    FingerprintSliceWitness, InitTransition, StorageReadWitness, StorageWitness,
+    TraceCommitmentHeader, TransitionInput, TransitionJournal, TransitionState,
 };
 use std::collections::{BTreeMap, HashMap};
 
@@ -24,6 +24,8 @@ use crate::authorization::authorization_guest_image_id;
 use crate::precomputed::EMPTY_TRIE_NODES;
 use crate::replay::ReplayResult;
 use crate::trace::{serializable_frontier_into_trace_frontier, SerializableFrontier, TraceTree};
+#[cfg(test)]
+use crate::trace::{TraceCommitment, TraceCommitmentExt};
 use crate::{TRANSITION_GUEST_ELF, TRANSITION_GUEST_ID};
 
 /// Everything the host recorded about one executed step, to be handed to the
@@ -145,6 +147,12 @@ fn storage_root(frontier: &SerializableFrontier) -> Vec<u8> {
 ///   step; pass `None` when the window contains the binding step itself, in
 ///   which case that step discharges the authorization instead. See
 ///   `checks::entrypoint` in the transition guest.
+/// * `commitment_header` / `fingerprint_slice` - The compact identity of the
+///   `commit.bin` this window refutes and the inclusion proofs binding
+///   `fingerprint` to it at the window's offset (see
+///   `TraceCommitmentExt::header` / `fingerprint_slice_witness`). Written to
+///   the guest only at the window-opening `Init` step, which verifies the
+///   slice and carries `refuted_trace_commitment` through the journal chain.
 ///
 /// # Returns
 /// A `TransitionReplayResult` with details about success or failure
@@ -154,6 +162,8 @@ pub fn step_transitions(
     initial_storage_index_root: &[u8],
     trace_window: &[StepRecord],
     fingerprint: Fingerprint,
+    commitment_header: &TraceCommitmentHeader,
+    fingerprint_slice: &FingerprintSliceWitness,
     // The canonical `program.bin` frame (bytes of the `ProgramDefinition`),
     // written to the guest, which hashes it to derive `program_commitment` and
     // decodes it for the CFS + tile registry. See program-identity.md.
@@ -230,6 +240,11 @@ pub fn step_transitions(
         builder.write(&current_state).unwrap();
         if let Some(previous_journal) = current_journal {
             builder.write(&previous_journal).unwrap();
+        } else {
+            // The window-opening `Init` step reads the commitment binding
+            // right after the state (see the guest's `main`).
+            builder.write(commitment_header).unwrap();
+            builder.write(fingerprint_slice).unwrap();
         }
         let env = builder.build().unwrap();
         let receipt = prover.prove(env, &TRANSITION_GUEST_ELF).unwrap().receipt;
@@ -562,14 +577,23 @@ mod tests {
             program_output_read_witness: None,
             program_output_selection_witness: None,
         };
+        let window_fingerprint = Fingerprint::from(vec![0], BitPacker::new(64), 1);
         let state = TransitionState::Init(InitTransition {
             init_frontier: make_init_frontier(),
             init_storage_frontier: make_init_frontier(),
             init_storage_root: storage_root(&make_init_frontier()),
             init_storage_index_root: coordinate_index_root(&std::collections::BTreeMap::new()),
             active_drafts: Default::default(),
-            fingerprint: Fingerprint::from(vec![0], BitPacker::new(64), 1),
+            fingerprint: window_fingerprint.clone(),
         });
+        // A minimal commitment whose fingerprint *is* the window (start 0),
+        // so the guest's Init-time slice check passes.
+        let trace_commitment = TraceCommitment {
+            fingerprint: window_fingerprint,
+            revealed_items: Vec::new(),
+        };
+        let commitment_header = trace_commitment.header();
+        let fingerprint_slice = trace_commitment.fingerprint_slice_witness(0, 1);
 
         let mut builder = risc0_zkvm::ExecutorEnv::builder();
         if let Some(receipt) = authorization_receipt {
@@ -579,6 +603,8 @@ mod tests {
         builder.write(&image_id_bytes(TRANSITION_GUEST_ID)).unwrap();
         builder.write(&input).unwrap();
         builder.write(&state).unwrap();
+        builder.write(&commitment_header).unwrap();
+        builder.write(&fingerprint_slice).unwrap();
         let env = builder.build().unwrap();
 
         prover.prove(env, &TRANSITION_GUEST_ELF)

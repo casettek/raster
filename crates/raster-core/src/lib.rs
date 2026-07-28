@@ -27,6 +27,8 @@ pub mod trace;
 #[cfg(feature = "std")]
 pub mod authorization;
 #[cfg(feature = "std")]
+pub mod chain;
+#[cfg(feature = "std")]
 pub mod coordinate_index;
 #[cfg(feature = "std")]
 pub mod manifest;

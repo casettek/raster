@@ -4,6 +4,7 @@
 //! They live in raster-core to avoid circular dependencies (guest cannot depend on prover).
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::string::String;
@@ -43,6 +44,65 @@ impl SerializableFrontier {
 pub struct StepRecordWitness {
     pub position: u64,
     pub path_elems: Vec<Vec<u8>>,
+}
+
+/// Domain prefix for [`TraceCommitmentHeader::digest`].
+pub const TRACE_COMMITMENT_DOMAIN: &[u8] = b"raster/trace-commitment/v1";
+
+/// The compact, guest-friendly identity of a `TraceCommitment`.
+///
+/// A full `commit.bin` scales with the trace (the packed fingerprint spans
+/// every step; the revealed window is a window of full step records), so the
+/// transition guest never ingests it. Instead this constant-size header
+/// stands for it: the fingerprint is represented by a Merkle root over its
+/// packed `u64` blocks (leaf `i` = `sha256(bits[i].to_le_bytes())`, combined
+/// exactly like the trace tree), and the revealed items by their hash. The
+/// guest hashes the header into `refuted_trace_commitment` and checks its
+/// window is a slice of the fingerprint via a [`FingerprintSliceWitness`] —
+/// O(window) data instead of O(trace). Host-side construction lives in
+/// `raster-prover::trace` (`TraceCommitmentExt`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TraceCommitmentHeader {
+    pub bits_packer: crate::fingerprint::BitPacker,
+    /// Trace items the fingerprint covers (`fingerprint.len`).
+    pub fingerprint_len: u64,
+    /// Merkle root over the fingerprint's packed `u64` blocks.
+    pub fingerprint_root: Vec<u8>,
+    /// `sha256(postcard(revealed_items))`.
+    pub revealed_items_commitment: Vec<u8>,
+}
+
+impl TraceCommitmentHeader {
+    /// The commitment identity: `sha256(domain || postcard(self))`. This is
+    /// what a journal's `refuted_trace_commitment` and a chain checkpoint's
+    /// `trace_commitment_digest` carry.
+    pub fn digest(&self) -> Vec<u8> {
+        let mut hasher = Sha256::new();
+        hasher.update(TRACE_COMMITMENT_DOMAIN);
+        hasher.update(postcard::to_allocvec(self).expect("TraceCommitmentHeader is serializable"));
+        hasher.finalize().to_vec()
+    }
+}
+
+/// Inclusion proof for one packed fingerprint block against
+/// [`TraceCommitmentHeader::fingerprint_root`]. Same path shape as every
+/// other Merkle witness the transition guest folds (`position`-bit ordering,
+/// level-prefixed combine).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FingerprintBlockWitness {
+    pub block: u64,
+    /// The block's index in the commitment's packed `bits` array.
+    pub position: u64,
+    pub path_elems: Vec<Vec<u8>>,
+}
+
+/// The contiguous run of proven fingerprint blocks covering a fraud window's
+/// item range `[window_start, window_start + window_len)`. The guest derives
+/// the required block range itself (from the window's frontier position and
+/// length) and rejects a witness whose positions differ.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FingerprintSliceWitness {
+    pub blocks: Vec<FingerprintBlockWitness>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -242,6 +302,16 @@ pub struct TransitionJournal {
     /// frame bytes, and asserted continuous across `Next` steps. See
     /// `docs/proposals/program-identity.md`.
     pub program_commitment: Vec<u8>,
+
+    /// `sha256(postcard(TraceCommitment))` — the identity of the `commit.bin`
+    /// this window audits. Derived in-guest at `Init` from the exact
+    /// commitment bytes, after asserting the window's committed fingerprint
+    /// is that commitment's fingerprint slice at the offset fixed by the
+    /// window's initial frontier; inherited across `Next` steps. A `Finished`
+    /// journal therefore refutes exactly this commitment — a downstream
+    /// verifier (the chain-fraud guest) binds it to a stage checkpoint by
+    /// hash equality alone. See `docs/proposals/chain-fraud-proof.md`.
+    pub refuted_trace_commitment: Vec<u8>,
 
     /// Whether this chain has tied `main`'s entry-argument binding to the
     /// authorization journal — established when the window opens (from a

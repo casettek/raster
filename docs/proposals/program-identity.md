@@ -1,6 +1,6 @@
 # Proposal: `program-identity` — what a raster program *is*, bindingly
 
-Status: proposed (2026-07-20)
+Status: implemented (2026-07-22; proposed 2026-07-20)
 Prerequisite for: [`program-chain.md`](./program-chain.md) (proposed) — supersedes its
 `program_commitment = sha256(canonical CFS bytes)` sketch.
 Series: [`program-start.md`](./program-start.md), [`program-end.md`](./program-end.md)
@@ -194,6 +194,17 @@ independently-verifiable object; `program.bin` does the same for the *program
 definition*. It is payload-only — nobody `select!`s into a program, so it needs no index.
 (The trace **fingerprint** is a separate mechanism entirely — it commits the execution
 *path*, not the program or the output value.)
+
+**As implemented, `program.bin` is a pure build cache — no code hard-depends on the file
+existing.** `cargo raster build` still writes it as an opportunistic fast path, but every
+consumer regenerates on demand when it is absent. The prover always regenerates it by
+recompiling tiles and drift-checking the fresh image ids against `Raster.lock`
+(`build_program_frame`); the light identity/audit path regenerates the *identical* frame
+from checked-in files only — the source CFS, the manifest, and the tile image ids already
+recorded in `Raster.lock` — with **no toolchain** (`reassemble_from_lock`), then hashes it.
+So the hard dependency is `Raster.lock` (checked in), not the gitignored cache file. The
+archival property above is unchanged: preserving a `program.bin` still lets a future
+verifier check old commitments even if source-reassembly logic changes.
 
 `Raster.lock` is **not** the identity — it is a reproducible *claim* of it, the record
 that ties `program_commitment` to a source revision over time (Cargo.lock semantics:

@@ -19,7 +19,9 @@ mod tests;
 
 use risc0_zkvm::guest::env;
 
-use raster_core::transition::{TransitionInput, TransitionState};
+use raster_core::transition::{
+    FingerprintSliceWitness, TraceCommitmentHeader, TransitionInput, TransitionState,
+};
 
 use crate::checks::io::verify_authorization_journal;
 use crate::fraud_proof::{commit_journal, FraudProofWindowContext, PublicParams};
@@ -30,6 +32,15 @@ fn main() {
     let params = PublicParams::read();
     let input: TransitionInput = env::read();
     let state: TransitionState = env::read();
+    // Only the window-opening step binds the committed fingerprint to a
+    // named `commit.bin`: it reads the commitment's compact header and the
+    // slice witness covering this window. `Next` steps inherit the (already
+    // verified) binding from the previous journal instead.
+    let commitment_binding: Option<(TraceCommitmentHeader, FingerprintSliceWitness)> =
+        match &state {
+            TransitionState::Init(_) => Some((env::read(), env::read())),
+            _ => None,
+        };
 
     // Precondition: external inputs were authorized against a manifest.
     assert!(verify_authorization_journal(
@@ -38,7 +49,8 @@ fn main() {
     ));
 
     // Attach this step to the fraud-proof chain.
-    let (window_context, current) = FraudProofWindowContext::proceed(&params, &input, state);
+    let (window_context, current) =
+        FraudProofWindowContext::proceed(&params, &input, state, commitment_binding);
 
     // Verify every recorded aspect of the step and advance the state.
     let next = current.apply_verified_step(&params.program, &params.cfs_cursor, &input);
@@ -56,6 +68,7 @@ fn main() {
         current_state,
         params.transition_image_id,
         params.program_commitment,
+        window_context.refuted_trace_commitment,
         &input,
         entrypoint_authorization,
         output_authorization,

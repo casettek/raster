@@ -1298,3 +1298,204 @@ fn genesis_authorization_rejects_forged_entry_object_commitment() {
         &first_step,
     );
 }
+
+// ============================================================================
+// Fingerprint slice binding (`assert_window_is_commitment_slice`)
+// ============================================================================
+
+mod fingerprint_slice {
+    use super::*;
+    use raster_core::fingerprint::{BitPacker, Fingerprint};
+    use raster_core::transition::{
+        FingerprintBlockWitness, FingerprintSliceWitness, TraceCommitmentHeader,
+    };
+    use raster_core::transition::InitTransition;
+
+    use crate::fraud_proof::assert_window_is_commitment_slice;
+
+    /// Mirror of the prover's fingerprint-block tree: leaf `i` =
+    /// `sha256(bits[i].to_le_bytes())`, combined by the shared trace-tree
+    /// convention. Rebuilt here so the guest-side check is exercised against
+    /// an independently constructed witness.
+    fn build_header_and_witness(
+        bits: &[u64],
+        bits_per_item: usize,
+        fingerprint_len: usize,
+        window_start: usize,
+        window_len: usize,
+    ) -> (TraceCommitmentHeader, FingerprintSliceWitness) {
+        let first_block = (window_start * bits_per_item) / 64;
+        let last_block = ((window_start + window_len) * bits_per_item - 1) / 64;
+
+        let mut tree = TraceBridgeTree::new(1);
+        let mut marked = Vec::new();
+        for (index, block) in bits.iter().enumerate() {
+            tree.append(Bytes(sha256_bytes(&block.to_le_bytes())));
+            if (first_block..=last_block).contains(&index) {
+                marked.push(tree.mark().expect("mark fingerprint block"));
+            }
+        }
+        let fingerprint_root = tree.root(0).expect("fingerprint root").0;
+
+        let blocks = (first_block..=last_block)
+            .zip(marked)
+            .map(|(index, position)| {
+                let path = tree.witness(position, 0).expect("block witness");
+                FingerprintBlockWitness {
+                    block: bits[index],
+                    position: u64::from(position),
+                    path_elems: path.iter().map(|elem| elem.0.clone()).collect(),
+                }
+            })
+            .collect();
+
+        let header = TraceCommitmentHeader {
+            bits_packer: BitPacker::new(bits_per_item),
+            fingerprint_len: fingerprint_len as u64,
+            fingerprint_root,
+            revealed_items_commitment: vec![9; 32],
+        };
+        (header, FingerprintSliceWitness { blocks })
+    }
+
+    fn init_transition_with_window(window_start: usize, window: Fingerprint) -> InitTransition {
+        InitTransition {
+            // Only the frontier's position matters to the slice check: it is
+            // what fixes the window's offset in the committed fingerprint.
+            init_frontier: SerializableFrontier {
+                position: window_start as u64,
+                leaf: EMPTY_LEAF.to_vec(),
+                ommers: Vec::new(),
+            },
+            init_storage_frontier: SerializableFrontier {
+                position: 0,
+                leaf: EMPTY_LEAF.to_vec(),
+                ommers: Vec::new(),
+            },
+            init_storage_root: Vec::new(),
+            init_storage_index_root: Vec::new(),
+            active_drafts: BTreeMap::new(),
+            fingerprint: window,
+        }
+    }
+
+    /// 40 items at 4 bits each = 160 bits = 3 packed blocks, with per-item
+    /// values `i & 0xf` so every offset mistake changes some value.
+    fn fixture_bits(bits_per_item: usize, items: usize) -> Vec<u64> {
+        let packer = BitPacker::new(bits_per_item);
+        let hashes: Vec<Vec<u8>> = (0..items).map(|i| vec![i as u8; 32]).collect();
+        packer.pack(&hashes)
+    }
+
+    #[test]
+    fn accepts_a_window_slice_crossing_a_block_boundary() {
+        let (bits_per_item, items) = (4, 40);
+        let bits = fixture_bits(bits_per_item, items);
+        // Items [14, 18) span bits [56, 72) — blocks 0 and 1.
+        let (window_start, window_len) = (14, 4);
+
+        let packer = BitPacker::new(bits_per_item);
+        let window_bits = packer
+            .get_range(window_start, window_start + window_len, &bits)
+            .expect("window slice");
+        let window = Fingerprint::from(window_bits, packer, window_len);
+
+        let (header, witness) =
+            build_header_and_witness(&bits, bits_per_item, items, window_start, window_len);
+        assert_window_is_commitment_slice(
+            &init_transition_with_window(window_start, window),
+            &header,
+            &witness,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "diverges from the committed fingerprint slice")]
+    fn rejects_a_window_fingerprint_not_in_the_commitment() {
+        let (bits_per_item, items) = (4, 40);
+        let bits = fixture_bits(bits_per_item, items);
+        let (window_start, window_len) = (14, 4);
+
+        let packer = BitPacker::new(bits_per_item);
+        let mut window_bits = packer
+            .get_range(window_start, window_start + window_len, &bits)
+            .expect("window slice");
+        // A challenger-fabricated "committed" fingerprint: one flipped value.
+        window_bits[0] ^= 0b1;
+        let window = Fingerprint::from(window_bits, packer, window_len);
+
+        let (header, witness) =
+            build_header_and_witness(&bits, bits_per_item, items, window_start, window_len);
+        assert_window_is_commitment_slice(
+            &init_transition_with_window(window_start, window),
+            &header,
+            &witness,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "diverges from the committed fingerprint slice")]
+    fn rejects_a_genuine_slice_claimed_at_the_wrong_offset() {
+        let (bits_per_item, items) = (4, 40);
+        let bits = fixture_bits(bits_per_item, items);
+        let (window_start, window_len) = (14, 4);
+
+        let packer = BitPacker::new(bits_per_item);
+        let window_bits = packer
+            .get_range(window_start, window_start + window_len, &bits)
+            .expect("window slice");
+        let window = Fingerprint::from(window_bits, packer, window_len);
+
+        // The frontier (and thus the derived offset) says one item later:
+        // the same committed blocks yield different values there.
+        let (header, witness) =
+            build_header_and_witness(&bits, bits_per_item, items, window_start + 1, window_len);
+        assert_window_is_commitment_slice(
+            &init_transition_with_window(window_start + 1, window),
+            &header,
+            &witness,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "block inclusion proof is invalid")]
+    fn rejects_a_tampered_block_value() {
+        let (bits_per_item, items) = (4, 40);
+        let bits = fixture_bits(bits_per_item, items);
+        let (window_start, window_len) = (14, 4);
+
+        let packer = BitPacker::new(bits_per_item);
+        let window_bits = packer
+            .get_range(window_start, window_start + window_len, &bits)
+            .expect("window slice");
+        let window = Fingerprint::from(window_bits, packer, window_len);
+
+        let (header, mut witness) =
+            build_header_and_witness(&bits, bits_per_item, items, window_start, window_len);
+        witness.blocks[0].block ^= 0b1;
+        assert_window_is_commitment_slice(
+            &init_transition_with_window(window_start, window),
+            &header,
+            &witness,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "Window range exceeds the committed fingerprint")]
+    fn rejects_a_window_past_the_committed_fingerprint() {
+        let (bits_per_item, items) = (4, 40);
+        let bits = fixture_bits(bits_per_item, items);
+        let (window_start, window_len) = (38, 4);
+
+        let packer = BitPacker::new(bits_per_item);
+        let window_bits = packer.get_range(36, 40, &bits).expect("window slice");
+        let window = Fingerprint::from(window_bits, packer, window_len);
+
+        let (header, witness) = build_header_and_witness(&bits, bits_per_item, items, 36, 4);
+        assert_window_is_commitment_slice(
+            &init_transition_with_window(window_start, window),
+            &header,
+            &witness,
+        );
+    }
+}

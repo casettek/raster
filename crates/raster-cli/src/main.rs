@@ -136,7 +136,8 @@ enum Commands {
         verify: bool,
     },
 
-    /// Run or audit a multi-program chain (see docs/proposals/program-chain.md)
+    /// Run or audit a multi-program chain, defined by a `Raster.toml` `[chain]`
+    /// table or a `chain.json` (see docs/proposals/program-chain.md)
     Chain {
         #[command(subcommand)]
         command: ChainCommand,
@@ -203,8 +204,10 @@ enum ChainCommand {
     /// Run every stage in order, threading each output into the next, and write
     /// a chain-commitment over the resulting checkpoints.
     Run {
-        /// Path to the chain.json pipeline definition
-        chain: String,
+        /// Chain manifest: a `Raster.toml` with a `[chain]` table, a directory
+        /// containing one (or a `chain.json`), or an explicit `chain.json`.
+        /// Omit to discover a chain manifest from the current directory upward.
+        chain: Option<String>,
 
         /// Trace items covered by each stage's fraud-proof window (power of two,
         /// 2..=1024); each stage is committed with this window.
@@ -214,11 +217,46 @@ enum ChainCommand {
 
     /// Verify a recorded chain's links and identities — public, no proving.
     Audit {
-        /// Path to the chain.json pipeline definition
-        chain: String,
+        /// Chain manifest (see `chain run`). Omit to discover from the current
+        /// directory upward.
+        chain: Option<String>,
 
-        /// Path to the chain-commitment written by `chain run`
-        chain_commitment: String,
+        /// Path to the chain-commitment written by `chain run`. Omit to use the
+        /// most recent run under `target/raster/chains/`.
+        chain_commitment: Option<String>,
+
+        /// Additionally re-run every stage natively and verify the honest
+        /// trace against the stage's committed `commit.bin` (detects
+        /// intra-stage execution fraud; use `chain fraud-prove` for a receipt).
+        #[arg(long)]
+        execution: bool,
+    },
+
+    /// Detect a chain fault (link, then execution) and produce a single
+    /// succinct chain fraud receipt naming the faulty stage.
+    FraudProve {
+        /// Chain manifest (see `chain run`).
+        chain: Option<String>,
+
+        /// Path to the chain-commitment written by `chain run`. Omit to use the
+        /// most recent run under `target/raster/chains/`.
+        chain_commitment: Option<String>,
+    },
+
+    /// Verify a chain fraud receipt against the local chain-commitment and
+    /// the known-good guest image ids.
+    FraudVerify {
+        /// Path to the `chain-fraud.receipt`. Omit to use the one next to the
+        /// chain-commitment.
+        receipt: Option<String>,
+
+        /// Chain manifest (see `chain run`).
+        #[arg(long)]
+        chain: Option<String>,
+
+        /// Path to the chain-commitment written by `chain run`.
+        #[arg(long)]
+        chain_commitment: Option<String>,
     },
 }
 
@@ -313,11 +351,25 @@ fn try_main() -> Result<()> {
             ChainCommand::Run {
                 chain,
                 fraud_proof_window_size,
-            } => chain::run(&chain, fraud_proof_window_size),
+            } => chain::run(chain.as_deref(), fraud_proof_window_size),
             ChainCommand::Audit {
                 chain,
                 chain_commitment,
-            } => chain::audit(&chain, &chain_commitment),
+                execution,
+            } => chain::audit(chain.as_deref(), chain_commitment.as_deref(), execution),
+            ChainCommand::FraudProve {
+                chain,
+                chain_commitment,
+            } => chain::fraud_prove(chain.as_deref(), chain_commitment.as_deref()),
+            ChainCommand::FraudVerify {
+                receipt,
+                chain,
+                chain_commitment,
+            } => chain::fraud_verify(
+                receipt.as_deref(),
+                chain.as_deref(),
+                chain_commitment.as_deref(),
+            ),
         },
         Commands::Run {
             backend,

@@ -378,6 +378,40 @@ pub struct TraceWindow {
     pub items: Vec<StepRecord>,
 }
 
+/// A commitment to one recorded trace: the packed fingerprint over every
+/// step's cumulative trace-tree root, plus the first fraud-proof window of
+/// steps revealed in the clear.
+///
+/// The struct lives in `raster-core` (not `raster-prover`) because the
+/// transition guest must decode the exact `commit.bin` bytes it refutes: at
+/// `Init` it hashes them into the journal's `refuted_trace_commitment` and
+/// asserts the window fingerprint is a slice of `fingerprint` at the offset
+/// fixed by the window's initial frontier (see
+/// `docs/proposals/chain-fraud-proof.md`). Construction and verification
+/// (Merkle-tree logic) stay host-side in `raster-prover::trace`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TraceCommitment {
+    pub fingerprint: Fingerprint,
+    pub revealed_items: Vec<StepRecord>,
+}
+
+impl TraceCommitment {
+    /// Fraud-proof window size this commitment was built with.
+    pub fn window_size(&self) -> usize {
+        self.revealed_items.len()
+    }
+
+    /// Get the number of commitments.
+    pub fn len(&self) -> usize {
+        self.fingerprint.len()
+    }
+
+    /// Check if the commitment is empty.
+    pub fn is_empty(&self) -> bool {
+        self.fingerprint.is_empty()
+    }
+}
+
 /// One declared `main` entry argument, as bound at runtime — enough for
 /// the recorder to independently reconstruct the `Referenced` object's
 /// commitment without touching any file bytes. `encoding` says which

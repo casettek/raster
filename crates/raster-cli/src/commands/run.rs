@@ -29,8 +29,8 @@ use raster_prover::authorization::authorize_external_inputs;
 use raster_prover::precomputed::EMPTY_TRIE_NODES;
 use raster_prover::replay::{ReplayResult, Replayer};
 use raster_prover::trace::{
-    Bytes, FraudEvidence, FraudProofConfig, SerializableFrontier, TraceCommitment, TraceTree,
-    TraceVerifier, VerificationResult,
+    Bytes, FraudEvidence, FraudProofConfig, SerializableFrontier, TraceCommitment,
+    TraceCommitmentExt, TraceTree, TraceVerifier, VerificationResult,
 };
 use raster_prover::transition::{step_transitions, StepIo};
 use raster_runtime::TraceRecorder;
@@ -262,6 +262,7 @@ pub fn run(
                 let backend = Risc0Backend::new(project.output_dir.clone())
                     .with_user_crate(project.root_dir.clone());
                 let replayer = Replayer::new(&backend, &project);
+                let trace_commitment = read_trace_commitment(commit_path)?;
                 let fraud_proof = prove(
                     fraud_evidence,
                     &trace,
@@ -269,6 +270,7 @@ pub fn run(
                     &trace_recorder,
                     &replayer,
                     input_manifest,
+                    &trace_commitment,
                 );
                 let fraud_proof_path = write_fraud_proof(&fraud_proof, commit_path);
                 println!("Fraud proof generated: {}", fraud_proof_path.display());
@@ -487,7 +489,7 @@ pub fn fraud(
     };
 
     let trace_commitment =
-        TraceCommitment::try_from(trace, &EMPTY_TRIE_NODES[0], fraud_proof_config)
+        TraceCommitment::try_build(trace, &EMPTY_TRIE_NODES[0], fraud_proof_config)
             .map_err(|e| Error::Other(e.to_string()))?;
 
     let bytes = postcard::to_allocvec(&trace_commitment).unwrap();
@@ -507,7 +509,7 @@ pub fn commit(
     fraud_proof_config: FraudProofConfig,
 ) -> Result<()> {
     let trace_commitment =
-        TraceCommitment::try_from(trace, &EMPTY_TRIE_NODES[0], fraud_proof_config)
+        TraceCommitment::try_build(trace, &EMPTY_TRIE_NODES[0], fraud_proof_config)
             .map_err(|e| Error::Other(e.to_string()))?;
     let bytes = postcard::to_allocvec(&trace_commitment).unwrap();
 
@@ -726,6 +728,7 @@ pub fn prove(
     trace_recorder: &TraceRecorder,
     replayer: &Replayer,
     input_manifest: Option<&str>,
+    trace_commitment: &TraceCommitment,
 ) -> risc0_zkvm::Receipt {
     let mode = ExecutionMode::prove_and_verify();
     let FraudEvidence {
@@ -943,12 +946,24 @@ pub fn prove(
 
         let program_frame = build_program_frame(cfs, replayer);
 
+        // Bind the window to the commitment it refutes: the window's start is
+        // the initial frontier's position (seed + one leaf per pre-window
+        // step), and the slice witness proves the window fingerprint occurs
+        // in the commitment there. The guest re-derives and checks both.
+        let commitment_header = trace_commitment.header();
+        let window_start = usize::try_from(frontier.position)
+            .expect("window start position overflows usize");
+        let fingerprint_slice = trace_commitment
+            .fingerprint_slice_witness(window_start, fraud_window.fingerprint.len());
+
         let Some(receipt) = step_transitions(
             &frontier,
             &initial_storage_state.frontier,
             &initial_storage_state.coordinate_index.root(),
             &fraud_window.items,
             fraud_window.fingerprint,
+            &commitment_header,
+            &fingerprint_slice,
             &program_frame,
             &input_sources_witnesses,
             &recorded_step_io,

@@ -255,16 +255,66 @@ pub fn reassemble_and_verify(
     Ok(program)
 }
 
+/// Reassemble a program's [`ProgramDefinition`] from checked-in files only — the
+/// source CFS, the manifest, and the tile image ids recorded in `Raster.lock` —
+/// with no guest recompilation. This is the on-demand regeneration of the
+/// `program.bin` frame when its build cache is cold: the light identity/audit
+/// path, which needs `Raster.lock` but no risc0 toolchain. The prover path never
+/// uses this — it recompiles tiles and drift-checks them ([`reassemble_and_verify`]).
+pub fn reassemble_from_lock(
+    project: &Project,
+    cfs: &ControlFlowSchema,
+) -> Result<ProgramDefinition> {
+    let manifest = load_or_synthesize_manifest(project, cfs)?;
+    let lock = read_lock(&raster_lock_path(project))?;
+    let mut tiles = BTreeMap::new();
+    for tile in &cfs.tiles {
+        let entry = lock.tiles.get(&tile.id).ok_or_else(|| {
+            Error::Other(format!(
+                "Raster.lock records no image id for tile '{}' — run `cargo raster build`",
+                tile.id
+            ))
+        })?;
+        tiles.insert(tile.id.clone(), decode_image_id(&entry.image_id, &tile.id)?);
+    }
+    ProgramDefinition::assemble(manifest, cfs.clone(), tiles)
+}
+
+/// Decode a `Raster.lock` image-id hex string into the 32-byte digest.
+fn decode_image_id(hex_str: &str, tile_id: &str) -> Result<ImageId> {
+    let bytes = hex::decode(hex_str).map_err(|e| {
+        Error::Other(format!(
+            "Raster.lock image id for tile '{tile_id}' is not valid hex: {e}"
+        ))
+    })?;
+    let len = bytes.len();
+    bytes.try_into().map_err(|_| {
+        Error::Other(format!(
+            "Raster.lock image id for tile '{tile_id}' is {len} bytes, expected 32"
+        ))
+    })
+}
+
+/// Read and parse `Raster.lock`. A missing lock is an error here (callers that
+/// tolerate absence check existence first, e.g. [`check_lock_drift`]).
+fn read_lock(lock_path: &Path) -> Result<RasterLock> {
+    let text = std::fs::read_to_string(lock_path).map_err(|_| {
+        Error::Other(format!(
+            "{} not found — run `cargo raster build`",
+            lock_path.display()
+        ))
+    })?;
+    serde_json::from_str(&text)
+        .map_err(|e| Error::Other(format!("failed to parse {}: {e}", lock_path.display())))
+}
+
 /// If `lock_path` exists, require the program's recomputed commitment to equal
 /// the lock's (the stale-lock drift check). Absent lock is not an error.
 fn check_lock_drift(program: &ProgramDefinition, lock_path: &Path) -> Result<()> {
     if !lock_path.exists() {
         return Ok(());
     }
-    let text = std::fs::read_to_string(lock_path)
-        .map_err(|e| Error::Other(format!("failed to read {}: {e}", lock_path.display())))?;
-    let lock: RasterLock = serde_json::from_str(&text)
-        .map_err(|e| Error::Other(format!("failed to parse {}: {e}", lock_path.display())))?;
+    let lock = read_lock(lock_path)?;
     let recomputed = hex::encode(program.commitment());
     if recomputed != lock.program_commitment {
         return Err(Error::Other(format!(
@@ -390,5 +440,26 @@ encoding = "raster"
         std::fs::remove_file(&lock_path).unwrap();
         assert!(check_lock_drift(&program, &lock_path).is_ok());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn decodes_valid_image_id_hex() {
+        let id = decode_image_id(&hex::encode([7u8; 32]), "greet").unwrap();
+        assert_eq!(id, [7u8; 32]);
+    }
+
+    #[test]
+    fn rejects_malformed_image_id_hex() {
+        // Not hex at all.
+        assert!(decode_image_id("nothex", "greet").is_err());
+        // Valid hex, wrong length (16 bytes).
+        let err = decode_image_id(&hex::encode([1u8; 16]), "greet").unwrap_err();
+        assert!(err.to_string().contains("expected 32"), "got: {err}");
+    }
+
+    #[test]
+    fn read_lock_reports_missing_file() {
+        let err = read_lock(Path::new("/nonexistent/Raster.lock")).unwrap_err();
+        assert!(err.to_string().contains("run `cargo raster build`"), "got: {err}");
     }
 }
