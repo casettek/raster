@@ -44,7 +44,7 @@ Two consequences:
 
 Two deliverables that share one normative rule set:
 
-1. **A strict authoring skill** (`.claude/skills/raster-authoring/`) that guides an AI
+1. **A strict authoring skill** (`.claude/skills/raster/`) that guides an AI
    agent step-by-step through writing a verifiable Raster program — tiles, sequences,
    recur-tiles/recur-sequences over blocks of data, program boundary, chaining — with
    every rule stated as a MUST/MUST NOT and paired with the check that verifies it.
@@ -205,12 +205,12 @@ detected by commit/audit divergence, **[none]** = currently unenforced — skill
   (`--commit` + fraud-proof window, then `--audit`) → `cargo raster program --verify`
   → for chains, `cargo raster chain run` + `chain audit --execution`.
 
-## 2. Deliverable 1: the `raster-authoring` skill
+## 2. Deliverable 1: the `raster` skill
 
 ### Location and shape
 
 ```text
-.claude/skills/raster-authoring/
+.claude/skills/raster/
   SKILL.md              # rules-first guide, the RAS index, the workflow ladder
   references/
     tiles.md            # RAS-2xx expanded: ABI, determinism list, no_std checklist
@@ -255,7 +255,7 @@ the skill should be a compiling doctest or mirror a UI test.
 
 ```markdown
 ---
-name: raster-authoring
+name: raster
 description: Write/modify verifiable Raster programs (tiles, sequences, recur
   over data blocks). MUST be used for any change under a Raster project's src/
   or Raster.toml. Enforces RISC0-replayability rules; pairs every rule with the
@@ -379,7 +379,7 @@ Exit non-zero on any deny-level finding → CI-ready.
 ## 5. Files likely to change
 
 - `docs/proposals/authoring-skill-and-tooling.md` — this document
-- `.claude/skills/raster-authoring/**` — new skill (Phase 1)
+- `.claude/skills/raster/**` — new skill (Phase 1)
 - `docs/tile-authoring.md` — align with RAS rule IDs (Phase 1)
 - `crates/raster-macros/src/lib.rs`, `crates/raster-macros/src/recur.rs` — spanned
   errors + new validations (Phase 2)

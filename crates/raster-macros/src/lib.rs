@@ -303,8 +303,15 @@ fn rewrite_into_auth_value_args(sig: &mut syn::Signature) {
             let ty = &pat_type.ty;
             if let Some(schema_ty) = draft_schema_type(ty) {
                 pat_type.ty = syn::parse_quote!(impl ::raster::IntoDraft<#schema_ty>);
-            } else {
+            } else if recur_input_inner_type(ty).is_some() || recur_state_inner_type(ty).is_some() {
+                // Recur protocol wrappers are framework-threaded, not materialized
+                // tile arguments; their inner types are policed by the recur shape.
                 pat_type.ty = syn::parse_quote!(impl ::raster::IntoAuthValue<#ty>);
+            } else {
+                // Plain tile arguments cross the materialization boundary: the
+                // `IntoMaterialized<#ty>` bound requires `#ty: Materializable`,
+                // so an unbounded collection (or inline `vec![..]`) is rejected.
+                pat_type.ty = syn::parse_quote!(impl ::raster::IntoMaterialized<#ty>);
             }
         }
     }
@@ -634,12 +641,12 @@ fn is_std_result_path(path: &Path) -> bool {
         || path_segments_match(path, &["core", "result", "Result"])
 }
 
-fn vec_element_type(ty: &Type) -> Option<Type> {
+fn generic_element_type(ty: &Type, wrapper: &str) -> Option<Type> {
     let Type::Path(type_path) = ty else {
         return None;
     };
     let segment = type_path.path.segments.last()?;
-    if segment.ident != "Vec" {
+    if segment.ident != wrapper {
         return None;
     }
     let PathArguments::AngleBracketed(args) = &segment.arguments else {
@@ -649,6 +656,17 @@ fn vec_element_type(ty: &Type) -> Option<Type> {
         GenericArgument::Type(inner) => Some(inner.clone()),
         _ => None,
     })
+}
+
+fn vec_element_type(ty: &Type) -> Option<Type> {
+    generic_element_type(ty, "Vec")
+}
+
+/// A `List<T>` field is the append-only collection in a Rastered struct; its
+/// draft accessor pushes elements. `Block<T>` is a bounded materialized window
+/// and is not a draft-buildable field, so only `List` is detected here.
+fn list_element_type(ty: &Type) -> Option<Type> {
+    generic_element_type(ty, "List")
 }
 
 fn fallible_result_message() -> &'static str {
@@ -2009,6 +2027,20 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
         .map(|shape| gen_recur_driver_function(fn_name, shape))
         .unwrap_or_else(|| quote! {});
 
+    // A tile's materialized output crosses the boundary just like its arguments:
+    // it is committed whole into the replay unit. Assert the output type is
+    // `Materializable`, so a tile cannot return an unbounded collection (build a
+    // `Block<T>` or a draft-threaded `List` field instead).
+    let return_materializable_assertion = match &return_kind {
+        ProtocolReturnKind::Value(ty) | ProtocolReturnKind::Fallible(ty) => quote! {
+            const _: fn() = || {
+                fn __raster_assert_materializable<T: ::raster::Materializable>() {}
+                __raster_assert_materializable::<#ty>();
+            };
+        },
+        _ => quote! {},
+    };
+
     let mut exposed_sig = input_fn.sig.clone();
     rewrite_into_auth_value_args(&mut exposed_sig);
 
@@ -2199,6 +2231,7 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
         #implementation_function
         #tile_call_binding
         #recur_driver_function
+        #return_materializable_assertion
 
         // Original function with tracing injected
         #original_function
@@ -2748,9 +2781,41 @@ impl Parse for SelectInput {
     }
 }
 
+/// Whether a selector expression's outermost access is a `[a..b]` range.
+fn selector_ends_in_range(expr: &Expr) -> bool {
+    matches!(expr, Expr::Index(ExprIndex { index, .. }) if matches!(&**index, Expr::Range(_)))
+}
+
+/// Whether a type's outermost path segment is the given wrapper ident.
+fn type_head_is(ty: &Type, wrapper: &str) -> bool {
+    matches!(ty, Type::Path(p) if p.path.segments.last().map(|s| s.ident == wrapper).unwrap_or(false))
+}
+
 #[proc_macro]
 pub fn select(item: TokenStream) -> TokenStream {
     let SelectInput { selected_ty, expr } = parse_macro_input!(item as SelectInput);
+
+    // Enforce the collection vocabulary: a bounded `[a..b]` range yields a
+    // `Block<T>`; anything else must not be named `Block`. This keeps `Block`
+    // constructible only from CFS-pinned range selections.
+    let ends_in_range = selector_ends_in_range(&expr);
+    let targets_block = type_head_is(&selected_ty, "Block");
+    if ends_in_range && !targets_block {
+        return TokenStream::from(quote! {
+            ::core::compile_error!(
+                "a range `[a..b]` selection yields a `Block<T>`; name the target type `Block<...>`"
+            )
+        });
+    }
+    if targets_block && !ends_in_range {
+        return TokenStream::from(quote! {
+            ::core::compile_error!(
+                "`Block<T>` is only produced by a literal range selection `xs[a..b]`; \
+                 to reference the whole collection select a `List<T>`"
+            )
+        });
+    }
+
     let (base_expr, segments) = split_selector_expr(expr);
 
     TokenStream::from(quote! {
@@ -2779,6 +2844,47 @@ pub fn derive_selectable(item: TokenStream) -> TokenStream {
         _ => panic!("Selectable can only be derived for structs"),
     };
 
+    // Reject `Vec<T>` fields: collections in Rastered data are `List<T>`
+    // (unbounded, referenced) and tiles receive bounded `Block<T>` windows.
+    let vec_field_errors: Vec<_> = fields
+        .iter()
+        .filter_map(|field| {
+            let element_ty = vec_element_type(&field.ty)?;
+            let field_name = field.ident.as_ref().expect("named field").to_string();
+            let msg = format!(
+                "`Vec<{}>` is not a Rastered type: field `{}` must be `List<{}>` \
+                 (tiles receive bounded `Block<{}>` windows of it)",
+                element_ty.to_token_stream(),
+                field_name,
+                element_ty.to_token_stream(),
+                element_ty.to_token_stream(),
+            );
+            Some(quote! { ::core::compile_error!(#msg); })
+        })
+        .collect();
+
+    let field_types: Vec<_> = fields.iter().map(|field| &field.ty).collect();
+
+    // A struct is `Materializable` iff every field is. A direct `List<T>` (or
+    // `Vec<T>`) field makes it unbounded, so such a struct gets NO `Materializable`
+    // impl — it stays `Selectable` but cannot cross a tile boundary whole. For all
+    // other structs we emit a where-bounded impl; the concrete field bounds hold
+    // for scalar/`Block`/materializable-struct fields and, if a field type is
+    // itself non-materializable, the impl simply does not apply.
+    let has_unbounded_field = fields
+        .iter()
+        .any(|field| list_element_type(&field.ty).is_some() || vec_element_type(&field.ty).is_some());
+    let materializable_impl = if has_unbounded_field {
+        quote! {}
+    } else {
+        quote! {
+            impl #impl_generics ::raster::core::Materializable for #ident #ty_generics
+            where
+                #(#field_types: ::raster::core::Materializable,)*
+            {}
+        }
+    };
+
     let schema_fields: Vec<_> = fields
         .iter()
         .map(|field| {
@@ -2802,7 +2908,7 @@ pub fn derive_selectable(item: TokenStream) -> TokenStream {
         .iter()
         .map(|field| {
             let field_ident = field.ident.as_ref().expect("named field");
-            if let Some(element_ty) = vec_element_type(&field.ty) {
+            if let Some(element_ty) = list_element_type(&field.ty) {
                 quote! {
                     fn #field_ident(&mut self) -> ::raster::DraftAppendField<'_, #ident #ty_generics, #element_ty>;
                 }
@@ -2820,7 +2926,7 @@ pub fn derive_selectable(item: TokenStream) -> TokenStream {
         .map(|field| {
             let field_ident = field.ident.as_ref().expect("named field");
             let field_name = field_ident.to_string();
-            if let Some(element_ty) = vec_element_type(&field.ty) {
+            if let Some(element_ty) = list_element_type(&field.ty) {
                 quote! {
                     fn #field_ident(&mut self) -> ::raster::DraftAppendField<'_, #ident #ty_generics, #element_ty> {
                         self.append_field(#field_name)
@@ -2854,5 +2960,9 @@ pub fn derive_selectable(item: TokenStream) -> TokenStream {
         impl #impl_generics #draft_trait_ident #ty_generics for ::raster::Draft<#ident #ty_generics> #where_clause {
             #(#draft_accessors)*
         }
+
+        #materializable_impl
+
+        #(#vec_field_errors)*
     })
 }

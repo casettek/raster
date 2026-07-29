@@ -196,8 +196,12 @@ fn runtime_tree_value(value: &raster_core::draft::DraftValue) -> TreeValue {
                 .map(|(name, child)| (name.clone(), runtime_tree_value(child)))
                 .collect(),
         ),
+        // Draft list fields are `List<T>` append targets (never `Block`), so they
+        // finalize to `(root, len)` handles — matching how a `List` field encodes
+        // through `encode_raster_value`. The list Merkle root is unchanged, so the
+        // finalized root still equals the incrementally-tracked draft root.
         raster_core::draft::DraftValue::List(values) => {
-            TreeValue::List(values.iter().map(runtime_tree_value).collect())
+            TreeValue::ListHandle(values.iter().map(runtime_tree_value).collect())
         }
         raster_core::draft::DraftValue::Map(entries) => TreeValue::Map(
             entries

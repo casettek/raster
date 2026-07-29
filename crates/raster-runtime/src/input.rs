@@ -37,6 +37,12 @@ pub(crate) enum TreeValue {
     String(String),
     Struct(Vec<(String, TreeValue)>),
     List(Vec<TreeValue>),
+    /// A `List<T>` value (as opposed to a `Block<T>`, which stays [`List`]).
+    /// Encoded as a `(root, len)` handle node (`0x09`) wrapping the inline list
+    /// so a parent struct's structural root skips its elements. Produced only on
+    /// the serialize/encode path (keyed by [`LIST_HANDLE_NEWTYPE_NAME`]); the
+    /// decode path is index-driven and reconstructs a plain [`List`].
+    ListHandle(Vec<TreeValue>),
     Map(Vec<(TreeValue, TreeValue)>),
     EnumUnit(String),
     EnumNewtype(String, Box<TreeValue>),
@@ -199,13 +205,23 @@ impl Serializer for TreeValueSerializer {
 
     fn serialize_newtype_struct<T>(
         self,
-        _name: &'static str,
+        name: &'static str,
         value: &T,
     ) -> Result<Self::Ok, Self::Error>
     where
         T: ?Sized + Serialize,
     {
-        value.serialize(self)
+        let inner = value.serialize(TreeValueSerializer)?;
+        // A `List<T>` announces itself through this newtype name (transparent to
+        // postcard/JSON). Tag it so `assemble_subtree` stores it as a `(root,
+        // len)` handle; every other newtype stays transparent, and a `Block<T>`
+        // (a plain seq) stays an inline `List`.
+        if name == raster_core::collections::LIST_HANDLE_NEWTYPE_NAME {
+            if let TreeValue::List(values) = inner {
+                return Ok(TreeValue::ListHandle(values));
+            }
+        }
+        Ok(inner)
     }
 
     fn serialize_newtype_variant<T>(
@@ -617,9 +633,11 @@ impl<'de> de::Deserializer<'de> for TreeValueDeserializer<'de> {
                 iter: fields.iter(),
                 value: None,
             }),
-            TreeValue::List(values) => visitor.visit_seq(TreeSeqAccess {
-                iter: values.iter(),
-            }),
+            TreeValue::List(values) | TreeValue::ListHandle(values) => {
+                visitor.visit_seq(TreeSeqAccess {
+                    iter: values.iter(),
+                })
+            }
             TreeValue::Map(entries) => visitor.visit_map(TreeMapAccess {
                 iter: entries.iter(),
                 value: None,
@@ -770,9 +788,11 @@ impl<'de> de::Deserializer<'de> for TreeValueDeserializer<'de> {
         V: Visitor<'de>,
     {
         match self.value {
-            TreeValue::List(values) => visitor.visit_seq(TreeSeqAccess {
-                iter: values.iter(),
-            }),
+            TreeValue::List(values) | TreeValue::ListHandle(values) => {
+                visitor.visit_seq(TreeSeqAccess {
+                    iter: values.iter(),
+                })
+            }
             _ => Err(TreeSerdeError("expected list".into())),
         }
     }
@@ -1183,6 +1203,7 @@ fn encode_leaf_bytes(value: &TreeValue) -> CoreResult<Vec<u8>> {
         }
         TreeValue::Struct(_)
         | TreeValue::List(_)
+        | TreeValue::ListHandle(_)
         | TreeValue::Map(_)
         | TreeValue::EnumUnit(_)
         | TreeValue::EnumNewtype(_, _)
@@ -1196,6 +1217,10 @@ fn encode_leaf_bytes(value: &TreeValue) -> CoreResult<Vec<u8>> {
     Ok(out)
 }
 
+/// Byte length of a list-handle header: `0x09` tag + 32-byte root + 8-byte len
+/// + 8-byte inner-length prefix. The inline `0x02` list payload follows.
+const LIST_HANDLE_HEADER_LEN: u64 = 1 + 32 + 8 + 8;
+
 /// Direct children of a `TreeValue`, in the order their payloads/roots are laid
 /// out by [`assemble_subtree`]. Used to drive an explicit-stack post-order
 /// traversal instead of recursing (which overflows the stack on deeply nested
@@ -1203,7 +1228,7 @@ fn encode_leaf_bytes(value: &TreeValue) -> CoreResult<Vec<u8>> {
 fn subtree_children(value: &TreeValue) -> Vec<&TreeValue> {
     match value {
         TreeValue::Struct(fields) => fields.iter().map(|(_, child)| child).collect(),
-        TreeValue::List(values) => values.iter().collect(),
+        TreeValue::List(values) | TreeValue::ListHandle(values) => values.iter().collect(),
         TreeValue::Map(entries) => {
             let mut children = Vec::with_capacity(entries.len() * 2);
             for (key, value) in entries {
@@ -1263,6 +1288,30 @@ fn assemble_subtree(
 
             let child_roots: Vec<Hash32> = children.iter().map(|(_, root)| *root).collect();
             (payload, list_root_from_hashes(&child_roots))
+        }
+        TreeValue::ListHandle(_) => {
+            // First build the inline `0x02` list payload (identical to `List`)…
+            let mut inner = Vec::new();
+            inner.push(0x02);
+            push_u64(&mut inner, children.len() as u64);
+            for (child_payload, _) in &children {
+                push_u64(&mut inner, child_payload.len() as u64);
+                inner.extend_from_slice(child_payload);
+            }
+            let child_roots: Vec<Hash32> = children.iter().map(|(_, root)| *root).collect();
+            let root = list_root_from_hashes(&child_roots);
+
+            // …then wrap it in a handle header `0x09 [root:32][len:8][inner_len:8]`.
+            // A parent's `parse_subtree_root` reads the stored root and skips the
+            // inline region, so it never re-Merkleizes the list; the elements are
+            // still present for selection.
+            let mut payload = Vec::with_capacity(LIST_HANDLE_HEADER_LEN as usize + inner.len());
+            payload.push(0x09);
+            payload.extend_from_slice(&root);
+            push_u64(&mut payload, children.len() as u64);
+            push_u64(&mut payload, inner.len() as u64);
+            payload.extend_from_slice(&inner);
+            (payload, root)
         }
         TreeValue::Map(_) => {
             // `children` is [key0, value0, key1, value1, ...]; re-pair before sorting.
@@ -1588,9 +1637,16 @@ pub(crate) fn prove_selection(
     segments: &[SelectorSegment],
 ) -> CoreResult<ProvenSelection> {
     if segments.is_empty() {
-        let (selected_bytes, root_hash) = subtree_payload_and_root(value)?;
+        // A whole `List<T>` selection yields the plain inline list bytes (not the
+        // `0x09` handle wrapper): its recomputed root equals the handle root, and
+        // downstream consumers select/iterate it like any other list.
+        let normalized = match value {
+            TreeValue::ListHandle(values) => TreeValue::List(values.clone()),
+            other => other.clone(),
+        };
+        let (selected_bytes, root_hash) = subtree_payload_and_root(&normalized)?;
         return Ok(ProvenSelection {
-            selected_value: value.clone(),
+            selected_value: normalized,
             selected_bytes,
             root_hash,
             steps: Vec::new(),
@@ -1662,7 +1718,7 @@ pub(crate) fn prove_selection(
         (
             SelectorSegment::Index(index),
             SchemaNode::List { element, .. },
-            TreeValue::List(values),
+            TreeValue::List(values) | TreeValue::ListHandle(values),
         ) => {
             let idx = *index as usize;
             let child_value = values
@@ -1698,7 +1754,7 @@ pub(crate) fn prove_selection(
         (
             SelectorSegment::Range { start, end },
             SchemaNode::List { .. },
-            TreeValue::List(values),
+            TreeValue::List(values) | TreeValue::ListHandle(values),
         ) => {
             if segments.len() > 1 {
                 return Err(Error::Other(
@@ -1970,6 +2026,22 @@ fn prepare_raster_children<'a>(
                 child_offset += 8 + child_payload.len() as u64;
             }
         }
+        TreeValue::ListHandle(values) => {
+            // The index node points at the inline `0x02` list (see
+            // `enter_raster_frame`), which starts past the handle header. Element
+            // offsets are therefore measured from that inner list, exactly as for
+            // a plain `List`.
+            let mut child_offset = offset + LIST_HANDLE_HEADER_LEN + 1 + 8;
+            for child in values {
+                let (child_payload, child_hash) = subtree_payload_and_root(child)?;
+                plans.push(RasterChildPlan {
+                    value: child,
+                    node_offset: child_offset + 8,
+                });
+                hashes.push(child_hash);
+                child_offset += 8 + child_payload.len() as u64;
+            }
+        }
         TreeValue::Map(entries) => {
             let mut records = Vec::with_capacity(entries.len());
             for (key, value) in entries {
@@ -2051,7 +2123,10 @@ fn finalize_raster_kind(
                 })
                 .collect(),
         },
-        TreeValue::List(values) => RasterNodeKind::List {
+        // A `ListHandle` indexes identically to a `List`: same element children,
+        // same Merkle levels, same selection behaviour. The handle wrapper is a
+        // parent-payload detail, invisible to the index kind.
+        TreeValue::List(values) | TreeValue::ListHandle(values) => RasterNodeKind::List {
             len: values.len() as u64,
             elements: child_ids.to_vec(),
             merkle_levels: merkle_levels_from_hashes(child_hashes),
@@ -2104,10 +2179,22 @@ fn enter_raster_frame<'a>(
     use crate::raster_index::{RasterNode, RasterNodeKind};
 
     let (payload, root_hash) = subtree_payload_and_root(value)?;
+    // A list handle's payload is `header(49) + inline 0x02 list`. The index node
+    // stands for the inline list itself, so it points past the header and its
+    // length is the inline region only. Every downstream selection then reads a
+    // plain list, and the handle wrapper exists solely inside the parent struct's
+    // bytes (where it makes the parent's structural root O(1)).
+    let (node_offset, node_len) = match value {
+        TreeValue::ListHandle(_) => (
+            offset + LIST_HANDLE_HEADER_LEN,
+            payload.len() as u64 - LIST_HANDLE_HEADER_LEN,
+        ),
+        _ => (offset, payload.len() as u64),
+    };
     let node_id = nodes.len() as u64;
     nodes.push(RasterNode {
-        offset,
-        len: payload.len() as u64,
+        offset: node_offset,
+        len: node_len,
         root_hash,
         kind: RasterNodeKind::Unit,
     });
@@ -2278,6 +2365,7 @@ mod tests {
     use crate::raster_index::RasterIndex;
     use crate::source::{sha256_hex, FileInputSourceResolver};
     use raster_core::input::{verify_selection_proof, SchemaField, SchemaNode, Selectable};
+    use raster_core::List;
     use serde::{Deserialize, Serialize};
     use std::collections::BTreeMap;
     use std::fs;
@@ -2290,15 +2378,15 @@ mod tests {
 
     #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
     struct Address {
-        lines: Vec<String>,
-        indexes: Vec<u32>,
+        lines: List<String>,
+        indexes: List<u32>,
     }
 
     #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
     struct PersonalData {
         age: usize,
         name: String,
-        addresses: Vec<Address>,
+        addresses: List<Address>,
     }
 
     #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
@@ -2322,8 +2410,8 @@ mod tests {
             SchemaNode::Struct {
                 type_name: "Address".into(),
                 fields: vec![
-                    SchemaField::new("lines", "lines", <Vec<String> as Selectable>::schema()),
-                    SchemaField::new("indexes", "indexes", <Vec<u32> as Selectable>::schema()),
+                    SchemaField::new("lines", "lines", <List<String> as Selectable>::schema()),
+                    SchemaField::new("indexes", "indexes", <List<u32> as Selectable>::schema()),
                 ],
             }
         }
@@ -2339,7 +2427,7 @@ mod tests {
                     SchemaField::new(
                         "addresses",
                         "addresses",
-                        <Vec<Address> as Selectable>::schema(),
+                        <List<Address> as Selectable>::schema(),
                     ),
                 ],
             }
@@ -2384,9 +2472,10 @@ mod tests {
             age: 25,
             name: "John".to_string(),
             addresses: vec![Address {
-                lines: vec!["221B Baker Street".to_string(), "Flat B".to_string()],
-                indexes: vec![7, 42],
-            }],
+                lines: vec!["221B Baker Street".to_string(), "Flat B".to_string()].into(),
+                indexes: vec![7, 42].into(),
+            }]
+            .into(),
         };
         let bytes = raster_core::postcard::to_allocvec(&data).unwrap();
         fs::write(dir.join("personal_data.bin"), &bytes).unwrap();
@@ -2435,8 +2524,9 @@ mod tests {
                 "c".to_string(),
                 "d".to_string(),
                 "e".to_string(),
-            ],
-            indexes: vec![1, 2, 3, 4, 5],
+            ]
+            .into(),
+            indexes: vec![1, 2, 3, 4, 5].into(),
         };
         let selector = SelectorPath::new(vec![
             SelectorSegment::from("lines"),
@@ -2468,8 +2558,8 @@ mod tests {
     #[test]
     fn range_selection_rejects_out_of_bounds_and_non_terminal_segments() {
         let root = Address {
-            lines: vec!["a".to_string(), "b".to_string()],
-            indexes: vec![],
+            lines: vec!["a".to_string(), "b".to_string()].into(),
+            indexes: List::default(),
         };
 
         let out_of_bounds = SelectorPath::new(vec![
@@ -2492,9 +2582,10 @@ mod tests {
             age: 25,
             name: "John".to_string(),
             addresses: vec![Address {
-                lines: vec!["221B Baker Street".to_string()],
-                indexes: vec![7],
-            }],
+                lines: vec!["221B Baker Street".to_string()].into(),
+                indexes: vec![7].into(),
+            }]
+            .into(),
         };
 
         let selected = selected_payload_from_proven(

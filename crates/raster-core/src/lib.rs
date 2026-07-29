@@ -15,6 +15,7 @@ extern crate std;
 
 pub mod cfs;
 pub mod chunking;
+pub mod collections;
 pub mod draft;
 pub mod error;
 pub mod fingerprint;
@@ -37,6 +38,7 @@ pub mod schema;
 #[cfg(feature = "std")]
 pub mod transition;
 
+pub use collections::{Block, List, Materializable};
 pub use error::{Error, Result};
 
 // Re-export postcard for tile ABI serialization (no_std compatible)

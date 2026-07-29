@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Deserialize, Serialize, Selectable)]
 struct Account {
-    txs: Vec<String>,
+    txs: List<String>,
     balance: u64,
 }
 

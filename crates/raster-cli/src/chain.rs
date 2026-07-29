@@ -17,6 +17,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::io::Write;
 use std::process::{Command, Stdio};
 
 use serde::Deserialize;
@@ -724,15 +725,36 @@ fn build_and_run_stage(
     input_manifest_path: &Path,
     stage_dir: &Path,
 ) -> Result<(raster_core::trace::Trace, raster_runtime::TraceRecorder)> {
-    let build_status = Command::new("cargo")
+    // The stage build is plumbing, not chain output: its cargo progress,
+    // dependency warnings, and protocol-guest build chatter would bury the
+    // per-stage lines this command exists to print. Capture it and surface it
+    // only when the build fails (or when RASTER_VERBOSE asks for everything).
+    let (build_stdio, capture_build) = if crate::utils::verbose_output() {
+        (Stdio::inherit as fn() -> Stdio, false)
+    } else {
+        (Stdio::piped as fn() -> Stdio, true)
+    };
+    let mut build_command = Command::new("cargo");
+    build_command
         .current_dir(&project.root_dir)
         .args(["build", "--release"])
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
+        .stdout(build_stdio())
+        .stderr(build_stdio());
+    crate::utils::quiet_guest_build(&mut build_command);
+    let build = build_command
+        .output()
         .map_err(|e| Error::Other(format!("failed to run cargo build: {e}")))?;
-    if !build_status.success() {
-        return Err(Error::Other(format!("stage build failed for {}", project.name)));
+    if !build.status.success() {
+        if capture_build {
+            // The failure is the one time this output is what the user needs.
+            std::io::stderr().write_all(&build.stdout).ok();
+            std::io::stderr().write_all(&build.stderr).ok();
+        }
+        return Err(Error::Other(format!(
+            "stage build failed for {} — {}",
+            project.name,
+            crate::utils::VERBOSE_HINT
+        )));
     }
 
     let binary_path = project.target_dir.join("release").join(&project.name);

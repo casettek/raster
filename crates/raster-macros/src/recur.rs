@@ -598,10 +598,10 @@ pub(crate) fn gen_recur_driver_function(
             #(#extra_wrapper_params,)*
         ) -> ::raster::AuthRef<#result_ty>
         where
-            #source_ident: ::raster::IntoAuthRef<::raster::alloc::vec::Vec<#item_ty>>,
+            #source_ident: ::raster::IntoAuthRef<::raster::List<#item_ty>>,
             #(#extra_where,)*
         {
-            let input = ::raster::into_auth_ref::<::raster::alloc::vec::Vec<#item_ty>, _>(input);
+            let input = ::raster::into_auth_ref::<::raster::List<#item_ty>, _>(input);
             #state_wrapper
 
             #[cfg(all(feature = "std", not(target_arch = "riscv32")))]
@@ -615,7 +615,7 @@ pub(crate) fn gen_recur_driver_function(
                 __raster_trace_values.push(__raster_input_trace.value);
                 __raster_trace_args.push(::raster::core::trace::FnInputArg {
                     name: ::raster::alloc::string::String::from("input"),
-                    ty: ::raster::alloc::string::String::from(stringify!(::raster::AuthRef<::raster::alloc::vec::Vec<#item_ty>>)),
+                    ty: ::raster::alloc::string::String::from(stringify!(::raster::AuthRef<::raster::List<#item_ty>>)),
                 });
                 if let ::core::option::Option::Some(__raster_internal_info) = __raster_input_trace.storage {
                     __raster_internal.insert(
@@ -954,10 +954,10 @@ pub(crate) fn gen_recur_sequence_driver_function(
             #(#extra_wrapper_params,)*
         ) -> ::raster::AuthRef<#result_ty>
         where
-            #source_ident: ::raster::IntoAuthRef<::raster::alloc::vec::Vec<#item_ty>>,
+            #source_ident: ::raster::IntoAuthRef<::raster::List<#item_ty>>,
             #(#extra_where,)*
         {
-            let input = ::raster::into_auth_ref::<::raster::alloc::vec::Vec<#item_ty>, _>(input);
+            let input = ::raster::into_auth_ref::<::raster::List<#item_ty>, _>(input);
             #state_wrapper
 
             #[cfg(all(feature = "std", not(target_arch = "riscv32")))]
@@ -971,7 +971,7 @@ pub(crate) fn gen_recur_sequence_driver_function(
                     values: ::raster::alloc::vec![__raster_input_trace.value],
                     args: ::raster::alloc::vec![::raster::core::trace::FnInputArg {
                         name: ::raster::alloc::string::String::from("input"),
-                        ty: ::raster::alloc::string::String::from(stringify!(::raster::AuthRef<::raster::alloc::vec::Vec<#item_ty>>)),
+                        ty: ::raster::alloc::string::String::from(stringify!(::raster::AuthRef<::raster::List<#item_ty>>)),
                     }],
                     storage: __raster_input_trace.storage.map(|internal| {
                         let mut map = ::raster::alloc::collections::BTreeMap::new();

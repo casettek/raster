@@ -7,7 +7,7 @@ use hello_tiles::*;
 fn personal_greet_seq(personal_data: PersonalData) -> Result<String> {
     let name = call!(maybe_echo_name, select!(String, personal_data.clone().name))?;
 
-    let addresses = select!(Vec<Address>, personal_data.addresses);
+    let addresses = select!(List<Address>, personal_data.addresses);
     let address = select!(Address, addresses[1]);
     let address_line = select!(String, address.lines[0]);
 
@@ -79,8 +79,8 @@ fn main(personal_data: PersonalData, personal_data_bin: PersonalData, seed: u64)
         select!(String, personal_data_bin.clone().addresses[0].lines[0])
     );
 
-    let selected_personal_data_bin = select!(PersonalData, personal_data_bin.clone());
-    call!(personal_greet_from_object, selected_personal_data_bin);
+    let selected_personal_data_bin_name = select!(String, personal_data_bin.clone().name);
+    call!(personal_greet_from_object, selected_personal_data_bin_name);
 
     let draft = new!(CollectiveGreeting);
     let draft = call!(
@@ -104,18 +104,18 @@ fn main(personal_data: PersonalData, personal_data_bin: PersonalData, seed: u64)
     let first_draft_line = select!(String, draft_greeting.lines[0]);
     call!(concat_messages, draft_title, first_draft_line);
 
-    let address_lines = select!(Vec<String>, personal_data_bin.clone().addresses[0].lines);
+    let address_lines = select!(List<String>, personal_data_bin.clone().addresses[0].lines);
 
     // Phase 1: select a contiguous slice of address lines as ONE authenticated
     // input. `lines[0..2]` yields a single SelectionCommitment, so the tile
     // records a single external binding for the whole slice.
     let first_two_lines =
-        select!(Vec<String>, personal_data_bin.clone().addresses[0].lines[0..2]);
+        select!(Block<String>, personal_data_bin.clone().addresses[0].lines[0..2]);
     let joined_lines = call!(join_address_lines, first_two_lines);
     println!("joined address slice: {:?}", joined_lines);
 
     // Phase 1: iterate the flat line list in chunks of 2. Each recur iteration
-    // receives a `Vec<String>` chunk instead of a single line, so the loop runs
+    // receives a `Block<String>` chunk instead of a single line, so the loop runs
     // ceil(len / 2) times while the source stays a single authenticated binding.
     let chunked_greeting = call_recur!(
         tile = collect_line_chunk,

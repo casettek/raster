@@ -35,9 +35,14 @@ pub fn personal_greet(name: String) -> String {
     greet
 }
 
+/// A tile that greets from a name selected out of a `PersonalData` object.
+///
+/// The tile takes only the scalar field it needs: `PersonalData` contains a
+/// `List<Address>`, so it is `Selectable` but not `Materializable` and cannot
+/// cross a tile boundary whole. Select the field, not the struct.
 #[tile(kind=iter)]
-pub fn personal_greet_from_object(personal_data: PersonalData) -> String {
-    let greet = format!("Hello from object, {}!!!!", personal_data.name);
+pub fn personal_greet_from_object(name: String) -> String {
+    let greet = format!("Hello from object, {}!!!!", name);
     println!("object greet: {}", greet);
 
     greet
@@ -61,13 +66,13 @@ pub fn greet_address_line(address_line: String) -> String {
     greet
 }
 
-/// Consumes a whole slice of address lines as a *single* authenticated input.
+/// Consumes a bounded window of address lines as a *single* authenticated input.
 ///
 /// The caller selects `...lines[0..2]` via `select!`, which produces one
-/// `SelectionCommitment` for the contiguous slice, so this tile records a
-/// single external binding instead of one per line.
+/// `SelectionCommitment` for the contiguous slice and yields a `Block<String>`,
+/// so this tile records a single external binding instead of one per line.
 #[tile(kind = iter)]
-pub fn join_address_lines(lines: alloc::vec::Vec<String>) -> String {
+pub fn join_address_lines(lines: Block<String>) -> String {
     let joined = lines.join(" | ");
     println!("joined slice ({} lines): {}", lines.len(), joined);
 
@@ -79,7 +84,7 @@ pub fn join_address_lines(lines: alloc::vec::Vec<String>) -> String {
 /// up to `N` lines and indexes them inline.
 #[tile(kind = recur)]
 pub fn collect_line_chunk(
-    input: RecurInput<alloc::vec::Vec<String>>,
+    input: RecurInput<Block<String>>,
     output: RecurOutput<CollectiveGreeting>,
     title: String,
 ) -> RecurOutput<CollectiveGreeting> {

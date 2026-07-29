@@ -339,6 +339,26 @@ fn parse_subtree_root(bytes: &[u8], offset: &mut usize) -> Option<Hash32> {
             Some(list_root_from_hashes(&child_roots, len))
         }
         0x03 => Some(selection_hash(&[b"unit"])),
+        // list-handle: `[root:32][len:8][inner_len:8][inner: a 0x02 list
+        // payload]`. The stored root is the list's Merkle root, so a parent
+        // struct's structural root is recomputed in O(1) — the inline elements
+        // are skipped, never re-Merkleized (see
+        // `docs/proposals/bounded-collections.md`, phase 2). The elements stay
+        // present so the list remains selectable; a selection *into* the list
+        // still proves each element against this same root, which is where a
+        // handle whose stored root disagrees with its elements is caught.
+        0x09 => {
+            let root_end = offset.checked_add(32)?;
+            let root: Hash32 = bytes.get(*offset..root_end)?.try_into().ok()?;
+            *offset = root_end;
+            let _len = parse_u64(bytes, offset)?;
+            let inner_len = parse_u64(bytes, offset)? as usize;
+            let inner_end = offset.checked_add(inner_len)?;
+            // Bounds-check the inline region, then skip it without parsing.
+            let _ = bytes.get(*offset..inner_end)?;
+            *offset = inner_end;
+            Some(root)
+        }
         0x04 => {
             let len = parse_u64(bytes, offset)?;
             let entry_count = len as usize;
@@ -883,17 +903,9 @@ impl_leaf_schema!(
     i8 => "i8"
 );
 
-impl<T> Selectable for Vec<T>
-where
-    T: Selectable,
-{
-    fn schema() -> SchemaNode {
-        SchemaNode::List {
-            type_name: "Vec".into(),
-            element: Box::new(T::schema()),
-        }
-    }
-}
+// `Vec<T>` is deliberately not `Selectable`: collections in Rastered data are
+// `List<T>` (unbounded, referenced) and `Block<T>` (bounded, materialized). Both
+// live in `crate::collections` and carry the `SchemaNode::List` schema.
 
 /// A private file-backed external input declared inside `input.json`.
 pub type ExternalInputPathEntry = String;

@@ -86,14 +86,31 @@ pub fn run(
         build_command.arg(features.join(","));
     }
 
-    let build_status = build_command
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
+    // Toolchain plumbing, not run output: cargo progress, dependency warnings,
+    // and the protocol guests' build chatter (raster-prover's build script)
+    // would bury the program's own output below. Kept back unless it fails.
+    let capture_build = !crate::utils::verbose_output();
+    let build_stdio = if capture_build {
+        Stdio::piped as fn() -> Stdio
+    } else {
+        Stdio::inherit as fn() -> Stdio
+    };
+    build_command.stdout(build_stdio()).stderr(build_stdio());
+    crate::utils::quiet_guest_build(&mut build_command);
+    let build = build_command
+        .output()
         .map_err(|e| Error::Other(format!("Failed to run cargo build: {}", e)))?;
 
-    if !build_status.success() {
-        return Err(Error::Other("cargo build failed".into()));
+    if !build.status.success() {
+        if capture_build {
+            // The one time this output is what the user needs.
+            std::io::stderr().write_all(&build.stdout).ok();
+            std::io::stderr().write_all(&build.stderr).ok();
+        }
+        return Err(Error::Other(format!(
+            "cargo build failed — {}",
+            crate::utils::VERBOSE_HINT
+        )));
     }
 
     let binary_path = project.target_dir.join("release").join(&project.name);

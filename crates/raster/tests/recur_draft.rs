@@ -50,13 +50,13 @@ where
 #[derive(Clone, Debug, Deserialize, Serialize, Selectable)]
 struct LineBundle {
     title: String,
-    items: Vec<String>,
+    items: List<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Selectable)]
 struct SearchBundle {
     needle: String,
-    matches: Vec<String>,
+    matches: List<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -73,7 +73,7 @@ impl Selectable for UnitLike {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, Selectable)]
 struct UnitLineBundle {
     marker: UnitLike,
-    items: Vec<String>,
+    items: List<String>,
 }
 
 // Output schema with no required scalar fields, so a recur sequence can
@@ -81,14 +81,14 @@ struct UnitLineBundle {
 // guard, where the step only materializes items).
 #[derive(Clone, Debug, Deserialize, Serialize, Selectable)]
 struct ItemsOnlyBundle {
-    items: Vec<String>,
+    items: List<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Selectable)]
 struct LimitedBundle {
     limit: u64,
     stopped_after: u64,
-    items: Vec<String>,
+    items: List<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -157,7 +157,7 @@ fn build_lines_reference() -> StorageRef {
 
     call_recur!(
         tile = collect_lines,
-        input = storage!(Vec<String>, source),
+        input = storage!(List<String>, source),
         output = new!(LineBundle),
         args = ()
     )
@@ -180,7 +180,7 @@ fn find_first_match(needle: String) -> SearchBundle {
 
     call_recur!(
         tile = collect_first_match,
-        input = storage!(Vec<String>, source),
+        input = storage!(List<String>, source),
         output = new!(SearchBundle),
         args = (needle,)
     )
@@ -192,7 +192,7 @@ fn collect_optional_lines_from_empty() -> UnitLineBundle {
 
     call_recur!(
         tile = collect_optional_lines,
-        input = storage!(Vec<String>, source),
+        input = storage!(List<String>, source),
         output = new!(UnitLineBundle),
         args = ()
     )
@@ -204,7 +204,7 @@ fn collect_required_lines_from_empty() -> LineBundle {
 
     call_recur!(
         tile = collect_lines,
-        input = storage!(Vec<String>, source),
+        input = storage!(List<String>, source),
         output = new!(LineBundle),
         args = ()
     )
@@ -320,7 +320,7 @@ fn collect_two_items(limit: u64) -> LimitedBundle {
 
     call_recur!(
         tile = collect_until_limit,
-        input = storage!(Vec<String>, source),
+        input = storage!(List<String>, source),
         state = LimitState { seen: 0 },
         output = new!(LimitedBundle),
         args = (limit,)
@@ -338,7 +338,7 @@ fn compute_max_len() -> MaxLenState {
 
     call_recur!(
         tile = track_max_len,
-        input = storage!(Vec<String>, source),
+        input = storage!(List<String>, source),
         state = MaxLenState { max_len: 0 },
         args = ()
     )
@@ -355,7 +355,7 @@ fn compute_max_len_field() -> u64 {
 
     let stats = call_recur!(
         tile = track_max_len,
-        input = storage!(Vec<String>, source),
+        input = storage!(List<String>, source),
         state = MaxLenState { max_len: 0 },
         args = ()
     );
@@ -374,7 +374,7 @@ fn count_seen_until_limit(limit: u64) -> LimitState {
 
     call_recur!(
         tile = count_until_limit_state_only,
-        input = storage!(Vec<String>, source),
+        input = storage!(List<String>, source),
         state = LimitState { seen: 0 },
         args = (limit,)
     )
@@ -386,7 +386,7 @@ fn state_only_empty_input() -> MaxLenState {
 
     call_recur!(
         tile = track_max_len,
-        input = storage!(Vec<String>, source),
+        input = storage!(List<String>, source),
         state = MaxLenState { max_len: 0 },
         args = ()
     )
@@ -407,7 +407,7 @@ fn build_prefixed_lines_with_recur_sequence() -> LineBundle {
 
     call_recur_seq!(
         sequence = collect_prefixed_lines,
-        input = storage!(Vec<String>, source),
+        input = storage!(List<String>, source),
         output = output,
         args = (storage!(String, prefix_source),)
     )
@@ -441,9 +441,9 @@ fn run_build_prefixed_lines_with_recur_sequence() -> LineBundle {
 
 fn resolve_counted_string_list(
     reference: StorageRef,
-) -> raster::core::Result<StorageValue<Vec<String>>> {
+) -> raster::core::Result<StorageValue<List<String>>> {
     RECUR_RESOLVE_COUNT.fetch_add(1, Ordering::SeqCst);
-    raster::resolve_storage_value::<Vec<String>>(reference)
+    raster::resolve_storage_value::<List<String>>(reference)
 }
 
 #[test]
@@ -489,7 +489,7 @@ fn call_recur_breaks_early_and_still_finalizes() {
     let result = run_find_first_match("beta".to_string());
 
     assert_eq!(result.needle, "beta");
-    assert_eq!(result.matches, vec!["beta".to_string()]);
+    assert_eq!(result.matches.into_vec(), vec!["beta".to_string()]);
 }
 
 #[test]
@@ -512,7 +512,7 @@ fn call_recur_threads_state_and_finalizes() {
 
     assert_eq!(result.limit, 2);
     assert_eq!(result.stopped_after, 2);
-    assert_eq!(result.items, vec!["one".to_string(), "two".to_string()]);
+    assert_eq!(result.items.into_vec(), vec!["one".to_string(), "two".to_string()]);
 }
 
 #[test]
@@ -549,7 +549,7 @@ fn call_recur_seq_orchestrates_tiles_per_item() {
 
     assert_eq!(result.title, "prefixed");
     assert_eq!(
-        result.items,
+        result.items.into_vec(),
         vec![
             "line: one".to_string(),
             "line: two".to_string(),
@@ -567,8 +567,8 @@ fn call_recur_resolves_internal_list_once_per_invocation() {
         "third".to_string(),
     ])
     .expect("list source should store");
-    let source = into_auth_ref::<Vec<String>, _>(
-        raster::typed_storage_with_resolver::<Vec<String>>(reference, resolve_counted_string_list),
+    let source = into_auth_ref::<List<String>, _>(
+        raster::typed_storage_with_resolver::<List<String>>(reference, resolve_counted_string_list),
     );
 
     RECUR_RESOLVE_COUNT.store(0, Ordering::SeqCst);
@@ -593,8 +593,8 @@ fn recur_sequence_resolves_internal_list_once_per_invocation() {
         "third".to_string(),
     ])
     .expect("list source should store");
-    let source = into_auth_ref::<Vec<String>, _>(
-        raster::typed_storage_with_resolver::<Vec<String>>(reference, resolve_counted_string_list),
+    let source = into_auth_ref::<List<String>, _>(
+        raster::typed_storage_with_resolver::<List<String>>(reference, resolve_counted_string_list),
     );
 
     RECUR_RESOLVE_COUNT.store(0, Ordering::SeqCst);

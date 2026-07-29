@@ -12,14 +12,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         name: "John".to_string(),
         addresses: vec![
             Address {
-                lines: vec!["221B Baker Street".to_string(), "Flat B".to_string()],
-                indexes: vec![7, 42],
+                lines: vec!["221B Baker Street".to_string(), "Flat B".to_string()].into(),
+                indexes: vec![7, 42].into(),
             },
             Address {
-                lines: vec!["Main Plaza".to_string()],
-                indexes: vec![3],
+                lines: vec!["Main Plaza".to_string()].into(),
+                indexes: vec![3].into(),
             },
-        ],
+        ]
+        .into(),
     };
     let seed: u64 = 123;
 

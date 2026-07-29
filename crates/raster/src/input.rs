@@ -7,7 +7,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 #[cfg(not(feature = "std"))]
 use alloc::format;
-#[cfg(not(feature = "std"))]
+pub use raster_core::collections::{Block, List, Materializable};
 use raster_core::draft::{draft_value_from_serialize, DraftOp};
 use raster_core::draft::{replay_handle_for_schema, DraftReplayHandle, DraftReplayTransition};
 pub use raster_core::input::{
@@ -1061,13 +1061,13 @@ where
 enum ResolvedRecurList<T> {
     Storage {
         reference: StorageRef,
-        value: Rc<StorageValue<Vec<T>>>,
+        value: Rc<StorageValue<List<T>>>,
     },
 }
 
 #[doc(hidden)]
 fn resolve_recur_list_source<T>(
-    source: &AuthRef<Vec<T>>,
+    source: &AuthRef<List<T>>,
 ) -> raster_core::Result<ResolvedRecurList<T>>
 where
     T: DeserializeOwned + Serialize,
@@ -1117,7 +1117,7 @@ impl<T> ResolvedRecurList<T> {
                         {
                             return Ok(selected);
                         }
-                        select_storage_value::<Vec<T>, T>(parent.as_ref(), &relative_selector)
+                        select_storage_value::<List<T>, T>(parent.as_ref(), &relative_selector)
                     }),
                     marker: PhantomData,
                 }))
@@ -1139,7 +1139,7 @@ where
     Ok(RecurInput::new(value, index, len))
 }
 
-fn resolve_recur_list<T>(source: &AuthRef<Vec<T>>) -> raster_core::Result<Vec<T>>
+fn resolve_recur_list<T>(source: &AuthRef<List<T>>) -> raster_core::Result<Vec<T>>
 where
     T: DeserializeOwned + Serialize,
 {
@@ -1149,42 +1149,45 @@ where
         )),
         AuthRef::Storage(binding) => {
             let current = (binding.resolve.as_ref())(binding.reference.clone())?;
-            Ok(current.value)
+            Ok(current.value.into_vec())
         }
     }
 }
 
-fn group_into_chunks<T>(items: Vec<T>, chunk: usize) -> Vec<Vec<T>> {
+fn group_into_chunks<T>(items: Vec<T>, chunk: usize) -> List<Block<T>> {
     let chunk = chunk.max(1);
-    let mut chunks = Vec::with_capacity(items.len().div_ceil(chunk));
+    let mut chunks: Vec<Block<T>> = Vec::with_capacity(items.len().div_ceil(chunk));
     let mut current = Vec::with_capacity(chunk);
     for item in items {
         current.push(item);
         if current.len() == chunk {
-            chunks.push(core::mem::replace(&mut current, Vec::with_capacity(chunk)));
+            chunks.push(Block::__from_selection(core::mem::replace(
+                &mut current,
+                Vec::with_capacity(chunk),
+            )));
         }
     }
     if !current.is_empty() {
-        chunks.push(current);
+        chunks.push(Block::__from_selection(current));
     }
-    chunks
+    List::from(chunks)
 }
 
-/// Adapt a flat list source `AuthRef<Vec<T>>` into a chunked source
-/// `AuthRef<Vec<Vec<T>>>` for `call_recur! { ..., chunk = N }`.
+/// Adapt a flat list source `AuthRef<List<T>>` into a chunked source
+/// `AuthRef<List<Block<T>>>` for `call_recur! { ..., chunk = N }`.
 ///
 /// The underlying source binding (name/selector/commitment for external,
 /// reference for internal) is preserved unchanged, so the trace still records a
 /// single authenticated binding for the whole collection. Only the resolved
-/// value is regrouped into contiguous chunks of `chunk` items (the final chunk
-/// may be shorter), turning per-element iteration into per-chunk iteration.
+/// value is regrouped into contiguous `Block`s of `chunk` items (the final block
+/// may be shorter), turning per-element iteration into per-block iteration.
 #[doc(hidden)]
-pub fn chunk_auth_ref<T>(source: AuthRef<Vec<T>>, chunk: usize) -> AuthRef<Vec<Vec<T>>>
+pub fn chunk_auth_ref<T>(source: AuthRef<List<T>>, chunk: usize) -> AuthRef<List<Block<T>>>
 where
     T: DeserializeOwned + Serialize + 'static,
 {
     match source {
-        AuthRef::Inline(items) => AuthRef::Inline(group_into_chunks(items, chunk)),
+        AuthRef::Inline(items) => AuthRef::Inline(group_into_chunks(items.into_vec(), chunk)),
         AuthRef::Storage(binding) => {
             let inner = binding.resolve.clone();
             AuthRef::Storage(DeferredAuthStorage {
@@ -1197,7 +1200,7 @@ where
                         resolved.bytes,
                         resolved.selector,
                         resolved.selection,
-                        group_into_chunks(resolved.value, chunk),
+                        group_into_chunks(resolved.value.into_vec(), chunk),
                     ))
                 }),
                 marker: PhantomData,
@@ -1246,6 +1249,20 @@ where
 
 pub trait IntoAuthValue<T> {
     fn into_auth_value(self) -> raster_core::Result<AuthValue<T>>;
+}
+
+/// The bounded tile-argument boundary: every plain tile argument is materialized
+/// through this trait, whose target `T` must be [`Materializable`]. `IntoAuthValue`
+/// remains the untyped mechanism (recur internals, state threading); a tile
+/// boundary only ever uses `IntoMaterialized`, so an unbounded collection — or an
+/// inline `vec![..]` literal — cannot cross it.
+pub trait IntoMaterialized<T: Materializable>: IntoAuthValue<T> {}
+
+impl<T, A> IntoMaterialized<T> for A
+where
+    T: Materializable,
+    A: IntoAuthValue<T>,
+{
 }
 
 pub trait IntoDraft<S: Schema> {
@@ -1672,7 +1689,7 @@ where
 
 #[doc(hidden)]
 pub fn run_recur_list<T, S, Step, Output>(
-    source: AuthRef<Vec<T>>,
+    source: AuthRef<List<T>>,
     output: Draft<S>,
     mut step: Step,
 ) -> AuthRef<S>
@@ -1720,7 +1737,7 @@ where
 
 #[doc(hidden)]
 pub fn run_recur_list_state<T, State, Step, Output>(
-    source: AuthRef<Vec<T>>,
+    source: AuthRef<List<T>>,
     state: RecurState<State>,
     mut step: Step,
 ) -> AuthRef<State>
@@ -1765,7 +1782,7 @@ where
 
 #[doc(hidden)]
 pub fn run_recur_list_with_state<T, State, S, Step, Output>(
-    source: AuthRef<Vec<T>>,
+    source: AuthRef<List<T>>,
     state: RecurState<State>,
     output: Draft<S>,
     mut step: Step,
@@ -1821,7 +1838,7 @@ where
 
 #[doc(hidden)]
 pub fn run_recur_sequence_list<T, S, Step, Output>(
-    source: AuthRef<Vec<T>>,
+    source: AuthRef<List<T>>,
     output: Draft<S>,
     mut step: Step,
 ) -> AuthRef<S>
@@ -1870,7 +1887,7 @@ where
 
 #[doc(hidden)]
 pub fn run_recur_sequence_list_state<T, State, Step, Output>(
-    source: AuthRef<Vec<T>>,
+    source: AuthRef<List<T>>,
     state: RecurState<State>,
     mut step: Step,
 ) -> AuthRef<State>
@@ -1916,7 +1933,7 @@ where
 
 #[doc(hidden)]
 pub fn run_recur_sequence_list_with_state<T, State, S, Step, Output>(
-    source: AuthRef<Vec<T>>,
+    source: AuthRef<List<T>>,
     state: RecurState<State>,
     output: Draft<S>,
     mut step: Step,
