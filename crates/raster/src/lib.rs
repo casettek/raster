@@ -17,22 +17,23 @@ pub use raster_core::draft;
 
 pub mod input;
 pub use input::{
-    auth_ref_result_trace, auth_ref_trace, chunk_auth_ref, draft_replay_handle,
-    draft_replay_transition, entry_argument_auth_ref, finalize,
-    into_auth_ref, into_auth_value, into_draft, materialize_auth_result, materialize_auth_return,
-    new_draft, raster_trace_payload, resolve_storage_ok_value, resolve_storage_value,
+    attach_index_bindings, auth_ref_result_trace, auth_ref_trace, chunk_auth_ref,
+    draft_replay_handle, draft_replay_transition, entry_argument_auth_ref, finalize,
+    index_binding_name, into_auth_ref, into_auth_value, into_auth_value_with_bindings, into_draft,
+    materialize_auth_result, materialize_auth_return, new_draft, push_bound_index,
+    raster_trace_payload, resolve_storage_ok_value, resolve_storage_value,
     restore_draft_from_replay_handle, run_recur_list, run_recur_list_state,
     run_recur_list_with_state, run_recur_sequence_list, run_recur_sequence_list_state,
     run_recur_sequence_list_with_state, select_source, select_stored_value, selector_path,
     serialize_draft_replay_handle, serialize_draft_trace, typed_selector_path, typed_storage,
     typed_storage_with_resolver, Anchor, AuthRef, AuthRefTrace, AuthValue, Block, Draft,
-    DraftAppendField, DraftSetField, IntoAuthRef, IntoAuthValue, IntoDraft, IntoRecurControl,
-    IntoMaterialized, List, ListProofDirection, Materializable,
-    ListProofSibling, Op, RecurControl, RecurInput, RecurOutput, RecurSequenceInput,
-    RecurSequenceOutput, RecurSequenceState, RecurState, Schema, SchemaField, SchemaFieldMode,
-    SchemaNode, SelectSource, Selectable, SelectedPayload, SelectionCommitment, SelectionProof,
-    SelectionProofStep, SelectionWitness, SelectorPath, SelectorSegment, StorageRef, StorageValue,
-    TypedSelectorPath, TypedStorageBinding,
+    DraftAppendField, DraftSetField, IndexBinding, IndexSource, IndexWidth, IntoAuthRef,
+    IntoAuthValue, IntoDraft, IntoMaterialized, IntoRecurControl, List, ListProofDirection,
+    ListProofSibling, Materializable, Op, RecurControl, RecurInput, RecurOutput,
+    RecurSequenceInput, RecurSequenceOutput, RecurSequenceState, RecurState, Schema, SchemaField,
+    SchemaFieldMode, SchemaNode, SelectSource, Selectable, SelectedPayload, SelectionCommitment,
+    SelectionProof, SelectionProofStep, SelectionWitness, SelectorPath, SelectorSegment,
+    StorageRef, StorageValue, TypedSelectorPath, TypedStorageBinding,
 };
 
 #[cfg(feature = "std")]
@@ -648,12 +649,13 @@ pub mod prelude {
     pub use crate::{
         call, call_recur, call_recur_seq, call_seq, finalize, into_auth_ref, into_draft,
         materialize_auth_result, materialize_auth_return, new, select, sequence, storage, tile,
-        Anchor, AuthRef, AuthValue, Block, Draft, IntoAuthRef, IntoAuthValue, IntoDraft, List,
-        Materializable, ListProofDirection, ListProofSibling, Op, RecurControl, RecurInput, RecurOutput,
-        RecurSequenceInput, RecurSequenceOutput, RecurSequenceState, RecurState, Schema,
-        SchemaField, SchemaFieldMode, SchemaNode, SelectSource, Selectable, SelectedPayload,
-        SelectionProof, SelectionProofStep, SelectorPath, SelectorSegment, StorageRef,
-        StorageValue, TypedSelectorPath, TypedStorageBinding,
+        Anchor, AuthRef, AuthValue, Block, Draft, IndexSource, IndexWidth, IntoAuthRef,
+        IntoAuthValue, IntoDraft, List, ListProofDirection, ListProofSibling, Materializable, Op,
+        RecurControl, RecurInput, RecurOutput, RecurSequenceInput, RecurSequenceOutput,
+        RecurSequenceState, RecurState, Schema, SchemaField, SchemaFieldMode, SchemaNode,
+        SelectSource, Selectable, SelectedPayload, SelectionProof, SelectionProofStep,
+        SelectorPath, SelectorSegment, StorageRef, StorageValue, TypedSelectorPath,
+        TypedStorageBinding,
     };
 
     // TODO: Re-enable once Executor/Tracer types are implemented

@@ -22,7 +22,7 @@ use alloc::vec::Vec;
 use core::ops::{Deref, DerefMut};
 use serde::{Deserialize, Serialize};
 
-use crate::input::{Selectable, SchemaNode};
+use crate::input::{SchemaNode, Selectable};
 
 /// A value bounded enough to be materialized whole into one replay unit.
 ///
@@ -49,9 +49,22 @@ macro_rules! impl_materializable_scalar {
     ($($ty:ty),* $(,)?) => { $(impl Materializable for $ty {})* };
 }
 impl_materializable_scalar!(
-    (), bool, char, String,
-    u8, u16, u32, u64, u128, usize,
-    i8, i16, i32, i64, i128, isize,
+    (),
+    bool,
+    char,
+    String,
+    u8,
+    u16,
+    u32,
+    u64,
+    u128,
+    usize,
+    i8,
+    i16,
+    i32,
+    i64,
+    i128,
+    isize,
 );
 
 impl<T: Materializable> Materializable for Option<T> {}

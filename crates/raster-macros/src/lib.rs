@@ -9,7 +9,8 @@ mod entrypoint;
 mod recur;
 
 use proc_macro::TokenStream;
-use quote::{format_ident, quote, ToTokens};
+use quote::{format_ident, quote, quote_spanned, ToTokens};
+use syn::spanned::Spanned;
 use syn::{
     parse::{Parse, ParseStream},
     parse_macro_input, Attribute, Expr, ExprField, ExprIndex, FnArg, GenericArgument, ItemFn,
@@ -321,6 +322,33 @@ fn internal_info_ident(param: &ParamInfo) -> syn::Ident {
     format_ident!("__raster_internal_info_{}", param.ident)
 }
 
+/// Ident holding the index citations carried by one argument's path.
+///
+/// Separate from [`internal_info_ident`] because these bindings go into the
+/// step's storage map under their *own* names, not the parameter's — they have
+/// no `args`/`values` entry at all (see `dynamic-index-selection.md` §2).
+fn index_bindings_ident(param: &ParamInfo) -> syn::Ident {
+    format_ident!("__raster_index_bindings_{}", param.ident)
+}
+
+/// Statement that merges one argument's index citations into the step's storage
+/// map, shared by every input-assembly site.
+///
+/// Insertion is by the binding's own content-derived name, so two arguments
+/// citing the same authorized index collapse to one entry — which is what makes
+/// "the same index" mean the same index.
+fn index_binding_insert(param: &ParamInfo) -> proc_macro2::TokenStream {
+    let ident = index_bindings_ident(param);
+    quote! {
+        for (__raster_index_name, __raster_index_data) in #ident.iter() {
+            __raster_internal.insert(
+                __raster_index_name.clone(),
+                __raster_index_data.clone(),
+            );
+        }
+    }
+}
+
 fn sequence_root_ident(index: usize) -> syn::Ident {
     format_ident!("__RasterRoot{}", index)
 }
@@ -344,10 +372,12 @@ fn gen_auth_value_materialization(input: &ItemFn) -> proc_macro2::TokenStream {
             let internal_info_ident = internal_info_ident(param);
             match protocol_kind {
                 ParamProtocolKind::AuthValue(value_ty) => {
+                    let index_bindings_ident = index_bindings_ident(param);
                     if profiling_enabled {
                         quote! {
                             let __raster_auth_value_start = ::raster::__private::profile_now();
-                            let __raster_auth_value = ::raster::into_auth_value::<#value_ty, _>(#name)
+                            let (__raster_auth_value, #index_bindings_ident) =
+                                ::raster::into_auth_value_with_bindings::<#value_ty, _>(#name)
                                 .unwrap_or_else(|e| panic!("Failed to materialize auth value for argument '{}': {}", stringify!(#name), e));
                             let __raster_auth_value_duration_ns =
                                 ::core::primitive::u64::try_from(__raster_auth_value_start.elapsed().as_nanos())
@@ -361,7 +391,8 @@ fn gen_auth_value_materialization(input: &ItemFn) -> proc_macro2::TokenStream {
                         }
                     } else {
                         quote! {
-                            let __raster_auth_value = ::raster::into_auth_value::<#value_ty, _>(#name)
+                            let (__raster_auth_value, #index_bindings_ident) =
+                                ::raster::into_auth_value_with_bindings::<#value_ty, _>(#name)
                                 .unwrap_or_else(|e| panic!("Failed to materialize auth value for argument '{}': {}", stringify!(#name), e));
                             let #internal_info_ident = __raster_auth_value.as_storage().cloned();
                             let #name: #value_ty = __raster_auth_value.into_inner();
@@ -370,9 +401,15 @@ fn gen_auth_value_materialization(input: &ItemFn) -> proc_macro2::TokenStream {
                 }
                 ParamProtocolKind::Draft(value_ty) | ParamProtocolKind::RecurOutput(value_ty) => {
                     let schema_ty = draft_param_schema(param).expect("draft schema type");
+                    let index_bindings_ident = index_bindings_ident(param);
                     quote! {
                         let #name: #value_ty = ::raster::into_draft::<#schema_ty, _>(#name);
                         let #internal_info_ident: ::core::option::Option<::raster::StorageValue<#value_ty>> = ::core::option::Option::None;
+                        // A draft is written, not selected: it has no path and
+                        // so cites nothing. Bound anyway so the assembly site
+                        // has one shape per parameter.
+                        let #index_bindings_ident: ::raster::alloc::vec::Vec<::raster::IndexBinding> =
+                            ::raster::alloc::vec::Vec::new();
                     }
                 },
             }
@@ -393,11 +430,13 @@ fn gen_sequence_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream 
             let name = &param.ident;
             let trace_value_ident = format_ident!("__raster_input_value_{}", name);
             let internal_info_ident = internal_info_ident(param);
+            let index_bindings_ident = index_bindings_ident(param);
             quote! {
                 let __raster_auth_trace = ::raster::auth_ref_trace(&#name)
                     .unwrap_or_else(|e| panic!("Failed to trace sequence argument '{}': {}", stringify!(#name), e));
                 let #trace_value_ident = __raster_auth_trace.value;
                 let #internal_info_ident = __raster_auth_trace.storage;
+                let #index_bindings_ident = __raster_auth_trace.index_bindings;
             }
         })
         .collect();
@@ -444,6 +483,7 @@ fn gen_sequence_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream 
         .map(|param| {
             let name_str = param.ident.to_string();
             let internal_info_ident = internal_info_ident(param);
+            let index_bindings = index_binding_insert(param);
             quote! {
                 if let ::core::option::Option::Some(__raster_internal_info) = &#internal_info_ident {
                     __raster_internal.insert(
@@ -451,6 +491,7 @@ fn gen_sequence_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream 
                         __raster_internal_info.clone(),
                     );
                 }
+                #index_bindings
             }
         })
         .collect();
@@ -502,12 +543,22 @@ fn gen_recur_sequence_input_serialization(input: &ItemFn) -> proc_macro2::TokenS
             let name = &param.ident;
             let trace_value_ident = format_ident!("__raster_input_value_{}", name);
             let internal_info_ident = internal_info_ident(param);
+            let index_bindings_ident = index_bindings_ident(param);
+            // Every branch binds `index_bindings_ident`: the inline forms
+            // (drafts, recur outputs, recur state) have no selector path and so
+            // cite nothing, but the assembly site expects one shape per
+            // parameter.
+            let no_citations = quote! {
+                let #index_bindings_ident: ::raster::alloc::vec::Vec<::raster::IndexBinding> =
+                    ::raster::alloc::vec::Vec::new();
+            };
             if recur_sequence_input_inner_type(&param.ty).is_some() {
                 quote! {
                     let __raster_auth_trace = #name.__raster_auth_trace()
                         .unwrap_or_else(|e| panic!("Failed to trace recursive sequence input '{}': {}", stringify!(#name), e));
                     let #trace_value_ident = __raster_auth_trace.value;
                     let #internal_info_ident = __raster_auth_trace.storage;
+                    let #index_bindings_ident = __raster_auth_trace.index_bindings;
                 }
             } else if let Some(schema_ty) = draft_param_schema(param) {
                 quote! {
@@ -516,6 +567,7 @@ fn gen_recur_sequence_input_serialization(input: &ItemFn) -> proc_macro2::TokenS
                     );
                     let #internal_info_ident: ::core::option::Option<::raster::core::trace::StorageData> =
                         ::core::option::Option::None;
+                    #no_citations
                 }
             } else if recur_sequence_output_inner_type(&param.ty).is_some() {
                 quote! {
@@ -524,6 +576,7 @@ fn gen_recur_sequence_input_serialization(input: &ItemFn) -> proc_macro2::TokenS
                     );
                     let #internal_info_ident: ::core::option::Option<::raster::core::trace::StorageData> =
                         ::core::option::Option::None;
+                    #no_citations
                 }
             } else if recur_sequence_state_inner_type(&param.ty).is_some() {
                 quote! {
@@ -532,6 +585,7 @@ fn gen_recur_sequence_input_serialization(input: &ItemFn) -> proc_macro2::TokenS
                     );
                     let #internal_info_ident: ::core::option::Option<::raster::core::trace::StorageData> =
                         ::core::option::Option::None;
+                    #no_citations
                 }
             } else {
                 quote! {
@@ -539,6 +593,7 @@ fn gen_recur_sequence_input_serialization(input: &ItemFn) -> proc_macro2::TokenS
                         .unwrap_or_else(|e| panic!("Failed to trace recursive sequence argument '{}': {}", stringify!(#name), e));
                     let #trace_value_ident = __raster_auth_trace.value;
                     let #internal_info_ident = __raster_auth_trace.storage;
+                    let #index_bindings_ident = __raster_auth_trace.index_bindings;
                 }
             }
         })
@@ -570,6 +625,7 @@ fn gen_recur_sequence_input_serialization(input: &ItemFn) -> proc_macro2::TokenS
         .map(|param| {
             let name_str = param.ident.to_string();
             let internal_info_ident = internal_info_ident(param);
+            let index_bindings = index_binding_insert(param);
             quote! {
                 if let ::core::option::Option::Some(__raster_internal_info) = &#internal_info_ident {
                     __raster_internal.insert(
@@ -577,6 +633,7 @@ fn gen_recur_sequence_input_serialization(input: &ItemFn) -> proc_macro2::TokenS
                         __raster_internal_info.clone(),
                     );
                 }
+                #index_bindings
             }
         })
         .collect();
@@ -1260,6 +1317,7 @@ fn gen_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream {
         .map(|param| {
             let name_str = param.ident.to_string();
             let internal_info_ident = internal_info_ident(param);
+            let index_bindings = index_binding_insert(param);
             quote! {
                 if let ::core::option::Option::Some(__raster_internal_info) = &#internal_info_ident {
                     __raster_internal.insert(
@@ -1272,6 +1330,7 @@ fn gen_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream {
                         }
                     );
                 }
+                #index_bindings
             }
         })
         .collect();
@@ -2739,8 +2798,7 @@ fn split_selector_expr(expr: Expr) -> (Expr, Vec<proc_macro2::TokenStream>) {
                         panic!("select! only supports integer literal indexes");
                     };
                     let value = expr_lit.lit.to_token_stream();
-                    segments
-                        .push(quote! { ::raster::SelectorSegment::Index((#value) as u64) });
+                    segments.push(quote! { ::raster::SelectorSegment::Index((#value) as u64) });
                 }
                 Expr::Range(expr_range) => {
                     let syn::RangeLimits::HalfOpen(_) = expr_range.limits else {
@@ -2756,7 +2814,35 @@ fn split_selector_expr(expr: Expr) -> (Expr, Vec<proc_macro2::TokenStream>) {
                         }
                     });
                 }
-                _ => panic!("select! only supports integer literal indexes or `start..end` ranges"),
+                // A bare binding in scope supplies the index at run time. Only a
+                // *path* is accepted — no arithmetic, no calls, no literals
+                // mixed in — because anything computed in a sequence body has
+                // no lineage (SKILL.md §4), and an index without lineage is one
+                // a prover could choose. The `IndexSource` bound then rejects
+                // any such binding that is not an authorized unsigned integer,
+                // so `rows[some_string]` and `rows[-1]` are type errors.
+                // Borrowed, not moved: one authorized index may locate several
+                // values in the same body, and `.clone()` is not expressible
+                // here (it is a computed index by this grammar).
+                //
+                // Spanned to the index expression so the `IndexSource` bound —
+                // which is how a non-integer or unauthorized index is rejected —
+                // reports against the offending index rather than the whole
+                // `select!`.
+                Expr::Path(path_expr) => {
+                    let span = path_expr.span();
+                    segments.push(quote_spanned! { span =>
+                        ::raster::push_bound_index(
+                            &mut __raster_index_bindings,
+                            &#path_expr,
+                        )
+                    });
+                }
+                _ => panic!(
+                    "select! index must be an integer literal, a `start..end` range, \
+                     or a binding in scope; computed indexes have no lineage — \
+                     move the computation into a tile"
+                ),
             }
             (base_expr, segments)
         }
@@ -2818,13 +2904,30 @@ pub fn select(item: TokenStream) -> TokenStream {
 
     let (base_expr, segments) = split_selector_expr(expr);
 
+    // The sink collects the storage bindings that authorize any dynamic index in
+    // this path. It is always declared (an unused empty `Vec` costs nothing and
+    // keeps one expansion shape), filled by `push_bound_index` as the segment
+    // vector is built, and then attached to the reference the selection produced
+    // so that whatever step reads it also records them. Order matters: the
+    // segments must be evaluated before `attach_index_bindings` sees the sink.
     TokenStream::from(quote! {
-        ::raster::select_source(
-            #base_expr,
-            ::raster::typed_selector_path::<_, #selected_ty>(
-                ::raster::SelectorPath::new(::raster::alloc::vec![#(#segments),*]),
-            ),
-        )
+        {
+            // `mut` is only exercised by a dynamic index; a literal-index
+            // selection must not emit an `unused_mut` warning in user code.
+            #[allow(unused_mut)]
+            let mut __raster_index_bindings: ::raster::alloc::vec::Vec<::raster::IndexBinding> =
+                ::raster::alloc::vec::Vec::new();
+            let __raster_selector_segments = ::raster::alloc::vec![#(#segments),*];
+            ::raster::attach_index_bindings(
+                ::raster::select_source(
+                    #base_expr,
+                    ::raster::typed_selector_path::<_, #selected_ty>(
+                        ::raster::SelectorPath::new(__raster_selector_segments),
+                    ),
+                ),
+                __raster_index_bindings,
+            )
+        }
     })
 }
 
@@ -2871,9 +2974,9 @@ pub fn derive_selectable(item: TokenStream) -> TokenStream {
     // other structs we emit a where-bounded impl; the concrete field bounds hold
     // for scalar/`Block`/materializable-struct fields and, if a field type is
     // itself non-materializable, the impl simply does not apply.
-    let has_unbounded_field = fields
-        .iter()
-        .any(|field| list_element_type(&field.ty).is_some() || vec_element_type(&field.ty).is_some());
+    let has_unbounded_field = fields.iter().any(|field| {
+        list_element_type(&field.ty).is_some() || vec_element_type(&field.ty).is_some()
+    });
     let materializable_impl = if has_unbounded_field {
         quote! {}
     } else {

@@ -16,8 +16,8 @@
 //! `raster-runtime`/the guests need no chain-specific change.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use serde::Deserialize;
@@ -126,14 +126,18 @@ pub fn run(chain: Option<&str>, window_size: usize) -> Result<()> {
         read_program_identity(&project, &stage.name)?;
     }
 
-    let fraud_proof_config = FraudProofConfig::from_window_size(window_size)
-        .map_err(|e| Error::Other(e.to_string()))?;
+    let fraud_proof_config =
+        FraudProofConfig::from_window_size(window_size).map_err(|e| Error::Other(e.to_string()))?;
 
     let chain_dir = chains_root().join(chain_run_id());
     std::fs::create_dir_all(&chain_dir)
         .map_err(|e| Error::Other(format!("failed to create {}: {e}", chain_dir.display())))?;
 
-    println!("chain run  {}  ({} stages)", chain_run_id_label(&chain_dir), spec.stages.len());
+    println!(
+        "chain run  {}  ({} stages)",
+        chain_run_id_label(&chain_dir),
+        spec.stages.len()
+    );
     println!("  dir: {}", chain_dir.display());
     println!();
 
@@ -143,13 +147,19 @@ pub fn run(chain: Option<&str>, window_size: usize) -> Result<()> {
     let stage_count = spec.stages.len();
     for (idx, stage) in spec.stages.iter().enumerate() {
         let is_terminal = idx + 1 == stage_count;
-        println!("▸ stage {}/{}  {}   ({})", idx + 1, stage_count, stage.name, stage.project);
+        println!(
+            "▸ stage {}/{}  {}   ({})",
+            idx + 1,
+            stage_count,
+            stage.name,
+            stage.project
+        );
 
         let project = Project::new(base_dir.join(&stage.project))
             .map_err(|e| Error::Other(format!("stage '{}': {e}", stage.name)))?;
-        let cfs = CfsBuilder::new(&project)
-            .build()
-            .map_err(|e| Error::Other(format!("stage '{}': failed to build CFS: {e}", stage.name)))?;
+        let cfs = CfsBuilder::new(&project).build().map_err(|e| {
+            Error::Other(format!("stage '{}': failed to build CFS: {e}", stage.name))
+        })?;
 
         // Fail fast, before running anything, if a non-terminal stage produces
         // no output to feed downstream (rather than discovering it mid-chain).
@@ -169,7 +179,14 @@ pub fn run(chain: Option<&str>, window_size: usize) -> Result<()> {
         // bindings: external inputs copy through; `from` inputs resolve to the
         // producing stage's `output.bin`/`output.rindex` and its structural
         // commitment, under this parameter's name.
-        let synth = synthesize_inputs(stage, &stage_dir, &base_dir, &chain_dir, &checkpoints, &stage_index)?;
+        let synth = synthesize_inputs(
+            stage,
+            &stage_dir,
+            &base_dir,
+            &chain_dir,
+            &checkpoints,
+            &stage_index,
+        )?;
         println!("    build & run …");
 
         let (trace, _recorder) = build_and_run_stage(
@@ -184,8 +201,11 @@ pub fn run(chain: Option<&str>, window_size: usize) -> Result<()> {
             TraceCommitment::try_build(&trace, &EMPTY_TRIE_NODES[0], fraud_proof_config)
                 .map_err(|e| Error::Other(e.to_string()))?;
         let commit_path = stage_dir.join("commit.bin");
-        std::fs::write(&commit_path, postcard::to_allocvec(&trace_commitment).unwrap())
-            .map_err(|e| Error::Other(format!("failed to write {}: {e}", commit_path.display())))?;
+        std::fs::write(
+            &commit_path,
+            postcard::to_allocvec(&trace_commitment).unwrap(),
+        )
+        .map_err(|e| Error::Other(format!("failed to write {}: {e}", commit_path.display())))?;
         // The checkpoint carries the commitment's compact identity, not the
         // trace-sized commitment itself; `commit.bin` stays a stage artifact
         // and `chain audit` re-derives the digest from it.
@@ -220,10 +240,20 @@ pub fn run(chain: Option<&str>, window_size: usize) -> Result<()> {
         println!();
     }
 
-    let chain = ChainCommitment { stages: checkpoints };
+    let chain = ChainCommitment {
+        stages: checkpoints,
+    };
     let chain_commitment_path = chain_dir.join(CHAIN_COMMITMENT_FILE);
-    std::fs::write(&chain_commitment_path, postcard::to_allocvec(&chain).unwrap())
-        .map_err(|e| Error::Other(format!("failed to write {}: {e}", chain_commitment_path.display())))?;
+    std::fs::write(
+        &chain_commitment_path,
+        postcard::to_allocvec(&chain).unwrap(),
+    )
+    .map_err(|e| {
+        Error::Other(format!(
+            "failed to write {}: {e}",
+            chain_commitment_path.display()
+        ))
+    })?;
 
     println!("chain-commitment → {}", chain_commitment_path.display());
     println!("chain digest: {}", hex::encode(chain.digest()));
@@ -283,7 +313,11 @@ fn load_recorded_chain(
 /// the honest trace against the stage's committed `commit.bin` — the
 /// challenger path that catches intra-stage execution fraud (reported, not
 /// proven; `chain fraud-prove` produces the receipt).
-pub fn audit(manifest: Option<&str>, chain_commitment: Option<&str>, execution: bool) -> Result<()> {
+pub fn audit(
+    manifest: Option<&str>,
+    chain_commitment: Option<&str>,
+    execution: bool,
+) -> Result<()> {
     let recorded = load_recorded_chain(manifest, chain_commitment)?;
     let RecordedChain {
         spec,
@@ -350,7 +384,10 @@ pub fn audit(manifest: Option<&str>, chain_commitment: Option<&str>, execution: 
                     stage.name
                 )));
             }
-            println!("  output   ✓  payload={}", short_hex(&out.payload_commitment));
+            println!(
+                "  output   ✓  payload={}",
+                short_hex(&out.payload_commitment)
+            );
         }
 
         // 3. Commitment binding — the stage's `commit.bin` must be the exact
@@ -389,7 +426,8 @@ pub fn audit(manifest: Option<&str>, chain_commitment: Option<&str>, execution: 
                         stage.name
                     )));
                 }
-                let expected = hex::encode(&chain.stages[producer_idx].output_structural_commitment);
+                let expected =
+                    hex::encode(&chain.stages[producer_idx].output_structural_commitment);
                 let actual = manifest.get(param).cloned().unwrap_or_default();
                 if actual != expected {
                     return Err(Error::Other(format!(
@@ -472,9 +510,9 @@ fn detect_execution_fraud(recorded: &RecordedChain) -> Result<Option<StageExecut
         let stage_dir = recorded.chain_dir.join(&stage.name);
         let project = Project::new(recorded.base_dir.join(&stage.project))
             .map_err(|e| Error::Other(format!("stage '{}': {e}", stage.name)))?;
-        let cfs = CfsBuilder::new(&project)
-            .build()
-            .map_err(|e| Error::Other(format!("stage '{}': failed to build CFS: {e}", stage.name)))?;
+        let cfs = CfsBuilder::new(&project).build().map_err(|e| {
+            Error::Other(format!("stage '{}': failed to build CFS: {e}", stage.name))
+        })?;
 
         let audit_dir = stage_dir.join("audit");
         std::fs::create_dir_all(&audit_dir)
@@ -486,7 +524,12 @@ fn detect_execution_fraud(recorded: &RecordedChain) -> Result<Option<StageExecut
         let input_json_path = stage_dir.join("input.json");
         let input_manifest_path = stage_dir.join("input_manifest.json");
 
-        println!("  stage {}/{}  {}  (re-running)", stage_index + 1, recorded.spec.stages.len(), stage.name);
+        println!(
+            "  stage {}/{}  {}  (re-running)",
+            stage_index + 1,
+            recorded.spec.stages.len(),
+            stage.name
+        );
         let (trace, recorder) = build_and_run_stage(
             &project,
             &cfs,
@@ -496,9 +539,8 @@ fn detect_execution_fraud(recorded: &RecordedChain) -> Result<Option<StageExecut
         )?;
 
         let trace_commitment = read_stage_trace_commitment(&stage_dir)?;
-        let mut verifier =
-            TraceVerifier::new(trace_commitment.clone(), &EMPTY_TRIE_NODES[0], &cfs)
-                .map_err(|e| Error::Other(e.to_string()))?;
+        let mut verifier = TraceVerifier::new(trace_commitment.clone(), &EMPTY_TRIE_NODES[0], &cfs)
+            .map_err(|e| Error::Other(e.to_string()))?;
         match verifier.verify(&trace) {
             VerificationResult::Ok => println!("    execution ✓"),
             VerificationResult::Fraud(evidence) => {
@@ -542,8 +584,9 @@ fn detect_link_fraud(recorded: &RecordedChain) -> Result<Option<(usize, String, 
             .chain_dir
             .join(&checkpoint.name)
             .join("input_manifest.json");
-        let manifest_bytes = std::fs::read(&manifest_path)
-            .map_err(|e| Error::Other(format!("failed to read {}: {e}", manifest_path.display())))?;
+        let manifest_bytes = std::fs::read(&manifest_path).map_err(|e| {
+            Error::Other(format!("failed to read {}: {e}", manifest_path.display()))
+        })?;
         if Sha256::digest(&manifest_bytes).to_vec() != checkpoint.input_manifest_commitment {
             // Without the checkpoint's manifest preimage no in-proof Link
             // fault can be exhibited from this artifact; the mismatch itself
@@ -553,7 +596,8 @@ fn detect_link_fraud(recorded: &RecordedChain) -> Result<Option<(usize, String, 
 
         let manifest = read_input_manifest(&recorded.chain_dir.join(&checkpoint.name))?;
         for (param, producer_index) in chained {
-            let producer_output = &recorded.chain.stages[producer_index].output_structural_commitment;
+            let producer_output =
+                &recorded.chain.stages[producer_index].output_structural_commitment;
             let actual = manifest.get(param).cloned().unwrap_or_default();
             if actual != hex::encode(producer_output) {
                 return Ok(Some((stage_index, param.clone(), manifest_bytes)));
@@ -585,7 +629,10 @@ fn write_chain_fraud_receipt(
         .unwrap_or("?");
     println!();
     println!("chain fraud proven ✓ → {}", receipt_path.display());
-    println!("  chain digest: {}", hex::encode(journal.chain_commitment_digest));
+    println!(
+        "  chain digest: {}",
+        hex::encode(journal.chain_commitment_digest)
+    );
     println!(
         "  faulty stage: {} '{}'  ({:?})",
         journal.faulty_stage, stage_name, journal.fault
@@ -699,7 +746,10 @@ pub fn fraud_verify(
         .map(|s| s.name.as_str())
         .unwrap_or("?");
     println!("chain fraud receipt verified ✓");
-    println!("  chain digest: {}", hex::encode(journal.chain_commitment_digest));
+    println!(
+        "  chain digest: {}",
+        hex::encode(journal.chain_commitment_digest)
+    );
     println!(
         "  faulty stage: {} '{}'  ({:?})",
         journal.faulty_stage, stage_name, journal.fault
@@ -836,7 +886,12 @@ fn synthesize_inputs(
                     Some(p) => absolute(base_dir, p),
                     None => path.with_extension("rindex"),
                 };
-                (path, index_path, ext.commitment.clone(), InputBindingSource::External)
+                (
+                    path,
+                    index_path,
+                    ext.commitment.clone(),
+                    InputBindingSource::External,
+                )
             }
             InputBinding::From(producer) => {
                 let producer_idx = *stage_index.get(producer).ok_or_else(|| {
@@ -846,8 +901,12 @@ fn synthesize_inputs(
                     ))
                 })?;
                 let producer_dir = chain_dir.join(producer);
-                let commitment = hex::encode(&checkpoints[producer_idx].output_structural_commitment);
-                if checkpoints[producer_idx].output_structural_commitment.is_empty() {
+                let commitment =
+                    hex::encode(&checkpoints[producer_idx].output_structural_commitment);
+                if checkpoints[producer_idx]
+                    .output_structural_commitment
+                    .is_empty()
+                {
                     return Err(Error::Other(format!(
                         "stage '{}': parameter '{param}' is fed from '{producer}', which produced no output",
                         stage.name
@@ -857,7 +916,9 @@ fn synthesize_inputs(
                     producer_dir.join("output.bin"),
                     producer_dir.join("output.rindex"),
                     commitment,
-                    InputBindingSource::Chained { stage: producer_idx },
+                    InputBindingSource::Chained {
+                        stage: producer_idx,
+                    },
                 )
             }
         };
@@ -885,10 +946,22 @@ fn synthesize_inputs(
     let input_manifest_bytes = serde_json::to_vec_pretty(&input_manifest)
         .map_err(|e| Error::Other(format!("failed to serialize input manifest: {e}")))?;
 
-    std::fs::write(&input_json_path, serde_json::to_vec_pretty(&input_json).unwrap())
-        .map_err(|e| Error::Other(format!("failed to write {}: {e}", input_json_path.display())))?;
-    std::fs::write(&input_manifest_path, &input_manifest_bytes)
-        .map_err(|e| Error::Other(format!("failed to write {}: {e}", input_manifest_path.display())))?;
+    std::fs::write(
+        &input_json_path,
+        serde_json::to_vec_pretty(&input_json).unwrap(),
+    )
+    .map_err(|e| {
+        Error::Other(format!(
+            "failed to write {}: {e}",
+            input_json_path.display()
+        ))
+    })?;
+    std::fs::write(&input_manifest_path, &input_manifest_bytes).map_err(|e| {
+        Error::Other(format!(
+            "failed to write {}: {e}",
+            input_manifest_path.display()
+        ))
+    })?;
 
     Ok(SynthesizedInputs {
         input_json_path,
@@ -918,7 +991,10 @@ fn collect_output(stage_dir: &Path) -> Result<StageOutput> {
 
     let payload_commitment = Sha256::digest(&bytes).to_vec();
     let structural = payload_structural_root(&bytes).ok_or_else(|| {
-        Error::Other(format!("{} is not a well-formed raster payload", output_bin.display()))
+        Error::Other(format!(
+            "{} is not a well-formed raster payload",
+            output_bin.display()
+        ))
     })?;
     let structural_commitment = structural.to_vec();
 
@@ -1163,7 +1239,10 @@ fn validate_stage_names(spec: &ChainSpec) -> Result<()> {
     let mut seen = std::collections::HashSet::new();
     for stage in &spec.stages {
         if !seen.insert(stage.name.as_str()) {
-            return Err(Error::Other(format!("duplicate stage name '{}'", stage.name)));
+            return Err(Error::Other(format!(
+                "duplicate stage name '{}'",
+                stage.name
+            )));
         }
     }
     Ok(())
@@ -1188,7 +1267,9 @@ fn chains_root() -> PathBuf {
 
 fn chain_run_id() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
     format!("{:020}-pid{}", now.as_nanos(), std::process::id())
 }
 
@@ -1312,8 +1393,16 @@ encoding = "raster"
     fn duplicate_stage_names_rejected() {
         let spec = ChainSpec {
             stages: vec![
-                StageSpec { name: "s".into(), project: "a".into(), inputs: BTreeMap::new() },
-                StageSpec { name: "s".into(), project: "b".into(), inputs: BTreeMap::new() },
+                StageSpec {
+                    name: "s".into(),
+                    project: "a".into(),
+                    inputs: BTreeMap::new(),
+                },
+                StageSpec {
+                    name: "s".into(),
+                    project: "b".into(),
+                    inputs: BTreeMap::new(),
+                },
             ],
         };
         assert!(validate_stage_names(&spec).is_err());
@@ -1330,9 +1419,15 @@ encoding = "raster"
             output_structural_commitment: vec![payload, payload],
             trace_commitment_digest: vec![7; 32],
         };
-        let a = ChainCommitment { stages: vec![checkpoint("s", 9)] };
-        let b = ChainCommitment { stages: vec![checkpoint("s", 9)] };
-        let c = ChainCommitment { stages: vec![checkpoint("s", 10)] };
+        let a = ChainCommitment {
+            stages: vec![checkpoint("s", 9)],
+        };
+        let b = ChainCommitment {
+            stages: vec![checkpoint("s", 9)],
+        };
+        let c = ChainCommitment {
+            stages: vec![checkpoint("s", 10)],
+        };
         assert_eq!(a.digest(), b.digest());
         assert_ne!(a.digest(), c.digest());
     }

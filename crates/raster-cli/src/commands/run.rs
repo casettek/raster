@@ -857,56 +857,55 @@ pub fn prove(
         // narrows to the returned value — the same read + selection machinery
         // tile inputs use. The witnesses come straight from the recorded
         // output binding, not the shared `[]` witness-store entry.
-        let (program_output_read_witness, program_output_selection_witness) =
-            match &step_record.kind {
-                StepKind::ProgramEnd(program_end) => match &program_end.output {
-                    Some(output) => {
-                        let index_witness = before_state
-                            .coordinate_index
-                            .membership_proof(&output.coordinates)
-                            .unwrap_or_else(|| {
-                                panic!(
-                                    "Missing coordinate-index witness for program output at {:?}",
-                                    output.coordinates
-                                )
-                            });
-                        let entry = StorageEntry {
-                            coordinates: output.coordinates.clone(),
-                            object_commitment: output.commitment.clone(),
-                        };
-                        let log_witness = build_storage_log_witness(
-                            &before_state.append_entries,
-                            index_witness.value.log_position,
-                        );
-                        let read = StorageReadWitness {
-                            entry,
-                            log_witness,
-                            index_witness,
-                        };
-                        let selection = if output.selection.selected_len > 0 {
-                            let reference = StorageRef::new(
-                                output.coordinates.clone(),
-                                output.commitment.clone(),
-                            );
-                            Some(
-                                trace_recorder
-                                    .storage_selection_witness(&reference, &output.selector)
-                                    .unwrap_or_else(|error| {
-                                        panic!(
-                                            "Failed to build program output selection witness: {}",
-                                            error
-                                        )
-                                    }),
+        let (program_output_read_witness, program_output_selection_witness) = match &step_record
+            .kind
+        {
+            StepKind::ProgramEnd(program_end) => match &program_end.output {
+                Some(output) => {
+                    let index_witness = before_state
+                        .coordinate_index
+                        .membership_proof(&output.coordinates)
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "Missing coordinate-index witness for program output at {:?}",
+                                output.coordinates
                             )
-                        } else {
-                            None
-                        };
-                        (Some(read), selection)
-                    }
-                    None => (None, None),
-                },
-                _ => (None, None),
-            };
+                        });
+                    let entry = StorageEntry {
+                        coordinates: output.coordinates.clone(),
+                        object_commitment: output.commitment.clone(),
+                    };
+                    let log_witness = build_storage_log_witness(
+                        &before_state.append_entries,
+                        index_witness.value.log_position,
+                    );
+                    let read = StorageReadWitness {
+                        entry,
+                        log_witness,
+                        index_witness,
+                    };
+                    let selection = if output.selection.selected_len > 0 {
+                        let reference =
+                            StorageRef::new(output.coordinates.clone(), output.commitment.clone());
+                        Some(
+                            trace_recorder
+                                .storage_selection_witness(&reference, &output.selector)
+                                .unwrap_or_else(|error| {
+                                    panic!(
+                                        "Failed to build program output selection witness: {}",
+                                        error
+                                    )
+                                }),
+                        )
+                    } else {
+                        None
+                    };
+                    (Some(read), selection)
+                }
+                None => (None, None),
+            },
+            _ => (None, None),
+        };
 
         recorded_step_io.insert(
             step_record.clone(),
@@ -968,8 +967,8 @@ pub fn prove(
         // step), and the slice witness proves the window fingerprint occurs
         // in the commitment there. The guest re-derives and checks both.
         let commitment_header = trace_commitment.header();
-        let window_start = usize::try_from(frontier.position)
-            .expect("window start position overflows usize");
+        let window_start =
+            usize::try_from(frontier.position).expect("window start position overflows usize");
         let fingerprint_slice = trace_commitment
             .fingerprint_slice_witness(window_start, fraud_window.fingerprint.len());
 

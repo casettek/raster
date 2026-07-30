@@ -80,10 +80,7 @@ pub fn check_iteration_chunk_len(declared: u64, actual: u64) -> Result<(), Chunk
 /// Ordering rule across iterations: every chunk except the final one must be
 /// exactly `declared` elements. Call with the length of the iteration that
 /// preceded the current one.
-pub fn check_previous_chunk_was_full(
-    declared: u64,
-    previous: u64,
-) -> Result<(), ChunkViolation> {
+pub fn check_previous_chunk_was_full(declared: u64, previous: u64) -> Result<(), ChunkViolation> {
     if previous != declared {
         return Err(ChunkViolation::ShortNonFinal {
             declared,

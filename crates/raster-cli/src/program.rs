@@ -149,9 +149,7 @@ fn synthesize_manifest(project: &Project, cfs: &ControlFlowSchema) -> ProgramMan
         .collect();
 
     let output = produces_output.then(|| InterfaceDecl {
-        type_path: main_ast
-            .and_then(|f| f.output.clone())
-            .unwrap_or_default(),
+        type_path: main_ast.and_then(|f| f.output.clone()).unwrap_or_default(),
         encoding: ExternalEncoding::Raster,
     });
 
@@ -164,7 +162,10 @@ fn synthesize_manifest(project: &Project, cfs: &ControlFlowSchema) -> ProgramMan
 }
 
 /// Compile every CFS tile to its image id (the program's tile registry).
-fn build_registry(cfs: &ControlFlowSchema, replayer: &Replayer) -> Result<BTreeMap<String, ImageId>> {
+fn build_registry(
+    cfs: &ControlFlowSchema,
+    replayer: &Replayer,
+) -> Result<BTreeMap<String, ImageId>> {
     let mut tiles = BTreeMap::new();
     for tile in &cfs.tiles {
         let image_id = replayer.tile_image_id(&tile.id)?;
@@ -460,6 +461,9 @@ encoding = "raster"
     #[test]
     fn read_lock_reports_missing_file() {
         let err = read_lock(Path::new("/nonexistent/Raster.lock")).unwrap_err();
-        assert!(err.to_string().contains("run `cargo raster build`"), "got: {err}");
+        assert!(
+            err.to_string().contains("run `cargo raster build`"),
+            "got: {err}"
+        );
     }
 }

@@ -512,7 +512,10 @@ fn call_recur_threads_state_and_finalizes() {
 
     assert_eq!(result.limit, 2);
     assert_eq!(result.stopped_after, 2);
-    assert_eq!(result.items.into_vec(), vec!["one".to_string(), "two".to_string()]);
+    assert_eq!(
+        result.items.into_vec(),
+        vec!["one".to_string(), "two".to_string()]
+    );
 }
 
 #[test]
@@ -567,9 +570,9 @@ fn call_recur_resolves_internal_list_once_per_invocation() {
         "third".to_string(),
     ])
     .expect("list source should store");
-    let source = into_auth_ref::<List<String>, _>(
-        raster::typed_storage_with_resolver::<List<String>>(reference, resolve_counted_string_list),
-    );
+    let source = into_auth_ref::<List<String>, _>(raster::typed_storage_with_resolver::<
+        List<String>,
+    >(reference, resolve_counted_string_list));
 
     RECUR_RESOLVE_COUNT.store(0, Ordering::SeqCst);
     let auth = raster::run_recur_list::<String, LineBundle, _, _>(
@@ -593,9 +596,9 @@ fn recur_sequence_resolves_internal_list_once_per_invocation() {
         "third".to_string(),
     ])
     .expect("list source should store");
-    let source = into_auth_ref::<List<String>, _>(
-        raster::typed_storage_with_resolver::<List<String>>(reference, resolve_counted_string_list),
-    );
+    let source = into_auth_ref::<List<String>, _>(raster::typed_storage_with_resolver::<
+        List<String>,
+    >(reference, resolve_counted_string_list));
 
     RECUR_RESOLVE_COUNT.store(0, Ordering::SeqCst);
     // Materialize every item the way the trace pipeline does. With a per-item

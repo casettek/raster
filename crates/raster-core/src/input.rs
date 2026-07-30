@@ -45,13 +45,104 @@ impl SelectorPath {
     }
 }
 
+/// Committed width of an integer that supplies a [`SelectorSegment::BoundIndex`].
+///
+/// The width is not decoration: a leaf's bytes are fixed-width little-endian
+/// (see `encode_leaf_bytes` in the runtime and `parse_subtree_root`'s `0x00`
+/// arm), so `7u32` and `7u64` are *different* payloads with different hashes.
+/// [`encode_index_leaf_payload`] needs the width to re-derive the exact bytes
+/// the index binding committed to.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexWidth {
+    U8,
+    U16,
+    U32,
+    U64,
+}
+
+impl IndexWidth {
+    /// Encode `index` as this width's leaf bytes, or `None` if it does not fit.
+    ///
+    /// The `None` case is load-bearing, not defensive. A truncating cast here
+    /// would be a forgery: a prover could record `index: 300` with width `U8`,
+    /// truncate to `44`, and match a binding that actually committed `44` —
+    /// proving element 300 while the authorized value said 44.
+    pub fn encode(self, index: u64) -> Option<Vec<u8>> {
+        let bytes = match self {
+            Self::U8 => Vec::from(&u8::try_from(index).ok()?.to_le_bytes()[..]),
+            Self::U16 => Vec::from(&u16::try_from(index).ok()?.to_le_bytes()[..]),
+            Self::U32 => Vec::from(&u32::try_from(index).ok()?.to_le_bytes()[..]),
+            Self::U64 => Vec::from(&index.to_le_bytes()[..]),
+        };
+        Some(bytes)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum SelectorSegment {
     Field(String),
     Index(u64),
     /// Contiguous list slice `[start, end)`. Only valid as the final segment
     /// of a selector path, and only against a list node.
+    Range {
+        start: u64,
+        end: u64,
+    },
+    /// List index taken from an authorized value rather than a literal.
+    ///
+    /// `index` is the value used on this run — per-run data, exactly as it
+    /// already is for a recur iteration's [`SelectorSegment::Index`]. `source`
+    /// names the storage binding *on the same step* that supplied it, and
+    /// `width` fixes how that binding's value is encoded.
+    ///
+    /// Naming a sibling binding is what makes the reference sound: the step's
+    /// storage map is already proved entry-by-entry (append-log path plus
+    /// coordinate-index membership plus selection witness), so a `BoundIndex`
+    /// can only point at a value this execution already authorized. Carrying
+    /// the index's own `StorageRef`/`SelectorPath` inline instead would put the
+    /// verifier back in the business of establishing provenance from scratch,
+    /// and would make `SelectorPath` recursive. See
+    /// `docs/proposals/dynamic-index-selection.md` §1-§3.
+    ///
+    /// `source` is a [`crate::trace::StorageBindingName`]; it is spelled
+    /// `String` here because `trace` depends on this module, not the reverse.
+    BoundIndex {
+        index: u64,
+        source: String,
+        width: IndexWidth,
+    },
+}
+
+/// What a [`SelectorSegment`] does to the tree, with provenance projected away.
+///
+/// A `BoundIndex` descends a list exactly as an `Index` does — same element,
+/// same proof step, same bytes. The *only* thing that differs is where the index
+/// came from, and that is checked in one place
+/// ([`crate::trace::verify_bound_index_bindings`]) rather than in every walker.
+/// Tree walkers and proof builders match on this, so "a dynamic index selects
+/// like a literal one" is enforced by the type rather than repeated by
+/// convention — and a future segment kind cannot be silently mishandled by a
+/// walker that forgot about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectorDescent<'a> {
+    Field(&'a str),
+    Index(u64),
     Range { start: u64, end: u64 },
+}
+
+impl SelectorSegment {
+    /// Project this segment onto the descent it performs.
+    pub fn descent(&self) -> SelectorDescent<'_> {
+        match self {
+            Self::Field(name) => SelectorDescent::Field(name.as_str()),
+            Self::Index(index) | Self::BoundIndex { index, .. } => SelectorDescent::Index(*index),
+            Self::Range { start, end } => SelectorDescent::Range {
+                start: *start,
+                end: *end,
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -510,8 +601,12 @@ fn step_proves_segment(step: &SelectionProofStep, segment: &SelectorSegment) -> 
         ) => field_names
             .get(*field_index as usize)
             .is_some_and(|proven| proven == name),
-        (SelectionProofStep::List { index, .. }, SelectorSegment::Index(claimed)) => {
-            index == claimed
+        // Both index forms are pinned the same way: the proof must prove the
+        // index the segment claims. For `BoundIndex` this is necessary but not
+        // sufficient — `verify_bound_index_bindings` is what ties that index to
+        // the authorized value it claims to come from.
+        (SelectionProofStep::List { index, .. }, segment) => {
+            segment.descent() == SelectorDescent::Index(*index)
         }
         // A range step is pinned to a range segment by its start; the slice
         // width is checked against the payload in `fold_list_range`.
@@ -734,6 +829,28 @@ pub fn verify_selection_proof(selected_bytes: &[u8], proof: &SelectionProof) -> 
 
 pub fn selection_payload_hash(selected_bytes: &[u8]) -> Hash32 {
     Sha256::digest(selected_bytes).into()
+}
+
+/// Re-derive the canonical selection payload a leaf holding `index` at `width`
+/// commits to: `[0x00][len: u64 LE][fixed-width LE bytes]`.
+///
+/// This is the *encode* half of the encode-and-compare check in
+/// [`crate::trace::verify_bound_index_bindings`]. Comparing an encoding rather
+/// than decoding the committed bytes keeps every integer decoder out of the
+/// guest and leaves no room for two spellings of the same value: the leaf
+/// encoding is fixed-width, so one `(index, width)` pair has exactly one
+/// payload. Mirrors the `0x00` arm of `parse_subtree_root` and the runtime's
+/// `encode_leaf_bytes`; a divergence between them is a verification failure, so
+/// the round-trip is covered by `bound_index_payload_matches_encoded_leaf`.
+///
+/// Returns `None` when `index` does not fit `width` (see [`IndexWidth::encode`]).
+pub fn encode_index_leaf_payload(index: u64, width: IndexWidth) -> Option<Vec<u8>> {
+    let leaf_bytes = width.encode(index)?;
+    let mut payload = Vec::with_capacity(1 + 8 + leaf_bytes.len());
+    payload.push(0x00);
+    payload.extend_from_slice(&(leaf_bytes.len() as u64).to_le_bytes());
+    payload.extend_from_slice(&leaf_bytes);
+    Some(payload)
 }
 
 pub fn verify_selection_witness(

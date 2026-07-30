@@ -775,9 +775,7 @@ impl TraceRecorder {
                     }
                     if let Some(previous) = recur_state.last_chunk_len {
                         if let Err(violation) =
-                            raster_core::chunking::check_previous_chunk_was_full(
-                                declared, previous,
-                            )
+                            raster_core::chunking::check_previous_chunk_was_full(declared, previous)
                         {
                             panic!(
                                 "Recur chunking violation at {:?} for '{}': {}",
@@ -962,7 +960,8 @@ impl TraceRecorder {
                 // else has yet) and binds its entry arguments at the sequence
                 // root coordinate `[]` — not a reserved child slot, so the
                 // frame's child index is left at 0 for the first real item.
-                self.sequence_callstack.push("main".to_string(), &self.cfs_cursor);
+                self.sequence_callstack
+                    .push("main".to_string(), &self.cfs_cursor);
                 let coordinates = self.sequence_callstack.current_sequence_coordinates.clone();
                 let sequence_id = self
                     .sequence_callstack
@@ -1177,9 +1176,8 @@ mod tests {
     /// a tuple leading with `RecurInput<Vec<String>> { value, index, len }`.
     fn chunked_iteration_event(elements: usize) -> TraceEvent {
         let chunk: Vec<String> = (0..elements).map(|i| format!("line-{}", i)).collect();
-        let data =
-            raster_core::postcard::to_allocvec(&((chunk, 0u64, 2u64), "title".to_string()))
-                .unwrap();
+        let data = raster_core::postcard::to_allocvec(&((chunk, 0u64, 2u64), "title".to_string()))
+            .unwrap();
         TraceEvent::RecurTileIterationExec(FnCallRecord {
             fn_name: "recur".to_string(),
             input: Some(raster_core::trace::FnInput {

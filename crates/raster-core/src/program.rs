@@ -170,7 +170,10 @@ fn validate_cfs_canonical(cfs: &ControlFlowSchema) -> Result<()> {
     Ok(())
 }
 
-fn validate_manifest_matches_cfs(manifest: &ProgramManifest, cfs: &ControlFlowSchema) -> Result<()> {
+fn validate_manifest_matches_cfs(
+    manifest: &ProgramManifest,
+    cfs: &ControlFlowSchema,
+) -> Result<()> {
     let (entry_arguments, produces_output) = match main_sequence(cfs) {
         Some(main) => (main.entry_arguments.as_slice(), main.produces_output),
         // No `main` (e.g. a library CFS): the interface contract is vacuous.
@@ -297,7 +300,10 @@ mod tests {
         )
         .expect("parts match");
         // Commitment is deterministic and domain-prefixed.
-        assert_eq!(def.commitment(), commitment_of_bytes(&def.canonical_bytes()));
+        assert_eq!(
+            def.commitment(),
+            commitment_of_bytes(&def.canonical_bytes())
+        );
         assert_ne!(def.commitment(), [0u8; 32]);
     }
 
@@ -321,17 +327,19 @@ mod tests {
 
     #[test]
     fn registry_must_cover_exactly_the_cfs_tiles() {
-        let cfs = cfs_with(
-            vec![TileDef::iter("greet", 1, 1)],
-            main_seq(vec![], false),
-        );
+        let cfs = cfs_with(vec![TileDef::iter("greet", 1, 1)], main_seq(vec![], false));
         // Missing image id.
-        assert!(ProgramDefinition::assemble(manifest(vec![], None), cfs.clone(), registry(&[])).is_err());
-        // Extra image id.
         assert!(
-            ProgramDefinition::assemble(manifest(vec![], None), cfs, registry(&["greet", "ghost"]))
+            ProgramDefinition::assemble(manifest(vec![], None), cfs.clone(), registry(&[]))
                 .is_err()
         );
+        // Extra image id.
+        assert!(ProgramDefinition::assemble(
+            manifest(vec![], None),
+            cfs,
+            registry(&["greet", "ghost"])
+        )
+        .is_err());
     }
 
     #[test]
@@ -341,7 +349,12 @@ mod tests {
             main_seq(vec!["seed".to_string()], false),
         );
         // Missing declared input.
-        assert!(ProgramDefinition::assemble(manifest(vec![], None), cfs.clone(), registry(&["greet"])).is_err());
+        assert!(ProgramDefinition::assemble(
+            manifest(vec![], None),
+            cfs.clone(),
+            registry(&["greet"])
+        )
+        .is_err());
         // Output declared but main returns unit.
         assert!(ProgramDefinition::assemble(
             manifest(vec![("seed", "u64")], Some("String")),
@@ -358,9 +371,11 @@ mod tests {
             vec![TileDef::iter("zeta", 1, 1), TileDef::iter("alpha", 1, 1)],
             main_seq(vec![], false),
         );
-        assert!(
-            ProgramDefinition::assemble(manifest(vec![], None), cfs, registry(&["zeta", "alpha"]))
-                .is_err()
-        );
+        assert!(ProgramDefinition::assemble(
+            manifest(vec![], None),
+            cfs,
+            registry(&["zeta", "alpha"])
+        )
+        .is_err());
     }
 }

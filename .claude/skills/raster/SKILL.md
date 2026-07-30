@@ -293,6 +293,34 @@ let two_lines    = select!(Block<String>, personal_data.addresses[0].lines[0..2]
   consumed** (§2 cost rules): a field beats the struct, one slice selection
   beats N element selections, and an unused selection is pure waste.
 
+### Indexing by an authorized value
+
+An index may also be a **binding in scope**, which is how you look an element up
+by a value the program computed instead of scanning for it:
+
+```rust
+let token_id = select!(u32, prompt.token_ids[0]);
+let row      = select!(EmbeddingRow, table.rows[token_id]);   // O(log n) proof
+
+// Inside a recur sequence, the item itself is the index:
+let wanted = input.into_ref();                 // AuthRef, nothing materialized
+let row    = select!(Row, rows[wanted]);
+```
+
+- The index must be an `AuthRef<uN>` (`u8`/`u16`/`u32`/`u64`) — an authorized
+  value. A literal, a computed expression (`i + 1`), a `.clone()`, or a signed
+  integer is rejected: an index with no lineage is one a prover could choose.
+  Pass the binding **bare**; it is borrowed, so the same index can locate
+  several values.
+- Ranges keep literal bounds. There is no dynamic `[a..b]` yet.
+- **An out-of-range index aborts the run with no output** — it cannot be
+  handled, because a list has no non-membership proof. Do not use a dynamic
+  index where "not found" is an expected outcome; that still needs a scan.
+- This replaces the scan-and-match idiom for *positional* lookup. Key→value
+  lookup (a string to an id) is still a scan — there is no map type.
+
+See `docs/proposals/dynamic-index-selection.md`.
+
 Details and the input-fixture format: `references/data-and-io.md`.
 
 ## 6. Building outputs across tiles — drafts

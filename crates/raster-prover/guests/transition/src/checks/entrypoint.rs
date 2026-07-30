@@ -54,7 +54,10 @@ pub fn combined_root(names: &[String], authorization_journal: &AuthorizationJour
                 .external_inputs_commitments
                 .get(name)
                 .unwrap_or_else(|| {
-                    panic!("Missing authorized commitment for entry argument '{}'", name)
+                    panic!(
+                        "Missing authorized commitment for entry argument '{}'",
+                        name
+                    )
                 });
             (name.as_str(), commitment.as_slice())
         })

@@ -36,11 +36,11 @@ fn main() {
     // named `commit.bin`: it reads the commitment's compact header and the
     // slice witness covering this window. `Next` steps inherit the (already
     // verified) binding from the previous journal instead.
-    let commitment_binding: Option<(TraceCommitmentHeader, FingerprintSliceWitness)> =
-        match &state {
-            TransitionState::Init(_) => Some((env::read(), env::read())),
-            _ => None,
-        };
+    let commitment_binding: Option<(TraceCommitmentHeader, FingerprintSliceWitness)> = match &state
+    {
+        TransitionState::Init(_) => Some((env::read(), env::read())),
+        _ => None,
+    };
 
     // Precondition: external inputs were authorized against a manifest.
     assert!(verify_authorization_journal(

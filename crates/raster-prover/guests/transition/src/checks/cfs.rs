@@ -4,6 +4,7 @@
 //! follow the schema's ordering.
 
 use raster_core::cfs::{CfsCoordinates, CfsCursor, InputBinding, InputSource, SequenceChildItem};
+use raster_core::input::SelectorSegment;
 use raster_core::trace::{
     ExecStep, ExecTarget, FnInput, FnInputValue, StepKind, StepRecord, StorageData,
 };
@@ -25,11 +26,12 @@ fn resolved_source_at<'a>(input: &'a FnInput, index: usize) -> ResolvedSource<'a
 
     match value {
         FnInputValue::Inline(bytes) => ResolvedSource::Inline(bytes),
-        FnInputValue::StorageBinding => {
-            ResolvedSource::Storage(input.storage().get(&arg.name).unwrap_or_else(|| {
-                panic!("Missing storage input metadata for arg '{}'", arg.name)
-            }))
-        }
+        FnInputValue::StorageBinding => ResolvedSource::Storage(
+            input
+                .storage()
+                .get(&arg.name)
+                .unwrap_or_else(|| panic!("Missing storage input metadata for arg '{}'", arg.name)),
+        ),
     }
 }
 
@@ -139,15 +141,14 @@ fn verify_recur_iteration_chunking(
             step_record
         )
     });
-    let chunk_len = raster_core::chunking::iteration_chunk_len(input_witness)
-        .unwrap_or_else(|| {
+    let chunk_len =
+        raster_core::chunking::iteration_chunk_len(input_witness).unwrap_or_else(|| {
             panic!(
                 "Chunked recur iteration {:?} input does not carry a chunk length",
                 step_record
             )
         });
-    if let Err(violation) = raster_core::chunking::check_iteration_chunk_len(declared, chunk_len)
-    {
+    if let Err(violation) = raster_core::chunking::check_iteration_chunk_len(declared, chunk_len) {
         panic!(
             "Recur chunking violation at step {:?}: {}",
             step_record, violation
@@ -174,12 +175,7 @@ pub fn verify_step_record_inputs(
     if let Some((site_coordinates, _)) =
         cfs_cursor.try_get_recur_iteration_coordinates(step_record.coordinates())
     {
-        verify_recur_iteration_chunking(
-            cfs_cursor,
-            step_record,
-            &site_coordinates,
-            input_witness,
-        );
+        verify_recur_iteration_chunking(cfs_cursor, step_record, &site_coordinates, input_witness);
         return;
     }
 
@@ -218,100 +214,225 @@ pub fn verify_step_record_inputs(
 
     for (input_index, step_input) in step_inputs.iter().enumerate() {
         let resolved_source = resolved_source_at(input_source_witness, input_index);
-        match step_input {
-            InputBinding::Direct(InputSource::Inline) => {
-                assert!(
-                    matches!(resolved_source, ResolvedSource::Inline(_)),
-                    "Expected inline input source for step {:?} arg {}",
-                    step_record,
-                    input_index,
-                );
-            }
-            InputBinding::Direct(InputSource::Storage) => {
-                assert!(
-                    matches!(resolved_source, ResolvedSource::Storage(_)),
-                    "Expected storage input source for step {:?} arg {}",
-                    step_record,
-                    input_index,
-                );
-            }
-            InputBinding::EntryArgument => {
-                // One of `main`'s entry arguments: it must be sourced from
-                // the authorized entry object at the sequence root `[]` that
-                // the `ProgramStart` step bound. The selector into that
-                // object (and its selection proof) is verified separately by
-                // the storage checks; here we hold the binding to the one
-                // coordinate the entry object can legitimately come from.
-                let storage_meta = match resolved_source {
-                    ResolvedSource::Storage(meta) => meta,
-                    _ => panic!(
-                        "Expected storage input source for entry-argument step {:?} arg {}",
-                        step_record, input_index
-                    ),
-                };
-                assert!(
-                    storage_meta.coordinates.is_empty(),
-                    "Entry-argument input for step {:?} arg {} must come from the sequence root",
-                    step_record,
-                    input_index,
-                );
-            }
-            InputBinding::SequenceScope { input_index } => {
-                let sequence_scope_witness = sequence_scope_witness.unwrap_or_else(|| {
-                    panic!(
-                        "Missing sequence scope witness for step record {:?}",
-                        step_record
-                    )
-                });
-                let scope_source = resolved_source_at(sequence_scope_witness, *input_index);
-                assert_same_source(resolved_source, scope_source);
-            }
-            InputBinding::PriorItemOutput {
-                intra_sequence_item_index,
-            } => {
-                assert!(
-                    *intra_sequence_item_index < item_coordinate as usize,
-                    "Step {:?} cannot depend on source item {} from the same or a future position {}",
-                    step_record,
-                    intra_sequence_item_index,
-                    item_coordinate
-                );
+        verify_one_binding(
+            step_input,
+            resolved_source,
+            input_index,
+            step_record,
+            cfs_cursor,
+            input_source_witness,
+            sequence_scope_witness,
+            &parent_sequence_coordinates,
+            item_coordinate,
+        );
+    }
+}
 
-                let mut source_coordinates = parent_sequence_coordinates.clone();
-                source_coordinates.push(
-                    (*intra_sequence_item_index)
-                        .try_into()
-                        .expect("Prior item output index exceeds CFS coordinate bounds"),
-                );
-                let storage_meta = match resolved_source {
-                    ResolvedSource::Storage(meta) => meta,
-                    _ => {
-                        panic!(
-                            "Expected storage input source for step {:?} arg {}",
-                            step_record, input_index
-                        )
-                    }
-                };
-                match cfs_cursor
-                    .try_get_item(&source_coordinates)
-                    .expect("Expected prior item output coordinates to resolve in CFS")
-                {
-                    raster_core::cfs::SequenceChildItem::Sequence(_)
-                    | raster_core::cfs::SequenceChildItem::RecurSequence(_) => {
-                        assert!(
+/// Count the `BoundIndex` segments in a resolved source's selection path.
+///
+/// Zero for an inline source: an inline value has no path, so it can carry no
+/// dynamic index.
+fn bound_index_count(resolved_source: &ResolvedSource<'_>) -> usize {
+    match resolved_source {
+        ResolvedSource::Inline(_) => 0,
+        ResolvedSource::Storage(meta) => meta
+            .selection
+            .path
+            .segments
+            .iter()
+            .filter(|segment| matches!(segment, SelectorSegment::BoundIndex { .. }))
+            .count(),
+    }
+}
+
+/// The storage bindings a resolved source cites through its `BoundIndex`
+/// segments, in selector order.
+///
+/// Resolving the citation here is what lets the CFS check reach the index's own
+/// binding: the step's storage map is the only place the cited value appears.
+fn cited_index_sources<'a>(
+    resolved_source: &ResolvedSource<'a>,
+    input_source_witness: &'a FnInput,
+) -> Vec<&'a StorageData> {
+    let ResolvedSource::Storage(meta) = resolved_source else {
+        return Vec::new();
+    };
+    meta.selection
+        .path
+        .segments
+        .iter()
+        .filter_map(|segment| match segment {
+            SelectorSegment::BoundIndex { source, .. } => {
+                Some(input_source_witness.storage().get(source).unwrap_or_else(|| {
+                    panic!("Bound index cites storage binding '{}', which the step does not record", source)
+                }))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Hold one recorded argument to one CFS input binding.
+///
+/// Split out of the loop so [`InputBinding::Indexed`] can delegate to it for
+/// both the value it wraps and each index it cites.
+#[allow(clippy::too_many_arguments)]
+fn verify_one_binding(
+    step_input: &InputBinding,
+    resolved_source: ResolvedSource<'_>,
+    input_index: usize,
+    step_record: &StepRecord,
+    cfs_cursor: &CfsCursor,
+    input_source_witness: &FnInput,
+    sequence_scope_witness: Option<&FnInput>,
+    parent_sequence_coordinates: &CfsCoordinates,
+    item_coordinate: u32,
+) {
+    // A binding the schema did *not* declare as index-sourced must not have
+    // become one in the recording, and vice versa. Without this pairing the
+    // schema would describe dynamic indexing without constraining it: a prover
+    // could add a `BoundIndex` to an argument the program wrote with a literal
+    // index (or drop one the program wrote), and every other check would still
+    // pass because each is satisfied by *some* consistent index.
+    let declared_indexes = step_input.index_bindings();
+    let recorded_indexes = bound_index_count(&resolved_source);
+    assert_eq!(
+        declared_indexes.len(),
+        recorded_indexes,
+        "Step {:?} arg {} records {} data-sourced index(es) but the CFS declares {}",
+        step_record,
+        input_index,
+        recorded_indexes,
+        declared_indexes.len(),
+    );
+
+    if !declared_indexes.is_empty() {
+        // Each cited index is itself a value with provenance; hold it to the
+        // binding the schema declares for it, the same way the wrapped value is
+        // held to its own.
+        let cited = cited_index_sources(&resolved_source, input_source_witness);
+        assert_eq!(
+            cited.len(),
+            declared_indexes.len(),
+            "Step {:?} arg {} cites {} index binding(s) but the CFS declares {}",
+            step_record,
+            input_index,
+            cited.len(),
+            declared_indexes.len(),
+        );
+        for (index_binding, index_source) in declared_indexes.iter().zip(cited) {
+            verify_one_binding(
+                index_binding,
+                ResolvedSource::Storage(index_source),
+                input_index,
+                step_record,
+                cfs_cursor,
+                input_source_witness,
+                sequence_scope_witness,
+                parent_sequence_coordinates,
+                item_coordinate,
+            );
+        }
+    }
+
+    match step_input.value_binding() {
+        InputBinding::Direct(InputSource::Inline) => {
+            assert!(
+                matches!(resolved_source, ResolvedSource::Inline(_)),
+                "Expected inline input source for step {:?} arg {}",
+                step_record,
+                input_index,
+            );
+        }
+        InputBinding::Direct(InputSource::Storage) => {
+            assert!(
+                matches!(resolved_source, ResolvedSource::Storage(_)),
+                "Expected storage input source for step {:?} arg {}",
+                step_record,
+                input_index,
+            );
+        }
+        InputBinding::EntryArgument => {
+            // One of `main`'s entry arguments: it must be sourced from
+            // the authorized entry object at the sequence root `[]` that
+            // the `ProgramStart` step bound. The selector into that
+            // object (and its selection proof) is verified separately by
+            // the storage checks; here we hold the binding to the one
+            // coordinate the entry object can legitimately come from.
+            let storage_meta = match resolved_source {
+                ResolvedSource::Storage(meta) => meta,
+                _ => panic!(
+                    "Expected storage input source for entry-argument step {:?} arg {}",
+                    step_record, input_index
+                ),
+            };
+            assert!(
+                storage_meta.coordinates.is_empty(),
+                "Entry-argument input for step {:?} arg {} must come from the sequence root",
+                step_record,
+                input_index,
+            );
+        }
+        InputBinding::SequenceScope { input_index } => {
+            let sequence_scope_witness = sequence_scope_witness.unwrap_or_else(|| {
+                panic!(
+                    "Missing sequence scope witness for step record {:?}",
+                    step_record
+                )
+            });
+            let scope_source = resolved_source_at(sequence_scope_witness, *input_index);
+            assert_same_source(resolved_source, scope_source);
+        }
+        InputBinding::PriorItemOutput {
+            intra_sequence_item_index,
+        } => {
+            assert!(
+                *intra_sequence_item_index < item_coordinate as usize,
+                "Step {:?} cannot depend on source item {} from the same or a future position {}",
+                step_record,
+                intra_sequence_item_index,
+                item_coordinate
+            );
+
+            let mut source_coordinates = parent_sequence_coordinates.clone();
+            source_coordinates.push(
+                (*intra_sequence_item_index)
+                    .try_into()
+                    .expect("Prior item output index exceeds CFS coordinate bounds"),
+            );
+            let storage_meta = match resolved_source {
+                ResolvedSource::Storage(meta) => meta,
+                _ => {
+                    panic!(
+                        "Expected storage input source for step {:?} arg {}",
+                        step_record, input_index
+                    )
+                }
+            };
+            match cfs_cursor
+                .try_get_item(&source_coordinates)
+                .expect("Expected prior item output coordinates to resolve in CFS")
+            {
+                raster_core::cfs::SequenceChildItem::Sequence(_)
+                | raster_core::cfs::SequenceChildItem::RecurSequence(_) => {
+                    assert!(
                             has_coordinate_prefix(&storage_meta.coordinates, &source_coordinates),
                             "Storage input prior-item-output coordinates do not descend from expected sequence source",
                         );
-                    }
-                    raster_core::cfs::SequenceChildItem::Tile(_)
-                    | raster_core::cfs::SequenceChildItem::RecurTile(_) => {
-                        assert_eq!(
+                }
+                raster_core::cfs::SequenceChildItem::Tile(_)
+                | raster_core::cfs::SequenceChildItem::RecurTile(_) => {
+                    assert_eq!(
                             storage_meta.coordinates, source_coordinates,
                             "Storage input prior-item-output coordinates do not match expected CFS source",
                         );
-                    }
                 }
             }
+        }
+        // `value_binding()` looks through every wrapper, so an `Indexed`
+        // binding can never reach this match.
+        InputBinding::Indexed { .. } => {
+            unreachable!("value_binding() unwraps Indexed before this match")
         }
     }
 }

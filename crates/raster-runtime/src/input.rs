@@ -1,7 +1,8 @@
 use raster_core::input::{
     selection_payload_hash, struct_commitments_root, Hash32, ListProofDirection, ListProofSibling,
     SchemaNode, Selectable, SelectedPayload, SelectionCommitment, SelectionProof,
-    SelectionProofStep, SelectionWitness, SelectorPath, SelectorSegment, StorageValue,
+    SelectionProofStep, SelectionWitness, SelectorDescent, SelectorPath, SelectorSegment,
+    StorageValue,
 };
 use raster_core::{Error, Result as CoreResult};
 use serde::de::{
@@ -1653,15 +1654,18 @@ pub(crate) fn prove_selection(
         });
     }
 
-    match (&segments[0], schema, value) {
+    // Matched by descent, so a data-sourced index builds the same `List` proof
+    // step a literal one does. Its provenance is discharged separately, against
+    // the step's storage map (`verify_bound_index_bindings`).
+    match (segments[0].descent(), schema, value) {
         (
-            SelectorSegment::Field(field_name),
+            SelectorDescent::Field(field_name),
             SchemaNode::Struct { fields, .. },
             TreeValue::Struct(entries),
         ) => {
             let target_index = fields
                 .iter()
-                .position(|field| field.name == *field_name)
+                .position(|field| field.name == field_name)
                 .ok_or_else(|| {
                     Error::Other(format!("Selector field '{}' was not found", field_name))
                 })?;
@@ -1716,11 +1720,11 @@ pub(crate) fn prove_selection(
             })
         }
         (
-            SelectorSegment::Index(index),
+            SelectorDescent::Index(index),
             SchemaNode::List { element, .. },
             TreeValue::List(values) | TreeValue::ListHandle(values),
         ) => {
-            let idx = *index as usize;
+            let idx = index as usize;
             let child_value = values
                 .get(idx)
                 .ok_or_else(|| Error::Other(format!("Selector index '{}' was not found", index)))?;
@@ -1738,7 +1742,7 @@ pub(crate) fn prove_selection(
 
             let mut steps = Vec::with_capacity(child.steps.len() + 1);
             steps.push(SelectionProofStep::List {
-                index: *index,
+                index,
                 len: values.len() as u64,
                 siblings,
             });
@@ -1752,7 +1756,7 @@ pub(crate) fn prove_selection(
             })
         }
         (
-            SelectorSegment::Range { start, end },
+            SelectorDescent::Range { start, end },
             SchemaNode::List { .. },
             TreeValue::List(values) | TreeValue::ListHandle(values),
         ) => {
@@ -1761,8 +1765,8 @@ pub(crate) fn prove_selection(
                     "Range selector segment must be the final segment".into(),
                 ));
             }
-            let start_idx = *start as usize;
-            let end_idx = *end as usize;
+            let start_idx = start as usize;
+            let end_idx = end as usize;
             if start_idx >= end_idx || end_idx > values.len() {
                 return Err(Error::Other(format!(
                     "Selector range '{}..{}' is out of bounds for list of length {}",
@@ -1786,21 +1790,21 @@ pub(crate) fn prove_selection(
                 selected_bytes,
                 root_hash,
                 steps: vec![SelectionProofStep::ListRange {
-                    start: *start,
+                    start,
                     len: values.len() as u64,
                     siblings,
                 }],
             })
         }
-        (SelectorSegment::Field(field_name), _, _) => Err(Error::Other(format!(
+        (SelectorDescent::Field(field_name), _, _) => Err(Error::Other(format!(
             "Selector field '{}' was not found in selected value",
             field_name
         ))),
-        (SelectorSegment::Index(index), _, _) => Err(Error::Other(format!(
+        (SelectorDescent::Index(index), _, _) => Err(Error::Other(format!(
             "Selector index '{}' was not found in selected value",
             index
         ))),
-        (SelectorSegment::Range { start, end }, _, _) => Err(Error::Other(format!(
+        (SelectorDescent::Range { start, end }, _, _) => Err(Error::Other(format!(
             "Selector range '{}..{}' requires a list value",
             start, end
         ))),
@@ -2306,7 +2310,9 @@ pub struct OutputArtifact {
 ///
 /// Writes only when `RASTER_OUTPUT_DIR` is set (by `cargo raster run`); a plain
 /// `cargo run` produces no files and returns `Ok(None)`.
-pub fn write_program_output_artifact<T: Serialize>(value: &T) -> CoreResult<Option<OutputArtifact>> {
+pub fn write_program_output_artifact<T: Serialize>(
+    value: &T,
+) -> CoreResult<Option<OutputArtifact>> {
     let Some(dir) = std::env::var_os(crate::tracing::OUTPUT_DIR_ENV) else {
         return Ok(None);
     };
@@ -2555,6 +2561,151 @@ mod tests {
         assert_eq!(whole.root_hash, witness.proof.root_hash);
     }
 
+    /// The verifier re-derives an index binding's committed bytes rather than
+    /// decoding them (`encode_index_leaf_payload`), so its encoding must agree
+    /// with the production selection encoder byte-for-byte. A divergence would
+    /// be a silent verification failure — every honest bound index would be
+    /// rejected, or worse, a dishonest one accepted — so pin the two together
+    /// against the real encoder for every supported width.
+    #[test]
+    fn bound_index_payload_matches_encoded_leaf() {
+        use raster_core::input::{encode_index_leaf_payload, IndexWidth};
+
+        #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
+        struct Widths {
+            a: List<u8>,
+            b: List<u16>,
+            c: List<u32>,
+            d: List<u64>,
+        }
+
+        impl Selectable for Widths {
+            fn schema() -> SchemaNode {
+                SchemaNode::Struct {
+                    type_name: "Widths".into(),
+                    fields: vec![
+                        SchemaField::new("a", "a", <List<u8> as Selectable>::schema()),
+                        SchemaField::new("b", "b", <List<u16> as Selectable>::schema()),
+                        SchemaField::new("c", "c", <List<u32> as Selectable>::schema()),
+                        SchemaField::new("d", "d", <List<u64> as Selectable>::schema()),
+                    ],
+                }
+            }
+        }
+
+        let root = Widths {
+            a: vec![0u8, 7, 255].into(),
+            b: vec![0u16, 300, 65_535].into(),
+            c: vec![0u32, 262_143, u32::MAX].into(),
+            d: vec![0u64, 1 << 40, u64::MAX].into(),
+        };
+
+        let cases: Vec<(&str, IndexWidth, Vec<u64>)> = vec![
+            ("a", IndexWidth::U8, vec![0, 7, 255]),
+            ("b", IndexWidth::U16, vec![0, 300, 65_535]),
+            ("c", IndexWidth::U32, vec![0, 262_143, u64::from(u32::MAX)]),
+            ("d", IndexWidth::U64, vec![0, 1 << 40, u64::MAX]),
+        ];
+
+        for (field, width, values) in cases {
+            for (position, value) in values.into_iter().enumerate() {
+                let selector = SelectorPath::new(vec![
+                    SelectorSegment::from(field),
+                    SelectorSegment::from(position),
+                ]);
+                let proven = typed_proven_selection(&root, &selector).unwrap();
+                assert_eq!(
+                    proven.selected_bytes,
+                    encode_index_leaf_payload(value, width).unwrap(),
+                    "encode_index_leaf_payload disagrees with the selection encoder \
+                     for {value} at {width:?}",
+                );
+            }
+        }
+    }
+
+    /// A `BoundIndex` segment must select and prove exactly what the equivalent
+    /// literal `Index` does — same element, same proof, same root. This is the
+    /// `SelectorDescent` contract: everything below the segment is
+    /// provenance-blind.
+    #[test]
+    fn bound_index_selection_proves_like_a_literal_index() {
+        let root = Address {
+            lines: vec!["a".to_string(), "b".to_string(), "c".to_string()].into(),
+            indexes: vec![7, 8, 9].into(),
+        };
+
+        let literal = SelectorPath::new(vec![
+            SelectorSegment::from("lines"),
+            SelectorSegment::Index(1),
+        ]);
+        let bound = SelectorPath::new(vec![
+            SelectorSegment::from("lines"),
+            SelectorSegment::BoundIndex {
+                index: 1,
+                source: "@idx/deadbeef".to_string(),
+                width: raster_core::input::IndexWidth::U32,
+            },
+        ]);
+
+        let via_literal = typed_proven_selection(&root, &literal).unwrap();
+        let via_bound = typed_proven_selection(&root, &bound).unwrap();
+
+        assert_eq!(via_literal.selected_bytes, via_bound.selected_bytes);
+        assert_eq!(via_literal.root_hash, via_bound.root_hash);
+        assert_eq!(via_literal.steps, via_bound.steps);
+        assert_eq!(
+            typed_value_from_tree::<String>(&via_bound.selected_value).unwrap(),
+            "b"
+        );
+
+        // And the proof verifies against the bound path it claims.
+        let witness = SelectionWitness {
+            bytes: via_bound.selected_bytes,
+            proof: SelectionProof {
+                path: bound,
+                root_hash: via_bound.root_hash,
+                steps: via_bound.steps,
+            },
+        };
+        assert!(verify_selection_proof(&witness.bytes, &witness.proof));
+    }
+
+    /// A proof of one element must not verify against a `BoundIndex` claiming a
+    /// different one — the `step_proves_segment` pinning, which is what stops a
+    /// prover swapping the element while keeping the path.
+    #[test]
+    fn bound_index_rejects_proof_of_a_different_element() {
+        let root = Address {
+            lines: vec!["a".to_string(), "b".to_string(), "c".to_string()].into(),
+            indexes: List::default(),
+        };
+
+        let honest = SelectorPath::new(vec![
+            SelectorSegment::from("lines"),
+            SelectorSegment::Index(1),
+        ]);
+        let proven = typed_proven_selection(&root, &honest).unwrap();
+
+        let lying = SelectorPath::new(vec![
+            SelectorSegment::from("lines"),
+            SelectorSegment::BoundIndex {
+                index: 2,
+                source: "@idx/deadbeef".to_string(),
+                width: raster_core::input::IndexWidth::U32,
+            },
+        ]);
+        let witness = SelectionWitness {
+            bytes: proven.selected_bytes,
+            proof: SelectionProof {
+                path: lying,
+                root_hash: proven.root_hash,
+                steps: proven.steps,
+            },
+        };
+        assert!(!verify_selection_proof(&witness.bytes, &witness.proof));
+    }
+
     #[test]
     fn range_selection_rejects_out_of_bounds_and_non_terminal_segments() {
         let root = Address {
@@ -2614,12 +2765,14 @@ mod tests {
         };
 
         let (payload, _index, commitment_hex) = encode_raster_value(&value).unwrap();
-        let root = raster_core::input::payload_structural_root(&payload)
-            .expect("payload is well-formed");
+        let root =
+            raster_core::input::payload_structural_root(&payload).expect("payload is well-formed");
         assert_eq!(super::hex_string(&root), commitment_hex);
 
         // A truncated artifact must not silently produce a root.
-        assert!(raster_core::input::payload_structural_root(&payload[..payload.len() - 1]).is_none());
+        assert!(
+            raster_core::input::payload_structural_root(&payload[..payload.len() - 1]).is_none()
+        );
     }
 
     #[test]

@@ -1,0 +1,7 @@
+error: proc macro panicked
+  --> tests/ui/select_computed_index_rejected.rs:17:16
+   |
+17 |     let _bad = select!(String, doc.lines[cursor + 1]);
+   |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: message: select! index must be an integer literal, a `start..end` range, or a binding in scope; computed indexes have no lineage — move the computation into a tile

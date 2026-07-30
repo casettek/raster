@@ -250,11 +250,7 @@ pub fn fingerprint_blocks_root(bits: &[u64]) -> Vec<u8> {
 }
 
 impl TraceCommitmentExt for TraceCommitment {
-    fn build(
-        trace: &Trace,
-        seed: &[u8],
-        fraud_proof_config: FraudProofConfig,
-    ) -> TraceCommitment {
+    fn build(trace: &Trace, seed: &[u8], fraud_proof_config: FraudProofConfig) -> TraceCommitment {
         assert!(
             trace.len() > fraud_proof_config.window_size,
             "Trace length can't be less than verification window"
@@ -430,8 +426,8 @@ impl TraceCommitmentExt for TraceCommitment {
     }
 
     fn header(&self) -> TraceCommitmentHeader {
-        let revealed_bytes = postcard::to_allocvec(&self.revealed_items)
-            .expect("revealed items are serializable");
+        let revealed_bytes =
+            postcard::to_allocvec(&self.revealed_items).expect("revealed items are serializable");
         TraceCommitmentHeader {
             bits_packer: self.fingerprint.bits_packer,
             fingerprint_len: self.fingerprint.len() as u64,
@@ -453,11 +449,8 @@ impl TraceCommitmentExt for TraceCommitment {
             window_start + window_len,
             self.fingerprint.len()
         );
-        let (first_block, last_block) = fingerprint_block_range(
-            self.fingerprint.bits_per_item(),
-            window_start,
-            window_len,
-        );
+        let (first_block, last_block) =
+            fingerprint_block_range(self.fingerprint.bits_per_item(), window_start, window_len);
 
         let mut tree = TraceTree::new(1);
         let mut marked = Vec::with_capacity(last_block - first_block + 1);
@@ -575,17 +568,40 @@ fn record_produces_item(record: &StepRecord, cfs_item: &SequenceChildItem) -> bo
     }
 }
 
+/// Flatten a binding into the leaf bindings a step actually depends on.
+///
+/// An `Indexed` binding is *two or more* dependencies, not one: the step reads
+/// the value and every authorized index that located it. Flattening here rather
+/// than special-casing below keeps a fraud window self-contained — omitting an
+/// index's source record would leave the window unable to re-derive the read.
+fn flatten_binding<'a>(binding: &'a InputBinding, out: &mut Vec<&'a InputBinding>) {
+    match binding {
+        InputBinding::Indexed { value, indexes } => {
+            flatten_binding(value, out);
+            for index in indexes {
+                flatten_binding(index, out);
+            }
+        }
+        leaf => out.push(leaf),
+    }
+}
+
 fn resolve_inputs_sources(
     step_record: &StepRecord,
     trace: &[StepRecord],
     cfs_cursor: &CfsCursor,
-    step_inputs: &[InputBinding],
+    declared_inputs: &[InputBinding],
 ) -> Vec<(usize, StepRecord)> {
     if cfs_cursor
         .try_get_recur_iteration_coordinates(step_record.coordinates())
         .is_some()
     {
         return Vec::new();
+    }
+
+    let mut step_inputs: Vec<&InputBinding> = Vec::new();
+    for binding in declared_inputs {
+        flatten_binding(binding, &mut step_inputs);
     }
 
     if step_inputs
@@ -706,6 +722,10 @@ fn resolve_inputs_sources(
                     });
 
                 source_records.push(source_record);
+            }
+            // Flattened away above: `Indexed` is never a leaf here.
+            InputBinding::Indexed { .. } => {
+                unreachable!("flatten_binding removes Indexed before this match")
             }
         }
     }

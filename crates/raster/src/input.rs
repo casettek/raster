@@ -11,10 +11,10 @@ pub use raster_core::collections::{Block, List, Materializable};
 use raster_core::draft::{draft_value_from_serialize, DraftOp};
 use raster_core::draft::{replay_handle_for_schema, DraftReplayHandle, DraftReplayTransition};
 pub use raster_core::input::{
-    verify_selection_proof, AuthValue, ExternalEncoding, ListProofDirection, ListProofSibling, Op,
-    Schema, SchemaField, SchemaFieldMode, SchemaNode, Selectable, SelectedPayload,
-    SelectionCommitment, SelectionProof, SelectionProofStep, SelectionWitness, SelectorPath,
-    SelectorSegment, StorageRef, StorageValue,
+    verify_selection_proof, AuthValue, ExternalEncoding, IndexWidth, ListProofDirection,
+    ListProofSibling, Op, Schema, SchemaField, SchemaFieldMode, SchemaNode, Selectable,
+    SelectedPayload, SelectionCommitment, SelectionProof, SelectionProofStep, SelectionWitness,
+    SelectorPath, SelectorSegment, StorageRef, StorageValue,
 };
 use raster_core::trace::{FnInputValue, StorageData as TraceStorageData};
 
@@ -210,6 +210,26 @@ impl<T> RecurSequenceInput<T> {
     pub fn __raster_as_auth_ref(&self) -> &AuthRef<T> {
         &self.item
     }
+
+    /// The item as an authorized reference, without materializing it.
+    ///
+    /// A recur-sequence item handle can only be *read* once, by passing it to a
+    /// tile. This hands out the reference instead, which is what lets an item
+    /// supply a `select!` index directly:
+    ///
+    /// ```ignore
+    /// let token_id = input.into_ref();
+    /// let row = select!(EmbeddingRow, rows[token_id]);
+    /// ```
+    ///
+    /// An inherent method rather than [`IntoAuthRef`] because the blanket
+    /// `impl<T: Serialize> IntoAuthRef<T> for T` makes `into_auth_ref()` on a
+    /// handle ambiguous; inherent resolution wins, so this spelling is
+    /// unambiguous at the call site. It materializes nothing: the reference
+    /// resolves only when a step reads it.
+    pub fn into_ref(self) -> AuthRef<T> {
+        self.item
+    }
 }
 
 impl<T> RecurSequenceInput<T>
@@ -230,6 +250,7 @@ where
                 raster_core::postcard::to_allocvec(&marker).unwrap_or_default(),
             ),
             storage: item_trace.storage,
+            index_bindings: item_trace.index_bindings,
         })
     }
 }
@@ -757,9 +778,9 @@ where
     AuthRef::Storage(DeferredAuthStorage {
         reference,
         selector,
-        resolve: Rc::new(move |reference| {
-            select_stored_value::<T>(&reference, &resolve_selector)
-        }),
+        // An entry argument's path is a single field name — no index to bind.
+        index_bindings: Vec::new(),
+        resolve: Rc::new(move |reference| select_stored_value::<T>(&reference, &resolve_selector)),
         marker: PhantomData,
     })
 }
@@ -773,6 +794,14 @@ pub fn typed_selector_path<Root, Selected>(
 type StorageResolveFn<Current> =
     Rc<dyn Fn(StorageRef) -> raster_core::Result<StorageValue<Current>>>;
 
+/// A storage binding that must travel alongside another one: the authorized
+/// value that supplied a [`SelectorSegment::BoundIndex`] in its path.
+///
+/// Named by content (see [`index_binding_name`]) rather than by the consuming
+/// parameter, because a `select!` does not know which tile argument the value it
+/// produces will eventually be passed as.
+pub type IndexBinding = (String, TraceStorageData);
+
 #[doc(hidden)]
 pub struct DeferredAuthStorage<Current> {
     reference: StorageRef,
@@ -781,6 +810,13 @@ pub struct DeferredAuthStorage<Current> {
     /// full path that storage can serve as a single indexed read — the
     /// value this binding was selected out of never has to materialize.
     selector: SelectorPath,
+    /// Bindings this one's selector cites by name through a `BoundIndex`
+    /// segment. They are resolved when the `select!` runs (the index value has
+    /// to be known to write the path at all) and carried here so that whatever
+    /// step eventually reads this value also records them — a `BoundIndex`
+    /// whose source is missing from the step's storage map is rejected by the
+    /// verifier, so this is what keeps an honest recording verifiable.
+    index_bindings: Vec<IndexBinding>,
     resolve: StorageResolveFn<Current>,
     marker: PhantomData<fn() -> Current>,
 }
@@ -805,6 +841,13 @@ impl<Current> AuthRef<Current> {
 pub struct AuthRefTrace {
     pub value: FnInputValue,
     pub storage: Option<TraceStorageData>,
+    /// Extra storage bindings this argument's path cites through a `BoundIndex`
+    /// segment. They belong in the step's `FnInput.storage` map but have no
+    /// entry in `values`/`args` — the tile does not take the index as a
+    /// parameter. This is the one place `storage` and `values` stop being
+    /// parallel; see `docs/proposals/dynamic-index-selection.md` §2.
+    #[serde(default)]
+    pub index_bindings: Vec<IndexBinding>,
 }
 
 impl<Root> Clone for TypedStorageBinding<Root> {
@@ -845,6 +888,7 @@ impl<Current> Clone for DeferredAuthStorage<Current> {
         Self {
             reference: self.reference.clone(),
             selector: self.selector.clone(),
+            index_bindings: self.index_bindings.clone(),
             resolve: self.resolve.clone(),
             marker: PhantomData,
         }
@@ -964,6 +1008,9 @@ where
         AuthRef::Storage(DeferredAuthStorage {
             reference,
             selector,
+            // A `TypedStorageBinding` is a root; any bound index in the path
+            // just handed to us is attached by `attach_index_bindings`.
+            index_bindings: Vec::new(),
             resolve: Rc::new(move |reference| {
                 let current = resolve(reference.clone())?;
                 select_storage_value::<Root, Selected>(&current, &resolve_selector)
@@ -1006,6 +1053,10 @@ where
                 AuthRef::Storage(DeferredAuthStorage {
                     reference: reference.clone(),
                     selector: full_selector,
+                    // Selecting *through* a value inherits its citations: the
+                    // composed path still contains the parent's `BoundIndex`
+                    // segments, so their sources must still reach the step.
+                    index_bindings: binding.index_bindings.clone(),
                     resolve: Rc::new(move |reference| {
                         // The composed path is anchored to the stored root
                         // `reference` names, so storage can serve the whole
@@ -1039,6 +1090,164 @@ where
     source.select(selector)
 }
 
+/// A value that may supply a `select!` index.
+///
+/// Implemented only for `AuthRef<T>` with `T` an unsigned integer, which is what
+/// makes "the index must be authorized, and must be an unsigned integer" a
+/// compile error rather than a runtime one. There is deliberately no blanket
+/// impl for plain integers: a computed or literal-valued index has no lineage,
+/// and an index without lineage is the prover-chosen index the whole mechanism
+/// exists to rule out. See `docs/proposals/dynamic-index-selection.md`.
+pub trait IndexSource {
+    /// The committed width of the supplying value. Load-bearing: leaf bytes are
+    /// fixed-width, so the verifier needs this to re-derive them.
+    const WIDTH: IndexWidth;
+
+    /// Materialize the index and the storage binding that authorizes it.
+    ///
+    /// Returns the index value, the binding to record, and any citations the
+    /// index's *own* path carried (a nested dynamic index).
+    ///
+    /// Takes `&self` so one authorized index can locate several values —
+    /// `rows[i]` and `cells[i]` in the same body. Consuming the reference would
+    /// force a `.clone()`, which the `select!` grammar rejects as a computed
+    /// index, making the shared-index case (the whole reason citations are
+    /// content-named and deduplicated) unwritable.
+    fn resolve_index(&self) -> raster_core::Result<(u64, TraceStorageData, Vec<IndexBinding>)>;
+}
+
+macro_rules! impl_index_source {
+    ($($ty:ty => $width:ident),* $(,)?) => {$(
+        impl IndexSource for AuthRef<$ty> {
+            const WIDTH: IndexWidth = IndexWidth::$width;
+
+            fn resolve_index(
+                &self,
+            ) -> raster_core::Result<(u64, TraceStorageData, Vec<IndexBinding>)> {
+                match self {
+                    // An inline value reached a sequence body without passing
+                    // through storage, so nothing commits to it. Rejecting here
+                    // is the runtime half of the type rule above.
+                    AuthRef::Inline(_) => Err(raster_core::Error::Other(
+                        "a select! index must be an authorized storage binding, \
+                         not an inline sequence value"
+                            .into(),
+                    )),
+                    AuthRef::Storage(binding) => {
+                        let resolved = (binding.resolve.as_ref())(binding.reference.clone())?;
+                        let data = TraceStorageData {
+                            coordinates: resolved.reference.coordinates.clone(),
+                            commitment: resolved.reference.commitment.clone(),
+                            selector: resolved.selector.clone(),
+                            selection: resolved.selection.clone(),
+                        };
+                        Ok((
+                            u64::from(resolved.value),
+                            data,
+                            binding.index_bindings.clone(),
+                        ))
+                    }
+                }
+            }
+        }
+    )*};
+}
+
+impl_index_source! {
+    u8 => U8,
+    u16 => U16,
+    u32 => U32,
+    u64 => U64,
+}
+
+/// Content-derived name for an index binding.
+///
+/// A `select!` cannot know which tile parameter its result will be passed as, so
+/// the name cannot be derived from the consumer. Hashing the binding itself
+/// gives two properties that matter:
+///
+/// * **collision-freedom with real parameters** — the `@` prefix is not a legal
+///   Rust identifier, so an index binding can never shadow an argument's entry
+///   in the step's storage map (which `resolved_source_at` looks up by
+///   parameter name);
+/// * **the same index used twice is one binding** — two selects citing the same
+///   authorized value produce identical `StorageData`, hence the same name, hence
+///   a single map entry. That is what makes "the same index" *mean* the same
+///   index rather than two independently forgeable ones.
+pub fn index_binding_name(data: &TraceStorageData) -> String {
+    let bytes = raster_core::postcard::to_allocvec(data).unwrap_or_default();
+    let digest = raster_core::input::selection_payload_hash(&bytes);
+    let mut name = String::from("@idx/");
+    for byte in digest.iter().take(8) {
+        name.push_str(&alloc::format!("{:02x}", byte));
+    }
+    name
+}
+
+/// Resolve a `select!` index expression into its selector segment, recording the
+/// binding that authorizes it into `sink`.
+///
+/// Called from `select!`'s expansion once per dynamic index. Resolution is eager
+/// because the path cannot be written without the index value — unlike the rest
+/// of a selection, which stays deferred. Panics on failure, matching how
+/// `select!` already treats an unresolvable path: a sequence body has no way to
+/// handle it, and continuing with a wrong index must not be possible.
+#[doc(hidden)]
+pub fn push_bound_index<I>(sink: &mut Vec<IndexBinding>, index: &I) -> SelectorSegment
+where
+    I: IndexSource,
+{
+    let (value, data, inherited) = index
+        .resolve_index()
+        .unwrap_or_else(|error| panic!("Failed to resolve select! index: {}", error));
+
+    let name = index_binding_name(&data);
+    // The index's own citations must also reach the step.
+    for binding in inherited {
+        if !sink.iter().any(|(existing, _)| *existing == binding.0) {
+            sink.push(binding);
+        }
+    }
+    if !sink.iter().any(|(existing, _)| *existing == name) {
+        sink.push((name.clone(), data));
+    }
+
+    SelectorSegment::BoundIndex {
+        index: value,
+        source: name,
+        width: I::WIDTH,
+    }
+}
+
+/// Attach the index bindings collected by a `select!` to the reference it
+/// produced, so every step that later reads it also records them.
+#[doc(hidden)]
+pub fn attach_index_bindings<T>(value: AuthRef<T>, bindings: Vec<IndexBinding>) -> AuthRef<T> {
+    if bindings.is_empty() {
+        return value;
+    }
+    match value {
+        // Unreachable through `select!` (selecting on an inline value already
+        // panics), but there is no correct way to attach a citation to a value
+        // that has no path, so say so rather than drop it silently.
+        AuthRef::Inline(_) => {
+            panic!("a select! with a dynamic index requires a storage-backed source")
+        }
+        AuthRef::Storage(mut binding) => {
+            for entry in bindings {
+                if !binding
+                    .index_bindings
+                    .iter()
+                    .any(|(existing, _)| *existing == entry.0)
+                {
+                    binding.index_bindings.push(entry);
+                }
+            }
+            AuthRef::Storage(binding)
+        }
+    }
+}
+
 pub fn selector_path(segments: Vec<SelectorSegment>) -> SelectorPath {
     SelectorPath::new(segments)
 }
@@ -1062,6 +1271,12 @@ enum ResolvedRecurList<T> {
     Storage {
         reference: StorageRef,
         value: Rc<StorageValue<List<T>>>,
+        /// Citations carried by the source list's own selector. Resolving the
+        /// list yields a `StorageValue`, which does not carry them, so they are
+        /// captured here — otherwise a recur over a list that was itself reached
+        /// through a bound index would emit per-item paths whose cited source
+        /// never reaches the step.
+        index_bindings: Vec<IndexBinding>,
     },
 }
 
@@ -1081,6 +1296,7 @@ where
             Ok(ResolvedRecurList::Storage {
                 reference: binding.reference.clone(),
                 value: Rc::new(value),
+                index_bindings: binding.index_bindings.clone(),
             })
         }
     }
@@ -1100,7 +1316,11 @@ impl<T> ResolvedRecurList<T> {
         let relative_selector = selector_path(Vec::from([SelectorSegment::Index(index)]));
 
         match self {
-            ResolvedRecurList::Storage { reference, value } => {
+            ResolvedRecurList::Storage {
+                reference,
+                value,
+                index_bindings,
+            } => {
                 let parent = value.clone();
                 let mut item_selector = parent.selector.clone();
                 item_selector
@@ -1111,6 +1331,11 @@ impl<T> ResolvedRecurList<T> {
                 Ok(AuthRef::Storage(DeferredAuthStorage {
                     reference: reference.clone(),
                     selector: item_selector,
+                    // A recur item's index is the loop counter, whose provenance
+                    // is structural (the CFS pins the driver) — it emits a plain
+                    // `Index` and cites nothing. Any citation already on the
+                    // list binding is inherited.
+                    index_bindings: index_bindings.clone(),
                     resolve: Rc::new(move |_| {
                         if let Ok(selected) =
                             select_stored_value::<T>(&parent.reference, &resolve_selector)
@@ -1193,6 +1418,9 @@ where
             AuthRef::Storage(DeferredAuthStorage {
                 reference: binding.reference,
                 selector: binding.selector,
+                // Chunking regroups elements without touching the path, so the
+                // citations it carries survive unchanged.
+                index_bindings: binding.index_bindings,
                 resolve: Rc::new(move |reference| {
                     let resolved = (inner.as_ref())(reference)?;
                     Ok(StorageValue::new_with_selection(
@@ -1228,6 +1456,8 @@ where
         AuthRef::Storage(DeferredAuthStorage {
             reference,
             selector: SelectorPath::default(),
+            // An empty path cites nothing.
+            index_bindings: Vec::new(),
             resolve: Rc::new(move |reference| (resolve)(reference)),
             marker: PhantomData,
         })
@@ -1249,6 +1479,22 @@ where
 
 pub trait IntoAuthValue<T> {
     fn into_auth_value(self) -> raster_core::Result<AuthValue<T>>;
+
+    /// Materialize, and also surrender the storage bindings this argument's path
+    /// cites through a `BoundIndex` segment.
+    ///
+    /// Materializing a reference resolves it to a `StorageValue`, which carries
+    /// no citations — so without this, passing a dynamically-indexed value into a
+    /// tile would record the value while dropping the binding that authorizes
+    /// its index, and the verifier would reject the step for a missing source.
+    /// Defaulted to "no citations", which is correct for every argument form
+    /// except [`AuthRef`]: only a reference can have been built by a `select!`.
+    fn into_auth_value_with_bindings(self) -> raster_core::Result<(AuthValue<T>, Vec<IndexBinding>)>
+    where
+        Self: Sized,
+    {
+        Ok((self.into_auth_value()?, Vec::new()))
+    }
 }
 
 /// The bounded tile-argument boundary: every plain tile argument is materialized
@@ -1327,6 +1573,19 @@ where
             }
         }
     }
+
+    fn into_auth_value_with_bindings(
+        self,
+    ) -> raster_core::Result<(AuthValue<Current>, Vec<IndexBinding>)> {
+        match self {
+            AuthRef::Inline(value) => Ok((AuthValue::inline(value), Vec::new())),
+            AuthRef::Storage(binding) => {
+                let bindings = binding.index_bindings.clone();
+                let value = (binding.resolve.as_ref())(binding.reference)?;
+                Ok((AuthValue::storage(value), bindings))
+            }
+        }
+    }
 }
 
 impl<T> IntoAuthRef<T> for RecurSequenceInput<T> {
@@ -1341,6 +1600,15 @@ where
 {
     fn into_auth_value(self) -> raster_core::Result<AuthValue<T>> {
         self.item.into_auth_value()
+    }
+
+    /// Forwards to the item: a recur-sequence item is an `AuthRef`, and if the
+    /// list it iterates was itself reached through a bound index, the item's
+    /// path carries that citation.
+    fn into_auth_value_with_bindings(
+        self,
+    ) -> raster_core::Result<(AuthValue<T>, Vec<IndexBinding>)> {
+        self.item.into_auth_value_with_bindings()
     }
 }
 
@@ -1393,6 +1661,20 @@ where
     arg.into_auth_value()
 }
 
+/// [`into_auth_value`], also yielding the argument's index citations.
+///
+/// This is what tile-argument materialization calls, so a dynamically-indexed
+/// value and the binding authorizing its index reach the step's storage map
+/// together.
+pub fn into_auth_value_with_bindings<T, A>(
+    arg: A,
+) -> raster_core::Result<(AuthValue<T>, Vec<IndexBinding>)>
+where
+    A: IntoAuthValue<T>,
+{
+    arg.into_auth_value_with_bindings()
+}
+
 pub fn auth_ref_trace<T>(arg: &AuthRef<T>) -> raster_core::Result<AuthRefTrace>
 where
     T: Serialize + DeserializeOwned,
@@ -1403,6 +1685,7 @@ where
                 raster_core::postcard::to_allocvec(value).unwrap_or_default(),
             ),
             storage: None,
+            index_bindings: Vec::new(),
         }),
         AuthRef::Storage(binding) => {
             let resolved = (binding.resolve.as_ref())(binding.reference.clone())?;
@@ -1414,6 +1697,7 @@ where
                     selector: resolved.selector,
                     selection: resolved.selection,
                 }),
+                index_bindings: binding.index_bindings.clone(),
             })
         }
     }

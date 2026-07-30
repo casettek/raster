@@ -86,8 +86,7 @@ impl<'a> CfsBuilder<'a> {
         // Only `main` produces a program output, and only when it returns a
         // non-unit value — its declared return type is the program's output
         // declaration (bound at runtime by the `ProgramEnd` step).
-        let produces_output =
-            seq.function.name == "main" && returns_non_unit(&seq.function.output);
+        let produces_output = seq.function.name == "main" && returns_non_unit(&seq.function.output);
 
         if seq.function.name == "main" && !seq.function.input_names.is_empty() {
             let items = resolver.resolve_with_entry_arguments(seq, &seq.function.input_names);
@@ -215,6 +214,7 @@ mod tests {
             output: Some("String".to_string()),
             signature: format!("fn {}()", name),
             selection_aliases: vec![],
+            selection_index_sources: vec![],
         }
     }
 
@@ -238,6 +238,7 @@ mod tests {
             output: None,
             signature: "fn main()".to_string(),
             selection_aliases: vec![],
+            selection_index_sources: vec![],
         }
     }
 

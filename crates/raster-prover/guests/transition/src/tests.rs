@@ -17,12 +17,12 @@ use raster_core::draft::{
 };
 use raster_core::input::{SchemaField, SchemaFieldMode, SchemaNode, Selectable};
 use raster_core::trace::{
-    ExecStep, ExecTarget, FnInput, FnInputArg, FnInputValue, StepKind, StorageData, StorageRoots,
-    StepRecord,
+    ExecStep, ExecTarget, FnInput, FnInputArg, FnInputValue, StepKind, StepRecord, StorageData,
+    StorageRoots,
 };
 use raster_core::transition::{
-    StorageEntry, StorageLogWitness, StorageReadWitness, StorageWitness,
-    StorageWriteWitness, SerializableFrontier,
+    SerializableFrontier, StorageEntry, StorageLogWitness, StorageReadWitness, StorageWitness,
+    StorageWriteWitness,
 };
 
 use crate::checks::cfs::verify_step_record_inputs;
@@ -444,10 +444,7 @@ fn build_storage_log_witness_for_entries(
     }
 }
 
-fn build_read_witness(
-    entries: &[StorageEntry],
-    entry: &StorageEntry,
-) -> StorageReadWitness {
+fn build_read_witness(entries: &[StorageEntry], entry: &StorageEntry) -> StorageReadWitness {
     let (_frontier, _root, index, _index_root) = build_storage_context(entries);
     let index_witness = coordinate_index_membership_proof(&index, &entry.coordinates)
         .expect("membership proof should exist");
@@ -468,8 +465,7 @@ fn build_write_witness(
         build_storage_context(before_entries);
     let mut after_entries = before_entries.to_vec();
     after_entries.push(new_entry.clone());
-    let (_frontier, _root, after_index, _after_index_root) =
-        build_storage_context(&after_entries);
+    let (_frontier, _root, after_index, _after_index_root) = build_storage_context(&after_entries);
     StorageWriteWitness {
         entry: new_entry.clone(),
         index_non_membership_witness: coordinate_index_non_membership_proof(
@@ -605,9 +601,7 @@ fn verify_storage_transition_rejects_duplicate_coordinates() {
 }
 
 #[test]
-#[should_panic(
-    expected = "Missing storage read witness for coordinates CfsCoordinates([0])"
-)]
+#[should_panic(expected = "Missing storage read witness for coordinates CfsCoordinates([0])")]
 fn verify_storage_transition_rejects_wrong_coordinates_with_correct_bytes() {
     let prior_entry = StorageEntry {
         coordinates: CfsCoordinates(vec![9]),
@@ -652,9 +646,7 @@ fn verify_storage_transition_rejects_wrong_coordinates_with_correct_bytes() {
 }
 
 #[test]
-#[should_panic(
-    expected = "Execution-step storage root before does not match current storage root"
-)]
+#[should_panic(expected = "Execution-step storage root before does not match current storage root")]
 fn verify_storage_transition_rejects_stale_root() {
     let new_entry = StorageEntry {
         coordinates: CfsCoordinates(vec![0]),
@@ -996,10 +988,7 @@ fn no_entrypoint_cfs() -> CfsCursor {
     })
 }
 
-fn two_arg_authorization_journal(
-    commitment_a: &[u8],
-    commitment_b: &[u8],
-) -> AuthorizationJournal {
+fn two_arg_authorization_journal(commitment_a: &[u8], commitment_b: &[u8]) -> AuthorizationJournal {
     AuthorizationJournal {
         external_inputs_commitments: [
             ("personal_data".to_string(), commitment_a.to_vec()),
@@ -1020,7 +1009,10 @@ fn dummy_storage_roots() -> StorageRoots {
     }
 }
 
-fn program_start_step(entry_arguments: Vec<String>, output_commitment: Vec<u8>) -> ProgramStartStep {
+fn program_start_step(
+    entry_arguments: Vec<String>,
+    output_commitment: Vec<u8>,
+) -> ProgramStartStep {
     ProgramStartStep {
         entry_arguments,
         output_commitment,
@@ -1043,10 +1035,7 @@ fn combined_root_matches_struct_hash_convention_over_declared_commitments() {
     let commitment_b = sha(b"seed-file");
     let journal = two_arg_authorization_journal(&commitment_a, &commitment_b);
 
-    let actual = combined_root(
-        &["personal_data".to_string(), "seed".to_string()],
-        &journal,
-    );
+    let actual = combined_root(&["personal_data".to_string(), "seed".to_string()], &journal);
 
     // The binding is an ordinary struct node over (name, commitment) pairs —
     // the same convention the selection tree uses, which is what lets a
@@ -1061,10 +1050,7 @@ fn combined_root_matches_struct_hash_convention_over_declared_commitments() {
 
     // Order matters: declaring the same two arguments in the opposite order
     // must produce a different root.
-    let swapped = combined_root(
-        &["seed".to_string(), "personal_data".to_string()],
-        &journal,
-    );
+    let swapped = combined_root(&["seed".to_string(), "personal_data".to_string()], &journal);
     assert_ne!(actual, swapped);
 }
 
@@ -1180,7 +1166,14 @@ fn genesis_authorization_rejects_unnecessary_witness_when_no_entry_arguments_dec
     let witness = build_read_witness(&[entry.clone()], &entry);
     let first_step = program_start_record(program_start_step(Vec::new(), Vec::new()));
 
-    verify_genesis_authorization(&cfs_cursor, &EMPTY_LEAF, &[], &journal, Some(&witness), &first_step);
+    verify_genesis_authorization(
+        &cfs_cursor,
+        &EMPTY_LEAF,
+        &[],
+        &journal,
+        Some(&witness),
+        &first_step,
+    );
 }
 
 #[test]
@@ -1221,8 +1214,7 @@ fn genesis_authorization_is_established_at_genesis_when_first_step_is_program_st
     // is the `ProgramStart` that binds and authorizes the entry arguments in
     // the same guest run, so authorization is established immediately.
     let names = vec!["personal_data".to_string(), "seed".to_string()];
-    let journal =
-        two_arg_authorization_journal(&sha(b"personal_data-file"), &sha(b"seed-file"));
+    let journal = two_arg_authorization_journal(&sha(b"personal_data-file"), &sha(b"seed-file"));
     let cfs_cursor = entrypoint_cfs(names.clone());
     let first_step = program_start_record(program_start_step(
         names.clone(),
@@ -1242,8 +1234,7 @@ fn genesis_authorization_rejects_a_late_window_missing_its_membership_witness() 
     // ProgramStart) must supply a membership witness; without one there is
     // nothing tying its storage to the manifest.
     let names = vec!["personal_data".to_string(), "seed".to_string()];
-    let journal =
-        two_arg_authorization_journal(&sha(b"personal_data-file"), &sha(b"seed-file"));
+    let journal = two_arg_authorization_journal(&sha(b"personal_data-file"), &sha(b"seed-file"));
     let cfs_cursor = entrypoint_cfs(names);
     let first_step = StepRecord {
         exec_index: 9,
@@ -1274,8 +1265,7 @@ fn genesis_authorization_rejects_forged_entry_object_commitment() {
         coordinates: CfsCoordinates(vec![]),
         object_commitment: sha(b"forged-combined-root"),
     };
-    let (_frontier, root, _index, index_root) =
-        build_storage_context(&[forged_entry.clone()]);
+    let (_frontier, root, _index, index_root) = build_storage_context(&[forged_entry.clone()]);
     let witness = build_read_witness(&[forged_entry.clone()], &forged_entry);
 
     // A membership witness is supplied, so the witness path is taken and
@@ -1306,10 +1296,10 @@ fn genesis_authorization_rejects_forged_entry_object_commitment() {
 mod fingerprint_slice {
     use super::*;
     use raster_core::fingerprint::{BitPacker, Fingerprint};
+    use raster_core::transition::InitTransition;
     use raster_core::transition::{
         FingerprintBlockWitness, FingerprintSliceWitness, TraceCommitmentHeader,
     };
-    use raster_core::transition::InitTransition;
 
     use crate::fraud_proof::assert_window_is_commitment_slice;
 

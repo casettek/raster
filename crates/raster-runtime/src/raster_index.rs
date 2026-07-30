@@ -1,5 +1,5 @@
 use raster_core::input::{
-    Hash32, ListProofDirection, ListProofSibling, SelectionProofStep, SelectorPath, SelectorSegment,
+    Hash32, ListProofDirection, ListProofSibling, SelectionProofStep, SelectorDescent, SelectorPath,
 };
 use raster_core::{Error, Result};
 use serde::{Deserialize, Serialize};
@@ -165,11 +165,11 @@ impl RasterIndex {
 
         for segment in &selector.segments {
             let node = self.node(current_id)?;
-            match (segment, &node.kind) {
-                (SelectorSegment::Field(field_name), RasterNodeKind::Struct { fields }) => {
+            match (segment.descent(), &node.kind) {
+                (SelectorDescent::Field(field_name), RasterNodeKind::Struct { fields }) => {
                     let target = fields
                         .iter()
-                        .find(|field| field.name == *field_name)
+                        .find(|field| field.name == field_name)
                         .ok_or_else(|| {
                             Error::Other(format!(
                                 "Selector field '{}' was not found in raster index",
@@ -178,33 +178,33 @@ impl RasterIndex {
                         })?;
                     current_id = target.child;
                 }
-                (SelectorSegment::Index(index), RasterNodeKind::List { len, elements, .. }) => {
-                    if *index >= *len {
+                (SelectorDescent::Index(index), RasterNodeKind::List { len, elements, .. }) => {
+                    if index >= *len {
                         return Err(Error::Other(format!(
                             "Selector index '{}' was not found in raster index",
                             index
                         )));
                     }
-                    current_id = *elements.get(*index as usize).ok_or_else(|| {
+                    current_id = *elements.get(index as usize).ok_or_else(|| {
                         Error::Serialization(format!(
                             "Malformed raster index: missing list element {}",
                             index
                         ))
                     })?;
                 }
-                (SelectorSegment::Field(field_name), _) => {
+                (SelectorDescent::Field(field_name), _) => {
                     return Err(Error::Other(format!(
                         "Selector field '{}' was not found in selected value",
                         field_name
                     )));
                 }
-                (SelectorSegment::Index(index), _) => {
+                (SelectorDescent::Index(index), _) => {
                     return Err(Error::Other(format!(
                         "Selector index '{}' was not found in selected value",
                         index
                     )));
                 }
-                (SelectorSegment::Range { start, end }, _) => {
+                (SelectorDescent::Range { start, end }, _) => {
                     return Err(Error::Other(format!(
                         "Selector range '{}..{}' is not supported for raster-encoded inputs yet",
                         start, end
@@ -232,11 +232,11 @@ impl RasterIndex {
 
         for segment in &selector.segments {
             let node = self.node(current_id)?;
-            match (segment, &node.kind) {
-                (SelectorSegment::Field(field_name), RasterNodeKind::Struct { fields }) => {
+            match (segment.descent(), &node.kind) {
+                (SelectorDescent::Field(field_name), RasterNodeKind::Struct { fields }) => {
                     let target_index = fields
                         .iter()
-                        .position(|field| field.name == *field_name)
+                        .position(|field| field.name == field_name)
                         .ok_or_else(|| {
                             Error::Other(format!(
                                 "Selector field '{}' was not found in raster index",
@@ -257,20 +257,20 @@ impl RasterIndex {
                     current_id = fields[target_index].child;
                 }
                 (
-                    SelectorSegment::Index(index),
+                    SelectorDescent::Index(index),
                     RasterNodeKind::List {
                         len,
                         elements,
                         merkle_levels,
                     },
                 ) => {
-                    if *index >= *len {
+                    if index >= *len {
                         return Err(Error::Other(format!(
                             "Selector index '{}' was not found in raster index",
                             index
                         )));
                     }
-                    let idx = *index as usize;
+                    let idx = index as usize;
                     let child = *elements.get(idx).ok_or_else(|| {
                         Error::Serialization(format!(
                             "Malformed raster index: missing list element {}",
@@ -278,25 +278,25 @@ impl RasterIndex {
                         ))
                     })?;
                     steps.push(SelectionProofStep::List {
-                        index: *index,
+                        index,
                         len: *len,
                         siblings: list_proof_siblings(merkle_levels, idx)?,
                     });
                     current_id = child;
                 }
-                (SelectorSegment::Field(field_name), _) => {
+                (SelectorDescent::Field(field_name), _) => {
                     return Err(Error::Other(format!(
                         "Selector field '{}' was not found in selected value",
                         field_name
                     )));
                 }
-                (SelectorSegment::Index(index), _) => {
+                (SelectorDescent::Index(index), _) => {
                     return Err(Error::Other(format!(
                         "Selector index '{}' was not found in selected value",
                         index
                     )));
                 }
-                (SelectorSegment::Range { start, end }, _) => {
+                (SelectorDescent::Range { start, end }, _) => {
                     return Err(Error::Other(format!(
                         "Selector range '{}..{}' is not supported for raster-encoded inputs yet",
                         start, end

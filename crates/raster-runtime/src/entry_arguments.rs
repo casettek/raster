@@ -89,8 +89,8 @@ pub struct EntryArgumentsBinding {
 /// still returns a placeholder binding so the caller uniformly publishes a
 /// `ProgramStart` event.
 pub fn start_program(args: &[EntryArgumentSpec]) -> Result<EntryArgumentsBinding> {
-    let coordinates = THREAD_SEQUENCE_CONTEXT
-        .with(|context| context.borrow().sequence_root_coordinates())?;
+    let coordinates =
+        THREAD_SEQUENCE_CONTEXT.with(|context| context.borrow().sequence_root_coordinates())?;
 
     if args.is_empty() {
         return Ok(EntryArgumentsBinding {

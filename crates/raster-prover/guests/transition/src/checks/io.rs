@@ -88,8 +88,9 @@ pub fn verify_step_record(
             expected_image_id.expect("tile step must resolve a registry image id");
         let replay_journal =
             replay_journal.expect("tile execution should provide a replay journal witness");
-        let replay_image_id_digest = risc0_zkvm::sha::Digest::try_from(expected_image_id.as_slice())
-            .expect("image_id must be 32 bytes");
+        let replay_image_id_digest =
+            risc0_zkvm::sha::Digest::try_from(expected_image_id.as_slice())
+                .expect("image_id must be 32 bytes");
         let replay_journal_bytes = postcard::to_allocvec(replay_journal)
             .expect("Failed to encode replay journal for receipt verification");
         env::verify(replay_image_id_digest, &replay_journal_bytes)

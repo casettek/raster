@@ -171,8 +171,8 @@ fn emit_program_artifacts(project: &Project) -> Result<()> {
     use raster_prover::replay::Replayer;
 
     let cfs = CfsBuilder::new(project).build()?;
-    let risc0 = Risc0Backend::new(project.output_dir.clone())
-        .with_user_crate(project.root_dir.clone());
+    let risc0 =
+        Risc0Backend::new(project.output_dir.clone()).with_user_crate(project.root_dir.clone());
     let replayer = Replayer::new(&risc0, project);
     let program = crate::program::assemble_program(project, &cfs, &replayer)?;
     let (bin_path, lock_path) =
@@ -192,8 +192,8 @@ pub fn program(verify: bool) -> Result<()> {
 
     let project = Project::new(project_path())?;
     let cfs = CfsBuilder::new(&project).build()?;
-    let risc0 = Risc0Backend::new(project.output_dir.clone())
-        .with_user_crate(project.root_dir.clone());
+    let risc0 =
+        Risc0Backend::new(project.output_dir.clone()).with_user_crate(project.root_dir.clone());
     let replayer = Replayer::new(&risc0, &project);
 
     let program = if verify {

@@ -83,6 +83,11 @@ pub struct FunctionAstItem {
     /// selection is a view of its source, so uses of `name` must bind to
     /// whatever `root` binds to.
     pub selection_aliases: Vec<(String, String)>,
+    /// `let name = select!(T, rows[idx])` locals, as `(name, [idx, ..])` — the
+    /// names supplying that selection's data-sourced indexes, in selector
+    /// order. Empty for every literal-index selection, which is why programs
+    /// that do not use the feature are unaffected.
+    pub selection_index_sources: Vec<(String, Vec<String>)>,
 }
 
 #[derive(Debug, Clone)]
@@ -173,6 +178,7 @@ impl ProjectAst {
                 visitor.visit_item_fn(func);
                 let call_infos = visitor.get_call_infos();
                 let selection_aliases = visitor.get_selection_aliases();
+                let selection_index_sources = visitor.get_selection_index_sources();
                 let function_info = FunctionAstItem {
                     name,
                     path: path.clone(),
@@ -183,6 +189,7 @@ impl ProjectAst {
                     output,
                     signature,
                     selection_aliases,
+                    selection_index_sources,
                 };
                 functions.push(function_info);
             }
@@ -275,6 +282,8 @@ pub struct CallVisitor {
     /// unknown identifier and fall back to treating committed data as if it
     /// were materialized in the body.
     selection_aliases: Vec<(String, String)>,
+    /// Per selection local, the names supplying its data-sourced indexes.
+    selection_index_sources: Vec<(String, Vec<String>)>,
 }
 
 impl CallVisitor {
@@ -283,6 +292,7 @@ impl CallVisitor {
             call_infos: Vec::new(),
             current_binding: None,
             selection_aliases: Vec::new(),
+            selection_index_sources: Vec::new(),
         }
     }
 
@@ -292,6 +302,10 @@ impl CallVisitor {
 
     fn get_selection_aliases(&self) -> Vec<(String, String)> {
         self.selection_aliases.clone()
+    }
+
+    fn get_selection_index_sources(&self) -> Vec<(String, Vec<String>)> {
+        self.selection_index_sources.clone()
     }
 
     /// Extracts the binding name from a pattern (e.g., `x` from `let x = ...`)
@@ -604,6 +618,49 @@ impl CallVisitor {
         Self::expr_root_ident(&args.expr)
     }
 
+    /// The names supplying a `select!`'s **data-sourced** indexes, outermost
+    /// segment first.
+    ///
+    /// `rows[token_id]` yields `["token_id"]`; `a.rows[i].cells[j]` yields
+    /// `["i", "j"]`; `rows[7]` and `rows[a..b]` yield nothing. The order matches
+    /// the selector's segment order, which is what lets the resolver line these
+    /// up with the `BoundIndex` segments the macro emits.
+    ///
+    /// Only a bare path counts, mirroring what `select!` itself accepts: the
+    /// macro rejects a computed index outright, so anything else here is not a
+    /// dynamic index the CFS needs to record.
+    fn selection_macro_index_roots(mac: &syn::Macro) -> Vec<String> {
+        let Ok(args) = mac.parse_body_with(SelectionMacroArgs::parse) else {
+            return Vec::new();
+        };
+        let mut roots = Vec::new();
+        Self::collect_index_roots(&args.expr, &mut roots);
+        roots
+    }
+
+    /// Walk a selector expression outside-in, collecting bare-path indexes.
+    ///
+    /// Recurses into the base *before* recording this level's index so the
+    /// collected order matches selector order (the base is the outer path).
+    fn collect_index_roots(expr: &Expr, roots: &mut Vec<String>) {
+        match expr {
+            Expr::Field(field) => Self::collect_index_roots(&field.base, roots),
+            Expr::Paren(paren) => Self::collect_index_roots(&paren.expr, roots),
+            Expr::MethodCall(call) => Self::collect_index_roots(&call.receiver, roots),
+            Expr::Reference(reference) => Self::collect_index_roots(&reference.expr, roots),
+            Expr::Try(try_expr) => Self::collect_index_roots(&try_expr.expr, roots),
+            Expr::Index(index) => {
+                Self::collect_index_roots(&index.expr, roots);
+                if let Expr::Path(path) = index.index.as_ref() {
+                    if let Some(ident) = path.path.get_ident() {
+                        roots.push(ident.to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn is_selection_macro(mac: &syn::Macro) -> bool {
         let segments: Vec<String> = mac
             .path
@@ -661,6 +718,11 @@ impl<'ast> Visit<'ast> for CallVisitor {
                 if Self::is_selection_macro(&expr_macro.mac) {
                     if let Some(root) = Self::selection_macro_root(&expr_macro.mac) {
                         self.selection_aliases.push((name.clone(), root));
+                    }
+                    let index_roots = Self::selection_macro_index_roots(&expr_macro.mac);
+                    if !index_roots.is_empty() {
+                        self.selection_index_sources
+                            .push((name.clone(), index_roots));
                     }
                 }
             }

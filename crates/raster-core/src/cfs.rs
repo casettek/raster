@@ -6,6 +6,7 @@
 //! - All sequences and their item composition
 //! - Data flow bindings between tiles, sequences, and external inputs
 
+use alloc::boxed::Box;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::ops::{Deref, DerefMut};
@@ -613,14 +614,40 @@ pub struct RecurSequenceItem {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum InputBinding {
     Direct(InputSource),
-    SequenceScope { input_index: usize },
-    PriorItemOutput { intra_sequence_item_index: usize },
+    SequenceScope {
+        input_index: usize,
+    },
+    PriorItemOutput {
+        intra_sequence_item_index: usize,
+    },
     /// One of `main`'s entry arguments, reached from the single authorized
     /// entry object at the sequence root (coordinates `[]`) that the
     /// `ProgramStart` step bound. `main` has no caller, so its arguments are
     /// not `SequenceScope`; and the entry object sits at the sequence root
     /// itself, which no `PriorItemOutput` index can name.
     EntryArgument,
+    /// A value whose selector reaches it through one or more **data-sourced**
+    /// list indexes (`select!(Row, rows[token_id])`).
+    ///
+    /// Composite rather than a peer of the variants above, because index
+    /// provenance is orthogonal to value provenance: the value still comes from
+    /// an entry argument, a prior item, or the caller's scope, and `value`
+    /// records which. `indexes` records where each index came from, in selector
+    /// order, so nesting (`a.rows[i].cells[j]`) is expressible.
+    ///
+    /// This is what makes "reads the element named by binding X" and "reads
+    /// element 7" different *programs*: the schema is hashed into program
+    /// identity, so the two cannot be swapped for one another behind a fixed
+    /// identity. Verification of the index values themselves is separate and
+    /// lives in [`crate::trace::verify_bound_index_bindings`]. See
+    /// `docs/proposals/dynamic-index-selection.md` §5.
+    ///
+    /// Declared last so the postcard variant indices of the four above — which
+    /// existing committed schemas encode — do not shift.
+    Indexed {
+        value: Box<InputBinding>,
+        indexes: Vec<InputBinding>,
+    },
 }
 
 impl InputBinding {
@@ -654,6 +681,37 @@ impl InputBinding {
     /// Create a binding to one of `main`'s entry arguments.
     pub fn entry_argument() -> Self {
         Self::EntryArgument
+    }
+
+    /// Wrap this binding as one reached through data-sourced list indexes.
+    ///
+    /// Returns `self` unchanged when `indexes` is empty, so a literal-index
+    /// selection keeps emitting exactly the binding it emits today — which is
+    /// what makes this phase a no-op for every existing program's identity.
+    pub fn indexed_by(self, indexes: Vec<InputBinding>) -> Self {
+        if indexes.is_empty() {
+            return self;
+        }
+        Self::Indexed {
+            value: Box::new(self),
+            indexes,
+        }
+    }
+
+    /// The underlying value binding, looking through any index wrapper.
+    pub fn value_binding(&self) -> &InputBinding {
+        match self {
+            Self::Indexed { value, .. } => value.value_binding(),
+            other => other,
+        }
+    }
+
+    /// The index bindings this one declares, in selector order.
+    pub fn index_bindings(&self) -> &[InputBinding] {
+        match self {
+            Self::Indexed { indexes, .. } => indexes.as_slice(),
+            _ => &[],
+        }
     }
 }
 

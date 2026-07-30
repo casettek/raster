@@ -82,9 +82,11 @@ fn expected_tile_image_id<'a>(
         StepKind::Exec(ExecStep {
             target: ExecTarget::Tile(name),
             ..
-        }) => Some(program.tile_image_id(name).unwrap_or_else(|| {
-            panic!("tile '{name}' has no image id in the program registry")
-        })),
+        }) => Some(
+            program
+                .tile_image_id(name)
+                .unwrap_or_else(|| panic!("tile '{name}' has no image id in the program registry")),
+        ),
         _ => None,
     }
 }
@@ -356,9 +358,8 @@ impl LiveTransition {
     ) -> Self {
         let frontier = deserialize_frontier(&init_transition.init_frontier)
             .expect("Invalid frontier in input");
-        let storage_frontier =
-            deserialize_frontier(&init_transition.init_storage_frontier)
-                .expect("Invalid storage frontier in input");
+        let storage_frontier = deserialize_frontier(&init_transition.init_storage_frontier)
+            .expect("Invalid storage frontier in input");
         assert_eq!(
             frontier_root(&storage_frontier),
             init_transition.init_storage_root,
@@ -488,11 +489,13 @@ impl LiveTransition {
             &input.step_record,
             self.next_expected_coordinates.as_ref(),
         );
-        self.next_expected_coordinates = Some(if matches!(input.step_record.kind, StepKind::ProgramEnd(_)) {
-            Vec::new()
-        } else {
-            next_coordinates
-        });
+        self.next_expected_coordinates = Some(
+            if matches!(input.step_record.kind, StepKind::ProgramEnd(_)) {
+                Vec::new()
+            } else {
+                next_coordinates
+            },
+        );
         checks::drafts::verify_draft_transition(
             &input.step_record,
             input.replay_journal.as_ref(),
@@ -582,7 +585,10 @@ pub fn commit_journal(
         current_state,
         transition_image_id,
         authorization_image_id: input.authorization_image_id.clone(),
-        input_manifest_commitment: input.authorization_journal.input_manifest_commitment.clone(),
+        input_manifest_commitment: input
+            .authorization_journal
+            .input_manifest_commitment
+            .clone(),
         program_commitment,
         refuted_trace_commitment,
         entrypoint_authorization,

@@ -109,8 +109,10 @@ fn main(personal_data: PersonalData, personal_data_bin: PersonalData, seed: u64)
     // Phase 1: select a contiguous slice of address lines as ONE authenticated
     // input. `lines[0..2]` yields a single SelectionCommitment, so the tile
     // records a single external binding for the whole slice.
-    let first_two_lines =
-        select!(Block<String>, personal_data_bin.clone().addresses[0].lines[0..2]);
+    let first_two_lines = select!(
+        Block<String>,
+        personal_data_bin.clone().addresses[0].lines[0..2]
+    );
     let joined_lines = call!(join_address_lines, first_two_lines);
     println!("joined address slice: {:?}", joined_lines);
 
