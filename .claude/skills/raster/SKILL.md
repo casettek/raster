@@ -119,8 +119,8 @@ authorized program output (ProgramEnd → output.bin + manifest)
     append instead of returning rebuilt collections;
   - don't `select!` a whole value just to "have it" — select only at the
     point where a tile consumes it;
-  - `.clone()` on a sequence binding clones a reference (cheap); materializing
-    that binding into a tile is what costs.
+  - `clone!(binding)` clones a reference (cheap); materializing that binding
+    into a tile is what costs.
 
 ### Collections are `List<T>`; the only tile-visible window is `Block<T>`
 
@@ -232,7 +232,7 @@ everything outside this list as forbidden:
 | draft creation / finish | `new!(Type)` / `finalize(draft)` (§6) |
 | explicit storage ref | `storage!(Type, reference)` |
 | binding a result | `let x = <one of the above>;` — simple identifier only |
-| cloning a binding | `binding.clone()` — clones the reference, cheap |
+| cloning a binding | `clone!(binding)` — clones the reference, cheap |
 | output | `raster::println!(...)` / `println!(...)` for debug |
 | return | last expression = a binding or call result |
 
@@ -288,7 +288,9 @@ let two_lines    = select!(Block<String>, personal_data.addresses[0].lines[0..2]
 - A **whole-collection** select names `List<T>`; a **range** `[a..b]` select
   names `Block<T>` (the macro rejects either target used the other way, §2).
 - Every struct traversed by a path must derive `Selectable`.
-- `.clone()` the source binding when it is used again later.
+- `clone!` the source binding when it is used again later. Inside a `select!`
+  path a bare `.clone()` is still the spelling (`personal_data.clone().name`) —
+  it is part of the selector expression, not a sequence step.
 - **Select the smallest value a tile actually needs, exactly where it is
   consumed** (§2 cost rules): a field beats the struct, one slice selection
   beats N element selections, and an unused selection is pure waste.
@@ -303,9 +305,18 @@ let token_id = select!(u32, prompt.token_ids[0]);
 let row      = select!(EmbeddingRow, table.rows[token_id]);   // O(log n) proof
 
 // Inside a recur sequence, the item itself is the index:
-let wanted = input.into_ref();                 // AuthRef, nothing materialized
+let wanted = into_ref!(input);                 // AuthRef, nothing materialized
 let row    = select!(Row, rows[wanted]);
 ```
+
+- **`into_ref!(handle)`** unwraps a recur-sequence item to its `AuthRef`. A
+  `RecurSequenceInput<T>` is a handle, not a reference: it does not implement
+  `SelectSource`, so `select!` cannot reach into it, and passing it to a tile
+  materializes the whole item. `into_ref!` is what lets you index by an item, or
+  select one field out of a wide one, without materializing anything. It is a
+  **macro, not a method** — the CFS attributes provenance by recognizing the
+  grammar's macros, so a bare method call would leave the local unattributed
+  (`InputSource::Inline`): an argument the schema pins to nothing.
 
 - The index must be an `AuthRef<uN>` (`u8`/`u16`/`u32`/`u64`) — an authorized
   value. A literal, a computed expression (`i + 1`), a `.clone()`, or a signed

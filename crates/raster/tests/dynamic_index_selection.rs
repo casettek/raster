@@ -303,15 +303,15 @@ fn append_gathered(output: Draft<Gathered>, row: Row) -> Draft<Gathered> {
 }
 
 /// One authorized row per item, by index — no scan, no fold state carrying a
-/// matched row. The item handle yields an `AuthRef` without materializing, which
-/// is what lets the id go straight into the selector.
+/// matched row. `into_ref!` yields the item's `AuthRef` without materializing
+/// it, which is what lets the id go straight into the selector.
 #[sequence(kind = recur)]
 fn gather_each(
     input: RecurSequenceInput<u32>,
     output: RecurSequenceOutput<Gathered>,
     rows: List<Row>,
 ) -> RecurSequenceOutput<Gathered> {
-    let wanted = input.into_ref();
+    let wanted = into_ref!(input);
     let row = select!(Row, rows[wanted]);
     call!(append_gathered, output, row)
 }

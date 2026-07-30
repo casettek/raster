@@ -211,23 +211,20 @@ impl<T> RecurSequenceInput<T> {
         &self.item
     }
 
-    /// The item as an authorized reference, without materializing it.
+    /// Implementation of [`into_ref!`](crate::into_ref) — call the macro, not
+    /// this.
     ///
-    /// A recur-sequence item handle can only be *read* once, by passing it to a
-    /// tile. This hands out the reference instead, which is what lets an item
-    /// supply a `select!` index directly:
+    /// Hidden deliberately. The CFS flow resolver reads the sequence body as
+    /// source and attributes provenance by recognizing the grammar's *macros*
+    /// by name; a bare method call is a form it cannot attribute, so a local
+    /// bound to one resolves to `InputSource::Inline` — a step argument the
+    /// schema does not pin to any upstream binding. Making the macro the only
+    /// public spelling keeps the surface and the analysis in agreement by
+    /// construction, rather than by convention.
     ///
-    /// ```ignore
-    /// let token_id = input.into_ref();
-    /// let row = select!(EmbeddingRow, rows[token_id]);
-    /// ```
-    ///
-    /// An inherent method rather than [`IntoAuthRef`] because the blanket
-    /// `impl<T: Serialize> IntoAuthRef<T> for T` makes `into_auth_ref()` on a
-    /// handle ambiguous; inherent resolution wins, so this spelling is
-    /// unambiguous at the call site. It materializes nothing: the reference
-    /// resolves only when a step reads it.
-    pub fn into_ref(self) -> AuthRef<T> {
+    /// Materializes nothing: the reference resolves only when a step reads it.
+    #[doc(hidden)]
+    pub fn __raster_into_ref(self) -> AuthRef<T> {
         self.item
     }
 }
@@ -1894,6 +1891,24 @@ pub fn resolve_storage_ok_value<T: DeserializeOwned + Serialize>(
             "Result-backed storage input resolution requires the `std` feature"
         )))
     }
+}
+
+/// Implementation of [`clone!`](crate::clone) — call the macro, not this.
+///
+/// A single choke point for duplicating a sequence binding. Bindings are
+/// *references*, so this copies a handle, never data.
+///
+/// Taking `&T` rather than `self` keeps the macro's argument borrowed, which is
+/// what lets `clone!(x)` appear in an argument list without moving `x`. The
+/// `Clone` bound is what keeps linear handles linear: `Draft<S>` is deliberately
+/// not `Clone`, so `clone!(draft)` does not compile — the same rule the
+/// `draft_handle_cannot_clone` UI test pins.
+#[doc(hidden)]
+pub fn __raster_clone<T>(value: &T) -> T
+where
+    T: Clone,
+{
+    value.clone()
 }
 
 pub fn new_draft<S>() -> Draft<S>

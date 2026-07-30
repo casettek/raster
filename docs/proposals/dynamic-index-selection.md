@@ -1,16 +1,31 @@
 # Proposal: `dynamic-index-selection` — selecting a list element by an authorized value
 
-Status: Phase 1 + Phase 2 implemented (2026-07-30; proposed 2026-07-29).
-Phase 3 (migrating `raster-chain-inference`) is not done — it lives in a
-separate repository and still carries the unsettled width-check decision the
-appendix describes.
+Status: Phase 1 + Phase 2 + Phase 3 implemented (2026-07-30; proposed
+2026-07-29). Phase 3 migrated `raster-chain-inference`'s `input-embedding` and
+`prefill-prepare-aux` off their scans; it took **option 1** on the width check
+(kept, now carrying width violations and table-ordering violations rather than
+misses), leaving option 2 to be argued on its own terms as this document asks.
+Chain output is bit-identical before and after the migration.
 
 Two things the implementation settled that this document had left open or wrong:
 
-- **`RecurSequenceInput::into_ref()`** is the "small addition to the
-  recur-sequence input surface" the appendix anticipated. It is inherent, not a
-  trait method, because the blanket `impl<T: Serialize> IntoAuthRef<T> for T`
-  makes `into_auth_ref()` ambiguous on a handle.
+- **`into_ref!(handle)`** is the "small addition to the recur-sequence input
+  surface" the appendix anticipated. It shipped first as an inherent method
+  (`RecurSequenceInput::into_ref()`) — a trait method was ruled out because the
+  blanket `impl<T: Serialize> IntoAuthRef<T> for T` makes `into_auth_ref()`
+  ambiguous on a handle — and that spelling was **wrong**, in a way the CFS
+  caught only once a real program used it. The flow resolver attributes
+  provenance by parsing the sequence body and recognizing the grammar's macros
+  by name (`CallVisitor::visit_local`); a bare method call is a form it cannot
+  attribute, so `let id = input.into_ref();` left `id` unresolved and every
+  argument reached from it — including the `BoundIndex` citation — was recorded
+  as `InputSource::Inline`. That is precisely the unauthenticated index §3
+  exists to rule out, arriving through the surface built to express it. The fix
+  is that the only public spelling is a macro; the method survives as
+  `__raster_into_ref`, `#[doc(hidden)]`. General lesson: **a sequence-body form
+  the flow resolver cannot name is unsound by default**, because `Inline` is the
+  permissive fallback — so new surface belongs in the macro grammar, not on an
+  inherent impl.
 - **`IndexSource::resolve_index` takes `&self`.** Consuming the reference makes
   the shared-index case (§"The same index used twice") unwritable, because the
   `.clone()` it would require is a *computed* index by this grammar and the
@@ -434,7 +449,7 @@ fn embed_prompt_token(
     rows: List<EmbeddingRow>,
     hidden_size: u32,
 ) -> RecurSequenceOutput<ActivationSequence> {
-    let token_id = input.into_ref();                     // AuthRef<u32>, unmaterialized
+    let token_id = into_ref!(input);                     // AuthRef<u32>, unmaterialized
     let row = select!(EmbeddingRow, rows[token_id]);      // one authenticated read
     call!(append_activation_row, output, row, hidden_size)
 }
@@ -446,9 +461,9 @@ Two details the first draft glossed, one of them awkward:
 
 - `input` is a `RecurSequenceInput<u32>` handle, not an `AuthRef<u32>`. Getting a
   reference out of it without materializing it is a small addition to the
-  recur-sequence input surface, and it is what keeps the id from needing its own
-  tile call. (Falling back to `call!(begin_row_lookup, …)` also works and costs
-  one tile per token, as today.)
+  recur-sequence input surface — `into_ref!` — and it is what keeps the id from
+  needing its own tile call. (Falling back to `call!(begin_row_lookup, …)` also
+  works and costs one tile per token, as today.)
 - **`hidden_size` does not cleanly go away, and neither does the error list.**
   The current program rejects a table row whose packed width disagrees with the
   declared `hidden_size`. That check cannot move into `append_activation_row` as

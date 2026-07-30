@@ -17,7 +17,7 @@ pub use raster_core::draft;
 
 pub mod input;
 pub use input::{
-    attach_index_bindings, auth_ref_result_trace, auth_ref_trace, chunk_auth_ref,
+    __raster_clone, attach_index_bindings, auth_ref_result_trace, auth_ref_trace, chunk_auth_ref,
     draft_replay_handle, draft_replay_transition, entry_argument_auth_ref, finalize,
     index_binding_name, into_auth_ref, into_auth_value, into_auth_value_with_bindings, into_draft,
     materialize_auth_result, materialize_auth_return, new_draft, push_bound_index,
@@ -561,6 +561,64 @@ macro_rules! new {
     };
 }
 
+/// A recur-sequence item as an authorized reference, without materializing it.
+///
+/// A `RecurSequenceInput<T>` is a handle, not a reference: it can be *read*
+/// once, by passing it to a tile, and it does not implement `SelectSource`, so
+/// `select!` cannot reach into it. `into_ref!` unwraps the handle to the
+/// `AuthRef<T>` inside, which is what lets an item narrow through `select!` or
+/// supply a `select!` index:
+///
+/// ```ignore
+/// let activation = into_ref!(input);                       // no materialization
+/// let token_id = select!(u32, activation.clone().token_id);
+/// let row = select!(EmbeddingRow, rows[token_id]);          // dynamic index
+/// ```
+///
+/// Without it the only way to reach one field of an item is to materialize the
+/// whole item into a tile — for a wide item (an activation row at model
+/// hidden-size) that copies the entire row in and back out to read a `u32`.
+///
+/// **A macro rather than a method**, even though it expands to one. The CFS
+/// flow resolver attributes provenance by parsing the sequence body, and it
+/// recognizes the grammar's macros by name; a bare method call is a form it
+/// cannot attribute, so `let x = handle.method();` resolves to
+/// `InputSource::Inline` — a step argument the schema does not pin to any
+/// upstream binding. Keeping this a macro means the only spelling available is
+/// the one the analysis understands.
+#[macro_export]
+macro_rules! into_ref {
+    ($input:expr) => {
+        $input.__raster_into_ref()
+    };
+}
+
+/// Duplicates a sequence binding so it can be used again.
+///
+/// Sequence bindings are authorized *references*, so this copies a handle, not
+/// data — the cost is a pointer, not the value it points at:
+///
+/// ```ignore
+/// let projected = call!(project_row, clone!(token_id), activation_hex);
+/// call!(combine_row, output, token_id, projected)
+/// ```
+///
+/// **The DSL spelling of `.clone()`, and the one to write.** A bare
+/// `binding.clone()` still compiles and is still analyzed correctly in an
+/// *argument* position, but the grammar the CFS flow resolver recognizes is
+/// made of macros, and keeping every sequence-body form inside it is what makes
+/// the analysis total rather than best-effort. See
+/// `docs/proposals/sequence-grammar-closure.md`.
+///
+/// Does not work on a `Draft<S>`: draft handles are linear — one live handle,
+/// rebound at every step — and `Draft` is deliberately not `Clone`.
+#[macro_export]
+macro_rules! clone {
+    ($binding:expr) => {
+        $crate::__raster_clone(&$binding)
+    };
+}
+
 /// Canonical call primitive for invoking a sub-sequence inside a sequence.
 ///
 /// `call_seq!` is the explicit "sequence call boundary" — use it instead of bare
@@ -647,7 +705,8 @@ pub mod prelude {
 
     pub use crate::exec::Result;
     pub use crate::{
-        call, call_recur, call_recur_seq, call_seq, finalize, into_auth_ref, into_draft,
+        call, call_recur, call_recur_seq, call_seq, clone, finalize, into_auth_ref, into_draft,
+        into_ref,
         materialize_auth_result, materialize_auth_return, new, select, sequence, storage, tile,
         Anchor, AuthRef, AuthValue, Block, Draft, IndexSource, IndexWidth, IntoAuthRef,
         IntoAuthValue, IntoDraft, List, ListProofDirection, ListProofSibling, Materializable, Op,

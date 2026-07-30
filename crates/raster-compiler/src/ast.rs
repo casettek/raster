@@ -607,6 +607,9 @@ impl CallVisitor {
             Expr::Macro(expr_macro) if Self::is_selection_macro(&expr_macro.mac) => {
                 Self::selection_macro_root(&expr_macro.mac)
             }
+            Expr::Macro(expr_macro) if Self::is_reference_macro(&expr_macro.mac) => {
+                Self::reference_macro_root(&expr_macro.mac)
+            }
             _ => None,
         }
     }
@@ -616,6 +619,19 @@ impl CallVisitor {
     fn selection_macro_root(mac: &syn::Macro) -> Option<String> {
         let args = mac.parse_body_with(SelectionMacroArgs::parse).ok()?;
         Self::expr_root_ident(&args.expr)
+    }
+
+    /// The root identifier of a **reference macro** — `into_ref!(handle)` or
+    /// `clone!(binding)`.
+    ///
+    /// Both take a single expression and hand back a reference to the same
+    /// data: `into_ref!` unwraps a recur-item handle, `clone!` duplicates a
+    /// binding. Neither narrows, computes, or produces a step, so the result
+    /// carries exactly the provenance of its argument — which is why they
+    /// resolve like selections rather than like calls.
+    fn reference_macro_root(mac: &syn::Macro) -> Option<String> {
+        let expr = mac.parse_body_with(Expr::parse).ok()?;
+        Self::expr_root_ident(&expr)
     }
 
     /// The names supplying a `select!`'s **data-sourced** indexes, outermost
@@ -662,6 +678,21 @@ impl CallVisitor {
     }
 
     fn is_selection_macro(mac: &syn::Macro) -> bool {
+        Self::macro_path_is(mac, "select")
+    }
+
+    /// A **reference macro**: `into_ref!` (recur-item unwrap) or `clone!`
+    /// (binding duplication).
+    ///
+    /// Grouped with `select!` rather than with the call primitives because
+    /// neither produces a step: like a selection, each re-points at data that
+    /// already exists, so its result carries its argument's provenance.
+    fn is_reference_macro(mac: &syn::Macro) -> bool {
+        Self::macro_path_is(mac, "into_ref") || Self::macro_path_is(mac, "clone")
+    }
+
+    /// Whether a macro path is `name!` or `raster::name!`.
+    fn macro_path_is(mac: &syn::Macro, name: &str) -> bool {
         let segments: Vec<String> = mac
             .path
             .segments
@@ -670,8 +701,8 @@ impl CallVisitor {
             .collect();
 
         match segments.as_slice() {
-            [name] => name == "select",
-            [prefix, name] => prefix == "raster" && name == "select",
+            [only] => only == name,
+            [prefix, last] => prefix == "raster" && last == name,
             _ => false,
         }
     }
@@ -709,9 +740,13 @@ impl<'ast> Visit<'ast> for CallVisitor {
     fn visit_local(&mut self, node: &'ast Local) {
         let binding_name = Self::extract_binding_name(&node.pat);
 
-        // `let name = select!(T, root.field)` binds a *view* of `root`, not a
-        // new value — record it so uses of `name` resolve to `root`'s
-        // binding. Call results are handled separately, through
+        // `let name = select!(T, root.field)` and `let name = into_ref!(root)`
+        // both bind a *view* of `root`, not a new value — record it so uses of
+        // `name` resolve to `root`'s binding. Missing this is not a cosmetic
+        // gap: an unattributed local resolves to `InputSource::Inline`, and an
+        // `Inline` argument is one the schema does not pin to any upstream
+        // binding, so a claimed trace could substitute bytes for it and still
+        // verify. Call results are handled separately, through
         // `current_binding` / `result_binding`.
         if let (Some(name), Some(init)) = (binding_name.as_ref(), node.init.as_ref()) {
             if let Expr::Macro(expr_macro) = init.expr.as_ref() {
@@ -723,6 +758,23 @@ impl<'ast> Visit<'ast> for CallVisitor {
                     if !index_roots.is_empty() {
                         self.selection_index_sources
                             .push((name.clone(), index_roots));
+                    }
+                } else if Self::is_reference_macro(&expr_macro.mac) {
+                    if let Some(root) = Self::reference_macro_root(&expr_macro.mac) {
+                        self.selection_aliases.push((name.clone(), root));
+                    }
+                }
+            // A bare `binding.clone()` is the pre-DSL spelling of `clone!`. It
+            // is still legal Rust and still correct in an *argument* position
+            // (`classify_argument` roots it through the receiver), so analyzing
+            // it here keeps the two positions from disagreeing while `clone!`
+            // becomes the written form. Allowlisted by name rather than
+            // accepting any method: a wrong alias claims provenance that does
+            // not hold, which is worse than claiming none.
+            } else if let Expr::MethodCall(call) = init.expr.as_ref() {
+                if call.method == "clone" {
+                    if let Some(root) = Self::expr_root_ident(&call.receiver) {
+                        self.selection_aliases.push((name.clone(), root));
                     }
                 }
             }
@@ -985,6 +1037,92 @@ mod tests {
                 ("name".to_string(), "personal_data".to_string()),
                 ("seed".to_string(), "seed".to_string()),
             ]
+        );
+    }
+
+    /// The reference macros — `into_ref!` and `clone!` — hand back a reference
+    /// to the same data, so the local must alias to their argument. Without
+    /// this the local is unattributed and resolves to `InputSource::Inline`: an
+    /// argument the schema pins to nothing.
+    #[test]
+    fn test_reference_macros_alias_to_their_argument() {
+        let file: syn::File = syn::parse_str(
+            r#"fn seq() {
+                let activation = into_ref!(input);
+                let qualified = raster::into_ref!(input);
+                let params_again = clone!(params);
+                let token_id = select!(u32, activation.clone().token_id);
+            }"#,
+        )
+        .expect("Failed to parse test code");
+        let mut visitor = CallVisitor::new();
+        visitor.visit_file(&file);
+
+        assert_eq!(
+            visitor.get_selection_aliases(),
+            vec![
+                ("activation".to_string(), "input".to_string()),
+                ("qualified".to_string(), "input".to_string()),
+                ("params_again".to_string(), "params".to_string()),
+                ("token_id".to_string(), "activation".to_string()),
+            ]
+        );
+    }
+
+    /// The pre-DSL spelling. `clone!` is the form to write, but a bare
+    /// `.clone()` is legal Rust and is already rooted correctly in argument
+    /// position — so a `let` bound to one must agree, or the same expression
+    /// means two different things depending on where it appears.
+    ///
+    /// Only `clone` is allowlisted: an arbitrary method may not preserve
+    /// provenance, and a wrong alias is worse than no alias.
+    #[test]
+    fn test_bare_clone_method_aliases_but_other_methods_do_not() {
+        let file: syn::File = syn::parse_str(
+            r#"fn seq() {
+                let copy = params.clone();
+                let nested = layer.params.clone();
+                let opaque = handle.into_inner();
+            }"#,
+        )
+        .expect("Failed to parse test code");
+        let mut visitor = CallVisitor::new();
+        visitor.visit_file(&file);
+
+        assert_eq!(
+            visitor.get_selection_aliases(),
+            vec![
+                ("copy".to_string(), "params".to_string()),
+                ("nested".to_string(), "layer".to_string()),
+            ],
+            "`into_inner` is not a provenance-preserving form and must not alias"
+        );
+    }
+
+    /// The index roots of a `select!` are what the CFS records as citations, so
+    /// this is the AST half of `Indexed`. Nothing covered it before, which is
+    /// why an unattributed index could reach the schema unnoticed.
+    #[test]
+    fn test_selection_index_sources_record_dynamic_indexes() {
+        let file: syn::File = syn::parse_str(
+            r#"fn seq() {
+                let row = select!(Row, rows[token_id]);
+                let cell = select!(Cell, grid[i].cells[j]);
+                let fixed = select!(Row, rows[7]);
+                let window = select!(Block<Row>, rows[0..4]);
+            }"#,
+        )
+        .expect("Failed to parse test code");
+        let mut visitor = CallVisitor::new();
+        visitor.visit_file(&file);
+
+        assert_eq!(
+            visitor.get_selection_index_sources(),
+            vec![
+                ("row".to_string(), vec!["token_id".to_string()]),
+                ("cell".to_string(), vec!["i".to_string(), "j".to_string()]),
+            ],
+            "literal and range indexes cite nothing; data-sourced ones cite in selector order"
         );
     }
 
