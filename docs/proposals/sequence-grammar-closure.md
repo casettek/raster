@@ -5,7 +5,9 @@ Status: Proposed (2026-07-30). Phase 1 (`clone!`, `into_ref!`, and the
 the default.
 Related: [`dynamic-index-selection.md`](./dynamic-index-selection.md) — the
 `into_ref` incident described there is one instance of the class this proposal
-closes. [`authoring-skill-and-tooling.md`](./authoring-skill-and-tooling.md) —
+closes. [`draft-provenance.md`](./draft-provenance.md) — a *second* instance,
+found after Phase 1: it argues the `finalize(d)` row of the surface table below
+is misclassified, and answers the "Should `Fresh` be narrower?" open question. [`authoring-skill-and-tooling.md`](./authoring-skill-and-tooling.md) —
 the sequence grammar currently lives there as prose; this makes one copy of it
 executable.
 
@@ -162,6 +164,11 @@ cost only grows.
   every unrecognized `Expr::Call` as `Fresh` rather than `Unrecognized` would
   re-open a smaller version of the same hole. Proposed: allowlist `finalize` by
   name and reject other calls, consistent with how `clone` is allowlisted.
+  **Superseded by [`draft-provenance.md`](./draft-provenance.md)**, which argues
+  `finalize` is a `Narrowing` rather than `Fresh` at all — measured against
+  `hello-tiles`, whose draft chain the resolver tracks through items 5→6→7 and
+  then drops at item 8. Making it a `finalize!` macro removes the need for an
+  allowlist: no `Expr::Call` need ever be recognized.
 - **Does the proc-macro diagnostic need the full CFS?** It only needs to
   classify forms, not resolve bindings — so the shared crate can be small
   (the enum plus the macro-name predicates). Worth confirming before committing

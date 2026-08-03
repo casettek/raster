@@ -54,6 +54,13 @@ Rules:
 - **Target-type vocabulary:** a whole-collection select names `List<T>`; a
   range `[a..b]` select names `Block<T>`. The macro rejects a `Block` target
   without a range and a range target that isn't `Block`.
+- **Derive `Selectable`/`Serialize`/`Deserialize`; never hand-write them.** The
+  derive is what makes the host's selector path and the guest's decode agree on
+  the same bytes; a manual impl (or a manual `Default`/`Ord`/`PartialEq` a tile
+  relies on) can silently diverge between native execution and replay, which
+  surfaces as an audit divergence with a clean native run. Any other computation
+  in an `impl` block on a Rastered type is governed by SKILL.md §3, "Where code
+  may live".
 - `.clone()` the source when it is used again later in the sequence.
 - Select the smallest thing the consuming tile needs. Feeding blocks: one
   range selection → one `Block<T>` tile input beats N single-element selections.
@@ -133,6 +140,29 @@ cargo raster run --input input.json --input-manifest input_manifest.json
 
 Adding/renaming/retyping a `main` parameter ⇒ regenerate fixtures, or the run
 fails to resolve/authorize the argument.
+
+**An entry argument must carry information.** A commitment attests *which
+bytes*, never *that the bytes mean anything* — so a field the generator
+computes from another field of the same input (`rounds: (0..chars.len())`,
+`count: items.len()`, a duplicated key) is committed to nothing and
+constrains nothing. Two failure modes follow, and both survive the whole
+check ladder:
+
+- **Derived scalars that the program then trusts.** Only pre-derive a value
+  when it is a static property of an already-committed table and the
+  derivation is part of the fixture's meaning (e.g. `unk_id` /
+  `max_special_len` in `raster-tokenizer`'s `GemmaTokenizer` — covered by the
+  same commitment as the vocabulary they come from). If the program would
+  behave differently for a *wrong* derived value, it must compute it in a
+  tile.
+- **Fabricated collections used to drive control flow.** A counter list
+  committed so a `call_recur!` has something of the right length to iterate
+  hands the loop's trip count to whoever writes the fixture. This is the
+  worst version of the fake recur precisely because it is committed; see
+  `references/recur.md` §2, "the committed counter list".
+
+The test: could a verifier disagree with this field? If its value is forced
+by the rest of the input, it belongs in a tile or nowhere.
 
 ## 4. Program output — the `ProgramEnd` contract
 

@@ -216,6 +216,31 @@ Hard rules:
   and recur calls (§7), build results through drafts. Use `estimated_cycles`
   to document known-heavy tiles.
 
+### Where code may live — the tile boundary is what pins it
+
+Program identity commits to the **tile image-id registry** (§8): code reachable
+from a tile body is compiled into a guest and pinned by that tile's image id.
+Code that only the host ever calls is in `program_commitment` nowhere. So the
+rule is not "no methods on data types" — a tile body is plain Rust and may call
+helpers freely — it is that **anything the program's result depends on must be
+reachable from a tile body**. An `impl` block is the easiest place to break
+that without noticing.
+
+| Code | Verdict |
+| --- | --- |
+| helper fn / method called from a **tile body** | fine — inside the image id, pinned, replayed in the guest |
+| helper called from **both** a tile and the fixture generator | fine, and the sanctioned way to keep host and guest byte-identical (`vocab_bucket_of` in `raster-tokenizer`) — it must obey the tile determinism rules |
+| method used **only** by host fixture code to *encode* a value | fine — representation, not logic; the committed bytes are the program's input |
+| method used by host fixture code to **derive** a value the program then trusts | ❌ computation outside every image id (§2, and `references/data-and-io.md` §3) |
+| method called from a **sequence** body | ❌ computation hidden from the CFS (§4) — the grammar forbids bare calls; a method call on a binding or inside a `select!` path is the sneak |
+| hand-written `Serialize`/`Deserialize`/`Selectable`/`Default`/`Ord` on a Rastered type | ❌ derive only — these decide what gets committed and how selector paths resolve; a hand-written impl can make host and guest disagree about the same value |
+| a native oracle (`encode_prompt_native`) used by tests | fine, and useful — but it is a *reference*, never a path the program takes |
+
+The test for any `impl` block on a Rastered type: **would the program's output
+change if this method were wrong?** If yes, it must be called from a tile. If
+it only shapes bytes on their way into `input.json`, it is encoding and may
+stay on the host.
+
 ## 4. Sequences — orchestration only
 
 A sequence is a free function annotated with `#[sequence]` in the `std`
@@ -386,6 +411,15 @@ Never loop in a sequence. To process a list, pick from this decision tree:
   "rounds") while the real data hides in `state`/`args` is the same
   violation wearing a loop costume — an unused `input` parameter in the
   step is the tell (`references/recur.md` §2, "the fake recur").
+  **Committing that counter list as part of an entry argument does not
+  launder it.** A `rounds: List<u32>` field sitting beside the real data,
+  filled with `0..data.len()`, passes every rung of §9 — it is genuinely
+  storage-backed and genuinely committed — and it is still the same
+  violation, now with the loop's trip count chosen by whoever writes the
+  fixture: a short list yields a truncated result with a valid proof over
+  it. A field derivable from another field of the same input is not data.
+  Full dissection and the sanctioned alternatives: `references/recur.md`
+  §2, "the committed counter list".
 - `state` — a tiny loop-carried value (counters, running max, a small
   accumulator struct). It is re-committed on **every** iteration, so it must
   stay scalar-small; anything that *grows* belongs in `output` (append-only
@@ -515,6 +549,11 @@ If any rung fails, map the failure back to a rule before touching code:
 | audit divergence with clean native run | nondeterminism in a tile (§3) |
 | ProgramEnd error on return | `main` returning a non-storage-backed value (§8) |
 | run is unexpectedly slow / heavy | unnecessary materialization: whole-object selections, oversized tile outputs (§2) |
+
+A green ladder is necessary, not sufficient: model violations that keep the
+mechanics intact — a fake recur, a committed counter list, computation hidden
+behind one CFS step — pass all six rungs. Re-read §2 and §7 against the code
+before calling it done.
 
 ## References
 

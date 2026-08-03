@@ -145,6 +145,87 @@ the real collection should be the input (`input = data_blocks`, not
 `input = fake_round_numbers`), or what you want is a growing output — which
 is a draft (`output = new!(Output)` + append per item), not rounds.
 
+### The committed counter list — a fake recur laundered through an entry argument
+
+The most dangerous form of the fake recur does not appear in a sequence at
+all. It appears in the **input type**, where a counter list is added beside
+the real data so that a `call_recur!` has something of the right length to
+iterate:
+
+```rust
+// ❌ DO NOT write this — `rounds` is not data.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, raster::Selectable)]
+pub struct PromptInput {
+    pub chars: List<PromptChar>,
+    /// One element per possible BPE merge round. Length is `chars.len()`: each
+    /// merge removes one piece, and there are at most `chars.len()` pieces.
+    pub rounds: List<u32>,
+}
+
+impl PromptInput {
+    pub fn new(text: &str) -> Self {
+        let chars: Vec<PromptChar> = text.char_indices().map(/* ... */).collect();
+        let rounds: Vec<u32> = (0..chars.len() as u32).collect();   // ← fabricated
+        Self { chars: chars.into(), rounds: rounds.into() }
+    }
+}
+```
+
+**Why this one is worse than the in-program version: it passes every check.**
+`rounds` is a genuine storage-backed `List<u32>`, committed in
+`input_manifest.json`, reachable by `select!`, and legal as a `call_recur!`
+source. `cargo raster cfs` shows a proper `seq_input` binding, not an
+`external`; the run, the commit/audit round-trip and `program --verify` all
+succeed. There is no rung of the check ladder that catches it. The commitment
+launders the counter into looking like data — but a commitment only attests
+*which bytes*, never *that the bytes mean anything*.
+
+The tells, in the order you will notice them:
+
+- **The field is derivable from another field of the same input.**
+  `rounds.len() == chars.len()` and `rounds[i] == i`. It carries zero
+  information about the prompt, so its commitment constrains nothing. A
+  committed argument must be something a verifier could disagree about.
+- **The step never consumes its item** — it reads `input.index()` /
+  `is_first()` at most, and the real work reaches it through `state`/`args`.
+- **The loop count is a bound someone chose**, not the collection being
+  processed. The comment justifying the length ("at most `chars.len()`
+  pieces") is the giveaway: it is reasoning about a *budget*, and budgets do
+  not belong in the data.
+
+**The security consequence, which is the decisive argument.** Once the trip
+count lives in the input, it is chosen by whoever writes the fixture. Commit a
+`rounds` list that is too short and the loop stops early: the program produces
+a *wrong* result — a partially-merged tokenization — with a completely valid
+proof over it. The commitment binds the rounds list; nothing binds it to being
+long enough, because "long enough" is a property of the computation, not of
+the bytes. A program must never let its own termination be an input.
+
+**What is actually wanted here is a data-dependent trip count** (loop until
+BPE reaches its fixpoint), and Raster cannot express one today: `state` cannot
+carry a collection — a `List<T>` is not `Materializable` and a `Block<T>`
+cannot drive a recur — so no loop can transform a collection. See
+`docs/proposals/loop-carried-state.md`. Until that lands, the options are:
+
+1. **Recur over the real collection** if the algorithm admits it (one pass per
+   element, accumulating into `output`).
+2. **Unroll a fixed number of rounds** as explicit `call_seq!` sites and end
+   with a tile that *asserts convergence* (`call!(assert_merges_complete, …)?`).
+   This is verbose and pins an arbitrary constant into `program_commitment` —
+   but it is honest, and honest in the exact place the counter list is not: the
+   budget is visible in the program identity where a reader can audit it, and
+   an over-long input **fails the run** instead of returning a truncated answer.
+   This is what `raster-inference/raster-tokenizer` does (`src/main.rs`,
+   `merge_all_rounds`).
+3. **Say the model doesn't support it yet.** Preferable to shipping a program
+   whose loop bound is attacker-chosen.
+
+The contrast worth keeping: `input` as a **budget** is fine when the budget
+*is* the data — recurring over the piece list because L pieces admit at most
+L−1 merges bounds the loop by construction. Fabricating a parallel list of
+integers to stand in for that same bound is not the same thing, even though
+the two have equal length.
+
 ### Restructuring cross-collection problems (the legitimate ways)
 
 - **Reduce the other collection first.** If the per-item check only needs a
