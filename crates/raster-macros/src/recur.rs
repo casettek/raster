@@ -766,9 +766,11 @@ pub(crate) fn gen_recur_sequence_step_function(
                     output: ::core::option::Option::None,
                     draft_transition_witness: ::core::option::Option::None,
                 };
-                ::raster::publish_trace_event(::raster::core::trace::TraceEvent::RecurSequenceStart(
-                    __raster_record.clone(),
-                ));
+                ::raster::publish_trace_event(
+                    ::raster::core::trace::TraceEvent::RecurSequenceIterationStart(
+                        __raster_record.clone(),
+                    ),
+                );
                 #result_binding
                 let __raster_output_bytes = ::raster::core::postcard::to_allocvec(&result)
                     .unwrap_or_default();
@@ -778,9 +780,9 @@ pub(crate) fn gen_recur_sequence_step_function(
                         ::raster::alloc::string::String::from(#output_type_expr),
                     )
                 );
-                ::raster::publish_trace_event(::raster::core::trace::TraceEvent::RecurSequenceEnd(
-                    __raster_record,
-                ));
+                ::raster::publish_trace_event(
+                    ::raster::core::trace::TraceEvent::RecurSequenceIterationEnd(__raster_record),
+                );
                 let _ = &__raster_recur_sequence_iteration_scope;
                 result
             }

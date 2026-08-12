@@ -152,7 +152,8 @@ impl StepWitnessStore {
         storage_write: Option<StorageWriteRecord>,
     ) {
         match event {
-            TraceEvent::SequenceStart(trace_item) | TraceEvent::RecurSequenceStart(trace_item) => {
+            TraceEvent::SequenceStart(trace_item)
+            | TraceEvent::RecurSequenceIterationStart(trace_item) => {
                 self.0.insert(
                     coordinates,
                     StepWitnessData {
@@ -169,7 +170,8 @@ impl StepWitnessStore {
                     },
                 );
             }
-            TraceEvent::SequenceEnd(trace_item) | TraceEvent::RecurSequenceEnd(trace_item) => {
+            TraceEvent::SequenceEnd(trace_item)
+            | TraceEvent::RecurSequenceIterationEnd(trace_item) => {
                 let trace_io = self.0.get_mut(&coordinates).unwrap_or_else(|| {
                     panic!(
                         "Missing step witness entry for SequenceEnd at coordinates {:?}. Expected a matching SequenceStart to be recorded first.",
@@ -535,7 +537,7 @@ impl TraceRecorder {
 
                 record
             }
-            TraceEvent::RecurSequenceStart(fn_call_record) => {
+            TraceEvent::RecurSequenceIterationStart(fn_call_record) => {
                 let parent_sequence_coordinates =
                     self.sequence_callstack.current_sequence_coordinates.clone();
                 let parent_current_index = self
@@ -614,7 +616,7 @@ impl TraceRecorder {
 
                 record
             }
-            TraceEvent::RecurSequenceEnd(fn_call_record) => {
+            TraceEvent::RecurSequenceIterationEnd(fn_call_record) => {
                 assert!(
                     self.active_recur.is_none(),
                     "RecurSequence iteration ended while RecurTile trace was still active"
@@ -1298,7 +1300,7 @@ mod tests {
             draft_transition_witness: None,
         }));
 
-        let iter0_start = recorder.record(TraceEvent::RecurSequenceStart(FnCallRecord {
+        let iter0_start = recorder.record(TraceEvent::RecurSequenceIterationStart(FnCallRecord {
             fn_name: "child".to_string(),
             input: None,
             output: None,
@@ -1310,13 +1312,13 @@ mod tests {
             output: None,
             draft_transition_witness: None,
         }));
-        let iter0_end = recorder.record(TraceEvent::RecurSequenceEnd(FnCallRecord {
+        let iter0_end = recorder.record(TraceEvent::RecurSequenceIterationEnd(FnCallRecord {
             fn_name: "child".to_string(),
             input: None,
             output: None,
             draft_transition_witness: None,
         }));
-        let iter1_start = recorder.record(TraceEvent::RecurSequenceStart(FnCallRecord {
+        let iter1_start = recorder.record(TraceEvent::RecurSequenceIterationStart(FnCallRecord {
             fn_name: "child".to_string(),
             input: None,
             output: None,
@@ -1328,7 +1330,7 @@ mod tests {
             output: None,
             draft_transition_witness: None,
         }));
-        let iter1_end = recorder.record(TraceEvent::RecurSequenceEnd(FnCallRecord {
+        let iter1_end = recorder.record(TraceEvent::RecurSequenceIterationEnd(FnCallRecord {
             fn_name: "child".to_string(),
             input: None,
             output: None,
@@ -1355,5 +1357,75 @@ mod tests {
         assert_eq!(iter1_end.coordinates(), &CfsCoordinates(vec![0, 1]));
         assert_eq!(site.coordinates(), &CfsCoordinates(vec![0]));
         assert_eq!(after.coordinates(), &CfsCoordinates(vec![1]));
+    }
+
+    /// The vocabulary table in `TraceEvent`'s doc comment, made executable:
+    /// which `StepKind` each event becomes, and where it lands.
+    ///
+    /// The row worth the test is `RecurTileIterationExec` — an iteration of a
+    /// recur *tile* records as `Exec(Tile)`, never `Exec(RecurTile)`, because
+    /// `RecurTile` names the site only.
+    ///
+    /// `ProgramStart` / `ProgramEnd` are left to the entrypoint suite: they
+    /// need entry-argument and storage-root setup these fixtures don't carry.
+    #[test]
+    fn vocabulary_table_holds_for_the_recorder() {
+        fn call(fn_name: &str) -> FnCallRecord {
+            FnCallRecord {
+                fn_name: fn_name.to_string(),
+                input: None,
+                output: None,
+                draft_transition_witness: None,
+            }
+        }
+
+        /// The `becomes` column, as a string so a mismatch reads plainly.
+        fn becomes(record: &StepRecord) -> &'static str {
+            match &record.kind {
+                StepKind::ProgramStart(_) => "ProgramStart",
+                StepKind::ProgramEnd(_) => "ProgramEnd",
+                StepKind::SequenceStart { .. } => "SequenceStart",
+                StepKind::SequenceEnd { .. } => "SequenceEnd",
+                StepKind::Exec(step) => match &step.target {
+                    ExecTarget::Tile(_) => "Exec(Tile)",
+                    ExecTarget::RecurTile(_) => "Exec(RecurTile)",
+                    ExecTarget::RecurSequence(_) => "Exec(RecurSequence)",
+                },
+            }
+        }
+
+        fn assert_row(record: &StepRecord, kind: &str, coordinates: &[u32]) {
+            assert_eq!(becomes(record), kind, "event became the wrong StepKind");
+            let expected = CfsCoordinates(coordinates.to_vec());
+            assert_eq!(record.coordinates(), &expected, "event landed wrong");
+        }
+
+        // Tile family. The site's own event comes after its iterations.
+        let mut recorder = recorder_with_recur_site();
+        start_main(&mut recorder);
+        let tile_iteration = recorder.record(TraceEvent::RecurTileIterationExec(call("recur")));
+        let tile_site = recorder.record(TraceEvent::RecurTileExec(call("recur")));
+        let tile = recorder.record(TraceEvent::TileExec(call("after")));
+
+        // Sequence family, same shape: iterations first, then the site.
+        let mut recorder = recorder_with_recur_sequence_site();
+        start_main(&mut recorder);
+        let iter_start = recorder.record(TraceEvent::RecurSequenceIterationStart(call("child")));
+        let iter_tile = recorder.record(TraceEvent::TileExec(call("inner")));
+        let iter_end = recorder.record(TraceEvent::RecurSequenceIterationEnd(call("child")));
+        let seq_site = recorder.record(TraceEvent::RecurSequenceExec(call("child")));
+
+        // Items land at their sequence's coordinates, [s].
+        assert_row(&tile, "Exec(Tile)", &[1]);
+        assert_row(&tile_site, "Exec(RecurTile)", &[0]);
+        assert_row(&seq_site, "Exec(RecurSequence)", &[0]);
+        // A tile inside a recur-sequence iteration is an item of that
+        // iteration's own sequence: [s] relative to it, [0,0][0] absolute.
+        assert_row(&iter_tile, "Exec(Tile)", &[0, 0, 0]);
+
+        // Iterations land one level deeper, at [s][i].
+        assert_row(&tile_iteration, "Exec(Tile)", &[0, 0]);
+        assert_row(&iter_start, "SequenceStart", &[0, 0]);
+        assert_row(&iter_end, "SequenceEnd", &[0, 0]);
     }
 }

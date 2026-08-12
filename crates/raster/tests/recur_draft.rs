@@ -726,7 +726,7 @@ fn recur_sequence_trace_keeps_inner_tiles_replayable() {
     let iteration_start_records = events
         .iter()
         .filter_map(|event| {
-            if let TraceEvent::RecurSequenceStart(record) = event {
+            if let TraceEvent::RecurSequenceIterationStart(record) = event {
                 (record.fn_name == "collect_prefixed_lines").then_some(record)
             } else {
                 None

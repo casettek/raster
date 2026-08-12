@@ -443,8 +443,8 @@ fn nested_sequence_trace_records_terminal_err_outputs() {
             }
             TraceEvent::RecurTileIterationExec(_)
             | TraceEvent::RecurTileExec(_)
-            | TraceEvent::RecurSequenceStart(_)
-            | TraceEvent::RecurSequenceEnd(_)
+            | TraceEvent::RecurSequenceIterationStart(_)
+            | TraceEvent::RecurSequenceIterationEnd(_)
             | TraceEvent::RecurSequenceExec(_)
             | TraceEvent::ProgramStart(_)
             | TraceEvent::ProgramEnd(_) => false,

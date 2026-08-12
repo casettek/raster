@@ -611,16 +611,67 @@ pub struct ProgramEndEvent {
     pub output: Option<StorageData>,
 }
 
+/// What the runtime publishes as a program runs. The recorder turns each of
+/// these into a [`StepRecord`]; nothing here is committed to directly.
+///
+/// # Naming rule
+///
+/// An event is named for the **CFS item** it belongs to. If it denotes an
+/// *iteration* of that item rather than the item itself, the name says
+/// `Iteration`. Unmarked means the item.
+///
+/// A recur site has both: the iterations that ran under it, and the site
+/// itself. Without the rule the two read alike, and `RecurSequenceStart`
+/// (as it was named) reads as "the recur sequence begins" while denoting
+/// "iteration *i* of the recur sequence begins".
+///
+/// # The vocabulary
+///
+/// | event | level | published by | becomes | at coordinates |
+/// | --- | --- | --- | --- | --- |
+/// | `ProgramStart` / `ProgramEnd` | program | entrypoint codegen | `StepKind::ProgramStart` / `ProgramEnd` | `[]` |
+/// | `SequenceStart` / `SequenceEnd` | item | `#[sequence]` wrapper | `StepKind::SequenceStart` / `SequenceEnd` | `[s]` |
+/// | `TileExec` | item | `#[tile]` wrapper | `Exec(Tile)` | `[s]` |
+/// | `RecurTileIterationExec` | iteration | `#[tile]` wrapper, **reclassified at publish** | `Exec(Tile)` | `[s][i]` |
+/// | `RecurSequenceIterationStart` / `…End` | iteration | recur-sequence step fn | `StepKind::SequenceStart` / `SequenceEnd` | `[s][i]` |
+/// | `RecurTileExec` | item | recur-tile driver, **after the loop** | `Exec(RecurTile)` | `[s]` |
+/// | `RecurSequenceExec` | item | recur-sequence driver, **after the loop** | `Exec(RecurSequence)` | `[s]` |
+///
+/// Two rows of that table surprise every reader, so they are also stated here:
+///
+/// - A recur site's own event is emitted **last**, after every iteration it
+///   contains — not before them.
+/// - A recur tile's iterations record as `ExecTarget::Tile`, never
+///   `ExecTarget::RecurTile`. `RecurTile` names the site only.
+///
+/// "Reclassified at publish" is the one place the level is decided positionally
+/// rather than structurally: the `#[tile]` wrapper always publishes `TileExec`,
+/// and `publish_trace_event` rewrites it to `RecurTileIterationExec` while a
+/// recur-tile site is on the stack. The recorder asserts the invariant that
+/// makes this sound — an ordinary tile cannot execute while recur iterations
+/// are active.
+///
+/// # Variant order is load-bearing
+///
+/// Postcard encodes a variant as the varint of its **declaration index**, with
+/// no name. Reordering these variants therefore changes what every previously
+/// recorded binary trace decodes to — an old `TileExec` would come back as
+/// whatever now sits at that index. A reorder needs a trace-format version tag
+/// and a decoder that refuses older traces; it is a migration, not a tidy-up.
+/// Renaming a variant is free, and adding one at the end is free.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TraceEvent {
+    // Program level.
     ProgramStart(ProgramStartEvent),
     ProgramEnd(ProgramEndEvent),
 
+    // Sequence boundaries: the first pair per item, the second per iteration.
     SequenceStart(FnCallRecord),
     SequenceEnd(FnCallRecord),
-    RecurSequenceStart(FnCallRecord),
-    RecurSequenceEnd(FnCallRecord),
+    RecurSequenceIterationStart(FnCallRecord),
+    RecurSequenceIterationEnd(FnCallRecord),
 
+    // Execution: `RecurTileIterationExec` is per iteration, the rest per item.
     TileExec(FnCallRecord),
     RecurTileIterationExec(FnCallRecord),
     RecurTileExec(FnCallRecord),

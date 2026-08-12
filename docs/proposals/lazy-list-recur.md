@@ -11,6 +11,12 @@ Related:
   end-to-end sound until the selection-to-replay binding below lands. Three gates, not one.
 - [`dynamic-index-selection.md`](./dynamic-index-selection.md) — per-item `AuthRef`s and the
   citations they carry are unchanged; §4 explains why materialization must stop dropping them.
+- [`recur-progress-commitment.md`](./recur-progress-commitment.md) — **§5 depends on this.**
+  §5 defines the per-iteration facts and the completeness rules; it does not define the carrier
+  the rules accumulate in. A fraud-proof window verifies one step at a time, so a window that
+  does not contain iteration 0 must start from state it cannot derive — and the prover chooses
+  where windows open. That proposal supplies the per-step commitment that makes the starting
+  state checkable rather than inherited. The two land together.
 - **Storage-selection-to-replay binding** — the generic gate `paged-bytes.md` §3.3 records.
   Per-item authorization (§4) is incomplete without it: rules 1–3 prove an item was selected,
   the replay journal proves the tile ran on *something*, and only that equality joins them.
