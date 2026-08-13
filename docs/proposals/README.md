@@ -1,6 +1,6 @@
 # Proposals — status and dependencies
 
-Index of `docs/proposals/`. Last reviewed 2026-08-13.
+Index of `docs/proposals/`. Last reviewed 2026-08-14.
 
 Each proposal's own `Status:` line is the source of truth; this file collects them and records
 where that line disagrees with the code or the git history. Where they disagree, the
@@ -22,10 +22,11 @@ document, and correcting it is the author's call.
 | [`authoring-skill-and-tooling`](./authoring-skill-and-tooling.md) | **half landed** ⚠️ header says `proposed` | the skill: `.claude/skills/raster/` (commit `d78c9a5`) | `cargo raster check` — `raster-cli` has only `run` and `tile` |
 | [`draft-provenance`](./draft-provenance.md) | proposed (2026-07-30) | — | whole |
 | [`loop-carried-state`](./loop-carried-state.md) | proposed (2026-07-30) | — | whole; see the note under *Dependencies* |
-| [`lazy-list-recur`](./lazy-list-recur.md) | **phases 1–4, 6 implemented** (2026-08-13) | metadata payload, `ListCursor`, driver-level chunking + range descent, per-item bindings, §5 journal facts | §5's completeness **rules** exist and are tested but nothing calls them — blocked on `recur-progress-commitment` |
-| [`recur-progress-commitment`](./recur-progress-commitment.md) | proposed 2026-08-07, **rev 2** 2026-08-13 | `raster-core/src/recur_progress.rs` + 21 tests | rev 1 was implemented and backed out — the recorder cannot compute the commitment; rev 2 adds the trace `recur_control` bit and site `Start`/`End` events to fix it |
+| [`lazy-list-recur`](./lazy-list-recur.md) | **phases 1–6 implemented** (2026-08-13/14) | metadata payload, `ListCursor`, driver-level chunking + range descent, per-item bindings, §5 journal facts, rules 1–7 + S1/S3/S4 enforced | **rule 8 unimplemented** (no `ListRange` cross-check) and S2 unenforced; the peak-RSS acceptance benchmark was never run — see §Outstanding at implementation |
+| [`recur-progress-commitment`](./recur-progress-commitment.md) | **rev 2 implemented** (2026-08-14) | `recur_progress.rs`, the trace `recur_control` bit, site `Start`/`End` events, recorder stamping, guest advance-and-compare — recorder and guest agree on every commitment | mid-loop window seeds, split out as `window-seed-reconstruction` |
 | [`paged-bytes`](./paged-bytes.md) | proposed 2026-08-04 (rev 3) | — | blocked on `lazy-list-recur` |
 | [`recur-sequence-break`](./recur-sequence-break.md) | proposed 2026-08-13 | — | whole; blocked on `recur-progress-commitment` rev 2. Weakens `lazy-list-recur` S4 to a prefix/terminal split |
+| [`window-seed-reconstruction`](./window-seed-reconstruction.md) | proposed 2026-08-14 | — | whole; small. Without it a fraud-proof window opening mid-loop is rejected — the design `recur-progress-commitment` explicitly refused, reinstated by an unfilled parameter |
 | [`carried-state-channel`](./carried-state-channel.md) | proposed 2026-08-07 — **enhancement** | — | deliberately deferred until a second component is ready |
 | [`trace-event-vocabulary`](./trace-event-vocabulary.md) | **implemented** (2026-08-13) | `RecurSequenceIterationStart`/`End`; the naming rule and vocabulary table on `TraceEvent` | — |
 
@@ -40,7 +41,9 @@ program-end ────┼──► program-identity ──► program-chain �
 bounded-collections (phases 1-2 impl)
         │
         ├──► lazy-list-recur ◄──── recur-progress-commitment ──► recur-sequence-break
-        │         │   ▲             (rev 2, unimplemented)        (proposed)
+        │         │   ▲              (rev 2 impl) │                (proposed)
+        │         │   │                           └──► window-seed-reconstruction
+        │         │   │                                     (proposed)
         │         │   │
         │         │   └── dynamic-index-selection (impl) — citations survive materialization
         │         │
@@ -57,15 +60,19 @@ sequence-grammar-closure (phase 1 impl) ◄──► draft-provenance
 
 ### The blocking edges, stated
 
-- **`paged-bytes` → `lazy-list-recur`.** Three gates, per `paged-bytes.md`: a `Bytes` region
-  cannot be swept until §1–§4 land; a sweep cannot be called *complete* until §5 lands; and no
-  sweep is end-to-end sound until the storage-selection-to-replay binding lands (`paged-bytes`
-  §3.3), which is out of scope for both.
-- **`lazy-list-recur` §5 → `recur-progress-commitment`.** §5 defines the per-iteration facts and
-  the completeness rules; it does not define the carrier those rules accumulate in. A
-  fraud-proof window verifies one step at a time and the prover chooses where windows open, so
-  without a committed carrier the rules bind only in a window that happens to contain iteration
-  0. One change, not two.
+- **`paged-bytes` → `lazy-list-recur`.** Three gates, per `paged-bytes.md`. Gate 1 (§1–§4, sweep
+  at all) is **satisfied**. Gate 2 (§5, call a sweep *complete*) is satisfied for element recur
+  and **partly** for chunked: rule 8's `ListRange` cross-check is unimplemented, so a chunked
+  sweep's coverage currently rests on the replay journal alone rather than on a folded proof.
+  Gate 3 — the storage-selection-to-replay binding (`paged-bytes` §3.3) — is untouched and out of
+  scope for both.
+- ~~**`lazy-list-recur` §5 → `recur-progress-commitment`.**~~ **Satisfied 2026-08-14.** The
+  carrier landed with revision 2, so §5's rules now bind across window boundaries rather than
+  only in a window containing iteration 0.
+- **`window-seed-reconstruction` → nothing; it unblocks mid-loop windows.** Until it lands, a
+  window opening inside a live loop is rejected because its seed is never reconstructed from the
+  trace prefix — which is the "refuse to open mid-loop" design `recur-progress-commitment`
+  §Problem explicitly rejected, arrived at by an unfilled parameter rather than by choice.
 - **`recur-sequence-break` → `recur-progress-commitment` rev 2.** Not merely ordered after it:
   the break bit rides on the `recur_control` trace field rev 2 introduces, and S4′ rewrites the
   `close_site` rule rev 2 implements. Landing it first would mean implementing both halves of
@@ -86,21 +93,26 @@ sequence-grammar-closure (phase 1 impl) ◄──► draft-provenance
 
 ## Ready to implement now
 
-1. **`recur-progress-commitment` revision 2** — the only thing standing between
-   `lazy-list-recur` and done. Its phases 1–4 and 6 landed 2026-08-13, along with §5's
-   replay-proven journal facts and the completeness rules themselves; what is missing is the
-   carrier that makes the rules bind across a window boundary. Revision 2 exists because
-   revision 1 was implemented and backed out: the recorder cannot compute the commitment it was
-   asked to stamp. Moves trace fingerprints, not only image ids. `paged-bytes` unblocks behind
-   it — its format and addressing work could start now, but not its sweep-coverage claim.
-2. **`sequence-grammar-closure` phase 2** — independent of the above; `draft-provenance` argues
-   one row of its classification table and can be taken with it or separately.
-3. **`authoring-skill-and-tooling`'s second half** (`cargo raster check`) — independent, and it
+1. **`lazy-list-recur` rule 8** — the one *missing check* left in an otherwise implemented
+   proposal. Without the `ListRange` cross-check, a chunked sweep's coverage rests on the replay
+   journal alone, which §6 is explicit is "a binding, not an authority". Small, and it is
+   `paged-bytes`' second gate. Take its S2 pairing check and the peak-RSS acceptance benchmark
+   with it — see that proposal's §Outstanding at implementation for the full list.
+2. **`window-seed-reconstruction`** — small (three files, one a single line) and it restores the
+   property `recur-progress-commitment` was built for: a fraud window that opens mid-loop.
+   Currently such a window is rejected.
+3. **`sequence-grammar-closure` phase 2** — independent of the above; `draft-provenance` argues
+   one row of its classification table and can be taken with it or separately. A nested call
+   macro in another call's arguments is now rejected at expansion
+   (`raster-macros/src/lib.rs`, `reject_nested_call_macros`), which is an instance of this
+   proposal's rule that arrived early via a different failure.
+4. **`authoring-skill-and-tooling`'s second half** (`cargo raster check`) — independent, and it
    is the enforcement surface for rules the type system cannot express.
 
-`trace-event-vocabulary` was on this list and landed 2026-08-13, ahead of the other three: it was
-the cheapest item and had to precede any site-level recur record. `recur-progress-commitment`'s
-`advance`/`close_site` split can now use those names.
+`trace-event-vocabulary` landed 2026-08-13 and was amended 2026-08-14: the trailing
+`RecurTileExec` / `RecurSequenceExec` became `…End` and gained `…Start` halves, so a recur site
+now brackets its iterations the way a sequence brackets its items. Variant indices were preserved
+(rename + append), so the event enum contributed nothing to the format break.
 
 ## Blocked or deliberately deferred
 

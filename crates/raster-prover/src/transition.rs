@@ -14,6 +14,7 @@ use raster_core::draft::DraftTransitionWitness;
 use raster_core::fingerprint::Fingerprint;
 use raster_core::input::SelectionWitness;
 use raster_core::trace::{FnInput, StepRecord};
+use raster_core::recur_progress::RecurProgressStack;
 use raster_core::transition::{
     FingerprintSliceWitness, InitTransition, StorageReadWitness, StorageWitness,
     TraceCommitmentHeader, TransitionInput, TransitionJournal, TransitionState,
@@ -55,6 +56,9 @@ fn build_transition_input(
     replayed_results: &HashMap<StepRecord, ReplayResult>,
     authorization_journal: &AuthorizationJournal,
     entrypoint_membership_witness: Option<&StorageReadWitness>,
+    // Recur progress the window opens with. `Some` only on a window's first
+    // step; every later step inherits the preimage through `Transition`.
+    window_start_recur_progress: Option<RecurProgressStack>,
 ) -> TransitionInput {
     let StepIo {
         input_witness,
@@ -87,6 +91,7 @@ fn build_transition_input(
 
     TransitionInput {
         step_record: step_record.clone(),
+        window_start_recur_progress,
         authorization_image_id: authorization_guest_image_id(),
         replay_journal,
         input_witness,
@@ -207,6 +212,17 @@ pub fn step_transitions(
                 .is_none()
                 .then_some(entrypoint_membership_witness)
                 .flatten(),
+            // A window that opens *inside* a live loop needs its recur-progress
+            // seed reconstructed from the trace prefix, the way
+            // `storage_state_from_prefix` reconstructs the store. That is not
+            // built yet, so no seed is supplied.
+            //
+            // This fails **closed**, not open: the guest advances the empty
+            // stack by the step's own facts and compares against the recorded
+            // commitment, so a genuinely mid-loop window mismatches and is
+            // rejected. A window opening outside any loop — the common case —
+            // starts from the empty stack and verifies normally.
+            None,
         );
         let replay_receipt_assumption: Option<risc0_zkvm::Receipt> =
             if step_record.requires_replay_proof() {
@@ -303,7 +319,7 @@ mod tests {
                 output_commitment: vec![exec_index as u8 + 1],
                 storage: empty_store_roots(),
             }),
-            recur_progress_commitment: [0u8; 32],
+            recur_progress_commitment: RecurProgressStack::new().commitment(),
         }
     }
 
@@ -392,6 +408,7 @@ mod tests {
             &replayed_results,
             &make_authorization_journal(),
             None,
+            None,
         );
 
         // The right replayed result is selected by step-record key.
@@ -437,6 +454,7 @@ mod tests {
             &replayed_results,
             &make_authorization_journal(),
             None,
+            None,
         );
 
         assert_eq!(
@@ -457,7 +475,7 @@ mod tests {
                 input_commitment: vec![1; 32],
                 input_source_commitment: Vec::new(),
             },
-            recur_progress_commitment: [0u8; 32],
+            recur_progress_commitment: RecurProgressStack::new().commitment(),
         };
         let sequence_end = StepRecord {
             exec_index: 2,
@@ -466,7 +484,7 @@ mod tests {
             kind: StepKind::SequenceEnd {
                 output_commitment: vec![2; 32],
             },
-            recur_progress_commitment: [0u8; 32],
+            recur_progress_commitment: RecurProgressStack::new().commitment(),
         };
         let recorded_step_io = HashMap::from([
             (sequence_start.clone(), io_witnesses(Some(vec![3, 4]), None)),
@@ -480,6 +498,7 @@ mod tests {
             &HashMap::new(),
             &make_authorization_journal(),
             None,
+            None,
         );
         let end_input = build_transition_input(
             &sequence_end,
@@ -487,6 +506,7 @@ mod tests {
             &recorded_step_io,
             &HashMap::new(),
             &make_authorization_journal(),
+            None,
             None,
         );
 
@@ -558,7 +578,7 @@ mod tests {
                 )
                 .to_vec(),
             },
-            recur_progress_commitment: [0u8; 32],
+            recur_progress_commitment: RecurProgressStack::new().commitment(),
         }
     }
 
@@ -568,6 +588,7 @@ mod tests {
     ) -> risc0_zkvm::Result<risc0_zkvm::ProveInfo> {
         let prover = risc0_zkvm::default_prover();
         let input = TransitionInput {
+            window_start_recur_progress: None,
             step_record: make_sequence_start_step(),
             authorization_image_id: authorization_guest_image_id(),
             replay_journal: None,

@@ -13,6 +13,7 @@ use std::vec::Vec;
 use crate::authorization::AuthorizationJournal;
 use crate::cfs::CfsCoordinates;
 use crate::draft::{DraftId, DraftTransitionWitness, TileReplayJournal, TrackedDraftState};
+use crate::recur_progress::RecurProgressStack;
 use crate::fingerprint::{Fingerprint, FingerprintAccumulator};
 use crate::input::SelectionWitness;
 use crate::trace::{FnInput, StepRecord};
@@ -185,6 +186,14 @@ pub struct TransitionInput {
     pub authorization_image_id: Vec<u8>,
     pub authorization_journal: AuthorizationJournal,
 
+    /// Recur progress the window's **first** step starts from.
+    ///
+    /// Never believed: advancing a wrong seed by this step's own facts yields a
+    /// different stack, hashes to a different value, and fails against the
+    /// step's recorded commitment. `InitTransition` gains nothing.
+    #[serde(default)]
+    pub window_start_recur_progress: Option<RecurProgressStack>,
+
     /// Membership witness for `main`'s entry-argument coordinate (`[]`)
     /// against the window's *initial* storage state, proving the binding
     /// already existed when this window opened.
@@ -214,6 +223,14 @@ pub struct Transition {
     pub active_drafts: BTreeMap<DraftId, TrackedDraftState>,
     pub actual_fingerprint_acc: FingerprintAccumulator,
     pub next_expected_coordinates: Vec<CfsCoordinates>,
+    /// Live recur sites, carried across steps in the window.
+    ///
+    /// The preimage travels in the clear because the guest must *advance* it
+    /// and a hash cannot be advanced. Each `StepRecord`'s
+    /// `recur_progress_commitment` is what lets a window that starts mid-loop
+    /// validate its seed instead of believing it.
+    #[serde(default)]
+    pub recur_progress: RecurProgressStack,
 }
 
 /// Initial transition (first step in a window).

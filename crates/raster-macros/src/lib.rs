@@ -1574,6 +1574,83 @@ fn is_call_recur_seq_macro(expr_macro: &syn::ExprMacro) -> bool {
     expr_macro.mac.path.is_ident("call_recur_seq")
 }
 
+/// The call-macro name a path denotes, bare or `raster::`-qualified.
+///
+/// Mirrors `CallVisitor::macro_call_kind` in `raster-compiler/src/ast.rs`; the
+/// two must recognize the same set, since one decides what becomes a CFS item
+/// and this one decides what is legal to write.
+fn call_macro_name(mac: &syn::Macro) -> Option<&'static str> {
+    let segments: Vec<String> = mac
+        .path
+        .segments
+        .iter()
+        .map(|segment| segment.ident.to_string())
+        .collect();
+    let name = match segments.as_slice() {
+        [name] => name.as_str(),
+        [prefix, name] if prefix == "raster" => name.as_str(),
+        _ => return None,
+    };
+    match name {
+        "call" => Some("call!"),
+        "call_seq" => Some("call_seq!"),
+        "call_recur" => Some("call_recur!"),
+        "call_recur_seq" => Some("call_recur_seq!"),
+        _ => None,
+    }
+}
+
+/// Reject a call macro nested inside another call macro's arguments.
+///
+/// Every call macro is a **step**: static discovery gives it a CFS item, and
+/// the runtime gives it a coordinate. Those are two independent enumerations of
+/// the same set, and they must agree — a coordinate `[s]` *means* "index `s` of
+/// that sequence's `items`".
+///
+/// They stop agreeing here. `CallVisitor` captures a recognized macro's
+/// arguments as *strings* and deliberately does not recurse into them
+/// (`raster-compiler/src/ast.rs`, "Do not recurse into the macro body"), which
+/// is right for an argument that is data and wrong for one that is itself a
+/// call. The nested call gets no CFS item, yet the expansion still executes it
+/// and it still claims a coordinate — so the trace names a coordinate the
+/// schema never allocated. Nothing catches that until `--commit`/`--audit`,
+/// where it surfaces as `Wrong coordinates for sequence child`, naming neither
+/// the call nor its file.
+///
+/// It is also an identity gap, not only an ergonomic one: the CFS is hashed
+/// into program identity, so a step that runs but is not declared means the
+/// schema is not a complete description of the program — and
+/// `record_matches_item` relies on every coordinate resolving to a declared
+/// item.
+///
+/// Rejecting here turns it into a `cargo build` error naming the offending
+/// call, which is what `sequence-grammar-closure.md` argues for generally: an
+/// unrecognized form must fail at the compiler rather than proceed. The
+/// author's fix is one line — bind the inner call to a `let` first, which is
+/// the shape the grammar expects everywhere else.
+fn reject_nested_call_macros(expr: &Expr, outer: &str) {
+    struct NestedCallFinder<'a> {
+        outer: &'a str,
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for NestedCallFinder<'_> {
+        fn visit_expr_macro(&mut self, node: &'ast syn::ExprMacro) {
+            if let Some(inner) = call_macro_name(&node.mac) {
+                panic!(
+                    "{} cannot appear inside {}'s arguments: it is a separate step, and a step \
+                     nested in an argument is never given a control-flow-schema item, so its \
+                     trace coordinate would resolve to nothing. Bind it first:\n    \
+                     let value = {} ...;\nthen pass `value`.",
+                    inner, self.outer, inner,
+                );
+            }
+            syn::visit::visit_expr_macro(self, node);
+        }
+    }
+
+    syn::visit::Visit::visit_expr(&mut NestedCallFinder { outer }, expr);
+}
+
 struct SequenceCallInput {
     callee: syn::Ident,
     args: syn::punctuated::Punctuated<Expr, Token![,]>,
@@ -1743,6 +1820,9 @@ fn rewrite_call_seq_macro(expr_macro: &syn::ExprMacro) -> Expr {
             panic!("call_seq! expects an identifier callee followed by zero or more arguments")
         });
     let hidden = format_ident!("__raster_sequence_auth_{}", input.callee);
+    for argument in input.args.iter() {
+        reject_nested_call_macros(argument, "call_seq!");
+    }
     let args = input.args;
     syn::parse_quote! {
         #hidden(#args)
@@ -1756,6 +1836,15 @@ fn rewrite_call_recur_macro(expr_macro: &syn::ExprMacro) -> Expr {
         )
     });
     let hidden = format_ident!("__raster_recur_auth_{}", input.tile);
+    for argument in input
+        .args
+        .iter()
+        .chain(core::iter::once(&input.input))
+        .chain(input.state.iter())
+        .chain(input.output.iter())
+    {
+        reject_nested_call_macros(argument, "call_recur!");
+    }
     let source_expr = input.input;
     let input_expr = quote! { #source_expr };
     // Chunking is a property of the *driver*, not of the source type. The
@@ -1824,6 +1913,15 @@ fn rewrite_call_recur_seq_macro(expr_macro: &syn::ExprMacro) -> Expr {
             )
         });
     let hidden = format_ident!("__raster_recur_sequence_auth_{}", input.sequence);
+    for argument in input
+        .args
+        .iter()
+        .chain(core::iter::once(&input.input))
+        .chain(input.state.iter())
+        .chain(input.output.iter())
+    {
+        reject_nested_call_macros(argument, "call_recur_seq!");
+    }
     let input_expr = input.input;
     let state_expr = input.state;
     let output_expr = input.output;
@@ -1870,6 +1968,9 @@ fn rewrite_call_macro(expr_macro: &syn::ExprMacro) -> Expr {
             panic!("call! expects an identifier callee followed by zero or more arguments")
         });
     let marker = tile_call_binding_marker_ident(&input.callee);
+    for argument in input.args.iter() {
+        reject_nested_call_macros(argument, "call!");
+    }
     let original = Expr::Macro(expr_macro.clone());
     syn::parse_quote! {
         ::raster::__private::bind_tile_call::<#marker, _>(#original)

@@ -16,6 +16,7 @@ use raster_core::draft::{
     RecurPosition, RecurTileReplay, TileReplayJournal, TrackedDraftState,
 };
 use raster_core::input::{SchemaField, SchemaFieldMode, SchemaNode, Selectable};
+use raster_core::recur_progress::RecurProgressStack;
 use raster_core::trace::{
     ExecStep, ExecTarget, FnInput, FnInputArg, FnInputValue, StepKind, StepRecord, StorageData,
     StorageRoots,
@@ -87,7 +88,7 @@ fn draft_tile_step(exec_index: u64) -> StepRecord {
                 index_root_after: Vec::new(),
             },
         }),
-        recur_progress_commitment: [0u8; 32],
+        recur_progress_commitment: RecurProgressStack::new().commitment(),
     }
 }
 
@@ -193,7 +194,7 @@ fn verify_tile_commitments_accept_matching_recorded_io() {
                 index_root_after: Vec::new(),
             },
         }),
-        recur_progress_commitment: [0u8; 32],
+        recur_progress_commitment: RecurProgressStack::new().commitment(),
     };
 
     verify_io_witness(&step, Some(&b"in".to_vec()), Some(&b"out".to_vec()));
@@ -219,7 +220,7 @@ fn verify_step_record_inputs_accepts_sequence_descendant_producer_coordinates() 
                 index_root_after: Vec::new(),
             },
         }),
-        recur_progress_commitment: [0u8; 32],
+        recur_progress_commitment: RecurProgressStack::new().commitment(),
     };
     let input_source_witness =
         storage_input_witness(CfsCoordinates(vec![0, 0]), sha(b"producer-output"));
@@ -271,7 +272,7 @@ fn recur_iteration_step(iteration: u32) -> StepRecord {
                 index_root_after: Vec::new(),
             },
         }),
-        recur_progress_commitment: [0u8; 32],
+        recur_progress_commitment: RecurProgressStack::new().commitment(),
     }
 }
 
@@ -406,7 +407,7 @@ fn verify_tile_commitments_reject_mismatched_input() {
                 index_root_after: Vec::new(),
             },
         }),
-        recur_progress_commitment: [0u8; 32],
+        recur_progress_commitment: RecurProgressStack::new().commitment(),
     };
 
     verify_io_witness(&step, Some(&b"actual".to_vec()), Some(&b"out".to_vec()));
@@ -422,7 +423,7 @@ fn verify_sequence_boundary_commitments_accept_matching_recorded_io() {
             input_commitment: sha(b"sequence-in"),
             input_source_commitment: Vec::new(),
         },
-        recur_progress_commitment: [0u8; 32],
+        recur_progress_commitment: RecurProgressStack::new().commitment(),
     };
     let end = StepRecord {
         exec_index: 2,
@@ -431,7 +432,7 @@ fn verify_sequence_boundary_commitments_accept_matching_recorded_io() {
         kind: StepKind::SequenceEnd {
             output_commitment: sha(b"sequence-out"),
         },
-        recur_progress_commitment: [0u8; 32],
+        recur_progress_commitment: RecurProgressStack::new().commitment(),
     };
 
     verify_io_witness(&start, Some(&b"sequence-in".to_vec()), None);
@@ -559,7 +560,7 @@ fn tile_step_with_store_roots(
                 index_root_after,
             },
         }),
-        recur_progress_commitment: [0u8; 32],
+        recur_progress_commitment: RecurProgressStack::new().commitment(),
     }
 }
 
@@ -1084,7 +1085,7 @@ fn program_start_record(program_start: ProgramStartStep) -> StepRecord {
         sequence_id: "main".to_string(),
         coordinates: CfsCoordinates(vec![]),
         kind: StepKind::ProgramStart(program_start),
-        recur_progress_commitment: [0u8; 32],
+        recur_progress_commitment: RecurProgressStack::new().commitment(),
     }
 }
 
@@ -1302,7 +1303,7 @@ fn genesis_authorization_rejects_a_late_window_missing_its_membership_witness() 
         kind: StepKind::SequenceEnd {
             output_commitment: Vec::new(),
         },
-        recur_progress_commitment: [0u8; 32],
+        recur_progress_commitment: RecurProgressStack::new().commitment(),
     };
 
     verify_genesis_authorization(&cfs_cursor, &EMPTY_LEAF, &[], &journal, None, &first_step);
@@ -1337,7 +1338,7 @@ fn genesis_authorization_rejects_forged_entry_object_commitment() {
         kind: StepKind::SequenceEnd {
             output_commitment: Vec::new(),
         },
-        recur_progress_commitment: [0u8; 32],
+        recur_progress_commitment: RecurProgressStack::new().commitment(),
     };
 
     verify_genesis_authorization(

@@ -1,6 +1,7 @@
 # Proposal: `lazy-list-recur` — an authenticated cursor for iterating a stored list
 
-Status: proposed 2026-08-05, revised 2026-08-05 (revision 2)
+Status: proposed 2026-08-05, revised 2026-08-05 (revision 2);
+**mostly implemented 2026-08-13/14 — see [Outstanding at implementation](#outstanding-at-implementation)**
 
 Related:
 - [`bounded-collections.md`](./bounded-collections.md) — established that a `List<T>` is
@@ -1009,6 +1010,66 @@ Leaving it describing the old behaviour is how a rule becomes folklore.
   raster payload (`storage.rs:1004`).
 - Existing recur suites green: element, state, output, chunked, recur sequences, early `Break`,
   empty input.
+
+## Outstanding at implementation
+
+Phases 1–6 landed 2026-08-13/14, and `recur-progress-commitment` revision 2 landed with them, so
+§5's rules are now enforced rather than merely written. What follows is what an audit against
+§Verification found **still missing** — recorded here rather than in a tracker so the next reader
+finds it beside the rule it belongs to.
+
+The split matters: one item is a **missing check**, the rest are **missing evidence**. The
+engineering is essentially complete; the evidence the proposal asks for is not.
+
+### Missing check
+
+- **Rule 8 is not implemented.** There is no `ListRange` reference anywhere in
+  `guests/transition/src/checks/`. Rules 1–7 are enforced through
+  `raster-core/src/recur_progress.rs` (`advance_tile_iteration` covers 1–4 and 6, `close_site`
+  covers 5 and 7), but nothing cross-checks a chunked iteration's **range selection** against its
+  journal: `ListRange.len == L`, `ListRange.start == covered_before`, payload element count
+  `k == consumed_elements`.
+
+  This is not a redundant belt: §6 is explicit that the journal is *"a binding, not an
+  authority"*, so on its own `consumed_elements` is a value the guest committed having seen in its
+  input. Rule 8 is what makes chunked coverage rest on a folded proof the prover cannot choose
+  freely, and what closes the second path to `L` back onto §1's metadata. **Chunked recur's
+  completeness currently leans on the journal alone.**
+
+- **S2 is not enforced.** `advance_sequence_iteration` fires only on `StepKind::SequenceStart`, so
+  an iteration's `End` boundary event is never paired with its `Start`. S1, S3 and S4 are covered
+  (`push_site`, the contiguity check, and `close_site`'s `count == L`); S5 holds structurally by
+  coordinates.
+
+### Missing evidence
+
+- **The peak-RSS benchmark was never run**, and §Verification names it as *"the acceptance
+  criterion, since the claim is a change of asymptotic class."* What exists instead are
+  zero-whole-source-resolve counters (`call_recur_never_materializes_its_source`,
+  `recur_sequence_never_materializes_its_source`), which prove the *mechanism* changed but not the
+  asymptotic claim that was supposed to decide acceptance.
+- The **"exactly one element resolved per iteration"** materialization counter — the counters
+  that exist assert *zero whole-source* resolves, which is a different statement.
+- The **`select_range` proof matrix**: one case is written
+  (`raster_index_selects_a_range_into_a_verifiable_slice_proof`); the proposal asks for six —
+  start, middle, end, short final chunk, `chunk > L`, and `L` an exact multiple of `chunk`.
+- The **postcard-source migration pair**: `call_recur!` over `encoding = "postcard"` failing at
+  `open` with the re-encode message, and the same data re-imported as raster sweeping correctly.
+  The error path exists; nothing tests it.
+- **Every internal source opens `Indexed`** — a tile output, a finalized draft and a
+  `store_value` result each sweeping without error.
+- The **`[A, B, C]` substitution**, which should be present and *marked known-accepted* rather
+  than absent, since "a missing test reads as coverage" (§Verification).
+
+### Still true of the claim table
+
+The last row of §"What this proposal proves, and what it does not" — *each tile consumed the value
+at the index it claims* — remains **not proved**. The storage-selection-to-replay binding
+(`paged-bytes` §3.3) was never in scope here and is owned by no proposal.
+
+Separately, `window-seed-reconstruction.md` records a completeness gap inherited from the
+companion: a fraud-proof window opening *inside* a live loop is rejected, because its
+recur-progress seed is never reconstructed from the trace prefix.
 
 ## Performance
 
