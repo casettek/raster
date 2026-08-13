@@ -21,6 +21,7 @@ pub mod error;
 pub mod fingerprint;
 pub mod input;
 pub mod program;
+pub mod recur_progress;
 pub mod tile;
 pub mod trace;
 

@@ -829,20 +829,44 @@ iteration", which reads as covering the last row.
 **Not** changed: the `.rindex` format (metadata is derived from existing Merkle levels), the
 proof-step enum, the selector-segment enum, `verify_bound_index_bindings`.
 
+**Phase 5's companion adds to this table, and its revision 2 adds more than revision 1 costed.**
+`recur-progress-commitment.md` touches `raster-core/src/recur_progress.rs` (new),
+`raster-core/src/trace.rs`, `raster-core/src/transition.rs`,
+`raster-runtime/src/tracing/recorder.rs`, `guests/transition/src/fraud_proof.rs`, and window
+assembly in `raster-prover` / `raster-cli` — its own Modules-touched table is authoritative. Its
+blast radius is the larger of the two: the **trace encoding** changes, so fingerprints move, not
+only image ids.
+
+Its revision 2 raised that further, after revision 1 was implemented and found unimplementable:
+the recorder cannot compute the commitment from `RecurExecutionState` alone, so the trace also
+gains a `recur_control` bit on `FnCallRecord` and a site `Start`/`End` pair replacing the single
+trailing `RecurTileExec` / `RecurSequenceExec`. That last one is not bookkeeping — a recur site's
+event is emitted *after* its iterations today, so there is no point at which an authenticated `L`
+can be pushed before iteration 0. See that proposal's §3.2.
+
 **Image ids do move**, for two independent reasons: `parse_subtree_root` is shared parsing
 compiled into every guest, and `TileReplayJournal`'s encoding changes. Revision 1 claimed
-otherwise; that was true only while the bound stayed unauthenticated. `paged-bytes` breaks
-identity for the same class of reason, so sequencing the three together makes it one migration
-rather than three.
+otherwise; that was true only while the bound stayed unauthenticated.
+
+**`paged-bytes` does not ride along.** It breaks identity for the same class of reason — its own
+`parse_subtree_root` arm for `0x0B` — so co-sequencing the two would make one migration rather
+than two. That is not the recorded plan: `paged-bytes` §9.0 has this proposal shipping first, on
+its own peak-RSS benchmark, and `docs/proposals/README.md` records `paged-bytes` as blocked
+behind it. Identity therefore breaks twice, deliberately. What makes the second break cheap is
+the central tag table in §1: `0x0B` is already reserved, so `paged-bytes` adds an arm rather than
+renegotiating the space.
 
 Because any later journal field is another such break, §5's journal shape is defined in full
 now. `consumed_elements` is needed from day one anyway: chunking is not a later phase (§6).
 
 ## Phasing
 
-**All five phases ship together.** They are ordered for implementation and review, not for
-release: §6 explains why stopping after any of them leaves chunked recur broken, and phases 3
-and 4 remove the two escape hatches it currently relies on.
+**All six phases ship together, and phase 5 ships with
+[`recur-progress-commitment.md`](./recur-progress-commitment.md)** — see Related above: §5
+defines the per-iteration facts and the rules, that proposal defines the carrier the rules
+accumulate in, and neither binds anything alone. The phases are ordered for implementation and
+review, not for release: §6 explains why stopping after any of them leaves chunked recur broken,
+and phases 3 and 4 remove the two escape hatches it currently relies on.
 
 1. Compact authenticated list metadata: payload, `parse_subtree_root` arm, runtime emitter.
 2. Recur tracing consumes metadata instead of resolving the source. **Peak memory moves here.**
@@ -854,10 +878,15 @@ and 4 remove the two escape hatches it currently relies on.
    binding and its citations recorded on each iteration's step.
 5. `TileReplayJournal` gains `recur: Option<RecurTileReplay>`; wrapper fills it;
    recur-tile completeness rules 1–8 and recur-sequence rules S1–S5;
-   `chunking::iteration_chunk_len` and `leading_varint` deleted.
+   `chunking::iteration_chunk_len` and `leading_varint` deleted. **Plus the whole of
+   `recur-progress-commitment`** — `RecurProgressStack`, the per-step
+   `recur_progress_commitment`, and the `Transition` / `TransitionInput` carriers. Without it the
+   rules in this phase bind only in a window that happens to contain iteration 0, and the prover
+   picks the window.
 6. **Update the skill** — see below. Not optional bookkeeping: the skill is what authors and
    agents read, and it currently frames the raster-source requirement as a performance rule.
-`paged-bytes` needs all five: 1–4 to sweep at all, 5 to claim the sweep covered the region.
+`paged-bytes` needs phases 1–5: 1–4 to sweep at all, 5 (with its companion) to claim the sweep
+covered the region.
 
 ## SKILL.md updates
 

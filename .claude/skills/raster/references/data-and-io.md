@@ -123,6 +123,14 @@ entry arguments. Each is resolved lazily, by parameter name, from two files:
   declared Rust type (or raster-encoded data with an `.rindex`, which is
   self-describing and also supports cross-process selection in the
   commit/audit pipeline; postcard entries are limited to in-process use).
+- **Any input a `call_recur!` / `call_recur_seq!` sweeps must be raster-encoded**
+  — `index_path` + `encoding = "raster"` in the manifest. This is a hard
+  requirement, not a performance preference: postcard is sequential and carries
+  no index, so `rows[i]` cannot be located without decoding everything before
+  it, and opening a recur over one fails at the call site. `--commit`/`--audit`
+  already imposes the same constraint on *every* argument it must build a
+  selection witness for, so raster encoding is the safe default for anything
+  larger than a scalar.
 
 **`input_manifest.json` (public — commitments):** one entry per argument name.
 For postcard-encoded arguments used with `select!`, the commitment is the

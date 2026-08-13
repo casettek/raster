@@ -6,8 +6,8 @@ use raster_core::draft::{
     DraftStateWitness, DraftTransitionWitness,
 };
 use raster_core::input::{
-    ExternalEncoding, Schema, SchemaFieldMode, SchemaNode, SelectionWitness, SelectorPath,
-    StorageRef, StorageValue,
+    AuthenticatedListMetadata, ExternalEncoding, Schema, SchemaFieldMode, SchemaNode,
+    SelectionPayloadKind, SelectionWitness, SelectorPath, StorageRef, StorageValue,
 };
 use raster_core::trace::RasterPayload;
 use raster_core::transition::{SerializableFrontier, StorageEntry, StorageIndexValue};
@@ -28,9 +28,9 @@ use crate::backing::{
     ObjectBacking, OwnedObject, ReferencedObject, ReferencedSource, ReferencedSourceKind,
 };
 use crate::input::{
-    encode_raster_value, selected_payload_from_raster_location,
-    selection_witness_from_raster_selection, tree_value_from_raster_location,
-    typed_value_from_tree, TreeValue,
+    encode_raster_value, list_metadata_payload, list_metadata_witness,
+    selected_payload_from_raster_location, selection_witness_from_raster_selection,
+    tree_value_from_raster_location, typed_value_from_tree, TreeValue,
 };
 use crate::raster_index::RasterIndex;
 use crate::source::SourceResolver;
@@ -498,10 +498,21 @@ impl StorageManager {
         Ok(stored)
     }
 
+    /// Rebuild the witness for a recorded selection.
+    ///
+    /// `payload_kind` is not a preference — it is what the recorded commitment
+    /// says the witness bytes must be, and the two forms are indistinguishable
+    /// from `(coordinates, commitment, selector)` alone: a metadata selection
+    /// and a whole-list selection share a path, a source root and a set of
+    /// proof steps. The commit pipeline replays a trace it did not produce
+    /// (`raster-cli`'s recorder runs in its own process), so it has to be told
+    /// which view to regenerate rather than inferring one. See
+    /// [`SelectionPayloadKind`].
     pub fn selection_witness(
         &self,
         reference: &StorageRef,
         selector: &SelectorPath,
+        payload_kind: SelectionPayloadKind,
     ) -> Result<SelectionWitness> {
         let stored = self.verify_reference(reference)?;
         match &stored.backing {
@@ -509,7 +520,15 @@ impl StorageManager {
                 let raster = Self::require_raster(owned, &reference.coordinates)?;
                 let index = RasterIndex::from_bytes(&raster.index_bytes)?;
                 let selection = index.select(selector)?;
-                selection_witness_from_raster_selection(&raster.bytes, selector, selection)
+                match payload_kind {
+                    SelectionPayloadKind::Raw => {
+                        selection_witness_from_raster_selection(&raster.bytes, selector, selection)
+                    }
+                    SelectionPayloadKind::List => {
+                        let (len, elements_root) = index.list_metadata(selector)?;
+                        Ok(list_metadata_witness(selector, selection, len, elements_root))
+                    }
+                }
             }
             ObjectBacking::Referenced(referenced) => {
                 let resolver = self.source_resolver.as_deref().ok_or_else(|| {
@@ -517,7 +536,44 @@ impl StorageManager {
                         "Storage has a referenced object but no source resolver configured".into(),
                     )
                 })?;
-                referenced.selection_witness(selector, resolver)
+                referenced.selection_witness(selector, payload_kind, resolver)
+            }
+        }
+    }
+
+    /// A recur source's authenticated `(len, elements_root)`, as a selection
+    /// whose payload is 41 bytes (9 when empty) instead of the whole list.
+    ///
+    /// This is the read that replaces resolving a recur source
+    /// (`docs/proposals/lazy-list-recur.md` §1–§2): it touches the index only,
+    /// never an element and never the data file.
+    pub fn list_metadata_selection(
+        &self,
+        reference: &StorageRef,
+        selector: &SelectorPath,
+    ) -> Result<AuthenticatedListMetadata> {
+        let stored = self.verify_reference(reference)?;
+        match &stored.backing {
+            ObjectBacking::Owned(owned) => {
+                let raster = Self::require_raster(owned, &reference.coordinates)?;
+                let index = RasterIndex::from_bytes(&raster.index_bytes)?;
+                let (len, elements_root) = index.list_metadata(selector)?;
+                // Every selection into an owned object anchors to the object's
+                // own root, which is what `locate` returns as `root_hash`.
+                Ok(list_metadata_payload(
+                    selector,
+                    index.root_commitment,
+                    len,
+                    elements_root,
+                ))
+            }
+            ObjectBacking::Referenced(referenced) => {
+                let resolver = self.source_resolver.as_deref().ok_or_else(|| {
+                    Error::Other(
+                        "Storage has a referenced object but no source resolver configured".into(),
+                    )
+                })?;
+                referenced.list_metadata_selection(selector, resolver)
             }
         }
     }
@@ -746,6 +802,7 @@ std::thread_local! {
     static THREAD_ACTIVE_EXECUTION_COORDINATES: RefCell<Vec<CfsCoordinates>> = RefCell::new(Vec::new());
     static THREAD_PENDING_OUTPUT_COORDINATES: RefCell<Option<CfsCoordinates>> = const { RefCell::new(None) };
     static THREAD_PENDING_OUTPUT_ENCODING: RefCell<Option<PendingOutputEncoding>> = const { RefCell::new(None) };
+    static THREAD_PENDING_RECUR_ITEM: RefCell<Option<PendingRecurItemBinding>> = const { RefCell::new(None) };
     static THREAD_DRAFT_STORAGE: RefCell<BTreeMap<Anchor, DraftRuntimeState>> =
         RefCell::new(BTreeMap::new());
 }
@@ -1038,6 +1095,52 @@ pub struct PendingOutputEncoding {
     pub raster: RasterPayload,
 }
 
+/// What authorized the item a recur iteration is about to run on, stashed by
+/// the driver for the tile wrapper that immediately follows.
+///
+/// Materializing an authorized item has **two** outputs — the value the tile
+/// sees and the binding that proves where it came from — and the tile ABI can
+/// only carry the first. `RecurInput<T> { value, index, len }` is what crosses
+/// into the replay guest, and widening it would move every recur tile's
+/// `input_commitment` to carry data the replay guest cannot use. So the second
+/// output travels host-side, through the same hand-off shape
+/// [`stash_pending_output_encoding`] already uses for a tile's output
+/// encoding: set by the producer, taken by the one consumer that runs next.
+///
+/// Dropping it instead — which is what `build_recur_input` did — does not
+/// merely lose provenance. For a source reached through a bound index it makes
+/// a legitimate program *un-auditable*: the item's path still carries the
+/// `BoundIndex` segment, and `verify_bound_index_bindings` rejects a selection
+/// whose cited source never reaches the step. See
+/// `docs/proposals/lazy-list-recur.md` §4.
+pub struct PendingRecurItemBinding {
+    pub storage: raster_core::trace::StorageData,
+    /// Citations inherited from the source binding's path, keyed by the name
+    /// the `BoundIndex` segment cites.
+    pub index_bindings: Vec<(String, raster_core::trace::StorageData)>,
+}
+
+pub fn stash_recur_item_binding(
+    storage: raster_core::trace::StorageData,
+    index_bindings: Vec<(String, raster_core::trace::StorageData)>,
+) {
+    THREAD_PENDING_RECUR_ITEM.with(|pending| {
+        *pending.borrow_mut() = Some(PendingRecurItemBinding {
+            storage,
+            index_bindings,
+        });
+    });
+}
+
+/// Take the stashed item binding, if the caller is a recur iteration.
+///
+/// Returns `None` for every ordinary tile, which is what keeps this from
+/// leaking across sites: a non-recur tile never asks, and a recur tile always
+/// finds exactly what its own driver just put there.
+pub fn take_recur_item_binding() -> Option<PendingRecurItemBinding> {
+    THREAD_PENDING_RECUR_ITEM.with(|pending| pending.borrow_mut().take())
+}
+
 pub fn stash_pending_output_encoding(
     type_name: &'static str,
     bytes: Vec<u8>,
@@ -1198,6 +1301,19 @@ pub fn select_stored_value<T: DeserializeOwned>(
     selector: &SelectorPath,
 ) -> Result<StorageValue<T>> {
     THREAD_STORAGE.with(|storage| storage.borrow().select(reference, selector))
+}
+
+/// The authenticated `(len, elements_root)` of the list at `selector`, as a
+/// 41-byte selection (9 when empty).
+///
+/// Unlike [`select_stored_value`] this deserializes nothing and reads no
+/// element — it is the whole reason a recur source no longer has to be
+/// materialized to be traced.
+pub fn stored_list_metadata(
+    reference: &StorageRef,
+    selector: &SelectorPath,
+) -> Result<AuthenticatedListMetadata> {
+    THREAD_STORAGE.with(|storage| storage.borrow().list_metadata_selection(reference, selector))
 }
 
 pub fn resolve_storage_ok_value<T: DeserializeOwned>(

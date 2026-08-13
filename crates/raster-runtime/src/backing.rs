@@ -11,17 +11,19 @@ use std::vec::Vec;
 
 use raster_core::cfs::CfsCoordinates;
 use raster_core::input::{
-    struct_commitments_root, Hash32, SchemaNode, SelectedPayload, SelectionCommitment,
-    SelectionProof, SelectionProofStep, SelectionWitness, SelectorPath, SelectorSegment,
+    struct_commitments_root, AuthenticatedListMetadata, Hash32, SchemaNode, SelectedPayload,
+    SelectionCommitment, SelectionPayloadKind, SelectionProof, SelectionProofStep,
+    SelectionWitness, SelectorPath, SelectorSegment,
 };
 use raster_core::trace::RasterPayload;
 use raster_core::{Error, Result};
 use serde::de::DeserializeOwned;
 
 use crate::input::{
-    hex_string, prove_selection, selected_payload_from_proven,
-    selected_payload_from_raster_location, selection_witness_from_raster_selection,
-    subtree_payload_and_root, tree_value_from_raster_location, typed_value_from_tree, TreeValue,
+    hex_string, list_metadata_payload, list_metadata_witness, prove_selection,
+    selected_payload_from_proven, selected_payload_from_raster_location,
+    selection_witness_from_raster_selection, subtree_payload_and_root,
+    tree_value_from_raster_location, typed_value_from_tree, TreeValue,
 };
 use crate::raster_index::RasterIndex;
 use crate::source::{ResolvedSourceData, SourceResolver};
@@ -242,6 +244,7 @@ impl ReferencedObject {
     pub fn selection_witness(
         &self,
         selector: &SelectorPath,
+        payload_kind: SelectionPayloadKind,
         resolver: &dyn SourceResolver,
     ) -> Result<SelectionWitness> {
         let (source, remaining) = self.find_source(selector)?;
@@ -257,12 +260,31 @@ impl ReferencedObject {
                     .raster_bytes()
                     .ok_or_else(|| Error::Other("Expected raster data bytes".into()))?;
                 let selection = index.select(&remaining)?;
-                selection_witness_from_raster_selection(data, &remaining, selection)?
+                match payload_kind {
+                    SelectionPayloadKind::Raw => {
+                        selection_witness_from_raster_selection(data, &remaining, selection)?
+                    }
+                    SelectionPayloadKind::List => {
+                        let (len, elements_root) = index.list_metadata(&remaining)?;
+                        list_metadata_witness(&remaining, selection, len, elements_root)
+                    }
+                }
             }
             (
                 ReferencedSourceKind::Postcard { to_tree, schema },
                 ResolvedSourceData::Postcard { .. },
             ) => {
+                // A metadata view is derived from a `.rindex`; a postcard
+                // source has none. This is the same class of refusal as the
+                // recur-source rule in `lazy-list-recur.md` §3, reached from
+                // the witness side.
+                if payload_kind == SelectionPayloadKind::List {
+                    return Err(Error::Other(format!(
+                        "Entry argument '{}' is postcard-encoded and cannot supply list metadata; \
+                         re-encode this input with encoding = \"raster\"",
+                        source.name
+                    )));
+                }
                 let tree = to_tree(resolved.bytes())?;
                 let (_, root_hash) = subtree_payload_and_root(&tree)?;
                 if root_hash.to_vec() != source.commitment {
@@ -307,6 +329,50 @@ impl ReferencedObject {
             },
         })
     }
+
+    /// A recur source's `(len, elements_root)` from an external input, without
+    /// resolving an element.
+    ///
+    /// Raster only: a postcard source is sequential and carries no index, so
+    /// `rows[i]` cannot be located without decoding everything before it. That
+    /// is the case `lazy-list-recur.md` §3 refuses at `open` rather than
+    /// servicing at `O(list)`.
+    pub fn list_metadata_selection(
+        &self,
+        selector: &SelectorPath,
+        resolver: &dyn SourceResolver,
+    ) -> Result<AuthenticatedListMetadata> {
+        let (source, remaining) = self.find_source(selector)?;
+        let resolved = resolver.resolve(&source.name)?;
+        Self::verify_source_commitment(source, &resolved)?;
+
+        let (ReferencedSourceKind::Raster, ResolvedSourceData::Raster { .. }) =
+            (&source.kind, &resolved)
+        else {
+            return Err(Error::Other(format!(
+                "call_recur! requires a raster-indexed List source; \
+                 re-encode this input with encoding = \"raster\" (input '{}')",
+                source.name
+            )));
+        };
+
+        let index = resolved
+            .raster_index()
+            .ok_or_else(|| Error::Other("Expected raster index metadata".into()))?;
+        let (len, elements_root) = index.list_metadata(&remaining)?;
+
+        let mut selected =
+            list_metadata_payload(&remaining, index.root_commitment, len, elements_root);
+        // Re-anchor to the combined root, exactly as `select` does: an entry
+        // argument's selections are proven against the object that binds every
+        // declared source, not against one source's own root.
+        selected.selected.commitment.path = full_selector_path(&source.name, &remaining);
+        selected.selected.commitment.source_root_hash = self
+            .combined_root()
+            .try_into()
+            .map_err(|_| Error::Other("Combined root is not 32 bytes".into()))?;
+        Ok(selected)
+    }
 }
 
 fn full_selector_path(name: &str, remaining: &SelectorPath) -> SelectorPath {
@@ -338,6 +404,7 @@ impl OwnedObject {
                     source_root_hash: raster.root_hash,
                     selected_hash: raster_core::input::selection_payload_hash(&raster.bytes),
                     selected_len: raster.bytes.len() as u64,
+                    payload_kind: SelectionPayloadKind::Raw,
                 },
                 value,
             ))
@@ -355,6 +422,7 @@ impl OwnedObject {
                     source_root_hash: [0; 32],
                     selected_hash: [0; 32],
                     selected_len: 0,
+                    payload_kind: SelectionPayloadKind::Raw,
                 },
                 value,
             ))
@@ -503,7 +571,9 @@ mod tests {
         ]);
 
         let (_, selected) = referenced.select(&selector, &resolver).unwrap();
-        let witness = referenced.selection_witness(&selector, &resolver).unwrap();
+        let witness = referenced
+            .selection_witness(&selector, SelectionPayloadKind::Raw, &resolver)
+            .unwrap();
 
         assert!(raster_core::input::verify_selection_witness(
             &selected.commitment,

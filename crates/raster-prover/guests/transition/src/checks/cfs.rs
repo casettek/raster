@@ -5,6 +5,7 @@
 
 use raster_core::cfs::{CfsCoordinates, CfsCursor, InputBinding, InputSource, SequenceChildItem};
 use raster_core::input::SelectorSegment;
+use raster_core::draft::TileReplayJournal;
 use raster_core::trace::{
     ExecStep, ExecTarget, FnInput, FnInputValue, StepKind, StepRecord, StorageData,
 };
@@ -110,21 +111,33 @@ fn record_matches_item(step_record: &StepRecord, cfs_item: &SequenceChildItem) -
             StepKind::SequenceStart { .. } | StepKind::SequenceEnd { .. },
             SequenceChildItem::RecurSequence(item),
         ) => step_record.sequence_id == item.id,
+        // A recur *tile* site opens with a boundary step too: `RecurTileStart`
+        // becomes `SequenceStart` at `[s]`, carrying the site's own id so it
+        // binds to the item the same way a sequence's boundary steps do. Its
+        // `End` half stays `Exec(RecurTile)`, matched above.
+        (StepKind::SequenceStart { .. }, SequenceChildItem::RecurTile(item)) => {
+            step_record.sequence_id == item.id
+        }
         _ => false,
     }
 }
 
 /// For an iteration of a recur site with a CFS-declared chunk size, verify the
-/// iteration consumed a chunk of `1..=declared` elements. The chunk length is
-/// the leading varint of the iteration's canonical input bytes (the first tile
-/// argument is `RecurInput<Vec<T>>`, whose first field is the chunk vector);
-/// those bytes are pinned by `input_commitment` and executed by the replay
-/// proof, so the prefix cannot lie about the payload.
+/// iteration consumed a chunk of `1..=declared` elements.
+///
+/// The count comes from the iteration's **replay journal** — `consumed_elements`
+/// — rather than from inspecting the leading postcard varint of its ABI bytes.
+/// The varint trick worked only because a chunked tile's first argument happened
+/// to be `RecurInput<Vec<T>>`, whose first field is the chunk vector; it was a
+/// layout assumption about user types, and it could not read anything else the
+/// audit needs (an *unchunked* iteration's index, or how the tile terminated).
+/// The tile now commits the number directly and the replay receipt covers it.
+/// See `docs/proposals/lazy-list-recur.md` §5.
 fn verify_recur_iteration_chunking(
     cfs_cursor: &CfsCursor,
     step_record: &StepRecord,
     site_coordinates: &CfsCoordinates,
-    input_witness: Option<&Vec<u8>>,
+    replay_journal: Option<&TileReplayJournal>,
 ) {
     let Some(raster_core::cfs::SequenceChildItem::RecurTile(item)) =
         cfs_cursor.try_get_item(site_coordinates)
@@ -135,24 +148,39 @@ fn verify_recur_iteration_chunking(
         return;
     };
 
-    let input_witness = input_witness.unwrap_or_else(|| {
-        panic!(
-            "Chunked recur iteration {:?} is missing its input witness",
-            step_record
-        )
-    });
-    let chunk_len =
-        raster_core::chunking::iteration_chunk_len(input_witness).unwrap_or_else(|| {
+    let recur = replay_journal
+        .and_then(|journal| journal.recur.as_ref())
+        .unwrap_or_else(|| {
             panic!(
-                "Chunked recur iteration {:?} input does not carry a chunk length",
+                "Chunked recur iteration {:?} is missing its replay-proven recur facts",
                 step_record
             )
         });
-    if let Err(violation) = raster_core::chunking::check_iteration_chunk_len(declared, chunk_len) {
+    let consumed = recur.position.consumed_elements;
+    if let Err(violation) = raster_core::chunking::check_iteration_chunk_len(declared, consumed) {
         panic!(
             "Recur chunking violation at step {:?}: {}",
             step_record, violation
         );
+    }
+
+    // Only the *final* chunk may be short. The native recorder used to enforce
+    // this by remembering the previous iteration's length; the journal makes it
+    // a stateless, per-iteration fact, because `declared_iterations` already
+    // says whether this iteration is the last one. Same rule, replay-proven
+    // instead of host-remembered — and it is what rejects a `4,1,4,1` shape at
+    // `C = 4` on the iteration that goes short, rather than on the one after.
+    let is_final_iteration =
+        recur.position.iteration_index + 1 >= recur.position.declared_iterations;
+    if !is_final_iteration {
+        if let Err(violation) =
+            raster_core::chunking::check_previous_chunk_was_full(declared, consumed)
+        {
+            panic!(
+                "Recur chunking violation at step {:?}: {}",
+                step_record, violation
+            );
+        }
     }
 }
 
@@ -161,7 +189,7 @@ pub fn verify_step_record_inputs(
     step_record: &StepRecord,
     input_source_witness: Option<&FnInput>,
     sequence_scope_witness: Option<&FnInput>,
-    input_witness: Option<&Vec<u8>>,
+    replay_journal: Option<&TileReplayJournal>,
 ) {
     // The program-boundary steps sit at the sequence root `[]`, which is not
     // itself a CFS item and binds no CFS inputs: `ProgramStart` binds
@@ -175,7 +203,7 @@ pub fn verify_step_record_inputs(
     if let Some((site_coordinates, _)) =
         cfs_cursor.try_get_recur_iteration_coordinates(step_record.coordinates())
     {
-        verify_recur_iteration_chunking(cfs_cursor, step_record, &site_coordinates, input_witness);
+        verify_recur_iteration_chunking(cfs_cursor, step_record, &site_coordinates, replay_journal);
         return;
     }
 

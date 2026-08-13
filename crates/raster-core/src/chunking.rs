@@ -1,12 +1,14 @@
 //! Validation of recur iteration chunk shapes against the CFS-declared
 //! chunk size (`RecurTileItem::chunk`).
 //!
-//! For a chunked recur tile the first tile argument is `RecurInput<Vec<T>>`,
-//! and `RecurInput`'s first field is the chunk vector, so the iteration's ABI
-//! input bytes begin with the postcard varint element count of the chunk.
-//! Both the native recorder and the transition guest validate against those
-//! canonical bytes (the same bytes the replay proof executes on, and that
-//! `input_commitment` pins), so a lying length prefix cannot pass replay.
+//! The element count an iteration consumed is read from its replay journal
+//! (`RecurPosition::consumed_elements`), which the tile commits directly and
+//! the replay receipt covers. This module used to infer the same number from
+//! the leading postcard varint of the iteration's ABI bytes — sound, but only
+//! because a chunked tile's first argument happened to be `RecurInput<Vec<T>>`
+//! with the chunk vector first. That was a layout assumption about user types,
+//! and it could not reach the other facts the audit needs. See
+//! `docs/proposals/lazy-list-recur.md` §5.
 
 use core::fmt;
 
@@ -45,27 +47,6 @@ impl fmt::Display for ChunkViolation {
     }
 }
 
-/// Decode the leading postcard varint from a byte slice.
-///
-/// Postcard encodes `u64` (and collection lengths) as LEB128 varints:
-/// little-endian 7-bit groups with the high bit as a continuation flag.
-pub fn leading_varint(bytes: &[u8]) -> Option<u64> {
-    let mut value: u64 = 0;
-    for (index, byte) in bytes.iter().enumerate().take(10) {
-        value |= u64::from(byte & 0x7f) << (7 * index);
-        if byte & 0x80 == 0 {
-            return Some(value);
-        }
-    }
-    None
-}
-
-/// Element count of the chunk consumed by a recur iteration, decoded from the
-/// iteration's canonical ABI input bytes.
-pub fn iteration_chunk_len(input_data: &[u8]) -> Option<u64> {
-    leading_varint(input_data)
-}
-
 /// Stateless per-iteration rule: a chunk must hold `1..=declared` elements.
 pub fn check_iteration_chunk_len(declared: u64, actual: u64) -> Result<(), ChunkViolation> {
     if actual == 0 {
@@ -93,37 +74,6 @@ pub fn check_previous_chunk_was_full(declared: u64, previous: u64) -> Result<(),
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::string::String;
-    use alloc::vec;
-    use alloc::vec::Vec;
-
-    #[test]
-    fn leading_varint_matches_postcard_collection_lengths() {
-        for len in [0usize, 1, 2, 5, 127, 128, 300, 20_000] {
-            let value: Vec<u8> = vec![7u8; len];
-            let bytes = postcard::to_allocvec(&value).unwrap();
-            assert_eq!(leading_varint(&bytes), Some(len as u64), "len {}", len);
-        }
-    }
-
-    #[test]
-    fn iteration_chunk_len_reads_recur_input_layout() {
-        // Mirrors `RecurInput<Vec<String>> { value, index, len }`: postcard
-        // encodes struct fields in order with no framing, so a tuple with the
-        // same field order produces identical leading bytes.
-        let recur_input = (
-            vec![String::from("a"), String::from("bc")],
-            3u64, // index
-            5u64, // len
-        );
-        let bytes = postcard::to_allocvec(&recur_input).unwrap();
-        assert_eq!(iteration_chunk_len(&bytes), Some(2));
-
-        // Multi-argument ABI: the tuple still leads with the RecurInput.
-        let with_extra_args = (recur_input, String::from("title"));
-        let bytes = postcard::to_allocvec(&with_extra_args).unwrap();
-        assert_eq!(iteration_chunk_len(&bytes), Some(2));
-    }
 
     #[test]
     fn per_iteration_rule_accepts_full_and_partial_chunks() {

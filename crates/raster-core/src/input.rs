@@ -270,12 +270,44 @@ pub struct SelectionProof {
     pub steps: Vec<SelectionProofStep>,
 }
 
+/// Which *view* of the selected node a commitment's payload carries.
+///
+/// A selector names a descent, so it cannot distinguish these: selecting a
+/// `List<T>` and selecting that list's metadata share a path, a source root and
+/// a set of proof steps, and both fold to the same root. What separates them is
+/// the payload — a `0x02` list against a `0x0A` metadata record — and the rule
+/// (`lazy-list-recur.md` §1) is that **every consumer states the kind it
+/// expects** rather than accepting whichever arrives.
+///
+/// It is recorded rather than derived from byte 0 because the payload is not
+/// always at hand: `raster-cli`'s commit pipeline rebuilds a witness from
+/// `(coordinates, commitment, selector)` alone
+/// (`raster-cli/src/commands/run.rs`, `build_storage_selection_witnesses`) and
+/// has to know which form to regenerate. A *reader* holding the bytes can still
+/// cross-check byte 0, which is what [`verify_selection_witness`] does.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum SelectionPayloadKind {
+    /// The selected node's own payload, whatever its kind — the only form that
+    /// existed before `lazy-list-recur`, and still the form for every selection
+    /// that is not a recur source.
+    #[default]
+    Raw,
+    /// The `0x0A` authenticated list metadata record: `(len, elements_root)`,
+    /// 41 bytes, or 9 for an empty list. There is deliberately no separate
+    /// "raw whole list" spelling here — naming the kind `List` is what encodes
+    /// that a list is *always* carried as metadata once it is named at all.
+    List,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct SelectionCommitment {
     pub path: SelectorPath,
     pub source_root_hash: Hash32,
     pub selected_hash: Hash32,
     pub selected_len: u64,
+    /// The view of the node `selected_hash` is taken over. See
+    /// [`SelectionPayloadKind`].
+    pub payload_kind: SelectionPayloadKind,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -288,6 +320,24 @@ pub struct SelectionWitness {
 pub struct SelectedPayload {
     pub bytes: Vec<u8>,
     pub commitment: SelectionCommitment,
+}
+
+/// A list's authenticated shape, together with the selection that proves it.
+///
+/// `len` is the value a recur loop is held to. It is *authenticated* rather
+/// than index-trusted precisely because `selected` commits to the `0x0A`
+/// payload carrying it: the committed root is recomputed from
+/// `(len, elements_root)`, so no other length reaches the same root. Reading
+/// the same integer straight off a `RasterIndex` node would not be — a nested
+/// list node's `len` is never checked against its children's hashes
+/// (`RasterIndex::validate`), which is the forged-`len = 0` sweep
+/// `docs/proposals/lazy-list-recur.md` exists to close.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AuthenticatedListMetadata {
+    pub len: u64,
+    /// `None` for an empty list, which has no Merkle levels at all.
+    pub elements_root: Option<Hash32>,
+    pub selected: SelectedPayload,
 }
 
 impl SelectedPayload {
@@ -349,9 +399,24 @@ fn parse_utf8(bytes: &[u8], offset: &mut usize) -> Option<Vec<u8>> {
     Some(slice.to_vec())
 }
 
+/// The final step of a list's root: `H(b"list-root" ‖ len ‖ elements_root)`,
+/// with the `b"empty"` sentinel standing in for an empty list's absent root.
+///
+/// Factored out because the `0x0A` metadata payload *is* exactly this step —
+/// metadata carries `(len, elements_root)` and nothing else, so recomputing its
+/// root must reuse this function rather than restate it. A divergence between
+/// the two spellings would be a metadata record that verifies against a root no
+/// list can produce.
+fn list_root_from_elements_root(len: u64, elements_root: Option<&Hash32>) -> Hash32 {
+    match elements_root {
+        Some(root) => selection_hash(&[b"list-root", &len.to_le_bytes(), root.as_slice()]),
+        None => selection_hash(&[b"list-root", &len.to_le_bytes(), b"empty"]),
+    }
+}
+
 fn list_root_from_hashes(hashes: &[Hash32], len: u64) -> Hash32 {
     if hashes.is_empty() {
-        return selection_hash(&[b"list-root", &len.to_le_bytes(), b"empty"]);
+        return list_root_from_elements_root(len, None);
     }
 
     let mut level = hashes.to_vec();
@@ -372,9 +437,53 @@ fn list_root_from_hashes(hashes: &[Hash32], len: u64) -> Hash32 {
         level = next;
     }
 
-    selection_hash(&[b"list-root", &len.to_le_bytes(), level[0].as_slice()])
+    list_root_from_elements_root(len, Some(&level[0]))
 }
 
+/// Encode the `0x0A` authenticated list metadata payload.
+///
+/// ```text
+/// 0x0A ‖ len:u64 ‖ elements_root:32     (len > 0)   41 bytes
+/// 0x0A ‖ 0u64                           (empty)      9 bytes
+/// ```
+///
+/// The encode half of the `0x0A` arm of [`parse_subtree_root`], in the same
+/// encode-and-compare spirit as [`encode_index_leaf_payload`]: producers build
+/// the bytes here so there is exactly one spelling of a metadata record, and
+/// the round-trip is covered by `list_metadata_payload_folds_to_the_list_root`.
+///
+/// `elements_root` is the top of a list node's Merkle levels — for a raster
+/// index, `merkle_levels.last().hashes[0]`, which `RasterIndex::validate`
+/// already guarantees is exactly one hash. `None` encodes the empty list.
+pub fn encode_list_metadata_payload(len: u64, elements_root: Option<Hash32>) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(1 + 8 + 32);
+    payload.push(0x0A);
+    payload.extend_from_slice(&len.to_le_bytes());
+    if let Some(root) = elements_root {
+        payload.extend_from_slice(&root);
+    }
+    payload
+}
+
+/// Recompute a selection payload's structural root from its bytes.
+///
+/// # Payload tags
+///
+/// The tag space is contiguous and small, so it is allocated **here**, centrally,
+/// rather than negotiated per proposal — two documents each reserving a byte is
+/// how collisions happen. Add a row before adding an arm.
+///
+/// | tag | payload | defined by |
+/// | --- | --- | --- |
+/// | `0x00` | leaf | — |
+/// | `0x01` | struct | — |
+/// | `0x02` | list | — |
+/// | `0x03` | unit | — |
+/// | `0x04` | map | — |
+/// | `0x05`–`0x08` | enum unit / newtype / tuple / struct | — |
+/// | `0x09` | list handle (stored root, skipped body) | `bounded-collections.md` |
+/// | `0x0A` | list metadata (`len`, `elements_root`) | `lazy-list-recur.md` |
+/// | `0x0B` | bytes page | *reserved* — `paged-bytes.md` |
 fn parse_subtree_root(bytes: &[u8], offset: &mut usize) -> Option<Hash32> {
     let kind = *bytes.get(*offset)?;
     *offset += 1;
@@ -449,6 +558,28 @@ fn parse_subtree_root(bytes: &[u8], offset: &mut usize) -> Option<Hash32> {
             let _ = bytes.get(*offset..inner_end)?;
             *offset = inner_end;
             Some(root)
+        }
+        // list-metadata: `[len:8]`, plus `[elements_root:32]` when `len > 0`.
+        // Proves a list's length and element root without carrying an element,
+        // which is what lets a recur source be traced in O(1) instead of
+        // O(list) (see `docs/proposals/lazy-list-recur.md` §1).
+        //
+        // The root is *recomputed* from `(len, elements_root)`, so a forged
+        // length yields a different root and fails to fold. That makes this
+        // strictly stronger than the `0x09` handle above, which returns its
+        // stored root and ignores its stored `len` — a handle's length field is
+        // not authenticated and cannot be used as a loop bound.
+        0x0A => {
+            let len = parse_u64(bytes, offset)?;
+            let elements_root = if len == 0 {
+                None
+            } else {
+                let root_end = offset.checked_add(32)?;
+                let root: Hash32 = bytes.get(*offset..root_end)?.try_into().ok()?;
+                *offset = root_end;
+                Some(root)
+            };
+            Some(list_root_from_elements_root(len, elements_root.as_ref()))
         }
         0x04 => {
             let len = parse_u64(bytes, offset)?;
@@ -853,6 +984,27 @@ pub fn encode_index_leaf_payload(index: u64, width: IndexWidth) -> Option<Vec<u8
     Some(payload)
 }
 
+/// Whether a payload's leading tag is the view `kind` claims.
+///
+/// This is the general form of the rule `lazy-list-recur.md` §1 states: a
+/// consumer pins the payload kind it expects. Two payload forms can fold to the
+/// same root — a `0x02` list and its `0x0A` metadata both do — so folding alone
+/// does not establish *which* was supplied. Accepting a `0x02` where metadata
+/// was recorded would not forge the length (a full-list fold authenticates its
+/// own length too), but it would put the whole-list payload back in the witness,
+/// which is the `O(list)` cost metadata exists to remove.
+fn payload_matches_kind(bytes: &[u8], kind: SelectionPayloadKind) -> bool {
+    match (bytes.first(), kind) {
+        (Some(0x0A), SelectionPayloadKind::List) => true,
+        (Some(0x0A), SelectionPayloadKind::Raw) => false,
+        (Some(_), SelectionPayloadKind::Raw) => true,
+        // A `List` commitment accepts nothing but metadata — in particular not
+        // the `0x02` list it was derived from.
+        (Some(_), SelectionPayloadKind::List) => false,
+        (None, _) => false,
+    }
+}
+
 pub fn verify_selection_witness(
     commitment: &SelectionCommitment,
     witness: &SelectionWitness,
@@ -861,6 +1013,7 @@ pub fn verify_selection_witness(
         || witness.proof.root_hash != commitment.source_root_hash
         || witness.bytes.len() as u64 != commitment.selected_len
         || selection_payload_hash(&witness.bytes) != commitment.selected_hash
+        || !payload_matches_kind(&witness.bytes, commitment.payload_kind)
     {
         return false;
     }
@@ -1451,5 +1604,193 @@ mod tests {
             .insert(0, SelectorSegment::Field("slice".to_string()));
         proof.root_hash = struct_root;
         assert!(verify_selection_proof(&payload, &proof));
+    }
+
+    // ---- `0x0A` authenticated list metadata (`lazy-list-recur.md` §1) ----
+
+    /// The top of a list's Merkle levels — what a `.rindex` stores as
+    /// `merkle_levels.last().hashes[0]`, and what metadata carries.
+    fn elements_root(element_roots: &[Hash32]) -> Option<Hash32> {
+        if element_roots.is_empty() {
+            return None;
+        }
+        let mut level = element_roots.to_vec();
+        while level.len() > 1 {
+            if level.len() % 2 == 1 {
+                level.push(*level.last().unwrap());
+            }
+            level = level
+                .chunks(2)
+                .map(|pair| selection_hash(&[b"list-node", &pair[0], &pair[1]]))
+                .collect();
+        }
+        Some(level[0])
+    }
+
+    fn metadata_fixture(len: usize) -> (Vec<u8>, Hash32) {
+        let element_roots: Vec<Hash32> = (0..len)
+            .map(|value| leaf_root(&[value as u8, 0xAB]))
+            .collect();
+        let payload = encode_list_metadata_payload(len as u64, elements_root(&element_roots));
+        (payload, list_root_from_hashes(&element_roots, len as u64))
+    }
+
+    fn parsed_root(payload: &[u8]) -> Option<Hash32> {
+        let mut offset = 0;
+        let root = parse_subtree_root(payload, &mut offset)?;
+        // The arm must consume exactly its own bytes: every struct/list parent
+        // asserts `child_offset == child_bytes.len()`.
+        (offset == payload.len()).then_some(root)
+    }
+
+    #[test]
+    fn list_metadata_payload_folds_to_the_list_root() {
+        // 0 and 1 are the boundary shapes; 2/3/4/5 cover even, odd (the Merkle
+        // duplication path), and a second level.
+        for len in [0usize, 1, 2, 3, 4, 5, 8, 9] {
+            let (payload, expected) = metadata_fixture(len);
+            assert_eq!(
+                payload.len(),
+                if len == 0 { 9 } else { 41 },
+                "metadata is 41 bytes, 9 when empty (len {})",
+                len
+            );
+            assert_eq!(
+                parsed_root(&payload),
+                Some(expected),
+                "metadata must recompute the same root the full list folds to (len {})",
+                len
+            );
+        }
+    }
+
+    #[test]
+    fn empty_list_metadata_uses_the_empty_sentinel() {
+        let (payload, expected) = metadata_fixture(0);
+        assert_eq!(payload, alloc::vec![0x0A, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            expected,
+            selection_hash(&[b"list-root", &0u64.to_le_bytes(), b"empty"])
+        );
+    }
+
+    /// The point of the whole payload form: the length is *recomputed into* the
+    /// root, so claiming a different one yields a different root. This is what
+    /// the `0x09` handle cannot do — it returns its stored root and ignores its
+    /// stored `len`.
+    #[test]
+    fn forged_list_metadata_length_fails_to_fold() {
+        let (payload, honest) = metadata_fixture(5);
+        for forged in [0u64, 1, 4, 6, 999] {
+            let mut tampered = payload.clone();
+            tampered[1..9].copy_from_slice(&forged.to_le_bytes());
+            assert_ne!(
+                parsed_root(&tampered),
+                Some(honest),
+                "a metadata record claiming len {} must not fold to the honest root",
+                forged
+            );
+        }
+    }
+
+    #[test]
+    fn forged_list_metadata_elements_root_fails_to_fold() {
+        let (payload, honest) = metadata_fixture(5);
+        let mut tampered = payload.clone();
+        tampered[9] ^= 0xFF;
+        assert_ne!(parsed_root(&tampered), Some(honest));
+    }
+
+    #[test]
+    fn truncated_list_metadata_is_rejected() {
+        let (payload, _) = metadata_fixture(5);
+        // Missing the elements root entirely, and a partial one.
+        assert_eq!(parsed_root(&payload[..9]), None);
+        assert_eq!(parsed_root(&payload[..30]), None);
+        // A non-empty length must not accept trailing slack either.
+        let mut padded = payload.clone();
+        padded.push(0);
+        assert_eq!(parsed_root(&padded), None);
+    }
+
+    /// Each consumer pins the kind it expects. A range proof reaches for the
+    /// element roots and must not silently accept a metadata record instead.
+    #[test]
+    fn parse_list_child_roots_rejects_metadata() {
+        let (payload, _) = metadata_fixture(4);
+        assert!(parse_list_child_roots(&payload).is_none());
+    }
+
+    fn metadata_witness(len: usize) -> (SelectionCommitment, SelectionWitness) {
+        let (payload, root) = metadata_fixture(len);
+        let commitment = SelectionCommitment {
+            path: SelectorPath::default(),
+            source_root_hash: root,
+            selected_hash: selection_payload_hash(&payload),
+            selected_len: payload.len() as u64,
+            payload_kind: SelectionPayloadKind::List,
+        };
+        let witness = SelectionWitness {
+            bytes: payload,
+            proof: SelectionProof {
+                path: SelectorPath::default(),
+                root_hash: root,
+                steps: Vec::new(),
+            },
+        };
+        (commitment, witness)
+    }
+
+    #[test]
+    fn metadata_witness_verifies_against_a_list_kind_commitment() {
+        let (commitment, witness) = metadata_witness(5);
+        assert!(verify_selection_witness(&commitment, &witness));
+    }
+
+    /// A whole-list payload folds to the same root as its metadata and
+    /// authenticates its own length just as well — so folding cannot be what
+    /// separates them. The recorded kind is, and a `List` commitment refuses
+    /// the `0x02` form outright rather than parsing it. That refusal is the
+    /// `O(list)` cost this proposal exists to remove.
+    #[test]
+    fn a_list_kind_commitment_refuses_a_whole_list_payload() {
+        let len = 5usize;
+        let element_bytes: Vec<Vec<u8>> = (0..len)
+            .map(|value| alloc::vec![value as u8, 0xAB])
+            .collect();
+        let element_roots: Vec<Hash32> =
+            element_bytes.iter().map(|bytes| leaf_root(bytes)).collect();
+        let encoded: Vec<Vec<u8>> = element_bytes.iter().map(|b| encode_leaf(b)).collect();
+        let whole = encode_list(&encoded);
+        let root = list_root_from_hashes(&element_roots, len as u64);
+
+        // It really does fold to the same root…
+        assert_eq!(parsed_root(&whole), Some(root));
+        assert_eq!(parsed_root(&metadata_fixture(len).0), Some(root));
+
+        // …and is still refused where metadata was recorded.
+        let commitment = SelectionCommitment {
+            path: SelectorPath::default(),
+            source_root_hash: root,
+            selected_hash: selection_payload_hash(&whole),
+            selected_len: whole.len() as u64,
+            payload_kind: SelectionPayloadKind::List,
+        };
+        let witness = SelectionWitness {
+            bytes: whole,
+            proof: SelectionProof {
+                path: SelectorPath::default(),
+                root_hash: root,
+                steps: Vec::new(),
+            },
+        };
+        assert!(!verify_selection_witness(&commitment, &witness));
+    }
+
+    #[test]
+    fn a_raw_kind_commitment_refuses_a_metadata_payload() {
+        let (mut commitment, witness) = metadata_witness(5);
+        commitment.payload_kind = SelectionPayloadKind::Raw;
+        assert!(!verify_selection_witness(&commitment, &witness));
     }
 }

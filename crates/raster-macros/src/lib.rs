@@ -88,6 +88,31 @@ fn is_draft_type(ty: &Type) -> bool {
     draft_inner_type(ty).is_some()
 }
 
+/// `Block<E>` → `E`, for a recur tile that iterates chunks.
+///
+/// A chunked recur tile is written as `RecurInput<Block<E>>`, but its *source*
+/// is an ordinary `AuthRef<List<E>>` — there is no `List<Block<E>>` in the
+/// storage tree to prove membership in, so the chunk has to come from a range
+/// selection over the real list rather than from a synthetic list of blocks.
+/// This is what lets the driver recover the element type the source is stated
+/// in. See `docs/proposals/lazy-list-recur.md` §6.
+pub(crate) fn block_element_type(ty: &Type) -> Option<Type> {
+    let Type::Path(type_path) = ty else {
+        return None;
+    };
+    let segment = type_path.path.segments.last()?;
+    if segment.ident != "Block" {
+        return None;
+    }
+    let PathArguments::AngleBracketed(args) = &segment.arguments else {
+        return None;
+    };
+    args.args.iter().find_map(|arg| match arg {
+        GenericArgument::Type(inner) => Some(inner.clone()),
+        _ => None,
+    })
+}
+
 fn recur_input_inner_type(ty: &Type) -> Option<Type> {
     let Type::Path(type_path) = ty else {
         return None;
@@ -371,6 +396,35 @@ fn gen_auth_value_materialization(input: &ItemFn) -> proc_macro2::TokenStream {
             let protocol_kind = param_protocol_kind(&param.ty);
             let internal_info_ident = internal_info_ident(param);
             match protocol_kind {
+                // A recur iteration's item is the one argument whose binding
+                // cannot travel with the value: `RecurInput<T>` is a plain
+                // serializable struct, so `into_auth_value` sees an inline
+                // value and there is nothing to read a selector off. The
+                // driver stashed the binding host-side just before calling
+                // this wrapper; taking it here is what turns the item from an
+                // `Inline` blob in the trace into an authenticated
+                // `StorageBinding` at `source[i]`, and what carries the source
+                // list's citations onto every iteration. See
+                // `docs/proposals/lazy-list-recur.md` §4.
+                ParamProtocolKind::AuthValue(value_ty)
+                    if recur_input_inner_type(&param.ty).is_some() =>
+                {
+                    let index_bindings_ident = index_bindings_ident(param);
+                    quote! {
+                        let (__raster_auth_value, __raster_arg_index_bindings) =
+                            ::raster::into_auth_value_with_bindings::<#value_ty, _>(#name)
+                            .unwrap_or_else(|e| panic!("Failed to materialize auth value for argument '{}': {}", stringify!(#name), e));
+                        let #internal_info_ident = ::raster::take_recur_item_binding();
+                        let #index_bindings_ident: ::raster::alloc::vec::Vec<::raster::IndexBinding> =
+                            match &#internal_info_ident {
+                                ::core::option::Option::Some(__raster_recur_binding) => {
+                                    __raster_recur_binding.index_bindings.clone()
+                                }
+                                ::core::option::Option::None => __raster_arg_index_bindings,
+                            };
+                        let #name: #value_ty = __raster_auth_value.into_inner();
+                    }
+                }
                 ParamProtocolKind::AuthValue(value_ty) => {
                     let index_bindings_ident = index_bindings_ident(param);
                     if profiling_enabled {
@@ -1109,12 +1163,83 @@ fn gen_replay_transition_binding(kind: &ProtocolReturnKind) -> proc_macro2::Toke
     }
 }
 
+/// Capture a recur iteration's position **before** the tile runs.
+///
+/// This cannot live where the journal is built. The decoded arguments are moved
+/// into the tile at the call, and `RecurInput` is not `Copy`, so by
+/// journal-construction time they are gone — writing this in the natural place
+/// simply does not compile. Hence a two-field capture emitted between decode
+/// and call, for recur-tile kinds only.
+///
+/// `consumed_elements` is the chunk's element count for a chunked tile and 1
+/// otherwise. Reading it from the typed value is what retires
+/// `chunking::iteration_chunk_len`, which had to infer the same number from the
+/// leading postcard varint of the ABI bytes.
+fn gen_recur_position_capture(input: &ItemFn) -> proc_macro2::TokenStream {
+    let none = quote! {
+        let __raster_recur_position: ::core::option::Option<::raster::core::draft::RecurPosition> =
+            ::core::option::Option::None;
+    };
+    let params = extract_params(input);
+    let Some(param) = params.first() else {
+        return none;
+    };
+    let Some(item_ty) = recur_input_inner_type(&param.ty) else {
+        return none;
+    };
+    let name = &param.ident;
+    let consumed_elements = if block_element_type(&item_ty).is_some() {
+        quote! { #name.value().as_slice().len() as ::core::primitive::u64 }
+    } else {
+        quote! { 1u64 }
+    };
+    quote! {
+        let __raster_recur_position = ::core::option::Option::Some(
+            ::raster::core::draft::RecurPosition {
+                iteration_index: #name.index(),
+                declared_iterations: #name.len(),
+                consumed_elements: #consumed_elements,
+            }
+        );
+    }
+}
+
+/// The iteration's termination, read from the typed result.
+///
+/// `gen_replay_transition_binding` already matches `Continue | Break` and
+/// *discards* the distinction; splitting that arm is the whole of `control` for
+/// the modes that have one. Modes whose return type carries no `RecurControl`
+/// emit a literal `Continue` — never an absence, so the audit never applies a
+/// default of its own.
+fn gen_recur_control_capture(kind: &ProtocolReturnKind) -> proc_macro2::TokenStream {
+    match kind {
+        ProtocolReturnKind::RecurControlDraft(_)
+        | ProtocolReturnKind::RecurControlRecurOutput(_)
+        | ProtocolReturnKind::RecurControlRecurState(_)
+        | ProtocolReturnKind::RecurControlRecurStateOutput(_) => quote! {
+            let __raster_recur_control = match &result {
+                ::raster::RecurControl::Continue(_) => {
+                    ::raster::core::draft::RecurControlKind::Continue
+                }
+                ::raster::RecurControl::Break(_) => {
+                    ::raster::core::draft::RecurControlKind::Break
+                }
+            };
+        },
+        _ => quote! {
+            let __raster_recur_control = ::raster::core::draft::RecurControlKind::Continue;
+        },
+    }
+}
+
 fn gen_replay_output_serialization(kind: &ProtocolReturnKind) -> proc_macro2::TokenStream {
     let replay_transition_binding = gen_replay_transition_binding(kind);
+    let recur_control_capture = gen_recur_control_capture(kind);
     quote! {
         let __raster_output_bytes = ::raster::core::postcard::to_allocvec(&result)
             .map_err(|e| ::raster::core::Error::Serialization(::raster::alloc::format!("Failed to serialize output: {}", e)))?;
         #replay_transition_binding
+        #recur_control_capture
         let __raster_input_commitment: [u8; 32] =
             <::raster::core::sha2::Sha256 as ::raster::core::sha2::Digest>::digest(
                 __raster_replay_input_bytes,
@@ -1124,6 +1249,12 @@ fn gen_replay_output_serialization(kind: &ProtocolReturnKind) -> proc_macro2::To
             input_commitment: __raster_input_commitment,
             output_bytes: __raster_output_bytes,
             draft_transition: __raster_draft_transition,
+            recur: __raster_recur_position.map(|__raster_position| {
+                ::raster::core::draft::RecurTileReplay {
+                    position: __raster_position,
+                    control: __raster_recur_control,
+                }
+            }),
         };
         let output = ::raster::core::postcard::to_allocvec(&replay_output)
             .map_err(|e| ::raster::core::Error::Serialization(::raster::alloc::format!("Failed to serialize replay output: {}", e)))?;
@@ -1318,6 +1449,20 @@ fn gen_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream {
             let name_str = param.ident.to_string();
             let internal_info_ident = internal_info_ident(param);
             let index_bindings = index_binding_insert(param);
+            // A recur item's binding arrives already shaped as `StorageData`
+            // (the driver built it from the item's own `AuthRef`), rather than
+            // as a `StorageValue` to project one out of.
+            if recur_input_inner_type(&param.ty).is_some() {
+                return quote! {
+                    if let ::core::option::Option::Some(__raster_internal_info) = &#internal_info_ident {
+                        __raster_internal.insert(
+                            ::raster::alloc::string::String::from(#name_str),
+                            __raster_internal_info.storage.clone(),
+                        );
+                    }
+                    #index_bindings
+                };
+            }
             quote! {
                 if let ::core::option::Option::Some(__raster_internal_info) = &#internal_info_ident {
                     __raster_internal.insert(
@@ -1612,26 +1757,26 @@ fn rewrite_call_recur_macro(expr_macro: &syn::ExprMacro) -> Expr {
     });
     let hidden = format_ident!("__raster_recur_auth_{}", input.tile);
     let source_expr = input.input;
-    let input_expr = match input.chunk {
-        Some(chunk_expr) => {
-            // The chunk size is pinned into the CFS by static discovery, so it
-            // must be an integer literal — anything dynamic would let the
-            // executed chunking diverge from the declared schema.
-            if !matches!(
-                &chunk_expr,
-                Expr::Lit(expr_lit) if matches!(&expr_lit.lit, syn::Lit::Int(_))
-            ) {
-                panic!("call_recur! `chunk = ...` must be an integer literal so it can be pinned in the CFS");
-            }
-            quote! {
-                ::raster::chunk_auth_ref(
-                    ::raster::into_auth_ref(#source_expr),
-                    (#chunk_expr) as usize,
-                )
-            }
+    let input_expr = quote! { #source_expr };
+    // Chunking is a property of the *driver*, not of the source type. The
+    // source stays `AuthRef<List<T>>` and the chunk size rides alongside it, so
+    // the driver can turn each iteration into a range selection over the real
+    // list. Previously this wrapped the source into an `AuthRef<List<Block<T>>>`
+    // whose selector still pointed at the underlying `List<T>` — type and path
+    // disagreeing, which only went unnoticed because the value was regrouped
+    // after a whole-list resolve. See `docs/proposals/lazy-list-recur.md` §6.
+    let chunk_arg = input.chunk.map(|chunk_expr| {
+        // The chunk size is pinned into the CFS by static discovery, so it
+        // must be an integer literal — anything dynamic would let the
+        // executed chunking diverge from the declared schema.
+        if !matches!(
+            &chunk_expr,
+            Expr::Lit(expr_lit) if matches!(&expr_lit.lit, syn::Lit::Int(_))
+        ) {
+            panic!("call_recur! `chunk = ...` must be an integer literal so it can be pinned in the CFS");
         }
-        None => quote! { #source_expr },
-    };
+        quote! { (#chunk_expr) as u64, }
+    });
     let state_expr = input.state;
     let output_expr = input.output;
     let args: Vec<_> = input.args.into_iter().collect();
@@ -1640,7 +1785,7 @@ fn rewrite_call_recur_macro(expr_macro: &syn::ExprMacro) -> Expr {
             syn::parse_quote! {
                 {
                     let __raster_recur_site_scope = ::raster::__private::RecurSiteScopeGuard::enter();
-                    let __raster_recur_result = #hidden(#input_expr, #state_expr, #output_expr #(, #args)*);
+                    let __raster_recur_result = #hidden(#input_expr, #chunk_arg #state_expr, #output_expr #(, #args)*);
                     let _ = &__raster_recur_site_scope;
                     __raster_recur_result
                 }
@@ -1649,7 +1794,7 @@ fn rewrite_call_recur_macro(expr_macro: &syn::ExprMacro) -> Expr {
             syn::parse_quote! {
                 {
                     let __raster_recur_site_scope = ::raster::__private::RecurSiteScopeGuard::enter();
-                    let __raster_recur_result = #hidden(#input_expr, #state_expr #(, #args)*);
+                    let __raster_recur_result = #hidden(#input_expr, #chunk_arg #state_expr #(, #args)*);
                     let _ = &__raster_recur_site_scope;
                     __raster_recur_result
                 }
@@ -1659,7 +1804,7 @@ fn rewrite_call_recur_macro(expr_macro: &syn::ExprMacro) -> Expr {
         syn::parse_quote! {
             {
                 let __raster_recur_site_scope = ::raster::__private::RecurSiteScopeGuard::enter();
-                let __raster_recur_result = #hidden(#input_expr, #output_expr #(, #args)*);
+                let __raster_recur_result = #hidden(#input_expr, #chunk_arg #output_expr #(, #args)*);
                 let _ = &__raster_recur_site_scope;
                 __raster_recur_result
             }
@@ -2063,6 +2208,7 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
     let function_call = gen_function_call(&implementation_name, &input_fn);
     let output_serialization = gen_output_serialization();
     let replay_output_serialization = gen_replay_output_serialization(&return_kind);
+    let recur_position_capture = gen_recur_position_capture(&input_fn);
     let trace_output_serialization = gen_tile_trace_output_serialization();
     let (native_draft_capture_start, native_draft_capture_finish) =
         gen_native_draft_capture(&input_fn, &return_kind);
@@ -2191,6 +2337,7 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
                         input: __raster_input,
                         output: __raster_output,
                         draft_transition_witness: __raster_draft_transition_witness,
+                        recur_control: ::core::option::Option::None,
                     };
                     let __raster_output_record_build_ns =
                         ::core::primitive::u64::try_from(__raster_output_record_build_start.elapsed().as_nanos())
@@ -2268,6 +2415,7 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
                         input: __raster_input,
                         output: __raster_output,
                         draft_transition_witness: __raster_draft_transition_witness,
+                        recur_control: ::core::option::Option::None,
                     };
                     ::raster::publish_trace_event(::raster::core::trace::TraceEvent::TileExec(
                         __raster_record,
@@ -2315,6 +2463,10 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
             let __raster_replay_input_bytes: &[u8] = input;
 
             #inputs_deserialization
+
+            // Before the call: the decoded `RecurInput` is moved into the tile
+            // below, and it is not `Copy`.
+            #recur_position_capture
 
             #function_call
 
@@ -2432,6 +2584,7 @@ fn gen_sequence_wrapped_body(
                     input: __raster_input,
                     output: ::core::option::Option::None,
                     draft_transition_witness: ::core::option::Option::None,
+                    recur_control: ::core::option::Option::None,
                 };
                 #sequence_start_publish
                 let __raster_sequence_start_event_publish_ns =
@@ -2493,6 +2646,7 @@ fn gen_sequence_wrapped_body(
                     input: __raster_input,
                     output: ::core::option::Option::None,
                     draft_transition_witness: ::core::option::Option::None,
+                    recur_control: ::core::option::Option::None,
                 };
                 #sequence_start_publish
                 #auth_result_binding

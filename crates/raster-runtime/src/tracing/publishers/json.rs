@@ -69,6 +69,7 @@ mod tests {
             input: None,
             output: None,
             draft_transition_witness: None,
+            recur_control: None,
         })
     }
 

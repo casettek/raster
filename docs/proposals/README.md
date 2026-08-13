@@ -1,6 +1,6 @@
 # Proposals — status and dependencies
 
-Index of `docs/proposals/`. Last reviewed 2026-08-07.
+Index of `docs/proposals/`. Last reviewed 2026-08-13.
 
 Each proposal's own `Status:` line is the source of truth; this file collects them and records
 where that line disagrees with the code or the git history. Where they disagree, the
@@ -22,9 +22,10 @@ document, and correcting it is the author's call.
 | [`authoring-skill-and-tooling`](./authoring-skill-and-tooling.md) | **half landed** ⚠️ header says `proposed` | the skill: `.claude/skills/raster/` (commit `d78c9a5`) | `cargo raster check` — `raster-cli` has only `run` and `tile` |
 | [`draft-provenance`](./draft-provenance.md) | proposed (2026-07-30) | — | whole |
 | [`loop-carried-state`](./loop-carried-state.md) | proposed (2026-07-30) | — | whole; see the note under *Dependencies* |
-| [`lazy-list-recur`](./lazy-list-recur.md) | proposed 2026-08-05 (rev 2) | — | whole; 6 phases, ship together |
-| [`recur-progress-commitment`](./recur-progress-commitment.md) | proposed 2026-08-07 | — | ships **with** `lazy-list-recur` phase 5 |
+| [`lazy-list-recur`](./lazy-list-recur.md) | **phases 1–4, 6 implemented** (2026-08-13) | metadata payload, `ListCursor`, driver-level chunking + range descent, per-item bindings, §5 journal facts | §5's completeness **rules** exist and are tested but nothing calls them — blocked on `recur-progress-commitment` |
+| [`recur-progress-commitment`](./recur-progress-commitment.md) | proposed 2026-08-07, **rev 2** 2026-08-13 | `raster-core/src/recur_progress.rs` + 21 tests | rev 1 was implemented and backed out — the recorder cannot compute the commitment; rev 2 adds the trace `recur_control` bit and site `Start`/`End` events to fix it |
 | [`paged-bytes`](./paged-bytes.md) | proposed 2026-08-04 (rev 3) | — | blocked on `lazy-list-recur` |
+| [`recur-sequence-break`](./recur-sequence-break.md) | proposed 2026-08-13 | — | whole; blocked on `recur-progress-commitment` rev 2. Weakens `lazy-list-recur` S4 to a prefix/terminal split |
 | [`carried-state-channel`](./carried-state-channel.md) | proposed 2026-08-07 — **enhancement** | — | deliberately deferred until a second component is ready |
 | [`trace-event-vocabulary`](./trace-event-vocabulary.md) | **implemented** (2026-08-13) | `RecurSequenceIterationStart`/`End`; the naming rule and vocabulary table on `TraceEvent` | — |
 
@@ -38,8 +39,8 @@ program-end ────┼──► program-identity ──► program-chain �
 
 bounded-collections (phases 1-2 impl)
         │
-        ├──► lazy-list-recur ◄──── recur-progress-commitment
-        │         │   ▲                     (ships together, phase 5)
+        ├──► lazy-list-recur ◄──── recur-progress-commitment ──► recur-sequence-break
+        │         │   ▲             (rev 2, unimplemented)        (proposed)
         │         │   │
         │         │   └── dynamic-index-selection (impl) — citations survive materialization
         │         │
@@ -65,6 +66,10 @@ sequence-grammar-closure (phase 1 impl) ◄──► draft-provenance
   fraud-proof window verifies one step at a time and the prover chooses where windows open, so
   without a committed carrier the rules bind only in a window that happens to contain iteration
   0. One change, not two.
+- **`recur-sequence-break` → `recur-progress-commitment` rev 2.** Not merely ordered after it:
+  the break bit rides on the `recur_control` trace field rev 2 introduces, and S4′ rewrites the
+  `close_site` rule rev 2 implements. Landing it first would mean implementing both halves of
+  that proposal anyway, in the wrong order.
 - **`chain-fraud-proof` → `program-chain`, `program-identity`.** Already satisfied; noted
   because it is why `program-chain`'s `proposed` header must be stale.
 
@@ -81,8 +86,13 @@ sequence-grammar-closure (phase 1 impl) ◄──► draft-provenance
 
 ## Ready to implement now
 
-1. **`lazy-list-recur` + `recur-progress-commitment`** — one change, six phases, all shipping
-   together. Every image id moves; `paged-bytes` unblocks behind it.
+1. **`recur-progress-commitment` revision 2** — the only thing standing between
+   `lazy-list-recur` and done. Its phases 1–4 and 6 landed 2026-08-13, along with §5's
+   replay-proven journal facts and the completeness rules themselves; what is missing is the
+   carrier that makes the rules bind across a window boundary. Revision 2 exists because
+   revision 1 was implemented and backed out: the recorder cannot compute the commitment it was
+   asked to stamp. Moves trace fingerprints, not only image ids. `paged-bytes` unblocks behind
+   it — its format and addressing work could start now, but not its sweep-coverage claim.
 2. **`sequence-grammar-closure` phase 2** — independent of the above; `draft-provenance` argues
    one row of its classification table and can be taken with it or separately.
 3. **`authoring-skill-and-tooling`'s second half** (`cargo raster check`) — independent, and it

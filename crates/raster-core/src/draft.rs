@@ -45,6 +45,65 @@ pub struct TileReplayJournal {
     pub input_commitment: [u8; 32],
     pub output_bytes: Vec<u8>,
     pub draft_transition: Option<DraftReplayTransition>,
+    /// `Some` for every recur tile, `None` for every other tile.
+    ///
+    /// Membership is by **recur site**, not by subtree. An ordinary tile in a
+    /// recur sequence's own body emits `None` — it carries no `RecurInput`, and
+    /// a recur sequence cannot terminate early, so that site's completeness
+    /// comes from trace structure instead. A `call_recur!` *nested* inside such
+    /// an iteration is a different site: its tiles emit `Some`, attributed to
+    /// the nested site by their own coordinates.
+    ///
+    /// This is a **binding, not an authority**. It commits what the tile *saw*
+    /// in its input; committing a value does not make it true. Its role is
+    /// exactly `input_commitment`'s — "this is what ran" — and authority comes
+    /// from checking it against the authenticated source metadata.
+    pub recur: Option<RecurTileReplay>,
+}
+
+/// The two facts a recur iteration must prove about itself: where it sat in the
+/// source, and how it terminated.
+///
+/// Neither is recoverable from bytes the guest already parses. `RecurInput` is
+/// `{ value, index, len }` with `value` **first**, so `index` and `len` sit
+/// behind an arbitrary-length `T` and cannot be reached without a full decoder
+/// for user types inside guest audit code. Termination has the same problem
+/// from the other side: a recur tile's return type varies by mode, so no fixed
+/// offset in `output_bytes` holds the control discriminant. So the tile commits
+/// both directly, and the replay receipt covers them.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct RecurTileReplay {
+    pub position: RecurPosition,
+    /// Always explicit. A recur tile whose return type carries no
+    /// `RecurControl` emits `Continue` rather than omitting the field: reading
+    /// an absence as `Continue` would put a default in guest audit code, where
+    /// it is indistinguishable from a field a malicious or merely buggy
+    /// producer failed to set. The wrapper knows the return kind statically, so
+    /// the redundancy is resolved at the producer and the audit reads a value
+    /// in every case.
+    pub control: RecurControlKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct RecurPosition {
+    pub iteration_index: u64,
+    /// `RecurInput.len` — the number of iterations the tile was told to expect,
+    /// **not** the source length. The two differ under `chunk = N`, and the
+    /// name must not paper over that: `RecurInput::is_last()` is
+    /// `index + 1 == len`, so this is load-bearing user-visible semantics and
+    /// has to stay the iteration count. The audit relates it to the
+    /// authenticated source length itself.
+    pub declared_iterations: u64,
+    /// Elements this iteration consumed: 1 for element recur, the chunk size
+    /// for chunked recur, short on the final chunk. Replaces
+    /// `chunking::iteration_chunk_len`'s leading-varint inspection outright.
+    pub consumed_elements: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum RecurControlKind {
+    Continue,
+    Break,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]

@@ -32,7 +32,9 @@ pub use storage::{
     exit_recur_sequence_iteration_scope, exit_recur_site_scope, exit_sequence_scope,
     finalize_draft, finalize_empty_draft, finish_draft_step_capture, global_storage_snapshot,
     publish_pending_output_coordinates, resolve_storage_ok_value, resolve_storage_value,
-    select_stored_value, stash_pending_output_encoding, store_execution_output_value, store_value,
+    select_stored_value, stash_pending_output_encoding, stash_recur_item_binding,
+    store_execution_output_value, store_value, stored_list_metadata, take_recur_item_binding,
+    PendingRecurItemBinding,
     DraftCaptureSnapshot, StorageManager, StorageSnapshot, StorageWriteRecord, StoredObject,
     TileExecutionScopeGuard,
 };

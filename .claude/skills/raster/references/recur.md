@@ -432,6 +432,15 @@ the step's element type changes from `T` to `Block<T>`, and the loop runs
 is the sanctioned way a step sees several elements at once — the framework builds
 it with the bound `N` pinned in the CFS.
 
+**How a chunk is proved.** The source type stays `AuthRef<List<T>>` — there is no
+`List<Block<T>>` anywhere in the storage tree, so there would be nothing to prove
+membership in. Each iteration is a **range selection** over the real list,
+`[i·N, min((i+1)·N, len))`, carrying a `ListRange` proof that folds to the same
+committed list root a single-element selection folds to. Only the final chunk is
+ever short. This is why `N` must be a literal: the driver, not an adapter,
+computes the ranges, and the audit checks each iteration's span against the
+program's declared shape.
+
 ```rust
 #[tile(kind = recur)]
 pub fn collect_line_chunk(

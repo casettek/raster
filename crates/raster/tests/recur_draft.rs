@@ -14,7 +14,14 @@ static TRACE_INIT: Once = Once::new();
 static TRACE_EVENTS: Mutex<Vec<TraceEvent>> = Mutex::new(Vec::new());
 static TRACE_CAPTURE_ACTIVE: AtomicBool = AtomicBool::new(false);
 static TRACE_CAPTURE_THREAD: Mutex<Option<ThreadId>> = Mutex::new(None);
-static RECUR_RESOLVE_COUNT: AtomicUsize = AtomicUsize::new(0);
+/// Whole-source resolutions counted by the recur-*tile* fixture, and by the
+/// recur-*sequence* one, separately.
+///
+/// One shared counter would race: both tests reset it and then assert on it,
+/// and `cargo test` runs them in parallel by default. That was latent while
+/// both expected the same value.
+static RECUR_TILE_RESOLVE_COUNT: AtomicUsize = AtomicUsize::new(0);
+static RECUR_SEQUENCE_RESOLVE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 struct TestPublisher;
 
@@ -442,7 +449,14 @@ fn run_build_prefixed_lines_with_recur_sequence() -> LineBundle {
 fn resolve_counted_string_list(
     reference: StorageRef,
 ) -> raster::core::Result<StorageValue<List<String>>> {
-    RECUR_RESOLVE_COUNT.fetch_add(1, Ordering::SeqCst);
+    RECUR_TILE_RESOLVE_COUNT.fetch_add(1, Ordering::SeqCst);
+    raster::resolve_storage_value::<List<String>>(reference)
+}
+
+fn resolve_counted_string_list_for_sequence(
+    reference: StorageRef,
+) -> raster::core::Result<StorageValue<List<String>>> {
+    RECUR_SEQUENCE_RESOLVE_COUNT.fetch_add(1, Ordering::SeqCst);
     raster::resolve_storage_value::<List<String>>(reference)
 }
 
@@ -561,8 +575,15 @@ fn call_recur_seq_orchestrates_tiles_per_item() {
     );
 }
 
+/// A recur tile never materializes its source either.
+///
+/// This is the bigger of the two changes: recur tiles previously bypassed
+/// per-item selection entirely, resolving the source into an owned `Vec<T>` and
+/// iterating that — the index was not consulted once. They now run on the same
+/// `ListCursor` the sequence family does, so the two families share one
+/// implementation and neither has a path back to `O(list)`.
 #[test]
-fn call_recur_resolves_internal_list_once_per_invocation() {
+fn call_recur_never_materializes_its_source() {
     let _guard = raster::__private::SequenceScopeGuard::enter("recur_single_list_resolve");
     let reference = raster::store_value(&vec![
         "first".to_string(),
@@ -574,7 +595,7 @@ fn call_recur_resolves_internal_list_once_per_invocation() {
         List<String>,
     >(reference, resolve_counted_string_list));
 
-    RECUR_RESOLVE_COUNT.store(0, Ordering::SeqCst);
+    RECUR_TILE_RESOLVE_COUNT.store(0, Ordering::SeqCst);
     let auth = raster::run_recur_list::<String, LineBundle, _, _>(
         source,
         new!(LineBundle),
@@ -582,13 +603,26 @@ fn call_recur_resolves_internal_list_once_per_invocation() {
     );
     let result = into_auth_value::<LineBundle, _>(auth).unwrap().into_inner();
 
+    // The sweep really ran — otherwise "zero resolves" would be vacuous.
     assert_eq!(result.title, "collected");
     assert_eq!(result.items.len(), 3);
-    assert_eq!(RECUR_RESOLVE_COUNT.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        RECUR_TILE_RESOLVE_COUNT.load(Ordering::SeqCst),
+        0,
+        "the source list must never be resolved whole",
+    );
 }
 
+/// A recur sequence never materializes its source — not once, not at all.
+///
+/// This used to assert exactly *one* whole-source resolve: the driver resolved
+/// the parent list up front and cached it behind an `Rc` so per-item `AuthRef`s
+/// could select out of the cached value. `ListCursor` removes that cache along
+/// with the resolve it was caching — the loop bound now comes from the `0x0A`
+/// metadata selection and each item from its own indexed read — so the honest
+/// expectation is zero. See `docs/proposals/lazy-list-recur.md` §2–§3.
 #[test]
-fn recur_sequence_resolves_internal_list_once_per_invocation() {
+fn recur_sequence_never_materializes_its_source() {
     let _guard = raster::__private::SequenceScopeGuard::enter("recur_sequence_single_list_resolve");
     let reference = raster::store_value(&vec![
         "first".to_string(),
@@ -598,12 +632,13 @@ fn recur_sequence_resolves_internal_list_once_per_invocation() {
     .expect("list source should store");
     let source = into_auth_ref::<List<String>, _>(raster::typed_storage_with_resolver::<
         List<String>,
-    >(reference, resolve_counted_string_list));
+    >(reference, resolve_counted_string_list_for_sequence));
 
-    RECUR_RESOLVE_COUNT.store(0, Ordering::SeqCst);
-    // Materialize every item the way the trace pipeline does. With a per-item
-    // re-resolve this would be O(n) source resolutions (plus the length probe);
-    // the cached parent keeps it to a single resolve for the whole sequence.
+    RECUR_SEQUENCE_RESOLVE_COUNT.store(0, Ordering::SeqCst);
+    // Materialize every item the way the trace pipeline does, so this counts
+    // the *source* resolutions a full sweep costs — not just the ones an
+    // untouched `AuthRef` would defer.
+    let mut items = 0usize;
     let _auth = raster::run_recur_sequence_list::<String, ItemsOnlyBundle, _, _>(
         source,
         new!(ItemsOnlyBundle),
@@ -611,11 +646,18 @@ fn recur_sequence_resolves_internal_list_once_per_invocation() {
             input
                 .__raster_auth_trace()
                 .expect("sequence item should resolve");
+            items += 1;
             output
         },
     );
 
-    assert_eq!(RECUR_RESOLVE_COUNT.load(Ordering::SeqCst), 1);
+    // The sweep really ran — otherwise "zero resolves" would be vacuous.
+    assert_eq!(items, 3, "every element should still be visited");
+    assert_eq!(
+        RECUR_SEQUENCE_RESOLVE_COUNT.load(Ordering::SeqCst),
+        0,
+        "the source list must never be resolved whole",
+    );
 }
 
 #[test]
@@ -688,13 +730,67 @@ fn recur_trace_threads_verified_roots_between_steps() {
     }
 }
 
+/// Each iteration records the item it ran on as an authenticated selection at
+/// `source[i]`, not as an inline blob.
+///
+/// Materializing an authorized item produces two things — the value and the
+/// binding that authorizes it — and the old `build_recur_input` kept only the
+/// first. Recur tiles therefore recorded their item as `FnInputValue::Inline`,
+/// with no selector, no commitment and no citations: the audit could see *a*
+/// value but nothing tying it to `source[i]`. This asserts both halves of the
+/// fix — the trace value is a storage binding, and the recorded selector ends
+/// in `Index(i)` for the right `i`. See `docs/proposals/lazy-list-recur.md` §4.
+#[test]
+fn recur_iterations_record_the_item_binding_they_ran_on() {
+    let (_reference, events) = capture_trace_events(run_build_lines_reference);
+    let iterations: Vec<_> = events
+        .into_iter()
+        .filter_map(|event| match event {
+            TraceEvent::RecurTileIterationExec(record) if record.fn_name == "collect_lines" => {
+                Some(record)
+            }
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(iterations.len(), 3);
+    for (index, record) in iterations.into_iter().enumerate() {
+        let input = record.input.expect("tile input should be traced");
+
+        assert!(
+            matches!(input.values.first(), Some(FnInputValue::StorageBinding)),
+            "iteration {} recorded its item as {:?}, not a storage binding",
+            index,
+            input.values.first(),
+        );
+
+        let binding = input
+            .storage
+            .get("input")
+            .unwrap_or_else(|| panic!("iteration {} should record an 'input' binding", index));
+        assert_eq!(
+            binding.selector.segments.last(),
+            Some(&SelectorSegment::Index(index as u64)),
+            "iteration {} should be authenticated at source[{}], got {:?}",
+            index,
+            index,
+            binding.selector.segments,
+        );
+        assert_ne!(
+            binding.selection.selected_len, 0,
+            "iteration {} binding should carry a real selection commitment",
+            index,
+        );
+    }
+}
+
 #[test]
 fn recur_trace_emits_site_completion_event() {
     let (_reference, events) = capture_trace_events(run_build_lines_reference);
     let site_events: Vec<_> = events
         .into_iter()
         .filter_map(|event| match event {
-            TraceEvent::RecurTileExec(record) if record.fn_name == "collect_lines" => Some(record),
+            TraceEvent::RecurTileEnd(record) if record.fn_name == "collect_lines" => Some(record),
             _ => None,
         })
         .collect();
@@ -747,7 +843,7 @@ fn recur_sequence_trace_keeps_inner_tiles_replayable() {
         .filter(|event| {
             matches!(
                 event,
-                TraceEvent::RecurSequenceExec(record)
+                TraceEvent::RecurSequenceEnd(record)
                     if record.fn_name == "collect_prefixed_lines"
             )
         })
@@ -780,4 +876,84 @@ fn recur_sequence_trace_keeps_inner_tiles_replayable() {
         assert_eq!(marker.len, 3);
         assert_eq!(marker.item, FnInputValue::StorageBinding);
     }
+}
+
+// ---- Replay journal: the per-iteration facts (`lazy-list-recur.md` §5) ----
+//
+// These call the generated replay entry point directly, which is the same
+// function the guest runs and whose output the replay receipt covers. Anything
+// asserted here is therefore replay-proven in production, not merely recorded
+// by the host.
+
+fn replay_journal(bytes: Vec<u8>) -> raster::core::draft::TileReplayJournal {
+    raster::core::postcard::from_bytes(&bytes).expect("replay journal should decode")
+}
+
+/// An ordinary tile carries no `RecurInput`, so it emits no recur facts at all.
+#[test]
+fn ordinary_tile_emits_no_recur_journal() {
+    let input = raster::core::postcard::to_allocvec(&(
+        String::from("line"),
+        String::from("prefix: "),
+    ))
+    .unwrap();
+    let journal = replay_journal(__raster_tile_replay_entry_prefix_line(&input).unwrap());
+    assert_eq!(journal.recur, None);
+}
+
+/// A recur tile whose return type carries no `RecurControl` must still emit an
+/// explicit `Continue`.
+///
+/// The tempting alternative — omit the field and read absence as `Continue` —
+/// puts a default in guest audit code, where it is indistinguishable from a
+/// field a producer failed to set. `dynamic-index-selection.md` already records
+/// what that costs: `InputSource::Inline` was exactly such a permissive
+/// fallback. This is the regression test for not reintroducing it.
+#[test]
+fn recur_tile_without_control_emits_explicit_continue() {
+    let input = raster::core::postcard::to_allocvec(&(
+        RecurInput::new(String::from("abcd"), 2u64, 5u64),
+        RecurState::new(MaxLenState { max_len: 0 }),
+    ))
+    .unwrap();
+    let journal = replay_journal(__raster_tile_replay_entry_track_max_len(&input).unwrap());
+
+    let recur = journal.recur.expect("a recur tile must emit recur facts");
+    assert_eq!(recur.control, raster::core::draft::RecurControlKind::Continue);
+    assert_eq!(recur.position.iteration_index, 2);
+    assert_eq!(recur.position.declared_iterations, 5);
+    // Element recur consumes exactly one element per iteration.
+    assert_eq!(recur.position.consumed_elements, 1);
+}
+
+/// A tile that *can* break reports which branch it actually took.
+#[test]
+fn recur_tile_reports_break_and_continue_distinctly() {
+    // `limit = 2`, `seen` starts at 0 -> first call continues, second breaks.
+    let continues = raster::core::postcard::to_allocvec(&(
+        RecurInput::new(String::from("a"), 0u64, 4u64),
+        RecurState::new(LimitState { seen: 0 }),
+        2u64,
+    ))
+    .unwrap();
+    let breaks = raster::core::postcard::to_allocvec(&(
+        RecurInput::new(String::from("b"), 1u64, 4u64),
+        RecurState::new(LimitState { seen: 1 }),
+        2u64,
+    ))
+    .unwrap();
+
+    let continued =
+        replay_journal(__raster_tile_replay_entry_count_until_limit_state_only(&continues).unwrap());
+    let broke =
+        replay_journal(__raster_tile_replay_entry_count_until_limit_state_only(&breaks).unwrap());
+
+    assert_eq!(
+        continued.recur.expect("recur facts").control,
+        raster::core::draft::RecurControlKind::Continue,
+    );
+    assert_eq!(
+        broke.recur.expect("recur facts").control,
+        raster::core::draft::RecurControlKind::Break,
+    );
 }

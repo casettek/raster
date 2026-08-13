@@ -420,17 +420,23 @@ Never loop in a sequence. To process a list, pick from this decision tree:
   it. A field derivable from another field of the same input is not data.
   Full dissection and the sanctioned alternatives: `references/recur.md`
   §2, "the committed counter list".
-- `input` **must come from a raster-encoded source.** A recur reaches its items
-  one at a time through the source's raster index. A postcard-encoded external
-  has no index, so the runtime deserializes the whole collection before the
-  first iteration — `O(list)` host memory for a loop that touches one item at a
-  time. Declare large iterable inputs with `index_path` + `encoding = "raster"`;
-  `examples/hello-tiles/bin/gen_input.rs` shows the pattern, keeping a postcard
-  input for scalar `select!`s and a raster one for the sweeps. Internally stored
-  values (tile outputs, finalized drafts) always carry a raster index, so only
-  **external** inputs need the declaration. Today this is a performance rule;
-  when `docs/proposals/lazy-list-recur.md` lands it becomes an error at the
-  `call_recur!` site.
+- `input` **must come from a raster-encoded source.** This is an error, not a
+  tuning knob: a recur reaches its items one at a time through the source's
+  raster index, and a postcard external has no index, so `rows[i]` cannot be
+  located without decoding everything before it. Opening a recur over one fails
+  with
+
+  ```text
+  call_recur! requires a raster-indexed List source;
+  re-encode this input with encoding = "raster"
+  ```
+
+  Declare iterable inputs with `index_path` + `encoding = "raster"`;
+  `examples/hello-tiles/bin/gen_input.rs` shows the pattern. Internally stored
+  values (tile outputs, finalized drafts, `store_value` results) always carry a
+  raster index, so only **external** inputs need the declaration. The source is
+  never materialized: the loop bound comes from an authenticated 41-byte
+  metadata selection and each item from its own indexed read.
 - `state` — a tiny loop-carried value (counters, running max, a small
   accumulator struct). It is re-committed on **every** iteration, so it must
   stay scalar-small; anything that *grows* belongs in `output` (append-only
@@ -560,7 +566,7 @@ If any rung fails, map the failure back to a rule before touching code:
 | audit divergence with clean native run | nondeterminism in a tile (§3) |
 | ProgramEnd error on return | `main` returning a non-storage-backed value (§8) |
 | run is unexpectedly slow / heavy | unnecessary materialization: whole-object selections, oversized tile outputs (§2) |
-| recur over a large input peaks at whole-collection memory | recur source is a postcard external — re-declare it with `index_path` + `encoding = "raster"` (§7) |
+| `call_recur! requires a raster-indexed List source` | recur source is a postcard external — re-declare it with `index_path` + `encoding = "raster"` (§7) |
 
 A green ladder is necessary, not sufficient: model violations that keep the
 mechanics intact — a fake recur, a committed counter list, computation hidden

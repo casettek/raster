@@ -1,8 +1,9 @@
 use raster_core::input::{
-    selection_payload_hash, struct_commitments_root, Hash32, ListProofDirection, ListProofSibling,
-    SchemaNode, Selectable, SelectedPayload, SelectionCommitment, SelectionProof,
-    SelectionProofStep, SelectionWitness, SelectorDescent, SelectorPath, SelectorSegment,
-    StorageValue,
+    encode_list_metadata_payload, selection_payload_hash, struct_commitments_root,
+    AuthenticatedListMetadata, Hash32, ListProofDirection, ListProofSibling,
+    SchemaNode, Selectable, SelectedPayload, SelectionCommitment, SelectionPayloadKind,
+    SelectionProof, SelectionProofStep, SelectionWitness, SelectorDescent, SelectorPath,
+    SelectorSegment, StorageValue,
 };
 use raster_core::{Error, Result as CoreResult};
 use serde::de::{
@@ -21,7 +22,9 @@ use std::path::Path;
 use std::string::{String, ToString};
 use std::vec::Vec;
 
-use crate::raster_index::{RasterIndex, RasterNodeKind, RasterSelection, RasterSelectionLocation};
+use crate::raster_index::{
+    RasterIndex, RasterNodeKind, RasterRangeSlice, RasterSelection, RasterSelectionLocation,
+};
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum TreeValue {
@@ -1043,7 +1046,56 @@ pub(crate) fn tree_value_from_raster_location(
     data_bytes: &[u8],
     selection: &RasterSelectionLocation,
 ) -> CoreResult<TreeValue> {
-    tree_value_from_raster_node(index, data_bytes, selection.node_id)
+    let Some(range) = selection.range else {
+        return tree_value_from_raster_node(index, data_bytes, selection.node_id);
+    };
+
+    // A range selects a slice of a list node's elements, which is a `List`
+    // value of its own — never a `ListHandle`, since the slice is not the
+    // committed collection and carries no stored root.
+    let node = index.get_node(selection.node_id)?;
+    let RasterNodeKind::List { elements, .. } = &node.kind else {
+        return Err(Error::Other(
+            "Range selection resolved to a non-list raster node".into(),
+        ));
+    };
+    let slice = elements
+        .get(range.start as usize..range.end as usize)
+        .ok_or_else(|| {
+            Error::Serialization(format!(
+                "Malformed raster index: list range '{}..{}' exceeds its element table",
+                range.start, range.end
+            ))
+        })?;
+
+    let mut values = Vec::with_capacity(slice.len());
+    for child in slice {
+        values.push(tree_value_from_raster_node(index, data_bytes, *child)?);
+    }
+    Ok(TreeValue::List(values))
+}
+
+/// The selection payload for a located region: the region itself, or — for a
+/// range — that region behind a synthesized `0x02 ‖ k` list header.
+///
+/// The header is the only synthesized part. The element bytes are copied
+/// straight through, contiguous and in order, because that is exactly how a
+/// list node lays them out (see [`RasterRangeSlice`]).
+fn raster_selection_payload(
+    data_bytes: &[u8],
+    offset: u64,
+    len: u64,
+    range: Option<RasterRangeSlice>,
+) -> CoreResult<Vec<u8>> {
+    let region = raster_subtree_bytes(data_bytes, offset, len)?;
+    let Some(range) = range else {
+        return Ok(region.to_vec());
+    };
+    let mut payload = Vec::with_capacity(1 + 8 + region.len());
+    payload.push(0x02);
+    push_u64(&mut payload, range.count());
+    payload.extend_from_slice(region);
+    Ok(payload)
 }
 
 fn tree_value_from_raster_node(
@@ -1824,6 +1876,7 @@ pub(crate) fn selected_payload_from_proven(
             source_root_hash: proven.root_hash,
             selected_hash,
             selected_len,
+            payload_kind: SelectionPayloadKind::Raw,
         },
     }
 }
@@ -1833,7 +1886,12 @@ pub(crate) fn selected_payload_from_raster_location(
     selector: &SelectorPath,
     selection: RasterSelectionLocation,
 ) -> CoreResult<SelectedPayload> {
-    let bytes = raster_subtree_bytes(data_bytes, selection.offset, selection.len)?.to_vec();
+    let bytes = raster_selection_payload(
+        data_bytes,
+        selection.offset,
+        selection.len,
+        selection.range,
+    )?;
     let selected_hash = selection_payload_hash(&bytes);
     let selected_len = bytes.len() as u64;
     Ok(SelectedPayload {
@@ -1843,8 +1901,63 @@ pub(crate) fn selected_payload_from_raster_location(
             source_root_hash: selection.root_hash,
             selected_hash,
             selected_len,
+            payload_kind: SelectionPayloadKind::Raw,
         },
     })
+}
+
+/// A `0x0A` list metadata selection: the authenticated `(len, elements_root)`
+/// of the list at `selector`, anchored to the same source root a whole-list
+/// selection of the same path anchors to.
+///
+/// The payload is 41 bytes, or 9 for an empty list, against the entire list
+/// today — which is the whole of `lazy-list-recur.md` §2.
+pub(crate) fn list_metadata_payload(
+    selector: &SelectorPath,
+    source_root_hash: Hash32,
+    len: u64,
+    elements_root: Option<Hash32>,
+) -> AuthenticatedListMetadata {
+    let bytes = encode_list_metadata_payload(len, elements_root);
+    let selected_hash = selection_payload_hash(&bytes);
+    let selected_len = bytes.len() as u64;
+    AuthenticatedListMetadata {
+        len,
+        elements_root,
+        selected: SelectedPayload {
+            bytes,
+            commitment: SelectionCommitment {
+                path: selector.clone(),
+                source_root_hash,
+                selected_hash,
+                selected_len,
+                payload_kind: SelectionPayloadKind::List,
+            },
+        },
+    }
+}
+
+/// The witness form of [`list_metadata_payload`].
+///
+/// The proof steps are the list's own, unchanged: metadata is a different
+/// *view* of one node, not a step below it, so the descent that reaches the
+/// list is the descent that reaches its metadata. Only the payload differs,
+/// and `parse_subtree_root`'s `0x0A` arm recomputes the same root the `0x02`
+/// form folds to.
+pub(crate) fn list_metadata_witness(
+    selector: &SelectorPath,
+    selection: RasterSelection,
+    len: u64,
+    elements_root: Option<Hash32>,
+) -> SelectionWitness {
+    SelectionWitness {
+        bytes: encode_list_metadata_payload(len, elements_root),
+        proof: SelectionProof {
+            path: selector.clone(),
+            root_hash: selection.root_hash,
+            steps: selection.steps,
+        },
+    }
 }
 
 pub(crate) fn selection_witness_from_raster_selection(
@@ -1853,7 +1966,12 @@ pub(crate) fn selection_witness_from_raster_selection(
     selection: RasterSelection,
 ) -> CoreResult<SelectionWitness> {
     Ok(SelectionWitness {
-        bytes: raster_subtree_bytes(data_bytes, selection.offset, selection.len)?.to_vec(),
+        bytes: raster_selection_payload(
+            data_bytes,
+            selection.offset,
+            selection.len,
+            selection.range,
+        )?,
         proof: SelectionProof {
             path: selector.clone(),
             root_hash: selection.root_hash,
@@ -1903,6 +2021,7 @@ where
             source_root_hash: value.selection.source_root_hash.clone(),
             selected_hash,
             selected_len,
+            payload_kind: SelectionPayloadKind::Raw,
         },
         typed_selected,
     ))
@@ -2801,6 +2920,7 @@ mod tests {
                 source_root_hash: selection.root_hash,
                 selected_hash,
                 selected_len,
+                payload_kind: SelectionPayloadKind::Raw,
             },
         );
         let witness = SelectionWitness {
@@ -2813,6 +2933,51 @@ mod tests {
         };
 
         assert_eq!(decoded, value);
+        assert!(verify_selection_proof(&witness.bytes, &witness.proof));
+    }
+
+    /// A range selection served straight from the `.rindex`, the way
+    /// `StorageManager::selection_witness` serves one at `--commit` time.
+    ///
+    /// The in-memory `typed_proven_selection` path has supported ranges since
+    /// `Block<T>` landed, so `select!(Block<T>, xs[a..b])` resolves in-process
+    /// via the fallback at `raster/src/input.rs:1064-1071`. The index-driven
+    /// path did not, which left the two halves of a range proof — the prover
+    /// in `RasterIndex::select` and the verifier in `fold_list_range` — never
+    /// having met. `lazy-list-recur.md` §6 needs this path for chunked recur.
+    #[test]
+    fn raster_index_selects_a_range_into_a_verifiable_slice_proof() {
+        let value = Address {
+            lines: vec![
+                "a".to_string(),
+                "b".to_string(),
+                "c".to_string(),
+                "d".to_string(),
+                "e".to_string(),
+            ]
+            .into(),
+            indexes: vec![1, 2, 3, 4, 5].into(),
+        };
+
+        let (data_bytes, index_bytes, _commitment) = encode_raster_value(&value).unwrap();
+        let index = RasterIndex::from_bytes(&index_bytes).unwrap();
+
+        let selector = SelectorPath::new(vec![
+            SelectorSegment::from("lines"),
+            SelectorSegment::Range { start: 1, end: 4 },
+        ]);
+        let selection = index.select(&selector).unwrap();
+        let witness =
+            selection_witness_from_raster_selection(&data_bytes, &selector, selection).unwrap();
+
+        // The index-driven producer must agree byte-for-byte with the
+        // in-memory one, which has served this shape since `Block<T>` landed.
+        let proven = typed_proven_selection(&value, &selector).unwrap();
+        assert_eq!(witness.bytes, proven.selected_bytes);
+        assert_eq!(witness.proof.steps, proven.steps);
+        assert_eq!(witness.proof.root_hash, proven.root_hash);
+
+        // And the slice folds through `ListRange` to the committed root.
         assert!(verify_selection_proof(&witness.bytes, &witness.proof));
     }
 }

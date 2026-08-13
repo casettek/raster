@@ -714,7 +714,14 @@ fn build_storage_selection_witnesses(
             Some((
                 binding_name.clone(),
                 trace_recorder
-                    .storage_selection_witness(&reference, &storage.selector)
+                    // The recorded commitment says which view of the node it
+                    // committed to. This process did not produce the trace, so
+                    // it cannot infer that from the payload — it has none yet.
+                    .storage_selection_witness(
+                        &reference,
+                        &storage.selector,
+                        storage.selection.payload_kind,
+                    )
                     .unwrap_or_else(|error| {
                         panic!(
                             "Failed to build storage selection witness for '{}': {}",
@@ -889,7 +896,11 @@ pub fn prove(
                             StorageRef::new(output.coordinates.clone(), output.commitment.clone());
                         Some(
                             trace_recorder
-                                .storage_selection_witness(&reference, &output.selector)
+                                .storage_selection_witness(
+                                    &reference,
+                                    &output.selector,
+                                    output.selection.payload_kind,
+                                )
                                 .unwrap_or_else(|error| {
                                     panic!(
                                         "Failed to build program output selection witness: {}",

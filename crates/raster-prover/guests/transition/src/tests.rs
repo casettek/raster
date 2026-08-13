@@ -12,8 +12,8 @@ use raster_core::coordinate_index::{
 };
 use raster_core::draft::{
     draft_root_from_witness, schema_hash as compute_schema_hash, DraftFieldValue, DraftOp,
-    DraftReplayTransition, DraftStateWitness, DraftTransitionWitness, TileReplayJournal,
-    TrackedDraftState,
+    DraftReplayTransition, DraftStateWitness, DraftTransitionWitness, RecurControlKind,
+    RecurPosition, RecurTileReplay, TileReplayJournal, TrackedDraftState,
 };
 use raster_core::input::{SchemaField, SchemaFieldMode, SchemaNode, Selectable};
 use raster_core::trace::{
@@ -87,6 +87,7 @@ fn draft_tile_step(exec_index: u64) -> StepRecord {
                 index_root_after: Vec::new(),
             },
         }),
+        recur_progress_commitment: [0u8; 32],
     }
 }
 
@@ -192,6 +193,7 @@ fn verify_tile_commitments_accept_matching_recorded_io() {
                 index_root_after: Vec::new(),
             },
         }),
+        recur_progress_commitment: [0u8; 32],
     };
 
     verify_io_witness(&step, Some(&b"in".to_vec()), Some(&b"out".to_vec()));
@@ -217,6 +219,7 @@ fn verify_step_record_inputs_accepts_sequence_descendant_producer_coordinates() 
                 index_root_after: Vec::new(),
             },
         }),
+        recur_progress_commitment: [0u8; 32],
     };
     let input_source_witness =
         storage_input_witness(CfsCoordinates(vec![0, 0]), sha(b"producer-output"));
@@ -268,29 +271,54 @@ fn recur_iteration_step(iteration: u32) -> StepRecord {
                 index_root_after: Vec::new(),
             },
         }),
+        recur_progress_commitment: [0u8; 32],
     }
 }
 
-/// ABI bytes of a chunked recur iteration input: the tuple leads with
-/// `RecurInput<Vec<String>> { value, index, len }`, so the first varint is the
-/// chunk element count.
-fn recur_iteration_input_bytes(elements: usize) -> Vec<u8> {
-    let chunk: Vec<String> = (0..elements).map(|i| format!("line-{}", i)).collect();
-    postcard::to_allocvec(&((chunk, 0u64, 2u64), "title".to_string())).unwrap()
+/// A chunked iteration's replay-proven recur facts.
+///
+/// The element count used to be inferred from the leading postcard varint of
+/// the iteration's ABI bytes; it is now a field the tile commits and the replay
+/// receipt covers, so these tests hand the checker a journal rather than a
+/// byte-layout puzzle.
+fn recur_journal(
+    iteration_index: u64,
+    declared_iterations: u64,
+    consumed_elements: u64,
+    control: RecurControlKind,
+) -> TileReplayJournal {
+    TileReplayJournal {
+        input_commitment: [0u8; 32],
+        output_bytes: Vec::new(),
+        draft_transition: None,
+        recur: Some(RecurTileReplay {
+            position: RecurPosition {
+                iteration_index,
+                declared_iterations,
+                consumed_elements,
+            },
+            control,
+        }),
+    }
 }
 
 #[test]
 fn verify_step_record_inputs_accepts_declared_chunk_sizes() {
     let cfs_cursor = chunked_recur_cfs(Some(2));
-    // Full chunk and short (final) chunk are both valid per-step.
-    for elements in [2usize, 1] {
-        let witness = recur_iteration_input_bytes(elements);
+    // A full chunk mid-sweep, and a short chunk on the final iteration.
+    for (iteration, declared_iterations, consumed) in [(0u64, 3u64, 2u64), (2, 3, 1)] {
+        let journal = recur_journal(
+            iteration,
+            declared_iterations,
+            consumed,
+            RecurControlKind::Continue,
+        );
         verify_step_record_inputs(
             &cfs_cursor,
-            &recur_iteration_step(0),
+            &recur_iteration_step(iteration as u32),
             None,
             None,
-            Some(&witness),
+            Some(&journal),
         );
     }
 }
@@ -298,7 +326,7 @@ fn verify_step_record_inputs_accepts_declared_chunk_sizes() {
 #[test]
 fn verify_step_record_inputs_ignores_chunking_when_not_declared() {
     let cfs_cursor = chunked_recur_cfs(None);
-    // Without a declared chunk no witness is required for iteration steps.
+    // Without a declared chunk an iteration step carries no chunk obligation.
     verify_step_record_inputs(&cfs_cursor, &recur_iteration_step(0), None, None, None);
 }
 
@@ -306,13 +334,13 @@ fn verify_step_record_inputs_ignores_chunking_when_not_declared() {
 #[should_panic(expected = "exceeds declared chunk size")]
 fn verify_step_record_inputs_rejects_oversized_chunk() {
     let cfs_cursor = chunked_recur_cfs(Some(2));
-    let witness = recur_iteration_input_bytes(3);
+    let journal = recur_journal(0, 3, 3, RecurControlKind::Continue);
     verify_step_record_inputs(
         &cfs_cursor,
         &recur_iteration_step(0),
         None,
         None,
-        Some(&witness),
+        Some(&journal),
     );
 }
 
@@ -320,19 +348,40 @@ fn verify_step_record_inputs_rejects_oversized_chunk() {
 #[should_panic(expected = "empty chunk")]
 fn verify_step_record_inputs_rejects_empty_chunk() {
     let cfs_cursor = chunked_recur_cfs(Some(2));
-    let witness = recur_iteration_input_bytes(0);
+    let journal = recur_journal(0, 3, 0, RecurControlKind::Continue);
     verify_step_record_inputs(
         &cfs_cursor,
         &recur_iteration_step(0),
         None,
         None,
-        Some(&witness),
+        Some(&journal),
+    );
+}
+
+/// Only the final chunk may be short — the `4,1,4,1` shape, rejected on the
+/// iteration that actually goes short.
+///
+/// The native recorder used to enforce this by remembering the previous
+/// iteration's length. `declared_iterations` makes it a stateless fact of the
+/// iteration itself, so the guest can check it without carrying state across
+/// steps.
+#[test]
+#[should_panic(expected = "smaller than declared chunk size")]
+fn verify_step_record_inputs_rejects_short_non_final_chunk() {
+    let cfs_cursor = chunked_recur_cfs(Some(2));
+    let journal = recur_journal(0, 3, 1, RecurControlKind::Continue);
+    verify_step_record_inputs(
+        &cfs_cursor,
+        &recur_iteration_step(0),
+        None,
+        None,
+        Some(&journal),
     );
 }
 
 #[test]
-#[should_panic(expected = "missing its input witness")]
-fn verify_step_record_inputs_requires_witness_for_declared_chunk() {
+#[should_panic(expected = "missing its replay-proven recur facts")]
+fn verify_step_record_inputs_requires_recur_facts_for_declared_chunk() {
     let cfs_cursor = chunked_recur_cfs(Some(2));
     verify_step_record_inputs(&cfs_cursor, &recur_iteration_step(0), None, None, None);
 }
@@ -357,6 +406,7 @@ fn verify_tile_commitments_reject_mismatched_input() {
                 index_root_after: Vec::new(),
             },
         }),
+        recur_progress_commitment: [0u8; 32],
     };
 
     verify_io_witness(&step, Some(&b"actual".to_vec()), Some(&b"out".to_vec()));
@@ -372,6 +422,7 @@ fn verify_sequence_boundary_commitments_accept_matching_recorded_io() {
             input_commitment: sha(b"sequence-in"),
             input_source_commitment: Vec::new(),
         },
+        recur_progress_commitment: [0u8; 32],
     };
     let end = StepRecord {
         exec_index: 2,
@@ -380,6 +431,7 @@ fn verify_sequence_boundary_commitments_accept_matching_recorded_io() {
         kind: StepKind::SequenceEnd {
             output_commitment: sha(b"sequence-out"),
         },
+        recur_progress_commitment: [0u8; 32],
     };
 
     verify_io_witness(&start, Some(&b"sequence-in".to_vec()), None);
@@ -507,6 +559,7 @@ fn tile_step_with_store_roots(
                 index_root_after,
             },
         }),
+        recur_progress_commitment: [0u8; 32],
     }
 }
 
@@ -804,6 +857,7 @@ fn verify_draft_transition_tracks_multi_step_chain() {
                 },
             ],
         }),
+        recur: None,
     };
     verify_draft_transition(
         &draft_tile_step(1),
@@ -843,6 +897,7 @@ fn verify_draft_transition_tracks_multi_step_chain() {
                 value: raster_core::draft::DraftValue::String("second".into()),
             }],
         }),
+        recur: None,
     };
     verify_draft_transition(
         &draft_tile_step(2),
@@ -886,6 +941,7 @@ fn verify_draft_transition_rejects_wrong_root_before() {
                 root_before: empty_root,
                 ops: Vec::new(),
             }),
+            recur: None,
         }),
         Some(&DraftTransitionWitness {
             pre_state: witness,
@@ -916,6 +972,7 @@ fn verify_draft_transition_rejects_wrong_schema_hash() {
                 root_before: empty_root,
                 ops: Vec::new(),
             }),
+            recur: None,
         }),
         Some(&DraftTransitionWitness {
             pre_state: witness,
@@ -943,6 +1000,7 @@ fn verify_draft_transition_rejects_tampered_pre_state_witness() {
                 root_before: empty_root,
                 ops: Vec::new(),
             }),
+            recur: None,
         }),
         Some(&DraftTransitionWitness {
             pre_state: DraftStateWitness {
@@ -1026,6 +1084,7 @@ fn program_start_record(program_start: ProgramStartStep) -> StepRecord {
         sequence_id: "main".to_string(),
         coordinates: CfsCoordinates(vec![]),
         kind: StepKind::ProgramStart(program_start),
+        recur_progress_commitment: [0u8; 32],
     }
 }
 
@@ -1243,6 +1302,7 @@ fn genesis_authorization_rejects_a_late_window_missing_its_membership_witness() 
         kind: StepKind::SequenceEnd {
             output_commitment: Vec::new(),
         },
+        recur_progress_commitment: [0u8; 32],
     };
 
     verify_genesis_authorization(&cfs_cursor, &EMPTY_LEAF, &[], &journal, None, &first_step);
@@ -1277,6 +1337,7 @@ fn genesis_authorization_rejects_forged_entry_object_commitment() {
         kind: StepKind::SequenceEnd {
             output_commitment: Vec::new(),
         },
+        recur_progress_commitment: [0u8; 32],
     };
 
     verify_genesis_authorization(

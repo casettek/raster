@@ -303,6 +303,7 @@ mod tests {
                 output_commitment: vec![exec_index as u8 + 1],
                 storage: empty_store_roots(),
             }),
+            recur_progress_commitment: [0u8; 32],
         }
     }
 
@@ -362,6 +363,7 @@ mod tests {
                         input_commitment: [0u8; 32],
                         output_bytes: vec![11],
                         draft_transition: None,
+                        recur: None,
                     },
                 },
             ),
@@ -377,6 +379,7 @@ mod tests {
                         input_commitment: [0u8; 32],
                         output_bytes: vec![22],
                         draft_transition: None,
+                        recur: None,
                     },
                 },
             ),
@@ -422,6 +425,7 @@ mod tests {
                     input_commitment: [0u8; 32],
                     output_bytes: error_output.clone(),
                     draft_transition: None,
+                    recur: None,
                 },
             },
         )]);
@@ -453,6 +457,7 @@ mod tests {
                 input_commitment: vec![1; 32],
                 input_source_commitment: Vec::new(),
             },
+            recur_progress_commitment: [0u8; 32],
         };
         let sequence_end = StepRecord {
             exec_index: 2,
@@ -461,6 +466,7 @@ mod tests {
             kind: StepKind::SequenceEnd {
                 output_commitment: vec![2; 32],
             },
+            recur_progress_commitment: [0u8; 32],
         };
         let recorded_step_io = HashMap::from([
             (sequence_start.clone(), io_witnesses(Some(vec![3, 4]), None)),
@@ -552,6 +558,7 @@ mod tests {
                 )
                 .to_vec(),
             },
+            recur_progress_commitment: [0u8; 32],
         }
     }
 

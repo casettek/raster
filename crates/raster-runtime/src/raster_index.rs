@@ -77,12 +77,37 @@ pub(crate) struct RasterMerkleLevel {
     pub hashes: Vec<Hash32>,
 }
 
+/// A contiguous slice of a list node's elements, as located in the data file.
+///
+/// A range is the one selection that names no node: the storage tree holds a
+/// `List<T>`, not a list of slices. What makes it addressable anyway is the
+/// element layout — a list node's payload is `0x02 ‖ len ‖ (len8 ‖ child)*`
+/// and element node offsets point *past* their length prefix
+/// (`prepare_raster_children` in `input.rs`), so elements `[start, end)` occupy
+/// one contiguous region. The payload is that region behind a synthesized
+/// `0x02 ‖ k` header, which is the only part that exists nowhere in the file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RasterRangeSlice {
+    pub start: u64,
+    pub end: u64,
+}
+
+impl RasterRangeSlice {
+    pub fn count(&self) -> u64 {
+        self.end.saturating_sub(self.start)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RasterSelectionLocation {
+    /// For a range, the *list* node the slice was taken from.
     pub node_id: u64,
     pub offset: u64,
     pub len: u64,
     pub root_hash: Hash32,
+    /// `Some` when the selection is a slice of `node_id`'s elements rather
+    /// than the node itself.
+    pub range: Option<RasterRangeSlice>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,6 +117,7 @@ pub(crate) struct RasterSelection {
     pub len: u64,
     pub root_hash: Hash32,
     pub steps: Vec<SelectionProofStep>,
+    pub range: Option<RasterRangeSlice>,
 }
 
 impl RasterIndex {
@@ -141,6 +167,7 @@ impl RasterIndex {
             offset: node.offset,
             len: node.len,
             root_hash: self.root_commitment.clone(),
+            range: None,
         })
     }
 
@@ -153,7 +180,53 @@ impl RasterIndex {
             len: location.len,
             root_hash: location.root_hash,
             steps: Vec::new(),
+            range: None,
         })
+    }
+
+    /// Byte region of elements `[start, end)` inside a list node's payload,
+    /// and the slice descriptor that turns it into a `0x02` payload.
+    ///
+    /// Rejects an empty or reversed range and one that overruns the list: the
+    /// index refuses it here rather than emitting a proof for `fold_list_range`
+    /// to reject later.
+    fn list_range_region(
+        &self,
+        len: u64,
+        elements: &[u64],
+        start: u64,
+        end: u64,
+    ) -> Result<(u64, u64, RasterRangeSlice)> {
+        if start >= end || end > len {
+            return Err(Error::Other(format!(
+                "Selector range '{}..{}' is out of bounds for a list of length {}",
+                start, end, len
+            )));
+        }
+
+        let first = self.node(*elements.get(start as usize).ok_or_else(|| {
+            Error::Serialization(format!("Malformed raster index: missing list element {}", start))
+        })?)?;
+        let last = self.node(*elements.get((end - 1) as usize).ok_or_else(|| {
+            Error::Serialization(format!(
+                "Malformed raster index: missing list element {}",
+                end - 1
+            ))
+        })?)?;
+
+        // Back up over the first element's 8-byte length prefix; element
+        // offsets point past it.
+        let region_start = first.offset.checked_sub(8).ok_or_else(|| {
+            Error::Serialization("Malformed raster index: list element precedes its length prefix".into())
+        })?;
+        let region_end = last.offset.checked_add(last.len).ok_or_else(|| {
+            Error::Serialization("Malformed raster index: list element region overflows".into())
+        })?;
+        let region_len = region_end.checked_sub(region_start).ok_or_else(|| {
+            Error::Serialization("Malformed raster index: list elements are not in order".into())
+        })?;
+
+        Ok((region_start, region_len, RasterRangeSlice { start, end }))
     }
 
     pub(crate) fn locate(&self, selector: &SelectorPath) -> Result<RasterSelectionLocation> {
@@ -162,9 +235,30 @@ impl RasterIndex {
         }
 
         let mut current_id = self.root_node;
+        let last_segment = selector.segments.len() - 1;
 
-        for segment in &selector.segments {
+        for (position, segment) in selector.segments.iter().enumerate() {
             let node = self.node(current_id)?;
+            if let (
+                SelectorDescent::Range { start, end },
+                RasterNodeKind::List { len, elements, .. },
+            ) = (segment.descent(), &node.kind)
+            {
+                if position != last_segment {
+                    return Err(Error::Other(
+                        "Range selector segment must be the final segment".into(),
+                    ));
+                }
+                let (offset, region_len, range) =
+                    self.list_range_region(*len, elements, start, end)?;
+                return Ok(RasterSelectionLocation {
+                    node_id: current_id,
+                    offset,
+                    len: region_len,
+                    root_hash: self.root_commitment.clone(),
+                    range: Some(range),
+                });
+            }
             match (segment.descent(), &node.kind) {
                 (SelectorDescent::Field(field_name), RasterNodeKind::Struct { fields }) => {
                     let target = fields
@@ -204,9 +298,11 @@ impl RasterIndex {
                         index
                     )));
                 }
+                // A list range is handled before this match; reaching here
+                // means the node it was applied to is not a list.
                 (SelectorDescent::Range { start, end }, _) => {
                     return Err(Error::Other(format!(
-                        "Selector range '{}..{}' is not supported for raster-encoded inputs yet",
+                        "Selector range '{}..{}' requires a list value",
                         start, end
                     )));
                 }
@@ -219,6 +315,7 @@ impl RasterIndex {
             offset: node.offset,
             len: node.len,
             root_hash: self.root_commitment.clone(),
+            range: None,
         })
     }
 
@@ -229,9 +326,44 @@ impl RasterIndex {
 
         let mut current_id = self.root_node;
         let mut steps = Vec::with_capacity(selector.segments.len());
+        let last_segment = selector.segments.len() - 1;
 
-        for segment in &selector.segments {
+        for (position, segment) in selector.segments.iter().enumerate() {
             let node = self.node(current_id)?;
+            if let (
+                SelectorDescent::Range { start, end },
+                RasterNodeKind::List {
+                    len,
+                    elements,
+                    merkle_levels,
+                },
+            ) = (segment.descent(), &node.kind)
+            {
+                if position != last_segment {
+                    return Err(Error::Other(
+                        "Range selector segment must be the final segment".into(),
+                    ));
+                }
+                let (offset, region_len, range) =
+                    self.list_range_region(*len, elements, start, end)?;
+                steps.push(SelectionProofStep::ListRange {
+                    start,
+                    len: *len,
+                    siblings: list_range_proof_siblings(
+                        merkle_levels,
+                        start as usize,
+                        end as usize,
+                    )?,
+                });
+                return Ok(RasterSelection {
+                    node_id: current_id,
+                    offset,
+                    len: region_len,
+                    root_hash: self.root_commitment.clone(),
+                    steps,
+                    range: Some(range),
+                });
+            }
             match (segment.descent(), &node.kind) {
                 (SelectorDescent::Field(field_name), RasterNodeKind::Struct { fields }) => {
                     let target_index = fields
@@ -296,9 +428,11 @@ impl RasterIndex {
                         index
                     )));
                 }
+                // A list range is handled before this match; reaching here
+                // means the node it was applied to is not a list.
                 (SelectorDescent::Range { start, end }, _) => {
                     return Err(Error::Other(format!(
-                        "Selector range '{}..{}' is not supported for raster-encoded inputs yet",
+                        "Selector range '{}..{}' requires a list value",
                         start, end
                     )));
                 }
@@ -312,7 +446,48 @@ impl RasterIndex {
             len: node.len,
             root_hash: self.root_commitment.clone(),
             steps,
+            range: None,
         })
+    }
+
+    /// A list node's authenticated length and element root, without touching
+    /// an element or the data file.
+    ///
+    /// Both come straight out of the index: `len` from the node, the elements
+    /// root from `merkle_levels.last()`, which [`RasterIndex::validate`]
+    /// already guarantees holds exactly one hash for a non-empty list and is
+    /// empty for an empty one. That is what makes recur-source tracing O(1) —
+    /// see `docs/proposals/lazy-list-recur.md` §1.
+    ///
+    /// The values are only *index-trusted* here. They become authenticated
+    /// when encoded as a `0x0A` payload and folded: the root is recomputed
+    /// from the pair, so a forged length cannot reach the committed root.
+    pub(crate) fn list_metadata(&self, selector: &SelectorPath) -> Result<(u64, Option<Hash32>)> {
+        let location = self.locate(selector)?;
+        if location.range.is_some() {
+            return Err(Error::Other(
+                "List metadata is a view of a whole list, not of a range selection".into(),
+            ));
+        }
+        let node = self.node(location.node_id)?;
+        let RasterNodeKind::List {
+            len, merkle_levels, ..
+        } = &node.kind
+        else {
+            return Err(Error::Other(
+                "List metadata requires a list value at the selected path".into(),
+            ));
+        };
+
+        let elements_root = match merkle_levels.last() {
+            None => None,
+            Some(level) => Some(*level.hashes.first().ok_or_else(|| {
+                Error::Serialization(
+                    "Malformed raster index: list node top Merkle level is empty".into(),
+                )
+            })?),
+        };
+        Ok((*len, elements_root))
     }
 
     pub(crate) fn get_node(&self, id: u64) -> Result<&RasterNode> {
@@ -410,6 +585,65 @@ impl RasterIndex {
             Error::Serialization(format!("Malformed raster index: missing node {}", id))
         })
     }
+}
+
+/// Boundary siblings for a slice `[start, end)`, consumed by `fold_list_range`
+/// level by level (left boundary before right).
+///
+/// The same walk as `list_root_and_range_proof` in `input.rs`, reading the
+/// index's **stored** levels instead of recomputing them — `merkle_levels` is
+/// exactly that function's `level` sequence before padding, so the two agree
+/// step for step. Only the two boundaries need a witness: everything strictly
+/// inside the slice is derived from the payload's own element roots, and an
+/// odd-width level's final node pairs with a duplicate of itself, which the
+/// verifier reconstructs without help.
+fn list_range_proof_siblings(
+    levels: &[RasterMerkleLevel],
+    start: usize,
+    end: usize,
+) -> Result<Vec<ListProofSibling>> {
+    let mut siblings = Vec::new();
+    let mut lo = start;
+    let mut hi = end;
+
+    for level in levels {
+        let width = level.hashes.len();
+        if width <= 1 {
+            break;
+        }
+
+        if lo % 2 == 1 {
+            siblings.push(ListProofSibling {
+                direction: ListProofDirection::Left,
+                hash: *level.hashes.get(lo - 1).ok_or_else(|| {
+                    Error::Serialization(
+                        "Malformed raster index: missing left range boundary sibling".into(),
+                    )
+                })?,
+            });
+            lo -= 1;
+        }
+        if hi % 2 == 1 {
+            if hi < width {
+                siblings.push(ListProofSibling {
+                    direction: ListProofDirection::Right,
+                    hash: *level.hashes.get(hi).ok_or_else(|| {
+                        Error::Serialization(
+                            "Malformed raster index: missing right range boundary sibling".into(),
+                        )
+                    })?,
+                });
+            }
+            // `hi == width`: odd-width level, the last node pairs with a
+            // duplicate of itself and the verifier derives it.
+            hi += 1;
+        }
+
+        lo /= 2;
+        hi /= 2;
+    }
+
+    Ok(siblings)
 }
 
 fn list_proof_siblings(

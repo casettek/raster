@@ -17,12 +17,13 @@ pub use raster_core::draft;
 
 pub mod input;
 pub use input::{
-    __raster_clone, attach_index_bindings, auth_ref_result_trace, auth_ref_trace, chunk_auth_ref,
+    __raster_clone, attach_index_bindings, auth_ref_result_trace, auth_ref_trace,
     draft_replay_handle, draft_replay_transition, entry_argument_auth_ref, finalize,
     index_binding_name, into_auth_ref, into_auth_value, into_auth_value_with_bindings, into_draft,
     materialize_auth_result, materialize_auth_return, new_draft, push_bound_index,
-    raster_trace_payload, resolve_storage_ok_value, resolve_storage_value,
-    restore_draft_from_replay_handle, run_recur_list, run_recur_list_state,
+    raster_trace_payload, recur_source_trace, resolve_storage_ok_value, resolve_storage_value,
+    restore_draft_from_replay_handle, run_recur_chunked_list, run_recur_chunked_list_state,
+    run_recur_chunked_list_with_state, run_recur_list, run_recur_list_state,
     run_recur_list_with_state, run_recur_sequence_list, run_recur_sequence_list_state,
     run_recur_sequence_list_with_state, select_source, select_stored_value, selector_path,
     serialize_draft_replay_handle, serialize_draft_trace, typed_selector_path, typed_storage,
@@ -32,8 +33,8 @@ pub use input::{
     ListProofSibling, Materializable, Op, RecurControl, RecurInput, RecurOutput,
     RecurSequenceInput, RecurSequenceOutput, RecurSequenceState, RecurState, Schema, SchemaField,
     SchemaFieldMode, SchemaNode, SelectSource, Selectable, SelectedPayload, SelectionCommitment,
-    SelectionProof, SelectionProofStep, SelectionWitness, SelectorPath, SelectorSegment,
-    StorageRef, StorageValue, TypedSelectorPath, TypedStorageBinding,
+    SelectionPayloadKind, SelectionProof, SelectionProofStep, SelectionWitness, SelectorPath,
+    SelectorSegment, StorageRef, StorageValue, TypedSelectorPath, TypedStorageBinding,
 };
 
 #[cfg(feature = "std")]
@@ -63,7 +64,7 @@ pub mod runtime {
 #[cfg(feature = "std")]
 pub use raster_runtime::{
     entry_argument_spec, finish, init, init_with, publish_trace_event, start_program,
-    EntryArgumentSpec, EntryArgumentsBinding,
+    take_recur_item_binding, EntryArgumentSpec, EntryArgumentsBinding,
 };
 
 #[cfg(feature = "std")]
