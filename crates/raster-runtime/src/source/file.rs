@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::format;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use super::document::FileInputRegistry;
 use super::{ResolvedSourceData, SourceFile, SourceResolver};
@@ -173,9 +173,9 @@ impl FileInputSourceResolver {
         }
 
         let file = match load_preference {
-            ExternalLoadPreference::Read => read_file(name, &canonical_path)?,
+            ExternalLoadPreference::Read => read_file_eager(name, &canonical_path)?,
             ExternalLoadPreference::Mmap => {
-                mmap_file(name, &canonical_path).or_else(|_| read_file(name, &canonical_path))?
+                mmap_file(name, &canonical_path).or_else(|_| read_file_eager(name, &canonical_path))?
             }
         };
         let resolved = ResolvedSourceData::Postcard {
@@ -264,7 +264,7 @@ impl SourceResolver for FileInputSourceResolver {
     }
 }
 
-fn read_file(name: &str, path: &Path) -> Result<SourceFile> {
+fn read_file_eager(name: &str, path: &Path) -> Result<SourceFile> {
     let bytes = fs::read(path).map_err(|e| {
         Error::Other(format!(
             "Failed to read external input '{}' from '{}': {}",
@@ -273,7 +273,23 @@ fn read_file(name: &str, path: &Path) -> Result<SourceFile> {
             e
         ))
     })?;
-    Ok(SourceFile::Read(Arc::<[u8]>::from(bytes)))
+    Ok(SourceFile::Memory(Arc::<[u8]>::from(bytes)))
+}
+
+fn read_file(name: &str, path: &Path) -> Result<SourceFile> {
+    let file = File::open(path).map_err(|e| {
+        Error::Other(format!(
+            "Failed to open external input '{}' from '{}': {}",
+            name,
+            path.display(),
+            e
+        ))
+    })?;
+    Ok(SourceFile::Read {
+        path: path.to_path_buf(),
+        file: Arc::new(Mutex::new(file)),
+        cache: Arc::new(OnceLock::new()),
+    })
 }
 
 fn mmap_file(name: &str, path: &Path) -> Result<SourceFile> {
@@ -407,7 +423,7 @@ mod tests {
         assert!(matches!(
             read,
             ResolvedSourceData::Postcard {
-                file: SourceFile::Read(_),
+                file: SourceFile::Memory(_),
                 ..
             }
         ));
@@ -455,6 +471,56 @@ mod tests {
         assert_eq!(first.commitment(), hash);
         assert_eq!(second.commitment(), hash);
 
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn raster_read_mode_serves_ranged_bytes_from_a_retained_handle() {
+        let dir = unique_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let data_path = dir.join("region.bin");
+        let index_path = dir.join("region.rindex");
+        let region = raster_core::Bytes::<4>::paged(vec![1, 2, 3, 4, 5]).unwrap();
+        crate::write_raster_files(&region, &data_path, &index_path).unwrap();
+        let file = read_file("region", &data_path).unwrap();
+        let prefix = file.read_range(0, 4).unwrap();
+        assert_eq!(prefix.len(), 4);
+        assert_eq!(prefix, file.bytes()[..4]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn raster_page_select_does_not_buffer_the_whole_read_file() {
+        use crate::input::tree_value_from_raster_location;
+        use raster_core::input::{SelectorPath, SelectorSegment};
+
+        let dir = unique_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let data_path = dir.join("region.bin");
+        let index_path = dir.join("region.rindex");
+        let region = raster_core::Bytes::<4>::paged(vec![1, 2, 3, 4, 5]).unwrap();
+        crate::write_raster_files(&region, &data_path, &index_path).unwrap();
+
+        let file = read_file("region", &data_path).unwrap();
+        let index = RasterIndex::from_bytes(&fs::read(&index_path).unwrap()).unwrap();
+        let location = index
+            .locate(&SelectorPath::new(vec![
+                SelectorSegment::Field("pages".into()),
+                SelectorSegment::Index(1),
+            ]))
+            .unwrap();
+        let tree = tree_value_from_raster_location(&index, &file, &location).unwrap();
+        match tree {
+            crate::input::TreeValue::BytesPage { index, offset, .. } => {
+                assert_eq!(index, 1);
+                assert_eq!(offset, 4);
+            }
+            other => panic!("expected BytesPage, got {other:?}"),
+        }
+        assert!(
+            !file.is_fully_buffered(),
+            "selecting one page must not call SourceFile::bytes()"
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 

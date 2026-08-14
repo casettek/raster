@@ -39,7 +39,12 @@ pub mod schema;
 #[cfg(feature = "std")]
 pub mod transition;
 
-pub use collections::{Block, List, Materializable};
+pub use collections::{
+    bytes_field_key, bytes_schema, check_bytes_geometry, check_page_partition, check_page_shape,
+    expected_page_len, page_count, page_index_for_field, page_index_for_region,
+    page_range_for_field, page_range_for_region, Block, Bytes, BytesFieldPageSize, BytesPage, List,
+    Materializable, PageSized,
+};
 pub use error::{Error, Result};
 
 // Re-export postcard for tile ABI serialization (no_std compatible)

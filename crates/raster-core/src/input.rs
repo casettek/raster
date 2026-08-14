@@ -465,6 +465,34 @@ pub fn encode_list_metadata_payload(len: u64, elements_root: Option<Hash32>) -> 
     payload
 }
 
+/// Encode the `0x0B` bytes-page payload.
+///
+/// ```text
+/// 0x0B ‖ index:u64 ‖ offset:u64 ‖ len:u64 ‖ bytes
+/// root = H(b"bytes-page" ‖ index ‖ offset ‖ len ‖ bytes)
+/// ```
+pub fn encode_bytes_page_payload(index: u64, offset: u64, len: u64, bytes: &[u8]) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(1 + 8 + 8 + 8 + bytes.len());
+    payload.push(0x0B);
+    payload.extend_from_slice(&index.to_le_bytes());
+    payload.extend_from_slice(&offset.to_le_bytes());
+    payload.extend_from_slice(&len.to_le_bytes());
+    payload.extend_from_slice(bytes);
+    payload
+}
+
+/// Domain-separated root of a bytes page. Distinct from the leaf domain so a
+/// page cannot collide with a `String` holding the same bytes.
+pub fn bytes_page_root(index: u64, offset: u64, len: u64, bytes: &[u8]) -> Hash32 {
+    selection_hash(&[
+        b"bytes-page",
+        &index.to_le_bytes(),
+        &offset.to_le_bytes(),
+        &len.to_le_bytes(),
+        bytes,
+    ])
+}
+
 /// Recompute a selection payload's structural root from its bytes.
 ///
 /// # Payload tags
@@ -483,7 +511,7 @@ pub fn encode_list_metadata_payload(len: u64, elements_root: Option<Hash32>) -> 
 /// | `0x05`–`0x08` | enum unit / newtype / tuple / struct | — |
 /// | `0x09` | list handle (stored root, skipped body) | `bounded-collections.md` |
 /// | `0x0A` | list metadata (`len`, `elements_root`) | `lazy-list-recur.md` |
-/// | `0x0B` | bytes page | *reserved* — `paged-bytes.md` |
+/// | `0x0B` | bytes page | `paged-bytes.md` |
 fn parse_subtree_root(bytes: &[u8], offset: &mut usize) -> Option<Hash32> {
     let kind = *bytes.get(*offset)?;
     *offset += 1;
@@ -580,6 +608,15 @@ fn parse_subtree_root(bytes: &[u8], offset: &mut usize) -> Option<Hash32> {
                 Some(root)
             };
             Some(list_root_from_elements_root(len, elements_root.as_ref()))
+        }
+        0x0B => {
+            let index = parse_u64(bytes, offset)?;
+            let page_offset = parse_u64(bytes, offset)?;
+            let len = parse_u64(bytes, offset)?;
+            let end = offset.checked_add(len as usize)?;
+            let page_bytes = bytes.get(*offset..end)?;
+            *offset = end;
+            Some(bytes_page_root(index, page_offset, len, page_bytes))
         }
         0x04 => {
             let len = parse_u64(bytes, offset)?;
@@ -1002,6 +1039,123 @@ fn payload_matches_kind(bytes: &[u8], kind: SelectionPayloadKind) -> bool {
         // the `0x02` list it was derived from.
         (Some(_), SelectionPayloadKind::List) => false,
         (None, _) => false,
+    }
+}
+
+/// Decode a `0x0B` page payload into `(index, offset, len, bytes)`.
+pub fn parse_bytes_page_payload(bytes: &[u8]) -> Option<(u64, u64, u64, &[u8])> {
+    if bytes.first().copied() != Some(0x0B) {
+        return None;
+    }
+    let mut offset = 1usize;
+    let index = parse_u64(bytes, &mut offset)?;
+    let page_offset = parse_u64(bytes, &mut offset)?;
+    let len = parse_u64(bytes, &mut offset)?;
+    let end = offset.checked_add(len as usize)?;
+    let page_bytes = bytes.get(offset..end)?;
+    if end != bytes.len() {
+        return None;
+    }
+    Some((index, page_offset, len, page_bytes))
+}
+
+fn u64_leaf_root(value: u64) -> Hash32 {
+    selection_hash(&[b"leaf", &value.to_le_bytes()])
+}
+
+/// Geometry rules 2–3 from `paged-bytes.md` §3.1, run where the witness is
+/// in scope. A non-page payload is accepted (nothing to check).
+pub fn verify_bytes_page_geometry(witness: &SelectionWitness) -> bool {
+    let Some((index, page_offset, len, page_bytes)) = parse_bytes_page_payload(&witness.bytes)
+    else {
+        return true;
+    };
+    if len != page_bytes.len() as u64 {
+        return false;
+    }
+
+    let mut bytes_step = None;
+    let mut list_len = None;
+    for step in &witness.proof.steps {
+        match step {
+            SelectionProofStep::Struct { field_names, .. }
+                if field_names.as_slice() == ["byte_len", "page_size", "pages"] =>
+            {
+                bytes_step = Some(step);
+            }
+            SelectionProofStep::List {
+                index: step_index,
+                len: step_len,
+                ..
+            } if *step_index == index => {
+                list_len = Some(*step_len);
+            }
+            _ => {}
+        }
+    }
+
+    let Some(SelectionProofStep::Struct {
+        field_index,
+        field_names,
+        siblings,
+    }) = bytes_step
+    else {
+        return true;
+    };
+    if field_names.get(*field_index as usize).map(String::as_str) != Some("pages") {
+        return false;
+    }
+    if siblings.len() != 2 {
+        return false;
+    }
+    let Some(page_count) = list_len else {
+        return false;
+    };
+    if index >= page_count {
+        return false;
+    }
+
+    let last = index + 1 == page_count;
+    let page_size = if index > 0 {
+        if page_offset % index != 0 {
+            return false;
+        }
+        page_offset / index
+    } else if !last {
+        if page_offset != 0 {
+            return false;
+        }
+        len
+    } else {
+        if page_offset != 0 {
+            return false;
+        }
+        let byte_len = len;
+        if u64_leaf_root(byte_len) != siblings[0] {
+            return false;
+        }
+        return page_count == 1;
+    };
+
+    if page_size == 0 || u64_leaf_root(page_size) != siblings[1] {
+        return false;
+    }
+    if page_offset != index.saturating_mul(page_size) {
+        return false;
+    }
+
+    if last {
+        let byte_len = page_offset + len;
+        if u64_leaf_root(byte_len) != siblings[0] {
+            return false;
+        }
+        let expected_len = core::cmp::min(page_size, byte_len.saturating_sub(page_offset));
+        if len != expected_len {
+            return false;
+        }
+        page_count == byte_len.div_ceil(page_size)
+    } else {
+        len == page_size
     }
 }
 
@@ -1699,6 +1853,147 @@ mod tests {
         let mut tampered = payload.clone();
         tampered[9] ^= 0xFF;
         assert_ne!(parsed_root(&tampered), Some(honest));
+    }
+
+    #[test]
+    fn bytes_page_payload_folds_to_domain_separated_root() {
+        let bytes = b"hello-page";
+        let payload = encode_bytes_page_payload(1, 4, bytes.len() as u64, bytes);
+        assert_eq!(payload[0], 0x0B);
+        assert_eq!(
+            parsed_root(&payload),
+            Some(bytes_page_root(1, 4, bytes.len() as u64, bytes))
+        );
+        let leaf = encode_leaf(bytes);
+        assert_ne!(parsed_root(&payload), parsed_root(&leaf));
+    }
+
+    #[test]
+    fn parse_bytes_page_payload_reads_coordinates() {
+        let bytes = b"abcd";
+        let payload = encode_bytes_page_payload(2, 8, 4, bytes);
+        let (index, offset, len, page) = parse_bytes_page_payload(&payload).unwrap();
+        assert_eq!((index, offset, len, page), (2, 8, 4, bytes.as_slice()));
+    }
+
+    #[test]
+    fn verify_bytes_page_geometry_accepts_last_page() {
+        let bytes = b"x";
+        let payload = encode_bytes_page_payload(1, 4, 1, bytes);
+        let witness = SelectionWitness {
+            bytes: payload,
+            proof: SelectionProof {
+                path: SelectorPath::default(),
+                root_hash: [0; 32],
+                steps: alloc::vec![
+                    SelectionProofStep::Struct {
+                        field_index: 2,
+                        field_names: alloc::vec![
+                            "byte_len".into(),
+                            "page_size".into(),
+                            "pages".into(),
+                        ],
+                        siblings: alloc::vec![u64_leaf_root(5), u64_leaf_root(4)],
+                    },
+                    SelectionProofStep::List {
+                        index: 1,
+                        len: 2,
+                        siblings: alloc::vec![],
+                    },
+                ],
+            },
+        };
+        assert!(verify_bytes_page_geometry(&witness));
+    }
+
+    #[test]
+    fn verify_bytes_page_geometry_rejects_bad_offset() {
+        let bytes = b"xxxx";
+        let payload = encode_bytes_page_payload(1, 3, 4, bytes);
+        let witness = SelectionWitness {
+            bytes: payload,
+            proof: SelectionProof {
+                path: SelectorPath::default(),
+                root_hash: [0; 32],
+                steps: alloc::vec![
+                    SelectionProofStep::Struct {
+                        field_index: 2,
+                        field_names: alloc::vec![
+                            "byte_len".into(),
+                            "page_size".into(),
+                            "pages".into(),
+                        ],
+                        siblings: alloc::vec![u64_leaf_root(8), u64_leaf_root(4)],
+                    },
+                    SelectionProofStep::List {
+                        index: 1,
+                        len: 2,
+                        siblings: alloc::vec![],
+                    },
+                ],
+            },
+        };
+        assert!(!verify_bytes_page_geometry(&witness));
+    }
+
+    #[test]
+    fn verify_bytes_page_geometry_rejects_short_non_final_page() {
+        let bytes = b"xxx";
+        let payload = encode_bytes_page_payload(1, 4, 3, bytes);
+        let witness = SelectionWitness {
+            bytes: payload,
+            proof: SelectionProof {
+                path: SelectorPath::default(),
+                root_hash: [0; 32],
+                steps: alloc::vec![
+                    SelectionProofStep::Struct {
+                        field_index: 2,
+                        field_names: alloc::vec![
+                            "byte_len".into(),
+                            "page_size".into(),
+                            "pages".into(),
+                        ],
+                        siblings: alloc::vec![u64_leaf_root(12), u64_leaf_root(4)],
+                    },
+                    SelectionProofStep::List {
+                        index: 1,
+                        len: 3,
+                        siblings: alloc::vec![],
+                    },
+                ],
+            },
+        };
+        assert!(!verify_bytes_page_geometry(&witness));
+    }
+
+    #[test]
+    fn verify_bytes_page_geometry_rejects_count_disagreeing_with_ceil() {
+        let bytes = b"x";
+        let payload = encode_bytes_page_payload(1, 4, 1, bytes);
+        let witness = SelectionWitness {
+            bytes: payload,
+            proof: SelectionProof {
+                path: SelectorPath::default(),
+                root_hash: [0; 32],
+                steps: alloc::vec![
+                    SelectionProofStep::Struct {
+                        field_index: 2,
+                        field_names: alloc::vec![
+                            "byte_len".into(),
+                            "page_size".into(),
+                            "pages".into(),
+                        ],
+                        siblings: alloc::vec![u64_leaf_root(5), u64_leaf_root(4)],
+                    },
+                    SelectionProofStep::List {
+                        index: 1,
+                        len: 3,
+                        siblings: alloc::vec![],
+                    },
+                ],
+            },
+        };
+        assert!(!verify_bytes_page_geometry(&witness));
     }
 
     #[test]

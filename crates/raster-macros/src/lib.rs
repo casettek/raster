@@ -13,8 +13,8 @@ use quote::{format_ident, quote, quote_spanned, ToTokens};
 use syn::spanned::Spanned;
 use syn::{
     parse::{Parse, ParseStream},
-    parse_macro_input, Attribute, Expr, ExprField, ExprIndex, FnArg, GenericArgument, ItemFn,
-    LitInt, Pat, Path, PathArguments, ReturnType, Token, Type,
+    parse_macro_input, Attribute, Expr, ExprField, ExprIndex, FnArg, GenericArgument, ItemFn, Lit,
+    LitInt, Meta, Pat, Path, PathArguments, ReturnType, Token, Type,
 };
 
 use crate::entrypoint::prepend_entry_argument_prelude;
@@ -45,6 +45,55 @@ fn extract_params(input: &ItemFn) -> Vec<ParamInfo> {
             FnArg::Receiver(_) => None,
         })
         .collect()
+}
+
+fn parse_page_size_attr(attrs: &[Attribute]) -> Option<u64> {
+    attrs.iter().find_map(|attr| {
+        if !attr.path().is_ident("page_size") {
+            return None;
+        }
+        match &attr.meta {
+            Meta::NameValue(nv) => match &nv.value {
+                Expr::Lit(expr_lit) => match &expr_lit.lit {
+                    Lit::Int(int) => int.base10_parse().ok(),
+                    _ => None,
+                },
+                _ => None,
+            },
+            _ => None,
+        }
+    })
+}
+
+fn bytes_const_page_size(ty: &Type) -> Option<u64> {
+    let Type::Path(type_path) = ty else {
+        return None;
+    };
+    let segment = type_path.path.segments.last()?;
+    if segment.ident != "Bytes" {
+        return None;
+    }
+    let PathArguments::AngleBracketed(args) = &segment.arguments else {
+        return None;
+    };
+    args.args.iter().find_map(|arg| match arg {
+        GenericArgument::Const(Expr::Lit(expr_lit)) => match &expr_lit.lit {
+            Lit::Int(int) => int.base10_parse().ok(),
+            _ => None,
+        },
+        _ => None,
+    })
+}
+
+fn is_bytes_type(ty: &Type) -> bool {
+    let Type::Path(type_path) = ty else {
+        return false;
+    };
+    type_path
+        .path
+        .segments
+        .last()
+        .is_some_and(|segment| segment.ident == "Bytes")
 }
 
 fn parse_schema_tag(attrs: &[Attribute]) -> Option<u32> {
@@ -3127,20 +3176,272 @@ fn selector_ends_in_range(expr: &Expr) -> bool {
     matches!(expr, Expr::Index(ExprIndex { index, .. }) if matches!(&**index, Expr::Range(_)))
 }
 
+/// Whether a selector expression's outermost access is an index or range.
+fn selector_ends_in_index(expr: &Expr) -> bool {
+    matches!(expr, Expr::Index(_))
+}
+
 /// Whether a type's outermost path segment is the given wrapper ident.
 fn type_head_is(ty: &Type, wrapper: &str) -> bool {
     matches!(ty, Type::Path(p) if p.path.segments.last().map(|s| s.ident == wrapper).unwrap_or(false))
+}
+
+fn type_inner_head_is(ty: &Type, wrapper: &str, inner: &str) -> bool {
+    let Type::Path(p) = ty else {
+        return false;
+    };
+    let Some(segment) = p.path.segments.last() else {
+        return false;
+    };
+    if segment.ident != wrapper {
+        return false;
+    }
+    let PathArguments::AngleBracketed(args) = &segment.arguments else {
+        return false;
+    };
+    args.args.iter().any(|arg| match arg {
+        GenericArgument::Type(inner_ty) => type_head_is(inner_ty, inner),
+        _ => false,
+    })
+}
+
+fn parse_u64_lit(expr: &Expr) -> Option<u64> {
+    match expr {
+        Expr::Lit(expr_lit) => match &expr_lit.lit {
+            Lit::Int(int) => int.base10_parse().ok(),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+enum SelSeg {
+    Field(String),
+    IndexLit(u64),
+    IndexBinding(Expr),
+    RangeLit { start: u64, end: u64 },
+    RangeDyn { start: proc_macro2::TokenStream, end: proc_macro2::TokenStream },
+}
+
+fn split_selector_structured(expr: Expr) -> (Expr, Vec<SelSeg>) {
+    match expr {
+        Expr::Field(ExprField { base, member, .. }) => {
+            let (base_expr, mut segments) = split_selector_structured(*base);
+            let segment = match member {
+                syn::Member::Named(ident) => SelSeg::Field(ident.to_string()),
+                syn::Member::Unnamed(index) => SelSeg::IndexLit(index.index as u64),
+            };
+            segments.push(segment);
+            (base_expr, segments)
+        }
+        Expr::Index(ExprIndex { expr, index, .. }) => {
+            let (base_expr, mut segments) = split_selector_structured(*expr);
+            match *index {
+                Expr::Lit(expr_lit) => {
+                    let syn::Lit::Int(int) = &expr_lit.lit else {
+                        panic!("select! only supports integer literal indexes");
+                    };
+                    let value = int
+                        .base10_parse::<u64>()
+                        .expect("select! index literal must fit in u64");
+                    segments.push(SelSeg::IndexLit(value));
+                }
+                Expr::Range(expr_range) => {
+                    let syn::RangeLimits::HalfOpen(_) = expr_range.limits else {
+                        panic!("select! range selectors must use half-open `start..end` syntax");
+                    };
+                    let (Some(start), Some(end)) = (expr_range.start, expr_range.end) else {
+                        panic!("select! range selectors require explicit `start..end` bounds");
+                    };
+                    match (parse_u64_lit(&start), parse_u64_lit(&end)) {
+                        (Some(start), Some(end)) => {
+                            segments.push(SelSeg::RangeLit { start, end });
+                        }
+                        _ => {
+                            segments.push(SelSeg::RangeDyn {
+                                start: start.to_token_stream(),
+                                end: end.to_token_stream(),
+                            });
+                        }
+                    }
+                }
+                Expr::Path(path_expr) => {
+                    segments.push(SelSeg::IndexBinding(Expr::Path(path_expr)));
+                }
+                _ => panic!(
+                    "select! index must be an integer literal, a `start..end` range, \
+                     or a binding in scope; computed indexes have no lineage — \
+                     move the computation into a tile"
+                ),
+            }
+            (base_expr, segments)
+        }
+        other => (other, Vec::new()),
+    }
+}
+
+fn emit_index_lit(
+    base_expr: &Expr,
+    prev_field: Option<&str>,
+    offset: u64,
+    convert: bool,
+) -> proc_macro2::TokenStream {
+    if !convert {
+        return quote! { ::raster::SelectorSegment::Index(#offset as u64) };
+    }
+    match prev_field {
+        Some("pages") | None => {
+            quote! {
+                ::raster::SelectorSegment::Index(
+                    ::raster::page_index_for_region::<_, #offset>(&#base_expr)
+                )
+            }
+        }
+        Some(field) => {
+            quote! {
+                ::raster::SelectorSegment::Index(
+                    ::raster::page_index_for_field::<_, { ::raster::bytes_field_key(#field) }, #offset>(
+                        &#base_expr
+                    )
+                )
+            }
+        }
+    }
+}
+
+fn emit_range_lit(
+    base_expr: &Expr,
+    prev_field: Option<&str>,
+    start: u64,
+    end: u64,
+    convert: bool,
+) -> Result<proc_macro2::TokenStream, TokenStream> {
+    if !convert {
+        return Ok(quote! {
+            ::raster::SelectorSegment::Range {
+                start: #start as u64,
+                end: #end as u64,
+            }
+        });
+    }
+    let pair = match prev_field {
+        Some("pages") | None => quote! {
+            ::raster::page_range_for_region::<_, #start, #end>(&#base_expr)
+        },
+        Some(field) => quote! {
+            ::raster::page_range_for_field::<_, { ::raster::bytes_field_key(#field) }, #start, #end>(
+                &#base_expr
+            )
+        },
+    };
+    Ok(quote! {
+        {
+            let (__raster_start, __raster_end) = #pair;
+            ::raster::SelectorSegment::Range {
+                start: __raster_start,
+                end: __raster_end,
+            }
+        }
+    })
+}
+
+fn emit_selector_segments(
+    base_expr: &Expr,
+    segments: Vec<SelSeg>,
+    convert_bytes: bool,
+) -> Result<Vec<proc_macro2::TokenStream>, TokenStream> {
+    let already_pages = matches!(
+        segments.get(segments.len().saturating_sub(2)),
+        Some(SelSeg::Field(name)) if name == "pages"
+    );
+    let insert_pages = convert_bytes
+        && !already_pages
+        && matches!(
+            segments.last(),
+            Some(
+                SelSeg::IndexLit(_)
+                    | SelSeg::IndexBinding(_)
+                    | SelSeg::RangeLit { .. }
+                    | SelSeg::RangeDyn { .. }
+            )
+        );
+    let convert_lits = insert_pages;
+
+    if convert_lits {
+        if let Some(SelSeg::RangeDyn { .. }) = segments.last() {
+            return Err(TokenStream::from(quote! {
+                ::core::compile_error!(
+                    "computed byte ranges are not supported; convert the offset in a tile \
+                     (`call!(page_of, offset, page_size)`) or use a literal range"
+                )
+            }));
+        }
+    }
+
+    let mut out = Vec::new();
+    let mut prev_field: Option<String> = None;
+    let last = segments.len().saturating_sub(1);
+    for (i, seg) in segments.into_iter().enumerate() {
+        if insert_pages && i == last {
+            out.push(quote! {
+                ::raster::SelectorSegment::Field(::raster::alloc::string::String::from("pages"))
+            });
+        }
+        match seg {
+            SelSeg::Field(name) => {
+                prev_field = Some(name.clone());
+                out.push(quote! {
+                    ::raster::SelectorSegment::Field(::raster::alloc::string::String::from(#name))
+                });
+            }
+            SelSeg::IndexLit(offset) => {
+                out.push(emit_index_lit(
+                    base_expr,
+                    prev_field.as_deref(),
+                    offset,
+                    convert_lits && i == last,
+                ));
+            }
+            SelSeg::IndexBinding(path_expr) => {
+                let span = path_expr.span();
+                out.push(quote_spanned! { span =>
+                    ::raster::push_bound_index(
+                        &mut __raster_index_bindings,
+                        &#path_expr,
+                    )
+                });
+            }
+            SelSeg::RangeLit { start, end } => {
+                out.push(emit_range_lit(
+                    base_expr,
+                    prev_field.as_deref(),
+                    start,
+                    end,
+                    convert_lits && i == last,
+                )?);
+            }
+            SelSeg::RangeDyn { start, end } => {
+                out.push(quote! {
+                    ::raster::SelectorSegment::Range {
+                        start: (#start) as u64,
+                        end: (#end) as u64,
+                    }
+                });
+            }
+        }
+    }
+    Ok(out)
 }
 
 #[proc_macro]
 pub fn select(item: TokenStream) -> TokenStream {
     let SelectInput { selected_ty, expr } = parse_macro_input!(item as SelectInput);
 
-    // Enforce the collection vocabulary: a bounded `[a..b]` range yields a
-    // `Block<T>`; anything else must not be named `Block`. This keeps `Block`
-    // constructible only from CFS-pinned range selections.
     let ends_in_range = selector_ends_in_range(&expr);
+    let ends_in_index = selector_ends_in_index(&expr);
     let targets_block = type_head_is(&selected_ty, "Block");
+    let targets_bytes_page = type_head_is(&selected_ty, "BytesPage");
+    let targets_block_bytes_page = type_inner_head_is(&selected_ty, "Block", "BytesPage");
     if ends_in_range && !targets_block {
         return TokenStream::from(quote! {
             ::core::compile_error!(
@@ -3156,19 +3457,24 @@ pub fn select(item: TokenStream) -> TokenStream {
             )
         });
     }
+    if targets_bytes_page && !ends_in_index {
+        return TokenStream::from(quote! {
+            ::core::compile_error!(
+                "`select!(BytesPage, region)` needs an index — a byte offset or a page index; \
+                 to sweep the region select `List<BytesPage>` from `.pages`"
+            )
+        });
+    }
 
-    let (base_expr, segments) = split_selector_expr(expr);
+    let convert_bytes = targets_bytes_page || targets_block_bytes_page;
+    let (base_expr, structured) = split_selector_structured(expr);
+    let segments = match emit_selector_segments(&base_expr, structured, convert_bytes) {
+        Ok(segments) => segments,
+        Err(tokens) => return tokens,
+    };
 
-    // The sink collects the storage bindings that authorize any dynamic index in
-    // this path. It is always declared (an unused empty `Vec` costs nothing and
-    // keeps one expansion shape), filled by `push_bound_index` as the segment
-    // vector is built, and then attached to the reference the selection produced
-    // so that whatever step reads it also records them. Order matters: the
-    // segments must be evaluated before `attach_index_bindings` sees the sink.
     TokenStream::from(quote! {
         {
-            // `mut` is only exercised by a dynamic index; a literal-index
-            // selection must not emit an `unused_mut` warning in user code.
             #[allow(unused_mut)]
             let mut __raster_index_bindings: ::raster::alloc::vec::Vec<::raster::IndexBinding> =
                 ::raster::alloc::vec::Vec::new();
@@ -3186,7 +3492,7 @@ pub fn select(item: TokenStream) -> TokenStream {
     })
 }
 
-#[proc_macro_derive(Selectable, attributes(schema))]
+#[proc_macro_derive(Selectable, attributes(schema, page_size))]
 pub fn derive_selectable(item: TokenStream) -> TokenStream {
     let input = parse_macro_input!(item as syn::DeriveInput);
     let ident = &input.ident;
@@ -3230,7 +3536,9 @@ pub fn derive_selectable(item: TokenStream) -> TokenStream {
     // for scalar/`Block`/materializable-struct fields and, if a field type is
     // itself non-materializable, the impl simply does not apply.
     let has_unbounded_field = fields.iter().any(|field| {
-        list_element_type(&field.ty).is_some() || vec_element_type(&field.ty).is_some()
+        list_element_type(&field.ty).is_some()
+            || vec_element_type(&field.ty).is_some()
+            || is_bytes_type(&field.ty)
     });
     let materializable_impl = if has_unbounded_field {
         quote! {}
@@ -3242,6 +3550,42 @@ pub fn derive_selectable(item: TokenStream) -> TokenStream {
             {}
         }
     };
+
+    let page_size_consts: Vec<_> = fields
+        .iter()
+        .filter_map(|field| {
+            let field_ident = field.ident.as_ref()?;
+            let declared = bytes_const_page_size(&field.ty)?;
+            if let Some(attr_size) = parse_page_size_attr(&field.attrs) {
+                if attr_size != declared {
+                    let msg = format!(
+                        "#[page_size = {attr_size}] does not match Bytes<{declared}> on field `{field_ident}`"
+                    );
+                    return Some(quote! { ::core::compile_error!(#msg); });
+                }
+            }
+            let const_ident = format_ident!("{}_PAGE_SIZE", field_ident.to_string().to_uppercase());
+            Some(quote! {
+                pub const #const_ident: u64 = #declared;
+            })
+        })
+        .collect();
+
+    let bytes_field_page_size_impls: Vec<_> = fields
+        .iter()
+        .filter_map(|field| {
+            let field_ident = field.ident.as_ref()?;
+            let declared = bytes_const_page_size(&field.ty)?;
+            let field_name = field_ident.to_string();
+            Some(quote! {
+                impl #impl_generics ::raster::BytesFieldPageSize<
+                    { ::raster::bytes_field_key(#field_name) }
+                > for #ident #ty_generics #where_clause {
+                    const PAGE_SIZE: u64 = #declared;
+                }
+            })
+        })
+        .collect();
 
     let schema_fields: Vec<_> = fields
         .iter()
@@ -3320,6 +3664,12 @@ pub fn derive_selectable(item: TokenStream) -> TokenStream {
         }
 
         #materializable_impl
+
+        impl #impl_generics #ident #ty_generics #where_clause {
+            #(#page_size_consts)*
+        }
+
+        #(#bytes_field_page_size_impls)*
 
         #(#vec_field_errors)*
     })

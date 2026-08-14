@@ -24,7 +24,7 @@ document, and correcting it is the author's call.
 | [`loop-carried-state`](./loop-carried-state.md) | proposed (2026-07-30) | — | whole; see the note under *Dependencies* |
 | [`lazy-list-recur`](./lazy-list-recur.md) | **phases 1–6 implemented** (2026-08-13/14) | metadata payload, `ListCursor`, driver-level chunking + range descent, per-item bindings, §5 journal facts, rules 1–7 + S1/S3/S4 enforced | **rule 8 unimplemented** (no `ListRange` cross-check) and S2 unenforced; the peak-RSS acceptance benchmark was never run — see §Outstanding at implementation |
 | [`recur-progress-commitment`](./recur-progress-commitment.md) | **rev 2 implemented** (2026-08-14) | `recur_progress.rs`, the trace `recur_control` bit, site `Start`/`End` events, recorder stamping, guest advance-and-compare — recorder and guest agree on every commitment | mid-loop window seeds, split out as `window-seed-reconstruction` |
-| [`paged-bytes`](./paged-bytes.md) | proposed 2026-08-04 (rev 3) | — | blocked on `lazy-list-recur` |
+| [`paged-bytes`](./paged-bytes.md) | **rev 3 implemented** (2026-08-14) | `Bytes<P>` / `BytesPage`, tag `0x0B`, `rindex03` hard-break, `InterfaceDecl.schema_hash`, geometry audit, `select!` byte→page conversion, ranged `Read` | Gate 2/3 still open (`ListRange` cross-check, selection↔replay bind); no `pages!` sugar |
 | [`recur-sequence-break`](./recur-sequence-break.md) | proposed 2026-08-13 | — | whole; blocked on `recur-progress-commitment` rev 2. Weakens `lazy-list-recur` S4 to a prefix/terminal split |
 | [`window-seed-reconstruction`](./window-seed-reconstruction.md) | proposed 2026-08-14 | — | whole; small. Without it a fraud-proof window opening mid-loop is rejected — the design `recur-progress-commitment` explicitly refused, reinstated by an unfilled parameter |
 | [`carried-state-channel`](./carried-state-channel.md) | proposed 2026-08-07 — **enhancement** | — | deliberately deferred until a second component is ready |
@@ -116,7 +116,8 @@ now brackets its iterations the way a sequence brackets its items. Variant indic
 
 ## Blocked or deliberately deferred
 
-- **`paged-bytes`** — blocked on `lazy-list-recur`.
+- **`paged-bytes` Gate 2/3** — format and addressing landed; chunked-sweep `ListRange`
+  cross-check and the selection↔replay bind are still open.
 - **`carried-state-channel`** — deferred by choice until a second component is ready. Waiting
   is free: adding a component to it breaks the trace format exactly as much as adding a field
   does, so nothing is saved by adopting it early.

@@ -8,7 +8,9 @@ by the macros — do not improvise.
 
 ## 1. The input source
 
-The `input = ...` of a recur call MUST be a **storage-backed `List<T>`**:
+The `input = ...` of a recur call MUST be a **storage-backed `List<T>`**
+(for bytes: `select!(List<BytesPage>, region.pages)` — never `Bytes` itself,
+and never a byte range; page count wobbles and fails the chunk rules):
 
 - a `select!(List<T>, ...)` result (the normal case),
 - a prior `call!`/`call_recur!` binding whose value is a `List<T>`,

@@ -13,7 +13,10 @@ use serde::ser::{
 use serde::{Deserialize, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 
-use crate::input::{Schema, SchemaField, SchemaFieldMode, SchemaNode};
+use crate::collections::{bytes_page_parts, BYTES_PAGE_NEWTYPE_NAME};
+use crate::input::{
+    bytes_page_root, encode_bytes_page_payload, Schema, SchemaField, SchemaFieldMode, SchemaNode,
+};
 use crate::{Error, Result};
 
 pub type DraftId = [u8; 32];
@@ -126,6 +129,12 @@ pub enum DraftValue {
     EnumNewtype(String, Box<DraftValue>),
     EnumTuple(String, Vec<DraftValue>),
     EnumStruct(String, Vec<(String, DraftValue)>),
+    BytesPage {
+        index: u64,
+        offset: u64,
+        len: u64,
+        bytes: Vec<u8>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -288,13 +297,27 @@ impl Serializer for DraftValueSerializer {
     }
     fn serialize_newtype_struct<T>(
         self,
-        _name: &'static str,
+        name: &'static str,
         value: &T,
     ) -> DraftSerdeResult<Self::Ok>
     where
         T: ?Sized + Serialize,
     {
-        value.serialize(self)
+        // Act on the name *before* serializing. The general-purpose serializer
+        // would expand the page payload into one `DraftValue::U8` per byte, only
+        // for `bytes_page_parts` to collapse it right back — see that function's
+        // note on why the `List<T>` handle can serialize-then-match and a page
+        // cannot.
+        if name == BYTES_PAGE_NEWTYPE_NAME {
+            let parts = bytes_page_parts(value).map_err(DraftSerdeError)?;
+            return Ok(DraftValue::BytesPage {
+                index: parts.index,
+                offset: parts.offset,
+                len: parts.len,
+                bytes: parts.bytes,
+            });
+        }
+        value.serialize(DraftValueSerializer)
     }
     fn serialize_newtype_variant<T>(
         self,
@@ -530,7 +553,8 @@ fn encode_leaf_bytes(value: &DraftValue) -> Result<Vec<u8>> {
         | DraftValue::EnumUnit(_)
         | DraftValue::EnumNewtype(_, _)
         | DraftValue::EnumTuple(_, _)
-        | DraftValue::EnumStruct(_, _) => {
+        | DraftValue::EnumStruct(_, _)
+        | DraftValue::BytesPage { .. } => {
             return Err(Error::Serialization(
                 "Expected leaf value while encoding draft payload".into(),
             ))
@@ -695,6 +719,15 @@ pub fn draft_value_payload_and_root(value: &DraftValue) -> Result<(Vec<u8>, Vec<
             }
             Ok((payload, selection_hash(&parts)))
         }
+        DraftValue::BytesPage {
+            index,
+            offset,
+            len,
+            bytes,
+        } => Ok((
+            encode_bytes_page_payload(*index, *offset, *len, bytes),
+            bytes_page_root(*index, *offset, *len, bytes).to_vec(),
+        )),
         _ => {
             let leaf_bytes = encode_leaf_bytes(value)?;
             let mut payload = Vec::new();

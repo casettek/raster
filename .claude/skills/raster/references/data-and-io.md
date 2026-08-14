@@ -53,7 +53,14 @@ Rules:
   `.clone()` on the source binding.
 - **Target-type vocabulary:** a whole-collection select names `List<T>`; a
   range `[a..b]` select names `Block<T>`. The macro rejects a `Block` target
-  without a range and a range target that isn't `Block`.
+  without a range and a range target that isn't `Block`. Byte regions are
+  `Bytes<P>`; a page select names `BytesPage` (with an index) and a covering
+  byte range names `Block<BytesPage>`. Literal indexes on `Bytes` are in bytes
+  and must be page-aligned; binding indexes are already page indexes.
+- **Paged fixtures:** write with `Bytes::<N>::paged(bytes)` (or
+  `Bytes::<{ Type::FIELD_PAGE_SIZE }>::paged(bytes)`). Prefer `mmap` for large
+  regions. Changing `N` / `#[page_size]` is both an artifact regeneration and
+  an identity change (`InterfaceDecl.schema_hash`).
 - **Derive `Selectable`/`Serialize`/`Deserialize`; never hand-write them.** The
   derive is what makes the host's selector path and the guest's decode agree on
   the same bytes; a manual impl (or a manual `Default`/`Ord`/`PartialEq` a tile

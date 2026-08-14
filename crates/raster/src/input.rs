@@ -7,7 +7,11 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 #[cfg(not(feature = "std"))]
 use alloc::format;
-pub use raster_core::collections::{Block, List, Materializable};
+pub use raster_core::collections::{
+    bytes_field_key, page_index_for_field, page_index_for_region, page_range_for_field,
+    page_range_for_region, Block, Bytes, BytesFieldPageSize, BytesPage, List, Materializable,
+    PageSized,
+};
 use raster_core::draft::{draft_value_from_serialize, DraftOp};
 use raster_core::draft::{replay_handle_for_schema, DraftReplayHandle, DraftReplayTransition};
 pub use raster_core::input::{
@@ -968,6 +972,28 @@ where
 
 pub trait IntoAuthRef<Current> {
     fn into_auth_ref(self) -> AuthRef<Current>;
+}
+
+/// Bound on a `call_recur!` source. The note names `.pages` so `select!(Bytes, …)`
+/// as a sweep input is a compile error with a useful diagnostic.
+#[cfg_attr(
+    not(doc),
+    diagnostic::on_unimplemented(
+        message = "call_recur! input must be a `List<T>`",
+        label = "not a page list",
+        note = "to sweep a `Bytes` region, select its pages: `select!(List<BytesPage>, region.pages)`"
+    )
+)]
+pub trait RecurListSource<E>: IntoAuthRef<List<E>> {}
+
+impl<T, E> RecurListSource<E> for T where T: IntoAuthRef<List<E>> {}
+
+impl<T: PageSized> PageSized for AuthRef<T> {
+    const PAGE_SIZE: u64 = T::PAGE_SIZE;
+}
+
+impl<T: BytesFieldPageSize<FIELD>, const FIELD: u64> BytesFieldPageSize<FIELD> for AuthRef<T> {
+    const PAGE_SIZE: u64 = T::PAGE_SIZE;
 }
 
 pub trait SelectSource {

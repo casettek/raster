@@ -11,7 +11,7 @@ use raster_core::cfs::CfsCoordinates;
 use raster_core::coordinate_index::{
     verify_coordinate_index_membership, verify_coordinate_index_non_membership,
 };
-use raster_core::input::verify_selection_witness;
+use raster_core::input::{verify_bytes_page_geometry, verify_selection_witness};
 use raster_core::trace::{FnInput, StepRecord, StorageRoots};
 use raster_core::transition::{
     SerializableFrontier, StorageEntry, StorageLogWitness, StorageReadWitness, StorageWitness,
@@ -199,6 +199,11 @@ pub fn verify_storage_transition(
                     assert!(
                         verify_selection_witness(&storage_meta.selection, witness),
                         "Storage input '{}' selection witness is invalid",
+                        binding_name,
+                    );
+                    assert!(
+                        verify_bytes_page_geometry(witness),
+                        "Storage input '{}' bytes-page geometry is invalid",
                         binding_name,
                     );
                 }

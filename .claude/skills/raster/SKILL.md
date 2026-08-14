@@ -157,6 +157,36 @@ Write `List<T>` in data types and whole-collection selects; write `Block<T>` in
 tile signatures fed by a range select or a `chunk = N` step. Full contract:
 `references/data-and-io.md` §1 and `references/recur.md`.
 
+### Raw bytes are `Bytes<P>`; the only tile-visible window is `BytesPage`
+
+Byte data gets the same split, with the granularity on the Rust type (`select!`
+is a proc macro and cannot see a field attribute):
+
+```rust
+#[page_size = 262_144]
+pub weights: Bytes<262_144>,
+```
+
+`#[page_size = n]` must equal `Bytes<N>` — a cross-check, not a second source of
+truth. The derive emits `WEIGHTS_PAGE_SIZE`.
+
+- **`Bytes<P>`** — a paged byte region. `Selectable`, never `Materializable`.
+- **`BytesPage`** — one page, the only byte value that may cross a tile boundary.
+  It carries committed `index()` and `offset()`.
+- Sweep with `select!(List<BytesPage>, region.pages)` then `call_recur!`. Never
+  pass `Bytes` as a recur input (compile error naming `.pages`).
+- To reach a byte offset, convert it to a page index **in a tile**
+  (`call!(page_of, offset, page_size)`), then index the region with the result.
+  A binding index is already a page index. Literal indexes/ranges on `Bytes` are
+  in **bytes** and converted to page units at expansion; unaligned literals are
+  a compile error. Pass the offset to the consuming tile —
+  `local = offset - page.offset()`.
+- Choose `page_size` as a multiple of your record stride so no record straddles
+  a page, then size it to the per-replay cycle budget.
+- Never model byte data as `List<u8>` or hex in a `String`.
+- Changing `#[page_size]` / `Bytes<N>` changes `program_commitment` via
+  `InterfaceDecl.schema_hash`. Re-import the artifact.
+
 ## 3. Tiles — all computation, always written for the zkVM
 
 A tile's unit of existence is a **RISC0 replay**: postcard input bytes in,
@@ -401,6 +431,11 @@ Never loop in a sequence. To process a list, pick from this decision tree:
 | early stop | state+output step returning `RecurControl` (`Continue`/`Break`) |
 | step should see N elements at a time | add `chunk = N` (step takes `RecurInput<Block<T>>`) |
 | several tiles per element | `#[sequence(kind = recur)]` + `call_recur_seq!` |
+| sweep a byte region | `call_recur!` with `input = select!(List<BytesPage>, region.pages)` |
+| several pages per replay unit | `chunk = N` (step takes `RecurInput<Block<BytesPage>>`) |
+| the page at a computed byte offset | `call!(page_of, offset, page_size)` then `select!(BytesPage, region[page_idx])` |
+| whole `Bytes` into one tile | **NEVER** (compile error — not `Materializable`) |
+| recur driven by byte ranges | **NEVER** — page count wobbles and fails the chunk rules |
 | whole `List<T>` into one tile | **NEVER** (a compile error — `List` is not `Materializable`) |
 
 **Placement is not negotiable** — each recur slot has a fixed role:

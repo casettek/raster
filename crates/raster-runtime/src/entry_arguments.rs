@@ -116,7 +116,9 @@ pub fn start_program(args: &[EntryArgumentSpec]) -> Result<EntryArgumentsBinding
     for spec in args {
         let (encoding, commitment_hex) = resolver.manifest_commitment_metadata(spec.name)?;
         let kind = match encoding {
-            ExternalEncoding::Raster => ReferencedSourceKind::Raster,
+            ExternalEncoding::Raster => ReferencedSourceKind::Raster {
+                schema: spec.schema,
+            },
             ExternalEncoding::Postcard => ReferencedSourceKind::Postcard {
                 to_tree: spec.to_tree,
                 schema: spec.schema,

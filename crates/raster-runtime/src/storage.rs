@@ -224,6 +224,17 @@ fn runtime_tree_value(value: &raster_core::draft::DraftValue) -> TreeValue {
                 .map(|(name, child)| (name.clone(), runtime_tree_value(child)))
                 .collect(),
         ),
+        raster_core::draft::DraftValue::BytesPage {
+            index,
+            offset,
+            len,
+            bytes,
+        } => TreeValue::BytesPage {
+            index: *index,
+            offset: *offset,
+            len: *len,
+            bytes: bytes.clone(),
+        },
     }
 }
 
@@ -1406,13 +1417,21 @@ mod tests {
                         name: "alpha".into(),
                         encoding: ExternalEncoding::Raster,
                         commitment: alpha_commitment.clone(),
-                        kind: ReferencedSourceKind::Raster,
+                        kind: ReferencedSourceKind::Raster {
+                            schema: || SchemaNode::Leaf {
+                                type_name: String::new(),
+                            },
+                        },
                     },
                     AuthorizedSource {
                         name: "beta".into(),
                         encoding: ExternalEncoding::Raster,
                         commitment: beta_commitment.clone(),
-                        kind: ReferencedSourceKind::Raster,
+                        kind: ReferencedSourceKind::Raster {
+                            schema: || SchemaNode::Leaf {
+                                type_name: String::new(),
+                            },
+                        },
                     },
                 ],
             },

@@ -1,6 +1,6 @@
 # Proposal: `paged-bytes` — `Bytes`/`BytesPage`, byte data that is addressed, never materialized
 
-Status: proposed 2026-08-04, revised 2026-08-05 (revision 3)
+Status: implemented 2026-08-14 (revision 3), **with defects — see §12**. Gate 2 (chunked-sweep `ListRange` cross-check) and Gate 3 (selection↔replay bind) remain open, as do `BoundRange`, a framework `page_of` tile, lazy-list-recur rule 8, and window-seed-reconstruction.
 
 Related:
 - [`bounded-collections.md`](./bounded-collections.md) — this is the same `List`/`Block`
@@ -95,7 +95,7 @@ pub struct ModelFile {
     /// 256 KiB pages = 16 rows per page. A multiple of `row_stride`, so no row
     /// ever straddles a page boundary.
     #[page_size = 262_144]
-    pub weights: Bytes,
+    pub weights: Bytes<262_144>,
 }
 
 #[derive(Serialize, Deserialize, Selectable)]
@@ -133,7 +133,7 @@ fn main() -> anyhow::Result<()> {
         input_width: 4096,
         row_stride:  4096 * 4,
         layers:      List::from(layers),
-        weights:     Bytes::paged(raw, ModelFile::WEIGHTS_PAGE_SIZE)?,
+        weights:     Bytes::<{ ModelFile::WEIGHTS_PAGE_SIZE }>::paged(raw)?,
     };
 
     let commitment = write_raster_files(
@@ -830,6 +830,202 @@ change.
 **`references/recur.md`** — sweeps over `Bytes`, why byte-range-driven recur is forbidden,
 and straddling records as an argument for stride-aligned page sizes.
 
+## 12. Implementation review (2026-08-14)
+
+Review of the landed implementation against this document. The format, the struct shape
+(§2.1), and the sweep path (§1.3) landed faithfully. What follows are defects, ranked.
+
+The headline: **the guest-side geometry audit that §3.1 exists for is fail-open in the two
+cases that matter** — range/chunked selections and single-page regions — and the serde
+bridge §4 called for was never added, so every page still round-trips one `TreeValue` per
+byte on the host.
+
+### 12.1 Guest audit holes — `raster-core/src/input.rs:1068-1160`
+
+**(a) Range and `chunk = N` selections skip the check entirely.**
+`verify_bytes_page_geometry` opens with
+
+```rust
+let Some(...) = parse_bytes_page_payload(&witness.bytes) else { return true };  // :1069-1072
+```
+
+A range selection's payload is a `0x02` list header wrapping the concatenated pages
+(`raster-runtime/src/input.rs:1370-1385`), never `0x0B`. It parses as `None` and is
+**accepted unconditionally**. `chunk = N` recur drives `Block<BytesPage>` from range
+selections — the spelling §1.3 and SKILL §7 recommend for "several pages per replay unit",
+and the one `crates/raster/tests/paged_bytes.rs:95` exercises. That sweep gets no
+page-shape auditing at all. Same for `select!(Block<BytesPage>, weights[a..b])`.
+
+This is the largest gap: rule 3 is what turns rule 2 from a count into a partition, and the
+recommended sweep spelling bypasses it.
+
+**(b) A single-page region never validates `page_size`.**
+
+```rust
+} else {                                   // index == 0 && last
+    if page_offset != 0 { return false; }
+    let byte_len = len;
+    if u64_leaf_root(byte_len) != siblings[0] { return false; }
+    return page_count == 1;                // :1137 — always true in this branch
+};
+```
+
+`siblings[1]`, the committed `page_size` leaf, is never touched. An artifact committing
+`page_size = 1, byte_len = 5` while shipping one 5-byte page passes the guest audit; the
+correct partition is five pages. The host catches it
+(`backing.rs::check_schema_page_sizes` → `check_page_partition`), but the host is not the
+trust boundary.
+
+**(c) Fail-open by default, and value-matched proof steps.**
+
+- `:1103` — if no `Struct` step has field names exactly `["byte_len","page_size","pages"]`,
+  the function returns `true`. Unrecognized ⇒ accepted.
+- Rule 2 (`page_count == byte_len.div_ceil(page_size)`) runs only on the **last** page
+  (`:1155`). A sweep that stops before the final page never checks count against `byte_len`.
+- `:1090` matches *any* `List` step whose `index` equals the page index — for
+  `models[1].weights.pages[1]` the outer list step is a candidate, and last-match-wins
+  happens to save it. `bytes_step` is likewise whichever qualifying struct step comes last.
+  Both should be positional (the step immediately enclosing the payload), not value-matched.
+
+§3.2 argues this principle in as many words — *"new surface the audit cannot name is unsound
+by default"*. The implementation does the opposite three times.
+
+### 12.2 Pages serialized as one value node per byte — **resolved**
+
+A page reached the selection tree by being serialized with the *general-purpose*
+`TreeValueSerializer` and pattern-matched afterwards:
+
+```rust
+let inner = value.serialize(TreeValueSerializer)?;   // full generic tree
+if name == BYTES_PAGE_NEWTYPE_NAME {
+    return tree_bytes_page_from_wire(inner);         // destructure it straight back
+}
+```
+
+`BytesPageWire { …, bytes: Vec<u8> }` uses a plain derive, so serde emits `serialize_seq` and
+each byte became a `TreeValue::U8` / `DraftValue::U8`. The decode direction did the mirror
+image: `bytes_page_wire_fields` expanded a flat payload into `List([U8; n])` purely so
+`OwnedStructAccess` could collapse it back into the `Vec<u8>` that `OwnedU8SeqDeserializer`
+already wanted.
+
+`size_of::<TreeValue>() == size_of::<DraftValue>() == 56`, so the transient intermediate was
+**56× the payload** — measured at 61–62× with allocator slack, 64 MB for a 1 MiB page —
+built, walked once, and discarded, per page, per direction. This was §Problem item 1's
+`List<u8>` cost reintroduced in the encode/decode path, and it is why §8's host-RSS row was
+unreachable.
+
+**The format was never affected.** A page is hashed once (`bytes_page_root`), carries one
+`Leaf` index node, and the `0x0B` payload is flat. The blowup was entirely in the
+Rust-value ↔ tree-value bridge, before anything hashed. Guest cycle figures were untouched.
+
+**Root cause: a pattern that is correct for `List<T>` and wrong for a page.** The
+serialize-then-match shape is inherited from the `ListHandle` arm one line up, where it is
+free — `ListHandle(values)` re-wraps the very `Vec` that had to be built anyway. For a page
+the intermediate is 56× and entirely thrown away. The `name` is a parameter of
+`serialize_newtype_struct`, available *before* the inner value is serialized; the code simply
+did not act on it until after.
+
+**Fix (landed).** Recognize the page from its newtype name first, and hand the inner value to
+a narrow serializer that knows the page shape statically —
+`raster_core::collections::bytes_page_parts`, one implementation shared by both bridges. Its
+`SerializeSeq` collects the payload into a flat `Vec<u8>` instead of a node per byte;
+everything that is not the page wire struct is an error. `BytesPage::serialize` now emits a
+borrowing `BytesPageWireRef`, which also drops a full-page clone per serialize. On the decode
+side `OwnedStructAccess` carries its own `PageWireField` instead of `TreeValue`, so the
+payload passes through as one buffer. `tree_bytes_page_from_wire`, `draft_bytes_page_from_wire`,
+`tree_bytes_field`, `draft_bytes_field`, and the two `*_u64_field` helpers are deleted.
+
+**What deliberately did *not* change:** neither `serialize_bytes` arm. Both still refuse raw
+bytes, so §Problem's invariant stays *structural* — bytes are unrepresentable in the general
+serializers, not merely rejected later. This is why the fix does not follow §4's
+"`serialize_bytes` arm" line item: that would have opened a general bytes channel and moved
+the invariant from impossible to checked. Also unchanged: the structural root, the `0x0B`
+payload, `rindex03`, and the postcard wire — verified byte-identical, since postcard encodes
+`u8` as one raw byte and a seq as varint-length plus elements. `input_commitment` and image
+ids do not move; this is an optimization, not a migration.
+
+**Tests.** `collections.rs`: postcard wire pinned to spec-derived bytes, round-trip across
+every page shape, `bytes_page_parts` rejects non-page values, and raw bytes are still refused
+by the general serializers. `raster-runtime/src/input.rs`: draft and direct encoding agree on
+a page's structural root (a §10 item that had no test). `raster-runtime/tests/bytes_page_alloc.rs`:
+a `#[global_allocator]` guard asserting a 1 MiB page encodes and drafts under 12× peak —
+confirmed to fail at 61–62× against the pre-fix code, which is the only reason it is worth
+having.
+
+### 12.3 Divergences from the specified surface
+
+| | Issue |
+| --- | --- |
+| (a) | **`#[page_size = n]` is decorative.** Page size lives in `Bytes<N>`; the attribute is optional and only cross-checked for equality (`raster-macros/src/lib.rs`, `page_size_consts`). All three jobs §1.1 assigns it are done by the const generic. It is now a hand-maintained duplicate of the type parameter. |
+| (b) | **Unaligned literal ranges are not a compile diagnostic** (§1.4c, phase 7). It is a post-monomorphization `const {}` panic inside `page_range_for_*`, with no span on the `select!`. `crates/raster/tests/ui/select_unaligned_byte_range.rs` **does not test `select!`** — it hand-writes `const _: () = assert!(...)` against `<Bytes<4> as PageSized>::PAGE_SIZE` and lets the actual `select!(Block<BytesPage>, model.weights[1..5])` compile clean. The test is a placebo. |
+| (c) | **Byte-vs-page units depend on spelling.** `weights[262144]` is a byte offset; `weights.pages[262144]` is a page index. Same target type, silently different meaning, decided by `already_pages` in `emit_selector_segments`. Nothing rejects or warns on the second form. |
+| (d) | **No page-shape check at the selection site.** §4 promised one in `selected_payload_from_raster_location`; there is none. Host-side only the partition *count* is checked, in `backing.rs::check_schema_page_sizes`, and only for the first element of any enclosing list. |
+| (e) | **`base_expr` is emitted twice** — once inside `page_index_for_*(&#base_expr)` and once in `select_source(#base_expr, …)`. For `model.clone().weights[0]` that is two clones and two evaluations of any side effect. |
+
+### 12.4 `schema_walk` is a second implementation of `Selectable::schema()`
+
+`crates/raster-compiler/src/schema_walk.rs` re-derives schemas from source text. It diverges
+from the derive in ways nothing cross-checks:
+
+- **ignores `#[schema(tag = N)]`** — the derive sets `SchemaField.label` from the tag
+  (`raster-macros/src/lib.rs:3596`), the walk always uses the field name. Any struct using
+  the attribute gets a wrong `schema_hash` committed, silently.
+- no enums, no tuple structs, no generics; `leaf_schema` omits `f32`/`f64`/`u128`/`char`
+- resolves struct names by bare ident across all of `src/`, so two same-named structs in
+  different modules collide
+
+**And it is a compile regression.** `fill_schema_hashes` returns
+`Err("unknown interface type X: no matching struct in src/")` for anything it cannot
+resolve, and it sits on the `assemble_program` path for *every* project
+(`raster-cli/src/program.rs:188`). Any existing program whose `main` takes an enum, a tuple
+struct, an `f64`, or a type from a dependency crate now fails to build. `hello-tiles`
+survives only because it happens to use `List`/`String`/`usize`.
+
+Separately, `InterfaceDecl.schema_hash` is `#[serde(default)]`, so an old `program.bin`
+deserializes with a zero hash rather than producing a version error — the opposite of the
+`rindex02` hard-break decided in open question 4.
+
+### 12.5 Runtime
+
+- **`tracing/recorder.rs:1103-1109` passes a stub schema** (`Leaf { type_name: "" }`) for
+  every Raster source, so §3.1 rule 1 is a no-op in the trace/replay path. The adjacent
+  Postcard arm carries a 15-line comment explaining its constraint; this one has none.
+- **`SourceFile::bytes()` panics on IO error** inside `get_or_init`
+  (`source/resolved.rs`) instead of returning `Error` — `OnceLock` cannot hold a `Result`,
+  so the fallible path was papered over.
+- **`read_range`'s non-unix branch** binds the mutex guard, drops it, then re-locks. Dead
+  code on Linux, but wrong as written.
+- **mmap selections now copy.** `RasterData::read_subtree` returns `Vec<u8>`, so leaf reads
+  that previously borrowed from the mapping allocate. A whole-region or root selection still
+  walks every page node into RAM, so §7's `O(page + witness)` claim holds only for
+  page-granular selects.
+
+### 12.6 §10 coverage gaps
+
+No test exists for: byte-offset addressing end-to-end (no `page_of`, no
+`select!(u64, region.page_size)`, no `select!(BytesPage, region[page_idx])` — phase 6 is
+entirely uncovered); range selection returning covering pages, or the `+1` unaligned case;
+`#[page_size]` changing `program_commitment`; draft set/finalize producing the same
+structural root as direct encoding for a `BytesPage`; forged single-page or range witnesses
+against the guest check (the four hand-built witnesses at `raster-core/src/input.rs:1880+`
+cover only the multi-page non-final and final cases).
+
+### 12.7 Fix order
+
+1. §12.1(a) and (b) — the audit is the trust boundary; a chunked sweep proving nothing
+   about page shape is the release blocker.
+2. §12.4 — the `assemble_program` regression breaks existing projects on this release,
+   independent of `Bytes`.
+3. §12.1(c), §12.3(b), §12.6 — fail-open arms, the placebo UI test, and the missing
+   phase-6 tests.
+4. §12.3(a)/(c)/(d)/(e) and §12.5 — surface and runtime cleanups.
+
+~~§12.2~~ — **done.** The per-byte value tree is gone in both bridges; §8's host-memory row
+is now reachable on the encode/decode path.
+
+Note that §3.3 (selection↔replay bind) and the lazy-list-recur blocking dependency are both
+still open, so `Bytes` is not end-to-end authorization-sound yet regardless of the above.
+
 ## Open questions
 
 1. **Should `page_of` be a framework-provided tile** rather than one every program writes?
@@ -841,15 +1037,13 @@ and straddling records as an argument for stride-aligned page sizes.
    the macro needs a const-eval story.
 3. **`BoundRange` for computed range bounds** — deferred to v2. Worth doing only when a
    program needs a variable-length window at a computed offset.
-4. **`rindex02` compatibility window** — keep a reader path, or hard-break given that image
-   ids change anyway? Hard-break is simpler.
-5. **Is `InterfaceDecl.schema_hash` in scope for this proposal or its own?** It is three
-   lines and it is the difference between §6(a) being true and being aspirational, but it
-   changes program identity for reasons unrelated to `Bytes`.
-6. **A `pages!(weights)` sugar macro,** registered in the sequence grammar the way `into_ref!`
-   was, so it is resolver-visible. Deferred: it saves one line over
-   `select!(List<BytesPage>, weights.pages)` and adds grammar surface. Worth doing only if
-   the explicit spelling proves noisy in a real program.
+4. ~~**`rindex02` compatibility window**~~ **Resolved: hard-break.** `rindex02` is a clean
+   version error; re-import as `rindex03`.
+5. ~~**Is `InterfaceDecl.schema_hash` in scope**~~ **Resolved: in scope.** The compiler
+   fills it from an AST schema walk; it is not authored in `Raster.toml`.
+6. ~~**A `pages!(weights)` sugar macro**~~ **Resolved: no.** Sweeps are
+   `select!(List<BytesPage>, region.pages)` then `call_recur!`. A trait adapter that
+   rewrites the selector is invisible to the flow resolver (§1.3).
 7. ~~Payload tag allocation.~~ **Resolved: `0x0B` here, `0x0A` for list metadata in
    `lazy-list-recur`**, with the canonical table recorded in `parse_subtree_root`'s doc comment
    rather than split across proposals. Revision 2's struct shape freed `0x0A` by dropping the

@@ -648,7 +648,7 @@ pub(crate) fn gen_recur_driver_function(
         where
             // `List<E>` in both modes: a chunked tile's `Block<E>` is produced
             // by the driver from range selections, never by the caller.
-            #source_ident: ::raster::IntoAuthRef<::raster::List<#source_element_ty>>,
+            #source_ident: ::raster::RecurListSource<#source_element_ty>,
             #(#extra_where,)*
         {
             let input = ::raster::into_auth_ref::<::raster::List<#source_element_ty>, _>(input);
@@ -1028,7 +1028,7 @@ pub(crate) fn gen_recur_sequence_driver_function(
             #(#extra_wrapper_params,)*
         ) -> ::raster::AuthRef<#result_ty>
         where
-            #source_ident: ::raster::IntoAuthRef<::raster::List<#item_ty>>,
+            #source_ident: ::raster::RecurListSource<#item_ty>,
             #(#extra_where,)*
         {
             let input = ::raster::into_auth_ref::<::raster::List<#item_ty>, _>(input);

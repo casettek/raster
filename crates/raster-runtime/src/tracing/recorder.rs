@@ -1100,7 +1100,13 @@ impl TraceRecorder {
                     .map(|argument| {
                         let kind = match argument.encoding {
                             raster_core::input::ExternalEncoding::Raster => {
-                                crate::backing::ReferencedSourceKind::Raster
+                                crate::backing::ReferencedSourceKind::Raster {
+                                    schema: || {
+                                        raster_core::input::SchemaNode::Leaf {
+                                            type_name: String::new(),
+                                        }
+                                    },
+                                }
                             }
                             raster_core::input::ExternalEncoding::Postcard => {
                                 // `TraceRecorder` runs in `raster-cli`'s own

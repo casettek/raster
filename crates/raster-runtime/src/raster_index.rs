@@ -7,8 +7,9 @@ use std::format;
 use std::string::String;
 use std::vec::Vec;
 
-const RINDEX_MAGIC: &[u8; 8] = b"rindex02";
-const RINDEX_VERSION: u32 = 2;
+const RINDEX_MAGIC: &[u8; 8] = b"rindex03";
+const RINDEX_VERSION: u32 = 3;
+const RINDEX_LEGACY_MAGIC: &[u8; 8] = b"rindex02";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct RasterIndex {
@@ -132,9 +133,16 @@ impl RasterIndex {
     }
 
     pub(crate) fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() >= RINDEX_LEGACY_MAGIC.len()
+            && &bytes[..RINDEX_LEGACY_MAGIC.len()] == RINDEX_LEGACY_MAGIC
+        {
+            return Err(Error::Serialization(
+                "Failed to parse raster index: rindex02 is no longer supported; re-import as rindex03".into(),
+            ));
+        }
         if bytes.len() < RINDEX_MAGIC.len() || &bytes[..RINDEX_MAGIC.len()] != RINDEX_MAGIC {
             return Err(Error::Serialization(
-                "Failed to parse raster index: missing rindex02 header".into(),
+                "Failed to parse raster index: missing rindex03 header".into(),
             ));
         }
 
