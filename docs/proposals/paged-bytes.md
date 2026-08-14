@@ -985,7 +985,94 @@ Separately, `InterfaceDecl.schema_hash` is `#[serde(default)]`, so an old `progr
 deserializes with a zero hash rather than producing a version error — the opposite of the
 `rindex02` hard-break decided in open question 4.
 
-### 12.5 Runtime
+Adding leaf types one at a time as they are hit — as `"BytesPage" => Leaf { .. }` does — is
+a treadmill, and each addition also widens a shadowing hazard: `leaf_schema` is consulted
+*before* the struct lookup (`schema_walk.rs:124-127`) and matches on the bare ident, so a
+user who defines their own `struct BytesPage` silently gets the framework leaf schema and a
+wrong committed hash. The fix has to be structural.
+
+#### The fix: the program reports its own interface
+
+**This revises open question 5.** Its resolution — "the compiler fills it from an AST schema
+walk" — is the source of every defect above. A text walk cannot be made correct, because
+"the schema of type `T`" is defined by `<T as Selectable>::schema()` and nothing else; any
+second derivation is a copy that drifts. `bytes_schema`'s own doc comment states the
+principle this proposal should have followed: *"one construction so the derive, the
+compiler's AST walk, and `Selectable for Bytes<P>` cannot drift."*
+
+The compiler is a separate process and cannot instantiate `<T as Selectable>` — which is why
+the walk exists. But *cannot link it* does not imply *must re-derive it*. The toolchain can
+ask the program, which is how it learns everything else about it.
+
+**The channel already exists and is already load-bearing.**
+`entry_argument_spec::<T>(name)` captures `schema: T::schema` — the real impl
+(`raster-runtime/src/entry_arguments.rs:56-65`) — and the `#[sequence] fn main` macro
+already emits one spec per parameter in declaration order
+(`raster-macros/src/entrypoint.rs:29-37`). That set *is* the interface `InterfaceDecl`
+describes. §2.1's page-size load check already reads `spec.schema` through this same path.
+
+Five changes, four of them deletions:
+
+1. **Carry the output type.** The macro knows `main`'s return type; emit
+   `output_schema: Option<fn() -> SchemaNode>` beside the argument specs. This is the only
+   genuinely new plumbing.
+2. **An emit mode on `start_program`.** When `RASTER_EMIT_INTERFACE` names a path, write
+   `{ inputs: { name → schema_hash }, output: schema_hash }` and exit 0. It must run
+   **before** the source-resolver lookup (`entry_arguments.rs:105-113`), so that reporting an
+   interface needs no `--input`/`--input-manifest` and no fixtures. It is inert in the guest
+   for free: the prelude is already
+   `#[cfg(all(feature = "std", not(target_arch = "riscv32")))]`.
+3. **`assemble_program` asks.** Build the host binary, run it once with that variable, read
+   the JSON, fill `InterfaceDecl.schema_hash`.
+4. **Delete** `schema_walk.rs`, `ProjectAst.structs`, `StructAstItem`, `StructFieldAst`, and
+   `collect_structs`.
+5. **Drop the `#[serde(default)]`** on `schema_hash` once every producer fills it, so an old
+   `program.bin` is a version error rather than a silent zero.
+
+What this buys, beyond correctness by construction: the whole failure class disappears at
+once rather than one leaf type at a time — enums, tuple structs, generics, `f64`, foreign-crate
+types, `#[schema(tag)]`, module-scoped name collisions, and the shadowing hazard above. It
+also fixes §12.6's recorder stub, which needs a real schema from the same channel.
+
+**The cost, stated plainly: `assemble_program` must run the host binary.**
+`emit_program_artifacts` and `program()` (`raster-cli/src/commands.rs:177,202`) do not build
+it today — `run` does (`commands/run.rs:74-88`). Those two paths gain a `cargo build` plus one
+subprocess. That is a real change to the build path and the main reason to weigh this rather
+than assume it. It is defensible: a program that cannot be built has no meaningful
+`program.bin` anyway, and `cargo raster program --verify` already claims to *recompute from
+source*.
+
+**Fallback if running the binary is rejected.** Keep the walk, but make drift loud instead of
+silent: at `start_program`, compare each argument's real `T::schema_hash()` against the value
+in the loaded `program.bin` and abort on mismatch. Cheap, hermetic, and converts a wrong
+committed hash into a first-run failure — but it leaves the hard-error class intact, so the
+leaf table still has to grow. It is a mitigation, not the fix.
+
+**Until either lands**, keep the `"BytesPage"` arm — it unblocks `List<BytesPage>` and bare
+`BytesPage` interface types — and pin it with a test against the real impl, mirroring the
+existing `bytes_type_matches_selectable_hash`:
+
+```rust
+#[test]
+fn bytespage_type_matches_selectable_hash() {
+    let schema = schema_of_type("BytesPage", &[]).unwrap();
+    assert_eq!(schema_hash(&schema), raster_core::BytesPage::schema_hash());
+}
+```
+
+### 12.5 The `rindex03` hard break left the repo's own fixtures stale — **resolved**
+
+Open question 4 resolved `rindex02` as a clean hard break, and §2.3 bumped the magic — but
+`examples/hello-tiles`' committed `personal_data.rindex` and `seed.rindex` were still
+`rindex02`. Five of the nine `raster-cli` integration tests failed against them, so the
+suite was red on this branch before any of §12 was addressed. Regenerated with
+`cargo run --features gen-input --bin gen_input -- .`.
+
+The lesson beyond the fix: **a format bump has to regenerate every committed artifact in the
+repo in the same change**, or the break lands as a test failure someone else has to diagnose.
+Worth a CI check that no `.rindex` under `examples/` carries a stale magic.
+
+### 12.6 Runtime
 
 - **`tracing/recorder.rs:1103-1109` passes a stub schema** (`Leaf { type_name: "" }`) for
   every Raster source, so §3.1 rule 1 is a no-op in the trace/replay path. The adjacent
@@ -1000,7 +1087,7 @@ deserializes with a zero hash rather than producing a version error — the oppo
   walks every page node into RAM, so §7's `O(page + witness)` claim holds only for
   page-granular selects.
 
-### 12.6 §10 coverage gaps
+### 12.7 §10 coverage gaps
 
 No test exists for: byte-offset addressing end-to-end (no `page_of`, no
 `select!(u64, region.page_size)`, no `select!(BytesPage, region[page_idx])` — phase 6 is
@@ -1010,15 +1097,16 @@ structural root as direct encoding for a `BytesPage`; forged single-page or rang
 against the guest check (the four hand-built witnesses at `raster-core/src/input.rs:1880+`
 cover only the multi-page non-final and final cases).
 
-### 12.7 Fix order
+### 12.8 Fix order
 
 1. §12.1(a) and (b) — the audit is the trust boundary; a chunked sweep proving nothing
    about page shape is the release blocker.
 2. §12.4 — the `assemble_program` regression breaks existing projects on this release,
-   independent of `Bytes`.
-3. §12.1(c), §12.3(b), §12.6 — fail-open arms, the placebo UI test, and the missing
+   independent of `Bytes`. Needs the design decision in §12.4 first (ask the program vs.
+   detect drift); the `"BytesPage"` leaf arm plus its test is the stopgap either way.
+3. §12.1(c), §12.3(b), §12.7 — fail-open arms, the placebo UI test, and the missing
    phase-6 tests.
-4. §12.3(a)/(c)/(d)/(e) and §12.5 — surface and runtime cleanups.
+4. §12.3(a)/(c)/(d)/(e) and §12.6 — surface and runtime cleanups.
 
 ~~§12.2~~ — **done.** The per-byte value tree is gone in both bridges; §8's host-memory row
 is now reachable on the encode/decode path.
@@ -1039,8 +1127,14 @@ still open, so `Bytes` is not end-to-end authorization-sound yet regardless of t
    program needs a variable-length window at a computed offset.
 4. ~~**`rindex02` compatibility window**~~ **Resolved: hard-break.** `rindex02` is a clean
    version error; re-import as `rindex03`.
-5. ~~**Is `InterfaceDecl.schema_hash` in scope**~~ **Resolved: in scope.** The compiler
-   fills it from an AST schema walk; it is not authored in `Raster.toml`.
+5. ~~**Is `InterfaceDecl.schema_hash` in scope**~~ **Resolved: in scope** — but *how* it is
+   filled is **reopened**. "The compiler fills it from an AST schema walk" turned out to be
+   the wrong half of the answer: a text walk is a second implementation of
+   `Selectable::schema()` and drifts from it silently, besides hard-failing the build on any
+   type it cannot parse (§12.4). The schema must come from `<T as Selectable>::schema()` via
+   the `EntryArgumentSpec` channel that already carries it. Open decision: whether
+   `assemble_program` may run the host binary to ask (§12.4's fix), or must stay hermetic and
+   settle for detecting drift at first run (its fallback).
 6. ~~**A `pages!(weights)` sugar macro**~~ **Resolved: no.** Sweeps are
    `select!(List<BytesPage>, region.pages)` then `call_recur!`. A trait adapter that
    rewrites the selector is invisible to the flow resolver (§1.3).

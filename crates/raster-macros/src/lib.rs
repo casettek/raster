@@ -1181,6 +1181,10 @@ fn gen_tile_trace_output_serialization() -> proc_macro2::TokenStream {
     quote! {
         let __raster_output_bytes = ::raster::core::postcard::to_allocvec(&result)
             .unwrap_or_else(|e| panic!("Failed to serialize tile output: {}", e));
+        // The other half of the replay budget: a large per-iteration output is
+        // the usual cause of a slow sweep, and is invisible in the timings alone.
+        #[allow(unused_variables)]
+        let __raster_output_byte_len = __raster_output_bytes.len() as ::core::primitive::u64;
     }
 }
 
@@ -1576,6 +1580,12 @@ fn gen_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream {
         ];
 
         #input_bytes
+
+        // The replay unit size, captured before the buffer moves into `FnInput`.
+        // This is the number a `page_size` (or any input-shape) decision is
+        // actually tuned against — the profiler has no other way to see it.
+        #[allow(unused_variables)]
+        let __raster_input_byte_len = __raster_input_bytes.len() as ::core::primitive::u64;
 
         let mut __raster_internal = ::raster::alloc::collections::BTreeMap::new();
         #(#internal_binding_entries)*
@@ -2524,6 +2534,8 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
                         __raster_output_record_build_ns,
                         __raster_trace_event_publish_ns,
                         __raster_output_coordinate_publish_ns,
+                        __raster_input_byte_len,
+                        __raster_output_byte_len,
                     );
                     let _ = &__raster_tile_execution_scope;
                     return result;

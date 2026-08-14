@@ -21,7 +21,7 @@ pub use input::{
     draft_replay_handle, draft_replay_transition, entry_argument_auth_ref, finalize,
     index_binding_name, into_auth_ref, into_auth_value, into_auth_value_with_bindings, into_draft,
     materialize_auth_result, materialize_auth_return, new_draft, push_bound_index,
-    raster_trace_payload, recur_source_trace, resolve_storage_ok_value, resolve_storage_value,
+    raster_trace_payload, resolve_storage_ok_value, resolve_storage_value,
     restore_draft_from_replay_handle, run_recur_chunked_list, run_recur_chunked_list_state,
     run_recur_chunked_list_with_state, run_recur_list, run_recur_list_state,
     run_recur_list_with_state, run_recur_sequence_list, run_recur_sequence_list_state,
@@ -43,8 +43,8 @@ pub use input::{
 #[cfg(feature = "std")]
 pub use input::{
     begin_draft_transition_capture, encode_raster_value, end_program_output, end_program_unit,
-    finish_draft_transition_capture, postcard_structural_commitment, store_value,
-    write_raster_files,
+    finish_draft_transition_capture, postcard_structural_commitment, recur_source_trace,
+    store_value, write_raster_files,
 };
 
 pub use raster_macros::{select, sequence, tile, Selectable};
@@ -69,6 +69,21 @@ pub use raster_runtime::{
     entry_argument_spec, finish, init, init_with, publish_trace_event, start_program,
     take_recur_item_binding, EntryArgumentSpec, EntryArgumentsBinding,
 };
+
+/// Guest tiles still expand `::raster::take_recur_item_binding()`; the host
+/// driver is the only caller that ever stashes a binding. On `no_std` there is
+/// no thread-local stash, so every take is `None` and the wrapper falls back
+/// to the argument's own index bindings.
+#[cfg(not(feature = "std"))]
+pub struct PendingRecurItemBinding {
+    pub storage: crate::core::trace::StorageData,
+    pub index_bindings: alloc::vec::Vec<IndexBinding>,
+}
+
+#[cfg(not(feature = "std"))]
+pub fn take_recur_item_binding() -> Option<PendingRecurItemBinding> {
+    None
+}
 
 #[cfg(feature = "std")]
 pub mod utils;
@@ -251,6 +266,8 @@ pub mod __private {
         output_record_build_ns: u64,
         trace_event_publish_ns: u64,
         output_coordinate_publish_ns: u64,
+        input_bytes: u64,
+        output_bytes: u64,
     ) {
         #[cfg(feature = "profiling")]
         raster_runtime::record_tile_profile(
@@ -270,6 +287,10 @@ pub mod __private {
                 output_coordinate_publish_ns,
                 other_wrapper_ns: 0,
             },
+            raster_runtime::TileProfileSizes {
+                input_bytes,
+                output_bytes,
+            },
         );
         #[cfg(not(feature = "profiling"))]
         let _ = (
@@ -285,13 +306,18 @@ pub mod __private {
             output_record_build_ns,
             trace_event_publish_ns,
             output_coordinate_publish_ns,
+            input_bytes,
+            output_bytes,
         );
     }
 
     #[cfg(not(feature = "std"))]
+    #[allow(clippy::too_many_arguments)]
     pub fn record_tile_profile(
         _: &str,
         _: crate::core::cfs::CfsCoordinates,
+        _: u64,
+        _: u64,
         _: u64,
         _: u64,
         _: u64,

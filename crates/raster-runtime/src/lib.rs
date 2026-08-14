@@ -23,6 +23,7 @@ pub use input::{
 pub use profiling::{
     begin_sequence_profile, finish_sequence_profile, record_tile_output_store_profile,
     record_tile_profile, ExecutionProfile, ProfileRecord, ProfileStreamEvent,
+    TileProfileSizes,
     SequenceProfileRecord, SequenceProfileSelfBreakdown, TileProfileOverheadBreakdown,
     TileProfileRecord, PROFILE_PATH_ENV, PROFILE_RUN_ID_ENV, PROFILE_STREAM_PATH_ENV,
 };

@@ -472,6 +472,37 @@ let chunked = call_recur!(
 `chunk` must be a literal — a named constant fails:
 ``call_recur! `chunk = ...` must be an integer literal so it can be pinned in the CFS``.
 
+### Sweeping a byte region
+
+A `Bytes<P>` sweep is an ordinary list recur over `select!(List<BytesPage>,
+region.pages)`; `chunk = N` gives the step a `RecurInput<Block<BytesPage>>` and
+works unchanged. Two constraints are specific to bytes:
+
+**Never drive a recur with byte ranges.** A byte range returns the whole pages
+*covering* it, so a request of length `L` yields `⌈L/P⌉` or `⌈L/P⌉ + 1` pages
+depending on where it starts:
+
+| request (`P` = 256 KiB) | pages |
+| --- | --- |
+| `[0 .. 262_144)` | 1 |
+| `[1 .. 262_145)` | 2 |
+| `[0 .. 1_048_576)` | 4 |
+| `[1 .. 1_048_577)` | 5 |
+
+Chunking requires every chunk to be exactly the declared size except the last,
+so an alternating 4/5 count fails `check_previous_chunk_was_full` on the first
+short iteration. **Ranges are for random access; recur is for sweeps.** A sweep
+over `.pages` is aligned by construction and never wobbles.
+
+**Straddling records are a `page_size` bug, not a tile problem.** If a record
+crosses a page boundary the step needs loop-carried stitching state — the
+partial record from the previous page — which is exactly the "state as a
+smuggled accumulator" pattern §2 forbids, and it makes the final page a special
+case on top. Choose `page_size` as a multiple of the record stride and the
+problem does not exist. This constraint outranks every performance
+consideration; tune the page size for cycles only *within* the set of stride
+multiples.
+
 ## 6. `RecurInput` API inside the step
 
 - `input.value()` — borrow the element (or chunk)

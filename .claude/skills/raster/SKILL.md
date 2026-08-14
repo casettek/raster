@@ -181,11 +181,38 @@ truth. The derive emits `WEIGHTS_PAGE_SIZE`.
   in **bytes** and converted to page units at expansion; unaligned literals are
   a compile error. Pass the offset to the consuming tile —
   `local = offset - page.offset()`.
-- Choose `page_size` as a multiple of your record stride so no record straddles
-  a page, then size it to the per-replay cycle budget.
 - Never model byte data as `List<u8>` or hex in a `String`.
 - Changing `#[page_size]` / `Bytes<N>` changes `program_commitment` via
   `InterfaceDecl.schema_hash`. Re-import the artifact.
+
+**A page is the replay unit, so `page_size` is the single knob that sets tile
+cost.** Pick it in this order — the first constraint is not negotiable, the
+second is a budget:
+
+1. **A multiple of your record stride**, so no record straddles a page. A
+   straddling record forces loop-carried stitching state in every tile and makes
+   the last page a special case. Get this wrong and no amount of tuning helps.
+2. **Then the largest page that stays under your per-replay cycle budget.**
+   Roughly `cycles ≈ page_size × (per-byte work + ~1.1 for the input-commitment
+   hash)` — SHA-256 runs ~1.06 cycles/byte with the risc0 accelerator, and it is
+   charged on *every* replay. Bigger pages amortize the fixed per-replay
+   overhead, so go as large as the budget allows.
+
+Why the vocabulary is worth obeying, for a 1 GiB region at 256 KiB pages:
+
+| | `List<u8>` | hex in a `String` | **`Bytes<P>`** |
+| --- | --- | --- | --- |
+| `.rindex` | ~120 GB — **infeasible** | ~460 KB | ~460 KB |
+| tile input per page | — | 512 KiB | **256 KiB** |
+| decode cycles per page | — | ~2.6–5.2 M | **0** |
+
+Hex decode is the term that carries the difference; `List<u8>` does not merely
+cost more, it cannot be built (one index node and one Merkle leaf per byte).
+Cycle figures are order-of-magnitude — **measure before quoting them**.
+
+Measure with `--features profiling`: `TileProfileRecord.input_bytes` is the
+replay unit size, and `output_bytes` catches the other half of the budget (see
+`references/data-and-io.md` §7).
 
 ## 3. Tiles — all computation, always written for the zkVM
 
@@ -602,6 +629,10 @@ If any rung fails, map the failure back to a rule before touching code:
 | ProgramEnd error on return | `main` returning a non-storage-backed value (§8) |
 | run is unexpectedly slow / heavy | unnecessary materialization: whole-object selections, oversized tile outputs (§2) |
 | `call_recur! requires a raster-indexed List source` | recur source is a postcard external — re-declare it with `index_path` + `encoding = "raster"` (§7) |
+| `.rindex` far larger than the data file | byte data modelled as `List<u8>` instead of `Bytes<P>` (§2) |
+| "artifact page size does not match declared `Bytes<N>`" at load | artifact written with a different `#[page_size]` — regenerate the fixture (§2) |
+| recur over pages fails `check_previous_chunk_was_full` | recur driven by byte ranges; page count wobbles by alignment — sweep `.pages` instead (§2, `references/recur.md` §1) |
+| tile aborts on `page is not i32-aligned` / spans two pages | `page_size` is not a multiple of the record stride (§2) |
 
 A green ladder is necessary, not sufficient: model violations that keep the
 mechanics intact — a fake recur, a committed counter list, computation hidden

@@ -389,6 +389,24 @@ impl<T> From<T> for RecurState<T> {
     }
 }
 
+impl<T> From<AuthRef<T>> for RecurState<T>
+where
+    T: DeserializeOwned + Serialize,
+{
+    fn from(value: AuthRef<T>) -> Self {
+        Self::new(
+            into_auth_value::<T, _>(value)
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "Failed to materialize recursive state from tile output: {}",
+                        error
+                    )
+                })
+                .into_inner(),
+        )
+    }
+}
+
 impl<T> core::ops::Deref for RecurState<T> {
     type Target = T;
 

@@ -72,6 +72,8 @@ fn ast_type_from_syn(ty: &Type) -> Result<AstType> {
         "List" => Ok(AstType::List(Box::new(first_type_arg(&segment.arguments)?))),
         "Block" => Ok(AstType::Block(Box::new(first_type_arg(&segment.arguments)?))),
         "Bytes" => Ok(AstType::Bytes(const_u64_arg(&segment.arguments)?)),
+        // Fallible `main` / tile outputs are `Result<T>`; identity hashes `T`.
+        "Result" => first_type_arg(&segment.arguments),
         _ => Ok(AstType::Named(name)),
     }
 }
@@ -156,6 +158,9 @@ fn leaf_schema(name: &str) -> Option<SchemaNode> {
         "i32" => i32::schema(),
         "i16" => i16::schema(),
         "i8" => i8::schema(),
+        "BytesPage" => SchemaNode::Leaf {
+            type_name: "BytesPage".into(),
+        },
         _ => return None,
     })
 }
@@ -212,6 +217,28 @@ mod tests {
     fn bytes_type_matches_selectable_hash() {
         let schema = schema_of_type("Bytes<4>", &[]).unwrap();
         assert_eq!(schema_hash(&schema), raster_core::Bytes::<4>::schema_hash());
+    }
+
+    /// `leaf_schema` is a hand-maintained copy of every `Selectable` impl, so
+    /// each entry needs a test pinning it against the real one. This is the
+    /// argument for deleting the walk rather than growing it — see
+    /// `paged-bytes.md` §12.4.
+    #[test]
+    fn bytes_page_type_matches_selectable_hash() {
+        let schema = schema_of_type("BytesPage", &[]).unwrap();
+        assert_eq!(schema_hash(&schema), raster_core::BytesPage::schema_hash());
+    }
+
+    /// The realistic reason the arm exists: a stage whose `main` consumes pages
+    /// produced upstream. Without it this is a hard build failure, not a wrong
+    /// hash.
+    #[test]
+    fn list_of_bytes_pages_resolves() {
+        let schema = schema_of_type("List<BytesPage>", &[]).unwrap();
+        assert_eq!(
+            schema_hash(&schema),
+            raster_core::List::<raster_core::BytesPage>::schema_hash()
+        );
     }
 
     #[test]

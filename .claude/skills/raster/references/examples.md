@@ -452,3 +452,139 @@ original native function, just with `#[tile]` added, it is probably wrong.
 The native version is one function; the Raster version is a *schema of small
 steps*. More steps, each smaller — that is what being verifiable costs, and
 recur/chunk is what keeps that cost linear instead of painful.
+
+## 5. A byte-region program — sweep and random access
+
+Byte data is `Bytes<P>`; the only value that crosses a tile boundary is one
+`BytesPage`. This is the same `List`/`Block` split one granularity down, so the
+driver is the ordinary list recur.
+
+### `src/input.rs` — declaring the region
+
+```rust
+#[derive(Serialize, Deserialize, Selectable)]
+pub struct ModelFile {
+    pub row_stride: u32,                  // 16 KiB — 4096 i32 per row
+
+    /// Where each layer's weights start, in bytes, within `weights`.
+    pub layers: List<LayerEntry>,
+
+    /// 256 KiB pages = 16 rows/page. A multiple of `row_stride`, so no row
+    /// straddles a page boundary — the first sizing rule, ahead of cycles.
+    #[page_size = 262_144]
+    pub weights: Bytes<262_144>,
+}
+
+#[derive(Serialize, Deserialize, Selectable)]
+pub struct LayerEntry {
+    pub layer_id: u32,
+    pub byte_offset: u64,                 // global offset into `weights`
+    pub byte_len: u64,
+}
+```
+
+`ModelFile` has `List` fields, so it is `Selectable` but not `Materializable` —
+passing the whole model into a tile is the existing compile error. `Bytes<P>` is
+never `Materializable` for the same reason.
+
+### `bin/gen_input.rs` — writing the artifact
+
+```rust
+let raw: Vec<u8> = load_weights("model.safetensors")?;
+let model = ModelFile {
+    row_stride: 4096 * 4,
+    layers:     List::from(layer_table_for(&raw)),   // offsets page-aligned
+    weights:    Bytes::<{ ModelFile::WEIGHTS_PAGE_SIZE }>::paged(raw)?,
+};
+let commitment = write_raster_files(
+    &model, Path::new("model.rastered"), Path::new("model.rindex"))?;
+```
+
+`paged` is the only constructor — a region without a page size has no addressing
+scheme. Use the generated `WEIGHTS_PAGE_SIZE` const so the fixture cannot drift
+from the declaration.
+
+### Sweeping the whole region
+
+```rust
+#[sequence]
+fn main(model: ModelFile) -> Accum {
+    // `.pages` is written explicitly: `call_recur!` iterates a `List<T>`, and
+    // the hop must be visible to the flow resolver or a sweep across a
+    // `call_seq!` boundary fails the audit.
+    let pages = select!(List<BytesPage>, model.weights.pages);
+    call_recur!(tile = accumulate_page, input = pages, state = Accum::default())
+}
+
+#[tile(kind = recur, description = "Accumulate one page", estimated_cycles = 1_200_000)]
+pub fn accumulate_page(input: RecurInput<BytesPage>, state: Accum) -> Accum {
+    let page = input.into_value();
+    let bytes = page.as_slice();
+    assert!(bytes.len() % 4 == 0, "page is not i32-aligned");   // last page is short
+
+    let mut state = state;
+    for word in bytes.chunks_exact(4) {
+        state.sum += i64::from(i32::from_le_bytes(word.try_into().unwrap()));
+    }
+    state
+}
+```
+
+Add `chunk = 4` if per-replay overhead dominates; the step then takes
+`RecurInput<Block<BytesPage>>` and nothing else changes.
+
+### Random access at a computed byte offset
+
+A byte offset is not a page index, and converting between them is arithmetic —
+so it happens in a tile, not in the selector.
+
+```rust
+#[sequence]
+fn main(model: ModelFile, request: LayerRequest) -> LayerOut {
+    let layer_id = select!(u32, request.layer_id);
+    let layers   = select!(List<LayerEntry>, model.clone().layers);
+    let entry    = select!(LayerEntry, layers[layer_id]);
+
+    let start = select!(u64, entry.clone().byte_offset);
+    let len   = select!(u64, entry.byte_len);
+
+    // The region's own committed page size — a selectable field, not a literal,
+    // so the index is bound to the artifact it addresses.
+    let page_size = select!(u64, model.clone().weights.page_size);
+    let page_idx  = call!(page_of, clone!(start), page_size);   // replayed, proven
+
+    let page = select!(BytesPage, model.weights[page_idx]);     // ordinary BoundIndex
+
+    call!(apply_layer, page, start, len)
+}
+
+#[tile(description = "Page containing a byte offset", estimated_cycles = 200)]
+pub fn page_of(byte_offset: u64, page_size: u64) -> u64 {
+    byte_offset / page_size
+}
+```
+
+`page_idx` is an ordinary authorized citation — no new proof step, no new audit
+arm. Note `start` is passed to `apply_layer` *alongside* the page: a page's
+Merkle leaf must be stable regardless of which byte was requested, so the
+request cannot live inside the page value. The consuming tile computes
+`local = start - page.offset()`.
+
+### The three ways to get this wrong
+
+```rust
+// 1. Byte data as a list of scalars. One index node and one Merkle leaf per
+//    byte: a 1 GiB region needs ~120 GB of .rindex. Not slow — impossible.
+pub weights: List<u8>,
+
+// 2. Hex in a String. 2x on disk, 2x in the replay input, plus a nibble
+//    decoder burning 2.6-5.2M cycles in every tile.
+pub weights: String,
+
+// 3. A recur driven by byte ranges. The page count wobbles by alignment
+//    (⌈L/P⌉ or ⌈L/P⌉+1), so chunking fails on the first short iteration.
+let window = select!(Block<BytesPage>, model.weights[0..1_048_576]);
+call_recur!(tile = accumulate_page, input = window, /* ... */);
+```
+
+Ranges are for random access; recur is for sweeps.
