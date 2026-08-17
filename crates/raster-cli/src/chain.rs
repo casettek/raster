@@ -19,6 +19,7 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -143,6 +144,10 @@ pub fn run(chain: Option<&str>, window_size: usize) -> Result<()> {
 
     let mut checkpoints: Vec<StageCheckpoint> = Vec::new();
     let mut stage_index: BTreeMap<String, usize> = BTreeMap::new();
+    // Wall clock of each stage binary. Reported only — never part of a
+    // `StageCheckpoint`, which `chain audit` and the chain-fraud guest digest
+    // and which must stay identical across runs.
+    let mut execution_times: Vec<(String, Duration)> = Vec::new();
 
     let stage_count = spec.stages.len();
     for (idx, stage) in spec.stages.iter().enumerate() {
@@ -189,13 +194,15 @@ pub fn run(chain: Option<&str>, window_size: usize) -> Result<()> {
         )?;
         println!("    build & run …");
 
-        let (trace, _recorder) = build_and_run_stage(
+        let (trace, _recorder, execution_time) = build_and_run_stage(
             &project,
             &cfs,
             &synth.input_json_path,
             &synth.input_manifest_path,
             &stage_dir,
         )?;
+        execution_times.push((stage.name.clone(), execution_time));
+        println!("    exec {}", format_duration(execution_time));
 
         let trace_commitment =
             TraceCommitment::try_build(&trace, &EMPTY_TRIE_NODES[0], fraud_proof_config)
@@ -257,7 +264,41 @@ pub fn run(chain: Option<&str>, window_size: usize) -> Result<()> {
 
     println!("chain-commitment → {}", chain_commitment_path.display());
     println!("chain digest: {}", hex::encode(chain.digest()));
+    print_execution_times(&execution_times);
     Ok(())
+}
+
+/// Per-stage execution time — the stage binary's own wall clock, not the build
+/// that precedes it or the commitment work that follows. The total is the sum
+/// of the stages, so it is deliberately less than the command's runtime.
+fn print_execution_times(execution_times: &[(String, Duration)]) {
+    if execution_times.is_empty() {
+        return;
+    }
+
+    let name_width = execution_times
+        .iter()
+        .map(|(name, _)| name.len())
+        .chain(std::iter::once("stage".len()))
+        .max()
+        .unwrap_or_default();
+
+    println!();
+    println!("{:<name_width$}  {:>10}", "stage", "exec");
+    for (name, duration) in execution_times {
+        println!("{:<name_width$}  {:>10}", name, format_duration(*duration));
+    }
+    let total: Duration = execution_times.iter().map(|(_, d)| *d).sum();
+    println!("{:<name_width$}  {:>10}", "total", format_duration(total));
+}
+
+/// Human-readable duration: sub-second in milliseconds, above that in seconds.
+fn format_duration(duration: Duration) -> String {
+    if duration.as_secs() == 0 {
+        format!("{}ms", duration.as_millis())
+    } else {
+        format!("{:.2}s", duration.as_secs_f64())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -530,7 +571,7 @@ fn detect_execution_fraud(recorded: &RecordedChain) -> Result<Option<StageExecut
             recorded.spec.stages.len(),
             stage.name
         );
-        let (trace, recorder) = build_and_run_stage(
+        let (trace, recorder, _execution_time) = build_and_run_stage(
             &project,
             &cfs,
             &input_json_path,
@@ -767,14 +808,20 @@ pub fn fraud_verify(
 
 /// Build the stage project and run its binary, writing the trace to
 /// `stage_dir/trace.bin` and the output artifact to `stage_dir` (via
-/// `RASTER_OUTPUT_DIR`). Returns the loaded trace.
+/// `RASTER_OUTPUT_DIR`). Returns the loaded trace and how long the stage
+/// binary itself ran — wall clock of the child process, excluding the build
+/// that precedes it and the trace load that follows.
 fn build_and_run_stage(
     project: &Project,
     cfs: &ControlFlowSchema,
     input_json_path: &Path,
     input_manifest_path: &Path,
     stage_dir: &Path,
-) -> Result<(raster_core::trace::Trace, raster_runtime::TraceRecorder)> {
+) -> Result<(
+    raster_core::trace::Trace,
+    raster_runtime::TraceRecorder,
+    Duration,
+)> {
     // The stage build is plumbing, not chain output: its cargo progress,
     // dependency warnings, and protocol-guest build chatter would bury the
     // per-stage lines this command exists to print. Capture it and surface it
@@ -819,6 +866,7 @@ fn build_and_run_stage(
     let input_json = input_json_path.to_string_lossy().to_string();
     let input_manifest = input_manifest_path.to_string_lossy().to_string();
 
+    let started = Instant::now();
     let status = Command::new(&binary_path)
         .current_dir(&project.root_dir)
         .env(raster_runtime::TRACE_PATH_ENV, &trace_path)
@@ -833,6 +881,7 @@ fn build_and_run_stage(
         .stderr(Stdio::inherit())
         .status()
         .map_err(|e| Error::Other(format!("failed to run stage binary: {e}")))?;
+    let execution_time = started.elapsed();
     if !status.success() {
         // A stage that errors/panics publishes no ProgramEnd and no artifact —
         // the chain halts here; nothing downstream can be attested.
@@ -842,13 +891,14 @@ fn build_and_run_stage(
         )));
     }
 
-    load_trace_from_file(
+    let (trace, recorder) = load_trace_from_file(
         &trace_path,
         TraceFormat::Binary,
         cfs,
         Some(&input_json),
         Some(&input_manifest),
-    )
+    )?;
+    Ok((trace, recorder, execution_time))
 }
 
 // ---------------------------------------------------------------------------

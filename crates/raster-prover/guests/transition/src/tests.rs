@@ -11,11 +11,14 @@ use raster_core::coordinate_index::{
     coordinate_index_membership_proof, coordinate_index_non_membership_proof, coordinate_index_root,
 };
 use raster_core::draft::{
-    draft_root_from_witness, schema_hash as compute_schema_hash, DraftFieldValue, DraftOp,
-    DraftReplayTransition, DraftStateWitness, DraftTransitionWitness, RecurControlKind,
+    draft_root_from_witness, draft_value_root, schema_hash as compute_schema_hash, DraftOp,
+    DraftReplayTransition, DraftStateWitness, DraftTransitionWitness, DraftWitnessField,
+    RecurControlKind,
     RecurPosition, RecurTileReplay, TileReplayJournal, TrackedDraftState,
 };
-use raster_core::input::{SchemaField, SchemaFieldMode, SchemaNode, Selectable};
+use raster_core::input::{
+    AppendFrontier, SchemaField, SchemaFieldMode, SchemaNode, Selectable,
+};
 use raster_core::recur_progress::RecurProgressStack;
 use raster_core::trace::{
     ExecStep, ExecTarget, FnInput, FnInputArg, FnInputValue, StepKind, StepRecord, StorageData,
@@ -828,6 +831,18 @@ fn verify_storage_transition_accepts_non_empty_initial_state() {
     assert_eq!(next_index_root, index_root_after);
 }
 
+/// The witness form of an append field: the right edge of the list's Merkle
+/// tree, built from the element roots the guest would derive from `ops`.
+fn append_frontier_of(items: &[&str]) -> AppendFrontier {
+    let roots: Vec<[u8; 32]> = items
+        .iter()
+        .map(|item| {
+            draft_value_root(&raster_core::draft::DraftValue::String((*item).into())).unwrap()
+        })
+        .collect();
+    AppendFrontier::from_leaf_roots(&roots)
+}
+
 #[test]
 fn verify_draft_transition_tracks_multi_step_chain() {
     let empty_witness = DraftStateWitness {
@@ -835,7 +850,7 @@ fn verify_draft_transition_tracks_multi_step_chain() {
         fields: Vec::new(),
     };
     let empty_root =
-        draft_root_from_witness(&empty_witness.schema, &BTreeMap::new(), false).unwrap();
+        draft_root_from_witness(&empty_witness.schema, &BTreeMap::new()).unwrap();
     let schema_hash = compute_schema_hash(&empty_witness.schema);
     let draft_id = [7; 32];
     let mut active_drafts = BTreeMap::new();
@@ -876,13 +891,11 @@ fn verify_draft_transition_tracks_multi_step_chain() {
         fields: vec![
             (
                 "title".into(),
-                DraftFieldValue::Set(raster_core::draft::DraftValue::String("collected".into())),
+                DraftWitnessField::Set(raster_core::draft::DraftValue::String("collected".into())),
             ),
             (
                 "items".into(),
-                DraftFieldValue::Append(vec![raster_core::draft::DraftValue::String(
-                    "first".into(),
-                )]),
+                DraftWitnessField::Append(append_frontier_of(&["first"])),
             ),
         ],
     };
@@ -920,7 +933,7 @@ fn verify_draft_transition_rejects_wrong_root_before() {
         schema: DemoDraft::schema(),
         fields: Vec::new(),
     };
-    let empty_root = draft_root_from_witness(&witness.schema, &BTreeMap::new(), false).unwrap();
+    let empty_root = draft_root_from_witness(&witness.schema, &BTreeMap::new()).unwrap();
     let schema_hash = compute_schema_hash(&witness.schema);
     let draft_id = [9; 32];
     let mut active_drafts = BTreeMap::from([(
@@ -959,7 +972,7 @@ fn verify_draft_transition_rejects_wrong_schema_hash() {
         schema: DemoDraft::schema(),
         fields: Vec::new(),
     };
-    let empty_root = draft_root_from_witness(&witness.schema, &BTreeMap::new(), false).unwrap();
+    let empty_root = draft_root_from_witness(&witness.schema, &BTreeMap::new()).unwrap();
     let mut active_drafts = BTreeMap::new();
 
     verify_draft_transition(
@@ -987,7 +1000,7 @@ fn verify_draft_transition_rejects_wrong_schema_hash() {
 #[should_panic(expected = "witness root")]
 fn verify_draft_transition_rejects_tampered_pre_state_witness() {
     let empty_root =
-        draft_root_from_witness(&DemoDraft::schema(), &BTreeMap::new(), false).unwrap();
+        draft_root_from_witness(&DemoDraft::schema(), &BTreeMap::new()).unwrap();
     let mut active_drafts = BTreeMap::new();
 
     verify_draft_transition(
@@ -1008,12 +1021,64 @@ fn verify_draft_transition_rejects_tampered_pre_state_witness() {
                 schema: DemoDraft::schema(),
                 fields: vec![(
                     "title".into(),
-                    DraftFieldValue::Set(raster_core::draft::DraftValue::String("tampered".into())),
+                    DraftWitnessField::Set(raster_core::draft::DraftValue::String(
+                        "tampered".into(),
+                    )),
                 )],
             },
             native_transition: None,
         }),
         &mut active_drafts,
+    );
+}
+
+/// The frontier twin of the tampered-witness test above.
+///
+/// A witness now proves the *shape* of the accumulated list rather than
+/// exhibiting it, so the thing a forger reaches for is a frontier claiming a
+/// different length. It must fail exactly where a wrong element value fails:
+/// the root is recomputed from `(len, edge)`, so a forged length yields a
+/// different root and never matches `root_before`.
+#[test]
+#[should_panic(expected = "witness root")]
+fn verify_draft_transition_rejects_a_frontier_claiming_the_wrong_length() {
+    let honest = DraftStateWitness {
+        schema: DemoDraft::schema(),
+        fields: vec![(
+            "items".into(),
+            DraftWitnessField::Append(append_frontier_of(&["first", "second"])),
+        )],
+    };
+    let root_before = draft_root_from_witness(
+        &honest.schema,
+        &raster_core::draft::witness_fields_map(&honest.fields),
+    )
+    .unwrap();
+
+    let mut forged = honest;
+    let DraftWitnessField::Append(frontier) = &mut forged.fields[0].1 else {
+        unreachable!("the fixture field is an append field");
+    };
+    frontier.len += 1;
+
+    verify_draft_transition(
+        &draft_tile_step(1),
+        Some(&TileReplayJournal {
+            input_commitment: [0u8; 32],
+            output_bytes: Vec::new(),
+            draft_transition: Some(DraftReplayTransition {
+                draft_id: [8; 32],
+                schema_hash: compute_schema_hash(&DemoDraft::schema()),
+                root_before,
+                ops: Vec::new(),
+            }),
+            recur: None,
+        }),
+        Some(&DraftTransitionWitness {
+            pre_state: forged,
+            native_transition: None,
+        }),
+        &mut BTreeMap::new(),
     );
 }
 

@@ -1721,6 +1721,87 @@ where
     arg.into_auth_value_with_bindings()
 }
 
+/// Selections at or above this size are worth remembering across repeats.
+///
+/// The threshold is what keeps the memo self-limiting: an entry is only ever
+/// created by a resolution that already moved at least this many bytes, and it
+/// costs ~200. So the memo can never grow to more than a fraction of a percent
+/// of the work already done, without any eviction policy to get wrong.
+#[cfg(feature = "std")]
+const TRACE_MEMO_MIN_SELECTED_LEN: u64 = 64 * 1024;
+
+#[cfg(feature = "std")]
+std::thread_local! {
+    /// Memoizes the storage half of [`auth_ref_trace`], keyed by the
+    /// `(coordinates, commitment, selector)` triple that determines it.
+    ///
+    /// Sound because the key names immutable content: storage is append-only,
+    /// and `verify_reference` holds an object at fixed coordinates to a fixed
+    /// commitment, so the same key can only ever describe the same bytes and
+    /// therefore the same `SelectionCommitment`.
+    static THREAD_AUTH_REF_TRACE_MEMO: core::cell::RefCell<
+        alloc::collections::BTreeMap<Vec<u8>, TraceStorageData>,
+    > = core::cell::RefCell::new(alloc::collections::BTreeMap::new());
+}
+
+/// The storage half of an `AuthRef`'s trace record.
+///
+/// Split out of [`auth_ref_trace`] so that the resolution it needs — which is
+/// eager, and on a whole-collection selector reads and decodes the entire
+/// collection — happens **once per distinct binding** instead of once per
+/// call. That difference is the whole point: a `#[sequence(kind = recur)]`
+/// re-enters its wrapper for every item, and traces every parameter each time,
+/// so an un-memoized big argument is re-decoded on every iteration even when
+/// the body never touches it.
+#[cfg(feature = "std")]
+fn auth_ref_trace_storage<T>(
+    binding: &DeferredAuthStorage<T>,
+) -> raster_core::Result<TraceStorageData> {
+    let key = raster_core::postcard::to_allocvec(&(
+        &binding.reference.coordinates,
+        &binding.reference.commitment,
+        &binding.selector,
+    ))
+    .unwrap_or_default();
+
+    if !key.is_empty() {
+        if let Some(hit) =
+            THREAD_AUTH_REF_TRACE_MEMO.with(|memo| memo.borrow().get(&key).cloned())
+        {
+            return Ok(hit);
+        }
+    }
+
+    let resolved = (binding.resolve.as_ref())(binding.reference.clone())?;
+    let storage = TraceStorageData {
+        coordinates: resolved.reference.coordinates,
+        commitment: resolved.reference.commitment,
+        selector: resolved.selector,
+        selection: resolved.selection,
+    };
+
+    if !key.is_empty() && storage.selection.selected_len >= TRACE_MEMO_MIN_SELECTED_LEN {
+        THREAD_AUTH_REF_TRACE_MEMO.with(|memo| {
+            memo.borrow_mut().insert(key, storage.clone());
+        });
+    }
+
+    Ok(storage)
+}
+
+#[cfg(not(feature = "std"))]
+fn auth_ref_trace_storage<T>(
+    binding: &DeferredAuthStorage<T>,
+) -> raster_core::Result<TraceStorageData> {
+    let resolved = (binding.resolve.as_ref())(binding.reference.clone())?;
+    Ok(TraceStorageData {
+        coordinates: resolved.reference.coordinates,
+        commitment: resolved.reference.commitment,
+        selector: resolved.selector,
+        selection: resolved.selection,
+    })
+}
+
 pub fn auth_ref_trace<T>(arg: &AuthRef<T>) -> raster_core::Result<AuthRefTrace>
 where
     T: Serialize + DeserializeOwned,
@@ -1733,19 +1814,11 @@ where
             storage: None,
             index_bindings: Vec::new(),
         }),
-        AuthRef::Storage(binding) => {
-            let resolved = (binding.resolve.as_ref())(binding.reference.clone())?;
-            Ok(AuthRefTrace {
-                value: FnInputValue::StorageBinding,
-                storage: Some(TraceStorageData {
-                    coordinates: resolved.reference.coordinates,
-                    commitment: resolved.reference.commitment,
-                    selector: resolved.selector,
-                    selection: resolved.selection,
-                }),
-                index_bindings: binding.index_bindings.clone(),
-            })
-        }
+        AuthRef::Storage(binding) => Ok(AuthRefTrace {
+            value: FnInputValue::StorageBinding,
+            storage: Some(auth_ref_trace_storage(binding)?),
+            index_bindings: binding.index_bindings.clone(),
+        }),
     }
 }
 

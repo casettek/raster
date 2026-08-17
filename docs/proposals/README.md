@@ -1,6 +1,6 @@
 # Proposals — status and dependencies
 
-Index of `docs/proposals/`. Last reviewed 2026-08-14.
+Index of `docs/proposals/`. Last reviewed 2026-08-16.
 
 Each proposal's own `Status:` line is the source of truth; this file collects them and records
 where that line disagrees with the code or the git history. Where they disagree, the
@@ -20,7 +20,9 @@ document, and correcting it is the author's call.
 | [`dynamic-index-selection`](./dynamic-index-selection.md) | **phases 1–3 implemented** (2026-07-30) | `BoundIndex`, citations, `verify_bound_index_bindings`, `into_ref!` | option 2 on the width check, left to be argued on its own terms |
 | [`sequence-grammar-closure`](./sequence-grammar-closure.md) | **phase 1 implemented** (2026-07-30) | `clone!`, `into_ref!`, the `.clone()` backstop | **phase 2** — inverting the default so an unrecognized form is an error, not `Inline` |
 | [`authoring-skill-and-tooling`](./authoring-skill-and-tooling.md) | **half landed** ⚠️ header says `proposed` | the skill: `.claude/skills/raster/` (commit `d78c9a5`) | `cargo raster check` — `raster-cli` has only `run` and `tile` |
+| [`guest-replayability-check`](./guest-replayability-check.md) | proposed (2026-08-16) | — | whole; `cargo raster zkcheck`, four tiers. Tier 2 is a mode flag through the existing `Replayer`. Adds RAS-209/210/602 to the `authoring-skill-and-tooling` rule set |
 | [`draft-provenance`](./draft-provenance.md) | proposed (2026-07-30) | — | whole |
+| [`incremental-draft-witness`](./incremental-draft-witness.md) | **implemented** (2026-08-15) | `input::AppendFrontier`; `DraftWitnessField` split off `DraftFieldValue`; frontier-based `apply_draft_ops` / `draft_root_from_witness`; live frontier in the runtime (the host recomputed the whole root per push too). Trace-format hard break; input fixtures and `program_commitment` unmoved, guest image ids move (`raster-core` is linked into them) | §5 not done by design — the witness still carries a full `SchemaNode` per step and a set-once field's whole value rather than its root; acceptance run on `raster-inference` not yet reported |
 | [`loop-carried-state`](./loop-carried-state.md) | proposed (2026-07-30) | — | whole; see the note under *Dependencies* |
 | [`lazy-list-recur`](./lazy-list-recur.md) | **phases 1–6 implemented** (2026-08-13/14) | metadata payload, `ListCursor`, driver-level chunking + range descent, per-item bindings, §5 journal facts, rules 1–7 + S1/S3/S4 enforced | **rule 8 unimplemented** (no `ListRange` cross-check) and S2 unenforced; the peak-RSS acceptance benchmark was never run — see §Outstanding at implementation |
 | [`recur-progress-commitment`](./recur-progress-commitment.md) | **rev 2 implemented** (2026-08-14) | `recur_progress.rs`, the trace `recur_control` bit, site `Start`/`End` events, recorder stamping, guest advance-and-compare — recorder and guest agree on every commitment | mid-loop window seeds, split out as `window-seed-reconstruction` |
@@ -54,6 +56,15 @@ bounded-collections (phases 1-2 impl)
 
 sequence-grammar-closure (phase 1 impl) ◄──► draft-provenance
         phase 2 and draft-provenance refine each other; neither blocks the other
+
+authoring-skill-and-tooling (half landed) ····► guest-replayability-check
+        owns the RAS rule set; zkcheck's tier 0 is its `cargo raster check`      (proposed)
+
+lazy-list-recur (impl) ─ same fix, write side ─► incremental-draft-witness
+                                                         (impl)
+                                                          ▲
+                        window-seed-reconstruction ·······┘
+                             (proposed)          shared frontier/seed mechanism
 ```
 
 `──►` blocking. `····►` recommended, not blocking.
@@ -82,10 +93,23 @@ sequence-grammar-closure (phase 1 impl) ◄──► draft-provenance
 
 ### The non-blocking edges, stated
 
+- **`incremental-draft-witness` → nothing; it is independent of `draft-provenance`.** Both touch
+  drafts and neither blocks the other: `draft-provenance` is about `finalize` severing a
+  provenance chain, this is about the witness carrying O(N) elements to prove one root. It does
+  share a mechanism with `window-seed-reconstruction` — a frontier is what a window opening
+  mid-draft would need as its seed — so whichever lands first should decide whether the frontier
+  lives in the witness or in `TrackedDraftState`. That is the first entry in its
+  §Uncertainties, not a blocking edge. **Decided at implementation: the witness owns it.**
+  `TrackedDraftState` is untouched, so `window-seed-reconstruction` can still move the frontier
+  there if it wants the smaller-but-more-coupled form.
 - **`loop-carried-state` → `carried-state-channel`.** `loop-carried-state` §2 proposes a
   `TrackedStateRoot` map "mirroring `active_drafts`", which would reproduce that map's
   window-open gap. It should extend the channel instead. Neither proposal blocks the other; the
   ordering only decides whether the trace format breaks once or twice.
+- **`guest-replayability-check` → `authoring-skill-and-tooling`.** Non-blocking in both
+  directions. `zkcheck`'s tiers 1–3 are new and depend on nothing; its tier 0 is that
+  proposal's `cargo raster check` and should land there rather than being duplicated. The
+  three rules it adds (RAS-209/210/602) belong to that document's §1.
 - **`carried-state-channel` → drafts.** Folding `active_drafts` in needs the trace to express
   draft *creation* first: `create_draft` (`raster-runtime/src/storage.rs:817`) emits no step, so
   an absent map entry is legitimate today and `checks/drafts.rs:69` is permissive for that
@@ -108,6 +132,9 @@ sequence-grammar-closure (phase 1 impl) ◄──► draft-provenance
    proposal's rule that arrived early via a different failure.
 4. **`authoring-skill-and-tooling`'s second half** (`cargo raster check`) — independent, and it
    is the enforcement surface for rules the type system cannot express.
+5. **`guest-replayability-check` tier 2** — `ExecutionMode::Estimate` through the existing
+   `Replayer` instead of `prove_and_verify()`. Small, independent, and it is the only thing in
+   the ladder that decides "does this tile actually run in the zkVM" without proving.
 
 `trace-event-vocabulary` landed 2026-08-13 and was amended 2026-08-14: the trailing
 `RecurTileExec` / `RecurSequenceExec` became `…End` and gained `…Start` halves, so a recur site

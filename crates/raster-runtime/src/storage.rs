@@ -1,13 +1,14 @@
 use raster_core::cfs::CfsCoordinates;
 use raster_core::coordinate_index::IncrementalCoordinateIndex;
 use raster_core::draft::{
-    draft_root_from_witness, draft_tree_from_witness, draft_value_from_serialize,
-    schema_hash as compute_schema_hash, DraftFieldValue, DraftOp, DraftReplayTransition,
-    DraftStateWitness, DraftTransitionWitness,
+    draft_root_from_field_roots, draft_tree_from_fields, draft_value_from_serialize,
+    draft_value_root, schema_hash as compute_schema_hash, DraftFieldValue, DraftOp,
+    DraftReplayTransition, DraftStateWitness, DraftTransitionWitness, DraftValue,
+    DraftWitnessField,
 };
 use raster_core::input::{
-    AuthenticatedListMetadata, ExternalEncoding, Schema, SchemaFieldMode, SchemaNode,
-    SelectionPayloadKind, SelectionWitness, SelectorPath, StorageRef, StorageValue,
+    AppendFrontier, AuthenticatedListMetadata, ExternalEncoding, Schema, SchemaFieldMode,
+    SchemaNode, SelectionPayloadKind, SelectionWitness, SelectorPath, StorageRef, StorageValue,
 };
 use raster_core::trace::RasterPayload;
 use raster_core::transition::{SerializableFrontier, StorageEntry, StorageIndexValue};
@@ -38,12 +39,77 @@ use crate::Sha256Commitment;
 
 type Anchor = [u8; 32];
 
+/// One draft field as the runtime holds it: the real value, plus the digest
+/// state needed to move the draft root forward without re-reading the value.
+///
+/// Keeping both is what makes a push O(log N) here as well as in the guest. The
+/// values are still the truth — `finalize` materializes the whole object from
+/// them — but they are no longer walked on every op. See
+/// `docs/proposals/incremental-draft-witness.md`.
+#[derive(Debug, Clone)]
+enum DraftFieldRuntime {
+    Set {
+        value: DraftValue,
+        root: [u8; 32],
+    },
+    Append {
+        values: Vec<DraftValue>,
+        frontier: AppendFrontier,
+    },
+}
+
+impl DraftFieldRuntime {
+    fn root(&self) -> Result<[u8; 32]> {
+        match self {
+            Self::Set { root, .. } => Ok(*root),
+            Self::Append { frontier, .. } => frontier
+                .root()
+                .ok_or_else(|| Error::Other("Draft append frontier is malformed".into())),
+        }
+    }
+
+    /// The runtime's own representation, rebuilt for the finalize path.
+    fn field_value(&self) -> DraftFieldValue {
+        match self {
+            Self::Set { value, .. } => DraftFieldValue::Set(value.clone()),
+            Self::Append { values, .. } => DraftFieldValue::Append(values.clone()),
+        }
+    }
+
+    /// What crosses into the trace: a frontier, never the accumulated log.
+    fn witness_field(&self) -> DraftWitnessField {
+        match self {
+            Self::Set { value, .. } => DraftWitnessField::Set(value.clone()),
+            Self::Append { frontier, .. } => DraftWitnessField::Append(frontier.clone()),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct DraftRuntimeState {
     schema: SchemaNode,
     current_root: [u8; 32],
-    fields: BTreeMap<String, DraftFieldValue>,
+    fields: BTreeMap<String, DraftFieldRuntime>,
     ops: Vec<DraftOp>,
+}
+
+impl DraftRuntimeState {
+    /// Recompose the draft root from the per-field roots the fields already
+    /// hold — O(#fields), with no element ever touched.
+    fn recompose_root(&self) -> Result<[u8; 32]> {
+        let mut roots = BTreeMap::new();
+        for (name, field) in &self.fields {
+            roots.insert(name.clone(), field.root()?);
+        }
+        draft_root_from_field_roots(&self.schema, &roots)
+    }
+
+    fn field_values(&self) -> BTreeMap<String, DraftFieldValue> {
+        self.fields
+            .iter()
+            .map(|(name, field)| (name.clone(), field.field_value()))
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -243,16 +309,8 @@ fn build_draft_tree(
     fields: &BTreeMap<String, DraftFieldValue>,
     require_complete: bool,
 ) -> Result<TreeValue> {
-    let tree = draft_tree_from_witness(schema, fields, require_complete)?;
+    let tree = draft_tree_from_fields(schema, fields, require_complete)?;
     Ok(runtime_tree_value(&tree))
-}
-
-fn draft_root(
-    schema: &SchemaNode,
-    fields: &BTreeMap<String, DraftFieldValue>,
-    require_complete: bool,
-) -> Result<[u8; 32]> {
-    draft_root_from_witness(schema, fields, require_complete)
 }
 
 fn locate_schema_field<'a>(
@@ -267,7 +325,7 @@ fn locate_schema_field<'a>(
 
 fn first_unset_set_once_field<'a>(
     schema: &'a SchemaNode,
-    fields: &BTreeMap<String, DraftFieldValue>,
+    fields: &BTreeMap<String, DraftFieldRuntime>,
 ) -> Result<Option<&'a str>> {
     for field in schema_struct_fields(schema)? {
         if field.mode == SchemaFieldMode::SetOnce && !fields.contains_key(&field.name) {
@@ -297,13 +355,18 @@ fn take_draft_state(
     })
 }
 
+/// The pre-state a tile step carries into the trace.
+///
+/// This used to clone `state.fields` wholesale — every element pushed so far,
+/// on every step, which is what made a draft cost O(N) trace bytes per step and
+/// O(N²) overall. It is now O(#fields · log N).
 fn draft_state_witness(state: &DraftRuntimeState) -> DraftStateWitness {
     DraftStateWitness {
         schema: state.schema.clone(),
         fields: state
             .fields
             .iter()
-            .map(|(name, value)| (name.clone(), value.clone()))
+            .map(|(name, field)| (name.clone(), field.witness_field()))
             .collect(),
     }
 }
@@ -890,7 +953,7 @@ where
     let coordinates = THREAD_SEQUENCE_CONTEXT
         .with(|context| context.borrow_mut().reserve_synthetic_coordinates())?;
     let anchor = anchor_for_schema(&coordinates, S::schema_hash());
-    let current_root = draft_root(&schema, &BTreeMap::new(), false)?;
+    let current_root = draft_root_from_field_roots(&schema, &BTreeMap::new())?;
     THREAD_DRAFT_STORAGE.with(|drafts| {
         drafts.borrow_mut().insert(
             anchor,
@@ -1000,14 +1063,16 @@ where
                 field
             )));
         }
-        state
-            .fields
-            .insert(field.to_string(), DraftFieldValue::Set(tree));
+        let root = draft_value_root(&tree)?;
+        state.fields.insert(
+            field.to_string(),
+            DraftFieldRuntime::Set { value: tree, root },
+        );
         state.ops.push(DraftOp::Set {
             field: field.to_string(),
             value: draft_value_from_serialize(value)?,
         });
-        state.current_root = draft_root(&state.schema, &state.fields, false)?;
+        state.current_root = state.recompose_root()?;
         Ok(state.current_root)
     })
 }
@@ -1041,13 +1106,25 @@ where
                 field
             )));
         }
+        // Hash the new element once, then move the frontier — O(log N). This
+        // used to re-Merkleize the entire accumulated list on every push, which
+        // dominated the host cost of a large draft.
+        let leaf = draft_value_root(&tree)?;
         match state.fields.entry(field.to_string()) {
             std::collections::btree_map::Entry::Vacant(entry) => {
-                entry.insert(DraftFieldValue::Append(vec![tree]));
+                let mut frontier = AppendFrontier::empty();
+                frontier.push(leaf);
+                entry.insert(DraftFieldRuntime::Append {
+                    values: vec![tree],
+                    frontier,
+                });
             }
             std::collections::btree_map::Entry::Occupied(mut entry) => match entry.get_mut() {
-                DraftFieldValue::Append(values) => values.push(tree),
-                DraftFieldValue::Set(_) => {
+                DraftFieldRuntime::Append { values, frontier } => {
+                    values.push(tree);
+                    frontier.push(leaf);
+                }
+                DraftFieldRuntime::Set { .. } => {
                     return Err(Error::Other(format!(
                         "Draft field '{}' is not appendable",
                         field
@@ -1059,7 +1136,7 @@ where
             field: field.to_string(),
             value: draft_value_from_serialize(value)?,
         });
-        state.current_root = draft_root(&state.schema, &state.fields, false)?;
+        state.current_root = state.recompose_root()?;
         Ok(state.current_root)
     })
 }
@@ -1257,7 +1334,9 @@ where
     S: Schema + DeserializeOwned + Serialize,
 {
     let state = take_draft_state(anchor, expected_root, "finalize")?;
-    let tree = build_draft_tree(&state.schema, &state.fields, true)?;
+    // Materializing the whole object here is correct and stays: it is O(N)
+    // once, which was never the problem.
+    let tree = build_draft_tree(&state.schema, &state.field_values(), true)?;
     let value = typed_value_from_tree::<S>(&tree).map_err(|error| {
         Error::Serialization(format!(
             "Failed to materialize finalized draft value: {}",
@@ -1278,7 +1357,7 @@ where
     S: Schema + DeserializeOwned + Serialize,
 {
     let state = take_draft_state(anchor, expected_root, "empty finalize")?;
-    let tree = build_draft_tree(&state.schema, &state.fields, false)?;
+    let tree = build_draft_tree(&state.schema, &state.field_values(), false)?;
     let value = typed_value_from_tree::<S>(&tree).map_err(|error| {
         if let Ok(Some(field)) = first_unset_set_once_field(&state.schema, &state.fields) {
             return Error::Other(format!(
