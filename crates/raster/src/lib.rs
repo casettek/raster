@@ -13,7 +13,25 @@ pub extern crate alloc;
 extern crate std;
 
 pub use raster_core as core;
+pub use raster_core::auth::AuthMode;
 pub use raster_core::draft;
+
+/// The authentication posture of this run. See
+/// `docs/proposals/unauthenticated-execution.md` §1.
+///
+/// `select!` and the sequence call bindings expand to a match on this, so it
+/// must resolve in both postures. Off the host there is no environment and no
+/// program entry point to read, and a guest replays a step that was recorded
+/// authenticated — so the guest answer is `Authenticated`, always.
+#[cfg(feature = "std")]
+pub fn auth_mode() -> AuthMode {
+    raster_runtime::auth::auth_mode()
+}
+
+#[cfg(not(feature = "std"))]
+pub fn auth_mode() -> AuthMode {
+    AuthMode::Authenticated
+}
 
 pub mod input;
 pub use input::{
@@ -22,16 +40,18 @@ pub use input::{
     index_binding_name, into_auth_ref, into_auth_value, into_auth_value_with_bindings, into_draft,
     materialize_auth_result, materialize_auth_return, new_draft, push_bound_index,
     raster_trace_payload, resolve_storage_ok_value, resolve_storage_value,
-    restore_draft_from_replay_handle, run_recur_chunked_list, run_recur_chunked_list_state,
+    inline_index, restore_draft_from_replay_handle, run_recur_chunked_list,
+    run_recur_chunked_list_state,
     run_recur_chunked_list_with_state, run_recur_list, run_recur_list_state,
     run_recur_list_with_state, run_recur_sequence_list, run_recur_sequence_list_state,
-    run_recur_sequence_list_with_state, select_source, select_stored_value, selector_path,
+    run_recur_sequence_list_with_state, select_inline, select_source, select_stored_value,
+    selector_path,
     serialize_draft_replay_handle, serialize_draft_trace, typed_selector_path, typed_storage,
     typed_storage_with_resolver, Anchor, AuthRef, AuthRefTrace, AuthValue, Block, Bytes, BytesPage,
     Draft,
     bytes_field_key, page_index_for_field, page_index_for_region, page_range_for_field,
     page_range_for_region, DraftAppendField, DraftSetField, IndexBinding, IndexSource, IndexWidth,
-    IntoAuthRef, BytesFieldPageSize, PageSized, RecurListSource,
+    InlineSelectSource, IntoAuthRef, BytesFieldPageSize, PageSized, RecurListSource,
     IntoAuthValue, IntoDraft, IntoMaterialized, IntoRecurControl, List, ListProofDirection,
     ListProofSibling, Materializable, Op, RecurControl, RecurInput, RecurOutput,
     RecurSequenceInput, RecurSequenceOutput, RecurSequenceState, RecurState, Schema, SchemaField,
@@ -424,11 +444,22 @@ pub mod __private {
         }
     }
 
+    /// Bind a tile's return value for the rest of the sequence.
+    ///
+    /// The `Serialize + DeserializeOwned` bounds are kept in both modes even
+    /// though the unauthenticated arm never uses them: dropping them would let
+    /// a program compile one way and not the other, and "develop
+    /// unauthenticated, commit authenticated" only works if the two modes
+    /// accept the same source.
     #[cfg(feature = "std")]
     pub fn bind_infallible_call<T>(result: T) -> crate::AuthRef<T>
     where
         T: serde::Serialize + serde::de::DeserializeOwned + 'static,
     {
+        if !crate::auth_mode().is_authenticated() {
+            return crate::AuthRef::Inline(result);
+        }
+
         #[cfg(feature = "profiling")]
         let output_store_start = profile_now();
         let reference = raster_runtime::store_execution_output_value(&result)
@@ -453,6 +484,13 @@ pub mod __private {
     where
         T: serde::Serialize + serde::de::DeserializeOwned + 'static,
     {
+        if !crate::auth_mode().is_authenticated() {
+            // The whole `Result` is what storage would hold, so the
+            // unauthenticated arm splits it here instead of behind
+            // `resolve_storage_ok_value`.
+            return result.map(crate::AuthRef::Inline);
+        }
+
         #[cfg(feature = "profiling")]
         let output_store_start = profile_now();
         let reference = raster_runtime::store_execution_output_value(&result)

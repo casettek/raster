@@ -954,7 +954,13 @@ impl<'de> serde::de::Visitor<'de> for BytesPageWireVisitor {
 pub struct Bytes<const PAGE_SIZE: u64> {
     byte_len: u64,
     page_size: u64,
-    pages: List<BytesPage>,
+    /// Public because `bytes_schema` already advertises `pages` as a struct
+    /// field (see [`bytes_schema`]), and generated `select!` code reaches it by
+    /// that name as a plain field access. Read-only in practice: the sibling
+    /// fields stay private, so a `Bytes` still cannot be built by struct
+    /// literal outside this module. [`Bytes::pages`] remains the authored
+    /// accessor.
+    pub pages: List<BytesPage>,
 }
 
 impl<const PAGE_SIZE: u64> Bytes<PAGE_SIZE> {

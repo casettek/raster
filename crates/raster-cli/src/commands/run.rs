@@ -46,6 +46,7 @@ pub fn run(
     commit_flag: Option<&str>,
     fraud_proof_config: Option<FraudProofConfig>,
     audit_flag: Option<&str>,
+    no_auth: bool,
     _verbose: bool,
     trace_format: TraceFormat,
     features: &[String],
@@ -141,10 +142,26 @@ pub fn run(
             profile_stream_path.display()
         );
     }
+
+    // Printed on every run, not just unauthenticated ones: a reader must never
+    // have to infer which mode produced the output in front of them.
+    if no_auth {
+        println!("Mode: unauthenticated (--no-auth) — results are not authoritative");
+    } else {
+        println!("Mode: authenticated");
+    }
     println!();
 
     let mut cmd = Command::new(&binary_path);
     cmd.current_dir(&project.root_dir);
+    // The mode belongs to the run, and this is where the run is launched — the
+    // same place the decision to commit is made. Always set explicitly: a bare
+    // `cargo run` defaults to unauthenticated, and the CLI must not inherit
+    // that silently. See `docs/proposals/unauthenticated-execution.md` §1.
+    cmd.env(
+        raster_runtime::auth::AUTH_ENV,
+        if no_auth { "0" } else { "1" },
+    );
     cmd.env(raster_runtime::TRACE_PATH_ENV, &trace_path);
     cmd.env(
         raster_runtime::TRACE_FORMAT_ENV,
@@ -251,6 +268,16 @@ pub fn run(
         println!("  {}", artifacts.run_dir.join("output.bin").display());
         println!("  {}", artifacts.run_dir.join("output.rindex").display());
         println!("  {}", output_manifest_path.display());
+    }
+
+    // An unauthenticated run installs no trace publisher, so there is no trace
+    // file to load and nothing for `--commit`/`--audit` to operate on — the
+    // interlock is the absence of the artifact, not a check on it. Reading the
+    // path here would just fail with a confusing "missing file".
+    if no_auth {
+        println!();
+        println!("no trace recorded (--no-auth)");
+        return Ok(());
     }
 
     let (mut trace, trace_recorder) =

@@ -1131,6 +1131,84 @@ where
     source.select(selector)
 }
 
+/// A `select!` base, seen by the unauthenticated arm.
+///
+/// The mirror of [`SelectSource`], which the two source forms — a sequence
+/// binding and an explicit `storage!` reference — both implement. Both must
+/// implement this too, or `select!` would stop compiling for one of them the
+/// moment the unauthenticated arm exists, regardless of which arm ever runs.
+pub trait InlineSelectSource {
+    type Current;
+
+    fn select_inline_with<Selected, F>(&self, select: F) -> AuthRef<Selected>
+    where
+        F: FnOnce(&Self::Current) -> Selected;
+}
+
+impl<Current> InlineSelectSource for AuthRef<Current> {
+    type Current = Current;
+
+    fn select_inline_with<Selected, F>(&self, select: F) -> AuthRef<Selected>
+    where
+        F: FnOnce(&Current) -> Selected,
+    {
+        match self {
+            AuthRef::Inline(value) => AuthRef::Inline(select(value)),
+            // Not mode leakage: this mode is about the values passed *between
+            // tiles*, and a storage-backed binding here is an external program
+            // input. `main`'s declared parameters are bound as
+            // `AuthRef::Storage` in both modes (see `entry_argument_auth_ref`)
+            // because they come from committed files rather than from a tile.
+            // Unauthenticated runs skip verifying those files (§8) but still
+            // read them, so resolve and apply the accessor. Resolving here also
+            // keeps external inputs lazy — the same point they materialize
+            // today.
+            AuthRef::Storage(binding) => {
+                let resolved = (binding.resolve.as_ref())(binding.reference.clone())
+                    .unwrap_or_else(|error| {
+                        panic!("Failed to resolve external input for select!: {}", error)
+                    });
+                AuthRef::Inline(select(&resolved.value))
+            }
+        }
+    }
+}
+
+impl<Root> InlineSelectSource for TypedStorageBinding<Root>
+where
+    Root: DeserializeOwned + Serialize,
+{
+    type Current = Root;
+
+    fn select_inline_with<Selected, F>(&self, select: F) -> AuthRef<Selected>
+    where
+        F: FnOnce(&Root) -> Selected,
+    {
+        // `storage!(T, reference)` names a storage coordinate outright, so it
+        // stays authenticated in either mode — the author asked for stored data
+        // by name. Resolve it, then apply the accessor in memory.
+        let resolved = (self.resolve)(self.reference.clone()).unwrap_or_else(|error| {
+            panic!("Failed to resolve storage! binding for select!: {}", error)
+        });
+        AuthRef::Inline(select(&resolved.value))
+    }
+}
+
+/// Apply a `select!` path as a plain Rust field access.
+///
+/// The unauthenticated counterpart of [`select_source`]. `select!` knows the
+/// path structurally at expansion time, so the accessor arrives here already
+/// lowered to real field and index expressions — nothing walks a
+/// [`SelectorPath`] at runtime, and a sequence binding is never serialized. See
+/// `docs/proposals/unauthenticated-execution.md` §5.1.
+pub fn select_inline<Source, Selected, F>(source: &Source, select: F) -> AuthRef<Selected>
+where
+    Source: InlineSelectSource,
+    F: FnOnce(&Source::Current) -> Selected,
+{
+    source.select_inline_with(select)
+}
+
 /// A value that may supply a `select!` index.
 ///
 /// Implemented only for `AuthRef<T>` with `T` an unsigned integer, which is what
@@ -1155,12 +1233,39 @@ pub trait IndexSource {
     /// index, making the shared-index case (the whole reason citations are
     /// content-named and deduplicated) unwritable.
     fn resolve_index(&self) -> raster_core::Result<(u64, TraceStorageData, Vec<IndexBinding>)>;
+
+    /// The index value alone, with no binding to record.
+    ///
+    /// The unauthenticated counterpart of [`Self::resolve_index`]. There is no
+    /// lineage to preserve in that mode, so the rule this trait exists to
+    /// enforce — an index must be an authorized value — protects nothing and is
+    /// suspended. See `docs/proposals/unauthenticated-execution.md` §5.3.
+    fn inline_index(&self) -> u64;
+}
+
+/// Read a `select!` index without authorizing it. Only reachable from the
+/// unauthenticated arm of `select!`.
+pub fn inline_index<I: IndexSource>(index: &I) -> u64 {
+    index.inline_index()
 }
 
 macro_rules! impl_index_source {
     ($($ty:ty => $width:ident),* $(,)?) => {$(
         impl IndexSource for AuthRef<$ty> {
             const WIDTH: IndexWidth = IndexWidth::$width;
+
+            fn inline_index(&self) -> u64 {
+                match self {
+                    AuthRef::Inline(value) => u64::from(*value),
+                    AuthRef::Storage(binding) => {
+                        let resolved = (binding.resolve.as_ref())(binding.reference.clone())
+                            .unwrap_or_else(|error| {
+                                panic!("Failed to resolve select! index: {}", error)
+                            });
+                        u64::from(resolved.value)
+                    }
+                }
+            }
 
             fn resolve_index(
                 &self,
@@ -2080,12 +2185,39 @@ where
     value.clone()
 }
 
+/// Refuse a construct that v1 of unauthenticated execution does not support.
+///
+/// `Draft<S>` threads set-once writes through a linear handle and
+/// `incremental-draft-witness` builds a per-step transition witness over it;
+/// the recur drivers carry progress commitments per iteration. Neither has a
+/// settled meaning with no storage behind it, so v1 rejects them rather than
+/// half-supporting them — a draft that silently loses its witness is worse than
+/// one that refuses to start. See
+/// `docs/proposals/unauthenticated-execution.md` §7.
+///
+/// Fires at first use rather than at startup: a runtime cannot know which
+/// constructs a program will reach. It still fires before any draft or
+/// iteration work happens, which is what the requirement is about.
+#[cfg(feature = "std")]
+fn reject_unauthenticated(construct: &str) {
+    if !crate::auth_mode().is_authenticated() {
+        panic!(
+            "`{construct}` requires authenticated execution, and this run is \
+             unauthenticated. Drafts and recur loops are out of scope for the \
+             first version of unauthenticated execution (see \
+             docs/proposals/unauthenticated-execution.md §7). Re-run \
+             authenticated: drop `--no-auth`, or set RASTER_AUTH=1."
+        );
+    }
+}
+
 pub fn new_draft<S>() -> Draft<S>
 where
     S: Schema,
 {
     #[cfg(feature = "std")]
     {
+        reject_unauthenticated("new!");
         let (anchor, current_root) = raster_runtime::create_draft::<S>().unwrap_or_else(|error| {
             panic!(
                 "Failed to create draft '{}': {}",
@@ -2167,6 +2299,8 @@ where
     Step: FnMut(RecurInput<T>, RecurOutput<S>) -> Output,
     Output: IntoRecurControl<RecurOutput<S>>,
 {
+    #[cfg(feature = "std")]
+    reject_unauthenticated("call_recur!");
     #[cfg(feature = "std")]
     {
         let cursor = ListCursor::open(&source)
@@ -2258,6 +2392,8 @@ where
     Output: IntoRecurControl<RecurOutput<S>>,
 {
     #[cfg(feature = "std")]
+    reject_unauthenticated("call_recur!");
+    #[cfg(feature = "std")]
     {
         let cursor = ListCursor::open(&source)
             .unwrap_or_else(|error| panic!("Failed to open recursive list source: {}", error));
@@ -2305,6 +2441,8 @@ where
     Output: IntoRecurControl<RecurState<State>>,
 {
     #[cfg(feature = "std")]
+    reject_unauthenticated("call_recur!");
+    #[cfg(feature = "std")]
     {
         let cursor = ListCursor::open(&source)
             .unwrap_or_else(|error| panic!("Failed to open recursive list source: {}", error));
@@ -2350,6 +2488,8 @@ where
     Step: FnMut(RecurInput<Block<T>>, RecurState<State>, RecurOutput<S>) -> Output,
     Output: IntoRecurControl<(RecurState<State>, RecurOutput<S>)>,
 {
+    #[cfg(feature = "std")]
+    reject_unauthenticated("call_recur!");
     #[cfg(feature = "std")]
     {
         let cursor = ListCursor::open(&source)
@@ -2403,6 +2543,8 @@ where
     Output: IntoRecurControl<RecurState<State>>,
 {
     #[cfg(feature = "std")]
+    reject_unauthenticated("call_recur!");
+    #[cfg(feature = "std")]
     {
         let cursor = ListCursor::open(&source)
             .unwrap_or_else(|error| panic!("Failed to open recursive list source: {}", error));
@@ -2449,6 +2591,8 @@ where
     Step: FnMut(RecurInput<T>, RecurState<State>, RecurOutput<S>) -> Output,
     Output: IntoRecurControl<(RecurState<State>, RecurOutput<S>)>,
 {
+    #[cfg(feature = "std")]
+    reject_unauthenticated("call_recur!");
     #[cfg(feature = "std")]
     {
         let cursor = ListCursor::open(&source)
@@ -2504,6 +2648,8 @@ where
     Output: Into<RecurSequenceOutput<S>>,
 {
     #[cfg(feature = "std")]
+    reject_unauthenticated("call_recur_seq!");
+    #[cfg(feature = "std")]
     {
         let cursor = ListCursor::open(&source).unwrap_or_else(|error| {
             panic!("Failed to open recursive sequence list source: {}", error)
@@ -2550,6 +2696,8 @@ where
     Output: Into<RecurSequenceState<State>>,
 {
     #[cfg(feature = "std")]
+    reject_unauthenticated("call_recur_seq!");
+    #[cfg(feature = "std")]
     {
         let cursor = ListCursor::open(&source).unwrap_or_else(|error| {
             panic!("Failed to open recursive sequence list source: {}", error)
@@ -2594,6 +2742,8 @@ where
     Step: FnMut(RecurSequenceInput<T>, RecurSequenceState<State>, RecurSequenceOutput<S>) -> Output,
     Output: Into<(RecurSequenceState<State>, RecurSequenceOutput<S>)>,
 {
+    #[cfg(feature = "std")]
+    reject_unauthenticated("call_recur_seq!");
     #[cfg(feature = "std")]
     {
         let cursor = ListCursor::open(&source).unwrap_or_else(|error| {

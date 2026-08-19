@@ -177,6 +177,13 @@ enum Commands {
         #[arg(long, conflicts_with = "commit")]
         audit: Option<String>,
 
+        /// Run without authenticated storage: tile outputs are passed as plain
+        /// Rust values, nothing is hashed or stored between tiles, and no trace
+        /// is written. Faster, and not authoritative — results cannot be
+        /// committed or audited. Drafts and recur loops are not supported yet.
+        #[arg(long = "no-auth", conflicts_with_all = ["commit", "audit"])]
+        no_auth: bool,
+
         /// Read and verify trace from file (mutually exclusive with --commit)
         #[arg(long)]
         verbose: bool,
@@ -378,6 +385,7 @@ fn try_main() -> Result<()> {
             commit,
             fraud_proof_config,
             audit,
+            no_auth,
             verbose,
             trace_format,
             features,
@@ -390,6 +398,7 @@ fn try_main() -> Result<()> {
             commit.as_deref(),
             fraud_proof_config,
             audit.as_deref(),
+            no_auth,
             verbose,
             trace_format,
             &features,

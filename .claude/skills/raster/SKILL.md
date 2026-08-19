@@ -590,7 +590,22 @@ termination, recur sequences, empty-input semantics) rather than improvising.
 
 Run in order; do not skip rungs. `cargo build` passing means nothing yet.
 
+**Rung 0 is not authoritative.** A plain `cargo run` executes the program with
+authenticated storage off: tile outputs are passed as ordinary Rust values,
+nothing is hashed or stored between tiles, and no trace is written — so nothing
+from it can be committed or audited. It is the fastest way to iterate on
+*logic*. A result that matters must be reproduced at rung 3 or above.
+
+The two modes agree on values for any type obeying RAS-203a (postcard
+round-trip is the identity); a disagreement is a violation of that rule, not a
+quirk of the mode — see the failure table below.
+
 ```bash
+# 0. Fastest iteration — plain Rust, no storage, no trace, not authoritative.
+#    Values match rung 3; storage bindings do not exist. Refuses `new!` and
+#    `call_recur!`/`call_recur_seq!` (not yet supported), and cannot commit.
+cargo run -- --input input.json --input-manifest input_manifest.json
+
 # 1. Both compilation postures (tiles must stay no_std-clean):
 cargo check
 cargo check -p <lib-crate> --no-default-features
@@ -600,7 +615,7 @@ cargo raster cfs && cat target/raster/cfs.json
 #    Red flag: an argument you meant as dataflow showing up as
 #    {"type": "external"} instead of seq_input/prior-output binding.
 
-# 3. Native run with committed inputs:
+# 3. Native run with committed inputs — the first authoritative rung:
 cargo raster run --input input.json --input-manifest input_manifest.json
 
 # 4. Commit/audit round-trip (the real verifiability test):
@@ -626,6 +641,8 @@ If any rung fails, map the failure back to a rule before touching code:
 | "requires a selectable storage list source" | `call_recur!` input not storage-backed (§7) |
 | set-once / finalize failure | draft reuse, double-set, or empty recur input (§6, §7) |
 | audit divergence with clean native run | nondeterminism in a tile (§3) |
+| rung 0 and rung 3 disagree on a value | a tile type whose postcard round-trip is not the identity — usually a `#[serde(skip)]` field, which authenticated mode clears between tiles and rung 0 carries through (RAS-203a) |
+| `` `new!` / `call_recur!` requires authenticated execution `` | rung 0 does not support drafts or recur yet — use rung 3 |
 | ProgramEnd error on return | `main` returning a non-storage-backed value (§8) |
 | run is unexpectedly slow / heavy | unnecessary materialization: whole-object selections, oversized tile outputs (§2) |
 | `call_recur! requires a raster-indexed List source` | recur source is a postcard external — re-declare it with `index_path` + `encoding = "raster"` (§7) |

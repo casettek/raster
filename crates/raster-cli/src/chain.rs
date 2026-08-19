@@ -869,6 +869,10 @@ fn build_and_run_stage(
     let started = Instant::now();
     let status = Command::new(&binary_path)
         .current_dir(&project.root_dir)
+        // Every stage of a chain run is committed today, so every stage is
+        // authenticated. Making cheap stages a chain-level option is separate
+        // work — see `docs/proposals/unauthenticated-execution.md` §10.
+        .env(raster_runtime::auth::AUTH_ENV, "1")
         .env(raster_runtime::TRACE_PATH_ENV, &trace_path)
         .env(
             raster_runtime::TRACE_FORMAT_ENV,

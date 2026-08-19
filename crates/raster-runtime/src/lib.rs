@@ -5,6 +5,7 @@
 //! - Optional execution tracing
 //! - Trace capture and storage
 
+pub mod auth;
 mod backing;
 mod entry_arguments;
 pub mod input;
