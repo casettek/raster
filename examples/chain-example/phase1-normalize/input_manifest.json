@@ -1,0 +1,4 @@
+{
+  "readings": { "type": "sha256", "encoding": "raster", "commitment": "3c15a8a65529dd56a5862a6687e2c2788e97e79f76cc994df50363fcc79fab6b" },
+  "threshold": { "type": "sha256", "encoding": "raster", "commitment": "3cb30ab8f7660969ea55a33a6b01487de74745b59deba49df5a7602edc98d952" }
+}

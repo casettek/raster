@@ -1,0 +1,34 @@
+# Chain manifest — the whole chain as a single "chain project".
+#
+# The Raster analogue of a Cargo *virtual workspace* manifest: a [chain] table
+# and no [program] table, so `cargo raster` treats this directory as a chain of
+# member programs run in order rather than as a single program. Run it from
+# this directory — the manifest is discovered from the current directory.
+#
+#   cargo raster chain run                          # authenticated, all stages
+#   cargo raster chain run --no-auth                # unattested, all stages
+#   cargo raster chain run --no-auth --stage aggregate   # just that stage
+#
+# Commitments below come from phase1-normalize's gen_input; regenerate with
+#   cargo run -p chain-stage-normalize --features gen-input --bin gen_input -- \
+#     examples/chain-example/phase1-normalize
+
+[chain]
+name = "chain-example"
+version = "0.1.0"
+
+[[chain.stage]]
+name = "normalize"
+project = "phase1-normalize"
+inputs.readings  = { external = { path = "phase1-normalize/measurements.rastered", index_path = "phase1-normalize/measurements.rindex", commitment = "3c15a8a65529dd56a5862a6687e2c2788e97e79f76cc994df50363fcc79fab6b" } }
+inputs.threshold = { external = { path = "phase1-normalize/threshold.rastered",    index_path = "phase1-normalize/threshold.rindex",    commitment = "3cb30ab8f7660969ea55a33a6b01487de74745b59deba49df5a7602edc98d952" } }
+
+[[chain.stage]]
+name = "aggregate"
+project = "phase2-aggregate"
+inputs.filtered = { from = "normalize" }
+
+[[chain.stage]]
+name = "report"
+project = "phase3-report"
+inputs.stats = { from = "aggregate" }

@@ -3,10 +3,12 @@
 Status: **partly implemented** (2026-08-21) — §2 (`latest`, `--run`), §3 (`--stage`,
 rehydration, the moved spec-validity check) and §4 (invalidation) have landed on the *existing*
 `--no-auth` surface: `cargo raster chain run --no-auth --stage <name> [--run <dir>]`, writing to
-`target/raster/chains-no-auth/`. **§1 has not landed.** Promoting the mode from a flag to a
-command, and the `chains-dry/` rename, are blocked on the naming question in §Open questions —
-which is not a preference but a conflict with a recorded decision (see below). The feature
-itself is independent of the name, so it was built first.
+`target/raster/chains-no-auth/`. Verified end-to-end on a real three-stage chain
+(`crates/raster-cli/tests/chain_stage_cli.rs`), for which this proposal also supplies the missing
+chain fixture `examples/chain-example` — see §Verification. **§1 has not landed.**
+Promoting the mode from a flag to a command, and the `chains-dry/` rename, are blocked on the
+naming question in §Open questions — which is not a preference but a conflict with a recorded
+decision (see below). The feature itself is independent of the name, so it was built first.
 Companion to: [`program-chain.md`](./program-chain.md) (partly implemented),
 [`unauthenticated-execution.md`](./unauthenticated-execution.md) (implemented)
 Depends on: `unauthenticated-execution.md` §6.1 — a cheap stage still produces a real
@@ -261,20 +263,41 @@ Steps 5 and 6 are the feature; 1–4 are what make it expressible.
 
 ## Verification
 
-- **Equivalence.** On `hello-tiles` (or the two-stage chain from `program-chain.md` §Verification):
-  a full `chain dry-run`, then `--stage <last>`, must leave the last stage's `output.bin`
-  byte-identical. Same for a middle stage on a three-stage chain, with the downstream stage re-run
-  afterwards.
-- **Rehydration is real.** After a full `chain dry-run`, delete a *middle* stage's `output.bin` and
-  confirm `--stage <its consumer>` fails with the §3 message rather than running against nothing.
-- **Invalidation.** `--stage` on stage 1 of a three-stage chain removes stages 2 and 3's
-  directories; `--stage` on the last stage removes nothing.
-- **`latest` does not drift.** Two full `chain dry-run`s, then `--stage` against the first via
-  `--run`; `latest` must still point at the second.
-- **Posture isolation.** No `--stage` invocation writes anything under `target/raster/chains/`, and
-  `chain audit` on a prior authenticated run is unaffected by any number of dry runs.
-- **Source change.** Edit a middle stage's tile, `--stage` it, confirm the new `output.bin` differs
-  and that no program-identity check fires (per §Facts — identity is not read in this mode).
+`program-chain.md`'s implementation order step 5 — an end-to-end multi-stage chain — was never
+done, and no chain fixture existed in this repo. So this proposal supplies one:
+**`examples/chain-example`**, a three-stage chain (`normalize → aggregate → report`) modelled on the
+`raster-pipeline` reference. Three stages is the minimum that expresses what per-stage execution
+is *for*: a **middle** stage re-run, and invalidation of **more than one** downstream stage. Two
+stages can express neither.
+
+It is a real raster program, not a harness: phase 1 filters with an output-building `call_recur!`,
+phase 2 folds with a state-only one, and phase 3 assembles its report **one line per tile call**
+through a `Draft<Report>` rather than building the whole thing inside a single tile — the shape
+the authoring rules exist to prevent.
+
+Landed as `crates/raster-cli/tests/chain_stage_cli.rs` (7 tests), driving the real CLI:
+
+- **Every link holds.** A whole-chain run leaves each stage's `input_manifest.json` commitment
+  equal to its producer's `output_manifest.json` commitment, across both links.
+- **Equivalence — the claim the feature rests on.** A full run, then `--stage report` alone,
+  produces a byte-identical `output.bin`. If rehydration fed the stage anything other than the
+  producer's committed bytes, this is where it shows.
+- **A middle stage** rehydrates from the stage before it, invalidates exactly `report`, leaves
+  `normalize` untouched, and reproduces its own output.
+- **The first stage invalidates every later stage**, not merely the next one — announced as
+  `invalidating 2 downstream stages: aggregate, report`.
+- **Stage-by-stage rebuild converges.** Re-running stage 1, then 2, then 3 lands on the same final
+  digest the whole-chain run produced. This is what makes per-stage execution a shortcut rather
+  than a second execution semantics.
+- **The missing-producer error names the fix**, and **`--stage` needs a prior run** rather than
+  minting an empty directory to fail inside.
+
+Unit coverage in `chain.rs` (13 tests) takes the pieces in isolation: `validate_spec` ordering,
+the rehydrated-commitment→manifest path, invalidation bounds, `latest` round-trip including the
+text fallback, and run-directory resolution.
+
+Not covered: posture isolation (no `--stage` invocation touching `target/raster/chains/`), still
+argued structurally from the separate roots rather than tested.
 
 ## Open questions
 
