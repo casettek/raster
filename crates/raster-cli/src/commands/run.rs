@@ -36,6 +36,7 @@ use raster_prover::transition::{step_transitions, StepIo};
 use raster_runtime::TraceRecorder;
 
 use crate::commands::create_run_artifacts;
+use crate::runtime_env::RuntimeEnv;
 use crate::utils::authorization::build_manifested_inputs;
 use crate::{BackendType, TraceFormat};
 
@@ -132,7 +133,7 @@ pub fn run(
     println!("  Run ID: {}", artifacts.run_id);
     println!("  Run artifacts dir: {}", artifacts.run_dir.display());
     println!("  Trace path: {}", trace_path.display());
-    if profiling_enabled(features, all_features) {
+    if profiling_enabled(features, all_features) && !no_auth {
         println!(
             "  Expected live profile stream: {}",
             profile_stream_path.display()
@@ -155,27 +156,19 @@ pub fn run(
     let mut cmd = Command::new(&binary_path);
     cmd.current_dir(&project.root_dir);
     // The mode belongs to the run, and this is where the run is launched — the
-    // same place the decision to commit is made. Always set explicitly: a bare
-    // `cargo run` defaults to unauthenticated, and the CLI must not inherit
-    // that silently. See `docs/proposals/unauthenticated-execution.md` §1.
-    cmd.env(
-        raster_runtime::auth::AUTH_ENV,
-        if no_auth { "0" } else { "1" },
-    );
-    cmd.env(raster_runtime::TRACE_PATH_ENV, &trace_path);
-    cmd.env(
-        raster_runtime::TRACE_FORMAT_ENV,
-        trace_format.as_runtime_str(),
-    );
-    cmd.env(raster_runtime::PROFILE_PATH_ENV, &profile_path);
-    cmd.env(
-        raster_runtime::PROFILE_STREAM_PATH_ENV,
-        &profile_stream_path,
-    );
-    cmd.env(raster_runtime::PROFILE_RUN_ID_ENV, &artifacts.run_id);
-    // Where a program that returns a value writes its output artifact
-    // (`output.bin` / `output.rindex` / `output_manifest.json`).
-    cmd.env(raster_runtime::OUTPUT_DIR_ENV, &artifacts.run_dir);
+    // same place the decision to commit is made. Which of the two shapes gets
+    // built is the whole statement of the mode; `RuntimeEnv` writes
+    // `RASTER_AUTH` from it, so nothing here can set a trace or a profile on a
+    // run that would refuse one. See `crate::runtime_env`.
+    let runtime_env = RuntimeEnv::new(&artifacts.run_dir);
+    if no_auth {
+        runtime_env.apply(&mut cmd);
+    } else {
+        runtime_env
+            .authenticated(&trace_path, trace_format)
+            .profiling(&artifacts)
+            .apply(&mut cmd);
+    }
     if let Some(input_json) = input {
         cmd.args(["--input", input_json]);
     }

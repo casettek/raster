@@ -656,6 +656,20 @@ pub(crate) fn gen_recur_driver_function(
 
             #[cfg(all(feature = "std", not(target_arch = "riscv32")))]
             {
+                // Unauthenticated: run the loop and nothing else. The trace
+                // machinery around it is not inline-safe and has no reader —
+                // `recur_source_trace` rejects a non-storage source, and the
+                // output half calls `AuthRef::reference()`, which panics on an
+                // inline binding. See
+                // `docs/proposals/unauthenticated-execution.md` §7.
+                if !::raster::auth_mode().is_authenticated() {
+                    let __raster_recur_trace_scope =
+                        ::raster::__private::RecurTraceScopeGuard::enter();
+                    let result = #run_driver;
+                    drop(__raster_recur_trace_scope);
+                    return result;
+                }
+
                 // A recur source is traced through its authenticated list
                 // metadata, never by resolving it: `auth_ref_trace` would
                 // materialize the whole list here, before any runner runs.
@@ -1036,6 +1050,16 @@ pub(crate) fn gen_recur_sequence_driver_function(
 
             #[cfg(all(feature = "std", not(target_arch = "riscv32")))]
             {
+                // See the recur-tile driver above: unauthenticated runs the
+                // loop only, because the trace half is not inline-safe.
+                if !::raster::auth_mode().is_authenticated() {
+                    let __raster_recur_trace_scope =
+                        ::raster::__private::RecurTraceScopeGuard::enter();
+                    let result = #run_driver;
+                    drop(__raster_recur_trace_scope);
+                    return result;
+                }
+
                 let __raster_input_trace = ::raster::auth_ref_trace(&input)
                     .unwrap_or_else(|e| panic!("Failed to build recur sequence input trace: {}", e));
                 let __raster_input_bytes = ::raster::core::postcard::to_allocvec(&__raster_input_trace.value)

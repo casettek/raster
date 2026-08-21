@@ -602,8 +602,8 @@ quirk of the mode — see the failure table below.
 
 ```bash
 # 0. Fastest iteration — plain Rust, no storage, no trace, not authoritative.
-#    Values match rung 3; storage bindings do not exist. Refuses `new!` and
-#    `call_recur!`/`call_recur_seq!` (not yet supported), and cannot commit.
+#    Whole surface including drafts and recur; values match rung 3, but storage
+#    bindings do not exist and nothing here can be committed. ~6x on the example.
 cargo run -- --input input.json --input-manifest input_manifest.json
 
 # 1. Both compilation postures (tiles must stay no_std-clean):
@@ -642,7 +642,6 @@ If any rung fails, map the failure back to a rule before touching code:
 | set-once / finalize failure | draft reuse, double-set, or empty recur input (§6, §7) |
 | audit divergence with clean native run | nondeterminism in a tile (§3) |
 | rung 0 and rung 3 disagree on a value | a tile type whose postcard round-trip is not the identity — usually a `#[serde(skip)]` field, which authenticated mode clears between tiles and rung 0 carries through (RAS-203a) |
-| `` `new!` / `call_recur!` requires authenticated execution `` | rung 0 does not support drafts or recur yet — use rung 3 |
 | ProgramEnd error on return | `main` returning a non-storage-backed value (§8) |
 | run is unexpectedly slow / heavy | unnecessary materialization: whole-object selections, oversized tile outputs (§2) |
 | `call_recur! requires a raster-indexed List source` | recur source is a postcard external — re-declare it with `index_path` + `encoding = "raster"` (§7) |

@@ -951,15 +951,18 @@ impl<'de> serde::de::Visitor<'de> for BytesPageWireVisitor {
 /// Page size is a type parameter so `select!` can convert literal byte offsets
 /// to page indices without type-level information the proc macro does not have.
 #[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// Every field is public because [`bytes_schema`] advertises all three as
+/// struct fields, so `select!` may name any of them and its unauthenticated arm
+/// reaches them as plain field accesses — code that is *emitted* whatever the
+/// mode, so a private field is a compile error rather than a runtime one.
+/// (v2 published only `pages`, which is the one `hello-tiles` selects;
+/// `input-embedding` selects `values.page_size` and did not build.) Read-only
+/// in practice: the accessors below stay the authored way in, and every
+/// constructor is here, so a `Bytes` still cannot be built by struct literal
+/// outside this module.
 pub struct Bytes<const PAGE_SIZE: u64> {
-    byte_len: u64,
-    page_size: u64,
-    /// Public because `bytes_schema` already advertises `pages` as a struct
-    /// field (see [`bytes_schema`]), and generated `select!` code reaches it by
-    /// that name as a plain field access. Read-only in practice: the sibling
-    /// fields stay private, so a `Bytes` still cannot be built by struct
-    /// literal outside this module. [`Bytes::pages`] remains the authored
-    /// accessor.
+    pub byte_len: u64,
+    pub page_size: u64,
     pub pages: List<BytesPage>,
 }
 

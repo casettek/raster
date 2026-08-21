@@ -40,7 +40,7 @@ pub use input::{
     index_binding_name, into_auth_ref, into_auth_value, into_auth_value_with_bindings, into_draft,
     materialize_auth_result, materialize_auth_return, new_draft, push_bound_index,
     raster_trace_payload, resolve_storage_ok_value, resolve_storage_value,
-    inline_index, restore_draft_from_replay_handle, run_recur_chunked_list,
+    inline_index, is_storage_backed, restore_draft_from_replay_handle, run_recur_chunked_list,
     run_recur_chunked_list_state,
     run_recur_chunked_list_with_state, run_recur_list, run_recur_list_state,
     run_recur_list_with_state, run_recur_sequence_list, run_recur_sequence_list_state,

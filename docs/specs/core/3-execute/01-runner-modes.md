@@ -159,12 +159,16 @@ encodes, hashes and stores each tile output and resolves it back for the consumi
   "cannot produce a trace commitment" structural rather than a check.
 - skips the integrity check on external inputs (the manifest is still read for its `encoding`);
 - refuses profiling, because a profile of it measures a program without the storage costs;
-- refuses `Draft<S>`, `call_recur!` and `call_recur_seq!` — out of scope for v1.
+- supports the whole authoring surface, drafts and recur included: a draft keeps its field
+  values and drops its commitments, and a recur source that came from storage stays lazy.
 
 The mode resolves once per process, and is then fixed:
 
 1. `RASTER_AUTH` (`1`/`on` or `0`/`off`), if set — always wins. `cargo raster run` sets it
-   explicitly on every run, and `--no-auth` selects `0`.
+   explicitly on every run, and `--no-auth` selects `0`. `cargo raster chain run` sets it the
+   same way for every stage it launches; its own `--no-auth` runs the whole chain
+   unauthenticated, which means no per-stage `commit.bin` and no chain-commitment. Stages still
+   link through their `output.bin`, whose bytes and structural root do not depend on the mode.
 2. otherwise `Unauthenticated`, if `raster::init()` ran.
 3. otherwise `Authenticated`.
 

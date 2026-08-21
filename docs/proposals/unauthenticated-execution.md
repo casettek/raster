@@ -1,17 +1,28 @@
 # Proposal: `unauthenticated-execution` — run a Raster program as plain Rust, with authenticated storage off
 
-Status: **v1 implemented** (2026-08-19)
+Status: **implemented** — v1 2026-08-19 (tiles, sequences, `select!`), v2 2026-08-20 (drafts,
+recur, provenance dispatch), v3 2026-08-20 (`chain run --no-auth` §10; inline dynamic index on a
+storage-backed base §5.3)
+
+**Measured on `examples/hello-tiles`** (release, median of 15 runs, whole process):
+unauthenticated **1.67 ms** vs authenticated **11.07 ms** — **6.6×**. Small program, so read it
+as the shape of the saving rather than a figure that generalizes; what it removes is per-value
+hashing and storage round-trips, which scale with the number of inter-tile values, not with the
+work inside tiles.
 
 Implementation notes, where the code corrected the design:
 
 - **A storage-backed `AuthRef` is not mode leakage** (§5.4). `main`'s declared parameters are
   bound as `AuthRef::Storage` in *both* modes (`entry_argument_auth_ref`,
   `crates/raster/src/input.rs:791`) because they come from committed files rather than from a
-  tile. The unauthenticated arm resolves them, which also keeps external inputs lazy. The mode is
-  about values passed *between tiles*; it was never about the program's boundary.
+  tile. The mode is about values passed *between tiles*; it was never about the program's
+  boundary. v1 resolved such a base eagerly at each `select!`; v2 keeps it storage-backed
+  instead, which is both lazier and what makes recur work.
 - **`storage!` works** rather than being the limitation §5 predicted, for the same reason.
-- **Drafts and recur are refused at first use, not at startup** (§7) — a runtime cannot know
-  which constructs a program will reach. Still before any draft or iteration work happens.
+- **The `--no-auth` CLI flag needed the profile env made conditional.** The runtime refuses
+  profiling in this mode, but `cargo raster run` set `RASTER_PROFILE_*` unconditionally as
+  plumbing, so every `--no-auth` run aborted. Fixed by only requesting a profile when the run can
+  produce a meaningful one.
 - **`Bytes::pages` became a public field** (`crates/raster-core/src/collections.rs`), because
   `bytes_schema` already advertises `pages` as a struct field and generated accessor code reaches
   it by that name. Read-only in practice: the sibling fields stay private.
@@ -204,9 +215,14 @@ rule holds for all nine storage-exercising files under `crates/raster/tests/` wi
 any of them — four already enter via `init_with` (`dynamic_index_selection`, `paged_bytes`,
 `external_selection`, `recur_draft`), and the rest never call an init at all.
 
-`cargo raster run` sets `RASTER_AUTH=1` alongside the env it already sets at
-`crates/raster-cli/src/commands/run.rs:148`–`:161`, and `RASTER_AUTH=0` when `--no-auth` is
-passed. `cargo raster chain run` sets `RASTER_AUTH=1` (see §10).
+`cargo raster run` sets `RASTER_AUTH=1` alongside the rest of the runtime env, and
+`RASTER_AUTH=0` when `--no-auth` is passed. `cargo raster chain run` sets `RASTER_AUTH=1` (see
+§10). Both go through `crates/raster-cli/src/runtime_env.rs`, the only place in the CLI that
+writes the runtime env vars: `RuntimeEnv` is the unauthenticated shape and `AuthenticatedEnv` —
+reachable only via `RuntimeEnv::authenticated` — is the one that carries a trace destination and
+an optional profile. `RASTER_AUTH` is written from which of the two a launch site built, so the
+mode cannot disagree with the artifacts requested alongside it, and §6's "no publisher under
+`=0`" holds because the unauthenticated shape has nowhere to put a trace path.
 
 Two consequences worth stating:
 
@@ -297,23 +313,58 @@ there is no lineage to break. So the unauthenticated arm accepts a plain integer
 unauthenticated can use an index the authenticated mode rejects, and will fail the first time it
 is run for commitment.
 
-#### 5.4 A storage-backed base is legitimate, and resolves
+**Amended v3: the suspension has to live in `push_bound_index`, not only in the accessor arm.**
+v2 read "the unauthenticated arm" as the accessor arm of §5.4, which left the combination neither
+section owned: a **storage-backed base indexed by a tile-produced value**. §5.4 keeps such a base
+on selector lowering — correctly, that is what makes it lazy — so the index reaches
+`push_bound_index` and was rejected there as an inline value, aborting the run. It is not a
+corner case: it is what a scan-with-a-hashed-bucket looks like, so the first real program tried
+in this mode (`raster-chain-inference`'s `prompt_prepare`, `select!(MergeBucket,
+merge_buckets[bucket_idx])`) hit it on stage 1.
 
-Two `select!` bases are storage-backed in *both* modes, and neither is mode leakage:
+`push_bound_index` (`crates/raster/src/input.rs`) now returns a plain `SelectorSegment::Index`
+and records no binding when unauthenticated, using the `IndexSource::inline_index` the accessor
+arm already had. Nothing else needed to change: `Index` is the segment a recur iteration already
+uses, and a `BoundIndex` names a sibling binding for a verifier that this mode never runs. The
+guest's `auth_mode()` is `Authenticated` unconditionally (§1), so a replayed step cannot reach
+the new arm, and `cargo test` is authenticated, so `dynamic-index-selection`'s rule is still
+asserted where it applies. Verified on `prompt_prepare`: `output.bin` and `output.rindex` are
+byte-identical to the authenticated run, same structural root.
+
+#### 5.4 Dispatch is on the base's provenance, not on the mode
+
+Revised in v2. v1 sent every `select!` in an unauthenticated run down the accessor arm, which
+meant a storage-backed base was **resolved eagerly at every step** — materializing its parent
+each time. That is both slower than the authenticated path and fatal at scale.
+
+The rule is:
+
+```
+authenticated                     → selector lowering (an inline base still panics: no lineage)
+unauthenticated, storage base     → selector lowering
+unauthenticated, inline base      → accessor lowering
+```
+
+Two `select!` bases are storage-backed in *both* modes:
 
 - **`main`'s declared parameters.** `entry_argument_auth_ref`
   (`crates/raster/src/input.rs:791`) always builds an `AuthRef::Storage`, because an external
   input comes from a committed file, not from a tile.
 - **`storage!(T, reference)`**, which names a storage coordinate outright.
 
-Both resolve, then apply the accessor in memory. That is the correct reading of the mode: it
-governs the values passed *between tiles*, not how the program's inputs arrive. Resolving at the
-`select!` also preserves laziness — the same point external inputs materialize today, which
-matters for mmap'd regions that must not be pulled in whole.
+Both keep composing a selector, so a chain of selections stays lazy and materializes once at the
+tile boundary — exactly as authenticated mode does. This is the correct reading of the mode: it
+governs the values passed *between tiles*, not how the program's inputs arrive. It is also what
+makes recur work, since `call_recur!` requires a raster-indexed source and would otherwise be
+handed an inline list (§7).
 
-Implementation note: this is why both base forms implement an `InlineSelectSource` trait
-mirroring `SelectSource`. Without it `select!` would stop compiling for `storage!` bases the
-moment the second arm existed, regardless of which arm ever ran.
+The mode check stays in front of the provenance check so that an inline base in an
+*authenticated* run still reaches `SelectSource`'s panic: an inline value has no lineage, and
+that rule is not this proposal's to relax.
+
+Implementation note: both base forms implement an `InlineSelectSource` trait mirroring
+`SelectSource`, carrying `is_storage_backed`. Without it `select!` would stop compiling for
+`storage!` bases the moment the second arm existed, regardless of which arm ever ran.
 
 ### 6. No trace, therefore no trace commitment
 
@@ -369,21 +420,46 @@ So an unauthenticated run under `cargo raster run` still writes `output.bin` / `
 `output_manifest.json` when `RASTER_OUTPUT_DIR` is set. This is deliberate and load-bearing for
 §10: a cheap stage that produces a real output artifact is the primitive the chain work needs.
 
-### 7. Out of scope for v1: `Draft<S>` and recur
+### 7. `Draft<S>` and recur (v2)
 
-`Draft<S>` (`crates/raster/src/input.rs:44`) is a linear handle threading set-once writes, and
-`incremental-draft-witness.md` (implemented) builds a per-step transition witness over it.
-`restore_draft_from_replay_handle` (`:628`) and the recur drivers (`run_recur_list` and its eight
-siblings, `:2159`–`:2634`) have no obvious unauthenticated meaning — a draft with no storage is
-just `S` being mutated, which is *simpler*, but the witness machinery around it is not.
+v1 refused both. v2 supports them, and `examples/hello-tiles` now runs end to end in either
+mode with identical values.
 
-v1 rejects them: a program using `new!`, `call_recur!` or `call_recur_seq!` fails at startup with
-a message naming the construct and telling the author to run authenticated. **Failing loudly at
-the top is the requirement** — a half-working draft here is worse than no mode at all.
+**A draft keeps its field map and drops its commitments.** `DraftRuntimeState`
+(`crates/raster-runtime/src/storage.rs`) holds a per-field `TreeValue` map plus a running root.
+Unauthenticated drafts keep the map — it is what `finalize` materializes from — and skip the
+per-value root, the root recomposition, the `DraftOp` log (replay only) and the append
+frontier's per-push hash. That is the SHA-256-per-op `incremental-draft-witness` was written to
+reduce, now not paid at all.
 
-The recur drivers write storage only through the step tile's own `bind_*_call`, so extending to
-them later is mostly a question of what a `Draft` *means* with no storage, not of finding more
-write sites.
+What remains is one serialize per `set`/`push` and one deserialize at `finalize`. A typed
+`Schema::Partial` generated by `derive(Selectable)` would remove those too, at the cost of an
+associated type on a trait every `Selectable` type implements. Deferred deliberately: see §12
+for the measurement that would have to justify it.
+
+**Set-once and empty-finalize rules are shared, not reimplemented.** Both modes route through
+`finalize_draft_value`, so the two can only disagree about commitments, never about whether a
+draft was validly built.
+
+**The transition witness has one off switch.** `begin_draft_transition_capture`
+(`crates/raster/src/input.rs`) returns `None` when unauthenticated; the tile macro already
+threads it through `Option::and_then`, so the witness disappears with no codegen change.
+
+**Recur needed almost nothing** — because §5's provenance rule keeps a recur source
+storage-backed, `ListCursor::open` reaches its existing lazy indexed path unchanged. Two things
+were added:
+
+- `ListCursor` gained an `Inline` variant, so recur over a *tile-produced* list works. It hands
+  out items through their postcard encoding rather than `Clone`, which would otherwise have to
+  be bounded on every recur element type across the nine `run_recur_*` signatures and out to
+  `call_recur!`. Not extra cost relative to the storage path, which deserializes per item anyway.
+- The recur macro's trace emission is gated on the mode. It was not inline-safe:
+  `recur_source_trace` rejects a non-storage source, and the output half calls
+  `AuthRef::reference()`, which panics on an inline binding.
+
+**`main` returning an inline value is accepted.** `end_program_output` required a storage-backed
+result — a statement about lineage that an unauthenticated run cannot make. It now writes the
+output artifact directly (§6.1) and publishes no `ProgramEnd`, there being no trace.
 
 ### 8. External inputs
 
@@ -456,23 +532,36 @@ rules in `authoring-skill-and-tooling.md` §3, not here.
 
 ### 10. Chains are a separate proposal
 
-`cargo raster chain run` today commits every stage, so it sets `RASTER_AUTH=1` and is otherwise
-untouched by this proposal.
+**Amended v3 (2026-08-20): `cargo raster chain run --no-auth` landed — the dev loop, not the
+policy.** The flag is all-or-nothing: every stage runs unauthenticated, no stage writes a
+`commit.bin`, and no chain-commitment is written, so the §6 interlock holds one level up — a
+chain that recorded no trace has nothing to build a checkpoint from. Unauthenticated runs go to
+`target/raster/chains-no-auth/` rather than `target/raster/chains/`, so `chain audit`'s
+"most recent run" discovery can never land on a directory with no commitment in it.
 
-The direction it unlocks — recorded here so the dependency is visible, and deliberately **not**
-designed here — is to stop paying for commitment on stages nobody is disputing: run the chain's
-stages cheaply to produce their output artifacts, and enter commitment mode only for the stage
-whose output is contested. That turns per-stage commitment from a fixed cost of running a chain
-into a cost paid on demand.
+Two things made it small. Stage linking is untouched: `collect_output` recomputes a produced
+stage's structural root from `output.bin` host-side, in either mode, so `synthesize_inputs` feeds
+the next stage the same bytes and the same commitment — verified on `hello-tiles`, whose
+`output.bin` / `output.rindex` / `output_manifest.json` are byte-identical under `RASTER_AUTH=0`
+and `RASTER_AUTH=1`. And the downstream stage does not need that commitment to be *checked*,
+because §8 already skips the comparison unauthenticated. Program identity is read only for
+checkpoints, so the pre-run identity fail-fast is skipped too — otherwise the mode would refuse
+to run in exactly the case it exists for, a source change whose `Raster.lock` has not been
+rebuilt.
 
-Two things this proposal deliberately provides for it, and nothing more:
+What is still **not** designed here, and remains the separate proposal's:
 
-- a stage execution that is cheap (§3–§5), and
-- an output artifact that a cheap stage still produces, so it can feed the next stage (§6.1).
+- stop paying for commitment on stages nobody is disputing — run the chain's stages cheaply to
+  produce their output artifacts, and enter commitment mode only for the stage whose output is
+  contested, turning per-stage commitment from a fixed cost into a cost paid on demand;
+- how a contested stage is identified, what a chain commitment means when its stages were run at
+  different postures, and whether a mixed chain is a coherent object at all.
 
-Everything else that idea needs — how a contested stage is identified, what a chain commitment
-means when its stages were run at different postures, whether a mixed chain is a coherent object
-at all — is chain-level policy and belongs with `program-chain.md` / `chain-fraud-proof.md`.
+`--no-auth` deliberately does not approach any of that: it produces no commitment for anything,
+which is the one posture that needs no answer to those questions. What this proposal provides
+for the mixed case, and nothing more, is a stage execution that is cheap (§3–§5) and an output
+artifact that a cheap stage still produces so it can feed the next stage (§6.1). The rest is
+chain-level policy and belongs with `program-chain.md` / `chain-fraud-proof.md`.
 
 ### 11. Documentation requirements
 

@@ -3611,32 +3611,36 @@ pub fn select(item: TokenStream) -> TokenStream {
     TokenStream::from(quote! {
         {
             let #base_ident = #base_expr;
-            // A process-lifetime flag, so this predicts perfectly and both arms
-            // stay monomorphic. See
-            // `docs/proposals/unauthenticated-execution.md` §5.1.
-            match ::raster::auth_mode() {
-                ::raster::AuthMode::Authenticated => {
-                    #[allow(unused_mut)]
-                    let mut __raster_index_bindings:
-                        ::raster::alloc::vec::Vec<::raster::IndexBinding> =
-                        ::raster::alloc::vec::Vec::new();
-                    let __raster_selector_segments = ::raster::alloc::vec![#(#segments),*];
-                    ::raster::attach_index_bindings(
-                        ::raster::select_source(
-                            #base_ident,
-                            ::raster::typed_selector_path::<_, #selected_ty>(
-                                ::raster::SelectorPath::new(__raster_selector_segments),
-                            ),
+            // Dispatch on the base's *provenance*, not the mode. A
+            // storage-backed base keeps composing a selector even with
+            // authentication off, so a large external region is read by indexed
+            // lookup at the tile boundary rather than materialized at every
+            // step. The mode check stays in front of it so that an inline base
+            // in an authenticated run still reaches `SelectSource`'s panic: an
+            // inline value has no lineage, and that rule is not this mode's to
+            // relax. See `docs/proposals/unauthenticated-execution.md` §5.
+            if ::raster::auth_mode().is_authenticated()
+                || ::raster::is_storage_backed(&#base_ident)
+            {
+                #[allow(unused_mut)]
+                let mut __raster_index_bindings:
+                    ::raster::alloc::vec::Vec<::raster::IndexBinding> =
+                    ::raster::alloc::vec::Vec::new();
+                let __raster_selector_segments = ::raster::alloc::vec![#(#segments),*];
+                ::raster::attach_index_bindings(
+                    ::raster::select_source(
+                        #base_ident,
+                        ::raster::typed_selector_path::<_, #selected_ty>(
+                            ::raster::SelectorPath::new(__raster_selector_segments),
                         ),
-                        __raster_index_bindings,
-                    )
-                }
-                ::raster::AuthMode::Unauthenticated => {
-                    ::raster::select_inline::<_, #selected_ty, _>(
-                        &#base_ident,
-                        |__raster_inline_value| #inline_accessor,
-                    )
-                }
+                    ),
+                    __raster_index_bindings,
+                )
+            } else {
+                ::raster::select_inline::<_, #selected_ty, _>(
+                    &#base_ident,
+                    |__raster_inline_value| #inline_accessor,
+                )
             }
         }
     })

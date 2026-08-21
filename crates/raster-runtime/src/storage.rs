@@ -335,6 +335,20 @@ fn first_unset_set_once_field<'a>(
     Ok(None)
 }
 
+/// Stand-in root for a draft in an unauthenticated run.
+///
+/// The root is a commitment, and an unauthenticated run computes none — but
+/// `Draft<S>` still threads a `[u8; 32]` from op to op, and the trace-facing
+/// mismatch checks compare against it. Rather than make the field optional
+/// through every signature, the mode uses one fixed value and skips the
+/// comparisons. See `docs/proposals/unauthenticated-execution.md` §7.
+const UNAUTHENTICATED_DRAFT_ROOT: [u8; 32] = [0u8; 32];
+
+/// Whether draft operations should compute and check commitments.
+fn drafts_are_authenticated() -> bool {
+    crate::auth::auth_mode().is_authenticated()
+}
+
 fn take_draft_state(
     anchor: &Anchor,
     expected_root: &[u8; 32],
@@ -345,7 +359,7 @@ fn take_draft_state(
         let state = drafts
             .remove(anchor)
             .ok_or_else(|| Error::Other("Unknown draft anchor".into()))?;
-        if state.current_root != *expected_root {
+        if drafts_are_authenticated() && state.current_root != *expected_root {
             return Err(Error::Other(format!(
                 "Draft root mismatch during {}: expected {:?}, found {:?}",
                 operation, expected_root, state.current_root
@@ -953,7 +967,14 @@ where
     let coordinates = THREAD_SEQUENCE_CONTEXT
         .with(|context| context.borrow_mut().reserve_synthetic_coordinates())?;
     let anchor = anchor_for_schema(&coordinates, S::schema_hash());
-    let current_root = draft_root_from_field_roots(&schema, &BTreeMap::new())?;
+    // The anchor is kept in both modes — it is the draft's identity in the
+    // thread-local map, and reserving a coordinate is O(1). Only the root is
+    // skipped.
+    let current_root = if drafts_are_authenticated() {
+        draft_root_from_field_roots(&schema, &BTreeMap::new())?
+    } else {
+        UNAUTHENTICATED_DRAFT_ROOT
+    };
     THREAD_DRAFT_STORAGE.with(|drafts| {
         drafts.borrow_mut().insert(
             anchor,
@@ -1044,12 +1065,15 @@ where
         let state = drafts
             .get_mut(anchor)
             .ok_or_else(|| Error::Other("Unknown draft anchor".into()))?;
-        if state.current_root != *expected_root {
+        let authenticated = drafts_are_authenticated();
+        if authenticated && state.current_root != *expected_root {
             return Err(Error::Other(format!(
                 "Draft root mismatch for field '{}': expected {:?}, found {:?}",
                 field, expected_root, state.current_root
             )));
         }
+        // Schema and set-once checks run in both modes: they are the draft's
+        // semantics, not its authentication.
         let schema_field = locate_schema_field(&state.schema, field)?;
         if schema_field.mode != SchemaFieldMode::SetOnce {
             return Err(Error::Other(format!(
@@ -1062,6 +1086,19 @@ where
                 "Draft field '{}' can only be written once",
                 field
             )));
+        }
+        if !authenticated {
+            // The field value is what `finalize` materializes from, so it is
+            // kept. The per-value root, the op log (replay only) and the root
+            // recomposition are all commitment work with no reader here.
+            state.fields.insert(
+                field.to_string(),
+                DraftFieldRuntime::Set {
+                    value: tree,
+                    root: UNAUTHENTICATED_DRAFT_ROOT,
+                },
+            );
+            return Ok(UNAUTHENTICATED_DRAFT_ROOT);
         }
         let root = draft_value_root(&tree)?;
         state.fields.insert(
@@ -1093,7 +1130,8 @@ where
         let state = drafts
             .get_mut(anchor)
             .ok_or_else(|| Error::Other("Unknown draft anchor".into()))?;
-        if state.current_root != *expected_root {
+        let authenticated = drafts_are_authenticated();
+        if authenticated && state.current_root != *expected_root {
             return Err(Error::Other(format!(
                 "Draft root mismatch for field '{}': expected {:?}, found {:?}",
                 field, expected_root, state.current_root
@@ -1108,12 +1146,21 @@ where
         }
         // Hash the new element once, then move the frontier — O(log N). This
         // used to re-Merkleize the entire accumulated list on every push, which
-        // dominated the host cost of a large draft.
-        let leaf = draft_value_root(&tree)?;
+        // dominated the host cost of a large draft. Unauthenticated runs skip
+        // the leaf hash and leave the frontier empty: nothing reads it, since
+        // `root()` is only reached through root recomposition and the witness,
+        // both of which are off.
+        let leaf = if authenticated {
+            draft_value_root(&tree)?
+        } else {
+            UNAUTHENTICATED_DRAFT_ROOT
+        };
         match state.fields.entry(field.to_string()) {
             std::collections::btree_map::Entry::Vacant(entry) => {
                 let mut frontier = AppendFrontier::empty();
-                frontier.push(leaf);
+                if authenticated {
+                    frontier.push(leaf);
+                }
                 entry.insert(DraftFieldRuntime::Append {
                     values: vec![tree],
                     frontier,
@@ -1122,7 +1169,9 @@ where
             std::collections::btree_map::Entry::Occupied(mut entry) => match entry.get_mut() {
                 DraftFieldRuntime::Append { values, frontier } => {
                     values.push(tree);
-                    frontier.push(leaf);
+                    if authenticated {
+                        frontier.push(leaf);
+                    }
                 }
                 DraftFieldRuntime::Set { .. } => {
                     return Err(Error::Other(format!(
@@ -1131,6 +1180,9 @@ where
                     )))
                 }
             },
+        }
+        if !authenticated {
+            return Ok(UNAUTHENTICATED_DRAFT_ROOT);
         }
         state.ops.push(DraftOp::Push {
             field: field.to_string(),
@@ -1329,55 +1381,78 @@ pub fn publish_pending_output_coordinates(coordinates: CfsCoordinates) {
     });
 }
 
-pub fn finalize_draft<S>(anchor: &Anchor, expected_root: &[u8; 32]) -> Result<StorageRef>
+/// Materialize a draft into its value, consuming the draft state.
+///
+/// The half both modes share. Set-once completeness and the empty-recur default
+/// rules live here, so an unauthenticated finalize enforces them identically
+/// rather than reimplementing them — the two modes can only disagree about
+/// commitments, never about whether a draft was validly built.
+///
+/// `require_complete` is `false` for the empty-recur path, where an untouched
+/// output must still materialize if the schema allows it.
+pub fn finalize_draft_value<S>(
+    anchor: &Anchor,
+    expected_root: &[u8; 32],
+    require_complete: bool,
+) -> Result<S>
 where
     S: Schema + DeserializeOwned + Serialize,
 {
-    let state = take_draft_state(anchor, expected_root, "finalize")?;
+    let operation = if require_complete {
+        "finalize"
+    } else {
+        "empty finalize"
+    };
+    let state = take_draft_state(anchor, expected_root, operation)?;
     // Materializing the whole object here is correct and stays: it is O(N)
     // once, which was never the problem.
-    let tree = build_draft_tree(&state.schema, &state.field_values(), true)?;
-    let value = typed_value_from_tree::<S>(&tree).map_err(|error| {
+    let tree = build_draft_tree(&state.schema, &state.field_values(), require_complete)?;
+    typed_value_from_tree::<S>(&tree).map_err(|error| {
+        if !require_complete {
+            if let Ok(Some(field)) = first_unset_set_once_field(&state.schema, &state.fields) {
+                return Error::Other(format!(
+                    "Empty recur input cannot finalize draft '{}': field '{}' was never written and the schema cannot materialize a default value",
+                    core::any::type_name::<S>(),
+                    field
+                ));
+            }
+            return Error::Serialization(format!(
+                "Failed to materialize finalized empty draft value: {}",
+                error
+            ));
+        }
         Error::Serialization(format!(
             "Failed to materialize finalized draft value: {}",
             error
         ))
-    })?;
+    })
+}
 
-    let reference = if let Some(coordinates) = current_recur_site_coordinates() {
-        store_value_at_coordinates(&value, coordinates)?
+fn store_finalized_draft<S>(value: &S) -> Result<StorageRef>
+where
+    S: Serialize,
+{
+    if let Some(coordinates) = current_recur_site_coordinates() {
+        store_value_at_coordinates(value, coordinates)
     } else {
-        store_value(&value)?
-    };
-    Ok(reference)
+        store_value(value)
+    }
+}
+
+pub fn finalize_draft<S>(anchor: &Anchor, expected_root: &[u8; 32]) -> Result<StorageRef>
+where
+    S: Schema + DeserializeOwned + Serialize,
+{
+    let value = finalize_draft_value::<S>(anchor, expected_root, true)?;
+    store_finalized_draft(&value)
 }
 
 pub fn finalize_empty_draft<S>(anchor: &Anchor, expected_root: &[u8; 32]) -> Result<StorageRef>
 where
     S: Schema + DeserializeOwned + Serialize,
 {
-    let state = take_draft_state(anchor, expected_root, "empty finalize")?;
-    let tree = build_draft_tree(&state.schema, &state.field_values(), false)?;
-    let value = typed_value_from_tree::<S>(&tree).map_err(|error| {
-        if let Ok(Some(field)) = first_unset_set_once_field(&state.schema, &state.fields) {
-            return Error::Other(format!(
-                "Empty recur input cannot finalize draft '{}': field '{}' was never written and the schema cannot materialize a default value",
-                core::any::type_name::<S>(),
-                field
-            ));
-        }
-        Error::Serialization(format!(
-            "Failed to materialize finalized empty draft value: {}",
-            error
-        ))
-    })?;
-
-    let reference = if let Some(coordinates) = current_recur_site_coordinates() {
-        store_value_at_coordinates(&value, coordinates)?
-    } else {
-        store_value(&value)?
-    };
-    Ok(reference)
+    let value = finalize_draft_value::<S>(anchor, expected_root, false)?;
+    store_finalized_draft(&value)
 }
 
 pub fn resolve_storage_value<T: DeserializeOwned>(

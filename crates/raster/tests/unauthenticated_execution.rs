@@ -194,12 +194,108 @@ fn bindings_chain_through_several_tiles() {
     assert_eq!(inline(again), "Hello, Hello, John!!");
 }
 
-/// v1 refuses drafts rather than half-supporting them (§7), naming the
-/// construct to blame.
+/// **`select!` dispatches on the base's provenance, not on the mode.** A
+/// storage-backed base keeps composing a selector even with authentication off,
+/// so a large source is read by indexed lookup instead of being materialized at
+/// every step. This is what lets `call_recur!` keep its raster-indexed source in
+/// this mode, and what stops the mode being unusable at scale.
 #[test]
-#[should_panic(expected = "`new!` requires authenticated execution")]
-fn drafts_are_refused() {
+fn a_storage_backed_base_stays_storage_backed() {
     unauthenticated();
-    let _guard = raster::__private::SequenceScopeGuard::enter("drafts_are_refused");
-    let _draft: raster::Draft<CollectiveGreeting> = new!(CollectiveGreeting);
+    let _guard =
+        raster::__private::SequenceScopeGuard::enter("a_storage_backed_base_stays_storage_backed");
+
+    let reference = raster::store_value(&sample()).expect("store personal data");
+    let stored = raster::typed_storage::<PersonalData>(reference);
+
+    let addresses = select!(List<Address>, storage!(PersonalData, stored.reference().clone()).addresses);
+    assert!(
+        matches!(addresses, AuthRef::Storage(_)),
+        "a storage-backed base must not be materialized just because auth is off"
+    );
+
+    // And narrowing further stays storage-backed rather than resolving the
+    // parent at each step.
+    let city = select!(String, addresses[0].city);
+    assert!(matches!(city, AuthRef::Storage(_)));
+}
+
+/// **A storage-backed base indexed by a tile-produced value** — the combination
+/// §5.3 and §5.4 each half-covered and neither owned. Because the base stays
+/// storage-backed, the index reaches `push_bound_index` (selector lowering)
+/// rather than the accessor arm, and an inline index there used to be rejected
+/// as unauthorized. In this mode there is no lineage to protect and no verifier
+/// to satisfy, so the segment degrades to a plain index and picks the element
+/// the authenticated run would pick.
+#[test]
+fn a_storage_backed_base_accepts_a_tile_produced_index() {
+    unauthenticated();
+    let _guard = raster::__private::SequenceScopeGuard::enter(
+        "a_storage_backed_base_accepts_a_tile_produced_index",
+    );
+
+    let reference = raster::store_value(&sample()).expect("store personal data");
+    let stored = raster::typed_storage::<PersonalData>(reference);
+    let addresses =
+        select!(List<Address>, storage!(PersonalData, stored.reference().clone()).addresses);
+
+    // A tile output: inline, with nothing committing to it. This is what the
+    // authenticated mode requires — and must keep requiring — to be authorized.
+    let index = bind(1u32);
+    assert!(matches!(index, AuthRef::Inline(_)));
+
+    let picked = select!(Address, addresses[index]);
+    let city = select!(String, picked.city);
+    assert_eq!(greet(city), "Hello, Madrid!");
+}
+
+/// A draft builds field by field and finalizes to the value, with no root
+/// hashing and no transition witness behind it (§7).
+#[test]
+fn a_draft_finalizes_to_its_value() {
+    unauthenticated();
+    let _guard = raster::__private::SequenceScopeGuard::enter("a_draft_finalizes_to_its_value");
+
+    let mut draft: raster::Draft<CollectiveGreeting> = new!(CollectiveGreeting);
+    draft.title().set("Built unauthenticated".to_string());
+    draft.lines().push("first".to_string());
+    draft.lines().push("second".to_string());
+
+    let finalized = inline(raster::finalize(draft));
+    assert_eq!(finalized.title, "Built unauthenticated");
+    assert_eq!(
+        finalized.lines.as_slice(),
+        ["first".to_string(), "second".to_string()]
+    );
+}
+
+/// Set-once is a property of the draft, not of authentication, so it still
+/// fires with commitments off — `finalize_draft_value` is shared by both modes
+/// precisely so these rules cannot drift apart.
+#[test]
+#[should_panic(expected = "can only be written once")]
+fn set_once_still_holds() {
+    unauthenticated();
+    let _guard = raster::__private::SequenceScopeGuard::enter("set_once_still_holds");
+
+    let mut draft: raster::Draft<CollectiveGreeting> = new!(CollectiveGreeting);
+    draft.title().set("first".to_string());
+    draft.title().set("second".to_string());
+}
+
+/// An append-only field left untouched still materializes, which is the
+/// empty-recur path (`allow_partial`) reaching `finalize_draft_value` with
+/// `require_complete = false`.
+#[test]
+fn an_untouched_append_field_finalizes_empty() {
+    unauthenticated();
+    let _guard =
+        raster::__private::SequenceScopeGuard::enter("an_untouched_append_field_finalizes_empty");
+
+    let mut draft: raster::Draft<CollectiveGreeting> = new!(CollectiveGreeting);
+    draft.title().set("No lines".to_string());
+
+    let finalized = inline(raster::finalize(draft));
+    assert_eq!(finalized.title, "No lines");
+    assert!(finalized.lines.as_slice().is_empty());
 }

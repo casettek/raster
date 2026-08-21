@@ -48,6 +48,7 @@ use raster_prover::trace::{
 use raster_runtime::TraceRecorder;
 
 use crate::commands::run::load_trace_from_file;
+use crate::runtime_env::RuntimeEnv;
 use crate::TraceFormat;
 
 // ---------------------------------------------------------------------------
@@ -114,23 +115,46 @@ const CHAIN_FRAUD_RECEIPT_FILE: &str = "chain-fraud.receipt";
 
 /// Run every stage in order, threading each output into the next, and write a
 /// `ChainCommitment` over the resulting checkpoints.
-pub fn run(chain: Option<&str>, window_size: usize) -> Result<()> {
+///
+/// With `no_auth`, every stage runs unauthenticated
+/// (`docs/proposals/unauthenticated-execution.md`): no trace, therefore no
+/// per-stage trace commitment and no chain-commitment. The linking is
+/// unchanged — a stage still produces a real `output.bin` (§6.1) whose
+/// structural root is hashed here, host-side, and fed to the next stage — so
+/// the chain computes the same values, it just attests nothing about how.
+/// This is the dev-loop half of §10; the other half, per-stage commitment on
+/// demand for a contested stage, is still chain-level policy and unaddressed:
+/// this flag is all-or-nothing.
+pub fn run(chain: Option<&str>, window_size: usize, no_auth: bool) -> Result<()> {
     let (spec, base_dir) = resolve_chain(chain)?;
     validate_stage_names(&spec)?;
 
     // Fail fast, before running anything, if a stage has no resolvable program
     // identity (neither a cached `program.bin` nor a `Raster.lock` to regenerate
     // it from). Cheaper to catch here than after a stage has already run.
-    for stage in &spec.stages {
-        let project = Project::new(base_dir.join(&stage.project))
-            .map_err(|e| Error::Other(format!("stage '{}': {e}", stage.name)))?;
-        read_program_identity(&project, &stage.name)?;
+    //
+    // Skipped unauthenticated: identity is read for the checkpoints, which this
+    // mode does not produce. Requiring it would also make the mode useless for
+    // the case it exists to serve — a source change whose `Raster.lock` has not
+    // been rebuilt yet cannot be reassembled, and would fail here before any
+    // stage ran.
+    if !no_auth {
+        for stage in &spec.stages {
+            let project = Project::new(base_dir.join(&stage.project))
+                .map_err(|e| Error::Other(format!("stage '{}': {e}", stage.name)))?;
+            read_program_identity(&project, &stage.name)?;
+        }
     }
 
     let fraud_proof_config =
         FraudProofConfig::from_window_size(window_size).map_err(|e| Error::Other(e.to_string()))?;
 
-    let chain_dir = chains_root().join(chain_run_id());
+    let chain_dir = if no_auth {
+        no_auth_chains_root()
+    } else {
+        chains_root()
+    }
+    .join(chain_run_id());
     std::fs::create_dir_all(&chain_dir)
         .map_err(|e| Error::Other(format!("failed to create {}: {e}", chain_dir.display())))?;
 
@@ -140,9 +164,21 @@ pub fn run(chain: Option<&str>, window_size: usize) -> Result<()> {
         spec.stages.len()
     );
     println!("  dir: {}", chain_dir.display());
+    // Printed either way: a reader must never have to infer which mode produced
+    // the output in front of them. Mirrors `commands::run`.
+    if no_auth {
+        println!("  mode: unauthenticated (--no-auth) — results are not authoritative");
+    } else {
+        println!("  mode: authenticated");
+    }
     println!();
 
     let mut checkpoints: Vec<StageCheckpoint> = Vec::new();
+    // Every stage's output structural commitment, by stage index — what a
+    // downstream `from` binding resolves to. Kept beside `checkpoints` rather
+    // than read out of them, because an unauthenticated stage produces this and
+    // no checkpoint.
+    let mut output_commitments: Vec<Vec<u8>> = Vec::new();
     let mut stage_index: BTreeMap<String, usize> = BTreeMap::new();
     // Wall clock of each stage binary. Reported only — never part of a
     // `StageCheckpoint`, which `chain audit` and the chain-fraud guest digest
@@ -189,34 +225,44 @@ pub fn run(chain: Option<&str>, window_size: usize) -> Result<()> {
             &stage_dir,
             &base_dir,
             &chain_dir,
-            &checkpoints,
+            &output_commitments,
             &stage_index,
         )?;
         println!("    build & run …");
 
-        let (trace, _recorder, execution_time) = build_and_run_stage(
+        let (replay, execution_time) = build_and_run_stage(
             &project,
             &cfs,
             &synth.input_json_path,
             &synth.input_manifest_path,
             &stage_dir,
+            no_auth,
         )?;
         execution_times.push((stage.name.clone(), execution_time));
         println!("    exec {}", format_duration(execution_time));
 
-        let trace_commitment =
-            TraceCommitment::try_build(&trace, &EMPTY_TRIE_NODES[0], fraud_proof_config)
-                .map_err(|e| Error::Other(e.to_string()))?;
-        let commit_path = stage_dir.join("commit.bin");
-        std::fs::write(
-            &commit_path,
-            postcard::to_allocvec(&trace_commitment).unwrap(),
-        )
-        .map_err(|e| Error::Other(format!("failed to write {}: {e}", commit_path.display())))?;
-        // The checkpoint carries the commitment's compact identity, not the
-        // trace-sized commitment itself; `commit.bin` stays a stage artifact
-        // and `chain audit` re-derives the digest from it.
-        let trace_commitment_digest = trace_commitment.header().digest();
+        // `None` only when unauthenticated, where there is no trace to commit
+        // to — the interlock is the absent trace, not a check here.
+        let trace_commitment_digest = match replay {
+            Some((trace, _recorder)) => {
+                let trace_commitment =
+                    TraceCommitment::try_build(&trace, &EMPTY_TRIE_NODES[0], fraud_proof_config)
+                        .map_err(|e| Error::Other(e.to_string()))?;
+                let commit_path = stage_dir.join("commit.bin");
+                std::fs::write(
+                    &commit_path,
+                    postcard::to_allocvec(&trace_commitment).unwrap(),
+                )
+                .map_err(|e| {
+                    Error::Other(format!("failed to write {}: {e}", commit_path.display()))
+                })?;
+                // The checkpoint carries the commitment's compact identity, not
+                // the trace-sized commitment itself; `commit.bin` stays a stage
+                // artifact and `chain audit` re-derives the digest from it.
+                Some(trace_commitment.header().digest())
+            }
+            None => None,
+        };
 
         let (output_payload_commitment, output_structural_commitment) = if produces_output {
             let out = collect_output(&stage_dir)?;
@@ -231,20 +277,37 @@ pub fn run(chain: Option<&str>, window_size: usize) -> Result<()> {
             (Vec::new(), Vec::new())
         };
 
-        let program_commitment = read_program_identity(&project, &stage.name)?;
-
-        checkpoints.push(StageCheckpoint {
-            name: stage.name.clone(),
-            program_commitment,
-            input_manifest_commitment: synth.input_manifest_commitment,
-            input_bindings: synth.bindings,
-            output_payload_commitment,
-            output_structural_commitment,
-            trace_commitment_digest,
-        });
+        output_commitments.push(output_structural_commitment.clone());
         stage_index.insert(stage.name.clone(), idx);
-        println!("    commit ✓");
+
+        match trace_commitment_digest {
+            Some(trace_commitment_digest) => {
+                let program_commitment = read_program_identity(&project, &stage.name)?;
+                checkpoints.push(StageCheckpoint {
+                    name: stage.name.clone(),
+                    program_commitment,
+                    input_manifest_commitment: synth.input_manifest_commitment,
+                    input_bindings: synth.bindings,
+                    output_payload_commitment,
+                    output_structural_commitment,
+                    trace_commitment_digest,
+                });
+                println!("    commit ✓");
+            }
+            None => println!("    (no trace, no commitment — --no-auth)"),
+        }
         println!();
+    }
+
+    if no_auth {
+        // No trace was written, so there is nothing to build a checkpoint from
+        // and no chain-commitment to write — the same structural interlock the
+        // single-program mode has (§6), one level up. `chain audit` therefore
+        // cannot be pointed at this run, and its "most recent run" discovery
+        // never sees it: unauthenticated runs live under their own root.
+        println!("no chain-commitment written (--no-auth)");
+        print_execution_times(&execution_times);
+        return Ok(());
     }
 
     let chain = ChainCommitment {
@@ -571,13 +634,17 @@ fn detect_execution_fraud(recorded: &RecordedChain) -> Result<Option<StageExecut
             recorded.spec.stages.len(),
             stage.name
         );
-        let (trace, recorder, _execution_time) = build_and_run_stage(
+        // Authenticated: an audit compares this run's trace against the stage's
+        // committed one, so there is one by construction.
+        let (replay, _execution_time) = build_and_run_stage(
             &project,
             &cfs,
             &input_json_path,
             &input_manifest_path,
             &audit_dir,
+            false,
         )?;
+        let (trace, recorder) = replay.expect("an authenticated stage run produces a trace");
 
         let trace_commitment = read_stage_trace_commitment(&stage_dir)?;
         let mut verifier = TraceVerifier::new(trace_commitment.clone(), &EMPTY_TRIE_NODES[0], &cfs)
@@ -811,17 +878,18 @@ pub fn fraud_verify(
 /// `RASTER_OUTPUT_DIR`). Returns the loaded trace and how long the stage
 /// binary itself ran — wall clock of the child process, excluding the build
 /// that precedes it and the trace load that follows.
+///
+/// With `no_auth` the stage runs with authenticated storage off and the trace
+/// is `None`: the runtime installs no publisher in that mode, so there would be
+/// no file to load. The output artifact is written either way.
 fn build_and_run_stage(
     project: &Project,
     cfs: &ControlFlowSchema,
     input_json_path: &Path,
     input_manifest_path: &Path,
     stage_dir: &Path,
-) -> Result<(
-    raster_core::trace::Trace,
-    raster_runtime::TraceRecorder,
-    Duration,
-)> {
+    no_auth: bool,
+) -> Result<(Option<(Trace, TraceRecorder)>, Duration)> {
     // The stage build is plumbing, not chain output: its cargo progress,
     // dependency warnings, and protocol-guest build chatter would bury the
     // per-stage lines this command exists to print. Capture it and surface it
@@ -866,23 +934,29 @@ fn build_and_run_stage(
     let input_json = input_json_path.to_string_lossy().to_string();
     let input_manifest = input_manifest_path.to_string_lossy().to_string();
 
-    let started = Instant::now();
-    let status = Command::new(&binary_path)
+    let mut command = Command::new(&binary_path);
+    command
         .current_dir(&project.root_dir)
-        // Every stage of a chain run is committed today, so every stage is
-        // authenticated. Making cheap stages a chain-level option is separate
-        // work — see `docs/proposals/unauthenticated-execution.md` §10.
-        .env(raster_runtime::auth::AUTH_ENV, "1")
-        .env(raster_runtime::TRACE_PATH_ENV, &trace_path)
-        .env(
-            raster_runtime::TRACE_FORMAT_ENV,
-            TraceFormat::Binary.as_runtime_str(),
-        )
-        .env(raster_runtime::OUTPUT_DIR_ENV, stage_dir)
         .args(["--input", &input_json])
         .args(["--input-manifest", &input_manifest])
         .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    // The mode belongs to the run, and this is where the run is launched.
+    // Which shape gets built states it: a stage that records a trace is an
+    // authenticated stage, and there is no way to spell one without the other.
+    // No `.profiling()` — chain stages are timed by the runner, not profiled.
+    // See `crate::runtime_env`.
+    let runtime_env = RuntimeEnv::new(stage_dir);
+    if no_auth {
+        runtime_env.apply(&mut command);
+    } else {
+        runtime_env
+            .authenticated(&trace_path, TraceFormat::Binary)
+            .apply(&mut command);
+    }
+
+    let started = Instant::now();
+    let status = command
         .status()
         .map_err(|e| Error::Other(format!("failed to run stage binary: {e}")))?;
     let execution_time = started.elapsed();
@@ -895,6 +969,10 @@ fn build_and_run_stage(
         )));
     }
 
+    if no_auth {
+        return Ok((None, execution_time));
+    }
+
     let (trace, recorder) = load_trace_from_file(
         &trace_path,
         TraceFormat::Binary,
@@ -902,7 +980,7 @@ fn build_and_run_stage(
         Some(&input_json),
         Some(&input_manifest),
     )?;
-    Ok((trace, recorder, execution_time))
+    Ok((Some((trace, recorder)), execution_time))
 }
 
 // ---------------------------------------------------------------------------
@@ -920,12 +998,17 @@ struct SynthesizedInputs {
 /// Write a stage's `input.json` (private file paths) and `input_manifest.json`
 /// (commitments) into `stage_dir` from its bindings, returning their paths, the
 /// manifest digest, and the per-parameter provenance.
+///
+/// `outputs` holds each already-run stage's output structural commitment by
+/// index, which is what a `from` binding resolves to. It is recomputed
+/// host-side from `output.bin` in either authentication mode, so the links a
+/// stage is fed are identical whether or not the producing stage was traced.
 fn synthesize_inputs(
     stage: &StageSpec,
     stage_dir: &Path,
     base_dir: &Path,
     chain_dir: &Path,
-    checkpoints: &[StageCheckpoint],
+    outputs: &[Vec<u8>],
     stage_index: &BTreeMap<String, usize>,
 ) -> Result<SynthesizedInputs> {
     let mut input_entries: Vec<(String, serde_json::Value)> = Vec::new();
@@ -955,17 +1038,14 @@ fn synthesize_inputs(
                     ))
                 })?;
                 let producer_dir = chain_dir.join(producer);
-                let commitment =
-                    hex::encode(&checkpoints[producer_idx].output_structural_commitment);
-                if checkpoints[producer_idx]
-                    .output_structural_commitment
-                    .is_empty()
-                {
+                let structural = &outputs[producer_idx];
+                if structural.is_empty() {
                     return Err(Error::Other(format!(
                         "stage '{}': parameter '{param}' is fed from '{producer}', which produced no output",
                         stage.name
                     )));
                 }
+                let commitment = hex::encode(structural);
                 (
                     producer_dir.join("output.bin"),
                     producer_dir.join("output.rindex"),
@@ -1312,11 +1392,22 @@ fn absolute(base_dir: &Path, path: &str) -> PathBuf {
 }
 
 fn chains_root() -> PathBuf {
+    raster_target_dir().join("chains")
+}
+
+/// Where `--no-auth` runs go. A separate root, not a marker inside the usual
+/// one, so `latest_chain_commitment`'s "newest directory wins" can never land
+/// on a run that has no chain-commitment in it — an unauthenticated run is
+/// invisible to every command that reads a commitment.
+fn no_auth_chains_root() -> PathBuf {
+    raster_target_dir().join("chains-no-auth")
+}
+
+fn raster_target_dir() -> PathBuf {
     std::env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))
         .join("target")
         .join("raster")
-        .join("chains")
 }
 
 fn chain_run_id() -> String {
