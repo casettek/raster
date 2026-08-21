@@ -4,6 +4,7 @@
 //! They live in raster-core to avoid circular dependencies (guest cannot depend on prover).
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::string::String;
@@ -12,9 +13,10 @@ use std::vec::Vec;
 use crate::authorization::AuthorizationJournal;
 use crate::cfs::CfsCoordinates;
 use crate::draft::{DraftId, DraftTransitionWitness, TileReplayJournal, TrackedDraftState};
+use crate::recur_progress::RecurProgressStack;
 use crate::fingerprint::{Fingerprint, FingerprintAccumulator};
 use crate::input::SelectionWitness;
-use crate::trace::{ExternalInput, FnInput, StepRecord};
+use crate::trace::{FnInput, StepRecord};
 
 /// Serializable representation of a Merkle frontier (position, leaf, ommers).
 ///
@@ -45,20 +47,79 @@ pub struct StepRecordWitness {
     pub path_elems: Vec<Vec<u8>>,
 }
 
+/// Domain prefix for [`TraceCommitmentHeader::digest`].
+pub const TRACE_COMMITMENT_DOMAIN: &[u8] = b"raster/trace-commitment/v1";
+
+/// The compact, guest-friendly identity of a `TraceCommitment`.
+///
+/// A full `commit.bin` scales with the trace (the packed fingerprint spans
+/// every step; the revealed window is a window of full step records), so the
+/// transition guest never ingests it. Instead this constant-size header
+/// stands for it: the fingerprint is represented by a Merkle root over its
+/// packed `u64` blocks (leaf `i` = `sha256(bits[i].to_le_bytes())`, combined
+/// exactly like the trace tree), and the revealed items by their hash. The
+/// guest hashes the header into `refuted_trace_commitment` and checks its
+/// window is a slice of the fingerprint via a [`FingerprintSliceWitness`] —
+/// O(window) data instead of O(trace). Host-side construction lives in
+/// `raster-prover::trace` (`TraceCommitmentExt`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TraceCommitmentHeader {
+    pub bits_packer: crate::fingerprint::BitPacker,
+    /// Trace items the fingerprint covers (`fingerprint.len`).
+    pub fingerprint_len: u64,
+    /// Merkle root over the fingerprint's packed `u64` blocks.
+    pub fingerprint_root: Vec<u8>,
+    /// `sha256(postcard(revealed_items))`.
+    pub revealed_items_commitment: Vec<u8>,
+}
+
+impl TraceCommitmentHeader {
+    /// The commitment identity: `sha256(domain || postcard(self))`. This is
+    /// what a journal's `refuted_trace_commitment` and a chain checkpoint's
+    /// `trace_commitment_digest` carry.
+    pub fn digest(&self) -> Vec<u8> {
+        let mut hasher = Sha256::new();
+        hasher.update(TRACE_COMMITMENT_DOMAIN);
+        hasher.update(postcard::to_allocvec(self).expect("TraceCommitmentHeader is serializable"));
+        hasher.finalize().to_vec()
+    }
+}
+
+/// Inclusion proof for one packed fingerprint block against
+/// [`TraceCommitmentHeader::fingerprint_root`]. Same path shape as every
+/// other Merkle witness the transition guest folds (`position`-bit ordering,
+/// level-prefixed combine).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FingerprintBlockWitness {
+    pub block: u64,
+    /// The block's index in the commitment's packed `bits` array.
+    pub position: u64,
+    pub path_elems: Vec<Vec<u8>>,
+}
+
+/// The contiguous run of proven fingerprint blocks covering a fraud window's
+/// item range `[window_start, window_start + window_len)`. The guest derives
+/// the required block range itself (from the window's frontier position and
+/// length) and rejects a witness whose positions differ.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FingerprintSliceWitness {
+    pub blocks: Vec<FingerprintBlockWitness>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct InternalStoreEntry {
+pub struct StorageEntry {
     pub coordinates: CfsCoordinates,
     pub object_commitment: Vec<u8>,
 }
 
-impl InternalStoreEntry {
+impl StorageEntry {
     pub fn to_bytes(&self) -> Vec<u8> {
         postcard::to_allocvec(self).unwrap_or_default()
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct InternalStoreIndexValue {
+pub struct StorageIndexValue {
     pub log_position: u64,
     pub object_commitment: Vec<u8>,
 }
@@ -66,7 +127,7 @@ pub struct InternalStoreIndexValue {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CoordinateIndexMembershipProof {
     pub coordinates: CfsCoordinates,
-    pub value: InternalStoreIndexValue,
+    pub value: StorageIndexValue,
     pub siblings: Vec<Vec<u8>>,
 }
 
@@ -77,73 +138,108 @@ pub struct CoordinateIndexNonMembershipProof {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct InternalStoreLogWitness {
+pub struct StorageLogWitness {
     pub position: u64,
     pub path_elems: Vec<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct InternalStoreReadWitness {
-    pub entry: InternalStoreEntry,
-    pub log_witness: InternalStoreLogWitness,
+pub struct StorageReadWitness {
+    pub entry: StorageEntry,
+    pub log_witness: StorageLogWitness,
     pub index_witness: CoordinateIndexMembershipProof,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct InternalStoreWriteWitness {
-    pub entry: InternalStoreEntry,
+pub struct StorageWriteWitness {
+    pub entry: StorageEntry,
     pub index_non_membership_witness: CoordinateIndexNonMembershipProof,
     pub index_membership_witness: CoordinateIndexMembershipProof,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct InternalStoreWitness {
-    pub reads: Vec<InternalStoreReadWitness>,
-    pub write: Option<InternalStoreWriteWitness>,
+pub struct StorageWitness {
+    pub reads: Vec<StorageReadWitness>,
+    pub write: Option<StorageWriteWitness>,
 }
 
 /// Input for a single transition step (passed into the transition guest).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransitionInput {
     pub step_record: StepRecord,
-    pub replay_image_id: Option<Vec<u8>>,
+    /// The tile replay journal for an execution step. The expected image id is
+    /// no longer carried here (it was host-supplied and unbound); the guest
+    /// resolves it from the program registry keyed by the step's tile id. See
+    /// `docs/proposals/program-identity.md`.
     pub replay_journal: Option<TileReplayJournal>,
 
     pub input_witness: Option<Vec<u8>>,
     pub output_witness: Option<Vec<u8>>,
     pub input_source_witness: Option<FnInput>,
     pub sequence_scope_witness: Option<FnInput>,
-    pub external_input: ExternalInput,
-    pub external_selection_witnesses: BTreeMap<String, SelectionWitness>,
-    pub internal_selection_witnesses: BTreeMap<String, SelectionWitness>,
-    pub internal_store_witness: Option<InternalStoreWitness>,
+    pub storage_selection_witnesses: BTreeMap<String, SelectionWitness>,
+    pub storage_witness: Option<StorageWitness>,
     pub draft_transition_witness: Option<DraftTransitionWitness>,
 
     pub input_sources_witnesses: HashMap<StepRecord, Vec<u8>>,
 
     pub authorization_image_id: Vec<u8>,
     pub authorization_journal: AuthorizationJournal,
+
+    /// Recur progress the window's **first** step starts from.
+    ///
+    /// Never believed: advancing a wrong seed by this step's own facts yields a
+    /// different stack, hashes to a different value, and fails against the
+    /// step's recorded commitment. `InitTransition` gains nothing.
+    #[serde(default)]
+    pub window_start_recur_progress: Option<RecurProgressStack>,
+
+    /// Membership witness for `main`'s entry-argument coordinate (`[]`)
+    /// against the window's *initial* storage state, proving the binding
+    /// already existed when this window opened.
+    ///
+    /// Only ever read on the step that establishes a fresh
+    /// `TransitionState::Init`; `Next` steps inherit the fact from the
+    /// previous journal instead. `None` at `Init` means the window opens at
+    /// genesis, so its first step is the `ProgramStart` that binds and
+    /// authorizes the entry arguments itself.
+    pub entrypoint_membership_witness: Option<StorageReadWitness>,
+
+    /// For a `ProgramEnd` step: the trace-inclusion proof that the program
+    /// output object (`ProgramEndStep::output`) lives in the current storage
+    /// state, and the selection proof narrowing it to the returned value.
+    /// Both `None` for every other step and for a unit program's end.
+    pub program_output_read_witness: Option<StorageReadWitness>,
+    pub program_output_selection_witness: Option<SelectionWitness>,
 }
 
 /// Result of applying one transition (new frontier and fingerprint state).
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct Transition {
     pub frontier: SerializableFrontier,
-    pub internal_store_frontier: SerializableFrontier,
-    pub internal_store_root: Vec<u8>,
-    pub internal_store_index_root: Vec<u8>,
+    pub storage_frontier: SerializableFrontier,
+    pub storage_root: Vec<u8>,
+    pub storage_index_root: Vec<u8>,
     pub active_drafts: BTreeMap<DraftId, TrackedDraftState>,
     pub actual_fingerprint_acc: FingerprintAccumulator,
     pub next_expected_coordinates: Vec<CfsCoordinates>,
+    /// Live recur sites, carried across steps in the window.
+    ///
+    /// The preimage travels in the clear because the guest must *advance* it
+    /// and a hash cannot be advanced. Each `StepRecord`'s
+    /// `recur_progress_commitment` is what lets a window that starts mid-loop
+    /// validate its seed instead of believing it.
+    #[serde(default)]
+    pub recur_progress: RecurProgressStack,
 }
 
 /// Initial transition (first step in a window).
 #[derive(Clone, Serialize, Deserialize)]
 pub struct InitTransition {
     pub init_frontier: SerializableFrontier,
-    pub init_internal_store_frontier: SerializableFrontier,
-    pub init_internal_store_root: Vec<u8>,
-    pub init_internal_store_index_root: Vec<u8>,
+    pub init_storage_frontier: SerializableFrontier,
+    pub init_storage_root: Vec<u8>,
+    pub init_storage_index_root: Vec<u8>,
     pub active_drafts: BTreeMap<DraftId, TrackedDraftState>,
     pub fingerprint: Fingerprint,
 }
@@ -156,6 +252,59 @@ pub enum TransitionState {
     Finished,
 }
 
+/// Whether `main`'s entry-argument binding has been tied to the authorization
+/// journal within a proof chain.
+///
+/// Because the binding is now a single `ProgramStart` step at coordinates
+/// `[]` — always the trace's first step — a window can establish the fact one
+/// of two ways, both decided when the window opens (see the transition
+/// guest's `checks::entrypoint::verify_genesis_authorization`):
+///
+/// - the window opens at genesis, so its first step *is* `ProgramStart`,
+///   verified against the journal in the same guest run; or
+/// - the window opens later, so a trace-inclusion witness proves the binding
+///   is already at `[]` in the window's initial storage state.
+///
+/// Either way authorization is `Established` before any later step runs, so
+/// there is no deferred debt and no `Finished`-time discharge to enforce.
+/// The state is carried on the journal so every `Next` step inherits the
+/// established fact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EntrypointAuthorization {
+    /// The CFS declares no `main` entry arguments — there is nothing to bind.
+    NotRequired,
+    /// The binding has been tied to the authorization journal in this chain.
+    Established,
+}
+
+/// Whether the program's authorized output has been tied to committed storage
+/// within a proof chain.
+///
+/// The output is bound by the trace's *last* step, `ProgramEnd`, which proves
+/// the returned value is a selection out of a committed storage object (see
+/// the transition guest's `checks::program::verify_program_end`). Because it
+/// is the last step, no window can open *after* it, so — unlike
+/// [`EntrypointAuthorization`] — there is no membership-witness route and no
+/// genesis case: a chain is `Pending` until it verifies the `ProgramEnd` step,
+/// then `Established`.
+///
+/// This is not discharged at `Finished`: a fraud chain legitimately concludes
+/// at a mid-trace divergence, before any output exists, and must stay
+/// `Pending`. The invariant is enforced elsewhere — `ProgramEnd` is the unique
+/// terminal step bound into the fingerprint, host-side full-trace verification
+/// requires it, and any consumer accepting a completed-program journal requires
+/// `Established`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OutputAuthorization {
+    /// The CFS declares `main` returns no value — there is no output to bind.
+    NotRequired,
+    /// The chain has not yet reached (and verified) the program's end.
+    Pending,
+    /// A `ProgramEnd` step has been verified in this chain: the committed
+    /// output provably lives in committed storage.
+    Established,
+}
+
 /// Journal produced by the transition guest (init state + current state + image id).
 #[derive(Clone, Serialize, Deserialize)]
 pub struct TransitionJournal {
@@ -163,5 +312,34 @@ pub struct TransitionJournal {
     pub current_state: TransitionState,
     pub transition_image_id: Vec<u8>,
     pub authorization_image_id: Vec<u8>,
-    pub manifest_commitment: Vec<u8>,
+    pub input_manifest_commitment: Vec<u8>,
+
+    /// `sha256(domain || program.bin)` — the identity of the program this
+    /// chain proves execution of. Derived in-guest from the `ProgramDefinition`
+    /// frame bytes, and asserted continuous across `Next` steps. See
+    /// `docs/proposals/program-identity.md`.
+    pub program_commitment: Vec<u8>,
+
+    /// `sha256(postcard(TraceCommitment))` — the identity of the `commit.bin`
+    /// this window audits. Derived in-guest at `Init` from the exact
+    /// commitment bytes, after asserting the window's committed fingerprint
+    /// is that commitment's fingerprint slice at the offset fixed by the
+    /// window's initial frontier; inherited across `Next` steps. A `Finished`
+    /// journal therefore refutes exactly this commitment — a downstream
+    /// verifier (the chain-fraud guest) binds it to a stage checkpoint by
+    /// hash equality alone. See `docs/proposals/chain-fraud-proof.md`.
+    pub refuted_trace_commitment: Vec<u8>,
+
+    /// Whether this chain has tied `main`'s entry-argument binding to the
+    /// authorization journal — established when the window opens (from a
+    /// trace-inclusion witness, or by the `ProgramStart` step at genesis),
+    /// and inherited by every `Next` step from the previous (recursively
+    /// verified) journal. See [`EntrypointAuthorization`].
+    pub entrypoint_authorization: EntrypointAuthorization,
+
+    /// Whether this chain has tied the program's output to committed storage —
+    /// `NotRequired` when `main` returns unit, `Pending` until a `ProgramEnd`
+    /// step is verified, `Established` after. Inherited across `Next` steps.
+    /// See [`OutputAuthorization`].
+    pub output_authorization: OutputAuthorization,
 }

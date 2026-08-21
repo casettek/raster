@@ -41,8 +41,7 @@ It is written to match the current codebase. Where the intended behavior (CFS en
   - `crates/raster-compiler/src/sequence.rs`
     - `SequenceDiscovery` resolves call infos into tile/sequence steps
   - `crates/raster-compiler/src/flow_resolver.rs`
-    - `FlowResolver::resolve_argument`
-    - **Current gap**: unresolved arguments fall back to `InputSource::External` instead of producing a validation error.
+    - `FlowResolver::resolve_argument` resolves each argument through the identifier its value is rooted at — including through narrowing expressions (`x.f[0]`, `x.clone()`) and `select!`, and through `let name = select!(T, root...)` aliases. A root that is a sequence parameter binds to `SequenceScope`, one produced by an earlier item (including `main`'s entry arguments, which bind to the leading `Entrypoint` item) binds to `PriorItemOutput`, and only values with no upstream at all bind to `InputSource::Inline`.
 
 ### Artifact identity and zkVM verification
 

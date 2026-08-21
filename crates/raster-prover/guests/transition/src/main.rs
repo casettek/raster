@@ -5,7 +5,7 @@
 //! 1. Attach to the chain: genesis state (`Init`) or a recursively verified
 //!    previous transition journal (`Next`).
 //! 2. Verify the step against every recorded commitment (CFS bindings,
-//!    IO/replay, internal store, draft chain) and append it to the trace
+//!    IO/replay, storage, draft chain) and append it to the trace
 //!    frontier + fingerprint.
 //! 3. Compare the accumulated fingerprint with the committed one and commit
 //!    the resulting journal (`Next`, or `Finished` on the proven divergence).
@@ -19,7 +19,9 @@ mod tests;
 
 use risc0_zkvm::guest::env;
 
-use raster_core::transition::{TransitionInput, TransitionState};
+use raster_core::transition::{
+    FingerprintSliceWitness, TraceCommitmentHeader, TransitionInput, TransitionState,
+};
 
 use crate::checks::io::verify_authorization_journal;
 use crate::fraud_proof::{commit_journal, FraudProofWindowContext, PublicParams};
@@ -30,6 +32,15 @@ fn main() {
     let params = PublicParams::read();
     let input: TransitionInput = env::read();
     let state: TransitionState = env::read();
+    // Only the window-opening step binds the committed fingerprint to a
+    // named `commit.bin`: it reads the commitment's compact header and the
+    // slice witness covering this window. `Next` steps inherit the (already
+    // verified) binding from the previous journal instead.
+    let commitment_binding: Option<(TraceCommitmentHeader, FingerprintSliceWitness)> = match &state
+    {
+        TransitionState::Init(_) => Some((env::read(), env::read())),
+        _ => None,
+    };
 
     // Precondition: external inputs were authorized against a manifest.
     assert!(verify_authorization_journal(
@@ -38,10 +49,13 @@ fn main() {
     ));
 
     // Attach this step to the fraud-proof chain.
-    let (window_context, current) = FraudProofWindowContext::proceed(&params, &input, state);
+    let (window_context, current) =
+        FraudProofWindowContext::proceed(&params, &input, state, commitment_binding);
 
     // Verify every recorded aspect of the step and advance the state.
-    let next = current.apply_verified_step(&params.cfs_cursor, &input);
+    let next = current.apply_verified_step(&params.program, &params.cfs_cursor, &input);
+    let entrypoint_authorization = next.entrypoint_authorization();
+    let output_authorization = next.output_authorization();
 
     // Continue the window, or finish on the proven fingerprint divergence.
     let current_state = next.finalize(
@@ -53,6 +67,10 @@ fn main() {
         window_context.init_state,
         current_state,
         params.transition_image_id,
+        params.program_commitment,
+        window_context.refuted_trace_commitment,
         &input,
+        entrypoint_authorization,
+        output_authorization,
     );
 }

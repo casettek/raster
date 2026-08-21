@@ -13,18 +13,24 @@ extern crate alloc;
 #[cfg(feature = "std")]
 extern crate std;
 
+pub mod auth;
 pub mod cfs;
 pub mod chunking;
+pub mod collections;
 pub mod draft;
 pub mod error;
 pub mod fingerprint;
 pub mod input;
+pub mod program;
+pub mod recur_progress;
 pub mod tile;
 pub mod trace;
 
 // These modules are only available with std (they use serde_json for complex serialization)
 #[cfg(feature = "std")]
 pub mod authorization;
+#[cfg(feature = "std")]
+pub mod chain;
 #[cfg(feature = "std")]
 pub mod coordinate_index;
 #[cfg(feature = "std")]
@@ -34,10 +40,19 @@ pub mod schema;
 #[cfg(feature = "std")]
 pub mod transition;
 
+pub use collections::{
+    bytes_field_key, bytes_schema, check_bytes_geometry, check_page_partition, check_page_shape,
+    expected_page_len, page_count, page_index_for_field, page_index_for_region,
+    page_range_for_field, page_range_for_region, Block, Bytes, BytesFieldPageSize, BytesPage, List,
+    Materializable, PageSized,
+};
 pub use error::{Error, Result};
 
 // Re-export postcard for tile ABI serialization (no_std compatible)
 pub use postcard;
+
+// Re-export sha2 so generated tile code can commit its input hash (no_std)
+pub use sha2;
 
 // Re-export bincode for std-only code that needs it
 #[cfg(feature = "std")]

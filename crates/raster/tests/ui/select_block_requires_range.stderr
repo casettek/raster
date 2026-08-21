@@ -1,0 +1,7 @@
+error: `Block<T>` is only produced by a literal range selection `xs[a..b]`; to reference the whole collection select a `List<T>`
+  --> tests/ui/select_block_requires_range.rs:13:16
+   |
+13 |     let _bad = select!(Block<String>, doc.lines);
+   |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: this error originates in the macro `select` (in Nightly builds, run with -Z macro-backtrace for more info)

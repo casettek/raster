@@ -19,8 +19,10 @@ use crate::error::{BitPackerError, Result};
 use crate::precomputed::{EMPTY_TRIE_NODES, HASH_SIZE};
 
 use raster_core::fingerprint::BitPacker;
-use raster_core::trace::{StepRecord, Trace, TraceWindow};
-use raster_core::transition::StepRecordWitness;
+use raster_core::trace::{ExecStep, ExecTarget, StepKind, StepRecord, Trace, TraceWindow};
+use raster_core::transition::{
+    FingerprintBlockWitness, FingerprintSliceWitness, StepRecordWitness, TraceCommitmentHeader,
+};
 
 /// Trait for types that can be hashed to bytes.
 pub trait BytesHashable {
@@ -182,18 +184,73 @@ impl FraudProofConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct TraceCommitment {
-    pub fingerprint: Fingerprint,
-    pub revealed_items: Vec<StepRecord>,
+/// Re-export from raster-core: the struct is shared with the transition guest,
+/// which decodes and hashes the exact `commit.bin` bytes it refutes (see
+/// `docs/proposals/chain-fraud-proof.md`). Everything needing the Merkle tree
+/// stays here, behind [`TraceCommitmentExt`].
+pub use raster_core::trace::TraceCommitment;
+
+/// Host-side construction and verification of a [`TraceCommitment`] — the
+/// tree-dependent half of the type, which cannot live in `raster-core`.
+///
+/// `build`/`try_build` were `TraceCommitment::from`/`try_from` when the
+/// struct was local; the rename avoids ambiguity with the prelude's
+/// `From`/`TryFrom` now that these are trait methods.
+pub trait TraceCommitmentExt: Sized {
+    fn build(trace: &Trace, seed: &[u8], fraud_proof_config: FraudProofConfig) -> Self;
+    fn try_build(trace: &Trace, seed: &[u8], fraud_proof_config: FraudProofConfig) -> Result<Self>;
+    fn validate(&self) -> Result<()>;
+    fn frontier(trace: &Trace, n: usize, seed: &[u8]) -> Option<TraceTreeFrontier>;
+    fn witness(trace: &Trace, n: usize, seed: &[u8]) -> Option<MerklePath<Bytes, 32>>;
+    fn try_frontier(trace: &Trace, n: usize, seed: &[u8]) -> Result<TraceTreeFrontier>;
+    fn diff(&self, other: &TraceCommitment) -> Option<usize>;
+    /// The commitment's compact identity (see [`TraceCommitmentHeader`]):
+    /// what journals and chain checkpoints hash instead of the whole file.
+    fn header(&self) -> TraceCommitmentHeader;
+    /// Inclusion proofs for the packed fingerprint blocks covering window
+    /// items `[window_start, window_start + window_len)` — the transition
+    /// guest's Init-time evidence that its window fingerprint occurs in this
+    /// commitment at exactly that offset.
+    fn fingerprint_slice_witness(
+        &self,
+        window_start: usize,
+        window_len: usize,
+    ) -> FingerprintSliceWitness;
 }
 
-impl TraceCommitment {
-    pub fn from(
-        trace: &Trace,
-        seed: &[u8],
-        fraud_proof_config: FraudProofConfig,
-    ) -> TraceCommitment {
+/// Leaf `i` of the fingerprint-block tree: `sha256(bits[i].to_le_bytes())`.
+pub fn fingerprint_block_leaf(block: u64) -> Bytes {
+    Bytes(sha256_bytes(&block.to_le_bytes()))
+}
+
+/// The packed-block index range `[first, last]` covering fingerprint items
+/// `[window_start, window_start + window_len)` at `bits_per_item`.
+pub fn fingerprint_block_range(
+    bits_per_item: usize,
+    window_start: usize,
+    window_len: usize,
+) -> (usize, usize) {
+    debug_assert!(window_len > 0);
+    let first = (window_start * bits_per_item) / 64;
+    let last = ((window_start + window_len) * bits_per_item - 1) / 64;
+    (first, last)
+}
+
+/// Merkle root over the fingerprint's packed `u64` blocks.
+pub fn fingerprint_blocks_root(bits: &[u64]) -> Vec<u8> {
+    assert!(
+        !bits.is_empty(),
+        "a trace commitment fingerprint is never empty"
+    );
+    let mut tree = TraceTree::new(1);
+    for block in bits {
+        tree.append(fingerprint_block_leaf(*block));
+    }
+    tree.root(0).expect("fingerprint blocks root").0
+}
+
+impl TraceCommitmentExt for TraceCommitment {
+    fn build(trace: &Trace, seed: &[u8], fraud_proof_config: FraudProofConfig) -> TraceCommitment {
         assert!(
             trace.len() > fraud_proof_config.window_size,
             "Trace length can't be less than verification window"
@@ -226,7 +283,7 @@ impl TraceCommitment {
 
     /// Try to create a commitment from items, returning an error if the trace
     /// is empty or too short for the fraud-proof window.
-    pub fn try_from(
+    fn try_build(
         trace: &Trace,
         seed: &[u8],
         fraud_proof_config: FraudProofConfig,
@@ -243,12 +300,7 @@ impl TraceCommitment {
                 fraud_proof_config.window_size + 1
             )));
         }
-        Ok(Self::from(trace, seed, fraud_proof_config))
-    }
-
-    /// Fraud-proof window size this commitment was built with.
-    pub fn window_size(&self) -> usize {
-        self.revealed_items.len()
+        Ok(Self::build(trace, seed, fraud_proof_config))
     }
 
     /// Check structural consistency of a (possibly untrusted) deserialized
@@ -258,7 +310,7 @@ impl TraceCommitment {
     /// This does not prove the commitment is honest — catching wrong hashes
     /// or fingerprints is verification's job — only that its fields are
     /// consistent with each other.
-    pub fn validate(&self) -> Result<()> {
+    fn validate(&self) -> Result<()> {
         let bits_per_item = self.fingerprint.bits_per_item();
         if !(MIN_BITS_PER_ITEM..=MAX_BITS_PER_ITEM).contains(&bits_per_item) {
             return Err(BitPackerError::InvalidCommitment(format!(
@@ -305,7 +357,7 @@ impl TraceCommitment {
     /// Get the frontier (partial Merkle path) at position n.
     ///
     /// This can be used to continue building the tree from position n.
-    pub fn frontier(trace: &Trace, n: usize, seed: &[u8]) -> Option<TraceTreeFrontier> {
+    fn frontier(trace: &Trace, n: usize, seed: &[u8]) -> Option<TraceTreeFrontier> {
         let items_hashes: Vec<Vec<u8>> = trace.iter().map(|item| item.hash()).collect();
 
         let mut trace_tree = TraceTree::new(1);
@@ -318,7 +370,7 @@ impl TraceCommitment {
         trace_tree.frontier().cloned()
     }
 
-    pub fn witness(trace: &Trace, n: usize, seed: &[u8]) -> Option<MerklePath<Bytes, 32>> {
+    fn witness(trace: &Trace, n: usize, seed: &[u8]) -> Option<MerklePath<Bytes, 32>> {
         if n >= trace.len() {
             return None;
         }
@@ -346,7 +398,7 @@ impl TraceCommitment {
     }
 
     /// Try to get the frontier, returning an error on failure.
-    pub fn try_frontier(trace: &Trace, n: usize, seed: &[u8]) -> Result<TraceTreeFrontier> {
+    fn try_frontier(trace: &Trace, n: usize, seed: &[u8]) -> Result<TraceTreeFrontier> {
         if n > trace.len() {
             return Err(BitPackerError::InvalidRange {
                 start: 0,
@@ -373,17 +425,60 @@ impl TraceCommitment {
             .ok_or_else(|| BitPackerError::InvalidWindow("Failed to get frontier".to_string()))
     }
 
-    /// Get the number of commitments.
-    pub fn len(&self) -> usize {
-        self.fingerprint.len()
+    fn header(&self) -> TraceCommitmentHeader {
+        let revealed_bytes =
+            postcard::to_allocvec(&self.revealed_items).expect("revealed items are serializable");
+        TraceCommitmentHeader {
+            bits_packer: self.fingerprint.bits_packer,
+            fingerprint_len: self.fingerprint.len() as u64,
+            fingerprint_root: fingerprint_blocks_root(&self.fingerprint.bits),
+            revealed_items_commitment: sha256_bytes(&revealed_bytes),
+        }
     }
 
-    /// Check if the commitment is empty.
-    pub fn is_empty(&self) -> bool {
-        self.fingerprint.is_empty()
+    fn fingerprint_slice_witness(
+        &self,
+        window_start: usize,
+        window_len: usize,
+    ) -> FingerprintSliceWitness {
+        assert!(window_len > 0, "empty fraud window");
+        assert!(
+            window_start + window_len <= self.fingerprint.len(),
+            "fraud window [{}, {}) exceeds the committed fingerprint ({} items)",
+            window_start,
+            window_start + window_len,
+            self.fingerprint.len()
+        );
+        let (first_block, last_block) =
+            fingerprint_block_range(self.fingerprint.bits_per_item(), window_start, window_len);
+
+        let mut tree = TraceTree::new(1);
+        let mut marked = Vec::with_capacity(last_block - first_block + 1);
+        for (index, block) in self.fingerprint.bits.iter().enumerate() {
+            tree.append(fingerprint_block_leaf(*block));
+            if (first_block..=last_block).contains(&index) {
+                marked.push(tree.mark().expect("mark fingerprint block"));
+            }
+        }
+
+        let blocks = (first_block..=last_block)
+            .zip(marked)
+            .map(|(index, position)| {
+                let path = tree
+                    .witness(position, 0)
+                    .expect("fingerprint block witness");
+                FingerprintBlockWitness {
+                    block: self.fingerprint.bits[index],
+                    position: u64::from(position),
+                    path_elems: path.iter().map(|elem| elem.0.clone()).collect(),
+                }
+            })
+            .collect();
+
+        FingerprintSliceWitness { blocks }
     }
 
-    pub fn diff(&self, other: &TraceCommitment) -> Option<usize> {
+    fn diff(&self, other: &TraceCommitment) -> Option<usize> {
         assert!(
             self.fingerprint.len() == other.fingerprint.len(),
             "Trace commitetment length mismatch"
@@ -440,11 +535,62 @@ fn sequence_coordinates(step_record: &StepRecord) -> Option<(CfsCoordinates, u32
     Some((CfsCoordinates(parent_coords.to_vec()), current_child_index))
 }
 
+/// Whether `record` is the step that produced `cfs_item`'s output — i.e.
+/// whether a `PriorItemOutput` binding on `cfs_item` resolves to it.
+fn record_produces_item(record: &StepRecord, cfs_item: &SequenceChildItem) -> bool {
+    match (&record.kind, cfs_item) {
+        // A tile run satisfies a recur-tile item too: an iteration of a
+        // recur site is recorded as an ordinary tile run.
+        (
+            StepKind::Exec(ExecStep {
+                target: ExecTarget::Tile(_),
+                ..
+            }),
+            SequenceChildItem::Tile(_) | SequenceChildItem::RecurTile(_),
+        ) => true,
+        (
+            StepKind::Exec(ExecStep {
+                target: ExecTarget::RecurTile(_),
+                ..
+            }),
+            SequenceChildItem::RecurTile(_),
+        ) => true,
+        (
+            StepKind::Exec(ExecStep {
+                target: ExecTarget::RecurSequence(_),
+                ..
+            }),
+            SequenceChildItem::RecurSequence(_),
+        ) => true,
+        // A nested sequence's output is what it reported on the way out.
+        (StepKind::SequenceEnd { .. }, SequenceChildItem::Sequence(_)) => true,
+        _ => false,
+    }
+}
+
+/// Flatten a binding into the leaf bindings a step actually depends on.
+///
+/// An `Indexed` binding is *two or more* dependencies, not one: the step reads
+/// the value and every authorized index that located it. Flattening here rather
+/// than special-casing below keeps a fraud window self-contained — omitting an
+/// index's source record would leave the window unable to re-derive the read.
+fn flatten_binding<'a>(binding: &'a InputBinding, out: &mut Vec<&'a InputBinding>) {
+    match binding {
+        InputBinding::Indexed { value, indexes } => {
+            flatten_binding(value, out);
+            for index in indexes {
+                flatten_binding(index, out);
+            }
+        }
+        leaf => out.push(leaf),
+    }
+}
+
 fn resolve_inputs_sources(
     step_record: &StepRecord,
     trace: &[StepRecord],
     cfs_cursor: &CfsCursor,
-    step_inputs: &[InputBinding],
+    declared_inputs: &[InputBinding],
 ) -> Vec<(usize, StepRecord)> {
     if cfs_cursor
         .try_get_recur_iteration_coordinates(step_record.coordinates())
@@ -453,12 +599,15 @@ fn resolve_inputs_sources(
         return Vec::new();
     }
 
-    if step_inputs.iter().all(|input| {
-        matches!(
-            input,
-            InputBinding::Direct(InputSource::External | InputSource::Inline)
-        )
-    }) {
+    let mut step_inputs: Vec<&InputBinding> = Vec::new();
+    for binding in declared_inputs {
+        flatten_binding(binding, &mut step_inputs);
+    }
+
+    if step_inputs
+        .iter()
+        .all(|input| matches!(input, InputBinding::Direct(InputSource::Inline)))
+    {
         return Vec::new();
     }
 
@@ -471,11 +620,8 @@ fn resolve_inputs_sources(
     let current_sequence_start_index = trace
         .iter()
         .rposition(|record| {
-            matches!(
-                record,
-                StepRecord::SequenceStart(sequence_start_record)
-                    if sequence_start_record.coordinates == sequence_coordinates
-            )
+            matches!(record.kind, StepKind::SequenceStart { .. })
+                && record.coordinates == sequence_coordinates
         })
         .unwrap_or_else(|| {
             panic!(
@@ -490,25 +636,34 @@ fn resolve_inputs_sources(
 
     for step_input in step_inputs {
         match step_input {
-            InputBinding::Direct(InputSource::External | InputSource::Inline) => {}
-            InputBinding::Direct(InputSource::Internal) => {
-                panic!("Direct internal bindings are not yet supported in trace source resolution");
+            InputBinding::Direct(InputSource::Inline) => {}
+            InputBinding::Direct(InputSource::Storage) => {
+                panic!("Direct storage bindings are not yet supported in trace source resolution");
+            }
+            InputBinding::EntryArgument => {
+                // The source is the program's `ProgramStart` step, which bound
+                // the authorized entry object at the sequence root `[]`.
+                let source = trace
+                    .iter()
+                    .enumerate()
+                    .find(|(_, record)| matches!(record.kind, StepKind::ProgramStart(_)))
+                    .map(|(index, record)| (index, record.clone()))
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "Failed to resolve ProgramStart source for entry-argument input of step {:?}",
+                            step_record
+                        )
+                    });
+                source_records.push(source);
             }
             InputBinding::SequenceScope { input_index } => {
                 let (parent_index, source_record) = current_sequence_trace_suffix
                     .first()
-                    .cloned()
-                    .and_then(|record| match record {
-                        StepRecord::SequenceStart(sequence_start_record)
-                            if sequence_start_record.coordinates == sequence_coordinates =>
-                        {
-                            Some((
-                                current_sequence_start_index,
-                                StepRecord::SequenceStart(sequence_start_record),
-                            ))
-                        }
-                        _ => None,
+                    .filter(|record| {
+                        matches!(record.kind, StepKind::SequenceStart { .. })
+                            && record.coordinates == sequence_coordinates
                     })
+                    .map(|record| (current_sequence_start_index, record.clone()))
                     .unwrap_or_else(|| {
                         panic!(
                             "Failed to resolve sequence input {input_index} for step {:?} in frame {:?}",
@@ -547,47 +702,15 @@ fn resolve_inputs_sources(
                 let source_record = current_sequence_trace_suffix
                     .iter()
                     .enumerate()
-                    .find_map(|(intra_sequence_offset, record)| match (record, source_record_cfs_item) {
+                    .find(|(_, record)| {
+                        record.coordinates == source_record_coordinates
+                            && record_produces_item(record, source_record_cfs_item)
+                    })
+                    .map(|(intra_sequence_offset, record)| {
                         (
-                            StepRecord::TileExec(tile_exec_record),
-                            SequenceChildItem::Tile(_) | SequenceChildItem::RecurTile(_),
+                            current_sequence_start_index + intra_sequence_offset,
+                            record.clone(),
                         )
-                            if tile_exec_record.coordinates == source_record_coordinates =>
-                        {
-                            Some((
-                                current_sequence_start_index + intra_sequence_offset,
-                                record.clone(),
-                            ))
-                        }
-                        (StepRecord::SequenceEnd(sequence_end_record), SequenceChildItem::Sequence(_))
-                            if sequence_end_record.coordinates == source_record_coordinates =>
-                        {
-                            Some((
-                                current_sequence_start_index + intra_sequence_offset,
-                                record.clone(),
-                            ))
-                        }
-                        (
-                            StepRecord::RecurTileExec(recur_exec_record),
-                            SequenceChildItem::RecurTile(_),
-                        )
-                            if recur_exec_record.coordinates == source_record_coordinates =>
-                        {
-                            Some((
-                                current_sequence_start_index + intra_sequence_offset,
-                                record.clone(),
-                            ))
-                        }
-                        (
-                            StepRecord::RecurSequenceExec(recur_sequence_exec_record),
-                            SequenceChildItem::RecurSequence(_),
-                        ) if recur_sequence_exec_record.coordinates == source_record_coordinates => {
-                            Some((
-                                current_sequence_start_index + intra_sequence_offset,
-                                record.clone(),
-                            ))
-                        }
-                        _ => None,
                     })
                     .unwrap_or_else(|| {
                         panic!(
@@ -599,6 +722,10 @@ fn resolve_inputs_sources(
                     });
 
                 source_records.push(source_record);
+            }
+            // Flattened away above: `Indexed` is never a leaf here.
+            InputBinding::Indexed { .. } => {
+                unreachable!("flatten_binding removes Indexed before this match")
             }
         }
     }
@@ -803,7 +930,7 @@ mod tests {
         CfsCoordinates, InputBinding, SequenceChildItem, SequenceDef, SequenceItem, TileDef,
         TileItem,
     };
-    use raster_core::trace::{SequenceEndRecord, SequenceStartRecord, TileExecRecord};
+    use raster_core::trace::StorageRoots;
 
     use super::*;
     use crate::precomputed;
@@ -859,21 +986,29 @@ mod tests {
         _input_count: usize,
         output: u64,
     ) -> StepRecord {
-        StepRecord::TileExec(TileExecRecord {
+        StepRecord {
             exec_index,
             sequence_id: sequence_id.to_string(),
-            intra_sequence_index,
             coordinates: CfsCoordinates(coordinates),
-            tile_id: fn_name.to_string(),
-            input_commitment: Vec::new(),
-            input_source_commitment: Vec::new(),
-            external_input_commitment: Vec::new(),
-            output_commitment: output.to_le_bytes().to_vec(),
-            internal_store_root_before: Vec::new(),
-            internal_store_root_after: Vec::new(),
-            internal_store_index_root_before: Vec::new(),
-            internal_store_index_root_after: Vec::new(),
-        })
+            kind: StepKind::Exec(ExecStep {
+                target: ExecTarget::Tile(fn_name.to_string()),
+                intra_sequence_index,
+                input_commitment: Vec::new(),
+                input_source_commitment: Vec::new(),
+                output_commitment: output.to_le_bytes().to_vec(),
+                storage: empty_storage_roots(),
+            }),
+            recur_progress_commitment: [0u8; 32],
+        }
+    }
+
+    fn empty_storage_roots() -> StorageRoots {
+        StorageRoots {
+            root_before: Vec::new(),
+            root_after: Vec::new(),
+            index_root_before: Vec::new(),
+            index_root_after: Vec::new(),
+        }
     }
 
     fn make_sequence_start_record(
@@ -882,14 +1017,16 @@ mod tests {
         coordinates: Vec<u32>,
         _input_count: usize,
     ) -> StepRecord {
-        StepRecord::SequenceStart(SequenceStartRecord {
+        StepRecord {
             exec_index,
             sequence_id: sequence_id.to_string(),
             coordinates: CfsCoordinates(coordinates),
-            input_commitment: Vec::new(),
-            input_source_commitment: Vec::new(),
-            external_input_commitment: Vec::new(),
-        })
+            kind: StepKind::SequenceStart {
+                input_commitment: Vec::new(),
+                input_source_commitment: Vec::new(),
+            },
+            recur_progress_commitment: [0u8; 32],
+        }
     }
 
     fn make_sequence_end_record(
@@ -897,12 +1034,15 @@ mod tests {
         sequence_id: &str,
         coordinates: Vec<u32>,
     ) -> StepRecord {
-        StepRecord::SequenceEnd(SequenceEndRecord {
+        StepRecord {
             exec_index,
             sequence_id: sequence_id.to_string(),
             coordinates: CfsCoordinates(coordinates),
-            output_commitment: Vec::new(),
-        })
+            kind: StepKind::SequenceEnd {
+                output_commitment: Vec::new(),
+            },
+            recur_progress_commitment: [0u8; 32],
+        }
     }
 
     fn make_test_cfs() -> ControlFlowSchema {
@@ -911,7 +1051,7 @@ mod tests {
         let mut main = SequenceDef::new("main");
         main.items.push(SequenceChildItem::Tile(TileItem {
             id: "test_tile".to_string(),
-            sources: vec![InputBinding::external()],
+            sources: vec![InputBinding::inline()],
         }));
         cfs.sequences.push(main);
         cfs
@@ -926,7 +1066,7 @@ mod tests {
         let mut main = SequenceDef::new("main");
         main.items.push(SequenceChildItem::Tile(TileItem {
             id: "producer".to_string(),
-            sources: vec![InputBinding::external()],
+            sources: vec![InputBinding::inline()],
         }));
         main.items.push(SequenceChildItem::Tile(TileItem {
             id: "consumer".to_string(),
@@ -934,7 +1074,7 @@ mod tests {
         }));
         main.items.push(SequenceChildItem::Tile(TileItem {
             id: "tail".to_string(),
-            sources: vec![InputBinding::external()],
+            sources: vec![InputBinding::inline()],
         }));
 
         cfs.sequences.push(main);
@@ -947,21 +1087,21 @@ mod tests {
         cfs.tiles.push(TileDef::iter("tail", 1, 1));
 
         let mut main = SequenceDef::new("main");
-        main.input_sources = vec![InputBinding::external()];
+        main.input_sources = vec![InputBinding::inline()];
         main.items.push(SequenceChildItem::Sequence(SequenceItem {
             id: "inner".to_string(),
             sources: vec![InputBinding::seq_input(0)],
         }));
         main.items.push(SequenceChildItem::Tile(TileItem {
             id: "tail".to_string(),
-            sources: vec![InputBinding::external()],
+            sources: vec![InputBinding::inline()],
         }));
 
         let mut inner = SequenceDef::new("inner");
-        inner.input_sources = vec![InputBinding::external()];
+        inner.input_sources = vec![InputBinding::inline()];
         inner.items.push(SequenceChildItem::Tile(TileItem {
             id: "inner_tile".to_string(),
-            sources: vec![InputBinding::external()],
+            sources: vec![InputBinding::inline()],
         }));
 
         cfs.sequences.push(main);
@@ -975,7 +1115,7 @@ mod tests {
         cfs.tiles.push(TileDef::iter("tail", 1, 1));
 
         let mut main = SequenceDef::new("main");
-        main.input_sources = vec![InputBinding::external()];
+        main.input_sources = vec![InputBinding::inline()];
         main.items.push(SequenceChildItem::Sequence(SequenceItem {
             id: "inner".to_string(),
             sources: vec![InputBinding::seq_input(0)],
@@ -986,10 +1126,10 @@ mod tests {
         }));
 
         let mut inner = SequenceDef::new("inner");
-        inner.input_sources = vec![InputBinding::external()];
+        inner.input_sources = vec![InputBinding::inline()];
         inner.items.push(SequenceChildItem::Tile(TileItem {
             id: "inner_tile".to_string(),
-            sources: vec![InputBinding::external()],
+            sources: vec![InputBinding::inline()],
         }));
 
         cfs.sequences.push(main);
@@ -1015,12 +1155,12 @@ mod tests {
             make_tile_trace_item(4, 4),
         ]);
 
-        let binded_trace = TraceCommitment::from(
+        let binded_trace = TraceCommitment::build(
             &items,
             &precomputed::EMPTY_TRIE_NODES[0],
             test_fraud_proof_config(),
         );
-        let ref_binded_trace = TraceCommitment::from(
+        let ref_binded_trace = TraceCommitment::build(
             &ref_items,
             &precomputed::EMPTY_TRIE_NODES[0],
             test_fraud_proof_config(),
@@ -1040,7 +1180,7 @@ mod tests {
     #[test]
     fn test_try_from_empty_trace() {
         let items = Trace::new();
-        let result = TraceCommitment::try_from(
+        let result = TraceCommitment::try_build(
             &items,
             &precomputed::EMPTY_TRIE_NODES[0],
             test_fraud_proof_config(),
@@ -1054,7 +1194,7 @@ mod tests {
         // shorter and an equal-length trace are rejected.
         for trace_len in [1, 2] {
             let items = Trace((0..trace_len).map(|i| make_tile_trace_item(i, i)).collect());
-            let result = TraceCommitment::try_from(
+            let result = TraceCommitment::try_build(
                 &items,
                 &precomputed::EMPTY_TRIE_NODES[0],
                 test_fraud_proof_config(),
@@ -1161,7 +1301,7 @@ mod tests {
     #[test]
     fn test_verify_trace_returns_ok_for_matching_trace() {
         let trace = Trace((0..5).map(|i| make_tile_trace_item(i, i)).collect());
-        let trace_commitment = TraceCommitment::from(
+        let trace_commitment = TraceCommitment::build(
             &trace,
             &precomputed::EMPTY_TRIE_NODES[0],
             test_fraud_proof_config(),
@@ -1181,7 +1321,7 @@ mod tests {
         let mut runtime_trace = committed_trace.clone();
         runtime_trace[2] = make_tile_trace_item(2, 999);
 
-        let trace_commitment = TraceCommitment::from(
+        let trace_commitment = TraceCommitment::build(
             &committed_trace,
             &precomputed::EMPTY_TRIE_NODES[0],
             test_fraud_proof_config(),
@@ -1199,7 +1339,7 @@ mod tests {
     fn test_verifier_rejects_structurally_malformed_commitment() {
         let trace = Trace((0..5).map(|i| make_tile_trace_item(i, i)).collect());
         let cfs = make_test_cfs();
-        let valid = TraceCommitment::from(
+        let valid = TraceCommitment::build(
             &trace,
             &precomputed::EMPTY_TRIE_NODES[0],
             test_fraud_proof_config(),
@@ -1243,7 +1383,7 @@ mod tests {
             make_tile_trace_item_at(4, "main", 2, vec![2], "tail".to_string(), 1, 30),
             make_sequence_end_record(5, "main", vec![]),
         ]);
-        let trace_commitment = TraceCommitment::from(
+        let trace_commitment = TraceCommitment::build(
             &trace,
             &precomputed::EMPTY_TRIE_NODES[0],
             test_fraud_proof_config(),
@@ -1267,7 +1407,7 @@ mod tests {
             make_tile_trace_item_at(5, "main", 1, vec![1], "tail".to_string(), 1, 20),
             make_sequence_end_record(6, "main", vec![]),
         ]);
-        let trace_commitment = TraceCommitment::from(
+        let trace_commitment = TraceCommitment::build(
             &trace,
             &precomputed::EMPTY_TRIE_NODES[0],
             test_fraud_proof_config(),
@@ -1291,7 +1431,7 @@ mod tests {
             make_tile_trace_item_at(5, "main", 1, vec![1], "tail".to_string(), 1, 20),
             make_sequence_end_record(6, "main", vec![]),
         ]);
-        let trace_commitment = TraceCommitment::from(
+        let trace_commitment = TraceCommitment::build(
             &trace,
             &precomputed::EMPTY_TRIE_NODES[0],
             test_fraud_proof_config(),
@@ -1320,7 +1460,7 @@ mod tests {
             make_tile_trace_item_at(3, "main", 2, vec![2], "tail".to_string(), 1, 30),
             make_sequence_end_record(4, "main", vec![]),
         ]);
-        let trace_commitment = TraceCommitment::from(
+        let trace_commitment = TraceCommitment::build(
             &committed_trace,
             &precomputed::EMPTY_TRIE_NODES[0],
             test_fraud_proof_config(),

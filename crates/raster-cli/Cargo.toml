@@ -38,3 +38,5 @@ hex = "0.4"
 rayon.workspace = true
 rand.workspace = true
 sha2.workspace = true
+toml = "0.8"
+serde = { workspace = true, features = ["derive"] }

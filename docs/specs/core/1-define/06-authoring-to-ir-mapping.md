@@ -275,8 +275,8 @@ fn greet_sequence(name: String) -> String {
 }
 
 #[sequence(description = "Entry point")]
-fn main() {
-    let name = select!(String, external!(String, "name"));
+fn main(name: String) {
+    let name = select!(String, name);
     call_seq!(greet_sequence, name);
 }
 ```
@@ -291,7 +291,8 @@ fn main() {
     - `name` resolves to `seq_input(0)`
     - `greeting` resolves to `prior_item_output(0)` (output of `greet`)
 - `main` → calls: `[call_seq!(greet_sequence, name) → Sequence]`
-    - `name` resolves to `external`
+    - `main` declares one entry argument, so its CFS definition gets a leading `Entrypoint` item (`names: ["name"]`) at item 0 and empty `input_sources`
+    - `name` resolves to `prior_item_output(0)` (the Entrypoint binding)
 
 ### Expected CFS (informative JSON shape)
 

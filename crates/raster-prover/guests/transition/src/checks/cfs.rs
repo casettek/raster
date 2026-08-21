@@ -1,13 +1,22 @@
-//! Checks that a step record matches the control flow schema: coordinate
-//! ordering and per-argument input bindings.
+//! Checks that a step record matches the control flow schema: that the
+//! record's kind matches the item declared at its coordinates, that its
+//! per-argument input bindings are honoured, and that its coordinates
+//! follow the schema's ordering.
 
-use raster_core::cfs::{CfsCoordinates, CfsCursor, InputBinding, InputSource};
-use raster_core::trace::{ExternalData, FnInput, FnInputValue, InternalData, StepRecord};
+use raster_core::cfs::{CfsCoordinates, CfsCursor, InputBinding, InputSource, SequenceChildItem};
+use raster_core::input::SelectorSegment;
+use std::collections::BTreeMap;
+
+use raster_core::draft::TileReplayJournal;
+use raster_core::input::{SelectionPayloadKind, SelectionWitness};
+use raster_core::recur_progress::{RecurProgressStack, RecurSiteKind};
+use raster_core::trace::{
+    ExecStep, ExecTarget, FnInput, FnInputValue, StepKind, StepRecord, StorageData,
+};
 
 enum ResolvedSource<'a> {
     Inline(&'a Vec<u8>),
-    External(&'a ExternalData),
-    Internal(&'a InternalData),
+    Storage(&'a StorageData),
 }
 
 fn resolved_source_at<'a>(input: &'a FnInput, index: usize) -> ResolvedSource<'a> {
@@ -22,16 +31,12 @@ fn resolved_source_at<'a>(input: &'a FnInput, index: usize) -> ResolvedSource<'a
 
     match value {
         FnInputValue::Inline(bytes) => ResolvedSource::Inline(bytes),
-        FnInputValue::ExternalBinding => {
-            ResolvedSource::External(input.external().get(&arg.name).unwrap_or_else(|| {
-                panic!("Missing external input metadata for arg '{}'", arg.name)
-            }))
-        }
-        FnInputValue::InternalBinding => {
-            ResolvedSource::Internal(input.internal().get(&arg.name).unwrap_or_else(|| {
-                panic!("Missing internal input metadata for arg '{}'", arg.name)
-            }))
-        }
+        FnInputValue::StorageBinding => ResolvedSource::Storage(
+            input
+                .storage()
+                .get(&arg.name)
+                .unwrap_or_else(|| panic!("Missing storage input metadata for arg '{}'", arg.name)),
+        ),
     }
 }
 
@@ -43,16 +48,10 @@ fn assert_same_source(left: ResolvedSource<'_>, right: ResolvedSource<'_>) {
                 "Inline sequence scope input does not match consumer binding",
             );
         }
-        (ResolvedSource::External(left_meta), ResolvedSource::External(right_meta)) => {
+        (ResolvedSource::Storage(left_meta), ResolvedSource::Storage(right_meta)) => {
             assert_eq!(
                 left_meta, right_meta,
-                "External sequence scope input does not match consumer binding",
-            );
-        }
-        (ResolvedSource::Internal(left_meta), ResolvedSource::Internal(right_meta)) => {
-            assert_eq!(
-                left_meta, right_meta,
-                "Internal sequence scope input does not match consumer binding",
+                "Storage sequence scope input does not match consumer binding",
             );
         }
         _ => {
@@ -69,17 +68,80 @@ fn has_coordinate_prefix(coordinates: &CfsCoordinates, prefix: &CfsCoordinates) 
             .all(|(coordinate, expected)| coordinate == expected)
 }
 
+/// Whether a step record of this kind may occupy a CFS item of this kind.
+///
+/// Input bindings alone cannot tell these apart, and the kinds differ in how
+/// their output is verified — a tile's by replay proof. Without this, a
+/// record could take a coordinate whose verification rules are weaker than
+/// its own. The program-boundary steps (`ProgramStart` and `main`'s
+/// `SequenceEnd`) never reach this check: they sit at the sequence root,
+/// which is not a CFS item.
+fn record_matches_item(step_record: &StepRecord, cfs_item: &SequenceChildItem) -> bool {
+    // The trace carries names (fingerprinted, so tamper-evident) but the guest
+    // must also *bind* them: the recorded target name must equal the CFS item
+    // id at the step's coordinates. Without this the coordinate → tile-id
+    // resolution the registry lookup relies on could be steered by a
+    // mislabelled record. See program-identity.md.
+    match (&step_record.kind, cfs_item) {
+        (
+            StepKind::Exec(ExecStep {
+                target: ExecTarget::Tile(name),
+                ..
+            }),
+            SequenceChildItem::Tile(item),
+        ) => name == &item.id,
+        (
+            StepKind::Exec(ExecStep {
+                target: ExecTarget::RecurTile(name),
+                ..
+            }),
+            SequenceChildItem::RecurTile(item),
+        ) => name == &item.id,
+        (
+            StepKind::Exec(ExecStep {
+                target: ExecTarget::RecurSequence(name),
+                ..
+            }),
+            SequenceChildItem::RecurSequence(item),
+        ) => name == &item.id,
+        // A nested sequence is entered and left at its own item coordinate,
+        // whether it is an ordinary or a recur sequence. The entered
+        // sequence's name is carried on the step record.
+        (
+            StepKind::SequenceStart { .. } | StepKind::SequenceEnd { .. },
+            SequenceChildItem::Sequence(item),
+        ) => step_record.sequence_id == item.id,
+        (
+            StepKind::SequenceStart { .. } | StepKind::SequenceEnd { .. },
+            SequenceChildItem::RecurSequence(item),
+        ) => step_record.sequence_id == item.id,
+        // A recur *tile* site opens with a boundary step too: `RecurTileStart`
+        // becomes `SequenceStart` at `[s]`, carrying the site's own id so it
+        // binds to the item the same way a sequence's boundary steps do. Its
+        // `End` half stays `Exec(RecurTile)`, matched above.
+        (StepKind::SequenceStart { .. }, SequenceChildItem::RecurTile(item)) => {
+            step_record.sequence_id == item.id
+        }
+        _ => false,
+    }
+}
+
 /// For an iteration of a recur site with a CFS-declared chunk size, verify the
-/// iteration consumed a chunk of `1..=declared` elements. The chunk length is
-/// the leading varint of the iteration's canonical input bytes (the first tile
-/// argument is `RecurInput<Vec<T>>`, whose first field is the chunk vector);
-/// those bytes are pinned by `input_commitment` and executed by the replay
-/// proof, so the prefix cannot lie about the payload.
+/// iteration consumed a chunk of `1..=declared` elements.
+///
+/// The count comes from the iteration's **replay journal** — `consumed_elements`
+/// — rather than from inspecting the leading postcard varint of its ABI bytes.
+/// The varint trick worked only because a chunked tile's first argument happened
+/// to be `RecurInput<Vec<T>>`, whose first field is the chunk vector; it was a
+/// layout assumption about user types, and it could not read anything else the
+/// audit needs (an *unchunked* iteration's index, or how the tile terminated).
+/// The tile now commits the number directly and the replay receipt covers it.
+/// See `docs/proposals/lazy-list-recur.md` §5.
 fn verify_recur_iteration_chunking(
     cfs_cursor: &CfsCursor,
     step_record: &StepRecord,
     site_coordinates: &CfsCoordinates,
-    input_witness: Option<&Vec<u8>>,
+    replay_journal: Option<&TileReplayJournal>,
 ) {
     let Some(raster_core::cfs::SequenceChildItem::RecurTile(item)) =
         cfs_cursor.try_get_item(site_coordinates)
@@ -90,25 +152,39 @@ fn verify_recur_iteration_chunking(
         return;
     };
 
-    let input_witness = input_witness.unwrap_or_else(|| {
-        panic!(
-            "Chunked recur iteration {:?} is missing its input witness",
-            step_record
-        )
-    });
-    let chunk_len = raster_core::chunking::iteration_chunk_len(input_witness)
+    let recur = replay_journal
+        .and_then(|journal| journal.recur.as_ref())
         .unwrap_or_else(|| {
             panic!(
-                "Chunked recur iteration {:?} input does not carry a chunk length",
+                "Chunked recur iteration {:?} is missing its replay-proven recur facts",
                 step_record
             )
         });
-    if let Err(violation) = raster_core::chunking::check_iteration_chunk_len(declared, chunk_len)
-    {
+    let consumed = recur.position.consumed_elements;
+    if let Err(violation) = raster_core::chunking::check_iteration_chunk_len(declared, consumed) {
         panic!(
             "Recur chunking violation at step {:?}: {}",
             step_record, violation
         );
+    }
+
+    // Only the *final* chunk may be short. The native recorder used to enforce
+    // this by remembering the previous iteration's length; the journal makes it
+    // a stateless, per-iteration fact, because `declared_iterations` already
+    // says whether this iteration is the last one. Same rule, replay-proven
+    // instead of host-remembered — and it is what rejects a `4,1,4,1` shape at
+    // `C = 4` on the iteration that goes short, rather than on the one after.
+    let is_final_iteration =
+        recur.position.iteration_index + 1 >= recur.position.declared_iterations;
+    if !is_final_iteration {
+        if let Err(violation) =
+            raster_core::chunking::check_previous_chunk_was_full(declared, consumed)
+        {
+            panic!(
+                "Recur chunking violation at step {:?}: {}",
+                step_record, violation
+            );
+        }
     }
 }
 
@@ -117,10 +193,13 @@ pub fn verify_step_record_inputs(
     step_record: &StepRecord,
     input_source_witness: Option<&FnInput>,
     sequence_scope_witness: Option<&FnInput>,
-    input_witness: Option<&Vec<u8>>,
+    replay_journal: Option<&TileReplayJournal>,
 ) {
-    // TODO: SequenceStart/SequenceEnd entrypoint case. In case of SequenceStart input is External Kind from
-    // cli or from file. SequenceEnd just binding latest executed tile output.
+    // The program-boundary steps sit at the sequence root `[]`, which is not
+    // itself a CFS item and binds no CFS inputs: `ProgramStart` binds
+    // authorized external data and `ProgramEnd` commits the authorized output,
+    // both checked in `checks::entrypoint` against storage/the journal rather
+    // than against CFS input bindings.
     if step_record.coordinates().is_empty() {
         return;
     }
@@ -128,12 +207,7 @@ pub fn verify_step_record_inputs(
     if let Some((site_coordinates, _)) =
         cfs_cursor.try_get_recur_iteration_coordinates(step_record.coordinates())
     {
-        verify_recur_iteration_chunking(
-            cfs_cursor,
-            step_record,
-            &site_coordinates,
-            input_witness,
-        );
+        verify_recur_iteration_chunking(cfs_cursor, step_record, &site_coordinates, replay_journal);
         return;
     }
 
@@ -145,6 +219,11 @@ pub fn verify_step_record_inputs(
                 step_record
             )
         });
+    assert!(
+        record_matches_item(step_record, cfs_item),
+        "Step record kind does not match the CFS item kind at its coordinates: {:?}",
+        step_record,
+    );
     let step_inputs = cfs_item.inputs();
 
     let input_source_witness = input_source_witness.unwrap_or_else(|| {
@@ -167,87 +246,225 @@ pub fn verify_step_record_inputs(
 
     for (input_index, step_input) in step_inputs.iter().enumerate() {
         let resolved_source = resolved_source_at(input_source_witness, input_index);
-        match step_input {
-            InputBinding::Direct(InputSource::External) => {
-                assert!(
-                    matches!(resolved_source, ResolvedSource::External(_)),
-                    "Expected external input source for step {:?} arg {}",
-                    step_record,
-                    input_index,
-                );
-            }
-            InputBinding::Direct(InputSource::Inline) => {
-                assert!(
-                    matches!(resolved_source, ResolvedSource::Inline(_)),
-                    "Expected inline input source for step {:?} arg {}",
-                    step_record,
-                    input_index,
-                );
-            }
-            InputBinding::Direct(InputSource::Internal) => {
-                assert!(
-                    matches!(resolved_source, ResolvedSource::Internal(_)),
-                    "Expected internal input source for step {:?} arg {}",
-                    step_record,
-                    input_index,
-                );
-            }
-            InputBinding::SequenceScope { input_index } => {
-                let sequence_scope_witness = sequence_scope_witness.unwrap_or_else(|| {
-                    panic!(
-                        "Missing sequence scope witness for step record {:?}",
-                        step_record
-                    )
-                });
-                let scope_source = resolved_source_at(sequence_scope_witness, *input_index);
-                assert_same_source(resolved_source, scope_source);
-            }
-            InputBinding::PriorItemOutput {
-                intra_sequence_item_index,
-            } => {
-                assert!(
-                    *intra_sequence_item_index < item_coordinate as usize,
-                    "Step {:?} cannot depend on source item {} from the same or a future position {}",
-                    step_record,
-                    intra_sequence_item_index,
-                    item_coordinate
-                );
+        verify_one_binding(
+            step_input,
+            resolved_source,
+            input_index,
+            step_record,
+            cfs_cursor,
+            input_source_witness,
+            sequence_scope_witness,
+            &parent_sequence_coordinates,
+            item_coordinate,
+        );
+    }
+}
 
-                let mut source_coordinates = parent_sequence_coordinates.clone();
-                source_coordinates.push(
-                    (*intra_sequence_item_index)
-                        .try_into()
-                        .expect("Prior item output index exceeds CFS coordinate bounds"),
-                );
-                let internal_meta = match resolved_source {
-                    ResolvedSource::Internal(meta) => meta,
-                    _ => {
-                        panic!(
-                            "Expected internal input source for step {:?} arg {}",
-                            step_record, input_index
-                        )
-                    }
-                };
-                match cfs_cursor
-                    .try_get_item(&source_coordinates)
-                    .expect("Expected prior item output coordinates to resolve in CFS")
-                {
-                    raster_core::cfs::SequenceChildItem::Sequence(_)
-                    | raster_core::cfs::SequenceChildItem::RecurSequence(_) => {
-                        assert!(
-                            has_coordinate_prefix(&internal_meta.coordinates, &source_coordinates),
-                            "Internal input prior-item-output coordinates do not descend from expected sequence source",
+/// Count the `BoundIndex` segments in a resolved source's selection path.
+///
+/// Zero for an inline source: an inline value has no path, so it can carry no
+/// dynamic index.
+fn bound_index_count(resolved_source: &ResolvedSource<'_>) -> usize {
+    match resolved_source {
+        ResolvedSource::Inline(_) => 0,
+        ResolvedSource::Storage(meta) => meta
+            .selection
+            .path
+            .segments
+            .iter()
+            .filter(|segment| matches!(segment, SelectorSegment::BoundIndex { .. }))
+            .count(),
+    }
+}
+
+/// The storage bindings a resolved source cites through its `BoundIndex`
+/// segments, in selector order.
+///
+/// Resolving the citation here is what lets the CFS check reach the index's own
+/// binding: the step's storage map is the only place the cited value appears.
+fn cited_index_sources<'a>(
+    resolved_source: &ResolvedSource<'a>,
+    input_source_witness: &'a FnInput,
+) -> Vec<&'a StorageData> {
+    let ResolvedSource::Storage(meta) = resolved_source else {
+        return Vec::new();
+    };
+    meta.selection
+        .path
+        .segments
+        .iter()
+        .filter_map(|segment| match segment {
+            SelectorSegment::BoundIndex { source, .. } => {
+                Some(input_source_witness.storage().get(source).unwrap_or_else(|| {
+                    panic!("Bound index cites storage binding '{}', which the step does not record", source)
+                }))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Hold one recorded argument to one CFS input binding.
+///
+/// Split out of the loop so [`InputBinding::Indexed`] can delegate to it for
+/// both the value it wraps and each index it cites.
+#[allow(clippy::too_many_arguments)]
+fn verify_one_binding(
+    step_input: &InputBinding,
+    resolved_source: ResolvedSource<'_>,
+    input_index: usize,
+    step_record: &StepRecord,
+    cfs_cursor: &CfsCursor,
+    input_source_witness: &FnInput,
+    sequence_scope_witness: Option<&FnInput>,
+    parent_sequence_coordinates: &CfsCoordinates,
+    item_coordinate: u32,
+) {
+    // A binding the schema did *not* declare as index-sourced must not have
+    // become one in the recording, and vice versa. Without this pairing the
+    // schema would describe dynamic indexing without constraining it: a prover
+    // could add a `BoundIndex` to an argument the program wrote with a literal
+    // index (or drop one the program wrote), and every other check would still
+    // pass because each is satisfied by *some* consistent index.
+    let declared_indexes = step_input.index_bindings();
+    let recorded_indexes = bound_index_count(&resolved_source);
+    assert_eq!(
+        declared_indexes.len(),
+        recorded_indexes,
+        "Step {:?} arg {} records {} data-sourced index(es) but the CFS declares {}",
+        step_record,
+        input_index,
+        recorded_indexes,
+        declared_indexes.len(),
+    );
+
+    if !declared_indexes.is_empty() {
+        // Each cited index is itself a value with provenance; hold it to the
+        // binding the schema declares for it, the same way the wrapped value is
+        // held to its own.
+        let cited = cited_index_sources(&resolved_source, input_source_witness);
+        assert_eq!(
+            cited.len(),
+            declared_indexes.len(),
+            "Step {:?} arg {} cites {} index binding(s) but the CFS declares {}",
+            step_record,
+            input_index,
+            cited.len(),
+            declared_indexes.len(),
+        );
+        for (index_binding, index_source) in declared_indexes.iter().zip(cited) {
+            verify_one_binding(
+                index_binding,
+                ResolvedSource::Storage(index_source),
+                input_index,
+                step_record,
+                cfs_cursor,
+                input_source_witness,
+                sequence_scope_witness,
+                parent_sequence_coordinates,
+                item_coordinate,
+            );
+        }
+    }
+
+    match step_input.value_binding() {
+        InputBinding::Direct(InputSource::Inline) => {
+            assert!(
+                matches!(resolved_source, ResolvedSource::Inline(_)),
+                "Expected inline input source for step {:?} arg {}",
+                step_record,
+                input_index,
+            );
+        }
+        InputBinding::Direct(InputSource::Storage) => {
+            assert!(
+                matches!(resolved_source, ResolvedSource::Storage(_)),
+                "Expected storage input source for step {:?} arg {}",
+                step_record,
+                input_index,
+            );
+        }
+        InputBinding::EntryArgument => {
+            // One of `main`'s entry arguments: it must be sourced from
+            // the authorized entry object at the sequence root `[]` that
+            // the `ProgramStart` step bound. The selector into that
+            // object (and its selection proof) is verified separately by
+            // the storage checks; here we hold the binding to the one
+            // coordinate the entry object can legitimately come from.
+            let storage_meta = match resolved_source {
+                ResolvedSource::Storage(meta) => meta,
+                _ => panic!(
+                    "Expected storage input source for entry-argument step {:?} arg {}",
+                    step_record, input_index
+                ),
+            };
+            assert!(
+                storage_meta.coordinates.is_empty(),
+                "Entry-argument input for step {:?} arg {} must come from the sequence root",
+                step_record,
+                input_index,
+            );
+        }
+        InputBinding::SequenceScope { input_index } => {
+            let sequence_scope_witness = sequence_scope_witness.unwrap_or_else(|| {
+                panic!(
+                    "Missing sequence scope witness for step record {:?}",
+                    step_record
+                )
+            });
+            let scope_source = resolved_source_at(sequence_scope_witness, *input_index);
+            assert_same_source(resolved_source, scope_source);
+        }
+        InputBinding::PriorItemOutput {
+            intra_sequence_item_index,
+        } => {
+            assert!(
+                *intra_sequence_item_index < item_coordinate as usize,
+                "Step {:?} cannot depend on source item {} from the same or a future position {}",
+                step_record,
+                intra_sequence_item_index,
+                item_coordinate
+            );
+
+            let mut source_coordinates = parent_sequence_coordinates.clone();
+            source_coordinates.push(
+                (*intra_sequence_item_index)
+                    .try_into()
+                    .expect("Prior item output index exceeds CFS coordinate bounds"),
+            );
+            let storage_meta = match resolved_source {
+                ResolvedSource::Storage(meta) => meta,
+                _ => {
+                    panic!(
+                        "Expected storage input source for step {:?} arg {}",
+                        step_record, input_index
+                    )
+                }
+            };
+            match cfs_cursor
+                .try_get_item(&source_coordinates)
+                .expect("Expected prior item output coordinates to resolve in CFS")
+            {
+                raster_core::cfs::SequenceChildItem::Sequence(_)
+                | raster_core::cfs::SequenceChildItem::RecurSequence(_) => {
+                    assert!(
+                            has_coordinate_prefix(&storage_meta.coordinates, &source_coordinates),
+                            "Storage input prior-item-output coordinates do not descend from expected sequence source",
                         );
-                    }
-                    raster_core::cfs::SequenceChildItem::Tile(_)
-                    | raster_core::cfs::SequenceChildItem::RecurTile(_) => {
-                        assert_eq!(
-                            internal_meta.coordinates, source_coordinates,
-                            "Internal input prior-item-output coordinates do not match expected CFS source",
+                }
+                raster_core::cfs::SequenceChildItem::Tile(_)
+                | raster_core::cfs::SequenceChildItem::RecurTile(_) => {
+                    assert_eq!(
+                            storage_meta.coordinates, source_coordinates,
+                            "Storage input prior-item-output coordinates do not match expected CFS source",
                         );
-                    }
                 }
             }
+        }
+        // `value_binding()` looks through every wrapper, so an `Indexed`
+        // binding can never reach this match.
+        InputBinding::Indexed { .. } => {
+            unreachable!("value_binding() unwraps Indexed before this match")
         }
     }
 }
@@ -270,4 +487,168 @@ pub fn get_next_expected_coordinates(
     cfs_cursor
         .try_get_next_coordinates(coordinates)
         .expect("Wrong tile coordinates")
+}
+
+/// The authenticated source length carried by a recur site's `Start` step.
+///
+/// `Start` records the source under the binding name `"input"`, whose selection
+/// is the `0x0A` list-metadata payload (`lazy-list-recur.md` §1–§2). By the time
+/// this runs, `checks::store` has already folded that witness to the committed
+/// root, so the length read here is authenticated rather than index-trusted —
+/// which is the whole reason the site needs a `Start` at all: `L` has to exist
+/// before iteration 0 is checked against it.
+fn authenticated_source_len(
+    step_record: &StepRecord,
+    input_source_witness: Option<&FnInput>,
+    storage_selection_witnesses: &BTreeMap<String, SelectionWitness>,
+) -> u64 {
+    let binding = input_source_witness
+        .and_then(|witness| witness.storage().get("input"))
+        .unwrap_or_else(|| {
+            panic!(
+                "Recur site start {:?} does not record its source binding",
+                step_record
+            )
+        });
+    assert_eq!(
+        binding.selection.payload_kind,
+        SelectionPayloadKind::List,
+        "Recur site start {:?} must commit to list metadata, not a raw payload",
+        step_record,
+    );
+    let witness = storage_selection_witnesses.get("input").unwrap_or_else(|| {
+        panic!(
+            "Recur site start {:?} is missing its source selection witness",
+            step_record
+        )
+    });
+    decode_list_metadata_len(&witness.bytes).unwrap_or_else(|| {
+        panic!(
+            "Recur site start {:?} carries a malformed list metadata payload",
+            step_record
+        )
+    })
+}
+
+/// `len` out of a `0x0A` payload: `[0x0A][len: u64 LE]`, then a 32-byte
+/// elements root when `len > 0`.
+fn decode_list_metadata_len(bytes: &[u8]) -> Option<u64> {
+    if *bytes.first()? != 0x0A {
+        return None;
+    }
+    let len = u64::from_le_bytes(bytes.get(1..9)?.try_into().ok()?);
+    let expected = if len == 0 { 9 } else { 41 };
+    (bytes.len() == expected).then_some(len)
+}
+
+/// Advance the carried recur progress by this step's facts and hold the result
+/// to the commitment the step recorded.
+///
+/// One rule, uniform for every step. The recorder reached its commitment by
+/// advancing with the values rules 3 and 4 *require* — derived from
+/// `(chunk, source_len, next_iteration_index)`, all of which it holds. The
+/// guest advances with the journal's actual values. Both mutate only
+/// `next_iteration_index` and `last_control`, so both land on the same frame
+/// **iff** the journal agrees with the derivation; where it disagrees, a rule
+/// fires before any hash is compared.
+///
+/// That asymmetry is the point: a journal value *compared against* the frame's
+/// inputs is reachable for a producer that has no journal, whereas revision 1's
+/// `consumed_total` — folded *into* the frame — was not. See
+/// `docs/proposals/recur-progress-commitment.md` §1 and §4.
+pub fn advance_recur_progress(
+    cfs_cursor: &CfsCursor,
+    progress: &mut RecurProgressStack,
+    step_record: &StepRecord,
+    replay_journal: Option<&TileReplayJournal>,
+    input_source_witness: Option<&FnInput>,
+    storage_selection_witnesses: &BTreeMap<String, SelectionWitness>,
+) {
+    let coordinates = step_record.coordinates();
+
+    if let Some((site_coordinates, iteration_index)) =
+        cfs_cursor.try_get_recur_iteration_coordinates(coordinates)
+    {
+        match cfs_cursor.try_get_item(&site_coordinates) {
+            Some(SequenceChildItem::RecurTile(_)) => {
+                let recur = replay_journal
+                    .and_then(|journal| journal.recur.as_ref())
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "Recur iteration {:?} is missing its replay-proven recur facts",
+                            step_record
+                        )
+                    });
+                if let Err(violation) = progress.advance_tile_iteration(
+                    coordinates,
+                    recur.position.iteration_index,
+                    recur.position.declared_iterations,
+                    recur.position.consumed_elements,
+                    recur.control,
+                ) {
+                    panic!(
+                        "Recur progress violation at step {:?}: {}",
+                        step_record, violation
+                    );
+                }
+            }
+            Some(SequenceChildItem::RecurSequence(_)) => {
+                // A recur sequence emits no journal; its iterations are read
+                // from trace structure. Only the boundary *start* advances the
+                // count, so an iteration is never counted twice.
+                if matches!(step_record.kind, StepKind::SequenceStart { .. }) {
+                    if let Err(violation) = progress
+                        .advance_sequence_iteration(coordinates, u64::from(iteration_index))
+                    {
+                        panic!(
+                            "Recur progress violation at step {:?}: {}",
+                            step_record, violation
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
+    } else if let Some(item) = cfs_cursor.try_get_item(coordinates) {
+        let kind = match item {
+            SequenceChildItem::RecurTile(_) => Some(RecurSiteKind::Tile),
+            SequenceChildItem::RecurSequence(_) => Some(RecurSiteKind::Sequence),
+            _ => None,
+        };
+        if let Some(kind) = kind {
+            match &step_record.kind {
+                // `Start`: open the frame with the authenticated `L`.
+                StepKind::SequenceStart { .. } => {
+                    let chunk = match item {
+                        SequenceChildItem::RecurTile(tile) => tile.chunk.unwrap_or(1),
+                        _ => 1,
+                    };
+                    let source_len = authenticated_source_len(
+                        step_record,
+                        input_source_witness,
+                        storage_selection_witnesses,
+                    );
+                    progress.push_site(coordinates.clone(), kind, chunk, source_len);
+                }
+                // `End`: the terminal rules — 5 and 7 for a tile site, S4 for a
+                // sequence site.
+                StepKind::Exec(_) => {
+                    if let Err(violation) = progress.close_site(coordinates) {
+                        panic!(
+                            "Recur progress violation at step {:?}: {}",
+                            step_record, violation
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    assert_eq!(
+        progress.commitment(),
+        step_record.recur_progress_commitment,
+        "Recur progress commitment does not match the state this step advances to: {:?}",
+        step_record,
+    );
 }

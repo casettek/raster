@@ -15,7 +15,9 @@ metal = ["risc0-zkvm/metal"]
 cuda = ["risc0-zkvm/cuda"]
 
 [dependencies]
-raster-core.workspace = true
+# This crate uses std-gated raster-core APIs (e.g. `Error::Io`), so it must
+# enable the `std` feature rather than relying on a downstream crate to.
+raster-core = { workspace = true, features = ["std"] }
 raster-backend.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true

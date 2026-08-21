@@ -6,6 +6,7 @@
 //! - All sequences and their item composition
 //! - Data flow bindings between tiles, sequences, and external inputs
 
+use alloc::boxed::Box;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::ops::{Deref, DerefMut};
@@ -82,6 +83,33 @@ impl CfsCursor {
         self.coordinates = coordinates;
     }
 
+    /// The declared entry-argument names, in canonical order, if `main`
+    /// declares any (`SequenceDef::entry_arguments`). `None` means `main`
+    /// declares no external arguments at all — there is nothing to authorize
+    /// at entry, and the program's `ProgramStart` step binds nothing.
+    pub fn main_entrypoint_names(&self) -> Option<&[String]> {
+        let main = self
+            .cfs
+            .sequences
+            .get(self.entrypoint_coordinate as usize)?;
+        if main.entry_arguments.is_empty() {
+            None
+        } else {
+            Some(main.entry_arguments.as_slice())
+        }
+    }
+
+    /// Whether `main` declares a program output (`SequenceDef::produces_output`).
+    /// When `true`, the program's `ProgramEnd` step must bind a storage-backed
+    /// output; when `false`, it binds nothing (a unit program).
+    pub fn main_produces_output(&self) -> bool {
+        self.cfs
+            .sequences
+            .get(self.entrypoint_coordinate as usize)
+            .map(|main| main.produces_output)
+            .unwrap_or(false)
+    }
+
     pub fn is_next_coordinates(&mut self, next_coordinates: &CfsCoordinates) -> bool {
         if let Some(next_coordinates_options) = self.try_get_next_coordinates(&self.coordinates()) {
             return next_coordinates_options.contains(next_coordinates);
@@ -97,10 +125,22 @@ impl CfsCursor {
         if let Some((site_coordinates, iteration_index)) =
             self.try_get_recur_iteration_coordinates(coordinates)
         {
-            let mut next_iteration_coordinates = site_coordinates.clone();
-            next_iteration_coordinates.push(iteration_index + 1);
+            // Only a recur *tile* iteration is a leaf: it is one `Exec` record
+            // at `[s][i]`, so its successors really are "the next iteration, or
+            // the site". A recur *sequence* iteration is a scope whose own
+            // steps live at `[s][i][j]`, so it must fall through to the descend
+            // path below — otherwise the first step inside an iteration is not
+            // an accepted successor and `get_next_expected_coordinates` rejects
+            // it. Covered by `recur_sequence_iteration_offers_its_first_inner_step`.
+            if matches!(
+                self.try_get_item(&site_coordinates),
+                Some(SequenceChildItem::RecurTile(_))
+            ) {
+                let mut next_iteration_coordinates = site_coordinates.clone();
+                next_iteration_coordinates.push(iteration_index + 1);
 
-            return Some(Vec::from([next_iteration_coordinates, site_coordinates]));
+                return Some(Vec::from([next_iteration_coordinates, site_coordinates]));
+            }
         }
 
         let mut current_coordinates = coordinates.clone();
@@ -253,12 +293,26 @@ impl CfsCursor {
                     if depth + 2 < coords.len() {
                         panic!("RecurTile iteration coordinates can only extend by one index");
                     }
-                    sequence_item_coord = Some(coord);
+                    // Same split as `RecurSequence`: bare `[s]` is the site
+                    // scope, `[s][i]` is one iteration.
+                    sequence_item_coord = if depth + 1 == coords.len() {
+                        None
+                    } else {
+                        Some(coord)
+                    };
                     depth = coords.len();
                 }
                 SequenceChildItem::RecurSequence(recur_sequence_item) => {
                     if depth + 1 == coords.len() {
-                        sequence_item_coord = Some(coord);
+                        // A bare site coordinate is a *scope*, like the nested
+                        // `Sequence` arm above: the site brackets its iterations
+                        // with a Start/End pair at `[s]`, so its successors are
+                        // "descend to iteration 0", "the End back at `[s]`", and
+                        // "the following item" — exactly the set the `None` arm
+                        // of `try_get_next_coordinates` builds. Returning `Some`
+                        // made `[s]` a leaf whose only successor was the next
+                        // item, which is what made a site `Start` unorderable.
+                        sequence_item_coord = None;
                         depth += 1;
                     } else {
                         if depth + 2 > coords.len() {
@@ -387,9 +441,14 @@ impl CfsCursor {
     ) -> Option<(CfsCoordinates, CfsCoordinate)> {
         let (&iteration_index, site_prefix) = coordinates.split_last()?;
         let site_coordinates = CfsCoordinates(site_prefix.to_vec());
+        // Both recur kinds address their iterations the same way — `site ++ [i]`
+        // — so both decompose here. Accepting only `RecurTile` made a
+        // recur-sequence site look like an ordinary item to every caller, which
+        // is what kept its iterations out of reach of the completeness rules.
+        // `expand_recur_entry_coordinates` just below has always matched both.
         matches!(
             self.try_get_item(&site_coordinates),
-            Some(SequenceChildItem::RecurTile(_))
+            Some(SequenceChildItem::RecurTile(_) | SequenceChildItem::RecurSequence(_))
         )
         .then_some((site_coordinates, iteration_index))
     }
@@ -488,6 +547,17 @@ pub struct SequenceDef {
     pub id: SequenceId,
     pub input_sources: Vec<InputBinding>,
     pub items: Vec<SequenceChildItem>,
+    /// `main`'s declared entry-argument names, in declaration order. Bound
+    /// once by the program's `ProgramStart` step into a single authorized
+    /// storage object at coordinates `[]`. Empty for every sequence other
+    /// than `main`, and for a `main` that declares no external arguments.
+    #[serde(default)]
+    pub entry_arguments: Vec<String>,
+    /// Whether `main` returns a program output (a non-unit value). When set,
+    /// the program's `ProgramEnd` step binds and authorizes that output.
+    /// Always `false` for sequences other than `main`.
+    #[serde(default)]
+    pub produces_output: bool,
 }
 
 impl SequenceDef {
@@ -497,6 +567,8 @@ impl SequenceDef {
             id: id.into(),
             input_sources: Vec::new(),
             items: Vec::new(),
+            entry_arguments: Vec::new(),
+            produces_output: false,
         }
     }
 
@@ -579,6 +651,34 @@ pub enum InputBinding {
     PriorItemOutput {
         intra_sequence_item_index: usize,
     },
+    /// One of `main`'s entry arguments, reached from the single authorized
+    /// entry object at the sequence root (coordinates `[]`) that the
+    /// `ProgramStart` step bound. `main` has no caller, so its arguments are
+    /// not `SequenceScope`; and the entry object sits at the sequence root
+    /// itself, which no `PriorItemOutput` index can name.
+    EntryArgument,
+    /// A value whose selector reaches it through one or more **data-sourced**
+    /// list indexes (`select!(Row, rows[token_id])`).
+    ///
+    /// Composite rather than a peer of the variants above, because index
+    /// provenance is orthogonal to value provenance: the value still comes from
+    /// an entry argument, a prior item, or the caller's scope, and `value`
+    /// records which. `indexes` records where each index came from, in selector
+    /// order, so nesting (`a.rows[i].cells[j]`) is expressible.
+    ///
+    /// This is what makes "reads the element named by binding X" and "reads
+    /// element 7" different *programs*: the schema is hashed into program
+    /// identity, so the two cannot be swapped for one another behind a fixed
+    /// identity. Verification of the index values themselves is separate and
+    /// lives in [`crate::trace::verify_bound_index_bindings`]. See
+    /// `docs/proposals/dynamic-index-selection.md` §5.
+    ///
+    /// Declared last so the postcard variant indices of the four above — which
+    /// existing committed schemas encode — do not shift.
+    Indexed {
+        value: Box<InputBinding>,
+        indexes: Vec<InputBinding>,
+    },
 }
 
 impl InputBinding {
@@ -587,19 +687,14 @@ impl InputBinding {
         Self::Direct(source)
     }
 
-    /// Create an external input binding.
-    pub fn external() -> Self {
-        Self::new(InputSource::External)
-    }
-
     /// Create an inline input binding.
     pub fn inline() -> Self {
         Self::new(InputSource::Inline)
     }
 
-    /// Create a direct internal input binding.
-    pub fn internal() -> Self {
-        Self::new(InputSource::Internal)
+    /// Create a direct storage input binding.
+    pub fn storage() -> Self {
+        Self::new(InputSource::Storage)
     }
 
     /// Create a sequence-scope binding.
@@ -613,19 +708,58 @@ impl InputBinding {
             intra_sequence_item_index,
         }
     }
+
+    /// Create a binding to one of `main`'s entry arguments.
+    pub fn entry_argument() -> Self {
+        Self::EntryArgument
+    }
+
+    /// Wrap this binding as one reached through data-sourced list indexes.
+    ///
+    /// Returns `self` unchanged when `indexes` is empty, so a literal-index
+    /// selection keeps emitting exactly the binding it emits today — which is
+    /// what makes this phase a no-op for every existing program's identity.
+    pub fn indexed_by(self, indexes: Vec<InputBinding>) -> Self {
+        if indexes.is_empty() {
+            return self;
+        }
+        Self::Indexed {
+            value: Box::new(self),
+            indexes,
+        }
+    }
+
+    /// The underlying value binding, looking through any index wrapper.
+    pub fn value_binding(&self) -> &InputBinding {
+        match self {
+            Self::Indexed { value, .. } => value.value_binding(),
+            other => other,
+        }
+    }
+
+    /// The index bindings this one declares, in selector order.
+    pub fn index_bindings(&self) -> &[InputBinding] {
+        match self {
+            Self::Indexed { indexes, .. } => indexes.as_slice(),
+            _ => &[],
+        }
+    }
 }
 
 /// Semantic source of an input value in the data flow schema.
+///
+/// Note there is no "external" source: data entering a program does so as
+/// `main`'s entry arguments, which are loaded once into storage by the
+/// program's `ProgramStart` step and reached from there through
+/// `InputBinding::EntryArgument`. A source here is only about values with no
+/// upstream item to bind to.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum InputSource {
-    /// Input comes from outside the sequence (runtime-provided).
-    External,
-
     /// Input is materialized inline in the sequence body.
     Inline,
 
-    /// Input is resolved from internal storage.
-    Internal,
+    /// Input is resolved from storage.
+    Storage,
 }
 
 #[cfg(test)]
@@ -661,6 +795,8 @@ mod tests {
                         sources: vec![],
                     }),
                 ],
+                entry_arguments: vec![],
+                produces_output: false,
             }],
         })
     }
@@ -697,13 +833,91 @@ mod tests {
         );
     }
 
+
+
+    /// A recur site coordinate is a *scope*, so its successor set covers both
+    /// halves of the site: the `End` back at `[1]`, iteration 0 at `[1][0]`
+    /// (and that iteration's first inner step), and the next sibling `[2]`.
+    ///
+    /// This used to assert `[2]` alone, from when `[s]` was a leaf item with a
+    /// single trailing event. With a `Start`/`End` pair both at `[s]`, the
+    /// successor genuinely depends on which half the record is — and since the
+    /// relation is keyed on the coordinate, the set must be the union.
+    ///
+    /// That is not a new weakening: a nested `Sequence` coordinate already
+    /// yields exactly this shape (`{[s], [s][0], [s+1]}`), for the same reason.
+    /// The ordering check bounds the *shape*; the count is bounded by the recur
+    /// progress rules, where `close_site` has popped the frame so a stray
+    /// iteration after the site fails with `NoActiveSite`.
     #[test]
-    fn recur_site_completion_moves_to_next_sibling() {
+    fn recur_site_coordinate_offers_both_halves_and_the_next_sibling() {
         let cursor = recur_cursor();
         let next = cursor
             .try_get_next_coordinates(&CfsCoordinates(vec![1]))
             .expect("next coordinates should exist");
 
-        assert_eq!(next, vec![CfsCoordinates(vec![2])]);
+        assert!(next.contains(&CfsCoordinates(vec![1])), "the End half: {:?}", next);
+        assert!(next.contains(&CfsCoordinates(vec![1, 0])), "iteration 0: {:?}", next);
+        assert!(next.contains(&CfsCoordinates(vec![2])), "next sibling: {:?}", next);
+    }
+
+    /// A recur *sequence* iteration is a scope with children, so its successor
+    /// set must include the first step **inside** it.
+    ///
+    /// Regression test. `try_get_next_coordinates` early-returns
+    /// `{site ++ [i+1], site}` for any coordinate that decomposes as a recur
+    /// iteration — a set written for the recur-*tile* shape, where an iteration
+    /// is a single leaf `Exec`. A recur sequence's iteration has children, so
+    /// that set excludes the only step that can legally follow it.
+    fn recur_sequence_cursor() -> CfsCursor {
+        CfsCursor::new(ControlFlowSchema {
+            version: "1.0".to_string(),
+            project: "test".to_string(),
+            encoding: "postcard".to_string(),
+            tiles: vec![TileDef::iter("inner", 0, 0), TileDef::iter("after", 0, 0)],
+            sequences: vec![
+                SequenceDef {
+                    id: "main".to_string(),
+                    input_sources: vec![],
+                    items: vec![
+                        SequenceChildItem::RecurSequence(RecurSequenceItem {
+                            id: "body".to_string(),
+                            sources: vec![],
+                        }),
+                        SequenceChildItem::Tile(TileItem {
+                            id: "after".to_string(),
+                            sources: vec![],
+                        }),
+                    ],
+                    entry_arguments: vec![],
+                    produces_output: false,
+                },
+                SequenceDef {
+                    id: "body".to_string(),
+                    input_sources: vec![],
+                    items: vec![SequenceChildItem::Tile(TileItem {
+                        id: "inner".to_string(),
+                        sources: vec![],
+                    })],
+                    entry_arguments: vec![],
+                    produces_output: false,
+                },
+            ],
+        })
+    }
+
+    #[test]
+    fn recur_sequence_iteration_offers_its_first_inner_step() {
+        let cursor = recur_sequence_cursor();
+        let next = cursor
+            .try_get_next_coordinates(&CfsCoordinates(vec![0, 0]))
+            .expect("next coordinates should exist");
+
+        assert!(
+            next.contains(&CfsCoordinates(vec![0, 0, 0])),
+            "iteration [0][0] must be able to be followed by its own first step \
+             [0][0][0], got {:?}",
+            next,
+        );
     }
 }

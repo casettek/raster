@@ -14,7 +14,14 @@ static TRACE_INIT: Once = Once::new();
 static TRACE_EVENTS: Mutex<Vec<TraceEvent>> = Mutex::new(Vec::new());
 static TRACE_CAPTURE_ACTIVE: AtomicBool = AtomicBool::new(false);
 static TRACE_CAPTURE_THREAD: Mutex<Option<ThreadId>> = Mutex::new(None);
-static RECUR_RESOLVE_COUNT: AtomicUsize = AtomicUsize::new(0);
+/// Whole-source resolutions counted by the recur-*tile* fixture, and by the
+/// recur-*sequence* one, separately.
+///
+/// One shared counter would race: both tests reset it and then assert on it,
+/// and `cargo test` runs them in parallel by default. That was latent while
+/// both expected the same value.
+static RECUR_TILE_RESOLVE_COUNT: AtomicUsize = AtomicUsize::new(0);
+static RECUR_SEQUENCE_RESOLVE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 struct TestPublisher;
 
@@ -50,13 +57,13 @@ where
 #[derive(Clone, Debug, Deserialize, Serialize, Selectable)]
 struct LineBundle {
     title: String,
-    items: Vec<String>,
+    items: List<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Selectable)]
 struct SearchBundle {
     needle: String,
-    matches: Vec<String>,
+    matches: List<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -73,7 +80,7 @@ impl Selectable for UnitLike {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, Selectable)]
 struct UnitLineBundle {
     marker: UnitLike,
-    items: Vec<String>,
+    items: List<String>,
 }
 
 // Output schema with no required scalar fields, so a recur sequence can
@@ -81,14 +88,14 @@ struct UnitLineBundle {
 // guard, where the step only materializes items).
 #[derive(Clone, Debug, Deserialize, Serialize, Selectable)]
 struct ItemsOnlyBundle {
-    items: Vec<String>,
+    items: List<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Selectable)]
 struct LimitedBundle {
     limit: u64,
     stopped_after: u64,
-    items: Vec<String>,
+    items: List<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -147,8 +154,8 @@ fn collect_optional_lines(
 }
 
 #[sequence]
-fn build_lines_reference() -> InternalRef {
-    let source = raster::store_internal_value(&vec![
+fn build_lines_reference() -> StorageRef {
+    let source = raster::store_value(&vec![
         "first".to_string(),
         "second".to_string(),
         "third".to_string(),
@@ -157,7 +164,7 @@ fn build_lines_reference() -> InternalRef {
 
     call_recur!(
         tile = collect_lines,
-        input = internal!(Vec<String>, source),
+        input = storage!(List<String>, source),
         output = new!(LineBundle),
         args = ()
     )
@@ -165,13 +172,41 @@ fn build_lines_reference() -> InternalRef {
     .clone()
 }
 
-fn run_build_lines_reference() -> InternalRef {
-    materialize_auth_return::<InternalRef, _>(__raster_sequence_auth_build_lines_reference())
+fn run_build_lines_reference() -> StorageRef {
+    materialize_auth_return::<StorageRef, _>(__raster_sequence_auth_build_lines_reference())
+}
+
+/// Long enough that an O(N) witness is unmistakable — at ~27 bytes per entry the
+/// old encoding's last step would be tens of KB against the first step's tens of
+/// bytes — and short enough to stay a unit test.
+const LONG_LINE_COUNT: usize = 512;
+
+#[sequence]
+fn long_lines_reference() -> StorageRef {
+    let source = raster::store_value(
+        &(0..LONG_LINE_COUNT)
+            .map(|index| format!("line-{}", index))
+            .collect::<Vec<String>>(),
+    )
+    .expect("list source should store");
+
+    call_recur!(
+        tile = collect_lines,
+        input = storage!(List<String>, source),
+        output = new!(LineBundle),
+        args = ()
+    )
+    .reference()
+    .clone()
+}
+
+fn run_long_lines_reference() -> StorageRef {
+    materialize_auth_return::<StorageRef, _>(__raster_sequence_auth_long_lines_reference())
 }
 
 #[sequence]
 fn find_first_match(needle: String) -> SearchBundle {
-    let source = raster::store_internal_value(&vec![
+    let source = raster::store_value(&vec![
         "alpha".to_string(),
         "beta".to_string(),
         "gamma".to_string(),
@@ -180,7 +215,7 @@ fn find_first_match(needle: String) -> SearchBundle {
 
     call_recur!(
         tile = collect_first_match,
-        input = internal!(Vec<String>, source),
+        input = storage!(List<String>, source),
         output = new!(SearchBundle),
         args = (needle,)
     )
@@ -188,12 +223,11 @@ fn find_first_match(needle: String) -> SearchBundle {
 
 #[sequence]
 fn collect_optional_lines_from_empty() -> UnitLineBundle {
-    let source =
-        raster::store_internal_value(&Vec::<String>::new()).expect("list source should store");
+    let source = raster::store_value(&Vec::<String>::new()).expect("list source should store");
 
     call_recur!(
         tile = collect_optional_lines,
-        input = internal!(Vec<String>, source),
+        input = storage!(List<String>, source),
         output = new!(UnitLineBundle),
         args = ()
     )
@@ -201,12 +235,11 @@ fn collect_optional_lines_from_empty() -> UnitLineBundle {
 
 #[sequence]
 fn collect_required_lines_from_empty() -> LineBundle {
-    let source =
-        raster::store_internal_value(&Vec::<String>::new()).expect("list source should store");
+    let source = raster::store_value(&Vec::<String>::new()).expect("list source should store");
 
     call_recur!(
         tile = collect_lines,
-        input = internal!(Vec<String>, source),
+        input = storage!(List<String>, source),
         output = new!(LineBundle),
         args = ()
     )
@@ -313,7 +346,7 @@ fn collect_prefixed_lines(
 
 #[sequence]
 fn collect_two_items(limit: u64) -> LimitedBundle {
-    let source = raster::store_internal_value(&vec![
+    let source = raster::store_value(&vec![
         "one".to_string(),
         "two".to_string(),
         "three".to_string(),
@@ -322,7 +355,7 @@ fn collect_two_items(limit: u64) -> LimitedBundle {
 
     call_recur!(
         tile = collect_until_limit,
-        input = internal!(Vec<String>, source),
+        input = storage!(List<String>, source),
         state = LimitState { seen: 0 },
         output = new!(LimitedBundle),
         args = (limit,)
@@ -331,7 +364,7 @@ fn collect_two_items(limit: u64) -> LimitedBundle {
 
 #[sequence]
 fn compute_max_len() -> MaxLenState {
-    let source = raster::store_internal_value(&vec![
+    let source = raster::store_value(&vec![
         "a".to_string(),
         "alphabet".to_string(),
         "rust".to_string(),
@@ -340,7 +373,7 @@ fn compute_max_len() -> MaxLenState {
 
     call_recur!(
         tile = track_max_len,
-        input = internal!(Vec<String>, source),
+        input = storage!(List<String>, source),
         state = MaxLenState { max_len: 0 },
         args = ()
     )
@@ -348,7 +381,7 @@ fn compute_max_len() -> MaxLenState {
 
 #[sequence]
 fn compute_max_len_field() -> u64 {
-    let source = raster::store_internal_value(&vec![
+    let source = raster::store_value(&vec![
         "a".to_string(),
         "alphabet".to_string(),
         "rust".to_string(),
@@ -357,7 +390,7 @@ fn compute_max_len_field() -> u64 {
 
     let stats = call_recur!(
         tile = track_max_len,
-        input = internal!(Vec<String>, source),
+        input = storage!(List<String>, source),
         state = MaxLenState { max_len: 0 },
         args = ()
     );
@@ -367,7 +400,7 @@ fn compute_max_len_field() -> u64 {
 
 #[sequence]
 fn count_seen_until_limit(limit: u64) -> LimitState {
-    let source = raster::store_internal_value(&vec![
+    let source = raster::store_value(&vec![
         "one".to_string(),
         "two".to_string(),
         "three".to_string(),
@@ -376,7 +409,7 @@ fn count_seen_until_limit(limit: u64) -> LimitState {
 
     call_recur!(
         tile = count_until_limit_state_only,
-        input = internal!(Vec<String>, source),
+        input = storage!(List<String>, source),
         state = LimitState { seen: 0 },
         args = (limit,)
     )
@@ -384,12 +417,11 @@ fn count_seen_until_limit(limit: u64) -> LimitState {
 
 #[sequence]
 fn state_only_empty_input() -> MaxLenState {
-    let source =
-        raster::store_internal_value(&Vec::<String>::new()).expect("list source should store");
+    let source = raster::store_value(&Vec::<String>::new()).expect("list source should store");
 
     call_recur!(
         tile = track_max_len,
-        input = internal!(Vec<String>, source),
+        input = storage!(List<String>, source),
         state = MaxLenState { max_len: 0 },
         args = ()
     )
@@ -397,22 +429,22 @@ fn state_only_empty_input() -> MaxLenState {
 
 #[sequence]
 fn build_prefixed_lines_with_recur_sequence() -> LineBundle {
-    let source = raster::store_internal_value(&vec![
+    let source = raster::store_value(&vec![
         "one".to_string(),
         "two".to_string(),
         "three".to_string(),
     ])
     .expect("list source should store");
     let prefix_source =
-        raster::store_internal_value(&"line: ".to_string()).expect("prefix source should store");
+        raster::store_value(&"line: ".to_string()).expect("prefix source should store");
 
     let output = call!(init_prefixed_bundle, new!(LineBundle));
 
     call_recur_seq!(
         sequence = collect_prefixed_lines,
-        input = internal!(Vec<String>, source),
+        input = storage!(List<String>, source),
         output = output,
-        args = (internal!(String, prefix_source),)
+        args = (storage!(String, prefix_source),)
     )
 }
 
@@ -443,19 +475,26 @@ fn run_build_prefixed_lines_with_recur_sequence() -> LineBundle {
 }
 
 fn resolve_counted_string_list(
-    reference: InternalRef,
-) -> raster::core::Result<InternalValue<Vec<String>>> {
-    RECUR_RESOLVE_COUNT.fetch_add(1, Ordering::SeqCst);
-    raster::resolve_internal_value::<Vec<String>>(reference)
+    reference: StorageRef,
+) -> raster::core::Result<StorageValue<List<String>>> {
+    RECUR_TILE_RESOLVE_COUNT.fetch_add(1, Ordering::SeqCst);
+    raster::resolve_storage_value::<List<String>>(reference)
+}
+
+fn resolve_counted_string_list_for_sequence(
+    reference: StorageRef,
+) -> raster::core::Result<StorageValue<List<String>>> {
+    RECUR_SEQUENCE_RESOLVE_COUNT.fetch_add(1, Ordering::SeqCst);
+    raster::resolve_storage_value::<List<String>>(reference)
 }
 
 #[test]
 fn call_recur_finalizes_to_selectable_internal_ref() {
     let reference = run_build_lines_reference();
 
-    let title = select!(String, internal!(LineBundle, reference.clone()).title);
-    let first = select!(String, internal!(LineBundle, reference.clone()).items[0]);
-    let third = select!(String, internal!(LineBundle, reference).items[2]);
+    let title = select!(String, storage!(LineBundle, reference.clone()).title);
+    let first = select!(String, storage!(LineBundle, reference.clone()).items[0]);
+    let third = select!(String, storage!(LineBundle, reference).items[2]);
 
     assert_eq!(
         into_auth_value::<String, _>(title).unwrap().into_inner(),
@@ -474,12 +513,12 @@ fn call_recur_finalizes_to_selectable_internal_ref() {
 #[test]
 fn debug_formats_materialized_internal_auth_ref() {
     let reference = run_build_lines_reference();
-    let auth = into_auth_ref::<LineBundle, _>(internal!(LineBundle, reference));
+    let auth = into_auth_ref::<LineBundle, _>(storage!(LineBundle, reference));
 
     let rendered = format!("{auth:?}");
 
     assert!(rendered.contains("AuthRef"));
-    assert!(rendered.contains("storage: \"internal\""));
+    assert!(rendered.contains("storage: \"storage\""));
     assert!(rendered.contains("coordinates: \""));
     assert!(rendered.contains("commitment_len"));
     assert!(rendered.contains("stored_bytes_len"));
@@ -492,7 +531,7 @@ fn call_recur_breaks_early_and_still_finalizes() {
     let result = run_find_first_match("beta".to_string());
 
     assert_eq!(result.needle, "beta");
-    assert_eq!(result.matches, vec!["beta".to_string()]);
+    assert_eq!(result.matches.into_vec(), vec!["beta".to_string()]);
 }
 
 #[test]
@@ -515,7 +554,10 @@ fn call_recur_threads_state_and_finalizes() {
 
     assert_eq!(result.limit, 2);
     assert_eq!(result.stopped_after, 2);
-    assert_eq!(result.items, vec!["one".to_string(), "two".to_string()]);
+    assert_eq!(
+        result.items.into_vec(),
+        vec!["one".to_string(), "two".to_string()]
+    );
 }
 
 #[test]
@@ -552,7 +594,7 @@ fn call_recur_seq_orchestrates_tiles_per_item() {
 
     assert_eq!(result.title, "prefixed");
     assert_eq!(
-        result.items,
+        result.items.into_vec(),
         vec![
             "line: one".to_string(),
             "line: two".to_string(),
@@ -561,20 +603,27 @@ fn call_recur_seq_orchestrates_tiles_per_item() {
     );
 }
 
+/// A recur tile never materializes its source either.
+///
+/// This is the bigger of the two changes: recur tiles previously bypassed
+/// per-item selection entirely, resolving the source into an owned `Vec<T>` and
+/// iterating that — the index was not consulted once. They now run on the same
+/// `ListCursor` the sequence family does, so the two families share one
+/// implementation and neither has a path back to `O(list)`.
 #[test]
-fn call_recur_resolves_internal_list_once_per_invocation() {
+fn call_recur_never_materializes_its_source() {
     let _guard = raster::__private::SequenceScopeGuard::enter("recur_single_list_resolve");
-    let reference = raster::store_internal_value(&vec![
+    let reference = raster::store_value(&vec![
         "first".to_string(),
         "second".to_string(),
         "third".to_string(),
     ])
     .expect("list source should store");
-    let source = into_auth_ref::<Vec<String>, _>(
-        raster::typed_internal_with_resolver::<Vec<String>>(reference, resolve_counted_string_list),
-    );
+    let source = into_auth_ref::<List<String>, _>(raster::typed_storage_with_resolver::<
+        List<String>,
+    >(reference, resolve_counted_string_list));
 
-    RECUR_RESOLVE_COUNT.store(0, Ordering::SeqCst);
+    RECUR_TILE_RESOLVE_COUNT.store(0, Ordering::SeqCst);
     let auth = raster::run_recur_list::<String, LineBundle, _, _>(
         source,
         new!(LineBundle),
@@ -582,28 +631,42 @@ fn call_recur_resolves_internal_list_once_per_invocation() {
     );
     let result = into_auth_value::<LineBundle, _>(auth).unwrap().into_inner();
 
+    // The sweep really ran — otherwise "zero resolves" would be vacuous.
     assert_eq!(result.title, "collected");
     assert_eq!(result.items.len(), 3);
-    assert_eq!(RECUR_RESOLVE_COUNT.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        RECUR_TILE_RESOLVE_COUNT.load(Ordering::SeqCst),
+        0,
+        "the source list must never be resolved whole",
+    );
 }
 
+/// A recur sequence never materializes its source — not once, not at all.
+///
+/// This used to assert exactly *one* whole-source resolve: the driver resolved
+/// the parent list up front and cached it behind an `Rc` so per-item `AuthRef`s
+/// could select out of the cached value. `ListCursor` removes that cache along
+/// with the resolve it was caching — the loop bound now comes from the `0x0A`
+/// metadata selection and each item from its own indexed read — so the honest
+/// expectation is zero. See `docs/proposals/lazy-list-recur.md` §2–§3.
 #[test]
-fn recur_sequence_resolves_internal_list_once_per_invocation() {
+fn recur_sequence_never_materializes_its_source() {
     let _guard = raster::__private::SequenceScopeGuard::enter("recur_sequence_single_list_resolve");
-    let reference = raster::store_internal_value(&vec![
+    let reference = raster::store_value(&vec![
         "first".to_string(),
         "second".to_string(),
         "third".to_string(),
     ])
     .expect("list source should store");
-    let source = into_auth_ref::<Vec<String>, _>(
-        raster::typed_internal_with_resolver::<Vec<String>>(reference, resolve_counted_string_list),
-    );
+    let source = into_auth_ref::<List<String>, _>(raster::typed_storage_with_resolver::<
+        List<String>,
+    >(reference, resolve_counted_string_list_for_sequence));
 
-    RECUR_RESOLVE_COUNT.store(0, Ordering::SeqCst);
-    // Materialize every item the way the trace pipeline does. With a per-item
-    // re-resolve this would be O(n) source resolutions (plus the length probe);
-    // the cached parent keeps it to a single resolve for the whole sequence.
+    RECUR_SEQUENCE_RESOLVE_COUNT.store(0, Ordering::SeqCst);
+    // Materialize every item the way the trace pipeline does, so this counts
+    // the *source* resolutions a full sweep costs — not just the ones an
+    // untouched `AuthRef` would defer.
+    let mut items = 0usize;
     let _auth = raster::run_recur_sequence_list::<String, ItemsOnlyBundle, _, _>(
         source,
         new!(ItemsOnlyBundle),
@@ -611,11 +674,18 @@ fn recur_sequence_resolves_internal_list_once_per_invocation() {
             input
                 .__raster_auth_trace()
                 .expect("sequence item should resolve");
+            items += 1;
             output
         },
     );
 
-    assert_eq!(RECUR_RESOLVE_COUNT.load(Ordering::SeqCst), 1);
+    // The sweep really ran — otherwise "zero resolves" would be vacuous.
+    assert_eq!(items, 3, "every element should still be visited");
+    assert_eq!(
+        RECUR_SEQUENCE_RESOLVE_COUNT.load(Ordering::SeqCst),
+        0,
+        "the source list must never be resolved whole",
+    );
 }
 
 #[test]
@@ -688,13 +758,109 @@ fn recur_trace_threads_verified_roots_between_steps() {
     }
 }
 
+/// A draft's per-step witness must not grow with how much has been appended.
+///
+/// The recorder used to clone the entire append log into every step, so a draft
+/// of N elements cost O(N) trace bytes per step and O(N²) over a run — 7.1 MB
+/// tail witnesses and a 29 GB trace on a 262k-element draft. This asserts the
+/// property the authoring rule already promised: the step's cost tracks its
+/// increment, not the accumulation. See
+/// `docs/proposals/incremental-draft-witness.md`.
+#[test]
+fn draft_witness_size_does_not_grow_with_the_accumulated_list() {
+    let (_reference, events) = capture_trace_events(run_long_lines_reference);
+
+    let witness_sizes: Vec<usize> = events
+        .into_iter()
+        .filter_map(|event| match event {
+            TraceEvent::RecurTileIterationExec(record) if record.fn_name == "collect_lines" => {
+                record.draft_transition_witness
+            }
+            _ => None,
+        })
+        .map(|witness| {
+            raster::core::postcard::to_allocvec(&witness)
+                .expect("witness should serialize")
+                .len()
+        })
+        .collect();
+
+    assert_eq!(witness_sizes.len(), LONG_LINE_COUNT);
+
+    let first = witness_sizes[0];
+    let last = *witness_sizes.last().unwrap();
+    // Under the append-log encoding the last step is ~LONG_LINE_COUNT times the
+    // first, so any constant bound separates the two encodings unambiguously.
+    assert!(
+        last <= first + 512,
+        "witness grew from {} to {} bytes over {} appends",
+        first,
+        last,
+        LONG_LINE_COUNT
+    );
+}
+
+/// Each iteration records the item it ran on as an authenticated selection at
+/// `source[i]`, not as an inline blob.
+///
+/// Materializing an authorized item produces two things — the value and the
+/// binding that authorizes it — and the old `build_recur_input` kept only the
+/// first. Recur tiles therefore recorded their item as `FnInputValue::Inline`,
+/// with no selector, no commitment and no citations: the audit could see *a*
+/// value but nothing tying it to `source[i]`. This asserts both halves of the
+/// fix — the trace value is a storage binding, and the recorded selector ends
+/// in `Index(i)` for the right `i`. See `docs/proposals/lazy-list-recur.md` §4.
+#[test]
+fn recur_iterations_record_the_item_binding_they_ran_on() {
+    let (_reference, events) = capture_trace_events(run_build_lines_reference);
+    let iterations: Vec<_> = events
+        .into_iter()
+        .filter_map(|event| match event {
+            TraceEvent::RecurTileIterationExec(record) if record.fn_name == "collect_lines" => {
+                Some(record)
+            }
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(iterations.len(), 3);
+    for (index, record) in iterations.into_iter().enumerate() {
+        let input = record.input.expect("tile input should be traced");
+
+        assert!(
+            matches!(input.values.first(), Some(FnInputValue::StorageBinding)),
+            "iteration {} recorded its item as {:?}, not a storage binding",
+            index,
+            input.values.first(),
+        );
+
+        let binding = input
+            .storage
+            .get("input")
+            .unwrap_or_else(|| panic!("iteration {} should record an 'input' binding", index));
+        assert_eq!(
+            binding.selector.segments.last(),
+            Some(&SelectorSegment::Index(index as u64)),
+            "iteration {} should be authenticated at source[{}], got {:?}",
+            index,
+            index,
+            binding.selector.segments,
+        );
+        assert_ne!(
+            binding.selection.selected_len, 0,
+            "iteration {} binding should carry a real selection commitment",
+            index,
+        );
+    }
+}
+
 #[test]
 fn recur_trace_emits_site_completion_event() {
     let (_reference, events) = capture_trace_events(run_build_lines_reference);
     let site_events: Vec<_> = events
         .into_iter()
         .filter_map(|event| match event {
-            TraceEvent::RecurTileExec(record) if record.fn_name == "collect_lines" => Some(record),
+            TraceEvent::RecurTileEnd(record) if record.fn_name == "collect_lines" => Some(record),
             _ => None,
         })
         .collect();
@@ -726,7 +892,7 @@ fn recur_sequence_trace_keeps_inner_tiles_replayable() {
     let iteration_start_records = events
         .iter()
         .filter_map(|event| {
-            if let TraceEvent::RecurSequenceStart(record) = event {
+            if let TraceEvent::RecurSequenceIterationStart(record) = event {
                 (record.fn_name == "collect_prefixed_lines").then_some(record)
             } else {
                 None
@@ -747,7 +913,7 @@ fn recur_sequence_trace_keeps_inner_tiles_replayable() {
         .filter(|event| {
             matches!(
                 event,
-                TraceEvent::RecurSequenceExec(record)
+                TraceEvent::RecurSequenceEnd(record)
                     if record.fn_name == "collect_prefixed_lines"
             )
         })
@@ -763,11 +929,11 @@ fn recur_sequence_trace_keeps_inner_tiles_replayable() {
             .as_ref()
             .expect("start event should have input");
         assert!(
-            input.internal.contains_key("input"),
+            input.storage.contains_key("input"),
             "selected item metadata should be keyed by the input parameter name"
         );
         assert!(
-            input.internal.contains_key("prefix"),
+            input.storage.contains_key("prefix"),
             "recursive sequence extra args should remain auth refs in iteration traces"
         );
         let FnInputValue::Inline(bytes) = &input.values[0] else {
@@ -778,6 +944,86 @@ fn recur_sequence_trace_keeps_inner_tiles_replayable() {
         assert_eq!(marker.kind, "raster::RecurSequenceInput");
         assert_eq!(marker.index, expected_index as u64);
         assert_eq!(marker.len, 3);
-        assert_eq!(marker.item, FnInputValue::InternalBinding);
+        assert_eq!(marker.item, FnInputValue::StorageBinding);
     }
+}
+
+// ---- Replay journal: the per-iteration facts (`lazy-list-recur.md` §5) ----
+//
+// These call the generated replay entry point directly, which is the same
+// function the guest runs and whose output the replay receipt covers. Anything
+// asserted here is therefore replay-proven in production, not merely recorded
+// by the host.
+
+fn replay_journal(bytes: Vec<u8>) -> raster::core::draft::TileReplayJournal {
+    raster::core::postcard::from_bytes(&bytes).expect("replay journal should decode")
+}
+
+/// An ordinary tile carries no `RecurInput`, so it emits no recur facts at all.
+#[test]
+fn ordinary_tile_emits_no_recur_journal() {
+    let input = raster::core::postcard::to_allocvec(&(
+        String::from("line"),
+        String::from("prefix: "),
+    ))
+    .unwrap();
+    let journal = replay_journal(__raster_tile_replay_entry_prefix_line(&input).unwrap());
+    assert_eq!(journal.recur, None);
+}
+
+/// A recur tile whose return type carries no `RecurControl` must still emit an
+/// explicit `Continue`.
+///
+/// The tempting alternative — omit the field and read absence as `Continue` —
+/// puts a default in guest audit code, where it is indistinguishable from a
+/// field a producer failed to set. `dynamic-index-selection.md` already records
+/// what that costs: `InputSource::Inline` was exactly such a permissive
+/// fallback. This is the regression test for not reintroducing it.
+#[test]
+fn recur_tile_without_control_emits_explicit_continue() {
+    let input = raster::core::postcard::to_allocvec(&(
+        RecurInput::new(String::from("abcd"), 2u64, 5u64),
+        RecurState::new(MaxLenState { max_len: 0 }),
+    ))
+    .unwrap();
+    let journal = replay_journal(__raster_tile_replay_entry_track_max_len(&input).unwrap());
+
+    let recur = journal.recur.expect("a recur tile must emit recur facts");
+    assert_eq!(recur.control, raster::core::draft::RecurControlKind::Continue);
+    assert_eq!(recur.position.iteration_index, 2);
+    assert_eq!(recur.position.declared_iterations, 5);
+    // Element recur consumes exactly one element per iteration.
+    assert_eq!(recur.position.consumed_elements, 1);
+}
+
+/// A tile that *can* break reports which branch it actually took.
+#[test]
+fn recur_tile_reports_break_and_continue_distinctly() {
+    // `limit = 2`, `seen` starts at 0 -> first call continues, second breaks.
+    let continues = raster::core::postcard::to_allocvec(&(
+        RecurInput::new(String::from("a"), 0u64, 4u64),
+        RecurState::new(LimitState { seen: 0 }),
+        2u64,
+    ))
+    .unwrap();
+    let breaks = raster::core::postcard::to_allocvec(&(
+        RecurInput::new(String::from("b"), 1u64, 4u64),
+        RecurState::new(LimitState { seen: 1 }),
+        2u64,
+    ))
+    .unwrap();
+
+    let continued =
+        replay_journal(__raster_tile_replay_entry_count_until_limit_state_only(&continues).unwrap());
+    let broke =
+        replay_journal(__raster_tile_replay_entry_count_until_limit_state_only(&breaks).unwrap());
+
+    assert_eq!(
+        continued.recur.expect("recur facts").control,
+        raster::core::draft::RecurControlKind::Continue,
+    );
+    assert_eq!(
+        broke.recur.expect("recur facts").control,
+        raster::core::draft::RecurControlKind::Break,
+    );
 }

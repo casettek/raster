@@ -1,0 +1,7 @@
+error: `select!(BytesPage, region)` needs an index — a byte offset or a page index; to sweep the region select `List<BytesPage>` from `.pages`
+  --> tests/ui/select_bytes_page_requires_index.rs:11:16
+   |
+11 |     let _bad = select!(BytesPage, model.weights);
+   |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: this error originates in the macro `select` (in Nightly builds, run with -Z macro-backtrace for more info)

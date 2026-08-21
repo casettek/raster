@@ -13,33 +13,58 @@ pub extern crate alloc;
 extern crate std;
 
 pub use raster_core as core;
+pub use raster_core::auth::AuthMode;
 pub use raster_core::draft;
+
+/// The authentication posture of this run. See
+/// `docs/proposals/unauthenticated-execution.md` §1.
+///
+/// `select!` and the sequence call bindings expand to a match on this, so it
+/// must resolve in both postures. Off the host there is no environment and no
+/// program entry point to read, and a guest replays a step that was recorded
+/// authenticated — so the guest answer is `Authenticated`, always.
+#[cfg(feature = "std")]
+pub fn auth_mode() -> AuthMode {
+    raster_runtime::auth::auth_mode()
+}
+
+#[cfg(not(feature = "std"))]
+pub fn auth_mode() -> AuthMode {
+    AuthMode::Authenticated
+}
 
 pub mod input;
 pub use input::{
-    auth_ref_result_trace, auth_ref_trace, chunk_auth_ref, draft_replay_handle,
-    draft_replay_transition, finalize,
-    into_auth_ref, into_auth_value, into_draft, materialize_auth_result, materialize_auth_return,
-    new_draft, raster_trace_payload, resolve_external_value, resolve_internal_ok_value,
-    resolve_internal_value, resolve_typed_external_value, restore_draft_from_replay_handle,
-    run_recur_list, run_recur_list_state, run_recur_list_with_state, run_recur_sequence_list,
-    run_recur_sequence_list_state, run_recur_sequence_list_with_state, select_source,
-    select_stored_internal_value, selector_path, serialize_draft_replay_handle,
-    serialize_draft_trace, typed_external, typed_internal, typed_internal_with_resolver,
-    typed_selector_path, Anchor, AuthRef, AuthRefTrace, AuthValue, Draft, DraftAppendField,
-    DraftSetField, ExternalRef, ExternalSelection, ExternalValue, InternalRef, InternalValue,
-    IntoAuthRef, IntoAuthValue, IntoDraft, IntoRecurControl, ListProofDirection, ListProofSibling,
-    Op, RecurControl, RecurInput, RecurOutput, RecurSequenceInput, RecurSequenceOutput,
-    RecurSequenceState, RecurState, Schema, SchemaField, SchemaFieldMode, SchemaNode, SelectSource,
-    Selectable, SelectedPayload, SelectionCommitment, SelectionProof, SelectionProofStep,
-    SelectionWitness, SelectorPath, SelectorSegment, TypedExternalBinding, TypedInternalBinding,
-    TypedSelectorPath,
+    __raster_clone, attach_index_bindings, auth_ref_result_trace, auth_ref_trace,
+    draft_replay_handle, draft_replay_transition, entry_argument_auth_ref, finalize,
+    index_binding_name, into_auth_ref, into_auth_value, into_auth_value_with_bindings, into_draft,
+    materialize_auth_result, materialize_auth_return, new_draft, push_bound_index,
+    raster_trace_payload, resolve_storage_ok_value, resolve_storage_value,
+    inline_index, is_storage_backed, restore_draft_from_replay_handle, run_recur_chunked_list,
+    run_recur_chunked_list_state,
+    run_recur_chunked_list_with_state, run_recur_list, run_recur_list_state,
+    run_recur_list_with_state, run_recur_sequence_list, run_recur_sequence_list_state,
+    run_recur_sequence_list_with_state, select_inline, select_source, select_stored_value,
+    selector_path,
+    serialize_draft_replay_handle, serialize_draft_trace, typed_selector_path, typed_storage,
+    typed_storage_with_resolver, Anchor, AuthRef, AuthRefTrace, AuthValue, Block, Bytes, BytesPage,
+    Draft,
+    bytes_field_key, page_index_for_field, page_index_for_region, page_range_for_field,
+    page_range_for_region, DraftAppendField, DraftSetField, IndexBinding, IndexSource, IndexWidth,
+    InlineSelectSource, IntoAuthRef, BytesFieldPageSize, PageSized, RecurListSource,
+    IntoAuthValue, IntoDraft, IntoMaterialized, IntoRecurControl, List, ListProofDirection,
+    ListProofSibling, Materializable, Op, RecurControl, RecurInput, RecurOutput,
+    RecurSequenceInput, RecurSequenceOutput, RecurSequenceState, RecurState, Schema, SchemaField,
+    SchemaFieldMode, SchemaNode, SelectSource, Selectable, SelectedPayload, SelectionCommitment,
+    SelectionPayloadKind, SelectionProof, SelectionProofStep, SelectionWitness, SelectorPath,
+    SelectorSegment, StorageRef, StorageValue, TypedSelectorPath, TypedStorageBinding,
 };
 
 #[cfg(feature = "std")]
 pub use input::{
-    begin_draft_transition_capture, encode_raster_value, finish_draft_transition_capture,
-    store_internal_value, write_raster_files,
+    begin_draft_transition_capture, encode_raster_value, end_program_output, end_program_unit,
+    finish_draft_transition_capture, postcard_structural_commitment, recur_source_trace,
+    store_value, write_raster_files,
 };
 
 pub use raster_macros::{select, sequence, tile, Selectable};
@@ -60,7 +85,25 @@ pub mod runtime {
 
 // Runtime helpers are only available with std feature.
 #[cfg(feature = "std")]
-pub use raster_runtime::{finish, init, init_with, publish_trace_event};
+pub use raster_runtime::{
+    entry_argument_spec, finish, init, init_with, publish_trace_event, start_program,
+    take_recur_item_binding, EntryArgumentSpec, EntryArgumentsBinding,
+};
+
+/// Guest tiles still expand `::raster::take_recur_item_binding()`; the host
+/// driver is the only caller that ever stashes a binding. On `no_std` there is
+/// no thread-local stash, so every take is `None` and the wrapper falls back
+/// to the argument's own index bindings.
+#[cfg(not(feature = "std"))]
+pub struct PendingRecurItemBinding {
+    pub storage: crate::core::trace::StorageData,
+    pub index_bindings: alloc::vec::Vec<IndexBinding>,
+}
+
+#[cfg(not(feature = "std"))]
+pub fn take_recur_item_binding() -> Option<PendingRecurItemBinding> {
+    None
+}
 
 #[cfg(feature = "std")]
 pub mod utils;
@@ -236,13 +279,15 @@ pub mod __private {
         total_duration_ns: u64,
         user_duration_ns: u64,
         external_input_resolve_ns: u64,
-        internal_input_resolve_ns: u64,
+        storage_input_resolve_ns: u64,
         trace_serialize_ns: u64,
         draft_capture_ns: u64,
         scope_enter_ns: u64,
         output_record_build_ns: u64,
         trace_event_publish_ns: u64,
         output_coordinate_publish_ns: u64,
+        input_bytes: u64,
+        output_bytes: u64,
     ) {
         #[cfg(feature = "profiling")]
         raster_runtime::record_tile_profile(
@@ -252,7 +297,7 @@ pub mod __private {
             user_duration_ns,
             raster_runtime::TileProfileOverheadBreakdown {
                 external_input_resolve_ns,
-                internal_input_resolve_ns,
+                storage_input_resolve_ns,
                 output_store_ns: 0,
                 trace_serialize_ns,
                 draft_capture_ns,
@@ -262,6 +307,10 @@ pub mod __private {
                 output_coordinate_publish_ns,
                 other_wrapper_ns: 0,
             },
+            raster_runtime::TileProfileSizes {
+                input_bytes,
+                output_bytes,
+            },
         );
         #[cfg(not(feature = "profiling"))]
         let _ = (
@@ -270,20 +319,25 @@ pub mod __private {
             total_duration_ns,
             user_duration_ns,
             external_input_resolve_ns,
-            internal_input_resolve_ns,
+            storage_input_resolve_ns,
             trace_serialize_ns,
             draft_capture_ns,
             scope_enter_ns,
             output_record_build_ns,
             trace_event_publish_ns,
             output_coordinate_publish_ns,
+            input_bytes,
+            output_bytes,
         );
     }
 
     #[cfg(not(feature = "std"))]
+    #[allow(clippy::too_many_arguments)]
     pub fn record_tile_profile(
         _: &str,
         _: crate::core::cfs::CfsCoordinates,
+        _: u64,
+        _: u64,
         _: u64,
         _: u64,
         _: u64,
@@ -390,23 +444,32 @@ pub mod __private {
         }
     }
 
+    /// Bind a tile's return value for the rest of the sequence.
+    ///
+    /// The `Serialize + DeserializeOwned` bounds are kept in both modes even
+    /// though the unauthenticated arm never uses them: dropping them would let
+    /// a program compile one way and not the other, and "develop
+    /// unauthenticated, commit authenticated" only works if the two modes
+    /// accept the same source.
     #[cfg(feature = "std")]
     pub fn bind_infallible_call<T>(result: T) -> crate::AuthRef<T>
     where
         T: serde::Serialize + serde::de::DeserializeOwned + 'static,
     {
+        if !crate::auth_mode().is_authenticated() {
+            return crate::AuthRef::Inline(result);
+        }
+
         #[cfg(feature = "profiling")]
         let output_store_start = profile_now();
-        let reference =
-            raster_runtime::store_execution_output_value(&result).unwrap_or_else(|error| {
-                panic!("Failed to store tile output in internal storage: {}", error)
-            });
+        let reference = raster_runtime::store_execution_output_value(&result)
+            .unwrap_or_else(|error| panic!("Failed to store tile output in storage: {}", error));
         #[cfg(feature = "profiling")]
         let output_store_duration_ns =
             u64::try_from(output_store_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
         #[cfg(feature = "profiling")]
         raster_runtime::record_tile_output_store_profile(output_store_duration_ns);
-        crate::into_auth_ref::<T, _>(crate::typed_internal::<T>(reference))
+        crate::into_auth_ref::<T, _>(crate::typed_storage::<T>(reference))
     }
 
     #[cfg(not(feature = "std"))]
@@ -421,12 +484,17 @@ pub mod __private {
     where
         T: serde::Serialize + serde::de::DeserializeOwned + 'static,
     {
+        if !crate::auth_mode().is_authenticated() {
+            // The whole `Result` is what storage would hold, so the
+            // unauthenticated arm splits it here instead of behind
+            // `resolve_storage_ok_value`.
+            return result.map(crate::AuthRef::Inline);
+        }
+
         #[cfg(feature = "profiling")]
         let output_store_start = profile_now();
-        let reference =
-            raster_runtime::store_execution_output_value(&result).unwrap_or_else(|error| {
-                panic!("Failed to store tile output in internal storage: {}", error)
-            });
+        let reference = raster_runtime::store_execution_output_value(&result)
+            .unwrap_or_else(|error| panic!("Failed to store tile output in storage: {}", error));
         #[cfg(feature = "profiling")]
         let output_store_duration_ns =
             u64::try_from(output_store_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
@@ -434,9 +502,9 @@ pub mod __private {
         raster_runtime::record_tile_output_store_profile(output_store_duration_ns);
         match result {
             Ok(_) => Ok(crate::into_auth_ref::<T, _>(
-                crate::typed_internal_with_resolver::<T>(
+                crate::typed_storage_with_resolver::<T>(
                     reference,
-                    crate::resolve_internal_ok_value::<T>,
+                    crate::resolve_storage_ok_value::<T>,
                 ),
             )),
             Err(error) => Err(error),
@@ -448,6 +516,42 @@ pub mod __private {
         _: core::result::Result<T, crate::alloc::string::String>,
     ) -> core::result::Result<crate::AuthRef<T>, crate::alloc::string::String> {
         panic!("Sequence call bindings require the `std` feature")
+    }
+
+    /// Builds a tile output's trace payload and stashes a copy of the
+    /// encoding — keyed by `output_bytes`, the postcard serialization the
+    /// wrapper traced — for the caller's `bind_*_call` to reuse when it
+    /// stores the same value. Raster-Merkleizing a large output dominates a
+    /// tile call's cost; without the stash it runs twice per output (once
+    /// for the trace, once for storage).
+    #[cfg(feature = "std")]
+    pub fn tile_output_trace_payload<T>(
+        value: &T,
+        output_bytes: &[u8],
+    ) -> raster_core::Result<raster_core::trace::RasterPayload>
+    where
+        T: serde::Serialize,
+    {
+        let payload = crate::raster_trace_payload(value)?;
+        raster_runtime::stash_pending_output_encoding(
+            core::any::type_name::<T>(),
+            output_bytes.to_vec(),
+            payload.clone(),
+        );
+        Ok(payload)
+    }
+
+    #[cfg(not(feature = "std"))]
+    pub fn tile_output_trace_payload<T>(
+        _: &T,
+        _: &[u8],
+    ) -> raster_core::Result<raster_core::trace::RasterPayload>
+    where
+        T: serde::Serialize,
+    {
+        Err(raster_core::Error::Other(
+            "Raster trace payload generation requires the `std` feature".into(),
+        ))
     }
 
     pub trait TileCallBinding<Return> {
@@ -510,22 +614,11 @@ macro_rules! call {
     };
 }
 
-/// Creates a typed external-input reference for explicit call-site bindings.
+/// Creates a typed storage reference for explicit call-site bindings.
 #[macro_export]
-macro_rules! external {
-    ($ty:ty, $name:literal) => {
-        $crate::typed_external::<$ty>($name)
-    };
-    ($ty:ty, $name:expr) => {
-        $crate::typed_external::<$ty>($name)
-    };
-}
-
-/// Creates a typed internal-store reference for explicit call-site bindings.
-#[macro_export]
-macro_rules! internal {
+macro_rules! storage {
     ($ty:ty, $reference:expr) => {
-        $crate::typed_internal::<$ty>($reference)
+        $crate::typed_storage::<$ty>($reference)
     };
 }
 
@@ -533,6 +626,64 @@ macro_rules! internal {
 macro_rules! new {
     ($ty:ty) => {
         $crate::new_draft::<$ty>()
+    };
+}
+
+/// A recur-sequence item as an authorized reference, without materializing it.
+///
+/// A `RecurSequenceInput<T>` is a handle, not a reference: it can be *read*
+/// once, by passing it to a tile, and it does not implement `SelectSource`, so
+/// `select!` cannot reach into it. `into_ref!` unwraps the handle to the
+/// `AuthRef<T>` inside, which is what lets an item narrow through `select!` or
+/// supply a `select!` index:
+///
+/// ```ignore
+/// let activation = into_ref!(input);                       // no materialization
+/// let token_id = select!(u32, activation.clone().token_id);
+/// let row = select!(EmbeddingRow, rows[token_id]);          // dynamic index
+/// ```
+///
+/// Without it the only way to reach one field of an item is to materialize the
+/// whole item into a tile — for a wide item (an activation row at model
+/// hidden-size) that copies the entire row in and back out to read a `u32`.
+///
+/// **A macro rather than a method**, even though it expands to one. The CFS
+/// flow resolver attributes provenance by parsing the sequence body, and it
+/// recognizes the grammar's macros by name; a bare method call is a form it
+/// cannot attribute, so `let x = handle.method();` resolves to
+/// `InputSource::Inline` — a step argument the schema does not pin to any
+/// upstream binding. Keeping this a macro means the only spelling available is
+/// the one the analysis understands.
+#[macro_export]
+macro_rules! into_ref {
+    ($input:expr) => {
+        $input.__raster_into_ref()
+    };
+}
+
+/// Duplicates a sequence binding so it can be used again.
+///
+/// Sequence bindings are authorized *references*, so this copies a handle, not
+/// data — the cost is a pointer, not the value it points at:
+///
+/// ```ignore
+/// let projected = call!(project_row, clone!(token_id), activation_hex);
+/// call!(combine_row, output, token_id, projected)
+/// ```
+///
+/// **The DSL spelling of `.clone()`, and the one to write.** A bare
+/// `binding.clone()` still compiles and is still analyzed correctly in an
+/// *argument* position, but the grammar the CFS flow resolver recognizes is
+/// made of macros, and keeping every sequence-body form inside it is what makes
+/// the analysis total rather than best-effort. See
+/// `docs/proposals/sequence-grammar-closure.md`.
+///
+/// Does not work on a `Draft<S>`: draft handles are linear — one live handle,
+/// rebound at every step — and `Draft` is deliberately not `Clone`.
+#[macro_export]
+macro_rules! clone {
+    ($binding:expr) => {
+        $crate::__raster_clone(&$binding)
     };
 }
 
@@ -610,30 +761,31 @@ macro_rules! println {
 /// terminal execution result type. Raster runtime failures remain available
 /// separately under `raster::runtime`.
 pub mod prelude {
-    pub use crate::core::{
-        input::ExternalRef,
-        tile::{TileId, TileIdStatic, TileMetadata, TileMetadataStatic},
-    };
+    pub use crate::core::tile::{TileId, TileIdStatic, TileMetadata, TileMetadataStatic};
 
     // These modules require std
     #[cfg(feature = "std")]
     pub use crate::core::{
         manifest::Manifest,
         schema::{ControlFlow, SequenceSchema},
-        trace::{FnCallRecord, FnInput, FnInputArg, FnOutput, TileExecRecord},
+        trace::{ExecStep, ExecTarget, FnCallRecord, FnInput, FnInputArg, FnOutput, StepKind},
     };
 
     pub use crate::exec::Result;
     pub use crate::{
-        call, call_recur, call_recur_seq, call_seq, external, finalize, internal, into_auth_ref,
-        into_draft, materialize_auth_result, materialize_auth_return, new, select, sequence, tile,
-        Anchor, AuthRef, AuthValue, Draft, ExternalSelection, ExternalValue, InternalRef,
-        InternalValue, IntoAuthRef, IntoAuthValue, IntoDraft, ListProofDirection, ListProofSibling,
-        Op, RecurControl, RecurInput, RecurOutput, RecurSequenceInput, RecurSequenceOutput,
+        call, call_recur, call_recur_seq, call_seq, clone, finalize, into_auth_ref, into_draft,
+        into_ref,
+        materialize_auth_result, materialize_auth_return, new, select, sequence, storage, tile,
+        bytes_field_key, page_index_for_field, page_index_for_region, page_range_for_field,
+        page_range_for_region, Anchor, AuthRef, AuthValue, Block, Bytes, BytesFieldPageSize,
+        BytesPage, Draft, IndexSource, IndexWidth, IntoAuthRef, IntoAuthValue, IntoDraft, List,
+        ListProofDirection, ListProofSibling, PageSized, RecurListSource,
+        Materializable, Op,
+        RecurControl, RecurInput, RecurOutput, RecurSequenceInput, RecurSequenceOutput,
         RecurSequenceState, RecurState, Schema, SchemaField, SchemaFieldMode, SchemaNode,
         SelectSource, Selectable, SelectedPayload, SelectionProof, SelectionProofStep,
-        SelectorPath, SelectorSegment, TypedExternalBinding, TypedInternalBinding,
-        TypedSelectorPath,
+        SelectorPath, SelectorSegment, StorageRef, StorageValue, TypedSelectorPath,
+        TypedStorageBinding,
     };
 
     // TODO: Re-enable once Executor/Tracer types are implemented
@@ -641,8 +793,5 @@ pub mod prelude {
     // pub use crate::{Executor, Tracer, FileTracer, NoOpTracer};
 
     #[cfg(feature = "std")]
-    pub use crate::{
-        resolve_external_value, resolve_internal_value, resolve_typed_external_value,
-        store_internal_value,
-    };
+    pub use crate::{resolve_storage_value, store_value};
 }

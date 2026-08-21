@@ -13,10 +13,9 @@ required-features = ["gen-input"]
 default = ["std"]
 std = ["raster/std"]
 profiling = ["raster/profiling"]
-gen-input = ["dep:serde_json", "dep:sha2"]
+gen-input = ["dep:serde_json"]
 
 [dependencies]
 raster = { path = "../../crates/raster", default-features = false }
 serde.workspace = true
 serde_json = { workspace = true, optional = true }
-sha2 = { version = "0.10.9", default-features = false, optional = true }

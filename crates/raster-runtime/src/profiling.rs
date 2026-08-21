@@ -72,10 +72,19 @@ pub struct TileProfileRecord {
     pub total_duration_ns: u64,
     pub user_duration_ns: u64,
     pub raster_overhead_ns: u64,
+    /// Size of the postcard replay input — **the replay unit size**. The one
+    /// number an input-shape decision (`page_size`, `chunk = N`, how much a
+    /// selection pulls in) is tuned against, and what the guest's
+    /// input-commitment hash is charged on. Timings alone cannot show it.
+    #[serde(default)]
+    pub input_bytes: u64,
+    /// Size of the postcard tile output — the other half of the replay budget.
+    #[serde(default)]
+    pub output_bytes: u64,
     #[serde(default)]
     pub external_input_resolve_ns: u64,
     #[serde(default)]
-    pub internal_input_resolve_ns: u64,
+    pub storage_input_resolve_ns: u64,
     #[serde(default)]
     pub output_store_ns: u64,
     #[serde(default)]
@@ -147,10 +156,20 @@ impl SequenceProfileSelfBreakdown {
     }
 }
 
+/// Byte sizes of one replay unit. Separate from the timing breakdown because it
+/// answers a different question: timings say *where* a tile spends its budget,
+/// sizes say *how big the unit being budgeted is* — which is what an author
+/// changes when tuning `page_size` or `chunk = N`.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct TileProfileSizes {
+    pub input_bytes: u64,
+    pub output_bytes: u64,
+}
+
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct TileProfileOverheadBreakdown {
     pub external_input_resolve_ns: u64,
-    pub internal_input_resolve_ns: u64,
+    pub storage_input_resolve_ns: u64,
     pub output_store_ns: u64,
     pub trace_serialize_ns: u64,
     pub draft_capture_ns: u64,
@@ -165,7 +184,7 @@ impl TileProfileOverheadBreakdown {
     #[cfg(feature = "profiling")]
     fn measured_total_ns(&self) -> u64 {
         self.external_input_resolve_ns
-            .saturating_add(self.internal_input_resolve_ns)
+            .saturating_add(self.storage_input_resolve_ns)
             .saturating_add(self.output_store_ns)
             .saturating_add(self.trace_serialize_ns)
             .saturating_add(self.draft_capture_ns)
@@ -464,6 +483,7 @@ pub fn record_tile_profile(
     total_duration_ns: u64,
     user_duration_ns: u64,
     overhead_breakdown: TileProfileOverheadBreakdown,
+    sizes: TileProfileSizes,
 ) {
     PROFILER_STATE.with(|state| {
         let mut state = state.borrow_mut();
@@ -489,8 +509,10 @@ pub fn record_tile_profile(
             total_duration_ns,
             user_duration_ns,
             raster_overhead_ns,
+            input_bytes: sizes.input_bytes,
+            output_bytes: sizes.output_bytes,
             external_input_resolve_ns: overhead_breakdown.external_input_resolve_ns,
-            internal_input_resolve_ns: overhead_breakdown.internal_input_resolve_ns,
+            storage_input_resolve_ns: overhead_breakdown.storage_input_resolve_ns,
             output_store_ns: overhead_breakdown.output_store_ns,
             trace_serialize_ns: overhead_breakdown.trace_serialize_ns,
             draft_capture_ns: overhead_breakdown.draft_capture_ns,
@@ -514,6 +536,7 @@ pub fn record_tile_profile(
     _: u64,
     _: u64,
     _: TileProfileOverheadBreakdown,
+    _: TileProfileSizes,
 ) {
 }
 
@@ -635,9 +658,7 @@ fn spawn_stream_writer(path: PathBuf) -> std::io::Result<ProfileStreamHandle> {
 #[cfg(all(test, feature = "profiling"))]
 mod tests {
     use super::*;
-    use crate::internal_storage::{
-        enter_sequence_scope, exit_sequence_scope, store_internal_value,
-    };
+    use crate::storage::{enter_sequence_scope, exit_sequence_scope, store_value};
 
     fn reset_profiler() {
         PROFILER_STATE.with(|state| {
@@ -756,7 +777,7 @@ mod tests {
 
         enter_sequence_scope("main");
         begin_sequence_profile("main");
-        let _ = store_internal_value(&123u64).expect("store should allocate synthetic coordinates");
+        let _ = store_value(&123u64).expect("store should allocate synthetic coordinates");
         finish_sequence_profile(
             "main",
             1_000_000,

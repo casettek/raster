@@ -17,6 +17,10 @@ Cargo.lock
 *.trace
 *.raster
 
+# Generated input fixtures (see examples/hello-tiles/bin/gen_input.rs)
+*.rastered
+*.rindex
+
 *.bin
 
 # Testing

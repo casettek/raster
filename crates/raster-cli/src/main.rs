@@ -2,7 +2,10 @@
 //!
 //! Provides commands for building, running, and analyzing Raster tiles.
 
+mod chain;
 mod commands;
+mod program;
+mod runtime_env;
 mod utils;
 
 use clap::{Parser, ValueEnum};
@@ -127,6 +130,20 @@ enum Commands {
         output: Option<String>,
     },
 
+    /// Show the program's identity (commitment, interface, tile registry)
+    Program {
+        /// Recompute from source and check against Raster.lock
+        #[arg(long)]
+        verify: bool,
+    },
+
+    /// Run or audit a multi-program chain, defined by a `Raster.toml` `[chain]`
+    /// table or a `chain.json` (see docs/proposals/program-chain.md)
+    Chain {
+        #[command(subcommand)]
+        command: ChainCommand,
+    },
+
     /// Run the user program
     Run {
         /// Backend to use for execution
@@ -161,6 +178,13 @@ enum Commands {
         #[arg(long, conflicts_with = "commit")]
         audit: Option<String>,
 
+        /// Run without authenticated storage: tile outputs are passed as plain
+        /// Rust values, nothing is hashed or stored between tiles, and no trace
+        /// is written. Faster, and not authoritative — results cannot be
+        /// committed or audited. Drafts and recur loops are not supported yet.
+        #[arg(long = "no-auth", conflicts_with_all = ["commit", "audit"])]
+        no_auth: bool,
+
         /// Read and verify trace from file (mutually exclusive with --commit)
         #[arg(long)]
         verbose: bool,
@@ -183,11 +207,77 @@ enum Commands {
     },
 }
 
+#[derive(Parser)]
+enum ChainCommand {
+    /// Run every stage in order, threading each output into the next, and write
+    /// a chain-commitment over the resulting checkpoints.
+    Run {
+        /// Chain manifest: a `Raster.toml` with a `[chain]` table, a directory
+        /// containing one (or a `chain.json`), or an explicit `chain.json`.
+        /// Omit to discover a chain manifest from the current directory upward.
+        chain: Option<String>,
+
+        /// Trace items covered by each stage's fraud-proof window (power of two,
+        /// 2..=1024); each stage is committed with this window.
+        #[arg(long = "fraud-proof-window-size", default_value_t = 2)]
+        fraud_proof_window_size: usize,
+
+        /// Run every stage without authenticated storage: no trace, no
+        /// per-stage `commit.bin`, and no chain-commitment. Stages still link
+        /// through their real `output.bin`, so the chain computes the same
+        /// values — it just cannot be audited. For iterating on stage logic.
+        #[arg(long = "no-auth", conflicts_with = "fraud_proof_window_size")]
+        no_auth: bool,
+    },
+
+    /// Verify a recorded chain's links and identities — public, no proving.
+    Audit {
+        /// Chain manifest (see `chain run`). Omit to discover from the current
+        /// directory upward.
+        chain: Option<String>,
+
+        /// Path to the chain-commitment written by `chain run`. Omit to use the
+        /// most recent run under `target/raster/chains/`.
+        chain_commitment: Option<String>,
+
+        /// Additionally re-run every stage natively and verify the honest
+        /// trace against the stage's committed `commit.bin` (detects
+        /// intra-stage execution fraud; use `chain fraud-prove` for a receipt).
+        #[arg(long)]
+        execution: bool,
+    },
+
+    /// Detect a chain fault (link, then execution) and produce a single
+    /// succinct chain fraud receipt naming the faulty stage.
+    FraudProve {
+        /// Chain manifest (see `chain run`).
+        chain: Option<String>,
+
+        /// Path to the chain-commitment written by `chain run`. Omit to use the
+        /// most recent run under `target/raster/chains/`.
+        chain_commitment: Option<String>,
+    },
+
+    /// Verify a chain fraud receipt against the local chain-commitment and
+    /// the known-good guest image ids.
+    FraudVerify {
+        /// Path to the `chain-fraud.receipt`. Omit to use the one next to the
+        /// chain-commitment.
+        receipt: Option<String>,
+
+        /// Chain manifest (see `chain run`).
+        #[arg(long)]
+        chain: Option<String>,
+
+        /// Path to the chain-commitment written by `chain run`.
+        #[arg(long)]
+        chain_commitment: Option<String>,
+    },
+}
+
 /// Parse and validate the --fraud-proof-window-size argument into the
 /// fraud-proof window parameters used for building trace commitments.
-fn parse_fraud_proof_config(
-    value: &str,
-) -> std::result::Result<FraudProofConfig, String> {
+fn parse_fraud_proof_config(value: &str) -> std::result::Result<FraudProofConfig, String> {
     let window_size: usize = value
         .parse()
         .map_err(|_| format!("'{value}' is not a valid window size"))?;
@@ -271,6 +361,32 @@ fn try_main() -> Result<()> {
             verify,
         } => commands::run_sequence(backend, &sequence, input.as_deref(), prove, verify),
         Commands::Cfs { output } => commands::cfs(output),
+        Commands::Program { verify } => commands::program(verify),
+        Commands::Chain { command } => match command {
+            ChainCommand::Run {
+                chain,
+                fraud_proof_window_size,
+                no_auth,
+            } => chain::run(chain.as_deref(), fraud_proof_window_size, no_auth),
+            ChainCommand::Audit {
+                chain,
+                chain_commitment,
+                execution,
+            } => chain::audit(chain.as_deref(), chain_commitment.as_deref(), execution),
+            ChainCommand::FraudProve {
+                chain,
+                chain_commitment,
+            } => chain::fraud_prove(chain.as_deref(), chain_commitment.as_deref()),
+            ChainCommand::FraudVerify {
+                receipt,
+                chain,
+                chain_commitment,
+            } => chain::fraud_verify(
+                receipt.as_deref(),
+                chain.as_deref(),
+                chain_commitment.as_deref(),
+            ),
+        },
         Commands::Run {
             backend,
             input,
@@ -278,6 +394,7 @@ fn try_main() -> Result<()> {
             commit,
             fraud_proof_config,
             audit,
+            no_auth,
             verbose,
             trace_format,
             features,
@@ -290,6 +407,7 @@ fn try_main() -> Result<()> {
             commit.as_deref(),
             fraud_proof_config,
             audit.as_deref(),
+            no_auth,
             verbose,
             trace_format,
             &features,
