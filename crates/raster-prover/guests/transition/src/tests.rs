@@ -11,18 +11,22 @@ use raster_core::coordinate_index::{
     coordinate_index_membership_proof, coordinate_index_non_membership_proof, coordinate_index_root,
 };
 use raster_core::draft::{
-    draft_root_from_witness, schema_hash as compute_schema_hash, DraftFieldValue, DraftOp,
-    DraftReplayTransition, DraftStateWitness, DraftTransitionWitness, TileReplayJournal,
-    TrackedDraftState,
+    draft_root_from_witness, draft_value_root, schema_hash as compute_schema_hash, DraftOp,
+    DraftReplayTransition, DraftStateWitness, DraftTransitionWitness, DraftWitnessField,
+    RecurControlKind,
+    RecurPosition, RecurTileReplay, TileReplayJournal, TrackedDraftState,
 };
-use raster_core::input::{SchemaField, SchemaFieldMode, SchemaNode, Selectable};
+use raster_core::input::{
+    AppendFrontier, SchemaField, SchemaFieldMode, SchemaNode, Selectable,
+};
+use raster_core::recur_progress::RecurProgressStack;
 use raster_core::trace::{
-    ExecStep, ExecTarget, FnInput, FnInputArg, FnInputValue, StepKind, StorageData, StorageRoots,
-    StepRecord,
+    ExecStep, ExecTarget, FnInput, FnInputArg, FnInputValue, StepKind, StepRecord, StorageData,
+    StorageRoots,
 };
 use raster_core::transition::{
-    StorageEntry, StorageLogWitness, StorageReadWitness, StorageWitness,
-    StorageWriteWitness, SerializableFrontier,
+    SerializableFrontier, StorageEntry, StorageLogWitness, StorageReadWitness, StorageWitness,
+    StorageWriteWitness,
 };
 
 use crate::checks::cfs::verify_step_record_inputs;
@@ -87,6 +91,7 @@ fn draft_tile_step(exec_index: u64) -> StepRecord {
                 index_root_after: Vec::new(),
             },
         }),
+        recur_progress_commitment: RecurProgressStack::new().commitment(),
     }
 }
 
@@ -192,6 +197,7 @@ fn verify_tile_commitments_accept_matching_recorded_io() {
                 index_root_after: Vec::new(),
             },
         }),
+        recur_progress_commitment: RecurProgressStack::new().commitment(),
     };
 
     verify_io_witness(&step, Some(&b"in".to_vec()), Some(&b"out".to_vec()));
@@ -217,6 +223,7 @@ fn verify_step_record_inputs_accepts_sequence_descendant_producer_coordinates() 
                 index_root_after: Vec::new(),
             },
         }),
+        recur_progress_commitment: RecurProgressStack::new().commitment(),
     };
     let input_source_witness =
         storage_input_witness(CfsCoordinates(vec![0, 0]), sha(b"producer-output"));
@@ -268,29 +275,54 @@ fn recur_iteration_step(iteration: u32) -> StepRecord {
                 index_root_after: Vec::new(),
             },
         }),
+        recur_progress_commitment: RecurProgressStack::new().commitment(),
     }
 }
 
-/// ABI bytes of a chunked recur iteration input: the tuple leads with
-/// `RecurInput<Vec<String>> { value, index, len }`, so the first varint is the
-/// chunk element count.
-fn recur_iteration_input_bytes(elements: usize) -> Vec<u8> {
-    let chunk: Vec<String> = (0..elements).map(|i| format!("line-{}", i)).collect();
-    postcard::to_allocvec(&((chunk, 0u64, 2u64), "title".to_string())).unwrap()
+/// A chunked iteration's replay-proven recur facts.
+///
+/// The element count used to be inferred from the leading postcard varint of
+/// the iteration's ABI bytes; it is now a field the tile commits and the replay
+/// receipt covers, so these tests hand the checker a journal rather than a
+/// byte-layout puzzle.
+fn recur_journal(
+    iteration_index: u64,
+    declared_iterations: u64,
+    consumed_elements: u64,
+    control: RecurControlKind,
+) -> TileReplayJournal {
+    TileReplayJournal {
+        input_commitment: [0u8; 32],
+        output_bytes: Vec::new(),
+        draft_transition: None,
+        recur: Some(RecurTileReplay {
+            position: RecurPosition {
+                iteration_index,
+                declared_iterations,
+                consumed_elements,
+            },
+            control,
+        }),
+    }
 }
 
 #[test]
 fn verify_step_record_inputs_accepts_declared_chunk_sizes() {
     let cfs_cursor = chunked_recur_cfs(Some(2));
-    // Full chunk and short (final) chunk are both valid per-step.
-    for elements in [2usize, 1] {
-        let witness = recur_iteration_input_bytes(elements);
+    // A full chunk mid-sweep, and a short chunk on the final iteration.
+    for (iteration, declared_iterations, consumed) in [(0u64, 3u64, 2u64), (2, 3, 1)] {
+        let journal = recur_journal(
+            iteration,
+            declared_iterations,
+            consumed,
+            RecurControlKind::Continue,
+        );
         verify_step_record_inputs(
             &cfs_cursor,
-            &recur_iteration_step(0),
+            &recur_iteration_step(iteration as u32),
             None,
             None,
-            Some(&witness),
+            Some(&journal),
         );
     }
 }
@@ -298,7 +330,7 @@ fn verify_step_record_inputs_accepts_declared_chunk_sizes() {
 #[test]
 fn verify_step_record_inputs_ignores_chunking_when_not_declared() {
     let cfs_cursor = chunked_recur_cfs(None);
-    // Without a declared chunk no witness is required for iteration steps.
+    // Without a declared chunk an iteration step carries no chunk obligation.
     verify_step_record_inputs(&cfs_cursor, &recur_iteration_step(0), None, None, None);
 }
 
@@ -306,13 +338,13 @@ fn verify_step_record_inputs_ignores_chunking_when_not_declared() {
 #[should_panic(expected = "exceeds declared chunk size")]
 fn verify_step_record_inputs_rejects_oversized_chunk() {
     let cfs_cursor = chunked_recur_cfs(Some(2));
-    let witness = recur_iteration_input_bytes(3);
+    let journal = recur_journal(0, 3, 3, RecurControlKind::Continue);
     verify_step_record_inputs(
         &cfs_cursor,
         &recur_iteration_step(0),
         None,
         None,
-        Some(&witness),
+        Some(&journal),
     );
 }
 
@@ -320,19 +352,40 @@ fn verify_step_record_inputs_rejects_oversized_chunk() {
 #[should_panic(expected = "empty chunk")]
 fn verify_step_record_inputs_rejects_empty_chunk() {
     let cfs_cursor = chunked_recur_cfs(Some(2));
-    let witness = recur_iteration_input_bytes(0);
+    let journal = recur_journal(0, 3, 0, RecurControlKind::Continue);
     verify_step_record_inputs(
         &cfs_cursor,
         &recur_iteration_step(0),
         None,
         None,
-        Some(&witness),
+        Some(&journal),
+    );
+}
+
+/// Only the final chunk may be short — the `4,1,4,1` shape, rejected on the
+/// iteration that actually goes short.
+///
+/// The native recorder used to enforce this by remembering the previous
+/// iteration's length. `declared_iterations` makes it a stateless fact of the
+/// iteration itself, so the guest can check it without carrying state across
+/// steps.
+#[test]
+#[should_panic(expected = "smaller than declared chunk size")]
+fn verify_step_record_inputs_rejects_short_non_final_chunk() {
+    let cfs_cursor = chunked_recur_cfs(Some(2));
+    let journal = recur_journal(0, 3, 1, RecurControlKind::Continue);
+    verify_step_record_inputs(
+        &cfs_cursor,
+        &recur_iteration_step(0),
+        None,
+        None,
+        Some(&journal),
     );
 }
 
 #[test]
-#[should_panic(expected = "missing its input witness")]
-fn verify_step_record_inputs_requires_witness_for_declared_chunk() {
+#[should_panic(expected = "missing its replay-proven recur facts")]
+fn verify_step_record_inputs_requires_recur_facts_for_declared_chunk() {
     let cfs_cursor = chunked_recur_cfs(Some(2));
     verify_step_record_inputs(&cfs_cursor, &recur_iteration_step(0), None, None, None);
 }
@@ -357,6 +410,7 @@ fn verify_tile_commitments_reject_mismatched_input() {
                 index_root_after: Vec::new(),
             },
         }),
+        recur_progress_commitment: RecurProgressStack::new().commitment(),
     };
 
     verify_io_witness(&step, Some(&b"actual".to_vec()), Some(&b"out".to_vec()));
@@ -372,6 +426,7 @@ fn verify_sequence_boundary_commitments_accept_matching_recorded_io() {
             input_commitment: sha(b"sequence-in"),
             input_source_commitment: Vec::new(),
         },
+        recur_progress_commitment: RecurProgressStack::new().commitment(),
     };
     let end = StepRecord {
         exec_index: 2,
@@ -380,6 +435,7 @@ fn verify_sequence_boundary_commitments_accept_matching_recorded_io() {
         kind: StepKind::SequenceEnd {
             output_commitment: sha(b"sequence-out"),
         },
+        recur_progress_commitment: RecurProgressStack::new().commitment(),
     };
 
     verify_io_witness(&start, Some(&b"sequence-in".to_vec()), None);
@@ -444,10 +500,7 @@ fn build_storage_log_witness_for_entries(
     }
 }
 
-fn build_read_witness(
-    entries: &[StorageEntry],
-    entry: &StorageEntry,
-) -> StorageReadWitness {
+fn build_read_witness(entries: &[StorageEntry], entry: &StorageEntry) -> StorageReadWitness {
     let (_frontier, _root, index, _index_root) = build_storage_context(entries);
     let index_witness = coordinate_index_membership_proof(&index, &entry.coordinates)
         .expect("membership proof should exist");
@@ -468,8 +521,7 @@ fn build_write_witness(
         build_storage_context(before_entries);
     let mut after_entries = before_entries.to_vec();
     after_entries.push(new_entry.clone());
-    let (_frontier, _root, after_index, _after_index_root) =
-        build_storage_context(&after_entries);
+    let (_frontier, _root, after_index, _after_index_root) = build_storage_context(&after_entries);
     StorageWriteWitness {
         entry: new_entry.clone(),
         index_non_membership_witness: coordinate_index_non_membership_proof(
@@ -511,6 +563,7 @@ fn tile_step_with_store_roots(
                 index_root_after,
             },
         }),
+        recur_progress_commitment: RecurProgressStack::new().commitment(),
     }
 }
 
@@ -605,9 +658,7 @@ fn verify_storage_transition_rejects_duplicate_coordinates() {
 }
 
 #[test]
-#[should_panic(
-    expected = "Missing storage read witness for coordinates CfsCoordinates([0])"
-)]
+#[should_panic(expected = "Missing storage read witness for coordinates CfsCoordinates([0])")]
 fn verify_storage_transition_rejects_wrong_coordinates_with_correct_bytes() {
     let prior_entry = StorageEntry {
         coordinates: CfsCoordinates(vec![9]),
@@ -652,9 +703,7 @@ fn verify_storage_transition_rejects_wrong_coordinates_with_correct_bytes() {
 }
 
 #[test]
-#[should_panic(
-    expected = "Execution-step storage root before does not match current storage root"
-)]
+#[should_panic(expected = "Execution-step storage root before does not match current storage root")]
 fn verify_storage_transition_rejects_stale_root() {
     let new_entry = StorageEntry {
         coordinates: CfsCoordinates(vec![0]),
@@ -782,6 +831,18 @@ fn verify_storage_transition_accepts_non_empty_initial_state() {
     assert_eq!(next_index_root, index_root_after);
 }
 
+/// The witness form of an append field: the right edge of the list's Merkle
+/// tree, built from the element roots the guest would derive from `ops`.
+fn append_frontier_of(items: &[&str]) -> AppendFrontier {
+    let roots: Vec<[u8; 32]> = items
+        .iter()
+        .map(|item| {
+            draft_value_root(&raster_core::draft::DraftValue::String((*item).into())).unwrap()
+        })
+        .collect();
+    AppendFrontier::from_leaf_roots(&roots)
+}
+
 #[test]
 fn verify_draft_transition_tracks_multi_step_chain() {
     let empty_witness = DraftStateWitness {
@@ -789,7 +850,7 @@ fn verify_draft_transition_tracks_multi_step_chain() {
         fields: Vec::new(),
     };
     let empty_root =
-        draft_root_from_witness(&empty_witness.schema, &BTreeMap::new(), false).unwrap();
+        draft_root_from_witness(&empty_witness.schema, &BTreeMap::new()).unwrap();
     let schema_hash = compute_schema_hash(&empty_witness.schema);
     let draft_id = [7; 32];
     let mut active_drafts = BTreeMap::new();
@@ -812,6 +873,7 @@ fn verify_draft_transition_tracks_multi_step_chain() {
                 },
             ],
         }),
+        recur: None,
     };
     verify_draft_transition(
         &draft_tile_step(1),
@@ -829,13 +891,11 @@ fn verify_draft_transition_tracks_multi_step_chain() {
         fields: vec![
             (
                 "title".into(),
-                DraftFieldValue::Set(raster_core::draft::DraftValue::String("collected".into())),
+                DraftWitnessField::Set(raster_core::draft::DraftValue::String("collected".into())),
             ),
             (
                 "items".into(),
-                DraftFieldValue::Append(vec![raster_core::draft::DraftValue::String(
-                    "first".into(),
-                )]),
+                DraftWitnessField::Append(append_frontier_of(&["first"])),
             ),
         ],
     };
@@ -851,6 +911,7 @@ fn verify_draft_transition_tracks_multi_step_chain() {
                 value: raster_core::draft::DraftValue::String("second".into()),
             }],
         }),
+        recur: None,
     };
     verify_draft_transition(
         &draft_tile_step(2),
@@ -872,7 +933,7 @@ fn verify_draft_transition_rejects_wrong_root_before() {
         schema: DemoDraft::schema(),
         fields: Vec::new(),
     };
-    let empty_root = draft_root_from_witness(&witness.schema, &BTreeMap::new(), false).unwrap();
+    let empty_root = draft_root_from_witness(&witness.schema, &BTreeMap::new()).unwrap();
     let schema_hash = compute_schema_hash(&witness.schema);
     let draft_id = [9; 32];
     let mut active_drafts = BTreeMap::from([(
@@ -894,6 +955,7 @@ fn verify_draft_transition_rejects_wrong_root_before() {
                 root_before: empty_root,
                 ops: Vec::new(),
             }),
+            recur: None,
         }),
         Some(&DraftTransitionWitness {
             pre_state: witness,
@@ -910,7 +972,7 @@ fn verify_draft_transition_rejects_wrong_schema_hash() {
         schema: DemoDraft::schema(),
         fields: Vec::new(),
     };
-    let empty_root = draft_root_from_witness(&witness.schema, &BTreeMap::new(), false).unwrap();
+    let empty_root = draft_root_from_witness(&witness.schema, &BTreeMap::new()).unwrap();
     let mut active_drafts = BTreeMap::new();
 
     verify_draft_transition(
@@ -924,6 +986,7 @@ fn verify_draft_transition_rejects_wrong_schema_hash() {
                 root_before: empty_root,
                 ops: Vec::new(),
             }),
+            recur: None,
         }),
         Some(&DraftTransitionWitness {
             pre_state: witness,
@@ -937,7 +1000,7 @@ fn verify_draft_transition_rejects_wrong_schema_hash() {
 #[should_panic(expected = "witness root")]
 fn verify_draft_transition_rejects_tampered_pre_state_witness() {
     let empty_root =
-        draft_root_from_witness(&DemoDraft::schema(), &BTreeMap::new(), false).unwrap();
+        draft_root_from_witness(&DemoDraft::schema(), &BTreeMap::new()).unwrap();
     let mut active_drafts = BTreeMap::new();
 
     verify_draft_transition(
@@ -951,18 +1014,71 @@ fn verify_draft_transition_rejects_tampered_pre_state_witness() {
                 root_before: empty_root,
                 ops: Vec::new(),
             }),
+            recur: None,
         }),
         Some(&DraftTransitionWitness {
             pre_state: DraftStateWitness {
                 schema: DemoDraft::schema(),
                 fields: vec![(
                     "title".into(),
-                    DraftFieldValue::Set(raster_core::draft::DraftValue::String("tampered".into())),
+                    DraftWitnessField::Set(raster_core::draft::DraftValue::String(
+                        "tampered".into(),
+                    )),
                 )],
             },
             native_transition: None,
         }),
         &mut active_drafts,
+    );
+}
+
+/// The frontier twin of the tampered-witness test above.
+///
+/// A witness now proves the *shape* of the accumulated list rather than
+/// exhibiting it, so the thing a forger reaches for is a frontier claiming a
+/// different length. It must fail exactly where a wrong element value fails:
+/// the root is recomputed from `(len, edge)`, so a forged length yields a
+/// different root and never matches `root_before`.
+#[test]
+#[should_panic(expected = "witness root")]
+fn verify_draft_transition_rejects_a_frontier_claiming_the_wrong_length() {
+    let honest = DraftStateWitness {
+        schema: DemoDraft::schema(),
+        fields: vec![(
+            "items".into(),
+            DraftWitnessField::Append(append_frontier_of(&["first", "second"])),
+        )],
+    };
+    let root_before = draft_root_from_witness(
+        &honest.schema,
+        &raster_core::draft::witness_fields_map(&honest.fields),
+    )
+    .unwrap();
+
+    let mut forged = honest;
+    let DraftWitnessField::Append(frontier) = &mut forged.fields[0].1 else {
+        unreachable!("the fixture field is an append field");
+    };
+    frontier.len += 1;
+
+    verify_draft_transition(
+        &draft_tile_step(1),
+        Some(&TileReplayJournal {
+            input_commitment: [0u8; 32],
+            output_bytes: Vec::new(),
+            draft_transition: Some(DraftReplayTransition {
+                draft_id: [8; 32],
+                schema_hash: compute_schema_hash(&DemoDraft::schema()),
+                root_before,
+                ops: Vec::new(),
+            }),
+            recur: None,
+        }),
+        Some(&DraftTransitionWitness {
+            pre_state: forged,
+            native_transition: None,
+        }),
+        &mut BTreeMap::new(),
     );
 }
 
@@ -996,10 +1112,7 @@ fn no_entrypoint_cfs() -> CfsCursor {
     })
 }
 
-fn two_arg_authorization_journal(
-    commitment_a: &[u8],
-    commitment_b: &[u8],
-) -> AuthorizationJournal {
+fn two_arg_authorization_journal(commitment_a: &[u8], commitment_b: &[u8]) -> AuthorizationJournal {
     AuthorizationJournal {
         external_inputs_commitments: [
             ("personal_data".to_string(), commitment_a.to_vec()),
@@ -1020,7 +1133,10 @@ fn dummy_storage_roots() -> StorageRoots {
     }
 }
 
-fn program_start_step(entry_arguments: Vec<String>, output_commitment: Vec<u8>) -> ProgramStartStep {
+fn program_start_step(
+    entry_arguments: Vec<String>,
+    output_commitment: Vec<u8>,
+) -> ProgramStartStep {
     ProgramStartStep {
         entry_arguments,
         output_commitment,
@@ -1034,6 +1150,7 @@ fn program_start_record(program_start: ProgramStartStep) -> StepRecord {
         sequence_id: "main".to_string(),
         coordinates: CfsCoordinates(vec![]),
         kind: StepKind::ProgramStart(program_start),
+        recur_progress_commitment: RecurProgressStack::new().commitment(),
     }
 }
 
@@ -1043,10 +1160,7 @@ fn combined_root_matches_struct_hash_convention_over_declared_commitments() {
     let commitment_b = sha(b"seed-file");
     let journal = two_arg_authorization_journal(&commitment_a, &commitment_b);
 
-    let actual = combined_root(
-        &["personal_data".to_string(), "seed".to_string()],
-        &journal,
-    );
+    let actual = combined_root(&["personal_data".to_string(), "seed".to_string()], &journal);
 
     // The binding is an ordinary struct node over (name, commitment) pairs —
     // the same convention the selection tree uses, which is what lets a
@@ -1061,10 +1175,7 @@ fn combined_root_matches_struct_hash_convention_over_declared_commitments() {
 
     // Order matters: declaring the same two arguments in the opposite order
     // must produce a different root.
-    let swapped = combined_root(
-        &["seed".to_string(), "personal_data".to_string()],
-        &journal,
-    );
+    let swapped = combined_root(&["seed".to_string(), "personal_data".to_string()], &journal);
     assert_ne!(actual, swapped);
 }
 
@@ -1180,7 +1291,14 @@ fn genesis_authorization_rejects_unnecessary_witness_when_no_entry_arguments_dec
     let witness = build_read_witness(&[entry.clone()], &entry);
     let first_step = program_start_record(program_start_step(Vec::new(), Vec::new()));
 
-    verify_genesis_authorization(&cfs_cursor, &EMPTY_LEAF, &[], &journal, Some(&witness), &first_step);
+    verify_genesis_authorization(
+        &cfs_cursor,
+        &EMPTY_LEAF,
+        &[],
+        &journal,
+        Some(&witness),
+        &first_step,
+    );
 }
 
 #[test]
@@ -1221,8 +1339,7 @@ fn genesis_authorization_is_established_at_genesis_when_first_step_is_program_st
     // is the `ProgramStart` that binds and authorizes the entry arguments in
     // the same guest run, so authorization is established immediately.
     let names = vec!["personal_data".to_string(), "seed".to_string()];
-    let journal =
-        two_arg_authorization_journal(&sha(b"personal_data-file"), &sha(b"seed-file"));
+    let journal = two_arg_authorization_journal(&sha(b"personal_data-file"), &sha(b"seed-file"));
     let cfs_cursor = entrypoint_cfs(names.clone());
     let first_step = program_start_record(program_start_step(
         names.clone(),
@@ -1242,8 +1359,7 @@ fn genesis_authorization_rejects_a_late_window_missing_its_membership_witness() 
     // ProgramStart) must supply a membership witness; without one there is
     // nothing tying its storage to the manifest.
     let names = vec!["personal_data".to_string(), "seed".to_string()];
-    let journal =
-        two_arg_authorization_journal(&sha(b"personal_data-file"), &sha(b"seed-file"));
+    let journal = two_arg_authorization_journal(&sha(b"personal_data-file"), &sha(b"seed-file"));
     let cfs_cursor = entrypoint_cfs(names);
     let first_step = StepRecord {
         exec_index: 9,
@@ -1252,6 +1368,7 @@ fn genesis_authorization_rejects_a_late_window_missing_its_membership_witness() 
         kind: StepKind::SequenceEnd {
             output_commitment: Vec::new(),
         },
+        recur_progress_commitment: RecurProgressStack::new().commitment(),
     };
 
     verify_genesis_authorization(&cfs_cursor, &EMPTY_LEAF, &[], &journal, None, &first_step);
@@ -1274,8 +1391,7 @@ fn genesis_authorization_rejects_forged_entry_object_commitment() {
         coordinates: CfsCoordinates(vec![]),
         object_commitment: sha(b"forged-combined-root"),
     };
-    let (_frontier, root, _index, index_root) =
-        build_storage_context(&[forged_entry.clone()]);
+    let (_frontier, root, _index, index_root) = build_storage_context(&[forged_entry.clone()]);
     let witness = build_read_witness(&[forged_entry.clone()], &forged_entry);
 
     // A membership witness is supplied, so the witness path is taken and
@@ -1287,6 +1403,7 @@ fn genesis_authorization_rejects_forged_entry_object_commitment() {
         kind: StepKind::SequenceEnd {
             output_commitment: Vec::new(),
         },
+        recur_progress_commitment: RecurProgressStack::new().commitment(),
     };
 
     verify_genesis_authorization(
@@ -1306,10 +1423,10 @@ fn genesis_authorization_rejects_forged_entry_object_commitment() {
 mod fingerprint_slice {
     use super::*;
     use raster_core::fingerprint::{BitPacker, Fingerprint};
+    use raster_core::transition::InitTransition;
     use raster_core::transition::{
         FingerprintBlockWitness, FingerprintSliceWitness, TraceCommitmentHeader,
     };
-    use raster_core::transition::InitTransition;
 
     use crate::fraud_proof::assert_window_is_commitment_slice;
 

@@ -89,8 +89,8 @@ pub struct EntryArgumentsBinding {
 /// still returns a placeholder binding so the caller uniformly publishes a
 /// `ProgramStart` event.
 pub fn start_program(args: &[EntryArgumentSpec]) -> Result<EntryArgumentsBinding> {
-    let coordinates = THREAD_SEQUENCE_CONTEXT
-        .with(|context| context.borrow().sequence_root_coordinates())?;
+    let coordinates =
+        THREAD_SEQUENCE_CONTEXT.with(|context| context.borrow().sequence_root_coordinates())?;
 
     if args.is_empty() {
         return Ok(EntryArgumentsBinding {
@@ -116,7 +116,9 @@ pub fn start_program(args: &[EntryArgumentSpec]) -> Result<EntryArgumentsBinding
     for spec in args {
         let (encoding, commitment_hex) = resolver.manifest_commitment_metadata(spec.name)?;
         let kind = match encoding {
-            ExternalEncoding::Raster => ReferencedSourceKind::Raster,
+            ExternalEncoding::Raster => ReferencedSourceKind::Raster {
+                schema: spec.schema,
+            },
             ExternalEncoding::Postcard => ReferencedSourceKind::Postcard {
                 to_tree: spec.to_tree,
                 schema: spec.schema,

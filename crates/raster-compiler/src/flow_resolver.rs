@@ -23,6 +23,9 @@ pub struct FlowResolver {
     entry_arguments: HashSet<String>,
     /// `let name = select!(T, root...)` locals, mapping `name` to `root`.
     selection_aliases: HashMap<String, String>,
+    /// `let name = select!(T, rows[idx])` locals, mapping `name` to the names
+    /// supplying its data-sourced indexes, in selector order.
+    selection_index_sources: HashMap<String, Vec<String>>,
 }
 
 impl FlowResolver {
@@ -58,6 +61,12 @@ impl FlowResolver {
         self.selection_aliases = sequence
             .function
             .selection_aliases
+            .iter()
+            .cloned()
+            .collect();
+        self.selection_index_sources = sequence
+            .function
+            .selection_index_sources
             .iter()
             .cloned()
             .collect();
@@ -172,26 +181,60 @@ impl FlowResolver {
         let CallArgumentKind::Rooted { root } = kind else {
             return InputBinding::inline();
         };
-        let root = self.resolve_alias(root.trim());
+        let name = root.trim();
+        // Collected before aliasing collapses the chain: the citations belong to
+        // the selection locals along it, not to the root the chain lands on.
+        let indexes = self.resolve_index_bindings(name);
+        let root = self.resolve_alias(name);
 
         // A sequence parameter: supplied by the caller's scope.
         if let Some(&idx) = self.param_indices.get(root) {
-            return InputBinding::seq_input(idx);
+            return InputBinding::seq_input(idx).indexed_by(indexes);
         }
 
         // One of `main`'s entry arguments: reached from the authorized entry
         // object at coordinates `[]` bound by the `ProgramStart` step.
         if self.entry_arguments.contains(root) {
-            return InputBinding::entry_argument();
+            return InputBinding::entry_argument().indexed_by(indexes);
         }
 
         // A value produced by an earlier item of this sequence.
         if let Some(&item_index) = self.bindings.get(root) {
-            return InputBinding::prior_item_output(item_index);
+            return InputBinding::prior_item_output(item_index).indexed_by(indexes);
         }
 
         // A local with no upstream: materialized in the body.
-        InputBinding::inline()
+        InputBinding::inline().indexed_by(indexes)
+    }
+
+    /// Resolve the index suppliers cited along `name`'s selection-alias chain.
+    ///
+    /// Walks the same chain `resolve_alias` walks, accumulating each link's
+    /// data-sourced indexes, so a value reached through several selects carries
+    /// every citation those selects made. Each supplier name is resolved to an
+    /// ordinary `InputBinding` — the index is itself a value with provenance,
+    /// which is exactly what the schema should record about it.
+    ///
+    /// The iteration bound mirrors `resolve_alias`: shadowing makes
+    /// self-referential aliases ordinary, and following them unboundedly would
+    /// not terminate.
+    fn resolve_index_bindings(&self, name: &str) -> Vec<InputBinding> {
+        let mut indexes = Vec::new();
+        let mut current = name;
+        for _ in 0..=self.selection_aliases.len() {
+            if let Some(sources) = self.selection_index_sources.get(current) {
+                for source in sources {
+                    indexes.push(self.resolve_argument(&CallArgumentKind::Rooted {
+                        root: source.clone(),
+                    }));
+                }
+            }
+            match self.selection_aliases.get(current) {
+                Some(root) if root != current => current = root.as_str(),
+                _ => break,
+            }
+        }
+        indexes
     }
 }
 
@@ -215,6 +258,7 @@ mod tests {
                 name: "test".to_string(),
                 root_path: PathBuf::from("/test"),
                 functions: vec![],
+                structs: vec![],
             },
             root_dir: PathBuf::from("/test"),
             output_dir: PathBuf::from("/test/target/raster"),
@@ -240,6 +284,7 @@ mod tests {
             },
             signature: format!("fn {}()", name),
             selection_aliases: vec![],
+            selection_index_sources: vec![],
         }
     }
 
@@ -257,6 +302,16 @@ mod tests {
         call_infos: Vec<CallInfo>,
         selection_aliases: Vec<(String, String)>,
     ) -> FunctionAstItem {
+        make_sequence_function_with_indexes(name, input_names, call_infos, selection_aliases, vec![])
+    }
+
+    fn make_sequence_function_with_indexes(
+        name: &str,
+        input_names: Vec<&str>,
+        call_infos: Vec<CallInfo>,
+        selection_aliases: Vec<(String, String)>,
+        selection_index_sources: Vec<(String, Vec<String>)>,
+    ) -> FunctionAstItem {
         FunctionAstItem {
             name: name.to_string(),
             path: PathBuf::from("test.rs"),
@@ -270,6 +325,7 @@ mod tests {
             output: Some("String".to_string()),
             signature: format!("fn {}()", name),
             selection_aliases,
+            selection_index_sources,
         }
     }
 
@@ -669,5 +725,132 @@ mod tests {
             )),
             _ => panic!("Expected Tile item"),
         }
+    }
+
+    /// A `select!` whose index came from an authorized value must resolve to an
+    /// `Indexed` binding wrapping the value's own provenance, with the index
+    /// resolved to *its* provenance. This is what makes "reads the element named
+    /// by binding X" a different program from "reads element 7" — the schema is
+    /// hashed into program identity, and the guest pairs the declared index
+    /// count against the recorded one.
+    #[test]
+    fn dynamic_index_resolves_to_an_indexed_binding() {
+        let project = make_mock_project();
+        let echo_func = make_tile_function("echo", vec!["row"], true);
+        let echo_tile = Tile {
+            function: &echo_func,
+            tile_type: "iter".to_string(),
+            estimated_cycles: None,
+            max_memory: None,
+            description: None,
+        };
+        let tile_discovery = TileDiscovery {
+            project: &project,
+            tiles: vec![echo_tile],
+        };
+
+        // Models:
+        //   fn main(table) { let wanted = select!(u32, table.wanted);
+        //                    let row = select!(Row, table.rows[wanted]);
+        //                    call!(echo, row) }
+        let seq_func = make_sequence_function_with_indexes(
+            "main",
+            vec!["table"],
+            vec![CallInfo {
+                callee: "echo".to_string(),
+                result_binding: None,
+                arguments: vec!["row".to_string()],
+                argument_kinds: vec![CallArgumentKind::Rooted {
+                    root: "row".to_string(),
+                }],
+                call_kind: CallKind::Tile,
+                chunk: None,
+            }],
+            vec![
+                ("row".to_string(), "table".to_string()),
+                ("wanted".to_string(), "table".to_string()),
+            ],
+            vec![("row".to_string(), vec!["wanted".to_string()])],
+        );
+        let sequence = Sequence {
+            function: &seq_func,
+            steps: vec![SequenceStep::Tile(&tile_discovery.tiles[0])],
+            description: None,
+        };
+
+        let mut resolver = FlowResolver::new();
+        let items = resolver.resolve(&sequence);
+
+        let SequenceChildItem::Tile(tile_item) = &items[0] else {
+            panic!("Expected Tile item");
+        };
+        let InputBinding::Indexed { value, indexes } = &tile_item.sources[0] else {
+            panic!(
+                "expected an Indexed binding, got {:?}",
+                tile_item.sources[0]
+            );
+        };
+        // The row still comes from the caller's scope; only its *index* is new.
+        assert!(matches!(
+            value.as_ref(),
+            InputBinding::SequenceScope { input_index: 0 }
+        ));
+        // And the index is itself a value with provenance, recorded as such.
+        assert_eq!(indexes.len(), 1);
+        assert!(matches!(
+            &indexes[0],
+            InputBinding::SequenceScope { input_index: 0 }
+        ));
+    }
+
+    /// A literal-index selection must keep emitting exactly the binding it emits
+    /// today, so no existing program's identity shifts under this feature.
+    #[test]
+    fn literal_index_resolves_without_a_wrapper() {
+        let project = make_mock_project();
+        let echo_func = make_tile_function("echo", vec!["row"], true);
+        let echo_tile = Tile {
+            function: &echo_func,
+            tile_type: "iter".to_string(),
+            estimated_cycles: None,
+            max_memory: None,
+            description: None,
+        };
+        let tile_discovery = TileDiscovery {
+            project: &project,
+            tiles: vec![echo_tile],
+        };
+
+        let seq_func = make_sequence_function_with_aliases(
+            "main",
+            vec!["table"],
+            vec![CallInfo {
+                callee: "echo".to_string(),
+                result_binding: None,
+                arguments: vec!["row".to_string()],
+                argument_kinds: vec![CallArgumentKind::Rooted {
+                    root: "row".to_string(),
+                }],
+                call_kind: CallKind::Tile,
+                chunk: None,
+            }],
+            vec![("row".to_string(), "table".to_string())],
+        );
+        let sequence = Sequence {
+            function: &seq_func,
+            steps: vec![SequenceStep::Tile(&tile_discovery.tiles[0])],
+            description: None,
+        };
+
+        let mut resolver = FlowResolver::new();
+        let items = resolver.resolve(&sequence);
+
+        let SequenceChildItem::Tile(tile_item) = &items[0] else {
+            panic!("Expected Tile item");
+        };
+        assert!(matches!(
+            &tile_item.sources[0],
+            InputBinding::SequenceScope { input_index: 0 }
+        ));
     }
 }

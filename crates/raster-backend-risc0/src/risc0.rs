@@ -217,9 +217,9 @@ impl Backend for Risc0Backend {
             .as_ref()
             .map(|src| format!("{src}-{}", builder.recipe_fingerprint()));
 
-        if let Some(cached) =
-            self.artifact_store
-                .load(tile_id, &self.output_dir, cache_key.clone())
+        if let Some(cached) = self
+            .artifact_store
+            .load(tile_id, &self.output_dir, cache_key.clone())
         {
             return Ok(cached);
         }

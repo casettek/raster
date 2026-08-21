@@ -1,0 +1,9 @@
+error: custom attribute panicked
+  --> tests/ui/nested_call_in_call_arguments_rejected.rs:19:1
+   |
+19 | #[sequence]
+   | ^^^^^^^^^^^
+   |
+   = help: message: call! cannot appear inside call!'s arguments: it is a separate step, and a step nested in an argument is never given a control-flow-schema item, so its trace coordinate would resolve to nothing. Bind it first:
+               let value = call! ...;
+           then pass `value`.

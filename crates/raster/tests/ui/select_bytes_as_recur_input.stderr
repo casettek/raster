@@ -1,0 +1,21 @@
+error[E0277]: call_recur! input must be a `List<T>`
+  --> tests/ui/select_bytes_as_recur_input.rs:20:17
+   |
+19 |         tile = accumulate,
+   |                ---------- required by a bound introduced by this call
+20 |         input = weights,
+   |                 ^^^^^^^ not a page list
+   |
+   = note: to sweep a `Bytes` region, select its pages: `select!(List<BytesPage>, region.pages)`
+   = help: the trait `IntoAuthRef<raster::List<raster::BytesPage>>` is not implemented for `AuthRef<raster::Bytes<4>>`
+           but trait `IntoAuthRef<raster::Bytes<4>>` is implemented for it
+   = help: for that trait implementation, expected `raster::Bytes<4>`, found `raster::List<raster::BytesPage>`
+   = note: required for `AuthRef<raster::Bytes<4>>` to implement `RecurListSource<raster::BytesPage>`
+note: required by a bound in `__raster_recur_auth_accumulate`
+  --> tests/ui/select_bytes_as_recur_input.rs:9:1
+   |
+ 9 | #[tile(kind = recur, description = "accumulate a page")]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `__raster_recur_auth_accumulate`
+10 | fn accumulate(input: RecurInput<BytesPage>, state: RecurState<u64>) -> RecurState<u64> {
+   |    ---------- required by a bound in this function
+   = note: this error originates in the attribute macro `tile` (in Nightly builds, run with -Z macro-backtrace for more info)

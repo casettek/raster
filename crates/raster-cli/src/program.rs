@@ -51,6 +51,7 @@ impl From<TomlInterface> for InterfaceDecl {
         InterfaceDecl {
             type_path: t.type_path,
             encoding: t.encoding,
+            schema_hash: [0u8; 32],
         }
     }
 }
@@ -143,16 +144,16 @@ fn synthesize_manifest(project: &Project, cfs: &ControlFlowSchema) -> ProgramMan
                 InterfaceDecl {
                     type_path,
                     encoding: ExternalEncoding::Raster,
+                    schema_hash: [0u8; 32],
                 },
             )
         })
         .collect();
 
     let output = produces_output.then(|| InterfaceDecl {
-        type_path: main_ast
-            .and_then(|f| f.output.clone())
-            .unwrap_or_default(),
+        type_path: main_ast.and_then(|f| f.output.clone()).unwrap_or_default(),
         encoding: ExternalEncoding::Raster,
+        schema_hash: [0u8; 32],
     });
 
     ProgramManifest {
@@ -164,7 +165,10 @@ fn synthesize_manifest(project: &Project, cfs: &ControlFlowSchema) -> ProgramMan
 }
 
 /// Compile every CFS tile to its image id (the program's tile registry).
-fn build_registry(cfs: &ControlFlowSchema, replayer: &Replayer) -> Result<BTreeMap<String, ImageId>> {
+fn build_registry(
+    cfs: &ControlFlowSchema,
+    replayer: &Replayer,
+) -> Result<BTreeMap<String, ImageId>> {
     let mut tiles = BTreeMap::new();
     for tile in &cfs.tiles {
         let image_id = replayer.tile_image_id(&tile.id)?;
@@ -180,7 +184,8 @@ pub fn assemble_program(
     cfs: &ControlFlowSchema,
     replayer: &Replayer,
 ) -> Result<ProgramDefinition> {
-    let manifest = load_or_synthesize_manifest(project, cfs)?;
+    let mut manifest = load_or_synthesize_manifest(project, cfs)?;
+    raster_compiler::schema_walk::fill_schema_hashes(&project.ast, &mut manifest)?;
     let tiles = build_registry(cfs, replayer)?;
     ProgramDefinition::assemble(manifest, cfs.clone(), tiles)
 }
@@ -399,6 +404,7 @@ encoding = "raster"
                 InterfaceDecl {
                     type_path: "u64".to_string(),
                     encoding: ExternalEncoding::Raster,
+                    schema_hash: [0u8; 32],
                 },
             )]
             .into_iter()
@@ -406,6 +412,7 @@ encoding = "raster"
             output: Some(InterfaceDecl {
                 type_path: "String".to_string(),
                 encoding: ExternalEncoding::Raster,
+                schema_hash: [0u8; 32],
             }),
         };
         let program = program_from(&cfs, manifest);
@@ -460,6 +467,9 @@ encoding = "raster"
     #[test]
     fn read_lock_reports_missing_file() {
         let err = read_lock(Path::new("/nonexistent/Raster.lock")).unwrap_err();
-        assert!(err.to_string().contains("run `cargo raster build`"), "got: {err}");
+        assert!(
+            err.to_string().contains("run `cargo raster build`"),
+            "got: {err}"
+        );
     }
 }

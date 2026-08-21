@@ -44,7 +44,7 @@ Two consequences:
 
 Two deliverables that share one normative rule set:
 
-1. **A strict authoring skill** (`.claude/skills/raster-authoring/`) that guides an AI
+1. **A strict authoring skill** (`.claude/skills/raster/`) that guides an AI
    agent step-by-step through writing a verifiable Raster program — tiles, sequences,
    recur-tiles/recur-sequences over blocks of data, program boundary, chaining — with
    every rule stated as a MUST/MUST NOT and paired with the check that verifies it.
@@ -90,6 +90,15 @@ detected by commit/audit divergence, **[none]** = currently unenforced — skill
 - **RAS-203** Tile inputs/outputs MUST be postcard-serializable serde types. The ABI
   is: 0 args → `postcard(())`, 1 arg → `postcard(arg)`, N args → `postcard(tuple)`;
   output is `postcard(return value)`. [type errors in generated wrapper]
+- **RAS-203a** A tile input/output type's postcard round-trip MUST be the identity. No field
+  affecting program output may be `#[serde(skip)]` (it is reconstructed as
+  `Default::default()` on decode), and a custom `Deserialize` MUST NOT normalize, clamp or
+  canonicalize. This is already relied on: a fraud proof replays a tile from its encoded input
+  and compares output bytes, which is meaningless if decode is lossy. It became visible because
+  authenticated execution round-trips every inter-tile value through postcard and
+  unauthenticated execution does not, so a lossy type makes the two modes disagree. Note that
+  RAS-206 already bans the classic offenders (`HashMap`/`HashSet` ordering, unverified floats);
+  this closes the narrow residual. See `docs/proposals/unauthenticated-execution.md` §9. [none]
 - **RAS-204** Attribute syntax is key/value only: `#[tile(kind = iter)]` (default) or
   `#[tile(kind = recur)]`. Positional `#[tile(recur)]` is silently ignored — never
   write it. Optional: `description`, `estimated_cycles`, `max_memory`. Unknown keys
@@ -205,12 +214,12 @@ detected by commit/audit divergence, **[none]** = currently unenforced — skill
   (`--commit` + fraud-proof window, then `--audit`) → `cargo raster program --verify`
   → for chains, `cargo raster chain run` + `chain audit --execution`.
 
-## 2. Deliverable 1: the `raster-authoring` skill
+## 2. Deliverable 1: the `raster` skill
 
 ### Location and shape
 
 ```text
-.claude/skills/raster-authoring/
+.claude/skills/raster/
   SKILL.md              # rules-first guide, the RAS index, the workflow ladder
   references/
     tiles.md            # RAS-2xx expanded: ABI, determinism list, no_std checklist
@@ -255,7 +264,7 @@ the skill should be a compiling doctest or mirror a UI test.
 
 ```markdown
 ---
-name: raster-authoring
+name: raster
 description: Write/modify verifiable Raster programs (tiles, sequences, recur
   over data blocks). MUST be used for any change under a Raster project's src/
   or Raster.toml. Enforces RISC0-replayability rules; pairs every rule with the
@@ -333,6 +342,7 @@ Checks, keyed by the rules above:
 | binding meant as dataflow silently resolved to `External` | RAS-305 | `FlowResolver` output introspection — the "silent CFS degradation" detector |
 | control-flow construct in sequence body | RAS-306 | AST |
 | forbidden idiom in tile body: `std::` paths, `HashMap`/`HashSet`, float types/ops, `SystemTime`, `thread`, `env`, `rand` | RAS-206 | AST + import scan of the tile's module graph (heuristic, deny-listed idioms; not a purity proof) |
+| `#[serde(skip)]` on a field of a tile input/output type | RAS-203a | AST scan of derive attributes on types reachable from a tile signature. Catches the one lossy-round-trip case that needs no exotic code; a hand-written normalizing `Deserialize` stays undetectable |
 | whole-collection tile parameter over threshold without recur (`Vec<T>` parameter fed from an unsliced source) | RAS-208 | binding + type heuristic, warn-level |
 | `main` returning an inline expression | RAS-501 | AST of `main`'s return position |
 | entry argument without a manifest entry (when `input_manifest.json` present) | RAS-102 | manifest cross-check |
@@ -379,7 +389,7 @@ Exit non-zero on any deny-level finding → CI-ready.
 ## 5. Files likely to change
 
 - `docs/proposals/authoring-skill-and-tooling.md` — this document
-- `.claude/skills/raster-authoring/**` — new skill (Phase 1)
+- `.claude/skills/raster/**` — new skill (Phase 1)
 - `docs/tile-authoring.md` — align with RAS rule IDs (Phase 1)
 - `crates/raster-macros/src/lib.rs`, `crates/raster-macros/src/recur.rs` — spanned
   errors + new validations (Phase 2)

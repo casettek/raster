@@ -11,7 +11,7 @@ use raster_core::cfs::CfsCoordinates;
 use raster_core::coordinate_index::{
     verify_coordinate_index_membership, verify_coordinate_index_non_membership,
 };
-use raster_core::input::verify_selection_witness;
+use raster_core::input::{verify_bytes_page_geometry, verify_selection_witness};
 use raster_core::trace::{FnInput, StepRecord, StorageRoots};
 use raster_core::transition::{
     SerializableFrontier, StorageEntry, StorageLogWitness, StorageReadWitness, StorageWitness,
@@ -26,10 +26,7 @@ pub fn storage_leaf_hash(entry: &StorageEntry) -> Vec<u8> {
     sha256_bytes(&entry.to_bytes())
 }
 
-fn append_log_root_from_witness(
-    entry: &StorageEntry,
-    witness: &StorageLogWitness,
-) -> Vec<u8> {
+fn append_log_root_from_witness(entry: &StorageEntry, witness: &StorageLogWitness) -> Vec<u8> {
     let mut current = storage_leaf_hash(entry);
     for (level, sibling) in witness.path_elems.iter().enumerate() {
         current = if ((witness.position >> level) & 1) == 0 {
@@ -204,7 +201,28 @@ pub fn verify_storage_transition(
                         "Storage input '{}' selection witness is invalid",
                         binding_name,
                     );
+                    assert!(
+                        verify_bytes_page_geometry(witness),
+                        "Storage input '{}' bytes-page geometry is invalid",
+                        binding_name,
+                    );
                 }
+            }
+
+            // Every binding above is now proved *individually*: its coordinates
+            // commit to its commitment in the store, and its selection witness
+            // folds its payload up to that commitment. What none of that
+            // establishes is where a data-sourced index came from — the element
+            // proof only pins the index the segment claims. Discharge that here,
+            // once, over the whole map, because the obligation is relational:
+            // it is about one binding citing another.
+            //
+            // Placed after the loop deliberately. Running it per-entry would let
+            // a `BoundIndex` cite a binding that had not yet been verified.
+            if let Err(violation) =
+                raster_core::trace::verify_bound_index_bindings(input_source_witness.storage())
+            {
+                panic!("Bound-index binding is invalid: {:?}", violation);
             }
         }
 

@@ -1,0 +1,19 @@
+error[E0277]: the trait bound `AuthRef<i32>: IndexSource` is not satisfied
+  --> tests/ui/select_signed_index_rejected.rs:16:42
+   |
+16 |     let _bad = select!(String, doc.lines[offset]);
+   |                                          ^^^^^^ the trait `IndexSource` is not implemented for `AuthRef<i32>`
+   |
+   = help: the following other types implement trait `IndexSource`:
+             AuthRef<u16>
+             AuthRef<u32>
+             AuthRef<u64>
+             AuthRef<u8>
+note: required by a bound in `push_bound_index`
+  --> src/input.rs
+   |
+   | pub fn push_bound_index<I>(sink: &mut Vec<IndexBinding>, index: &I) -> SelectorSegment
+   |        ---------------- required by a bound in this function
+   | where
+   |     I: IndexSource,
+   |        ^^^^^^^^^^^ required by this bound in `push_bound_index`

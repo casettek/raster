@@ -1,13 +1,14 @@
 use raster_core::cfs::CfsCoordinates;
 use raster_core::coordinate_index::IncrementalCoordinateIndex;
 use raster_core::draft::{
-    draft_root_from_witness, draft_tree_from_witness, draft_value_from_serialize,
-    schema_hash as compute_schema_hash, DraftFieldValue, DraftOp, DraftReplayTransition,
-    DraftStateWitness, DraftTransitionWitness,
+    draft_root_from_field_roots, draft_tree_from_fields, draft_value_from_serialize,
+    draft_value_root, schema_hash as compute_schema_hash, DraftFieldValue, DraftOp,
+    DraftReplayTransition, DraftStateWitness, DraftTransitionWitness, DraftValue,
+    DraftWitnessField,
 };
 use raster_core::input::{
-    ExternalEncoding, Schema, SchemaFieldMode, SchemaNode, SelectionWitness, SelectorPath,
-    StorageRef, StorageValue,
+    AppendFrontier, AuthenticatedListMetadata, ExternalEncoding, Schema, SchemaFieldMode,
+    SchemaNode, SelectionPayloadKind, SelectionWitness, SelectorPath, StorageRef, StorageValue,
 };
 use raster_core::trace::RasterPayload;
 use raster_core::transition::{SerializableFrontier, StorageEntry, StorageIndexValue};
@@ -28,9 +29,9 @@ use crate::backing::{
     ObjectBacking, OwnedObject, ReferencedObject, ReferencedSource, ReferencedSourceKind,
 };
 use crate::input::{
-    encode_raster_value, selected_payload_from_raster_location,
-    selection_witness_from_raster_selection, tree_value_from_raster_location,
-    typed_value_from_tree, TreeValue,
+    encode_raster_value, list_metadata_payload, list_metadata_witness,
+    selected_payload_from_raster_location, selection_witness_from_raster_selection,
+    tree_value_from_raster_location, typed_value_from_tree, TreeValue,
 };
 use crate::raster_index::RasterIndex;
 use crate::source::SourceResolver;
@@ -38,12 +39,77 @@ use crate::Sha256Commitment;
 
 type Anchor = [u8; 32];
 
+/// One draft field as the runtime holds it: the real value, plus the digest
+/// state needed to move the draft root forward without re-reading the value.
+///
+/// Keeping both is what makes a push O(log N) here as well as in the guest. The
+/// values are still the truth — `finalize` materializes the whole object from
+/// them — but they are no longer walked on every op. See
+/// `docs/proposals/incremental-draft-witness.md`.
+#[derive(Debug, Clone)]
+enum DraftFieldRuntime {
+    Set {
+        value: DraftValue,
+        root: [u8; 32],
+    },
+    Append {
+        values: Vec<DraftValue>,
+        frontier: AppendFrontier,
+    },
+}
+
+impl DraftFieldRuntime {
+    fn root(&self) -> Result<[u8; 32]> {
+        match self {
+            Self::Set { root, .. } => Ok(*root),
+            Self::Append { frontier, .. } => frontier
+                .root()
+                .ok_or_else(|| Error::Other("Draft append frontier is malformed".into())),
+        }
+    }
+
+    /// The runtime's own representation, rebuilt for the finalize path.
+    fn field_value(&self) -> DraftFieldValue {
+        match self {
+            Self::Set { value, .. } => DraftFieldValue::Set(value.clone()),
+            Self::Append { values, .. } => DraftFieldValue::Append(values.clone()),
+        }
+    }
+
+    /// What crosses into the trace: a frontier, never the accumulated log.
+    fn witness_field(&self) -> DraftWitnessField {
+        match self {
+            Self::Set { value, .. } => DraftWitnessField::Set(value.clone()),
+            Self::Append { frontier, .. } => DraftWitnessField::Append(frontier.clone()),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct DraftRuntimeState {
     schema: SchemaNode,
     current_root: [u8; 32],
-    fields: BTreeMap<String, DraftFieldValue>,
+    fields: BTreeMap<String, DraftFieldRuntime>,
     ops: Vec<DraftOp>,
+}
+
+impl DraftRuntimeState {
+    /// Recompose the draft root from the per-field roots the fields already
+    /// hold — O(#fields), with no element ever touched.
+    fn recompose_root(&self) -> Result<[u8; 32]> {
+        let mut roots = BTreeMap::new();
+        for (name, field) in &self.fields {
+            roots.insert(name.clone(), field.root()?);
+        }
+        draft_root_from_field_roots(&self.schema, &roots)
+    }
+
+    fn field_values(&self) -> BTreeMap<String, DraftFieldValue> {
+        self.fields
+            .iter()
+            .map(|(name, field)| (name.clone(), field.field_value()))
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -196,8 +262,12 @@ fn runtime_tree_value(value: &raster_core::draft::DraftValue) -> TreeValue {
                 .map(|(name, child)| (name.clone(), runtime_tree_value(child)))
                 .collect(),
         ),
+        // Draft list fields are `List<T>` append targets (never `Block`), so they
+        // finalize to `(root, len)` handles — matching how a `List` field encodes
+        // through `encode_raster_value`. The list Merkle root is unchanged, so the
+        // finalized root still equals the incrementally-tracked draft root.
         raster_core::draft::DraftValue::List(values) => {
-            TreeValue::List(values.iter().map(runtime_tree_value).collect())
+            TreeValue::ListHandle(values.iter().map(runtime_tree_value).collect())
         }
         raster_core::draft::DraftValue::Map(entries) => TreeValue::Map(
             entries
@@ -220,6 +290,17 @@ fn runtime_tree_value(value: &raster_core::draft::DraftValue) -> TreeValue {
                 .map(|(name, child)| (name.clone(), runtime_tree_value(child)))
                 .collect(),
         ),
+        raster_core::draft::DraftValue::BytesPage {
+            index,
+            offset,
+            len,
+            bytes,
+        } => TreeValue::BytesPage {
+            index: *index,
+            offset: *offset,
+            len: *len,
+            bytes: bytes.clone(),
+        },
     }
 }
 
@@ -228,16 +309,8 @@ fn build_draft_tree(
     fields: &BTreeMap<String, DraftFieldValue>,
     require_complete: bool,
 ) -> Result<TreeValue> {
-    let tree = draft_tree_from_witness(schema, fields, require_complete)?;
+    let tree = draft_tree_from_fields(schema, fields, require_complete)?;
     Ok(runtime_tree_value(&tree))
-}
-
-fn draft_root(
-    schema: &SchemaNode,
-    fields: &BTreeMap<String, DraftFieldValue>,
-    require_complete: bool,
-) -> Result<[u8; 32]> {
-    draft_root_from_witness(schema, fields, require_complete)
 }
 
 fn locate_schema_field<'a>(
@@ -252,7 +325,7 @@ fn locate_schema_field<'a>(
 
 fn first_unset_set_once_field<'a>(
     schema: &'a SchemaNode,
-    fields: &BTreeMap<String, DraftFieldValue>,
+    fields: &BTreeMap<String, DraftFieldRuntime>,
 ) -> Result<Option<&'a str>> {
     for field in schema_struct_fields(schema)? {
         if field.mode == SchemaFieldMode::SetOnce && !fields.contains_key(&field.name) {
@@ -260,6 +333,20 @@ fn first_unset_set_once_field<'a>(
         }
     }
     Ok(None)
+}
+
+/// Stand-in root for a draft in an unauthenticated run.
+///
+/// The root is a commitment, and an unauthenticated run computes none — but
+/// `Draft<S>` still threads a `[u8; 32]` from op to op, and the trace-facing
+/// mismatch checks compare against it. Rather than make the field optional
+/// through every signature, the mode uses one fixed value and skips the
+/// comparisons. See `docs/proposals/unauthenticated-execution.md` §7.
+const UNAUTHENTICATED_DRAFT_ROOT: [u8; 32] = [0u8; 32];
+
+/// Whether draft operations should compute and check commitments.
+fn drafts_are_authenticated() -> bool {
+    crate::auth::auth_mode().is_authenticated()
 }
 
 fn take_draft_state(
@@ -272,7 +359,7 @@ fn take_draft_state(
         let state = drafts
             .remove(anchor)
             .ok_or_else(|| Error::Other("Unknown draft anchor".into()))?;
-        if state.current_root != *expected_root {
+        if drafts_are_authenticated() && state.current_root != *expected_root {
             return Err(Error::Other(format!(
                 "Draft root mismatch during {}: expected {:?}, found {:?}",
                 operation, expected_root, state.current_root
@@ -282,13 +369,18 @@ fn take_draft_state(
     })
 }
 
+/// The pre-state a tile step carries into the trace.
+///
+/// This used to clone `state.fields` wholesale — every element pushed so far,
+/// on every step, which is what made a draft cost O(N) trace bytes per step and
+/// O(N²) overall. It is now O(#fields · log N).
 fn draft_state_witness(state: &DraftRuntimeState) -> DraftStateWitness {
     DraftStateWitness {
         schema: state.schema.clone(),
         fields: state
             .fields
             .iter()
-            .map(|(name, value)| (name.clone(), value.clone()))
+            .map(|(name, field)| (name.clone(), field.witness_field()))
             .collect(),
     }
 }
@@ -494,10 +586,21 @@ impl StorageManager {
         Ok(stored)
     }
 
+    /// Rebuild the witness for a recorded selection.
+    ///
+    /// `payload_kind` is not a preference — it is what the recorded commitment
+    /// says the witness bytes must be, and the two forms are indistinguishable
+    /// from `(coordinates, commitment, selector)` alone: a metadata selection
+    /// and a whole-list selection share a path, a source root and a set of
+    /// proof steps. The commit pipeline replays a trace it did not produce
+    /// (`raster-cli`'s recorder runs in its own process), so it has to be told
+    /// which view to regenerate rather than inferring one. See
+    /// [`SelectionPayloadKind`].
     pub fn selection_witness(
         &self,
         reference: &StorageRef,
         selector: &SelectorPath,
+        payload_kind: SelectionPayloadKind,
     ) -> Result<SelectionWitness> {
         let stored = self.verify_reference(reference)?;
         match &stored.backing {
@@ -505,7 +608,15 @@ impl StorageManager {
                 let raster = Self::require_raster(owned, &reference.coordinates)?;
                 let index = RasterIndex::from_bytes(&raster.index_bytes)?;
                 let selection = index.select(selector)?;
-                selection_witness_from_raster_selection(&raster.bytes, selector, selection)
+                match payload_kind {
+                    SelectionPayloadKind::Raw => {
+                        selection_witness_from_raster_selection(&raster.bytes, selector, selection)
+                    }
+                    SelectionPayloadKind::List => {
+                        let (len, elements_root) = index.list_metadata(selector)?;
+                        Ok(list_metadata_witness(selector, selection, len, elements_root))
+                    }
+                }
             }
             ObjectBacking::Referenced(referenced) => {
                 let resolver = self.source_resolver.as_deref().ok_or_else(|| {
@@ -513,7 +624,44 @@ impl StorageManager {
                         "Storage has a referenced object but no source resolver configured".into(),
                     )
                 })?;
-                referenced.selection_witness(selector, resolver)
+                referenced.selection_witness(selector, payload_kind, resolver)
+            }
+        }
+    }
+
+    /// A recur source's authenticated `(len, elements_root)`, as a selection
+    /// whose payload is 41 bytes (9 when empty) instead of the whole list.
+    ///
+    /// This is the read that replaces resolving a recur source
+    /// (`docs/proposals/lazy-list-recur.md` §1–§2): it touches the index only,
+    /// never an element and never the data file.
+    pub fn list_metadata_selection(
+        &self,
+        reference: &StorageRef,
+        selector: &SelectorPath,
+    ) -> Result<AuthenticatedListMetadata> {
+        let stored = self.verify_reference(reference)?;
+        match &stored.backing {
+            ObjectBacking::Owned(owned) => {
+                let raster = Self::require_raster(owned, &reference.coordinates)?;
+                let index = RasterIndex::from_bytes(&raster.index_bytes)?;
+                let (len, elements_root) = index.list_metadata(selector)?;
+                // Every selection into an owned object anchors to the object's
+                // own root, which is what `locate` returns as `root_hash`.
+                Ok(list_metadata_payload(
+                    selector,
+                    index.root_commitment,
+                    len,
+                    elements_root,
+                ))
+            }
+            ObjectBacking::Referenced(referenced) => {
+                let resolver = self.source_resolver.as_deref().ok_or_else(|| {
+                    Error::Other(
+                        "Storage has a referenced object but no source resolver configured".into(),
+                    )
+                })?;
+                referenced.list_metadata_selection(selector, resolver)
             }
         }
     }
@@ -742,6 +890,7 @@ std::thread_local! {
     static THREAD_ACTIVE_EXECUTION_COORDINATES: RefCell<Vec<CfsCoordinates>> = RefCell::new(Vec::new());
     static THREAD_PENDING_OUTPUT_COORDINATES: RefCell<Option<CfsCoordinates>> = const { RefCell::new(None) };
     static THREAD_PENDING_OUTPUT_ENCODING: RefCell<Option<PendingOutputEncoding>> = const { RefCell::new(None) };
+    static THREAD_PENDING_RECUR_ITEM: RefCell<Option<PendingRecurItemBinding>> = const { RefCell::new(None) };
     static THREAD_DRAFT_STORAGE: RefCell<BTreeMap<Anchor, DraftRuntimeState>> =
         RefCell::new(BTreeMap::new());
 }
@@ -818,7 +967,14 @@ where
     let coordinates = THREAD_SEQUENCE_CONTEXT
         .with(|context| context.borrow_mut().reserve_synthetic_coordinates())?;
     let anchor = anchor_for_schema(&coordinates, S::schema_hash());
-    let current_root = draft_root(&schema, &BTreeMap::new(), false)?;
+    // The anchor is kept in both modes — it is the draft's identity in the
+    // thread-local map, and reserving a coordinate is O(1). Only the root is
+    // skipped.
+    let current_root = if drafts_are_authenticated() {
+        draft_root_from_field_roots(&schema, &BTreeMap::new())?
+    } else {
+        UNAUTHENTICATED_DRAFT_ROOT
+    };
     THREAD_DRAFT_STORAGE.with(|drafts| {
         drafts.borrow_mut().insert(
             anchor,
@@ -909,12 +1065,15 @@ where
         let state = drafts
             .get_mut(anchor)
             .ok_or_else(|| Error::Other("Unknown draft anchor".into()))?;
-        if state.current_root != *expected_root {
+        let authenticated = drafts_are_authenticated();
+        if authenticated && state.current_root != *expected_root {
             return Err(Error::Other(format!(
                 "Draft root mismatch for field '{}': expected {:?}, found {:?}",
                 field, expected_root, state.current_root
             )));
         }
+        // Schema and set-once checks run in both modes: they are the draft's
+        // semantics, not its authentication.
         let schema_field = locate_schema_field(&state.schema, field)?;
         if schema_field.mode != SchemaFieldMode::SetOnce {
             return Err(Error::Other(format!(
@@ -928,14 +1087,29 @@ where
                 field
             )));
         }
-        state
-            .fields
-            .insert(field.to_string(), DraftFieldValue::Set(tree));
+        if !authenticated {
+            // The field value is what `finalize` materializes from, so it is
+            // kept. The per-value root, the op log (replay only) and the root
+            // recomposition are all commitment work with no reader here.
+            state.fields.insert(
+                field.to_string(),
+                DraftFieldRuntime::Set {
+                    value: tree,
+                    root: UNAUTHENTICATED_DRAFT_ROOT,
+                },
+            );
+            return Ok(UNAUTHENTICATED_DRAFT_ROOT);
+        }
+        let root = draft_value_root(&tree)?;
+        state.fields.insert(
+            field.to_string(),
+            DraftFieldRuntime::Set { value: tree, root },
+        );
         state.ops.push(DraftOp::Set {
             field: field.to_string(),
             value: draft_value_from_serialize(value)?,
         });
-        state.current_root = draft_root(&state.schema, &state.fields, false)?;
+        state.current_root = state.recompose_root()?;
         Ok(state.current_root)
     })
 }
@@ -956,7 +1130,8 @@ where
         let state = drafts
             .get_mut(anchor)
             .ok_or_else(|| Error::Other("Unknown draft anchor".into()))?;
-        if state.current_root != *expected_root {
+        let authenticated = drafts_are_authenticated();
+        if authenticated && state.current_root != *expected_root {
             return Err(Error::Other(format!(
                 "Draft root mismatch for field '{}': expected {:?}, found {:?}",
                 field, expected_root, state.current_root
@@ -969,13 +1144,36 @@ where
                 field
             )));
         }
+        // Hash the new element once, then move the frontier — O(log N). This
+        // used to re-Merkleize the entire accumulated list on every push, which
+        // dominated the host cost of a large draft. Unauthenticated runs skip
+        // the leaf hash and leave the frontier empty: nothing reads it, since
+        // `root()` is only reached through root recomposition and the witness,
+        // both of which are off.
+        let leaf = if authenticated {
+            draft_value_root(&tree)?
+        } else {
+            UNAUTHENTICATED_DRAFT_ROOT
+        };
         match state.fields.entry(field.to_string()) {
             std::collections::btree_map::Entry::Vacant(entry) => {
-                entry.insert(DraftFieldValue::Append(vec![tree]));
+                let mut frontier = AppendFrontier::empty();
+                if authenticated {
+                    frontier.push(leaf);
+                }
+                entry.insert(DraftFieldRuntime::Append {
+                    values: vec![tree],
+                    frontier,
+                });
             }
             std::collections::btree_map::Entry::Occupied(mut entry) => match entry.get_mut() {
-                DraftFieldValue::Append(values) => values.push(tree),
-                DraftFieldValue::Set(_) => {
+                DraftFieldRuntime::Append { values, frontier } => {
+                    values.push(tree);
+                    if authenticated {
+                        frontier.push(leaf);
+                    }
+                }
+                DraftFieldRuntime::Set { .. } => {
                     return Err(Error::Other(format!(
                         "Draft field '{}' is not appendable",
                         field
@@ -983,11 +1181,14 @@ where
                 }
             },
         }
+        if !authenticated {
+            return Ok(UNAUTHENTICATED_DRAFT_ROOT);
+        }
         state.ops.push(DraftOp::Push {
             field: field.to_string(),
             value: draft_value_from_serialize(value)?,
         });
-        state.current_root = draft_root(&state.schema, &state.fields, false)?;
+        state.current_root = state.recompose_root()?;
         Ok(state.current_root)
     })
 }
@@ -1032,6 +1233,52 @@ pub struct PendingOutputEncoding {
     pub type_name: &'static str,
     pub bytes: Vec<u8>,
     pub raster: RasterPayload,
+}
+
+/// What authorized the item a recur iteration is about to run on, stashed by
+/// the driver for the tile wrapper that immediately follows.
+///
+/// Materializing an authorized item has **two** outputs — the value the tile
+/// sees and the binding that proves where it came from — and the tile ABI can
+/// only carry the first. `RecurInput<T> { value, index, len }` is what crosses
+/// into the replay guest, and widening it would move every recur tile's
+/// `input_commitment` to carry data the replay guest cannot use. So the second
+/// output travels host-side, through the same hand-off shape
+/// [`stash_pending_output_encoding`] already uses for a tile's output
+/// encoding: set by the producer, taken by the one consumer that runs next.
+///
+/// Dropping it instead — which is what `build_recur_input` did — does not
+/// merely lose provenance. For a source reached through a bound index it makes
+/// a legitimate program *un-auditable*: the item's path still carries the
+/// `BoundIndex` segment, and `verify_bound_index_bindings` rejects a selection
+/// whose cited source never reaches the step. See
+/// `docs/proposals/lazy-list-recur.md` §4.
+pub struct PendingRecurItemBinding {
+    pub storage: raster_core::trace::StorageData,
+    /// Citations inherited from the source binding's path, keyed by the name
+    /// the `BoundIndex` segment cites.
+    pub index_bindings: Vec<(String, raster_core::trace::StorageData)>,
+}
+
+pub fn stash_recur_item_binding(
+    storage: raster_core::trace::StorageData,
+    index_bindings: Vec<(String, raster_core::trace::StorageData)>,
+) {
+    THREAD_PENDING_RECUR_ITEM.with(|pending| {
+        *pending.borrow_mut() = Some(PendingRecurItemBinding {
+            storage,
+            index_bindings,
+        });
+    });
+}
+
+/// Take the stashed item binding, if the caller is a recur iteration.
+///
+/// Returns `None` for every ordinary tile, which is what keeps this from
+/// leaking across sites: a non-recur tile never asks, and a recur tile always
+/// finds exactly what its own driver just put there.
+pub fn take_recur_item_binding() -> Option<PendingRecurItemBinding> {
+    THREAD_PENDING_RECUR_ITEM.with(|pending| pending.borrow_mut().take())
 }
 
 pub fn stash_pending_output_encoding(
@@ -1134,53 +1381,78 @@ pub fn publish_pending_output_coordinates(coordinates: CfsCoordinates) {
     });
 }
 
-pub fn finalize_draft<S>(anchor: &Anchor, expected_root: &[u8; 32]) -> Result<StorageRef>
+/// Materialize a draft into its value, consuming the draft state.
+///
+/// The half both modes share. Set-once completeness and the empty-recur default
+/// rules live here, so an unauthenticated finalize enforces them identically
+/// rather than reimplementing them — the two modes can only disagree about
+/// commitments, never about whether a draft was validly built.
+///
+/// `require_complete` is `false` for the empty-recur path, where an untouched
+/// output must still materialize if the schema allows it.
+pub fn finalize_draft_value<S>(
+    anchor: &Anchor,
+    expected_root: &[u8; 32],
+    require_complete: bool,
+) -> Result<S>
 where
     S: Schema + DeserializeOwned + Serialize,
 {
-    let state = take_draft_state(anchor, expected_root, "finalize")?;
-    let tree = build_draft_tree(&state.schema, &state.fields, true)?;
-    let value = typed_value_from_tree::<S>(&tree).map_err(|error| {
+    let operation = if require_complete {
+        "finalize"
+    } else {
+        "empty finalize"
+    };
+    let state = take_draft_state(anchor, expected_root, operation)?;
+    // Materializing the whole object here is correct and stays: it is O(N)
+    // once, which was never the problem.
+    let tree = build_draft_tree(&state.schema, &state.field_values(), require_complete)?;
+    typed_value_from_tree::<S>(&tree).map_err(|error| {
+        if !require_complete {
+            if let Ok(Some(field)) = first_unset_set_once_field(&state.schema, &state.fields) {
+                return Error::Other(format!(
+                    "Empty recur input cannot finalize draft '{}': field '{}' was never written and the schema cannot materialize a default value",
+                    core::any::type_name::<S>(),
+                    field
+                ));
+            }
+            return Error::Serialization(format!(
+                "Failed to materialize finalized empty draft value: {}",
+                error
+            ));
+        }
         Error::Serialization(format!(
             "Failed to materialize finalized draft value: {}",
             error
         ))
-    })?;
+    })
+}
 
-    let reference = if let Some(coordinates) = current_recur_site_coordinates() {
-        store_value_at_coordinates(&value, coordinates)?
+fn store_finalized_draft<S>(value: &S) -> Result<StorageRef>
+where
+    S: Serialize,
+{
+    if let Some(coordinates) = current_recur_site_coordinates() {
+        store_value_at_coordinates(value, coordinates)
     } else {
-        store_value(&value)?
-    };
-    Ok(reference)
+        store_value(value)
+    }
+}
+
+pub fn finalize_draft<S>(anchor: &Anchor, expected_root: &[u8; 32]) -> Result<StorageRef>
+where
+    S: Schema + DeserializeOwned + Serialize,
+{
+    let value = finalize_draft_value::<S>(anchor, expected_root, true)?;
+    store_finalized_draft(&value)
 }
 
 pub fn finalize_empty_draft<S>(anchor: &Anchor, expected_root: &[u8; 32]) -> Result<StorageRef>
 where
     S: Schema + DeserializeOwned + Serialize,
 {
-    let state = take_draft_state(anchor, expected_root, "empty finalize")?;
-    let tree = build_draft_tree(&state.schema, &state.fields, false)?;
-    let value = typed_value_from_tree::<S>(&tree).map_err(|error| {
-        if let Ok(Some(field)) = first_unset_set_once_field(&state.schema, &state.fields) {
-            return Error::Other(format!(
-                "Empty recur input cannot finalize draft '{}': field '{}' was never written and the schema cannot materialize a default value",
-                core::any::type_name::<S>(),
-                field
-            ));
-        }
-        Error::Serialization(format!(
-            "Failed to materialize finalized empty draft value: {}",
-            error
-        ))
-    })?;
-
-    let reference = if let Some(coordinates) = current_recur_site_coordinates() {
-        store_value_at_coordinates(&value, coordinates)?
-    } else {
-        store_value(&value)?
-    };
-    Ok(reference)
+    let value = finalize_draft_value::<S>(anchor, expected_root, false)?;
+    store_finalized_draft(&value)
 }
 
 pub fn resolve_storage_value<T: DeserializeOwned>(
@@ -1194,6 +1466,19 @@ pub fn select_stored_value<T: DeserializeOwned>(
     selector: &SelectorPath,
 ) -> Result<StorageValue<T>> {
     THREAD_STORAGE.with(|storage| storage.borrow().select(reference, selector))
+}
+
+/// The authenticated `(len, elements_root)` of the list at `selector`, as a
+/// 41-byte selection (9 when empty).
+///
+/// Unlike [`select_stored_value`] this deserializes nothing and reads no
+/// element — it is the whole reason a recur source no longer has to be
+/// materialized to be traced.
+pub fn stored_list_metadata(
+    reference: &StorageRef,
+    selector: &SelectorPath,
+) -> Result<AuthenticatedListMetadata> {
+    THREAD_STORAGE.with(|storage| storage.borrow().list_metadata_selection(reference, selector))
 }
 
 pub fn resolve_storage_ok_value<T: DeserializeOwned>(
@@ -1286,13 +1571,21 @@ mod tests {
                         name: "alpha".into(),
                         encoding: ExternalEncoding::Raster,
                         commitment: alpha_commitment.clone(),
-                        kind: ReferencedSourceKind::Raster,
+                        kind: ReferencedSourceKind::Raster {
+                            schema: || SchemaNode::Leaf {
+                                type_name: String::new(),
+                            },
+                        },
                     },
                     AuthorizedSource {
                         name: "beta".into(),
                         encoding: ExternalEncoding::Raster,
                         commitment: beta_commitment.clone(),
-                        kind: ReferencedSourceKind::Raster,
+                        kind: ReferencedSourceKind::Raster {
+                            schema: || SchemaNode::Leaf {
+                                type_name: String::new(),
+                            },
+                        },
                     },
                 ],
             },

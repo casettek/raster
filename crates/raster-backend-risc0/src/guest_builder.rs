@@ -290,7 +290,11 @@ impl GuestBuilder {
 
         for entry in rust_toolchains {
             let cargo = entry.path().join("bin").join("cargo");
-            println!("Using RISC0 cargo: {}", cargo.display());
+            // Toolchain plumbing: one line per tile per command drowns the
+            // result the command was run for. `RASTER_VERBOSE=1` brings it back.
+            if std::env::var_os("RASTER_VERBOSE").is_some_and(|v| !v.is_empty() && v != "0") {
+                println!("Using RISC0 cargo: {}", cargo.display());
+            }
             if cargo.exists() {
                 return Some(cargo);
             }

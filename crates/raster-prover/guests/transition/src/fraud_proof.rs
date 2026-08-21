@@ -20,6 +20,7 @@ use raster_core::cfs::{CfsCoordinates, CfsCursor};
 use raster_core::draft::{DraftId, TrackedDraftState};
 use raster_core::fingerprint::{Fingerprint, FingerprintAccumulator};
 use raster_core::program::{commitment_of_bytes, ImageId, ProgramDefinition};
+use raster_core::recur_progress::RecurProgressStack;
 use raster_core::trace::{ExecStep, ExecTarget, StepKind, StepRecord};
 use raster_core::transition::{
     EntrypointAuthorization, FingerprintSliceWitness, InitTransition, OutputAuthorization,
@@ -82,9 +83,11 @@ fn expected_tile_image_id<'a>(
         StepKind::Exec(ExecStep {
             target: ExecTarget::Tile(name),
             ..
-        }) => Some(program.tile_image_id(name).unwrap_or_else(|| {
-            panic!("tile '{name}' has no image id in the program registry")
-        })),
+        }) => Some(
+            program
+                .tile_image_id(name)
+                .unwrap_or_else(|| panic!("tile '{name}' has no image id in the program registry")),
+        ),
         _ => None,
     }
 }
@@ -161,7 +164,8 @@ impl FraudProofWindowContext {
                     &init_transition,
                     entrypoint_authorization,
                     output_authorization,
-                );
+                )
+                .seed_recur_progress(input.window_start_recur_progress.as_ref());
                 (
                     Self {
                         init_state: init_transition,
@@ -345,6 +349,9 @@ pub struct LiveTransition {
     /// storage. Advances `Pending` -> `Established` when the `ProgramEnd` step
     /// is verified in this window.
     output_authorization: OutputAuthorization,
+    /// Live recur sites. Seeded at a fresh `Init` from host-supplied state and
+    /// validated by *advancing* it, never by believing it.
+    recur_progress: RecurProgressStack,
 }
 
 impl LiveTransition {
@@ -356,9 +363,8 @@ impl LiveTransition {
     ) -> Self {
         let frontier = deserialize_frontier(&init_transition.init_frontier)
             .expect("Invalid frontier in input");
-        let storage_frontier =
-            deserialize_frontier(&init_transition.init_storage_frontier)
-                .expect("Invalid storage frontier in input");
+        let storage_frontier = deserialize_frontier(&init_transition.init_storage_frontier)
+            .expect("Invalid storage frontier in input");
         assert_eq!(
             frontier_root(&storage_frontier),
             init_transition.init_storage_root,
@@ -374,6 +380,12 @@ impl LiveTransition {
             next_expected_coordinates: None,
             entrypoint_authorization,
             output_authorization,
+            // `InitTransition` carries no recur progress by design; a window
+            // opening mid-loop supplies its seed separately, and that seed is
+            // only ever accepted by reproducing the first step's own recorded
+            // commitment. Absent means "no loop in flight" — itself a claim the
+            // same check rejects if false.
+            recur_progress: RecurProgressStack::new(),
         }
     }
 
@@ -402,7 +414,17 @@ impl LiveTransition {
             next_expected_coordinates: Some(transition.next_expected_coordinates.clone()),
             entrypoint_authorization,
             output_authorization,
+            recur_progress: transition.recur_progress.clone(),
         }
+    }
+
+    /// Seed a fresh window's recur progress. Not trust: the very next
+    /// `advance_recur_progress` must reproduce the step's recorded commitment.
+    fn seed_recur_progress(mut self, seed: Option<&RecurProgressStack>) -> Self {
+        if let Some(seed) = seed {
+            self.recur_progress = seed.clone();
+        }
+        self
     }
 
     /// What this chain has established so far — read by `main` to commit the
@@ -437,7 +459,15 @@ impl LiveTransition {
             &input.step_record,
             input.input_source_witness.as_ref(),
             input.sequence_scope_witness.as_ref(),
-            input.input_witness.as_ref(),
+            input.replay_journal.as_ref(),
+        );
+        checks::cfs::advance_recur_progress(
+            cfs_cursor,
+            &mut self.recur_progress,
+            &input.step_record,
+            input.replay_journal.as_ref(),
+            input.input_source_witness.as_ref(),
+            &input.storage_selection_witnesses,
         );
         if let StepKind::ProgramStart(program_start) = &input.step_record.kind {
             self.entrypoint_authorization = checks::entrypoint::verify_step(
@@ -488,11 +518,13 @@ impl LiveTransition {
             &input.step_record,
             self.next_expected_coordinates.as_ref(),
         );
-        self.next_expected_coordinates = Some(if matches!(input.step_record.kind, StepKind::ProgramEnd(_)) {
-            Vec::new()
-        } else {
-            next_coordinates
-        });
+        self.next_expected_coordinates = Some(
+            if matches!(input.step_record.kind, StepKind::ProgramEnd(_)) {
+                Vec::new()
+            } else {
+                next_coordinates
+            },
+        );
         checks::drafts::verify_draft_transition(
             &input.step_record,
             input.replay_journal.as_ref(),
@@ -561,6 +593,7 @@ impl LiveTransition {
             next_expected_coordinates: self
                 .next_expected_coordinates
                 .expect("Step must produce next expected coordinates"),
+            recur_progress: self.recur_progress,
         }
     }
 }
@@ -582,7 +615,10 @@ pub fn commit_journal(
         current_state,
         transition_image_id,
         authorization_image_id: input.authorization_image_id.clone(),
-        input_manifest_commitment: input.authorization_journal.input_manifest_commitment.clone(),
+        input_manifest_commitment: input
+            .authorization_journal
+            .input_manifest_commitment
+            .clone(),
         program_commitment,
         refuted_trace_commitment,
         entrypoint_authorization,
