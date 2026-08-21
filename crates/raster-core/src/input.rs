@@ -440,6 +440,115 @@ fn list_root_from_hashes(hashes: &[Hash32], len: u64) -> Hash32 {
     list_root_from_elements_root(len, Some(&level[0]))
 }
 
+/// The right edge of an append-only list's Merkle tree — enough to recompute
+/// [`list_root_from_hashes`] for `len` elements without holding one.
+///
+/// Appending changes only that edge, so the left siblings along it (O(log N)
+/// digests) are all a verifier needs to recompute the root and to advance it.
+/// This is what a draft's witness carries instead of the whole append log; see
+/// `docs/proposals/incremental-draft-witness.md`.
+///
+/// It lives here, beside the list-root functions, because it must agree with
+/// them **bit for bit** — including the duplicate-last padding rule, which is
+/// not the usual zero-padding and is the reason a general-purpose frontier
+/// implementation cannot be substituted. Same reason `draft.rs` reuses
+/// [`struct_commitments_root`] rather than restating it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct AppendFrontier {
+    pub len: u64,
+    /// Root of the last element. `None` iff `len == 0`.
+    pub leaf: Option<Hash32>,
+    /// Left siblings on the path from `leaf` upward, ascending by level.
+    /// Exactly `(len - 1).count_ones()` of them — the levels at which the last
+    /// element sits in a *right* child, which are the only levels where the
+    /// climb needs something it does not already hold.
+    pub ommers: Vec<Hash32>,
+}
+
+impl AppendFrontier {
+    /// The frontier of an empty list.
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    /// Whether the ommer count matches what `len` implies. Checked before any
+    /// root is computed: a frontier with a spare or missing ommer is a producer
+    /// bug, and hashing it anyway would silently answer for a list shape the
+    /// witness never described.
+    pub fn is_well_formed(&self) -> bool {
+        match self.leaf {
+            None => self.len == 0 && self.ommers.is_empty(),
+            Some(_) => self.len > 0 && self.ommers.len() as u32 == (self.len - 1).count_ones(),
+        }
+    }
+
+    /// Recompute the list root. `None` when the frontier is malformed.
+    ///
+    /// Climbs from the last element at `idx = len - 1`, taking a left sibling
+    /// when `idx` is odd and pairing the node with *itself* when it is even —
+    /// because an even index at that level is the last node, which is exactly
+    /// what [`list_root_from_hashes`] duplicates.
+    pub fn root(&self) -> Option<Hash32> {
+        if !self.is_well_formed() {
+            return None;
+        }
+        let Some(leaf) = self.leaf else {
+            return Some(list_root_from_elements_root(0, None));
+        };
+
+        let mut node = leaf;
+        let mut idx = self.len - 1;
+        let mut width = self.len;
+        let mut ommers = self.ommers.iter();
+        while width > 1 {
+            node = if idx % 2 == 1 {
+                selection_hash(&[b"list-node", ommers.next()?.as_slice(), node.as_slice()])
+            } else {
+                selection_hash(&[b"list-node", node.as_slice(), node.as_slice()])
+            };
+            idx /= 2;
+            width = width / 2 + width % 2;
+        }
+        if ommers.next().is_some() {
+            return None;
+        }
+
+        Some(list_root_from_elements_root(self.len, Some(&node)))
+    }
+
+    /// Append one element root, in O(log N).
+    ///
+    /// The old last element stops being the edge, so it folds upward through
+    /// the ommers at every level where it was a right child — the trailing ones
+    /// of its index — and the accumulated subtree becomes the new lowest ommer.
+    pub fn push(&mut self, leaf: Hash32) {
+        let Some(prior_leaf) = self.leaf.replace(leaf) else {
+            self.len = 1;
+            return;
+        };
+
+        let consumed = (self.len - 1).trailing_ones() as usize;
+        let mut carry = prior_leaf;
+        for ommer in self.ommers.iter().take(consumed) {
+            carry = selection_hash(&[b"list-node", ommer.as_slice(), carry.as_slice()]);
+        }
+        self.ommers.drain(..consumed);
+        self.ommers.insert(0, carry);
+        self.len += 1;
+    }
+
+    /// Build a frontier from every element root — O(N), so only for callers
+    /// that already hold the whole list (tests, and a host bootstrapping an
+    /// existing draft).
+    pub fn from_leaf_roots(roots: &[Hash32]) -> Self {
+        let mut frontier = Self::empty();
+        for root in roots {
+            frontier.push(*root);
+        }
+        frontier
+    }
+}
+
 /// Encode the `0x0A` authenticated list metadata payload.
 ///
 /// ```text
@@ -2087,5 +2196,117 @@ mod tests {
         let (mut commitment, witness) = metadata_witness(5);
         commitment.payload_kind = SelectionPayloadKind::Raw;
         assert!(!verify_selection_witness(&commitment, &witness));
+    }
+
+    fn frontier_test_leaves(count: usize) -> Vec<Hash32> {
+        (0..count as u64)
+            .map(|index| selection_hash(&[b"frontier-test-leaf", &index.to_le_bytes()]))
+            .collect()
+    }
+
+    /// The gate for `incremental-draft-witness`: a frontier must reproduce
+    /// `list_root_from_hashes` exactly, duplicate-last padding included. If this
+    /// fails, every committed draft root moves — stop.
+    #[test]
+    fn append_frontier_root_matches_list_root_from_hashes() {
+        let leaves = frontier_test_leaves(1024);
+        let mut frontier = AppendFrontier::empty();
+
+        // Grown one push at a time, so every intermediate length is checked
+        // against a whole-list recomputation of the same prefix.
+        assert_eq!(
+            frontier.root(),
+            Some(list_root_from_hashes(&[], 0)),
+            "empty frontier must produce the empty-list root"
+        );
+        for len in 1..=leaves.len() {
+            frontier.push(leaves[len - 1]);
+            assert_eq!(
+                frontier.root(),
+                Some(list_root_from_hashes(&leaves[..len], len as u64)),
+                "frontier root diverged at len {}",
+                len
+            );
+        }
+    }
+
+    /// N = 3..6 are the padding transitions worked in the proposal's §3:
+    /// `H(c,c)` becomes `H(c,d)` while `H(a,b)` is untouched, and at N = 5 the
+    /// duplication moves a level up. Explicit because they are the cases a
+    /// zero-padding frontier would get wrong.
+    #[test]
+    fn append_frontier_root_survives_the_padding_transitions() {
+        let leaves = frontier_test_leaves(6);
+        for len in [3usize, 4, 5, 6] {
+            let frontier = AppendFrontier::from_leaf_roots(&leaves[..len]);
+            assert_eq!(
+                frontier.root(),
+                Some(list_root_from_hashes(&leaves[..len], len as u64)),
+                "frontier root diverged at the N={} padding transition",
+                len
+            );
+        }
+    }
+
+    #[test]
+    fn append_frontier_stays_well_formed() {
+        let leaves = frontier_test_leaves(300);
+        let mut frontier = AppendFrontier::empty();
+        for (index, leaf) in leaves.iter().enumerate() {
+            frontier.push(*leaf);
+            assert_eq!(frontier.len, index as u64 + 1);
+            assert_eq!(
+                frontier.ommers.len() as u32,
+                (frontier.len - 1).count_ones(),
+                "ommer count must track the set bits of the last index at len {}",
+                frontier.len
+            );
+            assert!(frontier.is_well_formed());
+        }
+    }
+
+    /// A malformed frontier yields no root at all rather than a root for some
+    /// other list shape.
+    #[test]
+    fn append_frontier_rejects_a_mismatched_ommer_count() {
+        let frontier = AppendFrontier::from_leaf_roots(&frontier_test_leaves(7));
+        assert!(frontier.root().is_some());
+
+        let mut extra = frontier.clone();
+        extra.ommers.push([0u8; 32]);
+        assert_eq!(extra.root(), None);
+
+        let mut missing = frontier.clone();
+        missing.ommers.pop();
+        assert_eq!(missing.root(), None);
+
+        let mut relabelled = frontier;
+        relabelled.len += 1;
+        assert_eq!(relabelled.root(), None);
+
+        let headless = AppendFrontier {
+            len: 4,
+            leaf: None,
+            ommers: Vec::new(),
+        };
+        assert_eq!(headless.root(), None);
+    }
+
+    /// The size claim the proposal rests on: O(log N) digests where the append
+    /// log would be O(N) elements.
+    #[test]
+    fn append_frontier_is_logarithmic() {
+        let frontier = AppendFrontier::from_leaf_roots(&frontier_test_leaves(4096));
+        assert!(
+            frontier.ommers.len() <= 12,
+            "expected at most 12 ommers at N=4096, found {}",
+            frontier.ommers.len()
+        );
+        let encoded = crate::postcard::to_allocvec(&frontier).unwrap();
+        assert!(
+            encoded.len() < 500,
+            "expected a frontier under 500 bytes at N=4096, found {}",
+            encoded.len()
+        );
     }
 }

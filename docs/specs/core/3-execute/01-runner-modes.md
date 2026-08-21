@@ -147,6 +147,49 @@ Native mode means “execute without a zkVM” and without proof generation.
 
 - Whole-program native runs launched by `cargo raster run` capture trace events through `RASTER_TRACE_PATH`. The default `--trace-format binary` stores length-prefixed `postcard` frames; `--trace-format json` stores readable newline-delimited JSON. Direct plain Rust runs stay quiet by default.
 
+#### Authentication posture (orthogonal to the four modes)
+
+Native execution has a second, independent knob: whether values passed **between tiles** are
+authenticated. `AuthMode::Authenticated` (the default everywhere except a bare program run)
+encodes, hashes and stores each tile output and resolves it back for the consuming tile.
+`AuthMode::Unauthenticated` passes the value directly, and:
+
+- **emits no trace**, regardless of `RASTER_TRACE_PATH`. Since `--commit` operates host-side on
+  the trace file, an unauthenticated run leaves no artifact for it to work on. This is what makes
+  "cannot produce a trace commitment" structural rather than a check.
+- skips the integrity check on external inputs (the manifest is still read for its `encoding`);
+- refuses profiling, because a profile of it measures a program without the storage costs;
+- supports the whole authoring surface, drafts and recur included: a draft keeps its field
+  values and drops its commitments, and a recur source that came from storage stays lazy.
+
+The mode resolves once per process, and is then fixed:
+
+1. `RASTER_AUTH` (`1`/`on` or `0`/`off`), if set — always wins. `cargo raster run` sets it
+   explicitly on every run, and `--no-auth` selects `0`. `cargo raster chain run` sets it the
+   same way for every stage it launches; its own `--no-auth` runs the whole chain
+   unauthenticated, which means no per-stage `commit.bin` and no chain-commitment. Stages still
+   link through their `output.bin`, whose bytes and structural root do not depend on the mode.
+2. otherwise `Unauthenticated`, if `raster::init()` ran.
+3. otherwise `Authenticated`.
+
+Rule 2 is what distinguishes "a Raster program was launched" from "something is driving the
+runtime directly": `init()` is called only from the `fn main` the `#[sequence]` macro generates.
+A test binary or library embedder reaches the runtime through `init_with` — which installs a
+trace publisher, and a trace implies authentication — or not at all. **This is why `cargo test`
+is authenticated with no test opting in**, which matters because Raster's tests exist to check
+that authentication is correct.
+
+**Caveat**: `raster::init()` is public. Calling it outside a `#[sequence] main` opts that binary
+into unauthenticated execution. Set `RASTER_AUTH=1` to override.
+
+Resolution is cached rather than re-read: a mode that could answer differently twice within one
+run would let a sequence store half its bindings and pass the rest directly.
+
+**This is a posture, not a fifth mode.** It cannot combine with audit, zkVM-preview or window
+replay — those require exactly the bindings it removes — so it composes only with native.
+Unauthenticated results are not authoritative. Full rationale:
+`docs/proposals/unauthenticated-execution.md`.
+
 #### Errors and diagnostics
 
 - **If proof generation is requested on the native backend**, execution **fails** with an error message indicating proofs are not supported.

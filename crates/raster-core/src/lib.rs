@@ -13,6 +13,7 @@ extern crate alloc;
 #[cfg(feature = "std")]
 extern crate std;
 
+pub mod auth;
 pub mod cfs;
 pub mod chunking;
 pub mod collections;

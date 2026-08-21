@@ -15,7 +15,8 @@ use sha2::{Digest, Sha256};
 
 use crate::collections::{bytes_page_parts, BYTES_PAGE_NEWTYPE_NAME};
 use crate::input::{
-    bytes_page_root, encode_bytes_page_payload, Schema, SchemaField, SchemaFieldMode, SchemaNode,
+    bytes_page_root, encode_bytes_page_payload, AppendFrontier, Schema, SchemaField,
+    SchemaFieldMode, SchemaNode,
 };
 use crate::{Error, Result};
 
@@ -137,10 +138,30 @@ pub enum DraftValue {
     },
 }
 
+/// The **runtime's** own representation of a draft field: the real object, held
+/// in memory so `finalize` can materialize it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum DraftFieldValue {
     Set(DraftValue),
     Append(Vec<DraftValue>),
+}
+
+/// What crosses into the trace and the guest.
+///
+/// An append field is witnessed by the right edge of its Merkle tree, not by
+/// the elements: the guest's whole obligation is to supply a preimage of
+/// `root_before` that `ops` can be applied to, and for an append-only list that
+/// preimage is O(log N) digests rather than the list. It never inspects element
+/// values, so it never needed them. See
+/// `docs/proposals/incremental-draft-witness.md`.
+///
+/// Deliberately a different type from [`DraftFieldValue`]: sharing one enum
+/// would leave the witness able to express a full append log, which is the
+/// thing being removed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum DraftWitnessField {
+    Set(DraftValue),
+    Append(AppendFrontier),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -152,7 +173,7 @@ pub enum DraftOp {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct DraftStateWitness {
     pub schema: SchemaNode,
-    pub fields: Vec<(String, DraftFieldValue)>,
+    pub fields: Vec<(String, DraftWitnessField)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -769,7 +790,12 @@ fn locate_schema_field<'a>(schema: &'a SchemaNode, name: &str) -> Result<&'a Sch
         .ok_or_else(|| Error::Other(format!("Unknown draft field '{}'", name)))
 }
 
-pub fn draft_tree_from_witness(
+/// Materialize the whole draft object from the runtime's own field values.
+///
+/// The finalize path, and only the finalize path — O(N) **once**, which was
+/// never the problem. Witnesses go through [`draft_root_from_witness`], which
+/// never materializes anything.
+pub fn draft_tree_from_fields(
     schema: &SchemaNode,
     fields: &BTreeMap<String, DraftFieldValue>,
     require_complete: bool,
@@ -809,18 +835,93 @@ pub fn draft_tree_from_witness(
 }
 
 pub fn witness_fields_map(
-    fields: &[(String, DraftFieldValue)],
-) -> BTreeMap<String, DraftFieldValue> {
+    fields: &[(String, DraftWitnessField)],
+) -> BTreeMap<String, DraftWitnessField> {
     fields.iter().cloned().collect()
 }
 
+/// The root a field contributes when the draft has never written it: `Unit` for
+/// a set-once field, the empty list for an append field.
+///
+/// Spelled through the same functions the written cases use, so an unwritten
+/// field cannot drift away from a written-then-emptied one.
+fn absent_field_root(mode: SchemaFieldMode) -> Result<DraftRoot> {
+    match mode {
+        SchemaFieldMode::SetOnce => draft_value_root(&DraftValue::Unit),
+        SchemaFieldMode::AppendOnlyVec => AppendFrontier::empty()
+            .root()
+            .ok_or_else(|| Error::Other("Empty append frontier must have a root".into())),
+    }
+}
+
+/// Compose a draft's root from per-field roots, without materializing a field.
+///
+/// The struct step is [`crate::input::struct_commitments_root`], untouched —
+/// that shared spelling is what keeps a draft root indistinguishable from the
+/// selection-tree root of the same data.
+pub fn draft_root_from_field_roots(
+    schema: &SchemaNode,
+    roots: &BTreeMap<String, DraftRoot>,
+) -> Result<DraftRoot> {
+    let schema_fields = schema_struct_fields(schema)?;
+    let mut child_roots = Vec::with_capacity(schema_fields.len());
+    for field in schema_fields {
+        let root = match roots.get(&field.name) {
+            Some(root) => *root,
+            None => absent_field_root(field.mode)?,
+        };
+        child_roots.push((field.name.as_str(), root));
+    }
+    Ok(crate::input::struct_commitments_root(
+        child_roots
+            .iter()
+            .map(|(name, root)| (*name, root.as_slice())),
+    ))
+}
+
+/// The root of one witnessed field, plus the mode conformance check that used
+/// to live in [`draft_tree_from_fields`].
+fn witness_field_root(field: &SchemaField, value: &DraftWitnessField) -> Result<DraftRoot> {
+    match (field.mode, value) {
+        (SchemaFieldMode::SetOnce, DraftWitnessField::Set(value)) => draft_value_root(value),
+        (SchemaFieldMode::SetOnce, DraftWitnessField::Append(_)) => Err(Error::Other(format!(
+            "Draft field '{}' expected a set-once value, found append frontier",
+            field.name
+        ))),
+        (SchemaFieldMode::AppendOnlyVec, DraftWitnessField::Append(frontier)) => {
+            frontier.root().ok_or_else(|| {
+                Error::Other(format!(
+                    "Draft field '{}' carries a malformed append frontier",
+                    field.name
+                ))
+            })
+        }
+        (SchemaFieldMode::AppendOnlyVec, DraftWitnessField::Set(_)) => Err(Error::Other(format!(
+            "Draft field '{}' expected an append-only vector, found scalar value",
+            field.name
+        ))),
+    }
+}
+
+/// Recompute a draft root from a witness in O(#fields · log N).
+///
+/// There is no `require_complete` counterpart: completeness is a finalize
+/// concern, and every witness call site is mid-draft by construction.
 pub fn draft_root_from_witness(
     schema: &SchemaNode,
-    fields: &BTreeMap<String, DraftFieldValue>,
-    require_complete: bool,
+    fields: &BTreeMap<String, DraftWitnessField>,
 ) -> Result<DraftRoot> {
-    let tree = draft_tree_from_witness(schema, fields, require_complete)?;
-    draft_value_root(&tree)
+    let mut roots = BTreeMap::new();
+    for field in schema_struct_fields(schema)? {
+        let Some(value) = fields.get(&field.name) else {
+            continue;
+        };
+        roots.insert(field.name.clone(), witness_field_root(field, value)?);
+    }
+    // A field the schema does not declare contributes nothing to the root, and
+    // is ignored rather than rejected — exactly as the materializing path did.
+    // Rejecting it would be a new rule, and this change adds none.
+    draft_root_from_field_roots(schema, &roots)
 }
 
 pub fn apply_draft_ops(
@@ -844,7 +945,7 @@ pub fn apply_draft_ops(
                         field
                     )));
                 }
-                fields.insert(field.clone(), DraftFieldValue::Set(value.clone()));
+                fields.insert(field.clone(), DraftWitnessField::Set(value.clone()));
             }
             DraftOp::Push { field, value } => {
                 let schema_field = locate_schema_field(&witness.schema, field)?;
@@ -854,14 +955,20 @@ pub fn apply_draft_ops(
                         field
                     )));
                 }
+                // The element's leaf hash is the same one `list_root_from_hashes`
+                // consumes — taken from `ops`, which is per-step and already in
+                // the replay journal. Nothing new has to be recorded to append.
+                let leaf = draft_value_root(value)?;
                 match fields.entry(field.clone()) {
                     alloc::collections::btree_map::Entry::Vacant(entry) => {
-                        entry.insert(DraftFieldValue::Append(vec![value.clone()]));
+                        let mut frontier = AppendFrontier::empty();
+                        frontier.push(leaf);
+                        entry.insert(DraftWitnessField::Append(frontier));
                     }
                     alloc::collections::btree_map::Entry::Occupied(mut entry) => {
                         match entry.get_mut() {
-                            DraftFieldValue::Append(values) => values.push(value.clone()),
-                            DraftFieldValue::Set(_) => {
+                            DraftWitnessField::Append(frontier) => frontier.push(leaf),
+                            DraftWitnessField::Set(_) => {
                                 return Err(Error::Other(format!(
                                     "Draft field '{}' is not appendable",
                                     field
@@ -873,7 +980,7 @@ pub fn apply_draft_ops(
             }
         }
     }
-    let root = draft_root_from_witness(&witness.schema, &fields, false)?;
+    let root = draft_root_from_witness(&witness.schema, &fields)?;
     let fields = fields.into_iter().collect();
     Ok((
         DraftStateWitness {
@@ -886,7 +993,7 @@ pub fn apply_draft_ops(
 
 pub fn verify_witness_root(witness: &DraftStateWitness, expected_root: &DraftRoot) -> Result<()> {
     let fields = witness_fields_map(&witness.fields);
-    let actual_root = draft_root_from_witness(&witness.schema, &fields, false)?;
+    let actual_root = draft_root_from_witness(&witness.schema, &fields)?;
     if &actual_root != expected_root {
         return Err(Error::Other(format!(
             "Draft witness root mismatch: expected {:?}, found {:?}",
@@ -943,13 +1050,47 @@ mod tests {
         }
     }
 
+    fn demo_draft_value() -> DraftValue {
+        DraftValue::Struct(vec![
+            ("title".into(), DraftValue::String("collected".into())),
+            (
+                "items".into(),
+                DraftValue::List(
+                    (0..5)
+                        .map(|index| DraftValue::String(format!("item-{}", index)))
+                        .collect(),
+                ),
+            ),
+        ])
+    }
+
+    /// A draft root is a committed artifact: it is what a finalized draft is
+    /// selected against, so it must be indistinguishable from the selection-tree
+    /// root of the same data. Pinned as a literal so a change to the hashing is
+    /// caught here rather than in a dependent repository's fixtures.
+    ///
+    /// Computed on the value path, which `incremental-draft-witness` does not
+    /// touch — the witness path is then checked against *this*, closing the
+    /// chain frontier → witness root → value root → committed constant.
+    #[test]
+    fn draft_value_root_is_pinned() {
+        assert_eq!(
+            hex_root(&draft_value_root(&demo_draft_value()).unwrap()),
+            "c15acacaebc3b29f20323b3cb5dad331226a2b0da19f6e07d42b1814fe5ac1cb",
+        );
+    }
+
+    fn hex_root(root: &DraftRoot) -> String {
+        root.iter().map(|byte| format!("{:02x}", byte)).collect()
+    }
+
     #[test]
     fn apply_draft_ops_advances_roots_across_steps() {
         let witness = DraftStateWitness {
             schema: DemoDraft::schema(),
             fields: Vec::new(),
         };
-        let empty_root = draft_root_from_witness(&witness.schema, &BTreeMap::new(), false).unwrap();
+        let empty_root = draft_root_from_witness(&witness.schema, &BTreeMap::new()).unwrap();
 
         let (step_one_state, step_one_root) = apply_draft_ops(
             &witness,
@@ -1001,5 +1142,102 @@ mod tests {
         .unwrap_err();
 
         assert!(error.to_string().contains("can only be written once"));
+    }
+
+    /// The invariant the whole change rests on: a root witnessed by a frontier
+    /// equals the root of the materialized object, at every intermediate length.
+    ///
+    /// Together with `draft_value_root_is_pinned` and the frontier equivalence
+    /// test in `input.rs`, this closes the chain — frontier root = witness root
+    /// = value root = committed constant.
+    #[test]
+    fn witness_root_matches_the_materialized_value_root() {
+        let schema = DemoDraft::schema();
+        let mut witness = DraftStateWitness {
+            schema: schema.clone(),
+            fields: Vec::new(),
+        };
+        let mut values: Vec<DraftValue> = Vec::new();
+        let mut materialized = BTreeMap::new();
+
+        let (next, root) = apply_draft_ops(
+            &witness,
+            &[DraftOp::Set {
+                field: "title".into(),
+                value: DraftValue::String("collected".into()),
+            }],
+        )
+        .unwrap();
+        witness = next;
+        materialized.insert(
+            "title".to_string(),
+            DraftFieldValue::Set(DraftValue::String("collected".into())),
+        );
+        assert_eq!(
+            root,
+            draft_value_root(&draft_tree_from_fields(&schema, &materialized, false).unwrap())
+                .unwrap()
+        );
+
+        // 300 pushes crosses every padding transition in the range, including
+        // the ones where the duplicated node moves up a level.
+        for index in 0..300u32 {
+            let value = DraftValue::String(format!("item-{}", index));
+            let (next, root) = apply_draft_ops(
+                &witness,
+                &[DraftOp::Push {
+                    field: "items".into(),
+                    value: value.clone(),
+                }],
+            )
+            .unwrap();
+            witness = next;
+            values.push(value);
+            materialized.insert(
+                "items".to_string(),
+                DraftFieldValue::Append(values.clone()),
+            );
+
+            assert_eq!(
+                root,
+                draft_value_root(&draft_tree_from_fields(&schema, &materialized, false).unwrap())
+                    .unwrap(),
+                "witness root diverged from the materialized root after {} pushes",
+                index + 1
+            );
+        }
+    }
+
+    /// The witness is flat in the number of appended elements — the property the
+    /// authoring rule already promised and the encoding did not deliver.
+    #[test]
+    fn witness_size_does_not_track_the_appended_length() {
+        let mut witness = DraftStateWitness {
+            schema: DemoDraft::schema(),
+            fields: Vec::new(),
+        };
+
+        let mut first_size = None;
+        for index in 0..2048u32 {
+            let (next, _) = apply_draft_ops(
+                &witness,
+                &[DraftOp::Push {
+                    field: "items".into(),
+                    value: DraftValue::String(format!("item-{}", index)),
+                }],
+            )
+            .unwrap();
+            witness = next;
+
+            let size = postcard::to_allocvec(&witness.fields).unwrap().len();
+            let first = *first_size.get_or_insert(size);
+            assert!(
+                size <= first + 512,
+                "witness grew to {} bytes from {} after {} pushes",
+                size,
+                first,
+                index + 1
+            );
+        }
     }
 }

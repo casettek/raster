@@ -235,7 +235,16 @@ impl FileInputSourceResolver {
         };
         let index = Arc::new(RasterIndex::from_bytes(index_file.bytes())?);
         let actual_commitment = index.root_commitment_hex();
-        if normalize_hash(&expected_commitment) != normalize_hash(&actual_commitment) {
+        // The manifest is still read and still required — it carries the
+        // `encoding` that says how to decode this input, so both modes run the
+        // same program off the same fixtures. Only the integrity check is
+        // skipped, which is what "unauthenticated" means at the boundary too.
+        // Cost: a corrupted fixture now surfaces as a decode failure further
+        // in, rather than as a commitment mismatch here.
+        // See `docs/proposals/unauthenticated-execution.md` §8.
+        if crate::auth::auth_mode().is_authenticated()
+            && normalize_hash(&expected_commitment) != normalize_hash(&actual_commitment)
+        {
             return Err(Error::Other(format!(
                 "Raster input '{}' failed integrity check. Expected root commitment {}, got {}",
                 name, expected_commitment, actual_commitment

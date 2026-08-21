@@ -1,6 +1,6 @@
 # Proposals — status and dependencies
 
-Index of `docs/proposals/`. Last reviewed 2026-08-14.
+Index of `docs/proposals/`. Last reviewed 2026-08-16.
 
 Each proposal's own `Status:` line is the source of truth; this file collects them and records
 where that line disagrees with the code or the git history. Where they disagree, the
@@ -20,7 +20,9 @@ document, and correcting it is the author's call.
 | [`dynamic-index-selection`](./dynamic-index-selection.md) | **phases 1–3 implemented** (2026-07-30) | `BoundIndex`, citations, `verify_bound_index_bindings`, `into_ref!` | option 2 on the width check, left to be argued on its own terms |
 | [`sequence-grammar-closure`](./sequence-grammar-closure.md) | **phase 1 implemented** (2026-07-30) | `clone!`, `into_ref!`, the `.clone()` backstop | **phase 2** — inverting the default so an unrecognized form is an error, not `Inline` |
 | [`authoring-skill-and-tooling`](./authoring-skill-and-tooling.md) | **half landed** ⚠️ header says `proposed` | the skill: `.claude/skills/raster/` (commit `d78c9a5`) | `cargo raster check` — `raster-cli` has only `run` and `tile` |
+| [`zkvm-dry-run`](./zkvm-dry-run.md) | proposed 2026-08-17 — **rev 2**, narrowed from `guest-replayability-check` | — | whole; `cargo raster run --dry-run` (executor replay of every tile step, no proving) + a corrected proof-cost model. Rev 2 dropped the static/cross-compile tiers to `authoring-skill-and-tooling` |
 | [`draft-provenance`](./draft-provenance.md) | proposed (2026-07-30) | — | whole |
+| [`incremental-draft-witness`](./incremental-draft-witness.md) | **implemented** (2026-08-15) | `input::AppendFrontier`; `DraftWitnessField` split off `DraftFieldValue`; frontier-based `apply_draft_ops` / `draft_root_from_witness`; live frontier in the runtime (the host recomputed the whole root per push too). Trace-format hard break; input fixtures and `program_commitment` unmoved, guest image ids move (`raster-core` is linked into them) | §5 not done by design — the witness still carries a full `SchemaNode` per step and a set-once field's whole value rather than its root; acceptance run on `raster-inference` not yet reported |
 | [`loop-carried-state`](./loop-carried-state.md) | proposed (2026-07-30) | — | whole; see the note under *Dependencies* |
 | [`lazy-list-recur`](./lazy-list-recur.md) | **phases 1–6 implemented** (2026-08-13/14) | metadata payload, `ListCursor`, driver-level chunking + range descent, per-item bindings, §5 journal facts, rules 1–7 + S1/S3/S4 enforced | **rule 8 unimplemented** (no `ListRange` cross-check) and S2 unenforced; the peak-RSS acceptance benchmark was never run — see §Outstanding at implementation |
 | [`recur-progress-commitment`](./recur-progress-commitment.md) | **rev 2 implemented** (2026-08-14) | `recur_progress.rs`, the trace `recur_control` bit, site `Start`/`End` events, recorder stamping, guest advance-and-compare — recorder and guest agree on every commitment | mid-loop window seeds, split out as `window-seed-reconstruction` |
@@ -29,14 +31,20 @@ document, and correcting it is the author's call.
 | [`window-seed-reconstruction`](./window-seed-reconstruction.md) | proposed 2026-08-14 | — | whole; small. Without it a fraud-proof window opening mid-loop is rejected — the design `recur-progress-commitment` explicitly refused, reinstated by an unfilled parameter |
 | [`carried-state-channel`](./carried-state-channel.md) | proposed 2026-08-07 — **enhancement** | — | deliberately deferred until a second component is ready |
 | [`trace-event-vocabulary`](./trace-event-vocabulary.md) | **implemented** (2026-08-13) | `RecurSequenceIterationStart`/`End`; the naming rule and vocabulary table on `TraceEvent` | — |
+| [`chain-repeat`](./chain-repeat.md) | proposed 2026-08-19 | — | whole; `[[chain.repeat]]` with an authorized trip count (literal / external / stage output), `ChainShape` in the chain commitment, `ChainFaultKind::Shape`. `while` mode (iterate-until-a-stage-says-stop) split out as future work |
+| [`unauthenticated-execution`](./unauthenticated-execution.md) | **implemented** — v1 2026-08-19, v2 2026-08-20, v3 2026-08-20 | runtime `AuthMode` (`raster-runtime/src/auth.rs`); `select!` dispatched on base provenance, so storage sources stay lazy; drafts keep field values and drop commitments; recur full; `cargo raster run --no-auth`; no trace emitted, so a trace commitment is structurally impossible; profiling refused; RAS-203a landed. v3: `cargo raster chain run --no-auth` — all-or-nothing, no chain-commitment, own runs root; plus a storage-backed base indexed by a tile-produced value, which §5.3/§5.4 left uncovered and which stage 1 of `raster-chain-inference` hit immediately. **6.6× on `hello-tiles`**, both modes value-identical end to end | typed `Schema::Partial` to remove the remaining serialize per draft op — deferred, needs a measurement on a draft-heavy program. Mixed-posture chain policy (cheap stages, on-demand per-stage commitment) still out of scope — §10 |
 
 ## Dependencies
 
 ```
 program-start ──┐
 program-end ────┼──► program-identity ──► program-chain ──► chain-fraud-proof
-                │         (impl)             (partial)          (impl)
-                └── (impl)
+                │         (impl)             (partial)   │      (impl)
+                └── (impl)                               │        ▲
+                                                         └──► chain-repeat ──┘
+                                                              (proposed)
+                                        also borrows the authorized-value rule from
+                                        dynamic-index-selection (impl)
 
 bounded-collections (phases 1-2 impl)
         │
@@ -54,6 +62,24 @@ bounded-collections (phases 1-2 impl)
 
 sequence-grammar-closure (phase 1 impl) ◄──► draft-provenance
         phase 2 and draft-provenance refine each other; neither blocks the other
+
+authoring-skill-and-tooling (half landed) ····► zkvm-dry-run
+        owns RAS-206/208; the dry run is their first enforcement       (proposed)
+
+lazy-list-recur (impl) ─ same fix, write side ─► incremental-draft-witness
+                                                         (impl)
+                                                          ▲
+                        window-seed-reconstruction ·······┘
+                             (proposed)          shared frontier/seed mechanism
+
+unauthenticated-execution ····► incremental-draft-witness (impl) + lazy-list-recur (impl)
+        (proposed)              v1 defers Draft/recur because those own what a draft
+                                and a recur iteration would *mean* with no storage
+        ├── proposes RAS-203a into authoring-skill-and-tooling (half landed)
+        ├── suspends, in this mode only, the authorized-index rule from
+        │   dynamic-index-selection (impl)
+        └····► a future chain proposal: cheap stages + on-demand per-stage
+               commitment, over program-chain (partial) / chain-fraud-proof (impl)
 ```
 
 `──►` blocking. `····►` recommended, not blocking.
@@ -82,10 +108,24 @@ sequence-grammar-closure (phase 1 impl) ◄──► draft-provenance
 
 ### The non-blocking edges, stated
 
+- **`incremental-draft-witness` → nothing; it is independent of `draft-provenance`.** Both touch
+  drafts and neither blocks the other: `draft-provenance` is about `finalize` severing a
+  provenance chain, this is about the witness carrying O(N) elements to prove one root. It does
+  share a mechanism with `window-seed-reconstruction` — a frontier is what a window opening
+  mid-draft would need as its seed — so whichever lands first should decide whether the frontier
+  lives in the witness or in `TrackedDraftState`. That is the first entry in its
+  §Uncertainties, not a blocking edge. **Decided at implementation: the witness owns it.**
+  `TrackedDraftState` is untouched, so `window-seed-reconstruction` can still move the frontier
+  there if it wants the smaller-but-more-coupled form.
 - **`loop-carried-state` → `carried-state-channel`.** `loop-carried-state` §2 proposes a
   `TrackedStateRoot` map "mirroring `active_drafts`", which would reproduce that map's
   window-open gap. It should extend the channel instead. Neither proposal blocks the other; the
   ordering only decides whether the trace format breaks once or twice.
+- **`zkvm-dry-run` → `authoring-skill-and-tooling`.** Non-blocking in both directions. The dry
+  run depends on nothing that proposal delivers; it is the first *enforcement* of RAS-206
+  (determinism) and RAS-208 (replay size), both of which that proposal marks `[none]` and its
+  §6 leaves to "the zkVM replay itself". Rev 2 pushed the static-lint half back to
+  `cargo raster check` rather than duplicating it.
 - **`carried-state-channel` → drafts.** Folding `active_drafts` in needs the trace to express
   draft *creation* first: `create_draft` (`raster-runtime/src/storage.rs:817`) emits no step, so
   an absent map entry is legitimate today and `checks/drafts.rs:69` is permissive for that
@@ -108,6 +148,12 @@ sequence-grammar-closure (phase 1 impl) ◄──► draft-provenance
    proposal's rule that arrived early via a different failure.
 4. **`authoring-skill-and-tooling`'s second half** (`cargo raster check`) — independent, and it
    is the enforcement surface for rules the type system cannot express.
+5. **`zkvm-dry-run`** — the only thing that decides "does this tile actually run in the zkVM"
+   without proving, and the first enforcement RAS-206/208 have ever had. Independent. Not quite
+   free: `Replayer::replay` rejects a receiptless execution (`replay.rs:106`), so a
+   `TileExecutionResult.journal` field and a sibling `dry_run` method come with it — see §4.
+   Its §5 also reports that `calculate_proof_cycles` over-counts multi-segment executions and
+   that `Estimate`/`Prove` put different cycle quantities in the same field.
 
 `trace-event-vocabulary` landed 2026-08-13 and was amended 2026-08-14: the trailing
 `RecurTileExec` / `RecurSequenceExec` became `…End` and gained `…Start` halves, so a recur site

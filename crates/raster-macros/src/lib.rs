@@ -1181,6 +1181,10 @@ fn gen_tile_trace_output_serialization() -> proc_macro2::TokenStream {
     quote! {
         let __raster_output_bytes = ::raster::core::postcard::to_allocvec(&result)
             .unwrap_or_else(|e| panic!("Failed to serialize tile output: {}", e));
+        // The other half of the replay budget: a large per-iteration output is
+        // the usual cause of a slow sweep, and is invisible in the timings alone.
+        #[allow(unused_variables)]
+        let __raster_output_byte_len = __raster_output_bytes.len() as ::core::primitive::u64;
     }
 }
 
@@ -1576,6 +1580,12 @@ fn gen_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream {
         ];
 
         #input_bytes
+
+        // The replay unit size, captured before the buffer moves into `FnInput`.
+        // This is the number a `page_size` (or any input-shape) decision is
+        // actually tuned against — the profiler has no other way to see it.
+        #[allow(unused_variables)]
+        let __raster_input_byte_len = __raster_input_bytes.len() as ::core::primitive::u64;
 
         let mut __raster_internal = ::raster::alloc::collections::BTreeMap::new();
         #(#internal_binding_entries)*
@@ -2524,6 +2534,8 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
                         __raster_output_record_build_ns,
                         __raster_trace_event_publish_ns,
                         __raster_output_coordinate_publish_ns,
+                        __raster_input_byte_len,
+                        __raster_output_byte_len,
                     );
                     let _ = &__raster_tile_execution_scope;
                     return result;
@@ -3281,7 +3293,7 @@ fn split_selector_structured(expr: Expr) -> (Expr, Vec<SelSeg>) {
 }
 
 fn emit_index_lit(
-    base_expr: &Expr,
+    base_ident: &proc_macro2::Ident,
     prev_field: Option<&str>,
     offset: u64,
     convert: bool,
@@ -3293,7 +3305,7 @@ fn emit_index_lit(
         Some("pages") | None => {
             quote! {
                 ::raster::SelectorSegment::Index(
-                    ::raster::page_index_for_region::<_, #offset>(&#base_expr)
+                    ::raster::page_index_for_region::<_, #offset>(&#base_ident)
                 )
             }
         }
@@ -3301,7 +3313,7 @@ fn emit_index_lit(
             quote! {
                 ::raster::SelectorSegment::Index(
                     ::raster::page_index_for_field::<_, { ::raster::bytes_field_key(#field) }, #offset>(
-                        &#base_expr
+                        &#base_ident
                     )
                 )
             }
@@ -3310,7 +3322,7 @@ fn emit_index_lit(
 }
 
 fn emit_range_lit(
-    base_expr: &Expr,
+    base_ident: &proc_macro2::Ident,
     prev_field: Option<&str>,
     start: u64,
     end: u64,
@@ -3326,11 +3338,11 @@ fn emit_range_lit(
     }
     let pair = match prev_field {
         Some("pages") | None => quote! {
-            ::raster::page_range_for_region::<_, #start, #end>(&#base_expr)
+            ::raster::page_range_for_region::<_, #start, #end>(&#base_ident)
         },
         Some(field) => quote! {
             ::raster::page_range_for_field::<_, { ::raster::bytes_field_key(#field) }, #start, #end>(
-                &#base_expr
+                &#base_ident
             )
         },
     };
@@ -3345,16 +3357,121 @@ fn emit_range_lit(
     })
 }
 
-fn emit_selector_segments(
-    base_expr: &Expr,
-    segments: Vec<SelSeg>,
-    convert_bytes: bool,
-) -> Result<Vec<proc_macro2::TokenStream>, TokenStream> {
+/// Lower the same `SelSeg` list into a plain Rust accessor chain, for the
+/// unauthenticated arm of `select!`.
+///
+/// This is what makes the runtime mode flag free: `split_selector_structured`
+/// already recovered the path structurally, so the accessor is real field and
+/// index syntax rather than a runtime walk over a `SelectorPath`. See
+/// `docs/proposals/unauthenticated-execution.md` §5.1.
+///
+/// `base_ident` is the local the base expression was bound to; `insert_pages`
+/// and `convert_lits` mirror the decisions [`emit_selector_segments`] makes, so
+/// the two arms agree on which segment is the page index.
+fn emit_inline_accessor(
+    base_ident: &proc_macro2::Ident,
+    segments: &[SelSeg],
+    insert_pages: bool,
+    convert_lits: bool,
+) -> proc_macro2::TokenStream {
+    let mut access = quote! { __raster_inline_value };
+    let mut prev_field: Option<String> = None;
+    let mut ends_in_range = false;
+    let last = segments.len().saturating_sub(1);
+
+    for (i, seg) in segments.iter().enumerate() {
+        // A `Bytes<P>` region indexes its pages, so the page list has to be
+        // stepped into before the index is applied — the same insertion
+        // `emit_selector_segments` makes on the selector side. `pages` is a
+        // plain field access here for the same reason it is a schema field
+        // there.
+        if insert_pages && i == last {
+            access = quote! { #access.pages };
+        }
+        ends_in_range = false;
+        match seg {
+            SelSeg::Field(name) => {
+                let ident = proc_macro2::Ident::new(name, proc_macro2::Span::call_site());
+                prev_field = Some(name.clone());
+                access = quote! { #access.#ident };
+            }
+            SelSeg::IndexLit(offset) => {
+                // Reuses the same const-evaluated helpers as the authenticated
+                // arm; `AuthRef<T>` implements `PageSized`, so `&#base_ident`
+                // is a valid source for both.
+                let index = if convert_lits && i == last {
+                    inline_page_index(base_ident, prev_field.as_deref(), *offset)
+                } else {
+                    quote! { (#offset as usize) }
+                };
+                access = quote! { #access[#index] };
+            }
+            SelSeg::IndexBinding(path_expr) => {
+                let span = path_expr.span();
+                access = quote_spanned! { span =>
+                    #access[::raster::inline_index(&#path_expr) as usize]
+                };
+            }
+            SelSeg::RangeLit { start, end } => {
+                ends_in_range = true;
+                let range = if convert_lits && i == last {
+                    let start_index = inline_page_index(base_ident, prev_field.as_deref(), *start);
+                    let end_index = inline_page_index(base_ident, prev_field.as_deref(), *end);
+                    quote! { #start_index..#end_index }
+                } else {
+                    quote! { (#start as usize)..(#end as usize) }
+                };
+                access = quote! { #access[#range] };
+            }
+            SelSeg::RangeDyn { start, end } => {
+                ends_in_range = true;
+                access = quote! { #access[((#start) as usize)..((#end) as usize)] };
+            }
+        }
+    }
+
+    // A range selection yields `Block<T>`; everything else yields the selected
+    // value itself. `List<T>` needs no special case — it derefs to `Vec<T>` for
+    // indexing and is already the declared field type when one is selected
+    // whole.
+    if ends_in_range {
+        // The constructor `Block` documents for generated `select!` code; the
+        // size bound is pinned in the CFS rather than here.
+        quote! { ::raster::Block::__from_selection(#access.to_vec()) }
+    } else {
+        quote! { #access.clone() }
+    }
+}
+
+/// Byte offset → page index, for the unauthenticated arm. Same const-evaluated
+/// helpers the selector side uses, so a misaligned offset is still a compile
+/// error and both arms agree on the index.
+fn inline_page_index(
+    base_ident: &proc_macro2::Ident,
+    prev_field: Option<&str>,
+    offset: u64,
+) -> proc_macro2::TokenStream {
+    match prev_field {
+        Some("pages") | None => quote! {
+            (::raster::page_index_for_region::<_, #offset>(&#base_ident) as usize)
+        },
+        Some(field) => quote! {
+            (::raster::page_index_for_field::<_, { ::raster::bytes_field_key(#field) }, #offset>(
+                &#base_ident,
+            ) as usize)
+        },
+    }
+}
+
+/// Whether `emit_selector_segments` will splice a `pages` field before the
+/// final index, and therefore whether the final literal is a byte offset that
+/// needs converting. Split out so both arms decide identically.
+fn page_insertion_plan(segments: &[SelSeg], convert_bytes: bool) -> bool {
     let already_pages = matches!(
         segments.get(segments.len().saturating_sub(2)),
         Some(SelSeg::Field(name)) if name == "pages"
     );
-    let insert_pages = convert_bytes
+    convert_bytes
         && !already_pages
         && matches!(
             segments.last(),
@@ -3364,7 +3481,15 @@ fn emit_selector_segments(
                     | SelSeg::RangeLit { .. }
                     | SelSeg::RangeDyn { .. }
             )
-        );
+        )
+}
+
+fn emit_selector_segments(
+    base_ident: &proc_macro2::Ident,
+    segments: Vec<SelSeg>,
+    convert_bytes: bool,
+) -> Result<Vec<proc_macro2::TokenStream>, TokenStream> {
+    let insert_pages = page_insertion_plan(&segments, convert_bytes);
     let convert_lits = insert_pages;
 
     if convert_lits {
@@ -3396,7 +3521,7 @@ fn emit_selector_segments(
             }
             SelSeg::IndexLit(offset) => {
                 out.push(emit_index_lit(
-                    base_expr,
+                    base_ident,
                     prev_field.as_deref(),
                     offset,
                     convert_lits && i == last,
@@ -3413,7 +3538,7 @@ fn emit_selector_segments(
             }
             SelSeg::RangeLit { start, end } => {
                 out.push(emit_range_lit(
-                    base_expr,
+                    base_ident,
                     prev_field.as_deref(),
                     start,
                     end,
@@ -3468,26 +3593,55 @@ pub fn select(item: TokenStream) -> TokenStream {
 
     let convert_bytes = targets_bytes_page || targets_block_bytes_page;
     let (base_expr, structured) = split_selector_structured(expr);
-    let segments = match emit_selector_segments(&base_expr, structured, convert_bytes) {
+
+    // Bind the base once. Both arms need it, and the authenticated arm needs it
+    // twice — a byte-offset conversion borrows it while building the segments,
+    // then `select_source` consumes it. Splicing the expression at each use
+    // evaluated a base like `pd.clone().name` more than once.
+    let base_ident =
+        proc_macro2::Ident::new("__raster_select_base", proc_macro2::Span::call_site());
+    let insert_pages = page_insertion_plan(&structured, convert_bytes);
+    let inline_accessor =
+        emit_inline_accessor(&base_ident, &structured, insert_pages, insert_pages);
+    let segments = match emit_selector_segments(&base_ident, structured, convert_bytes) {
         Ok(segments) => segments,
         Err(tokens) => return tokens,
     };
 
     TokenStream::from(quote! {
         {
-            #[allow(unused_mut)]
-            let mut __raster_index_bindings: ::raster::alloc::vec::Vec<::raster::IndexBinding> =
-                ::raster::alloc::vec::Vec::new();
-            let __raster_selector_segments = ::raster::alloc::vec![#(#segments),*];
-            ::raster::attach_index_bindings(
-                ::raster::select_source(
-                    #base_expr,
-                    ::raster::typed_selector_path::<_, #selected_ty>(
-                        ::raster::SelectorPath::new(__raster_selector_segments),
+            let #base_ident = #base_expr;
+            // Dispatch on the base's *provenance*, not the mode. A
+            // storage-backed base keeps composing a selector even with
+            // authentication off, so a large external region is read by indexed
+            // lookup at the tile boundary rather than materialized at every
+            // step. The mode check stays in front of it so that an inline base
+            // in an authenticated run still reaches `SelectSource`'s panic: an
+            // inline value has no lineage, and that rule is not this mode's to
+            // relax. See `docs/proposals/unauthenticated-execution.md` §5.
+            if ::raster::auth_mode().is_authenticated()
+                || ::raster::is_storage_backed(&#base_ident)
+            {
+                #[allow(unused_mut)]
+                let mut __raster_index_bindings:
+                    ::raster::alloc::vec::Vec<::raster::IndexBinding> =
+                    ::raster::alloc::vec::Vec::new();
+                let __raster_selector_segments = ::raster::alloc::vec![#(#segments),*];
+                ::raster::attach_index_bindings(
+                    ::raster::select_source(
+                        #base_ident,
+                        ::raster::typed_selector_path::<_, #selected_ty>(
+                            ::raster::SelectorPath::new(__raster_selector_segments),
+                        ),
                     ),
-                ),
-                __raster_index_bindings,
-            )
+                    __raster_index_bindings,
+                )
+            } else {
+                ::raster::select_inline::<_, #selected_ty, _>(
+                    &#base_ident,
+                    |__raster_inline_value| #inline_accessor,
+                )
+            }
         }
     })
 }

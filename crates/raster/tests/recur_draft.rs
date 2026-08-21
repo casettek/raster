@@ -176,6 +176,34 @@ fn run_build_lines_reference() -> StorageRef {
     materialize_auth_return::<StorageRef, _>(__raster_sequence_auth_build_lines_reference())
 }
 
+/// Long enough that an O(N) witness is unmistakable — at ~27 bytes per entry the
+/// old encoding's last step would be tens of KB against the first step's tens of
+/// bytes — and short enough to stay a unit test.
+const LONG_LINE_COUNT: usize = 512;
+
+#[sequence]
+fn long_lines_reference() -> StorageRef {
+    let source = raster::store_value(
+        &(0..LONG_LINE_COUNT)
+            .map(|index| format!("line-{}", index))
+            .collect::<Vec<String>>(),
+    )
+    .expect("list source should store");
+
+    call_recur!(
+        tile = collect_lines,
+        input = storage!(List<String>, source),
+        output = new!(LineBundle),
+        args = ()
+    )
+    .reference()
+    .clone()
+}
+
+fn run_long_lines_reference() -> StorageRef {
+    materialize_auth_return::<StorageRef, _>(__raster_sequence_auth_long_lines_reference())
+}
+
 #[sequence]
 fn find_first_match(needle: String) -> SearchBundle {
     let source = raster::store_value(&vec![
@@ -728,6 +756,48 @@ fn recur_trace_threads_verified_roots_between_steps() {
             apply_draft_ops(&witness.pre_state, &native_transition.ops).expect("ops should apply");
         prior_root_after = Some(root_after);
     }
+}
+
+/// A draft's per-step witness must not grow with how much has been appended.
+///
+/// The recorder used to clone the entire append log into every step, so a draft
+/// of N elements cost O(N) trace bytes per step and O(N²) over a run — 7.1 MB
+/// tail witnesses and a 29 GB trace on a 262k-element draft. This asserts the
+/// property the authoring rule already promised: the step's cost tracks its
+/// increment, not the accumulation. See
+/// `docs/proposals/incremental-draft-witness.md`.
+#[test]
+fn draft_witness_size_does_not_grow_with_the_accumulated_list() {
+    let (_reference, events) = capture_trace_events(run_long_lines_reference);
+
+    let witness_sizes: Vec<usize> = events
+        .into_iter()
+        .filter_map(|event| match event {
+            TraceEvent::RecurTileIterationExec(record) if record.fn_name == "collect_lines" => {
+                record.draft_transition_witness
+            }
+            _ => None,
+        })
+        .map(|witness| {
+            raster::core::postcard::to_allocvec(&witness)
+                .expect("witness should serialize")
+                .len()
+        })
+        .collect();
+
+    assert_eq!(witness_sizes.len(), LONG_LINE_COUNT);
+
+    let first = witness_sizes[0];
+    let last = *witness_sizes.last().unwrap();
+    // Under the append-log encoding the last step is ~LONG_LINE_COUNT times the
+    // first, so any constant bound separates the two encodings unambiguously.
+    assert!(
+        last <= first + 512,
+        "witness grew from {} to {} bytes over {} appends",
+        first,
+        last,
+        LONG_LINE_COUNT
+    );
 }
 
 /// Each iteration records the item it ran on as an authenticated selection at
