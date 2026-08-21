@@ -11,17 +11,19 @@ use std::vec::Vec;
 
 use raster_core::cfs::CfsCoordinates;
 use raster_core::input::{
-    struct_commitments_root, Hash32, SchemaNode, SelectedPayload, SelectionCommitment,
-    SelectionProof, SelectionProofStep, SelectionWitness, SelectorPath, SelectorSegment,
+    struct_commitments_root, AuthenticatedListMetadata, Hash32, SchemaNode, SelectedPayload,
+    SelectionCommitment, SelectionPayloadKind, SelectionProof, SelectionProofStep,
+    SelectionWitness, SelectorPath, SelectorSegment,
 };
 use raster_core::trace::RasterPayload;
 use raster_core::{Error, Result};
 use serde::de::DeserializeOwned;
 
 use crate::input::{
-    hex_string, prove_selection, selected_payload_from_proven,
-    selected_payload_from_raster_location, selection_witness_from_raster_selection,
-    subtree_payload_and_root, tree_value_from_raster_location, typed_value_from_tree, TreeValue,
+    hex_string, list_metadata_payload, list_metadata_witness, prove_selection,
+    selected_payload_from_proven, selected_payload_from_raster_location,
+    selection_witness_from_raster_selection, subtree_payload_and_root,
+    tree_value_from_raster_location, typed_value_from_tree, RasterData, TreeValue,
 };
 use crate::raster_index::RasterIndex;
 use crate::source::{ResolvedSourceData, SourceResolver};
@@ -58,9 +60,11 @@ pub(crate) struct ReferencedSource {
 
 #[derive(Clone)]
 pub(crate) enum ReferencedSourceKind {
-    /// Self-describing on disk (an `.rindex` carries the schema), so no
-    /// type-specific hook is needed to select into it.
-    Raster,
+    /// Self-describing on disk (an `.rindex` carries the tree), plus the
+    /// declared `Selectable` schema so `Bytes<N>` can be checked at load.
+    Raster {
+        schema: fn() -> SchemaNode,
+    },
     /// Postcard bytes carry no schema of their own; the macro-generated
     /// bind site supplies these two monomorphized, zero-capture function
     /// pointers so this stays a plain `Clone` enum rather than a trait
@@ -74,7 +78,7 @@ pub(crate) enum ReferencedSourceKind {
 impl std::fmt::Debug for ReferencedSourceKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Raster => f.write_str("Raster"),
+            Self::Raster { .. } => f.write_str("Raster"),
             Self::Postcard { .. } => f.write_str("Postcard"),
         }
     }
@@ -198,13 +202,14 @@ impl ReferencedObject {
         resolved: &ResolvedSourceData,
     ) -> Result<(TreeValue, SelectedPayload)> {
         match (&source.kind, resolved) {
-            (ReferencedSourceKind::Raster, ResolvedSourceData::Raster { .. }) => {
+            (ReferencedSourceKind::Raster { schema }, ResolvedSourceData::Raster { .. }) => {
                 let index = resolved
                     .raster_index()
                     .ok_or_else(|| Error::Other("Expected raster index metadata".into()))?;
                 let data = resolved
-                    .raster_bytes()
-                    .ok_or_else(|| Error::Other("Expected raster data bytes".into()))?;
+                    .raster_data_file()
+                    .ok_or_else(|| Error::Other("Expected raster data file".into()))?;
+                check_schema_page_sizes(&schema(), index, data)?;
                 let location = index.locate(remaining)?;
                 let tree = tree_value_from_raster_location(index, data, &location)?;
                 let selected = selected_payload_from_raster_location(data, remaining, location)?;
@@ -242,6 +247,7 @@ impl ReferencedObject {
     pub fn selection_witness(
         &self,
         selector: &SelectorPath,
+        payload_kind: SelectionPayloadKind,
         resolver: &dyn SourceResolver,
     ) -> Result<SelectionWitness> {
         let (source, remaining) = self.find_source(selector)?;
@@ -249,20 +255,40 @@ impl ReferencedObject {
         Self::verify_source_commitment(source, &resolved)?;
 
         let inner = match (&source.kind, &resolved) {
-            (ReferencedSourceKind::Raster, ResolvedSourceData::Raster { .. }) => {
+            (ReferencedSourceKind::Raster { schema }, ResolvedSourceData::Raster { .. }) => {
                 let index = resolved
                     .raster_index()
                     .ok_or_else(|| Error::Other("Expected raster index metadata".into()))?;
                 let data = resolved
-                    .raster_bytes()
-                    .ok_or_else(|| Error::Other("Expected raster data bytes".into()))?;
+                    .raster_data_file()
+                    .ok_or_else(|| Error::Other("Expected raster data file".into()))?;
+                check_schema_page_sizes(&schema(), index, data)?;
                 let selection = index.select(&remaining)?;
-                selection_witness_from_raster_selection(data, &remaining, selection)?
+                match payload_kind {
+                    SelectionPayloadKind::Raw => {
+                        selection_witness_from_raster_selection(data, &remaining, selection)?
+                    }
+                    SelectionPayloadKind::List => {
+                        let (len, elements_root) = index.list_metadata(&remaining)?;
+                        list_metadata_witness(&remaining, selection, len, elements_root)
+                    }
+                }
             }
             (
                 ReferencedSourceKind::Postcard { to_tree, schema },
                 ResolvedSourceData::Postcard { .. },
             ) => {
+                // A metadata view is derived from a `.rindex`; a postcard
+                // source has none. This is the same class of refusal as the
+                // recur-source rule in `lazy-list-recur.md` §3, reached from
+                // the witness side.
+                if payload_kind == SelectionPayloadKind::List {
+                    return Err(Error::Other(format!(
+                        "Entry argument '{}' is postcard-encoded and cannot supply list metadata; \
+                         re-encode this input with encoding = \"raster\"",
+                        source.name
+                    )));
+                }
                 let tree = to_tree(resolved.bytes())?;
                 let (_, root_hash) = subtree_payload_and_root(&tree)?;
                 if root_hash.to_vec() != source.commitment {
@@ -307,6 +333,163 @@ impl ReferencedObject {
             },
         })
     }
+
+    /// A recur source's `(len, elements_root)` from an external input, without
+    /// resolving an element.
+    ///
+    /// Raster only: a postcard source is sequential and carries no index, so
+    /// `rows[i]` cannot be located without decoding everything before it. That
+    /// is the case `lazy-list-recur.md` §3 refuses at `open` rather than
+    /// servicing at `O(list)`.
+    pub fn list_metadata_selection(
+        &self,
+        selector: &SelectorPath,
+        resolver: &dyn SourceResolver,
+    ) -> Result<AuthenticatedListMetadata> {
+        let (source, remaining) = self.find_source(selector)?;
+        let resolved = resolver.resolve(&source.name)?;
+        Self::verify_source_commitment(source, &resolved)?;
+
+        let (ReferencedSourceKind::Raster { schema }, ResolvedSourceData::Raster { .. }) =
+            (&source.kind, &resolved)
+        else {
+            return Err(Error::Other(format!(
+                "call_recur! requires a raster-indexed List source; \
+                 re-encode this input with encoding = \"raster\" (input '{}')",
+                source.name
+            )));
+        };
+
+        let index = resolved
+            .raster_index()
+            .ok_or_else(|| Error::Other("Expected raster index metadata".into()))?;
+        if let Some(data) = resolved.raster_data_file() {
+            check_schema_page_sizes(&schema(), index, data)?;
+        }
+        let (len, elements_root) = index.list_metadata(&remaining)?;
+
+        let mut selected =
+            list_metadata_payload(&remaining, index.root_commitment, len, elements_root);
+        // Re-anchor to the combined root, exactly as `select` does: an entry
+        // argument's selections are proven against the object that binds every
+        // declared source, not against one source's own root.
+        selected.selected.commitment.path = full_selector_path(&source.name, &remaining);
+        selected.selected.commitment.source_root_hash = self
+            .combined_root()
+            .try_into()
+            .map_err(|_| Error::Other("Combined root is not 32 bytes".into()))?;
+        Ok(selected)
+    }
+}
+
+fn parse_bytes_type_page_size(type_name: &str) -> Option<u64> {
+    type_name
+        .strip_prefix("$raster::Bytes<")?
+        .strip_suffix('>')?
+        .parse()
+        .ok()
+}
+
+fn read_u64_leaf(index: &RasterIndex, data: &impl RasterData, node_id: u64) -> Result<u64> {
+    let node = index.get_node(node_id)?;
+    let subtree = data.read_subtree(node.offset, node.len)?;
+    if subtree.first().copied() != Some(0x00) || subtree.len() < 17 {
+        return Err(Error::Other("expected a u64 leaf payload".into()));
+    }
+    let len = u64::from_le_bytes(subtree[1..9].try_into().unwrap());
+    if len != 8 {
+        return Err(Error::Other("u64 leaf has unexpected width".into()));
+    }
+    Ok(u64::from_le_bytes(subtree[9..17].try_into().unwrap()))
+}
+
+fn schema_mentions_bytes(schema: &SchemaNode) -> bool {
+    match schema {
+        SchemaNode::Struct { type_name, fields } => {
+            parse_bytes_type_page_size(type_name).is_some()
+                || fields.iter().any(|field| schema_mentions_bytes(&field.schema))
+        }
+        SchemaNode::List { element, .. } => schema_mentions_bytes(element),
+        SchemaNode::Leaf { .. } => false,
+    }
+}
+
+fn check_schema_page_sizes(
+    schema: &SchemaNode,
+    index: &RasterIndex,
+    data: &impl RasterData,
+) -> Result<()> {
+    walk_schema_page_sizes(schema, index.root_node, index, data)
+}
+
+fn walk_schema_page_sizes(
+    schema: &SchemaNode,
+    node_id: u64,
+    index: &RasterIndex,
+    data: &impl RasterData,
+) -> Result<()> {
+    match schema {
+        SchemaNode::Struct { type_name, fields } => {
+            if let Some(declared) = parse_bytes_type_page_size(type_name) {
+                let node = index.get_node(node_id)?;
+                let crate::raster_index::RasterNodeKind::Struct { fields: idx_fields } =
+                    &node.kind
+                else {
+                    return Err(Error::Other(
+                        "schema names Bytes but the artifact node is not a struct".into(),
+                    ));
+                };
+                let page_size_id = idx_fields
+                    .iter()
+                    .find(|field| field.name == "page_size")
+                    .map(|field| field.child)
+                    .ok_or_else(|| Error::Other("Bytes artifact is missing page_size".into()))?;
+                let artifact = read_u64_leaf(index, data, page_size_id)?;
+                if artifact != declared {
+                    return Err(Error::PageSizeMismatch { declared, artifact });
+                }
+                if let (Some(byte_len_id), Some(pages_id)) = (
+                    idx_fields
+                        .iter()
+                        .find(|field| field.name == "byte_len")
+                        .map(|field| field.child),
+                    idx_fields
+                        .iter()
+                        .find(|field| field.name == "pages")
+                        .map(|field| field.child),
+                ) {
+                    let byte_len = read_u64_leaf(index, data, byte_len_id)?;
+                    let pages = index.get_node(pages_id)?;
+                    if let crate::raster_index::RasterNodeKind::List { len, .. } = &pages.kind {
+                        raster_core::check_page_partition(byte_len, declared, *len)?;
+                    }
+                }
+            }
+            let node = index.get_node(node_id)?;
+            if let crate::raster_index::RasterNodeKind::Struct { fields: idx_fields } = &node.kind
+            {
+                for field in fields {
+                    if let Some(child) = idx_fields.iter().find(|f| f.name == field.name) {
+                        walk_schema_page_sizes(&field.schema, child.child, index, data)?;
+                    }
+                }
+            }
+            Ok(())
+        }
+        SchemaNode::List { element, .. } => {
+            if !schema_mentions_bytes(element) {
+                return Ok(());
+            }
+            let node = index.get_node(node_id)?;
+            if let crate::raster_index::RasterNodeKind::List { elements, .. } = &node.kind {
+                if let Some(first) = elements.first() {
+                    walk_schema_page_sizes(element, *first, index, data)?;
+                }
+            }
+            Ok(())
+        }
+        SchemaNode::Leaf { .. } => Ok(()),
+    }
 }
 
 fn full_selector_path(name: &str, remaining: &SelectorPath) -> SelectorPath {
@@ -338,6 +521,7 @@ impl OwnedObject {
                     source_root_hash: raster.root_hash,
                     selected_hash: raster_core::input::selection_payload_hash(&raster.bytes),
                     selected_len: raster.bytes.len() as u64,
+                    payload_kind: SelectionPayloadKind::Raw,
                 },
                 value,
             ))
@@ -355,6 +539,7 @@ impl OwnedObject {
                     source_root_hash: [0; 32],
                     selected_hash: [0; 32],
                     selected_len: 0,
+                    payload_kind: SelectionPayloadKind::Raw,
                 },
                 value,
             ))
@@ -434,7 +619,7 @@ mod tests {
                 .ok_or_else(|| Error::Other(format!("no fixture for '{}'", name)))?;
             Ok(ResolvedSourceData::Postcard {
                 commitment,
-                file: crate::source::SourceFile::Read(Arc::from(bytes.into_boxed_slice())),
+                file: crate::source::SourceFile::Memory(Arc::from(bytes.into_boxed_slice())),
             })
         }
     }
@@ -503,7 +688,9 @@ mod tests {
         ]);
 
         let (_, selected) = referenced.select(&selector, &resolver).unwrap();
-        let witness = referenced.selection_witness(&selector, &resolver).unwrap();
+        let witness = referenced
+            .selection_witness(&selector, SelectionPayloadKind::Raw, &resolver)
+            .unwrap();
 
         assert!(raster_core::input::verify_selection_witness(
             &selected.commitment,
@@ -574,5 +761,49 @@ mod tests {
         };
 
         assert_ne!(referenced.combined_root(), renamed.combined_root());
+    }
+
+    fn tamper_u64_leaf(data: &mut [u8], index: &RasterIndex, field: &str, value: u64) {
+        let node = index.get_node(index.root_node).unwrap();
+        let crate::raster_index::RasterNodeKind::Struct { fields } = &node.kind else {
+            panic!("expected Bytes struct root");
+        };
+        let child = fields
+            .iter()
+            .find(|f| f.name == field)
+            .unwrap()
+            .child;
+        let leaf = index.get_node(child).unwrap();
+        let start = leaf.offset as usize + 9;
+        data[start..start + 8].copy_from_slice(&value.to_le_bytes());
+    }
+
+    #[test]
+    fn load_rejects_page_size_leaf_that_disagrees_with_schema() {
+        let region = raster_core::Bytes::<4>::paged(vec![1, 2, 3, 4, 5]).unwrap();
+        let (mut data, index_bytes, _) = crate::encode_raster_value(&region).unwrap();
+        let index = RasterIndex::from_bytes(&index_bytes).unwrap();
+        tamper_u64_leaf(&mut data, &index, "page_size", 8);
+        let err = check_schema_page_sizes(&raster_core::Bytes::<4>::schema(), &index, &data)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::PageSizeMismatch {
+                declared: 4,
+                artifact: 8
+            }
+        ));
+    }
+
+    #[test]
+    fn load_rejects_page_count_that_disagrees_with_ceil() {
+        let region = raster_core::Bytes::<4>::paged(vec![1, 2, 3, 4, 5]).unwrap();
+        let (mut data, index_bytes, _) = crate::encode_raster_value(&region).unwrap();
+        let index = RasterIndex::from_bytes(&index_bytes).unwrap();
+        // 5 bytes / 4 → 2 pages; claiming byte_len = 4 expects 1 page.
+        tamper_u64_leaf(&mut data, &index, "byte_len", 4);
+        let err = check_schema_page_sizes(&raster_core::Bytes::<4>::schema(), &index, &data)
+            .unwrap_err();
+        assert!(matches!(err, Error::PageShape { .. }));
     }
 }

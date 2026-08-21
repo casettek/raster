@@ -204,7 +204,7 @@ fn hello_tiles_run_can_use_json_trace_format() {
         parsed.get("ProgramStart").is_some()
             || parsed.get("SequenceStart").is_some()
             || parsed.get("TileExec").is_some()
-            || parsed.get("RecurTileExec").is_some()
+            || parsed.get("RecurTileEnd").is_some()
             || parsed.get("SequenceEnd").is_some(),
         "json trace line should be a trace event: {first_line}"
     );

@@ -23,6 +23,15 @@ pub enum Error {
 
     /// Generic error with a message.
     Other(String),
+
+    /// `Bytes::paged` was called with a zero page size.
+    PageSizeZero,
+
+    /// An artifact's committed `page_size` does not match the type's `Bytes<N>`.
+    PageSizeMismatch { declared: u64, artifact: u64 },
+
+    /// A page's `offset`/`len` do not form a partition of the region.
+    PageShape { index: u64, offset: u64, len: u64 },
 }
 
 impl fmt::Display for Error {
@@ -34,6 +43,15 @@ impl fmt::Display for Error {
             #[cfg(feature = "std")]
             Error::Io(e) => write!(f, "IO error: {}", e),
             Error::Other(msg) => write!(f, "{}", msg),
+            Error::PageSizeZero => write!(f, "Bytes page size must be greater than zero"),
+            Error::PageSizeMismatch { declared, artifact } => write!(
+                f,
+                "artifact page size {artifact} does not match declared Bytes<{declared}>"
+            ),
+            Error::PageShape { index, offset, len } => write!(
+                f,
+                "bytes page {index} has offset {offset} and len {len}, which is not a valid partition"
+            ),
         }
     }
 }

@@ -44,6 +44,10 @@ pub struct InterfaceDecl {
     /// The external encoding the value is carried in.
     #[serde(default)]
     pub encoding: ExternalEncoding,
+    /// Hash of the argument's `Selectable` schema. Pins `Bytes<N>` (and every
+    /// other declared type) into `program_commitment`.
+    #[serde(default)]
+    pub schema_hash: [u8; 32],
 }
 
 /// The authored program interface (from `Raster.toml`). Part of the program's
@@ -269,6 +273,7 @@ mod tests {
                         InterfaceDecl {
                             type_path: ty.to_string(),
                             encoding: ExternalEncoding::Raster,
+                            schema_hash: [0u8; 32],
                         },
                     )
                 })
@@ -276,6 +281,7 @@ mod tests {
             output: output.map(|ty| InterfaceDecl {
                 type_path: ty.to_string(),
                 encoding: ExternalEncoding::Raster,
+                schema_hash: [0u8; 32],
             }),
         }
     }

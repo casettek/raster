@@ -8,7 +8,9 @@ by the macros — do not improvise.
 
 ## 1. The input source
 
-The `input = ...` of a recur call MUST be a **storage-backed `List<T>`**:
+The `input = ...` of a recur call MUST be a **storage-backed `List<T>`**
+(for bytes: `select!(List<BytesPage>, region.pages)` — never `Bytes` itself,
+and never a byte range; page count wobbles and fails the chunk rules):
 
 - a `select!(List<T>, ...)` result (the normal case),
 - a prior `call!`/`call_recur!` binding whose value is a `List<T>`,
@@ -432,6 +434,15 @@ the step's element type changes from `T` to `Block<T>`, and the loop runs
 is the sanctioned way a step sees several elements at once — the framework builds
 it with the bound `N` pinned in the CFS.
 
+**How a chunk is proved.** The source type stays `AuthRef<List<T>>` — there is no
+`List<Block<T>>` anywhere in the storage tree, so there would be nothing to prove
+membership in. Each iteration is a **range selection** over the real list,
+`[i·N, min((i+1)·N, len))`, carrying a `ListRange` proof that folds to the same
+committed list root a single-element selection folds to. Only the final chunk is
+ever short. This is why `N` must be a literal: the driver, not an adapter,
+computes the ranges, and the audit checks each iteration's span against the
+program's declared shape.
+
 ```rust
 #[tile(kind = recur)]
 pub fn collect_line_chunk(
@@ -460,6 +471,37 @@ let chunked = call_recur!(
 
 `chunk` must be a literal — a named constant fails:
 ``call_recur! `chunk = ...` must be an integer literal so it can be pinned in the CFS``.
+
+### Sweeping a byte region
+
+A `Bytes<P>` sweep is an ordinary list recur over `select!(List<BytesPage>,
+region.pages)`; `chunk = N` gives the step a `RecurInput<Block<BytesPage>>` and
+works unchanged. Two constraints are specific to bytes:
+
+**Never drive a recur with byte ranges.** A byte range returns the whole pages
+*covering* it, so a request of length `L` yields `⌈L/P⌉` or `⌈L/P⌉ + 1` pages
+depending on where it starts:
+
+| request (`P` = 256 KiB) | pages |
+| --- | --- |
+| `[0 .. 262_144)` | 1 |
+| `[1 .. 262_145)` | 2 |
+| `[0 .. 1_048_576)` | 4 |
+| `[1 .. 1_048_577)` | 5 |
+
+Chunking requires every chunk to be exactly the declared size except the last,
+so an alternating 4/5 count fails `check_previous_chunk_was_full` on the first
+short iteration. **Ranges are for random access; recur is for sweeps.** A sweep
+over `.pages` is aligned by construction and never wobbles.
+
+**Straddling records are a `page_size` bug, not a tile problem.** If a record
+crosses a page boundary the step needs loop-carried stitching state — the
+partial record from the previous page — which is exactly the "state as a
+smuggled accumulator" pattern §2 forbids, and it makes the final page a special
+case on top. Choose `page_size` as a multiple of the record stride and the
+problem does not exist. This constraint outranks every performance
+consideration; tune the page size for cycles only *within* the set of stride
+multiples.
 
 ## 6. `RecurInput` API inside the step
 

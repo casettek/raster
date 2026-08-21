@@ -1,7 +1,7 @@
 use raster::core::trace::TraceEvent;
 use raster::prelude::*;
 use raster::selector_path;
-use raster::SelectionCommitment;
+use raster::{SelectionCommitment, SelectionPayloadKind};
 use raster_core::postcard;
 use raster_runtime::{init_with, Publisher};
 use serde::{Deserialize, Serialize};
@@ -285,6 +285,7 @@ fn nested_auth_ref_selection_matches_direct_internal_selection_trace() {
             source_root_hash: root_hash,
             selected_hash: [0; 32],
             selected_len: 0,
+            payload_kind: SelectionPayloadKind::Raw,
         },
         personal,
     );
@@ -442,10 +443,12 @@ fn nested_sequence_trace_records_terminal_err_outputs() {
                 matches!(record.fn_name.as_str(), "echo_name" | "maybe_echo_name")
             }
             TraceEvent::RecurTileIterationExec(_)
-            | TraceEvent::RecurTileExec(_)
-            | TraceEvent::RecurSequenceStart(_)
+            | TraceEvent::RecurTileEnd(_)
+            | TraceEvent::RecurSequenceIterationStart(_)
+            | TraceEvent::RecurSequenceIterationEnd(_)
             | TraceEvent::RecurSequenceEnd(_)
-            | TraceEvent::RecurSequenceExec(_)
+            | TraceEvent::RecurTileStart(_)
+            | TraceEvent::RecurSequenceStart(_)
             | TraceEvent::ProgramStart(_)
             | TraceEvent::ProgramEnd(_) => false,
         })

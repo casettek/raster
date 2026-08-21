@@ -36,6 +36,7 @@ use raster_prover::transition::{step_transitions, StepIo};
 use raster_runtime::TraceRecorder;
 
 use crate::commands::create_run_artifacts;
+use crate::runtime_env::RuntimeEnv;
 use crate::utils::authorization::build_manifested_inputs;
 use crate::{BackendType, TraceFormat};
 
@@ -46,6 +47,7 @@ pub fn run(
     commit_flag: Option<&str>,
     fraud_proof_config: Option<FraudProofConfig>,
     audit_flag: Option<&str>,
+    no_auth: bool,
     _verbose: bool,
     trace_format: TraceFormat,
     features: &[String],
@@ -131,7 +133,7 @@ pub fn run(
     println!("  Run ID: {}", artifacts.run_id);
     println!("  Run artifacts dir: {}", artifacts.run_dir.display());
     println!("  Trace path: {}", trace_path.display());
-    if profiling_enabled(features, all_features) {
+    if profiling_enabled(features, all_features) && !no_auth {
         println!(
             "  Expected live profile stream: {}",
             profile_stream_path.display()
@@ -141,24 +143,32 @@ pub fn run(
             profile_stream_path.display()
         );
     }
+
+    // Printed on every run, not just unauthenticated ones: a reader must never
+    // have to infer which mode produced the output in front of them.
+    if no_auth {
+        println!("Mode: unauthenticated (--no-auth) — results are not authoritative");
+    } else {
+        println!("Mode: authenticated");
+    }
     println!();
 
     let mut cmd = Command::new(&binary_path);
     cmd.current_dir(&project.root_dir);
-    cmd.env(raster_runtime::TRACE_PATH_ENV, &trace_path);
-    cmd.env(
-        raster_runtime::TRACE_FORMAT_ENV,
-        trace_format.as_runtime_str(),
-    );
-    cmd.env(raster_runtime::PROFILE_PATH_ENV, &profile_path);
-    cmd.env(
-        raster_runtime::PROFILE_STREAM_PATH_ENV,
-        &profile_stream_path,
-    );
-    cmd.env(raster_runtime::PROFILE_RUN_ID_ENV, &artifacts.run_id);
-    // Where a program that returns a value writes its output artifact
-    // (`output.bin` / `output.rindex` / `output_manifest.json`).
-    cmd.env(raster_runtime::OUTPUT_DIR_ENV, &artifacts.run_dir);
+    // The mode belongs to the run, and this is where the run is launched — the
+    // same place the decision to commit is made. Which of the two shapes gets
+    // built is the whole statement of the mode; `RuntimeEnv` writes
+    // `RASTER_AUTH` from it, so nothing here can set a trace or a profile on a
+    // run that would refuse one. See `crate::runtime_env`.
+    let runtime_env = RuntimeEnv::new(&artifacts.run_dir);
+    if no_auth {
+        runtime_env.apply(&mut cmd);
+    } else {
+        runtime_env
+            .authenticated(&trace_path, trace_format)
+            .profiling(&artifacts)
+            .apply(&mut cmd);
+    }
     if let Some(input_json) = input {
         cmd.args(["--input", input_json]);
     }
@@ -251,6 +261,16 @@ pub fn run(
         println!("  {}", artifacts.run_dir.join("output.bin").display());
         println!("  {}", artifacts.run_dir.join("output.rindex").display());
         println!("  {}", output_manifest_path.display());
+    }
+
+    // An unauthenticated run installs no trace publisher, so there is no trace
+    // file to load and nothing for `--commit`/`--audit` to operate on — the
+    // interlock is the absence of the artifact, not a check on it. Reading the
+    // path here would just fail with a confusing "missing file".
+    if no_auth {
+        println!();
+        println!("no trace recorded (--no-auth)");
+        return Ok(());
     }
 
     let (mut trace, trace_recorder) =
@@ -714,7 +734,14 @@ fn build_storage_selection_witnesses(
             Some((
                 binding_name.clone(),
                 trace_recorder
-                    .storage_selection_witness(&reference, &storage.selector)
+                    // The recorded commitment says which view of the node it
+                    // committed to. This process did not produce the trace, so
+                    // it cannot infer that from the payload — it has none yet.
+                    .storage_selection_witness(
+                        &reference,
+                        &storage.selector,
+                        storage.selection.payload_kind,
+                    )
                     .unwrap_or_else(|error| {
                         panic!(
                             "Failed to build storage selection witness for '{}': {}",
@@ -889,7 +916,11 @@ pub fn prove(
                             StorageRef::new(output.coordinates.clone(), output.commitment.clone());
                         Some(
                             trace_recorder
-                                .storage_selection_witness(&reference, &output.selector)
+                                .storage_selection_witness(
+                                    &reference,
+                                    &output.selector,
+                                    output.selection.payload_kind,
+                                )
                                 .unwrap_or_else(|error| {
                                     panic!(
                                         "Failed to build program output selection witness: {}",

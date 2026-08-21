@@ -13,34 +13,58 @@ pub extern crate alloc;
 extern crate std;
 
 pub use raster_core as core;
+pub use raster_core::auth::AuthMode;
 pub use raster_core::draft;
+
+/// The authentication posture of this run. See
+/// `docs/proposals/unauthenticated-execution.md` §1.
+///
+/// `select!` and the sequence call bindings expand to a match on this, so it
+/// must resolve in both postures. Off the host there is no environment and no
+/// program entry point to read, and a guest replays a step that was recorded
+/// authenticated — so the guest answer is `Authenticated`, always.
+#[cfg(feature = "std")]
+pub fn auth_mode() -> AuthMode {
+    raster_runtime::auth::auth_mode()
+}
+
+#[cfg(not(feature = "std"))]
+pub fn auth_mode() -> AuthMode {
+    AuthMode::Authenticated
+}
 
 pub mod input;
 pub use input::{
-    __raster_clone, attach_index_bindings, auth_ref_result_trace, auth_ref_trace, chunk_auth_ref,
+    __raster_clone, attach_index_bindings, auth_ref_result_trace, auth_ref_trace,
     draft_replay_handle, draft_replay_transition, entry_argument_auth_ref, finalize,
     index_binding_name, into_auth_ref, into_auth_value, into_auth_value_with_bindings, into_draft,
     materialize_auth_result, materialize_auth_return, new_draft, push_bound_index,
     raster_trace_payload, resolve_storage_ok_value, resolve_storage_value,
-    restore_draft_from_replay_handle, run_recur_list, run_recur_list_state,
+    inline_index, is_storage_backed, restore_draft_from_replay_handle, run_recur_chunked_list,
+    run_recur_chunked_list_state,
+    run_recur_chunked_list_with_state, run_recur_list, run_recur_list_state,
     run_recur_list_with_state, run_recur_sequence_list, run_recur_sequence_list_state,
-    run_recur_sequence_list_with_state, select_source, select_stored_value, selector_path,
+    run_recur_sequence_list_with_state, select_inline, select_source, select_stored_value,
+    selector_path,
     serialize_draft_replay_handle, serialize_draft_trace, typed_selector_path, typed_storage,
-    typed_storage_with_resolver, Anchor, AuthRef, AuthRefTrace, AuthValue, Block, Draft,
-    DraftAppendField, DraftSetField, IndexBinding, IndexSource, IndexWidth, IntoAuthRef,
+    typed_storage_with_resolver, Anchor, AuthRef, AuthRefTrace, AuthValue, Block, Bytes, BytesPage,
+    Draft,
+    bytes_field_key, page_index_for_field, page_index_for_region, page_range_for_field,
+    page_range_for_region, DraftAppendField, DraftSetField, IndexBinding, IndexSource, IndexWidth,
+    InlineSelectSource, IntoAuthRef, BytesFieldPageSize, PageSized, RecurListSource,
     IntoAuthValue, IntoDraft, IntoMaterialized, IntoRecurControl, List, ListProofDirection,
     ListProofSibling, Materializable, Op, RecurControl, RecurInput, RecurOutput,
     RecurSequenceInput, RecurSequenceOutput, RecurSequenceState, RecurState, Schema, SchemaField,
     SchemaFieldMode, SchemaNode, SelectSource, Selectable, SelectedPayload, SelectionCommitment,
-    SelectionProof, SelectionProofStep, SelectionWitness, SelectorPath, SelectorSegment,
-    StorageRef, StorageValue, TypedSelectorPath, TypedStorageBinding,
+    SelectionPayloadKind, SelectionProof, SelectionProofStep, SelectionWitness, SelectorPath,
+    SelectorSegment, StorageRef, StorageValue, TypedSelectorPath, TypedStorageBinding,
 };
 
 #[cfg(feature = "std")]
 pub use input::{
     begin_draft_transition_capture, encode_raster_value, end_program_output, end_program_unit,
-    finish_draft_transition_capture, postcard_structural_commitment, store_value,
-    write_raster_files,
+    finish_draft_transition_capture, postcard_structural_commitment, recur_source_trace,
+    store_value, write_raster_files,
 };
 
 pub use raster_macros::{select, sequence, tile, Selectable};
@@ -63,8 +87,23 @@ pub mod runtime {
 #[cfg(feature = "std")]
 pub use raster_runtime::{
     entry_argument_spec, finish, init, init_with, publish_trace_event, start_program,
-    EntryArgumentSpec, EntryArgumentsBinding,
+    take_recur_item_binding, EntryArgumentSpec, EntryArgumentsBinding,
 };
+
+/// Guest tiles still expand `::raster::take_recur_item_binding()`; the host
+/// driver is the only caller that ever stashes a binding. On `no_std` there is
+/// no thread-local stash, so every take is `None` and the wrapper falls back
+/// to the argument's own index bindings.
+#[cfg(not(feature = "std"))]
+pub struct PendingRecurItemBinding {
+    pub storage: crate::core::trace::StorageData,
+    pub index_bindings: alloc::vec::Vec<IndexBinding>,
+}
+
+#[cfg(not(feature = "std"))]
+pub fn take_recur_item_binding() -> Option<PendingRecurItemBinding> {
+    None
+}
 
 #[cfg(feature = "std")]
 pub mod utils;
@@ -247,6 +286,8 @@ pub mod __private {
         output_record_build_ns: u64,
         trace_event_publish_ns: u64,
         output_coordinate_publish_ns: u64,
+        input_bytes: u64,
+        output_bytes: u64,
     ) {
         #[cfg(feature = "profiling")]
         raster_runtime::record_tile_profile(
@@ -266,6 +307,10 @@ pub mod __private {
                 output_coordinate_publish_ns,
                 other_wrapper_ns: 0,
             },
+            raster_runtime::TileProfileSizes {
+                input_bytes,
+                output_bytes,
+            },
         );
         #[cfg(not(feature = "profiling"))]
         let _ = (
@@ -281,13 +326,18 @@ pub mod __private {
             output_record_build_ns,
             trace_event_publish_ns,
             output_coordinate_publish_ns,
+            input_bytes,
+            output_bytes,
         );
     }
 
     #[cfg(not(feature = "std"))]
+    #[allow(clippy::too_many_arguments)]
     pub fn record_tile_profile(
         _: &str,
         _: crate::core::cfs::CfsCoordinates,
+        _: u64,
+        _: u64,
         _: u64,
         _: u64,
         _: u64,
@@ -394,11 +444,22 @@ pub mod __private {
         }
     }
 
+    /// Bind a tile's return value for the rest of the sequence.
+    ///
+    /// The `Serialize + DeserializeOwned` bounds are kept in both modes even
+    /// though the unauthenticated arm never uses them: dropping them would let
+    /// a program compile one way and not the other, and "develop
+    /// unauthenticated, commit authenticated" only works if the two modes
+    /// accept the same source.
     #[cfg(feature = "std")]
     pub fn bind_infallible_call<T>(result: T) -> crate::AuthRef<T>
     where
         T: serde::Serialize + serde::de::DeserializeOwned + 'static,
     {
+        if !crate::auth_mode().is_authenticated() {
+            return crate::AuthRef::Inline(result);
+        }
+
         #[cfg(feature = "profiling")]
         let output_store_start = profile_now();
         let reference = raster_runtime::store_execution_output_value(&result)
@@ -423,6 +484,13 @@ pub mod __private {
     where
         T: serde::Serialize + serde::de::DeserializeOwned + 'static,
     {
+        if !crate::auth_mode().is_authenticated() {
+            // The whole `Result` is what storage would hold, so the
+            // unauthenticated arm splits it here instead of behind
+            // `resolve_storage_ok_value`.
+            return result.map(crate::AuthRef::Inline);
+        }
+
         #[cfg(feature = "profiling")]
         let output_store_start = profile_now();
         let reference = raster_runtime::store_execution_output_value(&result)
@@ -708,8 +776,11 @@ pub mod prelude {
         call, call_recur, call_recur_seq, call_seq, clone, finalize, into_auth_ref, into_draft,
         into_ref,
         materialize_auth_result, materialize_auth_return, new, select, sequence, storage, tile,
-        Anchor, AuthRef, AuthValue, Block, Draft, IndexSource, IndexWidth, IntoAuthRef,
-        IntoAuthValue, IntoDraft, List, ListProofDirection, ListProofSibling, Materializable, Op,
+        bytes_field_key, page_index_for_field, page_index_for_region, page_range_for_field,
+        page_range_for_region, Anchor, AuthRef, AuthValue, Block, Bytes, BytesFieldPageSize,
+        BytesPage, Draft, IndexSource, IndexWidth, IntoAuthRef, IntoAuthValue, IntoDraft, List,
+        ListProofDirection, ListProofSibling, PageSized, RecurListSource,
+        Materializable, Op,
         RecurControl, RecurInput, RecurOutput, RecurSequenceInput, RecurSequenceOutput,
         RecurSequenceState, RecurState, Schema, SchemaField, SchemaFieldMode, SchemaNode,
         SelectSource, Selectable, SelectedPayload, SelectionProof, SelectionProofStep,

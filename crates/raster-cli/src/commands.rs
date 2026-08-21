@@ -45,7 +45,7 @@ pub(crate) struct RunArtifacts {
 }
 
 impl RunArtifacts {
-    fn new(run_id: String, trace_format: TraceFormat) -> Self {
+    pub(crate) fn new(run_id: String, trace_format: TraceFormat) -> Self {
         let run_dir = output_dir().join("runs").join(&run_id);
         Self {
             trace_path: run_dir.join(trace_format.trace_file_name()),

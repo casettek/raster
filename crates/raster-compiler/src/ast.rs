@@ -16,6 +16,20 @@ pub struct ProjectAst {
     pub name: String,
     pub root_path: PathBuf,
     pub functions: Vec<FunctionAstItem>,
+    /// Named structs in `src/`, used to fill `InterfaceDecl.schema_hash`.
+    pub structs: Vec<StructAstItem>,
+}
+
+#[derive(Debug, Clone)]
+pub struct StructAstItem {
+    pub name: String,
+    pub fields: Vec<StructFieldAst>,
+}
+
+#[derive(Debug, Clone)]
+pub struct StructFieldAst {
+    pub name: String,
+    pub ty: String,
 }
 
 /// Indicates which canonical Raster call primitive was used.
@@ -106,22 +120,21 @@ impl ProjectAst {
 
         let files_paths = Self::find_all_rs_files(project_root);
 
-        let functions = files_paths
-            .iter()
-            .flat_map(|path| Self::parse_file(path))
-            .collect::<Vec<FunctionAstItem>>();
+        let mut functions = Vec::new();
+        let mut structs = Vec::new();
+        for path in &files_paths {
+            let content = std::fs::read_to_string(path).unwrap();
+            let ast = parse_file(&content).unwrap();
+            functions.extend(Self::parse_functions(&ast, path.to_path_buf()));
+            structs.extend(crate::schema_walk::collect_structs(&ast.items));
+        }
 
         Ok(Self {
             name: package.name.clone(),
             root_path: project_root.to_path_buf(),
             functions,
+            structs,
         })
-    }
-
-    fn parse_file(path: &Path) -> Vec<FunctionAstItem> {
-        let content = std::fs::read_to_string(path).unwrap();
-        let ast = parse_file(&content).unwrap();
-        Self::parse_functions(&ast, path.to_path_buf())
     }
 
     fn find_all_rs_files(project_root: &Path) -> Vec<PathBuf> {

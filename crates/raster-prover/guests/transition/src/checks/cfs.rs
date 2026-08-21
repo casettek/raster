@@ -5,6 +5,11 @@
 
 use raster_core::cfs::{CfsCoordinates, CfsCursor, InputBinding, InputSource, SequenceChildItem};
 use raster_core::input::SelectorSegment;
+use std::collections::BTreeMap;
+
+use raster_core::draft::TileReplayJournal;
+use raster_core::input::{SelectionPayloadKind, SelectionWitness};
+use raster_core::recur_progress::{RecurProgressStack, RecurSiteKind};
 use raster_core::trace::{
     ExecStep, ExecTarget, FnInput, FnInputValue, StepKind, StepRecord, StorageData,
 };
@@ -110,21 +115,33 @@ fn record_matches_item(step_record: &StepRecord, cfs_item: &SequenceChildItem) -
             StepKind::SequenceStart { .. } | StepKind::SequenceEnd { .. },
             SequenceChildItem::RecurSequence(item),
         ) => step_record.sequence_id == item.id,
+        // A recur *tile* site opens with a boundary step too: `RecurTileStart`
+        // becomes `SequenceStart` at `[s]`, carrying the site's own id so it
+        // binds to the item the same way a sequence's boundary steps do. Its
+        // `End` half stays `Exec(RecurTile)`, matched above.
+        (StepKind::SequenceStart { .. }, SequenceChildItem::RecurTile(item)) => {
+            step_record.sequence_id == item.id
+        }
         _ => false,
     }
 }
 
 /// For an iteration of a recur site with a CFS-declared chunk size, verify the
-/// iteration consumed a chunk of `1..=declared` elements. The chunk length is
-/// the leading varint of the iteration's canonical input bytes (the first tile
-/// argument is `RecurInput<Vec<T>>`, whose first field is the chunk vector);
-/// those bytes are pinned by `input_commitment` and executed by the replay
-/// proof, so the prefix cannot lie about the payload.
+/// iteration consumed a chunk of `1..=declared` elements.
+///
+/// The count comes from the iteration's **replay journal** — `consumed_elements`
+/// — rather than from inspecting the leading postcard varint of its ABI bytes.
+/// The varint trick worked only because a chunked tile's first argument happened
+/// to be `RecurInput<Vec<T>>`, whose first field is the chunk vector; it was a
+/// layout assumption about user types, and it could not read anything else the
+/// audit needs (an *unchunked* iteration's index, or how the tile terminated).
+/// The tile now commits the number directly and the replay receipt covers it.
+/// See `docs/proposals/lazy-list-recur.md` §5.
 fn verify_recur_iteration_chunking(
     cfs_cursor: &CfsCursor,
     step_record: &StepRecord,
     site_coordinates: &CfsCoordinates,
-    input_witness: Option<&Vec<u8>>,
+    replay_journal: Option<&TileReplayJournal>,
 ) {
     let Some(raster_core::cfs::SequenceChildItem::RecurTile(item)) =
         cfs_cursor.try_get_item(site_coordinates)
@@ -135,24 +152,39 @@ fn verify_recur_iteration_chunking(
         return;
     };
 
-    let input_witness = input_witness.unwrap_or_else(|| {
-        panic!(
-            "Chunked recur iteration {:?} is missing its input witness",
-            step_record
-        )
-    });
-    let chunk_len =
-        raster_core::chunking::iteration_chunk_len(input_witness).unwrap_or_else(|| {
+    let recur = replay_journal
+        .and_then(|journal| journal.recur.as_ref())
+        .unwrap_or_else(|| {
             panic!(
-                "Chunked recur iteration {:?} input does not carry a chunk length",
+                "Chunked recur iteration {:?} is missing its replay-proven recur facts",
                 step_record
             )
         });
-    if let Err(violation) = raster_core::chunking::check_iteration_chunk_len(declared, chunk_len) {
+    let consumed = recur.position.consumed_elements;
+    if let Err(violation) = raster_core::chunking::check_iteration_chunk_len(declared, consumed) {
         panic!(
             "Recur chunking violation at step {:?}: {}",
             step_record, violation
         );
+    }
+
+    // Only the *final* chunk may be short. The native recorder used to enforce
+    // this by remembering the previous iteration's length; the journal makes it
+    // a stateless, per-iteration fact, because `declared_iterations` already
+    // says whether this iteration is the last one. Same rule, replay-proven
+    // instead of host-remembered — and it is what rejects a `4,1,4,1` shape at
+    // `C = 4` on the iteration that goes short, rather than on the one after.
+    let is_final_iteration =
+        recur.position.iteration_index + 1 >= recur.position.declared_iterations;
+    if !is_final_iteration {
+        if let Err(violation) =
+            raster_core::chunking::check_previous_chunk_was_full(declared, consumed)
+        {
+            panic!(
+                "Recur chunking violation at step {:?}: {}",
+                step_record, violation
+            );
+        }
     }
 }
 
@@ -161,7 +193,7 @@ pub fn verify_step_record_inputs(
     step_record: &StepRecord,
     input_source_witness: Option<&FnInput>,
     sequence_scope_witness: Option<&FnInput>,
-    input_witness: Option<&Vec<u8>>,
+    replay_journal: Option<&TileReplayJournal>,
 ) {
     // The program-boundary steps sit at the sequence root `[]`, which is not
     // itself a CFS item and binds no CFS inputs: `ProgramStart` binds
@@ -175,7 +207,7 @@ pub fn verify_step_record_inputs(
     if let Some((site_coordinates, _)) =
         cfs_cursor.try_get_recur_iteration_coordinates(step_record.coordinates())
     {
-        verify_recur_iteration_chunking(cfs_cursor, step_record, &site_coordinates, input_witness);
+        verify_recur_iteration_chunking(cfs_cursor, step_record, &site_coordinates, replay_journal);
         return;
     }
 
@@ -455,4 +487,168 @@ pub fn get_next_expected_coordinates(
     cfs_cursor
         .try_get_next_coordinates(coordinates)
         .expect("Wrong tile coordinates")
+}
+
+/// The authenticated source length carried by a recur site's `Start` step.
+///
+/// `Start` records the source under the binding name `"input"`, whose selection
+/// is the `0x0A` list-metadata payload (`lazy-list-recur.md` §1–§2). By the time
+/// this runs, `checks::store` has already folded that witness to the committed
+/// root, so the length read here is authenticated rather than index-trusted —
+/// which is the whole reason the site needs a `Start` at all: `L` has to exist
+/// before iteration 0 is checked against it.
+fn authenticated_source_len(
+    step_record: &StepRecord,
+    input_source_witness: Option<&FnInput>,
+    storage_selection_witnesses: &BTreeMap<String, SelectionWitness>,
+) -> u64 {
+    let binding = input_source_witness
+        .and_then(|witness| witness.storage().get("input"))
+        .unwrap_or_else(|| {
+            panic!(
+                "Recur site start {:?} does not record its source binding",
+                step_record
+            )
+        });
+    assert_eq!(
+        binding.selection.payload_kind,
+        SelectionPayloadKind::List,
+        "Recur site start {:?} must commit to list metadata, not a raw payload",
+        step_record,
+    );
+    let witness = storage_selection_witnesses.get("input").unwrap_or_else(|| {
+        panic!(
+            "Recur site start {:?} is missing its source selection witness",
+            step_record
+        )
+    });
+    decode_list_metadata_len(&witness.bytes).unwrap_or_else(|| {
+        panic!(
+            "Recur site start {:?} carries a malformed list metadata payload",
+            step_record
+        )
+    })
+}
+
+/// `len` out of a `0x0A` payload: `[0x0A][len: u64 LE]`, then a 32-byte
+/// elements root when `len > 0`.
+fn decode_list_metadata_len(bytes: &[u8]) -> Option<u64> {
+    if *bytes.first()? != 0x0A {
+        return None;
+    }
+    let len = u64::from_le_bytes(bytes.get(1..9)?.try_into().ok()?);
+    let expected = if len == 0 { 9 } else { 41 };
+    (bytes.len() == expected).then_some(len)
+}
+
+/// Advance the carried recur progress by this step's facts and hold the result
+/// to the commitment the step recorded.
+///
+/// One rule, uniform for every step. The recorder reached its commitment by
+/// advancing with the values rules 3 and 4 *require* — derived from
+/// `(chunk, source_len, next_iteration_index)`, all of which it holds. The
+/// guest advances with the journal's actual values. Both mutate only
+/// `next_iteration_index` and `last_control`, so both land on the same frame
+/// **iff** the journal agrees with the derivation; where it disagrees, a rule
+/// fires before any hash is compared.
+///
+/// That asymmetry is the point: a journal value *compared against* the frame's
+/// inputs is reachable for a producer that has no journal, whereas revision 1's
+/// `consumed_total` — folded *into* the frame — was not. See
+/// `docs/proposals/recur-progress-commitment.md` §1 and §4.
+pub fn advance_recur_progress(
+    cfs_cursor: &CfsCursor,
+    progress: &mut RecurProgressStack,
+    step_record: &StepRecord,
+    replay_journal: Option<&TileReplayJournal>,
+    input_source_witness: Option<&FnInput>,
+    storage_selection_witnesses: &BTreeMap<String, SelectionWitness>,
+) {
+    let coordinates = step_record.coordinates();
+
+    if let Some((site_coordinates, iteration_index)) =
+        cfs_cursor.try_get_recur_iteration_coordinates(coordinates)
+    {
+        match cfs_cursor.try_get_item(&site_coordinates) {
+            Some(SequenceChildItem::RecurTile(_)) => {
+                let recur = replay_journal
+                    .and_then(|journal| journal.recur.as_ref())
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "Recur iteration {:?} is missing its replay-proven recur facts",
+                            step_record
+                        )
+                    });
+                if let Err(violation) = progress.advance_tile_iteration(
+                    coordinates,
+                    recur.position.iteration_index,
+                    recur.position.declared_iterations,
+                    recur.position.consumed_elements,
+                    recur.control,
+                ) {
+                    panic!(
+                        "Recur progress violation at step {:?}: {}",
+                        step_record, violation
+                    );
+                }
+            }
+            Some(SequenceChildItem::RecurSequence(_)) => {
+                // A recur sequence emits no journal; its iterations are read
+                // from trace structure. Only the boundary *start* advances the
+                // count, so an iteration is never counted twice.
+                if matches!(step_record.kind, StepKind::SequenceStart { .. }) {
+                    if let Err(violation) = progress
+                        .advance_sequence_iteration(coordinates, u64::from(iteration_index))
+                    {
+                        panic!(
+                            "Recur progress violation at step {:?}: {}",
+                            step_record, violation
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
+    } else if let Some(item) = cfs_cursor.try_get_item(coordinates) {
+        let kind = match item {
+            SequenceChildItem::RecurTile(_) => Some(RecurSiteKind::Tile),
+            SequenceChildItem::RecurSequence(_) => Some(RecurSiteKind::Sequence),
+            _ => None,
+        };
+        if let Some(kind) = kind {
+            match &step_record.kind {
+                // `Start`: open the frame with the authenticated `L`.
+                StepKind::SequenceStart { .. } => {
+                    let chunk = match item {
+                        SequenceChildItem::RecurTile(tile) => tile.chunk.unwrap_or(1),
+                        _ => 1,
+                    };
+                    let source_len = authenticated_source_len(
+                        step_record,
+                        input_source_witness,
+                        storage_selection_witnesses,
+                    );
+                    progress.push_site(coordinates.clone(), kind, chunk, source_len);
+                }
+                // `End`: the terminal rules — 5 and 7 for a tile site, S4 for a
+                // sequence site.
+                StepKind::Exec(_) => {
+                    if let Err(violation) = progress.close_site(coordinates) {
+                        panic!(
+                            "Recur progress violation at step {:?}: {}",
+                            step_record, violation
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    assert_eq!(
+        progress.commitment(),
+        step_record.recur_progress_commitment,
+        "Recur progress commitment does not match the state this step advances to: {:?}",
+        step_record,
+    );
 }

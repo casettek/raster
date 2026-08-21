@@ -139,6 +139,28 @@ fn main(personal_data: PersonalData, personal_data_bin: PersonalData, seed: u64)
     let recur_first_line = select!(String, recur_greeting.lines[0]);
     call!(concat_messages, recur_title, recur_first_line);
 
+    // A recur *sequence*: several tiles per item. Present so the
+    // `--commit`/`--audit` pipeline exercises the recur-sequence shape at all —
+    // its iterations are scopes with their own inner steps, which the
+    // recur-tile sites above never produce.
+    // The title is set by its own tile *before* the loop: a recur-sequence body
+    // is orchestration-only, so it cannot set a `SetOnce` field itself, and a
+    // `call!` nested inside a macro argument is not picked up by static
+    // discovery — it would execute and claim a coordinate the CFS never
+    // allocated.
+    let sequence_output = call!(
+        set_draft_greeting_title,
+        "Recur-sequence greeting".to_string(),
+        new!(CollectiveGreeting)
+    );
+    let sequence_greeting = call_recur_seq!(
+        sequence = decorate_lines_sequence,
+        input = address_lines.clone(),
+        output = sequence_output,
+        args = ("*".to_string(),)
+    );
+    println!("recur sequence greeting: {:?}", sequence_greeting);
+
     let recur_line_stats = call_recur!(
         tile = compute_recur_max_line_len,
         input = address_lines.clone(),

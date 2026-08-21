@@ -5,6 +5,7 @@
 mod chain;
 mod commands;
 mod program;
+mod runtime_env;
 mod utils;
 
 use clap::{Parser, ValueEnum};
@@ -177,6 +178,13 @@ enum Commands {
         #[arg(long, conflicts_with = "commit")]
         audit: Option<String>,
 
+        /// Run without authenticated storage: tile outputs are passed as plain
+        /// Rust values, nothing is hashed or stored between tiles, and no trace
+        /// is written. Faster, and not authoritative — results cannot be
+        /// committed or audited. Drafts and recur loops are not supported yet.
+        #[arg(long = "no-auth", conflicts_with_all = ["commit", "audit"])]
+        no_auth: bool,
+
         /// Read and verify trace from file (mutually exclusive with --commit)
         #[arg(long)]
         verbose: bool,
@@ -213,6 +221,13 @@ enum ChainCommand {
         /// 2..=1024); each stage is committed with this window.
         #[arg(long = "fraud-proof-window-size", default_value_t = 2)]
         fraud_proof_window_size: usize,
+
+        /// Run every stage without authenticated storage: no trace, no
+        /// per-stage `commit.bin`, and no chain-commitment. Stages still link
+        /// through their real `output.bin`, so the chain computes the same
+        /// values — it just cannot be audited. For iterating on stage logic.
+        #[arg(long = "no-auth", conflicts_with = "fraud_proof_window_size")]
+        no_auth: bool,
     },
 
     /// Verify a recorded chain's links and identities — public, no proving.
@@ -351,7 +366,8 @@ fn try_main() -> Result<()> {
             ChainCommand::Run {
                 chain,
                 fraud_proof_window_size,
-            } => chain::run(chain.as_deref(), fraud_proof_window_size),
+                no_auth,
+            } => chain::run(chain.as_deref(), fraud_proof_window_size, no_auth),
             ChainCommand::Audit {
                 chain,
                 chain_commitment,
@@ -378,6 +394,7 @@ fn try_main() -> Result<()> {
             commit,
             fraud_proof_config,
             audit,
+            no_auth,
             verbose,
             trace_format,
             features,
@@ -390,6 +407,7 @@ fn try_main() -> Result<()> {
             commit.as_deref(),
             fraud_proof_config,
             audit.as_deref(),
+            no_auth,
             verbose,
             trace_format,
             &features,
