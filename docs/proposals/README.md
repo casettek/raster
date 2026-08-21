@@ -32,7 +32,8 @@ document, and correcting it is the author's call.
 | [`carried-state-channel`](./carried-state-channel.md) | proposed 2026-08-07 — **enhancement** | — | deliberately deferred until a second component is ready |
 | [`trace-event-vocabulary`](./trace-event-vocabulary.md) | **implemented** (2026-08-13) | `RecurSequenceIterationStart`/`End`; the naming rule and vocabulary table on `TraceEvent` | — |
 | [`chain-repeat`](./chain-repeat.md) | proposed 2026-08-19 | — | whole; `[[chain.repeat]]` with an authorized trip count (literal / external / stage output), `ChainShape` in the chain commitment, `ChainFaultKind::Shape`. `while` mode (iterate-until-a-stage-says-stop) split out as future work |
-| [`unauthenticated-execution`](./unauthenticated-execution.md) | **implemented** — v1 2026-08-19, v2 2026-08-20, v3 2026-08-20 | runtime `AuthMode` (`raster-runtime/src/auth.rs`); `select!` dispatched on base provenance, so storage sources stay lazy; drafts keep field values and drop commitments; recur full; `cargo raster run --no-auth`; no trace emitted, so a trace commitment is structurally impossible; profiling refused; RAS-203a landed. v3: `cargo raster chain run --no-auth` — all-or-nothing, no chain-commitment, own runs root; plus a storage-backed base indexed by a tile-produced value, which §5.3/§5.4 left uncovered and which stage 1 of `raster-chain-inference` hit immediately. **6.6× on `hello-tiles`**, both modes value-identical end to end | typed `Schema::Partial` to remove the remaining serialize per draft op — deferred, needs a measurement on a draft-heavy program. Mixed-posture chain policy (cheap stages, on-demand per-stage commitment) still out of scope — §10 |
+| [`unauthenticated-execution`](./unauthenticated-execution.md) | **implemented** — v1 2026-08-19, v2 2026-08-20, v3 2026-08-20 | runtime `AuthMode` (`raster-runtime/src/auth.rs`); `select!` dispatched on base provenance, so storage sources stay lazy; drafts keep field values and drop commitments; recur full; `cargo raster run --no-auth`; no trace emitted, so a trace commitment is structurally impossible; profiling refused; RAS-203a landed. v3: `cargo raster chain run --no-auth` — all-or-nothing, no chain-commitment, own runs root; plus a storage-backed base indexed by a tile-produced value, which §5.3/§5.4 left uncovered and which stage 1 of `raster-chain-inference` hit immediately. **6.6× on `hello-tiles`**, both modes value-identical end to end | typed `Schema::Partial` to remove the remaining serialize per draft op — deferred, needs a measurement on a draft-heavy program. Mixed-posture chain policy (on-demand per-stage commitment) still out of scope — §10; the cheap-stage half of §10 is now [`chain-stage-execution`](./chain-stage-execution.md) |
+| [`chain-stage-execution`](./chain-stage-execution.md) | **partly implemented** (2026-08-21) | §2–§4: `cargo raster chain run --no-auth --stage <name> [--run <dir>]` — one stage re-run in place, producer commitments rehydrated from `output.bin` via the existing `collect_output`, downstream stage dirs invalidated in spec order, `latest` pointer, spec-validity (`from` ordering) check moved ahead of execution. Authenticated path untouched | §1 — promoting the mode from `--no-auth` to a command, and the `chains-dry/` rename. **Blocked on naming**: `dry-run` reverses `unauthenticated-execution` §Naming *and* takes the term `zkvm-dry-run` §3 reserves; `unauth` costs one line and no collision. Also unverified end-to-end on a multi-stage chain — no such fixture exists in this repo (`program-chain` implementation order step 5 was never done) |
 
 ## Dependencies
 
@@ -78,8 +79,10 @@ unauthenticated-execution ····► incremental-draft-witness (impl) + lazy-li
         ├── proposes RAS-203a into authoring-skill-and-tooling (half landed)
         ├── suspends, in this mode only, the authorized-index rule from
         │   dynamic-index-selection (impl)
-        └····► a future chain proposal: cheap stages + on-demand per-stage
-               commitment, over program-chain (partial) / chain-fraud-proof (impl)
+        ├····► chain-stage-execution (proposed) — the cheap-stage half of §10:
+        │      per-stage re-execution, unattested only, over program-chain (partial)
+        └····► still unwritten: on-demand per-stage commitment for a contested
+               stage, and what a mixed-posture chain commitment means — §10
 ```
 
 `──►` blocking. `····►` recommended, not blocking.
