@@ -1,0 +1,10 @@
+error[E0080]: evaluation panicked: select! byte range is not page-aligned
+  --> tests/ui/select_unaligned_byte_range.rs:14:15
+   |
+14 |   const _: () = assert!(
+   |  _______________^
+15 | |     1u64 % <Bytes<4> as PageSized>::PAGE_SIZE == 0
+16 | |         && 5u64 % <Bytes<4> as PageSized>::PAGE_SIZE == 0,
+17 | |     "select! byte range is not page-aligned"
+18 | | );
+   | |_^ evaluation of `_` failed here

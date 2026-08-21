@@ -1,6 +1,7 @@
 # Proposal: `lazy-list-recur` — an authenticated cursor for iterating a stored list
 
-Status: proposed 2026-08-05, revised 2026-08-05 (revision 2)
+Status: proposed 2026-08-05, revised 2026-08-05 (revision 2);
+**mostly implemented 2026-08-13/14 — see [Outstanding at implementation](#outstanding-at-implementation)**
 
 Related:
 - [`bounded-collections.md`](./bounded-collections.md) — established that a `List<T>` is
@@ -11,6 +12,12 @@ Related:
   end-to-end sound until the selection-to-replay binding below lands. Three gates, not one.
 - [`dynamic-index-selection.md`](./dynamic-index-selection.md) — per-item `AuthRef`s and the
   citations they carry are unchanged; §4 explains why materialization must stop dropping them.
+- [`recur-progress-commitment.md`](./recur-progress-commitment.md) — **§5 depends on this.**
+  §5 defines the per-iteration facts and the completeness rules; it does not define the carrier
+  the rules accumulate in. A fraud-proof window verifies one step at a time, so a window that
+  does not contain iteration 0 must start from state it cannot derive — and the prover chooses
+  where windows open. That proposal supplies the per-step commitment that makes the starting
+  state checkable rather than inherited. The two land together.
 - **Storage-selection-to-replay binding** — the generic gate `paged-bytes.md` §3.3 records.
   Per-item authorization (§4) is incomplete without it: rules 1–3 prove an item was selected,
   the replay journal proves the tile ran on *something*, and only that equality joins them.
@@ -823,20 +830,44 @@ iteration", which reads as covering the last row.
 **Not** changed: the `.rindex` format (metadata is derived from existing Merkle levels), the
 proof-step enum, the selector-segment enum, `verify_bound_index_bindings`.
 
+**Phase 5's companion adds to this table, and its revision 2 adds more than revision 1 costed.**
+`recur-progress-commitment.md` touches `raster-core/src/recur_progress.rs` (new),
+`raster-core/src/trace.rs`, `raster-core/src/transition.rs`,
+`raster-runtime/src/tracing/recorder.rs`, `guests/transition/src/fraud_proof.rs`, and window
+assembly in `raster-prover` / `raster-cli` — its own Modules-touched table is authoritative. Its
+blast radius is the larger of the two: the **trace encoding** changes, so fingerprints move, not
+only image ids.
+
+Its revision 2 raised that further, after revision 1 was implemented and found unimplementable:
+the recorder cannot compute the commitment from `RecurExecutionState` alone, so the trace also
+gains a `recur_control` bit on `FnCallRecord` and a site `Start`/`End` pair replacing the single
+trailing `RecurTileExec` / `RecurSequenceExec`. That last one is not bookkeeping — a recur site's
+event is emitted *after* its iterations today, so there is no point at which an authenticated `L`
+can be pushed before iteration 0. See that proposal's §3.2.
+
 **Image ids do move**, for two independent reasons: `parse_subtree_root` is shared parsing
 compiled into every guest, and `TileReplayJournal`'s encoding changes. Revision 1 claimed
-otherwise; that was true only while the bound stayed unauthenticated. `paged-bytes` breaks
-identity for the same class of reason, so sequencing the three together makes it one migration
-rather than three.
+otherwise; that was true only while the bound stayed unauthenticated.
+
+**`paged-bytes` does not ride along.** It breaks identity for the same class of reason — its own
+`parse_subtree_root` arm for `0x0B` — so co-sequencing the two would make one migration rather
+than two. That is not the recorded plan: `paged-bytes` §9.0 has this proposal shipping first, on
+its own peak-RSS benchmark, and `docs/proposals/README.md` records `paged-bytes` as blocked
+behind it. Identity therefore breaks twice, deliberately. What makes the second break cheap is
+the central tag table in §1: `0x0B` is already reserved, so `paged-bytes` adds an arm rather than
+renegotiating the space.
 
 Because any later journal field is another such break, §5's journal shape is defined in full
 now. `consumed_elements` is needed from day one anyway: chunking is not a later phase (§6).
 
 ## Phasing
 
-**All five phases ship together.** They are ordered for implementation and review, not for
-release: §6 explains why stopping after any of them leaves chunked recur broken, and phases 3
-and 4 remove the two escape hatches it currently relies on.
+**All six phases ship together, and phase 5 ships with
+[`recur-progress-commitment.md`](./recur-progress-commitment.md)** — see Related above: §5
+defines the per-iteration facts and the rules, that proposal defines the carrier the rules
+accumulate in, and neither binds anything alone. The phases are ordered for implementation and
+review, not for release: §6 explains why stopping after any of them leaves chunked recur broken,
+and phases 3 and 4 remove the two escape hatches it currently relies on.
 
 1. Compact authenticated list metadata: payload, `parse_subtree_root` arm, runtime emitter.
 2. Recur tracing consumes metadata instead of resolving the source. **Peak memory moves here.**
@@ -848,10 +879,15 @@ and 4 remove the two escape hatches it currently relies on.
    binding and its citations recorded on each iteration's step.
 5. `TileReplayJournal` gains `recur: Option<RecurTileReplay>`; wrapper fills it;
    recur-tile completeness rules 1–8 and recur-sequence rules S1–S5;
-   `chunking::iteration_chunk_len` and `leading_varint` deleted.
+   `chunking::iteration_chunk_len` and `leading_varint` deleted. **Plus the whole of
+   `recur-progress-commitment`** — `RecurProgressStack`, the per-step
+   `recur_progress_commitment`, and the `Transition` / `TransitionInput` carriers. Without it the
+   rules in this phase bind only in a window that happens to contain iteration 0, and the prover
+   picks the window.
 6. **Update the skill** — see below. Not optional bookkeeping: the skill is what authors and
    agents read, and it currently frames the raster-source requirement as a performance rule.
-`paged-bytes` needs all five: 1–4 to sweep at all, 5 to claim the sweep covered the region.
+`paged-bytes` needs phases 1–5: 1–4 to sweep at all, 5 (with its companion) to claim the sweep
+covered the region.
 
 ## SKILL.md updates
 
@@ -974,6 +1010,66 @@ Leaving it describing the old behaviour is how a rule becomes folklore.
   raster payload (`storage.rs:1004`).
 - Existing recur suites green: element, state, output, chunked, recur sequences, early `Break`,
   empty input.
+
+## Outstanding at implementation
+
+Phases 1–6 landed 2026-08-13/14, and `recur-progress-commitment` revision 2 landed with them, so
+§5's rules are now enforced rather than merely written. What follows is what an audit against
+§Verification found **still missing** — recorded here rather than in a tracker so the next reader
+finds it beside the rule it belongs to.
+
+The split matters: one item is a **missing check**, the rest are **missing evidence**. The
+engineering is essentially complete; the evidence the proposal asks for is not.
+
+### Missing check
+
+- **Rule 8 is not implemented.** There is no `ListRange` reference anywhere in
+  `guests/transition/src/checks/`. Rules 1–7 are enforced through
+  `raster-core/src/recur_progress.rs` (`advance_tile_iteration` covers 1–4 and 6, `close_site`
+  covers 5 and 7), but nothing cross-checks a chunked iteration's **range selection** against its
+  journal: `ListRange.len == L`, `ListRange.start == covered_before`, payload element count
+  `k == consumed_elements`.
+
+  This is not a redundant belt: §6 is explicit that the journal is *"a binding, not an
+  authority"*, so on its own `consumed_elements` is a value the guest committed having seen in its
+  input. Rule 8 is what makes chunked coverage rest on a folded proof the prover cannot choose
+  freely, and what closes the second path to `L` back onto §1's metadata. **Chunked recur's
+  completeness currently leans on the journal alone.**
+
+- **S2 is not enforced.** `advance_sequence_iteration` fires only on `StepKind::SequenceStart`, so
+  an iteration's `End` boundary event is never paired with its `Start`. S1, S3 and S4 are covered
+  (`push_site`, the contiguity check, and `close_site`'s `count == L`); S5 holds structurally by
+  coordinates.
+
+### Missing evidence
+
+- **The peak-RSS benchmark was never run**, and §Verification names it as *"the acceptance
+  criterion, since the claim is a change of asymptotic class."* What exists instead are
+  zero-whole-source-resolve counters (`call_recur_never_materializes_its_source`,
+  `recur_sequence_never_materializes_its_source`), which prove the *mechanism* changed but not the
+  asymptotic claim that was supposed to decide acceptance.
+- The **"exactly one element resolved per iteration"** materialization counter — the counters
+  that exist assert *zero whole-source* resolves, which is a different statement.
+- The **`select_range` proof matrix**: one case is written
+  (`raster_index_selects_a_range_into_a_verifiable_slice_proof`); the proposal asks for six —
+  start, middle, end, short final chunk, `chunk > L`, and `L` an exact multiple of `chunk`.
+- The **postcard-source migration pair**: `call_recur!` over `encoding = "postcard"` failing at
+  `open` with the re-encode message, and the same data re-imported as raster sweeping correctly.
+  The error path exists; nothing tests it.
+- **Every internal source opens `Indexed`** — a tile output, a finalized draft and a
+  `store_value` result each sweeping without error.
+- The **`[A, B, C]` substitution**, which should be present and *marked known-accepted* rather
+  than absent, since "a missing test reads as coverage" (§Verification).
+
+### Still true of the claim table
+
+The last row of §"What this proposal proves, and what it does not" — *each tile consumed the value
+at the index it claims* — remains **not proved**. The storage-selection-to-replay binding
+(`paged-bytes` §3.3) was never in scope here and is owned by no proposal.
+
+Separately, `window-seed-reconstruction.md` records a completeness gap inherited from the
+companion: a fraud-proof window opening *inside* a live loop is rejected, because its
+recur-progress seed is never reconstructed from the trace prefix.
 
 ## Performance
 

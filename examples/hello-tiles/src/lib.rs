@@ -158,6 +158,35 @@ pub fn build_recur_draft_greeting(
     output
 }
 
+/// Per-item work for the recur *sequence* below: an ordinary tile, so the
+/// sequence itself stays orchestration-only.
+#[tile(kind = iter)]
+pub fn decorate_address_line(line: String, marker: String) -> String {
+    format!("{} {}", marker, line)
+}
+
+/// A recur **sequence**: several tiles per item, rather than one tile per item.
+///
+/// This is the only `call_recur_seq!` in a fixture the `--commit`/`--audit`
+/// pipeline runs, and it exists for that reason. `call_recur_seq!` previously
+/// appeared only in `crates/raster/tests/`, so the transition guest's
+/// expected-coordinate chain had never run over a recur sequence — which is how
+/// a real gap in `try_get_next_coordinates` survived unnoticed (a recur-sequence
+/// iteration is a *scope* with steps at `[s][i][j]`, not a leaf like a
+/// recur-tile iteration). See `recur-progress-commitment.md` §3.2.1.
+///
+/// The body cannot inspect the item: `RecurSequenceInput` is opaque by design,
+/// so every decision lives in the tiles it calls.
+#[sequence(kind = recur)]
+pub fn decorate_lines_sequence(
+    input: RecurSequenceInput<String>,
+    output: RecurSequenceOutput<CollectiveGreeting>,
+    marker: String,
+) -> RecurSequenceOutput<CollectiveGreeting> {
+    let decorated = call!(decorate_address_line, input, marker);
+    call!(push_draft_greeting_line, decorated, output)
+}
+
 /// State returned from a state-only recur tile.
 #[derive(Clone, Debug, Deserialize, Serialize, Selectable)]
 pub struct LineLengthStats {

@@ -157,6 +157,63 @@ Write `List<T>` in data types and whole-collection selects; write `Block<T>` in
 tile signatures fed by a range select or a `chunk = N` step. Full contract:
 `references/data-and-io.md` §1 and `references/recur.md`.
 
+### Raw bytes are `Bytes<P>`; the only tile-visible window is `BytesPage`
+
+Byte data gets the same split, with the granularity on the Rust type (`select!`
+is a proc macro and cannot see a field attribute):
+
+```rust
+#[page_size = 262_144]
+pub weights: Bytes<262_144>,
+```
+
+`#[page_size = n]` must equal `Bytes<N>` — a cross-check, not a second source of
+truth. The derive emits `WEIGHTS_PAGE_SIZE`.
+
+- **`Bytes<P>`** — a paged byte region. `Selectable`, never `Materializable`.
+- **`BytesPage`** — one page, the only byte value that may cross a tile boundary.
+  It carries committed `index()` and `offset()`.
+- Sweep with `select!(List<BytesPage>, region.pages)` then `call_recur!`. Never
+  pass `Bytes` as a recur input (compile error naming `.pages`).
+- To reach a byte offset, convert it to a page index **in a tile**
+  (`call!(page_of, offset, page_size)`), then index the region with the result.
+  A binding index is already a page index. Literal indexes/ranges on `Bytes` are
+  in **bytes** and converted to page units at expansion; unaligned literals are
+  a compile error. Pass the offset to the consuming tile —
+  `local = offset - page.offset()`.
+- Never model byte data as `List<u8>` or hex in a `String`.
+- Changing `#[page_size]` / `Bytes<N>` changes `program_commitment` via
+  `InterfaceDecl.schema_hash`. Re-import the artifact.
+
+**A page is the replay unit, so `page_size` is the single knob that sets tile
+cost.** Pick it in this order — the first constraint is not negotiable, the
+second is a budget:
+
+1. **A multiple of your record stride**, so no record straddles a page. A
+   straddling record forces loop-carried stitching state in every tile and makes
+   the last page a special case. Get this wrong and no amount of tuning helps.
+2. **Then the largest page that stays under your per-replay cycle budget.**
+   Roughly `cycles ≈ page_size × (per-byte work + ~1.1 for the input-commitment
+   hash)` — SHA-256 runs ~1.06 cycles/byte with the risc0 accelerator, and it is
+   charged on *every* replay. Bigger pages amortize the fixed per-replay
+   overhead, so go as large as the budget allows.
+
+Why the vocabulary is worth obeying, for a 1 GiB region at 256 KiB pages:
+
+| | `List<u8>` | hex in a `String` | **`Bytes<P>`** |
+| --- | --- | --- | --- |
+| `.rindex` | ~120 GB — **infeasible** | ~460 KB | ~460 KB |
+| tile input per page | — | 512 KiB | **256 KiB** |
+| decode cycles per page | — | ~2.6–5.2 M | **0** |
+
+Hex decode is the term that carries the difference; `List<u8>` does not merely
+cost more, it cannot be built (one index node and one Merkle leaf per byte).
+Cycle figures are order-of-magnitude — **measure before quoting them**.
+
+Measure with `--features profiling`: `TileProfileRecord.input_bytes` is the
+replay unit size, and `output_bytes` catches the other half of the budget (see
+`references/data-and-io.md` §7).
+
 ## 3. Tiles — all computation, always written for the zkVM
 
 A tile's unit of existence is a **RISC0 replay**: postcard input bytes in,
@@ -401,6 +458,11 @@ Never loop in a sequence. To process a list, pick from this decision tree:
 | early stop | state+output step returning `RecurControl` (`Continue`/`Break`) |
 | step should see N elements at a time | add `chunk = N` (step takes `RecurInput<Block<T>>`) |
 | several tiles per element | `#[sequence(kind = recur)]` + `call_recur_seq!` |
+| sweep a byte region | `call_recur!` with `input = select!(List<BytesPage>, region.pages)` |
+| several pages per replay unit | `chunk = N` (step takes `RecurInput<Block<BytesPage>>`) |
+| the page at a computed byte offset | `call!(page_of, offset, page_size)` then `select!(BytesPage, region[page_idx])` |
+| whole `Bytes` into one tile | **NEVER** (compile error — not `Materializable`) |
+| recur driven by byte ranges | **NEVER** — page count wobbles and fails the chunk rules |
 | whole `List<T>` into one tile | **NEVER** (a compile error — `List` is not `Materializable`) |
 
 **Placement is not negotiable** — each recur slot has a fixed role:
@@ -420,17 +482,23 @@ Never loop in a sequence. To process a list, pick from this decision tree:
   it. A field derivable from another field of the same input is not data.
   Full dissection and the sanctioned alternatives: `references/recur.md`
   §2, "the committed counter list".
-- `input` **must come from a raster-encoded source.** A recur reaches its items
-  one at a time through the source's raster index. A postcard-encoded external
-  has no index, so the runtime deserializes the whole collection before the
-  first iteration — `O(list)` host memory for a loop that touches one item at a
-  time. Declare large iterable inputs with `index_path` + `encoding = "raster"`;
-  `examples/hello-tiles/bin/gen_input.rs` shows the pattern, keeping a postcard
-  input for scalar `select!`s and a raster one for the sweeps. Internally stored
-  values (tile outputs, finalized drafts) always carry a raster index, so only
-  **external** inputs need the declaration. Today this is a performance rule;
-  when `docs/proposals/lazy-list-recur.md` lands it becomes an error at the
-  `call_recur!` site.
+- `input` **must come from a raster-encoded source.** This is an error, not a
+  tuning knob: a recur reaches its items one at a time through the source's
+  raster index, and a postcard external has no index, so `rows[i]` cannot be
+  located without decoding everything before it. Opening a recur over one fails
+  with
+
+  ```text
+  call_recur! requires a raster-indexed List source;
+  re-encode this input with encoding = "raster"
+  ```
+
+  Declare iterable inputs with `index_path` + `encoding = "raster"`;
+  `examples/hello-tiles/bin/gen_input.rs` shows the pattern. Internally stored
+  values (tile outputs, finalized drafts, `store_value` results) always carry a
+  raster index, so only **external** inputs need the declaration. The source is
+  never materialized: the loop bound comes from an authenticated 41-byte
+  metadata selection and each item from its own indexed read.
 - `state` — a tiny loop-carried value (counters, running max, a small
   accumulator struct). It is re-committed on **every** iteration, so it must
   stay scalar-small; anything that *grows* belongs in `output` (append-only
@@ -522,7 +590,22 @@ termination, recur sequences, empty-input semantics) rather than improvising.
 
 Run in order; do not skip rungs. `cargo build` passing means nothing yet.
 
+**Rung 0 is not authoritative.** A plain `cargo run` executes the program with
+authenticated storage off: tile outputs are passed as ordinary Rust values,
+nothing is hashed or stored between tiles, and no trace is written — so nothing
+from it can be committed or audited. It is the fastest way to iterate on
+*logic*. A result that matters must be reproduced at rung 3 or above.
+
+The two modes agree on values for any type obeying RAS-203a (postcard
+round-trip is the identity); a disagreement is a violation of that rule, not a
+quirk of the mode — see the failure table below.
+
 ```bash
+# 0. Fastest iteration — plain Rust, no storage, no trace, not authoritative.
+#    Whole surface including drafts and recur; values match rung 3, but storage
+#    bindings do not exist and nothing here can be committed. ~6x on the example.
+cargo run -- --input input.json --input-manifest input_manifest.json
+
 # 1. Both compilation postures (tiles must stay no_std-clean):
 cargo check
 cargo check -p <lib-crate> --no-default-features
@@ -532,7 +615,7 @@ cargo raster cfs && cat target/raster/cfs.json
 #    Red flag: an argument you meant as dataflow showing up as
 #    {"type": "external"} instead of seq_input/prior-output binding.
 
-# 3. Native run with committed inputs:
+# 3. Native run with committed inputs — the first authoritative rung:
 cargo raster run --input input.json --input-manifest input_manifest.json
 
 # 4. Commit/audit round-trip (the real verifiability test):
@@ -558,9 +641,14 @@ If any rung fails, map the failure back to a rule before touching code:
 | "requires a selectable storage list source" | `call_recur!` input not storage-backed (§7) |
 | set-once / finalize failure | draft reuse, double-set, or empty recur input (§6, §7) |
 | audit divergence with clean native run | nondeterminism in a tile (§3) |
+| rung 0 and rung 3 disagree on a value | a tile type whose postcard round-trip is not the identity — usually a `#[serde(skip)]` field, which authenticated mode clears between tiles and rung 0 carries through (RAS-203a) |
 | ProgramEnd error on return | `main` returning a non-storage-backed value (§8) |
 | run is unexpectedly slow / heavy | unnecessary materialization: whole-object selections, oversized tile outputs (§2) |
-| recur over a large input peaks at whole-collection memory | recur source is a postcard external — re-declare it with `index_path` + `encoding = "raster"` (§7) |
+| `call_recur! requires a raster-indexed List source` | recur source is a postcard external — re-declare it with `index_path` + `encoding = "raster"` (§7) |
+| `.rindex` far larger than the data file | byte data modelled as `List<u8>` instead of `Bytes<P>` (§2) |
+| "artifact page size does not match declared `Bytes<N>`" at load | artifact written with a different `#[page_size]` — regenerate the fixture (§2) |
+| recur over pages fails `check_previous_chunk_was_full` | recur driven by byte ranges; page count wobbles by alignment — sweep `.pages` instead (§2, `references/recur.md` §1) |
+| tile aborts on `page is not i32-aligned` / spans two pages | `page_size` is not a multiple of the record stride (§2) |
 
 A green ladder is necessary, not sufficient: model violations that keep the
 mechanics intact — a fake recur, a committed counter list, computation hidden

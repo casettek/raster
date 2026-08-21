@@ -53,7 +53,14 @@ Rules:
   `.clone()` on the source binding.
 - **Target-type vocabulary:** a whole-collection select names `List<T>`; a
   range `[a..b]` select names `Block<T>`. The macro rejects a `Block` target
-  without a range and a range target that isn't `Block`.
+  without a range and a range target that isn't `Block`. Byte regions are
+  `Bytes<P>`; a page select names `BytesPage` (with an index) and a covering
+  byte range names `Block<BytesPage>`. Literal indexes on `Bytes` are in bytes
+  and must be page-aligned; binding indexes are already page indexes.
+- **Paged fixtures:** write with `Bytes::<N>::paged(bytes)` (or
+  `Bytes::<{ Type::FIELD_PAGE_SIZE }>::paged(bytes)`). Prefer `mmap` for large
+  regions. Changing `N` / `#[page_size]` is both an artifact regeneration and
+  an identity change (`InterfaceDecl.schema_hash`).
 - **Derive `Selectable`/`Serialize`/`Deserialize`; never hand-write them.** The
   derive is what makes the host's selector path and the guest's decode agree on
   the same bytes; a manual impl (or a manual `Default`/`Ord`/`PartialEq` a tile
@@ -123,6 +130,14 @@ entry arguments. Each is resolved lazily, by parameter name, from two files:
   declared Rust type (or raster-encoded data with an `.rindex`, which is
   self-describing and also supports cross-process selection in the
   commit/audit pipeline; postcard entries are limited to in-process use).
+- **Any input a `call_recur!` / `call_recur_seq!` sweeps must be raster-encoded**
+  — `index_path` + `encoding = "raster"` in the manifest. This is a hard
+  requirement, not a performance preference: postcard is sequential and carries
+  no index, so `rows[i]` cannot be located without decoding everything before
+  it, and opening a recur over one fails at the call site. `--commit`/`--audit`
+  already imposes the same constraint on *every* argument it must build a
+  selection witness for, so raster encoding is the safe default for anything
+  larger than a scalar.
 
 **`input_manifest.json` (public — commitments):** one entry per argument name.
 For postcard-encoded arguments used with `select!`, the commitment is the
@@ -291,3 +306,90 @@ cargo raster program --verify   # recompute from source, check against Raster.lo
 - In chain projects, member stages carry their own `Raster.lock` (no
   per-member `Raster.toml` needed); `chain audit`'s identity ✓ per stage
   depends on those locks being committed and current.
+
+## 7. Byte regions — `Bytes<P>` and `BytesPage`
+
+### The tile-side contract
+
+A tile never receives a `Bytes<P>` region; it receives one `BytesPage`, or a
+`Block<BytesPage>` under `chunk = N`. What a page gives you:
+
+| on a `BytesPage` | |
+| --- | --- |
+| `page.offset()` | global byte offset of the page start — committed, audited `== index × page_size` |
+| `page.index()` | page number — committed |
+| `page.as_slice()` | the bytes; `page_size` long **except on the last page** |
+| `page.len()` | actual length — assert your element alignment, never assume it |
+| the offset you *asked for* | **not on the page** — it arrives as its own authorized tile argument |
+| mutation | none: no `DerefMut`, no public constructor |
+| `Debug` | prints `{ index, offset, len }`, never the payload |
+
+Two rules follow, and both are load-bearing:
+
+```rust
+#[tile(kind = recur, description = "Accumulate one page", estimated_cycles = 1_200_000)]
+pub fn accumulate_page(input: RecurInput<BytesPage>, state: Accum) -> Accum {
+    let page = input.into_value();
+    let bytes = page.as_slice();
+    // 1. `len` is input, not a constant. The final page is short.
+    assert!(bytes.len() % 4 == 0, "page is not i32-aligned");
+
+    let mut state = state;
+    for word in bytes.chunks_exact(4) {
+        state.sum += i64::from(i32::from_le_bytes(word.try_into().unwrap()));
+    }
+    state
+}
+
+#[tile(description = "Apply one layer", estimated_cycles = 900_000)]
+pub fn apply_layer(page: BytesPage, start: u64, len: u64) -> LayerOut {
+    // 2. Position inside the page is `start - page.offset()`. `start` is passed
+    //    alongside because a page's Merkle leaf must be stable regardless of
+    //    which byte was asked for — putting the request in the page value would
+    //    change its root.
+    let local = (start - page.offset()) as usize;
+    assert!(local + len as usize <= page.len(), "layer spans more than one page");
+    /* ... */
+    LayerOut::default()
+}
+```
+
+**Pagination is visible in the tile no matter how the sequence is written.**
+Hiding it in the selector changes the sequence's spelling, not the tile's
+arithmetic.
+
+### Sizing `page_size`
+
+Stride first, then budget — see SKILL.md §2 for the formula and the comparison
+against `List<u8>` / hex. Two more rules:
+
+- **Keep record offsets page-aligned at import.** It costs nothing in the
+  fixture generator and turns a runtime abort ("spans more than one page") into
+  an import-time invariant.
+- **Compute addresses from committed headers, never on the host.** A layer table
+  *inside* the artifact, cited via `BoundIndex`, keeps the address in the
+  authorization chain. A host-computed offset surfaces as `external`/`Inline` in
+  `cfs.json` — it is not authorized, and the audit will say so.
+
+### Measuring, so sizing is not guesswork
+
+Build with `--features profiling` and read `TileProfileRecord`:
+
+| field | what it tells you |
+| --- | --- |
+| `input_bytes` | **the replay unit size** — the number `page_size` controls, and what the input-commitment hash is charged on |
+| `output_bytes` | the other half of the budget; a large per-iteration output is the usual cause of a slow sweep |
+| `user_duration_ns` vs `raster_overhead_ns` | whether you are paying for work or for framing — small pages mean more replays, so fixed overhead dominates |
+
+Sweep a page-size candidate, read `input_bytes`, confirm it equals your declared
+`page_size` on every iteration but the last, and check `user_duration_ns` is
+still the dominant term. If overhead dominates, the page is too small.
+
+### Host memory
+
+- Give a large region its own external input with `load_preference: "mmap"`.
+  Mapping does not allocate; a page selection is one slice plus one copy.
+- Selecting **`.pages` then one page at a time** keeps host memory at
+  `O(page + witness)`. Selecting the region whole (`select!(Bytes<P>, …)`) walks
+  every page node into RAM — that spelling is for holding a reference, not for
+  reading.

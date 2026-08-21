@@ -258,6 +258,7 @@ mod tests {
                 name: "test".to_string(),
                 root_path: PathBuf::from("/test"),
                 functions: vec![],
+                structs: vec![],
             },
             root_dir: PathBuf::from("/test"),
             output_dir: PathBuf::from("/test/target/raster"),

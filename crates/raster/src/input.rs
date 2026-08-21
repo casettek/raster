@@ -7,14 +7,18 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 #[cfg(not(feature = "std"))]
 use alloc::format;
-pub use raster_core::collections::{Block, List, Materializable};
+pub use raster_core::collections::{
+    bytes_field_key, page_index_for_field, page_index_for_region, page_range_for_field,
+    page_range_for_region, Block, Bytes, BytesFieldPageSize, BytesPage, List, Materializable,
+    PageSized,
+};
 use raster_core::draft::{draft_value_from_serialize, DraftOp};
 use raster_core::draft::{replay_handle_for_schema, DraftReplayHandle, DraftReplayTransition};
 pub use raster_core::input::{
     verify_selection_proof, AuthValue, ExternalEncoding, IndexWidth, ListProofDirection,
     ListProofSibling, Op, Schema, SchemaField, SchemaFieldMode, SchemaNode, Selectable,
-    SelectedPayload, SelectionCommitment, SelectionProof, SelectionProofStep, SelectionWitness,
-    SelectorPath, SelectorSegment, StorageRef, StorageValue,
+    SelectedPayload, SelectionCommitment, SelectionPayloadKind, SelectionProof,
+    SelectionProofStep, SelectionWitness, SelectorPath, SelectorSegment, StorageRef, StorageValue,
 };
 use raster_core::trace::{FnInputValue, StorageData as TraceStorageData};
 
@@ -385,6 +389,24 @@ impl<T> From<T> for RecurState<T> {
     }
 }
 
+impl<T> From<AuthRef<T>> for RecurState<T>
+where
+    T: DeserializeOwned + Serialize,
+{
+    fn from(value: AuthRef<T>) -> Self {
+        Self::new(
+            into_auth_value::<T, _>(value)
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "Failed to materialize recursive state from tile output: {}",
+                        error
+                    )
+                })
+                .into_inner(),
+        )
+    }
+}
+
 impl<T> core::ops::Deref for RecurState<T> {
     type Target = T;
 
@@ -649,6 +671,15 @@ pub fn begin_draft_transition_capture<S>(
 where
     S: Schema,
 {
+    // The witness exists to let a guest replay one draft step. An
+    // unauthenticated run produces no trace for it to live in, so returning
+    // `None` here disables it end to end: the tile macro threads this through
+    // `Option::and_then`, so `finish_draft_transition_capture` is skipped with
+    // no codegen change. See `docs/proposals/unauthenticated-execution.md` §7.
+    if !crate::auth_mode().is_authenticated() {
+        return None;
+    }
+
     Some(
         raster_runtime::begin_draft_step_capture::<S>(draft.anchor(), draft.current_root())
             .unwrap_or_else(|error| {
@@ -970,6 +1001,28 @@ pub trait IntoAuthRef<Current> {
     fn into_auth_ref(self) -> AuthRef<Current>;
 }
 
+/// Bound on a `call_recur!` source. The note names `.pages` so `select!(Bytes, …)`
+/// as a sweep input is a compile error with a useful diagnostic.
+#[cfg_attr(
+    not(doc),
+    diagnostic::on_unimplemented(
+        message = "call_recur! input must be a `List<T>`",
+        label = "not a page list",
+        note = "to sweep a `Bytes` region, select its pages: `select!(List<BytesPage>, region.pages)`"
+    )
+)]
+pub trait RecurListSource<E>: IntoAuthRef<List<E>> {}
+
+impl<T, E> RecurListSource<E> for T where T: IntoAuthRef<List<E>> {}
+
+impl<T: PageSized> PageSized for AuthRef<T> {
+    const PAGE_SIZE: u64 = T::PAGE_SIZE;
+}
+
+impl<T: BytesFieldPageSize<FIELD>, const FIELD: u64> BytesFieldPageSize<FIELD> for AuthRef<T> {
+    const PAGE_SIZE: u64 = T::PAGE_SIZE;
+}
+
 pub trait SelectSource {
     type Root;
     type Current;
@@ -1087,6 +1140,104 @@ where
     source.select(selector)
 }
 
+/// A `select!` base, seen by the unauthenticated arm.
+///
+/// The mirror of [`SelectSource`], which the two source forms — a sequence
+/// binding and an explicit `storage!` reference — both implement. Both must
+/// implement this too, or `select!` would stop compiling for one of them the
+/// moment the unauthenticated arm exists, regardless of which arm ever runs.
+pub trait InlineSelectSource {
+    type Current;
+
+    fn select_inline_with<Selected, F>(&self, select: F) -> AuthRef<Selected>
+    where
+        F: FnOnce(&Self::Current) -> Selected;
+
+    /// Whether this base names data in storage rather than carrying it.
+    ///
+    /// `select!` dispatches on this, not on the mode: a storage-backed base
+    /// keeps composing a selector even with authentication off, so an external
+    /// input is read by indexed lookup at the tile boundary instead of being
+    /// materialized whole at every step. That is what keeps a large region
+    /// lazy — the property `lazy-list-recur` exists to protect — and what lets
+    /// `call_recur!` keep its raster-indexed source in either mode.
+    fn is_storage_backed(&self) -> bool;
+}
+
+/// Free-function form of [`InlineSelectSource::is_storage_backed`], for the
+/// `select!` expansion.
+pub fn is_storage_backed<Source: InlineSelectSource>(source: &Source) -> bool {
+    source.is_storage_backed()
+}
+
+impl<Current> InlineSelectSource for AuthRef<Current> {
+    type Current = Current;
+
+    fn is_storage_backed(&self) -> bool {
+        matches!(self, AuthRef::Storage(_))
+    }
+
+    fn select_inline_with<Selected, F>(&self, select: F) -> AuthRef<Selected>
+    where
+        F: FnOnce(&Current) -> Selected,
+    {
+        match self {
+            AuthRef::Inline(value) => AuthRef::Inline(select(value)),
+            // Unreachable through `select!`, which now sends a storage-backed
+            // base down the selector arm instead (see `is_storage_backed`).
+            // Kept correct rather than a panic because the trait is public and
+            // a direct caller can still land here; resolving is the honest
+            // answer, at the cost of materializing the parent.
+            AuthRef::Storage(binding) => {
+                let resolved = (binding.resolve.as_ref())(binding.reference.clone())
+                    .unwrap_or_else(|error| {
+                        panic!("Failed to resolve external input for select!: {}", error)
+                    });
+                AuthRef::Inline(select(&resolved.value))
+            }
+        }
+    }
+}
+
+impl<Root> InlineSelectSource for TypedStorageBinding<Root>
+where
+    Root: DeserializeOwned + Serialize,
+{
+    type Current = Root;
+
+    /// Always. `storage!(T, reference)` names a storage coordinate outright.
+    fn is_storage_backed(&self) -> bool {
+        true
+    }
+
+    fn select_inline_with<Selected, F>(&self, select: F) -> AuthRef<Selected>
+    where
+        F: FnOnce(&Root) -> Selected,
+    {
+        // As above: `select!` routes this to the selector arm, so this is a
+        // direct-caller path only.
+        let resolved = (self.resolve)(self.reference.clone()).unwrap_or_else(|error| {
+            panic!("Failed to resolve storage! binding for select!: {}", error)
+        });
+        AuthRef::Inline(select(&resolved.value))
+    }
+}
+
+/// Apply a `select!` path as a plain Rust field access.
+///
+/// The unauthenticated counterpart of [`select_source`]. `select!` knows the
+/// path structurally at expansion time, so the accessor arrives here already
+/// lowered to real field and index expressions — nothing walks a
+/// [`SelectorPath`] at runtime, and a sequence binding is never serialized. See
+/// `docs/proposals/unauthenticated-execution.md` §5.1.
+pub fn select_inline<Source, Selected, F>(source: &Source, select: F) -> AuthRef<Selected>
+where
+    Source: InlineSelectSource,
+    F: FnOnce(&Source::Current) -> Selected,
+{
+    source.select_inline_with(select)
+}
+
 /// A value that may supply a `select!` index.
 ///
 /// Implemented only for `AuthRef<T>` with `T` an unsigned integer, which is what
@@ -1111,12 +1262,39 @@ pub trait IndexSource {
     /// index, making the shared-index case (the whole reason citations are
     /// content-named and deduplicated) unwritable.
     fn resolve_index(&self) -> raster_core::Result<(u64, TraceStorageData, Vec<IndexBinding>)>;
+
+    /// The index value alone, with no binding to record.
+    ///
+    /// The unauthenticated counterpart of [`Self::resolve_index`]. There is no
+    /// lineage to preserve in that mode, so the rule this trait exists to
+    /// enforce — an index must be an authorized value — protects nothing and is
+    /// suspended. See `docs/proposals/unauthenticated-execution.md` §5.3.
+    fn inline_index(&self) -> u64;
+}
+
+/// Read a `select!` index without authorizing it. Only reachable from the
+/// unauthenticated arm of `select!`.
+pub fn inline_index<I: IndexSource>(index: &I) -> u64 {
+    index.inline_index()
 }
 
 macro_rules! impl_index_source {
     ($($ty:ty => $width:ident),* $(,)?) => {$(
         impl IndexSource for AuthRef<$ty> {
             const WIDTH: IndexWidth = IndexWidth::$width;
+
+            fn inline_index(&self) -> u64 {
+                match self {
+                    AuthRef::Inline(value) => u64::from(*value),
+                    AuthRef::Storage(binding) => {
+                        let resolved = (binding.resolve.as_ref())(binding.reference.clone())
+                            .unwrap_or_else(|error| {
+                                panic!("Failed to resolve select! index: {}", error)
+                            });
+                        u64::from(resolved.value)
+                    }
+                }
+            }
 
             fn resolve_index(
                 &self,
@@ -1189,11 +1367,27 @@ pub fn index_binding_name(data: &TraceStorageData) -> String {
 /// of a selection, which stays deferred. Panics on failure, matching how
 /// `select!` already treats an unresolvable path: a sequence body has no way to
 /// handle it, and continuing with a wrong index must not be possible.
+///
+/// Unauthenticated, the segment degrades to a plain [`SelectorSegment::Index`]
+/// and nothing is recorded. `BoundIndex` names a sibling storage binding so a
+/// verifier can establish that the index was one this execution already
+/// authorized; this mode writes no trace, so that binding has no reader and no
+/// verifier will ever run. This is the same suspension
+/// `docs/proposals/unauthenticated-execution.md` §5.3 makes for a plain integer
+/// index — reached here rather than in the accessor arm because a
+/// storage-backed base keeps selector lowering (§5.4) even when the index
+/// feeding it is a tile-produced inline value, which is the combination §5.3
+/// did not cover. A guest answers `Authenticated` unconditionally, so a
+/// replayed step cannot take this arm.
 #[doc(hidden)]
 pub fn push_bound_index<I>(sink: &mut Vec<IndexBinding>, index: &I) -> SelectorSegment
 where
     I: IndexSource,
 {
+    if !crate::auth_mode().is_authenticated() {
+        return SelectorSegment::Index(index.inline_index());
+    }
+
     let (value, data, inherited) = index
         .resolve_index()
         .unwrap_or_else(|error| panic!("Failed to resolve select! index: {}", error));
@@ -1258,98 +1452,236 @@ where
     raster_core::postcard::to_allocvec(&draft_trace_marker::<S>()).unwrap_or_default()
 }
 
-/// A recursive-sequence list source resolved exactly once.
+/// Produce an owned copy of a value through its postcard encoding.
 ///
-/// The parent list value is cached behind an `Rc` so that counting the list
-/// and selecting each item are O(1) on the source: per-item `AuthRef`s select
-/// out of this cached value rather than re-resolving the whole parent list.
+/// Used by the inline [`ListCursor`] to hand out an item without requiring
+/// `T: Clone` on every recur element type — that bound would have to propagate
+/// through the nine `run_recur_*` signatures and out to `call_recur!`, breaking
+/// programs whose element types are not `Clone`. It is not extra cost relative
+/// to the storage path, which deserializes a fresh value per item anyway; it is
+/// only a cost relative to a clone, and it is confined to a source that came
+/// from a tile in an unauthenticated run.
+fn reencode_value<T>(value: &T) -> raster_core::Result<T>
+where
+    T: Serialize + DeserializeOwned,
+{
+    let bytes = raster_core::postcard::to_allocvec(value).map_err(|error| {
+        raster_core::Error::Serialization(alloc::format!(
+            "Failed to encode inline recur item: {}",
+            error
+        ))
+    })?;
+    raster_core::postcard::from_bytes(&bytes).map_err(|error| {
+        raster_core::Error::Serialization(alloc::format!(
+            "Failed to decode inline recur item: {}",
+            error
+        ))
+    })
+}
+
+/// An authenticated cursor over a stored list, opened without reading it.
+///
+/// **Invariant: every recur source is raster-indexed, and no recur ever
+/// materializes its source whole.** There is no second backend and no
+/// materializing fallback, so there is no path that reintroduces `O(list)` —
+/// see `docs/proposals/lazy-list-recur.md` §3.
+///
+/// `len` is authenticated at [`ListCursor::open`] by the `0x0A` metadata
+/// selection, not read off the index: a nested list node's `len` is
+/// index-trusted, and trusting it is the forged-`len = 0` sweep. Items and
+/// ranges are then reached by their own selection proofs against the same
+/// committed root.
+///
+/// The parsed index is *not* held here — `RasterIndex` is private to
+/// `raster-runtime`, and the retention that matters (not re-parsing per item)
+/// belongs to the storage layer that owns it, which is where every
+/// `select_item` call lands anyway.
 #[doc(hidden)]
-enum ResolvedRecurList<T> {
+pub enum ListCursor<T> {
     Storage {
         reference: StorageRef,
-        value: Rc<StorageValue<List<T>>>,
-        /// Citations carried by the source list's own selector. Resolving the
-        /// list yields a `StorageValue`, which does not carry them, so they are
-        /// captured here — otherwise a recur over a list that was itself reached
-        /// through a bound index would emit per-item paths whose cited source
-        /// never reaches the step.
+        /// Path from `reference`'s stored root down to the list itself. Item and
+        /// range selectors extend it.
+        selector: SelectorPath,
+        len: u64,
+        /// Citations carried by the source list's own selector, inherited by every
+        /// item path. Without them a recur over a list reached through a bound
+        /// index emits per-item paths whose cited source never reaches the step,
+        /// and `verify_bound_index_bindings` rejects the selection outright.
         index_bindings: Vec<IndexBinding>,
+        marker: PhantomData<fn() -> T>,
     },
+    /// A source that is already in memory: a tile output in an unauthenticated
+    /// run. The invariant above is about never *materializing* a stored list;
+    /// here the elements already exist, so there is nothing left to keep lazy.
+    /// Only reachable with authentication off — an inline source in an
+    /// authenticated run is still rejected by [`ListCursor::open`].
+    Inline(List<T>),
 }
 
-#[doc(hidden)]
-fn resolve_recur_list_source<T>(
-    source: &AuthRef<List<T>>,
-) -> raster_core::Result<ResolvedRecurList<T>>
+impl<T> ListCursor<T>
 where
-    T: DeserializeOwned + Serialize,
+    T: DeserializeOwned + Serialize + Selectable + 'static,
 {
-    match source {
-        AuthRef::Inline(_) => Err(raster_core::Error::Other(
-            "call_recur! requires a selectable storage list source".into(),
-        )),
-        AuthRef::Storage(binding) => {
-            let value = (binding.resolve.as_ref())(binding.reference.clone())?;
-            Ok(ResolvedRecurList::Storage {
-                reference: binding.reference.clone(),
-                value: Rc::new(value),
-                index_bindings: binding.index_bindings.clone(),
-            })
-        }
-    }
-}
-
-impl<T> ResolvedRecurList<T> {
-    fn len(&self) -> u64 {
-        match self {
-            ResolvedRecurList::Storage { value, .. } => value.value.len() as u64,
-        }
-    }
-
-    fn select_item(&self, index: u64) -> raster_core::Result<AuthRef<T>>
-    where
-        T: DeserializeOwned + Serialize + Selectable + 'static,
-    {
-        let relative_selector = selector_path(Vec::from([SelectorSegment::Index(index)]));
-
-        match self {
-            ResolvedRecurList::Storage {
-                reference,
-                value,
-                index_bindings,
-            } => {
-                let parent = value.clone();
-                let mut item_selector = parent.selector.clone();
-                item_selector
-                    .segments
-                    .extend(relative_selector.segments.iter().cloned());
-                let resolve_selector = item_selector.clone();
-
-                Ok(AuthRef::Storage(DeferredAuthStorage {
-                    reference: reference.clone(),
-                    selector: item_selector,
-                    // A recur item's index is the loop counter, whose provenance
-                    // is structural (the CFS pins the driver) — it emits a plain
-                    // `Index` and cites nothing. Any citation already on the
-                    // list binding is inherited.
-                    index_bindings: index_bindings.clone(),
-                    resolve: Rc::new(move |_| {
-                        if let Ok(selected) =
-                            select_stored_value::<T>(&parent.reference, &resolve_selector)
-                        {
-                            return Ok(selected);
-                        }
-                        select_storage_value::<List<T>, T>(parent.as_ref(), &relative_selector)
-                    }),
-                    marker: PhantomData,
-                }))
+    /// Open a cursor over a recur source, authenticating its length.
+    ///
+    /// Refuses anything that is not a raster-indexed storage list. That is a
+    /// real restriction on existing programs and the right one: postcard is
+    /// sequential and not self-indexing, so `rows[i]` cannot be located without
+    /// decoding everything before it, and keeping a fallback would preserve
+    /// exactly the `O(list)` peak this exists to remove — on the input class
+    /// most likely to be large, since it came from a file.
+    #[cfg(feature = "std")]
+    pub fn open(source: &AuthRef<List<T>>) -> raster_core::Result<Self> {
+        let binding = match source {
+            AuthRef::Storage(binding) => binding,
+            // A tile-produced list in an unauthenticated run. The rule above
+            // exists to stop a *stored* list being pulled in whole; this one is
+            // already in memory, so refusing it would forbid the case for no
+            // benefit. Authenticated runs keep refusing it — there, an inline
+            // source means a list with no lineage.
+            AuthRef::Inline(list) => {
+                if crate::auth_mode().is_authenticated() {
+                    return Err(raster_core::Error::Other(
+                        "call_recur! requires a raster-indexed List source; \
+                         re-encode this input with encoding = \"raster\""
+                            .into(),
+                    ));
+                }
+                return Ok(Self::Inline(reencode_value(list)?));
             }
+        };
+
+        let metadata =
+            raster_runtime::stored_list_metadata(&binding.reference, &binding.selector)?;
+
+        Ok(Self::Storage {
+            reference: binding.reference.clone(),
+            selector: binding.selector.clone(),
+            len: metadata.len,
+            index_bindings: binding.index_bindings.clone(),
+            marker: PhantomData,
+        })
+    }
+
+    /// The authenticated element count. This is the `L` every completeness
+    /// rule is stated against.
+    pub fn len(&self) -> u64 {
+        match self {
+            Self::Storage { len, .. } => *len,
+            Self::Inline(list) => list.len() as u64,
         }
+    }
+
+    /// One element, as its own authenticated reference.
+    ///
+    /// Errors propagate. The previous per-item path fell back to resolving the
+    /// whole parent when an indexed read failed, which treated a malformed
+    /// index and an out-of-range selector identically to "this source has no
+    /// index" — turning a corruption signal into a multi-gigabyte allocation.
+    /// With no materializing backend there is nowhere to fall back *to*, so
+    /// every failure here is a failure.
+    pub fn select_item(&self, index: u64) -> raster_core::Result<AuthRef<T>> {
+        if let Self::Inline(list) = self {
+            let item = list.as_slice().get(index as usize).ok_or_else(|| {
+                raster_core::Error::Other(alloc::format!(
+                    "recur item {} is out of range for an inline source of {}",
+                    index,
+                    list.len()
+                ))
+            })?;
+            return Ok(AuthRef::Inline(reencode_value(item)?));
+        }
+        self.select_at(SelectorSegment::Index(index))
+    }
+
+    /// A contiguous chunk, as one authenticated reference.
+    ///
+    /// The proof is a `ListRange` over the real `List<T>` — there is no
+    /// synthetic `List<Block<T>>` anywhere in the tree to prove membership in,
+    /// which is why chunking has to be a driver-level range selection rather
+    /// than a type-changing adapter (§6).
+    pub fn select_range(&self, start: u64, end: u64) -> raster_core::Result<AuthRef<Block<T>>> {
+        if let Self::Inline(list) = self {
+            let slice = list
+                .as_slice()
+                .get(start as usize..end as usize)
+                .ok_or_else(|| {
+                    raster_core::Error::Other(alloc::format!(
+                        "recur range {}..{} is out of bounds for an inline source of {}",
+                        start,
+                        end,
+                        list.len()
+                    ))
+                })?;
+            let items = slice
+                .iter()
+                .map(reencode_value)
+                .collect::<raster_core::Result<Vec<T>>>()?;
+            return Ok(AuthRef::Inline(Block::__from_selection(items)));
+        }
+        self.select_at(SelectorSegment::Range { start, end })
+    }
+
+    fn select_at<Selected>(
+        &self,
+        segment: SelectorSegment,
+    ) -> raster_core::Result<AuthRef<Selected>>
+    where
+        Selected: DeserializeOwned + Serialize + 'static,
+    {
+        let Self::Storage {
+            reference,
+            selector,
+            index_bindings,
+            ..
+        } = self
+        else {
+            // Both public callers handle the inline variant before reaching
+            // here; this arm exists so the enum match is total.
+            return Err(raster_core::Error::Other(
+                "select_at is only defined for a storage-backed recur source".into(),
+            ));
+        };
+
+        let mut item_selector = selector.clone();
+        item_selector.segments.push(segment);
+        let resolve_selector = item_selector.clone();
+
+        Ok(AuthRef::Storage(DeferredAuthStorage {
+            reference: reference.clone(),
+            selector: item_selector,
+            // A recur item's index is the loop counter, whose provenance is
+            // structural (the CFS pins the driver) — it emits a plain `Index`
+            // and cites nothing. Any citation already on the list binding is
+            // inherited.
+            index_bindings: index_bindings.clone(),
+            resolve: Rc::new(move |reference| {
+                select_stored_value::<Selected>(&reference, &resolve_selector)
+            }),
+            marker: PhantomData,
+        }))
     }
 }
 
+/// Materialize one authorized recur item into the value the tile receives,
+/// keeping the binding that authorizes it.
+///
+/// Materialization has **two** outputs. `into_auth_value(...).into_inner()`
+/// keeps the value and discards the selector, the selection commitment and any
+/// inherited citations — before the iteration's trace can record them. That is
+/// the whole of the bug `build_recur_input` embodied, and the shape here is the
+/// established one, not a new invention: `IndexSource::resolve_index` and
+/// `program_output_binding` both already return "the value, plus what
+/// authorizes it".
+///
+/// The second output is handed to the tile wrapper through a host-side stash
+/// rather than through `RecurInput`, so the replay ABI and every recur tile's
+/// image id stay exactly where they are. See
+/// [`raster_runtime::stash_recur_item_binding`].
 #[doc(hidden)]
-pub fn build_recur_input<T>(
+#[cfg(feature = "std")]
+pub fn materialize_recur_item<T>(
     item: AuthRef<T>,
     index: u64,
     len: u64,
@@ -1357,81 +1689,39 @@ pub fn build_recur_input<T>(
 where
     T: DeserializeOwned + Serialize,
 {
-    let value = into_auth_value::<T, _>(item)?.into_inner();
-    Ok(RecurInput::new(value, index, len))
+    let (auth_value, index_bindings) = into_auth_value_with_bindings::<T, _>(item)?;
+
+    if let Some(stored) = auth_value.as_storage() {
+        raster_runtime::stash_recur_item_binding(
+            TraceStorageData {
+                coordinates: stored.reference.coordinates.clone(),
+                commitment: stored.reference.commitment.clone(),
+                selector: stored.selector.clone(),
+                selection: stored.selection.clone(),
+            },
+            index_bindings,
+        );
+    }
+
+    Ok(RecurInput::new(auth_value.into_inner(), index, len))
 }
 
-fn resolve_recur_list<T>(source: &AuthRef<List<T>>) -> raster_core::Result<Vec<T>>
-where
-    T: DeserializeOwned + Serialize,
-{
-    match source {
-        AuthRef::Inline(_) => Err(raster_core::Error::Other(
-            "call_recur! requires a selectable storage list source".into(),
-        )),
-        AuthRef::Storage(binding) => {
-            let current = (binding.resolve.as_ref())(binding.reference.clone())?;
-            Ok(current.value.into_vec())
-        }
-    }
-}
-
-fn group_into_chunks<T>(items: Vec<T>, chunk: usize) -> List<Block<T>> {
-    let chunk = chunk.max(1);
-    let mut chunks: Vec<Block<T>> = Vec::with_capacity(items.len().div_ceil(chunk));
-    let mut current = Vec::with_capacity(chunk);
-    for item in items {
-        current.push(item);
-        if current.len() == chunk {
-            chunks.push(Block::__from_selection(core::mem::replace(
-                &mut current,
-                Vec::with_capacity(chunk),
-            )));
-        }
-    }
-    if !current.is_empty() {
-        chunks.push(Block::__from_selection(current));
-    }
-    List::from(chunks)
-}
-
-/// Adapt a flat list source `AuthRef<List<T>>` into a chunked source
-/// `AuthRef<List<Block<T>>>` for `call_recur! { ..., chunk = N }`.
+/// Select and materialize iteration `index`, recording what authorized it.
 ///
-/// The underlying source binding (name/selector/commitment for external,
-/// reference for internal) is preserved unchanged, so the trace still records a
-/// single authenticated binding for the whole collection. Only the resolved
-/// value is regrouped into contiguous `Block`s of `chunk` items (the final block
-/// may be shorter), turning per-element iteration into per-block iteration.
-#[doc(hidden)]
-pub fn chunk_auth_ref<T>(source: AuthRef<List<T>>, chunk: usize) -> AuthRef<List<Block<T>>>
+/// Both failures are panics rather than fallbacks. There is no materializing
+/// backend to fall back *to*, so a malformed index and an out-of-range
+/// selector are what they look like — failures — instead of a signal to
+/// resolve the whole list.
+#[cfg(feature = "std")]
+fn recur_iteration_input<T>(cursor: &ListCursor<T>, index: u64, len: u64) -> RecurInput<T>
 where
-    T: DeserializeOwned + Serialize + 'static,
+    T: DeserializeOwned + Serialize + Selectable + 'static,
 {
-    match source {
-        AuthRef::Inline(items) => AuthRef::Inline(group_into_chunks(items.into_vec(), chunk)),
-        AuthRef::Storage(binding) => {
-            let inner = binding.resolve.clone();
-            AuthRef::Storage(DeferredAuthStorage {
-                reference: binding.reference,
-                selector: binding.selector,
-                // Chunking regroups elements without touching the path, so the
-                // citations it carries survive unchanged.
-                index_bindings: binding.index_bindings,
-                resolve: Rc::new(move |reference| {
-                    let resolved = (inner.as_ref())(reference)?;
-                    Ok(StorageValue::new_with_selection(
-                        resolved.reference,
-                        resolved.bytes,
-                        resolved.selector,
-                        resolved.selection,
-                        group_into_chunks(resolved.value.into_vec(), chunk),
-                    ))
-                }),
-                marker: PhantomData,
-            })
-        }
-    }
+    let item = cursor
+        .select_item(index)
+        .unwrap_or_else(|error| panic!("Failed to select recur item {}: {}", index, error));
+    materialize_recur_item(item, index, len)
+        .unwrap_or_else(|error| panic!("Failed to materialize recur item {}: {}", index, error))
 }
 
 impl<T> IntoAuthRef<T> for T
@@ -1672,6 +1962,87 @@ where
     arg.into_auth_value_with_bindings()
 }
 
+/// Selections at or above this size are worth remembering across repeats.
+///
+/// The threshold is what keeps the memo self-limiting: an entry is only ever
+/// created by a resolution that already moved at least this many bytes, and it
+/// costs ~200. So the memo can never grow to more than a fraction of a percent
+/// of the work already done, without any eviction policy to get wrong.
+#[cfg(feature = "std")]
+const TRACE_MEMO_MIN_SELECTED_LEN: u64 = 64 * 1024;
+
+#[cfg(feature = "std")]
+std::thread_local! {
+    /// Memoizes the storage half of [`auth_ref_trace`], keyed by the
+    /// `(coordinates, commitment, selector)` triple that determines it.
+    ///
+    /// Sound because the key names immutable content: storage is append-only,
+    /// and `verify_reference` holds an object at fixed coordinates to a fixed
+    /// commitment, so the same key can only ever describe the same bytes and
+    /// therefore the same `SelectionCommitment`.
+    static THREAD_AUTH_REF_TRACE_MEMO: core::cell::RefCell<
+        alloc::collections::BTreeMap<Vec<u8>, TraceStorageData>,
+    > = core::cell::RefCell::new(alloc::collections::BTreeMap::new());
+}
+
+/// The storage half of an `AuthRef`'s trace record.
+///
+/// Split out of [`auth_ref_trace`] so that the resolution it needs — which is
+/// eager, and on a whole-collection selector reads and decodes the entire
+/// collection — happens **once per distinct binding** instead of once per
+/// call. That difference is the whole point: a `#[sequence(kind = recur)]`
+/// re-enters its wrapper for every item, and traces every parameter each time,
+/// so an un-memoized big argument is re-decoded on every iteration even when
+/// the body never touches it.
+#[cfg(feature = "std")]
+fn auth_ref_trace_storage<T>(
+    binding: &DeferredAuthStorage<T>,
+) -> raster_core::Result<TraceStorageData> {
+    let key = raster_core::postcard::to_allocvec(&(
+        &binding.reference.coordinates,
+        &binding.reference.commitment,
+        &binding.selector,
+    ))
+    .unwrap_or_default();
+
+    if !key.is_empty() {
+        if let Some(hit) =
+            THREAD_AUTH_REF_TRACE_MEMO.with(|memo| memo.borrow().get(&key).cloned())
+        {
+            return Ok(hit);
+        }
+    }
+
+    let resolved = (binding.resolve.as_ref())(binding.reference.clone())?;
+    let storage = TraceStorageData {
+        coordinates: resolved.reference.coordinates,
+        commitment: resolved.reference.commitment,
+        selector: resolved.selector,
+        selection: resolved.selection,
+    };
+
+    if !key.is_empty() && storage.selection.selected_len >= TRACE_MEMO_MIN_SELECTED_LEN {
+        THREAD_AUTH_REF_TRACE_MEMO.with(|memo| {
+            memo.borrow_mut().insert(key, storage.clone());
+        });
+    }
+
+    Ok(storage)
+}
+
+#[cfg(not(feature = "std"))]
+fn auth_ref_trace_storage<T>(
+    binding: &DeferredAuthStorage<T>,
+) -> raster_core::Result<TraceStorageData> {
+    let resolved = (binding.resolve.as_ref())(binding.reference.clone())?;
+    Ok(TraceStorageData {
+        coordinates: resolved.reference.coordinates,
+        commitment: resolved.reference.commitment,
+        selector: resolved.selector,
+        selection: resolved.selection,
+    })
+}
+
 pub fn auth_ref_trace<T>(arg: &AuthRef<T>) -> raster_core::Result<AuthRefTrace>
 where
     T: Serialize + DeserializeOwned,
@@ -1684,15 +2055,54 @@ where
             storage: None,
             index_bindings: Vec::new(),
         }),
+        AuthRef::Storage(binding) => Ok(AuthRefTrace {
+            value: FnInputValue::StorageBinding,
+            storage: Some(auth_ref_trace_storage(binding)?),
+            index_bindings: binding.index_bindings.clone(),
+        }),
+    }
+}
+
+/// Trace a recur source without resolving it.
+///
+/// [`auth_ref_trace`] exists to obtain a `SelectionCommitment`, and for a
+/// whole-list selector the payload it commits to is the entire list — so it
+/// resolves the binding, throws the value away (`resolved.value` is never
+/// read), and keeps only the commitment. On a recur source that is the
+/// earliest and largest of the three eager paths: it runs *before any runner*,
+/// so nothing downstream can be lazy.
+///
+/// This replaces it with the `0x0A` metadata selection of `lazy-list-recur.md`
+/// §1: the same coordinates, commitment, selector and citations, over a
+/// payload of 41 bytes (9 when empty) instead of the list. The bound it
+/// commits to is *more* authenticated than before, not less — the root is
+/// recomputed from `(len, elements_root)`, where previously a nested list
+/// node's `len` was only index-trusted.
+///
+/// Inline sources are refused here rather than traced: a recur source must be
+/// a selectable storage list, and `ListCursor::open` says so with the message
+/// authors are meant to act on.
+#[cfg(feature = "std")]
+pub fn recur_source_trace<T>(arg: &AuthRef<List<T>>) -> raster_core::Result<AuthRefTrace>
+where
+    T: Serialize + DeserializeOwned,
+{
+    match arg {
+        AuthRef::Inline(_) => Err(raster_core::Error::Other(
+            "call_recur! requires a raster-indexed List source; \
+             re-encode this input with encoding = \"raster\""
+                .into(),
+        )),
         AuthRef::Storage(binding) => {
-            let resolved = (binding.resolve.as_ref())(binding.reference.clone())?;
+            let metadata =
+                raster_runtime::stored_list_metadata(&binding.reference, &binding.selector)?;
             Ok(AuthRefTrace {
                 value: FnInputValue::StorageBinding,
                 storage: Some(TraceStorageData {
-                    coordinates: resolved.reference.coordinates,
-                    commitment: resolved.reference.commitment,
-                    selector: resolved.selector,
-                    selection: resolved.selection,
+                    coordinates: binding.reference.coordinates.clone(),
+                    commitment: binding.reference.commitment.clone(),
+                    selector: binding.selector.clone(),
+                    selection: metadata.selected.commitment,
                 }),
                 index_bindings: binding.index_bindings.clone(),
             })
@@ -1761,6 +2171,28 @@ pub fn end_program_output<T>(result: &AuthRef<T>)
 where
     T: Serialize + DeserializeOwned,
 {
+    // "The output must be storage-backed" is a statement about lineage, and an
+    // unauthenticated run has none to offer — `main` returns an inline value
+    // here by construction. The artifact is still written: its hash commits to
+    // the output *bytes*, which is honest in either mode, and a cheap stage
+    // that still produces one is what the chain work needs (§6.1). There is no
+    // `ProgramEnd` event because there is no trace to carry it.
+    if !crate::auth_mode().is_authenticated() {
+        let write = |value: &T| {
+            raster_runtime::write_program_output_artifact(value)
+                .unwrap_or_else(|error| panic!("Failed to write program output artifact: {}", error))
+        };
+        match result {
+            AuthRef::Inline(value) => write(value),
+            AuthRef::Storage(binding) => {
+                let resolved = (binding.resolve.as_ref())(binding.reference.clone())
+                    .unwrap_or_else(|error| panic!("Failed to resolve program output: {}", error));
+                write(&resolved.value)
+            }
+        };
+        return;
+    }
+
     let (storage, value) = program_output_binding(result)
         .unwrap_or_else(|error| panic!("Failed to resolve program output: {}", error));
     raster_runtime::write_program_output_artifact(&value)
@@ -1939,6 +2371,18 @@ where
 {
     #[cfg(feature = "std")]
     {
+        if !crate::auth_mode().is_authenticated() {
+            let value =
+                raster_runtime::finalize_draft_value::<S>(draft.anchor(), draft.current_root(), true)
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "Failed to finalize draft '{}': {}",
+                            core::any::type_name::<S>(),
+                            error
+                        )
+                    });
+            return AuthRef::Inline(value);
+        }
         let reference = raster_runtime::finalize_draft::<S>(draft.anchor(), draft.current_root())
             .unwrap_or_else(|error| {
                 panic!(
@@ -1963,6 +2407,24 @@ where
 {
     #[cfg(feature = "std")]
     {
+        // `allow_partial` is the empty-recur path: an output draft no iteration
+        // ever touched must still materialize if the schema permits it.
+        let require_complete = !allow_partial;
+        if !crate::auth_mode().is_authenticated() {
+            let value = raster_runtime::finalize_draft_value::<S>(
+                draft.anchor(),
+                draft.current_root(),
+                require_complete,
+            )
+            .unwrap_or_else(|error| {
+                panic!(
+                    "Failed to finalize draft '{}': {}",
+                    core::any::type_name::<S>(),
+                    error
+                )
+            });
+            return AuthRef::Inline(value);
+        }
         let reference = if allow_partial {
             raster_runtime::finalize_empty_draft::<S>(draft.anchor(), draft.current_root())
         } else {
@@ -2000,16 +2462,16 @@ where
 {
     #[cfg(feature = "std")]
     {
-        let items = resolve_recur_list(&source)
-            .unwrap_or_else(|error| panic!("Failed to resolve recursive list source: {}", error));
-        let len = items.len() as u64;
+        let cursor = ListCursor::open(&source)
+            .unwrap_or_else(|error| panic!("Failed to open recursive list source: {}", error));
+        let len = cursor.len();
         if len == 0 {
             return finalize_recur_output(output, true);
         }
         let mut output = output;
 
-        for (index, value) in items.into_iter().enumerate() {
-            let input = RecurInput::new(value, index as u64, len);
+        for index in 0..len {
+            let input = recur_iteration_input(&cursor, index, len);
 
             match step(input, output).into_recur_control() {
                 RecurControl::Continue(next) => {
@@ -2034,6 +2496,193 @@ where
     }
 }
 
+/// Iteration count for a chunked sweep: `⌈len / chunk⌉`.
+///
+/// `chunk` is a CFS literal, so it is already part of program identity; `max(1)`
+/// only guards a nonsensical `chunk = 0` from producing a division trap.
+#[cfg(feature = "std")]
+fn chunk_iteration_count(len: u64, chunk: u64) -> u64 {
+    len.div_ceil(chunk.max(1))
+}
+
+/// Select and materialize chunk `index` of a chunked sweep.
+///
+/// The range is `[i·C, min((i+1)·C, L))`, so only the final chunk is ever
+/// short — which is exactly the shape the completeness rules hold every
+/// iteration to (§5 rule 4).
+#[cfg(feature = "std")]
+fn recur_chunk_input<T>(
+    cursor: &ListCursor<T>,
+    index: u64,
+    iterations: u64,
+    chunk: u64,
+    len: u64,
+) -> RecurInput<Block<T>>
+where
+    T: DeserializeOwned + Serialize + Selectable + 'static,
+{
+    let chunk = chunk.max(1);
+    let start = index * chunk;
+    let end = core::cmp::min(start + chunk, len);
+    let block = cursor
+        .select_range(start, end)
+        .unwrap_or_else(|error| panic!("Failed to select recur chunk {}..{}: {}", start, end, error));
+    materialize_recur_item(block, index, iterations)
+        .unwrap_or_else(|error| panic!("Failed to materialize recur chunk {}: {}", index, error))
+}
+
+/// `call_recur! { ..., chunk = N }`, output-only.
+///
+/// The source stays `AuthRef<List<T>>` in both modes — no synthetic
+/// `List<Block<T>>` is ever constructed, because none exists in the storage
+/// tree to prove membership in. `RecurInput.len` remains the **iteration**
+/// count, so `is_first`/`is_last` keep their current meanings inside the step.
+#[doc(hidden)]
+pub fn run_recur_chunked_list<T, S, Step, Output>(
+    source: AuthRef<List<T>>,
+    chunk: u64,
+    output: Draft<S>,
+    mut step: Step,
+) -> AuthRef<S>
+where
+    T: DeserializeOwned + Serialize + Selectable + 'static,
+    S: Schema + DeserializeOwned + Serialize + 'static,
+    Step: FnMut(RecurInput<Block<T>>, RecurOutput<S>) -> Output,
+    Output: IntoRecurControl<RecurOutput<S>>,
+{
+    #[cfg(feature = "std")]
+    {
+        let cursor = ListCursor::open(&source)
+            .unwrap_or_else(|error| panic!("Failed to open recursive list source: {}", error));
+        let len = cursor.len();
+        let iterations = chunk_iteration_count(len, chunk);
+        if iterations == 0 {
+            return finalize_recur_output(output, true);
+        }
+        let mut output = output;
+
+        for index in 0..iterations {
+            let input = recur_chunk_input(&cursor, index, iterations, chunk, len);
+
+            match step(input, output).into_recur_control() {
+                RecurControl::Continue(next) => output = next,
+                RecurControl::Break(done) => {
+                    output = done;
+                    break;
+                }
+            }
+        }
+
+        return finalize_recur_output(output, false);
+    }
+
+    #[cfg(not(feature = "std"))]
+    {
+        let _ = (source, chunk, output, step);
+        panic!("Recursive list execution requires the `std` feature")
+    }
+}
+
+/// `call_recur! { ..., chunk = N }`, state-only.
+#[doc(hidden)]
+pub fn run_recur_chunked_list_state<T, State, Step, Output>(
+    source: AuthRef<List<T>>,
+    chunk: u64,
+    state: RecurState<State>,
+    mut step: Step,
+) -> AuthRef<State>
+where
+    T: DeserializeOwned + Serialize + Selectable + 'static,
+    State: DeserializeOwned + Serialize + 'static,
+    Step: FnMut(RecurInput<Block<T>>, RecurState<State>) -> Output,
+    Output: IntoRecurControl<RecurState<State>>,
+{
+    #[cfg(feature = "std")]
+    {
+        let cursor = ListCursor::open(&source)
+            .unwrap_or_else(|error| panic!("Failed to open recursive list source: {}", error));
+        let len = cursor.len();
+        let iterations = chunk_iteration_count(len, chunk);
+        let mut state = state;
+
+        for index in 0..iterations {
+            let input = recur_chunk_input(&cursor, index, iterations, chunk, len);
+
+            match step(input, state).into_recur_control() {
+                RecurControl::Continue(next_state) => state = next_state,
+                RecurControl::Break(done_state) => {
+                    state = done_state;
+                    break;
+                }
+            }
+        }
+
+        return crate::__private::bind_infallible_call(state.into_inner());
+    }
+
+    #[cfg(not(feature = "std"))]
+    {
+        let _ = (source, chunk, state, step);
+        panic!("Recursive list execution requires the `std` feature")
+    }
+}
+
+/// `call_recur! { ..., chunk = N }`, state + output.
+#[doc(hidden)]
+pub fn run_recur_chunked_list_with_state<T, State, S, Step, Output>(
+    source: AuthRef<List<T>>,
+    chunk: u64,
+    state: RecurState<State>,
+    output: Draft<S>,
+    mut step: Step,
+) -> AuthRef<S>
+where
+    T: DeserializeOwned + Serialize + Selectable + 'static,
+    State: DeserializeOwned + Serialize + 'static,
+    S: Schema + DeserializeOwned + Serialize + 'static,
+    Step: FnMut(RecurInput<Block<T>>, RecurState<State>, RecurOutput<S>) -> Output,
+    Output: IntoRecurControl<(RecurState<State>, RecurOutput<S>)>,
+{
+    #[cfg(feature = "std")]
+    {
+        let cursor = ListCursor::open(&source)
+            .unwrap_or_else(|error| panic!("Failed to open recursive list source: {}", error));
+        let len = cursor.len();
+        let iterations = chunk_iteration_count(len, chunk);
+        if iterations == 0 {
+            let _ = state;
+            return finalize_recur_output(output, true);
+        }
+        let mut state = state;
+        let mut output = output;
+
+        for index in 0..iterations {
+            let input = recur_chunk_input(&cursor, index, iterations, chunk, len);
+
+            match step(input, state, output).into_recur_control() {
+                RecurControl::Continue((next_state, next_output)) => {
+                    state = next_state;
+                    output = next_output;
+                }
+                RecurControl::Break((done_state, done_output)) => {
+                    state = done_state;
+                    output = done_output;
+                    break;
+                }
+            }
+        }
+
+        let _ = state;
+        return finalize_recur_output(output, false);
+    }
+
+    #[cfg(not(feature = "std"))]
+    {
+        let _ = (source, chunk, state, output, step);
+        panic!("Recursive list execution requires the `std` feature")
+    }
+}
+
 #[doc(hidden)]
 pub fn run_recur_list_state<T, State, Step, Output>(
     source: AuthRef<List<T>>,
@@ -2048,13 +2697,13 @@ where
 {
     #[cfg(feature = "std")]
     {
-        let items = resolve_recur_list(&source)
-            .unwrap_or_else(|error| panic!("Failed to resolve recursive list source: {}", error));
-        let len = items.len() as u64;
+        let cursor = ListCursor::open(&source)
+            .unwrap_or_else(|error| panic!("Failed to open recursive list source: {}", error));
+        let len = cursor.len();
         let mut state = state;
 
-        for (index, value) in items.into_iter().enumerate() {
-            let input = RecurInput::new(value, index as u64, len);
+        for index in 0..len {
+            let input = recur_iteration_input(&cursor, index, len);
 
             match step(input, state).into_recur_control() {
                 RecurControl::Continue(next_state) => {
@@ -2095,9 +2744,9 @@ where
 {
     #[cfg(feature = "std")]
     {
-        let items = resolve_recur_list(&source)
-            .unwrap_or_else(|error| panic!("Failed to resolve recursive list source: {}", error));
-        let len = items.len() as u64;
+        let cursor = ListCursor::open(&source)
+            .unwrap_or_else(|error| panic!("Failed to open recursive list source: {}", error));
+        let len = cursor.len();
         if len == 0 {
             let _ = state;
             return finalize_recur_output(output, true);
@@ -2105,8 +2754,8 @@ where
         let mut state = state;
         let mut output = output;
 
-        for (index, value) in items.into_iter().enumerate() {
-            let input = RecurInput::new(value, index as u64, len);
+        for index in 0..len {
+            let input = recur_iteration_input(&cursor, index, len);
 
             match step(input, state, output).into_recur_control() {
                 RecurControl::Continue((next_state, next_output)) => {
@@ -2149,20 +2798,17 @@ where
 {
     #[cfg(feature = "std")]
     {
-        let resolved = resolve_recur_list_source(&source).unwrap_or_else(|error| {
-            panic!(
-                "Failed to resolve recursive sequence list source: {}",
-                error
-            )
+        let cursor = ListCursor::open(&source).unwrap_or_else(|error| {
+            panic!("Failed to open recursive sequence list source: {}", error)
         });
-        let len = resolved.len();
+        let len = cursor.len();
         if len == 0 {
             return finalize_recur_output(output, true);
         }
 
         let mut output = output;
         for index in 0..len {
-            let item = resolved.select_item(index).unwrap_or_else(|error| {
+            let item = cursor.select_item(index).unwrap_or_else(|error| {
                 panic!("Failed to select recursive sequence list item: {}", error)
             });
             let input = RecurSequenceInput::__raster_from_auth_ref(item, index, len);
@@ -2198,17 +2844,14 @@ where
 {
     #[cfg(feature = "std")]
     {
-        let resolved = resolve_recur_list_source(&source).unwrap_or_else(|error| {
-            panic!(
-                "Failed to resolve recursive sequence list source: {}",
-                error
-            )
+        let cursor = ListCursor::open(&source).unwrap_or_else(|error| {
+            panic!("Failed to open recursive sequence list source: {}", error)
         });
-        let len = resolved.len();
+        let len = cursor.len();
         let mut state = state;
 
         for index in 0..len {
-            let item = resolved.select_item(index).unwrap_or_else(|error| {
+            let item = cursor.select_item(index).unwrap_or_else(|error| {
                 panic!("Failed to select recursive sequence list item: {}", error)
             });
             let input = RecurSequenceInput::__raster_from_auth_ref(item, index, len);
@@ -2246,13 +2889,10 @@ where
 {
     #[cfg(feature = "std")]
     {
-        let resolved = resolve_recur_list_source(&source).unwrap_or_else(|error| {
-            panic!(
-                "Failed to resolve recursive sequence list source: {}",
-                error
-            )
+        let cursor = ListCursor::open(&source).unwrap_or_else(|error| {
+            panic!("Failed to open recursive sequence list source: {}", error)
         });
-        let len = resolved.len();
+        let len = cursor.len();
         if len == 0 {
             let _ = state;
             return finalize_recur_output(output, true);
@@ -2261,7 +2901,7 @@ where
         let mut state = state;
         let mut output = output;
         for index in 0..len {
-            let item = resolved.select_item(index).unwrap_or_else(|error| {
+            let item = cursor.select_item(index).unwrap_or_else(|error| {
                 panic!("Failed to select recursive sequence list item: {}", error)
             });
             let input = RecurSequenceInput::__raster_from_auth_ref(item, index, len);

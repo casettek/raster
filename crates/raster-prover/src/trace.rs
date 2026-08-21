@@ -998,6 +998,7 @@ mod tests {
                 output_commitment: output.to_le_bytes().to_vec(),
                 storage: empty_storage_roots(),
             }),
+            recur_progress_commitment: [0u8; 32],
         }
     }
 
@@ -1024,6 +1025,7 @@ mod tests {
                 input_commitment: Vec::new(),
                 input_source_commitment: Vec::new(),
             },
+            recur_progress_commitment: [0u8; 32],
         }
     }
 
@@ -1039,6 +1041,7 @@ mod tests {
             kind: StepKind::SequenceEnd {
                 output_commitment: Vec::new(),
             },
+            recur_progress_commitment: [0u8; 32],
         }
     }
 

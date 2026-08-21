@@ -270,12 +270,44 @@ pub struct SelectionProof {
     pub steps: Vec<SelectionProofStep>,
 }
 
+/// Which *view* of the selected node a commitment's payload carries.
+///
+/// A selector names a descent, so it cannot distinguish these: selecting a
+/// `List<T>` and selecting that list's metadata share a path, a source root and
+/// a set of proof steps, and both fold to the same root. What separates them is
+/// the payload — a `0x02` list against a `0x0A` metadata record — and the rule
+/// (`lazy-list-recur.md` §1) is that **every consumer states the kind it
+/// expects** rather than accepting whichever arrives.
+///
+/// It is recorded rather than derived from byte 0 because the payload is not
+/// always at hand: `raster-cli`'s commit pipeline rebuilds a witness from
+/// `(coordinates, commitment, selector)` alone
+/// (`raster-cli/src/commands/run.rs`, `build_storage_selection_witnesses`) and
+/// has to know which form to regenerate. A *reader* holding the bytes can still
+/// cross-check byte 0, which is what [`verify_selection_witness`] does.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum SelectionPayloadKind {
+    /// The selected node's own payload, whatever its kind — the only form that
+    /// existed before `lazy-list-recur`, and still the form for every selection
+    /// that is not a recur source.
+    #[default]
+    Raw,
+    /// The `0x0A` authenticated list metadata record: `(len, elements_root)`,
+    /// 41 bytes, or 9 for an empty list. There is deliberately no separate
+    /// "raw whole list" spelling here — naming the kind `List` is what encodes
+    /// that a list is *always* carried as metadata once it is named at all.
+    List,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct SelectionCommitment {
     pub path: SelectorPath,
     pub source_root_hash: Hash32,
     pub selected_hash: Hash32,
     pub selected_len: u64,
+    /// The view of the node `selected_hash` is taken over. See
+    /// [`SelectionPayloadKind`].
+    pub payload_kind: SelectionPayloadKind,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -288,6 +320,24 @@ pub struct SelectionWitness {
 pub struct SelectedPayload {
     pub bytes: Vec<u8>,
     pub commitment: SelectionCommitment,
+}
+
+/// A list's authenticated shape, together with the selection that proves it.
+///
+/// `len` is the value a recur loop is held to. It is *authenticated* rather
+/// than index-trusted precisely because `selected` commits to the `0x0A`
+/// payload carrying it: the committed root is recomputed from
+/// `(len, elements_root)`, so no other length reaches the same root. Reading
+/// the same integer straight off a `RasterIndex` node would not be — a nested
+/// list node's `len` is never checked against its children's hashes
+/// (`RasterIndex::validate`), which is the forged-`len = 0` sweep
+/// `docs/proposals/lazy-list-recur.md` exists to close.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AuthenticatedListMetadata {
+    pub len: u64,
+    /// `None` for an empty list, which has no Merkle levels at all.
+    pub elements_root: Option<Hash32>,
+    pub selected: SelectedPayload,
 }
 
 impl SelectedPayload {
@@ -349,9 +399,24 @@ fn parse_utf8(bytes: &[u8], offset: &mut usize) -> Option<Vec<u8>> {
     Some(slice.to_vec())
 }
 
+/// The final step of a list's root: `H(b"list-root" ‖ len ‖ elements_root)`,
+/// with the `b"empty"` sentinel standing in for an empty list's absent root.
+///
+/// Factored out because the `0x0A` metadata payload *is* exactly this step —
+/// metadata carries `(len, elements_root)` and nothing else, so recomputing its
+/// root must reuse this function rather than restate it. A divergence between
+/// the two spellings would be a metadata record that verifies against a root no
+/// list can produce.
+fn list_root_from_elements_root(len: u64, elements_root: Option<&Hash32>) -> Hash32 {
+    match elements_root {
+        Some(root) => selection_hash(&[b"list-root", &len.to_le_bytes(), root.as_slice()]),
+        None => selection_hash(&[b"list-root", &len.to_le_bytes(), b"empty"]),
+    }
+}
+
 fn list_root_from_hashes(hashes: &[Hash32], len: u64) -> Hash32 {
     if hashes.is_empty() {
-        return selection_hash(&[b"list-root", &len.to_le_bytes(), b"empty"]);
+        return list_root_from_elements_root(len, None);
     }
 
     let mut level = hashes.to_vec();
@@ -372,9 +437,190 @@ fn list_root_from_hashes(hashes: &[Hash32], len: u64) -> Hash32 {
         level = next;
     }
 
-    selection_hash(&[b"list-root", &len.to_le_bytes(), level[0].as_slice()])
+    list_root_from_elements_root(len, Some(&level[0]))
 }
 
+/// The right edge of an append-only list's Merkle tree — enough to recompute
+/// [`list_root_from_hashes`] for `len` elements without holding one.
+///
+/// Appending changes only that edge, so the left siblings along it (O(log N)
+/// digests) are all a verifier needs to recompute the root and to advance it.
+/// This is what a draft's witness carries instead of the whole append log; see
+/// `docs/proposals/incremental-draft-witness.md`.
+///
+/// It lives here, beside the list-root functions, because it must agree with
+/// them **bit for bit** — including the duplicate-last padding rule, which is
+/// not the usual zero-padding and is the reason a general-purpose frontier
+/// implementation cannot be substituted. Same reason `draft.rs` reuses
+/// [`struct_commitments_root`] rather than restating it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct AppendFrontier {
+    pub len: u64,
+    /// Root of the last element. `None` iff `len == 0`.
+    pub leaf: Option<Hash32>,
+    /// Left siblings on the path from `leaf` upward, ascending by level.
+    /// Exactly `(len - 1).count_ones()` of them — the levels at which the last
+    /// element sits in a *right* child, which are the only levels where the
+    /// climb needs something it does not already hold.
+    pub ommers: Vec<Hash32>,
+}
+
+impl AppendFrontier {
+    /// The frontier of an empty list.
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    /// Whether the ommer count matches what `len` implies. Checked before any
+    /// root is computed: a frontier with a spare or missing ommer is a producer
+    /// bug, and hashing it anyway would silently answer for a list shape the
+    /// witness never described.
+    pub fn is_well_formed(&self) -> bool {
+        match self.leaf {
+            None => self.len == 0 && self.ommers.is_empty(),
+            Some(_) => self.len > 0 && self.ommers.len() as u32 == (self.len - 1).count_ones(),
+        }
+    }
+
+    /// Recompute the list root. `None` when the frontier is malformed.
+    ///
+    /// Climbs from the last element at `idx = len - 1`, taking a left sibling
+    /// when `idx` is odd and pairing the node with *itself* when it is even —
+    /// because an even index at that level is the last node, which is exactly
+    /// what [`list_root_from_hashes`] duplicates.
+    pub fn root(&self) -> Option<Hash32> {
+        if !self.is_well_formed() {
+            return None;
+        }
+        let Some(leaf) = self.leaf else {
+            return Some(list_root_from_elements_root(0, None));
+        };
+
+        let mut node = leaf;
+        let mut idx = self.len - 1;
+        let mut width = self.len;
+        let mut ommers = self.ommers.iter();
+        while width > 1 {
+            node = if idx % 2 == 1 {
+                selection_hash(&[b"list-node", ommers.next()?.as_slice(), node.as_slice()])
+            } else {
+                selection_hash(&[b"list-node", node.as_slice(), node.as_slice()])
+            };
+            idx /= 2;
+            width = width / 2 + width % 2;
+        }
+        if ommers.next().is_some() {
+            return None;
+        }
+
+        Some(list_root_from_elements_root(self.len, Some(&node)))
+    }
+
+    /// Append one element root, in O(log N).
+    ///
+    /// The old last element stops being the edge, so it folds upward through
+    /// the ommers at every level where it was a right child — the trailing ones
+    /// of its index — and the accumulated subtree becomes the new lowest ommer.
+    pub fn push(&mut self, leaf: Hash32) {
+        let Some(prior_leaf) = self.leaf.replace(leaf) else {
+            self.len = 1;
+            return;
+        };
+
+        let consumed = (self.len - 1).trailing_ones() as usize;
+        let mut carry = prior_leaf;
+        for ommer in self.ommers.iter().take(consumed) {
+            carry = selection_hash(&[b"list-node", ommer.as_slice(), carry.as_slice()]);
+        }
+        self.ommers.drain(..consumed);
+        self.ommers.insert(0, carry);
+        self.len += 1;
+    }
+
+    /// Build a frontier from every element root — O(N), so only for callers
+    /// that already hold the whole list (tests, and a host bootstrapping an
+    /// existing draft).
+    pub fn from_leaf_roots(roots: &[Hash32]) -> Self {
+        let mut frontier = Self::empty();
+        for root in roots {
+            frontier.push(*root);
+        }
+        frontier
+    }
+}
+
+/// Encode the `0x0A` authenticated list metadata payload.
+///
+/// ```text
+/// 0x0A ‖ len:u64 ‖ elements_root:32     (len > 0)   41 bytes
+/// 0x0A ‖ 0u64                           (empty)      9 bytes
+/// ```
+///
+/// The encode half of the `0x0A` arm of [`parse_subtree_root`], in the same
+/// encode-and-compare spirit as [`encode_index_leaf_payload`]: producers build
+/// the bytes here so there is exactly one spelling of a metadata record, and
+/// the round-trip is covered by `list_metadata_payload_folds_to_the_list_root`.
+///
+/// `elements_root` is the top of a list node's Merkle levels — for a raster
+/// index, `merkle_levels.last().hashes[0]`, which `RasterIndex::validate`
+/// already guarantees is exactly one hash. `None` encodes the empty list.
+pub fn encode_list_metadata_payload(len: u64, elements_root: Option<Hash32>) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(1 + 8 + 32);
+    payload.push(0x0A);
+    payload.extend_from_slice(&len.to_le_bytes());
+    if let Some(root) = elements_root {
+        payload.extend_from_slice(&root);
+    }
+    payload
+}
+
+/// Encode the `0x0B` bytes-page payload.
+///
+/// ```text
+/// 0x0B ‖ index:u64 ‖ offset:u64 ‖ len:u64 ‖ bytes
+/// root = H(b"bytes-page" ‖ index ‖ offset ‖ len ‖ bytes)
+/// ```
+pub fn encode_bytes_page_payload(index: u64, offset: u64, len: u64, bytes: &[u8]) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(1 + 8 + 8 + 8 + bytes.len());
+    payload.push(0x0B);
+    payload.extend_from_slice(&index.to_le_bytes());
+    payload.extend_from_slice(&offset.to_le_bytes());
+    payload.extend_from_slice(&len.to_le_bytes());
+    payload.extend_from_slice(bytes);
+    payload
+}
+
+/// Domain-separated root of a bytes page. Distinct from the leaf domain so a
+/// page cannot collide with a `String` holding the same bytes.
+pub fn bytes_page_root(index: u64, offset: u64, len: u64, bytes: &[u8]) -> Hash32 {
+    selection_hash(&[
+        b"bytes-page",
+        &index.to_le_bytes(),
+        &offset.to_le_bytes(),
+        &len.to_le_bytes(),
+        bytes,
+    ])
+}
+
+/// Recompute a selection payload's structural root from its bytes.
+///
+/// # Payload tags
+///
+/// The tag space is contiguous and small, so it is allocated **here**, centrally,
+/// rather than negotiated per proposal — two documents each reserving a byte is
+/// how collisions happen. Add a row before adding an arm.
+///
+/// | tag | payload | defined by |
+/// | --- | --- | --- |
+/// | `0x00` | leaf | — |
+/// | `0x01` | struct | — |
+/// | `0x02` | list | — |
+/// | `0x03` | unit | — |
+/// | `0x04` | map | — |
+/// | `0x05`–`0x08` | enum unit / newtype / tuple / struct | — |
+/// | `0x09` | list handle (stored root, skipped body) | `bounded-collections.md` |
+/// | `0x0A` | list metadata (`len`, `elements_root`) | `lazy-list-recur.md` |
+/// | `0x0B` | bytes page | `paged-bytes.md` |
 fn parse_subtree_root(bytes: &[u8], offset: &mut usize) -> Option<Hash32> {
     let kind = *bytes.get(*offset)?;
     *offset += 1;
@@ -449,6 +695,37 @@ fn parse_subtree_root(bytes: &[u8], offset: &mut usize) -> Option<Hash32> {
             let _ = bytes.get(*offset..inner_end)?;
             *offset = inner_end;
             Some(root)
+        }
+        // list-metadata: `[len:8]`, plus `[elements_root:32]` when `len > 0`.
+        // Proves a list's length and element root without carrying an element,
+        // which is what lets a recur source be traced in O(1) instead of
+        // O(list) (see `docs/proposals/lazy-list-recur.md` §1).
+        //
+        // The root is *recomputed* from `(len, elements_root)`, so a forged
+        // length yields a different root and fails to fold. That makes this
+        // strictly stronger than the `0x09` handle above, which returns its
+        // stored root and ignores its stored `len` — a handle's length field is
+        // not authenticated and cannot be used as a loop bound.
+        0x0A => {
+            let len = parse_u64(bytes, offset)?;
+            let elements_root = if len == 0 {
+                None
+            } else {
+                let root_end = offset.checked_add(32)?;
+                let root: Hash32 = bytes.get(*offset..root_end)?.try_into().ok()?;
+                *offset = root_end;
+                Some(root)
+            };
+            Some(list_root_from_elements_root(len, elements_root.as_ref()))
+        }
+        0x0B => {
+            let index = parse_u64(bytes, offset)?;
+            let page_offset = parse_u64(bytes, offset)?;
+            let len = parse_u64(bytes, offset)?;
+            let end = offset.checked_add(len as usize)?;
+            let page_bytes = bytes.get(*offset..end)?;
+            *offset = end;
+            Some(bytes_page_root(index, page_offset, len, page_bytes))
         }
         0x04 => {
             let len = parse_u64(bytes, offset)?;
@@ -853,6 +1130,144 @@ pub fn encode_index_leaf_payload(index: u64, width: IndexWidth) -> Option<Vec<u8
     Some(payload)
 }
 
+/// Whether a payload's leading tag is the view `kind` claims.
+///
+/// This is the general form of the rule `lazy-list-recur.md` §1 states: a
+/// consumer pins the payload kind it expects. Two payload forms can fold to the
+/// same root — a `0x02` list and its `0x0A` metadata both do — so folding alone
+/// does not establish *which* was supplied. Accepting a `0x02` where metadata
+/// was recorded would not forge the length (a full-list fold authenticates its
+/// own length too), but it would put the whole-list payload back in the witness,
+/// which is the `O(list)` cost metadata exists to remove.
+fn payload_matches_kind(bytes: &[u8], kind: SelectionPayloadKind) -> bool {
+    match (bytes.first(), kind) {
+        (Some(0x0A), SelectionPayloadKind::List) => true,
+        (Some(0x0A), SelectionPayloadKind::Raw) => false,
+        (Some(_), SelectionPayloadKind::Raw) => true,
+        // A `List` commitment accepts nothing but metadata — in particular not
+        // the `0x02` list it was derived from.
+        (Some(_), SelectionPayloadKind::List) => false,
+        (None, _) => false,
+    }
+}
+
+/// Decode a `0x0B` page payload into `(index, offset, len, bytes)`.
+pub fn parse_bytes_page_payload(bytes: &[u8]) -> Option<(u64, u64, u64, &[u8])> {
+    if bytes.first().copied() != Some(0x0B) {
+        return None;
+    }
+    let mut offset = 1usize;
+    let index = parse_u64(bytes, &mut offset)?;
+    let page_offset = parse_u64(bytes, &mut offset)?;
+    let len = parse_u64(bytes, &mut offset)?;
+    let end = offset.checked_add(len as usize)?;
+    let page_bytes = bytes.get(offset..end)?;
+    if end != bytes.len() {
+        return None;
+    }
+    Some((index, page_offset, len, page_bytes))
+}
+
+fn u64_leaf_root(value: u64) -> Hash32 {
+    selection_hash(&[b"leaf", &value.to_le_bytes()])
+}
+
+/// Geometry rules 2–3 from `paged-bytes.md` §3.1, run where the witness is
+/// in scope. A non-page payload is accepted (nothing to check).
+pub fn verify_bytes_page_geometry(witness: &SelectionWitness) -> bool {
+    let Some((index, page_offset, len, page_bytes)) = parse_bytes_page_payload(&witness.bytes)
+    else {
+        return true;
+    };
+    if len != page_bytes.len() as u64 {
+        return false;
+    }
+
+    let mut bytes_step = None;
+    let mut list_len = None;
+    for step in &witness.proof.steps {
+        match step {
+            SelectionProofStep::Struct { field_names, .. }
+                if field_names.as_slice() == ["byte_len", "page_size", "pages"] =>
+            {
+                bytes_step = Some(step);
+            }
+            SelectionProofStep::List {
+                index: step_index,
+                len: step_len,
+                ..
+            } if *step_index == index => {
+                list_len = Some(*step_len);
+            }
+            _ => {}
+        }
+    }
+
+    let Some(SelectionProofStep::Struct {
+        field_index,
+        field_names,
+        siblings,
+    }) = bytes_step
+    else {
+        return true;
+    };
+    if field_names.get(*field_index as usize).map(String::as_str) != Some("pages") {
+        return false;
+    }
+    if siblings.len() != 2 {
+        return false;
+    }
+    let Some(page_count) = list_len else {
+        return false;
+    };
+    if index >= page_count {
+        return false;
+    }
+
+    let last = index + 1 == page_count;
+    let page_size = if index > 0 {
+        if page_offset % index != 0 {
+            return false;
+        }
+        page_offset / index
+    } else if !last {
+        if page_offset != 0 {
+            return false;
+        }
+        len
+    } else {
+        if page_offset != 0 {
+            return false;
+        }
+        let byte_len = len;
+        if u64_leaf_root(byte_len) != siblings[0] {
+            return false;
+        }
+        return page_count == 1;
+    };
+
+    if page_size == 0 || u64_leaf_root(page_size) != siblings[1] {
+        return false;
+    }
+    if page_offset != index.saturating_mul(page_size) {
+        return false;
+    }
+
+    if last {
+        let byte_len = page_offset + len;
+        if u64_leaf_root(byte_len) != siblings[0] {
+            return false;
+        }
+        let expected_len = core::cmp::min(page_size, byte_len.saturating_sub(page_offset));
+        if len != expected_len {
+            return false;
+        }
+        page_count == byte_len.div_ceil(page_size)
+    } else {
+        len == page_size
+    }
+}
+
 pub fn verify_selection_witness(
     commitment: &SelectionCommitment,
     witness: &SelectionWitness,
@@ -861,6 +1276,7 @@ pub fn verify_selection_witness(
         || witness.proof.root_hash != commitment.source_root_hash
         || witness.bytes.len() as u64 != commitment.selected_len
         || selection_payload_hash(&witness.bytes) != commitment.selected_hash
+        || !payload_matches_kind(&witness.bytes, commitment.payload_kind)
     {
         return false;
     }
@@ -1451,5 +1867,446 @@ mod tests {
             .insert(0, SelectorSegment::Field("slice".to_string()));
         proof.root_hash = struct_root;
         assert!(verify_selection_proof(&payload, &proof));
+    }
+
+    // ---- `0x0A` authenticated list metadata (`lazy-list-recur.md` §1) ----
+
+    /// The top of a list's Merkle levels — what a `.rindex` stores as
+    /// `merkle_levels.last().hashes[0]`, and what metadata carries.
+    fn elements_root(element_roots: &[Hash32]) -> Option<Hash32> {
+        if element_roots.is_empty() {
+            return None;
+        }
+        let mut level = element_roots.to_vec();
+        while level.len() > 1 {
+            if level.len() % 2 == 1 {
+                level.push(*level.last().unwrap());
+            }
+            level = level
+                .chunks(2)
+                .map(|pair| selection_hash(&[b"list-node", &pair[0], &pair[1]]))
+                .collect();
+        }
+        Some(level[0])
+    }
+
+    fn metadata_fixture(len: usize) -> (Vec<u8>, Hash32) {
+        let element_roots: Vec<Hash32> = (0..len)
+            .map(|value| leaf_root(&[value as u8, 0xAB]))
+            .collect();
+        let payload = encode_list_metadata_payload(len as u64, elements_root(&element_roots));
+        (payload, list_root_from_hashes(&element_roots, len as u64))
+    }
+
+    fn parsed_root(payload: &[u8]) -> Option<Hash32> {
+        let mut offset = 0;
+        let root = parse_subtree_root(payload, &mut offset)?;
+        // The arm must consume exactly its own bytes: every struct/list parent
+        // asserts `child_offset == child_bytes.len()`.
+        (offset == payload.len()).then_some(root)
+    }
+
+    #[test]
+    fn list_metadata_payload_folds_to_the_list_root() {
+        // 0 and 1 are the boundary shapes; 2/3/4/5 cover even, odd (the Merkle
+        // duplication path), and a second level.
+        for len in [0usize, 1, 2, 3, 4, 5, 8, 9] {
+            let (payload, expected) = metadata_fixture(len);
+            assert_eq!(
+                payload.len(),
+                if len == 0 { 9 } else { 41 },
+                "metadata is 41 bytes, 9 when empty (len {})",
+                len
+            );
+            assert_eq!(
+                parsed_root(&payload),
+                Some(expected),
+                "metadata must recompute the same root the full list folds to (len {})",
+                len
+            );
+        }
+    }
+
+    #[test]
+    fn empty_list_metadata_uses_the_empty_sentinel() {
+        let (payload, expected) = metadata_fixture(0);
+        assert_eq!(payload, alloc::vec![0x0A, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            expected,
+            selection_hash(&[b"list-root", &0u64.to_le_bytes(), b"empty"])
+        );
+    }
+
+    /// The point of the whole payload form: the length is *recomputed into* the
+    /// root, so claiming a different one yields a different root. This is what
+    /// the `0x09` handle cannot do — it returns its stored root and ignores its
+    /// stored `len`.
+    #[test]
+    fn forged_list_metadata_length_fails_to_fold() {
+        let (payload, honest) = metadata_fixture(5);
+        for forged in [0u64, 1, 4, 6, 999] {
+            let mut tampered = payload.clone();
+            tampered[1..9].copy_from_slice(&forged.to_le_bytes());
+            assert_ne!(
+                parsed_root(&tampered),
+                Some(honest),
+                "a metadata record claiming len {} must not fold to the honest root",
+                forged
+            );
+        }
+    }
+
+    #[test]
+    fn forged_list_metadata_elements_root_fails_to_fold() {
+        let (payload, honest) = metadata_fixture(5);
+        let mut tampered = payload.clone();
+        tampered[9] ^= 0xFF;
+        assert_ne!(parsed_root(&tampered), Some(honest));
+    }
+
+    #[test]
+    fn bytes_page_payload_folds_to_domain_separated_root() {
+        let bytes = b"hello-page";
+        let payload = encode_bytes_page_payload(1, 4, bytes.len() as u64, bytes);
+        assert_eq!(payload[0], 0x0B);
+        assert_eq!(
+            parsed_root(&payload),
+            Some(bytes_page_root(1, 4, bytes.len() as u64, bytes))
+        );
+        let leaf = encode_leaf(bytes);
+        assert_ne!(parsed_root(&payload), parsed_root(&leaf));
+    }
+
+    #[test]
+    fn parse_bytes_page_payload_reads_coordinates() {
+        let bytes = b"abcd";
+        let payload = encode_bytes_page_payload(2, 8, 4, bytes);
+        let (index, offset, len, page) = parse_bytes_page_payload(&payload).unwrap();
+        assert_eq!((index, offset, len, page), (2, 8, 4, bytes.as_slice()));
+    }
+
+    #[test]
+    fn verify_bytes_page_geometry_accepts_last_page() {
+        let bytes = b"x";
+        let payload = encode_bytes_page_payload(1, 4, 1, bytes);
+        let witness = SelectionWitness {
+            bytes: payload,
+            proof: SelectionProof {
+                path: SelectorPath::default(),
+                root_hash: [0; 32],
+                steps: alloc::vec![
+                    SelectionProofStep::Struct {
+                        field_index: 2,
+                        field_names: alloc::vec![
+                            "byte_len".into(),
+                            "page_size".into(),
+                            "pages".into(),
+                        ],
+                        siblings: alloc::vec![u64_leaf_root(5), u64_leaf_root(4)],
+                    },
+                    SelectionProofStep::List {
+                        index: 1,
+                        len: 2,
+                        siblings: alloc::vec![],
+                    },
+                ],
+            },
+        };
+        assert!(verify_bytes_page_geometry(&witness));
+    }
+
+    #[test]
+    fn verify_bytes_page_geometry_rejects_bad_offset() {
+        let bytes = b"xxxx";
+        let payload = encode_bytes_page_payload(1, 3, 4, bytes);
+        let witness = SelectionWitness {
+            bytes: payload,
+            proof: SelectionProof {
+                path: SelectorPath::default(),
+                root_hash: [0; 32],
+                steps: alloc::vec![
+                    SelectionProofStep::Struct {
+                        field_index: 2,
+                        field_names: alloc::vec![
+                            "byte_len".into(),
+                            "page_size".into(),
+                            "pages".into(),
+                        ],
+                        siblings: alloc::vec![u64_leaf_root(8), u64_leaf_root(4)],
+                    },
+                    SelectionProofStep::List {
+                        index: 1,
+                        len: 2,
+                        siblings: alloc::vec![],
+                    },
+                ],
+            },
+        };
+        assert!(!verify_bytes_page_geometry(&witness));
+    }
+
+    #[test]
+    fn verify_bytes_page_geometry_rejects_short_non_final_page() {
+        let bytes = b"xxx";
+        let payload = encode_bytes_page_payload(1, 4, 3, bytes);
+        let witness = SelectionWitness {
+            bytes: payload,
+            proof: SelectionProof {
+                path: SelectorPath::default(),
+                root_hash: [0; 32],
+                steps: alloc::vec![
+                    SelectionProofStep::Struct {
+                        field_index: 2,
+                        field_names: alloc::vec![
+                            "byte_len".into(),
+                            "page_size".into(),
+                            "pages".into(),
+                        ],
+                        siblings: alloc::vec![u64_leaf_root(12), u64_leaf_root(4)],
+                    },
+                    SelectionProofStep::List {
+                        index: 1,
+                        len: 3,
+                        siblings: alloc::vec![],
+                    },
+                ],
+            },
+        };
+        assert!(!verify_bytes_page_geometry(&witness));
+    }
+
+    #[test]
+    fn verify_bytes_page_geometry_rejects_count_disagreeing_with_ceil() {
+        let bytes = b"x";
+        let payload = encode_bytes_page_payload(1, 4, 1, bytes);
+        let witness = SelectionWitness {
+            bytes: payload,
+            proof: SelectionProof {
+                path: SelectorPath::default(),
+                root_hash: [0; 32],
+                steps: alloc::vec![
+                    SelectionProofStep::Struct {
+                        field_index: 2,
+                        field_names: alloc::vec![
+                            "byte_len".into(),
+                            "page_size".into(),
+                            "pages".into(),
+                        ],
+                        siblings: alloc::vec![u64_leaf_root(5), u64_leaf_root(4)],
+                    },
+                    SelectionProofStep::List {
+                        index: 1,
+                        len: 3,
+                        siblings: alloc::vec![],
+                    },
+                ],
+            },
+        };
+        assert!(!verify_bytes_page_geometry(&witness));
+    }
+
+    #[test]
+    fn truncated_list_metadata_is_rejected() {
+        let (payload, _) = metadata_fixture(5);
+        // Missing the elements root entirely, and a partial one.
+        assert_eq!(parsed_root(&payload[..9]), None);
+        assert_eq!(parsed_root(&payload[..30]), None);
+        // A non-empty length must not accept trailing slack either.
+        let mut padded = payload.clone();
+        padded.push(0);
+        assert_eq!(parsed_root(&padded), None);
+    }
+
+    /// Each consumer pins the kind it expects. A range proof reaches for the
+    /// element roots and must not silently accept a metadata record instead.
+    #[test]
+    fn parse_list_child_roots_rejects_metadata() {
+        let (payload, _) = metadata_fixture(4);
+        assert!(parse_list_child_roots(&payload).is_none());
+    }
+
+    fn metadata_witness(len: usize) -> (SelectionCommitment, SelectionWitness) {
+        let (payload, root) = metadata_fixture(len);
+        let commitment = SelectionCommitment {
+            path: SelectorPath::default(),
+            source_root_hash: root,
+            selected_hash: selection_payload_hash(&payload),
+            selected_len: payload.len() as u64,
+            payload_kind: SelectionPayloadKind::List,
+        };
+        let witness = SelectionWitness {
+            bytes: payload,
+            proof: SelectionProof {
+                path: SelectorPath::default(),
+                root_hash: root,
+                steps: Vec::new(),
+            },
+        };
+        (commitment, witness)
+    }
+
+    #[test]
+    fn metadata_witness_verifies_against_a_list_kind_commitment() {
+        let (commitment, witness) = metadata_witness(5);
+        assert!(verify_selection_witness(&commitment, &witness));
+    }
+
+    /// A whole-list payload folds to the same root as its metadata and
+    /// authenticates its own length just as well — so folding cannot be what
+    /// separates them. The recorded kind is, and a `List` commitment refuses
+    /// the `0x02` form outright rather than parsing it. That refusal is the
+    /// `O(list)` cost this proposal exists to remove.
+    #[test]
+    fn a_list_kind_commitment_refuses_a_whole_list_payload() {
+        let len = 5usize;
+        let element_bytes: Vec<Vec<u8>> = (0..len)
+            .map(|value| alloc::vec![value as u8, 0xAB])
+            .collect();
+        let element_roots: Vec<Hash32> =
+            element_bytes.iter().map(|bytes| leaf_root(bytes)).collect();
+        let encoded: Vec<Vec<u8>> = element_bytes.iter().map(|b| encode_leaf(b)).collect();
+        let whole = encode_list(&encoded);
+        let root = list_root_from_hashes(&element_roots, len as u64);
+
+        // It really does fold to the same root…
+        assert_eq!(parsed_root(&whole), Some(root));
+        assert_eq!(parsed_root(&metadata_fixture(len).0), Some(root));
+
+        // …and is still refused where metadata was recorded.
+        let commitment = SelectionCommitment {
+            path: SelectorPath::default(),
+            source_root_hash: root,
+            selected_hash: selection_payload_hash(&whole),
+            selected_len: whole.len() as u64,
+            payload_kind: SelectionPayloadKind::List,
+        };
+        let witness = SelectionWitness {
+            bytes: whole,
+            proof: SelectionProof {
+                path: SelectorPath::default(),
+                root_hash: root,
+                steps: Vec::new(),
+            },
+        };
+        assert!(!verify_selection_witness(&commitment, &witness));
+    }
+
+    #[test]
+    fn a_raw_kind_commitment_refuses_a_metadata_payload() {
+        let (mut commitment, witness) = metadata_witness(5);
+        commitment.payload_kind = SelectionPayloadKind::Raw;
+        assert!(!verify_selection_witness(&commitment, &witness));
+    }
+
+    fn frontier_test_leaves(count: usize) -> Vec<Hash32> {
+        (0..count as u64)
+            .map(|index| selection_hash(&[b"frontier-test-leaf", &index.to_le_bytes()]))
+            .collect()
+    }
+
+    /// The gate for `incremental-draft-witness`: a frontier must reproduce
+    /// `list_root_from_hashes` exactly, duplicate-last padding included. If this
+    /// fails, every committed draft root moves — stop.
+    #[test]
+    fn append_frontier_root_matches_list_root_from_hashes() {
+        let leaves = frontier_test_leaves(1024);
+        let mut frontier = AppendFrontier::empty();
+
+        // Grown one push at a time, so every intermediate length is checked
+        // against a whole-list recomputation of the same prefix.
+        assert_eq!(
+            frontier.root(),
+            Some(list_root_from_hashes(&[], 0)),
+            "empty frontier must produce the empty-list root"
+        );
+        for len in 1..=leaves.len() {
+            frontier.push(leaves[len - 1]);
+            assert_eq!(
+                frontier.root(),
+                Some(list_root_from_hashes(&leaves[..len], len as u64)),
+                "frontier root diverged at len {}",
+                len
+            );
+        }
+    }
+
+    /// N = 3..6 are the padding transitions worked in the proposal's §3:
+    /// `H(c,c)` becomes `H(c,d)` while `H(a,b)` is untouched, and at N = 5 the
+    /// duplication moves a level up. Explicit because they are the cases a
+    /// zero-padding frontier would get wrong.
+    #[test]
+    fn append_frontier_root_survives_the_padding_transitions() {
+        let leaves = frontier_test_leaves(6);
+        for len in [3usize, 4, 5, 6] {
+            let frontier = AppendFrontier::from_leaf_roots(&leaves[..len]);
+            assert_eq!(
+                frontier.root(),
+                Some(list_root_from_hashes(&leaves[..len], len as u64)),
+                "frontier root diverged at the N={} padding transition",
+                len
+            );
+        }
+    }
+
+    #[test]
+    fn append_frontier_stays_well_formed() {
+        let leaves = frontier_test_leaves(300);
+        let mut frontier = AppendFrontier::empty();
+        for (index, leaf) in leaves.iter().enumerate() {
+            frontier.push(*leaf);
+            assert_eq!(frontier.len, index as u64 + 1);
+            assert_eq!(
+                frontier.ommers.len() as u32,
+                (frontier.len - 1).count_ones(),
+                "ommer count must track the set bits of the last index at len {}",
+                frontier.len
+            );
+            assert!(frontier.is_well_formed());
+        }
+    }
+
+    /// A malformed frontier yields no root at all rather than a root for some
+    /// other list shape.
+    #[test]
+    fn append_frontier_rejects_a_mismatched_ommer_count() {
+        let frontier = AppendFrontier::from_leaf_roots(&frontier_test_leaves(7));
+        assert!(frontier.root().is_some());
+
+        let mut extra = frontier.clone();
+        extra.ommers.push([0u8; 32]);
+        assert_eq!(extra.root(), None);
+
+        let mut missing = frontier.clone();
+        missing.ommers.pop();
+        assert_eq!(missing.root(), None);
+
+        let mut relabelled = frontier;
+        relabelled.len += 1;
+        assert_eq!(relabelled.root(), None);
+
+        let headless = AppendFrontier {
+            len: 4,
+            leaf: None,
+            ommers: Vec::new(),
+        };
+        assert_eq!(headless.root(), None);
+    }
+
+    /// The size claim the proposal rests on: O(log N) digests where the append
+    /// log would be O(N) elements.
+    #[test]
+    fn append_frontier_is_logarithmic() {
+        let frontier = AppendFrontier::from_leaf_roots(&frontier_test_leaves(4096));
+        assert!(
+            frontier.ommers.len() <= 12,
+            "expected at most 12 ommers at N=4096, found {}",
+            frontier.ommers.len()
+        );
+        let encoded = crate::postcard::to_allocvec(&frontier).unwrap();
+        assert!(
+            encoded.len() < 500,
+            "expected a frontier under 500 bytes at N=4096, found {}",
+            encoded.len()
+        );
     }
 }

@@ -13,6 +13,7 @@ pub mod builder;
 pub mod cfs_builder;
 pub mod flow_resolver;
 pub mod project;
+pub mod schema_walk;
 pub mod sequence;
 pub mod tile;
 

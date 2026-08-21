@@ -7,6 +7,13 @@ an iteration, which that document did not cover.
 [`draft-provenance.md`](./draft-provenance.md) — the sibling gap on the other
 side of the same wall: there, a collection built in a tile loses its binding;
 here, a collection cannot cross an iteration at all.
+[`carried-state-channel.md`](./carried-state-channel.md) — **read before building
+§2's `TrackedStateRoot`.** Mirroring `active_drafts` (`:280` below) reproduces its
+window-open gap: a map carried in `Transition` is host-supplied and unchecked at a
+fresh `Init`, so a window opening mid-loop inherits a state root nobody proved.
+[`recur-progress-commitment.md`](./recur-progress-commitment.md) shows the fix —
+commit the state per step and reproduce it from the seed — and the channel proposal
+is where this state root should live rather than in a third parallel map.
 Motivating program: `raster-inference/raster-tokenizer`, whose BPE merge loop is
 unrolled 48 times because its loop-carried value is a `List`.
 

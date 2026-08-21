@@ -279,6 +279,18 @@ pub struct FnCallRecord {
     pub input: Option<FnInput>,
     pub output: Option<FnOutput>,
     pub draft_transition_witness: Option<DraftTransitionWitness>,
+    /// How a recur-tile iteration terminated. `Some` on a recur-tile
+    /// iteration, `None` everywhere else.
+    ///
+    /// Host-recorded, and **bound** by the guest to the replay-proven copy in
+    /// `TileReplayJournal.recur.control` — without that bind the value is
+    /// prover-chosen and the progress commitment computed over it means
+    /// nothing. It exists only so the *recorder* can compute the same
+    /// commitment the guest recomputes: the journal is the authority, but the
+    /// recorder never sees a journal. See
+    /// `docs/proposals/recur-progress-commitment.md` §3.1.
+    #[serde(default)]
+    pub recur_control: Option<crate::draft::RecurControlKind>,
 }
 
 impl FnCallRecord {
@@ -406,6 +418,16 @@ pub struct StepRecord {
     pub sequence_id: String,
     pub coordinates: CfsCoordinates,
     pub kind: StepKind,
+    /// Commitment to the recur-progress stack **after** this step.
+    ///
+    /// Recording only the *after* state is what lets one 32-byte field seed a
+    /// fraud-proof window: the window's carried state is validated by
+    /// reproducing this value, not by matching a predecessor record the window
+    /// does not contain. Bound exactly as strongly as `storage.root_before` —
+    /// by fingerprint agreement with `commit.bin`. See
+    /// `docs/proposals/recur-progress-commitment.md`.
+    #[serde(default)]
+    pub recur_progress_commitment: Hash32,
 }
 
 impl StepRecord {
@@ -611,26 +633,90 @@ pub struct ProgramEndEvent {
     pub output: Option<StorageData>,
 }
 
+/// What the runtime publishes as a program runs. The recorder turns each of
+/// these into a [`StepRecord`]; nothing here is committed to directly.
+///
+/// # Naming rule
+///
+/// An event is named for the **CFS item** it belongs to. If it denotes an
+/// *iteration* of that item rather than the item itself, the name says
+/// `Iteration`. Unmarked means the item.
+///
+/// A recur site has both: the iterations that ran under it, and the site
+/// itself. Without the rule the two read alike, and `RecurSequenceStart`
+/// (as it was named) reads as "the recur sequence begins" while denoting
+/// "iteration *i* of the recur sequence begins".
+///
+/// # The vocabulary
+///
+/// | event | level | published by | becomes | at coordinates |
+/// | --- | --- | --- | --- | --- |
+/// | `ProgramStart` / `ProgramEnd` | program | entrypoint codegen | `StepKind::ProgramStart` / `ProgramEnd` | `[]` |
+/// | `SequenceStart` / `SequenceEnd` | item | `#[sequence]` wrapper | `StepKind::SequenceStart` / `SequenceEnd` | `[s]` |
+/// | `TileExec` | item | `#[tile]` wrapper | `Exec(Tile)` | `[s]` |
+/// | `RecurTileIterationExec` | iteration | `#[tile]` wrapper, **reclassified at publish** | `Exec(Tile)` | `[s][i]` |
+/// | `RecurSequenceIterationStart` / `…End` | iteration | recur-sequence step fn | `StepKind::SequenceStart` / `SequenceEnd` | `[s][i]` |
+/// | `RecurTileStart` / `RecurTileEnd` | item | recur-tile driver, **around the loop** | `Exec(RecurTile)` | `[s]` |
+/// | `RecurSequenceStart` / `RecurSequenceEnd` | item | recur-sequence driver, **around the loop** | `Exec(RecurSequence)` | `[s]` |
+///
+/// A recur site brackets its iterations the way a sequence brackets its items:
+/// `Start` carries the loop's **inputs** — including the source's authenticated
+/// list metadata, which is what makes the loop bound `L` known *before*
+/// iteration 0 — and `End` carries the **output**. The single trailing
+/// `RecurTileEnd` / `RecurSequenceEnd` this replaces published both halves
+/// after the loop, which left no point at which `L` was available to the
+/// iterations checked against it (see
+/// `docs/proposals/recur-progress-commitment.md` §3.2).
+///
+/// One row still surprises every reader, so it is stated here:
+///
+/// - A recur tile's iterations record as `ExecTarget::Tile`, never
+///   `ExecTarget::RecurTile`. `RecurTile` names the site only.
+///
+/// "Reclassified at publish" is the one place the level is decided positionally
+/// rather than structurally: the `#[tile]` wrapper always publishes `TileExec`,
+/// and `publish_trace_event` rewrites it to `RecurTileIterationExec` while a
+/// recur-tile site is on the stack. The recorder asserts the invariant that
+/// makes this sound — an ordinary tile cannot execute while recur iterations
+/// are active.
+///
+/// # Variant order is load-bearing
+///
+/// Postcard encodes a variant as the varint of its **declaration index**, with
+/// no name. Reordering these variants therefore changes what every previously
+/// recorded binary trace decodes to — an old `TileExec` would come back as
+/// whatever now sits at that index. A reorder needs a trace-format version tag
+/// and a decoder that refuses older traces; it is a migration, not a tidy-up.
+/// Renaming a variant is free, and adding one at the end is free.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TraceEvent {
+    // Program level.
     ProgramStart(ProgramStartEvent),
     ProgramEnd(ProgramEndEvent),
 
+    // Sequence boundaries: the first pair per item, the second per iteration.
     SequenceStart(FnCallRecord),
     SequenceEnd(FnCallRecord),
-    RecurSequenceStart(FnCallRecord),
-    RecurSequenceEnd(FnCallRecord),
+    RecurSequenceIterationStart(FnCallRecord),
+    RecurSequenceIterationEnd(FnCallRecord),
 
+    // Execution: `RecurTileIterationExec` is per iteration, the rest per item.
     TileExec(FnCallRecord),
     RecurTileIterationExec(FnCallRecord),
-    RecurTileExec(FnCallRecord),
-    RecurSequenceExec(FnCallRecord),
+    // Site lifetime. These two were `RecurTileEnd` / `RecurSequenceEnd`; they
+    // are *renames*, which keeps their declaration indices — see the note on
+    // variant order below. Their `Start` halves are appended for the same
+    // reason.
+    RecurTileEnd(FnCallRecord),
+    RecurSequenceEnd(FnCallRecord),
+    RecurTileStart(FnCallRecord),
+    RecurSequenceStart(FnCallRecord),
 }
 
 #[cfg(test)]
 mod bound_index_tests {
     use super::*;
-    use crate::input::encode_index_leaf_payload;
+    use crate::input::{encode_index_leaf_payload, SelectionPayloadKind};
     use alloc::vec;
 
     /// A storage binding whose selection commits to `value` at `width` — i.e. a
@@ -646,6 +732,7 @@ mod bound_index_tests {
                 source_root_hash: [0u8; 32],
                 selected_hash: selection_payload_hash(&payload),
                 selected_len: payload.len() as u64,
+                payload_kind: SelectionPayloadKind::Raw,
             },
         }
     }
@@ -669,6 +756,7 @@ mod bound_index_tests {
                 source_root_hash: [9u8; 32],
                 selected_hash: [7u8; 32],
                 selected_len: 32,
+                payload_kind: SelectionPayloadKind::Raw,
             },
         }
     }
@@ -811,6 +899,7 @@ mod bound_index_tests {
                 source_root_hash: [0u8; 32],
                 selected_hash: [0u8; 32],
                 selected_len: 0,
+                payload_kind: SelectionPayloadKind::Raw,
             },
         };
         assert_eq!(verify_bound_index_bindings(&map(&[("row", plain)])), Ok(()));
