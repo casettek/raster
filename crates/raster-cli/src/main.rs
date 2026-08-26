@@ -242,6 +242,13 @@ enum ChainCommand {
         /// recent one (`latest`). Unauthenticated only.
         #[arg(long = "run", requires = "no_auth")]
         run_dir: Option<String>,
+
+        /// Trace transport format used between each stage process and the
+        /// Raster CLI. Transport only: every stage's commitment is built from
+        /// the decoded trace, so this changes no commitment and no audit.
+        /// Ignored under `--no-auth`, which records no trace at all.
+        #[arg(long = "trace-format", value_enum, default_value = "binary")]
+        trace_format: TraceFormat,
     },
 
     /// Verify a recorded chain's links and identities — public, no proving.
@@ -383,12 +390,14 @@ fn try_main() -> Result<()> {
                 no_auth,
                 stage,
                 run_dir,
+                trace_format,
             } => chain::run(
                 chain.as_deref(),
                 fraud_proof_window_size,
                 no_auth,
                 stage.as_deref(),
                 run_dir.as_deref(),
+                trace_format,
             ),
             ChainCommand::Audit {
                 chain,

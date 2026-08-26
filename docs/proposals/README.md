@@ -34,6 +34,7 @@ document, and correcting it is the author's call.
 | [`chain-repeat`](./chain-repeat.md) | proposed 2026-08-19 | — | whole; `[[chain.repeat]]` with an authorized trip count (literal / external / stage output), `ChainShape` in the chain commitment, `ChainFaultKind::Shape`. `while` mode (iterate-until-a-stage-says-stop) split out as future work |
 | [`unauthenticated-execution`](./unauthenticated-execution.md) | **implemented** — v1 2026-08-19, v2 2026-08-20, v3 2026-08-20 | runtime `AuthMode` (`raster-runtime/src/auth.rs`); `select!` dispatched on base provenance, so storage sources stay lazy; drafts keep field values and drop commitments; recur full; `cargo raster run --no-auth`; no trace emitted, so a trace commitment is structurally impossible; profiling refused; RAS-203a landed. v3: `cargo raster chain run --no-auth` — all-or-nothing, no chain-commitment, own runs root; plus a storage-backed base indexed by a tile-produced value, which §5.3/§5.4 left uncovered and which stage 1 of `raster-chain-inference` hit immediately. **6.6× on `hello-tiles`**, both modes value-identical end to end | typed `Schema::Partial` to remove the remaining serialize per draft op — deferred, needs a measurement on a draft-heavy program. Mixed-posture chain policy (on-demand per-stage commitment) still out of scope — §10; the cheap-stage half of §10 is now [`chain-stage-execution`](./chain-stage-execution.md) |
 | [`chain-stage-execution`](./chain-stage-execution.md) | **partly implemented** (2026-08-21) | §2–§4: `cargo raster chain run --no-auth --stage <name> [--run <dir>]` — one stage re-run in place, producer commitments rehydrated from `output.bin` via the existing `collect_output`, downstream stage dirs invalidated in spec order, `latest` pointer, spec-validity (`from` ordering) check moved ahead of execution. Authenticated path untouched. Verified end-to-end on a three-stage chain (`tests/chain_stage_cli.rs`, 7 tests — middle-stage re-run, multi-stage invalidation, stage-by-stage rebuild converging on the whole-chain result), for which it also supplies `examples/chain-example`, the chain fixture `program-chain` implementation order step 5 called for and never got | §1 — promoting the mode from `--no-auth` to a command, and the `chains-dry/` rename. **Blocked on naming**: `dry-run` reverses `unauthenticated-execution` §Naming *and* takes the term `zkvm-dry-run` §3 reserves; `unauth` costs one line and no collision. Untested: posture isolation (no `--stage` invocation touching `target/raster/chains/`) |
+| [`artifact-inspection`](./artifact-inspection.md) | proposed 2026-08-21 | — | whole; `cargo raster show <artifact>` — decode a raster payload back into a typed, structured value, plus `chain show <stage>`. The decoder already exists and is exercised on every selection (`RasterNodeKind::Leaf` carries `type_name`; `parse_leaf_value` / `tree_value_from_raster_node`) — it is all `pub(crate)` in `raster-runtime`, so the work is exposing it, a structural fallback for a missing `.rindex`, truncation limits, and rendering. Today the only way to read an artifact is `strings(1)` |
 
 ## Dependencies
 
@@ -83,6 +84,12 @@ unauthenticated-execution ····► incremental-draft-witness (impl) + lazy-li
         │      per-stage re-execution, unattested only, over program-chain (partial)
         └····► still unwritten: on-demand per-stage commitment for a contested
                stage, and what a mixed-posture chain commitment means — §10
+
+program-end (impl) ──► artifact-inspection (proposed)
+        defines output.bin;   `cargo raster show` reads it back. Non-blocking:
+        the decoder exists in raster-runtime, unexported. chain-stage-execution
+        (partial) is what makes the absence acute — re-run one stage, then have
+        no way to see what it produced.
 ```
 
 `──►` blocking. `····►` recommended, not blocking.
@@ -183,3 +190,14 @@ now brackets its iterations the way a sequence brackets its items. Variant indic
   coordinates are not held to the CFS. Unlike carried state it wants *derivation* (from the
   first step's own coordinates plus the CFS), not a carrier. Recorded in
   `recur-progress-commitment` §Problem.
+- **No loop-carried slot is both readable and incrementally committed.** `state` is readable and
+  re-committed whole every iteration; `output` pays only its increment and holds no value to
+  read. A bounded accumulator written slice by slice therefore costs `2 · N · |state|` to carry
+  through `N` iterations, and a data-dependent `Break` can only be decided from the expensive
+  slot — which is also the unchecked one. Written up as
+  [`docs/issues/recur-accumulator-slots.md`](../issues/recur-accumulator-slots.md); adjacent to
+  `loop-carried-state` (recur *sequences* carrying a `List` by reference) but not covered by it,
+  since a recur *tile* body has no `select!` and a reference would be materialized anyway.
+
+Gaps are collected in [`docs/issues/`](../issues/README.md) once they are reproducible from the
+code; that directory's README states the issue-versus-proposal split.

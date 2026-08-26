@@ -131,6 +131,7 @@ pub fn run(
     no_auth: bool,
     stage_selection: Option<&str>,
     run_dir: Option<&str>,
+    trace_format: TraceFormat,
 ) -> Result<()> {
     let (spec, base_dir) = resolve_chain(chain)?;
     validate_spec(&spec)?;
@@ -301,6 +302,7 @@ pub fn run(
             &synth.input_manifest_path,
             &stage_dir,
             no_auth,
+            trace_format,
         )?;
         execution_times.push((stage.name.clone(), execution_time));
         println!("    exec {}", format_duration(execution_time));
@@ -703,6 +705,11 @@ fn detect_execution_fraud(recorded: &RecordedChain) -> Result<Option<StageExecut
         );
         // Authenticated: an audit compares this run's trace against the stage's
         // committed one, so there is one by construction.
+        //
+        // Binary regardless of what the recorded run chose: this trace is
+        // consumed in-process by the verifier below and never read again, so
+        // there is no reader to accommodate and no reason to pay JSON's
+        // encoding cost on a re-run of every stage.
         let (replay, _execution_time) = build_and_run_stage(
             &project,
             &cfs,
@@ -710,6 +717,7 @@ fn detect_execution_fraud(recorded: &RecordedChain) -> Result<Option<StageExecut
             &input_manifest_path,
             &audit_dir,
             false,
+            TraceFormat::Binary,
         )?;
         let (trace, recorder) = replay.expect("an authenticated stage run produces a trace");
 
@@ -941,10 +949,15 @@ pub fn fraud_verify(
 // ---------------------------------------------------------------------------
 
 /// Build the stage project and run its binary, writing the trace to
-/// `stage_dir/trace.bin` and the output artifact to `stage_dir` (via
-/// `RASTER_OUTPUT_DIR`). Returns the loaded trace and how long the stage
-/// binary itself ran — wall clock of the child process, excluding the build
-/// that precedes it and the trace load that follows.
+/// `stage_dir/` under `trace_format`'s file name and the output artifact to
+/// `stage_dir` (via `RASTER_OUTPUT_DIR`). Returns the loaded trace and how long
+/// the stage binary itself ran — wall clock of the child process, excluding the
+/// build that precedes it and the trace load that follows.
+///
+/// `trace_format` is transport only: this function writes the trace and reads
+/// it back within the one call, and nothing downstream reads the file again —
+/// `chain audit` and `chain fraud-prove` work from the stage's `commit.bin`.
+/// So the choice is per-invocation and changes no commitment.
 ///
 /// With `no_auth` the stage runs with authenticated storage off and the trace
 /// is `None`: the runtime installs no publisher in that mode, so there would be
@@ -956,6 +969,7 @@ fn build_and_run_stage(
     input_manifest_path: &Path,
     stage_dir: &Path,
     no_auth: bool,
+    trace_format: TraceFormat,
 ) -> Result<(Option<(Trace, TraceRecorder)>, Duration)> {
     // The stage build is plumbing, not chain output: its cargo progress,
     // dependency warnings, and protocol-guest build chatter would bury the
@@ -997,7 +1011,7 @@ fn build_and_run_stage(
         )));
     }
 
-    let trace_path = stage_dir.join(TraceFormat::Binary.trace_file_name());
+    let trace_path = stage_dir.join(trace_format.trace_file_name());
     let input_json = input_json_path.to_string_lossy().to_string();
     let input_manifest = input_manifest_path.to_string_lossy().to_string();
 
@@ -1018,7 +1032,7 @@ fn build_and_run_stage(
         runtime_env.apply(&mut command);
     } else {
         runtime_env
-            .authenticated(&trace_path, TraceFormat::Binary)
+            .authenticated(&trace_path, trace_format)
             .apply(&mut command);
     }
 
@@ -1042,7 +1056,7 @@ fn build_and_run_stage(
 
     let (trace, recorder) = load_trace_from_file(
         &trace_path,
-        TraceFormat::Binary,
+        trace_format,
         cfs,
         Some(&input_json),
         Some(&input_manifest),
