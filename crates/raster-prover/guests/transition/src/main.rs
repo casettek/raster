@@ -69,6 +69,7 @@ fn main() {
         params.transition_image_id,
         params.program_commitment,
         window_context.refuted_trace_commitment,
+        window_context.window_is_terminal,
         &input,
         entrypoint_authorization,
         output_authorization,

@@ -75,8 +75,8 @@ pub struct TraceCommitmentHeader {
 
 impl TraceCommitmentHeader {
     /// The commitment identity: `sha256(domain || postcard(self))`. This is
-    /// what a journal's `refuted_trace_commitment` and a chain checkpoint's
-    /// `trace_commitment_digest` carry.
+    /// what a journal's `refuted_trace_commitment` carries. A chain checkpoint
+    /// no longer names one — see `docs/proposals/chain-io-commitment.md`.
     pub fn digest(&self) -> Vec<u8> {
         let mut hasher = Sha256::new();
         hasher.update(TRACE_COMMITMENT_DOMAIN);
@@ -294,15 +294,23 @@ pub enum EntrypointAuthorization {
 /// terminal step bound into the fingerprint, host-side full-trace verification
 /// requires it, and any consumer accepting a completed-program journal requires
 /// `Established`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OutputAuthorization {
     /// The CFS declares `main` returns no value — there is no output to bind.
     NotRequired,
     /// The chain has not yet reached (and verified) the program's end.
     Pending,
     /// A `ProgramEnd` step has been verified in this chain: the committed
-    /// output provably lives in committed storage.
-    Established,
+    /// output provably lives in committed storage — and `output_commitment`
+    /// is the value it committed (`ProgramEnd.output_commitment`, checked
+    /// in-guest against the selection witness by
+    /// `checks::entrypoint::verify_program_end`).
+    ///
+    /// Carrying the value rather than only the fact is what makes the journal
+    /// symmetric: [`TransitionJournal::input_manifest_commitment`] names the
+    /// authorized *input* the same window is bound to, and this names the
+    /// output it produced. See `docs/proposals/chain-io-commitment.md`.
+    Established { output_commitment: Vec<u8> },
 }
 
 /// Journal produced by the transition guest (init state + current state + image id).
@@ -342,4 +350,20 @@ pub struct TransitionJournal {
     /// step is verified, `Established` after. Inherited across `Next` steps.
     /// See [`OutputAuthorization`].
     pub output_authorization: OutputAuthorization,
+
+    /// Whether this window ends exactly where the commitment named by
+    /// [`Self::refuted_trace_commitment`] ends — `init_frontier.position +
+    /// fingerprint.len() == header.fingerprint_len`. Derived in-guest at
+    /// `Init` from the same header the slice check reads, and inherited
+    /// across `Next` steps.
+    ///
+    /// Why it matters, and why it is separate from
+    /// [`Self::output_authorization`]: a `ProgramEnd` step forces
+    /// `next_expected_coordinates` empty, so nothing may follow it *within* a
+    /// window — a window containing one ends with it. Add this flag and the
+    /// `ProgramEnd` is the *commitment's* last item too. A consumer that
+    /// requires `Established { .. } && window_is_terminal` therefore learns
+    /// the trace's actual result, not the output of some `ProgramEnd`
+    /// sitting mid-commitment. See `docs/proposals/chain-io-commitment.md`.
+    pub window_is_terminal: bool,
 }

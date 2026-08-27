@@ -1,0 +1,26 @@
+{
+  "format": 1,
+  "program_commitment": "40c81a4ed0596fee8b478ee64fd396aae981d0b70d004eec23fe3fd7d8cee34a",
+  "tiles": {
+    "mean_scaled": {
+      "image_id": "45d822fef14d649bf8ecf46a75813dcfe3ee7b075bf32920a13b6b251e6492c6",
+      "source_hash": "9513a10179eb73d80000000000000a80"
+    },
+    "push_mean": {
+      "image_id": "23c37fcfbd82e41f4c521fd5cfd9e2d341b6023741d54214cc1cdccdfa6b1a10",
+      "source_hash": "9513a10179eb73d80000000000000a80"
+    },
+    "push_metric": {
+      "image_id": "1383d439a695e2360de16812d7e0aa2d2024922699059e5e18302143a09e7d62",
+      "source_hash": "9513a10179eb73d80000000000000a80"
+    },
+    "set_report_title": {
+      "image_id": "2a65d13ddb8e9bafbbbfb78355e2a88b1a410cac212b8ee3bfc07699d610febf",
+      "source_hash": "9513a10179eb73d80000000000000a80"
+    }
+  },
+  "toolchain": {
+    "risc0": "risc0-zkvm-1.2",
+    "build_mode": "local"
+  }
+}

@@ -242,5 +242,10 @@ pub fn verify_program_end(
         "ProgramEnd output commitment does not match the selected output hash",
     );
 
-    OutputAuthorization::Established
+    // Carry the value, not just the fact: it has been verified against the
+    // selection witness above, so committing it to the journal costs nothing
+    // and is what lets a consumer learn *which* output this trace produced.
+    OutputAuthorization::Established {
+        output_commitment: program_end.output_commitment.clone(),
+    }
 }

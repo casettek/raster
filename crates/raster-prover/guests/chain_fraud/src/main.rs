@@ -21,7 +21,6 @@ use raster_core::chain::{
     ChainCommitment, ChainFaultKind, ChainFraudEvidence, ChainFraudInput, ChainFraudJournal,
     InputBindingSource, StageCheckpoint,
 };
-use raster_core::transition::{TransitionJournal, TransitionState};
 
 fn sha256_bytes(bytes: &[u8]) -> [u8; 32] {
     Risc0Sha256::hash_bytes(bytes).as_bytes().try_into().unwrap()
@@ -48,39 +47,6 @@ fn verify_inner_receipt<J: serde::Serialize>(image_id: &[u8], journal: &J) {
         .expect("Failed to verify inner receipt");
 }
 
-/// An `Execution` fault: a verified, `Finished` stage fraud receipt whose
-/// attribution triple matches the checkpoint — it refutes exactly this
-/// stage's program, authorized inputs, and committed trace.
-fn verify_execution_fault(
-    stage: &StageCheckpoint,
-    fraud_journal: &TransitionJournal,
-    transition_image_id: &[u8],
-) {
-    verify_inner_receipt(transition_image_id, fraud_journal);
-    // The transition guest holds its image id constant across the receipt's
-    // whole recursion, so this equality extends the verification to every
-    // inner step, and the id we commit is the one that recursion ran under.
-    assert!(
-        fraud_journal.transition_image_id == transition_image_id,
-        "Fraud journal names a different transition guest than it was verified with"
-    );
-    assert!(
-        matches!(fraud_journal.current_state, TransitionState::Finished),
-        "Stage receipt is an honest window, not a fraud proof"
-    );
-    assert!(
-        fraud_journal.program_commitment == stage.program_commitment,
-        "Fraud receipt refutes a different program than the checkpoint's"
-    );
-    assert!(
-        fraud_journal.input_manifest_commitment == stage.input_manifest_commitment,
-        "Fraud receipt was authorized against a different input manifest"
-    );
-    assert!(
-        fraud_journal.refuted_trace_commitment == stage.trace_commitment_digest,
-        "Fraud receipt refutes a different trace commitment than the checkpoint's"
-    );
-}
 
 /// A `Link` fault: the checkpoint's own committed manifest feeds a `from`
 /// parameter a value different from the producing stage's committed output
@@ -142,13 +108,6 @@ fn main() {
         .expect("faulty_stage is out of range for this chain");
 
     let (fault, transition_image_id, authorization_image_id) = match &input.evidence {
-        ChainFraudEvidence::Execution {
-            fraud_journal,
-            transition_image_id,
-        } => {
-            verify_execution_fault(stage, fraud_journal, transition_image_id);
-            (ChainFaultKind::Execution, transition_image_id.clone(), Vec::new())
-        }
         ChainFraudEvidence::Link {
             parameter,
             authorization_journal,

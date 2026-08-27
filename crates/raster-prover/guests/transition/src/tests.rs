@@ -1615,4 +1615,219 @@ mod fingerprint_slice {
             &witness,
         );
     }
+
+    /// Build a valid window at `[window_start, window_start + window_len)` of
+    /// a `items`-long commitment and report whether the check calls it
+    /// terminal.
+    fn terminality_of(window_start: usize, window_len: usize) -> bool {
+        let (bits_per_item, items) = (4, 40);
+        let bits = fixture_bits(bits_per_item, items);
+
+        let packer = BitPacker::new(bits_per_item);
+        let window_bits = packer
+            .get_range(window_start, window_start + window_len, &bits)
+            .expect("window slice");
+        let window = Fingerprint::from(window_bits, packer, window_len);
+
+        let (header, witness) =
+            build_header_and_witness(&bits, bits_per_item, items, window_start, window_len);
+        assert_window_is_commitment_slice(
+            &init_transition_with_window(window_start, window),
+            &header,
+            &witness,
+        )
+    }
+
+    /// A window ending exactly at the committed fingerprint's end is terminal:
+    /// a `ProgramEnd` inside it is the commitment's last item.
+    #[test]
+    fn a_window_ending_at_the_commitment_end_is_terminal() {
+        // Items [36, 40) of a 40-item commitment.
+        assert!(terminality_of(36, 4));
+    }
+
+    /// The case the flag exists for. This window is a perfectly valid slice —
+    /// the check passes — but it sits mid-commitment, so a `ProgramEnd` found
+    /// inside it would *not* be the trace's result.
+    #[test]
+    fn a_valid_mid_commitment_window_is_not_terminal() {
+        assert!(!terminality_of(14, 4));
+    }
+
+    /// Off by exactly one item. Terminality is an equality, not a bound.
+    #[test]
+    fn a_window_one_item_short_of_the_end_is_not_terminal() {
+        assert!(!terminality_of(35, 4));
+    }
+}
+
+// ============================================================================
+// Program output binding (`verify_program_end`)
+// ============================================================================
+
+mod program_end {
+    use super::*;
+    use raster_core::input::SelectionCommitment;
+    use raster_core::trace::ProgramEndStep;
+    use raster_core::transition::OutputAuthorization;
+
+    use crate::checks::entrypoint::verify_program_end;
+
+    /// `main` returns a value, so a `ProgramEnd` owes an output binding.
+    fn producing_cfs() -> CfsCursor {
+        CfsCursor::new(ControlFlowSchema {
+            version: "1.0".into(),
+            project: "test".into(),
+            encoding: "postcard".into(),
+            tiles: vec![],
+            sequences: vec![SequenceDef {
+                id: "main".into(),
+                input_sources: vec![],
+                items: vec![],
+                entry_arguments: vec![],
+                produces_output: true,
+            }],
+        })
+    }
+
+    fn program_end_record(program_end: ProgramEndStep) -> StepRecord {
+        StepRecord {
+            exec_index: 9,
+            sequence_id: "main".to_string(),
+            // `entrypoint_coordinates()` — the sequence root.
+            coordinates: CfsCoordinates(vec![]),
+            kind: StepKind::ProgramEnd(program_end),
+            recur_progress_commitment: RecurProgressStack::new().commitment(),
+        }
+    }
+
+    /// A program output living at the sequence root, selected whole.
+    ///
+    /// `selected_len == 0` keeps the selection *witness* out of the picture —
+    /// `verify_program_end` only verifies one for a non-empty selection, and
+    /// the selection machinery is covered elsewhere. What is under test here
+    /// is the binding between the step's `output_commitment` and what the
+    /// function returns.
+    fn fixture(
+        object_commitment: Vec<u8>,
+        selected_hash: Vec<u8>,
+        declared_output_commitment: Vec<u8>,
+    ) -> (StorageEntry, Vec<u8>, Vec<u8>, StorageReadWitness, StepRecord) {
+        let entry = StorageEntry {
+            coordinates: CfsCoordinates(vec![]),
+            object_commitment: object_commitment.clone(),
+        };
+        let (_frontier, root, _index, index_root) = build_storage_context(&[entry.clone()]);
+        let witness = build_read_witness(&[entry.clone()], &entry);
+
+        let source_root_hash: [u8; 32] = object_commitment
+            .clone()
+            .try_into()
+            .expect("test commitments are 32 bytes");
+        let selected: [u8; 32] = selected_hash
+            .try_into()
+            .expect("test commitments are 32 bytes");
+
+        let record = program_end_record(ProgramEndStep {
+            output: Some(StorageData {
+                coordinates: CfsCoordinates(vec![]),
+                commitment: object_commitment,
+                selector: Default::default(),
+                selection: SelectionCommitment {
+                    source_root_hash,
+                    selected_hash: selected,
+                    selected_len: 0,
+                    ..Default::default()
+                },
+            }),
+            output_commitment: declared_output_commitment,
+            storage: dummy_storage_roots(),
+        });
+
+        (entry, root, index_root, witness, record)
+    }
+
+    /// The phase-1 property: the value the check already verified is the value
+    /// it hands back, so the journal can name *which* output this trace
+    /// produced rather than only that one exists.
+    #[test]
+    fn establishes_with_the_committed_output_value() {
+        let object_commitment = sha(b"program-output-object");
+        let selected_hash = sha(b"program-output-value");
+        let (_entry, root, index_root, witness, record) = fixture(
+            object_commitment,
+            selected_hash.clone(),
+            selected_hash.clone(),
+        );
+        let StepKind::ProgramEnd(program_end) = record.kind.clone() else {
+            unreachable!("fixture builds a ProgramEnd step");
+        };
+
+        assert_eq!(
+            verify_program_end(
+                &producing_cfs(),
+                &record,
+                &program_end,
+                &root,
+                &index_root,
+                Some(&witness),
+                None,
+            ),
+            OutputAuthorization::Established {
+                output_commitment: selected_hash,
+            },
+        );
+    }
+
+    /// The invariant the carried value rests on. Without this, `Established`
+    /// could name a value the selection never produced.
+    #[test]
+    #[should_panic(expected = "ProgramEnd output commitment does not match the selected output")]
+    fn rejects_an_output_commitment_that_is_not_the_selected_hash() {
+        let (_entry, root, index_root, witness, record) = fixture(
+            sha(b"program-output-object"),
+            sha(b"program-output-value"),
+            sha(b"a-different-value"),
+        );
+        let StepKind::ProgramEnd(program_end) = record.kind.clone() else {
+            unreachable!("fixture builds a ProgramEnd step");
+        };
+
+        verify_program_end(
+            &producing_cfs(),
+            &record,
+            &program_end,
+            &root,
+            &index_root,
+            Some(&witness),
+            None,
+        );
+    }
+
+    /// A unit `main` binds nothing and carries no value — the variant stays
+    /// payload-free, so nothing downstream can read an output out of it.
+    #[test]
+    fn unit_output_is_not_required() {
+        let record = program_end_record(ProgramEndStep {
+            output: None,
+            output_commitment: Vec::new(),
+            storage: dummy_storage_roots(),
+        });
+        let StepKind::ProgramEnd(program_end) = record.kind.clone() else {
+            unreachable!("fixture builds a ProgramEnd step");
+        };
+
+        assert_eq!(
+            verify_program_end(
+                &no_entrypoint_cfs(),
+                &record,
+                &program_end,
+                &EMPTY_LEAF.to_vec(),
+                &Vec::new(),
+                None,
+                None,
+            ),
+            OutputAuthorization::NotRequired,
+        );
+    }
 }

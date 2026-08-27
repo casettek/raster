@@ -61,13 +61,6 @@ pub fn verify_chain_fraud_receipt(receipt: &risc0_zkvm::Receipt) -> Result<Chain
         .map_err(|e| BitPackerError::SerializationError(format!("chain-fraud journal: {e}")))?;
 
     match journal.fault {
-        ChainFaultKind::Execution => {
-            if journal.transition_image_id != transition_guest_image_id() {
-                return Err(BitPackerError::InvalidCommitment(
-                    "chain-fraud receipt verified an unknown transition guest".to_string(),
-                ));
-            }
-        }
         ChainFaultKind::Link => {
             if journal.authorization_image_id != authorization_guest_image_id() {
                 return Err(BitPackerError::InvalidCommitment(
