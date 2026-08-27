@@ -14,7 +14,6 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::authorization::AuthorizationJournal;
-use crate::transition::TransitionJournal;
 
 /// Provenance of one stage parameter, recorded in the checkpoint.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -28,6 +27,15 @@ pub enum InputBindingSource {
 /// One link of the chain: which program ran, on which authorized inputs, to
 /// which authorized output — the same tuple `program-identity.md` names, with
 /// the output side expanded into the two commitments a link needs.
+///
+/// **Input and output only.** Every field is a pure function of public
+/// artifacts, so a checkpoint costs no trace and no authenticated storage —
+/// a cheap run produces byte-identical bytes to an authenticated one. The
+/// trace commitment a stage's execution is disputed against is not named
+/// here: it is a dispute-time artifact, produced on demand by re-running the
+/// contested stage (`cargo raster chain run --stage <name>`), because
+/// execution is a pure function of the committed program and inputs. See
+/// `docs/proposals/chain-io-commitment.md`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StageCheckpoint {
     pub name: String,
@@ -43,12 +51,6 @@ pub struct StageCheckpoint {
     /// `payload_structural_root(output.bin)` == the output manifest's per-value
     /// commitment. Empty for a unit-output terminal stage.
     pub output_structural_commitment: Vec<u8>,
-    /// `TraceCommitmentHeader::digest()` of the stage's `commit.bin` — ties
-    /// this checkpoint to a specific (optimistically auditable) run without
-    /// embedding the trace-sized commitment itself. `chain audit` recomputes
-    /// it from the stage artifact; a stage fraud receipt's
-    /// `refuted_trace_commitment` is attributed by equality with it.
-    pub trace_commitment_digest: Vec<u8>,
 }
 
 /// The chain-level object: an ordered list of stage checkpoints. A verifier
@@ -71,13 +73,18 @@ impl ChainCommitment {
 /// Which committed chain fault a chain fraud proof exhibits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ChainFaultKind {
-    /// The stage's committed trace diverges from honest execution — proven by
-    /// a transition fraud receipt bound to the stage's `commit.bin`.
-    Execution,
     /// A `from` parameter's committed input value differs from the producing
     /// stage's committed output structural root — an inconsistency inside the
     /// `ChainCommitment` itself, proven from the manifest the checkpoint
     /// committed.
+    ///
+    /// The only fault a `ChainCommitment` can condemn *on its own*. Execution
+    /// fraud is no longer one: with no trace commitment in the checkpoint
+    /// there is nothing for a stage fraud receipt to be attributed against,
+    /// so a divergent stage is established by the challenge/response protocol
+    /// instead — see `docs/proposals/chain-io-commitment.md` §3. Until that
+    /// lands, `chain audit --execution` detects it and `chain fraud-prove`
+    /// emits a terminal-window receipt as evidence.
     Link,
 }
 
@@ -99,8 +106,10 @@ pub struct ChainFraudJournal {
     /// `== ChainCommitment.stages[faulty_stage].program_commitment`.
     pub stage_program_commitment: Vec<u8>,
     pub fault: ChainFaultKind,
-    /// The transition-guest image id the stage fraud receipt was verified
-    /// against (`Execution` faults; empty for `Link`).
+    /// Reserved for a fault kind that verifies a transition receipt. Always
+    /// empty today: `Link` is the only kind, and it verifies an authorization
+    /// journal. Kept so the journal shape survives the dispute protocol
+    /// landing (`docs/proposals/chain-io-commitment.md` §5).
     pub transition_image_id: Vec<u8>,
     /// The authorization-guest image id the manifest journal was verified
     /// against (`Link` faults; empty for `Execution`).
@@ -111,14 +120,6 @@ pub struct ChainFraudJournal {
 /// here must also be supplied to the prover as an assumption.
 #[derive(Clone, Serialize, Deserialize)]
 pub enum ChainFraudEvidence {
-    /// A stage fraud receipt's (reduced, `Finished`) journal, plus the image
-    /// id to verify it against. The guest asserts the journal's own
-    /// `transition_image_id` matches, so the id it commits is the one the
-    /// receipt's whole recursion was checked with.
-    Execution {
-        fraud_journal: TransitionJournal,
-        transition_image_id: Vec<u8>,
-    },
     /// The consumer stage's authorized-manifest journal (which carries the
     /// parsed `param -> commitment` map), plus the image id to verify it
     /// against, and the offending `from` parameter.

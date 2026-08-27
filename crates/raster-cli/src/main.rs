@@ -231,16 +231,21 @@ enum ChainCommand {
 
         /// Run only this stage, in place, against an existing run directory.
         /// Its `from` producers must already have an `output.bin` there; every
-        /// stage after it is deleted, since it is now stale. Unauthenticated
-        /// only — a chain-commitment is a statement about a whole chain, so
-        /// there is no per-stage form of one.
-        #[arg(long, requires = "no_auth")]
+        /// stage after it is deleted, since it is now stale.
+        ///
+        /// Authenticated single-stage runs write the stage's `commit.bin` but
+        /// **no** chain-commitment: one is a statement about a whole chain, so
+        /// there is no per-stage form of it, and the existing one is left
+        /// untouched rather than overwritten with a one-stage impostor. That
+        /// is what a dispute needs — the contested stage's trace, on demand.
+        /// See `docs/proposals/chain-io-commitment.md`.
+        #[arg(long)]
         stage: Option<String>,
 
         /// The chain run directory to work in, e.g.
-        /// `target/raster/chains-no-auth/00017…-pid4021`. Omit to use the most
-        /// recent one (`latest`). Unauthenticated only.
-        #[arg(long = "run", requires = "no_auth")]
+        /// `target/raster/chains/00017…-pid4021` (or `chains-no-auth/…` under
+        /// `--no-auth`). Omit to use the most recent one (`latest`).
+        #[arg(long = "run")]
         run_dir: Option<String>,
 
         /// Trace transport format used between each stage process and the

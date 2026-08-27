@@ -922,6 +922,88 @@ impl<'a> TraceVerifier<'a> {
 
         VerificationResult::Ok
     }
+
+    /// The window covering the trace's final `window_size` items, paired with
+    /// the *committed* fingerprint slice over that same range.
+    ///
+    /// Not a fraud path — no divergence is sought, and none is expected: the
+    /// caller builds the commitment and the trace from the same run, so the
+    /// slice matches by construction. What this produces is the window a
+    /// **terminal-window receipt** is proven over: the one whose last step is
+    /// `ProgramEnd`, and which the guest recognises as terminal because it
+    /// ends exactly where the committed fingerprint ends (see
+    /// `TransitionJournal::window_is_terminal` and
+    /// `docs/proposals/chain-io-commitment.md`).
+    ///
+    /// Shares `verify`'s walk deliberately: the trailing `Window` buffers, the
+    /// frontier alignment (`window_frontiers.first()` is the frontier *before*
+    /// the first window item) and the input-source witnessing are the same
+    /// mechanism, so the two windows are constructed the same way and can be
+    /// fed to the same prover.
+    pub fn terminal_window(&mut self, trace: &Trace) -> Result<FraudEvidence> {
+        if trace.len() < self.window_size {
+            return Err(BitPackerError::InvalidWindow(format!(
+                "Trace has {} steps but a terminal window needs at least {}",
+                trace.len(),
+                self.window_size
+            )));
+        }
+
+        let cfs_cursor = CfsCursor::new(self.cfs.clone());
+
+        for step_record in trace.iter() {
+            self.window_frontiers.push(self.latest_frontier.clone());
+            self.window_items.push(step_record.clone());
+
+            self.latest_frontier.append(Bytes(step_record.hash()));
+
+            let root = TraceTree::from_frontier(1, self.latest_frontier.clone())
+                .root(0)
+                .expect("Failed to derive current trace root from frontier");
+            self.fingerprint_acc.append(&root.0);
+        }
+
+        let last_index = trace.len() - 1;
+        let window_start = trace.len() - self.window_size;
+        let committed_bits = self
+            .trace_commitment
+            .fingerprint
+            .bits_packer
+            .get_range(
+                window_start,
+                last_index + 1,
+                &self.trace_commitment.fingerprint.bits,
+            )
+            .ok_or_else(|| {
+                BitPackerError::InvalidWindow(
+                    "Committed fingerprint is shorter than the trace".to_string(),
+                )
+            })?;
+        let window_fingerprint = Fingerprint::from(
+            committed_bits,
+            self.trace_commitment.fingerprint.bits_packer,
+            self.window_size,
+        );
+
+        let window_frontier = self
+            .window_frontiers
+            .first()
+            .expect("a walked trace leaves at least one window frontier")
+            .clone();
+        let window = TraceWindow {
+            frontier: serializable_frontier_from_trace_frontier(window_frontier).to_bytes(),
+            items: self.window_items.to_vec(),
+            fingerprint: window_fingerprint,
+        };
+
+        let input_sources_witnesses =
+            witness_record_inputs(trace, last_index, &window, &cfs_cursor, &self.seed);
+
+        Ok(FraudEvidence {
+            window,
+            input_sources_witnesses,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -1313,6 +1395,75 @@ mod tests {
 
         let verification_result = trace_verifier.verify(&trace);
         assert!(matches!(verification_result, VerificationResult::Ok));
+    }
+
+    /// The terminal window must satisfy, on the host, the exact equality the
+    /// guest re-derives at `Init` to set `window_is_terminal`:
+    /// `init_frontier.position + window.fingerprint.len() == fingerprint_len`.
+    ///
+    /// Asserting it here is what keeps `prove_terminal_window` honest without
+    /// running a proof: if the frontier alignment or the slice range drifts,
+    /// the guest would silently call the window non-terminal and every
+    /// terminal-window receipt would stop being admissible.
+    #[test]
+    fn terminal_window_ends_where_the_committed_fingerprint_ends() {
+        let trace = Trace((0..8).map(|i| make_tile_trace_item(i, i)).collect());
+        let trace_commitment = TraceCommitment::build(
+            &trace,
+            &precomputed::EMPTY_TRIE_NODES[0],
+            test_fraud_proof_config(),
+        );
+        let fingerprint_len = trace_commitment.fingerprint.len();
+        let window_size = trace_commitment.window_size();
+        let cfs = make_test_cfs();
+        let mut trace_verifier = TraceVerifier::new(
+            trace_commitment,
+            &precomputed::EMPTY_TRIE_NODES[0],
+            &cfs,
+        )
+        .expect("valid commitment");
+
+        let evidence = trace_verifier
+            .terminal_window(&trace)
+            .expect("terminal window");
+
+        // The window is the trace's tail.
+        assert_eq!(evidence.window.items.len(), window_size);
+        assert_eq!(
+            evidence.window.items.last().expect("non-empty window"),
+            trace.last().expect("non-empty trace"),
+        );
+
+        // The guest's terminality equality, computed the guest's way.
+        let frontier = SerializableFrontier::from_bytes(&evidence.window.frontier)
+            .expect("window frontier deserializes");
+        let window_start = usize::try_from(frontier.position).expect("position fits");
+        assert_eq!(
+            window_start + evidence.window.fingerprint.len(),
+            fingerprint_len,
+            "terminal window must end where the committed fingerprint ends",
+        );
+    }
+
+    /// A trace shorter than one window has no terminal window to prove.
+    #[test]
+    fn terminal_window_rejects_a_trace_shorter_than_the_window() {
+        let trace = Trace((0..8).map(|i| make_tile_trace_item(i, i)).collect());
+        let trace_commitment = TraceCommitment::build(
+            &trace,
+            &precomputed::EMPTY_TRIE_NODES[0],
+            test_fraud_proof_config(),
+        );
+        let cfs = make_test_cfs();
+        let mut trace_verifier = TraceVerifier::new(
+            trace_commitment,
+            &precomputed::EMPTY_TRIE_NODES[0],
+            &cfs,
+        )
+        .expect("valid commitment");
+
+        let short = Trace(trace.iter().take(1).cloned().collect());
+        assert!(trace_verifier.terminal_window(&short).is_err());
     }
 
     #[test]

@@ -109,6 +109,10 @@ pub struct FraudProofWindowContext {
     /// audits — derived at `Init` (after the slice check below), inherited
     /// from the recursively verified previous journal at `Next`.
     pub refuted_trace_commitment: Vec<u8>,
+    /// Whether this window ends where that commitment ends. Derived at `Init`
+    /// by the slice check, inherited at `Next`. See
+    /// `TransitionJournal::window_is_terminal`.
+    pub window_is_terminal: bool,
 }
 
 impl FraudProofWindowContext {
@@ -137,7 +141,7 @@ impl FraudProofWindowContext {
             TransitionState::Init(init_transition) => {
                 let (commitment_header, slice_witness) = commitment_binding
                     .expect("Init step requires the trace-commitment header and slice witness");
-                assert_window_is_commitment_slice(
+                let window_is_terminal = assert_window_is_commitment_slice(
                     &init_transition,
                     &commitment_header,
                     &slice_witness,
@@ -171,6 +175,7 @@ impl FraudProofWindowContext {
                         init_state: init_transition,
                         position: StepPosition::First,
                         refuted_trace_commitment,
+                        window_is_terminal,
                     },
                     live,
                 )
@@ -192,6 +197,7 @@ impl FraudProofWindowContext {
                         init_state: prev_journal.init_state,
                         position: StepPosition::Subsequent,
                         refuted_trace_commitment: prev_journal.refuted_trace_commitment,
+                        window_is_terminal: prev_journal.window_is_terminal,
                     },
                     live,
                 )
@@ -215,11 +221,17 @@ impl FraudProofWindowContext {
 /// `fingerprint_root` at its derived index, and every window item's
 /// fingerprint value must equal the value at its bit offset inside those
 /// proven blocks.
+///
+/// Returns whether the window is **terminal** in that commitment — it ends
+/// exactly where the committed fingerprint ends. Derived here because this is
+/// the one place holding `s`, `w` and `header.fingerprint_len` at once; the
+/// header is dropped when `proceed` returns, and `apply_verified_step` never
+/// sees it. See `TransitionJournal::window_is_terminal`.
 pub(crate) fn assert_window_is_commitment_slice(
     init_transition: &InitTransition,
     header: &TraceCommitmentHeader,
     slice_witness: &FingerprintSliceWitness,
-) {
+) -> bool {
     let window_fingerprint = &init_transition.fingerprint;
     assert!(
         window_fingerprint.bits_packer == header.bits_packer,
@@ -284,6 +296,9 @@ pub(crate) fn assert_window_is_commitment_slice(
             "Window fingerprint diverges from the committed fingerprint slice"
         );
     }
+
+    // `<=` was asserted above; equality is the terminal case.
+    window_start + window_len == fingerprint_len
 }
 
 /// Recursively verify the previous transition receipt for this same guest.
@@ -434,7 +449,7 @@ impl LiveTransition {
     }
 
     pub fn output_authorization(&self) -> OutputAuthorization {
-        self.output_authorization
+        self.output_authorization.clone()
     }
 
     /// Verify every recorded aspect of one step and advance the state:
@@ -606,6 +621,7 @@ pub fn commit_journal(
     transition_image_id: Vec<u8>,
     program_commitment: Vec<u8>,
     refuted_trace_commitment: Vec<u8>,
+    window_is_terminal: bool,
     input: &TransitionInput,
     entrypoint_authorization: EntrypointAuthorization,
     output_authorization: OutputAuthorization,
@@ -623,6 +639,7 @@ pub fn commit_journal(
         refuted_trace_commitment,
         entrypoint_authorization,
         output_authorization,
+        window_is_terminal,
     };
 
     env::commit(&journal);

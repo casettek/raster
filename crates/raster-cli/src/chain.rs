@@ -36,14 +36,11 @@ use raster_core::trace::Trace;
 use raster_core::transition::TransitionJournal;
 use raster_core::{Error, Result};
 use raster_prover::authorization::{authorization_guest_image_id, authorize_external_inputs};
-use raster_prover::chain_fraud::{
-    prove_chain_fraud, transition_guest_image_id, verify_chain_fraud_receipt,
-};
+use raster_prover::chain_fraud::{prove_chain_fraud, verify_chain_fraud_receipt};
 use raster_prover::precomputed::EMPTY_TRIE_NODES;
 use raster_prover::replay::Replayer;
 use raster_prover::trace::{
-    FraudEvidence, FraudProofConfig, TraceCommitment, TraceCommitmentExt, TraceVerifier,
-    VerificationResult,
+    FraudProofConfig, TraceCommitment, TraceCommitmentExt, TraceVerifier,
 };
 use raster_runtime::TraceRecorder;
 
@@ -166,18 +163,32 @@ pub fn run(
     // identity (neither a cached `program.bin` nor a `Raster.lock` to regenerate
     // it from). Cheaper to catch here than after a stage has already run.
     //
-    // Skipped unauthenticated: identity is read for the checkpoints, which this
-    // mode does not produce. Requiring it would also make the mode useless for
-    // the case it exists to serve — a source change whose `Raster.lock` has not
-    // been rebuilt yet cannot be reassembled, and would fail here before any
-    // stage ran. That is also what makes re-running a single stage whose source
-    // just changed coherent: nothing checks its identity in this mode.
-    if !no_auth {
-        for &idx in &selected {
-            let stage = &spec.stages[idx];
-            let project = Project::new(base_dir.join(&stage.project))
-                .map_err(|e| Error::Other(format!("stage '{}': {e}", stage.name)))?;
-            read_program_identity(&project, &stage.name)?;
+    // A checkpoint now costs no trace, so **both** postures produce one and
+    // both need identity. But the unauthenticated mode exists precisely for the
+    // case where identity cannot be resolved — a source change whose
+    // `Raster.lock` has not been rebuilt — so there it degrades instead of
+    // refusing: the run proceeds and writes no chain-commitment. Authenticated
+    // still errors, because a run that cannot name its programs cannot produce
+    // the object it was asked for.
+    let mut commit_chain = true;
+    for &idx in &selected {
+        let stage = &spec.stages[idx];
+        let stage_root = base_dir.join(&stage.project);
+        if !program_identity_resolvable(&stage_root) {
+            if !no_auth {
+                return Err(Error::Other(format!(
+                    "stage '{}': no program identity — neither a cached `program.bin` nor a \
+                     `Raster.lock` to rebuild one from. Run `cargo raster build` in {}",
+                    stage.name,
+                    stage_root.display(),
+                )));
+            }
+            println!(
+                "  no chain-commitment: stage '{}' has no resolvable program identity",
+                stage.name
+            );
+            commit_chain = false;
+            break;
         }
     }
 
@@ -197,7 +208,13 @@ pub fn run(
     // an existing directory; repointing from there would turn `latest` into
     // "most recently touched" and let a run against an older directory drag the
     // pointer backwards.
-    if no_auth && minting {
+    //
+    // Written in the authenticated root too, now that `--stage` is legal there:
+    // that is how a single-stage re-run finds the directory to work in. It
+    // cannot confuse `latest_chain_commitment`'s newest-dir discovery, which
+    // counts only entries whose own file type is a directory — a symlink (or
+    // the text-file fallback) is neither.
+    if minting {
         write_latest(&root, &chain_dir);
     }
 
@@ -307,28 +324,23 @@ pub fn run(
         execution_times.push((stage.name.clone(), execution_time));
         println!("    exec {}", format_duration(execution_time));
 
-        // `None` only when unauthenticated, where there is no trace to commit
-        // to — the interlock is the absent trace, not a check here.
-        let trace_commitment_digest = match replay {
-            Some((trace, _recorder)) => {
-                let trace_commitment =
-                    TraceCommitment::try_build(&trace, &EMPTY_TRIE_NODES[0], fraud_proof_config)
-                        .map_err(|e| Error::Other(e.to_string()))?;
-                let commit_path = stage_dir.join("commit.bin");
-                std::fs::write(
-                    &commit_path,
-                    postcard::to_allocvec(&trace_commitment).unwrap(),
-                )
-                .map_err(|e| {
-                    Error::Other(format!("failed to write {}: {e}", commit_path.display()))
-                })?;
-                // The checkpoint carries the commitment's compact identity, not
-                // the trace-sized commitment itself; `commit.bin` stays a stage
-                // artifact and `chain audit` re-derives the digest from it.
-                Some(trace_commitment.header().digest())
-            }
-            None => None,
-        };
+        // A recorded trace still yields a `commit.bin`, but nothing in the
+        // checkpoint names it any more: it is this stage's *dispute* artifact,
+        // the thing a divergence is proven against, and it is needed only for a
+        // stage somebody contests. See `docs/proposals/chain-io-commitment.md`.
+        if let Some((trace, _recorder)) = replay {
+            let trace_commitment =
+                TraceCommitment::try_build(&trace, &EMPTY_TRIE_NODES[0], fraud_proof_config)
+                    .map_err(|e| Error::Other(e.to_string()))?;
+            let commit_path = stage_dir.join("commit.bin");
+            std::fs::write(
+                &commit_path,
+                postcard::to_allocvec(&trace_commitment).unwrap(),
+            )
+            .map_err(|e| {
+                Error::Other(format!("failed to write {}: {e}", commit_path.display()))
+            })?;
+        }
 
         let (output_payload_commitment, output_structural_commitment) = if produces_output {
             let out = collect_output(&stage_dir)?;
@@ -349,32 +361,44 @@ pub fn run(
             None
         };
 
-        match trace_commitment_digest {
-            Some(trace_commitment_digest) => {
-                let program_commitment = read_program_identity(&project, &stage.name)?;
-                checkpoints.push(StageCheckpoint {
-                    name: stage.name.clone(),
-                    program_commitment,
-                    input_manifest_commitment: synth.input_manifest_commitment,
-                    input_bindings: synth.bindings,
-                    output_payload_commitment,
-                    output_structural_commitment,
-                    trace_commitment_digest,
-                });
-                println!("    commit ✓");
-            }
-            None => println!("    (no trace, no commitment — --no-auth)"),
+        // Every field here is a pure function of public artifacts, so this is
+        // the same checkpoint in either posture — the property `chain audit`
+        // and the equivalence test both rest on.
+        if commit_chain {
+            let program_commitment = program_identity_with_cfs(&project, &cfs, &stage.name)?;
+            checkpoints.push(StageCheckpoint {
+                name: stage.name.clone(),
+                program_commitment,
+                input_manifest_commitment: synth.input_manifest_commitment,
+                input_bindings: synth.bindings,
+                output_payload_commitment,
+                output_structural_commitment,
+            });
+            println!("    commit ✓");
         }
         println!();
     }
 
-    if no_auth {
-        // No trace was written, so there is nothing to build a checkpoint from
-        // and no chain-commitment to write — the same structural interlock the
-        // single-program mode has (§6), one level up. `chain audit` therefore
-        // cannot be pointed at this run, and its "most recent run" discovery
-        // never sees it: unauthenticated runs live under their own root.
-        println!("no chain-commitment written (--no-auth)");
+    // The interlock that used to live here — no trace, therefore no
+    // checkpoint — is gone: a checkpoint names only inputs and outputs, which
+    // both postures produce identically, so an unauthenticated run now writes
+    // a real chain-commitment. What it does *not* write is any `commit.bin`,
+    // so no stage of it can be disputed until that stage is re-run with
+    // `--stage`. The only thing that still suppresses the commitment is an
+    // unresolvable program identity (see `commit_chain` above).
+    if !commit_chain {
+        print_execution_times(&execution_times);
+        return Ok(());
+    }
+
+    // A chain-commitment is a statement about a *whole* chain: the digest
+    // folds every stage. A single-stage run has one checkpoint, so writing one
+    // here would replace the recorded commitment with an impostor that audits
+    // against a chain nobody ran. The stage's `commit.bin` is already on disk —
+    // which is the entire point of an authenticated `--stage` run, and what a
+    // dispute over that stage needs. See `docs/proposals/chain-io-commitment.md`.
+    if stage_selection.is_some() {
+        println!("stage re-run complete — commit.bin written, chain-commitment left untouched");
         print_execution_times(&execution_times);
         return Ok(());
     }
@@ -563,25 +587,13 @@ pub fn audit(
             );
         }
 
-        // 3. Commitment binding — the stage's `commit.bin` must be the exact
-        //    artifact the checkpoint's trace_commitment_digest names. With the
-        //    checkpoint carrying only the digest, this is what keeps a swapped
-        //    or regenerated commitment file from standing in for the recorded
-        //    run (and what a stage fraud receipt's refuted_trace_commitment
-        //    is attributed against).
-        let trace_commitment = read_stage_trace_commitment(&chain_dir.join(&stage.name))?;
-        if trace_commitment.header().digest() != checkpoint.trace_commitment_digest {
-            return Err(Error::Other(format!(
-                "stage '{}': commitment fraud — commit.bin does not match the checkpoint's trace commitment digest",
-                stage.name
-            )));
-        }
-        println!(
-            "  commit   ✓  {}",
-            short_hex(&checkpoint.trace_commitment_digest)
-        );
+        // (The commitment-binding check that used to sit here is gone with the
+        //  checkpoint field it compared: a checkpoint no longer names a
+        //  `commit.bin`, so there is no binding to verify. Execution is checked
+        //  by re-running the stage and comparing its output — `--execution`
+        //  below — not by matching a recorded trace.)
 
-        // 4. Downstream binding — for each `from` parameter, the value this
+        // 3. Downstream binding — for each `from` parameter, the value this
         //    stage was fed must equal the producing stage's output structural
         //    commitment. Read straight from this stage's synthesized manifest.
         let manifest = read_input_manifest(&chain_dir.join(&stage.name))?;
@@ -622,15 +634,19 @@ pub fn audit(
 
     if execution {
         println!();
-        println!("execution audit — re-running every stage against its commit.bin");
-        match detect_execution_fraud(&recorded)? {
-            None => println!("execution verified ✓  (no stage diverges from its committed trace)"),
+        println!("execution audit — re-running every stage against its committed output");
+        match detect_output_fraud(&recorded)? {
+            None => {
+                println!("execution verified ✓  (every stage reproduces its committed output)")
+            }
             Some(fraud) => {
                 println!(
-                    "execution fraud ✗  stage {} '{}' diverges from its committed trace",
+                    "execution fraud ✗  stage {} '{}' does not reproduce its committed output",
                     fraud.stage_index, spec.stages[fraud.stage_index].name
                 );
-                println!("run `cargo raster chain fraud-prove` to produce the chain fraud receipt");
+                println!("    committed  {}", short_hex(&fraud.committed));
+                println!("    recomputed {}", short_hex(&fraud.recomputed));
+                println!("run `cargo raster chain fraud-prove` to produce the evidence receipt");
                 return Err(Error::Other(format!(
                     "stage '{}': execution fraud detected",
                     spec.stages[fraud.stage_index].name
@@ -645,41 +661,51 @@ pub fn audit(
 // Fraud: detection (`audit --execution`), proving, verification
 // ---------------------------------------------------------------------------
 
-/// Read and structurally validate a stage's `commit.bin`.
-fn read_stage_trace_commitment(stage_dir: &Path) -> Result<TraceCommitment> {
-    let path = stage_dir.join("commit.bin");
-    let bytes = std::fs::read(&path)
-        .map_err(|e| Error::Other(format!("failed to read {}: {e}", path.display())))?;
-    let trace_commitment: TraceCommitment = postcard::from_bytes(&bytes)
-        .map_err(|e| Error::Other(format!("failed to decode {}: {e}", path.display())))?;
-    trace_commitment
-        .validate()
-        .map_err(|e| Error::Other(format!("{}: {e}", path.display())))?;
-    Ok(trace_commitment)
-}
+/// Fraud-proof window the auditor builds its own commitment with.
+///
+/// The auditor picks this, not the chain: a checkpoint no longer records a
+/// window size because it no longer records a trace commitment at all. It only
+/// has to be a legal window (`FraudProofConfig::from_window_size`) shorter than
+/// the stage's trace — the security margin is fixed at
+/// `FRAUD_DETECTION_SECURITY_BITS` per window however the size is split.
+const EVIDENCE_WINDOW_SIZE: usize = 2;
 
-/// Everything the stage-fraud prover needs about one detected execution
-/// fraud: the evidence window plus the honest re-execution context it came
-/// from.
-struct StageExecutionFraud {
+/// A stage whose recomputed output disagrees with what the chain committed.
+struct StageOutputFraud {
     stage_index: usize,
-    evidence: FraudEvidence,
-    trace: Trace,
-    recorder: TraceRecorder,
-    cfs: ControlFlowSchema,
-    project: Project,
-    trace_commitment: TraceCommitment,
-    input_manifest_path: PathBuf,
+    committed: Vec<u8>,
+    recomputed: Vec<u8>,
 }
 
-/// The challenger path: re-run each stage natively (a deterministic honest
-/// replay, into a separate `audit/` dir so the recorded artifacts stay
-/// untouched) and verify the honest trace against the stage's committed
-/// `commit.bin`. The first diverging stage is returned with its fraud
-/// window; stages after it are not checked (one proven fault already
-/// condemns the chain, and later stages consumed committed inputs).
-fn detect_execution_fraud(recorded: &RecordedChain) -> Result<Option<StageExecutionFraud>> {
+/// The challenger's scan: re-run every stage **unauthenticated** and compare
+/// the output it actually produces against the output the checkpoint claims.
+///
+/// Cheap by construction, and that is the point. Execution is a pure function
+/// of the committed program and the committed inputs, so a stage whose honest
+/// re-run yields a different `output.bin` is a stage whose checkpoint is
+/// false — no trace, no commitment and no proving needed to *find* it. Only
+/// arguing about it costs anything, and only for the one stage
+/// (`prove_terminal_window`).
+///
+/// The first disagreeing stage is returned; later stages are not checked, since
+/// one false checkpoint already condemns the chain and the stages after it
+/// consumed committed inputs.
+fn detect_output_fraud(recorded: &RecordedChain) -> Result<Option<StageOutputFraud>> {
     for (stage_index, stage) in recorded.spec.stages.iter().enumerate() {
+        let checkpoint = &recorded.chain.stages[stage_index];
+        // A unit-output terminal stage commits no output, so there is nothing
+        // to disagree with. It also feeds nothing downstream, so it cannot
+        // change the chain's result.
+        if checkpoint.output_payload_commitment.is_empty() {
+            println!(
+                "  stage {}/{}  {}  (unit output — nothing committed to check)",
+                stage_index + 1,
+                recorded.spec.stages.len(),
+                stage.name
+            );
+            continue;
+        }
+
         let stage_dir = recorded.chain_dir.join(&stage.name);
         let project = Project::new(recorded.base_dir.join(&stage.project))
             .map_err(|e| Error::Other(format!("stage '{}': {e}", stage.name)))?;
@@ -691,58 +717,104 @@ fn detect_execution_fraud(recorded: &RecordedChain) -> Result<Option<StageExecut
         std::fs::create_dir_all(&audit_dir)
             .map_err(|e| Error::Other(format!("failed to create {}: {e}", audit_dir.display())))?;
 
-        // The committed inputs: the same synthesized files the recorded run
-        // was fed (chained inputs resolve to the producers' committed
-        // `output.bin` artifacts by absolute path).
-        let input_json_path = stage_dir.join("input.json");
-        let input_manifest_path = stage_dir.join("input_manifest.json");
-
         println!(
             "  stage {}/{}  {}  (re-running)",
             stage_index + 1,
             recorded.spec.stages.len(),
             stage.name
         );
-        // Authenticated: an audit compares this run's trace against the stage's
-        // committed one, so there is one by construction.
-        //
-        // Binary regardless of what the recorded run chose: this trace is
-        // consumed in-process by the verifier below and never read again, so
-        // there is no reader to accommodate and no reason to pay JSON's
-        // encoding cost on a re-run of every stage.
-        let (replay, _execution_time) = build_and_run_stage(
+        // Unauthenticated: `output.bin` is byte-identical either way
+        // (`unauthenticated-execution.md` §6.1), and the trace this would
+        // otherwise record is not what the comparison reads.
+        let (_replay, _execution_time) = build_and_run_stage(
             &project,
             &cfs,
-            &input_json_path,
-            &input_manifest_path,
+            &stage_dir.join("input.json"),
+            &stage_dir.join("input_manifest.json"),
             &audit_dir,
-            false,
+            true,
             TraceFormat::Binary,
         )?;
-        let (trace, recorder) = replay.expect("an authenticated stage run produces a trace");
 
-        let trace_commitment = read_stage_trace_commitment(&stage_dir)?;
-        let mut verifier = TraceVerifier::new(trace_commitment.clone(), &EMPTY_TRIE_NODES[0], &cfs)
-            .map_err(|e| Error::Other(e.to_string()))?;
-        match verifier.verify(&trace) {
-            VerificationResult::Ok => println!("    execution ✓"),
-            VerificationResult::Fraud(evidence) => {
-                println!("    execution ✗  committed trace diverges");
-                return Ok(Some(StageExecutionFraud {
-                    stage_index,
-                    evidence,
-                    trace,
-                    recorder,
-                    cfs,
-                    project,
-                    trace_commitment,
-                    input_manifest_path,
-                }));
-            }
+        let recomputed = collect_output(&audit_dir)?;
+        if recomputed.payload_commitment != checkpoint.output_payload_commitment {
+            println!("    output ✗  recomputed {}", short_hex(&recomputed.payload_commitment));
+            return Ok(Some(StageOutputFraud {
+                stage_index,
+                committed: checkpoint.output_payload_commitment.clone(),
+                recomputed: recomputed.payload_commitment,
+            }));
         }
+        println!("    output ✓");
     }
     Ok(None)
 }
+
+/// Re-run one stage **authenticated** and prove its terminal window.
+///
+/// The receipt says: *honest execution of this checkpoint's committed program,
+/// on its committed inputs, terminates in `output_commitment`.* Paired with the
+/// checkpoint's disagreeing `output_payload_commitment`, that is the evidence a
+/// stage's execution is fraudulent.
+///
+/// It is **evidence, not a self-contained fraud proof**: nothing in it shows the
+/// trace it was proven over is the honest one, which is what the
+/// challenge/response timeout supplies (`chain-io-commitment.md` §3). For a
+/// local auditor — the same party proving and checking — that gap costs
+/// nothing. The artifact is unchanged when the protocol lands: it *is* the
+/// challenge receipt.
+fn prove_terminal_window(
+    recorded: &RecordedChain,
+    stage_index: usize,
+    fraud_proof_config: FraudProofConfig,
+) -> Result<risc0_zkvm::Receipt> {
+    let stage = &recorded.spec.stages[stage_index];
+    let stage_dir = recorded.chain_dir.join(&stage.name);
+    let project = Project::new(recorded.base_dir.join(&stage.project))
+        .map_err(|e| Error::Other(format!("stage '{}': {e}", stage.name)))?;
+    let cfs = CfsBuilder::new(&project)
+        .build()
+        .map_err(|e| Error::Other(format!("stage '{}': failed to build CFS: {e}", stage.name)))?;
+
+    let evidence_dir = stage_dir.join("evidence");
+    std::fs::create_dir_all(&evidence_dir)
+        .map_err(|e| Error::Other(format!("failed to create {}: {e}", evidence_dir.display())))?;
+
+    let input_manifest_path = stage_dir.join("input_manifest.json");
+    let (replay, _execution_time) = build_and_run_stage(
+        &project,
+        &cfs,
+        &stage_dir.join("input.json"),
+        &input_manifest_path,
+        &evidence_dir,
+        false,
+        TraceFormat::Binary,
+    )?;
+    let (trace, recorder) = replay.expect("an authenticated stage run produces a trace");
+
+    let trace_commitment =
+        TraceCommitment::try_build(&trace, &EMPTY_TRIE_NODES[0], fraud_proof_config)
+            .map_err(|e| Error::Other(e.to_string()))?;
+    let mut verifier = TraceVerifier::new(trace_commitment.clone(), &EMPTY_TRIE_NODES[0], &cfs)
+        .map_err(|e| Error::Other(e.to_string()))?;
+    let window = verifier
+        .terminal_window(&trace)
+        .map_err(|e| Error::Other(e.to_string()))?;
+
+    let backend = raster_backend_risc0::Risc0Backend::new(project.output_dir.clone())
+        .with_user_crate(project.root_dir.clone());
+    let replayer = Replayer::new(&backend, &project);
+    Ok(crate::commands::run::prove(
+        window,
+        &trace,
+        &cfs,
+        &recorder,
+        &replayer,
+        Some(&input_manifest_path.to_string_lossy().to_string()),
+        &trace_commitment,
+    ))
+}
+
 
 /// A `Link` fault inside the commitment: a checkpoint whose own committed
 /// manifest feeds a chained parameter a value different from the producer's
@@ -854,43 +926,54 @@ pub fn fraud_prove(manifest: Option<&str>, chain_commitment: Option<&str>) -> Re
         return write_chain_fraud_receipt(&recorded, &receipt);
     }
 
-    println!("no link fraud — re-running stages against their commitments");
-    let Some(fraud) = detect_execution_fraud(&recorded)? else {
-        println!("no fraud found — every stage matches its committed trace");
+    println!("no link fraud — re-running stages against their committed outputs");
+    let Some(fraud) = detect_output_fraud(&recorded)? else {
+        println!("no fraud found — every stage reproduces its committed output");
         return Ok(());
     };
 
     let stage_name = &recorded.spec.stages[fraud.stage_index].name;
-    println!("proving stage '{stage_name}' fraud (transition guest)…");
-    let backend = raster_backend_risc0::Risc0Backend::new(fraud.project.output_dir.clone())
-        .with_user_crate(fraud.project.root_dir.clone());
-    let replayer = Replayer::new(&backend, &fraud.project);
-    let input_manifest = fraud.input_manifest_path.to_string_lossy().to_string();
-    let stage_receipt = crate::commands::run::prove(
-        fraud.evidence,
-        &fraud.trace,
-        &fraud.cfs,
-        &fraud.recorder,
-        &replayer,
-        Some(&input_manifest),
-        &fraud.trace_commitment,
+    println!(
+        "output fraud: stage {} '{stage_name}' committed {} but honest execution yields {}",
+        fraud.stage_index,
+        short_hex(&fraud.committed),
+        short_hex(&fraud.recomputed),
     );
-    let fraud_journal: TransitionJournal = stage_receipt
+
+    // No chain-fraud aggregation for this fault. The chain-fraud guest can only
+    // attribute what the `ChainCommitment` names, and it no longer names a
+    // trace commitment — so execution fraud is established by the
+    // challenge/response protocol, not by a single self-contained receipt
+    // (`docs/proposals/chain-io-commitment.md` §3, §7). What is produced here
+    // is the object that protocol opens a challenge with.
+    println!("proving stage '{stage_name}' terminal window (transition guest)…");
+    let fraud_proof_config = FraudProofConfig::from_window_size(EVIDENCE_WINDOW_SIZE)
+        .map_err(|e| Error::Other(e.to_string()))?;
+    let receipt = prove_terminal_window(&recorded, fraud.stage_index, fraud_proof_config)?;
+    let journal: TransitionJournal = receipt
         .journal
         .decode()
-        .map_err(|e| Error::Other(format!("failed to decode stage fraud journal: {e}")))?;
+        .map_err(|e| Error::Other(format!("failed to decode terminal-window journal: {e}")))?;
 
-    println!("aggregating into a chain fraud receipt (chain-fraud guest)…");
-    let input = ChainFraudInput {
-        chain_commitment_bytes: recorded.chain_bytes.clone(),
-        faulty_stage: fraud.stage_index as u32,
-        evidence: ChainFraudEvidence::Execution {
-            fraud_journal,
-            transition_image_id: transition_guest_image_id(),
-        },
-    };
-    let receipt = prove_chain_fraud(&input, stage_receipt);
-    write_chain_fraud_receipt(&recorded, &receipt)
+    let evidence_path = recorded.chain_dir.join("execution-fraud.receipt");
+    std::fs::write(&evidence_path, postcard::to_allocvec(&receipt).unwrap())
+        .map_err(|e| Error::Other(format!("failed to write {}: {e}", evidence_path.display())))?;
+
+    println!();
+    println!("execution-fraud evidence → {}", evidence_path.display());
+    println!("  stage            {} '{stage_name}'", fraud.stage_index);
+    println!("  program          {}", short_hex(&journal.program_commitment));
+    println!("  input manifest   {}", short_hex(&journal.input_manifest_commitment));
+    println!("  honest output    {}", short_hex(&fraud.recomputed));
+    println!("  committed output {}", short_hex(&fraud.committed));
+    println!("  window terminal  {}", journal.window_is_terminal);
+    println!();
+    println!(
+        "Evidence, not a self-contained fraud proof: it shows honest execution of this \n\
+         checkpoint's program and inputs ends in a different output, but not that the trace \n\
+         it was proven over is the honest one. A settlement layer supplies that by timeout."
+    );
+    Ok(())
 }
 
 /// `cargo raster chain fraud-verify` — the relying party's checks: the
@@ -1473,13 +1556,53 @@ fn read_program_identity(project: &Project, stage_name: &str) -> Result<Vec<u8>>
     if let Ok(bytes) = std::fs::read(&cached) {
         return Ok(commitment_of_bytes(&bytes).to_vec());
     }
-    // Cache cold — reassemble from source + Raster.lock (no toolchain).
+    // Cache cold — build the CFS, then reassemble from source + Raster.lock.
     let cfs = CfsBuilder::new(project)
         .build()
         .map_err(|e| Error::Other(format!("stage '{stage_name}': failed to build CFS: {e}")))?;
-    let program = crate::program::reassemble_from_lock(project, &cfs)
+    program_identity_with_cfs(project, &cfs, stage_name)
+}
+
+/// Program identity for a caller that already holds the stage's CFS.
+///
+/// The chain runner builds one per stage anyway, and a cold `program.bin`
+/// otherwise makes [`read_program_identity`] build a *second* one — a full syn
+/// AST discovery over the crate (`CfsBuilder::build`), per stage. On a
+/// 74-stage chain that is the difference between one traversal per stage and
+/// several. Pass the CFS you have.
+fn program_identity_with_cfs(
+    project: &Project,
+    cfs: &ControlFlowSchema,
+    stage_name: &str,
+) -> Result<Vec<u8>> {
+    let cached = project.output_dir.join("program.bin");
+    if let Ok(bytes) = std::fs::read(&cached) {
+        return Ok(commitment_of_bytes(&bytes).to_vec());
+    }
+    let program = crate::program::reassemble_from_lock(project, cfs)
         .map_err(|e| Error::Other(format!("stage '{stage_name}': {e}")))?;
     Ok(program.commitment().to_vec())
+}
+
+/// Can this stage's identity be resolved at all, without paying to resolve it?
+///
+/// **Takes a path, not a `Project`, and that is the whole point.**
+/// `Project::new` spawns `cargo metadata` and parses the project's entire AST
+/// (`raster-compiler/src/project.rs:21-36`). The run loop already builds one
+/// per stage; constructing a second one here just to look at two filenames
+/// doubled that — 74 extra subprocess spawns and AST parses on a chain like
+/// `raster-chain-inference`, which has 74 stages over 6 distinct projects.
+///
+/// `output_dir` is `root/target/raster` unconditionally (`project.rs:29`), so
+/// both paths are derivable from the stage root. Two `stat`s, no process, no
+/// parse.
+///
+/// The pre-run check exists to catch "stage 40 of 74 has no identity" before
+/// stage 1 runs, and that failure is always a missing artifact — neither a
+/// cached frame nor a lock to rebuild one from.
+fn program_identity_resolvable(stage_root: &Path) -> bool {
+    stage_root.join("target").join("raster").join("program.bin").is_file()
+        || stage_root.join("Raster.lock").is_file()
 }
 
 fn load_chain_spec(chain_file: &Path) -> Result<ChainSpec> {
@@ -1885,7 +2008,6 @@ encoding = "raster"
             input_bindings: BTreeMap::new(),
             output_payload_commitment: vec![payload],
             output_structural_commitment: vec![payload, payload],
-            trace_commitment_digest: vec![7; 32],
         };
         let a = ChainCommitment {
             stages: vec![checkpoint("s", 9)],

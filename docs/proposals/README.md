@@ -33,7 +33,9 @@ document, and correcting it is the author's call.
 | [`trace-event-vocabulary`](./trace-event-vocabulary.md) | **implemented** (2026-08-13) | `RecurSequenceIterationStart`/`End`; the naming rule and vocabulary table on `TraceEvent` | — |
 | [`chain-repeat`](./chain-repeat.md) | proposed 2026-08-19 | — | whole; `[[chain.repeat]]` with an authorized trip count (literal / external / stage output), `ChainShape` in the chain commitment, `ChainFaultKind::Shape`. `while` mode (iterate-until-a-stage-says-stop) split out as future work |
 | [`unauthenticated-execution`](./unauthenticated-execution.md) | **implemented** — v1 2026-08-19, v2 2026-08-20, v3 2026-08-20 | runtime `AuthMode` (`raster-runtime/src/auth.rs`); `select!` dispatched on base provenance, so storage sources stay lazy; drafts keep field values and drop commitments; recur full; `cargo raster run --no-auth`; no trace emitted, so a trace commitment is structurally impossible; profiling refused; RAS-203a landed. v3: `cargo raster chain run --no-auth` — all-or-nothing, no chain-commitment, own runs root; plus a storage-backed base indexed by a tile-produced value, which §5.3/§5.4 left uncovered and which stage 1 of `raster-chain-inference` hit immediately. **6.6× on `hello-tiles`**, both modes value-identical end to end | typed `Schema::Partial` to remove the remaining serialize per draft op — deferred, needs a measurement on a draft-heavy program. Mixed-posture chain policy (on-demand per-stage commitment) still out of scope — §10; the cheap-stage half of §10 is now [`chain-stage-execution`](./chain-stage-execution.md) |
-| [`chain-stage-execution`](./chain-stage-execution.md) | **partly implemented** (2026-08-21) | §2–§4: `cargo raster chain run --no-auth --stage <name> [--run <dir>]` — one stage re-run in place, producer commitments rehydrated from `output.bin` via the existing `collect_output`, downstream stage dirs invalidated in spec order, `latest` pointer, spec-validity (`from` ordering) check moved ahead of execution. Authenticated path untouched. Verified end-to-end on a three-stage chain (`tests/chain_stage_cli.rs`, 7 tests — middle-stage re-run, multi-stage invalidation, stage-by-stage rebuild converging on the whole-chain result), for which it also supplies `examples/chain-example`, the chain fixture `program-chain` implementation order step 5 called for and never got | §1 — promoting the mode from `--no-auth` to a command, and the `chains-dry/` rename. **Blocked on naming**: `dry-run` reverses `unauthenticated-execution` §Naming *and* takes the term `zkvm-dry-run` §3 reserves; `unauth` costs one line and no collision. Untested: posture isolation (no `--stage` invocation touching `target/raster/chains/`) |
+| [`chain-stage-execution`](./chain-stage-execution.md) | **partly implemented** (2026-08-21) | §2–§4: `cargo raster chain run --no-auth --stage <name> [--run <dir>]` — one stage re-run in place, producer commitments rehydrated from `output.bin` via the existing `collect_output`, downstream stage dirs invalidated in spec order, `latest` pointer, spec-validity (`from` ordering) check moved ahead of execution. Authenticated path untouched. Verified end-to-end on a three-stage chain (`tests/chain_stage_cli.rs`, 7 tests — middle-stage re-run, multi-stage invalidation, stage-by-stage rebuild converging on the whole-chain result), for which it also supplies `examples/chain-example`, the chain fixture `program-chain` implementation order step 5 called for and never got | §1 — promoting the mode from `--no-auth` to a command, and the `chains-dry/` rename. **Blocked on naming**: `dry-run` reverses `unauthenticated-execution` §Naming *and* takes the term `zkvm-dry-run` §3 reserves; `unauth` costs one line and no collision. Untested: posture isolation. ⚠️ **§5's "authenticated path untouched" no longer holds** — [`chain-io-commitment`](./chain-io-commitment.md) lifted the `requires = "no_auth"` gate on `--stage`/`--run`, because its stated reason (what a chain commitment means when stages were committed at different times) does not arise when the per-stage commitment is a dispute artifact rather than a checkpoint field. An authenticated `--stage` run writes `commit.bin` and leaves the chain-commitment alone |
+| [`program-manifest`](./program-manifest.md) | proposed 2026-08-26 | — | whole; one `Raster.toml` grammar (`[program]` xor `[chain]`, one parser), `[program]` **mandatory** — reverses `program-identity` §Manifest slimming's "optional with derived defaults", which in practice means **no program in the tree authors the manifest its identity is computed over**; identity artifact renamed `program.bin` → `<program.name>.bin`; chain membership via `version.chain = true` / `chain = "<path>"` / per-parameter `source = "chain"`. Costs a one-time `program_commitment` move for all four in-tree projects |
+| [`chain-io-commitment`](./chain-io-commitment.md) | **partly implemented** (2026-08-27) | §1 checkpoint narrowing + the journal work under it: `OutputAuthorization::Established { output_commitment }` (the value `verify_program_end` already checked and discarded), `window_is_terminal` derived at `Init`, `TraceVerifier::terminal_window`, `StageCheckpoint` loses `trace_commitment_digest` so **both postures write a real `ChainCommitment`**, `chain audit` loses its commitment-binding check, `detect_execution_fraud` → `detect_output_fraud`, `ChainFaultKind::Execution` removed. Two forced decisions: `--no-auth` **degrades** (unresolvable identity drops the commitment, run proceeds) rather than reversing `unauthenticated-execution` §10; and `chain fraud-prove` now emits a terminal-window **evidence** receipt so removing `Execution` is not a capability regression | **§3 dispute protocol not built** — `StageChallenge`, admission checks, `ChallengeFraudJournal`, `chain challenge`/`respond`/`challenge-verify`; inert without a settlement clock, so it gates use, not design. Costs: execution fraud is condemned by silence + timeout rather than by a self-contained receipt. Settlement contracts, artifact DA and bonding are **assumed planned infrastructure** (§Assumed infrastructure); attacks reducing to them are marked `[infra]` and not treated as blockers. The one in-repo blocker is a **hard dependency on `window-seed-reconstruction`** — a terminal window opening mid-recur is rejected today, which makes recur-heavy stages unchallengeable |
 | [`artifact-inspection`](./artifact-inspection.md) | proposed 2026-08-21 | — | whole; `cargo raster show <artifact>` — decode a raster payload back into a typed, structured value, plus `chain show <stage>`. The decoder already exists and is exercised on every selection (`RasterNodeKind::Leaf` carries `type_name`; `parse_leaf_value` / `tree_value_from_raster_node`) — it is all `pub(crate)` in `raster-runtime`, so the work is exposing it, a structural fallback for a missing `.rindex`, truncation limits, and rendering. Today the only way to read an artifact is `strings(1)` |
 
 ## Dependencies
@@ -42,11 +44,22 @@ document, and correcting it is the author's call.
 program-start ──┐
 program-end ────┼──► program-identity ──► program-chain ──► chain-fraud-proof
                 │         (impl)             (partial)   │      (impl)
-                └── (impl)                               │        ▲
-                                                         └──► chain-repeat ──┘
-                                                              (proposed)
+                └── (impl)   │                           │        ▲
+                             │                           └──► chain-repeat ──┘
+                             │                                (proposed)
+                             └──► program-manifest ◄── also reorganizes the [chain]
+                                    (proposed)             table chain-repeat extends
                                         also borrows the authorized-value rule from
                                         dynamic-index-selection (impl)
+
+chain-fraud-proof (impl) ──► chain-io-commitment ◄──── window-seed-reconstruction
+   reuses the window/slice        (proposed)   hard dep    (proposed)
+   binding; disagrees on one      ▲            — a terminal window opening mid-recur
+   checkpoint field               │              is rejected, so recur-heavy stages
+                                  │              cannot be challenged
+   chain-stage-execution ─────────┘
+     (partial) supplies the determinism fact and the --stage machinery;
+     its §5 refusal to touch the authenticated path is lifted there
 
 bounded-collections (phases 1-2 impl)
         │
@@ -115,6 +128,12 @@ program-end (impl) ──► artifact-inspection (proposed)
   that proposal anyway, in the wrong order.
 - **`chain-fraud-proof` → `program-chain`, `program-identity`.** Already satisfied; noted
   because it is why `program-chain`'s `proposed` header must be stale.
+- **`chain-io-commitment` → `window-seed-reconstruction`.** Its challenge is a *terminal-window*
+  receipt, and for a recur-heavy stage that window very often opens inside a live loop — which is
+  rejected today. So the mid-loop gap stops being a fraud-proving inconvenience and becomes a
+  soundness-adjacent one: a claimer could pick such a program and be unchallengeable. Ship
+  together. This is the second consumer of `window-seed-reconstruction`, which until now was
+  wanted only by `recur-progress-commitment`'s own window model.
 
 ### The non-blocking edges, stated
 
@@ -178,6 +197,12 @@ now brackets its iterations the way a sequence brackets its items. Variant indic
   is free: adding a component to it breaks the trace format exactly as much as adding a field
   does, so nothing is saved by adopting it early.
 - **`loop-carried-state`, `draft-provenance`** — not blocked, not scheduled.
+- **`chain-io-commitment`** — steps 1–3 (the journal's output value, the terminality pin, the
+  host plumbing) are landable now and leave the current protocol working. The checkpoint
+  narrowing at step 4 is the point of no return. One in-repo blocker:
+  `window-seed-reconstruction`, without which recur-heavy stages cannot be challenged at all.
+  The settlement/DA/bonding dependencies are assumed planned and deliberately not treated as
+  blockers — the dispute protocol is inert without them, so they gate *use*, not *design*.
 
 ## Known open gaps not owned by any proposal
 
