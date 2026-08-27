@@ -1,0 +1,11 @@
+target/
+
+# The committed fixtures are checked in on purpose, against the root
+# .gitignore's blanket `*.rastered` / `*.rindex`: the chain manifest's external
+# bindings commit to these exact bytes, and `chain_stage_cli.rs` runs the chain
+# straight from a clone. Regenerate with `bin/gen_input.rs` (see ../README.md),
+# which also reprints the commitments to paste back into Raster.toml.
+!measurements.rastered
+!measurements.rindex
+!threshold.rastered
+!threshold.rindex

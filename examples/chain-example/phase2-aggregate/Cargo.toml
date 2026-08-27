@@ -1,0 +1,14 @@
+[package]
+name = "chain-stage-aggregate"
+version = "0.1.0"
+edition = "2021"
+default-run = "chain-stage-aggregate"
+
+[features]
+default = ["std"]
+std = ["raster/std"]
+profiling = ["raster/profiling"]
+
+[dependencies]
+raster = { path = "../../../crates/raster", default-features = false }
+serde.workspace = true

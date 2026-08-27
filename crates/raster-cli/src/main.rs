@@ -228,6 +228,20 @@ enum ChainCommand {
         /// values — it just cannot be audited. For iterating on stage logic.
         #[arg(long = "no-auth", conflicts_with = "fraud_proof_window_size")]
         no_auth: bool,
+
+        /// Run only this stage, in place, against an existing run directory.
+        /// Its `from` producers must already have an `output.bin` there; every
+        /// stage after it is deleted, since it is now stale. Unauthenticated
+        /// only — a chain-commitment is a statement about a whole chain, so
+        /// there is no per-stage form of one.
+        #[arg(long, requires = "no_auth")]
+        stage: Option<String>,
+
+        /// The chain run directory to work in, e.g.
+        /// `target/raster/chains-no-auth/00017…-pid4021`. Omit to use the most
+        /// recent one (`latest`). Unauthenticated only.
+        #[arg(long = "run", requires = "no_auth")]
+        run_dir: Option<String>,
     },
 
     /// Verify a recorded chain's links and identities — public, no proving.
@@ -367,7 +381,15 @@ fn try_main() -> Result<()> {
                 chain,
                 fraud_proof_window_size,
                 no_auth,
-            } => chain::run(chain.as_deref(), fraud_proof_window_size, no_auth),
+                stage,
+                run_dir,
+            } => chain::run(
+                chain.as_deref(),
+                fraud_proof_window_size,
+                no_auth,
+                stage.as_deref(),
+                run_dir.as_deref(),
+            ),
             ChainCommand::Audit {
                 chain,
                 chain_commitment,

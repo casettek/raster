@@ -125,9 +125,41 @@ const CHAIN_FRAUD_RECEIPT_FILE: &str = "chain-fraud.receipt";
 /// This is the dev-loop half of §10; the other half, per-stage commitment on
 /// demand for a contested stage, is still chain-level policy and unaddressed:
 /// this flag is all-or-nothing.
-pub fn run(chain: Option<&str>, window_size: usize, no_auth: bool) -> Result<()> {
+pub fn run(
+    chain: Option<&str>,
+    window_size: usize,
+    no_auth: bool,
+    stage_selection: Option<&str>,
+    run_dir: Option<&str>,
+) -> Result<()> {
     let (spec, base_dir) = resolve_chain(chain)?;
-    validate_stage_names(&spec)?;
+    validate_spec(&spec)?;
+
+    // Stage names resolve against the *spec*, up front, for every stage —
+    // rather than being accumulated as stages complete. A `--stage` run
+    // legitimately names producers it is not going to execute, so "is this a
+    // stage of this chain?" and "has this stage produced an artifact?" have to
+    // be two separate questions; the second one lives in `outputs` below.
+    let stage_index: BTreeMap<String, usize> = spec
+        .stages
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.name.clone(), i))
+        .collect();
+
+    let selected: Vec<usize> = match stage_selection {
+        Some(name) => vec![*stage_index.get(name).ok_or_else(|| {
+            Error::Other(format!(
+                "no stage named '{name}' in this chain — stages are: {}",
+                spec.stages
+                    .iter()
+                    .map(|s| s.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        })?],
+        None => (0..spec.stages.len()).collect(),
+    };
 
     // Fail fast, before running anything, if a stage has no resolvable program
     // identity (neither a cached `program.bin` nor a `Raster.lock` to regenerate
@@ -137,9 +169,11 @@ pub fn run(chain: Option<&str>, window_size: usize, no_auth: bool) -> Result<()>
     // mode does not produce. Requiring it would also make the mode useless for
     // the case it exists to serve — a source change whose `Raster.lock` has not
     // been rebuilt yet cannot be reassembled, and would fail here before any
-    // stage ran.
+    // stage ran. That is also what makes re-running a single stage whose source
+    // just changed coherent: nothing checks its identity in this mode.
     if !no_auth {
-        for stage in &spec.stages {
+        for &idx in &selected {
+            let stage = &spec.stages[idx];
             let project = Project::new(base_dir.join(&stage.project))
                 .map_err(|e| Error::Other(format!("stage '{}': {e}", stage.name)))?;
             read_program_identity(&project, &stage.name)?;
@@ -149,20 +183,36 @@ pub fn run(chain: Option<&str>, window_size: usize, no_auth: bool) -> Result<()>
     let fraud_proof_config =
         FraudProofConfig::from_window_size(window_size).map_err(|e| Error::Other(e.to_string()))?;
 
-    let chain_dir = if no_auth {
+    let root = if no_auth {
         no_auth_chains_root()
     } else {
         chains_root()
-    }
-    .join(chain_run_id());
+    };
+    let minting = run_dir.is_none() && stage_selection.is_none();
+    let chain_dir = resolve_run_dir(&root, run_dir, stage_selection.is_some())?;
     std::fs::create_dir_all(&chain_dir)
         .map_err(|e| Error::Other(format!("failed to create {}: {e}", chain_dir.display())))?;
+    // Only a fresh whole-chain run moves `latest`. A `--stage` run works inside
+    // an existing directory; repointing from there would turn `latest` into
+    // "most recently touched" and let a run against an older directory drag the
+    // pointer backwards.
+    if no_auth && minting {
+        write_latest(&root, &chain_dir);
+    }
 
-    println!(
-        "chain run  {}  ({} stages)",
-        chain_run_id_label(&chain_dir),
-        spec.stages.len()
-    );
+    match stage_selection {
+        Some(name) => println!(
+            "chain run  {}  (stage '{}' of {})",
+            chain_run_id_label(&chain_dir),
+            name,
+            spec.stages.len()
+        ),
+        None => println!(
+            "chain run  {}  ({} stages)",
+            chain_run_id_label(&chain_dir),
+            spec.stages.len()
+        ),
+    }
     println!("  dir: {}", chain_dir.display());
     // Printed either way: a reader must never have to infer which mode produced
     // the output in front of them. Mirrors `commands::run`.
@@ -175,25 +225,39 @@ pub fn run(chain: Option<&str>, window_size: usize, no_auth: bool) -> Result<()>
 
     let mut checkpoints: Vec<StageCheckpoint> = Vec::new();
     // Every stage's output structural commitment, by stage index — what a
-    // downstream `from` binding resolves to. Kept beside `checkpoints` rather
-    // than read out of them, because an unauthenticated stage produces this and
-    // no checkpoint.
-    let mut output_commitments: Vec<Vec<u8>> = Vec::new();
-    let mut stage_index: BTreeMap<String, usize> = BTreeMap::new();
+    // downstream `from` binding resolves to. `None` means "no artifact", which
+    // covers both "has not run" and "ran but returns unit". Kept beside
+    // `checkpoints` rather than read out of them, because an unauthenticated
+    // stage produces this and no checkpoint.
+    let mut outputs: Vec<Option<Vec<u8>>> = vec![None; spec.stages.len()];
     // Wall clock of each stage binary. Reported only — never part of a
     // `StageCheckpoint`, which `chain audit` and the chain-fraud guest digest
     // and which must stay identical across runs.
     let mut execution_times: Vec<(String, Duration)> = Vec::new();
 
+    if let Some(&only) = selected.first().filter(|_| stage_selection.is_some()) {
+        // The producers this stage is fed from already ran; recover what they
+        // committed straight from their artifacts. Everything after it is now
+        // stale and goes.
+        rehydrate_producers(&spec, &selected, &stage_index, &chain_dir, &mut outputs)?;
+        invalidate_downstream(&chain_dir, &spec, only)?;
+    }
+
     let stage_count = spec.stages.len();
-    for (idx, stage) in spec.stages.iter().enumerate() {
+    for &idx in &selected {
+        let stage = &spec.stages[idx];
         let is_terminal = idx + 1 == stage_count;
         println!(
-            "▸ stage {}/{}  {}   ({})",
+            "▸ stage {}/{}  {}   ({}){}",
             idx + 1,
             stage_count,
             stage.name,
-            stage.project
+            stage.project,
+            if stage_selection.is_some() {
+                "   (re-run in place)"
+            } else {
+                ""
+            }
         );
 
         let project = Project::new(base_dir.join(&stage.project))
@@ -225,7 +289,7 @@ pub fn run(chain: Option<&str>, window_size: usize, no_auth: bool) -> Result<()>
             &stage_dir,
             &base_dir,
             &chain_dir,
-            &output_commitments,
+            &outputs,
             &stage_index,
         )?;
         println!("    build & run …");
@@ -277,8 +341,11 @@ pub fn run(chain: Option<&str>, window_size: usize, no_auth: bool) -> Result<()>
             (Vec::new(), Vec::new())
         };
 
-        output_commitments.push(output_structural_commitment.clone());
-        stage_index.insert(stage.name.clone(), idx);
+        outputs[idx] = if produces_output {
+            Some(output_structural_commitment.clone())
+        } else {
+            None
+        };
 
         match trace_commitment_digest {
             Some(trace_commitment_digest) => {
@@ -984,9 +1051,198 @@ fn build_and_run_stage(
 }
 
 // ---------------------------------------------------------------------------
+// Per-stage execution
+// ---------------------------------------------------------------------------
+
+/// Recover, from the run directory, the output commitments the selected stages
+/// are fed from.
+///
+/// This is the whole mechanism a mid-chain run needs: a `from` binding resolves
+/// to the producer's structural root, and that root is a pure function of the
+/// producer's `output.bin`, which is already on disk. `collect_output` recomputes
+/// it and cross-checks it against the `output_manifest.json` written beside it,
+/// so a producer whose artifacts disagree is rejected here rather than silently
+/// feeding a stage.
+///
+/// A producer with no artifact is left `None` on purpose: `synthesize_inputs`
+/// owns that error, and states which stage to run.
+fn rehydrate_producers(
+    spec: &ChainSpec,
+    selected: &[usize],
+    stage_index: &BTreeMap<String, usize>,
+    chain_dir: &Path,
+    outputs: &mut [Option<Vec<u8>>],
+) -> Result<()> {
+    for &idx in selected {
+        for binding in spec.stages[idx].inputs.values() {
+            let InputBinding::From(producer) = binding else {
+                continue;
+            };
+            let Some(&producer_idx) = stage_index.get(producer) else {
+                continue; // `validate_spec` already rejected this
+            };
+            if outputs[producer_idx].is_some() {
+                continue;
+            }
+            let producer_dir = chain_dir.join(producer);
+            if producer_dir.join("output.bin").is_file() {
+                outputs[producer_idx] = Some(collect_output(&producer_dir)?.structural_commitment);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Delete the stage directories after `from_idx`, which the stage about to
+/// re-run has just invalidated.
+///
+/// "After" is **spec order**, not the dependency closure. In a linear v1 chain
+/// the two coincide; where they diverge (a downstream stage bound only to
+/// externals) spec order over-deletes rather than under-deletes. Over-deleting
+/// costs recompute; under-deleting leaves a stale artifact that looks fresh and
+/// silently feeds the next comparison.
+///
+/// The whole directory goes, not just the outputs: a downstream
+/// `input_manifest.json` was synthesized against the *old* upstream commitment
+/// and is stale in exactly the same way.
+fn invalidate_downstream(chain_dir: &Path, spec: &ChainSpec, from_idx: usize) -> Result<()> {
+    let victims: Vec<&str> = spec.stages[from_idx + 1..]
+        .iter()
+        .map(|s| s.name.as_str())
+        .filter(|name| chain_dir.join(name).is_dir())
+        .collect();
+    if victims.is_empty() {
+        return Ok(());
+    }
+
+    // Announced, because it can throw away a lot of work.
+    println!(
+        "  invalidating {} downstream stage{}: {}",
+        victims.len(),
+        if victims.len() == 1 { "" } else { "s" },
+        summarize_names(&victims)
+    );
+    for name in &victims {
+        let dir = chain_dir.join(name);
+        std::fs::remove_dir_all(&dir)
+            .map_err(|e| Error::Other(format!("failed to remove {}: {e}", dir.display())))?;
+    }
+    Ok(())
+}
+
+/// `a, b, c` in full when short, `a, b … y, z` when long — a list meant to be
+/// recognized, not read.
+fn summarize_names(names: &[&str]) -> String {
+    if names.len() <= 6 {
+        return names.join(", ");
+    }
+    format!(
+        "{} … {}",
+        names[..2].join(", "),
+        names[names.len() - 2..].join(", ")
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Run directory resolution — `--run`, and `latest`
+// ---------------------------------------------------------------------------
+
+/// The pointer to the newest run under a chains root.
+const LATEST_LINK: &str = "latest";
+
+/// Where this invocation's stage directories live.
+///
+/// - `--run <path>` names one explicitly (it must already exist);
+/// - a per-stage run without `--run` follows `latest`;
+/// - anything else mints a fresh timestamped directory.
+fn resolve_run_dir(root: &Path, explicit: Option<&str>, per_stage: bool) -> Result<PathBuf> {
+    if let Some(path) = explicit {
+        let dir = PathBuf::from(path);
+        if !dir.is_dir() {
+            return Err(Error::Other(format!(
+                "no such chain run directory: {}",
+                dir.display()
+            )));
+        }
+        return Ok(dir);
+    }
+    if per_stage {
+        // A single stage runs *into* an existing run; there is nothing to
+        // rehydrate from in a directory this invocation just created.
+        return read_latest(root).filter(|dir| dir.is_dir()).ok_or_else(|| {
+            Error::Other(format!(
+                "no previous chain run under {} — run the whole chain once before running a single stage",
+                root.display()
+            ))
+        });
+    }
+    Ok(root.join(chain_run_id()))
+}
+
+/// Point `latest` at `target`. Best-effort: a missing pointer costs a `--run`
+/// argument, so a failure here is not worth aborting a run over.
+fn write_latest(root: &Path, target: &Path) {
+    let link = root.join(LATEST_LINK);
+    let Some(name) = target.file_name() else {
+        return;
+    };
+    // Whether it is a symlink or the text fallback, it has to go before it can
+    // be replaced.
+    let _ = std::fs::remove_file(&link);
+    if symlink_dir(Path::new(name), &link).is_ok() {
+        return;
+    }
+    // Symlinks need a privilege we may not have (Windows without developer
+    // mode). A file holding the directory name reads the same way.
+    let _ = std::fs::write(&link, name.to_string_lossy().as_bytes());
+}
+
+#[cfg(unix)]
+fn symlink_dir(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(windows)]
+fn symlink_dir(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_dir(target, link)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn symlink_dir(_target: &Path, _link: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "symlinks unsupported on this platform",
+    ))
+}
+
+/// Resolve `latest`, accepting either form `write_latest` may have produced.
+fn read_latest(root: &Path) -> Option<PathBuf> {
+    let link = root.join(LATEST_LINK);
+    let metadata = std::fs::symlink_metadata(&link).ok()?;
+    if metadata.file_type().is_symlink() {
+        let target = std::fs::read_link(&link).ok()?;
+        return Some(if target.is_absolute() {
+            target
+        } else {
+            root.join(target)
+        });
+    }
+    if metadata.is_file() {
+        let name = std::fs::read_to_string(&link).ok()?;
+        let name = name.trim();
+        if name.is_empty() {
+            return None;
+        }
+        return Some(root.join(name));
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
 // Input synthesis
 // ---------------------------------------------------------------------------
 
+#[derive(Debug)]
 struct SynthesizedInputs {
     input_json_path: PathBuf,
     input_manifest_path: PathBuf,
@@ -999,16 +1255,19 @@ struct SynthesizedInputs {
 /// (commitments) into `stage_dir` from its bindings, returning their paths, the
 /// manifest digest, and the per-parameter provenance.
 ///
-/// `outputs` holds each already-run stage's output structural commitment by
-/// index, which is what a `from` binding resolves to. It is recomputed
-/// host-side from `output.bin` in either authentication mode, so the links a
-/// stage is fed are identical whether or not the producing stage was traced.
+/// `outputs` holds each stage's output structural commitment by index, which is
+/// what a `from` binding resolves to; `None` means that stage has produced no
+/// artifact — either it has not run, or its `main` returns unit. It is
+/// recomputed host-side from `output.bin` in either authentication mode, so the
+/// links a stage is fed are identical whether or not the producing stage was
+/// traced, and identical whether the producer ran in this invocation or an
+/// earlier one.
 fn synthesize_inputs(
     stage: &StageSpec,
     stage_dir: &Path,
     base_dir: &Path,
     chain_dir: &Path,
-    outputs: &[Vec<u8>],
+    outputs: &[Option<Vec<u8>>],
     stage_index: &BTreeMap<String, usize>,
 ) -> Result<SynthesizedInputs> {
     let mut input_entries: Vec<(String, serde_json::Value)> = Vec::new();
@@ -1033,18 +1292,24 @@ fn synthesize_inputs(
             InputBinding::From(producer) => {
                 let producer_idx = *stage_index.get(producer).ok_or_else(|| {
                     Error::Other(format!(
-                        "stage '{}': parameter '{param}' is fed from stage '{producer}', which has not run",
+                        "stage '{}': parameter '{param}' is fed from unknown stage '{producer}'",
                         stage.name
                     ))
                 })?;
                 let producer_dir = chain_dir.join(producer);
-                let structural = &outputs[producer_idx];
-                if structural.is_empty() {
-                    return Err(Error::Other(format!(
-                        "stage '{}': parameter '{param}' is fed from '{producer}', which produced no output",
-                        stage.name
-                    )));
-                }
+                // Absent either because the producer has not run in this run
+                // directory, or because its `main` returns unit. The first is
+                // the case a per-stage run exists to hit, so it names the fix.
+                let structural = outputs[producer_idx].as_ref().ok_or_else(|| {
+                    Error::Other(format!(
+                        "stage '{}': parameter '{param}' is fed from '{producer}', which has no output.bin\n  \
+                         expected: {}\n  \
+                         run: cargo raster chain run --no-auth --run {} --stage {producer}",
+                        stage.name,
+                        producer_dir.join("output.bin").display(),
+                        chain_dir.display(),
+                    ))
+                })?;
                 let commitment = hex::encode(structural);
                 (
                     producer_dir.join("output.bin"),
@@ -1382,6 +1647,50 @@ fn validate_stage_names(spec: &ChainSpec) -> Result<()> {
     Ok(())
 }
 
+/// Whether the manifest is well-formed — names unique, and every `from` binding
+/// naming a stage that actually precedes it.
+///
+/// The ordering rule is a property of `chain.json`, not of any particular run,
+/// so it is checked before anything executes. A sequential run could never
+/// reach a violation (a later producer simply has not run yet, and fails on its
+/// missing artifact instead), but `--stage` can name one directly, and would
+/// otherwise get the confusing "no output.bin" error for a binding that is
+/// unsatisfiable by construction.
+///
+/// `audit` keeps its own copy of this check: it verifies a commitment that may
+/// have been produced elsewhere, and must not assume this ran.
+fn validate_spec(spec: &ChainSpec) -> Result<()> {
+    validate_stage_names(spec)?;
+
+    let stage_index: BTreeMap<&str, usize> = spec
+        .stages
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.name.as_str(), i))
+        .collect();
+
+    for (idx, stage) in spec.stages.iter().enumerate() {
+        for (param, binding) in &stage.inputs {
+            let InputBinding::From(producer) = binding else {
+                continue;
+            };
+            let producer_idx = *stage_index.get(producer.as_str()).ok_or_else(|| {
+                Error::Other(format!(
+                    "stage '{}': parameter '{param}' is fed from unknown stage '{producer}'",
+                    stage.name
+                ))
+            })?;
+            if producer_idx >= idx {
+                return Err(Error::Other(format!(
+                    "stage '{}': parameter '{param}' is fed from '{producer}', which does not run earlier",
+                    stage.name
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn absolute(base_dir: &Path, path: &str) -> PathBuf {
     let p = Path::new(path);
     if p.is_absolute() {
@@ -1582,5 +1891,236 @@ encoding = "raster"
         let base = Path::new("/base/dir");
         assert_eq!(absolute(base, "x.bin"), PathBuf::from("/base/dir/x.bin"));
         assert_eq!(absolute(base, "/abs/x.bin"), PathBuf::from("/abs/x.bin"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-stage execution
+    // -----------------------------------------------------------------------
+
+    fn scratch(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "raster-chain-{}-{tag}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn stage_spec(name: &str, inputs: &[(&str, InputBinding)]) -> StageSpec {
+        StageSpec {
+            name: name.into(),
+            project: name.into(),
+            inputs: inputs
+                .iter()
+                .map(|(p, b)| {
+                    (
+                        (*p).to_string(),
+                        match b {
+                            InputBinding::From(s) => InputBinding::From(s.clone()),
+                            InputBinding::External(e) => InputBinding::External(ExternalRef {
+                                path: e.path.clone(),
+                                index_path: e.index_path.clone(),
+                                commitment: e.commitment.clone(),
+                            }),
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn validate_spec_rejects_a_forward_from_reference() {
+        // 'a' is fed from 'b', which runs after it — unsatisfiable by
+        // construction, and reachable only via `--stage`.
+        let spec = ChainSpec {
+            stages: vec![
+                stage_spec("a", &[("x", InputBinding::From("b".into()))]),
+                stage_spec("b", &[]),
+            ],
+        };
+        let err = validate_spec(&spec).unwrap_err().to_string();
+        assert!(err.contains("does not run earlier"), "{err}");
+    }
+
+    #[test]
+    fn validate_spec_rejects_an_unknown_producer() {
+        let spec = ChainSpec {
+            stages: vec![stage_spec(
+                "a",
+                &[("x", InputBinding::From("ghost".into()))],
+            )],
+        };
+        let err = validate_spec(&spec).unwrap_err().to_string();
+        assert!(err.contains("unknown stage 'ghost'"), "{err}");
+    }
+
+    #[test]
+    fn validate_spec_accepts_a_backward_reference() {
+        let spec = ChainSpec {
+            stages: vec![
+                stage_spec("a", &[]),
+                stage_spec("b", &[("x", InputBinding::From("a".into()))]),
+            ],
+        };
+        assert!(validate_spec(&spec).is_ok());
+    }
+
+    #[test]
+    fn synthesize_inputs_names_the_stage_to_run_when_a_producer_has_no_artifact() {
+        let dir = scratch("synth-missing");
+        let stage = stage_spec("b", &[("kv", InputBinding::From("a".into()))]);
+        let stage_index: BTreeMap<String, usize> = [("a".to_string(), 0), ("b".to_string(), 1)]
+            .into_iter()
+            .collect();
+        // 'a' is a real stage of the chain, it just has not produced anything
+        // in this run directory.
+        let outputs = vec![None, None];
+
+        let err = synthesize_inputs(&stage, &dir, &dir, &dir, &outputs, &stage_index)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("has no output.bin"), "{err}");
+        assert!(err.contains("--stage a"), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn synthesize_inputs_feeds_a_rehydrated_producer_commitment() {
+        // The point of the feature: a commitment recovered from a producer's
+        // artifact reaches the consumer's manifest unchanged, exactly as if the
+        // producer had run in this same invocation.
+        let dir = scratch("synth-rehydrated");
+        let stage = stage_spec("b", &[("kv", InputBinding::From("a".into()))]);
+        let stage_index: BTreeMap<String, usize> = [("a".to_string(), 0), ("b".to_string(), 1)]
+            .into_iter()
+            .collect();
+        let outputs = vec![Some(vec![0xab, 0xcd]), None];
+
+        let synth = synthesize_inputs(&stage, &dir, &dir, &dir, &outputs, &stage_index).unwrap();
+        assert!(matches!(
+            synth.bindings["kv"],
+            InputBindingSource::Chained { stage: 0 }
+        ));
+        let manifest = read_input_manifest(&dir).unwrap();
+        assert_eq!(manifest["kv"], "abcd");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn invalidate_downstream_removes_later_stages_only() {
+        let dir = scratch("invalidate");
+        let spec = ChainSpec {
+            stages: vec![
+                stage_spec("a", &[]),
+                stage_spec("b", &[]),
+                stage_spec("c", &[]),
+            ],
+        };
+        for name in ["a", "b", "c"] {
+            std::fs::create_dir_all(dir.join(name)).unwrap();
+            std::fs::write(dir.join(name).join("output.bin"), b"x").unwrap();
+        }
+
+        invalidate_downstream(&dir, &spec, 0).unwrap();
+        assert!(dir.join("a").is_dir(), "the re-run stage survives");
+        assert!(!dir.join("b").exists());
+        assert!(!dir.join("c").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn invalidate_downstream_on_the_last_stage_removes_nothing() {
+        let dir = scratch("invalidate-last");
+        let spec = ChainSpec {
+            stages: vec![stage_spec("a", &[]), stage_spec("b", &[])],
+        };
+        for name in ["a", "b"] {
+            std::fs::create_dir_all(dir.join(name)).unwrap();
+        }
+
+        invalidate_downstream(&dir, &spec, 1).unwrap();
+        assert!(dir.join("a").is_dir());
+        assert!(dir.join("b").is_dir());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn latest_round_trips() {
+        let root = scratch("latest");
+        let target = root.join("00018-pid5566");
+        std::fs::create_dir_all(&target).unwrap();
+
+        write_latest(&root, &target);
+        assert_eq!(
+            read_latest(&root).map(|p| std::fs::canonicalize(p).unwrap()),
+            Some(std::fs::canonicalize(&target).unwrap())
+        );
+
+        // Repointing replaces rather than failing on an existing link.
+        let second = root.join("00019-pid5567");
+        std::fs::create_dir_all(&second).unwrap();
+        write_latest(&root, &second);
+        assert_eq!(
+            read_latest(&root).map(|p| std::fs::canonicalize(p).unwrap()),
+            Some(std::fs::canonicalize(&second).unwrap())
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn latest_reads_the_text_pointer_fallback() {
+        // What a platform without symlink privileges leaves behind.
+        let root = scratch("latest-text");
+        let target = root.join("00020-pid1");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(root.join(LATEST_LINK), "00020-pid1\n").unwrap();
+
+        assert_eq!(read_latest(&root), Some(target));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn resolve_run_dir_requires_an_existing_explicit_directory() {
+        let root = scratch("resolve-explicit");
+        let missing = root.join("nope");
+        let err = resolve_run_dir(&root, Some(missing.to_str().unwrap()), true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no such chain run directory"), "{err}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn resolve_run_dir_per_stage_needs_a_previous_run() {
+        let root = scratch("resolve-no-latest");
+        let err = resolve_run_dir(&root, None, true).unwrap_err().to_string();
+        assert!(err.contains("run the whole chain once"), "{err}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn resolve_run_dir_mints_only_for_a_whole_chain_run() {
+        let root = scratch("resolve-mint");
+        let minted = resolve_run_dir(&root, None, false).unwrap();
+        assert_eq!(minted.parent(), Some(root.as_path()));
+        assert!(
+            !minted.exists(),
+            "minting names a directory, it does not create one"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn summarize_names_elides_only_long_lists() {
+        assert_eq!(summarize_names(&["a", "b", "c"]), "a, b, c");
+        assert_eq!(
+            summarize_names(&["a", "b", "c", "d", "e", "f", "g"]),
+            "a, b … f, g"
+        );
     }
 }

@@ -1,0 +1,4 @@
+{
+  "readings": { "path": "measurements.rastered", "index_path": "measurements.rindex", "load_preference": "read" },
+  "threshold": { "path": "threshold.rastered", "index_path": "threshold.rindex", "load_preference": "read" }
+}
