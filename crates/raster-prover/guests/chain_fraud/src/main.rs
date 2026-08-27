@@ -17,6 +17,7 @@ use risc0_zkvm::guest::env;
 use risc0_zkvm::sha::{Impl as Risc0Sha256, Sha256 as _};
 
 use raster_core::authorization::AuthorizationJournal;
+use raster_core::input::scalar_leaf_root;
 use raster_core::chain::{
     ChainCommitment, ChainFaultKind, ChainFraudEvidence, ChainFraudInput, ChainFraudJournal,
     InputBindingSource, StageCheckpoint,
@@ -47,6 +48,52 @@ fn verify_inner_receipt<J: serde::Serialize>(image_id: &[u8], journal: &J) {
         .expect("Failed to verify inner receipt");
 }
 
+
+/// A `Shape` fault: the chain records a trip count that the stage supposed to
+/// have produced it did not commit — so the chain expanded to the wrong number
+/// of stages.
+///
+/// Every value comes out of the `ChainCommitment` the guest already hashed;
+/// the host supplies only `repeat_index`. Nothing is verified with `env::verify`
+/// and no artifact is read, because a stage-produced count is that stage's
+/// *whole* output: the check is to re-encode the count the chain claims and
+/// compare one hash against what the stage committed. Re-encoding rather than
+/// decoding is deliberate — adversarial payload bytes have no path in here, and
+/// there is no decoder to diverge from the runtime's.
+fn verify_shape_fault(chain: &ChainCommitment, faulty_stage: usize, repeat_index: u32) {
+    let repeat = chain
+        .shape
+        .repeats
+        .get(usize::try_from(repeat_index).expect("repeat_index overflows usize"))
+        .expect("repeat_index is out of range for this chain");
+
+    let source_stage = repeat
+        .source_stage
+        .expect("a literal or external count has nothing in the commitment to contradict");
+    let source_stage = usize::try_from(source_stage).expect("source_stage overflows usize");
+
+    // Blame lands on the stage that produced the count. Without this the host
+    // could exhibit a real disagreement and attribute it to any stage it liked.
+    assert!(
+        source_stage == faulty_stage,
+        "A shape fault blames the stage that produced the count, not another"
+    );
+
+    let producer = chain
+        .stages
+        .get(source_stage)
+        .expect("the count's producing stage is out of range for this chain");
+    let claimed = scalar_leaf_root(repeat.width, u64::from(repeat.resolved_count))
+        .expect("the recorded count must fit its recorded width");
+
+    // The inequality *is* the fault: honest execution would have made these
+    // equal, so a chain exhibiting both a count and a producer that disagree
+    // about it is fraudulent on its face.
+    assert!(
+        claimed.as_slice() != producer.output_structural_commitment.as_slice(),
+        "Recorded count matches what the producing stage committed — no shape fault here"
+    );
+}
 
 /// A `Link` fault: the checkpoint's own committed manifest feeds a `from`
 /// parameter a value different from the producing stage's committed output
@@ -121,6 +168,13 @@ fn main() {
                 authorization_image_id,
             );
             (ChainFaultKind::Link, Vec::new(), authorization_image_id.clone())
+        }
+        ChainFraudEvidence::Shape { repeat_index } => {
+            verify_shape_fault(&chain, faulty_stage, *repeat_index);
+            // Neither id is filled, and that is checked on the way out: a
+            // `Shape` receipt verified no inner receipt, so an image id here
+            // would be a claim about a recursion that never happened.
+            (ChainFaultKind::Shape, Vec::new(), Vec::new())
         }
     };
 

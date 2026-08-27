@@ -1,0 +1,52 @@
+# A chain whose **length is decided at run time**.
+#
+# `planner` returns a plain `u64`, and that number is the trip count of the
+# `steps` block — so the chain's stage list does not exist until the planner has
+# run. The manifest bounds it (`max`) and nothing else: how many stages this
+# chain has is a property of the run, not of the code.
+#
+# A test fixture, not an alternative way to run the example: `chain run`
+# discovers `Raster.toml`, and this file is reached only by being named
+# explicitly. Exercised by `crates/raster-cli/tests/chain_repeat_cli.rs`.
+#
+# See `docs/proposals/chain-repeat.md` §4 and §6.
+[chain]
+name = "chain-example-dynamic"
+version = "0.1.0"
+
+# Reuses phase 1's committed threshold as the planner's budget — one committed
+# `u64`, already fixtured.
+[chain.input.budget]
+path       = "phase1-normalize/threshold.rastered"
+index_path = "phase1-normalize/threshold.rindex"
+commitment = "3cb30ab8f7660969ea55a33a6b01487de74745b59deba49df5a7602edc98d952"
+
+[[chain.stage]]
+name = "planner"
+project = "planner"
+inputs.budget = { input = "budget" }
+
+[[chain.repeat]]
+name  = "steps"
+index = "t"
+count = { from = "planner", max = 8 }
+
+  # What the stage after the block binds to. Named rather than positional, and
+  # with its own `entry` for the `count = 0` case — which for this chain would
+  # mean the sink reads the planner's own output.
+  [chain.repeat.exports.total]
+  stage = "step{t}"
+  entry = "planner"
+
+  [[chain.repeat.stage]]
+  name    = "step{t}"
+  project = "step"
+  # `{t-1}` underflows at the block's first iteration, and `first` is what it
+  # resolves to there. Mandatory: that edge is exactly what mis-wires when a
+  # chain like this is written out by hand.
+  inputs.prev = { from = "step{t-1}", first = "planner" }
+
+[[chain.stage]]
+name = "sink"
+project = "step"
+inputs.prev = { from = "steps.total" }
