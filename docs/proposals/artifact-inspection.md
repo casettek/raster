@@ -1,8 +1,20 @@
 # Proposal: `artifact-inspection` — `cargo raster show`, reading a raster artifact back
 
-Status: proposed (2026-08-21) — **rev 2** (2026-08-31): adds §6 `--show-output` on `run` /
-`chain run`, resolving open question 3; adds §4.1 stating that the text format is `Debug`-shaped
-but cannot name a struct, because `RasterNodeKind::Struct` records field names and no type name.
+Status: **implemented** (2026-08-31) — rev 2, minus the deferred §2 structural fallback. See
+§Implementation record for what shipped and where it departs from the design below.
+
+Rev 2 (2026-08-31): adds §6 `--show-output` on `run` / `chain run`, resolving open question 3;
+adds §4.1 stating that the text format is `Debug`-shaped but cannot name a struct, because
+`RasterNodeKind::Struct` records field names and no type name. **Rejects `--select` and
+`cargo raster chain show`** (§Alternatives), and **defers** the structural fallback (§2) with
+the `raster-core` refactor under it.
+
+`cargo raster show <artifact>` is unchanged and remains the primary answer — the durable
+artifact stays readable without re-running anything. `--show-output` is the same reader invoked
+at the end of a run, on the artifact that run just wrote; it removes the keystrokes from the
+fast loop without becoming the only way in. One implementation, two entry points: the flag
+supplies paths it already knows, so it is sugar and not a second code path.
+
 Companion to: [`program-end.md`](./program-end.md) (implemented) — defines the output artifact
 this reads; [`chain-stage-execution.md`](./chain-stage-execution.md) (partly implemented) — the
 per-stage dev loop that makes the absence acute.
@@ -51,6 +63,12 @@ third is `strings`.
 One command over every raster payload, because they are one format: a program's `output.bin`, an
 external input's `*.rastered`, a chain stage's artifact. Whatever produced it, the bytes and the
 index are the same shape.
+
+And `--show-output` on `run` / `chain run` (§6) — the same reader on the artifact the run just
+wrote, so the common case does not require knowing a path. Two entry points, one implementation.
+`show` is the capability; `--show-output` is the ergonomics. Neither is a substitute for the
+other: a flag alone would make a durable artifact readable only at the moment it was produced,
+and a command alone would make the fast loop retype a path it already printed.
 
 ## Facts the design builds on (verified in code)
 
@@ -123,6 +141,7 @@ pub fn read_raster_value(
 ) -> Result<RasterValue>;
 
 /// Decode from the payload alone — structure and field names, untyped leaves.
+/// DEFERRED (rev 2, §2) — not in the first cut.
 pub fn read_raster_value_structural(data: &[u8], limits: &ReadLimits) -> Result<RasterValue>;
 ```
 
@@ -134,7 +153,14 @@ and lives beside the walk.
 Limits are a parameter, not a constant, because the same walk serves a terminal (truncate hard)
 and `--format json` piped into a file (truncate loosely or not at all).
 
-### 2. The structural fallback matters more than it looks
+### 2. The structural fallback matters more than it looks — deferred
+
+> **Rev 2: deferred, not dropped.** `--show-output` never needs it: the run wrote the `.rindex`
+> seconds earlier, so the index is present by construction. Only standalone `show` can be pointed
+> at an orphaned payload. Deferring keeps the first cut inside `raster-runtime` + `raster-cli` and
+> avoids refactoring commitment-critical code in `raster-core` to serve a degraded mode. Until it
+> lands, `show` with no index errors with the path it looked for and says structural mode is not
+> implemented — never a silent or partial render. The argument below stands for when it is built.
 
 `read_raster_value_structural` takes the payload with **no index**. It recovers structure and
 field names, and renders leaves as raw bytes:
@@ -177,35 +203,82 @@ outside a selection proof catches that today.
 ```bash
 cargo raster show <artifact>                    # index inferred: <artifact> with .rindex
 cargo raster show <artifact> --index <path>
-cargo raster show <artifact> --select report.lines[0]
 cargo raster show <artifact> --format text|json
 cargo raster show <artifact> --max-bytes 4096 --max-list 1000 --depth 8
 ```
 
 - **Index inference** mirrors the chain runner's own default (`chain.rs:1023`: `path` with the
   extension replaced by `rindex`), so `cargo raster show output.bin` just works on a stage
-  directory. Missing index → structural mode, with a one-line note saying which mode ran and why.
-  Never silent.
-- **`--select`** reuses the existing selector-path machinery that `tree_value_from_raster_location`
-  already implements, including list ranges. Inspecting one field of a large artifact should not
-  require decoding all of it — and the index makes that genuinely cheap, since the walk is
-  node-addressed rather than a linear scan.
+  directory. Missing index → the §2 error, naming the path it looked for. Never silent.
 - **`--format json`** so it composes with `jq` and with tests. Text is for humans and is the
   default.
+- **No `--select`.** Rejected in rev 2 — see §Alternatives. `show` reads a file; it does not
+  query one.
 
-### 5. Chain ergonomics
+### 4.1 The text format is `Debug`-shaped, and cannot name a struct
 
-The forcing case is a chain stage, so name one:
+The obvious rendering target is Rust's `Debug`, and the index gets most of the way there — but
+not all of it. `RasterNodeKind::Leaf` carries `type_name`, so a leaf can be rendered as its Rust
+type. `RasterNodeKind::Struct` carries `fields: Vec<RasterStructField>` and **no type name**
+(`crates/raster-runtime/src/raster_index.rs:36`). The artifact knows a struct's field names and
+not what the struct is called.
 
-```bash
-cargo raster chain show <stage>          # the stage's output in the latest run
-cargo raster chain show <stage> --run <dir>
+So the text format brackets structs anonymously, and does not pretend otherwise:
+
+```
+{
+  title: "Pipeline report for sensor-A"
+  lines: [4] [
+    "count   : 6"
+    "sum     : 353"
+    … 2 more elements
+  ]
+  total: 353u64
+}
 ```
 
-Resolution reuses `chain-stage-execution`'s `latest` pointer and `--run` exactly, so the two
-commands agree on what "the current run" means. This is sugar over
-`cargo raster show <run>/<stage>/output.bin`, and is worth it only because that path is the one
-nobody wants to type while iterating.
+Enum variants *are* named (`EnumUnit`/`EnumNewtype`/`EnumTuple`/`EnumStruct` all carry
+`variant`), so they render as `Variant { … }`. This asymmetry — variants named, structs not — is
+a property of the index, not a choice. Recovering the struct name needs the declared type, which
+is the linking alternative in §Alternatives, still future work.
+
+### 5. Integrity on the `show` path
+
+Covered by §3. Worth noting that the chain runner already does half of it: `collect_output`
+(`chain.rs:2129`) recomputes the structural root from `output.bin` and hard-errors if it
+disagrees with `output_manifest.json` (`chain.rs:2144`). So a chain stage's artifact is already
+cross-checked before `--show-output` ever renders it; the §3 commitment line is new work only on
+the standalone `show` and plain `run` paths.
+
+### 6. `--show-output` on `run` and `chain run`
+
+```bash
+cargo raster run --show-output
+cargo raster chain run --show-output
+cargo raster chain run --no-auth --stage report --show-output
+```
+
+Opt-in, off by default. It runs the program, then renders the `output.bin` it just wrote, using
+§1's reader and §4's renderer with `ReadLimits::default()`.
+
+- **`run`** renders at `run.rs:255`, inside the existing `output_manifest.json` existence check
+  that already gates the `Program output artifact:` block. Under a distinct header — `run.rs:238`
+  already prints `Output:` for `raster::println!` lines, and the two must not read as one block.
+- **`chain run`** renders the **final stage's** output. Combined with `chain-stage-execution`'s
+  `--stage`, that is also how you inspect a middle stage: `--stage report --show-output` re-runs
+  that stage and shows it, because the stage you re-ran is the last one that ran. So "final stage
+  only" costs nothing in the dev loop it was designed for, and keeps a 74-stage chain from
+  printing 74 values. `--show-output=all` is left as residue in §Open questions.
+- **It reads from disk, like everything else.** `cargo raster run` spawns the program as a child
+  process (`run.rs:222`) and recovers `raster::println!` output by scraping `[output]`-prefixed
+  stdout lines; the CLI never holds the output value in memory. `chain run` likewise re-reads the
+  artifact through `collect_output` (`chain.rs:581`). So `--show-output` is the same decode as
+  `show`, triggered at a different moment — not a shortcut past it. This is why the two surfaces
+  can share one implementation rather than merely one renderer.
+- **No truncation policy in the runner.** `ReadLimits` and its defaults live on `raster-runtime`'s
+  public API (§1); the runner passes `ReadLimits::default()` and holds a call, not a policy. This
+  was the second half of the original objection to inline printing, and it is what makes the flag
+  admissible now.
 
 ## Alternatives considered
 
@@ -225,25 +298,46 @@ nobody wants to type while iterating.
   encoder internal on a rendering use case.
 - **Extending `cargo raster analyze`** rather than a new command. Rejected: `analyze` reads traces
   and reports cycles and sizes. Different input, different question.
-- **Teaching `chain run` to print stage outputs inline.** Rejected as the primary answer — it only
-  helps at run time, which is exactly the limitation being removed, and it would put a truncation
-  policy in the middle of the runner. `chain show` after the fact composes better.
+- **Teaching `chain run` to print stage outputs inline.** Rejected as the *primary* answer, and
+  that still holds: a run-time-only view leaves the durable artifact readable only through an
+  ephemeral event, so an `output.bin` from yesterday's run would need a re-run to look at a file
+  already on disk. **Rev 2 accepts it as a secondary answer** — `--show-output`, §6 — because the
+  two objections do not survive the flag being sugar over `show`. "Only helps at run time" is
+  answered by `show` existing; "truncation policy in the runner" is answered by `ReadLimits`
+  living on the runtime API. Adopted as an addition, never as a replacement.
+- **`--select <path>` on `show`.** Rejected in rev 2. The machinery exists —
+  `tree_value_from_raster_location` (`raster-runtime/src/input.rs:1271`) already resolves selector
+  paths including list ranges — so this is a rejection on surface area, not on cost. Two reasons.
+  Every selector-path surface is another place the path grammar can drift from `select!`'s, and
+  that grammar is load-bearing for selection proofs, not just for reading. And it changes what the
+  command *is*: `show` reads a file, and `--select` makes it query one, which invites the whole
+  query-language tail. `--format json` piped to `jq` covers the real need with a grammar that is
+  somebody else's problem. Revisit when the truncation limits are demonstrably the thing standing
+  between a developer and a field they need.
+- **`cargo raster chain show <stage>`.** Rejected in rev 2. It was sugar over
+  `cargo raster show <run>/<stage>/output.bin`, justified purely by that path being tedious to
+  type. With `--show-output` on `chain run` covering the iterate-and-look loop — including the
+  `--stage` case — what is left is a second command that resolves `latest`/`--run` and then calls
+  `show`. That is a second place chain run-resolution can drift from `chain-stage-execution`'s,
+  bought for keystrokes. Type the path.
 
 ## Implementation plan
 
-1. **Split walk from hash** in `crates/raster-core/src/input.rs`: `parse_subtree_root` becomes a
-   visitor-driven traversal with the current hashing as one visitor. Behaviour-preserving; the
-   existing selection-proof tests are the guard.
-2. **`RasterValue` + `ReadLimits` + the two `read_raster_value*` entry points** in
-   `raster-runtime`, converting from `TreeValue` and from the structural walk. Promote
-   `RasterIndex::from_bytes` and the `tree_value_from_raster_node` path to `pub`.
-3. **Renderers** — text tree and JSON — in `raster-cli`, with truncation markers that are visibly
-   truncation (`… 936 more elements`), never silent elision.
-4. **`cargo raster show`** with index inference, `--select`, `--format`, and the limit flags; the
-   commitment line of §3.
-5. **`cargo raster chain show`** over `latest` / `--run`.
+1. **`RasterValue` + `ReadLimits` + `read_raster_value`** in `raster-runtime`, converting from
+   `TreeValue`. Promote `RasterIndex::from_bytes` (`raster_index.rs:135`) and the
+   `tree_value_from_raster_node` path (`input.rs:1328`) to `pub`.
+2. **Renderers** — text tree (§4.1) and JSON — in `raster-cli`, with truncation markers that are
+   visibly truncation (`… 936 more elements`), never silent elision.
+3. **`cargo raster show`** with index inference, `--format`, and the limit flags; the commitment
+   line of §3; the §2 error when the index is absent.
+4. **`--show-output`** on `run` (`run.rs:255`) and `chain run` (`chain.rs:581`), final stage only.
 
-Steps 1–2 are the proposal; 3–5 are surface.
+Step 1 is the proposal; 2–4 are surface. Nothing here touches `raster-core`.
+
+**Deferred** — `read_raster_value_structural` and the walk/hash split in
+`crates/raster-core/src/input.rs` (`parse_subtree_root` becomes a visitor-driven traversal with
+the current hashing as one visitor, behaviour-preserving, guarded by the existing selection-proof
+tests). Only standalone `show` on an orphaned payload needs it; see §2.
 
 ## Verification
 
@@ -253,14 +347,21 @@ Steps 1–2 are the proposal; 3–5 are surface.
 - **Every tag.** A fixture per payload tag `0x00`–`0x0B`, including the `0x09` handle, `0x0A`
   metadata, and a `0x0B` page — the tag table is the checklist, and a new tag without a `show`
   arm should be a visible omission.
-- **Structural mode agrees with typed mode** on structure and field names for the same artifact,
-  differing only in leaf rendering.
+- **Missing index.** `show` on a payload whose `.rindex` is absent errors, names the path it
+  looked for, and renders nothing partial (§2, until the structural mode lands).
 - **Integrity.** A byte-flipped `output.bin` reports a commitment mismatch rather than rendering
   confidently; a `0x09` handle whose stored root disagrees with its elements is flagged.
 - **Limits hold.** A `Bytes<262144>` page and a 100k-element list both render bounded, in bounded
   time, with the truncation stated.
-- **Chain.** `cargo raster chain show report` on `examples/chain-example` prints the same value the
-  stage printed at run time — the specific gap in §Problem, closed.
+- **The two surfaces agree.** On `examples/chain-example`,
+  `cargo raster chain run --no-auth --show-output` and
+  `cargo raster show <run>/report/output.bin` print byte-identical renderings. This is the test
+  that keeps `--show-output` sugar rather than a second code path.
+- **Chain.** That same `--show-output` run prints the value the `report` stage would otherwise
+  have had to `raster::println!` — the specific gap in §Problem, closed.
+- **`--stage` inspection.** `chain run --no-auth --stage report --show-output` on a three-stage
+  chain shows `report`'s output and no other stage's, confirming "final stage of this run" is the
+  right rule for the dev loop (§6).
 
 ## Open questions
 
@@ -268,13 +369,58 @@ Steps 1–2 are the proposal; 3–5 are surface.
   in hand), but it makes a viewer into a checker, and a mismatch then has to decide between a
   warning and a non-zero exit. Defaulting to *report, exit 0* and putting the exit-code behaviour
   behind a flag is the current leaning.
-- **Does `--select` belong in v1?** It is the difference between "read a file" and "query a file",
-  and the machinery exists. But every selector-path surface is one more place the path grammar can
-  drift from `select!`'s.
+- ~~**Does `--select` belong in v1?**~~ **Resolved 2026-08-31: no, and not in v2 either** — see
+  §Alternatives. Not deferred but rejected; reopening it means arguing that `--format json | jq`
+  is insufficient, which is a different and harder claim than "the machinery already exists".
 - ~~**Should `run` and `chain run` print the output value by default once this exists?**~~
   **Resolved 2026-08-31 → §6**: opt-in `--show-output`, off by default, final stage only for a
-  chain. The residue is narrower — whether `--show-output=all` is worth defining for a chain, and
-  whether a chain long enough to want it is better served by `chain show` in a loop.
+  chain. The residue is narrower — whether `--show-output=all` is worth defining for a chain, or
+  whether a chain long enough to want it is better served by `show` over the run directory, which
+  needs no flag and no re-run.
+
+## Implementation record (2026-08-31)
+
+Steps 1–4 of the plan landed. Files: `crates/raster-runtime/src/reader.rs` (new),
+`RasterValue` + the bounded walk in `crates/raster-runtime/src/input.rs`,
+`crates/raster-cli/src/commands/show.rs` (new), and the flag wiring in
+`commands/run.rs` and `chain.rs`. Nothing in `raster-core` was touched, as §2 predicted.
+Tests: 12 in `reader.rs`, 9 in `crates/raster-cli/tests/show_cli.rs`.
+
+**Where the code departs from §1's sketch.** All of these are the same cause — *"never silent
+elision"* needs a place to record that something was cut, and the sketch had nowhere to put it:
+
+- `Str { value, truncated }`, `Bytes { …, truncated }` and `Map { len, entries, truncated }`
+  carry truncation flags. The sketch had a bare `Str(String)` and `Map(Vec<…>)`, which can only
+  truncate silently.
+- `Int { value, ty }` carries the Rust type name, because §4.1 renders `353u64` and the width is
+  lost once every leaf is widened to `i128`.
+- `Elided` was added: `max_depth` needs a representation in the value, not just in the renderer.
+- **`Float` was dropped.** It is not a gap — `TreeValue` has no float variant and
+  `parse_leaf_value` has no float arm, so the encoder cannot produce one. A `Float` in the reader
+  would describe a value that cannot exist.
+
+**Other departures.**
+
+- **`read_raster_artifact` / `RasterArtifact` sit beside `read_raster_value`.** §1's signature
+  returns only the value, but §3 needs the roots; rather than change the documented signature,
+  the integrity-carrying form is a second entry point and `read_raster_value` delegates to it.
+- **The walk is its own traversal, not a conversion from `TreeValue`.** §Implementation plan said
+  "converting from `TreeValue`", which would materialize the whole tree before truncating it —
+  exactly the 100k-element list the limits exist to avoid. `raster_value_from_node` mirrors
+  `tree_value_from_raster_node` node for node and reuses `parse_leaf_value` verbatim, so the leaf
+  semantics stay literally shared with the encoder.
+- **`--format json` defaults to unbounded**, via `ReadLimits::unbounded()`. §1 said JSON should
+  "truncate loosely"; a pipe into `jq` has no reason to truncate at all, and the limit flags still
+  apply if given.
+- **`--show-output` after a failed run** says the program failed rather than that it returns unit.
+  Both produce no artifact; only one is a property of the program.
+
+**Not implemented, and not merely deferred with §2:** the `0x09` cross-check from §3's last
+paragraph — flagging a list handle whose *stored* root disagrees with its own elements. Whole
+artifact integrity is in (payload structural root vs. the `.rindex` root, reported on every
+`show` and `--show-output`), but the handle-level check is a statement about the payload's
+internal consistency and needs the payload walk that §2 defers. It rides with the structural
+fallback.
 
 ## Out of scope
 
