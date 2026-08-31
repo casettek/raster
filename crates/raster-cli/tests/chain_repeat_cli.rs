@@ -387,6 +387,43 @@ fn a_tampered_trip_count_is_rejected_with_no_prover() {
 }
 
 #[test]
+fn a_shape_record_that_cannot_be_read_is_reported_not_proved() {
+    // `fraud-prove` loads the chain *as claimed*, so it is the one path where a
+    // shape record that is invalid on its face still reaches the detectors. A
+    // `source_stage` past the end of the chain is not a fault — a `Shape` fault
+    // is an inequality against what the producing stage committed, and there is
+    // no such stage — so it must come back as a verdict, not as an index panic
+    // on the way to naming the stage to blame.
+    let scratch = Scratch::new("shape-malformed");
+    scratch.run(DYNAMIC);
+
+    let commitment_path = scratch.latest_commitment();
+    let mut chain = scratch.chain(false);
+    chain.shape.repeats[0].source_stage = Some(99);
+    fs::write(&commitment_path, postcard::to_allocvec(&chain).unwrap())
+        .expect("commitment should be writable");
+
+    let out = scratch.cargo_raster(&[
+        "chain",
+        "fraud-prove",
+        manifest(DYNAMIC).to_str().expect("utf-8 path"),
+        commitment_path.to_str().expect("utf-8 path"),
+    ]);
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!out.status.success(), "{combined}");
+    assert!(combined.contains("malformed chain commitment"), "{combined}");
+    assert!(combined.contains("past the end of"), "{combined}");
+    assert!(
+        !combined.contains("panicked"),
+        "a malformed record is a verdict, not a crash\n{combined}"
+    );
+}
+
+#[test]
 fn a_tampered_manifest_is_rejected_with_no_prover() {
     // The other half of §6 step 1: the commitment names the manifest it was
     // expanded from, so a verifier holding a different manifest learns that

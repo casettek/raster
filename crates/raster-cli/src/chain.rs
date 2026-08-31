@@ -1233,11 +1233,16 @@ fn prove_terminal_window(
 }
 
 
-/// A `Link` fault inside the commitment: a checkpoint whose own committed
-/// manifest feeds a chained parameter a value different from the producer's
-/// committed output root. Returns the manifest bytes (the checkpoint's
-/// preimage) so the fault can be exhibited in-guest via the authorization
-/// journal.
+/// One exhibitable `Shape` fault: which repeat block, and the stage blame lands
+/// on.
+#[derive(Debug)]
+struct ShapeFault {
+    repeat_index: usize,
+    /// In range for `chain.stages` — `detect_shape_fraud` will not return a
+    /// fault naming a stage that is not there, so callers may index with it.
+    source_stage: u32,
+}
+
 /// A repeat block whose recorded count is not the one its producing stage
 /// committed.
 ///
@@ -1249,32 +1254,62 @@ fn prove_terminal_window(
 /// In practice `load_recorded_chain` has already refused such a chain — this
 /// exists so `fraud-prove` can produce the *receipt* for a fault a relying
 /// party can then check without the manifest.
-fn detect_shape_fraud(recorded: &RecordedChain) -> Option<usize> {
-    recorded
-        .chain
-        .shape
-        .repeats
-        .iter()
-        .enumerate()
-        .find(|(_, repeat)| {
-            let Some(source) = repeat.source_stage else {
-                return false;
-            };
-            let Some(producer) = recorded.chain.stages.get(source as usize) else {
-                return true;
-            };
-            match scalar_leaf_root(repeat.width, u64::from(repeat.resolved_count)) {
-                Some(claimed) => {
-                    claimed.as_slice() != producer.output_structural_commitment.as_slice()
-                }
-                // A count that does not fit its own recorded width cannot be
-                // what any stage committed.
-                None => true,
-            }
-        })
-        .map(|(index, _)| index)
+///
+/// `Err` is a **malformed** record, not a fault: a `source_stage` past the end
+/// of the chain, or a count its own recorded width cannot represent. Both make
+/// the chain invalid on its face, and neither is exhibitable — a `Shape` fault
+/// is an inequality between the recorded count and what the producing stage
+/// committed, and in these two cases one side of it does not exist. Saying so
+/// is the whole point of separating them: this path loads the chain *as
+/// claimed*, so unlike `audit` it has no `verify_shape` upstream to have
+/// refused them, and treating them as faults would index past `chain.stages`
+/// here and hit the guest's own `expect`s after paying for a proof.
+fn detect_shape_fraud(recorded: &RecordedChain) -> Result<Option<ShapeFault>> {
+    for (repeat_index, repeat) in recorded.chain.shape.repeats.iter().enumerate() {
+        let Some(source_stage) = repeat.source_stage else {
+            continue;
+        };
+        let malformed = |detail: String| {
+            Error::Other(format!(
+                "malformed chain commitment — repeat block '{}': {detail}. The chain is invalid, \
+                 but this is not a fault a receipt can exhibit",
+                repeat.name
+            ))
+        };
+
+        let producer = recorded
+            .chain
+            .stages
+            .get(source_stage as usize)
+            .ok_or_else(|| {
+                malformed(format!(
+                    "it names producing stage {source_stage}, past the end of a {}-stage chain",
+                    recorded.chain.stages.len()
+                ))
+            })?;
+        let claimed = scalar_leaf_root(repeat.width, u64::from(repeat.resolved_count))
+            .ok_or_else(|| {
+                malformed(format!(
+                    "it records {} iteration(s), which its recorded width {:?} cannot represent",
+                    repeat.resolved_count, repeat.width
+                ))
+            })?;
+
+        if claimed.as_slice() != producer.output_structural_commitment.as_slice() {
+            return Ok(Some(ShapeFault {
+                repeat_index,
+                source_stage,
+            }));
+        }
+    }
+    Ok(None)
 }
 
+/// A `Link` fault inside the commitment: a checkpoint whose own committed
+/// manifest feeds a chained parameter a value different from the producer's
+/// committed output root. Returns the manifest bytes (the checkpoint's
+/// preimage) so the fault can be exhibited in-guest via the authorization
+/// journal.
 fn detect_link_fraud(recorded: &RecordedChain) -> Result<Option<(usize, String, Vec<u8>)>> {
     for (stage_index, checkpoint) in recorded.chain.stages.iter().enumerate() {
         let chained: Vec<(&String, usize)> = checkpoint
@@ -1367,19 +1402,22 @@ pub fn fraud_prove(manifest: Option<&str>, chain_commitment: Option<&str>) -> Re
     // only one that can be answered *before* the stage list is agreed: an
     // output comparison is meaningless against a chain with the wrong number of
     // stages. See `docs/proposals/chain-repeat.md` §6.1.
-    if let Some(repeat_index) = detect_shape_fraud(&recorded) {
+    if let Some(ShapeFault {
+        repeat_index,
+        source_stage,
+    }) = detect_shape_fraud(&recorded)?
+    {
         let repeat = &recorded.chain.shape.repeats[repeat_index];
-        let faulty_stage = repeat.source_stage.expect("a shape fault names its producer");
         println!(
-            "shape fraud: repeat block '{}' records {} iteration(s), which stage {faulty_stage} \
+            "shape fraud: repeat block '{}' records {} iteration(s), which stage {source_stage} \
              ('{}') did not commit",
             repeat.name,
             repeat.resolved_count,
-            recorded.chain.stages[faulty_stage as usize].name,
+            recorded.chain.stages[source_stage as usize].name,
         );
         let input = ChainFraudInput {
             chain_commitment_bytes: recorded.chain_bytes.clone(),
-            faulty_stage,
+            faulty_stage: source_stage,
             evidence: ChainFraudEvidence::Shape {
                 repeat_index: repeat_index as u32,
             },
@@ -2591,6 +2629,91 @@ fn short_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `RecordedChain` carrying nothing but the commitment — enough for the
+    /// detectors that read only that, and for nothing else.
+    fn recorded_from(chain: ChainCommitment) -> RecordedChain {
+        RecordedChain {
+            spec: ChainSpec {
+                stages: Vec::new(),
+                inputs: BTreeMap::new(),
+            },
+            base_dir: PathBuf::from("."),
+            chain,
+            chain_bytes: Vec::new(),
+            chain_dir: PathBuf::from("."),
+        }
+    }
+
+    /// A one-stage chain whose repeat block claims `count`, sourced from
+    /// `source_stage` at `width`, against a planner that committed `committed`.
+    fn shape_chain(
+        source_stage: u32,
+        width: IndexWidth,
+        count: u32,
+        committed: u32,
+    ) -> ChainCommitment {
+        ChainCommitment {
+            stages: vec![StageCheckpoint {
+                name: "planner".into(),
+                program_commitment: vec![1],
+                input_manifest_commitment: vec![2],
+                input_bindings: BTreeMap::new(),
+                output_payload_commitment: vec![3],
+                output_structural_commitment: scalar_leaf_root(
+                    IndexWidth::U32,
+                    u64::from(committed),
+                )
+                .unwrap()
+                .to_vec(),
+            }],
+            shape: ChainShape {
+                spec_digest: Vec::new(),
+                repeats: vec![RepeatResolution {
+                    name: "decode".into(),
+                    source_stage: Some(source_stage),
+                    source_commitment: Vec::new(),
+                    selector: String::new(),
+                    width,
+                    max: 128,
+                    resolved_count: count,
+                }],
+            },
+        }
+    }
+
+    #[test]
+    fn detect_shape_fraud_finds_the_inequality_it_can_exhibit() {
+        let recorded = recorded_from(shape_chain(0, IndexWidth::U32, 5, 3));
+        let fault = detect_shape_fraud(&recorded).unwrap().unwrap();
+        assert_eq!(fault.repeat_index, 0);
+        assert_eq!(fault.source_stage, 0);
+
+        let honest = recorded_from(shape_chain(0, IndexWidth::U32, 3, 3));
+        assert!(detect_shape_fraud(&honest).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_source_stage_past_the_end_is_malformed_not_a_fault() {
+        // Reported, not proved, and above all not indexed: treating this as a
+        // fault would have `fraud_prove` index `chain.stages[7]` to name the
+        // stage to blame.
+        let recorded = recorded_from(shape_chain(7, IndexWidth::U32, 3, 3));
+        let err = detect_shape_fraud(&recorded).unwrap_err().to_string();
+        assert!(err.contains("malformed chain commitment"), "{err}");
+        assert!(err.contains("past the end of a 1-stage chain"), "{err}");
+    }
+
+    #[test]
+    fn a_count_its_width_cannot_represent_is_malformed_not_a_fault() {
+        // `scalar_leaf_root` returns `None`, so there is no value to compare
+        // against what the producer committed. The guest asserts the same thing
+        // with an `expect`, which is a panic mid-proof rather than a verdict.
+        let recorded = recorded_from(shape_chain(0, IndexWidth::U8, 300, 3));
+        let err = detect_shape_fraud(&recorded).unwrap_err().to_string();
+        assert!(err.contains("malformed chain commitment"), "{err}");
+        assert!(err.contains("cannot represent"), "{err}");
+    }
 
     #[test]
     fn parses_chain_json_external_and_from_bindings() {

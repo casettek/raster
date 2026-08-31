@@ -495,8 +495,19 @@ Given `ChainCommitment`, the unexpanded manifest, and each stage's `output.bin`:
    - **literal / external source** — re-derive the count from the spec, or from the external
      whose commitment the spec declares, applying `selector`. Both are manifest-static: no
      stage artifact is involved and nothing is read from a run.
-   - **stage source** — take `stages[source_stage]`, an already-verified checkpoint naming a
-     program, its inputs, and its output commitments. The payload **is** the count (§3), so
+   - **stage source** — locate the producer by **re-deriving its index** from the manifest's
+     `from` against the expansion so far, exactly as the run loop did, and check the recorded
+     `source_stage` equals it. The recorded index is compared, never followed: it is a field
+     of the record under examination, so following it would let any checkpoint whose output
+     happens to encode the wanted count authenticate it — including one the block itself
+     created, which is the circularity the "producer precedes the block" rule exists to
+     prevent. This is why step 2 walks the manifest and expands as it goes rather than
+     zipping `shape.repeats` against the block list: the producer's position is only knowable
+     once the blocks before it have expanded, and the counts that expand them are verified in
+     the same order.
+   - Then take `stages[source_stage]`, an already-verified checkpoint naming a
+     program, its inputs, and its output commitments, and assert its `name` is the `from` the
+     manifest declares. The payload **is** the count (§3), so
      assert `scalar_leaf_root(width, resolved_count)` equals that checkpoint's
      `output_structural_commitment`. Nothing is parsed: the recorded count is
      re-encoded and its commitment compared. Outside a guest, `output.bin` is available too
@@ -719,6 +730,21 @@ allowed to supply the width would submit `U8` against an honest `u64` planner an
 honest chain. And the guest must assert `faulty_stage == repeats[i].source_stage`, or blame
 lands on an arbitrary stage. `Shape` covers stage-sourced repeats only; a `source_stage:
 None` count is manifest-static and re-derived host-side for free.
+
+**What the guest's `Shape` fault does not cover.** It holds no manifest, so it can only
+exhibit a disagreement *inside* the commitment: the count the chain records versus what the
+checkpoint the chain names committed. Whether that checkpoint is the producer the manifest's
+`from` declares is a manifest question, and it is settled host-side in step 2 — which is
+where it belongs, since a producer that is not the declared one is a verdict reachable with
+no prover at all. The two are complementary and neither subsumes the other.
+
+The same boundary applies to a shape record that is invalid on its face: a `source_stage`
+past the end of the chain, or a `resolved_count` its own recorded `width` cannot represent.
+Neither is exhibitable, because `Shape` asserts an inequality between two values and in both
+cases one side does not exist — which is exactly what the guest's two `expect`s say. So
+`detect_shape_fraud` separates them from the fault it can prove and returns them as a
+"malformed chain commitment" error. `audit` never sees these (step 2 refuses them first);
+`fraud-prove` loads the chain as claimed and must therefore check them itself.
 
 Phase 3 is the real test of the templating design: if `[[chain.repeat]]` cannot reproduce the
 existing hand-written stages exactly, the syntax is wrong — and that is discoverable before

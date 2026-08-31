@@ -295,28 +295,51 @@ pub(super) fn verify_shape(
         )));
     }
 
+    // The manifest is walked and expanded here rather than only in `expand`,
+    // because a stage-sourced count's producer is identified *by position* in
+    // the expanded list, and that position is only knowable once the blocks
+    // before it have expanded. Each block's count is verified against the
+    // producer this walk derives, then the block expands with it — so a count
+    // can never be checked against a stage the count itself brought into being.
     let mut counts = BTreeMap::new();
-    for (block, recorded) in blocks.iter().zip(&chain.shape.repeats) {
-        if block.name != recorded.name {
-            return Err(Error::Other(format!(
-                "shape fraud — repeat block {} is '{}' in the manifest and '{}' in the commitment",
-                counts.len(),
-                block.name,
-                recorded.name,
-            )));
+    let mut stages: Vec<StageSpec> = Vec::new();
+    let mut exports: BTreeMap<String, String> = BTreeMap::new();
+    let mut ordinal = 0usize;
+
+    for item in &manifest.items {
+        match item {
+            ChainItem::Stage(stage) => stages.push(stage.clone()),
+            ChainItem::Repeat(block) => {
+                let recorded = &chain.shape.repeats[ordinal];
+                if block.name != recorded.name {
+                    return Err(Error::Other(format!(
+                        "shape fraud — repeat block {ordinal} is '{}' in the manifest and '{}' in \
+                         the commitment",
+                        block.name, recorded.name,
+                    )));
+                }
+                verify_count(block, recorded, chain, &stages)?;
+                expand_repeat(block, recorded.resolved_count, &mut stages, &mut exports)?;
+                counts.insert(recorded.name.clone(), recorded.resolved_count);
+                ordinal += 1;
+            }
         }
-        verify_count(block, recorded, chain)?;
-        counts.insert(recorded.name.clone(), recorded.resolved_count);
     }
+    debug_assert_eq!(ordinal, blocks.len());
 
     Ok(VerifiedCounts(counts))
 }
 
 /// One block's count, re-derived from whatever authorized value it names.
+///
+/// `expanded` is the stage list up to but not including this block — the same
+/// prefix the run loop had when it recorded the resolution, and what the
+/// producing stage's index is derived against.
 fn verify_count(
     block: &RepeatSpec,
     recorded: &RepeatResolution,
     chain: &ChainCommitment,
+    expanded: &[StageSpec],
 ) -> Result<()> {
     let fault = |detail: String| {
         Error::Other(format!(
@@ -341,12 +364,39 @@ fn verify_count(
             Ok(())
         }
         CountSource::Stage { from, max } => {
-            let index = recorded.source_stage.ok_or_else(|| {
+            let recorded_index = recorded.source_stage.ok_or_else(|| {
                 fault(format!("the count comes from stage '{from}', but none is recorded"))
-            })? as usize;
+            })?;
+            // Which stage produced the count is settled by the manifest, not by
+            // the record being checked: re-derive the index the same way the run
+            // loop did. A recorded index is only ever compared against it, never
+            // followed — otherwise a chain could point at any checkpoint whose
+            // output happens to encode the count it wants, including one the
+            // block itself created, and the count would be authenticated by a
+            // stage the manifest never named.
+            let index = producer_index(expanded, block)?;
+            if recorded_index != index {
+                return Err(fault(format!(
+                    "its count comes from stage '{from}' at index {index}, but the commitment \
+                     names stage {recorded_index} as the producer"
+                )));
+            }
+            let index = index as usize;
             let producer = chain.stages.get(index).ok_or_else(|| {
                 fault(format!("names producing stage {index}, past the end of the chain"))
             })?;
+            // Position pins which checkpoint is read; this pins that the
+            // checkpoint at that position is the stage the manifest named. The
+            // two disagree only if `chain.stages` does not correspond to the
+            // expansion at all, which `audit` reports stage-for-stage — but the
+            // count is verified here, before that comparison runs.
+            if producer.name != *from {
+                return Err(fault(format!(
+                    "its count comes from stage '{from}', but the commitment's stage {index} is \
+                     '{}'",
+                    producer.name
+                )));
+            }
 
             // The bound comes from the manifest, which `spec_digest` pins —
             // never from the record being checked. A recorded `max` that
@@ -1216,6 +1266,125 @@ count = { from = "planner", max = 128 }
         let err = verify_shape(&manifest, &chain).unwrap_err().to_string();
         assert!(err.contains("shape fraud"), "{err}");
         assert!(err.contains("claims 3 iterations"), "{err}");
+    }
+
+    /// The same chain, plus a second stage before the block that the block's
+    /// count does *not* come from.
+    fn sidecar_manifest() -> ChainManifest {
+        manifest(
+            r#"
+[chain]
+[[chain.stage]]
+name = "planner"
+project = "p"
+
+[[chain.stage]]
+name = "sidecar"
+project = "p"
+
+[[chain.repeat]]
+name  = "decode"
+index = "t"
+count = { from = "planner", max = 128 }
+  [[chain.repeat.stage]]
+  name    = "step{t}"
+  project = "p"
+"#,
+        )
+        .unwrap()
+    }
+
+    fn count_root(n: u32) -> Vec<u8> {
+        scalar_leaf_root(IndexWidth::U32, u64::from(n)).unwrap().to_vec()
+    }
+
+    fn decode_resolution(source_stage: u32, count: u32) -> RepeatResolution {
+        RepeatResolution {
+            name: "decode".into(),
+            source_stage: Some(source_stage),
+            source_commitment: Vec::new(),
+            selector: String::new(),
+            width: IndexWidth::U32,
+            max: 128,
+            resolved_count: count,
+        }
+    }
+
+    #[test]
+    fn verify_shape_rejects_a_count_authenticated_by_a_stage_the_manifest_did_not_name() {
+        // `source_stage` is a field of the record being checked, so following it
+        // would let any checkpoint whose output happens to encode the wanted
+        // count stand in for the declared producer: here `planner` committed 3
+        // and `sidecar` committed 5, and the chain expands to 5 by pointing at
+        // `sidecar`. The index is re-derived from the manifest instead.
+        let manifest = sidecar_manifest();
+        let mut stages = vec![
+            checkpoint("planner", count_root(3)),
+            checkpoint("sidecar", count_root(5)),
+        ];
+        for t in 0..5u32 {
+            stages.push(checkpoint(&format!("step{t}"), vec![t as u8]));
+        }
+        let chain = ChainCommitment {
+            stages,
+            shape: ChainShape {
+                spec_digest: spec_digest(&manifest),
+                repeats: vec![decode_resolution(1, 5)],
+            },
+        };
+
+        let err = verify_shape(&manifest, &chain).unwrap_err().to_string();
+        assert!(err.contains("shape fraud"), "{err}");
+        assert!(err.contains("names stage 1 as the producer"), "{err}");
+    }
+
+    #[test]
+    fn a_block_may_not_authenticate_its_own_count() {
+        // The circularity `producer_index` exists to prevent, arriving through
+        // the commitment rather than the manifest: `step0` only exists because
+        // the count says 3, so it cannot be what establishes that the count is 3.
+        let manifest = dynamic_manifest();
+        let chain = ChainCommitment {
+            stages: vec![
+                checkpoint("planner", count_root(1)),
+                checkpoint("step0", count_root(3)),
+                checkpoint("step1", vec![1]),
+                checkpoint("step2", vec![2]),
+            ],
+            shape: ChainShape {
+                spec_digest: spec_digest(&manifest),
+                repeats: vec![decode_resolution(1, 3)],
+            },
+        };
+
+        let err = verify_shape(&manifest, &chain).unwrap_err().to_string();
+        assert!(err.contains("names stage 1 as the producer"), "{err}");
+    }
+
+    #[test]
+    fn verify_shape_rejects_a_producer_whose_checkpoint_is_another_stage() {
+        // Right index, wrong stage at it: the commitment drops `planner` and
+        // puts the stage that committed 5 in its place. Caught here rather than
+        // left to `audit`'s stage-for-stage comparison, because this is the
+        // check that decides the count is authentic.
+        let manifest = sidecar_manifest();
+        let mut stages = vec![
+            checkpoint("sidecar", count_root(5)),
+            checkpoint("planner", count_root(3)),
+        ];
+        for t in 0..5u32 {
+            stages.push(checkpoint(&format!("step{t}"), vec![t as u8]));
+        }
+        let chain = ChainCommitment {
+            stages,
+            shape: ChainShape {
+                spec_digest: spec_digest(&manifest),
+                repeats: vec![decode_resolution(0, 5)],
+            },
+        };
+
+        let err = verify_shape(&manifest, &chain).unwrap_err().to_string();
+        assert!(err.contains("the commitment's stage 0 is 'sidecar'"), "{err}");
     }
 
     #[test]
