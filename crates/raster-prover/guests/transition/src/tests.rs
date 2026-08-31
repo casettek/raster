@@ -250,6 +250,7 @@ fn chunked_recur_cfs(chunk: Option<u64>) -> CfsCursor {
                 id: "collect".into(),
                 sources: vec![],
                 chunk,
+                leaves_output_open: false,
             })],
             entry_arguments: Vec::new(),
             produces_output: false,

@@ -371,6 +371,9 @@ pub(crate) fn gen_recur_driver_function(
 ) -> proc_macro2::TokenStream {
     let fn_name_str = fn_name.to_string();
     let hidden_name = format_ident!("__raster_recur_auth_{}", fn_name);
+    // Second entry point for `call_recur!(.., finalize = false, ..)`: same
+    // sweep, same tracing, but it hands the draft back instead of closing it.
+    let hidden_open_name = format_ident!("__raster_recur_auth_open_{}", fn_name);
     let source_ident = format_ident!("__RasterRecurSource");
     let item_ty =
         recur_input_inner_type(&shape.input_param.ty).expect("validated recur input type");
@@ -555,6 +558,70 @@ pub(crate) fn gen_recur_driver_function(
             }
         }
     };
+    // The `finalize = false` driver set. Output-bearing modes only: a
+    // state-only recur has no draft to leave open, so there is nothing to defer.
+    let open_result_ty = shape
+        .output_schema
+        .clone()
+        .unwrap_or_else(|| syn::parse_quote!(()));
+    let run_driver_open = match shape.mode {
+        RecurTileMode::OutputOnly => {
+            let output_schema = shape
+                .output_schema
+                .as_ref()
+                .expect("output-only output schema");
+            if chunked {
+                quote! {
+                    ::raster::run_recur_chunked_list_open::<#source_element_ty, #output_schema, _, _>(
+                        input,
+                        __raster_recur_chunk,
+                        output,
+                        move |input, output| #call_expr,
+                    )
+                }
+            } else {
+                quote! {
+                    ::raster::run_recur_list_open::<#item_ty, #output_schema, _, _>(
+                        input,
+                        output,
+                        move |input, output| #call_expr,
+                    )
+                }
+            }
+        }
+        RecurTileMode::StateOutput => {
+            let state_ident = &shape
+                .state_param
+                .as_ref()
+                .expect("state+output state param")
+                .ident;
+            let output_schema = shape
+                .output_schema
+                .as_ref()
+                .expect("state+output output schema");
+            if chunked {
+                quote! {
+                    ::raster::run_recur_chunked_list_with_state_open::<#source_element_ty, _, #output_schema, _, _>(
+                        input,
+                        __raster_recur_chunk,
+                        #state_ident,
+                        output,
+                        move |input, state, output| #call_expr,
+                    )
+                }
+            } else {
+                quote! {
+                    ::raster::run_recur_list_with_state_open::<#item_ty, _, #output_schema, _, _>(
+                        input,
+                        #state_ident,
+                        output,
+                        move |input, state, output| #call_expr,
+                    )
+                }
+            }
+        }
+        RecurTileMode::StateOnly => quote! { compile_error!("unreachable: state-only recur has no draft to leave open") },
+    };
     let wrapper_generics = if extra_generic_idents.is_empty() {
         quote! { <#source_ident> }
     } else {
@@ -636,7 +703,131 @@ pub(crate) fn gen_recur_driver_function(
         })
         .collect();
 
-    quote! {
+    let open_wrapper = if shape.output_schema.is_some() {
+        quote! {
+        #[doc(hidden)]
+        pub fn #hidden_open_name #wrapper_generics (
+            input: #source_ident,
+            #chunk_param
+            #state_param
+            #output_param
+            #(#extra_wrapper_params,)*
+        ) -> ::raster::Draft<#open_result_ty>
+        where
+            // `List<E>` in both modes: a chunked tile's `Block<E>` is produced
+            // by the driver from range selections, never by the caller.
+            #source_ident: ::raster::RecurListSource<#source_element_ty>,
+            #(#extra_where,)*
+        {
+            let input = ::raster::into_auth_ref::<::raster::List<#source_element_ty>, _>(input);
+            #state_wrapper
+
+            #[cfg(all(feature = "std", not(target_arch = "riscv32")))]
+            {
+                // Unauthenticated: run the loop and nothing else. The trace
+                // machinery around it is not inline-safe and has no reader —
+                // `recur_source_trace` rejects a non-storage source, and the
+                // output half calls `AuthRef::reference()`, which panics on an
+                // inline binding. See
+                // `docs/proposals/unauthenticated-execution.md` §7.
+                if !::raster::auth_mode().is_authenticated() {
+                    let __raster_recur_trace_scope =
+                        ::raster::__private::RecurTraceScopeGuard::enter();
+                    let result = #run_driver_open;
+                    drop(__raster_recur_trace_scope);
+                    return result;
+                }
+
+                // A recur source is traced through its authenticated list
+                // metadata, never by resolving it: `auth_ref_trace` would
+                // materialize the whole list here, before any runner runs.
+                // See `docs/proposals/lazy-list-recur.md` §2.
+                let __raster_input_trace = ::raster::recur_source_trace(&input)
+                    .unwrap_or_else(|e| panic!("Failed to build recur input trace: {}", e));
+                let mut __raster_trace_values = ::raster::alloc::vec::Vec::new();
+                let mut __raster_trace_args = ::raster::alloc::vec::Vec::new();
+                let mut __raster_internal = ::raster::alloc::collections::BTreeMap::new();
+
+                __raster_trace_values.push(__raster_input_trace.value);
+                __raster_trace_args.push(::raster::core::trace::FnInputArg {
+                    name: ::raster::alloc::string::String::from("input"),
+                    ty: ::raster::alloc::string::String::from(stringify!(::raster::AuthRef<::raster::List<#source_element_ty>>)),
+                });
+                if let ::core::option::Option::Some(__raster_internal_info) = __raster_input_trace.storage {
+                    __raster_internal.insert(
+                        ::raster::alloc::string::String::from("input"),
+                        __raster_internal_info,
+                    );
+                }
+                #state_trace_capture
+                #output_trace_capture
+                #(#extra_trace_capture)*
+                let __raster_input_bytes = ::raster::core::postcard::to_allocvec(&(
+                    __raster_trace_values.clone(),
+                    __raster_internal.clone(),
+                ))
+                .unwrap_or_default();
+                let __raster_input = ::core::option::Option::Some(::raster::core::trace::FnInput {
+                    data: __raster_input_bytes,
+                    values: __raster_trace_values,
+                    args: __raster_trace_args,
+                    storage: __raster_internal,
+                });
+
+                // `Start` publishes the input half at the point it was already
+                // computed, so the loop bound `L` carried by the source's `0x0A`
+                // metadata selection is known *before* iteration 0. `End` keeps
+                // its input too for now: every downstream check on the site's
+                // `Exec` record reads it, so duplicating keeps this addition
+                // strictly additive. See `recur-progress-commitment.md` §3.2.
+                ::raster::publish_trace_event(::raster::core::trace::TraceEvent::RecurTileStart(
+                    ::raster::core::trace::FnCallRecord {
+                        fn_name: ::raster::alloc::string::String::from(#fn_name_str),
+                        input: ::core::clone::Clone::clone(&__raster_input),
+                        output: ::core::option::Option::None,
+                        draft_transition_witness: ::core::option::Option::None,
+                        recur_control: ::core::option::Option::None,
+                    }
+                ));
+
+                let __raster_recur_trace_scope = ::raster::__private::RecurTraceScopeGuard::enter();
+                let result = #run_driver_open;
+                drop(__raster_recur_trace_scope);
+
+                // No finalized value to record: this sweep deliberately left its
+                // draft open for a later writer. Nothing is lost by that. The
+                // appends are attested where they actually happen — every
+                // iteration's `TileExec` carries a `DraftReplayTransition` whose
+                // `root_before` the fraud-proof guest chains against the previous
+                // step's root
+                // (`raster-prover/guests/transition/src/checks/drafts.rs`).
+                // Deferring `finalize` moves no attestation; it moves only the
+                // materialization.
+                let __raster_output = ::core::option::Option::None;
+                ::raster::publish_trace_event(::raster::core::trace::TraceEvent::RecurTileEnd(
+                    ::raster::core::trace::FnCallRecord {
+                        fn_name: ::raster::alloc::string::String::from(#fn_name_str),
+                        input: __raster_input,
+                        output: __raster_output,
+                        draft_transition_witness: ::core::option::Option::None,
+                        recur_control: ::core::option::Option::None,
+                    }
+                ));
+
+                return result;
+            }
+
+            #[cfg(not(all(feature = "std", not(target_arch = "riscv32"))))]
+            {
+                #run_driver_open
+            }
+        }
+        }
+    } else {
+        quote! {}
+    };
+
+    let closed_wrapper = quote! {
         #[doc(hidden)]
         pub fn #hidden_name #wrapper_generics (
             input: #source_ident,
@@ -756,6 +947,11 @@ pub(crate) fn gen_recur_driver_function(
                 #run_driver
             }
         }
+    };
+
+    quote! {
+        #closed_wrapper
+        #open_wrapper
     }
 }
 

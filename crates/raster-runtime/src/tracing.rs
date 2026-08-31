@@ -192,6 +192,7 @@ pub fn finish() {
     if let Some(publisher) = GLOBAL_PUBLISHER.get() {
         publisher.finish();
     }
+    crate::tile_census::finish();
     if let Err(error) = crate::profiling::finish() {
         panic!("Failed to write Raster execution profile: {}", error);
     }
@@ -202,18 +203,46 @@ pub fn finish() {
 
 #[doc(hidden)]
 pub fn publish_trace_event(event: TraceEvent) {
-    if let Some(publisher) = GLOBAL_PUBLISHER.get() {
-        let event = RECUR_TRACE_DEPTH.with(|depth| {
-            if depth.get() > 0 {
-                match event {
-                    TraceEvent::TileExec(record) => TraceEvent::RecurTileIterationExec(record),
-                    other => other,
-                }
-            } else {
-                event
+    // Before the publisher check: an unauthenticated run installs no publisher,
+    // and its tiles — and the events it would have traced — are exactly the
+    // ones an authenticated run has.
+    if let TraceEvent::TileExec(record) = &event {
+        crate::tile_census::note_tile_execution(&record.fn_name);
+    }
+    // Hoisted out of the publisher branch so the census sees the variant that
+    // would land in the trace, not the one before the depth rewrite.
+    let event = RECUR_TRACE_DEPTH.with(|depth| {
+        if depth.get() > 0 {
+            match event {
+                TraceEvent::TileExec(record) => TraceEvent::RecurTileIterationExec(record),
+                other => other,
             }
-        });
+        } else {
+            event
+        }
+    });
+    crate::tile_census::note_trace_event(trace_event_variant(&event));
+    if let Some(publisher) = GLOBAL_PUBLISHER.get() {
         publisher.publish(event);
+    }
+}
+
+/// The variant's own name, for the census. Kept exhaustive on purpose: a new
+/// `TraceEvent` variant should not silently land in an "other" bucket.
+fn trace_event_variant(event: &TraceEvent) -> &'static str {
+    match event {
+        TraceEvent::ProgramStart(_) => "ProgramStart",
+        TraceEvent::ProgramEnd(_) => "ProgramEnd",
+        TraceEvent::SequenceStart(_) => "SequenceStart",
+        TraceEvent::SequenceEnd(_) => "SequenceEnd",
+        TraceEvent::RecurSequenceIterationStart(_) => "RecurSequenceIterationStart",
+        TraceEvent::RecurSequenceIterationEnd(_) => "RecurSequenceIterationEnd",
+        TraceEvent::TileExec(_) => "TileExec",
+        TraceEvent::RecurTileIterationExec(_) => "RecurTileIterationExec",
+        TraceEvent::RecurTileEnd(_) => "RecurTileEnd",
+        TraceEvent::RecurSequenceEnd(_) => "RecurSequenceEnd",
+        TraceEvent::RecurTileStart(_) => "RecurTileStart",
+        TraceEvent::RecurSequenceStart(_) => "RecurSequenceStart",
     }
 }
 

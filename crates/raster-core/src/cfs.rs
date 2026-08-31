@@ -331,9 +331,16 @@ impl CfsCursor {
 
     pub fn try_get_item(&self, coordinates: &CfsCoordinates) -> Option<&SequenceChildItem> {
         if let Some((site_coordinates, _)) = self.try_get_recur_iteration_coordinates(coordinates) {
-            return self.try_get_item(&site_coordinates);
+            return self.try_get_item_exact(&site_coordinates);
         }
+        self.try_get_item_exact(coordinates)
+    }
 
+    /// Resolve an item without interpreting the final coordinate as a recur
+    /// iteration. Keeping this separate prevents a nested coordinate such as
+    /// `[outer_site, iteration, inner_item]` from being misclassified as an
+    /// iteration of `[outer_site, iteration]`.
+    fn try_get_item_exact(&self, coordinates: &CfsCoordinates) -> Option<&SequenceChildItem> {
         let mut current_sequence = self.cfs.sequences.get(self.entrypoint_coordinate as usize);
         let mut current_child_item: Option<&SequenceChildItem> = None;
 
@@ -447,7 +454,7 @@ impl CfsCursor {
         // is what kept its iterations out of reach of the completeness rules.
         // `expand_recur_entry_coordinates` just below has always matched both.
         matches!(
-            self.try_get_item(&site_coordinates),
+            self.try_get_item_exact(&site_coordinates),
             Some(SequenceChildItem::RecurTile(_) | SequenceChildItem::RecurSequence(_))
         )
         .then_some((site_coordinates, iteration_index))
@@ -625,6 +632,10 @@ pub struct TileItem {
     pub sources: Vec<InputBinding>,
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecurTileItem {
     pub id: TileId,
@@ -634,6 +645,10 @@ pub struct RecurTileItem {
     /// shorter). `None` means per-element iteration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chunk: Option<u64>,
+    /// Whether this recur deliberately returns its output draft without
+    /// finalizing it. False is the historical/default behavior.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub leaves_output_open: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -789,6 +804,7 @@ mod tests {
                         id: "recur".to_string(),
                         sources: vec![],
                         chunk: None,
+                        leaves_output_open: false,
                     }),
                     SequenceChildItem::Tile(TileItem {
                         id: "after".to_string(),
@@ -874,7 +890,11 @@ mod tests {
             version: "1.0".to_string(),
             project: "test".to_string(),
             encoding: "postcard".to_string(),
-            tiles: vec![TileDef::iter("inner", 0, 0), TileDef::iter("after", 0, 0)],
+            tiles: vec![
+                TileDef::iter("inner", 0, 0),
+                TileDef::iter("chunked", 0, 0),
+                TileDef::iter("after", 0, 0),
+            ],
             sequences: vec![
                 SequenceDef {
                     id: "main".to_string(),
@@ -895,10 +915,18 @@ mod tests {
                 SequenceDef {
                     id: "body".to_string(),
                     input_sources: vec![],
-                    items: vec![SequenceChildItem::Tile(TileItem {
-                        id: "inner".to_string(),
-                        sources: vec![],
-                    })],
+                    items: vec![
+                        SequenceChildItem::Tile(TileItem {
+                            id: "inner".to_string(),
+                            sources: vec![],
+                        }),
+                        SequenceChildItem::RecurTile(RecurTileItem {
+                            id: "chunked".to_string(),
+                            sources: vec![],
+                            chunk: Some(64),
+                            leaves_output_open: false,
+                        }),
+                    ],
                     entry_arguments: vec![],
                     produces_output: false,
                 },
@@ -919,5 +947,18 @@ mod tests {
              [0][0][0], got {:?}",
             next,
         );
+    }
+
+    #[test]
+    fn nested_recur_tile_resolves_as_inner_item_not_outer_iteration() {
+        let cursor = recur_sequence_cursor();
+        let coordinates = CfsCoordinates(vec![0, 0, 1]);
+        let item = cursor
+            .try_get_item(&coordinates)
+            .expect("nested recur tile should resolve");
+        let SequenceChildItem::RecurTile(item) = item else {
+            panic!("expected nested recur tile, got {item:?}");
+        };
+        assert_eq!(item.chunk, Some(64));
     }
 }
