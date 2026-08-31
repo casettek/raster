@@ -162,6 +162,10 @@ enum Commands {
         #[arg(long = "max-list")]
         max_list: Option<usize>,
 
+        /// Fields kept from a single struct
+        #[arg(long = "max-fields")]
+        max_fields: Option<usize>,
+
         /// Nesting depth before a subtree is elided
         #[arg(long)]
         depth: Option<usize>,
@@ -513,6 +517,7 @@ fn try_main() -> Result<()> {
             format,
             max_bytes,
             max_list,
+            max_fields,
             depth,
         } => commands::show::show(
             &artifact,
@@ -520,6 +525,7 @@ fn try_main() -> Result<()> {
             format,
             max_bytes,
             max_list,
+            max_fields,
             depth,
         ),
     }

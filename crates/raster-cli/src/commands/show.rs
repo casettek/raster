@@ -28,6 +28,7 @@ pub fn show(
     format: ShowFormat,
     max_bytes: Option<usize>,
     max_list: Option<usize>,
+    max_fields: Option<usize>,
     depth: Option<usize>,
 ) -> Result<()> {
     let data_path = PathBuf::from(artifact);
@@ -56,23 +57,60 @@ pub fn show(
         )));
     }
 
-    let limits = resolve_limits(format, max_bytes, max_list, depth);
+    let limits = resolve_limits(format, max_bytes, max_list, max_fields, depth);
     let artifact = read_raster_artifact(&data_path, &index_path, &limits)?;
 
     match format {
         ShowFormat::Text => {
             print!("{}", render_text(&artifact.value));
             println!();
-            print_integrity(&artifact, &data_path, "");
+            print_integrity(&artifact, &data_path, "", Stream::Stdout);
         }
-        ShowFormat::Json => println!(
-            "{}",
-            serde_json::to_string_pretty(&render_json(&artifact.value)).map_err(|e| {
-                Error::Other(format!("failed to encode artifact as JSON: {e}"))
-            })?
-        ),
+        ShowFormat::Json => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&render_json(&artifact.value)).map_err(|e| {
+                    Error::Other(format!("failed to encode artifact as JSON: {e}"))
+                })?
+            );
+            // To stderr, so stdout stays a single parseable document for `jq`.
+            // Reporting only in text mode would mean the machine-readable path
+            // was the one that hid a corrupt artifact.
+            print_integrity(&artifact, &data_path, "", Stream::Stderr);
+        }
+    }
+
+    // A mismatch is a failure, not a note. Rendering still happened above —
+    // seeing what a corrupt artifact decodes to is the reason to run `show` on
+    // it at all — but the command must not *succeed*, or a script that decodes
+    // an artifact and checks the exit status learns nothing.
+    //
+    // This resolves §Open questions' first item against the "report, exit 0"
+    // leaning recorded there; see §Implementation record.
+    if !artifact.roots_agree() {
+        return Err(Error::Other(format!(
+            "'{}' does not match its index — the value above is not what was committed",
+            data_path.display()
+        )));
     }
     Ok(())
+}
+
+/// Where an integrity report goes. Text mode prints it inline; JSON mode must
+/// keep stdout parseable, so it goes to stderr.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Stream {
+    Stdout,
+    Stderr,
+}
+
+macro_rules! report {
+    ($stream:expr, $($arg:tt)*) => {
+        match $stream {
+            Stream::Stdout => println!($($arg)*),
+            Stream::Stderr => eprintln!($($arg)*),
+        }
+    };
 }
 
 /// Render the `output.bin` a run just produced, for `--show-output`.
@@ -101,7 +139,7 @@ pub fn show_run_output(run_dir: &Path, label: Option<&str>) -> Result<bool> {
     for line in render_text(&artifact.value).lines() {
         println!("  {line}");
     }
-    print_integrity(&artifact, &data_path, "  ");
+    print_integrity(&artifact, &data_path, "  ", Stream::Stdout);
     Ok(true)
 }
 
@@ -110,6 +148,7 @@ fn resolve_limits(
     format: ShowFormat,
     max_bytes: Option<usize>,
     max_list: Option<usize>,
+    max_fields: Option<usize>,
     depth: Option<usize>,
 ) -> ReadLimits {
     let base = match format {
@@ -119,6 +158,7 @@ fn resolve_limits(
     ReadLimits {
         max_bytes_per_leaf: max_bytes.unwrap_or(base.max_bytes_per_leaf),
         max_list_elements: max_list.unwrap_or(base.max_list_elements),
+        max_struct_fields: max_fields.unwrap_or(base.max_struct_fields),
         max_depth: depth.unwrap_or(base.max_depth),
     }
 }
@@ -134,19 +174,21 @@ fn inferred_index_path(data_path: &Path) -> PathBuf {
 /// Reports rather than enforces — exit stays 0 on a mismatch. A corrupt
 /// artifact is the one you most want rendered, and a viewer that refuses to
 /// show you the bytes is not helping you find out why they are wrong.
-fn print_integrity(artifact: &RasterArtifact, data_path: &Path, indent: &str) {
+fn print_integrity(artifact: &RasterArtifact, data_path: &Path, indent: &str, stream: Stream) {
     let root = &artifact.structural_root;
     if artifact.roots_agree() {
-        println!("{indent}commitment {}…  ✓ matches .rindex", short(root));
+        report!(stream, "{indent}commitment {}…  ✓ matches .rindex", short(root));
         return;
     }
-    println!(
+    report!(
+        stream,
         "{indent}commitment {}…  ✗ MISMATCH — payload and index are not the same artifact",
         short(root)
     );
-    println!("{indent}  payload {}", root);
-    println!("{indent}  index   {}", artifact.index_root);
-    println!(
+    report!(stream, "{indent}  payload {}", root);
+    report!(stream, "{indent}  index   {}", artifact.index_root);
+    report!(
+        stream,
         "{indent}  '{}' has been edited, truncated or swapped since its index was written.",
         data_path.display()
     );
@@ -197,8 +239,12 @@ fn write_text(value: &RasterValue, indent: usize, out: &mut String) {
                 out.push_str(&format!(" … {} more bytes", len.saturating_sub(data.len() as u64)));
             }
         }
-        RasterValue::Struct(fields) => {
-            if fields.is_empty() {
+        RasterValue::Struct {
+            len,
+            fields,
+            truncated,
+        } => {
+            if fields.is_empty() && !*truncated {
                 out.push_str("{}");
                 return;
             }
@@ -209,6 +255,13 @@ fn write_text(value: &RasterValue, indent: usize, out: &mut String) {
                 out.push_str(": ");
                 write_text(field, indent + 1, out);
                 out.push('\n');
+            }
+            if *truncated {
+                out.push_str(&inner_pad);
+                out.push_str(&format!(
+                    "… {} more fields\n",
+                    len.saturating_sub(fields.len() as u64)
+                ));
             }
             out.push_str(&pad);
             out.push('}');
@@ -323,12 +376,23 @@ pub fn render_json(value: &RasterValue) -> serde_json::Value {
             "hex": hex_preview(data),
             "truncated": truncated,
         }),
-        RasterValue::Struct(fields) => Value::Object(
-            fields
-                .iter()
-                .map(|(name, field)| (name.clone(), render_json(field)))
-                .collect(),
-        ),
+        RasterValue::Struct {
+            len,
+            fields,
+            truncated,
+        } => {
+            let object = Value::Object(
+                fields
+                    .iter()
+                    .map(|(name, field)| (name.clone(), render_json(field)))
+                    .collect(),
+            );
+            if *truncated {
+                json!({ "len": len, "fields": object, "truncated": true })
+            } else {
+                object
+            }
+        }
         RasterValue::List {
             len,
             elements,
@@ -380,19 +444,24 @@ mod tests {
         }
     }
 
+    fn strukt(fields: Vec<(String, RasterValue)>) -> RasterValue {
+        RasterValue::Struct {
+            len: fields.len() as u64,
+            fields,
+            truncated: false,
+        }
+    }
+
     #[test]
     fn text_renders_a_struct_anonymously_and_names_a_variant() {
         // The §4.1 asymmetry, in the output rather than in the prose.
-        let value = RasterValue::Struct(vec![
+        let value = strukt(vec![
             ("total".into(), int(353, "u64")),
             (
                 "shape".into(),
                 RasterValue::Enum {
                     variant: "Named".into(),
-                    payload: Some(Box::new(RasterValue::Struct(vec![(
-                        "side".into(),
-                        int(3, "u32"),
-                    )]))),
+                    payload: Some(Box::new(strukt(vec![("side".into(), int(3, "u32"))]))),
                 },
             ),
         ]);
@@ -445,6 +514,27 @@ mod tests {
     #[test]
     fn json_keeps_negative_values_negative() {
         assert_eq!(render_json(&int(-4, "i64")), json!(-4));
+    }
+
+    #[test]
+    fn struct_truncation_is_stated_in_both_formats() {
+        // A struct's field table is index data, so it needs the same visible
+        // bound a list has — and the bound must survive into JSON, not just
+        // into the terminal rendering.
+        let value = RasterValue::Struct {
+            len: 900,
+            fields: vec![("a".into(), int(1, "u8"))],
+            truncated: true,
+        };
+        assert!(
+            render_text(&value).contains("… 899 more fields"),
+            "text: {}",
+            render_text(&value)
+        );
+        assert_eq!(
+            render_json(&value),
+            json!({ "len": 900, "fields": { "a": 1 }, "truncated": true })
+        );
     }
 
     #[test]

@@ -296,14 +296,13 @@ fn show_refuses_without_an_index_and_names_the_path() {
     );
 }
 
-/// A byte-flipped payload renders — and says it is not what was committed.
-/// Refusing to show a corrupt artifact would remove the only tool for finding
-/// out why it is corrupt.
-#[test]
-fn show_reports_a_commitment_mismatch() {
-    let fixture = Fixture::new("mismatch");
-    assert_ok(&fixture.chain(&[]), "chain run");
-
+/// Corrupt a decodable artifact so its payload no longer matches its index.
+///
+/// A flipped bit inside a string leaf keeps the *shape* valid — the index still
+/// describes a struct with the same fields — so the artifact decodes cleanly
+/// and only the commitment reveals that it is not what was committed. That is
+/// the case a viewer can silently get wrong.
+fn corrupt_payload(fixture: &Fixture) -> PathBuf {
     let payload = fixture.output_bin("report");
     let mut bytes = fs::read(&payload).expect("payload should be readable");
     let at = bytes
@@ -312,9 +311,19 @@ fn show_reports_a_commitment_mismatch() {
         .expect("the title should be in the payload");
     bytes[at] ^= 0x01;
     fs::write(&payload, &bytes).expect("payload should be writable");
+    payload
+}
+
+/// A byte-flipped payload renders — and says it is not what was committed.
+/// Refusing to show a corrupt artifact would remove the only tool for finding
+/// out why it is corrupt, so it renders *and* fails.
+#[test]
+fn show_reports_a_commitment_mismatch() {
+    let fixture = Fixture::new("mismatch");
+    assert_ok(&fixture.chain(&[]), "chain run");
+    let payload = corrupt_payload(&fixture);
 
     let shown = fixture.show(&[payload.to_str().unwrap()]);
-    assert_ok(&shown, "show a corrupt artifact");
     let text = stdout_of(&shown);
 
     assert!(
@@ -325,4 +334,56 @@ fn show_reports_a_commitment_mismatch() {
         text.contains("title: "),
         "the value should still render\n{text}"
     );
+    assert!(
+        !shown.status.success(),
+        "a mismatch must not exit successfully\n{text}"
+    );
+}
+
+/// The JSON path must not be the quiet one. Text mode reported a mismatch while
+/// `--format json` printed an apparently valid document and exited 0 — a
+/// machine consumer would have accepted a corrupt artifact.
+#[test]
+fn json_reports_a_commitment_mismatch_and_fails() {
+    let fixture = Fixture::new("mismatch-json");
+    assert_ok(&fixture.chain(&[]), "chain run");
+    let payload = corrupt_payload(&fixture);
+
+    let shown = fixture.show(&[payload.to_str().unwrap(), "--format", "json"]);
+    let stdout = stdout_of(&shown);
+    let stderr = String::from_utf8_lossy(&shown.stderr).to_string();
+
+    assert!(
+        !shown.status.success(),
+        "a mismatch must not exit successfully\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+    );
+    assert!(
+        stderr.contains("MISMATCH"),
+        "the mismatch belongs on stderr, where it cannot corrupt the document\n{stderr}"
+    );
+    // stdout stays a single parseable document, so `show … | jq` still works
+    // and the diagnosis is not smuggled into the data.
+    serde_json::from_str::<serde_json::Value>(&stdout)
+        .expect("stdout should remain valid JSON even when the artifact is corrupt");
+}
+
+/// The healthy JSON path stays clean: nothing but the document on stdout.
+#[test]
+fn json_keeps_stdout_free_of_the_integrity_line() {
+    let fixture = Fixture::new("json-clean");
+    assert_ok(&fixture.chain(&[]), "chain run");
+
+    let shown = fixture.show(&[
+        fixture.output_bin("report").to_str().unwrap(),
+        "--format",
+        "json",
+    ]);
+    assert_ok(&shown, "show --format json");
+    let stdout = stdout_of(&shown);
+
+    assert!(
+        !stdout.contains("commitment"),
+        "the integrity report must not land in the JSON document\n{stdout}"
+    );
+    serde_json::from_str::<serde_json::Value>(&stdout).expect("stdout should be valid JSON");
 }

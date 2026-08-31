@@ -130,6 +130,7 @@ pub enum RasterValue {
 pub struct ReadLimits {
     pub max_bytes_per_leaf: usize,   // default 256
     pub max_list_elements: usize,    // default 64
+    pub max_struct_fields: usize,    // default 256
     pub max_depth: usize,            // default 32
 }
 
@@ -194,6 +195,12 @@ commitment 10a07855108e669e…  ✓ matches output_manifest.json
 Three outcomes: matches the sibling manifest, no manifest present (state the root, claim nothing),
 or **mismatch** — which is a corrupt or swapped artifact and should be loud. This makes `show` the
 natural first command when a chain link fails, rather than a separate debugging step.
+
+**Loud means both formats and the exit status** (resolved 2026-08-31; see §Open questions). Text
+mode prints the report on stdout. JSON mode prints it on **stderr**, so stdout stays a single
+parseable document — putting it in the JSON would either change the value's shape unpredictably
+or bury the warning in the data. Either way a mismatch exits non-zero. The value still renders
+first: seeing what a corrupt artifact decodes to is the reason to point `show` at one.
 
 Where a `0x09` handle's stored root disagrees with its own elements, say so on that node. Nothing
 outside a selection proof catches that today.
@@ -365,10 +372,13 @@ tests). Only standalone `show` on an orphaned payload needs it; see §2.
 
 ## Open questions
 
-- **Should `show` verify the commitment by default, or on `--verify`?** Free here (the bytes are
-  in hand), but it makes a viewer into a checker, and a mismatch then has to decide between a
-  warning and a non-zero exit. Defaulting to *report, exit 0* and putting the exit-code behaviour
-  behind a flag is the current leaning.
+- ~~**Should `show` verify the commitment by default, or on `--verify`?**~~ **Resolved
+  2026-08-31: verify by default, report in both formats, and exit non-zero on a mismatch** —
+  against the "report, exit 0" leaning recorded here. What settled it was building `--format
+  json`: a viewer that renders a corrupt artifact and exits 0 is fine for a human, who reads the
+  commitment line, and wrong for a script, which reads the exit status and gets "success" for an
+  artifact that is not what was committed. Exit 0 made the machine-readable path the quiet one.
+  A `--no-verify` escape hatch was not added; nobody has wanted one yet.
 - ~~**Does `--select` belong in v1?**~~ **Resolved 2026-08-31: no, and not in v2 either** — see
   §Alternatives. Not deferred but rejected; reopening it means arguing that `--format json | jq`
   is insufficient, which is a different and harder claim than "the machinery already exists".
@@ -389,9 +399,17 @@ Tests: 12 in `reader.rs`, 9 in `crates/raster-cli/tests/show_cli.rs`.
 **Where the code departs from §1's sketch.** All of these are the same cause — *"never silent
 elision"* needs a place to record that something was cut, and the sketch had nowhere to put it:
 
-- `Str { value, truncated }`, `Bytes { …, truncated }` and `Map { len, entries, truncated }`
-  carry truncation flags. The sketch had a bare `Str(String)` and `Map(Vec<…>)`, which can only
-  truncate silently.
+- `Str { value, truncated }`, `Bytes { …, truncated }`, `Map { len, entries, truncated }` and
+  `Struct { len, fields, truncated }` carry truncation flags. The sketch had a bare `Str(String)`,
+  `Map(Vec<…>)` and `Struct(Vec<…>)`, which can only truncate silently.
+- **`max_struct_fields` was added to `ReadLimits`** (default 256) and `Struct` became bounded.
+  §1's sketch bounded lists, bytes and depth but let a struct's field walk run to completion,
+  on the implicit assumption that a struct's width is fixed by the Rust type it came from. It is
+  not: the field table is read out of the `.rindex`, so its width is *data*, and a corrupt or
+  hostile index can declare any number of fields. The limit is deliberately far above
+  `max_list_elements` — it guards against a malformed index rather than expressing a display
+  preference, so it should never fire on a real type. `EnumStruct` shares the same walk and is
+  covered by construction.
 - `Int { value, ty }` carries the Rust type name, because §4.1 renders `353u64` and the width is
   lost once every leaf is widened to `i128`.
 - `Elided` was added: `max_depth` needs a representation in the value, not just in the renderer.
@@ -412,6 +430,11 @@ elision"* needs a place to record that something was cut, and the sketch had now
 - **`--format json` defaults to unbounded**, via `ReadLimits::unbounded()`. §1 said JSON should
   "truncate loosely"; a pipe into `jq` has no reason to truncate at all, and the limit flags still
   apply if given.
+- **A mismatch exits non-zero, in both formats**, and the JSON report goes to stderr — §3 and
+  §Open questions, both amended. The first cut had the JSON arm render the value and return `Ok`
+  without consulting the integrity result at all, which made the machine-readable path the one
+  that could silently accept a corrupt artifact.
+- **`--max-fields`** joins `--max-bytes` / `--max-list` / `--depth` on the CLI.
 - **`--show-output` after a failed run** says the program failed rather than that it returns unit.
   Both produce no artifact; only one is a property of the program.
 

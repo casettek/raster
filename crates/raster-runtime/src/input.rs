@@ -1420,7 +1420,17 @@ pub enum RasterValue {
         data: Vec<u8>,
         truncated: bool,
     },
-    Struct(Vec<(String, RasterValue)>),
+    /// `len` is the field count the index declares; `fields` may be shorter.
+    ///
+    /// A struct is bounded for the same reason a list is: the field table comes
+    /// out of the `.rindex`, so its width is data, not a property of any Rust
+    /// type that was compiled. A corrupt or hostile index can declare as many
+    /// fields as it likes.
+    Struct {
+        len: u64,
+        fields: Vec<(String, RasterValue)>,
+        truncated: bool,
+    },
     List {
         len: u64,
         elements: Vec<RasterValue>,
@@ -1478,13 +1488,9 @@ fn raster_value_at_depth<D: RasterData + ?Sized>(
             let subtree = data.read_subtree(node.offset, node.len)?;
             raster_value_from_leaf(parse_leaf_value(type_name, &subtree)?, limits)
         }
-        RasterNodeKind::Struct { fields } => Ok(RasterValue::Struct(raster_value_fields(
-            index,
-            data,
-            fields,
-            limits,
-            child_depth,
-        )?)),
+        RasterNodeKind::Struct { fields } => {
+            raster_value_fields(index, data, fields, limits, child_depth)
+        }
         RasterNodeKind::List { len, elements, .. } => {
             let kept = elements.len().min(limits.max_list_elements);
             let mut values = Vec::with_capacity(kept);
@@ -1555,13 +1561,13 @@ fn raster_value_at_depth<D: RasterData + ?Sized>(
         }
         RasterNodeKind::EnumStruct { variant, fields } => Ok(RasterValue::Enum {
             variant: variant.clone(),
-            payload: Some(Box::new(RasterValue::Struct(raster_value_fields(
+            payload: Some(Box::new(raster_value_fields(
                 index,
                 data,
                 fields,
                 limits,
                 child_depth,
-            )?))),
+            )?)),
         }),
     }
 }
@@ -1572,15 +1578,20 @@ fn raster_value_fields<D: RasterData + ?Sized>(
     fields: &[RasterStructField],
     limits: &ReadLimits,
     depth: usize,
-) -> CoreResult<Vec<(String, RasterValue)>> {
-    let mut values = Vec::with_capacity(fields.len());
-    for field in fields {
+) -> CoreResult<RasterValue> {
+    let kept = fields.len().min(limits.max_struct_fields);
+    let mut values = Vec::with_capacity(kept);
+    for field in &fields[..kept] {
         values.push((
             field.name.clone(),
             raster_value_at_depth(index, data, field.child, limits, depth)?,
         ));
     }
-    Ok(values)
+    Ok(RasterValue::Struct {
+        len: fields.len() as u64,
+        fields: values,
+        truncated: kept < fields.len(),
+    })
 }
 
 /// Narrow a leaf [`TreeValue`] to its rendering view, applying the byte limit.

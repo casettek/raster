@@ -31,8 +31,16 @@ use crate::raster_index::RasterIndex;
 pub struct ReadLimits {
     /// Bytes kept from a single `String` or `BytesPage` leaf.
     pub max_bytes_per_leaf: usize,
-    /// Elements kept from a single list.
+    /// Elements kept from a single list, map or tuple variant.
     pub max_list_elements: usize,
+    /// Fields kept from a single struct or struct variant.
+    ///
+    /// Separate from `max_list_elements` and far higher, because the two bound
+    /// different things. A list is *data* and is routinely long enough that a
+    /// terminal wants 64 of it; a struct's width comes from a Rust type and is
+    /// realistically tens of fields, so this is not a display preference but a
+    /// guard against an index whose field table is not a real type's.
+    pub max_struct_fields: usize,
     /// Nesting depth before a subtree is elided.
     pub max_depth: usize,
 }
@@ -42,6 +50,7 @@ impl Default for ReadLimits {
         Self {
             max_bytes_per_leaf: 256,
             max_list_elements: 64,
+            max_struct_fields: 256,
             max_depth: 32,
         }
     }
@@ -54,6 +63,7 @@ impl ReadLimits {
         Self {
             max_bytes_per_leaf: usize::MAX,
             max_list_elements: usize::MAX,
+            max_struct_fields: usize::MAX,
             max_depth: usize::MAX,
         }
     }
@@ -172,6 +182,16 @@ mod tests {
         }
     }
 
+    /// A whole (untruncated) struct, which is what every round trip below
+    /// expects unless it is specifically testing the field limit.
+    fn strukt(fields: Vec<(String, RasterValue)>) -> RasterValue {
+        RasterValue::Struct {
+            len: fields.len() as u64,
+            fields,
+            truncated: false,
+        }
+    }
+
     #[derive(Serialize)]
     struct Report {
         title: String,
@@ -192,7 +212,7 @@ mod tests {
 
         assert_eq!(
             artifact.value,
-            RasterValue::Struct(vec![
+            strukt(vec![
                 ("title".into(), text("Pipeline report for sensor-A")),
                 (
                     "lines".into(),
@@ -242,7 +262,7 @@ mod tests {
         );
         assert_eq!(
             artifact.value,
-            RasterValue::Struct(vec![
+            strukt(vec![
                 ("a".into(), int(1, "u8")),
                 ("b".into(), int(2, "u16")),
                 ("c".into(), int(3, "u32")),
@@ -299,7 +319,7 @@ mod tests {
             round_trip(&Shape::Named { side: 3 }, &limits).value,
             RasterValue::Enum {
                 variant: "Named".into(),
-                payload: Some(Box::new(RasterValue::Struct(vec![(
+                payload: Some(Box::new(strukt(vec![(
                     "side".into(),
                     int(3, "u32")
                 )]))),
@@ -351,7 +371,7 @@ mod tests {
             max_bytes_per_leaf: 2,
             ..ReadLimits::default()
         };
-        let RasterValue::Struct(fields) = round_trip(&bytes, &limits).value else {
+        let RasterValue::Struct { fields, .. } = round_trip(&bytes, &limits).value else {
             panic!("expected a struct");
         };
         let pages = fields
@@ -434,7 +454,7 @@ mod tests {
         };
         assert_eq!(
             round_trip(&Outer { inner: Inner { deep: 1 } }, &limits).value,
-            RasterValue::Struct(vec![("inner".into(), RasterValue::Elided)])
+            strukt(vec![("inner".into(), RasterValue::Elided)])
         );
     }
 
@@ -472,6 +492,67 @@ mod tests {
         };
         let (_data, index, _) = encode_raster_value(&value).expect("encode");
         assert!(read_raster_artifact_from_bytes(b"not a raster payload", &index, &ReadLimits::default()).is_err());
+    }
+
+    #[derive(Serialize)]
+    struct Wide {
+        a: u8,
+        b: u8,
+        c: u8,
+        d: u8,
+    }
+
+    #[test]
+    fn struct_breadth_is_bounded_and_says_so() {
+        // Field count comes from the `.rindex`, so it is data. A struct that
+        // is wider than the limit must truncate visibly rather than walking
+        // every field it was told about.
+        let limits = ReadLimits {
+            max_struct_fields: 2,
+            ..ReadLimits::default()
+        };
+        let RasterValue::Struct {
+            len,
+            fields,
+            truncated,
+        } = round_trip(
+            &Wide {
+                a: 1,
+                b: 2,
+                c: 3,
+                d: 4,
+            },
+            &limits,
+        )
+        .value
+        else {
+            panic!("expected a struct");
+        };
+        assert_eq!(len, 4, "the declared width stays visible");
+        assert_eq!(fields.len(), 2);
+        assert!(truncated);
+    }
+
+    #[test]
+    fn struct_breadth_bound_reaches_inside_an_enum_variant() {
+        // `EnumStruct` shares the field walk, so the guard must cover it too —
+        // otherwise a wide struct is bounded only until someone wraps it in a
+        // variant.
+        let limits = ReadLimits {
+            max_struct_fields: 1,
+            ..ReadLimits::default()
+        };
+        let RasterValue::Enum { payload, .. } = round_trip(&Shape::Named { side: 3 }, &limits).value
+        else {
+            panic!("expected an enum");
+        };
+        let Some(payload) = payload else {
+            panic!("expected a payload");
+        };
+        assert!(
+            matches!(*payload, RasterValue::Struct { truncated: false, .. }),
+            "a one-field variant is under the limit and must not report truncation"
+        );
     }
 
     #[test]
