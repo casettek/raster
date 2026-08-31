@@ -140,6 +140,12 @@ pub fn show_run_output(run_dir: &Path, label: Option<&str>) -> Result<bool> {
         println!("  {line}");
     }
     print_integrity(&artifact, &data_path, "  ", Stream::Stdout);
+    if !artifact.roots_agree() {
+        return Err(Error::Other(format!(
+            "'{}' does not match its index — the value above is not what was committed",
+            data_path.display()
+        )));
+    }
     Ok(true)
 }
 
