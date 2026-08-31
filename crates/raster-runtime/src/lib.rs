@@ -10,6 +10,7 @@ mod backing;
 mod entry_arguments;
 pub mod input;
 pub mod profiling;
+pub mod tile_census;
 mod raster_index;
 mod source;
 mod storage;
@@ -21,6 +22,7 @@ pub use input::{
     encode_raster_value, postcard_structural_commitment, select_storage_value,
     write_program_output_artifact, write_raster_files, OutputArtifact,
 };
+pub use tile_census::{note_tile_execution, TILE_CENSUS_ENV, TILE_CENSUS_PATH_ENV};
 pub use profiling::{
     begin_sequence_profile, finish_sequence_profile, record_tile_output_store_profile,
     record_tile_profile, ExecutionProfile, ProfileRecord, ProfileStreamEvent,
