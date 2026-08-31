@@ -137,6 +137,40 @@ enum Commands {
         verify: bool,
     },
 
+    /// Print the value inside a raster artifact — a program's `output.bin`, a
+    /// chain stage's artifact, or an external `*.rastered` input. They are one
+    /// format, so this is one command (see docs/proposals/artifact-inspection.md)
+    Show {
+        /// Path to the raster payload
+        artifact: String,
+
+        /// Path to the `.rindex` (default: the artifact path with a `.rindex`
+        /// extension, matching how the chain runner resolves it)
+        #[arg(long)]
+        index: Option<String>,
+
+        /// Output format. Text truncates for a terminal; JSON does not, so it
+        /// composes with `jq`
+        #[arg(long, value_enum, default_value = "text")]
+        format: ShowFormat,
+
+        /// Bytes kept from a single string or bytes-page leaf
+        #[arg(long = "max-bytes")]
+        max_bytes: Option<usize>,
+
+        /// Elements kept from a single list
+        #[arg(long = "max-list")]
+        max_list: Option<usize>,
+
+        /// Fields kept from a single struct
+        #[arg(long = "max-fields")]
+        max_fields: Option<usize>,
+
+        /// Nesting depth before a subtree is elided
+        #[arg(long)]
+        depth: Option<usize>,
+    },
+
     /// Run or audit a multi-program chain, defined by a `Raster.toml` `[chain]`
     /// table or a `chain.json` (see docs/proposals/program-chain.md)
     Chain {
@@ -188,6 +222,12 @@ enum Commands {
         /// Read and verify trace from file (mutually exclusive with --commit)
         #[arg(long)]
         verbose: bool,
+
+        /// After the run, print the value in the `output.bin` it produced —
+        /// the same reader as `cargo raster show`, on the path this command
+        /// already knows
+        #[arg(long = "show-output")]
+        show_output: bool,
 
         /// Trace transport format used between the user process and Raster CLI
         #[arg(long = "trace-format", value_enum, default_value = "binary")]
@@ -247,6 +287,14 @@ enum ChainCommand {
         /// `--no-auth`). Omit to use the most recent one (`latest`).
         #[arg(long = "run")]
         run_dir: Option<String>,
+
+        /// After the run, print the value in the final stage's `output.bin` —
+        /// the same reader as `cargo raster show`. Final stage only, so a long
+        /// chain does not print one value per stage; combine with `--stage` to
+        /// inspect a middle stage, since the stage you re-ran is the last one
+        /// that ran.
+        #[arg(long = "show-output")]
+        show_output: bool,
 
         /// Trace transport format used between each stage process and the
         /// Raster CLI. Transport only: every stage's commitment is built from
@@ -313,6 +361,15 @@ fn parse_fraud_proof_config(value: &str) -> std::result::Result<FraudProofConfig
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum AnalyzeFormat {
     Text,
+    Json,
+}
+
+/// Rendering format for `show` / `--show-output`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum ShowFormat {
+    /// Indented tree, truncated for a terminal
+    Text,
+    /// JSON, untruncated by default so it composes with `jq`
     Json,
 }
 
@@ -395,6 +452,7 @@ fn try_main() -> Result<()> {
                 no_auth,
                 stage,
                 run_dir,
+                show_output,
                 trace_format,
             } => chain::run(
                 chain.as_deref(),
@@ -402,6 +460,7 @@ fn try_main() -> Result<()> {
                 no_auth,
                 stage.as_deref(),
                 run_dir.as_deref(),
+                show_output,
                 trace_format,
             ),
             ChainCommand::Audit {
@@ -432,6 +491,7 @@ fn try_main() -> Result<()> {
             audit,
             no_auth,
             verbose,
+            show_output,
             trace_format,
             features,
             all_features,
@@ -445,10 +505,28 @@ fn try_main() -> Result<()> {
             audit.as_deref(),
             no_auth,
             verbose,
+            show_output,
             trace_format,
             &features,
             all_features,
             no_default_features,
+        ),
+        Commands::Show {
+            artifact,
+            index,
+            format,
+            max_bytes,
+            max_list,
+            max_fields,
+            depth,
+        } => commands::show::show(
+            &artifact,
+            index.as_deref(),
+            format,
+            max_bytes,
+            max_list,
+            max_fields,
+            depth,
         ),
     }
 }

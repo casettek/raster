@@ -93,6 +93,28 @@ cargo raster run --no-trace
 cargo raster analyze
 ```
 
+### 5. Read what it produced
+
+A run's result is an artifact on disk (`output.bin` plus its `.rindex`), not printed output.
+`show` decodes one back into a typed, structured value:
+
+```bash
+# Any raster payload: a program's output, a chain stage's artifact, a `*.rastered` input.
+# `run` prints the run directory it wrote; a chain run also links `latest`.
+cargo raster show target/raster/runs/<run-id>/output.bin
+cargo raster show target/raster/chains/latest/<stage>/output.bin
+
+# Or print it as part of the run itself, so there is no path to look up
+cargo raster run --show-output
+cargo raster chain run --show-output          # the final stage's value
+```
+
+Both report whether what they are showing matches the artifact's own commitment; `show` renders
+the value either way but exits non-zero when it does not match, so a script can tell. `--format
+json` composes with `jq` — the document goes to stdout and any integrity warning to stderr.
+`--max-bytes` / `--max-list` / `--max-fields` / `--depth` bound what a large artifact prints, and
+truncation is always stated rather than silent. See `docs/proposals/artifact-inspection.md`.
+
 ## Design Principles
 
 - **Intentionally simple**: No cryptography or zkVM logic in v0

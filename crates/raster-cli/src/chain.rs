@@ -344,6 +344,7 @@ pub fn run(
     no_auth: bool,
     stage_selection: Option<&str>,
     run_dir: Option<&str>,
+    show_output: bool,
     trace_format: TraceFormat,
 ) -> Result<()> {
     let (manifest, base_dir) = resolve_chain(chain)?;
@@ -444,6 +445,8 @@ pub fn run(
     // `StageCheckpoint`, which `chain audit` and the chain-fraud guest digest
     // and which must stay identical across runs.
     let mut execution_times: Vec<(String, Duration)> = Vec::new();
+    // The last stage that produced an artifact, for `--show-output`.
+    let mut last_output: Option<(String, PathBuf)> = None;
 
     // How far execution has got. Everything below this index has run, in this
     // invocation or a previous one.
@@ -596,6 +599,14 @@ pub fn run(
             None
         };
 
+        // "Final stage" for `--show-output` means the last stage that actually
+        // ran and produced something — which under `--stage` is the single
+        // re-run stage, so one rule serves both the whole-chain and the
+        // dev-loop case. See `artifact-inspection.md` §6.
+        if produces_output {
+            last_output = Some((stage.name.clone(), stage_dir.clone()));
+        }
+
         // Every field here is a pure function of public artifacts, so this is
         // the same checkpoint in either posture — the property `chain audit`
         // and the equivalence test both rest on.
@@ -659,6 +670,22 @@ pub fn run(
     // `--stage` re-run needs to reconstruct this directory's stage list, and
     // that is true whether or not a chain-commitment was produced.
     write_chain_shape(&chain_dir, &manifest, &repeats)?;
+
+    // Placed before every early return below so the flag behaves the same in
+    // both postures and under `--stage` — the value is a property of the run,
+    // not of whether it earned a chain-commitment.
+    if show_output {
+        match &last_output {
+            Some((name, dir)) => {
+                crate::commands::show::show_run_output(dir, Some(name))?;
+                println!();
+            }
+            None => {
+                println!("--show-output: no stage produced an output artifact");
+                println!();
+            }
+        }
+    }
 
     // The interlock that used to live here — no trace, therefore no
     // checkpoint — is gone: a checkpoint names only inputs and outputs, which

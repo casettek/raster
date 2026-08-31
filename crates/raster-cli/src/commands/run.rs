@@ -49,6 +49,7 @@ pub fn run(
     audit_flag: Option<&str>,
     no_auth: bool,
     _verbose: bool,
+    show_output: bool,
     trace_format: TraceFormat,
     features: &[String],
     all_features: bool,
@@ -261,6 +262,25 @@ pub fn run(
         println!("  {}", artifacts.run_dir.join("output.bin").display());
         println!("  {}", artifacts.run_dir.join("output.rindex").display());
         println!("  {}", output_manifest_path.display());
+
+        // `--show-output` is sugar over `cargo raster show <that path>`: same
+        // decode, same renderer, same limits — it just supplies the path this
+        // command already printed. See `artifact-inspection.md` §6.
+        if show_output {
+            crate::commands::show::show_run_output(&artifacts.run_dir, None)?;
+        }
+    } else if show_output {
+        println!();
+        // Only a *successful* run that wrote nothing is a unit-returning
+        // program. After a failure there is no artifact for the ordinary
+        // reason that the program never got far enough to produce one, and
+        // saying "returns unit" there would be a second, wrong diagnosis on
+        // top of the real error.
+        if status.success() {
+            println!("--show-output: this program returns unit — no output artifact to show");
+        } else {
+            println!("--show-output: the program failed, so it produced no output artifact");
+        }
     }
 
     // An unauthenticated run installs no trace publisher, so there is no trace

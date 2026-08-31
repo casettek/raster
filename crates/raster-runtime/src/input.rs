@@ -25,7 +25,9 @@ use std::vec::Vec;
 
 use crate::raster_index::{
     RasterIndex, RasterNodeKind, RasterRangeSlice, RasterSelection, RasterSelectionLocation,
+    RasterStructField,
 };
+use crate::reader::ReadLimits;
 use crate::source::SourceFile;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1386,6 +1388,271 @@ fn tree_value_from_raster_node<D: RasterData + ?Sized>(
             }
             Ok(TreeValue::EnumStruct(variant.clone(), values))
         }
+    }
+}
+
+/// A decoded raster value — the rendering-facing view of an artifact.
+///
+/// Deliberately separate from [`TreeValue`], which is the encoder's internal
+/// representation and load-bearing for commitments; making that public would
+/// freeze an internal on a rendering use case.
+///
+/// Two absences are properties of the format, not omissions:
+///
+/// - **No struct name.** [`RasterNodeKind::Struct`] records field names and no
+///   type name, so a struct renders anonymously. Enum variants *are* named.
+/// - **No float.** [`parse_leaf_value`] has no float arm because [`TreeValue`]
+///   has no float variant; the encoder cannot produce one.
+///
+/// See `docs/proposals/artifact-inspection.md` §4.1.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RasterValue {
+    Unit,
+    Bool(bool),
+    /// Every signed and unsigned width, widened. `ty` is the Rust type name the
+    /// index recorded, so a renderer can print `353u64` rather than `353`.
+    Int { value: i128, ty: &'static str },
+    Str { value: String, truncated: bool },
+    Bytes {
+        index: u64,
+        offset: u64,
+        len: u64,
+        data: Vec<u8>,
+        truncated: bool,
+    },
+    /// `len` is the field count the index declares; `fields` may be shorter.
+    ///
+    /// A struct is bounded for the same reason a list is: the field table comes
+    /// out of the `.rindex`, so its width is data, not a property of any Rust
+    /// type that was compiled. A corrupt or hostile index can declare as many
+    /// fields as it likes.
+    Struct {
+        len: u64,
+        fields: Vec<(String, RasterValue)>,
+        truncated: bool,
+    },
+    List {
+        len: u64,
+        elements: Vec<RasterValue>,
+        truncated: bool,
+    },
+    Map {
+        len: u64,
+        entries: Vec<(RasterValue, RasterValue)>,
+        truncated: bool,
+    },
+    Enum {
+        variant: String,
+        payload: Option<Box<RasterValue>>,
+    },
+    /// `ReadLimits::max_depth` reached — the subtree exists and was not walked.
+    Elided,
+}
+
+/// Walk index + payload into a [`RasterValue`], bounded by `limits`.
+///
+/// Mirrors [`tree_value_from_raster_node`] node for node, and reuses
+/// [`parse_leaf_value`] verbatim for leaves — the reader and the encoder agree
+/// on what a leaf is because it is literally the same function. It is a
+/// separate walk rather than a conversion from [`TreeValue`] because limits
+/// have to bind *during* the descent: converting afterwards would materialize
+/// the 100k-element list first, which is the case the limits exist for.
+pub(crate) fn raster_value_from_node<D: RasterData + ?Sized>(
+    index: &RasterIndex,
+    data: &D,
+    node_id: u64,
+    limits: &ReadLimits,
+) -> CoreResult<RasterValue> {
+    raster_value_at_depth(index, data, node_id, limits, 0)
+}
+
+fn raster_value_at_depth<D: RasterData + ?Sized>(
+    index: &RasterIndex,
+    data: &D,
+    node_id: u64,
+    limits: &ReadLimits,
+    depth: usize,
+) -> CoreResult<RasterValue> {
+    let node = index.get_node(node_id)?;
+
+    // A leaf is cheap and self-terminating, so the depth cut applies only to
+    // the composites — eliding a scalar would lose information for nothing.
+    if depth >= limits.max_depth && !matches!(node.kind, RasterNodeKind::Leaf { .. }) {
+        return Ok(RasterValue::Elided);
+    }
+    let child_depth = depth + 1;
+
+    match &node.kind {
+        RasterNodeKind::Unit => Ok(RasterValue::Unit),
+        RasterNodeKind::Leaf { type_name } => {
+            let subtree = data.read_subtree(node.offset, node.len)?;
+            raster_value_from_leaf(parse_leaf_value(type_name, &subtree)?, limits)
+        }
+        RasterNodeKind::Struct { fields } => {
+            raster_value_fields(index, data, fields, limits, child_depth)
+        }
+        RasterNodeKind::List { len, elements, .. } => {
+            let kept = elements.len().min(limits.max_list_elements);
+            let mut values = Vec::with_capacity(kept);
+            for child in &elements[..kept] {
+                values.push(raster_value_at_depth(
+                    index,
+                    data,
+                    *child,
+                    limits,
+                    child_depth,
+                )?);
+            }
+            Ok(RasterValue::List {
+                len: *len,
+                elements: values,
+                truncated: kept < elements.len(),
+            })
+        }
+        RasterNodeKind::Map { entries } => {
+            let kept = entries.len().min(limits.max_list_elements);
+            let mut values = Vec::with_capacity(kept);
+            for entry in &entries[..kept] {
+                values.push((
+                    raster_value_at_depth(index, data, entry.key, limits, child_depth)?,
+                    raster_value_at_depth(index, data, entry.value, limits, child_depth)?,
+                ));
+            }
+            Ok(RasterValue::Map {
+                len: entries.len() as u64,
+                entries: values,
+                truncated: kept < entries.len(),
+            })
+        }
+        RasterNodeKind::EnumUnit { variant } => Ok(RasterValue::Enum {
+            variant: variant.clone(),
+            payload: None,
+        }),
+        RasterNodeKind::EnumNewtype { variant, child } => Ok(RasterValue::Enum {
+            variant: variant.clone(),
+            payload: Some(Box::new(raster_value_at_depth(
+                index,
+                data,
+                *child,
+                limits,
+                child_depth,
+            )?)),
+        }),
+        RasterNodeKind::EnumTuple { variant, elements } => {
+            let kept = elements.len().min(limits.max_list_elements);
+            let mut values = Vec::with_capacity(kept);
+            for child in &elements[..kept] {
+                values.push(raster_value_at_depth(
+                    index,
+                    data,
+                    *child,
+                    limits,
+                    child_depth,
+                )?);
+            }
+            Ok(RasterValue::Enum {
+                variant: variant.clone(),
+                payload: Some(Box::new(RasterValue::List {
+                    len: elements.len() as u64,
+                    elements: values,
+                    truncated: kept < elements.len(),
+                })),
+            })
+        }
+        RasterNodeKind::EnumStruct { variant, fields } => Ok(RasterValue::Enum {
+            variant: variant.clone(),
+            payload: Some(Box::new(raster_value_fields(
+                index,
+                data,
+                fields,
+                limits,
+                child_depth,
+            )?)),
+        }),
+    }
+}
+
+fn raster_value_fields<D: RasterData + ?Sized>(
+    index: &RasterIndex,
+    data: &D,
+    fields: &[RasterStructField],
+    limits: &ReadLimits,
+    depth: usize,
+) -> CoreResult<RasterValue> {
+    let kept = fields.len().min(limits.max_struct_fields);
+    let mut values = Vec::with_capacity(kept);
+    for field in &fields[..kept] {
+        values.push((
+            field.name.clone(),
+            raster_value_at_depth(index, data, field.child, limits, depth)?,
+        ));
+    }
+    Ok(RasterValue::Struct {
+        len: fields.len() as u64,
+        fields: values,
+        truncated: kept < fields.len(),
+    })
+}
+
+/// Narrow a leaf [`TreeValue`] to its rendering view, applying the byte limit.
+///
+/// Only leaf-shaped variants can arrive here — [`parse_leaf_value`] produces
+/// nothing else — so the composite arms are unreachable in practice and are
+/// mapped rather than panicking.
+fn raster_value_from_leaf(value: TreeValue, limits: &ReadLimits) -> CoreResult<RasterValue> {
+    let int = |value: i128, ty: &'static str| Ok(RasterValue::Int { value, ty });
+    match value {
+        TreeValue::Unit => Ok(RasterValue::Unit),
+        TreeValue::Bool(v) => Ok(RasterValue::Bool(v)),
+        TreeValue::U8(v) => int(v as i128, "u8"),
+        TreeValue::U16(v) => int(v as i128, "u16"),
+        TreeValue::U32(v) => int(v as i128, "u32"),
+        TreeValue::U64(v) => int(v as i128, "u64"),
+        TreeValue::I8(v) => int(v as i128, "i8"),
+        TreeValue::I16(v) => int(v as i128, "i16"),
+        TreeValue::I32(v) => int(v as i128, "i32"),
+        TreeValue::I64(v) => int(v as i128, "i64"),
+        TreeValue::String(text) => {
+            // Truncate on a char boundary: `max_bytes_per_leaf` bounds bytes,
+            // and cutting mid-codepoint would produce a string that is not a
+            // string.
+            let keep = text
+                .char_indices()
+                .map(|(idx, _)| idx)
+                .chain(std::iter::once(text.len()))
+                .take_while(|idx| *idx <= limits.max_bytes_per_leaf)
+                .last()
+                .unwrap_or(0);
+            let truncated = keep < text.len();
+            let mut text = text;
+            text.truncate(keep);
+            Ok(RasterValue::Str {
+                value: text,
+                truncated,
+            })
+        }
+        TreeValue::BytesPage {
+            index,
+            offset,
+            len,
+            bytes,
+        } => {
+            let keep = bytes.len().min(limits.max_bytes_per_leaf);
+            let truncated = keep < bytes.len();
+            let mut bytes = bytes;
+            bytes.truncate(keep);
+            Ok(RasterValue::Bytes {
+                index,
+                offset,
+                len,
+                data: bytes,
+                truncated,
+            })
+        }
+        other => Err(Error::Serialization(format!(
+            "Raster leaf decoded to a non-leaf value: {:?}",
+            other
+        ))),
     }
 }
 

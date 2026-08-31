@@ -1,5 +1,6 @@
 //! Command implementations for the Raster CLI.
 pub mod run;
+pub mod show;
 pub mod tile;
 
 use crate::utils::encode::{decode_execution_output, encode_input};

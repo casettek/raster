@@ -12,6 +12,7 @@ pub mod input;
 pub mod profiling;
 pub mod tile_census;
 mod raster_index;
+pub mod reader;
 mod source;
 mod storage;
 pub mod tracing;
@@ -20,7 +21,11 @@ pub use entry_arguments::{
 };
 pub use input::{
     encode_raster_value, postcard_structural_commitment, select_storage_value,
-    write_program_output_artifact, write_raster_files, OutputArtifact,
+    write_program_output_artifact, write_raster_files, OutputArtifact, RasterValue,
+};
+pub use reader::{
+    read_raster_artifact, read_raster_artifact_from_bytes, read_raster_value, RasterArtifact,
+    ReadLimits,
 };
 pub use tile_census::{note_tile_execution, TILE_CENSUS_ENV, TILE_CENSUS_PATH_ENV};
 pub use profiling::{
