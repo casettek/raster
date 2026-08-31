@@ -102,6 +102,21 @@ pub(super) fn resolve(manifest: &ChainManifest) -> Result<Expansion> {
     expand_with(manifest, CountPlan::Resolve)
 }
 
+/// A count carried over from a previous invocation, via the run directory's
+/// `chain-shape` sidecar.
+///
+/// `source_stage` travels with the count because a count means nothing without
+/// the stage it came out of: reuse has to establish that the producer this
+/// manifest names today is the one that produced it. A bare number would make
+/// that unaskable.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct RecordedCount {
+    pub width: IndexWidth,
+    pub count: u32,
+    /// Index into the stage list expanded so far, as `producer_index` derives it.
+    pub source_stage: u32,
+}
+
 /// A block whose count is not yet knowable, and the stage that will supply it.
 pub(super) struct PendingCount {
     pub block: String,
@@ -127,9 +142,13 @@ pub(super) struct PartialExpansion {
 /// with one more count reproduces every stage it produced before — which is
 /// what lets the run loop re-expand from scratch each round rather than
 /// splicing, and assert that the part already executed did not move.
+///
+/// A count in `known` is keyed by block name and nothing else, so every other
+/// thing the manifest says about that block is re-derived here and checked
+/// against it — see `check_recorded_count`.
 pub(super) fn resolve_partial(
     manifest: &ChainManifest,
-    known: &BTreeMap<String, (IndexWidth, u32)>,
+    known: &BTreeMap<String, RecordedCount>,
 ) -> Result<PartialExpansion> {
     let mut stages: Vec<StageSpec> = Vec::new();
     let mut repeats: Vec<RepeatResolution> = Vec::new();
@@ -141,12 +160,13 @@ pub(super) fn resolve_partial(
             ChainItem::Repeat(block) => {
                 let (count, resolution) = match (&block.count, known.get(&block.name)) {
                     (CountSource::Literal(n), _) => (*n, literal_resolution(block, *n)),
-                    (CountSource::Stage { max, .. }, Some((width, count))) => {
+                    (CountSource::Stage { from, max }, Some(recorded)) => {
                         // The producer's index is re-derived rather than carried,
                         // so this stays a pure function of its two arguments.
                         let source_stage = producer_index(&stages, block)?;
+                        check_recorded_count(block, from, recorded, source_stage, *max)?;
                         (
-                            *count,
+                            recorded.count,
                             RepeatResolution {
                                 name: block.name.clone(),
                                 source_stage: Some(source_stage),
@@ -156,9 +176,9 @@ pub(super) fn resolve_partial(
                                 // Not an assumption: `7u32` and `7u64` commit to
                                 // different roots, so a guessed width would fail
                                 // verification against an honest chain.
-                                width: *width,
+                                width: recorded.width,
                                 max: *max,
-                                resolved_count: *count,
+                                resolved_count: recorded.count,
                             },
                         )
                     }
@@ -224,6 +244,46 @@ fn producer_index(expanded: &[StageSpec], block: &RepeatSpec) -> Result<u32> {
                 block.name
             ))
         })
+}
+
+/// Recheck a count that was resolved by some earlier invocation.
+///
+/// A recorded count is host-local state a run *inherits*, so both of the things
+/// the manifest says about it are re-derived here rather than taken from the
+/// record: `max` is the manifest's bound, and the producer is the stage
+/// expansion has just located. `read_trip_count` applies the same `max` at the
+/// moment a count is first read out of a stage; this is that check on the other
+/// way in, so a count cannot enter the graph over the bound by having been
+/// resolved somewhere else.
+///
+/// `read_chain_shape` has already discarded a sidecar resolved from a different
+/// manifest, so in practice these fire on a sidecar whose body was edited or
+/// corrupted under a digest that still matches — the digest covers the manifest,
+/// not the record. Refused rather than re-resolved: this function may not do
+/// I/O, so it cannot go and ask the producing stage who is right.
+fn check_recorded_count(
+    block: &RepeatSpec,
+    from: &str,
+    recorded: &RecordedCount,
+    source_stage: u32,
+    max: u32,
+) -> Result<()> {
+    if recorded.count > max {
+        return Err(Error::Other(format!(
+            "repeat block '{}': the recorded shape asks for {} iteration(s), over the \
+             manifest's max of {max}",
+            block.name, recorded.count,
+        )));
+    }
+    if recorded.source_stage != source_stage {
+        return Err(Error::Other(format!(
+            "repeat block '{}': its count comes from stage '{from}', which this manifest \
+             places at position {source_stage}, but the recorded shape's count came from \
+             position {}. That record describes a different chain",
+            block.name, recorded.source_stage,
+        )));
+    }
+    Ok(())
 }
 
 fn literal_resolution(block: &RepeatSpec, count: u32) -> RepeatResolution {
@@ -526,6 +586,25 @@ fn expand_repeat(
     out: &mut Vec<StageSpec>,
     exports: &mut BTreeMap<String, String>,
 ) -> Result<()> {
+    // Every index range is checked before any of it is materialized, so the
+    // additions below cannot overflow. Checked here rather than at parse time
+    // because `count` is not always authored — a stage-sourced one arrives from
+    // a run or from a commitment, and `expand_repeat` is where the two meet.
+    //
+    // Inner ranges are checked even when the block is empty, for the reason
+    // `render_binding` checks `first` before rendering: the manifest is wrong
+    // regardless of which count happens to be zero.
+    check_index_range(&format!("repeat block '{}'", block.name), block.start, count)?;
+    for template in &block.stages {
+        if let Some(inner_count) = template.count {
+            check_index_range(
+                &format!("repeat block '{}': stage '{}'", block.name, template.name),
+                template.start,
+                inner_count,
+            )?;
+        }
+    }
+
     for step in 0..count {
         let outer = Index {
             name: &block.index,
@@ -572,7 +651,10 @@ fn expand_repeat(
         } else {
             let last = Index {
                 name: &block.index,
-                value: block.start + count - 1,
+                // Grouped this way on purpose: `start + count` is the index one
+                // past the last, and `check_index_range` above bounds the last
+                // one — not that.
+                value: block.start + (count - 1),
                 start: block.start,
             };
             let what = format!("repeat block '{}' export '{name}'", block.name);
@@ -582,6 +664,26 @@ fn expand_repeat(
     }
 
     Ok(())
+}
+
+/// Whether `start .. start + count` fits a `u32`.
+///
+/// Refused rather than saturated or widened: an index range that does not fit
+/// is unauthorable, and clamping it would make two different manifests expand
+/// to the same stage names — the argument `max` makes against clamping a count
+/// (`docs/proposals/chain-repeat.md` §3), applied to the range the count
+/// produces. Without this the sum wraps in release builds, which is the same
+/// collision arriving silently.
+fn check_index_range(what: &str, start: u32, count: u32) -> Result<()> {
+    // An empty range materializes no index, so it cannot overflow.
+    if count == 0 || start.checked_add(count - 1).is_some() {
+        return Ok(());
+    }
+    Err(Error::Other(format!(
+        "{what}: its indexes run from {start} for {count} iteration(s), past the end of a u32. \
+         `start` plus `count` must be at most {}",
+        u32::MAX
+    )))
 }
 
 /// Render one templated stage against the indexes in scope.
@@ -1184,6 +1286,178 @@ count = 1
         .unwrap_err()
         .to_string();
         assert!(err.contains("declares index without count"), "{err}");
+    }
+
+    #[test]
+    fn an_index_range_past_the_end_of_a_u32_is_refused() {
+        // Not a hypothetical about a hostile manifest so much as the module's
+        // own claim: expansion is a *total* function. Unchecked, this addition
+        // panics in a debug build and wraps in a release one, and the wrap is
+        // worse — `start = u32::MAX` would silently produce an `s_l0` beside a
+        // real one.
+        let err = spec(
+            r#"
+[chain]
+[[chain.repeat]]
+name  = "b"
+index = "l"
+start = 4294967295
+count = 2
+  [[chain.repeat.stage]]
+  name    = "s_l{l}"
+  project = "p"
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("past the end of a u32"), "{err}");
+        assert!(err.contains("repeat block 'b'"), "{err}");
+
+        // The inner fan has its own `start` and its own range.
+        let err = spec(
+            r#"
+[chain]
+[[chain.repeat]]
+name  = "b"
+index = "t"
+count = 1
+  [[chain.repeat.stage]]
+  name    = "s{t}_l{l}"
+  index   = "l"
+  start   = 4294967290
+  count   = 10
+  project = "p"
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("past the end of a u32"), "{err}");
+        assert!(err.contains("stage 's{t}_l{l}'"), "{err}");
+    }
+
+    #[test]
+    fn a_range_ending_exactly_at_u32_max_still_expands() {
+        // The bound is the last index, not the one past it — a range that ends
+        // on `u32::MAX` is authorable, and the export target renders against
+        // that final iteration.
+        let s = spec(
+            r#"
+[chain]
+[[chain.stage]]
+name = "seed"
+project = "p"
+
+[[chain.repeat]]
+name  = "b"
+index = "l"
+start = 4294967294
+count = 2
+
+  [chain.repeat.exports.last]
+  stage = "s_l{l}"
+  entry = "seed"
+
+  [[chain.repeat.stage]]
+  name    = "s_l{l}"
+  project = "p"
+
+[[chain.stage]]
+name = "sink"
+project = "p"
+inputs.tail = { from = "b.last" }
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            names(&s),
+            ["seed", "s_l4294967294", "s_l4294967295", "sink"]
+        );
+        assert!(matches!(
+            &s.stages.last().unwrap().inputs["tail"],
+            InputBinding::From(p) if p == "s_l4294967295"
+        ));
+        assert!(validate_spec(&s).is_ok());
+    }
+
+    /// A chain whose one block takes its count from a stage, so `resolve_partial`
+    /// either inherits a recorded count or reports the block as pending.
+    const RECORDED: &str = r#"
+[chain]
+[[chain.stage]]
+name = "planner"
+project = "planner"
+
+[[chain.repeat]]
+name  = "steps"
+index = "t"
+count = { from = "planner", max = 8 }
+  [[chain.repeat.stage]]
+  name    = "step{t}"
+  project = "step"
+"#;
+
+    fn recorded(count: u32, source_stage: u32) -> BTreeMap<String, RecordedCount> {
+        [(
+            "steps".to_string(),
+            RecordedCount {
+                width: IndexWidth::U64,
+                count,
+                source_stage,
+            },
+        )]
+        .into_iter()
+        .collect()
+    }
+
+    #[test]
+    fn a_recorded_count_expands_the_block_it_was_resolved_for() {
+        let partial = resolve_partial(&manifest(RECORDED).unwrap(), &recorded(3, 0)).unwrap();
+        assert!(partial.pending.is_none());
+        assert_eq!(names(&partial.spec), ["planner", "step0", "step1", "step2"]);
+        // Recorded, not re-derived: the width came from the producing stage and
+        // there is nothing in the manifest to recover it from.
+        assert_eq!(partial.repeats[0].width, IndexWidth::U64);
+        assert_eq!(partial.repeats[0].source_stage, Some(0));
+    }
+
+    #[test]
+    fn a_recorded_count_over_the_manifests_max_is_refused() {
+        // `read_trip_count` bounds a count on the way *out* of the producing
+        // stage. This is the same bound on the way in from a previous run, so a
+        // count cannot enter the graph over the manifest's max by having been
+        // resolved somewhere else — the manifest in hand decides, always.
+        let err = resolve_partial(&manifest(RECORDED).unwrap(), &recorded(9, 0))
+            .err()
+            .expect("a count over max must not expand")
+            .to_string();
+        assert!(err.contains("over the manifest's max of 8"), "{err}");
+        assert!(err.contains("repeat block 'steps'"), "{err}");
+    }
+
+    #[test]
+    fn a_recorded_count_from_another_producer_is_refused() {
+        // A count is only meaningful together with the stage that produced it.
+        // The manifest puts `planner` at position 0; a record claiming the count
+        // came from somewhere else describes a chain this is not.
+        let err = resolve_partial(&manifest(RECORDED).unwrap(), &recorded(3, 1))
+            .err()
+            .expect("a count from another producer must not expand")
+            .to_string();
+        assert!(err.contains("describes a different chain"), "{err}");
+        assert!(err.contains("position 0"), "{err}");
+    }
+
+    #[test]
+    fn no_recorded_count_leaves_the_block_pending() {
+        // The other half of the pair: with nothing inherited the block is
+        // reported against the stage that would supply it, rather than expanded
+        // to a guess.
+        let partial = resolve_partial(&manifest(RECORDED).unwrap(), &BTreeMap::new()).unwrap();
+        let pending = partial.pending.expect("the count is not knowable yet");
+        assert_eq!(pending.block, "steps");
+        assert_eq!(pending.from, "planner");
+        assert_eq!(pending.source_stage, 0);
+        assert_eq!(names(&partial.spec), ["planner"]);
     }
 
     fn checkpoint(name: &str, structural: Vec<u8>) -> StageCheckpoint {

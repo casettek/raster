@@ -67,14 +67,49 @@ impl Scratch {
 
     /// Run a chain to completion, returning its reported digest.
     fn run(&self, manifest_name: &str) -> String {
+        self.run_path(&manifest(manifest_name))
+    }
+
+    /// The same, from a manifest that is not one of the example's own files.
+    fn run_path(&self, path: &PathBuf) -> String {
         let out = self.cargo_raster(&[
             "chain",
             "run",
-            manifest(manifest_name).to_str().expect("utf-8 path"),
+            path.to_str().expect("utf-8 path"),
             "--no-auth",
         ]);
-        let stdout = assert_ok(&out, &format!("chain run {manifest_name}"));
-        digest_line(&stdout, manifest_name)
+        let what = path.display().to_string();
+        let stdout = assert_ok(&out, &format!("chain run {what}"));
+        digest_line(&stdout, &what)
+    }
+
+    /// `Raster-dynamic.toml`, copied into this scratch directory with every
+    /// relative path made absolute and `max` set to `max`.
+    ///
+    /// A copy because the claim under test needs *two* manifests that differ in
+    /// something no stage name depends on — a recorded shape is keyed by block
+    /// name, so it looks applicable to both — and editing the repo's own fixture
+    /// to get one is not on.
+    fn portable_dynamic(&self, name: &str, max: u32) -> PathBuf {
+        let example = workspace_root().join("examples/chain-example");
+        let text = fs::read_to_string(manifest(DYNAMIC))
+            .expect("the dynamic fixture should be readable")
+            .replace(
+                "project = \"planner\"",
+                &format!("project = \"{}\"", example.join("planner").display()),
+            )
+            .replace(
+                "project = \"step\"",
+                &format!("project = \"{}\"", example.join("step").display()),
+            )
+            .replace(
+                "\"phase1-normalize/",
+                &format!("\"{}/phase1-normalize/", example.display()),
+            )
+            .replace("max = 8", &format!("max = {max}"));
+        let path = self.dir.join(name);
+        fs::write(&path, text).expect("the copy should be writable");
+        path
     }
 
     /// The stage checkpoints of the run just performed, as canonical bytes.
@@ -344,6 +379,114 @@ fn a_stage_re_run_needs_a_shape_to_place_it_in() {
         combined.contains("stage 'planner'"),
         "the refusal must name the stage that would supply the count\n{combined}"
     );
+}
+
+#[test]
+fn a_stage_re_run_refuses_a_shape_recorded_for_a_different_manifest() {
+    // A run directory's recorded shape is keyed by block *name*, and the name
+    // survives every edit that does not rename the block — so nothing but the
+    // manifest digest can tell "this count describes the graph I am building"
+    // from "this count describes the graph that was here yesterday". Without
+    // that binding the re-run would expand a stale stage list, invalidate
+    // downstream artifacts against it, and write it back, all against a
+    // chain-commitment `--stage` deliberately leaves untouched.
+    //
+    // The two manifests here differ only in the block's `max`: every stage name
+    // is identical, so a refusal cannot be coming from name resolution.
+    let scratch = Scratch::new("dynamic-stage-edited");
+    let original = scratch.portable_dynamic("original.toml", 8);
+    let edited = scratch.portable_dynamic("edited.toml", 7);
+    scratch.run_path(&original);
+
+    let out = scratch.cargo_raster(&[
+        "chain",
+        "run",
+        edited.to_str().expect("utf-8 path"),
+        "--no-auth",
+        "--stage",
+        "step1",
+    ]);
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.status.success(),
+        "a stage must not be placed by a shape resolved from another manifest\n{combined}"
+    );
+    assert!(combined.contains("shape is not fully known"), "{combined}");
+    assert!(
+        combined.contains("resolved from a different manifest"),
+        "the refusal must say the counts were discarded rather than never resolved\n{combined}"
+    );
+
+    // The control, and the reason the assertion above is about staleness rather
+    // than about `--stage` having stopped working: the manifest the directory
+    // was built from still places the same stage.
+    let out = scratch.cargo_raster(&[
+        "chain",
+        "run",
+        original.to_str().expect("utf-8 path"),
+        "--no-auth",
+        "--stage",
+        "step1",
+    ]);
+    let stdout = assert_ok(&out, "chain run --stage step1 (unedited manifest)");
+    assert!(stdout.contains("(re-run in place)"), "{stdout}");
+}
+
+#[test]
+fn a_whole_chain_run_re_derives_its_counts_rather_than_inheriting_them() {
+    // A whole-chain run starts at the first stage, so every stage-produced
+    // count is re-derived by executing its producer — including a run pointed
+    // at a directory that already holds a recorded shape. Inheriting one there
+    // would let a previous run's count outrank the one the planner just
+    // committed, and since this path *writes a commitment*, that is how a
+    // chain-commitment gets minted whose `resolved_count` contradicts the
+    // producing stage's own recorded output. Its own `audit` would then refuse
+    // it, having reported success.
+    let scratch = Scratch::new("dynamic-rerun-in-place");
+    scratch.run(DYNAMIC);
+    let run_dir = scratch.run_root(false);
+
+    // Corrupt the sidecar with a count the planner never asked for. Any
+    // inheritance at all shows up as this number.
+    let shape_path = run_dir.join("chain-shape");
+    let mut shape: raster_core::chain::ChainShape =
+        postcard::from_bytes(&fs::read(&shape_path).expect("chain-shape should exist"))
+            .expect("chain-shape should decode");
+    assert_eq!(shape.repeats.len(), 1, "the fixture has one repeat block");
+    shape.repeats[0].resolved_count += 1;
+    fs::write(&shape_path, postcard::to_allocvec(&shape).unwrap()).expect("writable");
+
+    let out = scratch.cargo_raster(&[
+        "chain",
+        "run",
+        manifest(DYNAMIC).to_str().expect("utf-8 path"),
+        "--no-auth",
+        "--run",
+        run_dir.to_str().expect("utf-8 path"),
+    ]);
+    assert_ok(&out, "chain run --run <existing dir>");
+
+    let honest = scratch.planner_count(false);
+    assert_eq!(
+        scratch.chain(false).shape.repeats[0].resolved_count as u64,
+        honest,
+        "the count in the new commitment must be the one the planner just committed"
+    );
+
+    // Said the other way, since that is the property that actually matters: the
+    // commitment this run wrote is one its own audit accepts.
+    let out = scratch.cargo_raster(&[
+        "chain",
+        "audit",
+        manifest(DYNAMIC).to_str().expect("utf-8 path"),
+        scratch.latest_commitment().to_str().expect("utf-8 path"),
+    ]);
+    let stdout = assert_ok(&out, "chain audit after a re-run in place");
+    assert!(stdout.contains("chain verified"), "{stdout}");
 }
 
 #[test]

@@ -254,7 +254,11 @@ Templating rules:
   uses. `start` exists because a segment sometimes begins partway: layers 15–34 are a
   different wiring regime from 0–14 (§7), and `start = 15, count = 20` is how that is said.
   Note `count` counts *iterations* and `max` bounds *`count`*, not the largest index — error
-  messages must say which.
+  messages must say which. The largest index has its own bound: `start + count - 1` must fit
+  a `u32`, checked before a block expands and **refused**, not saturated. Saturating would
+  let two manifests with different ranges expand to the same stage names, which is §3's
+  argument against clamping a count applied to the range that count produces; and left
+  unchecked the sum wraps in a release build, which is the same collision without the error.
 - `{ident-1}` is the only arithmetic. It exists to express the sequential dependency
   that makes a repeat a chain rather than a fan-out, and deliberately stops there —
   general expressions in a manifest is the road to a config language.
@@ -398,7 +402,26 @@ A dynamic chain also writes `chain_dir/chain-shape` as each count resolves, **un
 — not gated on whether a chain-commitment is being written.** `run` degrades to no commitment
 when program identity is unresolvable (`chain.rs:174-192`), and that is precisely the state a
 contested chain can be in, so `--stage` name resolution must not depend on the commitment
-existing. It also makes the partition loop resumable.
+existing.
+
+The sidecar holds a whole `ChainShape` — the resolutions **and** `spec_digest` — and for the
+same reason §5 puts the digest in the commitment: a count is only meaningful for the manifest
+it was resolved from. The resolutions are keyed by block *name*, and a name survives every
+edit that does not rename the block, so the digest is the only thing that distinguishes "this
+count describes the graph I am building" from "this count describes the graph that was here
+yesterday". A sidecar whose digest does not match is discarded, and the caller says so —
+"resolved from a different manifest" rather than "that stage has not run", which is what an
+unresolved shape otherwise looks like from the inside. Two things are then rechecked at reuse
+anyway, since the digest covers the manifest and not the record: the count against the
+manifest's `max` (the same bound `read_trip_count` applies on the way out of the producing
+stage), and the recorded producer against the position expansion just derived for it.
+
+**Only `--stage` inherits a recorded count.** A whole-chain run starts at the first stage and
+therefore re-derives every count by executing its producer, including one pointed at an
+existing directory with `--run`. Seeding it there would let a previous run's count outrank the
+one the producer just committed — and since that path writes a commitment, it is how a
+`ChainCommitment` gets minted whose `resolved_count` contradicts its own producing stage's
+recorded output: a chain that reports success and then fails §6 step 2 under its own `audit`.
 
 Both postures run this loop. `chain-io-commitment.md` made a cheap run produce a real
 `ChainCommitment`, so nothing here may sit behind an authentication branch.
@@ -777,11 +800,11 @@ Landed 2026-08-27, all nine phases of the plan below.
 | Static expansion (§2) | **landed** in `raster-cli/src/chain/expand.rs` — textual substitution, `start`, `first`, one `{ident-1}`, exports with per-export `entry`, fixed ordering |
 | `ChainShape` on `ChainCommitment` (§5) | **landed**, unconditional. Chain-commitment format break; recorded digests move |
 | `verify_shape` + `VerifiedCounts` (§6) | **landed.** `expand` is uncallable without counts, and `verify_shape` is the only thing that makes them — "ordering, not trust" is a property of the types |
-| Stage-produced counts (§4) | **landed.** The run loop re-expands from the manifest each round and asserts the executed prefix did not move; a `chain-shape` sidecar makes `--stage` work on a dynamic chain |
+| Stage-produced counts (§4) | **landed.** The run loop re-expands from the manifest each round and asserts the executed prefix did not move; a `chain-shape` sidecar, digest-bound to its manifest, makes `--stage` work on a dynamic chain |
 | `ChainFaultKind::Shape` (§6.1) | **landed** beside `Link`. `ChainFraudEvidence::Shape { repeat_index }` and nothing else; `prove_chain_fraud` takes `Option<Receipt>` |
 | Acceptance on `raster-inference` | **landed.** The 35 `prefill_prepare_aux` stages are one repeat block plus one indexed input, and the manifest expands to the **identical 74 stages** |
 
-**Three things the implementation forced, none of them in the design.**
+**Four things the implementation forced, none of them in the design.**
 
 1. **TOML cannot interleave two arrays-of-tables.** `[[chain.stage]]` and `[[chain.repeat]]` reach
    serde as two independent `Vec`s with no ordering between them, and `raster-inference` is
@@ -795,7 +818,16 @@ Landed 2026-08-27, all nine phases of the plan below.
    claimer could set to anything. It is now a checked equality, so the field cannot become a place
    to put a convenient number.
 
-3. **A fraud prover must be able to load a fraudulent chain.** `verify_shape` in the load path
+3. **The `chain-shape` sidecar had no manifest to be a shape *of*.** The same lesson as (2), one
+   layer out and on host-local state rather than on the commitment. The sidecar recorded counts
+   keyed by block name, and nothing bound them to the manifest they came from — so a `--stage`
+   re-run after an edit placed its stage in the graph that was there yesterday, and a whole-chain
+   run pointed at an existing directory with `--run` inherited a count over the one its own
+   planner had just committed, minting a commitment its own `audit` rejects. It now carries
+   `spec_digest` (§4), `--stage` is the only reader, and `max` and the producer are rechecked at
+   reuse against the manifest in hand.
+
+4. **A fraud prover must be able to load a fraudulent chain.** `verify_shape` in the load path
    refuses a bad shape, which is right for a verifier and fatal for `fraud-prove` — it has to
    reconstruct the chain the claimer *asserts* in order to exhibit what is wrong with it. Split
    into a `ShapePolicy`: `Verify` for `audit`, `AsClaimed` for the two fraud commands.

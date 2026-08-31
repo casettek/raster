@@ -52,7 +52,8 @@ use crate::TraceFormat;
 
 mod expand;
 use expand::{
-    expand, resolve, resolve_partial, spec_digest, verify_shape, PendingCount, VerifiedCounts,
+    expand, resolve, resolve_partial, spec_digest, verify_shape, PendingCount, RecordedCount,
+    VerifiedCounts,
 };
 
 // ---------------------------------------------------------------------------
@@ -390,19 +391,41 @@ pub fn run(
     }
     println!();
 
-    // Counts already resolved by an earlier invocation, if any. A `--stage`
-    // re-run works inside an existing run directory and must reconstruct the
-    // same shape that directory was built with — and it cannot re-derive a
-    // stage-produced count without re-running the stage that produced it.
-    let mut known = read_chain_shape(&chain_dir);
+    // Counts already resolved by an earlier invocation, if any. **Only a
+    // `--stage` re-run inherits them**: it works inside an existing run
+    // directory, executes one stage, and cannot re-derive a stage-produced count
+    // without re-running the stage that produced it.
+    //
+    // A whole-chain run never does, not even one pointed at an existing
+    // directory with `--run`: it starts at the first stage, so every
+    // stage-produced count is re-derived by executing its producer. Seeding it
+    // from the sidecar there would let a count recorded by a previous run
+    // outrank the one this run just produced — and since a whole-chain run
+    // *writes a commitment*, that is how a chain-commitment gets minted whose
+    // `resolved_count` contradicts the producing stage's own recorded output.
+    let recorded = if stage_selection.is_some() {
+        read_chain_shape(&chain_dir, &manifest)
+    } else {
+        RecordedShape::default()
+    };
+    let mut known = recorded.counts;
     let mut partial = resolve_partial(&manifest, &known)?;
 
     if stage_selection.is_some() && partial.pending.is_some() {
         let pending = partial.pending.expect("checked above");
+        // Said explicitly, because otherwise this reads as "that stage never
+        // ran" when what happened is that it ran against a manifest which has
+        // since been edited.
+        let discarded = if recorded.stale {
+            "\n  (that directory holds a recorded shape resolved from a different manifest, \
+             so its counts describe another chain and were discarded)"
+        } else {
+            ""
+        };
         return Err(Error::Other(format!(
             "this chain's shape is not fully known: repeat block '{}' takes its count from \
-             stage '{}', which has not run in {}.\n  run the whole chain once first: \
-             cargo raster chain run{}",
+             stage '{}', which has not run in {}.{discarded}\n  run the whole chain once \
+             first: cargo raster chain run{}",
             pending.block,
             pending.from,
             chain_dir.display(),
@@ -606,7 +629,14 @@ pub fn run(
             pending.block, pending.from
         );
         println!();
-        known.insert(pending.block.clone(), (width, count));
+        known.insert(
+            pending.block.clone(),
+            RecordedCount {
+                width,
+                count,
+                source_stage: pending.source_stage,
+            },
+        );
 
         // Re-expand from the manifest rather than splicing, then check that the
         // part already executed did not move. Expansion does no I/O and the
@@ -628,7 +658,7 @@ pub fn run(
     // Written before any of the early returns below: the shape is what a later
     // `--stage` re-run needs to reconstruct this directory's stage list, and
     // that is true whether or not a chain-commitment was produced.
-    write_chain_shape(&chain_dir, &repeats)?;
+    write_chain_shape(&chain_dir, &manifest, &repeats)?;
 
     // The interlock that used to live here — no trace, therefore no
     // checkpoint — is gone: a checkpoint names only inputs and outputs, which
@@ -687,34 +717,83 @@ pub fn run(
 /// re-running its producer — so the shape has to be on disk even when the
 /// commitment is not. It is a convenience for this run directory, never
 /// evidence: everything a *verifier* needs is in `ChainCommitment::shape`.
+///
+/// It holds a `ChainShape` — the same `spec_digest` + resolutions the commitment
+/// carries, and for the same reason. A count is only meaningful for the manifest
+/// it was resolved from, and the resolutions are keyed by block *name*, which
+/// survives an edit that changes everything else about the block.
 const CHAIN_SHAPE_FILE: &str = "chain-shape";
+
+/// What a run directory's recorded shape says about the manifest in hand.
+#[derive(Debug, Default)]
+struct RecordedShape {
+    /// Stage-produced counts by block name. Empty unless the sidecar was
+    /// resolved from this very manifest.
+    counts: BTreeMap<String, RecordedCount>,
+    /// A sidecar was there and decoded, but records a different manifest — the
+    /// difference between "not resolved yet" and "resolved for another chain",
+    /// which the caller reports rather than acts on.
+    stale: bool,
+}
 
 /// Read back the counts an earlier invocation resolved in this run directory.
 ///
 /// A missing or unreadable sidecar is not an error — it means "nothing resolved
-/// yet", which is the normal state of a fresh run.
-fn read_chain_shape(chain_dir: &Path) -> BTreeMap<String, (IndexWidth, u32)> {
+/// yet", which is the normal state of a fresh run. Neither is one belonging to
+/// another manifest: it is discarded, and the caller's refusal explains why.
+/// Both land in the same place, an unresolved shape, which every consumer of
+/// this already handles — including a sidecar written before it carried a
+/// digest, which lands in one or the other and costs that directory one
+/// whole-chain run before `--stage` works in it again.
+fn read_chain_shape(chain_dir: &Path, manifest: &ChainManifest) -> RecordedShape {
     let Ok(bytes) = std::fs::read(chain_dir.join(CHAIN_SHAPE_FILE)) else {
-        return BTreeMap::new();
+        return RecordedShape::default();
     };
-    let Ok(recorded) = postcard::from_bytes::<Vec<RepeatResolution>>(&bytes) else {
-        return BTreeMap::new();
+    let Ok(recorded) = postcard::from_bytes::<ChainShape>(&bytes) else {
+        return RecordedShape::default();
     };
-    recorded
-        .into_iter()
-        .filter(|resolution| resolution.source_stage.is_some())
-        .map(|resolution| {
-            (
-                resolution.name,
-                (resolution.width, resolution.resolved_count),
-            )
-        })
-        .collect()
+    if recorded.spec_digest != spec_digest(manifest) {
+        return RecordedShape {
+            counts: BTreeMap::new(),
+            stale: true,
+        };
+    }
+
+    RecordedShape {
+        counts: recorded
+            .repeats
+            .into_iter()
+            .filter_map(|resolution| {
+                // A literal count is manifest-static and re-derived by
+                // expansion; only a stage-produced one is unrecoverable without
+                // re-running its producer, and `source_stage` is what tells the
+                // two apart.
+                let source_stage = resolution.source_stage?;
+                Some((
+                    resolution.name,
+                    RecordedCount {
+                        width: resolution.width,
+                        count: resolution.resolved_count,
+                        source_stage,
+                    },
+                ))
+            })
+            .collect(),
+        stale: false,
+    }
 }
 
-fn write_chain_shape(chain_dir: &Path, repeats: &[RepeatResolution]) -> Result<()> {
+fn write_chain_shape(
+    chain_dir: &Path,
+    manifest: &ChainManifest,
+    repeats: &[RepeatResolution],
+) -> Result<()> {
     let path = chain_dir.join(CHAIN_SHAPE_FILE);
-    std::fs::write(&path, postcard::to_allocvec(repeats).unwrap())
+    let shape = ChainShape {
+        spec_digest: spec_digest(manifest),
+        repeats: repeats.to_vec(),
+    };
+    std::fs::write(&path, postcard::to_allocvec(&shape).unwrap())
         .map_err(|e| Error::Other(format!("failed to write {}: {e}", path.display())))
 }
 
@@ -3226,6 +3305,105 @@ encoding = "raster"
         ));
         let manifest = read_input_manifest(&dir).unwrap();
         assert_eq!(manifest["kv"], "abcd");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A dynamic chain, and the same chain with one thing changed that leaves
+    /// every stage *name* alone — so a shape recorded for one of them looks
+    /// applicable to the other by every key the sidecar has.
+    const SHAPE_MANIFEST: &str = r#"
+[chain]
+[[chain.stage]]
+name = "planner"
+project = "planner"
+
+[[chain.repeat]]
+name  = "steps"
+index = "t"
+count = { from = "planner", max = 8 }
+  [[chain.repeat.stage]]
+  name    = "step{t}"
+  project = "step"
+"#;
+
+    const SHAPE_MANIFEST_EDITED: &str = r#"
+[chain]
+[[chain.stage]]
+name = "planner"
+project = "planner"
+
+[[chain.repeat]]
+name  = "steps"
+index = "t"
+count = { from = "planner", max = 3 }
+  [[chain.repeat.stage]]
+  name    = "step{t}"
+  project = "step"
+"#;
+
+    fn stage_sourced_shape(count: u32) -> Vec<RepeatResolution> {
+        vec![RepeatResolution {
+            name: "steps".into(),
+            source_stage: Some(0),
+            source_commitment: Vec::new(),
+            selector: String::new(),
+            width: IndexWidth::U64,
+            max: 8,
+            resolved_count: count,
+        }]
+    }
+
+    #[test]
+    fn a_recorded_shape_is_read_back_only_for_the_manifest_that_wrote_it() {
+        // The sidecar is keyed by block *name*, which survives every edit that
+        // does not rename the block — so without the digest an edited manifest
+        // inherits counts belonging to a graph it is not building. Both
+        // manifests here declare a block called `steps`, and only `max` differs.
+        let dir = scratch("shape-binding");
+        let manifest = manifest_from_toml(SHAPE_MANIFEST).unwrap();
+        write_chain_shape(&dir, &manifest, &stage_sourced_shape(5)).unwrap();
+
+        let read = read_chain_shape(&dir, &manifest);
+        assert!(!read.stale);
+        assert_eq!(read.counts["steps"].count, 5);
+        assert_eq!(read.counts["steps"].source_stage, 0);
+
+        let edited = manifest_from_toml(SHAPE_MANIFEST_EDITED).unwrap();
+        let read = read_chain_shape(&dir, &edited);
+        assert!(
+            read.counts.is_empty(),
+            "a count resolved from another manifest must not be inherited"
+        );
+        assert!(
+            read.stale,
+            "and the caller has to be able to say so — 'that stage never ran' would be a lie"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_literal_count_is_never_read_back_from_the_recorded_shape() {
+        // `source_stage: None` is a manifest-static count. Expansion re-derives
+        // it, and inheriting it would let a recorded number outrank the
+        // manifest's own.
+        let dir = scratch("shape-literal");
+        let manifest = manifest_from_toml(SHAPE_MANIFEST).unwrap();
+        let mut repeats = stage_sourced_shape(5);
+        repeats[0].source_stage = None;
+        write_chain_shape(&dir, &manifest, &repeats).unwrap();
+
+        assert!(read_chain_shape(&dir, &manifest).counts.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_missing_recorded_shape_is_not_a_stale_one() {
+        let dir = scratch("shape-absent");
+        let manifest = manifest_from_toml(SHAPE_MANIFEST).unwrap();
+        let read = read_chain_shape(&dir, &manifest);
+        assert!(read.counts.is_empty());
+        assert!(!read.stale, "nothing recorded is not the same as recorded for another chain");
         std::fs::remove_dir_all(&dir).ok();
     }
 
