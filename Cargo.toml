@@ -17,6 +17,10 @@ members = [
     "examples/chain-example/phase1-normalize",
     "examples/chain-example/phase2-aggregate",
     "examples/chain-example/phase3-report",
+    # Fixtures for `[[chain.repeat]]` — a chain whose length is decided at run
+    # time (`examples/chain-example/Raster-dynamic.toml`).
+    "examples/chain-example/planner",
+    "examples/chain-example/step",
 ]
 
 [workspace.package]

@@ -1,0 +1,51 @@
+# The same chain as `Raster.toml`, with `normalize` expressed as a
+# one-iteration `[[chain.repeat]]` block instead of a `[[chain.stage]]`.
+#
+# A test fixture, not an alternative way to run the example: `chain run` and
+# `chain audit` discover `Raster.toml`, and this file is reached only by being
+# named explicitly. It exists to pin the property expansion has to have: **a
+# repeat block that expands to a given stage list must produce the
+# byte-identical stage checkpoints the hand-written form does**, or
+# `[[chain.repeat]]` is a semantic change dressed as a refactor.
+#
+# The *chain digest* deliberately does differ between the two. It covers
+# `ChainShape::spec_digest`, taken over the unexpanded manifest, so two
+# different manifests are two different chains even when they compute the same
+# thing — which is what lets a commitment name the spec it came from.
+#
+# Exercised by `crates/raster-cli/tests/chain_repeat_cli.rs`.
+# See `docs/proposals/chain-repeat.md` §4.
+[chain]
+name = "chain-example"
+version = "0.1.0"
+
+[chain.input.measurements]
+path       = "phase1-normalize/measurements.rastered"
+index_path = "phase1-normalize/measurements.rindex"
+commitment = "3c15a8a65529dd56a5862a6687e2c2788e97e79f76cc994df50363fcc79fab6b"
+
+[chain.input.threshold]
+path       = "phase1-normalize/threshold.rastered"
+index_path = "phase1-normalize/threshold.rindex"
+commitment = "3cb30ab8f7660969ea55a33a6b01487de74745b59deba49df5a7602edc98d952"
+
+[[chain.repeat]]
+name  = "prepare"
+index = "i"
+count = 1
+
+  [[chain.repeat.stage]]
+  name    = "normalize"
+  project = "phase1-normalize"
+  inputs.readings  = { input = "measurements" }
+  inputs.threshold = { input = "threshold" }
+
+[[chain.stage]]
+name = "aggregate"
+project = "phase2-aggregate"
+inputs.filtered = { from = "normalize" }
+
+[[chain.stage]]
+name = "report"
+project = "phase3-report"
+inputs.stats = { from = "aggregate" }

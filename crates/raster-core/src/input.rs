@@ -1168,8 +1168,58 @@ pub fn parse_bytes_page_payload(bytes: &[u8]) -> Option<(u64, u64, u64, &[u8])> 
     Some((index, page_offset, len, page_bytes))
 }
 
+/// The structural root of a payload that is a single unsigned scalar:
+/// `sha256(b"leaf" || value.to_le_bytes_at(width))`.
+///
+/// `None` when `value` does not fit `width` — [`IndexWidth::encode`]'s refusal
+/// to truncate, inherited for the same reason.
+///
+/// This is the whole check behind a `chain-repeat` trip count
+/// (`docs/proposals/chain-repeat.md` §3, §6). A stage-produced count is the
+/// producing stage's *entire* output, so a verifier re-encodes the count it
+/// was handed and compares one hash against the checkpoint's
+/// `output_structural_commitment` — it never parses a payload. That direction
+/// is deliberate: adversarial `output.bin` bytes have no path into the guest,
+/// and there is no decoder to diverge from the runtime's.
+pub fn scalar_leaf_root(width: IndexWidth, value: u64) -> Option<Hash32> {
+    Some(selection_hash(&[b"leaf", &width.encode(value)?]))
+}
+
+/// Read back a payload that is a single unsigned scalar: the inverse of
+/// [`scalar_leaf_root`]'s input.
+///
+/// `None` for anything that is not exactly one fixed-width unsigned leaf — a
+/// struct, a list, a leaf of some other width, or trailing bytes. Narrow on
+/// purpose: its caller is a `chain-repeat` trip count, and "this artifact is a
+/// count" should be a decision about the whole artifact rather than a value
+/// fished out of a larger one.
+pub fn parse_scalar_leaf(bytes: &[u8]) -> Option<(IndexWidth, u64)> {
+    let (tag, rest) = bytes.split_first()?;
+    if *tag != 0x00 {
+        return None;
+    }
+    let len_bytes: [u8; 8] = rest.get(..8)?.try_into().ok()?;
+    let len = u64::from_le_bytes(len_bytes) as usize;
+    let leaf = rest.get(8..8 + len)?;
+    if 8 + len != rest.len() {
+        return None;
+    }
+
+    let width = match len {
+        1 => IndexWidth::U8,
+        2 => IndexWidth::U16,
+        4 => IndexWidth::U32,
+        8 => IndexWidth::U64,
+        _ => return None,
+    };
+
+    let mut value = [0u8; 8];
+    value[..len].copy_from_slice(leaf);
+    Some((width, u64::from_le_bytes(value)))
+}
+
 fn u64_leaf_root(value: u64) -> Hash32 {
-    selection_hash(&[b"leaf", &value.to_le_bytes()])
+    scalar_leaf_root(IndexWidth::U64, value).expect("every u64 fits U64")
 }
 
 /// Geometry rules 2–3 from `paged-bytes.md` §3.1, run where the witness is
@@ -1538,6 +1588,74 @@ pub type InputManifestDocument = BTreeMap<String, InputManifestEntry>;
 mod tests {
     use super::*;
     use alloc::string::ToString;
+
+    #[test]
+    fn scalar_leaf_root_is_width_sensitive_and_matches_the_payload_root() {
+        // The whole soundness argument for a `chain-repeat` trip count rests on
+        // this: the width is not derivable from the value, so a verifier handed
+        // `7` cannot check anything until it is also told which width committed
+        // it (`docs/proposals/chain-repeat.md` §5, `RepeatResolution.width`).
+        let as_u32 = scalar_leaf_root(IndexWidth::U32, 7).unwrap();
+        let as_u64 = scalar_leaf_root(IndexWidth::U64, 7).unwrap();
+        assert_ne!(
+            as_u32, as_u64,
+            "7u32 and 7u64 are different payloads and must have different roots"
+        );
+
+        // And each is the root the real payload for that width parses to, so a
+        // re-encoded count is comparable against a recorded
+        // `output_structural_commitment` without ever decoding an artifact.
+        for (width, expected) in [(IndexWidth::U32, as_u32), (IndexWidth::U64, as_u64)] {
+            let payload = encode_index_leaf_payload(7, width).unwrap();
+            assert_eq!(payload_structural_root(&payload), Some(expected));
+        }
+    }
+
+    #[test]
+    fn a_scalar_payload_round_trips_through_parse_and_root() {
+        // The two directions have to agree: the run loop reads a count out of a
+        // stage's `output.bin` with `parse_scalar_leaf`, and every verifier
+        // afterwards re-encodes it with `scalar_leaf_root` and compares against
+        // what that stage committed.
+        for width in [IndexWidth::U8, IndexWidth::U16, IndexWidth::U32, IndexWidth::U64] {
+            let payload = encode_index_leaf_payload(7, width).unwrap();
+            assert_eq!(parse_scalar_leaf(&payload), Some((width, 7)));
+            assert_eq!(
+                payload_structural_root(&payload),
+                scalar_leaf_root(width, 7)
+            );
+        }
+    }
+
+    #[test]
+    fn parse_scalar_leaf_refuses_anything_that_is_not_one_whole_scalar() {
+        // A count is a statement about the entire artifact. Accepting a prefix,
+        // or an odd width, would let "this stage produced a count" be true of
+        // artifacts that are not counts.
+        let payload = encode_index_leaf_payload(7, IndexWidth::U32).unwrap();
+
+        let mut trailing = payload.clone();
+        trailing.push(0xff);
+        assert_eq!(parse_scalar_leaf(&trailing), None, "trailing bytes");
+        assert_eq!(parse_scalar_leaf(&payload[..payload.len() - 1]), None, "truncated");
+
+        let mut odd_width = payload.clone();
+        odd_width[1] = 3;
+        odd_width.truncate(1 + 8 + 3);
+        assert_eq!(parse_scalar_leaf(&odd_width), None, "3-byte leaf is no scalar");
+
+        let mut not_a_leaf = payload.clone();
+        not_a_leaf[0] = 0x01;
+        assert_eq!(parse_scalar_leaf(&not_a_leaf), None, "struct tag");
+    }
+
+    #[test]
+    fn scalar_leaf_root_refuses_a_value_that_does_not_fit() {
+        // Inherited from `IndexWidth::encode`: truncating here would let a
+        // recorded count of 300 at width U8 match a stage that committed 44.
+        assert_eq!(scalar_leaf_root(IndexWidth::U8, 300), None);
+        assert!(scalar_leaf_root(IndexWidth::U16, 300).is_some());
+    }
 
     #[test]
     fn parses_external_input_entries_with_per_file_load_preference() {

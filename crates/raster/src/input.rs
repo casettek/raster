@@ -2449,16 +2449,18 @@ where
 }
 
 #[doc(hidden)]
-pub fn run_recur_list<T, S, Step, Output>(
+fn run_recur_list_with_finish<T, S, Step, Output, Finish, R>(
     source: AuthRef<List<T>>,
     output: Draft<S>,
     mut step: Step,
-) -> AuthRef<S>
+    finish: Finish,
+) -> R
 where
     T: DeserializeOwned + Serialize + Selectable + 'static,
     S: Schema + DeserializeOwned + Serialize + 'static,
     Step: FnMut(RecurInput<T>, RecurOutput<S>) -> Output,
     Output: IntoRecurControl<RecurOutput<S>>,
+    Finish: FnOnce(Draft<S>, bool) -> R,
 {
     #[cfg(feature = "std")]
     {
@@ -2466,7 +2468,7 @@ where
             .unwrap_or_else(|error| panic!("Failed to open recursive list source: {}", error));
         let len = cursor.len();
         if len == 0 {
-            return finalize_recur_output(output, true);
+            return finish(output, true);
         }
         let mut output = output;
 
@@ -2484,7 +2486,7 @@ where
             }
         }
 
-        return finalize_recur_output(output, false);
+        return finish(output, false);
     }
 
     #[cfg(not(feature = "std"))]
@@ -2492,6 +2494,7 @@ where
         let _ = source;
         let _ = output;
         let _ = step;
+        let _ = finish;
         panic!("Recursive list execution requires the `std` feature")
     }
 }
@@ -2538,17 +2541,19 @@ where
 /// tree to prove membership in. `RecurInput.len` remains the **iteration**
 /// count, so `is_first`/`is_last` keep their current meanings inside the step.
 #[doc(hidden)]
-pub fn run_recur_chunked_list<T, S, Step, Output>(
+fn run_recur_chunked_list_with_finish<T, S, Step, Output, Finish, R>(
     source: AuthRef<List<T>>,
     chunk: u64,
     output: Draft<S>,
     mut step: Step,
-) -> AuthRef<S>
+    finish: Finish,
+) -> R
 where
     T: DeserializeOwned + Serialize + Selectable + 'static,
     S: Schema + DeserializeOwned + Serialize + 'static,
     Step: FnMut(RecurInput<Block<T>>, RecurOutput<S>) -> Output,
     Output: IntoRecurControl<RecurOutput<S>>,
+    Finish: FnOnce(Draft<S>, bool) -> R,
 {
     #[cfg(feature = "std")]
     {
@@ -2557,7 +2562,7 @@ where
         let len = cursor.len();
         let iterations = chunk_iteration_count(len, chunk);
         if iterations == 0 {
-            return finalize_recur_output(output, true);
+            return finish(output, true);
         }
         let mut output = output;
 
@@ -2573,7 +2578,7 @@ where
             }
         }
 
-        return finalize_recur_output(output, false);
+        return finish(output, false);
     }
 
     #[cfg(not(feature = "std"))]
@@ -2629,19 +2634,21 @@ where
 
 /// `call_recur! { ..., chunk = N }`, state + output.
 #[doc(hidden)]
-pub fn run_recur_chunked_list_with_state<T, State, S, Step, Output>(
+fn run_recur_chunked_list_with_state_with_finish<T, State, S, Step, Output, Finish, R>(
     source: AuthRef<List<T>>,
     chunk: u64,
     state: RecurState<State>,
     output: Draft<S>,
     mut step: Step,
-) -> AuthRef<S>
+    finish: Finish,
+) -> R
 where
     T: DeserializeOwned + Serialize + Selectable + 'static,
     State: DeserializeOwned + Serialize + 'static,
     S: Schema + DeserializeOwned + Serialize + 'static,
     Step: FnMut(RecurInput<Block<T>>, RecurState<State>, RecurOutput<S>) -> Output,
     Output: IntoRecurControl<(RecurState<State>, RecurOutput<S>)>,
+    Finish: FnOnce(Draft<S>, bool) -> R,
 {
     #[cfg(feature = "std")]
     {
@@ -2651,7 +2658,7 @@ where
         let iterations = chunk_iteration_count(len, chunk);
         if iterations == 0 {
             let _ = state;
-            return finalize_recur_output(output, true);
+            return finish(output, true);
         }
         let mut state = state;
         let mut output = output;
@@ -2673,7 +2680,7 @@ where
         }
 
         let _ = state;
-        return finalize_recur_output(output, false);
+        return finish(output, false);
     }
 
     #[cfg(not(feature = "std"))]
@@ -2729,18 +2736,20 @@ where
 }
 
 #[doc(hidden)]
-pub fn run_recur_list_with_state<T, State, S, Step, Output>(
+fn run_recur_list_with_state_with_finish<T, State, S, Step, Output, Finish, R>(
     source: AuthRef<List<T>>,
     state: RecurState<State>,
     output: Draft<S>,
     mut step: Step,
-) -> AuthRef<S>
+    finish: Finish,
+) -> R
 where
     T: DeserializeOwned + Serialize + Selectable + 'static,
     State: DeserializeOwned + Serialize + 'static,
     S: Schema + DeserializeOwned + Serialize + 'static,
     Step: FnMut(RecurInput<T>, RecurState<State>, RecurOutput<S>) -> Output,
     Output: IntoRecurControl<(RecurState<State>, RecurOutput<S>)>,
+    Finish: FnOnce(Draft<S>, bool) -> R,
 {
     #[cfg(feature = "std")]
     {
@@ -2749,7 +2758,7 @@ where
         let len = cursor.len();
         if len == 0 {
             let _ = state;
-            return finalize_recur_output(output, true);
+            return finish(output, true);
         }
         let mut state = state;
         let mut output = output;
@@ -2771,7 +2780,7 @@ where
         }
 
         let _ = state;
-        return finalize_recur_output(output, false);
+        return finish(output, false);
     }
 
     #[cfg(not(feature = "std"))]
@@ -2780,21 +2789,24 @@ where
         let _ = state;
         let _ = output;
         let _ = step;
+        let _ = finish;
         panic!("Recursive list execution requires the `std` feature")
     }
 }
 
 #[doc(hidden)]
-pub fn run_recur_sequence_list<T, S, Step, Output>(
+fn run_recur_sequence_list_with_finish<T, S, Step, Output, Finish, R>(
     source: AuthRef<List<T>>,
     output: Draft<S>,
     mut step: Step,
-) -> AuthRef<S>
+    finish: Finish,
+) -> R
 where
     T: DeserializeOwned + Serialize + Selectable + 'static,
     S: Schema + DeserializeOwned + Serialize + 'static,
     Step: FnMut(RecurSequenceInput<T>, RecurSequenceOutput<S>) -> Output,
     Output: Into<RecurSequenceOutput<S>>,
+    Finish: FnOnce(Draft<S>, bool) -> R,
 {
     #[cfg(feature = "std")]
     {
@@ -2803,7 +2815,7 @@ where
         });
         let len = cursor.len();
         if len == 0 {
-            return finalize_recur_output(output, true);
+            return finish(output, true);
         }
 
         let mut output = output;
@@ -2818,7 +2830,7 @@ where
                 .__raster_into_recur_output();
         }
 
-        return finalize_recur_output(output, false);
+        return finish(output, false);
     }
 
     #[cfg(not(feature = "std"))]
@@ -2826,6 +2838,7 @@ where
         let _ = source;
         let _ = output;
         let _ = step;
+        let _ = finish;
         panic!("Recursive sequence list execution requires the `std` feature")
     }
 }
@@ -2874,18 +2887,20 @@ where
 }
 
 #[doc(hidden)]
-pub fn run_recur_sequence_list_with_state<T, State, S, Step, Output>(
+fn run_recur_sequence_list_with_state_with_finish<T, State, S, Step, Output, Finish, R>(
     source: AuthRef<List<T>>,
     state: RecurState<State>,
     output: Draft<S>,
     mut step: Step,
-) -> AuthRef<S>
+    finish: Finish,
+) -> R
 where
     T: DeserializeOwned + Serialize + Selectable + 'static,
     State: DeserializeOwned + Serialize + 'static,
     S: Schema + DeserializeOwned + Serialize + 'static,
     Step: FnMut(RecurSequenceInput<T>, RecurSequenceState<State>, RecurSequenceOutput<S>) -> Output,
     Output: Into<(RecurSequenceState<State>, RecurSequenceOutput<S>)>,
+    Finish: FnOnce(Draft<S>, bool) -> R,
 {
     #[cfg(feature = "std")]
     {
@@ -2895,7 +2910,7 @@ where
         let len = cursor.len();
         if len == 0 {
             let _ = state;
-            return finalize_recur_output(output, true);
+            return finish(output, true);
         }
 
         let mut state = state;
@@ -2913,7 +2928,7 @@ where
         }
 
         let _ = state;
-        return finalize_recur_output(output, false);
+        return finish(output, false);
     }
 
     #[cfg(not(feature = "std"))]
@@ -2922,9 +2937,267 @@ where
         let _ = state;
         let _ = output;
         let _ = step;
+        let _ = finish;
         panic!("Recursive sequence list execution requires the `std` feature")
     }
 }
+
+/// Runs the sweep and **closes** its output draft, binding the finalized value.
+/// This is what a `call_recur!` without `finalize = false` compiles to.
+#[doc(hidden)]
+pub fn run_recur_list<T, S, Step, Output>(
+
+    source: AuthRef<List<T>>,
+    output: Draft<S>,
+    mut step: Step,
+) -> AuthRef<S>
+where
+    T: DeserializeOwned + Serialize + Selectable + 'static,
+    S: Schema + DeserializeOwned + Serialize + 'static,
+    Step: FnMut(RecurInput<T>, RecurOutput<S>) -> Output,
+    Output: IntoRecurControl<RecurOutput<S>>,
+{
+    run_recur_list_with_finish(source, output, step, finalize_recur_output)
+}
+
+/// Runs the sweep and **leaves** its output draft open, so a later writer can go
+/// on appending to the same value.
+///
+/// The draft stays linear and stays set-once; deferring only moves the single
+/// `finalize` to the end of the chain of writers instead of forcing it at the
+/// first recur. Compiled from `call_recur!(..., finalize = false, args = (..))`.
+#[doc(hidden)]
+pub fn run_recur_list_open<T, S, Step, Output>(
+
+    source: AuthRef<List<T>>,
+    output: Draft<S>,
+    mut step: Step,
+) -> Draft<S>
+where
+    T: DeserializeOwned + Serialize + Selectable + 'static,
+    S: Schema + DeserializeOwned + Serialize + 'static,
+    Step: FnMut(RecurInput<T>, RecurOutput<S>) -> Output,
+    Output: IntoRecurControl<RecurOutput<S>>,
+{
+    run_recur_list_with_finish(source, output, step, |draft, _| draft)
+}
+
+/// Runs the sweep and **closes** its output draft, binding the finalized value.
+/// This is what a `call_recur!` without `finalize = false` compiles to.
+#[doc(hidden)]
+pub fn run_recur_chunked_list<T, S, Step, Output>(
+
+    source: AuthRef<List<T>>,
+    chunk: u64,
+    output: Draft<S>,
+    mut step: Step,
+) -> AuthRef<S>
+where
+    T: DeserializeOwned + Serialize + Selectable + 'static,
+    S: Schema + DeserializeOwned + Serialize + 'static,
+    Step: FnMut(RecurInput<Block<T>>, RecurOutput<S>) -> Output,
+    Output: IntoRecurControl<RecurOutput<S>>,
+{
+    run_recur_chunked_list_with_finish(source, chunk, output, step, finalize_recur_output)
+}
+
+/// Runs the sweep and **leaves** its output draft open, so a later writer can go
+/// on appending to the same value.
+///
+/// The draft stays linear and stays set-once; deferring only moves the single
+/// `finalize` to the end of the chain of writers instead of forcing it at the
+/// first recur. Compiled from `call_recur!(..., finalize = false, args = (..))`.
+#[doc(hidden)]
+pub fn run_recur_chunked_list_open<T, S, Step, Output>(
+
+    source: AuthRef<List<T>>,
+    chunk: u64,
+    output: Draft<S>,
+    mut step: Step,
+) -> Draft<S>
+where
+    T: DeserializeOwned + Serialize + Selectable + 'static,
+    S: Schema + DeserializeOwned + Serialize + 'static,
+    Step: FnMut(RecurInput<Block<T>>, RecurOutput<S>) -> Output,
+    Output: IntoRecurControl<RecurOutput<S>>,
+{
+    run_recur_chunked_list_with_finish(source, chunk, output, step, |draft, _| draft)
+}
+
+/// Runs the sweep and **closes** its output draft, binding the finalized value.
+/// This is what a `call_recur!` without `finalize = false` compiles to.
+#[doc(hidden)]
+pub fn run_recur_chunked_list_with_state<T, State, S, Step, Output>(
+
+    source: AuthRef<List<T>>,
+    chunk: u64,
+    state: RecurState<State>,
+    output: Draft<S>,
+    mut step: Step,
+) -> AuthRef<S>
+where
+    T: DeserializeOwned + Serialize + Selectable + 'static,
+    State: DeserializeOwned + Serialize + 'static,
+    S: Schema + DeserializeOwned + Serialize + 'static,
+    Step: FnMut(RecurInput<Block<T>>, RecurState<State>, RecurOutput<S>) -> Output,
+    Output: IntoRecurControl<(RecurState<State>, RecurOutput<S>)>,
+{
+    run_recur_chunked_list_with_state_with_finish(source, chunk, state, output, step, finalize_recur_output)
+}
+
+/// Runs the sweep and **leaves** its output draft open, so a later writer can go
+/// on appending to the same value.
+///
+/// The draft stays linear and stays set-once; deferring only moves the single
+/// `finalize` to the end of the chain of writers instead of forcing it at the
+/// first recur. Compiled from `call_recur!(..., finalize = false, args = (..))`.
+#[doc(hidden)]
+pub fn run_recur_chunked_list_with_state_open<T, State, S, Step, Output>(
+
+    source: AuthRef<List<T>>,
+    chunk: u64,
+    state: RecurState<State>,
+    output: Draft<S>,
+    mut step: Step,
+) -> Draft<S>
+where
+    T: DeserializeOwned + Serialize + Selectable + 'static,
+    State: DeserializeOwned + Serialize + 'static,
+    S: Schema + DeserializeOwned + Serialize + 'static,
+    Step: FnMut(RecurInput<Block<T>>, RecurState<State>, RecurOutput<S>) -> Output,
+    Output: IntoRecurControl<(RecurState<State>, RecurOutput<S>)>,
+{
+    run_recur_chunked_list_with_state_with_finish(source, chunk, state, output, step, |draft, _| draft)
+}
+
+/// Runs the sweep and **closes** its output draft, binding the finalized value.
+/// This is what a `call_recur!` without `finalize = false` compiles to.
+#[doc(hidden)]
+pub fn run_recur_list_with_state<T, State, S, Step, Output>(
+
+    source: AuthRef<List<T>>,
+    state: RecurState<State>,
+    output: Draft<S>,
+    mut step: Step,
+) -> AuthRef<S>
+where
+    T: DeserializeOwned + Serialize + Selectable + 'static,
+    State: DeserializeOwned + Serialize + 'static,
+    S: Schema + DeserializeOwned + Serialize + 'static,
+    Step: FnMut(RecurInput<T>, RecurState<State>, RecurOutput<S>) -> Output,
+    Output: IntoRecurControl<(RecurState<State>, RecurOutput<S>)>,
+{
+    run_recur_list_with_state_with_finish(source, state, output, step, finalize_recur_output)
+}
+
+/// Runs the sweep and **leaves** its output draft open, so a later writer can go
+/// on appending to the same value.
+///
+/// The draft stays linear and stays set-once; deferring only moves the single
+/// `finalize` to the end of the chain of writers instead of forcing it at the
+/// first recur. Compiled from `call_recur!(..., finalize = false, args = (..))`.
+#[doc(hidden)]
+pub fn run_recur_list_with_state_open<T, State, S, Step, Output>(
+
+    source: AuthRef<List<T>>,
+    state: RecurState<State>,
+    output: Draft<S>,
+    mut step: Step,
+) -> Draft<S>
+where
+    T: DeserializeOwned + Serialize + Selectable + 'static,
+    State: DeserializeOwned + Serialize + 'static,
+    S: Schema + DeserializeOwned + Serialize + 'static,
+    Step: FnMut(RecurInput<T>, RecurState<State>, RecurOutput<S>) -> Output,
+    Output: IntoRecurControl<(RecurState<State>, RecurOutput<S>)>,
+{
+    run_recur_list_with_state_with_finish(source, state, output, step, |draft, _| draft)
+}
+
+/// Runs the sweep and **closes** its output draft, binding the finalized value.
+/// This is what a `call_recur!` without `finalize = false` compiles to.
+#[doc(hidden)]
+pub fn run_recur_sequence_list<T, S, Step, Output>(
+
+    source: AuthRef<List<T>>,
+    output: Draft<S>,
+    mut step: Step,
+) -> AuthRef<S>
+where
+    T: DeserializeOwned + Serialize + Selectable + 'static,
+    S: Schema + DeserializeOwned + Serialize + 'static,
+    Step: FnMut(RecurSequenceInput<T>, RecurSequenceOutput<S>) -> Output,
+    Output: Into<RecurSequenceOutput<S>>,
+{
+    run_recur_sequence_list_with_finish(source, output, step, finalize_recur_output)
+}
+
+/// Runs the sweep and **leaves** its output draft open, so a later writer can go
+/// on appending to the same value.
+///
+/// The draft stays linear and stays set-once; deferring only moves the single
+/// `finalize` to the end of the chain of writers instead of forcing it at the
+/// first recur. Compiled from `call_recur!(..., finalize = false, args = (..))`.
+#[doc(hidden)]
+pub fn run_recur_sequence_list_open<T, S, Step, Output>(
+
+    source: AuthRef<List<T>>,
+    output: Draft<S>,
+    mut step: Step,
+) -> Draft<S>
+where
+    T: DeserializeOwned + Serialize + Selectable + 'static,
+    S: Schema + DeserializeOwned + Serialize + 'static,
+    Step: FnMut(RecurSequenceInput<T>, RecurSequenceOutput<S>) -> Output,
+    Output: Into<RecurSequenceOutput<S>>,
+{
+    run_recur_sequence_list_with_finish(source, output, step, |draft, _| draft)
+}
+
+/// Runs the sweep and **closes** its output draft, binding the finalized value.
+/// This is what a `call_recur!` without `finalize = false` compiles to.
+#[doc(hidden)]
+pub fn run_recur_sequence_list_with_state<T, State, S, Step, Output>(
+
+    source: AuthRef<List<T>>,
+    state: RecurState<State>,
+    output: Draft<S>,
+    mut step: Step,
+) -> AuthRef<S>
+where
+    T: DeserializeOwned + Serialize + Selectable + 'static,
+    State: DeserializeOwned + Serialize + 'static,
+    S: Schema + DeserializeOwned + Serialize + 'static,
+    Step: FnMut(RecurSequenceInput<T>, RecurSequenceState<State>, RecurSequenceOutput<S>) -> Output,
+    Output: Into<(RecurSequenceState<State>, RecurSequenceOutput<S>)>,
+{
+    run_recur_sequence_list_with_state_with_finish(source, state, output, step, finalize_recur_output)
+}
+
+/// Runs the sweep and **leaves** its output draft open, so a later writer can go
+/// on appending to the same value.
+///
+/// The draft stays linear and stays set-once; deferring only moves the single
+/// `finalize` to the end of the chain of writers instead of forcing it at the
+/// first recur. Compiled from `call_recur!(..., finalize = false, args = (..))`.
+#[doc(hidden)]
+pub fn run_recur_sequence_list_with_state_open<T, State, S, Step, Output>(
+
+    source: AuthRef<List<T>>,
+    state: RecurState<State>,
+    output: Draft<S>,
+    mut step: Step,
+) -> Draft<S>
+where
+    T: DeserializeOwned + Serialize + Selectable + 'static,
+    State: DeserializeOwned + Serialize + 'static,
+    S: Schema + DeserializeOwned + Serialize + 'static,
+    Step: FnMut(RecurSequenceInput<T>, RecurSequenceState<State>, RecurSequenceOutput<S>) -> Output,
+    Output: Into<(RecurSequenceState<State>, RecurSequenceOutput<S>)>,
+{
+    run_recur_sequence_list_with_state_with_finish(source, state, output, step, |draft, _| draft)
+}
+
 
 #[cfg(feature = "std")]
 pub fn store_value<T: Serialize>(value: &T) -> raster_core::Result<StorageRef> {

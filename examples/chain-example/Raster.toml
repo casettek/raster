@@ -17,11 +17,25 @@
 name = "chain-example"
 version = "0.1.0"
 
+# Top-level externals, declared once. A stage binds one by name; the resolution
+# is identical to an inline `external = { .. }`, so this is a spelling and not a
+# second kind of input. See `docs/proposals/chain-repeat.md` §1.
+
+[chain.input.measurements]
+path       = "phase1-normalize/measurements.rastered"
+index_path = "phase1-normalize/measurements.rindex"
+commitment = "3c15a8a65529dd56a5862a6687e2c2788e97e79f76cc994df50363fcc79fab6b"
+
+[chain.input.threshold]
+path       = "phase1-normalize/threshold.rastered"
+index_path = "phase1-normalize/threshold.rindex"
+commitment = "3cb30ab8f7660969ea55a33a6b01487de74745b59deba49df5a7602edc98d952"
+
 [[chain.stage]]
 name = "normalize"
 project = "phase1-normalize"
-inputs.readings  = { external = { path = "phase1-normalize/measurements.rastered", index_path = "phase1-normalize/measurements.rindex", commitment = "3c15a8a65529dd56a5862a6687e2c2788e97e79f76cc994df50363fcc79fab6b" } }
-inputs.threshold = { external = { path = "phase1-normalize/threshold.rastered",    index_path = "phase1-normalize/threshold.rindex",    commitment = "3cb30ab8f7660969ea55a33a6b01487de74745b59deba49df5a7602edc98d952" } }
+inputs.readings  = { input = "measurements" }
+inputs.threshold = { input = "threshold" }
 
 [[chain.stage]]
 name = "aggregate"

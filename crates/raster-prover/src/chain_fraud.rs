@@ -25,17 +25,25 @@ pub fn transition_guest_image_id() -> Vec<u8> {
     image_id_bytes(TRANSITION_GUEST_ID)
 }
 
-/// Prove a chain fraud: verify the stage-level evidence receipt in-guest and
-/// bind it to the named chain checkpoint. `evidence_receipt` must be the
-/// receipt whose journal `input.evidence` carries (the stage fraud receipt
-/// for `Execution`, the authorization receipt for `Link`).
+/// Prove a chain fraud: verify the stage-level evidence in-guest and bind it to
+/// the named chain checkpoint.
+///
+/// `evidence_receipt` is the receipt whose journal `input.evidence` carries —
+/// the authorization receipt for `Link`. It is `None` for `Shape`, which
+/// verifies no inner receipt at all: everything that fault compares is read out
+/// of the `ChainCommitment` bytes the guest hashes for itself, so there is no
+/// assumption to discharge. One entry point rather than two, so the two cannot
+/// drift on the thing that must not drift — what the guest reads.
 pub fn prove_chain_fraud(
     input: &ChainFraudInput,
-    evidence_receipt: risc0_zkvm::Receipt,
+    evidence_receipt: Option<risc0_zkvm::Receipt>,
 ) -> risc0_zkvm::Receipt {
     let prover = risc0_zkvm::default_prover();
-    let env = risc0_zkvm::ExecutorEnv::builder()
-        .add_assumption(evidence_receipt)
+    let mut builder = risc0_zkvm::ExecutorEnv::builder();
+    if let Some(receipt) = evidence_receipt {
+        builder.add_assumption(receipt);
+    }
+    let env = builder
         .write(input)
         .expect("chain fraud input is serializable")
         .build()
@@ -65,6 +73,20 @@ pub fn verify_chain_fraud_receipt(receipt: &risc0_zkvm::Receipt) -> Result<Chain
             if journal.authorization_image_id != authorization_guest_image_id() {
                 return Err(BitPackerError::InvalidCommitment(
                     "chain-fraud receipt verified an unknown authorization guest".to_string(),
+                ));
+            }
+        }
+        // A positive assertion, not a fallthrough. A `Shape` receipt verified
+        // nothing, so a populated image id would be a claim about a recursion
+        // that never happened — and a relying party that pins ids would read it
+        // as meaningful. The absence has to be checked to mean anything.
+        ChainFaultKind::Shape => {
+            if !journal.authorization_image_id.is_empty() || !journal.transition_image_id.is_empty()
+            {
+                return Err(BitPackerError::InvalidCommitment(
+                    "chain-fraud receipt claims a shape fault but names an inner guest; a shape \
+                     fault verifies no receipt"
+                        .to_string(),
                 ));
             }
         }

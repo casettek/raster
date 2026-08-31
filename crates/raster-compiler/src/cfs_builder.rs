@@ -266,6 +266,7 @@ mod tests {
                 }],
                 call_kind: CallKind::Tile,
                 chunk: None,
+                leaves_output_open: false,
             }],
         );
         let sequence = Sequence {
@@ -376,6 +377,7 @@ mod tests {
                 argument_kinds: vec![CallArgumentKind::Inline],
                 call_kind: CallKind::Tile,
                 chunk: None,
+                leaves_output_open: false,
             }],
         );
         let sequence = Sequence {

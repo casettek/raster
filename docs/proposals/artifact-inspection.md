@@ -1,6 +1,8 @@
 # Proposal: `artifact-inspection` — `cargo raster show`, reading a raster artifact back
 
-Status: proposed (2026-08-21)
+Status: proposed (2026-08-21) — **rev 2** (2026-08-31): adds §6 `--show-output` on `run` /
+`chain run`, resolving open question 3; adds §4.1 stating that the text format is `Debug`-shaped
+but cannot name a struct, because `RasterNodeKind::Struct` records field names and no type name.
 Companion to: [`program-end.md`](./program-end.md) (implemented) — defines the output artifact
 this reads; [`chain-stage-execution.md`](./chain-stage-execution.md) (partly implemented) — the
 per-stage dev loop that makes the absence acute.
@@ -269,9 +271,10 @@ Steps 1–2 are the proposal; 3–5 are surface.
 - **Does `--select` belong in v1?** It is the difference between "read a file" and "query a file",
   and the machinery exists. But every selector-path surface is one more place the path grammar can
   drift from `select!`'s.
-- **Should `run` and `chain run` print the output value by default once this exists?** Cheap for a
-  small output, wrong for a large one, and it needs the same truncation policy — but the reason
-  `raster::println!` is currently the only way to see a result is that nothing prints it.
+- ~~**Should `run` and `chain run` print the output value by default once this exists?**~~
+  **Resolved 2026-08-31 → §6**: opt-in `--show-output`, off by default, final stage only for a
+  chain. The residue is narrower — whether `--show-output=all` is worth defining for a chain, and
+  whether a chain long enough to want it is better served by `chain show` in a loop.
 
 ## Out of scope
 

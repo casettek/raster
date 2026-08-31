@@ -1,0 +1,14 @@
+{
+  "format": 1,
+  "program_commitment": "824d6bf5e73f82f2a7b23fd6a5825a203cf6d4591166aeed10d4c2f13f5fd5b5",
+  "tiles": {
+    "plan_steps": {
+      "image_id": "9bd7fa127e03dd46641d3d964aea5e090e46676317a5d207b7dfef4ce0e32342",
+      "source_hash": "0ab58f5a69710ff90000000000000374"
+    }
+  },
+  "toolchain": {
+    "risc0": "risc0-zkvm-1.2",
+    "build_mode": "local"
+  }
+}

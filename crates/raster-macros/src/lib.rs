@@ -1732,6 +1732,10 @@ struct RecurCallInput {
     chunk: Option<Expr>,
     state: Option<Expr>,
     output: Option<Expr>,
+    /// `finalize = false` leaves the output draft open for a later writer.
+    /// Absent means `true` — closing is the default, and the only behaviour
+    /// that existed before this flag.
+    finalize: Option<Expr>,
     args: syn::punctuated::Punctuated<Expr, Token![,]>,
 }
 
@@ -1785,6 +1789,14 @@ impl Parse for RecurCallInput {
         let chunk = parse_optional_named_expr(input, "chunk")?;
         let state = parse_optional_named_expr(input, "state")?;
         let output = parse_optional_named_expr(input, "output")?;
+        let finalize = parse_optional_named_expr(input, "finalize")?;
+
+        if finalize.is_some() && output.is_none() {
+            return Err(syn::Error::new(
+                input.span(),
+                "call_recur! `finalize = ...` only applies to a recur with `output = ...`; a state-only recur has no draft to leave open",
+            ));
+        }
 
         if state.is_none() && output.is_none() {
             return Err(syn::Error::new(
@@ -1805,6 +1817,7 @@ impl Parse for RecurCallInput {
             chunk,
             state,
             output,
+            finalize,
             args,
         })
     }
@@ -1894,7 +1907,23 @@ fn rewrite_call_recur_macro(expr_macro: &syn::ExprMacro) -> Expr {
             "call_recur! expects `tile = ...`, `input = ...`, optional `state = ...`, optional `output = ...`, and `args = (...)`"
         )
     });
-    let hidden = format_ident!("__raster_recur_auth_{}", input.tile);
+    // `finalize = false` routes to the sibling entry point that hands the draft
+    // back instead of closing it. The flag must be a bool literal: whether a
+    // recur closed its draft is a fact about the program's shape, so it belongs
+    // in the CFS rather than being decided at run time.
+    let leaves_draft_open = match input.finalize.as_ref() {
+        None => false,
+        Some(Expr::Lit(lit)) => match &lit.lit {
+            syn::Lit::Bool(b) => !b.value(),
+            _ => panic!("call_recur! `finalize = ...` must be `true` or `false`"),
+        },
+        Some(_) => panic!("call_recur! `finalize = ...` must be a bool literal so it can be pinned in the CFS"),
+    };
+    let hidden = if leaves_draft_open {
+        format_ident!("__raster_recur_auth_open_{}", input.tile)
+    } else {
+        format_ident!("__raster_recur_auth_{}", input.tile)
+    };
     for argument in input
         .args
         .iter()

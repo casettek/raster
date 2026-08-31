@@ -1304,6 +1304,7 @@ mod tests {
                         id: "recur".to_string(),
                         sources: vec![],
                         chunk: None,
+                        leaves_output_open: false,
                     }),
                     SequenceChildItem::Tile(TileItem {
                         id: "after".to_string(),

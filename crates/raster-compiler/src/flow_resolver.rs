@@ -119,6 +119,7 @@ impl FlowResolver {
                     id: call.callee.clone(),
                     sources: input_sources,
                     chunk: call.chunk,
+                    leaves_output_open: call.leaves_output_open,
                 }),
                 CallKind::RecursiveSequence => {
                     SequenceChildItem::RecurSequence(RecurSequenceItem {
@@ -373,6 +374,7 @@ mod tests {
                     }],
                     call_kind: CallKind::Tile,
                     chunk: None,
+                    leaves_output_open: false,
                 },
                 CallInfo {
                     callee: "exclaim".to_string(),
@@ -383,6 +385,7 @@ mod tests {
                     }],
                     call_kind: CallKind::Tile,
                     chunk: None,
+                    leaves_output_open: false,
                 },
             ],
         );
@@ -458,6 +461,7 @@ mod tests {
                 argument_kinds: vec![CallArgumentKind::Inline],
                 call_kind: CallKind::Tile,
                 chunk: None,
+                leaves_output_open: false,
             }],
         );
 
@@ -521,6 +525,7 @@ mod tests {
                     }],
                     call_kind: CallKind::Tile,
                     chunk: None,
+                    leaves_output_open: false,
                 },
                 CallInfo {
                     callee: "exclaim".to_string(),
@@ -531,6 +536,7 @@ mod tests {
                     }],
                     call_kind: CallKind::Tile,
                     chunk: None,
+                    leaves_output_open: false,
                 },
             ],
         );
@@ -607,6 +613,7 @@ mod tests {
                 }],
                 call_kind: CallKind::Tile,
                 chunk: None,
+                leaves_output_open: false,
             }],
             vec![("name".to_string(), "personal_data".to_string())],
         );
@@ -660,6 +667,7 @@ mod tests {
                 }],
                 call_kind: CallKind::Tile,
                 chunk: None,
+                leaves_output_open: false,
             }],
             vec![("seed".to_string(), "seed".to_string())],
         );
@@ -707,6 +715,7 @@ mod tests {
                 argument_kinds: vec![CallArgumentKind::Inline],
                 call_kind: CallKind::Tile,
                 chunk: None,
+                leaves_output_open: false,
             }],
         );
         let sequence = Sequence {
@@ -765,6 +774,7 @@ mod tests {
                 }],
                 call_kind: CallKind::Tile,
                 chunk: None,
+                leaves_output_open: false,
             }],
             vec![
                 ("row".to_string(), "table".to_string()),
@@ -833,6 +843,7 @@ mod tests {
                 }],
                 call_kind: CallKind::Tile,
                 chunk: None,
+                leaves_output_open: false,
             }],
             vec![("row".to_string(), "table".to_string())],
         );
