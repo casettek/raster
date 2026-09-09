@@ -279,6 +279,24 @@ pub struct TraceRecorder {
     /// sees; every field here is derived from the CFS, the trace event, or the
     /// authenticated source metadata.
     recur_progress: RecurProgressStack,
+    /// The stack as it stood *after* each recorded step, retained so a
+    /// fraud-proof window opening mid-loop can be seeded from the trace
+    /// prefix instead of from the empty stack. Written at the same tail that
+    /// stamps `recur_progress_commitment`, so the two cannot disagree.
+    ///
+    /// Keyed by `exec_index`, **not** by coordinates: a recur site's `Start`
+    /// and `End` share the bare site coordinate (a site coordinate is a
+    /// *scope* — `recur-progress-commitment.md` §3.2.1), and those two steps
+    /// hold opposite stacks. Keying by coordinate lets the close overwrite the
+    /// open, which is the one case a seed most needs to distinguish.
+    ///
+    /// Retained rather than re-derived: `last_control` is not recoverable
+    /// from a step's coordinates, which is the same field that forced a trace
+    /// bit in `recur-progress-commitment.md` §3.1. See
+    /// `window-seed-reconstruction.md` §2 — a second implementation of these
+    /// rules would fail as a commitment mismatch, indistinguishable from the
+    /// bug it exists to fix.
+    recur_progress_store: HashMap<u64, RecurProgressStack>,
 }
 
 impl TraceRecorder {
@@ -292,6 +310,7 @@ impl TraceRecorder {
             witness_store: StepWitnessStore::new(),
             storage: StorageManager::new(),
             recur_progress: RecurProgressStack::new(),
+            recur_progress_store: HashMap::new(),
         }
     }
 
@@ -330,6 +349,17 @@ impl TraceRecorder {
 
     pub fn step_witness_at(&self, coordinates: &CfsCoordinates) -> Option<StepWitnessData> {
         self.witness_store.get(coordinates).cloned()
+    }
+
+    /// The recur-progress stack as it stood **after** the step with this
+    /// `exec_index` — the state the *next* step's guest must start from.
+    ///
+    /// `None` for a step this recorder never recorded. The empty stack is a
+    /// *value*, not an absence: a step outside any loop returns
+    /// `Some(RecurProgressStack::new())`, which is the positive claim "no loop
+    /// in flight" that the guest checks like any other.
+    pub fn recur_progress_after(&self, exec_index: u64) -> Option<RecurProgressStack> {
+        self.recur_progress_store.get(&exec_index).cloned()
     }
 
     pub fn storage_snapshot(&self) -> StorageSnapshot {
@@ -1190,6 +1220,8 @@ impl TraceRecorder {
         // than by matching a predecessor record the window does not contain.
         let mut step_record = step_record;
         step_record.recur_progress_commitment = self.recur_progress.commitment();
+        self.recur_progress_store
+            .insert(step_record.exec_index, self.recur_progress.clone());
         step_record
     }
 
@@ -1562,6 +1594,100 @@ mod tests {
         // Closing pops the frame, so the stack is empty again — "no loop in
         // flight" as a positive statement, not an absent field.
         assert_eq!(site_end.recur_progress_commitment, empty, "site close");
+    }
+
+    /// Every step's retained stack hashes to that step's own stamped
+    /// commitment.
+    ///
+    /// This is the seed's correctness asserted *at its source*. A fraud-proof
+    /// window seeded from `recur_progress_after` is validated by the guest
+    /// advancing it and comparing against the recorded commitment, so a
+    /// divergence here is precisely a wrong seed — and would otherwise surface
+    /// only as a proof that fails for unclear reasons.
+    /// See `window-seed-reconstruction.md` §Verification.
+    #[test]
+    fn recur_progress_after_agrees_with_every_stamped_commitment() {
+        let mut recorder = recorder_with_recur_site();
+        start_main(&mut recorder);
+
+        let start = seed_recur_source(&mut recorder, "recur", 2);
+        let steps = vec![
+            recorder.record(TraceEvent::RecurTileStart(start)),
+            recorder.record(TraceEvent::RecurTileIterationExec(call("recur"))),
+            recorder.record(TraceEvent::RecurTileIterationExec(call("recur"))),
+            recorder.record(TraceEvent::RecurTileEnd(call("recur"))),
+        ];
+
+        for step in &steps {
+            let retained = recorder
+                .recur_progress_after(step.exec_index)
+                .unwrap_or_else(|| panic!("no retained stack for exec_index {}", step.exec_index));
+            assert_eq!(
+                retained.commitment(),
+                step.recur_progress_commitment,
+                "retained stack disagrees with the stamped commitment at {:?}",
+                step.coordinates(),
+            );
+        }
+    }
+
+    /// The same agreement across a recur *sequence* site, including a plain
+    /// tile executing inside an iteration — the shape a window is most likely
+    /// to open on, since the loop is live but the step itself is ordinary.
+    #[test]
+    fn recur_progress_after_agrees_across_a_recur_sequence_site() {
+        let mut recorder = recorder_with_recur_sequence_site();
+        recorder.record(TraceEvent::SequenceStart(call("main")));
+
+        let start = seed_recur_source(&mut recorder, "child", 2);
+        let mut steps = vec![recorder.record(TraceEvent::RecurSequenceStart(start))];
+        for _ in 0..2 {
+            steps.push(recorder.record(TraceEvent::RecurSequenceIterationStart(call("child"))));
+            steps.push(recorder.record(TraceEvent::TileExec(call("inner"))));
+            steps.push(recorder.record(TraceEvent::RecurSequenceIterationEnd(call("child"))));
+        }
+        steps.push(recorder.record(TraceEvent::RecurSequenceEnd(call("child"))));
+
+        for step in &steps {
+            let retained = recorder
+                .recur_progress_after(step.exec_index)
+                .unwrap_or_else(|| panic!("no retained stack for exec_index {}", step.exec_index));
+            assert_eq!(
+                retained.commitment(),
+                step.recur_progress_commitment,
+                "retained stack disagrees with the stamped commitment at {:?}",
+                step.coordinates(),
+            );
+        }
+    }
+
+    /// The seed a mid-loop window would open with is a *live* stack, not the
+    /// empty one — the whole point of retaining it.
+    ///
+    /// Reading the stack after iteration 0 is exactly what
+    /// `prove()` does for a window whose first step is iteration 1.
+    #[test]
+    fn recur_progress_after_a_live_iteration_is_not_the_empty_stack() {
+        let mut recorder = recorder_with_recur_site();
+        start_main(&mut recorder);
+
+        let start = seed_recur_source(&mut recorder, "recur", 2);
+        recorder.record(TraceEvent::RecurTileStart(start));
+        let iter0 = recorder.record(TraceEvent::RecurTileIterationExec(call("recur")));
+        let site_end_before_close = recorder.record(TraceEvent::RecurTileIterationExec(call("recur")));
+
+        let seed = recorder
+            .recur_progress_after(iter0.exec_index)
+            .expect("iteration 0 retained a stack");
+        assert!(!seed.is_empty(), "a window opening after iteration 0 is mid-loop");
+        assert_eq!(seed.depth(), 1);
+
+        // And the last iteration is still inside the site: only the site's
+        // `End` pops the frame.
+        let seed = recorder
+            .recur_progress_after(site_end_before_close.exec_index)
+            .expect("iteration 1 retained a stack");
+        assert!(!seed.is_empty());
     }
 
     /// A sweep that stops short of `L` is rejected at `close_site` by rule 5.

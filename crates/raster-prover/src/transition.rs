@@ -158,6 +158,13 @@ fn storage_root(frontier: &SerializableFrontier) -> Vec<u8> {
 ///   `TraceCommitmentExt::header` / `fingerprint_slice_witness`). Written to
 ///   the guest only at the window-opening `Init` step, which verifies the
 ///   slice and carries `refuted_trace_commitment` through the journal chain.
+/// * `window_start_recur_progress` - The recur-progress stack the window opens
+///   with, reconstructed from the trace prefix by the caller (see
+///   `TraceRecorder::recur_progress_after`). Required whenever the window's
+///   first step sits inside a live recur site; `None` means the canonical
+///   empty stack, which is itself a claim the guest checks. Read only at the
+///   `Init` step — later steps inherit it through `Transition`. See
+///   `window-seed-reconstruction.md`.
 ///
 /// # Returns
 /// A `TransitionReplayResult` with details about success or failure
@@ -179,6 +186,7 @@ pub fn step_transitions(
     authorization_journal: &AuthorizationJournal,
     authorization_receipt: &risc0_zkvm::Receipt,
     entrypoint_membership_witness: Option<&StorageReadWitness>,
+    window_start_recur_progress: Option<RecurProgressStack>,
 ) -> Option<risc0_zkvm::Receipt> {
     let prover = risc0_zkvm::default_prover();
 
@@ -212,17 +220,18 @@ pub fn step_transitions(
                 .is_none()
                 .then_some(entrypoint_membership_witness)
                 .flatten(),
-            // A window that opens *inside* a live loop needs its recur-progress
-            // seed reconstructed from the trace prefix, the way
-            // `storage_state_from_prefix` reconstructs the store. That is not
-            // built yet, so no seed is supplied.
+            // Only the window's first step reads the seed; every later step
+            // inherits the preimage through `Transition`. Same guard, and the
+            // same reason, as `entrypoint_membership_witness` above.
             //
-            // This fails **closed**, not open: the guest advances the empty
-            // stack by the step's own facts and compares against the recorded
-            // commitment, so a genuinely mid-loop window mismatches and is
-            // rejected. A window opening outside any loop — the common case —
-            // starts from the empty stack and verifies normally.
-            None,
+            // The seed is never believed: the guest advances it by the step's
+            // own facts and compares against the recorded
+            // `recur_progress_commitment`, so a wrong one is rejected exactly
+            // as an absent one is today.
+            current_journal
+                .is_none()
+                .then(|| window_start_recur_progress.clone())
+                .flatten(),
         );
         let replay_receipt_assumption: Option<risc0_zkvm::Receipt> =
             if step_record.requires_replay_proof() {

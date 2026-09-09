@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 use bridgetree::NonEmptyFrontier;
 use risc0_zkvm::guest::env;
 
-use raster_core::cfs::{CfsCoordinates, CfsCursor};
+use raster_core::cfs::{CfsCoordinates, CfsCursor, SequenceChildItem};
 use raster_core::draft::{DraftId, TrackedDraftState};
 use raster_core::fingerprint::{Fingerprint, FingerprintAccumulator};
 use raster_core::program::{commitment_of_bytes, ImageId, ProgramDefinition};
@@ -115,6 +115,58 @@ pub struct FraudProofWindowContext {
     pub window_is_terminal: bool,
 }
 
+/// Refuse a window that opens inside a live recur site with no seed, naming
+/// the cause.
+///
+/// **Diagnostics only, no soundness weight.** The advance-and-compare in
+/// [`checks::cfs::advance_recur_progress`] remains the sole authority on
+/// whether a seed is correct — a wrong seed advances to a different stack and
+/// fails there, seeded or not.
+///
+/// What this buys is the error message. Without it, a missing seed surfaces as
+/// a recur-progress commitment mismatch, which reads like a soundness
+/// violation in the trace and points a reader at the guest rather than at the
+/// host that failed to reconstruct the seed. That misreading is exactly what
+/// let an unfilled parameter ship for weeks as a de-facto "refuse to open
+/// mid-loop" rule — the design `recur-progress-commitment.md` §Problem had
+/// explicitly rejected. See `window-seed-reconstruction.md` §Uncertainty 3.
+///
+/// Best-effort by construction: it fires on a step whose coordinates sit under
+/// a recur site, and stays silent where the CFS cannot resolve them.
+fn assert_seed_present_for_mid_loop_open(
+    cfs_cursor: &CfsCursor,
+    step_record: &StepRecord,
+    seed: Option<&RecurProgressStack>,
+) {
+    if let Some(seed) = seed {
+        if !seed.is_empty() {
+            return;
+        }
+    }
+
+    let coordinates = step_record.coordinates();
+    // A *strict* prefix naming a recur site means this step executes inside
+    // one. The full coordinate is excluded on purpose: a window opening on the
+    // site's own `Start` opens before the frame is pushed, so the empty stack
+    // is the true state there.
+    let opens_inside_recur_site = (1..coordinates.len()).any(|depth| {
+        matches!(
+            cfs_cursor.try_get_item(&CfsCoordinates(coordinates[..depth].to_vec())),
+            Some(SequenceChildItem::RecurTile(_)) | Some(SequenceChildItem::RecurSequence(_))
+        )
+    });
+
+    assert!(
+        !opens_inside_recur_site,
+        "Window opens at {:?}, which executes inside a live recur site, but no \
+         recur-progress seed was supplied. The host must reconstruct it from the \
+         trace prefix (`TraceRecorder::recur_progress_after`); an empty stack here \
+         is the positive claim \"no loop in flight\", which these coordinates \
+         contradict.",
+        coordinates
+    );
+}
+
 impl FraudProofWindowContext {
     /// Attach the step to the fraud proof window context.
     ///
@@ -170,6 +222,11 @@ impl FraudProofWindowContext {
                     output_authorization,
                 )
                 .seed_recur_progress(input.window_start_recur_progress.as_ref());
+                assert_seed_present_for_mid_loop_open(
+                    &params.cfs_cursor,
+                    &input.step_record,
+                    input.window_start_recur_progress.as_ref(),
+                );
                 (
                     Self {
                         init_state: init_transition,

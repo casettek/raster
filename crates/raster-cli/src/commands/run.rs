@@ -814,6 +814,19 @@ pub fn prove(
         storage_state_from_prefix(&trace[..window_start_index], trace_recorder);
     let initial_storage_state = current_storage_state.clone();
 
+    // The recur-progress stack the window opens with, taken from the last step
+    // *before* it. A window opening at index 0 has no predecessor and starts
+    // from the canonical empty stack, which `step_transitions` reads as `None`.
+    //
+    // Reconstructed here, on the same prefix the store is rebuilt from, and
+    // read off the recorder rather than re-derived: a second implementation of
+    // the advance rules would fail as a commitment mismatch, indistinguishable
+    // from the missing-seed bug this replaces. See
+    // `window-seed-reconstruction.md` §2.
+    let window_start_recur_progress = window_start_index
+        .checked_sub(1)
+        .and_then(|previous| trace_recorder.recur_progress_after(trace[previous].exec_index));
+
     for step_record in &fraud_window.items {
         let step_witness = trace_recorder
             .step_witness_at(step_record.coordinates())
@@ -1038,6 +1051,7 @@ pub fn prove(
             &authorization_journal,
             &authorization_receipt,
             entrypoint_membership_witness.as_ref(),
+            window_start_recur_progress,
         ) else {
             panic!("Failed to generate fraud proof");
         };

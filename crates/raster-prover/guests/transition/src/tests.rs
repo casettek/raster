@@ -19,7 +19,7 @@ use raster_core::draft::{
 use raster_core::input::{
     AppendFrontier, SchemaField, SchemaFieldMode, SchemaNode, Selectable,
 };
-use raster_core::recur_progress::RecurProgressStack;
+use raster_core::recur_progress::{RecurProgressStack, RecurSiteKind};
 use raster_core::trace::{
     ExecStep, ExecTarget, FnInput, FnInputArg, FnInputValue, StepKind, StepRecord, StorageData,
     StorageRoots,
@@ -305,6 +305,145 @@ fn recur_journal(
             control,
         }),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Window seeding — `window-seed-reconstruction.md`
+//
+// A window's first step has no previous journal, so its carried recur progress
+// arrives as a host-supplied seed. These tests pin the property that makes that
+// acceptable: the seed is never believed. It is advanced by the step's own
+// facts and held to the step's recorded commitment, so a wrong seed fails
+// exactly as an absent one does.
+// ---------------------------------------------------------------------------
+
+/// The stack as it stands after iteration `through` of a 3-iteration chunked
+/// sweep over 6 elements — what the host reconstructs from the trace prefix.
+fn seeded_stack(through: u64) -> RecurProgressStack {
+    let mut stack = RecurProgressStack::new();
+    stack.push_site(CfsCoordinates(vec![0]), RecurSiteKind::Tile, 2, 6);
+    for iteration in 0..=through {
+        stack
+            .advance_tile_iteration(
+                &CfsCoordinates(vec![0, iteration as u32]),
+                iteration,
+                3,
+                2,
+                RecurControlKind::Continue,
+            )
+            .expect("honest prefix advances cleanly");
+    }
+    stack
+}
+
+/// Advance `seed` by iteration `iteration`, holding it to `recorded`.
+fn advance_seeded(seed: &mut RecurProgressStack, iteration: u32, recorded: [u8; 32]) {
+    let cfs_cursor = chunked_recur_cfs(Some(2));
+    let journal = recur_journal(u64::from(iteration), 3, 2, RecurControlKind::Continue);
+    let mut step = recur_iteration_step(iteration);
+    step.recur_progress_commitment = recorded;
+    crate::checks::cfs::advance_recur_progress(
+        &cfs_cursor,
+        seed,
+        &step,
+        Some(&journal),
+        None,
+        &BTreeMap::new(),
+    );
+}
+
+/// The case the change exists for: a window opening at iteration 1 of a live
+/// sweep verifies, seeded from the prefix, at unchanged window size.
+#[test]
+fn a_seeded_mid_loop_window_verifies() {
+    let mut seed = seeded_stack(0);
+    // What the recorder stamped on the step this window opens with.
+    let recorded = {
+        let mut expected = seeded_stack(0);
+        expected
+            .advance_tile_iteration(
+                &CfsCoordinates(vec![0, 1]),
+                1,
+                3,
+                2,
+                RecurControlKind::Continue,
+            )
+            .expect("honest advance");
+        expected.commitment()
+    };
+
+    advance_seeded(&mut seed, 1, recorded);
+}
+
+/// The failure this replaces: with no seed the empty stack is advanced, which
+/// is the claim "no loop in flight" — and iteration 1 contradicts it.
+#[test]
+#[should_panic(expected = "recur iteration has no active recur site")]
+fn an_unseeded_mid_loop_window_is_rejected() {
+    let mut empty = RecurProgressStack::new();
+    advance_seeded(&mut empty, 1, RecurProgressStack::new().commitment());
+}
+
+/// Reconstruction does not weaken the check: a seed claiming a different
+/// position advances to a different stack and fails the comparison.
+#[test]
+#[should_panic(expected = "Recur progress commitment does not match")]
+fn a_forged_seed_is_rejected() {
+    // The honest record for a window opening after iteration 0...
+    let recorded = {
+        let mut expected = seeded_stack(0);
+        expected
+            .advance_tile_iteration(
+                &CfsCoordinates(vec![0, 1]),
+                1,
+                3,
+                2,
+                RecurControlKind::Continue,
+            )
+            .expect("honest advance");
+        expected.commitment()
+    };
+
+    // ...against a seed claiming iteration 1 already happened. It advances to
+    // a different stack, so the recorded commitment does not reproduce.
+    let mut forged = seeded_stack(1);
+    let cfs_cursor = chunked_recur_cfs(Some(2));
+    let journal = recur_journal(2, 3, 2, RecurControlKind::Continue);
+    let mut step = recur_iteration_step(2);
+    step.recur_progress_commitment = recorded;
+    crate::checks::cfs::advance_recur_progress(
+        &cfs_cursor,
+        &mut forged,
+        &step,
+        Some(&journal),
+        None,
+        &BTreeMap::new(),
+    );
+}
+
+/// Nesting: a seed must carry **both** frames. A `call_recur!` inside a
+/// recur-sequence iteration is stack depth 2, and depth is exactly what a seed
+/// carries — a seed naming only the inner frame commits to something else.
+#[test]
+fn a_nested_seed_carries_both_frames() {
+    let mut both = RecurProgressStack::new();
+    both.push_site(CfsCoordinates(vec![0]), RecurSiteKind::Sequence, 1, 2);
+    both.advance_sequence_iteration(&CfsCoordinates(vec![0, 0]), 0)
+        .expect("outer iteration 0");
+    both.push_site(CfsCoordinates(vec![0, 0, 0]), RecurSiteKind::Tile, 2, 6);
+    assert_eq!(both.depth(), 2);
+
+    let mut inner_only = RecurProgressStack::new();
+    inner_only.push_site(CfsCoordinates(vec![0, 0, 0]), RecurSiteKind::Tile, 2, 6);
+    assert_eq!(inner_only.depth(), 1);
+
+    // Both stacks agree on the innermost frame and still commit differently,
+    // so a window seeded with only the inner frame is rejected.
+    assert_eq!(
+        both.innermost().map(|frame| frame.site.clone()),
+        inner_only.innermost().map(|frame| frame.site.clone()),
+    );
+    assert_ne!(both.commitment(), inner_only.commitment());
 }
 
 #[test]

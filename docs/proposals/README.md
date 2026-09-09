@@ -1,6 +1,6 @@
 # Proposals — status and dependencies
 
-Index of `docs/proposals/`. Last reviewed 2026-08-16.
+Index of `docs/proposals/`. Last reviewed 2026-09-09.
 
 Each proposal's own `Status:` line is the source of truth; this file collects them and records
 where that line disagrees with the code or the git history. Where they disagree, the
@@ -28,10 +28,11 @@ document, and correcting it is the author's call.
 | [`recur-progress-commitment`](./recur-progress-commitment.md) | **rev 2 implemented** (2026-08-14) | `recur_progress.rs`, the trace `recur_control` bit, site `Start`/`End` events, recorder stamping, guest advance-and-compare — recorder and guest agree on every commitment | mid-loop window seeds, split out as `window-seed-reconstruction` |
 | [`paged-bytes`](./paged-bytes.md) | **rev 3 implemented** (2026-08-14) | `Bytes<P>` / `BytesPage`, tag `0x0B`, `rindex03` hard-break, `InterfaceDecl.schema_hash`, geometry audit, `select!` byte→page conversion, ranged `Read` | Gate 2/3 still open (`ListRange` cross-check, selection↔replay bind); no `pages!` sugar |
 | [`recur-sequence-break`](./recur-sequence-break.md) | proposed 2026-08-13 | — | whole; blocked on `recur-progress-commitment` rev 2. Weakens `lazy-list-recur` S4 to a prefix/terminal split |
-| [`window-seed-reconstruction`](./window-seed-reconstruction.md) | proposed 2026-08-14 | — | whole; small. Without it a fraud-proof window opening mid-loop is rejected — the design `recur-progress-commitment` explicitly refused, reinstated by an unfilled parameter |
+| [`window-seed-reconstruction`](./window-seed-reconstruction.md) | **implemented** (2026-09-09) | the recorder retains its stack per step (`recur_progress_after`); `prove()` reconstructs the seed on the prefix walk it already makes for storage; `step_transitions` threads it under the existing first-step guard. Plus Uncertainty 3's diagnostic, which names a mid-loop open instead of letting it read as a commitment mismatch. Three corrections to the proposal, recorded in its §Implementation record — notably the accessor **cannot** be keyed by `CfsCoordinates` (a site's `Start` and `End` share the bare site coordinate and hold opposite stacks), so it is keyed by `exec_index` | — |
 | [`carried-state-channel`](./carried-state-channel.md) | proposed 2026-08-07 — **enhancement** | — | deliberately deferred until a second component is ready |
 | [`trace-event-vocabulary`](./trace-event-vocabulary.md) | **implemented** (2026-08-13) | `RecurSequenceIterationStart`/`End`; the naming rule and vocabulary table on `TraceEvent` | — |
 | [`chain-repeat`](./chain-repeat.md) | **implemented** (2026-08-27) | `[[chain.repeat]]` with an authorized trip count (literal or stage-produced); `[chain.input]` named + indexed externals; `ChainShape` in the chain commitment; `ChainFaultKind::Shape` **added beside `Link`** (not a restoration of the removed `Execution`). `raster-inference`'s 35 `prefill_prepare_aux` stages are now one block, expanding to the identical 74 stages. Chain-commitment format break — `spec_digest` moves every recorded digest, and **closes S1** (`chain_spec_commitment`), still recorded as open in `chain-fraud-proof` and `chain-io-commitment` | external (`{ input = ... }`) counts; `while` mode; collapsing `prefill_range`, which needs the §7 donor rewrite plus a two-block split |
+| [`recur-deferred-finalize`](./recur-deferred-finalize.md) | **implemented** (2026-08-28) | opt-in `finalize = false` on `call_recur!`, so a draft can take a second writer; six drivers gain a `*_with_finish` form and a `*_open` wrapper; a hidden `__raster_recur_auth_open_<tile>` entry point. Default unchanged — omitting the flag closes the draft as before. Attestation does not move: draft witnesses already attach to `TileExec` steps, one iteration at a time | two open questions in §Open questions — whether the CFS should mark an open recur explicitly rather than implicitly by entry point, and whether `RecurTileEnd` should record the draft's post-root instead of `output: None` |
 | [`unauthenticated-execution`](./unauthenticated-execution.md) | **implemented** — v1 2026-08-19, v2 2026-08-20, v3 2026-08-20 | runtime `AuthMode` (`raster-runtime/src/auth.rs`); `select!` dispatched on base provenance, so storage sources stay lazy; drafts keep field values and drop commitments; recur full; `cargo raster run --no-auth`; no trace emitted, so a trace commitment is structurally impossible; profiling refused; RAS-203a landed. v3: `cargo raster chain run --no-auth` — all-or-nothing, no chain-commitment, own runs root; plus a storage-backed base indexed by a tile-produced value, which §5.3/§5.4 left uncovered and which stage 1 of `raster-chain-inference` hit immediately. **6.6× on `hello-tiles`**, both modes value-identical end to end | typed `Schema::Partial` to remove the remaining serialize per draft op — deferred, needs a measurement on a draft-heavy program. Mixed-posture chain policy (on-demand per-stage commitment) still out of scope — §10; the cheap-stage half of §10 is now [`chain-stage-execution`](./chain-stage-execution.md) |
 | [`chain-stage-execution`](./chain-stage-execution.md) | **partly implemented** (2026-08-21) | §2–§4: `cargo raster chain run --no-auth --stage <name> [--run <dir>]` — one stage re-run in place, producer commitments rehydrated from `output.bin` via the existing `collect_output`, downstream stage dirs invalidated in spec order, `latest` pointer, spec-validity (`from` ordering) check moved ahead of execution. Authenticated path untouched. Verified end-to-end on a three-stage chain (`tests/chain_stage_cli.rs`, 7 tests — middle-stage re-run, multi-stage invalidation, stage-by-stage rebuild converging on the whole-chain result), for which it also supplies `examples/chain-example`, the chain fixture `program-chain` implementation order step 5 called for and never got | §1 — promoting the mode from `--no-auth` to a command, and the `chains-dry/` rename. **Blocked on naming**: `dry-run` reverses `unauthenticated-execution` §Naming *and* takes the term `zkvm-dry-run` §3 reserves; `unauth` costs one line and no collision. Untested: posture isolation. ⚠️ **§5's "authenticated path untouched" no longer holds** — [`chain-io-commitment`](./chain-io-commitment.md) lifted the `requires = "no_auth"` gate on `--stage`/`--run`, because its stated reason (what a chain commitment means when stages were committed at different times) does not arise when the per-stage commitment is a dispute artifact rather than a checkpoint field. An authenticated `--stage` run writes `commit.bin` and leaves the chain-commitment alone |
 | [`program-manifest`](./program-manifest.md) | proposed 2026-08-26 | — | whole; one `Raster.toml` grammar (`[program]` xor `[chain]`, one parser), `[program]` **mandatory** — reverses `program-identity` §Manifest slimming's "optional with derived defaults", which in practice means **no program in the tree authors the manifest its identity is computed over**; identity artifact renamed `program.bin` → `<program.name>.bin`; chain membership via `version.chain = true` / `chain = "<path>"` / per-parameter `source = "chain"`. Costs a one-time `program_commitment` move for all four in-tree projects |
@@ -46,17 +47,17 @@ program-end ────┼──► program-identity ──► program-chain �
                 │         (impl)             (partial)   │      (impl)
                 └── (impl)   │                           │        ▲
                              │                           └──► chain-repeat ──┘
-                             │                                (proposed)
+                             │                                  (impl)
                              └──► program-manifest ◄── also reorganizes the [chain]
                                     (proposed)             table chain-repeat extends
                                         also borrows the authorized-value rule from
                                         dynamic-index-selection (impl)
 
 chain-fraud-proof (impl) ──► chain-io-commitment ◄──── window-seed-reconstruction
-   reuses the window/slice        (proposed)   hard dep    (proposed)
+   reuses the window/slice        (proposed)   satisfied      (impl)
    binding; disagrees on one      ▲            — a terminal window opening mid-recur
-   checkpoint field               │              is rejected, so recur-heavy stages
-                                  │              cannot be challenged
+   checkpoint field               │              verifies as of 2026-09-09, so
+                                  │              recur-heavy stages are challengeable
    chain-stage-execution ─────────┘
      (partial) supplies the determinism fact and the --stage machinery;
      its §5 refusal to touch the authenticated path is lifted there
@@ -66,7 +67,7 @@ bounded-collections (phases 1-2 impl)
         ├──► lazy-list-recur ◄──── recur-progress-commitment ──► recur-sequence-break
         │         │   ▲              (rev 2 impl) │                (proposed)
         │         │   │                           └──► window-seed-reconstruction
-        │         │   │                                     (proposed)
+        │         │   │                                       (impl)
         │         │   │
         │         │   └── dynamic-index-selection (impl) — citations survive materialization
         │         │
@@ -85,7 +86,7 @@ lazy-list-recur (impl) ─ same fix, write side ─► incremental-draft-witness
                                                          (impl)
                                                           ▲
                         window-seed-reconstruction ·······┘
-                             (proposed)          shared frontier/seed mechanism
+                               (impl)            shared frontier/seed mechanism
 
 unauthenticated-execution ····► incremental-draft-witness (impl) + lazy-list-recur (impl)
         (proposed)              v1 defers Draft/recur because those own what a draft
@@ -118,22 +119,22 @@ program-end (impl) ──► artifact-inspection (impl)
 - ~~**`lazy-list-recur` §5 → `recur-progress-commitment`.**~~ **Satisfied 2026-08-14.** The
   carrier landed with revision 2, so §5's rules now bind across window boundaries rather than
   only in a window containing iteration 0.
-- **`window-seed-reconstruction` → nothing; it unblocks mid-loop windows.** Until it lands, a
-  window opening inside a live loop is rejected because its seed is never reconstructed from the
-  trace prefix — which is the "refuse to open mid-loop" design `recur-progress-commitment`
-  §Problem explicitly rejected, arrived at by an unfilled parameter rather than by choice.
+- ~~**`window-seed-reconstruction` → nothing; it unblocks mid-loop windows.**~~ **Satisfied
+  2026-09-09.** A window opening inside a live loop now reconstructs its seed from the trace
+  prefix, so the de-facto "refuse to open mid-loop" behaviour — the design
+  `recur-progress-commitment` §Problem explicitly rejected, arrived at by an unfilled parameter
+  rather than by choice — is gone.
 - **`recur-sequence-break` → `recur-progress-commitment` rev 2.** Not merely ordered after it:
   the break bit rides on the `recur_control` trace field rev 2 introduces, and S4′ rewrites the
   `close_site` rule rev 2 implements. Landing it first would mean implementing both halves of
   that proposal anyway, in the wrong order.
 - **`chain-fraud-proof` → `program-chain`, `program-identity`.** Already satisfied; noted
   because it is why `program-chain`'s `proposed` header must be stale.
-- **`chain-io-commitment` → `window-seed-reconstruction`.** Its challenge is a *terminal-window*
-  receipt, and for a recur-heavy stage that window very often opens inside a live loop — which is
-  rejected today. So the mid-loop gap stops being a fraud-proving inconvenience and becomes a
-  soundness-adjacent one: a claimer could pick such a program and be unchallengeable. Ship
-  together. This is the second consumer of `window-seed-reconstruction`, which until now was
-  wanted only by `recur-progress-commitment`'s own window model.
+- ~~**`chain-io-commitment` → `window-seed-reconstruction`.**~~ **Satisfied 2026-09-09.** Its
+  challenge is a *terminal-window* receipt, and for a recur-heavy stage that window very often
+  opens inside a live loop. That is what made the mid-loop gap soundness-adjacent rather than
+  merely inconvenient — a claimer could pick such a program and be unchallengeable. §3's remaining
+  blockers are the assumed settlement/DA/bonding infrastructure, which gate *use*, not design.
 
 ### The non-blocking edges, stated
 
@@ -167,17 +168,14 @@ program-end (impl) ──► artifact-inspection (impl)
    journal alone, which §6 is explicit is "a binding, not an authority". Small, and it is
    `paged-bytes`' second gate. Take its S2 pairing check and the peak-RSS acceptance benchmark
    with it — see that proposal's §Outstanding at implementation for the full list.
-2. **`window-seed-reconstruction`** — small (three files, one a single line) and it restores the
-   property `recur-progress-commitment` was built for: a fraud window that opens mid-loop.
-   Currently such a window is rejected.
-3. **`sequence-grammar-closure` phase 2** — independent of the above; `draft-provenance` argues
+2. **`sequence-grammar-closure` phase 2** — independent of the above; `draft-provenance` argues
    one row of its classification table and can be taken with it or separately. A nested call
    macro in another call's arguments is now rejected at expansion
    (`raster-macros/src/lib.rs`, `reject_nested_call_macros`), which is an instance of this
    proposal's rule that arrived early via a different failure.
-4. **`authoring-skill-and-tooling`'s second half** (`cargo raster check`) — independent, and it
+3. **`authoring-skill-and-tooling`'s second half** (`cargo raster check`) — independent, and it
    is the enforcement surface for rules the type system cannot express.
-5. **`zkvm-dry-run`** — the only thing that decides "does this tile actually run in the zkVM"
+4. **`zkvm-dry-run`** — the only thing that decides "does this tile actually run in the zkVM"
    without proving, and the first enforcement RAS-206/208 have ever had. Independent. Not quite
    free: `Replayer::replay` rejects a receiptless execution (`replay.rs:106`), so a
    `TileExecutionResult.journal` field and a sibling `dry_run` method come with it — see §4.
@@ -199,8 +197,8 @@ now brackets its iterations the way a sequence brackets its items. Variant indic
 - **`loop-carried-state`, `draft-provenance`** — not blocked, not scheduled.
 - **`chain-io-commitment`** — steps 1–3 (the journal's output value, the terminality pin, the
   host plumbing) are landable now and leave the current protocol working. The checkpoint
-  narrowing at step 4 is the point of no return. One in-repo blocker:
-  `window-seed-reconstruction`, without which recur-heavy stages cannot be challenged at all.
+  narrowing at step 4 is the point of no return. Its one in-repo blocker,
+  `window-seed-reconstruction`, landed 2026-09-09, so recur-heavy stages are now challengeable.
   The settlement/DA/bonding dependencies are assumed planned and deliberately not treated as
   blockers — the dispute protocol is inert without them, so they gate *use*, not *design*.
 
