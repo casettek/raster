@@ -78,6 +78,19 @@ pub struct TileReplayJournal {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct RecurTileReplay {
     pub position: RecurPosition,
+    /// The iteration's carried-state transition, `None` iff the tile declares
+    /// no `RecurState` parameter.
+    ///
+    /// An `Option` here is **not** the `active_drafts` defect (`checks/drafts.rs`'s
+    /// permissive `if let Some(..)`). There, absence is chosen by the host, so
+    /// omitting an entry is the cheapest way to skip a continuity check. Here
+    /// the producer is the tile's own replay image, pinned in the program's
+    /// registry and verified by `env::verify`, so absence is a statement the
+    /// program's code makes, not one a prover can fabricate. The guest still
+    /// rejects a mismatch between this field's presence and the site's declared
+    /// shape.
+    #[serde(default)]
+    pub state: Option<RecurStateTransition>,
     /// Always explicit. A recur tile whose return type carries no
     /// `RecurControl` emits `Continue` rather than omitting the field: reading
     /// an absence as `Continue` would put a default in guest audit code, where
@@ -108,6 +121,29 @@ pub struct RecurPosition {
 pub enum RecurControlKind {
     Continue,
     Break,
+}
+
+/// One iteration's carried-state transition: the commitment of the state that
+/// entered it, and of the state it produced.
+///
+/// The pair is what makes a recur's carried state chainable at all. Iteration
+/// *N+1*'s `state_in` must equal iteration *N*'s `state_out`, and nothing in
+/// the trace expressed that before: the state travels as
+/// `FnInputValue::Inline` and the guest's whole obligation for an inline
+/// binding is that the source *is* inline, so a claimed trace could substitute
+/// arbitrary bytes between iterations and still verify. See
+/// `docs/proposals/loop-carried-state.md` §4.
+///
+/// Recorded twice, on purpose, for the two consumers that cannot see each
+/// other's copy: `RecurTileReplay.state` is replay-proven and is what the guest
+/// folds; `FnCallRecord.recur_state` is the host copy the *recorder* folds,
+/// because the recorder never sees a journal. Duplication is safe here for the
+/// same reason it is safe for `control` — both copies are folded into
+/// `recur_progress_commitment`, so an equality of commitments is the bind.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct RecurStateTransition {
+    pub state_in: crate::input::Hash32,
+    pub state_out: crate::input::Hash32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]

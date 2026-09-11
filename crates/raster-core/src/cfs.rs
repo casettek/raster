@@ -649,12 +649,27 @@ pub struct RecurTileItem {
     /// finalizing it. False is the historical/default behavior.
     #[serde(default, skip_serializing_if = "is_false")]
     pub leaves_output_open: bool,
+    /// Whether the site's own output *is* its carried state — `state` with no
+    /// `output`.
+    ///
+    /// This is what pins a sweep's **final** carried state. Every earlier one is
+    /// pinned by the next iteration's bound `state_in`; the last has no
+    /// successor, so the only thing it can be compared against is the value the
+    /// site returned. That comparison is only meaningful for this shape: a
+    /// state+output site discards its state and returns the draft.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub state_is_output: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecurSequenceItem {
     pub id: SequenceId,
     pub sources: Vec<InputBinding>,
+    /// See [`RecurTileItem::state_is_output`]. A recur sequence needs it more
+    /// than a recur tile does: a tile's last iteration is replay-proven, so its
+    /// final state is anchored regardless, while a sequence's is not.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub state_is_output: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -805,6 +820,7 @@ mod tests {
                         sources: vec![],
                         chunk: None,
                         leaves_output_open: false,
+                        state_is_output: false,
                     }),
                     SequenceChildItem::Tile(TileItem {
                         id: "after".to_string(),
@@ -903,6 +919,7 @@ mod tests {
                         SequenceChildItem::RecurSequence(RecurSequenceItem {
                             id: "body".to_string(),
                             sources: vec![],
+                            state_is_output: false,
                         }),
                         SequenceChildItem::Tile(TileItem {
                             id: "after".to_string(),
@@ -925,6 +942,7 @@ mod tests {
                             sources: vec![],
                             chunk: Some(64),
                             leaves_output_open: false,
+                            state_is_output: false,
                         }),
                     ],
                     entry_arguments: vec![],

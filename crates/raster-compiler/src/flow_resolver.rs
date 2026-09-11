@@ -120,11 +120,13 @@ impl FlowResolver {
                     sources: input_sources,
                     chunk: call.chunk,
                     leaves_output_open: call.leaves_output_open,
+                    state_is_output: call.state_is_output,
                 }),
                 CallKind::RecursiveSequence => {
                     SequenceChildItem::RecurSequence(RecurSequenceItem {
                         id: call.callee.clone(),
                         sources: input_sources,
+                        state_is_output: call.state_is_output,
                     })
                 }
                 CallKind::Sequence => SequenceChildItem::Sequence(SequenceItem {
@@ -375,6 +377,7 @@ mod tests {
                     call_kind: CallKind::Tile,
                     chunk: None,
                     leaves_output_open: false,
+                    state_is_output: false,
                 },
                 CallInfo {
                     callee: "exclaim".to_string(),
@@ -386,6 +389,7 @@ mod tests {
                     call_kind: CallKind::Tile,
                     chunk: None,
                     leaves_output_open: false,
+                    state_is_output: false,
                 },
             ],
         );
@@ -462,6 +466,7 @@ mod tests {
                 call_kind: CallKind::Tile,
                 chunk: None,
                 leaves_output_open: false,
+                state_is_output: false,
             }],
         );
 
@@ -526,6 +531,7 @@ mod tests {
                     call_kind: CallKind::Tile,
                     chunk: None,
                     leaves_output_open: false,
+                    state_is_output: false,
                 },
                 CallInfo {
                     callee: "exclaim".to_string(),
@@ -537,6 +543,7 @@ mod tests {
                     call_kind: CallKind::Tile,
                     chunk: None,
                     leaves_output_open: false,
+                    state_is_output: false,
                 },
             ],
         );
@@ -614,6 +621,7 @@ mod tests {
                 call_kind: CallKind::Tile,
                 chunk: None,
                 leaves_output_open: false,
+                state_is_output: false,
             }],
             vec![("name".to_string(), "personal_data".to_string())],
         );
@@ -668,6 +676,7 @@ mod tests {
                 call_kind: CallKind::Tile,
                 chunk: None,
                 leaves_output_open: false,
+                state_is_output: false,
             }],
             vec![("seed".to_string(), "seed".to_string())],
         );
@@ -716,6 +725,7 @@ mod tests {
                 call_kind: CallKind::Tile,
                 chunk: None,
                 leaves_output_open: false,
+                state_is_output: false,
             }],
         );
         let sequence = Sequence {
@@ -775,6 +785,7 @@ mod tests {
                 call_kind: CallKind::Tile,
                 chunk: None,
                 leaves_output_open: false,
+                state_is_output: false,
             }],
             vec![
                 ("row".to_string(), "table".to_string()),
@@ -844,6 +855,7 @@ mod tests {
                 call_kind: CallKind::Tile,
                 chunk: None,
                 leaves_output_open: false,
+                state_is_output: false,
             }],
             vec![("row".to_string(), "table".to_string())],
         );

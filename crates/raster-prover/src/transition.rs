@@ -329,6 +329,7 @@ mod tests {
                 storage: empty_store_roots(),
             }),
             recur_progress_commitment: RecurProgressStack::new().commitment(),
+            recur_state: None,
         }
     }
 
@@ -485,6 +486,7 @@ mod tests {
                 input_source_commitment: Vec::new(),
             },
             recur_progress_commitment: RecurProgressStack::new().commitment(),
+            recur_state: None,
         };
         let sequence_end = StepRecord {
             exec_index: 2,
@@ -494,6 +496,7 @@ mod tests {
                 output_commitment: vec![2; 32],
             },
             recur_progress_commitment: RecurProgressStack::new().commitment(),
+            recur_state: None,
         };
         let recorded_step_io = HashMap::from([
             (sequence_start.clone(), io_witnesses(Some(vec![3, 4]), None)),
@@ -588,6 +591,7 @@ mod tests {
                 .to_vec(),
             },
             recur_progress_commitment: RecurProgressStack::new().commitment(),
+            recur_state: None,
         }
     }
 

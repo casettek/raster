@@ -556,12 +556,55 @@ fn decode_list_metadata_len(bytes: &[u8]) -> Option<u64> {
 /// inputs is reachable for a producer that has no journal, whereas revision 1's
 /// `consumed_total` — folded *into* the frame — was not. See
 /// `docs/proposals/recur-progress-commitment.md` §1 and §4.
+/// Bind a recur iteration's claimed incoming state to what it actually read.
+///
+/// The transition on the step record is host-written. On its own that would
+/// make the chain a set of equalities between prover-chosen values; this ties
+/// `state_in` to the iteration's own recorded input witness, which is already
+/// bound to the step by `input_source_commitment`. A recur sequence's carried
+/// state is the second recorded value — the body's parameters are
+/// `input, state?, output?, args...`, which is also the order the CFS records
+/// the call's sources in.
+fn assert_carried_state_matches_input(step_record: &StepRecord, input_source_witness: Option<&FnInput>) {
+    let Some(transition) = step_record.recur_state.as_ref() else {
+        return;
+    };
+    let witness = input_source_witness.unwrap_or_else(|| {
+        panic!(
+            "Recur iteration claims a carried state with no input witness: {:?}",
+            step_record
+        )
+    });
+    let Some(FnInputValue::Inline(bytes)) = witness.values().get(1) else {
+        panic!(
+            "Recur iteration claims a carried state but records no inline state value: {:?}",
+            step_record
+        )
+    };
+    assert_eq!(
+        transition.state_in,
+        raster_core::recur_progress::state_commitment(bytes),
+        "Recur iteration's claimed incoming state is not the state it read: {:?}",
+        step_record,
+    );
+}
+
+/// Whether a recur site's own output is its carried state, from the CFS.
+fn site_state_is_output(item: &SequenceChildItem) -> bool {
+    match item {
+        SequenceChildItem::RecurTile(tile) => tile.state_is_output,
+        SequenceChildItem::RecurSequence(sequence) => sequence.state_is_output,
+        _ => false,
+    }
+}
+
 pub fn advance_recur_progress(
     cfs_cursor: &CfsCursor,
     progress: &mut RecurProgressStack,
     step_record: &StepRecord,
     replay_journal: Option<&TileReplayJournal>,
     input_source_witness: Option<&FnInput>,
+    output_witness: Option<&Vec<u8>>,
     storage_selection_witnesses: &BTreeMap<String, SelectionWitness>,
 ) {
     let coordinates = step_record.coordinates();
@@ -571,6 +614,19 @@ pub fn advance_recur_progress(
     {
         match cfs_cursor.try_get_item(&site_coordinates) {
             Some(SequenceChildItem::RecurTile(_)) => {
+                // The step record carries a host copy of the same transition,
+                // for uniformity with recur sequences. Duplicating a fact is
+                // only safe where an equality makes the duplicate
+                // non-load-bearing — this is that equality.
+                assert_eq!(
+                    step_record.recur_state.as_ref(),
+                    replay_journal
+                        .and_then(|journal| journal.recur.as_ref())
+                        .and_then(|recur| recur.state.as_ref()),
+                    "Recur tile iteration's recorded carried state disagrees with its replay-proven one: {:?}",
+                    step_record,
+                );
+
                 let recur = replay_journal
                     .and_then(|journal| journal.recur.as_ref())
                     .unwrap_or_else(|| {
@@ -585,6 +641,11 @@ pub fn advance_recur_progress(
                     recur.position.declared_iterations,
                     recur.position.consumed_elements,
                     recur.control,
+                    // The replay-proven copy is the authority. The step record
+                    // carries a host copy too, for uniformity with recur
+                    // sequences; bind them so the duplicate is not
+                    // load-bearing.
+                    recur.state.as_ref(),
                 ) {
                     panic!(
                         "Recur progress violation at step {:?}: {}",
@@ -600,6 +661,27 @@ pub fn advance_recur_progress(
                     if let Err(violation) = progress
                         .advance_sequence_iteration(coordinates, u64::from(iteration_index))
                     {
+                        panic!(
+                            "Recur progress violation at step {:?}: {}",
+                            step_record, violation
+                        );
+                    }
+                    // `state_in` is bound to what this iteration actually read,
+                    // so the chain cannot be advanced through a value the step
+                    // never consumed. `state_out` needs no separate anchor: the
+                    // next iteration's bound `state_in` pins it through the
+                    // fold rule, and the last one is pinned when the site
+                    // closes.
+                    assert_carried_state_matches_input(step_record, input_source_witness);
+                }
+                // The transition itself arrives with the iteration's `End`,
+                // which is the first step at which what it produced is known.
+                if matches!(step_record.kind, StepKind::SequenceEnd { .. }) {
+                    if let Err(violation) = progress.fold_sequence_iteration_state(
+                        coordinates,
+                        step_record.recur_state.as_ref(),
+                        output_witness.map(|bytes| bytes.as_slice()),
+                    ) {
                         panic!(
                             "Recur progress violation at step {:?}: {}",
                             step_record, violation
@@ -628,7 +710,13 @@ pub fn advance_recur_progress(
                         input_source_witness,
                         storage_selection_witnesses,
                     );
-                    progress.push_site(coordinates.clone(), kind, chunk, source_len);
+                    progress.push_site(
+                        coordinates.clone(),
+                        kind,
+                        chunk,
+                        source_len,
+                        site_state_is_output(item),
+                    );
                 }
                 // `End`: the terminal rules — 5 and 7 for a tile site, S4 for a
                 // sequence site.

@@ -539,6 +539,7 @@ impl LiveTransition {
             &input.step_record,
             input.replay_journal.as_ref(),
             input.input_source_witness.as_ref(),
+            input.output_witness.as_ref(),
             &input.storage_selection_witnesses,
         );
         if let StepKind::ProgramStart(program_start) = &input.step_record.kind {

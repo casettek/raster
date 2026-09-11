@@ -84,6 +84,11 @@ pub struct CallInfo {
     /// a recur that publishes a value from one that deliberately leaves its
     /// draft open for a later writer.
     pub leaves_output_open: bool,
+    /// True when the site's own output *is* its carried state — `state` with no
+    /// `output`. It is what lets the trace pin a sweep's **final** carried
+    /// state: every earlier one is pinned by the next iteration's, and this is
+    /// the only shape where the last one has something to be compared against.
+    pub state_is_output: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -347,7 +352,7 @@ impl CallVisitor {
     /// is a comma-separated list; the first token is the callee identifier.
     fn parse_call_macro_args(
         mac: &syn::Macro,
-    ) -> Option<(String, Vec<String>, Vec<CallArgumentKind>, Option<u64>, bool)> {
+    ) -> Option<(String, Vec<String>, Vec<CallArgumentKind>, Option<u64>, bool, bool)> {
         if matches!(Self::macro_call_kind(mac), Some(CallKind::RecursiveTile)) {
             return Self::parse_recur_call_macro_args(mac);
         }
@@ -356,7 +361,9 @@ impl CallVisitor {
             Some(CallKind::RecursiveSequence)
         ) {
             return Self::parse_recur_sequence_call_macro_args(mac)
-                .map(|(callee, args, kinds)| (callee, args, kinds, None, false));
+                .map(|(callee, args, kinds, state_is_output)| {
+                    (callee, args, kinds, None, false, state_is_output)
+                });
         }
 
         // Parse the macro tokens as a punctuated sequence of expressions.
@@ -381,12 +388,12 @@ impl CallVisitor {
             .map(|expr| Self::classify_argument(expr))
             .collect();
 
-        Some((callee, arguments, argument_kinds, None, false))
+        Some((callee, arguments, argument_kinds, None, false, false))
     }
 
     fn parse_recur_call_macro_args(
         mac: &syn::Macro,
-    ) -> Option<(String, Vec<String>, Vec<CallArgumentKind>, Option<u64>, bool)> {
+    ) -> Option<(String, Vec<String>, Vec<CallArgumentKind>, Option<u64>, bool, bool)> {
         struct RecurCallInput {
             tile: syn::Ident,
             input: Expr,
@@ -494,6 +501,10 @@ impl CallVisitor {
         if leaves_output_open && parsed.output.is_none() {
             panic!("call_recur! `finalize = false` requires `output = ...`");
         }
+        // A site whose own output *is* its carried state: `state` with no
+        // `output`. That is the shape whose final state the trace can pin, by
+        // comparing the site's recorded output against the chain's last value.
+        let state_is_output = parsed.state.is_some() && parsed.output.is_none();
         let mut arguments = vec![Self::expr_to_string(&parsed.input)];
         let mut argument_kinds = vec![Self::classify_argument(&parsed.input)];
 
@@ -518,12 +529,13 @@ impl CallVisitor {
             argument_kinds,
             chunk,
             leaves_output_open,
+            state_is_output,
         ))
     }
 
     fn parse_recur_sequence_call_macro_args(
         mac: &syn::Macro,
-    ) -> Option<(String, Vec<String>, Vec<CallArgumentKind>)> {
+    ) -> Option<(String, Vec<String>, Vec<CallArgumentKind>, bool)> {
         struct RecurSequenceCallInput {
             sequence: syn::Ident,
             input: Expr,
@@ -589,6 +601,7 @@ impl CallVisitor {
         }
 
         let parsed = syn::parse2::<RecurSequenceCallInput>(mac.tokens.clone()).ok()?;
+        let state_is_output = parsed.state.is_some() && parsed.output.is_none();
         let mut arguments = vec![Self::expr_to_string(&parsed.input)];
         let mut argument_kinds = vec![Self::classify_argument(&parsed.input)];
 
@@ -607,7 +620,12 @@ impl CallVisitor {
             argument_kinds.push(Self::classify_argument(&expr));
         }
 
-        Some((parsed.sequence.to_string(), arguments, argument_kinds))
+        Some((
+            parsed.sequence.to_string(),
+            arguments,
+            argument_kinds,
+            state_is_output,
+        ))
     }
 
     fn parse_named_recur_key(input: ParseStream, expected: &str) -> syn::Result<()> {
@@ -838,7 +856,14 @@ impl<'ast> Visit<'ast> for CallVisitor {
 
     fn visit_expr_macro(&mut self, node: &'ast ExprMacro) {
         if let Some(call_kind) = Self::macro_call_kind(&node.mac) {
-            if let Some((callee, arguments, argument_kinds, chunk, leaves_output_open)) =
+            if let Some((
+                callee,
+                arguments,
+                argument_kinds,
+                chunk,
+                leaves_output_open,
+                state_is_output,
+            )) =
                 Self::parse_call_macro_args(&node.mac)
             {
                 let result_binding = self.current_binding.take();
@@ -850,6 +875,7 @@ impl<'ast> Visit<'ast> for CallVisitor {
                     call_kind,
                     chunk,
                     leaves_output_open,
+                    state_is_output,
                 });
                 // Do not recurse into the macro body — arguments are already captured above.
                 return;
@@ -866,7 +892,14 @@ impl<'ast> Visit<'ast> for CallVisitor {
         // which does NOT trigger `visit_expr_macro`. We handle them here so that statement-
         // position `call!` and `call_seq!` invocations are captured without a binding.
         if let Some(call_kind) = Self::macro_call_kind(&node.mac) {
-            if let Some((callee, arguments, argument_kinds, chunk, leaves_output_open)) =
+            if let Some((
+                callee,
+                arguments,
+                argument_kinds,
+                chunk,
+                leaves_output_open,
+                state_is_output,
+            )) =
                 Self::parse_call_macro_args(&node.mac)
             {
                 // current_binding is None here — bare statements have no let binding.
@@ -878,6 +911,7 @@ impl<'ast> Visit<'ast> for CallVisitor {
                     call_kind,
                     chunk,
                     leaves_output_open,
+                    state_is_output,
                 });
                 return;
             }

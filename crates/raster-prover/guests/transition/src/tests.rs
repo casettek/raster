@@ -4,8 +4,8 @@ use bridgetree::NonEmptyFrontier;
 
 use raster_core::authorization::AuthorizationJournal;
 use raster_core::cfs::{
-    CfsCoordinates, CfsCursor, ControlFlowSchema, InputBinding, InputSource, RecurTileItem,
-    SequenceChildItem, SequenceDef, SequenceItem, TileDef, TileItem,
+    CfsCoordinates, CfsCursor, ControlFlowSchema, InputBinding, InputSource, RecurSequenceItem,
+    RecurTileItem, SequenceChildItem, SequenceDef, SequenceItem, TileDef, TileItem,
 };
 use raster_core::coordinate_index::{
     coordinate_index_membership_proof, coordinate_index_non_membership_proof, coordinate_index_root,
@@ -14,12 +14,15 @@ use raster_core::draft::{
     draft_root_from_witness, draft_value_root, schema_hash as compute_schema_hash, DraftOp,
     DraftReplayTransition, DraftStateWitness, DraftTransitionWitness, DraftWitnessField,
     RecurControlKind,
-    RecurPosition, RecurTileReplay, TileReplayJournal, TrackedDraftState,
+    RecurPosition, RecurStateTransition, RecurTileReplay, TileReplayJournal, TrackedDraftState,
 };
 use raster_core::input::{
     AppendFrontier, SchemaField, SchemaFieldMode, SchemaNode, Selectable,
 };
-use raster_core::recur_progress::{RecurProgressStack, RecurSiteKind};
+use raster_core::input::Hash32;
+use raster_core::recur_progress::{
+    RecurProgressStack, RecurProgressViolation, RecurSiteKind,
+};
 use raster_core::trace::{
     ExecStep, ExecTarget, FnInput, FnInputArg, FnInputValue, StepKind, StepRecord, StorageData,
     StorageRoots,
@@ -92,6 +95,7 @@ fn draft_tile_step(exec_index: u64) -> StepRecord {
             },
         }),
         recur_progress_commitment: RecurProgressStack::new().commitment(),
+        recur_state: None,
     }
 }
 
@@ -198,6 +202,7 @@ fn verify_tile_commitments_accept_matching_recorded_io() {
             },
         }),
         recur_progress_commitment: RecurProgressStack::new().commitment(),
+        recur_state: None,
     };
 
     verify_io_witness(&step, Some(&b"in".to_vec()), Some(&b"out".to_vec()));
@@ -224,6 +229,7 @@ fn verify_step_record_inputs_accepts_sequence_descendant_producer_coordinates() 
             },
         }),
         recur_progress_commitment: RecurProgressStack::new().commitment(),
+        recur_state: None,
     };
     let input_source_witness =
         storage_input_witness(CfsCoordinates(vec![0, 0]), sha(b"producer-output"));
@@ -251,6 +257,7 @@ fn chunked_recur_cfs(chunk: Option<u64>) -> CfsCursor {
                 sources: vec![],
                 chunk,
                 leaves_output_open: false,
+                state_is_output: false,
             })],
             entry_arguments: Vec::new(),
             produces_output: false,
@@ -277,6 +284,7 @@ fn recur_iteration_step(iteration: u32) -> StepRecord {
             },
         }),
         recur_progress_commitment: RecurProgressStack::new().commitment(),
+        recur_state: None,
     }
 }
 
@@ -303,6 +311,7 @@ fn recur_journal(
                 consumed_elements,
             },
             control,
+            state: None,
         }),
     }
 }
@@ -321,7 +330,7 @@ fn recur_journal(
 /// sweep over 6 elements — what the host reconstructs from the trace prefix.
 fn seeded_stack(through: u64) -> RecurProgressStack {
     let mut stack = RecurProgressStack::new();
-    stack.push_site(CfsCoordinates(vec![0]), RecurSiteKind::Tile, 2, 6);
+    stack.push_site(CfsCoordinates(vec![0]), RecurSiteKind::Tile, 2, 6, false);
     for iteration in 0..=through {
         stack
             .advance_tile_iteration(
@@ -330,6 +339,7 @@ fn seeded_stack(through: u64) -> RecurProgressStack {
                 3,
                 2,
                 RecurControlKind::Continue,
+                None,
             )
             .expect("honest prefix advances cleanly");
     }
@@ -347,6 +357,7 @@ fn advance_seeded(seed: &mut RecurProgressStack, iteration: u32, recorded: [u8; 
         seed,
         &step,
         Some(&journal),
+        None,
         None,
         &BTreeMap::new(),
     );
@@ -367,6 +378,7 @@ fn a_seeded_mid_loop_window_verifies() {
                 3,
                 2,
                 RecurControlKind::Continue,
+                None,
             )
             .expect("honest advance");
         expected.commitment()
@@ -399,6 +411,7 @@ fn a_forged_seed_is_rejected() {
                 3,
                 2,
                 RecurControlKind::Continue,
+                None,
             )
             .expect("honest advance");
         expected.commitment()
@@ -417,6 +430,7 @@ fn a_forged_seed_is_rejected() {
         &step,
         Some(&journal),
         None,
+        None,
         &BTreeMap::new(),
     );
 }
@@ -427,14 +441,14 @@ fn a_forged_seed_is_rejected() {
 #[test]
 fn a_nested_seed_carries_both_frames() {
     let mut both = RecurProgressStack::new();
-    both.push_site(CfsCoordinates(vec![0]), RecurSiteKind::Sequence, 1, 2);
+    both.push_site(CfsCoordinates(vec![0]), RecurSiteKind::Sequence, 1, 2, false);
     both.advance_sequence_iteration(&CfsCoordinates(vec![0, 0]), 0)
         .expect("outer iteration 0");
-    both.push_site(CfsCoordinates(vec![0, 0, 0]), RecurSiteKind::Tile, 2, 6);
+    both.push_site(CfsCoordinates(vec![0, 0, 0]), RecurSiteKind::Tile, 2, 6, false);
     assert_eq!(both.depth(), 2);
 
     let mut inner_only = RecurProgressStack::new();
-    inner_only.push_site(CfsCoordinates(vec![0, 0, 0]), RecurSiteKind::Tile, 2, 6);
+    inner_only.push_site(CfsCoordinates(vec![0, 0, 0]), RecurSiteKind::Tile, 2, 6, false);
     assert_eq!(inner_only.depth(), 1);
 
     // Both stacks agree on the innermost frame and still commit differently,
@@ -551,6 +565,7 @@ fn verify_tile_commitments_reject_mismatched_input() {
             },
         }),
         recur_progress_commitment: RecurProgressStack::new().commitment(),
+        recur_state: None,
     };
 
     verify_io_witness(&step, Some(&b"actual".to_vec()), Some(&b"out".to_vec()));
@@ -567,6 +582,7 @@ fn verify_sequence_boundary_commitments_accept_matching_recorded_io() {
             input_source_commitment: Vec::new(),
         },
         recur_progress_commitment: RecurProgressStack::new().commitment(),
+        recur_state: None,
     };
     let end = StepRecord {
         exec_index: 2,
@@ -576,6 +592,7 @@ fn verify_sequence_boundary_commitments_accept_matching_recorded_io() {
             output_commitment: sha(b"sequence-out"),
         },
         recur_progress_commitment: RecurProgressStack::new().commitment(),
+        recur_state: None,
     };
 
     verify_io_witness(&start, Some(&b"sequence-in".to_vec()), None);
@@ -704,6 +721,7 @@ fn tile_step_with_store_roots(
             },
         }),
         recur_progress_commitment: RecurProgressStack::new().commitment(),
+        recur_state: None,
     }
 }
 
@@ -1291,6 +1309,7 @@ fn program_start_record(program_start: ProgramStartStep) -> StepRecord {
         coordinates: CfsCoordinates(vec![]),
         kind: StepKind::ProgramStart(program_start),
         recur_progress_commitment: RecurProgressStack::new().commitment(),
+        recur_state: None,
     }
 }
 
@@ -1509,6 +1528,7 @@ fn genesis_authorization_rejects_a_late_window_missing_its_membership_witness() 
             output_commitment: Vec::new(),
         },
         recur_progress_commitment: RecurProgressStack::new().commitment(),
+        recur_state: None,
     };
 
     verify_genesis_authorization(&cfs_cursor, &EMPTY_LEAF, &[], &journal, None, &first_step);
@@ -1544,6 +1564,7 @@ fn genesis_authorization_rejects_forged_entry_object_commitment() {
             output_commitment: Vec::new(),
         },
         recur_progress_commitment: RecurProgressStack::new().commitment(),
+        recur_state: None,
     };
 
     verify_genesis_authorization(
@@ -1838,6 +1859,7 @@ mod program_end {
             coordinates: CfsCoordinates(vec![]),
             kind: StepKind::ProgramEnd(program_end),
             recur_progress_commitment: RecurProgressStack::new().commitment(),
+            recur_state: None,
         }
     }
 
@@ -1970,4 +1992,386 @@ mod program_end {
             OutputAuthorization::NotRequired,
         );
     }
+}
+
+/// A recur *sequence* site, shaped exactly like the one in
+/// `examples/hello-tiles`: `call_recur_seq!` declares `input`, `output` and one
+/// entry in `args`, so `RecurSequenceItem.sources` holds three bindings.
+fn recur_sequence_site_cfs() -> CfsCursor {
+    CfsCursor::new(ControlFlowSchema {
+        version: "1.0".into(),
+        project: "test".into(),
+        encoding: "postcard".into(),
+        tiles: vec![TileDef::iter("decorate", 0, 1)],
+        sequences: vec![
+            SequenceDef {
+                id: "main".into(),
+                input_sources: vec![],
+                items: vec![SequenceChildItem::RecurSequence(RecurSequenceItem {
+                    id: "decorate_lines".into(),
+                    // input, output, args.0 — one binding per `call_recur_seq!`
+                    // argument, per `ast.rs`'s parse and `flow_resolver.rs`'s
+                    // `resolve_call_inputs`.
+                    sources: vec![
+                        InputBinding::storage(),
+                        InputBinding::inline(),
+                        InputBinding::inline(),
+                    ],
+                    state_is_output: false,
+                })],
+                entry_arguments: Vec::new(),
+                produces_output: false,
+            },
+            SequenceDef {
+                id: "decorate_lines".into(),
+                input_sources: vec![],
+                items: vec![SequenceChildItem::Tile(TileItem {
+                    id: "decorate".into(),
+                    sources: vec![InputBinding::seq_input(0)],
+                })],
+                entry_arguments: Vec::new(),
+                produces_output: false,
+            },
+        ],
+    })
+}
+
+/// The site step the recorder writes for that call: `RecurSequenceStart`
+/// becomes a `SequenceStart` at the site coordinate `[0]`, carrying the site's
+/// own id (`recorder.rs`'s `RecurTileStart | RecurSequenceStart` arm).
+fn recur_sequence_site_step() -> StepRecord {
+    StepRecord {
+        exec_index: 1,
+        sequence_id: "decorate_lines".into(),
+        coordinates: CfsCoordinates(vec![0]),
+        kind: StepKind::SequenceStart {
+            input_commitment: sha(b"recur-seq-in"),
+            input_source_commitment: Vec::new(),
+        },
+        recur_progress_commitment: RecurProgressStack::new().commitment(),
+        recur_state: None,
+    }
+}
+
+/// What the fixed site wrapper records: one value per declared argument, in
+/// the CFS's order — input, output, args.0 — with the driving list's storage
+/// data under its own key.
+fn recur_sequence_site_witness() -> FnInput {
+    let commitment = sha(b"lines");
+    let source_root_hash: [u8; 32] = commitment
+        .clone()
+        .try_into()
+        .expect("test commitments are 32 bytes");
+    FnInput {
+        data: Vec::new(),
+        values: vec![
+            FnInputValue::StorageBinding,
+            FnInputValue::Inline(b"draft-handle".to_vec()),
+            FnInputValue::Inline(b"*".to_vec()),
+        ],
+        args: vec![
+            FnInputArg {
+                name: "input".to_string(),
+                ty: "AuthRef<List<String>>".to_string(),
+            },
+            FnInputArg {
+                name: "output".to_string(),
+                ty: "Draft<CollectiveGreeting>".to_string(),
+            },
+            FnInputArg {
+                name: "decoration".to_string(),
+                ty: "String".to_string(),
+            },
+        ],
+        storage: [(
+            "input".to_string(),
+            StorageData {
+                coordinates: CfsCoordinates(vec![0, 0]),
+                commitment,
+                selector: Default::default(),
+                selection: raster_core::input::SelectionCommitment {
+                    source_root_hash,
+                    ..Default::default()
+                },
+            },
+        )]
+        .into_iter()
+        .collect(),
+    }
+}
+
+#[test]
+fn a_recur_sequence_site_binds_every_declared_source() {
+    // The site wrapper must record one value per `call_recur_seq!` argument,
+    // because the CFS declares one `InputBinding` per argument and the guest
+    // asserts the two arities agree. A recur *site* — unlike a recur
+    // *iteration* — does not short-circuit before reaching that assert.
+    let cfs_cursor = recur_sequence_site_cfs();
+
+    verify_step_record_inputs(
+        &cfs_cursor,
+        &recur_sequence_site_step(),
+        Some(&recur_sequence_site_witness()),
+        None,
+        None,
+    );
+}
+
+#[test]
+#[should_panic(expected = "CFS input count does not match input source witness arity")]
+fn a_recur_sequence_site_recording_only_its_input_is_rejected() {
+    // The regression this guards: the site used to record
+    // `values: vec![input]` and nothing else, which made every recur sequence
+    // carrying an `output` or any `args` unprovable.
+    let cfs_cursor = recur_sequence_site_cfs();
+    let mut witness = recur_sequence_site_witness();
+    witness.values.truncate(1);
+    witness.args.truncate(1);
+
+    verify_step_record_inputs(
+        &cfs_cursor,
+        &recur_sequence_site_step(),
+        Some(&witness),
+        None,
+        None,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Carried-state chaining — `loop-carried-state.md` §4
+//
+// A recur's carried state travels as `FnInputValue::Inline`, and the guest's
+// whole obligation for an inline binding is that the source *is* inline. These
+// tests pin the missing half: iteration N's incoming state must be the state
+// iteration N-1 returned.
+// ---------------------------------------------------------------------------
+
+fn state(seed: &[u8]) -> Hash32 {
+    raster_core::recur_progress::state_commitment(seed)
+}
+
+fn transition(state_in: Hash32, state_out: Hash32) -> RecurStateTransition {
+    RecurStateTransition {
+        state_in,
+        state_out,
+    }
+}
+
+/// A 3-iteration unchunked sweep whose carried state advances a -> b -> c -> d.
+fn state_chain_stack() -> RecurProgressStack {
+    let mut stack = RecurProgressStack::new();
+    stack.push_site(CfsCoordinates(vec![0]), RecurSiteKind::Tile, 1, 3, false);
+    stack
+}
+
+#[test]
+fn a_carried_state_chain_advances_across_iterations() {
+    let mut stack = state_chain_stack();
+    let steps = [(b"a", b"b"), (b"b", b"c"), (b"c", b"d")];
+    for (index, (from, to)) in steps.iter().enumerate() {
+        stack
+            .advance_tile_iteration(
+                &CfsCoordinates(vec![0, index as u32]),
+                index as u64,
+                3,
+                1,
+                RecurControlKind::Continue,
+                Some(&transition(state(*from), state(*to))),
+            )
+            .expect("an honest chain advances");
+    }
+}
+
+#[test]
+fn a_substituted_iteration_state_is_rejected() {
+    // The bug this whole change exists for: iteration 1 claims to have started
+    // from a state iteration 0 never produced.
+    let mut stack = state_chain_stack();
+    stack
+        .advance_tile_iteration(
+            &CfsCoordinates(vec![0, 0]),
+            0,
+            3,
+            1,
+            RecurControlKind::Continue,
+            Some(&transition(state(b"a"), state(b"b"))),
+        )
+        .expect("iteration 0 adopts");
+
+    assert_eq!(
+        stack.advance_tile_iteration(
+            &CfsCoordinates(vec![0, 1]),
+            1,
+            3,
+            1,
+            RecurControlKind::Continue,
+            Some(&transition(state(b"forged"), state(b"c"))),
+        ),
+        Err(RecurProgressViolation::CarriedStateMismatch {
+            expected: state(b"b"),
+            actual: state(b"forged"),
+        }),
+    );
+}
+
+#[test]
+fn an_omitted_carried_state_is_rejected() {
+    // Absence is the cheapest attack on a continuity check — the weakness
+    // `checks/drafts.rs`'s permissive `if let Some(..)` still has for drafts.
+    let mut stack = state_chain_stack();
+    stack
+        .advance_tile_iteration(
+            &CfsCoordinates(vec![0, 0]),
+            0,
+            3,
+            1,
+            RecurControlKind::Continue,
+            Some(&transition(state(b"a"), state(b"b"))),
+        )
+        .expect("iteration 0 adopts");
+
+    assert_eq!(
+        stack.advance_tile_iteration(
+            &CfsCoordinates(vec![0, 1]),
+            1,
+            3,
+            1,
+            RecurControlKind::Continue,
+            None,
+        ),
+        Err(RecurProgressViolation::CarriedStateOmitted),
+    );
+}
+
+#[test]
+fn a_stateless_site_claiming_carried_state_is_rejected() {
+    let mut stack = state_chain_stack();
+    stack
+        .advance_tile_iteration(
+            &CfsCoordinates(vec![0, 0]),
+            0,
+            3,
+            1,
+            RecurControlKind::Continue,
+            None,
+        )
+        .expect("a stateless iteration 0 is fine");
+
+    assert_eq!(
+        stack.advance_tile_iteration(
+            &CfsCoordinates(vec![0, 1]),
+            1,
+            3,
+            1,
+            RecurControlKind::Continue,
+            Some(&transition(state(b"x"), state(b"y"))),
+        ),
+        Err(RecurProgressViolation::CarriedStateUnexpected),
+    );
+}
+
+#[test]
+fn a_seed_differing_only_in_carried_state_is_rejected() {
+    // The window-open case: two stacks identical but for the state they claim
+    // the loop reached commit differently, so a forged seed cannot reproduce
+    // the recorded commitment.
+    let mut honest = state_chain_stack();
+    honest
+        .advance_tile_iteration(
+            &CfsCoordinates(vec![0, 0]),
+            0,
+            3,
+            1,
+            RecurControlKind::Continue,
+            Some(&transition(state(b"a"), state(b"b"))),
+        )
+        .expect("honest");
+
+    let mut forged = state_chain_stack();
+    forged
+        .advance_tile_iteration(
+            &CfsCoordinates(vec![0, 0]),
+            0,
+            3,
+            1,
+            RecurControlKind::Continue,
+            Some(&transition(state(b"a"), state(b"elsewhere"))),
+        )
+        .expect("forged advances too — it just lands somewhere else");
+
+    assert_ne!(honest.commitment(), forged.commitment());
+}
+
+#[test]
+fn a_sequence_iterations_output_must_be_the_state_it_claims_to_have_produced() {
+    // The terminal pin. Every `state_out` but the last is held by the next
+    // iteration's bound `state_in`; the last is held here, against the bytes
+    // the iteration actually emitted. It lives on the iteration rather than the
+    // site because a site's recorded output is the raster-encoded stored
+    // object, while the carried state is postcard — the iteration's output is
+    // where the two encodings coincide.
+    let mut stack = RecurProgressStack::new();
+    stack.push_site(CfsCoordinates(vec![0]), RecurSiteKind::Sequence, 1, 1, true);
+    stack
+        .advance_sequence_iteration(&CfsCoordinates(vec![0, 0]), 0)
+        .expect("counted");
+
+    let honest = stack.clone().fold_sequence_iteration_state(
+        &CfsCoordinates(vec![0, 0]),
+        Some(&transition(state(b"seed"), state(b"final"))),
+        Some(b"final"),
+    );
+    assert!(honest.is_ok());
+
+    assert_eq!(
+        stack
+            .fold_sequence_iteration_state(
+                &CfsCoordinates(vec![0, 0]),
+                Some(&transition(state(b"seed"), state(b"claimed"))),
+                Some(b"actually-emitted"),
+            )
+            .unwrap_err(),
+        RecurProgressViolation::TerminalStateMismatch {
+            expected: state(b"claimed"),
+            actual: state(b"actually-emitted"),
+        },
+    );
+}
+
+#[test]
+fn a_state_returning_sequence_iteration_without_an_output_is_rejected() {
+    let mut stack = RecurProgressStack::new();
+    stack.push_site(CfsCoordinates(vec![0]), RecurSiteKind::Sequence, 1, 1, true);
+    stack
+        .advance_sequence_iteration(&CfsCoordinates(vec![0, 0]), 0)
+        .expect("counted");
+
+    assert_eq!(
+        stack
+            .fold_sequence_iteration_state(
+                &CfsCoordinates(vec![0, 0]),
+                Some(&transition(state(b"seed"), state(b"final"))),
+                None,
+            )
+            .unwrap_err(),
+        RecurProgressViolation::TerminalStateUnwitnessed,
+    );
+}
+
+#[test]
+fn a_state_plus_output_sequence_iteration_is_not_pinned_by_its_output() {
+    // A state+output site returns the draft, not the state, so its recorded
+    // output is not the carried state and must not be compared against it.
+    let mut stack = RecurProgressStack::new();
+    stack.push_site(CfsCoordinates(vec![0]), RecurSiteKind::Sequence, 1, 1, false);
+    stack
+        .advance_sequence_iteration(&CfsCoordinates(vec![0, 0]), 0)
+        .expect("counted");
+    assert!(stack
+        .fold_sequence_iteration_state(
+            &CfsCoordinates(vec![0, 0]),
+            Some(&transition(state(b"seed"), state(b"final"))),
+            Some(b"a-draft-root-not-the-state"),
+        )
+        .is_ok());
 }

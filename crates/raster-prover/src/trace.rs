@@ -1081,6 +1081,7 @@ mod tests {
                 storage: empty_storage_roots(),
             }),
             recur_progress_commitment: [0u8; 32],
+            recur_state: None,
         }
     }
 
@@ -1108,6 +1109,7 @@ mod tests {
                 input_source_commitment: Vec::new(),
             },
             recur_progress_commitment: [0u8; 32],
+            recur_state: None,
         }
     }
 
@@ -1124,6 +1126,7 @@ mod tests {
                 output_commitment: Vec::new(),
             },
             recur_progress_commitment: [0u8; 32],
+            recur_state: None,
         }
     }
 

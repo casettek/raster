@@ -291,6 +291,17 @@ pub struct FnCallRecord {
     /// `docs/proposals/recur-progress-commitment.md` §3.1.
     #[serde(default)]
     pub recur_control: Option<crate::draft::RecurControlKind>,
+    /// The iteration's carried-state transition, host-recorded. `Some` on a
+    /// recur iteration whose step declares a `RecurState`, `None` everywhere
+    /// else.
+    ///
+    /// Same arrangement as `recur_control`, and for the same reason: the
+    /// recorder has to fold this into `recur_progress_commitment` and never
+    /// sees a replay journal. The guest folds the replay-proven copy
+    /// (`TileReplayJournal.recur.state`); the two agree or the commitments
+    /// differ. See `docs/proposals/loop-carried-state.md` §4.
+    #[serde(default)]
+    pub recur_state: Option<crate::draft::RecurStateTransition>,
 }
 
 impl FnCallRecord {
@@ -428,6 +439,21 @@ pub struct StepRecord {
     /// `docs/proposals/recur-progress-commitment.md`.
     #[serde(default)]
     pub recur_progress_commitment: Hash32,
+    /// The carried-state transition this step performed, `Some` only on a recur
+    /// iteration whose site carries state.
+    ///
+    /// It lives on the step record — not only in the replay journal — because a
+    /// recur *sequence* emits no journal, and its iterations need the same
+    /// chain a recur tile's do. Here it is bound by fingerprint agreement with
+    /// `commit.bin`, exactly like `recur_progress_commitment`; the guest
+    /// additionally binds `state_in` against the step's own recorded input
+    /// witness, so the value cannot be invented, and a tile's copy against the
+    /// replay-proven journal.
+    ///
+    /// Every `state_out` is pinned in turn: by the next iteration's bound
+    /// `state_in` through the fold rule, and the last one by the site's close.
+    #[serde(default)]
+    pub recur_state: Option<crate::draft::RecurStateTransition>,
 }
 
 impl StepRecord {
