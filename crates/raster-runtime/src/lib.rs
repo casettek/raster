@@ -17,7 +17,8 @@ mod source;
 mod storage;
 pub mod tracing;
 pub use entry_arguments::{
-    entry_argument_spec, start_program, EntryArgumentSpec, EntryArgumentsBinding,
+    entry_argument_spec, install_file_source_resolver, start_program, EntryArgumentSpec,
+    EntryArgumentsBinding,
 };
 pub use input::{
     encode_raster_value, postcard_structural_commitment, select_storage_value,

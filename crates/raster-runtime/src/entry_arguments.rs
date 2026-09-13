@@ -10,6 +10,7 @@
 //! traced step, and is always emitted — even when `main` declares no entry
 //! arguments, in which case it binds nothing and touches no storage.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use raster_core::input::{ExternalEncoding, SchemaNode, StorageRef};
@@ -99,9 +100,9 @@ pub fn start_program(args: &[EntryArgumentSpec]) -> Result<EntryArgumentsBinding
         });
     }
 
-    // The resolver is installed once, by `init` (see
-    // `install_default_source_resolver`) — this is a consumer of the
-    // runtime's input context, not a second place that decides what it is.
+    // The resolver is installed by `init` or by an embedding caller via
+    // `install_file_source_resolver`. This consumes the runtime's input
+    // context rather than deciding where inputs come from.
     let resolver = THREAD_STORAGE
         .with(|storage| storage.borrow().source_resolver())
         .ok_or_else(|| {
@@ -154,15 +155,36 @@ pub fn start_program(args: &[EntryArgumentSpec]) -> Result<EntryArgumentsBinding
 /// Wire the process's external input context into the runtime, from the
 /// `--input` / `--input-manifest` arguments it was started with.
 ///
-/// Called once from `init`. This is the only place production code decides
-/// where entry-argument bytes come from — `start_program` and the trace
-/// recorder consume that decision rather than each re-deriving it from
-/// `std::env::args`. A program run without those arguments installs nothing,
-/// which is only an error if it goes on to declare entry arguments.
+/// Called once from `init` for standalone programs. Embedding callers can
+/// instead install explicit paths with [`install_file_source_resolver`].
+/// A program run without those arguments installs nothing, which is only
+/// an error if it goes on to declare entry arguments.
 pub fn install_default_source_resolver() -> Result<()> {
     let Some(manager) = FileInputSourceResolver::from_cli_args()? else {
         return Ok(());
     };
+    let resolver: Arc<dyn SourceResolver> = Arc::new(manager);
+    THREAD_STORAGE.with(|storage| storage.borrow_mut().set_source_resolver(resolver));
+    Ok(())
+}
+
+/// Install external input files for the current thread's next program run.
+///
+/// Call after runtime initialization and before entering the program's root
+/// sequence scope. Embedders running multiple stages in one process can call
+/// this before each stage to replace its input context. Relative artifact
+/// paths are resolved against the input document's directory.
+///
+/// Both documents are parsed before the existing resolver is replaced, so an
+/// error leaves the previous input context intact.
+pub fn install_file_source_resolver(input: &Path, input_manifest: &Path) -> Result<()> {
+    let raw_input = input
+        .to_str()
+        .ok_or_else(|| Error::Other("Input document path must be valid UTF-8".into()))?;
+    let raw_manifest = input_manifest
+        .to_str()
+        .ok_or_else(|| Error::Other("Input manifest path must be valid UTF-8".into()))?;
+    let manager = FileInputSourceResolver::from_input_args(Some(raw_input), Some(raw_manifest))?;
     let resolver: Arc<dyn SourceResolver> = Arc::new(manager);
     THREAD_STORAGE.with(|storage| storage.borrow_mut().set_source_resolver(resolver));
     Ok(())

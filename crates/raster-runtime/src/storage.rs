@@ -401,10 +401,9 @@ impl StorageManager {
         }
     }
 
-    /// Injects the resolver a `Referenced` object dispatches to. Set once
-    /// per runtime — by runtime initialization in production, or
-    /// directly by a caller that supplies its own input context (the trace
-    /// recorder, tests).
+    /// Injects the resolver a `Referenced` object dispatches to. Installed
+    /// by runtime initialization or replaced between program runs by an
+    /// embedding caller that supplies its own input context.
     pub(crate) fn set_source_resolver(&mut self, resolver: Arc<dyn SourceResolver>) {
         self.source_resolver = Some(resolver);
     }
@@ -898,10 +897,9 @@ std::thread_local! {
 fn reset_thread_storage() {
     THREAD_STORAGE.with(|storage| {
         let mut storage = storage.borrow_mut();
-        // Where the process's inputs come from is a property of how it was
-        // started, not of the execution being reset: it is installed once by
-        // `init`, before any sequence runs, and must outlive the store it was
-        // installed into.
+        // The input context is installed by `init` or an embedding caller
+        // before entering the root sequence, so preserve it when resetting
+        // the previous program's storage.
         let source_resolver = storage.source_resolver();
         *storage = StorageManager::new();
         if let Some(resolver) = source_resolver {
