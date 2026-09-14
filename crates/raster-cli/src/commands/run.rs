@@ -48,13 +48,15 @@ pub fn run(
     fraud_proof_config: Option<FraudProofConfig>,
     audit_flag: Option<&str>,
     no_auth: bool,
-    _verbose: bool,
+    verbose: bool,
     show_output: bool,
     trace_format: TraceFormat,
     features: &[String],
     all_features: bool,
     no_default_features: bool,
+    profiling: &crate::profiling::ProfileOptions,
 ) -> Result<()> {
+    profiling.validate(audit_flag.is_some())?;
     if backend_type != BackendType::Native {
         return Err(Error::Other(
             "Only the native backend is supported for running entire programs. \
@@ -65,6 +67,9 @@ pub fn run(
 
     let project_path = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let project = Project::new(project_path).expect("Failed to read project");
+    let profile_tiles =
+        super::replay_profile::validate_tiles(&project, profiling.selected_tiles())?;
+    let features = profiling.build_features(features);
 
     println!("Control Flow Schema build..");
     let cfs_builder = CfsBuilder::new(&project);
@@ -134,7 +139,7 @@ pub fn run(
     println!("  Run ID: {}", artifacts.run_id);
     println!("  Run artifacts dir: {}", artifacts.run_dir.display());
     println!("  Trace path: {}", trace_path.display());
-    if profiling_enabled(features, all_features) && !no_auth {
+    if profiling_enabled(&features, all_features) && !no_auth {
         println!(
             "  Expected live profile stream: {}",
             profile_stream_path.display()
@@ -293,8 +298,34 @@ pub fn run(
         return Ok(());
     }
 
+    if !profile_tiles.is_empty() && !status.success() {
+        return Err(Error::Other(
+            "Native execution failed; replay profiling was not started".into(),
+        ));
+    }
+
+    if profiling.native() && !profile_path.exists() {
+        return Err(Error::Other(
+            "Native profiling produced no profile.json. Ensure the program enables its std \
+             feature and uses Raster's sequence entry point."
+                .into(),
+        ));
+    }
+
     let (mut trace, trace_recorder) =
         load_trace_from_file(&trace_path, trace_format, &cfs, input, input_manifest)?;
+
+    let profiling_replay = !profile_tiles.is_empty();
+    if profiling_replay {
+        super::replay_profile::run(
+            &project,
+            &trace,
+            &trace_recorder,
+            profile_tiles,
+            &artifacts.run_id,
+            &artifacts.run_dir.join("replay-profile.json"),
+        )?;
+    }
 
     if commit_flag.is_some() {
         let commit_path = commit_flag.expect("Commitment path was provided");
@@ -333,7 +364,7 @@ pub fn run(
                 println!("Fraud proof generated: {}", fraud_proof_path.display());
             }
         }
-    } else {
+    } else if (!profiling_replay && !profile_path.exists()) || verbose {
         // TODO: in case of just simple execution did printing out trace items is enough or save
         // them to file
 
@@ -365,7 +396,7 @@ pub fn run(
                 profile_stream_path.display()
             );
         }
-        println!("  Execution profile saved to: {}", profile_path.display());
+        super::print_profile_artifact(&profile_path);
         let analyzer = Analyzer::from_path(&profile_path)?;
         let metrics = analyzer.analyze()?;
         let report = Report::new(metrics);

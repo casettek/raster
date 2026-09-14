@@ -34,6 +34,8 @@ Raster is organized as a Rust workspace with the following crates:
 
 - `docs/architecture.md`: technical architecture notes
 - `docs/tile-authoring.md`: authoring guide for tiles/sequences
+- [Native-to-replay profiling workflow](docs/profiling-workflow.md): profile a program in a separate repository, choose heavy tiles, and measure guest replay cycles
+- `docs/replay-profiling.md`: profile up to 128 invocations per selected tile ID without proving
 - `docs/specs/README.md`: canonical, code-adjacent specs
 
 ## Installation
@@ -89,8 +91,15 @@ cargo raster run
 # Run without tracing
 cargo raster run --no-trace
 
-# Analyze execution
-cargo raster analyze
+# Profile native tile timings
+cargo raster run --profile native
+
+# Profile up to 128 invocations per selected tile ID in RISC Zero
+cargo raster run --profile replay --tile compute,process
+
+# Reopen the profile path printed by the run
+cargo raster analyze target/raster/runs/<run-id>/profile.json
+# For a replay profile, use replay-profile.json in that run's directory instead.
 ```
 
 ### 5. Read what it produced

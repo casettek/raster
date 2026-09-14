@@ -1,4 +1,5 @@
 //! Command implementations for the Raster CLI.
+pub mod replay_profile;
 pub mod run;
 pub mod show;
 pub mod tile;
@@ -241,15 +242,50 @@ pub fn analyze(
             "Provide a profile path, or use `cargo raster analyze --follow <path>`.".into(),
         ));
     };
-    println!("Analyzing profile: {}", profile_path.display());
-    println!();
+    if matches!(format, AnalyzeFormat::Text) {
+        println!("Analyzing profile: {}", profile_path.display());
+        println!();
+    }
 
+    #[derive(serde::Deserialize)]
+    struct ProfileKind {
+        kind: Option<String>,
+    }
+    // Read only the discriminator into memory, leaving large native profiles
+    // to their existing reader. An unknown kind must not look like native data.
+    let marker: ProfileKind =
+        serde_json::from_reader(BufReader::new(fs::File::open(&profile_path)?))?;
+    if let Some(kind) = marker.kind {
+        use raster_analysis::replay_profile::{
+            ReplayProfile, LEGACY_ZKVM_PROFILE_KIND, REPLAY_PROFILE_KIND,
+        };
+        if !matches!(
+            kind.as_str(),
+            REPLAY_PROFILE_KIND | LEGACY_ZKVM_PROFILE_KIND
+        ) {
+            return Err(Error::Other(format!("Unknown profile kind: {kind}")));
+        }
+        let profile: ReplayProfile =
+            serde_json::from_reader(BufReader::new(fs::File::open(&profile_path)?))?;
+        profile.validate_format()?;
+        let rendered = match format {
+            AnalyzeFormat::Text => profile.to_text(),
+            AnalyzeFormat::Json => serde_json::to_string_pretty(&profile)?,
+        };
+        println!("{rendered}");
+        return Ok(());
+    }
     let analyzer = Analyzer::from_path(&profile_path)?;
     let metrics = analyzer.analyze()?;
     let report = Report::new(metrics);
     println!("{}", render_report(&report, format)?);
 
     Ok(())
+}
+
+pub(super) fn print_profile_artifact(path: &std::path::Path) {
+    println!("  Execution profile saved to: {}", path.display());
+    println!("  Analyze with: cargo raster analyze {}", path.display());
 }
 
 fn render_report(report: &Report, format: AnalyzeFormat) -> Result<String> {

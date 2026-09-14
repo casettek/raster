@@ -7,6 +7,7 @@
 
 pub mod analyzer;
 pub mod metrics;
+pub mod replay_profile;
 pub mod report;
 
 pub use analyzer::Analyzer;
