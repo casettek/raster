@@ -586,6 +586,40 @@ fn flatten_binding<'a>(binding: &'a InputBinding, out: &mut Vec<&'a InputBinding
     }
 }
 
+/// Index of the program's `ProgramStart` step — the record that opens the root
+/// frame and binds the authorized entry object at coordinates `[]`.
+///
+/// Unique and first by construction (`StepKind::ProgramStart`: "The trace's
+/// first step"), so `position` and `rposition` agree here.
+fn program_start_index(trace: &[StepRecord]) -> Option<usize> {
+    trace
+        .iter()
+        .position(|record| matches!(record.kind, StepKind::ProgramStart(_)))
+}
+
+/// Index of the record that opened `frame`, bounding the search for sources
+/// produced inside it to the invocation currently in flight.
+///
+/// Every frame but the root is opened by the `SequenceStart` carrying its
+/// coordinates, and `rposition` is what picks the *current* invocation: a
+/// sequence called more than once has one such record per entry, and only the
+/// latest is open.
+///
+/// The root frame `[]` is the exception, and it is why scanning for a
+/// `SequenceStart` alone used to fail every top-level step: no record ever
+/// carries `SequenceStart` at `[]`. `ProgramStart` opens `main`'s frame
+/// ("nothing else has yet" — `raster_runtime::tracing::recorder`), and the root
+/// is entered exactly once, so first and last coincide.
+fn frame_opening_index(trace: &[StepRecord], frame: &CfsCoordinates) -> Option<usize> {
+    if frame.is_empty() {
+        return program_start_index(trace);
+    }
+
+    trace.iter().rposition(|record| {
+        matches!(record.kind, StepKind::SequenceStart { .. }) && record.coordinates == *frame
+    })
+}
+
 fn resolve_inputs_sources(
     step_record: &StepRecord,
     trace: &[StepRecord],
@@ -616,13 +650,9 @@ fn resolve_inputs_sources(
         return Vec::new();
     };
 
-    // Find the parent sequence record start
-    let current_sequence_start_index = trace
-        .iter()
-        .rposition(|record| {
-            matches!(record.kind, StepKind::SequenceStart { .. })
-                && record.coordinates == sequence_coordinates
-        })
+    // Find the record that opened this step's frame — `SequenceStart` for a
+    // nested frame, `ProgramStart` for the root.
+    let current_sequence_start_index = frame_opening_index(trace, &sequence_coordinates)
         .unwrap_or_else(|| {
             panic!(
                 "Failed to resolve active sequence invocation for step {:?} in frame {:?}",
@@ -642,21 +672,33 @@ fn resolve_inputs_sources(
             }
             InputBinding::EntryArgument => {
                 // The source is the program's `ProgramStart` step, which bound
-                // the authorized entry object at the sequence root `[]`.
-                let source = trace
-                    .iter()
-                    .enumerate()
-                    .find(|(_, record)| matches!(record.kind, StepKind::ProgramStart(_)))
-                    .map(|(index, record)| (index, record.clone()))
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "Failed to resolve ProgramStart source for entry-argument input of step {:?}",
-                            step_record
-                        )
-                    });
-                source_records.push(source);
+                // the authorized entry object at the sequence root `[]` — the
+                // same record that opens the root frame above.
+                let index = program_start_index(trace).unwrap_or_else(|| {
+                    panic!(
+                        "Failed to resolve ProgramStart source for entry-argument input of step {:?}",
+                        step_record
+                    )
+                });
+                source_records.push((index, trace[index].clone()));
             }
             InputBinding::SequenceScope { input_index } => {
+                // A scope input is a value the frame's *caller* supplied, so the
+                // root frame can never carry one: `main` has no caller, and the
+                // compiler resolves its declared parameters to `EntryArgument`
+                // instead (`FlowResolver::resolve_with_entry_arguments` — "since
+                // `main` has no caller to supply them"). Asserting it names the
+                // broken assumption; without it the lookup below would meet
+                // `ProgramStart` where it expects a `SequenceStart` and report a
+                // missing sequence input, which points at the wrong thing.
+                assert!(
+                    !sequence_coordinates.is_empty(),
+                    "Step {:?} binds sequence-scope input {} at the root frame, but `main` \
+                     has no caller to supply one; its parameters resolve to `EntryArgument`",
+                    step_record,
+                    input_index
+                );
+
                 let (parent_index, source_record) = current_sequence_trace_suffix
                     .first()
                     .filter(|record| {
@@ -745,7 +787,9 @@ fn witness_record_inputs(
 
     for (offset, step_record) in fraud_window.items.iter().enumerate() {
         if step_record.coordinates().is_empty() {
-            // Empty coordinates mean SequenceStart/SequenceEnd of main function
+            // The root coordinate holds only the program boundaries —
+            // `ProgramStart`, `ProgramEnd` and `main`'s `SequenceEnd`. None is a
+            // CFS item, so none binds CFS inputs to resolve.
             continue;
         }
 
@@ -1012,7 +1056,7 @@ mod tests {
         CfsCoordinates, InputBinding, SequenceChildItem, SequenceDef, SequenceItem, TileDef,
         TileItem,
     };
-    use raster_core::trace::StorageRoots;
+    use raster_core::trace::{ProgramStartStep, StorageRoots};
 
     use super::*;
     use crate::precomputed;
@@ -1091,6 +1135,27 @@ mod tests {
             root_after: Vec::new(),
             index_root_before: Vec::new(),
             index_root_after: Vec::new(),
+        }
+    }
+
+    /// The step that opens `main`'s frame, as the recorder emits it: always
+    /// first, always at the root coordinate `[]`, and never a `SequenceStart`.
+    ///
+    /// Fixtures must use this rather than a `SequenceStart` at `[]`, which the
+    /// recorder does not produce — a trace shaped that way hides every defect
+    /// keyed on how the root frame is opened.
+    fn make_program_start_record(exec_index: u64, entry_arguments: Vec<String>) -> StepRecord {
+        StepRecord {
+            exec_index,
+            sequence_id: "main".to_string(),
+            coordinates: CfsCoordinates(vec![]),
+            kind: StepKind::ProgramStart(ProgramStartStep {
+                entry_arguments,
+                output_commitment: Vec::new(),
+                storage: empty_storage_roots(),
+            }),
+            recur_progress_commitment: [0u8; 32],
+            recur_state: None,
         }
     }
 
@@ -1531,7 +1596,7 @@ mod tests {
     #[test]
     fn test_verify_trace_returns_ok_for_producer_dependency() {
         let trace = Trace(vec![
-            make_sequence_start_record(1, "main", vec![], 0),
+            make_program_start_record(1, Vec::new()),
             make_tile_trace_item_at(2, "main", 0, vec![0], "producer".to_string(), 1, 10),
             make_tile_trace_item_at(3, "main", 1, vec![1], "consumer".to_string(), 1, 20),
             make_tile_trace_item_at(4, "main", 2, vec![2], "tail".to_string(), 1, 30),
@@ -1554,7 +1619,7 @@ mod tests {
     #[test]
     fn test_verify_trace_returns_ok_for_sequence_step_seq_input_dependency() {
         let trace = Trace(vec![
-            make_sequence_start_record(1, "main", vec![], 1),
+            make_program_start_record(1, Vec::new()),
             make_sequence_start_record(2, "inner", vec![0], 1),
             make_tile_trace_item_at(3, "inner", 0, vec![0, 0], "inner_tile".to_string(), 1, 10),
             make_sequence_end_record(4, "inner", vec![0]),
@@ -1578,7 +1643,7 @@ mod tests {
     #[test]
     fn test_verify_trace_returns_ok_for_nested_sequence_output_dependency() {
         let trace = Trace(vec![
-            make_sequence_start_record(1, "main", vec![], 1),
+            make_program_start_record(1, Vec::new()),
             make_sequence_start_record(2, "inner", vec![0], 1),
             make_tile_trace_item_at(3, "inner", 0, vec![0, 0], "inner_tile".to_string(), 1, 10),
             make_sequence_end_record(4, "inner", vec![0]),
@@ -1599,17 +1664,218 @@ mod tests {
         assert!(matches!(verification_result, VerificationResult::Ok));
     }
 
+    /// `main` whose *last* item is top-level and reads a prior sibling, so the
+    /// terminal window's first entry is a depth-1 step with a non-inline input.
+    fn make_top_level_tail_dependency_cfs() -> ControlFlowSchema {
+        let mut cfs = ControlFlowSchema::new("test");
+        cfs.tiles.push(TileDef::iter("producer", 1, 1));
+        cfs.tiles.push(TileDef::iter("consumer", 1, 1));
+
+        let mut main = SequenceDef::new("main");
+        main.items.push(SequenceChildItem::Tile(TileItem {
+            id: "producer".to_string(),
+            sources: vec![InputBinding::inline()],
+        }));
+        main.items.push(SequenceChildItem::Tile(TileItem {
+            id: "consumer".to_string(),
+            sources: vec![InputBinding::prior_item_output(0)],
+        }));
+
+        cfs.sequences.push(main);
+        cfs
+    }
+
+    /// `main` declaring an entry argument, read by a top-level item.
+    fn make_top_level_entry_argument_cfs() -> ControlFlowSchema {
+        let mut cfs = ControlFlowSchema::new("test");
+        cfs.tiles.push(TileDef::iter("consumer", 1, 1));
+        cfs.tiles.push(TileDef::iter("tail", 1, 1));
+
+        let mut main = SequenceDef::new("main");
+        main.entry_arguments = vec!["arg".to_string()];
+        main.items.push(SequenceChildItem::Tile(TileItem {
+            id: "consumer".to_string(),
+            sources: vec![InputBinding::entry_argument()],
+        }));
+        main.items.push(SequenceChildItem::Tile(TileItem {
+            id: "tail".to_string(),
+            sources: vec![InputBinding::inline()],
+        }));
+
+        cfs.sequences.push(main);
+        cfs
+    }
+
+    /// A top-level item binding `SequenceScope`, which the compiler never emits
+    /// — `main` has no caller. Only constructible by hand, which is the point.
+    fn make_root_sequence_scope_cfs() -> ControlFlowSchema {
+        let mut cfs = ControlFlowSchema::new("test");
+        cfs.tiles.push(TileDef::iter("consumer", 1, 1));
+        cfs.tiles.push(TileDef::iter("tail", 1, 1));
+
+        let mut main = SequenceDef::new("main");
+        main.input_sources = vec![InputBinding::inline()];
+        main.items.push(SequenceChildItem::Tile(TileItem {
+            id: "consumer".to_string(),
+            sources: vec![InputBinding::seq_input(0)],
+        }));
+        main.items.push(SequenceChildItem::Tile(TileItem {
+            id: "tail".to_string(),
+            sources: vec![InputBinding::inline()],
+        }));
+
+        cfs.sequences.push(main);
+        cfs
+    }
+
+    /// A divergence whose window holds a *top-level* step with a non-inline
+    /// input used to panic in evidence construction, before any window was
+    /// produced: `resolve_inputs_sources` scanned for the `SequenceStart` that
+    /// opened frame `[]`, and `ProgramStart` opens it.
+    #[test]
+    fn fraud_window_resolves_top_level_step_inputs() {
+        let committed_trace = Trace(vec![
+            make_program_start_record(1, Vec::new()),
+            make_tile_trace_item_at(2, "main", 0, vec![0], "producer".to_string(), 1, 10),
+            make_tile_trace_item_at(3, "main", 1, vec![1], "consumer".to_string(), 1, 20),
+            make_tile_trace_item_at(4, "main", 2, vec![2], "tail".to_string(), 1, 30),
+            make_sequence_end_record(5, "main", vec![]),
+        ]);
+        // Diverges at index 2, so the window is [producer@[0], consumer@[1]] and
+        // `consumer` — depth 1, reading a prior sibling — must resolve.
+        let mut runtime_trace = committed_trace.clone();
+        runtime_trace.0[2] =
+            make_tile_trace_item_at(3, "main", 1, vec![1], "consumer".to_string(), 1, 999);
+
+        let trace_commitment = TraceCommitment::build(
+            &committed_trace,
+            &precomputed::EMPTY_TRIE_NODES[0],
+            test_fraud_proof_config(),
+        );
+        let cfs = make_producer_dependency_cfs();
+        let mut trace_verifier =
+            TraceVerifier::new(trace_commitment, &precomputed::EMPTY_TRIE_NODES[0], &cfs)
+                .expect("valid commitment");
+
+        let VerificationResult::Fraud(evidence) = trace_verifier.verify(&runtime_trace) else {
+            panic!("expected a divergence at the consumer step");
+        };
+
+        // The producer is the resolved source, and it is witnessed.
+        assert!(
+            evidence
+                .input_sources_witnesses
+                .contains_key(&committed_trace.0[1]),
+            "producer step should be witnessed as the consumer's input source",
+        );
+    }
+
+    /// The same defect on the non-fraud path: `terminal_window` witnesses its
+    /// window through the identical resolution.
+    #[test]
+    fn terminal_window_resolves_top_level_step_inputs() {
+        let trace = Trace(vec![
+            make_program_start_record(1, Vec::new()),
+            make_tile_trace_item_at(2, "main", 0, vec![0], "producer".to_string(), 1, 10),
+            make_tile_trace_item_at(3, "main", 1, vec![1], "consumer".to_string(), 1, 20),
+            make_sequence_end_record(4, "main", vec![]),
+        ]);
+        let trace_commitment = TraceCommitment::build(
+            &trace,
+            &precomputed::EMPTY_TRIE_NODES[0],
+            test_fraud_proof_config(),
+        );
+        let cfs = make_top_level_tail_dependency_cfs();
+        let mut trace_verifier =
+            TraceVerifier::new(trace_commitment, &precomputed::EMPTY_TRIE_NODES[0], &cfs)
+                .expect("valid commitment");
+
+        let evidence = trace_verifier
+            .terminal_window(&trace)
+            .expect("terminal window over a trace longer than the window");
+
+        assert!(
+            evidence.input_sources_witnesses.contains_key(&trace.0[1]),
+            "producer step should be witnessed as the consumer's input source",
+        );
+    }
+
+    /// `EntryArgument` at a top-level step resolves to `ProgramStart` — the same
+    /// record that opens the root frame. Unreachable before the frame lookup was
+    /// fixed: the scan panicked before this arm ran.
+    #[test]
+    fn entry_argument_at_top_level_resolves_to_program_start() {
+        let committed_trace = Trace(vec![
+            make_program_start_record(1, vec!["arg".to_string()]),
+            make_tile_trace_item_at(2, "main", 0, vec![0], "consumer".to_string(), 1, 20),
+            make_tile_trace_item_at(3, "main", 1, vec![1], "tail".to_string(), 1, 30),
+            make_sequence_end_record(4, "main", vec![]),
+        ]);
+        let mut runtime_trace = committed_trace.clone();
+        runtime_trace.0[1] =
+            make_tile_trace_item_at(2, "main", 0, vec![0], "consumer".to_string(), 1, 999);
+
+        let trace_commitment = TraceCommitment::build(
+            &committed_trace,
+            &precomputed::EMPTY_TRIE_NODES[0],
+            test_fraud_proof_config(),
+        );
+        let cfs = make_top_level_entry_argument_cfs();
+        let mut trace_verifier =
+            TraceVerifier::new(trace_commitment, &precomputed::EMPTY_TRIE_NODES[0], &cfs)
+                .expect("valid commitment");
+
+        let VerificationResult::Fraud(evidence) = trace_verifier.verify(&runtime_trace) else {
+            panic!("expected a divergence at the consumer step");
+        };
+
+        assert!(
+            evidence
+                .input_sources_witnesses
+                .contains_key(&committed_trace.0[0]),
+            "ProgramStart should be witnessed as the entry-argument source",
+        );
+    }
+
+    /// `main` has no caller, so a scope binding at the root frame is a broken
+    /// assumption, not a missing record. It must say so.
+    #[test]
+    #[should_panic(expected = "has no caller to supply one")]
+    fn sequence_scope_at_root_frame_is_refused() {
+        let committed_trace = Trace(vec![
+            make_program_start_record(1, Vec::new()),
+            make_tile_trace_item_at(2, "main", 0, vec![0], "consumer".to_string(), 1, 20),
+            make_tile_trace_item_at(3, "main", 1, vec![1], "tail".to_string(), 1, 30),
+            make_sequence_end_record(4, "main", vec![]),
+        ]);
+        let mut runtime_trace = committed_trace.clone();
+        runtime_trace.0[1] =
+            make_tile_trace_item_at(2, "main", 0, vec![0], "consumer".to_string(), 1, 999);
+
+        let trace_commitment = TraceCommitment::build(
+            &committed_trace,
+            &precomputed::EMPTY_TRIE_NODES[0],
+            test_fraud_proof_config(),
+        );
+        let cfs = make_root_sequence_scope_cfs();
+        let mut trace_verifier =
+            TraceVerifier::new(trace_commitment, &precomputed::EMPTY_TRIE_NODES[0], &cfs)
+                .expect("valid commitment");
+
+        let _ = trace_verifier.verify(&runtime_trace);
+    }
+
     #[test]
     #[should_panic(expected = "Failed to resolve source record")]
     fn test_verify_trace_returns_failure_for_unresolved_required_prior_item_output() {
         let runtime_trace = Trace(vec![
-            make_sequence_start_record(1, "main", vec![], 0),
+            make_program_start_record(1, Vec::new()),
             make_tile_trace_item_at(2, "main", 1, vec![1], "consumer".to_string(), 1, 20),
             make_tile_trace_item_at(3, "main", 2, vec![2], "tail".to_string(), 1, 30),
             make_sequence_end_record(4, "main", vec![]),
         ]);
         let committed_trace = Trace(vec![
-            make_sequence_start_record(1, "main", vec![], 0),
+            make_program_start_record(1, Vec::new()),
             make_tile_trace_item_at(2, "main", 1, vec![1], "consumer".to_string(), 1, 999),
             make_tile_trace_item_at(3, "main", 2, vec![2], "tail".to_string(), 1, 30),
             make_sequence_end_record(4, "main", vec![]),
