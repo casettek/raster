@@ -2198,6 +2198,30 @@ mod fingerprint_slice {
         )
     }
 
+    /// A header whose tail-roots commitment matches `tail_roots`, so the
+    /// revealed-tail binding can be exercised.
+    fn build_header_and_witness_with_tail(
+        bits: &[u64],
+        bits_per_item: usize,
+        fingerprint_len: usize,
+        window_start: usize,
+        window_len: usize,
+        tail_roots: &[Vec<u8>],
+    ) -> (TraceCommitmentHeader, FingerprintSliceWitness) {
+        let (mut header, witness) = build_header_and_witness_for_window(
+            bits,
+            bits_per_item,
+            fingerprint_len,
+            window_start,
+            window_len,
+            tail_roots.len(),
+        );
+        header.revealed_tail_roots_commitment = sha256_bytes(
+            &postcard::to_allocvec(&tail_roots.to_vec()).expect("tail roots serialize"),
+        );
+        (header, witness)
+    }
+
     /// As above, but the commitment declares `window_size` independently of the
     /// window actually presented — which is what the shape check is about.
     fn build_header_and_witness_for_window(
@@ -2292,7 +2316,7 @@ mod fingerprint_slice {
     /// witness is forged. The lie is only the window's shape, which is why no
     /// other check catches it.
     #[test]
-    #[should_panic(expected = "but the commitment was built with a window of")]
+    #[should_panic(expected = "against a commitment built with a window of")]
     fn a_short_window_is_refused_anywhere_in_the_commitment() {
         let (bits_per_item, items) = (4, 40);
         let bits = fixture_bits(bits_per_item, items);
@@ -2317,12 +2341,221 @@ mod fingerprint_slice {
             &init_transition_with_window(window_start, window),
             &header,
             &witness,
+            None,
         );
+    }
+
+    /// The tail roots, when supplied, are bound to the commitment — and the
+    /// root the terminal step will need is picked out at the same time.
+    #[test]
+    fn a_window_ending_in_the_tail_carries_its_committed_root() {
+        let (bits_per_item, items) = (4, 40);
+        let bits = fixture_bits(bits_per_item, items);
+        // The commitment's window is 4, so its tail covers items 36..40.
+        // A window ending at item 39 ends inside it.
+        let (window_start, window_len) = (36, 4);
+        let tail_roots: Vec<Vec<u8>> = (36..40u8).map(|i| vec![i; 32]).collect();
+
+        let packer = BitPacker::new(bits_per_item);
+        let window_bits = packer
+            .get_range(window_start, window_start + window_len, &bits)
+            .expect("window slice");
+        let window = Fingerprint::from(window_bits, packer, window_len);
+
+        let (header, witness) = build_header_and_witness_with_tail(
+            &bits,
+            bits_per_item,
+            items,
+            window_start,
+            window_len,
+            &tail_roots,
+        );
+        let binding = assert_window_is_commitment_slice(
+            &init_transition_with_window(window_start, window),
+            &header,
+            &witness,
+            Some(&tail_roots),
+        );
+
+        assert!(binding.window_is_terminal);
+        // Item 39 is the last of the tail.
+        assert_eq!(binding.final_committed_root, Some(vec![39u8; 32]));
+    }
+
+    /// A window that ends before the revealed tail gets no root, and so keeps
+    /// proving divergence the only way it can — on fingerprint entries.
+    #[test]
+    fn a_window_ending_before_the_tail_carries_no_committed_root() {
+        let (bits_per_item, items) = (4, 40);
+        let bits = fixture_bits(bits_per_item, items);
+        let (window_start, window_len) = (10, 4);
+        let tail_roots: Vec<Vec<u8>> = (36..40u8).map(|i| vec![i; 32]).collect();
+
+        let packer = BitPacker::new(bits_per_item);
+        let window_bits = packer
+            .get_range(window_start, window_start + window_len, &bits)
+            .expect("window slice");
+        let window = Fingerprint::from(window_bits, packer, window_len);
+
+        let (header, witness) = build_header_and_witness_with_tail(
+            &bits,
+            bits_per_item,
+            items,
+            window_start,
+            window_len,
+            &tail_roots,
+        );
+        let binding = assert_window_is_commitment_slice(
+            &init_transition_with_window(window_start, window),
+            &header,
+            &witness,
+            Some(&tail_roots),
+        );
+
+        assert!(!binding.window_is_terminal);
+        assert_eq!(binding.final_committed_root, None);
+    }
+
+    /// Supplying roots the commitment did not commit to is refused — otherwise
+    /// a challenger could invent a root to "diverge" from.
+    #[test]
+    #[should_panic(expected = "do not match the commitment's tail-roots commitment")]
+    fn fabricated_tail_roots_are_refused() {
+        let (bits_per_item, items) = (4, 40);
+        let bits = fixture_bits(bits_per_item, items);
+        let (window_start, window_len) = (36, 4);
+        let committed: Vec<Vec<u8>> = (36..40u8).map(|i| vec![i; 32]).collect();
+
+        let packer = BitPacker::new(bits_per_item);
+        let window_bits = packer
+            .get_range(window_start, window_start + window_len, &bits)
+            .expect("window slice");
+        let window = Fingerprint::from(window_bits, packer, window_len);
+
+        let (header, witness) = build_header_and_witness_with_tail(
+            &bits,
+            bits_per_item,
+            items,
+            window_start,
+            window_len,
+            &committed,
+        );
+
+        // A different story about the tail, so the terminal step could claim a
+        // divergence that never happened.
+        let invented: Vec<Vec<u8>> = (36..40u8).map(|i| vec![i ^ 0xFF; 32]).collect();
+        assert_window_is_commitment_slice(
+            &init_transition_with_window(window_start, window),
+            &header,
+            &witness,
+            Some(&invented),
+        );
+    }
+
+    /// A window opening at the genesis state — the one place a short window is
+    /// legitimate.
+    fn genesis_init_transition(window: Fingerprint) -> InitTransition {
+        InitTransition {
+            init_frontier: SerializableFrontier {
+                position: 0,
+                leaf: EMPTY_LEAF.to_vec(),
+                ommers: Vec::new(),
+            },
+            init_storage_frontier: SerializableFrontier {
+                position: 0,
+                leaf: EMPTY_LEAF.to_vec(),
+                ommers: Vec::new(),
+            },
+            init_storage_root: Vec::new(),
+            init_storage_index_root: coordinate_index_root(&BTreeMap::new()),
+            active_drafts: BTreeMap::new(),
+            fingerprint: window,
+        }
+    }
+
+    fn short_genesis_window(
+        bits: &[u64],
+        bits_per_item: usize,
+        items: usize,
+        window_len: usize,
+        window_size: usize,
+    ) -> (InitTransition, TraceCommitmentHeader, FingerprintSliceWitness) {
+        let packer = BitPacker::new(bits_per_item);
+        let window_bits = packer
+            .get_range(0, window_len, bits)
+            .expect("window slice");
+        let window = Fingerprint::from(window_bits, packer, window_len);
+        let (header, witness) = build_header_and_witness_for_window(
+            bits, bits_per_item, items, 0, window_len, window_size,
+        );
+        (genesis_init_transition(window), header, witness)
+    }
+
+    /// A divergence inside the trace's first `window_size` steps has no room
+    /// for a full window behind it, so the honest host emits a short one — and
+    /// it can only ever do so at trace index 0.
+    ///
+    /// It carries no pre-divergence margin, and needs none: the margin exists
+    /// to pin a *challenger-supplied* opening state, and at index 0 the opening
+    /// state is the public genesis constant instead.
+    #[test]
+    fn a_short_window_at_genesis_is_accepted() {
+        let (bits_per_item, items) = (4, 40);
+        let bits = fixture_bits(bits_per_item, items);
+        let (init, header, witness) = short_genesis_window(&bits, bits_per_item, items, 2, 4);
+
+        let binding = assert_window_is_commitment_slice(&init, &header, &witness, None);
+        assert!(!binding.window_is_terminal);
+    }
+
+    /// Even a one-item window, which is what a divergence in the trace's very
+    /// first step produces.
+    #[test]
+    fn a_one_item_genesis_window_is_accepted() {
+        let (bits_per_item, items) = (4, 40);
+        let bits = fixture_bits(bits_per_item, items);
+        let (init, header, witness) = short_genesis_window(&bits, bits_per_item, items, 1, 4);
+
+        assert_window_is_commitment_slice(&init, &header, &witness, None);
+    }
+
+    /// Position 0 alone is not enough: the opening *state* has to be genesis,
+    /// or the missing margin would be a hole rather than an irrelevance.
+    #[test]
+    #[should_panic(expected = "must open on an empty coordinate index")]
+    fn a_short_window_claiming_genesis_with_dirty_storage_is_refused() {
+        let (bits_per_item, items) = (4, 40);
+        let bits = fixture_bits(bits_per_item, items);
+        let (mut init, header, witness) = short_genesis_window(&bits, bits_per_item, items, 2, 4);
+
+        // Storage that already holds something cannot be the state before the
+        // program's first step.
+        init.init_storage_index_root = vec![7u8; 32];
+
+        assert_window_is_commitment_slice(&init, &header, &witness, None);
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot have a draft in flight")]
+    fn a_short_window_claiming_genesis_with_a_live_draft_is_refused() {
+        let (bits_per_item, items) = (4, 40);
+        let bits = fixture_bits(bits_per_item, items);
+        let (mut init, header, witness) = short_genesis_window(&bits, bits_per_item, items, 2, 4);
+
+        init.active_drafts.insert(
+            [9u8; 32],
+            TrackedDraftState {
+                schema_hash: [1u8; 32],
+                root: [2u8; 32],
+            },
+        );
+
+        assert_window_is_commitment_slice(&init, &header, &witness, None);
     }
 
     /// The other direction: claiming more items than the commitment's window.
     #[test]
-    #[should_panic(expected = "but the commitment was built with a window of")]
+    #[should_panic(expected = "against a commitment built with a window of")]
     fn a_window_longer_than_the_commitments_is_refused() {
         let (bits_per_item, items) = (4, 40);
         let bits = fixture_bits(bits_per_item, items);
@@ -2346,6 +2579,7 @@ mod fingerprint_slice {
             &init_transition_with_window(window_start, window),
             &header,
             &witness,
+            None,
         );
     }
 
@@ -2368,6 +2602,7 @@ mod fingerprint_slice {
             &init_transition_with_window(window_start, window),
             &header,
             &witness,
+            None,
         );
     }
 
@@ -2392,6 +2627,7 @@ mod fingerprint_slice {
             &init_transition_with_window(window_start, window),
             &header,
             &witness,
+            None,
         );
     }
 
@@ -2416,6 +2652,7 @@ mod fingerprint_slice {
             &init_transition_with_window(window_start + 1, window),
             &header,
             &witness,
+            None,
         );
     }
 
@@ -2439,6 +2676,7 @@ mod fingerprint_slice {
             &init_transition_with_window(window_start, window),
             &header,
             &witness,
+            None,
         );
     }
 
@@ -2458,6 +2696,7 @@ mod fingerprint_slice {
             &init_transition_with_window(window_start, window),
             &header,
             &witness,
+            None,
         );
     }
 
@@ -2480,7 +2719,9 @@ mod fingerprint_slice {
             &init_transition_with_window(window_start, window),
             &header,
             &witness,
+            None,
         )
+        .window_is_terminal
     }
 
     /// A window ending exactly at the committed fingerprint's end is terminal:

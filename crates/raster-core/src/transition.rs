@@ -231,6 +231,16 @@ pub struct TransitionInput {
     /// Both `None` for every other step and for a unit program's end.
     pub program_output_read_witness: Option<StorageReadWitness>,
     pub program_output_selection_witness: Option<SelectionWitness>,
+
+    /// The commitment's revealed tail roots, read only by the window-opening
+    /// step and bound there against `TraceCommitmentHeader::
+    /// revealed_tail_roots_commitment`.
+    ///
+    /// Optional because they only buy anything when the window's final index
+    /// falls inside the revealed tail. Omitting them costs the challenger the
+    /// root-divergence route and nothing else, so absence is never an attack.
+    #[serde(default)]
+    pub revealed_tail_roots: Option<Vec<Vec<u8>>>,
 }
 
 /// Result of applying one transition (new frontier and fingerprint state).
@@ -386,4 +396,17 @@ pub struct TransitionJournal {
     /// the trace's actual result, not the output of some `ProgramEnd`
     /// sitting mid-commitment. See `docs/proposals/chain-io-commitment.md`.
     pub window_is_terminal: bool,
+
+    /// The committed trace root revealed for this window's **final** index,
+    /// when that index falls inside the commitment's revealed tail.
+    ///
+    /// Derived at `Init` — the only step holding the header — and inherited
+    /// across `Next`, because the step that needs it is the last one. It is
+    /// what lets a tail divergence be *proven* and not merely detected: the
+    /// packed fingerprint keeps `bits_per_item` bits of each root, so when
+    /// every entry from the divergence to the end collides there is nothing
+    /// left in the fingerprint to diverge on, and at `window_size >= 128`
+    /// (`bits_per_item == 1`) that is a coin flip rather than a rarity.
+    #[serde(default)]
+    pub final_committed_root: Option<Vec<u8>>,
 }

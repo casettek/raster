@@ -198,9 +198,12 @@ enum Commands {
 
         /// Number of trace items covered by a fraud-proof window; must be a
         /// power of two between 2 and 1024. Fingerprint bits revealed per item
-        /// are derived from it to reach 128-bit fraud detection (window 128 ->
-        /// 1 bit/item, 32 -> 4 bits/item). Required with --commit; audits
-        /// derive it from the commitment file.
+        /// are derived from it so that one window reveals 128 bits (window 128
+        /// -> 1 bit/item, 32 -> 4 bits/item). The trace's final window is
+        /// covered separately: its trace roots are committed in full, so
+        /// detection there does not depend on bits per item. Sizing this is
+        /// therefore a proof-size choice, not a detection-strength one.
+        /// Required with --commit; audits derive it from the commitment file.
         #[arg(
             long = "fraud-proof-window-size",
             value_parser = parse_fraud_proof_config,

@@ -577,6 +577,15 @@ impl<T: Clone> Window<T> {
     fn to_vec(&self) -> Vec<T> {
         self.queue.clone().into_iter().flatten().collect()
     }
+
+    /// Items actually held, which is `size` only once the buffer has filled.
+    /// Not `self.size`: the queue always has `size` slots, pre-filled with
+    /// `None` and flattened away on read, so before the window fills the
+    /// capacity and the occupancy disagree — which is exactly the case a
+    /// head window is.
+    fn len(&self) -> usize {
+        self.queue.iter().flatten().count()
+    }
 }
 
 fn sequence_coordinates(step_record: &StepRecord) -> Option<(CfsCoordinates, u32)> {
@@ -1029,21 +1038,44 @@ impl<'a> TraceVerifier<'a> {
             };
 
             if diverges {
+                // The rolling buffers *measure* the window; this slice has to
+                // reproduce what they already know. `index.saturating_sub(w) + 1`
+                // did not: below `w` the `saturating_sub` floors to 0 and the
+                // `+ 1` lands on **1**, giving one entry too few *and* starting
+                // one item late, so window item 0 was compared against
+                // committed item 1. At `index == 0` the range was `1..1` and
+                // the slice came back empty while still declaring `w` items.
+                //
+                // Clamping instead is identical for `index >= w` and yields 0
+                // at the head, which is where the window genuinely starts.
+                let window_len = self.window_items.len();
                 let diff_bits = self
                     .trace_commitment
                     .fingerprint
                     .bits_packer
                     .get_range(
-                        index.saturating_sub(self.window_size) + 1,
+                        (index + 1).saturating_sub(self.window_size),
                         index + 1,
                         &self.trace_commitment.fingerprint.bits,
                     )
                     .unwrap();
 
+                // Declare what the slice holds, not the window's capacity.
+                // `Fingerprint::from` stores `len` verbatim without checking it
+                // against `bits`, and the guest reads that declared length as
+                // authoritative — which is how a head window used to travel all
+                // the way there claiming items it did not carry.
+                assert_eq!(
+                    diff_bits.len(),
+                    (window_len * self.trace_commitment.fingerprint.bits_per_item()).div_ceil(64),
+                    "fraud window slice holds {} blocks but declares {} items",
+                    diff_bits.len(),
+                    window_len,
+                );
                 let window_fingerprint = Fingerprint::from(
                     diff_bits,
                     self.trace_commitment.fingerprint.bits_packer,
-                    self.window_size,
+                    window_len,
                 );
 
                 let window_frontier = self.window_frontiers.first().unwrap().clone();
@@ -1091,8 +1123,15 @@ impl<'a> TraceVerifier<'a> {
     /// Shares `verify`'s walk deliberately: the trailing `Window` buffers, the
     /// frontier alignment (`window_frontiers.first()` is the frontier *before*
     /// the first window item) and the input-source witnessing are the same
-    /// mechanism, so the two windows are constructed the same way and can be
-    /// fed to the same prover.
+    /// mechanism, and both feed the same prover.
+    ///
+    /// They differ in exactly one way, and it is worth naming because this
+    /// comment used to deny it: a terminal window is **always** `window_size`
+    /// items — the trace is refused outright if it is shorter — while a fraud
+    /// window is shorter than that whenever the divergence falls inside the
+    /// trace's first `window_size` steps. Such a window opens at trace index 0,
+    /// where the guest asserts the genesis opening state instead of relying on
+    /// a pre-divergence margin it cannot have.
     pub fn terminal_window(&mut self, trace: &Trace) -> Result<FraudEvidence> {
         if trace.len() < self.window_size {
             return Err(BitPackerError::InvalidWindow(format!(
@@ -1651,6 +1690,70 @@ mod tests {
 
         let short = Trace(trace.iter().take(1).cloned().collect());
         assert!(trace_verifier.terminal_window(&short).is_err());
+    }
+
+    /// Window geometry across the head boundary.
+    ///
+    /// Three channels must describe the same range of trace indices: the
+    /// frontier says *where* the window starts, the declared length says *how
+    /// many* items, and the bits say *what* the committed values are. The
+    /// buffers measure the first two; the slice computes the third and has to
+    /// agree.
+    ///
+    /// The offset assertion is the load-bearing one. A length-only check passes
+    /// on a slice that is short *and* shifted, which is exactly what the old
+    /// `index.saturating_sub(w) + 1` produced below `w`.
+    #[test]
+    fn fraud_window_geometry_agrees_across_the_head_boundary() {
+        let seed = precomputed::EMPTY_TRIE_NODES[0];
+        let config = test_fraud_proof_config();
+        let window_size = config.window_size;
+        let committed = Trace((0..12).map(|i| make_tile_trace_item(i, i)).collect());
+        let commitment = TraceCommitment::build(&committed, &seed, config);
+        let cfs = make_test_cfs();
+
+        for divergence in 0..=window_size + 1 {
+            let mut runtime = committed.clone();
+            runtime.0[divergence] = make_tile_trace_item(divergence as u64, 900 + divergence as u64);
+
+            let mut verifier = TraceVerifier::new(commitment.clone(), &seed, &cfs)
+                .expect("valid commitment");
+            let VerificationResult::Fraud(evidence) = verifier.verify(&runtime) else {
+                panic!("expected a divergence at index {divergence}");
+            };
+
+            let window = &evidence.window;
+            let expected_len = (divergence + 1).min(window_size);
+            let window_start = SerializableFrontier::from_bytes(&window.frontier)
+                .expect("window frontier")
+                .position as usize;
+
+            // How many: the declared length is the measured item count.
+            assert_eq!(window.items.len(), expected_len, "items at {divergence}");
+            assert_eq!(window.fingerprint.len(), expected_len, "declared at {divergence}");
+            assert_eq!(
+                window.fingerprint.bits.len(),
+                (expected_len * config.bits_per_item).div_ceil(64),
+                "blocks actually held at {divergence}",
+            );
+
+            // Where: the frontier and the slice agree on the first item.
+            assert_eq!(window_start, divergence + 1 - expected_len, "start at {divergence}");
+            let committed_at_start = commitment
+                .fingerprint
+                .bits_packer
+                .try_get(window_start, &commitment.fingerprint.bits)
+                .expect("committed entry at the window's start");
+            let window_at_zero = window
+                .fingerprint
+                .bits_packer
+                .try_get(0, &window.fingerprint.bits)
+                .expect("window entry 0");
+            assert_eq!(
+                window_at_zero, committed_at_start,
+                "window item 0 must be the committed entry at the frontier's position ({divergence})",
+            );
+        }
     }
 
     /// The cumulative root after every step of `trace`.

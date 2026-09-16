@@ -1,6 +1,27 @@
 # Issue: `fraud-window-trace-ends` — the window the 128-bit argument assumes does not exist at either end of a trace
 
-Status: open 2026-09-11. Unowned.
+Status: **closed** 2026-09-16.
+
+Closed by:
+- [`trace-end-windows`](../proposals/trace-end-windows.md) — §2, §3, and the head/tail halves of
+  §5. Clamps the head slice, reveals the tail's trace roots so detection there stops reading the
+  fingerprint, asserts the genesis opening state in place of a margin a head window cannot have,
+  and removes the `First` exemption so a one-item window is provable.
+- [`trace-leaf-field-binding`](../proposals/trace-leaf-field-binding.md) — the
+  `witness_record_inputs` panic this issue records as a separate defect in §2 and §5, plus three
+  soundness breaks found while fixing it: `exec_index` and `sequence_id` reached the trace leaf
+  unverified, the sequence-scope witness was bound to nothing, and the window's *shape* was
+  unbound. Each let a dishonest challenger forge a receipt against an honest prover, none is
+  about the ends of a trace, and all of them predate this issue.
+
+The framing question §5 closes on — **is `window_size` one parameter or two?** — is answered
+*one*. Revealing the tail's roots removes the conflict instead of splitting the parameter:
+detection in the final window no longer reads the fingerprint, so per-item strength stops
+mattering exactly where it was weakest. Sizing the window became a proof-size choice.
+
+§4's "not a soundness hole" held for what this issue reported, and did not hold for the codebase:
+the fraud-proof path had three soundness holes at the time of writing, none visible from the
+window's arithmetic.
 
 Reproduced against `feature/recur-mid-seed` at `63980a9`. Every citation is committed code.
 

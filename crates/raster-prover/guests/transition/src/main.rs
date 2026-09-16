@@ -60,7 +60,7 @@ fn main() {
     // Continue the window, or finish on the proven fingerprint divergence.
     let current_state = next.finalize(
         &window_context.init_state.fingerprint,
-        &window_context.position,
+        window_context.final_committed_root.as_ref(),
     );
 
     commit_journal(
@@ -70,6 +70,7 @@ fn main() {
         params.program_commitment,
         window_context.refuted_trace_commitment,
         window_context.window_is_terminal,
+        window_context.final_committed_root,
         &input,
         entrypoint_authorization,
         output_authorization,

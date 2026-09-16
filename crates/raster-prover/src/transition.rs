@@ -59,6 +59,10 @@ fn build_transition_input(
     // Recur progress the window opens with. `Some` only on a window's first
     // step; every later step inherits the preimage through `Transition`.
     window_start_recur_progress: Option<RecurProgressStack>,
+    // The commitment's revealed tail roots. `Some` only on the first step —
+    // the only one holding the header to bind them against; the root the
+    // terminal step needs is carried forward on the journal.
+    revealed_tail_roots: Option<Vec<Vec<u8>>>,
 ) -> TransitionInput {
     let StepIo {
         input_witness,
@@ -106,6 +110,7 @@ fn build_transition_input(
         entrypoint_membership_witness: entrypoint_membership_witness.cloned(),
         program_output_read_witness,
         program_output_selection_witness,
+        revealed_tail_roots,
     }
 }
 
@@ -187,6 +192,10 @@ pub fn step_transitions(
     authorization_receipt: &risc0_zkvm::Receipt,
     entrypoint_membership_witness: Option<&StorageReadWitness>,
     window_start_recur_progress: Option<RecurProgressStack>,
+    // The commitment's revealed tail roots, so a divergence the packed
+    // fingerprint is blind to can still be proven. See
+    // `TransitionJournal::final_committed_root`.
+    revealed_tail_roots: &[Vec<u8>],
 ) -> Option<risc0_zkvm::Receipt> {
     let prover = risc0_zkvm::default_prover();
 
@@ -232,6 +241,11 @@ pub fn step_transitions(
                 .is_none()
                 .then(|| window_start_recur_progress.clone())
                 .flatten(),
+            // Same guard again: bound at `Init` against the header, then
+            // carried forward as a single root on the journal.
+            current_journal
+                .is_none()
+                .then(|| revealed_tail_roots.to_vec()),
         );
         let replay_receipt_assumption: Option<risc0_zkvm::Receipt> =
             if step_record.requires_replay_proof() {
@@ -419,6 +433,7 @@ mod tests {
             &make_authorization_journal(),
             None,
             None,
+            None,
         );
 
         // The right replayed result is selected by step-record key.
@@ -463,6 +478,7 @@ mod tests {
             &recorded_step_io,
             &replayed_results,
             &make_authorization_journal(),
+            None,
             None,
             None,
         );
@@ -511,6 +527,7 @@ mod tests {
             &make_authorization_journal(),
             None,
             None,
+            None,
         );
         let end_input = build_transition_input(
             &sequence_end,
@@ -518,6 +535,7 @@ mod tests {
             &recorded_step_io,
             &HashMap::new(),
             &make_authorization_journal(),
+            None,
             None,
             None,
         );
@@ -617,6 +635,7 @@ mod tests {
             entrypoint_membership_witness: None,
             program_output_read_witness: None,
             program_output_selection_witness: None,
+            revealed_tail_roots: None,
         };
         let window_fingerprint = Fingerprint::from(vec![0], BitPacker::new(64), 1);
         let state = TransitionState::Init(InitTransition {

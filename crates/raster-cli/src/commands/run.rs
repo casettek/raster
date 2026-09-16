@@ -1052,6 +1052,9 @@ pub fn prove(
             &authorization_receipt,
             entrypoint_membership_witness.as_ref(),
             window_start_recur_progress,
+            // Lets a divergence the packed fingerprint is blind to still be
+            // proven — the tail's roots are revealed in full.
+            &trace_commitment.revealed_tail_roots,
         ) else {
             panic!("Failed to generate fraud proof");
         };
