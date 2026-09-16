@@ -273,11 +273,23 @@ commitment over them change. `prompt-prepare/commit.bin` must be regenerated.
 Neither is this issue's defect; both were uncovered by running past it, and each deserves its own
 issue if it reproduces outside this environment.
 
-- **Program identity drift** — `build_program_frame` (`run.rs:782-786`) panics with
-  `reassembled commitment 3489fc70… != Raster.lock 3955e106… — run 'cargo raster build'`. Running
-  `cargo raster build` does **not** change the lock, so the builder and
-  `program::reassemble_and_verify` disagree about the commitment rather than the lock being stale.
-  Only the fraud path reaches this: an honest audit returns `Ok` before `prove()`.
+- ~~**Program identity drift**~~ — **fixed 2026-09-17.** The two paths never disagreed. Plain
+  `cargo raster build` defaults to `--backend native`, and `commands::build` emits `program.bin` +
+  `Raster.lock` **only** under risc0, because image ids need compiled guests — so the command the
+  error recommends reports success, changes nothing, and returns the same error. `cargo raster
+  build --backend risc0` writes `3489fc70…`, exactly what `reassemble_and_verify` computes, and
+  the drift clears. Fixed by naming the working command in all three messages
+  (`program.rs:279`, `:308`, `:326`) and by having `build` say when it has *not* written those
+  artifacts rather than printing a bare `Build complete!`. Only the fraud path reaches the check:
+  an honest audit returns `Ok` before `prove()`, which is why a stale lock can sit unnoticed.
+- **The transition guest cannot decode the `ProgramDefinition` frame** — newly reached once the
+  lock was refreshed, and the current blocker:
+  `guests/transition/src/fraud_proof.rs:64` → `failed to decode ProgramDefinition: Found a bool
+  that wasn't 0 or 1`, surfacing host-side at `raster-prover/src/transition.rs:289`. A postcard
+  misalignment of that shape means the host and the guest disagree about the struct's layout,
+  which normally means the embedded guest ELF was built against a different `raster-core`. Worth
+  ruling out a stale risc0 build cache first, since `RISC0_SKIP_BUILD=1` is used freely during
+  development and this workspace has moved `raster-core` repeatedly.
 - **Replay journal decode failures** — `Failed to decode replay journal: Hit the end of buffer`
   for every tile, non-fatal (`run.rs:1002` prints and continues). Consistent with prebuilt tile
   guests predating a `raster-core` change; a clean guest rebuild would confirm.
