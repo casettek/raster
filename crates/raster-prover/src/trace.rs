@@ -8,7 +8,7 @@ use incrementalmerkletree::{MerklePath, Position};
 use raster_core::cfs::{
     CfsCoordinates, CfsCursor, ControlFlowSchema, InputBinding, InputSource, SequenceChildItem,
 };
-use raster_core::fingerprint::{Fingerprint, FingerprintAccumulator};
+use raster_core::fingerprint::{fingerprint_value, Fingerprint, FingerprintAccumulator};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
@@ -266,9 +266,17 @@ impl TraceCommitmentExt for TraceCommitment {
         let mut fingerprint_acc =
             FingerprintAccumulator::new(BitPacker(fraud_proof_config.bits_per_item));
 
-        for item_hash in &items_hashes {
+        // The tail's roots are revealed in full. Captured on the walk that
+        // already computes them, so there is no second pass over the trace.
+        let tail_start = items_hashes.len() - fraud_proof_config.window_size;
+        let mut revealed_tail_roots = Vec::with_capacity(fraud_proof_config.window_size);
+
+        for (index, item_hash) in items_hashes.iter().enumerate() {
             trace_tree.append(Bytes(item_hash.clone()));
             if let Some(root) = trace_tree.root(0) {
+                if index >= tail_start {
+                    revealed_tail_roots.push(root.0.clone());
+                }
                 fingerprint_acc.append(&root.0);
             }
         }
@@ -278,6 +286,7 @@ impl TraceCommitmentExt for TraceCommitment {
         TraceCommitment {
             fingerprint,
             revealed_items,
+            revealed_tail_roots,
         }
     }
 
@@ -349,6 +358,44 @@ impl TraceCommitmentExt for TraceCommitment {
                 expected_blocks,
                 self.fingerprint.bits.len()
             )));
+        }
+
+        // The revealed tail covers exactly the final window.
+        if self.revealed_tail_roots.len() != window_size {
+            return Err(BitPackerError::InvalidCommitment(format!(
+                "Commitment reveals {} tail roots but the fraud-proof window covers {}",
+                self.revealed_tail_roots.len(),
+                window_size
+            )));
+        }
+
+        // Each revealed root must squeeze to the fingerprint entry already
+        // committed at its index. The roots are strictly more information than
+        // the entries — the entries are derived from them — so this is what
+        // stops a commitment carrying a tail that contradicts its own
+        // fingerprint. `fingerprint_value` is the same function the accumulator
+        // used to produce those entries.
+        let tail_start = self.fingerprint.len() - window_size;
+        for (offset, root) in self.revealed_tail_roots.iter().enumerate() {
+            let index = tail_start + offset;
+            let committed = self
+                .fingerprint
+                .bits_packer
+                .try_get(index, &self.fingerprint.bits)
+                .map_err(|error| {
+                    BitPackerError::InvalidCommitment(format!(
+                        "Fingerprint has no entry at tail index {}: {}",
+                        index, error
+                    ))
+                })?;
+            let derived = fingerprint_value(root, bits_per_item);
+            if derived != committed {
+                return Err(BitPackerError::InvalidCommitment(format!(
+                    "Revealed tail root at index {} squeezes to {} but the fingerprint \
+                     commits {}",
+                    index, derived, committed
+                )));
+            }
         }
 
         Ok(())
@@ -428,11 +475,15 @@ impl TraceCommitmentExt for TraceCommitment {
     fn header(&self) -> TraceCommitmentHeader {
         let revealed_bytes =
             postcard::to_allocvec(&self.revealed_items).expect("revealed items are serializable");
+        let tail_roots_bytes = postcard::to_allocvec(&self.revealed_tail_roots)
+            .expect("revealed tail roots are serializable");
         TraceCommitmentHeader {
             bits_packer: self.fingerprint.bits_packer,
             fingerprint_len: self.fingerprint.len() as u64,
             fingerprint_root: fingerprint_blocks_root(&self.fingerprint.bits),
             revealed_items_commitment: sha256_bytes(&revealed_bytes),
+            window_size: self.window_size() as u64,
+            revealed_tail_roots_commitment: sha256_bytes(&tail_roots_bytes),
         }
     }
 
@@ -620,19 +671,21 @@ fn frame_opening_index(trace: &[StepRecord], frame: &CfsCoordinates) -> Option<u
     })
 }
 
+/// The trace records that produced each of `declared_inputs`, so the fraud
+/// window can carry a witness for every value the step read.
+///
+/// `step_record` must name a real CFS item in a real frame — the caller skips
+/// the two kinds of step that do not (the program boundaries at `[]` and recur
+/// iterations at `site ++ [i]`), because it is the caller that also has to
+/// decide whether to look the item up at all. Everything below reads the last
+/// coordinate as an item index within its parent frame
+/// (`sequence_coordinates`), which is true exactly under that precondition.
 fn resolve_inputs_sources(
     step_record: &StepRecord,
     trace: &[StepRecord],
     cfs_cursor: &CfsCursor,
     declared_inputs: &[InputBinding],
 ) -> Vec<(usize, StepRecord)> {
-    if cfs_cursor
-        .try_get_recur_iteration_coordinates(step_record.coordinates())
-        .is_some()
-    {
-        return Vec::new();
-    }
-
     let mut step_inputs: Vec<&InputBinding> = Vec::new();
     for binding in declared_inputs {
         flatten_binding(binding, &mut step_inputs);
@@ -786,10 +839,35 @@ fn witness_record_inputs(
     let mut source_records_witnesses: HashMap<StepRecord, Vec<u8>> = HashMap::new();
 
     for (offset, step_record) in fraud_window.items.iter().enumerate() {
+        // The two steps that bind no CFS inputs, skipped in the order the guest
+        // skips them (`checks::cfs::verify_step_record_inputs`). Both sides must
+        // agree on which steps have inputs to resolve: a witness the guest never
+        // reads is dead weight in the evidence, and a witness it reads and does
+        // not get is a panic.
         if step_record.coordinates().is_empty() {
             // The root coordinate holds only the program boundaries —
             // `ProgramStart`, `ProgramEnd` and `main`'s `SequenceEnd`. None is a
             // CFS item, so none binds CFS inputs to resolve.
+            continue;
+        }
+
+        if cfs_cursor
+            .try_get_recur_iteration_coordinates(step_record.coordinates())
+            .is_some()
+        {
+            // An iteration of a recur site is not a CFS item either: `site ++ [i]`
+            // addresses a run of the site, and the site's own bindings are resolved
+            // once at `[site]`. What an iteration must prove instead is chunking
+            // and recur progress, which the guest checks against its replay journal
+            // (`verify_recur_iteration_chunking`, `advance_recur_progress`) and
+            // which needs no source record.
+            //
+            // Skipping *before* `try_get_item` is the point: that lookup folds
+            // iteration coordinates back to the site (`CfsCursor::try_get_item`),
+            // so resolving here would hand `resolve_inputs_sources` the site's
+            // bindings under the iteration's coordinates — a frame of `[site]` and
+            // an item index of `i`, which is an iteration counter, not a sibling
+            // index.
             continue;
         }
 
@@ -893,6 +971,24 @@ impl<'a> TraceVerifier<'a> {
         })
     }
 
+    /// The committed trace root revealed for `index`, or `None` when `index`
+    /// falls outside the final window.
+    ///
+    /// `validate` has already established that the commitment reveals exactly
+    /// `window_size` roots and that the fingerprint is longer than the window,
+    /// so the subtraction cannot underflow.
+    fn revealed_tail_root_at(&self, index: usize) -> Option<&[u8]> {
+        let tail_start = self
+            .trace_commitment
+            .fingerprint
+            .len()
+            .checked_sub(self.trace_commitment.revealed_tail_roots.len())?;
+        index
+            .checked_sub(tail_start)
+            .and_then(|offset| self.trace_commitment.revealed_tail_roots.get(offset))
+            .map(|root| root.as_slice())
+    }
+
     pub fn verify(&mut self, trace: &Trace) -> VerificationResult {
         let cfs_cursor = CfsCursor::new(self.cfs.clone());
 
@@ -915,11 +1011,24 @@ impl<'a> TraceVerifier<'a> {
 
             let index = latest_fingerprint.len() - 1;
 
-            if latest_fingerprint.bits_packer.diff_at_index(
-                index,
-                &latest_fingerprint.bits,
-                &self.trace_commitment.fingerprint.bits,
-            ) {
+            // Across the final window the committed roots are revealed in full,
+            // so compare those: detection there is exact rather than
+            // `bits_per_item` bits, which at `window_size >= 128` was one bit.
+            // Elsewhere the packed entry is all there is.
+            //
+            // Root equality implies entry equality — the entry is derived from
+            // the root — so this strictly replaces the weaker test rather than
+            // sitting alongside it.
+            let diverges = match self.revealed_tail_root_at(index) {
+                Some(committed_root) => committed_root != root.0.as_slice(),
+                None => latest_fingerprint.bits_packer.diff_at_index(
+                    index,
+                    &latest_fingerprint.bits,
+                    &self.trace_commitment.fingerprint.bits,
+                ),
+            };
+
+            if diverges {
                 let diff_bits = self
                     .trace_commitment
                     .fingerprint
@@ -1053,8 +1162,8 @@ impl<'a> TraceVerifier<'a> {
 #[cfg(test)]
 mod tests {
     use raster_core::cfs::{
-        CfsCoordinates, InputBinding, SequenceChildItem, SequenceDef, SequenceItem, TileDef,
-        TileItem,
+        CfsCoordinates, InputBinding, RecurTileItem, SequenceChildItem, SequenceDef, SequenceItem,
+        TileDef, TileItem,
     };
     use raster_core::trace::{ProgramStartStep, StorageRoots};
 
@@ -1231,16 +1340,25 @@ mod tests {
         cfs
     }
 
+    /// A scope binding where the compiler can actually put one: on an item of a
+    /// *nested* frame, reading that frame's own parameter.
+    ///
+    /// It used to sit at `[0]` — a `SequenceScope` on an item of `main` — which
+    /// the compiler never emits, because `main` has no caller and its
+    /// parameters resolve to `EntryArgument`
+    /// (`FlowResolver::resolve_with_entry_arguments`). Unreachable there, so it
+    /// left the `SequenceScope` arm of `resolve_inputs_sources` untested while
+    /// appearing to cover it.
     fn make_sequence_input_dependency_cfs() -> ControlFlowSchema {
         let mut cfs = ControlFlowSchema::new("test");
         cfs.tiles.push(TileDef::iter("inner_tile", 1, 1));
         cfs.tiles.push(TileDef::iter("tail", 1, 1));
 
         let mut main = SequenceDef::new("main");
-        main.input_sources = vec![InputBinding::inline()];
+        main.entry_arguments = vec!["arg".to_string()];
         main.items.push(SequenceChildItem::Sequence(SequenceItem {
             id: "inner".to_string(),
-            sources: vec![InputBinding::seq_input(0)],
+            sources: vec![InputBinding::entry_argument()],
         }));
         main.items.push(SequenceChildItem::Tile(TileItem {
             id: "tail".to_string(),
@@ -1251,7 +1369,8 @@ mod tests {
         inner.input_sources = vec![InputBinding::inline()];
         inner.items.push(SequenceChildItem::Tile(TileItem {
             id: "inner_tile".to_string(),
-            sources: vec![InputBinding::inline()],
+            // `inner`'s own parameter 0 — supplied by its caller, `main`.
+            sources: vec![InputBinding::seq_input(0)],
         }));
 
         cfs.sequences.push(main);
@@ -1534,6 +1653,116 @@ mod tests {
         assert!(trace_verifier.terminal_window(&short).is_err());
     }
 
+    /// The cumulative root after every step of `trace`.
+    fn final_trace_root(trace: &Trace, seed: &[u8]) -> Vec<u8> {
+        let mut tree = TraceTree::new(1);
+        tree.append(Bytes(seed.to_vec()));
+        for item in trace.iter() {
+            tree.append(Bytes(item.hash()));
+        }
+        tree.root(0).expect("trace root").0
+    }
+
+    #[test]
+    fn build_reveals_the_final_window_of_trace_roots() {
+        let trace = Trace((0..10).map(|i| make_tile_trace_item(i, i)).collect());
+        let config = test_fraud_proof_config();
+        let commitment =
+            TraceCommitment::build(&trace, &precomputed::EMPTY_TRIE_NODES[0], config);
+
+        assert_eq!(commitment.revealed_tail_roots.len(), config.window_size);
+        // The last revealed root is the trace's final root.
+        assert_eq!(
+            *commitment.revealed_tail_roots.last().unwrap(),
+            final_trace_root(&trace, &precomputed::EMPTY_TRIE_NODES[0]),
+        );
+        // And the commitment is internally consistent.
+        commitment.validate().expect("freshly built commitment");
+    }
+
+    /// A commitment whose revealed roots contradict its own fingerprint is
+    /// unrepresentable — the roots are strictly more information than the
+    /// entries they squeeze to, so the two can be held against each other.
+    #[test]
+    fn validate_rejects_a_tail_root_that_contradicts_the_fingerprint() {
+        let trace = Trace((0..10).map(|i| make_tile_trace_item(i, i)).collect());
+        let mut commitment = TraceCommitment::build(
+            &trace,
+            &precomputed::EMPTY_TRIE_NODES[0],
+            test_fraud_proof_config(),
+        );
+
+        // Flip enough bits to change the squeezed value, not just the root.
+        commitment.revealed_tail_roots[0] = vec![0xFF; 32];
+
+        assert!(matches!(
+            commitment.validate(),
+            Err(BitPackerError::InvalidCommitment(_))
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_a_tail_that_does_not_cover_the_window() {
+        let trace = Trace((0..10).map(|i| make_tile_trace_item(i, i)).collect());
+        let mut commitment = TraceCommitment::build(
+            &trace,
+            &precomputed::EMPTY_TRIE_NODES[0],
+            test_fraud_proof_config(),
+        );
+
+        commitment.revealed_tail_roots.pop();
+
+        assert!(matches!(
+            commitment.validate(),
+            Err(BitPackerError::InvalidCommitment(_))
+        ));
+    }
+
+    /// The case the packed fingerprint cannot see.
+    ///
+    /// At `window_size = 128`, `bits_per_item` is 1, so a divergence in the
+    /// trace's final step has exactly one bit of evidence — it survived audit
+    /// half the time. This deliberately searches for a tamper whose squeezed
+    /// bit *collides* with the honest one, which is precisely the case the old
+    /// detection missed, and asserts it is now caught.
+    #[test]
+    fn a_final_step_divergence_is_detected_when_its_fingerprint_bit_collides() {
+        let seed = precomputed::EMPTY_TRIE_NODES[0];
+        let config = FraudProofConfig::from_window_size(128).expect("power-of-two window");
+        assert_eq!(config.bits_per_item, 1, "the degenerate case this is about");
+
+        let honest = Trace((0..130).map(|i| make_tile_trace_item(i, i)).collect());
+        let last = honest.len() - 1;
+        let honest_bit = fingerprint_value(&final_trace_root(&honest, &seed), config.bits_per_item);
+
+        // A tamper the fingerprint is blind to: same final bit, different root.
+        let runtime = (1_000u64..1_100)
+            .find_map(|candidate| {
+                let mut candidate_trace = honest.clone();
+                candidate_trace.0[last] = make_tile_trace_item(last as u64, candidate);
+                let root = final_trace_root(&candidate_trace, &seed);
+                (fingerprint_value(&root, config.bits_per_item) == honest_bit)
+                    .then_some(candidate_trace)
+            })
+            .expect("a colliding tamper exists at 1 bit per item");
+
+        assert_ne!(
+            final_trace_root(&runtime, &seed),
+            final_trace_root(&honest, &seed),
+            "the traces must actually differ, or the test proves nothing"
+        );
+
+        let commitment = TraceCommitment::build(&honest, &seed, config);
+        let cfs = make_test_cfs();
+        let mut verifier =
+            TraceVerifier::new(commitment, &seed, &cfs).expect("valid commitment");
+
+        assert!(
+            matches!(verifier.verify(&runtime), VerificationResult::Fraud(_)),
+            "a final-step divergence must be detected even when its fingerprint bit collides"
+        );
+    }
+
     #[test]
     fn test_verify_trace_returns_fraud_for_mismatched_trace() {
         let committed_trace = Trace((0..5).map(|i| make_tile_trace_item(i, i)).collect());
@@ -1619,7 +1848,7 @@ mod tests {
     #[test]
     fn test_verify_trace_returns_ok_for_sequence_step_seq_input_dependency() {
         let trace = Trace(vec![
-            make_program_start_record(1, Vec::new()),
+            make_program_start_record(1, vec!["arg".to_string()]),
             make_sequence_start_record(2, "inner", vec![0], 1),
             make_tile_trace_item_at(3, "inner", 0, vec![0, 0], "inner_tile".to_string(), 1, 10),
             make_sequence_end_record(4, "inner", vec![0]),
@@ -1800,6 +2029,80 @@ mod tests {
         );
     }
 
+    /// A recur site whose own binding reads a prior sibling. The site's
+    /// `sources` are deliberately **not** inline, because the point is that they
+    /// are resolved once at the site and never per iteration.
+    fn make_recur_site_cfs() -> ControlFlowSchema {
+        let mut cfs = ControlFlowSchema::new("test");
+        cfs.tiles.push(TileDef::iter("producer", 1, 1));
+        cfs.tiles.push(TileDef::iter("sweep", 1, 1));
+
+        let mut main = SequenceDef::new("main");
+        main.items.push(SequenceChildItem::Tile(TileItem {
+            id: "producer".to_string(),
+            sources: vec![InputBinding::inline()],
+        }));
+        main.items
+            .push(SequenceChildItem::RecurTile(RecurTileItem {
+                id: "sweep".to_string(),
+                sources: vec![InputBinding::prior_item_output(0)],
+                chunk: Some(2),
+                leaves_output_open: false,
+                state_is_output: false,
+            }));
+
+        cfs.sequences.push(main);
+        cfs
+    }
+
+    /// An iteration of a recur site binds no CFS inputs, so it contributes no
+    /// source witness — the same classification the guest makes, in the same
+    /// order (`checks::cfs::verify_step_record_inputs`: root coordinates first,
+    /// then recur iterations, then the CFS item).
+    ///
+    /// The fixture is built so the skip is load-bearing rather than incidental.
+    /// `try_get_item` folds `[1, i]` back to the site, so an iteration resolved
+    /// as an ordinary step would be handed the *site's* `PriorItemOutput(0)`
+    /// under a frame of `[1]` and an item coordinate of `i` — the iteration
+    /// counter read as a sibling index. At `i = 0` that trips the
+    /// same-or-future-index panic; at `i = 1` it silently resolves to whatever
+    /// sits at `[1, 0]`, which is the previous *iteration*, not item 0.
+    #[test]
+    fn recur_iterations_contribute_no_input_source_witness() {
+        let committed_trace = Trace(vec![
+            make_program_start_record(1, Vec::new()),
+            make_tile_trace_item_at(2, "main", 0, vec![0], "producer".to_string(), 1, 10),
+            make_sequence_start_record(3, "main", vec![1], 1),
+            make_tile_trace_item_at(4, "main", 0, vec![1, 0], "sweep".to_string(), 1, 20),
+            make_tile_trace_item_at(5, "main", 1, vec![1, 1], "sweep".to_string(), 1, 30),
+            make_sequence_end_record(6, "main", vec![]),
+        ]);
+        // Diverges at index 4, so the window is the two iteration steps.
+        let mut runtime_trace = committed_trace.clone();
+        runtime_trace.0[4] =
+            make_tile_trace_item_at(5, "main", 1, vec![1, 1], "sweep".to_string(), 1, 999);
+
+        let trace_commitment = TraceCommitment::build(
+            &committed_trace,
+            &precomputed::EMPTY_TRIE_NODES[0],
+            test_fraud_proof_config(),
+        );
+        let cfs = make_recur_site_cfs();
+        let mut trace_verifier =
+            TraceVerifier::new(trace_commitment, &precomputed::EMPTY_TRIE_NODES[0], &cfs)
+                .expect("valid commitment");
+
+        let VerificationResult::Fraud(evidence) = trace_verifier.verify(&runtime_trace) else {
+            panic!("expected a divergence at the second iteration");
+        };
+
+        assert!(
+            evidence.input_sources_witnesses.is_empty(),
+            "recur iterations bind no CFS inputs, so the window carries no source witnesses: {:?}",
+            evidence.input_sources_witnesses,
+        );
+    }
+
     /// `EntryArgument` at a top-level step resolves to `ProgramStart` — the same
     /// record that opens the root frame. Unreachable before the frame lookup was
     /// fixed: the scan panicked before this arm ran.
@@ -1834,6 +2137,135 @@ mod tests {
                 .input_sources_witnesses
                 .contains_key(&committed_trace.0[0]),
             "ProgramStart should be witnessed as the entry-argument source",
+        );
+    }
+
+    /// Tampering `exec_index` alone still *detects* as a divergence here, and
+    /// should: the walker compares the replayed trace against the commitment,
+    /// and a tampered record genuinely hashes to a different leaf — a different
+    /// trace root, a different fingerprint entry. This side is a detector, not
+    /// an authorizer, so it has no opinion on *why* the traces differ.
+    ///
+    /// What used to follow from that was a forged receipt. The window's earlier
+    /// items are the honest ones and still match the commitment, so the margin
+    /// is satisfied and only the last item "diverges" — `finalize`'s `Finished`
+    /// condition — on a field the guest never read. The margin pins the
+    /// window's *opening state*; it never pinned the *diverging item*.
+    ///
+    /// That is now closed on the guest side: `checks::cfs::verify_exec_index`
+    /// fixes the field from the step's trace index, so a window built from this
+    /// evidence is refused before `finalize` is reached. See
+    /// `exec_index_tampering_is_refused` in the transition guest's tests.
+    ///
+    /// Kept host-side to pin the other half of that argument: the field really
+    /// does reach the leaf, so it really does need verifying.
+    #[test]
+    fn exec_index_tampering_is_detected_but_no_longer_provable() {
+        let honest = Trace(vec![
+            make_program_start_record(1, Vec::new()),
+            make_tile_trace_item_at(2, "main", 0, vec![0], "producer".to_string(), 1, 10),
+            make_tile_trace_item_at(3, "main", 1, vec![1], "consumer".to_string(), 1, 20),
+            make_tile_trace_item_at(4, "main", 2, vec![2], "tail".to_string(), 1, 30),
+            make_sequence_end_record(5, "main", vec![]),
+        ]);
+        let cfs = make_producer_dependency_cfs();
+        let trace_commitment = TraceCommitment::build(
+            &honest,
+            &precomputed::EMPTY_TRIE_NODES[0],
+            test_fraud_proof_config(),
+        );
+
+        // Baseline: the honest trace agrees with its own commitment everywhere.
+        let mut honest_verifier = TraceVerifier::new(
+            trace_commitment.clone(),
+            &precomputed::EMPTY_TRIE_NODES[0],
+            &cfs,
+        )
+        .expect("valid commitment");
+        assert!(matches!(
+            honest_verifier.verify(&honest),
+            VerificationResult::Ok
+        ));
+
+        // Bump `exec_index` on one step. Nothing else changes — same kind, same
+        // coordinates, same commitments, so the same replay receipt would still
+        // verify and every per-step check still passes.
+        let mut forged = honest.clone();
+        forged.0[3].exec_index += 1;
+        assert_eq!(forged.0[3].kind, honest.0[3].kind);
+        assert_eq!(forged.0[3].coordinates, honest.0[3].coordinates);
+        assert_eq!(forged.0[3].sequence_id, honest.0[3].sequence_id);
+        assert_ne!(
+            forged.0[3].hash(),
+            honest.0[3].hash(),
+            "the tampered field must reach the trace leaf, or there is no attack"
+        );
+
+        let mut forged_verifier =
+            TraceVerifier::new(trace_commitment, &precomputed::EMPTY_TRIE_NODES[0], &cfs)
+                .expect("valid commitment");
+        let VerificationResult::Fraud(evidence) = forged_verifier.verify(&forged) else {
+            panic!(
+                "expected the tampered exec_index to manufacture a divergence; \
+                 if this now returns Ok, exec_index no longer reaches the trace leaf"
+            );
+        };
+
+        // The window is the `Finished` shape: earlier items are the honest ones
+        // and match the commitment, the last is the tampered record.
+        let window_items = &evidence.window.items;
+        assert_eq!(*window_items.last().unwrap(), forged.0[3]);
+        for (offset, item) in window_items.iter().rev().skip(1).enumerate() {
+            let honest_index = 3 - 1 - offset;
+            assert_eq!(
+                *item, honest.0[honest_index],
+                "every item before the divergence is the honest record"
+            );
+        }
+    }
+
+    /// The `SequenceScope` arm of `resolve_inputs_sources`, exercised for the
+    /// first time.
+    ///
+    /// A scope value is not produced inside the frame — it arrives *with* it —
+    /// so the only record holding it is the frame's opening `SequenceStart`.
+    /// That is the record this must resolve to, and the one the guest's
+    /// `verify_sequence_scope_parent` then binds the scope witness against.
+    #[test]
+    fn fraud_window_resolves_nested_sequence_scope_input() {
+        let committed_trace = Trace(vec![
+            make_program_start_record(1, vec!["arg".to_string()]),
+            make_sequence_start_record(2, "inner", vec![0], 1),
+            make_tile_trace_item_at(3, "inner", 0, vec![0, 0], "inner_tile".to_string(), 1, 10),
+            make_sequence_end_record(4, "inner", vec![0]),
+            make_tile_trace_item_at(5, "main", 1, vec![1], "tail".to_string(), 1, 20),
+            make_sequence_end_record(6, "main", vec![]),
+        ]);
+        // Diverge at `inner_tile`, so the window holds the scope-binding step
+        // and the `SequenceStart` that opened its frame.
+        let mut runtime_trace = committed_trace.clone();
+        runtime_trace.0[2] =
+            make_tile_trace_item_at(3, "inner", 0, vec![0, 0], "inner_tile".to_string(), 1, 999);
+
+        let trace_commitment = TraceCommitment::build(
+            &committed_trace,
+            &precomputed::EMPTY_TRIE_NODES[0],
+            test_fraud_proof_config(),
+        );
+        let cfs = make_sequence_input_dependency_cfs();
+        let mut trace_verifier =
+            TraceVerifier::new(trace_commitment, &precomputed::EMPTY_TRIE_NODES[0], &cfs)
+                .expect("valid commitment");
+
+        let VerificationResult::Fraud(evidence) = trace_verifier.verify(&runtime_trace) else {
+            panic!("expected a divergence at the inner tile");
+        };
+
+        assert!(
+            evidence
+                .input_sources_witnesses
+                .contains_key(&committed_trace.0[1]),
+            "the frame-opening SequenceStart is the scope input's source, and must be witnessed",
         );
     }
 

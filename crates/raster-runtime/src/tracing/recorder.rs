@@ -1619,6 +1619,98 @@ mod tests {
         assert_eq!(after.coordinates(), &CfsCoordinates(vec![1]));
     }
 
+    /// `sequence_id`'s vocabulary, made executable.
+    ///
+    /// The field means two different things depending on the step kind, and the
+    /// transition guest derives it to stop it being free entropy in the trace
+    /// leaf (`checks::cfs::verify_sequence_id`), so the rule it derives against
+    /// belongs in a test rather than in a reader's head:
+    ///
+    /// - a **boundary** step (`SequenceStart`/`SequenceEnd`) names the sequence
+    ///   it enters or leaves — the callee;
+    /// - every **other** step names the frame it executes in.
+    ///
+    /// The two recur kinds part company here, which is the row worth the test:
+    /// a recur *tile* pushes no frame, so its iterations stay in the containing
+    /// sequence, while a recur *sequence* does, so its body's steps name the
+    /// site.
+    #[test]
+    fn sequence_id_names_the_callee_at_boundaries_and_the_frame_everywhere_else() {
+        let mut recorder = recorder_with_recur_site();
+        start_main(&mut recorder);
+        let __start = seed_recur_source(&mut recorder, "recur", 1);
+        let site_start = recorder.record(TraceEvent::RecurTileStart(__start));
+        let iter = recorder.record(TraceEvent::RecurTileIterationExec(FnCallRecord {
+            fn_name: "recur".to_string(),
+            input: None,
+            output: None,
+            draft_transition_witness: None,
+            recur_control: Some(raster_core::draft::RecurControlKind::Continue),
+            recur_state: None,
+        }));
+        let site_end = recorder.record(TraceEvent::RecurTileEnd(FnCallRecord {
+            fn_name: "recur".to_string(),
+            input: None,
+            output: None,
+            draft_transition_witness: None,
+            recur_control: Some(raster_core::draft::RecurControlKind::Continue),
+            recur_state: None,
+        }));
+
+        // The site's opening boundary names the callee...
+        assert_eq!(site_start.sequence_id, "recur");
+        // ...but a recur *tile* pushes no frame, so its iteration and its
+        // closing `Exec` both stay in `main`.
+        assert_eq!(iter.sequence_id, "main");
+        assert_eq!(site_end.sequence_id, "main");
+
+        let mut recorder = recorder_with_recur_sequence_site();
+        start_main(&mut recorder);
+        let __start = seed_recur_source(&mut recorder, "child", 1);
+        let site_start = recorder.record(TraceEvent::RecurSequenceStart(__start));
+        let iteration_start =
+            recorder.record(TraceEvent::RecurSequenceIterationStart(FnCallRecord {
+                fn_name: "child".to_string(),
+                input: None,
+                output: None,
+                draft_transition_witness: None,
+                recur_control: None,
+                recur_state: None,
+            }));
+        let inner = recorder.record(TraceEvent::TileExec(FnCallRecord {
+            fn_name: "inner".to_string(),
+            input: None,
+            output: None,
+            draft_transition_witness: None,
+            recur_control: None,
+            recur_state: None,
+        }));
+        let iteration_end = recorder.record(TraceEvent::RecurSequenceIterationEnd(FnCallRecord {
+            fn_name: "child".to_string(),
+            input: None,
+            output: None,
+            draft_transition_witness: None,
+            recur_control: None,
+            recur_state: None,
+        }));
+        let site_end = recorder.record(TraceEvent::RecurSequenceEnd(FnCallRecord {
+            fn_name: "child".to_string(),
+            input: None,
+            output: None,
+            draft_transition_witness: None,
+            recur_control: None,
+            recur_state: None,
+        }));
+
+        assert_eq!(site_start.sequence_id, "child");
+        assert_eq!(iteration_start.sequence_id, "child");
+        // A recur *sequence* does push a frame, so its body names the site.
+        assert_eq!(inner.sequence_id, "child");
+        assert_eq!(iteration_end.sequence_id, "child");
+        // The site's closing `Exec` sits back in the containing sequence.
+        assert_eq!(site_end.sequence_id, "main");
+    }
+
     /// The vocabulary table in `TraceEvent`'s doc comment, made executable:
     /// which `StepKind` each event becomes, and where it lands.
     ///

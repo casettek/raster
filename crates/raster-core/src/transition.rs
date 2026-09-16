@@ -48,7 +48,11 @@ pub struct StepRecordWitness {
 }
 
 /// Domain prefix for [`TraceCommitmentHeader::digest`].
-pub const TRACE_COMMITMENT_DOMAIN: &[u8] = b"raster/trace-commitment/v1";
+/// Bumped to v2 when the header gained `window_size` and
+/// `revealed_tail_roots_commitment`: the digest is the commitment's identity,
+/// so a v1 `commit.bin` and any receipt carrying its
+/// `refuted_trace_commitment` no longer match.
+pub const TRACE_COMMITMENT_DOMAIN: &[u8] = b"raster/trace-commitment/v2";
 
 /// The compact, guest-friendly identity of a `TraceCommitment`.
 ///
@@ -71,6 +75,22 @@ pub struct TraceCommitmentHeader {
     pub fingerprint_root: Vec<u8>,
     /// `sha256(postcard(revealed_items))`.
     pub revealed_items_commitment: Vec<u8>,
+    /// The fraud-proof window size this commitment was built with —
+    /// `revealed_items.len()` host-side.
+    ///
+    /// Here because the guest could not otherwise learn it, and without it
+    /// `window_len` and `window_start` are challenger-supplied with only
+    /// `window_start + window_len <= fingerprint_len` constraining them: an
+    /// upper bound, not a shape. A two-item window anywhere in the trace has no
+    /// margin at all, since `finalize` never compares the first item and
+    /// requires the last to diverge.
+    pub window_size: u64,
+    /// `sha256(postcard(revealed_tail_roots))`.
+    ///
+    /// The roots themselves are O(window), so they travel as a witness when a
+    /// tail divergence is proven; the header stays constant-size, which is its
+    /// whole purpose.
+    pub revealed_tail_roots_commitment: Vec<u8>,
 }
 
 impl TraceCommitmentHeader {

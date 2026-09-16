@@ -5,7 +5,11 @@
 
 use raster_core::cfs::{CfsCoordinates, CfsCursor, InputBinding, InputSource, SequenceChildItem};
 use raster_core::input::SelectorSegment;
-use std::collections::BTreeMap;
+use raster_core::transition::StepRecordWitness;
+use std::collections::{BTreeMap, HashMap};
+
+use crate::checks::io::input_source_commitment;
+use crate::merkle_tree::{combine_merkle_level, hash_trace_item};
 
 use raster_core::draft::TileReplayJournal;
 use raster_core::input::{SelectionPayloadKind, SelectionWitness};
@@ -302,6 +306,260 @@ fn cited_index_sources<'a>(
             _ => None,
         })
         .collect()
+}
+
+/// Hold a step to the `exec_index` its position in the trace determines.
+///
+/// **Why this is a soundness check, not a sanity check.** The trace leaf is
+/// `sha256(postcard(StepRecord))` over the *whole* record, so every field
+/// reaches the leaf, the trace root, and the fingerprint entry. A field that
+/// reaches the leaf but is verified by nothing is free entropy: take an honest
+/// window, change only that field on the last item, and the earlier items still
+/// match the commitment while the last one "diverges" — which is exactly
+/// `finalize`'s `Finished` condition. That forges a fraud receipt against an
+/// honest prover, with no short window and no fabricated frontier. The window's
+/// margin pins the *opening state*; it has never pinned the *diverging item*.
+///
+/// `exec_index` was such a field. It is fully determined by position:
+/// `TraceRecorder::new` starts the counter at 0 and `record` increments before
+/// use, and the single production call site pushes every returned record
+/// unconditionally (`raster-cli::commands::run::record_trace_event`), so the
+/// step at trace index `t` carries `exec_index == t + 1`.
+///
+/// `trace_position` is the frontier's position *before* this step is appended.
+/// The window's initial frontier holds the seed plus one leaf per pre-window
+/// step, so its position is the trace index of the window's first item, and it
+/// advances in step with the walk — it is the trace index, not a window offset.
+pub fn verify_exec_index(trace_position: u64, step_record: &StepRecord) {
+    let expected = trace_position + 1;
+    assert_eq!(
+        step_record.exec_index, expected,
+        "Step at trace index {} carries exec_index {} but its position determines {}",
+        trace_position, step_record.exec_index, expected,
+    );
+}
+
+/// The entrypoint sequence's id. A literal here for the same reason it is one
+/// in `CfsCursor::new` ("Missing main entrypoint") and in the recorder, which
+/// pushes `main`'s frame by name at `ProgramStart`.
+const MAIN_SEQUENCE_ID: &str = "main";
+
+/// The sequence declared *at* `coordinates` — what a boundary step names.
+///
+/// `try_get_item` already folds a recur *iteration* coordinate to its site, so
+/// `RecurSequenceIterationStart`/`End` at `site ++ [i]` resolve to the site's
+/// own item, which is exactly the sequence they enter and leave.
+fn declared_sequence_id<'a>(
+    cfs_cursor: &'a CfsCursor,
+    coordinates: &CfsCoordinates,
+) -> Option<&'a str> {
+    if coordinates.is_empty() {
+        // Only `main`'s own boundary sits at the root coordinate.
+        return Some(MAIN_SEQUENCE_ID);
+    }
+    match cfs_cursor.try_get_item(coordinates)? {
+        SequenceChildItem::Sequence(item) => Some(item.id.as_str()),
+        SequenceChildItem::RecurSequence(item) => Some(item.id.as_str()),
+        SequenceChildItem::RecurTile(item) => Some(item.id.as_str()),
+        // A tile is not a frame, so no boundary step can sit at one.
+        SequenceChildItem::Tile(_) => None,
+    }
+}
+
+/// The sequence frame `coordinates` execute *in* — what every non-boundary step
+/// names.
+///
+/// Walks outward rather than resolving in one step, because the two recur kinds
+/// differ: a recur **sequence** pushes a frame, so its body names the site; a
+/// recur **tile** pushes none, so its iterations stay in the sequence that
+/// contains the site. Pinned by `sequence_id_names_the_callee_at_boundaries_and_
+/// the_frame_everywhere_else` in the recorder's tests.
+fn enclosing_sequence_id<'a>(
+    cfs_cursor: &'a CfsCursor,
+    coordinates: &CfsCoordinates,
+) -> &'a str {
+    let mut frame = coordinates.clone();
+    loop {
+        let Some((parent, _)) = frame.try_parent() else {
+            return MAIN_SEQUENCE_ID;
+        };
+        if parent.is_empty() {
+            return MAIN_SEQUENCE_ID;
+        }
+        match cfs_cursor.try_get_item(&parent) {
+            // A nested sequence, ordinary or recur, is a frame of its own.
+            Some(SequenceChildItem::Sequence(item)) => return item.id.as_str(),
+            Some(SequenceChildItem::RecurSequence(item)) => return item.id.as_str(),
+            // A recur tile pushes no frame, and a tile has no children at all:
+            // in both cases the frame is further out.
+            _ => frame = parent,
+        }
+    }
+}
+
+/// Hold a step to the `sequence_id` the schema and its coordinates determine.
+///
+/// Same class as [`verify_exec_index`]: the field reaches the trace leaf — the
+/// leaf is `sha256(postcard(StepRecord))` over the whole record — so leaving it
+/// unverified leaves free entropy an attacker can use to manufacture a
+/// divergence on the window's last item.
+///
+/// It was only partly covered. [`record_matches_item`] compares it for
+/// `SequenceStart`/`SequenceEnd`, but the `Exec` arms there compare the *target
+/// name* instead, and the program boundaries never reach that check at all —
+/// `verify_step_record_inputs` returns early on empty coordinates. This closes
+/// both, and covers recur-iteration steps, which that check also skips.
+///
+/// The field carries two different things, which is why this is not one lookup:
+/// a boundary step names the sequence it enters or leaves, everything else
+/// names the frame it runs in.
+pub fn verify_sequence_id(cfs_cursor: &CfsCursor, step_record: &StepRecord) {
+    let coordinates = step_record.coordinates();
+    let expected = match &step_record.kind {
+        StepKind::SequenceStart { .. } | StepKind::SequenceEnd { .. } => {
+            declared_sequence_id(cfs_cursor, coordinates).unwrap_or_else(|| {
+                panic!(
+                    "Boundary step {:?} sits at coordinates that declare no sequence",
+                    step_record
+                )
+            })
+        }
+        StepKind::Exec(_) | StepKind::ProgramStart(_) | StepKind::ProgramEnd(_) => {
+            enclosing_sequence_id(cfs_cursor, coordinates)
+        }
+    };
+
+    assert_eq!(
+        step_record.sequence_id, expected,
+        "Step at {:?} carries sequence_id {:?} but its kind and coordinates determine {:?}",
+        coordinates, step_record.sequence_id, expected,
+    );
+}
+
+/// Whether any of `item`'s declared inputs is a scope binding, flattening
+/// `Indexed` so an index sourced from the caller's scope counts too.
+fn binds_sequence_scope(item: &SequenceChildItem) -> bool {
+    fn any_scope(binding: &InputBinding) -> bool {
+        match binding {
+            InputBinding::SequenceScope { .. } => true,
+            InputBinding::Indexed { value, indexes } => {
+                any_scope(value) || indexes.iter().any(any_scope)
+            }
+            _ => false,
+        }
+    }
+    item.inputs().iter().any(any_scope)
+}
+
+/// Fold a step record's trace-inclusion proof and hold it to `trace_root`.
+///
+/// Same fold as the fingerprint-block witnesses in
+/// `fraud_proof::assert_window_is_commitment_slice`, and the same convention as
+/// the host's `Hashable for Bytes` — `sha256(level || left || right)`, sibling
+/// order chosen by the position bit at each level. Trace item `n` sits at
+/// Merkle position `n + 1`, since position 0 is the seed leaf.
+fn assert_record_in_trace(record: &StepRecord, witness: &StepRecordWitness, trace_root: &[u8]) {
+    let mut current = hash_trace_item(record);
+    for (level, sibling) in witness.path_elems.iter().enumerate() {
+        current = if ((witness.position >> level) & 1) == 0 {
+            combine_merkle_level(level, &current, sibling)
+        } else {
+            combine_merkle_level(level, sibling, &current)
+        };
+    }
+    assert!(
+        current == trace_root,
+        "Sequence-scope parent record is not in the trace at the claimed position",
+    );
+}
+
+/// Bind a `SequenceScope` witness to the frame-opening record it claims to be.
+///
+/// `verify_one_binding` compares the step's own source against argument `i` of
+/// the parent's `FnInput`. That comparison is only worth anything if the parent
+/// `FnInput` is the parent's: the step's own witness is pinned to its record's
+/// fingerprinted `input_source_commitment` (`checks::io::verify_step_record`),
+/// but the parent's arrived from the host bound to nothing, so the check
+/// compared a value against a value the same party chose and passed for any
+/// claim at all.
+///
+/// Three things together pin it:
+///
+/// 1. the supplied parent record is really in the trace, proven against the
+///    root of the prefix this step is appended to;
+/// 2. it is the `SequenceStart` at this step's parent frame coordinates —
+///    coordinates carry the iteration index inside recur sites, so they name
+///    one invocation rather than a set;
+/// 3. its recorded `input_source_commitment` is the commitment of the supplied
+///    `FnInput` — which is what makes the preimage the parent's own arguments.
+///
+/// This is what `TransitionInput::input_sources_witnesses` was built for. The
+/// host has always shipped it (`raster-prover::trace::witness_record_inputs`)
+/// and nothing read it.
+pub fn verify_sequence_scope_parent(
+    cfs_cursor: &CfsCursor,
+    step_record: &StepRecord,
+    sequence_scope_witness: Option<&FnInput>,
+    input_sources_witnesses: &HashMap<StepRecord, Vec<u8>>,
+    trace_root: &[u8],
+) {
+    let coordinates = step_record.coordinates();
+    // The program boundaries bind no CFS inputs, and a recur iteration's inputs
+    // are checked by the chunking rules instead — both mirror the guards in
+    // `verify_step_record_inputs`.
+    if coordinates.is_empty()
+        || cfs_cursor
+            .try_get_recur_iteration_coordinates(coordinates)
+            .is_some()
+    {
+        return;
+    }
+
+    let Some(cfs_item) = cfs_cursor.try_get_item(coordinates) else {
+        return;
+    };
+    if !binds_sequence_scope(cfs_item) {
+        return;
+    }
+
+    let scope_witness = sequence_scope_witness.unwrap_or_else(|| {
+        panic!(
+            "Step {:?} binds a sequence-scope input but supplied no scope witness",
+            step_record
+        )
+    });
+    let Some((parent_coordinates, _)) = coordinates.try_parent() else {
+        panic!(
+            "Step {:?} binds a sequence-scope input at the root frame, which has no caller",
+            step_record
+        )
+    };
+
+    let (parent_record, witness_bytes) = input_sources_witnesses
+        .iter()
+        .find(|(record, _)| {
+            matches!(record.kind, StepKind::SequenceStart { .. })
+                && *record.coordinates() == parent_coordinates
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "Step {:?} binds a sequence-scope input but no SequenceStart witness for frame \
+                 {:?} was supplied",
+                step_record, parent_coordinates
+            )
+        });
+
+    let witness: StepRecordWitness = postcard::from_bytes(witness_bytes)
+        .expect("Sequence-scope parent witness is not a StepRecordWitness");
+    assert_record_in_trace(parent_record, &witness, trace_root);
+
+    let recorded = parent_record
+        .input_source_commitment()
+        .expect("a SequenceStart record always commits its input source");
+    assert!(
+        *recorded == input_source_commitment(scope_witness),
+        "Sequence-scope witness is not the parent SequenceStart's recorded input source",
+    );
 }
 
 /// Hold one recorded argument to one CFS input binding.

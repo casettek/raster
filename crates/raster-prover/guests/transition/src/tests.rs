@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use bridgetree::NonEmptyFrontier;
 
@@ -24,15 +24,18 @@ use raster_core::recur_progress::{
     RecurProgressStack, RecurProgressViolation, RecurSiteKind,
 };
 use raster_core::trace::{
-    ExecStep, ExecTarget, FnInput, FnInputArg, FnInputValue, StepKind, StepRecord, StorageData,
-    StorageRoots,
+    ExecStep, ExecTarget, FnInput, FnInputArg, FnInputValue, ProgramEndStep, StepKind, StepRecord,
+    StorageData, StorageRoots,
 };
 use raster_core::transition::{
     SerializableFrontier, StorageEntry, StorageLogWitness, StorageReadWitness, StorageWitness,
     StorageWriteWitness,
 };
 
-use crate::checks::cfs::verify_step_record_inputs;
+use crate::checks::cfs::{
+    verify_exec_index, verify_sequence_id, verify_sequence_scope_parent,
+    verify_step_record_inputs,
+};
 use crate::checks::drafts::verify_draft_transition;
 use crate::checks::io::{input_source_commitment, verify_io_witness};
 use crate::checks::store::{storage_leaf_hash, verify_storage_transition};
@@ -140,6 +143,279 @@ fn storage_input_witness(coordinates: CfsCoordinates, commitment: Vec<u8>) -> Fn
     }
 }
 
+/// `sub`'s item reads `sub`'s own parameter 0 — a `SequenceScope` binding at a
+/// *nested* frame, which is the shape the compiler actually emits. (`main`'s
+/// parameters resolve to `EntryArgument`; a scope binding at the root frame is
+/// unreachable.)
+fn scope_binding_cfs() -> CfsCursor {
+    CfsCursor::new(ControlFlowSchema {
+        version: "1.0".into(),
+        project: "test".into(),
+        encoding: "postcard".into(),
+        tiles: vec![TileDef::iter("consumer", 1, 1)],
+        sequences: vec![
+            SequenceDef {
+                id: "main".into(),
+                input_sources: vec![],
+                items: vec![SequenceChildItem::Sequence(SequenceItem {
+                    id: "sub".into(),
+                    sources: vec![InputBinding::Direct(InputSource::Inline)],
+                })],
+                entry_arguments: vec![],
+                produces_output: false,
+            },
+            SequenceDef {
+                id: "sub".into(),
+                input_sources: vec![InputBinding::Direct(InputSource::Inline)],
+                items: vec![SequenceChildItem::Tile(TileItem {
+                    id: "consumer".into(),
+                    sources: vec![InputBinding::seq_input(0)],
+                })],
+                entry_arguments: vec![],
+                produces_output: false,
+            },
+        ],
+    })
+}
+
+/// Build the trace tree over `prefix` — seed at leaf 0, item `n` at `n + 1` —
+/// and return its root with a `StepRecordWitness` for `index`.
+fn trace_root_and_witness(
+    prefix: &[StepRecord],
+    index: usize,
+) -> (Vec<u8>, raster_core::transition::StepRecordWitness) {
+    let mut tree = TraceBridgeTree::new(1);
+    tree.append(Bytes(EMPTY_LEAF.to_vec()));
+    let mut marked = None;
+    for (i, record) in prefix.iter().enumerate() {
+        tree.append(Bytes(crate::merkle_tree::hash_trace_item(record)));
+        if i == index {
+            marked = tree.mark();
+        }
+    }
+    let position = marked.expect("marked position");
+    let root = tree.root(0).expect("trace root").0;
+    let path = tree.witness(position, 0).expect("trace witness");
+    (
+        root,
+        raster_core::transition::StepRecordWitness {
+            position: u64::from(position),
+            path_elems: path.iter().map(|elem| elem.0.clone()).collect(),
+        },
+    )
+}
+
+/// The step at `[0, 0]` reading `sub`'s parameter 0, its own source witness,
+/// and the parent `SequenceStart` at `[0]` carrying `parent_args`.
+fn scope_binding_scenario(
+    read_from: CfsCoordinates,
+    commitment: Vec<u8>,
+) -> (StepRecord, FnInput, StepRecord, FnInput) {
+    let step_record = StepRecord {
+        exec_index: 2,
+        sequence_id: "sub".into(),
+        coordinates: CfsCoordinates(vec![0, 0]),
+        kind: StepKind::Exec(ExecStep {
+            target: ExecTarget::Tile("consumer".into()),
+            intra_sequence_index: 0,
+            input_commitment: Vec::new(),
+            input_source_commitment: Vec::new(),
+            output_commitment: Vec::new(),
+            storage: StorageRoots {
+                root_before: Vec::new(),
+                root_after: Vec::new(),
+                index_root_before: Vec::new(),
+                index_root_after: Vec::new(),
+            },
+        }),
+        recur_progress_commitment: RecurProgressStack::new().commitment(),
+        recur_state: None,
+    };
+    let step_source = storage_input_witness(read_from.clone(), commitment.clone());
+    let parent_args = storage_input_witness(read_from, commitment);
+    let parent_record = StepRecord {
+        exec_index: 1,
+        sequence_id: "sub".into(),
+        coordinates: CfsCoordinates(vec![0]),
+        kind: StepKind::SequenceStart {
+            input_commitment: Vec::new(),
+            // The record commits its own argument list; that commitment is
+            // fingerprinted, which is what makes it an anchor.
+            input_source_commitment: input_source_commitment(&parent_args),
+        },
+        recur_progress_commitment: RecurProgressStack::new().commitment(),
+        recur_state: None,
+    };
+    (step_record, step_source, parent_record, parent_args)
+}
+
+#[test]
+fn sequence_scope_parent_binding_accepts_the_real_parent() {
+    let cfs_cursor = scope_binding_cfs();
+    let (step_record, _step_source, parent_record, parent_args) =
+        scope_binding_scenario(CfsCoordinates(vec![9, 9]), sha(b"the-caller-passed-this"));
+
+    let (trace_root, witness) = trace_root_and_witness(&[parent_record.clone()], 0);
+    let mut witnesses = HashMap::new();
+    witnesses.insert(
+        parent_record,
+        postcard::to_allocvec(&witness).expect("witness serializes"),
+    );
+
+    verify_sequence_scope_parent(
+        &cfs_cursor,
+        &step_record,
+        Some(&parent_args),
+        &witnesses,
+        &trace_root,
+    );
+}
+
+/// The forgery the check exists to stop: a parent `FnInput` invented to agree
+/// with the step, paired with the real parent record. It is refused because the
+/// record commits its own argument list and the invention does not match it.
+#[test]
+#[should_panic(expected = "not the parent SequenceStart's recorded input source")]
+fn sequence_scope_parent_binding_refuses_a_fabricated_witness() {
+    let cfs_cursor = scope_binding_cfs();
+    let (step_record, _step_source, parent_record, _parent_args) =
+        scope_binding_scenario(CfsCoordinates(vec![9, 9]), sha(b"the-caller-passed-this"));
+
+    // A different story about what the caller passed, built to agree with a
+    // step that read it.
+    let fabricated = storage_input_witness(CfsCoordinates(vec![4, 2]), sha(b"a-different-story"));
+
+    let (trace_root, witness) = trace_root_and_witness(&[parent_record.clone()], 0);
+    let mut witnesses = HashMap::new();
+    witnesses.insert(
+        parent_record,
+        postcard::to_allocvec(&witness).expect("witness serializes"),
+    );
+
+    verify_sequence_scope_parent(
+        &cfs_cursor,
+        &step_record,
+        Some(&fabricated),
+        &witnesses,
+        &trace_root,
+    );
+}
+
+/// An invented parent *record*, self-consistent with its own invented argument
+/// list, is refused a step earlier: it is not in the trace.
+#[test]
+#[should_panic(expected = "not in the trace at the claimed position")]
+fn sequence_scope_parent_binding_refuses_a_parent_not_in_the_trace() {
+    let cfs_cursor = scope_binding_cfs();
+    let (step_record, _step_source, parent_record, parent_args) =
+        scope_binding_scenario(CfsCoordinates(vec![9, 9]), sha(b"the-caller-passed-this"));
+
+    // The witness proves inclusion in *some* trace — just not the one this step
+    // is being appended to.
+    let (_, witness) = trace_root_and_witness(&[parent_record.clone()], 0);
+    let (unrelated_root, _) = trace_root_and_witness(
+        &[step_with_sequence_id(
+            boundary_start_kind(),
+            vec![0],
+            "sub",
+        )],
+        0,
+    );
+    let mut witnesses = HashMap::new();
+    witnesses.insert(
+        parent_record,
+        postcard::to_allocvec(&witness).expect("witness serializes"),
+    );
+
+    verify_sequence_scope_parent(
+        &cfs_cursor,
+        &step_record,
+        Some(&parent_args),
+        &witnesses,
+        &unrelated_root,
+    );
+}
+
+/// Why [`verify_sequence_scope_parent`] has to exist.
+///
+/// `SequenceScope { i }` claims "my input is parameter `i` of the frame I am
+/// in". The guest checks it by comparing the step's own resolved source against
+/// argument `i` of the **parent's** `FnInput`, supplied as
+/// `sequence_scope_witness`.
+///
+/// The step's own witness is pinned — `verify_step_record` holds it to the
+/// record's `input_source_commitment`, which is fingerprinted. The parent's is
+/// not pinned to anything: it arrives from the host and no check ties it to the
+/// parent `SequenceStart`'s own recorded commitment. So `assert_same_source`
+/// compares a value against a value the same party chose, and passes for any
+/// claim at all.
+///
+/// Demonstrated by inventing two mutually exclusive parents. Each says the
+/// caller passed something different; each is accepted, because each was built
+/// to agree with the step. Their `input_source_commitment`s differ, so a check
+/// that consulted the parent record would have separated them.
+///
+/// Invert once the parent record's trace inclusion is verified and its
+/// `input_source_commitment` compared (`input_sources_witnesses`, currently
+/// shipped to the guest and read by nothing).
+#[test]
+fn poc_the_sequence_scope_witness_is_bound_to_nothing() {
+    let cfs_cursor = scope_binding_cfs();
+
+    let step_at = |read_from: CfsCoordinates, commitment: Vec<u8>| {
+        let step_record = StepRecord {
+            exec_index: 3,
+            sequence_id: "sub".into(),
+            coordinates: CfsCoordinates(vec![0, 0]),
+            kind: StepKind::Exec(ExecStep {
+                target: ExecTarget::Tile("consumer".into()),
+                intra_sequence_index: 0,
+                input_commitment: Vec::new(),
+                input_source_commitment: Vec::new(),
+                output_commitment: Vec::new(),
+                storage: StorageRoots {
+                    root_before: Vec::new(),
+                    root_after: Vec::new(),
+                    index_root_before: Vec::new(),
+                    index_root_after: Vec::new(),
+                },
+            }),
+            recur_progress_commitment: RecurProgressStack::new().commitment(),
+            recur_state: None,
+        };
+        (step_record, storage_input_witness(read_from, commitment))
+    };
+
+    // Two invented parents, each claiming the caller passed a different object,
+    // and each paired with a step that read exactly what it claims.
+    let claims = [
+        (CfsCoordinates(vec![9, 9]), sha(b"one-story")),
+        (CfsCoordinates(vec![4, 2]), sha(b"a-different-story")),
+    ];
+
+    let mut parent_commitments = Vec::new();
+    for (read_from, commitment) in claims {
+        let (step_record, step_source) = step_at(read_from.clone(), commitment.clone());
+        // Invented wholesale: not derived from any parent record in any trace.
+        let fabricated_parent = storage_input_witness(read_from, commitment);
+
+        verify_step_record_inputs(
+            &cfs_cursor,
+            &step_record,
+            Some(&step_source),
+            Some(&fabricated_parent),
+            None,
+        );
+
+        parent_commitments.push(input_source_commitment(&fabricated_parent));
+    }
+
+    assert_ne!(
+        parent_commitments[0], parent_commitments[1],
+        "the two fabricated parents must be distinguishable, or the test proves nothing"
+    );
+}
+
 fn producer_sequence_cfs() -> CfsCursor {
     CfsCursor::new(ControlFlowSchema {
         version: "1.0".into(),
@@ -240,6 +516,313 @@ fn verify_step_record_inputs_accepts_sequence_descendant_producer_coordinates() 
         Some(&input_source_witness),
         None,
         None,
+    );
+}
+
+/// A step at trace index `t` carries `exec_index == t + 1`.
+fn exec_index_fixture(exec_index: u64) -> StepRecord {
+    StepRecord {
+        exec_index,
+        sequence_id: "main".into(),
+        coordinates: CfsCoordinates(vec![1]),
+        kind: StepKind::Exec(ExecStep {
+            target: ExecTarget::Tile("consumer".into()),
+            intra_sequence_index: 1,
+            input_commitment: Vec::new(),
+            input_source_commitment: Vec::new(),
+            output_commitment: Vec::new(),
+            storage: StorageRoots {
+                root_before: Vec::new(),
+                root_after: Vec::new(),
+                index_root_before: Vec::new(),
+                index_root_after: Vec::new(),
+            },
+        }),
+        recur_progress_commitment: RecurProgressStack::new().commitment(),
+        recur_state: None,
+    }
+}
+
+/// A recur **tile** site at `[0]` and a recur **sequence** site at `[1]`,
+/// so both frame rules are reachable from one schema.
+fn recur_frames_cfs() -> CfsCursor {
+    CfsCursor::new(ControlFlowSchema {
+        version: "1.0".into(),
+        project: "test".into(),
+        encoding: "postcard".into(),
+        tiles: vec![TileDef::iter("recur", 1, 1), TileDef::iter("inner", 1, 1)],
+        sequences: vec![
+            SequenceDef {
+                id: "main".into(),
+                input_sources: vec![],
+                items: vec![
+                    SequenceChildItem::RecurTile(RecurTileItem {
+                        id: "recur".into(),
+                        sources: vec![InputBinding::Direct(InputSource::Inline)],
+                        chunk: None,
+                        leaves_output_open: false,
+                        state_is_output: false,
+                    }),
+                    SequenceChildItem::RecurSequence(RecurSequenceItem {
+                        id: "child".into(),
+                        sources: vec![InputBinding::Direct(InputSource::Inline)],
+                        state_is_output: false,
+                    }),
+                ],
+                entry_arguments: vec![],
+                produces_output: false,
+            },
+            SequenceDef {
+                id: "child".into(),
+                input_sources: vec![InputBinding::Direct(InputSource::Inline)],
+                items: vec![SequenceChildItem::Tile(TileItem {
+                    id: "inner".into(),
+                    sources: vec![InputBinding::Direct(InputSource::Inline)],
+                })],
+                entry_arguments: vec![],
+                produces_output: false,
+            },
+        ],
+    })
+}
+
+fn step_with_sequence_id(
+    kind: StepKind,
+    coordinates: Vec<u32>,
+    sequence_id: &str,
+) -> StepRecord {
+    StepRecord {
+        exec_index: 1,
+        sequence_id: sequence_id.into(),
+        coordinates: CfsCoordinates(coordinates),
+        kind,
+        recur_progress_commitment: RecurProgressStack::new().commitment(),
+        recur_state: None,
+    }
+}
+
+fn exec_kind(target: ExecTarget) -> StepKind {
+    StepKind::Exec(ExecStep {
+        target,
+        intra_sequence_index: 0,
+        input_commitment: Vec::new(),
+        input_source_commitment: Vec::new(),
+        output_commitment: Vec::new(),
+        storage: StorageRoots {
+            root_before: Vec::new(),
+            root_after: Vec::new(),
+            index_root_before: Vec::new(),
+            index_root_after: Vec::new(),
+        },
+    })
+}
+
+fn boundary_start_kind() -> StepKind {
+    StepKind::SequenceStart {
+        input_commitment: Vec::new(),
+        input_source_commitment: Vec::new(),
+    }
+}
+
+/// The rule `verify_sequence_id` derives, exercised on both recur kinds.
+///
+/// Mirrors the recorder's own
+/// `sequence_id_names_the_callee_at_boundaries_and_the_frame_everywhere_else`,
+/// so the guest's derivation and the producer's behaviour are pinned to the
+/// same table from both sides.
+#[test]
+fn sequence_id_derivation_matches_the_recorder() {
+    let cfs = recur_frames_cfs();
+
+    // Boundary steps name the callee.
+    verify_sequence_id(
+        &cfs,
+        &step_with_sequence_id(boundary_start_kind(), vec![0], "recur"),
+    );
+    verify_sequence_id(
+        &cfs,
+        &step_with_sequence_id(boundary_start_kind(), vec![1], "child"),
+    );
+    // A recur sequence's iteration boundary resolves through the site.
+    verify_sequence_id(
+        &cfs,
+        &step_with_sequence_id(boundary_start_kind(), vec![1, 0], "child"),
+    );
+
+    // A recur *tile* pushes no frame: its iteration and its closing `Exec`
+    // both stay in `main`.
+    verify_sequence_id(
+        &cfs,
+        &step_with_sequence_id(exec_kind(ExecTarget::Tile("recur".into())), vec![0, 0], "main"),
+    );
+    verify_sequence_id(
+        &cfs,
+        &step_with_sequence_id(
+            exec_kind(ExecTarget::RecurTile("recur".into())),
+            vec![0],
+            "main",
+        ),
+    );
+
+    // A recur *sequence* does push one: its body names the site, while the
+    // site's own closing `Exec` sits back in `main`.
+    verify_sequence_id(
+        &cfs,
+        &step_with_sequence_id(
+            exec_kind(ExecTarget::Tile("inner".into())),
+            vec![1, 0, 0],
+            "child",
+        ),
+    );
+    verify_sequence_id(
+        &cfs,
+        &step_with_sequence_id(
+            exec_kind(ExecTarget::RecurSequence("child".into())),
+            vec![1],
+            "main",
+        ),
+    );
+}
+
+#[test]
+#[should_panic(expected = "but its kind and coordinates determine")]
+fn sequence_id_tampering_is_refused_for_an_exec_step() {
+    verify_sequence_id(
+        &recur_frames_cfs(),
+        &step_with_sequence_id(
+            exec_kind(ExecTarget::Tile("inner".into())),
+            vec![1, 0, 0],
+            // The site's containing sequence, not the frame it runs in — the
+            // plausible lie, and the one a tamperer reaches for.
+            "main",
+        ),
+    );
+}
+
+#[test]
+#[should_panic(expected = "but its kind and coordinates determine")]
+fn sequence_id_tampering_is_refused_at_a_program_boundary() {
+    verify_sequence_id(
+        &recur_frames_cfs(),
+        &step_with_sequence_id(
+            StepKind::ProgramStart(ProgramStartStep {
+                entry_arguments: Vec::new(),
+                output_commitment: Vec::new(),
+                storage: StorageRoots {
+                    root_before: Vec::new(),
+                    root_after: Vec::new(),
+                    index_root_before: Vec::new(),
+                    index_root_after: Vec::new(),
+                },
+            }),
+            vec![],
+            "not-main",
+        ),
+    );
+}
+
+/// A boundary step names its callee, so claiming the *containing* sequence is
+/// the plausible lie here — and it is the one `record_matches_item` would have
+/// caught. This pins that the new check catches it too, at a coordinate
+/// `verify_step_record_inputs` skips.
+#[test]
+#[should_panic(expected = "but its kind and coordinates determine")]
+fn sequence_id_tampering_is_refused_at_a_sequence_boundary() {
+    verify_sequence_id(
+        &recur_frames_cfs(),
+        &step_with_sequence_id(
+            StepKind::SequenceEnd {
+                output_commitment: Vec::new(),
+            },
+            // The recur sequence's own iteration boundary: names "child",
+            // never the frame that contains the site.
+            vec![1, 0],
+            "main",
+        ),
+    );
+}
+
+#[test]
+#[should_panic(expected = "but its kind and coordinates determine")]
+fn sequence_id_tampering_is_refused_at_the_program_end() {
+    verify_sequence_id(
+        &recur_frames_cfs(),
+        &step_with_sequence_id(
+            StepKind::ProgramEnd(ProgramEndStep {
+                output: None,
+                output_commitment: Vec::new(),
+                storage: StorageRoots {
+                    root_before: Vec::new(),
+                    root_after: Vec::new(),
+                    index_root_before: Vec::new(),
+                    index_root_after: Vec::new(),
+                },
+            }),
+            vec![],
+            "child",
+        ),
+    );
+}
+
+/// Regression for the forged-divergence attack (was a proof of concept).
+///
+/// `exec_index` reaches the trace leaf — it is `StepRecord`'s first field and
+/// `hash_trace_item` hashes the whole postcard encoding — so a record and its
+/// `exec_index`-bumped twin hash to different leaves, different trace roots,
+/// and different fingerprint entries. While nothing verified the field, putting
+/// the twin last in an otherwise honest window left every earlier item matching
+/// the commitment, so `finalize` reached `assert!(diverges)` and returned
+/// `Finished` against an honest commitment.
+///
+/// `verify_exec_index` closes it: the field is fixed by the step's trace index.
+#[test]
+#[should_panic(expected = "but its position determines")]
+fn exec_index_tampering_is_refused() {
+    // The step at trace index 3 must carry 4; anything else is unauthorized
+    // entropy in the leaf.
+    verify_exec_index(3, &exec_index_fixture(999));
+}
+
+#[test]
+fn exec_index_matching_its_trace_position_is_accepted() {
+    for trace_index in [0u64, 1, 7, 1_996] {
+        verify_exec_index(trace_index, &exec_index_fixture(trace_index + 1));
+    }
+}
+
+/// Off-by-one in either direction is the cheap version of the attack: the
+/// neighbouring values are the ones an attacker reaches for first.
+#[test]
+#[should_panic(expected = "but its position determines")]
+fn exec_index_one_short_is_refused() {
+    verify_exec_index(3, &exec_index_fixture(3));
+}
+
+/// The field still reaches the trace leaf — that is *why* it must be verified.
+/// If this ever stops holding, `verify_exec_index` is guarding nothing.
+#[test]
+fn exec_index_reaches_the_trace_leaf() {
+    let honest = exec_index_fixture(1);
+    let mut tampered = honest.clone();
+    tampered.exec_index = 999;
+    assert_eq!(tampered.kind, honest.kind);
+    assert_eq!(tampered.coordinates, honest.coordinates);
+    assert_eq!(tampered.sequence_id, honest.sequence_id);
+
+    let honest_leaf = crate::merkle_tree::hash_trace_item(&honest);
+    let tampered_leaf = crate::merkle_tree::hash_trace_item(&tampered);
+    assert_ne!(honest_leaf, tampered_leaf);
+
+    let root_after = |leaf: Vec<u8>| {
+        let mut tree = TraceBridgeTree::new(1);
+        tree.append(Bytes(EMPTY_LEAF.to_vec()));
+        tree.append(Bytes(leaf));
+        tree.root(0).expect("trace root").0
+    };
+    assert_ne!(
+        root_after(honest_leaf),
+        root_after(tampered_leaf),
+        "a field that moves the trace root must be verified, or it is forgeable"
     );
 }
 
@@ -1595,12 +2178,35 @@ mod fingerprint_slice {
     /// `sha256(bits[i].to_le_bytes())`, combined by the shared trace-tree
     /// convention. Rebuilt here so the guest-side check is exercised against
     /// an independently constructed witness.
+    /// A header whose declared window size matches the window being built —
+    /// the ordinary case, and what every slice test other than the shape tests
+    /// wants.
     fn build_header_and_witness(
         bits: &[u64],
         bits_per_item: usize,
         fingerprint_len: usize,
         window_start: usize,
         window_len: usize,
+    ) -> (TraceCommitmentHeader, FingerprintSliceWitness) {
+        build_header_and_witness_for_window(
+            bits,
+            bits_per_item,
+            fingerprint_len,
+            window_start,
+            window_len,
+            window_len,
+        )
+    }
+
+    /// As above, but the commitment declares `window_size` independently of the
+    /// window actually presented — which is what the shape check is about.
+    fn build_header_and_witness_for_window(
+        bits: &[u64],
+        bits_per_item: usize,
+        fingerprint_len: usize,
+        window_start: usize,
+        window_len: usize,
+        window_size: usize,
     ) -> (TraceCommitmentHeader, FingerprintSliceWitness) {
         let first_block = (window_start * bits_per_item) / 64;
         let last_block = ((window_start + window_len) * bits_per_item - 1) / 64;
@@ -1632,6 +2238,8 @@ mod fingerprint_slice {
             fingerprint_len: fingerprint_len as u64,
             fingerprint_root,
             revealed_items_commitment: vec![9; 32],
+            window_size: window_size as u64,
+            revealed_tail_roots_commitment: vec![8; 32],
         };
         (header, FingerprintSliceWitness { blocks })
     }
@@ -1663,6 +2271,82 @@ mod fingerprint_slice {
         let packer = BitPacker::new(bits_per_item);
         let hashes: Vec<Vec<u8>> = (0..items).map(|i| vec![i as u8; 32]).collect();
         packer.pack(&hashes)
+    }
+
+    /// Regression for the unbound-shape hole (was a proof of concept).
+    ///
+    /// `window_len` comes from the challenger's `Fingerprint::len` — a metadata
+    /// field `Fingerprint::from` stores verbatim without checking it against
+    /// `bits` — and `window_start` from the challenger's frontier position. The
+    /// only constraint used to be `window_start + window_len <=
+    /// fingerprint_len`: an upper bound, not a shape.
+    ///
+    /// A two-item window is the degenerate case, not a merely unusual one. Over
+    /// `L` items `finalize` never compares item 0, requires items `1..L-2` to
+    /// match, and requires item `L-1` to diverge — so at `L = 2` there are
+    /// **zero** matching comparisons, nothing pins the challenger's opening
+    /// state to reality, and a window fabricated anywhere in the trace reaches
+    /// `Finished`.
+    ///
+    /// Note the slice itself is *genuine* here: no bits are tampered, no
+    /// witness is forged. The lie is only the window's shape, which is why no
+    /// other check catches it.
+    #[test]
+    #[should_panic(expected = "but the commitment was built with a window of")]
+    fn a_short_window_is_refused_anywhere_in_the_commitment() {
+        let (bits_per_item, items) = (4, 40);
+        let bits = fixture_bits(bits_per_item, items);
+        // Mid-commitment, arbitrary, and nothing like a head or terminal window.
+        let (window_start, window_len, window_size) = (20, 2, 4);
+
+        let packer = BitPacker::new(bits_per_item);
+        let window_bits = packer
+            .get_range(window_start, window_start + window_len, &bits)
+            .expect("window slice");
+        let window = Fingerprint::from(window_bits, packer, window_len);
+
+        let (header, witness) = build_header_and_witness_for_window(
+            &bits,
+            bits_per_item,
+            items,
+            window_start,
+            window_len,
+            window_size,
+        );
+        assert_window_is_commitment_slice(
+            &init_transition_with_window(window_start, window),
+            &header,
+            &witness,
+        );
+    }
+
+    /// The other direction: claiming more items than the commitment's window.
+    #[test]
+    #[should_panic(expected = "but the commitment was built with a window of")]
+    fn a_window_longer_than_the_commitments_is_refused() {
+        let (bits_per_item, items) = (4, 40);
+        let bits = fixture_bits(bits_per_item, items);
+        let (window_start, window_len, window_size) = (20, 8, 4);
+
+        let packer = BitPacker::new(bits_per_item);
+        let window_bits = packer
+            .get_range(window_start, window_start + window_len, &bits)
+            .expect("window slice");
+        let window = Fingerprint::from(window_bits, packer, window_len);
+
+        let (header, witness) = build_header_and_witness_for_window(
+            &bits,
+            bits_per_item,
+            items,
+            window_start,
+            window_len,
+            window_size,
+        );
+        assert_window_is_commitment_slice(
+            &init_transition_with_window(window_start, window),
+            &header,
+            &witness,
+        );
     }
 
     #[test]

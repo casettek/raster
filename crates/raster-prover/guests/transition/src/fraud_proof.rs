@@ -298,6 +298,27 @@ pub(crate) fn assert_window_is_commitment_slice(
     let window_len = window_fingerprint.len();
     assert!(window_len > 0, "Window fingerprint is empty");
 
+    // The window's *shape*, which nothing constrained before the header carried
+    // `window_size`. `window_len` comes from the challenger's `Fingerprint::len`
+    // — a metadata field `Fingerprint::from` stores verbatim without checking it
+    // against `bits` — and `window_start` from the challenger's frontier
+    // position, leaving only the upper bound below to hold them.
+    //
+    // A short window is the degenerate case rather than a merely unusual one:
+    // counting what `finalize` compares over `L` items, item 0 is `First` and
+    // never compared, items `1..L-2` must match, and item `L-1` must diverge.
+    // At `L = 2` that is *zero* matching comparisons, so nothing ties the
+    // challenger's opening state to reality and a window fabricated anywhere in
+    // the trace reaches `Finished`.
+    let declared_window_size =
+        usize::try_from(header.window_size).expect("Window size overflows usize");
+    assert!(
+        window_len == declared_window_size,
+        "Window declares {} items but the commitment was built with a window of {}",
+        window_len,
+        declared_window_size,
+    );
+
     let window_start = usize::try_from(init_transition.init_frontier.position)
         .expect("Window start position overflows usize");
     let fingerprint_len =
@@ -526,6 +547,19 @@ impl LiveTransition {
         cfs_cursor: &CfsCursor,
         input: &TransitionInput,
     ) -> Self {
+        // Before `append_to_trace` advances it, the frontier's position is this
+        // step's trace index — which is what fixes its `exec_index`.
+        checks::cfs::verify_exec_index(self.frontier.position().into(), &input.step_record);
+        checks::cfs::verify_sequence_id(cfs_cursor, &input.step_record);
+        // The same pre-append frontier: its root is the root of the trace
+        // prefix the parent record must be provably in.
+        checks::cfs::verify_sequence_scope_parent(
+            cfs_cursor,
+            &input.step_record,
+            input.sequence_scope_witness.as_ref(),
+            &input.input_sources_witnesses,
+            &frontier_root(&self.frontier),
+        );
         checks::cfs::verify_step_record_inputs(
             cfs_cursor,
             &input.step_record,

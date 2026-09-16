@@ -607,6 +607,22 @@ pub struct TraceWindow {
 pub struct TraceCommitment {
     pub fingerprint: Fingerprint,
     pub revealed_items: Vec<StepRecord>,
+    /// The cumulative trace roots for the final `window_size` indices, in the
+    /// clear — the tail's counterpart to `revealed_items` revealing the first
+    /// `window_size` step records.
+    ///
+    /// Detection reads the packed fingerprint, which keeps only
+    /// `bits_per_item` bits of each root, and a divergence at index `N - k` has
+    /// only `k` entries left to differ in. At `window_size >= 128`
+    /// `bits_per_item` is 1, so a last-step divergence was a coin flip. Full
+    /// roots make detection exact across the final window, and pinpoint the
+    /// index rather than only reporting that something differs.
+    ///
+    /// Revealing them gives nothing away that the fingerprint did not already
+    /// commit to, and `validate` holds each one to the entry it squeezes to, so
+    /// a commitment whose roots and bits disagree is unrepresentable.
+    #[serde(default)]
+    pub revealed_tail_roots: Vec<Vec<u8>>,
 }
 
 impl TraceCommitment {

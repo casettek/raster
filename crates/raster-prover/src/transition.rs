@@ -628,10 +628,13 @@ mod tests {
             fingerprint: window_fingerprint.clone(),
         });
         // A minimal commitment whose fingerprint *is* the window (start 0),
-        // so the guest's Init-time slice check passes.
+        // so the guest's Init-time slice check passes. One revealed item, so
+        // the header's `window_size` agrees with the one-item window this
+        // proves — the guest asserts that agreement.
         let trace_commitment = TraceCommitment {
             fingerprint: window_fingerprint,
-            revealed_items: Vec::new(),
+            revealed_items: vec![make_sequence_start_step()],
+            revealed_tail_roots: vec![vec![0u8; 32]],
         };
         let commitment_header = trace_commitment.header();
         let fingerprint_slice = trace_commitment.fingerprint_slice_witness(0, 1);
