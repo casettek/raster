@@ -732,6 +732,22 @@ struct SequenceFrame {
 struct RecurFrame {
     site_coordinates: CfsCoordinates,
     next_iteration_index: u32,
+    /// Whether a recur *sequence* iteration body is currently open.
+    ///
+    /// A recur **tile**'s iteration is one tile execution and pushes no
+    /// `SequenceFrame`, so its coordinate is `site ++ [iteration]` and the recur
+    /// frame is the right place to reserve it. A recur **sequence**'s iteration
+    /// is a body of several steps: `enter_recur_sequence_iteration` pushes a
+    /// frame at `site ++ [iteration]`, and the body's steps belong *under* it as
+    /// `site ++ [iteration, item]`.
+    ///
+    /// Without this flag `reserve_execution_coordinates` took the recur branch
+    /// for body steps too, addressing them as `site ++ [flat]` and advancing
+    /// `next_iteration_index` once per step rather than once per iteration —
+    /// so the coordinates disagreed with the trace recorder's, and the iteration
+    /// numbering drifted on top. See
+    /// `docs/issues/fraud-evidence-storage-unavailable.md` §2b.
+    iteration_open: bool,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -778,6 +794,7 @@ impl SequenceExecutionContext {
         self.recur_stack.push(RecurFrame {
             site_coordinates,
             next_iteration_index: 0,
+            iteration_open: false,
         });
         Ok(())
     }
@@ -789,6 +806,7 @@ impl SequenceExecutionContext {
         let mut coordinates = recur_frame.site_coordinates.clone();
         coordinates.push(recur_frame.next_iteration_index);
         recur_frame.next_iteration_index += 1;
+        recur_frame.iteration_open = true;
         self.stack.push(SequenceFrame {
             coordinates,
             next_child_index: 0,
@@ -801,6 +819,9 @@ impl SequenceExecutionContext {
         self.stack
             .pop()
             .expect("Corrupted recur sequence iteration context");
+        if let Some(recur_frame) = self.recur_stack.last_mut() {
+            recur_frame.iteration_open = false;
+        }
     }
 
     fn exit_recur_site(&mut self) {
@@ -824,7 +845,18 @@ impl SequenceExecutionContext {
     }
 
     pub(crate) fn reserve_execution_coordinates(&mut self) -> Result<CfsCoordinates> {
-        if let Some(recur_frame) = self.recur_stack.last_mut() {
+        // Only a recur *tile* site reserves from the recur frame: its iteration
+        // is one tile execution, so `site ++ [iteration]` is the step's own
+        // coordinate. Inside a recur *sequence* iteration the body's frame is
+        // already on `self.stack` at `site ++ [iteration]`, and the step belongs
+        // under it — so fall through and let the frame below assign
+        // `site ++ [iteration, item]`, which is what the trace recorder and the
+        // CFS both use.
+        if let Some(recur_frame) = self
+            .recur_stack
+            .last_mut()
+            .filter(|frame| !frame.iteration_open)
+        {
             let mut coordinates = recur_frame.site_coordinates.clone();
             coordinates.push(recur_frame.next_iteration_index);
             recur_frame.next_iteration_index += 1;

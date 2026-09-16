@@ -4,6 +4,9 @@ Status: open 2026-09-16. Unowned. **Top priority** — set 2026-09-16.
 
 Reproducible against `feature/recur-mid-seed` at `0a71d10`. Every citation is committed code.
 
+§2a's half is **demonstrated**, not only reasoned — see §3. The fabricated sweep is built and
+run against the real rule machinery, and the rules close it clean.
+
 This is the only open issue in this directory that is a **soundness** gap rather than a
 fail-closed defect. `authenticated-chain-draft-output` panics, `chain-shape-count-unverified`
 needs a tampered sidecar and moves no commitment, `fraud-window-trace-ends` degenerates to a
@@ -116,6 +119,25 @@ produce two proposals each able to claim the other is load-bearing.
   rules 1–2 see indices `0..5`; rule 5 sees a complete prefix; the site closes clean. The trace
   claims to have swept a 10-element list and read the first two elements five times.
 
+  **Demonstrated 2026-09-16**, driving the real machinery rather than by inspection:
+  `poc_a_sweep_that_rereads_the_first_chunk_passes_every_completeness_rule`
+  (`crates/raster-core/src/recur_progress.rs`) builds exactly this `L = 10, chunk = 2` case and
+  closes the site clean. It then states the hole as an equality rather than a story: the honest
+  ranges `[0,2) [2,4) [4,6) [6,8) [8,10)` and the fabricated `[0,2)×5` genuinely differ, yet the
+  tuples handed to `advance_tile_iteration` are **identical**, so no completeness rule can
+  separate them. A companion test shows chunking is not the cause — `consumed_elements` carries no
+  position at any chunk size, so `chunk = 1` is exposed the same way.
+
+  The other half needs no construction. `verify_selection_witness(commitment, witness)`
+  (`raster-core/src/input.rs:1321`) is pure in exactly two arguments, neither of which carries an
+  iteration index or a position, so the same valid `Range { start: 0, end: 2 }` witness verifies
+  on every call. There is no cross-step state that could notice — consistent with the zero
+  `ListRange` hits in the guest.
+
+  Not demonstrated: the converse, **land 2a only**. That one rests on a tile being replayable on
+  arbitrary bytes, which is `checks/io.rs:105-113` binding the journal to the *recorded witness*
+  rather than to the selection — read, but not exercised.
+
 ## 4. What it costs today
 
 `examples/hello-tiles/src/main.rs:122-125` is a live `chunk = 2` sweep, so this is not
@@ -138,11 +160,18 @@ or `SKILL.md` line about "authenticated iteration" should quote this table rathe
 
 A secondary consequence, worth naming because it will otherwise be rediscovered: the prover's
 `resolve_inputs_sources` returns no source records for an iteration
-(`crates/raster-prover/src/trace.rs:629-634`), mirroring the guest's early return
-(`checks/cfs.rs:207-212`). That mirroring is correct — an iteration binds no CFS inputs — and it
+(`crates/raster-prover/src/trace.rs:864`), mirroring the guest's early return
+(`checks/cfs.rs:212`). That mirroring is correct — an iteration binds no CFS inputs — and it
 is *also* why neither side has an obvious place to hang the missing checks. Whatever closes this
 has to decide where an iteration's per-step obligations live, given that the CFS-binding path
 deliberately skips them.
+
+⚠️ **Amended 2026-09-16.** Less true than when written. `trace-leaf-field-binding` added
+`verify_exec_index` and `verify_sequence_id` in `LiveTransition::apply_verified_step` — *outside*
+`verify_step_record_inputs`, so they run for **every** step including recur iterations, which is
+precisely the set the CFS-binding path skips. A recur iteration therefore now does carry per-step
+obligations, and §5's *per-step obligation record* direction has a structural hook it did not
+have. The line numbers above also moved with that work; they are updated.
 
 ## 5. Directions
 

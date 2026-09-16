@@ -637,6 +637,91 @@ mod tests {
         assert!(sweep_unchunked(3, 3, RecurControlKind::Continue).is_ok());
     }
 
+    /// PROOF OF CONCEPT — soundness. See
+    /// `docs/issues/selection-unbound-from-execution.md` §3.
+    ///
+    /// The completeness rules decide whether a recur sweep covered its source.
+    /// They are handed the journal's self-reported numbers and nothing else:
+    /// [`RecurProgressStack::advance_tile_iteration`] takes an iteration index,
+    /// a declared iteration count, a consumed-element count and a control
+    /// flag — **no range, no selection, no bytes**. The selection proof that
+    /// says *where in the source this iteration actually read* is verified
+    /// separately, in `checks::store`, and the two are never joined.
+    ///
+    /// So a sweep that reads the first chunk five times presents the rules with
+    /// exactly the facts a complete sweep presents. This builds the issue's
+    /// worked example — `L = 10`, `chunk = 2` — and shows the rules close it
+    /// clean.
+    ///
+    /// Invert when rule 8 lands: the cross-check must reject a sweep whose
+    /// ranges do not tile `[0, L)`.
+    #[test]
+    fn poc_a_sweep_that_rereads_the_first_chunk_passes_every_completeness_rule() {
+        const SOURCE_LEN: u64 = 10;
+        const CHUNK: u64 = 2;
+        let declared_iterations = SOURCE_LEN.div_ceil(CHUNK); // 5
+
+        // What each iteration *claims* to have consumed. Identical for the
+        // honest sweep and the fabricated one, because `consumed_elements` says
+        // how much, never from where.
+        let mut stack = tile_stack(SOURCE_LEN, CHUNK);
+        for index in 0..declared_iterations {
+            stack
+                .advance_tile_iteration(
+                    &iteration(index),
+                    index,
+                    declared_iterations,
+                    CHUNK,
+                    RecurControlKind::Continue,
+                    None,
+                )
+                .expect("rule 4 accepts a full chunk while elements remain");
+        }
+
+        // Rules 5-7: the sweep is complete and closes clean.
+        let frame = stack.close_site(&site()).expect("a complete sweep closes");
+        assert_eq!(frame.consumed_total(), SOURCE_LEN);
+        assert_eq!(frame.next_iteration_index, declared_iterations);
+
+        // And here is the hole, stated as an equality rather than a story.
+        //
+        // The honest sweep reads [0,2) [2,4) [4,6) [6,8) [8,10); the fabricated
+        // one reads [0,2) five times. Those are different executions over a
+        // different number of the source's elements — but the facts the rules
+        // receive are byte-identical, because the range is not among them.
+        let honest_ranges: Vec<(u64, u64)> =
+            (0..declared_iterations).map(|i| (i * CHUNK, i * CHUNK + CHUNK)).collect();
+        let fabricated_ranges: Vec<(u64, u64)> =
+            (0..declared_iterations).map(|_| (0, CHUNK)).collect();
+        assert_ne!(
+            honest_ranges, fabricated_ranges,
+            "the two sweeps must really differ, or this proves nothing",
+        );
+
+        let rule_inputs = |_ranges: &[(u64, u64)]| -> Vec<(u64, u64, u64)> {
+            // Everything `advance_tile_iteration` is told, per iteration. The
+            // range argument is deliberately unused: there is nowhere to put it.
+            (0..declared_iterations)
+                .map(|index| (index, declared_iterations, CHUNK))
+                .collect()
+        };
+        assert_eq!(
+            rule_inputs(&honest_ranges),
+            rule_inputs(&fabricated_ranges),
+            "no completeness rule can distinguish the two sweeps",
+        );
+    }
+
+    /// The same blindness from the other side: an *element* sweep that rereads
+    /// element 0 every iteration also closes clean.
+    ///
+    /// Included because chunking is not the cause — `consumed_elements` carries
+    /// no position at any chunk size, so `chunk = 1` is exposed identically.
+    #[test]
+    fn poc_an_element_sweep_that_rereads_one_element_passes_every_completeness_rule() {
+        assert!(sweep_unchunked(4, 4, RecurControlKind::Continue).is_ok());
+    }
+
     #[test]
     fn an_empty_source_with_zero_iterations_is_accepted() {
         assert!(sweep_unchunked(0, 0, RecurControlKind::Continue).is_ok());
