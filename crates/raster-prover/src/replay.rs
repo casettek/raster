@@ -15,6 +15,12 @@ pub struct PreparedTileProfile<'a> {
     artifact: Box<dyn CompilationArtifact>,
 }
 
+/// Validated executor output, reusable by execution-only transition profiling.
+pub struct ProfiledTileExecution {
+    pub cycles: u64,
+    pub journal: TileReplayJournal,
+}
+
 impl PreparedTileProfile<'_> {
     pub fn image_id(&self) -> String {
         self.artifact.artifact_id()
@@ -23,6 +29,16 @@ impl PreparedTileProfile<'_> {
     /// Replay the recorded bytes once and return guest-user cycles, including
     /// wrapper work. Only matching, successfully completed executions count.
     pub fn profile(&self, input: &[u8], expected_output: &[u8]) -> Result<u64> {
+        Ok(self.profile_with_journal(input, expected_output)?.cycles)
+    }
+
+    /// Return validated draft/recursive facts for overhead measurement without
+    /// executing the tile a second time.
+    pub fn profile_with_journal(
+        &self,
+        input: &[u8],
+        expected_output: &[u8],
+    ) -> Result<ProfiledTileExecution> {
         let result =
             self.backend
                 .execute_tile(self.artifact.as_ref(), input, ExecutionMode::Estimate)?;
@@ -47,9 +63,10 @@ impl PreparedTileProfile<'_> {
                 journal.output_bytes.len(),
             )));
         }
-        result
+        let cycles = result
             .cycles
-            .ok_or_else(|| Error::Other("Executor did not report guest cycles".into()))
+            .ok_or_else(|| Error::Other("Executor did not report guest cycles".into()))?;
+        Ok(ProfiledTileExecution { cycles, journal })
     }
 }
 

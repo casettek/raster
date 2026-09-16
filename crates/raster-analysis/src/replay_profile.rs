@@ -6,7 +6,7 @@ use raster_core::{cfs::CfsCoordinates, Error, Result};
 use serde::{Deserialize, Serialize};
 
 pub const REPLAY_PROFILE_KIND: &str = "replay-profile";
-pub const REPLAY_PROFILE_VERSION: u32 = 2;
+pub const REPLAY_PROFILE_VERSION: u32 = 3;
 /// Fixed profiling budget per selected tile ID, across all call sites.
 pub const REPLAY_INVOCATION_LIMIT: u64 = 128;
 pub const LEGACY_ZKVM_PROFILE_KIND: &str = "zkvm-profile";
@@ -26,10 +26,33 @@ pub struct ReplayTileProfile {
     pub total_guest_cycles: u64,
     pub max_guest_cycles: Option<u64>,
     pub heaviest_invocation: Option<InvocationLocation>,
+    #[serde(default)]
+    pub transition_overhead: Option<TransitionOverhead>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransitionOverhead {
+    pub guest_cycles: u64,
+    pub invocation: InvocationLocation,
+    pub transition_image_id: String,
+    /// This describes modeled continuation state, not a proven fault window.
+    pub context: String,
+    pub context_version: u32,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProfileFailurePhase {
+    #[default]
+    Replay,
+    Authorization,
+    TransitionOverhead,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReplayProfileFailure {
+    #[serde(default)]
+    pub phase: ProfileFailurePhase,
     pub tile: String,
     pub invocation: InvocationLocation,
     pub message: String,
@@ -40,7 +63,8 @@ pub struct ReplayProfile {
     pub kind: String,
     pub version: u32,
     pub run_id: String,
-    /// Whether the requested replays finished successfully, up to the limit.
+    /// Whether the capped replays and (in v3) each executed tile's overhead
+    /// measurement finished successfully.
     pub complete: bool,
     /// None for version 1 reports, which replayed every recorded invocation.
     #[serde(default)]
@@ -70,7 +94,7 @@ impl ReplayProfile {
     pub fn validate_format(&self) -> Result<()> {
         let supported = match (self.kind.as_str(), self.version) {
             (REPLAY_PROFILE_KIND | LEGACY_ZKVM_PROFILE_KIND, 1) => self.invocation_limit.is_none(),
-            (REPLAY_PROFILE_KIND, REPLAY_PROFILE_VERSION) => {
+            (REPLAY_PROFILE_KIND, 2 | REPLAY_PROFILE_VERSION) => {
                 self.invocation_limit == Some(REPLAY_INVOCATION_LIMIT)
             }
             _ => false,
@@ -131,6 +155,9 @@ impl ReplayProfile {
             ));
         }
         lines.push("  Calls: successfully profiled / recorded invocations.".into());
+        if self.version >= 3 {
+            lines.push("  Transition overhead: one representative continuation step; separate from replay totals, excludes window setup and proving.".into());
+        }
         if !self.complete {
             lines.push("  Partial totals include only successfully profiled invocations.".into());
         }
@@ -173,6 +200,15 @@ impl ReplayProfile {
                 "    {tile}: max {maximum}, total {total} guest cycles, calls {}, heaviest {location}{capped}",
                 format!("{}/{}", stats.profiled_invocations, stats.invocations),
             ));
+            if stats.invocations > 0 {
+                lines.push(match &stats.transition_overhead {
+                    Some(overhead) => format!(
+                        "      Sample transition overhead: {} guest cycles at {:?} (representative)",
+                        overhead.guest_cycles, overhead.invocation.coordinates.0,
+                    ),
+                    None => "      Sample transition overhead: not measured".into(),
+                });
+            }
         }
         lines.push(format!(
             "  {}profiled-invocation guest cycles: {}",
@@ -181,7 +217,8 @@ impl ReplayProfile {
         ));
         if let Some(failure) = &self.failure {
             lines.push(format!(
-                "  FAILED: {} at {:?} (execution {}): {}",
+                "  FAILED ({:?}): {} at {:?} (execution {}): {}",
+                failure.phase,
                 failure.tile,
                 failure.invocation.coordinates.0,
                 failure.invocation.exec_index,
@@ -201,6 +238,42 @@ mod tests {
             exec_index: index as u64,
             coordinates: CfsCoordinates(vec![index]),
         }
+    }
+
+    #[test]
+    fn overhead_is_separate_and_old_reports_do_not_invent_it() {
+        let mut profile = ReplayProfile::new("new".into(), ["tile".into()]);
+        profile.tiles.get_mut("tile").unwrap().invocations = 2;
+        profile.record("tile", location(0), 40).unwrap();
+        profile.record("tile", location(1), 50).unwrap();
+        profile.tiles.get_mut("tile").unwrap().transition_overhead = Some(TransitionOverhead {
+            guest_cycles: 1000,
+            invocation: location(0),
+            transition_image_id: "image".into(),
+            context: "representative-continuation".into(),
+            context_version: 1,
+        });
+        profile.complete = true;
+        let restored: ReplayProfile =
+            serde_json::from_slice(&serde_json::to_vec(&profile).unwrap()).unwrap();
+        restored.validate_format().unwrap();
+        assert_eq!(restored.total_guest_cycles, 90);
+        assert_eq!(restored.tiles["tile"].max_guest_cycles, Some(50));
+        assert!(restored
+            .to_text()
+            .contains("Sample transition overhead: 1000 guest cycles at [0]"));
+        let mut old = serde_json::to_value(profile).unwrap();
+        old["version"] = 2.into();
+        old["tiles"]["tile"]
+            .as_object_mut()
+            .unwrap()
+            .remove("transition_overhead");
+        let old: ReplayProfile = serde_json::from_value(old).unwrap();
+        old.validate_format().unwrap();
+        assert!(old.tiles["tile"].transition_overhead.is_none());
+        assert!(old
+            .to_text()
+            .contains("Sample transition overhead: not measured"));
     }
 
     #[test]
@@ -231,6 +304,7 @@ mod tests {
         profile.tiles.get_mut("tile").unwrap().invocations = 3;
         profile.record("tile", location(0), 0).unwrap();
         profile.failure = Some(ReplayProfileFailure {
+            phase: ProfileFailurePhase::Replay,
             tile: "tile".into(),
             invocation: location(1),
             message: "guest aborted".into(),
@@ -264,7 +338,7 @@ mod tests {
         let decoded: ReplayProfile =
             serde_json::from_slice(&serde_json::to_vec(&profile).unwrap()).unwrap();
         decoded.validate_format().unwrap();
-        assert_eq!(decoded.version, 2);
+        assert_eq!(decoded.version, 3);
         assert_eq!(decoded.invocation_limit, Some(128));
         assert_eq!(decoded.to_text(), text);
     }

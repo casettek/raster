@@ -1,5 +1,6 @@
 //! Command implementations for the Raster CLI.
 pub mod replay_profile;
+mod replay_profile_context;
 pub mod run;
 pub mod show;
 pub mod tile;

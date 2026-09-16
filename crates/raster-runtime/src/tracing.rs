@@ -1,6 +1,7 @@
 pub mod commitment;
 pub mod publishers;
 pub mod recorder;
+pub mod replay_profile;
 
 use raster_core::trace::TraceEvent;
 

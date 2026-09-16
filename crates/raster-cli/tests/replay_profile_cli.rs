@@ -231,7 +231,7 @@ fn analyze_renders_replay_json_and_preserves_native_profiles() {
     assert_eq!(decoded.run_id, "test-run");
     assert!(decoded.complete);
     assert_eq!(decoded.kind, "replay-profile");
-    assert_eq!(decoded.version, 2);
+    assert_eq!(decoded.version, 3);
     assert_eq!(decoded.invocation_limit, Some(128));
 
     // Old saved reports are still readable, regardless of their filename.

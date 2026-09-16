@@ -312,8 +312,14 @@ pub fn run(
         ));
     }
 
-    let (mut trace, trace_recorder) =
-        load_trace_from_file(&trace_path, trace_format, &cfs, input, input_manifest)?;
+    let (mut trace, trace_recorder) = load_trace_for_profile(
+        &trace_path,
+        trace_format,
+        &cfs,
+        input,
+        input_manifest,
+        &profile_tiles,
+    )?;
 
     let profiling_replay = !profile_tiles.is_empty();
     if profiling_replay {
@@ -321,6 +327,8 @@ pub fn run(
             &project,
             &trace,
             &trace_recorder,
+            &cfs,
+            input_manifest,
             profile_tiles,
             &artifacts.run_id,
             &artifacts.run_dir.join("replay-profile.json"),
@@ -449,8 +457,29 @@ pub(crate) fn load_trace_from_file(
     input: Option<&str>,
     input_manifest: Option<&str>,
 ) -> Result<(Trace, TraceRecorder)> {
+    load_trace_for_profile(
+        trace_path,
+        trace_format,
+        cfs,
+        input,
+        input_manifest,
+        &Default::default(),
+    )
+}
+
+pub(super) fn load_trace_for_profile(
+    trace_path: &PathBuf,
+    trace_format: TraceFormat,
+    cfs: &ControlFlowSchema,
+    input: Option<&str>,
+    input_manifest: Option<&str>,
+    selected: &std::collections::BTreeSet<String>,
+) -> Result<(Trace, TraceRecorder)> {
     let mut trace = Trace::new();
     let mut trace_recorder = TraceRecorder::new(cfs.clone());
+    if !selected.is_empty() {
+        trace_recorder.capture_replay_profile(selected.iter().cloned());
+    }
     // Replaying an entry-argument binding needs the same input context the
     // traced run had; we already parsed it, so hand it over rather than
     // letting the recorder go looking for it.

@@ -5,13 +5,15 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use raster_analysis::replay_profile::{
-    InvocationLocation, ReplayProfile, ReplayProfileFailure, REPLAY_INVOCATION_LIMIT,
+    InvocationLocation, ProfileFailurePhase, ReplayProfile, ReplayProfileFailure,
+    TransitionOverhead, REPLAY_INVOCATION_LIMIT,
 };
 use raster_backend_risc0::Risc0Backend;
 use raster_compiler::{tile::TileDiscovery, Project};
 use raster_core::trace::{ExecStep, ExecTarget, StepKind, StepRecord, Trace};
 use raster_core::{Error, Result};
 use raster_prover::replay::Replayer;
+use raster_prover::transition_profile::{self, ProfileAuthorization};
 use raster_runtime::TraceRecorder;
 
 pub(super) fn validate_tiles(project: &Project, requested: &[String]) -> Result<BTreeSet<String>> {
@@ -34,6 +36,8 @@ pub(super) fn run(
     project: &Project,
     trace: &Trace,
     recorder: &TraceRecorder,
+    cfs: &raster_core::cfs::ControlFlowSchema,
+    input_manifest: Option<&str>,
     selected: BTreeSet<String>,
     run_id: &str,
     report_path: &Path,
@@ -45,6 +49,7 @@ pub(super) fn run(
     let mut report = ReplayProfile::new(run_id.into(), selected);
     println!("\nProfiling selected tiles in RISC Zero (up to {REPLAY_INVOCATION_LIMIT} invocations per tile, no proving)...");
     let mut last_progress = Instant::now();
+    let mut authorization: Option<ProfileAuthorization> = None;
     let outcome = replay_selected(
         trace.iter(),
         &mut report,
@@ -64,7 +69,53 @@ pub(super) fn run(
             let output = witness
                 .output_data()
                 .ok_or_else(|| Error::Other("Missing recorded output bytes".into()))?;
-            prepared.profile(&input, &output)
+            let execution = prepared.profile_with_journal(&input, &output)?;
+            Ok((execution.cycles, execution.journal))
+        },
+        |prepared, step, journal| {
+            if authorization.is_none() {
+                let result = crate::utils::authorization::build_manifested_inputs(input_manifest)
+                    .and_then(|input| transition_profile::profile_authorization(&input));
+                authorization =
+                    Some(result.map_err(|error| (ProfileFailurePhase::Authorization, error))?);
+            }
+            let result = (|| {
+                let tile = tile_id(step).unwrap();
+                let sample = recorder
+                    .replay_profile_sample(tile)
+                    .ok_or_else(|| Error::Other("Missing recorded overhead context".into()))?
+                    .as_ref()
+                    .map_err(|error| Error::Other(error.clone()))?;
+                let auth = authorization.as_ref().unwrap();
+                let program = super::replay_profile_context::program_frame(
+                    project,
+                    cfs,
+                    tile,
+                    &prepared.image_id(),
+                )?;
+                let input = super::replay_profile_context::transition_input(
+                    trace,
+                    recorder,
+                    cfs,
+                    step,
+                    sample,
+                    journal,
+                    &auth.journal,
+                )?;
+                let cycles =
+                    transition_profile::profile_transition(&program, &sample.context, input, auth)?;
+                Ok(TransitionOverhead {
+                    guest_cycles: cycles,
+                    invocation: InvocationLocation {
+                        exec_index: step.exec_index,
+                        coordinates: step.coordinates.clone(),
+                    },
+                    transition_image_id: transition_profile::transition_image_id(),
+                    context: transition_profile::CONTEXT_KIND.into(),
+                    context_version: transition_profile::CONTEXT_VERSION,
+                })
+            })();
+            result.map_err(|error| (ProfileFailurePhase::TransitionOverhead, error))
         },
         |done, total| {
             if last_progress.elapsed() >= Duration::from_secs(1) {
@@ -95,11 +146,17 @@ fn tile_id(step: &StepRecord) -> Option<&str> {
 /// Two linear passes over the existing trace. Additional memory is O(selected
 /// tiles), plus one invocation's witnesses and the retained compiled artifacts.
 /// The injected operations keep coverage/failure tests independent of a zkVM.
-fn replay_selected<'a, P>(
+fn replay_selected<'a, P, J>(
     steps: impl Iterator<Item = &'a StepRecord> + Clone,
     report: &mut ReplayProfile,
     mut prepare: impl FnMut(&str) -> Result<(P, String)>,
-    mut execute: impl FnMut(&P, &StepRecord) -> Result<u64>,
+    mut execute: impl FnMut(&P, &StepRecord) -> Result<(u64, J)>,
+    mut overhead: impl FnMut(
+        &P,
+        &StepRecord,
+        &J,
+    )
+        -> std::result::Result<TransitionOverhead, (ProfileFailurePhase, Error)>,
     mut progress: impl FnMut(u64, u64),
 ) -> Result<()> {
     let mut total = 0;
@@ -126,17 +183,29 @@ fn replay_selected<'a, P>(
             exec_index: step.exec_index,
             coordinates: step.coordinates.clone(),
         };
-        let outcome = (|| {
+        let mut phase = ProfileFailurePhase::Replay;
+        let outcome: Result<()> = (|| {
             if !prepared.contains_key(tile) {
                 let (artifact, image_id) = prepare(tile)?;
                 report.tiles.get_mut(tile).unwrap().image_id = Some(image_id);
                 prepared.insert(tile.to_string(), artifact);
             }
-            let cycles = execute(&prepared[tile], step)?;
-            report.record(tile, location.clone(), cycles)
+            let (cycles, journal) = execute(&prepared[tile], step)?;
+            report.record(tile, location.clone(), cycles)?;
+            if report.tiles[tile].profiled_invocations == 1 {
+                let measured = overhead(&prepared[tile], step, &journal).map_err(
+                    |(failed_phase, error)| {
+                        phase = failed_phase;
+                        error
+                    },
+                )?;
+                report.tiles.get_mut(tile).unwrap().transition_overhead = Some(measured);
+            }
+            Ok(())
         })();
         if let Err(error) = outcome {
             report.failure = Some(ReplayProfileFailure {
+                phase,
                 tile: tile.into(),
                 invocation: location,
                 message: error.to_string(),
@@ -161,6 +230,36 @@ mod tests {
     use super::*;
     use raster_core::{cfs::CfsCoordinates, trace::StorageRoots};
 
+    fn mock_overhead(step: &StepRecord) -> TransitionOverhead {
+        TransitionOverhead {
+            guest_cycles: 123,
+            invocation: InvocationLocation {
+                exec_index: step.exec_index,
+                coordinates: step.coordinates.clone(),
+            },
+            transition_image_id: "image".into(),
+            context: "representative-continuation".into(),
+            context_version: 1,
+        }
+    }
+
+    fn replay_selected<'a, P>(
+        steps: impl Iterator<Item = &'a StepRecord> + Clone,
+        report: &mut ReplayProfile,
+        prepare: impl FnMut(&str) -> Result<(P, String)>,
+        mut execute: impl FnMut(&P, &StepRecord) -> Result<u64>,
+        progress: impl FnMut(u64, u64),
+    ) -> Result<()> {
+        super::replay_selected(
+            steps,
+            report,
+            prepare,
+            |prepared, step| execute(prepared, step).map(|cycles| (cycles, ())),
+            |_, step, _| Ok(mock_overhead(step)),
+            progress,
+        )
+    }
+
     fn step(index: u32, target: ExecTarget, coordinates: Vec<u32>) -> StepRecord {
         StepRecord {
             exec_index: index as u64,
@@ -180,6 +279,94 @@ mod tests {
                 },
             }),
             recur_progress_commitment: [0; 32],
+        }
+    }
+
+    #[test]
+    fn overhead_runs_once_per_id_and_reuses_the_first_replay_journal() {
+        let steps = (0..1000)
+            .flat_map(|i| {
+                [
+                    step(i * 3, ExecTarget::Tile("ordinary".into()), vec![i, 0]),
+                    step(i * 3 + 1, ExecTarget::Tile("recursive".into()), vec![2, i]),
+                    step(i * 3 + 2, ExecTarget::Tile("unselected".into()), vec![3, i]),
+                ]
+            })
+            .collect::<Vec<_>>();
+        let mut report = ReplayProfile::new(
+            "test".into(),
+            ["ordinary", "recursive", "unused"].map(String::from),
+        );
+        let mut prepares = 0;
+        let mut replays = 0;
+        let mut samples = Vec::new();
+        super::replay_selected(
+            steps.iter(),
+            &mut report,
+            |tile| {
+                prepares += 1;
+                Ok((tile.to_string(), "image".into()))
+            },
+            |tile, step| {
+                replays += 1;
+                Ok((10, format!("{tile}/{}", step.exec_index)))
+            },
+            |tile, step, journal| {
+                assert_eq!(journal, &format!("{tile}/{}", step.exec_index));
+                samples.push((tile.clone(), step.exec_index));
+                Ok(mock_overhead(step))
+            },
+            |_, _| {},
+        )
+        .unwrap();
+        assert_eq!(prepares, 2);
+        assert_eq!(replays, 256);
+        assert_eq!(samples, [("ordinary".into(), 0), ("recursive".into(), 1)]);
+        assert_eq!(report.total_guest_cycles, 2560);
+        assert_eq!(
+            report.tiles["recursive"]
+                .transition_overhead
+                .as_ref()
+                .unwrap()
+                .guest_cycles,
+            123
+        );
+        assert!(report.tiles["unused"].transition_overhead.is_none());
+    }
+
+    #[test]
+    fn overhead_or_authorization_failure_retains_the_successful_tile_replay() {
+        for phase in [
+            ProfileFailurePhase::Authorization,
+            ProfileFailurePhase::TransitionOverhead,
+        ] {
+            let step = step(1, ExecTarget::Tile("tile".into()), vec![0, 0]);
+            let mut report = ReplayProfile::new("test".into(), ["tile".into()]);
+            let mut replays = 0;
+            let result = super::replay_selected(
+                std::iter::repeat(&step).take(1000),
+                &mut report,
+                |_| Ok(((), "image".into())),
+                |_, _| {
+                    replays += 1;
+                    Ok((42, ()))
+                },
+                |_, _, _| Err((phase, Error::Other("invalid witness".into()))),
+                |_, _| {},
+            );
+            assert!(result.is_err());
+            assert_eq!(replays, 1);
+            assert!(!report.complete);
+            assert_eq!(report.tiles["tile"].invocations, 1000);
+            assert_eq!(report.tiles["tile"].profiled_invocations, 1);
+            assert_eq!(report.total_guest_cycles, 42);
+            assert!(report.tiles["tile"].transition_overhead.is_none());
+            assert_eq!(report.failure.as_ref().unwrap().phase, phase);
+            assert_eq!(report.failure.as_ref().unwrap().invocation.exec_index, 1);
+            let restored: ReplayProfile =
+                serde_json::from_slice(&serde_json::to_vec(&report).unwrap()).unwrap();
+            assert!(restored.to_text().contains("PARTIAL"));
+            assert!(restored.to_text().contains("not measured"));
         }
     }
 

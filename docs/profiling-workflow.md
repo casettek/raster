@@ -170,6 +170,11 @@ total cycles, successful/recorded invocation counts, and the heaviest
 invocation's trace coordinate. A capped tile shows `calls 128/1000` and
 `capped (872 beyond limit)`; reaching the cap counts as successful completion.
 An unused selected tile says `not executed`. Cycles include guest wrapper work.
+Each executed tile also shows **sample transition overhead**, measured once from
+its first replayed invocation, with that sample's coordinate. The tile is not
+replayed again for this measurement. Overhead is separate from replay cycles
+and uses a representative continuation context; it is not a complete fault
+window measurement.
 Totals and maxima cover only the profiled invocations, without extrapolating
 to later invocations or the whole program.
 
@@ -187,6 +192,20 @@ total to assess the measured portion of the workload. After
 changing tile boundaries, repeat this workflow on the same input. These
 measurements describe execution cycles, not proving latency.
 
+For a rough estimate of replay plus transition checking for 128 measured calls:
+
+```text
+rough cost for 128 measured invocations
+  = replay total + 128 × sampled transition overhead
+```
+
+Use the actual measured count when it is below 128. This excludes window
+initialization, authorization execution, non-tile boundary transitions, and
+cryptographic proving/composition. The sample uses real recorded witnesses and
+recursive state with modeled preceding proof-chain state. Overhead can vary
+between invocations and with accumulated state, so this is not a worst-case
+bound. The selected calls also need not form a contiguous fault window.
+
 ## Runtime and compatibility
 
 Native profiling adds timing and record-keeping overhead to the native run.
@@ -194,7 +213,9 @@ The existing native profiler retains individual records, so its memory and
 report size grow with invocation count; it is not an aggregate-only mode.
 
 Replay profiling adds guest preparation and up to 128 replays per selected
-tile ID. A tile called a million times causes only 128 executor runs. The native
+tile ID, one transition execution per executed selected tile, one shared
+authorization execution, and host witness preparation. A tile called a million
+times causes only 128 tile replays plus one transition execution. The native
 program still executes fully, and its entire trace is recorded and counted.
 Progress counts the planned replays within the cap and is printed at most once
 per second between replays; replay profiles have no live NDJSON follow mode.
@@ -203,7 +224,7 @@ Both `--profile` modes require authenticated execution and reject `--no-auth`.
 Replay profiling also rejects `--audit`. Both support `--commit` with its required
 `--fraud-proof-window-size`; a saved trace commitment is optional for profiling.
 The profiling cap stays at 128 per tile ID regardless of that window setting.
-If a zkVM replay fails or mismatches, the command exits nonzero and saves a
+If replay, authorization, or transition-overhead execution fails or mismatches, the command exits nonzero and saves a
 clearly marked partial report with the failing tile and coordinate. Partial
 totals cover only previously successful replays.
 
@@ -214,8 +235,17 @@ profiling. Both `--profile zkvm --tile tile_a,tile_b` and
 still open with `cargo raster analyze`. Projects that already forward a
 `profiling` feature can continue using `--features profiling` too.
 
-New replay reports use version 2 with `invocation_limit: 128`. Version 1 reports
-remain readable and retain the uncapped measurements from their original runs.
+New replay reports use version 3 with `invocation_limit: 128` and a per-tile
+`transition_overhead` measurement. Versions 1 and 2 remain readable with overhead
+shown as `not measured`; version 1 retains its original uncapped measurements.
+A failure records its phase, tile, and coordinate. If the replay succeeded before
+an overhead failure, its cycles remain in the clearly marked partial report.
+
+When updating Raster, rebuild both the CLI and the consuming program against the
+same revision. In particular, older native builds assigned incorrect storage
+coordinates to child tiles inside recursive sequences. Those traces can fail
+transition-overhead preparation even when individual tile replays succeed; they
+need a fresh native run after rebuilding.
 
 See [replay profiling details](replay-profiling.md) for the artifact fields and
 executor validation boundaries.

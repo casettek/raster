@@ -7,7 +7,7 @@ use raster_core::{Error, Result};
 pub enum ProfileMode {
     /// Time all tile invocations during native execution
     Native,
-    /// Replay the first 128 invocations per selected tile ID in RISC Zero without proving
+    /// Replay up to 128 calls per tile and measure one transition's overhead, without proving
     #[value(alias = "zkvm")]
     Replay,
 }

@@ -923,6 +923,22 @@ fn recur_sequence_trace_keeps_inner_tiles_replayable() {
     assert_eq!(inner_tile_execs, 3);
     assert_eq!(site_completions, 1);
 
+    // The consumer's storage binding must name the producer inside the same
+    // iteration, not consume another index from the enclosing recur site.
+    let consumer_inputs: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            TraceEvent::TileExec(record) if record.fn_name == "append_prefixed_line" => {
+                Some(record.input.as_ref().unwrap())
+            }
+            _ => None,
+        })
+        .collect();
+    for (iteration, input) in consumer_inputs.iter().enumerate() {
+        let producer = &input.storage["line"];
+        assert_eq!(producer.coordinates.0, [1, iteration as u32, 0]);
+    }
+
     for (expected_index, record) in iteration_start_records.iter().enumerate() {
         let input = record
             .input
