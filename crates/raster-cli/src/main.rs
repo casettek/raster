@@ -4,6 +4,7 @@
 
 mod chain;
 mod commands;
+mod profiling;
 mod program;
 mod runtime_env;
 mod utils;
@@ -20,6 +21,132 @@ use raster_prover::trace::FraudProofConfig;
 enum Cli {
     #[command(subcommand)]
     Raster(Commands),
+}
+
+#[cfg(test)]
+mod profiling_cli_tests {
+    use super::*;
+
+    fn parse_run(args: &[&str]) -> profiling::ProfileOptions {
+        let cli = Cli::try_parse_from(
+            ["cargo-raster", "raster", "run"]
+                .into_iter()
+                .chain(args.iter().copied()),
+        )
+        .unwrap();
+        let Cli::Raster(Commands::Run { profiling, .. }) = cli else {
+            panic!("expected run")
+        };
+        profiling
+    }
+
+    #[test]
+    fn common_profile_modes_preserve_features_and_select_tiles() {
+        let native = parse_run(&["--profile", "native", "--features", "extra"]);
+        native.validate(false).unwrap();
+        assert!(native.native());
+        assert!(native.selected_tiles().is_empty());
+        assert_eq!(
+            native.build_features(&["extra".into()]),
+            ["extra", "raster/profiling"]
+        );
+        assert_eq!(
+            native.build_features(&["extra,raster/profiling".into()]),
+            ["extra,raster/profiling"]
+        );
+
+        let replay = parse_run(&["--profile", "replay", "--tile", "a,b", "--tile", "a"]);
+        replay.validate(false).unwrap();
+        assert!(!replay.native());
+        assert_eq!(replay.selected_tiles(), ["a", "b", "a"]);
+        assert_eq!(replay.build_features(&["extra".into()]), ["extra"]);
+
+        let legacy_replay = parse_run(&["--profile", "zkvm", "--tile", "a,b", "--tile", "a"]);
+        legacy_replay.validate(false).unwrap();
+        assert_eq!(legacy_replay.profile, Some(profiling::ProfileMode::Replay));
+        assert_eq!(legacy_replay.selected_tiles(), replay.selected_tiles());
+        assert!(legacy_replay.validate(true).is_err());
+
+        let legacy = parse_run(&["--features", "profiling"]);
+        assert_eq!(legacy.build_features(&["profiling".into()]), ["profiling"]);
+    }
+
+    #[test]
+    fn common_profile_modes_reject_invalid_combinations() {
+        for args in [
+            vec!["--profile"],
+            vec!["--profile", "other"],
+            vec!["--profile", "replay"],
+            vec!["--profile", "zkvm"],
+            vec!["--profile", "replay", "--tile"],
+            vec!["--tile", "a"],
+            vec!["--profile", "native", "--no-auth"],
+            vec!["--profile", "replay", "--tile", "a", "--no-auth"],
+            vec!["--profile", "zkvm", "--tile", "a", "--no-auth"],
+            vec!["--profile", "native", "--zkvm-profile", "a"],
+            vec!["--profile", "replay", "--tile", "a", "--zkvm-profile", "b"],
+        ] {
+            assert!(
+                Cli::try_parse_from(["cargo-raster", "raster", "run"].into_iter().chain(args),)
+                    .is_err()
+            );
+        }
+        assert!(parse_run(&["--profile", "native", "--tile", "a"])
+            .validate(false)
+            .is_err());
+        assert!(parse_run(&["--profile", "replay", "--tile", "a"])
+            .validate(true)
+            .is_err());
+        parse_run(&["--profile", "native"]).validate(true).unwrap();
+        parse_run(&[
+            "--profile",
+            "replay",
+            "--tile",
+            "a",
+            "--commit",
+            "commit.bin",
+            "--fraud-proof-window-size",
+            "8",
+        ])
+        .validate(false)
+        .unwrap();
+    }
+
+    #[test]
+    fn parses_explicit_comma_separated_and_repeated_tiles_with_commit() {
+        let cli = Cli::try_parse_from([
+            "cargo-raster",
+            "raster",
+            "run",
+            "--zkvm-profile",
+            "a,b",
+            "--zkvm-profile",
+            "a",
+            "--commit",
+            "commit.bin",
+            "--fraud-proof-window-size",
+            "8",
+        ])
+        .unwrap_or_else(|e| panic!("{e}"));
+        let Cli::Raster(Commands::Run { profiling, .. }) = cli else {
+            panic!("expected run")
+        };
+        assert_eq!(profiling.selected_tiles(), ["a", "b", "a"]);
+    }
+
+    #[test]
+    fn rejects_missing_names_and_incompatible_modes() {
+        for args in [
+            vec!["--zkvm-profile"],
+            vec!["--zkvm-profile", "a", "--no-auth"],
+            vec!["--zkvm-profile", "a", "--audit", "commit.bin"],
+        ] {
+            assert!(
+                Cli::try_parse_from(["cargo-raster", "raster", "run"].into_iter().chain(args))
+                    .is_err()
+            );
+        }
+    }
 }
 
 #[derive(Parser)]
@@ -61,7 +188,7 @@ enum Commands {
     /// List all project tiles
     List,
 
-    /// Analyze execution traces
+    /// Analyze native or replay execution profiles
     Analyze {
         /// Path to a run-scoped profile file emitted by `cargo raster run`
         profile_path: Option<String>,
@@ -219,7 +346,7 @@ enum Commands {
         #[arg(long = "no-auth", conflicts_with_all = ["commit", "audit"])]
         no_auth: bool,
 
-        /// Read and verify trace from file (mutually exclusive with --commit)
+        /// Print individual trace items during profiling
         #[arg(long)]
         verbose: bool,
 
@@ -244,6 +371,9 @@ enum Commands {
         /// Disable default Cargo features when building the target project
         #[arg(long)]
         no_default_features: bool,
+
+        #[command(flatten)]
+        profiling: profiling::ProfileOptions,
     },
 }
 
@@ -496,6 +626,7 @@ fn try_main() -> Result<()> {
             features,
             all_features,
             no_default_features,
+            profiling,
         } => commands::run::run(
             backend,
             input.as_deref(),
@@ -510,6 +641,7 @@ fn try_main() -> Result<()> {
             &features,
             all_features,
             no_default_features,
+            &profiling,
         ),
         Commands::Show {
             artifact,

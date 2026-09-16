@@ -1,11 +1,74 @@
 //! Trace replayer for re-executing tiles with proof generation.
 
-use raster_backend::{Backend, ExecutionMode};
+use raster_backend::{Backend, CompilationArtifact, ExecutionMode};
 use raster_compiler::tile::TileDiscovery;
 use raster_compiler::Project;
 
 use raster_core::draft::TileReplayJournal;
 use raster_core::{Error, Result};
+use sha2::{Digest, Sha256};
+
+/// A tile prepared once for any number of independent executor-only replays.
+/// No receipt is produced or accepted by this profiling path.
+pub struct PreparedTileProfile<'a> {
+    backend: &'a dyn Backend,
+    artifact: Box<dyn CompilationArtifact>,
+}
+
+/// Validated executor output, reusable by execution-only transition profiling.
+pub struct ProfiledTileExecution {
+    pub cycles: u64,
+    pub journal: TileReplayJournal,
+}
+
+impl PreparedTileProfile<'_> {
+    pub fn image_id(&self) -> String {
+        self.artifact.artifact_id()
+    }
+
+    /// Replay the recorded bytes once and return guest-user cycles, including
+    /// wrapper work. Only matching, successfully completed executions count.
+    pub fn profile(&self, input: &[u8], expected_output: &[u8]) -> Result<u64> {
+        Ok(self.profile_with_journal(input, expected_output)?.cycles)
+    }
+
+    /// Return validated draft/recursive facts for overhead measurement without
+    /// executing the tile a second time.
+    pub fn profile_with_journal(
+        &self,
+        input: &[u8],
+        expected_output: &[u8],
+    ) -> Result<ProfiledTileExecution> {
+        let result =
+            self.backend
+                .execute_tile(self.artifact.as_ref(), input, ExecutionMode::Estimate)?;
+        if result.receipt.is_some() {
+            return Err(Error::Other(
+                "Profiling unexpectedly generated a receipt".into(),
+            ));
+        }
+        let journal = result
+            .journal
+            .ok_or_else(|| Error::Other("Profiling requires an executor journal".into()))?;
+        let journal: TileReplayJournal = raster_core::postcard::from_bytes(&journal)
+            .map_err(|e| Error::Other(format!("Failed to decode replay journal: {e}")))?;
+        let expected_commitment: [u8; 32] = Sha256::digest(input).into();
+        if journal.input_commitment != expected_commitment {
+            return Err(Error::Other("Replay input commitment mismatch".into()));
+        }
+        if journal.output_bytes != expected_output {
+            return Err(Error::Other(format!(
+                "Replay output mismatch (recorded {} bytes, guest {} bytes)",
+                expected_output.len(),
+                journal.output_bytes.len(),
+            )));
+        }
+        let cycles = result
+            .cycles
+            .ok_or_else(|| Error::Other("Executor did not report guest cycles".into()))?;
+        Ok(ProfiledTileExecution { cycles, journal })
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ReplayResult {
@@ -46,6 +109,22 @@ impl<'a> Replayer<'a> {
     /// The project this replayer resolves tiles against.
     pub fn project(&self) -> &Project {
         self.project
+    }
+
+    /// Discover and compile/load a tile once; reuse the returned object for
+    /// all of its recorded invocations.
+    pub fn prepare_profile(&self, tile_id: &str) -> Result<PreparedTileProfile<'a>> {
+        let discovery = TileDiscovery::new(self.project);
+        let tile = discovery.get(tile_id).ok_or_else(|| {
+            Error::InvalidTileId(format!("Tile '{tile_id}' not found in project"))
+        })?;
+        let artifact = self
+            .backend
+            .compile_tile(&tile.to_metadata(), tile.to_content_hash())?;
+        Ok(PreparedTileProfile {
+            backend: self.backend,
+            artifact,
+        })
     }
 
     /// Compile a tile and return its 32-byte image id, without executing it.
@@ -120,5 +199,142 @@ impl<'a> Replayer<'a> {
             output: replay_journal.output_bytes.clone(),
             replay_journal,
         })
+    }
+}
+
+#[cfg(test)]
+mod profiling_tests {
+    use super::*;
+    use raster_backend::{ArtifactStore, ResourceEstimate, TileExecutionResult};
+    use raster_core::tile::TileMetadata;
+    use std::any::Any;
+
+    struct Artifact;
+    impl CompilationArtifact for Artifact {
+        fn id(&self) -> &str {
+            "tile"
+        }
+        fn artifact_id(&self) -> String {
+            "ab".repeat(32)
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+        fn as_any_mut(&mut self) -> &mut dyn Any {
+            self
+        }
+    }
+
+    struct BackendStub {
+        result: TileExecutionResult,
+        abort: bool,
+    }
+    impl Backend for BackendStub {
+        fn name(&self) -> &'static str {
+            "test"
+        }
+        fn compile_tile(
+            &self,
+            _: &TileMetadata,
+            _: Option<String>,
+        ) -> Result<Box<dyn CompilationArtifact>> {
+            panic!("a prepared replay must never compile")
+        }
+        fn execute_tile(
+            &self,
+            _: &dyn CompilationArtifact,
+            input: &[u8],
+            mode: ExecutionMode,
+        ) -> Result<TileExecutionResult> {
+            assert_eq!(input, b"recorded input");
+            assert_eq!(mode, ExecutionMode::Estimate);
+            if self.abort {
+                Err(Error::Other("guest aborted".into()))
+            } else {
+                Ok(self.result.clone())
+            }
+        }
+        fn artifact_store(&self) -> &dyn ArtifactStore {
+            panic!("prepared replay")
+        }
+        fn estimate_resources(&self, _: &TileMetadata) -> Result<ResourceEstimate> {
+            panic!("must measure")
+        }
+        fn verify_receipt(&self, _: &dyn CompilationArtifact, _: &[u8]) -> Result<bool> {
+            panic!("no proof")
+        }
+    }
+
+    fn backend() -> BackendStub {
+        let journal = TileReplayJournal {
+            input_commitment: Sha256::digest(b"recorded input").into(),
+            output_bytes: b"recorded output".to_vec(),
+            draft_transition: None,
+            recur: None,
+        };
+        let mut result = TileExecutionResult::estimate(journal.output_bytes.clone(), 123);
+        result.journal = Some(raster_core::postcard::to_allocvec(&journal).unwrap());
+        BackendStub {
+            result,
+            abort: false,
+        }
+    }
+
+    fn profile(backend: &BackendStub, output: &[u8]) -> Result<u64> {
+        PreparedTileProfile {
+            backend,
+            artifact: Box::new(Artifact),
+        }
+        .profile(b"recorded input", output)
+    }
+
+    #[test]
+    fn returns_user_cycles_without_a_receipt_or_recompilation() {
+        let backend = backend();
+        assert_ne!(backend.result.proof_cycles, Some(123));
+        assert_eq!(profile(&backend, b"recorded output").unwrap(), 123);
+        assert_eq!(profile(&backend, b"recorded output").unwrap(), 123);
+    }
+
+    #[test]
+    fn rejects_mismatched_output_and_input_commitment() {
+        let mut backend = backend();
+        assert!(profile(&backend, b"different output")
+            .unwrap_err()
+            .to_string()
+            .contains("output mismatch"));
+        let mut journal: TileReplayJournal =
+            raster_core::postcard::from_bytes(backend.result.journal.as_ref().unwrap()).unwrap();
+        journal.input_commitment = [0; 32];
+        backend.result.journal = Some(raster_core::postcard::to_allocvec(&journal).unwrap());
+        assert!(profile(&backend, b"recorded output")
+            .unwrap_err()
+            .to_string()
+            .contains("input commitment mismatch"));
+    }
+
+    #[test]
+    fn rejects_missing_journal_cycles_receipts_and_guest_failures() {
+        let mut missing_journal = backend();
+        missing_journal.result.journal = None;
+        assert!(profile(&missing_journal, b"recorded output").is_err());
+        let mut malformed = backend();
+        malformed.result.journal = Some(vec![0]);
+        assert!(profile(&malformed, b"recorded output").is_err());
+        let mut missing_cycles = backend();
+        missing_cycles.result.cycles = None;
+        assert!(profile(&missing_cycles, b"recorded output").is_err());
+        let mut proved = backend();
+        proved.result.receipt = Some(vec![1]);
+        assert!(profile(&proved, b"recorded output")
+            .unwrap_err()
+            .to_string()
+            .contains("receipt"));
+        let mut aborted = backend();
+        aborted.abort = true;
+        assert!(profile(&aborted, b"recorded output")
+            .unwrap_err()
+            .to_string()
+            .contains("guest aborted"));
     }
 }

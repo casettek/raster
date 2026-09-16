@@ -632,23 +632,42 @@ pub struct TileItem {
     pub sources: Vec<InputBinding>,
 }
 
-fn is_false(value: &bool) -> bool {
-    !*value
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct RecurTileItem {
     pub id: TileId,
     pub sources: Vec<InputBinding>,
     /// Static chunk size from `call_recur! { ..., chunk = N }`: each iteration
     /// consumes a contiguous group of N source elements (the final group may be
     /// shorter). `None` means per-element iteration.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub chunk: Option<u64>,
     /// Whether this recur deliberately returns its output draft without
     /// finalizing it. False is the historical/default behavior.
-    #[serde(default, skip_serializing_if = "is_false")]
+    #[serde(default)]
     pub leaves_output_open: bool,
+}
+
+// JSON can omit defaults, but positional binary formats (postcard program
+// frames and zkVM inputs) must serialize every field. Omitting a field there
+// shifts the remaining frame and makes even an honest program undecodable.
+impl Serialize for RecurTileItem {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let human = serializer.is_human_readable();
+        let chunk = !human || self.chunk.is_some();
+        let open = !human || self.leaves_output_open;
+        let mut record = serializer
+            .serialize_struct("RecurTileItem", 2 + usize::from(chunk) + usize::from(open))?;
+        record.serialize_field("id", &self.id)?;
+        record.serialize_field("sources", &self.sources)?;
+        if chunk {
+            record.serialize_field("chunk", &self.chunk)?;
+        }
+        if open {
+            record.serialize_field("leaves_output_open", &self.leaves_output_open)?;
+        }
+        record.end()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -815,6 +834,44 @@ mod tests {
                 produces_output: false,
             }],
         })
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn recursive_json_keeps_omitting_defaults() {
+        let item = RecurTileItem {
+            id: "tile".into(),
+            sources: vec![],
+            chunk: None,
+            leaves_output_open: false,
+        };
+        let value = serde_json::to_value(&item).unwrap();
+        assert_eq!(value, serde_json::json!({"id": "tile", "sources": []}));
+        let restored: RecurTileItem = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.chunk, None);
+        assert!(!restored.leaves_output_open);
+    }
+
+    #[test]
+    fn recursive_item_defaults_round_trip_in_positional_binary_frames() {
+        for chunk in [None, Some(2)] {
+            for leaves_output_open in [false, true] {
+                let item = RecurTileItem {
+                    id: "tile".into(),
+                    sources: vec![],
+                    chunk,
+                    leaves_output_open,
+                };
+                // The trailing sentinel detects consuming bytes from the next
+                // field, which optional JSON-style omission used to cause.
+                let bytes = postcard::to_allocvec(&(item, 123u64)).unwrap();
+                let (decoded, sentinel): (RecurTileItem, u64) =
+                    postcard::from_bytes(&bytes).unwrap();
+                assert_eq!(decoded.chunk, chunk);
+                assert_eq!(decoded.leaves_output_open, leaves_output_open);
+                assert_eq!(sentinel, 123);
+            }
+        }
     }
 
     #[test]

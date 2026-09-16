@@ -19,6 +19,7 @@ pub mod precomputed;
 pub mod replay;
 pub mod trace;
 pub mod transition;
+pub mod transition_profile;
 pub mod utils;
 
 pub use error::{BitPackerError, Result};

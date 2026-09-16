@@ -16,6 +16,7 @@ use crate::storage::{
     AuthorizedSource, AuthorizedSourceLoad, StorageManager, StorageSnapshot, StorageWriteRecord,
 };
 use crate::tracing::commitment::Sha256Commitment;
+use crate::tracing::replay_profile::{ReplayProfileCapture, ReplayProfileSample};
 
 pub type SequenceId = String;
 
@@ -265,6 +266,7 @@ fn input_source_commitment(input: &FnInput) -> Vec<u8> {
 
 #[derive(Debug, Clone)]
 pub struct TraceRecorder {
+    profile_capture: Option<ReplayProfileCapture>,
     exec_index: u64,
     sequence_callstack: SequenceCallstack,
     active_recur: Option<RecurExecutionState>,
@@ -284,6 +286,7 @@ pub struct TraceRecorder {
 impl TraceRecorder {
     pub fn new(cfs: ControlFlowSchema) -> Self {
         Self {
+            profile_capture: None,
             exec_index: 0,
             sequence_callstack: SequenceCallstack::new(),
             active_recur: None,
@@ -320,6 +323,25 @@ impl TraceRecorder {
         self.witness_store
             .get(coordinates)
             .map(|trace_io| trace_io.input_data.clone())
+    }
+
+    /// Enable only while loading a replay-profile run. Normal tracing retains
+    /// no additional snapshots, and each selected ID captures just once.
+    pub fn capture_replay_profile(&mut self, selected: impl IntoIterator<Item = String>) {
+        self.profile_capture = Some(ReplayProfileCapture::new(selected));
+    }
+
+    pub fn replay_profile_sample(
+        &self,
+        tile: &str,
+    ) -> Option<&std::result::Result<ReplayProfileSample, String>> {
+        self.profile_capture.as_ref()?.sample(tile)
+    }
+
+    /// Borrow just the append metadata when constructing a sampled read path;
+    /// avoid copying every prefix step's input/output payloads.
+    pub fn storage_write_at(&self, coordinates: &CfsCoordinates) -> Option<&StorageWriteRecord> {
+        self.witness_store.get(coordinates)?.storage_write.as_ref()
     }
 
     pub fn output_data_at(&self, coordinates: &CfsCoordinates) -> Option<Option<Vec<u8>>> {
@@ -403,6 +425,10 @@ impl TraceRecorder {
     }
 
     pub fn record(&mut self, event: TraceEvent) -> StepRecord {
+        let profile_sample = self
+            .profile_capture
+            .as_ref()
+            .and_then(|capture| capture.before(&event, &self.storage, &self.recur_progress));
         self.exec_index += 1;
         let exec_index = self.exec_index;
 
@@ -1190,6 +1216,9 @@ impl TraceRecorder {
         // than by matching a predecessor record the window does not contain.
         let mut step_record = step_record;
         step_record.recur_progress_commitment = self.recur_progress.commitment();
+        if let Some(capture) = self.profile_capture.as_mut() {
+            capture.after(profile_sample, &step_record, &self.storage);
+        }
         step_record
     }
 
@@ -1529,6 +1558,106 @@ mod tests {
             draft_transition_witness: None,
             recur_control: None,
         }
+    }
+
+    #[test]
+    fn replay_profile_captures_both_nested_recursive_sequence_frames() {
+        let mut main = SequenceDef::new("main");
+        main.items
+            .push(SequenceChildItem::RecurSequence(RecurSequenceItem {
+                id: "outer".into(),
+                sources: vec![],
+            }));
+        let mut outer = SequenceDef::new("outer");
+        outer
+            .items
+            .push(SequenceChildItem::RecurSequence(RecurSequenceItem {
+                id: "inner_seq".into(),
+                sources: vec![],
+            }));
+        let mut inner = SequenceDef::new("inner_seq");
+        inner.items.push(SequenceChildItem::Tile(TileItem {
+            id: "inner".into(),
+            sources: vec![],
+        }));
+        let mut recorder = TraceRecorder::new(ControlFlowSchema {
+            version: "1.0".into(),
+            project: "nested".into(),
+            encoding: "postcard".into(),
+            tiles: vec![TileDef::iter("inner", 0, 0)],
+            sequences: vec![main, outer, inner],
+        });
+        recorder.capture_replay_profile(["inner".into()]);
+        start_main(&mut recorder);
+        let source = seed_recur_source(&mut recorder, "outer", 2);
+        recorder.record(TraceEvent::RecurSequenceStart(source.clone()));
+        recorder.record(TraceEvent::RecurSequenceIterationStart(call("outer")));
+        let mut inner_source = source;
+        inner_source.fn_name = "inner_seq".into();
+        recorder.record(TraceEvent::RecurSequenceStart(inner_source));
+        recorder.record(TraceEvent::RecurSequenceIterationStart(call("inner_seq")));
+        let before = recorder.recur_progress.clone();
+        let first = recorder.record(TraceEvent::TileExec(call("inner")));
+        let sample = recorder
+            .replay_profile_sample("inner")
+            .unwrap()
+            .as_ref()
+            .unwrap();
+        assert_eq!(sample.context.recur_progress.depth(), 2);
+        assert_eq!(sample.context.recur_progress, before);
+        assert_eq!(before.commitment(), first.recur_progress_commitment);
+    }
+
+    #[test]
+    fn replay_profile_captures_only_first_recursive_invocation_before_advance() {
+        let mut recorder = recorder_with_recur_site();
+        recorder.capture_replay_profile(["recur".into(), "unused".into()]);
+        start_main(&mut recorder);
+        let start = seed_recur_source(&mut recorder, "recur", 1000);
+        recorder.record(TraceEvent::RecurTileStart(start));
+        let before = recorder.recur_progress.clone();
+        let first = recorder.record(TraceEvent::RecurTileIterationExec(call("recur")));
+        for _ in 1..1000 {
+            recorder.record(TraceEvent::RecurTileIterationExec(call("recur")));
+        }
+        let sample = recorder
+            .replay_profile_sample("recur")
+            .unwrap()
+            .as_ref()
+            .unwrap();
+        assert_eq!(sample.exec_index, first.exec_index);
+        assert_eq!(sample.context.recur_progress, before);
+        assert_eq!(
+            sample
+                .context
+                .recur_progress
+                .innermost()
+                .unwrap()
+                .next_iteration_index,
+            0
+        );
+        assert!(recorder.replay_profile_sample("unused").is_none());
+    }
+
+    #[test]
+    fn replay_profile_captures_ordinary_tile_inside_recursive_sequence() {
+        let mut recorder = recorder_with_recur_sequence_site();
+        recorder.capture_replay_profile(["inner".into()]);
+        start_main(&mut recorder);
+        let start = seed_recur_source(&mut recorder, "child", 2);
+        recorder.record(TraceEvent::RecurSequenceStart(start));
+        recorder.record(TraceEvent::RecurSequenceIterationStart(call("child")));
+        let before = recorder.recur_progress.clone();
+        let first = recorder.record(TraceEvent::TileExec(call("inner")));
+        let sample = recorder
+            .replay_profile_sample("inner")
+            .unwrap()
+            .as_ref()
+            .unwrap();
+        assert_eq!(sample.exec_index, first.exec_index);
+        assert_eq!(sample.context.recur_progress, before);
+        assert!(!before.is_empty());
+        assert_eq!(before.commitment(), first.recur_progress_commitment);
     }
 
     /// The recorder actually advances a progress stack, rather than stamping a

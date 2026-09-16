@@ -429,6 +429,13 @@ impl StorageManager {
         self.coordinate_index.root()
     }
 
+    pub(crate) fn profile_index_witness(
+        &self,
+        coordinates: &CfsCoordinates,
+    ) -> Option<raster_core::transition::CoordinateIndexMembershipProof> {
+        self.coordinate_index.membership_proof(coordinates)
+    }
+
     fn append(
         &mut self,
         backing: ObjectBacking,
@@ -731,6 +738,9 @@ struct SequenceFrame {
 struct RecurFrame {
     site_coordinates: CfsCoordinates,
     next_iteration_index: u32,
+    /// Depth of the sequence containing the site. A deeper sequence frame
+    /// owns its child tile slots; those tiles are not iterations of this site.
+    sequence_depth: usize,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -759,7 +769,9 @@ impl SequenceExecutionContext {
 
     fn exit_sequence(&mut self) {
         assert!(
-            self.recur_stack.is_empty(),
+            self.recur_stack
+                .last()
+                .is_none_or(|recur| recur.sequence_depth < self.stack.len()),
             "Cannot exit a sequence while a recur site is still active"
         );
         self.stack
@@ -777,6 +789,7 @@ impl SequenceExecutionContext {
         self.recur_stack.push(RecurFrame {
             site_coordinates,
             next_iteration_index: 0,
+            sequence_depth: self.stack.len(),
         });
         Ok(())
     }
@@ -823,7 +836,11 @@ impl SequenceExecutionContext {
     }
 
     pub(crate) fn reserve_execution_coordinates(&mut self) -> Result<CfsCoordinates> {
-        if let Some(recur_frame) = self.recur_stack.last_mut() {
+        if let Some(recur_frame) = self
+            .recur_stack
+            .last_mut()
+            .filter(|recur| recur.sequence_depth == self.stack.len())
+        {
             let mut coordinates = recur_frame.site_coordinates.clone();
             coordinates.push(recur_frame.next_iteration_index);
             recur_frame.next_iteration_index += 1;
@@ -1511,6 +1528,52 @@ mod tests {
     use serde::{Deserialize, Serialize};
 
     struct SequenceScopeGuard;
+
+    #[test]
+    fn recursive_sequence_children_keep_their_own_coordinate_scope() {
+        let mut context = SequenceExecutionContext::default();
+        context.enter_sequence();
+        context.enter_recur_site().unwrap(); // outer sequence site [0]
+        for iteration in 0..2 {
+            context.enter_recur_sequence_iteration().unwrap();
+            assert_eq!(
+                context.reserve_execution_coordinates().unwrap().0,
+                [0, iteration, 0]
+            );
+            context.enter_recur_site().unwrap(); // tile site [0, iteration, 1]
+            for inner in 0..3 {
+                assert_eq!(
+                    context.reserve_execution_coordinates().unwrap().0,
+                    [0, iteration, 1, inner]
+                );
+            }
+            context.exit_recur_site();
+            assert_eq!(
+                context.reserve_execution_coordinates().unwrap().0,
+                [0, iteration, 2]
+            );
+            context.enter_recur_site().unwrap(); // nested sequence site
+            for inner in 0..2 {
+                context.enter_recur_sequence_iteration().unwrap();
+                assert_eq!(
+                    context.reserve_execution_coordinates().unwrap().0,
+                    [0, iteration, 3, inner, 0]
+                );
+                context.exit_recur_sequence_iteration();
+            }
+            context.exit_recur_site();
+            context.enter_sequence(); // ordinary sequence inside the iteration
+            assert_eq!(
+                context.reserve_execution_coordinates().unwrap().0,
+                [0, iteration, 4, 0]
+            );
+            context.exit_sequence();
+            context.exit_recur_sequence_iteration();
+        }
+        context.exit_recur_site();
+        assert_eq!(context.reserve_execution_coordinates().unwrap().0, [1]);
+        context.exit_sequence();
+    }
 
     impl SequenceScopeGuard {
         fn enter(sequence_id: &str) -> Self {

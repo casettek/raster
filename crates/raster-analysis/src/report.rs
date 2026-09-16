@@ -21,6 +21,7 @@ impl Report {
         };
 
         lines.push(String::from("Profile Summary"));
+        lines.push(String::from("  Type: native (elapsed time)"));
         lines.push(format!(
             "  Run: {}",
             self.metrics.run_id.as_deref().unwrap_or("unknown")

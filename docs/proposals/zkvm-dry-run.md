@@ -2,6 +2,12 @@
 
 Status: proposed 2026-08-17 (rev 2 — narrowed from `guest-replayability-check`)
 
+Implementation note (2026-09-13): the focused selected-tile profiler is now
+implemented as `cargo raster run --profile replay --tile tile_a,tile_b`. It replays
+up to the first 128 invocations per named tile ID and reports measured guest cycles. See
+[`replay-profiling.md`](../replay-profiling.md). The broader all-tile dry run, padded
+cost model, and budgets described below remain proposals.
+
 Revision note: rev 1 proposed four tiers (static lint, cross-compile probe, executor replay,
 cycle budget). Rev 2 keeps only the executor replay and the cost model. The static and
 cross-compile tiers belong to [`authoring-skill-and-tooling`](./authoring-skill-and-tooling.md)

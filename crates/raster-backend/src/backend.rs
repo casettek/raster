@@ -150,6 +150,10 @@ pub struct TileExecutionResult {
     /// Only present when executed in Prove mode.
     pub receipt: Option<Vec<u8>>,
 
+    /// Raw guest journal, available without a proof in zkVM estimate mode.
+    /// Native backends leave this unset.
+    pub journal: Option<Vec<u8>>,
+
     /// Whether the proof was verified (if proof was generated).
     pub verified: Option<bool>,
 }
@@ -163,6 +167,7 @@ impl TileExecutionResult {
             cycles: Some(cycles),
             proof_cycles: Some(calculate_proof_cycles(cycles)),
             receipt: None,
+            journal: None,
             verified: None,
         }
     }
@@ -175,6 +180,7 @@ impl TileExecutionResult {
             cycles,
             proof_cycles,
             receipt: Some(receipt),
+            journal: None,
             verified: Some(verified),
         }
     }

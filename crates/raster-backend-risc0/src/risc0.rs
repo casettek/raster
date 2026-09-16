@@ -151,6 +151,8 @@ pub struct Risc0Backend {
     user_crate_path: Option<PathBuf>,
     /// Artifact store for caching compiled artifacts.
     artifact_store: Risc0ArtifactStore,
+    /// Whether guest standard output is forwarded to the host terminal.
+    guest_stdout: bool,
 }
 
 impl Risc0Backend {
@@ -160,12 +162,20 @@ impl Risc0Backend {
             output_dir,
             user_crate_path: None,
             artifact_store: Risc0ArtifactStore::new(),
+            guest_stdout: true,
         }
     }
 
     /// Set the path to the user's crate containing tiles.
     pub fn with_user_crate(mut self, path: PathBuf) -> Self {
         self.user_crate_path = Some(path);
+        self
+    }
+
+    /// Control guest stdout forwarding. Errors on stderr remain visible.
+    /// Discarding stdout still executes guest writes and counts their cycles.
+    pub fn with_guest_stdout(mut self, enabled: bool) -> Self {
+        self.guest_stdout = enabled;
         self
     }
 
@@ -277,7 +287,11 @@ impl Backend for Risc0Backend {
         // Build the executor environment with the input
         // Write length first, then raw bytes (guest expects this format)
         let input_len = input.len() as u32;
-        let env = ExecutorEnv::builder()
+        let mut env_builder = ExecutorEnv::builder();
+        if !self.guest_stdout {
+            env_builder.stdout(std::io::sink());
+        }
+        let env = env_builder
             .write(&input_len)
             .map_err(|e| Error::Other(format!("Failed to write input length: {}", e)))?
             .write_slice(input)
@@ -292,13 +306,22 @@ impl Backend for Risc0Backend {
                     .execute(env, &risc0.elf)
                     .map_err(|e| Error::Other(format!("Execution failed: {}", e)))?;
 
+                if session.exit_code != risc0_zkvm::ExitCode::Halted(0) {
+                    return Err(Error::Other(format!(
+                        "Guest did not complete successfully: {:?}",
+                        session.exit_code
+                    )));
+                }
+
                 // Get the journal (output)
                 let replay_output: TileReplayJournal = postcard::from_bytes(&session.journal.bytes)
                     .map_err(|e| Error::Other(format!("Failed to decode replay journal: {}", e)))?;
                 let output = replay_output.output_bytes;
                 let cycles = session.cycles();
 
-                Ok(TileExecutionResult::estimate(output, cycles))
+                let mut result = TileExecutionResult::estimate(output, cycles);
+                result.journal = Some(session.journal.bytes);
+                Ok(result)
             }
             ExecutionMode::Prove { verify } => {
                 let prover = risc0_zkvm::default_prover();
@@ -328,12 +351,10 @@ impl Backend for Risc0Backend {
                 let receipt_bytes = postcard::to_allocvec(&receipt)
                     .map_err(|e| Error::Other(format!("Failed to serialize receipt: {}", e)))?;
 
-                Ok(TileExecutionResult::proved(
-                    output,
-                    Some(cycles),
-                    receipt_bytes,
-                    verified,
-                ))
+                let mut result =
+                    TileExecutionResult::proved(output, Some(cycles), receipt_bytes, verified);
+                result.journal = Some(receipt.journal.bytes);
+                Ok(result)
             }
         }
     }
