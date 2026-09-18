@@ -47,10 +47,10 @@ fn entrypoint_coordinates() -> CfsCoordinates {
 /// `TreeValue::Struct` convention, so selecting into one argument composes
 /// as one ordinary selection proof rather than a special case.
 pub fn combined_root(names: &[String], authorization_journal: &AuthorizationJournal) -> Vec<u8> {
-    let fields: Vec<(&str, &[u8])> = names
+    let commitments: Vec<(&str, Vec<u8>)> = names
         .iter()
         .map(|name| {
-            let commitment = authorization_journal
+            let text = authorization_journal
                 .external_inputs_commitments
                 .get(name)
                 .unwrap_or_else(|| {
@@ -59,11 +59,59 @@ pub fn combined_root(names: &[String], authorization_journal: &AuthorizationJour
                         name
                     )
                 });
-            (name.as_str(), commitment.as_slice())
+            (name.as_str(), decode_authorized_commitment(name, text))
         })
         .collect();
 
-    struct_commitments_root(fields.iter().copied()).to_vec()
+    struct_commitments_root(
+        commitments
+            .iter()
+            .map(|(name, commitment)| (*name, commitment.as_slice())),
+    )
+    .to_vec()
+}
+
+/// Decode one journal entry from the manifest's spelling into the digest it
+/// names.
+///
+/// The authorization journal stores each commitment exactly as the manifest
+/// writes it — lowercase hex *text*, because `normalize_hash_string` in the
+/// authorization guest ends in `String::into_bytes` rather than a hex decode
+/// (`guests/authorization/src/main.rs`). Every other side of the selection
+/// tree speaks raw digests: the entry object the runtime assembles in
+/// `backing::ReferencedObject::combined_root` hashes `source.commitment`,
+/// which is 32 bytes, and so does every other child root
+/// `struct_commitments_root` consumes. Passing the text straight through
+/// produced a root over the digest's *spelling*, which cannot equal the
+/// entry object's root for any input — so the decode belongs here, at the
+/// one consumer that needs digests rather than in the guest whose image id
+/// the chain-fraud check already depends on.
+///
+/// Strict on purpose. Accepting both spellings would let two distinct roots
+/// authorize the same manifest entry, and a prover would simply present
+/// whichever one its claimed storage state already matched.
+fn decode_authorized_commitment(name: &str, text: &[u8]) -> Vec<u8> {
+    assert_eq!(
+        text.len(),
+        64,
+        "Authorized commitment for entry argument '{}' is not a 64-character sha256 hex string",
+        name,
+    );
+
+    let nibble = |c: u8| -> u8 {
+        match c {
+            b'0'..=b'9' => c - b'0',
+            b'a'..=b'f' => c - b'a' + 10,
+            _ => panic!(
+                "Authorized commitment for entry argument '{}' is not lowercase hex",
+                name
+            ),
+        }
+    };
+
+    text.chunks(2)
+        .map(|pair| (nibble(pair[0]) << 4) | nibble(pair[1]))
+        .collect()
 }
 
 /// Per-step check: the `ProgramStart` step binds exactly the arguments the

@@ -1,5 +1,6 @@
 use raster_core::cfs::{
-    CfsCoordinates, CfsCursor, ControlFlowSchema, SequenceChildId, SequenceChildItem,
+    CfsCoordinate, CfsCoordinates, CfsCursor, ControlFlowSchema, SequenceChildId,
+    SequenceChildItem, FIRST_COORDINATE,
 };
 use raster_core::recur_progress::{RecurProgressStack, RecurSiteKind};
 use raster_core::draft::DraftTransitionWitness;
@@ -28,7 +29,7 @@ pub struct SequenceCallstack {
 #[derive(Debug, Clone)]
 pub struct SequenceState {
     id: SequenceId,
-    current_index: u32,
+    current_index: CfsCoordinate,
     parent_coordinates: CfsCoordinates,
 }
 
@@ -37,8 +38,8 @@ struct RecurExecutionState {
     site_id: String,
     sequence_coordinates: CfsCoordinates,
     site_coordinates: CfsCoordinates,
-    intra_sequence_index: u32,
-    next_iteration_index: u32,
+    intra_sequence_index: CfsCoordinate,
+    next_iteration_index: CfsCoordinate,
 }
 
 impl SequenceCallstack {
@@ -70,7 +71,7 @@ impl SequenceCallstack {
 
         let sequence_execution_state = SequenceState {
             id: sequence_id,
-            current_index: 0,
+            current_index: FIRST_COORDINATE,
             parent_coordinates: parent_sequence_coords,
         };
         self.callstack.push_back(sequence_execution_state);
@@ -87,7 +88,7 @@ impl SequenceCallstack {
         self.current_sequence_coordinates = coordinates;
         self.callstack.push_back(SequenceState {
             id: sequence_id,
-            current_index: 0,
+            current_index: FIRST_COORDINATE,
             parent_coordinates,
         });
     }
@@ -168,18 +169,40 @@ impl StepWitnessStore {
                     },
                 );
             }
-            TraceEvent::SequenceEnd(trace_item)
-            | TraceEvent::RecurSequenceIterationEnd(trace_item) => {
+            // A recur sequence iteration now closes at its own coordinate, so
+            // it gets its own entry instead of filling in the `Start`'s. That
+            // is the point: the `End` declares no input source
+            // (`StepRecord::input_source_commitment` is `None` for a
+            // `SequenceEnd`), and while the two shared a key it inherited the
+            // `Start`'s anyway — which the fraud-proof guest refuses outright.
+            TraceEvent::RecurSequenceIterationEnd(trace_item) => {
+                self.0.insert(
+                    coordinates,
+                    StepWitnessData {
+                        input_data: None,
+                        input_source_witness: None,
+                        output_data: trace_item.output.as_ref().map(|output| output.data.clone()),
+                        storage_input: StorageInput::new(),
+                        storage_write,
+                        draft_transition_witness: trace_item.draft_transition_witness,
+                    },
+                );
+            }
+            TraceEvent::SequenceEnd(trace_item) => {
                 let trace_io = self.0.get_mut(&coordinates).unwrap_or_else(|| {
                     panic!(
-                        "Missing step witness entry for SequenceEnd at coordinates {:?}. Expected a matching SequenceStart to be recorded first.",
+                        "Missing step witness entry for SequenceEnd at coordinates {:?}. The entry \
+                         is created by the matching SequenceStart — or, at the sequence root, by \
+                         ProgramStart, since `main` publishes no SequenceStart.",
                         coordinates
                     )
                 });
                 trace_io.output_data = trace_item.output.as_ref().map(|output| output.data.clone());
-                // `main`'s `SequenceEnd` shares coordinates `[]` with the
-                // `ProgramStart` step; a sequence end never writes storage, so
-                // it must not clobber the entry-object write recorded there.
+                // A sequence end never writes storage, so it must not clobber
+                // whatever write the matching start recorded at these
+                // coordinates. (`main` reaches neither arm: it publishes no
+                // sequence events at all — see `gen_main_wrapped_body` — so
+                // the root entry belongs to `ProgramStart` alone.)
                 if let Some(storage_write) = storage_write {
                     trace_io.storage_write = Some(storage_write);
                 }
@@ -279,6 +302,24 @@ pub struct TraceRecorder {
     /// sees; every field here is derived from the CFS, the trace event, or the
     /// authenticated source metadata.
     recur_progress: RecurProgressStack,
+    /// The stack as it stood *after* each recorded step, retained so a
+    /// fraud-proof window opening mid-loop can be seeded from the trace
+    /// prefix instead of from the empty stack. Written at the same tail that
+    /// stamps `recur_progress_commitment`, so the two cannot disagree.
+    ///
+    /// Keyed by `exec_index`, **not** by coordinates: a recur site's `Start`
+    /// and `End` share the bare site coordinate (a site coordinate is a
+    /// *scope* — `recur-progress-commitment.md` §3.2.1), and those two steps
+    /// hold opposite stacks. Keying by coordinate lets the close overwrite the
+    /// open, which is the one case a seed most needs to distinguish.
+    ///
+    /// Retained rather than re-derived: `last_control` is not recoverable
+    /// from a step's coordinates, which is the same field that forced a trace
+    /// bit in `recur-progress-commitment.md` §3.1. See
+    /// `window-seed-reconstruction.md` §2 — a second implementation of these
+    /// rules would fail as a commitment mismatch, indistinguishable from the
+    /// bug it exists to fix.
+    recur_progress_store: HashMap<u64, RecurProgressStack>,
 }
 
 impl TraceRecorder {
@@ -292,6 +333,7 @@ impl TraceRecorder {
             witness_store: StepWitnessStore::new(),
             storage: StorageManager::new(),
             recur_progress: RecurProgressStack::new(),
+            recur_progress_store: HashMap::new(),
         }
     }
 
@@ -330,6 +372,17 @@ impl TraceRecorder {
 
     pub fn step_witness_at(&self, coordinates: &CfsCoordinates) -> Option<StepWitnessData> {
         self.witness_store.get(coordinates).cloned()
+    }
+
+    /// The recur-progress stack as it stood **after** the step with this
+    /// `exec_index` — the state the *next* step's guest must start from.
+    ///
+    /// `None` for a step this recorder never recorded. The empty stack is a
+    /// *value*, not an absence: a step outside any loop returns
+    /// `Some(RecurProgressStack::new())`, which is the positive claim "no loop
+    /// in flight" that the guest checks like any other.
+    pub fn recur_progress_after(&self, exec_index: u64) -> Option<RecurProgressStack> {
+        self.recur_progress_store.get(&exec_index).cloned()
     }
 
     pub fn storage_snapshot(&self) -> StorageSnapshot {
@@ -384,7 +437,7 @@ impl TraceRecorder {
     fn exec_step(
         &self,
         target: ExecTarget,
-        intra_sequence_index: u32,
+        intra_sequence_index: CfsCoordinate,
         input: Option<&FnInput>,
         storage_write: Option<&StorageWriteRecord>,
     ) -> ExecStep {
@@ -450,6 +503,7 @@ impl TraceRecorder {
                     },
                     self.recur_site_chunk(&site_coordinates),
                     self.recur_source_len(input.as_ref()),
+                    self.recur_site_state_is_output(&site_coordinates),
                 );
 
                 let record = StepRecord {
@@ -470,6 +524,7 @@ impl TraceRecorder {
                             .unwrap_or_default(),
                     },
                     recur_progress_commitment: [0u8; 32],
+                    recur_state: None,
                 };
 
                 self.witness_store
@@ -502,6 +557,7 @@ impl TraceRecorder {
                         input_source_commitment,
                     },
                     recur_progress_commitment: [0u8; 32],
+                    recur_state: None,
                 };
 
                 self.witness_store.insert(coordinates, event.clone(), None);
@@ -535,6 +591,7 @@ impl TraceRecorder {
                     sequence_id: fn_call_record.fn_name.clone(),
                     kind: StepKind::SequenceEnd { output_commitment },
                     recur_progress_commitment: [0u8; 32],
+                    recur_state: None,
                 };
 
                 self.sequence_callstack
@@ -612,6 +669,7 @@ impl TraceRecorder {
                         storage: self.storage_roots(None),
                     }),
                     recur_progress_commitment: [0u8; 32],
+                    recur_state: None,
                 };
 
                 self.sequence_callstack
@@ -648,7 +706,7 @@ impl TraceRecorder {
                             sequence_coordinates: parent_sequence_coordinates.clone(),
                             site_coordinates,
                             intra_sequence_index: parent_current_index,
-                            next_iteration_index: 0,
+                            next_iteration_index: FIRST_COORDINATE,
                             // Chunking is not supported for recur sequences yet.
                         },
                     );
@@ -668,7 +726,11 @@ impl TraceRecorder {
 
                 let mut iteration_coordinates = recur_state.site_coordinates.clone();
                 iteration_coordinates.push(recur_state.next_iteration_index);
-                let iteration_index = u64::from(recur_state.next_iteration_index);
+                // Coordinates are 1-based; the progress rules count from 0.
+                // Same seam the guest crosses in `advance_recur_progress`.
+                let iteration_index =
+                    u64::try_from(recur_state.next_iteration_index - FIRST_COORDINATE)
+                        .expect("a recur iteration coordinate is at least the first");
                 recur_state.next_iteration_index += 1;
 
                 // Only the iteration's *Start* advances the frame; its End is
@@ -706,6 +768,7 @@ impl TraceRecorder {
                         input_source_commitment,
                     },
                     recur_progress_commitment: [0u8; 32],
+                    recur_state: None,
                 };
 
                 self.witness_store
@@ -727,12 +790,45 @@ impl TraceRecorder {
                     .map(|output| Sha256Commitment::from(output).into())
                     .unwrap_or_default();
 
+                // The iteration closes at its *own* coordinate, not the one it
+                // opened on. While the two were the same, nothing keyed or
+                // dispatched on position could tell a `Start` from its `End`:
+                // the witness store served the Start's input to the End, and
+                // `try_get_next_coordinates` answered a close with the open's
+                // successors, rejecting the next iteration of an honest sweep.
+                // `frame.site` is still a prefix of the close, so the recur
+                // rules below read it exactly as before.
+                let closing_coordinates = self
+                    .cfs_cursor
+                    .closing_coordinates_of(&sequence_coordinates)
+                    .unwrap_or_else(|| sequence_coordinates.clone());
+
+                // A recur sequence iteration closes here, and this is the
+                // first point at which what it *produced* is known: the count
+                // moved at its `Start`, the carried state folds now.
+                if matches!(
+                    self.recur_progress.innermost().map(|frame| frame.kind),
+                    Some(raster_core::recur_progress::RecurSiteKind::Sequence)
+                ) {
+                    if let Err(violation) = self.recur_progress.fold_sequence_iteration_state(
+                        &closing_coordinates,
+                        fn_call_record.recur_state.as_ref(),
+                        output.as_ref().map(|o| o.data.as_slice()),
+                    ) {
+                        panic!(
+                            "Recur progress violation at {:?}: {}",
+                            closing_coordinates, violation
+                        );
+                    }
+                }
+
                 let record = StepRecord {
                     exec_index,
-                    coordinates: sequence_coordinates.clone(),
+                    coordinates: closing_coordinates.clone(),
                     sequence_id: fn_call_record.fn_name.clone(),
                     kind: StepKind::SequenceEnd { output_commitment },
                     recur_progress_commitment: [0u8; 32],
+                    recur_state: fn_call_record.recur_state,
                 };
 
                 self.sequence_callstack
@@ -740,7 +836,7 @@ impl TraceRecorder {
                     .expect("Corrupted recur sequence stack");
 
                 self.witness_store
-                    .insert(sequence_coordinates, event.clone(), None);
+                    .insert(closing_coordinates, event.clone(), None);
 
                 record
             }
@@ -803,6 +899,7 @@ impl TraceRecorder {
                         storage_write.as_ref(),
                     )),
                     recur_progress_commitment: [0u8; 32],
+                    recur_state: None,
                 };
 
                 self.witness_store
@@ -831,7 +928,7 @@ impl TraceRecorder {
                         sequence_coordinates: sequence_coordinates.clone(),
                         site_coordinates,
                         intra_sequence_index: parent_current_index,
-                        next_iteration_index: 0,
+                        next_iteration_index: FIRST_COORDINATE,
                     }
                 });
                 assert_eq!(
@@ -845,7 +942,12 @@ impl TraceRecorder {
 
                 let mut tile_coordinates = recur_state.site_coordinates.clone();
                 tile_coordinates.push(recur_state.next_iteration_index);
-                let iteration_index = u64::from(recur_state.next_iteration_index);
+                // Coordinates are 1-based; the progress rules count iterations
+                // from 0 — the same 0 the tile's replay journal reports, which
+                // is why the counter is not renumbered with the coordinates.
+                let iteration_index =
+                    u64::try_from(recur_state.next_iteration_index - FIRST_COORDINATE)
+                        .expect("a recur iteration coordinate is at least the first");
                 recur_state.next_iteration_index += 1;
                 let intra_sequence_index = recur_state.intra_sequence_index;
 
@@ -867,6 +969,7 @@ impl TraceRecorder {
 
                 // An iteration of a recur site is an ordinary tile run: it is
                 // replayed and verified exactly like one.
+                let recur_state_for_record = fn_call_record.recur_state;
                 let record = StepRecord {
                     exec_index,
                     sequence_id,
@@ -878,6 +981,11 @@ impl TraceRecorder {
                         storage_write.as_ref(),
                     )),
                     recur_progress_commitment: [0u8; 32],
+                    // Also on the step record, not only in the replay
+                    // journal: a recur *sequence* has no journal, so the guest
+                    // reads the transition from here uniformly, and binds a
+                    // tile's copy against the replay-proven one.
+                    recur_state: recur_state_for_record,
                 };
 
                 // Advance with the values rule 3 and rule 4 *require*: the
@@ -900,15 +1008,25 @@ impl TraceRecorder {
                     let declared = frame_len.div_ceil(frame_chunk.max(1));
                     let consumed =
                         core::cmp::min(frame_chunk, frame_len.saturating_sub(consumed_before));
-                    let control = fn_call_record
-                        .recur_control
-                        .unwrap_or(raster_core::draft::RecurControlKind::Continue);
+                    // No default. Defaulting an absent control to `Continue`
+                    // is what made every `Break`-terminated sweep unrecordable
+                    // while looking like a rule-5 violation: the recorder folded
+                    // `Continue`, `close_site` saw an incomplete prefix, and the
+                    // panic named the sweep rather than the missing field. The
+                    // tile wrapper sets it on every recur iteration.
+                    let control = fn_call_record.recur_control.unwrap_or_else(|| {
+                        panic!(
+                            "Recur iteration at {:?} carries no control; the tile wrapper must record one",
+                            tile_coordinates
+                        )
+                    });
                     if let Err(violation) = self.recur_progress.advance_tile_iteration(
                         &tile_coordinates,
                         iteration_index,
                         declared,
                         consumed,
                         control,
+                        recur_state_for_record.as_ref(),
                     ) {
                         panic!(
                             "Recur progress violation at {:?}: {}",
@@ -943,7 +1061,7 @@ impl TraceRecorder {
                         sequence_coordinates: sequence_coordinates.clone(),
                         site_coordinates,
                         intra_sequence_index: parent_current_index,
-                        next_iteration_index: 0,
+                        next_iteration_index: FIRST_COORDINATE,
                     }
                 });
 
@@ -988,6 +1106,7 @@ impl TraceRecorder {
                         storage_write.as_ref(),
                     )),
                     recur_progress_commitment: [0u8; 32],
+                    recur_state: None,
                 };
 
                 self.witness_store
@@ -1020,7 +1139,7 @@ impl TraceRecorder {
                             sequence_coordinates: sequence_coordinates.clone(),
                             site_coordinates,
                             intra_sequence_index: parent_current_index,
-                            next_iteration_index: 0,
+                            next_iteration_index: FIRST_COORDINATE,
                         }
                     });
 
@@ -1067,6 +1186,7 @@ impl TraceRecorder {
                         storage_write.as_ref(),
                     )),
                     recur_progress_commitment: [0u8; 32],
+                    recur_state: None,
                 };
 
                 self.witness_store
@@ -1176,6 +1296,7 @@ impl TraceRecorder {
                         storage: self.storage_roots(storage_write.as_ref()),
                     }),
                     recur_progress_commitment: [0u8; 32],
+                    recur_state: None,
                 };
 
                 self.witness_store
@@ -1190,6 +1311,8 @@ impl TraceRecorder {
         // than by matching a predecessor record the window does not contain.
         let mut step_record = step_record;
         step_record.recur_progress_commitment = self.recur_progress.commitment();
+        self.recur_progress_store
+            .insert(step_record.exec_index, self.recur_progress.clone());
         step_record
     }
 
@@ -1220,13 +1343,24 @@ impl TraceRecorder {
             _ => 1,
         }
     }
+
+    /// Whether the site at these coordinates returns its carried state, from
+    /// the CFS — the fact `close_site` needs to pin a sweep's final state.
+    fn recur_site_state_is_output(&self, site_coordinates: &CfsCoordinates) -> bool {
+        match self.cfs_cursor.try_get_item(site_coordinates) {
+            Some(SequenceChildItem::RecurTile(item)) => item.state_is_output,
+            Some(SequenceChildItem::RecurSequence(item)) => item.state_is_output,
+            _ => false,
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use raster_core::cfs::{
-        RecurSequenceItem, RecurTileItem, SequenceChildItem, SequenceDef, TileDef, TileItem,
+        closing_coordinate, RecurSequenceItem, RecurTileItem, SequenceChildItem, SequenceDef,
+        TileDef, TileItem,
     };
     use raster_core::trace::FnCallRecord;
 
@@ -1287,6 +1421,7 @@ mod tests {
             output: None,
             draft_transition_witness: None,
             recur_control: None,
+            recur_state: None,
         }
     }
 
@@ -1305,6 +1440,7 @@ mod tests {
                         sources: vec![],
                         chunk: None,
                         leaves_output_open: false,
+                        state_is_output: false,
                     }),
                     SequenceChildItem::Tile(TileItem {
                         id: "after".to_string(),
@@ -1331,6 +1467,7 @@ mod tests {
                         SequenceChildItem::RecurSequence(RecurSequenceItem {
                             id: "child".to_string(),
                             sources: vec![],
+                            state_is_output: false,
                         }),
                         SequenceChildItem::Tile(TileItem {
                             id: "after".to_string(),
@@ -1356,44 +1493,176 @@ mod tests {
 
     #[test]
     #[should_panic(
-        expected = "Missing step witness entry for SequenceEnd at coordinates CfsCoordinates([]). Expected a matching SequenceStart to be recorded first."
+        expected = "Missing step witness entry for SequenceEnd at coordinates CfsCoordinates([3, 1])"
     )]
     fn sequence_end_without_matching_start_reports_coordinates() {
+        // A nested sequence, because that is the only place a `SequenceEnd`
+        // occurs: `main` publishes none (`gen_main_wrapped_body`). The old
+        // fixture used `"main"` at `[]`, which cannot happen.
         let mut store = StepWitnessStore::new();
         store.insert(
-            CfsCoordinates(vec![]),
+            CfsCoordinates(vec![3, 1]),
             TraceEvent::SequenceEnd(FnCallRecord {
-                fn_name: "main".to_string(),
+                fn_name: "child".to_string(),
                 input: None,
                 output: None,
                 draft_transition_witness: None,
                 recur_control: None,
+                recur_state: None,
             }),
             None,
         );
     }
 
+    /// Start `main` the way the generated code does.
+    ///
+    /// `main` publishes **no** `SequenceStart`: the macro suppresses it
+    /// (`raster-macros/src/lib.rs`, `if is_main { quote!{} }`) precisely
+    /// because `ProgramStart` is what pushes main's frame at `[]` and creates
+    /// the `[]` witness-store entry. These fixtures used to record a
+    /// `SequenceStart` for `"main"`, an event the generated code cannot emit —
+    /// which took the wrong arm of both `record` and `StepWitnessStore::insert`
+    /// and so described a trace shape that never occurs.
+    ///
+    /// Zero arguments is the supported "program still starts, binding nothing"
+    /// path, so no manifest or source resolver is needed.
     fn start_main(recorder: &mut TraceRecorder) {
-        recorder.record(TraceEvent::SequenceStart(FnCallRecord {
-            fn_name: "main".to_string(),
-            input: None,
-            output: None,
-            draft_transition_witness: None,
-            recur_control: None,
-        }));
+        recorder.record(TraceEvent::ProgramStart(
+            raster_core::trace::ProgramStartEvent {
+                arguments: Vec::new(),
+            },
+        ));
     }
 
+
+    /// `main` containing one ordinary nested sequence — the shape that makes
+    /// the `SequenceStart`/`SequenceEnd` coordinate collision observable.
+    fn recorder_with_nested_sequence() -> TraceRecorder {
+        TraceRecorder::new(ControlFlowSchema {
+            version: "1.0".to_string(),
+            project: "test".to_string(),
+            encoding: "postcard".to_string(),
+            tiles: vec![],
+            sequences: vec![
+                SequenceDef {
+                    id: "main".to_string(),
+                    input_sources: vec![],
+                    items: vec![SequenceChildItem::Sequence(raster_core::cfs::SequenceItem {
+                        id: "child".to_string(),
+                        sources: vec![],
+                    })],
+                    entry_arguments: vec![],
+                    produces_output: false,
+                },
+                SequenceDef {
+                    id: "child".to_string(),
+                    input_sources: vec![],
+                    items: vec![],
+                    entry_arguments: vec![],
+                    produces_output: false,
+                },
+            ],
+        })
+    }
+
+    fn call_with_input(fn_name: &str) -> FnCallRecord {
+        let mut record = call(fn_name);
+        record.input = Some(FnInput {
+            data: vec![1, 2, 3],
+            values: vec![],
+            args: vec![],
+            storage: Default::default(),
+        });
+        record
+    }
+
+    #[test]
+    fn program_start_is_what_creates_mains_root_entry() {
+        // `main` publishes no `SequenceStart` (`raster-macros/src/lib.rs`
+        // suppresses it), so `ProgramStart` both pushes main's frame and
+        // creates the `[]` witness-store entry. It records no input source,
+        // because main's arguments are entry arguments rather than CFS inputs.
+        let mut recorder = recorder_with_nested_sequence();
+        assert!(recorder.step_witness_at(&CfsCoordinates(vec![])).is_none());
+
+        start_main(&mut recorder);
+
+        let entry = recorder
+            .step_witness_at(&CfsCoordinates(vec![]))
+            .expect("ProgramStart creates the root entry");
+        assert!(entry.input_source_witness().is_none());
+    }
+
+    #[test]
+    fn program_end_leaves_the_root_entry_untouched() {
+        // `main` publishes neither a `SequenceStart` nor a `SequenceEnd`: the
+        // macro routes it to `gen_main_wrapped_body`, whose boundaries are
+        // `ProgramStart` and `ProgramEnd` (`raster-macros/src/lib.rs` — the
+        // dispatch at `if item_fn.sig.ident == "main"`). So exactly two steps
+        // sit at `[]`, and `ProgramEnd` writes nothing: the root entry is
+        // `ProgramStart`'s alone, and `output_data` there stays `None`.
+        //
+        // This is why the `SequenceEnd` inheritance bug needs a *nested*
+        // sequence — at the root there is no `SequenceEnd` to inherit
+        // anything.
+        let mut recorder = recorder_with_nested_sequence();
+        start_main(&mut recorder);
+        let before = recorder
+            .step_witness_at(&CfsCoordinates(vec![]))
+            .expect("ProgramStart created the root entry");
+
+        recorder.record(TraceEvent::ProgramEnd(raster_core::trace::ProgramEndEvent {
+            output: None,
+        }));
+
+        let after = recorder
+            .step_witness_at(&CfsCoordinates(vec![]))
+            .expect("root entry still present");
+        assert!(after.input_source_witness().is_none());
+        assert_eq!(after.output_data(), before.output_data());
+        assert!(after.output_data().is_none());
+    }
+
+    #[test]
+    fn a_nested_sequence_end_lands_on_its_own_starts_entry() {
+        // The collision itself: `SequenceStart` and `SequenceEnd` share
+        // coordinates, and the End does `get_mut` rather than creating its own
+        // entry — so after the End the entry still carries the *Start's*
+        // input source. Nothing is wrong with that here; it is why the fraud
+        // host must select witnesses by what the step's record declares
+        // (`StepRecord::input_source_commitment` is `None` for a
+        // `SequenceEnd`) instead of by coordinates alone.
+        let mut recorder = recorder_with_nested_sequence();
+        start_main(&mut recorder);
+
+        let start = recorder.record(TraceEvent::SequenceStart(call_with_input("child")));
+        let child_coordinates = start.coordinates().clone();
+        let at_start = recorder
+            .step_witness_at(&child_coordinates)
+            .expect("SequenceStart creates the child entry");
+        assert!(at_start.input_source_witness().is_some());
+
+        let end = recorder.record(TraceEvent::SequenceEnd(call("child")));
+        assert_eq!(end.coordinates(), &child_coordinates);
+
+        let at_end = recorder
+            .step_witness_at(&child_coordinates)
+            .expect("child entry still present");
+        assert_eq!(
+            at_end.input_source_witness(),
+            at_start.input_source_witness(),
+            "the End inherits the Start's input source, which is exactly why it must be \
+             filtered by step kind rather than looked up by coordinates",
+        );
+        // And the record itself declares none, which is the fact the host and
+        // guest both key on.
+        assert!(end.input_source_commitment().is_none());
+    }
 
     #[test]
     fn recur_iterations_and_site_completion_get_distinct_coordinates() {
         let mut recorder = recorder_with_recur_site();
-        recorder.record(TraceEvent::SequenceStart(FnCallRecord {
-            fn_name: "main".to_string(),
-            input: None,
-            output: None,
-            draft_transition_witness: None,
-            recur_control: None,
-        }));
+        start_main(&mut recorder);
 
         let __start = seed_recur_source(&mut recorder, "recur", 2);
         recorder.record(TraceEvent::RecurTileStart(__start));
@@ -1402,21 +1671,24 @@ mod tests {
             input: None,
             output: None,
             draft_transition_witness: None,
-            recur_control: None,
+            recur_control: Some(raster_core::draft::RecurControlKind::Continue),
+            recur_state: None,
         }));
         let iter1 = recorder.record(TraceEvent::RecurTileIterationExec(FnCallRecord {
             fn_name: "recur".to_string(),
             input: None,
             output: None,
             draft_transition_witness: None,
-            recur_control: None,
+            recur_control: Some(raster_core::draft::RecurControlKind::Continue),
+            recur_state: None,
         }));
         let site = recorder.record(TraceEvent::RecurTileEnd(FnCallRecord {
             fn_name: "recur".to_string(),
             input: None,
             output: None,
             draft_transition_witness: None,
-            recur_control: None,
+            recur_control: Some(raster_core::draft::RecurControlKind::Continue),
+            recur_state: None,
         }));
         let after = recorder.record(TraceEvent::TileExec(FnCallRecord {
             fn_name: "after".to_string(),
@@ -1424,24 +1696,19 @@ mod tests {
             output: None,
             draft_transition_witness: None,
             recur_control: None,
+            recur_state: None,
         }));
 
-        assert_eq!(iter0.coordinates(), &CfsCoordinates(vec![0, 0]));
-        assert_eq!(iter1.coordinates(), &CfsCoordinates(vec![0, 1]));
-        assert_eq!(site.coordinates(), &CfsCoordinates(vec![0]));
-        assert_eq!(after.coordinates(), &CfsCoordinates(vec![1]));
+        assert_eq!(iter0.coordinates(), &CfsCoordinates(vec![1, 1]));
+        assert_eq!(iter1.coordinates(), &CfsCoordinates(vec![1, 2]));
+        assert_eq!(site.coordinates(), &CfsCoordinates(vec![1]));
+        assert_eq!(after.coordinates(), &CfsCoordinates(vec![2]));
     }
 
     #[test]
     fn recur_sequence_iterations_restore_parent_coordinates_before_site_completion() {
         let mut recorder = recorder_with_recur_sequence_site();
-        recorder.record(TraceEvent::SequenceStart(FnCallRecord {
-            fn_name: "main".to_string(),
-            input: None,
-            output: None,
-            draft_transition_witness: None,
-            recur_control: None,
-        }));
+        start_main(&mut recorder);
 
         let __start = seed_recur_source(&mut recorder, "child", 2);
         recorder.record(TraceEvent::RecurSequenceStart(__start));
@@ -1451,6 +1718,7 @@ mod tests {
             output: None,
             draft_transition_witness: None,
             recur_control: None,
+            recur_state: None,
         }));
         let iter0_inner = recorder.record(TraceEvent::TileExec(FnCallRecord {
             fn_name: "inner".to_string(),
@@ -1458,6 +1726,7 @@ mod tests {
             output: None,
             draft_transition_witness: None,
             recur_control: None,
+            recur_state: None,
         }));
         let iter0_end = recorder.record(TraceEvent::RecurSequenceIterationEnd(FnCallRecord {
             fn_name: "child".to_string(),
@@ -1465,6 +1734,7 @@ mod tests {
             output: None,
             draft_transition_witness: None,
             recur_control: None,
+            recur_state: None,
         }));
         let iter1_start = recorder.record(TraceEvent::RecurSequenceIterationStart(FnCallRecord {
             fn_name: "child".to_string(),
@@ -1472,6 +1742,7 @@ mod tests {
             output: None,
             draft_transition_witness: None,
             recur_control: None,
+            recur_state: None,
         }));
         let iter1_inner = recorder.record(TraceEvent::TileExec(FnCallRecord {
             fn_name: "inner".to_string(),
@@ -1479,6 +1750,7 @@ mod tests {
             output: None,
             draft_transition_witness: None,
             recur_control: None,
+            recur_state: None,
         }));
         let iter1_end = recorder.record(TraceEvent::RecurSequenceIterationEnd(FnCallRecord {
             fn_name: "child".to_string(),
@@ -1486,6 +1758,7 @@ mod tests {
             output: None,
             draft_transition_witness: None,
             recur_control: None,
+            recur_state: None,
         }));
         let site = recorder.record(TraceEvent::RecurSequenceEnd(FnCallRecord {
             fn_name: "child".to_string(),
@@ -1493,6 +1766,7 @@ mod tests {
             output: None,
             draft_transition_witness: None,
             recur_control: None,
+            recur_state: None,
         }));
         let after = recorder.record(TraceEvent::TileExec(FnCallRecord {
             fn_name: "after".to_string(),
@@ -1500,16 +1774,115 @@ mod tests {
             output: None,
             draft_transition_witness: None,
             recur_control: None,
+            recur_state: None,
         }));
 
-        assert_eq!(iter0_start.coordinates(), &CfsCoordinates(vec![0, 0]));
-        assert_eq!(iter0_inner.coordinates(), &CfsCoordinates(vec![0, 0, 0]));
-        assert_eq!(iter0_end.coordinates(), &CfsCoordinates(vec![0, 0]));
-        assert_eq!(iter1_start.coordinates(), &CfsCoordinates(vec![0, 1]));
-        assert_eq!(iter1_inner.coordinates(), &CfsCoordinates(vec![0, 1, 0]));
-        assert_eq!(iter1_end.coordinates(), &CfsCoordinates(vec![0, 1]));
-        assert_eq!(site.coordinates(), &CfsCoordinates(vec![0]));
-        assert_eq!(after.coordinates(), &CfsCoordinates(vec![1]));
+        // An iteration's `End` closes at its own coordinate, distinct from the
+        // `Start`'s, so nothing keyed on position can confuse the two. The
+        // bracket is symmetric because positions are 1-based: open `1` closes
+        // at `-1`, with no offset to carry.
+        assert_eq!(iter0_start.coordinates(), &CfsCoordinates(vec![1, 1]));
+        assert_eq!(iter0_inner.coordinates(), &CfsCoordinates(vec![1, 1, 1]));
+        assert_eq!(iter0_end.coordinates(), &CfsCoordinates(vec![1, -1]));
+        assert_eq!(iter1_start.coordinates(), &CfsCoordinates(vec![1, 2]));
+        assert_eq!(iter1_inner.coordinates(), &CfsCoordinates(vec![1, 2, 1]));
+        assert_eq!(iter1_end.coordinates(), &CfsCoordinates(vec![1, -2]));
+        assert_ne!(iter0_end.coordinates(), iter0_start.coordinates());
+        assert_ne!(iter1_end.coordinates(), iter1_start.coordinates());
+        assert_eq!(site.coordinates(), &CfsCoordinates(vec![1]));
+        assert_eq!(after.coordinates(), &CfsCoordinates(vec![2]));
+    }
+
+    /// `sequence_id`'s vocabulary, made executable.
+    ///
+    /// The field means two different things depending on the step kind, and the
+    /// transition guest derives it to stop it being free entropy in the trace
+    /// leaf (`checks::cfs::verify_sequence_id`), so the rule it derives against
+    /// belongs in a test rather than in a reader's head:
+    ///
+    /// - a **boundary** step (`SequenceStart`/`SequenceEnd`) names the sequence
+    ///   it enters or leaves — the callee;
+    /// - every **other** step names the frame it executes in.
+    ///
+    /// The two recur kinds part company here, which is the row worth the test:
+    /// a recur *tile* pushes no frame, so its iterations stay in the containing
+    /// sequence, while a recur *sequence* does, so its body's steps name the
+    /// site.
+    #[test]
+    fn sequence_id_names_the_callee_at_boundaries_and_the_frame_everywhere_else() {
+        let mut recorder = recorder_with_recur_site();
+        start_main(&mut recorder);
+        let __start = seed_recur_source(&mut recorder, "recur", 1);
+        let site_start = recorder.record(TraceEvent::RecurTileStart(__start));
+        let iter = recorder.record(TraceEvent::RecurTileIterationExec(FnCallRecord {
+            fn_name: "recur".to_string(),
+            input: None,
+            output: None,
+            draft_transition_witness: None,
+            recur_control: Some(raster_core::draft::RecurControlKind::Continue),
+            recur_state: None,
+        }));
+        let site_end = recorder.record(TraceEvent::RecurTileEnd(FnCallRecord {
+            fn_name: "recur".to_string(),
+            input: None,
+            output: None,
+            draft_transition_witness: None,
+            recur_control: Some(raster_core::draft::RecurControlKind::Continue),
+            recur_state: None,
+        }));
+
+        // The site's opening boundary names the callee...
+        assert_eq!(site_start.sequence_id, "recur");
+        // ...but a recur *tile* pushes no frame, so its iteration and its
+        // closing `Exec` both stay in `main`.
+        assert_eq!(iter.sequence_id, "main");
+        assert_eq!(site_end.sequence_id, "main");
+
+        let mut recorder = recorder_with_recur_sequence_site();
+        start_main(&mut recorder);
+        let __start = seed_recur_source(&mut recorder, "child", 1);
+        let site_start = recorder.record(TraceEvent::RecurSequenceStart(__start));
+        let iteration_start =
+            recorder.record(TraceEvent::RecurSequenceIterationStart(FnCallRecord {
+                fn_name: "child".to_string(),
+                input: None,
+                output: None,
+                draft_transition_witness: None,
+                recur_control: None,
+                recur_state: None,
+            }));
+        let inner = recorder.record(TraceEvent::TileExec(FnCallRecord {
+            fn_name: "inner".to_string(),
+            input: None,
+            output: None,
+            draft_transition_witness: None,
+            recur_control: None,
+            recur_state: None,
+        }));
+        let iteration_end = recorder.record(TraceEvent::RecurSequenceIterationEnd(FnCallRecord {
+            fn_name: "child".to_string(),
+            input: None,
+            output: None,
+            draft_transition_witness: None,
+            recur_control: None,
+            recur_state: None,
+        }));
+        let site_end = recorder.record(TraceEvent::RecurSequenceEnd(FnCallRecord {
+            fn_name: "child".to_string(),
+            input: None,
+            output: None,
+            draft_transition_witness: None,
+            recur_control: None,
+            recur_state: None,
+        }));
+
+        assert_eq!(site_start.sequence_id, "child");
+        assert_eq!(iteration_start.sequence_id, "child");
+        // A recur *sequence* does push a frame, so its body names the site.
+        assert_eq!(inner.sequence_id, "child");
+        assert_eq!(iteration_end.sequence_id, "child");
+        // The site's closing `Exec` sits back in the containing sequence.
+        assert_eq!(site_end.sequence_id, "main");
     }
 
     /// The vocabulary table in `TraceEvent`'s doc comment, made executable:
@@ -1528,6 +1901,18 @@ mod tests {
             output: None,
             draft_transition_witness: None,
             recur_control: None,
+            recur_state: None,
+        }
+    }
+
+    /// A recur iteration's record. Distinct from [`call`] because a recur
+    /// iteration always carries a control — the recorder rejects one that does
+    /// not, so a fixture that omits it is not a smaller version of a real
+    /// event, it is an impossible one.
+    fn recur_call(fn_name: &str, control: raster_core::draft::RecurControlKind) -> FnCallRecord {
+        FnCallRecord {
+            recur_control: Some(control),
+            ..call(fn_name)
         }
     }
 
@@ -1550,8 +1935,8 @@ mod tests {
 
         let start = seed_recur_source(&mut recorder, "recur", 2);
         let site_start = recorder.record(TraceEvent::RecurTileStart(start));
-        let iter0 = recorder.record(TraceEvent::RecurTileIterationExec(call("recur")));
-        let iter1 = recorder.record(TraceEvent::RecurTileIterationExec(call("recur")));
+        let iter0 = recorder.record(TraceEvent::RecurTileIterationExec(recur_call("recur", raster_core::draft::RecurControlKind::Continue)));
+        let iter1 = recorder.record(TraceEvent::RecurTileIterationExec(recur_call("recur", raster_core::draft::RecurControlKind::Continue)));
         let site_end = recorder.record(TraceEvent::RecurTileEnd(call("recur")));
 
         // Open, and each iteration, must move it.
@@ -1564,6 +1949,100 @@ mod tests {
         assert_eq!(site_end.recur_progress_commitment, empty, "site close");
     }
 
+    /// Every step's retained stack hashes to that step's own stamped
+    /// commitment.
+    ///
+    /// This is the seed's correctness asserted *at its source*. A fraud-proof
+    /// window seeded from `recur_progress_after` is validated by the guest
+    /// advancing it and comparing against the recorded commitment, so a
+    /// divergence here is precisely a wrong seed — and would otherwise surface
+    /// only as a proof that fails for unclear reasons.
+    /// See `window-seed-reconstruction.md` §Verification.
+    #[test]
+    fn recur_progress_after_agrees_with_every_stamped_commitment() {
+        let mut recorder = recorder_with_recur_site();
+        start_main(&mut recorder);
+
+        let start = seed_recur_source(&mut recorder, "recur", 2);
+        let steps = vec![
+            recorder.record(TraceEvent::RecurTileStart(start)),
+            recorder.record(TraceEvent::RecurTileIterationExec(recur_call("recur", raster_core::draft::RecurControlKind::Continue))),
+            recorder.record(TraceEvent::RecurTileIterationExec(recur_call("recur", raster_core::draft::RecurControlKind::Continue))),
+            recorder.record(TraceEvent::RecurTileEnd(call("recur"))),
+        ];
+
+        for step in &steps {
+            let retained = recorder
+                .recur_progress_after(step.exec_index)
+                .unwrap_or_else(|| panic!("no retained stack for exec_index {}", step.exec_index));
+            assert_eq!(
+                retained.commitment(),
+                step.recur_progress_commitment,
+                "retained stack disagrees with the stamped commitment at {:?}",
+                step.coordinates(),
+            );
+        }
+    }
+
+    /// The same agreement across a recur *sequence* site, including a plain
+    /// tile executing inside an iteration — the shape a window is most likely
+    /// to open on, since the loop is live but the step itself is ordinary.
+    #[test]
+    fn recur_progress_after_agrees_across_a_recur_sequence_site() {
+        let mut recorder = recorder_with_recur_sequence_site();
+        start_main(&mut recorder);
+
+        let start = seed_recur_source(&mut recorder, "child", 2);
+        let mut steps = vec![recorder.record(TraceEvent::RecurSequenceStart(start))];
+        for _ in 0..2 {
+            steps.push(recorder.record(TraceEvent::RecurSequenceIterationStart(call("child"))));
+            steps.push(recorder.record(TraceEvent::TileExec(call("inner"))));
+            steps.push(recorder.record(TraceEvent::RecurSequenceIterationEnd(call("child"))));
+        }
+        steps.push(recorder.record(TraceEvent::RecurSequenceEnd(call("child"))));
+
+        for step in &steps {
+            let retained = recorder
+                .recur_progress_after(step.exec_index)
+                .unwrap_or_else(|| panic!("no retained stack for exec_index {}", step.exec_index));
+            assert_eq!(
+                retained.commitment(),
+                step.recur_progress_commitment,
+                "retained stack disagrees with the stamped commitment at {:?}",
+                step.coordinates(),
+            );
+        }
+    }
+
+    /// The seed a mid-loop window would open with is a *live* stack, not the
+    /// empty one — the whole point of retaining it.
+    ///
+    /// Reading the stack after iteration 0 is exactly what
+    /// `prove()` does for a window whose first step is iteration 1.
+    #[test]
+    fn recur_progress_after_a_live_iteration_is_not_the_empty_stack() {
+        let mut recorder = recorder_with_recur_site();
+        start_main(&mut recorder);
+
+        let start = seed_recur_source(&mut recorder, "recur", 2);
+        recorder.record(TraceEvent::RecurTileStart(start));
+        let iter0 = recorder.record(TraceEvent::RecurTileIterationExec(recur_call("recur", raster_core::draft::RecurControlKind::Continue)));
+        let site_end_before_close = recorder.record(TraceEvent::RecurTileIterationExec(recur_call("recur", raster_core::draft::RecurControlKind::Continue)));
+
+        let seed = recorder
+            .recur_progress_after(iter0.exec_index)
+            .expect("iteration 0 retained a stack");
+        assert!(!seed.is_empty(), "a window opening after iteration 0 is mid-loop");
+        assert_eq!(seed.depth(), 1);
+
+        // And the last iteration is still inside the site: only the site's
+        // `End` pops the frame.
+        let seed = recorder
+            .recur_progress_after(site_end_before_close.exec_index)
+            .expect("iteration 1 retained a stack");
+        assert!(!seed.is_empty());
+    }
+
     /// A sweep that stops short of `L` is rejected at `close_site` by rule 5.
     #[test]
     #[should_panic(expected = "Recur progress violation")]
@@ -1572,7 +2051,7 @@ mod tests {
         start_main(&mut recorder);
         let start = seed_recur_source(&mut recorder, "recur", 3);
         recorder.record(TraceEvent::RecurTileStart(start));
-        recorder.record(TraceEvent::RecurTileIterationExec(call("recur")));
+        recorder.record(TraceEvent::RecurTileIterationExec(recur_call("recur", raster_core::draft::RecurControlKind::Continue)));
         // Only one of three elements covered, and no Break.
         recorder.record(TraceEvent::RecurTileEnd(call("recur")));
     }
@@ -1586,6 +2065,7 @@ mod tests {
                 output: None,
                 draft_transition_witness: None,
                 recur_control: None,
+                recur_state: None,
             }
         }
 
@@ -1604,7 +2084,7 @@ mod tests {
             }
         }
 
-        fn assert_row(record: &StepRecord, kind: &str, coordinates: &[u32]) {
+        fn assert_row(record: &StepRecord, kind: &str, coordinates: &[CfsCoordinate]) {
             assert_eq!(becomes(record), kind, "event became the wrong StepKind");
             let expected = CfsCoordinates(coordinates.to_vec());
             assert_eq!(record.coordinates(), &expected, "event landed wrong");
@@ -1615,7 +2095,7 @@ mod tests {
         start_main(&mut recorder);
         let __start = seed_recur_source(&mut recorder, "recur", 1);
         recorder.record(TraceEvent::RecurTileStart(__start));
-        let tile_iteration = recorder.record(TraceEvent::RecurTileIterationExec(call("recur")));
+        let tile_iteration = recorder.record(TraceEvent::RecurTileIterationExec(recur_call("recur", raster_core::draft::RecurControlKind::Continue)));
         let tile_site = recorder.record(TraceEvent::RecurTileEnd(call("recur")));
         let tile = recorder.record(TraceEvent::TileExec(call("after")));
 
@@ -1630,16 +2110,17 @@ mod tests {
         let seq_site = recorder.record(TraceEvent::RecurSequenceEnd(call("child")));
 
         // Items land at their sequence's coordinates, [s].
-        assert_row(&tile, "Exec(Tile)", &[1]);
-        assert_row(&tile_site, "Exec(RecurTile)", &[0]);
-        assert_row(&seq_site, "Exec(RecurSequence)", &[0]);
+        assert_row(&tile, "Exec(Tile)", &[2]);
+        assert_row(&tile_site, "Exec(RecurTile)", &[1]);
+        assert_row(&seq_site, "Exec(RecurSequence)", &[1]);
         // A tile inside a recur-sequence iteration is an item of that
         // iteration's own sequence: [s] relative to it, [0,0][0] absolute.
-        assert_row(&iter_tile, "Exec(Tile)", &[0, 0, 0]);
+        assert_row(&iter_tile, "Exec(Tile)", &[1, 1, 1]);
 
         // Iterations land one level deeper, at [s][i].
-        assert_row(&tile_iteration, "Exec(Tile)", &[0, 0]);
-        assert_row(&iter_start, "SequenceStart", &[0, 0]);
-        assert_row(&iter_end, "SequenceEnd", &[0, 0]);
+        assert_row(&tile_iteration, "Exec(Tile)", &[1, 1]);
+        assert_row(&iter_start, "SequenceStart", &[1, 1]);
+        // The close of iteration 0, not the open again.
+        assert_row(&iter_end, "SequenceEnd", &[1, closing_coordinate(1)]);
     }
 }

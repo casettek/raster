@@ -1027,3 +1027,170 @@ fn recur_tile_reports_break_and_continue_distinctly() {
         raster::core::draft::RecurControlKind::Break,
     );
 }
+
+// ---------------------------------------------------------------------------
+// Stateful recur sequences
+//
+// The shape `raster-inference` organises every outer loop with — a recur
+// sequence carrying state, with tiles nested inside it — and the shape nothing
+// in this repo covered. Its site under-recorded its arguments, so the
+// transition guest rejected it on arity before any of this could be checked.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize, Selectable)]
+struct WordCursor {
+    seen: u64,
+    total_len: u64,
+}
+
+#[tile]
+fn advance_word_cursor(state: WordCursor, word: String) -> WordCursor {
+    let mut state = state;
+    state.seen += 1;
+    state.total_len += word.len() as u64;
+    state
+}
+
+#[sequence(kind = recur)]
+fn scan_words(
+    input: RecurSequenceInput<String>,
+    state: RecurSequenceState<WordCursor>,
+    marker: String,
+) -> RecurSequenceState<WordCursor> {
+    let word = call!(prefix_line, input, marker);
+    call!(advance_word_cursor, state, word)
+}
+
+#[sequence]
+fn scan_all_words() -> WordCursor {
+    let source = raster::store_value(&vec![
+        "alpha".to_string(),
+        "beta".to_string(),
+        "gamma".to_string(),
+    ])
+    .expect("list source should store");
+    let marker = raster::store_value(&">".to_string()).expect("marker should store");
+
+    let seed = call!(begin_word_cursor);
+
+    call_recur_seq!(
+        sequence = scan_words,
+        input = storage!(List<String>, source),
+        state = seed,
+        args = (storage!(String, marker),)
+    )
+}
+
+#[tile]
+fn begin_word_cursor() -> WordCursor {
+    WordCursor {
+        seen: 0,
+        total_len: 0,
+    }
+}
+
+fn run_scan_all_words() -> WordCursor {
+    materialize_auth_return::<WordCursor, _>(__raster_sequence_auth_scan_all_words())
+}
+
+#[test]
+fn a_stateful_recur_sequence_threads_its_state() {
+    let cursor = run_scan_all_words();
+    // ">" prefixed onto each of alpha/beta/gamma: 6 + 5 + 6.
+    assert_eq!(cursor.seen, 3);
+    assert_eq!(cursor.total_len, 17);
+}
+
+#[test]
+fn a_stateful_recur_sequence_site_records_every_declared_source() {
+    let (_, events) = capture_trace_events(run_scan_all_words);
+
+    let site_input = events
+        .iter()
+        .find_map(|event| match event {
+            TraceEvent::RecurSequenceStart(record) if record.fn_name == "scan_words" => {
+                record.input.clone()
+            }
+            _ => None,
+        })
+        .expect("the recur sequence site publishes a Start with its input");
+
+    // input, state, args.0 — one per `call_recur_seq!` argument, which is what
+    // the CFS declares and what the transition guest asserts against.
+    assert_eq!(site_input.values().len(), 3);
+    assert_eq!(
+        site_input
+            .args()
+            .iter()
+            .map(|arg| arg.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["input", "state", "marker"],
+    );
+}
+
+#[test]
+fn a_recur_sequence_site_commits_to_its_source_list_metadata() {
+    // `lazy-list-recur.md` §2–§3: *both* recur macros trace their source
+    // through the `0x0A` metadata selection. `call_recur_seq!` used
+    // `auth_ref_trace` instead, which resolves the binding — materializing the
+    // whole list before any runner runs, the earliest and largest of the eager
+    // paths — and records a `Raw` selection.
+    //
+    // The consequence was not only memory: `checks::cfs::authenticated_source_len`
+    // refuses anything but `List`, so no fraud proof covering a recur *sequence*
+    // site could be produced at all. No test caught it because the recorder's
+    // own fixture (`seed_recur_source`) hand-builds the metadata commitment
+    // rather than going through the macro.
+    let (_, events) = capture_trace_events(run_scan_all_words);
+
+    let site_input = events
+        .iter()
+        .find_map(|event| match event {
+            TraceEvent::RecurSequenceStart(record) if record.fn_name == "scan_words" => {
+                record.input.clone()
+            }
+            _ => None,
+        })
+        .expect("the recur sequence site publishes a Start with its input");
+
+    let source = site_input
+        .storage()
+        .get("input")
+        .expect("the site records its source under `input`");
+
+    assert_eq!(
+        source.selection.payload_kind,
+        raster::core::input::SelectionPayloadKind::List,
+        "a recur source must commit to list metadata, not the list itself",
+    );
+    // `1 + 8 + 32` — the tag, `len`, and `elements_root`. The point of the
+    // metadata form is that this is constant, not a function of list length.
+    assert_eq!(source.selection.selected_len, 41);
+}
+
+#[test]
+fn a_stateful_recur_sequence_iteration_chains_its_carried_state() {
+    let (_, events) = capture_trace_events(run_scan_all_words);
+
+    let transitions: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            TraceEvent::RecurSequenceIterationEnd(record) if record.fn_name == "scan_words" => {
+                record.recur_state
+            }
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(transitions.len(), 3, "one transition per iteration");
+    for pair in transitions.windows(2) {
+        assert_eq!(
+            pair[0].state_out, pair[1].state_in,
+            "each iteration must start from the state its predecessor produced",
+        );
+    }
+    assert_ne!(
+        transitions[0].state_in, transitions[0].state_out,
+        "a fold that changes the state must change its commitment",
+    );
+}

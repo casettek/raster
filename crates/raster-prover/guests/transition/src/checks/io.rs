@@ -73,9 +73,14 @@ pub fn verify_step_record(
             "Step input source witness does not match recorded source commitment",
         );
     } else {
+        // `ProgramStart`, `ProgramEnd` and `SequenceEnd` all report `None`
+        // here. None of them binds a step input, so a witness supplied for one
+        // is unbound by construction — nothing in the record commits to it.
         assert!(
             input_source_witness.is_none(),
-            "SequenceEnd must not carry input source witness",
+            "Step {:?} declares no input source commitment, so it must not carry an input \
+             source witness",
+            step_record.coordinates,
         );
     }
 

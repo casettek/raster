@@ -16,7 +16,8 @@ use std::collections::BTreeMap;
 use bridgetree::NonEmptyFrontier;
 use risc0_zkvm::guest::env;
 
-use raster_core::cfs::{CfsCoordinates, CfsCursor};
+use raster_core::cfs::{CfsCoordinates, CfsCursor, SequenceChildItem};
+use raster_core::coordinate_index::coordinate_index_root;
 use raster_core::draft::{DraftId, TrackedDraftState};
 use raster_core::fingerprint::{Fingerprint, FingerprintAccumulator};
 use raster_core::program::{commitment_of_bytes, ImageId, ProgramDefinition};
@@ -30,7 +31,7 @@ use raster_core::transition::{
 use crate::checks;
 use crate::merkle_tree::{
     combine_merkle_level, deserialize_frontier, frontier_root, hash_trace_item, serialize_frontier,
-    sha256_bytes, Bytes,
+    sha256_bytes, Bytes, EMPTY_LEAF,
 };
 
 /// Public parameters every step of the fraud proof runs under.
@@ -92,19 +93,17 @@ fn expected_tile_image_id<'a>(
     }
 }
 
-/// Whether this step opens the fraud-proof window or continues it.
-pub enum StepPosition {
-    /// First step of the window: committed without a fingerprint comparison.
-    First,
-    /// Subsequent step: must match the committed fingerprint, except the
-    /// final item which must diverge (the fraud being proven).
-    Subsequent,
-}
-
-/// Where this step attaches to the fraud-proof chain.
+/// Where this step attaches, and the facts the window carries across its steps.
+///
+/// There is deliberately no "is this the first step" flag. Every window item is
+/// compared against the committed fingerprint under one rule — **every item
+/// before the last must match, and the last must diverge** — so the opening
+/// step needs no special case. It used to have one, committed without any
+/// comparison, which weakened every window by an item of margin and made a
+/// one-item window unprovable in principle: its only item was the one never
+/// examined. That was exactly the head of a trace.
 pub struct FraudProofWindowContext {
     pub init_state: InitTransition,
-    pub position: StepPosition,
     /// `TraceCommitmentHeader::digest()` of the `commit.bin` this window
     /// audits — derived at `Init` (after the slice check below), inherited
     /// from the recursively verified previous journal at `Next`.
@@ -113,6 +112,62 @@ pub struct FraudProofWindowContext {
     /// by the slice check, inherited at `Next`. See
     /// `TransitionJournal::window_is_terminal`.
     pub window_is_terminal: bool,
+    /// The committed trace root for this window's final index, when it falls in
+    /// the revealed tail. Derived at `Init`, inherited at `Next`, and read only
+    /// by the terminal step. See `TransitionJournal::final_committed_root`.
+    pub final_committed_root: Option<Vec<u8>>,
+}
+
+/// Refuse a window that opens inside a live recur site with no seed, naming
+/// the cause.
+///
+/// **Diagnostics only, no soundness weight.** The advance-and-compare in
+/// [`checks::cfs::advance_recur_progress`] remains the sole authority on
+/// whether a seed is correct — a wrong seed advances to a different stack and
+/// fails there, seeded or not.
+///
+/// What this buys is the error message. Without it, a missing seed surfaces as
+/// a recur-progress commitment mismatch, which reads like a soundness
+/// violation in the trace and points a reader at the guest rather than at the
+/// host that failed to reconstruct the seed. That misreading is exactly what
+/// let an unfilled parameter ship for weeks as a de-facto "refuse to open
+/// mid-loop" rule — the design `recur-progress-commitment.md` §Problem had
+/// explicitly rejected. See `window-seed-reconstruction.md` §Uncertainty 3.
+///
+/// Best-effort by construction: it fires on a step whose coordinates sit under
+/// a recur site, and stays silent where the CFS cannot resolve them.
+fn assert_seed_present_for_mid_loop_open(
+    cfs_cursor: &CfsCursor,
+    step_record: &StepRecord,
+    seed: Option<&RecurProgressStack>,
+) {
+    if let Some(seed) = seed {
+        if !seed.is_empty() {
+            return;
+        }
+    }
+
+    let coordinates = step_record.coordinates();
+    // A *strict* prefix naming a recur site means this step executes inside
+    // one. The full coordinate is excluded on purpose: a window opening on the
+    // site's own `Start` opens before the frame is pushed, so the empty stack
+    // is the true state there.
+    let opens_inside_recur_site = (1..coordinates.len()).any(|depth| {
+        matches!(
+            cfs_cursor.try_get_item(&CfsCoordinates(coordinates[..depth].to_vec())),
+            Some(SequenceChildItem::RecurTile(_)) | Some(SequenceChildItem::RecurSequence(_))
+        )
+    });
+
+    assert!(
+        !opens_inside_recur_site,
+        "Window opens at {:?}, which executes inside a live recur site, but no \
+         recur-progress seed was supplied. The host must reconstruct it from the \
+         trace prefix (`TraceRecorder::recur_progress_after`); an empty stack here \
+         is the positive claim \"no loop in flight\", which these coordinates \
+         contradict.",
+        coordinates
+    );
 }
 
 impl FraudProofWindowContext {
@@ -141,10 +196,11 @@ impl FraudProofWindowContext {
             TransitionState::Init(init_transition) => {
                 let (commitment_header, slice_witness) = commitment_binding
                     .expect("Init step requires the trace-commitment header and slice witness");
-                let window_is_terminal = assert_window_is_commitment_slice(
+                let window_binding = assert_window_is_commitment_slice(
                     &init_transition,
                     &commitment_header,
                     &slice_witness,
+                    input.revealed_tail_roots.as_ref(),
                 );
                 let refuted_trace_commitment = commitment_header.digest();
                 let entrypoint_authorization = checks::entrypoint::verify_genesis_authorization(
@@ -170,12 +226,17 @@ impl FraudProofWindowContext {
                     output_authorization,
                 )
                 .seed_recur_progress(input.window_start_recur_progress.as_ref());
+                assert_seed_present_for_mid_loop_open(
+                    &params.cfs_cursor,
+                    &input.step_record,
+                    input.window_start_recur_progress.as_ref(),
+                );
                 (
                     Self {
                         init_state: init_transition,
-                        position: StepPosition::First,
                         refuted_trace_commitment,
-                        window_is_terminal,
+                        window_is_terminal: window_binding.window_is_terminal,
+                        final_committed_root: window_binding.final_committed_root,
                     },
                     live,
                 )
@@ -195,9 +256,9 @@ impl FraudProofWindowContext {
                 (
                     Self {
                         init_state: prev_journal.init_state,
-                        position: StepPosition::Subsequent,
                         refuted_trace_commitment: prev_journal.refuted_trace_commitment,
                         window_is_terminal: prev_journal.window_is_terminal,
+                        final_committed_root: prev_journal.final_committed_root,
                     },
                     live,
                 )
@@ -227,11 +288,65 @@ impl FraudProofWindowContext {
 /// the one place holding `s`, `w` and `header.fingerprint_len` at once; the
 /// header is dropped when `proceed` returns, and `apply_verified_step` never
 /// sees it. See `TransitionJournal::window_is_terminal`.
+/// Hold a window that opens at trace index 0 to the genesis state.
+///
+/// Every other window carries a *margin*: the steps before the divergence must
+/// reproduce the committed fingerprint, and that is the only thing tying the
+/// challenger-supplied opening state to reality. A window opening at index 0
+/// cannot have one — there are no steps before it — which is why the head of a
+/// trace looked unprovable.
+///
+/// It does not need one. At index 0 the opening state is not the challenger's
+/// to choose: the trace tree holds only the seed, which is the same public
+/// constant for every program (`EMPTY_TRIE_NODES[0]` host-side, `EMPTY_LEAF`
+/// here), storage is empty, and no draft or loop is in flight. Asserting that
+/// removes the need for the margin rather than excusing its absence.
+///
+/// What the seed does *not* say is which program ran with which inputs — the
+/// seed is program-independent. That comes from the window's first step being
+/// `ProgramStart`, whose `output_commitment` must equal the combined root over
+/// the authorization journal's entry-argument commitments
+/// (`checks::entrypoint::verify_step`), and whose structural fields are pinned
+/// by `verify_exec_index` and `verify_sequence_id`. Together those make the
+/// record unique, which is what a one-item window needs.
+fn assert_opens_at_genesis(init_transition: &InitTransition) {
+    let frontier = &init_transition.init_frontier;
+    assert!(
+        frontier.position == 0 && frontier.leaf == EMPTY_LEAF && frontier.ommers.is_empty(),
+        "A window opening at trace index 0 must open on the seed leaf alone",
+    );
+
+    let storage = &init_transition.init_storage_frontier;
+    assert!(
+        storage.position == 0 && storage.leaf == EMPTY_LEAF && storage.ommers.is_empty(),
+        "A window opening at trace index 0 must open on empty storage",
+    );
+    assert!(
+        init_transition.init_storage_index_root == coordinate_index_root(&BTreeMap::new()),
+        "A window opening at trace index 0 must open on an empty coordinate index",
+    );
+    assert!(
+        init_transition.active_drafts.is_empty(),
+        "A window opening at trace index 0 cannot have a draft in flight",
+    );
+}
+
+pub(crate) struct WindowBinding {
+    /// Whether this window ends exactly where the commitment's fingerprint
+    /// ends. See `TransitionJournal::window_is_terminal`.
+    pub window_is_terminal: bool,
+    /// The committed trace root for this window's final index, when that index
+    /// falls inside the revealed tail. See
+    /// `TransitionJournal::final_committed_root`.
+    pub final_committed_root: Option<Vec<u8>>,
+}
+
 pub(crate) fn assert_window_is_commitment_slice(
     init_transition: &InitTransition,
     header: &TraceCommitmentHeader,
     slice_witness: &FingerprintSliceWitness,
-) -> bool {
+    revealed_tail_roots: Option<&Vec<Vec<u8>>>,
+) -> WindowBinding {
     let window_fingerprint = &init_transition.fingerprint;
     assert!(
         window_fingerprint.bits_packer == header.bits_packer,
@@ -241,8 +356,44 @@ pub(crate) fn assert_window_is_commitment_slice(
     let window_len = window_fingerprint.len();
     assert!(window_len > 0, "Window fingerprint is empty");
 
+    // The window's *shape*, which nothing constrained before the header carried
+    // `window_size`. `window_len` comes from the challenger's `Fingerprint::len`
+    // — a metadata field `Fingerprint::from` stores verbatim without checking it
+    // against `bits` — and `window_start` from the challenger's frontier
+    // position, leaving only the upper bound below to hold them.
+    //
+    // A short window is the degenerate case rather than a merely unusual one:
+    // counting what `finalize` compares over `L` items, item 0 is `First` and
+    // never compared, items `1..L-2` must match, and item `L-1` must diverge.
+    // At `L = 2` that is *zero* matching comparisons, so nothing ties the
+    // challenger's opening state to reality and a window fabricated anywhere in
+    // the trace reaches `Finished`.
+    let declared_window_size =
+        usize::try_from(header.window_size).expect("Window size overflows usize");
+
     let window_start = usize::try_from(init_transition.init_frontier.position)
         .expect("Window start position overflows usize");
+
+    if window_len != declared_window_size {
+        // A short window is legal in exactly one place, and it is not a
+        // concession: a divergence inside the trace's first `window_size` steps
+        // has no room for a full window behind it, and the rolling buffer
+        // correctly yields `min(i + 1, w)` items starting at 0. So the honest
+        // host can produce a short window *only* at trace index 0.
+        assert!(
+            window_start == 0 && window_len < declared_window_size,
+            "Window declares {} items against a commitment built with a window of {}, and \
+             only a window opening at trace index 0 may be short",
+            window_len,
+            declared_window_size,
+        );
+        // And there it needs no pre-divergence margin. The margin exists to
+        // pin a *challenger-supplied* opening state to reality by replaying
+        // forward from it; at index 0 the opening state is not supplied at all,
+        // it is the public genesis constant. Assert that directly and the
+        // missing margin stops mattering rather than being tolerated.
+        assert_opens_at_genesis(init_transition);
+    }
     let fingerprint_len =
         usize::try_from(header.fingerprint_len).expect("Fingerprint length overflows usize");
     assert!(
@@ -297,8 +448,36 @@ pub(crate) fn assert_window_is_commitment_slice(
         );
     }
 
-    // `<=` was asserted above; equality is the terminal case.
-    window_start + window_len == fingerprint_len
+    // The revealed tail, if the host supplied it. Binding is unconditional
+    // once supplied; whether it is *useful* depends on where this window ends.
+    let final_committed_root = revealed_tail_roots.and_then(|roots| {
+        let roots_bytes =
+            postcard::to_allocvec(roots).expect("revealed tail roots are serializable");
+        assert!(
+            sha256_bytes(&roots_bytes) == header.revealed_tail_roots_commitment,
+            "Revealed tail roots do not match the commitment's tail-roots commitment",
+        );
+        assert!(
+            roots.len() == declared_window_size,
+            "Commitment reveals {} tail roots but declares a window of {}",
+            roots.len(),
+            declared_window_size,
+        );
+
+        // The tail covers the fingerprint's final `window_size` indices.
+        let tail_start = fingerprint_len - roots.len();
+        let final_index = window_start + window_len - 1;
+        final_index
+            .checked_sub(tail_start)
+            .and_then(|offset| roots.get(offset))
+            .cloned()
+    });
+
+    WindowBinding {
+        // `<=` was asserted above; equality is the terminal case.
+        window_is_terminal: window_start + window_len == fingerprint_len,
+        final_committed_root,
+    }
 }
 
 /// Recursively verify the previous transition receipt for this same guest.
@@ -469,6 +648,19 @@ impl LiveTransition {
         cfs_cursor: &CfsCursor,
         input: &TransitionInput,
     ) -> Self {
+        // Before `append_to_trace` advances it, the frontier's position is this
+        // step's trace index — which is what fixes its `exec_index`.
+        checks::cfs::verify_exec_index(self.frontier.position().into(), &input.step_record);
+        checks::cfs::verify_sequence_id(cfs_cursor, &input.step_record);
+        // The same pre-append frontier: its root is the root of the trace
+        // prefix the parent record must be provably in.
+        checks::cfs::verify_sequence_scope_parent(
+            cfs_cursor,
+            &input.step_record,
+            input.sequence_scope_witness.as_ref(),
+            &input.input_sources_witnesses,
+            &frontier_root(&self.frontier),
+        );
         checks::cfs::verify_step_record_inputs(
             cfs_cursor,
             &input.step_record,
@@ -482,6 +674,7 @@ impl LiveTransition {
             &input.step_record,
             input.replay_journal.as_ref(),
             input.input_source_witness.as_ref(),
+            input.output_witness.as_ref(),
             &input.storage_selection_witnesses,
         );
         if let StepKind::ProgramStart(program_start) = &input.step_record.kind {
@@ -572,27 +765,43 @@ impl LiveTransition {
     pub fn finalize(
         self,
         committed_fingerprint: &Fingerprint,
-        position: &StepPosition,
+        final_committed_root: Option<&Vec<u8>>,
     ) -> TransitionState {
-        match position {
-            StepPosition::First => TransitionState::Next(self.into_transition()),
-            StepPosition::Subsequent => {
-                let actual_fingerprint: Fingerprint =
-                    self.fingerprint_acc.clone().into_fingerprint();
-                let last_index = actual_fingerprint.len() - 1;
-                let diverges = actual_fingerprint.diff_at_index(last_index, committed_fingerprint);
+        let actual_fingerprint: Fingerprint = self.fingerprint_acc.clone().into_fingerprint();
+        let last_index = actual_fingerprint.len() - 1;
+        let diverges = actual_fingerprint.diff_at_index(last_index, committed_fingerprint);
 
-                if actual_fingerprint.len() == committed_fingerprint.len() {
-                    assert!(diverges);
-                    TransitionState::Finished
-                } else {
-                    assert!(!diverges);
-                    let mut transition = self.into_transition();
-                    transition.actual_fingerprint_acc =
-                        FingerprintAccumulator::from(actual_fingerprint);
-                    TransitionState::Next(transition)
-                }
-            }
+        // The window's own length says whether this is the last item: the
+        // accumulator has one entry per step applied so far.
+        if actual_fingerprint.len() == committed_fingerprint.len() {
+            // The fingerprint keeps only `bits_per_item` bits of each trace
+            // root, so a divergence it cannot see is a divergence that cannot
+            // be proven this way. Inside the revealed tail the full root is
+            // available and settles the question exactly: at
+            // `window_size >= 128` — one bit per item — the packed entry agrees
+            // with an honest run half the time even when the roots differ.
+            //
+            // The root is only ever an *additional* route to the same
+            // conclusion. Root equality implies entry equality, so a window
+            // that diverges on bits diverges on roots too; this widens what is
+            // provable, never what is accepted as a match.
+            let diverges_by_root = final_committed_root
+                .is_some_and(|committed_root| frontier_root(&self.frontier) != *committed_root);
+            assert!(
+                diverges || diverges_by_root,
+                "A fraud proof's final step must diverge from the commitment, by fingerprint \
+                 entry or by revealed trace root",
+            );
+            TransitionState::Finished
+        } else {
+            assert!(
+                !diverges,
+                "Every window item before the last must match the commitment; a divergence \
+                 here is not the one this window claims to prove",
+            );
+            let mut transition = self.into_transition();
+            transition.actual_fingerprint_acc = FingerprintAccumulator::from(actual_fingerprint);
+            TransitionState::Next(transition)
         }
     }
 
@@ -622,6 +831,7 @@ pub fn commit_journal(
     program_commitment: Vec<u8>,
     refuted_trace_commitment: Vec<u8>,
     window_is_terminal: bool,
+    final_committed_root: Option<Vec<u8>>,
     input: &TransitionInput,
     entrypoint_authorization: EntrypointAuthorization,
     output_authorization: OutputAuthorization,
@@ -640,6 +850,7 @@ pub fn commit_journal(
         entrypoint_authorization,
         output_authorization,
         window_is_terminal,
+        final_committed_root,
     };
 
     env::commit(&journal);

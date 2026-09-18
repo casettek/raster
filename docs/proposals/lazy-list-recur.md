@@ -1023,6 +1023,13 @@ engineering is essentially complete; the evidence the proposal asks for is not.
 
 ### Missing check
 
+Tracked as of 2026-09-16 by
+[`selection-unbound-from-execution`](../issues/selection-unbound-from-execution.md), **top
+priority**, which pairs rule 8 with `paged-bytes` §3.3 and the claim table's last row below —
+they are one joint, and neither half closes it alone. That issue owns the problem statement; the
+entry here stays as the record of what this proposal's own §Verification found missing. S2, in
+the second bullet, is deliberately *not* in it.
+
 - **Rule 8 is not implemented.** There is no `ListRange` reference anywhere in
   `guests/transition/src/checks/`. Rules 1–7 are enforced through
   `raster-core/src/recur_progress.rs` (`advance_tile_iteration` covers 1–4 and 6, `close_site`
@@ -1065,7 +1072,9 @@ engineering is essentially complete; the evidence the proposal asks for is not.
 
 The last row of §"What this proposal proves, and what it does not" — *each tile consumed the value
 at the index it claims* — remains **not proved**. The storage-selection-to-replay binding
-(`paged-bytes` §3.3) was never in scope here and is owned by no proposal.
+(`paged-bytes` §3.3) was never in scope here and is owned by no proposal. As of 2026-09-16 it has
+an issue rather than an owner:
+[`selection-unbound-from-execution`](../issues/selection-unbound-from-execution.md).
 
 Separately, `window-seed-reconstruction.md` records a completeness gap inherited from the
 companion: a fraud-proof window opening *inside* a live loop is rejected, because its

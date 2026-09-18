@@ -298,14 +298,14 @@ impl ReferencedObject {
                     )));
                 }
                 let proven = prove_selection(&schema(), &tree, &remaining.segments)?;
-                SelectionWitness {
-                    bytes: proven.selected_bytes.clone(),
-                    proof: SelectionProof {
+                SelectionWitness::from_payload(
+                    proven.selected_bytes.clone(),
+                    SelectionProof {
                         path: remaining.clone(),
                         root_hash: proven.root_hash,
                         steps: proven.steps.clone(),
                     },
-                }
+                )
             }
             _ => {
                 return Err(Error::Other(format!(
@@ -321,9 +321,9 @@ impl ReferencedObject {
         // with its siblings into the combined root) must be the *first*
         // element, not appended after the source's own (more inner) steps.
         steps.insert(0, self.struct_step(&source.name)?);
-        Ok(SelectionWitness {
-            bytes: inner.bytes,
-            proof: SelectionProof {
+        Ok(SelectionWitness::from_payload(
+            inner.bytes,
+            SelectionProof {
                 path: full_selector_path(&source.name, &remaining),
                 root_hash: self
                     .combined_root()
@@ -331,7 +331,7 @@ impl ReferencedObject {
                     .map_err(|_| Error::Other("Combined root is not 32 bytes".into()))?,
                 steps,
             },
-        })
+        ))
     }
 
     /// A recur source's `(len, elements_root)` from an external input, without
@@ -354,7 +354,7 @@ impl ReferencedObject {
             (&source.kind, &resolved)
         else {
             return Err(Error::Other(format!(
-                "call_recur! requires a raster-indexed List source; \
+                "a recur source must be a raster-indexed List (call_recur! or call_recur_seq!); \
                  re-encode this input with encoding = \"raster\" (input '{}')",
                 source.name
             )));

@@ -369,7 +369,13 @@ Two valid return forms:
   ```
 
 - `RecurControl<(RecurState<S>, RecurOutput<O>)>` — when the loop must be able
-  to stop early. This is the ONLY early-exit mechanism in the model:
+  to stop early. `RecurControl` is the only early-exit mechanism in the model,
+  and it wraps **any** of the three recur-tile return shapes:
+  `RecurControl<RecurOutput<S>>`, `RecurControl<RecurState<S>>` and
+  `RecurControl<(RecurState<S>, RecurOutput<O>)>` are all accepted
+  (`raster-macros/src/recur.rs`). A recur *sequence* cannot return it — early
+  termination is decided inside recur tiles. The state+output form below is one
+  instance, not the only one:
 
 ```rust
 #[tile(kind = recur)]

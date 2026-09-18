@@ -267,6 +267,7 @@ mod tests {
                 call_kind: CallKind::Tile,
                 chunk: None,
                 leaves_output_open: false,
+                state_is_output: false,
             }],
         );
         let sequence = Sequence {
@@ -378,6 +379,7 @@ mod tests {
                 call_kind: CallKind::Tile,
                 chunk: None,
                 leaves_output_open: false,
+                state_is_output: false,
             }],
         );
         let sequence = Sequence {

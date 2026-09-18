@@ -35,8 +35,9 @@ use core::fmt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::cfs::CfsCoordinates;
+use crate::cfs::{CfsCoordinate, CfsCoordinates};
 use crate::draft::RecurControlKind;
+use crate::draft::RecurStateTransition;
 use crate::input::Hash32;
 
 /// Which rule set a site's iterations are held to.
@@ -66,6 +67,8 @@ pub enum RecurSiteKind {
 /// | `source_len` | switching `L` mid-loop | the site `Start` event's metadata selection |
 /// | `next_iteration_index` | rules 1 and 2 — first index is 0, indices are contiguous | `RecurExecutionState` |
 /// | `last_control` | rule 6 — a `Break` is invisible to the iteration after it | the control bit on the iteration event |
+/// | `state_commitment` | substituting the carried state between iterations | the state transition on the iteration event |
+/// | `state_is_output` | dropping the *final* iteration's state, which has no successor to pin it | CFS literal |
 ///
 /// **There is deliberately no `consumed_total`.** Rule 4 *defines* it —
 /// `consumed_elements == min(C, L − covered_before)` — so once that rule is
@@ -92,9 +95,63 @@ pub struct RecurProgressFrame {
     pub source_len: u64,
     pub next_iteration_index: u64,
     pub last_control: RecurControlKind,
+    /// Commitment of the carried state as it stood after the last iteration —
+    /// `None` before iteration 0, and for a site that carries no state.
+    ///
+    /// Recording only the *after* value is what lets one field chain a whole
+    /// sweep and still seed a window: the seed is validated by reproducing the
+    /// window's own first step's commitment, not by matching a predecessor
+    /// record the window does not contain.
+    #[serde(default)]
+    pub state_commitment: Option<Hash32>,
+    /// Whether this site's own output is its carried state, from the CFS.
+    ///
+    /// Every carried state but the last is pinned by the next iteration's
+    /// bound `state_in`. The last one has no successor, so [`Self::close_site`]
+    /// compares it against what the site actually returned — which is only a
+    /// meaningful comparison for this shape.
+    #[serde(default)]
+    pub state_is_output: bool,
 }
 
 impl RecurProgressFrame {
+    /// Chain one iteration's carried-state transition onto the frame.
+    ///
+    /// Iteration 0 *adopts*; every later iteration must *match*. There is no
+    /// `if let Some` here on purpose — a live chain whose next iteration omits
+    /// its transition is a violation, not a skip.
+    ///
+    /// `is_first` is passed rather than inferred from `next_iteration_index`,
+    /// because the two kinds fold at different moments: a tile folds before its
+    /// counter moves, a sequence after. Inferring it made a stateless site's
+    /// second iteration look like a first one, which is exactly the case that
+    /// must be rejected.
+    fn fold_carried_state(
+        &mut self,
+        state: Option<&RecurStateTransition>,
+        is_first: bool,
+    ) -> Result<(), RecurProgressViolation> {
+        match (self.state_commitment, state) {
+            (None, Some(_)) if !is_first => Err(RecurProgressViolation::CarriedStateUnexpected),
+            (None, None) => Ok(()),
+            (None, Some(transition)) => {
+                self.state_commitment = Some(transition.state_out);
+                Ok(())
+            }
+            (Some(_), None) => Err(RecurProgressViolation::CarriedStateOmitted),
+            (Some(expected), Some(transition)) => {
+                if transition.state_in != expected {
+                    return Err(RecurProgressViolation::CarriedStateMismatch {
+                        expected,
+                        actual: transition.state_in,
+                    });
+                }
+                self.state_commitment = Some(transition.state_out);
+                Ok(())
+            }
+        }
+    }
+
     /// Elements covered so far, derived rather than carried.
     ///
     /// Exact while rule 4 holds, which `advance_tile_iteration` enforces on
@@ -143,12 +200,48 @@ pub enum RecurProgressViolation {
     SequenceIterationCountMismatch { expected: u64, actual: u64 },
     /// A site closed that is not the innermost live one.
     SiteNotInnermost,
+    /// A live carried-state chain's next iteration supplied no transition.
+    /// Deliberately an error rather than a skip: absence is the cheapest attack
+    /// on a continuity check, which is what `checks/drafts.rs`'s permissive
+    /// `if let Some(..)` still allows for drafts.
+    CarriedStateOmitted,
+    /// A transition arrived for a site whose chain never started.
+    CarriedStateUnexpected,
+    /// Iteration *N*'s incoming state is not iteration *N−1*'s outgoing state.
+    CarriedStateMismatch { expected: Hash32, actual: Hash32 },
+    /// A site returning its carried state closed with no recorded output to
+    /// hold the chain's last value against.
+    TerminalStateUnwitnessed,
+    /// The value a site returned is not the carried state its sweep produced.
+    TerminalStateMismatch { expected: Hash32, actual: Hash32 },
 }
 
 impl fmt::Display for RecurProgressViolation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NoActiveSite => write!(f, "recur iteration has no active recur site"),
+            Self::CarriedStateOmitted => write!(
+                f,
+                "recur iteration omitted the carried-state transition its site is chaining"
+            ),
+            Self::CarriedStateUnexpected => write!(
+                f,
+                "recur iteration supplied a carried-state transition for a site that carries none"
+            ),
+            Self::CarriedStateMismatch { expected, actual } => write!(
+                f,
+                "recur carried state does not continue the previous iteration: expected {:?}, got {:?}",
+                expected, actual
+            ),
+            Self::TerminalStateUnwitnessed => write!(
+                f,
+                "recur site returns its carried state but recorded no output to hold it against"
+            ),
+            Self::TerminalStateMismatch { expected, actual } => write!(
+                f,
+                "recur site output is not the carried state its sweep produced: expected {:?}, got {:?}",
+                expected, actual
+            ),
             Self::SiteMismatch => write!(
                 f,
                 "recur progress frame site is not a prefix of the step coordinates"
@@ -231,6 +324,8 @@ impl RecurProgressStack {
         hasher.finalize().into()
     }
 
+
+
     /// Open a site. `source_len` comes from the authenticated `0x0A` metadata
     /// at the site step — **not** from the first item's proof.
     ///
@@ -244,6 +339,7 @@ impl RecurProgressStack {
         kind: RecurSiteKind,
         chunk: u64,
         source_len: u64,
+        state_is_output: bool,
     ) {
         self.0.push(RecurProgressFrame {
             site,
@@ -254,6 +350,16 @@ impl RecurProgressStack {
             // A site that has run no iterations has not broken out of
             // anything; the first iteration is always legal.
             last_control: RecurControlKind::Continue,
+            // Adopted from iteration 0's own transition rather than read off
+            // the site's recorded seed. `InputSource::Inline` is a unit variant
+            // — the CFS holds no literal bytes — so a recorded seed is a
+            // prover-chosen value compared against a prover-chosen value. What
+            // this chain guarantees is that the fold is consistent with the
+            // seed the prover recorded, not with the seed the program wrote;
+            // pinning the latter needs `InlineLiteral { commitment }` and is
+            // deliberately out of scope. See `loop-carried-state.md` §4.
+            state_commitment: None,
+            state_is_output,
         });
     }
 
@@ -269,6 +375,7 @@ impl RecurProgressStack {
         declared_iterations: u64,
         consumed_elements: u64,
         control: RecurControlKind,
+        state: Option<&RecurStateTransition>,
     ) -> Result<(), RecurProgressViolation> {
         let frame = self.0.last_mut().ok_or(RecurProgressViolation::NoActiveSite)?;
         if !coordinates_have_prefix(coordinates, &frame.site) {
@@ -324,6 +431,7 @@ impl RecurProgressStack {
             });
         }
 
+        frame.fold_carried_state(state, frame.next_iteration_index == 0)?;
         frame.next_iteration_index += 1;
         frame.last_control = control;
         Ok(())
@@ -351,6 +459,49 @@ impl RecurProgressStack {
         }
         frame.next_iteration_index += 1;
         Ok(())
+    }
+
+    /// Chain a **sequence** iteration's carried state, at its `End`.
+    ///
+    /// Split from [`Self::advance_sequence_iteration`] because the two facts
+    /// arrive at different events: the iteration is counted when it opens, but
+    /// what it *produced* is only known when it closes. A recur tile has both at
+    /// once and folds them together.
+    /// `output` is the iteration's own recorded output. When the site returns
+    /// its carried state, that output *is* the state the iteration produced, in
+    /// the same postcard encoding — so this is where `state_out` gets pinned.
+    ///
+    /// It has to happen here rather than at the site's close. A site's recorded
+    /// output is the *raster-encoded* stored object, not postcard bytes, so
+    /// comparing the chain against it would be comparing two encodings. The
+    /// iteration's output is the one place the two forms coincide.
+    ///
+    /// This closes the chain's last open end: every other `state_out` is pinned
+    /// by the next iteration's bound `state_in`, and the final one is pinned
+    /// here, by the bytes the iteration actually emitted.
+    pub fn fold_sequence_iteration_state(
+        &mut self,
+        coordinates: &CfsCoordinates,
+        state: Option<&RecurStateTransition>,
+        output: Option<&[u8]>,
+    ) -> Result<(), RecurProgressViolation> {
+        let frame = self.0.last_mut().ok_or(RecurProgressViolation::NoActiveSite)?;
+        if !coordinates_have_prefix(coordinates, &frame.site) {
+            return Err(RecurProgressViolation::SiteMismatch);
+        }
+        if frame.state_is_output {
+            if let Some(transition) = state {
+                let bytes = output.ok_or(RecurProgressViolation::TerminalStateUnwitnessed)?;
+                let actual = state_commitment(bytes);
+                if actual != transition.state_out {
+                    return Err(RecurProgressViolation::TerminalStateMismatch {
+                        expected: transition.state_out,
+                        actual,
+                    });
+                }
+            }
+        }
+        frame.fold_carried_state(state, frame.next_iteration_index == 1)
     }
 
     /// Close the innermost site, applying the terminal rules.
@@ -414,6 +565,7 @@ impl RecurProgressStack {
                 // also excusing a truncated sweep.
             }
         }
+
         Ok(frame)
     }
 }
@@ -427,6 +579,22 @@ fn coordinates_have_prefix(coordinates: &CfsCoordinates, prefix: &CfsCoordinates
             .all(|(left, right)| left == right)
 }
 
+/// `H(b"recur-carried-state" ‖ bytes)` — the commitment over one carried-state
+/// value's serialized form.
+///
+/// **One implementation, three callers**: the tile wrapper (which stamps the
+/// pair into the replay journal and the host record), the recorder (which folds
+/// the host copy) and the guest (which folds the replay-proven copy). A second
+/// copy of this hash would be a divergence no test of either side alone could
+/// catch — the same reason `chunking` lives in `raster-core` rather than being
+/// written twice.
+pub fn state_commitment(bytes: &[u8]) -> Hash32 {
+    let mut hasher = Sha256::new();
+    hasher.update(b"recur-carried-state");
+    hasher.update(bytes);
+    hasher.finalize().into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -437,12 +605,12 @@ mod tests {
     }
 
     fn iteration(index: u64) -> CfsCoordinates {
-        CfsCoordinates(vec![2, index as u32])
+        CfsCoordinates(vec![2, index as CfsCoordinate])
     }
 
     fn tile_stack(source_len: u64, chunk: u64) -> RecurProgressStack {
         let mut stack = RecurProgressStack::new();
-        stack.push_site(site(), RecurSiteKind::Tile, chunk, source_len);
+        stack.push_site(site(), RecurSiteKind::Tile, chunk, source_len, false);
         stack
     }
 
@@ -459,7 +627,7 @@ mod tests {
             } else {
                 RecurControlKind::Continue
             };
-            stack.advance_tile_iteration(&iteration(index), index, source_len, 1, control)?;
+            stack.advance_tile_iteration(&iteration(index), index, source_len, 1, control, None)?;
         }
         stack.close_site(&site())
     }
@@ -467,6 +635,91 @@ mod tests {
     #[test]
     fn a_complete_unchunked_sweep_is_accepted() {
         assert!(sweep_unchunked(3, 3, RecurControlKind::Continue).is_ok());
+    }
+
+    /// PROOF OF CONCEPT — soundness. See
+    /// `docs/issues/selection-unbound-from-execution.md` §3.
+    ///
+    /// The completeness rules decide whether a recur sweep covered its source.
+    /// They are handed the journal's self-reported numbers and nothing else:
+    /// [`RecurProgressStack::advance_tile_iteration`] takes an iteration index,
+    /// a declared iteration count, a consumed-element count and a control
+    /// flag — **no range, no selection, no bytes**. The selection proof that
+    /// says *where in the source this iteration actually read* is verified
+    /// separately, in `checks::store`, and the two are never joined.
+    ///
+    /// So a sweep that reads the first chunk five times presents the rules with
+    /// exactly the facts a complete sweep presents. This builds the issue's
+    /// worked example — `L = 10`, `chunk = 2` — and shows the rules close it
+    /// clean.
+    ///
+    /// Invert when rule 8 lands: the cross-check must reject a sweep whose
+    /// ranges do not tile `[0, L)`.
+    #[test]
+    fn poc_a_sweep_that_rereads_the_first_chunk_passes_every_completeness_rule() {
+        const SOURCE_LEN: u64 = 10;
+        const CHUNK: u64 = 2;
+        let declared_iterations = SOURCE_LEN.div_ceil(CHUNK); // 5
+
+        // What each iteration *claims* to have consumed. Identical for the
+        // honest sweep and the fabricated one, because `consumed_elements` says
+        // how much, never from where.
+        let mut stack = tile_stack(SOURCE_LEN, CHUNK);
+        for index in 0..declared_iterations {
+            stack
+                .advance_tile_iteration(
+                    &iteration(index),
+                    index,
+                    declared_iterations,
+                    CHUNK,
+                    RecurControlKind::Continue,
+                    None,
+                )
+                .expect("rule 4 accepts a full chunk while elements remain");
+        }
+
+        // Rules 5-7: the sweep is complete and closes clean.
+        let frame = stack.close_site(&site()).expect("a complete sweep closes");
+        assert_eq!(frame.consumed_total(), SOURCE_LEN);
+        assert_eq!(frame.next_iteration_index, declared_iterations);
+
+        // And here is the hole, stated as an equality rather than a story.
+        //
+        // The honest sweep reads [0,2) [2,4) [4,6) [6,8) [8,10); the fabricated
+        // one reads [0,2) five times. Those are different executions over a
+        // different number of the source's elements — but the facts the rules
+        // receive are byte-identical, because the range is not among them.
+        let honest_ranges: Vec<(u64, u64)> =
+            (0..declared_iterations).map(|i| (i * CHUNK, i * CHUNK + CHUNK)).collect();
+        let fabricated_ranges: Vec<(u64, u64)> =
+            (0..declared_iterations).map(|_| (0, CHUNK)).collect();
+        assert_ne!(
+            honest_ranges, fabricated_ranges,
+            "the two sweeps must really differ, or this proves nothing",
+        );
+
+        let rule_inputs = |_ranges: &[(u64, u64)]| -> Vec<(u64, u64, u64)> {
+            // Everything `advance_tile_iteration` is told, per iteration. The
+            // range argument is deliberately unused: there is nowhere to put it.
+            (0..declared_iterations)
+                .map(|index| (index, declared_iterations, CHUNK))
+                .collect()
+        };
+        assert_eq!(
+            rule_inputs(&honest_ranges),
+            rule_inputs(&fabricated_ranges),
+            "no completeness rule can distinguish the two sweeps",
+        );
+    }
+
+    /// The same blindness from the other side: an *element* sweep that rereads
+    /// element 0 every iteration also closes clean.
+    ///
+    /// Included because chunking is not the cause — `consumed_elements` carries
+    /// no position at any chunk size, so `chunk = 1` is exposed identically.
+    #[test]
+    fn poc_an_element_sweep_that_rereads_one_element_passes_every_completeness_rule() {
+        assert!(sweep_unchunked(4, 4, RecurControlKind::Continue).is_ok());
     }
 
     #[test]
@@ -509,10 +762,10 @@ mod tests {
     fn an_iteration_after_a_break_is_rejected() {
         let mut stack = tile_stack(5, 1);
         stack
-            .advance_tile_iteration(&iteration(0), 0, 5, 1, RecurControlKind::Break)
+            .advance_tile_iteration(&iteration(0), 0, 5, 1, RecurControlKind::Break, None)
             .unwrap();
         assert_eq!(
-            stack.advance_tile_iteration(&iteration(1), 1, 5, 1, RecurControlKind::Continue),
+            stack.advance_tile_iteration(&iteration(1), 1, 5, 1, RecurControlKind::Continue, None),
             Err(RecurProgressViolation::IterationAfterBreak),
         );
     }
@@ -521,7 +774,7 @@ mod tests {
     fn a_non_zero_first_index_is_rejected() {
         let mut stack = tile_stack(5, 1);
         assert_eq!(
-            stack.advance_tile_iteration(&iteration(1), 1, 5, 1, RecurControlKind::Continue),
+            stack.advance_tile_iteration(&iteration(1), 1, 5, 1, RecurControlKind::Continue, None),
             Err(RecurProgressViolation::NonContiguousIteration {
                 expected: 0,
                 actual: 1,
@@ -533,10 +786,10 @@ mod tests {
     fn a_gap_in_iteration_indices_is_rejected() {
         let mut stack = tile_stack(5, 1);
         stack
-            .advance_tile_iteration(&iteration(0), 0, 5, 1, RecurControlKind::Continue)
+            .advance_tile_iteration(&iteration(0), 0, 5, 1, RecurControlKind::Continue, None)
             .unwrap();
         assert_eq!(
-            stack.advance_tile_iteration(&iteration(2), 2, 5, 1, RecurControlKind::Continue),
+            stack.advance_tile_iteration(&iteration(2), 2, 5, 1, RecurControlKind::Continue, None),
             Err(RecurProgressViolation::NonContiguousIteration {
                 expected: 1,
                 actual: 2,
@@ -549,7 +802,7 @@ mod tests {
     fn a_declared_iteration_count_that_disagrees_with_the_source_is_rejected() {
         let mut stack = tile_stack(10, 4);
         assert_eq!(
-            stack.advance_tile_iteration(&iteration(0), 0, 2, 4, RecurControlKind::Continue),
+            stack.advance_tile_iteration(&iteration(0), 0, 2, 4, RecurControlKind::Continue, None),
             Err(RecurProgressViolation::DeclaredIterationsMismatch {
                 expected: 3,
                 actual: 2,
@@ -570,6 +823,7 @@ mod tests {
                     3,
                     consumed,
                     RecurControlKind::Continue,
+                    None,
                 )
                 .unwrap_or_else(|e| panic!("iteration {} should be accepted: {}", index, e));
         }
@@ -582,10 +836,10 @@ mod tests {
     fn a_short_non_final_chunk_is_rejected_where_it_happens() {
         let mut stack = tile_stack(10, 4);
         stack
-            .advance_tile_iteration(&iteration(0), 0, 3, 4, RecurControlKind::Continue)
+            .advance_tile_iteration(&iteration(0), 0, 3, 4, RecurControlKind::Continue, None)
             .unwrap();
         assert_eq!(
-            stack.advance_tile_iteration(&iteration(1), 1, 3, 1, RecurControlKind::Continue),
+            stack.advance_tile_iteration(&iteration(1), 1, 3, 1, RecurControlKind::Continue, None),
             Err(RecurProgressViolation::UnexpectedConsumption {
                 expected: 4,
                 actual: 1,
@@ -602,7 +856,7 @@ mod tests {
     fn an_undersized_terminating_chunk_is_rejected() {
         let mut stack = tile_stack(100, 4);
         assert_eq!(
-            stack.advance_tile_iteration(&iteration(0), 0, 25, 1, RecurControlKind::Break),
+            stack.advance_tile_iteration(&iteration(0), 0, 25, 1, RecurControlKind::Break, None),
             Err(RecurProgressViolation::UnexpectedConsumption {
                 expected: 4,
                 actual: 1,
@@ -617,7 +871,7 @@ mod tests {
     fn a_full_chunk_break_mid_source_is_accepted() {
         let mut stack = tile_stack(100, 4);
         stack
-            .advance_tile_iteration(&iteration(0), 0, 25, 4, RecurControlKind::Break)
+            .advance_tile_iteration(&iteration(0), 0, 25, 4, RecurControlKind::Break, None)
             .unwrap();
         let frame = stack.close_site(&site()).expect("Break may stop early");
         assert_eq!(frame.consumed_total(), 4);
@@ -626,7 +880,7 @@ mod tests {
     #[test]
     fn a_recur_sequence_must_run_exactly_the_source_length() {
         let mut stack = RecurProgressStack::new();
-        stack.push_site(site(), RecurSiteKind::Sequence, 1, 3);
+        stack.push_site(site(), RecurSiteKind::Sequence, 1, 3, false);
         for index in 0..3 {
             stack
                 .advance_sequence_iteration(&iteration(index), index)
@@ -638,7 +892,7 @@ mod tests {
     #[test]
     fn a_short_recur_sequence_is_rejected() {
         let mut stack = RecurProgressStack::new();
-        stack.push_site(site(), RecurSiteKind::Sequence, 1, 3);
+        stack.push_site(site(), RecurSiteKind::Sequence, 1, 3, false);
         stack
             .advance_sequence_iteration(&iteration(0), 0)
             .unwrap();
@@ -655,11 +909,11 @@ mod tests {
     #[test]
     fn a_recur_sequence_over_an_empty_source_runs_no_iterations() {
         let mut stack = RecurProgressStack::new();
-        stack.push_site(site(), RecurSiteKind::Sequence, 1, 0);
+        stack.push_site(site(), RecurSiteKind::Sequence, 1, 0, false);
         assert!(stack.close_site(&site()).is_ok());
 
         let mut stack = RecurProgressStack::new();
-        stack.push_site(site(), RecurSiteKind::Sequence, 1, 0);
+        stack.push_site(site(), RecurSiteKind::Sequence, 1, 0, false);
         stack
             .advance_sequence_iteration(&iteration(0), 0)
             .unwrap();
@@ -681,8 +935,7 @@ mod tests {
                 0,
                 5,
                 1,
-                RecurControlKind::Continue
-            ),
+                RecurControlKind::Continue, None),
             Err(RecurProgressViolation::SiteMismatch),
         );
     }
@@ -691,7 +944,7 @@ mod tests {
     fn an_iteration_with_no_live_site_is_rejected() {
         let mut stack = RecurProgressStack::new();
         assert_eq!(
-            stack.advance_tile_iteration(&iteration(0), 0, 1, 1, RecurControlKind::Continue),
+            stack.advance_tile_iteration(&iteration(0), 0, 1, 1, RecurControlKind::Continue, None),
             Err(RecurProgressViolation::NoActiveSite),
         );
     }
@@ -704,7 +957,7 @@ mod tests {
         let outer = CfsCoordinates(vec![2]);
         let inner = CfsCoordinates(vec![2, 1, 3]);
         let mut stack = RecurProgressStack::new();
-        stack.push_site(outer.clone(), RecurSiteKind::Sequence, 1, 2);
+        stack.push_site(outer.clone(), RecurSiteKind::Sequence, 1, 2, false);
 
         stack
             .advance_sequence_iteration(&CfsCoordinates(vec![2, 0]), 0)
@@ -714,7 +967,7 @@ mod tests {
             .unwrap();
 
         // The nested site opens, breaks early, and closes — legally.
-        stack.push_site(inner.clone(), RecurSiteKind::Tile, 1, 8);
+        stack.push_site(inner.clone(), RecurSiteKind::Tile, 1, 8, false);
         stack
             .advance_tile_iteration(
                 &CfsCoordinates(vec![2, 1, 3, 0]),
@@ -722,6 +975,7 @@ mod tests {
                 8,
                 1,
                 RecurControlKind::Break,
+                None,
             )
             .unwrap();
         assert!(stack.close_site(&inner).is_ok());

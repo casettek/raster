@@ -48,7 +48,11 @@ pub struct StepRecordWitness {
 }
 
 /// Domain prefix for [`TraceCommitmentHeader::digest`].
-pub const TRACE_COMMITMENT_DOMAIN: &[u8] = b"raster/trace-commitment/v1";
+/// Bumped to v2 when the header gained `window_size` and
+/// `revealed_tail_roots_commitment`: the digest is the commitment's identity,
+/// so a v1 `commit.bin` and any receipt carrying its
+/// `refuted_trace_commitment` no longer match.
+pub const TRACE_COMMITMENT_DOMAIN: &[u8] = b"raster/trace-commitment/v2";
 
 /// The compact, guest-friendly identity of a `TraceCommitment`.
 ///
@@ -71,6 +75,22 @@ pub struct TraceCommitmentHeader {
     pub fingerprint_root: Vec<u8>,
     /// `sha256(postcard(revealed_items))`.
     pub revealed_items_commitment: Vec<u8>,
+    /// The fraud-proof window size this commitment was built with —
+    /// `revealed_items.len()` host-side.
+    ///
+    /// Here because the guest could not otherwise learn it, and without it
+    /// `window_len` and `window_start` are challenger-supplied with only
+    /// `window_start + window_len <= fingerprint_len` constraining them: an
+    /// upper bound, not a shape. A two-item window anywhere in the trace has no
+    /// margin at all, since `finalize` never compares the first item and
+    /// requires the last to diverge.
+    pub window_size: u64,
+    /// `sha256(postcard(revealed_tail_roots))`.
+    ///
+    /// The roots themselves are O(window), so they travel as a witness when a
+    /// tail divergence is proven; the header stays constant-size, which is its
+    /// whole purpose.
+    pub revealed_tail_roots_commitment: Vec<u8>,
 }
 
 impl TraceCommitmentHeader {
@@ -181,7 +201,17 @@ pub struct TransitionInput {
     pub storage_witness: Option<StorageWitness>,
     pub draft_transition_witness: Option<DraftTransitionWitness>,
 
-    pub input_sources_witnesses: HashMap<StepRecord, Vec<u8>>,
+    /// Trace-inclusion witnesses for the records a step's bindings resolve to,
+    /// keyed by **(the verifying step's `exec_index`, the source record)**.
+    ///
+    /// The verifier is part of the key because a witness is only valid at the
+    /// trace root its verifier holds. The guest folds each one against
+    /// `frontier_root(self.frontier)` *at that step*, and the frontier grows by
+    /// one item per step — so two window steps resolving the same source need
+    /// two different witnesses. Keyed by the source record alone, the later
+    /// step's `insert` silently overwrote the earlier one's and the earlier
+    /// step's fold could never reach its own root.
+    pub input_sources_witnesses: HashMap<(u64, StepRecord), Vec<u8>>,
 
     pub authorization_image_id: Vec<u8>,
     pub authorization_journal: AuthorizationJournal,
@@ -211,6 +241,16 @@ pub struct TransitionInput {
     /// Both `None` for every other step and for a unit program's end.
     pub program_output_read_witness: Option<StorageReadWitness>,
     pub program_output_selection_witness: Option<SelectionWitness>,
+
+    /// The commitment's revealed tail roots, read only by the window-opening
+    /// step and bound there against `TraceCommitmentHeader::
+    /// revealed_tail_roots_commitment`.
+    ///
+    /// Optional because they only buy anything when the window's final index
+    /// falls inside the revealed tail. Omitting them costs the challenger the
+    /// root-divergence route and nothing else, so absence is never an attack.
+    #[serde(default)]
+    pub revealed_tail_roots: Option<Vec<Vec<u8>>>,
 }
 
 /// Result of applying one transition (new frontier and fingerprint state).
@@ -366,4 +406,17 @@ pub struct TransitionJournal {
     /// the trace's actual result, not the output of some `ProgramEnd`
     /// sitting mid-commitment. See `docs/proposals/chain-io-commitment.md`.
     pub window_is_terminal: bool,
+
+    /// The committed trace root revealed for this window's **final** index,
+    /// when that index falls inside the commitment's revealed tail.
+    ///
+    /// Derived at `Init` — the only step holding the header — and inherited
+    /// across `Next`, because the step that needs it is the last one. It is
+    /// what lets a tail divergence be *proven* and not merely detected: the
+    /// packed fingerprint keeps `bits_per_item` bits of each root, so when
+    /// every entry from the divergence to the end collides there is nothing
+    /// left in the fingerprint to diverge on, and at `window_size >= 128`
+    /// (`bits_per_item == 1`) that is a coin flip rather than a rarity.
+    #[serde(default)]
+    pub final_committed_root: Option<Vec<u8>>,
 }

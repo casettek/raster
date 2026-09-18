@@ -276,7 +276,7 @@ pub fn reassemble_from_lock(
     for tile in &cfs.tiles {
         let entry = lock.tiles.get(&tile.id).ok_or_else(|| {
             Error::Other(format!(
-                "Raster.lock records no image id for tile '{}' — run `cargo raster build`",
+                "Raster.lock records no image id for tile '{}' — run `cargo raster build --backend risc0`",
                 tile.id
             ))
         })?;
@@ -305,7 +305,7 @@ fn decode_image_id(hex_str: &str, tile_id: &str) -> Result<ImageId> {
 fn read_lock(lock_path: &Path) -> Result<RasterLock> {
     let text = std::fs::read_to_string(lock_path).map_err(|_| {
         Error::Other(format!(
-            "{} not found — run `cargo raster build`",
+            "{} not found — run `cargo raster build --backend risc0`",
             lock_path.display()
         ))
     })?;
@@ -315,6 +315,12 @@ fn read_lock(lock_path: &Path) -> Result<RasterLock> {
 
 /// If `lock_path` exists, require the program's recomputed commitment to equal
 /// the lock's (the stale-lock drift check). Absent lock is not an error.
+/// The remedy named in these errors is `--backend risc0` on purpose: plain
+/// `cargo raster build` defaults to the native backend, and
+/// `commands::build` emits `program.bin` + `Raster.lock` **only** under risc0
+/// (image ids need compiled guests). Advising the bare command sent a reader
+/// in a circle — it reports success, changes nothing, and the same drift
+/// error returns.
 fn check_lock_drift(program: &ProgramDefinition, lock_path: &Path) -> Result<()> {
     if !lock_path.exists() {
         return Ok(());
@@ -323,7 +329,7 @@ fn check_lock_drift(program: &ProgramDefinition, lock_path: &Path) -> Result<()>
     let recomputed = hex::encode(program.commitment());
     if recomputed != lock.program_commitment {
         return Err(Error::Other(format!(
-            "program identity drift: reassembled commitment {recomputed} != Raster.lock {} — run `cargo raster build`",
+            "program identity drift: reassembled commitment {recomputed} != Raster.lock {} — run `cargo raster build --backend risc0`",
             lock.program_commitment
         )));
     }
@@ -468,7 +474,7 @@ encoding = "raster"
     fn read_lock_reports_missing_file() {
         let err = read_lock(Path::new("/nonexistent/Raster.lock")).unwrap_err();
         assert!(
-            err.to_string().contains("run `cargo raster build`"),
+            err.to_string().contains("run `cargo raster build --backend risc0`"),
             "got: {err}"
         );
     }
