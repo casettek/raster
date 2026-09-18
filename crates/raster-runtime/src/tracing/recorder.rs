@@ -172,14 +172,18 @@ impl StepWitnessStore {
             | TraceEvent::RecurSequenceIterationEnd(trace_item) => {
                 let trace_io = self.0.get_mut(&coordinates).unwrap_or_else(|| {
                     panic!(
-                        "Missing step witness entry for SequenceEnd at coordinates {:?}. Expected a matching SequenceStart to be recorded first.",
+                        "Missing step witness entry for SequenceEnd at coordinates {:?}. The entry \
+                         is created by the matching SequenceStart — or, at the sequence root, by \
+                         ProgramStart, since `main` publishes no SequenceStart.",
                         coordinates
                     )
                 });
                 trace_io.output_data = trace_item.output.as_ref().map(|output| output.data.clone());
-                // `main`'s `SequenceEnd` shares coordinates `[]` with the
-                // `ProgramStart` step; a sequence end never writes storage, so
-                // it must not clobber the entry-object write recorded there.
+                // A sequence end never writes storage, so it must not clobber
+                // whatever write the matching start recorded at these
+                // coordinates. (`main` reaches neither arm: it publishes no
+                // sequence events at all — see `gen_main_wrapped_body` — so
+                // the root entry belongs to `ProgramStart` alone.)
                 if let Some(storage_write) = storage_write {
                     trace_io.storage_write = Some(storage_write);
                 }
@@ -1447,14 +1451,17 @@ mod tests {
 
     #[test]
     #[should_panic(
-        expected = "Missing step witness entry for SequenceEnd at coordinates CfsCoordinates([]). Expected a matching SequenceStart to be recorded first."
+        expected = "Missing step witness entry for SequenceEnd at coordinates CfsCoordinates([3, 1])"
     )]
     fn sequence_end_without_matching_start_reports_coordinates() {
+        // A nested sequence, because that is the only place a `SequenceEnd`
+        // occurs: `main` publishes none (`gen_main_wrapped_body`). The old
+        // fixture used `"main"` at `[]`, which cannot happen.
         let mut store = StepWitnessStore::new();
         store.insert(
-            CfsCoordinates(vec![]),
+            CfsCoordinates(vec![3, 1]),
             TraceEvent::SequenceEnd(FnCallRecord {
-                fn_name: "main".to_string(),
+                fn_name: "child".to_string(),
                 input: None,
                 output: None,
                 draft_transition_witness: None,
@@ -1465,29 +1472,155 @@ mod tests {
         );
     }
 
+    /// Start `main` the way the generated code does.
+    ///
+    /// `main` publishes **no** `SequenceStart`: the macro suppresses it
+    /// (`raster-macros/src/lib.rs`, `if is_main { quote!{} }`) precisely
+    /// because `ProgramStart` is what pushes main's frame at `[]` and creates
+    /// the `[]` witness-store entry. These fixtures used to record a
+    /// `SequenceStart` for `"main"`, an event the generated code cannot emit —
+    /// which took the wrong arm of both `record` and `StepWitnessStore::insert`
+    /// and so described a trace shape that never occurs.
+    ///
+    /// Zero arguments is the supported "program still starts, binding nothing"
+    /// path, so no manifest or source resolver is needed.
     fn start_main(recorder: &mut TraceRecorder) {
-        recorder.record(TraceEvent::SequenceStart(FnCallRecord {
-            fn_name: "main".to_string(),
-            input: None,
-            output: None,
-            draft_transition_witness: None,
-            recur_control: None,
-            recur_state: None,
-        }));
+        recorder.record(TraceEvent::ProgramStart(
+            raster_core::trace::ProgramStartEvent {
+                arguments: Vec::new(),
+            },
+        ));
     }
 
+
+    /// `main` containing one ordinary nested sequence — the shape that makes
+    /// the `SequenceStart`/`SequenceEnd` coordinate collision observable.
+    fn recorder_with_nested_sequence() -> TraceRecorder {
+        TraceRecorder::new(ControlFlowSchema {
+            version: "1.0".to_string(),
+            project: "test".to_string(),
+            encoding: "postcard".to_string(),
+            tiles: vec![],
+            sequences: vec![
+                SequenceDef {
+                    id: "main".to_string(),
+                    input_sources: vec![],
+                    items: vec![SequenceChildItem::Sequence(raster_core::cfs::SequenceItem {
+                        id: "child".to_string(),
+                        sources: vec![],
+                    })],
+                    entry_arguments: vec![],
+                    produces_output: false,
+                },
+                SequenceDef {
+                    id: "child".to_string(),
+                    input_sources: vec![],
+                    items: vec![],
+                    entry_arguments: vec![],
+                    produces_output: false,
+                },
+            ],
+        })
+    }
+
+    fn call_with_input(fn_name: &str) -> FnCallRecord {
+        let mut record = call(fn_name);
+        record.input = Some(FnInput {
+            data: vec![1, 2, 3],
+            values: vec![],
+            args: vec![],
+            storage: Default::default(),
+        });
+        record
+    }
+
+    #[test]
+    fn program_start_is_what_creates_mains_root_entry() {
+        // `main` publishes no `SequenceStart` (`raster-macros/src/lib.rs`
+        // suppresses it), so `ProgramStart` both pushes main's frame and
+        // creates the `[]` witness-store entry. It records no input source,
+        // because main's arguments are entry arguments rather than CFS inputs.
+        let mut recorder = recorder_with_nested_sequence();
+        assert!(recorder.step_witness_at(&CfsCoordinates(vec![])).is_none());
+
+        start_main(&mut recorder);
+
+        let entry = recorder
+            .step_witness_at(&CfsCoordinates(vec![]))
+            .expect("ProgramStart creates the root entry");
+        assert!(entry.input_source_witness().is_none());
+    }
+
+    #[test]
+    fn program_end_leaves_the_root_entry_untouched() {
+        // `main` publishes neither a `SequenceStart` nor a `SequenceEnd`: the
+        // macro routes it to `gen_main_wrapped_body`, whose boundaries are
+        // `ProgramStart` and `ProgramEnd` (`raster-macros/src/lib.rs` — the
+        // dispatch at `if item_fn.sig.ident == "main"`). So exactly two steps
+        // sit at `[]`, and `ProgramEnd` writes nothing: the root entry is
+        // `ProgramStart`'s alone, and `output_data` there stays `None`.
+        //
+        // This is why the `SequenceEnd` inheritance bug needs a *nested*
+        // sequence — at the root there is no `SequenceEnd` to inherit
+        // anything.
+        let mut recorder = recorder_with_nested_sequence();
+        start_main(&mut recorder);
+        let before = recorder
+            .step_witness_at(&CfsCoordinates(vec![]))
+            .expect("ProgramStart created the root entry");
+
+        recorder.record(TraceEvent::ProgramEnd(raster_core::trace::ProgramEndEvent {
+            output: None,
+        }));
+
+        let after = recorder
+            .step_witness_at(&CfsCoordinates(vec![]))
+            .expect("root entry still present");
+        assert!(after.input_source_witness().is_none());
+        assert_eq!(after.output_data(), before.output_data());
+        assert!(after.output_data().is_none());
+    }
+
+    #[test]
+    fn a_nested_sequence_end_lands_on_its_own_starts_entry() {
+        // The collision itself: `SequenceStart` and `SequenceEnd` share
+        // coordinates, and the End does `get_mut` rather than creating its own
+        // entry — so after the End the entry still carries the *Start's*
+        // input source. Nothing is wrong with that here; it is why the fraud
+        // host must select witnesses by what the step's record declares
+        // (`StepRecord::input_source_commitment` is `None` for a
+        // `SequenceEnd`) instead of by coordinates alone.
+        let mut recorder = recorder_with_nested_sequence();
+        start_main(&mut recorder);
+
+        let start = recorder.record(TraceEvent::SequenceStart(call_with_input("child")));
+        let child_coordinates = start.coordinates().clone();
+        let at_start = recorder
+            .step_witness_at(&child_coordinates)
+            .expect("SequenceStart creates the child entry");
+        assert!(at_start.input_source_witness().is_some());
+
+        let end = recorder.record(TraceEvent::SequenceEnd(call("child")));
+        assert_eq!(end.coordinates(), &child_coordinates);
+
+        let at_end = recorder
+            .step_witness_at(&child_coordinates)
+            .expect("child entry still present");
+        assert_eq!(
+            at_end.input_source_witness(),
+            at_start.input_source_witness(),
+            "the End inherits the Start's input source, which is exactly why it must be \
+             filtered by step kind rather than looked up by coordinates",
+        );
+        // And the record itself declares none, which is the fact the host and
+        // guest both key on.
+        assert!(end.input_source_commitment().is_none());
+    }
 
     #[test]
     fn recur_iterations_and_site_completion_get_distinct_coordinates() {
         let mut recorder = recorder_with_recur_site();
-        recorder.record(TraceEvent::SequenceStart(FnCallRecord {
-            fn_name: "main".to_string(),
-            input: None,
-            output: None,
-            draft_transition_witness: None,
-            recur_control: None,
-            recur_state: None,
-        }));
+        start_main(&mut recorder);
 
         let __start = seed_recur_source(&mut recorder, "recur", 2);
         recorder.record(TraceEvent::RecurTileStart(__start));
@@ -1533,14 +1666,7 @@ mod tests {
     #[test]
     fn recur_sequence_iterations_restore_parent_coordinates_before_site_completion() {
         let mut recorder = recorder_with_recur_sequence_site();
-        recorder.record(TraceEvent::SequenceStart(FnCallRecord {
-            fn_name: "main".to_string(),
-            input: None,
-            output: None,
-            draft_transition_witness: None,
-            recur_control: None,
-            recur_state: None,
-        }));
+        start_main(&mut recorder);
 
         let __start = seed_recur_source(&mut recorder, "child", 2);
         recorder.record(TraceEvent::RecurSequenceStart(__start));
@@ -1816,7 +1942,7 @@ mod tests {
     #[test]
     fn recur_progress_after_agrees_across_a_recur_sequence_site() {
         let mut recorder = recorder_with_recur_sequence_site();
-        recorder.record(TraceEvent::SequenceStart(call("main")));
+        start_main(&mut recorder);
 
         let start = seed_recur_source(&mut recorder, "child", 2);
         let mut steps = vec![recorder.record(TraceEvent::RecurSequenceStart(start))];

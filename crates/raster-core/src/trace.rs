@@ -422,6 +422,74 @@ pub enum StepKind {
     Exec(ExecStep),
 }
 
+/// The binding name a recur site's source is always recorded under. Shared so
+/// the payload rule below and `checks::cfs::authenticated_source_len` cannot
+/// disagree about which binding that is.
+pub const RECUR_SOURCE_BINDING: &str = "input";
+
+/// Does the fraud-proof guest need this storage binding's **payload**, or only
+/// the root of the value it selects?
+///
+/// A sequence — ordinary or recur — receives its storage arguments as
+/// references: coordinates, commitment and selector, never bytes. It forwards
+/// them inward, and only a tile that actually consumes a value sees one. So
+/// for every non-`Exec` step the guest needs to establish just the scoping
+/// fact — *this reference resolves inside an object the store authenticates* —
+/// which folds from a root with no payload at all.
+///
+/// The one exception is a recur site's source. `checks::cfs`'s
+/// `authenticated_source_len` reads the sweep bound `L` out of that binding's
+/// payload, and `L` is the number every completeness rule holds the sweep to.
+/// That payload is the list's *metadata* view — `(len, elements_root)` — so it
+/// stays small however long the list is.
+///
+/// Keyed on the record's own kind and the binding's name, both of which the
+/// guest already has, so the decision is the guest's and a prover cannot make
+/// it. Conservative on purpose: it demands the payload for a `"input"` binding
+/// on any non-`Exec` step, not only a recur site, because narrowing that
+/// further would mean trusting a second derivation of *which* sites are recur
+/// sites, and the payload in question is small either way.
+pub fn binding_requires_payload(
+    kind: &StepKind,
+    binding_name: &str,
+    storage: &StorageInput,
+) -> bool {
+    // A tile ran on these bytes. `ExecTarget::Tile` is the discriminating
+    // fact, not `StepKind::Exec`: the recorder emits it for `TileExec` and for
+    // `RecurTileIterationExec` — every step where a tile actually consumed a
+    // value — while `ExecTarget::RecurTile` and `ExecTarget::RecurSequence`
+    // appear only on the step that *closes* a recur site, which executes
+    // nothing and merely holds the site's arguments. Treating those as
+    // executions is what kept a forwarded 106 MB `List<MergeBucket>` on the
+    // recur site step at `[2, 0]` after the sequence steps were already
+    // reduced. This is the same predicate as
+    // [`StepRecord::requires_replay_proof`], for the same reason: a replay
+    // journal exists exactly where a tile ran.
+    if matches!(
+        kind,
+        StepKind::Exec(ExecStep {
+            target: ExecTarget::Tile(_),
+            ..
+        })
+    ) {
+        return true;
+    }
+    // The sweep bound `L` is read out of this binding's metadata payload.
+    if binding_name == RECUR_SOURCE_BINDING {
+        return true;
+    }
+    // A binding cited as a `BoundIndex` source has its `selected_hash`
+    // compared against the canonical encoding of the claimed index by
+    // [`verify_bound_index_bindings`]. That comparison means something only
+    // while `selected_hash` is itself tied to real bytes — which is exactly
+    // what the payload check does and a reference witness does not. Without
+    // this clause a prover could forward the source as a reference, forge its
+    // `selected_hash`, and have any index accepted.
+    storage
+        .values()
+        .any(|data| bound_indexes(&data.selection.path).any(|(_, source, _)| source == binding_name))
+}
+
 /// One step of a trace: where it sits, and what it did.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct StepRecord {
@@ -963,5 +1031,153 @@ mod bound_index_tests {
             ("@idx/base", index_supplier(4, IndexWidth::U32)),
         ]);
         assert_eq!(verify_bound_index_bindings(&storage), Ok(()));
+    }
+}
+
+#[cfg(test)]
+mod payload_rule_tests {
+    use super::*;
+    use alloc::string::ToString;
+    use alloc::vec;
+
+    fn exec_kind() -> StepKind {
+        StepKind::Exec(ExecStep {
+            target: ExecTarget::Tile("tile".to_string()),
+            intra_sequence_index: 0,
+            input_commitment: Vec::new(),
+            input_source_commitment: Vec::new(),
+            output_commitment: Vec::new(),
+            storage: StorageRoots {
+                root_before: Vec::new(),
+                root_after: Vec::new(),
+                index_root_before: Vec::new(),
+                index_root_after: Vec::new(),
+            },
+        })
+    }
+
+    fn sequence_kind() -> StepKind {
+        StepKind::SequenceStart {
+            input_commitment: Vec::new(),
+            input_source_commitment: Vec::new(),
+        }
+    }
+
+    fn binding(name: &str, path: SelectorPath) -> (StorageBindingName, StorageData) {
+        (
+            name.to_string(),
+            StorageData {
+                coordinates: CfsCoordinates(Vec::new()),
+                commitment: Vec::new(),
+                selector: path.clone(),
+                selection: SelectionCommitment {
+                    path,
+                    ..Default::default()
+                },
+            },
+        )
+    }
+
+    fn recur_site_close_kind(target: ExecTarget) -> StepKind {
+        let StepKind::Exec(mut exec) = exec_kind() else {
+            unreachable!()
+        };
+        exec.target = target;
+        StepKind::Exec(exec)
+    }
+
+    #[test]
+    fn a_tile_step_always_needs_the_payload() {
+        let storage: StorageInput = [binding("arg", SelectorPath::default())]
+            .into_iter()
+            .collect();
+        assert!(binding_requires_payload(&exec_kind(), "arg", &storage));
+    }
+
+    #[test]
+    fn a_recur_site_close_step_forwards_rather_than_consumes() {
+        // `ExecTarget::RecurTile` / `RecurSequence` mark the step that closes a
+        // recur site. It executes nothing and only holds the site's arguments,
+        // so keying on `StepKind::Exec` alone wrongly demanded their payloads.
+        let storage: StorageInput = [binding("merge_buckets", SelectorPath::default())]
+            .into_iter()
+            .collect();
+        for target in [
+            ExecTarget::RecurSequence("seq".to_string()),
+            ExecTarget::RecurTile("tile".to_string()),
+        ] {
+            assert!(!binding_requires_payload(
+                &recur_site_close_kind(target),
+                "merge_buckets",
+                &storage
+            ));
+        }
+    }
+
+    #[test]
+    fn a_recur_tile_iteration_still_needs_the_payload() {
+        // Each iteration is recorded with `ExecTarget::Tile`, because a tile
+        // really did run on those bytes — the reference shortcut must not
+        // reach it.
+        let storage: StorageInput = [binding("arg", SelectorPath::default())]
+            .into_iter()
+            .collect();
+        assert!(binding_requires_payload(
+            &recur_site_close_kind(ExecTarget::Tile("tile".to_string())),
+            "arg",
+            &storage
+        ));
+    }
+
+    #[test]
+    fn a_forwarded_sequence_argument_needs_only_its_root() {
+        let storage: StorageInput = [binding("merge_buckets", SelectorPath::default())]
+            .into_iter()
+            .collect();
+        assert!(!binding_requires_payload(
+            &sequence_kind(),
+            "merge_buckets",
+            &storage
+        ));
+    }
+
+    #[test]
+    fn a_recur_source_needs_its_payload_even_on_a_sequence_step() {
+        let storage: StorageInput = [binding(RECUR_SOURCE_BINDING, SelectorPath::default())]
+            .into_iter()
+            .collect();
+        assert!(binding_requires_payload(
+            &sequence_kind(),
+            RECUR_SOURCE_BINDING,
+            &storage
+        ));
+    }
+
+    #[test]
+    fn a_binding_cited_as_a_bound_index_source_needs_its_payload() {
+        // `verify_bound_index_bindings` compares the *source* binding's
+        // `selected_hash` against the canonical encoding of the claimed index.
+        // That is only meaningful while something ties `selected_hash` to real
+        // bytes — so a cited source may never be forwarded as a reference,
+        // whatever the step kind.
+        let cited = SelectorPath::new(vec![SelectorSegment::BoundIndex {
+            index: 3,
+            source: "idx".to_string(),
+            width: IndexWidth::U32,
+        }]);
+        let storage: StorageInput = [
+            binding("bucket", cited),
+            binding("idx", SelectorPath::default()),
+        ]
+        .into_iter()
+        .collect();
+
+        assert!(binding_requires_payload(&sequence_kind(), "idx", &storage));
+        // The citing binding itself is still only forwarded.
+        assert!(!binding_requires_payload(
+            &sequence_kind(),
+            "bucket",
+            &storage
+        ));
     }
 }

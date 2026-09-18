@@ -228,6 +228,23 @@ pub fn verify_step_record_inputs(
         "Step record kind does not match the CFS item kind at its coordinates: {:?}",
         step_record,
     );
+    // A `SequenceEnd` reports what the sequence produced; the sequence's input
+    // bindings belong to its `SequenceStart`, which was verified at the same
+    // coordinates. Verifying them again here was not a second check but a
+    // vacuous one: `StepRecord::input_source_commitment` is `None` for a
+    // `SequenceEnd` (`trace.rs`), so nothing ties the witness to this record
+    // and anything it "proved" could have been fabricated. It only ever ran
+    // because the witness store is keyed by coordinates alone, so the End
+    // inherited the Start's entry — the same sharing `recorder.rs` already
+    // guards for `storage_write`. `checks::io` refuses that witness outright,
+    // so requiring it here was also self-contradictory.
+    //
+    // Placed after `record_matches_item` so the step is still held to the CFS
+    // item at its coordinates; only the input-binding half is skipped.
+    if matches!(step_record.kind, StepKind::SequenceEnd { .. }) {
+        return;
+    }
+
     let step_inputs = cfs_item.inputs();
 
     let input_source_witness = input_source_witness.unwrap_or_else(|| {

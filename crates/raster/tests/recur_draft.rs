@@ -1129,6 +1129,46 @@ fn a_stateful_recur_sequence_site_records_every_declared_source() {
 }
 
 #[test]
+fn a_recur_sequence_site_commits_to_its_source_list_metadata() {
+    // `lazy-list-recur.md` §2–§3: *both* recur macros trace their source
+    // through the `0x0A` metadata selection. `call_recur_seq!` used
+    // `auth_ref_trace` instead, which resolves the binding — materializing the
+    // whole list before any runner runs, the earliest and largest of the eager
+    // paths — and records a `Raw` selection.
+    //
+    // The consequence was not only memory: `checks::cfs::authenticated_source_len`
+    // refuses anything but `List`, so no fraud proof covering a recur *sequence*
+    // site could be produced at all. No test caught it because the recorder's
+    // own fixture (`seed_recur_source`) hand-builds the metadata commitment
+    // rather than going through the macro.
+    let (_, events) = capture_trace_events(run_scan_all_words);
+
+    let site_input = events
+        .iter()
+        .find_map(|event| match event {
+            TraceEvent::RecurSequenceStart(record) if record.fn_name == "scan_words" => {
+                record.input.clone()
+            }
+            _ => None,
+        })
+        .expect("the recur sequence site publishes a Start with its input");
+
+    let source = site_input
+        .storage()
+        .get("input")
+        .expect("the site records its source under `input`");
+
+    assert_eq!(
+        source.selection.payload_kind,
+        raster::core::input::SelectionPayloadKind::List,
+        "a recur source must commit to list metadata, not the list itself",
+    );
+    // `1 + 8 + 32` — the tag, `len`, and `elements_root`. The point of the
+    // metadata form is that this is constant, not a function of list length.
+    assert_eq!(source.selection.selected_len, 41);
+}
+
+#[test]
 fn a_stateful_recur_sequence_iteration_chains_its_carried_state() {
     let (_, events) = capture_trace_events(run_scan_all_words);
 

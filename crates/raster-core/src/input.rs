@@ -314,6 +314,82 @@ pub struct SelectionCommitment {
 pub struct SelectionWitness {
     pub bytes: Vec<u8>,
     pub proof: SelectionProof,
+    /// Set **instead of** `bytes` when the step only *forwards* this binding as
+    /// a reference and never consumes its value — a sequence argument, which is
+    /// how every non-`Exec` step receives storage data.
+    ///
+    /// It carries the selected value's structural subtree root, so the proof
+    /// folds from there to `proof.root_hash` without the payload ever entering
+    /// the guest. `merge_buckets` in `prompt-prepare` is why this exists: a
+    /// forwarded `List<MergeBucket>` made a 106 MB witness for a step whose
+    /// recorded input was 145 bytes, and re-deriving its root exhausted the
+    /// guest heap.
+    ///
+    /// Which mode is legal is the *guest's* decision, never the host's — see
+    /// `checks::store::verify_storage_transition`. Appended last and
+    /// `#[serde(default)]`, never `skip_serializing_if`, because postcard is
+    /// positional: omitting a field on write while `Deserialize` still reads at
+    /// that offset shifts every later field.
+    #[serde(default)]
+    pub selected_root: Option<Hash32>,
+}
+
+impl SelectionWitness {
+    /// A witness carrying the payload, for a binding whose value was consumed.
+    pub fn from_payload(bytes: Vec<u8>, proof: SelectionProof) -> Self {
+        Self {
+            bytes,
+            proof,
+            selected_root: None,
+        }
+    }
+
+    /// A witness carrying only the selected value's root, for a binding the
+    /// step forwards as a reference.
+    pub fn reference(selected_root: Hash32, proof: SelectionProof) -> Self {
+        Self {
+            bytes: Vec::new(),
+            proof,
+            selected_root: Some(selected_root),
+        }
+    }
+
+    /// `true` when this witness omits the payload. The guest decides whether
+    /// that is permitted for the binding at hand before consulting this.
+    pub fn is_reference_only(&self) -> bool {
+        self.selected_root.is_some()
+    }
+
+    /// Drop the payload, keeping the root the proof folds from.
+    ///
+    /// The host builds the full witness as usual and downgrades here, so the
+    /// large value is read once on the host — where it already works — and
+    /// never reaches the guest. `None` when the payload cannot be reduced: a
+    /// proof ending in `ListRange` derives its starting hash from the
+    /// payload's element roots, so it has no single subtree root to carry.
+    ///
+    /// Uses [`selected_subtree_root`], the same function
+    /// [`verify_selection_reference`] folds from, so producer and checker
+    /// cannot drift into computing two different roots.
+    pub fn into_reference(self) -> Option<Self> {
+        if matches!(
+            self.proof.steps.last(),
+            Some(SelectionProofStep::ListRange { .. })
+        ) {
+            return None;
+        }
+        let root = selected_subtree_root(&self.bytes)?;
+        Some(Self::reference(root, self.proof))
+    }
+}
+
+/// The structural subtree root of a selected payload: the hash
+/// [`verify_selection_proof`] derives before folding, and the one
+/// [`verify_selection_reference`] is handed directly.
+pub fn selected_subtree_root(selected_bytes: &[u8]) -> Option<Hash32> {
+    let mut offset = 0;
+    let hash = parse_subtree_root(selected_bytes, &mut offset)?;
+    (offset == selected_bytes.len()).then_some(hash)
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -994,18 +1070,46 @@ fn fold_list_range(
     ]))
 }
 
+/// Do the proof's steps describe the path it claims, one step per segment,
+/// outermost first? Shared by both entry points below, since a proof that
+/// does not describe its own path is invalid however its leaf is obtained.
+fn proof_steps_match_path(proof: &SelectionProof) -> bool {
+    proof.steps.len() == proof.path.segments.len()
+        && proof
+            .steps
+            .iter()
+            .zip(proof.path.segments.iter())
+            .all(|(step, segment)| step_proves_segment(step, segment))
+}
+
+/// Verify a selection **without its payload**, folding a claimed subtree root
+/// up to the proof's source root.
+///
+/// Sound because the fold is self-authenticating: `proof.root_hash` is checked
+/// by the caller against a commitment already proven to sit at the binding's
+/// coordinates in the authenticated store, and a wrong `selected_root` cannot
+/// reach it without a hash collision. What this establishes is exactly the
+/// scoping fact a forwarded reference needs — *the value at this path inside
+/// that authenticated object has this root* — and nothing about the bytes,
+/// which the step never consumed.
+///
+/// A trailing `ListRange` step is refused: it derives its starting hash from
+/// the payload's element roots, so it cannot be checked without the payload.
+pub fn verify_selection_reference(selected_root: &Hash32, proof: &SelectionProof) -> bool {
+    if !proof_steps_match_path(proof) {
+        return false;
+    }
+    if matches!(proof.steps.last(), Some(SelectionProofStep::ListRange { .. })) {
+        return false;
+    }
+    fold_selection_steps(*selected_root, &proof.steps)
+        .is_some_and(|hash| hash == proof.root_hash)
+}
+
 pub fn verify_selection_proof(selected_bytes: &[u8], proof: &SelectionProof) -> bool {
     // One step per path segment, outermost first in both — anything else is
     // a proof that does not describe the path it claims.
-    if proof.steps.len() != proof.path.segments.len() {
-        return false;
-    }
-    if !proof
-        .steps
-        .iter()
-        .zip(proof.path.segments.iter())
-        .all(|(step, segment)| step_proves_segment(step, segment))
-    {
+    if !proof_steps_match_path(proof) {
         return false;
     }
 
@@ -1013,7 +1117,7 @@ pub fn verify_selection_proof(selected_bytes: &[u8], proof: &SelectionProof) -> 
     // derives the starting hash from the payload's element roots instead of
     // the payload's own subtree root.
     let mut steps = proof.steps.as_slice();
-    let mut current_hash = if let Some(SelectionProofStep::ListRange {
+    let current_hash = if let Some(SelectionProofStep::ListRange {
         start,
         len,
         siblings,
@@ -1038,6 +1142,12 @@ pub fn verify_selection_proof(selected_bytes: &[u8], proof: &SelectionProof) -> 
         hash
     };
 
+    fold_selection_steps(current_hash, steps).is_some_and(|hash| hash == proof.root_hash)
+}
+
+/// Fold a leaf hash up through `steps`, outermost step last.
+fn fold_selection_steps(start: Hash32, steps: &[SelectionProofStep]) -> Option<Hash32> {
+    let mut current_hash = start;
     for step in steps.iter().rev() {
         current_hash = match step {
             SelectionProofStep::Struct {
@@ -1048,7 +1158,7 @@ pub fn verify_selection_proof(selected_bytes: &[u8], proof: &SelectionProof) -> 
                 let field_index = *field_index as usize;
                 let field_count = field_names.len();
                 if field_index >= field_count || siblings.len() + 1 != field_count {
-                    return false;
+                    return None;
                 }
 
                 let mut child_roots = Vec::with_capacity(field_count);
@@ -1059,7 +1169,7 @@ pub fn verify_selection_proof(selected_bytes: &[u8], proof: &SelectionProof) -> 
                     } else if let Some(sibling) = sibling_iter.next() {
                         child_roots.push(*sibling);
                     } else {
-                        return false;
+                        return None;
                     }
                 }
 
@@ -1076,7 +1186,7 @@ pub fn verify_selection_proof(selected_bytes: &[u8], proof: &SelectionProof) -> 
                 siblings,
             } => {
                 if *len == 0 || *index >= *len {
-                    return false;
+                    return None;
                 }
 
                 let mut hash = current_hash;
@@ -1098,10 +1208,10 @@ pub fn verify_selection_proof(selected_bytes: &[u8], proof: &SelectionProof) -> 
             }
             // A range step is only valid as the final step, which was consumed
             // before this loop.
-            SelectionProofStep::ListRange { .. } => return false,
+            SelectionProofStep::ListRange { .. } => return None,
         };
     }
-    current_hash == proof.root_hash
+    Some(current_hash)
 }
 
 pub fn selection_payload_hash(selected_bytes: &[u8]) -> Hash32 {
@@ -1332,6 +1442,32 @@ pub fn verify_selection_witness(
     }
 
     verify_selection_proof(&witness.bytes, &witness.proof)
+}
+
+/// Verify a **forwarded reference**: the binding resolves to a real position
+/// inside an object the store already authenticates, proven without its bytes.
+///
+/// Deliberately silent about `selected_hash`, `selected_len` and
+/// `payload_kind`. Those tie the recorded commitment to actual bytes, and with
+/// no bytes present there is nothing to tie. That is sound only for a binding
+/// whose value the step never consumed, which is why the *guest* — not the
+/// host, and not this function — decides when a reference witness is
+/// acceptable. A prover that could choose would simply choose this mode.
+pub fn verify_selection_reference_witness(
+    commitment: &SelectionCommitment,
+    witness: &SelectionWitness,
+) -> bool {
+    let Some(selected_root) = witness.selected_root.as_ref() else {
+        return false;
+    };
+    if !witness.bytes.is_empty()
+        || witness.proof.path != commitment.path
+        || witness.proof.root_hash != commitment.source_root_hash
+    {
+        return false;
+    }
+
+    verify_selection_reference(selected_root, &witness.proof)
 }
 
 impl From<&str> for SelectorSegment {
@@ -2129,6 +2265,7 @@ mod tests {
                     },
                 ],
             },
+            selected_root: None,
         };
         assert!(verify_bytes_page_geometry(&witness));
     }
@@ -2159,6 +2296,7 @@ mod tests {
                     },
                 ],
             },
+            selected_root: None,
         };
         assert!(!verify_bytes_page_geometry(&witness));
     }
@@ -2189,6 +2327,7 @@ mod tests {
                     },
                 ],
             },
+            selected_root: None,
         };
         assert!(!verify_bytes_page_geometry(&witness));
     }
@@ -2219,6 +2358,7 @@ mod tests {
                     },
                 ],
             },
+            selected_root: None,
         };
         assert!(!verify_bytes_page_geometry(&witness));
     }
@@ -2252,14 +2392,14 @@ mod tests {
             selected_len: payload.len() as u64,
             payload_kind: SelectionPayloadKind::List,
         };
-        let witness = SelectionWitness {
-            bytes: payload,
-            proof: SelectionProof {
+        let witness = SelectionWitness::from_payload(
+            payload,
+            SelectionProof {
                 path: SelectorPath::default(),
                 root_hash: root,
                 steps: Vec::new(),
             },
-        };
+        );
         (commitment, witness)
     }
 
@@ -2267,6 +2407,97 @@ mod tests {
     fn metadata_witness_verifies_against_a_list_kind_commitment() {
         let (commitment, witness) = metadata_witness(5);
         assert!(verify_selection_witness(&commitment, &witness));
+    }
+
+    /// A one-step fold: the metadata payload sits at field `b` of a two-field
+    /// struct, so the reference path has a real step to walk rather than an
+    /// empty one.
+    fn nested_witness() -> (SelectionCommitment, SelectionWitness) {
+        let (payload, payload_root) = metadata_fixture(5);
+        let sibling_root: Hash32 = [9u8; 32];
+        let source_root = struct_commitments_root([
+            ("a", sibling_root.as_slice()),
+            ("b", payload_root.as_slice()),
+        ]);
+        let path = SelectorPath::new(alloc::vec![SelectorSegment::Field("b".into())]);
+        let proof = SelectionProof {
+            path: path.clone(),
+            root_hash: source_root,
+            steps: alloc::vec![SelectionProofStep::Struct {
+                field_index: 1,
+                field_names: alloc::vec!["a".into(), "b".into()],
+                siblings: alloc::vec![sibling_root],
+            }],
+        };
+        let commitment = SelectionCommitment {
+            path,
+            source_root_hash: source_root,
+            selected_hash: selection_payload_hash(&payload),
+            selected_len: payload.len() as u64,
+            payload_kind: SelectionPayloadKind::List,
+        };
+        (commitment, SelectionWitness::from_payload(payload, proof))
+    }
+
+    #[test]
+    fn a_reference_witness_proves_the_same_position_without_the_payload() {
+        let (commitment, payload_witness) = nested_witness();
+        assert!(verify_selection_witness(&commitment, &payload_witness));
+
+        let reference = payload_witness.clone().into_reference().unwrap();
+
+        // The payload is gone, and what is left is the root the fold starts
+        // from — this is the whole point: a forwarded 106 MB list ships 32
+        // bytes.
+        assert!(reference.bytes.is_empty());
+        assert!(reference.is_reference_only());
+        assert_eq!(
+            reference.selected_root,
+            selected_subtree_root(&payload_witness.bytes)
+        );
+
+        // And it still proves the position inside the authenticated object.
+        assert!(verify_selection_reference_witness(&commitment, &reference));
+    }
+
+    #[test]
+    fn a_reference_witness_with_a_forged_root_is_refused() {
+        let (commitment, payload_witness) = nested_witness();
+        let mut forged = payload_witness.into_reference().unwrap();
+        forged.selected_root = Some([7u8; 32]);
+        // The fold is self-authenticating: a wrong leaf cannot reach the
+        // source root, which is the reason a bytes-less witness is safe.
+        assert!(!verify_selection_reference_witness(&commitment, &forged));
+    }
+
+    #[test]
+    fn a_reference_check_refuses_a_witness_that_still_carries_bytes() {
+        let (commitment, payload_witness) = nested_witness();
+        let mut smuggled = payload_witness.clone().into_reference().unwrap();
+        smuggled.bytes = payload_witness.bytes;
+        // Demanding the shape, not merely tolerating it, is what stops a large
+        // payload being handed to a guest that has no need for it.
+        assert!(!verify_selection_reference_witness(&commitment, &smuggled));
+    }
+
+    #[test]
+    fn a_payload_check_refuses_a_reference_only_witness() {
+        let (commitment, payload_witness) = nested_witness();
+        let reference = payload_witness.into_reference().unwrap();
+        // The two modes are not interchangeable in either direction.
+        assert!(!verify_selection_witness(&commitment, &reference));
+    }
+
+    #[test]
+    fn a_range_proof_cannot_be_reduced_to_a_reference() {
+        let (payload, proof) = range_fixture(8, 2, 5);
+        assert!(verify_selection_proof(&payload, &proof));
+        // A trailing `ListRange` derives its starting hash from the payload's
+        // element roots, so there is no single subtree root to carry and the
+        // reduction must fail rather than invent one.
+        let witness = SelectionWitness::from_payload(payload, proof.clone());
+        assert!(witness.into_reference().is_none());
+        assert!(!verify_selection_reference(&[0u8; 32], &proof));
     }
 
     /// A whole-list payload folds to the same root as its metadata and
@@ -2298,14 +2529,14 @@ mod tests {
             selected_len: whole.len() as u64,
             payload_kind: SelectionPayloadKind::List,
         };
-        let witness = SelectionWitness {
-            bytes: whole,
-            proof: SelectionProof {
+        let witness = SelectionWitness::from_payload(
+            whole,
+            SelectionProof {
                 path: SelectorPath::default(),
                 root_hash: root,
                 steps: Vec::new(),
             },
-        };
+        );
         assert!(!verify_selection_witness(&commitment, &witness));
     }
 

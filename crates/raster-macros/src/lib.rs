@@ -2886,20 +2886,22 @@ fn gen_sequence_wrapped_body(
     item_fn: &ItemFn,
     return_kind: &ProtocolReturnKind,
 ) -> proc_macro2::TokenStream {
-    let is_main = fn_name_str == "main";
     let body = &item_fn.block;
     let input_serialization = gen_sequence_input_serialization(&item_fn);
     let auth_result_binding = auth_result_binding(return_kind, body);
     let trace_output_binding = trace_output_binding(return_kind);
 
-    let sequence_start_publish = if is_main {
-        quote! {}
-    } else {
-        quote! {
-            ::raster::publish_trace_event(::raster::core::trace::TraceEvent::SequenceStart(
-                __raster_record.clone(),
-            ));
-        }
+    // Unconditional: `main` never reaches this generator (the caller dispatches
+    // on `item_fn.sig.ident == "main"` and `fn_name_str` is that same ident),
+    // so every sequence wrapped here publishes both boundary events. This was
+    // an `if is_main { quote!{} }` that could not be true, and reading it as
+    // "main suppresses its SequenceStart" misdescribes the root shape: main
+    // publishes no sequence events at all, and its boundaries are
+    // `ProgramStart`/`ProgramEnd`.
+    let sequence_start_publish = quote! {
+        ::raster::publish_trace_event(::raster::core::trace::TraceEvent::SequenceStart(
+            __raster_record.clone(),
+        ));
     };
 
     let output_type_expr = match &item_fn.sig.output {

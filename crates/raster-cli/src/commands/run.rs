@@ -735,6 +735,7 @@ fn build_entrypoint_membership_witness(state: &ProofStorageState) -> Option<Stor
 }
 
 fn build_storage_selection_witnesses(
+    step_record: &StepRecord,
     input_source_witness: Option<&FnInput>,
     trace_recorder: &TraceRecorder,
 ) -> BTreeMap<String, SelectionWitness> {
@@ -751,24 +752,48 @@ fn build_storage_selection_witnesses(
             }
             let reference =
                 StorageRef::new(storage.coordinates.clone(), storage.commitment.clone());
-            Some((
-                binding_name.clone(),
-                trace_recorder
-                    // The recorded commitment says which view of the node it
-                    // committed to. This process did not produce the trace, so
-                    // it cannot infer that from the payload — it has none yet.
-                    .storage_selection_witness(
-                        &reference,
-                        &storage.selector,
-                        storage.selection.payload_kind,
+            let witness = trace_recorder
+                // The recorded commitment says which view of the node it
+                // committed to. This process did not produce the trace, so
+                // it cannot infer that from the payload — it has none yet.
+                .storage_selection_witness(
+                    &reference,
+                    &storage.selector,
+                    storage.selection.payload_kind,
+                )
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "Failed to build storage selection witness for '{}': {}",
+                        binding_name, error
                     )
-                    .unwrap_or_else(|error| {
-                        panic!(
-                            "Failed to build storage selection witness for '{}': {}",
-                            binding_name, error
-                        )
-                    }),
-            ))
+                });
+
+            // A binding the step only forwards as a reference ships its root
+            // instead of its value. The payload is read once here, on the
+            // host, and never reaches the guest — which is the whole point:
+            // `prompt-prepare` forwards a 106 MB `List<MergeBucket>` into a
+            // sequence whose recorded input is 145 bytes, and rebuilding that
+            // list's Merkle tree exhausted the guest heap.
+            //
+            // The same `binding_requires_payload` the guest enforces, so the
+            // host cannot ship a shape the guest will reject — and cannot
+            // choose a weaker one either.
+            let witness = if raster_core::trace::binding_requires_payload(
+                &step_record.kind,
+                binding_name.as_str(),
+                input_source_witness.storage(),
+            ) {
+                witness
+            } else {
+                witness.clone().into_reference().unwrap_or_else(|| {
+                    panic!(
+                        "Failed to reduce forwarded binding '{}' to a selection reference",
+                        binding_name
+                    )
+                })
+            };
+
+            Some((binding_name.clone(), witness))
         })
         .collect()
 }
@@ -836,9 +861,22 @@ pub fn prove(
                     step_record.coordinates()
                 )
             });
-        let input_witness = step_witness.input_data();
+        // The witness store is keyed by coordinates alone, and a sequence's
+        // `SequenceStart` and `SequenceEnd` share coordinates — the End does
+        // `get_mut` on the Start's entry and fills in `output_data` only
+        // (`recorder.rs`, which already guards the same sharing for
+        // `storage_write`). So both input fields still hold the *Start's*
+        // values when this step is the End. Take each only when this step's
+        // record actually declares the matching commitment: the guest refuses
+        // an input source witness on a step that commits to none, and never
+        // reads an input witness there.
+        let input_witness = step_record
+            .input_commitment()
+            .and_then(|_| step_witness.input_data());
         let output_witness = step_witness.output_data();
-        let input_source_witness = step_witness.input_source_witness();
+        let input_source_witness = step_record
+            .input_source_commitment()
+            .and_then(|_| step_witness.input_source_witness());
         let sequence_scope_witness =
             step_record
                 .coordinates()
@@ -848,12 +886,35 @@ pub fn prove(
                         .step_witness_at(&parent_coordinates)
                         .and_then(|witness| witness.input_source_witness())
                 });
-        let storage_selection_witnesses =
-            build_storage_selection_witnesses(input_source_witness.as_ref(), trace_recorder);
+        let storage_selection_witnesses = build_storage_selection_witnesses(
+            step_record,
+            input_source_witness.as_ref(),
+            trace_recorder,
+        );
         let draft_transition_witness = step_witness.draft_transition_witness();
         let before_state = current_storage_state.clone();
         let mut storage_read_witnesses = Vec::new();
-        if let Some(input_source_witness_ref) = input_source_witness.as_ref() {
+        // Only a step that declares storage roots can carry a storage witness:
+        // the guest has nothing to verify membership *against* otherwise, and
+        // refuses one outright ("Only execution steps may carry storage
+        // witnesses"). A `SequenceStart` legitimately has storage bindings —
+        // that is how a sequence receives its arguments — so without this gate
+        // the reads get built for it and the proof is rejected.
+        //
+        // The write side already guards the same way one block below; this is
+        // the read half of it. A sequence step is transparent to the storage
+        // chain: the guest forwards its carried frontier unchanged, so there is
+        // no root here for a membership proof to be relative to. The bindings
+        // are proved where they are consumed, against that step's own root.
+        //
+        // Gated here rather than on the `StorageWitness` that wraps the loop so
+        // the proofs are never built: each binding costs a coordinate-index
+        // membership proof and a log witness whose only consumer is that
+        // discarded witness.
+        let step_reads_storage = step_record.storage_roots().is_some();
+        if let Some(input_source_witness_ref) =
+            input_source_witness.as_ref().filter(|_| step_reads_storage)
+        {
             for storage_meta in input_source_witness_ref.storage().values() {
                 let index_witness = before_state
                     .coordinate_index

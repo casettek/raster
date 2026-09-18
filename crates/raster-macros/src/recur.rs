@@ -1373,7 +1373,17 @@ pub(crate) fn gen_recur_sequence_driver_function(
                     return result;
                 }
 
-                let __raster_input_trace = ::raster::auth_ref_trace(&input)
+                // Same metadata path the recur-tile drivers above take, and for
+                // the same two reasons (`lazy-list-recur.md` §2, which binds
+                // *both* macros): `auth_ref_trace` resolves the binding, which
+                // materializes the whole list before any runner runs — the
+                // earliest and largest of the eager paths — and it records a
+                // `Raw` selection, so the site's `L` is index-trusted rather
+                // than authenticated. `checks::cfs::authenticated_source_len`
+                // requires the `0x0A` metadata form and refuses `Raw`, so no
+                // fraud proof covering a recur *sequence* site could be built
+                // at all while this used the ordinary tracer.
+                let __raster_input_trace = ::raster::recur_source_trace(&input)
                     .unwrap_or_else(|e| panic!("Failed to build recur sequence input trace: {}", e));
                 let mut __raster_trace_values = ::raster::alloc::vec::Vec::new();
                 let mut __raster_trace_args = ::raster::alloc::vec::Vec::new();

@@ -282,17 +282,322 @@ issue if it reproduces outside this environment.
   (`program.rs:279`, `:308`, `:326`) and by having `build` say when it has *not* written those
   artifacts rather than printing a bare `Build complete!`. Only the fraud path reaches the check:
   an honest audit returns `Ok` before `prove()`, which is why a stale lock can sit unnoticed.
-- **The transition guest cannot decode the `ProgramDefinition` frame** — newly reached once the
-  lock was refreshed, and the current blocker:
-  `guests/transition/src/fraud_proof.rs:64` → `failed to decode ProgramDefinition: Found a bool
-  that wasn't 0 or 1`, surfacing host-side at `raster-prover/src/transition.rs:289`. A postcard
-  misalignment of that shape means the host and the guest disagree about the struct's layout,
-  which normally means the embedded guest ELF was built against a different `raster-core`. Worth
-  ruling out a stale risc0 build cache first, since `RISC0_SKIP_BUILD=1` is used freely during
-  development and this workspace has moved `raster-core` repeatedly.
-- **Replay journal decode failures** — `Failed to decode replay journal: Hit the end of buffer`
-  for every tile, non-fatal (`run.rs:1002` prints and continues). Consistent with prebuilt tile
-  guests predating a `raster-core` change; a clean guest rebuild would confirm.
+- ~~**The transition guest cannot decode the `ProgramDefinition` frame**~~ — **fixed 2026-09-17.**
+  Not a stale ELF: `skip_serializing_if` on four `cfs.rs` fields omitted them on write while
+  `Deserialize` still read at those offsets, shifting every later field. postcard is positional and
+  non-self-describing, so the attributes are unusable there. Fixed by removing them and keeping
+  `#[serde(default)]`.
+- ~~**The entry-argument binding can never be recomputed**~~ — **fixed 2026-09-17.**
+  `checks/store.rs:58`, `"Storage read witness commitment does not match requested commitment"`,
+  reached by every fraud window that opens *after* `ProgramStart` in a program with entry
+  arguments. Not corruption: the two roots are the same two commitments in different encodings.
+  `AuthorizationJournal.external_inputs_commitments` holds the manifest's **lowercase hex text** —
+  `normalize_hash_string` in the authorization guest ends in `String::into_bytes`, so a sha256
+  entry is 64 ASCII bytes, not a digest — while the entry object the runtime builds
+  (`backing::ReferencedObject::combined_root`) hashes raw `source.commitment` bytes.
+  `checks::entrypoint::combined_root` fed the text straight to `struct_commitments_root`, hashing
+  the digest's *spelling*.
+
+  Confirmed arithmetically before changing anything: over the same pair
+  `(tokenizer, initial_pieces)`, hashing the decoded digests reproduces the storage object at `[]`
+  (`228df060…`) exactly, and hashing the text reproduces what the guest computed (`1dea6b5a…`).
+
+  Fixed in `combined_root`, not in the authorization guest: the hex-text form is the journal's
+  established contract — `chain_fraud/src/main.rs:136` compares against it with `hex_lower`, and
+  `transition.rs:558` pins it as a byte-string literal — so changing the guest would move the
+  authorization image id *and* break the chain-fraud check. The decode is strict (64 lowercase hex
+  bytes, nothing else): accepting both spellings would let two distinct roots authorize one
+  manifest entry, and a prover would present whichever its claimed storage state matched.
+
+  **Why no test caught it.** Every entrypoint test fed `combined_root`'s own output back as the
+  expected value — tautologies that hold under any encoding. The one test pinning an external
+  convention, `combined_root_matches_struct_hash_convention_over_declared_commitments`, built its
+  journal from `sha(b"…")` raw digests, a shape the real authorization guest cannot produce. The
+  fixtures now hex-encode, which makes that test non-tautological on its own.
+
+  **Verified:** `prompt-prepare` audited against `fraud_demo.bin` now runs the transition guest for
+  ~20 minutes at ~1900% CPU before failing elsewhere, where every previous attempt asserted in
+  seconds. Guest tests 84, `raster-core` 141, clippy clean.
+
+- ~~**The transition guest exhausts its heap**~~ — **fixed 2026-09-17.** Newly reached once the
+  binding recomputed:
+
+  ```
+  transition.rs → Guest panicked: Out of memory! You have been using the default bump
+  allocator which does not reclaim memory. Enable the `heap-embedded-alloc` feature...
+  ```
+
+  **The error's own advice is wrong here, and measuring is what showed it.** Two facts rule it out.
+  The guest runs **once per step**, not once per window (`prove_transition_window` builds a fresh
+  `ExecutorEnv` and calls `prover.prove` inside the step loop), so nothing accumulates across a
+  window and there are no per-step temporaries to reclaim. And the failing step's input is **106 MB
+  of live data**, which a reclaiming allocator cannot shrink — the risc0 guest address space is
+  smaller than the working set it is being handed.
+
+  Measured on `prompt-prepare` in `RISC0_DEV_MODE=1` (full guest execution, no proving — minutes
+  instead of hours), printing each step's serialized guest input:
+
+  | step | whole input | largest field |
+  | --- | --- | --- |
+  | `[2, 0, 14, 4]` | 70,848 | `entrypoint_membership_witness` 9,578 |
+  | `[2, 0, 14]` | **106,091,826** | `storage_selection_witnesses` **106,038,269** |
+
+  All of it is one entry: selection `merge_buckets` = **106,037,710 bytes**. Its siblings on the
+  same step are `merge_bucket_count` 306 and `input` 213. Executed alone, the first step completes
+  in 28,412,563 cycles over 33 segments with no OOM, so the first step was never the problem —
+  it is simply slow to prove (>22 min), which is what made proving useless as a measurement tool.
+
+  **Cause.** `merge_buckets: List<MergeBucket>` is the tokenizer's whole merge table, passed as a
+  *whole-object* argument to the sequence at `[2, 0, 14]`. `build_storage_selection_witnesses`
+  (`run.rs:737`) builds a witness for every storage binding with `selected_len > 0`, including one
+  whose selector is empty — so the witness's `bytes` field is the entire object. The guest then
+  runs `verify_selection_witness`, which hashes all of it, to re-derive a root it already holds:
+  `storage_meta.commitment` is asserted equal to `selection.source_root_hash` two lines earlier,
+  and `verify_storage_read_witness` has already proven that commitment sits at those coordinates in
+  the authenticated store.
+
+  For a whole-object binding the fold therefore establishes nothing the guest does not already
+  know, at the cost of moving and rehashing the entire value — which is precisely what an
+  `AuthRef` exists to avoid.
+
+  **The fix: a forwarded reference ships its root, not its value.**
+
+  A sequence — ordinary or recur — receives storage arguments as references and forwards them
+  inward; only a tile that consumes a value ever sees bytes. The witness builder did not make that
+  distinction, so it materialized the value for every binding. Worse, `SequenceStart` carries no
+  storage roots, so `verify_storage_transition` returns before the selection branch — the 106 MB
+  was deserialized into the guest and then *never looked at*.
+
+  `SelectionWitness` gains `selected_root: Option<Hash32>`, set instead of `bytes`, and
+  `verify_selection_reference` folds from that root to `proof.root_hash`. Sound because the fold is
+  self-authenticating: `root_hash` is checked against a commitment already proven to sit at the
+  binding's coordinates, and a wrong root cannot reach it without a collision. That establishes
+  exactly the scoping fact a forwarded reference needs — *this reference resolves inside an object
+  the store authenticates* — and nothing about bytes the step never read.
+
+  The rule lives once, in `raster_core::trace::binding_requires_payload`, and both the host builder
+  and the guest call it, so the host cannot ship a shape the guest rejects nor choose a weaker one:
+
+  | condition | payload required | why |
+  | --- | --- | --- |
+  | `StepKind::Exec` | yes | a tile ran on these bytes |
+  | binding is `"input"` | yes | `authenticated_source_len` reads the sweep bound `L`; the list *metadata* view, so small |
+  | binding cited as a `BoundIndex` source | yes | `verify_bound_index_bindings` compares its `selected_hash` against the claimed index, which means nothing unless bytes back it |
+  | otherwise | no | forwarded reference |
+
+  The third row is the subtle one: without it a prover could forward an index source as a
+  reference, forge its `selected_hash`, and have any index accepted.
+
+  The shape check runs at the top of `verify_storage_transition`, *before* the storage-roots guard,
+  because a `SequenceStart` exits that guard immediately and is exactly where forwarded bindings
+  live. `SelectionProof` is host-supplied evidence and is not in the recorded trace, so **no trace
+  leaf, fingerprint or `program_commitment` moves** — only the transition guest image id, which
+  this cycle already moves.
+
+  **Verified:** the audit that OOM'd now proves past that step — zero `Out of memory` against one
+  before — and stops on an unrelated pre-existing check (below). `raster-core` 150,
+  `raster-runtime` 62, transition guest 88, clippy clean.
+
+  **Not fixed by this:** a tile that genuinely consumes a value larger than the guest heap. That
+  payload is the thing being proved, so it cannot be reduced to a root; it is what
+  `docs/proposals/paged-bytes.md` addresses.
+
+- ~~**A `SequenceEnd` step is handed an input source witness**~~ — **fixed 2026-09-17.**
+  `checks/io.rs` → `SequenceEnd must not carry input source witness`. `StepWitnessStore` is keyed
+  by coordinates alone and a sequence's `SequenceStart`/`SequenceEnd` share them: the End does
+  `get_mut` on the Start's entry and fills in `output_data` only. The recorder already guards this
+  sharing for `storage_write` (`recorder.rs`: *"`main`'s `SequenceEnd` shares coordinates `[]` with
+  the `ProgramStart` step"*) and left `input_source_witness` and `input_data` inherited.
+
+  It stayed hidden because `TraceEvent::ProgramStart` inserts `input_source_witness: None`, so
+  *main*'s `SequenceEnd` at `[]` reads `None` and passes. Only a **nested** sequence's end inherits
+  a real witness, and only a fraud window inside one reaches it.
+
+  The naive host-side gate would have broken plain nested sequences: `checks/cfs.rs`'s
+  `verify_step_record_inputs` returns early for root coordinates and recur iterations but not for a
+  plain nested `SequenceEnd`, which falls through to `input_source_witness.unwrap_or_else(panic)`.
+  So the guest held two contradictory expectations. `cfs.rs` was the wrong one, and its check was
+  **vacuous**: `input_source_commitment` is `None` for a `SequenceEnd`, so nothing tied that witness
+  to the record and anything it "proved" could have been fabricated. Fixed by returning early there
+  — after `record_matches_item`, so the step is still held to its CFS item — and by having the host
+  take each witness only when the record declares the matching commitment. The `io.rs` message now
+  names the real condition; it said "SequenceEnd" while covering `ProgramStart` and `ProgramEnd`
+  too.
+
+  **A second finding from the same measurement.** With `[2, 0, 14]` reduced, the 106 MB reappeared
+  at `[2, 0]` — the recur *site* step, whose kind is `Exec` and which `binding_requires_payload`
+  therefore treated as a consumer. It is not: the recorder emits `ExecTarget::RecurTile` /
+  `RecurSequence` only on the step that **closes** a site, which executes nothing and merely holds
+  the site's arguments, while `ExecTarget::Tile` marks both `TileExec` and
+  `RecurTileIterationExec` — every step where a tile really ran. The rule now keys on the target,
+  which is the same predicate as `StepRecord::requires_replay_proof` and for the same reason.
+
+  **The fixtures described a trace that cannot exist.** `recorder.rs`'s tests recorded
+  `TraceEvent::SequenceStart` and `SequenceEnd` with `fn_name: "main"` — events the generated code
+  never emits. `#[sequence] fn main` routes to `gen_main_wrapped_body`, not to
+  `gen_sequence_wrapped_body` (`raster-macros/src/lib.rs`, `if item_fn.sig.ident == "main"`), and
+  that generator publishes **no sequence events at all**: main's boundaries are `ProgramStart` and
+  `ProgramEnd`, symmetrically. Exactly two steps sit at `[]`.
+
+  The `is_main` branch inside `gen_sequence_wrapped_body` is dead code — that function is only
+  reached on the non-main arm — and reading it as "main takes this path with the start suppressed"
+  is what produced a wrong account of the root shape twice while diagnosing this. The fixture therefore took the
+  wrong arm of both `record` and `StepWitnessStore::insert`, and the tests neither exercised the
+  real root shape nor documented it — which is what made this bug hard to reason about and led to
+  one wrong explanation of it. The same pattern as the authorization-journal fixtures in the
+  entry-argument blocker above: a test that builds an input the producer cannot produce.
+
+  Fixed: `start_main` now records `ProgramStart` with zero arguments (the supported "program still
+  starts, binding nothing" path), and three tests pin the real shape — `ProgramStart` creates the
+  root entry with no input source; main's `SequenceEnd` lands on it and adds none; a nested
+  sequence's `SequenceEnd` lands on its own `Start`'s entry and inherits its input source, which is
+  exactly why witnesses must be selected by the record's declarations rather than by coordinates.
+  The "Missing step witness entry" panic also named only `SequenceStart`, which is wrong at the
+  root; it now names both creators.
+
+  **Verified:** the audit now proves **5** transition steps with **0** `Out of memory`, against 2
+  and 1 before. `raster-core` 152, `raster-runtime` 65, transition guest 90, clippy clean.
+
+- ~~**A `SequenceStart` step is handed a storage witness**~~ — **fixed 2026-09-18.**
+  `checks/store.rs` → `Only execution steps may carry storage witnesses`. `run.rs` built the read
+  witnesses from the step's storage bindings gated only on the witness existing, never on the step
+  kind — and a `SequenceStart` legitimately has storage bindings, since that is how a sequence
+  receives its arguments. The write side one block below was already gated
+  (`if step_record.appends_to_storage()`), with a comment describing the same class of bug; this
+  was its read half.
+
+  Fixed by gating the loop on `step_record.storage_roots().is_some()`, placed on the loop rather
+  than on the `StorageWitness` that wraps it so the proofs are never built at all — each binding
+  costs a coordinate-index membership proof and a log witness whose only consumer is the discarded
+  witness. (An earlier draft justified the placement by claiming `membership_proof` would panic on
+  an absent coordinate; the failing run disproves that — the guest's rejection is proof the host
+  built the witness successfully, so every coordinate resolved.)
+
+  **Verified:** the audit now proves **6** transition steps, 0 `Out of memory`.
+
+- **Why a `SequenceStart` needs no storage evidence at all** (recorded because an earlier draft of
+  this file claimed the opposite). A step with no `StorageRoots` never proposes a root: the guest
+  returns its own carried frontier unchanged, and every step that *does* declare roots must match
+  it (`Execution-step storage root before does not match current storage root`). So a sequence step
+  is transparent to the storage chain — it cannot alter the root because it is never asked for one,
+  and giving it roots would be *worse*, handing a prover somewhere to propose one.
+
+  Its arguments are authenticated in three places, none of them a storage witness on the sequence
+  step: `input_source_commitment` binds the argument list to the record and the record is
+  fingerprint-bound to `commit.bin`; `verify_step_record_inputs` holds those arguments to the CFS;
+  and the **consuming** step — which has roots — proves the coordinates are in the store and the
+  selection resolves. `checks/cfs.rs`'s `verify_sequence_scope_parent` plus `assert_record_in_trace`
+  pin "argument `i` of the parent" to the parent's own record. The obligation is discharged where
+  consumption happens, which is the only place there is an authenticated root to check against.
+
+  Open nuance, untraced: a recur sequence *iteration*'s `SequenceStart` returns early from
+  `verify_step_record_inputs` into `verify_recur_iteration_chunking`, so the generic CFS binding
+  check is skipped there in favour of the recur rules. Whether those cover the same ground is worth
+  its own look.
+
+- ~~**A recur site's source is recorded as a raw payload, not list metadata**~~ — **fixed
+  2026-09-18.** `checks/cfs.rs` → `Recur site start … must commit to list metadata, not a raw
+  payload` (`left: Raw, right: List`) at the `call_recur_seq!` site `[3, 0]`.
+
+  `lazy-list-recur` §2 was implemented for the recur **tile** macro and never for the recur
+  **sequence** one, though §3 says it binds both. `call_recur!` traced its source through
+  `recur_source_trace` (`recur.rs:745`, `:870`); `call_recur_seq!` used `auth_ref_trace`
+  (`:1376`) — while carrying, verbatim, the comment describing the `0x0A` metadata selection it
+  did not make.
+
+  **Two costs, one line.** `authenticated_source_len` refuses anything but `List`, so no fraud
+  proof covering a recur *sequence* site could be produced at all. And `auth_ref_trace` resolves
+  the binding, materializing the whole list before any runner runs — §2's *"earliest and largest
+  of the three eager paths"*, the very thing that proposal's headline change exists to remove. The
+  recur sequence had been paying the full `O(list)` eager resolve the whole time.
+
+  **How it was found.** Two wrong diagnoses first, both from reasoning instead of measuring: that
+  the program side never produces `List` (a grep for the literal enum variant missed
+  `recur_source_trace`'s indirect path), and that both recur macros already called it (two call
+  sites seen, assumed one per macro — both are recur-*tile* variants). The measurement that settled
+  it: the site's `"input"` binding was byte-identical to the enclosing sequence's `pieces`
+  argument, `selected_len = 441` where metadata is a constant 41.
+
+  **Verified:** `a_recur_sequence_site_commits_to_its_source_list_metadata` (`raster/tests/
+  recur_draft.rs`) asserts `payload_kind == List` and `selected_len == 41` through the macro rather
+  than a hand-built fixture — and reverting the one-line fix makes it fail with the production
+  symptom (`left: Raw, right: List`), so it is not tautological. `prompt-prepare` regenerated its
+  commitment honestly (exit 0) and re-audited. Error message corrected too: it named `call_recur!`
+  on a path reachable from either macro.
+
+  **Cost:** every recur-sequence site's recorded binding changes, so `input_source_commitment`,
+  the step record, the trace leaf and the fingerprint all move. Any existing `commit.bin` for a
+  program using `call_recur_seq!` must be regenerated.
+
+- **A window step is not where the CFS expects it** — newly reached, and the current blocker:
+  `checks/cfs.rs` → `Step coordinates are not in expected next coordinates`, two steps into a
+  window. The injector places its tamper by trace index, so the regenerated commitment moved the
+  window to a different part of the trace; whether this is a property of that region or of the new
+  window's opening position is the first thing to establish.
+
+- **Why a `SequenceStart` needs no storage evidence at all** (recorded because an earlier draft of
+  this file claimed the opposite). A step with no `StorageRoots` never proposes a root: the guest
+  returns its own carried frontier unchanged, and every step that *does* declare roots must match
+  it (`Execution-step storage root before does not match current storage root`). So a sequence step
+  is transparent to the storage chain — it cannot alter the root because it is never asked for one,
+  and giving it roots would be *worse*, handing a prover somewhere to propose one.
+
+  Its arguments are authenticated in three places, none of them a storage witness on the sequence
+  step: `input_source_commitment` binds the argument list to the record and the record is
+  fingerprint-bound to `commit.bin`; `verify_step_record_inputs` holds those arguments to the CFS;
+  and the **consuming** step — which has roots — proves the coordinates are in the store and the
+  selection resolves. `checks/cfs.rs`'s `verify_sequence_scope_parent` plus `assert_record_in_trace`
+  pin "argument `i` of the parent" to the parent's own record. The obligation is discharged where
+  consumption happens, which is the only place there is an authenticated root to check against.
+
+  Open nuance, untraced: a recur sequence *iteration*'s `SequenceStart` returns early from
+  `verify_step_record_inputs` into `verify_recur_iteration_chunking`, so the generic CFS binding
+  check is skipped there in favour of the recur rules. Whether those cover the same ground is worth
+  its own look.
+
+- **A recur site's source is recorded as a raw payload, not list metadata** — newly reached, and
+  the current blocker:
+
+  ```
+  checks/cfs.rs → Recur site start StepRecord { exec_index: 735,
+      sequence_id: "merge_prompt_piece", coordinates: CfsCoordinates([3, 0]),
+      kind: SequenceStart { .. } } must commit to list metadata, not a raw payload
+    left: Raw    right: List
+  ```
+
+  `authenticated_source_len` requires the site's `"input"` binding to commit to the `0x0A`
+  `(len, elements_root)` record. That strictness is load-bearing, not incidental: it is what makes
+  `L` *authenticated* rather than index-trusted, and it is the check that refuses the forged
+  `len = 0` sweep `lazy-list-recur` exists to close. A `Raw` payload cannot satisfy it even in
+  principle — `decode_list_metadata_len` parses the `0x0A` form and a raw payload is not one.
+
+  **Not yet diagnosed.** An earlier draft here claimed the program side never produces `List`,
+  from a grep for the literal enum variant in `raster-macros`/`raster`. That grep was too shallow
+  and the claim is **wrong**: `raster/src/input.rs`'s `recur_source_trace` builds the binding from
+  `stored_list_metadata`, whose commitment is `List`-kinded, and *both* recur macros call it
+  (`raster-macros/src/recur.rs:745` and `:870`, each with a comment citing `lazy-list-recur` §2).
+  So §2 is implemented and the site start should already record `List`.
+
+  What is established: the failing record is the recur **site** start (`[3, 0]` is main's item 3 →
+  `merge_round` → its child 0, the `call_recur_seq!` site; iterations are `[3, 0, i]`), the
+  `"input"` binding is present, and its recorded `payload_kind` is `Raw`. Why a binding built by
+  `recur_source_trace` arrives as `Raw` is the open question — measure the recorded binding rather
+  than reason about it, which is what the wrong claim above cost.
+
+  A related correction: an even earlier draft guessed this was specific to a produced-list source
+  because "the site at `[2, 0]` passed". That evidence does not exist — `[2, 0]` passed only as the
+  site-*close* `Exec` step, and `authenticated_source_len` runs only on `SequenceStart`.
+
+  **The tests still hand-build the shape.** `seed_recur_source` inserts
+  `metadata.selected.commitment` directly rather than exercising `recur_source_trace`, so whatever
+  is happening between that function and the recorded trace is not covered by any recorder test.
+
+  **Directions** (not picked): build the site's `input` binding from a metadata selection in
+  `call_recur_seq!`/`call_recur!`, so the recorded commitment describes what the site actually
+  consumes; or patch the binding in the recorder when it emits the site `Start`, where
+  `recur_source_len` already holds the metadata and where `input_source_commitment` is computed
+  over the same (patched) input. The first is what `lazy-list-recur` §1–§2 describes; the second is
+  smaller but makes the recorded binding differ from what the program published.
 
 ## 3. What this is not
 

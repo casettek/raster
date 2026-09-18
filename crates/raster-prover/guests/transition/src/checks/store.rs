@@ -11,7 +11,9 @@ use raster_core::cfs::CfsCoordinates;
 use raster_core::coordinate_index::{
     verify_coordinate_index_membership, verify_coordinate_index_non_membership,
 };
-use raster_core::input::{verify_bytes_page_geometry, verify_selection_witness};
+use raster_core::input::{
+    verify_bytes_page_geometry, verify_selection_reference_witness, verify_selection_witness,
+};
 use raster_core::trace::{FnInput, StepRecord, StorageRoots};
 use raster_core::transition::{
     SerializableFrontier, StorageEntry, StorageLogWitness, StorageReadWitness, StorageWitness,
@@ -143,6 +145,38 @@ pub fn verify_storage_transition(
     current_frontier: &mut NonEmptyFrontier<Bytes>,
     current_index_root: &[u8],
 ) -> (SerializableFrontier, Vec<u8>, Vec<u8>) {
+    // Runs for *every* step, before the storage-roots guard below. A
+    // `SequenceStart` carries no roots, so it exits that guard immediately —
+    // and a sequence step is exactly where a forwarded binding lives, so a
+    // check placed inside the guard would never see one. Without this, a host
+    // could still hand the guest a payload it has no use for, which is how a
+    // 106 MB `List<MergeBucket>` reached a step whose recorded input was 145
+    // bytes and exhausted the guest heap.
+    if let Some(input_source_witness) = input_source_witness {
+        for (binding_name, storage_meta) in input_source_witness.storage() {
+            if storage_meta.selection.selected_len == 0 {
+                continue;
+            }
+            let Some(witness) = storage_selection_witnesses.get(binding_name.as_str()) else {
+                continue;
+            };
+            let requires_payload = raster_core::trace::binding_requires_payload(
+                &step_record.kind,
+                binding_name.as_str(),
+                input_source_witness.storage(),
+            );
+            assert_eq!(
+                !witness.is_reference_only(),
+                requires_payload,
+                "Storage input '{}' on step {:?} carries the wrong selection witness shape: \
+                 a binding whose value the step consumes must carry its payload, and one the \
+                 step only forwards must omit it",
+                binding_name,
+                step_record.coordinates,
+            );
+        }
+    }
+
     if let Some(StorageRoots {
         root_before: storage_root_before,
         root_after: storage_root_after,
@@ -196,16 +230,45 @@ pub fn verify_storage_transition(
                                 binding_name
                             )
                         });
-                    assert!(
-                        verify_selection_witness(&storage_meta.selection, witness),
-                        "Storage input '{}' selection witness is invalid",
-                        binding_name,
+                    // Which mode is legal is decided here, from the record's
+                    // own kind and this step's storage map — never from the
+                    // witness's shape. A prover that could pick would always
+                    // pick the cheaper one.
+                    let requires_payload = raster_core::trace::binding_requires_payload(
+                        &step_record.kind,
+                        binding_name.as_str(),
+                        input_source_witness.storage(),
                     );
-                    assert!(
-                        verify_bytes_page_geometry(witness),
-                        "Storage input '{}' bytes-page geometry is invalid",
-                        binding_name,
-                    );
+                    if requires_payload {
+                        assert!(
+                            verify_selection_witness(&storage_meta.selection, witness),
+                            "Storage input '{}' selection witness is invalid",
+                            binding_name,
+                        );
+                        assert!(
+                            verify_bytes_page_geometry(witness),
+                            "Storage input '{}' bytes-page geometry is invalid",
+                            binding_name,
+                        );
+                    } else {
+                        // Forwarded as a reference: the step never saw the
+                        // bytes, so the fold runs from the selected value's
+                        // root and proves only that the reference resolves
+                        // inside an object the store authenticates. Demanding
+                        // the reference shape rather than merely accepting it
+                        // keeps a large payload from being smuggled back in.
+                        assert!(
+                            witness.is_reference_only(),
+                            "Storage input '{}' is forwarded as a reference, so its selection \
+                             witness must omit the payload and carry the selected root",
+                            binding_name,
+                        );
+                        assert!(
+                            verify_selection_reference_witness(&storage_meta.selection, witness),
+                            "Storage input '{}' selection reference witness is invalid",
+                            binding_name,
+                        );
+                    }
                 }
             }
 

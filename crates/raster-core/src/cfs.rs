@@ -632,9 +632,14 @@ pub struct TileItem {
     pub sources: Vec<InputBinding>,
 }
 
-fn is_false(value: &bool) -> bool {
-    !*value
-}
+// Every field below is written unconditionally. `skip_serializing_if` would be
+// harmless in the CFS's JSON form, but this struct is also postcard-encoded as
+// part of `ProgramDefinition::canonical_bytes` — the transition guest's
+// verification frame — and postcard is positional and non-self-describing. A
+// skipped field is simply absent from the stream while `Deserialize` still
+// reads one at that offset, so every later field shifts and the frame fails to
+// decode. `#[serde(default)]` stays: it costs nothing here and keeps older
+// JSON readable.
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecurTileItem {
@@ -643,11 +648,11 @@ pub struct RecurTileItem {
     /// Static chunk size from `call_recur! { ..., chunk = N }`: each iteration
     /// consumes a contiguous group of N source elements (the final group may be
     /// shorter). `None` means per-element iteration.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub chunk: Option<u64>,
     /// Whether this recur deliberately returns its output draft without
     /// finalizing it. False is the historical/default behavior.
-    #[serde(default, skip_serializing_if = "is_false")]
+    #[serde(default)]
     pub leaves_output_open: bool,
     /// Whether the site's own output *is* its carried state — `state` with no
     /// `output`.
@@ -657,7 +662,7 @@ pub struct RecurTileItem {
     /// successor, so the only thing it can be compared against is the value the
     /// site returned. That comparison is only meaningful for this shape: a
     /// state+output site discards its state and returns the draft.
-    #[serde(default, skip_serializing_if = "is_false")]
+    #[serde(default)]
     pub state_is_output: bool,
 }
 
@@ -668,7 +673,7 @@ pub struct RecurSequenceItem {
     /// See [`RecurTileItem::state_is_output`]. A recur sequence needs it more
     /// than a recur tile does: a tile's last iteration is replay-proven, so its
     /// final state is anchored regardless, while a sequence's is not.
-    #[serde(default, skip_serializing_if = "is_false")]
+    #[serde(default)]
     pub state_is_output: bool,
 }
 

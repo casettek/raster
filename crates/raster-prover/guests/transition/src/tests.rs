@@ -37,7 +37,7 @@ use crate::checks::cfs::{
     verify_step_record_inputs,
 };
 use crate::checks::drafts::verify_draft_transition;
-use crate::checks::io::{input_source_commitment, verify_io_witness};
+use crate::checks::io::{input_source_commitment, verify_io_witness, verify_step_record};
 use crate::checks::store::{storage_leaf_hash, verify_storage_transition};
 use crate::merkle_tree::{
     deserialize_frontier, frontier_root, sha256_bytes, sha256_hex, Bytes, TraceBridgeTree,
@@ -102,11 +102,28 @@ fn draft_tile_step(exec_index: u64) -> StepRecord {
     }
 }
 
+/// The manifest's spelling of a digest, which is what the authorization
+/// guest actually commits: lowercase hex text, not the 32 raw bytes. The
+/// fixtures below take raw digests and encode here, so every entrypoint test
+/// runs against a journal the real guest could have produced.
+fn authorized_commitment_text(commitment: &[u8]) -> Vec<u8> {
+    commitment
+        .iter()
+        .flat_map(|byte| {
+            let hex = format!("{:02x}", byte);
+            hex.into_bytes()
+        })
+        .collect()
+}
+
 fn authorization_journal(binding_name: &str, commitment: &[u8]) -> AuthorizationJournal {
     AuthorizationJournal {
-        external_inputs_commitments: [(binding_name.to_string(), commitment.to_vec())]
-            .into_iter()
-            .collect(),
+        external_inputs_commitments: [(
+            binding_name.to_string(),
+            authorized_commitment_text(commitment),
+        )]
+        .into_iter()
+        .collect(),
         input_manifest_commitment: vec![7; 32],
     }
 }
@@ -1308,6 +1325,187 @@ fn tile_step_with_store_roots(
     }
 }
 
+/// A storage binding with a *real* selection, unlike `storage_input_witness`
+/// whose `selected_len` is 0 and so never reaches the selection branch at all.
+/// Returns the input witness plus both witness shapes for it.
+fn selecting_input_witness(
+    binding: &str,
+    coordinates: CfsCoordinates,
+) -> (
+    FnInput,
+    Vec<u8>,
+    raster_core::input::SelectionWitness,
+    raster_core::input::SelectionWitness,
+) {
+    use raster_core::input::{
+        encode_index_leaf_payload, selected_subtree_root, selection_payload_hash, IndexWidth,
+        SelectionProof, SelectionWitness,
+    };
+    let payload = encode_index_leaf_payload(7, IndexWidth::U32).unwrap();
+    let root = selected_subtree_root(&payload).unwrap();
+    let selection = raster_core::input::SelectionCommitment {
+        path: Default::default(),
+        source_root_hash: root,
+        selected_hash: selection_payload_hash(&payload),
+        selected_len: payload.len() as u64,
+        payload_kind: Default::default(),
+    };
+    let proof = SelectionProof {
+        path: Default::default(),
+        root_hash: root,
+        steps: Vec::new(),
+    };
+    let with_payload = SelectionWitness::from_payload(payload, proof);
+    let as_reference = with_payload.clone().into_reference().unwrap();
+    let input = FnInput {
+        data: Vec::new(),
+        values: vec![FnInputValue::StorageBinding],
+        args: vec![FnInputArg {
+            name: binding.to_string(),
+            ty: "Vec<u8>".to_string(),
+        }],
+        storage: [(
+            binding.to_string(),
+            StorageData {
+                coordinates,
+                commitment: root.to_vec(),
+                selector: Default::default(),
+                selection,
+            },
+        )]
+        .into_iter()
+        .collect(),
+    };
+    (input, root.to_vec(), with_payload, as_reference)
+}
+
+fn sequence_start_step(coordinates: CfsCoordinates, input_source_commitment: Vec<u8>) -> StepRecord {
+    StepRecord {
+        exec_index: 1,
+        sequence_id: "main".to_string(),
+        coordinates,
+        kind: StepKind::SequenceStart {
+            input_commitment: Vec::new(),
+            input_source_commitment,
+        },
+        recur_progress_commitment: RecurProgressStack::new().commitment(),
+        recur_state: None,
+    }
+}
+
+/// Drive only the witness-shape rule, which runs before the storage-roots
+/// guard and so is the only part of `verify_storage_transition` a
+/// `SequenceStart` reaches at all.
+fn check_witness_shape(
+    step: &StepRecord,
+    input: &FnInput,
+    witness: raster_core::input::SelectionWitness,
+    name: &str,
+) {
+    let (mut frontier, _root, _index, index_root) = build_storage_context(&[]);
+    let witnesses: BTreeMap<String, raster_core::input::SelectionWitness> =
+        [(name.to_string(), witness)].into_iter().collect();
+    let _ = verify_storage_transition(
+        step,
+        Some(input),
+        &witnesses,
+        None,
+        None,
+        &mut frontier,
+        &index_root,
+    );
+}
+
+#[test]
+#[should_panic(expected = "must not carry an input source witness")]
+fn a_sequence_end_may_not_carry_an_input_source_witness() {
+    // The witness store is keyed by coordinates, and a `SequenceEnd` shares
+    // them with its `SequenceStart`, so the host used to hand over the Start's
+    // input. Nothing in a `SequenceEnd` record commits to it, so it is unbound
+    // and must be refused rather than quietly re-verified.
+    let (input, ..) = selecting_input_witness("arg", CfsCoordinates(vec![0]));
+    let step = StepRecord {
+        exec_index: 3,
+        sequence_id: "sub".to_string(),
+        coordinates: CfsCoordinates(vec![2, 0, 14]),
+        kind: StepKind::SequenceEnd {
+            output_commitment: Vec::new(),
+        },
+        recur_progress_commitment: RecurProgressStack::new().commitment(),
+        recur_state: None,
+    };
+    verify_step_record(&step, None, None, None, None, Some(&input));
+}
+
+#[test]
+fn a_sequence_end_without_an_input_source_witness_is_accepted() {
+    let step = StepRecord {
+        exec_index: 3,
+        sequence_id: "sub".to_string(),
+        coordinates: CfsCoordinates(vec![2, 0, 14]),
+        kind: StepKind::SequenceEnd {
+            output_commitment: sha(b""),
+        },
+        recur_progress_commitment: RecurProgressStack::new().commitment(),
+        recur_state: None,
+    };
+    // `output_commitment` is still checked against the recorded output bytes —
+    // dropping the *input* side leaves the end's own fact intact.
+    verify_step_record(&step, None, None, None, Some(&b"".to_vec()), None);
+}
+
+#[test]
+fn a_forwarded_sequence_argument_may_omit_its_payload() {
+    // The `merge_buckets` shape: a sequence receives the binding as a
+    // reference and never consumes its bytes, so the root is all the guest
+    // needs and the payload never crosses into the zkVM.
+    let (input, _root, _payload, reference) =
+        selecting_input_witness("merge_buckets", CfsCoordinates(vec![]));
+    let step = sequence_start_step(CfsCoordinates(vec![2, 0, 14]), Vec::new());
+    check_witness_shape(&step, &input, reference, "merge_buckets");
+}
+
+#[test]
+#[should_panic(expected = "carries the wrong selection witness shape")]
+fn a_forwarded_sequence_argument_may_not_smuggle_a_payload() {
+    let (input, _root, payload, _reference) =
+        selecting_input_witness("merge_buckets", CfsCoordinates(vec![]));
+    let step = sequence_start_step(CfsCoordinates(vec![2, 0, 14]), Vec::new());
+    check_witness_shape(&step, &input, payload, "merge_buckets");
+}
+
+#[test]
+#[should_panic(expected = "carries the wrong selection witness shape")]
+fn a_recur_source_must_still_carry_its_payload() {
+    // `authenticated_source_len` reads the sweep bound `L` out of this
+    // binding's metadata payload, so it is the one sequence argument a
+    // reference cannot replace.
+    let (input, _root, _payload, reference) =
+        selecting_input_witness("input", CfsCoordinates(vec![]));
+    let step = sequence_start_step(CfsCoordinates(vec![2, 0]), Vec::new());
+    check_witness_shape(&step, &input, reference, "input");
+}
+
+#[test]
+#[should_panic(expected = "carries the wrong selection witness shape")]
+fn a_tile_step_may_not_replace_a_consumed_value_with_a_reference() {
+    // An `Exec` step's tile ran on these bytes, so the payload is the thing
+    // being proved and a root says nothing about it.
+    let (input, _root, _payload, reference) =
+        selecting_input_witness("arg", CfsCoordinates(vec![0]));
+    let step = tile_step_with_store_roots(
+        1,
+        CfsCoordinates(vec![1]),
+        Vec::new(),
+        sha(b"out"),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    );
+    check_witness_shape(&step, &input, reference, "arg");
+}
+
 #[test]
 fn verify_storage_transition_uses_output_commitment_as_keyed_entry() {
     let output_commitment = sha(b"out");
@@ -1856,8 +2054,11 @@ fn no_entrypoint_cfs() -> CfsCursor {
 fn two_arg_authorization_journal(commitment_a: &[u8], commitment_b: &[u8]) -> AuthorizationJournal {
     AuthorizationJournal {
         external_inputs_commitments: [
-            ("personal_data".to_string(), commitment_a.to_vec()),
-            ("seed".to_string(), commitment_b.to_vec()),
+            (
+                "personal_data".to_string(),
+                authorized_commitment_text(commitment_a),
+            ),
+            ("seed".to_string(), authorized_commitment_text(commitment_b)),
         ]
         .into_iter()
         .collect(),
@@ -1919,6 +2120,79 @@ fn combined_root_matches_struct_hash_convention_over_declared_commitments() {
     // must produce a different root.
     let swapped = combined_root(&["seed".to_string(), "personal_data".to_string()], &journal);
     assert_ne!(actual, swapped);
+}
+
+#[test]
+fn combined_root_decodes_the_manifest_spelling_rather_than_hashing_it() {
+    // Regression: the journal stores each commitment as lowercase hex *text*
+    // (`normalize_hash_string` in the authorization guest ends in
+    // `String::into_bytes`). Hashing that text produced a root over the
+    // digest's spelling, which can never equal the entry object the runtime
+    // builds from raw commitments — so every fraud window that opened after
+    // `ProgramStart` failed the storage read witness on a program with entry
+    // arguments, and every window containing `ProgramStart` failed
+    // `verify_step`'s binding assert.
+    let commitment_a = sha(b"personal_data-file");
+    let commitment_b = sha(b"seed-file");
+    let journal = two_arg_authorization_journal(&commitment_a, &commitment_b);
+    let names = vec!["personal_data".to_string(), "seed".to_string()];
+
+    // The fixture really does hold text, not digests — 64 ASCII bytes.
+    let stored = &journal.external_inputs_commitments["personal_data"];
+    assert_eq!(stored.len(), 64);
+    assert_eq!(*stored, authorized_commitment_text(&commitment_a));
+
+    // And the root is over the decoded digests, matching what
+    // `ReferencedObject::combined_root` computes host-side from
+    // `source.commitment`.
+    assert_eq!(
+        combined_root(&names, &journal),
+        raster_core::input::struct_commitments_root([
+            ("personal_data", commitment_a.as_slice()),
+            ("seed", commitment_b.as_slice()),
+        ])
+        .to_vec()
+    );
+
+    // Hashing the spelling is a genuinely different root, so the two are not
+    // accidentally interchangeable.
+    assert_ne!(
+        combined_root(&names, &journal),
+        raster_core::input::struct_commitments_root([
+            ("personal_data", authorized_commitment_text(&commitment_a).as_slice()),
+            ("seed", authorized_commitment_text(&commitment_b).as_slice()),
+        ])
+        .to_vec()
+    );
+}
+
+#[test]
+#[should_panic(expected = "is not a 64-character sha256 hex string")]
+fn combined_root_refuses_a_commitment_that_is_not_hex_text() {
+    // A raw 32-byte digest in the journal is the exact shape the old
+    // fixtures used. Refuse it: silently accepting both spellings would let
+    // two distinct roots authorize one manifest entry.
+    let journal = AuthorizationJournal {
+        external_inputs_commitments: [("personal_data".to_string(), sha(b"raw"))]
+            .into_iter()
+            .collect(),
+        input_manifest_commitment: vec![7; 32],
+    };
+    combined_root(&["personal_data".to_string()], &journal);
+}
+
+#[test]
+#[should_panic(expected = "is not lowercase hex")]
+fn combined_root_refuses_a_commitment_with_non_hex_characters() {
+    let mut text = authorized_commitment_text(&sha(b"personal_data-file"));
+    text[0] = b'A';
+    let journal = AuthorizationJournal {
+        external_inputs_commitments: [("personal_data".to_string(), text)]
+            .into_iter()
+            .collect(),
+        input_manifest_commitment: vec![7; 32],
+    };
+    combined_root(&["personal_data".to_string()], &journal);
 }
 
 #[test]
