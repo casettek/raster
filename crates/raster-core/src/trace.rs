@@ -5,7 +5,7 @@ use core::hash::Hash;
 use core::ops::{Deref, DerefMut};
 use serde::{Deserialize, Serialize};
 
-use crate::cfs::{CfsCoordinates, SequenceId, TileId};
+use crate::cfs::{CfsCoordinate, CfsCoordinates, SequenceId, TileId};
 use crate::draft::DraftTransitionWitness;
 use crate::fingerprint::Fingerprint;
 use crate::input::{
@@ -341,7 +341,7 @@ pub enum ExecTarget {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct ExecStep {
     pub target: ExecTarget,
-    pub intra_sequence_index: u32,
+    pub intra_sequence_index: CfsCoordinate,
 
     pub input_commitment: Vec<u8>,
     pub input_source_commitment: Vec<u8>,

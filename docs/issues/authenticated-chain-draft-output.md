@@ -45,6 +45,14 @@ let witness = self.storage.selection_witness(&reference, …)
     .unwrap_or_else(|error| panic!("Failed to replay program output selection: {error}"));
 ```
 
+> **Still reproduces after the 1-based signed-coordinate change (2026-09-18), with the draft
+> sentinel renumbered.** `CfsCoordinate` is now `i32` and `DRAFT_NAMESPACE` moved from `u32::MAX`
+> to `i32::MIN`, so the coordinate below now reads `[-2147483648, n]`. Confirmed on
+> `examples/chain-example` with every stage's tile guests rebuilt from scratch: stages 1 and 2
+> commit cleanly, stage 3 panics at `recorder.rs:642` with `Missing storage object at coordinates
+> CfsCoordinates([-2147483648, 2])`. Same defect, same line, new spelling — read `u32::MAX` as
+> `DRAFT_NAMESPACE` throughout the rest of this file.
+
 The replica has no object at `[4294967295, 1]` — `[u32::MAX, 1]`, the coordinate a finalized
 `Draft` is stored under. Stages 1 and 2 return plain values at ordinary coordinates (`0`, `1`)
 and replay fine; stage 3 returns a `Draft<Report>`, and it does not.

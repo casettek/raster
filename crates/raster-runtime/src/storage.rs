@@ -1,4 +1,4 @@
-use raster_core::cfs::CfsCoordinates;
+use raster_core::cfs::{CfsCoordinate, CfsCoordinates, FIRST_COORDINATE};
 use raster_core::coordinate_index::IncrementalCoordinateIndex;
 use raster_core::draft::{
     draft_root_from_field_roots, draft_tree_from_fields, draft_value_from_serialize,
@@ -724,14 +724,14 @@ impl Default for StorageManager {
 #[derive(Debug, Clone)]
 struct SequenceFrame {
     coordinates: CfsCoordinates,
-    next_child_index: u32,
-    next_synthetic_index: u32,
+    next_child_index: CfsCoordinate,
+    next_synthetic_index: CfsCoordinate,
 }
 
 #[derive(Debug, Clone)]
 struct RecurFrame {
     site_coordinates: CfsCoordinates,
-    next_iteration_index: u32,
+    next_iteration_index: CfsCoordinate,
     /// Whether a recur *sequence* iteration body is currently open.
     ///
     /// A recur **tile**'s iteration is one tile execution and pushes no
@@ -769,8 +769,8 @@ impl SequenceExecutionContext {
 
         self.stack.push(SequenceFrame {
             coordinates,
-            next_child_index: 0,
-            next_synthetic_index: 0,
+            next_child_index: FIRST_COORDINATE,
+            next_synthetic_index: FIRST_COORDINATE,
         });
     }
 
@@ -793,7 +793,7 @@ impl SequenceExecutionContext {
         frame.next_child_index += 1;
         self.recur_stack.push(RecurFrame {
             site_coordinates,
-            next_iteration_index: 0,
+            next_iteration_index: FIRST_COORDINATE,
             iteration_open: false,
         });
         Ok(())
@@ -809,8 +809,8 @@ impl SequenceExecutionContext {
         recur_frame.iteration_open = true;
         self.stack.push(SequenceFrame {
             coordinates,
-            next_child_index: 0,
-            next_synthetic_index: 0,
+            next_child_index: FIRST_COORDINATE,
+            next_synthetic_index: FIRST_COORDINATE,
         });
         Ok(())
     }
@@ -902,7 +902,7 @@ impl SequenceExecutionContext {
                 .coordinates
                 .clone()
         };
-        coordinates.push(u32::MAX);
+        coordinates.push(raster_core::cfs::DRAFT_NAMESPACE);
         coordinates.push(synthetic_index);
         if should_record_sequence_overhead {
             if let Some(start) = synthetic_coordinate_alloc_start {

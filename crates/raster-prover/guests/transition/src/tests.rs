@@ -4,7 +4,8 @@ use bridgetree::NonEmptyFrontier;
 
 use raster_core::authorization::AuthorizationJournal;
 use raster_core::cfs::{
-    CfsCoordinates, CfsCursor, ControlFlowSchema, InputBinding, InputSource, RecurSequenceItem,
+    CfsCoordinate, CfsCoordinates, CfsCursor, ControlFlowSchema, InputBinding, InputSource,
+    RecurSequenceItem, FIRST_COORDINATE,
     RecurTileItem, SequenceChildItem, SequenceDef, SequenceItem, TileDef, TileItem,
 };
 use raster_core::coordinate_index::{
@@ -83,10 +84,10 @@ fn draft_tile_step(exec_index: u64) -> StepRecord {
     StepRecord {
         exec_index,
         sequence_id: "main".into(),
-        coordinates: CfsCoordinates(vec![exec_index as u32]),
+        coordinates: CfsCoordinates(vec![exec_index as CfsCoordinate + FIRST_COORDINATE]),
         kind: StepKind::Exec(ExecStep {
             target: ExecTarget::Tile("collect_lines".into()),
-            intra_sequence_index: exec_index as u32,
+            intra_sequence_index: exec_index as CfsCoordinate,
             input_commitment: vec![exec_index as u8; 32],
             input_source_commitment: vec![0; 32],
             output_commitment: vec![1; 32],
@@ -231,7 +232,7 @@ fn scope_binding_scenario(
     let step_record = StepRecord {
         exec_index: 2,
         sequence_id: "sub".into(),
-        coordinates: CfsCoordinates(vec![0, 0]),
+        coordinates: CfsCoordinates(vec![1, 1]),
         kind: StepKind::Exec(ExecStep {
             target: ExecTarget::Tile("consumer".into()),
             intra_sequence_index: 0,
@@ -253,7 +254,7 @@ fn scope_binding_scenario(
     let parent_record = StepRecord {
         exec_index: 1,
         sequence_id: "sub".into(),
-        coordinates: CfsCoordinates(vec![0]),
+        coordinates: CfsCoordinates(vec![1]),
         kind: StepKind::SequenceStart {
             input_commitment: Vec::new(),
             // The record commits its own argument list; that commitment is
@@ -270,7 +271,7 @@ fn scope_binding_scenario(
 fn sequence_scope_parent_binding_accepts_the_real_parent() {
     let cfs_cursor = scope_binding_cfs();
     let (step_record, _step_source, parent_record, parent_args) =
-        scope_binding_scenario(CfsCoordinates(vec![9, 9]), sha(b"the-caller-passed-this"));
+        scope_binding_scenario(CfsCoordinates(vec![10, 10]), sha(b"the-caller-passed-this"));
 
     let (trace_root, witness) = trace_root_and_witness(&[parent_record.clone()], 0);
     let mut witnesses = HashMap::new();
@@ -296,11 +297,11 @@ fn sequence_scope_parent_binding_accepts_the_real_parent() {
 fn sequence_scope_parent_binding_refuses_a_fabricated_witness() {
     let cfs_cursor = scope_binding_cfs();
     let (step_record, _step_source, parent_record, _parent_args) =
-        scope_binding_scenario(CfsCoordinates(vec![9, 9]), sha(b"the-caller-passed-this"));
+        scope_binding_scenario(CfsCoordinates(vec![10, 10]), sha(b"the-caller-passed-this"));
 
     // A different story about what the caller passed, built to agree with a
     // step that read it.
-    let fabricated = storage_input_witness(CfsCoordinates(vec![4, 2]), sha(b"a-different-story"));
+    let fabricated = storage_input_witness(CfsCoordinates(vec![5, 3]), sha(b"a-different-story"));
 
     let (trace_root, witness) = trace_root_and_witness(&[parent_record.clone()], 0);
     let mut witnesses = HashMap::new();
@@ -325,7 +326,7 @@ fn sequence_scope_parent_binding_refuses_a_fabricated_witness() {
 fn sequence_scope_parent_binding_refuses_a_parent_not_in_the_trace() {
     let cfs_cursor = scope_binding_cfs();
     let (step_record, _step_source, parent_record, parent_args) =
-        scope_binding_scenario(CfsCoordinates(vec![9, 9]), sha(b"the-caller-passed-this"));
+        scope_binding_scenario(CfsCoordinates(vec![10, 10]), sha(b"the-caller-passed-this"));
 
     // The witness proves inclusion in *some* trace — just not the one this step
     // is being appended to.
@@ -333,7 +334,7 @@ fn sequence_scope_parent_binding_refuses_a_parent_not_in_the_trace() {
     let (unrelated_root, _) = trace_root_and_witness(
         &[step_with_sequence_id(
             boundary_start_kind(),
-            vec![0],
+            vec![2],
             "sub",
         )],
         0,
@@ -383,7 +384,7 @@ fn poc_the_sequence_scope_witness_is_bound_to_nothing() {
         let step_record = StepRecord {
             exec_index: 3,
             sequence_id: "sub".into(),
-            coordinates: CfsCoordinates(vec![0, 0]),
+            coordinates: CfsCoordinates(vec![1, 1]),
             kind: StepKind::Exec(ExecStep {
                 target: ExecTarget::Tile("consumer".into()),
                 intra_sequence_index: 0,
@@ -406,8 +407,8 @@ fn poc_the_sequence_scope_witness_is_bound_to_nothing() {
     // Two invented parents, each claiming the caller passed a different object,
     // and each paired with a step that read exactly what it claims.
     let claims = [
-        (CfsCoordinates(vec![9, 9]), sha(b"one-story")),
-        (CfsCoordinates(vec![4, 2]), sha(b"a-different-story")),
+        (CfsCoordinates(vec![10, 10]), sha(b"one-story")),
+        (CfsCoordinates(vec![5, 3]), sha(b"a-different-story")),
     ];
 
     let mut parent_commitments = Vec::new();
@@ -480,7 +481,7 @@ fn verify_tile_commitments_accept_matching_recorded_io() {
     let step = StepRecord {
         exec_index: 1,
         sequence_id: "main".to_string(),
-        coordinates: CfsCoordinates(vec![0]),
+        coordinates: CfsCoordinates(vec![1]),
         kind: StepKind::Exec(ExecStep {
             target: ExecTarget::Tile("tile".to_string()),
             intra_sequence_index: 0,
@@ -507,7 +508,7 @@ fn verify_step_record_inputs_accepts_sequence_descendant_producer_coordinates() 
     let step_record = StepRecord {
         exec_index: 1,
         sequence_id: "main".into(),
-        coordinates: CfsCoordinates(vec![1]),
+        coordinates: CfsCoordinates(vec![2]),
         kind: StepKind::Exec(ExecStep {
             target: ExecTarget::Tile("consumer".into()),
             intra_sequence_index: 1,
@@ -525,7 +526,7 @@ fn verify_step_record_inputs_accepts_sequence_descendant_producer_coordinates() 
         recur_state: None,
     };
     let input_source_witness =
-        storage_input_witness(CfsCoordinates(vec![0, 0]), sha(b"producer-output"));
+        storage_input_witness(CfsCoordinates(vec![1, 1]), sha(b"producer-output"));
 
     verify_step_record_inputs(
         &cfs_cursor,
@@ -541,7 +542,7 @@ fn exec_index_fixture(exec_index: u64) -> StepRecord {
     StepRecord {
         exec_index,
         sequence_id: "main".into(),
-        coordinates: CfsCoordinates(vec![1]),
+        coordinates: CfsCoordinates(vec![2]),
         kind: StepKind::Exec(ExecStep {
             target: ExecTarget::Tile("consumer".into()),
             intra_sequence_index: 1,
@@ -605,7 +606,7 @@ fn recur_frames_cfs() -> CfsCursor {
 
 fn step_with_sequence_id(
     kind: StepKind,
-    coordinates: Vec<u32>,
+    coordinates: Vec<CfsCoordinate>,
     sequence_id: &str,
 ) -> StepRecord {
     StepRecord {
@@ -654,29 +655,29 @@ fn sequence_id_derivation_matches_the_recorder() {
     // Boundary steps name the callee.
     verify_sequence_id(
         &cfs,
-        &step_with_sequence_id(boundary_start_kind(), vec![0], "recur"),
+        &step_with_sequence_id(boundary_start_kind(), vec![1], "recur"),
     );
     verify_sequence_id(
         &cfs,
-        &step_with_sequence_id(boundary_start_kind(), vec![1], "child"),
+        &step_with_sequence_id(boundary_start_kind(), vec![2], "child"),
     );
     // A recur sequence's iteration boundary resolves through the site.
     verify_sequence_id(
         &cfs,
-        &step_with_sequence_id(boundary_start_kind(), vec![1, 0], "child"),
+        &step_with_sequence_id(boundary_start_kind(), vec![2, 1], "child"),
     );
 
     // A recur *tile* pushes no frame: its iteration and its closing `Exec`
     // both stay in `main`.
     verify_sequence_id(
         &cfs,
-        &step_with_sequence_id(exec_kind(ExecTarget::Tile("recur".into())), vec![0, 0], "main"),
+        &step_with_sequence_id(exec_kind(ExecTarget::Tile("recur".into())), vec![1, 1], "main"),
     );
     verify_sequence_id(
         &cfs,
         &step_with_sequence_id(
             exec_kind(ExecTarget::RecurTile("recur".into())),
-            vec![0],
+            vec![1],
             "main",
         ),
     );
@@ -687,7 +688,7 @@ fn sequence_id_derivation_matches_the_recorder() {
         &cfs,
         &step_with_sequence_id(
             exec_kind(ExecTarget::Tile("inner".into())),
-            vec![1, 0, 0],
+            vec![2, 1, 1],
             "child",
         ),
     );
@@ -695,7 +696,7 @@ fn sequence_id_derivation_matches_the_recorder() {
         &cfs,
         &step_with_sequence_id(
             exec_kind(ExecTarget::RecurSequence("child".into())),
-            vec![1],
+            vec![2],
             "main",
         ),
     );
@@ -708,7 +709,7 @@ fn sequence_id_tampering_is_refused_for_an_exec_step() {
         &recur_frames_cfs(),
         &step_with_sequence_id(
             exec_kind(ExecTarget::Tile("inner".into())),
-            vec![1, 0, 0],
+            vec![2, 1, 1],
             // The site's containing sequence, not the frame it runs in — the
             // plausible lie, and the one a tamperer reaches for.
             "main",
@@ -753,7 +754,7 @@ fn sequence_id_tampering_is_refused_at_a_sequence_boundary() {
             },
             // The recur sequence's own iteration boundary: names "child",
             // never the frame that contains the site.
-            vec![1, 0],
+            vec![2, 1],
             "main",
         ),
     );
@@ -865,11 +866,11 @@ fn chunked_recur_cfs(chunk: Option<u64>) -> CfsCursor {
     })
 }
 
-fn recur_iteration_step(iteration: u32) -> StepRecord {
+fn recur_iteration_step(iteration: CfsCoordinate) -> StepRecord {
     StepRecord {
         exec_index: 1,
         sequence_id: "main".into(),
-        coordinates: CfsCoordinates(vec![0, iteration]),
+        coordinates: CfsCoordinates(vec![FIRST_COORDINATE, iteration + FIRST_COORDINATE]),
         kind: StepKind::Exec(ExecStep {
             target: ExecTarget::RecurTile("collect".into()),
             intra_sequence_index: 0,
@@ -930,11 +931,14 @@ fn recur_journal(
 /// sweep over 6 elements — what the host reconstructs from the trace prefix.
 fn seeded_stack(through: u64) -> RecurProgressStack {
     let mut stack = RecurProgressStack::new();
-    stack.push_site(CfsCoordinates(vec![0]), RecurSiteKind::Tile, 2, 6, false);
+    stack.push_site(CfsCoordinates(vec![1]), RecurSiteKind::Tile, 2, 6, false);
     for iteration in 0..=through {
         stack
             .advance_tile_iteration(
-                &CfsCoordinates(vec![0, iteration as u32]),
+                &CfsCoordinates(vec![
+                    FIRST_COORDINATE,
+                    iteration as CfsCoordinate + FIRST_COORDINATE,
+                ]),
                 iteration,
                 3,
                 2,
@@ -947,9 +951,9 @@ fn seeded_stack(through: u64) -> RecurProgressStack {
 }
 
 /// Advance `seed` by iteration `iteration`, holding it to `recorded`.
-fn advance_seeded(seed: &mut RecurProgressStack, iteration: u32, recorded: [u8; 32]) {
+fn advance_seeded(seed: &mut RecurProgressStack, iteration: CfsCoordinate, recorded: [u8; 32]) {
     let cfs_cursor = chunked_recur_cfs(Some(2));
-    let journal = recur_journal(u64::from(iteration), 3, 2, RecurControlKind::Continue);
+    let journal = recur_journal(iteration as u64, 3, 2, RecurControlKind::Continue);
     let mut step = recur_iteration_step(iteration);
     step.recur_progress_commitment = recorded;
     crate::checks::cfs::advance_recur_progress(
@@ -973,7 +977,7 @@ fn a_seeded_mid_loop_window_verifies() {
         let mut expected = seeded_stack(0);
         expected
             .advance_tile_iteration(
-                &CfsCoordinates(vec![0, 1]),
+                &CfsCoordinates(vec![1, 2]),
                 1,
                 3,
                 2,
@@ -1006,7 +1010,7 @@ fn a_forged_seed_is_rejected() {
         let mut expected = seeded_stack(0);
         expected
             .advance_tile_iteration(
-                &CfsCoordinates(vec![0, 1]),
+                &CfsCoordinates(vec![1, 2]),
                 1,
                 3,
                 2,
@@ -1041,14 +1045,14 @@ fn a_forged_seed_is_rejected() {
 #[test]
 fn a_nested_seed_carries_both_frames() {
     let mut both = RecurProgressStack::new();
-    both.push_site(CfsCoordinates(vec![0]), RecurSiteKind::Sequence, 1, 2, false);
-    both.advance_sequence_iteration(&CfsCoordinates(vec![0, 0]), 0)
+    both.push_site(CfsCoordinates(vec![1]), RecurSiteKind::Sequence, 1, 2, false);
+    both.advance_sequence_iteration(&CfsCoordinates(vec![1, 1]), 0)
         .expect("outer iteration 0");
-    both.push_site(CfsCoordinates(vec![0, 0, 0]), RecurSiteKind::Tile, 2, 6, false);
+    both.push_site(CfsCoordinates(vec![1, 1, 1]), RecurSiteKind::Tile, 2, 6, false);
     assert_eq!(both.depth(), 2);
 
     let mut inner_only = RecurProgressStack::new();
-    inner_only.push_site(CfsCoordinates(vec![0, 0, 0]), RecurSiteKind::Tile, 2, 6, false);
+    inner_only.push_site(CfsCoordinates(vec![1, 1, 1]), RecurSiteKind::Tile, 2, 6, false);
     assert_eq!(inner_only.depth(), 1);
 
     // Both stacks agree on the innermost frame and still commit differently,
@@ -1073,7 +1077,7 @@ fn verify_step_record_inputs_accepts_declared_chunk_sizes() {
         );
         verify_step_record_inputs(
             &cfs_cursor,
-            &recur_iteration_step(iteration as u32),
+            &recur_iteration_step(iteration as CfsCoordinate),
             None,
             None,
             Some(&journal),
@@ -1150,7 +1154,7 @@ fn verify_tile_commitments_reject_mismatched_input() {
     let step = StepRecord {
         exec_index: 1,
         sequence_id: "main".to_string(),
-        coordinates: CfsCoordinates(vec![0]),
+        coordinates: CfsCoordinates(vec![1]),
         kind: StepKind::Exec(ExecStep {
             target: ExecTarget::Tile("tile".to_string()),
             intra_sequence_index: 0,
@@ -1423,11 +1427,11 @@ fn a_sequence_end_may_not_carry_an_input_source_witness() {
     // them with its `SequenceStart`, so the host used to hand over the Start's
     // input. Nothing in a `SequenceEnd` record commits to it, so it is unbound
     // and must be refused rather than quietly re-verified.
-    let (input, ..) = selecting_input_witness("arg", CfsCoordinates(vec![0]));
+    let (input, ..) = selecting_input_witness("arg", CfsCoordinates(vec![1]));
     let step = StepRecord {
         exec_index: 3,
         sequence_id: "sub".to_string(),
-        coordinates: CfsCoordinates(vec![2, 0, 14]),
+        coordinates: CfsCoordinates(vec![3, 1, 15]),
         kind: StepKind::SequenceEnd {
             output_commitment: Vec::new(),
         },
@@ -1442,7 +1446,7 @@ fn a_sequence_end_without_an_input_source_witness_is_accepted() {
     let step = StepRecord {
         exec_index: 3,
         sequence_id: "sub".to_string(),
-        coordinates: CfsCoordinates(vec![2, 0, 14]),
+        coordinates: CfsCoordinates(vec![3, 1, 15]),
         kind: StepKind::SequenceEnd {
             output_commitment: sha(b""),
         },
@@ -1461,7 +1465,7 @@ fn a_forwarded_sequence_argument_may_omit_its_payload() {
     // needs and the payload never crosses into the zkVM.
     let (input, _root, _payload, reference) =
         selecting_input_witness("merge_buckets", CfsCoordinates(vec![]));
-    let step = sequence_start_step(CfsCoordinates(vec![2, 0, 14]), Vec::new());
+    let step = sequence_start_step(CfsCoordinates(vec![3, 1, 15]), Vec::new());
     check_witness_shape(&step, &input, reference, "merge_buckets");
 }
 
@@ -1470,7 +1474,7 @@ fn a_forwarded_sequence_argument_may_omit_its_payload() {
 fn a_forwarded_sequence_argument_may_not_smuggle_a_payload() {
     let (input, _root, payload, _reference) =
         selecting_input_witness("merge_buckets", CfsCoordinates(vec![]));
-    let step = sequence_start_step(CfsCoordinates(vec![2, 0, 14]), Vec::new());
+    let step = sequence_start_step(CfsCoordinates(vec![3, 1, 15]), Vec::new());
     check_witness_shape(&step, &input, payload, "merge_buckets");
 }
 
@@ -1482,7 +1486,7 @@ fn a_recur_source_must_still_carry_its_payload() {
     // reference cannot replace.
     let (input, _root, _payload, reference) =
         selecting_input_witness("input", CfsCoordinates(vec![]));
-    let step = sequence_start_step(CfsCoordinates(vec![2, 0]), Vec::new());
+    let step = sequence_start_step(CfsCoordinates(vec![3, 1]), Vec::new());
     check_witness_shape(&step, &input, reference, "input");
 }
 
@@ -1492,10 +1496,10 @@ fn a_tile_step_may_not_replace_a_consumed_value_with_a_reference() {
     // An `Exec` step's tile ran on these bytes, so the payload is the thing
     // being proved and a root says nothing about it.
     let (input, _root, _payload, reference) =
-        selecting_input_witness("arg", CfsCoordinates(vec![0]));
+        selecting_input_witness("arg", CfsCoordinates(vec![1]));
     let step = tile_step_with_store_roots(
         1,
-        CfsCoordinates(vec![1]),
+        CfsCoordinates(vec![2]),
         Vec::new(),
         sha(b"out"),
         Vec::new(),
@@ -1510,7 +1514,7 @@ fn a_tile_step_may_not_replace_a_consumed_value_with_a_reference() {
 fn verify_storage_transition_uses_output_commitment_as_keyed_entry() {
     let output_commitment = sha(b"out");
     let new_entry = StorageEntry {
-        coordinates: CfsCoordinates(vec![0]),
+        coordinates: CfsCoordinates(vec![1]),
         object_commitment: output_commitment.clone(),
     };
     let (mut before_frontier, root_before, _before_index, index_root_before) =
@@ -1550,7 +1554,7 @@ fn verify_storage_transition_uses_output_commitment_as_keyed_entry() {
 #[should_panic(expected = "Coordinate-index non-membership proof is invalid before write")]
 fn verify_storage_transition_rejects_duplicate_coordinates() {
     let existing_entry = StorageEntry {
-        coordinates: CfsCoordinates(vec![0]),
+        coordinates: CfsCoordinates(vec![1]),
         object_commitment: sha(b"existing"),
     };
     let (mut before_frontier, root_before, before_index, index_root_before) =
@@ -1597,14 +1601,14 @@ fn verify_storage_transition_rejects_duplicate_coordinates() {
 }
 
 #[test]
-#[should_panic(expected = "Missing storage read witness for coordinates CfsCoordinates([0])")]
+#[should_panic(expected = "Missing storage read witness for coordinates CfsCoordinates([1])")]
 fn verify_storage_transition_rejects_wrong_coordinates_with_correct_bytes() {
     let prior_entry = StorageEntry {
-        coordinates: CfsCoordinates(vec![9]),
+        coordinates: CfsCoordinates(vec![10]),
         object_commitment: sha(b"shared"),
     };
     let new_entry = StorageEntry {
-        coordinates: CfsCoordinates(vec![1]),
+        coordinates: CfsCoordinates(vec![2]),
         object_commitment: sha(b"out"),
     };
     let (mut before_frontier, root_before, _before_index, index_root_before) =
@@ -1612,7 +1616,7 @@ fn verify_storage_transition_rejects_wrong_coordinates_with_correct_bytes() {
     let (_after_frontier, root_after, _after_index, index_root_after) =
         build_storage_context(&[prior_entry.clone(), new_entry.clone()]);
     let input_source_witness = storage_input_witness(
-        CfsCoordinates(vec![0]),
+        CfsCoordinates(vec![1]),
         prior_entry.object_commitment.clone(),
     );
     let step = tile_step_with_store_roots(
@@ -1645,7 +1649,7 @@ fn verify_storage_transition_rejects_wrong_coordinates_with_correct_bytes() {
 #[should_panic(expected = "Execution-step storage root before does not match current storage root")]
 fn verify_storage_transition_rejects_stale_root() {
     let new_entry = StorageEntry {
-        coordinates: CfsCoordinates(vec![0]),
+        coordinates: CfsCoordinates(vec![1]),
         object_commitment: sha(b"out"),
     };
     let (_before_frontier, root_before, _before_index, index_root_before) =
@@ -1663,7 +1667,7 @@ fn verify_storage_transition_rejects_stale_root() {
         index_root_after,
     );
     let stale_entry = StorageEntry {
-        coordinates: CfsCoordinates(vec![99]),
+        coordinates: CfsCoordinates(vec![100]),
         object_commitment: sha(b"stale"),
     };
     let (mut stale_frontier, _stale_root, _stale_index, _stale_index_root) =
@@ -1690,7 +1694,7 @@ fn verify_storage_transition_rejects_stale_root() {
 )]
 fn verify_storage_transition_rejects_stale_index_root() {
     let new_entry = StorageEntry {
-        coordinates: CfsCoordinates(vec![0]),
+        coordinates: CfsCoordinates(vec![1]),
         object_commitment: sha(b"out"),
     };
     let (mut before_frontier, root_before, _before_index, index_root_before) =
@@ -1726,11 +1730,11 @@ fn verify_storage_transition_rejects_stale_index_root() {
 #[test]
 fn verify_storage_transition_accepts_non_empty_initial_state() {
     let prior_entry = StorageEntry {
-        coordinates: CfsCoordinates(vec![0]),
+        coordinates: CfsCoordinates(vec![1]),
         object_commitment: sha(b"prior"),
     };
     let new_entry = StorageEntry {
-        coordinates: CfsCoordinates(vec![1]),
+        coordinates: CfsCoordinates(vec![2]),
         object_commitment: sha(b"next"),
     };
     let (mut before_frontier, root_before, _before_index, index_root_before) =
@@ -2380,7 +2384,7 @@ fn genesis_authorization_rejects_a_late_window_missing_its_membership_witness() 
     let first_step = StepRecord {
         exec_index: 9,
         sequence_id: "main".to_string(),
-        coordinates: CfsCoordinates(vec![0]),
+        coordinates: CfsCoordinates(vec![1]),
         kind: StepKind::SequenceEnd {
             output_commitment: Vec::new(),
         },
@@ -3242,7 +3246,7 @@ fn recur_sequence_site_step() -> StepRecord {
     StepRecord {
         exec_index: 1,
         sequence_id: "decorate_lines".into(),
-        coordinates: CfsCoordinates(vec![0]),
+        coordinates: CfsCoordinates(vec![1]),
         kind: StepKind::SequenceStart {
             input_commitment: sha(b"recur-seq-in"),
             input_source_commitment: Vec::new(),
@@ -3285,7 +3289,7 @@ fn recur_sequence_site_witness() -> FnInput {
         storage: [(
             "input".to_string(),
             StorageData {
-                coordinates: CfsCoordinates(vec![0, 0]),
+                coordinates: CfsCoordinates(vec![1, 1]),
                 commitment,
                 selector: Default::default(),
                 selection: raster_core::input::SelectionCommitment {
@@ -3359,7 +3363,7 @@ fn transition(state_in: Hash32, state_out: Hash32) -> RecurStateTransition {
 /// A 3-iteration unchunked sweep whose carried state advances a -> b -> c -> d.
 fn state_chain_stack() -> RecurProgressStack {
     let mut stack = RecurProgressStack::new();
-    stack.push_site(CfsCoordinates(vec![0]), RecurSiteKind::Tile, 1, 3, false);
+    stack.push_site(CfsCoordinates(vec![1]), RecurSiteKind::Tile, 1, 3, false);
     stack
 }
 
@@ -3370,7 +3374,10 @@ fn a_carried_state_chain_advances_across_iterations() {
     for (index, (from, to)) in steps.iter().enumerate() {
         stack
             .advance_tile_iteration(
-                &CfsCoordinates(vec![0, index as u32]),
+                &CfsCoordinates(vec![
+                    FIRST_COORDINATE,
+                    index as CfsCoordinate + FIRST_COORDINATE,
+                ]),
                 index as u64,
                 3,
                 1,
@@ -3388,7 +3395,7 @@ fn a_substituted_iteration_state_is_rejected() {
     let mut stack = state_chain_stack();
     stack
         .advance_tile_iteration(
-            &CfsCoordinates(vec![0, 0]),
+            &CfsCoordinates(vec![1, 1]),
             0,
             3,
             1,
@@ -3399,7 +3406,7 @@ fn a_substituted_iteration_state_is_rejected() {
 
     assert_eq!(
         stack.advance_tile_iteration(
-            &CfsCoordinates(vec![0, 1]),
+            &CfsCoordinates(vec![1, 2]),
             1,
             3,
             1,
@@ -3420,7 +3427,7 @@ fn an_omitted_carried_state_is_rejected() {
     let mut stack = state_chain_stack();
     stack
         .advance_tile_iteration(
-            &CfsCoordinates(vec![0, 0]),
+            &CfsCoordinates(vec![1, 1]),
             0,
             3,
             1,
@@ -3431,7 +3438,7 @@ fn an_omitted_carried_state_is_rejected() {
 
     assert_eq!(
         stack.advance_tile_iteration(
-            &CfsCoordinates(vec![0, 1]),
+            &CfsCoordinates(vec![1, 2]),
             1,
             3,
             1,
@@ -3447,7 +3454,7 @@ fn a_stateless_site_claiming_carried_state_is_rejected() {
     let mut stack = state_chain_stack();
     stack
         .advance_tile_iteration(
-            &CfsCoordinates(vec![0, 0]),
+            &CfsCoordinates(vec![1, 1]),
             0,
             3,
             1,
@@ -3458,7 +3465,7 @@ fn a_stateless_site_claiming_carried_state_is_rejected() {
 
     assert_eq!(
         stack.advance_tile_iteration(
-            &CfsCoordinates(vec![0, 1]),
+            &CfsCoordinates(vec![1, 2]),
             1,
             3,
             1,
@@ -3477,7 +3484,7 @@ fn a_seed_differing_only_in_carried_state_is_rejected() {
     let mut honest = state_chain_stack();
     honest
         .advance_tile_iteration(
-            &CfsCoordinates(vec![0, 0]),
+            &CfsCoordinates(vec![1, 1]),
             0,
             3,
             1,
@@ -3489,7 +3496,7 @@ fn a_seed_differing_only_in_carried_state_is_rejected() {
     let mut forged = state_chain_stack();
     forged
         .advance_tile_iteration(
-            &CfsCoordinates(vec![0, 0]),
+            &CfsCoordinates(vec![1, 1]),
             0,
             3,
             1,
@@ -3510,13 +3517,13 @@ fn a_sequence_iterations_output_must_be_the_state_it_claims_to_have_produced() {
     // object, while the carried state is postcard — the iteration's output is
     // where the two encodings coincide.
     let mut stack = RecurProgressStack::new();
-    stack.push_site(CfsCoordinates(vec![0]), RecurSiteKind::Sequence, 1, 1, true);
+    stack.push_site(CfsCoordinates(vec![1]), RecurSiteKind::Sequence, 1, 1, true);
     stack
-        .advance_sequence_iteration(&CfsCoordinates(vec![0, 0]), 0)
+        .advance_sequence_iteration(&CfsCoordinates(vec![1, 1]), 0)
         .expect("counted");
 
     let honest = stack.clone().fold_sequence_iteration_state(
-        &CfsCoordinates(vec![0, 0]),
+        &CfsCoordinates(vec![1, 1]),
         Some(&transition(state(b"seed"), state(b"final"))),
         Some(b"final"),
     );
@@ -3525,7 +3532,7 @@ fn a_sequence_iterations_output_must_be_the_state_it_claims_to_have_produced() {
     assert_eq!(
         stack
             .fold_sequence_iteration_state(
-                &CfsCoordinates(vec![0, 0]),
+                &CfsCoordinates(vec![1, 1]),
                 Some(&transition(state(b"seed"), state(b"claimed"))),
                 Some(b"actually-emitted"),
             )
@@ -3540,15 +3547,15 @@ fn a_sequence_iterations_output_must_be_the_state_it_claims_to_have_produced() {
 #[test]
 fn a_state_returning_sequence_iteration_without_an_output_is_rejected() {
     let mut stack = RecurProgressStack::new();
-    stack.push_site(CfsCoordinates(vec![0]), RecurSiteKind::Sequence, 1, 1, true);
+    stack.push_site(CfsCoordinates(vec![1]), RecurSiteKind::Sequence, 1, 1, true);
     stack
-        .advance_sequence_iteration(&CfsCoordinates(vec![0, 0]), 0)
+        .advance_sequence_iteration(&CfsCoordinates(vec![1, 1]), 0)
         .expect("counted");
 
     assert_eq!(
         stack
             .fold_sequence_iteration_state(
-                &CfsCoordinates(vec![0, 0]),
+                &CfsCoordinates(vec![1, 1]),
                 Some(&transition(state(b"seed"), state(b"final"))),
                 None,
             )
@@ -3562,13 +3569,13 @@ fn a_state_plus_output_sequence_iteration_is_not_pinned_by_its_output() {
     // A state+output site returns the draft, not the state, so its recorded
     // output is not the carried state and must not be compared against it.
     let mut stack = RecurProgressStack::new();
-    stack.push_site(CfsCoordinates(vec![0]), RecurSiteKind::Sequence, 1, 1, false);
+    stack.push_site(CfsCoordinates(vec![1]), RecurSiteKind::Sequence, 1, 1, false);
     stack
-        .advance_sequence_iteration(&CfsCoordinates(vec![0, 0]), 0)
+        .advance_sequence_iteration(&CfsCoordinates(vec![1, 1]), 0)
         .expect("counted");
     assert!(stack
         .fold_sequence_iteration_state(
-            &CfsCoordinates(vec![0, 0]),
+            &CfsCoordinates(vec![1, 1]),
             Some(&transition(state(b"seed"), state(b"final"))),
             Some(b"a-draft-root-not-the-state"),
         )

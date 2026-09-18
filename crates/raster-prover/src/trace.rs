@@ -6,7 +6,8 @@
 use bridgetree::{Hashable, Level, NonEmptyFrontier};
 use incrementalmerkletree::{MerklePath, Position};
 use raster_core::cfs::{
-    CfsCoordinates, CfsCursor, ControlFlowSchema, InputBinding, InputSource, SequenceChildItem,
+    CfsCoordinate, CfsCoordinates, CfsCursor, ControlFlowSchema, InputBinding, InputSource,
+    SequenceChildItem, FIRST_COORDINATE,
 };
 use raster_core::fingerprint::{fingerprint_value, Fingerprint, FingerprintAccumulator};
 use serde::{Deserialize, Serialize};
@@ -588,7 +589,7 @@ impl<T: Clone> Window<T> {
     }
 }
 
-fn sequence_coordinates(step_record: &StepRecord) -> Option<(CfsCoordinates, u32)> {
+fn sequence_coordinates(step_record: &StepRecord) -> Option<(CfsCoordinates, CfsCoordinate)> {
     let coordinates = step_record.coordinates();
     let (&current_child_index, parent_coords) = coordinates.split_last()?;
 
@@ -780,7 +781,12 @@ fn resolve_inputs_sources(
             InputBinding::PriorItemOutput {
                 intra_sequence_item_index,
             } => {
-                if *intra_sequence_item_index >= item_coordinate as usize {
+                // 0-based index into `items` becomes a 1-based coordinate; the
+                // guest crosses the same boundary in `checks::cfs`.
+                let source_coordinate = CfsCoordinate::try_from(*intra_sequence_item_index)
+                    .expect("Prior item output index exceeds CFS coordinate bounds")
+                    + FIRST_COORDINATE;
+                if source_coordinate >= item_coordinate {
                     panic!(
                         "Step {:?} cannot depend on sibling item {} from the same or a future index {}",
                         step_record, intra_sequence_item_index, item_coordinate
@@ -788,11 +794,7 @@ fn resolve_inputs_sources(
                 }
 
                 let mut source_record_coordinates = sequence_coordinates.clone();
-                source_record_coordinates.push(
-                    (*intra_sequence_item_index)
-                        .try_into()
-                        .expect("Prior item output index exceeds CFS coordinate bounds"),
-                );
+                source_record_coordinates.push(source_coordinate);
 
                 let source_record_cfs_item = cfs_cursor
                     .try_get_item(&source_record_coordinates)
@@ -908,6 +910,25 @@ fn witness_record_inputs(
                     .collect(),
             })
             .expect("Failed to serialize source record witness");
+
+            // [measure#9] temporary
+            eprintln!(
+                "[measure#9] step {:?} (window offset {}) -> parent {:?} kind={} at trace_index={} prefix_len={} prefix_root={:?} path_elems={}",
+                step_record.coordinates,
+                offset,
+                source_record.coordinates,
+                match &source_record.kind {
+                    StepKind::SequenceStart { .. } => "SequenceStart",
+                    StepKind::SequenceEnd { .. } => "SequenceEnd",
+                    StepKind::Exec(_) => "Exec",
+                    StepKind::ProgramStart(_) => "ProgramStart",
+                    StepKind::ProgramEnd(_) => "ProgramEnd",
+                },
+                trace_index,
+                step_index,
+                merkle_path.root(Bytes(source_record.hash())).0,
+                merkle_path.path_elems().len(),
+            );
 
             source_records_witnesses.insert(source_record, witness_bytes);
         }
@@ -1201,8 +1222,8 @@ impl<'a> TraceVerifier<'a> {
 #[cfg(test)]
 mod tests {
     use raster_core::cfs::{
-        CfsCoordinates, InputBinding, RecurTileItem, SequenceChildItem, SequenceDef, SequenceItem,
-        TileDef, TileItem,
+        CfsCoordinate, CfsCoordinates, InputBinding, RecurTileItem, SequenceChildItem, SequenceDef,
+        SequenceItem, TileDef, TileItem,
     };
     use raster_core::trace::{ProgramStartStep, StorageRoots};
 
@@ -1243,8 +1264,8 @@ mod tests {
         make_tile_trace_item_at(
             input,
             "test_sequence",
-            input as u32,
-            vec![0],
+            input as CfsCoordinate,
+            vec![1],
             format!("test_tile_{input}"),
             1,
             output,
@@ -1254,8 +1275,8 @@ mod tests {
     fn make_tile_trace_item_at(
         exec_index: u64,
         sequence_id: &str,
-        intra_sequence_index: u32,
-        coordinates: Vec<u32>,
+        intra_sequence_index: CfsCoordinate,
+        coordinates: Vec<CfsCoordinate>,
         fn_name: String,
         _input_count: usize,
         output: u64,
@@ -1310,7 +1331,7 @@ mod tests {
     fn make_sequence_start_record(
         exec_index: u64,
         sequence_id: &str,
-        coordinates: Vec<u32>,
+        coordinates: Vec<CfsCoordinate>,
         _input_count: usize,
     ) -> StepRecord {
         StepRecord {
@@ -1329,7 +1350,7 @@ mod tests {
     fn make_sequence_end_record(
         exec_index: u64,
         sequence_id: &str,
-        coordinates: Vec<u32>,
+        coordinates: Vec<CfsCoordinate>,
     ) -> StepRecord {
         StepRecord {
             exec_index,
@@ -1929,9 +1950,9 @@ mod tests {
     fn test_verify_trace_returns_ok_for_producer_dependency() {
         let trace = Trace(vec![
             make_program_start_record(1, Vec::new()),
-            make_tile_trace_item_at(2, "main", 0, vec![0], "producer".to_string(), 1, 10),
-            make_tile_trace_item_at(3, "main", 1, vec![1], "consumer".to_string(), 1, 20),
-            make_tile_trace_item_at(4, "main", 2, vec![2], "tail".to_string(), 1, 30),
+            make_tile_trace_item_at(2, "main", 1, vec![1], "producer".to_string(), 1, 10),
+            make_tile_trace_item_at(3, "main", 2, vec![2], "consumer".to_string(), 1, 20),
+            make_tile_trace_item_at(4, "main", 3, vec![3], "tail".to_string(), 1, 30),
             make_sequence_end_record(5, "main", vec![]),
         ]);
         let trace_commitment = TraceCommitment::build(
@@ -1952,10 +1973,10 @@ mod tests {
     fn test_verify_trace_returns_ok_for_sequence_step_seq_input_dependency() {
         let trace = Trace(vec![
             make_program_start_record(1, vec!["arg".to_string()]),
-            make_sequence_start_record(2, "inner", vec![0], 1),
-            make_tile_trace_item_at(3, "inner", 0, vec![0, 0], "inner_tile".to_string(), 1, 10),
-            make_sequence_end_record(4, "inner", vec![0]),
-            make_tile_trace_item_at(5, "main", 1, vec![1], "tail".to_string(), 1, 20),
+            make_sequence_start_record(2, "inner", vec![1], 1),
+            make_tile_trace_item_at(3, "inner", 1, vec![1, 1], "inner_tile".to_string(), 1, 10),
+            make_sequence_end_record(4, "inner", vec![1]),
+            make_tile_trace_item_at(5, "main", 2, vec![2], "tail".to_string(), 1, 20),
             make_sequence_end_record(6, "main", vec![]),
         ]);
         let trace_commitment = TraceCommitment::build(
@@ -1976,10 +1997,10 @@ mod tests {
     fn test_verify_trace_returns_ok_for_nested_sequence_output_dependency() {
         let trace = Trace(vec![
             make_program_start_record(1, Vec::new()),
-            make_sequence_start_record(2, "inner", vec![0], 1),
-            make_tile_trace_item_at(3, "inner", 0, vec![0, 0], "inner_tile".to_string(), 1, 10),
-            make_sequence_end_record(4, "inner", vec![0]),
-            make_tile_trace_item_at(5, "main", 1, vec![1], "tail".to_string(), 1, 20),
+            make_sequence_start_record(2, "inner", vec![1], 1),
+            make_tile_trace_item_at(3, "inner", 1, vec![1, 1], "inner_tile".to_string(), 1, 10),
+            make_sequence_end_record(4, "inner", vec![1]),
+            make_tile_trace_item_at(5, "main", 2, vec![2], "tail".to_string(), 1, 20),
             make_sequence_end_record(6, "main", vec![]),
         ]);
         let trace_commitment = TraceCommitment::build(
@@ -2068,16 +2089,16 @@ mod tests {
     fn fraud_window_resolves_top_level_step_inputs() {
         let committed_trace = Trace(vec![
             make_program_start_record(1, Vec::new()),
-            make_tile_trace_item_at(2, "main", 0, vec![0], "producer".to_string(), 1, 10),
-            make_tile_trace_item_at(3, "main", 1, vec![1], "consumer".to_string(), 1, 20),
-            make_tile_trace_item_at(4, "main", 2, vec![2], "tail".to_string(), 1, 30),
+            make_tile_trace_item_at(2, "main", 1, vec![1], "producer".to_string(), 1, 10),
+            make_tile_trace_item_at(3, "main", 2, vec![2], "consumer".to_string(), 1, 20),
+            make_tile_trace_item_at(4, "main", 3, vec![3], "tail".to_string(), 1, 30),
             make_sequence_end_record(5, "main", vec![]),
         ]);
         // Diverges at index 2, so the window is [producer@[0], consumer@[1]] and
         // `consumer` — depth 1, reading a prior sibling — must resolve.
         let mut runtime_trace = committed_trace.clone();
         runtime_trace.0[2] =
-            make_tile_trace_item_at(3, "main", 1, vec![1], "consumer".to_string(), 1, 999);
+            make_tile_trace_item_at(3, "main", 2, vec![2], "consumer".to_string(), 1, 999);
 
         let trace_commitment = TraceCommitment::build(
             &committed_trace,
@@ -2108,8 +2129,8 @@ mod tests {
     fn terminal_window_resolves_top_level_step_inputs() {
         let trace = Trace(vec![
             make_program_start_record(1, Vec::new()),
-            make_tile_trace_item_at(2, "main", 0, vec![0], "producer".to_string(), 1, 10),
-            make_tile_trace_item_at(3, "main", 1, vec![1], "consumer".to_string(), 1, 20),
+            make_tile_trace_item_at(2, "main", 1, vec![1], "producer".to_string(), 1, 10),
+            make_tile_trace_item_at(3, "main", 2, vec![2], "consumer".to_string(), 1, 20),
             make_sequence_end_record(4, "main", vec![]),
         ]);
         let trace_commitment = TraceCommitment::build(
@@ -2174,16 +2195,16 @@ mod tests {
     fn recur_iterations_contribute_no_input_source_witness() {
         let committed_trace = Trace(vec![
             make_program_start_record(1, Vec::new()),
-            make_tile_trace_item_at(2, "main", 0, vec![0], "producer".to_string(), 1, 10),
-            make_sequence_start_record(3, "main", vec![1], 1),
-            make_tile_trace_item_at(4, "main", 0, vec![1, 0], "sweep".to_string(), 1, 20),
-            make_tile_trace_item_at(5, "main", 1, vec![1, 1], "sweep".to_string(), 1, 30),
+            make_tile_trace_item_at(2, "main", 1, vec![1], "producer".to_string(), 1, 10),
+            make_sequence_start_record(3, "main", vec![2], 1),
+            make_tile_trace_item_at(4, "main", 1, vec![2, 1], "sweep".to_string(), 1, 20),
+            make_tile_trace_item_at(5, "main", 2, vec![2, 2], "sweep".to_string(), 1, 30),
             make_sequence_end_record(6, "main", vec![]),
         ]);
         // Diverges at index 4, so the window is the two iteration steps.
         let mut runtime_trace = committed_trace.clone();
         runtime_trace.0[4] =
-            make_tile_trace_item_at(5, "main", 1, vec![1, 1], "sweep".to_string(), 1, 999);
+            make_tile_trace_item_at(5, "main", 2, vec![2, 2], "sweep".to_string(), 1, 999);
 
         let trace_commitment = TraceCommitment::build(
             &committed_trace,
@@ -2213,13 +2234,13 @@ mod tests {
     fn entry_argument_at_top_level_resolves_to_program_start() {
         let committed_trace = Trace(vec![
             make_program_start_record(1, vec!["arg".to_string()]),
-            make_tile_trace_item_at(2, "main", 0, vec![0], "consumer".to_string(), 1, 20),
-            make_tile_trace_item_at(3, "main", 1, vec![1], "tail".to_string(), 1, 30),
+            make_tile_trace_item_at(2, "main", 1, vec![1], "consumer".to_string(), 1, 20),
+            make_tile_trace_item_at(3, "main", 2, vec![2], "tail".to_string(), 1, 30),
             make_sequence_end_record(4, "main", vec![]),
         ]);
         let mut runtime_trace = committed_trace.clone();
         runtime_trace.0[1] =
-            make_tile_trace_item_at(2, "main", 0, vec![0], "consumer".to_string(), 1, 999);
+            make_tile_trace_item_at(2, "main", 1, vec![1], "consumer".to_string(), 1, 999);
 
         let trace_commitment = TraceCommitment::build(
             &committed_trace,
@@ -2266,9 +2287,9 @@ mod tests {
     fn exec_index_tampering_is_detected_but_no_longer_provable() {
         let honest = Trace(vec![
             make_program_start_record(1, Vec::new()),
-            make_tile_trace_item_at(2, "main", 0, vec![0], "producer".to_string(), 1, 10),
-            make_tile_trace_item_at(3, "main", 1, vec![1], "consumer".to_string(), 1, 20),
-            make_tile_trace_item_at(4, "main", 2, vec![2], "tail".to_string(), 1, 30),
+            make_tile_trace_item_at(2, "main", 1, vec![1], "producer".to_string(), 1, 10),
+            make_tile_trace_item_at(3, "main", 2, vec![2], "consumer".to_string(), 1, 20),
+            make_tile_trace_item_at(4, "main", 3, vec![3], "tail".to_string(), 1, 30),
             make_sequence_end_record(5, "main", vec![]),
         ]);
         let cfs = make_producer_dependency_cfs();
@@ -2338,17 +2359,17 @@ mod tests {
     fn fraud_window_resolves_nested_sequence_scope_input() {
         let committed_trace = Trace(vec![
             make_program_start_record(1, vec!["arg".to_string()]),
-            make_sequence_start_record(2, "inner", vec![0], 1),
-            make_tile_trace_item_at(3, "inner", 0, vec![0, 0], "inner_tile".to_string(), 1, 10),
-            make_sequence_end_record(4, "inner", vec![0]),
-            make_tile_trace_item_at(5, "main", 1, vec![1], "tail".to_string(), 1, 20),
+            make_sequence_start_record(2, "inner", vec![1], 1),
+            make_tile_trace_item_at(3, "inner", 1, vec![1, 1], "inner_tile".to_string(), 1, 10),
+            make_sequence_end_record(4, "inner", vec![1]),
+            make_tile_trace_item_at(5, "main", 2, vec![2], "tail".to_string(), 1, 20),
             make_sequence_end_record(6, "main", vec![]),
         ]);
         // Diverge at `inner_tile`, so the window holds the scope-binding step
         // and the `SequenceStart` that opened its frame.
         let mut runtime_trace = committed_trace.clone();
         runtime_trace.0[2] =
-            make_tile_trace_item_at(3, "inner", 0, vec![0, 0], "inner_tile".to_string(), 1, 999);
+            make_tile_trace_item_at(3, "inner", 1, vec![1, 1], "inner_tile".to_string(), 1, 999);
 
         let trace_commitment = TraceCommitment::build(
             &committed_trace,
@@ -2379,13 +2400,13 @@ mod tests {
     fn sequence_scope_at_root_frame_is_refused() {
         let committed_trace = Trace(vec![
             make_program_start_record(1, Vec::new()),
-            make_tile_trace_item_at(2, "main", 0, vec![0], "consumer".to_string(), 1, 20),
-            make_tile_trace_item_at(3, "main", 1, vec![1], "tail".to_string(), 1, 30),
+            make_tile_trace_item_at(2, "main", 1, vec![1], "consumer".to_string(), 1, 20),
+            make_tile_trace_item_at(3, "main", 2, vec![2], "tail".to_string(), 1, 30),
             make_sequence_end_record(4, "main", vec![]),
         ]);
         let mut runtime_trace = committed_trace.clone();
         runtime_trace.0[1] =
-            make_tile_trace_item_at(2, "main", 0, vec![0], "consumer".to_string(), 1, 999);
+            make_tile_trace_item_at(2, "main", 1, vec![1], "consumer".to_string(), 1, 999);
 
         let trace_commitment = TraceCommitment::build(
             &committed_trace,
@@ -2405,14 +2426,14 @@ mod tests {
     fn test_verify_trace_returns_failure_for_unresolved_required_prior_item_output() {
         let runtime_trace = Trace(vec![
             make_program_start_record(1, Vec::new()),
-            make_tile_trace_item_at(2, "main", 1, vec![1], "consumer".to_string(), 1, 20),
-            make_tile_trace_item_at(3, "main", 2, vec![2], "tail".to_string(), 1, 30),
+            make_tile_trace_item_at(2, "main", 2, vec![2], "consumer".to_string(), 1, 20),
+            make_tile_trace_item_at(3, "main", 3, vec![3], "tail".to_string(), 1, 30),
             make_sequence_end_record(4, "main", vec![]),
         ]);
         let committed_trace = Trace(vec![
             make_program_start_record(1, Vec::new()),
-            make_tile_trace_item_at(2, "main", 1, vec![1], "consumer".to_string(), 1, 999),
-            make_tile_trace_item_at(3, "main", 2, vec![2], "tail".to_string(), 1, 30),
+            make_tile_trace_item_at(2, "main", 2, vec![2], "consumer".to_string(), 1, 999),
+            make_tile_trace_item_at(3, "main", 3, vec![3], "tail".to_string(), 1, 30),
             make_sequence_end_record(4, "main", vec![]),
         ]);
         let trace_commitment = TraceCommitment::build(

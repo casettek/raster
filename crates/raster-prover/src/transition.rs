@@ -304,7 +304,7 @@ mod tests {
     use crate::authorization::authorize_external_inputs;
     use crate::precomputed::EMPTY_TRIE_NODES;
     use raster_core::authorization::{AuthorizationJournal, ManifestedInputs};
-    use raster_core::cfs::{CfsCoordinates, ControlFlowSchema, SequenceDef};
+    use raster_core::cfs::{CfsCoordinate, CfsCoordinates, ControlFlowSchema, SequenceDef};
     use raster_core::coordinate_index::coordinate_index_root;
     use raster_core::draft::TileReplayJournal;
     use raster_core::fingerprint::{BitPacker, Fingerprint};
@@ -329,7 +329,7 @@ mod tests {
         }
     }
 
-    fn make_tile_step(exec_index: u64, coordinates: Vec<u32>) -> StepRecord {
+    fn make_tile_step(exec_index: u64, coordinates: Vec<CfsCoordinate>) -> StepRecord {
         StepRecord {
             exec_index,
             sequence_id: "main".to_string(),

@@ -35,7 +35,7 @@ use core::fmt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::cfs::CfsCoordinates;
+use crate::cfs::{CfsCoordinate, CfsCoordinates};
 use crate::draft::RecurControlKind;
 use crate::draft::RecurStateTransition;
 use crate::input::Hash32;
@@ -605,7 +605,7 @@ mod tests {
     }
 
     fn iteration(index: u64) -> CfsCoordinates {
-        CfsCoordinates(vec![2, index as u32])
+        CfsCoordinates(vec![2, index as CfsCoordinate])
     }
 
     fn tile_stack(source_len: u64, chunk: u64) -> RecurProgressStack {

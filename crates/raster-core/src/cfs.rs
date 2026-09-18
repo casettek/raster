@@ -12,7 +12,55 @@ use alloc::vec::Vec;
 use core::ops::{Deref, DerefMut};
 use serde::{Deserialize, Serialize};
 
-pub type CfsCoordinate = u32;
+/// One step of a CFS position.
+///
+/// Signed so a scope's **closing** step can occupy a coordinate distinct from
+/// its opening one. Before that, a `SequenceStart` and its matching
+/// `SequenceEnd` shared a single coordinate, and anything dispatching on
+/// position alone could not tell them apart: the witness store served the
+/// Start's input to the End, and `try_get_next_coordinates` answered with the
+/// Start's successors after a close, rejecting the next iteration of an honest
+/// recur sweep.
+pub type CfsCoordinate = i32;
+
+/// The first valid coordinate. Positions are **1-based**, so `0` is never a
+/// position: it is free to mean "unset", and a stray `vec![0]` fails to resolve
+/// instead of silently naming the first item.
+///
+/// 1-basing is what makes the bracket symmetric — open `i` closes at `-i`, with
+/// no offset to carry. At 0-based it could not be, since `-0 == 0` would fold
+/// the first item's close back onto its open.
+pub const FIRST_COORDINATE: CfsCoordinate = 1;
+
+/// Reserved namespace for synthetic (draft) coordinates, which are not CFS
+/// item positions at all. Was `u32::MAX`; `i32::MIN` keeps it out of reach of
+/// both real positions and closing markers, whose range is `[-i32::MAX, -1]`.
+pub const DRAFT_NAMESPACE: CfsCoordinate = i32::MIN;
+
+/// The coordinate a scope's closing step occupies: the negation of its open.
+///
+/// `[3, 1]` opens and `[3, -1]` closes. Exact inverse of
+/// [`opening_coordinate`], with nothing to offset — see [`FIRST_COORDINATE`].
+pub const fn closing_coordinate(open_index: CfsCoordinate) -> CfsCoordinate {
+    debug_assert!(open_index >= FIRST_COORDINATE);
+    -open_index
+}
+
+/// The opening coordinate a closing marker refers to, or `None` when this is an
+/// ordinary position. [`DRAFT_NAMESPACE`] is excluded explicitly: it is
+/// negative but is not a close marker, and negating `i32::MIN` would overflow.
+pub const fn opening_coordinate(coordinate: CfsCoordinate) -> Option<CfsCoordinate> {
+    if coordinate < 0 && coordinate != DRAFT_NAMESPACE {
+        Some(-coordinate)
+    } else {
+        None
+    }
+}
+
+/// Whether this coordinate marks a scope's close rather than a position.
+pub const fn is_closing_coordinate(coordinate: CfsCoordinate) -> bool {
+    opening_coordinate(coordinate).is_some()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CfsCoordinates(pub Vec<CfsCoordinate>);
@@ -26,6 +74,32 @@ impl CfsCoordinates {
         let (&current_child_index, parent_coords) = self.split_last()?;
 
         Some((CfsCoordinates(parent_coords.to_vec()), current_child_index))
+    }
+
+    /// This position with a trailing close marker resolved back to the scope it
+    /// closes.
+    ///
+    /// Only the last element can ever be a close marker — a scope closes at its
+    /// own level, and every step inside it is recorded while it is still open.
+    /// Anything asking *where in the CFS* wants this; only code distinguishing a
+    /// scope's boundaries from one another wants the raw coordinates.
+    pub fn opened(&self) -> CfsCoordinates {
+        match self.split_last() {
+            Some((&last, prefix)) => match opening_coordinate(last) {
+                Some(open_index) => {
+                    let mut opened = prefix.to_vec();
+                    opened.push(open_index);
+                    CfsCoordinates(opened)
+                }
+                None => self.clone(),
+            },
+            None => self.clone(),
+        }
+    }
+
+    /// Whether this position is a scope's closing step.
+    pub fn is_closing(&self) -> bool {
+        self.last().copied().is_some_and(is_closing_coordinate)
     }
 }
 
@@ -59,7 +133,7 @@ pub struct CfsCursor {
 
 impl CfsCursor {
     pub fn new(cfs: ControlFlowSchema) -> Self {
-        let entrypoint_coordinate: u32 = cfs
+        let entrypoint_coordinate: CfsCoordinate = cfs
             .sequences
             .iter()
             .position(|s| s.id == "main")
@@ -122,6 +196,29 @@ impl CfsCursor {
         &self,
         coordinates: &CfsCoordinates,
     ) -> Option<Vec<CfsCoordinates>> {
+        // A recur *sequence* iteration's close. What may follow a finished
+        // iteration is the next one, or the site closing — never the
+        // iteration's own body, which has already run.
+        //
+        // This is the whole reason a close gets its own coordinate. While the
+        // `End` shared the `Start`'s, this function saw only the position and
+        // answered with the *opening* successors, so an honest sweep stepping
+        // from iteration `i`'s end to iteration `i + 1`'s start was rejected:
+        // `[2, 0, 2] is not among [[2, 0, 1], [2, 0, 1, 0], [2, 0]]`.
+        if let Some((&last, site_prefix)) = coordinates.split_last() {
+            if let Some(open_index) = opening_coordinate(last) {
+                let site_coordinates = CfsCoordinates(site_prefix.to_vec());
+                if matches!(
+                    self.try_get_item_exact(&site_coordinates),
+                    Some(SequenceChildItem::RecurSequence(_))
+                ) {
+                    let mut next_iteration_coordinates = site_coordinates.clone();
+                    next_iteration_coordinates.push(open_index + 1);
+                    return Some(Vec::from([next_iteration_coordinates, site_coordinates]));
+                }
+            }
+        }
+
         if let Some((site_coordinates, iteration_index)) =
             self.try_get_recur_iteration_coordinates(coordinates)
         {
@@ -147,7 +244,7 @@ impl CfsCursor {
         loop {
             let (current_sequence, current_item_coordinate) =
                 self.get_sequence(&current_coordinates);
-            let sequence_last_coordinate = current_sequence.items.len() - 1;
+            let sequence_last_coordinate = current_sequence.last_coordinate();
 
             // if the item is not the sequence itself we can try find next item within that
             // sequence (last coordinate, is a sequence coordinate)
@@ -155,11 +252,7 @@ impl CfsCursor {
                 Some(current_item_coordinate) => {
                     let next_item_coordinate = current_item_coordinate + 1;
 
-                    if current_sequence
-                        .items
-                        .get(next_item_coordinate as usize)
-                        .is_some()
-                    {
+                    if current_sequence.item_at(next_item_coordinate).is_some() {
                         let mut next_coordinates = current_coordinates.clone();
 
                         match next_coordinates.last_mut() {
@@ -173,7 +266,7 @@ impl CfsCursor {
                         }
 
                         return Some(self.expand_recur_entry_coordinates(next_coordinates));
-                    } else if current_item_coordinate as usize == sequence_last_coordinate {
+                    } else if Some(current_item_coordinate) == sequence_last_coordinate {
                         let (current_sequence_coordinate, parent_sequence_coordinates) =
                             current_coordinates.split_last().expect("Empty coordinates");
                         let parent_sequence_coordinates =
@@ -181,9 +274,8 @@ impl CfsCursor {
 
                         let (parent_sequence, _) = self.get_sequence(&parent_sequence_coordinates);
 
-                        if let Some(_next_item) = parent_sequence
-                            .items
-                            .get((*current_sequence_coordinate + 1) as usize)
+                        if let Some(_next_item) =
+                            parent_sequence.item_at(*current_sequence_coordinate + 1)
                         {
                             let mut next_coordinates = parent_sequence_coordinates.clone();
                             next_coordinates.push(*current_sequence_coordinate + 1);
@@ -206,11 +298,19 @@ impl CfsCursor {
                 None => {
                     let mut next_coordinates_options: Vec<CfsCoordinates> = Vec::new();
 
-                    next_coordinates_options.push(current_coordinates.clone());
+                    // The scope's own close. A recur *sequence* iteration
+                    // closes at a distinct coordinate, handled at the top of
+                    // this function; an ordinary nested sequence still closes
+                    // on its own coordinate, which is the remaining half of
+                    // this encoding.
+                    next_coordinates_options.push(
+                        self.closing_coordinates_of(&current_coordinates)
+                            .unwrap_or_else(|| current_coordinates.clone()),
+                    );
 
                     let mut next_coordinates = current_coordinates.clone();
 
-                    next_coordinates.push(0);
+                    next_coordinates.push(FIRST_COORDINATE);
                     if self.try_get_item(&next_coordinates).is_some() {
                         next_coordinates_options
                             .extend(self.expand_recur_entry_coordinates(next_coordinates));
@@ -229,9 +329,8 @@ impl CfsCursor {
                         CfsCoordinates(parent_sequence_coordinates.to_vec());
                     let (parent_sequence, _) = self.get_sequence(&parent_sequence_coordinates);
 
-                    if let Some(_next_item) = parent_sequence
-                        .items
-                        .get((*current_sequence_coordinate + 1) as usize)
+                    if let Some(_next_item) =
+                        parent_sequence.item_at(*current_sequence_coordinate + 1)
                     {
                         let mut next_coordinates = parent_sequence_coordinates.clone();
                         next_coordinates.push(*current_sequence_coordinate + 1);
@@ -261,6 +360,10 @@ impl CfsCursor {
     }
 
     fn get_sequence(&self, coords: &CfsCoordinates) -> (&SequenceDef, Option<CfsCoordinate>) {
+        // A close marker names the same CFS position its open does; only the
+        // trace distinguishes them. Resolve it before walking, or `items.get`
+        // would index with a negative coordinate.
+        let coords = &coords.opened();
         let mut current_sequence = self
             .cfs
             .sequences
@@ -273,8 +376,7 @@ impl CfsCursor {
         while depth < coords.len() {
             let coord = coords[depth];
             let child_item = current_sequence
-                .items
-                .get(coord as usize)
+                .item_at(coord)
                 .expect("Could not resolve sequence coordinates");
 
             match child_item {
@@ -341,6 +443,8 @@ impl CfsCursor {
     /// `[outer_site, iteration, inner_item]` from being misclassified as an
     /// iteration of `[outer_site, iteration]`.
     fn try_get_item_exact(&self, coordinates: &CfsCoordinates) -> Option<&SequenceChildItem> {
+        // As in `get_sequence`: a close names the same item its open does.
+        let coordinates = &coordinates.opened();
         let mut current_sequence = self.cfs.sequences.get(self.entrypoint_coordinate as usize);
         let mut current_child_item: Option<&SequenceChildItem> = None;
 
@@ -348,7 +452,7 @@ impl CfsCursor {
         while depth < coordinates.len() {
             let coord = coordinates[depth];
             let sequence = current_sequence?;
-            let child = sequence.items.get(coord as usize)?;
+            let child = sequence.item_at(coord)?;
             current_child_item = Some(child);
 
             match child {
@@ -409,7 +513,10 @@ impl CfsCursor {
                     }
                 };
 
-                id == child_id && index >= parent_current_index as usize
+                // `index` is a 0-based Vec position; `parent_current_index` is a
+                // 1-based coordinate.
+                id == child_id
+                    && index >= (parent_current_index - FIRST_COORDINATE).max(0) as usize
             })
             .unwrap_or_else(|| {
                 panic!(
@@ -434,9 +541,8 @@ impl CfsCursor {
 
         let mut current_coords = parent_coords.clone();
         current_coords.push(
-            child_coord
-                .try_into()
-                .expect("Sequence coordinate out ouf bound u8"),
+            CfsCoordinate::try_from(child_coord).expect("Sequence coordinate out of bounds")
+                + FIRST_COORDINATE,
         );
 
         current_coords
@@ -446,6 +552,9 @@ impl CfsCursor {
         &self,
         coordinates: &CfsCoordinates,
     ) -> Option<(CfsCoordinates, CfsCoordinate)> {
+        // Report the *opening* index for a close, so callers asking "which
+        // iteration is this step in" get the same answer at both boundaries.
+        let coordinates = &coordinates.opened();
         let (&iteration_index, site_prefix) = coordinates.split_last()?;
         let site_coordinates = CfsCoordinates(site_prefix.to_vec());
         // Both recur kinds address their iterations the same way — `site ++ [i]`
@@ -460,13 +569,33 @@ impl CfsCursor {
         .then_some((site_coordinates, iteration_index))
     }
 
+    /// The coordinate at which a recur *sequence* iteration closes, if these
+    /// coordinates open one.
+    ///
+    /// `None` for anything else, including a recur *tile* iteration: that is a
+    /// single `Exec` record with no separate boundary steps, so it has no close
+    /// to distinguish.
+    pub fn closing_coordinates_of(&self, coordinates: &CfsCoordinates) -> Option<CfsCoordinates> {
+        let (site_coordinates, iteration_index) =
+            self.try_get_recur_iteration_coordinates(coordinates)?;
+        matches!(
+            self.try_get_item_exact(&site_coordinates),
+            Some(SequenceChildItem::RecurSequence(_))
+        )
+        .then(|| {
+            let mut closing = site_coordinates;
+            closing.push(closing_coordinate(iteration_index));
+            closing
+        })
+    }
+
     fn expand_recur_entry_coordinates(&self, coordinates: CfsCoordinates) -> Vec<CfsCoordinates> {
         if matches!(
             self.try_get_item(&coordinates),
             Some(SequenceChildItem::RecurTile(_) | SequenceChildItem::RecurSequence(_))
         ) {
             let mut iteration_coordinates = coordinates.clone();
-            iteration_coordinates.push(0);
+            iteration_coordinates.push(FIRST_COORDINATE);
             Vec::from([coordinates, iteration_coordinates])
         } else {
             Vec::from([coordinates])
@@ -577,6 +706,21 @@ impl SequenceDef {
             entry_arguments: Vec::new(),
             produces_output: false,
         }
+    }
+
+    /// The item at a **1-based** coordinate.
+    ///
+    /// `None` for `0`, for a negative coordinate, and past the end — so an
+    /// unset or closing coordinate resolves to nothing rather than silently
+    /// naming the first item. See [`FIRST_COORDINATE`].
+    pub fn item_at(&self, coordinate: CfsCoordinate) -> Option<&SequenceChildItem> {
+        let index = usize::try_from(coordinate.checked_sub(FIRST_COORDINATE)?).ok()?;
+        self.items.get(index)
+    }
+
+    /// The coordinate of this sequence's last item, or `None` when it has none.
+    pub fn last_coordinate(&self) -> Option<CfsCoordinate> {
+        (!self.items.is_empty()).then(|| self.items.len() as CfsCoordinate)
     }
 
     pub fn sequences(&self) -> Vec<SequenceItem> {
@@ -842,12 +986,12 @@ mod tests {
     fn recur_site_entry_offers_site_and_first_iteration_coordinates() {
         let cursor = recur_cursor();
         let next = cursor
-            .try_get_next_coordinates(&CfsCoordinates(vec![0]))
+            .try_get_next_coordinates(&CfsCoordinates(vec![1]))
             .expect("next coordinates should exist");
 
         assert_eq!(
             next,
-            vec![CfsCoordinates(vec![1]), CfsCoordinates(vec![1, 0])]
+            vec![CfsCoordinates(vec![2]), CfsCoordinates(vec![2, 1])]
         );
     }
 
@@ -855,16 +999,16 @@ mod tests {
     fn recur_iteration_advances_or_returns_to_site() {
         let cursor = recur_cursor();
         let next = cursor
-            .try_get_next_coordinates(&CfsCoordinates(vec![1, 0]))
+            .try_get_next_coordinates(&CfsCoordinates(vec![2, 1]))
             .expect("next coordinates should exist");
 
         assert_eq!(
             next,
-            vec![CfsCoordinates(vec![1, 1]), CfsCoordinates(vec![1])]
+            vec![CfsCoordinates(vec![2, 2]), CfsCoordinates(vec![2])]
         );
         assert_eq!(
             cursor
-                .try_get_item(&CfsCoordinates(vec![1, 4]))
+                .try_get_item(&CfsCoordinates(vec![2, 5]))
                 .map(|item| matches!(item, SequenceChildItem::RecurTile(_))),
             Some(true)
         );
@@ -890,12 +1034,16 @@ mod tests {
     fn recur_site_coordinate_offers_both_halves_and_the_next_sibling() {
         let cursor = recur_cursor();
         let next = cursor
-            .try_get_next_coordinates(&CfsCoordinates(vec![1]))
+            .try_get_next_coordinates(&CfsCoordinates(vec![2]))
             .expect("next coordinates should exist");
 
-        assert!(next.contains(&CfsCoordinates(vec![1])), "the End half: {:?}", next);
-        assert!(next.contains(&CfsCoordinates(vec![1, 0])), "iteration 0: {:?}", next);
-        assert!(next.contains(&CfsCoordinates(vec![2])), "next sibling: {:?}", next);
+        assert!(next.contains(&CfsCoordinates(vec![2])), "the End half: {:?}", next);
+        assert!(
+            next.contains(&CfsCoordinates(vec![2, 1])),
+            "first iteration: {:?}",
+            next
+        );
+        assert!(next.contains(&CfsCoordinates(vec![3])), "next sibling: {:?}", next);
     }
 
     /// A recur *sequence* iteration is a scope with children, so its successor
@@ -961,21 +1109,92 @@ mod tests {
     fn recur_sequence_iteration_offers_its_first_inner_step() {
         let cursor = recur_sequence_cursor();
         let next = cursor
-            .try_get_next_coordinates(&CfsCoordinates(vec![0, 0]))
+            .try_get_next_coordinates(&CfsCoordinates(vec![1, 1]))
             .expect("next coordinates should exist");
 
         assert!(
-            next.contains(&CfsCoordinates(vec![0, 0, 0])),
-            "iteration [0][0] must be able to be followed by its own first step \
-             [0][0][0], got {:?}",
+            next.contains(&CfsCoordinates(vec![1, 1, 1])),
+            "iteration [1][1] must be able to be followed by its own first step \
+             [1][1][1], got {:?}",
             next,
         );
     }
 
     #[test]
+    fn a_recur_sequence_iteration_closes_at_its_own_coordinate() {
+        let cursor = recur_sequence_cursor();
+        let open = CfsCoordinates(vec![1, 1]);
+
+        let close = cursor
+            .closing_coordinates_of(&open)
+            .expect("a recur sequence iteration has a distinct close");
+        // The bracket is symmetric: open `1` closes at `-1`. That symmetry is
+        // what 1-basing buys — at 0-based, `-0 == 0` would fold the first
+        // iteration's close back onto its own open.
+        assert_eq!(close, CfsCoordinates(vec![1, -1]));
+        assert_eq!(close, CfsCoordinates(vec![1, closing_coordinate(1)]));
+        assert_ne!(close, open);
+
+        let next = cursor
+            .try_get_next_coordinates(&open)
+            .expect("next coordinates should exist");
+        assert!(
+            next.contains(&close),
+            "an open iteration must be able to close, got {:?}",
+            next,
+        );
+        assert!(
+            !next.contains(&open),
+            "an open iteration must not offer its own coordinate as a successor — that was \
+             the reuse that made a close indistinguishable from an open: {:?}",
+            next,
+        );
+    }
+
+    #[test]
+    fn a_closed_recur_sequence_iteration_is_followed_by_the_next_one() {
+        // The transition an honest sweep makes and the guest rejected:
+        // iteration 1 ends, iteration 2 begins.
+        let cursor = recur_sequence_cursor();
+        let close_of_2 = CfsCoordinates(vec![1, closing_coordinate(2)]);
+
+        let next = cursor
+            .try_get_next_coordinates(&close_of_2)
+            .expect("a closed iteration has successors");
+
+        assert!(
+            next.contains(&CfsCoordinates(vec![1, 3])),
+            "a closed iteration must be followed by the next one, got {:?}",
+            next,
+        );
+        assert!(
+            next.contains(&CfsCoordinates(vec![1])),
+            "or by the site closing, got {:?}",
+            next,
+        );
+        assert!(
+            !next.contains(&CfsCoordinates(vec![1, 2, 1])),
+            "a closed iteration must not offer its own body again: {:?}",
+            next,
+        );
+    }
+
+    #[test]
+    fn a_draft_namespace_coordinate_is_not_read_as_a_close() {
+        // `DRAFT_NAMESPACE` is negative but is not a close marker, and negating
+        // `i32::MIN` would overflow.
+        assert!(opening_coordinate(DRAFT_NAMESPACE).is_none());
+        assert!(!is_closing_coordinate(DRAFT_NAMESPACE));
+        assert!(is_closing_coordinate(closing_coordinate(FIRST_COORDINATE)));
+        assert_eq!(opening_coordinate(closing_coordinate(7)), Some(7));
+        // `0` is not a position at all, so it is not a close either.
+        assert!(!is_closing_coordinate(0));
+    }
+
+    #[test]
     fn nested_recur_tile_resolves_as_inner_item_not_outer_iteration() {
         let cursor = recur_sequence_cursor();
-        let coordinates = CfsCoordinates(vec![0, 0, 1]);
+        let coordinates = CfsCoordinates(vec![1, 1, 2]);
         let item = cursor
             .try_get_item(&coordinates)
             .expect("nested recur tile should resolve");

@@ -3,7 +3,10 @@
 //! per-argument input bindings are honoured, and that its coordinates
 //! follow the schema's ordering.
 
-use raster_core::cfs::{CfsCoordinates, CfsCursor, InputBinding, InputSource, SequenceChildItem};
+use raster_core::cfs::{
+    CfsCoordinate, CfsCoordinates, CfsCursor, InputBinding, InputSource, SequenceChildItem,
+    FIRST_COORDINATE,
+};
 use raster_core::input::SelectorSegment;
 use raster_core::transition::StepRecordWitness;
 use std::collections::{BTreeMap, HashMap};
@@ -486,7 +489,14 @@ fn assert_record_in_trace(record: &StepRecord, witness: &StepRecordWitness, trac
     }
     assert!(
         current == trace_root,
-        "Sequence-scope parent record is not in the trace at the claimed position",
+        "Sequence-scope parent record is not in the trace at the claimed position: folding \
+         record {:?} from position {} through {} path elements gives {:?}, but the trace root \
+         here is {:?}",
+        record.coordinates,
+        witness.position,
+        witness.path_elems.len(),
+        current,
+        trace_root,
     );
 }
 
@@ -593,7 +603,7 @@ fn verify_one_binding(
     input_source_witness: &FnInput,
     sequence_scope_witness: Option<&FnInput>,
     parent_sequence_coordinates: &CfsCoordinates,
-    item_coordinate: u32,
+    item_coordinate: CfsCoordinate,
 ) {
     // A binding the schema did *not* declare as index-sourced must not have
     // become one in the recording, and vice versa. Without this pairing the
@@ -693,8 +703,15 @@ fn verify_one_binding(
         InputBinding::PriorItemOutput {
             intra_sequence_item_index,
         } => {
+            // `intra_sequence_item_index` is a 0-based index into the
+            // sequence's `items`, which is what the CFS stores; coordinates are
+            // 1-based positions derived from it. Converting here keeps the two
+            // schemes apart at the one place they meet.
+            let source_coordinate = CfsCoordinate::try_from(*intra_sequence_item_index)
+                .expect("Prior item output index exceeds CFS coordinate bounds")
+                + FIRST_COORDINATE;
             assert!(
-                *intra_sequence_item_index < item_coordinate as usize,
+                source_coordinate < item_coordinate,
                 "Step {:?} cannot depend on source item {} from the same or a future position {}",
                 step_record,
                 intra_sequence_item_index,
@@ -702,11 +719,7 @@ fn verify_one_binding(
             );
 
             let mut source_coordinates = parent_sequence_coordinates.clone();
-            source_coordinates.push(
-                (*intra_sequence_item_index)
-                    .try_into()
-                    .expect("Prior item output index exceeds CFS coordinate bounds"),
-            );
+            source_coordinates.push(source_coordinate);
             let storage_meta = match resolved_source {
                 ResolvedSource::Storage(meta) => meta,
                 _ => {
@@ -755,7 +768,16 @@ pub fn get_next_expected_coordinates(
     if let Some(current_expected_coordinates) = current_expected_coordinates {
         assert!(
             current_expected_coordinates.contains(coordinates),
-            "Step coordinates are not in expected next coordinates"
+            "Step {:?} (kind {}) is not among the coordinates the previous step allows: {:?}",
+            coordinates,
+            match &step.kind {
+                StepKind::ProgramStart(_) => "ProgramStart",
+                StepKind::ProgramEnd(_) => "ProgramEnd",
+                StepKind::SequenceStart { .. } => "SequenceStart",
+                StepKind::SequenceEnd { .. } => "SequenceEnd",
+                StepKind::Exec(_) => "Exec",
+            },
+            current_expected_coordinates,
         );
     }
 
@@ -934,7 +956,16 @@ pub fn advance_recur_progress(
                 // count, so an iteration is never counted twice.
                 if matches!(step_record.kind, StepKind::SequenceStart { .. }) {
                     if let Err(violation) = progress
-                        .advance_sequence_iteration(coordinates, u64::from(iteration_index))
+                        // The only seam between the two numbering schemes:
+                        // coordinates are 1-based positions, while the progress
+                        // rules count iterations from 0 — the same 0 a recur
+                        // *tile*'s replay journal reports, so the counter stays
+                        // one convention for both families.
+                        .advance_sequence_iteration(
+                            coordinates,
+                            u64::try_from(iteration_index - FIRST_COORDINATE)
+                                .expect("a recur iteration coordinate is at least the first"),
+                        )
                     {
                         panic!(
                             "Recur progress violation at step {:?}: {}",
