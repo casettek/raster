@@ -845,9 +845,9 @@ fn witness_record_inputs(
     fraud_window: &TraceWindow,
     cfs_cursor: &CfsCursor,
     seed: &[u8],
-) -> HashMap<StepRecord, Vec<u8>> {
+) -> HashMap<(u64, StepRecord), Vec<u8>> {
     let window_start_index = window_end_index + 1 - fraud_window.items.len();
-    let mut source_records_witnesses: HashMap<StepRecord, Vec<u8>> = HashMap::new();
+    let mut source_records_witnesses: HashMap<(u64, StepRecord), Vec<u8>> = HashMap::new();
 
     for (offset, step_record) in fraud_window.items.iter().enumerate() {
         // The two steps that bind no CFS inputs, skipped in the order the guest
@@ -911,26 +911,12 @@ fn witness_record_inputs(
             })
             .expect("Failed to serialize source record witness");
 
-            // [measure#9] temporary
-            eprintln!(
-                "[measure#9] step {:?} (window offset {}) -> parent {:?} kind={} at trace_index={} prefix_len={} prefix_root={:?} path_elems={}",
-                step_record.coordinates,
-                offset,
-                source_record.coordinates,
-                match &source_record.kind {
-                    StepKind::SequenceStart { .. } => "SequenceStart",
-                    StepKind::SequenceEnd { .. } => "SequenceEnd",
-                    StepKind::Exec(_) => "Exec",
-                    StepKind::ProgramStart(_) => "ProgramStart",
-                    StepKind::ProgramEnd(_) => "ProgramEnd",
-                },
-                trace_index,
-                step_index,
-                merkle_path.root(Bytes(source_record.hash())).0,
-                merkle_path.path_elems().len(),
-            );
-
-            source_records_witnesses.insert(source_record, witness_bytes);
+            // Keyed by the *verifying* step as well as the source, because the
+            // witness is only valid at that step's trace root. Two window steps
+            // resolving the same source get two witnesses; keyed by the source
+            // alone, this `insert` overwrote the earlier step's and left it
+            // folding a proof built over a longer prefix than its own root.
+            source_records_witnesses.insert((step_record.exec_index, source_record), witness_bytes);
         }
     }
 
@@ -953,7 +939,7 @@ pub struct TraceVerifier<'a> {
 #[derive(Debug, Clone)]
 pub struct FraudEvidence {
     pub window: TraceWindow,
-    pub input_sources_witnesses: HashMap<StepRecord, Vec<u8>>,
+    pub input_sources_witnesses: HashMap<(u64, StepRecord), Vec<u8>>,
 }
 
 pub enum VerificationResult {
@@ -2115,10 +2101,13 @@ mod tests {
         };
 
         // The producer is the resolved source, and it is witnessed.
+        // Keyed by (verifying step, source), so look the producer up under the
+        // consumer that reads it rather than on its own.
         assert!(
             evidence
                 .input_sources_witnesses
-                .contains_key(&committed_trace.0[1]),
+                .keys()
+                .any(|(_, record)| *record == committed_trace.0[1]),
             "producer step should be witnessed as the consumer's input source",
         );
     }
@@ -2148,7 +2137,10 @@ mod tests {
             .expect("terminal window over a trace longer than the window");
 
         assert!(
-            evidence.input_sources_witnesses.contains_key(&trace.0[1]),
+            evidence
+                .input_sources_witnesses
+                .keys()
+                .any(|(_, record)| *record == trace.0[1]),
             "producer step should be witnessed as the consumer's input source",
         );
     }
@@ -2259,7 +2251,8 @@ mod tests {
         assert!(
             evidence
                 .input_sources_witnesses
-                .contains_key(&committed_trace.0[0]),
+                .keys()
+                .any(|(_, record)| *record == committed_trace.0[0]),
             "ProgramStart should be witnessed as the entry-argument source",
         );
     }
@@ -2388,7 +2381,8 @@ mod tests {
         assert!(
             evidence
                 .input_sources_witnesses
-                .contains_key(&committed_trace.0[1]),
+                .keys()
+                .any(|(_, record)| *record == committed_trace.0[1]),
             "the frame-opening SequenceStart is the scope input's source, and must be witnessed",
         );
     }

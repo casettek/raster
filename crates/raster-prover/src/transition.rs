@@ -51,7 +51,7 @@ type RecordedStepIo = HashMap<StepRecord, StepIo>;
 
 fn build_transition_input(
     step_record: &StepRecord,
-    input_sources_witnesses: &HashMap<StepRecord, Vec<u8>>,
+    input_sources_witnesses: &HashMap<(u64, StepRecord), Vec<u8>>,
     recorded_step_io: &RecordedStepIo,
     replayed_results: &HashMap<StepRecord, ReplayResult>,
     authorization_journal: &AuthorizationJournal,
@@ -185,7 +185,7 @@ pub fn step_transitions(
     // written to the guest, which hashes it to derive `program_commitment` and
     // decodes it for the CFS + tile registry. See program-identity.md.
     program_frame: &[u8],
-    input_sources_witnesses: &HashMap<StepRecord, Vec<u8>>,
+    input_sources_witnesses: &HashMap<(u64, StepRecord), Vec<u8>>,
     recorded_step_io: &RecordedStepIo,
     replayed_results: &HashMap<StepRecord, ReplayResult>,
     authorization_journal: &AuthorizationJournal,

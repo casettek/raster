@@ -527,7 +527,7 @@ pub fn verify_sequence_scope_parent(
     cfs_cursor: &CfsCursor,
     step_record: &StepRecord,
     sequence_scope_witness: Option<&FnInput>,
-    input_sources_witnesses: &HashMap<StepRecord, Vec<u8>>,
+    input_sources_witnesses: &HashMap<(u64, StepRecord), Vec<u8>>,
     trace_root: &[u8],
 ) {
     let coordinates = step_record.coordinates();
@@ -564,9 +564,14 @@ pub fn verify_sequence_scope_parent(
 
     let (parent_record, witness_bytes) = input_sources_witnesses
         .iter()
-        .find(|(record, _)| {
-            matches!(record.kind, StepKind::SequenceStart { .. })
-                && *record.coordinates() == parent_coordinates
+        .find_map(|((verifier_exec_index, record), bytes)| {
+            // This step's own witness, not merely one for this parent: a
+            // witness folds to the trace root of the step it was built for,
+            // and the frontier has grown by then for any other step.
+            (*verifier_exec_index == step_record.exec_index
+                && matches!(record.kind, StepKind::SequenceStart { .. })
+                && *record.coordinates() == parent_coordinates)
+                .then_some((record, bytes))
         })
         .unwrap_or_else(|| {
             panic!(

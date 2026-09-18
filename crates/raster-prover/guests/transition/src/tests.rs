@@ -276,7 +276,7 @@ fn sequence_scope_parent_binding_accepts_the_real_parent() {
     let (trace_root, witness) = trace_root_and_witness(&[parent_record.clone()], 0);
     let mut witnesses = HashMap::new();
     witnesses.insert(
-        parent_record,
+        (step_record.exec_index, parent_record),
         postcard::to_allocvec(&witness).expect("witness serializes"),
     );
 
@@ -286,6 +286,92 @@ fn sequence_scope_parent_binding_accepts_the_real_parent() {
         Some(&parent_args),
         &witnesses,
         &trace_root,
+    );
+}
+
+/// Two steps in the same frame, verifying at different points in the trace.
+///
+/// This is the shape that made `hello-tiles` unprovable: window offsets 9 and
+/// 10 both resolved the scope parent `[21]`, so the host built two witnesses —
+/// one against a 74-item prefix, one against 75 — and keyed both by the parent
+/// record alone. The second `insert` replaced the first, and offset 9 was left
+/// folding a proof over a prefix one item longer than its own trace root.
+///
+/// The fix is the key: each step gets *its* witness. A test keyed only by the
+/// parent cannot catch this, because with one step there is nothing to
+/// overwrite.
+#[test]
+fn two_steps_sharing_a_scope_parent_each_verify_at_their_own_trace_root() {
+    let cfs_cursor = scope_binding_cfs();
+    let (first_step, _, parent_record, parent_args) =
+        scope_binding_scenario(CfsCoordinates(vec![10, 10]), sha(b"the-caller-passed-this"));
+
+    // A second step in the same frame, one item later in the trace.
+    let mut second_step = first_step.clone();
+    second_step.exec_index = first_step.exec_index + 1;
+
+    // Each verifies against a different prefix: the parent, then the parent
+    // plus one intervening step.
+    let filler = parent_record.clone();
+    let (root_at_first, witness_at_first) = trace_root_and_witness(&[parent_record.clone()], 0);
+    let (root_at_second, witness_at_second) =
+        trace_root_and_witness(&[parent_record.clone(), filler], 0);
+    assert_ne!(
+        root_at_first, root_at_second,
+        "the trace root must grow between the two steps, or this proves nothing",
+    );
+
+    let mut witnesses = HashMap::new();
+    witnesses.insert(
+        (first_step.exec_index, parent_record.clone()),
+        postcard::to_allocvec(&witness_at_first).expect("witness serializes"),
+    );
+    witnesses.insert(
+        (second_step.exec_index, parent_record),
+        postcard::to_allocvec(&witness_at_second).expect("witness serializes"),
+    );
+
+    verify_sequence_scope_parent(
+        &cfs_cursor,
+        &first_step,
+        Some(&parent_args),
+        &witnesses,
+        &root_at_first,
+    );
+    verify_sequence_scope_parent(
+        &cfs_cursor,
+        &second_step,
+        Some(&parent_args),
+        &witnesses,
+        &root_at_second,
+    );
+}
+
+/// A step handed only *another* step's witness for the same parent is refused
+/// rather than accidentally accepted — the failure the old key produced, now
+/// stated as a rule.
+#[test]
+#[should_panic(expected = "no SequenceStart witness for frame")]
+fn a_step_cannot_borrow_another_steps_witness_for_the_same_parent() {
+    let cfs_cursor = scope_binding_cfs();
+    let (first_step, _, parent_record, parent_args) =
+        scope_binding_scenario(CfsCoordinates(vec![10, 10]), sha(b"the-caller-passed-this"));
+    let mut second_step = first_step.clone();
+    second_step.exec_index = first_step.exec_index + 1;
+
+    let (root_at_first, witness_at_first) = trace_root_and_witness(&[parent_record.clone()], 0);
+    let mut witnesses = HashMap::new();
+    witnesses.insert(
+        (first_step.exec_index, parent_record),
+        postcard::to_allocvec(&witness_at_first).expect("witness serializes"),
+    );
+
+    verify_sequence_scope_parent(
+        &cfs_cursor,
+        &second_step,
+        Some(&parent_args),
+        &witnesses,
+        &root_at_first,
     );
 }
 
@@ -306,7 +392,7 @@ fn sequence_scope_parent_binding_refuses_a_fabricated_witness() {
     let (trace_root, witness) = trace_root_and_witness(&[parent_record.clone()], 0);
     let mut witnesses = HashMap::new();
     witnesses.insert(
-        parent_record,
+        (step_record.exec_index, parent_record),
         postcard::to_allocvec(&witness).expect("witness serializes"),
     );
 
@@ -341,7 +427,7 @@ fn sequence_scope_parent_binding_refuses_a_parent_not_in_the_trace() {
     );
     let mut witnesses = HashMap::new();
     witnesses.insert(
-        parent_record,
+        (step_record.exec_index, parent_record),
         postcard::to_allocvec(&witness).expect("witness serializes"),
     );
 
