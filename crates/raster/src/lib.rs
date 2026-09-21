@@ -254,6 +254,11 @@ pub mod __private {
                 body_self_ns: 0,
                 scope_enter_ns,
                 synthetic_coordinate_alloc_ns: 0,
+                // Both accumulate through `record_sequence_draft_finalize`
+                // during the body, exactly as the synthetic-coordinate counter
+                // does; the wrapper contributes nothing of its own.
+                draft_materialize_ns: 0,
+                draft_store_ns: 0,
                 input_trace_ns,
                 start_event_publish_ns,
                 output_trace_ns,

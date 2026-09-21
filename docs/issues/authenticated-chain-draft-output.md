@@ -1,6 +1,9 @@
-# Issue: `authenticated-chain-draft-output` — a draft-returning stage cannot complete an authenticated chain run
+# Issue: `authenticated-chain-draft-output` — a finalized draft has no object in the recorder's storage replica
 
-Status: open 2026-08-27. Unowned.
+Status: open 2026-08-27. Unowned. **Scope widened 2026-09-18: not chain-specific, and not
+specific to program outputs.** The name is kept so links stay valid; read it as *draft-object
+missing from the replica*. A second reproducer on `examples/hello-tiles` fails on the
+**fraud-proof** path, where the draft is a tile *input*, not a stage output.
 
 Related:
 - [`chain-stage-execution.md`](../proposals/chain-stage-execution.md) — **supplies the fixture
@@ -53,6 +56,32 @@ let witness = self.storage.selection_witness(&reference, …)
 > CfsCoordinates([-2147483648, 2])`. Same defect, same line, new spelling — read `u32::MAX` as
 > `DRAFT_NAMESPACE` throughout the rest of this file.
 
+## Second reproducer: the fraud path, on a program that is not a chain
+
+`examples/hello-tiles`, tile guests rebuilt from scratch, fraud injected and audited:
+
+```
+run.rs:765 → Failed to build storage selection witness for 'message1':
+             Missing storage object at coordinates CfsCoordinates([-2147483648, 2])
+```
+
+Same missing object, different caller. `message1` is `concat_messages`'s first parameter
+(`src/lib.rs:123`), bound in `main` to `select!(String, draft_greeting.clone().title)` after
+`finalize(draft)` (`src/main.rs:101-105`) — a selection **into** a finalized draft, consumed as a
+tile input. Nothing here is a chain, and nothing here is a program output.
+
+So the defect is one fact reached from two directions, and both callers are simply asking storage
+for an object at a draft coordinate:
+
+| caller | what it wants | program |
+| --- | --- | --- |
+| `recorder.rs:642` — program output selection replay | the draft **as the program's output** | `chain-example` stage 3 |
+| `run.rs:765` — `build_storage_selection_witnesses` | the draft **as a tile's input source** | `hello-tiles` fraud proof |
+
+The honest path is unaffected in both: `hello-tiles` commits and audits clean
+(`Verification Success`), and detection works — the audit exits `101`. It is *proof construction*
+that cannot proceed, which is this issue's whole shape.
+
 The replica has no object at `[4294967295, 1]` — `[u32::MAX, 1]`, the coordinate a finalized
 `Draft` is stored under. Stages 1 and 2 return plain values at ordinary coordinates (`0`, `1`)
 and replay fine; stage 3 returns a `Draft<Report>`, and it does not.
@@ -101,19 +130,32 @@ does not hit this either.
 
 ## Directions
 
-Sketched, not chosen.
+Sketched, not chosen. The second reproducer narrows the field: any fix has to serve **both**
+callers in the table above, and one of the three original sketches no longer can.
 
 - **Populate the replica with finalized drafts.** If the finalize path writes the draft's object
-  into the recorder's replica under the same `[u32::MAX, n]` coordinate the runtime reports, the
-  existing lookup succeeds unchanged. Cheapest if the object is already materialized somewhere at
-  finalize time; needs checking against `incremental-draft-witness`'s frontier, which deliberately
-  avoids holding whole values.
-- **Teach `selection_witness` the draft coordinate space.** Resolve `[u32::MAX, n]` through the
-  draft tracker rather than the storage log. Keeps the replica untouched but adds a second
-  addressing path to a function whose whole point is that there is one.
-- **Make a draft output ineligible as a program output.** Force `finalize` into ordinary storage
-  before `ProgramEnd`. Simplest to verify, and the most likely to be wrong — it would forbid the
-  shape `chain-example` was written to demonstrate.
+  into the recorder's replica under the same `[DRAFT_NAMESPACE, n]` coordinate the runtime
+  reports, both lookups succeed unchanged — neither caller needs to know a draft was involved.
+  Cheapest if the object is already materialized somewhere at finalize time; needs checking
+  against `incremental-draft-witness`'s frontier, which deliberately avoids holding whole values.
+  **Strengthened** by the second reproducer: it is the only sketch that fixes an input binding and
+  an output selection with one change, because it fixes the thing both of them ask.
+- **Teach `selection_witness` the draft coordinate space.** Resolve `[DRAFT_NAMESPACE, n]` through
+  the draft tracker rather than the storage log. Also serves both callers, since both reach
+  storage through that function. Keeps the replica untouched but adds a second addressing path to
+  a function whose whole point is that there is one — and the fraud-proof guest would then have to
+  learn the same second path, or the witness it is handed proves membership in a structure the
+  guest cannot check.
+- ~~**Make a draft output ineligible as a program output.**~~ **Ruled out 2026-09-18.** It would
+  not touch `hello-tiles`, where the draft is a tile *input* (`message1`) and never the program's
+  output. It only ever addressed the chain reproducer, and the defect is not about outputs.
+
+The second sketch carries a consequence worth stating before anyone picks it: the fraud path does
+not merely *read* the object, it builds a witness the transition guest verifies against the
+authenticated store's roots. A resolution route that exists only host-side produces evidence the
+guest has no way to accept. The first sketch does not have this problem — a draft written into the
+replica is an ordinary storage object with ordinary membership, which is what every existing check
+already knows how to verify.
 
 ## Cost of leaving it
 
@@ -121,3 +163,12 @@ No authenticated multi-stage chain can complete if any stage returns a draft, so
 `chain-commitment` from an authenticated run of such a chain, no `commit.bin` for its last stage,
 and therefore no dispute over that stage. It also blocks `chain-io-commitment`'s V4 equivalence
 test, which is the check that the cheap and authenticated postures agree.
+
+**Raised 2026-09-18.** With the second reproducer, this also blocks **fraud proof construction for
+any program that selects into a finalized draft** — chain or not. On `hello-tiles` the honest path
+is entirely healthy (commit `0`, audit `Verification Success`) and fraud is *detected* (`101`), but
+the receipt cannot be built. That is a completeness defect on the dispute path, and on the dispute
+path a completeness defect is a lost dispute — the same framing
+[`fraud-evidence-storage-unavailable`](./fraud-evidence-storage-unavailable.md) §3 uses. As of this
+date it is the **last** blocker standing between a detected divergence and a completed fraud proof
+on `hello-tiles`: every other step in that window verifies.

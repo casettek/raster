@@ -356,6 +356,10 @@ fn apply_stream_event(profile: &mut ExecutionProfile, event: ProfileStreamEvent)
             }
             false
         }
+        // The follow view aggregates per-record; a standalone finalize has no
+        // record to attach to (a draft closed in `main` has no sequence frame
+        // at all). It stays in the stream for direct reading.
+        ProfileStreamEvent::DraftFinalize { .. } => false,
         ProfileStreamEvent::RunFinished {
             program_total_duration_ns,
             ..

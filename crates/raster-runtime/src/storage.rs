@@ -162,6 +162,16 @@ pub(crate) struct AuthorizedSourceLoad {
 #[derive(Clone)]
 pub struct StorageManager {
     frontier: TraceTreeFrontier,
+    /// The storage root as of the last mutation.
+    ///
+    /// `frontier_root` rebuilds a `TraceTree` from a **cloned** frontier, so
+    /// recomputing it per read is not free: measured at ~110 µs per `append`,
+    /// which called it twice — 32–55% of an append's whole cost, and paid by
+    /// every storage write in every program. `store_root_before` is by
+    /// construction the previous append's `store_root_after`, so one recompute
+    /// per mutation is all that is ever needed.
+    /// See `docs/proposals/storage-write-cost.md`.
+    cached_root: Vec<u8>,
     objects: BTreeMap<CfsCoordinates, StoredObject>,
     coordinate_index: IncrementalCoordinateIndex,
     /// Set once (via `start_program`) for programs that declare `main` entry
@@ -393,8 +403,10 @@ impl StorageManager {
             .frontier()
             .cloned()
             .expect("storage frontier should exist after seed append");
+        let cached_root = frontier_root(&frontier);
         Self {
             frontier,
+            cached_root,
             objects: BTreeMap::new(),
             coordinate_index: IncrementalCoordinateIndex::new(),
             source_resolver: None,
@@ -423,7 +435,7 @@ impl StorageManager {
     }
 
     pub fn current_root(&self) -> Vec<u8> {
-        frontier_root(&self.frontier)
+        self.cached_root.clone()
     }
 
     pub fn current_index_root(&self) -> Vec<u8> {
@@ -442,22 +454,43 @@ impl StorageManager {
             coordinates
         );
 
+        let timing = crate::profiling::profiling_enabled();
+
+        // `current_root` rebuilds a `TraceTree` from a cloned frontier, and is
+        // called once here and once below — so the roots term is timed apart
+        // from the work that actually mutates state.
+        let roots_start = timing.then(std::time::Instant::now);
         let store_root_before = self.current_root();
         let index_root_before = self.current_index_root();
+        let mut roots_ns = elapsed_ns(roots_start);
+
         let entry = StorageEntry {
             coordinates: coordinates.clone(),
             object_commitment,
         };
-        let leaf_hash: Vec<u8> = Sha256Commitment::from(entry.to_bytes().as_slice()).into();
 
+        let frontier_start = timing.then(std::time::Instant::now);
+        let leaf_hash: Vec<u8> = Sha256Commitment::from(entry.to_bytes().as_slice()).into();
         self.frontier.append(Bytes(leaf_hash));
+        let frontier_ns = elapsed_ns(frontier_start);
+
+        // The one recompute per mutation; every read below is served from it.
+        // Timed as roots work, not frontier work, so a before/after against the
+        // pre-cache numbers compares the same thing.
+        let recompute_start = timing.then(std::time::Instant::now);
+        self.cached_root = frontier_root(&self.frontier);
+        roots_ns = roots_ns.saturating_add(elapsed_ns(recompute_start));
+
         let log_position: u64 = self.frontier.position().into();
         let index_value = StorageIndexValue {
             log_position,
             object_commitment: entry.object_commitment.clone(),
         };
+
+        let index_start = timing.then(std::time::Instant::now);
         self.coordinate_index
             .insert(coordinates.clone(), index_value);
+        let index_ns = elapsed_ns(index_start);
 
         let reference = StorageRef::new(coordinates.clone(), entry.object_commitment.clone());
 
@@ -470,7 +503,8 @@ impl StorageManager {
             },
         );
 
-        StorageWriteRecord {
+        let roots_after_start = timing.then(std::time::Instant::now);
+        let record = StorageWriteRecord {
             entry,
             log_position,
             store_root_before,
@@ -478,7 +512,11 @@ impl StorageManager {
             index_root_before,
             index_root_after: self.current_index_root(),
             frontier_after: serializable_frontier_from_trace_frontier(self.frontier.clone()),
-        }
+        };
+        roots_ns = roots_ns.saturating_add(elapsed_ns(roots_after_start));
+
+        crate::profiling::record_draft_append_phase(roots_ns, frontier_ns, index_ns);
+        record
     }
 
     pub fn append_serialized_bytes(
@@ -1229,21 +1267,36 @@ fn store_value_at_coordinates<T: Serialize>(
     value: &T,
     coordinates: CfsCoordinates,
 ) -> Result<StorageRef> {
+    // Phase timings land in the draft-store accumulator only while a
+    // `finalize` has armed it; an ordinary tile-output store records nothing.
+    let timing = crate::profiling::profiling_enabled();
+
+    let postcard_start = timing.then(std::time::Instant::now);
     let bytes = raster_core::postcard::to_allocvec(value).map_err(|error| {
         Error::Serialization(format!(
             "Failed to serialize storage object for current sequence step: {}",
             error
         ))
     })?;
+    let postcard_ns = elapsed_ns(postcard_start);
+
+    let payload_start = timing.then(std::time::Instant::now);
     let raster_payload = Some(raster_payload_for_value(value)?);
-    THREAD_STORAGE.with(|storage| {
+    let payload_ns = elapsed_ns(payload_start);
+
+    let append_start = timing.then(std::time::Instant::now);
+    let result = THREAD_STORAGE.with(|storage| {
         let write = storage.borrow_mut().append_serialized_bytes(
             &bytes,
             coordinates.clone(),
             raster_payload,
         );
         Ok(StorageRef::new(coordinates, write.entry.object_commitment))
-    })
+    });
+    let append_ns = elapsed_ns(append_start);
+
+    crate::profiling::record_draft_store_phase(postcard_ns, payload_ns, append_ns);
+    result
 }
 
 pub fn store_value<T: Serialize>(value: &T) -> Result<StorageRef> {
@@ -1475,16 +1528,52 @@ pub fn finalize_draft<S>(anchor: &Anchor, expected_root: &[u8; 32]) -> Result<St
 where
     S: Schema + DeserializeOwned + Serialize,
 {
-    let value = finalize_draft_value::<S>(anchor, expected_root, true)?;
-    store_finalized_draft(&value)
+    finalize_and_store::<S>(anchor, expected_root, true)
 }
 
 pub fn finalize_empty_draft<S>(anchor: &Anchor, expected_root: &[u8; 32]) -> Result<StorageRef>
 where
     S: Schema + DeserializeOwned + Serialize,
 {
-    let value = finalize_draft_value::<S>(anchor, expected_root, false)?;
-    store_finalized_draft(&value)
+    finalize_and_store::<S>(anchor, expected_root, false)
+}
+
+/// The two halves of closing a draft, timed separately.
+///
+/// They are separated because they are the two costs
+/// `docs/proposals/incremental-draft-materialization.md` removes, and it
+/// removes them for different reasons: *materialize* rebuilds the whole object
+/// from the draft's field values, and *store* then encodes it and re-derives
+/// every element root that the draft's `AppendFrontier` already folded. A
+/// before/after needs to see which half moved.
+fn finalize_and_store<S>(
+    anchor: &Anchor,
+    expected_root: &[u8; 32],
+    require_complete: bool,
+) -> Result<StorageRef>
+where
+    S: Schema + DeserializeOwned + Serialize,
+{
+    let profiling_enabled = crate::profiling::profiling_enabled();
+
+    let materialize_start = profiling_enabled.then(std::time::Instant::now);
+    let value = finalize_draft_value::<S>(anchor, expected_root, require_complete)?;
+    let materialize_ns = elapsed_ns(materialize_start);
+
+    crate::profiling::arm_draft_store_phases();
+    let store_start = profiling_enabled.then(std::time::Instant::now);
+    let reference = store_finalized_draft(&value);
+    let store_ns = elapsed_ns(store_start);
+    let phases = crate::profiling::take_draft_store_phases();
+
+    crate::profiling::record_sequence_draft_finalize(materialize_ns, store_ns, phases);
+    reference
+}
+
+fn elapsed_ns(start: Option<std::time::Instant>) -> u64 {
+    start
+        .map(|start| u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
 }
 
 pub fn resolve_storage_value<T: DeserializeOwned>(
