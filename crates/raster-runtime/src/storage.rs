@@ -15,7 +15,7 @@ use raster_core::transition::{SerializableFrontier, StorageEntry, StorageIndexVa
 use raster_core::{Error, Result};
 use raster_prover::precomputed::EMPTY_TRIE_NODES;
 use raster_prover::trace::{
-    serializable_frontier_from_trace_frontier, Bytes, TraceTree, TraceTreeFrontier,
+    frontier_root, serializable_frontier_from_trace_frontier, Bytes, TraceTree, TraceTreeFrontier,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -164,12 +164,13 @@ pub struct StorageManager {
     frontier: TraceTreeFrontier,
     /// The storage root as of the last mutation.
     ///
-    /// `frontier_root` rebuilds a `TraceTree` from a **cloned** frontier, so
-    /// recomputing it per read is not free: measured at ~110 µs per `append`,
-    /// which called it twice — 32–55% of an append's whole cost, and paid by
-    /// every storage write in every program. `store_root_before` is by
-    /// construction the previous append's `store_root_after`, so one recompute
-    /// per mutation is all that is ever needed.
+    /// Recomputing `frontier_root` per read is not free even after the direct
+    /// ommer fold: it hashes the whole right spine. It was measured at ~110 µs
+    /// per `append` back when it rebuilt a `TraceTree` from a cloned frontier —
+    /// 32–55% of an append's whole cost, and paid by every storage write in
+    /// every program. `store_root_before` is by construction the previous
+    /// append's `store_root_after`, so one recompute per mutation is all that
+    /// is ever needed.
     /// See `docs/proposals/storage-write-cost.md`.
     cached_root: Vec<u8>,
     objects: BTreeMap<CfsCoordinates, StoredObject>,
@@ -187,13 +188,6 @@ impl std::fmt::Debug for StorageManager {
             .field("has_source_resolver", &self.source_resolver.is_some())
             .finish()
     }
-}
-
-fn frontier_root(frontier: &TraceTreeFrontier) -> Vec<u8> {
-    TraceTree::from_frontier(1, frontier.clone())
-        .root(0)
-        .expect("storage root should exist")
-        .0
 }
 
 pub(crate) fn decode_hex_bytes(input: &str) -> Result<Vec<u8>> {
@@ -456,7 +450,7 @@ impl StorageManager {
 
         let timing = crate::profiling::profiling_enabled();
 
-        // `current_root` rebuilds a `TraceTree` from a cloned frontier, and is
+        // `current_root`/`frontier_root` fold the frontier's ommers, and are
         // called once here and once below — so the roots term is timed apart
         // from the work that actually mutates state.
         let roots_start = timing.then(std::time::Instant::now);
@@ -479,7 +473,8 @@ impl StorageManager {
         // pre-cache numbers compares the same thing.
         let recompute_start = timing.then(std::time::Instant::now);
         self.cached_root = frontier_root(&self.frontier);
-        roots_ns = roots_ns.saturating_add(elapsed_ns(recompute_start));
+        let root_recompute_ns = elapsed_ns(recompute_start);
+        roots_ns = roots_ns.saturating_add(root_recompute_ns);
 
         let log_position: u64 = self.frontier.position().into();
         let index_value = StorageIndexValue {
@@ -503,6 +498,13 @@ impl StorageManager {
             },
         );
 
+        // `frontier_after` clones the frontier and converts it; timed apart
+        // from the root recompute so the roots term says whether it is hashing
+        // or allocation.
+        let frontier_after_start = timing.then(std::time::Instant::now);
+        let frontier_after = serializable_frontier_from_trace_frontier(self.frontier.clone());
+        let frontier_after_ns = elapsed_ns(frontier_after_start);
+
         let roots_after_start = timing.then(std::time::Instant::now);
         let record = StorageWriteRecord {
             entry,
@@ -511,11 +513,19 @@ impl StorageManager {
             store_root_after: self.current_root(),
             index_root_before,
             index_root_after: self.current_index_root(),
-            frontier_after: serializable_frontier_from_trace_frontier(self.frontier.clone()),
+            frontier_after,
         };
-        roots_ns = roots_ns.saturating_add(elapsed_ns(roots_after_start));
+        roots_ns = roots_ns
+            .saturating_add(elapsed_ns(roots_after_start))
+            .saturating_add(frontier_after_ns);
 
-        crate::profiling::record_draft_append_phase(roots_ns, frontier_ns, index_ns);
+        crate::profiling::record_draft_append_phase(
+            roots_ns,
+            frontier_ns,
+            index_ns,
+            root_recompute_ns,
+            frontier_after_ns,
+        );
         record
     }
 

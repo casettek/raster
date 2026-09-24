@@ -267,6 +267,15 @@ pub enum ProfileStreamEvent {
         append_frontier_ns: u64,
         #[serde(default)]
         append_index_ns: u64,
+        /// `append_roots_ns` split again: the single `frontier_root` recompute,
+        /// and the separate `frontier.clone()` + conversion for `frontier_after`.
+        /// Whether the roots term is hashing or allocation decides whether
+        /// `incremental-draft-materialization`'s log-per-modification variant is
+        /// viable at all.
+        #[serde(default)]
+        append_root_recompute_ns: u64,
+        #[serde(default)]
+        append_frontier_after_ns: u64,
     },
     RunFinished {
         run_id: String,
@@ -478,6 +487,8 @@ pub struct DraftStorePhases {
     pub append_roots_ns: u64,
     pub append_frontier_ns: u64,
     pub append_index_ns: u64,
+    pub append_root_recompute_ns: u64,
+    pub append_frontier_after_ns: u64,
 }
 
 #[cfg(feature = "profiling")]
@@ -495,7 +506,7 @@ pub(crate) fn arm_draft_store_phases() {
 pub(crate) fn arm_draft_store_phases() {}
 
 #[cfg(feature = "profiling")]
-pub(crate) fn take_draft_store_phases() -> (u64, u64, u64, u64, u64, u64) {
+pub(crate) fn take_draft_store_phases() -> (u64, u64, u64, u64, u64, u64, u64, u64) {
     DRAFT_STORE_PHASES.with(|cell| {
         cell.borrow_mut()
             .take()
@@ -507,15 +518,17 @@ pub(crate) fn take_draft_store_phases() -> (u64, u64, u64, u64, u64, u64) {
                     p.append_roots_ns,
                     p.append_frontier_ns,
                     p.append_index_ns,
+                    p.append_root_recompute_ns,
+                    p.append_frontier_after_ns,
                 )
             })
-            .unwrap_or((0, 0, 0, 0, 0, 0))
+            .unwrap_or((0, 0, 0, 0, 0, 0, 0, 0))
     })
 }
 
 #[cfg(not(feature = "profiling"))]
-pub(crate) fn take_draft_store_phases() -> (u64, u64, u64, u64, u64, u64) {
-    (0, 0, 0, 0, 0, 0)
+pub(crate) fn take_draft_store_phases() -> (u64, u64, u64, u64, u64, u64, u64, u64) {
+    (0, 0, 0, 0, 0, 0, 0, 0)
 }
 
 #[cfg(feature = "profiling")]
@@ -533,18 +546,30 @@ pub(crate) fn record_draft_store_phase(postcard_ns: u64, raster_payload_ns: u64,
 pub(crate) fn record_draft_store_phase(_: u64, _: u64, _: u64) {}
 
 #[cfg(feature = "profiling")]
-pub(crate) fn record_draft_append_phase(roots_ns: u64, frontier_ns: u64, index_ns: u64) {
+pub(crate) fn record_draft_append_phase(
+    roots_ns: u64,
+    frontier_ns: u64,
+    index_ns: u64,
+    root_recompute_ns: u64,
+    frontier_after_ns: u64,
+) {
     DRAFT_STORE_PHASES.with(|cell| {
         if let Some(phases) = cell.borrow_mut().as_mut() {
             phases.append_roots_ns = phases.append_roots_ns.saturating_add(roots_ns);
             phases.append_frontier_ns = phases.append_frontier_ns.saturating_add(frontier_ns);
             phases.append_index_ns = phases.append_index_ns.saturating_add(index_ns);
+            phases.append_root_recompute_ns = phases
+                .append_root_recompute_ns
+                .saturating_add(root_recompute_ns);
+            phases.append_frontier_after_ns = phases
+                .append_frontier_after_ns
+                .saturating_add(frontier_after_ns);
         }
     });
 }
 
 #[cfg(not(feature = "profiling"))]
-pub(crate) fn record_draft_append_phase(_: u64, _: u64, _: u64) {}
+pub(crate) fn record_draft_append_phase(_: u64, _: u64, _: u64, _: u64, _: u64) {}
 
 /// Attribute one `finalize` to the sequence whose frame is running.
 ///
@@ -554,7 +579,7 @@ pub(crate) fn record_draft_append_phase(_: u64, _: u64, _: u64) {}
 pub(crate) fn record_sequence_draft_finalize(
     materialize_ns: u64,
     store_ns: u64,
-    phases: (u64, u64, u64, u64, u64, u64),
+    phases: (u64, u64, u64, u64, u64, u64, u64, u64),
 ) {
     PROFILER_STATE.with(|state| {
         let mut state = state.borrow_mut();
@@ -583,13 +608,20 @@ pub(crate) fn record_sequence_draft_finalize(
                 append_roots_ns: phases.3,
                 append_frontier_ns: phases.4,
                 append_index_ns: phases.5,
+                append_root_recompute_ns: phases.6,
+                append_frontier_after_ns: phases.7,
             })
             .unwrap_or_else(|error| panic!("Failed to stream draft finalize: {}", error));
     });
 }
 
 #[cfg(not(feature = "profiling"))]
-pub(crate) fn record_sequence_draft_finalize(_: u64, _: u64, _: (u64, u64, u64, u64, u64, u64)) {}
+pub(crate) fn record_sequence_draft_finalize(
+    _: u64,
+    _: u64,
+    _: (u64, u64, u64, u64, u64, u64, u64, u64),
+) {
+}
 
 #[cfg(feature = "profiling")]
 pub fn finish_sequence_profile(

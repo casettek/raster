@@ -78,6 +78,27 @@ impl Hashable for Bytes {
         Bytes(EMPTY_TRIE_NODES[0].to_vec())
     }
 
+    /// Memoized empty-subtree root.
+    ///
+    /// The trait's default is an unmemoized fold from level 0, and
+    /// `NonEmptyFrontier::root` calls it once per level — so folding a
+    /// depth-32 frontier spent 0+1+..+31 = 496 hashes rederiving the same
+    /// constants, against ~32 hashes of actual spine. The memo is built by
+    /// that same fold, so the values are identical by construction.
+    ///
+    /// Note this is *not* `EMPTY_TRIE_NODES`: despite that table's doc
+    /// comment, its entries above level 0 are not this `combine`'s empty
+    /// roots (`empty_root_memo_matches_fold` is the guard that would catch a
+    /// swap).
+    fn empty_root(level: Level) -> Self {
+        let idx = usize::from(u8::from(level));
+        match empty_root_memo().get(idx) {
+            Some(node) => Bytes(node.to_vec()),
+            // Above the memo: fold, so a deeper tree stays correct.
+            None => empty_root_fold(level),
+        }
+    }
+
     fn combine(level: Level, a: &Self, b: &Self) -> Self {
         let mut data = Vec::with_capacity(1 + HASH_SIZE + HASH_SIZE);
 
@@ -87,6 +108,28 @@ impl Hashable for Bytes {
 
         Bytes(sha256_bytes(&data))
     }
+}
+
+/// The `Hashable` default: fold empty leaves up to `level`. O(level) hashes.
+fn empty_root_fold(level: Level) -> Bytes {
+    Level::from(0)
+        .iter_to(level)
+        .fold(Bytes::empty_leaf(), |v, lvl| Bytes::combine(lvl, &v, &v))
+}
+
+/// Empty-subtree roots for levels `0..=TRACE_TREE_DEPTH`, folded once.
+fn empty_root_memo() -> &'static [[u8; HASH_SIZE]] {
+    static MEMO: std::sync::OnceLock<Vec<[u8; HASH_SIZE]>> = std::sync::OnceLock::new();
+    MEMO.get_or_init(|| {
+        (0..=TRACE_TREE_DEPTH)
+            .map(|level| {
+                let root = empty_root_fold(Level::from(level));
+                let mut out = [0u8; HASH_SIZE];
+                out.copy_from_slice(&root.0);
+                out
+            })
+            .collect()
+    })
 }
 
 fn sha256_bytes(bytes: &[u8]) -> Vec<u8> {
@@ -123,6 +166,20 @@ pub fn serializable_frontier_into_trace_frontier(
 /// Bridge tree for trace commitments with 32 levels.
 pub type TraceTree = bridgetree::BridgeTree<Bytes, u64, 32>;
 pub type TraceTreeFrontier = NonEmptyFrontier<Bytes>;
+
+/// Depth of [`TraceTree`]; the root level a frontier must be folded to.
+pub const TRACE_TREE_DEPTH: u8 = 32;
+
+/// Root of a frontier, folded directly against the empty-subtree roots.
+///
+/// Equivalent to `TraceTree::from_frontier(1, frontier.clone()).root(0)` — which
+/// is what `BridgeTree::root` itself does after rebuilding the bridge — but
+/// without the clone and the tree allocation. The rebuild dominated every
+/// storage append (~53 us of a ~56 us root recompute), so the fold is called
+/// directly.
+pub fn frontier_root(frontier: &TraceTreeFrontier) -> Vec<u8> {
+    frontier.root(Some(Level::from(TRACE_TREE_DEPTH))).0
+}
 
 /// Soundness target (in bits) for fraud detection: a fraud-proof window
 /// reveals `window_size * bits_per_item >= FRAUD_DETECTION_SECURITY_BITS`
@@ -1017,9 +1074,7 @@ impl<'a> TraceVerifier<'a> {
             let step_record_hash = step_record.hash();
             self.latest_frontier.append(Bytes(step_record_hash));
 
-            let root = TraceTree::from_frontier(1, self.latest_frontier.clone())
-                .root(0)
-                .expect("Failed to derive current trace root from frontier");
+            let root = Bytes(frontier_root(&self.latest_frontier));
 
             self.fingerprint_acc.append(&root.0);
 
@@ -1156,9 +1211,7 @@ impl<'a> TraceVerifier<'a> {
 
             self.latest_frontier.append(Bytes(step_record.hash()));
 
-            let root = TraceTree::from_frontier(1, self.latest_frontier.clone())
-                .root(0)
-                .expect("Failed to derive current trace root from frontier");
+            let root = Bytes(frontier_root(&self.latest_frontier));
             self.fingerprint_acc.append(&root.0);
         }
 
@@ -2441,5 +2494,52 @@ mod tests {
                 .expect("valid commitment");
 
         let _ = trace_verifier.verify(&runtime_trace);
+    }
+}
+
+#[cfg(test)]
+mod frontier_root_tests {
+    use super::*;
+
+    /// The memo must equal the fold it replaced at every level. It is built
+    /// from that fold, so this guards a future edit that swaps in a table —
+    /// which is exactly what `EMPTY_TRIE_NODES` looked like it could be, and
+    /// is not.
+    #[test]
+    fn empty_root_memo_matches_fold() {
+        for level in 0..=TRACE_TREE_DEPTH {
+            let level = Level::from(level);
+            assert_eq!(
+                Bytes::empty_root(level).0,
+                empty_root_fold(level).0,
+                "memo diverges from the fold at level {}",
+                u8::from(level)
+            );
+        }
+    }
+
+    /// The direct ommer fold must agree, byte for byte, with the
+    /// clone-and-rebuild it replaced — at every length, not just one.
+    ///
+    /// `frontier_root` is on the hot path of every storage append and every
+    /// trace step, so the rebuild was removed for cost; this pins that the
+    /// removal changed no commitment.
+    #[test]
+    fn direct_fold_matches_bridge_tree_rebuild() {
+        let leaf = |i: u64| Bytes(sha256_bytes(&i.to_le_bytes()));
+
+        let mut frontier = TraceTreeFrontier::new(leaf(0));
+        for i in 1..=257u64 {
+            let rebuilt = TraceTree::from_frontier(1, frontier.clone())
+                .root(0)
+                .expect("rebuilt root should exist")
+                .0;
+            assert_eq!(
+                frontier_root(&frontier),
+                rebuilt,
+                "root diverged at length {i}"
+            );
+            frontier.append(leaf(i));
+        }
     }
 }

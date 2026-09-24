@@ -24,7 +24,9 @@ use std::collections::{BTreeMap, HashMap};
 use crate::authorization::authorization_guest_image_id;
 use crate::precomputed::EMPTY_TRIE_NODES;
 use crate::replay::ReplayResult;
-use crate::trace::{serializable_frontier_into_trace_frontier, SerializableFrontier, TraceTree};
+use crate::trace::{
+    frontier_root, serializable_frontier_into_trace_frontier, SerializableFrontier,
+};
 #[cfg(test)]
 use crate::trace::{TraceCommitment, TraceCommitmentExt};
 use crate::{TRANSITION_GUEST_ELF, TRANSITION_GUEST_ID};
@@ -132,10 +134,7 @@ fn empty_storage_frontier() -> SerializableFrontier {
 fn storage_root(frontier: &SerializableFrontier) -> Vec<u8> {
     let frontier = serializable_frontier_into_trace_frontier(frontier.clone())
         .expect("storage frontier should deserialize");
-    TraceTree::from_frontier(1, frontier)
-        .root(0)
-        .expect("storage root should exist")
-        .0
+    frontier_root(&frontier)
 }
 
 /// Replay trace transitions using the transition guest to prove merkle tree state transitions.

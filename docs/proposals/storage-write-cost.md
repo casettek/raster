@@ -1,6 +1,6 @@
 # Proposal: `storage-write-cost` — a storage append costs 200–360 µs, and almost none of it is the append
 
-Status: Proposed 2026-09-21. **Measured, not estimated** — see §Measurement.
+Status: Term 1 **implemented** 2026-09-21; Term 2 open. **Measured, not estimated** — see §Measurement.
 
 Related:
 - [`incremental-draft-materialization`](./incremental-draft-materialization.md) — found this while
@@ -23,27 +23,71 @@ Every storage write — every tile output, every `store_value`, every draft fina
 
 The operation that records the write is **0.3–0.4%** of the write. The rest is bookkeeping.
 
-## Term 1: the roots are recomputed from a cloned frontier, twice per append
+## Term 1: the root fold, twice per append — RESOLVED
+
+Two separate defects sat behind one symptom. Both are fixed; the second was not what this
+proposal originally claimed, so the original claim is kept below and corrected.
+
+### 1a. Called twice per append (fixed: cache)
 
 ```rust
-fn frontier_root(frontier: &TraceTreeFrontier) -> Vec<u8> {
-    TraceTree::from_frontier(1, frontier.clone())   // clone the frontier, rebuild a tree
-        .root(0).expect("storage root should exist").0
-}
-
 pub fn current_root(&self) -> Vec<u8> { frontier_root(&self.frontier) }
 ```
 
-`append` calls `current_root()` **twice** — for `store_root_before` and `store_root_after` — and
-additionally clones the frontier for `frontier_after`. Three clones and two tree rebuilds per
-write, ~110 µs.
+`append` called `current_root()` **twice** — for `store_root_before` and `store_root_after`.
+`store_root_before` is, by construction, the previous append's `store_root_after`, so it never
+needed computing. `StorageManager::cached_root` now serves it and one recompute happens per
+mutation. Verified by the commit/audit round trip: byte-identical commit, `Verification Success`.
 
-`store_root_before` is, by construction, the previous append's `store_root_after`. It never needs
-computing at all.
+### 1b. Each call refolded the empty-subtree roots (fixed: memoize)
 
-**Fix.** Cache the current root and index root on `StorageManager`, recompute once after a
-mutation, and serve `*_before` from the cache. No format change, no semantic change, no witness
-change: the same bytes are produced. Expected to remove ~30–55% of every storage write.
+**The original claim here was that the cost was `TraceTree::from_frontier(1, frontier.clone())` —
+a frontier clone and a tree rebuild. That was wrong.** Removing the clone and calling
+`NonEmptyFrontier::root(Some(Level::from(32)))` directly changed the measured time by nothing.
+
+The real cost is inside `root()`. It calls `H::empty_root(l)` once per level, and the `Hashable`
+default (`incrementalmerkletree/src/lib.rs:671`) is an **unmemoized fold from level 0**:
+
+```rust
+fn empty_root(level: Level) -> Self {
+    Level::from(0).iter_to(level).fold(Self::empty_leaf(), |v, lvl| Self::combine(lvl, &v, &v))
+}
+```
+
+So one `frontier_root` at depth 32 did `0+1+..+31 = 496` hashes rederiving the same constants,
+against ~32 hashes of actual spine — 94% waste. `Bytes::empty_root` now reads a `OnceLock` memo
+built by that same fold (identical by construction; `empty_root_memo_matches_fold` guards it).
+
+The same override is in the guest's `Bytes`, where those are proven cycles and `frontier_root`
+runs at ~11 call sites per execution.
+
+**Not `EMPTY_TRIE_NODES`.** That table's doc comment claims `Level N = Hash(level, empty[N-1],
+empty[N-1])`, which is exactly this sequence — but it is not. A test written against it failed at
+level 1, and none of `combine(l-1)`, `combine(l)` or a level-less `sha256(e ‖ e)` reproduces the
+table. Only `EMPTY_TRIE_NODES[0]` is load-bearing here (it is `empty_leaf`, and matches the
+guest's `EMPTY_LEAF`); what the rest of the table actually is has not been established and is
+worth its own look.
+
+### Measured
+
+In-process A/B in release, against a twin type identical but for the override, with the two roots
+asserted equal in the same test:
+
+| | ns/call |
+| --- | --- |
+| trait default fold | 54 014 |
+| memoized | 3 224 |
+| | **16.8x** |
+
+End to end on `hello-tiles`, median over the run's storage appends:
+
+| | before | after |
+| --- | --- | --- |
+| `append_root_recompute_ns` | 52–56 µs | **3.2 µs** |
+| `append_roots_ns` | 53–56 µs | **3.6 µs** |
+| `store_append_ns` | ~170 µs | **56–60 µs** |
+
+Term 2 (the coordinate index) is now the whole remaining cost of an append at ~51–54 µs.
 
 ## Term 2: the coordinate index is 256 levels deep
 
