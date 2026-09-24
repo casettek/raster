@@ -2454,14 +2454,14 @@ pub(crate) fn list_metadata_witness(
     len: u64,
     elements_root: Option<Hash32>,
 ) -> SelectionWitness {
-    SelectionWitness {
-        bytes: encode_list_metadata_payload(len, elements_root),
-        proof: SelectionProof {
+    SelectionWitness::from_payload(
+        encode_list_metadata_payload(len, elements_root),
+        SelectionProof {
             path: selector.clone(),
             root_hash: selection.root_hash,
             steps: selection.steps,
         },
-    }
+    )
 }
 
 pub(crate) fn selection_witness_from_raster_selection(
@@ -2469,19 +2469,14 @@ pub(crate) fn selection_witness_from_raster_selection(
     selector: &SelectorPath,
     selection: RasterSelection,
 ) -> CoreResult<SelectionWitness> {
-    Ok(SelectionWitness {
-        bytes: raster_selection_payload(
-            data,
-            selection.offset,
-            selection.len,
-            selection.range,
-        )?,
-        proof: SelectionProof {
+    Ok(SelectionWitness::from_payload(
+        raster_selection_payload(data, selection.offset, selection.len, selection.range)?,
+        SelectionProof {
             path: selector.clone(),
             root_hash: selection.root_hash,
             steps: selection.steps,
         },
-    })
+    ))
 }
 
 fn typed_proven_selection<Root: Serialize + Selectable>(
@@ -3135,6 +3130,7 @@ mod tests {
                 root_hash: proven.root_hash,
                 steps: proven.steps.clone(),
             },
+            selected_root: None,
         };
 
         assert_eq!(
@@ -3176,6 +3172,7 @@ mod tests {
                 root_hash: proven.root_hash,
                 steps: proven.steps,
             },
+            selected_root: None,
         };
         assert!(verify_selection_proof(&witness.bytes, &witness.proof));
 
@@ -3291,6 +3288,7 @@ mod tests {
                 root_hash: via_bound.root_hash,
                 steps: via_bound.steps,
             },
+            selected_root: None,
         };
         assert!(verify_selection_proof(&witness.bytes, &witness.proof));
     }
@@ -3326,6 +3324,7 @@ mod tests {
                 root_hash: proven.root_hash,
                 steps: proven.steps,
             },
+            selected_root: None,
         };
         assert!(!verify_selection_proof(&witness.bytes, &witness.proof));
     }
@@ -3435,6 +3434,7 @@ mod tests {
                 root_hash: selection.root_hash,
                 steps: Vec::new(),
             },
+            selected_root: None,
         };
 
         assert_eq!(decoded, value);
@@ -3442,7 +3442,7 @@ mod tests {
     }
 
     /// A range selection served straight from the `.rindex`, the way
-    /// `StorageManager::selection_witness` serves one at `--commit` time.
+    /// `AuthenticatedObjectStore::selection_witness` serves one at `--commit` time.
     ///
     /// The in-memory `typed_proven_selection` path has supported ranges since
     /// `Block<T>` landed, so `select!(Block<T>, xs[a..b])` resolves in-process

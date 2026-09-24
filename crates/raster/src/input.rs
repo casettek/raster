@@ -1543,7 +1543,7 @@ where
             AuthRef::Inline(list) => {
                 if crate::auth_mode().is_authenticated() {
                     return Err(raster_core::Error::Other(
-                        "call_recur! requires a raster-indexed List source; \
+                        "a recur source must be a raster-indexed List (call_recur! or call_recur_seq!); \
                          re-encode this input with encoding = \"raster\""
                             .into(),
                     ));
@@ -2089,7 +2089,7 @@ where
 {
     match arg {
         AuthRef::Inline(_) => Err(raster_core::Error::Other(
-            "call_recur! requires a raster-indexed List source; \
+            "a recur source must be a raster-indexed List (call_recur! or call_recur_seq!); \
              re-encode this input with encoding = \"raster\""
                 .into(),
         )),

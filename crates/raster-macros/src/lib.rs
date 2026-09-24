@@ -1288,11 +1288,13 @@ fn gen_recur_control_capture(kind: &ProtocolReturnKind) -> proc_macro2::TokenStr
 fn gen_replay_output_serialization(kind: &ProtocolReturnKind) -> proc_macro2::TokenStream {
     let replay_transition_binding = gen_replay_transition_binding(kind);
     let recur_control_capture = gen_recur_control_capture(kind);
+    let recur_state_finish = gen_recur_state_finish(kind);
     quote! {
         let __raster_output_bytes = ::raster::core::postcard::to_allocvec(&result)
             .map_err(|e| ::raster::core::Error::Serialization(::raster::alloc::format!("Failed to serialize output: {}", e)))?;
         #replay_transition_binding
         #recur_control_capture
+        #recur_state_finish
         let __raster_input_commitment: [u8; 32] =
             <::raster::core::sha2::Sha256 as ::raster::core::sha2::Digest>::digest(
                 __raster_replay_input_bytes,
@@ -1306,6 +1308,7 @@ fn gen_replay_output_serialization(kind: &ProtocolReturnKind) -> proc_macro2::To
                 ::raster::core::draft::RecurTileReplay {
                     position: __raster_position,
                     control: __raster_recur_control,
+                    state: __raster_recur_state,
                 }
             }),
         };
@@ -1313,6 +1316,147 @@ fn gen_replay_output_serialization(kind: &ProtocolReturnKind) -> proc_macro2::To
             .map_err(|e| ::raster::core::Error::Serialization(::raster::alloc::format!("Failed to serialize replay output: {}", e)))?;
     }
 }
+
+/// The first carried-state parameter, tile or sequence flavoured.
+fn first_recur_state_param(params: &[ParamInfo]) -> Option<(ParamInfo, Type)> {
+    params.iter().find_map(|param| {
+        recur_state_inner_type(&param.ty)
+            .or_else(|| recur_sequence_state_inner_type(&param.ty))
+            .map(|inner| (param.clone(), inner))
+    })
+}
+
+/// The iteration's carried-state transition, read off the typed values.
+///
+/// Returns a `(start, finish)` pair like [`gen_native_draft_capture`]: `start`
+/// commits the state *entering* the tile, before the user function runs;
+/// `finish` commits the state it *returned*, unwrapping whichever shape the
+/// return kind uses. The macro knows that shape statically, which is what keeps
+/// the guest out of the business of parsing three different postcard layouts.
+///
+/// Both halves are emitted for the **host** record. The replay wrapper stamps
+/// the same pair into `RecurTileReplay.state` from the same helper, so the two
+/// copies cannot drift.
+/// The host copy of the iteration's termination.
+///
+/// `Some` exactly when the tile is a recur tile — i.e. when it takes a
+/// `RecurInput`, which is the same test [`gen_recur_position_capture`] uses.
+/// An ordinary tile records `None`, so the recorder can tell "not a recur
+/// iteration" from "a recur iteration that ended with `Continue`" instead of
+/// defaulting the two together.
+fn gen_native_recur_control_capture(
+    input_fn: &ItemFn,
+    return_kind: &ProtocolReturnKind,
+) -> proc_macro2::TokenStream {
+    let params = extract_params(input_fn);
+    let is_recur = params
+        .first()
+        .is_some_and(|param| recur_input_inner_type(&param.ty).is_some());
+    if !is_recur {
+        return quote! {
+            let __raster_recur_control_host: ::core::option::Option<
+                ::raster::core::draft::RecurControlKind,
+            > = ::core::option::Option::None;
+        };
+    }
+    let control = match return_kind {
+        ProtocolReturnKind::RecurControlDraft(_)
+        | ProtocolReturnKind::RecurControlRecurOutput(_)
+        | ProtocolReturnKind::RecurControlRecurState(_)
+        | ProtocolReturnKind::RecurControlRecurStateOutput(_) => quote! {
+            match &result {
+                ::raster::RecurControl::Continue(_) => {
+                    ::raster::core::draft::RecurControlKind::Continue
+                }
+                ::raster::RecurControl::Break(_) => {
+                    ::raster::core::draft::RecurControlKind::Break
+                }
+            }
+        },
+        _ => quote! { ::raster::core::draft::RecurControlKind::Continue },
+    };
+    quote! {
+        let __raster_recur_control_host = ::core::option::Option::Some(#control);
+    }
+}
+
+/// The state *entering* the iteration, committed before the tile runs.
+fn gen_recur_state_start(input_fn: &ItemFn) -> proc_macro2::TokenStream {
+    let params = extract_params(input_fn);
+    let Some((param, _inner)) = first_recur_state_param(&params) else {
+        return quote! {
+            let __raster_recur_state_in: ::core::option::Option<::raster::core::input::Hash32> =
+                ::core::option::Option::None;
+        };
+    };
+    let param_ident = param.ident;
+    quote! {
+        let __raster_recur_state_in = ::core::option::Option::Some(
+            ::raster::core::recur_progress::state_commitment(
+                &::raster::core::postcard::to_allocvec(&#param_ident).unwrap_or_default()
+            )
+        );
+    }
+}
+
+/// The state the iteration *returned*, paired with the one that entered.
+///
+/// The return kind decides where the state sits — bare, inside a
+/// `RecurControl`, or first of a tuple — and the macro knows that statically.
+/// Reading it from the typed value is what keeps the guest out of the business
+/// of parsing three different postcard layouts for the same field.
+fn gen_recur_state_finish(kind: &ProtocolReturnKind) -> proc_macro2::TokenStream {
+    let none = quote! {
+        let __raster_recur_state: ::core::option::Option<::raster::core::draft::RecurStateTransition> =
+            ::core::option::Option::None;
+    };
+    let state_out_expr = match kind {
+        ProtocolReturnKind::RecurState(_) => quote! { ::core::option::Option::Some(&result) },
+        ProtocolReturnKind::RecurControlRecurState(_) => quote! {
+            match &result {
+                ::raster::RecurControl::Continue(state)
+                | ::raster::RecurControl::Break(state) => ::core::option::Option::Some(state),
+            }
+        },
+        ProtocolReturnKind::RecurStateOutput(_) => quote! { ::core::option::Option::Some(&result.0) },
+        ProtocolReturnKind::RecurControlRecurStateOutput(_) => quote! {
+            match &result {
+                ::raster::RecurControl::Continue((state, _))
+                | ::raster::RecurControl::Break((state, _)) => ::core::option::Option::Some(state),
+            }
+        },
+        _ => return none,
+    };
+    quote! {
+        let __raster_recur_state = match (__raster_recur_state_in, #state_out_expr) {
+            (
+                ::core::option::Option::Some(__raster_state_in),
+                ::core::option::Option::Some(__raster_state_out),
+            ) => ::core::option::Option::Some(::raster::core::draft::RecurStateTransition {
+                state_in: __raster_state_in,
+                state_out: ::raster::core::recur_progress::state_commitment(
+                    &::raster::core::postcard::to_allocvec(__raster_state_out).unwrap_or_default()
+                ),
+            }),
+            _ => ::core::option::Option::None,
+        };
+    }
+}
+
+/// The `(start, finish)` pair for the **host** record, mirroring
+/// [`gen_native_draft_capture`]. The replay wrapper stamps the same pair into
+/// `RecurTileReplay.state` from the very same two helpers, so the host copy and
+/// the replay-proven copy cannot drift.
+fn gen_native_recur_capture(
+    input_fn: &ItemFn,
+    return_kind: &ProtocolReturnKind,
+) -> (proc_macro2::TokenStream, proc_macro2::TokenStream) {
+    (
+        gen_recur_state_start(input_fn),
+        gen_recur_state_finish(return_kind),
+    )
+}
+
 
 fn gen_native_draft_capture(
     input_fn: &ItemFn,
@@ -2398,9 +2542,15 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
     let output_serialization = gen_output_serialization();
     let replay_output_serialization = gen_replay_output_serialization(&return_kind);
     let recur_position_capture = gen_recur_position_capture(&input_fn);
+    // The replay wrapper commits the incoming state at the same point it
+    // captures the position: after decode, before the call.
+    let recur_state_start = gen_recur_state_start(&input_fn);
     let trace_output_serialization = gen_tile_trace_output_serialization();
     let (native_draft_capture_start, native_draft_capture_finish) =
         gen_native_draft_capture(&input_fn, &return_kind);
+    let (native_recur_capture_start, native_recur_capture_finish) =
+        gen_native_recur_capture(&input_fn, &return_kind);
+    let native_recur_control_capture = gen_native_recur_control_capture(&input_fn, &return_kind);
     let publish_output_coordinates = match return_kind {
         ProtocolReturnKind::Unit
         | ProtocolReturnKind::Value(_)
@@ -2485,6 +2635,7 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                     let __raster_draft_capture_start_timer = ::raster::__private::profile_now();
                     #native_draft_capture_start
+                    #native_recur_capture_start
                     __raster_draft_capture_ns = __raster_draft_capture_ns.saturating_add(
                         ::core::primitive::u64::try_from(__raster_draft_capture_start_timer.elapsed().as_nanos())
                             .unwrap_or(::core::primitive::u64::MAX)
@@ -2498,6 +2649,8 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                     let __raster_draft_capture_finish_timer = ::raster::__private::profile_now();
                     #native_draft_capture_finish
+                    #native_recur_capture_finish
+                    #native_recur_control_capture
                     __raster_draft_capture_ns = __raster_draft_capture_ns.saturating_add(
                         ::core::primitive::u64::try_from(__raster_draft_capture_finish_timer.elapsed().as_nanos())
                             .unwrap_or(::core::primitive::u64::MAX)
@@ -2526,7 +2679,8 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
                         input: __raster_input,
                         output: __raster_output,
                         draft_transition_witness: __raster_draft_transition_witness,
-                        recur_control: ::core::option::Option::None,
+                        recur_control: __raster_recur_control_host,
+                        recur_state: __raster_recur_state,
                     };
                     let __raster_output_record_build_ns =
                         ::core::primitive::u64::try_from(__raster_output_record_build_start.elapsed().as_nanos())
@@ -2588,8 +2742,11 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
                     let __raster_tile_execution_scope = ::raster::__private::TileExecutionScopeGuard::enter();
                     #input_serialization
                     #native_draft_capture_start
+                    #native_recur_capture_start
                     #function_call
                     #native_draft_capture_finish
+                    #native_recur_capture_finish
+                    #native_recur_control_capture
                     #trace_output_serialization
                     let __raster_output_raster_payload =
                         ::raster::__private::tile_output_trace_payload(&result, &__raster_output_bytes)
@@ -2606,7 +2763,8 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
                         input: __raster_input,
                         output: __raster_output,
                         draft_transition_witness: __raster_draft_transition_witness,
-                        recur_control: ::core::option::Option::None,
+                        recur_control: __raster_recur_control_host,
+                        recur_state: __raster_recur_state,
                     };
                     ::raster::publish_trace_event(::raster::core::trace::TraceEvent::TileExec(
                         __raster_record,
@@ -2658,6 +2816,7 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
             // Before the call: the decoded `RecurInput` is moved into the tile
             // below, and it is not `Copy`.
             #recur_position_capture
+            #recur_state_start
 
             #function_call
 
@@ -2727,20 +2886,22 @@ fn gen_sequence_wrapped_body(
     item_fn: &ItemFn,
     return_kind: &ProtocolReturnKind,
 ) -> proc_macro2::TokenStream {
-    let is_main = fn_name_str == "main";
     let body = &item_fn.block;
     let input_serialization = gen_sequence_input_serialization(&item_fn);
     let auth_result_binding = auth_result_binding(return_kind, body);
     let trace_output_binding = trace_output_binding(return_kind);
 
-    let sequence_start_publish = if is_main {
-        quote! {}
-    } else {
-        quote! {
-            ::raster::publish_trace_event(::raster::core::trace::TraceEvent::SequenceStart(
-                __raster_record.clone(),
-            ));
-        }
+    // Unconditional: `main` never reaches this generator (the caller dispatches
+    // on `item_fn.sig.ident == "main"` and `fn_name_str` is that same ident),
+    // so every sequence wrapped here publishes both boundary events. This was
+    // an `if is_main { quote!{} }` that could not be true, and reading it as
+    // "main suppresses its SequenceStart" misdescribes the root shape: main
+    // publishes no sequence events at all, and its boundaries are
+    // `ProgramStart`/`ProgramEnd`.
+    let sequence_start_publish = quote! {
+        ::raster::publish_trace_event(::raster::core::trace::TraceEvent::SequenceStart(
+            __raster_record.clone(),
+        ));
     };
 
     let output_type_expr = match &item_fn.sig.output {
@@ -2776,6 +2937,7 @@ fn gen_sequence_wrapped_body(
                     output: ::core::option::Option::None,
                     draft_transition_witness: ::core::option::Option::None,
                     recur_control: ::core::option::Option::None,
+                        recur_state: ::core::option::Option::None,
                 };
                 #sequence_start_publish
                 let __raster_sequence_start_event_publish_ns =
@@ -2838,6 +3000,7 @@ fn gen_sequence_wrapped_body(
                     output: ::core::option::Option::None,
                     draft_transition_witness: ::core::option::Option::None,
                     recur_control: ::core::option::Option::None,
+                        recur_state: ::core::option::Option::None,
                 };
                 #sequence_start_publish
                 #auth_result_binding

@@ -121,9 +121,10 @@ fn finalized_internal_refs_support_select() {
 #[test]
 fn draft_creation_does_not_shift_later_tile_coordinates() {
     let reference = run_reference_after_new("after-new".to_string());
+    // Positions are 1-based, so the first tile sits at `[1]`.
     assert_eq!(
         reference.coordinates,
-        raster::core::cfs::CfsCoordinates(vec![0])
+        raster::core::cfs::CfsCoordinates(vec![1])
     );
 }
 
@@ -132,7 +133,7 @@ fn finalize_does_not_shift_later_tile_coordinates() {
     let reference = run_reference_after_finalize("after-finalize".to_string());
     assert_eq!(
         reference.coordinates,
-        raster::core::cfs::CfsCoordinates(vec![1])
+        raster::core::cfs::CfsCoordinates(vec![2])
     );
 }
 

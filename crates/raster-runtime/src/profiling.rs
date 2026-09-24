@@ -111,6 +111,18 @@ pub struct SequenceProfileSelfBreakdown {
     pub scope_enter_ns: u64,
     #[serde(default)]
     pub synthetic_coordinate_alloc_ns: u64,
+    /// `finalize` half one: rebuilding the whole object from the draft's field
+    /// values (`build_draft_tree` + `typed_value_from_tree`).
+    #[serde(default)]
+    pub draft_materialize_ns: u64,
+    /// `finalize` half two: encoding and committing it (`postcard` +
+    /// `encode_raster_value`, which re-derives every element root the draft's
+    /// `AppendFrontier` already folded, + the storage append).
+    ///
+    /// Split from the half above because `incremental-draft-materialization`
+    /// removes work in both, and the split says where the saving lands.
+    #[serde(default)]
+    pub draft_store_ns: u64,
     #[serde(default)]
     pub input_trace_ns: u64,
     #[serde(default)]
@@ -128,6 +140,8 @@ impl SequenceProfileSelfBreakdown {
     fn measured_non_body_ns(&self) -> u64 {
         self.scope_enter_ns
             .saturating_add(self.synthetic_coordinate_alloc_ns)
+            .saturating_add(self.draft_materialize_ns)
+            .saturating_add(self.draft_store_ns)
             .saturating_add(self.input_trace_ns)
             .saturating_add(self.start_event_publish_ns)
             .saturating_add(self.output_trace_ns)
@@ -148,6 +162,8 @@ impl SequenceProfileSelfBreakdown {
         self.body_self_ns
             .saturating_add(self.scope_enter_ns)
             .saturating_add(self.synthetic_coordinate_alloc_ns)
+            .saturating_add(self.draft_materialize_ns)
+            .saturating_add(self.draft_store_ns)
             .saturating_add(self.input_trace_ns)
             .saturating_add(self.start_event_publish_ns)
             .saturating_add(self.output_trace_ns)
@@ -220,6 +236,46 @@ pub enum ProfileStreamEvent {
     TileOutputStore {
         invocation_index: u64,
         output_store_ns: u64,
+    },
+    /// One `finalize`, emitted standalone rather than only folded into a
+    /// sequence frame.
+    ///
+    /// `main` pushes no profiling frame (`gen_main_wrapped_body` emits no
+    /// `begin_sequence_profile`), and a draft created and closed in `main` is
+    /// the common case — `examples/hello-tiles` is exactly that. Folding into
+    /// `active_sequences.last_mut()` alone reports zero for it.
+    DraftFinalize {
+        materialize_ns: u64,
+        store_ns: u64,
+        /// `store_ns` split three ways, to say which term actually costs:
+        /// postcard encoding, `encode_raster_value` (tree + every element root
+        /// + index build + index encode), and the storage append (frontier plus
+        /// a fixed 256-hash coordinate-index update).
+        #[serde(default)]
+        store_postcard_ns: u64,
+        #[serde(default)]
+        store_raster_payload_ns: u64,
+        #[serde(default)]
+        store_append_ns: u64,
+        /// `store_append_ns` split again. `current_root()` rebuilds a
+        /// `TraceTree` from a *cloned* frontier and is called twice per append
+        /// (before and after), so the roots term is separated from the work
+        /// that actually mutates state.
+        #[serde(default)]
+        append_roots_ns: u64,
+        #[serde(default)]
+        append_frontier_ns: u64,
+        #[serde(default)]
+        append_index_ns: u64,
+        /// `append_roots_ns` split again: the single `frontier_root` recompute,
+        /// and the separate `frontier.clone()` + conversion for `frontier_after`.
+        /// Whether the roots term is hashing or allocation decides whether
+        /// `incremental-draft-materialization`'s log-per-modification variant is
+        /// viable at all.
+        #[serde(default)]
+        append_root_recompute_ns: u64,
+        #[serde(default)]
+        append_frontier_after_ns: u64,
     },
     RunFinished {
         run_id: String,
@@ -419,6 +475,153 @@ pub(crate) fn record_sequence_synthetic_coordinate_alloc(duration_ns: u64) {
 
 #[cfg(not(feature = "profiling"))]
 pub(crate) fn record_sequence_synthetic_coordinate_alloc(_: u64) {}
+
+/// The store half's phase timings, accumulated only while a `finalize` is in
+/// flight so ordinary tile-output stores do not land here.
+#[cfg(feature = "profiling")]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DraftStorePhases {
+    pub postcard_ns: u64,
+    pub raster_payload_ns: u64,
+    pub append_ns: u64,
+    pub append_roots_ns: u64,
+    pub append_frontier_ns: u64,
+    pub append_index_ns: u64,
+    pub append_root_recompute_ns: u64,
+    pub append_frontier_after_ns: u64,
+}
+
+#[cfg(feature = "profiling")]
+thread_local! {
+    static DRAFT_STORE_PHASES: std::cell::RefCell<Option<DraftStorePhases>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(feature = "profiling")]
+pub(crate) fn arm_draft_store_phases() {
+    DRAFT_STORE_PHASES.with(|cell| *cell.borrow_mut() = Some(DraftStorePhases::default()));
+}
+
+#[cfg(not(feature = "profiling"))]
+pub(crate) fn arm_draft_store_phases() {}
+
+#[cfg(feature = "profiling")]
+pub(crate) fn take_draft_store_phases() -> (u64, u64, u64, u64, u64, u64, u64, u64) {
+    DRAFT_STORE_PHASES.with(|cell| {
+        cell.borrow_mut()
+            .take()
+            .map(|p| {
+                (
+                    p.postcard_ns,
+                    p.raster_payload_ns,
+                    p.append_ns,
+                    p.append_roots_ns,
+                    p.append_frontier_ns,
+                    p.append_index_ns,
+                    p.append_root_recompute_ns,
+                    p.append_frontier_after_ns,
+                )
+            })
+            .unwrap_or((0, 0, 0, 0, 0, 0, 0, 0))
+    })
+}
+
+#[cfg(not(feature = "profiling"))]
+pub(crate) fn take_draft_store_phases() -> (u64, u64, u64, u64, u64, u64, u64, u64) {
+    (0, 0, 0, 0, 0, 0, 0, 0)
+}
+
+#[cfg(feature = "profiling")]
+pub(crate) fn record_draft_store_phase(postcard_ns: u64, raster_payload_ns: u64, append_ns: u64) {
+    DRAFT_STORE_PHASES.with(|cell| {
+        if let Some(phases) = cell.borrow_mut().as_mut() {
+            phases.postcard_ns = phases.postcard_ns.saturating_add(postcard_ns);
+            phases.raster_payload_ns = phases.raster_payload_ns.saturating_add(raster_payload_ns);
+            phases.append_ns = phases.append_ns.saturating_add(append_ns);
+        }
+    });
+}
+
+#[cfg(not(feature = "profiling"))]
+pub(crate) fn record_draft_store_phase(_: u64, _: u64, _: u64) {}
+
+#[cfg(feature = "profiling")]
+pub(crate) fn record_draft_append_phase(
+    roots_ns: u64,
+    frontier_ns: u64,
+    index_ns: u64,
+    root_recompute_ns: u64,
+    frontier_after_ns: u64,
+) {
+    DRAFT_STORE_PHASES.with(|cell| {
+        if let Some(phases) = cell.borrow_mut().as_mut() {
+            phases.append_roots_ns = phases.append_roots_ns.saturating_add(roots_ns);
+            phases.append_frontier_ns = phases.append_frontier_ns.saturating_add(frontier_ns);
+            phases.append_index_ns = phases.append_index_ns.saturating_add(index_ns);
+            phases.append_root_recompute_ns = phases
+                .append_root_recompute_ns
+                .saturating_add(root_recompute_ns);
+            phases.append_frontier_after_ns = phases
+                .append_frontier_after_ns
+                .saturating_add(frontier_after_ns);
+        }
+    });
+}
+
+#[cfg(not(feature = "profiling"))]
+pub(crate) fn record_draft_append_phase(_: u64, _: u64, _: u64, _: u64, _: u64) {}
+
+/// Attribute one `finalize` to the sequence whose frame is running.
+///
+/// Both halves land on the same frame: a draft is closed by a step in the
+/// sequence that owns it, so there is no ambiguity about which frame pays.
+#[cfg(feature = "profiling")]
+pub(crate) fn record_sequence_draft_finalize(
+    materialize_ns: u64,
+    store_ns: u64,
+    phases: (u64, u64, u64, u64, u64, u64, u64, u64),
+) {
+    PROFILER_STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        if !state.enabled() || (materialize_ns == 0 && store_ns == 0) {
+            return;
+        }
+
+        if let Some(frame) = state.active_sequences.last_mut() {
+            frame.self_breakdown.draft_materialize_ns = frame
+                .self_breakdown
+                .draft_materialize_ns
+                .saturating_add(materialize_ns);
+            frame.self_breakdown.draft_store_ns = frame
+                .self_breakdown
+                .draft_store_ns
+                .saturating_add(store_ns);
+        }
+
+        state
+            .send_stream_event(ProfileStreamEvent::DraftFinalize {
+                materialize_ns,
+                store_ns,
+                store_postcard_ns: phases.0,
+                store_raster_payload_ns: phases.1,
+                store_append_ns: phases.2,
+                append_roots_ns: phases.3,
+                append_frontier_ns: phases.4,
+                append_index_ns: phases.5,
+                append_root_recompute_ns: phases.6,
+                append_frontier_after_ns: phases.7,
+            })
+            .unwrap_or_else(|error| panic!("Failed to stream draft finalize: {}", error));
+    });
+}
+
+#[cfg(not(feature = "profiling"))]
+pub(crate) fn record_sequence_draft_finalize(
+    _: u64,
+    _: u64,
+    _: (u64, u64, u64, u64, u64, u64, u64, u64),
+) {
+}
 
 #[cfg(feature = "profiling")]
 pub fn finish_sequence_profile(

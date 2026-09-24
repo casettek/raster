@@ -1327,7 +1327,7 @@ fn prove_terminal_window(
     let backend = raster_backend_risc0::Risc0Backend::new(project.output_dir.clone())
         .with_user_crate(project.root_dir.clone());
     let replayer = Replayer::new(&backend, &project);
-    Ok(crate::commands::run::prove(
+    Ok(crate::commands::prove::prove(
         window,
         &trace,
         &cfs,

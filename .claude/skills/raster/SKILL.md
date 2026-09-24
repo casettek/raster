@@ -455,7 +455,7 @@ Never loop in a sequence. To process a list, pick from this decision tree:
 | fold list → single summary value | `call_recur!` + `state = ...` |
 | map list → one built object | `call_recur!` + `output = new!(T)` |
 | fold AND build together | `call_recur!` + `state` + `output`, step returns the `(state, output)` tuple |
-| early stop | state+output step returning `RecurControl` (`Continue`/`Break`) |
+| early stop | any `call_recur!` step returning `RecurControl<..>` (`Continue`/`Break`) — output-only, state-only and state+output all accept it. Not available on `call_recur_seq!` |
 | step should see N elements at a time | add `chunk = N` (step takes `RecurInput<Block<T>>`) |
 | several tiles per element | `#[sequence(kind = recur)]` + `call_recur_seq!` |
 | sweep a byte region | `call_recur!` with `input = select!(List<BytesPage>, region.pages)` |

@@ -759,6 +759,17 @@ pub(crate) fn gen_recur_driver_function(
                         __raster_internal_info,
                     );
                 }
+                // A source selected by a data-sourced index (`list[i]`) cites
+                // that index as a sibling `@idx/…` binding; the site record must
+                // carry it, as a tile call's does, or the guest cannot resolve
+                // the `BoundIndex` in `input`'s path. See
+                // `docs/proposals/dynamic-index-selection.md` §2.
+                for (__raster_index_name, __raster_index_data) in __raster_input_trace.index_bindings.iter() {
+                    __raster_internal.insert(
+                        __raster_index_name.clone(),
+                        __raster_index_data.clone(),
+                    );
+                }
                 #state_trace_capture
                 #output_trace_capture
                 #(#extra_trace_capture)*
@@ -787,6 +798,7 @@ pub(crate) fn gen_recur_driver_function(
                         output: ::core::option::Option::None,
                         draft_transition_witness: ::core::option::Option::None,
                         recur_control: ::core::option::Option::None,
+                        recur_state: ::core::option::Option::None,
                     }
                 ));
 
@@ -811,6 +823,7 @@ pub(crate) fn gen_recur_driver_function(
                         output: __raster_output,
                         draft_transition_witness: ::core::option::Option::None,
                         recur_control: ::core::option::Option::None,
+                        recur_state: ::core::option::Option::None,
                     }
                 ));
 
@@ -882,6 +895,17 @@ pub(crate) fn gen_recur_driver_function(
                         __raster_internal_info,
                     );
                 }
+                // A source selected by a data-sourced index (`list[i]`) cites
+                // that index as a sibling `@idx/…` binding; the site record must
+                // carry it, as a tile call's does, or the guest cannot resolve
+                // the `BoundIndex` in `input`'s path. See
+                // `docs/proposals/dynamic-index-selection.md` §2.
+                for (__raster_index_name, __raster_index_data) in __raster_input_trace.index_bindings.iter() {
+                    __raster_internal.insert(
+                        __raster_index_name.clone(),
+                        __raster_index_data.clone(),
+                    );
+                }
                 #state_trace_capture
                 #output_trace_capture
                 #(#extra_trace_capture)*
@@ -910,6 +934,7 @@ pub(crate) fn gen_recur_driver_function(
                         output: ::core::option::Option::None,
                         draft_transition_witness: ::core::option::Option::None,
                         recur_control: ::core::option::Option::None,
+                        recur_state: ::core::option::Option::None,
                     }
                 ));
 
@@ -936,6 +961,7 @@ pub(crate) fn gen_recur_driver_function(
                         output: __raster_output,
                         draft_transition_witness: ::core::option::Option::None,
                         recur_control: ::core::option::Option::None,
+                        recur_state: ::core::option::Option::None,
                     }
                 ));
 
@@ -961,6 +987,44 @@ pub(crate) fn gen_recur_sequence_step_function(
     shape: &RecurSequenceShape,
 ) -> proc_macro2::TokenStream {
     let fn_name_str = fn_name.to_string();
+    // A recur sequence cannot return `RecurControl` (validated above), so its
+    // carried state sits bare or first of a `(state, output)` tuple.
+    let (state_in_capture, state_out_capture) = match shape.state_param.as_ref() {
+        Some(param) => {
+            let state_ident = &param.ident;
+            let state_out = if shape.output_schema.is_some() {
+                quote! { &result.0 }
+            } else {
+                quote! { &result }
+            };
+            (
+                quote! {
+                    let __raster_recur_state_in =
+                        ::raster::core::recur_progress::state_commitment(
+                            &::raster::core::postcard::to_allocvec(&#state_ident).unwrap_or_default()
+                        );
+                },
+                quote! {
+                    let __raster_recur_state = ::core::option::Option::Some(
+                        ::raster::core::draft::RecurStateTransition {
+                            state_in: __raster_recur_state_in,
+                            state_out: ::raster::core::recur_progress::state_commitment(
+                                &::raster::core::postcard::to_allocvec(#state_out).unwrap_or_default()
+                            ),
+                        }
+                    );
+                },
+            )
+        }
+        None => (
+            quote! {},
+            quote! {
+                let __raster_recur_state: ::core::option::Option<
+                    ::raster::core::draft::RecurStateTransition,
+                > = ::core::option::Option::None;
+            },
+        ),
+    };
     let step_name = format_ident!("__raster_recur_sequence_step_{}", fn_name);
     let mut step_sig = item_fn.sig.clone();
     step_sig.ident = step_name;
@@ -1041,12 +1105,14 @@ pub(crate) fn gen_recur_sequence_step_function(
                 let __raster_recur_sequence_iteration_scope =
                     ::raster::__private::RecurSequenceIterationScopeGuard::enter();
                 #input_serialization
+                #state_in_capture
                 let mut __raster_record = ::raster::core::trace::FnCallRecord {
                     fn_name: ::raster::alloc::string::String::from(#fn_name_str),
                     input: __raster_input,
                     output: ::core::option::Option::None,
                     draft_transition_witness: ::core::option::Option::None,
                     recur_control: ::core::option::Option::None,
+                        recur_state: ::core::option::Option::None,
                 };
                 ::raster::publish_trace_event(
                     ::raster::core::trace::TraceEvent::RecurSequenceIterationStart(
@@ -1054,6 +1120,8 @@ pub(crate) fn gen_recur_sequence_step_function(
                     ),
                 );
                 #result_binding
+                #state_out_capture
+                __raster_record.recur_state = __raster_recur_state;
                 let __raster_output_bytes = ::raster::core::postcard::to_allocvec(&result)
                     .unwrap_or_default();
                 __raster_record.output = ::core::option::Option::Some(
@@ -1223,6 +1291,77 @@ pub(crate) fn gen_recur_sequence_driver_function(
             }
         }
     };
+    // Every `call_recur_seq!` argument becomes an `InputBinding` in
+    // `RecurSequenceItem.sources` (`ast.rs`'s parse, then
+    // `flow_resolver.rs`'s `resolve_call_inputs`), and the transition guest
+    // asserts the site's recorded `values` has the same arity. Recording only
+    // the input made every recur sequence unprovable; these three fragments
+    // are the recur-tile site's, in the CFS's argument order.
+    let state_trace_capture = shape
+        .state_param
+        .as_ref()
+        .map(|param| {
+            let state_ident = &param.ident;
+            let state_ty_str = param.ty.to_token_stream().to_string();
+            quote! {
+                __raster_trace_values.push(::raster::core::trace::FnInputValue::Inline(
+                    ::raster::core::postcard::to_allocvec(&#state_ident).unwrap_or_default()
+                ));
+                __raster_trace_args.push(::raster::core::trace::FnInputArg {
+                    name: ::raster::alloc::string::String::from(stringify!(#state_ident)),
+                    ty: ::raster::alloc::string::String::from(#state_ty_str),
+                });
+            }
+        })
+        .unwrap_or_else(|| quote! {});
+    let output_trace_capture = shape
+        .output_schema
+        .as_ref()
+        .map(|output_schema| {
+            let output_ty = quote! { ::raster::Draft<#output_schema> }.to_string();
+            quote! {
+                __raster_trace_values.push(::raster::core::trace::FnInputValue::Inline(
+                    ::raster::serialize_draft_replay_handle::<#output_schema>(&output)
+                ));
+                __raster_trace_args.push(::raster::core::trace::FnInputArg {
+                    name: ::raster::alloc::string::String::from("output"),
+                    ty: ::raster::alloc::string::String::from(#output_ty),
+                });
+            }
+        })
+        .unwrap_or_else(|| quote! {});
+    let extra_trace_capture: Vec<_> = shape
+        .extra_params
+        .iter()
+        .enumerate()
+        .map(|(index, param)| {
+            let trace_ident = format_ident!("__raster_recur_sequence_trace_arg_{}", index);
+            let name = &param.ident;
+            let name_str = name.to_string();
+            let ty = &param.ty;
+            let ty_str = ty.to_token_stream().to_string();
+            quote! {
+                let #trace_ident = ::raster::into_auth_ref::<#ty, _>(#name.clone());
+                let #trace_ident = ::raster::auth_ref_trace(&#trace_ident)
+                    .unwrap_or_else(|e| panic!(
+                        "Failed to build recur sequence argument trace for '{}': {}",
+                        stringify!(#name), e
+                    ));
+                __raster_trace_values.push(#trace_ident.value);
+                __raster_trace_args.push(::raster::core::trace::FnInputArg {
+                    name: ::raster::alloc::string::String::from(#name_str),
+                    ty: ::raster::alloc::string::String::from(#ty_str),
+                });
+                if let ::core::option::Option::Some(__raster_internal_info) = #trace_ident.storage {
+                    __raster_internal.insert(
+                        ::raster::alloc::string::String::from(#name_str),
+                        __raster_internal_info,
+                    );
+                }
+            }
+        })
+        .collect();
+
     let wrapper_generics = if extra_generic_idents.is_empty() {
         quote! { <#source_ident> }
     } else {
@@ -1256,22 +1395,57 @@ pub(crate) fn gen_recur_sequence_driver_function(
                     return result;
                 }
 
-                let __raster_input_trace = ::raster::auth_ref_trace(&input)
+                // Same metadata path the recur-tile drivers above take, and for
+                // the same two reasons (`lazy-list-recur.md` §2, which binds
+                // *both* macros): `auth_ref_trace` resolves the binding, which
+                // materializes the whole list before any runner runs — the
+                // earliest and largest of the eager paths — and it records a
+                // `Raw` selection, so the site's `L` is index-trusted rather
+                // than authenticated. `checks::cfs::authenticated_source_len`
+                // requires the `0x0A` metadata form and refuses `Raw`, so no
+                // fraud proof covering a recur *sequence* site could be built
+                // at all while this used the ordinary tracer.
+                let __raster_input_trace = ::raster::recur_source_trace(&input)
                     .unwrap_or_else(|e| panic!("Failed to build recur sequence input trace: {}", e));
-                let __raster_input_bytes = ::raster::core::postcard::to_allocvec(&__raster_input_trace.value)
-                    .unwrap_or_default();
+                let mut __raster_trace_values = ::raster::alloc::vec::Vec::new();
+                let mut __raster_trace_args = ::raster::alloc::vec::Vec::new();
+                let mut __raster_internal = ::raster::alloc::collections::BTreeMap::new();
+
+                __raster_trace_values.push(__raster_input_trace.value);
+                __raster_trace_args.push(::raster::core::trace::FnInputArg {
+                    name: ::raster::alloc::string::String::from("input"),
+                    ty: ::raster::alloc::string::String::from(stringify!(::raster::AuthRef<::raster::List<#item_ty>>)),
+                });
+                if let ::core::option::Option::Some(__raster_internal_info) = __raster_input_trace.storage {
+                    __raster_internal.insert(
+                        ::raster::alloc::string::String::from("input"),
+                        __raster_internal_info,
+                    );
+                }
+                // A source selected by a data-sourced index (`list[i]`) cites
+                // that index as a sibling `@idx/…` binding; the site record must
+                // carry it, as a tile call's does, or the guest cannot resolve
+                // the `BoundIndex` in `input`'s path. See
+                // `docs/proposals/dynamic-index-selection.md` §2.
+                for (__raster_index_name, __raster_index_data) in __raster_input_trace.index_bindings.iter() {
+                    __raster_internal.insert(
+                        __raster_index_name.clone(),
+                        __raster_index_data.clone(),
+                    );
+                }
+                #state_trace_capture
+                #output_trace_capture
+                #(#extra_trace_capture)*
+                let __raster_input_bytes = ::raster::core::postcard::to_allocvec(&(
+                    __raster_trace_values.clone(),
+                    __raster_internal.clone(),
+                ))
+                .unwrap_or_default();
                 let __raster_input = ::core::option::Option::Some(::raster::core::trace::FnInput {
                     data: __raster_input_bytes,
-                    values: ::raster::alloc::vec![__raster_input_trace.value],
-                    args: ::raster::alloc::vec![::raster::core::trace::FnInputArg {
-                        name: ::raster::alloc::string::String::from("input"),
-                        ty: ::raster::alloc::string::String::from(stringify!(::raster::AuthRef<::raster::List<#item_ty>>)),
-                    }],
-                    storage: __raster_input_trace.storage.map(|internal| {
-                        let mut map = ::raster::alloc::collections::BTreeMap::new();
-                        map.insert(::raster::alloc::string::String::from("input"), internal);
-                        map
-                    }).unwrap_or_default(),
+                    values: __raster_trace_values,
+                    args: __raster_trace_args,
+                    storage: __raster_internal,
                 });
 
                 // `Start` publishes the input half at the point it was already
@@ -1287,6 +1461,7 @@ pub(crate) fn gen_recur_sequence_driver_function(
                         output: ::core::option::Option::None,
                         draft_transition_witness: ::core::option::Option::None,
                         recur_control: ::core::option::Option::None,
+                        recur_state: ::core::option::Option::None,
                     }
                 ));
 
@@ -1311,6 +1486,7 @@ pub(crate) fn gen_recur_sequence_driver_function(
                         output: __raster_output,
                         draft_transition_witness: ::core::option::Option::None,
                         recur_control: ::core::option::Option::None,
+                        recur_state: ::core::option::Option::None,
                     }
                 ));
 

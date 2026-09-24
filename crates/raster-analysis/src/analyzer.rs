@@ -365,6 +365,8 @@ mod tests {
                         body_self_ns: 4,
                         scope_enter_ns: 1,
                         synthetic_coordinate_alloc_ns: 2,
+                        draft_materialize_ns: 0,
+                        draft_store_ns: 0,
                         input_trace_ns: 1,
                         start_event_publish_ns: 1,
                         output_trace_ns: 1,

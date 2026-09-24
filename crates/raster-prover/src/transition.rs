@@ -24,7 +24,9 @@ use std::collections::{BTreeMap, HashMap};
 use crate::authorization::authorization_guest_image_id;
 use crate::precomputed::EMPTY_TRIE_NODES;
 use crate::replay::ReplayResult;
-use crate::trace::{serializable_frontier_into_trace_frontier, SerializableFrontier, TraceTree};
+use crate::trace::{
+    frontier_root, serializable_frontier_into_trace_frontier, SerializableFrontier,
+};
 #[cfg(test)]
 use crate::trace::{TraceCommitment, TraceCommitmentExt};
 use crate::{TRANSITION_GUEST_ELF, TRANSITION_GUEST_ID};
@@ -51,7 +53,7 @@ type RecordedStepIo = HashMap<StepRecord, StepIo>;
 
 fn build_transition_input(
     step_record: &StepRecord,
-    input_sources_witnesses: &HashMap<StepRecord, Vec<u8>>,
+    input_sources_witnesses: &HashMap<(u64, StepRecord), Vec<u8>>,
     recorded_step_io: &RecordedStepIo,
     replayed_results: &HashMap<StepRecord, ReplayResult>,
     authorization_journal: &AuthorizationJournal,
@@ -59,6 +61,10 @@ fn build_transition_input(
     // Recur progress the window opens with. `Some` only on a window's first
     // step; every later step inherits the preimage through `Transition`.
     window_start_recur_progress: Option<RecurProgressStack>,
+    // The commitment's revealed tail roots. `Some` only on the first step —
+    // the only one holding the header to bind them against; the root the
+    // terminal step needs is carried forward on the journal.
+    revealed_tail_roots: Option<Vec<Vec<u8>>>,
 ) -> TransitionInput {
     let StepIo {
         input_witness,
@@ -106,6 +112,7 @@ fn build_transition_input(
         entrypoint_membership_witness: entrypoint_membership_witness.cloned(),
         program_output_read_witness,
         program_output_selection_witness,
+        revealed_tail_roots,
     }
 }
 
@@ -127,10 +134,7 @@ fn empty_storage_frontier() -> SerializableFrontier {
 fn storage_root(frontier: &SerializableFrontier) -> Vec<u8> {
     let frontier = serializable_frontier_into_trace_frontier(frontier.clone())
         .expect("storage frontier should deserialize");
-    TraceTree::from_frontier(1, frontier)
-        .root(0)
-        .expect("storage root should exist")
-        .0
+    frontier_root(&frontier)
 }
 
 /// Replay trace transitions using the transition guest to prove merkle tree state transitions.
@@ -158,6 +162,13 @@ fn storage_root(frontier: &SerializableFrontier) -> Vec<u8> {
 ///   `TraceCommitmentExt::header` / `fingerprint_slice_witness`). Written to
 ///   the guest only at the window-opening `Init` step, which verifies the
 ///   slice and carries `refuted_trace_commitment` through the journal chain.
+/// * `window_start_recur_progress` - The recur-progress stack the window opens
+///   with, reconstructed from the trace prefix by the caller (see
+///   `TraceRecorder::recur_progress_after`). Required whenever the window's
+///   first step sits inside a live recur site; `None` means the canonical
+///   empty stack, which is itself a claim the guest checks. Read only at the
+///   `Init` step — later steps inherit it through `Transition`. See
+///   `window-seed-reconstruction.md`.
 ///
 /// # Returns
 /// A `TransitionReplayResult` with details about success or failure
@@ -173,12 +184,17 @@ pub fn step_transitions(
     // written to the guest, which hashes it to derive `program_commitment` and
     // decodes it for the CFS + tile registry. See program-identity.md.
     program_frame: &[u8],
-    input_sources_witnesses: &HashMap<StepRecord, Vec<u8>>,
+    input_sources_witnesses: &HashMap<(u64, StepRecord), Vec<u8>>,
     recorded_step_io: &RecordedStepIo,
     replayed_results: &HashMap<StepRecord, ReplayResult>,
     authorization_journal: &AuthorizationJournal,
     authorization_receipt: &risc0_zkvm::Receipt,
     entrypoint_membership_witness: Option<&StorageReadWitness>,
+    window_start_recur_progress: Option<RecurProgressStack>,
+    // The commitment's revealed tail roots, so a divergence the packed
+    // fingerprint is blind to can still be proven. See
+    // `TransitionJournal::final_committed_root`.
+    revealed_tail_roots: &[Vec<u8>],
 ) -> Option<risc0_zkvm::Receipt> {
     let prover = risc0_zkvm::default_prover();
 
@@ -212,17 +228,23 @@ pub fn step_transitions(
                 .is_none()
                 .then_some(entrypoint_membership_witness)
                 .flatten(),
-            // A window that opens *inside* a live loop needs its recur-progress
-            // seed reconstructed from the trace prefix, the way
-            // `storage_state_from_prefix` reconstructs the store. That is not
-            // built yet, so no seed is supplied.
+            // Only the window's first step reads the seed; every later step
+            // inherits the preimage through `Transition`. Same guard, and the
+            // same reason, as `entrypoint_membership_witness` above.
             //
-            // This fails **closed**, not open: the guest advances the empty
-            // stack by the step's own facts and compares against the recorded
-            // commitment, so a genuinely mid-loop window mismatches and is
-            // rejected. A window opening outside any loop — the common case —
-            // starts from the empty stack and verifies normally.
-            None,
+            // The seed is never believed: the guest advances it by the step's
+            // own facts and compares against the recorded
+            // `recur_progress_commitment`, so a wrong one is rejected exactly
+            // as an absent one is today.
+            current_journal
+                .is_none()
+                .then(|| window_start_recur_progress.clone())
+                .flatten(),
+            // Same guard again: bound at `Init` against the header, then
+            // carried forward as a single root on the journal.
+            current_journal
+                .is_none()
+                .then(|| revealed_tail_roots.to_vec()),
         );
         let replay_receipt_assumption: Option<risc0_zkvm::Receipt> =
             if step_record.requires_replay_proof() {
@@ -281,7 +303,7 @@ mod tests {
     use crate::authorization::authorize_external_inputs;
     use crate::precomputed::EMPTY_TRIE_NODES;
     use raster_core::authorization::{AuthorizationJournal, ManifestedInputs};
-    use raster_core::cfs::{CfsCoordinates, ControlFlowSchema, SequenceDef};
+    use raster_core::cfs::{CfsCoordinate, CfsCoordinates, ControlFlowSchema, SequenceDef};
     use raster_core::coordinate_index::coordinate_index_root;
     use raster_core::draft::TileReplayJournal;
     use raster_core::fingerprint::{BitPacker, Fingerprint};
@@ -306,7 +328,7 @@ mod tests {
         }
     }
 
-    fn make_tile_step(exec_index: u64, coordinates: Vec<u32>) -> StepRecord {
+    fn make_tile_step(exec_index: u64, coordinates: Vec<CfsCoordinate>) -> StepRecord {
         StepRecord {
             exec_index,
             sequence_id: "main".to_string(),
@@ -320,6 +342,7 @@ mod tests {
                 storage: empty_store_roots(),
             }),
             recur_progress_commitment: RecurProgressStack::new().commitment(),
+            recur_state: None,
         }
     }
 
@@ -409,6 +432,7 @@ mod tests {
             &make_authorization_journal(),
             None,
             None,
+            None,
         );
 
         // The right replayed result is selected by step-record key.
@@ -455,6 +479,7 @@ mod tests {
             &make_authorization_journal(),
             None,
             None,
+            None,
         );
 
         assert_eq!(
@@ -476,6 +501,7 @@ mod tests {
                 input_source_commitment: Vec::new(),
             },
             recur_progress_commitment: RecurProgressStack::new().commitment(),
+            recur_state: None,
         };
         let sequence_end = StepRecord {
             exec_index: 2,
@@ -485,6 +511,7 @@ mod tests {
                 output_commitment: vec![2; 32],
             },
             recur_progress_commitment: RecurProgressStack::new().commitment(),
+            recur_state: None,
         };
         let recorded_step_io = HashMap::from([
             (sequence_start.clone(), io_witnesses(Some(vec![3, 4]), None)),
@@ -499,6 +526,7 @@ mod tests {
             &make_authorization_journal(),
             None,
             None,
+            None,
         );
         let end_input = build_transition_input(
             &sequence_end,
@@ -506,6 +534,7 @@ mod tests {
             &recorded_step_io,
             &HashMap::new(),
             &make_authorization_journal(),
+            None,
             None,
             None,
         );
@@ -579,6 +608,7 @@ mod tests {
                 .to_vec(),
             },
             recur_progress_commitment: RecurProgressStack::new().commitment(),
+            recur_state: None,
         }
     }
 
@@ -604,6 +634,7 @@ mod tests {
             entrypoint_membership_witness: None,
             program_output_read_witness: None,
             program_output_selection_witness: None,
+            revealed_tail_roots: None,
         };
         let window_fingerprint = Fingerprint::from(vec![0], BitPacker::new(64), 1);
         let state = TransitionState::Init(InitTransition {
@@ -615,10 +646,13 @@ mod tests {
             fingerprint: window_fingerprint.clone(),
         });
         // A minimal commitment whose fingerprint *is* the window (start 0),
-        // so the guest's Init-time slice check passes.
+        // so the guest's Init-time slice check passes. One revealed item, so
+        // the header's `window_size` agrees with the one-item window this
+        // proves — the guest asserts that agreement.
         let trace_commitment = TraceCommitment {
             fingerprint: window_fingerprint,
-            revealed_items: Vec::new(),
+            revealed_items: vec![make_sequence_start_step()],
+            revealed_tail_roots: vec![vec![0u8; 32]],
         };
         let commitment_header = trace_commitment.header();
         let fingerprint_slice = trace_commitment.fingerprint_slice_witness(0, 1);

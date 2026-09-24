@@ -1,4 +1,6 @@
 //! Command implementations for the Raster CLI.
+pub mod fraud;
+pub mod prove;
 pub mod run;
 pub mod show;
 pub mod tile;
@@ -159,6 +161,18 @@ pub fn build(backend_type: BackendType, tile: Option<String>) -> Result<()> {
     // ids, so there is nothing to pin.
     if matches!(backend_type, BackendType::Risc0) {
         emit_program_artifacts(&project)?;
+    } else {
+        // Say so. Image ids need compiled guests, so only the risc0 backend can
+        // emit them — but "Build complete!" on its own reads as "everything is
+        // up to date", and the drift error's remedy is exactly this command.
+        // A reader who runs it, sees success, and hits the same error next time
+        // has been sent in a circle.
+        println!();
+        println!(
+            "Note: program.bin and Raster.lock were not written — they record tile image ids, \
+             which only the risc0 backend produces. Run `cargo raster build --backend risc0` \
+             to refresh them."
+        );
     }
 
     println!();
@@ -344,6 +358,10 @@ fn apply_stream_event(profile: &mut ExecutionProfile, event: ProfileStreamEvent)
             }
             false
         }
+        // The follow view aggregates per-record; a standalone finalize has no
+        // record to attach to (a draft closed in `main` has no sequence frame
+        // at all). It stays in the stream for direct reading.
+        ProfileStreamEvent::DraftFinalize { .. } => false,
         ProfileStreamEvent::RunFinished {
             program_total_duration_ns,
             ..
