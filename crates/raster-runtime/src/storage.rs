@@ -124,7 +124,6 @@ pub struct DraftCaptureSnapshot {
 #[derive(Debug, Clone)]
 pub struct StoredObject {
     pub reference: StorageRef,
-    pub log_position: u64,
     pub(crate) backing: ObjectBacking,
 }
 
@@ -159,8 +158,43 @@ pub(crate) struct AuthorizedSourceLoad {
     pub sources: Vec<AuthorizedSource>,
 }
 
+/// The objects a running program wrote, keyed by the coordinates that address
+/// them, plus the resolver a `Referenced` object dispatches to.
+///
+/// This is what *executing* a program needs and no more: a sequence binds
+/// references rather than values, so a later tile's `call!` has to read back
+/// the bytes an earlier one produced. It authenticates nothing — no frontier,
+/// no coordinate index, no roots. [`AuthenticatedObjectStore`] wraps it with
+/// those, for the one role that reads them.
+/// See `docs/proposals/storage-role-split.md`.
 #[derive(Clone)]
-pub struct StorageManager {
+pub struct ObjectStore {
+    objects: BTreeMap<CfsCoordinates, StoredObject>,
+    /// Set once (via `start_program`) for programs that declare `main` entry
+    /// arguments; `None` otherwise, and never consulted unless a `Referenced`
+    /// object actually needs resolving.
+    source_resolver: Option<Arc<dyn SourceResolver>>,
+}
+
+impl std::fmt::Debug for ObjectStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ObjectStore")
+            .field("objects", &self.objects)
+            .field("has_source_resolver", &self.source_resolver.is_some())
+            .finish()
+    }
+}
+
+/// An [`ObjectStore`] plus the structures that make its contents provable: an
+/// append-only log of `(coordinates, object_commitment)` entries and a
+/// coordinate-keyed Merkle index, whose roots every write reports.
+///
+/// The trace recorder holds one of these, because it is the only role that
+/// reads those roots — it commits them per step and builds the membership and
+/// selection witnesses the guest checks against them.
+#[derive(Clone)]
+pub struct AuthenticatedObjectStore {
+    objects: ObjectStore,
     frontier: TraceTreeFrontier,
     /// The storage root as of the last mutation.
     ///
@@ -173,19 +207,13 @@ pub struct StorageManager {
     /// is ever needed.
     /// See `docs/proposals/storage-write-cost.md`.
     cached_root: Vec<u8>,
-    objects: BTreeMap<CfsCoordinates, StoredObject>,
     coordinate_index: IncrementalCoordinateIndex,
-    /// Set once (via `start_program`) for programs that declare `main` entry
-    /// arguments; `None` otherwise, and never consulted unless a `Referenced`
-    /// object actually needs resolving.
-    source_resolver: Option<Arc<dyn SourceResolver>>,
 }
 
-impl std::fmt::Debug for StorageManager {
+impl std::fmt::Debug for AuthenticatedObjectStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("StorageManager")
+        f.debug_struct("AuthenticatedObjectStore")
             .field("objects", &self.objects)
-            .field("has_source_resolver", &self.source_resolver.is_some())
             .finish()
     }
 }
@@ -228,6 +256,37 @@ fn internal_object_commitment(bytes: &[u8], raster: Option<&RasterPayload>) -> V
     raster
         .map(|payload| payload.root_hash.to_vec())
         .unwrap_or_else(|| Sha256Commitment::from(bytes).into())
+}
+
+/// The backing and commitment for a value the program produced. Shared by both
+/// stores so the commitment rule has exactly one definition.
+fn owned_backing(bytes: &[u8], raster: Option<RasterPayload>) -> (ObjectBacking, Vec<u8>) {
+    let object_commitment = internal_object_commitment(bytes, raster.as_ref());
+    let owned = OwnedObject {
+        bytes: bytes.to_vec(),
+        raster,
+    };
+    (ObjectBacking::Owned(owned), object_commitment)
+}
+
+/// The backing and commitment for an authorized set of named sources.
+fn referenced_backing(load: AuthorizedSourceLoad) -> (ObjectBacking, Vec<u8>) {
+    let referenced = ReferencedObject {
+        sources: load
+            .sources
+            .into_iter()
+            .map(|source| ReferencedSource {
+                name: source.name,
+                commitment: source.commitment,
+                kind: {
+                    let _authorized_encoding = source.encoding;
+                    source.kind
+                },
+            })
+            .collect(),
+    };
+    let combined_root = referenced.combined_root();
+    (ObjectBacking::Referenced(referenced), combined_root)
 }
 
 fn anchor_for_schema(coordinates: &CfsCoordinates, schema_hash: [u8; 32]) -> Anchor {
@@ -389,20 +448,10 @@ fn draft_state_witness(state: &DraftRuntimeState) -> DraftStateWitness {
     }
 }
 
-impl StorageManager {
+impl ObjectStore {
     pub fn new() -> Self {
-        let mut tree = TraceTree::new(1);
-        tree.append(Bytes(EMPTY_TRIE_NODES[0].to_vec()));
-        let frontier = tree
-            .frontier()
-            .cloned()
-            .expect("storage frontier should exist after seed append");
-        let cached_root = frontier_root(&frontier);
         Self {
-            frontier,
-            cached_root,
             objects: BTreeMap::new(),
-            coordinate_index: IncrementalCoordinateIndex::new(),
             source_resolver: None,
         }
     }
@@ -420,127 +469,47 @@ impl StorageManager {
         self.source_resolver.clone()
     }
 
-    pub fn snapshot(&self) -> StorageSnapshot {
-        StorageSnapshot {
-            frontier: serializable_frontier_from_trace_frontier(self.frontier.clone()),
-            root: self.current_root(),
-            index_root: self.current_index_root(),
-        }
-    }
-
-    pub fn current_root(&self) -> Vec<u8> {
-        self.cached_root.clone()
-    }
-
-    pub fn current_index_root(&self) -> Vec<u8> {
-        self.coordinate_index.root()
-    }
-
-    fn append(
+    /// Inserts `backing` at `coordinates` under `object_commitment`, and
+    /// returns the entry naming it.
+    fn put(
         &mut self,
-        backing: ObjectBacking,
-        object_commitment: Vec<u8>,
         coordinates: CfsCoordinates,
-    ) -> StorageWriteRecord {
+        object_commitment: Vec<u8>,
+        backing: ObjectBacking,
+    ) -> StorageEntry {
+        // `objects` and the authenticated coordinate index are written in
+        // lockstep, so their key sets are identical: this is the same guard
+        // `AuthenticatedObjectStore::append` states against the index, and the
+        // one a store without an index keeps. `insert` overwrites, and two
+        // writes to one coordinate would silently replace an object that
+        // outstanding references still point at, surfacing later as a
+        // commitment mismatch in `verify_reference` with nothing to say why.
         assert!(
-            !self.coordinate_index.contains_key(&coordinates),
+            !self.objects.contains_key(&coordinates),
             "Duplicate storage write at coordinates {:?}",
             coordinates
         );
-
-        let timing = crate::profiling::profiling_enabled();
-
-        // `current_root`/`frontier_root` fold the frontier's ommers, and are
-        // called once here and once below — so the roots term is timed apart
-        // from the work that actually mutates state.
-        let roots_start = timing.then(std::time::Instant::now);
-        let store_root_before = self.current_root();
-        let index_root_before = self.current_index_root();
-        let mut roots_ns = elapsed_ns(roots_start);
-
-        let entry = StorageEntry {
-            coordinates: coordinates.clone(),
-            object_commitment,
-        };
-
-        let frontier_start = timing.then(std::time::Instant::now);
-        let leaf_hash: Vec<u8> = Sha256Commitment::from(entry.to_bytes().as_slice()).into();
-        self.frontier.append(Bytes(leaf_hash));
-        let frontier_ns = elapsed_ns(frontier_start);
-
-        // The one recompute per mutation; every read below is served from it.
-        // Timed as roots work, not frontier work, so a before/after against the
-        // pre-cache numbers compares the same thing.
-        let recompute_start = timing.then(std::time::Instant::now);
-        self.cached_root = frontier_root(&self.frontier);
-        let root_recompute_ns = elapsed_ns(recompute_start);
-        roots_ns = roots_ns.saturating_add(root_recompute_ns);
-
-        let log_position: u64 = self.frontier.position().into();
-        let index_value = StorageIndexValue {
-            log_position,
-            object_commitment: entry.object_commitment.clone(),
-        };
-
-        let index_start = timing.then(std::time::Instant::now);
-        self.coordinate_index
-            .insert(coordinates.clone(), index_value);
-        let index_ns = elapsed_ns(index_start);
-
-        let reference = StorageRef::new(coordinates.clone(), entry.object_commitment.clone());
-
-        self.objects.insert(
+        let reference = StorageRef::new(coordinates.clone(), object_commitment.clone());
+        self.objects
+            .insert(coordinates.clone(), StoredObject { reference, backing });
+        StorageEntry {
             coordinates,
-            StoredObject {
-                reference,
-                log_position,
-                backing,
-            },
-        );
-
-        // `frontier_after` clones the frontier and converts it; timed apart
-        // from the root recompute so the roots term says whether it is hashing
-        // or allocation.
-        let frontier_after_start = timing.then(std::time::Instant::now);
-        let frontier_after = serializable_frontier_from_trace_frontier(self.frontier.clone());
-        let frontier_after_ns = elapsed_ns(frontier_after_start);
-
-        let roots_after_start = timing.then(std::time::Instant::now);
-        let record = StorageWriteRecord {
-            entry,
-            log_position,
-            store_root_before,
-            store_root_after: self.current_root(),
-            index_root_before,
-            index_root_after: self.current_index_root(),
-            frontier_after,
-        };
-        roots_ns = roots_ns
-            .saturating_add(elapsed_ns(roots_after_start))
-            .saturating_add(frontier_after_ns);
-
-        crate::profiling::record_draft_append_phase(
-            roots_ns,
-            frontier_ns,
-            index_ns,
-            root_recompute_ns,
-            frontier_after_ns,
-        );
-        record
+            object_commitment,
+        }
     }
 
+    /// Stores a value the program produced. The returned entry's
+    /// `object_commitment` is the half of a [`StorageRef`] that says *which
+    /// value*, and it is the only thing a write gives the running program —
+    /// see `docs/proposals/storage-role-split.md`.
     pub fn append_serialized_bytes(
         &mut self,
         bytes: &[u8],
         coordinates: CfsCoordinates,
         raster: Option<RasterPayload>,
-    ) -> StorageWriteRecord {
-        let object_commitment = internal_object_commitment(bytes, raster.as_ref());
-        let owned = OwnedObject {
-            bytes: bytes.to_vec(),
-            raster,
-        };
-        self.append(ObjectBacking::Owned(owned), object_commitment, coordinates)
+    ) -> StorageEntry {
+        let (backing, object_commitment) = owned_backing(bytes, raster);
+        self.put(coordinates, object_commitment, backing)
     }
 
     /// Loads an authorized set of named sources as one storage object. Today
@@ -549,27 +518,9 @@ impl StorageManager {
         &mut self,
         load: AuthorizedSourceLoad,
         coordinates: CfsCoordinates,
-    ) -> StorageWriteRecord {
-        let referenced = ReferencedObject {
-            sources: load
-                .sources
-                .into_iter()
-                .map(|source| ReferencedSource {
-                    name: source.name,
-                    commitment: source.commitment,
-                    kind: {
-                        let _authorized_encoding = source.encoding;
-                        source.kind
-                    },
-                })
-                .collect(),
-        };
-        let combined_root = referenced.combined_root();
-        self.append(
-            ObjectBacking::Referenced(referenced),
-            combined_root,
-            coordinates,
-        )
+    ) -> StorageEntry {
+        let (backing, object_commitment) = referenced_backing(load);
+        self.put(coordinates, object_commitment, backing)
     }
 
     pub fn resolve<T: DeserializeOwned>(&self, reference: &StorageRef) -> Result<StorageValue<T>> {
@@ -763,7 +714,196 @@ impl StorageManager {
     }
 }
 
-impl Default for StorageManager {
+impl AuthenticatedObjectStore {
+    pub fn new() -> Self {
+        let mut tree = TraceTree::new(1);
+        tree.append(Bytes(EMPTY_TRIE_NODES[0].to_vec()));
+        let frontier = tree
+            .frontier()
+            .cloned()
+            .expect("storage frontier should exist after seed append");
+        let cached_root = frontier_root(&frontier);
+        Self {
+            objects: ObjectStore::new(),
+            frontier,
+            cached_root,
+            coordinate_index: IncrementalCoordinateIndex::new(),
+        }
+    }
+
+    pub fn snapshot(&self) -> StorageSnapshot {
+        StorageSnapshot {
+            frontier: serializable_frontier_from_trace_frontier(self.frontier.clone()),
+            root: self.current_root(),
+            index_root: self.current_index_root(),
+        }
+    }
+
+    pub fn current_root(&self) -> Vec<u8> {
+        self.cached_root.clone()
+    }
+
+    pub fn current_index_root(&self) -> Vec<u8> {
+        self.coordinate_index.root()
+    }
+
+    fn append(
+        &mut self,
+        backing: ObjectBacking,
+        object_commitment: Vec<u8>,
+        coordinates: CfsCoordinates,
+    ) -> StorageWriteRecord {
+        assert!(
+            !self.coordinate_index.contains_key(&coordinates),
+            "Duplicate storage write at coordinates {:?}",
+            coordinates
+        );
+
+        let timing = crate::profiling::profiling_enabled();
+
+        // `current_root`/`frontier_root` fold the frontier's ommers, and are
+        // called once here and once below — so the roots term is timed apart
+        // from the work that actually mutates state.
+        let roots_start = timing.then(std::time::Instant::now);
+        let store_root_before = self.current_root();
+        let index_root_before = self.current_index_root();
+        let mut roots_ns = elapsed_ns(roots_start);
+
+        let entry = StorageEntry {
+            coordinates: coordinates.clone(),
+            object_commitment,
+        };
+
+        let frontier_start = timing.then(std::time::Instant::now);
+        let leaf_hash: Vec<u8> = Sha256Commitment::from(entry.to_bytes().as_slice()).into();
+        self.frontier.append(Bytes(leaf_hash));
+        let frontier_ns = elapsed_ns(frontier_start);
+
+        // The one recompute per mutation; every read below is served from it.
+        // Timed as roots work, not frontier work, so a before/after against the
+        // pre-cache numbers compares the same thing.
+        let recompute_start = timing.then(std::time::Instant::now);
+        self.cached_root = frontier_root(&self.frontier);
+        let root_recompute_ns = elapsed_ns(recompute_start);
+        roots_ns = roots_ns.saturating_add(root_recompute_ns);
+
+        let log_position: u64 = self.frontier.position().into();
+        let index_value = StorageIndexValue {
+            log_position,
+            object_commitment: entry.object_commitment.clone(),
+        };
+
+        let index_start = timing.then(std::time::Instant::now);
+        self.coordinate_index
+            .insert(coordinates.clone(), index_value);
+        let index_ns = elapsed_ns(index_start);
+
+        self.objects
+            .put(coordinates, entry.object_commitment.clone(), backing);
+
+        // `frontier_after` clones the frontier and converts it; timed apart
+        // from the root recompute so the roots term says whether it is hashing
+        // or allocation.
+        let frontier_after_start = timing.then(std::time::Instant::now);
+        let frontier_after = serializable_frontier_from_trace_frontier(self.frontier.clone());
+        let frontier_after_ns = elapsed_ns(frontier_after_start);
+
+        let roots_after_start = timing.then(std::time::Instant::now);
+        let record = StorageWriteRecord {
+            entry,
+            log_position,
+            store_root_before,
+            store_root_after: self.current_root(),
+            index_root_before,
+            index_root_after: self.current_index_root(),
+            frontier_after,
+        };
+        roots_ns = roots_ns
+            .saturating_add(elapsed_ns(roots_after_start))
+            .saturating_add(frontier_after_ns);
+
+        crate::profiling::record_draft_append_phase(
+            roots_ns,
+            frontier_ns,
+            index_ns,
+            root_recompute_ns,
+            frontier_after_ns,
+        );
+        record
+    }
+
+    pub fn append_serialized_bytes(
+        &mut self,
+        bytes: &[u8],
+        coordinates: CfsCoordinates,
+        raster: Option<RasterPayload>,
+    ) -> StorageWriteRecord {
+        let (backing, object_commitment) = owned_backing(bytes, raster);
+        self.append(backing, object_commitment, coordinates)
+    }
+
+    /// Loads an authorized set of named sources as one storage object. Today
+    /// this is called only for `main`'s entrypoint binding at coordinate `[0]`.
+    pub(crate) fn load_authorized_sources(
+        &mut self,
+        load: AuthorizedSourceLoad,
+        coordinates: CfsCoordinates,
+    ) -> StorageWriteRecord {
+        let (backing, object_commitment) = referenced_backing(load);
+        self.append(backing, object_commitment, coordinates)
+    }
+
+    /// Injects the resolver a `Referenced` object dispatches to. Set once
+    /// per runtime — by runtime initialization in production, or
+    /// directly by a caller that supplies its own input context (the trace
+    /// recorder, tests).
+    pub(crate) fn set_source_resolver(&mut self, resolver: Arc<dyn SourceResolver>) {
+        self.objects.set_source_resolver(resolver);
+    }
+
+    /// The installed input context, if this runtime has one.
+    pub(crate) fn source_resolver(&self) -> Option<Arc<dyn SourceResolver>> {
+        self.objects.source_resolver()
+    }
+
+    pub fn resolve<T: DeserializeOwned>(&self, reference: &StorageRef) -> Result<StorageValue<T>> {
+        self.objects.resolve(reference)
+    }
+
+    pub fn select<T: DeserializeOwned>(
+        &self,
+        reference: &StorageRef,
+        selector: &SelectorPath,
+    ) -> Result<StorageValue<T>> {
+        self.objects.select(reference, selector)
+    }
+
+    pub fn selection_witness(
+        &self,
+        reference: &StorageRef,
+        selector: &SelectorPath,
+        payload_kind: SelectionPayloadKind,
+    ) -> Result<SelectionWitness> {
+        self.objects
+            .selection_witness(reference, selector, payload_kind)
+    }
+
+    pub fn list_metadata_selection(
+        &self,
+        reference: &StorageRef,
+        selector: &SelectorPath,
+    ) -> Result<AuthenticatedListMetadata> {
+        self.objects.list_metadata_selection(reference, selector)
+    }
+}
+
+impl Default for ObjectStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Default for AuthenticatedObjectStore {
     fn default() -> Self {
         Self::new()
     }
@@ -963,8 +1103,7 @@ impl SequenceExecutionContext {
 }
 
 std::thread_local! {
-    pub(crate) static THREAD_STORAGE: RefCell<StorageManager> =
-        RefCell::new(StorageManager::new());
+    pub(crate) static THREAD_STORAGE: RefCell<ObjectStore> = RefCell::new(ObjectStore::new());
     pub(crate) static THREAD_SEQUENCE_CONTEXT: RefCell<SequenceExecutionContext> =
         RefCell::new(SequenceExecutionContext::default());
     static THREAD_ACTIVE_EXECUTION_COORDINATES: RefCell<Vec<CfsCoordinates>> = RefCell::new(Vec::new());
@@ -983,7 +1122,7 @@ fn reset_thread_storage() {
         // `init`, before any sequence runs, and must outlive the store it was
         // installed into.
         let source_resolver = storage.source_resolver();
-        *storage = StorageManager::new();
+        *storage = ObjectStore::new();
         if let Some(resolver) = source_resolver {
             storage.set_source_resolver(resolver);
         }
@@ -1033,10 +1172,6 @@ pub fn exit_recur_sequence_iteration_scope() {
     THREAD_SEQUENCE_CONTEXT.with(|context| {
         context.borrow_mut().exit_recur_sequence_iteration();
     });
-}
-
-pub fn global_storage_snapshot() -> StorageSnapshot {
-    THREAD_STORAGE.with(|storage| storage.borrow().snapshot())
 }
 
 pub fn create_draft<S>() -> Result<(Anchor, [u8; 32])>
@@ -1296,12 +1431,12 @@ fn store_value_at_coordinates<T: Serialize>(
 
     let append_start = timing.then(std::time::Instant::now);
     let result = THREAD_STORAGE.with(|storage| {
-        let write = storage.borrow_mut().append_serialized_bytes(
+        let entry = storage.borrow_mut().append_serialized_bytes(
             &bytes,
             coordinates.clone(),
             raster_payload,
         );
-        Ok(StorageRef::new(coordinates, write.entry.object_commitment))
+        Ok(StorageRef::new(coordinates, entry.object_commitment))
     });
     let append_ns = elapsed_ns(append_start);
 
@@ -1413,12 +1548,12 @@ pub fn store_execution_output_value<T: Serialize>(value: &T) -> Result<StorageRe
         _ => raster_payload_for_value(value)?,
     };
     THREAD_STORAGE.with(|storage| {
-        let write = storage.borrow_mut().append_serialized_bytes(
+        let entry = storage.borrow_mut().append_serialized_bytes(
             &bytes,
             coordinates.clone(),
             Some(raster_payload),
         );
-        Ok(StorageRef::new(coordinates, write.entry.object_commitment))
+        Ok(StorageRef::new(coordinates, entry.object_commitment))
     })
 }
 
@@ -1681,16 +1816,53 @@ mod tests {
     #[test]
     #[should_panic(expected = "Duplicate storage write at coordinates")]
     fn rejects_duplicate_coordinate_writes() {
-        let mut manager = StorageManager::new();
+        let mut manager = AuthenticatedObjectStore::new();
         let coordinates = CfsCoordinates(vec![1, 2, 3]);
 
         manager.append_serialized_bytes(b"first", coordinates.clone(), None);
         manager.append_serialized_bytes(b"second", coordinates, None);
     }
 
+    /// The same guard, on the store a *running program* uses. The
+    /// authenticated store states it against the coordinate index; an
+    /// `ObjectStore` has no index, so it states it against `objects` — and the
+    /// running program depends on this one, not the test above.
+    /// See `docs/proposals/storage-role-split.md`.
+    #[test]
+    #[should_panic(expected = "Duplicate storage write at coordinates")]
+    fn object_store_rejects_duplicate_coordinate_writes() {
+        let mut objects = ObjectStore::new();
+        let coordinates = CfsCoordinates(vec![1, 2, 3]);
+
+        objects.append_serialized_bytes(b"first", coordinates.clone(), None);
+        objects.append_serialized_bytes(b"second", coordinates, None);
+    }
+
+    /// A write gives the running program its object commitment and nothing
+    /// else, and a read finds the value back under it.
+    #[test]
+    fn object_store_round_trips_a_value_through_its_commitment() {
+        let mut objects = ObjectStore::new();
+        let coordinates = CfsCoordinates(vec![7]);
+
+        let entry = objects.append_serialized_bytes(b"payload", coordinates.clone(), None);
+
+        assert_eq!(entry.coordinates, coordinates);
+        assert_eq!(
+            entry.object_commitment,
+            internal_object_commitment(b"payload", None),
+        );
+
+        let reference = StorageRef::new(coordinates, entry.object_commitment);
+        let stored = objects
+            .verify_reference(&reference)
+            .expect("the object just written must verify");
+        assert_eq!(stored.reference, reference);
+    }
+
     #[test]
     fn authorized_source_load_commits_to_declared_sources_in_order() {
-        let mut manager = StorageManager::new();
+        let mut manager = AuthenticatedObjectStore::new();
         let alpha_commitment = vec![1; 32];
         let beta_commitment = vec![2; 32];
         let coordinates = CfsCoordinates(vec![0]);
@@ -1759,5 +1931,96 @@ mod tests {
 
         assert!(error.contains("must be written before finalize"));
         assert!(THREAD_DRAFT_STORAGE.with(|drafts| !drafts.borrow().contains_key(&anchor)));
+    }
+
+    /// A draft with a `List<String>` field, for the large-draft measurement.
+    #[derive(Debug, Deserialize, Serialize)]
+    struct BigDraft {
+        lines: Vec<String>,
+    }
+
+    impl Selectable for BigDraft {
+        fn schema() -> SchemaNode {
+            SchemaNode::Struct {
+                type_name: "BigDraft".into(),
+                fields: vec![SchemaField::new(
+                    "lines",
+                    "lines",
+                    SchemaNode::List {
+                        type_name: "List<String>".into(),
+                        element: Box::new(SchemaNode::Leaf {
+                            type_name: "String".into(),
+                        }),
+                    },
+                )],
+            }
+        }
+    }
+
+    /// How a draft's close scales in its element count.
+    ///
+    /// `docs/proposals/incremental-draft-materialization.md` is entirely about
+    /// an `O(N)` term, and every number measured for it so far came from
+    /// `hello-tiles`, whose drafts hold **two** elements — a size at which an
+    /// `O(N)` term and a constant are indistinguishable. This walks N so the
+    /// growth is visible instead of inferred.
+    ///
+    /// Ignored by default: it is a measurement, not an assertion.
+    /// `cargo test -p raster-runtime --release --lib large_draft -- --ignored --nocapture`
+    #[test]
+    #[ignore = "measurement, not an assertion"]
+    fn large_draft_finalize_scaling() {
+        println!();
+        println!(
+            "{:>8}  {:>12}  {:>12}  {:>12}  {:>12}  {:>12}  {:>10}",
+            "N", "push_total", "materialize", "encode", "append", "finalize", "ns/element"
+        );
+
+        for n in [1usize, 16, 64, 256, 1024, 4096, 16384] {
+            let _scope = SequenceScopeGuard::enter("bench");
+            let (anchor, mut root) =
+                create_draft::<BigDraft>().expect("draft is created");
+
+            let push_start = std::time::Instant::now();
+            for index in 0..n {
+                let line = format!("line-{index:08}");
+                root = apply_draft_push::<BigDraft, String>(&anchor, &root, "lines", &line)
+                    .expect("push applies");
+            }
+            let push_ns = push_start.elapsed().as_nanos() as u64;
+
+            // The two halves of the close, timed apart exactly as
+            // `finalize_and_store` times them in a real run.
+            let materialize_start = std::time::Instant::now();
+            let value = finalize_draft_value::<BigDraft>(&anchor, &root, true)
+                .expect("draft materializes");
+            let materialize_ns = materialize_start.elapsed().as_nanos() as u64;
+            assert_eq!(value.lines.len(), n, "draft holds every pushed element");
+
+            // `encode_raster_value` is Stage 1's target: the second hash of
+            // every element. Measured on its own, outside the storage write.
+            let encode_start = std::time::Instant::now();
+            let _payload = raster_payload_for_value(&value).expect("value encodes");
+            let encode_ns = encode_start.elapsed().as_nanos() as u64;
+
+            let append_start = std::time::Instant::now();
+            let stored = store_finalized_draft(&value).expect("value stores");
+            let append_ns = append_start.elapsed().as_nanos() as u64;
+            let _ = stored;
+
+            let finalize_ns = materialize_ns + append_ns;
+            println!(
+                "{:>8}  {:>10.2}ms  {:>10.2}ms  {:>10.2}ms  {:>10.2}ms  {:>10.2}ms  {:>10}",
+                n,
+                push_ns as f64 / 1e6,
+                materialize_ns as f64 / 1e6,
+                encode_ns as f64 / 1e6,
+                append_ns as f64 / 1e6,
+                finalize_ns as f64 / 1e6,
+                finalize_ns / n as u64,
+            );
+        }
+        println!();
+        println!("`encode` is included in `append` (append calls it); it is timed twice on purpose.");
     }
 }

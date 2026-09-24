@@ -141,11 +141,11 @@ pub fn start_program(args: &[EntryArgumentSpec]) -> Result<EntryArgumentsBinding
     let load = AuthorizedSourceLoad { sources };
 
     THREAD_STORAGE.with(|storage| {
-        let write = storage
+        let entry = storage
             .borrow_mut()
             .load_authorized_sources(load, coordinates.clone());
         Ok(EntryArgumentsBinding {
-            reference: StorageRef::new(coordinates, write.entry.object_commitment),
+            reference: StorageRef::new(coordinates, entry.object_commitment),
             arguments: bindings,
         })
     })

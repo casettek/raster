@@ -759,6 +759,17 @@ pub(crate) fn gen_recur_driver_function(
                         __raster_internal_info,
                     );
                 }
+                // A source selected by a data-sourced index (`list[i]`) cites
+                // that index as a sibling `@idx/…` binding; the site record must
+                // carry it, as a tile call's does, or the guest cannot resolve
+                // the `BoundIndex` in `input`'s path. See
+                // `docs/proposals/dynamic-index-selection.md` §2.
+                for (__raster_index_name, __raster_index_data) in __raster_input_trace.index_bindings.iter() {
+                    __raster_internal.insert(
+                        __raster_index_name.clone(),
+                        __raster_index_data.clone(),
+                    );
+                }
                 #state_trace_capture
                 #output_trace_capture
                 #(#extra_trace_capture)*
@@ -882,6 +893,17 @@ pub(crate) fn gen_recur_driver_function(
                     __raster_internal.insert(
                         ::raster::alloc::string::String::from("input"),
                         __raster_internal_info,
+                    );
+                }
+                // A source selected by a data-sourced index (`list[i]`) cites
+                // that index as a sibling `@idx/…` binding; the site record must
+                // carry it, as a tile call's does, or the guest cannot resolve
+                // the `BoundIndex` in `input`'s path. See
+                // `docs/proposals/dynamic-index-selection.md` §2.
+                for (__raster_index_name, __raster_index_data) in __raster_input_trace.index_bindings.iter() {
+                    __raster_internal.insert(
+                        __raster_index_name.clone(),
+                        __raster_index_data.clone(),
                     );
                 }
                 #state_trace_capture
@@ -1398,6 +1420,17 @@ pub(crate) fn gen_recur_sequence_driver_function(
                     __raster_internal.insert(
                         ::raster::alloc::string::String::from("input"),
                         __raster_internal_info,
+                    );
+                }
+                // A source selected by a data-sourced index (`list[i]`) cites
+                // that index as a sibling `@idx/…` binding; the site record must
+                // carry it, as a tile call's does, or the guest cannot resolve
+                // the `BoundIndex` in `input`'s path. See
+                // `docs/proposals/dynamic-index-selection.md` §2.
+                for (__raster_index_name, __raster_index_data) in __raster_input_trace.index_bindings.iter() {
+                    __raster_internal.insert(
+                        __raster_index_name.clone(),
+                        __raster_index_data.clone(),
                     );
                 }
                 #state_trace_capture

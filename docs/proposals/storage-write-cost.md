@@ -87,27 +87,72 @@ End to end on `hello-tiles`, median over the run's storage appends:
 | `append_roots_ns` | 53–56 µs | **3.6 µs** |
 | `store_append_ns` | ~170 µs | **56–60 µs** |
 
-Term 2 (the coordinate index) is now the whole remaining cost of an append at ~51–54 µs.
+Term 2 (the coordinate index) is now the whole remaining cost of an append at ~51–54 µs — **on a
+small object.**
 
-## Term 2: the coordinate index is 256 levels deep
+> **Scope corrected 2026-09-22.** What this proposal removes is *per storage write*, so it is flat
+> in a draft's element count. `incremental-draft-materialization`'s `large_draft_finalize_scaling`
+> measures the whole fixed append overhead at 0.12 ms against a finalize growing at ~1.6 µs per
+> element — so Term 2 is **0.45% of closing a 16 K-element draft**, and the crossover with the
+> per-element term is around **80 elements**. Term 2 is still worth doing, but it is a
+> *small-object* optimization: it pays on the many ordinary tile-output writes a program makes,
+> not on large drafts. Sequencing the two against each other by percentage requires saying which
+> regime the program is in.
+
+## Term 2: the coordinate index is 256 levels deep — now the whole cost of an append
+
+With Term 1 done, this is **93% of a storage `append`** (66.4 µs of 71.6 µs, `hello-tiles` median)
+and ~65% of a whole draft finalize. It is also the most variable thing in the profile: the five
+finalizes in one run measured 51.8, 183.7, 66.4, **810.4** and 52.8 µs.
 
 ```rust
-const INDEX_BITS: usize = 256;
-...
-for depth in (0..INDEX_BITS).rev() { ... combine_node_hash(...) ... }
+let mut current = leaf;
+for depth in (0..INDEX_BITS).rev() {          // INDEX_BITS = 256, always
+    let bit = bit_at(&key, depth);
+    let sibling = self.child_hash(&key, depth, !bit);
+    current = if bit { combine_node_hash(depth, &sibling, &current) }
+              else    { combine_node_hash(depth, &current, &sibling) };
+    self.node_hashes.insert(node_key(&key, depth), current.clone());
+}
 ```
 
-A fixed **256 hashes per write**, independent of how many entries the index holds, and 256
-siblings in every membership proof the fraud-proof guest verifies.
+`coordinates_key` is `sha256(domain ‖ postcard(coordinates))`, so keys are uniform over 256 bits
+and the tree is a full-depth sparse Merkle trie. Every insert walks all 256 levels.
 
-The depth follows from keying the index by a 256-bit hash of the coordinates
-(`coordinates_key`). Whether the keyspace needs to be that wide is a design question this document
-raises rather than answers — the tree is sparse and the number of live coordinates in any real
-program is small. A shallower key, or a different index structure, would cut both host time and
-guest witness size.
+### The 256 hashes are irreducible for this root definition
 
-**Not proposed here**, because unlike Term 1 it changes the index root and therefore every
-commitment. Worth its own argument; noted so Term 1 is not mistaken for the whole story.
+Worth stating because it rules out the obvious fix. Below the depth at which this key diverges from
+every other occupied key, the *sibling* is the empty-subtree hash — but `current` never is, so every
+one of the 256 `combine_node_hash` calls is a genuine hash of two distinct values. Precomputing
+empty subtree roots (which `empty_hashes` already does) removes nothing, because no combine has
+two empty children. There is no memo of the kind that fixed Term 1b here.
+
+### 2a — remove the constant, change no commitment
+
+256 SHA-256 over ~72-byte inputs is ~25 µs at the rate measured in Term 1b. The insert costs
+52–66 µs. **So roughly half to two-thirds of this term is not hashing**, it is:
+
+- a `Vec<u8>` allocated per level by `combine_node_hash`, plus `current.clone()` per level;
+- a `HashMap<NodeKey, Vec<u8>>` insert per level, where `NodeKey` is `{ depth, prefix: [u8;32] }`
+  hashed with the default SipHash — 256 map inserts and 256 33-byte key hashes per storage write;
+- the 810 µs outlier, which has the shape of a map growth/rehash.
+
+Switching node hashes to `[u8; 32]`, giving the map a cheap hasher (or replacing it with a
+depth-indexed structure), and not re-inserting nodes whose value is unchanged are all local to
+`coordinate_index.rs` and **produce the same root**. Verifiable exactly as Term 1 was: a
+byte-identical `commit.bin` through the commit/audit round trip. Expected to roughly halve an
+append again, to ~30–40 µs, with ~25 µs the floor.
+
+### 2b — go below the floor, and move every commitment
+
+Getting from ~25 µs to ~log2(N) hashes needs the root *redefined* as a compressed sparse Merkle
+trie (collapse each all-empty subtree into a constant with an explicit skip encoding). That changes
+`coordinate_index_root` for every program, so it moves `init_storage_index_root`, the membership and
+non-membership proof shapes, and the guest checks that verify them. It is a real proposal with a
+real payoff (~10x on top of 2a) and it should not be smuggled in as a performance tweak.
+
+**Do 2a first.** It is worth ~2x, is verifiable byte-for-byte, and does not spend the compatibility
+budget that 2b needs.
 
 ## Measurement
 

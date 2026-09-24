@@ -1,6 +1,6 @@
 # Issue: `authenticated-chain-draft-output` — a finalized draft has no object in the recorder's storage replica
 
-Status: open 2026-08-27. Unowned. **Scope widened 2026-09-18: not chain-specific, and not
+Status: open 2026-08-27. Unowned. **Deterministic reproducer: `--fraud-step 22` on `examples/hello-tiles` (§Second reproducer).** **Scope widened 2026-09-18: not chain-specific, and not
 specific to program outputs.** The name is kept so links stay valid; read it as *draft-object
 missing from the replica*. A second reproducer on `examples/hello-tiles` fails on the
 **fraud-proof** path, where the draft is a tile *input*, not a stage output.
@@ -58,12 +58,45 @@ let witness = self.storage.selection_witness(&reference, …)
 
 ## Second reproducer: the fraud path, on a program that is not a chain
 
-`examples/hello-tiles`, tile guests rebuilt from scratch, fraud injected and audited:
+**Deterministic as of 2026-09-21** — `--fraud-step` (`run.rs`, `FraudTarget`) replaced the
+injector's unseeded random choice, so this is now a one-line reproducer rather than a draw from
+58 eligible steps:
+
+```console
+$ cd examples/hello-tiles
+$ cargo raster run --input input.json --input-manifest input_manifest.json \
+    --commit probe22.bin --fraud-proof-window-size 32 --fraud-step 22
+  Fraud injected into 1 of 58 eligible steps:
+    index       22
+    exec_index  40
+    target      tile concat_messages
+    coordinates CfsCoordinates([9])
+$ cargo raster run --input input.json --input-manifest input_manifest.json --audit probe22.bin
+```
 
 ```
-run.rs:765 → Failed to build storage selection witness for 'message1':
+run.rs:966 → Failed to build storage selection witness for 'message1':
              Missing storage object at coordinates CfsCoordinates([-2147483648, 2])
 ```
+
+Exit `101`: fraud detected, receipt cannot be built. **It fails in seconds** — the witness is
+built host-side in `prove()` before any proving starts, so this reproducer is cheap to re-run.
+Contrast [`sequence-scope-forbids-narrowing`](./sequence-scope-forbids-narrowing.md)
+(`--fraud-step 45`), whose panic is inside the guest and therefore arrives only after ~2.5 h of
+proving.
+
+> **The "in seconds" claim is stale as of 2026-09-24, on a tree carrying uncommitted `run.rs` work
+> (`7e2ce27` "witness selection for parent" and later).** The injection still reproduces exactly —
+> index 22, `exec_index` 40, tile `concat_messages`, `CfsCoordinates([9])` — but the audit no longer
+> stops at the witness build: it ran the program to completion, printed its output artifacts, and
+> went into proving, still running after 15 minutes at ~16 cores. So this reproducer is **no longer
+> cheap**, and whether the underlying defect is fixed on that path or merely moved is **unresolved**
+> — the run was killed rather than finished. Anything citing this as a fast check needs re-basing;
+> [`storage-role-split`](../proposals/storage-role-split.md) §Verification did, and says so.
+
+`--fraud-step 22` is the index in that listing; `exec:40` names the same step by `exec_index`.
+`--fraud-step list` prints the table. The flag enables the injector on its own, so the commitment
+file needs no `fraud_` prefix.
 
 Same missing object, different caller. `message1` is `concat_messages`'s first parameter
 (`src/lib.rs:123`), bound in `main` to `select!(String, draft_greeting.clone().title)` after
@@ -169,6 +202,14 @@ any program that selects into a finalized draft** — chain or not. On `hello-ti
 is entirely healthy (commit `0`, audit `Verification Success`) and fraud is *detected* (`101`), but
 the receipt cannot be built. That is a completeness defect on the dispute path, and on the dispute
 path a completeness defect is a lost dispute — the same framing
-[`fraud-evidence-storage-unavailable`](./fraud-evidence-storage-unavailable.md) §3 uses. As of this
-date it is the **last** blocker standing between a detected divergence and a completed fraud proof
-on `hello-tiles`: every other step in that window verifies.
+[`fraud-evidence-storage-unavailable`](./fraud-evidence-storage-unavailable.md) §3 uses. As of that
+date it looked like the **last** blocker standing between a detected divergence and a completed
+fraud proof on `hello-tiles`.
+
+> **Retracted 2026-09-21.** It is not. A fraud probe whose injector drew a different random victim
+> step reached a different wall — [`sequence-scope-forbids-narrowing`](./sequence-scope-forbids-narrowing.md),
+> a guest assertion at `checks/cfs.rs:59` that forbids a sub-sequence from `select!`ing into its own
+> parameter. The original claim rested on a run that happened to draw a draft-dependent step; the
+> injector corrupts a **randomly chosen** step (`run.rs:537-545`), so no single probe establishes
+> what the next one hits. The honest count of remaining blockers on the fraud path is **unknown**.
+> At ~2.5 h per probe, a targetable injector is the cheapest way to make it knowable.

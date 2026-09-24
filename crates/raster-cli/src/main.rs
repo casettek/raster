@@ -211,6 +211,17 @@ enum Commands {
         )]
         fraud_proof_config: Option<FraudProofConfig>,
 
+        /// Which executed step the fraud injector should corrupt, instead of
+        /// picking one at random. `<n>` is a position in the eligible list,
+        /// `exec:<n>` an `exec_index`, `tile:<name>` the first step running
+        /// that tile or recur sequence, `seed:<n>` a reproducible random
+        /// choice, and `list` prints the eligible steps and writes nothing.
+        /// Passing this enables the injector on its own; without it the
+        /// injector is enabled by a `fraud_` filename prefix and its random
+        /// choice is reported as a `seed:` you can replay.
+        #[arg(long = "fraud-step", requires = "commit")]
+        fraud_step: Option<commands::fraud::FraudTarget>,
+
         /// Read and verify trace from file (mutually exclusive with --commit)
         #[arg(long, conflicts_with = "commit")]
         audit: Option<String>,
@@ -491,6 +502,7 @@ fn try_main() -> Result<()> {
             input_manifest,
             commit,
             fraud_proof_config,
+            fraud_step,
             audit,
             no_auth,
             verbose,
@@ -505,6 +517,7 @@ fn try_main() -> Result<()> {
             input_manifest.as_deref(),
             commit.as_deref(),
             fraud_proof_config,
+            fraud_step.as_ref(),
             audit.as_deref(),
             no_auth,
             verbose,

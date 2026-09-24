@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 
 use crate::storage::{
-    AuthorizedSource, AuthorizedSourceLoad, StorageManager, StorageSnapshot, StorageWriteRecord,
+    AuthorizedSource, AuthorizedSourceLoad, AuthenticatedObjectStore, StorageSnapshot, StorageWriteRecord,
 };
 use crate::tracing::commitment::Sha256Commitment;
 
@@ -294,7 +294,7 @@ pub struct TraceRecorder {
     active_recur_sequence: HashMap<(CfsCoordinates, String), RecurExecutionState>,
     cfs_cursor: CfsCursor,
     witness_store: StepWitnessStore,
-    storage: StorageManager,
+    storage: AuthenticatedObjectStore,
     /// Live recur sites, advanced in step with the guest so both compute the
     /// same `recur_progress_commitment`. Revision 1 of
     /// `recur-progress-commitment.md` failed because two of the frame's fields
@@ -331,7 +331,7 @@ impl TraceRecorder {
             active_recur_sequence: HashMap::new(),
             cfs_cursor: CfsCursor::new(cfs),
             witness_store: StepWitnessStore::new(),
-            storage: StorageManager::new(),
+            storage: AuthenticatedObjectStore::new(),
             recur_progress: RecurProgressStack::new(),
             recur_progress_store: HashMap::new(),
         }

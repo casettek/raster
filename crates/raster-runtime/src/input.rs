@@ -3442,7 +3442,7 @@ mod tests {
     }
 
     /// A range selection served straight from the `.rindex`, the way
-    /// `StorageManager::selection_witness` serves one at `--commit` time.
+    /// `AuthenticatedObjectStore::selection_witness` serves one at `--commit` time.
     ///
     /// The in-memory `typed_proven_selection` path has supported ranges since
     /// `Block<T>` landed, so `select!(Block<T>, xs[a..b])` resolves in-process
