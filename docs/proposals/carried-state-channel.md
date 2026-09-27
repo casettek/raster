@@ -4,6 +4,23 @@ Status: proposed 2026-08-07 — **enhancement.** Nothing is blocked on it and no
 waits for it. It consolidates mechanisms that each work on their own, and it should be done
 when the *second* of them is ready, not before (§When).
 
+**Revised 2026-09-27 — realised under another name, for every component known so far.** All three
+components have landed, or are designed to land, as fields of one existing carrier:
+`RecurProgressFrame`, committed per step as `recur_progress_commitment`.
+- recur progress is the frame itself;
+- loop-carried state became `state_commitment` in
+  [`recur-state-chaining`](./recur-state-chaining.md) (implemented 2026-09-11): *"one more frame
+  field rather than a new carrier"*;
+- draft roots become the frame's `draft` entry in
+  [`incremental-draft-materialization`](./incremental-draft-materialization.md) §The draft root
+  rides in the site's recur-progress frame, which answers §4's creation question.
+
+This works because every one of them is **site-scoped**. Under that proposal's one storage rule no
+draft exists outside a recur site, so a draft's lifetime is its site's lifetime, and the frame
+already opens and closes with the site. The design below still holds, but `RecurProgressStack` is
+the channel, and what remains here is a rename. A separate `CarriedState` struct is needed only if
+carried state appears that is **not** site-scoped; none is known.
+
 Related:
 - [`recur-progress-commitment.md`](./recur-progress-commitment.md) — the first component, and
   the proposal that establishes the mechanism this one generalizes. It ships standalone, with
@@ -124,6 +141,23 @@ step, or a creation marker on the first mutating step's journal, or a rule deriv
 draft anchor's synthetic coordinates (`storage.rs:822`). Until that is decided, folding drafts
 in would preserve the hole under a better name.
 
+> **Answered 2026-09-27** by
+> [`incremental-draft-materialization`](./incremental-draft-materialization.md). A draft is
+> created only by a recur site, at the site's `Start`, which is already a trace step. The
+> synthetic coordinates are deleted with `DRAFT_NAMESPACE`. The component is a
+> `draft: Option<SiteDraft { schema_hash, root }>` field on `RecurProgressFrame`, not a map:
+>
+> | step | advance |
+> | --- | --- |
+> | site `Start` | open with the empty root of `S`, or the base object's commitment for a deriving site |
+> | iteration | journal `root_before` must equal the entry; the entry becomes `root_after` |
+> | site close | entry must equal `output_commitment`; popped with the frame |
+>
+> The entry is `None` exactly when the CFS says the site owns no object (`state_is_output`).
+> Whether the site derives is also read from the CFS, so neither fact is prover-chosen. The
+> recorder computes `root_after` from the `draft_transition_witness` it already receives, so the
+> field passes the parity rule that sank revision 1 of `recur-progress-commitment`.
+
 **`state_roots` — waits on its own proposal.** `loop-carried-state` is not implemented; there
 is nothing to carry yet. The dependency is one-directional: that proposal should reference this
 channel instead of specifying a map, and nothing here waits on it.
@@ -172,6 +206,13 @@ When it does happen, batch it with a release that already breaks the trace forma
 proposal in the `lazy-list-recur` / `paged-bytes` line does — so the migration is shared rather
 than doubled.
 
+> **2026-09-27.** Both triggers have now fired, and neither needed this proposal's struct.
+> `loop-carried-state` §4 landed as a frame field, and the draft question is answered with another
+> one. What is left is the rename `recur_progress_commitment` → `carried_state_commitment` (and
+> `RecurProgressStack` → a name that no longer says "progress"). It is optional, and it is worth
+> doing only inside a release that already breaks the trace format, such as the one
+> `incremental-draft-materialization` causes.
+
 ## Modules touched (sketch)
 
 | file | change |
@@ -180,7 +221,7 @@ than doubled.
 | `raster-core/src/trace.rs` | `recur_progress_commitment` → `carried_state_commitment` on `StepRecord` |
 | `raster-core/src/transition.rs` | `carried_state` on `Transition`; `window_start_carried_state` on `TransitionInput`; **remove** `active_drafts` from `Transition` *and* `InitTransition` |
 | `raster-runtime/src/tracing/recorder.rs` | stamp one commitment instead of one per component |
-| `guests/transition/src/checks/drafts.rs` | the permissive `if let Some(..)` becomes a required continuity check, once §4 is answered |
+| `guests/transition/src/checks/drafts.rs` | the permissive `if let Some(..)` is **deleted**, not tightened: the expected `root_before` comes from the site's frame. Owned by `incremental-draft-materialization` |
 | `guests/transition/src/checks/cfs.rs`, `fraud_proof.rs` | one advance-and-compare for the whole channel |
 
 ## Verification
@@ -197,6 +238,7 @@ than doubled.
 - Draft continuity across a window boundary: a spliced draft chain (a root the tile legitimately
   produced, but not the one the previous step of *this* chain ended with) is rejected. This is
   the case `if let Some(..)` accepts today, and the reason drafts belong in the channel at all.
+  Now listed in `incremental-draft-materialization` §Verification, which owns the draft entry.
 
 ## Uncertainties for review
 
@@ -207,6 +249,8 @@ than doubled.
    the channel should be three components sharing a commitment rather than a trait.
 2. **Whether the draft creation question belongs here or in `draft-provenance`.** It is a trace
    expressiveness question, not a carrier question; this proposal only needs the answer.
+   *Answered 2026-09-27 in neither:* `incremental-draft-materialization` makes the site's `Start`
+   the creation step.
 3. **Ordering against `loop-carried-state`.** If that proposal lands first, it should be built
    *into* the channel directly rather than shipping a `TrackedStateRoot` map that this then
    migrates — one break instead of two.
