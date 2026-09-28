@@ -3125,31 +3125,138 @@ mod fingerprint_slice {
 
 mod program_end {
     use super::*;
-    use raster_core::input::SelectionCommitment;
+    use raster_core::cfs::SequenceReturn;
+    use raster_core::input::{
+        encode_index_leaf_payload, selected_subtree_root, selection_payload_hash,
+        struct_commitments_root, IndexWidth, SelectionCommitment, SelectionProof,
+        SelectionProofStep, SelectionWitness, SelectorPath, SelectorSegment,
+    };
     use raster_core::trace::ProgramEndStep;
     use raster_core::transition::OutputAuthorization;
 
     use crate::checks::entrypoint::verify_program_end;
 
-    /// `main = [produce, other]`, returning `produce`'s output: a `ProgramEnd`
-    /// owes an output binding, and it must be the object at `[1]`.
-    fn producing_cfs() -> CfsCursor {
-        cfs_returning(
-            vec![
-                SequenceChildItem::Tile(TileItem {
-                    id: "produce".into(),
-                    sources: vec![],
-                }),
-                SequenceChildItem::Tile(TileItem {
-                    id: "other".into(),
-                    sources: vec![],
-                }),
-            ],
-            Some(InputBinding::prior_item_output(0)),
+    /// The stored object every test reads: `Stats { count: 3, sum: 12, max: 7 }`
+    /// as a raster struct of three `u64` leaves, fields in declaration order.
+    const FIELDS: [(&str, u64); 3] = [("count", 3), ("sum", 12), ("max", 7)];
+
+    fn leaf(value: u64) -> Vec<u8> {
+        encode_index_leaf_payload(value, IndexWidth::U64).expect("u64 leaf encodes")
+    }
+
+    fn leaf_roots() -> Vec<[u8; 32]> {
+        FIELDS
+            .iter()
+            .map(|(_, value)| selected_subtree_root(&leaf(*value)).expect("leaf has a root"))
+            .collect()
+    }
+
+    fn object_root() -> [u8; 32] {
+        let roots = leaf_roots();
+        struct_commitments_root(
+            FIELDS
+                .iter()
+                .zip(roots.iter())
+                .map(|((name, _), root)| (*name, root.as_slice())),
         )
     }
 
-    fn cfs_returning(items: Vec<SequenceChildItem>, returns: Option<InputBinding>) -> CfsCursor {
+    /// The whole object's raster payload: `0x01 ‖ count ‖ (name_len ‖ name ‖
+    /// payload_len ‖ payload)*`, as `assemble_subtree` writes a struct.
+    fn object_payload() -> Vec<u8> {
+        let mut payload = vec![0x01];
+        payload.extend_from_slice(&(FIELDS.len() as u64).to_le_bytes());
+        for (name, value) in FIELDS {
+            let child = leaf(value);
+            payload.extend_from_slice(&(name.len() as u64).to_le_bytes());
+            payload.extend_from_slice(name.as_bytes());
+            payload.extend_from_slice(&(child.len() as u64).to_le_bytes());
+            payload.extend_from_slice(&child);
+        }
+        payload
+    }
+
+    /// A genuine selection of `field` (or of the whole object, for `None`) and
+    /// its proof: the commitment `ProgramEnd` records, and the witness the
+    /// guest verifies it with.
+    fn select(field: Option<&str>) -> (SelectionCommitment, SelectionWitness) {
+        let root = object_root();
+        let (payload, path, steps) = match field {
+            None => (object_payload(), vec![], vec![]),
+            Some(field) => {
+                let position = FIELDS
+                    .iter()
+                    .position(|(name, _)| *name == field)
+                    .expect("field of Stats");
+                let roots = leaf_roots();
+                let siblings = roots
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| *index != position)
+                    .map(|(_, root)| *root)
+                    .collect();
+                (
+                    leaf(FIELDS[position].1),
+                    vec![SelectorSegment::Field(field.to_string())],
+                    vec![SelectionProofStep::Struct {
+                        field_index: position as u64,
+                        field_names: FIELDS.iter().map(|(name, _)| name.to_string()).collect(),
+                        siblings,
+                    }],
+                )
+            }
+        };
+        let path = SelectorPath::new(path);
+        let commitment = SelectionCommitment {
+            path: path.clone(),
+            source_root_hash: root,
+            selected_hash: selection_payload_hash(&payload),
+            selected_len: payload.len() as u64,
+            payload_kind: Default::default(),
+        };
+        let witness = SelectionWitness::from_payload(
+            payload,
+            SelectionProof {
+                path,
+                root_hash: root,
+                steps,
+            },
+        );
+        (commitment, witness)
+    }
+
+    fn fields(names: &[&str]) -> Vec<SelectorSegment> {
+        names
+            .iter()
+            .map(|name| SelectorSegment::Field(name.to_string()))
+            .collect()
+    }
+
+    fn returning(source: InputBinding, path: &[&str]) -> Option<SequenceReturn> {
+        Some(SequenceReturn {
+            source,
+            path: fields(path),
+        })
+    }
+
+    /// `main = [produce, other]`, returning `select!(u64, produced.max)`: a
+    /// `ProgramEnd` owes an output binding, and it must be the `max` field of
+    /// the object at `[1]`.
+    fn producing_cfs() -> CfsCursor {
+        cfs_returning(
+            vec![tile_item("produce"), tile_item("other")],
+            returning(InputBinding::prior_item_output(0), &["max"]),
+        )
+    }
+
+    fn tile_item(id: &str) -> SequenceChildItem {
+        SequenceChildItem::Tile(TileItem {
+            id: id.into(),
+            sources: vec![],
+        })
+    }
+
+    fn cfs_returning(items: Vec<SequenceChildItem>, returns: Option<SequenceReturn>) -> CfsCursor {
         CfsCursor::new(ControlFlowSchema {
             version: "1.0".into(),
             project: "test".into(),
@@ -3167,22 +3274,22 @@ mod program_end {
                 SequenceDef {
                     id: "child".into(),
                     input_sources: vec![],
-                    items: vec![
-                        SequenceChildItem::Tile(TileItem {
-                            id: "produce".into(),
-                            sources: vec![],
-                        }),
-                        SequenceChildItem::Tile(TileItem {
-                            id: "other".into(),
-                            sources: vec![],
-                        }),
-                    ],
+                    items: vec![tile_item("produce"), tile_item("other")],
                     entry_arguments: vec![],
                     produces_output: false,
                     returns: None,
                 },
             ],
         })
+    }
+
+    fn nested_cfs(extra: Vec<SequenceChildItem>) -> CfsCursor {
+        let mut items = vec![SequenceChildItem::Sequence(SequenceItem {
+            id: "child".into(),
+            sources: vec![],
+        })];
+        items.extend(extra);
+        cfs_returning(items, returning(InputBinding::prior_item_output(0), &["max"]))
     }
 
     fn program_end_record(program_end: ProgramEndStep) -> StepRecord {
@@ -3197,138 +3304,96 @@ mod program_end {
         }
     }
 
-    /// A program output living at the sequence root, selected whole.
-    ///
-    /// `selected_len == 0` keeps the selection *witness* out of the picture —
-    /// `verify_program_end` only verifies one for a non-empty selection, and
-    /// the selection machinery is covered elsewhere. What is under test here
-    /// is the binding between the step's `output_commitment` and what the
-    /// function returns.
-    fn fixture(
-        object_commitment: Vec<u8>,
-        selected_hash: Vec<u8>,
-        declared_output_commitment: Vec<u8>,
-    ) -> (StorageEntry, Vec<u8>, Vec<u8>, StorageReadWitness, StepRecord) {
-        fixture_at(
-            vec![1],
-            object_commitment,
-            selected_hash,
-            declared_output_commitment,
-        )
-    }
-
-    /// As [`fixture`], with the output object stored at `coordinates`.
-    fn fixture_at(
+    /// Store the object at `coordinates`, record a `ProgramEnd` over the given
+    /// selection with `declared_output_commitment`, and verify it with
+    /// `witness`.
+    fn verify_recorded(
+        cfs: &CfsCursor,
         coordinates: Vec<CfsCoordinate>,
-        object_commitment: Vec<u8>,
-        selected_hash: Vec<u8>,
+        selection: SelectionCommitment,
         declared_output_commitment: Vec<u8>,
-    ) -> (StorageEntry, Vec<u8>, Vec<u8>, StorageReadWitness, StepRecord) {
+        witness: Option<&SelectionWitness>,
+    ) -> OutputAuthorization {
+        let commitment = object_root().to_vec();
         let entry = StorageEntry {
             coordinates: CfsCoordinates(coordinates.clone()),
-            object_commitment: object_commitment.clone(),
+            object_commitment: commitment.clone(),
         };
         let (_frontier, root, _index, index_root) = build_storage_context(&[entry.clone()]);
-        let witness = build_read_witness(&[entry.clone()], &entry);
-
-        let source_root_hash: [u8; 32] = object_commitment
-            .clone()
-            .try_into()
-            .expect("test commitments are 32 bytes");
-        let selected: [u8; 32] = selected_hash
-            .try_into()
-            .expect("test commitments are 32 bytes");
-
+        let read_witness = build_read_witness(&[entry.clone()], &entry);
         let record = program_end_record(ProgramEndStep {
             output: Some(StorageData {
                 coordinates: CfsCoordinates(coordinates),
-                commitment: object_commitment,
+                commitment,
                 selector: Default::default(),
-                selection: SelectionCommitment {
-                    source_root_hash,
-                    selected_hash: selected,
-                    selected_len: 0,
-                    ..Default::default()
-                },
+                selection,
             }),
             output_commitment: declared_output_commitment,
             storage: dummy_storage_roots(),
         });
-
-        (entry, root, index_root, witness, record)
-    }
-
-    /// The phase-1 property: the value the check already verified is the value
-    /// it hands back, so the journal can name *which* output this trace
-    /// produced rather than only that one exists.
-    #[test]
-    fn establishes_with_the_committed_output_value() {
-        let object_commitment = sha(b"program-output-object");
-        let selected_hash = sha(b"program-output-value");
-        let (_entry, root, index_root, witness, record) = fixture(
-            object_commitment,
-            selected_hash.clone(),
-            selected_hash.clone(),
-        );
         let StepKind::ProgramEnd(program_end) = record.kind.clone() else {
             unreachable!("fixture builds a ProgramEnd step");
         };
-
-        assert_eq!(
-            verify_program_end(
-                &producing_cfs(),
-                &record,
-                &program_end,
-                &root,
-                &index_root,
-                Some(&witness),
-                None,
-            ),
-            OutputAuthorization::Established {
-                output_commitment: selected_hash,
-            },
-        );
-    }
-
-    /// The invariant the carried value rests on. Without this, `Established`
-    /// could name a value the selection never produced.
-    #[test]
-    #[should_panic(expected = "ProgramEnd output commitment does not match the selected output")]
-    fn rejects_an_output_commitment_that_is_not_the_selected_hash() {
-        let (_entry, root, index_root, witness, record) = fixture(
-            sha(b"program-output-object"),
-            sha(b"program-output-value"),
-            sha(b"a-different-value"),
-        );
-        let StepKind::ProgramEnd(program_end) = record.kind.clone() else {
-            unreachable!("fixture builds a ProgramEnd step");
-        };
-
         verify_program_end(
-            &producing_cfs(),
+            cfs,
             &record,
             &program_end,
             &root,
             &index_root,
-            Some(&witness),
-            None,
+            Some(&read_witness),
+            witness,
+        )
+    }
+
+    /// An honest-looking `ProgramEnd` over `field` of the object stored at
+    /// `coordinates`, with a genuine proof.
+    fn verify_output(
+        cfs: &CfsCursor,
+        coordinates: Vec<CfsCoordinate>,
+        field: Option<&str>,
+    ) -> OutputAuthorization {
+        let (selection, witness) = select(field);
+        let output_commitment = selection.selected_hash.to_vec();
+        verify_recorded(cfs, coordinates, selection, output_commitment, Some(&witness))
+    }
+
+    /// The value the check verified is the value it hands back, so the journal
+    /// names *which* output this trace produced.
+    #[test]
+    fn establishes_with_the_committed_output_value() {
+        let (selection, _) = select(Some("max"));
+        assert_eq!(
+            verify_output(&producing_cfs(), vec![1], Some("max")),
+            OutputAuthorization::Established {
+                output_commitment: selection.selected_hash.to_vec(),
+            },
         );
     }
 
-    /// Run `verify_program_end` on an honest-looking output stored at
-    /// `coordinates`, against `cfs`.
-    fn verify_output_at(cfs: &CfsCursor, coordinates: Vec<CfsCoordinate>) -> OutputAuthorization {
-        let selected_hash = sha(b"program-output-value");
-        let (_entry, root, index_root, witness, record) = fixture_at(
-            coordinates,
-            sha(b"program-output-object"),
-            selected_hash.clone(),
-            selected_hash,
+    #[test]
+    #[should_panic(expected = "ProgramEnd output commitment does not match the selected output")]
+    fn rejects_an_output_commitment_that_is_not_the_selected_hash() {
+        let (selection, witness) = select(Some("max"));
+        verify_recorded(
+            &producing_cfs(),
+            vec![1],
+            selection,
+            sha(b"a-different-value"),
+            Some(&witness),
         );
-        let StepKind::ProgramEnd(program_end) = record.kind.clone() else {
-            unreachable!("fixture builds a ProgramEnd step");
-        };
-        verify_program_end(cfs, &record, &program_end, &root, &index_root, Some(&witness), None)
+    }
+
+    /// A zero-length selection is how a postcard-only object reports "no raster
+    /// view". It used to skip the proof, leaving `selected_hash` — the output
+    /// commitment — free: this is that forgery, with a value nothing selected.
+    #[test]
+    #[should_panic(expected = "requires a selection witness")]
+    fn rejects_a_zero_length_selection_that_skips_its_proof() {
+        let (mut selection, _) = select(Some("max"));
+        selection.selected_len = 0;
+        selection.selected_hash = sha(b"any-value-at-all").try_into().expect("32 bytes");
+        let output_commitment = selection.selected_hash.to_vec();
+        verify_recorded(&producing_cfs(), vec![1], selection, output_commitment, None);
     }
 
     /// Regression for `docs/issues/program-output-unbound.md`, the probe that
@@ -3337,16 +3402,42 @@ mod program_end {
     #[test]
     #[should_panic(expected = "do not match expected CFS source")]
     fn rejects_an_output_at_a_coordinate_no_item_names() {
-        verify_output_at(&producing_cfs(), vec![7]);
+        verify_output(&producing_cfs(), vec![7], Some("max"));
     }
 
-    /// The realistic forgery: a real, stored intermediate object — `other`'s
-    /// output at `[2]` — named as the program's output when `main` returns
-    /// `produce`'s at `[1]`. Every storage and selection check passes.
+    /// A real, stored intermediate object — `other`'s output at `[2]` — named as
+    /// the program's output when `main` returns `produce`'s at `[1]`.
     #[test]
     #[should_panic(expected = "do not match expected CFS source")]
     fn rejects_an_intermediate_object_as_the_program_output() {
-        verify_output_at(&producing_cfs(), vec![2]);
+        verify_output(&producing_cfs(), vec![2], Some("max"));
+    }
+
+    /// The right object, another field of it: `sum` where `main` returns `max`.
+    /// Every storage and selection check passes — only the path tells them
+    /// apart.
+    #[test]
+    #[should_panic(expected = "selects a different part of the object")]
+    fn rejects_another_field_of_the_returned_object() {
+        verify_output(&producing_cfs(), vec![1], Some("sum"));
+    }
+
+    #[test]
+    #[should_panic(expected = "selects a different part of the object")]
+    fn rejects_the_whole_object_when_main_returns_a_field() {
+        verify_output(&producing_cfs(), vec![1], None);
+    }
+
+    #[test]
+    fn accepts_the_whole_object_when_main_returns_it() {
+        let cfs = cfs_returning(
+            vec![tile_item("produce")],
+            returning(InputBinding::prior_item_output(0), &[]),
+        );
+        assert!(matches!(
+            verify_output(&cfs, vec![1], None),
+            OutputAuthorization::Established { .. }
+        ));
     }
 
     /// A program whose return the CFS could not bind — a finalized draft, a
@@ -3354,74 +3445,65 @@ mod program_end {
     #[test]
     #[should_panic(expected = "does not bind the value `main` returns")]
     fn refuses_an_output_when_main_returns_nothing_bindable() {
-        let items = vec![SequenceChildItem::Tile(TileItem {
-            id: "produce".into(),
-            sources: vec![],
-        })];
-        verify_output_at(&cfs_returning(items, None), vec![1]);
+        verify_output(&cfs_returning(vec![tile_item("produce")], None), vec![1], Some("max"));
     }
 
-    /// A `main` passing an entry argument straight through returns the entry
-    /// object at `[]`, and nothing else.
+    /// `main(count, sum, max) -> u64 { max }`: the entry object at `[]` holds
+    /// every argument, and the returned one is named by the path.
     #[test]
-    fn accepts_an_entry_argument_returned_from_the_entry_object() {
-        let cfs = cfs_returning(vec![], Some(InputBinding::entry_argument()));
+    fn accepts_the_returned_entry_argument() {
+        let cfs = cfs_returning(vec![], returning(InputBinding::entry_argument(), &["max"]));
         assert!(matches!(
-            verify_output_at(&cfs, vec![]),
+            verify_output(&cfs, vec![], Some("max")),
             OutputAuthorization::Established { .. }
         ));
+    }
+
+    #[test]
+    #[should_panic(expected = "selects a different part of the entry object")]
+    fn rejects_another_entry_argument() {
+        let cfs = cfs_returning(vec![], returning(InputBinding::entry_argument(), &["max"]));
+        verify_output(&cfs, vec![], Some("sum"));
     }
 
     #[test]
     #[should_panic(expected = "must come from the entry object")]
     fn rejects_a_stored_object_for_an_entry_argument_return() {
-        let items = vec![SequenceChildItem::Tile(TileItem {
-            id: "produce".into(),
-            sources: vec![],
-        })];
-        verify_output_at(&cfs_returning(items, Some(InputBinding::entry_argument())), vec![1]);
+        let cfs = cfs_returning(
+            vec![tile_item("produce")],
+            returning(InputBinding::entry_argument(), &["max"]),
+        );
+        verify_output(&cfs, vec![1], Some("max"));
     }
 
     /// The residual gap, pinned so it is not mistaken for closed: `main`
-    /// returning a nested sequence's result can only be held to *inside* that
-    /// sequence until nested returns are bound at `SequenceEnd`.
+    /// returning a nested sequence's result is held only to *inside* that
+    /// sequence, and to a path *ending with* what `main` selected, until
+    /// nested returns are bound at `SequenceEnd`.
     #[test]
     fn a_nested_sequence_return_is_held_only_to_its_scope() {
-        let cfs = cfs_returning(
-            vec![SequenceChildItem::Sequence(SequenceItem {
-                id: "child".into(),
-                sources: vec![],
-            })],
-            Some(InputBinding::prior_item_output(0)),
-        );
+        let cfs = nested_cfs(vec![]);
         // Either object the child wrote is accepted — the gap.
         assert!(matches!(
-            verify_output_at(&cfs, vec![1, 2]),
+            verify_output(&cfs, vec![1, 2], Some("max")),
             OutputAuthorization::Established { .. }
         ));
         assert!(matches!(
-            verify_output_at(&cfs, vec![1, 1]),
+            verify_output(&cfs, vec![1, 1], Some("max")),
             OutputAuthorization::Established { .. }
         ));
+    }
+
+    #[test]
+    #[should_panic(expected = "selects a different part of the sequence's result")]
+    fn rejects_a_nested_sequence_return_with_another_field() {
+        verify_output(&nested_cfs(vec![]), vec![1, 2], Some("sum"));
     }
 
     #[test]
     #[should_panic(expected = "do not descend from expected sequence source")]
     fn rejects_a_nested_sequence_return_outside_its_scope() {
-        let cfs = cfs_returning(
-            vec![
-                SequenceChildItem::Sequence(SequenceItem {
-                    id: "child".into(),
-                    sources: vec![],
-                }),
-                SequenceChildItem::Tile(TileItem {
-                    id: "other".into(),
-                    sources: vec![],
-                }),
-            ],
-            Some(InputBinding::prior_item_output(0)),
-        );
-        verify_output_at(&cfs, vec![2]);
+        verify_output(&nested_cfs(vec![tile_item("other")]), vec![2], Some("max"));
     }
 
     /// A unit `main` binds nothing and carries no value — the variant stays

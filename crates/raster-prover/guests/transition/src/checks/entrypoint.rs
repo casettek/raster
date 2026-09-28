@@ -21,9 +21,12 @@
 //! deferred debt to discharge at the end of the chain.
 
 use raster_core::authorization::AuthorizationJournal;
-use raster_core::cfs::{CfsCoordinate, CfsCoordinates, CfsCursor, InputBinding, FIRST_COORDINATE};
+use raster_core::cfs::{
+    CfsCoordinate, CfsCoordinates, CfsCursor, InputBinding, SequenceChildItem, SequenceReturn,
+    FIRST_COORDINATE,
+};
 use raster_core::input::{struct_commitments_root, verify_selection_witness, SelectionWitness};
-use raster_core::trace::{ProgramEndStep, ProgramStartStep, StepKind, StepRecord};
+use raster_core::trace::{ProgramEndStep, ProgramStartStep, StepKind, StepRecord, StorageData};
 use raster_core::transition::{EntrypointAuthorization, OutputAuthorization, StorageReadWitness};
 
 use crate::checks::cfs::assert_prior_item_output_coordinates;
@@ -271,7 +274,7 @@ pub fn verify_program_end(
              ProgramEnd output can be verified"
         )
     });
-    verify_program_output_source(cfs_cursor, returns, &output.coordinates);
+    verify_program_output_source(cfs_cursor, returns, output);
 
     // The output object is present at its coordinates in the current store.
     let read_witness = read_witness.expect("ProgramEnd output requires a storage read witness");
@@ -289,14 +292,18 @@ pub fn verify_program_end(
         output.selection.source_root_hash.as_slice(),
         "Program output object commitment must match the selection source root",
     );
-    if output.selection.selected_len > 0 {
-        let selection_witness =
-            selection_witness.expect("ProgramEnd output requires a selection witness");
-        assert!(
-            verify_selection_witness(&output.selection, selection_witness),
-            "Program output selection witness is invalid",
-        );
-    }
+    // Unconditionally. A zero-length selection is how a postcard-only object
+    // reports "no raster view" (`OwnedObject::resolve_whole`), and skipping the
+    // proof for it would let a `ProgramEnd` claim `selected_len: 0` and name any
+    // `selected_hash` it likes. A program output is always raster-encoded, and
+    // every raster payload is at least its tag byte, so an honest output
+    // always has a proof to give.
+    let selection_witness =
+        selection_witness.expect("ProgramEnd output requires a selection witness");
+    assert!(
+        verify_selection_witness(&output.selection, selection_witness),
+        "Program output selection witness is invalid",
+    );
 
     // The committed output is exactly that selection's value.
     assert_eq!(
@@ -313,29 +320,46 @@ pub fn verify_program_end(
     }
 }
 
-/// Hold the program output's coordinates to the binding `main` returns.
+/// Hold the program output to what `main` returns: the object (`source`) and
+/// the part of it (`path`).
 ///
-/// The same rule a tile argument is held to: an item's output must sit where
-/// that item writes it (`assert_prior_item_output_coordinates`), and an entry
-/// argument comes from the authorized entry object at `[]`. `main` has no
-/// caller, so a sequence-scope binding cannot occur, and an inline value
+/// The object is held by the rule a tile argument is held to: an item's output
+/// must sit where that item writes it (`assert_prior_item_output_coordinates`),
+/// and an entry argument comes from the authorized entry object at `[]`. `main`
+/// has no caller, so a sequence-scope binding cannot occur, and an inline value
 /// cannot be a program output. A data-sourced index is refused: `ProgramEnd`
-/// carries no index citation to hold it to, and the CFS builder does not
-/// record such a return.
+/// carries no index citation to hold it to, and the CFS builder does not record
+/// such a return.
+///
+/// The part is held on `selection.path` — the path the selection proof is
+/// pinned to (`verify_selection_witness`) — not on `selector`, which no proof
+/// constrains. Exactly, for a tile's output or an entry argument, whose
+/// selector the program composes in full. As a suffix, for a sequence's
+/// output: the leading segments are whatever the nested sequence selected, and
+/// the CFS does not record a nested sequence's return yet.
 fn verify_program_output_source(
     cfs_cursor: &CfsCursor,
-    returns: &InputBinding,
-    output_coordinates: &CfsCoordinates,
+    returns: &SequenceReturn,
+    output: &StorageData,
 ) {
+    let source = &returns.source;
+    let selected_path = output.selection.path.segments.as_slice();
     assert!(
-        returns.index_bindings().is_empty(),
+        source.index_bindings().is_empty(),
         "main returns a value selected by a data-sourced index, which ProgramEnd cannot verify",
     );
-    match returns.value_binding() {
-        InputBinding::EntryArgument => assert!(
-            output_coordinates.is_empty(),
-            "Program output bound to an entry argument must come from the entry object at []",
-        ),
+    match source.value_binding() {
+        InputBinding::EntryArgument => {
+            assert!(
+                output.coordinates.is_empty(),
+                "Program output bound to an entry argument must come from the entry object at []",
+            );
+            assert_eq!(
+                selected_path,
+                returns.path.as_slice(),
+                "Program output selects a different part of the entry object than main returns",
+            );
+        }
         InputBinding::PriorItemOutput {
             intra_sequence_item_index,
         } => {
@@ -346,8 +370,27 @@ fn verify_program_output_source(
                 cfs_cursor,
                 &entrypoint_coordinates(),
                 source_coordinate,
-                output_coordinates,
+                &output.coordinates,
             );
+            let mut source_coordinates = entrypoint_coordinates();
+            source_coordinates.push(source_coordinate);
+            match cfs_cursor.try_get_item(&source_coordinates) {
+                Some(SequenceChildItem::Tile(_) | SequenceChildItem::RecurTile(_)) => {
+                    assert_eq!(
+                        selected_path,
+                        returns.path.as_slice(),
+                        "Program output selects a different part of the object than main returns",
+                    );
+                }
+                Some(SequenceChildItem::Sequence(_) | SequenceChildItem::RecurSequence(_)) => {
+                    assert!(
+                        selected_path.ends_with(&returns.path),
+                        "Program output selects a different part of the sequence's result than \
+                         main returns",
+                    );
+                }
+                None => panic!("main's returned item does not resolve in the CFS"),
+            }
         }
         other => panic!(
             "main's returned value is bound as {:?}, which cannot name a program output",

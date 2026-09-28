@@ -9,6 +9,7 @@ use syn::{
 };
 use walkdir::WalkDir;
 
+use raster_core::input::SelectorSegment;
 use raster_core::Result;
 
 #[derive(Debug, Clone)]
@@ -71,8 +72,14 @@ pub enum ReturnExpr {
     /// returns that call's result: the output of the last step.
     TailCall,
     /// The body returns a value rooted at a name — a binding, `select!(T,
-    /// x.f)`, `clone!(x)` — optionally wrapped in `Ok(..)` or `..?`.
-    Rooted { root: String },
+    /// x.f)`, `clone!(x)` — optionally wrapped in `Ok(..)` or `..?`. `path` is
+    /// the returned expression's own static selector path (`[f]` for
+    /// `select!(T, x.f)`, empty for a bare binding); the resolver prefixes the
+    /// paths of `root`'s alias chain.
+    Rooted {
+        root: String,
+        path: Vec<SelectorSegment>,
+    },
     /// A returned expression the CFS cannot bind: a literal, a computed
     /// value, a plain function call such as `finalize(draft)`, or a `select!`
     /// with a data-sourced index. Kept as source text for the diagnostic.
@@ -129,6 +136,12 @@ pub struct FunctionAstItem {
     /// order. Empty for every literal-index selection, which is why programs
     /// that do not use the feature are unaffected.
     pub selection_index_sources: Vec<(String, Vec<String>)>,
+    /// `let name = select!(T, root.path)` locals, as `(name, path)` — the
+    /// static selector path each selection appends to its root's selector,
+    /// in selector order. `clone!`/`into_ref!`/`.clone()` aliases append
+    /// nothing, so they record an empty path. A selection with a
+    /// data-sourced index records none.
+    pub selection_paths: Vec<(String, Vec<SelectorSegment>)>,
     /// The body's returned expression, classified. `None` when the body ends
     /// in a statement (a unit return).
     pub return_expr: Option<ReturnExpr>,
@@ -222,6 +235,7 @@ impl ProjectAst {
                 let call_infos = visitor.get_call_infos();
                 let selection_aliases = visitor.get_selection_aliases();
                 let selection_index_sources = visitor.get_selection_index_sources();
+                let selection_paths = visitor.get_selection_paths();
                 let return_expr = CallVisitor::classify_return(&func.block);
                 let function_info = FunctionAstItem {
                     name,
@@ -234,6 +248,7 @@ impl ProjectAst {
                     signature,
                     selection_aliases,
                     selection_index_sources,
+                    selection_paths,
                     return_expr,
                 };
                 functions.push(function_info);
@@ -329,6 +344,9 @@ pub struct CallVisitor {
     selection_aliases: Vec<(String, String)>,
     /// Per selection local, the names supplying its data-sourced indexes.
     selection_index_sources: Vec<(String, Vec<String>)>,
+    /// Per alias local, the static selector path it appends (see
+    /// `FunctionAstItem::selection_paths`).
+    selection_paths: Vec<(String, Vec<SelectorSegment>)>,
 }
 
 impl CallVisitor {
@@ -338,6 +356,7 @@ impl CallVisitor {
             current_binding: None,
             selection_aliases: Vec::new(),
             selection_index_sources: Vec::new(),
+            selection_paths: Vec::new(),
         }
     }
 
@@ -351,6 +370,10 @@ impl CallVisitor {
 
     fn get_selection_index_sources(&self) -> Vec<(String, Vec<String>)> {
         self.selection_index_sources.clone()
+    }
+
+    fn get_selection_paths(&self) -> Vec<(String, Vec<SelectorSegment>)> {
+        self.selection_paths.clone()
     }
 
     /// Extracts the binding name from a pattern (e.g., `x` from `let x = ...`)
@@ -392,23 +415,110 @@ impl CallVisitor {
             Expr::Macro(expr_macro) if Self::macro_call_kind(&expr_macro.mac).is_some() => {
                 ReturnExpr::TailCall
             }
-            // A selection whose index is data-sourced cites that index as a
-            // separate binding; a program output has nowhere to carry the
-            // citation, so it is not bound rather than bound loosely.
-            Expr::Macro(expr_macro)
-                if Self::is_selection_macro(&expr_macro.mac)
-                    && !Self::selection_macro_index_roots(&expr_macro.mac).is_empty() =>
-            {
-                ReturnExpr::Unbound {
-                    expr: Self::expr_to_string(expr),
+            // A selection: its root, and the static path it appends. One with
+            // a data-sourced index has no static path — the index is cited as
+            // a separate binding a program output has nowhere to carry — so it
+            // is not bound rather than bound loosely.
+            Expr::Macro(expr_macro) if Self::is_selection_macro(&expr_macro.mac) => {
+                match (
+                    Self::selection_macro_root(&expr_macro.mac),
+                    Self::selection_macro_path(&expr_macro.mac),
+                ) {
+                    (Some(root), Some(path)) => ReturnExpr::Rooted { root, path },
+                    _ => ReturnExpr::Unbound {
+                        expr: Self::expr_to_string(expr),
+                    },
                 }
             }
-            _ => match Self::expr_root_ident(expr) {
-                Some(root) => ReturnExpr::Rooted { root },
-                None => ReturnExpr::Unbound {
-                    expr: Self::expr_to_string(expr),
-                },
+            // Views that append nothing to the selector.
+            Expr::Macro(expr_macro) if Self::is_reference_macro(&expr_macro.mac) => {
+                match Self::reference_macro_root(&expr_macro.mac) {
+                    Some(root) => ReturnExpr::Rooted {
+                        root,
+                        path: Vec::new(),
+                    },
+                    None => ReturnExpr::Unbound {
+                        expr: Self::expr_to_string(expr),
+                    },
+                }
+            }
+            Expr::MethodCall(call) if call.method == "clone" && call.args.is_empty() => {
+                match Self::expr_root_ident(&call.receiver) {
+                    Some(root) => ReturnExpr::Rooted {
+                        root,
+                        path: Vec::new(),
+                    },
+                    None => ReturnExpr::Unbound {
+                        expr: Self::expr_to_string(expr),
+                    },
+                }
+            }
+            Expr::Path(path) if path.path.get_ident().is_some() => ReturnExpr::Rooted {
+                root: path.path.get_ident().expect("checked above").to_string(),
+                path: Vec::new(),
             },
+            // Anything else — including a raw `x.f` or `x[0]`, which would
+            // narrow without saying so — is not bound: returning it with an
+            // empty path would claim the whole of `x`.
+            _ => ReturnExpr::Unbound {
+                expr: Self::expr_to_string(expr),
+            },
+        }
+    }
+
+    /// The static selector path a `select!(T, root.path)` appends, lowered the
+    /// way the `select!` macro lowers it (`split_selector_expr` in
+    /// `raster-macros`): a named field to `Field`, a tuple field or an integer
+    /// literal index to `Index`, a literal `start..end` to `Range`. `None` for
+    /// a data-sourced index (a bare binding), which is cited at run time rather
+    /// than fixed by the program, and for anything the macro rejects.
+    fn selection_macro_path(mac: &syn::Macro) -> Option<Vec<SelectorSegment>> {
+        let args = mac.parse_body_with(SelectionMacroArgs::parse).ok()?;
+        let mut path = Vec::new();
+        Self::collect_static_path(&args.expr, &mut path)?;
+        Some(path)
+    }
+
+    fn collect_static_path(expr: &Expr, path: &mut Vec<SelectorSegment>) -> Option<()> {
+        match expr {
+            Expr::Field(field) => {
+                Self::collect_static_path(&field.base, path)?;
+                path.push(match &field.member {
+                    syn::Member::Named(ident) => SelectorSegment::Field(ident.to_string()),
+                    syn::Member::Unnamed(index) => SelectorSegment::Index(u64::from(index.index)),
+                });
+                Some(())
+            }
+            Expr::Index(index) => {
+                Self::collect_static_path(&index.expr, path)?;
+                match index.index.as_ref() {
+                    Expr::Lit(ExprLit {
+                        lit: Lit::Int(value),
+                        ..
+                    }) => path.push(SelectorSegment::Index(value.base10_parse().ok()?)),
+                    Expr::Range(range) => {
+                        let bound = |expr: &Option<Box<Expr>>| match expr.as_deref() {
+                            Some(Expr::Lit(ExprLit {
+                                lit: Lit::Int(value),
+                                ..
+                            })) => value.base10_parse::<u64>().ok(),
+                            _ => None,
+                        };
+                        if !matches!(range.limits, syn::RangeLimits::HalfOpen(_)) {
+                            return None;
+                        }
+                        path.push(SelectorSegment::Range {
+                            start: bound(&range.start)?,
+                            end: bound(&range.end)?,
+                        });
+                    }
+                    _ => return None,
+                }
+                Some(())
+            }
+            // The selection's base — the root binding, possibly `x.clone()` —
+            // contributes no segments, as in the macro.
+            _ => Some(()),
         }
     }
 
@@ -891,6 +1001,9 @@ impl<'ast> Visit<'ast> for CallVisitor {
                     if let Some(root) = Self::selection_macro_root(&expr_macro.mac) {
                         self.selection_aliases.push((name.clone(), root));
                     }
+                    if let Some(path) = Self::selection_macro_path(&expr_macro.mac) {
+                        self.selection_paths.push((name.clone(), path));
+                    }
                     let index_roots = Self::selection_macro_index_roots(&expr_macro.mac);
                     if !index_roots.is_empty() {
                         self.selection_index_sources
@@ -899,6 +1012,7 @@ impl<'ast> Visit<'ast> for CallVisitor {
                 } else if Self::is_reference_macro(&expr_macro.mac) {
                     if let Some(root) = Self::reference_macro_root(&expr_macro.mac) {
                         self.selection_aliases.push((name.clone(), root));
+                        self.selection_paths.push((name.clone(), Vec::new()));
                     }
                 }
             // A bare `binding.clone()` is the pre-DSL spelling of `clone!`. It
@@ -912,6 +1026,7 @@ impl<'ast> Visit<'ast> for CallVisitor {
                 if call.method == "clone" {
                     if let Some(root) = Self::expr_root_ident(&call.receiver) {
                         self.selection_aliases.push((name.clone(), root));
+                        self.selection_paths.push((name.clone(), Vec::new()));
                     }
                 }
             }
@@ -1024,9 +1139,18 @@ mod tests {
     }
 
     fn rooted_return(root: &str) -> Option<ReturnExpr> {
+        rooted_return_at(root, vec![])
+    }
+
+    fn rooted_return_at(root: &str, path: Vec<SelectorSegment>) -> Option<ReturnExpr> {
         Some(ReturnExpr::Rooted {
             root: root.to_string(),
+            path,
         })
+    }
+
+    fn field(name: &str) -> SelectorSegment {
+        SelectorSegment::Field(name.to_string())
     }
 
     /// Every form a value-returning `main` ends with in `examples/` and
@@ -1051,6 +1175,34 @@ mod tests {
         );
         assert_eq!(
             classify_return_of("fn main() -> u64 { let s = call!(f, b); select!(u64, s.count) }"),
+            rooted_return_at("s", vec![field("count")])
+        );
+        // The path is lowered as the `select!` macro lowers it.
+        assert_eq!(
+            classify_return_of(
+                "fn main() -> u64 { let s = call!(f, b); select!(u64, s.rows[2].cells.0) }"
+            ),
+            rooted_return_at(
+                "s",
+                vec![
+                    field("rows"),
+                    SelectorSegment::Index(2),
+                    field("cells"),
+                    SelectorSegment::Index(0)
+                ]
+            )
+        );
+        assert_eq!(
+            classify_return_of("fn main() -> X { let s = call!(f, b); select!(X, s.rows[1..3]) }"),
+            rooted_return_at("s", vec![field("rows"), SelectorSegment::Range { start: 1, end: 3 }])
+        );
+        // A `.clone()` base contributes nothing, as in the macro.
+        assert_eq!(
+            classify_return_of("fn main() -> u32 { let s = call!(f, b); select!(u32, s.clone().count) }"),
+            rooted_return_at("s", vec![field("count")])
+        );
+        assert_eq!(
+            classify_return_of("fn main() -> X { let s = call!(f, b); clone!(s) }"),
             rooted_return("s")
         );
         assert_eq!(
@@ -1074,8 +1226,35 @@ mod tests {
             classify_return_of("fn main() -> u64 { let s = call!(f, b); select!(u64, s.rows[i]) }"),
             Some(ReturnExpr::Unbound { .. })
         ));
+        // A raw field access would narrow without a path: not bound, rather
+        // than bound to the whole object.
+        assert!(matches!(
+            classify_return_of("fn main() -> u64 { let s = call!(f, b); s.count }"),
+            Some(ReturnExpr::Unbound { .. })
+        ));
         // A unit body returns nothing to bind.
         assert_eq!(classify_return_of("fn main() { call!(f, b); }"), None);
+    }
+
+    #[test]
+    fn selection_aliases_record_their_static_paths() {
+        let file: syn::File = syn::parse_str(
+            "fn seq() { let s = call!(f, b); let w = select!(W, s.window); \
+             let m = select!(u64, w.max); let c = clone!(m); \
+             let r = select!(u64, s.rows[i]); }",
+        )
+        .expect("parse");
+        let mut visitor = CallVisitor::new();
+        visitor.visit_file(&file);
+        assert_eq!(
+            visitor.get_selection_paths(),
+            vec![
+                ("w".to_string(), vec![field("window")]),
+                ("m".to_string(), vec![field("max")]),
+                ("c".to_string(), vec![]),
+                // `r`'s index is data-sourced: no static path is recorded.
+            ]
+        );
     }
 
     #[test]

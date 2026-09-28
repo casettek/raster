@@ -1,8 +1,12 @@
 # Issue: `program-output-unbound` — a sequence's returned value is not bound to its body, and `main`'s output can be any stored object
 
-Status: open 2026-09-28. **Soundness gap in shipped code.** Direction picked, not implemented:
+Status: open 2026-09-28. **Soundness gap in shipped code — partly fixed** (2026-09-28): `ProgramEnd`
+is held to the object `main` returns (`5e0bf83`) and to the part of it (the selector fix that
+followed, which also closed a zero-length-selection bypass). A nested sequence's return and the
+object's own integrity are still open (§What is fixed, and what remains).
+Direction picked:
 [`incremental-draft-materialization`](../proposals/incremental-draft-materialization.md) §Sequence
-return binding (decision D5c), with the `ProgramEnd` half to land first as a standalone fix.
+return binding (decision D5c).
 
 Related:
 - [`program-end.md`](../proposals/program-end.md) (implemented) — §7 argues a forged output
@@ -12,6 +16,11 @@ Related:
 - [`selection-unbound-from-execution`](./selection-unbound-from-execution.md) — adjacent, not the
   same. That issue is about the bytes a tile ran on versus the bytes its selection proves. This
   one is about *which object* a reference names at all.
+- [`tile-output-commitment-unbound`](./tile-output-commitment-unbound.md) — what the fix here
+  rests on. Pinning `ProgramEnd` to the coordinate a tile wrote pins whatever was *written* there;
+  that issue is that nothing ties a tile's write to its replayed output.
+- [`recur-carried-state-unbound`](./recur-carried-state-unbound.md) — the inline-state half of this
+  gap, and the reason a recur site's stored result is not yet trustworthy as a program output.
 - [`sequence-grammar-closure`](../proposals/sequence-grammar-closure.md) — the grammar rule that
   makes the fix single-valued: a sequence's only return form is *"last expression = a binding or
   call result"*, and control flow is forbidden in sequence bodies
@@ -113,11 +122,95 @@ A recur sequence's carried state is the same gap in inline form; that half is fi
 - Not `trace-leaf-field-binding`: `ProgramEnd.output` is bound into the leaf and checked for
   internal consistency; what is missing is a check against the program.
 
+## What is fixed, and what remains
+
+**Fixed in `5e0bf83`: `ProgramEnd` names the object `main` returns.**
+
+- *Build.* `raster-compiler` classifies `main`'s returned expression (`CallVisitor::classify_return`:
+  the last value statement or a final `return`, looking through `Ok(..)`, `..?` and parentheses)
+  and resolves it like an argument (`FlowResolver::resolve_return`): a tail call to the last item's
+  output, a binding to its producing item or entry argument. The result is recorded as
+  `SequenceDef.returns` for `main` only.
+- *Guest.* `verify_program_end` requires `returns` (a missing one **fails closed**) and holds the
+  output's coordinates to it (`verify_program_output_source`) with the same helper tile arguments
+  use (`assert_prior_item_output_coordinates`): **equal** to `[j]` for a tile or recur tile,
+  **inside** `[j]` for a sequence, `[]` for an entry argument; a data-sourced index is refused.
+
+**Fixed after it (2026-09-28): the part of the object, and a proof bypass.**
+
+- *The selector.* `returns` is now `SequenceReturn { source, path }`. The compiler records each
+  `select!` alias's static path (`FunctionAstItem::selection_paths`, lowered as the `select!` macro
+  lowers it) and composes the path along the returned binding's alias chain
+  (`FlowResolver::compose_alias_path`) — the selector the runtime builds by appending each
+  `select!`'s segments to its base's. An entry argument's path starts with the argument's name,
+  as the runtime binds it (`entry_argument_auth_ref`). A returned `x.f` or `x[0]` written without
+  `select!` is now *not* bound, rather than bound as the whole of `x`. The guest compares the path
+  with `output.selection.path` — the path the selection proof is pinned to — not with `selector`,
+  which no proof constrains: **exactly** for a tile's output or an entry argument, as a **suffix**
+  for a sequence's output (the leading segments are the nested sequence's own selection).
+- *A zero-length selection skipped its proof* (found while fixing the selector). A postcard-only
+  object reports "no raster view" as an all-zero selection with `selected_len: 0`
+  (`OwnedObject::resolve_whole`), and `verify_program_end` verified the selection proof only when
+  `selected_len > 0`. So a `ProgramEnd` could claim `selected_len: 0`, keep `source_root_hash`
+  equal to the object's commitment, and name any `selected_hash` as the program's output — the old
+  test fixture did exactly that. The proof is now required unconditionally; an honest output is
+  raster-encoded, and every raster payload has at least its tag byte. Step inputs have the same
+  skip (`checks/store.rs:224`); it belongs to
+  [`selection-unbound-from-execution`](./selection-unbound-from-execution.md) and is not changed
+  here.
+
+*Tests.* The guest's `program_end` module builds a real raster object (`Stats { count, sum, max }`)
+and genuine selection proofs: the `[7]` probe inverted, an intermediate object, another field, the
+whole object for a field return, the zero-length bypass, another entry argument, and a nested
+return with the wrong field are rejected; field, whole-object and entry-argument outputs are
+accepted. `raster-compiler` tests the path lowering, alias composition and the entry-argument
+prefix.
+
+**In practice.** A `cfs` pass over all 15 programs (`examples/` and `raster-inference`) binds 12
+returns, and every one is a whole object (`path: []`) — no program returns a field. The field-level
+cases are exercised by the tests only.
+
+**Remaining gaps.**
+
+1. **A nested-sequence return is held only to "inside `[j]`"**, and its path only as a suffix.
+   `main` returning a `call_seq!` result may name any object that sequence wrote — `hello-tiles`,
+   `input-embedding`, `prefill-prepare-aux`, `prefill-range` and `prompt-prepare` have this shape.
+   Pinned by `a_nested_sequence_return_is_held_only_to_its_scope`. Closes with `SequenceEnd`
+   recording its returned binding (D5c's second half).
+2. **The object is only as good as its write.** A forged write at the right coordinate still
+   verifies as the output: [`tile-output-commitment-unbound`](./tile-output-commitment-unbound.md).
+3. **A recur site's result** is pinned exactly at `[s]`, but a site's stored result is not yet tied
+   to its computation: the draft close check (`incremental-draft-materialization`) and
+   [`recur-carried-state-unbound`](./recur-carried-state-unbound.md).
+
+**Effects on existing programs.**
+
+- **Programs returning `finalize(draft)` fail closed** at `ProgramEnd`: `finalize(d)` is a plain
+  call, so the return cannot be bound, and the build prints a warning saying so. Confirmed by the
+  `cfs` pass: `examples/chain-example/phase3-report`, and `raster-inference`'s `decode-init` and
+  `decode-select-token` — exactly these three. `phase3-report` already fails earlier on the
+  authenticated path ([`authenticated-chain-draft-output`](./authenticated-chain-draft-output.md)),
+  and `finalize` leaves the language under `incremental-draft-materialization`. A build *warning*
+  rather than the error the proposal specifies, so these programs still build and run
+  unauthenticated.
+- **Every program's identity moved, twice** — once per change to `returns`. The CFS is
+  postcard-encoded into `program_commitment` (`ProgramDefinition::canonical_bytes`), and postcard is
+  not self-describing, so a new or reshaped field changes every program's bytes;
+  `#[serde(default)]` does not help. An existing `program.bin` will not decode. The 6 tracked
+  `Raster.lock` files in this repository are regenerated from from-scratch guest builds and pass
+  `cargo raster program --verify`; the 9 in `raster-inference` are not. Regenerating exposed a
+  separate problem: the tile guest build cache is keyed on the tile's source file and a build
+  recipe, not on `raster-core` or `raster` — which every guest links, and whose changes do alter
+  guest ELFs (guest builds are reproducible; `collect_line_chunk`'s image id moved with each of
+  these changes) — so the cache served stale ELFs. Against the committed locks, 14 of the 29 tile
+  image ids changed.
+
 ## Directions
 
-Picked, in `incremental-draft-materialization` §Sequence return binding: the CFS records
-`SequenceDef.returns: Option<InputBinding>`, resolved from the body's returned expression by the
-same resolution as arguments, with an unresolvable return a build error. `SequenceEnd` records its
-returned value as a binding, as `ProgramEnd` already does; the guest checks both against `returns`;
-a consumer of a sequence item cites exactly the returned binding. `ProgramEnd` first: `main`'s
-`returns` and one check in `verify_program_end`, with the probe above inverted as its test.
+Picked, in `incremental-draft-materialization` §Sequence return binding: the CFS records each
+sequence's return — its source binding **and its selector path** — resolved from the body's
+returned expression by the same resolution as arguments. `SequenceEnd` records its returned value
+as a binding, as `ProgramEnd` already does; the guest checks both against `returns`, source and
+path; a consumer of a sequence item cites exactly the returned binding. `main`'s half — source and
+path — is in place; what remains is the nested half (gap 1) and the producers' own bindings
+(gaps 2 and 3).

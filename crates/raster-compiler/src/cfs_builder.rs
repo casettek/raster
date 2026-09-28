@@ -3,7 +3,7 @@
 //! This module orchestrates the generation of a CFS from a Raster project
 //! by combining tile discovery, sequence discovery, and data flow resolution.
 
-use raster_core::cfs::{ControlFlowSchema, InputBinding, SequenceDef, TileDef};
+use raster_core::cfs::{ControlFlowSchema, InputBinding, SequenceDef, SequenceReturn, TileDef};
 
 use crate::flow_resolver::FlowResolver;
 use crate::sequence::{Sequence, SequenceDiscovery};
@@ -138,7 +138,7 @@ fn main_returns(
     seq: &Sequence<'_>,
     produces_output: bool,
     item_count: usize,
-) -> Option<InputBinding> {
+) -> Option<SequenceReturn> {
     if !produces_output {
         return None;
     }
@@ -150,8 +150,8 @@ fn main_returns(
     if returns.is_none() {
         let form = match &seq.function.return_expr {
             Some(crate::ast::ReturnExpr::Unbound { expr }) => format!("`{expr}`"),
-            Some(crate::ast::ReturnExpr::Rooted { root }) => {
-                format!("`{root}`, which has no upstream step")
+            Some(crate::ast::ReturnExpr::Rooted { root, .. }) => {
+                format!("`{root}` (a name no step produced)")
             }
             Some(crate::ast::ReturnExpr::TailCall) => "its final call".to_string(),
             None => "no returned expression".to_string(),
@@ -261,6 +261,7 @@ mod tests {
             signature: format!("fn {}()", name),
             selection_aliases: vec![],
             selection_index_sources: vec![],
+            selection_paths: vec![],
             return_expr: None,
         }
     }
@@ -286,6 +287,7 @@ mod tests {
             signature: "fn main()".to_string(),
             selection_aliases: vec![],
             selection_index_sources: vec![],
+            selection_paths: vec![],
             return_expr: None,
         }
     }

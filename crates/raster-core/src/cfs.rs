@@ -12,6 +12,8 @@ use alloc::vec::Vec;
 use core::ops::{Deref, DerefMut};
 use serde::{Deserialize, Serialize};
 
+use crate::input::SelectorSegment;
+
 /// One step of a CFS position.
 ///
 /// Signed so a scope's **closing** step can occupy a coordinate distinct from
@@ -184,9 +186,9 @@ impl CfsCursor {
             .unwrap_or(false)
     }
 
-    /// The binding of the value `main` returns (`SequenceDef::returns`), if
-    /// the CFS could resolve one.
-    pub fn main_returns(&self) -> Option<&InputBinding> {
+    /// What `main` returns (`SequenceDef::returns`), if the CFS could resolve
+    /// it.
+    pub fn main_returns(&self) -> Option<&SequenceReturn> {
         self.cfs
             .sequences
             .get(self.entrypoint_coordinate as usize)
@@ -704,19 +706,34 @@ pub struct SequenceDef {
     /// Always `false` for sequences other than `main`.
     #[serde(default)]
     pub produces_output: bool,
-    /// The value `main` returns, resolved like a step argument: which item's
-    /// output (or which entry argument) the program's output is.
+    /// The value `main` returns: which item's output (or which entry
+    /// argument) the program's output is, and which part of it.
     ///
     /// Without it the guest can check that a `ProgramEnd` names *some* stored
-    /// object, not that it names the one `main` returns — any intermediate
-    /// object would verify as the program's output. `None` for a unit `main`,
-    /// for every other sequence (their returns are not bound yet), and for a
-    /// `main` whose returned expression the CFS cannot bind (a finalized
-    /// draft, a computed value); the guest then refuses the `ProgramEnd`
-    /// rather than accept an unchecked output. See
+    /// value, not the one `main` returns — any intermediate object, or any
+    /// field of the right one, would verify as the program's output. `None`
+    /// for a unit `main`, for every other sequence (their returns are not bound
+    /// yet), and for a `main` whose returned expression the CFS cannot bind (a
+    /// finalized draft, a computed value); the guest then refuses the
+    /// `ProgramEnd` rather than accept an unchecked output. See
     /// `docs/issues/program-output-unbound.md`.
     #[serde(default)]
-    pub returns: Option<InputBinding>,
+    pub returns: Option<SequenceReturn>,
+}
+
+/// What a sequence returns: where the value comes from, and the path into it.
+///
+/// `source` is resolved like a step argument. `path` is the selector the
+/// returned value is read through, composed the way the runtime composes it:
+/// every `select!` along the returned binding's alias chain appends its
+/// segments, and an entry argument's path starts with the argument's name,
+/// because all of `main`'s arguments live in one entry object at `[]`. Only
+/// static segments (`Field`, `Index`, `Range`) occur — a data-sourced index
+/// would need its citation carried alongside, so such a return is not bound.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SequenceReturn {
+    pub source: InputBinding,
+    pub path: Vec<SelectorSegment>,
 }
 
 impl SequenceDef {

@@ -723,14 +723,21 @@ consistent with itself but not with what the body computed.
 
 **The design.**
 
-- **The CFS records each sequence's return**: `SequenceDef.returns: Option<InputBinding>`,
-  resolved from the body's returned expression by the same `resolve_argument` used for arguments —
-  a prior item's output, a sequence parameter, an entry argument — with `select!` paths and index
-  citations. `produces_output` becomes `returns.is_some()` for `main`. The grammar makes this a
+- **The CFS records each sequence's return — its source and its selector path**, resolved from
+  the body's returned expression by the same `resolve_argument` used for arguments: a prior item's
+  output, a sequence parameter, an entry argument. The source alone is not enough. An
+  `InputBinding` carries no path — the CFS binds provenance, not shape — so a return recorded as a
+  bare `InputBinding` pins *which object* and leaves *which part of it* free: for `main` ending in
+  `select!(u64, stats.count)`, a `ProgramEnd` selecting `stats.sum` would verify. The return
+  therefore records the `select!` path as well (static by the grammar; a data-sourced index is
+  refused, having nowhere to carry its citation), and the guest compares it with the recorded
+  selector. `produces_output` becomes `returns.is_some()` for `main`. The grammar makes this a
   single binding: the only return form is *"last expression = a binding or call result"*, and
   control flow is forbidden in sequence bodies (`.claude/skills/raster/SKILL.md`, the sequence
   grammar table). A returned expression the resolver cannot resolve is a **build error**, never
-  `Inline` — `sequence-grammar-closure`'s rule applied to returns.
+  `Inline` — `sequence-grammar-closure`'s rule applied to returns. (Until `finalize` leaves the
+  language, `5e0bf83` makes it a build *warning* for `main` instead, so a program returning
+  `finalize(draft)` still builds and runs unauthenticated; its `ProgramEnd` fails closed.)
 - **`SequenceEnd` records its returned value as a binding**, as `ProgramEnd` already does:
   `output: Option<StorageData>`, with `output_commitment = selected_hash`.
 - **The guest checks `SequenceEnd` and `ProgramEnd` against `returns`** with the machinery it
@@ -749,6 +756,20 @@ consistent with itself but not with what the body computed.
 `verify_program_end`. It is a soundness gap in shipped code and the smallest piece, like D1's
 replay assertion. Nested sequences and consumers follow with the step-kind change, since
 `SequenceEnd` moves to `[-s]` in the same break.
+
+**Implemented so far — 2026-09-28: `main`'s return, source and path.** `SequenceDef.returns` is
+`SequenceReturn { source, path }` for `main` (`5e0bf83` added the source, the selector fix the
+path); `verify_program_end` requires it, holds `ProgramEnd`'s coordinates to the source (equal for
+a tile, inside for a sequence, `[]` for an entry argument) and its proven `selection.path` to the
+path (exact, or a suffix for a sequence). The selector fix also made the selection proof
+unconditional: a zero-length selection used to skip it, leaving the output commitment free. Not
+yet: nested sequences' returns, so `main` returning a `call_seq!` result is held only to "inside
+`[j]`" and its path only as a suffix; and every consumer of a sequence item, whose argument
+bindings carry no path either. The check also pins only *where* the output was written, which is as good as the
+write itself — [`tile-output-commitment-unbound`](../issues/tile-output-commitment-unbound.md).
+Side effects: every program's `program_commitment` moved (the CFS is postcard-encoded, so a new
+field changes every program's bytes), and the tracked `Raster.lock` files are stale until
+regenerated. Details in [`program-output-unbound`](../issues/program-output-unbound.md).
 
 ### Draft and carried state are different things
 
@@ -1642,8 +1663,10 @@ Closed:
     returns publish no output; seeding tiles become values; a nested recur tile appending to the
     outer draft is a non-goal.
   - ~~**D5c. Binding a sequence's returned value to its body.**~~ **Decided 2026-09-28** — §Sequence
-    return binding: the CFS records `SequenceDef.returns`; `SequenceEnd` and `ProgramEnd` are
-    checked against it; consumers cite exactly the returned binding; `ProgramEnd` first. As found:
+    return binding: the CFS records each sequence's return, source and selector path;
+    `SequenceEnd` and `ProgramEnd` are checked against it; consumers cite exactly the returned
+    binding; `ProgramEnd` first. **Partly implemented** — `main`'s source (`5e0bf83`) and path;
+    nested returns and consumers remain. As found:
     2026-09-28, and broader than recur sequences. `SequenceDef` has no return binding — only
     `main`'s `produces_output` flag — and the flow resolver resolves call *arguments*
     (`resolve_argument`) but never a body's returned expression. Three consequences:
@@ -1809,7 +1832,10 @@ zero-iteration site was not probed.
   site whose seed is a stored object opens its frame from that binding, and an iteration 0
   reporting a different `state_in` is rejected.
 - Return binding: a `ProgramEnd` citing any object other than the one `main` returns is rejected
-  (the measured probe, inverted); a consumer citing A at `[2,1]` where the sequence returns B at
+  (the measured probe, inverted — **in place since `5e0bf83`**, with the intermediate-object case);
+  a `ProgramEnd` citing the right object under a different selector (`stats.sum` where `main`
+  returns `select!(u64, stats.count)`, or the whole `stats`) is rejected, as is a zero-length
+  selection claiming an output with no proof — **both in place**, with genuine proofs; a consumer citing A at `[2,1]` where the sequence returns B at
   `[2,2]` is rejected; a re-return through two sequences resolves to the original coordinate; a
   recur sequence iteration whose recorded state is not its body tile's output is rejected; a
   sequence whose returned expression the resolver cannot resolve fails to build.
