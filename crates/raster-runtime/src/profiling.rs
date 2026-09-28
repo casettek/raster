@@ -879,7 +879,7 @@ mod tests {
         begin_sequence_profile("main");
         record_tile_profile(
             "tile_a",
-            CfsCoordinates(vec![0]),
+            CfsCoordinates(vec![1]),
             30,
             20,
             TileProfileOverheadBreakdown::default(),
@@ -887,7 +887,7 @@ mod tests {
         begin_sequence_profile("nested");
         record_tile_profile(
             "tile_b",
-            CfsCoordinates(vec![1, 0]),
+            CfsCoordinates(vec![2, 1]),
             10,
             7,
             TileProfileOverheadBreakdown::default(),
@@ -930,7 +930,7 @@ mod tests {
         begin_sequence_profile("main");
         record_tile_profile(
             "tile_a",
-            CfsCoordinates(vec![0]),
+            CfsCoordinates(vec![1]),
             30,
             20,
             TileProfileOverheadBreakdown {

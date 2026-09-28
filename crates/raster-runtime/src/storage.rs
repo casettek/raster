@@ -513,7 +513,8 @@ impl ObjectStore {
     }
 
     /// Loads an authorized set of named sources as one storage object. Today
-    /// this is called only for `main`'s entrypoint binding at coordinate `[0]`.
+    /// this is called only for `main`'s entrypoint binding, at the sequence
+    /// root `[]` that `ProgramStart` binds.
     pub(crate) fn load_authorized_sources(
         &mut self,
         load: AuthorizedSourceLoad,
@@ -843,7 +844,8 @@ impl AuthenticatedObjectStore {
     }
 
     /// Loads an authorized set of named sources as one storage object. Today
-    /// this is called only for `main`'s entrypoint binding at coordinate `[0]`.
+    /// this is called only for `main`'s entrypoint binding, at the sequence
+    /// root `[]` that `ProgramStart` binds.
     pub(crate) fn load_authorized_sources(
         &mut self,
         load: AuthorizedSourceLoad,
@@ -1865,7 +1867,7 @@ mod tests {
         let mut manager = AuthenticatedObjectStore::new();
         let alpha_commitment = vec![1; 32];
         let beta_commitment = vec![2; 32];
-        let coordinates = CfsCoordinates(vec![0]);
+        let coordinates = CfsCoordinates(vec![]);
 
         let write = manager.load_authorized_sources(
             AuthorizedSourceLoad {

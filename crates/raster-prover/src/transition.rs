@@ -303,7 +303,9 @@ mod tests {
     use crate::authorization::authorize_external_inputs;
     use crate::precomputed::EMPTY_TRIE_NODES;
     use raster_core::authorization::{AuthorizationJournal, ManifestedInputs};
-    use raster_core::cfs::{CfsCoordinate, CfsCoordinates, ControlFlowSchema, SequenceDef};
+    use raster_core::cfs::{
+        CfsCoordinate, CfsCoordinates, ControlFlowSchema, SequenceDef, FIRST_COORDINATE,
+    };
     use raster_core::coordinate_index::coordinate_index_root;
     use raster_core::draft::TileReplayJournal;
     use raster_core::fingerprint::{BitPacker, Fingerprint};
@@ -335,7 +337,7 @@ mod tests {
             coordinates: CfsCoordinates(coordinates),
             kind: StepKind::Exec(ExecStep {
                 target: ExecTarget::Tile("shared_tile".to_string()),
-                intra_sequence_index: 0,
+                intra_sequence_index: FIRST_COORDINATE,
                 input_commitment: vec![exec_index as u8],
                 input_source_commitment: Vec::new(),
                 output_commitment: vec![exec_index as u8 + 1],

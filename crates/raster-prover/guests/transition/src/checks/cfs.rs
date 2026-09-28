@@ -594,6 +594,46 @@ pub fn verify_sequence_scope_parent(
     );
 }
 
+/// Hold a stored value's coordinates to the item that produced it.
+///
+/// `source_coordinate` is the producing item's 1-based position in the
+/// sequence at `parent_sequence_coordinates`. A tile has one output, at its own
+/// coordinate, so the value must sit exactly there. A sequence writes many
+/// objects under its coordinate and the CFS does not yet record which one it
+/// returns, so for a sequence item this can only require the value to lie
+/// *inside* it — the gap `docs/issues/program-output-unbound.md` records.
+///
+/// Shared by tile arguments and by the program output (`ProgramEnd`), so the
+/// two are held to the same rule.
+pub(crate) fn assert_prior_item_output_coordinates(
+    cfs_cursor: &CfsCursor,
+    parent_sequence_coordinates: &CfsCoordinates,
+    source_coordinate: CfsCoordinate,
+    value_coordinates: &CfsCoordinates,
+) {
+    let mut source_coordinates = parent_sequence_coordinates.clone();
+    source_coordinates.push(source_coordinate);
+    match cfs_cursor
+        .try_get_item(&source_coordinates)
+        .expect("Expected prior item output coordinates to resolve in CFS")
+    {
+        raster_core::cfs::SequenceChildItem::Sequence(_)
+        | raster_core::cfs::SequenceChildItem::RecurSequence(_) => {
+            assert!(
+                has_coordinate_prefix(value_coordinates, &source_coordinates),
+                "Storage input prior-item-output coordinates do not descend from expected sequence source",
+            );
+        }
+        raster_core::cfs::SequenceChildItem::Tile(_)
+        | raster_core::cfs::SequenceChildItem::RecurTile(_) => {
+            assert_eq!(
+                value_coordinates, &source_coordinates,
+                "Storage input prior-item-output coordinates do not match expected CFS source",
+            );
+        }
+    }
+}
+
 /// Hold one recorded argument to one CFS input binding.
 ///
 /// Split out of the loop so [`InputBinding::Indexed`] can delegate to it for
@@ -723,8 +763,6 @@ fn verify_one_binding(
                 item_coordinate
             );
 
-            let mut source_coordinates = parent_sequence_coordinates.clone();
-            source_coordinates.push(source_coordinate);
             let storage_meta = match resolved_source {
                 ResolvedSource::Storage(meta) => meta,
                 _ => {
@@ -734,25 +772,12 @@ fn verify_one_binding(
                     )
                 }
             };
-            match cfs_cursor
-                .try_get_item(&source_coordinates)
-                .expect("Expected prior item output coordinates to resolve in CFS")
-            {
-                raster_core::cfs::SequenceChildItem::Sequence(_)
-                | raster_core::cfs::SequenceChildItem::RecurSequence(_) => {
-                    assert!(
-                            has_coordinate_prefix(&storage_meta.coordinates, &source_coordinates),
-                            "Storage input prior-item-output coordinates do not descend from expected sequence source",
-                        );
-                }
-                raster_core::cfs::SequenceChildItem::Tile(_)
-                | raster_core::cfs::SequenceChildItem::RecurTile(_) => {
-                    assert_eq!(
-                            storage_meta.coordinates, source_coordinates,
-                            "Storage input prior-item-output coordinates do not match expected CFS source",
-                        );
-                }
-            }
+            assert_prior_item_output_coordinates(
+                cfs_cursor,
+                parent_sequence_coordinates,
+                source_coordinate,
+                &storage_meta.coordinates,
+            );
         }
         // `value_binding()` looks through every wrapper, so an `Indexed`
         // binding can never reach this match.

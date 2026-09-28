@@ -1,5 +1,7 @@
 # Rust
 target/
+# CUDA build of the zkVM prover tests (`--features cuda`), kept apart from target/
+target-cuda/
 Cargo.lock
 **/*.rs.bk
 *.pdb

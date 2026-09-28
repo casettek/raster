@@ -181,6 +181,7 @@ fn scope_binding_cfs() -> CfsCursor {
                 })],
                 entry_arguments: vec![],
                 produces_output: false,
+                returns: None,
             },
             SequenceDef {
                 id: "sub".into(),
@@ -191,6 +192,7 @@ fn scope_binding_cfs() -> CfsCursor {
                 })],
                 entry_arguments: vec![],
                 produces_output: false,
+                returns: None,
             },
         ],
     })
@@ -223,8 +225,8 @@ fn trace_root_and_witness(
     )
 }
 
-/// The step at `[0, 0]` reading `sub`'s parameter 0, its own source witness,
-/// and the parent `SequenceStart` at `[0]` carrying `parent_args`.
+/// The step at `[1, 1]` reading `sub`'s parameter 0, its own source witness,
+/// and the parent `SequenceStart` at `[1]` carrying `parent_args`.
 fn scope_binding_scenario(
     read_from: CfsCoordinates,
     commitment: Vec<u8>,
@@ -235,7 +237,7 @@ fn scope_binding_scenario(
         coordinates: CfsCoordinates(vec![1, 1]),
         kind: StepKind::Exec(ExecStep {
             target: ExecTarget::Tile("consumer".into()),
-            intra_sequence_index: 0,
+            intra_sequence_index: FIRST_COORDINATE,
             input_commitment: Vec::new(),
             input_source_commitment: Vec::new(),
             output_commitment: Vec::new(),
@@ -473,7 +475,7 @@ fn poc_the_sequence_scope_witness_is_bound_to_nothing() {
             coordinates: CfsCoordinates(vec![1, 1]),
             kind: StepKind::Exec(ExecStep {
                 target: ExecTarget::Tile("consumer".into()),
-                intra_sequence_index: 0,
+                intra_sequence_index: FIRST_COORDINATE,
                 input_commitment: Vec::new(),
                 input_source_commitment: Vec::new(),
                 output_commitment: Vec::new(),
@@ -547,6 +549,7 @@ fn producer_sequence_cfs() -> CfsCursor {
                 ],
                 entry_arguments: vec![],
                 produces_output: false,
+                returns: None,
             },
             SequenceDef {
                 id: "sub".into(),
@@ -557,6 +560,7 @@ fn producer_sequence_cfs() -> CfsCursor {
                 })],
                 entry_arguments: vec![],
                 produces_output: false,
+                returns: None,
             },
         ],
     })
@@ -570,7 +574,7 @@ fn verify_tile_commitments_accept_matching_recorded_io() {
         coordinates: CfsCoordinates(vec![1]),
         kind: StepKind::Exec(ExecStep {
             target: ExecTarget::Tile("tile".to_string()),
-            intra_sequence_index: 0,
+            intra_sequence_index: FIRST_COORDINATE,
             input_commitment: sha(b"in"),
             input_source_commitment: Vec::new(),
             output_commitment: sha(b"out"),
@@ -647,7 +651,7 @@ fn exec_index_fixture(exec_index: u64) -> StepRecord {
     }
 }
 
-/// A recur **tile** site at `[0]` and a recur **sequence** site at `[1]`,
+/// A recur **tile** site at `[1]` and a recur **sequence** site at `[2]`,
 /// so both frame rules are reachable from one schema.
 fn recur_frames_cfs() -> CfsCursor {
     CfsCursor::new(ControlFlowSchema {
@@ -675,6 +679,7 @@ fn recur_frames_cfs() -> CfsCursor {
                 ],
                 entry_arguments: vec![],
                 produces_output: false,
+                returns: None,
             },
             SequenceDef {
                 id: "child".into(),
@@ -685,6 +690,7 @@ fn recur_frames_cfs() -> CfsCursor {
                 })],
                 entry_arguments: vec![],
                 produces_output: false,
+                returns: None,
             },
         ],
     })
@@ -708,7 +714,7 @@ fn step_with_sequence_id(
 fn exec_kind(target: ExecTarget) -> StepKind {
     StepKind::Exec(ExecStep {
         target,
-        intra_sequence_index: 0,
+        intra_sequence_index: FIRST_COORDINATE,
         input_commitment: Vec::new(),
         input_source_commitment: Vec::new(),
         output_commitment: Vec::new(),
@@ -948,6 +954,7 @@ fn chunked_recur_cfs(chunk: Option<u64>) -> CfsCursor {
             })],
             entry_arguments: Vec::new(),
             produces_output: false,
+            returns: None,
         }],
     })
 }
@@ -959,7 +966,7 @@ fn recur_iteration_step(iteration: CfsCoordinate) -> StepRecord {
         coordinates: CfsCoordinates(vec![FIRST_COORDINATE, iteration + FIRST_COORDINATE]),
         kind: StepKind::Exec(ExecStep {
             target: ExecTarget::RecurTile("collect".into()),
-            intra_sequence_index: 0,
+            intra_sequence_index: FIRST_COORDINATE,
             input_commitment: Vec::new(),
             input_source_commitment: Vec::new(),
             output_commitment: Vec::new(),
@@ -1243,7 +1250,7 @@ fn verify_tile_commitments_reject_mismatched_input() {
         coordinates: CfsCoordinates(vec![1]),
         kind: StepKind::Exec(ExecStep {
             target: ExecTarget::Tile("tile".to_string()),
-            intra_sequence_index: 0,
+            intra_sequence_index: FIRST_COORDINATE,
             input_commitment: sha(b"expected"),
             input_source_commitment: Vec::new(),
             output_commitment: sha(b"out"),
@@ -1399,7 +1406,7 @@ fn tile_step_with_store_roots(
         coordinates,
         kind: StepKind::Exec(ExecStep {
             target: ExecTarget::Tile("tile".to_string()),
-            intra_sequence_index: 0,
+            intra_sequence_index: FIRST_COORDINATE,
             input_commitment: Vec::new(),
             input_source_commitment,
             output_commitment,
@@ -2127,6 +2134,7 @@ fn entrypoint_cfs(names: Vec<String>) -> CfsCursor {
             items: vec![],
             entry_arguments: names,
             produces_output: false,
+            returns: None,
         }],
     })
 }
@@ -3123,20 +3131,57 @@ mod program_end {
 
     use crate::checks::entrypoint::verify_program_end;
 
-    /// `main` returns a value, so a `ProgramEnd` owes an output binding.
+    /// `main = [produce, other]`, returning `produce`'s output: a `ProgramEnd`
+    /// owes an output binding, and it must be the object at `[1]`.
     fn producing_cfs() -> CfsCursor {
+        cfs_returning(
+            vec![
+                SequenceChildItem::Tile(TileItem {
+                    id: "produce".into(),
+                    sources: vec![],
+                }),
+                SequenceChildItem::Tile(TileItem {
+                    id: "other".into(),
+                    sources: vec![],
+                }),
+            ],
+            Some(InputBinding::prior_item_output(0)),
+        )
+    }
+
+    fn cfs_returning(items: Vec<SequenceChildItem>, returns: Option<InputBinding>) -> CfsCursor {
         CfsCursor::new(ControlFlowSchema {
             version: "1.0".into(),
             project: "test".into(),
             encoding: "postcard".into(),
-            tiles: vec![],
-            sequences: vec![SequenceDef {
-                id: "main".into(),
-                input_sources: vec![],
-                items: vec![],
-                entry_arguments: vec![],
-                produces_output: true,
-            }],
+            tiles: vec![TileDef::iter("produce", 0, 1), TileDef::iter("other", 0, 1)],
+            sequences: vec![
+                SequenceDef {
+                    id: "main".into(),
+                    input_sources: vec![],
+                    items,
+                    entry_arguments: vec![],
+                    produces_output: true,
+                    returns,
+                },
+                SequenceDef {
+                    id: "child".into(),
+                    input_sources: vec![],
+                    items: vec![
+                        SequenceChildItem::Tile(TileItem {
+                            id: "produce".into(),
+                            sources: vec![],
+                        }),
+                        SequenceChildItem::Tile(TileItem {
+                            id: "other".into(),
+                            sources: vec![],
+                        }),
+                    ],
+                    entry_arguments: vec![],
+                    produces_output: false,
+                    returns: None,
+                },
+            ],
         })
     }
 
@@ -3164,8 +3209,23 @@ mod program_end {
         selected_hash: Vec<u8>,
         declared_output_commitment: Vec<u8>,
     ) -> (StorageEntry, Vec<u8>, Vec<u8>, StorageReadWitness, StepRecord) {
+        fixture_at(
+            vec![1],
+            object_commitment,
+            selected_hash,
+            declared_output_commitment,
+        )
+    }
+
+    /// As [`fixture`], with the output object stored at `coordinates`.
+    fn fixture_at(
+        coordinates: Vec<CfsCoordinate>,
+        object_commitment: Vec<u8>,
+        selected_hash: Vec<u8>,
+        declared_output_commitment: Vec<u8>,
+    ) -> (StorageEntry, Vec<u8>, Vec<u8>, StorageReadWitness, StepRecord) {
         let entry = StorageEntry {
-            coordinates: CfsCoordinates(vec![]),
+            coordinates: CfsCoordinates(coordinates.clone()),
             object_commitment: object_commitment.clone(),
         };
         let (_frontier, root, _index, index_root) = build_storage_context(&[entry.clone()]);
@@ -3181,7 +3241,7 @@ mod program_end {
 
         let record = program_end_record(ProgramEndStep {
             output: Some(StorageData {
-                coordinates: CfsCoordinates(vec![]),
+                coordinates: CfsCoordinates(coordinates),
                 commitment: object_commitment,
                 selector: Default::default(),
                 selection: SelectionCommitment {
@@ -3255,6 +3315,115 @@ mod program_end {
         );
     }
 
+    /// Run `verify_program_end` on an honest-looking output stored at
+    /// `coordinates`, against `cfs`.
+    fn verify_output_at(cfs: &CfsCursor, coordinates: Vec<CfsCoordinate>) -> OutputAuthorization {
+        let selected_hash = sha(b"program-output-value");
+        let (_entry, root, index_root, witness, record) = fixture_at(
+            coordinates,
+            sha(b"program-output-object"),
+            selected_hash.clone(),
+            selected_hash,
+        );
+        let StepKind::ProgramEnd(program_end) = record.kind.clone() else {
+            unreachable!("fixture builds a ProgramEnd step");
+        };
+        verify_program_end(cfs, &record, &program_end, &root, &index_root, Some(&witness), None)
+    }
+
+    /// Regression for `docs/issues/program-output-unbound.md`, the probe that
+    /// found it inverted: an output stored at `[7]` — a coordinate naming no
+    /// item — was accepted as `main`'s output.
+    #[test]
+    #[should_panic(expected = "do not match expected CFS source")]
+    fn rejects_an_output_at_a_coordinate_no_item_names() {
+        verify_output_at(&producing_cfs(), vec![7]);
+    }
+
+    /// The realistic forgery: a real, stored intermediate object — `other`'s
+    /// output at `[2]` — named as the program's output when `main` returns
+    /// `produce`'s at `[1]`. Every storage and selection check passes.
+    #[test]
+    #[should_panic(expected = "do not match expected CFS source")]
+    fn rejects_an_intermediate_object_as_the_program_output() {
+        verify_output_at(&producing_cfs(), vec![2]);
+    }
+
+    /// A program whose return the CFS could not bind — a finalized draft, a
+    /// computed value — fails closed instead of accepting an unchecked output.
+    #[test]
+    #[should_panic(expected = "does not bind the value `main` returns")]
+    fn refuses_an_output_when_main_returns_nothing_bindable() {
+        let items = vec![SequenceChildItem::Tile(TileItem {
+            id: "produce".into(),
+            sources: vec![],
+        })];
+        verify_output_at(&cfs_returning(items, None), vec![1]);
+    }
+
+    /// A `main` passing an entry argument straight through returns the entry
+    /// object at `[]`, and nothing else.
+    #[test]
+    fn accepts_an_entry_argument_returned_from_the_entry_object() {
+        let cfs = cfs_returning(vec![], Some(InputBinding::entry_argument()));
+        assert!(matches!(
+            verify_output_at(&cfs, vec![]),
+            OutputAuthorization::Established { .. }
+        ));
+    }
+
+    #[test]
+    #[should_panic(expected = "must come from the entry object")]
+    fn rejects_a_stored_object_for_an_entry_argument_return() {
+        let items = vec![SequenceChildItem::Tile(TileItem {
+            id: "produce".into(),
+            sources: vec![],
+        })];
+        verify_output_at(&cfs_returning(items, Some(InputBinding::entry_argument())), vec![1]);
+    }
+
+    /// The residual gap, pinned so it is not mistaken for closed: `main`
+    /// returning a nested sequence's result can only be held to *inside* that
+    /// sequence until nested returns are bound at `SequenceEnd`.
+    #[test]
+    fn a_nested_sequence_return_is_held_only_to_its_scope() {
+        let cfs = cfs_returning(
+            vec![SequenceChildItem::Sequence(SequenceItem {
+                id: "child".into(),
+                sources: vec![],
+            })],
+            Some(InputBinding::prior_item_output(0)),
+        );
+        // Either object the child wrote is accepted — the gap.
+        assert!(matches!(
+            verify_output_at(&cfs, vec![1, 2]),
+            OutputAuthorization::Established { .. }
+        ));
+        assert!(matches!(
+            verify_output_at(&cfs, vec![1, 1]),
+            OutputAuthorization::Established { .. }
+        ));
+    }
+
+    #[test]
+    #[should_panic(expected = "do not descend from expected sequence source")]
+    fn rejects_a_nested_sequence_return_outside_its_scope() {
+        let cfs = cfs_returning(
+            vec![
+                SequenceChildItem::Sequence(SequenceItem {
+                    id: "child".into(),
+                    sources: vec![],
+                }),
+                SequenceChildItem::Tile(TileItem {
+                    id: "other".into(),
+                    sources: vec![],
+                }),
+            ],
+            Some(InputBinding::prior_item_output(0)),
+        );
+        verify_output_at(&cfs, vec![2]);
+    }
+
     /// A unit `main` binds nothing and carries no value — the variant stays
     /// payload-free, so nothing downstream can read an output out of it.
     #[test]
@@ -3310,6 +3479,7 @@ fn recur_sequence_site_cfs() -> CfsCursor {
                 })],
                 entry_arguments: Vec::new(),
                 produces_output: false,
+                returns: None,
             },
             SequenceDef {
                 id: "decorate_lines".into(),
@@ -3320,13 +3490,14 @@ fn recur_sequence_site_cfs() -> CfsCursor {
                 })],
                 entry_arguments: Vec::new(),
                 produces_output: false,
+                returns: None,
             },
         ],
     })
 }
 
 /// The site step the recorder writes for that call: `RecurSequenceStart`
-/// becomes a `SequenceStart` at the site coordinate `[0]`, carrying the site's
+/// becomes a `SequenceStart` at the site coordinate `[1]`, carrying the site's
 /// own id (`recorder.rs`'s `RecurTileStart | RecurSequenceStart` arm).
 fn recur_sequence_site_step() -> StepRecord {
     StepRecord {

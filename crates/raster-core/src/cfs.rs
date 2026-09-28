@@ -184,6 +184,15 @@ impl CfsCursor {
             .unwrap_or(false)
     }
 
+    /// The binding of the value `main` returns (`SequenceDef::returns`), if
+    /// the CFS could resolve one.
+    pub fn main_returns(&self) -> Option<&InputBinding> {
+        self.cfs
+            .sequences
+            .get(self.entrypoint_coordinate as usize)
+            .and_then(|main| main.returns.as_ref())
+    }
+
     pub fn is_next_coordinates(&mut self, next_coordinates: &CfsCoordinates) -> bool {
         if let Some(next_coordinates_options) = self.try_get_next_coordinates(&self.coordinates()) {
             return next_coordinates_options.contains(next_coordinates);
@@ -204,7 +213,8 @@ impl CfsCursor {
         // `End` shared the `Start`'s, this function saw only the position and
         // answered with the *opening* successors, so an honest sweep stepping
         // from iteration `i`'s end to iteration `i + 1`'s start was rejected:
-        // `[2, 0, 2] is not among [[2, 0, 1], [2, 0, 1, 0], [2, 0]]`.
+        // `[2, 0, 2] is not among [[2, 0, 1], [2, 0, 1, 0], [2, 0]]` (quoted as
+        // it was reported, from before coordinates became 1-based).
         if let Some((&last, site_prefix)) = coordinates.split_last() {
             if let Some(open_index) = opening_coordinate(last) {
                 let site_coordinates = CfsCoordinates(site_prefix.to_vec());
@@ -694,6 +704,19 @@ pub struct SequenceDef {
     /// Always `false` for sequences other than `main`.
     #[serde(default)]
     pub produces_output: bool,
+    /// The value `main` returns, resolved like a step argument: which item's
+    /// output (or which entry argument) the program's output is.
+    ///
+    /// Without it the guest can check that a `ProgramEnd` names *some* stored
+    /// object, not that it names the one `main` returns — any intermediate
+    /// object would verify as the program's output. `None` for a unit `main`,
+    /// for every other sequence (their returns are not bound yet), and for a
+    /// `main` whose returned expression the CFS cannot bind (a finalized
+    /// draft, a computed value); the guest then refuses the `ProgramEnd`
+    /// rather than accept an unchecked output. See
+    /// `docs/issues/program-output-unbound.md`.
+    #[serde(default)]
+    pub returns: Option<InputBinding>,
 }
 
 impl SequenceDef {
@@ -705,6 +728,7 @@ impl SequenceDef {
             items: Vec::new(),
             entry_arguments: Vec::new(),
             produces_output: false,
+            returns: None,
         }
     }
 
@@ -821,7 +845,7 @@ pub struct RecurSequenceItem {
     pub state_is_output: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum InputBinding {
     Direct(InputSource),
     SequenceScope {
@@ -932,7 +956,7 @@ impl InputBinding {
 /// program's `ProgramStart` step and reached from there through
 /// `InputBinding::EntryArgument`. A source here is only about values with no
 /// upstream item to bind to.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum InputSource {
     /// Input is materialized inline in the sequence body.
     Inline,
@@ -978,6 +1002,7 @@ mod tests {
                 ],
                 entry_arguments: vec![],
                 produces_output: false,
+                returns: None,
             }],
         })
     }
@@ -1017,8 +1042,9 @@ mod tests {
 
 
     /// A recur site coordinate is a *scope*, so its successor set covers both
-    /// halves of the site: the `End` back at `[1]`, iteration 0 at `[1][0]`
-    /// (and that iteration's first inner step), and the next sibling `[2]`.
+    /// halves of the site: the `End` back at `[2]`, the first iteration at
+    /// `[2][1]` (and that iteration's first inner step), and the next sibling
+    /// `[3]`.
     ///
     /// This used to assert `[2]` alone, from when `[s]` was a leaf item with a
     /// single trailing event. With a `Start`/`End` pair both at `[s]`, the
@@ -1026,7 +1052,7 @@ mod tests {
     /// relation is keyed on the coordinate, the set must be the union.
     ///
     /// That is not a new weakening: a nested `Sequence` coordinate already
-    /// yields exactly this shape (`{[s], [s][0], [s+1]}`), for the same reason.
+    /// yields exactly this shape (`{[s], [s][1], [s+1]}`), for the same reason.
     /// The ordering check bounds the *shape*; the count is bounded by the recur
     /// progress rules, where `close_site` has popped the frame so a stray
     /// iteration after the site fails with `NoActiveSite`.
@@ -1081,6 +1107,7 @@ mod tests {
                     ],
                     entry_arguments: vec![],
                     produces_output: false,
+                    returns: None,
                 },
                 SequenceDef {
                     id: "body".to_string(),
@@ -1100,6 +1127,7 @@ mod tests {
                     ],
                     entry_arguments: vec![],
                     produces_output: false,
+                    returns: None,
                 },
             ],
         })

@@ -5,7 +5,7 @@ use syn::{
     parse::{Parse, ParseStream},
     parse_file,
     visit::Visit,
-    Attribute, Expr, ExprLit, ExprMacro, FnArg, Lit, Local, Meta, Pat, StmtMacro, Token,
+    Attribute, Expr, ExprLit, ExprMacro, FnArg, Lit, Local, Meta, Pat, Stmt, StmtMacro, Token,
 };
 use walkdir::WalkDir;
 
@@ -63,6 +63,22 @@ pub enum CallArgumentKind {
     Inline,
 }
 
+/// What a function body returns — its last expression, classified the way a
+/// call argument is, so the flow resolver can bind it to a source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReturnExpr {
+    /// The body ends with a call primitive (`call!`, `call_seq!`, …) and
+    /// returns that call's result: the output of the last step.
+    TailCall,
+    /// The body returns a value rooted at a name — a binding, `select!(T,
+    /// x.f)`, `clone!(x)` — optionally wrapped in `Ok(..)` or `..?`.
+    Rooted { root: String },
+    /// A returned expression the CFS cannot bind: a literal, a computed
+    /// value, a plain function call such as `finalize(draft)`, or a `select!`
+    /// with a data-sourced index. Kept as source text for the diagnostic.
+    Unbound { expr: String },
+}
+
 /// Captures detailed information about a function call within a function body.
 #[derive(Debug, Clone)]
 pub struct CallInfo {
@@ -113,6 +129,9 @@ pub struct FunctionAstItem {
     /// order. Empty for every literal-index selection, which is why programs
     /// that do not use the feature are unaffected.
     pub selection_index_sources: Vec<(String, Vec<String>)>,
+    /// The body's returned expression, classified. `None` when the body ends
+    /// in a statement (a unit return).
+    pub return_expr: Option<ReturnExpr>,
 }
 
 #[derive(Debug, Clone)]
@@ -203,6 +222,7 @@ impl ProjectAst {
                 let call_infos = visitor.get_call_infos();
                 let selection_aliases = visitor.get_selection_aliases();
                 let selection_index_sources = visitor.get_selection_index_sources();
+                let return_expr = CallVisitor::classify_return(&func.block);
                 let function_info = FunctionAstItem {
                     name,
                     path: path.clone(),
@@ -214,6 +234,7 @@ impl ProjectAst {
                     signature,
                     selection_aliases,
                     selection_index_sources,
+                    return_expr,
                 };
                 functions.push(function_info);
             }
@@ -339,6 +360,61 @@ impl CallVisitor {
             Pat::Type(pat_type) => Self::extract_binding_name(&pat_type.pat),
             _ => None,
         }
+    }
+
+    /// Classify a function body's returned expression: its last statement
+    /// when that statement is a value (no trailing `;`), or the operand of a
+    /// final `return`.
+    pub(crate) fn classify_return(block: &syn::Block) -> Option<ReturnExpr> {
+        match block.stmts.last()? {
+            Stmt::Expr(Expr::Return(ret), _) => ret.expr.as_deref().map(Self::classify_return_expr),
+            Stmt::Expr(expr, None) => Some(Self::classify_return_expr(expr)),
+            // A trailing macro invocation with no `;` parses as a statement
+            // macro, not an expression.
+            Stmt::Macro(stmt) if stmt.semi_token.is_none() => {
+                Some(Self::classify_return_expr(&Expr::Macro(ExprMacro {
+                    attrs: stmt.attrs.clone(),
+                    mac: stmt.mac.clone(),
+                })))
+            }
+            _ => None,
+        }
+    }
+
+    fn classify_return_expr(expr: &Expr) -> ReturnExpr {
+        match expr {
+            // `Ok(x)` from a fallible `main`, and `x?`, return `x`.
+            Expr::Call(call) if call.args.len() == 1 && Self::expr_path_is(&call.func, "Ok") => {
+                Self::classify_return_expr(&call.args[0])
+            }
+            Expr::Try(try_expr) => Self::classify_return_expr(&try_expr.expr),
+            Expr::Paren(paren) => Self::classify_return_expr(&paren.expr),
+            Expr::Macro(expr_macro) if Self::macro_call_kind(&expr_macro.mac).is_some() => {
+                ReturnExpr::TailCall
+            }
+            // A selection whose index is data-sourced cites that index as a
+            // separate binding; a program output has nowhere to carry the
+            // citation, so it is not bound rather than bound loosely.
+            Expr::Macro(expr_macro)
+                if Self::is_selection_macro(&expr_macro.mac)
+                    && !Self::selection_macro_index_roots(&expr_macro.mac).is_empty() =>
+            {
+                ReturnExpr::Unbound {
+                    expr: Self::expr_to_string(expr),
+                }
+            }
+            _ => match Self::expr_root_ident(expr) {
+                Some(root) => ReturnExpr::Rooted { root },
+                None => ReturnExpr::Unbound {
+                    expr: Self::expr_to_string(expr),
+                },
+            },
+        }
+    }
+
+    /// Whether `expr` is the bare path `name`.
+    fn expr_path_is(expr: &Expr, name: &str) -> bool {
+        matches!(expr, Expr::Path(path) if path.path.is_ident(name))
     }
 
     /// Converts an expression to its string representation for argument capture
@@ -940,6 +1016,66 @@ mod tests {
         CallArgumentKind::Rooted {
             root: root.to_string(),
         }
+    }
+
+    fn classify_return_of(code: &str) -> Option<ReturnExpr> {
+        let item: syn::ItemFn = syn::parse_str(code).expect("Failed to parse test fn");
+        CallVisitor::classify_return(&item.block)
+    }
+
+    fn rooted_return(root: &str) -> Option<ReturnExpr> {
+        Some(ReturnExpr::Rooted {
+            root: root.to_string(),
+        })
+    }
+
+    /// Every form a value-returning `main` ends with in `examples/` and
+    /// `raster-inference`: a binding, `Ok(binding)`, a tail call, a selection.
+    #[test]
+    fn return_forms_that_bind() {
+        assert_eq!(
+            classify_return_of("fn main() -> u64 { let s = call!(plan, b); s }"),
+            rooted_return("s")
+        );
+        assert_eq!(
+            classify_return_of("fn main() -> Result<X> { let p = call!(f, a); Ok(p) }"),
+            rooted_return("p")
+        );
+        assert_eq!(
+            classify_return_of("fn main() -> u64 { call!(plan, b) }"),
+            Some(ReturnExpr::TailCall)
+        );
+        assert_eq!(
+            classify_return_of("fn main() -> Result<X> { Ok(call!(plan, b)?) }"),
+            Some(ReturnExpr::TailCall)
+        );
+        assert_eq!(
+            classify_return_of("fn main() -> u64 { let s = call!(f, b); select!(u64, s.count) }"),
+            rooted_return("s")
+        );
+        assert_eq!(
+            classify_return_of("fn main() -> u64 { let s = call!(f, b); return s; }"),
+            rooted_return("s")
+        );
+    }
+
+    #[test]
+    fn return_forms_that_do_not_bind() {
+        assert!(matches!(
+            classify_return_of("fn main() -> u64 { 42 }"),
+            Some(ReturnExpr::Unbound { .. })
+        ));
+        assert!(matches!(
+            classify_return_of("fn main() -> R { let d = call!(f, new!(R)); finalize(d) }"),
+            Some(ReturnExpr::Unbound { .. })
+        ));
+        // A data-sourced index would need its citation carried to ProgramEnd.
+        assert!(matches!(
+            classify_return_of("fn main() -> u64 { let s = call!(f, b); select!(u64, s.rows[i]) }"),
+            Some(ReturnExpr::Unbound { .. })
+        ));
+        // A unit body returns nothing to bind.
+        assert_eq!(classify_return_of("fn main() { call!(f, b); }"), None);
     }
 
     #[test]

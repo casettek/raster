@@ -598,14 +598,17 @@ pub fn state_commitment(bytes: &[u8]) -> Hash32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cfs::FIRST_COORDINATE;
     use alloc::vec;
 
     fn site() -> CfsCoordinates {
         CfsCoordinates(vec![2])
     }
 
+    /// The coordinate of 0-based iteration `index` of `site()`: coordinates are
+    /// 1-based, the progress rules count iterations from 0.
     fn iteration(index: u64) -> CfsCoordinates {
-        CfsCoordinates(vec![2, index as CfsCoordinate])
+        CfsCoordinates(vec![2, index as CfsCoordinate + FIRST_COORDINATE])
     }
 
     fn tile_stack(source_len: u64, chunk: u64) -> RecurProgressStack {
@@ -931,7 +934,7 @@ mod tests {
         let mut stack = tile_stack(5, 1);
         assert_eq!(
             stack.advance_tile_iteration(
-                &CfsCoordinates(vec![7, 0]),
+                &CfsCoordinates(vec![7, 1]),
                 0,
                 5,
                 1,
@@ -955,22 +958,22 @@ mod tests {
     #[test]
     fn a_nested_break_does_not_terminate_the_outer_sweep() {
         let outer = CfsCoordinates(vec![2]);
-        let inner = CfsCoordinates(vec![2, 1, 3]);
+        let inner = CfsCoordinates(vec![2, 2, 3]);
         let mut stack = RecurProgressStack::new();
         stack.push_site(outer.clone(), RecurSiteKind::Sequence, 1, 2, false);
 
         stack
-            .advance_sequence_iteration(&CfsCoordinates(vec![2, 0]), 0)
+            .advance_sequence_iteration(&CfsCoordinates(vec![2, 1]), 0)
             .unwrap();
         stack
-            .advance_sequence_iteration(&CfsCoordinates(vec![2, 1]), 1)
+            .advance_sequence_iteration(&CfsCoordinates(vec![2, 2]), 1)
             .unwrap();
 
         // The nested site opens, breaks early, and closes — legally.
         stack.push_site(inner.clone(), RecurSiteKind::Tile, 1, 8, false);
         stack
             .advance_tile_iteration(
-                &CfsCoordinates(vec![2, 1, 3, 0]),
+                &CfsCoordinates(vec![2, 2, 3, 1]),
                 0,
                 8,
                 1,

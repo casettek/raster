@@ -1442,7 +1442,7 @@ mod tests {
     /// A scope binding where the compiler can actually put one: on an item of a
     /// *nested* frame, reading that frame's own parameter.
     ///
-    /// It used to sit at `[0]` — a `SequenceScope` on an item of `main` — which
+    /// It used to sit on an item of `main` — a `SequenceScope` there — which
     /// the compiler never emits, because `main` has no caller and its
     /// parameters resolve to `EntryArgument`
     /// (`FlowResolver::resolve_with_entry_arguments`). Unreachable there, so it
@@ -2133,7 +2133,7 @@ mod tests {
             make_tile_trace_item_at(4, "main", 3, vec![3], "tail".to_string(), 1, 30),
             make_sequence_end_record(5, "main", vec![]),
         ]);
-        // Diverges at index 2, so the window is [producer@[0], consumer@[1]] and
+        // Diverges at index 2, so the window is [producer@[1], consumer@[2]] and
         // `consumer` — depth 1, reading a prior sibling — must resolve.
         let mut runtime_trace = committed_trace.clone();
         runtime_trace.0[2] =
@@ -2230,12 +2230,12 @@ mod tests {
     /// then recur iterations, then the CFS item).
     ///
     /// The fixture is built so the skip is load-bearing rather than incidental.
-    /// `try_get_item` folds `[1, i]` back to the site, so an iteration resolved
-    /// as an ordinary step would be handed the *site's* `PriorItemOutput(0)`
-    /// under a frame of `[1]` and an item coordinate of `i` — the iteration
-    /// counter read as a sibling index. At `i = 0` that trips the
-    /// same-or-future-index panic; at `i = 1` it silently resolves to whatever
-    /// sits at `[1, 0]`, which is the previous *iteration*, not item 0.
+    /// `try_get_item` folds `[2, i]` back to the site, so an iteration resolved
+    /// as an ordinary step would be handed the *site's* `PriorItemOutput(0)` —
+    /// the producer at `[1]` — under a frame of `[2]` and an item coordinate of
+    /// `i`: the iteration counter read as a sibling index. At `i = 1` that trips
+    /// the same-or-future-index panic; at `i = 2` it silently resolves to
+    /// `[2, 1]`, which is the previous *iteration*, not the producer.
     #[test]
     fn recur_iterations_contribute_no_input_source_witness() {
         let committed_trace = Trace(vec![

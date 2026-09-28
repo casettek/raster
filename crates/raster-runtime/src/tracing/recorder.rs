@@ -1449,6 +1449,7 @@ mod tests {
                 ],
                 entry_arguments: vec![],
                 produces_output: false,
+                returns: None,
             }],
         })
     }
@@ -1476,6 +1477,7 @@ mod tests {
                     ],
                     entry_arguments: vec![],
                     produces_output: false,
+                    returns: None,
                 },
                 SequenceDef {
                     id: "child".to_string(),
@@ -1486,6 +1488,7 @@ mod tests {
                     })],
                     entry_arguments: vec![],
                     produces_output: false,
+                    returns: None,
                 },
             ],
         })
@@ -1553,6 +1556,7 @@ mod tests {
                     })],
                     entry_arguments: vec![],
                     produces_output: false,
+                    returns: None,
                 },
                 SequenceDef {
                     id: "child".to_string(),
@@ -1560,6 +1564,7 @@ mod tests {
                     items: vec![],
                     entry_arguments: vec![],
                     produces_output: false,
+                    returns: None,
                 },
             ],
         })
@@ -2114,7 +2119,7 @@ mod tests {
         assert_row(&tile_site, "Exec(RecurTile)", &[1]);
         assert_row(&seq_site, "Exec(RecurSequence)", &[1]);
         // A tile inside a recur-sequence iteration is an item of that
-        // iteration's own sequence: [s] relative to it, [0,0][0] absolute.
+        // iteration's own sequence: [s] relative to it, [1,1][1] absolute.
         assert_row(&iter_tile, "Exec(Tile)", &[1, 1, 1]);
 
         // Iterations land one level deeper, at [s][i].

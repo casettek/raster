@@ -8,7 +8,7 @@ use raster_core::cfs::{
 };
 use std::collections::{HashMap, HashSet};
 
-use crate::ast::{CallArgumentKind, CallInfo, CallKind};
+use crate::ast::{CallArgumentKind, CallInfo, CallKind, ReturnExpr};
 use crate::sequence::Sequence;
 
 /// Resolves data flow within a sequence, producing `SequenceItem`s with
@@ -144,6 +144,30 @@ impl FlowResolver {
         }
 
         items
+    }
+
+    /// Resolve what a sequence body returns, the way an argument is resolved.
+    ///
+    /// Call after [`Self::resolve_with_entry_arguments`], which fills the
+    /// bindings this reads; `item_count` is the number of items it produced.
+    /// `None` when the return cannot be bound: an [`ReturnExpr::Unbound`]
+    /// form, or a name with no upstream (a finalized draft, a local computed
+    /// in the body). A returned value selected through a data-sourced index is
+    /// also `None` — the binding would need the index citations, and a
+    /// program output has nowhere to carry them.
+    pub fn resolve_return(&self, ret: &ReturnExpr, item_count: usize) -> Option<InputBinding> {
+        let binding = match ret {
+            ReturnExpr::TailCall => InputBinding::prior_item_output(item_count.checked_sub(1)?),
+            ReturnExpr::Rooted { root } => self.resolve_argument(&CallArgumentKind::Rooted {
+                root: root.clone(),
+            }),
+            ReturnExpr::Unbound { .. } => return None,
+        };
+        let unbound = matches!(
+            binding.value_binding(),
+            InputBinding::Direct(raster_core::cfs::InputSource::Inline)
+        ) || !binding.index_bindings().is_empty();
+        (!unbound).then_some(binding)
     }
 
     /// Resolve input sources for a function call's arguments.
@@ -288,6 +312,7 @@ mod tests {
             signature: format!("fn {}()", name),
             selection_aliases: vec![],
             selection_index_sources: vec![],
+            return_expr: None,
         }
     }
 
@@ -329,6 +354,7 @@ mod tests {
             signature: format!("fn {}()", name),
             selection_aliases,
             selection_index_sources,
+            return_expr: None,
         }
     }
 
@@ -437,6 +463,51 @@ mod tests {
             }
             _ => panic!("Expected Tile item"),
         }
+
+        // What the body returns binds like an argument: a binding to its
+        // producing item, a tail call to the last item, a parameter to its
+        // scope slot; a name with no upstream, or an unbindable form, to
+        // nothing.
+        assert_eq!(
+            resolver.resolve_return(
+                &ReturnExpr::Rooted {
+                    root: "greeting".to_string()
+                },
+                items.len()
+            ),
+            Some(InputBinding::prior_item_output(0))
+        );
+        assert_eq!(
+            resolver.resolve_return(&ReturnExpr::TailCall, items.len()),
+            Some(InputBinding::prior_item_output(1))
+        );
+        assert_eq!(
+            resolver.resolve_return(
+                &ReturnExpr::Rooted {
+                    root: "name".to_string()
+                },
+                items.len()
+            ),
+            Some(InputBinding::seq_input(0))
+        );
+        assert_eq!(
+            resolver.resolve_return(
+                &ReturnExpr::Rooted {
+                    root: "report".to_string()
+                },
+                items.len()
+            ),
+            None
+        );
+        assert_eq!(
+            resolver.resolve_return(
+                &ReturnExpr::Unbound {
+                    expr: "42".to_string()
+                },
+                items.len()
+            ),
+            None
+        );
     }
 
     #[test]

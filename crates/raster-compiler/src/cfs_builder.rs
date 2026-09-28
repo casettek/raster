@@ -90,6 +90,7 @@ impl<'a> CfsBuilder<'a> {
 
         if seq.function.name == "main" && !seq.function.input_names.is_empty() {
             let items = resolver.resolve_with_entry_arguments(seq, &seq.function.input_names);
+            let returns = main_returns(&resolver, seq, produces_output, items.len());
 
             return Ok(SequenceDef {
                 id: seq.function.name.clone(),
@@ -97,6 +98,7 @@ impl<'a> CfsBuilder<'a> {
                 items,
                 entry_arguments: seq.function.input_names.clone(),
                 produces_output,
+                returns,
             });
         }
 
@@ -109,6 +111,7 @@ impl<'a> CfsBuilder<'a> {
 
         // Resolve data flow for the sequence items
         let items = resolver.resolve(seq);
+        let returns = main_returns(&resolver, seq, produces_output, items.len());
 
         Ok(SequenceDef {
             id: seq.function.name.clone(),
@@ -116,8 +119,50 @@ impl<'a> CfsBuilder<'a> {
             items,
             entry_arguments: Vec::new(),
             produces_output,
+            returns,
         })
     }
+}
+
+/// Bind the value `main` returns, so the guest can hold `ProgramEnd` to it.
+///
+/// Only `main`'s return is recorded for now: a nested sequence's return is
+/// checked at its `SequenceEnd`, which does not record a binding yet (see
+/// `docs/proposals/incremental-draft-materialization.md` §Sequence return
+/// binding). A `main` whose return cannot be bound is not a build error — a
+/// program returning `finalize(draft)` must still build and run
+/// unauthenticated — but its `ProgramEnd` will not verify, so say so here
+/// rather than at proving time.
+fn main_returns(
+    resolver: &FlowResolver,
+    seq: &Sequence<'_>,
+    produces_output: bool,
+    item_count: usize,
+) -> Option<InputBinding> {
+    if !produces_output {
+        return None;
+    }
+    let returns = seq
+        .function
+        .return_expr
+        .as_ref()
+        .and_then(|ret| resolver.resolve_return(ret, item_count));
+    if returns.is_none() {
+        let form = match &seq.function.return_expr {
+            Some(crate::ast::ReturnExpr::Unbound { expr }) => format!("`{expr}`"),
+            Some(crate::ast::ReturnExpr::Rooted { root }) => {
+                format!("`{root}`, which has no upstream step")
+            }
+            Some(crate::ast::ReturnExpr::TailCall) => "its final call".to_string(),
+            None => "no returned expression".to_string(),
+        };
+        eprintln!(
+            "warning: `main` returns {form}, which the CFS cannot bind to a step's output or an \
+             entry argument; this program's ProgramEnd will not verify. Return a binding of a \
+             `call!`/`call_recur!`/`call_seq!` result, or a `select!` of one."
+        );
+    }
+    returns
 }
 
 /// Reject duplicate ids in a (already sorted) id sequence, naming the kind
@@ -216,6 +261,7 @@ mod tests {
             signature: format!("fn {}()", name),
             selection_aliases: vec![],
             selection_index_sources: vec![],
+            return_expr: None,
         }
     }
 
@@ -240,6 +286,7 @@ mod tests {
             signature: "fn main()".to_string(),
             selection_aliases: vec![],
             selection_index_sources: vec![],
+            return_expr: None,
         }
     }
 

@@ -461,7 +461,8 @@ pub fn binding_requires_payload(
     // appear only on the step that *closes* a recur site, which executes
     // nothing and merely holds the site's arguments. Treating those as
     // executions is what kept a forwarded 106 MB `List<MergeBucket>` on the
-    // recur site step at `[2, 0]` after the sequence steps were already
+    // recur site step at `[2, 0]` (0-based, as observed at the time) after the
+    // sequence steps were already
     // reduced. This is the same predicate as
     // [`StepRecord::requires_replay_proof`], for the same reason: a replay
     // journal exists exactly where a tile ran.
@@ -1037,13 +1038,14 @@ mod bound_index_tests {
 #[cfg(test)]
 mod payload_rule_tests {
     use super::*;
+    use crate::cfs::FIRST_COORDINATE;
     use alloc::string::ToString;
     use alloc::vec;
 
     fn exec_kind() -> StepKind {
         StepKind::Exec(ExecStep {
             target: ExecTarget::Tile("tile".to_string()),
-            intra_sequence_index: 0,
+            intra_sequence_index: FIRST_COORDINATE,
             input_commitment: Vec::new(),
             input_source_commitment: Vec::new(),
             output_commitment: Vec::new(),

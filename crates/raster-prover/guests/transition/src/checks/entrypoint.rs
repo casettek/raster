@@ -21,11 +21,12 @@
 //! deferred debt to discharge at the end of the chain.
 
 use raster_core::authorization::AuthorizationJournal;
-use raster_core::cfs::{CfsCoordinates, CfsCursor};
+use raster_core::cfs::{CfsCoordinate, CfsCoordinates, CfsCursor, InputBinding, FIRST_COORDINATE};
 use raster_core::input::{struct_commitments_root, verify_selection_witness, SelectionWitness};
 use raster_core::trace::{ProgramEndStep, ProgramStartStep, StepKind, StepRecord};
 use raster_core::transition::{EntrypointAuthorization, OutputAuthorization, StorageReadWitness};
 
+use crate::checks::cfs::assert_prior_item_output_coordinates;
 use crate::checks::store::verify_storage_read_witness;
 
 /// The coordinate `main`'s entry-argument binding always occupies: the
@@ -220,6 +221,11 @@ pub fn verify_genesis_authorization(
 /// to the returned value, and `output_commitment` is pinned to that
 /// selection's `selected_hash`. A unit program binds nothing. This reuses the
 /// exact storage-read and selection machinery that verifies tile inputs.
+///
+/// Presence is not identity. The object must also be the one `main`
+/// *returns*, as the CFS resolves it (`SequenceDef::returns`) — otherwise any
+/// stored object, an intermediate included, would verify as the program's
+/// output. See `docs/issues/program-output-unbound.md`.
 pub fn verify_program_end(
     cfs_cursor: &CfsCursor,
     record: &StepRecord,
@@ -258,6 +264,15 @@ pub fn verify_program_end(
         "ProgramEnd binds an output the CFS does not declare",
     );
 
+    // The output must be the value `main` returns, not merely a stored one.
+    let returns = cfs_cursor.main_returns().unwrap_or_else(|| {
+        panic!(
+            "CFS declares a program output but does not bind the value `main` returns, so no \
+             ProgramEnd output can be verified"
+        )
+    });
+    verify_program_output_source(cfs_cursor, returns, &output.coordinates);
+
     // The output object is present at its coordinates in the current store.
     let read_witness = read_witness.expect("ProgramEnd output requires a storage read witness");
     verify_storage_read_witness(
@@ -295,5 +310,48 @@ pub fn verify_program_end(
     // and is what lets a consumer learn *which* output this trace produced.
     OutputAuthorization::Established {
         output_commitment: program_end.output_commitment.clone(),
+    }
+}
+
+/// Hold the program output's coordinates to the binding `main` returns.
+///
+/// The same rule a tile argument is held to: an item's output must sit where
+/// that item writes it (`assert_prior_item_output_coordinates`), and an entry
+/// argument comes from the authorized entry object at `[]`. `main` has no
+/// caller, so a sequence-scope binding cannot occur, and an inline value
+/// cannot be a program output. A data-sourced index is refused: `ProgramEnd`
+/// carries no index citation to hold it to, and the CFS builder does not
+/// record such a return.
+fn verify_program_output_source(
+    cfs_cursor: &CfsCursor,
+    returns: &InputBinding,
+    output_coordinates: &CfsCoordinates,
+) {
+    assert!(
+        returns.index_bindings().is_empty(),
+        "main returns a value selected by a data-sourced index, which ProgramEnd cannot verify",
+    );
+    match returns.value_binding() {
+        InputBinding::EntryArgument => assert!(
+            output_coordinates.is_empty(),
+            "Program output bound to an entry argument must come from the entry object at []",
+        ),
+        InputBinding::PriorItemOutput {
+            intra_sequence_item_index,
+        } => {
+            let source_coordinate = CfsCoordinate::try_from(*intra_sequence_item_index)
+                .expect("Prior item output index exceeds CFS coordinate bounds")
+                + FIRST_COORDINATE;
+            assert_prior_item_output_coordinates(
+                cfs_cursor,
+                &entrypoint_coordinates(),
+                source_coordinate,
+                output_coordinates,
+            );
+        }
+        other => panic!(
+            "main's returned value is bound as {:?}, which cannot name a program output",
+            other
+        ),
     }
 }

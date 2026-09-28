@@ -92,14 +92,15 @@ fn hello_tiles_run_reports_recur_iteration_coordinates() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     // The program opens with a single ProgramStart at the sequence root. Recur
     // sites report their own coordinate, and each iteration's tile appends the
-    // iteration index: site `[11]` runs two iterations (`[11, 0]`, `[11, 1]`),
-    // site `[10]` runs one (`[10, 0]`).
+    // iteration index. Coordinates are 1-based (`cfs::FIRST_COORDINATE`): site
+    // `[12]` runs two iterations (`[12, 1]`, `[12, 2]`), site `[11]` runs one
+    // (`[11, 1]`).
     assert!(stdout.contains("program_start_coordinates: CfsCoordinates([])"));
-    assert!(stdout.contains("tile_coordinates: CfsCoordinates([11, 0])"));
+    assert!(stdout.contains("tile_coordinates: CfsCoordinates([12, 1])"));
+    assert!(stdout.contains("tile_coordinates: CfsCoordinates([12, 2])"));
+    assert!(stdout.contains("recur_tile_coordinates: CfsCoordinates([12])"));
     assert!(stdout.contains("tile_coordinates: CfsCoordinates([11, 1])"));
     assert!(stdout.contains("recur_tile_coordinates: CfsCoordinates([11])"));
-    assert!(stdout.contains("tile_coordinates: CfsCoordinates([10, 0])"));
-    assert!(stdout.contains("recur_tile_coordinates: CfsCoordinates([10])"));
 }
 
 #[test]

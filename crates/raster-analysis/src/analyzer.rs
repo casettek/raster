@@ -316,7 +316,7 @@ mod tests {
                     invocation_index: 1,
                     tile_id: "alpha".to_string(),
                     depth: 1,
-                    coordinates: raster_core::cfs::CfsCoordinates(vec![0]),
+                    coordinates: raster_core::cfs::CfsCoordinates(vec![1]),
                     total_duration_ns: 20,
                     user_duration_ns: 12,
                     input_bytes: 0,

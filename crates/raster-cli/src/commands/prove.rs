@@ -573,8 +573,8 @@ pub fn prove(
         authorize_external_inputs(&manifested_inputs);
 
     // Only meaningful when `main` declares entry arguments at all; without a
-    // declaration the guest requires no witness (and rejects one, since
-    // coordinate `[0]` would then be an ordinary item, not a binding).
+    // declaration the guest requires no witness (and rejects one: with no
+    // entry arguments, `ProgramStart` writes nothing at the root `[]`).
     let entrypoint_membership_witness = CfsCursor::new(cfs.clone())
         .main_entrypoint_names()
         .is_some()

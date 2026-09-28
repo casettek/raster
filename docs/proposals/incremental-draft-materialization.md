@@ -54,6 +54,14 @@ Related:
   direction picked here: [`program-output-unbound`](../issues/program-output-unbound.md) (D5c),
   [`recur-carried-state-unbound`](../issues/recur-carried-state-unbound.md) (D5b, D5c) and
   [`replay-draft-schema-unbound`](../issues/replay-draft-schema-unbound.md) (D1).
+- [`tile-output-commitment-unbound`](../issues/tile-output-commitment-unbound.md) (filed
+  2026-09-28) — **to be resolved together with this proposal.** The object a tile step stores is
+  never tied to the output its replay produced: `verify_io_witness` skips execution steps,
+  `verify_storage_transition` ignores the output bytes, and nothing requires a tile with output to
+  write. Measured with a guest probe. This proposal leans on stored commitments being what their
+  producing tile computed — a deriving site opens at its base's commitment, a state-only site's
+  close compares against its stored result — and it already breaks the same tile journal (D1, D2),
+  needs the same shared encoder (D5b) and edits the same store check (D3).
 
 ## What is already incremental, and what is not
 
@@ -546,6 +554,14 @@ let storage_write = output.as_ref().map(|output| {
 > so the gap is small; once every recur iteration takes it, an unconstrained 32-byte field on every
 > iteration record is free entropy for manufacturing a divergence. Rule: **an `Exec` step without a
 > storage write must have an empty `output_commitment`.**
+>
+> That rule is necessary, not sufficient. It neither requires a write when the replay produced
+> output nor ties a write's commitment to that output, so a step with a forged commitment, or with
+> its write dropped, still verifies —
+> [`tile-output-commitment-unbound`](../issues/tile-output-commitment-unbound.md). What closes both
+> lands with this rule: a tile step writes exactly when its journal's `output_bytes` is non-empty,
+> and its write's commitment is bound to that output. How the binding is made is the issue's open
+> choice (§Directions there).
 >
 > **State-only iterations are included** (§Still open, D3 — decided 2026-09-28). A tile returning
 > `RecurState<T>` or `RecurControl<RecurState<T>>` also writes its returned state at `[s][i]`
@@ -1535,6 +1551,9 @@ in the same break (D4), so every trace with a nested sequence changes too.
   object, its schema hash and empty root (computed by `schema_walk`), and whether it derives and
   from which input.
 - **The replay tile's schema assertion**, `handle.schema_hash == S::schema_hash()`.
+- **Tile output bound to the stored object**, resolved together with this proposal:
+  [`tile-output-commitment-unbound`](../issues/tile-output-commitment-unbound.md). A deriving
+  site's base and a state-only site's stored result are only as sound as that join.
 - ~~**Persist the append frontier** with the object.~~ **Superseded 2026-09-27**: the raster
   index already stores every list's Merkle levels, so a deriving site reads the frontier from the
   base's index in `O(log N)`. See §Continuation on the draft buffer.
