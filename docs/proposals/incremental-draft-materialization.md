@@ -1,4 +1,4 @@
-# Proposal: `incremental-draft-materialization` — seal a draft instead of rebuilding it, and let the wrapping sequence close it
+# Proposal: `incremental-draft-materialization` — seal a draft instead of rebuilding it, and complete it at its recur site's close
 
 Status: Proposed 2026-09-21. **Revised 2026-09-24** — §One storage rule replaces
 §Update-at-coordinate's cost note, for `call_recur!` only. The organising claim is not about
@@ -15,6 +15,9 @@ drafts, travel between steps — `new!`/`finalize`/`finalize = false` leave the 
 object at a real coordinate. Extension by a later site is **derivation** — an ordinary first write whose
 contents share structure — restricted to `push`, which makes continuation a whole-object property
 *and* dissolves the layout blocker, since payload order and hash order are already decoupled.
+(Corrected 2026-09-27: that holds for a struct with one growing list; with several, `rindex04`
+relative offsets are what dissolve it, and they are now adopted — §Continuation on the draft
+buffer.)
 
 **Revised 2026-09-27** — §The draft root rides in the site's recur-progress frame. A fraud window
 may open at any step of a sweep, including its close, so the draft root a site carries between
@@ -32,7 +35,11 @@ Related:
 - [`incremental-draft-witness`](./incremental-draft-witness.md) (implemented 2026-08-15) — **the
   half that is already done.** It made the *digest* incremental: a push is `O(log N)` and
   `recompose_root` is `O(#fields)` "with no element ever touched". This proposal is the same move
-  on the *payload and index*, which that one left alone.
+  on the *payload and index*, which that one left alone. It is a **precondition, and it is
+  satisfied**: the frontier-based witness (`DraftWitnessField::Append` carrying an
+  `AppendFrontier`) is what lets a draft step, and a deriving site's first step, carry `O(log N)`
+  instead of every element. Its §5 (set-once fields as roots rather than whole values) was not done
+  and is **not** required here; it would only shrink the first-iteration witness of a deriving site.
 - [`recur-deferred-finalize`](./recur-deferred-finalize.md) (implemented 2026-08-28) — `finalize =
   false`, whose own summary is that deferring the close *"moves no attestation; it moves only the
   materialization"*. If materialization stops being a lump, that flag's reason to exist goes with
@@ -43,6 +50,10 @@ Related:
 - [`authenticated-chain-draft-output`](../issues/authenticated-chain-draft-output.md) — the open
   issue that finalize writes to storage with **no trace step**, so the recorder's replica never
   performs the write. Closing at a sequence boundary gives it one.
+- Issues filed 2026-09-28 for soundness gaps found while deciding this proposal, each with its
+  direction picked here: [`program-output-unbound`](../issues/program-output-unbound.md) (D5c),
+  [`recur-carried-state-unbound`](../issues/recur-carried-state-unbound.md) (D5b, D5c) and
+  [`replay-draft-schema-unbound`](../issues/replay-draft-schema-unbound.md) (D1).
 
 ## What is already incremental, and what is not
 
@@ -81,6 +92,16 @@ then `store_value_at_coordinates` runs `postcard::to_allocvec` and
 `raster_payload_for_value`, whose `encode_raster_value` re-derives every element root and every
 Merkle level — work `draft_value_root` already did per push and `AppendFrontier` already folded.
 **A draft of N elements hashes all N of them twice.**
+
+> **At a recur site's close it is three times** (found 2026-09-27 by reading the code, not yet
+> measured). In authenticated mode the recur driver builds the `RecurTileEnd` event's payload
+> separately from the store: after the loop it calls `resolve_storage_value` on the stored
+> result, which deserializes the whole object, and then `raster_trace_payload`, which runs
+> `encode_raster_value` a second time on the same value (`raster-macros/src/recur.rs`, just
+> before `RecurTileEnd` is published). So the element hashes are computed once per push, once by
+> `store_value_at_coordinates` → `raster_payload_for_value` (`storage.rs:1429`), and once more
+> for the trace. The seal has to hand its one payload to **both** consumers — the child's object
+> store and the End event's `FnOutput` — or removing one encoding leaves the other in place.
 
 > **Re-measured 2026-09-21 after `storage-write-cost` Term 1 landed.** The first measurement
 > concluded "the premise of this proposal is wrong in its weighting — the double hash is 7–16%".
@@ -168,8 +189,10 @@ Keep, per append field, alongside the frontier:
 - the element's `RasterNode`, pushed to a per-field node arena;
 - the list node's `merkle_levels`, updated along the right spine (`O(log N)`).
 
-`finalize` then **seals**: concatenate the field buffers, write the header, emit the index. No
-element is re-encoded and no element is re-hashed.
+The draft is then **sealed**: concatenate the field buffers, write the header, emit the index. No
+element is re-encoded and no element is re-hashed. Today that moment is `finalize`; under §One
+storage rule it is the recur site's close, where the seal runs in the child before `RecurTileEnd`
+is published (§Where the seal runs).
 
 ### Why the encoding permits it
 
@@ -200,9 +223,13 @@ TreeValue::Struct(fields) => {
 }
 ```
 
-Fields occupy consecutive regions, and a draft's fields are a `BTreeMap` — **sorted by name**. For
-`CollectiveGreeting { title, lines }` the order is `lines, title`, so appending to `lines` shifts
-`title`. A draft with one append field is only append-safe if that field happens to sort last.
+Fields occupy consecutive regions in **declaration order**: the payload is encoded from the typed
+value (`encode_raster_value` → `tree_value_from_serialize`), and `TreeStructSerializer::serialize_field`
+pushes fields in the order serde visits them. Appending to a list therefore shifts every field
+declared after it, and a struct is append-safe only if its one growing list is declared last.
+`CollectiveGreeting { title, lines }` declares `lines` last, so it happens to be safe. (Corrected
+2026-09-28: an earlier version said name order, from the draft's `BTreeMap`, which feeds only
+materialization, not layout.)
 
 ### Two remedies, and the trade between them
 
@@ -218,7 +245,32 @@ Fields occupy consecutive regions, and a draft's fields are a `BTreeMap` — **s
 the element count. **They compose** — (a) can land first and (b) later, since (b) only removes the
 fixup (a) introduces.
 
+> **Decided 2026-09-27: (b) is adopted, not optional.** Continuation shares a base object's bytes
+> and index nodes with the object derived from it (§Continuation on the draft buffer).
+>
+> Sharing does **not** strictly need relative offsets. With absolute offsets it still works if
+> every node addresses its own buffer: a base node keeps its offset into `[s1]`'s bytes, and the
+> buffer is implied by the node-id range. (An earlier version of this note said absolute offsets
+> would force rewriting every base node; that holds only if nodes address one shared logical
+> space.) Relative offsets are chosen for three things absolute offsets do not give:
+>
+> 1. **One logical address space.** A node's position is `pos(parent) + rel(child)`, computed on
+>    descent, and a single piece table maps logical positions to buffers. No node carries a buffer
+>    tag, and a chain of derivations adds pieces, not addressing modes.
+> 2. **Cheap export.** A derived object becomes a standalone contiguous `.rindex` artifact — a
+>    program output, an `--input` for the next program — by concatenating its pieces. The index is
+>    valid as it stands; with absolute offsets every node after the first grown region would be
+>    rewritten.
+> 3. **A seal with no fixup** for a creating site: per-field buffers concatenate without the
+>    `O(#nodes)` offset pass remedy (a) leaves.
+
 ## The lifetime model this unlocks
+
+> **Superseded 2026-09-24 by §One storage rule.** The rule below — the sequence wrapping a draft's
+> creation closes it — was replaced: a draft exists only inside a recur site, and the site
+> completes its own object at its own close. The seal survives unchanged; only the moment it runs
+> moved. This section is kept because §What it fixes records how the creation-step question was
+> found and answered.
 
 With seal cheap, *where* a draft closes stops being a cost decision and becomes a semantic one.
 (Measurement qualifies this: a seal costs one storage `append`, ~200–360 µs, dominated by terms
@@ -275,7 +327,8 @@ applies one level up. `finalize` disappears from the sequence grammar.
 - **`recur-deferred-finalize`'s open questions.** *"Should the CFS mark an open recur explicitly
   rather than implicitly by entry point?"* — yes, and it stops being special: every producer may
   return open. *"Should `RecurTileEnd` record the draft's post-root instead of `output: None`?"* —
-  yes; that root is what the enclosing frame receives and later seals.
+  yes; that root is what the enclosing frame receives and later seals. (Under §One storage rule
+  the site seals its own object at its close, and the root check lands at `RecurEnd`.)
 
 ### What must change, and what is not yet settled
 
@@ -289,12 +342,8 @@ applies one level up. `finalize` disappears from the sequence grammar.
   > **Dissolved for recur tiles by §The derivation model.** A site returns `AuthRef<S>`, so nothing
   > open crosses a boundary and `output_commitment` keeps meaning what it means everywhere else.
   > The question survives only for a recur *sequence*, which that revision leaves out of scope.
-- **The coordinate moves.** `store_finalized_draft` picks coordinates from
-  `current_recur_site_coordinates()`, so a draft closed inside a recur site is charged to the site.
-  Closing at the wrapping sequence puts the object in that sequence's frame instead.
-- **A created-but-unused draft must stay an error.** Under blanket auto-close, a draft nobody uses
-  would be silently sealed, stored, committed and traced. Auto-close only what is returned or
-  consumed; keep "created and dropped" a compile error, as today.
+  > **Dissolved for recur sequences too, 2026-09-28** (§Recur sequences): an iteration whose body
+  > returns the draft publishes no output; the draft's progress lives in the frame.
 - **Set-once fields are still whole values in the witness.** `incremental-draft-witness` §5 was
   deliberately not done — the witness carries a full `SchemaNode` per step and a set-once field's
   whole value rather than its root. That is orthogonal, but it bounds how small a draft step can get.
@@ -347,8 +396,8 @@ position and the step that writes it is the event the recorder already replays.
 ### What the rule implies
 
 - **A recur site owns one object**, at `[s]`. It opens at the site's `Start`, the iterations extend
-  it, the site's close completes it, and the site returns `AuthRef<S>`. No seal ceremony — the
-  close *is* the completion.
+  it, the site's close completes it, and the site returns `AuthRef<S>`. No user-visible close call —
+  the site's close *is* the completion, and the seal of §Mechanism runs inside it.
 - **`Draft` shrinks to a tile-local op buffer**: operations a tile performs, applied to storage to
   build the site's object. It never escapes a tile body.
 - **`new!`, `finalize` and `finalize = false` leave the language.** The flag existed only because
@@ -365,6 +414,12 @@ convention:
 
 > **A `Draft<S>` exists only inside a recur site, between its `Start` and its `End`. No step
 > boundary ever carries one.** Values cross between steps; ops live inside a tile.
+
+> **Amended 2026-09-28 for recur sequences (D5a): the boundary is the *site's*, not every step's.**
+> A recur sequence's body is ordinary sequence code that hands the site's draft to plain tiles
+> (`append_activation_row(output: Draft<ActivationSequence>, …) -> Draft<…>` in `raster-inference`'s
+> `input-embedding`). Inside the site's scope, `[s]` to `[-s]`, the draft may pass between the
+> body's steps; it never leaves the scope. See §Recur sequences.
 
 `new!` is not the defect — it is a symptom. The defect is an **open draft crossing a step boundary
 with no storage identity**, which is exactly what mints `[DRAFT_NAMESPACE, n]`: a value that exists
@@ -415,10 +470,23 @@ the thing needing incremental attestation, and a recur site is what supplies it.
 | `raster-macros/src/recur.rs` | `finalize` key removed from `RecurCallInput`; the `*_open` driver set and `__raster_recur_auth_open_<tile>` entry point deleted; `output` becomes present/absent (create) or an expression (derive) |
 | `raster-runtime/src/storage.rs` | `reserve_synthetic_coordinates` deleted with its `next_synthetic_index` counter; `store_finalized_draft`'s two-branch coordinate choice collapses to the site's coordinate |
 | `raster-core/src/cfs.rs` | `DRAFT_NAMESPACE` deleted — no draft can be closed outside a site, so nothing needs the namespace |
+| `raster-macros/src/lib.rs` (tile wrapper) | a recur-iteration tile — one whose return carries the site's draft or its carried state — publishes `output: None`, and its replay emits `output_bytes = []` — see §What actually happens during a sweep |
+| `raster-runtime/src/storage.rs` (draft identity) | the draft's `Anchor` becomes `anchor_for_schema([s], S::schema_hash())`, the site's own coordinate — see §Draft identity |
+| `raster-core/src/draft.rs`, `raster/src/input.rs` | `draft_id` removed from `DraftReplayHandle` and `DraftReplayTransition`; the replayed `Draft` gets a constant anchor — see §Draft identity |
+| `raster-runtime/src/storage.rs` (draft buffer) | `THREAD_DRAFT_STORAGE` → a per-site `DraftBuffer`, holding the encoded per-field buffers of §Mechanism alongside the frontiers and op log; consumed once by the seal — see §The draft buffer |
+| `checks/store.rs` | an `Exec` step without a storage write must have an empty `output_commitment` |
+| `raster-core/src/cfs.rs` (`SequenceDef`), `raster-compiler` (flow resolver) | `returns: Option<InputBinding>`, resolved from the body's returned expression; an unresolvable return is a build error; `produces_output` becomes `returns.is_some()` — see §Sequence return binding |
+| `raster-core/src/trace.rs` (`SequenceEnd`), recorder | `SequenceEnd` records `output: Option<StorageData>` and `output_commitment = selected_hash` |
+| `checks/entrypoint.rs`, `checks/cfs.rs` | `ProgramEnd` and `SequenceEnd` checked against `returns`; a consumer of a sequence item cites exactly its returned binding |
+| `raster-core/src/recur_progress.rs` | `state_commitment` becomes the value's raster root; the frame opens its state at `push_site` from a stored seed's binding; `close_site` checks a state-only site's result — see §Carried-state commitment |
+| `raster-macros` (tile replay, sequence step) | the replay computes `state_in`/`state_out` as raster roots; a recur sequence iteration binds its state as a reference, not inline bytes |
+| `checks/cfs.rs` (`assert_carried_state_matches_input`, `fold_sequence_iteration_state`) | a sequence's `state_in` is the `Start`'s state reference; its `state_out` is the End's returned binding |
 | `checks/drafts.rs` | keeps the per-step `root_before → ops → root_after` check against the witness; loses `active_drafts` and the permissive `if let Some(..)` at `:69`. The expected `root_before` now comes from the site's frame |
 | `raster-core/src/recur_progress.rs` | `RecurProgressFrame` gains the draft entry: opened by `push_site`, advanced by `advance_tile_iteration`, compared against `output_commitment` and popped by `close_site`. See §The draft root rides in the site's recur-progress frame |
 | `raster-core/src/transition.rs` | `active_drafts` removed from `Transition` and `InitTransition`, together with `TrackedDraftState` |
-| `raster-core/src/cfs.rs` (`RecurTileItem`) | `leaves_output_open` deleted; the item says whether the site **derives**, and from which input, so the opening root is not prover-chosen |
+| `raster-core/src/cfs.rs` (`RecurTileItem`) | `leaves_output_open` deleted; `output: Option<RecurOutputDecl { schema_hash, empty_root, derives_from }>` added, so the opening root is not prover-chosen — see §What must come from the CFS |
+| `raster-compiler` (`CfsBuilder`) | fills `RecurOutputDecl.schema_hash` and `empty_root` with `schema_walk` over the site's output type |
+| `raster/src/input.rs` (`restore_draft_from_replay_handle`) | asserts `handle.schema_hash == S::schema_hash()` instead of overwriting it |
 | programs | `new!`/`finalize`/`finalize = false` removed everywhere; seeding tiles either fold into the creating recur tile or become plain value-returning tiles that a site derives from |
 
 **`active_drafts` becomes site-scoped, and then it is not needed at all.** An entry opens at a
@@ -436,8 +504,8 @@ The rule above says *at the coordinate of the step that produced it*. For a recu
 the **close**, not the iterations, and this is load-bearing enough to state mechanically because it
 is nowhere else in these documents.
 
-A mid-sweep iteration writes **nothing to storage**. The recorder's write is conditional on the
-event carrying an output value:
+Under this proposal a mid-sweep iteration writes **nothing to storage**. The recorder's write is
+conditional on the event carrying an output value:
 
 ```rust
 let storage_write = output.as_ref().map(|output| {
@@ -445,9 +513,50 @@ let storage_write = output.as_ref().map(|output| {
 });
 ```
 
-An iteration that hands back an open draft carries no output, so no write occurs. The single write
-happens at `RecurTileEnd` (`recorder.rs:1085`), the same step whose `output_commitment` is set from
-`storage_write.entry.object_commitment`.
+> **Corrected 2026-09-27: today every iteration does write.** An earlier version of this section
+> said an iteration handing back an open draft *"carries no output, so no write occurs."* That is
+> not what the code does. The tile wrapper attaches an `FnOutput` to **every** tile event, whatever
+> it returns (`raster-macros/src/lib.rs`, the native wrapper). A draft-returning tile's result is
+> the `Draft` handle, and `Draft` serializes as a fixed marker, `{ kind: "raster::Draft", schema:
+> <type name>, reusable: false }` (`raster/src/input.rs:317`). So the recorder appends that marker
+> as an object at `[s][i]` on every iteration. Checked on a real trace: all 7
+> `RecurTileIterationExec` frames in the latest `hello-tiles` `trace.bin` carry it. A sweep of N
+> iterations is **N + 1** authenticated appends today. At the measured 71.6 µs per append (93% of
+> it the coordinate index), that is ~7 s per 100 K iterations — the cost §The original cost
+> measurement rules out for per-iteration updates, spent on an object that carries no information.
+>
+> **What makes "no write per iteration" true.** The host cannot simply drop the output. For every
+> tile step the transition guest checks `replay_journal.output_bytes == recorded output witness`
+> (`checks/io.rs`), and the replayed tile serializes its `Draft` result as the same marker, since
+> `Draft`'s `Serialize` impl is not target-specific. Both sides have to change together:
+>
+> - **The replay wrapper** emits `output_bytes = []` for a tile whose return carries the site's
+>   draft — `Draft`, `RecurControl<Draft>`, `(RecurState, Draft)` and `RecurControl<(RecurState,
+>   Draft)>`. Nothing is lost: the draft's effect is the journal's `draft_transition`, the control
+>   is `recur.control`, and the carried state is `recur.state`.
+> - **The native wrapper** publishes `output: None` for the same return kinds, so the recorder's
+>   `output.as_ref().map(..)` writes nothing and `exec_step` leaves `output_commitment` empty.
+>
+> The guest then accepts the step with no other change: the I/O check compares an empty journal
+> output with an absent witness (`unwrap_or(&[])`), and `verify_storage_transition` takes its
+> no-write branch, which requires the storage and index roots to be unchanged.
+>
+> **One guest check to add.** That no-write branch does not constrain `output_commitment`, and the
+> I/O check skips execution steps. Today the branch is rare — every tile event carries an output —
+> so the gap is small; once every recur iteration takes it, an unconstrained 32-byte field on every
+> iteration record is free entropy for manufacturing a divergence. Rule: **an `Exec` step without a
+> storage write must have an empty `output_commitment`.**
+>
+> **State-only iterations are included** (§Still open, D3 — decided 2026-09-28). A tile returning
+> `RecurState<T>` or `RecurControl<RecurState<T>>` also writes its returned state at `[s][i]`
+> today, and nothing reads it: the next iteration receives its state *inline* in its input
+> (`FnInputValue::Inline`), and the chain is enforced on commitments — the replay computes
+> `state_in` from that input and the frame requires it to equal the previous `state_out`. Such a
+> tile likewise publishes `output: None` and replays `output_bytes = []`. Recur *sequences* are
+> unaffected: their iterations close with `SequenceEnd`, which writes nothing.
+
+The single write happens at the site's close (`RecurTileEnd`, `recorder.rs:1043`), the same step
+whose `output_commitment` is set from `storage_write.entry.object_commitment`.
 
 Two accumulators therefore advance at different rates, and conflating them is easy:
 
@@ -456,13 +565,309 @@ Two accumulators therefore advance at different rates, and conflating them is ea
 | one step record | one step record |
 | one `hash_trace_item` → trace frontier | — |
 | one fingerprint entry | one fingerprint entry |
-| **no** storage write | **one** storage write: object + log append + index insert |
+| **no** storage write (today: one, the draft marker — see above) | **one** storage write: object + log append + index insert |
 
-A 1000-iteration sweep is 1001 trace steps and 1001 fingerprint entries, and **one** storage write.
+Under this proposal a 1000-iteration sweep is 1001 trace steps and 1001 fingerprint entries, and
+**one** storage write (1001 today).
 The trace records the *process*; storage records the *result*. That is why every draft mutation is
 fingerprint-bound without touching storage, and why
 [`recur-deferred-finalize`](./recur-deferred-finalize.md) could say deferring the close
 *"moves no attestation; it moves only the materialization."*
+
+### Where the seal runs
+
+The seal of §Mechanism is a child-process operation. It is not a step, not a trace event and not
+something the guest checks directly. Under this rule it has exactly one place to run: the site's
+close, just before the child publishes `RecurTileEnd`.
+
+| moment | child process | recorder | guest |
+| --- | --- | --- | --- |
+| `RecurTileStart` → `RecurStart` at `[s]` | creates the draft with empty per-field buffers; a deriving site loads the base object's persisted frontier and buffers | opens the frame and its draft entry | opens the entry: empty root, or the base's commitment |
+| each iteration → `Exec(Tile)` at `[s][i]` | push: frontier, payload bytes, node arena and Merkle spine updated incrementally | records the witness; advances the frame's root | replays the ops: `root_before` equals the entry, and the entry becomes `root_after` |
+| site close → `RecurTileEnd` → `RecurEnd` at `[-s]` | **seal**: join the buffers into object bytes, index and root; the same payload goes to the child's store and into the End event's `FnOutput` | appends the bytes at `[s]` and sets `output_commitment` | `entry.root == output_commitment`, then pops the frame |
+
+(`RecurStart`, `RecurEnd` and `[-s]` are §A recur site gets its own step kinds; the seal is
+indifferent to them and would run at the same moment with today's kinds.)
+
+Two consequences:
+
+- **The close assertion checks the seal.** A seal whose bytes differ from a full encoding produces
+  a commitment that does not match the replay-derived root, so the guest rejects even an honest
+  trace. The byte-identity invariant in §Verification is therefore enforced at `RecurEnd`, not
+  only by tests — a seal bug shows up as a rejected honest trace, never as an accepted wrong one.
+- **One payload, two consumers.** The seal's output must feed both the store and the trace event.
+  Today the trace side re-encodes independently (§The finding that motivated this), so a seal that
+  replaces only the store's encoding would leave one full re-hash per close in place.
+- **The recorder checks it first.** `close_site` is shared `raster-core` code, and the recorder
+  calls it at the site's close as the guest does. With the draft entry in the frame, the
+  comparison `draft.root == output_commitment` therefore also runs **at record time**, before
+  anything is committed: a seal whose root disagrees with the replayed ops panics in the recorder
+  rather than producing a trace no guest accepts. What it covers is the *root*: the recorder takes
+  an object's commitment from the payload's `root_hash` (`internal_object_commitment`) and does not
+  rehash the bytes, so bytes that disagree with their own root surface only when something reads
+  them with a selection proof.
+
+### Recur sequences (D5a)
+
+**Decided 2026-09-28.** A recur sequence builds its draft in its body's plain tiles, and those
+tiles are replayed: each `Exec(Tile)` at `[s][i][j]` carries a draft transition in its journal.
+So a recur sequence needs no journal of its own to advance the frame's draft entry — the body's
+tiles are that journal.
+
+- **Scope rule.** A draft never crosses a *site* boundary (§The restriction, amended). Inside a
+  recur sequence's scope the body may hand the site's draft to plain tiles; a nested ordinary
+  sequence may not take it, as today.
+- **Frame rule.** Any `Exec(Tile)` whose journal carries a draft transition advances the draft
+  entry of the **innermost live site frame** whose coordinates contain the step. That covers a
+  recur tile's iterations and a recur sequence's body tiles with one rule. A nested recur tile
+  inside the body has its own frame; once it closes, the innermost frame is the sequence's again.
+- **Opening and closing** are the recur tile's: `RecurStart` opens the entry from
+  `RecurSequenceItem.output` (D1's declaration, on both recur item kinds), and `RecurEnd` checks
+  `draft.root == output_commitment` and pops.
+- **No output for a draft-returning step** (D3, generalized): any tile whose return is the site's
+  draft publishes no output, and so does a recur sequence iteration whose body returns the draft.
+  This dissolves §What must change's open question — what `SequenceEnd.output_commitment` commits
+  to for an open draft: nothing, because the draft's progress lives in the frame.
+- **Seeding tiles become values.** `begin_ple_layer(new!(PleLayerInputs), …)` and
+  `begin_layer_output(new!(ActivationSequence), …)` become plain tiles returning a value, and the
+  site derives from it; both only set scalars, so a push-only deriving site suffices.
+  `prefill-range`'s two writers on one draft (`carry_cached_key` with `finalize = false`, then
+  `attend_token`) become a chain of two derivations.
+- **Non-goal: a nested recur tile appending to the enclosing site's draft.** Possible today with
+  `output = output, finalize = false` inside a body; used nowhere in the tests, `examples/` or
+  `raster-inference`. A nested site owns its own result. If it is ever needed, it is a *borrowing*
+  site: one that owns no object, advances the owning frame's draft entry, and whose `RecurEnd`
+  writes nothing.
+
+Full event sequence, for `main = [ per_row ]` with `per_row` a recur sequence over L = 2 rows whose
+body runs a nested recur tile `mac` over K = 2 weights and then `append_row(output, acc)`:
+
+```
+ProgramStart                                          []
+├─ RecurSequenceStart ─► RecurStart     [1]           opens SEQUENCE site per_row (draft entry opens)
+│  ├─ RecurSequenceIterationStart ─► SequenceStart  [1,1]    iteration 1
+│  │  ├─ RecurTileStart ─► RecurStart   [1,1,1]       opens TILE site mac (state only)
+│  │  │  ├─ RecurTileIterationExec ─► Exec(Tile)  [1,1,1,1]   no write (D3)
+│  │  │  └─ RecurTileIterationExec ─► Exec(Tile)  [1,1,1,2]   no write (D3)
+│  │  ├─ RecurTileEnd   ─► RecurEnd     [1,1,-1]      closes mac → writes Acc at [1,1,1]
+│  │  └─ TileExec (append_row) ─► Exec(Tile)  [1,1,2] no write; advances per_row's draft entry
+│  ├─ RecurSequenceIterationEnd ─► SequenceEnd  [1,-1]       no output
+│  ├─ RecurSequenceIterationStart ─► SequenceStart  [1,2]    iteration 2 — same shape at [1,2,…]
+│  │  …                                                       writes Acc at [1,2,1]
+│  └─ RecurSequenceIterationEnd ─► SequenceEnd  [1,-2]
+├─ RecurSequenceEnd   ─► RecurEnd       [-1]          seal; writes the object at [1];
+│                                                      draft.root == output_commitment
+ProgramEnd                                            []
+```
+
+The step kind `RecurStart`/`RecurEnd` is the same for both families; the CFS item at the coordinate
+says which (`[1]` is a `RecurSequence` item, `[1,1,1]` a `RecurTile` item). Three writes in all —
+each iteration's `Acc`, which `append_row` reads, and the site's object — against
+L·(K + 2) + 1 = 9 today.
+
+### Sequence return binding (D5c)
+
+**Decided 2026-09-28.** A reference names a stored object; the guest can only check it as
+precisely as the CFS describes where it came from:
+
+| a step's argument comes from | what the CFS records | what the guest checks | precise? |
+| --- | --- | --- | --- |
+| a tile or recur tile, item `[j]` | "item `j`'s output" | coordinates **equal** `[j]` — a tile has one output, at its own coordinate | yes |
+| a sequence, item `[j]` | "item `j`'s output" | coordinates merely **inside** `[j]` (the `Sequence \| RecurSequence` arm of the prior-item-output check in `checks/cfs.rs`) | no |
+| `main`'s return, at `ProgramEnd` | only `produces_output` | the object is stored and the selection is valid | no |
+
+A sequence writes many objects under `[j]`, one per tile it calls, and which one it returns is
+decided by its body — which the CFS does not record: `SequenceDef` has no return binding, and the
+flow resolver resolves call *arguments* (`resolve_argument`) but never a body's returned
+expression. So a dishonest trace can substitute any object the sequence wrote:
+
+```rust
+#[sequence]
+fn inner(list: …) -> AuthRef<Out> {
+    let a = call!(prepare, list);                    // writes A at [2,1]
+    let b = call_recur!(tile = t, input = list, …);  // writes B at [2,2]
+    b                                                // returns B
+}
+#[sequence]
+fn main(list: …) -> … {
+    let r = call!(inner, list);    // item [2]
+    call!(consume, r)              // item [3]: should read B
+}
+```
+
+A trace in which `consume` cites A at `[2,1]` passes every check — inside `[2]`, stored, validly
+selected, replay input equal to recorded input — and claims `consume(A)`, a computation the program
+never performs. `ProgramEnd` is looser still. **Measured**: a throwaway guest probe gave
+`verify_program_end` an output object at `[7]`, a coordinate naming no CFS item, and it returned
+`Established`. `program-end.md` §7's argument that a forged output "diverges from the fingerprint,
+which is fraud-provable" needs the guest to reject the forged step, which it does not. A recur
+sequence's carried state is the same gap in inline form: an iteration's returned state is its
+`SequenceEnd` output bytes, checked only against their own hash, so the chain of `state_out`s is
+consistent with itself but not with what the body computed.
+
+**The design.**
+
+- **The CFS records each sequence's return**: `SequenceDef.returns: Option<InputBinding>`,
+  resolved from the body's returned expression by the same `resolve_argument` used for arguments —
+  a prior item's output, a sequence parameter, an entry argument — with `select!` paths and index
+  citations. `produces_output` becomes `returns.is_some()` for `main`. The grammar makes this a
+  single binding: the only return form is *"last expression = a binding or call result"*, and
+  control flow is forbidden in sequence bodies (`.claude/skills/raster/SKILL.md`, the sequence
+  grammar table). A returned expression the resolver cannot resolve is a **build error**, never
+  `Inline` — `sequence-grammar-closure`'s rule applied to returns.
+- **`SequenceEnd` records its returned value as a binding**, as `ProgramEnd` already does:
+  `output: Option<StorageData>`, with `output_commitment = selected_hash`.
+- **The guest checks `SequenceEnd` and `ProgramEnd` against `returns`** with the machinery it
+  already runs for tile arguments: a prior item's output against that item's producing record, a
+  sequence parameter against the parent's `Start`.
+- **A consumer of a sequence item cites exactly that sequence's returned binding**, replacing the
+  "inside `[j]`" prefix check. A re-return is one more link: `main` → `inner` → `b` resolves to
+  exactly `[2,2]`.
+- **A nested sequence may not return an inline value**, the rule `main` already has. A recur
+  sequence's returned state is a body tile's output (`advance_word_cursor` in
+  `crates/raster/tests/recur_draft.rs`), so it resolves to a prior item's output and is bound.
+- **A recur site needs no return binding**: its result is its own object at `[s]` (drafts), or its
+  state (D5b).
+
+**Order.** `ProgramEnd` first, as a standalone fix — `main`'s `returns` and one check in
+`verify_program_end`. It is a soundness gap in shipped code and the smallest piece, like D1's
+replay assertion. Nested sequences and consumers follow with the step-kind change, since
+`SequenceEnd` moves to `[-s]` in the same break.
+
+### Draft and carried state are different things
+
+They meet in the same frame and at the same `RecurEnd`, which makes them easy to conflate. They
+should not share a mechanism, a commitment or a check.
+
+| | draft | carried state |
+| --- | --- | --- |
+| what it is | the site's **output object** under construction | a **value threaded between iterations** |
+| how it changes | by ops — `set` and `push` — inside tiles | replaced whole: each iteration returns the next value |
+| where it lives between steps | the child's `DraftBuffer`, never in the trace | recur tile: inline in the next iteration's input. Recur sequence: a **reference** to the previous iteration's returned object (D5b) |
+| frame field | `draft: Option<SiteDraft { schema_hash, root }>` | `state_commitment: Option<Hash32>` |
+| per-step link | `root_before == frame root`; replay proves `root_after` from ops | `state_in == frame commitment`; `state_out` becomes it |
+| commitment | the object's structural root, the same function as its raster commitment | the state value's **object commitment**, the raster root of `T` (D5b; today `H("recur-carried-state" ‖ postcard)`) |
+| what the site returns | the object, at `[s]` | the final state, at `[s]`, for a state-only site; discarded for a state+output site |
+| terminal check | `draft.root == output_commitment` at `RecurEnd` | a state-only site: `frame.state_commitment == output_commitment` at `RecurEnd` (D5b) — a separate field compared by a separate rule |
+
+A state+output site has both, independently: the draft is checked by the draft rule; the state is
+chained per iteration and, since the site discards it, has no terminal check to make.
+
+### Carried-state commitment (D5b)
+
+**Decided 2026-09-28** (resolves D3′). A carried state is committed by the state value's **object
+commitment** — the raster root of `T`, over the inner `T`, not `RecurState<T>`, whose raster
+encoding adds the field name `inner`. That is the function storage already uses for any stored
+object, which is what makes a state comparable with the result a site stores.
+
+| | recur tile | recur sequence |
+| --- | --- | --- |
+| `state_in` | computed in the replay from the typed input value | the commitment of the **reference** the iteration's `Start` binds: the previous iteration's returned object, or the seed |
+| `state_out` | computed in the replay from the returned value | the commitment of the iteration's returned binding, which §Sequence return binding binds to a body tile's output — no hashing, no type needed in the guest |
+| frame opens at `RecurStart` | from the seed's binding when the seed is stored; adopted from iteration 0 only for an inline literal seed | the same |
+| terminal check, state-only site | `frame.state_commitment == output_commitment` at `RecurEnd` | the same |
+| state+output site | chained per iteration; discarded, so no terminal check | the same |
+
+Recur sequence state therefore passes between iterations by reference rather than as inline bytes.
+The `{6}`/`{7}` substitution of D3′ is rejected at `RecurEnd`, for tiles and sequences alike.
+
+**What it also closes.** Both of `recur-state-chaining`'s stated non-goals, in part. A stored seed
+is now pinned — `attend_token`'s `scores` chain in `raster-inference`, each site seeded by the
+previous site's result, and `scan_all_words`'s `begin_word_cursor` — because the frame opens from
+the seed's binding instead of adopting what iteration 0 reports; an inline literal seed stays
+unpinned. And a state+output recur sequence's final `state_out` is no longer free: it is a body
+tile's bound output.
+
+**Rejected.** Keeping `H(postcard)`: the terminal check is impossible for recur sequences, since the
+guest cannot turn postcard bytes into a raster root without knowing `T`. The selection hash of the
+state's raster payload: computable without the type, but the stored result is committed by its
+raster root, so the close would have to carry the stored object's payload to compare.
+
+**Requires.** The replay's raster root must equal storage's for every state type. The probe in
+§Verification showed it for a struct of a `String` and a `List<String>` only; a type-coverage test
+(enums, maps, integers, `Bytes<N>`, nesting) must pass before relying on it. On a mismatch, the fix
+is one shared encoder in `raster-core`, used by both the replay and storage.
+
+### Draft identity
+
+A draft is keyed by an `Anchor` in `THREAD_DRAFT_STORAGE`, and the replay journal's
+`DraftReplayTransition.draft_id` carries it. Today the anchor is
+`anchor_for_schema(coordinates, schema_hash)` over the **synthetic** coordinate
+`reserve_synthetic_coordinates` mints, `[…, DRAFT_NAMESPACE, n]`. Deleting the namespace deletes
+that input, so the anchor needs a new one.
+
+**Rule: `anchor = anchor_for_schema([s], S::schema_hash())`**, the site's own coordinate. It is
+unique, because a site owns exactly one draft and no two live sites share `[s]`, and it needs no
+counter. It is a **host-side** key only: it names the site's `DraftBuffer`, and it does not enter
+the trace.
+
+**`draft_id` leaves the trace — decided 2026-09-28** (§Still open, D2). Its only reader in the
+guest was the `active_drafts` map key (`checks/drafts.rs:69,84`), which the frame design deletes: an
+iteration at `[s][i]` finds its draft through the site frame, and a tile step carries at most one
+draft, since a `Draft` appears only in a recur tile's output slot. Everywhere else it was passed
+through: the replay tile read it from the handle in its input (`Draft::new(handle.draft_id, …)`)
+and echoed it into the journal, and the native witness copied the host anchor
+(`raster-runtime/src/storage.rs:1254`). Left in place it would be a host-chosen value reaching a
+trace leaf that nothing checks — the free-field entropy `verify_sequence_id` is written to exclude.
+
+So `draft_id` is removed from `DraftReplayHandle`, from `DraftReplayTransition` (the replay
+journal's and the native witness's), and with `active_drafts` from the guest. The replayed `Draft`
+is constructed with a constant anchor, which it never uses — the replay has no draft buffer. The
+alternative, checking `draft_id == anchor_for_schema(frame.site, output.schema_hash)`, was rejected:
+it would move `anchor_for_schema` into `raster-core` only to validate a field nothing reads. The
+change moves the tile guests' journal format and image ids, which D1's schema assertion and the
+step-kind change move anyway.
+
+### The draft buffer — why a draft is not an entry in the object store
+
+The child process keeps two stores, and it is fair to ask why a draft does not simply live at `[s]`
+in the first one and get updated per iteration.
+
+| | `THREAD_STORAGE: ObjectStore` | `THREAD_DRAFT_STORAGE` |
+| --- | --- | --- |
+| entry | `StoredObject { reference: (coordinates, commitment), backing: bytes + raster payload }` | `DraftRuntimeState { schema, current_root, fields, ops }` |
+| form | **encoded and final**: postcard bytes plus the raster index and root, built in one pass by `encode_raster_value` | **working form**: a set-once field as a value tree with its root; an append field as `values: Vec<DraftValue>` plus an `AppendFrontier` |
+| mutability | write-once: `put` asserts no earlier write at the coordinate | changed on every `set`/`push` |
+| key | coordinate, read through a `StorageRef` that pins the commitment | `Anchor`, which no step can select |
+| authenticated structures | none since `storage-role-split`: log, index and roots live only in the recorder | none |
+
+**What the draft buffer is for.** It is not only a root tracker. It does four things `ObjectStore`
+cannot:
+
+1. **It accumulates values until materialization.** Under `--no-auth`, where roots are skipped,
+   this is all it does.
+2. **It tracks the root cheaply.** A push hashes the new element once and moves the frontier —
+   `O(log N)`, plus `O(#fields)` to recompose. The root is needed per op (the handle's
+   `expected_root`), in the tile's input (`root_before`), and in the witness (the pre-state must
+   root to `root_before`).
+3. **It produces the per-step witness.** `ops` and the pre-state snapshot (schema, set values,
+   frontiers) are what give the guest `root_before → ops → root_after` for each iteration.
+   `ObjectStore` has no op log.
+4. **It keeps the half-built value unreachable.** Keyed by `Anchor`, it cannot be selected by any
+   step; the object at `[s]` appears only at the close.
+
+**Why not update the object at `[s]` per iteration instead.** The answer differs by layer:
+
+| layer | per-iteration update would cost | verdict |
+| --- | --- | --- |
+| child `ObjectStore` | a full re-encode per push. No index or root is involved on this side, but the stored form is the encoded payload, and today it is not appendable — `RasterNode.offset` is absolute and struct fields are laid out sequentially (§The two things that do not permit it). So each push reruns `encode_raster_value` over the whole object: `O(N)` per push, `O(N²)` per sweep. At the measured ~1.5 µs per element, a 16 384-element sweep would spend about N²/2 × 1.5 µs ≈ **200 s**, against ~25 ms for build-then-seal (an estimate from the measured rate, not a run) | ruled out |
+| recorder `AuthenticatedObjectStore` | a traced write per iteration: log append plus index insert, 71.6 µs, 93% of it the index; an update-witness kind; a storage gate | ruled out, §The draft root rides in the site's recur-progress frame |
+| transition guest | nothing either way: it verifies ops against roots and first sees the object in the close's write witness | — |
+
+**The seal makes the question a matter of placement.** Once §Mechanism is in place, each append
+field keeps its *encoded* payload bytes, node arena and Merkle spine up to date as elements are
+pushed. The draft buffer then *is* the object under construction, in appendable form, and the seal
+only joins the buffers and hands them to `ObjectStore` at `[s]`. At that point it could in principle
+be a mutable `ObjectStore` entry. It stays separate because `ObjectStore`'s contract is that a
+`StorageRef` — coordinates plus commitment — pins immutable bytes. A mutable entry would change its
+commitment on every push, breaking that contract for the length of the sweep, and it would need the
+duplicate-write assertion relaxed and a new rule that nothing may read `[s]` yet. A separate buffer
+keeps the invariant for free, and the recorder never has to mirror it.
+
+**Rename.** `THREAD_DRAFT_STORAGE` becomes a per-site **`DraftBuffer`**: keyed by the site's anchor
+(§Draft identity); holding the values or encoded buffers, the frontiers and the op log; created at
+the site's `Start`; handed to `ObjectStore` exactly once, by the seal at the site's close. "Storage"
+suggests an addressable store alongside `ObjectStore`, which is exactly what it must not be.
 
 ### Three representations, and why none is redundant
 
@@ -471,7 +876,7 @@ written down:
 
 | | holds | why it cannot be elsewhere |
 | --- | --- | --- |
-| **child process** | full state: `values` **and** `AppendFrontier`, in `THREAD_DRAFT_STORAGE` keyed by `Anchor` | it has to *compute*. The recorder is downstream on a one-way pipe, and under `--no-auth` there is no recorder at all |
+| **child process** | full state: `values` **and** `AppendFrontier`, in `THREAD_DRAFT_STORAGE` keyed by `Anchor` | it has to *compute*. The recorder is downstream and one-way: it runs in the `cargo raster run` process and replays `trace.bin` after the program has exited (`run.rs`, `child.wait()` before `load_trace_from_file`). Under `--no-auth` there is no recorder at all |
 | **recorder** | per-step `draft_transition_witness`, and — under §The draft root rides in the site's recur-progress frame — **one running root per live site**, in its `RecurProgressStack` | it holds *evidence*. Each witness is self-contained — a pre-state frontier plus ops — so nothing needs accumulating to *prove* a step. The running root exists only so the recorder can stamp `recur_progress_commitment`, and it is computed from the same witness |
 | **transition guest** | the running root only: `active_drafts[id]` today, the site frame's `draft.root` under §The draft root rides in the site's recur-progress frame | it *verifies*: `root_before → ops → root_after`, one link per step. It never sees an element value |
 
@@ -525,12 +930,18 @@ another site's object — is push-only. Two things follow, and both are larger t
 1. *Continuation becomes a whole-object property.* With `set` permitted, a derived object could
    differ from its base in a set-once field, so "`[s2]` is `[s1]` plus appends" would hold only
    field by field. Append-only makes it true of the object.
-2. *The layout blocker stops binding.* §The two things that do not permit it shows appends shift
-   later fields because a draft's fields are a `BTreeMap` laid out in name order — *"only
-   append-safe if that field happens to sort last."* But the **root** does not use layout order:
-   `draft_root_from_field_roots` folds child roots through `struct_commitments_root` in *schema*
-   order. Layout and hash order are already decoupled, so laying append-only fields **last in the
-   payload** makes an append shift nothing, whatever the names sort to.
+2. *The layout blocker stops binding* — through relative offsets (`rindex04`, adopted in §Two
+   remedies), not through field order. With offsets relative to the parent's region, an append
+   shifts no node's recorded offset for any number of lists; four of the eight `raster-inference`
+   recur outputs in the table below have two or more (`KvSequence`, `PleLayerInputs`,
+   `PrefillLogits`, `ActivationSequence`).
+
+   > **Corrected 2026-09-28.** An earlier version argued that layout and hash order are decoupled,
+   > so append-only fields could simply be laid out last. Both premises are wrong. Fields are laid
+   > out in declaration order (§The two things that do not permit it), and the raster root folds a
+   > struct's children in that same order (`assemble_subtree` → `struct_commitments_root`), so
+   > reordering the layout would change the object's commitment. The draft root's schema order
+   > matches it — measured, §Verification.
 
 The line is drawn at **creator vs deriver**, not at *first iteration vs later*. An earlier
 draft of this section said set-once fields must be written at `is_first()`; that is wrong and would
@@ -553,10 +964,150 @@ are not: `output-finalize/src/lib.rs:143-148` sets `generated_token_count`, `gen
 summary scalars" is the natural shape of a finalize stage, and an `is_first()` rule would forbid it.
 
 Creator-vs-deriver keeps every one of those programs legal while preserving what mattered: a
-derived site touches only the tail, so continuation stays a whole-object property and the payload
-never shifts. `DecodeEdge`'s chain is already push-only downstream —
+derived site touches only the tail of each list, so continuation stays a whole-object property, and
+with relative offsets no base node is rewritten. `DecodeEdge`'s chain is already push-only downstream —
 `append_selected_token` (`decode-select-token/src/lib.rs:96`) does nothing but
 `generated_token_ids().push(..)`.
+
+### Continuation on the draft buffer
+
+**Added 2026-09-27.** How a deriving site runs, with the pieces defined elsewhere in this
+proposal — `RecurStart`/`RecurEnd`, the `DraftBuffer`, the frame's draft entry and the seal:
+
+```rust
+let base = call!(begin_greeting, title);                                        // object at [3]
+let g = call_recur!(tile = add_line, input = lines, output = base, args = ());  // object at [4]
+```
+
+| step | user side (`DraftBuffer`) | recorder | guest |
+| --- | --- | --- | --- |
+| `RecurStart` at `[s2]` | create the buffer, anchor `anchor_for_schema([s2], S)`, **initialized from the base**: read `[s1]` from `ObjectStore`; take each list's frontier and each field's root from its raster index; decode the set-once fields only | open the frame's draft entry: root = base commitment, `derived = true` (from the CFS) | the same, with the base commitment bound through `RecurStart`'s input source witness to the record that produced `[s1]` |
+| iteration | `push` only: hash the new element, move the frontier, append its encoded bytes and nodes to that list's tail | `root_after = apply_draft_ops(pre_state, ops)`; the frame root advances | `root_before == frame root`; ops apply; **no `Set`** |
+| `RecurEnd` at `[-s2]` | seal: the delta — each list's tail, updated headers and right spine — plus a reference to `[s1]` | one write at `[s2]`, as a **derived** object sharing `[s1]`'s bytes and nodes; `frame root == output_commitment` | the same comparison, then pop |
+
+**How continuation is proven — one chain, no new witness.** The base's commitment is bound at
+`RecurStart`. At the first iteration, `verify_witness_root(pre_state, root_before)` shows the
+pre-state (frontiers and set-field values) roots to exactly that commitment, so the prefix cannot
+be altered. Only `Push` ops follow. The chain's final root equals the commitment written at
+`[s2]`. Together: `[s2]` is `[s1]` plus appends. The frame's opening root is the whole join.
+
+**What it requires.**
+
+1. **The frontier comes from the base's index, not from a persisted copy.** The raster index
+   already stores every Merkle level of every list (`RasterNodeKind::List { merkle_levels }`,
+   built by `merkle_levels_from_hashes`). The frontier — length, last leaf, the complete left
+   subtrees — is readable from those levels in `O(log N)`. This replaces the earlier requirement
+   to persist a frontier with the object, which a base produced by a plain tile (`begin_greeting`)
+   would never have had. The condition is that the base is raster-encoded, as a recur source
+   already must be.
+2. **The seal lands before or with derivation.** Today's buffer keeps decoded `values` and finalize
+   re-encodes everything. A deriving site on today's buffer would decode all N base elements at
+   `RecurStart` and re-hash them at the close — correct, but `O(N)` per extension, which is what
+   derivation exists to avoid. With the encoded per-field buffers of §Mechanism, the base's bytes
+   and nodes are adopted as they are.
+3. **Push-only is enforced explicitly.** The set-once rule does not cover it: a base whose set-once
+   field was never set stores `Unit`, and `root(Unit)` equals the absent-field root
+   (`absent_field_root`), so a prover can present that field as absent in the witness and a
+   deriver's `Set` then passes `apply_draft_ops`. The frame's draft entry carries `derived`, taken
+   from the CFS like the site's other facts, and `advance_tile_iteration` rejects any `Set` op when
+   it is set.
+4. **The first iteration's witness carries the base's set-once values.** `incremental-draft-witness`
+   §5 was not done, so the pre-state holds a set-once field's value, not its root. The buffer
+   decodes the base's set-once fields — never its lists — at `RecurStart`. The cost is bounded by
+   the size of those scalars.
+5. **Relative offsets (`rindex04`).** Adopted, per §Two remedies: one logical address space,
+   export by concatenation, and a fixup-free seal. §How a derived object maps onto buffers
+   below relies on the first.
+
+**The close carries a delta, not the whole object.** Today `RecurTileEnd` carries the site's full
+output — `FnOutput { postcard bytes, raster payload }` — and the recorder stores a full copy at the
+site's coordinate. That is the only way the object reaches the recorder, which rebuilds its storage
+from trace events alone. For a derived object it is redundant: the recorder already holds `[s1]`,
+written by the step that produced it. So a deriving site's `RecurTileEnd` carries:
+
+- a reference to the base, `(coordinates [s1], commitment)`;
+- per list field, the appended elements' bytes and index nodes, and the updated right spine;
+- the updated list headers (`len`) and the new root — `O(#fields)`.
+
+The recorder resolves `[s1]` in its own replica and stores `[s2]` as a new backing kind,
+`ObjectBacking::Derived { base: StorageRef, tails }`, beside today's `Owned` and `Referenced`. The
+child's `ObjectStore` uses the same backing and shares the base's bytes instead of copying them.
+The commitment written is the stated root; the close check `frame root == output_commitment` ties
+it to the replayed ops, and the recorder can recompute it in `O(k + log N)` from the base's levels
+and the tail's element roots. The guest is unaffected: a write witness proves `(coordinates,
+commitment)`, never bytes. Selection proofs into `[s2]` come from the derived backing's index —
+the base's levels plus the updated spine — and must equal those of the same object encoded
+contiguously.
+
+Cost per derivation of k elements onto N: **hashing `O(k + log N)`, trace bytes `O(k)`, recorder
+memory `O(k)`**, against `O(N + k)` for all three with a full-object output. A chain of m
+derivations carries `O(Σk)` bytes instead of about `m · N`.
+
+A plain site's output, and any non-derived object, still travels whole: those bytes are new data,
+and the recorder has no other way to learn them.
+
+#### How a derived object maps onto buffers
+
+A design sketch, fitted to today's format: a node's payload is `tag(1) ‖ count(8) ‖ children`; a
+struct field is `name_len(8) ‖ name ‖ payload_len(8) ‖ payload`; a list element is
+`len(8) ‖ payload` (`prepare_raster_children`); all lengths are fixed-width. A read selects a node
+and slices `(offset, len)` out of the payload. A list node stores its element ids **and every
+Merkle level** inline (`RasterNodeKind::List { elements, merkle_levels }`), so a list node is itself
+`O(N)`.
+
+**Bytes — a piece table.** The derived object's logical payload is an ordered list of pieces,
+`(logical_start, source, source_offset, len)`, each sourced from the base's bytes or the delta's
+tail buffer. For `CollectiveGreeting { lines, title }` (laid out in name order), with k lines
+appended to `[s1]`:
+
+```
+P1 Base[s1] | S tag,count | "lines" name_len,name |     unchanged
+P2 Tail     | payload_len′ | L tag,count′ |               16 new header bytes
+P3 Base[s1] | e1 … en1 |                                  base elements
+P4 Tail     | en1+1 … en1+k |                             appended elements
+P5 Base[s1] | "title" field |                             unchanged
+```
+
+There are `O(#fields)` pieces: per grown list a header piece, a base region and a tail region;
+adjacent unchanged base bytes merge. A read binary-searches the pieces. A range inside one piece is
+a borrowed slice with no copy — and selecting element i or a set-once field always is, since an
+element never straddles the base/tail boundary. Only a whole grown list, the whole object, or a
+range across the boundary spans pieces; hashing such a span streams the pieces into sha256 in
+order, without copying, and decoding gathers them.
+
+**Nodes — an overlay index.** With relative offsets, each node of the derived object is one of:
+
+| kind | nodes | cost |
+| --- | --- | --- |
+| shared | every base node in an unchanged region: base elements and their subtrees, unchanged fields' subtrees | none — reused by id; their relative offsets still hold because the list header stays 9 bytes |
+| new | the appended elements and their subtrees | `O(k)` |
+| rewritten | the path from the root to each grown list (struct root, grown list nodes), and sibling fields after a grown list, whose offset relative to the struct moved; their children are relative to them and do not change | `O(#fields + depth)` |
+
+The base arena keeps its ids, and the overlay appends new ones — the push-only arena property
+§Why the encoding permits it already relies on.
+
+**Lists — a continuation, not a copy.** A grown list's node becomes `{ base list node, extra
+element ids, per-level tails }`. Element i's id comes from the base below `n₁` and from the extras
+after. At level h the first `p_h = ⌊n₁ / 2^h⌋` nodes covered complete subtrees in the base and are
+unchanged, so level h is `base.levels[h][..p_h] ++ tail[h]`; all the tails together are
+`O(k + log N)` hashes — the same work as the draft buffer's frontier push. A proof sibling at
+level h comes from the base prefix below `p_h` and from the tail otherwise, `O(1)` per level, so
+selection proofs keep their shape.
+
+**Chains — flattened at derivation.** `[s3]` derived from `[s2]` gets pieces that point directly at
+the original buffers (`[s1]`'s bytes, `[s2]`'s tail, `[s3]`'s tail), never at `[s2]`'s piece table,
+so a read costs the same at any chain depth. A grown list gains one piece per derivation, so after
+m derivations a lookup is `O(log m)`; compacting a list past a piece threshold is optional.
+
+**The recorder rebuilds, it does not trust.** It reconstructs the piece table from the base's index
+and the overlay rather than accepting one from the child, and can recompute the root from the
+overlay in `O(#fields + k + log N)`. A derived object keeps no postcard form: whole-object reads
+already use the raster bytes when present (`OwnedObject::resolve_whole`).
+
+**The invariant.** Flattening the pieces yields a payload **byte-identical** to encoding the same
+value contiguously, and every node reached by a selector path has the same logical position,
+length and root as in that encoding (node ids may differ). Selection proofs therefore cannot tell
+a derived object from a contiguous one.
 
 ### What this fixes beyond the reported failure
 
@@ -637,7 +1188,7 @@ pub struct SiteDraft {
 
 | step | frame operation | check |
 | --- | --- | --- |
-| site `Start` | `push_site` opens `draft` | creating site: `root` = the empty root of `S`. Deriving site: `root` = the base object's commitment, bound the way the site's `Start` binds all its inputs, by its input source witness against the producing record's `output_commitment` |
+| site `Start` | `push_site` opens `draft` | creating site: `root` = `output.empty_root` from the CFS. Deriving site: `root` = the base object's commitment, bound the way the site's `Start` binds all its inputs, by its input source witness against the producing record's `output_commitment` |
 | iteration | `advance_tile_iteration` advances `draft` | the replay journal carries a `DraftReplayTransition` **iff** `draft` is `Some`, with `schema_hash` and `root_before` equal to the frame's. `root` becomes the `root_after` that `apply_draft_ops` derives |
 | site close | `close_site` compares, then pops the frame | `draft.root == step.output_commitment`. The close's storage write witness already proves `([s], output_commitment)` was inserted |
 | every step | — | `progress.commitment() == step.recur_progress_commitment`, unchanged |
@@ -665,6 +1216,40 @@ must not choose either of them:
   `state_is_output` was added.
 - *Whether the site derives, and from which input.* Without this, a deriving site could be
   presented as a creating one: it would open at the empty root and silently drop its base.
+- *The output's schema hash and empty root* (§Still open, D1 — decided 2026-09-28). The empty root
+  depends only on `S`, and a zero-iteration close has nothing else to compare against.
+
+All three live in one field, computed when the CFS is built:
+
+```rust
+pub struct RecurTileItem {
+    // … id, sources, chunk, state_is_output …   (`leaves_output_open` deleted)
+    /// `None` exactly for a state-only site.
+    pub output: Option<RecurOutputDecl>,
+}
+
+pub struct RecurOutputDecl {
+    pub schema_hash: [u8; 32],     // schema_walk over the output type, hashed
+    pub empty_root: [u8; 32],      // draft_root_from_field_roots(schema, {})
+    pub derives_from: Option<InputBinding>,  // `None` for a creating site
+}
+```
+
+`CfsBuilder` fills `schema_hash` and `empty_root` with `raster-compiler::schema_walk`, the walker
+that already fills `InterfaceDecl.schema_hash` for `main`'s interface, so both enter
+`program_commitment` through the CFS. The guest therefore needs no `SchemaNode` at `RecurStart`.
+Two consequences:
+
+- **The replay tile must bind the schema.** Today `restore_draft_from_replay_handle` sets
+  `S::schema_hash()` and then overwrites it with the host-supplied `handle.schema_hash`
+  (`raster/src/input.rs:636`), so a journal's `schema_hash` is host-chosen. It becomes an
+  assertion, `handle.schema_hash == S::schema_hash()`, which makes every iteration's schema hash
+  replay-proven. The guest then checks the journal's hash against `output.schema_hash`. This is a
+  gap today, independent of this proposal, and worth fixing first.
+- **The walker must agree with the derive** for every recur output type — the same reliance
+  `InterfaceDecl` already has. A disagreement cannot pass silently: an honest run fails, at the
+  first iteration (journal hash against the CFS hash) or at a zero-iteration close (stored object
+  against `empty_root`).
 
 **Parity with the recorder.** Every frame field must be computable by the recorder, which is what
 made revision 1 of `recur-progress-commitment` unimplementable. The draft root qualifies. The
@@ -736,7 +1321,10 @@ closest existing kind, `SequenceStart`. So the close is `Exec` for historical re
    `RecurTileStart` and `RecurTileEnd` (`raster-macros/src/recur.rs:822, 960`), and the recorder
    passes it into the close's `ExecStep`. Both steps bind the inputs, and both need input source
    witnesses. §3.2 intended the opposite: *"The trailing event stops being an input carrier at
-   all."*
+   all."* The macro records why it did not happen: *"`End` keeps its input too for now: every
+   downstream check on the site's `Exec` record reads it, so duplicating keeps this addition
+   strictly additive"* (`raster-macros/src/recur.rs`, above `RecurTileStart`). A deliberate
+   temporary duplication, then, which the new step kinds retire.
 4. **Open and close share `[s]`.** After the close, `[s][1]` is still an ordering-legal successor,
    which only `close_site` rejects. The witness store is keyed by coordinates, so the close's entry
    overwrites the `Start`'s. This is the defect #8 fixed for recur-*sequence* iterations by moving
@@ -843,8 +1431,8 @@ than on a borrowed kind that only the item disambiguates:
 One rule becomes easy to state with a kind of its own: `RecurEnd` **always** writes exactly one
 object. Under §One storage rule every site produces one, `finalize = false` is gone, and a
 state-only site stores its state. So `storage` is never "unchanged", and the guest requires a
-write rather than accepting its absence. §Still open's question of where a creating site's empty
-root comes from is unchanged: it is needed at `RecurStart`, and still needs `S`'s schema there.
+write rather than accepting its absence. Where a creating site's empty root comes from is not
+changed by this: it is needed at `RecurStart`, and still needs `S`'s schema there (§Still open, D1).
 
 **What the move to `[-s]` forces.**
 
@@ -887,12 +1475,33 @@ root comes from is unchanged: it is needed at `RecurStart`, and still needs `S`'
   iterations today and must also accept a recur site item; the scope branch already asks it for a
   scope's close.
 
+- **Ordinary nested sequences close at `[-s]` too** (§Still open, D4 — decided 2026-09-28). With
+  a sequence's `SequenceStart` and `SequenceEnd` sharing `[s]`, the successor relation — keyed on
+  the coordinate alone — is the union of both halves' successors. Measured with a throwaway probe
+  on `main = [a, child, d]`, `child = [b, c]`:
+
+  | after | successors today |
+  | --- | --- |
+  | `[2]` (child's `SequenceStart`) | `[2]` (End), `[2,1]` (first step), **`[3]` (next sibling)** |
+  | `[2,2]` (child's last step) | `[2]` (End), **`[2,1]` (restart the body)**, **`[3]` (next sibling)** |
+
+  So the ordering check accepts a trace that skips a sequence's End, and one that restarts its
+  body after the last step — the latter stopped only incidentally, by the duplicate-write assert on
+  the body's first tile. Nothing else requires the End: a consumer of the child's output is checked
+  only for storage coordinates inside `[2]`. With the End at `[-s]`, every scope — sequence, recur
+  sequence iteration, recur site — opens at `i` and closes at `-i`, and each set is exact:
+  `SequenceStart` → `{[s][1], [-s]}`, the last child → `{[-s]}`, `SequenceEnd` → `{[s+1]}` or the
+  parent's close. The union branch in `try_get_next_coordinates` goes away rather than surviving
+  for nested sequences alone.
+
 **What moves.**
 
 | area | change |
 | --- | --- |
 | `raster-core/src/trace.rs` | `RecurStart` and `RecurEnd` added to `StepKind`, with `RecurStartStep` and `RecurEndStep`; `ExecTarget::RecurTile` and `ExecTarget::RecurSequence` removed, and the comments that explain them (`trace.rs:457`, `:784`) rewritten; the accessors `input_commitment()`, `input_source_commitment()`, `output_commitment()` and `storage_roots()` gain arms — inputs only on `RecurStart`, output and storage only on `RecurEnd` |
-| `raster-core/src/cfs.rs` | `closing_coordinates_of` accepts a recur site item; `try_get_next_coordinates` and `expand_recur_entry_coordinates` change the successor sets above |
+| `raster-core/src/cfs.rs` | `closing_coordinates_of` accepts recur site and sequence items; `try_get_next_coordinates` (including the climb out of a sequence's last child, which returns the parent's close) and `expand_recur_entry_coordinates` change the successor sets above |
+| `raster-runtime/src/tracing/recorder.rs` (`SequenceEnd`) | a nested sequence's `SequenceEnd` records at `[-s]`, with its own witness-store entry |
+| `raster-prover/src/trace.rs` (producer lookup) | a `Sequence` item's producer is its `SequenceEnd` at `[-s]` |
 | `raster-runtime/src/tracing/recorder.rs` | the `RecurTileStart`/`RecurSequenceStart` event arm records `RecurStart` with `site_id`, and `sequence_id` naming the enclosing sequence; the `RecurTileEnd`/`RecurSequenceEnd` event arms record `RecurEnd` at `[-s]`, write at `[s]`, and stop reading `fn_call_record.input` |
 | `raster-macros/src/recur.rs` | the `RecurTileEnd` and `RecurSequenceEnd` events publish `input: None` |
 | `checks/cfs.rs` | `record_matches_item` gains one arm, `(RecurStart \| RecurEnd, RecurTile(item) \| RecurSequence(item)) => site_id == item.id`, with any other item rejected, and loses `(SequenceStart, RecurTile)` and the two `Exec` site arms; `declared_sequence_id` loses its `RecurTile` arm; `advance_recur_progress` dispatches on the kind, takes the family from the item and passes `opened(coordinates)` to `close_site`; step-kind names in panic messages gain the two |
@@ -902,9 +1511,8 @@ root comes from is unchanged: it is needed at `RecurStart`, and still needs `S`'
 
 **Cost.** A trace-format break: `StepKind` gains two variants, `ExecTarget` loses two, and site
 closes move coordinate, so every trace containing a recur site changes its fingerprint. Batch it
-with the break §One storage rule already causes. The ordinary nested `SequenceEnd` still shares
-`[s]` with its `SequenceStart`; moving it to `[-s]` is the same change and could ride along, but
-nothing here needs it.
+with the break §One storage rule already causes. Nested sequences' `SequenceEnd` moves to `[-s]`
+in the same break (D4), so every trace with a nested sequence changes too.
 
 ### What it needs
 
@@ -915,42 +1523,153 @@ nothing here needs it.
   compares and pops it. `advance_tile_iteration` chains it in between.
 - **`RecurStart`/`RecurEnd` step kinds** for both recur site families, in place of the borrowed
   `SequenceStart` and `Exec`, with the close at `[-s]`. See §A recur site gets its own step kinds.
-- **Two CFS facts on `RecurTileItem`**: whether the site owns an object (`!state_is_output`,
-  already present) and whether it derives, and from which input (new).
-- **Persist the append frontier** with the object, per append-only field. Without it a derived site
-  must refold every base element to obtain a right edge — `O(N)` per extension, which defeats the
-  sharing. It is `(len, leaf, ommers)`: **≤ 20 digests at 10⁶ elements**. Safe to store because it
-  is *derived*, not authoritative — `verify_witness_root` already requires it to root to
-  `root_before`, and `root_before` must equal the read-proven base commitment.
-- **Lay append-only fields last in the payload**, independent of name order.
-- **`rindex04` relative offsets** become an *optimisation* rather than a prerequisite under
-  append-only derivation, since nothing earlier in the payload grows. They still matter for
-  avoiding an `O(N)` re-assembly when a derived object is materialized contiguously.
+- **No output for draft-returning iterations**, on the host and in the replay, plus the guest rule
+  that an `Exec` step without a write has an empty `output_commitment`. See §What actually happens
+  during a sweep.
+- **Draft identity from the site**: `anchor_for_schema([s], S::schema_hash())` as the host-side
+  buffer key, and `draft_id` removed from the handle, the journal and the witness. See §Draft
+  identity.
+- **`THREAD_DRAFT_STORAGE` renamed to a per-site `DraftBuffer`**, created at the site's `Start` and
+  consumed once by the seal. See §The draft buffer.
+- **`RecurTileItem.output: Option<RecurOutputDecl>`** in the CFS: whether the site owns an
+  object, its schema hash and empty root (computed by `schema_walk`), and whether it derives and
+  from which input.
+- **The replay tile's schema assertion**, `handle.schema_hash == S::schema_hash()`.
+- ~~**Persist the append frontier** with the object.~~ **Superseded 2026-09-27**: the raster
+  index already stores every list's Merkle levels, so a deriving site reads the frontier from the
+  base's index in `O(log N)`. See §Continuation on the draft buffer.
+- ~~**Lay append-only fields last in the payload.**~~ **Superseded 2026-09-27**: sufficient for one
+  growing list only; relative offsets cover any number.
+- **Derivation after (or with) the seal**, the `derived` flag with its push-only guest check, and
+  decoding only the base's set-once fields at `RecurStart`. See §Continuation on the draft buffer.
+- **A delta output for a deriving site's close**, and `ObjectBacking::Derived` in both stores.
+- **One sealed payload for both consumers** at the site's close: the child's store and the
+  `RecurTileEnd` event's `FnOutput`. The driver's separate `resolve_storage_value` +
+  `raster_trace_payload` pass goes away.
+- **`rindex04` relative offsets — adopted.** An earlier revision made them an optimisation, on
+  the premise that nothing earlier in the payload grows; that holds for one growing list only.
+  Sharing could be built on absolute offsets with per-buffer addressing, but relative offsets give
+  one logical address space, export by concatenation and a fixup-free seal. See §Two remedies.
+- **The derived-object mapping**: piece table, overlay index, list continuation, flattening at
+  derivation. See §How a derived object maps onto buffers.
 
 ### Still open
 
+Closed:
+
 - ~~Who owns a draft no recur creates.~~ **Closed 2026-09-27** by §The restriction: a draft never
-  crosses a step boundary. No draft exists outside a recur site, so the question does not arise.
-  `hello-tiles/src/main.rs:85` is rewritten — a plain tile returns an ordinary value and a site
-  derives from it — at the cost that a chain of plain tiles contributing to one *growing* object is
-  no longer expressible.
-- **Recur sequences.** This revision is written for `call_recur!`. The rule should extend
-  unchanged, since a recur sequence site already lands its output at `[s]`, but the
-  `SequenceEnd.output_commitment` question in §What must change is untouched here. The
-  recur-progress frame already serves both site kinds, but a recur sequence has no replay journal
-  to advance the frame's draft entry from, so it inherits the open question behind
-  `recur-state-chaining`'s unpinned terminal `state_out`.
-- **Whether intermediate objects should stay addressable.** A chain leaves `[s1]` readable at its
-  own commitment forever. That is sound — every read names the commitment it read — but it grows
-  the coordinate index by one per extension.
-- **Where a creating site's empty root comes from at `Start`.** It is the root of the empty
-  object of `S`, so it needs `S`'s schema, and today the schema first appears in iteration 0's
-  witness (`pre_state.schema`). There are two options. The CFS item can record the output schema
-  hash while the `Start` supplies the `SchemaNode` to hash against it. Or the frame can open as
-  "empty, schema `h`" and let iteration 0 *adopt* its root after checking that its pre-state
-  witness is empty, which is how `state_commitment` adopts at iteration 0. The second option
-  still needs the schema at the close when there are zero iterations, so the first is the simpler
-  rule.
+  crosses a step boundary, so no draft exists outside a recur site. `hello-tiles/src/main.rs:85` is
+  rewritten — a plain tile returns an ordinary value and a site derives from it — at the cost that a
+  chain of plain tiles contributing to one *growing* object is no longer expressible.
+- ~~Whether intermediate objects should stay addressable.~~ **Answered 2026-09-27: yes.** A derived
+  object's backing refers to its base, so the base must stay (§Continuation on the draft buffer).
+
+**Decisions**, in the order they should be taken — each later one leans on the earlier:
+
+- ~~**D1. The site's output schema: where it comes from, and how it is bound.**~~ **Decided
+  2026-09-28: the CFS declares it** — `RecurTileItem.output` carries `schema_hash` and `empty_root`,
+  computed by `schema_walk`, and the replay tile asserts its schema instead of adopting the host's
+  (§What must come from the CFS). Rejected: taking the schema from iteration 0, which leaves a
+  zero-iteration close nothing to compare against; and carrying a `SchemaNode` at `RecurStart`,
+  whose hash would still need a bound value to check against. The question as it stood: A creating site's
+  frame opens at the empty root of `S`, and a zero-iteration close compares against that root, so
+  the guest needs `S`'s schema hash and empty root at `RecurStart`. Two facts constrain the
+  answer. The CFS is built from the source AST (`raster-compiler`'s `CfsBuilder`), but
+  `raster-compiler::schema_walk` already computes a `SchemaNode` from source for `main`'s interface
+  (`InterfaceDecl.schema_hash`, pinned in `program_commitment`). And **the replay tile does not bind
+  the schema today**: `restore_draft_from_replay_handle` overwrites the statically known
+  `S::schema_hash()` with the host-supplied `handle.schema_hash`, so the journal's `schema_hash`,
+  and the witness schema checked against it, are host-chosen at the first link of a chain.
+- ~~**D2. The journal's `draft_id`: check it or remove it.**~~ **Decided 2026-09-28: removed**
+  from `DraftReplayHandle` and `DraftReplayTransition`; the anchor stays a host-side buffer key
+  (§Draft identity).
+- ~~**D3. State-only iterations.**~~ **Decided 2026-09-28: included.** A `RecurState<T>` return
+  publishes no output and replays empty `output_bytes`, as a draft return does; nothing reads the
+  `[s][i]` object (§What actually happens during a sweep).
+- ~~**D3′. A state-only site's stored result is not tied to its final carried state.**~~
+  **Resolved 2026-09-28 by D5b** (§Carried-state commitment). As found:
+  2026-09-28 while deciding D3; it exists today, independently of D3. A state-only site stores its
+  final state `T` at `[s]` (`run_recur_list_state` → `bind_infallible_call` →
+  `store_execution_output_value`, at `current_recur_site_coordinates()`), and the recorder writes
+  it with `output_commitment = raster_root(T)`. The chain ends at `frame.state_commitment =
+  H("recur-carried-state" ‖ postcard(T))`, replay-proven for tiles. No step compares the two —
+  `close_site` receives no output, and the I/O check skips execution steps — and they cannot be
+  compared directly, being different hash functions over the value. So the chain can prove one
+  final state while `[s]` holds another, and every later reader consumes the stored one without
+  complaint: summing `[1, 2, 3]` proves `{6}` while `{7}` is written. `recur-state-chaining` hit the
+  same encoding mismatch and moved its terminal check onto the iteration's postcard output, for
+  recur sequences only; for tiles the last hop was left open.
+
+  The fix is a terminal check **of the state's own**, kept separate from the draft's (§Draft and
+  carried state are different things): at `RecurEnd` of a state-only site, the stored result must
+  be the chain's final state. What remains to choose is the commitment that makes the two
+  comparable — for instance `raster_root(T)` over the inner `T` (not `RecurState<T>`, whose raster
+  encoding adds the field name `inner`), computed in the replay; or the selection hash of the
+  state's raster payload, which the guest can compute from payload bytes without knowing `T`.
+  A state+output site needs no terminal state check: it discards its state. Open points: the draft root has
+  been shown equal to the raster root only for a struct of a `String` and a `List<String>` (not yet
+  enums, maps or integers); and recur sequences bind `state_in` from inline postcard bytes in the
+  guest, which cannot compute a raster root without the type, so their half belongs with D5.
+
+  **Deferred to D5b (2026-09-28).** The carried-state commitment function is shared by recur tiles
+  and recur sequences, so it is decided once, with recur sequences, rather than changed for tiles
+  now and again later.
+- ~~**D4. Ordinary nested `SequenceEnd` at `[-s]`.**~~ **Decided 2026-09-28: included**, with the
+  step-kind change. Measured: sharing `[s]` lets the ordering check accept a skipped End and a
+  restarted body (§What the move to `[-s]` forces).
+- **D5. Recur sequences**, split in three:
+  - ~~**D5a. Drafts in recur sequences.**~~ **Decided 2026-09-28** — §Recur sequences: the draft
+    never crosses a *site* boundary; body tiles advance the innermost frame's draft entry; draft
+    returns publish no output; seeding tiles become values; a nested recur tile appending to the
+    outer draft is a non-goal.
+  - ~~**D5c. Binding a sequence's returned value to its body.**~~ **Decided 2026-09-28** — §Sequence
+    return binding: the CFS records `SequenceDef.returns`; `SequenceEnd` and `ProgramEnd` are
+    checked against it; consumers cite exactly the returned binding; `ProgramEnd` first. As found:
+    2026-09-28, and broader than recur sequences. `SequenceDef` has no return binding — only
+    `main`'s `produces_output` flag — and the flow resolver resolves call *arguments*
+    (`resolve_argument`) but never a body's returned expression. Three consequences:
+    - a nested `SequenceEnd` is checked only against its own output witness bytes, so an
+      *inline* returned value — a recur sequence's carried state — is bound to nothing the body
+      computed: the chain of `state_out`s is consistent with itself, not with the body;
+    - a consumer of a nested sequence's output is checked only for storage coordinates **inside**
+      `[s]` (`checks/cfs.rs`, the `Sequence | RecurSequence` arm of the prior-item-output check),
+      so it may cite any object the sequence wrote, not the one it returned;
+    - `main`'s output is checked for presence and selection, not identity. **Measured**: a
+      throwaway guest probe gave `verify_program_end` an output object at `[7]` — a coordinate
+      naming no CFS item — and it returned `Established`. `program-end.md` §7 argues a forged
+      output "diverges from the fingerprint, which is fraud-provable"; that needs the guest to
+      reject the forged `ProgramEnd`, which it does not.
+  - ~~**D5b. The carried-state commitment.**~~ **Decided 2026-09-28: the value's object
+    commitment**, the raster root of `T` (§Carried-state commitment). Recur sequence state passes by
+    reference; a state-only site's `RecurEnd` checks `frame.state_commitment == output_commitment`;
+    a stored seed opens the frame at `RecurStart`. Resolves D3′.
+
+**Left to implementation:**
+
+- The delta output's wire format: a new `FnOutput` form, or a separate field.
+- The exact `rindex04` format — in particular whether a field's relative offset lives in the child
+  node or in the parent's field entry. The second leaves fields after a grown list unrewritten.
+- The piece-compaction threshold for long derivation chains (optional).
+- Whether a derivation's base may be a *selection* inside another object
+  (`output = select!(x.inner)`) rather than a whole object at a coordinate. It must at least be
+  raster-encoded.
+
+**Not yet measured or tested:**
+
+- The third full encoding at a recur close — found by reading the code, not timed.
+- How much of the ~1.46 µs/element the seal removes: only the re-hash is purely duplicated; payload
+  bytes and index nodes are still built, earlier (§The measurement basis was not representative).
+- Figures derived from measured rates rather than runs: ~200 s for re-encoding per push at
+  N = 16 384, and ~7 s per 100 K iterations for today's marker writes.
+- The frontier read from `merkle_levels` equals the frontier built by pushing — the duplicate-last
+  padding makes this worth a test before relying on it.
+- Byte-identity of the seal and of the derived-object mapping.
+- `schema_walk` agrees with the derive's `S::schema()` for every recur output type in `examples/`,
+  `crates/raster/tests/` and `raster-inference`.
+- The replay's raster root equals storage's for every state type: enums, maps, integers,
+  `Bytes<N>`, nesting (§Carried-state commitment).
+- A zero-iteration creating site's stored object equals the empty root of `S` (only the
+  non-empty case is measured).
 
 ### The original cost measurement, unchanged
 
@@ -994,9 +1713,9 @@ gate. The measurements stand; the variant is no longer needed.
   object's coordinate — a draft closed inside a recur site is charged to the site today via
   `current_recur_site_coordinates()` and would be *opened* there instead, and one closed outside a
   recur moves out of `[DRAFT_NAMESPACE, n]` entirely — so traces and commitments move for every
-  program that builds a draft. It adds a persisted append frontier per append-only field
-  (≤ 20 digests at 10⁶ elements) and a payload layout rule (append fields last); `rindex04` becomes
-  an optimisation rather than a prerequisite.
+  program that builds a draft. `rindex04` relative offsets are adopted (a `.rindex` format break,
+  above), and continuation adds a delta form of a deriving site's output and a `Derived` object
+  backing in both stores.
 - Derivation is restricted to `push`; **creation is not**. A site sets and pushes freely on its own
   object. `begin_decode_edge`-style seeding tiles fold into the creating recur tile, and a
   finalize stage like `output-finalize` still writes its summary scalars after its own sweep. Only
@@ -1018,10 +1737,21 @@ gate. The measurements stand; the variant is no longer needed.
 
 ## Verification
 
+**Measured 2026-09-28 — the close assertion holds for an honest run.** The design's central check,
+`draft.root == output_commitment` at `RecurEnd`, needs a draft's root to equal the stored object's
+raster commitment, and `struct_commitments_root` is order-sensitive. A throwaway probe on the
+existing `collect_lines` fixture (`crates/raster/tests/recur_draft.rs`; `LineBundle { title, items }`,
+`title` set, `items` pushed, declaration order differing from name order) compared the last
+iteration's `root_after` from `apply_draft_ops`, the `RecurTileEnd` raster root and the returned
+`StorageRef` commitment: all three were `540d47bc…2a6b`. The probe was removed afterwards. A
+zero-iteration site was not probed.
+
 - `append_frontier_root_matches_list_root_from_hashes` already pins frontier ≡ list root; the new
   invariant is the sibling: **a sealed draft's payload, index and root are byte-identical to
   `raster_payload_for_value` on the same value**, checked over the same 1..1024 growth.
-- An element-hash counter asserting each element is hashed **once** across create→seal.
+- An element-hash counter asserting each element is hashed **once** across create→seal,
+  counting the trace payload built for `RecurTileEnd` as well as the store — today that path hashes
+  every element a third time.
 - `hello-tiles` and `examples/chain-example` through the full ladder — the latter is
   `authenticated-chain-draft-output`'s reproducer and should start passing. As of 2026-09-24
   `hello-tiles` reproduces it too, on the **fraud** path rather than a chain run
@@ -1046,6 +1776,26 @@ gate. The measurements stand; the variant is no longer needed.
   rejected; a sequence-scope witness naming a `RecurStart` as its frame is rejected; a
   `RecurEnd`'s `sequence_id` naming anything but the enclosing sequence is rejected; a `RecurStart`
   or `RecurEnd` at a coordinate whose item is not a recur site is rejected.
+- Iteration writes: a sweep of N iterations performs exactly one authenticated append, for a
+  draft-building and for a state-only site alike; an
+  iteration record carrying a non-empty `output_commitment` with no write is rejected; neither a
+  tile's input nor its journal carries a draft id.
+- Recorder-side close: a seal whose root differs from the frame's draft root panics at record
+  time, not only in the guest.
+- Schema binding: a replay handle whose `schema_hash` is not `S::schema_hash()` fails in the
+  replay tile; a journal whose schema hash differs from `output.schema_hash` is rejected by the
+  guest; a zero-iteration close whose stored object differs from `output.empty_root` is rejected.
+- Carried state: a state-only site whose stored result differs from the chain's final state is
+  rejected at `RecurEnd` (`{6}` proven, `{7}` stored), for a recur tile and a recur sequence; a
+  site whose seed is a stored object opens its frame from that binding, and an iteration 0
+  reporting a different `state_in` is rejected.
+- Return binding: a `ProgramEnd` citing any object other than the one `main` returns is rejected
+  (the measured probe, inverted); a consumer citing A at `[2,1]` where the sequence returns B at
+  `[2,2]` is rejected; a re-return through two sequences resolves to the original coordinate; a
+  recur sequence iteration whose recorded state is not its body tile's output is rejected; a
+  sequence whose returned expression the resolver cannot resolve fails to build.
+- Sequence ordering: a trace that skips a nested sequence's `SequenceEnd` (`[s]` straight to
+  `[s+1]`), or restarts its body after the last step, is rejected by the ordering check.
 - Site ordering: a trace that leaves a site without its `RecurEnd` (`RecurStart` then `[s+1]`), or
   enters it without its `RecurStart` (straight to `[s][1]`), is rejected by the ordering check; a
   zero-iteration site `RecurStart` → `RecurEnd` is accepted; a later sibling's `PriorItemOutput`
@@ -1055,6 +1805,16 @@ gate. The measurements stand; the variant is no longer needed.
 - A sharing test: deriving `[s2]` from `[s1]` + k appends hashes **k** elements, not `len([s1]) + k`
   — the sibling of the element-hash counter above, and the thing `rindex04` exists to make true of
   the payload as well as the root.
+- Frontier from the index: for every length up to 1024, the frontier read from a list's stored
+  `merkle_levels` equals the frontier built by pushing the same elements.
+- Continuation: a deriving site's `Set` on a base's unset set-once field is rejected; a deriving
+  site's `RecurTileEnd` carries `O(k)` bytes; `[s2]`'s derived backing yields selection proofs and a
+  materialized payload byte-identical to the same object encoded contiguously; a delta whose
+  stated root differs from the frame root panics in the recorder.
+- Derived mapping: for a chain of derivations over a struct with several lists, flattening the
+  pieces equals the contiguous encoding byte for byte, every selector path yields the same
+  position, length and root, and proofs of element i equal the contiguous object's; exporting a
+  derived object as `.rindex` by concatenation round-trips through `read_raster_artifact`.
 
 ## Not in this proposal
 
