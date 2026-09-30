@@ -1,9 +1,11 @@
 # Issue: `program-output-unbound` — a sequence's returned value is not bound to its body, and `main`'s output can be any stored object
 
-Status: open 2026-09-28. **Soundness gap in shipped code — partly fixed** (2026-09-28): `ProgramEnd`
-is held to the object `main` returns (`5e0bf83`) and to the part of it (the selector fix that
-followed, which also closed a zero-length-selection bypass). A nested sequence's return and the
-object's own integrity are still open (§What is fixed, and what remains).
+Status: open 2026-09-28. **Soundness gap in shipped code — mostly fixed** (2026-09-28): `ProgramEnd`
+is held to the object `main` returns (`5e0bf83`) and to the part of it (`923aa9f`, which also
+closed a zero-length-selection bypass), and every sequence's return is now followed statically
+through the CFS, for `ProgramEnd` and for every argument taken from a sequence item. Still open: a
+path through a sequence parameter (suffix only), two chains the walk does not follow, and the
+object's own integrity (§What is fixed, and what remains).
 Direction picked:
 [`incremental-draft-materialization`](../proposals/incremental-draft-materialization.md) §Sequence
 return binding (decision D5c).
@@ -166,20 +168,40 @@ return with the wrong field are rejected; field, whole-object and entry-argument
 accepted. `raster-compiler` tests the path lowering, alias composition and the entry-argument
 prefix.
 
-**In practice.** A `cfs` pass over all 15 programs (`examples/` and `raster-inference`) binds 12
-returns, and every one is a whole object (`path: []`) — no program returns a field. The field-level
-cases are exercised by the tests only.
+**In practice.** A `cfs` pass over all 15 programs (`examples/` and `raster-inference`): every
+`main` return and every plain nested sequence's return binds, and every one is a whole object
+(`path: []`) — no program returns a field, so the field-level cases are exercised by the tests
+only. The only unbound returns are the three `finalize(draft)` mains below; the other sequences
+without `returns` are recur-sequence bodies, skipped by design.
+
+**Fixed after it (2026-09-28): nested returns, resolved statically.** The compiler records
+`returns` for every value-returning sequence (`sequence_returns` in `cfs_builder.rs`; a
+recur-sequence body is skipped — its site writes the result at its own coordinate). `returns` is
+relative — an item index — because one definition is called from many places. The guest follows
+it with `CfsCursor::resolve_value` (`raster-core/src/cfs.rs`) from `main`, or from any argument's
+frame, down to the step that wrote the object: a tile, recur tile or recur-sequence site at its
+own coordinate; through a nested sequence's `returns`, prepending its path; through a returned
+parameter to the caller's argument; or to the entry object at `[]`. `ProgramEnd` requires the
+output at exactly that coordinate (and fails closed if the chain cannot be followed); a
+prior-item argument requires the same, falling back to the old "inside the source item" rule only
+for the two chains the walk does not follow. On a real `hello-tiles` trace, `ProgramEnd` resolves
+through three nested sequences to `exclaim`'s object at `[21,7,4,1]` — where the run put it — and
+all 32 prior-item arguments resolve to the coordinates the run recorded. An honest sequence that
+returns its own parameter, which the old rule refused, is now accepted.
 
 **Remaining gaps.**
 
-1. **A nested-sequence return is held only to "inside `[j]`"**, and its path only as a suffix.
-   `main` returning a `call_seq!` result may name any object that sequence wrote — `hello-tiles`,
-   `input-embedding`, `prefill-prepare-aux`, `prefill-range` and `prompt-prepare` have this shape.
-   Pinned by `a_nested_sequence_return_is_held_only_to_its_scope`. Closes with `SequenceEnd`
-   recording its returned binding (D5c's second half).
-2. **The object is only as good as its write.** A forged write at the right coordinate still
+1. **A path through a sequence parameter is only a suffix**, and prior-item arguments get no path
+   check. Argument bindings record no path, so once the walk crosses a parameter only the
+   trailing segments are known. Closes with bindings that carry a path (the same change closes
+   [`sequence-scope-forbids-narrowing`](./sequence-scope-forbids-narrowing.md)).
+2. **Two chains are not followed**: a nested return the CFS could not bind (a nested
+   `finalize(draft)`), and a recur-sequence body's parameter (the site source's element). A
+   prior-item argument falls back to "inside the source item" for these; `ProgramEnd` fails
+   closed. No program in `examples/` or `raster-inference` has either shape today.
+3. **The object is only as good as its write.** A forged write at the right coordinate still
    verifies as the output: [`tile-output-commitment-unbound`](./tile-output-commitment-unbound.md).
-3. **A recur site's result** is pinned exactly at `[s]`, but a site's stored result is not yet tied
+4. **A recur site's result** is pinned exactly at `[s]`, but a site's stored result is not yet tied
    to its computation: the draft close check (`incremental-draft-materialization`) and
    [`recur-carried-state-unbound`](./recur-carried-state-unbound.md).
 
@@ -193,7 +215,7 @@ cases are exercised by the tests only.
   and `finalize` leaves the language under `incremental-draft-materialization`. A build *warning*
   rather than the error the proposal specifies, so these programs still build and run
   unauthenticated.
-- **Every program's identity moved, twice** — once per change to `returns`. The CFS is
+- **A program's identity moves whenever its CFS changes** — with the first two changes to `returns`, every program with an output; with the third, only programs with nested sequences (`hello-tiles` among the examples). The CFS is
   postcard-encoded into `program_commitment` (`ProgramDefinition::canonical_bytes`), and postcard is
   not self-describing, so a new or reshaped field changes every program's bytes;
   `#[serde(default)]` does not help. An existing `program.bin` will not decode. The 6 tracked
@@ -203,14 +225,17 @@ cases are exercised by the tests only.
   recipe, not on `raster-core` or `raster` — which every guest links, and whose changes do alter
   guest ELFs (guest builds are reproducible; `collect_line_chunk`'s image id moved with each of
   these changes) — so the cache served stale ELFs. Against the committed locks, 14 of the 29 tile
-  image ids changed.
+  image ids changed. **Fixed 2026-09-28**: `GuestBuilder::recipe_fingerprint` now also hashes the
+  sources a guest compiles (`raster`, `raster-core`, `raster-macros`, the workspace manifest, and
+  the user crate's lib, excluding `src/main.rs` and `src/bin/`), so a raster-only edit rebuilds and
+  an unchanged tree is a cache hit. External crate versions remain unpinned: the guest resolves
+  them fresh, with no lockfile.
 
 ## Directions
 
 Picked, in `incremental-draft-materialization` §Sequence return binding: the CFS records each
 sequence's return — its source binding **and its selector path** — resolved from the body's
-returned expression by the same resolution as arguments. `SequenceEnd` records its returned value
-as a binding, as `ProgramEnd` already does; the guest checks both against `returns`, source and
-path; a consumer of a sequence item cites exactly the returned binding. `main`'s half — source and
-path — is in place; what remains is the nested half (gap 1) and the producers' own bindings
-(gaps 2 and 3).
+returned expression by the same resolution as arguments, and followed statically through the CFS
+by `ProgramEnd` and by every consumer of a sequence item. In place for storage-backed returns.
+What remains: paths through parameters (gap 1, bindings with paths), the two unfollowed chains
+(gap 2), inline returns (D5b), and the producers' own bindings (gaps 3 and 4).

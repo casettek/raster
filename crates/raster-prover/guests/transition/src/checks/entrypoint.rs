@@ -21,15 +21,11 @@
 //! deferred debt to discharge at the end of the chain.
 
 use raster_core::authorization::AuthorizationJournal;
-use raster_core::cfs::{
-    CfsCoordinate, CfsCoordinates, CfsCursor, InputBinding, SequenceChildItem, SequenceReturn,
-    FIRST_COORDINATE,
-};
+use raster_core::cfs::{CfsCoordinates, CfsCursor, SequenceReturn};
 use raster_core::input::{struct_commitments_root, verify_selection_witness, SelectionWitness};
 use raster_core::trace::{ProgramEndStep, ProgramStartStep, StepKind, StepRecord, StorageData};
 use raster_core::transition::{EntrypointAuthorization, OutputAuthorization, StorageReadWitness};
 
-use crate::checks::cfs::assert_prior_item_output_coordinates;
 use crate::checks::store::verify_storage_read_witness;
 
 /// The coordinate `main`'s entry-argument binding always occupies: the
@@ -320,81 +316,54 @@ pub fn verify_program_end(
     }
 }
 
-/// Hold the program output to what `main` returns: the object (`source`) and
-/// the part of it (`path`).
+/// Hold the program output to what `main` returns: the object and the part of
+/// it.
 ///
-/// The object is held by the rule a tile argument is held to: an item's output
-/// must sit where that item writes it (`assert_prior_item_output_coordinates`),
-/// and an entry argument comes from the authorized entry object at `[]`. `main`
-/// has no caller, so a sequence-scope binding cannot occur, and an inline value
-/// cannot be a program output. A data-sourced index is refused: `ProgramEnd`
-/// carries no index citation to hold it to, and the CFS builder does not record
-/// such a return.
+/// The object is found by following `main`'s `returns` through the CFS down to
+/// the step that wrote it (`CfsCursor::resolve_value`): a tile's or recur
+/// site's own coordinate, through as many nested sequences as the chain passes,
+/// or the entry object at `[]`. Every other object — including anything a
+/// nested sequence wrote but did not return — is refused. A chain the CFS
+/// cannot follow (an unbindable return anywhere on it) fails closed, and a
+/// data-sourced index is refused: `ProgramEnd` carries no citation to hold it
+/// to.
 ///
 /// The part is held on `selection.path` — the path the selection proof is
 /// pinned to (`verify_selection_witness`) — not on `selector`, which no proof
-/// constrains. Exactly, for a tile's output or an entry argument, whose
-/// selector the program composes in full. As a suffix, for a sequence's
-/// output: the leading segments are whatever the nested sequence selected, and
-/// the CFS does not record a nested sequence's return yet.
+/// constrains: exactly, unless the chain crossed a sequence parameter, whose
+/// argument binding records no path; then only the known trailing segments.
 fn verify_program_output_source(
     cfs_cursor: &CfsCursor,
     returns: &SequenceReturn,
     output: &StorageData,
 ) {
-    let source = &returns.source;
-    let selected_path = output.selection.path.segments.as_slice();
     assert!(
-        source.index_bindings().is_empty(),
+        returns.source.index_bindings().is_empty(),
         "main returns a value selected by a data-sourced index, which ProgramEnd cannot verify",
     );
-    match source.value_binding() {
-        InputBinding::EntryArgument => {
-            assert!(
-                output.coordinates.is_empty(),
-                "Program output bound to an entry argument must come from the entry object at []",
-            );
-            assert_eq!(
-                selected_path,
-                returns.path.as_slice(),
-                "Program output selects a different part of the entry object than main returns",
-            );
-        }
-        InputBinding::PriorItemOutput {
-            intra_sequence_item_index,
-        } => {
-            let source_coordinate = CfsCoordinate::try_from(*intra_sequence_item_index)
-                .expect("Prior item output index exceeds CFS coordinate bounds")
-                + FIRST_COORDINATE;
-            assert_prior_item_output_coordinates(
-                cfs_cursor,
-                &entrypoint_coordinates(),
-                source_coordinate,
-                &output.coordinates,
-            );
-            let mut source_coordinates = entrypoint_coordinates();
-            source_coordinates.push(source_coordinate);
-            match cfs_cursor.try_get_item(&source_coordinates) {
-                Some(SequenceChildItem::Tile(_) | SequenceChildItem::RecurTile(_)) => {
-                    assert_eq!(
-                        selected_path,
-                        returns.path.as_slice(),
-                        "Program output selects a different part of the object than main returns",
-                    );
-                }
-                Some(SequenceChildItem::Sequence(_) | SequenceChildItem::RecurSequence(_)) => {
-                    assert!(
-                        selected_path.ends_with(&returns.path),
-                        "Program output selects a different part of the sequence's result than \
-                         main returns",
-                    );
-                }
-                None => panic!("main's returned item does not resolve in the CFS"),
-            }
-        }
-        other => panic!(
-            "main's returned value is bound as {:?}, which cannot name a program output",
-            other
-        ),
+    let resolved = cfs_cursor
+        .resolve_value(&entrypoint_coordinates(), &returns.source, &returns.path)
+        .unwrap_or_else(|error| {
+            panic!(
+                "main's returned value cannot be followed to the step that wrote it: {:?}",
+                error
+            )
+        });
+    assert_eq!(
+        output.coordinates, resolved.coordinates,
+        "Program output is not the object main returns",
+    );
+    let selected_path = output.selection.path.segments.as_slice();
+    if resolved.path_complete {
+        assert_eq!(
+            selected_path,
+            resolved.path.as_slice(),
+            "Program output selects a different part of the object than main returns",
+        );
+    } else {
+        assert!(
+            selected_path.ends_with(&resolved.path),
+            "Program output selects a different part of the object than main returns",
+        );
     }
 }

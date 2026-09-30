@@ -8,15 +8,49 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Guest build recipe version. Bump when the guest ELF can change without the
-/// tile *source* changing — e.g. a change to the tile macro's replay-wrapper
-/// codegen (raster-macros) or to raster/raster-core code the guest links.
-/// It is folded into the artifact cache key, so a bump invalidates stale
-/// cached image ids (see docs/proposals/program-identity.md).
+/// Guest build recipe version, folded into the artifact cache key (see
+/// docs/proposals/program-identity.md). Source changes to what a guest compiles
+/// — the `raster`, `raster-core` and `raster-macros` crates and the user
+/// crate's lib — are picked up automatically by
+/// [`GuestBuilder::recipe_fingerprint`]; bump this only for a change it cannot
+/// see, such as a build-environment change.
 ///
 /// v2: replay wrapper now commits `sha256(input)` (`input_commitment`); guest
 /// manifest uses risc0-zkvm default features + resolver v2.
 const GUEST_BUILD_ABI: &str = "2";
+
+/// Record `root/relative` under the name `label ++ relative`, if it exists.
+fn collect_file(files: &mut Vec<(String, PathBuf)>, label: &str, root: &Path, relative: &Path) {
+    let path = root.join(relative);
+    if path.is_file() {
+        files.push((format!("{label}{}", relative.display()), path));
+    }
+}
+
+/// Record every file under `root/relative`, recursively, skipping the
+/// `excluded` paths (relative to `root`).
+fn collect_tree(
+    files: &mut Vec<(String, PathBuf)>,
+    label: &str,
+    root: &Path,
+    relative: &Path,
+    excluded: &[&Path],
+) {
+    if excluded.iter().any(|excluded| *excluded == relative) {
+        return;
+    }
+    let path = root.join(relative);
+    if path.is_file() {
+        files.push((format!("{label}{}", relative.display()), path));
+        return;
+    }
+    let Ok(entries) = fs::read_dir(&path) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        collect_tree(files, label, root, &relative.join(entry.file_name()), excluded);
+    }
+}
 
 /// Configuration for building guest crates.
 pub struct GuestBuilder {
@@ -258,7 +292,59 @@ impl GuestBuilder {
         // Tile-independent view of the templates (fixed placeholder id).
         hasher.update(self.generate_guest_cargo_toml("__recipe__").as_bytes());
         hasher.update(self.generate_guest_main("__recipe__").as_bytes());
+        hasher.update(self.sources_fingerprint());
         hex::encode(&hasher.finalize()[..8])
+    }
+
+    /// A hash of every source file a tile guest compiles from.
+    ///
+    /// The guest links the `raster` crate (without default features, so not
+    /// `raster-runtime`), which pulls in `raster-core` and `raster-macros`, and
+    /// the user crate's **lib** — all by path. Keying the cache on the tile's
+    /// own source file alone served stale ELFs, with stale image ids, whenever
+    /// any of those changed: measured 2026-09-28, 14 of 29 tile image ids in
+    /// the repository's locks were stale. Hashing the files is cheap next to a
+    /// guest build and needs no cargo invocation.
+    ///
+    /// Covered: the raster workspace's `Cargo.toml` (it pins the crates'
+    /// dependency versions) and `Cargo.toml` + `src/` of the three crates; the
+    /// user crate's `Cargo.toml` + `src/`, minus `src/main.rs` and `src/bin/`,
+    /// which are not part of the lib — an edit to a sequence rebuilds nothing.
+    /// Not covered: external crate versions, which the guest resolves fresh
+    /// with no lockfile.
+    fn sources_fingerprint(&self) -> Vec<u8> {
+        use raster_core::sha2::{Digest, Sha256};
+        let mut files: Vec<(String, PathBuf)> = Vec::new();
+        if let Some(workspace) = &self.raster_workspace {
+            collect_file(&mut files, "raster:", workspace, Path::new("Cargo.toml"));
+            for krate in ["raster", "raster-core", "raster-macros"] {
+                let root = workspace.join("crates").join(krate);
+                let label = format!("raster:crates/{krate}/");
+                collect_file(&mut files, &label, &root, Path::new("Cargo.toml"));
+                collect_tree(&mut files, &label, &root, Path::new("src"), &[]);
+            }
+        }
+        if let Some(user) = &self.user_crate_path {
+            collect_file(&mut files, "user:", user, Path::new("Cargo.toml"));
+            collect_tree(
+                &mut files,
+                "user:",
+                user,
+                Path::new("src"),
+                &[Path::new("src/main.rs"), Path::new("src/bin")],
+            );
+        }
+        files.sort_by(|left, right| left.0.cmp(&right.0));
+
+        let mut hasher = Sha256::new();
+        for (name, path) in files {
+            let contents = fs::read(&path).unwrap_or_default();
+            hasher.update((name.len() as u64).to_le_bytes());
+            hasher.update(name.as_bytes());
+            hasher.update((contents.len() as u64).to_le_bytes());
+            hasher.update(&contents);
+        }
+        hasher.finalize().to_vec()
     }
 
     fn find_risc0_cargo() -> Option<PathBuf> {
@@ -409,4 +495,86 @@ pub enum GuestBuildError {
 
     #[error("JSON serialization error: {0}")]
     Json(#[from] serde_json::Error),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A raster workspace and a user crate on disk, laid out as a guest sees
+    /// them.
+    struct Layout {
+        _dir: tempfile::TempDir,
+        workspace: PathBuf,
+        user: PathBuf,
+    }
+
+    fn write(path: &Path, contents: &str) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, contents).unwrap();
+    }
+
+    fn layout() -> Layout {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("raster");
+        let user = dir.path().join("user");
+        write(&workspace.join("Cargo.toml"), "[workspace]");
+        for krate in ["raster", "raster-core", "raster-macros", "raster-runtime"] {
+            let root = workspace.join("crates").join(krate);
+            write(&root.join("Cargo.toml"), "[package]");
+            write(&root.join("src/lib.rs"), "// lib");
+        }
+        write(&user.join("Cargo.toml"), "[package]");
+        write(&user.join("src/lib.rs"), "// tiles");
+        write(&user.join("src/helpers/mod.rs"), "// helpers");
+        write(&user.join("src/main.rs"), "// sequences");
+        Layout {
+            _dir: dir,
+            workspace,
+            user,
+        }
+    }
+
+    fn fingerprint(layout: &Layout) -> String {
+        GuestBuilder {
+            output_dir: PathBuf::from("/unused"),
+            user_crate_path: Some(layout.user.clone()),
+            user_crate_name: Some("user".to_string()),
+            raster_workspace: Some(layout.workspace.clone()),
+        }
+        .recipe_fingerprint()
+    }
+
+    /// Everything a guest compiles moves the key; what it does not compile
+    /// leaves it alone.
+    #[test]
+    fn the_recipe_tracks_what_a_guest_compiles() {
+        let layout = layout();
+        let base = fingerprint(&layout);
+        assert_eq!(fingerprint(&layout), base, "the fingerprint is deterministic");
+
+        let changed = |path: PathBuf| {
+            let before = fingerprint(&layout);
+            let original = fs::read_to_string(&path).unwrap();
+            write(&path, &format!("{original}\n// edited"));
+            let after = fingerprint(&layout);
+            write(&path, &original);
+            before != after
+        };
+
+        for krate in ["raster", "raster-core", "raster-macros"] {
+            assert!(
+                changed(layout.workspace.join("crates").join(krate).join("src/lib.rs")),
+                "a change to {krate} must invalidate cached guests"
+            );
+        }
+        assert!(changed(layout.workspace.join("Cargo.toml")));
+        assert!(changed(layout.user.join("src/helpers/mod.rs")), "a helper outside the tile's file");
+        assert!(changed(layout.user.join("Cargo.toml")));
+
+        // Not compiled into a guest: the runtime (std only) and the user
+        // crate's binary, where its sequences live.
+        assert!(!changed(layout.workspace.join("crates/raster-runtime/src/lib.rs")));
+        assert!(!changed(layout.user.join("src/main.rs")));
+    }
 }

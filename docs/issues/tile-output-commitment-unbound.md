@@ -4,6 +4,8 @@ Status: open 2026-09-28. **Soundness gap in shipped code.** Unowned; to be resol
 [`incremental-draft-materialization`](../proposals/incremental-draft-materialization.md), which
 changes the same journal, the same store check and the same trace format (§Why together).
 
+Proposed fix: [`tile-io-structural-roots`](../proposals/tile-io-structural-roots.md) (2026-09-28) — closes this issue and its mirror in one tile image-id break.
+
 Related:
 - [`selection-unbound-from-execution`](./selection-unbound-from-execution.md) — the **input-side
   mirror**. That issue: the bytes a tile ran on are never joined to the bytes its selection proof

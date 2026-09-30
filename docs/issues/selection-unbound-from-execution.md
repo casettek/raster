@@ -2,6 +2,8 @@
 
 Status: open 2026-09-16. Unowned. **Top priority** — set 2026-09-16.
 
+Proposed fix: [`tile-io-structural-roots`](../proposals/tile-io-structural-roots.md) (2026-09-28) — closes this issue and its mirror in one tile image-id break.
+
 Reproducible against `feature/recur-mid-seed` at `0a71d10`. Every citation is committed code.
 
 §2a's half is **demonstrated**, not only reasoned — see §3. The fabricated sweep is built and

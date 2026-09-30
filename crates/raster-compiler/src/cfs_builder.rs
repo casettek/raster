@@ -90,7 +90,7 @@ impl<'a> CfsBuilder<'a> {
 
         if seq.function.name == "main" && !seq.function.input_names.is_empty() {
             let items = resolver.resolve_with_entry_arguments(seq, &seq.function.input_names);
-            let returns = main_returns(&resolver, seq, produces_output, items.len());
+            let returns = sequence_returns(&resolver, seq, items.len());
 
             return Ok(SequenceDef {
                 id: seq.function.name.clone(),
@@ -111,7 +111,7 @@ impl<'a> CfsBuilder<'a> {
 
         // Resolve data flow for the sequence items
         let items = resolver.resolve(seq);
-        let returns = main_returns(&resolver, seq, produces_output, items.len());
+        let returns = sequence_returns(&resolver, seq, items.len());
 
         Ok(SequenceDef {
             id: seq.function.name.clone(),
@@ -124,22 +124,27 @@ impl<'a> CfsBuilder<'a> {
     }
 }
 
-/// Bind the value `main` returns, so the guest can hold `ProgramEnd` to it.
+/// Bind the value a sequence returns, so the guest can follow it.
 ///
-/// Only `main`'s return is recorded for now: a nested sequence's return is
-/// checked at its `SequenceEnd`, which does not record a binding yet (see
-/// `docs/proposals/incremental-draft-materialization.md` §Sequence return
-/// binding). A `main` whose return cannot be bound is not a build error — a
-/// program returning `finalize(draft)` must still build and run
-/// unauthenticated — but its `ProgramEnd` will not verify, so say so here
-/// rather than at proving time.
-fn main_returns(
+/// Recorded for every sequence that returns a value, relative to the
+/// sequence itself (an item index, never a coordinate — one definition is
+/// called from many places). The guest walks these from `main` or from any
+/// consumer of a sequence's output down to the step that wrote the object
+/// (`CfsCursor::resolve_value`). A recur sequence's body is skipped: its site
+/// writes the result at the site's own coordinate, which is where the walk
+/// stops.
+///
+/// An unbindable return is not a build error — a program returning
+/// `finalize(draft)` must still build and run unauthenticated — so it is
+/// reported here rather than discovered at proving time: for `main`, its
+/// `ProgramEnd` will not verify; for a nested sequence, a use of its result is
+/// held only to "inside the call".
+fn sequence_returns(
     resolver: &FlowResolver,
     seq: &Sequence<'_>,
-    produces_output: bool,
     item_count: usize,
 ) -> Option<SequenceReturn> {
-    if !produces_output {
+    if !returns_non_unit(&seq.function.output) || is_recur_sequence(seq) {
         return None;
     }
     let returns = seq
@@ -148,6 +153,7 @@ fn main_returns(
         .as_ref()
         .and_then(|ret| resolver.resolve_return(ret, item_count));
     if returns.is_none() {
+        let name = &seq.function.name;
         let form = match &seq.function.return_expr {
             Some(crate::ast::ReturnExpr::Unbound { expr }) => format!("`{expr}`"),
             Some(crate::ast::ReturnExpr::Rooted { root, .. }) => {
@@ -156,13 +162,26 @@ fn main_returns(
             Some(crate::ast::ReturnExpr::TailCall) => "its final call".to_string(),
             None => "no returned expression".to_string(),
         };
+        let consequence = if name == "main" {
+            "this program's ProgramEnd will not verify"
+        } else {
+            "a use of its result is held only to \"inside the call\""
+        };
         eprintln!(
-            "warning: `main` returns {form}, which the CFS cannot bind to a step's output or an \
-             entry argument; this program's ProgramEnd will not verify. Return a binding of a \
-             `call!`/`call_recur!`/`call_seq!` result, or a `select!` of one."
+            "warning: `{name}` returns {form}, which the CFS cannot bind to a step's output or \
+             an argument; {consequence}. Return a binding of a `call!`/`call_recur!`/`call_seq!` \
+             result, or a `select!` of one."
         );
     }
     returns
+}
+
+/// Whether `seq` is the body of a recur sequence (`#[sequence(kind = recur)]`).
+fn is_recur_sequence(seq: &Sequence<'_>) -> bool {
+    seq.function.macros.iter().any(|attr| {
+        attr.name.rsplit("::").next() == Some("sequence")
+            && attr.args.get("kind").map(String::as_str) == Some("recur")
+    })
 }
 
 /// Reject duplicate ids in a (already sorted) id sequence, naming the kind
@@ -353,6 +372,68 @@ mod tests {
             }
             other => panic!("Expected a Tile item, got {:?}", other),
         }
+    }
+
+    /// Every sequence that returns a value records what it returns — not only
+    /// `main` — except a recur sequence's body, whose site writes the result
+    /// at its own coordinate.
+    #[test]
+    fn nested_sequences_record_their_returns_and_recur_bodies_do_not() {
+        let project = mock_project();
+        let greet_func = tile_function("greet");
+        let greet_tile = Tile {
+            function: &greet_func,
+            tile_type: "iter".to_string(),
+            estimated_cycles: None,
+            max_memory: None,
+            description: None,
+        };
+        let body = |name: &str, kind: Option<&str>| {
+            let mut function = main_function_with_params(
+                vec![],
+                vec![CallInfo {
+                    callee: "greet".to_string(),
+                    result_binding: Some("greeting".to_string()),
+                    arguments: vec!["\"hi\"".to_string()],
+                    argument_kinds: vec![CallArgumentKind::Inline],
+                    call_kind: CallKind::Tile,
+                    chunk: None,
+                    leaves_output_open: false,
+                    state_is_output: false,
+                }],
+            );
+            function.name = name.to_string();
+            function.output = Some("String".to_string());
+            function.return_expr = Some(crate::ast::ReturnExpr::Rooted {
+                root: "greeting".to_string(),
+                path: vec![],
+            });
+            if let Some(kind) = kind {
+                function.macros[0].args.insert("kind".to_string(), kind.to_string());
+            }
+            function
+        };
+        let builder = CfsBuilder::new(&project);
+        let def_of = |function: &FunctionAstItem| {
+            builder
+                .build_sequence_def(&Sequence {
+                    function,
+                    steps: vec![SequenceStep::Tile(&greet_tile)],
+                    description: None,
+                })
+                .unwrap()
+        };
+
+        let nested = def_of(&body("helper", None));
+        assert!(!nested.produces_output, "only main produces the program output");
+        assert_eq!(
+            nested.returns,
+            Some(SequenceReturn {
+                source: InputBinding::prior_item_output(0),
+                path: vec![],
+            })
+        );
+        assert_eq!(def_of(&body("sweep", Some("recur"))).returns, None);
     }
 
     fn project_with_tile_functions(names: &[&str]) -> Project {

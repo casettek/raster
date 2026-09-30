@@ -592,6 +592,8 @@ fn verify_tile_commitments_accept_matching_recorded_io() {
     verify_io_witness(&step, Some(&b"in".to_vec()), Some(&b"out".to_vec()));
 }
 
+/// `sub` records no `returns` (the CFS could not bind it), so the consumer is
+/// held by the fallback rule: anything inside the source item.
 #[test]
 fn verify_step_record_inputs_accepts_sequence_descendant_producer_coordinates() {
     let cfs_cursor = producer_sequence_cfs();
@@ -624,6 +626,127 @@ fn verify_step_record_inputs_accepts_sequence_descendant_producer_coordinates() 
         Some(&input_source_witness),
         None,
         None,
+    );
+}
+
+/// `main = [<items>…, consumer(item k)]` over callee sequences `defs`; the
+/// consumer at `consumer_at` reads `input_coordinates`.
+fn verify_consumer_input(
+    main_items: Vec<SequenceChildItem>,
+    defs: Vec<SequenceDef>,
+    source_index: usize,
+    input_coordinates: Vec<CfsCoordinate>,
+) {
+    let mut items = main_items;
+    items.push(SequenceChildItem::Tile(TileItem {
+        id: "consumer".into(),
+        sources: vec![InputBinding::prior_item_output(source_index)],
+    }));
+    let consumer_at = items.len() as CfsCoordinate;
+    let mut sequences = vec![SequenceDef {
+        id: "main".into(),
+        input_sources: vec![],
+        items,
+        entry_arguments: vec![],
+        produces_output: false,
+        returns: None,
+    }];
+    sequences.extend(defs);
+    let cfs_cursor = CfsCursor::new(ControlFlowSchema {
+        version: "1.0".into(),
+        project: "test".into(),
+        encoding: "postcard".into(),
+        tiles: vec![
+            TileDef::iter("producer", 0, 1),
+            TileDef::iter("other", 0, 1),
+            TileDef::iter("consumer", 1, 1),
+        ],
+        sequences,
+    });
+    let mut step_record = exec_index_fixture(1);
+    step_record.coordinates = CfsCoordinates(vec![consumer_at]);
+    verify_step_record_inputs(
+        &cfs_cursor,
+        &step_record,
+        Some(&storage_input_witness(
+            CfsCoordinates(input_coordinates),
+            sha(b"source-output"),
+        )),
+        None,
+        None,
+    );
+}
+
+fn tile_item(id: &str, sources: Vec<InputBinding>) -> SequenceChildItem {
+    SequenceChildItem::Tile(TileItem {
+        id: id.into(),
+        sources,
+    })
+}
+
+fn call_item(id: &str, sources: Vec<InputBinding>) -> SequenceChildItem {
+    SequenceChildItem::Sequence(SequenceItem {
+        id: id.into(),
+        sources,
+    })
+}
+
+/// `sub = [producer, other]`, returning `other`'s output.
+fn sub_returning_other() -> SequenceDef {
+    SequenceDef {
+        id: "sub".into(),
+        input_sources: vec![],
+        items: vec![
+            tile_item("producer", vec![InputBinding::Direct(InputSource::Inline)]),
+            tile_item("other", vec![InputBinding::Direct(InputSource::Inline)]),
+        ],
+        entry_arguments: vec![],
+        produces_output: false,
+        returns: Some(raster_core::cfs::SequenceReturn {
+            source: InputBinding::prior_item_output(1),
+            path: vec![],
+        }),
+    }
+}
+
+/// A consumer of a sequence's output reads the object the sequence returns.
+#[test]
+fn a_sequence_argument_resolves_to_the_returned_object() {
+    verify_consumer_input(vec![call_item("sub", vec![])], vec![sub_returning_other()], 0, vec![1, 2]);
+}
+
+/// `producer`'s output at `[1,1]` is written by `sub` but not returned by it.
+/// The old "inside the source item" rule accepted it.
+#[test]
+#[should_panic(expected = "do not match expected CFS source")]
+fn a_sequence_argument_rejects_an_object_the_sequence_did_not_return() {
+    verify_consumer_input(vec![call_item("sub", vec![])], vec![sub_returning_other()], 0, vec![1, 1]);
+}
+
+/// `main = [producer, pass(producer), consumer(pass's result)]`: `pass`
+/// returns its parameter, so the consumer honestly reads `producer`'s object
+/// at `[1]` — outside the call at `[2]`, which the old rule refused.
+#[test]
+fn a_sequence_argument_follows_a_returned_parameter_to_its_producer() {
+    let pass = SequenceDef {
+        id: "pass".into(),
+        input_sources: vec![InputBinding::seq_input(0)],
+        items: vec![],
+        entry_arguments: vec![],
+        produces_output: false,
+        returns: Some(raster_core::cfs::SequenceReturn {
+            source: InputBinding::seq_input(0),
+            path: vec![],
+        }),
+    };
+    verify_consumer_input(
+        vec![
+            tile_item("producer", vec![InputBinding::Direct(InputSource::Inline)]),
+            call_item("pass", vec![InputBinding::prior_item_output(0)]),
+        ],
+        vec![pass],
+        1,
+        vec![1],
     );
 }
 
@@ -3257,6 +3380,16 @@ mod program_end {
     }
 
     fn cfs_returning(items: Vec<SequenceChildItem>, returns: Option<SequenceReturn>) -> CfsCursor {
+        cfs_with(items, returns, returning(InputBinding::prior_item_output(1), &[]))
+    }
+
+    /// `main` plus two callees: `child = [produce, other]` returning
+    /// `child_returns`, and `pass(x) -> x`, which returns its own parameter.
+    fn cfs_with(
+        items: Vec<SequenceChildItem>,
+        returns: Option<SequenceReturn>,
+        child_returns: Option<SequenceReturn>,
+    ) -> CfsCursor {
         CfsCursor::new(ControlFlowSchema {
             version: "1.0".into(),
             project: "test".into(),
@@ -3277,7 +3410,15 @@ mod program_end {
                     items: vec![tile_item("produce"), tile_item("other")],
                     entry_arguments: vec![],
                     produces_output: false,
-                    returns: None,
+                    returns: child_returns,
+                },
+                SequenceDef {
+                    id: "pass".into(),
+                    input_sources: vec![InputBinding::seq_input(0)],
+                    items: vec![],
+                    entry_arguments: vec![],
+                    produces_output: false,
+                    returns: returning(InputBinding::seq_input(0), &[]),
                 },
             ],
         })
@@ -3400,7 +3541,7 @@ mod program_end {
     /// found it inverted: an output stored at `[7]` — a coordinate naming no
     /// item — was accepted as `main`'s output.
     #[test]
-    #[should_panic(expected = "do not match expected CFS source")]
+    #[should_panic(expected = "is not the object main returns")]
     fn rejects_an_output_at_a_coordinate_no_item_names() {
         verify_output(&producing_cfs(), vec![7], Some("max"));
     }
@@ -3408,7 +3549,7 @@ mod program_end {
     /// A real, stored intermediate object — `other`'s output at `[2]` — named as
     /// the program's output when `main` returns `produce`'s at `[1]`.
     #[test]
-    #[should_panic(expected = "do not match expected CFS source")]
+    #[should_panic(expected = "is not the object main returns")]
     fn rejects_an_intermediate_object_as_the_program_output() {
         verify_output(&producing_cfs(), vec![2], Some("max"));
     }
@@ -3460,14 +3601,14 @@ mod program_end {
     }
 
     #[test]
-    #[should_panic(expected = "selects a different part of the entry object")]
+    #[should_panic(expected = "selects a different part of the object than main returns")]
     fn rejects_another_entry_argument() {
         let cfs = cfs_returning(vec![], returning(InputBinding::entry_argument(), &["max"]));
         verify_output(&cfs, vec![], Some("sum"));
     }
 
     #[test]
-    #[should_panic(expected = "must come from the entry object")]
+    #[should_panic(expected = "is not the object main returns")]
     fn rejects_a_stored_object_for_an_entry_argument_return() {
         let cfs = cfs_returning(
             vec![tile_item("produce")],
@@ -3476,34 +3617,83 @@ mod program_end {
         verify_output(&cfs, vec![1], Some("max"));
     }
 
-    /// The residual gap, pinned so it is not mistaken for closed: `main`
-    /// returning a nested sequence's result is held only to *inside* that
-    /// sequence, and to a path *ending with* what `main` selected, until
-    /// nested returns are bound at `SequenceEnd`.
+    /// `main` returning `select!(child_result.max)`: the CFS says `child`
+    /// returns its item 1 (`other`, at `[1,2]`), so that object and nothing else
+    /// `child` wrote is the program output.
     #[test]
-    fn a_nested_sequence_return_is_held_only_to_its_scope() {
-        let cfs = nested_cfs(vec![]);
-        // Either object the child wrote is accepted — the gap.
+    fn a_nested_sequence_return_resolves_to_the_object_it_returns() {
         assert!(matches!(
-            verify_output(&cfs, vec![1, 2], Some("max")),
-            OutputAuthorization::Established { .. }
-        ));
-        assert!(matches!(
-            verify_output(&cfs, vec![1, 1], Some("max")),
+            verify_output(&nested_cfs(vec![]), vec![1, 2], Some("max")),
             OutputAuthorization::Established { .. }
         ));
     }
 
+    /// `produce`'s output at `[1,1]` — written by the same nested sequence,
+    /// not returned by it. Accepted while nested returns were unrecorded.
     #[test]
-    #[should_panic(expected = "selects a different part of the sequence's result")]
+    #[should_panic(expected = "is not the object main returns")]
+    fn rejects_another_object_the_nested_sequence_wrote() {
+        verify_output(&nested_cfs(vec![]), vec![1, 1], Some("max"));
+    }
+
+    #[test]
+    #[should_panic(expected = "selects a different part of the object than main returns")]
     fn rejects_a_nested_sequence_return_with_another_field() {
         verify_output(&nested_cfs(vec![]), vec![1, 2], Some("sum"));
     }
 
     #[test]
-    #[should_panic(expected = "do not descend from expected sequence source")]
+    #[should_panic(expected = "is not the object main returns")]
     fn rejects_a_nested_sequence_return_outside_its_scope() {
         verify_output(&nested_cfs(vec![tile_item("other")]), vec![2], Some("max"));
+    }
+
+    /// A nested sequence whose return the CFS could not bind makes `main`'s
+    /// output unfollowable: fail closed.
+    #[test]
+    #[should_panic(expected = "cannot be followed to the step that wrote it")]
+    fn refuses_a_nested_sequence_whose_return_is_unbound() {
+        let cfs = cfs_with(
+            vec![SequenceChildItem::Sequence(SequenceItem {
+                id: "child".into(),
+                sources: vec![],
+            })],
+            returning(InputBinding::prior_item_output(0), &["max"]),
+            None,
+        );
+        verify_output(&cfs, vec![1, 1], Some("max"));
+    }
+
+    /// `main = [produce, pass(produce)]` returning `select!(passed.max)`: `pass`
+    /// returns its parameter, so the output is `produce`'s object at `[1]` —
+    /// outside the call at `[2]`, which the old "inside the item" rule refused.
+    /// The argument binding records no path, so the path is checked as a
+    /// suffix.
+    fn pass_through_cfs() -> CfsCursor {
+        cfs_returning(
+            vec![
+                tile_item("produce"),
+                SequenceChildItem::Sequence(SequenceItem {
+                    id: "pass".into(),
+                    sources: vec![InputBinding::prior_item_output(0)],
+                }),
+            ],
+            returning(InputBinding::prior_item_output(1), &["max"]),
+        )
+    }
+
+    #[test]
+    fn accepts_a_value_a_nested_sequence_passes_through() {
+        assert!(matches!(
+            verify_output(&pass_through_cfs(), vec![1], Some("max")),
+            OutputAuthorization::Established { .. }
+        ));
+    }
+
+    #[test]
+    #[should_panic(expected = "selects a different part of the object than main returns")]
+    fn rejects_another_field_of_a_passed_through_value() {
+        verify_output(&pass_through_cfs(), vec![1], Some("sum"));
     }
 
     /// A unit `main` binds nothing and carries no value — the variant stays

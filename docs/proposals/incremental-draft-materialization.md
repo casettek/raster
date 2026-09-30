@@ -738,14 +738,23 @@ consistent with itself but not with what the body computed.
   `Inline` — `sequence-grammar-closure`'s rule applied to returns. (Until `finalize` leaves the
   language, `5e0bf83` makes it a build *warning* for `main` instead, so a program returning
   `finalize(draft)` still builds and runs unauthenticated; its `ProgramEnd` fails closed.)
-- **`SequenceEnd` records its returned value as a binding**, as `ProgramEnd` already does:
-  `output: Option<StorageData>`, with `output_commitment = selected_hash`.
-- **The guest checks `SequenceEnd` and `ProgramEnd` against `returns`** with the machinery it
-  already runs for tile arguments: a prior item's output against that item's producing record, a
-  sequence parameter against the parent's `Start`.
-- **A consumer of a sequence item cites exactly that sequence's returned binding**, replacing the
-  "inside `[j]`" prefix check. A re-return is one more link: `main` → `inner` → `b` resolves to
-  exactly `[2,2]`.
+- **Storage-backed returns are resolved statically, through the CFS** (revised 2026-09-28; this
+  replaces a runtime check at each `SequenceEnd`). A sequence body has no control flow, so which
+  step's output it returns is fixed at build time. `returns` is recorded *relative* to the
+  sequence — an item index, never a coordinate, because one definition is called from many places
+  — and the guest follows it from any consumer down to the step that wrote the object
+  (`CfsCursor::resolve_value`): `PriorItemOutput(k)` names item `F ++ [k+1]`, where a tile, recur
+  tile or recur sequence wrote its value exactly; a nested sequence hands on its own `returns`,
+  prepending its path; a returned parameter continues at the caller's argument; an entry argument
+  is the entry object at `[]`. No trace or witness field is involved, so the check also holds in a
+  fraud window that contains no `SequenceEnd`.
+- **`ProgramEnd` and every consumer of a sequence item cite exactly the resolved object**,
+  replacing the "inside `[j]`" prefix check. A re-return is one more hop: `main` → `inner` → `b`
+  resolves to exactly `[2,2]`. Measured on `hello-tiles`: `main` returns through three nested
+  sequences to `exclaim`'s object at `[21,7,4,1]`, and every one of the trace's 32 prior-item
+  arguments resolves to the coordinates the run recorded.
+- **`SequenceEnd` records a returned binding only for inline values** — a recur sequence's carried
+  state (D5b), the one return the static walk cannot follow because it is not a stored object.
 - **A nested sequence may not return an inline value**, the rule `main` already has. A recur
   sequence's returned state is a body tile's output (`advance_word_cursor` in
   `crates/raster/tests/recur_draft.rs`), so it resolves to a prior item's output and is bound.
@@ -757,19 +766,28 @@ consistent with itself but not with what the body computed.
 replay assertion. Nested sequences and consumers follow with the step-kind change, since
 `SequenceEnd` moves to `[-s]` in the same break.
 
-**Implemented so far — 2026-09-28: `main`'s return, source and path.** `SequenceDef.returns` is
-`SequenceReturn { source, path }` for `main` (`5e0bf83` added the source, the selector fix the
-path); `verify_program_end` requires it, holds `ProgramEnd`'s coordinates to the source (equal for
-a tile, inside for a sequence, `[]` for an entry argument) and its proven `selection.path` to the
-path (exact, or a suffix for a sequence). The selector fix also made the selection proof
-unconditional: a zero-length selection used to skip it, leaving the output commitment free. Not
-yet: nested sequences' returns, so `main` returning a `call_seq!` result is held only to "inside
-`[j]`" and its path only as a suffix; and every consumer of a sequence item, whose argument
-bindings carry no path either. The check also pins only *where* the output was written, which is as good as the
-write itself — [`tile-output-commitment-unbound`](../issues/tile-output-commitment-unbound.md).
-Side effects: every program's `program_commitment` moved (the CFS is postcard-encoded, so a new
-field changes every program's bytes), and the tracked `Raster.lock` files are stale until
-regenerated. Details in [`program-output-unbound`](../issues/program-output-unbound.md).
+**Implemented so far — 2026-09-28: storage-backed returns, static.** In three steps: `main`'s
+return source (`5e0bf83`); its selector path, with the selection proof made unconditional — a
+zero-length selection used to skip it, leaving the output commitment free (`923aa9f`); then
+`returns` for every value-returning sequence (a recur-sequence body excepted — its site is the
+leaf) and the static walk, used by `ProgramEnd` (fails closed on any unfollowable chain) and by
+every prior-item argument. Not yet:
+
+- **A path through a parameter is only a suffix.** Argument bindings carry no path, so once the
+  walk crosses a sequence parameter only the trailing segments are known (`path_complete =
+  false`); prior-item arguments get no path check at all. Giving bindings a path is a separate
+  change, and also closes [`sequence-scope-forbids-narrowing`](../issues/sequence-scope-forbids-narrowing.md).
+- **Two chains are not followed**: a nested return the CFS could not bind, and a recur-sequence
+  body's parameter. `ProgramEnd` fails closed on both; a prior-item argument falls back to the
+  old "inside the source item" rule, so no honest program regresses.
+- **Inline returns** (recur-sequence carried state) — D5b.
+- **The write itself.** The walk pins *where* the object was written, which is as good as the
+  write — [`tile-output-commitment-unbound`](../issues/tile-output-commitment-unbound.md).
+
+Each step moved the `program_commitment` of every program whose CFS it changed (the CFS is
+postcard-encoded) — the first two every program with an output, the third only programs with
+nested sequences (`hello-tiles` among the examples). Details in
+[`program-output-unbound`](../issues/program-output-unbound.md).
 
 ### Draft and carried state are different things
 
@@ -1665,8 +1683,9 @@ Closed:
   - ~~**D5c. Binding a sequence's returned value to its body.**~~ **Decided 2026-09-28** — §Sequence
     return binding: the CFS records each sequence's return, source and selector path;
     `SequenceEnd` and `ProgramEnd` are checked against it; consumers cite exactly the returned
-    binding; `ProgramEnd` first. **Partly implemented** — `main`'s source (`5e0bf83`) and path;
-    nested returns and consumers remain. As found:
+    binding; `ProgramEnd` first. **Implemented for storage-backed returns** (2026-09-28), resolved
+    statically through the CFS rather than checked at each `SequenceEnd`; paths through a
+    parameter and inline returns remain (§Sequence return binding). As found:
     2026-09-28, and broader than recur sequences. `SequenceDef` has no return binding — only
     `main`'s `produces_output` flag — and the flow resolver resolves call *arguments*
     (`resolve_argument`) but never a body's returned expression. Three consequences:
@@ -1835,7 +1854,9 @@ zero-iteration site was not probed.
   (the measured probe, inverted — **in place since `5e0bf83`**, with the intermediate-object case);
   a `ProgramEnd` citing the right object under a different selector (`stats.sum` where `main`
   returns `select!(u64, stats.count)`, or the whole `stats`) is rejected, as is a zero-length
-  selection claiming an output with no proof — **both in place**, with genuine proofs; a consumer citing A at `[2,1]` where the sequence returns B at
+  selection claiming an output with no proof — **both in place**, with genuine proofs; an object a
+  nested sequence wrote but did not return is rejected, for `ProgramEnd` and for an argument, and
+  a value a sequence passes through is accepted outside the call — **in place**; a consumer citing A at `[2,1]` where the sequence returns B at
   `[2,2]` is rejected; a re-return through two sequences resolves to the original coordinate; a
   recur sequence iteration whose recorded state is not its body tile's output is rejected; a
   sequence whose returned expression the resolver cannot resolve fails to build.

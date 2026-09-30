@@ -4,7 +4,8 @@
 //! follow the schema's ordering.
 
 use raster_core::cfs::{
-    CfsCoordinate, CfsCoordinates, CfsCursor, InputBinding, InputSource, SequenceChildItem,
+    CfsCoordinate, CfsCoordinates, CfsCursor, InputBinding, InputSource, ResolveError,
+    SequenceChildItem,
     FIRST_COORDINATE,
 };
 use raster_core::input::SelectorSegment;
@@ -594,18 +595,16 @@ pub fn verify_sequence_scope_parent(
     );
 }
 
-/// Hold a stored value's coordinates to the item that produced it.
+/// The fallback for a source item whose value `CfsCursor::resolve_value`
+/// cannot follow: hold the value's coordinates to the item itself.
 ///
 /// `source_coordinate` is the producing item's 1-based position in the
 /// sequence at `parent_sequence_coordinates`. A tile has one output, at its own
-/// coordinate, so the value must sit exactly there. A sequence writes many
-/// objects under its coordinate and the CFS does not yet record which one it
-/// returns, so for a sequence item this can only require the value to lie
-/// *inside* it — the gap `docs/issues/program-output-unbound.md` records.
-///
-/// Shared by tile arguments and by the program output (`ProgramEnd`), so the
-/// two are held to the same rule.
-pub(crate) fn assert_prior_item_output_coordinates(
+/// coordinate, so the value must sit exactly there. For a sequence item whose
+/// return the CFS could not bind, or a chain ending at a recur body's
+/// parameter, this can only require the value to lie *inside* the item — the
+/// residual gap `docs/issues/program-output-unbound.md` records.
+fn assert_prior_item_output_coordinates(
     cfs_cursor: &CfsCursor,
     parent_sequence_coordinates: &CfsCoordinates,
     source_coordinate: CfsCoordinate,
@@ -772,12 +771,34 @@ fn verify_one_binding(
                     )
                 }
             };
-            assert_prior_item_output_coordinates(
-                cfs_cursor,
+            // Follow the source item down to the step that wrote its value: a
+            // nested sequence returns one object of the many it writes, and the
+            // CFS records which. Where the chain cannot be followed — a nested
+            // return the CFS could not bind, or a recur body's parameter — fall
+            // back to the looser "inside the source item" rule rather than
+            // refuse an honest program.
+            match cfs_cursor.resolve_value(
                 parent_sequence_coordinates,
-                source_coordinate,
-                &storage_meta.coordinates,
-            );
+                &InputBinding::prior_item_output(*intra_sequence_item_index),
+                &[],
+            ) {
+                Ok(resolved) => assert_eq!(
+                    storage_meta.coordinates, resolved.coordinates,
+                    "Storage input prior-item-output coordinates do not match expected CFS source",
+                ),
+                Err(ResolveError::UnboundReturn(_) | ResolveError::RecurBodyParameter) => {
+                    assert_prior_item_output_coordinates(
+                        cfs_cursor,
+                        parent_sequence_coordinates,
+                        source_coordinate,
+                        &storage_meta.coordinates,
+                    )
+                }
+                Err(error) => panic!(
+                    "Step {:?} arg {} names a source the CFS cannot follow: {:?}",
+                    step_record, input_index, error
+                ),
+            }
         }
         // `value_binding()` looks through every wrapper, so an `Indexed`
         // binding can never reach this match.

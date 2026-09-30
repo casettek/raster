@@ -306,74 +306,12 @@ fn schema_struct_fields(schema: &SchemaNode) -> Result<&[raster_core::input::Sch
     }
 }
 
-fn runtime_tree_value(value: &raster_core::draft::DraftValue) -> TreeValue {
-    match value {
-        raster_core::draft::DraftValue::Unit => TreeValue::Unit,
-        raster_core::draft::DraftValue::Bool(value) => TreeValue::Bool(*value),
-        raster_core::draft::DraftValue::U8(value) => TreeValue::U8(*value),
-        raster_core::draft::DraftValue::U16(value) => TreeValue::U16(*value),
-        raster_core::draft::DraftValue::U32(value) => TreeValue::U32(*value),
-        raster_core::draft::DraftValue::U64(value) => TreeValue::U64(*value),
-        raster_core::draft::DraftValue::I8(value) => TreeValue::I8(*value),
-        raster_core::draft::DraftValue::I16(value) => TreeValue::I16(*value),
-        raster_core::draft::DraftValue::I32(value) => TreeValue::I32(*value),
-        raster_core::draft::DraftValue::I64(value) => TreeValue::I64(*value),
-        raster_core::draft::DraftValue::String(value) => TreeValue::String(value.clone()),
-        raster_core::draft::DraftValue::Struct(fields) => TreeValue::Struct(
-            fields
-                .iter()
-                .map(|(name, child)| (name.clone(), runtime_tree_value(child)))
-                .collect(),
-        ),
-        // Draft list fields are `List<T>` append targets (never `Block`), so they
-        // finalize to `(root, len)` handles — matching how a `List` field encodes
-        // through `encode_raster_value`. The list Merkle root is unchanged, so the
-        // finalized root still equals the incrementally-tracked draft root.
-        raster_core::draft::DraftValue::List(values) => {
-            TreeValue::ListHandle(values.iter().map(runtime_tree_value).collect())
-        }
-        raster_core::draft::DraftValue::Map(entries) => TreeValue::Map(
-            entries
-                .iter()
-                .map(|(key, value)| (runtime_tree_value(key), runtime_tree_value(value)))
-                .collect(),
-        ),
-        raster_core::draft::DraftValue::EnumUnit(variant) => TreeValue::EnumUnit(variant.clone()),
-        raster_core::draft::DraftValue::EnumNewtype(variant, value) => {
-            TreeValue::EnumNewtype(variant.clone(), Box::new(runtime_tree_value(value)))
-        }
-        raster_core::draft::DraftValue::EnumTuple(variant, values) => TreeValue::EnumTuple(
-            variant.clone(),
-            values.iter().map(runtime_tree_value).collect(),
-        ),
-        raster_core::draft::DraftValue::EnumStruct(variant, fields) => TreeValue::EnumStruct(
-            variant.clone(),
-            fields
-                .iter()
-                .map(|(name, child)| (name.clone(), runtime_tree_value(child)))
-                .collect(),
-        ),
-        raster_core::draft::DraftValue::BytesPage {
-            index,
-            offset,
-            len,
-            bytes,
-        } => TreeValue::BytesPage {
-            index: *index,
-            offset: *offset,
-            len: *len,
-            bytes: bytes.clone(),
-        },
-    }
-}
-
 fn build_draft_tree(
     schema: &SchemaNode,
     fields: &BTreeMap<String, DraftFieldValue>,
     require_complete: bool,
 ) -> Result<TreeValue> {
-    let tree = draft_tree_from_fields(schema, fields, require_complete)?;
-    Ok(runtime_tree_value(&tree))
+    draft_tree_from_fields(schema, fields, require_complete)
 }
 
 fn locate_schema_field<'a>(

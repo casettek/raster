@@ -363,6 +363,112 @@ impl CfsCursor {
         }
     }
 
+    /// Follow a binding to the step that actually wrote its value.
+    ///
+    /// `frame` is the coordinates of the sequence the binding is written in —
+    /// `[]` for `main`, a call's own coordinates for a nested sequence, `[s, i]`
+    /// for an iteration of a recur sequence. `path` is the selector already
+    /// known to apply on top of the binding (e.g. `SequenceReturn::path`).
+    ///
+    /// A sequence writes many objects under its coordinate but returns one, and
+    /// a sequence body has no control flow, so *which* one is fixed by the CFS
+    /// (`SequenceDef::returns`, recorded relative to the sequence — an item
+    /// index, never a coordinate — because one definition is called from many
+    /// places). The walk descends one call at a time:
+    ///
+    /// * `PriorItemOutput(k)` names item `F ++ [k + 1]`. A tile, recur tile or
+    ///   recur sequence wrote its value exactly there; a nested sequence hands
+    ///   on its own `returns`, prepending its path.
+    /// * `SequenceScope(i)` is the caller's `i`-th argument at this frame's call
+    ///   site. Argument bindings record no path yet, so from here on only a
+    ///   *suffix* of the path is known (`path_complete = false`). A parameter of
+    ///   a recur sequence body is the site source's element for that iteration,
+    ///   which this walk does not follow (`RecurBodyParameter`).
+    /// * `EntryArgument` is the entry object at `[]`.
+    pub fn resolve_value(
+        &self,
+        frame: &CfsCoordinates,
+        source: &InputBinding,
+        path: &[SelectorSegment],
+    ) -> Result<ResolvedValue, ResolveError> {
+        // The CFS has no recursive sequence calls, so every walk ends; the
+        // bound only turns a malformed schema into a refusal instead of a hang.
+        const MAX_HOPS: usize = 256;
+
+        let mut frame = frame.clone();
+        let mut source = source.clone();
+        let mut path = path.to_vec();
+        let mut path_complete = true;
+        for _ in 0..MAX_HOPS {
+            match source {
+                InputBinding::PriorItemOutput {
+                    intra_sequence_item_index,
+                } => {
+                    let position = CfsCoordinate::try_from(intra_sequence_item_index)
+                        .ok()
+                        .and_then(|index| index.checked_add(FIRST_COORDINATE))
+                        .ok_or(ResolveError::NotStorage)?;
+                    let mut item_coordinates = frame.clone();
+                    item_coordinates.push(position);
+                    match self.try_get_item(&item_coordinates) {
+                        Some(
+                            SequenceChildItem::Tile(_)
+                            | SequenceChildItem::RecurTile(_)
+                            | SequenceChildItem::RecurSequence(_),
+                        ) => {
+                            return Ok(ResolvedValue {
+                                coordinates: item_coordinates,
+                                path,
+                                path_complete,
+                            })
+                        }
+                        Some(SequenceChildItem::Sequence(item)) => {
+                            let returns = self
+                                .cfs
+                                .sequences
+                                .iter()
+                                .find(|sequence| sequence.id == item.id)
+                                .and_then(|sequence| sequence.returns.as_ref())
+                                .ok_or_else(|| ResolveError::UnboundReturn(item.id.clone()))?;
+                            let mut composed = returns.path.clone();
+                            composed.extend(path);
+                            path = composed;
+                            source = returns.source.clone();
+                            frame = item_coordinates;
+                        }
+                        None => return Err(ResolveError::NotStorage),
+                    }
+                }
+                InputBinding::SequenceScope { input_index } => {
+                    if self.try_get_recur_iteration_coordinates(&frame).is_some() {
+                        return Err(ResolveError::RecurBodyParameter);
+                    }
+                    let call = self.try_get_item(&frame).ok_or(ResolveError::NotStorage)?;
+                    let argument = call
+                        .inputs()
+                        .get(input_index)
+                        .cloned()
+                        .ok_or(ResolveError::NotStorage)?;
+                    let (caller_frame, _) = frame.try_parent().ok_or(ResolveError::NotStorage)?;
+                    path_complete = false;
+                    source = argument;
+                    frame = caller_frame;
+                }
+                InputBinding::EntryArgument => {
+                    return Ok(ResolvedValue {
+                        coordinates: CfsCoordinates::new(),
+                        path,
+                        path_complete,
+                    })
+                }
+                InputBinding::Direct(_) | InputBinding::Indexed { .. } => {
+                    return Err(ResolveError::NotStorage)
+                }
+            }
+        }
+        Err(ResolveError::TooDeep)
+    }
+
     fn sequence_by_id(&self, id: &str) -> &SequenceDef {
         self.cfs
             .sequences
@@ -719,6 +825,35 @@ pub struct SequenceDef {
     /// `docs/issues/program-output-unbound.md`.
     #[serde(default)]
     pub returns: Option<SequenceReturn>,
+}
+
+/// Where a binding's value was written, from [`CfsCursor::resolve_value`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedValue {
+    /// The coordinates of the step that wrote the object.
+    pub coordinates: CfsCoordinates,
+    /// The selector into that object — all of it when `path_complete`, else
+    /// only its trailing segments.
+    pub path: Vec<SelectorSegment>,
+    /// `false` once the walk crossed a sequence parameter, whose argument
+    /// binding records no path.
+    pub path_complete: bool,
+}
+
+/// Why [`CfsCursor::resolve_value`] could not follow a binding to a written
+/// object.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolveError {
+    /// A sequence on the chain has no `returns` — its returned expression is
+    /// not a binding the CFS can follow (a finalized draft, a computed value).
+    UnboundReturn(SequenceId),
+    /// The chain reached a parameter of a recur sequence body.
+    RecurBodyParameter,
+    /// The chain reached an inline value, a data-sourced index, or a
+    /// position the CFS does not describe.
+    NotStorage,
+    /// The walk exceeded its hop bound.
+    TooDeep,
 }
 
 /// What a sequence returns: where the value comes from, and the path into it.
@@ -1248,4 +1383,158 @@ mod tests {
         };
         assert_eq!(item.chunk, Some(64));
     }
+
+    /// `main = [a, outer, outer, choose, rs, noret]`, where `outer` returns
+    /// `select!(inner_result.x)`, `inner` returns `select!(c.y)`, `choose`
+    /// returns `select!(its parameter.z)`, and `rs` is a recur sequence whose
+    /// body calls `choose` on the body's own parameter.
+    fn returns_cursor() -> CfsCursor {
+        let tile = |id: &str, sources: Vec<InputBinding>| {
+            SequenceChildItem::Tile(TileItem { id: id.to_string(), sources })
+        };
+        let call = |id: &str, sources: Vec<InputBinding>| {
+            SequenceChildItem::Sequence(SequenceItem { id: id.to_string(), sources })
+        };
+        let returning = |index: usize, field: &str| {
+            Some(SequenceReturn {
+                source: InputBinding::prior_item_output(index),
+                path: vec![SelectorSegment::Field(field.to_string())],
+            })
+        };
+        let seq = |id: &str, items: Vec<SequenceChildItem>, returns: Option<SequenceReturn>| {
+            SequenceDef {
+                id: id.to_string(),
+                input_sources: vec![InputBinding::seq_input(0)],
+                items,
+                entry_arguments: vec![],
+                produces_output: false,
+                returns,
+            }
+        };
+        CfsCursor::new(ControlFlowSchema {
+            version: "1.0".to_string(),
+            project: "test".to_string(),
+            encoding: "postcard".to_string(),
+            tiles: vec![TileDef::iter("a", 0, 1), TileDef::iter("b", 1, 1), TileDef::iter("c", 1, 1)],
+            sequences: vec![
+                SequenceDef {
+                    id: "main".to_string(),
+                    input_sources: vec![],
+                    items: vec![
+                        tile("a", vec![]),
+                        call("outer", vec![InputBinding::prior_item_output(0)]),
+                        call("outer", vec![InputBinding::prior_item_output(0)]),
+                        call("choose", vec![InputBinding::prior_item_output(0)]),
+                        SequenceChildItem::RecurSequence(RecurSequenceItem {
+                            id: "rs".to_string(),
+                            sources: vec![InputBinding::prior_item_output(0)],
+                            state_is_output: false,
+                        }),
+                        call("noret", vec![InputBinding::prior_item_output(0)]),
+                    ],
+                    entry_arguments: vec![],
+                    produces_output: true,
+                    returns: None,
+                },
+                seq(
+                    "outer",
+                    vec![tile("b", vec![InputBinding::seq_input(0)]), call("inner", vec![InputBinding::prior_item_output(0)])],
+                    returning(1, "x"),
+                ),
+                seq("inner", vec![tile("c", vec![InputBinding::seq_input(0)])], returning(0, "y")),
+                seq(
+                    "choose",
+                    vec![],
+                    Some(SequenceReturn {
+                        source: InputBinding::seq_input(0),
+                        path: vec![SelectorSegment::Field("z".to_string())],
+                    }),
+                ),
+                seq("rs", vec![call("choose", vec![InputBinding::seq_input(0)])], returning(0, "w")),
+                seq("noret", vec![tile("b", vec![InputBinding::seq_input(0)])], None),
+            ],
+        })
+    }
+
+    fn fields(names: &[&str]) -> Vec<SelectorSegment> {
+        names.iter().map(|name| SelectorSegment::Field(name.to_string())).collect()
+    }
+
+    #[test]
+    fn a_nested_return_resolves_to_the_step_that_wrote_it() {
+        let cursor = returns_cursor();
+        let resolved = cursor
+            .resolve_value(&CfsCoordinates::new(), &InputBinding::prior_item_output(1), &fields(&["m"]))
+            .expect("resolves");
+        // main → outer at [2] → inner at [2,2] → tile c at [2,2,1]; each hop
+        // prepends its own selection: c.y, then .x, then main's .m.
+        assert_eq!(resolved.coordinates, CfsCoordinates(vec![2, 2, 1]));
+        assert_eq!(resolved.path, fields(&["y", "x", "m"]));
+        assert!(resolved.path_complete);
+    }
+
+    /// One definition, two call sites: the relative `returns` resolves against
+    /// whichever call it is reached through.
+    #[test]
+    fn the_same_definition_resolves_per_call_site() {
+        let cursor = returns_cursor();
+        let second = cursor
+            .resolve_value(&CfsCoordinates::new(), &InputBinding::prior_item_output(2), &[])
+            .expect("resolves");
+        assert_eq!(second.coordinates, CfsCoordinates(vec![3, 2, 1]));
+    }
+
+    /// A sequence returning its parameter hands the value back to the caller's
+    /// argument — which here is `a`'s output at `[1]`, outside the call at
+    /// `[4]`. The argument binding records no path, so only a suffix is known.
+    #[test]
+    fn a_returned_parameter_resolves_through_the_callers_argument() {
+        let cursor = returns_cursor();
+        let resolved = cursor
+            .resolve_value(&CfsCoordinates::new(), &InputBinding::prior_item_output(3), &[])
+            .expect("resolves");
+        assert_eq!(resolved.coordinates, CfsCoordinates(vec![1]));
+        assert_eq!(resolved.path, fields(&["z"]));
+        assert!(!resolved.path_complete);
+    }
+
+    #[test]
+    fn a_recur_sequence_site_is_its_own_leaf() {
+        let cursor = returns_cursor();
+        let resolved = cursor
+            .resolve_value(&CfsCoordinates::new(), &InputBinding::prior_item_output(4), &[])
+            .expect("resolves");
+        assert_eq!(resolved.coordinates, CfsCoordinates(vec![5]));
+    }
+
+    #[test]
+    fn a_recur_body_parameter_is_not_followed() {
+        let cursor = returns_cursor();
+        // Inside iteration 1 of `rs` at [5], `choose` (item [5,1,1]) returns the
+        // body's own parameter.
+        assert_eq!(
+            cursor.resolve_value(&CfsCoordinates(vec![5, 1]), &InputBinding::prior_item_output(0), &[]),
+            Err(ResolveError::RecurBodyParameter)
+        );
+    }
+
+    #[test]
+    fn an_unbound_return_and_an_inline_value_are_refused() {
+        let cursor = returns_cursor();
+        assert_eq!(
+            cursor.resolve_value(&CfsCoordinates::new(), &InputBinding::prior_item_output(5), &[]),
+            Err(ResolveError::UnboundReturn("noret".to_string()))
+        );
+        assert_eq!(
+            cursor.resolve_value(&CfsCoordinates::new(), &InputBinding::inline(), &[]),
+            Err(ResolveError::NotStorage)
+        );
+        assert_eq!(
+            cursor
+                .resolve_value(&CfsCoordinates::new(), &InputBinding::entry_argument(), &fields(&["cfg"]))
+                .map(|resolved| (resolved.coordinates, resolved.path)),
+            Ok((CfsCoordinates::new(), fields(&["cfg"])))
+        );
+    }
+
 }
