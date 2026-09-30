@@ -819,7 +819,7 @@ object, which is what makes a state comparable with the result a site stores.
 | --- | --- | --- |
 | `state_in` | computed in the replay from the typed input value | the commitment of the **reference** the iteration's `Start` binds: the previous iteration's returned object, or the seed |
 | `state_out` | computed in the replay from the returned value | the commitment of the iteration's returned binding, which §Sequence return binding binds to a body tile's output — no hashing, no type needed in the guest |
-| frame opens at `RecurStart` | from the seed's binding when the seed is stored; adopted from iteration 0 only for an inline literal seed | the same |
+| frame opens at `RecurStart` | from the seed's binding when the seed is stored — authenticated by `RecurStart`'s storage read; adopted from iteration 0 only for an inline literal seed | the same |
 | terminal check, state-only site | `frame.state_commitment == output_commitment` at `RecurEnd` | the same |
 | state+output site | chained per iteration; discarded, so no terminal check | the same |
 
@@ -1036,7 +1036,7 @@ let g = call_recur!(tile = add_line, input = lines, output = base, args = ());  
 
 | step | user side (`DraftBuffer`) | recorder | guest |
 | --- | --- | --- | --- |
-| `RecurStart` at `[s2]` | create the buffer, anchor `anchor_for_schema([s2], S)`, **initialized from the base**: read `[s1]` from `ObjectStore`; take each list's frontier and each field's root from its raster index; decode the set-once fields only | open the frame's draft entry: root = base commitment, `derived = true` (from the CFS) | the same, with the base commitment bound through `RecurStart`'s input source witness to the record that produced `[s1]` |
+| `RecurStart` at `[s2]` | create the buffer, anchor `anchor_for_schema([s2], S)`, **initialized from the base**: read `[s1]` from `ObjectStore`; take each list's frontier and each field's root from its raster index; decode the set-once fields only | open the frame's draft entry: root = base commitment, `derived = true` (from the CFS) | the same, with the base commitment authenticated by `RecurStart`'s storage read of `[s1]` (a CFS binding alone pins its coordinates, not its commitment) |
 | iteration | `push` only: hash the new element, move the frontier, append its encoded bytes and nodes to that list's tail | `root_after = apply_draft_ops(pre_state, ops)`; the frame root advances | `root_before == frame root`; ops apply; **no `Set`** |
 | `RecurEnd` at `[-s2]` | seal: the delta — each list's tail, updated headers and right spine — plus a reference to `[s1]` | one write at `[s2]`, as a **derived** object sharing `[s1]`'s bytes and nodes; `frame root == output_commitment` | the same comparison, then pop |
 
@@ -1218,11 +1218,27 @@ step is the `InitTransition.active_drafts` entry, which the host supplies and no
 `StepKind::SequenceStart` (`recorder.rs:470-516`). `[s]` is a scope, so the site's `Start` and its
 close share the coordinate the way a nested sequence's boundary steps do, and
 `record_matches_item` binds it to the `RecurTile` item the same way. It carries the site's inputs,
-including the authenticated `L` from the `0x0A` metadata. It produces nothing, and boundary steps
-carry no `StorageRoots`, so the creation record cannot be a write at `[s]`. It does not need to be:
-`Start` already opens the site's `RecurProgressFrame` (`push_site`), and that frame is committed on
-every step. The same holds after §A recur site gets its own step kinds: `RecurStart` also carries
-no `StorageRoots`.
+including `L` from the `0x0A` metadata. It produces nothing, so the creation record cannot be a
+write at `[s]`. It does not need to be: `Start` already opens the site's `RecurProgressFrame`
+(`push_site`), and that frame is committed on every step. The same holds after §A recur site gets
+its own step kinds: `RecurStart` **never writes**.
+
+> **Corrected 2026-09-30 — no write, but a verified read.** This paragraph used to say `L` was
+> authenticated and that `RecurStart` carries no `StorageRoots`. The first was false in shipped
+> code: a boundary step has no storage roots, so `checks::store` neither reads its object nor folds
+> its witnesses, and `L` was read from unverified bytes. Rule 8
+> ([`tile-io-structural-roots`](./tile-io-structural-roots.md) §Step 1) now catches a wrong `L` at
+> the first iteration, but a `Start` naming a fabricated **empty** list at the right coordinates,
+> followed by zero iterations, passed rule 7. The fix gives the site `Start` **read-only**
+> `StorageRoots` (`root_before == root_after`), like `ProgramEnd`: the record pins the roots, so
+> the existing store path verifies the read and the `0x0A` fold. It lands first on
+> `SequenceStart` as `storage: Option<StorageRoots>`, set only at a recur site `Start`, and moves
+> into `RecurStartStep.storage` when §A recur site gets its own step kinds lands. This proposal
+> needs that read more than today's code does: the two further storage-backed facts `RecurStart`
+> gains here — a deriving site's base commitment (§Continuation on the draft buffer) and a stored
+> seed's commitment (§Carried-state commitment (D5b)) — are unauthenticated without it, since a CFS binding
+> pins coordinates only. **Landed 2026-09-30** on `SequenceStart` (guest-tested, and verified on
+> real `hello-tiles` fraud windows).
 
 **The design.** Add the draft entry to the frame:
 
@@ -1414,6 +1430,7 @@ pub struct RecurStartStep {
     pub site_id: String,            // the CFS item id at [s]
     pub input_commitment: Vec<u8>,
     pub input_source_commitment: Vec<u8>,
+    pub storage: StorageRoots,      // read-only: before == after; authenticates L, base, seed
 }
 
 pub struct RecurEndStep {
@@ -1478,7 +1495,7 @@ than on a borrowed kind that only the item disambiguates:
 
 | kind | binds inputs | storage | frame | draft (tile sites) |
 | --- | --- | --- | --- | --- |
-| `RecurStart` at a `RecurTile` item | yes: the CFS sources, with the `0x0A` payload for `input` | none | `push_site(Tile, chunk, L, state_is_output)` | open the entry: empty root of `S`, or the base object's commitment |
+| `RecurStart` at a `RecurTile` item | yes: the CFS sources, with the `0x0A` payload for `input` | **read only**: its storage inputs are read and folded against unchanged roots — this is what authenticates `L`, a base and a stored seed | `push_site(Tile, chunk, L, state_is_output)` | open the entry: empty root of `S`, or the base object's commitment |
 | `Exec(Tile)` at `[s][i]` | through the replay journal, as today | none | `advance_tile_iteration` | `root_before` must equal the entry; the entry becomes `root_after` |
 | `RecurEnd` at a `RecurTile` item | **no** | **exactly one** write, at `[s]` | `close_site` | `entry.root == output_commitment`, then pop |
 | `RecurStart` / `RecurEnd` at a `RecurSequence` item | as for a tile site | as for a tile site | `push_site(Sequence, …)` / `close_site` | none; recur sequences are out of scope |

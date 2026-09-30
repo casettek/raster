@@ -415,6 +415,21 @@ pub enum StepKind {
     SequenceStart {
         input_commitment: Vec<u8>,
         input_source_commitment: Vec<u8>,
+        /// **Read-only** storage roots (`root_before == root_after`), set
+        /// exactly on a recur site's `Start` at `[s]` and `None` on every other
+        /// sequence boundary.
+        ///
+        /// A site `Start` reads its source's `0x0A` metadata, which is where
+        /// the sweep bound `L` comes from. A boundary step with no roots gets
+        /// no storage read and no witness fold, so without these `L` — and the
+        /// source object itself — were whatever the prover recorded: a
+        /// fabricated empty list at the right coordinates, swept zero times,
+        /// passed rule 7. With them the record pins the roots, as `ProgramEnd`
+        /// does for its read, and `checks::store` verifies the read like any
+        /// other. Moves into `RecurStartStep` with
+        /// `incremental-draft-materialization`'s step kinds; see
+        /// `docs/proposals/tile-io-structural-roots.md` §Step 1.
+        storage: Option<StorageRoots>,
     },
     SequenceEnd {
         output_commitment: Vec<u8>,
@@ -574,14 +589,16 @@ impl StepRecord {
     }
 
     /// The storage roots this step claims, for kinds that touch the store.
-    /// Sequence boundaries never touch it, so they have none. A program end
-    /// reads its output (roots unchanged) so it claims them too.
+    /// A program end reads its output (roots unchanged) so it claims them too,
+    /// and so does a recur site's `Start`, which reads its source. Every other
+    /// sequence boundary has none.
     pub fn storage_roots(&self) -> Option<&StorageRoots> {
         match &self.kind {
             StepKind::Exec(exec) => Some(&exec.storage),
             StepKind::ProgramStart(program_start) => Some(&program_start.storage),
             StepKind::ProgramEnd(program_end) => Some(&program_end.storage),
-            StepKind::SequenceStart { .. } | StepKind::SequenceEnd { .. } => None,
+            StepKind::SequenceStart { storage, .. } => storage.as_ref(),
+            StepKind::SequenceEnd { .. } => None,
         }
     }
 
@@ -1062,6 +1079,7 @@ mod payload_rule_tests {
         StepKind::SequenceStart {
             input_commitment: Vec::new(),
             input_source_commitment: Vec::new(),
+            storage: None,
         }
     }
 

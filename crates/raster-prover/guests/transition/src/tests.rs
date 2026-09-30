@@ -262,6 +262,7 @@ fn scope_binding_scenario(
             // The record commits its own argument list; that commitment is
             // fingerprinted, which is what makes it an anchor.
             input_source_commitment: input_source_commitment(&parent_args),
+            storage: None,
         },
         recur_progress_commitment: RecurProgressStack::new().commitment(),
         recur_state: None,
@@ -854,6 +855,7 @@ fn boundary_start_kind() -> StepKind {
     StepKind::SequenceStart {
         input_commitment: Vec::new(),
         input_source_commitment: Vec::new(),
+        storage: None,
     }
 }
 
@@ -1509,6 +1511,7 @@ fn verify_sequence_boundary_commitments_accept_matching_recorded_io() {
         kind: StepKind::SequenceStart {
             input_commitment: sha(b"sequence-in"),
             input_source_commitment: Vec::new(),
+            storage: None,
         },
         recur_progress_commitment: RecurProgressStack::new().commitment(),
         recur_state: None,
@@ -1716,6 +1719,7 @@ fn sequence_start_step(coordinates: CfsCoordinates, input_source_commitment: Vec
         kind: StepKind::SequenceStart {
             input_commitment: Vec::new(),
             input_source_commitment,
+            storage: None,
         },
         recur_progress_commitment: RecurProgressStack::new().commitment(),
         recur_state: None,
@@ -3888,6 +3892,7 @@ fn recur_sequence_site_step() -> StepRecord {
         kind: StepKind::SequenceStart {
             input_commitment: sha(b"recur-seq-in"),
             input_source_commitment: Vec::new(),
+            storage: None,
         },
         recur_progress_commitment: RecurProgressStack::new().commitment(),
         recur_state: None,
@@ -4318,6 +4323,7 @@ fn recur_sequence_iteration(index: u64) -> (StepRecord, FnInput, BTreeMap<String
         kind: StepKind::SequenceStart {
             input_commitment: Vec::new(),
             input_source_commitment: Vec::new(),
+            storage: None,
         },
         recur_progress_commitment: [0u8; 32],
         recur_state: None,
@@ -4497,4 +4503,290 @@ fn a_recur_sequence_iteration_without_a_handle_is_rejected() {
     scope.values[0] = FnInputValue::Inline(b"not a handle".to_vec());
     let (step, input) = decorate_reading(0, 0);
     verify_step_record_inputs(&recur_sequence_site_cfs(), &step, Some(&input), Some(&scope), None);
+}
+
+// ---------------------------------------------------------------------------
+// The site `Start`'s `L` — `tile-io-structural-roots.md` §Step 1, "Found, not
+// fixed".
+// ---------------------------------------------------------------------------
+
+/// `main`: a tile at `[1]` producing a list, and a chunked recur tile site at
+/// `[2]` sweeping it.
+fn produced_list_sweep_cfs() -> CfsCursor {
+    CfsCursor::new(ControlFlowSchema {
+        version: "1.0".into(),
+        project: "test".into(),
+        encoding: "postcard".into(),
+        tiles: vec![TileDef::iter("produce", 0, 1), TileDef::iter("collect", 1, 1)],
+        sequences: vec![SequenceDef {
+            id: "main".into(),
+            input_sources: vec![],
+            items: vec![
+                SequenceChildItem::Tile(TileItem {
+                    id: "produce".into(),
+                    sources: vec![],
+                }),
+                SequenceChildItem::RecurTile(RecurTileItem {
+                    id: "collect".into(),
+                    sources: vec![InputBinding::prior_item_output(0)],
+                    chunk: Some(2),
+                    leaves_output_open: false,
+                    state_is_output: false,
+                }),
+            ],
+            entry_arguments: Vec::new(),
+            produces_output: false,
+            returns: None,
+        }],
+    })
+}
+
+/// A site `Start` at `[2]` whose `"input"` names `[1]` — the right producer —
+/// with any commitment and any `0x0A` metadata bytes.
+fn site_start_reading(
+    commitment: Hash32,
+    metadata: Vec<u8>,
+) -> (StepRecord, FnInput, BTreeMap<String, SelectionWitness>) {
+    let input = FnInput {
+        data: Vec::new(),
+        values: vec![FnInputValue::StorageBinding],
+        args: vec![FnInputArg {
+            name: "input".to_string(),
+            ty: "AuthRef<List<String>>".to_string(),
+        }],
+        storage: [(
+            "input".to_string(),
+            StorageData {
+                coordinates: CfsCoordinates(vec![1]),
+                commitment: commitment.to_vec(),
+                selector: Default::default(),
+                selection: raster_core::input::SelectionCommitment {
+                    source_root_hash: commitment,
+                    selected_hash: raster_core::input::selection_payload_hash(&metadata),
+                    selected_len: metadata.len() as u64,
+                    payload_kind: raster_core::input::SelectionPayloadKind::List,
+                    ..Default::default()
+                },
+            },
+        )]
+        .into_iter()
+        .collect(),
+    };
+    let witness = SelectionWitness {
+        bytes: metadata,
+        proof: raster_core::input::SelectionProof {
+            path: Default::default(),
+            root_hash: commitment,
+            steps: Vec::new(),
+        },
+        selected_root: None,
+    };
+    let step = StepRecord {
+        exec_index: 2,
+        sequence_id: "collect".into(),
+        coordinates: CfsCoordinates(vec![2]),
+        kind: StepKind::SequenceStart {
+            input_commitment: Vec::new(),
+            input_source_commitment: input_source_commitment(&input),
+            storage: None,
+        },
+        recur_progress_commitment: [0u8; 32],
+        recur_state: None,
+    };
+    (step, input, [("input".to_string(), witness)].into_iter().collect())
+}
+
+fn site_start_claiming(
+    commitment: Hash32,
+    len: u64,
+) -> (StepRecord, FnInput, BTreeMap<String, SelectionWitness>) {
+    let mut metadata = vec![0x0A];
+    metadata.extend_from_slice(&len.to_le_bytes());
+    site_start_reading(commitment, metadata)
+}
+
+/// The honest `0x0A` metadata of `swept_lines()`: `[0x0A][len][elements root]`,
+/// where the elements root is the top of the element Merkle tree.
+fn swept_lines_metadata() -> Vec<u8> {
+    let (_, elements) = swept_lines();
+    let mut top = b"list-node".to_vec();
+    top.extend_from_slice(&elements[0]);
+    top.extend_from_slice(&elements[1]);
+    let top: Hash32 = sha(&top).try_into().unwrap();
+    raster_core::input::encode_list_metadata_payload(2, Some(top))
+}
+
+/// The store holds `swept_lines()` at `[1]`, as the producer wrote it.
+fn produced_lines_store() -> Vec<StorageEntry> {
+    vec![StorageEntry {
+        coordinates: CfsCoordinates(vec![1]),
+        object_commitment: swept_lines().0.to_vec(),
+    }]
+}
+
+/// Run a site `Start` through the checks it gets: the CFS binding, the frame
+/// opening (with the commitment the honest recorder would stamp), and the
+/// store check against `store`, reading whatever object `read` names. With
+/// `roots`, the `Start` claims the store's current roots, read-only.
+fn run_site_start(
+    (mut start, input, witnesses): (StepRecord, FnInput, BTreeMap<String, SelectionWitness>),
+    roots: bool,
+    store: &[StorageEntry],
+    read: Option<&StorageEntry>,
+) -> RecurProgressStack {
+    let (mut frontier, root, _index, index_root) = build_storage_context(store);
+    if roots {
+        if let StepKind::SequenceStart { storage, .. } = &mut start.kind {
+            *storage = Some(StorageRoots {
+                root_before: root.clone(),
+                root_after: root,
+                index_root_before: index_root.clone(),
+                index_root_after: index_root.clone(),
+            });
+        }
+    }
+    let binding = &input.storage["input"];
+    let len = witnesses["input"].bytes.get(1..9).map_or(0, |bytes| {
+        u64::from_le_bytes(bytes.try_into().unwrap())
+    });
+    let mut expected = RecurProgressStack::new();
+    expected.push_site(
+        CfsCoordinates(vec![2]),
+        RecurSiteKind::Tile,
+        2,
+        len,
+        false,
+        raster_core::recur_progress::source_identity(binding),
+    );
+    start.recur_progress_commitment = expected.commitment();
+
+    let cfs = produced_list_sweep_cfs();
+    verify_step_record_inputs(&cfs, &start, Some(&input), None, None);
+    let mut progress = RecurProgressStack::new();
+    crate::checks::cfs::advance_recur_progress(
+        &cfs,
+        &mut progress,
+        &start,
+        None,
+        Some(&input),
+        None,
+        &witnesses,
+    );
+    let storage_witness = read.map(|entry| StorageWitness {
+        reads: vec![build_read_witness(store, entry)],
+        write: None,
+    });
+    let _ = verify_storage_transition(
+        &start,
+        Some(&input),
+        &witnesses,
+        None,
+        storage_witness.as_ref(),
+        &mut frontier,
+        &index_root,
+    );
+    progress
+}
+
+/// Was `poc_a_site_start_claiming_an_empty_source_is_accepted`: a `Start`
+/// naming a fabricated empty list at the right producer, followed by zero
+/// iterations, passed every check — the frame opened with `L = 0` read from
+/// unverified bytes, the store check looked only at the witness shape, and
+/// rule 7 closed the site. Without roots it is now refused where the frame
+/// opens.
+#[test]
+#[should_panic(expected = "must read its source from storage")]
+fn a_site_start_without_storage_roots_is_rejected() {
+    run_site_start(site_start_claiming([0xEE; 32], 0), false, &produced_lines_store(), None);
+}
+
+/// And with roots, the fabricated list cannot be read: the store holds the
+/// producer's real list at `[1]`, so the only read witness that exists there is
+/// for that commitment, and none matches `(coordinates, fabricated)`.
+#[test]
+#[should_panic(expected = "Missing storage read witness for coordinates")]
+fn a_site_start_claiming_a_fabricated_empty_source_is_rejected() {
+    let store = produced_lines_store();
+    run_site_start(site_start_claiming([0xEE; 32], 0), true, &store, Some(&store[0]));
+}
+
+/// The real object, with doctored metadata: the read passes, the fold does not.
+#[test]
+#[should_panic(expected = "Storage input 'input' selection witness is invalid")]
+fn a_site_start_with_doctored_metadata_is_rejected() {
+    let store = produced_lines_store();
+    let (real, _) = swept_lines();
+    run_site_start(site_start_claiming(real, 0), true, &store, Some(&store[0]));
+}
+
+#[test]
+fn an_honest_site_start_reads_its_source() {
+    let store = produced_lines_store();
+    let (real, _) = swept_lines();
+    let progress = run_site_start(
+        site_start_reading(real, swept_lines_metadata()),
+        true,
+        &store,
+        Some(&store[0]),
+    );
+    assert_eq!(progress.innermost().map(|frame| frame.source_len), Some(2));
+}
+
+/// An honest empty source still sweeps zero times: the read authenticates
+/// `L = 0` rather than forbidding it.
+#[test]
+fn an_honest_empty_source_reads_zero() {
+    let empty = raster_core::tree::list_root_from_hashes(&[]);
+    let store = vec![StorageEntry {
+        coordinates: CfsCoordinates(vec![1]),
+        object_commitment: empty.to_vec(),
+    }];
+    let progress = run_site_start(
+        site_start_reading(empty, raster_core::input::encode_list_metadata_payload(0, None)),
+        true,
+        &store,
+        Some(&store[0]),
+    );
+    assert_eq!(progress.innermost().map(|frame| frame.source_len), Some(0));
+}
+
+/// Roots belong to a site `Start` only; an ordinary boundary cannot claim them.
+#[test]
+#[should_panic(expected = "Only a recur site start may claim storage roots")]
+fn an_ordinary_sequence_start_may_not_claim_storage_roots() {
+    let mut step = recur_sequence_iteration(0).0;
+    if let StepKind::SequenceStart { storage, .. } = &mut step.kind {
+        *storage = Some(StorageRoots {
+            root_before: Vec::new(),
+            root_after: Vec::new(),
+            index_root_before: Vec::new(),
+            index_root_after: Vec::new(),
+        });
+    }
+    crate::checks::cfs::advance_recur_progress(
+        &recur_sequence_site_cfs(),
+        &mut lines_sweep(),
+        &step,
+        None,
+        None,
+        None,
+        &BTreeMap::new(),
+    );
+}
+
+/// The companion to the PoC: what the `Start` *is* held to. Naming the wrong
+/// producer is rejected — coordinates are the one fact the CFS check pins.
+#[test]
+#[should_panic(expected = "prior-item-output coordinates do not match expected CFS source")]
+fn a_site_start_naming_the_wrong_producer_is_rejected() {
+    let (mut start, mut input, _) = site_start_claiming([0xEE; 32], 0);
+    input.storage.get_mut("input").unwrap().coordinates = CfsCoordinates(vec![5]);
+    if let StepKind::SequenceStart {
+        input_source_commitment,
+        ..
+    } = &mut start.kind
+    {
+        *input_source_commitment = crate::checks::io::input_source_commitment(&input);
+    }
+    verify_step_record_inputs(&produced_list_sweep_cfs(), &start, Some(&input), None, None);
 }

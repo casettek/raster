@@ -1380,6 +1380,7 @@ mod tests {
             kind: StepKind::SequenceStart {
                 input_commitment: Vec::new(),
                 input_source_commitment: Vec::new(),
+                storage: None,
             },
             recur_progress_commitment: [0u8; 32],
             recur_state: None,

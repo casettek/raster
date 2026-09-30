@@ -3,9 +3,10 @@
 Status: open 2026-09-16. Unowned. **Top priority** — set 2026-09-16. **§2a fixed 2026-09-30 for
 recur tiles** — rule 8, plus a gap found on the way: an iteration's item was never tied to the
 site's source list at all, since iterations skip the CFS input check. §3's PoC is inverted. Open:
-§2b (the bytes a tile ran on). Recur-*sequence* items bound the same day. New gap found: a recur
-site `Start`'s `L` is read from an unverified witness — rule 8 cross-checks it except when there
-are zero iterations. See
+§2b (the bytes a tile ran on). Recur-*sequence* items bound the same day. A recur site `Start`'s
+`L` was read from an unverified witness (a fabricated empty source swept zero times passed) —
+fixed the same day: the site `Start` now carries read-only storage roots and its source is read
+and folded like a tile input. See
 [`tile-io-structural-roots`](../proposals/tile-io-structural-roots.md) §Step 1.
 
 Proposed fix: [`tile-io-structural-roots`](../proposals/tile-io-structural-roots.md) (2026-09-28) — closes this issue and its mirror in one tile image-id break.

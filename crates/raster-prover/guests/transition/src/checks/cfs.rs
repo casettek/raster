@@ -919,11 +919,13 @@ pub fn get_next_expected_coordinates(
 /// exist before iteration 0 is checked against it, which is why the site needs
 /// a `Start` at all.
 ///
-/// **Not authenticated here.** `Start` is a `SequenceStart`, which carries no
-/// storage roots, so `checks::store` folds none of its witnesses and never
-/// reads its object. Rule 8 (`check_iteration_item`) holds `L` to each
-/// iteration's verified proof, so a wrong `L` is caught at the first
-/// iteration — but not for a sweep with no iterations. See
+/// **Authenticated by the same step, not by this function.** A site `Start`
+/// must claim read-only storage roots (`advance_recur_progress`), so
+/// `checks::store` reads the source object against the store and folds this
+/// metadata witness to its commitment. Those checks run later in the step, but
+/// any failure rejects the step, so the `L` read here only stands if they pass.
+/// Before the roots, a boundary step got neither check, and a fabricated empty
+/// list swept zero times passed rule 7. See
 /// `docs/proposals/tile-io-structural-roots.md` §Step 1.
 fn authenticated_source_len(
     step_record: &StepRecord,
@@ -1113,6 +1115,34 @@ fn recur_sequence_item_selection<'a>(
     (item, item_witness)
 }
 
+/// A `SequenceStart` claims storage roots exactly when it opens a recur site.
+///
+/// The site `Start` must (checked where its frame opens); every other sequence
+/// boundary must not, so the field cannot turn an ordinary boundary into a
+/// storage step — which would make its forwarded bindings carry reads the
+/// prover chose to add.
+fn assert_sequence_start_storage(cfs_cursor: &CfsCursor, step_record: &StepRecord) {
+    let StepKind::SequenceStart {
+        storage: Some(_), ..
+    } = &step_record.kind
+    else {
+        return;
+    };
+    let coordinates = step_record.coordinates();
+    let opens_recur_site = cfs_cursor
+        .try_get_recur_iteration_coordinates(coordinates)
+        .is_none()
+        && matches!(
+            cfs_cursor.try_get_item(coordinates),
+            Some(SequenceChildItem::RecurTile(_) | SequenceChildItem::RecurSequence(_))
+        );
+    assert!(
+        opens_recur_site,
+        "Only a recur site start may claim storage roots: {:?}",
+        step_record,
+    );
+}
+
 /// Whether a recur site's own output is its carried state, from the CFS.
 fn site_state_is_output(item: &SequenceChildItem) -> bool {
     match item {
@@ -1132,6 +1162,7 @@ pub fn advance_recur_progress(
     storage_selection_witnesses: &BTreeMap<String, SelectionWitness>,
 ) {
     let coordinates = step_record.coordinates();
+    assert_sequence_start_storage(cfs_cursor, step_record);
 
     if let Some((site_coordinates, iteration_index)) =
         cfs_cursor.try_get_recur_iteration_coordinates(coordinates)
@@ -1275,6 +1306,14 @@ pub fn advance_recur_progress(
             match &step_record.kind {
                 // `Start`: open the frame with the authenticated `L`.
                 StepKind::SequenceStart { .. } => {
+                    // The read that authenticates `L`: with roots claimed,
+                    // `checks::store` reads the source object from the store
+                    // and folds its metadata witness, in this same step.
+                    assert!(
+                        step_record.storage_roots().is_some(),
+                        "Recur site start {:?} must read its source from storage",
+                        step_record,
+                    );
                     let chunk = match item {
                         SequenceChildItem::RecurTile(tile) => tile.chunk.unwrap_or(1),
                         _ => 1,

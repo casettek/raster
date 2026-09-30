@@ -523,6 +523,10 @@ impl TraceRecorder {
                             .as_ref()
                             .map(input_source_commitment)
                             .unwrap_or_default(),
+                        // A site `Start` reads its source — `L` comes from
+                        // its metadata — and writes nothing, so it claims the
+                        // current roots on both sides, as `ProgramEnd` does.
+                        storage: Some(self.storage_roots(None)),
                     },
                     recur_progress_commitment: [0u8; 32],
                     recur_state: None,
@@ -556,6 +560,7 @@ impl TraceRecorder {
                     kind: StepKind::SequenceStart {
                         input_commitment,
                         input_source_commitment,
+                        storage: None,
                     },
                     recur_progress_commitment: [0u8; 32],
                     recur_state: None,
@@ -767,6 +772,7 @@ impl TraceRecorder {
                     kind: StepKind::SequenceStart {
                         input_commitment,
                         input_source_commitment,
+                        storage: None,
                     },
                     recur_progress_commitment: [0u8; 32],
                     recur_state: None,

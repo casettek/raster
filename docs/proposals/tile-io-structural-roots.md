@@ -161,13 +161,37 @@ item = element `consumed_total` of the site's source.
   earlier step hits it. `incremental-draft-materialization` (drafts never cross a step boundary)
   removes the case; not fixed here.
 
-*Found, not fixed: the site `Start`'s `L` is unverified.* `authenticated_source_len` says
-`checks::store` has already folded the `"input"` metadata witness; it has not — the `Start` is a
-`SequenceStart`, so nothing folds it, and the object's commitment is not store-authenticated
-either (the CFS check pins coordinates only). Rule 8 now cross-checks `L` against the first
-iteration's proven list length, so a forged `L` is caught **unless there is no iteration**: a
-`Start` naming a fabricated empty list at the right coordinates, followed by zero iterations,
-passes rule 7. Closing it needs the `Start` to carry a storage read (a trace-format change).
+*The site `Start`'s `L` was unverified — fixed 2026-09-30 (option (a)).* `authenticated_source_len`
+said `checks::store` had folded the `"input"` metadata witness; it had not — the `Start` is a
+`SequenceStart`, which carried no storage roots, so nothing read its object or folded its witness,
+and the CFS check pins coordinates only. Rule 8 cross-checks `L` against the first iteration's
+proven list length, so the hole was the empty sweep: a `Start` naming a fabricated empty list at
+the right producer, followed by zero iterations, passed rule 7. Demonstrated first by a guest PoC
+(`poc_a_site_start_claiming_an_empty_source_is_accepted`), now inverted.
+
+- **Format.** `StepKind::SequenceStart` gains `storage: Option<StorageRoots>` — `Some` exactly at a
+  recur site `Start`, read-only (`root_before == root_after`), the way `ProgramEnd` claims roots
+  for its read. `StepRecord::storage_roots()` returns it. The recorder stamps the current roots
+  (`storage_roots(None)`); `prove.rs`'s read-witness gate is `storage_roots().is_some()`, so the
+  `Start`'s reads are built with no other change.
+- **Guest.** Nothing new in `checks::store`: with roots, the `Start` takes the existing path —
+  `root_before ==` the carried root, `verify_storage_read_witness` (the object is in the store),
+  `commitment == selection.source_root_hash`, and `verify_selection_witness` on the `0x0A` payload.
+  `advance_recur_progress` requires the roots where the site frame opens ("must read its source
+  from storage") and forbids them on every other `SequenceStart` ("Only a recur site start may
+  claim storage roots"). Because the record pins the roots, a window opening **on** the `Start`
+  is anchored like any `Exec` step.
+- **Tests.** Guest: a `Start` without roots; a fabricated empty source with roots (no read witness
+  matches it); the real object with doctored metadata (the fold fails); an honest non-empty and an
+  honest empty source (`L = 0` is authenticated, not forbidden); roots on an ordinary boundary.
+- **Real traces.** `hello-tiles` fraud windows (dev mode) containing each recur tile site `Start`
+  — `[11]`, `[12]`, `[16]`, `[18]`, window sizes 2 and 4, several opening on the `Start` itself —
+  produce proofs. Negative control: with the guest's roots requirement inverted, every one fails
+  at its site `Start`, so the read ran on each.
+- **Moves** into `RecurStartStep.storage` when `incremental-draft-materialization`'s step kinds
+  land; that proposal is corrected to match.
+- **Cost.** A trace-format break (every trace hash; old commitments must be re-recorded) and the
+  transition guest's image id. No tile id, no `program_commitment`: the locks still verify.
 
 *Not covered.* §2b is untouched: the bytes a tile ran on are still not the bytes the selection
 proves — step 2.

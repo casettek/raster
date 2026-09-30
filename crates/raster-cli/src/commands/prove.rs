@@ -406,6 +406,8 @@ pub fn prove(
         // chain: the guest forwards its carried frontier unchanged, so there is
         // no root here for a membership proof to be relative to. The bindings
         // are proved where they are consumed, against that step's own root.
+        // The exception is a recur site `Start`: it claims read-only roots
+        // (`StepKind::SequenceStart::storage`), so the gate below admits it.
         //
         // Gated here rather than on the `StorageWitness` that wraps the loop so
         // the proofs are never built: each binding costs a coordinate-index

@@ -501,6 +501,7 @@ mod tests {
             kind: StepKind::SequenceStart {
                 input_commitment: vec![1; 32],
                 input_source_commitment: Vec::new(),
+                storage: None,
             },
             recur_progress_commitment: RecurProgressStack::new().commitment(),
             recur_state: None,
@@ -608,6 +609,7 @@ mod tests {
                     empty_input_source_witness().source_witness_bytes(),
                 )
                 .to_vec(),
+                storage: None,
             },
             recur_progress_commitment: RecurProgressStack::new().commitment(),
             recur_state: None,
