@@ -504,6 +504,7 @@ impl TraceRecorder {
                     self.recur_site_chunk(&site_coordinates),
                     self.recur_source_len(input.as_ref()),
                     self.recur_site_state_is_output(&site_coordinates),
+                    recur_source_identity(input.as_ref()),
                 );
 
                 let record = StepRecord {
@@ -2128,4 +2129,14 @@ mod tests {
         // The close of iteration 0, not the open again.
         assert_row(&iter_end, "SequenceEnd", &[1, closing_coordinate(1)]);
     }
+}
+
+/// Which list a recur site sweeps, as the guest will re-derive it: the site
+/// `Start`'s `"input"` binding, through the shared
+/// [`raster_core::recur_progress::source_identity`].
+fn recur_source_identity(input: Option<&FnInput>) -> raster_core::input::Hash32 {
+    let binding = input
+        .and_then(|input| input.storage().get("input"))
+        .expect("Recur site Start must record its source binding");
+    raster_core::recur_progress::source_identity(binding)
 }

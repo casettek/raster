@@ -20,7 +20,7 @@ use raster_core::draft::{
 use raster_core::input::{
     AppendFrontier, SchemaField, SchemaFieldMode, SchemaNode, Selectable,
 };
-use raster_core::input::Hash32;
+use raster_core::input::{Hash32, SelectionWitness, SelectorSegment};
 use raster_core::recur_progress::{
     RecurProgressStack, RecurProgressViolation, RecurSiteKind,
 };
@@ -1143,11 +1143,78 @@ fn recur_journal(
 // exactly as an absent one does.
 // ---------------------------------------------------------------------------
 
+/// The swept list: the site `Start`'s `"input"` binding, a whole object at
+/// `[9]`.
+fn sweep_source_binding() -> StorageData {
+    storage_input_witness(CfsCoordinates(vec![9]), sha(b"sweep-source"))
+        .storage
+        .remove("arg")
+        .expect("the fixture records one binding")
+}
+
+/// What a chunked iteration records for its item: `RecurInput` as argument 0,
+/// selecting `[start, start + width)` of the 6-element source, with the
+/// selection witness `checks::store` has already verified. Rule 8 reads only
+/// the path, the proof's final step and the payload's element count.
+fn sweep_item_witness(start: u64, width: u64) -> (FnInput, BTreeMap<String, SelectionWitness>) {
+    let source = sweep_source_binding();
+    let path = raster_core::input::SelectorPath::new(vec![SelectorSegment::Range {
+        start,
+        end: start + width,
+    }]);
+    let mut payload = vec![0x02];
+    payload.extend_from_slice(&width.to_le_bytes());
+    for element in 0..width {
+        payload.extend_from_slice(&10u64.to_le_bytes());
+        payload.push(0x00);
+        payload.extend_from_slice(&1u64.to_le_bytes());
+        payload.push(element as u8);
+    }
+    let witness = SelectionWitness {
+        bytes: payload,
+        proof: raster_core::input::SelectionProof {
+            path: path.clone(),
+            root_hash: source.selection.source_root_hash,
+            steps: vec![raster_core::input::SelectionProofStep::ListRange {
+                start,
+                len: 6,
+                siblings: Vec::new(),
+            }],
+        },
+        selected_root: None,
+    };
+    let item = StorageData {
+        selector: path.clone(),
+        selection: raster_core::input::SelectionCommitment {
+            path,
+            ..source.selection.clone()
+        },
+        ..source
+    };
+    let input = FnInput {
+        data: Vec::new(),
+        values: vec![FnInputValue::StorageBinding],
+        args: vec![FnInputArg {
+            name: "chunk".to_string(),
+            ty: "RecurInput<Block<u8>>".to_string(),
+        }],
+        storage: [("chunk".to_string(), item)].into_iter().collect(),
+    };
+    (input, [("chunk".to_string(), witness)].into_iter().collect())
+}
+
 /// The stack as it stands after iteration `through` of a 3-iteration chunked
 /// sweep over 6 elements — what the host reconstructs from the trace prefix.
 fn seeded_stack(through: u64) -> RecurProgressStack {
     let mut stack = RecurProgressStack::new();
-    stack.push_site(CfsCoordinates(vec![1]), RecurSiteKind::Tile, 2, 6, false);
+    stack.push_site(
+        CfsCoordinates(vec![1]),
+        RecurSiteKind::Tile,
+        2,
+        6,
+        false,
+        raster_core::recur_progress::source_identity(&sweep_source_binding()),
+    );
     for iteration in 0..=through {
         stack
             .advance_tile_iteration(
@@ -1170,6 +1237,7 @@ fn seeded_stack(through: u64) -> RecurProgressStack {
 fn advance_seeded(seed: &mut RecurProgressStack, iteration: CfsCoordinate, recorded: [u8; 32]) {
     let cfs_cursor = chunked_recur_cfs(Some(2));
     let journal = recur_journal(iteration as u64, 3, 2, RecurControlKind::Continue);
+    let (input, witnesses) = sweep_item_witness(2 * iteration as u64, 2);
     let mut step = recur_iteration_step(iteration);
     step.recur_progress_commitment = recorded;
     crate::checks::cfs::advance_recur_progress(
@@ -1177,9 +1245,9 @@ fn advance_seeded(seed: &mut RecurProgressStack, iteration: CfsCoordinate, recor
         seed,
         &step,
         Some(&journal),
+        Some(&input),
         None,
-        None,
-        &BTreeMap::new(),
+        &witnesses,
     );
 }
 
@@ -1242,12 +1310,53 @@ fn a_forged_seed_is_rejected() {
     let mut forged = seeded_stack(1);
     let cfs_cursor = chunked_recur_cfs(Some(2));
     let journal = recur_journal(2, 3, 2, RecurControlKind::Continue);
+    let (input, witnesses) = sweep_item_witness(4, 2);
     let mut step = recur_iteration_step(2);
     step.recur_progress_commitment = recorded;
     crate::checks::cfs::advance_recur_progress(
         &cfs_cursor,
         &mut forged,
         &step,
+        Some(&journal),
+        Some(&input),
+        None,
+        &witnesses,
+    );
+}
+
+/// Rule 8 through the guest's own entry point: an iteration whose journal
+/// and commitment are honest but whose item re-reads chunk 0 is rejected
+/// before the commitment is even compared.
+#[test]
+#[should_panic(expected = "starts at element 0 but the sweep has reached 2")]
+fn a_seeded_window_that_rereads_the_first_chunk_is_rejected() {
+    let mut seed = seeded_stack(0);
+    let cfs_cursor = chunked_recur_cfs(Some(2));
+    let journal = recur_journal(1, 3, 2, RecurControlKind::Continue);
+    let (input, witnesses) = sweep_item_witness(0, 2);
+    crate::checks::cfs::advance_recur_progress(
+        &cfs_cursor,
+        &mut seed,
+        &recur_iteration_step(1),
+        Some(&journal),
+        Some(&input),
+        None,
+        &witnesses,
+    );
+}
+
+/// And an iteration with no item at all — the shape every recur iteration had
+/// to the guest before rule 8, since iterations skip the CFS input check.
+#[test]
+#[should_panic(expected = "records no input witness for its item")]
+fn a_recur_iteration_without_an_item_is_rejected() {
+    let mut seed = seeded_stack(0);
+    let cfs_cursor = chunked_recur_cfs(Some(2));
+    let journal = recur_journal(1, 3, 2, RecurControlKind::Continue);
+    crate::checks::cfs::advance_recur_progress(
+        &cfs_cursor,
+        &mut seed,
+        &recur_iteration_step(1),
         Some(&journal),
         None,
         None,
@@ -1261,14 +1370,14 @@ fn a_forged_seed_is_rejected() {
 #[test]
 fn a_nested_seed_carries_both_frames() {
     let mut both = RecurProgressStack::new();
-    both.push_site(CfsCoordinates(vec![1]), RecurSiteKind::Sequence, 1, 2, false);
+    both.push_site(CfsCoordinates(vec![1]), RecurSiteKind::Sequence, 1, 2, false, [0u8; 32]);
     both.advance_sequence_iteration(&CfsCoordinates(vec![1, 1]), 0)
         .expect("outer iteration 0");
-    both.push_site(CfsCoordinates(vec![1, 1, 1]), RecurSiteKind::Tile, 2, 6, false);
+    both.push_site(CfsCoordinates(vec![1, 1, 1]), RecurSiteKind::Tile, 2, 6, false, [0u8; 32]);
     assert_eq!(both.depth(), 2);
 
     let mut inner_only = RecurProgressStack::new();
-    inner_only.push_site(CfsCoordinates(vec![1, 1, 1]), RecurSiteKind::Tile, 2, 6, false);
+    inner_only.push_site(CfsCoordinates(vec![1, 1, 1]), RecurSiteKind::Tile, 2, 6, false, [0u8; 32]);
     assert_eq!(inner_only.depth(), 1);
 
     // Both stacks agree on the innermost frame and still commit differently,
@@ -3892,7 +4001,7 @@ fn transition(state_in: Hash32, state_out: Hash32) -> RecurStateTransition {
 /// A 3-iteration unchunked sweep whose carried state advances a -> b -> c -> d.
 fn state_chain_stack() -> RecurProgressStack {
     let mut stack = RecurProgressStack::new();
-    stack.push_site(CfsCoordinates(vec![1]), RecurSiteKind::Tile, 1, 3, false);
+    stack.push_site(CfsCoordinates(vec![1]), RecurSiteKind::Tile, 1, 3, false, [0u8; 32]);
     stack
 }
 
@@ -4046,7 +4155,7 @@ fn a_sequence_iterations_output_must_be_the_state_it_claims_to_have_produced() {
     // object, while the carried state is postcard — the iteration's output is
     // where the two encodings coincide.
     let mut stack = RecurProgressStack::new();
-    stack.push_site(CfsCoordinates(vec![1]), RecurSiteKind::Sequence, 1, 1, true);
+    stack.push_site(CfsCoordinates(vec![1]), RecurSiteKind::Sequence, 1, 1, true, [0u8; 32]);
     stack
         .advance_sequence_iteration(&CfsCoordinates(vec![1, 1]), 0)
         .expect("counted");
@@ -4076,7 +4185,7 @@ fn a_sequence_iterations_output_must_be_the_state_it_claims_to_have_produced() {
 #[test]
 fn a_state_returning_sequence_iteration_without_an_output_is_rejected() {
     let mut stack = RecurProgressStack::new();
-    stack.push_site(CfsCoordinates(vec![1]), RecurSiteKind::Sequence, 1, 1, true);
+    stack.push_site(CfsCoordinates(vec![1]), RecurSiteKind::Sequence, 1, 1, true, [0u8; 32]);
     stack
         .advance_sequence_iteration(&CfsCoordinates(vec![1, 1]), 0)
         .expect("counted");
@@ -4098,7 +4207,7 @@ fn a_state_plus_output_sequence_iteration_is_not_pinned_by_its_output() {
     // A state+output site returns the draft, not the state, so its recorded
     // output is not the carried state and must not be compared against it.
     let mut stack = RecurProgressStack::new();
-    stack.push_site(CfsCoordinates(vec![1]), RecurSiteKind::Sequence, 1, 1, false);
+    stack.push_site(CfsCoordinates(vec![1]), RecurSiteKind::Sequence, 1, 1, false, [0u8; 32]);
     stack
         .advance_sequence_iteration(&CfsCoordinates(vec![1, 1]), 0)
         .expect("counted");
@@ -4109,4 +4218,283 @@ fn a_state_plus_output_sequence_iteration_is_not_pinned_by_its_output() {
             Some(b"a-draft-root-not-the-state"),
         )
         .is_ok());
+}
+
+// ---------------------------------------------------------------------------
+// Rule 8 for recur-sequence iterations
+//
+// An iteration `Start` is a sequence boundary: no storage roots, so
+// `checks::store` folds none of its witnesses. The item check verifies the one
+// it reads, then holds it to the site's source and the sweep position.
+// ---------------------------------------------------------------------------
+
+/// A real two-element `List<String>` stored whole at `[9]`: its commitment,
+/// and the element roots its proofs fold from.
+fn swept_lines() -> (Hash32, [Hash32; 2]) {
+    let root_of = |value: &str| {
+        raster_core::tree::subtree_payload_and_root(
+            &raster_core::tree::tree_value_from_serialize(&value.to_string()).unwrap(),
+        )
+        .unwrap()
+        .1
+    };
+    let elements = [root_of("first"), root_of("second")];
+    let root = raster_core::tree::list_root_from_hashes(&elements);
+    (root, elements)
+}
+
+fn swept_lines_source() -> StorageData {
+    let (root, _) = swept_lines();
+    StorageData {
+        coordinates: CfsCoordinates(vec![9]),
+        commitment: root.to_vec(),
+        selector: Default::default(),
+        selection: raster_core::input::SelectionCommitment {
+            source_root_hash: root,
+            ..Default::default()
+        },
+    }
+}
+
+/// What iteration `Start` `[1, index + 1]` records: the body's `input`
+/// parameter as an inline marker, the item's storage data under its name, and
+/// a reference witness proving element `index`.
+fn recur_sequence_iteration(index: u64) -> (StepRecord, FnInput, BTreeMap<String, SelectionWitness>) {
+    let (root, elements) = swept_lines();
+    let path = raster_core::input::SelectorPath::new(vec![SelectorSegment::Index(index)]);
+    let (direction, sibling) = if index == 0 {
+        (raster_core::input::ListProofDirection::Right, elements[1])
+    } else {
+        (raster_core::input::ListProofDirection::Left, elements[0])
+    };
+    let witness = SelectionWitness {
+        bytes: Vec::new(),
+        proof: raster_core::input::SelectionProof {
+            path: path.clone(),
+            root_hash: root,
+            steps: vec![raster_core::input::SelectionProofStep::List {
+                index,
+                len: 2,
+                siblings: vec![raster_core::input::ListProofSibling {
+                    direction,
+                    hash: sibling,
+                }],
+            }],
+        },
+        selected_root: Some(elements[index as usize]),
+    };
+    let source = swept_lines_source();
+    let item = StorageData {
+        selector: path.clone(),
+        selection: raster_core::input::SelectionCommitment {
+            path,
+            selected_len: 1,
+            ..source.selection.clone()
+        },
+        ..source
+    };
+    let input = FnInput {
+        data: Vec::new(),
+        values: vec![
+            FnInputValue::Inline(recur_sequence_input_marker(index, FnInputValue::StorageBinding)),
+            FnInputValue::Inline(b"draft-handle".to_vec()),
+        ],
+        args: vec![
+            FnInputArg {
+                name: "line".to_string(),
+                ty: "RecurSequenceInput<String>".to_string(),
+            },
+            FnInputArg {
+                name: "output".to_string(),
+                ty: "RecurSequenceOutput<CollectiveGreeting>".to_string(),
+            },
+        ],
+        storage: [("line".to_string(), item)].into_iter().collect(),
+    };
+    let step = StepRecord {
+        exec_index: 10 + index,
+        sequence_id: "decorate_lines".into(),
+        coordinates: CfsCoordinates(vec![1, index as CfsCoordinate + FIRST_COORDINATE]),
+        kind: StepKind::SequenceStart {
+            input_commitment: Vec::new(),
+            input_source_commitment: Vec::new(),
+        },
+        recur_progress_commitment: [0u8; 32],
+        recur_state: None,
+    };
+    (step, input, [("line".to_string(), witness)].into_iter().collect())
+}
+
+/// The bytes `RecurSequenceInput` records for itself (`raster::input`'s
+/// `RecurSequenceInputTraceMarker`).
+fn recur_sequence_input_marker(index: u64, item: FnInputValue) -> Vec<u8> {
+    #[derive(serde::Serialize)]
+    struct Marker {
+        kind: &'static str,
+        index: u64,
+        len: u64,
+        item: FnInputValue,
+    }
+    postcard::to_allocvec(&Marker {
+        kind: "raster::RecurSequenceInput",
+        index,
+        len: 2,
+        item,
+    })
+    .unwrap()
+}
+
+fn lines_sweep() -> RecurProgressStack {
+    let mut stack = RecurProgressStack::new();
+    stack.push_site(
+        CfsCoordinates(vec![1]),
+        RecurSiteKind::Sequence,
+        1,
+        2,
+        false,
+        raster_core::recur_progress::source_identity(&swept_lines_source()),
+    );
+    stack
+}
+
+/// Run iteration `index`'s `Start` through the guest, stamping the commitment
+/// the honest recorder would have.
+fn advance_lines_iteration(
+    progress: &mut RecurProgressStack,
+    index: u64,
+    input: &FnInput,
+    witnesses: &BTreeMap<String, SelectionWitness>,
+    mut step: StepRecord,
+) {
+    let mut expected = progress.clone();
+    expected
+        .advance_sequence_iteration(&step.coordinates, index)
+        .expect("the recorder's own advance");
+    step.recur_progress_commitment = expected.commitment();
+    crate::checks::cfs::advance_recur_progress(
+        &recur_sequence_site_cfs(),
+        progress,
+        &step,
+        None,
+        Some(input),
+        None,
+        witnesses,
+    );
+}
+
+#[test]
+fn an_honest_recur_sequence_sweep_satisfies_rule_8() {
+    let mut progress = lines_sweep();
+    for index in 0..2 {
+        let (step, input, witnesses) = recur_sequence_iteration(index);
+        advance_lines_iteration(&mut progress, index, &input, &witnesses, step);
+    }
+}
+
+#[test]
+#[should_panic(expected = "starts at element 0 but the sweep has reached 1")]
+fn a_recur_sequence_iteration_rereading_an_element_is_rejected() {
+    let mut progress = lines_sweep();
+    let (step, input, witnesses) = recur_sequence_iteration(0);
+    advance_lines_iteration(&mut progress, 0, &input, &witnesses, step);
+
+    // Iteration 1 hands the body element 0 again.
+    let (_, input, witnesses) = recur_sequence_iteration(0);
+    let (step, _, _) = recur_sequence_iteration(1);
+    advance_lines_iteration(&mut progress, 1, &input, &witnesses, step);
+}
+
+#[test]
+#[should_panic(expected = "item selection witness does not fold to its commitment")]
+fn a_recur_sequence_item_whose_proof_does_not_fold_is_rejected() {
+    let mut progress = lines_sweep();
+    let (step, input, mut witnesses) = recur_sequence_iteration(0);
+    witnesses.get_mut("line").unwrap().selected_root = Some([5; 32]);
+    advance_lines_iteration(&mut progress, 0, &input, &witnesses, step);
+}
+
+#[test]
+#[should_panic(expected = "not selected out of its site's source list")]
+fn a_recur_sequence_item_from_another_object_is_rejected() {
+    let mut progress = lines_sweep();
+    let (step, mut input, witnesses) = recur_sequence_iteration(0);
+    input.storage.get_mut("line").unwrap().coordinates = CfsCoordinates(vec![3]);
+    advance_lines_iteration(&mut progress, 0, &input, &witnesses, step);
+}
+
+// ---------------------------------------------------------------------------
+// A recur-sequence body reading its item
+//
+// The iteration `Start` records `RecurSequenceInput` as an inline handle; the
+// body tile that reads the item records the storage binding itself. The scope
+// check looks through the handle.
+// ---------------------------------------------------------------------------
+
+/// `decorate` at `[1, index + 1, 1]` reading the element `item_of` stored
+/// under its parameter.
+fn decorate_reading(index: u64, item_of: u64) -> (StepRecord, FnInput) {
+    let (_, iteration_input, _) = recur_sequence_iteration(item_of);
+    let item = iteration_input.storage["line"].clone();
+    let step = StepRecord {
+        exec_index: 20 + index,
+        sequence_id: "decorate_lines".into(),
+        coordinates: CfsCoordinates(vec![
+            1,
+            index as CfsCoordinate + FIRST_COORDINATE,
+            FIRST_COORDINATE,
+        ]),
+        kind: StepKind::Exec(ExecStep {
+            target: ExecTarget::Tile("decorate".into()),
+            intra_sequence_index: FIRST_COORDINATE,
+            input_commitment: Vec::new(),
+            input_source_commitment: Vec::new(),
+            output_commitment: Vec::new(),
+            storage: StorageRoots {
+                root_before: Vec::new(),
+                root_after: Vec::new(),
+                index_root_before: Vec::new(),
+                index_root_after: Vec::new(),
+            },
+        }),
+        recur_progress_commitment: RecurProgressStack::new().commitment(),
+        recur_state: None,
+    };
+    let input = FnInput {
+        data: Vec::new(),
+        values: vec![FnInputValue::StorageBinding],
+        args: vec![FnInputArg {
+            name: "line".to_string(),
+            ty: "AuthRef<String>".to_string(),
+        }],
+        storage: [("line".to_string(), item)].into_iter().collect(),
+    };
+    (step, input)
+}
+
+#[test]
+fn a_recur_sequence_body_reading_its_item_is_accepted() {
+    for index in 0..2 {
+        let (_, scope, _) = recur_sequence_iteration(index);
+        let (step, input) = decorate_reading(index, index);
+        verify_step_record_inputs(&recur_sequence_site_cfs(), &step, Some(&input), Some(&scope), None);
+    }
+}
+
+#[test]
+#[should_panic(expected = "Storage sequence scope input does not match consumer binding")]
+fn a_recur_sequence_body_reading_another_element_is_rejected() {
+    let (_, scope, _) = recur_sequence_iteration(1);
+    let (step, input) = decorate_reading(1, 0);
+    verify_step_record_inputs(&recur_sequence_site_cfs(), &step, Some(&input), Some(&scope), None);
+}
+
+/// Looking through the handle is only for a handle: a scope value that does
+/// not decode as `RecurSequenceInput` is refused rather than read as one.
+#[test]
+#[should_panic(expected = "is not a RecurSequenceInput handle")]
+fn a_recur_sequence_iteration_without_a_handle_is_rejected() {
+    let (_, mut scope, _) = recur_sequence_iteration(0);
+    scope.values[0] = FnInputValue::Inline(b"not a handle".to_vec());
+    let (step, input) = decorate_reading(0, 0);
+    verify_step_record_inputs(&recur_sequence_site_cfs(), &step, Some(&input), Some(&scope), None);
 }

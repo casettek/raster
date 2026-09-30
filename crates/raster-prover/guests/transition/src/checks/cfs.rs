@@ -16,8 +16,11 @@ use crate::checks::io::input_source_commitment;
 use crate::merkle_tree::{combine_merkle_level, hash_trace_item};
 
 use raster_core::draft::TileReplayJournal;
-use raster_core::input::{SelectionPayloadKind, SelectionWitness};
-use raster_core::recur_progress::{RecurProgressStack, RecurSiteKind};
+use raster_core::input::{
+    verify_selection_reference_witness, verify_selection_witness, SelectionPayloadKind,
+    SelectionWitness,
+};
+use raster_core::recur_progress::{source_identity, RecurProgressStack, RecurSiteKind};
 use raster_core::trace::{
     ExecStep, ExecTarget, FnInput, FnInputValue, StepKind, StepRecord, StorageData,
 };
@@ -44,6 +47,72 @@ fn resolved_source_at<'a>(input: &'a FnInput, index: usize) -> ResolvedSource<'a
                 .storage()
                 .get(&arg.name)
                 .unwrap_or_else(|| panic!("Missing storage input metadata for arg '{}'", arg.name)),
+        ),
+    }
+}
+
+/// Whether `frame` is one iteration `[s, i]` of a recur **sequence** site.
+fn is_recur_sequence_iteration_frame(cfs_cursor: &CfsCursor, frame: &CfsCoordinates) -> bool {
+    cfs_cursor
+        .try_get_recur_iteration_coordinates(frame)
+        .is_some_and(|(site, _)| {
+            matches!(
+                cfs_cursor.try_get_item(&site),
+                Some(SequenceChildItem::RecurSequence(_))
+            )
+        })
+}
+
+/// How `RecurSequenceInput` records itself: an opaque handle, so the body sees
+/// neither the value nor the position. Mirrors `raster::input`'s trace marker;
+/// `kind` is a `&'static str` there, which postcard encodes as a `String`.
+#[derive(serde::Deserialize)]
+struct RecurSequenceInputMarker {
+    kind: String,
+    #[allow(dead_code)]
+    index: u64,
+    #[allow(dead_code)]
+    len: u64,
+    item: FnInputValue,
+}
+
+/// A recur-sequence iteration's parameter 0, resolved to the item it carries.
+///
+/// The iteration `Start` records the `RecurSequenceInput` handle as an inline
+/// marker, and — when the item is stored — the item's storage data under the
+/// parameter's name. A body step that reads the item (`into_ref!`) records that
+/// storage binding directly, so the scope comparison has to look through the
+/// handle to the item, or every honest recur-sequence body fails it.
+///
+/// Sound because the whole witness, marker included, is the one the parent
+/// `Start` committed (`verify_sequence_scope_parent`), and the storage entry
+/// resolved here is the one rule 8 held to the site's source at that `Start`.
+fn recur_sequence_item_source(scope_witness: &FnInput) -> ResolvedSource<'_> {
+    let arg = scope_witness
+        .args()
+        .first()
+        .expect("A recur sequence iteration records its item parameter");
+    let Some(FnInputValue::Inline(marker_bytes)) = scope_witness.values().first() else {
+        panic!("A recur sequence iteration must record its item as a RecurSequenceInput handle");
+    };
+    let marker: RecurSequenceInputMarker = postcard::from_bytes(marker_bytes)
+        .expect("A recur sequence iteration's item is not a RecurSequenceInput handle");
+    assert_eq!(
+        marker.kind, "raster::RecurSequenceInput",
+        "A recur sequence iteration's item is not a RecurSequenceInput handle",
+    );
+    match marker.item {
+        FnInputValue::StorageBinding => ResolvedSource::Storage(
+            scope_witness
+                .storage()
+                .get(&arg.name)
+                .unwrap_or_else(|| panic!("Missing storage input metadata for arg '{}'", arg.name)),
+        ),
+        // Rule 8 already refuses an iteration whose item is not stored
+        // (`recur_sequence_item_selection`), so no verified trace reaches this.
+        FnInputValue::Inline(_) => panic!(
+            "A recur sequence iteration's item '{}' is not stored",
+            arg.name
         ),
     }
 }
@@ -741,7 +810,13 @@ fn verify_one_binding(
                     step_record
                 )
             });
-            let scope_source = resolved_source_at(sequence_scope_witness, *input_index);
+            let scope_source = if *input_index == 0
+                && is_recur_sequence_iteration_frame(cfs_cursor, parent_sequence_coordinates)
+            {
+                recur_sequence_item_source(sequence_scope_witness)
+            } else {
+                resolved_source_at(sequence_scope_witness, *input_index)
+            };
             assert_same_source(resolved_source, scope_source);
         }
         InputBinding::PriorItemOutput {
@@ -837,14 +912,19 @@ pub fn get_next_expected_coordinates(
         .expect("Wrong tile coordinates")
 }
 
-/// The authenticated source length carried by a recur site's `Start` step.
+/// The source length carried by a recur site's `Start` step.
 ///
 /// `Start` records the source under the binding name `"input"`, whose selection
-/// is the `0x0A` list-metadata payload (`lazy-list-recur.md` §1–§2). By the time
-/// this runs, `checks::store` has already folded that witness to the committed
-/// root, so the length read here is authenticated rather than index-trusted —
-/// which is the whole reason the site needs a `Start` at all: `L` has to exist
-/// before iteration 0 is checked against it.
+/// is the `0x0A` list-metadata payload (`lazy-list-recur.md` §1–§2). `L` has to
+/// exist before iteration 0 is checked against it, which is why the site needs
+/// a `Start` at all.
+///
+/// **Not authenticated here.** `Start` is a `SequenceStart`, which carries no
+/// storage roots, so `checks::store` folds none of its witnesses and never
+/// reads its object. Rule 8 (`check_iteration_item`) holds `L` to each
+/// iteration's verified proof, so a wrong `L` is caught at the first
+/// iteration — but not for a sweep with no iterations. See
+/// `docs/proposals/tile-io-structural-roots.md` §Step 1.
 fn authenticated_source_len(
     step_record: &StepRecord,
     input_source_witness: Option<&FnInput>,
@@ -937,6 +1017,102 @@ fn assert_carried_state_matches_input(step_record: &StepRecord, input_source_wit
     );
 }
 
+/// A recur tile iteration's item: its first parameter, the `RecurInput`,
+/// which the driver records as a storage binding under the parameter's own
+/// name — so it is found by position, never by a fixed name — together with
+/// its selection witness, already verified by `checks::store`.
+fn recur_item_selection<'a>(
+    step_record: &StepRecord,
+    input_source_witness: Option<&'a FnInput>,
+    storage_selection_witnesses: &'a BTreeMap<String, SelectionWitness>,
+) -> (&'a StorageData, &'a SelectionWitness) {
+    let witness = input_source_witness.unwrap_or_else(|| {
+        panic!(
+            "Recur iteration {:?} records no input witness for its item",
+            step_record
+        )
+    });
+    let name = match (witness.args().first(), witness.values().first()) {
+        (Some(arg), Some(FnInputValue::StorageBinding)) => arg.name.as_str(),
+        _ => panic!(
+            "Recur iteration {:?} does not read its item from storage",
+            step_record
+        ),
+    };
+    let item = witness.storage().get(name).unwrap_or_else(|| {
+        panic!(
+            "Recur iteration {:?} is missing its item binding '{}'",
+            step_record, name
+        )
+    });
+    let item_witness = storage_selection_witnesses.get(name).unwrap_or_else(|| {
+        panic!(
+            "Recur iteration {:?} is missing its item selection witness '{}'",
+            step_record, name
+        )
+    });
+    (item, item_witness)
+}
+
+/// A recur **sequence** iteration's item, with its selection witness verified
+/// here.
+///
+/// The body's parameter 0 is the `RecurSequenceInput`. Its recorded value is
+/// an inline marker (index, len — host-written, not read here), and the item's
+/// storage data sits under the parameter's name. The iteration `Start` only
+/// forwards the item, so its witness is normally the reference form; either
+/// form is folded to the recorded commitment before rule 8 reads its steps.
+fn recur_sequence_item_selection<'a>(
+    step_record: &StepRecord,
+    input_source_witness: Option<&'a FnInput>,
+    storage_selection_witnesses: &'a BTreeMap<String, SelectionWitness>,
+) -> (&'a StorageData, &'a SelectionWitness) {
+    let witness = input_source_witness.unwrap_or_else(|| {
+        panic!(
+            "Recur sequence iteration {:?} records no input witness for its item",
+            step_record
+        )
+    });
+    let name = witness
+        .args()
+        .first()
+        .map(|arg| arg.name.as_str())
+        .unwrap_or_else(|| {
+            panic!(
+                "Recur sequence iteration {:?} records no item parameter",
+                step_record
+            )
+        });
+    let item = witness.storage().get(name).unwrap_or_else(|| {
+        panic!(
+            "Recur sequence iteration {:?} does not read its item '{}' from storage",
+            step_record, name
+        )
+    });
+    let item_witness = storage_selection_witnesses.get(name).unwrap_or_else(|| {
+        panic!(
+            "Recur sequence iteration {:?} is missing its item selection witness '{}'",
+            step_record, name
+        )
+    });
+    let verified = if item_witness.is_reference_only() {
+        verify_selection_reference_witness(&item.selection, item_witness)
+    } else {
+        verify_selection_witness(&item.selection, item_witness)
+    };
+    assert!(
+        verified,
+        "Recur sequence iteration {:?} item selection witness does not fold to its commitment",
+        step_record
+    );
+    assert_eq!(
+        item.commitment, item.selection.source_root_hash,
+        "Recur sequence iteration {:?} item commitment must match its selection root",
+        step_record
+    );
+    (item, item_witness)
+}
+
 /// Whether a recur site's own output is its carried state, from the CFS.
 fn site_state_is_output(item: &SequenceChildItem) -> bool {
     match item {
@@ -961,7 +1137,7 @@ pub fn advance_recur_progress(
         cfs_cursor.try_get_recur_iteration_coordinates(coordinates)
     {
         match cfs_cursor.try_get_item(&site_coordinates) {
-            Some(SequenceChildItem::RecurTile(_)) => {
+            Some(SequenceChildItem::RecurTile(tile)) => {
                 // The step record carries a host copy of the same transition,
                 // for uniformity with recur sequences. Duplicating a fact is
                 // only safe where an equality makes the duplicate
@@ -983,6 +1159,25 @@ pub fn advance_recur_progress(
                             step_record
                         )
                     });
+                // Rule 8 first: it reads the sweep position this iteration
+                // starts from, which `advance_tile_iteration` moves past.
+                let (item, item_witness) = recur_item_selection(
+                    step_record,
+                    input_source_witness,
+                    storage_selection_witnesses,
+                );
+                if let Err(violation) = progress.check_iteration_item(
+                    coordinates,
+                    item,
+                    item_witness,
+                    tile.chunk.is_some(),
+                    recur.position.consumed_elements,
+                ) {
+                    panic!(
+                        "Recur progress violation at step {:?}: {}",
+                        step_record, violation
+                    );
+                }
                 if let Err(violation) = progress.advance_tile_iteration(
                     coordinates,
                     recur.position.iteration_index,
@@ -1006,6 +1201,28 @@ pub fn advance_recur_progress(
                 // from trace structure. Only the boundary *start* advances the
                 // count, so an iteration is never counted twice.
                 if matches!(step_record.kind, StepKind::SequenceStart { .. }) {
+                    // Rule 8 for a sequence iteration: its item is element
+                    // `consumed_total` of the site's source. Before advancing,
+                    // which moves `consumed_total` past it.
+                    //
+                    // An iteration `Start` is a sequence boundary, so it has
+                    // no storage roots and `checks::store` never folds its
+                    // witnesses — this check verifies the one it reads. The
+                    // object the item names is authenticated when a body tile
+                    // reads it, through `verify_sequence_scope_parent`.
+                    let (item, item_witness) = recur_sequence_item_selection(
+                        step_record,
+                        input_source_witness,
+                        storage_selection_witnesses,
+                    );
+                    if let Err(violation) =
+                        progress.check_iteration_item(coordinates, item, item_witness, false, 1)
+                    {
+                        panic!(
+                            "Recur progress violation at step {:?}: {}",
+                            step_record, violation
+                        );
+                    }
                     if let Err(violation) = progress
                         // The only seam between the two numbering schemes:
                         // coordinates are 1-based positions, while the progress
@@ -1067,12 +1284,19 @@ pub fn advance_recur_progress(
                         input_source_witness,
                         storage_selection_witnesses,
                     );
+                    // `authenticated_source_len` has already required the
+                    // binding; this is the object and path it names.
+                    let source = input_source_witness
+                        .and_then(|witness| witness.storage().get("input"))
+                        .map(source_identity)
+                        .expect("the source binding was required above");
                     progress.push_site(
                         coordinates.clone(),
                         kind,
                         chunk,
                         source_len,
                         site_state_is_output(item),
+                        source,
                     );
                 }
                 // `End`: the terminal rules — 5 and 7 for a tile site, S4 for a

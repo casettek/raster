@@ -38,7 +38,8 @@ use sha2::{Digest, Sha256};
 use crate::cfs::{CfsCoordinate, CfsCoordinates};
 use crate::draft::RecurControlKind;
 use crate::draft::RecurStateTransition;
-use crate::input::Hash32;
+use crate::input::{Hash32, SelectionProofStep, SelectionWitness, SelectorSegment};
+use crate::trace::StorageData;
 
 /// Which rule set a site's iterations are held to.
 ///
@@ -112,6 +113,16 @@ pub struct RecurProgressFrame {
     /// meaningful comparison for this shape.
     #[serde(default)]
     pub state_is_output: bool,
+    /// Which list the site sweeps — [`source_identity`] of the site `Start`'s
+    /// `"input"` binding, whose object the CFS input check has already bound.
+    ///
+    /// Held in the frame for the same reason `L` is: an iteration is checked
+    /// against it (rule 8, [`RecurProgressStack::check_iteration_item`]) and a
+    /// fraud window may open after the `Start` that established it. Without
+    /// it, nothing ties an iteration's item to the source at all — recur
+    /// iterations skip the CFS input check.
+    #[serde(default)]
+    pub source: Hash32,
 }
 
 impl RecurProgressFrame {
@@ -214,6 +225,19 @@ pub enum RecurProgressViolation {
     TerminalStateUnwitnessed,
     /// The value a site returned is not the carried state its sweep produced.
     TerminalStateMismatch { expected: Hash32, actual: Hash32 },
+    /// Rule 8: the iteration's item is not selected out of the site's source —
+    /// another object, or another path inside it.
+    ItemNotFromSource,
+    /// Rule 8: the item's selection does not end in the step the site's mode
+    /// requires — a `Range` for a chunked site, a literal `Index` otherwise.
+    ItemSelectionShape,
+    /// Rule 8: the item does not start where the sweep has reached.
+    ItemOutOfPlace { expected: u64, actual: u64 },
+    /// Rule 8: the item's proof folds against a list whose length is not `L`.
+    ItemSourceLenMismatch { expected: u64, actual: u64 },
+    /// Rule 8: the item holds a different number of elements than the
+    /// iteration reports consuming, or than its selector claims.
+    ItemWidthMismatch { expected: u64, actual: u64 },
 }
 
 impl fmt::Display for RecurProgressViolation {
@@ -282,11 +306,70 @@ impl fmt::Display for RecurProgressViolation {
                 "recur sequence ran {} iterations over a source of {} elements",
                 actual, expected
             ),
+            Self::ItemNotFromSource => write!(
+                f,
+                "recur iteration's item is not selected out of its site's source list"
+            ),
+            Self::ItemSelectionShape => write!(
+                f,
+                "recur iteration's item selection does not end in the range or index its site's mode requires"
+            ),
+            Self::ItemOutOfPlace { expected, actual } => write!(
+                f,
+                "recur iteration's item starts at element {} but the sweep has reached {}",
+                actual, expected
+            ),
+            Self::ItemSourceLenMismatch { expected, actual } => write!(
+                f,
+                "recur iteration's item is proven against a list of {} elements but the source has {}",
+                actual, expected
+            ),
+            Self::ItemWidthMismatch { expected, actual } => write!(
+                f,
+                "recur iteration's item holds {} elements but {} were expected",
+                actual, expected
+            ),
             Self::SiteNotInnermost => {
                 write!(f, "recur site closed while a nested site is still live")
             }
         }
     }
+}
+
+/// The identity a recur site's frame records for the list it sweeps: the
+/// object and the selector path of the site `Start`'s `"input"` binding.
+///
+/// Uses `selection.path` — the path the selection proof is pinned to — never
+/// `selector`, which nothing verifies. Shared by the recorder, which opens the
+/// frame, and the guest, which re-opens it, so the two cannot spell it
+/// differently.
+pub fn source_identity(binding: &StorageData) -> Hash32 {
+    source_identity_parts(
+        &binding.coordinates,
+        &binding.commitment,
+        &binding.selection.path.segments,
+    )
+}
+
+fn source_identity_parts(
+    coordinates: &CfsCoordinates,
+    commitment: &[u8],
+    path: &[SelectorSegment],
+) -> Hash32 {
+    let encoded = postcard::to_allocvec(&(coordinates, commitment, path))
+        .expect("coordinates, a commitment and a selector path always encode");
+    let mut hasher = Sha256::new();
+    hasher.update(b"recur-source");
+    hasher.update(&encoded);
+    hasher.finalize().into()
+}
+
+/// Element count of a `0x02` list payload, `None` for any other kind.
+fn list_payload_len(bytes: &[u8]) -> Option<u64> {
+    if *bytes.first()? != 0x02 {
+        return None;
+    }
+    Some(u64::from_le_bytes(bytes.get(1..9)?.try_into().ok()?))
 }
 
 /// `⌈len / chunk⌉`, the iteration count a sweep of `len` elements implies.
@@ -340,6 +423,7 @@ impl RecurProgressStack {
         chunk: u64,
         source_len: u64,
         state_is_output: bool,
+        source: Hash32,
     ) {
         self.0.push(RecurProgressFrame {
             site,
@@ -360,7 +444,115 @@ impl RecurProgressStack {
             // deliberately out of scope. See `loop-carried-state.md` §4.
             state_commitment: None,
             state_is_output,
+            source,
         });
+    }
+
+    /// Rule 8: the iteration's item is the next slice of the site's source.
+    ///
+    /// Rules 1–4 pin *how many* elements each iteration consumes, from the
+    /// replay journal alone; nothing there says *which*. The item's selection
+    /// proof does, by an independent route, and this requires the two to
+    /// agree (`lazy-list-recur.md` §6):
+    ///
+    /// | fact | frame / journal | item selection |
+    /// | --- | --- | --- |
+    /// | which list | `source` (site `Start`) | object + path before the last segment |
+    /// | where it sat | `consumed_total` | `ListRange.start` / `List.index` |
+    /// | source length | `L` | `ListRange.len` / `List.len` |
+    /// | how much | `consumed_elements` | payload element count |
+    ///
+    /// Both families: a recur tile's item (`chunked` from the CFS, `consumed`
+    /// from its journal) and a recur sequence's (never chunked, one element).
+    ///
+    /// Call it **before** [`Self::advance_tile_iteration`] /
+    /// [`Self::advance_sequence_iteration`], which move
+    /// `consumed_total` past this iteration. `item` must already be verified
+    /// against `witness` (`checks::store`); the steps read here are the ones
+    /// that verification pinned to `item.selection.path`. A `Range` segment is
+    /// pinned to its proof step by `start` alone, so its width is taken from
+    /// the payload and the segment's `end` is held to it.
+    pub fn check_iteration_item(
+        &self,
+        coordinates: &CfsCoordinates,
+        item: &StorageData,
+        witness: &SelectionWitness,
+        chunked: bool,
+        consumed_elements: u64,
+    ) -> Result<(), RecurProgressViolation> {
+        let frame = self.0.last().ok_or(RecurProgressViolation::NoActiveSite)?;
+        if !coordinates_have_prefix(coordinates, &frame.site) {
+            return Err(RecurProgressViolation::SiteMismatch);
+        }
+
+        let segments = &item.selection.path.segments;
+        let (last, prefix) = segments
+            .split_last()
+            .ok_or(RecurProgressViolation::ItemSelectionShape)?;
+        if source_identity_parts(&item.coordinates, &item.commitment, prefix) != frame.source {
+            return Err(RecurProgressViolation::ItemNotFromSource);
+        }
+
+        let expected_start = frame.consumed_total();
+        let (start, proven_len) = match (chunked, last, witness.proof.steps.last()) {
+            (
+                true,
+                SelectorSegment::Range { start, end },
+                Some(SelectionProofStep::ListRange {
+                    start: proven_start,
+                    len,
+                    ..
+                }),
+            ) => {
+                let width = list_payload_len(&witness.bytes)
+                    .ok_or(RecurProgressViolation::ItemSelectionShape)?;
+                if width != consumed_elements {
+                    return Err(RecurProgressViolation::ItemWidthMismatch {
+                        expected: consumed_elements,
+                        actual: width,
+                    });
+                }
+                if end.checked_sub(*start) != Some(width) {
+                    return Err(RecurProgressViolation::ItemWidthMismatch {
+                        expected: width,
+                        actual: end.saturating_sub(*start),
+                    });
+                }
+                if proven_start != start {
+                    return Err(RecurProgressViolation::ItemSelectionShape);
+                }
+                (*start, *len)
+            }
+            (
+                false,
+                SelectorSegment::Index(index),
+                Some(SelectionProofStep::List {
+                    index: proven_index,
+                    len,
+                    ..
+                }),
+            ) => {
+                if proven_index != index {
+                    return Err(RecurProgressViolation::ItemSelectionShape);
+                }
+                (*index, *len)
+            }
+            _ => return Err(RecurProgressViolation::ItemSelectionShape),
+        };
+
+        if start != expected_start {
+            return Err(RecurProgressViolation::ItemOutOfPlace {
+                expected: expected_start,
+                actual: start,
+            });
+        }
+        if proven_len != frame.source_len {
+            return Err(RecurProgressViolation::ItemSourceLenMismatch {
+                expected: frame.source_len,
+                actual: proven_len,
+            });
+        }
+        Ok(())
     }
 
     /// Advance the innermost frame by one recur-**tile** iteration.
@@ -599,6 +791,7 @@ pub fn state_commitment(bytes: &[u8]) -> Hash32 {
 mod tests {
     use super::*;
     use crate::cfs::FIRST_COORDINATE;
+    use crate::input::{SelectionCommitment, SelectionProof, SelectorPath};
     use alloc::vec;
 
     fn site() -> CfsCoordinates {
@@ -613,7 +806,7 @@ mod tests {
 
     fn tile_stack(source_len: u64, chunk: u64) -> RecurProgressStack {
         let mut stack = RecurProgressStack::new();
-        stack.push_site(site(), RecurSiteKind::Tile, chunk, source_len, false);
+        stack.push_site(site(), RecurSiteKind::Tile, chunk, source_len, false, [0u8; 32]);
         stack
     }
 
@@ -640,89 +833,276 @@ mod tests {
         assert!(sweep_unchunked(3, 3, RecurControlKind::Continue).is_ok());
     }
 
-    /// PROOF OF CONCEPT — soundness. See
-    /// `docs/issues/selection-unbound-from-execution.md` §3.
-    ///
-    /// The completeness rules decide whether a recur sweep covered its source.
-    /// They are handed the journal's self-reported numbers and nothing else:
-    /// [`RecurProgressStack::advance_tile_iteration`] takes an iteration index,
-    /// a declared iteration count, a consumed-element count and a control
-    /// flag — **no range, no selection, no bytes**. The selection proof that
-    /// says *where in the source this iteration actually read* is verified
-    /// separately, in `checks::store`, and the two are never joined.
-    ///
-    /// So a sweep that reads the first chunk five times presents the rules with
-    /// exactly the facts a complete sweep presents. This builds the issue's
-    /// worked example — `L = 10`, `chunk = 2` — and shows the rules close it
-    /// clean.
-    ///
-    /// Invert when rule 8 lands: the cross-check must reject a sweep whose
-    /// ranges do not tile `[0, L)`.
-    #[test]
-    fn poc_a_sweep_that_rereads_the_first_chunk_passes_every_completeness_rule() {
-        const SOURCE_LEN: u64 = 10;
-        const CHUNK: u64 = 2;
-        let declared_iterations = SOURCE_LEN.div_ceil(CHUNK); // 5
+    // -----------------------------------------------------------------------
+    // Rule 8 — the item is the next slice of the site's source
+    // -----------------------------------------------------------------------
 
-        // What each iteration *claims* to have consumed. Identical for the
-        // honest sweep and the fabricated one, because `consumed_elements` says
-        // how much, never from where.
-        let mut stack = tile_stack(SOURCE_LEN, CHUNK);
-        for index in 0..declared_iterations {
-            stack
-                .advance_tile_iteration(
-                    &iteration(index),
-                    index,
-                    declared_iterations,
-                    CHUNK,
-                    RecurControlKind::Continue,
-                    None,
-                )
-                .expect("rule 4 accepts a full chunk while elements remain");
+    /// The site `Start`'s source binding: `lines` inside the object at `[1]`.
+    fn source_binding() -> StorageData {
+        StorageData {
+            coordinates: CfsCoordinates(vec![1]),
+            commitment: vec![7; 32],
+            selector: Default::default(),
+            selection: SelectionCommitment {
+                path: SelectorPath::new(vec![SelectorSegment::Field("lines".into())]),
+                source_root_hash: [7; 32],
+                ..Default::default()
+            },
         }
+    }
 
-        // Rules 5-7: the sweep is complete and closes clean.
-        let frame = stack.close_site(&site()).expect("a complete sweep closes");
-        assert_eq!(frame.consumed_total(), SOURCE_LEN);
-        assert_eq!(frame.next_iteration_index, declared_iterations);
-
-        // And here is the hole, stated as an equality rather than a story.
-        //
-        // The honest sweep reads [0,2) [2,4) [4,6) [6,8) [8,10); the fabricated
-        // one reads [0,2) five times. Those are different executions over a
-        // different number of the source's elements — but the facts the rules
-        // receive are byte-identical, because the range is not among them.
-        let honest_ranges: Vec<(u64, u64)> =
-            (0..declared_iterations).map(|i| (i * CHUNK, i * CHUNK + CHUNK)).collect();
-        let fabricated_ranges: Vec<(u64, u64)> =
-            (0..declared_iterations).map(|_| (0, CHUNK)).collect();
-        assert_ne!(
-            honest_ranges, fabricated_ranges,
-            "the two sweeps must really differ, or this proves nothing",
+    fn swept_stack(source_len: u64, chunk: u64) -> RecurProgressStack {
+        let mut stack = RecurProgressStack::new();
+        stack.push_site(
+            site(),
+            RecurSiteKind::Tile,
+            chunk,
+            source_len,
+            false,
+            source_identity(&source_binding()),
         );
+        stack
+    }
 
-        let rule_inputs = |_ranges: &[(u64, u64)]| -> Vec<(u64, u64, u64)> {
-            // Everything `advance_tile_iteration` is told, per iteration. The
-            // range argument is deliberately unused: there is nowhere to put it.
-            (0..declared_iterations)
-                .map(|index| (index, declared_iterations, CHUNK))
-                .collect()
+    /// A `0x02` list payload of `width` one-byte leaves.
+    fn list_payload(width: u64) -> Vec<u8> {
+        let mut bytes = vec![0x02];
+        bytes.extend_from_slice(&width.to_le_bytes());
+        for element in 0..width {
+            bytes.extend_from_slice(&10u64.to_le_bytes());
+            bytes.push(0x00);
+            bytes.extend_from_slice(&1u64.to_le_bytes());
+            bytes.push(element as u8);
+        }
+        bytes
+    }
+
+    /// An iteration item selecting `last` out of `binding`'s list, proven
+    /// against a list of `proven_len` elements and carrying `width` of them.
+    /// Only the facts rule 8 reads are filled in; the fold itself is
+    /// `checks::store`'s and is not re-run here.
+    fn item_from(
+        binding: &StorageData,
+        last: SelectorSegment,
+        proven_len: u64,
+        width: u64,
+    ) -> (StorageData, SelectionWitness) {
+        let step = match &last {
+            SelectorSegment::Range { start, .. } => SelectionProofStep::ListRange {
+                start: *start,
+                len: proven_len,
+                siblings: Vec::new(),
+            },
+            SelectorSegment::Index(index) => SelectionProofStep::List {
+                index: *index,
+                len: proven_len,
+                siblings: Vec::new(),
+            },
+            _ => unreachable!("items end in a range or an index"),
         };
+        let mut segments = binding.selection.path.segments.clone();
+        segments.push(last);
+        let path = SelectorPath::new(segments);
+        let item = StorageData {
+            coordinates: binding.coordinates.clone(),
+            commitment: binding.commitment.clone(),
+            selector: path.clone(),
+            selection: SelectionCommitment {
+                path: path.clone(),
+                ..binding.selection.clone()
+            },
+        };
+        let witness = SelectionWitness {
+            bytes: list_payload(width),
+            proof: SelectionProof {
+                path,
+                root_hash: [7; 32],
+                steps: vec![step],
+            },
+            selected_root: None,
+        };
+        (item, witness)
+    }
+
+    fn slice_item(last: SelectorSegment, proven_len: u64, width: u64) -> (StorageData, SelectionWitness) {
+        item_from(&source_binding(), last, proven_len, width)
+    }
+
+    fn range(start: u64, end: u64) -> SelectorSegment {
+        SelectorSegment::Range { start, end }
+    }
+
+    /// Drive a chunked sweep whose journal reports the honest counts while
+    /// iteration `i` reads `ranges[i]`, applying rule 8 then rules 1–4.
+    fn chunked_sweep(
+        source_len: u64,
+        chunk: u64,
+        ranges: &[(u64, u64)],
+    ) -> Result<RecurProgressFrame, RecurProgressViolation> {
+        let mut stack = swept_stack(source_len, chunk);
+        let declared = iteration_count(source_len, chunk);
+        for (index, (start, end)) in ranges.iter().enumerate() {
+            let index = index as u64;
+            let consumed = core::cmp::min(chunk, source_len - index * chunk);
+            let (item, witness) = slice_item(range(*start, *end), source_len, end - start);
+            stack.check_iteration_item(&iteration(index), &item, &witness, true, consumed)?;
+            stack.advance_tile_iteration(
+                &iteration(index),
+                index,
+                declared,
+                consumed,
+                RecurControlKind::Continue,
+                None,
+            )?;
+        }
+        stack.close_site(&site())
+    }
+
+    #[test]
+    fn an_honest_chunked_sweep_satisfies_rule_8() {
+        // `L = 9, C = 2`: four full chunks and a short final one.
+        let frame = chunked_sweep(9, 2, &[(0, 2), (2, 4), (4, 6), (6, 8), (8, 9)])
+            .expect("the honest ranges tile [0, 9)");
+        assert_eq!(frame.consumed_total(), 9);
+    }
+
+    /// Was `poc_a_sweep_that_rereads_the_first_chunk_passes_every_completeness_rule`
+    /// (`selection-unbound-from-execution.md` §3): the issue's worked example,
+    /// `L = 10, C = 2`, reading `[0, 2)` five times while the journal reports
+    /// the honest counts. Rules 1–7 accepted it; rule 8 stops it at the first
+    /// repeat.
+    #[test]
+    fn a_sweep_that_rereads_the_first_chunk_is_rejected() {
         assert_eq!(
-            rule_inputs(&honest_ranges),
-            rule_inputs(&fabricated_ranges),
-            "no completeness rule can distinguish the two sweeps",
+            chunked_sweep(10, 2, &[(0, 2); 5]),
+            Err(RecurProgressViolation::ItemOutOfPlace {
+                expected: 2,
+                actual: 0,
+            }),
         );
     }
 
-    /// The same blindness from the other side: an *element* sweep that rereads
-    /// element 0 every iteration also closes clean.
-    ///
-    /// Included because chunking is not the cause — `consumed_elements` carries
-    /// no position at any chunk size, so `chunk = 1` is exposed identically.
+    /// Was `poc_an_element_sweep_that_rereads_one_element_passes_every_completeness_rule`:
+    /// chunking was never the cause, so the unchunked form is pinned the same
+    /// way, through the proof's `List.index`.
     #[test]
-    fn poc_an_element_sweep_that_rereads_one_element_passes_every_completeness_rule() {
-        assert!(sweep_unchunked(4, 4, RecurControlKind::Continue).is_ok());
+    fn an_element_sweep_that_rereads_one_element_is_rejected() {
+        let mut stack = swept_stack(4, 1);
+        for index in 0..2 {
+            let (item, witness) = slice_item(SelectorSegment::Index(0), 4, 1);
+            let result = stack.check_iteration_item(&iteration(index), &item, &witness, false, 1);
+            if index == 0 {
+                result.expect("element 0 is where the sweep starts");
+            } else {
+                assert_eq!(
+                    result,
+                    Err(RecurProgressViolation::ItemOutOfPlace {
+                        expected: 1,
+                        actual: 0,
+                    }),
+                );
+            }
+            stack
+                .advance_tile_iteration(&iteration(index), index, 4, 1, RecurControlKind::Continue, None)
+                .expect("rules 1-4 cannot see the position");
+        }
+    }
+
+    #[test]
+    fn an_honest_element_sweep_satisfies_rule_8() {
+        let mut stack = swept_stack(3, 1);
+        for index in 0..3 {
+            let (item, witness) = slice_item(SelectorSegment::Index(index), 3, 1);
+            stack
+                .check_iteration_item(&iteration(index), &item, &witness, false, 1)
+                .expect("element i at iteration i");
+            stack
+                .advance_tile_iteration(&iteration(index), index, 3, 1, RecurControlKind::Continue, None)
+                .expect("honest advance");
+        }
+        assert!(stack.close_site(&site()).is_ok());
+    }
+
+    /// Before rule 8 nothing tied an iteration's item to the site's source at
+    /// all: recur iterations skip the CFS input check, and `checks::store`
+    /// proves only that the item is *some* stored object's slice.
+    #[test]
+    fn an_item_from_another_list_is_rejected() {
+        let stack = swept_stack(10, 2);
+
+        let mut other_object = source_binding();
+        other_object.coordinates = CfsCoordinates(vec![3]);
+        let (item, witness) = item_from(&other_object, range(0, 2), 10, 2);
+        assert_eq!(
+            stack.check_iteration_item(&iteration(0), &item, &witness, true, 2),
+            Err(RecurProgressViolation::ItemNotFromSource),
+        );
+
+        let mut other_field = source_binding();
+        other_field.selection.path = SelectorPath::new(vec![SelectorSegment::Field("other".into())]);
+        let (item, witness) = item_from(&other_field, range(0, 2), 10, 2);
+        assert_eq!(
+            stack.check_iteration_item(&iteration(0), &item, &witness, true, 2),
+            Err(RecurProgressViolation::ItemNotFromSource),
+        );
+    }
+
+    #[test]
+    fn an_item_proven_against_a_list_of_another_length_is_rejected() {
+        let stack = swept_stack(10, 2);
+        let (item, witness) = slice_item(range(0, 2), 12, 2);
+        assert_eq!(
+            stack.check_iteration_item(&iteration(0), &item, &witness, true, 2),
+            Err(RecurProgressViolation::ItemSourceLenMismatch {
+                expected: 10,
+                actual: 12,
+            }),
+        );
+    }
+
+    /// Width, from both sides: the payload must hold what the journal reports
+    /// consuming, and the selector's `end` — which the proof does not pin —
+    /// must agree with the payload.
+    #[test]
+    fn an_item_whose_width_disagrees_is_rejected() {
+        let stack = swept_stack(10, 2);
+
+        let (item, witness) = slice_item(range(0, 1), 10, 1);
+        assert_eq!(
+            stack.check_iteration_item(&iteration(0), &item, &witness, true, 2),
+            Err(RecurProgressViolation::ItemWidthMismatch {
+                expected: 2,
+                actual: 1,
+            }),
+        );
+
+        let (item, mut witness) = slice_item(range(0, 5), 10, 2);
+        witness.bytes = list_payload(2);
+        assert_eq!(
+            stack.check_iteration_item(&iteration(0), &item, &witness, true, 2),
+            Err(RecurProgressViolation::ItemWidthMismatch {
+                expected: 2,
+                actual: 5,
+            }),
+        );
+    }
+
+    /// The selection's last step must be the one the site's mode implies.
+    #[test]
+    fn an_item_selected_the_wrong_way_is_rejected() {
+        let chunked = swept_stack(10, 2);
+        let (item, witness) = slice_item(SelectorSegment::Index(0), 10, 1);
+        assert_eq!(
+            chunked.check_iteration_item(&iteration(0), &item, &witness, true, 2),
+            Err(RecurProgressViolation::ItemSelectionShape),
+        );
+
+        let unchunked = swept_stack(10, 1);
+        let (item, witness) = slice_item(range(0, 1), 10, 1);
+        assert_eq!(
+            unchunked.check_iteration_item(&iteration(0), &item, &witness, false, 1),
+            Err(RecurProgressViolation::ItemSelectionShape),
+        );
     }
 
     #[test]
@@ -883,7 +1263,7 @@ mod tests {
     #[test]
     fn a_recur_sequence_must_run_exactly_the_source_length() {
         let mut stack = RecurProgressStack::new();
-        stack.push_site(site(), RecurSiteKind::Sequence, 1, 3, false);
+        stack.push_site(site(), RecurSiteKind::Sequence, 1, 3, false, [0u8; 32]);
         for index in 0..3 {
             stack
                 .advance_sequence_iteration(&iteration(index), index)
@@ -895,7 +1275,7 @@ mod tests {
     #[test]
     fn a_short_recur_sequence_is_rejected() {
         let mut stack = RecurProgressStack::new();
-        stack.push_site(site(), RecurSiteKind::Sequence, 1, 3, false);
+        stack.push_site(site(), RecurSiteKind::Sequence, 1, 3, false, [0u8; 32]);
         stack
             .advance_sequence_iteration(&iteration(0), 0)
             .unwrap();
@@ -912,11 +1292,11 @@ mod tests {
     #[test]
     fn a_recur_sequence_over_an_empty_source_runs_no_iterations() {
         let mut stack = RecurProgressStack::new();
-        stack.push_site(site(), RecurSiteKind::Sequence, 1, 0, false);
+        stack.push_site(site(), RecurSiteKind::Sequence, 1, 0, false, [0u8; 32]);
         assert!(stack.close_site(&site()).is_ok());
 
         let mut stack = RecurProgressStack::new();
-        stack.push_site(site(), RecurSiteKind::Sequence, 1, 0, false);
+        stack.push_site(site(), RecurSiteKind::Sequence, 1, 0, false, [0u8; 32]);
         stack
             .advance_sequence_iteration(&iteration(0), 0)
             .unwrap();
@@ -960,7 +1340,7 @@ mod tests {
         let outer = CfsCoordinates(vec![2]);
         let inner = CfsCoordinates(vec![2, 2, 3]);
         let mut stack = RecurProgressStack::new();
-        stack.push_site(outer.clone(), RecurSiteKind::Sequence, 1, 2, false);
+        stack.push_site(outer.clone(), RecurSiteKind::Sequence, 1, 2, false, [0u8; 32]);
 
         stack
             .advance_sequence_iteration(&CfsCoordinates(vec![2, 1]), 0)
@@ -970,7 +1350,7 @@ mod tests {
             .unwrap();
 
         // The nested site opens, breaks early, and closes — legally.
-        stack.push_site(inner.clone(), RecurSiteKind::Tile, 1, 8, false);
+        stack.push_site(inner.clone(), RecurSiteKind::Tile, 1, 8, false, [0u8; 32]);
         stack
             .advance_tile_iteration(
                 &CfsCoordinates(vec![2, 2, 3, 1]),

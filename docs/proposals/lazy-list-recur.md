@@ -1030,6 +1030,11 @@ they are one joint, and neither half closes it alone. That issue owns the proble
 entry here stays as the record of what this proposal's own §Verification found missing. S2, in
 the second bullet, is deliberately *not* in it.
 
+- **Rule 8 — implemented 2026-09-30 for recur tiles** (`RecurProgressStack::check_iteration_item`, see
+  [`tile-io-structural-roots`](./tile-io-structural-roots.md) §Step 1), together with the check
+  this section did not anticipate: the item must come from the site's source list at all, which
+  nothing required before because iterations skip the CFS input check. Recur-sequence items are
+  held to the same rule. The note below is kept as written.
 - **Rule 8 is not implemented.** There is no `ListRange` reference anywhere in
   `guests/transition/src/checks/`. Rules 1–7 are enforced through
   `raster-core/src/recur_progress.rs` (`advance_tile_iteration` covers 1–4 and 6, `close_site`

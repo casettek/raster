@@ -1,6 +1,6 @@
 # Proposal: `tile-io-structural-roots` — bind what a tile reads and writes to its replay
 
-Status: proposed 2026-09-28. Closes
+Status: proposed 2026-09-28; steps 0 and 1 done 2026-09-30. Closes
 [`tile-output-commitment-unbound`](../issues/tile-output-commitment-unbound.md) and
 [`selection-unbound-from-execution`](../issues/selection-unbound-from-execution.md) in one tile
 image-id break.
@@ -71,24 +71,106 @@ runtime's encoder into `raster-core` so one implementation exists. D5b of
    payload bytes for the chain verifier, the reader and the selection checks. 49 shapes
    re-derive their encoder root; 6 (`u128`, `i128`, `f32`, `f64`, `char`, `serialize_bytes`) are
    refused. A mutated hash tag fails it.
-5. *Cost: a tile image-id break, taken now.* Every tile guest commits a `TileReplayJournal`, whose
-   `draft_transition` carries `DraftOp`s and so `DraftValue`'s serialize code — linked into every
-   tile, draft or not. The new variant changes it, so all 6 tracked locks were regenerated: every
-   tile image id and every `program_commitment` moved (the chain examples too). Step 2 breaks
-   tile image ids again; batch the two before a release rather than shipping step 0 alone.
+5. *Cost, measured against `HEAD` with the workspace CLI:* `build_recur_draft_greeting` is the only
+   tile whose image id moved (it calls the draft serializer); no chain-example tile moved. Every
+   `program_commitment` moved, but that diff also carries the uncommitted nested-returns CFS change
+   and step 1's new transition guest, so it is not step 0's alone. (A first measurement said every
+   tile moved: it had been built with the stale installed `cargo raster`, not the workspace binary.)
 
-### Step 1 — rule 8, the sweep cross-check (no break)
+### Step 1 — rule 8, the sweep cross-check
 
-In `advance_recur_progress`'s recur-tile iteration branch, require the iteration's recorded range
-selection to agree with the replay journal and the frame:
+**Done 2026-09-30**, for recur tiles and recur sequences.
 
-- `ListRange.len == L` (the frame's `source_len`);
-- `ListRange.start == consumed_total` before this iteration;
-- the payload's element count `k == consumed_elements`.
+*Finding first.* Recur iterations skip the CFS input check (`verify_step_record_inputs` and the
+sequence-scope check both return early on an iteration coordinate). So beyond the missing position
+check, **nothing tied an iteration's item to the site's source at all** — `checks::store` proves
+only that the item is a correct slice of *some* stored object. The three equalities above would
+have pinned the position of a slice of any list of length `L`.
 
-A per-element sweep's `Index(i)` selection is held to `i == consumed_total` the same way. The
-existing `poc_a_sweep_that_rereads_the_first_chunk_passes_every_completeness_rule` inverts into
-the regression test.
+*Design.*
+
+- `RecurProgressFrame` gains `source: Hash32` — `recur_progress::source_identity` of the site
+  `Start`'s `"input"` binding: `H("recur-source" ‖ postcard(coordinates, commitment,
+  selection.path))`. `Start` passes the full CFS input check, so its object is bound; holding the
+  identity in the frame is what lets an iteration — or a fraud window opening mid-sweep, through
+  the seed — be checked against it, the same way `L` is. The recorder and the guest call the same
+  function.
+- `RecurProgressStack::check_iteration_item` (rule 8), called by the guest before
+  `advance_tile_iteration`, on the iteration's item — argument 0, the `RecurInput`, found by
+  position since the driver records it under the parameter's own name:
+
+  | fact | frame / journal | item selection |
+  | --- | --- | --- |
+  | which list | `source` | coordinates + commitment + path minus its last segment |
+  | where it sat | `consumed_total` | `ListRange.start` (chunked) / `List.index` (unchunked) |
+  | source length | `L` | `ListRange.len` / `List.len` |
+  | how much | `consumed_elements` | payload element count; the `Range` segment's `end` held to it |
+
+  The last segment must be `Range` for a site whose CFS declares `chunk`, a literal `Index`
+  otherwise. A `Range` segment is pinned to its proof step by `start` only
+  (`step_proves_segment`), which is why the width comes from the payload.
+
+*Verified.*
+
+- `raster-core`: the two PoCs are inverted into regressions (`a_sweep_that_rereads_the_first_chunk_is_rejected`
+  — rejected at iteration 1, `ItemOutOfPlace { expected: 2, actual: 0 }`; the element-sweep twin),
+  plus one test per fact (other object, other path, `len ≠ L`, width ≠ journal, `end` ≠ payload,
+  wrong mode).
+- Guest: the window-seeding fixtures now carry an honest item; a seeded window re-reading chunk 0,
+  and an iteration with no item, are rejected through `advance_recur_progress`.
+- Real traces: `hello-tiles` fraud proofs in `RISC0_DEV_MODE` (the real transition guest executes)
+  over windows holding `[11,1]` (chunked, window opening after the site `Start` — the source
+  identity arrives through the seed), `[16,1..2]` and `[18,1..2]` (unchunked) all verify. Negative
+  control: with the expected start off by one, all three are rejected at those iterations.
+  Wider windows hit two known blockers before any recur iteration —
+  [`fraud-evidence-storage-unavailable`](../issues/fraud-evidence-storage-unavailable.md) (draft
+  coordinates) and [`sequence-scope-forbids-narrowing`](../issues/sequence-scope-forbids-narrowing.md)
+  (inside recur sequence `[15]`).
+
+*Recur sequences (same day).* An iteration `Start` `[s, i]` runs the same
+`check_iteration_item` (never chunked, one element) on the body's parameter 0, the
+`RecurSequenceInput`: its recorded value is an inline marker, and its storage data sits under the
+parameter's name. A `Start` is a sequence boundary with no storage roots, so `checks::store` folds
+**none** of its witnesses — the check verifies the item's witness itself (reference or payload
+form) before reading its proof. The object is authenticated later, when a body tile reads the
+item and `verify_sequence_scope_parent` ties that read to this binding.
+
+- Guest: an honest two-element sweep with real proofs, a re-read element, a witness that does not
+  fold, and an item from another object.
+- Real trace: `hello-tiles` windows holding `[15,1]` and `[15,2]` pass rule 8; with the expected
+  start off by one they are rejected there.
+
+*Recur-sequence bodies could not be fraud-proven — fixed the same day.* The iteration `Start`
+records `RecurSequenceInput` as an inline handle (`{kind, index, len, item}`), while a body tile
+reading the item (`into_ref!`) records the storage binding itself. The scope check compared the
+two by kind and panicked — "Sequence scope source kind does not match consumer binding" — on
+every honest body. It now looks through the handle for parameter 0 of a recur-sequence iteration
+frame (`recur_sequence_item_source`): the handle must decode with `kind ==
+"raster::RecurSequenceInput"`, and the scope source is the item's storage entry — the one rule 8
+held to the source at that `Start`. So the chain is: body tile's store-verified read = iteration
+item = element `consumed_total` of the site's source.
+
+- Guest: a body tile reading its own element is accepted, another element is rejected, a scope
+  value that is not a handle is refused.
+- Real trace: windows `[15,1..]` (size 2), `[15,2..]` (sizes 2 and 4) now produce fraud proofs;
+  all four windows tried failed before.
+- The fourth window also holds the site `Start` `[15]` and fails on a different, pre-existing
+  mismatch: the CFS binds `output = sequence_output` — a draft produced by the previous tile — as
+  a storage input, while the trace records the draft replay handle inline ("Expected storage input
+  source … arg 1"). Any window containing a recur site `Start` whose `output` draft came from an
+  earlier step hits it. `incremental-draft-materialization` (drafts never cross a step boundary)
+  removes the case; not fixed here.
+
+*Found, not fixed: the site `Start`'s `L` is unverified.* `authenticated_source_len` says
+`checks::store` has already folded the `"input"` metadata witness; it has not — the `Start` is a
+`SequenceStart`, so nothing folds it, and the object's commitment is not store-authenticated
+either (the CFS check pins coordinates only). Rule 8 now cross-checks `L` against the first
+iteration's proven list length, so a forged `L` is caught **unless there is no iteration**: a
+`Start` naming a fabricated empty list at the right coordinates, followed by zero iterations,
+passes rule 7. Closing it needs the `Start` to carry a storage read (a trace-format change).
+
+*Not covered.* §2b is untouched: the bytes a tile ran on are still not the bytes the selection
+proves — step 2.
 
 ### Step 2 — structural roots in `TileReplayJournal` (one image-id break)
 
@@ -116,5 +198,7 @@ Step 0, then step 1 (independent, small), then step 2, batched with
 
 ## Costs
 
-Step 2 moves every tile image id, hence every `program_commitment`, and grows each replay journal
-by one root per argument plus one for the output. Step 1 changes no format.
+Step 1 adds a field to `RecurProgressFrame`, so every `recur_progress_commitment` changes and
+traces must be re-recorded; it moves the transition guest's image id and no tile's. Step 2 moves
+every tile image id, hence every `program_commitment`, and grows each replay journal by one root
+per argument plus one for the output.
