@@ -262,7 +262,6 @@ fn scope_binding_scenario(
             // The record commits its own argument list; that commitment is
             // fingerprinted, which is what makes it an anchor.
             input_source_commitment: input_source_commitment(&parent_args),
-            storage: None,
         },
         recur_progress_commitment: RecurProgressStack::new().commitment(),
         recur_state: None,
@@ -855,8 +854,33 @@ fn boundary_start_kind() -> StepKind {
     StepKind::SequenceStart {
         input_commitment: Vec::new(),
         input_source_commitment: Vec::new(),
-        storage: None,
     }
+}
+
+fn empty_roots() -> StorageRoots {
+    StorageRoots {
+        root_before: Vec::new(),
+        root_after: Vec::new(),
+        index_root_before: Vec::new(),
+        index_root_after: Vec::new(),
+    }
+}
+
+fn recur_start_kind(site: &str) -> StepKind {
+    StepKind::RecurStart(raster_core::trace::RecurStartStep {
+        site_id: site.into(),
+        input_commitment: Vec::new(),
+        input_source_commitment: Vec::new(),
+        storage: empty_roots(),
+    })
+}
+
+fn recur_end_kind(site: &str) -> StepKind {
+    StepKind::RecurEnd(raster_core::trace::RecurEndStep {
+        site_id: site.into(),
+        output_commitment: Vec::new(),
+        storage: empty_roots(),
+    })
 }
 
 /// The rule `verify_sequence_id` derives, exercised on both recur kinds.
@@ -869,52 +893,32 @@ fn boundary_start_kind() -> StepKind {
 fn sequence_id_derivation_matches_the_recorder() {
     let cfs = recur_frames_cfs();
 
-    // Boundary steps name the callee.
-    verify_sequence_id(
-        &cfs,
-        &step_with_sequence_id(boundary_start_kind(), vec![1], "recur"),
-    );
-    verify_sequence_id(
-        &cfs,
-        &step_with_sequence_id(boundary_start_kind(), vec![2], "child"),
-    );
+    // A recur site's own steps name the *enclosing* sequence; the site is
+    // `site_id`. (Before `RecurStart`, a site's `Start` borrowed
+    // `SequenceStart` and put the tile's id in the sequence slot.)
+    verify_sequence_id(&cfs, &step_with_sequence_id(recur_start_kind("recur"), vec![1], "main"));
+    verify_sequence_id(&cfs, &step_with_sequence_id(recur_end_kind("recur"), vec![-1], "main"));
+    verify_sequence_id(&cfs, &step_with_sequence_id(recur_start_kind("child"), vec![2], "main"));
+    verify_sequence_id(&cfs, &step_with_sequence_id(recur_end_kind("child"), vec![-2], "main"));
     // A recur sequence's iteration boundary resolves through the site.
     verify_sequence_id(
         &cfs,
         &step_with_sequence_id(boundary_start_kind(), vec![2, 1], "child"),
     );
 
-    // A recur *tile* pushes no frame: its iteration and its closing `Exec`
-    // both stay in `main`.
+    // A recur *tile* pushes no frame: its iterations stay in `main`.
     verify_sequence_id(
         &cfs,
         &step_with_sequence_id(exec_kind(ExecTarget::Tile("recur".into())), vec![1, 1], "main"),
     );
-    verify_sequence_id(
-        &cfs,
-        &step_with_sequence_id(
-            exec_kind(ExecTarget::RecurTile("recur".into())),
-            vec![1],
-            "main",
-        ),
-    );
 
-    // A recur *sequence* does push one: its body names the site, while the
-    // site's own closing `Exec` sits back in `main`.
+    // A recur *sequence* does push one: its body names the site.
     verify_sequence_id(
         &cfs,
         &step_with_sequence_id(
             exec_kind(ExecTarget::Tile("inner".into())),
             vec![2, 1, 1],
             "child",
-        ),
-    );
-    verify_sequence_id(
-        &cfs,
-        &step_with_sequence_id(
-            exec_kind(ExecTarget::RecurSequence("child".into())),
-            vec![2],
-            "main",
         ),
     );
 }
@@ -1090,7 +1094,7 @@ fn recur_iteration_step(iteration: CfsCoordinate) -> StepRecord {
         sequence_id: "main".into(),
         coordinates: CfsCoordinates(vec![FIRST_COORDINATE, iteration + FIRST_COORDINATE]),
         kind: StepKind::Exec(ExecStep {
-            target: ExecTarget::RecurTile("collect".into()),
+            target: ExecTarget::Tile("collect".into()),
             intra_sequence_index: FIRST_COORDINATE,
             input_commitment: Vec::new(),
             input_source_commitment: Vec::new(),
@@ -1511,7 +1515,6 @@ fn verify_sequence_boundary_commitments_accept_matching_recorded_io() {
         kind: StepKind::SequenceStart {
             input_commitment: sha(b"sequence-in"),
             input_source_commitment: Vec::new(),
-            storage: None,
         },
         recur_progress_commitment: RecurProgressStack::new().commitment(),
         recur_state: None,
@@ -1719,7 +1722,6 @@ fn sequence_start_step(coordinates: CfsCoordinates, input_source_commitment: Vec
         kind: StepKind::SequenceStart {
             input_commitment: Vec::new(),
             input_source_commitment,
-            storage: None,
         },
         recur_progress_commitment: RecurProgressStack::new().commitment(),
         recur_state: None,
@@ -3887,13 +3889,14 @@ fn recur_sequence_site_cfs() -> CfsCursor {
 fn recur_sequence_site_step() -> StepRecord {
     StepRecord {
         exec_index: 1,
-        sequence_id: "decorate_lines".into(),
+        sequence_id: "main".into(),
         coordinates: CfsCoordinates(vec![1]),
-        kind: StepKind::SequenceStart {
+        kind: StepKind::RecurStart(raster_core::trace::RecurStartStep {
+            site_id: "decorate_lines".into(),
             input_commitment: sha(b"recur-seq-in"),
             input_source_commitment: Vec::new(),
-            storage: None,
-        },
+            storage: empty_roots(),
+        }),
         recur_progress_commitment: RecurProgressStack::new().commitment(),
         recur_state: None,
     }
@@ -4323,7 +4326,6 @@ fn recur_sequence_iteration(index: u64) -> (StepRecord, FnInput, BTreeMap<String
         kind: StepKind::SequenceStart {
             input_commitment: Vec::new(),
             input_source_commitment: Vec::new(),
-            storage: None,
         },
         recur_progress_commitment: [0u8; 32],
         recur_state: None,
@@ -4583,13 +4585,14 @@ fn site_start_reading(
     };
     let step = StepRecord {
         exec_index: 2,
-        sequence_id: "collect".into(),
+        sequence_id: "main".into(),
         coordinates: CfsCoordinates(vec![2]),
-        kind: StepKind::SequenceStart {
+        kind: StepKind::RecurStart(raster_core::trace::RecurStartStep {
+            site_id: "collect".into(),
             input_commitment: Vec::new(),
             input_source_commitment: input_source_commitment(&input),
-            storage: None,
-        },
+            storage: empty_roots(),
+        }),
         recur_progress_commitment: [0u8; 32],
         recur_state: None,
     };
@@ -4624,26 +4627,23 @@ fn produced_lines_store() -> Vec<StorageEntry> {
     }]
 }
 
-/// Run a site `Start` through the checks it gets: the CFS binding, the frame
-/// opening (with the commitment the honest recorder would stamp), and the
-/// store check against `store`, reading whatever object `read` names. With
-/// `roots`, the `Start` claims the store's current roots, read-only.
+/// Run a site `RecurStart` through the checks it gets: the CFS binding, the
+/// frame opening (with the commitment the honest recorder would stamp), and
+/// the store check against `store`, reading whatever object `read` names. The
+/// `RecurStart` claims the store's current roots, read-only.
 fn run_site_start(
     (mut start, input, witnesses): (StepRecord, FnInput, BTreeMap<String, SelectionWitness>),
-    roots: bool,
     store: &[StorageEntry],
     read: Option<&StorageEntry>,
 ) -> RecurProgressStack {
     let (mut frontier, root, _index, index_root) = build_storage_context(store);
-    if roots {
-        if let StepKind::SequenceStart { storage, .. } = &mut start.kind {
-            *storage = Some(StorageRoots {
-                root_before: root.clone(),
-                root_after: root,
-                index_root_before: index_root.clone(),
-                index_root_after: index_root.clone(),
-            });
-        }
+    if let StepKind::RecurStart(recur_start) = &mut start.kind {
+        recur_start.storage = StorageRoots {
+            root_before: root.clone(),
+            root_after: root,
+            index_root_before: index_root.clone(),
+            index_root_after: index_root.clone(),
+        };
     }
     let binding = &input.storage["input"];
     let len = witnesses["input"].bytes.get(1..9).map_or(0, |bytes| {
@@ -4688,17 +4688,6 @@ fn run_site_start(
     progress
 }
 
-/// Was `poc_a_site_start_claiming_an_empty_source_is_accepted`: a `Start`
-/// naming a fabricated empty list at the right producer, followed by zero
-/// iterations, passed every check — the frame opened with `L = 0` read from
-/// unverified bytes, the store check looked only at the witness shape, and
-/// rule 7 closed the site. Without roots it is now refused where the frame
-/// opens.
-#[test]
-#[should_panic(expected = "must read its source from storage")]
-fn a_site_start_without_storage_roots_is_rejected() {
-    run_site_start(site_start_claiming([0xEE; 32], 0), false, &produced_lines_store(), None);
-}
 
 /// And with roots, the fabricated list cannot be read: the store holds the
 /// producer's real list at `[1]`, so the only read witness that exists there is
@@ -4707,7 +4696,7 @@ fn a_site_start_without_storage_roots_is_rejected() {
 #[should_panic(expected = "Missing storage read witness for coordinates")]
 fn a_site_start_claiming_a_fabricated_empty_source_is_rejected() {
     let store = produced_lines_store();
-    run_site_start(site_start_claiming([0xEE; 32], 0), true, &store, Some(&store[0]));
+    run_site_start(site_start_claiming([0xEE; 32], 0), &store, Some(&store[0]));
 }
 
 /// The real object, with doctored metadata: the read passes, the fold does not.
@@ -4716,7 +4705,7 @@ fn a_site_start_claiming_a_fabricated_empty_source_is_rejected() {
 fn a_site_start_with_doctored_metadata_is_rejected() {
     let store = produced_lines_store();
     let (real, _) = swept_lines();
-    run_site_start(site_start_claiming(real, 0), true, &store, Some(&store[0]));
+    run_site_start(site_start_claiming(real, 0), &store, Some(&store[0]));
 }
 
 #[test]
@@ -4725,7 +4714,6 @@ fn an_honest_site_start_reads_its_source() {
     let (real, _) = swept_lines();
     let progress = run_site_start(
         site_start_reading(real, swept_lines_metadata()),
-        true,
         &store,
         Some(&store[0]),
     );
@@ -4743,36 +4731,12 @@ fn an_honest_empty_source_reads_zero() {
     }];
     let progress = run_site_start(
         site_start_reading(empty, raster_core::input::encode_list_metadata_payload(0, None)),
-        true,
         &store,
         Some(&store[0]),
     );
     assert_eq!(progress.innermost().map(|frame| frame.source_len), Some(0));
 }
 
-/// Roots belong to a site `Start` only; an ordinary boundary cannot claim them.
-#[test]
-#[should_panic(expected = "Only a recur site start may claim storage roots")]
-fn an_ordinary_sequence_start_may_not_claim_storage_roots() {
-    let mut step = recur_sequence_iteration(0).0;
-    if let StepKind::SequenceStart { storage, .. } = &mut step.kind {
-        *storage = Some(StorageRoots {
-            root_before: Vec::new(),
-            root_after: Vec::new(),
-            index_root_before: Vec::new(),
-            index_root_after: Vec::new(),
-        });
-    }
-    crate::checks::cfs::advance_recur_progress(
-        &recur_sequence_site_cfs(),
-        &mut lines_sweep(),
-        &step,
-        None,
-        None,
-        None,
-        &BTreeMap::new(),
-    );
-}
 
 /// The companion to the PoC: what the `Start` *is* held to. Naming the wrong
 /// producer is rejected — coordinates are the one fact the CFS check pins.
@@ -4781,12 +4745,87 @@ fn an_ordinary_sequence_start_may_not_claim_storage_roots() {
 fn a_site_start_naming_the_wrong_producer_is_rejected() {
     let (mut start, mut input, _) = site_start_claiming([0xEE; 32], 0);
     input.storage.get_mut("input").unwrap().coordinates = CfsCoordinates(vec![5]);
-    if let StepKind::SequenceStart {
-        input_source_commitment,
-        ..
-    } = &mut start.kind
-    {
-        *input_source_commitment = crate::checks::io::input_source_commitment(&input);
+    if let StepKind::RecurStart(recur_start) = &mut start.kind {
+        recur_start.input_source_commitment = crate::checks::io::input_source_commitment(&input);
     }
     verify_step_record_inputs(&produced_list_sweep_cfs(), &start, Some(&input), None, None);
+}
+
+// ---------------------------------------------------------------------------
+// Recur site step kinds and `[-s]` closes — `incremental-draft-materialization`
+// §A recur site gets its own step kinds (batch A).
+// ---------------------------------------------------------------------------
+
+fn kind_at(kind: StepKind, coordinates: Vec<CfsCoordinate>) -> StepRecord {
+    step_with_sequence_id(kind, coordinates, "main")
+}
+
+/// A site opens with `RecurStart` at `[s]` and closes with `RecurEnd` at
+/// `[-s]`; the borrowed shapes are refused. The site `[1]` of
+/// `chunked_recur_cfs` is a recur tile.
+#[test]
+fn a_recur_site_accepts_only_its_own_step_kinds() {
+    let cfs = chunked_recur_cfs(Some(2));
+    let rejects = |record: StepRecord| {
+        std::panic::catch_unwind(|| {
+            verify_step_record_inputs(&cfs, &record, None, None, None)
+        })
+        .is_err()
+    };
+    // The borrowed `SequenceStart` at the site.
+    assert!(rejects(kind_at(boundary_start_kind(), vec![1])));
+    // `RecurEnd` at the open coordinate; `RecurStart` at the close.
+    assert!(rejects(kind_at(recur_end_kind("collect"), vec![1])));
+    assert!(rejects(kind_at(recur_start_kind("collect"), vec![-1])));
+    // A site id that is not the item's.
+    assert!(rejects(kind_at(recur_end_kind("other"), vec![-1])));
+    // The honest close binds no inputs and passes.
+    verify_step_record_inputs(&cfs, &kind_at(recur_end_kind("collect"), vec![-1]), None, None, None);
+}
+
+/// A `RecurStart`/`RecurEnd` where the CFS has no recur site is refused.
+#[test]
+#[should_panic(expected = "Step record kind does not match the CFS item kind")]
+fn a_recur_start_at_a_plain_tile_is_rejected() {
+    let cfs = produced_list_sweep_cfs();
+    // `[1]` is the plain tile `produce`.
+    verify_step_record_inputs(
+        &cfs,
+        &kind_at(recur_start_kind("produce"), vec![1]),
+        Some(&FnInput {
+            data: Vec::new(),
+            values: Vec::new(),
+            args: Vec::new(),
+            storage: Default::default(),
+        }),
+        None,
+        None,
+    );
+}
+
+/// Ordering: the only way into a site is its `RecurStart`, and the only way
+/// out is its `RecurEnd`. Both used to be skippable.
+#[test]
+fn a_recur_site_cannot_be_entered_or_left_around_its_boundary_steps() {
+    let cfs = produced_list_sweep_cfs();
+    let after = |coordinates: Vec<CfsCoordinate>| {
+        crate::checks::cfs::get_next_expected_coordinates(
+            &cfs,
+            &kind_at(exec_kind(ExecTarget::Tile("produce".into())), coordinates),
+            None,
+        )
+    };
+    // After the tile at `[1]`: only the site's `RecurStart` at `[2]`.
+    assert_eq!(after(vec![1]), vec![CfsCoordinates(vec![2])]);
+
+    let from_start = crate::checks::cfs::get_next_expected_coordinates(
+        &cfs,
+        &kind_at(recur_start_kind("collect"), vec![2]),
+        None,
+    );
+    // First iteration, or zero iterations straight to the close — never past it.
+    assert_eq!(
+        from_start,
+        vec![CfsCoordinates(vec![2, 1]), CfsCoordinates(vec![-2])]
+    );
 }

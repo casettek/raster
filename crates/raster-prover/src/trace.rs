@@ -655,33 +655,25 @@ fn sequence_coordinates(step_record: &StepRecord) -> Option<(CfsCoordinates, Cfs
 
 /// Whether `record` is the step that produced `cfs_item`'s output — i.e.
 /// whether a `PriorItemOutput` binding on `cfs_item` resolves to it.
+///
+/// A tile produces at its own coordinate `[k]`; a nested sequence and a recur
+/// site report their output on the way out, at `[-k]` (the caller compares
+/// `record.coordinates.opened()`). A site's object is stored at `[k]`, but
+/// the record that wrote it is the `RecurEnd`.
 fn record_produces_item(record: &StepRecord, cfs_item: &SequenceChildItem) -> bool {
     match (&record.kind, cfs_item) {
-        // A tile run satisfies a recur-tile item too: an iteration of a
-        // recur site is recorded as an ordinary tile run.
         (
             StepKind::Exec(ExecStep {
                 target: ExecTarget::Tile(_),
                 ..
             }),
-            SequenceChildItem::Tile(_) | SequenceChildItem::RecurTile(_),
+            SequenceChildItem::Tile(_),
         ) => true,
-        (
-            StepKind::Exec(ExecStep {
-                target: ExecTarget::RecurTile(_),
-                ..
-            }),
-            SequenceChildItem::RecurTile(_),
-        ) => true,
-        (
-            StepKind::Exec(ExecStep {
-                target: ExecTarget::RecurSequence(_),
-                ..
-            }),
-            SequenceChildItem::RecurSequence(_),
-        ) => true,
-        // A nested sequence's output is what it reported on the way out.
         (StepKind::SequenceEnd { .. }, SequenceChildItem::Sequence(_)) => true,
+        (
+            StepKind::RecurEnd(_),
+            SequenceChildItem::RecurTile(_) | SequenceChildItem::RecurSequence(_),
+        ) => true,
         _ => false,
     }
 }
@@ -866,7 +858,7 @@ fn resolve_inputs_sources(
                     .iter()
                     .enumerate()
                     .find(|(_, record)| {
-                        record.coordinates == source_record_coordinates
+                        record.coordinates.opened() == source_record_coordinates
                             && record_produces_item(record, source_record_cfs_item)
                     })
                     .map(|(intra_sequence_offset, record)| {
@@ -912,10 +904,11 @@ fn witness_record_inputs(
         // agree on which steps have inputs to resolve: a witness the guest never
         // reads is dead weight in the evidence, and a witness it reads and does
         // not get is a panic.
-        if step_record.coordinates().is_empty() {
-            // The root coordinate holds only the program boundaries —
-            // `ProgramStart`, `ProgramEnd` and `main`'s `SequenceEnd`. None is a
-            // CFS item, so none binds CFS inputs to resolve.
+        if step_record.input_source_commitment().is_none() || step_record.coordinates().is_empty()
+        {
+            // Steps that bind no inputs — the program boundaries at `[]`, and
+            // every close (`SequenceEnd`, `RecurEnd`), whose inputs belong to
+            // the matching open.
             continue;
         }
 
@@ -1380,7 +1373,6 @@ mod tests {
             kind: StepKind::SequenceStart {
                 input_commitment: Vec::new(),
                 input_source_commitment: Vec::new(),
-                storage: None,
             },
             recur_progress_commitment: [0u8; 32],
             recur_state: None,

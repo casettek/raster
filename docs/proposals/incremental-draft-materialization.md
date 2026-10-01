@@ -1238,7 +1238,8 @@ its own step kinds: `RecurStart` **never writes**.
 > gains here — a deriving site's base commitment (§Continuation on the draft buffer) and a stored
 > seed's commitment (§Carried-state commitment (D5b)) — are unauthenticated without it, since a CFS binding
 > pins coordinates only. **Landed 2026-09-30** on `SequenceStart` (guest-tested, and verified on
-> real `hello-tiles` fraud windows).
+> real `hello-tiles` fraud windows), and moved into `RecurStartStep.storage` the same day with
+> batch A.
 
 **The design.** Add the draft entry to the frame:
 
@@ -1778,6 +1779,73 @@ leaves the log append untouched.
 a window that opens mid-sweep through the storage frontier. §The draft root rides in the site's
 recur-progress frame does that for one frame field per step, with no storage write and no update
 gate. The measurements stand; the variant is no longer needed.
+
+## Implementation order
+
+Decided 2026-09-30: this proposal is implemented in full, together with
+[`tile-io-structural-roots`](./tile-io-structural-roots.md) step 2. Batches are grouped by what
+they break; the same table is in that proposal's §Order.
+
+| batch | contents | breaks |
+| --- | --- | --- |
+| **A — trace shape** | `RecurStart`/`RecurEnd` step kinds, site closes at `[-s]`, `ExecTarget::RecurTile`/`RecurSequence` removed; D4 (nested `SequenceEnd` at `[-s]`); `RecurStartStep.storage` (read-only) takes over the interim `SequenceStart.storage` (landed 2026-09-30), which is removed again; site-ordering checks | trace shape, transition guest; **done 2026-09-30** — moves the image ids of tiles that link the edited code (see below) |
+| **B — language and object ownership** | §One storage rule and §The restriction: `new!`/`finalize`/`finalize = false` removed, a site owns its object at `[s]` (creates, or derives with `output = base`), plain tiles return values, `DRAFT_NAMESPACE` deleted, host anchor `anchor_for_schema([s], S)`; D1b (`RecurOutputDecl` in the CFS via `schema_walk`); programs rewritten (`examples/`, `crates/raster/tests`, `raster-inference`) | CFS, programs, `program_commitment` |
+| **C — tile journal** (one tile-image-id break) | D3 (recur iterations publish no output; an `Exec` with no write has an empty `output_commitment`); D2 (`draft_id` removed); D1a (replay tile asserts its schema); D5b (replayed state as raster roots, recur-sequence state by reference); **`tile-io-structural-roots` step 2** (`output_root`, `input_roots`); guest: the frame's draft entry replaces `active_drafts`, `RecurEnd` writes exactly one object | every tile image id, `program_commitment` |
+| **D — materialization** | `DraftBuffer`, one seal for store and `RecurEnd` output, `rindex04` relative offsets, derivation sharing (`Derived` backing, delta output) | `.rindex` format; no guest or tile change |
+| **E — verification** | both proposals' Verification lists; `tile-io-structural-roots` step 3; GPU proving; all locks, `raster-inference` included | — |
+
+What implementing this proposal in full changes for `tile-io-structural-roots`:
+
+- Step 2's write rule needs no exceptions: a plain tile returns a value (`output_root = Some`), a
+  recur iteration never writes, and `RecurEnd`'s one write is bound by the frame (draft root or
+  D5b state commitment), not by a journal.
+- D2 is not deferred: with no draft crossing a step boundary, the frame's draft entry replaces
+  `active_drafts`, the only reader of `draft_id`.
+- D3 covers recur iterations only; plain `Draft`-returning tiles no longer exist.
+- The draft-argument binding mismatch (CFS says storage, trace says an inline handle — the `[7]`
+  and `[15]` fraud windows) disappears with batch B.
+
+Open: whether batch B verifies under today's guest on its own. If not, B and C merge. Checked
+first, on one rewritten recur site in `hello-tiles`.
+
+**Batch A — done 2026-09-30.**
+
+- **Step kinds.** `StepKind::RecurStart(RecurStartStep { site_id, input_commitment,
+  input_source_commitment, storage })` at `[s]` and `StepKind::RecurEnd(RecurEndStep { site_id,
+  output_commitment, storage })` at `[-s]`, for both families; `ExecTarget` is left with `Tile`
+  only. The interim `SequenceStart.storage` is gone: the `L` read is `RecurStartStep.storage`. A
+  site's steps name the **enclosing** sequence in `sequence_id`; the site is `site_id`. `RecurEnd`
+  carries no inputs, the macros stop re-publishing them on `RecurTileEnd`/`RecurSequenceEnd`, and it
+  writes the site's object at `opened([-s]) = [s]` (`checks::store`).
+- **Closes at `[-s]`.** Every scope — nested sequence (D4), recur site, recur-sequence iteration —
+  closes at its own coordinate, with its own witness-store entry and no input.
+  `CfsCursor::try_get_next_coordinates` is rewritten as explicit per-kind rules instead of the
+  union walk. It is **stricter than the table above** in one place: a scope with a body cannot
+  close before its first child — `SequenceStart` offers `[s][1]` only, not `{[s][1], [-s]}`. It also
+  closes a hole the table did not list: `ProgramStart` used to offer `[]`, i.e. `ProgramEnd`
+  straight away, skipping the program.
+- **Guest.** `record_matches_item` binds `RecurStart`/`RecurEnd` to a recur site item by
+  `site_id`, `RecurStart` only at an open coordinate and `RecurEnd` only at a close; the borrowed
+  `SequenceStart`-at-a-site and `Exec(RecurTile/RecurSequence)` arms are gone. `advance_recur_progress`
+  opens the frame on `RecurStart` and closes it on `RecurEnd` (`close_site(opened)`). Steps without
+  an input source commitment (every close) skip the scope-parent check on both host and guest.
+- **Deferred to batch C, deliberately.** `RecurEnd` writes *at most* one object: `finalize = false`
+  sites still write none until batch B. `RecurEnd` counts as an execution step (its output is not
+  compared yet — the frame's draft entry does that in batch C).
+- **Fraud tooling.** `RecurEnd` is an eligible `--fraud-step` target (`recur-site`), so a site's
+  close can be corrupted and proven.
+- **Tile image ids do move.** The table said "no tile ids". Wrong: a tile binary embeds code — and
+  the file and line of every panic site — from the raster crates it links, so editing
+  `raster-core/src/trace.rs` moved the five `hello-tiles` tiles that link it (the draft and recur
+  tiles). Every batch that touches code compiled into tiles moves those tiles; the "one break"
+  framing is about released program identities, not about development.
+- **Verified.** `raster-core` 169 (successor tests rewritten; D4 and `main` ordering tests added),
+  runtime 67, `raster` 26 + suites, guest 129 (site-kind and ordering tests added). Real
+  `hello-tiles` fraud windows in dev mode: site starts `[11] [16] [18]`, site closes `[-11]` (the
+  corrupted step itself), `[-16]`, `[-18]`, a window crossing nested-sequence closes (`29:4`) and
+  one ending at `ProgramEnd` (`97:4`) all prove. `35:4` fails on the pre-existing
+  [`sequence-scope-forbids-narrowing`](../issues/sequence-scope-forbids-narrowing.md)
+  (`personal_greet_seq` selects into its parameter).
 
 ## Costs
 

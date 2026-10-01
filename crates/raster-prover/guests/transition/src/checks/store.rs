@@ -299,7 +299,9 @@ pub fn verify_storage_transition(
                     .clone();
 
                 let expected_entry = StorageEntry {
-                    coordinates: step_record.coordinates().clone(),
+                    // A `RecurEnd` sits at `[-s]` and writes the site's
+                    // object at `[s]`; every other writer writes where it sits.
+                    coordinates: step_record.coordinates().opened(),
                     object_commitment,
                 };
                 current_frontier.append(Bytes(storage_leaf_hash(&expected_entry)));

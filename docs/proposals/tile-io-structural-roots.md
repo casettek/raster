@@ -169,9 +169,11 @@ proven list length, so the hole was the empty sweep: a `Start` naming a fabricat
 the right producer, followed by zero iterations, passed rule 7. Demonstrated first by a guest PoC
 (`poc_a_site_start_claiming_an_empty_source_is_accepted`), now inverted.
 
-- **Format.** `StepKind::SequenceStart` gains `storage: Option<StorageRoots>` — `Some` exactly at a
+- **Format.** `StepKind::SequenceStart` gained `storage: Option<StorageRoots>` — `Some` exactly at a
   recur site `Start`, read-only (`root_before == root_after`), the way `ProgramEnd` claims roots
-  for its read. `StepRecord::storage_roots()` returns it. The recorder stamps the current roots
+  for its read. *Moved the same day* into `RecurStartStep.storage` (non-optional) with
+  `incremental-draft-materialization`'s batch A; the guest's "must read its source" and "only a
+  site start may claim roots" rules became type-level and were deleted with their tests. `StepRecord::storage_roots()` returns it. The recorder stamps the current roots
   (`storage_roots(None)`); `prove.rs`'s read-witness gate is `storage_roots().is_some()`, so the
   `Start`'s reads are built with no other change.
 - **Guest.** Nothing new in `checks::store`: with roots, the `Start` takes the existing path —
@@ -217,8 +219,33 @@ with `cargo raster build --backend risc0` (the tile cache key now tracks raster 
 
 ## Order
 
-Step 0, then step 1 (independent, small), then step 2, batched with
-`incremental-draft-materialization`'s journal changes if that lands first.
+Steps 0 and 1 are done. The rest, and `incremental-draft-materialization`:
+
+Decided 2026-09-30, with `incremental-draft-materialization` implemented **in full** alongside
+this proposal. Batches are grouped by what they break: a *trace-shape* break re-records traces; a
+*tile-image-id* break rebuilds every lock.
+
+| batch | contents | breaks |
+| --- | --- | --- |
+| **A — trace shape** | `RecurStart`/`RecurEnd` step kinds, site closes at `[-s]`, `ExecTarget::RecurTile`/`RecurSequence` removed; D4 (nested `SequenceEnd` at `[-s]`); `RecurStartStep.storage` (read-only) takes over this proposal's `SequenceStart.storage`, which is removed again; site-ordering checks | trace shape, transition guest; **done 2026-09-30** — also moves the image ids of tiles that link the edited `raster-core` code |
+| **B — language and object ownership** | §One storage rule and §The restriction: `new!`/`finalize`/`finalize = false` removed, a site owns its object at `[s]` (creates, or derives with `output = base`), plain tiles return values, `DRAFT_NAMESPACE` deleted, host anchor `anchor_for_schema([s], S)`; D1b (`RecurOutputDecl` in the CFS via `schema_walk`); programs rewritten (`examples/`, `crates/raster/tests`, `raster-inference`) | CFS, programs, `program_commitment` |
+| **C — tile journal** (one tile-image-id break) | D3 (recur iterations publish no output; an `Exec` with no write has an empty `output_commitment`); D2 (`draft_id` removed); D1a (replay tile asserts its schema); D5b (replayed state as raster roots, recur-sequence state by reference); **this proposal's step 2** (`output_root`, `input_roots`); guest: the frame's draft entry replaces `active_drafts`, `RecurEnd` writes exactly one object | every tile image id, `program_commitment` |
+| **D — materialization** | `DraftBuffer`, one seal for store and `RecurEnd` output, `rindex04` relative offsets, derivation sharing (`Derived` backing, delta output) | `.rindex` format; no guest or tile change |
+| **E — verification** | both proposals' Verification lists; this proposal's step 3; GPU proving; all locks, `raster-inference` included | — |
+
+What implementing the draft proposal in full changes here:
+
+- Step 2's write rule needs no exceptions: a plain tile returns a value (`output_root = Some`), a
+  recur iteration never writes, and `RecurEnd`'s one write is bound by the frame (draft root or
+  D5b state commitment), not by a journal.
+- D2 is not deferred: with no draft crossing a step boundary, the frame's draft entry replaces
+  `active_drafts`, the only reader of `draft_id`.
+- D3 covers recur iterations only; plain `Draft`-returning tiles no longer exist.
+- The draft-argument binding mismatch (CFS says storage, trace says an inline handle — the `[7]`
+  and `[15]` fraud windows) disappears with batch B.
+
+Open: whether batch B verifies under today's guest on its own. If not, B and C merge. Checked
+first, on one rewritten recur site in `hello-tiles`.
 
 ## Costs
 

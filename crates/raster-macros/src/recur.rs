@@ -787,10 +787,10 @@ pub(crate) fn gen_recur_driver_function(
 
                 // `Start` publishes the input half at the point it was already
                 // computed, so the loop bound `L` carried by the source's `0x0A`
-                // metadata selection is known *before* iteration 0. `End` keeps
-                // its input too for now: every downstream check on the site's
-                // `Exec` record reads it, so duplicating keeps this addition
-                // strictly additive. See `recur-progress-commitment.md` §3.2.
+                // metadata selection is known *before* iteration 0. `End` carries
+                // no input: the site's inputs are bound once, at `RecurStart`.
+                // See `incremental-draft-materialization.md` §A recur site gets
+                // its own step kinds.
                 ::raster::publish_trace_event(::raster::core::trace::TraceEvent::RecurTileStart(
                     ::raster::core::trace::FnCallRecord {
                         fn_name: ::raster::alloc::string::String::from(#fn_name_str),
@@ -819,7 +819,8 @@ pub(crate) fn gen_recur_driver_function(
                 ::raster::publish_trace_event(::raster::core::trace::TraceEvent::RecurTileEnd(
                     ::raster::core::trace::FnCallRecord {
                         fn_name: ::raster::alloc::string::String::from(#fn_name_str),
-                        input: __raster_input,
+                        // The site's inputs were bound once, at its `RecurStart`.
+                        input: ::core::option::Option::None,
                         output: __raster_output,
                         draft_transition_witness: ::core::option::Option::None,
                         recur_control: ::core::option::Option::None,
@@ -923,10 +924,10 @@ pub(crate) fn gen_recur_driver_function(
 
                 // `Start` publishes the input half at the point it was already
                 // computed, so the loop bound `L` carried by the source's `0x0A`
-                // metadata selection is known *before* iteration 0. `End` keeps
-                // its input too for now: every downstream check on the site's
-                // `Exec` record reads it, so duplicating keeps this addition
-                // strictly additive. See `recur-progress-commitment.md` §3.2.
+                // metadata selection is known *before* iteration 0. `End` carries
+                // no input: the site's inputs are bound once, at `RecurStart`.
+                // See `incremental-draft-materialization.md` §A recur site gets
+                // its own step kinds.
                 ::raster::publish_trace_event(::raster::core::trace::TraceEvent::RecurTileStart(
                     ::raster::core::trace::FnCallRecord {
                         fn_name: ::raster::alloc::string::String::from(#fn_name_str),
@@ -957,7 +958,8 @@ pub(crate) fn gen_recur_driver_function(
                 ::raster::publish_trace_event(::raster::core::trace::TraceEvent::RecurTileEnd(
                     ::raster::core::trace::FnCallRecord {
                         fn_name: ::raster::alloc::string::String::from(#fn_name_str),
-                        input: __raster_input,
+                        // The site's inputs were bound once, at its `RecurStart`.
+                        input: ::core::option::Option::None,
                         output: __raster_output,
                         draft_transition_witness: ::core::option::Option::None,
                         recur_control: ::core::option::Option::None,
@@ -1450,10 +1452,10 @@ pub(crate) fn gen_recur_sequence_driver_function(
 
                 // `Start` publishes the input half at the point it was already
                 // computed, so the loop bound `L` carried by the source's `0x0A`
-                // metadata selection is known *before* iteration 0. `End` keeps
-                // its input too for now: every downstream check on the site's
-                // `Exec` record reads it, so duplicating keeps this addition
-                // strictly additive. See `recur-progress-commitment.md` §3.2.
+                // metadata selection is known *before* iteration 0. `End` carries
+                // no input: the site's inputs are bound once, at `RecurStart`.
+                // See `incremental-draft-materialization.md` §A recur site gets
+                // its own step kinds.
                 ::raster::publish_trace_event(::raster::core::trace::TraceEvent::RecurSequenceStart(
                     ::raster::core::trace::FnCallRecord {
                         fn_name: ::raster::alloc::string::String::from(#fn_name_str),
@@ -1482,7 +1484,8 @@ pub(crate) fn gen_recur_sequence_driver_function(
                 ::raster::publish_trace_event(::raster::core::trace::TraceEvent::RecurSequenceEnd(
                     ::raster::core::trace::FnCallRecord {
                         fn_name: ::raster::alloc::string::String::from(#fn_name_str),
-                        input: __raster_input,
+                        // The site's inputs were bound once, at its `RecurStart`.
+                        input: ::core::option::Option::None,
                         output: __raster_output,
                         draft_transition_witness: ::core::option::Option::None,
                         recur_control: ::core::option::Option::None,

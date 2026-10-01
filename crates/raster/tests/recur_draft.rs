@@ -857,24 +857,29 @@ fn recur_iterations_record_the_item_binding_they_ran_on() {
 #[test]
 fn recur_trace_emits_site_completion_event() {
     let (_reference, events) = capture_trace_events(run_build_lines_reference);
-    let site_events: Vec<_> = events
-        .into_iter()
+    let starts: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            TraceEvent::RecurTileStart(record) if record.fn_name == "collect_lines" => Some(record),
+            _ => None,
+        })
+        .collect();
+    let ends: Vec<_> = events
+        .iter()
         .filter_map(|event| match event {
             TraceEvent::RecurTileEnd(record) if record.fn_name == "collect_lines" => Some(record),
             _ => None,
         })
         .collect();
 
-    assert_eq!(site_events.len(), 1);
-    let site_event = &site_events[0];
-    assert!(
-        site_event.input.is_some(),
-        "recur site should capture input trace"
-    );
-    assert!(
-        site_event.output.is_some(),
-        "recur site should capture finalized output"
-    );
+    assert_eq!(starts.len(), 1);
+    assert_eq!(ends.len(), 1);
+    // The site's inputs are bound once, at its start; the end carries only the
+    // finalized output (`incremental-draft-materialization` §A recur site gets
+    // its own step kinds — the close used to re-publish the inputs).
+    assert!(starts[0].input.is_some(), "recur site start should capture input trace");
+    assert!(ends[0].input.is_none(), "recur site end must not re-bind the inputs");
+    assert!(ends[0].output.is_some(), "recur site should capture finalized output");
 }
 
 #[test]

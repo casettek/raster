@@ -5,7 +5,7 @@ use core::hash::Hash;
 use core::ops::{Deref, DerefMut};
 use serde::{Deserialize, Serialize};
 
-use crate::cfs::{CfsCoordinate, CfsCoordinates, SequenceId, TileId};
+use crate::cfs::{CfsCoordinate, CfsCoordinates, TileId};
 use crate::draft::DraftTransitionWitness;
 use crate::fingerprint::Fingerprint;
 use crate::input::{
@@ -323,21 +323,19 @@ pub struct StorageRoots {
     pub index_root_after: Vec<u8>,
 }
 
-/// What an [`ExecStep`] ran. The distinction is not cosmetic: it decides how
-/// the step's output is verified (only `Tile` carries a replay proof) and
-/// which CFS item kind the step may occupy.
+/// What an [`ExecStep`] ran: always a tile, a plain call or one recur tile
+/// iteration, and always with a replay proof.
+///
+/// `RecurTile` and `RecurSequence` targets used to name a recur site's close,
+/// which runs nothing; that step is [`StepKind::RecurEnd`] now, so `Exec`
+/// means "a tile ran" again. See `docs/proposals/incremental-draft-
+/// materialization.md` §A recur site gets its own step kinds.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum ExecTarget {
     Tile(TileId),
-    RecurTile(TileId),
-    RecurSequence(SequenceId),
 }
 
-/// A step that ran something and committed to what it consumed and produced.
-///
-/// The three targets share one shape deliberately: they commit to exactly
-/// the same things and differ only in what ran, so a field added here cannot
-/// be added to two of them and forgotten on the third.
+/// A step where a tile ran, committing to what it consumed and produced.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct ExecStep {
     pub target: ExecTarget,
@@ -412,29 +410,61 @@ pub enum StepKind {
     /// The trace's last step: commits `main`'s authorized output (see
     /// [`ProgramEndStep`]). Always at coordinates `[]`.
     ProgramEnd(ProgramEndStep),
+    /// A nested sequence (at `[s]`) or a recur-sequence iteration (at
+    /// `[s][i]`) opens.
     SequenceStart {
         input_commitment: Vec<u8>,
         input_source_commitment: Vec<u8>,
-        /// **Read-only** storage roots (`root_before == root_after`), set
-        /// exactly on a recur site's `Start` at `[s]` and `None` on every other
-        /// sequence boundary.
-        ///
-        /// A site `Start` reads its source's `0x0A` metadata, which is where
-        /// the sweep bound `L` comes from. A boundary step with no roots gets
-        /// no storage read and no witness fold, so without these `L` — and the
-        /// source object itself — were whatever the prover recorded: a
-        /// fabricated empty list at the right coordinates, swept zero times,
-        /// passed rule 7. With them the record pins the roots, as `ProgramEnd`
-        /// does for its read, and `checks::store` verifies the read like any
-        /// other. Moves into `RecurStartStep` with
-        /// `incremental-draft-materialization`'s step kinds; see
-        /// `docs/proposals/tile-io-structural-roots.md` §Step 1.
-        storage: Option<StorageRoots>,
     },
+    /// …and closes, at `[-s]` / `[s][-i]`.
     SequenceEnd {
         output_commitment: Vec<u8>,
     },
     Exec(ExecStep),
+    /// A recur site (tile or sequence — the CFS item says which) opens at
+    /// `[s]`. See [`RecurStartStep`].
+    RecurStart(RecurStartStep),
+    /// …and closes at `[-s]`, writing its object at `[s]`. See
+    /// [`RecurEndStep`].
+    RecurEnd(RecurEndStep),
+}
+
+/// A recur site opens: the loop's inputs are bound here, once.
+///
+/// Both recur families share this kind; the family is the CFS item's at `[s]`,
+/// so a record cannot disagree with it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct RecurStartStep {
+    /// The CFS item id at `[s]`. The record's `sequence_id` names the
+    /// *enclosing* sequence, as on every step that is not a sequence boundary.
+    pub site_id: String,
+    pub input_commitment: Vec<u8>,
+    pub input_source_commitment: Vec<u8>,
+    /// **Read-only** storage roots (`root_before == root_after`).
+    ///
+    /// The site reads its source's `0x0A` metadata, which is where the sweep
+    /// bound `L` comes from. A step with no roots gets no storage read and no
+    /// witness fold, so without these `L` — and the source object itself —
+    /// were whatever the prover recorded: a fabricated empty list at the right
+    /// coordinates, swept zero times, passed rule 7. With them the record pins
+    /// the roots, as `ProgramEnd` does for its read, and `checks::store`
+    /// verifies the read like any other. See
+    /// `docs/proposals/tile-io-structural-roots.md` §Step 1.
+    pub storage: StorageRoots,
+}
+
+/// A recur site closes at `[-s]`: its output, written at `[s]`.
+///
+/// No input fields: the inputs were bound at [`RecurStartStep`], and a close
+/// that re-bound them is what committed every site's inputs twice.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct RecurEndStep {
+    pub site_id: String,
+    /// The object written at `[s]`, or empty when the site writes none
+    /// (`finalize = false`, until `incremental-draft-materialization`'s
+    /// language change makes every site write exactly one).
+    pub output_commitment: Vec<u8>,
+    pub storage: StorageRoots,
 }
 
 /// The binding name a recur site's source is always recorded under. Shared so
@@ -552,6 +582,8 @@ impl StepRecord {
                 input_commitment, ..
             } => Some(input_commitment),
             StepKind::Exec(exec) => Some(&exec.input_commitment),
+            StepKind::RecurStart(start) => Some(&start.input_commitment),
+            StepKind::RecurEnd(_) => None,
             // A program start binds authorized external data and a program end
             // commits an authorized output rather than consuming a step input;
             // a sequence end only reports what it produced.
@@ -567,7 +599,8 @@ impl StepRecord {
             StepKind::Exec(exec) => Some(&exec.output_commitment),
             StepKind::ProgramStart(program_start) => Some(&program_start.output_commitment),
             StepKind::ProgramEnd(program_end) => Some(&program_end.output_commitment),
-            StepKind::SequenceStart { .. } => None,
+            StepKind::RecurEnd(end) => Some(&end.output_commitment),
+            StepKind::SequenceStart { .. } | StepKind::RecurStart(_) => None,
         }
     }
 
@@ -578,6 +611,8 @@ impl StepRecord {
                 ..
             } => Some(input_source_commitment),
             StepKind::Exec(exec) => Some(&exec.input_source_commitment),
+            StepKind::RecurStart(start) => Some(&start.input_source_commitment),
+            StepKind::RecurEnd(_) => None,
             // A program start makes no input commitment at all (its "input" is
             // the outside world, authorized against the manifest journal), and
             // a program end carries its output binding in the record itself
@@ -590,15 +625,16 @@ impl StepRecord {
 
     /// The storage roots this step claims, for kinds that touch the store.
     /// A program end reads its output (roots unchanged) so it claims them too,
-    /// and so does a recur site's `Start`, which reads its source. Every other
-    /// sequence boundary has none.
+    /// and so does a recur site's `RecurStart`, which reads its source.
+    /// Sequence boundaries have none.
     pub fn storage_roots(&self) -> Option<&StorageRoots> {
         match &self.kind {
             StepKind::Exec(exec) => Some(&exec.storage),
             StepKind::ProgramStart(program_start) => Some(&program_start.storage),
             StepKind::ProgramEnd(program_end) => Some(&program_end.storage),
-            StepKind::SequenceStart { storage, .. } => storage.as_ref(),
-            StepKind::SequenceEnd { .. } => None,
+            StepKind::RecurStart(start) => Some(&start.storage),
+            StepKind::RecurEnd(end) => Some(&end.storage),
+            StepKind::SequenceStart { .. } | StepKind::SequenceEnd { .. } => None,
         }
     }
 
@@ -606,10 +642,19 @@ impl StepRecord {
     /// mechanism other than a direct byte-witness comparison: a replay proof
     /// for a tile, the authorization journal for a program start, or a
     /// storage selection proof for a program end.
+    ///
+    /// A `RecurEnd` counts as one because it did before as `Exec(RecurTile)`:
+    /// its output is the site's object, which the frame's draft entry (or the
+    /// D5b state commitment) binds in `incremental-draft-materialization`'s
+    /// batch C. Until then nothing compares it — the gap
+    /// `tile-output-commitment-unbound` records.
     pub fn is_execution_step(&self) -> bool {
         matches!(
             self.kind,
-            StepKind::Exec(_) | StepKind::ProgramStart(_) | StepKind::ProgramEnd(_)
+            StepKind::Exec(_)
+                | StepKind::ProgramStart(_)
+                | StepKind::ProgramEnd(_)
+                | StepKind::RecurEnd(_)
         )
     }
 
@@ -619,7 +664,10 @@ impl StepRecord {
     /// necessary because `ProgramStart` (append) and `ProgramEnd` (read-only)
     /// share coordinates `[]` and thus a witness-store entry.
     pub fn appends_to_storage(&self) -> bool {
-        matches!(self.kind, StepKind::Exec(_) | StepKind::ProgramStart(_))
+        matches!(
+            self.kind,
+            StepKind::Exec(_) | StepKind::ProgramStart(_) | StepKind::RecurEnd(_)
+        )
     }
 
     pub fn requires_replay_proof(&self) -> bool {
@@ -1079,8 +1127,21 @@ mod payload_rule_tests {
         StepKind::SequenceStart {
             input_commitment: Vec::new(),
             input_source_commitment: Vec::new(),
-            storage: None,
         }
+    }
+
+    fn recur_start_kind() -> StepKind {
+        StepKind::RecurStart(RecurStartStep {
+            site_id: "site".to_string(),
+            input_commitment: Vec::new(),
+            input_source_commitment: Vec::new(),
+            storage: StorageRoots {
+                root_before: Vec::new(),
+                root_after: Vec::new(),
+                index_root_before: Vec::new(),
+                index_root_after: Vec::new(),
+            },
+        })
     }
 
     fn binding(name: &str, path: SelectorPath) -> (StorageBindingName, StorageData) {
@@ -1098,13 +1159,6 @@ mod payload_rule_tests {
         )
     }
 
-    fn recur_site_close_kind(target: ExecTarget) -> StepKind {
-        let StepKind::Exec(mut exec) = exec_kind() else {
-            unreachable!()
-        };
-        exec.target = target;
-        StepKind::Exec(exec)
-    }
 
     #[test]
     fn a_tile_step_always_needs_the_payload() {
@@ -1115,23 +1169,27 @@ mod payload_rule_tests {
     }
 
     #[test]
-    fn a_recur_site_close_step_forwards_rather_than_consumes() {
-        // `ExecTarget::RecurTile` / `RecurSequence` mark the step that closes a
-        // recur site. It executes nothing and only holds the site's arguments,
-        // so keying on `StepKind::Exec` alone wrongly demanded their payloads.
-        let storage: StorageInput = [binding("merge_buckets", SelectorPath::default())]
-            .into_iter()
-            .collect();
-        for target in [
-            ExecTarget::RecurSequence("seq".to_string()),
-            ExecTarget::RecurTile("tile".to_string()),
-        ] {
-            assert!(!binding_requires_payload(
-                &recur_site_close_kind(target),
-                "merge_buckets",
-                &storage
-            ));
-        }
+    fn a_recur_site_start_forwards_its_arguments_but_reads_its_source() {
+        // A site's `RecurStart` executes nothing: an argument it only holds
+        // for the iterations is forwarded as a reference (a forwarded 106 MB
+        // `List<MergeBucket>` is why), while its `"input"` — the source whose
+        // metadata gives `L` — needs its payload.
+        let storage: StorageInput = [
+            binding("merge_buckets", SelectorPath::default()),
+            binding(RECUR_SOURCE_BINDING, SelectorPath::default()),
+        ]
+        .into_iter()
+        .collect();
+        assert!(!binding_requires_payload(
+            &recur_start_kind(),
+            "merge_buckets",
+            &storage
+        ));
+        assert!(binding_requires_payload(
+            &recur_start_kind(),
+            RECUR_SOURCE_BINDING,
+            &storage
+        ));
     }
 
     #[test]
@@ -1143,7 +1201,7 @@ mod payload_rule_tests {
             .into_iter()
             .collect();
         assert!(binding_requires_payload(
-            &recur_site_close_kind(ExecTarget::Tile("tile".to_string())),
+            &exec_kind(),
             "arg",
             &storage
         ));

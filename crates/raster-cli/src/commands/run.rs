@@ -368,9 +368,9 @@ fn step_coordinate_label(kind: &StepKind) -> &'static str {
         StepKind::SequenceStart { .. } | StepKind::SequenceEnd { .. } => "sequence_coordinates",
         StepKind::Exec(exec) => match exec.target {
             ExecTarget::Tile(_) => "tile_coordinates",
-            ExecTarget::RecurTile(_) => "recur_tile_coordinates",
-            ExecTarget::RecurSequence(_) => "recur_sequence_coordinates",
         },
+        StepKind::RecurStart(_) => "recur_site_coordinates",
+        StepKind::RecurEnd(_) => "recur_site_close_coordinates",
     }
 }
 
@@ -378,8 +378,10 @@ fn step_coordinate_label(kind: &StepKind) -> &'static str {
 fn step_target_id(kind: &StepKind) -> Option<&str> {
     match kind {
         StepKind::Exec(exec) => Some(match &exec.target {
-            ExecTarget::Tile(id) | ExecTarget::RecurTile(id) | ExecTarget::RecurSequence(id) => id,
+            ExecTarget::Tile(id) => id,
         }),
+        StepKind::RecurStart(start) => Some(&start.site_id),
+        StepKind::RecurEnd(end) => Some(&end.site_id),
         _ => None,
     }
 }

@@ -167,37 +167,29 @@ fn record_matches_item(step_record: &StepRecord, cfs_item: &SequenceChildItem) -
             }),
             SequenceChildItem::Tile(item),
         ) => name == &item.id,
-        (
-            StepKind::Exec(ExecStep {
-                target: ExecTarget::RecurTile(name),
-                ..
-            }),
-            SequenceChildItem::RecurTile(item),
-        ) => name == &item.id,
-        (
-            StepKind::Exec(ExecStep {
-                target: ExecTarget::RecurSequence(name),
-                ..
-            }),
-            SequenceChildItem::RecurSequence(item),
-        ) => name == &item.id,
-        // A nested sequence is entered and left at its own item coordinate,
-        // whether it is an ordinary or a recur sequence. The entered
-        // sequence's name is carried on the step record.
-        (
-            StepKind::SequenceStart { .. } | StepKind::SequenceEnd { .. },
-            SequenceChildItem::Sequence(item),
-        ) => step_record.sequence_id == item.id,
-        (
-            StepKind::SequenceStart { .. } | StepKind::SequenceEnd { .. },
-            SequenceChildItem::RecurSequence(item),
-        ) => step_record.sequence_id == item.id,
-        // A recur *tile* site opens with a boundary step too: `RecurTileStart`
-        // becomes `SequenceStart` at `[s]`, carrying the site's own id so it
-        // binds to the item the same way a sequence's boundary steps do. Its
-        // `End` half stays `Exec(RecurTile)`, matched above.
-        (StepKind::SequenceStart { .. }, SequenceChildItem::RecurTile(item)) => {
-            step_record.sequence_id == item.id
+        // A nested sequence is entered and left at its own item coordinate
+        // (`[s]` / `[-s]`). The entered sequence's name is carried on the
+        // step record. A recur-sequence *iteration*'s boundary steps never
+        // reach this match: iterations return before it.
+        (StepKind::SequenceStart { .. }, SequenceChildItem::Sequence(item)) => {
+            !step_record.coordinates().is_closing() && step_record.sequence_id == item.id
+        }
+        (StepKind::SequenceEnd { .. }, SequenceChildItem::Sequence(item)) => {
+            step_record.coordinates().is_closing() && step_record.sequence_id == item.id
+        }
+        // A recur site opens with `RecurStart` at `[s]` and closes with
+        // `RecurEnd` at `[-s]`, whichever family the CFS item is.
+        (StepKind::RecurStart(start), SequenceChildItem::RecurTile(item)) => {
+            !step_record.coordinates().is_closing() && start.site_id == item.id
+        }
+        (StepKind::RecurStart(start), SequenceChildItem::RecurSequence(item)) => {
+            !step_record.coordinates().is_closing() && start.site_id == item.id
+        }
+        (StepKind::RecurEnd(end), SequenceChildItem::RecurTile(item)) => {
+            step_record.coordinates().is_closing() && end.site_id == item.id
+        }
+        (StepKind::RecurEnd(end), SequenceChildItem::RecurSequence(item)) => {
+            step_record.coordinates().is_closing() && end.site_id == item.id
         }
         _ => false,
     }
@@ -314,7 +306,10 @@ pub fn verify_step_record_inputs(
     //
     // Placed after `record_matches_item` so the step is still held to the CFS
     // item at its coordinates; only the input-binding half is skipped.
-    if matches!(step_record.kind, StepKind::SequenceEnd { .. }) {
+    if matches!(
+        step_record.kind,
+        StepKind::SequenceEnd { .. } | StepKind::RecurEnd(_)
+    ) {
         return;
     }
 
@@ -450,9 +445,10 @@ fn declared_sequence_id<'a>(
     match cfs_cursor.try_get_item(coordinates)? {
         SequenceChildItem::Sequence(item) => Some(item.id.as_str()),
         SequenceChildItem::RecurSequence(item) => Some(item.id.as_str()),
-        SequenceChildItem::RecurTile(item) => Some(item.id.as_str()),
-        // A tile is not a frame, so no boundary step can sit at one.
-        SequenceChildItem::Tile(_) => None,
+        // A tile is not a frame, and a recur tile pushes none, so no sequence
+        // boundary step can sit at either; a recur site opens and closes with
+        // `RecurStart`/`RecurEnd`, which name their enclosing sequence.
+        SequenceChildItem::Tile(_) | SequenceChildItem::RecurTile(_) => None,
     }
 }
 
@@ -514,9 +510,11 @@ pub fn verify_sequence_id(cfs_cursor: &CfsCursor, step_record: &StepRecord) {
                 )
             })
         }
-        StepKind::Exec(_) | StepKind::ProgramStart(_) | StepKind::ProgramEnd(_) => {
-            enclosing_sequence_id(cfs_cursor, coordinates)
-        }
+        StepKind::Exec(_)
+        | StepKind::ProgramStart(_)
+        | StepKind::ProgramEnd(_)
+        | StepKind::RecurStart(_)
+        | StepKind::RecurEnd(_) => enclosing_sequence_id(cfs_cursor, coordinates),
     };
 
     assert_eq!(
@@ -601,10 +599,11 @@ pub fn verify_sequence_scope_parent(
     trace_root: &[u8],
 ) {
     let coordinates = step_record.coordinates();
-    // The program boundaries bind no CFS inputs, and a recur iteration's inputs
-    // are checked by the chunking rules instead — both mirror the guards in
-    // `verify_step_record_inputs`.
-    if coordinates.is_empty()
+    // The program boundaries and every close bind no CFS inputs, and a recur
+    // iteration's inputs are checked by the chunking rules instead — both
+    // mirror the guards in `verify_step_record_inputs`.
+    if step_record.input_source_commitment().is_none()
+        || coordinates.is_empty()
         || cfs_cursor
             .try_get_recur_iteration_coordinates(coordinates)
             .is_some()
@@ -902,6 +901,8 @@ pub fn get_next_expected_coordinates(
                 StepKind::SequenceStart { .. } => "SequenceStart",
                 StepKind::SequenceEnd { .. } => "SequenceEnd",
                 StepKind::Exec(_) => "Exec",
+                StepKind::RecurStart(_) => "RecurStart",
+                StepKind::RecurEnd(_) => "RecurEnd",
             },
             current_expected_coordinates,
         );
@@ -1115,34 +1116,6 @@ fn recur_sequence_item_selection<'a>(
     (item, item_witness)
 }
 
-/// A `SequenceStart` claims storage roots exactly when it opens a recur site.
-///
-/// The site `Start` must (checked where its frame opens); every other sequence
-/// boundary must not, so the field cannot turn an ordinary boundary into a
-/// storage step — which would make its forwarded bindings carry reads the
-/// prover chose to add.
-fn assert_sequence_start_storage(cfs_cursor: &CfsCursor, step_record: &StepRecord) {
-    let StepKind::SequenceStart {
-        storage: Some(_), ..
-    } = &step_record.kind
-    else {
-        return;
-    };
-    let coordinates = step_record.coordinates();
-    let opens_recur_site = cfs_cursor
-        .try_get_recur_iteration_coordinates(coordinates)
-        .is_none()
-        && matches!(
-            cfs_cursor.try_get_item(coordinates),
-            Some(SequenceChildItem::RecurTile(_) | SequenceChildItem::RecurSequence(_))
-        );
-    assert!(
-        opens_recur_site,
-        "Only a recur site start may claim storage roots: {:?}",
-        step_record,
-    );
-}
-
 /// Whether a recur site's own output is its carried state, from the CFS.
 fn site_state_is_output(item: &SequenceChildItem) -> bool {
     match item {
@@ -1162,7 +1135,6 @@ pub fn advance_recur_progress(
     storage_selection_witnesses: &BTreeMap<String, SelectionWitness>,
 ) {
     let coordinates = step_record.coordinates();
-    assert_sequence_start_storage(cfs_cursor, step_record);
 
     if let Some((site_coordinates, iteration_index)) =
         cfs_cursor.try_get_recur_iteration_coordinates(coordinates)
@@ -1304,16 +1276,11 @@ pub fn advance_recur_progress(
         };
         if let Some(kind) = kind {
             match &step_record.kind {
-                // `Start`: open the frame with the authenticated `L`.
-                StepKind::SequenceStart { .. } => {
-                    // The read that authenticates `L`: with roots claimed,
-                    // `checks::store` reads the source object from the store
-                    // and folds its metadata witness, in this same step.
-                    assert!(
-                        step_record.storage_roots().is_some(),
-                        "Recur site start {:?} must read its source from storage",
-                        step_record,
-                    );
+                // `RecurStart`: open the frame with the authenticated `L`. The
+                // kind carries read-only storage roots, so `checks::store`
+                // reads the source object and folds its metadata witness in
+                // this same step.
+                StepKind::RecurStart(_) => {
                     let chunk = match item {
                         SequenceChildItem::RecurTile(tile) => tile.chunk.unwrap_or(1),
                         _ => 1,
@@ -1340,8 +1307,9 @@ pub fn advance_recur_progress(
                 }
                 // `End`: the terminal rules — 5 and 7 for a tile site, S4 for a
                 // sequence site.
-                StepKind::Exec(_) => {
-                    if let Err(violation) = progress.close_site(coordinates) {
+                // The frame is keyed by the site `[s]`; the close sits at `[-s]`.
+                StepKind::RecurEnd(_) => {
+                    if let Err(violation) = progress.close_site(&coordinates.opened()) {
                         panic!(
                             "Recur progress violation at step {:?}: {}",
                             step_record, violation

@@ -67,30 +67,28 @@ impl std::str::FromStr for FraudTarget {
     }
 }
 
-/// What ran at a step, for the listing and for `tile:` matching.
-fn exec_target_name(target: &ExecTarget) -> &str {
-    match target {
-        ExecTarget::Tile(id) | ExecTarget::RecurTile(id) => id,
-        ExecTarget::RecurSequence(id) => id,
+/// What a corruptible step is, for the listing and for `tile:` matching: a
+/// tile run, or a recur site's close (whose output is the site's object).
+fn step_target(kind: &StepKind) -> Option<(&'static str, &str)> {
+    match kind {
+        StepKind::Exec(exec) => match &exec.target {
+            ExecTarget::Tile(id) => Some(("tile", id)),
+        },
+        StepKind::RecurEnd(end) => Some(("recur-site", &end.site_id)),
+        _ => None,
     }
 }
 
-fn exec_target_kind(target: &ExecTarget) -> &'static str {
-    match target {
-        ExecTarget::Tile(_) => "tile",
-        ExecTarget::RecurTile(_) => "recur-tile",
-        ExecTarget::RecurSequence(_) => "recur-seq",
-    }
-}
-
-/// Steps worth corrupting: a sequence boundary or a program start has no
-/// replayed output to contradict.
+/// Steps worth corrupting: a tile run with an input, or a recur site's close.
+/// A sequence boundary or a program start has no output to contradict.
 fn eligible_fraud_steps(trace: &Trace) -> Vec<usize> {
     trace
         .iter()
         .enumerate()
-        .filter(|(_, step_record)| {
-            matches!(&step_record.kind, StepKind::Exec(exec) if !exec.input_commitment.is_empty())
+        .filter(|(_, step_record)| match &step_record.kind {
+            StepKind::Exec(exec) => !exec.input_commitment.is_empty(),
+            StepKind::RecurEnd(_) => true,
+            _ => false,
         })
         .map(|(position, _)| position)
         .collect()
@@ -105,16 +103,12 @@ fn print_eligible_fraud_steps(trace: &Trace, eligible: &[usize]) {
     );
     for (index, position) in eligible.iter().enumerate() {
         let step_record = &trace[*position];
-        let StepKind::Exec(exec) = &step_record.kind else {
+        let Some((kind, name)) = step_target(&step_record.kind) else {
             continue;
         };
         println!(
             "  {:>5}  {:>10}  {:>10}  {:<24}  {:?}",
-            index,
-            step_record.exec_index,
-            exec_target_kind(&exec.target),
-            exec_target_name(&exec.target),
-            step_record.coordinates,
+            index, step_record.exec_index, kind, name, step_record.coordinates,
         );
     }
     println!();
@@ -144,9 +138,8 @@ fn resolve_fraud_step(trace: &Trace, eligible: &[usize], target: &FraudTarget) -
         FraudTarget::Named(name) => eligible
             .iter()
             .copied()
-            .find(|position| match &trace[*position].kind {
-                StepKind::Exec(exec) => exec_target_name(&exec.target) == name,
-                _ => false,
+            .find(|position| {
+                step_target(&trace[*position].kind).is_some_and(|(_, target)| target == name)
             })
             .ok_or_else(|| {
                 Error::Other(format!(
@@ -198,17 +191,14 @@ pub fn fraud(
 
     let exec_index = trace[position].exec_index;
     let coordinates = trace[position].coordinates.clone();
-    let (kind, name) = match &trace[position].kind {
-        StepKind::Exec(exec) => (
-            exec_target_kind(&exec.target),
-            exec_target_name(&exec.target).to_string(),
-        ),
-        _ => unreachable!("eligible steps are Exec steps"),
-    };
+    let (kind, name) = step_target(&trace[position].kind)
+        .map(|(kind, name)| (kind, name.to_string()))
+        .expect("eligible steps are tile runs or site closes");
 
     match &mut trace[position].kind {
         StepKind::Exec(exec) => exec.output_commitment = vec![0u8, 1u8],
-        _ => unreachable!("eligible steps are Exec steps"),
+        StepKind::RecurEnd(end) => end.output_commitment = vec![0u8, 1u8],
+        _ => unreachable!("eligible steps are tile runs or site closes"),
     }
 
     println!();
