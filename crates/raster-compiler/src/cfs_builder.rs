@@ -3,7 +3,7 @@
 //! This module orchestrates the generation of a CFS from a Raster project
 //! by combining tile discovery, sequence discovery, and data flow resolution.
 
-use raster_core::cfs::{ControlFlowSchema, InputBinding, SequenceDef, SequenceReturn, TileDef};
+use raster_core::cfs::{ControlFlowSchema, InputBinding, SequenceDef, SequenceReturn, TileDef, SequenceChildItem};
 
 use crate::flow_resolver::FlowResolver;
 use crate::sequence::{Sequence, SequenceDiscovery};
@@ -46,7 +46,8 @@ impl<'a> CfsBuilder<'a> {
         // Build sequence definitions with resolved data flow
         let mut sequences = Vec::new();
         for seq in &sequence_discovery.sequences {
-            let seq_def = self.build_sequence_def(seq)?;
+            let mut seq_def = self.build_sequence_def(seq)?;
+            self.fill_site_output_schemas(&mut seq_def)?;
             sequences.push(seq_def);
         }
 
@@ -69,6 +70,56 @@ impl<'a> CfsBuilder<'a> {
             tiles,
             sequences,
         })
+    }
+
+    /// Fill each recur site's [`RecurOutputDecl`] with its output type's
+    /// schema hash and empty root (D1 of `incremental-draft-materialization`):
+    /// the object a site owns is declared by the program, not chosen by the
+    /// prover.
+    ///
+    /// The type comes from the site's own signature — the `RecurOutput<S>`
+    /// parameter of a recur tile, the `RecurSequenceOutput<S>` parameter of a
+    /// recur sequence — and is resolved by the same `schema_walk` that fills
+    /// the program interface's schema hashes.
+    fn fill_site_output_schemas(&self, sequence: &mut SequenceDef) -> Result<()> {
+        for item in &mut sequence.items {
+            let (id, output, wrapper) = match item {
+                SequenceChildItem::RecurTile(item) => (&item.id, &mut item.output, "RecurOutput"),
+                SequenceChildItem::RecurSequence(item) => {
+                    (&item.id, &mut item.output, "RecurSequenceOutput")
+                }
+                _ => continue,
+            };
+            let Some(declaration) = output.as_mut() else {
+                continue;
+            };
+            let function = self
+                .project
+                .ast
+                .functions
+                .iter()
+                .find(|function| &function.name == id)
+                .ok_or_else(|| {
+                    Error::Other(format!("Recur site '{id}' has no function to read its output type from"))
+                })?;
+            let output_type = function
+                .inputs
+                .iter()
+                .find_map(|ty| generic_inner(ty, wrapper))
+                .ok_or_else(|| {
+                    Error::Other(format!(
+                        "Recur site '{id}' has an `output` but no `{wrapper}<S>` parameter"
+                    ))
+                })?;
+            let schema =
+                crate::schema_walk::schema_of_type(&output_type, &self.project.ast.structs)?;
+            declaration.schema_hash = raster_core::draft::schema_hash(&schema);
+            declaration.empty_root = raster_core::draft::draft_root_from_field_roots(
+                &schema,
+                &std::collections::BTreeMap::new(),
+            )?;
+        }
+        Ok(())
     }
 
     /// Build a sequence definition from a discovered sequence.
@@ -334,7 +385,7 @@ mod tests {
                 }],
                 call_kind: CallKind::Tile,
                 chunk: None,
-                leaves_output_open: false,
+                output: None,
                 state_is_output: false,
             }],
         );
@@ -398,7 +449,7 @@ mod tests {
                     argument_kinds: vec![CallArgumentKind::Inline],
                     call_kind: CallKind::Tile,
                     chunk: None,
-                    leaves_output_open: false,
+                    output: None,
                     state_is_output: false,
                 }],
             );
@@ -508,7 +559,7 @@ mod tests {
                 argument_kinds: vec![CallArgumentKind::Inline],
                 call_kind: CallKind::Tile,
                 chunk: None,
-                leaves_output_open: false,
+                output: None,
                 state_is_output: false,
             }],
         );
@@ -532,4 +583,19 @@ mod tests {
         assert_eq!(seq_def.items.len(), 1, "just the one tile item");
         assert!(matches!(seq_def.items[0], SequenceChildItem::Tile(_)));
     }
+}
+
+/// `S` out of a parameter type `wrapper<S>`, as the AST prints it
+/// (`RecurOutput < CollectiveGreeting >`), including a path-qualified wrapper
+/// (`raster :: RecurOutput < S >`).
+fn generic_inner(ty: &str, wrapper: &str) -> Option<String> {
+    let compact: String = ty.chars().filter(|c| !c.is_whitespace()).collect();
+    let start = compact.find(&format!("{wrapper}<"))?;
+    let preceding = compact[..start].chars().last();
+    if preceding.is_some_and(|c| c.is_alphanumeric() || c == '_') {
+        return None;
+    }
+    let inner = &compact[start + wrapper.len() + 1..];
+    let inner = inner.strip_suffix('>')?;
+    Some(inner.to_string())
 }

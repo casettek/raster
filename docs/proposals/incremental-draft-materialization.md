@@ -423,6 +423,17 @@ convention:
 > **A `Draft<S>` exists only inside a recur site, between its `Start` and its `End`. No step
 > boundary ever carries one.** Values cross between steps; ops live inside a tile.
 
+> **Amended 2026-10-01 (batch B): a draft may also live inside one plain tile.** The replacement
+> below — "a plain tile returns an ordinary value" — cannot compile: `bounded-collections` makes a
+> struct with a `List` field non-`Materializable`, so no tile may return it. Instead a plain tile
+> may create a draft with `Draft::<S>::new()`, populate it, and **return** it; the tile's close
+> completes it into an `S` stored at the tile's own coordinate, and the caller receives that
+> object. Nothing open crosses the boundary — the rule above still holds for every step boundary.
+> What makes a `List`-bearing tile output acceptable is the **draft budget**
+> (`DRAFT_STEP_BUDGET`, 64 KiB of `set`/`push` payload per tile run, times the consumed elements
+> of a chunked iteration), enforced by the shared `Draft` code in the native run and the replay.
+> A recur site continues such an object by derivation (`output = base`), as below.
+
 > **Amended 2026-09-28 for recur sequences (D5a): the boundary is the *site's*, not every step's.**
 > A recur sequence's body is ordinary sequence code that hands the site's draft to plain tiles
 > (`append_activation_row(output: Draft<ActivationSequence>, …) -> Draft<…>` in `raster-inference`'s
@@ -1789,7 +1800,7 @@ they break; the same table is in that proposal's §Order.
 | batch | contents | breaks |
 | --- | --- | --- |
 | **A — trace shape** | `RecurStart`/`RecurEnd` step kinds, site closes at `[-s]`, `ExecTarget::RecurTile`/`RecurSequence` removed; D4 (nested `SequenceEnd` at `[-s]`); `RecurStartStep.storage` (read-only) takes over the interim `SequenceStart.storage` (landed 2026-09-30), which is removed again; site-ordering checks | trace shape, transition guest; **done 2026-09-30** — moves the image ids of tiles that link the edited code (see below) |
-| **B — language and object ownership** | §One storage rule and §The restriction: `new!`/`finalize`/`finalize = false` removed, a site owns its object at `[s]` (creates, or derives with `output = base`), plain tiles return values, `DRAFT_NAMESPACE` deleted, host anchor `anchor_for_schema([s], S)`; D1b (`RecurOutputDecl` in the CFS via `schema_walk`); programs rewritten (`examples/`, `crates/raster/tests`, `raster-inference`) | CFS, programs, `program_commitment` |
+| **B — language and object ownership** (**done 2026-10-01**) | §One storage rule and §The restriction: `new!`/`finalize`/`finalize = false` removed, a site owns its object at `[s]` (creates, or derives with `output = base`), plain tiles return values, `DRAFT_NAMESPACE` deleted, host anchor `anchor_for_schema([s], S)`; D1b (`RecurOutputDecl` in the CFS via `schema_walk`); programs rewritten (`examples/`, `crates/raster/tests`, `raster-inference`) | CFS, programs, `program_commitment` |
 | **C — tile journal** (one tile-image-id break) | D3 (recur iterations publish no output; an `Exec` with no write has an empty `output_commitment`); D2 (`draft_id` removed); D1a (replay tile asserts its schema); D5b (replayed state as raster roots, recur-sequence state by reference); **`tile-io-structural-roots` step 2** (`output_root`, `input_roots`); guest: the frame's draft entry replaces `active_drafts`, `RecurEnd` writes exactly one object | every tile image id, `program_commitment` |
 | **D — materialization** | `DraftBuffer`, one seal for store and `RecurEnd` output, `rindex04` relative offsets, derivation sharing (`Derived` backing, delta output) | `.rindex` format; no guest or tile change |
 | **E — verification** | both proposals' Verification lists; `tile-io-structural-roots` step 3; GPU proving; all locks, `raster-inference` included | — |
@@ -1846,6 +1857,47 @@ first, on one rewritten recur site in `hello-tiles`.
   one ending at `ProgramEnd` (`97:4`) all prove. `35:4` fails on the pre-existing
   [`sequence-scope-forbids-narrowing`](../issues/sequence-scope-forbids-narrowing.md)
   (`personal_greet_seq` selects into its parameter).
+
+**Batch B — done 2026-10-01** (language and object ownership; this repository — `raster-inference`
+is a separate follow-up).
+
+- **Language.** `new!`, `finalize`, `finalize = false`, `new_draft` and the six `run_recur_*_open`
+  drivers are gone. `call_recur!`/`call_recur_seq!` take bare `output` (the site **creates** its
+  object) or `output = base` (it **derives** from a stored object). A site's entry point receives
+  `SiteOutput<S>`; a derived base is traced as a **storage** binding of `RecurStart`, so batch A's
+  read authenticates it.
+- **Tile-local drafts** (the amendment to §The restriction). `Draft::<S>::new()` (refused outside a
+  tile); a tile returning a draft it created — it takes no draft — is completed by the `#[tile]`
+  wrapper into its `S` output, native and replay alike, via `draft_tree_from_fields` and the value
+  decoder now shared in `raster_core::tree`. A tile that *receives* a draft (a recur-sequence body
+  tile) returns it to its site as before.
+- **Derivation.** `derive_site_draft` rebuilds the draft from the base's value — set-once fields
+  written, list fields with their elements and frontier — and asserts its root equals the base's
+  commitment. Push-only falls out: a second write to a set-once field is refused. `[k]` is never
+  modified; `[s]` is a new object. (Rebuilding re-hashes the base's elements; batch D reads the
+  frontier from the stored index instead.)
+- **Draft identity.** `anchor_for_schema([s], S)`; drafts complete only at their site's
+  coordinate. The synthetic namespace survives **only** for the fixture helper `store_value`, which
+  no program path reaches — a deviation from "`DRAFT_NAMESPACE` is deleted", kept to avoid
+  rewriting ~30 test fixtures.
+- **D1b.** `RecurOutputDecl { schema_hash, empty_root, derives }` on both recur item kinds, filled
+  by `CfsBuilder::fill_site_output_schemas` from the site's `RecurOutput<S>` /
+  `RecurSequenceOutput<S>` parameter via `schema_walk`. Checked on `hello-tiles`: create sites
+  `derives = false`, the recur sequence `derives = true`, the state-only site none. Not yet
+  checked: `schema_walk`'s hash equals the derive's `S::schema_hash()` — needed by batch C.
+- **Draft budget.** `DRAFT_STEP_BUDGET` = 64 KiB per consumed element, `DRAFT_OP_CHARGE` = 64 bytes
+  per op, reset per tile run by the wrapper. Measured: `hello-tiles` peaks at 327 bytes per run;
+  `raster-inference`'s widest per-element write is a 1536-wide `ActivationRow`, ~6 KiB.
+- **Programs.** `hello-tiles`: the three-tile draft chain is one creating tile; the recur sequence
+  derives from a tile-built base. `chain-example/phase3-report`: one creating tile builds the report
+  (`authenticated-chain-draft-output`'s reproducer). Create sites use bare `output`.
+- **Verified.** Suites green (core 169, compiler 44, runtime 67, `raster` incl. new tests for
+  creating tiles, the budget, derivation and `Draft::new` outside a tile, guest 129). `hello-tiles`
+  commit + honest audit. Dev-mode fraud windows over the creating tiles `[6]`, `[12]`, a consumer
+  of `[6]`, create sites `[9]`, `[10]` and their closes, and the derive site `[13]` — **its windows
+  were blocked before batch B** — all prove; a negative control fails at `[13]`'s `RecurStart`
+  reading its base. Guest unchanged in this batch: a derived site's first `root_before` is still
+  adopted (`active_drafts`); batch C anchors it.
 
 ## Costs
 

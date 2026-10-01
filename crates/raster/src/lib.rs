@@ -36,18 +36,16 @@ pub fn auth_mode() -> AuthMode {
 pub mod input;
 pub use input::{
     __raster_clone, attach_index_bindings, auth_ref_result_trace, auth_ref_trace,
-    draft_replay_handle, draft_replay_transition, entry_argument_auth_ref, finalize,
+    complete_tile_draft, draft_replay_handle, draft_replay_transition, entry_argument_auth_ref,
+    open_site_draft,
     index_binding_name, into_auth_ref, into_auth_value, into_auth_value_with_bindings, into_draft,
-    materialize_auth_result, materialize_auth_return, new_draft, push_bound_index,
+    materialize_auth_result, materialize_auth_return, push_bound_index, site_output_trace,
     raster_trace_payload, resolve_storage_ok_value, resolve_storage_value,
     inline_index, is_storage_backed, restore_draft_from_replay_handle, run_recur_chunked_list,
     run_recur_chunked_list_state,
-    run_recur_chunked_list_open, run_recur_chunked_list_with_state,
-    run_recur_chunked_list_with_state_open, run_recur_list, run_recur_list_open,
-    run_recur_list_state,
-    run_recur_list_with_state, run_recur_list_with_state_open, run_recur_sequence_list,
-    run_recur_sequence_list_open, run_recur_sequence_list_state,
-    run_recur_sequence_list_with_state, run_recur_sequence_list_with_state_open,
+    run_recur_chunked_list_with_state, run_recur_list, run_recur_list_state,
+    run_recur_list_with_state, run_recur_sequence_list, run_recur_sequence_list_state,
+    run_recur_sequence_list_with_state,
     select_inline, select_source, select_stored_value,
     selector_path,
     serialize_draft_replay_handle, serialize_draft_trace, typed_selector_path, typed_storage,
@@ -59,6 +57,7 @@ pub use input::{
     IntoAuthValue, IntoDraft, IntoMaterialized, IntoRecurControl, List, ListProofDirection,
     ListProofSibling, Materializable, Op, RecurControl, RecurInput, RecurOutput,
     RecurSequenceInput, RecurSequenceOutput, RecurSequenceState, RecurState, Schema, SchemaField,
+    SiteOutput,
     SchemaFieldMode, SchemaNode, SelectSource, Selectable, SelectedPayload, SelectionCommitment,
     SelectionPayloadKind, SelectionProof, SelectionProofStep, SelectionWitness, SelectorPath,
     SelectorSegment, StorageRef, StorageValue, TypedSelectorPath, TypedStorageBinding,
@@ -631,12 +630,6 @@ macro_rules! storage {
     };
 }
 
-#[macro_export]
-macro_rules! new {
-    ($ty:ty) => {
-        $crate::new_draft::<$ty>()
-    };
-}
 
 /// A recur-sequence item as an authorized reference, without materializing it.
 ///
@@ -782,16 +775,16 @@ pub mod prelude {
 
     pub use crate::exec::Result;
     pub use crate::{
-        call, call_recur, call_recur_seq, call_seq, clone, finalize, into_auth_ref, into_draft,
+        call, call_recur, call_recur_seq, call_seq, clone, into_auth_ref, into_draft,
         into_ref,
-        materialize_auth_result, materialize_auth_return, new, select, sequence, storage, tile,
+        materialize_auth_result, materialize_auth_return, select, sequence, storage, tile,
         bytes_field_key, page_index_for_field, page_index_for_region, page_range_for_field,
         page_range_for_region, Anchor, AuthRef, AuthValue, Block, Bytes, BytesFieldPageSize,
         BytesPage, Draft, IndexSource, IndexWidth, IntoAuthRef, IntoAuthValue, IntoDraft, List,
         ListProofDirection, ListProofSibling, PageSized, RecurListSource,
         Materializable, Op,
         RecurControl, RecurInput, RecurOutput, RecurSequenceInput, RecurSequenceOutput,
-        RecurSequenceState, RecurState, Schema, SchemaField, SchemaFieldMode, SchemaNode,
+        RecurSequenceState, RecurState, Schema, SchemaField, SchemaFieldMode, SchemaNode, SiteOutput,
         SelectSource, Selectable, SelectedPayload, SelectionProof, SelectionProofStep,
         SelectorPath, SelectorSegment, StorageRef, StorageValue, TypedSelectorPath,
         TypedStorageBinding,

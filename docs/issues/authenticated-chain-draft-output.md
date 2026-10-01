@@ -1,6 +1,15 @@
 # Issue: `authenticated-chain-draft-output` — a finalized draft has no object in the recorder's storage replica
 
-Status: open 2026-08-27. Unowned. **Deterministic reproducer: `--fraud-step 22` on `examples/hello-tiles` (§Second reproducer).** **Scope widened 2026-09-18: not chain-specific, and not
+Status: **resolved 2026-10-01 by `incremental-draft-materialization` batch B** (opened
+2026-08-27). The synthetic draft coordinate no longer exists on any program path: a draft is
+completed at the coordinate of the tile or recur site that built it, where the replica holds it.
+Verified: `cargo raster chain run` (authenticated) on `examples/chain-example` completes all
+three stages; phase 3's report is stored at coordinate `2` (formerly `4294967295/1`) and the chain
+commitment is written. On `hello-tiles`, dev-mode fraud windows over every draft-producing step
+(creating tiles, create sites, the derive site and their closes) prove. The step-22 reproducer
+below refers to the pre-batch-B layout. Original text follows.
+
+Former status: open 2026-08-27. Unowned. **Deterministic reproducer: `--fraud-step 22` on `examples/hello-tiles` (§Second reproducer).** **Scope widened 2026-09-18: not chain-specific, and not
 specific to program outputs.** The name is kept so links stay valid; read it as *draft-object
 missing from the replica*. A second reproducer on `examples/hello-tiles` fails on the
 **fraud-proof** path, where the draft is a tile *input*, not a stage output.

@@ -72,43 +72,38 @@ Rules:
 - Select the smallest thing the consuming tile needs. Feeding blocks: one
   range selection → one `Block<T>` tile input beats N single-element selections.
 
-## 2. Drafts — multi-tile object construction
+## 2. Drafts — building objects inside a tile
 
-`Draft<T>` lets several tiles build one object with authenticated lineage.
-
-```rust
-let draft = new!(CollectiveGreeting);                       // empty draft
-let draft = call!(set_draft_greeting_title, "Title".to_string(), draft);
-let draft = call!(push_draft_greeting_line, "Line 1".to_string(), draft);
-let draft = call!(push_draft_greeting_line, "Line 2".to_string(), draft);
-let greeting = finalize(draft);                             // materialized T
-let title = select!(String, greeting.clone().title);        // select! from it
-```
-
-Tile side: take `Draft<T>` (position doesn't matter), mutate through set-once
-accessors, return it:
+A `Draft<T>` lives inside one tile. The tile creates it, populates it with
+set-once / append accessors, and returns it; the tile's close completes it into
+a `T` stored at the tile's own coordinate, and `call!` yields that object.
 
 ```rust
 #[tile(kind = iter)]
-pub fn set_draft_greeting_title(
-    title: String,
-    draft: Draft<CollectiveGreeting>,
-) -> Draft<CollectiveGreeting> {
-    let mut draft = draft;
-    draft.title().set(title);      // scalar field: set-once
-    draft
+pub fn build_greeting(title: String, first: String, second: String) -> Draft<CollectiveGreeting> {
+    let mut greeting = Draft::<CollectiveGreeting>::new();
+    greeting.title().set(title);       // scalar field: set-once
+    greeting.lines().push(first);      // list field: append-only
+    greeting.lines().push(second);
+    greeting
 }
-// list fields: draft.lines().push(value) — append-only
+
+let greeting = call!(build_greeting, "Title".to_string(), "Line 1".to_string(), "Line 2".to_string());
+let title = select!(String, greeting.clone().title);        // select! from it
 ```
 
-Hard rules (compile-time UI-tested):
+A recur site continues such an object with `output = greeting` (push-only), and
+writes the extended object at its own coordinate (`references/recur.md`).
 
-- Draft handles are **linear**: cloning one is a compile error; using a
-  binding again after passing it to a `call!` is a compile error. Rebind at
-  every step: `let draft = call!(step, ..., draft);`
-- Scalar fields are set-once — a second `.set()` fails at runtime.
-- `finalize(draft)` fails if required fields were never set (this is also why
-  empty recur inputs can fail output finalization).
+Hard rules:
+
+- `Draft::<T>::new()` only inside a tile (runtime-checked).
+- Draft handles are **linear**: cloning one is a compile error; reusing one
+  after passing it is a compile error.
+- Scalar fields are set-once — a second `.set()` fails at runtime; every
+  set-once field must be set before the tile returns.
+- The draft budget caps one tile run's draft writes (64 KiB per consumed
+  source element); exceeding it panics.
 
 ## 3. Entry arguments — `input.json` + `input_manifest.json`
 

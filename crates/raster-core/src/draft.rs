@@ -10,6 +10,27 @@ use crate::input::{AppendFrontier, Schema, SchemaField, SchemaFieldMode, SchemaN
 use crate::tree::{subtree_payload_and_root, tree_value_from_serialize, TreeValue};
 use crate::{Error, Result};
 
+/// Bytes of draft writes one tile run may make: the encoded payload of every
+/// `set` and `push`, plus [`DRAFT_OP_CHARGE`] per op. A recur iteration that
+/// consumes a chunk of `n` source elements gets `n` times this.
+///
+/// It is what bounds a replay unit's work when the unit builds a `List`-bearing
+/// object: `bounded-collections` forbids passing such an object whole, and this
+/// makes building one in a single step bounded instead. Enforced by the shared
+/// `Draft` code, so the tile replay enforces it too — pinned by the tile's image
+/// id.
+///
+/// Sized 2026-10-01: `hello-tiles` peaks at 327 bytes per run; the largest
+/// per-element write in `raster-inference` is an `ActivationRow` of the
+/// 1536-wide Gemma E2B model, ~6 KiB, plus KV/query/key entries of a few KiB per
+/// token. 64 KiB per element leaves several times that, and still fits
+/// 4096-wide rows. Re-measure when `raster-inference` moves to this API.
+pub const DRAFT_STEP_BUDGET: u64 = 64 * 1024;
+
+/// Fixed charge per draft op, on top of its payload: the frontier update and
+/// the op record.
+pub const DRAFT_OP_CHARGE: u64 = 64;
+
 pub type DraftId = [u8; 32];
 pub type DraftRoot = [u8; 32];
 

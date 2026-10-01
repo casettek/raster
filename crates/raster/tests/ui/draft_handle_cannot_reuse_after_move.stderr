@@ -1,7 +1,7 @@
 error[E0382]: use of moved value: `draft`
   --> tests/ui/draft_handle_cannot_reuse_after_move.rs:14:13
    |
-12 |     let draft = new!(Account);
+12 |     let draft = Draft::<Account>::new();
    |         ----- move occurs because `draft` has type `raster::Draft<Account>`, which does not implement the `Copy` trait
 13 |     consume(draft);
    |             ----- value moved here

@@ -1,22 +1,14 @@
 {
   "format": 1,
-  "program_commitment": "1696da7063d3d2652cad536c5eec7b32ba807346cfee5df58c59d00963d3c943",
+  "program_commitment": "a53e7e1c0b4423c629ff423b77fd977cd194e2d8f0f1263112c088ce0b82d13c",
   "tiles": {
+    "build_report": {
+      "image_id": "836ba9f65b4928d6da382a889f2b579d190e17915cf94707a3e63b61a299ce1b",
+      "source_hash": "d7d8653fcece18c10000000000000a76"
+    },
     "mean_scaled": {
-      "image_id": "28e32b2e9550eee8d4a3a00548cd9bc79d477054aa0a5cc4bd978ce720eb9a13",
-      "source_hash": "9513a10179eb73d80000000000000a80"
-    },
-    "push_mean": {
-      "image_id": "3dff1eb22252809cfff372a23c1d7aa815359b9564d9919c2f2ad7614aa91690",
-      "source_hash": "9513a10179eb73d80000000000000a80"
-    },
-    "push_metric": {
-      "image_id": "fb0629636da769c6d5bf0d9025d4a56264466d1d60191e36f2d466f44df137bd",
-      "source_hash": "9513a10179eb73d80000000000000a80"
-    },
-    "set_report_title": {
-      "image_id": "d7726bc87a0f0c8eddb361252fc25e85f81539cae3bdda16edbb398c5225fc56",
-      "source_hash": "9513a10179eb73d80000000000000a80"
+      "image_id": "3fa2145cc90371e1efcb543178462b787e8528ed24dadc4672cedd7e9baf13a0",
+      "source_hash": "d7d8653fcece18c10000000000000a76"
     }
   },
   "toolchain": {

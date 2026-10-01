@@ -145,7 +145,7 @@ real, meaningful item — a chunk, a row, a record, a block. If you find
 yourself building a `List<u32>` of round numbers to iterate over, stop: either
 the real collection should be the input (`input = data_blocks`, not
 `input = fake_round_numbers`), or what you want is a growing output — which
-is a draft (`output = new!(Output)` + append per item), not rounds.
+is a recur site building one object (`output` + append per item), not rounds.
 
 ### The committed counter list — a fake recur laundered through an entry argument
 
@@ -333,14 +333,14 @@ pub fn build_recur_draft_greeting(
 let greeting = call_recur!(
     tile = build_recur_draft_greeting,
     input = address_lines.clone(),
-    output = new!(CollectiveGreeting),
+    output,
     args = ("Recur-built greeting".to_string(),)
 );
 ```
 
 `RecurOutput<O>` is a draft handle: set-once accessors
 (`.field().set(v)`, `.list().push(v)`), linear (rebind every iteration —
-the macro-generated driver threads it for you). The site finalizes the draft
+the macro-generated driver threads it for you). The site completes the draft
 and binds the materialized `O`.
 
 ### Mode C — state + output
@@ -406,7 +406,7 @@ let limited = call_recur!(
     tile = build_limited_recur_greeting,
     input = address_lines,
     state = GreetingLimitState { seen: 0 },
-    output = new!(CollectiveGreeting),
+    output,
     args = ("State+output recur greeting".to_string(), 2)
 );
 ```
@@ -419,16 +419,21 @@ call_recur!(
     input  = <storage-backed list>,      // required
     chunk  = <integer literal>,          // optional — must be a literal (pinned in CFS)
     state  = <initial S expression>,     // required iff tile has RecurState
-    output = <new!(O) or draft handle>,  // required iff tile has RecurOutput
+    output [= <base>],                   // required iff tile has RecurOutput: bare `output`
+                                         // creates the object; `output = base` derives
+                                         // from a stored object (push-only)
     args   = (<extras>,)                 // required, LAST — () if none
 )
 ```
 
 - `state`/`output` presence must exactly match the tile's mode; the macro
-  rejects mismatches: ``call_recur! requires `state = ...` and/or `output = ...` ``.
+  rejects mismatches: ``call_recur! requires `state = ...` and/or `output` / `output = base` ``.
+- The site owns exactly one object, written at its own coordinate when the
+  sweep closes. A derived site's base is never modified — the result is a new
+  object: the base plus what the sweep appended.
 - `args = (...)` is always last; error otherwise:
   ``requires `state = ...` and/or `output = ...` before `args = (...)` ``.
-- The binding of the call is the finalized result: `S` (state-only), `O`
+- The binding of the call is the site's completed result: `S` (state-only), `O`
   (output-only), or the pair's materialized parts for state+output — select
   into it like any other value.
 
@@ -470,7 +475,7 @@ let chunked = call_recur!(
     tile = collect_line_chunk,
     input = address_lines,
     chunk = 2,                            // MUST be an integer literal
-    output = new!(CollectiveGreeting),
+    output,
     args = ("Chunked greeting".to_string(),)
 );
 ```
@@ -556,7 +561,7 @@ fn append_prefixed_line(output: Draft<LineBundle>, line: String) -> Draft<LineBu
 let bundle = call_recur_seq!(
     sequence = collect_prefixed_lines,
     input = storage!(List<String>, source),
-    output = output,                          // new!(T) or an already-threaded draft
+    output = base,                            // bare `output` creates; `= base` derives
     args = (prefix_arg,)
 );
 ```

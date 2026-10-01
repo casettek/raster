@@ -124,16 +124,33 @@ pub fn concat_messages(message1: String, message2: String) -> String {
     format!("{} {}", message1, message2)
 }
 
+/// A greeting with a title and two lines, drafted in this tile. Returning the
+/// draft completes it: the greeting is stored at this tile's coordinate, and the
+/// caller gets that object. Its two pushes are well inside the draft budget a
+/// tile run may spend.
 #[tile(kind = iter)]
-pub fn set_draft_greeting_title(
+pub fn build_greeting(
     title: String,
-    draft: Draft<CollectiveGreeting>,
+    first_line: String,
+    second_line: String,
 ) -> Draft<CollectiveGreeting> {
-    let mut draft = draft;
-    draft.title().set(title);
-    draft
+    let mut greeting = Draft::<CollectiveGreeting>::new();
+    greeting.title().set(title);
+    greeting.lines().push(first_line);
+    greeting.lines().push(second_line);
+    greeting
 }
 
+/// A titled greeting with no lines yet — the base a recur site derives from.
+#[tile(kind = iter)]
+pub fn begin_greeting(title: String) -> Draft<CollectiveGreeting> {
+    let mut greeting = Draft::<CollectiveGreeting>::new();
+    greeting.title().set(title);
+    greeting
+}
+
+/// Appends one line to the enclosing recur sequence's draft. Takes a `Draft`,
+/// which only a recur site's body can hand it.
 #[tile(kind = iter)]
 pub fn push_draft_greeting_line(
     line: String,

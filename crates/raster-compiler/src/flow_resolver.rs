@@ -13,6 +13,18 @@ use std::collections::{HashMap, HashSet};
 use crate::ast::{CallArgumentKind, CallInfo, CallKind, ReturnExpr};
 use crate::sequence::Sequence;
 
+/// The declaration a recur site's `output` produces, with its schema left for
+/// the CFS builder: it resolves the site's output type against the project's
+/// structs (`CfsBuilder::fill_site_output_schemas`), which the resolver does
+/// not hold.
+fn site_output_decl(output: Option<crate::ast::SiteOutputKind>) -> Option<raster_core::cfs::RecurOutputDecl> {
+    output.map(|kind| raster_core::cfs::RecurOutputDecl {
+        schema_hash: [0u8; 32],
+        empty_root: [0u8; 32],
+        derives: kind == crate::ast::SiteOutputKind::Derive,
+    })
+}
+
 /// Resolves data flow within a sequence, producing `SequenceItem`s with
 /// correctly bound input sources.
 #[derive(Default)]
@@ -129,7 +141,7 @@ impl FlowResolver {
                     id: call.callee.clone(),
                     sources: input_sources,
                     chunk: call.chunk,
-                    leaves_output_open: call.leaves_output_open,
+                    output: site_output_decl(call.output),
                     state_is_output: call.state_is_output,
                 }),
                 CallKind::RecursiveSequence => {
@@ -137,6 +149,7 @@ impl FlowResolver {
                         id: call.callee.clone(),
                         sources: input_sources,
                         state_is_output: call.state_is_output,
+                        output: site_output_decl(call.output),
                     })
                 }
                 CallKind::Sequence => SequenceChildItem::Sequence(SequenceItem {
@@ -454,7 +467,7 @@ mod tests {
                     }],
                     call_kind: CallKind::Tile,
                     chunk: None,
-                    leaves_output_open: false,
+                    output: None,
                     state_is_output: false,
                 },
                 CallInfo {
@@ -466,7 +479,7 @@ mod tests {
                     }],
                     call_kind: CallKind::Tile,
                     chunk: None,
-                    leaves_output_open: false,
+                    output: None,
                     state_is_output: false,
                 },
             ],
@@ -591,7 +604,7 @@ mod tests {
                 }],
                 call_kind: CallKind::Tile,
                 chunk: None,
-                leaves_output_open: false,
+                output: None,
                 state_is_output: false,
             }],
         );
@@ -672,7 +685,7 @@ mod tests {
                 argument_kinds: vec![CallArgumentKind::Inline],
                 call_kind: CallKind::Tile,
                 chunk: None,
-                leaves_output_open: false,
+                output: None,
                 state_is_output: false,
             }],
         );
@@ -737,7 +750,7 @@ mod tests {
                     }],
                     call_kind: CallKind::Tile,
                     chunk: None,
-                    leaves_output_open: false,
+                    output: None,
                     state_is_output: false,
                 },
                 CallInfo {
@@ -749,7 +762,7 @@ mod tests {
                     }],
                     call_kind: CallKind::Tile,
                     chunk: None,
-                    leaves_output_open: false,
+                    output: None,
                     state_is_output: false,
                 },
             ],
@@ -827,7 +840,7 @@ mod tests {
                 }],
                 call_kind: CallKind::Tile,
                 chunk: None,
-                leaves_output_open: false,
+                output: None,
                 state_is_output: false,
             }],
             vec![("name".to_string(), "personal_data".to_string())],
@@ -882,7 +895,7 @@ mod tests {
                 }],
                 call_kind: CallKind::Tile,
                 chunk: None,
-                leaves_output_open: false,
+                output: None,
                 state_is_output: false,
             }],
             vec![("seed".to_string(), "seed".to_string())],
@@ -931,7 +944,7 @@ mod tests {
                 argument_kinds: vec![CallArgumentKind::Inline],
                 call_kind: CallKind::Tile,
                 chunk: None,
-                leaves_output_open: false,
+                output: None,
                 state_is_output: false,
             }],
         );
@@ -991,7 +1004,7 @@ mod tests {
                 }],
                 call_kind: CallKind::Tile,
                 chunk: None,
-                leaves_output_open: false,
+                output: None,
                 state_is_output: false,
             }],
             vec![
@@ -1061,7 +1074,7 @@ mod tests {
                 }],
                 call_kind: CallKind::Tile,
                 chunk: None,
-                leaves_output_open: false,
+                output: None,
                 state_is_output: false,
             }],
             vec![("row".to_string(), "table".to_string())],

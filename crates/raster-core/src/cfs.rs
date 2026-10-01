@@ -946,10 +946,10 @@ pub struct RecurTileItem {
     /// shorter). `None` means per-element iteration.
     #[serde(default)]
     pub chunk: Option<u64>,
-    /// Whether this recur deliberately returns its output draft without
-    /// finalizing it. False is the historical/default behavior.
+    /// The object the site owns, when it has an `output`: see
+    /// [`RecurOutputDecl`]. `None` for a state-only site.
     #[serde(default)]
-    pub leaves_output_open: bool,
+    pub output: Option<RecurOutputDecl>,
     /// Whether the site's own output *is* its carried state — `state` with no
     /// `output`.
     ///
@@ -971,6 +971,32 @@ pub struct RecurSequenceItem {
     /// final state is anchored regardless, while a sequence's is not.
     #[serde(default)]
     pub state_is_output: bool,
+    /// See [`RecurTileItem::output`].
+    #[serde(default)]
+    pub output: Option<RecurOutputDecl>,
+}
+
+/// The object a recur site owns, declared by the program rather than chosen
+/// by the prover (`incremental-draft-materialization` §What must come from the
+/// CFS, D1).
+///
+/// A site either **creates** its object — it opens at `empty_root` — or
+/// **derives** it from a stored base passed as its `output` source, opening
+/// at the base's commitment and only appending. Either way the site closes by
+/// writing exactly that object at `[s]`. Computed by the compiler with
+/// `schema_walk` over the site's output type, so it is pinned in
+/// `program_commitment`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RecurOutputDecl {
+    /// `schema_hash(S::schema())` of the output type `S`.
+    pub schema_hash: [u8; 32],
+    /// The raster root of an `S` no field of which has been written: where a
+    /// creating site's draft opens, and what a zero-iteration creating site
+    /// must store.
+    pub empty_root: [u8; 32],
+    /// Whether the site derives from its `output` source (push-only) rather
+    /// than creating a new object.
+    pub derives: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1120,7 +1146,7 @@ mod tests {
                         id: "recur".to_string(),
                         sources: vec![],
                         chunk: None,
-                        leaves_output_open: false,
+                        output: None,
                         state_is_output: false,
                     }),
                     SequenceChildItem::Tile(TileItem {
@@ -1216,6 +1242,7 @@ mod tests {
                             id: "body".to_string(),
                             sources: vec![],
                             state_is_output: false,
+                            output: None,
                         }),
                         SequenceChildItem::Tile(TileItem {
                             id: "after".to_string(),
@@ -1238,7 +1265,7 @@ mod tests {
                             id: "chunked".to_string(),
                             sources: vec![],
                             chunk: Some(64),
-                            leaves_output_open: false,
+                            output: None,
                             state_is_output: false,
                         }),
                     ],
@@ -1471,6 +1498,7 @@ mod tests {
                             id: "rs".to_string(),
                             sources: vec![InputBinding::prior_item_output(0)],
                             state_is_output: false,
+                            output: None,
                         }),
                         call("noret", vec![InputBinding::prior_item_output(0)]),
                     ],

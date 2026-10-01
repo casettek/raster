@@ -1114,33 +1114,138 @@ pub fn exit_recur_sequence_iteration_scope() {
     });
 }
 
-pub fn create_draft<S>() -> Result<(Anchor, [u8; 32])>
+/// The site a recur site's draft belongs to: the innermost live recur site.
+///
+/// A draft exists only inside a recur site (`incremental-draft-materialization`
+/// §The restriction), so its identity is the site's own coordinate and schema —
+/// unique, because a site owns exactly one draft and no two live sites share
+/// `[s]` (§Draft identity). It is a host-side key only.
+fn site_draft_anchor<S: Schema>() -> Result<Anchor> {
+    let site = current_recur_site_coordinates().ok_or_else(|| {
+        Error::Other(format!(
+            "A draft of '{}' can only be opened by a recur site",
+            core::any::type_name::<S>()
+        ))
+    })?;
+    Ok(anchor_for_schema(&site, S::schema_hash()))
+}
+
+fn insert_draft(anchor: Anchor, state: DraftRuntimeState) -> Result<()> {
+    THREAD_DRAFT_STORAGE.with(|drafts| {
+        let mut drafts = drafts.borrow_mut();
+        if drafts.contains_key(&anchor) {
+            return Err(Error::Other(
+                "A recur site already holds an open draft".into(),
+            ));
+        }
+        drafts.insert(anchor, state);
+        Ok(())
+    })
+}
+
+/// Open a recur site's **own** object: an empty draft of `S` (`output`, bare,
+/// in `call_recur!`). Its root is the empty root of `S`.
+pub fn create_site_draft<S>() -> Result<(Anchor, [u8; 32])>
 where
     S: Schema,
 {
     let schema = S::schema();
-    let coordinates = THREAD_SEQUENCE_CONTEXT
-        .with(|context| context.borrow_mut().reserve_synthetic_coordinates())?;
-    let anchor = anchor_for_schema(&coordinates, S::schema_hash());
-    // The anchor is kept in both modes — it is the draft's identity in the
-    // thread-local map, and reserving a coordinate is O(1). Only the root is
-    // skipped.
+    let anchor = site_draft_anchor::<S>()?;
     let current_root = if drafts_are_authenticated() {
         draft_root_from_field_roots(&schema, &BTreeMap::new())?
     } else {
         UNAUTHENTICATED_DRAFT_ROOT
     };
-    THREAD_DRAFT_STORAGE.with(|drafts| {
-        drafts.borrow_mut().insert(
-            anchor,
-            DraftRuntimeState {
-                schema,
-                current_root,
-                fields: BTreeMap::new(),
-                ops: Vec::new(),
+    insert_draft(
+        anchor,
+        DraftRuntimeState {
+            schema,
+            current_root,
+            fields: BTreeMap::new(),
+            ops: Vec::new(),
+        },
+    )?;
+    Ok((anchor, current_root))
+}
+
+/// Open a recur site that **derives** from `base` (`output = base` in
+/// `call_recur!`): a draft holding `base`'s every field, so the site's
+/// object is `base` plus what the sweep appends.
+///
+/// Push-only falls out of the state rather than a flag: every set-once field
+/// is already written, and a second write to one is refused
+/// (`apply_draft_set`). The returned root is `base`'s raster root, which is
+/// what a derived object's chain must start from (§Extension is derivation).
+///
+/// `O(N)` in `base` — every element is hashed again to rebuild the append
+/// frontiers. Batch D's continuation reads them from the base's stored index
+/// instead.
+pub fn derive_site_draft<S>(base: &S) -> Result<(Anchor, [u8; 32])>
+where
+    S: Schema + Serialize,
+{
+    let schema = S::schema();
+    let anchor = site_draft_anchor::<S>()?;
+    let authenticated = drafts_are_authenticated();
+    let DraftValue::Struct(values) = draft_value_from_serialize(base)? else {
+        return Err(Error::Other(format!(
+            "A derived draft's base '{}' is not a struct",
+            core::any::type_name::<S>()
+        )));
+    };
+    let mut fields = BTreeMap::new();
+    for field in schema_struct_fields(&schema)? {
+        let value = values
+            .iter()
+            .find(|(name, _)| name == &field.name)
+            .map(|(_, value)| value.clone())
+            .ok_or_else(|| {
+                Error::Other(format!("Derived draft base lacks field '{}'", field.name))
+            })?;
+        let runtime = match field.mode {
+            SchemaFieldMode::SetOnce => DraftFieldRuntime::Set {
+                root: if authenticated {
+                    draft_value_root(&value)?
+                } else {
+                    UNAUTHENTICATED_DRAFT_ROOT
+                },
+                value,
             },
-        );
-    });
+            SchemaFieldMode::AppendOnlyVec => {
+                let elements = match value {
+                    DraftValue::ListHandle(elements) | DraftValue::List(elements) => elements,
+                    _ => {
+                        return Err(Error::Other(format!(
+                            "Derived draft base field '{}' is not a list",
+                            field.name
+                        )))
+                    }
+                };
+                let mut frontier = AppendFrontier::empty();
+                if authenticated {
+                    for element in &elements {
+                        frontier.push(draft_value_root(element)?);
+                    }
+                }
+                DraftFieldRuntime::Append {
+                    values: elements,
+                    frontier,
+                }
+            }
+        };
+        fields.insert(field.name.clone(), runtime);
+    }
+    let mut state = DraftRuntimeState {
+        schema,
+        current_root: UNAUTHENTICATED_DRAFT_ROOT,
+        fields,
+        ops: Vec::new(),
+    };
+    if authenticated {
+        state.current_root = state.recompose_root()?;
+    }
+    let current_root = state.current_root;
+    insert_draft(anchor, state)?;
     Ok((anchor, current_root))
 }
 
@@ -1384,6 +1489,9 @@ fn store_value_at_coordinates<T: Serialize>(
     result
 }
 
+/// Store a value outside any step, at a synthetic coordinate — a **fixture**
+/// helper for seeding storage in tests. No program path reaches it: tile
+/// outputs land at their own coordinate and a recur site's object at `[s]`.
 pub fn store_value<T: Serialize>(value: &T) -> Result<StorageRef> {
     let coordinates = THREAD_SEQUENCE_CONTEXT
         .with(|context| context.borrow_mut().reserve_synthetic_coordinates())?;
@@ -1545,6 +1653,12 @@ impl Drop for TileExecutionScopeGuard {
     }
 }
 
+/// Whether a tile is executing on this thread — inside its
+/// `TileExecutionScopeGuard`. A tile-local draft may only be created there.
+pub fn in_tile_execution() -> bool {
+    THREAD_ACTIVE_EXECUTION_COORDINATES.with(|active| !active.borrow().is_empty())
+}
+
 pub fn publish_pending_output_coordinates(coordinates: CfsCoordinates) {
     THREAD_PENDING_OUTPUT_COORDINATES.with(|pending| {
         *pending.borrow_mut() = Some(coordinates);
@@ -1598,15 +1712,19 @@ where
     })
 }
 
+/// A draft completes only at its recur site's close, as the site's object at
+/// `[s]` (`incremental-draft-materialization` §One storage rule). There is no
+/// other place: the synthetic `[…, DRAFT_NAMESPACE, n]` fallback, a
+/// coordinate no CFS position names and no step writes, is what both
+/// reproductions of `authenticated-chain-draft-output` landed on.
 fn store_finalized_draft<S>(value: &S) -> Result<StorageRef>
 where
     S: Serialize,
 {
-    if let Some(coordinates) = current_recur_site_coordinates() {
-        store_value_at_coordinates(value, coordinates)
-    } else {
-        store_value(value)
-    }
+    let coordinates = current_recur_site_coordinates().ok_or_else(|| {
+        Error::Other("A draft can only be completed at its recur site's close".into())
+    })?;
+    store_value_at_coordinates(value, coordinates)
 }
 
 pub fn finalize_draft<S>(anchor: &Anchor, expected_root: &[u8; 32]) -> Result<StorageRef>
@@ -1860,8 +1978,10 @@ mod tests {
     #[test]
     fn failed_finalize_removes_draft_anchor() {
         let _guard = SequenceScopeGuard::enter("failed_finalize_removes_draft_anchor");
+        // A draft belongs to a recur site, so it opens inside one.
+        enter_recur_site_scope().expect("site scope");
         let (anchor, current_root) =
-            create_draft::<RequiredFieldDraft>().expect("draft should be created");
+            create_site_draft::<RequiredFieldDraft>().expect("draft should be created");
 
         assert!(THREAD_DRAFT_STORAGE.with(|drafts| drafts.borrow().contains_key(&anchor)));
 
@@ -1871,6 +1991,7 @@ mod tests {
 
         assert!(error.contains("must be written before finalize"));
         assert!(THREAD_DRAFT_STORAGE.with(|drafts| !drafts.borrow().contains_key(&anchor)));
+        exit_recur_site_scope();
     }
 
     /// A draft with a `List<String>` field, for the large-draft measurement.
@@ -1918,8 +2039,9 @@ mod tests {
 
         for n in [1usize, 16, 64, 256, 1024, 4096, 16384] {
             let _scope = SequenceScopeGuard::enter("bench");
+            enter_recur_site_scope().expect("site scope");
             let (anchor, mut root) =
-                create_draft::<BigDraft>().expect("draft is created");
+                create_site_draft::<BigDraft>().expect("draft is created");
 
             let push_start = std::time::Instant::now();
             for index in 0..n {
@@ -1959,6 +2081,7 @@ mod tests {
                 finalize_ns as f64 / 1e6,
                 finalize_ns / n as u64,
             );
+            exit_recur_site_scope();
         }
         println!();
         println!("`encode` is included in `append` (append calls it); it is timed twice on purpose.");

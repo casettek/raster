@@ -3,9 +3,9 @@ use raster::prelude::*;
 
 /// Phase 3 entrypoint (terminal).
 ///
-/// `stats` is bound by the chain to phase 2's authorized output. The report is
-/// assembled one line per tile call through a draft; the sequence itself does
-/// no computation — it only selects, calls, and rebinds.
+/// `stats` is bound by the chain to phase 2's authorized output. One tile
+/// assembles the report; the sequence itself does no computation — it only
+/// selects, calls, and rebinds.
 #[sequence]
 fn main(stats: Stats) -> Report {
     let label = select!(String, stats.clone().label);
@@ -15,14 +15,7 @@ fn main(stats: Stats) -> Report {
 
     let mean = call!(mean_scaled, clone!(sum), clone!(count));
 
-    let draft = new!(Report);
-    let draft = call!(set_report_title, label, draft);
-    let draft = call!(push_metric, "count".to_string(), count, draft);
-    let draft = call!(push_metric, "sum".to_string(), sum, draft);
-    let draft = call!(push_metric, "max".to_string(), max, draft);
-    let draft = call!(push_mean, mean, draft);
-
-    let report = finalize(draft);
+    let report = call!(build_report, label, count, sum, max, mean);
     raster::println!("phase3 report → {:?}", report);
     report
 }

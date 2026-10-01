@@ -1748,6 +1748,35 @@ fn gen_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream {
 /// Generate only the function call code.
 ///
 /// Returns a TokenStream that calls the function and stores the result.
+/// Reset each received draft's credits for this run: the draft budget times the
+/// number of source elements the run consumes — a chunked recur iteration's
+/// block length, else 1. Emitted before the call in the native wrapper and the
+/// replay alike, so both enforce the same bound.
+fn gen_draft_budget_reset(input: &ItemFn) -> proc_macro2::TokenStream {
+    let params = extract_params(input);
+    let consumed = params
+        .first()
+        .and_then(|first| {
+            let item_ty = recur_input_inner_type(&first.ty)?;
+            block_element_type(&item_ty)?;
+            let name = &first.ident;
+            Some(quote! { (#name.value().len() as u64) })
+        })
+        .unwrap_or_else(|| quote! { 1u64 });
+    let resets: Vec<_> = params
+        .iter()
+        .filter(|param| draft_param_schema(param).is_some())
+        .map(|param| {
+            let name = &param.ident;
+            quote! {
+                let mut #name = #name;
+                #name.__raster_begin_step(#consumed);
+            }
+        })
+        .collect();
+    quote! { #(#resets)* }
+}
+
 fn gen_function_call(target_fn: &syn::Ident, input: &ItemFn) -> proc_macro2::TokenStream {
     let param_names: Vec<syn::Ident> = extract_params(input)
         .into_iter()
@@ -1875,11 +1904,7 @@ struct RecurCallInput {
     input: Expr,
     chunk: Option<Expr>,
     state: Option<Expr>,
-    output: Option<Expr>,
-    /// `finalize = false` leaves the output draft open for a later writer.
-    /// Absent means `true` — closing is the default, and the only behaviour
-    /// that existed before this flag.
-    finalize: Option<Expr>,
+    output: Option<SiteOutputSpec>,
     args: syn::punctuated::Punctuated<Expr, Token![,]>,
 }
 
@@ -1887,8 +1912,53 @@ struct RecurSequenceCallInput {
     sequence: syn::Ident,
     input: Expr,
     state: Option<Expr>,
-    output: Option<Expr>,
+    output: Option<SiteOutputSpec>,
     args: syn::punctuated::Punctuated<Expr, Token![,]>,
+}
+
+/// A recur site's `output`: bare `output,` creates the site's own object;
+/// `output = base,` derives it from a stored object. Either way the site owns
+/// one object, at its own coordinate (`incremental-draft-materialization`
+/// §One storage rule).
+enum SiteOutputSpec {
+    Create,
+    Derive(Expr),
+}
+
+impl SiteOutputSpec {
+    fn base(&self) -> Option<&Expr> {
+        match self {
+            Self::Create => None,
+            Self::Derive(base) => Some(base),
+        }
+    }
+
+    fn to_tokens(&self) -> proc_macro2::TokenStream {
+        match self {
+            Self::Create => quote! { ::raster::SiteOutput::Create },
+            Self::Derive(base) => quote! { ::raster::SiteOutput::derive(#base) },
+        }
+    }
+}
+
+/// Parse an optional `output,` or `output = <expr>,` entry.
+fn parse_site_output(input: ParseStream) -> syn::Result<Option<SiteOutputSpec>> {
+    if !input.peek(syn::Ident) {
+        return Ok(None);
+    }
+    let fork = input.fork();
+    let ident: syn::Ident = fork.parse()?;
+    if ident != "output" {
+        return Ok(None);
+    }
+    let _: syn::Ident = input.parse()?;
+    if input.parse::<Option<Token![=]>>()?.is_some() {
+        let base: Expr = input.parse()?;
+        input.parse::<Token![,]>()?;
+        return Ok(Some(SiteOutputSpec::Derive(base)));
+    }
+    input.parse::<Token![,]>()?;
+    Ok(Some(SiteOutputSpec::Create))
 }
 
 fn parse_named_key(input: ParseStream, expected: &str) -> syn::Result<()> {
@@ -1932,20 +2002,12 @@ impl Parse for RecurCallInput {
 
         let chunk = parse_optional_named_expr(input, "chunk")?;
         let state = parse_optional_named_expr(input, "state")?;
-        let output = parse_optional_named_expr(input, "output")?;
-        let finalize = parse_optional_named_expr(input, "finalize")?;
-
-        if finalize.is_some() && output.is_none() {
-            return Err(syn::Error::new(
-                input.span(),
-                "call_recur! `finalize = ...` only applies to a recur with `output = ...`; a state-only recur has no draft to leave open",
-            ));
-        }
+        let output = parse_site_output(input)?;
 
         if state.is_none() && output.is_none() {
             return Err(syn::Error::new(
                 input.span(),
-                "call_recur! requires `state = ...` and/or `output = ...` before `args = (...)`",
+                "call_recur! requires `state = ...` and/or `output` / `output = base` before `args = (...)`",
             ));
         }
 
@@ -1961,7 +2023,6 @@ impl Parse for RecurCallInput {
             chunk,
             state,
             output,
-            finalize,
             args,
         })
     }
@@ -1992,20 +2053,7 @@ impl Parse for RecurSequenceCallInput {
             None
         };
 
-        let output = if input.peek(syn::Ident) {
-            let fork = input.fork();
-            let ident: syn::Ident = fork.parse()?;
-            if ident == "output" {
-                parse_named_key(input, "output")?;
-                let output_expr: Expr = input.parse()?;
-                input.parse::<Token![,]>()?;
-                Some(output_expr)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        let output = parse_site_output(input)?;
 
         if state.is_none() && output.is_none() {
             return Err(syn::Error::new(
@@ -2051,29 +2099,13 @@ fn rewrite_call_recur_macro(expr_macro: &syn::ExprMacro) -> Expr {
             "call_recur! expects `tile = ...`, `input = ...`, optional `state = ...`, optional `output = ...`, and `args = (...)`"
         )
     });
-    // `finalize = false` routes to the sibling entry point that hands the draft
-    // back instead of closing it. The flag must be a bool literal: whether a
-    // recur closed its draft is a fact about the program's shape, so it belongs
-    // in the CFS rather than being decided at run time.
-    let leaves_draft_open = match input.finalize.as_ref() {
-        None => false,
-        Some(Expr::Lit(lit)) => match &lit.lit {
-            syn::Lit::Bool(b) => !b.value(),
-            _ => panic!("call_recur! `finalize = ...` must be `true` or `false`"),
-        },
-        Some(_) => panic!("call_recur! `finalize = ...` must be a bool literal so it can be pinned in the CFS"),
-    };
-    let hidden = if leaves_draft_open {
-        format_ident!("__raster_recur_auth_open_{}", input.tile)
-    } else {
-        format_ident!("__raster_recur_auth_{}", input.tile)
-    };
+    let hidden = format_ident!("__raster_recur_auth_{}", input.tile);
     for argument in input
         .args
         .iter()
         .chain(core::iter::once(&input.input))
         .chain(input.state.iter())
-        .chain(input.output.iter())
+        .chain(input.output.iter().filter_map(SiteOutputSpec::base))
     {
         reject_nested_call_macros(argument, "call_recur!");
     }
@@ -2099,7 +2131,7 @@ fn rewrite_call_recur_macro(expr_macro: &syn::ExprMacro) -> Expr {
         quote! { (#chunk_expr) as u64, }
     });
     let state_expr = input.state;
-    let output_expr = input.output;
+    let output_expr = input.output.as_ref().map(SiteOutputSpec::to_tokens);
     let args: Vec<_> = input.args.into_iter().collect();
     if let Some(state_expr) = state_expr {
         if let Some(output_expr) = output_expr {
@@ -2150,13 +2182,13 @@ fn rewrite_call_recur_seq_macro(expr_macro: &syn::ExprMacro) -> Expr {
         .iter()
         .chain(core::iter::once(&input.input))
         .chain(input.state.iter())
-        .chain(input.output.iter())
+        .chain(input.output.iter().filter_map(SiteOutputSpec::base))
     {
         reject_nested_call_macros(argument, "call_recur_seq!");
     }
     let input_expr = input.input;
     let state_expr = input.state;
-    let output_expr = input.output;
+    let output_expr = input.output.as_ref().map(SiteOutputSpec::to_tokens);
     let args: Vec<_> = input.args.into_iter().collect();
     if let Some(state_expr) = state_expr {
         if let Some(output_expr) = output_expr {
@@ -2508,6 +2540,31 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
     validate_protocol_return_type(&input_fn);
     let return_kind = protocol_return_kind(&input_fn.sig.output);
 
+    // A plain tile that returns a `Draft<S>` it created with `Draft::new()` —
+    // it takes no draft — is a *creating* tile: its close completes the draft
+    // into an `S`, stored at the tile's own coordinate like any output. From
+    // here on it is a `Value(S)` tile; only the call completes the draft. A
+    // tile that *receives* a draft (a recur-sequence body tile) returns it to
+    // its site and keeps the draft path.
+    let created_draft_schema: Option<Type> = match &return_kind {
+        ProtocolReturnKind::Draft(ty)
+            if !extract_params(&input_fn)
+                .iter()
+                .any(|param| draft_param_schema(param).is_some()) =>
+        {
+            draft_inner_type(ty)
+        }
+        _ => None,
+    };
+    let value_output: ReturnType = match &created_draft_schema {
+        Some(schema) => syn::parse_quote!(-> #schema),
+        None => input_fn.sig.output.clone(),
+    };
+    let return_kind = match &created_draft_schema {
+        Some(schema) => ProtocolReturnKind::Value(schema.clone()),
+        None => return_kind,
+    };
+
     let fn_name = &input_fn.sig.ident;
     let fn_vis = &input_fn.vis;
     let fn_attrs = &input_fn.attrs;
@@ -2538,7 +2595,19 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     // Generate deserialization and function call
     let inputs_deserialization = gen_inputs_deserialization(&input_fn);
+    let draft_budget_reset = gen_draft_budget_reset(&input_fn);
     let function_call = gen_function_call(&implementation_name, &input_fn);
+    let function_call = match &created_draft_schema {
+        Some(schema) => quote! {
+            #draft_budget_reset
+            #function_call
+            let result: #schema = ::raster::complete_tile_draft::<#schema>(result);
+        },
+        None => quote! {
+            #draft_budget_reset
+            #function_call
+        },
+    };
     let output_serialization = gen_output_serialization();
     let replay_output_serialization = gen_replay_output_serialization(&return_kind);
     let recur_position_capture = gen_recur_position_capture(&input_fn);
@@ -2565,7 +2634,7 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
     let auth_value_materialization = gen_auth_value_materialization(&input_fn);
     let tile_call_binding =
-        gen_tile_call_binding_marker(&call_binding_marker, &return_kind, &input_fn.sig.output);
+        gen_tile_call_binding_marker(&call_binding_marker, &return_kind, &value_output);
     let recur_driver_function = recur_shape
         .as_ref()
         .map(|shape| gen_recur_driver_function(fn_name, shape))
@@ -2575,7 +2644,10 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
     // it is committed whole into the replay unit. Assert the output type is
     // `Materializable`, so a tile cannot return an unbounded collection (build a
     // `Block<T>` or a draft-threaded `List` field instead).
+    // A creating tile is exempt: its `List` fields were filled by draft ops,
+    // which the draft budget bounds per run.
     let return_materializable_assertion = match &return_kind {
+        _ if created_draft_schema.is_some() => quote! {},
         ProtocolReturnKind::Value(ty) | ProtocolReturnKind::Fallible(ty) => quote! {
             const _: fn() = || {
                 fn __raster_assert_materializable<T: ::raster::Materializable>() {}
@@ -2587,12 +2659,13 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let mut exposed_sig = input_fn.sig.clone();
     rewrite_into_auth_value_args(&mut exposed_sig);
+    exposed_sig.output = value_output.clone();
 
     let mut implementation_sig = input_fn.sig.clone();
     implementation_sig.ident = implementation_name.clone();
 
     // Generate output type expression
-    let output_type_expr = match &input_fn.sig.output {
+    let output_type_expr = match &value_output {
         ReturnType::Default => quote! { "()" },
         ReturnType::Type(_, ty) => {
             let ty_str = ty.to_token_stream().to_string();

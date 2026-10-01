@@ -2209,7 +2209,7 @@ mod tests {
                 id: "sweep".to_string(),
                 sources: vec![InputBinding::prior_item_output(0)],
                 chunk: Some(2),
-                leaves_output_open: false,
+                output: None,
                 state_is_output: false,
             }));
 

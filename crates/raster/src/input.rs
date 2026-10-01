@@ -46,7 +46,23 @@ pub struct Draft<S: Schema> {
     current_root: [u8; 32],
     #[cfg(not(feature = "std"))]
     replay_state: ReplayDraftState,
+    /// `Some` for a draft a tile created with [`Draft::new`]: held in memory,
+    /// identically in the native run and the replay, and completed into the
+    /// tile's output when the tile returns. `None` for a recur site's draft,
+    /// handed to the tile by the site.
+    local: Option<LocalDraft>,
+    /// What this tile run may still write, out of `step_budget` — see
+    /// [`raster_core::draft::DRAFT_STEP_BUDGET`].
+    credits: u64,
+    step_budget: u64,
     _schema: PhantomData<fn() -> S>,
+}
+
+/// A tile-local draft's fields, as the values a completion assembles.
+#[derive(Debug, Clone)]
+struct LocalDraft {
+    schema: SchemaNode,
+    fields: alloc::collections::BTreeMap<String, raster_core::draft::DraftFieldValue>,
 }
 
 #[cfg(not(feature = "std"))]
@@ -468,7 +484,34 @@ impl<Root, Selected> TypedSelectorPath<Root, Selected> {
 }
 
 impl<S: Schema> Draft<S> {
-    pub fn new(anchor: Anchor, current_root: [u8; 32]) -> Self {
+    /// Start a draft of `S` inside a tile. Populate it with the usual
+    /// `set`/`push` and return it from the tile: the tile's close completes it
+    /// into an `S`, stored at the tile's own coordinate, and the caller gets
+    /// that object (`AuthRef<S>`). A recur site can continue it with
+    /// `output = <that object>`.
+    ///
+    /// A draft never leaves a tile open (`incremental-draft-materialization`
+    /// §The restriction), so this refuses to run outside a tile.
+    pub fn new() -> Self {
+        #[cfg(all(feature = "std", not(target_arch = "riscv32")))]
+        {
+            assert!(
+                raster_runtime::in_tile_execution(),
+                "Draft::<{}>::new() can only be called inside a tile",
+                core::any::type_name::<S>()
+            );
+        }
+        let mut draft = Self::from_site([0u8; 32], [0u8; 32]);
+        draft.local = Some(LocalDraft {
+            schema: S::schema(),
+            fields: alloc::collections::BTreeMap::new(),
+        });
+        draft
+    }
+
+    /// A recur site's draft, as the site hands it to a tile.
+    #[doc(hidden)]
+    pub fn from_site(anchor: Anchor, current_root: [u8; 32]) -> Self {
         Self {
             anchor,
             current_root,
@@ -478,7 +521,88 @@ impl<S: Schema> Draft<S> {
                 ops: Vec::new(),
                 fields: Vec::new(),
             },
+            local: None,
+            credits: raster_core::draft::DRAFT_STEP_BUDGET,
+            step_budget: raster_core::draft::DRAFT_STEP_BUDGET,
             _schema: PhantomData,
+        }
+    }
+
+    /// Reset this tile run's credits: the budget times the number of source
+    /// elements the run consumes (`chunk` for a chunked recur iteration, else
+    /// 1). Called by the tile wrapper, native and replay alike.
+    #[doc(hidden)]
+    pub fn __raster_begin_step(&mut self, consumed_elements: u64) {
+        self.step_budget =
+            raster_core::draft::DRAFT_STEP_BUDGET.saturating_mul(consumed_elements.max(1));
+        self.credits = self.step_budget;
+    }
+
+    /// Lower this run's remaining credits to at most `bytes` — for testing the
+    /// budget without writing `DRAFT_STEP_BUDGET` bytes. It can only lower them.
+    #[doc(hidden)]
+    pub fn __raster_with_budget(mut self, bytes: u64) -> Self {
+        self.credits = self.credits.min(bytes);
+        self.step_budget = self.step_budget.min(bytes);
+        self
+    }
+
+    /// Spend credits for writing `value`; panics past the budget.
+    fn charge<Value: Serialize>(&mut self, field: &str, value: &Value) -> raster_core::draft::DraftValue {
+        let tree = draft_value_from_serialize(value).unwrap_or_else(|error| {
+            panic!("Failed to encode draft field '{}': {}", field, error)
+        });
+        let (payload, _) = raster_core::tree::subtree_payload_and_root(&tree)
+            .unwrap_or_else(|error| panic!("Failed to encode draft field '{}': {}", field, error));
+        let cost = (payload.len() as u64).saturating_add(raster_core::draft::DRAFT_OP_CHARGE);
+        self.credits = self.credits.checked_sub(cost).unwrap_or_else(|| {
+            panic!(
+                "Draft budget exceeded writing '{}' of '{}': this write costs {} bytes and {} of this \
+                 run's {} remain (a tile run may write {} bytes of draft data per consumed source element)",
+                field,
+                core::any::type_name::<S>(),
+                cost,
+                self.credits,
+                self.step_budget,
+                raster_core::draft::DRAFT_STEP_BUDGET
+            )
+        });
+        #[cfg(all(feature = "std", not(target_arch = "riscv32")))]
+        record_draft_spend(self.step_budget - self.credits);
+        tree
+    }
+
+    /// Write a field of a tile-local draft, with `apply_draft_set`/`apply_draft_push`'s rules.
+    fn write_local(&mut self, field: &str, tree: raster_core::draft::DraftValue, push: bool) {
+        use raster_core::draft::DraftFieldValue;
+        let local = self.local.as_mut().expect("a local draft");
+        let mode = match &local.schema {
+            SchemaNode::Struct { fields, .. } => fields
+                .iter()
+                .find(|schema_field| schema_field.name == field)
+                .map(|schema_field| schema_field.mode),
+            _ => None,
+        }
+        .unwrap_or_else(|| panic!("Unknown draft field '{}'", field));
+        match (push, mode) {
+            (false, SchemaFieldMode::SetOnce) => {
+                if local.fields.contains_key(field) {
+                    panic!("Draft field '{}' can only be written once", field);
+                }
+                local.fields.insert(field.into(), DraftFieldValue::Set(tree));
+            }
+            (true, SchemaFieldMode::AppendOnlyVec) => {
+                match local
+                    .fields
+                    .entry(field.into())
+                    .or_insert_with(|| DraftFieldValue::Append(Vec::new()))
+                {
+                    DraftFieldValue::Append(values) => values.push(tree),
+                    DraftFieldValue::Set(_) => panic!("Draft field '{}' is not appendable", field),
+                }
+            }
+            (false, _) => panic!("Draft field '{}' does not support set; use push", field),
+            (true, _) => panic!("Draft field '{}' does not support push; use set", field),
         }
     }
 
@@ -629,7 +753,7 @@ pub fn restore_draft_from_replay_handle<S>(handle: DraftReplayHandle) -> Draft<S
 where
     S: Schema,
 {
-    let draft = Draft::new(handle.draft_id, handle.root_before);
+    let draft = Draft::from_site(handle.draft_id, handle.root_before);
     #[cfg(not(feature = "std"))]
     {
         let mut draft = draft;
@@ -719,6 +843,11 @@ where
     Value: Serialize,
 {
     pub fn set(self, value: Value) {
+        let tree = self.draft.charge(self.field, &value);
+        if self.draft.local.is_some() {
+            self.draft.write_local(self.field, tree, false);
+            return;
+        }
         #[cfg(feature = "std")]
         {
             let expected_root = *self.draft.current_root();
@@ -749,6 +878,11 @@ where
     Value: Serialize,
 {
     pub fn push(self, value: Value) {
+        let tree = self.draft.charge(self.field, &value);
+        if self.draft.local.is_some() {
+            self.draft.write_local(self.field, tree, true);
+            return;
+        }
         #[cfg(feature = "std")]
         {
             let expected_root = *self.draft.current_root();
@@ -2343,61 +2477,148 @@ where
     value.clone()
 }
 
-pub fn new_draft<S>() -> Draft<S>
+/// Complete a draft a tile created with [`Draft::new`] into its value — the
+/// tile's output. Every set-once field must have been set. The same assembly
+/// the site's close uses (`draft_tree_from_fields`) and the shared decoder, so
+/// the native run and the tile replay produce the same object.
+#[doc(hidden)]
+pub fn complete_tile_draft<S>(draft: Draft<S>) -> S
 where
-    S: Schema,
+    S: Schema + DeserializeOwned,
 {
-    #[cfg(feature = "std")]
-    {
-        let (anchor, current_root) = raster_runtime::create_draft::<S>().unwrap_or_else(|error| {
+    let local = draft.local.unwrap_or_else(|| {
+        panic!(
+            "A tile may only return a draft of '{}' it created with Draft::new(); a recur site's draft is returned to its site",
+            core::any::type_name::<S>()
+        )
+    });
+    let tree = raster_core::draft::draft_tree_from_fields(&local.schema, &local.fields, true)
+        .unwrap_or_else(|error| {
             panic!(
-                "Failed to create draft '{}': {}",
+                "Failed to complete the draft of '{}': {}",
                 core::any::type_name::<S>(),
                 error
             )
         });
-        return Draft::new(anchor, current_root);
-    }
+    raster_core::tree::typed_value_from_tree::<S>(&tree).unwrap_or_else(|error| {
+        panic!(
+            "Failed to complete the draft of '{}': {}",
+            core::any::type_name::<S>(),
+            error
+        )
+    })
+}
 
-    #[cfg(not(feature = "std"))]
+/// Peak draft spend of any tile run so far, for sizing
+/// [`raster_core::draft::DRAFT_STEP_BUDGET`]: set `RASTER_DRAFT_SPEND_LOG=1`
+/// and each new peak is printed to stderr.
+#[cfg(all(feature = "std", not(target_arch = "riscv32")))]
+fn record_draft_spend(spent: u64) {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    static PEAK: AtomicU64 = AtomicU64::new(0);
+    if spent > PEAK.fetch_max(spent, Ordering::Relaxed)
+        && std::env::var_os("RASTER_DRAFT_SPEND_LOG").is_some()
     {
-        panic!("Draft creation requires the `std` feature")
+        std::eprintln!("raster: draft step spend peak {} bytes", spent);
     }
 }
 
-pub fn finalize<S>(draft: Draft<S>) -> AuthRef<S>
+/// What a recur site's `output` is: an object the site **creates** (`output`,
+/// bare, in `call_recur!`), or a stored object it **derives** from
+/// (`output = base`).
+///
+/// A site owns exactly one object, at its own coordinate `[s]`, and returns a
+/// reference to it. There is no user-visible draft to create or close: the
+/// site opens it and its close completes it
+/// (`incremental-draft-materialization` §One storage rule).
+pub enum SiteOutput<S> {
+    Create,
+    Derive(AuthRef<S>),
+}
+
+impl<S> SiteOutput<S> {
+    #[doc(hidden)]
+    pub fn derive<A>(base: A) -> Self
+    where
+        A: IntoAuthRef<S>,
+    {
+        Self::Derive(into_auth_ref::<S, _>(base))
+    }
+}
+
+/// Open the draft a recur site builds its object in. Called by the site's
+/// generated entry point, inside its site scope — the draft is keyed by the
+/// site's coordinate.
+#[doc(hidden)]
+pub fn open_site_draft<S>(output: SiteOutput<S>) -> Draft<S>
 where
     S: Schema + DeserializeOwned + Serialize + 'static,
 {
     #[cfg(feature = "std")]
     {
-        if !crate::auth_mode().is_authenticated() {
-            let value =
-                raster_runtime::finalize_draft_value::<S>(draft.anchor(), draft.current_root(), true)
-                    .unwrap_or_else(|error| {
-                        panic!(
-                            "Failed to finalize draft '{}': {}",
-                            core::any::type_name::<S>(),
-                            error
-                        )
-                    });
-            return AuthRef::Inline(value);
-        }
-        let reference = raster_runtime::finalize_draft::<S>(draft.anchor(), draft.current_root())
-            .unwrap_or_else(|error| {
-                panic!(
-                    "Failed to finalize draft '{}': {}",
-                    core::any::type_name::<S>(),
-                    error
-                )
-            });
-        return into_auth_ref::<S, _>(typed_storage::<S>(reference));
+        let opened = match output {
+            SiteOutput::Create => raster_runtime::create_site_draft::<S>(),
+            SiteOutput::Derive(base) => {
+                let (base, commitment) = match into_auth_value::<S, _>(base).unwrap_or_else(|error| {
+                    panic!(
+                        "Failed to read the base '{}' a recur site derives from: {}",
+                        core::any::type_name::<S>(),
+                        error
+                    )
+                }) {
+                    AuthValue::Storage(stored) => (stored.value, Some(stored.reference.commitment)),
+                    AuthValue::Inline(value) => (value, None),
+                };
+                raster_runtime::derive_site_draft::<S>(&base).map(|(anchor, root)| {
+                    // A derived object's chain starts from its base's root; if
+                    // the draft rebuilt from the base's value roots anywhere
+                    // else, the site would extend a different object.
+                    if let Some(commitment) = commitment.filter(|_| crate::auth_mode().is_authenticated()) {
+                        assert_eq!(
+                            root.as_slice(),
+                            commitment.as_slice(),
+                            "A derived draft of '{}' does not start from its base's commitment",
+                            core::any::type_name::<S>()
+                        );
+                    }
+                    (anchor, root)
+                })
+            }
+        };
+        let (anchor, current_root) = opened.unwrap_or_else(|error| {
+            panic!(
+                "Failed to open the recur site's draft of '{}': {}",
+                core::any::type_name::<S>(),
+                error
+            )
+        });
+        return Draft::from_site(anchor, current_root);
     }
 
     #[cfg(not(feature = "std"))]
     {
-        let _ = draft;
-        panic!("Draft finalization requires the `std` feature")
+        let _ = output;
+        panic!("A recur site's draft requires the `std` feature")
+    }
+}
+
+/// The trace value of a site's `output`: an inline marker for a created
+/// object, the base's storage binding for a derived one — so the site's
+/// `RecurStart` reads and authenticates the base like any other input.
+#[doc(hidden)]
+pub fn site_output_trace<S>(output: &SiteOutput<S>) -> raster_core::Result<AuthRefTrace>
+where
+    S: Serialize + DeserializeOwned,
+{
+    match output {
+        SiteOutput::Create => Ok(AuthRefTrace {
+            value: FnInputValue::Inline(
+                raster_core::postcard::to_allocvec(&"raster::SiteOutput::Create").unwrap_or_default(),
+            ),
+            storage: None,
+            index_bindings: Vec::new(),
+        }),
+        SiteOutput::Derive(base) => auth_ref_trace(base),
     }
 }
 
@@ -2960,28 +3181,6 @@ where
     run_recur_list_with_finish(source, output, step, finalize_recur_output)
 }
 
-/// Runs the sweep and **leaves** its output draft open, so a later writer can go
-/// on appending to the same value.
-///
-/// The draft stays linear and stays set-once; deferring only moves the single
-/// `finalize` to the end of the chain of writers instead of forcing it at the
-/// first recur. Compiled from `call_recur!(..., finalize = false, args = (..))`.
-#[doc(hidden)]
-pub fn run_recur_list_open<T, S, Step, Output>(
-
-    source: AuthRef<List<T>>,
-    output: Draft<S>,
-    mut step: Step,
-) -> Draft<S>
-where
-    T: DeserializeOwned + Serialize + Selectable + 'static,
-    S: Schema + DeserializeOwned + Serialize + 'static,
-    Step: FnMut(RecurInput<T>, RecurOutput<S>) -> Output,
-    Output: IntoRecurControl<RecurOutput<S>>,
-{
-    run_recur_list_with_finish(source, output, step, |draft, _| draft)
-}
-
 /// Runs the sweep and **closes** its output draft, binding the finalized value.
 /// This is what a `call_recur!` without `finalize = false` compiles to.
 #[doc(hidden)]
@@ -2999,29 +3198,6 @@ where
     Output: IntoRecurControl<RecurOutput<S>>,
 {
     run_recur_chunked_list_with_finish(source, chunk, output, step, finalize_recur_output)
-}
-
-/// Runs the sweep and **leaves** its output draft open, so a later writer can go
-/// on appending to the same value.
-///
-/// The draft stays linear and stays set-once; deferring only moves the single
-/// `finalize` to the end of the chain of writers instead of forcing it at the
-/// first recur. Compiled from `call_recur!(..., finalize = false, args = (..))`.
-#[doc(hidden)]
-pub fn run_recur_chunked_list_open<T, S, Step, Output>(
-
-    source: AuthRef<List<T>>,
-    chunk: u64,
-    output: Draft<S>,
-    mut step: Step,
-) -> Draft<S>
-where
-    T: DeserializeOwned + Serialize + Selectable + 'static,
-    S: Schema + DeserializeOwned + Serialize + 'static,
-    Step: FnMut(RecurInput<Block<T>>, RecurOutput<S>) -> Output,
-    Output: IntoRecurControl<RecurOutput<S>>,
-{
-    run_recur_chunked_list_with_finish(source, chunk, output, step, |draft, _| draft)
 }
 
 /// Runs the sweep and **closes** its output draft, binding the finalized value.
@@ -3045,31 +3221,6 @@ where
     run_recur_chunked_list_with_state_with_finish(source, chunk, state, output, step, finalize_recur_output)
 }
 
-/// Runs the sweep and **leaves** its output draft open, so a later writer can go
-/// on appending to the same value.
-///
-/// The draft stays linear and stays set-once; deferring only moves the single
-/// `finalize` to the end of the chain of writers instead of forcing it at the
-/// first recur. Compiled from `call_recur!(..., finalize = false, args = (..))`.
-#[doc(hidden)]
-pub fn run_recur_chunked_list_with_state_open<T, State, S, Step, Output>(
-
-    source: AuthRef<List<T>>,
-    chunk: u64,
-    state: RecurState<State>,
-    output: Draft<S>,
-    mut step: Step,
-) -> Draft<S>
-where
-    T: DeserializeOwned + Serialize + Selectable + 'static,
-    State: DeserializeOwned + Serialize + 'static,
-    S: Schema + DeserializeOwned + Serialize + 'static,
-    Step: FnMut(RecurInput<Block<T>>, RecurState<State>, RecurOutput<S>) -> Output,
-    Output: IntoRecurControl<(RecurState<State>, RecurOutput<S>)>,
-{
-    run_recur_chunked_list_with_state_with_finish(source, chunk, state, output, step, |draft, _| draft)
-}
-
 /// Runs the sweep and **closes** its output draft, binding the finalized value.
 /// This is what a `call_recur!` without `finalize = false` compiles to.
 #[doc(hidden)]
@@ -3090,30 +3241,6 @@ where
     run_recur_list_with_state_with_finish(source, state, output, step, finalize_recur_output)
 }
 
-/// Runs the sweep and **leaves** its output draft open, so a later writer can go
-/// on appending to the same value.
-///
-/// The draft stays linear and stays set-once; deferring only moves the single
-/// `finalize` to the end of the chain of writers instead of forcing it at the
-/// first recur. Compiled from `call_recur!(..., finalize = false, args = (..))`.
-#[doc(hidden)]
-pub fn run_recur_list_with_state_open<T, State, S, Step, Output>(
-
-    source: AuthRef<List<T>>,
-    state: RecurState<State>,
-    output: Draft<S>,
-    mut step: Step,
-) -> Draft<S>
-where
-    T: DeserializeOwned + Serialize + Selectable + 'static,
-    State: DeserializeOwned + Serialize + 'static,
-    S: Schema + DeserializeOwned + Serialize + 'static,
-    Step: FnMut(RecurInput<T>, RecurState<State>, RecurOutput<S>) -> Output,
-    Output: IntoRecurControl<(RecurState<State>, RecurOutput<S>)>,
-{
-    run_recur_list_with_state_with_finish(source, state, output, step, |draft, _| draft)
-}
-
 /// Runs the sweep and **closes** its output draft, binding the finalized value.
 /// This is what a `call_recur!` without `finalize = false` compiles to.
 #[doc(hidden)]
@@ -3130,28 +3257,6 @@ where
     Output: Into<RecurSequenceOutput<S>>,
 {
     run_recur_sequence_list_with_finish(source, output, step, finalize_recur_output)
-}
-
-/// Runs the sweep and **leaves** its output draft open, so a later writer can go
-/// on appending to the same value.
-///
-/// The draft stays linear and stays set-once; deferring only moves the single
-/// `finalize` to the end of the chain of writers instead of forcing it at the
-/// first recur. Compiled from `call_recur!(..., finalize = false, args = (..))`.
-#[doc(hidden)]
-pub fn run_recur_sequence_list_open<T, S, Step, Output>(
-
-    source: AuthRef<List<T>>,
-    output: Draft<S>,
-    mut step: Step,
-) -> Draft<S>
-where
-    T: DeserializeOwned + Serialize + Selectable + 'static,
-    S: Schema + DeserializeOwned + Serialize + 'static,
-    Step: FnMut(RecurSequenceInput<T>, RecurSequenceOutput<S>) -> Output,
-    Output: Into<RecurSequenceOutput<S>>,
-{
-    run_recur_sequence_list_with_finish(source, output, step, |draft, _| draft)
 }
 
 /// Runs the sweep and **closes** its output draft, binding the finalized value.
@@ -3173,31 +3278,6 @@ where
 {
     run_recur_sequence_list_with_state_with_finish(source, state, output, step, finalize_recur_output)
 }
-
-/// Runs the sweep and **leaves** its output draft open, so a later writer can go
-/// on appending to the same value.
-///
-/// The draft stays linear and stays set-once; deferring only moves the single
-/// `finalize` to the end of the chain of writers instead of forcing it at the
-/// first recur. Compiled from `call_recur!(..., finalize = false, args = (..))`.
-#[doc(hidden)]
-pub fn run_recur_sequence_list_with_state_open<T, State, S, Step, Output>(
-
-    source: AuthRef<List<T>>,
-    state: RecurState<State>,
-    output: Draft<S>,
-    mut step: Step,
-) -> Draft<S>
-where
-    T: DeserializeOwned + Serialize + Selectable + 'static,
-    State: DeserializeOwned + Serialize + 'static,
-    S: Schema + DeserializeOwned + Serialize + 'static,
-    Step: FnMut(RecurSequenceInput<T>, RecurSequenceState<State>, RecurSequenceOutput<S>) -> Output,
-    Output: Into<(RecurSequenceState<State>, RecurSequenceOutput<S>)>,
-{
-    run_recur_sequence_list_with_state_with_finish(source, state, output, step, |draft, _| draft)
-}
-
 
 #[cfg(feature = "std")]
 pub fn store_value<T: Serialize>(value: &T) -> raster_core::Result<StorageRef> {

@@ -1449,7 +1449,7 @@ mod tests {
                         id: "recur".to_string(),
                         sources: vec![],
                         chunk: None,
-                        leaves_output_open: false,
+                        output: None,
                         state_is_output: false,
                     }),
                     SequenceChildItem::Tile(TileItem {
@@ -1479,6 +1479,7 @@ mod tests {
                             id: "child".to_string(),
                             sources: vec![],
                             state_is_output: false,
+                            output: None,
                         }),
                         SequenceChildItem::Tile(TileItem {
                             id: "after".to_string(),

@@ -12,85 +12,102 @@ use std::collections::BTreeMap;
 
 use raster_core::collections::{Block, Bytes, BytesPage, List};
 use raster_core::input::payload_structural_root;
-use raster_core::tree::{subtree_payload_and_root, tree_value_from_serialize};
-use serde::Serialize;
+use raster_core::tree::{subtree_payload_and_root, tree_value_from_serialize, typed_value_from_tree};
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 
 /// `Some((encoder root, parser root))`, or `None` if the encoder refuses.
-fn roots<T: Serialize>(value: &T) -> Option<([u8; 32], Option<[u8; 32]>)> {
+fn encoder_roots<T: Serialize>(value: &T) -> Option<([u8; 32], Option<[u8; 32]>)> {
     let tree = tree_value_from_serialize(value).ok()?;
     let (payload, root) = subtree_payload_and_root(&tree).expect("a serialized tree encodes");
     Some((root, payload_structural_root(&payload)))
 }
 
-#[derive(Serialize)]
+/// [`encoder_roots`], and asserts the decoder inverts the encoder: decoding the tree back into
+/// `T` and re-encoding it reproduces the same tree. A draft is completed into
+/// its typed value this way, in the tile replay as well as on the host.
+fn roots<T: Serialize + DeserializeOwned>(value: &T) -> Option<([u8; 32], Option<[u8; 32]>)> {
+    let tree = tree_value_from_serialize(value).ok()?;
+    let decoded: T = typed_value_from_tree(&tree).expect("a serialized tree decodes");
+    assert_eq!(
+        tree_value_from_serialize(&decoded).expect("a decoded value re-encodes"),
+        tree,
+        "decode is not the inverse of encode for {}",
+        core::any::type_name::<T>()
+    );
+    let (payload, root) = subtree_payload_and_root(&tree).expect("a serialized tree encodes");
+    Some((root, payload_structural_root(&payload)))
+}
+
+#[derive(Serialize, Deserialize)]
 struct Unit;
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct Newtype(u32);
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct TupleStruct(u8, String);
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct Plain {
     count: u64,
     name: String,
     flag: bool,
 }
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct Nested {
     inner: Plain,
     tag: i16,
 }
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct WithList {
     title: String,
     lines: List<String>,
 }
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct WithBlock {
     title: String,
     window: Block<u32>,
 }
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct WithListOfStructs {
     rows: List<Plain>,
 }
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct WithOption {
     maybe: Option<u64>,
     nested: Option<Plain>,
 }
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 enum Shape {
     Empty,
     Radius(u32),
     Pair(u8, u8),
     Rect { width: u16, height: u16 },
 }
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct WithEnums {
     first: Shape,
     rest: Vec<Shape>,
 }
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct WithMap {
     index: BTreeMap<String, u32>,
 }
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct WithNestedLists {
     grid: List<List<u8>>,
     wrapped: Vec<List<u16>>,
     maybe: Option<List<String>>,
     pair: (List<u8>, u8),
 }
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 enum Carrier {
     Lines(List<String>),
     Named { rows: List<Plain>, tail: u8 },
 }
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct WithStructMap {
     rows: BTreeMap<u32, Plain>,
 }
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct WithBytes {
     head: u8,
     body: Bytes<4>,
@@ -126,7 +143,7 @@ fn every_payload_rederives_its_root() {
     }
     macro_rules! refused {
         ($name:expr, $value:expr) => {
-            cases.push(($name, false, roots(&$value)))
+            cases.push(($name, false, encoder_roots(&$value)))
         };
     }
 

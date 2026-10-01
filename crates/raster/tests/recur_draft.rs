@@ -165,7 +165,7 @@ fn build_lines_reference() -> StorageRef {
     call_recur!(
         tile = collect_lines,
         input = storage!(List<String>, source),
-        output = new!(LineBundle),
+        output,
         args = ()
     )
     .reference()
@@ -193,7 +193,7 @@ fn long_lines_reference() -> StorageRef {
     call_recur!(
         tile = collect_lines,
         input = storage!(List<String>, source),
-        output = new!(LineBundle),
+        output,
         args = ()
     )
     .reference()
@@ -216,7 +216,7 @@ fn find_first_match(needle: String) -> SearchBundle {
     call_recur!(
         tile = collect_first_match,
         input = storage!(List<String>, source),
-        output = new!(SearchBundle),
+        output,
         args = (needle,)
     )
 }
@@ -228,7 +228,7 @@ fn collect_optional_lines_from_empty() -> UnitLineBundle {
     call_recur!(
         tile = collect_optional_lines,
         input = storage!(List<String>, source),
-        output = new!(UnitLineBundle),
+        output,
         args = ()
     )
 }
@@ -240,7 +240,7 @@ fn collect_required_lines_from_empty() -> LineBundle {
     call_recur!(
         tile = collect_lines,
         input = storage!(List<String>, source),
-        output = new!(LineBundle),
+        output,
         args = ()
     )
 }
@@ -320,9 +320,11 @@ fn prefix_line(line: String, prefix: String) -> String {
     format!("{}{}", prefix, line)
 }
 
+/// The base the recur sequence below derives from: drafted in this tile and
+/// stored at its coordinate.
 #[tile]
-fn init_prefixed_bundle(output: Draft<LineBundle>) -> Draft<LineBundle> {
-    let mut output = output;
+fn init_prefixed_bundle() -> Draft<LineBundle> {
+    let mut output = Draft::<LineBundle>::new();
     output.title().set("prefixed".to_string());
     output
 }
@@ -357,7 +359,7 @@ fn collect_two_items(limit: u64) -> LimitedBundle {
         tile = collect_until_limit,
         input = storage!(List<String>, source),
         state = LimitState { seen: 0 },
-        output = new!(LimitedBundle),
+        output,
         args = (limit,)
     )
 }
@@ -438,7 +440,7 @@ fn build_prefixed_lines_with_recur_sequence() -> LineBundle {
     let prefix_source =
         raster::store_value(&"line: ".to_string()).expect("prefix source should store");
 
-    let output = call!(init_prefixed_bundle, new!(LineBundle));
+    let output = call!(init_prefixed_bundle);
 
     call_recur_seq!(
         sequence = collect_prefixed_lines,
@@ -624,9 +626,10 @@ fn call_recur_never_materializes_its_source() {
     >(reference, resolve_counted_string_list));
 
     RECUR_TILE_RESOLVE_COUNT.store(0, Ordering::SeqCst);
+    let _site = raster::__private::RecurSiteScopeGuard::enter();
     let auth = raster::run_recur_list::<String, LineBundle, _, _>(
         source,
-        new!(LineBundle),
+        raster::open_site_draft::<LineBundle>(raster::SiteOutput::Create),
         |input, output| collect_lines(input, output),
     );
     let result = into_auth_value::<LineBundle, _>(auth).unwrap().into_inner();
@@ -667,9 +670,10 @@ fn recur_sequence_never_materializes_its_source() {
     // the *source* resolutions a full sweep costs — not just the ones an
     // untouched `AuthRef` would defer.
     let mut items = 0usize;
+    let _site = raster::__private::RecurSiteScopeGuard::enter();
     let _auth = raster::run_recur_sequence_list::<String, ItemsOnlyBundle, _, _>(
         source,
-        new!(ItemsOnlyBundle),
+        raster::open_site_draft::<ItemsOnlyBundle>(raster::SiteOutput::Create),
         |input, output| {
             input
                 .__raster_auth_trace()
@@ -1198,4 +1202,81 @@ fn a_stateful_recur_sequence_iteration_chains_its_carried_state() {
         transitions[0].state_in, transitions[0].state_out,
         "a fold that changes the state must change its commitment",
     );
+}
+
+// ---------------------------------------------------------------------------
+// Derivation: a recur site continuing a stored object
+// ---------------------------------------------------------------------------
+
+/// Only appends — the shape a site deriving from a stored object may take.
+#[tile(kind = recur)]
+fn append_only(input: RecurInput<String>, output: RecurOutput<LineBundle>) -> RecurOutput<LineBundle> {
+    let mut output = output;
+    output.items().push(input.into_value());
+    output
+}
+
+#[tile]
+fn titled_bundle_with_one_item() -> Draft<LineBundle> {
+    let mut bundle = Draft::<LineBundle>::new();
+    bundle.title().set("base".to_string());
+    bundle.items().push("zero".to_string());
+    bundle
+}
+
+#[sequence]
+fn derive_bundle() -> (StorageRef, StorageRef) {
+    let source = raster::store_value(&vec!["one".to_string(), "two".to_string()])
+        .expect("list source should store");
+    let base = call!(titled_bundle_with_one_item);
+    let base_reference = base.reference().clone();
+    let derived = call_recur!(
+        tile = append_only,
+        input = storage!(List<String>, source),
+        output = base,
+        args = ()
+    );
+    (base_reference, derived.reference().clone())
+}
+
+/// A site that sets a field on a derived object: the base already wrote it.
+#[sequence]
+fn derive_bundle_and_set_title() -> LineBundle {
+    let source = raster::store_value(&vec!["one".to_string()]).expect("list source should store");
+    let base = call!(titled_bundle_with_one_item);
+    call_recur!(
+        tile = collect_lines,
+        input = storage!(List<String>, source),
+        output = base,
+        args = ()
+    )
+}
+
+/// `[s]` is the base plus the sweep's appends, written as a new object at the
+/// site's own coordinate; the base at `[k]` is untouched.
+#[test]
+fn a_derived_site_extends_its_base_into_a_new_object() {
+    let (base, derived) = materialize_auth_return::<(StorageRef, StorageRef), _>(
+        __raster_sequence_auth_derive_bundle(),
+    );
+    assert_ne!(base.coordinates, derived.coordinates);
+
+    let base_value = into_auth_value::<LineBundle, _>(storage!(LineBundle, base)).unwrap().into_inner();
+    assert_eq!(base_value.title, "base");
+    assert_eq!(base_value.items.as_slice(), ["zero".to_string()]);
+
+    let derived_value =
+        into_auth_value::<LineBundle, _>(storage!(LineBundle, derived)).unwrap().into_inner();
+    assert_eq!(derived_value.title, "base");
+    assert_eq!(
+        derived_value.items.as_slice(),
+        ["zero".to_string(), "one".to_string(), "two".to_string()]
+    );
+}
+
+/// Derivation is push-only: every set-once field came written from the base.
+#[test]
+#[should_panic(expected = "can only be written once")]
+fn a_derived_site_cannot_set_a_field() {
+    let _ = materialize_auth_return::<LineBundle, _>(__raster_sequence_auth_derive_bundle_and_set_title());
 }

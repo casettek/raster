@@ -16,6 +16,9 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt;
 
+use serde::de::{
+    self, DeserializeOwned, DeserializeSeed, IntoDeserializer, MapAccess, SeqAccess, Visitor,
+};
 use serde::ser::{
     self, SerializeMap, SerializeSeq, SerializeStruct, SerializeStructVariant, SerializeTuple,
     SerializeTupleStruct, SerializeTupleVariant,
@@ -804,4 +807,664 @@ pub fn list_root_from_hashes(hashes: &[Hash32]) -> Hash32 {
     }
 
     selection_hash(&[b"list-root", &len.to_le_bytes(), level[0].as_slice()])
+}
+
+// ---------------------------------------------------------------------------
+// Decoding: a tree back into a typed value
+// ---------------------------------------------------------------------------
+
+impl de::Error for TreeSerdeError {
+    fn custom<T: fmt::Display>(msg: T) -> Self {
+        Self(msg.to_string())
+    }
+}
+
+
+struct TreeValueDeserializer<'de> {
+    value: &'de TreeValue,
+}
+
+impl<'de> TreeValueDeserializer<'de> {
+    fn new(value: &'de TreeValue) -> Self {
+        Self { value }
+    }
+}
+
+struct TreeSeqAccess<'de> {
+    iter: core::slice::Iter<'de, TreeValue>,
+}
+
+impl<'de> SeqAccess<'de> for TreeSeqAccess<'de> {
+    type Error = TreeSerdeError;
+
+    fn next_element_seed<T>(&mut self, seed: T) -> Result<Option<T::Value>, Self::Error>
+    where
+        T: DeserializeSeed<'de>,
+    {
+        match self.iter.next() {
+            Some(value) => seed
+                .deserialize(TreeValueDeserializer::new(value))
+                .map(Some),
+            None => Ok(None),
+        }
+    }
+}
+
+struct TreeStructAccess<'de> {
+    iter: core::slice::Iter<'de, (String, TreeValue)>,
+    value: Option<&'de TreeValue>,
+}
+
+/// Feeds `BytesPageWire`'s `Deserialize` its four fields. Used only for the
+/// bytes-page arm, so it carries its own field type rather than `TreeValue`:
+/// the payload stays one flat buffer instead of becoming a node per byte that
+/// the very next step would collapse again.
+struct OwnedStructAccess {
+    iter: alloc::vec::IntoIter<(&'static str, PageWireField)>,
+    value: Option<PageWireField>,
+}
+
+enum PageWireField {
+    U64(u64),
+    Bytes(Vec<u8>),
+}
+
+fn bytes_page_wire_fields(
+    index: u64,
+    offset: u64,
+    len: u64,
+    bytes: &[u8],
+) -> Vec<(&'static str, PageWireField)> {
+    vec![
+        ("index", PageWireField::U64(index)),
+        ("offset", PageWireField::U64(offset)),
+        ("len", PageWireField::U64(len)),
+        ("bytes", PageWireField::Bytes(bytes.to_vec())),
+    ]
+}
+
+struct TreeMapAccess<'de> {
+    iter: core::slice::Iter<'de, (TreeValue, TreeValue)>,
+    value: Option<&'de TreeValue>,
+}
+
+struct TreeEnumAccess<'de> {
+    variant: &'de str,
+    value: TreeEnumValue<'de>,
+}
+
+enum TreeEnumValue<'de> {
+    Unit,
+    Newtype(&'de TreeValue),
+    Tuple(&'de [TreeValue]),
+    Struct(&'de [(String, TreeValue)]),
+}
+
+impl<'de> MapAccess<'de> for TreeStructAccess<'de> {
+    type Error = TreeSerdeError;
+
+    fn next_key_seed<K>(&mut self, seed: K) -> Result<Option<K::Value>, Self::Error>
+    where
+        K: DeserializeSeed<'de>,
+    {
+        match self.iter.next() {
+            Some((key, value)) => {
+                self.value = Some(value);
+                seed.deserialize(key.as_str().into_deserializer()).map(Some)
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn next_value_seed<V>(&mut self, seed: V) -> Result<V::Value, Self::Error>
+    where
+        V: DeserializeSeed<'de>,
+    {
+        let value = self
+            .value
+            .take()
+            .ok_or_else(|| TreeSerdeError("missing struct field value".into()))?;
+        seed.deserialize(TreeValueDeserializer::new(value))
+    }
+}
+
+impl<'de> MapAccess<'de> for OwnedStructAccess {
+    type Error = TreeSerdeError;
+
+    fn next_key_seed<K>(&mut self, seed: K) -> Result<Option<K::Value>, Self::Error>
+    where
+        K: DeserializeSeed<'de>,
+    {
+        match self.iter.next() {
+            Some((key, value)) => {
+                self.value = Some(value);
+                seed.deserialize(key.into_deserializer()).map(Some)
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn next_value_seed<V>(&mut self, seed: V) -> Result<V::Value, Self::Error>
+    where
+        V: DeserializeSeed<'de>,
+    {
+        let value = self
+            .value
+            .take()
+            .ok_or_else(|| TreeSerdeError("missing struct field value".into()))?;
+        match value {
+            PageWireField::U64(n) => seed.deserialize(n.into_deserializer()),
+            PageWireField::Bytes(bytes) => seed.deserialize(OwnedU8SeqDeserializer { bytes }),
+        }
+    }
+}
+
+struct OwnedU8SeqDeserializer {
+    bytes: Vec<u8>,
+}
+
+impl<'de> serde::Deserializer<'de> for OwnedU8SeqDeserializer {
+    type Error = TreeSerdeError;
+
+    fn deserialize_any<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_seq(OwnedU8SeqAccess {
+            iter: self.bytes.into_iter(),
+        })
+    }
+
+    fn deserialize_seq<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        self.deserialize_any(visitor)
+    }
+
+    fn deserialize_bytes<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_byte_buf(self.bytes)
+    }
+
+    fn deserialize_byte_buf<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_byte_buf(self.bytes)
+    }
+
+    serde::forward_to_deserialize_any! {
+        bool i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 char str string
+        option unit unit_struct newtype_struct tuple tuple_struct
+        map struct enum identifier ignored_any
+    }
+}
+
+struct OwnedU8SeqAccess {
+    iter: alloc::vec::IntoIter<u8>,
+}
+
+impl<'de> SeqAccess<'de> for OwnedU8SeqAccess {
+    type Error = TreeSerdeError;
+
+    fn next_element_seed<T>(&mut self, seed: T) -> Result<Option<T::Value>, Self::Error>
+    where
+        T: DeserializeSeed<'de>,
+    {
+        match self.iter.next() {
+            Some(byte) => seed.deserialize(u8::into_deserializer(byte)).map(Some),
+            None => Ok(None),
+        }
+    }
+}
+
+impl<'de> MapAccess<'de> for TreeMapAccess<'de> {
+    type Error = TreeSerdeError;
+
+    fn next_key_seed<K>(&mut self, seed: K) -> Result<Option<K::Value>, Self::Error>
+    where
+        K: DeserializeSeed<'de>,
+    {
+        match self.iter.next() {
+            Some((key, value)) => {
+                self.value = Some(value);
+                seed.deserialize(TreeValueDeserializer::new(key)).map(Some)
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn next_value_seed<V>(&mut self, seed: V) -> Result<V::Value, Self::Error>
+    where
+        V: DeserializeSeed<'de>,
+    {
+        let value = self
+            .value
+            .take()
+            .ok_or_else(|| TreeSerdeError("missing map value".into()))?;
+        seed.deserialize(TreeValueDeserializer::new(value))
+    }
+}
+
+impl<'de> de::EnumAccess<'de> for TreeEnumAccess<'de> {
+    type Error = TreeSerdeError;
+    type Variant = Self;
+
+    fn variant_seed<V>(self, seed: V) -> Result<(V::Value, Self::Variant), Self::Error>
+    where
+        V: DeserializeSeed<'de>,
+    {
+        let variant = seed.deserialize(self.variant.into_deserializer())?;
+        Ok((variant, self))
+    }
+}
+
+impl<'de> de::VariantAccess<'de> for TreeEnumAccess<'de> {
+    type Error = TreeSerdeError;
+
+    fn unit_variant(self) -> Result<(), Self::Error> {
+        match self.value {
+            TreeEnumValue::Unit => Ok(()),
+            _ => Err(TreeSerdeError("expected unit variant".into())),
+        }
+    }
+
+    fn newtype_variant_seed<T>(self, seed: T) -> Result<T::Value, Self::Error>
+    where
+        T: DeserializeSeed<'de>,
+    {
+        match self.value {
+            TreeEnumValue::Newtype(value) => seed.deserialize(TreeValueDeserializer::new(value)),
+            _ => Err(TreeSerdeError("expected newtype variant".into())),
+        }
+    }
+
+    fn tuple_variant<V>(self, _len: usize, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        match self.value {
+            TreeEnumValue::Tuple(values) => visitor.visit_seq(TreeSeqAccess {
+                iter: values.iter(),
+            }),
+            _ => Err(TreeSerdeError("expected tuple variant".into())),
+        }
+    }
+
+    fn struct_variant<V>(
+        self,
+        _fields: &'static [&'static str],
+        visitor: V,
+    ) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        match self.value {
+            TreeEnumValue::Struct(fields) => visitor.visit_map(TreeStructAccess {
+                iter: fields.iter(),
+                value: None,
+            }),
+            _ => Err(TreeSerdeError("expected struct variant".into())),
+        }
+    }
+}
+
+impl<'de> de::Deserializer<'de> for TreeValueDeserializer<'de> {
+    type Error = TreeSerdeError;
+
+    fn deserialize_any<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        match self.value {
+            TreeValue::Unit => visitor.visit_unit(),
+            TreeValue::Bool(value) => visitor.visit_bool(*value),
+            TreeValue::U8(value) => visitor.visit_u8(*value),
+            TreeValue::U16(value) => visitor.visit_u16(*value),
+            TreeValue::U32(value) => visitor.visit_u32(*value),
+            TreeValue::U64(value) => visitor.visit_u64(*value),
+            TreeValue::I8(value) => visitor.visit_i8(*value),
+            TreeValue::I16(value) => visitor.visit_i16(*value),
+            TreeValue::I32(value) => visitor.visit_i32(*value),
+            TreeValue::I64(value) => visitor.visit_i64(*value),
+            TreeValue::String(value) => visitor.visit_string(value.clone()),
+            TreeValue::Struct(fields) => visitor.visit_map(TreeStructAccess {
+                iter: fields.iter(),
+                value: None,
+            }),
+            TreeValue::List(values) | TreeValue::ListHandle(values) => {
+                visitor.visit_seq(TreeSeqAccess {
+                    iter: values.iter(),
+                })
+            }
+            TreeValue::Map(entries) => visitor.visit_map(TreeMapAccess {
+                iter: entries.iter(),
+                value: None,
+            }),
+            TreeValue::EnumUnit(variant) => visitor.visit_enum(TreeEnumAccess {
+                variant,
+                value: TreeEnumValue::Unit,
+            }),
+            TreeValue::EnumNewtype(variant, value) => visitor.visit_enum(TreeEnumAccess {
+                variant,
+                value: TreeEnumValue::Newtype(value.as_ref()),
+            }),
+            TreeValue::EnumTuple(variant, values) => visitor.visit_enum(TreeEnumAccess {
+                variant,
+                value: TreeEnumValue::Tuple(values.as_slice()),
+            }),
+            TreeValue::EnumStruct(variant, fields) => visitor.visit_enum(TreeEnumAccess {
+                variant,
+                value: TreeEnumValue::Struct(fields.as_slice()),
+            }),
+            TreeValue::BytesPage {
+                index,
+                offset,
+                len,
+                bytes,
+            } => visitor.visit_map(OwnedStructAccess {
+                iter: bytes_page_wire_fields(*index, *offset, *len, bytes).into_iter(),
+                value: None,
+            }),
+        }
+    }
+
+    fn deserialize_bool<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        match self.value {
+            TreeValue::Bool(value) => visitor.visit_bool(*value),
+            _ => Err(TreeSerdeError("expected bool".into())),
+        }
+    }
+
+    fn deserialize_u8<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        match self.value {
+            TreeValue::U8(value) => visitor.visit_u8(*value),
+            _ => Err(TreeSerdeError("expected u8".into())),
+        }
+    }
+
+    fn deserialize_u16<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        match self.value {
+            TreeValue::U16(value) => visitor.visit_u16(*value),
+            TreeValue::U8(value) => visitor.visit_u16(*value as u16),
+            _ => Err(TreeSerdeError("expected u16".into())),
+        }
+    }
+
+    fn deserialize_u32<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        match self.value {
+            TreeValue::U32(value) => visitor.visit_u32(*value),
+            TreeValue::U16(value) => visitor.visit_u32(*value as u32),
+            TreeValue::U8(value) => visitor.visit_u32(*value as u32),
+            _ => Err(TreeSerdeError("expected u32".into())),
+        }
+    }
+
+    fn deserialize_u64<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        match self.value {
+            TreeValue::U64(value) => visitor.visit_u64(*value),
+            TreeValue::U32(value) => visitor.visit_u64(*value as u64),
+            TreeValue::U16(value) => visitor.visit_u64(*value as u64),
+            TreeValue::U8(value) => visitor.visit_u64(*value as u64),
+            _ => Err(TreeSerdeError("expected u64".into())),
+        }
+    }
+
+    fn deserialize_i8<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        match self.value {
+            TreeValue::I8(value) => visitor.visit_i8(*value),
+            _ => Err(TreeSerdeError("expected i8".into())),
+        }
+    }
+
+    fn deserialize_i16<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        match self.value {
+            TreeValue::I16(value) => visitor.visit_i16(*value),
+            TreeValue::I8(value) => visitor.visit_i16(*value as i16),
+            _ => Err(TreeSerdeError("expected i16".into())),
+        }
+    }
+
+    fn deserialize_i32<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        match self.value {
+            TreeValue::I32(value) => visitor.visit_i32(*value),
+            TreeValue::I16(value) => visitor.visit_i32(*value as i32),
+            TreeValue::I8(value) => visitor.visit_i32(*value as i32),
+            _ => Err(TreeSerdeError("expected i32".into())),
+        }
+    }
+
+    fn deserialize_i64<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        match self.value {
+            TreeValue::I64(value) => visitor.visit_i64(*value),
+            TreeValue::I32(value) => visitor.visit_i64(*value as i64),
+            TreeValue::I16(value) => visitor.visit_i64(*value as i64),
+            TreeValue::I8(value) => visitor.visit_i64(*value as i64),
+            _ => Err(TreeSerdeError("expected i64".into())),
+        }
+    }
+
+    fn deserialize_str<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        match self.value {
+            TreeValue::String(value) => visitor.visit_str(value.as_str()),
+            _ => Err(TreeSerdeError("expected string".into())),
+        }
+    }
+
+    fn deserialize_string<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        match self.value {
+            TreeValue::String(value) => visitor.visit_string(value.clone()),
+            _ => Err(TreeSerdeError("expected string".into())),
+        }
+    }
+
+    fn deserialize_seq<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        match self.value {
+            TreeValue::List(values) | TreeValue::ListHandle(values) => {
+                visitor.visit_seq(TreeSeqAccess {
+                    iter: values.iter(),
+                })
+            }
+            _ => Err(TreeSerdeError("expected list".into())),
+        }
+    }
+
+    fn deserialize_tuple<V>(self, _len: usize, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        self.deserialize_seq(visitor)
+    }
+
+    fn deserialize_tuple_struct<V>(
+        self,
+        _name: &'static str,
+        _len: usize,
+        visitor: V,
+    ) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        self.deserialize_seq(visitor)
+    }
+
+    fn deserialize_struct<V>(
+        self,
+        _name: &'static str,
+        _fields: &'static [&'static str],
+        visitor: V,
+    ) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        match self.value {
+            TreeValue::Struct(fields) => visitor.visit_map(TreeStructAccess {
+                iter: fields.iter(),
+                value: None,
+            }),
+            TreeValue::BytesPage {
+                index,
+                offset,
+                len,
+                bytes,
+            } => visitor.visit_map(OwnedStructAccess {
+                iter: bytes_page_wire_fields(*index, *offset, *len, bytes).into_iter(),
+                value: None,
+            }),
+            _ => Err(TreeSerdeError("expected struct".into())),
+        }
+    }
+
+    fn deserialize_newtype_struct<V>(
+        self,
+        _name: &'static str,
+        visitor: V,
+    ) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_newtype_struct(self)
+    }
+
+    fn deserialize_identifier<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        self.deserialize_string(visitor)
+    }
+
+    fn deserialize_ignored_any<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_unit()
+    }
+
+    fn deserialize_option<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        match self.value {
+            TreeValue::Unit => visitor.visit_none(),
+            _ => visitor.visit_some(self),
+        }
+    }
+
+    fn deserialize_unit<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        match self.value {
+            TreeValue::Unit => visitor.visit_unit(),
+            _ => Err(TreeSerdeError("expected unit".into())),
+        }
+    }
+
+    fn deserialize_unit_struct<V>(
+        self,
+        _name: &'static str,
+        visitor: V,
+    ) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        self.deserialize_unit(visitor)
+    }
+
+    fn deserialize_map<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        match self.value {
+            TreeValue::Map(entries) => visitor.visit_map(TreeMapAccess {
+                iter: entries.iter(),
+                value: None,
+            }),
+            _ => Err(TreeSerdeError("expected map".into())),
+        }
+    }
+
+    fn deserialize_enum<V>(
+        self,
+        _name: &'static str,
+        _variants: &'static [&'static str],
+        visitor: V,
+    ) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        match self.value {
+            TreeValue::EnumUnit(variant) => visitor.visit_enum(TreeEnumAccess {
+                variant,
+                value: TreeEnumValue::Unit,
+            }),
+            TreeValue::EnumNewtype(variant, value) => visitor.visit_enum(TreeEnumAccess {
+                variant,
+                value: TreeEnumValue::Newtype(value.as_ref()),
+            }),
+            TreeValue::EnumTuple(variant, values) => visitor.visit_enum(TreeEnumAccess {
+                variant,
+                value: TreeEnumValue::Tuple(values.as_slice()),
+            }),
+            TreeValue::EnumStruct(variant, fields) => visitor.visit_enum(TreeEnumAccess {
+                variant,
+                value: TreeEnumValue::Struct(fields.as_slice()),
+            }),
+            _ => Err(TreeSerdeError("expected enum".into())),
+        }
+    }
+
+    serde::forward_to_deserialize_any! {
+        i128 u128 f32 f64 char bytes byte_buf
+    }
+}
+
+/// Decode a value out of its tree — the inverse of [`tree_value_from_serialize`].
+/// `no_std`, so a tile replay can complete a draft into its typed value.
+pub fn typed_value_from_tree<T: DeserializeOwned>(value: &TreeValue) -> CoreResult<T> {
+    T::deserialize(TreeValueDeserializer::new(value)).map_err(|e| {
+        Error::Serialization(format!(
+            "Failed to deserialize selected external input from selection tree: {}",
+            e
+        ))
+    })
 }
