@@ -4,8 +4,8 @@
 //! follow the schema's ordering.
 
 use raster_core::cfs::{
-    CfsCoordinate, CfsCoordinates, CfsCursor, InputBinding, InputSource, ResolveError,
-    SequenceChildItem,
+    CfsCoordinate, CfsCoordinates, CfsCursor, InputBinding, InputSource, RecurOutputDecl,
+    ResolveError, SequenceChildItem,
     FIRST_COORDINATE,
 };
 use raster_core::input::SelectorSegment;
@@ -17,10 +17,13 @@ use crate::merkle_tree::{combine_merkle_level, hash_trace_item};
 
 use raster_core::draft::TileReplayJournal;
 use raster_core::input::{
-    verify_selection_reference_witness, verify_selection_witness, SelectionPayloadKind,
+    verify_selection_reference_witness, verify_selection_witness, Hash32, SelectionPayloadKind,
     SelectionWitness,
 };
-use raster_core::recur_progress::{source_identity, RecurProgressStack, RecurSiteKind};
+use raster_core::transition::StorageReadWitness;
+use raster_core::recur_progress::{
+    source_identity, DraftStep, RecurProgressStack, RecurSiteKind, SiteDraft,
+};
 use raster_core::trace::{
     ExecStep, ExecTarget, FnInput, FnInputValue, StepKind, StepRecord, StorageData,
 };
@@ -972,50 +975,157 @@ fn decode_list_metadata_len(bytes: &[u8]) -> Option<u64> {
     (bytes.len() == expected).then_some(len)
 }
 
-/// Advance the carried recur progress by this step's facts and hold the result
-/// to the commitment the step recorded.
+/// A recur-sequence iteration's state, at its `Start`: the body's second
+/// parameter (`input, state, output?, args…`), the order the CFS records the
+/// call's sources in.
 ///
-/// One rule, uniform for every step. The recorder reached its commitment by
-/// advancing with the values rules 3 and 4 *require* — derived from
-/// `(chunk, source_len, next_iteration_index)`, all of which it holds. The
-/// guest advances with the journal's actual values. Both mutate only
-/// `next_iteration_index` and `last_control`, so both land on the same frame
-/// **iff** the journal agrees with the derivation; where it disagrees, a rule
-/// fires before any hash is compared.
+/// Held by reference after iteration 0 (D5b), so it must be a binding naming
+/// exactly the state the chain has reached — the previous iteration's returned
+/// object, or a stored seed — as a whole object. Only iteration 0 of a site
+/// seeded inline reads its state inline, and nothing commits it: the chain
+/// adopts it at that iteration's `End`, as an inline seed always was.
 ///
-/// That asymmetry is the point: a journal value *compared against* the frame's
-/// inputs is reachable for a producer that has no journal, whereas revision 1's
-/// `consumed_total` — folded *into* the frame — was not. See
-/// `docs/proposals/recur-progress-commitment.md` §1 and §4.
-/// Bind a recur iteration's claimed incoming state to what it actually read.
-///
-/// The transition on the step record is host-written. On its own that would
-/// make the chain a set of equalities between prover-chosen values; this ties
-/// `state_in` to the iteration's own recorded input witness, which is already
-/// bound to the step by `input_source_commitment`. A recur sequence's carried
-/// state is the second recorded value — the body's parameters are
-/// `input, state?, output?, args...`, which is also the order the CFS records
-/// the call's sources in.
-fn assert_carried_state_matches_input(step_record: &StepRecord, input_source_witness: Option<&FnInput>) {
-    let Some(transition) = step_record.recur_state.as_ref() else {
-        return;
-    };
+/// The binding is not read here: a sequence boundary has no storage roots. A
+/// body tile that consumes the state reads it from storage, and
+/// `verify_sequence_scope_parent` ties that read to this binding.
+fn check_iteration_state_binding(
+    step_record: &StepRecord,
+    progress: &RecurProgressStack,
+    input_source_witness: Option<&FnInput>,
+) {
     let witness = input_source_witness.unwrap_or_else(|| {
         panic!(
-            "Recur iteration claims a carried state with no input witness: {:?}",
+            "Recur sequence iteration {:?} carries state but records no input witness",
             step_record
         )
     });
-    let Some(FnInputValue::Inline(bytes)) = witness.values().get(1) else {
+    let expected = progress.innermost().and_then(|frame| frame.state_commitment);
+    match (witness.values().get(1), expected) {
+        (Some(FnInputValue::StorageBinding), Some(expected)) => {
+            let name = witness
+                .args()
+                .get(1)
+                .map(|arg| arg.name.as_str())
+                .expect("a recorded value has an argument");
+            let binding = witness.storage().get(name).unwrap_or_else(|| {
+                panic!(
+                    "Recur sequence iteration {:?} is missing its state binding '{}'",
+                    step_record, name
+                )
+            });
+            assert!(
+                binding.selection.path.segments.is_empty(),
+                "Recur sequence iteration {:?} must carry its state as a whole object",
+                step_record,
+            );
+            assert_eq!(
+                binding.commitment.as_slice(),
+                expected.as_slice(),
+                "Recur sequence iteration {:?} reads a state that is not the one its sweep reached",
+                step_record,
+            );
+        }
+        (Some(FnInputValue::Inline(_)), None) => {}
+        (Some(FnInputValue::Inline(_)), Some(_)) => panic!(
+            "Recur sequence iteration {:?} carries its state inline after the chain started; \
+             it must be the previous iteration's returned object",
+            step_record
+        ),
+        (Some(FnInputValue::StorageBinding), None) => panic!(
+            "Recur sequence iteration {:?} reads a stored state its site's chain never opened at",
+            step_record
+        ),
+        (None, _) => panic!(
+            "Recur sequence iteration {:?} carries state but records no state value",
+            step_record
+        ),
+    }
+}
+
+/// A recur-sequence iteration's returned state, at its `End` (D5b): the
+/// object the CFS's `returns` for the body names inside this iteration, read
+/// from the current storage state, whose commitment is the transition's
+/// `state_out`. That ties every link of the chain to what a body tile wrote —
+/// the tile's write is itself bound to its replay (`tile-io-structural-roots`
+/// step 2) — and the last link to the site's stored result, at `RecurEnd`.
+///
+/// A body returning its state parameter unchanged returns the state it read.
+fn verify_returned_state(
+    cfs_cursor: &CfsCursor,
+    step_record: &StepRecord,
+    body_id: &str,
+    transition: &raster_core::draft::RecurStateTransition,
+    output_witness: Option<&Vec<u8>>,
+    read_witness: Option<&StorageReadWitness>,
+    current_storage_root: &[u8],
+    current_index_root: &[u8],
+) {
+    let returns = cfs_cursor.sequence_returns(body_id).unwrap_or_else(|| {
         panic!(
-            "Recur iteration claims a carried state but records no inline state value: {:?}",
+            "Recur sequence `{}` carries state but the CFS binds no returned state",
+            body_id
+        )
+    });
+    if matches!(returns.source, InputBinding::SequenceScope { input_index: 1 })
+        && returns.path.is_empty()
+    {
+        assert_eq!(
+            transition.state_out, transition.state_in,
+            "Recur sequence iteration {:?} returns its state unchanged but claims another",
+            step_record,
+        );
+        return;
+    }
+    let iteration = step_record.coordinates().opened();
+    let resolved = cfs_cursor
+        .resolve_value(&iteration, &returns.source, &returns.path)
+        .unwrap_or_else(|error| {
+            panic!(
+                "Recur sequence `{}`'s returned state does not resolve to a step's output: {:?}",
+                body_id, error
+            )
+        });
+    assert!(
+        resolved.path.is_empty() && resolved.path_complete,
+        "Recur sequence `{}` must return its state as a whole object",
+        body_id,
+    );
+    let returned: Option<StorageData> = output_witness
+        .and_then(|bytes| postcard::from_bytes(bytes).ok())
+        .unwrap_or_else(|| {
+            panic!(
+                "Recur sequence iteration {:?} records no returned state binding",
+                step_record
+            )
+        });
+    let returned = returned.unwrap_or_else(|| {
+        panic!(
+            "Recur sequence iteration {:?} returned a state that is not a stored object",
             step_record
         )
-    };
+    });
     assert_eq!(
-        transition.state_in,
-        raster_core::recur_progress::state_commitment(bytes),
-        "Recur iteration's claimed incoming state is not the state it read: {:?}",
+        returned.coordinates, resolved.coordinates,
+        "Recur sequence iteration {:?} returned a state its body did not produce",
+        step_record,
+    );
+    let read_witness = read_witness.unwrap_or_else(|| {
+        panic!(
+            "Recur sequence iteration {:?} is missing the read witness of its returned state",
+            step_record
+        )
+    });
+    crate::checks::store::verify_storage_read_witness(
+        read_witness,
+        current_storage_root,
+        current_index_root,
+        &returned.coordinates,
+        &returned.commitment,
+    );
+    assert_eq!(
+        transition.state_out.as_slice(),
+        returned.commitment.as_slice(),
+        "Recur sequence iteration {:?} claims a state_out that is not its returned object",
         step_record,
     );
 }
@@ -1125,22 +1235,106 @@ fn site_state_is_output(item: &SequenceChildItem) -> bool {
     }
 }
 
+/// A recur site's stored seed, at its `Start` (D5b): the commitment of its
+/// second argument when the CFS says it carries state and the seed is a whole
+/// stored object — read from storage by `checks::store`, since `RecurStart`
+/// carries storage roots. `None` for an inline seed, which the chain adopts
+/// from iteration 0, and for a selection inside an object, whose value root
+/// the binding does not carry.
+fn stored_seed(item: &SequenceChildItem, input_source_witness: Option<&FnInput>) -> Option<Hash32> {
+    let carries_state = match item {
+        SequenceChildItem::RecurTile(tile) => tile.carries_state,
+        SequenceChildItem::RecurSequence(sequence) => sequence.carries_state,
+        _ => false,
+    };
+    if !carries_state {
+        return None;
+    }
+    let witness = input_source_witness?;
+    if !matches!(witness.values().get(1), Some(FnInputValue::StorageBinding)) {
+        return None;
+    }
+    let binding = witness.storage().get(witness.args().get(1)?.name.as_str())?;
+    if !binding.selection.path.segments.is_empty() {
+        return None;
+    }
+    binding.commitment.as_slice().try_into().ok()
+}
+
+/// The object a recur site owns, from the CFS: `None` for a state-only site.
+fn site_output_decl(item: &SequenceChildItem) -> Option<&RecurOutputDecl> {
+    match item {
+        SequenceChildItem::RecurTile(tile) => tile.output.as_ref(),
+        SequenceChildItem::RecurSequence(sequence) => sequence.output.as_ref(),
+        _ => None,
+    }
+}
+
+/// The root a site's object opens at: the CFS's empty root for a creating
+/// site; for a deriving one, the commitment of the base its `Start` reads as
+/// `"output"` — bound to its producer by the CFS input check and read from
+/// storage by `checks::store`, since `RecurStart` carries storage roots.
+///
+/// A whole object only: a base selected out of a larger object would need the
+/// selected value's root, which the binding does not carry.
+fn opening_draft(
+    step_record: &StepRecord,
+    decl: &RecurOutputDecl,
+    input_source_witness: Option<&FnInput>,
+) -> SiteDraft {
+    if !decl.derives {
+        return SiteDraft {
+            schema_hash: decl.schema_hash,
+            root: decl.empty_root,
+        };
+    }
+    let base = input_source_witness
+        .and_then(|witness| witness.storage().get("output"))
+        .unwrap_or_else(|| {
+            panic!(
+                "Deriving recur site {:?} does not read its base as `output`",
+                step_record.coordinates
+            )
+        });
+    assert!(
+        base.selection.path.segments.is_empty(),
+        "Deriving recur site {:?} must derive from a whole object, not a selection inside one",
+        step_record.coordinates,
+    );
+    SiteDraft {
+        schema_hash: decl.schema_hash,
+        root: base
+            .commitment
+            .as_slice()
+            .try_into()
+            .expect("an object commitment is 32 bytes"),
+    }
+}
+
 pub fn advance_recur_progress(
     cfs_cursor: &CfsCursor,
     progress: &mut RecurProgressStack,
     step_record: &StepRecord,
     replay_journal: Option<&TileReplayJournal>,
+    draft_step: Option<&DraftStep>,
     input_source_witness: Option<&FnInput>,
     output_witness: Option<&Vec<u8>>,
     storage_selection_witnesses: &BTreeMap<String, SelectionWitness>,
+    returned_state_read_witness: Option<&StorageReadWitness>,
+    current_storage_root: &[u8],
+    current_index_root: &[u8],
 ) {
     let coordinates = step_record.coordinates();
+    // Set for a recur tile's iteration: its return is the site's draft, so a
+    // site owning an object requires a transition from every one.
+    let mut is_tile_iteration = false;
 
     if let Some((site_coordinates, iteration_index)) =
         cfs_cursor.try_get_recur_iteration_coordinates(coordinates)
     {
         match cfs_cursor.try_get_item(&site_coordinates) {
             Some(SequenceChildItem::RecurTile(tile)) => {
+                is_tile_iteration = true;
                 // The step record carries a host copy of the same transition,
                 // for uniformity with recur sequences. Duplicating a fact is
                 // only safe where an equality makes the duplicate
@@ -1199,7 +1393,7 @@ pub fn advance_recur_progress(
                     );
                 }
             }
-            Some(SequenceChildItem::RecurSequence(_)) => {
+            Some(SequenceChildItem::RecurSequence(sequence_item)) => {
                 // A recur sequence emits no journal; its iterations are read
                 // from trace structure. Only the boundary *start* advances the
                 // count, so an iteration is never counted twice.
@@ -1249,15 +1443,28 @@ pub fn advance_recur_progress(
                     // next iteration's bound `state_in` pins it through the
                     // fold rule, and the last one is pinned when the site
                     // closes.
-                    assert_carried_state_matches_input(step_record, input_source_witness);
+                    if sequence_item.carries_state {
+                        check_iteration_state_binding(step_record, progress, input_source_witness);
+                    }
                 }
                 // The transition itself arrives with the iteration's `End`,
                 // which is the first step at which what it produced is known.
                 if matches!(step_record.kind, StepKind::SequenceEnd { .. }) {
+                    if let Some(transition) = step_record.recur_state.as_ref() {
+                        verify_returned_state(
+                            cfs_cursor,
+                            step_record,
+                            &sequence_item.id,
+                            transition,
+                            output_witness,
+                            returned_state_read_witness,
+                            current_storage_root,
+                            current_index_root,
+                        );
+                    }
                     if let Err(violation) = progress.fold_sequence_iteration_state(
                         coordinates,
                         step_record.recur_state.as_ref(),
-                        output_witness.map(|bytes| bytes.as_slice()),
                     ) {
                         panic!(
                             "Recur progress violation at step {:?}: {}",
@@ -1304,12 +1511,22 @@ pub fn advance_recur_progress(
                         site_state_is_output(item),
                         source,
                     );
+                    if let Some(decl) = site_output_decl(item) {
+                        progress.open_draft(opening_draft(step_record, decl, input_source_witness));
+                    }
+                    if let Some(seed) = stored_seed(item, input_source_witness) {
+                        progress.seed_state(seed);
+                    }
                 }
                 // `End`: the terminal rules — 5 and 7 for a tile site, S4 for a
                 // sequence site.
                 // The frame is keyed by the site `[s]`; the close sits at `[-s]`.
-                StepKind::RecurEnd(_) => {
-                    if let Err(violation) = progress.close_site(&coordinates.opened()) {
+                // Then the object it wrote: the one its steps built, or its
+                // final carried state.
+                StepKind::RecurEnd(end) => {
+                    if let Err(violation) =
+                        progress.close_site(&coordinates.opened(), &end.output_commitment)
+                    {
                         panic!(
                             "Recur progress violation at step {:?}: {}",
                             step_record, violation
@@ -1318,6 +1535,19 @@ pub fn advance_recur_progress(
                 }
                 _ => {}
             }
+        }
+    }
+
+    // Any tile step: its draft transition, if any, advances the innermost
+    // site's object — a recur tile's iteration or a recur sequence's body tile.
+    if step_record.requires_replay_proof() {
+        if let Err(violation) =
+            progress.advance_draft(coordinates, draft_step, is_tile_iteration)
+        {
+            panic!(
+                "Recur progress violation at step {:?}: {}",
+                step_record, violation
+            );
         }
     }
 

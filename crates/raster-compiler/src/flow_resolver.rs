@@ -143,12 +143,14 @@ impl FlowResolver {
                     chunk: call.chunk,
                     output: site_output_decl(call.output),
                     state_is_output: call.state_is_output,
+                    carries_state: call.carries_state,
                 }),
                 CallKind::RecursiveSequence => {
                     SequenceChildItem::RecurSequence(RecurSequenceItem {
                         id: call.callee.clone(),
                         sources: input_sources,
                         state_is_output: call.state_is_output,
+                        carries_state: call.carries_state,
                         output: site_output_decl(call.output),
                     })
                 }
@@ -195,7 +197,7 @@ impl FlowResolver {
                 }
                 (source, full_path)
             }
-            ReturnExpr::Unbound { .. } => return None,
+            ReturnExpr::Unbound { .. } | ReturnExpr::Tuple(_) => return None,
         };
         let unbound = matches!(
             source.value_binding(),
@@ -469,6 +471,7 @@ mod tests {
                     chunk: None,
                     output: None,
                     state_is_output: false,
+                    carries_state: false,
                 },
                 CallInfo {
                     callee: "exclaim".to_string(),
@@ -481,6 +484,7 @@ mod tests {
                     chunk: None,
                     output: None,
                     state_is_output: false,
+                    carries_state: false,
                 },
             ],
         );
@@ -606,6 +610,7 @@ mod tests {
                 chunk: None,
                 output: None,
                 state_is_output: false,
+                carries_state: false,
             }],
         );
         seq_func.selection_aliases = vec![
@@ -687,6 +692,7 @@ mod tests {
                 chunk: None,
                 output: None,
                 state_is_output: false,
+                carries_state: false,
             }],
         );
 
@@ -752,6 +758,7 @@ mod tests {
                     chunk: None,
                     output: None,
                     state_is_output: false,
+                    carries_state: false,
                 },
                 CallInfo {
                     callee: "exclaim".to_string(),
@@ -764,6 +771,7 @@ mod tests {
                     chunk: None,
                     output: None,
                     state_is_output: false,
+                    carries_state: false,
                 },
             ],
         );
@@ -842,6 +850,7 @@ mod tests {
                 chunk: None,
                 output: None,
                 state_is_output: false,
+                carries_state: false,
             }],
             vec![("name".to_string(), "personal_data".to_string())],
         );
@@ -897,6 +906,7 @@ mod tests {
                 chunk: None,
                 output: None,
                 state_is_output: false,
+                carries_state: false,
             }],
             vec![("seed".to_string(), "seed".to_string())],
         );
@@ -946,6 +956,7 @@ mod tests {
                 chunk: None,
                 output: None,
                 state_is_output: false,
+                carries_state: false,
             }],
         );
         let sequence = Sequence {
@@ -1006,6 +1017,7 @@ mod tests {
                 chunk: None,
                 output: None,
                 state_is_output: false,
+                carries_state: false,
             }],
             vec![
                 ("row".to_string(), "table".to_string()),
@@ -1076,6 +1088,7 @@ mod tests {
                 chunk: None,
                 output: None,
                 state_is_output: false,
+                carries_state: false,
             }],
             vec![("row".to_string(), "table".to_string())],
         );

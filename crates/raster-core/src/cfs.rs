@@ -188,6 +188,16 @@ impl CfsCursor {
 
     /// What `main` returns (`SequenceDef::returns`), if the CFS could resolve
     /// it.
+    /// What the sequence `id` returns (`SequenceDef::returns`) — for a
+    /// recur-sequence body, the carried state it returns.
+    pub fn sequence_returns(&self, id: &str) -> Option<&SequenceReturn> {
+        self.cfs
+            .sequences
+            .iter()
+            .find(|sequence| sequence.id == id)
+            .and_then(|sequence| sequence.returns.as_ref())
+    }
+
     pub fn main_returns(&self) -> Option<&SequenceReturn> {
         self.cfs
             .sequences
@@ -960,6 +970,11 @@ pub struct RecurTileItem {
     /// state+output site discards its state and returns the draft.
     #[serde(default)]
     pub state_is_output: bool,
+    /// Whether the site carries state (`state = …`), with or without an
+    /// `output`. Its seed is then the site `Start`'s second argument; a stored
+    /// one opens the frame's chain (`incremental-draft-materialization` D5b).
+    #[serde(default)]
+    pub carries_state: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -971,6 +986,9 @@ pub struct RecurSequenceItem {
     /// final state is anchored regardless, while a sequence's is not.
     #[serde(default)]
     pub state_is_output: bool,
+    /// See [`RecurTileItem::carries_state`].
+    #[serde(default)]
+    pub carries_state: bool,
     /// See [`RecurTileItem::output`].
     #[serde(default)]
     pub output: Option<RecurOutputDecl>,
@@ -1148,6 +1166,7 @@ mod tests {
                         chunk: None,
                         output: None,
                         state_is_output: false,
+                        carries_state: false,
                     }),
                     SequenceChildItem::Tile(TileItem {
                         id: "after".to_string(),
@@ -1242,6 +1261,7 @@ mod tests {
                             id: "body".to_string(),
                             sources: vec![],
                             state_is_output: false,
+                            carries_state: false,
                             output: None,
                         }),
                         SequenceChildItem::Tile(TileItem {
@@ -1267,6 +1287,7 @@ mod tests {
                             chunk: Some(64),
                             output: None,
                             state_is_output: false,
+                            carries_state: false,
                         }),
                     ],
                     entry_arguments: vec![],
@@ -1498,6 +1519,7 @@ mod tests {
                             id: "rs".to_string(),
                             sources: vec![InputBinding::prior_item_output(0)],
                             state_is_output: false,
+                            carries_state: false,
                             output: None,
                         }),
                         call("noret", vec![InputBinding::prior_item_output(0)]),

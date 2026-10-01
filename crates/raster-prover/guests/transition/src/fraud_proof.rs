@@ -18,7 +18,6 @@ use risc0_zkvm::guest::env;
 
 use raster_core::cfs::{CfsCoordinates, CfsCursor, SequenceChildItem};
 use raster_core::coordinate_index::coordinate_index_root;
-use raster_core::draft::{DraftId, TrackedDraftState};
 use raster_core::fingerprint::{Fingerprint, FingerprintAccumulator};
 use raster_core::program::{commitment_of_bytes, ImageId, ProgramDefinition};
 use raster_core::recur_progress::RecurProgressStack;
@@ -325,10 +324,6 @@ fn assert_opens_at_genesis(init_transition: &InitTransition) {
         init_transition.init_storage_index_root == coordinate_index_root(&BTreeMap::new()),
         "A window opening at trace index 0 must open on an empty coordinate index",
     );
-    assert!(
-        init_transition.active_drafts.is_empty(),
-        "A window opening at trace index 0 cannot have a draft in flight",
-    );
 }
 
 pub(crate) struct WindowBinding {
@@ -531,7 +526,6 @@ pub struct LiveTransition {
     frontier: NonEmptyFrontier<Bytes>,
     storage_frontier: NonEmptyFrontier<Bytes>,
     storage_index_root: Vec<u8>,
-    active_drafts: BTreeMap<DraftId, TrackedDraftState>,
     fingerprint_acc: FingerprintAccumulator,
     /// `None` only for the genesis state, where no coordinates are expected yet.
     next_expected_coordinates: Option<Vec<CfsCoordinates>>,
@@ -569,7 +563,6 @@ impl LiveTransition {
             frontier,
             storage_frontier,
             storage_index_root: init_transition.init_storage_index_root.clone(),
-            active_drafts: init_transition.active_drafts.clone(),
             fingerprint_acc: FingerprintAccumulator::new(init_transition.fingerprint.bits_packer),
             next_expected_coordinates: None,
             entrypoint_authorization,
@@ -603,7 +596,6 @@ impl LiveTransition {
             frontier,
             storage_frontier,
             storage_index_root: transition.storage_index_root.clone(),
-            active_drafts: transition.active_drafts.clone(),
             fingerprint_acc: transition.actual_fingerprint_acc.clone(),
             next_expected_coordinates: Some(transition.next_expected_coordinates.clone()),
             entrypoint_authorization,
@@ -668,14 +660,26 @@ impl LiveTransition {
             input.sequence_scope_witness.as_ref(),
             input.replay_journal.as_ref(),
         );
+        // The draft transition on its own first; the site frame then chains it.
+        let draft_step = checks::drafts::verify_draft_transition(
+            &input.step_record,
+            input.replay_journal.as_ref(),
+            input.draft_transition_witness.as_ref(),
+        );
         checks::cfs::advance_recur_progress(
             cfs_cursor,
             &mut self.recur_progress,
             &input.step_record,
             input.replay_journal.as_ref(),
+            draft_step.as_ref(),
             input.input_source_witness.as_ref(),
             input.output_witness.as_ref(),
             &input.storage_selection_witnesses,
+            input.returned_state_read_witness.as_ref(),
+            // No step that reads a returned state writes, so the current
+            // roots are the ones the read is against.
+            &frontier_root(&self.storage_frontier),
+            &self.storage_index_root,
         );
         if let StepKind::ProgramStart(program_start) = &input.step_record.kind {
             self.entrypoint_authorization = checks::entrypoint::verify_step(
@@ -707,6 +711,7 @@ impl LiveTransition {
             input.input_witness.as_ref(),
             input.output_witness.as_ref(),
             input.input_source_witness.as_ref(),
+            &input.storage_selection_witnesses,
         );
         let (_, _, next_index_root) = checks::store::verify_storage_transition(
             &input.step_record,
@@ -732,12 +737,6 @@ impl LiveTransition {
             } else {
                 next_coordinates
             },
-        );
-        checks::drafts::verify_draft_transition(
-            &input.step_record,
-            input.replay_journal.as_ref(),
-            input.draft_transition_witness.as_ref(),
-            &mut self.active_drafts,
         );
         self.append_to_trace(&input.step_record);
         self
@@ -812,7 +811,6 @@ impl LiveTransition {
             storage_frontier: serialize_frontier(&self.storage_frontier),
             storage_root: frontier_root(&self.storage_frontier),
             storage_index_root: self.storage_index_root,
-            active_drafts: self.active_drafts,
             actual_fingerprint_acc: self.fingerprint_acc,
             next_expected_coordinates: self
                 .next_expected_coordinates

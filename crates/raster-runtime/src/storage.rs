@@ -1296,7 +1296,6 @@ where
             )));
         }
         Ok(DraftReplayTransition {
-            draft_id: snapshot.anchor,
             schema_hash: snapshot.schema_hash,
             root_before: snapshot.root_before,
             ops: state.ops[snapshot.op_count_before..].to_vec(),

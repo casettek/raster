@@ -534,6 +534,43 @@ pub fn prove(
             _ => (None, None),
         };
 
+        // A recur-sequence iteration's `End` that carries state reads the
+        // object it returned as that state, against the current storage state
+        // (D5b). Its output witness is that binding.
+        let returned_state_read_witness = match (&step_record.kind, &step_record.recur_state) {
+            (StepKind::SequenceEnd { .. }, Some(_)) => output_witness
+                .as_ref()
+                .and_then(|bytes| {
+                    raster_core::postcard::from_bytes::<Option<raster_core::trace::StorageData>>(bytes)
+                        .ok()
+                        .flatten()
+                })
+                .map(|returned| {
+                    let index_witness = before_state
+                        .coordinate_index
+                        .membership_proof(&returned.coordinates)
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "Missing coordinate-index witness for returned state at {:?}",
+                                returned.coordinates
+                            )
+                        });
+                    let log_witness = build_storage_log_witness(
+                        &before_state.append_entries,
+                        index_witness.value.log_position,
+                    );
+                    StorageReadWitness {
+                        entry: StorageEntry {
+                            coordinates: returned.coordinates,
+                            object_commitment: returned.commitment,
+                        },
+                        log_witness,
+                        index_witness,
+                    }
+                }),
+            _ => None,
+        };
+
         recorded_step_io.insert(
             step_record.clone(),
             StepIo {
@@ -546,6 +583,7 @@ pub fn prove(
                 draft_transition_witness,
                 program_output_read_witness,
                 program_output_selection_witness,
+                returned_state_read_witness,
             },
         );
 

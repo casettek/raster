@@ -682,13 +682,14 @@ fn gen_recur_sequence_input_serialization(input: &ItemFn) -> proc_macro2::TokenS
                     #no_citations
                 }
             } else if recur_sequence_state_inner_type(&param.ty).is_some() {
+                // By reference after iteration 0 (D5b): the previous
+                // iteration's returned object, or a stored seed.
                 quote! {
-                    let #trace_value_ident = ::raster::core::trace::FnInputValue::Inline(
-                        ::raster::core::postcard::to_allocvec(&#name).unwrap_or_default()
-                    );
-                    let #internal_info_ident: ::core::option::Option<::raster::core::trace::StorageData> =
-                        ::core::option::Option::None;
-                    #no_citations
+                    let __raster_auth_trace = #name.__raster_auth_trace()
+                        .unwrap_or_else(|e| panic!("Failed to trace recursive sequence state '{}': {}", stringify!(#name), e));
+                    let #trace_value_ident = __raster_auth_trace.value;
+                    let #internal_info_ident = __raster_auth_trace.storage;
+                    let #index_bindings_ident = __raster_auth_trace.index_bindings;
                 }
             } else {
                 quote! {
@@ -1285,13 +1286,75 @@ fn gen_recur_control_capture(kind: &ProtocolReturnKind) -> proc_macro2::TokenStr
     }
 }
 
+/// Whether a tile with this return publishes an output — writes an object at
+/// its coordinate.
+///
+/// A recur iteration returning its site's draft or carried state does not
+/// (`incremental-draft-materialization` D3): the draft's effect is the
+/// journal's draft transition, the state's is `recur.state`, and the site
+/// writes its one object at its close. Nothing reads an `[s][i]` object, so
+/// writing one per iteration was N appends of a value that carried nothing.
+fn publishes_output(kind: &ProtocolReturnKind) -> bool {
+    matches!(
+        kind,
+        ProtocolReturnKind::Unit | ProtocolReturnKind::Value(_) | ProtocolReturnKind::Fallible(_)
+    )
+}
+
+/// The raster root of each decoded argument, captured between decode and the
+/// call (which moves them), for the replay journal's `input_roots`
+/// (`tile-io-structural-roots` step 2). A recur item contributes its value, a
+/// carried state its inner value, a draft handle nothing.
+fn gen_input_roots_capture(input: &ItemFn) -> proc_macro2::TokenStream {
+    let roots: Vec<_> = extract_params(input)
+        .iter()
+        .map(|param| {
+            let name = &param.ident;
+            let value = if recur_input_inner_type(&param.ty).is_some() {
+                quote! { #name.value() }
+            } else if recur_state_inner_type(&param.ty).is_some() {
+                quote! { #name.get() }
+            } else if matches!(
+                param_protocol_kind(&param.ty),
+                ParamProtocolKind::Draft(_) | ParamProtocolKind::RecurOutput(_)
+            ) {
+                return quote! { ::core::option::Option::None };
+            } else {
+                quote! { &#name }
+            };
+            quote! {
+                ::core::option::Option::Some(::raster::core::tree::value_root(#value)?)
+            }
+        })
+        .collect();
+    quote! {
+        let __raster_input_roots: ::raster::alloc::vec::Vec<
+            ::core::option::Option<::raster::core::input::Hash32>,
+        > = ::raster::alloc::vec![#(#roots),*];
+    }
+}
+
 fn gen_replay_output_serialization(kind: &ProtocolReturnKind) -> proc_macro2::TokenStream {
     let replay_transition_binding = gen_replay_transition_binding(kind);
     let recur_control_capture = gen_recur_control_capture(kind);
     let recur_state_finish = gen_recur_state_finish(kind);
+    let output = if publishes_output(kind) {
+        quote! {
+            let __raster_output_bytes = ::raster::core::postcard::to_allocvec(&result)
+                .map_err(|e| ::raster::core::Error::Serialization(::raster::alloc::format!("Failed to serialize output: {}", e)))?;
+            let __raster_output_root = ::core::option::Option::Some(
+                ::raster::core::tree::value_root(&result)?
+            );
+        }
+    } else {
+        quote! {
+            let __raster_output_bytes: ::raster::alloc::vec::Vec<u8> = ::raster::alloc::vec::Vec::new();
+            let __raster_output_root: ::core::option::Option<::raster::core::input::Hash32> =
+                ::core::option::Option::None;
+        }
+    };
     quote! {
-        let __raster_output_bytes = ::raster::core::postcard::to_allocvec(&result)
-            .map_err(|e| ::raster::core::Error::Serialization(::raster::alloc::format!("Failed to serialize output: {}", e)))?;
+        #output
         #replay_transition_binding
         #recur_control_capture
         #recur_state_finish
@@ -1303,6 +1366,8 @@ fn gen_replay_output_serialization(kind: &ProtocolReturnKind) -> proc_macro2::To
         let replay_output = ::raster::core::draft::TileReplayJournal {
             input_commitment: __raster_input_commitment,
             output_bytes: __raster_output_bytes,
+            output_root: __raster_output_root,
+            input_roots: __raster_input_roots,
             draft_transition: __raster_draft_transition,
             recur: __raster_recur_position.map(|__raster_position| {
                 ::raster::core::draft::RecurTileReplay {
@@ -1391,11 +1456,8 @@ fn gen_recur_state_start(input_fn: &ItemFn) -> proc_macro2::TokenStream {
     };
     let param_ident = param.ident;
     quote! {
-        let __raster_recur_state_in = ::core::option::Option::Some(
-            ::raster::core::recur_progress::state_commitment(
-                &::raster::core::postcard::to_allocvec(&#param_ident).unwrap_or_default()
-            )
-        );
+        let __raster_recur_state_in =
+            ::core::option::Option::Some(::raster::recur_state_root(&#param_ident));
     }
 }
 
@@ -1434,9 +1496,7 @@ fn gen_recur_state_finish(kind: &ProtocolReturnKind) -> proc_macro2::TokenStream
                 ::core::option::Option::Some(__raster_state_out),
             ) => ::core::option::Option::Some(::raster::core::draft::RecurStateTransition {
                 state_in: __raster_state_in,
-                state_out: ::raster::core::recur_progress::state_commitment(
-                    &::raster::core::postcard::to_allocvec(__raster_state_out).unwrap_or_default()
-                ),
+                state_out: ::raster::recur_state_root(__raster_state_out),
             }),
             _ => ::core::option::Option::None,
         };
@@ -2611,6 +2671,7 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
     let output_serialization = gen_output_serialization();
     let replay_output_serialization = gen_replay_output_serialization(&return_kind);
     let recur_position_capture = gen_recur_position_capture(&input_fn);
+    let input_roots_capture = gen_input_roots_capture(&input_fn);
     // The replay wrapper commits the incoming state at the same point it
     // captures the position: after decode, before the call.
     let recur_state_start = gen_recur_state_start(&input_fn);
@@ -2670,6 +2731,27 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
         ReturnType::Type(_, ty) => {
             let ty_str = ty.to_token_stream().to_string();
             quote! { #ty_str }
+        }
+    };
+    // The published output, or none for an iteration returning its site's
+    // draft or state (D3): the recorder's write is conditional on it.
+    let native_output = if publishes_output(&return_kind) {
+        quote! {
+            let __raster_output_raster_payload =
+                ::raster::__private::tile_output_trace_payload(&result, &__raster_output_bytes)
+                    .unwrap_or_else(|e| panic!("Failed to build raster output payload: {}", e));
+            let __raster_output = ::core::option::Option::Some(
+                ::raster::core::trace::FnOutput::new(
+                    __raster_output_bytes,
+                    ::raster::alloc::string::String::from(#output_type_expr),
+                ).with_raster(__raster_output_raster_payload)
+            );
+        }
+    } else {
+        quote! {
+            let _ = __raster_output_bytes;
+            let __raster_output: ::core::option::Option<::raster::core::trace::FnOutput> =
+                ::core::option::Option::None;
         }
     };
 
@@ -2737,15 +2819,7 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
                     );
 
                     let __raster_output_record_build_start = ::raster::__private::profile_now();
-                    let __raster_output_raster_payload =
-                        ::raster::__private::tile_output_trace_payload(&result, &__raster_output_bytes)
-                            .unwrap_or_else(|e| panic!("Failed to build raster output payload: {}", e));
-                    let __raster_output = ::core::option::Option::Some(
-                        ::raster::core::trace::FnOutput::new(
-                            __raster_output_bytes,
-                            ::raster::alloc::string::String::from(#output_type_expr),
-                        ).with_raster(__raster_output_raster_payload)
-                    );
+                    #native_output
 
                     let __raster_record = ::raster::core::trace::FnCallRecord {
                         fn_name: ::raster::alloc::string::String::from(#fn_name_str),
@@ -2821,15 +2895,7 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
                     #native_recur_capture_finish
                     #native_recur_control_capture
                     #trace_output_serialization
-                    let __raster_output_raster_payload =
-                        ::raster::__private::tile_output_trace_payload(&result, &__raster_output_bytes)
-                            .unwrap_or_else(|e| panic!("Failed to build raster output payload: {}", e));
-                    let __raster_output = ::core::option::Option::Some(
-                        ::raster::core::trace::FnOutput::new(
-                            __raster_output_bytes,
-                            ::raster::alloc::string::String::from(#output_type_expr),
-                        ).with_raster(__raster_output_raster_payload)
-                    );
+                    #native_output
 
                     let __raster_record = ::raster::core::trace::FnCallRecord {
                         fn_name: ::raster::alloc::string::String::from(#fn_name_str),
@@ -2890,6 +2956,7 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
             // below, and it is not `Copy`.
             #recur_position_capture
             #recur_state_start
+            #input_roots_capture
 
             #function_call
 

@@ -293,6 +293,11 @@ pub fn verify_storage_transition(
 
         match write_witness {
             Some(write_witness) => {
+                assert!(
+                    step_record.appends_to_storage(),
+                    "Step {:?} does not append to storage, so it must not carry a write witness",
+                    step_record.coordinates,
+                );
                 let object_commitment = step_record
                     .output_commitment()
                     .expect("Execution step must expose output commitment")
@@ -326,6 +331,21 @@ pub fn verify_storage_transition(
                 )
             }
             None => {
+                // A writing step kind that wrote nothing commits to nothing:
+                // otherwise its output commitment is a free 32-byte field —
+                // entropy for manufacturing a divergence — on every recur
+                // iteration, which never writes (D3).
+                if step_record.appends_to_storage()
+                    && !matches!(step_record.kind, raster_core::trace::StepKind::ProgramStart(_))
+                {
+                    assert!(
+                        step_record
+                            .output_commitment()
+                            .is_none_or(|commitment| commitment.is_empty()),
+                        "Step {:?} wrote nothing, so it must record no output commitment",
+                        step_record.coordinates,
+                    );
+                }
                 assert_eq!(
                     storage_root_before, storage_root_after,
                     "Execution-step without storage write must leave append-log root unchanged",

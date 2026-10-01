@@ -730,6 +730,18 @@ pub fn assemble_subtree(
     Ok(result)
 }
 
+/// The raster root of a value: the commitment storage gives the same value
+/// stored as an object, and the root a selection of it folds from.
+///
+/// What a tile's replay commits for its output and each decoded argument
+/// (`tile-io-structural-roots` step 2), and a carried state's commitment
+/// (`incremental-draft-materialization` D5b) — one encoder for all three, so
+/// the guest can compare them with storage's commitments directly.
+pub fn value_root<T: Serialize>(value: &T) -> CoreResult<Hash32> {
+    let tree = tree_value_from_serialize(value)?;
+    Ok(subtree_payload_and_root(&tree)?.1)
+}
+
 pub fn subtree_payload_and_root(root: &TreeValue) -> CoreResult<(Vec<u8>, Hash32)> {
     // Iterative post-order traversal with an explicit heap stack, so nesting
     // depth no longer consumes the call stack. Each frame collects its

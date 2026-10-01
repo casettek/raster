@@ -15,14 +15,14 @@ use raster_core::draft::{
     draft_root_from_witness, draft_value_root, schema_hash as compute_schema_hash, DraftOp,
     DraftReplayTransition, DraftStateWitness, DraftTransitionWitness, DraftWitnessField,
     RecurControlKind,
-    RecurPosition, RecurStateTransition, RecurTileReplay, TileReplayJournal, TrackedDraftState,
+    RecurPosition, RecurStateTransition, RecurTileReplay, TileReplayJournal,
 };
 use raster_core::input::{
     AppendFrontier, SchemaField, SchemaFieldMode, SchemaNode, Selectable,
 };
 use raster_core::input::{Hash32, SelectionWitness, SelectorSegment};
 use raster_core::recur_progress::{
-    RecurProgressStack, RecurProgressViolation, RecurSiteKind,
+    DraftStep, RecurProgressStack, RecurProgressViolation, RecurSiteKind, SiteDraft,
 };
 use raster_core::trace::{
     ExecStep, ExecTarget, FnInput, FnInputArg, FnInputValue, ProgramEndStep, StepKind, StepRecord,
@@ -793,11 +793,13 @@ fn recur_frames_cfs() -> CfsCursor {
                         chunk: None,
                         output: None,
                         state_is_output: false,
+                        carries_state: false,
                     }),
                     SequenceChildItem::RecurSequence(RecurSequenceItem {
                         id: "child".into(),
                         sources: vec![InputBinding::Direct(InputSource::Inline)],
                         state_is_output: false,
+                        carries_state: false,
                         output: None,
                     }),
                 ],
@@ -1081,6 +1083,7 @@ fn chunked_recur_cfs(chunk: Option<u64>) -> CfsCursor {
                 chunk,
                 output: None,
                 state_is_output: false,
+                carries_state: false,
             })],
             entry_arguments: Vec::new(),
             produces_output: false,
@@ -1127,6 +1130,8 @@ fn recur_journal(
     TileReplayJournal {
         input_commitment: [0u8; 32],
         output_bytes: Vec::new(),
+        output_root: None,
+        input_roots: Vec::new(),
         draft_transition: None,
         recur: Some(RecurTileReplay {
             position: RecurPosition {
@@ -1252,9 +1257,13 @@ fn advance_seeded(seed: &mut RecurProgressStack, iteration: CfsCoordinate, recor
         seed,
         &step,
         Some(&journal),
+        None,
         Some(&input),
         None,
         &witnesses,
+        None,
+        &[],
+        &[],
     );
 }
 
@@ -1325,9 +1334,13 @@ fn a_forged_seed_is_rejected() {
         &mut forged,
         &step,
         Some(&journal),
+        None,
         Some(&input),
         None,
         &witnesses,
+        None,
+        &[],
+        &[],
     );
 }
 
@@ -1346,9 +1359,13 @@ fn a_seeded_window_that_rereads_the_first_chunk_is_rejected() {
         &mut seed,
         &recur_iteration_step(1),
         Some(&journal),
+        None,
         Some(&input),
         None,
         &witnesses,
+        None,
+        &[],
+        &[],
     );
 }
 
@@ -1367,7 +1384,11 @@ fn a_recur_iteration_without_an_item_is_rejected() {
         Some(&journal),
         None,
         None,
+        None,
         &BTreeMap::new(),
+        None,
+        &[],
+        &[],
     );
 }
 
@@ -1770,7 +1791,7 @@ fn a_sequence_end_may_not_carry_an_input_source_witness() {
         recur_progress_commitment: RecurProgressStack::new().commitment(),
         recur_state: None,
     };
-    verify_step_record(&step, None, None, None, None, Some(&input));
+    verify_step_record(&step, None, None, None, None, Some(&input), &BTreeMap::new());
 }
 
 #[test]
@@ -1787,7 +1808,7 @@ fn a_sequence_end_without_an_input_source_witness_is_accepted() {
     };
     // `output_commitment` is still checked against the recorded output bytes —
     // dropping the *input* side leaves the end's own fact intact.
-    verify_step_record(&step, None, None, None, Some(&b"".to_vec()), None);
+    verify_step_record(&step, None, None, None, Some(&b"".to_vec()), None, &BTreeMap::new());
 }
 
 #[test]
@@ -2127,14 +2148,21 @@ fn verify_draft_transition_tracks_multi_step_chain() {
     let empty_root =
         draft_root_from_witness(&empty_witness.schema, &BTreeMap::new()).unwrap();
     let schema_hash = compute_schema_hash(&empty_witness.schema);
-    let draft_id = [7; 32];
-    let mut active_drafts = BTreeMap::new();
+    // The site's frame holds the object; each step's transition advances it.
+    let site = CfsCoordinates(vec![1]);
+    let mut frame = RecurProgressStack::new();
+    frame.push_site(site.clone(), RecurSiteKind::Tile, 1, 2, false, [0u8; 32]);
+    frame.open_draft(SiteDraft {
+        schema_hash,
+        root: empty_root,
+    });
 
     let step_one = TileReplayJournal {
         input_commitment: [0u8; 32],
         output_bytes: Vec::new(),
+        output_root: None,
+        input_roots: Vec::new(),
         draft_transition: Some(DraftReplayTransition {
-            draft_id,
             schema_hash,
             root_before: empty_root,
             ops: vec![
@@ -2150,16 +2178,19 @@ fn verify_draft_transition_tracks_multi_step_chain() {
         }),
         recur: None,
     };
-    verify_draft_transition(
+    let step = verify_draft_transition(
         &draft_tile_step(1),
         Some(&step_one),
         Some(&DraftTransitionWitness {
             pre_state: empty_witness.clone(),
             native_transition: step_one.draft_transition.clone(),
         }),
-        &mut active_drafts,
-    );
-    let step_one_root = active_drafts.get(&draft_id).unwrap().root;
+    )
+    .expect("step one carries a transition");
+    frame
+        .advance_draft(&CfsCoordinates(vec![1, 1]), Some(&step), true)
+        .expect("step one continues the opened object");
+    let step_one_root = step.root_after;
 
     let step_two_witness = DraftStateWitness {
         schema: empty_witness.schema.clone(),
@@ -2177,8 +2208,9 @@ fn verify_draft_transition_tracks_multi_step_chain() {
     let step_two = TileReplayJournal {
         input_commitment: [0u8; 32],
         output_bytes: Vec::new(),
+        output_root: None,
+        input_roots: Vec::new(),
         draft_transition: Some(DraftReplayTransition {
-            draft_id,
             schema_hash,
             root_before: step_one_root,
             ops: vec![DraftOp::Push {
@@ -2188,55 +2220,46 @@ fn verify_draft_transition_tracks_multi_step_chain() {
         }),
         recur: None,
     };
-    verify_draft_transition(
+    let step = verify_draft_transition(
         &draft_tile_step(2),
         Some(&step_two),
         Some(&DraftTransitionWitness {
             pre_state: step_two_witness,
             native_transition: step_two.draft_transition.clone(),
         }),
-        &mut active_drafts,
-    );
+    )
+    .expect("step two carries a transition");
+    frame
+        .advance_draft(&CfsCoordinates(vec![1, 2]), Some(&step), true)
+        .expect("step two continues step one's root");
 
-    assert_ne!(active_drafts.get(&draft_id).unwrap().root, step_one_root);
+    assert_ne!(frame.innermost().unwrap().draft.unwrap().root, step_one_root);
 }
 
+/// A transition starting from a root other than the site object's is refused
+/// by the frame, which replaced the id-keyed `active_drafts` map.
 #[test]
-#[should_panic(expected = "root_before does not match tracked draft root")]
-fn verify_draft_transition_rejects_wrong_root_before() {
-    let witness = DraftStateWitness {
-        schema: DemoDraft::schema(),
-        fields: Vec::new(),
-    };
-    let empty_root = draft_root_from_witness(&witness.schema, &BTreeMap::new()).unwrap();
-    let schema_hash = compute_schema_hash(&witness.schema);
-    let draft_id = [9; 32];
-    let mut active_drafts = BTreeMap::from([(
-        draft_id,
-        TrackedDraftState {
-            schema_hash,
-            root: [1; 32],
-        },
-    )]);
-
-    verify_draft_transition(
-        &draft_tile_step(1),
-        Some(&TileReplayJournal {
-            input_commitment: [0u8; 32],
-            output_bytes: Vec::new(),
-            draft_transition: Some(DraftReplayTransition {
-                draft_id,
-                schema_hash,
-                root_before: empty_root,
-                ops: Vec::new(),
+fn a_draft_transition_from_another_root_is_rejected_by_the_frame() {
+    let mut frame = RecurProgressStack::new();
+    frame.push_site(CfsCoordinates(vec![1]), RecurSiteKind::Tile, 1, 1, false, [0u8; 32]);
+    frame.open_draft(SiteDraft {
+        schema_hash: [4; 32],
+        root: [1; 32],
+    });
+    assert_eq!(
+        frame.advance_draft(
+            &CfsCoordinates(vec![1, 1]),
+            Some(&DraftStep {
+                schema_hash: [4; 32],
+                root_before: [2; 32],
+                root_after: [3; 32],
             }),
-            recur: None,
+            true,
+        ),
+        Err(RecurProgressViolation::DraftRootMismatch {
+            expected: [1; 32],
+            actual: [2; 32],
         }),
-        Some(&DraftTransitionWitness {
-            pre_state: witness,
-            native_transition: None,
-        }),
-        &mut active_drafts,
     );
 }
 
@@ -2248,15 +2271,14 @@ fn verify_draft_transition_rejects_wrong_schema_hash() {
         fields: Vec::new(),
     };
     let empty_root = draft_root_from_witness(&witness.schema, &BTreeMap::new()).unwrap();
-    let mut active_drafts = BTreeMap::new();
-
     verify_draft_transition(
         &draft_tile_step(1),
         Some(&TileReplayJournal {
             input_commitment: [0u8; 32],
             output_bytes: Vec::new(),
+            output_root: None,
+            input_roots: Vec::new(),
             draft_transition: Some(DraftReplayTransition {
-                draft_id: [3; 32],
                 schema_hash: [4; 32],
                 root_before: empty_root,
                 ops: Vec::new(),
@@ -2267,7 +2289,6 @@ fn verify_draft_transition_rejects_wrong_schema_hash() {
             pre_state: witness,
             native_transition: None,
         }),
-        &mut active_drafts,
     );
 }
 
@@ -2276,15 +2297,14 @@ fn verify_draft_transition_rejects_wrong_schema_hash() {
 fn verify_draft_transition_rejects_tampered_pre_state_witness() {
     let empty_root =
         draft_root_from_witness(&DemoDraft::schema(), &BTreeMap::new()).unwrap();
-    let mut active_drafts = BTreeMap::new();
-
     verify_draft_transition(
         &draft_tile_step(1),
         Some(&TileReplayJournal {
             input_commitment: [0u8; 32],
             output_bytes: Vec::new(),
+            output_root: None,
+            input_roots: Vec::new(),
             draft_transition: Some(DraftReplayTransition {
-                draft_id: [6; 32],
                 schema_hash: compute_schema_hash(&DemoDraft::schema()),
                 root_before: empty_root,
                 ops: Vec::new(),
@@ -2303,7 +2323,6 @@ fn verify_draft_transition_rejects_tampered_pre_state_witness() {
             },
             native_transition: None,
         }),
-        &mut active_drafts,
     );
 }
 
@@ -2341,8 +2360,9 @@ fn verify_draft_transition_rejects_a_frontier_claiming_the_wrong_length() {
         Some(&TileReplayJournal {
             input_commitment: [0u8; 32],
             output_bytes: Vec::new(),
+            output_root: None,
+            input_roots: Vec::new(),
             draft_transition: Some(DraftReplayTransition {
-                draft_id: [8; 32],
                 schema_hash: compute_schema_hash(&DemoDraft::schema()),
                 root_before,
                 ops: Vec::new(),
@@ -2353,7 +2373,6 @@ fn verify_draft_transition_rejects_a_frontier_claiming_the_wrong_length() {
             pre_state: forged,
             native_transition: None,
         }),
-        &mut BTreeMap::new(),
     );
 }
 
@@ -2895,7 +2914,6 @@ mod fingerprint_slice {
             },
             init_storage_root: Vec::new(),
             init_storage_index_root: Vec::new(),
-            active_drafts: BTreeMap::new(),
             fingerprint: window,
         }
     }
@@ -3079,7 +3097,6 @@ mod fingerprint_slice {
             },
             init_storage_root: Vec::new(),
             init_storage_index_root: coordinate_index_root(&BTreeMap::new()),
-            active_drafts: BTreeMap::new(),
             fingerprint: window,
         }
     }
@@ -3142,24 +3159,6 @@ mod fingerprint_slice {
         // Storage that already holds something cannot be the state before the
         // program's first step.
         init.init_storage_index_root = vec![7u8; 32];
-
-        assert_window_is_commitment_slice(&init, &header, &witness, None);
-    }
-
-    #[test]
-    #[should_panic(expected = "cannot have a draft in flight")]
-    fn a_short_window_claiming_genesis_with_a_live_draft_is_refused() {
-        let (bits_per_item, items) = (4, 40);
-        let bits = fixture_bits(bits_per_item, items);
-        let (mut init, header, witness) = short_genesis_window(&bits, bits_per_item, items, 2, 4);
-
-        init.active_drafts.insert(
-            [9u8; 32],
-            TrackedDraftState {
-                schema_hash: [1u8; 32],
-                root: [2u8; 32],
-            },
-        );
 
         assert_window_is_commitment_slice(&init, &header, &witness, None);
     }
@@ -3864,6 +3863,7 @@ fn recur_sequence_site_cfs() -> CfsCursor {
                         InputBinding::inline(),
                     ],
                     state_is_output: false,
+                    carries_state: false,
                     output: None,
                 })],
                 entry_arguments: Vec::new(),
@@ -3998,7 +3998,7 @@ fn a_recur_sequence_site_recording_only_its_input_is_rejected() {
 // ---------------------------------------------------------------------------
 
 fn state(seed: &[u8]) -> Hash32 {
-    raster_core::recur_progress::state_commitment(seed)
+    raster_core::tree::value_root(&seed.to_vec()).expect("bytes encode")
 }
 
 fn transition(state_in: Hash32, state_out: Hash32) -> RecurStateTransition {
@@ -4156,77 +4156,65 @@ fn a_seed_differing_only_in_carried_state_is_rejected() {
     assert_ne!(honest.commitment(), forged.commitment());
 }
 
+/// The terminal pin (D5b). Every `state_out` but the last is held by the
+/// next iteration's bound `state_in`; the last is held at the close, against
+/// the object the site stored — both raster roots, so they are comparable.
 #[test]
-fn a_sequence_iterations_output_must_be_the_state_it_claims_to_have_produced() {
-    // The terminal pin. Every `state_out` but the last is held by the next
-    // iteration's bound `state_in`; the last is held here, against the bytes
-    // the iteration actually emitted. It lives on the iteration rather than the
-    // site because a site's recorded output is the raster-encoded stored
-    // object, while the carried state is postcard — the iteration's output is
-    // where the two encodings coincide.
+fn a_state_only_site_must_store_the_state_its_chain_reached() {
     let mut stack = RecurProgressStack::new();
     stack.push_site(CfsCoordinates(vec![1]), RecurSiteKind::Sequence, 1, 1, true, [0u8; 32]);
     stack
         .advance_sequence_iteration(&CfsCoordinates(vec![1, 1]), 0)
         .expect("counted");
+    stack
+        .fold_sequence_iteration_state(
+            &CfsCoordinates(vec![1, 1]),
+            Some(&transition(state(b"seed"), state(b"final"))),
+        )
+        .expect("iteration 0 adopts");
 
-    let honest = stack.clone().fold_sequence_iteration_state(
-        &CfsCoordinates(vec![1, 1]),
-        Some(&transition(state(b"seed"), state(b"final"))),
-        Some(b"final"),
-    );
-    assert!(honest.is_ok());
-
+    assert!(stack
+        .clone()
+        .close_site(&CfsCoordinates(vec![1]), &state(b"final"))
+        .is_ok());
     assert_eq!(
         stack
-            .fold_sequence_iteration_state(
-                &CfsCoordinates(vec![1, 1]),
-                Some(&transition(state(b"seed"), state(b"claimed"))),
-                Some(b"actually-emitted"),
-            )
+            .close_site(&CfsCoordinates(vec![1]), &state(b"stored-instead"))
             .unwrap_err(),
         RecurProgressViolation::TerminalStateMismatch {
-            expected: state(b"claimed"),
-            actual: state(b"actually-emitted"),
+            expected: state(b"final"),
+            actual: state(b"stored-instead"),
         },
     );
 }
 
 #[test]
-fn a_state_returning_sequence_iteration_without_an_output_is_rejected() {
+fn a_site_that_stores_nothing_is_rejected() {
     let mut stack = RecurProgressStack::new();
-    stack.push_site(CfsCoordinates(vec![1]), RecurSiteKind::Sequence, 1, 1, true, [0u8; 32]);
-    stack
-        .advance_sequence_iteration(&CfsCoordinates(vec![1, 1]), 0)
-        .expect("counted");
-
+    stack.push_site(CfsCoordinates(vec![1]), RecurSiteKind::Sequence, 1, 0, true, [0u8; 32]);
     assert_eq!(
-        stack
-            .fold_sequence_iteration_state(
-                &CfsCoordinates(vec![1, 1]),
-                Some(&transition(state(b"seed"), state(b"final"))),
-                None,
-            )
-            .unwrap_err(),
-        RecurProgressViolation::TerminalStateUnwitnessed,
+        stack.close_site(&CfsCoordinates(vec![1]), &[]).unwrap_err(),
+        RecurProgressViolation::SiteOutputMissing,
     );
 }
 
 #[test]
-fn a_state_plus_output_sequence_iteration_is_not_pinned_by_its_output() {
-    // A state+output site returns the draft, not the state, so its recorded
-    // output is not the carried state and must not be compared against it.
+fn a_state_plus_output_site_is_not_pinned_by_its_state() {
+    // A state+output site returns the draft, not the state, so its stored
+    // object is not the carried state and must not be compared against it.
     let mut stack = RecurProgressStack::new();
     stack.push_site(CfsCoordinates(vec![1]), RecurSiteKind::Sequence, 1, 1, false, [0u8; 32]);
     stack
         .advance_sequence_iteration(&CfsCoordinates(vec![1, 1]), 0)
         .expect("counted");
-    assert!(stack
+    stack
         .fold_sequence_iteration_state(
             &CfsCoordinates(vec![1, 1]),
             Some(&transition(state(b"seed"), state(b"final"))),
-            Some(b"a-draft-root-not-the-state"),
         )
+        .expect("iteration 0 adopts");
+    assert!(stack
+        .close_site(&CfsCoordinates(vec![1]), &[9u8; 32])
         .is_ok());
 }
 
@@ -4386,9 +4374,13 @@ fn advance_lines_iteration(
         progress,
         &step,
         None,
+        None,
         Some(input),
         None,
         witnesses,
+        None,
+        &[],
+        &[],
     );
 }
 
@@ -4536,6 +4528,7 @@ fn produced_list_sweep_cfs() -> CfsCursor {
                     chunk: Some(2),
                     output: None,
                     state_is_output: false,
+                    carries_state: false,
                 }),
             ],
             entry_arguments: Vec::new(),
@@ -4670,9 +4663,13 @@ fn run_site_start(
         &mut progress,
         &start,
         None,
+        None,
         Some(&input),
         None,
         &witnesses,
+        None,
+        &[],
+        &[],
     );
     let storage_witness = read.map(|entry| StorageWitness {
         reads: vec![build_read_witness(store, entry)],

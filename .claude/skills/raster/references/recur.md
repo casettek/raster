@@ -577,6 +577,21 @@ Recur-sequence-specific rules (macro/UI-test enforced):
 - Tile handles (`RecurInput`/`RecurState`/`RecurOutput`) are rejected in
   recur-sequence signatures — use the `RecurSequence*` forms.
 - `main` cannot be `#[sequence(kind = recur)]`.
+- **Carried state is passed by reference.** Each iteration's state is the object
+  a body tile returned in the previous iteration (or the seed). The returned
+  state MUST be a `call!` result — the body's last call, or for `(state,
+  output)` a binding of one, e.g. `let state = call!(advance, state); (state,
+  output)` — or the incoming `state` unchanged. Anything else fails to bind in
+  the CFS (a build warning) and the iterations will not verify.
+
+### Seeds
+
+A `state = …` seed that is a stored value (a `call!` result) is read by the
+site's `RecurStart`, and the loop's state chain starts at it — prefer it. A
+literal seed is accepted, but nothing pins it. A seed (and a derive base,
+`output = base`) must be a **whole** object, not a `select!` into one: for a
+recur sequence a selected seed fails verification; for a recur tile it is
+treated like a literal.
 
 ## 9. Choosing tile-recur vs sequence-recur
 

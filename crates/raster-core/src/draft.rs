@@ -34,16 +34,18 @@ pub const DRAFT_OP_CHARGE: u64 = 64;
 pub type DraftId = [u8; 32];
 pub type DraftRoot = [u8; 32];
 
+/// What a draft-taking tile is told about the draft it continues: its schema
+/// and the root its ops apply to. No identity: a step finds its draft through
+/// the innermost recur site's frame (`RecurProgressFrame::draft`), so a
+/// host-chosen id here would be a trace field nothing checks.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct DraftReplayHandle {
-    pub draft_id: DraftId,
     pub schema_hash: [u8; 32],
     pub root_before: DraftRoot,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct DraftReplayTransition {
-    pub draft_id: DraftId,
     pub schema_hash: [u8; 32],
     pub root_before: DraftRoot,
     pub ops: Vec<DraftOp>,
@@ -59,6 +61,18 @@ pub struct TileReplayJournal {
     /// `docs/proposals/program-identity.md`.
     pub input_commitment: [u8; 32],
     pub output_bytes: Vec<u8>,
+    /// The raster root of the value the tile returned — `Some` exactly when
+    /// the tile publishes an output, which the transition guest then requires
+    /// it to have written with this commitment. `None` for a recur iteration
+    /// returning its site's draft or carried state: it writes nothing
+    /// (`incremental-draft-materialization` D3). See
+    /// `tile-io-structural-roots` step 2.
+    pub output_root: Option<crate::input::Hash32>,
+    /// The raster root of each decoded argument, in parameter order (`None`
+    /// for a draft handle). The transition guest requires every
+    /// storage-bound argument's selection to fold from this root, joining the
+    /// bytes the selection proves to the value the tile ran on.
+    pub input_roots: Vec<Option<crate::input::Hash32>>,
     pub draft_transition: Option<DraftReplayTransition>,
     /// `Some` for every recur tile, `None` for every other tile.
     ///
@@ -203,12 +217,6 @@ pub struct DraftStateWitness {
 pub struct DraftTransitionWitness {
     pub pre_state: DraftStateWitness,
     pub native_transition: Option<DraftReplayTransition>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub struct TrackedDraftState {
-    pub schema_hash: [u8; 32],
-    pub root: DraftRoot,
 }
 
 pub fn draft_value_from_serialize<T: Serialize>(value: &T) -> Result<DraftValue> {
@@ -471,12 +479,8 @@ pub fn verify_witness_root(witness: &DraftStateWitness, expected_root: &DraftRoo
     Ok(())
 }
 
-pub fn replay_handle_for_schema<S: Schema>(
-    draft_id: DraftId,
-    root_before: DraftRoot,
-) -> DraftReplayHandle {
+pub fn replay_handle_for_schema<S: Schema>(root_before: DraftRoot) -> DraftReplayHandle {
     DraftReplayHandle {
-        draft_id,
         schema_hash: S::schema_hash(),
         root_before,
     }

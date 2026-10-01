@@ -195,7 +195,10 @@ fn sequence_returns(
     seq: &Sequence<'_>,
     item_count: usize,
 ) -> Option<SequenceReturn> {
-    if !returns_non_unit(&seq.function.output) || is_recur_sequence(seq) {
+    if is_recur_sequence(seq) {
+        return recur_state_return(resolver, seq, item_count);
+    }
+    if !returns_non_unit(&seq.function.output) {
         return None;
     }
     let returns = seq
@@ -211,6 +214,7 @@ fn sequence_returns(
                 format!("`{root}` (a name no step produced)")
             }
             Some(crate::ast::ReturnExpr::TailCall) => "its final call".to_string(),
+            Some(crate::ast::ReturnExpr::Tuple(_)) => "a tuple".to_string(),
             None => "no returned expression".to_string(),
         };
         let consequence = if name == "main" {
@@ -222,6 +226,43 @@ fn sequence_returns(
             "warning: `{name}` returns {form}, which the CFS cannot bind to a step's output or \
              an argument; {consequence}. Return a binding of a `call!`/`call_recur!`/`call_seq!` \
              result, or a `select!` of one."
+        );
+    }
+    returns
+}
+
+/// For a recur-sequence body, the **carried state** it returns — the whole
+/// return of a state-only body, the first element of a `(state, output)` one;
+/// `None` for an output-only body.
+///
+/// Not a value the static walk follows: the site writes its result at its own
+/// coordinate, where `CfsCursor::resolve_value` stops. It is what each
+/// iteration's `SequenceEnd` is checked against — the state it returns must be
+/// the object this binding names inside the iteration
+/// (`incremental-draft-materialization` D5b, recur-sequence state by
+/// reference).
+fn recur_state_return(
+    resolver: &FlowResolver,
+    seq: &Sequence<'_>,
+    item_count: usize,
+) -> Option<SequenceReturn> {
+    let output = syn::parse_str::<syn::Type>(seq.function.output.as_deref()?).ok()?;
+    let state_expr = match (&output, seq.function.return_expr.as_ref()?) {
+        (syn::Type::Tuple(_), crate::ast::ReturnExpr::Tuple(elems)) => elems.first()?.clone(),
+        (syn::Type::Path(path), expr)
+            if path.path.segments.last().map(|s| s.ident == "RecurSequenceState")
+                == Some(true) =>
+        {
+            expr.clone()
+        }
+        _ => return None,
+    };
+    let returns = resolver.resolve_return(&state_expr, item_count);
+    if returns.is_none() {
+        eprintln!(
+            "warning: recur sequence `{}` returns a carried state the CFS cannot bind to a step's \
+             output; its iterations will not verify. Return a binding of a `call!` result.",
+            seq.function.name
         );
     }
     returns
@@ -387,6 +428,7 @@ mod tests {
                 chunk: None,
                 output: None,
                 state_is_output: false,
+                carries_state: false,
             }],
         );
         let sequence = Sequence {
@@ -451,6 +493,7 @@ mod tests {
                     chunk: None,
                     output: None,
                     state_is_output: false,
+                    carries_state: false,
                 }],
             );
             function.name = name.to_string();
@@ -561,6 +604,7 @@ mod tests {
                 chunk: None,
                 output: None,
                 state_is_output: false,
+                carries_state: false,
             }],
         );
         let sequence = Sequence {

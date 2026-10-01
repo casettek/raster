@@ -1801,7 +1801,7 @@ they break; the same table is in that proposal's §Order.
 | --- | --- | --- |
 | **A — trace shape** | `RecurStart`/`RecurEnd` step kinds, site closes at `[-s]`, `ExecTarget::RecurTile`/`RecurSequence` removed; D4 (nested `SequenceEnd` at `[-s]`); `RecurStartStep.storage` (read-only) takes over the interim `SequenceStart.storage` (landed 2026-09-30), which is removed again; site-ordering checks | trace shape, transition guest; **done 2026-09-30** — moves the image ids of tiles that link the edited code (see below) |
 | **B — language and object ownership** (**done 2026-10-01**) | §One storage rule and §The restriction: `new!`/`finalize`/`finalize = false` removed, a site owns its object at `[s]` (creates, or derives with `output = base`), plain tiles return values, `DRAFT_NAMESPACE` deleted, host anchor `anchor_for_schema([s], S)`; D1b (`RecurOutputDecl` in the CFS via `schema_walk`); programs rewritten (`examples/`, `crates/raster/tests`, `raster-inference`) | CFS, programs, `program_commitment` |
-| **C — tile journal** (one tile-image-id break) | D3 (recur iterations publish no output; an `Exec` with no write has an empty `output_commitment`); D2 (`draft_id` removed); D1a (replay tile asserts its schema); D5b (replayed state as raster roots, recur-sequence state by reference); **`tile-io-structural-roots` step 2** (`output_root`, `input_roots`); guest: the frame's draft entry replaces `active_drafts`, `RecurEnd` writes exactly one object | every tile image id, `program_commitment` |
+| **C — tile journal** (one tile-image-id break) (**done 2026-10-01**) | D3 (recur iterations publish no output; an `Exec` with no write has an empty `output_commitment`); D2 (`draft_id` removed); D1a (replay tile asserts its schema); D5b (replayed state as raster roots, recur-sequence state by reference); **`tile-io-structural-roots` step 2** (`output_root`, `input_roots`); guest: the frame's draft entry replaces `active_drafts`, `RecurEnd` writes exactly one object | every tile image id, `program_commitment` |
 | **D — materialization** | `DraftBuffer`, one seal for store and `RecurEnd` output, `rindex04` relative offsets, derivation sharing (`Derived` backing, delta output) | `.rindex` format; no guest or tile change |
 | **E — verification** | both proposals' Verification lists; `tile-io-structural-roots` step 3; GPU proving; all locks, `raster-inference` included | — |
 
@@ -1898,6 +1898,57 @@ is a separate follow-up).
   were blocked before batch B** — all prove; a negative control fails at `[13]`'s `RecurStart`
   reading its base. Guest unchanged in this batch: a derived site's first `root_before` is still
   adopted (`active_drafts`); batch C anchors it.
+
+**Batch C — done 2026-10-01** (tile journal; every tile image id and `program_commitment` move).
+
+- **D2.** `draft_id` is gone from `DraftReplayHandle`, `DraftReplayTransition` and the native
+  witness; the replay builds its `Draft` with a constant anchor it never reads.
+- **D1a.** `restore_draft_from_replay_handle` asserts `handle.schema_hash == S::schema_hash()`
+  instead of adopting the host's hash, so every journal's schema is replay-proven.
+- **The frame's draft entry.** `RecurProgressFrame.draft: Option<SiteDraft { schema_hash, root
+  }>`, opened at `RecurStart` from `RecurOutputDecl` (empty root, or the `"output"` base's
+  commitment — a whole object only), advanced by `RecurProgressStack::advance_draft` on every
+  tile step that carries a transition (the innermost site: a recur tile's iteration — where it is
+  required — or a recur sequence's body tile), compared at `close_site` with the object written.
+  `active_drafts`, `TrackedDraftState` and the guest's `if let Some(..)` are deleted; the guest's
+  draft check now returns a `DraftStep` for the frame. The recorder runs the same three calls from
+  the native witness (`DraftStep::from_native_witness`), so a seal or schema disagreement fails at
+  record time. `RecurEnd` must write: `close_site` refuses an empty `output_commitment`.
+- **D3.** A tile whose return carries its site's draft or state publishes no output natively and
+  replays empty `output_bytes`; a recur-sequence iteration returning the draft publishes none
+  either. Guest: a writing step kind that wrote nothing records an empty commitment, and only a
+  writing step kind may carry a write witness.
+- **D5b.** Carried state is committed by its raster root (`raster_core::tree::value_root`; for a
+  recur tile over the inner `T`, `raster::recur_state_root`); the postcard `state_commitment` is
+  deleted. A **stored** seed — a whole object, second argument of a site the CFS marks
+  `carries_state` (new on both recur items) — is read at `RecurStart` and opens the chain
+  (`RecurProgressStack::seed_state`); an inline seed is adopted from iteration 0, as before. A
+  state-only site's `close_site` requires `state_commitment == output_commitment`. **Recur
+  sequences pass state by reference**: `RecurSequenceState<T>` holds an `AuthRef<T>`; an
+  iteration's `Start` records the state as a storage binding, checked to be the chain's current
+  commitment; its `End` records the returned state's binding, which the guest checks is the object
+  the CFS's `returns` for the body names inside the iteration (the compiler now records a recur
+  body's returned *state* there, the first element of a `(state, output)` tuple — `ReturnExpr::
+  Tuple`), reads from the current storage state (`TransitionInput.returned_state_read_witness`),
+  and holds `state_out` to. The postcard iteration output and its terminal check are gone.
+- **`tile-io-structural-roots` step 2** — see that proposal: `output_root`, `input_roots`.
+- **Fixtures.** `hello-tiles` gains a stored seed for its state-only recur tile and a stateful recur
+  sequence seeded by a stored object (`count_lines_sequence`), so the D5b paths run under
+  `--commit`/`--audit`.
+- **Verified.** Suites green: core, compiler, runtime, `raster` (incl. new tests for the replay's
+  roots, D3 and by-reference state), transition guest, prover, CLI. `hello-tiles`
+  commit + honest audit; dev-mode fraud windows prove over: a creating tile; draft iterations,
+  which now write nothing; the create-site and derive-site closes (draft root check); the derived
+  recur sequence's body tiles; state-only iterations and close from an inline and from a stored
+  seed; an early-`Break` site; the stateful recur sequence's `RecurStart`, iteration `Start`, body
+  tiles, iteration `End` and close. Negative controls (guest markers placed after each new check
+  succeeds) fire on those windows: D3's empty-commitment rule, the draft-root close at `[-9]` and
+  at the derive site `[-13]`, the state close at the state-only site, the iteration state binding
+  and the returned-state read. The one failing window, at exec 3, is
+  `sequence-scope-forbids-narrowing`, unchanged.
+- **Limits, recorded.** A derive base, a stored seed, and a recur sequence's state must be whole
+  objects: a binding carries the object commitment, not a selected value's root. A selected seed
+  falls back to adoption for a recur tile and is refused for a recur sequence.
 
 ## Costs
 

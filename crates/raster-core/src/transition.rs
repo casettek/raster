@@ -12,7 +12,7 @@ use std::vec::Vec;
 
 use crate::authorization::AuthorizationJournal;
 use crate::cfs::CfsCoordinates;
-use crate::draft::{DraftId, DraftTransitionWitness, TileReplayJournal, TrackedDraftState};
+use crate::draft::{DraftTransitionWitness, TileReplayJournal};
 use crate::recur_progress::RecurProgressStack;
 use crate::fingerprint::{Fingerprint, FingerprintAccumulator};
 use crate::input::SelectionWitness;
@@ -242,6 +242,13 @@ pub struct TransitionInput {
     pub program_output_read_witness: Option<StorageReadWitness>,
     pub program_output_selection_witness: Option<SelectionWitness>,
 
+    /// For a recur-sequence iteration's `SequenceEnd` that carries state: the
+    /// proof that the object the iteration returned as its state is in the
+    /// current storage state, with the commitment it claims
+    /// (`incremental-draft-materialization` D5b). `None` for every other step.
+    #[serde(default)]
+    pub returned_state_read_witness: Option<StorageReadWitness>,
+
     /// The commitment's revealed tail roots, read only by the window-opening
     /// step and bound there against `TraceCommitmentHeader::
     /// revealed_tail_roots_commitment`.
@@ -260,7 +267,6 @@ pub struct Transition {
     pub storage_frontier: SerializableFrontier,
     pub storage_root: Vec<u8>,
     pub storage_index_root: Vec<u8>,
-    pub active_drafts: BTreeMap<DraftId, TrackedDraftState>,
     pub actual_fingerprint_acc: FingerprintAccumulator,
     pub next_expected_coordinates: Vec<CfsCoordinates>,
     /// Live recur sites, carried across steps in the window.
@@ -280,7 +286,6 @@ pub struct InitTransition {
     pub init_storage_frontier: SerializableFrontier,
     pub init_storage_root: Vec<u8>,
     pub init_storage_index_root: Vec<u8>,
-    pub active_drafts: BTreeMap<DraftId, TrackedDraftState>,
     pub fingerprint: Fingerprint,
 }
 

@@ -37,7 +37,7 @@ use sha2::{Digest, Sha256};
 
 use crate::cfs::{CfsCoordinate, CfsCoordinates};
 use crate::draft::RecurControlKind;
-use crate::draft::RecurStateTransition;
+use crate::draft::{DraftRoot, RecurStateTransition};
 use crate::input::{Hash32, SelectionProofStep, SelectionWitness, SelectorSegment};
 use crate::trace::StorageData;
 
@@ -123,6 +123,61 @@ pub struct RecurProgressFrame {
     /// iterations skip the CFS input check.
     #[serde(default)]
     pub source: Hash32,
+    /// The object this site builds, as it stands after the last step that
+    /// changed it — `None` exactly when the CFS says the site owns no object
+    /// (a state-only site).
+    ///
+    /// Opened at the site's `Start` from the CFS (`RecurOutputDecl`): the empty
+    /// root of `S` for a creating site, the base's commitment for a deriving
+    /// one. Every step carrying a draft transition advances it
+    /// ([`RecurProgressStack::advance_draft`]); the close compares it with the
+    /// object the site wrote ([`RecurProgressStack::close_site`]). A window
+    /// opening mid-site inherits it through the seeded stack, which the first
+    /// step's recorded commitment validates. See
+    /// `incremental-draft-materialization.md` §The draft root rides in the
+    /// site's recur-progress frame.
+    #[serde(default)]
+    pub draft: Option<SiteDraft>,
+}
+
+/// A site's object under construction: its schema, and its root after the last
+/// op applied to it.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct SiteDraft {
+    pub schema_hash: [u8; 32],
+    pub root: DraftRoot,
+}
+
+/// One step's draft transition, as both the guest (replay journal + witness)
+/// and the recorder (native witness) derive it: `root_after` is what
+/// `apply_draft_ops` reaches from `root_before`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DraftStep {
+    pub schema_hash: [u8; 32],
+    pub root_before: DraftRoot,
+    pub root_after: DraftRoot,
+}
+
+impl DraftStep {
+    /// The step a native draft witness records, for the **recorder**: the same
+    /// `apply_draft_ops` the guest runs over the replay journal's ops, here
+    /// over the native capture's. `None` when the tile carried no draft.
+    pub fn from_native_witness(
+        witness: Option<&crate::draft::DraftTransitionWitness>,
+    ) -> crate::Result<Option<Self>> {
+        let Some(witness) = witness else {
+            return Ok(None);
+        };
+        let Some(native) = witness.native_transition.as_ref() else {
+            return Ok(None);
+        };
+        let (_, root_after) = crate::draft::apply_draft_ops(&witness.pre_state, &native.ops)?;
+        Ok(Some(Self {
+            schema_hash: native.schema_hash,
+            root_before: native.root_before,
+            root_after,
+        }))
+    }
 }
 
 impl RecurProgressFrame {
@@ -238,6 +293,20 @@ pub enum RecurProgressViolation {
     /// Rule 8: the item holds a different number of elements than the
     /// iteration reports consuming, or than its selector claims.
     ItemWidthMismatch { expected: u64, actual: u64 },
+    /// A step carried a draft transition with no site object to apply it to —
+    /// outside every site, or inside a state-only one.
+    DraftWithoutSiteObject,
+    /// A recur tile iteration of a site that owns an object carried no draft
+    /// transition: every iteration's return is the site's draft.
+    DraftTransitionOmitted,
+    /// The transition names another schema than the site's object.
+    DraftSchemaMismatch { expected: [u8; 32], actual: [u8; 32] },
+    /// The transition starts from another root than the site's object has.
+    DraftRootMismatch { expected: DraftRoot, actual: DraftRoot },
+    /// The object a site wrote at its close is not the one its steps built.
+    DraftOutputMismatch { expected: DraftRoot, actual: [u8; 32] },
+    /// A site closed without writing its object.
+    SiteOutputMissing,
 }
 
 impl fmt::Display for RecurProgressViolation {
@@ -332,6 +401,30 @@ impl fmt::Display for RecurProgressViolation {
             Self::SiteNotInnermost => {
                 write!(f, "recur site closed while a nested site is still live")
             }
+            Self::DraftWithoutSiteObject => write!(
+                f,
+                "step carries a draft transition but no live recur site owns an object"
+            ),
+            Self::DraftTransitionOmitted => write!(
+                f,
+                "recur iteration of a site that owns an object carried no draft transition"
+            ),
+            Self::DraftSchemaMismatch { expected, actual } => write!(
+                f,
+                "draft transition names schema {:?}, but the site's object is {:?}",
+                actual, expected
+            ),
+            Self::DraftRootMismatch { expected, actual } => write!(
+                f,
+                "draft transition starts from root {:?}, but the site's object is at {:?}",
+                actual, expected
+            ),
+            Self::DraftOutputMismatch { expected, actual } => write!(
+                f,
+                "recur site wrote object {:?}, but its steps built {:?}",
+                actual, expected
+            ),
+            Self::SiteOutputMissing => write!(f, "recur site closed without writing its object"),
         }
     }
 }
@@ -445,7 +538,78 @@ impl RecurProgressStack {
             state_commitment: None,
             state_is_output,
             source,
+            draft: None,
         });
+    }
+
+    /// Open the innermost site's object, at its `Start`: the root the CFS
+    /// declares for a creating site, or the base's commitment for a deriving
+    /// one. Called right after [`Self::push_site`].
+    pub fn open_draft(&mut self, draft: SiteDraft) {
+        if let Some(frame) = self.0.last_mut() {
+            frame.draft = Some(draft);
+        }
+    }
+
+    /// Open the innermost site's carried state from a **stored** seed, at its
+    /// `Start` (`incremental-draft-materialization` D5b): the seed's object
+    /// commitment, which `Start`'s storage read authenticates. Iteration 0 must
+    /// then continue it. A site seeded inline has no such fact and adopts
+    /// iteration 0's `state_in`, as before.
+    pub fn seed_state(&mut self, commitment: Hash32) {
+        if let Some(frame) = self.0.last_mut() {
+            frame.state_commitment = Some(commitment);
+        }
+    }
+
+    /// Advance the innermost site's object by one step's draft transition.
+    ///
+    /// One rule for both families (`incremental-draft-materialization` §Recur
+    /// sequences, D5a): any tile step whose replay carries a draft transition
+    /// advances the **innermost** live site — a recur tile's iteration, or a
+    /// recur sequence's body tile. `is_tile_iteration` adds the "iff" for a
+    /// recur tile: each of its iterations returns the site's draft, so a site
+    /// that owns an object requires one. A sequence body tile that does not
+    /// touch the draft carries none.
+    pub fn advance_draft(
+        &mut self,
+        coordinates: &CfsCoordinates,
+        step: Option<&DraftStep>,
+        is_tile_iteration: bool,
+    ) -> Result<(), RecurProgressViolation> {
+        let Some(frame) = self.0.last_mut() else {
+            return match step {
+                Some(_) => Err(RecurProgressViolation::DraftWithoutSiteObject),
+                None => Ok(()),
+            };
+        };
+        if !coordinates_have_prefix(coordinates, &frame.site) {
+            return Err(RecurProgressViolation::SiteMismatch);
+        }
+        match (frame.draft.as_mut(), step) {
+            (None, None) => Ok(()),
+            (None, Some(_)) => Err(RecurProgressViolation::DraftWithoutSiteObject),
+            (Some(_), None) if is_tile_iteration => {
+                Err(RecurProgressViolation::DraftTransitionOmitted)
+            }
+            (Some(_), None) => Ok(()),
+            (Some(draft), Some(step)) => {
+                if step.schema_hash != draft.schema_hash {
+                    return Err(RecurProgressViolation::DraftSchemaMismatch {
+                        expected: draft.schema_hash,
+                        actual: step.schema_hash,
+                    });
+                }
+                if step.root_before != draft.root {
+                    return Err(RecurProgressViolation::DraftRootMismatch {
+                        expected: draft.root,
+                        actual: step.root_before,
+                    });
+                }
+                draft.root = step.root_after;
+                Ok(())
+            }
+        }
     }
 
     /// Rule 8: the iteration's item is the next slice of the site's source.
@@ -659,39 +823,23 @@ impl RecurProgressStack {
     /// arrive at different events: the iteration is counted when it opens, but
     /// what it *produced* is only known when it closes. A recur tile has both at
     /// once and folds them together.
-    /// `output` is the iteration's own recorded output. When the site returns
-    /// its carried state, that output *is* the state the iteration produced, in
-    /// the same postcard encoding — so this is where `state_out` gets pinned.
     ///
-    /// It has to happen here rather than at the site's close. A site's recorded
-    /// output is the *raster-encoded* stored object, not postcard bytes, so
-    /// comparing the chain against it would be comparing two encodings. The
-    /// iteration's output is the one place the two forms coincide.
-    ///
-    /// This closes the chain's last open end: every other `state_out` is pinned
-    /// by the next iteration's bound `state_in`, and the final one is pinned
-    /// here, by the bytes the iteration actually emitted.
+    /// Under D5b both commitments are object commitments: `state_in` is the
+    /// binding the iteration read its state through, `state_out` the binding
+    /// its body returned — which the caller has already checked is the object
+    /// the CFS's `returns` names inside this iteration, read from storage. So
+    /// the chain is the chain of objects the bodies wrote, and the last one is
+    /// held to the site's stored result by [`Self::close_site`]: the same
+    /// function commits both, which the postcard commitment this replaces
+    /// could not offer.
     pub fn fold_sequence_iteration_state(
         &mut self,
         coordinates: &CfsCoordinates,
         state: Option<&RecurStateTransition>,
-        output: Option<&[u8]>,
     ) -> Result<(), RecurProgressViolation> {
         let frame = self.0.last_mut().ok_or(RecurProgressViolation::NoActiveSite)?;
         if !coordinates_have_prefix(coordinates, &frame.site) {
             return Err(RecurProgressViolation::SiteMismatch);
-        }
-        if frame.state_is_output {
-            if let Some(transition) = state {
-                let bytes = output.ok_or(RecurProgressViolation::TerminalStateUnwitnessed)?;
-                let actual = state_commitment(bytes);
-                if actual != transition.state_out {
-                    return Err(RecurProgressViolation::TerminalStateMismatch {
-                        expected: transition.state_out,
-                        actual,
-                    });
-                }
-            }
         }
         frame.fold_carried_state(state, frame.next_iteration_index == 1)
     }
@@ -706,9 +854,16 @@ impl RecurProgressStack {
     /// equal `L`. There is no prefix/terminal split because a recur sequence
     /// has no early exit to excuse a short sweep, and `count == L` covers
     /// `L == 0` in both directions, so S4 needs no empty-source special case.
+    ///
+    /// Then the object it wrote, `output_commitment` (empty when it wrote
+    /// none): every site writes exactly one object at `[s]`. A site that owns
+    /// a draft wrote the object its steps built; a site returning its carried
+    /// state wrote that state (D5b) — both commitments are raster roots, the
+    /// function storage commits objects with.
     pub fn close_site(
         &mut self,
         site: &CfsCoordinates,
+        output_commitment: &[u8],
     ) -> Result<RecurProgressFrame, RecurProgressViolation> {
         let frame = self.0.last().ok_or(RecurProgressViolation::NoActiveSite)?;
         if &frame.site != site {
@@ -758,6 +913,31 @@ impl RecurProgressStack {
             }
         }
 
+        if output_commitment.is_empty() {
+            return Err(RecurProgressViolation::SiteOutputMissing);
+        }
+        if let Some(draft) = frame.draft {
+            if draft.root.as_slice() != output_commitment {
+                return Err(RecurProgressViolation::DraftOutputMismatch {
+                    expected: draft.root,
+                    actual: output_commitment.try_into().unwrap_or([0u8; 32]),
+                });
+            }
+        }
+        if frame.state_is_output {
+            // `None` only for a zero-iteration site seeded inline: nothing
+            // committed the state, so there is nothing to hold the result to —
+            // the inline seed is unpinned, as `push_site` records.
+            if let Some(expected) = frame.state_commitment {
+                if expected.as_slice() != output_commitment {
+                    return Err(RecurProgressViolation::TerminalStateMismatch {
+                        expected,
+                        actual: output_commitment.try_into().unwrap_or([0u8; 32]),
+                    });
+                }
+            }
+        }
+
         Ok(frame)
     }
 }
@@ -771,28 +951,16 @@ fn coordinates_have_prefix(coordinates: &CfsCoordinates, prefix: &CfsCoordinates
             .all(|(left, right)| left == right)
 }
 
-/// `H(b"recur-carried-state" ‖ bytes)` — the commitment over one carried-state
-/// value's serialized form.
-///
-/// **One implementation, three callers**: the tile wrapper (which stamps the
-/// pair into the replay journal and the host record), the recorder (which folds
-/// the host copy) and the guest (which folds the replay-proven copy). A second
-/// copy of this hash would be a divergence no test of either side alone could
-/// catch — the same reason `chunking` lives in `raster-core` rather than being
-/// written twice.
-pub fn state_commitment(bytes: &[u8]) -> Hash32 {
-    let mut hasher = Sha256::new();
-    hasher.update(b"recur-carried-state");
-    hasher.update(bytes);
-    hasher.finalize().into()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::cfs::FIRST_COORDINATE;
     use crate::input::{SelectionCommitment, SelectionProof, SelectorPath};
     use alloc::vec;
+
+    /// A site's close always writes its object; frames without a draft or a
+    /// returned state accept any commitment.
+    const WROTE: &[u8] = &[1u8; 32];
 
     fn site() -> CfsCoordinates {
         CfsCoordinates(vec![2])
@@ -825,7 +993,7 @@ mod tests {
             };
             stack.advance_tile_iteration(&iteration(index), index, source_len, 1, control, None)?;
         }
-        stack.close_site(&site())
+        stack.close_site(&site(), WROTE)
     }
 
     #[test]
@@ -955,7 +1123,7 @@ mod tests {
                 None,
             )?;
         }
-        stack.close_site(&site())
+        stack.close_site(&site(), WROTE)
     }
 
     #[test]
@@ -1020,7 +1188,7 @@ mod tests {
                 .advance_tile_iteration(&iteration(index), index, 3, 1, RecurControlKind::Continue, None)
                 .expect("honest advance");
         }
-        assert!(stack.close_site(&site()).is_ok());
+        assert!(stack.close_site(&site(), WROTE).is_ok());
     }
 
     /// Before rule 8 nothing tied an iteration's item to the site's source at
@@ -1210,7 +1378,7 @@ mod tests {
                 )
                 .unwrap_or_else(|e| panic!("iteration {} should be accepted: {}", index, e));
         }
-        assert!(stack.close_site(&site()).is_ok());
+        assert!(stack.close_site(&site(), WROTE).is_ok());
     }
 
     /// The `4,1,4,1` shape, rejected at iteration 1 — the case the old
@@ -1256,7 +1424,7 @@ mod tests {
         stack
             .advance_tile_iteration(&iteration(0), 0, 25, 4, RecurControlKind::Break, None)
             .unwrap();
-        let frame = stack.close_site(&site()).expect("Break may stop early");
+        let frame = stack.close_site(&site(), WROTE).expect("Break may stop early");
         assert_eq!(frame.consumed_total(), 4);
     }
 
@@ -1269,7 +1437,7 @@ mod tests {
                 .advance_sequence_iteration(&iteration(index), index)
                 .unwrap();
         }
-        assert!(stack.close_site(&site()).is_ok());
+        assert!(stack.close_site(&site(), WROTE).is_ok());
     }
 
     #[test]
@@ -1280,7 +1448,7 @@ mod tests {
             .advance_sequence_iteration(&iteration(0), 0)
             .unwrap();
         assert_eq!(
-            stack.close_site(&site()),
+            stack.close_site(&site(), WROTE),
             Err(RecurProgressViolation::SequenceIterationCountMismatch {
                 expected: 3,
                 actual: 1,
@@ -1293,7 +1461,7 @@ mod tests {
     fn a_recur_sequence_over_an_empty_source_runs_no_iterations() {
         let mut stack = RecurProgressStack::new();
         stack.push_site(site(), RecurSiteKind::Sequence, 1, 0, false, [0u8; 32]);
-        assert!(stack.close_site(&site()).is_ok());
+        assert!(stack.close_site(&site(), WROTE).is_ok());
 
         let mut stack = RecurProgressStack::new();
         stack.push_site(site(), RecurSiteKind::Sequence, 1, 0, false, [0u8; 32]);
@@ -1301,7 +1469,7 @@ mod tests {
             .advance_sequence_iteration(&iteration(0), 0)
             .unwrap();
         assert_eq!(
-            stack.close_site(&site()),
+            stack.close_site(&site(), WROTE),
             Err(RecurProgressViolation::SequenceIterationCountMismatch {
                 expected: 0,
                 actual: 1,
@@ -1361,10 +1529,10 @@ mod tests {
                 None,
             )
             .unwrap();
-        assert!(stack.close_site(&inner).is_ok());
+        assert!(stack.close_site(&inner, WROTE).is_ok());
 
         // The outer sweep is unaffected: it ran its full length.
-        assert!(stack.close_site(&outer).is_ok());
+        assert!(stack.close_site(&outer, WROTE).is_ok());
     }
 
     /// Every field is load-bearing: mutating any of them changes the
@@ -1406,5 +1574,137 @@ mod tests {
             RecurProgressStack::new().commitment(),
             tile_stack(1, 1).commitment()
         );
+    }
+
+    // ---- The site's object (`incremental-draft-materialization` batch C) ----
+
+    fn draft_site(len: u64) -> RecurProgressStack {
+        let mut stack = RecurProgressStack::new();
+        stack.push_site(site(), RecurSiteKind::Tile, 1, len, false, [0u8; 32]);
+        stack.open_draft(SiteDraft {
+            schema_hash: [7u8; 32],
+            root: [1u8; 32],
+        });
+        stack
+    }
+
+    fn at_iteration(index: CfsCoordinate) -> CfsCoordinates {
+        CfsCoordinates(vec![2, index])
+    }
+
+    fn draft_step(before: u8, after: u8) -> DraftStep {
+        DraftStep {
+            schema_hash: [7u8; 32],
+            root_before: [before; 32],
+            root_after: [after; 32],
+        }
+    }
+
+    #[test]
+    fn a_draft_chains_through_iterations_and_the_close_checks_the_object() {
+        // `L = 0` keeps the sweep rules out of the way: this is the draft
+        // entry alone, which advances independently of the iteration count.
+        let mut stack = draft_site(0);
+        stack
+            .advance_draft(&at_iteration(1), Some(&draft_step(1, 2)), true)
+            .expect("iteration 0 continues the opened root");
+        stack
+            .advance_draft(&at_iteration(2), Some(&draft_step(2, 3)), true)
+            .expect("iteration 1 continues iteration 0");
+        assert_eq!(
+            stack.clone().close_site(&site(), &[9u8; 32]).unwrap_err(),
+            RecurProgressViolation::DraftOutputMismatch {
+                expected: [3u8; 32],
+                actual: [9u8; 32],
+            },
+        );
+        assert!(stack.close_site(&site(), &[3u8; 32]).is_ok());
+    }
+
+    #[test]
+    fn an_object_owning_tile_iteration_must_carry_a_transition() {
+        let mut stack = draft_site(1);
+        assert_eq!(
+            stack.advance_draft(&at_iteration(1), None, true),
+            Err(RecurProgressViolation::DraftTransitionOmitted),
+        );
+        // A recur sequence's body tile that leaves the draft alone carries none.
+        assert!(stack.advance_draft(&CfsCoordinates(vec![2, 1, 1]), None, false).is_ok());
+    }
+
+    #[test]
+    fn a_transition_with_no_site_object_is_rejected() {
+        let mut outside = RecurProgressStack::new();
+        assert_eq!(
+            outside.advance_draft(&CfsCoordinates(vec![3]), Some(&draft_step(1, 2)), false),
+            Err(RecurProgressViolation::DraftWithoutSiteObject),
+        );
+        let mut state_only = RecurProgressStack::new();
+        state_only.push_site(site(), RecurSiteKind::Tile, 1, 1, true, [0u8; 32]);
+        assert_eq!(
+            state_only.advance_draft(&at_iteration(1), Some(&draft_step(1, 2)), true),
+            Err(RecurProgressViolation::DraftWithoutSiteObject),
+        );
+    }
+
+    #[test]
+    fn a_transition_for_another_schema_is_rejected() {
+        let mut stack = draft_site(1);
+        let mut step = draft_step(1, 2);
+        step.schema_hash = [8u8; 32];
+        assert_eq!(
+            stack.advance_draft(&at_iteration(1), Some(&step), true),
+            Err(RecurProgressViolation::DraftSchemaMismatch {
+                expected: [7u8; 32],
+                actual: [8u8; 32],
+            }),
+        );
+    }
+
+    #[test]
+    fn a_zero_iteration_creating_site_stores_its_opening_root() {
+        let stack = draft_site(0);
+        assert!(stack.clone().close_site(&site(), &[1u8; 32]).is_ok());
+        assert!(stack.clone().close_site(&site(), &[2u8; 32]).is_err());
+    }
+
+    /// A stored seed opens the chain (D5b): iteration 0 can no longer adopt a
+    /// state of its choosing.
+    #[test]
+    fn a_stored_seed_pins_iteration_zero() {
+        let mut stack = RecurProgressStack::new();
+        stack.push_site(site(), RecurSiteKind::Tile, 1, 1, true, [0u8; 32]);
+        stack.seed_state([5u8; 32]);
+        assert_eq!(
+            stack.clone().advance_tile_iteration(
+                &at_iteration(1),
+                0,
+                1,
+                1,
+                RecurControlKind::Continue,
+                Some(&RecurStateTransition {
+                    state_in: [6u8; 32],
+                    state_out: [7u8; 32],
+                }),
+            ),
+            Err(RecurProgressViolation::CarriedStateMismatch {
+                expected: [5u8; 32],
+                actual: [6u8; 32],
+            }),
+        );
+        stack
+            .advance_tile_iteration(
+                &at_iteration(1),
+                0,
+                1,
+                1,
+                RecurControlKind::Continue,
+                Some(&RecurStateTransition {
+                    state_in: [5u8; 32],
+                    state_out: [7u8; 32],
+                }),
+            )
+            .expect("continues the seed");
+        assert!(stack.close_site(&site(), &[7u8; 32]).is_ok());
     }
 }

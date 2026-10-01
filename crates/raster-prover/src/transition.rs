@@ -47,6 +47,9 @@ pub struct StepIo {
     /// narrowing it to the returned value. `None` for every other step.
     pub program_output_read_witness: Option<StorageReadWitness>,
     pub program_output_selection_witness: Option<SelectionWitness>,
+    /// For a recur-sequence iteration's `SequenceEnd` that carries state: the
+    /// read proof of the object it returned as its state (D5b).
+    pub returned_state_read_witness: Option<StorageReadWitness>,
 }
 
 type RecordedStepIo = HashMap<StepRecord, StepIo>;
@@ -76,6 +79,7 @@ fn build_transition_input(
         draft_transition_witness,
         program_output_read_witness,
         program_output_selection_witness,
+        returned_state_read_witness,
     } = recorded_step_io
         .get(step_record)
         .cloned()
@@ -112,6 +116,7 @@ fn build_transition_input(
         entrypoint_membership_witness: entrypoint_membership_witness.cloned(),
         program_output_read_witness,
         program_output_selection_witness,
+        returned_state_read_witness,
         revealed_tail_roots,
     }
 }
@@ -205,7 +210,6 @@ pub fn step_transitions(
         init_storage_frontier: initial_storage_frontier.clone(),
         init_storage_root: storage_root(initial_storage_frontier),
         init_storage_index_root: initial_storage_index_root.to_vec(),
-        active_drafts: Default::default(),
         fingerprint,
     };
 
@@ -403,6 +407,8 @@ mod tests {
                     replay_journal: TileReplayJournal {
                         input_commitment: [0u8; 32],
                         output_bytes: vec![11],
+                        output_root: None,
+                        input_roots: Vec::new(),
                         draft_transition: None,
                         recur: None,
                     },
@@ -419,6 +425,8 @@ mod tests {
                     replay_journal: TileReplayJournal {
                         input_commitment: [0u8; 32],
                         output_bytes: vec![22],
+                        output_root: None,
+                        input_roots: Vec::new(),
                         draft_transition: None,
                         recur: None,
                     },
@@ -467,6 +475,8 @@ mod tests {
                 replay_journal: TileReplayJournal {
                     input_commitment: [0u8; 32],
                     output_bytes: error_output.clone(),
+                    output_root: None,
+                    input_roots: Vec::new(),
                     draft_transition: None,
                     recur: None,
                 },
@@ -636,6 +646,7 @@ mod tests {
             entrypoint_membership_witness: None,
             program_output_read_witness: None,
             program_output_selection_witness: None,
+            returned_state_read_witness: None,
             revealed_tail_roots: None,
         };
         let window_fingerprint = Fingerprint::from(vec![0], BitPacker::new(64), 1);
@@ -644,8 +655,7 @@ mod tests {
             init_storage_frontier: make_init_frontier(),
             init_storage_root: storage_root(&make_init_frontier()),
             init_storage_index_root: coordinate_index_root(&std::collections::BTreeMap::new()),
-            active_drafts: Default::default(),
-            fingerprint: window_fingerprint.clone(),
+                fingerprint: window_fingerprint.clone(),
         });
         // A minimal commitment whose fingerprint *is* the window (start 0),
         // so the guest's Init-time slice check passes. One revealed item, so

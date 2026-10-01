@@ -1,6 +1,8 @@
 # Issue: `selection-unbound-from-execution` — a verified selection proof is never joined to the execution it authorizes
 
-Status: open 2026-09-16. Unowned. **Top priority** — set 2026-09-16. **§2a fixed 2026-09-30 for
+Status: **resolved 2026-10-01** — §2b by `tile-io-structural-roots` step 2: the replay commits the
+raster root of every decoded argument (`input_roots`) and the guest requires each storage-bound
+argument's selection to fold from it. Opened 2026-09-16, **top priority**. **§2a fixed 2026-09-30 for
 recur tiles** — rule 8, plus a gap found on the way: an iteration's item was never tied to the
 site's source list at all, since iterations skip the CFS input check. §3's PoC is inverted. Open:
 §2b (the bytes a tile ran on). Recur-*sequence* items bound the same day. A recur site `Start`'s

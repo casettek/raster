@@ -149,10 +149,14 @@ fn main(personal_data: PersonalData, personal_data_bin: PersonalData, seed: u64)
     );
     println!("recur sequence greeting: {:?}", sequence_greeting);
 
+    // A stored seed: the site's `RecurStart` reads it, so the carried-state
+    // chain opens at its commitment. (`limited_recur_greeting` below keeps an
+    // inline seed, which the chain adopts from iteration 0.)
+    let line_stats_seed = call!(zero_line_stats);
     let recur_line_stats = call_recur!(
         tile = compute_recur_max_line_len,
         input = address_lines.clone(),
-        state = LineLengthStats { max_len: 0 },
+        state = line_stats_seed,
         args = ()
     );
     println!("state-only recur stats: {:?}", recur_line_stats);
@@ -161,7 +165,7 @@ fn main(personal_data: PersonalData, personal_data_bin: PersonalData, seed: u64)
 
     let limited_recur_greeting = call_recur!(
         tile = build_limited_recur_greeting,
-        input = address_lines,
+        input = address_lines.clone(),
         state = GreetingLimitState { seen: 0 },
         output,
         args = ("State+output recur greeting".to_string(), 2)
@@ -170,6 +174,18 @@ fn main(personal_data: PersonalData, personal_data_bin: PersonalData, seed: u64)
     let limited_title = select!(String, limited_recur_greeting.clone().title);
     let limited_first_line = select!(String, limited_recur_greeting.lines[0]);
     call!(concat_messages, limited_title, limited_first_line);
+
+    // A recur sequence carrying state from a stored seed: its state crosses
+    // iterations by reference, each iteration's returned cursor is a body
+    // tile's output, and the stored result is the last of them.
+    let cursor_seed = call!(begin_line_cursor);
+    let line_cursor = call_recur_seq!(
+        sequence = count_lines_sequence,
+        input = address_lines.clone(),
+        state = cursor_seed,
+        args = ("-".to_string(),)
+    );
+    println!("stateful recur sequence cursor: {:?}", line_cursor);
 
     let name_2 = call_seq!(placeholder_sequence, "Placeholder".to_string());
     let result = call_seq!(greet_sequence, name_2, personal_data_bin);

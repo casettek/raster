@@ -1,6 +1,10 @@
 # Issue: `tile-output-commitment-unbound` — the object a tile step stores is never tied to the output its replay produced
 
-Status: open 2026-09-28. **Soundness gap in shipped code.** Unowned; to be resolved together with
+Status: **resolved 2026-10-01** by `tile-io-structural-roots` step 2 (with
+`incremental-draft-materialization` batch C): the replay commits `output_root`, the guest requires a
+tile step to write iff it is `Some` and with exactly that commitment, and a `RecurEnd`'s write is
+bound by the site frame (draft root or carried-state root). Opened 2026-09-28 as a
+**soundness gap in shipped code.** Unowned; to be resolved together with
 [`incremental-draft-materialization`](../proposals/incremental-draft-materialization.md), which
 changes the same journal, the same store check and the same trace format (§Why together).
 

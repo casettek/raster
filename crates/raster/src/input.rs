@@ -131,13 +131,29 @@ pub struct RecurSequenceInput<T> {
     len: u64,
 }
 
-/// Opaque recursive-sequence view of threaded inline state.
+/// Opaque recursive-sequence view of threaded state.
 ///
 /// State transitions must happen in normal tiles, not directly in sequence
 /// bodies, so this type intentionally exposes no mutation accessors.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+///
+/// Held **by reference** (`incremental-draft-materialization` D5b): after
+/// iteration 0 it is the object a body tile returned, and a stored seed is the
+/// seed's object. So an iteration's state is a storage binding the guest can
+/// check against the previous iteration's return, and its commitment is the
+/// object's — the raster root the site's stored result is committed by. Only
+/// an inline seed is held by value. Also the seed carrier of a recur *tile*
+/// site, for the same reason: a stored seed opens the frame's chain at
+/// `RecurStart`.
 pub struct RecurSequenceState<T> {
-    inner: T,
+    inner: AuthRef<T>,
+}
+
+impl<T: Clone> Clone for RecurSequenceState<T> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
 }
 
 /// Opaque recursive-sequence view of threaded draft output.
@@ -274,16 +290,77 @@ where
 
 impl<T> RecurSequenceState<T> {
     #[doc(hidden)]
-    pub fn __raster_from_recur_state(inner: RecurState<T>) -> Self {
-        Self {
-            inner: inner.into_inner(),
-        }
+    pub fn __raster_as_auth_ref(&self) -> &AuthRef<T> {
+        &self.inner
     }
 
     #[doc(hidden)]
-    pub fn __raster_into_recur_state(self) -> RecurState<T> {
-        RecurState::new(self.inner)
+    pub fn __raster_into_auth_ref(self) -> AuthRef<T> {
+        self.inner
     }
+
+    #[doc(hidden)]
+    pub fn __raster_auth_trace(&self) -> raster_core::Result<AuthRefTrace>
+    where
+        T: Serialize + DeserializeOwned,
+    {
+        auth_ref_trace(&self.inner)
+    }
+
+    /// The state's value, read from storage when held by reference.
+    #[doc(hidden)]
+    pub fn __raster_materialize(self) -> T
+    where
+        T: Serialize + DeserializeOwned,
+    {
+        into_auth_value::<T, _>(self.inner)
+            .unwrap_or_else(|error| panic!("Failed to materialize recursive state: {}", error))
+            .into_inner()
+    }
+
+    /// The storage binding this state names, for an iteration `End` to record
+    /// as what it returned; `None` for a state held by value.
+    #[doc(hidden)]
+    pub fn __raster_storage_binding(&self) -> Option<TraceStorageData>
+    where
+        T: Serialize + DeserializeOwned,
+    {
+        match &self.inner {
+            AuthRef::Inline(_) => None,
+            AuthRef::Storage(binding) => Some(auth_ref_trace_storage(binding).unwrap_or_else(
+                |error| panic!("Failed to trace recursive state binding: {}", error),
+            )),
+        }
+    }
+}
+
+/// A recur sequence's carried-state commitment (D5b): a state held by
+/// reference is committed by its object's commitment — which the guest reads
+/// off the binding — and an inline one by its raster root, the same function.
+#[doc(hidden)]
+pub fn recur_sequence_state_root<T: Serialize>(
+    state: &RecurSequenceState<T>,
+) -> raster_core::input::Hash32 {
+    match &state.inner {
+        AuthRef::Storage(binding) => binding
+            .reference
+            .commitment
+            .as_slice()
+            .try_into()
+            .expect("an object commitment is 32 bytes"),
+        AuthRef::Inline(value) => raster_core::tree::value_root(value)
+            .unwrap_or_else(|error| panic!("Failed to commit recursive state: {}", error)),
+    }
+}
+
+/// A recur tile's carried-state commitment (D5b): the raster root of the
+/// inner value — what storage commits the site's stored result by, so the
+/// chain's last value is comparable with it at `RecurEnd`. Shared by the
+/// native wrapper and the replay.
+#[doc(hidden)]
+pub fn recur_state_root<T: Serialize>(state: &RecurState<T>) -> raster_core::input::Hash32 {
+    raster_core::tree::value_root(state.get())
+        .unwrap_or_else(|error| panic!("Failed to commit recursive state: {}", error))
 }
 
 impl<S> RecurSequenceOutput<S>
@@ -739,7 +816,7 @@ pub fn draft_replay_handle<S>(draft: &Draft<S>) -> DraftReplayHandle
 where
     S: Schema,
 {
-    replay_handle_for_schema::<S>(*draft.anchor(), *draft.current_root())
+    replay_handle_for_schema::<S>(*draft.current_root())
 }
 
 pub fn serialize_draft_replay_handle<S>(draft: &Draft<S>) -> Vec<u8>
@@ -753,17 +830,18 @@ pub fn restore_draft_from_replay_handle<S>(handle: DraftReplayHandle) -> Draft<S
 where
     S: Schema,
 {
-    let draft = Draft::from_site(handle.draft_id, handle.root_before);
-    #[cfg(not(feature = "std"))]
-    {
-        let mut draft = draft;
-        draft.replay_state.schema_hash = handle.schema_hash;
-        return draft;
-    }
-    #[cfg(feature = "std")]
-    {
-        draft
-    }
+    // The schema is the tile's own, statically: a handle naming another one
+    // is refused rather than adopted, so every journal's `schema_hash` is
+    // replay-proven (`incremental-draft-materialization` D1a). The replay has
+    // no draft buffer, so the anchor is a constant it never reads.
+    assert_eq!(
+        handle.schema_hash,
+        S::schema_hash(),
+        "Draft handle names schema {:?}, but this tile's draft is '{}'",
+        handle.schema_hash,
+        core::any::type_name::<S>(),
+    );
+    Draft::from_site([0u8; 32], handle.root_before)
 }
 
 pub fn draft_replay_transition<S>(draft: &Draft<S>) -> Option<DraftReplayTransition>
@@ -773,7 +851,6 @@ where
     #[cfg(not(feature = "std"))]
     {
         return Some(DraftReplayTransition {
-            draft_id: *draft.anchor(),
             schema_hash: draft.replay_state().schema_hash,
             root_before: *draft.current_root(),
             ops: draft.replay_state().ops.clone(),
@@ -2038,13 +2115,21 @@ where
     T: Serialize,
 {
     fn into_auth_value(self) -> raster_core::Result<AuthValue<T>> {
-        Ok(AuthValue::inline(self.inner))
+        self.inner.into_auth_value()
+    }
+
+    fn into_auth_value_with_bindings(
+        self,
+    ) -> raster_core::Result<(AuthValue<T>, Vec<IndexBinding>)> {
+        self.inner.into_auth_value_with_bindings()
     }
 }
 
 impl<T> From<T> for RecurSequenceState<T> {
     fn from(value: T) -> Self {
-        Self { inner: value }
+        Self {
+            inner: AuthRef::Inline(value),
+        }
     }
 }
 
@@ -2052,17 +2137,9 @@ impl<T> From<AuthRef<T>> for RecurSequenceState<T>
 where
     T: DeserializeOwned + Serialize,
 {
+    /// Kept as a reference: a body tile's output, or a stored seed (D5b).
     fn from(value: AuthRef<T>) -> Self {
-        Self {
-            inner: into_auth_value::<T, _>(value)
-                .unwrap_or_else(|error| {
-                    panic!(
-                        "Failed to materialize recursive sequence state from tile output: {}",
-                        error
-                    )
-                })
-                .into_inner(),
-        }
+        Self { inner: value }
     }
 }
 
@@ -3067,7 +3144,7 @@ where
 #[doc(hidden)]
 pub fn run_recur_sequence_list_state<T, State, Step, Output>(
     source: AuthRef<List<T>>,
-    state: RecurState<State>,
+    state: RecurSequenceState<State>,
     mut step: Step,
 ) -> AuthRef<State>
 where
@@ -3089,13 +3166,10 @@ where
                 panic!("Failed to select recursive sequence list item: {}", error)
             });
             let input = RecurSequenceInput::__raster_from_auth_ref(item, index, len);
-            let sequence_state = RecurSequenceState::__raster_from_recur_state(state);
-            state = step(input, sequence_state)
-                .into()
-                .__raster_into_recur_state();
+            state = step(input, state).into();
         }
 
-        return crate::__private::bind_infallible_call(state.into_inner());
+        return crate::__private::bind_infallible_call(state.__raster_materialize());
     }
 
     #[cfg(not(feature = "std"))]
@@ -3110,7 +3184,7 @@ where
 #[doc(hidden)]
 fn run_recur_sequence_list_with_state_with_finish<T, State, S, Step, Output, Finish, R>(
     source: AuthRef<List<T>>,
-    state: RecurState<State>,
+    state: RecurSequenceState<State>,
     output: Draft<S>,
     mut step: Step,
     finish: Finish,
@@ -3141,10 +3215,9 @@ where
                 panic!("Failed to select recursive sequence list item: {}", error)
             });
             let input = RecurSequenceInput::__raster_from_auth_ref(item, index, len);
-            let sequence_state = RecurSequenceState::__raster_from_recur_state(state);
             let sequence_output = RecurSequenceOutput::__raster_from_recur_output(output);
-            let (next_state, next_output) = step(input, sequence_state, sequence_output).into();
-            state = next_state.__raster_into_recur_state();
+            let (next_state, next_output) = step(input, state, sequence_output).into();
+            state = next_state;
             output = next_output.__raster_into_recur_output();
         }
 
@@ -3265,7 +3338,7 @@ where
 pub fn run_recur_sequence_list_with_state<T, State, S, Step, Output>(
 
     source: AuthRef<List<T>>,
-    state: RecurState<State>,
+    state: RecurSequenceState<State>,
     output: Draft<S>,
     mut step: Step,
 ) -> AuthRef<S>

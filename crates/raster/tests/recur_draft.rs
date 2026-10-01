@@ -1280,3 +1280,145 @@ fn a_derived_site_extends_its_base_into_a_new_object() {
 fn a_derived_site_cannot_set_a_field() {
     let _ = materialize_auth_return::<LineBundle, _>(__raster_sequence_auth_derive_bundle_and_set_title());
 }
+
+// ---------------------------------------------------------------------------
+// Batch C: what a tile's replay commits, and what an iteration publishes
+// (`tile-io-structural-roots` step 2, `incremental-draft-materialization` D3/D5b)
+// ---------------------------------------------------------------------------
+
+fn root_of<T: Serialize>(value: &T) -> [u8; 32] {
+    raster::core::tree::value_root(value).expect("value encodes")
+}
+
+/// A plain tile's replay commits the raster root of what it returned — the
+/// commitment its write must carry — and of each argument it ran on.
+#[test]
+fn a_plain_tile_replay_commits_its_output_and_input_roots() {
+    let input = raster::core::postcard::to_allocvec(&(
+        String::from("line"),
+        String::from("prefix: "),
+    ))
+    .unwrap();
+    let journal = replay_journal(__raster_tile_replay_entry_prefix_line(&input).unwrap());
+    assert_eq!(journal.output_root, Some(root_of(&String::from("prefix: line"))));
+    assert_eq!(
+        journal.input_roots,
+        vec![
+            Some(root_of(&String::from("line"))),
+            Some(root_of(&String::from("prefix: "))),
+        ],
+    );
+}
+
+/// A state-returning iteration publishes nothing (D3); its carried state is
+/// committed by raster root, the function the site's stored result is
+/// committed by (D5b).
+#[test]
+fn a_state_returning_iteration_publishes_no_output() {
+    let input = raster::core::postcard::to_allocvec(&(
+        RecurInput::new(String::from("abcd"), 2u64, 5u64),
+        RecurState::new(MaxLenState { max_len: 1 }),
+    ))
+    .unwrap();
+    let journal = replay_journal(__raster_tile_replay_entry_track_max_len(&input).unwrap());
+    assert!(journal.output_bytes.is_empty());
+    assert_eq!(journal.output_root, None);
+    assert_eq!(
+        journal.input_roots,
+        vec![
+            Some(root_of(&String::from("abcd"))),
+            Some(root_of(&MaxLenState { max_len: 1 })),
+        ],
+    );
+    let state = journal.recur.and_then(|recur| recur.state).expect("a carried state");
+    assert_eq!(state.state_in, root_of(&MaxLenState { max_len: 1 }));
+    assert_eq!(state.state_out, root_of(&MaxLenState { max_len: 4 }));
+}
+
+/// Natively, a draft-returning iteration publishes no output, so the recorder
+/// writes nothing per iteration; the site's close publishes its one object.
+#[test]
+fn draft_iterations_publish_no_output_and_the_close_publishes_the_object() {
+    let (_, events) = capture_trace_events(|| {
+        materialize_auth_return::<LineBundle, _>(__raster_sequence_auth_derive_bundle_and_append())
+    });
+    let iterations: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            TraceEvent::RecurTileIterationExec(record) => Some(record),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(iterations.len(), 2);
+    assert!(iterations.iter().all(|record| record.output.is_none()));
+    assert!(iterations
+        .iter()
+        .all(|record| record.draft_transition_witness.is_some()));
+    let close = events
+        .iter()
+        .find_map(|event| match event {
+            TraceEvent::RecurTileEnd(record) => Some(record),
+            _ => None,
+        })
+        .expect("the site closes");
+    assert!(close.output.is_some());
+}
+
+#[sequence]
+fn derive_bundle_and_append() -> LineBundle {
+    let source = raster::store_value(&vec!["one".to_string(), "two".to_string()])
+        .expect("list source should store");
+    let base = call!(titled_bundle_with_one_item);
+    call_recur!(
+        tile = append_only,
+        input = storage!(List<String>, source),
+        output = base,
+        args = ()
+    )
+}
+
+/// A recur sequence's state crosses iterations by reference (D5b): each
+/// iteration reads the object the previous one returned, and its `End`
+/// records that returned binding, whose commitment is the claimed `state_out`.
+#[test]
+fn a_stateful_recur_sequence_passes_its_state_by_reference() {
+    let (_, events) = capture_trace_events(run_scan_all_words);
+
+    let starts: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            TraceEvent::RecurSequenceIterationStart(record) if record.fn_name == "scan_words" => {
+                record.input.clone()
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(starts.len(), 3);
+    for input in &starts {
+        assert_eq!(input.values()[1], FnInputValue::StorageBinding);
+        assert!(input.storage().contains_key("state"));
+    }
+
+    let ends: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            TraceEvent::RecurSequenceIterationEnd(record) if record.fn_name == "scan_words" => {
+                Some(record)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ends.len(), 3);
+    for (index, end) in ends.iter().enumerate() {
+        let output = end.output.as_ref().expect("a state iteration records its return");
+        let returned: Option<raster::core::trace::StorageData> =
+            raster::core::postcard::from_bytes(&output.data).expect("a returned binding");
+        let returned = returned.expect("the returned state is stored");
+        let transition = end.recur_state.expect("a state transition");
+        assert_eq!(transition.state_out.as_slice(), returned.commitment.as_slice());
+        // The next iteration reads exactly that object.
+        if let Some(next) = starts.get(index + 1) {
+            assert_eq!(next.storage()["state"].commitment, returned.commitment);
+        }
+    }
+}

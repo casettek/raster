@@ -94,6 +94,11 @@ pub enum ReturnExpr {
     /// value, a plain function call such as `finalize(draft)`, or a `select!`
     /// with a data-sourced index. Kept as source text for the diagnostic.
     Unbound { expr: String },
+    /// `(a, b, …)` — a recur-sequence body's `(state, output)`. Each element
+    /// is classified on its own, except that a call inside the tuple is not
+    /// bound: it need not be the body's last step, which is what `TailCall`
+    /// means.
+    Tuple(Vec<ReturnExpr>),
 }
 
 /// Captures detailed information about a function call within a function body.
@@ -121,6 +126,10 @@ pub struct CallInfo {
     /// state: every earlier one is pinned by the next iteration's, and this is
     /// the only shape where the last one has something to be compared against.
     pub state_is_output: bool,
+    /// Whether the site carries state at all (`state = …`), with or without
+    /// an `output`. Recorded in the CFS so a stored seed is found by position
+    /// at `RecurStart` (`incremental-draft-materialization` D5b).
+    pub carries_state: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -421,6 +430,18 @@ impl CallVisitor {
             }
             Expr::Try(try_expr) => Self::classify_return_expr(&try_expr.expr),
             Expr::Paren(paren) => Self::classify_return_expr(&paren.expr),
+            Expr::Tuple(tuple) => ReturnExpr::Tuple(
+                tuple
+                    .elems
+                    .iter()
+                    .map(|elem| match Self::classify_return_expr(elem) {
+                        ReturnExpr::TailCall => ReturnExpr::Unbound {
+                            expr: Self::expr_to_string(elem),
+                        },
+                        other => other,
+                    })
+                    .collect(),
+            ),
             Expr::Macro(expr_macro) if Self::macro_call_kind(&expr_macro.mac).is_some() => {
                 ReturnExpr::TailCall
             }
@@ -556,8 +577,8 @@ impl CallVisitor {
             Some(CallKind::RecursiveSequence)
         ) {
             return Self::parse_recur_sequence_call_macro_args(mac)
-                .map(|(callee, args, kinds, output, state_is_output)| {
-                    (callee, args, kinds, None, output, state_is_output)
+                .map(|(callee, args, kinds, output, carries_state)| {
+                    (callee, args, kinds, None, output, carries_state)
                 });
         }
 
@@ -683,7 +704,10 @@ impl CallVisitor {
         // A site whose own output *is* its carried state: `state` with no
         // `output`. That is the shape whose final state the trace can pin, by
         // comparing the site's recorded output against the chain's last value.
-        let state_is_output = parsed.state.is_some() && parsed.output.is_none();
+        // Whether the site carries state: the CFS records it, so the guest can
+        // find a stored seed at `RecurStart` (D5b). `state_is_output` follows
+        // from it and `output` at the visitor.
+        let carries_state = parsed.state.is_some();
         let mut arguments = vec![Self::expr_to_string(&parsed.input)];
         let mut argument_kinds = vec![Self::classify_argument(&parsed.input)];
 
@@ -705,7 +729,7 @@ impl CallVisitor {
             argument_kinds,
             chunk,
             output,
-            state_is_output,
+            carries_state,
         ))
     }
 
@@ -764,7 +788,10 @@ impl CallVisitor {
         }
 
         let parsed = syn::parse2::<RecurSequenceCallInput>(mac.tokens.clone()).ok()?;
-        let state_is_output = parsed.state.is_some() && parsed.output.is_none();
+        // Whether the site carries state: the CFS records it, so the guest can
+        // find a stored seed at `RecurStart` (D5b). `state_is_output` follows
+        // from it and `output` at the visitor.
+        let carries_state = parsed.state.is_some();
         let mut arguments = vec![Self::expr_to_string(&parsed.input)];
         let mut argument_kinds = vec![Self::classify_argument(&parsed.input)];
 
@@ -785,7 +812,7 @@ impl CallVisitor {
             arguments,
             argument_kinds,
             output,
-            state_is_output,
+            carries_state,
         ))
     }
 
@@ -1070,7 +1097,7 @@ impl<'ast> Visit<'ast> for CallVisitor {
                 argument_kinds,
                 chunk,
                 output,
-                state_is_output,
+                carries_state,
             )) =
                 Self::parse_call_macro_args(&node.mac)
             {
@@ -1082,8 +1109,11 @@ impl<'ast> Visit<'ast> for CallVisitor {
                     result_binding,
                     call_kind,
                     chunk,
+                    // A site whose own output *is* its carried state: `state`
+                    // with no `output`.
+                    state_is_output: carries_state && output.is_none(),
                     output,
-                    state_is_output,
+                    carries_state,
                 });
                 // Do not recurse into the macro body — arguments are already captured above.
                 return;
@@ -1106,7 +1136,7 @@ impl<'ast> Visit<'ast> for CallVisitor {
                 argument_kinds,
                 chunk,
                 output,
-                state_is_output,
+                carries_state,
             )) =
                 Self::parse_call_macro_args(&node.mac)
             {
@@ -1118,8 +1148,11 @@ impl<'ast> Visit<'ast> for CallVisitor {
                     result_binding: None,
                     call_kind,
                     chunk,
+                    // A site whose own output *is* its carried state: `state`
+                    // with no `output`.
+                    state_is_output: carries_state && output.is_none(),
                     output,
-                    state_is_output,
+                    carries_state,
                 });
                 return;
             }

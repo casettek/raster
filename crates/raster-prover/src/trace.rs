@@ -2211,6 +2211,7 @@ mod tests {
                 chunk: Some(2),
                 output: None,
                 state_is_output: false,
+                carries_state: false,
             }));
 
         cfs.sequences.push(main);

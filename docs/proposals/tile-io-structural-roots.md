@@ -1,6 +1,7 @@
 # Proposal: `tile-io-structural-roots` — bind what a tile reads and writes to its replay
 
-Status: proposed 2026-09-28; steps 0 and 1 done 2026-09-30. Closes
+Status: proposed 2026-09-28; steps 0 and 1 done 2026-09-30; step 2 done 2026-10-01 (with
+`incremental-draft-materialization` batch C). Closes
 [`tile-output-commitment-unbound`](../issues/tile-output-commitment-unbound.md) and
 [`selection-unbound-from-execution`](../issues/selection-unbound-from-execution.md) in one tile
 image-id break.
@@ -211,6 +212,27 @@ proves — step 2.
   payload bytes and compares it with the claimed `root_hash`, so a child encoder bug fails the run
   rather than producing a trace no honest challenger can defend.
 
+**Done 2026-10-01**, in batch C.
+
+- `TileReplayJournal.output_root` — `Some(value_root(result))` exactly when the tile publishes an
+  output; `transition` guest `checks::io::verify_output_root` requires `output_commitment` to equal
+  it, or to be empty when `None`; `checks::store` requires a step with an empty commitment to write
+  nothing and refuses a write witness on a non-writing step kind. Together: a tile writes iff its
+  replay produced an output, and writes exactly that root.
+- `TileReplayJournal.input_roots` — the raster root of each decoded argument (a recur item's
+  value, a carried state's inner value, `None` for a draft handle), captured between decode and
+  call. `checks::io::verify_input_roots` requires every storage-bound argument's selected payload
+  root (`payload_structural_root`, the root its selection proof folds from; `selected_root` for a
+  reference witness) to equal it, and the root count to equal the recorded argument count.
+- **Recorder parity for outputs** is by construction rather than a recomputation: the native
+  wrapper's stored payload and the replay's `output_root` come from the same encoder
+  (`raster_core::tree`), and an encoder disagreement fails the honest run's fraud windows, which
+  were run (see the draft proposal's batch C notes). A host-side recomputation of `root_hash` from
+  payload bytes was not added.
+- Measured on real windows: every storage-bound argument of every tile replayed in the
+  `hello-tiles` windows run — strings, structs, a stored carried state, recur items and `chunk = 2`
+  blocks — agrees with its selection's root.
+
 ### Step 3 — verify and regenerate
 
 Invert both issues' probes (a forged output commitment; the re-read sweep), replay real traces
@@ -229,7 +251,7 @@ this proposal. Batches are grouped by what they break: a *trace-shape* break re-
 | --- | --- | --- |
 | **A — trace shape** | `RecurStart`/`RecurEnd` step kinds, site closes at `[-s]`, `ExecTarget::RecurTile`/`RecurSequence` removed; D4 (nested `SequenceEnd` at `[-s]`); `RecurStartStep.storage` (read-only) takes over this proposal's `SequenceStart.storage`, which is removed again; site-ordering checks | trace shape, transition guest; **done 2026-09-30** — also moves the image ids of tiles that link the edited `raster-core` code |
 | **B — language and object ownership** | §One storage rule and §The restriction: `new!`/`finalize`/`finalize = false` removed, a site owns its object at `[s]` (creates, or derives with `output = base`), plain tiles return values, `DRAFT_NAMESPACE` deleted, host anchor `anchor_for_schema([s], S)`; D1b (`RecurOutputDecl` in the CFS via `schema_walk`); programs rewritten (`examples/`, `crates/raster/tests`, `raster-inference`) | CFS, programs, `program_commitment` |
-| **C — tile journal** (one tile-image-id break) | D3 (recur iterations publish no output; an `Exec` with no write has an empty `output_commitment`); D2 (`draft_id` removed); D1a (replay tile asserts its schema); D5b (replayed state as raster roots, recur-sequence state by reference); **this proposal's step 2** (`output_root`, `input_roots`); guest: the frame's draft entry replaces `active_drafts`, `RecurEnd` writes exactly one object | every tile image id, `program_commitment` |
+| **C — tile journal** (one tile-image-id break) (**done 2026-10-01**) | D3 (recur iterations publish no output; an `Exec` with no write has an empty `output_commitment`); D2 (`draft_id` removed); D1a (replay tile asserts its schema); D5b (replayed state as raster roots, recur-sequence state by reference); **this proposal's step 2** (`output_root`, `input_roots`); guest: the frame's draft entry replaces `active_drafts`, `RecurEnd` writes exactly one object | every tile image id, `program_commitment` |
 | **D — materialization** | `DraftBuffer`, one seal for store and `RecurEnd` output, `rindex04` relative offsets, derivation sharing (`Derived` backing, delta output) | `.rindex` format; no guest or tile change |
 | **E — verification** | both proposals' Verification lists; this proposal's step 3; GPU proving; all locks, `raster-inference` included | — |
 
