@@ -71,6 +71,24 @@ impl Crop for Vec<u8> {
     }
 }
 
+/// The value a hash squeezes to at `bits_per_item` — the whole of what a
+/// fingerprint entry retains about it.
+///
+/// Extracted so the two places that need it cannot drift:
+/// [`FingerprintAccumulator::append`], which produces the entries, and the
+/// commitment's `validate`, which checks a revealed full trace root against the
+/// entry already committed at its index. If those disagreed, a commitment could
+/// carry roots that contradict its own fingerprint.
+pub fn fingerprint_value(item: &[u8], bits_per_item: usize) -> u64 {
+    let cropped = item.to_vec().crop(bits_per_item);
+
+    // Little-endian, and short items zero-extend.
+    let mut item_bytes = [0u8; 8];
+    let bytes_len = cropped.len().min(8);
+    item_bytes[..bytes_len].copy_from_slice(&cropped[..bytes_len]);
+    u64::from_le_bytes(item_bytes)
+}
+
 /// Packs hash bits into compact fingerprints.
 ///
 /// The BitPacker extracts a fixed number of bits from each hash and packs
@@ -569,14 +587,7 @@ impl FingerprintAccumulator {
     }
 
     pub fn append(&mut self, item: &[u8]) {
-        // Crop the item to the specified number of bits
-        let cropped = item.to_vec().crop(self.fingerprint.bits_per_item());
-
-        // Convert cropped bytes to u64 (little-endian)
-        let mut item_bytes = [0u8; 8];
-        let bytes_len = cropped.len().min(8);
-        item_bytes[..bytes_len].copy_from_slice(&cropped[..bytes_len]);
-        let item_u64 = u64::from_le_bytes(item_bytes);
+        let item_u64 = fingerprint_value(item, self.fingerprint.bits_per_item());
 
         // Calculate which block(s) the item spans
         let item_pos = self.fingerprint.len();

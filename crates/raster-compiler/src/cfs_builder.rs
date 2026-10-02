@@ -3,7 +3,7 @@
 //! This module orchestrates the generation of a CFS from a Raster project
 //! by combining tile discovery, sequence discovery, and data flow resolution.
 
-use raster_core::cfs::{ControlFlowSchema, InputBinding, SequenceDef, TileDef};
+use raster_core::cfs::{ControlFlowSchema, InputBinding, SequenceDef, SequenceReturn, TileDef, SequenceChildItem};
 
 use crate::flow_resolver::FlowResolver;
 use crate::sequence::{Sequence, SequenceDiscovery};
@@ -46,7 +46,8 @@ impl<'a> CfsBuilder<'a> {
         // Build sequence definitions with resolved data flow
         let mut sequences = Vec::new();
         for seq in &sequence_discovery.sequences {
-            let seq_def = self.build_sequence_def(seq)?;
+            let mut seq_def = self.build_sequence_def(seq)?;
+            self.fill_site_output_schemas(&mut seq_def)?;
             sequences.push(seq_def);
         }
 
@@ -71,6 +72,56 @@ impl<'a> CfsBuilder<'a> {
         })
     }
 
+    /// Fill each recur site's [`RecurOutputDecl`] with its output type's
+    /// schema hash and empty root (D1 of `incremental-draft-materialization`):
+    /// the object a site owns is declared by the program, not chosen by the
+    /// prover.
+    ///
+    /// The type comes from the site's own signature — the `RecurOutput<S>`
+    /// parameter of a recur tile, the `RecurSequenceOutput<S>` parameter of a
+    /// recur sequence — and is resolved by the same `schema_walk` that fills
+    /// the program interface's schema hashes.
+    fn fill_site_output_schemas(&self, sequence: &mut SequenceDef) -> Result<()> {
+        for item in &mut sequence.items {
+            let (id, output, wrapper) = match item {
+                SequenceChildItem::RecurTile(item) => (&item.id, &mut item.output, "RecurOutput"),
+                SequenceChildItem::RecurSequence(item) => {
+                    (&item.id, &mut item.output, "RecurSequenceOutput")
+                }
+                _ => continue,
+            };
+            let Some(declaration) = output.as_mut() else {
+                continue;
+            };
+            let function = self
+                .project
+                .ast
+                .functions
+                .iter()
+                .find(|function| &function.name == id)
+                .ok_or_else(|| {
+                    Error::Other(format!("Recur site '{id}' has no function to read its output type from"))
+                })?;
+            let output_type = function
+                .inputs
+                .iter()
+                .find_map(|ty| generic_inner(ty, wrapper))
+                .ok_or_else(|| {
+                    Error::Other(format!(
+                        "Recur site '{id}' has an `output` but no `{wrapper}<S>` parameter"
+                    ))
+                })?;
+            let schema =
+                crate::schema_walk::schema_of_type(&output_type, &self.project.ast.structs)?;
+            declaration.schema_hash = raster_core::draft::schema_hash(&schema);
+            declaration.empty_root = raster_core::draft::draft_root_from_field_roots(
+                &schema,
+                &std::collections::BTreeMap::new(),
+            )?;
+        }
+        Ok(())
+    }
+
     /// Build a sequence definition from a discovered sequence.
     ///
     /// `main`'s declared parameters are entry arguments, not caller-supplied
@@ -90,6 +141,7 @@ impl<'a> CfsBuilder<'a> {
 
         if seq.function.name == "main" && !seq.function.input_names.is_empty() {
             let items = resolver.resolve_with_entry_arguments(seq, &seq.function.input_names);
+            let returns = sequence_returns(&resolver, seq, items.len())?;
 
             return Ok(SequenceDef {
                 id: seq.function.name.clone(),
@@ -97,6 +149,7 @@ impl<'a> CfsBuilder<'a> {
                 items,
                 entry_arguments: seq.function.input_names.clone(),
                 produces_output,
+                returns,
             });
         }
 
@@ -109,6 +162,7 @@ impl<'a> CfsBuilder<'a> {
 
         // Resolve data flow for the sequence items
         let items = resolver.resolve(seq);
+        let returns = sequence_returns(&resolver, seq, items.len())?;
 
         Ok(SequenceDef {
             id: seq.function.name.clone(),
@@ -116,8 +170,117 @@ impl<'a> CfsBuilder<'a> {
             items,
             entry_arguments: Vec::new(),
             produces_output,
+            returns,
         })
     }
+}
+
+/// Bind the value a sequence returns, so the guest can follow it.
+///
+/// Recorded for every sequence that returns a value, relative to the
+/// sequence itself (an item index, never a coordinate — one definition is
+/// called from many places). The guest walks these from `main` or from any
+/// consumer of a sequence's output down to the step that wrote the object
+/// (`CfsCursor::resolve_value`). A recur sequence's body is skipped: its site
+/// writes the result at the site's own coordinate, which is where the walk
+/// stops.
+///
+/// An unbindable return is a **build error**
+/// (`incremental-draft-materialization` §Sequence return binding): the guest
+/// could not follow it, so `main`'s `ProgramEnd` would not verify and a use of
+/// a nested sequence's result would be unchecked. It was a warning only while
+/// `finalize(draft)` — a plain call, not a step — could still be returned;
+/// that left the language in batch B.
+fn sequence_returns(
+    resolver: &FlowResolver,
+    seq: &Sequence<'_>,
+    item_count: usize,
+) -> Result<Option<SequenceReturn>> {
+    if is_recur_sequence(seq) {
+        return recur_state_return(resolver, seq, item_count);
+    }
+    if !returns_non_unit(&seq.function.output) {
+        return Ok(None);
+    }
+    let returns = seq
+        .function
+        .return_expr
+        .as_ref()
+        .and_then(|ret| resolver.resolve_return(ret, item_count));
+    if returns.is_none() {
+        let name = &seq.function.name;
+        let form = match &seq.function.return_expr {
+            Some(crate::ast::ReturnExpr::Unbound { expr }) => format!("`{expr}`"),
+            Some(crate::ast::ReturnExpr::Rooted { root, .. }) => {
+                format!("`{root}` (a name no step produced)")
+            }
+            Some(crate::ast::ReturnExpr::TailCall) => "its final call".to_string(),
+            Some(crate::ast::ReturnExpr::Tuple(_)) => "a tuple".to_string(),
+            None => "no returned expression".to_string(),
+        };
+        return Err(Error::Other(format!(
+            "`{name}` returns {form}, which the CFS cannot bind to a step's output or an \
+             argument, so no audit could follow it. Return a binding of a \
+             `call!`/`call_recur!`/`call_seq!` result, or a `select!` of one."
+        )));
+    }
+    Ok(returns)
+}
+
+/// For a recur-sequence body, the **carried state** it returns — the whole
+/// return of a state-only body, the first element of a `(state, output)` one;
+/// `None` for an output-only body.
+///
+/// Not a value the static walk follows: the site writes its result at its own
+/// coordinate, where `CfsCursor::resolve_value` stops. It is what each
+/// iteration's `SequenceEnd` is checked against — the state it returns must be
+/// the object this binding names inside the iteration
+/// (`incremental-draft-materialization` D5b, recur-sequence state by
+/// reference). A state the CFS cannot bind is a build error, as above.
+fn recur_state_return(
+    resolver: &FlowResolver,
+    seq: &Sequence<'_>,
+    item_count: usize,
+) -> Result<Option<SequenceReturn>> {
+    let Some(output) = seq
+        .function
+        .output
+        .as_deref()
+        .and_then(|output| syn::parse_str::<syn::Type>(output).ok())
+    else {
+        return Ok(None);
+    };
+    let Some(return_expr) = seq.function.return_expr.as_ref() else {
+        return Ok(None);
+    };
+    let state_expr = match (&output, return_expr) {
+        (syn::Type::Tuple(_), crate::ast::ReturnExpr::Tuple(elems)) => elems.first().cloned(),
+        (syn::Type::Path(path), expr)
+            if path.path.segments.last().map(|s| s.ident == "RecurSequenceState")
+                == Some(true) =>
+        {
+            Some(expr.clone())
+        }
+        _ => return Ok(None),
+    };
+    let returns = state_expr.and_then(|expr| resolver.resolve_return(&expr, item_count));
+    if returns.is_none() {
+        return Err(Error::Other(format!(
+            "recur sequence `{}` returns a carried state the CFS cannot bind to a step's \
+             output, so its iterations could not be audited. Return a binding of a `call!` \
+             result (for `(state, output)`, as the first element).",
+            seq.function.name
+        )));
+    }
+    Ok(returns)
+}
+
+/// Whether `seq` is the body of a recur sequence (`#[sequence(kind = recur)]`).
+fn is_recur_sequence(seq: &Sequence<'_>) -> bool {
+    seq.function.macros.iter().any(|attr| {
+        attr.name.rsplit("::").next() == Some("sequence")
+            && attr.args.get("kind").map(String::as_str) == Some("recur")
+    })
 }
 
 /// Reject duplicate ids in a (already sorted) id sequence, naming the kind
@@ -216,6 +379,8 @@ mod tests {
             signature: format!("fn {}()", name),
             selection_aliases: vec![],
             selection_index_sources: vec![],
+            selection_paths: vec![],
+            return_expr: None,
         }
     }
 
@@ -240,6 +405,8 @@ mod tests {
             signature: "fn main()".to_string(),
             selection_aliases: vec![],
             selection_index_sources: vec![],
+            selection_paths: vec![],
+            return_expr: None,
         }
     }
 
@@ -266,7 +433,9 @@ mod tests {
                 }],
                 call_kind: CallKind::Tile,
                 chunk: None,
-                leaves_output_open: false,
+                output: None,
+                state_is_output: false,
+                carries_state: false,
             }],
         );
         let sequence = Sequence {
@@ -303,6 +472,99 @@ mod tests {
             }
             other => panic!("Expected a Tile item, got {:?}", other),
         }
+    }
+
+    /// Every sequence that returns a value records what it returns — not only
+    /// `main` — except a recur sequence's body, whose site writes the result
+    /// at its own coordinate.
+    #[test]
+    fn nested_sequences_record_their_returns_and_recur_bodies_do_not() {
+        let project = mock_project();
+        let greet_func = tile_function("greet");
+        let greet_tile = Tile {
+            function: &greet_func,
+            tile_type: "iter".to_string(),
+            estimated_cycles: None,
+            max_memory: None,
+            description: None,
+        };
+        let body = |name: &str, kind: Option<&str>| {
+            let mut function = main_function_with_params(
+                vec![],
+                vec![CallInfo {
+                    callee: "greet".to_string(),
+                    result_binding: Some("greeting".to_string()),
+                    arguments: vec!["\"hi\"".to_string()],
+                    argument_kinds: vec![CallArgumentKind::Inline],
+                    call_kind: CallKind::Tile,
+                    chunk: None,
+                    output: None,
+                    state_is_output: false,
+                    carries_state: false,
+                }],
+            );
+            function.name = name.to_string();
+            function.output = Some("String".to_string());
+            function.return_expr = Some(crate::ast::ReturnExpr::Rooted {
+                root: "greeting".to_string(),
+                path: vec![],
+            });
+            if let Some(kind) = kind {
+                function.macros[0].args.insert("kind".to_string(), kind.to_string());
+            }
+            function
+        };
+        let builder = CfsBuilder::new(&project);
+        let def_of = |function: &FunctionAstItem| {
+            builder
+                .build_sequence_def(&Sequence {
+                    function,
+                    steps: vec![SequenceStep::Tile(&greet_tile)],
+                    description: None,
+                })
+                .unwrap()
+        };
+
+        let nested = def_of(&body("helper", None));
+        assert!(!nested.produces_output, "only main produces the program output");
+        assert_eq!(
+            nested.returns,
+            Some(SequenceReturn {
+                source: InputBinding::prior_item_output(0),
+                path: vec![],
+            })
+        );
+        assert_eq!(def_of(&body("sweep", Some("recur"))).returns, None);
+    }
+
+    /// A value-returning sequence whose return the CFS cannot bind fails to
+    /// build: no audit could follow it.
+    #[test]
+    fn an_unbindable_return_is_a_build_error() {
+        let project = mock_project();
+        let greet_func = tile_function("greet");
+        let greet_tile = Tile {
+            function: &greet_func,
+            tile_type: "iter".to_string(),
+            estimated_cycles: None,
+            max_memory: None,
+            description: None,
+        };
+        let mut function = main_function_with_params(vec![], vec![]);
+        function.name = "helper".to_string();
+        function.output = Some("String".to_string());
+        function.return_expr = Some(crate::ast::ReturnExpr::Unbound {
+            expr: "format!(\"{}\", x)".to_string(),
+        });
+        let error = CfsBuilder::new(&project)
+            .build_sequence_def(&Sequence {
+                function: &function,
+                steps: vec![SequenceStep::Tile(&greet_tile)],
+                description: None,
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("cannot bind"), "{error}");
     }
 
     fn project_with_tile_functions(names: &[&str]) -> Project {
@@ -377,7 +639,9 @@ mod tests {
                 argument_kinds: vec![CallArgumentKind::Inline],
                 call_kind: CallKind::Tile,
                 chunk: None,
-                leaves_output_open: false,
+                output: None,
+                state_is_output: false,
+                carries_state: false,
             }],
         );
         let sequence = Sequence {
@@ -400,4 +664,19 @@ mod tests {
         assert_eq!(seq_def.items.len(), 1, "just the one tile item");
         assert!(matches!(seq_def.items[0], SequenceChildItem::Tile(_)));
     }
+}
+
+/// `S` out of a parameter type `wrapper<S>`, as the AST prints it
+/// (`RecurOutput < CollectiveGreeting >`), including a path-qualified wrapper
+/// (`raster :: RecurOutput < S >`).
+fn generic_inner(ty: &str, wrapper: &str) -> Option<String> {
+    let compact: String = ty.chars().filter(|c| !c.is_whitespace()).collect();
+    let start = compact.find(&format!("{wrapper}<"))?;
+    let preceding = compact[..start].chars().last();
+    if preceding.is_some_and(|c| c.is_alphanumeric() || c == '_') {
+        return None;
+    }
+    let inner = &compact[start + wrapper.len() + 1..];
+    let inner = inner.strip_suffix('>')?;
+    Some(inner.to_string())
 }

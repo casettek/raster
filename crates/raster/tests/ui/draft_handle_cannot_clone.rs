@@ -7,7 +7,7 @@ struct Account {
 }
 
 fn attempt_clone() {
-    let draft = new!(Account);
+    let draft = Draft::<Account>::new();
     let _copy = draft.clone();
 }
 

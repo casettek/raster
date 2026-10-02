@@ -1,6 +1,6 @@
 # Proposal: `window-seed-reconstruction` — give a fraud-proof window the carried state it opens with
 
-Status: proposed 2026-08-14
+Status: **implemented** (2026-09-09)
 
 Related:
 - [`recur-progress-commitment.md`](./recur-progress-commitment.md) — **the immediate consumer.**
@@ -157,6 +157,60 @@ plus five scalars, and stack depth is loop-*nesting* depth — 1 in almost every
 
 No change to window size, proving time, receipt count, or the trace itself. The prefix walk is the
 one `storage_state_from_prefix` already performs.
+
+## Implementation record (2026-09-09)
+
+Landed as specified: the recorder retains the stack, the CLI reads it on the prefix walk it
+already performs, and the prover threads it to the guest, which already knew what to do with it.
+Uncertainty 1 resolved as recommended (**retain**, not derive); Uncertainty 2 deferred
+(`active_drafts` untouched — `carried-state-channel` still owns the generalization); Uncertainty 3
+**taken** (§4 below).
+
+Three corrections to this document, found while implementing:
+
+1. **The production `None` was not where §Modules touched implies.** `raster-prover/src/transition.rs:591`
+   is a *test fixture*. The real one was inside `step_transitions`, which had no seed parameter —
+   so the prover-side change is a new parameter plus its one caller (`raster-cli`), not "one line".
+   `build_transition_input` did already carry the parameter.
+
+2. **The accessor cannot be keyed by `CfsCoordinates`.** §2 sketches
+   `recur_progress_after(&CfsCoordinates)`, mirroring `step_witness_at`. That loses data: a recur
+   site's `Start` and `End` share the bare site coordinate (a site coordinate is a *scope* —
+   `recur-progress-commitment.md` §3.2.1) and hold opposite stacks, so the close silently
+   overwrites the open. Keyed by `exec_index`, which `TraceRecorder` already assigns uniquely per
+   step. Caught by the §Verification item 5 agreement test on its first run, which is the argument
+   for asserting agreement at the source rather than only through a proof that fails downstream.
+
+3. **The guest was not left untouched.** §Modules touched says the guest needs no change, which
+   held for the seed itself — but Uncertainty 3's diagnostic lives there, so this change *does*
+   move the transition guest's image id. Items 1-3 alone would not have.
+
+### What changed
+
+| file | change |
+| --- | --- |
+| `raster-runtime/src/tracing/recorder.rs` | `recur_progress_store: HashMap<u64, RecurProgressStack>`, written at the same tail that stamps `recur_progress_commitment`; `recur_progress_after(exec_index)` |
+| `raster-cli/src/commands/run.rs` | seed read in `prove()` from the step before `window_start_index`, beside the existing `storage_state_from_prefix` call |
+| `raster-prover/src/transition.rs` | `window_start_recur_progress` parameter on `step_transitions`, supplied to `build_transition_input` under the existing `current_journal.is_none()` first-step guard |
+| `guests/transition/src/fraud_proof.rs` | `assert_seed_present_for_mid_loop_open` — names a mid-loop open with no seed instead of letting it surface as a commitment mismatch |
+
+### Verification as run
+
+- **Agreement at the source** (`recorder.rs` tests): every step's retained stack hashes to that
+  step's own stamped commitment, across a tile site and a recur-sequence site (including a plain
+  tile executing inside an iteration). Plus: the stack retained after a live iteration is not the
+  empty one.
+- **Guest** (`guests/transition/src/tests.rs`): a seeded mid-loop window verifies; an unseeded one
+  fails with `recur iteration has no active recur site`; a forged seed fails the commitment
+  comparison; a nested seed carrying both frames commits differently from one carrying only the
+  inner frame.
+- **Unaffected**: the `hello-tiles` `--commit`/`--audit` path, seeded with the empty stack.
+
+Not run: the end-to-end mid-loop fraud proof. No test today opens a window at a chosen mid-trace
+offset — committed windows are `trace[..window_size]` and `terminal_window` takes the last
+`window_size` — and the reachable route (tamper a `commit.bin` fingerprint bit deep inside a sweep
+so `TraceVerifier::verify`'s bounded `Window` opens mid-loop) drives the real RISC0 prover, which
+the repo has no `RISC0_DEV_MODE` convention to make cheap. Left as a manual acceptance run.
 
 ## Uncertainties for review
 

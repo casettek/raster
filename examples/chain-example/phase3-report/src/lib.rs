@@ -49,32 +49,26 @@ pub fn mean_scaled(sum: u64, count: u64) -> u64 {
     }
 }
 
-/// Set the report's title. Set-once, so this runs exactly once.
-#[tile(description = "Set the report title")]
-pub fn set_report_title(label: String, draft: Draft<Report>) -> Draft<Report> {
-    let mut draft = draft;
-    draft.title().set(format!("Pipeline report for {label}"));
-    draft
-}
-
-/// Append one `name: value` line. Two small scalars in, one line appended —
-/// the draft pays for the increment, not for re-committing the whole report.
-#[tile(description = "Append one metric line to the report")]
-pub fn push_metric(name: String, value: u64, draft: Draft<Report>) -> Draft<Report> {
-    let mut draft = draft;
-    draft.lines().push(format!("{name:<8}: {value}"));
-    draft
-}
-
-/// Append the mean, formatted back from its scaled integer form.
-#[tile(description = "Append the formatted mean line to the report")]
-pub fn push_mean(mean_scaled: u64, draft: Draft<Report>) -> Draft<Report> {
-    let mut draft = draft;
-    draft.lines().push(format!(
+/// Assemble the report: a title and one line per metric, the mean formatted
+/// back from its scaled integer form.
+///
+/// Drafted in one tile and returned: the tile's close completes it into the
+/// `Report` stored at this tile's coordinate. (This was a draft threaded
+/// through four tiles and closed with `finalize`, which stored the report at a
+/// coordinate no step wrote — `authenticated-chain-draft-output`'s
+/// reproducer. A draft now lives inside one tile.)
+#[tile(description = "Assemble the pipeline report")]
+pub fn build_report(label: String, count: u64, sum: u64, max: u64, mean_scaled: u64) -> Draft<Report> {
+    let mut report = Draft::<Report>::new();
+    report.title().set(format!("Pipeline report for {label}"));
+    report.lines().push(format!("{:<8}: {}", "count", count));
+    report.lines().push(format!("{:<8}: {}", "sum", sum));
+    report.lines().push(format!("{:<8}: {}", "max", max));
+    report.lines().push(format!(
         "{:<8}: {}.{:02}",
         "mean",
         mean_scaled / 100,
         mean_scaled % 100
     ));
-    draft
+    report
 }

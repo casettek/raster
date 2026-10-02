@@ -258,6 +258,7 @@ mod tests {
             })],
             entry_arguments,
             produces_output,
+            returns: None,
         }
     }
 

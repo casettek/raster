@@ -124,16 +124,33 @@ pub fn concat_messages(message1: String, message2: String) -> String {
     format!("{} {}", message1, message2)
 }
 
+/// A greeting with a title and two lines, drafted in this tile. Returning the
+/// draft completes it: the greeting is stored at this tile's coordinate, and the
+/// caller gets that object. Its two pushes are well inside the draft budget a
+/// tile run may spend.
 #[tile(kind = iter)]
-pub fn set_draft_greeting_title(
+pub fn build_greeting(
     title: String,
-    draft: Draft<CollectiveGreeting>,
+    first_line: String,
+    second_line: String,
 ) -> Draft<CollectiveGreeting> {
-    let mut draft = draft;
-    draft.title().set(title);
-    draft
+    let mut greeting = Draft::<CollectiveGreeting>::new();
+    greeting.title().set(title);
+    greeting.lines().push(first_line);
+    greeting.lines().push(second_line);
+    greeting
 }
 
+/// A titled greeting with no lines yet — the base a recur site derives from.
+#[tile(kind = iter)]
+pub fn begin_greeting(title: String) -> Draft<CollectiveGreeting> {
+    let mut greeting = Draft::<CollectiveGreeting>::new();
+    greeting.title().set(title);
+    greeting
+}
+
+/// Appends one line to the enclosing recur sequence's draft. Takes a `Draft`,
+/// which only a recur site's body can hand it.
 #[tile(kind = iter)]
 pub fn push_draft_greeting_line(
     line: String,
@@ -197,6 +214,54 @@ pub struct LineLengthStats {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct GreetingLimitState {
     pub seen: u64,
+}
+
+/// The stored seed of the state-only recur below. A seed a tile wrote is
+/// read by the site's `RecurStart`, so the sweep's carried-state chain opens
+/// at its commitment rather than adopting whatever iteration 0 reports.
+#[tile(kind = iter)]
+pub fn zero_line_stats() -> LineLengthStats {
+    LineLengthStats { max_len: 0 }
+}
+
+/// Carried state of the stateful recur sequence below.
+#[derive(Clone, Debug, Deserialize, Serialize, Selectable)]
+pub struct LineCursor {
+    pub seen: u64,
+    pub total_len: u64,
+}
+
+/// Its stored seed.
+#[tile(kind = iter)]
+pub fn begin_line_cursor() -> LineCursor {
+    LineCursor {
+        seen: 0,
+        total_len: 0,
+    }
+}
+
+/// One step of the cursor, on one decorated line.
+#[tile(kind = iter)]
+pub fn advance_line_cursor(cursor: LineCursor, line: String) -> LineCursor {
+    LineCursor {
+        seen: cursor.seen + 1,
+        total_len: cursor.total_len + line.len() as u64,
+    }
+}
+
+/// A recur sequence that carries **state**: each iteration decorates its line
+/// and advances the cursor. The state crosses iterations by reference — the
+/// object the previous iteration's `advance_line_cursor` wrote — so each
+/// iteration's `End` is checked to return exactly that tile's output, and the
+/// site's stored result to be the last one.
+#[sequence(kind = recur)]
+pub fn count_lines_sequence(
+    input: RecurSequenceInput<String>,
+    state: RecurSequenceState<LineCursor>,
+    marker: String,
+) -> RecurSequenceState<LineCursor> {
+    let decorated = call!(decorate_address_line, input, marker);
+    call!(advance_line_cursor, state, decorated)
 }
 
 /// State-only recur: reduce a list of lines down to a single summary value.

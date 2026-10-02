@@ -221,6 +221,14 @@ pub enum OutputAuthorization {
   1. the guest makes `ProgramEnd` the unique terminal step, so any committed full trace
      necessarily contains it and the output commitment is bound into the fingerprint —
      forging an output means diverging from the fingerprint, which is fraud-provable;
+
+     > **Corrected 2026-09-28.** Diverging is fraud-provable only if the guest *rejects* the
+     > forged step, and `verify_program_end` checks that the output object is stored and validly
+     > selected — not that it is the one `main` returns. A throwaway guest probe gave it an object
+     > at `[7]`, a coordinate naming no CFS item, and it returned `Established`. The fix — a
+     > `returns` binding in the CFS, checked here — is in
+     > [`incremental-draft-materialization`](./incremental-draft-materialization.md) §Sequence
+     > return binding.
   2. host-side full-trace verification (`TraceVerifier`, the `commands/run.rs` audit
      path) asserts the trace ends with a verified `ProgramEnd` and that the artifact
      commitment matches;

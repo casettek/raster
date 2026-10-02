@@ -5,10 +5,11 @@ use syn::{
     parse::{Parse, ParseStream},
     parse_file,
     visit::Visit,
-    Attribute, Expr, ExprLit, ExprMacro, FnArg, Lit, Local, Meta, Pat, StmtMacro, Token,
+    Attribute, Expr, ExprLit, ExprMacro, FnArg, Lit, Local, Meta, Pat, Stmt, StmtMacro, Token,
 };
 use walkdir::WalkDir;
 
+use raster_core::input::SelectorSegment;
 use raster_core::Result;
 
 #[derive(Debug, Clone)]
@@ -63,6 +64,43 @@ pub enum CallArgumentKind {
     Inline,
 }
 
+/// How a recur site gets its object (`incremental-draft-materialization` §One
+/// storage rule).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SiteOutputKind {
+    /// `output,` — the site creates a new object.
+    Create,
+    /// `output = base,` — the site derives from a stored object.
+    Derive,
+}
+
+/// What a function body returns — its last expression, classified the way a
+/// call argument is, so the flow resolver can bind it to a source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReturnExpr {
+    /// The body ends with a call primitive (`call!`, `call_seq!`, …) and
+    /// returns that call's result: the output of the last step.
+    TailCall,
+    /// The body returns a value rooted at a name — a binding, `select!(T,
+    /// x.f)`, `clone!(x)` — optionally wrapped in `Ok(..)` or `..?`. `path` is
+    /// the returned expression's own static selector path (`[f]` for
+    /// `select!(T, x.f)`, empty for a bare binding); the resolver prefixes the
+    /// paths of `root`'s alias chain.
+    Rooted {
+        root: String,
+        path: Vec<SelectorSegment>,
+    },
+    /// A returned expression the CFS cannot bind: a literal, a computed
+    /// value, a plain function call such as `finalize(draft)`, or a `select!`
+    /// with a data-sourced index. Kept as source text for the diagnostic.
+    Unbound { expr: String },
+    /// `(a, b, …)` — a recur-sequence body's `(state, output)`. Each element
+    /// is classified on its own, except that a call inside the tuple is not
+    /// bound: it need not be the body's last step, which is what `TailCall`
+    /// means.
+    Tuple(Vec<ReturnExpr>),
+}
+
 /// Captures detailed information about a function call within a function body.
 #[derive(Debug, Clone)]
 pub struct CallInfo {
@@ -78,12 +116,20 @@ pub struct CallInfo {
     pub call_kind: CallKind,
     /// Static chunk size from `call_recur! { ..., chunk = N }`, if declared.
     pub chunk: Option<u64>,
-    /// True only for `call_recur!(..., output = ..., finalize = false, ...)`.
-    ///
-    /// This is control-flow shape, not a data argument: the CFS must distinguish
-    /// a recur that publishes a value from one that deliberately leaves its
-    /// draft open for a later writer.
-    pub leaves_output_open: bool,
+    /// A recur site's `output`, when it has one: bare `output` creates the
+    /// site's own object, `output = base` derives it from a stored one. This
+    /// is control-flow shape, not only a data argument — the CFS declares it
+    /// (`RecurOutputDecl`).
+    pub output: Option<SiteOutputKind>,
+    /// True when the site's own output *is* its carried state — `state` with no
+    /// `output`. It is what lets the trace pin a sweep's **final** carried
+    /// state: every earlier one is pinned by the next iteration's, and this is
+    /// the only shape where the last one has something to be compared against.
+    pub state_is_output: bool,
+    /// Whether the site carries state at all (`state = …`), with or without
+    /// an `output`. Recorded in the CFS so a stored seed is found by position
+    /// at `RecurStart` (`incremental-draft-materialization` D5b).
+    pub carries_state: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -108,6 +154,15 @@ pub struct FunctionAstItem {
     /// order. Empty for every literal-index selection, which is why programs
     /// that do not use the feature are unaffected.
     pub selection_index_sources: Vec<(String, Vec<String>)>,
+    /// `let name = select!(T, root.path)` locals, as `(name, path)` — the
+    /// static selector path each selection appends to its root's selector,
+    /// in selector order. `clone!`/`into_ref!`/`.clone()` aliases append
+    /// nothing, so they record an empty path. A selection with a
+    /// data-sourced index records none.
+    pub selection_paths: Vec<(String, Vec<SelectorSegment>)>,
+    /// The body's returned expression, classified. `None` when the body ends
+    /// in a statement (a unit return).
+    pub return_expr: Option<ReturnExpr>,
 }
 
 #[derive(Debug, Clone)]
@@ -198,6 +253,8 @@ impl ProjectAst {
                 let call_infos = visitor.get_call_infos();
                 let selection_aliases = visitor.get_selection_aliases();
                 let selection_index_sources = visitor.get_selection_index_sources();
+                let selection_paths = visitor.get_selection_paths();
+                let return_expr = CallVisitor::classify_return(&func.block);
                 let function_info = FunctionAstItem {
                     name,
                     path: path.clone(),
@@ -209,6 +266,8 @@ impl ProjectAst {
                     signature,
                     selection_aliases,
                     selection_index_sources,
+                    selection_paths,
+                    return_expr,
                 };
                 functions.push(function_info);
             }
@@ -303,6 +362,9 @@ pub struct CallVisitor {
     selection_aliases: Vec<(String, String)>,
     /// Per selection local, the names supplying its data-sourced indexes.
     selection_index_sources: Vec<(String, Vec<String>)>,
+    /// Per alias local, the static selector path it appends (see
+    /// `FunctionAstItem::selection_paths`).
+    selection_paths: Vec<(String, Vec<SelectorSegment>)>,
 }
 
 impl CallVisitor {
@@ -312,6 +374,7 @@ impl CallVisitor {
             current_binding: None,
             selection_aliases: Vec::new(),
             selection_index_sources: Vec::new(),
+            selection_paths: Vec::new(),
         }
     }
 
@@ -327,6 +390,10 @@ impl CallVisitor {
         self.selection_index_sources.clone()
     }
 
+    fn get_selection_paths(&self) -> Vec<(String, Vec<SelectorSegment>)> {
+        self.selection_paths.clone()
+    }
+
     /// Extracts the binding name from a pattern (e.g., `x` from `let x = ...`)
     fn extract_binding_name(pat: &Pat) -> Option<String> {
         match pat {
@@ -334,6 +401,160 @@ impl CallVisitor {
             Pat::Type(pat_type) => Self::extract_binding_name(&pat_type.pat),
             _ => None,
         }
+    }
+
+    /// Classify a function body's returned expression: its last statement
+    /// when that statement is a value (no trailing `;`), or the operand of a
+    /// final `return`.
+    pub(crate) fn classify_return(block: &syn::Block) -> Option<ReturnExpr> {
+        match block.stmts.last()? {
+            Stmt::Expr(Expr::Return(ret), _) => ret.expr.as_deref().map(Self::classify_return_expr),
+            Stmt::Expr(expr, None) => Some(Self::classify_return_expr(expr)),
+            // A trailing macro invocation with no `;` parses as a statement
+            // macro, not an expression.
+            Stmt::Macro(stmt) if stmt.semi_token.is_none() => {
+                Some(Self::classify_return_expr(&Expr::Macro(ExprMacro {
+                    attrs: stmt.attrs.clone(),
+                    mac: stmt.mac.clone(),
+                })))
+            }
+            _ => None,
+        }
+    }
+
+    fn classify_return_expr(expr: &Expr) -> ReturnExpr {
+        match expr {
+            // `Ok(x)` from a fallible `main`, and `x?`, return `x`.
+            Expr::Call(call) if call.args.len() == 1 && Self::expr_path_is(&call.func, "Ok") => {
+                Self::classify_return_expr(&call.args[0])
+            }
+            Expr::Try(try_expr) => Self::classify_return_expr(&try_expr.expr),
+            Expr::Paren(paren) => Self::classify_return_expr(&paren.expr),
+            Expr::Tuple(tuple) => ReturnExpr::Tuple(
+                tuple
+                    .elems
+                    .iter()
+                    .map(|elem| match Self::classify_return_expr(elem) {
+                        ReturnExpr::TailCall => ReturnExpr::Unbound {
+                            expr: Self::expr_to_string(elem),
+                        },
+                        other => other,
+                    })
+                    .collect(),
+            ),
+            Expr::Macro(expr_macro) if Self::macro_call_kind(&expr_macro.mac).is_some() => {
+                ReturnExpr::TailCall
+            }
+            // A selection: its root, and the static path it appends. One with
+            // a data-sourced index has no static path — the index is cited as
+            // a separate binding a program output has nowhere to carry — so it
+            // is not bound rather than bound loosely.
+            Expr::Macro(expr_macro) if Self::is_selection_macro(&expr_macro.mac) => {
+                match (
+                    Self::selection_macro_root(&expr_macro.mac),
+                    Self::selection_macro_path(&expr_macro.mac),
+                ) {
+                    (Some(root), Some(path)) => ReturnExpr::Rooted { root, path },
+                    _ => ReturnExpr::Unbound {
+                        expr: Self::expr_to_string(expr),
+                    },
+                }
+            }
+            // Views that append nothing to the selector.
+            Expr::Macro(expr_macro) if Self::is_reference_macro(&expr_macro.mac) => {
+                match Self::reference_macro_root(&expr_macro.mac) {
+                    Some(root) => ReturnExpr::Rooted {
+                        root,
+                        path: Vec::new(),
+                    },
+                    None => ReturnExpr::Unbound {
+                        expr: Self::expr_to_string(expr),
+                    },
+                }
+            }
+            Expr::MethodCall(call) if call.method == "clone" && call.args.is_empty() => {
+                match Self::expr_root_ident(&call.receiver) {
+                    Some(root) => ReturnExpr::Rooted {
+                        root,
+                        path: Vec::new(),
+                    },
+                    None => ReturnExpr::Unbound {
+                        expr: Self::expr_to_string(expr),
+                    },
+                }
+            }
+            Expr::Path(path) if path.path.get_ident().is_some() => ReturnExpr::Rooted {
+                root: path.path.get_ident().expect("checked above").to_string(),
+                path: Vec::new(),
+            },
+            // Anything else — including a raw `x.f` or `x[0]`, which would
+            // narrow without saying so — is not bound: returning it with an
+            // empty path would claim the whole of `x`.
+            _ => ReturnExpr::Unbound {
+                expr: Self::expr_to_string(expr),
+            },
+        }
+    }
+
+    /// The static selector path a `select!(T, root.path)` appends, lowered the
+    /// way the `select!` macro lowers it (`split_selector_expr` in
+    /// `raster-macros`): a named field to `Field`, a tuple field or an integer
+    /// literal index to `Index`, a literal `start..end` to `Range`. `None` for
+    /// a data-sourced index (a bare binding), which is cited at run time rather
+    /// than fixed by the program, and for anything the macro rejects.
+    fn selection_macro_path(mac: &syn::Macro) -> Option<Vec<SelectorSegment>> {
+        let args = mac.parse_body_with(SelectionMacroArgs::parse).ok()?;
+        let mut path = Vec::new();
+        Self::collect_static_path(&args.expr, &mut path)?;
+        Some(path)
+    }
+
+    fn collect_static_path(expr: &Expr, path: &mut Vec<SelectorSegment>) -> Option<()> {
+        match expr {
+            Expr::Field(field) => {
+                Self::collect_static_path(&field.base, path)?;
+                path.push(match &field.member {
+                    syn::Member::Named(ident) => SelectorSegment::Field(ident.to_string()),
+                    syn::Member::Unnamed(index) => SelectorSegment::Index(u64::from(index.index)),
+                });
+                Some(())
+            }
+            Expr::Index(index) => {
+                Self::collect_static_path(&index.expr, path)?;
+                match index.index.as_ref() {
+                    Expr::Lit(ExprLit {
+                        lit: Lit::Int(value),
+                        ..
+                    }) => path.push(SelectorSegment::Index(value.base10_parse().ok()?)),
+                    Expr::Range(range) => {
+                        let bound = |expr: &Option<Box<Expr>>| match expr.as_deref() {
+                            Some(Expr::Lit(ExprLit {
+                                lit: Lit::Int(value),
+                                ..
+                            })) => value.base10_parse::<u64>().ok(),
+                            _ => None,
+                        };
+                        if !matches!(range.limits, syn::RangeLimits::HalfOpen(_)) {
+                            return None;
+                        }
+                        path.push(SelectorSegment::Range {
+                            start: bound(&range.start)?,
+                            end: bound(&range.end)?,
+                        });
+                    }
+                    _ => return None,
+                }
+                Some(())
+            }
+            // The selection's base — the root binding, possibly `x.clone()` —
+            // contributes no segments, as in the macro.
+            _ => Some(()),
+        }
+    }
+
+    /// Whether `expr` is the bare path `name`.
+    fn expr_path_is(expr: &Expr, name: &str) -> bool {
+        matches!(expr, Expr::Path(path) if path.path.is_ident(name))
     }
 
     /// Converts an expression to its string representation for argument capture
@@ -347,7 +568,7 @@ impl CallVisitor {
     /// is a comma-separated list; the first token is the callee identifier.
     fn parse_call_macro_args(
         mac: &syn::Macro,
-    ) -> Option<(String, Vec<String>, Vec<CallArgumentKind>, Option<u64>, bool)> {
+    ) -> Option<(String, Vec<String>, Vec<CallArgumentKind>, Option<u64>, Option<SiteOutputKind>, bool)> {
         if matches!(Self::macro_call_kind(mac), Some(CallKind::RecursiveTile)) {
             return Self::parse_recur_call_macro_args(mac);
         }
@@ -356,7 +577,9 @@ impl CallVisitor {
             Some(CallKind::RecursiveSequence)
         ) {
             return Self::parse_recur_sequence_call_macro_args(mac)
-                .map(|(callee, args, kinds)| (callee, args, kinds, None, false));
+                .map(|(callee, args, kinds, output, carries_state)| {
+                    (callee, args, kinds, None, output, carries_state)
+                });
         }
 
         // Parse the macro tokens as a punctuated sequence of expressions.
@@ -381,12 +604,12 @@ impl CallVisitor {
             .map(|expr| Self::classify_argument(expr))
             .collect();
 
-        Some((callee, arguments, argument_kinds, None, false))
+        Some((callee, arguments, argument_kinds, None, None, false))
     }
 
     fn parse_recur_call_macro_args(
         mac: &syn::Macro,
-    ) -> Option<(String, Vec<String>, Vec<CallArgumentKind>, Option<u64>, bool)> {
+    ) -> Option<(String, Vec<String>, Vec<CallArgumentKind>, Option<u64>, Option<SiteOutputKind>, bool)> {
         struct RecurCallInput {
             tile: syn::Ident,
             input: Expr,
@@ -395,8 +618,9 @@ impl CallVisitor {
             // into the CFS item and excluded from the extracted arguments.
             chunk: Option<Expr>,
             state: Option<Expr>,
-            output: Option<Expr>,
-            finalize: Option<Expr>,
+            /// `None`: no output; `Some(None)`: bare `output` (create);
+            /// `Some(Some(base))`: `output = base` (derive).
+            output: Option<Option<Expr>>,
             args: syn::punctuated::Punctuated<Expr, Token![,]>,
         }
 
@@ -442,8 +666,7 @@ impl CallVisitor {
 
                 let chunk = parse_optional_named_expr(input, "chunk")?;
                 let state = parse_optional_named_expr(input, "state")?;
-                let output = parse_optional_named_expr(input, "output")?;
-                let finalize = parse_optional_named_expr(input, "finalize")?;
+                let output = CallVisitor::parse_site_output(input)?;
 
                 parse_named_key(input, "args")?;
                 let content;
@@ -457,7 +680,6 @@ impl CallVisitor {
                     chunk,
                     state,
                     output,
-                    finalize,
                     args,
                 })
             }
@@ -479,21 +701,13 @@ impl CallVisitor {
                 "call_recur! `chunk = ...` must be an integer literal so it can be pinned in the CFS"
             ),
         });
-        let leaves_output_open = match parsed.finalize.as_ref() {
-            None => false,
-            Some(Expr::Lit(expr_lit)) => match &expr_lit.lit {
-                syn::Lit::Bool(value) => !value.value(),
-                _ => panic!(
-                    "call_recur! `finalize = ...` must be a bool literal so it can be pinned in the CFS"
-                ),
-            },
-            Some(_) => panic!(
-                "call_recur! `finalize = ...` must be a bool literal so it can be pinned in the CFS"
-            ),
-        };
-        if leaves_output_open && parsed.output.is_none() {
-            panic!("call_recur! `finalize = false` requires `output = ...`");
-        }
+        // A site whose own output *is* its carried state: `state` with no
+        // `output`. That is the shape whose final state the trace can pin, by
+        // comparing the site's recorded output against the chain's last value.
+        // Whether the site carries state: the CFS records it, so the guest can
+        // find a stored seed at `RecurStart` (D5b). `state_is_output` follows
+        // from it and `output` at the visitor.
+        let carries_state = parsed.state.is_some();
         let mut arguments = vec![Self::expr_to_string(&parsed.input)];
         let mut argument_kinds = vec![Self::classify_argument(&parsed.input)];
 
@@ -502,10 +716,7 @@ impl CallVisitor {
             argument_kinds.push(Self::classify_argument(&state));
         }
 
-        if let Some(output) = parsed.output {
-            arguments.push(Self::expr_to_string(&output));
-            argument_kinds.push(Self::classify_argument(&output));
-        }
+        let output = Self::push_site_output(parsed.output, &mut arguments, &mut argument_kinds);
 
         for expr in parsed.args {
             arguments.push(Self::expr_to_string(&expr));
@@ -517,18 +728,19 @@ impl CallVisitor {
             arguments,
             argument_kinds,
             chunk,
-            leaves_output_open,
+            output,
+            carries_state,
         ))
     }
 
     fn parse_recur_sequence_call_macro_args(
         mac: &syn::Macro,
-    ) -> Option<(String, Vec<String>, Vec<CallArgumentKind>)> {
+    ) -> Option<(String, Vec<String>, Vec<CallArgumentKind>, Option<SiteOutputKind>, bool)> {
         struct RecurSequenceCallInput {
             sequence: syn::Ident,
             input: Expr,
             state: Option<Expr>,
-            output: Option<Expr>,
+            output: Option<Option<Expr>>,
             args: syn::punctuated::Punctuated<Expr, Token![,]>,
         }
 
@@ -557,20 +769,7 @@ impl CallVisitor {
                     None
                 };
 
-                let output = if input.peek(syn::Ident) {
-                    let fork = input.fork();
-                    let ident: syn::Ident = fork.parse()?;
-                    if ident == "output" {
-                        CallVisitor::parse_named_recur_key(input, "output")?;
-                        let output_expr: Expr = input.parse()?;
-                        input.parse::<Token![,]>()?;
-                        Some(output_expr)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
+                let output = CallVisitor::parse_site_output(input)?;
 
                 CallVisitor::parse_named_recur_key(input, "args")?;
                 let content;
@@ -589,6 +788,10 @@ impl CallVisitor {
         }
 
         let parsed = syn::parse2::<RecurSequenceCallInput>(mac.tokens.clone()).ok()?;
+        // Whether the site carries state: the CFS records it, so the guest can
+        // find a stored seed at `RecurStart` (D5b). `state_is_output` follows
+        // from it and `output` at the visitor.
+        let carries_state = parsed.state.is_some();
         let mut arguments = vec![Self::expr_to_string(&parsed.input)];
         let mut argument_kinds = vec![Self::classify_argument(&parsed.input)];
 
@@ -597,17 +800,62 @@ impl CallVisitor {
             argument_kinds.push(Self::classify_argument(&state));
         }
 
-        if let Some(output) = parsed.output {
-            arguments.push(Self::expr_to_string(&output));
-            argument_kinds.push(Self::classify_argument(&output));
-        }
+        let output = Self::push_site_output(parsed.output, &mut arguments, &mut argument_kinds);
 
         for expr in parsed.args {
             arguments.push(Self::expr_to_string(&expr));
             argument_kinds.push(Self::classify_argument(&expr));
         }
 
-        Some((parsed.sequence.to_string(), arguments, argument_kinds))
+        Some((
+            parsed.sequence.to_string(),
+            arguments,
+            argument_kinds,
+            output,
+            carries_state,
+        ))
+    }
+
+    /// Parse an optional `output,` (create) or `output = base,` (derive).
+    fn parse_site_output(input: ParseStream) -> syn::Result<Option<Option<Expr>>> {
+        if !input.peek(syn::Ident) {
+            return Ok(None);
+        }
+        let fork = input.fork();
+        let ident: syn::Ident = fork.parse()?;
+        if ident != "output" {
+            return Ok(None);
+        }
+        let _: syn::Ident = input.parse()?;
+        if input.parse::<Option<Token![=]>>()?.is_some() {
+            let base: Expr = input.parse()?;
+            input.parse::<Token![,]>()?;
+            return Ok(Some(Some(base)));
+        }
+        input.parse::<Token![,]>()?;
+        Ok(Some(None))
+    }
+
+    /// Record a site's `output` as its call argument. A created object has no
+    /// expression, so it takes an inline slot — the site still records one
+    /// value for it, and the CFS one source.
+    fn push_site_output(
+        output: Option<Option<Expr>>,
+        arguments: &mut Vec<String>,
+        argument_kinds: &mut Vec<CallArgumentKind>,
+    ) -> Option<SiteOutputKind> {
+        match output? {
+            None => {
+                arguments.push("output".to_string());
+                argument_kinds.push(CallArgumentKind::Inline);
+                Some(SiteOutputKind::Create)
+            }
+            Some(base) => {
+                arguments.push(Self::expr_to_string(&base));
+                argument_kinds.push(Self::classify_argument(&base));
+                Some(SiteOutputKind::Derive)
+            }
+        }
     }
 
     fn parse_named_recur_key(input: ParseStream, expected: &str) -> syn::Result<()> {
@@ -797,6 +1045,9 @@ impl<'ast> Visit<'ast> for CallVisitor {
                     if let Some(root) = Self::selection_macro_root(&expr_macro.mac) {
                         self.selection_aliases.push((name.clone(), root));
                     }
+                    if let Some(path) = Self::selection_macro_path(&expr_macro.mac) {
+                        self.selection_paths.push((name.clone(), path));
+                    }
                     let index_roots = Self::selection_macro_index_roots(&expr_macro.mac);
                     if !index_roots.is_empty() {
                         self.selection_index_sources
@@ -805,6 +1056,7 @@ impl<'ast> Visit<'ast> for CallVisitor {
                 } else if Self::is_reference_macro(&expr_macro.mac) {
                     if let Some(root) = Self::reference_macro_root(&expr_macro.mac) {
                         self.selection_aliases.push((name.clone(), root));
+                        self.selection_paths.push((name.clone(), Vec::new()));
                     }
                 }
             // A bare `binding.clone()` is the pre-DSL spelling of `clone!`. It
@@ -818,6 +1070,7 @@ impl<'ast> Visit<'ast> for CallVisitor {
                 if call.method == "clone" {
                     if let Some(root) = Self::expr_root_ident(&call.receiver) {
                         self.selection_aliases.push((name.clone(), root));
+                        self.selection_paths.push((name.clone(), Vec::new()));
                     }
                 }
             }
@@ -838,7 +1091,14 @@ impl<'ast> Visit<'ast> for CallVisitor {
 
     fn visit_expr_macro(&mut self, node: &'ast ExprMacro) {
         if let Some(call_kind) = Self::macro_call_kind(&node.mac) {
-            if let Some((callee, arguments, argument_kinds, chunk, leaves_output_open)) =
+            if let Some((
+                callee,
+                arguments,
+                argument_kinds,
+                chunk,
+                output,
+                carries_state,
+            )) =
                 Self::parse_call_macro_args(&node.mac)
             {
                 let result_binding = self.current_binding.take();
@@ -849,7 +1109,11 @@ impl<'ast> Visit<'ast> for CallVisitor {
                     result_binding,
                     call_kind,
                     chunk,
-                    leaves_output_open,
+                    // A site whose own output *is* its carried state: `state`
+                    // with no `output`.
+                    state_is_output: carries_state && output.is_none(),
+                    output,
+                    carries_state,
                 });
                 // Do not recurse into the macro body — arguments are already captured above.
                 return;
@@ -866,7 +1130,14 @@ impl<'ast> Visit<'ast> for CallVisitor {
         // which does NOT trigger `visit_expr_macro`. We handle them here so that statement-
         // position `call!` and `call_seq!` invocations are captured without a binding.
         if let Some(call_kind) = Self::macro_call_kind(&node.mac) {
-            if let Some((callee, arguments, argument_kinds, chunk, leaves_output_open)) =
+            if let Some((
+                callee,
+                arguments,
+                argument_kinds,
+                chunk,
+                output,
+                carries_state,
+            )) =
                 Self::parse_call_macro_args(&node.mac)
             {
                 // current_binding is None here — bare statements have no let binding.
@@ -877,7 +1148,11 @@ impl<'ast> Visit<'ast> for CallVisitor {
                     result_binding: None,
                     call_kind,
                     chunk,
-                    leaves_output_open,
+                    // A site whose own output *is* its carried state: `state`
+                    // with no `output`.
+                    state_is_output: carries_state && output.is_none(),
+                    output,
+                    carries_state,
                 });
                 return;
             }
@@ -906,6 +1181,130 @@ mod tests {
         CallArgumentKind::Rooted {
             root: root.to_string(),
         }
+    }
+
+    fn classify_return_of(code: &str) -> Option<ReturnExpr> {
+        let item: syn::ItemFn = syn::parse_str(code).expect("Failed to parse test fn");
+        CallVisitor::classify_return(&item.block)
+    }
+
+    fn rooted_return(root: &str) -> Option<ReturnExpr> {
+        rooted_return_at(root, vec![])
+    }
+
+    fn rooted_return_at(root: &str, path: Vec<SelectorSegment>) -> Option<ReturnExpr> {
+        Some(ReturnExpr::Rooted {
+            root: root.to_string(),
+            path,
+        })
+    }
+
+    fn field(name: &str) -> SelectorSegment {
+        SelectorSegment::Field(name.to_string())
+    }
+
+    /// Every form a value-returning `main` ends with in `examples/` and
+    /// `raster-inference`: a binding, `Ok(binding)`, a tail call, a selection.
+    #[test]
+    fn return_forms_that_bind() {
+        assert_eq!(
+            classify_return_of("fn main() -> u64 { let s = call!(plan, b); s }"),
+            rooted_return("s")
+        );
+        assert_eq!(
+            classify_return_of("fn main() -> Result<X> { let p = call!(f, a); Ok(p) }"),
+            rooted_return("p")
+        );
+        assert_eq!(
+            classify_return_of("fn main() -> u64 { call!(plan, b) }"),
+            Some(ReturnExpr::TailCall)
+        );
+        assert_eq!(
+            classify_return_of("fn main() -> Result<X> { Ok(call!(plan, b)?) }"),
+            Some(ReturnExpr::TailCall)
+        );
+        assert_eq!(
+            classify_return_of("fn main() -> u64 { let s = call!(f, b); select!(u64, s.count) }"),
+            rooted_return_at("s", vec![field("count")])
+        );
+        // The path is lowered as the `select!` macro lowers it.
+        assert_eq!(
+            classify_return_of(
+                "fn main() -> u64 { let s = call!(f, b); select!(u64, s.rows[2].cells.0) }"
+            ),
+            rooted_return_at(
+                "s",
+                vec![
+                    field("rows"),
+                    SelectorSegment::Index(2),
+                    field("cells"),
+                    SelectorSegment::Index(0)
+                ]
+            )
+        );
+        assert_eq!(
+            classify_return_of("fn main() -> X { let s = call!(f, b); select!(X, s.rows[1..3]) }"),
+            rooted_return_at("s", vec![field("rows"), SelectorSegment::Range { start: 1, end: 3 }])
+        );
+        // A `.clone()` base contributes nothing, as in the macro.
+        assert_eq!(
+            classify_return_of("fn main() -> u32 { let s = call!(f, b); select!(u32, s.clone().count) }"),
+            rooted_return_at("s", vec![field("count")])
+        );
+        assert_eq!(
+            classify_return_of("fn main() -> X { let s = call!(f, b); clone!(s) }"),
+            rooted_return("s")
+        );
+        assert_eq!(
+            classify_return_of("fn main() -> u64 { let s = call!(f, b); return s; }"),
+            rooted_return("s")
+        );
+    }
+
+    #[test]
+    fn return_forms_that_do_not_bind() {
+        assert!(matches!(
+            classify_return_of("fn main() -> u64 { 42 }"),
+            Some(ReturnExpr::Unbound { .. })
+        ));
+        assert!(matches!(
+            classify_return_of("fn main() -> R { let d = call!(f, new!(R)); finalize(d) }"),
+            Some(ReturnExpr::Unbound { .. })
+        ));
+        // A data-sourced index would need its citation carried to ProgramEnd.
+        assert!(matches!(
+            classify_return_of("fn main() -> u64 { let s = call!(f, b); select!(u64, s.rows[i]) }"),
+            Some(ReturnExpr::Unbound { .. })
+        ));
+        // A raw field access would narrow without a path: not bound, rather
+        // than bound to the whole object.
+        assert!(matches!(
+            classify_return_of("fn main() -> u64 { let s = call!(f, b); s.count }"),
+            Some(ReturnExpr::Unbound { .. })
+        ));
+        // A unit body returns nothing to bind.
+        assert_eq!(classify_return_of("fn main() { call!(f, b); }"), None);
+    }
+
+    #[test]
+    fn selection_aliases_record_their_static_paths() {
+        let file: syn::File = syn::parse_str(
+            "fn seq() { let s = call!(f, b); let w = select!(W, s.window); \
+             let m = select!(u64, w.max); let c = clone!(m); \
+             let r = select!(u64, s.rows[i]); }",
+        )
+        .expect("parse");
+        let mut visitor = CallVisitor::new();
+        visitor.visit_file(&file);
+        assert_eq!(
+            visitor.get_selection_paths(),
+            vec![
+                ("w".to_string(), vec![field("window")]),
+                ("m".to_string(), vec![field("max")]),
+                ("c".to_string(), vec![]),
+                // `r`'s index is data-sourced: no static path is recorded.
+            ]
+        );
     }
 
     #[test]
@@ -940,7 +1339,7 @@ mod tests {
     #[test]
     fn test_call_recur_macro_extraction() {
         let calls = parse_calls(
-            "fn seq() { let result = call_recur!(tile = build, input = items, output = new!(Doc), args = (needle,)); }",
+            "fn seq() { let result = call_recur!(tile = build, input = items, output, args = (needle,)); }",
         );
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].callee, "build");
@@ -967,43 +1366,51 @@ mod tests {
         // discovered, chunk must not appear among the extracted arguments,
         // and the literal value must be captured for CFS pinning.
         let calls = parse_calls(
-            "fn seq() { let result = call_recur!(tile = collect, input = items, chunk = 2, output = new!(Doc), args = (title,)); }",
+            "fn seq() { let result = call_recur!(tile = collect, input = items, chunk = 2, output, args = (title,)); }",
         );
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].callee, "collect");
         assert_eq!(calls[0].call_kind, CallKind::RecursiveTile);
         assert_eq!(calls[0].result_binding.as_deref(), Some("result"));
-        assert_eq!(calls[0].arguments, vec!["items", "new ! (Doc)", "title"]);
+        // A created object takes an inline argument slot.
+        assert_eq!(calls[0].arguments, vec!["items", "output", "title"]);
+        assert_eq!(calls[0].argument_kinds[1], CallArgumentKind::Inline);
+        assert_eq!(calls[0].output, Some(SiteOutputKind::Create));
         assert_eq!(calls[0].chunk, Some(2));
     }
 
     #[test]
     fn test_call_recur_without_chunk_has_no_chunk() {
         let calls = parse_calls(
-            "fn seq() { let result = call_recur!(tile = build, input = items, output = new!(Doc), args = (needle,)); }",
+            "fn seq() { let result = call_recur!(tile = build, input = items, output, args = (needle,)); }",
         );
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].chunk, None);
-        assert!(!calls[0].leaves_output_open);
     }
 
     #[test]
-    fn test_call_recur_deferred_finalize_is_extracted_and_not_an_argument() {
+    fn test_call_recur_derived_output_is_its_base_argument() {
         let calls = parse_calls(
-            "fn seq() { let draft = call_recur!(tile = build, input = items, chunk = 4, output = draft, finalize = false, args = (needle,)); }",
+            "fn seq() { let doc = call_recur!(tile = build, input = items, chunk = 4, output = base, args = (needle,)); }",
         );
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].callee, "build");
-        assert_eq!(calls[0].arguments, vec!["items", "draft", "needle"]);
+        assert_eq!(calls[0].arguments, vec!["items", "base", "needle"]);
+        assert_eq!(
+            calls[0].argument_kinds[1],
+            CallArgumentKind::Rooted {
+                root: "base".to_string()
+            }
+        );
+        assert_eq!(calls[0].output, Some(SiteOutputKind::Derive));
         assert_eq!(calls[0].chunk, Some(4));
-        assert!(calls[0].leaves_output_open);
     }
 
     #[test]
     #[should_panic(expected = "must be an integer literal")]
     fn test_call_recur_rejects_non_literal_chunk() {
         parse_calls(
-            "fn seq() { let result = call_recur!(tile = collect, input = items, chunk = size, output = new!(Doc), args = (title,)); }",
+            "fn seq() { let result = call_recur!(tile = collect, input = items, chunk = size, output, args = (title,)); }",
         );
     }
 

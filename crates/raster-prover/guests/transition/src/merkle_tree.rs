@@ -15,6 +15,10 @@ pub struct Bytes(pub Vec<u8>);
 
 pub type TraceBridgeTree = bridgetree::BridgeTree<Bytes, u64, 32>;
 
+/// Depth of [`TraceBridgeTree`]; the root level a frontier must be folded to.
+/// Mirrors `raster_prover::trace::TRACE_TREE_DEPTH`.
+pub const TRACE_TREE_DEPTH: u8 = 32;
+
 // ============================================================================
 // Bytes + Hashable for bridgetree (matches prover's empty leaf and combine)
 // ============================================================================
@@ -57,6 +61,43 @@ impl Hashable for Bytes {
         data.extend_from_slice(&b.0);
         Bytes(sha256_bytes(&data))
     }
+
+    /// Memoized empty-subtree root; mirrors `raster_prover::trace::Bytes`.
+    ///
+    /// The trait's default folds from level 0 on every call, and
+    /// `NonEmptyFrontier::root` calls it once per level — 0+1+..+31 = 496
+    /// hashes of rederived constants per fold, against ~32 of actual spine.
+    /// In the guest those are proven cycles, and `frontier_root` runs several
+    /// times per execution, so the memo is built once and read thereafter.
+    fn empty_root(level: Level) -> Self {
+        let idx = usize::from(u8::from(level));
+        match empty_root_memo().get(idx) {
+            Some(node) => Bytes(node.to_vec()),
+            None => empty_root_fold(level),
+        }
+    }
+}
+
+/// The `Hashable` default: fold empty leaves up to `level`. O(level) hashes.
+fn empty_root_fold(level: Level) -> Bytes {
+    Level::from(0)
+        .iter_to(level)
+        .fold(Bytes::empty_leaf(), |v, lvl| Bytes::combine(lvl, &v, &v))
+}
+
+/// Empty-subtree roots for levels `0..=TRACE_TREE_DEPTH`, folded once.
+fn empty_root_memo() -> &'static [[u8; HASH_SIZE]] {
+    static MEMO: std::sync::OnceLock<Vec<[u8; HASH_SIZE]>> = std::sync::OnceLock::new();
+    MEMO.get_or_init(|| {
+        (0..=TRACE_TREE_DEPTH)
+            .map(|level| {
+                let root = empty_root_fold(Level::from(level));
+                let mut out = [0u8; HASH_SIZE];
+                out.copy_from_slice(&root.0);
+                out
+            })
+            .collect()
+    })
 }
 
 // ============================================================================
@@ -94,11 +135,14 @@ pub fn sha256_bytes(bytes: &[u8]) -> Vec<u8> {
     Risc0Sha256::hash_bytes(bytes).as_bytes().to_vec()
 }
 
+/// Root of a frontier, folded directly against the empty-subtree roots.
+///
+/// Equivalent to `TraceBridgeTree::from_frontier(1, frontier.clone()).root(0)` —
+/// which is what `BridgeTree::root` itself does after rebuilding the bridge —
+/// but without the clone and the tree allocation. Mirrors
+/// `raster_prover::trace::frontier_root`.
 pub fn frontier_root(frontier: &NonEmptyFrontier<Bytes>) -> Vec<u8> {
-    TraceBridgeTree::from_frontier(1, frontier.clone())
-        .root(0)
-        .expect("Can't get current frontier root")
-        .0
+    frontier.root(Some(Level::from(TRACE_TREE_DEPTH))).0
 }
 
 pub fn sha256_hex(bytes: &[u8]) -> Vec<u8> {

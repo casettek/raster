@@ -102,7 +102,7 @@ authorized program output (ProgramEnd → output.bin + manifest)
   it. So: authorization lives at the boundaries; the tile stays plain Rust.
 - **Dynamically built data goes through drafts.** Any object or collection
   that doesn't come from input must grow inside the authorized draft protocol
-  — `new!`/`Draft<T>` with set-once writes (§6), or `RecurOutput` in loops
+  — a `Draft<T>` built inside one tile (§6), or `RecurOutput` in a recur site
   (§7). Never assemble a collection ad hoc in sequence code (unverifiable)
   and never return a giant rebuilt collection from a tile (unaffordable, see
   below).
@@ -311,7 +311,7 @@ everything outside this list as forbidden:
 | sub-sequence call | `call_seq!(seq_name, args...)` |
 | recur over a list | `call_recur!( ... )` / `call_recur_seq!( ... )` (§7) |
 | data selection | `select!(Type, binding.path)` (§5) |
-| draft creation / finish | `new!(Type)` / `finalize(draft)` (§6) |
+| draft creation / completion | `Draft::<T>::new()` in a tile, returned (§6) |
 | explicit storage ref | `storage!(Type, reference)` |
 | binding a result | `let x = <one of the above>;` — simple identifier only |
 | cloning a binding | `clone!(binding)` — clones the reference, cheap |
@@ -353,7 +353,7 @@ tiles: return `Result<T>`, propagate with `?`.
 ## 5. Selecting data — `select!`
 
 `select!(Type, source.path)` is the only sanctioned way to reach INTO a
-referenced value (entry argument, tile output, finalized draft). It produces
+referenced value (entry argument, tile output, recur site result). It produces
 an authenticated selection commitment; plain field access in a sequence is
 forbidden (§4).
 
@@ -416,33 +416,42 @@ See `docs/proposals/dynamic-index-selection.md`.
 
 Details and the input-fixture format: `references/data-and-io.md`.
 
-## 6. Building outputs across tiles — drafts
+## 6. Building objects — drafts live inside a tile
 
-Dynamically built data MUST grow through the authorized draft protocol (§2).
-To build one object with several tiles, thread a `Draft<T>` through them:
+A `Draft<T>` exists only **inside a tile**. It never crosses a step boundary:
+what crosses is the stored object it completes into.
+
+**One tile builds a small object** — create the draft, populate it, return it.
+The tile's close completes it into a `T` stored at the tile's own coordinate,
+and the caller gets that object:
 
 ```rust
-// in the sequence:
-let draft = new!(CollectiveGreeting);
-let draft = call!(set_title, "Greeting".to_string(), draft);
-let draft = call!(push_line, "Hello".to_string(), draft);
-let greeting = finalize(draft);                    // materialized CollectiveGreeting
-let title = select!(String, greeting.clone().title);
-
-// tiles take and return the draft:
 #[tile(kind = iter)]
-pub fn push_line(line: String, draft: Draft<CollectiveGreeting>) -> Draft<CollectiveGreeting> {
-    let mut draft = draft;
-    draft.lines().push(line);       // set-once accessors: .field().set(v), .list().push(v)
-    draft
+pub fn build_greeting(title: String, line: String) -> Draft<CollectiveGreeting> {
+    let mut greeting = Draft::<CollectiveGreeting>::new();
+    greeting.title().set(title);        // set-once field: .set(v)
+    greeting.lines().push(line);        // List field: .push(v)
+    greeting                            // completed at the tile's close
 }
+
+// in the sequence:
+let greeting = call!(build_greeting, "Greeting".to_string(), "Hello".to_string());
+let title = select!(String, greeting.clone().title);
 ```
 
-Draft handles are **linear**: never clone one, never reuse one after passing
-it to a call — rebind (`let draft = call!(...)`) every step. Fields are
-set-once: a second `.set()` on the same field fails at runtime. This is also
-the cheap path: each step appends its increment instead of re-materializing
-and re-committing the whole object (§2).
+**Anything that grows is a recur site** (§7): bare `output` creates the site's
+object; `output = base` continues a stored object (push-only — every set-once
+field is already written) into a new object at the site's coordinate.
+
+Rules:
+- `Draft::<T>::new()` only inside a tile; a sequence cannot create one.
+- Every set-once field must be set before the tile returns; a second `.set()`
+  fails. A deriving site can only `.push()`.
+- **Draft budget**: one tile run may write at most `DRAFT_STEP_BUDGET` bytes
+  (64 KiB) of draft data per consumed source element — a chunked iteration of
+  `chunk = N` gets N times that. Exceeding it panics. Build big objects across
+  recur iterations, never in one tile.
+- Draft handles are linear: never clone one, never reuse one after passing it.
 
 ## 7. Blocks of data — recur tiles and recur sequences
 
@@ -453,9 +462,10 @@ Never loop in a sequence. To process a list, pick from this decision tree:
 | one value / sub-value | `select!` |
 | a bounded `Block<T>` window as one tile input | `select!` with `[a..b]` |
 | fold list → single summary value | `call_recur!` + `state = ...` |
-| map list → one built object | `call_recur!` + `output = new!(T)` |
+| map list → one built object | `call_recur!` + bare `output` (create) |
+| extend a stored object | `call_recur!` + `output = base` (derive, push-only) |
 | fold AND build together | `call_recur!` + `state` + `output`, step returns the `(state, output)` tuple |
-| early stop | state+output step returning `RecurControl` (`Continue`/`Break`) |
+| early stop | any `call_recur!` step returning `RecurControl<..>` (`Continue`/`Break`) — output-only, state-only and state+output all accept it. Not available on `call_recur_seq!` |
 | step should see N elements at a time | add `chunk = N` (step takes `RecurInput<Block<T>>`) |
 | several tiles per element | `#[sequence(kind = recur)]` + `call_recur_seq!` |
 | sweep a byte region | `call_recur!` with `input = select!(List<BytesPage>, region.pages)` |
@@ -495,7 +505,7 @@ Never loop in a sequence. To process a list, pick from this decision tree:
 
   Declare iterable inputs with `index_path` + `encoding = "raster"`;
   `examples/hello-tiles/bin/gen_input.rs` shows the pattern. Internally stored
-  values (tile outputs, finalized drafts, `store_value` results) always carry a
+  values (tile outputs, recur site results, `store_value` results) always carry a
   raster index, so only **external** inputs need the declaration. The source is
   never materialized: the loop bound comes from an authenticated 41-byte
   metadata selection and each item from its own indexed read.
@@ -524,7 +534,7 @@ let address_lines = select!(List<String>, personal_data.addresses[0].lines);
 let greeting = call_recur!(
     tile = build_greeting_line,
     input = address_lines,
-    output = new!(CollectiveGreeting),
+    output,
     args = ("Recur-built".to_string(),)
 );
 
@@ -639,7 +649,8 @@ If any rung fails, map the failure back to a rule before touching code:
 | binding shows as `external` in CFS | computed argument / destructured `let` (§4) |
 | guest build failure | `std` leakage into the tile library (§1) |
 | "requires a selectable storage list source" | `call_recur!` input not storage-backed (§7) |
-| set-once / finalize failure | draft reuse, double-set, or empty recur input (§6, §7) |
+| set-once / completion failure | draft reuse, double-set, a field never set, or empty recur input (§6, §7) |
+| draft budget exceeded | one tile run built too much — move the growth into a recur site (§6) |
 | audit divergence with clean native run | nondeterminism in a tile (§3) |
 | rung 0 and rung 3 disagree on a value | a tile type whose postcard round-trip is not the identity — usually a `#[serde(skip)]` field, which authenticated mode clears between tiles and rung 0 carries through (RAS-203a) |
 | ProgramEnd error on return | `main` returning a non-storage-backed value (§8) |

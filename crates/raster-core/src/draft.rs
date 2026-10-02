@@ -1,38 +1,51 @@
-use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::format;
-use alloc::string::{String, ToString};
-use alloc::vec;
+use alloc::string::String;
 use alloc::vec::Vec;
-use core::fmt;
 
-use serde::ser::{
-    self, SerializeMap, SerializeSeq, SerializeStruct, SerializeStructVariant, SerializeTuple,
-    SerializeTupleStruct, SerializeTupleVariant,
-};
-use serde::{Deserialize, Serialize, Serializer};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::collections::{bytes_page_parts, BYTES_PAGE_NEWTYPE_NAME};
-use crate::input::{
-    bytes_page_root, encode_bytes_page_payload, AppendFrontier, Schema, SchemaField,
-    SchemaFieldMode, SchemaNode,
-};
+use crate::input::{AppendFrontier, Schema, SchemaField, SchemaFieldMode, SchemaNode};
+use crate::tree::{subtree_payload_and_root, tree_value_from_serialize, TreeValue};
 use crate::{Error, Result};
+
+/// Bytes of draft writes one tile run may make: the encoded payload of every
+/// `set` and `push`, plus [`DRAFT_OP_CHARGE`] per op. A recur iteration that
+/// consumes a chunk of `n` source elements gets `n` times this.
+///
+/// It is what bounds a replay unit's work when the unit builds a `List`-bearing
+/// object: `bounded-collections` forbids passing such an object whole, and this
+/// makes building one in a single step bounded instead. Enforced by the shared
+/// `Draft` code, so the tile replay enforces it too — pinned by the tile's image
+/// id.
+///
+/// Sized 2026-10-01: `hello-tiles` peaks at 327 bytes per run; the largest
+/// per-element write in `raster-inference` is an `ActivationRow` of the
+/// 1536-wide Gemma E2B model, ~6 KiB, plus KV/query/key entries of a few KiB per
+/// token. 64 KiB per element leaves several times that, and still fits
+/// 4096-wide rows. Re-measure when `raster-inference` moves to this API.
+pub const DRAFT_STEP_BUDGET: u64 = 64 * 1024;
+
+/// Fixed charge per draft op, on top of its payload: the frontier update and
+/// the op record.
+pub const DRAFT_OP_CHARGE: u64 = 64;
 
 pub type DraftId = [u8; 32];
 pub type DraftRoot = [u8; 32];
 
+/// What a draft-taking tile is told about the draft it continues: its schema
+/// and the root its ops apply to. No identity: a step finds its draft through
+/// the innermost recur site's frame (`RecurProgressFrame::draft`), so a
+/// host-chosen id here would be a trace field nothing checks.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct DraftReplayHandle {
-    pub draft_id: DraftId,
     pub schema_hash: [u8; 32],
     pub root_before: DraftRoot,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct DraftReplayTransition {
-    pub draft_id: DraftId,
     pub schema_hash: [u8; 32],
     pub root_before: DraftRoot,
     pub ops: Vec<DraftOp>,
@@ -48,6 +61,18 @@ pub struct TileReplayJournal {
     /// `docs/proposals/program-identity.md`.
     pub input_commitment: [u8; 32],
     pub output_bytes: Vec<u8>,
+    /// The raster root of the value the tile returned — `Some` exactly when
+    /// the tile publishes an output, which the transition guest then requires
+    /// it to have written with this commitment. `None` for a recur iteration
+    /// returning its site's draft or carried state: it writes nothing
+    /// (`incremental-draft-materialization` D3). See
+    /// `tile-io-structural-roots` step 2.
+    pub output_root: Option<crate::input::Hash32>,
+    /// The raster root of each decoded argument, in parameter order (`None`
+    /// for a draft handle). The transition guest requires every
+    /// storage-bound argument's selection to fold from this root, joining the
+    /// bytes the selection proves to the value the tile ran on.
+    pub input_roots: Vec<Option<crate::input::Hash32>>,
     pub draft_transition: Option<DraftReplayTransition>,
     /// `Some` for every recur tile, `None` for every other tile.
     ///
@@ -78,6 +103,19 @@ pub struct TileReplayJournal {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct RecurTileReplay {
     pub position: RecurPosition,
+    /// The iteration's carried-state transition, `None` iff the tile declares
+    /// no `RecurState` parameter.
+    ///
+    /// An `Option` here is **not** the `active_drafts` defect (`checks/drafts.rs`'s
+    /// permissive `if let Some(..)`). There, absence is chosen by the host, so
+    /// omitting an entry is the cheapest way to skip a continuity check. Here
+    /// the producer is the tile's own replay image, pinned in the program's
+    /// registry and verified by `env::verify`, so absence is a statement the
+    /// program's code makes, not one a prover can fabricate. The guest still
+    /// rejects a mismatch between this field's presence and the site's declared
+    /// shape.
+    #[serde(default)]
+    pub state: Option<RecurStateTransition>,
     /// Always explicit. A recur tile whose return type carries no
     /// `RecurControl` emits `Continue` rather than omitting the field: reading
     /// an absence as `Continue` would put a default in guest audit code, where
@@ -110,33 +148,32 @@ pub enum RecurControlKind {
     Break,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub enum DraftValue {
-    Unit,
-    Bool(bool),
-    U8(u8),
-    U16(u16),
-    U32(u32),
-    U64(u64),
-    I8(i8),
-    I16(i16),
-    I32(i32),
-    I64(i64),
-    String(String),
-    Struct(Vec<(String, DraftValue)>),
-    List(Vec<DraftValue>),
-    Map(Vec<(DraftValue, DraftValue)>),
-    EnumUnit(String),
-    EnumNewtype(String, Box<DraftValue>),
-    EnumTuple(String, Vec<DraftValue>),
-    EnumStruct(String, Vec<(String, DraftValue)>),
-    BytesPage {
-        index: u64,
-        offset: u64,
-        len: u64,
-        bytes: Vec<u8>,
-    },
+/// One iteration's carried-state transition: the commitment of the state that
+/// entered it, and of the state it produced.
+///
+/// The pair is what makes a recur's carried state chainable at all. Iteration
+/// *N+1*'s `state_in` must equal iteration *N*'s `state_out`, and nothing in
+/// the trace expressed that before: the state travels as
+/// `FnInputValue::Inline` and the guest's whole obligation for an inline
+/// binding is that the source *is* inline, so a claimed trace could substitute
+/// arbitrary bytes between iterations and still verify. See
+/// `docs/proposals/loop-carried-state.md` §4.
+///
+/// Recorded twice, on purpose, for the two consumers that cannot see each
+/// other's copy: `RecurTileReplay.state` is replay-proven and is what the guest
+/// folds; `FnCallRecord.recur_state` is the host copy the *recorder* folds,
+/// because the recorder never sees a journal. Duplication is safe here for the
+/// same reason it is safe for `control` — both copies are folded into
+/// `recur_progress_commitment`, so an equality of commitments is the bind.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct RecurStateTransition {
+    pub state_in: crate::input::Hash32,
+    pub state_out: crate::input::Hash32,
 }
+
+/// A value as raster stores it. The same type as [`TreeValue`]: a draft is
+/// encoded, rooted and stored by the one encoder in [`crate::tree`].
+pub type DraftValue = TreeValue;
 
 /// The **runtime's** own representation of a draft field: the real object, held
 /// in memory so `finalize` can materialize it.
@@ -182,582 +219,17 @@ pub struct DraftTransitionWitness {
     pub native_transition: Option<DraftReplayTransition>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub struct TrackedDraftState {
-    pub schema_hash: [u8; 32],
-    pub root: DraftRoot,
-}
-
-#[derive(Debug, Clone)]
-struct DraftSerdeError(String);
-
-impl fmt::Display for DraftSerdeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl core::error::Error for DraftSerdeError {}
-
-impl ser::Error for DraftSerdeError {
-    fn custom<T: fmt::Display>(msg: T) -> Self {
-        Self(msg.to_string())
-    }
-}
-
-type DraftSerdeResult<T> = core::result::Result<T, DraftSerdeError>;
-
-struct DraftValueSerializer;
-
-struct DraftSeqSerializer {
-    values: Vec<DraftValue>,
-}
-
-struct DraftStructSerializer {
-    fields: Vec<(String, DraftValue)>,
-}
-
-struct DraftMapSerializer {
-    entries: Vec<(DraftValue, DraftValue)>,
-    next_key: Option<DraftValue>,
-}
-
-struct DraftVariantSeqSerializer {
-    variant: String,
-    values: Vec<DraftValue>,
-}
-
-struct DraftVariantStructSerializer {
-    variant: String,
-    fields: Vec<(String, DraftValue)>,
-}
-
-impl Serializer for DraftValueSerializer {
-    type Ok = DraftValue;
-    type Error = DraftSerdeError;
-    type SerializeSeq = DraftSeqSerializer;
-    type SerializeTuple = DraftSeqSerializer;
-    type SerializeTupleStruct = DraftSeqSerializer;
-    type SerializeStruct = DraftStructSerializer;
-    type SerializeTupleVariant = DraftVariantSeqSerializer;
-    type SerializeMap = DraftMapSerializer;
-    type SerializeStructVariant = DraftVariantStructSerializer;
-
-    fn serialize_bool(self, value: bool) -> DraftSerdeResult<Self::Ok> {
-        Ok(DraftValue::Bool(value))
-    }
-    fn serialize_i8(self, value: i8) -> DraftSerdeResult<Self::Ok> {
-        Ok(DraftValue::I8(value))
-    }
-    fn serialize_i16(self, value: i16) -> DraftSerdeResult<Self::Ok> {
-        Ok(DraftValue::I16(value))
-    }
-    fn serialize_i32(self, value: i32) -> DraftSerdeResult<Self::Ok> {
-        Ok(DraftValue::I32(value))
-    }
-    fn serialize_i64(self, value: i64) -> DraftSerdeResult<Self::Ok> {
-        Ok(DraftValue::I64(value))
-    }
-    fn serialize_u8(self, value: u8) -> DraftSerdeResult<Self::Ok> {
-        Ok(DraftValue::U8(value))
-    }
-    fn serialize_u16(self, value: u16) -> DraftSerdeResult<Self::Ok> {
-        Ok(DraftValue::U16(value))
-    }
-    fn serialize_u32(self, value: u32) -> DraftSerdeResult<Self::Ok> {
-        Ok(DraftValue::U32(value))
-    }
-    fn serialize_u64(self, value: u64) -> DraftSerdeResult<Self::Ok> {
-        Ok(DraftValue::U64(value))
-    }
-    fn serialize_f32(self, _value: f32) -> DraftSerdeResult<Self::Ok> {
-        Err(DraftSerdeError(
-            "f32 is not supported by draft transitions".into(),
-        ))
-    }
-    fn serialize_f64(self, _value: f64) -> DraftSerdeResult<Self::Ok> {
-        Err(DraftSerdeError(
-            "f64 is not supported by draft transitions".into(),
-        ))
-    }
-    fn serialize_char(self, _value: char) -> DraftSerdeResult<Self::Ok> {
-        Err(DraftSerdeError(
-            "char is not supported by draft transitions".into(),
-        ))
-    }
-    fn serialize_str(self, value: &str) -> DraftSerdeResult<Self::Ok> {
-        Ok(DraftValue::String(value.into()))
-    }
-    fn serialize_bytes(self, _value: &[u8]) -> DraftSerdeResult<Self::Ok> {
-        Err(DraftSerdeError(
-            "raw bytes are not supported by draft transitions".into(),
-        ))
-    }
-    fn serialize_none(self) -> DraftSerdeResult<Self::Ok> {
-        Ok(DraftValue::Unit)
-    }
-    fn serialize_some<T>(self, value: &T) -> DraftSerdeResult<Self::Ok>
-    where
-        T: ?Sized + Serialize,
-    {
-        value.serialize(self)
-    }
-    fn serialize_unit(self) -> DraftSerdeResult<Self::Ok> {
-        Ok(DraftValue::Unit)
-    }
-    fn serialize_unit_struct(self, _name: &'static str) -> DraftSerdeResult<Self::Ok> {
-        Ok(DraftValue::Unit)
-    }
-    fn serialize_unit_variant(
-        self,
-        _name: &'static str,
-        _variant_index: u32,
-        variant: &'static str,
-    ) -> DraftSerdeResult<Self::Ok> {
-        Ok(DraftValue::EnumUnit(variant.into()))
-    }
-    fn serialize_newtype_struct<T>(
-        self,
-        name: &'static str,
-        value: &T,
-    ) -> DraftSerdeResult<Self::Ok>
-    where
-        T: ?Sized + Serialize,
-    {
-        // Act on the name *before* serializing. The general-purpose serializer
-        // would expand the page payload into one `DraftValue::U8` per byte, only
-        // for `bytes_page_parts` to collapse it right back — see that function's
-        // note on why the `List<T>` handle can serialize-then-match and a page
-        // cannot.
-        if name == BYTES_PAGE_NEWTYPE_NAME {
-            let parts = bytes_page_parts(value).map_err(DraftSerdeError)?;
-            return Ok(DraftValue::BytesPage {
-                index: parts.index,
-                offset: parts.offset,
-                len: parts.len,
-                bytes: parts.bytes,
-            });
-        }
-        value.serialize(DraftValueSerializer)
-    }
-    fn serialize_newtype_variant<T>(
-        self,
-        _name: &'static str,
-        _variant_index: u32,
-        variant: &'static str,
-        value: &T,
-    ) -> DraftSerdeResult<Self::Ok>
-    where
-        T: ?Sized + Serialize,
-    {
-        Ok(DraftValue::EnumNewtype(
-            variant.into(),
-            Box::new(value.serialize(DraftValueSerializer)?),
-        ))
-    }
-    fn serialize_seq(self, len: Option<usize>) -> DraftSerdeResult<Self::SerializeSeq> {
-        Ok(DraftSeqSerializer {
-            values: Vec::with_capacity(len.unwrap_or_default()),
-        })
-    }
-    fn serialize_tuple(self, len: usize) -> DraftSerdeResult<Self::SerializeTuple> {
-        self.serialize_seq(Some(len))
-    }
-    fn serialize_tuple_struct(
-        self,
-        _name: &'static str,
-        len: usize,
-    ) -> DraftSerdeResult<Self::SerializeTupleStruct> {
-        self.serialize_seq(Some(len))
-    }
-    fn serialize_tuple_variant(
-        self,
-        _name: &'static str,
-        _variant_index: u32,
-        variant: &'static str,
-        len: usize,
-    ) -> DraftSerdeResult<Self::SerializeTupleVariant> {
-        Ok(DraftVariantSeqSerializer {
-            variant: variant.into(),
-            values: Vec::with_capacity(len),
-        })
-    }
-    fn serialize_map(self, len: Option<usize>) -> DraftSerdeResult<Self::SerializeMap> {
-        Ok(DraftMapSerializer {
-            entries: Vec::with_capacity(len.unwrap_or_default()),
-            next_key: None,
-        })
-    }
-    fn serialize_struct(
-        self,
-        _name: &'static str,
-        len: usize,
-    ) -> DraftSerdeResult<Self::SerializeStruct> {
-        Ok(DraftStructSerializer {
-            fields: Vec::with_capacity(len),
-        })
-    }
-    fn serialize_struct_variant(
-        self,
-        _name: &'static str,
-        _variant_index: u32,
-        variant: &'static str,
-        len: usize,
-    ) -> DraftSerdeResult<Self::SerializeStructVariant> {
-        Ok(DraftVariantStructSerializer {
-            variant: variant.into(),
-            fields: Vec::with_capacity(len),
-        })
-    }
-}
-
-impl SerializeSeq for DraftSeqSerializer {
-    type Ok = DraftValue;
-    type Error = DraftSerdeError;
-    fn serialize_element<T>(&mut self, value: &T) -> DraftSerdeResult<()>
-    where
-        T: ?Sized + Serialize,
-    {
-        self.values.push(value.serialize(DraftValueSerializer)?);
-        Ok(())
-    }
-    fn end(self) -> DraftSerdeResult<Self::Ok> {
-        Ok(DraftValue::List(self.values))
-    }
-}
-
-impl SerializeTuple for DraftSeqSerializer {
-    type Ok = DraftValue;
-    type Error = DraftSerdeError;
-    fn serialize_element<T>(&mut self, value: &T) -> DraftSerdeResult<()>
-    where
-        T: ?Sized + Serialize,
-    {
-        SerializeSeq::serialize_element(self, value)
-    }
-    fn end(self) -> DraftSerdeResult<Self::Ok> {
-        SerializeSeq::end(self)
-    }
-}
-
-impl SerializeTupleStruct for DraftSeqSerializer {
-    type Ok = DraftValue;
-    type Error = DraftSerdeError;
-    fn serialize_field<T>(&mut self, value: &T) -> DraftSerdeResult<()>
-    where
-        T: ?Sized + Serialize,
-    {
-        SerializeSeq::serialize_element(self, value)
-    }
-    fn end(self) -> DraftSerdeResult<Self::Ok> {
-        SerializeSeq::end(self)
-    }
-}
-
-impl SerializeStruct for DraftStructSerializer {
-    type Ok = DraftValue;
-    type Error = DraftSerdeError;
-    fn serialize_field<T>(&mut self, key: &'static str, value: &T) -> DraftSerdeResult<()>
-    where
-        T: ?Sized + Serialize,
-    {
-        self.fields
-            .push((key.into(), value.serialize(DraftValueSerializer)?));
-        Ok(())
-    }
-    fn end(self) -> DraftSerdeResult<Self::Ok> {
-        Ok(DraftValue::Struct(self.fields))
-    }
-}
-
-impl SerializeMap for DraftMapSerializer {
-    type Ok = DraftValue;
-    type Error = DraftSerdeError;
-    fn serialize_key<T>(&mut self, key: &T) -> DraftSerdeResult<()>
-    where
-        T: ?Sized + Serialize,
-    {
-        self.next_key = Some(key.serialize(DraftValueSerializer)?);
-        Ok(())
-    }
-    fn serialize_value<T>(&mut self, value: &T) -> DraftSerdeResult<()>
-    where
-        T: ?Sized + Serialize,
-    {
-        let key = self
-            .next_key
-            .take()
-            .ok_or_else(|| DraftSerdeError("serialize_value called before serialize_key".into()))?;
-        self.entries
-            .push((key, value.serialize(DraftValueSerializer)?));
-        Ok(())
-    }
-    fn end(self) -> DraftSerdeResult<Self::Ok> {
-        if self.next_key.is_some() {
-            return Err(DraftSerdeError(
-                "serialize_map ended with a dangling key".into(),
-            ));
-        }
-        Ok(DraftValue::Map(self.entries))
-    }
-}
-
-impl SerializeTupleVariant for DraftVariantSeqSerializer {
-    type Ok = DraftValue;
-    type Error = DraftSerdeError;
-    fn serialize_field<T>(&mut self, value: &T) -> DraftSerdeResult<()>
-    where
-        T: ?Sized + Serialize,
-    {
-        self.values.push(value.serialize(DraftValueSerializer)?);
-        Ok(())
-    }
-    fn end(self) -> DraftSerdeResult<Self::Ok> {
-        Ok(DraftValue::EnumTuple(self.variant, self.values))
-    }
-}
-
-impl SerializeStructVariant for DraftVariantStructSerializer {
-    type Ok = DraftValue;
-    type Error = DraftSerdeError;
-    fn serialize_field<T>(&mut self, key: &'static str, value: &T) -> DraftSerdeResult<()>
-    where
-        T: ?Sized + Serialize,
-    {
-        self.fields
-            .push((key.into(), value.serialize(DraftValueSerializer)?));
-        Ok(())
-    }
-    fn end(self) -> DraftSerdeResult<Self::Ok> {
-        Ok(DraftValue::EnumStruct(self.variant, self.fields))
-    }
-}
-
 pub fn draft_value_from_serialize<T: Serialize>(value: &T) -> Result<DraftValue> {
-    value
-        .serialize(DraftValueSerializer)
+    tree_value_from_serialize(value)
         .map_err(|e| Error::Serialization(format!("Failed to serialize draft value: {}", e)))
 }
 
-fn selection_hash(parts: &[&[u8]]) -> Vec<u8> {
-    let mut hasher = Sha256::new();
-    for part in parts {
-        hasher.update(part);
-    }
-    hasher.finalize().to_vec()
-}
-
-fn push_u64(out: &mut Vec<u8>, value: u64) {
-    out.extend_from_slice(&value.to_le_bytes());
-}
-
-fn encode_leaf_bytes(value: &DraftValue) -> Result<Vec<u8>> {
-    let mut out = Vec::new();
-    match value {
-        DraftValue::Unit => {}
-        DraftValue::Bool(value) => out.push(u8::from(*value)),
-        DraftValue::U8(value) => out.push(*value),
-        DraftValue::U16(value) => out.extend_from_slice(&value.to_le_bytes()),
-        DraftValue::U32(value) => out.extend_from_slice(&value.to_le_bytes()),
-        DraftValue::U64(value) => out.extend_from_slice(&value.to_le_bytes()),
-        DraftValue::I8(value) => out.push(*value as u8),
-        DraftValue::I16(value) => out.extend_from_slice(&value.to_le_bytes()),
-        DraftValue::I32(value) => out.extend_from_slice(&value.to_le_bytes()),
-        DraftValue::I64(value) => out.extend_from_slice(&value.to_le_bytes()),
-        DraftValue::String(value) => {
-            push_u64(&mut out, value.len() as u64);
-            out.extend_from_slice(value.as_bytes());
-        }
-        DraftValue::Struct(_)
-        | DraftValue::List(_)
-        | DraftValue::Map(_)
-        | DraftValue::EnumUnit(_)
-        | DraftValue::EnumNewtype(_, _)
-        | DraftValue::EnumTuple(_, _)
-        | DraftValue::EnumStruct(_, _)
-        | DraftValue::BytesPage { .. } => {
-            return Err(Error::Serialization(
-                "Expected leaf value while encoding draft payload".into(),
-            ))
-        }
-    }
-    Ok(out)
-}
-
-fn list_root_from_hashes(hashes: &[Vec<u8>]) -> Vec<u8> {
-    let len = hashes.len() as u64;
-    if hashes.is_empty() {
-        return selection_hash(&[b"list-root", &len.to_le_bytes(), b"empty"]);
-    }
-    let mut level = hashes.to_vec();
-    while level.len() > 1 {
-        if level.len() % 2 == 1 {
-            let last = level.last().cloned().unwrap();
-            level.push(last);
-        }
-        let mut next = Vec::with_capacity(level.len() / 2);
-        for pair in level.chunks(2) {
-            next.push(selection_hash(&[
-                b"list-node",
-                pair[0].as_slice(),
-                pair[1].as_slice(),
-            ]));
-        }
-        level = next;
-    }
-    selection_hash(&[b"list-root", &len.to_le_bytes(), level[0].as_slice()])
-}
-
+/// The canonical payload and raster root of a value — [`crate::tree`]'s one
+/// encoder, so a draft's root is by construction the root storage computes for
+/// the same data.
 pub fn draft_value_payload_and_root(value: &DraftValue) -> Result<(Vec<u8>, Vec<u8>)> {
-    match value {
-        DraftValue::Unit => Ok((vec![0x03], selection_hash(&[b"unit"]))),
-        DraftValue::Struct(fields) => {
-            // Field names go into both the payload and the root hash: a
-            // draft's root must be indistinguishable from the selection-tree
-            // root of the same data (that equality is what lets a finalized
-            // draft be selected into like any other object), so this must
-            // track `input::assemble_subtree` exactly. Sharing
-            // `struct_commitments_root` is what keeps that true.
-            let mut payload = Vec::new();
-            payload.push(0x01);
-            push_u64(&mut payload, fields.len() as u64);
-            let mut child_roots = Vec::with_capacity(fields.len());
-            for (name, child) in fields {
-                let (child_payload, child_root) = draft_value_payload_and_root(child)?;
-                push_u64(&mut payload, name.len() as u64);
-                payload.extend_from_slice(name.as_bytes());
-                push_u64(&mut payload, child_payload.len() as u64);
-                payload.extend_from_slice(&child_payload);
-                child_roots.push((name.as_str(), child_root));
-            }
-            let root = crate::input::struct_commitments_root(
-                child_roots
-                    .iter()
-                    .map(|(name, root)| (*name, root.as_slice())),
-            );
-            Ok((payload, root.to_vec()))
-        }
-        DraftValue::List(values) => {
-            let mut payload = Vec::new();
-            payload.push(0x02);
-            push_u64(&mut payload, values.len() as u64);
-            let mut child_roots = Vec::with_capacity(values.len());
-            for child in values {
-                let (child_payload, child_root) = draft_value_payload_and_root(child)?;
-                push_u64(&mut payload, child_payload.len() as u64);
-                payload.extend_from_slice(&child_payload);
-                child_roots.push(child_root);
-            }
-            Ok((payload, list_root_from_hashes(&child_roots)))
-        }
-        DraftValue::Map(entries) => {
-            let mut entries_with_payloads = Vec::with_capacity(entries.len());
-            for (key, value) in entries {
-                let (key_payload, key_root) = draft_value_payload_and_root(key)?;
-                let (value_payload, value_root) = draft_value_payload_and_root(value)?;
-                entries_with_payloads.push((key_payload, key_root, value_payload, value_root));
-            }
-            entries_with_payloads.sort_by(|left, right| left.0.cmp(&right.0));
-            let mut payload = Vec::new();
-            payload.push(0x04);
-            push_u64(&mut payload, entries_with_payloads.len() as u64);
-            for (key_payload, _, value_payload, _) in &entries_with_payloads {
-                push_u64(&mut payload, key_payload.len() as u64);
-                payload.extend_from_slice(key_payload);
-                push_u64(&mut payload, value_payload.len() as u64);
-                payload.extend_from_slice(value_payload);
-            }
-            let entry_count = entries_with_payloads.len() as u64;
-            let len_bytes = entry_count.to_le_bytes();
-            let mut parts: Vec<&[u8]> = Vec::with_capacity(entries_with_payloads.len() * 2 + 2);
-            parts.push(b"map");
-            parts.push(&len_bytes);
-            for (_, key_root, _, value_root) in &entries_with_payloads {
-                parts.push(key_root.as_slice());
-                parts.push(value_root.as_slice());
-            }
-            Ok((payload, selection_hash(&parts)))
-        }
-        DraftValue::EnumUnit(variant) => {
-            let mut payload = Vec::new();
-            payload.push(0x05);
-            push_u64(&mut payload, variant.len() as u64);
-            payload.extend_from_slice(variant.as_bytes());
-            Ok((payload, selection_hash(&[b"enum-unit", variant.as_bytes()])))
-        }
-        DraftValue::EnumNewtype(variant, value) => {
-            let (child_payload, child_root) = draft_value_payload_and_root(value)?;
-            let mut payload = Vec::new();
-            payload.push(0x06);
-            push_u64(&mut payload, variant.len() as u64);
-            payload.extend_from_slice(variant.as_bytes());
-            push_u64(&mut payload, child_payload.len() as u64);
-            payload.extend_from_slice(&child_payload);
-            Ok((
-                payload,
-                selection_hash(&[b"enum-newtype", variant.as_bytes(), child_root.as_slice()]),
-            ))
-        }
-        DraftValue::EnumTuple(variant, values) => {
-            let mut payload = Vec::new();
-            payload.push(0x07);
-            push_u64(&mut payload, variant.len() as u64);
-            payload.extend_from_slice(variant.as_bytes());
-            push_u64(&mut payload, values.len() as u64);
-            let mut child_roots = Vec::with_capacity(values.len());
-            for child in values {
-                let (child_payload, child_root) = draft_value_payload_and_root(child)?;
-                push_u64(&mut payload, child_payload.len() as u64);
-                payload.extend_from_slice(&child_payload);
-                child_roots.push(child_root);
-            }
-            let mut parts: Vec<&[u8]> = Vec::with_capacity(child_roots.len() + 2);
-            parts.push(b"enum-tuple");
-            parts.push(variant.as_bytes());
-            for root in &child_roots {
-                parts.push(root.as_slice());
-            }
-            Ok((payload, selection_hash(&parts)))
-        }
-        DraftValue::EnumStruct(variant, fields) => {
-            let mut payload = Vec::new();
-            payload.push(0x08);
-            push_u64(&mut payload, variant.len() as u64);
-            payload.extend_from_slice(variant.as_bytes());
-            push_u64(&mut payload, fields.len() as u64);
-            let mut child_roots = Vec::with_capacity(fields.len());
-            for (_, child) in fields {
-                let (child_payload, child_root) = draft_value_payload_and_root(child)?;
-                push_u64(&mut payload, child_payload.len() as u64);
-                payload.extend_from_slice(&child_payload);
-                child_roots.push(child_root);
-            }
-            let mut parts: Vec<&[u8]> = Vec::with_capacity(child_roots.len() + 2);
-            parts.push(b"enum-struct");
-            parts.push(variant.as_bytes());
-            for root in &child_roots {
-                parts.push(root.as_slice());
-            }
-            Ok((payload, selection_hash(&parts)))
-        }
-        DraftValue::BytesPage {
-            index,
-            offset,
-            len,
-            bytes,
-        } => Ok((
-            encode_bytes_page_payload(*index, *offset, *len, bytes),
-            bytes_page_root(*index, *offset, *len, bytes).to_vec(),
-        )),
-        _ => {
-            let leaf_bytes = encode_leaf_bytes(value)?;
-            let mut payload = Vec::new();
-            payload.push(0x00);
-            push_u64(&mut payload, leaf_bytes.len() as u64);
-            payload.extend_from_slice(&leaf_bytes);
-            Ok((payload, selection_hash(&[b"leaf", leaf_bytes.as_slice()])))
-        }
-    }
+    let (payload, root) = subtree_payload_and_root(value)?;
+    Ok((payload, root.to_vec()))
 }
 
 pub fn draft_value_root(value: &DraftValue) -> Result<DraftRoot> {
@@ -818,8 +290,12 @@ pub fn draft_tree_from_fields(
                 )))
             }
             (SchemaFieldMode::SetOnce, None) => DraftValue::Unit,
+            // An append field is a `List<T>`, so it finalizes to the `(root, len)`
+            // handle `List<T>` serializes to — the object a tile writing the same
+            // value directly would store. The handle's root is the list root, so
+            // the finalized root equals the incrementally tracked one.
             (SchemaFieldMode::AppendOnlyVec, Some(DraftFieldValue::Append(values))) => {
-                DraftValue::List(values.clone())
+                DraftValue::ListHandle(values.clone())
             }
             (SchemaFieldMode::AppendOnlyVec, Some(DraftFieldValue::Set(_))) => {
                 return Err(Error::Other(format!(
@@ -827,7 +303,7 @@ pub fn draft_tree_from_fields(
                     field.name
                 )))
             }
-            (SchemaFieldMode::AppendOnlyVec, None) => DraftValue::List(Vec::new()),
+            (SchemaFieldMode::AppendOnlyVec, None) => DraftValue::ListHandle(Vec::new()),
         };
         values.push((field.name.clone(), value));
     }
@@ -1003,12 +479,8 @@ pub fn verify_witness_root(witness: &DraftStateWitness, expected_root: &DraftRoo
     Ok(())
 }
 
-pub fn replay_handle_for_schema<S: Schema>(
-    draft_id: DraftId,
-    root_before: DraftRoot,
-) -> DraftReplayHandle {
+pub fn replay_handle_for_schema<S: Schema>(root_before: DraftRoot) -> DraftReplayHandle {
     DraftReplayHandle {
-        draft_id,
         schema_hash: S::schema_hash(),
         root_before,
     }
@@ -1017,6 +489,9 @@ pub fn replay_handle_for_schema<S: Schema>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::boxed::Box;
+    use alloc::string::ToString;
+    use alloc::vec;
     use crate::input::Selectable;
 
     struct DemoDraft;

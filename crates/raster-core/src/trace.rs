@@ -5,7 +5,7 @@ use core::hash::Hash;
 use core::ops::{Deref, DerefMut};
 use serde::{Deserialize, Serialize};
 
-use crate::cfs::{CfsCoordinates, SequenceId, TileId};
+use crate::cfs::{CfsCoordinate, CfsCoordinates, TileId};
 use crate::draft::DraftTransitionWitness;
 use crate::fingerprint::Fingerprint;
 use crate::input::{
@@ -239,11 +239,43 @@ pub struct RasterPayload {
     pub root_hash: Hash32,
 }
 
+/// What a derived object adds over its base: the delta a deriving site's close
+/// carries. `O(k + #fields + log N)` for k appended elements onto a base of N.
+///
+/// The recorder rebuilds the object from its own copy of the base: the
+/// logical payload is `segments` in order — base ranges are offsets into the
+/// base object's logical payload, tail ranges into `tail` — and the index is
+/// `overlay_nodes` (the runtime's index nodes, postcard-encoded) layered over
+/// the base's `base_node_count` nodes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct DerivedPayload {
+    pub base_coordinates: CfsCoordinates,
+    pub base_commitment: Vec<u8>,
+    pub base_node_count: u64,
+    pub tail: Vec<u8>,
+    pub segments: Vec<DerivedSegment>,
+    pub overlay_nodes: Vec<u8>,
+    pub root_node: u64,
+    pub root_hash: Hash32,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum DerivedSegment {
+    Base { offset: u64, len: u64 },
+    Tail { offset: u64, len: u64 },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct FnOutput {
     pub data: Vec<u8>,
     pub ty: String,
     pub raster: Option<RasterPayload>,
+    /// A derived object (`output = base`) travels as what derivation added
+    /// over its base, which the recorder already holds, instead of the whole
+    /// object (`incremental-draft-materialization` §Continuation on the draft
+    /// buffer). `None` for every other output.
+    #[serde(default)]
+    pub derived: Option<DerivedPayload>,
 }
 
 impl FnOutput {
@@ -252,11 +284,17 @@ impl FnOutput {
             data,
             ty: ty.into(),
             raster: None,
+            derived: None,
         }
     }
 
     pub fn with_raster(mut self, raster: RasterPayload) -> Self {
         self.raster = Some(raster);
+        self
+    }
+
+    pub fn with_derived(mut self, derived: DerivedPayload) -> Self {
+        self.derived = Some(derived);
         self
     }
 
@@ -291,6 +329,17 @@ pub struct FnCallRecord {
     /// `docs/proposals/recur-progress-commitment.md` §3.1.
     #[serde(default)]
     pub recur_control: Option<crate::draft::RecurControlKind>,
+    /// The iteration's carried-state transition, host-recorded. `Some` on a
+    /// recur iteration whose step declares a `RecurState`, `None` everywhere
+    /// else.
+    ///
+    /// Same arrangement as `recur_control`, and for the same reason: the
+    /// recorder has to fold this into `recur_progress_commitment` and never
+    /// sees a replay journal. The guest folds the replay-proven copy
+    /// (`TileReplayJournal.recur.state`); the two agree or the commitments
+    /// differ. See `docs/proposals/loop-carried-state.md` §4.
+    #[serde(default)]
+    pub recur_state: Option<crate::draft::RecurStateTransition>,
 }
 
 impl FnCallRecord {
@@ -312,25 +361,23 @@ pub struct StorageRoots {
     pub index_root_after: Vec<u8>,
 }
 
-/// What an [`ExecStep`] ran. The distinction is not cosmetic: it decides how
-/// the step's output is verified (only `Tile` carries a replay proof) and
-/// which CFS item kind the step may occupy.
+/// What an [`ExecStep`] ran: always a tile, a plain call or one recur tile
+/// iteration, and always with a replay proof.
+///
+/// `RecurTile` and `RecurSequence` targets used to name a recur site's close,
+/// which runs nothing; that step is [`StepKind::RecurEnd`] now, so `Exec`
+/// means "a tile ran" again. See `docs/proposals/incremental-draft-
+/// materialization.md` §A recur site gets its own step kinds.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum ExecTarget {
     Tile(TileId),
-    RecurTile(TileId),
-    RecurSequence(SequenceId),
 }
 
-/// A step that ran something and committed to what it consumed and produced.
-///
-/// The three targets share one shape deliberately: they commit to exactly
-/// the same things and differ only in what ran, so a field added here cannot
-/// be added to two of them and forgotten on the third.
+/// A step where a tile ran, committing to what it consumed and produced.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct ExecStep {
     pub target: ExecTarget,
-    pub intra_sequence_index: u32,
+    pub intra_sequence_index: CfsCoordinate,
 
     pub input_commitment: Vec<u8>,
     pub input_source_commitment: Vec<u8>,
@@ -401,14 +448,130 @@ pub enum StepKind {
     /// The trace's last step: commits `main`'s authorized output (see
     /// [`ProgramEndStep`]). Always at coordinates `[]`.
     ProgramEnd(ProgramEndStep),
+    /// A nested sequence (at `[s]`) or a recur-sequence iteration (at
+    /// `[s][i]`) opens.
     SequenceStart {
         input_commitment: Vec<u8>,
         input_source_commitment: Vec<u8>,
     },
+    /// …and closes, at `[-s]` / `[s][-i]`.
     SequenceEnd {
         output_commitment: Vec<u8>,
     },
     Exec(ExecStep),
+    /// A recur site (tile or sequence — the CFS item says which) opens at
+    /// `[s]`. See [`RecurStartStep`].
+    RecurStart(RecurStartStep),
+    /// …and closes at `[-s]`, writing its object at `[s]`. See
+    /// [`RecurEndStep`].
+    RecurEnd(RecurEndStep),
+}
+
+/// A recur site opens: the loop's inputs are bound here, once.
+///
+/// Both recur families share this kind; the family is the CFS item's at `[s]`,
+/// so a record cannot disagree with it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct RecurStartStep {
+    /// The CFS item id at `[s]`. The record's `sequence_id` names the
+    /// *enclosing* sequence, as on every step that is not a sequence boundary.
+    pub site_id: String,
+    pub input_commitment: Vec<u8>,
+    pub input_source_commitment: Vec<u8>,
+    /// **Read-only** storage roots (`root_before == root_after`).
+    ///
+    /// The site reads its source's `0x0A` metadata, which is where the sweep
+    /// bound `L` comes from. A step with no roots gets no storage read and no
+    /// witness fold, so without these `L` — and the source object itself —
+    /// were whatever the prover recorded: a fabricated empty list at the right
+    /// coordinates, swept zero times, passed rule 7. With them the record pins
+    /// the roots, as `ProgramEnd` does for its read, and `checks::store`
+    /// verifies the read like any other. See
+    /// `docs/proposals/tile-io-structural-roots.md` §Step 1.
+    pub storage: StorageRoots,
+}
+
+/// A recur site closes at `[-s]`: its output, written at `[s]`.
+///
+/// No input fields: the inputs were bound at [`RecurStartStep`], and a close
+/// that re-bound them is what committed every site's inputs twice.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct RecurEndStep {
+    pub site_id: String,
+    /// The object written at `[s]`, or empty when the site writes none
+    /// (`finalize = false`, until `incremental-draft-materialization`'s
+    /// language change makes every site write exactly one).
+    pub output_commitment: Vec<u8>,
+    pub storage: StorageRoots,
+}
+
+/// The binding name a recur site's source is always recorded under. Shared so
+/// the payload rule below and `checks::cfs::authenticated_source_len` cannot
+/// disagree about which binding that is.
+pub const RECUR_SOURCE_BINDING: &str = "input";
+
+/// Does the fraud-proof guest need this storage binding's **payload**, or only
+/// the root of the value it selects?
+///
+/// A sequence — ordinary or recur — receives its storage arguments as
+/// references: coordinates, commitment and selector, never bytes. It forwards
+/// them inward, and only a tile that actually consumes a value sees one. So
+/// for every non-`Exec` step the guest needs to establish just the scoping
+/// fact — *this reference resolves inside an object the store authenticates* —
+/// which folds from a root with no payload at all.
+///
+/// The one exception is a recur site's source. `checks::cfs`'s
+/// `authenticated_source_len` reads the sweep bound `L` out of that binding's
+/// payload, and `L` is the number every completeness rule holds the sweep to.
+/// That payload is the list's *metadata* view — `(len, elements_root)` — so it
+/// stays small however long the list is.
+///
+/// Keyed on the record's own kind and the binding's name, both of which the
+/// guest already has, so the decision is the guest's and a prover cannot make
+/// it. Conservative on purpose: it demands the payload for a `"input"` binding
+/// on any non-`Exec` step, not only a recur site, because narrowing that
+/// further would mean trusting a second derivation of *which* sites are recur
+/// sites, and the payload in question is small either way.
+pub fn binding_requires_payload(
+    kind: &StepKind,
+    binding_name: &str,
+    storage: &StorageInput,
+) -> bool {
+    // A tile ran on these bytes. `ExecTarget::Tile` is the discriminating
+    // fact, not `StepKind::Exec`: the recorder emits it for `TileExec` and for
+    // `RecurTileIterationExec` — every step where a tile actually consumed a
+    // value — while `ExecTarget::RecurTile` and `ExecTarget::RecurSequence`
+    // appear only on the step that *closes* a recur site, which executes
+    // nothing and merely holds the site's arguments. Treating those as
+    // executions is what kept a forwarded 106 MB `List<MergeBucket>` on the
+    // recur site step at `[2, 0]` (0-based, as observed at the time) after the
+    // sequence steps were already
+    // reduced. This is the same predicate as
+    // [`StepRecord::requires_replay_proof`], for the same reason: a replay
+    // journal exists exactly where a tile ran.
+    if matches!(
+        kind,
+        StepKind::Exec(ExecStep {
+            target: ExecTarget::Tile(_),
+            ..
+        })
+    ) {
+        return true;
+    }
+    // The sweep bound `L` is read out of this binding's metadata payload.
+    if binding_name == RECUR_SOURCE_BINDING {
+        return true;
+    }
+    // A binding cited as a `BoundIndex` source has its `selected_hash`
+    // compared against the canonical encoding of the claimed index by
+    // [`verify_bound_index_bindings`]. That comparison means something only
+    // while `selected_hash` is itself tied to real bytes — which is exactly
+    // what the payload check does and a reference witness does not. Without
+    // this clause a prover could forward the source as a reference, forge its
+    // `selected_hash`, and have any index accepted.
+    storage
+        .values()
+        .any(|data| bound_indexes(&data.selection.path).any(|(_, source, _)| source == binding_name))
 }
 
 /// One step of a trace: where it sits, and what it did.
@@ -428,6 +591,21 @@ pub struct StepRecord {
     /// `docs/proposals/recur-progress-commitment.md`.
     #[serde(default)]
     pub recur_progress_commitment: Hash32,
+    /// The carried-state transition this step performed, `Some` only on a recur
+    /// iteration whose site carries state.
+    ///
+    /// It lives on the step record — not only in the replay journal — because a
+    /// recur *sequence* emits no journal, and its iterations need the same
+    /// chain a recur tile's do. Here it is bound by fingerprint agreement with
+    /// `commit.bin`, exactly like `recur_progress_commitment`; the guest
+    /// additionally binds `state_in` against the step's own recorded input
+    /// witness, so the value cannot be invented, and a tile's copy against the
+    /// replay-proven journal.
+    ///
+    /// Every `state_out` is pinned in turn: by the next iteration's bound
+    /// `state_in` through the fold rule, and the last one by the site's close.
+    #[serde(default)]
+    pub recur_state: Option<crate::draft::RecurStateTransition>,
 }
 
 impl StepRecord {
@@ -442,6 +620,8 @@ impl StepRecord {
                 input_commitment, ..
             } => Some(input_commitment),
             StepKind::Exec(exec) => Some(&exec.input_commitment),
+            StepKind::RecurStart(start) => Some(&start.input_commitment),
+            StepKind::RecurEnd(_) => None,
             // A program start binds authorized external data and a program end
             // commits an authorized output rather than consuming a step input;
             // a sequence end only reports what it produced.
@@ -457,7 +637,8 @@ impl StepRecord {
             StepKind::Exec(exec) => Some(&exec.output_commitment),
             StepKind::ProgramStart(program_start) => Some(&program_start.output_commitment),
             StepKind::ProgramEnd(program_end) => Some(&program_end.output_commitment),
-            StepKind::SequenceStart { .. } => None,
+            StepKind::RecurEnd(end) => Some(&end.output_commitment),
+            StepKind::SequenceStart { .. } | StepKind::RecurStart(_) => None,
         }
     }
 
@@ -468,6 +649,8 @@ impl StepRecord {
                 ..
             } => Some(input_source_commitment),
             StepKind::Exec(exec) => Some(&exec.input_source_commitment),
+            StepKind::RecurStart(start) => Some(&start.input_source_commitment),
+            StepKind::RecurEnd(_) => None,
             // A program start makes no input commitment at all (its "input" is
             // the outside world, authorized against the manifest journal), and
             // a program end carries its output binding in the record itself
@@ -479,13 +662,16 @@ impl StepRecord {
     }
 
     /// The storage roots this step claims, for kinds that touch the store.
-    /// Sequence boundaries never touch it, so they have none. A program end
-    /// reads its output (roots unchanged) so it claims them too.
+    /// A program end reads its output (roots unchanged) so it claims them too,
+    /// and so does a recur site's `RecurStart`, which reads its source.
+    /// Sequence boundaries have none.
     pub fn storage_roots(&self) -> Option<&StorageRoots> {
         match &self.kind {
             StepKind::Exec(exec) => Some(&exec.storage),
             StepKind::ProgramStart(program_start) => Some(&program_start.storage),
             StepKind::ProgramEnd(program_end) => Some(&program_end.storage),
+            StepKind::RecurStart(start) => Some(&start.storage),
+            StepKind::RecurEnd(end) => Some(&end.storage),
             StepKind::SequenceStart { .. } | StepKind::SequenceEnd { .. } => None,
         }
     }
@@ -494,10 +680,19 @@ impl StepRecord {
     /// mechanism other than a direct byte-witness comparison: a replay proof
     /// for a tile, the authorization journal for a program start, or a
     /// storage selection proof for a program end.
+    ///
+    /// A `RecurEnd` counts as one because it did before as `Exec(RecurTile)`:
+    /// its output is the site's object, which the frame's draft entry (or the
+    /// D5b state commitment) binds in `incremental-draft-materialization`'s
+    /// batch C. Until then nothing compares it — the gap
+    /// `tile-output-commitment-unbound` records.
     pub fn is_execution_step(&self) -> bool {
         matches!(
             self.kind,
-            StepKind::Exec(_) | StepKind::ProgramStart(_) | StepKind::ProgramEnd(_)
+            StepKind::Exec(_)
+                | StepKind::ProgramStart(_)
+                | StepKind::ProgramEnd(_)
+                | StepKind::RecurEnd(_)
         )
     }
 
@@ -507,7 +702,10 @@ impl StepRecord {
     /// necessary because `ProgramStart` (append) and `ProgramEnd` (read-only)
     /// share coordinates `[]` and thus a witness-store entry.
     pub fn appends_to_storage(&self) -> bool {
-        matches!(self.kind, StepKind::Exec(_) | StepKind::ProgramStart(_))
+        matches!(
+            self.kind,
+            StepKind::Exec(_) | StepKind::ProgramStart(_) | StepKind::RecurEnd(_)
+        )
     }
 
     pub fn requires_replay_proof(&self) -> bool {
@@ -581,6 +779,22 @@ pub struct TraceWindow {
 pub struct TraceCommitment {
     pub fingerprint: Fingerprint,
     pub revealed_items: Vec<StepRecord>,
+    /// The cumulative trace roots for the final `window_size` indices, in the
+    /// clear — the tail's counterpart to `revealed_items` revealing the first
+    /// `window_size` step records.
+    ///
+    /// Detection reads the packed fingerprint, which keeps only
+    /// `bits_per_item` bits of each root, and a divergence at index `N - k` has
+    /// only `k` entries left to differ in. At `window_size >= 128`
+    /// `bits_per_item` is 1, so a last-step divergence was a coin flip. Full
+    /// roots make detection exact across the final window, and pinpoint the
+    /// index rather than only reporting that something differs.
+    ///
+    /// Revealing them gives nothing away that the fingerprint did not already
+    /// commit to, and `validate` holds each one to the entry it squeezes to, so
+    /// a commitment whose roots and bits disagree is unrepresentable.
+    #[serde(default)]
+    pub revealed_tail_roots: Vec<Vec<u8>>,
 }
 
 impl TraceCommitment {
@@ -921,5 +1135,165 @@ mod bound_index_tests {
             ("@idx/base", index_supplier(4, IndexWidth::U32)),
         ]);
         assert_eq!(verify_bound_index_bindings(&storage), Ok(()));
+    }
+}
+
+#[cfg(test)]
+mod payload_rule_tests {
+    use super::*;
+    use crate::cfs::FIRST_COORDINATE;
+    use alloc::string::ToString;
+    use alloc::vec;
+
+    fn exec_kind() -> StepKind {
+        StepKind::Exec(ExecStep {
+            target: ExecTarget::Tile("tile".to_string()),
+            intra_sequence_index: FIRST_COORDINATE,
+            input_commitment: Vec::new(),
+            input_source_commitment: Vec::new(),
+            output_commitment: Vec::new(),
+            storage: StorageRoots {
+                root_before: Vec::new(),
+                root_after: Vec::new(),
+                index_root_before: Vec::new(),
+                index_root_after: Vec::new(),
+            },
+        })
+    }
+
+    fn sequence_kind() -> StepKind {
+        StepKind::SequenceStart {
+            input_commitment: Vec::new(),
+            input_source_commitment: Vec::new(),
+        }
+    }
+
+    fn recur_start_kind() -> StepKind {
+        StepKind::RecurStart(RecurStartStep {
+            site_id: "site".to_string(),
+            input_commitment: Vec::new(),
+            input_source_commitment: Vec::new(),
+            storage: StorageRoots {
+                root_before: Vec::new(),
+                root_after: Vec::new(),
+                index_root_before: Vec::new(),
+                index_root_after: Vec::new(),
+            },
+        })
+    }
+
+    fn binding(name: &str, path: SelectorPath) -> (StorageBindingName, StorageData) {
+        (
+            name.to_string(),
+            StorageData {
+                coordinates: CfsCoordinates(Vec::new()),
+                commitment: Vec::new(),
+                selector: path.clone(),
+                selection: SelectionCommitment {
+                    path,
+                    ..Default::default()
+                },
+            },
+        )
+    }
+
+
+    #[test]
+    fn a_tile_step_always_needs_the_payload() {
+        let storage: StorageInput = [binding("arg", SelectorPath::default())]
+            .into_iter()
+            .collect();
+        assert!(binding_requires_payload(&exec_kind(), "arg", &storage));
+    }
+
+    #[test]
+    fn a_recur_site_start_forwards_its_arguments_but_reads_its_source() {
+        // A site's `RecurStart` executes nothing: an argument it only holds
+        // for the iterations is forwarded as a reference (a forwarded 106 MB
+        // `List<MergeBucket>` is why), while its `"input"` — the source whose
+        // metadata gives `L` — needs its payload.
+        let storage: StorageInput = [
+            binding("merge_buckets", SelectorPath::default()),
+            binding(RECUR_SOURCE_BINDING, SelectorPath::default()),
+        ]
+        .into_iter()
+        .collect();
+        assert!(!binding_requires_payload(
+            &recur_start_kind(),
+            "merge_buckets",
+            &storage
+        ));
+        assert!(binding_requires_payload(
+            &recur_start_kind(),
+            RECUR_SOURCE_BINDING,
+            &storage
+        ));
+    }
+
+    #[test]
+    fn a_recur_tile_iteration_still_needs_the_payload() {
+        // Each iteration is recorded with `ExecTarget::Tile`, because a tile
+        // really did run on those bytes — the reference shortcut must not
+        // reach it.
+        let storage: StorageInput = [binding("arg", SelectorPath::default())]
+            .into_iter()
+            .collect();
+        assert!(binding_requires_payload(
+            &exec_kind(),
+            "arg",
+            &storage
+        ));
+    }
+
+    #[test]
+    fn a_forwarded_sequence_argument_needs_only_its_root() {
+        let storage: StorageInput = [binding("merge_buckets", SelectorPath::default())]
+            .into_iter()
+            .collect();
+        assert!(!binding_requires_payload(
+            &sequence_kind(),
+            "merge_buckets",
+            &storage
+        ));
+    }
+
+    #[test]
+    fn a_recur_source_needs_its_payload_even_on_a_sequence_step() {
+        let storage: StorageInput = [binding(RECUR_SOURCE_BINDING, SelectorPath::default())]
+            .into_iter()
+            .collect();
+        assert!(binding_requires_payload(
+            &sequence_kind(),
+            RECUR_SOURCE_BINDING,
+            &storage
+        ));
+    }
+
+    #[test]
+    fn a_binding_cited_as_a_bound_index_source_needs_its_payload() {
+        // `verify_bound_index_bindings` compares the *source* binding's
+        // `selected_hash` against the canonical encoding of the claimed index.
+        // That is only meaningful while something ties `selected_hash` to real
+        // bytes — so a cited source may never be forwarded as a reference,
+        // whatever the step kind.
+        let cited = SelectorPath::new(vec![SelectorSegment::BoundIndex {
+            index: 3,
+            source: "idx".to_string(),
+            width: IndexWidth::U32,
+        }]);
+        let storage: StorageInput = [
+            binding("bucket", cited),
+            binding("idx", SelectorPath::default()),
+        ]
+        .into_iter()
+        .collect();
+
+        assert!(binding_requires_payload(&sequence_kind(), "idx", &storage));
+        // The citing binding itself is still only forwarded.
+        assert!(!binding_requires_payload(
+            &sequence_kind(),
+            "bucket",
+            &storage
+        ));
     }
 }

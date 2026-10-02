@@ -25,6 +25,7 @@ pub mod program;
 pub mod recur_progress;
 pub mod tile;
 pub mod trace;
+pub mod tree;
 
 // These modules are only available with std (they use serde_json for complex serialization)
 #[cfg(feature = "std")]

@@ -21,9 +21,9 @@
 //! deferred debt to discharge at the end of the chain.
 
 use raster_core::authorization::AuthorizationJournal;
-use raster_core::cfs::{CfsCoordinates, CfsCursor};
+use raster_core::cfs::{CfsCoordinates, CfsCursor, SequenceReturn};
 use raster_core::input::{struct_commitments_root, verify_selection_witness, SelectionWitness};
-use raster_core::trace::{ProgramEndStep, ProgramStartStep, StepKind, StepRecord};
+use raster_core::trace::{ProgramEndStep, ProgramStartStep, StepKind, StepRecord, StorageData};
 use raster_core::transition::{EntrypointAuthorization, OutputAuthorization, StorageReadWitness};
 
 use crate::checks::store::verify_storage_read_witness;
@@ -47,10 +47,10 @@ fn entrypoint_coordinates() -> CfsCoordinates {
 /// `TreeValue::Struct` convention, so selecting into one argument composes
 /// as one ordinary selection proof rather than a special case.
 pub fn combined_root(names: &[String], authorization_journal: &AuthorizationJournal) -> Vec<u8> {
-    let fields: Vec<(&str, &[u8])> = names
+    let commitments: Vec<(&str, Vec<u8>)> = names
         .iter()
         .map(|name| {
-            let commitment = authorization_journal
+            let text = authorization_journal
                 .external_inputs_commitments
                 .get(name)
                 .unwrap_or_else(|| {
@@ -59,11 +59,59 @@ pub fn combined_root(names: &[String], authorization_journal: &AuthorizationJour
                         name
                     )
                 });
-            (name.as_str(), commitment.as_slice())
+            (name.as_str(), decode_authorized_commitment(name, text))
         })
         .collect();
 
-    struct_commitments_root(fields.iter().copied()).to_vec()
+    struct_commitments_root(
+        commitments
+            .iter()
+            .map(|(name, commitment)| (*name, commitment.as_slice())),
+    )
+    .to_vec()
+}
+
+/// Decode one journal entry from the manifest's spelling into the digest it
+/// names.
+///
+/// The authorization journal stores each commitment exactly as the manifest
+/// writes it — lowercase hex *text*, because `normalize_hash_string` in the
+/// authorization guest ends in `String::into_bytes` rather than a hex decode
+/// (`guests/authorization/src/main.rs`). Every other side of the selection
+/// tree speaks raw digests: the entry object the runtime assembles in
+/// `backing::ReferencedObject::combined_root` hashes `source.commitment`,
+/// which is 32 bytes, and so does every other child root
+/// `struct_commitments_root` consumes. Passing the text straight through
+/// produced a root over the digest's *spelling*, which cannot equal the
+/// entry object's root for any input — so the decode belongs here, at the
+/// one consumer that needs digests rather than in the guest whose image id
+/// the chain-fraud check already depends on.
+///
+/// Strict on purpose. Accepting both spellings would let two distinct roots
+/// authorize the same manifest entry, and a prover would simply present
+/// whichever one its claimed storage state already matched.
+fn decode_authorized_commitment(name: &str, text: &[u8]) -> Vec<u8> {
+    assert_eq!(
+        text.len(),
+        64,
+        "Authorized commitment for entry argument '{}' is not a 64-character sha256 hex string",
+        name,
+    );
+
+    let nibble = |c: u8| -> u8 {
+        match c {
+            b'0'..=b'9' => c - b'0',
+            b'a'..=b'f' => c - b'a' + 10,
+            _ => panic!(
+                "Authorized commitment for entry argument '{}' is not lowercase hex",
+                name
+            ),
+        }
+    };
+
+    text.chunks(2)
+        .map(|pair| (nibble(pair[0]) << 4) | nibble(pair[1]))
+        .collect()
 }
 
 /// Per-step check: the `ProgramStart` step binds exactly the arguments the
@@ -172,6 +220,11 @@ pub fn verify_genesis_authorization(
 /// to the returned value, and `output_commitment` is pinned to that
 /// selection's `selected_hash`. A unit program binds nothing. This reuses the
 /// exact storage-read and selection machinery that verifies tile inputs.
+///
+/// Presence is not identity. The object must also be the one `main`
+/// *returns*, as the CFS resolves it (`SequenceDef::returns`) — otherwise any
+/// stored object, an intermediate included, would verify as the program's
+/// output. See `docs/issues/program-output-unbound.md`.
 pub fn verify_program_end(
     cfs_cursor: &CfsCursor,
     record: &StepRecord,
@@ -210,6 +263,15 @@ pub fn verify_program_end(
         "ProgramEnd binds an output the CFS does not declare",
     );
 
+    // The output must be the value `main` returns, not merely a stored one.
+    let returns = cfs_cursor.main_returns().unwrap_or_else(|| {
+        panic!(
+            "CFS declares a program output but does not bind the value `main` returns, so no \
+             ProgramEnd output can be verified"
+        )
+    });
+    verify_program_output_source(cfs_cursor, returns, output);
+
     // The output object is present at its coordinates in the current store.
     let read_witness = read_witness.expect("ProgramEnd output requires a storage read witness");
     verify_storage_read_witness(
@@ -226,14 +288,18 @@ pub fn verify_program_end(
         output.selection.source_root_hash.as_slice(),
         "Program output object commitment must match the selection source root",
     );
-    if output.selection.selected_len > 0 {
-        let selection_witness =
-            selection_witness.expect("ProgramEnd output requires a selection witness");
-        assert!(
-            verify_selection_witness(&output.selection, selection_witness),
-            "Program output selection witness is invalid",
-        );
-    }
+    // Unconditionally. A zero-length selection is how a postcard-only object
+    // reports "no raster view" (`OwnedObject::resolve_whole`), and skipping the
+    // proof for it would let a `ProgramEnd` claim `selected_len: 0` and name any
+    // `selected_hash` it likes. A program output is always raster-encoded, and
+    // every raster payload is at least its tag byte, so an honest output
+    // always has a proof to give.
+    let selection_witness =
+        selection_witness.expect("ProgramEnd output requires a selection witness");
+    assert!(
+        verify_selection_witness(&output.selection, selection_witness),
+        "Program output selection witness is invalid",
+    );
 
     // The committed output is exactly that selection's value.
     assert_eq!(
@@ -247,5 +313,57 @@ pub fn verify_program_end(
     // and is what lets a consumer learn *which* output this trace produced.
     OutputAuthorization::Established {
         output_commitment: program_end.output_commitment.clone(),
+    }
+}
+
+/// Hold the program output to what `main` returns: the object and the part of
+/// it.
+///
+/// The object is found by following `main`'s `returns` through the CFS down to
+/// the step that wrote it (`CfsCursor::resolve_value`): a tile's or recur
+/// site's own coordinate, through as many nested sequences as the chain passes,
+/// or the entry object at `[]`. Every other object — including anything a
+/// nested sequence wrote but did not return — is refused. A chain the CFS
+/// cannot follow (an unbindable return anywhere on it) fails closed, and a
+/// data-sourced index is refused: `ProgramEnd` carries no citation to hold it
+/// to.
+///
+/// The part is held on `selection.path` — the path the selection proof is
+/// pinned to (`verify_selection_witness`) — not on `selector`, which no proof
+/// constrains: exactly, unless the chain crossed a sequence parameter, whose
+/// argument binding records no path; then only the known trailing segments.
+fn verify_program_output_source(
+    cfs_cursor: &CfsCursor,
+    returns: &SequenceReturn,
+    output: &StorageData,
+) {
+    assert!(
+        returns.source.index_bindings().is_empty(),
+        "main returns a value selected by a data-sourced index, which ProgramEnd cannot verify",
+    );
+    let resolved = cfs_cursor
+        .resolve_value(&entrypoint_coordinates(), &returns.source, &returns.path)
+        .unwrap_or_else(|error| {
+            panic!(
+                "main's returned value cannot be followed to the step that wrote it: {:?}",
+                error
+            )
+        });
+    assert_eq!(
+        output.coordinates, resolved.coordinates,
+        "Program output is not the object main returns",
+    );
+    let selected_path = output.selection.path.segments.as_slice();
+    if resolved.path_complete {
+        assert_eq!(
+            selected_path,
+            resolved.path.as_slice(),
+            "Program output selects a different part of the object than main returns",
+        );
+    } else {
+        assert!(
+            selected_path.ends_with(&resolved.path),
+            "Program output selects a different part of the object than main returns",
+        );
     }
 }

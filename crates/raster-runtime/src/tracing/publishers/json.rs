@@ -70,6 +70,7 @@ mod tests {
             output: None,
             draft_transition_witness: None,
             recur_control: None,
+            recur_state: None,
         })
     }
 

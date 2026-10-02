@@ -249,19 +249,38 @@ fn a_storage_backed_base_accepts_a_tile_produced_index() {
     assert_eq!(greet(city), "Hello, Madrid!");
 }
 
-/// A draft builds field by field and finalizes to the value, with no root
-/// hashing and no transition witness behind it (§7).
-#[test]
-fn a_draft_finalizes_to_its_value() {
-    unauthenticated();
-    let _guard = raster::__private::SequenceScopeGuard::enter("a_draft_finalizes_to_its_value");
-
-    let mut draft: raster::Draft<CollectiveGreeting> = new!(CollectiveGreeting);
-    draft.title().set("Built unauthenticated".to_string());
+#[tile]
+fn draft_two_lines(title: String) -> Draft<CollectiveGreeting> {
+    let mut draft = Draft::<CollectiveGreeting>::new();
+    draft.title().set(title);
     draft.lines().push("first".to_string());
     draft.lines().push("second".to_string());
+    draft
+}
 
-    let finalized = inline(raster::finalize(draft));
+#[tile]
+fn draft_title_twice() -> Draft<CollectiveGreeting> {
+    let mut draft = Draft::<CollectiveGreeting>::new();
+    draft.title().set("first".to_string());
+    draft.title().set("second".to_string());
+    draft
+}
+
+#[tile]
+fn draft_title_only(title: String) -> Draft<CollectiveGreeting> {
+    let mut draft = Draft::<CollectiveGreeting>::new();
+    draft.title().set(title);
+    draft
+}
+
+/// A tile drafts an object field by field and its return completes it to the
+/// value, with no root hashing and no transition witness behind it (§7).
+#[test]
+fn a_tile_draft_completes_to_its_value() {
+    unauthenticated();
+    let _guard = raster::__private::SequenceScopeGuard::enter("a_tile_draft_completes_to_its_value");
+
+    let finalized = draft_two_lines("Built unauthenticated".to_string());
     assert_eq!(finalized.title, "Built unauthenticated");
     assert_eq!(
         finalized.lines.as_slice(),
@@ -270,32 +289,23 @@ fn a_draft_finalizes_to_its_value() {
 }
 
 /// Set-once is a property of the draft, not of authentication, so it still
-/// fires with commitments off — `finalize_draft_value` is shared by both modes
-/// precisely so these rules cannot drift apart.
+/// fires with commitments off.
 #[test]
 #[should_panic(expected = "can only be written once")]
 fn set_once_still_holds() {
     unauthenticated();
     let _guard = raster::__private::SequenceScopeGuard::enter("set_once_still_holds");
-
-    let mut draft: raster::Draft<CollectiveGreeting> = new!(CollectiveGreeting);
-    draft.title().set("first".to_string());
-    draft.title().set("second".to_string());
+    let _ = draft_title_twice();
 }
 
-/// An append-only field left untouched still materializes, which is the
-/// empty-recur path (`allow_partial`) reaching `finalize_draft_value` with
-/// `require_complete = false`.
+/// An append-only field left untouched completes empty.
 #[test]
-fn an_untouched_append_field_finalizes_empty() {
+fn an_untouched_append_field_completes_empty() {
     unauthenticated();
     let _guard =
-        raster::__private::SequenceScopeGuard::enter("an_untouched_append_field_finalizes_empty");
+        raster::__private::SequenceScopeGuard::enter("an_untouched_append_field_completes_empty");
 
-    let mut draft: raster::Draft<CollectiveGreeting> = new!(CollectiveGreeting);
-    draft.title().set("No lines".to_string());
-
-    let finalized = inline(raster::finalize(draft));
+    let finalized = draft_title_only("No lines".to_string());
     assert_eq!(finalized.title, "No lines");
     assert!(finalized.lines.as_slice().is_empty());
 }

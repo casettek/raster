@@ -82,23 +82,16 @@ fn main(personal_data: PersonalData, personal_data_bin: PersonalData, seed: u64)
     let selected_personal_data_bin_name = select!(String, personal_data_bin.clone().name);
     call!(personal_greet_from_object, selected_personal_data_bin_name);
 
-    let draft = new!(CollectiveGreeting);
-    let draft = call!(
-        set_draft_greeting_title,
+    // A small object built by one plain tile and stored at its own coordinate.
+    // (This used to be a draft handed through three plain tiles and closed with
+    // `finalize`; a draft now exists only inside a recur site —
+    // `incremental-draft-materialization` §The restriction.)
+    let draft_greeting = call!(
+        build_greeting,
         "Draft-built greeting".to_string(),
-        draft
-    );
-    let draft = call!(
-        push_draft_greeting_line,
         "Hello from a Draft object".to_string(),
-        draft
+        "This line was appended in a second tile".to_string()
     );
-    let draft = call!(
-        push_draft_greeting_line,
-        "This line was appended in a second tile".to_string(),
-        draft
-    );
-    let draft_greeting = finalize(draft);
     println!("draft greeting: {:?}", draft_greeting);
     let draft_title = select!(String, draft_greeting.clone().title);
     let first_draft_line = select!(String, draft_greeting.lines[0]);
@@ -123,7 +116,7 @@ fn main(personal_data: PersonalData, personal_data_bin: PersonalData, seed: u64)
         tile = collect_line_chunk,
         input = address_lines.clone(),
         chunk = 2,
-        output = new!(CollectiveGreeting),
+        output,
         args = ("Chunked greeting".to_string(),)
     );
     println!("chunked recur greeting: {:?}", chunked_greeting);
@@ -131,7 +124,7 @@ fn main(personal_data: PersonalData, personal_data_bin: PersonalData, seed: u64)
     let recur_greeting = call_recur!(
         tile = build_recur_draft_greeting,
         input = address_lines.clone(),
-        output = new!(CollectiveGreeting),
+        output,
         args = ("Recur-built greeting".to_string(),)
     );
     println!("output-only recur greeting: {:?}", recur_greeting);
@@ -143,28 +136,33 @@ fn main(personal_data: PersonalData, personal_data_bin: PersonalData, seed: u64)
     // `--commit`/`--audit` pipeline exercises the recur-sequence shape at all —
     // its iterations are scopes with their own inner steps, which the
     // recur-tile sites above never produce.
-    // The title is set by its own tile *before* the loop: a recur-sequence body
-    // is orchestration-only, so it cannot set a `SetOnce` field itself, and a
-    // `call!` nested inside a macro argument is not picked up by static
-    // discovery — it would execute and claim a coordinate the CFS never
-    // allocated.
-    let sequence_output = call!(
-        set_draft_greeting_title,
-        "Recur-sequence greeting".to_string(),
-        new!(CollectiveGreeting)
-    );
+    // The site *derives* from a titled greeting a plain tile stored first: a
+    // recur-sequence body is orchestration-only, so it cannot set a `SetOnce`
+    // field itself, and a derived site only appends. `[s]` is the base plus
+    // the decorated lines.
+    let sequence_base = call!(begin_greeting, "Recur-sequence greeting".to_string());
     let sequence_greeting = call_recur_seq!(
         sequence = decorate_lines_sequence,
         input = address_lines.clone(),
-        output = sequence_output,
+        output = sequence_base,
         args = ("*".to_string(),)
     );
     println!("recur sequence greeting: {:?}", sequence_greeting);
+    // Read the derived object back: its title is the base's bytes, its second
+    // line an appended element — both proven out of an object stored as the
+    // base plus a delta.
+    let sequence_title = select!(String, sequence_greeting.clone().title);
+    let sequence_line = select!(String, sequence_greeting.lines[1]);
+    call!(concat_messages, sequence_title, sequence_line);
 
+    // A stored seed: the site's `RecurStart` reads it, so the carried-state
+    // chain opens at its commitment. (`limited_recur_greeting` below keeps an
+    // inline seed, which the chain adopts from iteration 0.)
+    let line_stats_seed = call!(zero_line_stats);
     let recur_line_stats = call_recur!(
         tile = compute_recur_max_line_len,
         input = address_lines.clone(),
-        state = LineLengthStats { max_len: 0 },
+        state = line_stats_seed,
         args = ()
     );
     println!("state-only recur stats: {:?}", recur_line_stats);
@@ -173,15 +171,27 @@ fn main(personal_data: PersonalData, personal_data_bin: PersonalData, seed: u64)
 
     let limited_recur_greeting = call_recur!(
         tile = build_limited_recur_greeting,
-        input = address_lines,
+        input = address_lines.clone(),
         state = GreetingLimitState { seen: 0 },
-        output = new!(CollectiveGreeting),
+        output,
         args = ("State+output recur greeting".to_string(), 2)
     );
     println!("state+output recur greeting: {:?}", limited_recur_greeting);
     let limited_title = select!(String, limited_recur_greeting.clone().title);
     let limited_first_line = select!(String, limited_recur_greeting.lines[0]);
     call!(concat_messages, limited_title, limited_first_line);
+
+    // A recur sequence carrying state from a stored seed: its state crosses
+    // iterations by reference, each iteration's returned cursor is a body
+    // tile's output, and the stored result is the last of them.
+    let cursor_seed = call!(begin_line_cursor);
+    let line_cursor = call_recur_seq!(
+        sequence = count_lines_sequence,
+        input = address_lines.clone(),
+        state = cursor_seed,
+        args = ("-".to_string(),)
+    );
+    println!("stateful recur sequence cursor: {:?}", line_cursor);
 
     let name_2 = call_seq!(placeholder_sequence, "Placeholder".to_string());
     let result = call_seq!(greet_sequence, name_2, personal_data_bin);

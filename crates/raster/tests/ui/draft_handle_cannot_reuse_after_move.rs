@@ -9,7 +9,7 @@ struct Account {
 fn consume(_: Draft<Account>) {}
 
 fn attempt_reuse() {
-    let draft = new!(Account);
+    let draft = Draft::<Account>::new();
     consume(draft);
     consume(draft);
 }

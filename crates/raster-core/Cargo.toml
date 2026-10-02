@@ -11,6 +11,8 @@ description = "Core types and schemas for the Raster toolchain"
 default = ["std"]
 std = ["serde/std", "serde_json", "bincode"]
 alloc = []
+# Test instrumentation: count leaf hashes per thread (`tree::leaf_hash_count`).
+hash-count = ["std"]
 
 [dependencies]
 serde.workspace = true

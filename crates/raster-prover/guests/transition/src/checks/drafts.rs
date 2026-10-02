@@ -1,21 +1,22 @@
-//! Checks that a tile step's draft transition chains correctly: the replay
-//! journal's pre-state is authenticated by the draft witness, ops re-apply to
-//! the derived post-root, and roots stay continuous within a tracked chain.
-
-use std::collections::BTreeMap;
+//! Checks a tile step's draft transition on its own: the replay journal's
+//! pre-state is authenticated by the draft witness, and the ops re-apply to a
+//! derived post-root. Which object the transition belongs to — and that it
+//! continues that object's root — is the site frame's business
+//! (`RecurProgressStack::advance_draft`, called from `checks::cfs`), so this
+//! returns the step for the frame to chain rather than tracking drafts itself.
 
 use raster_core::draft::{
     apply_draft_ops, schema_hash as compute_schema_hash, verify_witness_root,
-    DraftReplayTransition, DraftTransitionWitness, TileReplayJournal, TrackedDraftState,
+    DraftReplayTransition, DraftTransitionWitness, TileReplayJournal,
 };
+use raster_core::recur_progress::DraftStep;
 use raster_core::trace::StepRecord;
 
 pub fn verify_draft_transition(
     step_record: &StepRecord,
     replay_journal: Option<&TileReplayJournal>,
     draft_transition_witness: Option<&DraftTransitionWitness>,
-    active_drafts: &mut BTreeMap<[u8; 32], TrackedDraftState>,
-) {
+) -> Option<DraftStep> {
     if !step_record.requires_replay_proof() {
         assert!(
             replay_journal.is_none(),
@@ -25,14 +26,13 @@ pub fn verify_draft_transition(
             draft_transition_witness.is_none(),
             "Only tile steps may carry draft transition witnesses",
         );
-        return;
+        return None;
     }
 
     let Some(replay_journal) = replay_journal else {
         panic!("TileExec replay journal is missing");
     };
     let Some(DraftReplayTransition {
-        draft_id,
         schema_hash,
         root_before,
         ops,
@@ -42,7 +42,7 @@ pub fn verify_draft_transition(
             draft_transition_witness.is_none(),
             "TileExec without replay-emitted draft transition must not carry draft witnesses",
         );
-        return;
+        return None;
     };
 
     let witness = draft_transition_witness
@@ -66,25 +66,13 @@ pub fn verify_draft_transition(
         );
     }
 
-    if let Some(tracked_state) = active_drafts.get(draft_id) {
-        assert_eq!(
-            tracked_state.schema_hash, *schema_hash,
-            "Tracked draft schema hash changed within a draft chain",
-        );
-        assert_eq!(
-            tracked_state.root, *root_before,
-            "Replay journal root_before does not match tracked draft root",
-        );
-    }
-
     let (_, root_after) = apply_draft_ops(&witness.pre_state, ops)
         .expect("Draft replay ops must apply to authenticated pre-state witness");
 
-    active_drafts.insert(
-        *draft_id,
-        TrackedDraftState {
-            schema_hash: *schema_hash,
-            root: root_after,
-        },
-    );
+    Some(DraftStep {
+        schema_hash: *schema_hash,
+        root_before: *root_before,
+        root_after,
+        sets: ops.iter().any(|op| matches!(op, raster_core::draft::DraftOp::Set { .. })),
+    })
 }
