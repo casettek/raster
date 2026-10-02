@@ -1029,7 +1029,7 @@ mod tests {
     use crate::input::{encode_raster_value, tree_value_from_serialize};
     use crate::raster_encode::tests::assert_same_object;
     use raster_core::collections::List;
-    use raster_core::input::{SchemaField, Selectable};
+    use raster_core::input::{SchemaField, Selectable, SelectorPath, SelectorSegment};
     use serde::Serialize;
 
     #[derive(Serialize, Clone)]
@@ -1308,5 +1308,147 @@ mod tests {
             frontier.push(subtree_payload_and_root(&tree(&value)).unwrap().1);
             assert_eq!(witness_frontier(&buffer), frontier);
         }
+    }
+
+    // ---- Growth sweeps and export ----
+
+    #[derive(Serialize)]
+    struct Lines {
+        lines: List<String>,
+    }
+
+    fn lines_schema() -> SchemaNode {
+        SchemaNode::Struct {
+            type_name: "Lines".into(),
+            fields: vec![SchemaField::new(
+                "lines",
+                "lines",
+                <List<String> as Selectable>::schema(),
+            )],
+        }
+    }
+
+    /// Every length from 0 to 1024: the sealed object is the value encoded
+    /// whole — payload, root, and the selections a sweep relies on (first,
+    /// last, the whole list, a range across the middle).
+    #[test]
+    fn sealing_matches_whole_encoding_at_every_length_to_1024() {
+        let mut buffer = DraftBuffer::new(lines_schema(), true).unwrap();
+        let mut values = Vec::new();
+        for n in 0..=1024usize {
+            let sealed = buffer.clone().seal(true).unwrap();
+            let (payload, index_bytes, _) =
+                encode_raster_value(&Lines { lines: List::from(values.clone()) }).unwrap();
+            let index = RasterIndex::from_bytes(&index_bytes).unwrap();
+            assert_eq!(sealed.payload, payload, "payload at {n}");
+            assert_eq!(sealed.root, index.root_commitment, "root at {n}");
+            let mut paths = vec![vec![SelectorSegment::Field("lines".into())]];
+            if n > 0 {
+                for segment in [
+                    SelectorSegment::Index(0),
+                    SelectorSegment::Index(n as u64 - 1),
+                    SelectorSegment::Range { start: n as u64 / 3, end: n as u64 },
+                ] {
+                    paths.push(vec![SelectorSegment::Field("lines".into()), segment]);
+                }
+            }
+            for path in paths {
+                let path = SelectorPath::new(path);
+                let new = sealed.index.select(&path).unwrap();
+                let old = index.select(&path).unwrap();
+                assert_eq!(
+                    (new.offset, new.len, new.root_hash, new.steps),
+                    (old.offset, old.len, old.root_hash, old.steps),
+                    "{path:?} at {n}"
+                );
+            }
+            let value = format!("line {n}");
+            buffer.push("lines", tree(&value)).unwrap();
+            values.push(value);
+        }
+    }
+
+    /// Every length from 0 to 1024: the frontier read from a stored list's
+    /// Merkle levels is the frontier pushing builds — the duplicate-last
+    /// padding included. A deriving site starts from the first.
+    #[test]
+    fn the_frontier_from_stored_levels_matches_pushing_at_every_length_to_1024() {
+        let mut values = Vec::new();
+        let mut frontier = AppendFrontier::empty();
+        for n in 0..=1024usize {
+            let (_, index_bytes, _) =
+                encode_raster_value(&Lines { lines: List::from(values.clone()) }).unwrap();
+            let index = Arc::new(RasterIndex::from_bytes(&index_bytes).unwrap());
+            let RasterNodeKind::Struct { fields } = &index.get_node(index.root_node).unwrap().kind
+            else {
+                unreachable!()
+            };
+            let list = fields[0].child;
+            let continued = AppendBuffer::continuing(BaseList {
+                index: index.clone(),
+                node: list,
+                len: n as u64,
+                body_len: index.get_node(list).unwrap().len - 9,
+            })
+            .unwrap();
+            assert_eq!(continued.frontier(), frontier, "length {n}");
+            let value = format!("line {n}");
+            frontier.push(subtree_payload_and_root(&tree(&value)).unwrap().1);
+            values.push(value);
+        }
+    }
+
+    /// A derived object exported — its pieces concatenated, its layered index
+    /// flattened — is a standalone artifact the reader decodes, whose payload
+    /// root is the index's.
+    #[test]
+    fn an_exported_derived_object_round_trips_through_the_reader() {
+        let first = derive_and_check(stored(&report(3, 2)), (3, 2), (5, 1));
+        let second = derive_and_check(as_base(&first), (8, 3), (2, 4));
+        let data = second.pieces.read_subtree(0, second.pieces.len).unwrap();
+        let index_bytes = second.index.encode().unwrap();
+        let artifact = crate::reader::read_raster_artifact_from_bytes(
+            &data,
+            &index_bytes,
+            &crate::reader::ReadLimits::unbounded(),
+        )
+        .unwrap();
+        assert!(artifact.roots_agree());
+        let expected = encode_raster_value(&report(10, 7)).unwrap();
+        let reference = crate::reader::read_raster_artifact_from_bytes(
+            &expected.0,
+            &expected.1,
+            &crate::reader::ReadLimits::unbounded(),
+        )
+        .unwrap();
+        assert_eq!(format!("{:?}", artifact.value), format!("{:?}", reference.value));
+        assert_eq!(artifact.index_root, reference.index_root);
+    }
+
+    /// The recorder rebuilds a derived object from its own base and refuses a
+    /// delta that does not hold together: a root that does not fold from the
+    /// fields, a base of another size, a tail shorter than its pieces.
+    #[test]
+    fn a_tampered_delta_is_refused_by_the_rebuild() {
+        let base = stored(&report(4, 2));
+        let mut buffer = DraftBuffer::derive(report_schema(), base.clone()).unwrap();
+        buffer.push("lines", tree(&String::from("line 4"))).unwrap();
+        let (_, payload) = buffer.seal_derived().unwrap();
+        let rebuild = |payload: &DerivedPayload| {
+            derived_object(&base.index, &base.bytes, payload, overlay_nodes(payload).unwrap())
+        };
+        assert!(rebuild(&payload).is_ok());
+
+        let mut root = payload.clone();
+        root.root_hash = [7u8; 32];
+        assert!(rebuild(&root).is_err());
+
+        let mut size = payload.clone();
+        size.base_node_count += 1;
+        assert!(rebuild(&size).is_err());
+
+        let mut tail = payload.clone();
+        tail.tail.truncate(tail.tail.len() - 1);
+        assert!(rebuild(&tail).is_err());
     }
 }

@@ -1,7 +1,7 @@
 # Proposal: `tile-io-structural-roots` — bind what a tile reads and writes to its replay
 
-Status: proposed 2026-09-28; steps 0 and 1 done 2026-09-30; step 2 done 2026-10-01 (with
-`incremental-draft-materialization` batch C). Closes
+Status: **implemented 2026-10-01** — steps 0 and 1 done 2026-09-30; step 2 with
+`incremental-draft-materialization` batch C, step 3 with its batch E (without GPU proving). Closes
 [`tile-output-commitment-unbound`](../issues/tile-output-commitment-unbound.md) and
 [`selection-unbound-from-execution`](../issues/selection-unbound-from-execution.md) in one tile
 image-id break.
@@ -239,6 +239,15 @@ Invert both issues' probes (a forged output commitment; the re-read sweep), repl
 host-side as for `program-output-unbound`, run the proving tests (GPU), and regenerate the locks
 with `cargo raster build --backend risc0` (the tile cache key now tracks raster sources).
 
+**Done 2026-10-01, without GPU.** `tile-output-commitment-unbound`'s probe is inverted
+(`a_tile_write_unrelated_to_its_replayed_output_is_rejected`, beside its honest twin and the
+no-output case); the re-read sweep was inverted in step 1. Real traces were replayed through the
+transition guest in dev mode — `hello-tiles` steps 33–81 and `phase1-normalize` steps 2–13 — which
+found a false rejection: a tile consuming a fallible call's `Ok(v)` after `?` ran on `v` while its
+selection proves `Ok(v)`; the input check now also accepts the inner value's root of an `Ok`
+payload. All locks were rebuilt with the workspace CLI. Not done: proving on GPU, and
+`raster-inference`.
+
 ## Order
 
 Steps 0 and 1 are done. The rest, and `incremental-draft-materialization`:
@@ -253,7 +262,7 @@ this proposal. Batches are grouped by what they break: a *trace-shape* break re-
 | **B — language and object ownership** | §One storage rule and §The restriction: `new!`/`finalize`/`finalize = false` removed, a site owns its object at `[s]` (creates, or derives with `output = base`), plain tiles return values, `DRAFT_NAMESPACE` deleted, host anchor `anchor_for_schema([s], S)`; D1b (`RecurOutputDecl` in the CFS via `schema_walk`); programs rewritten (`examples/`, `crates/raster/tests`, `raster-inference`) | CFS, programs, `program_commitment` |
 | **C — tile journal** (one tile-image-id break) (**done 2026-10-01**) | D3 (recur iterations publish no output; an `Exec` with no write has an empty `output_commitment`); D2 (`draft_id` removed); D1a (replay tile asserts its schema); D5b (replayed state as raster roots, recur-sequence state by reference); **this proposal's step 2** (`output_root`, `input_roots`); guest: the frame's draft entry replaces `active_drafts`, `RecurEnd` writes exactly one object | every tile image id, `program_commitment` |
 | **D — materialization** (**done 2026-10-01**) | `DraftBuffer`, one seal for store and `RecurEnd` output, `rindex04` relative offsets, derivation sharing (`Derived` backing, delta output) | `.rindex` format; no guest or tile change |
-| **E — verification** | both proposals' Verification lists; this proposal's step 3; GPU proving; all locks, `raster-inference` included | — |
+| **E — verification** (**done 2026-10-01, without GPU**) | both proposals' Verification lists; this proposal's step 3; GPU proving; all locks, `raster-inference` included | — |
 
 What implementing the draft proposal in full changes here:
 

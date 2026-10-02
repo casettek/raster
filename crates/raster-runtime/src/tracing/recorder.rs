@@ -2268,6 +2268,85 @@ mod tests {
         // The close of iteration 0, not the open again.
         assert_row(&iter_end, "SequenceEnd", &[1, closing_coordinate(1)]);
     }
+
+    /// A recorder whose recur site owns an object: a creating site of a
+    /// one-field struct, so its empty root is known.
+    fn recorder_with_object_site() -> (TraceRecorder, raster_core::cfs::RecurOutputDecl) {
+        let schema = raster_core::input::SchemaNode::Struct {
+            type_name: "Lines".into(),
+            fields: vec![raster_core::input::SchemaField::new(
+                "lines",
+                "lines",
+                <raster_core::collections::List<String> as raster_core::input::Selectable>::schema(),
+            )],
+        };
+        let decl = raster_core::cfs::RecurOutputDecl {
+            schema_hash: raster_core::draft::schema_hash(&schema),
+            empty_root: raster_core::draft::draft_root_from_field_roots(
+                &schema,
+                &std::collections::BTreeMap::new(),
+            )
+            .unwrap(),
+            derives: false,
+        };
+        let recorder = TraceRecorder::new(ControlFlowSchema {
+            version: "1.0".to_string(),
+            project: "test".to_string(),
+            encoding: "postcard".to_string(),
+            tiles: vec![TileDef::iter("recur", 0, 0)],
+            sequences: vec![SequenceDef {
+                id: "main".to_string(),
+                input_sources: vec![],
+                items: vec![SequenceChildItem::RecurTile(RecurTileItem {
+                    id: "recur".to_string(),
+                    sources: vec![],
+                    chunk: None,
+                    output: Some(decl.clone()),
+                    state_is_output: false,
+                    carries_state: false,
+                })],
+                entry_arguments: vec![],
+                produces_output: false,
+                returns: None,
+            }],
+        });
+        (recorder, decl)
+    }
+
+    /// The close check runs at record time: a site that writes an object other
+    /// than the one its steps built panics in the recorder, before anything
+    /// is committed — not only in the guest.
+    #[test]
+    #[should_panic(expected = "recur site wrote object")]
+    fn a_close_writing_another_object_panics_at_record_time() {
+        let (mut recorder, _) = recorder_with_object_site();
+        start_main(&mut recorder);
+        let start = seed_recur_source(&mut recorder, "recur", 0);
+        recorder.record(TraceEvent::RecurTileStart(start));
+        // Zero iterations: the object must be the empty one; this is not.
+        recorder.record(TraceEvent::RecurTileEnd(site_end("recur")));
+    }
+
+    /// A sweep of N iterations is one authenticated append: the iterations
+    /// write nothing (D3), the close writes the site's object.
+    #[test]
+    fn a_sweep_of_n_iterations_appends_once() {
+        let mut recorder = recorder_with_recur_site();
+        start_main(&mut recorder);
+        let start = seed_recur_source(&mut recorder, "recur", 5);
+        recorder.record(TraceEvent::RecurTileStart(start));
+        let before = recorder.storage.snapshot().frontier.position;
+        for _ in 0..5 {
+            let iteration = recorder.record(TraceEvent::RecurTileIterationExec(recur_call(
+                "recur",
+                raster_core::draft::RecurControlKind::Continue,
+            )));
+            assert!(iteration.output_commitment().unwrap().is_empty());
+        }
+        assert_eq!(recorder.storage.snapshot().frontier.position, before);
+        recorder.record(TraceEvent::RecurTileEnd(site_end("recur")));
+        assert_eq!(recorder.storage.snapshot().frontier.position, before + 1);
+    }
 }
 
 /// Which list a recur site sweeps, as the guest will re-derive it: the site

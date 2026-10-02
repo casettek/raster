@@ -4831,3 +4831,450 @@ fn a_recur_site_cannot_be_entered_or_left_around_its_boundary_steps() {
         vec![CfsCoordinates(vec![2, 1]), CfsCoordinates(vec![-2])]
     );
 }
+
+// ---------------------------------------------------------------------------
+// Batch E: the tile's write and reads are its replay's
+// (`tile-io-structural-roots` step 2/3, `tile-output-commitment-unbound`,
+// `selection-unbound-from-execution` §2b)
+// ---------------------------------------------------------------------------
+
+fn journal_with(output_root: Option<Hash32>, input_roots: Vec<Option<Hash32>>) -> TileReplayJournal {
+    TileReplayJournal {
+        input_commitment: [0u8; 32],
+        output_bytes: Vec::new(),
+        output_root,
+        input_roots,
+        draft_transition: None,
+        recur: None,
+    }
+}
+
+fn tile_with_commitment(commitment: Vec<u8>) -> StepRecord {
+    tile_step_with_store_roots(
+        1,
+        CfsCoordinates(vec![1]),
+        Vec::new(),
+        commitment,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    )
+}
+
+/// `tile-output-commitment-unbound`'s probe, inverted: a write whose
+/// commitment is unrelated to the replayed output was accepted; it is now
+/// refused against the replay's `output_root`.
+#[test]
+#[should_panic(expected = "is not the root of the value its replay returned")]
+fn a_tile_write_unrelated_to_its_replayed_output_is_rejected() {
+    let replayed = raster_core::tree::value_root(&String::from("out")).unwrap();
+    crate::checks::io::verify_output_root(
+        &tile_with_commitment(sha(b"an object the tile never produced")),
+        &journal_with(Some(replayed), Vec::new()),
+    );
+}
+
+#[test]
+fn a_tile_write_of_its_replayed_output_is_accepted() {
+    let replayed = raster_core::tree::value_root(&String::from("out")).unwrap();
+    crate::checks::io::verify_output_root(
+        &tile_with_commitment(replayed.to_vec()),
+        &journal_with(Some(replayed), Vec::new()),
+    );
+}
+
+/// A recur iteration returning its site's draft or state writes nothing
+/// (D3); its record may not claim a commitment.
+#[test]
+#[should_panic(expected = "returned no output must record no output commitment")]
+fn a_tile_that_returned_nothing_may_not_claim_a_commitment() {
+    crate::checks::io::verify_output_root(
+        &tile_with_commitment(sha(b"free bytes")),
+        &journal_with(None, Vec::new()),
+    );
+}
+
+/// The store half: a writing step kind that wrote nothing records no
+/// commitment.
+#[test]
+#[should_panic(expected = "wrote nothing, so it must record no output commitment")]
+fn a_step_that_wrote_nothing_may_not_record_a_commitment() {
+    let (mut frontier, root, _index, index_root) = build_storage_context(&[]);
+    let step = tile_step_with_store_roots(
+        1,
+        CfsCoordinates(vec![1]),
+        Vec::new(),
+        sha(b"a write that never happened"),
+        root.clone(),
+        root,
+        index_root.clone(),
+        index_root.clone(),
+    );
+    let _ = verify_storage_transition(
+        &step,
+        None,
+        &BTreeMap::new(),
+        None,
+        None,
+        &mut frontier,
+        &index_root,
+    );
+}
+
+/// §2b: the value a tile ran on is the value its selection proves.
+#[test]
+fn a_tile_reading_its_selected_value_is_accepted() {
+    let (input, root, with_payload, _) = selecting_input_witness("arg", CfsCoordinates(vec![1]));
+    let witnesses = [("arg".to_string(), with_payload)].into_iter().collect();
+    crate::checks::io::verify_input_roots(
+        &tile_with_commitment(Vec::new()),
+        &journal_with(None, vec![Some(root.try_into().unwrap())]),
+        Some(&input),
+        &witnesses,
+    );
+}
+
+#[test]
+#[should_panic(expected = "is not the value its selection proves")]
+fn a_tile_that_ran_on_other_bytes_than_its_selection_is_rejected() {
+    let (input, _root, with_payload, _) = selecting_input_witness("arg", CfsCoordinates(vec![1]));
+    let witnesses = [("arg".to_string(), with_payload)].into_iter().collect();
+    crate::checks::io::verify_input_roots(
+        &tile_with_commitment(Vec::new()),
+        &journal_with(None, vec![Some([9u8; 32])]),
+        Some(&input),
+        &witnesses,
+    );
+}
+
+#[test]
+#[should_panic(expected = "replayed 0 arguments but records 1")]
+fn a_tile_replaying_another_arity_is_rejected() {
+    let (input, _root, with_payload, _) = selecting_input_witness("arg", CfsCoordinates(vec![1]));
+    let witnesses = [("arg".to_string(), with_payload)].into_iter().collect();
+    crate::checks::io::verify_input_roots(
+        &tile_with_commitment(Vec::new()),
+        &journal_with(None, Vec::new()),
+        Some(&input),
+        &witnesses,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Batch E: recur-sequence state by reference (D5b)
+// ---------------------------------------------------------------------------
+
+/// `main = [ body ]`, `body` a state-only recur sequence whose one item, the
+/// tile `advance`, returns its state.
+fn stateful_sequence_cfs() -> CfsCursor {
+    CfsCursor::new(ControlFlowSchema {
+        version: "1.0".into(),
+        project: "test".into(),
+        encoding: "postcard".into(),
+        tiles: vec![TileDef::iter("advance", 1, 1)],
+        sequences: vec![
+            SequenceDef {
+                id: "main".into(),
+                input_sources: vec![],
+                items: vec![SequenceChildItem::RecurSequence(RecurSequenceItem {
+                    id: "body".into(),
+                    sources: vec![InputBinding::storage(), InputBinding::storage()],
+                    state_is_output: true,
+                    carries_state: true,
+                    output: None,
+                })],
+                entry_arguments: Vec::new(),
+                produces_output: false,
+                returns: None,
+            },
+            SequenceDef {
+                id: "body".into(),
+                input_sources: vec![],
+                items: vec![SequenceChildItem::Tile(TileItem {
+                    id: "advance".into(),
+                    sources: vec![InputBinding::seq_input(1)],
+                })],
+                entry_arguments: Vec::new(),
+                produces_output: false,
+                returns: Some(raster_core::cfs::SequenceReturn {
+                    source: InputBinding::prior_item_output(0),
+                    path: Vec::new(),
+                }),
+            },
+        ],
+    })
+}
+
+fn iteration_end(state_in: Hash32, state_out: Hash32) -> StepRecord {
+    StepRecord {
+        exec_index: 5,
+        sequence_id: "body".into(),
+        coordinates: CfsCoordinates(vec![1, raster_core::cfs::closing_coordinate(1)]),
+        kind: StepKind::SequenceEnd {
+            output_commitment: Vec::new(),
+        },
+        recur_progress_commitment: RecurProgressStack::new().commitment(),
+        recur_state: Some(transition(state_in, state_out)),
+    }
+}
+
+fn returned(coordinates: Vec<CfsCoordinate>, commitment: Hash32) -> StorageData {
+    StorageData {
+        coordinates: CfsCoordinates(coordinates),
+        commitment: commitment.to_vec(),
+        selector: Default::default(),
+        selection: Default::default(),
+    }
+}
+
+/// Run the iteration `End`'s returned-state check against a store holding
+/// `stored` (what `advance` wrote).
+fn check_returned_state(
+    step: &StepRecord,
+    claimed: StorageData,
+    stored: StorageData,
+    with_read: bool,
+) {
+    let entry = StorageEntry {
+        coordinates: stored.coordinates.clone(),
+        object_commitment: stored.commitment.clone(),
+    };
+    let entries = vec![entry.clone()];
+    let (_frontier, root, _index, index_root) = build_storage_context(&entries);
+    let read = build_read_witness(
+        &entries,
+        &StorageEntry {
+            coordinates: claimed.coordinates.clone(),
+            object_commitment: claimed.commitment.clone(),
+        },
+    );
+    let output = raster_core::postcard::to_allocvec(&Some(claimed)).unwrap();
+    let transition = step.recur_state.unwrap();
+    crate::checks::cfs::verify_returned_state(
+        &stateful_sequence_cfs(),
+        step,
+        "body",
+        &transition,
+        Some(&output),
+        with_read.then_some(&read),
+        &root,
+        &index_root,
+    );
+}
+
+#[test]
+fn an_iteration_returning_its_body_tiles_state_is_accepted() {
+    let state = [6u8; 32];
+    check_returned_state(
+        &iteration_end([1u8; 32], state),
+        returned(vec![1, 1, 1], state),
+        returned(vec![1, 1, 1], state),
+        true,
+    );
+}
+
+/// An object the body wrote somewhere else, or did not write as its return.
+#[test]
+#[should_panic(expected = "returned a state its body did not produce")]
+fn an_iteration_returning_another_object_is_rejected() {
+    let state = [6u8; 32];
+    check_returned_state(
+        &iteration_end([1u8; 32], state),
+        returned(vec![1, 1, 2], state),
+        returned(vec![1, 1, 2], state),
+        true,
+    );
+}
+
+/// `{6}` proven, `{7}` claimed: the chain's `state_out` must be the object
+/// the body returned.
+#[test]
+#[should_panic(expected = "claims a state_out that is not its returned object")]
+fn an_iteration_claiming_another_state_out_is_rejected() {
+    let state = [6u8; 32];
+    check_returned_state(
+        &iteration_end([1u8; 32], [7u8; 32]),
+        returned(vec![1, 1, 1], state),
+        returned(vec![1, 1, 1], state),
+        true,
+    );
+}
+
+/// The returned object is read against the current storage state: a claim
+/// no store holds has no read witness to verify.
+#[test]
+#[should_panic(expected = "missing the read witness of its returned state")]
+fn an_iteration_without_a_read_of_its_returned_state_is_rejected() {
+    let state = [6u8; 32];
+    check_returned_state(
+        &iteration_end([1u8; 32], state),
+        returned(vec![1, 1, 1], state),
+        returned(vec![1, 1, 1], state),
+        false,
+    );
+}
+
+fn iteration_start_with_state(value: FnInputValue, commitment: Hash32) -> (StepRecord, FnInput) {
+    let step = StepRecord {
+        exec_index: 3,
+        sequence_id: "body".into(),
+        coordinates: CfsCoordinates(vec![1, 2]),
+        kind: StepKind::SequenceStart {
+            input_commitment: Vec::new(),
+            input_source_commitment: Vec::new(),
+        },
+        recur_progress_commitment: RecurProgressStack::new().commitment(),
+        recur_state: None,
+    };
+    let input = FnInput {
+        data: Vec::new(),
+        values: vec![FnInputValue::StorageBinding, value],
+        args: vec![
+            FnInputArg {
+                name: "input".into(),
+                ty: "RecurSequenceInput<String>".into(),
+            },
+            FnInputArg {
+                name: "state".into(),
+                ty: "RecurSequenceState<Cursor>".into(),
+            },
+        ],
+        storage: [("state".to_string(), returned(vec![1, 1, 1], commitment))]
+            .into_iter()
+            .collect(),
+    };
+    (step, input)
+}
+
+fn chain_at(commitment: Hash32) -> RecurProgressStack {
+    let mut stack = RecurProgressStack::new();
+    stack.push_site(CfsCoordinates(vec![1]), RecurSiteKind::Sequence, 1, 3, true, [0u8; 32]);
+    stack.seed_state(commitment);
+    stack
+}
+
+#[test]
+fn an_iteration_reading_the_chains_state_is_accepted() {
+    let (step, input) = iteration_start_with_state(FnInputValue::StorageBinding, [5u8; 32]);
+    crate::checks::cfs::check_iteration_state_binding(&step, &chain_at([5u8; 32]), Some(&input));
+}
+
+#[test]
+#[should_panic(expected = "reads a state that is not the one its sweep reached")]
+fn an_iteration_reading_another_state_is_rejected() {
+    let (step, input) = iteration_start_with_state(FnInputValue::StorageBinding, [4u8; 32]);
+    crate::checks::cfs::check_iteration_state_binding(&step, &chain_at([5u8; 32]), Some(&input));
+}
+
+#[test]
+#[should_panic(expected = "carries its state inline after the chain started")]
+fn an_iteration_carrying_state_inline_after_the_chain_started_is_rejected() {
+    let (step, input) = iteration_start_with_state(FnInputValue::Inline(vec![1, 2]), [5u8; 32]);
+    crate::checks::cfs::check_iteration_state_binding(&step, &chain_at([5u8; 32]), Some(&input));
+}
+
+/// A sequence-scope witness must be the frame's `SequenceStart`. A
+/// `RecurStart` at the same coordinates — in the trace, carrying the same
+/// arguments — is refused: a site's inputs bind its iterations through the
+/// iteration `Start`s, never directly.
+#[test]
+#[should_panic(expected = "no SequenceStart witness for frame")]
+fn a_sequence_scope_witness_naming_a_recur_start_is_rejected() {
+    let cfs_cursor = scope_binding_cfs();
+    let (step_record, _step_source, parent_record, parent_args) =
+        scope_binding_scenario(CfsCoordinates(vec![10, 10]), sha(b"the-caller-passed-this"));
+    let StepKind::SequenceStart {
+        input_source_commitment,
+        ..
+    } = parent_record.kind.clone()
+    else {
+        unreachable!()
+    };
+    let recur_start = StepRecord {
+        kind: StepKind::RecurStart(raster_core::trace::RecurStartStep {
+            site_id: "sub".into(),
+            input_commitment: Vec::new(),
+            input_source_commitment,
+            storage: StorageRoots {
+                root_before: Vec::new(),
+                root_after: Vec::new(),
+                index_root_before: Vec::new(),
+                index_root_after: Vec::new(),
+            },
+        }),
+        ..parent_record
+    };
+    let (trace_root, witness) = trace_root_and_witness(&[recur_start.clone()], 0);
+    let mut witnesses = HashMap::new();
+    witnesses.insert(
+        (step_record.exec_index, recur_start),
+        postcard::to_allocvec(&witness).expect("witness serializes"),
+    );
+    verify_sequence_scope_parent(
+        &cfs_cursor,
+        &step_record,
+        Some(&parent_args),
+        &witnesses,
+        &trace_root,
+    );
+}
+
+/// A site's close names its enclosing sequence, like every non-boundary
+/// step; naming the site itself is refused.
+#[test]
+#[should_panic(expected = "but its kind and coordinates determine")]
+fn a_recur_end_naming_the_site_as_its_sequence_is_rejected() {
+    verify_sequence_id(
+        &recur_frames_cfs(),
+        &step_with_sequence_id(recur_end_kind("recur"), vec![-1], "recur"),
+    );
+}
+
+/// A fallible call's stored `Ok(v)`, consumed with `?`: the selection proves
+/// the `Result`, the next tile ran on `v`. Found by the batch-E window over
+/// `hello-tiles`' `concat_messages` at `[3,3]`.
+fn fallible_input(stored: &core::result::Result<String, String>) -> (FnInput, BTreeMap<String, SelectionWitness>) {
+    let (input, _root, mut with_payload, _) = selecting_input_witness("arg", CfsCoordinates(vec![1]));
+    let tree = raster_core::tree::tree_value_from_serialize(stored).unwrap();
+    with_payload.bytes = raster_core::tree::subtree_payload_and_root(&tree).unwrap().0;
+    (input, [("arg".to_string(), with_payload)].into_iter().collect())
+}
+
+#[test]
+fn a_tile_reading_the_value_inside_an_ok_is_accepted() {
+    let (input, witnesses) = fallible_input(&Ok("John".into()));
+    let value = raster_core::tree::value_root(&String::from("John")).unwrap();
+    crate::checks::io::verify_input_roots(
+        &tile_with_commitment(Vec::new()),
+        &journal_with(None, vec![Some(value)]),
+        Some(&input),
+        &witnesses,
+    );
+}
+
+#[test]
+#[should_panic(expected = "is not the value its selection proves")]
+fn a_tile_reading_another_value_than_the_ok_holds_is_rejected() {
+    let (input, witnesses) = fallible_input(&Ok("John".into()));
+    let value = raster_core::tree::value_root(&String::from("Jane")).unwrap();
+    crate::checks::io::verify_input_roots(
+        &tile_with_commitment(Vec::new()),
+        &journal_with(None, vec![Some(value)]),
+        Some(&input),
+        &witnesses,
+    );
+}
+
+#[test]
+#[should_panic(expected = "is not the value its selection proves")]
+fn a_tile_reading_the_value_inside_an_err_is_rejected() {
+    let (input, witnesses) = fallible_input(&Err("John".into()));
+    let value = raster_core::tree::value_root(&String::from("John")).unwrap();
+    crate::checks::io::verify_input_roots(
+        &tile_with_commitment(Vec::new()),
+        &journal_with(None, vec![Some(value)]),
+        Some(&input),
+        &witnesses,
+    );
+}

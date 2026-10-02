@@ -1428,3 +1428,20 @@ fn a_stateful_recur_sequence_passes_its_state_by_reference() {
         }
     }
 }
+
+/// D1a: the replay tile binds its draft's schema. A handle naming another
+/// schema is refused in the replay itself, so no journal can carry a
+/// host-chosen `schema_hash`.
+#[test]
+#[should_panic(expected = "Draft handle names schema")]
+fn a_replayed_draft_handle_naming_another_schema_is_refused() {
+    let input = raster::core::postcard::to_allocvec(&(
+        RecurInput::new(String::from("line"), 0u64, 1u64),
+        DraftReplayHandle {
+            schema_hash: [9u8; 32],
+            root_before: [0u8; 32],
+        },
+    ))
+    .unwrap();
+    let _ = __raster_tile_replay_entry_append_only(&input);
+}

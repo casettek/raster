@@ -723,7 +723,7 @@ pub fn assemble_subtree(
             payload.push(0x00);
             push_u64(&mut payload, leaf_bytes.len() as u64);
             payload.extend_from_slice(&leaf_bytes);
-            let root = selection_hash(&[b"leaf", leaf_bytes.as_slice()]);
+            let root = leaf_root(leaf_bytes.as_slice());
             (payload, root)
         }
     };
@@ -1479,4 +1479,26 @@ pub fn typed_value_from_tree<T: DeserializeOwned>(value: &TreeValue) -> CoreResu
             e
         ))
     })
+}
+
+/// A leaf's root — every element hash of a list of scalars is one of these.
+/// Counted per thread under the `hash-count` feature, so tests can assert an
+/// element is hashed exactly once from a draft's push to its site's close
+/// (`incremental-draft-materialization` §Verification).
+#[inline(always)]
+fn leaf_root(leaf_bytes: &[u8]) -> Hash32 {
+    #[cfg(feature = "hash-count")]
+    LEAF_HASHES.with(|count| count.set(count.get() + 1));
+    selection_hash(&[b"leaf", leaf_bytes])
+}
+
+#[cfg(feature = "hash-count")]
+std::thread_local! {
+    static LEAF_HASHES: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+}
+
+/// Leaf hashes computed on this thread so far (`hash-count` feature).
+#[cfg(feature = "hash-count")]
+pub fn leaf_hash_count() -> u64 {
+    LEAF_HASHES.with(|count| count.get())
 }

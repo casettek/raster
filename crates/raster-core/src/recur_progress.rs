@@ -1751,4 +1751,79 @@ mod tests {
         step.sets = false;
         assert!(stack.advance_draft(&at_iteration(1), Some(&step), true).is_ok());
     }
+
+    // ---- Window-open attacks on the frame's draft entry ----
+
+    /// A window opening mid-sweep is validated by reproducing its first
+    /// step's recorded commitment from the seed. A seed whose draft root is
+    /// not the honest one, or which omits the entry, commits differently, so
+    /// it cannot reproduce it.
+    #[test]
+    fn a_seed_forging_or_omitting_the_draft_entry_commits_differently() {
+        let honest = draft_site(3);
+        let mut forged = draft_site(3);
+        forged.0.last_mut().unwrap().draft.as_mut().unwrap().root = [9u8; 32];
+        let mut omitted = draft_site(3);
+        omitted.0.last_mut().unwrap().draft = None;
+        assert_ne!(honest.commitment(), forged.commitment());
+        assert_ne!(honest.commitment(), omitted.commitment());
+    }
+
+    /// A window opening at the close with a seed whose root is one the sweep
+    /// legitimately reached — but not the one it ended on — cannot close on
+    /// the object the sweep wrote (the spliced chain of
+    /// `carried-state-channel` §Verification).
+    #[test]
+    fn a_spliced_seed_cannot_close_on_the_written_object() {
+        let mut honest = draft_site(0);
+        honest
+            .advance_draft(&at_iteration(1), Some(&draft_step(1, 2)), true)
+            .unwrap();
+        let mut spliced = honest.clone();
+        honest
+            .advance_draft(&at_iteration(2), Some(&draft_step(2, 3)), true)
+            .unwrap();
+        // `spliced` stands at root 2, a root the sweep produced, while the
+        // sweep ended at 3 and wrote 3.
+        assert_eq!(
+            spliced.close_site(&site(), &[3u8; 32]).unwrap_err(),
+            RecurProgressViolation::DraftOutputMismatch {
+                expected: [2u8; 32],
+                actual: [3u8; 32],
+            },
+        );
+        assert!(honest.close_site(&site(), &[3u8; 32]).is_ok());
+    }
+
+    /// `{6}` proven, `{7}` stored: a state-only recur **tile** site's stored
+    /// result must be the chain's final state (D5b) — the sequence case is in
+    /// the transition guest's tests.
+    #[test]
+    fn a_state_only_tile_site_must_store_its_final_state() {
+        let six = [6u8; 32];
+        let seven = [7u8; 32];
+        let mut stack = RecurProgressStack::new();
+        stack.push_site(site(), RecurSiteKind::Tile, 1, 1, true, [0u8; 32]);
+        stack
+            .advance_tile_iteration(
+                &iteration(0),
+                0,
+                1,
+                1,
+                RecurControlKind::Continue,
+                Some(&RecurStateTransition {
+                    state_in: [1u8; 32],
+                    state_out: six,
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            stack.clone().close_site(&site(), &seven).unwrap_err(),
+            RecurProgressViolation::TerminalStateMismatch {
+                expected: six,
+                actual: seven,
+            },
+        );
+        assert!(stack.close_site(&site(), &six).is_ok());
+    }
 }

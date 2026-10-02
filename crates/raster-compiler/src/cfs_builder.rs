@@ -141,7 +141,7 @@ impl<'a> CfsBuilder<'a> {
 
         if seq.function.name == "main" && !seq.function.input_names.is_empty() {
             let items = resolver.resolve_with_entry_arguments(seq, &seq.function.input_names);
-            let returns = sequence_returns(&resolver, seq, items.len());
+            let returns = sequence_returns(&resolver, seq, items.len())?;
 
             return Ok(SequenceDef {
                 id: seq.function.name.clone(),
@@ -162,7 +162,7 @@ impl<'a> CfsBuilder<'a> {
 
         // Resolve data flow for the sequence items
         let items = resolver.resolve(seq);
-        let returns = sequence_returns(&resolver, seq, items.len());
+        let returns = sequence_returns(&resolver, seq, items.len())?;
 
         Ok(SequenceDef {
             id: seq.function.name.clone(),
@@ -185,21 +185,22 @@ impl<'a> CfsBuilder<'a> {
 /// writes the result at the site's own coordinate, which is where the walk
 /// stops.
 ///
-/// An unbindable return is not a build error — a program returning
-/// `finalize(draft)` must still build and run unauthenticated — so it is
-/// reported here rather than discovered at proving time: for `main`, its
-/// `ProgramEnd` will not verify; for a nested sequence, a use of its result is
-/// held only to "inside the call".
+/// An unbindable return is a **build error**
+/// (`incremental-draft-materialization` §Sequence return binding): the guest
+/// could not follow it, so `main`'s `ProgramEnd` would not verify and a use of
+/// a nested sequence's result would be unchecked. It was a warning only while
+/// `finalize(draft)` — a plain call, not a step — could still be returned;
+/// that left the language in batch B.
 fn sequence_returns(
     resolver: &FlowResolver,
     seq: &Sequence<'_>,
     item_count: usize,
-) -> Option<SequenceReturn> {
+) -> Result<Option<SequenceReturn>> {
     if is_recur_sequence(seq) {
         return recur_state_return(resolver, seq, item_count);
     }
     if !returns_non_unit(&seq.function.output) {
-        return None;
+        return Ok(None);
     }
     let returns = seq
         .function
@@ -217,18 +218,13 @@ fn sequence_returns(
             Some(crate::ast::ReturnExpr::Tuple(_)) => "a tuple".to_string(),
             None => "no returned expression".to_string(),
         };
-        let consequence = if name == "main" {
-            "this program's ProgramEnd will not verify"
-        } else {
-            "a use of its result is held only to \"inside the call\""
-        };
-        eprintln!(
-            "warning: `{name}` returns {form}, which the CFS cannot bind to a step's output or \
-             an argument; {consequence}. Return a binding of a `call!`/`call_recur!`/`call_seq!` \
-             result, or a `select!` of one."
-        );
+        return Err(Error::Other(format!(
+            "`{name}` returns {form}, which the CFS cannot bind to a step's output or an \
+             argument, so no audit could follow it. Return a binding of a \
+             `call!`/`call_recur!`/`call_seq!` result, or a `select!` of one."
+        )));
     }
-    returns
+    Ok(returns)
 }
 
 /// For a recur-sequence body, the **carried state** it returns — the whole
@@ -240,32 +236,43 @@ fn sequence_returns(
 /// iteration's `SequenceEnd` is checked against — the state it returns must be
 /// the object this binding names inside the iteration
 /// (`incremental-draft-materialization` D5b, recur-sequence state by
-/// reference).
+/// reference). A state the CFS cannot bind is a build error, as above.
 fn recur_state_return(
     resolver: &FlowResolver,
     seq: &Sequence<'_>,
     item_count: usize,
-) -> Option<SequenceReturn> {
-    let output = syn::parse_str::<syn::Type>(seq.function.output.as_deref()?).ok()?;
-    let state_expr = match (&output, seq.function.return_expr.as_ref()?) {
-        (syn::Type::Tuple(_), crate::ast::ReturnExpr::Tuple(elems)) => elems.first()?.clone(),
+) -> Result<Option<SequenceReturn>> {
+    let Some(output) = seq
+        .function
+        .output
+        .as_deref()
+        .and_then(|output| syn::parse_str::<syn::Type>(output).ok())
+    else {
+        return Ok(None);
+    };
+    let Some(return_expr) = seq.function.return_expr.as_ref() else {
+        return Ok(None);
+    };
+    let state_expr = match (&output, return_expr) {
+        (syn::Type::Tuple(_), crate::ast::ReturnExpr::Tuple(elems)) => elems.first().cloned(),
         (syn::Type::Path(path), expr)
             if path.path.segments.last().map(|s| s.ident == "RecurSequenceState")
                 == Some(true) =>
         {
-            expr.clone()
+            Some(expr.clone())
         }
-        _ => return None,
+        _ => return Ok(None),
     };
-    let returns = resolver.resolve_return(&state_expr, item_count);
+    let returns = state_expr.and_then(|expr| resolver.resolve_return(&expr, item_count));
     if returns.is_none() {
-        eprintln!(
-            "warning: recur sequence `{}` returns a carried state the CFS cannot bind to a step's \
-             output; its iterations will not verify. Return a binding of a `call!` result.",
+        return Err(Error::Other(format!(
+            "recur sequence `{}` returns a carried state the CFS cannot bind to a step's \
+             output, so its iterations could not be audited. Return a binding of a `call!` \
+             result (for `(state, output)`, as the first element).",
             seq.function.name
-        );
+        )));
     }
-    returns
+    Ok(returns)
 }
 
 /// Whether `seq` is the body of a recur sequence (`#[sequence(kind = recur)]`).
@@ -528,6 +535,36 @@ mod tests {
             })
         );
         assert_eq!(def_of(&body("sweep", Some("recur"))).returns, None);
+    }
+
+    /// A value-returning sequence whose return the CFS cannot bind fails to
+    /// build: no audit could follow it.
+    #[test]
+    fn an_unbindable_return_is_a_build_error() {
+        let project = mock_project();
+        let greet_func = tile_function("greet");
+        let greet_tile = Tile {
+            function: &greet_func,
+            tile_type: "iter".to_string(),
+            estimated_cycles: None,
+            max_memory: None,
+            description: None,
+        };
+        let mut function = main_function_with_params(vec![], vec![]);
+        function.name = "helper".to_string();
+        function.output = Some("String".to_string());
+        function.return_expr = Some(crate::ast::ReturnExpr::Unbound {
+            expr: "format!(\"{}\", x)".to_string(),
+        });
+        let error = CfsBuilder::new(&project)
+            .build_sequence_def(&Sequence {
+                function: &function,
+                steps: vec![SequenceStep::Tile(&greet_tile)],
+                description: None,
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("cannot bind"), "{error}");
     }
 
     fn project_with_tile_functions(names: &[&str]) -> Project {

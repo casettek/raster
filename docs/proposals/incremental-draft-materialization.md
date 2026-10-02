@@ -1,6 +1,7 @@
 # Proposal: `incremental-draft-materialization` — seal a draft instead of rebuilding it, and complete it at its recur site's close
 
-Status: Proposed 2026-09-21. **Revised 2026-09-24** — §One storage rule replaces
+Status: **Implemented 2026-10-01** (batches A–E, §Implementation order; GPU proving and
+`raster-inference` are follow-ups). Proposed 2026-09-21. **Revised 2026-09-24** — §One storage rule replaces
 §Update-at-coordinate's cost note, for `call_recur!` only. The organising claim is not about
 drafts: there is **one rule** for how a produced value becomes a stored object — *at the coordinate
 of the step that produced it, by a traced write* — and drafts are the only producer that does not
@@ -1803,7 +1804,7 @@ they break; the same table is in that proposal's §Order.
 | **B — language and object ownership** (**done 2026-10-01**) | §One storage rule and §The restriction: `new!`/`finalize`/`finalize = false` removed, a site owns its object at `[s]` (creates, or derives with `output = base`), plain tiles return values, `DRAFT_NAMESPACE` deleted, host anchor `anchor_for_schema([s], S)`; D1b (`RecurOutputDecl` in the CFS via `schema_walk`); programs rewritten (`examples/`, `crates/raster/tests`, `raster-inference`) | CFS, programs, `program_commitment` |
 | **C — tile journal** (one tile-image-id break) (**done 2026-10-01**) | D3 (recur iterations publish no output; an `Exec` with no write has an empty `output_commitment`); D2 (`draft_id` removed); D1a (replay tile asserts its schema); D5b (replayed state as raster roots, recur-sequence state by reference); **`tile-io-structural-roots` step 2** (`output_root`, `input_roots`); guest: the frame's draft entry replaces `active_drafts`, `RecurEnd` writes exactly one object | every tile image id, `program_commitment` |
 | **D — materialization** (**done 2026-10-01**) | `DraftBuffer`, one seal for store and `RecurEnd` output, `rindex04` relative offsets, derivation sharing (`Derived` backing, delta output) | `.rindex` format; no guest or tile change |
-| **E — verification** | both proposals' Verification lists; `tile-io-structural-roots` step 3; GPU proving; all locks, `raster-inference` included | — |
+| **E — verification** (**done 2026-10-01, without GPU**) | both proposals' Verification lists; `tile-io-structural-roots` step 3; GPU proving; all locks, `raster-inference` included | — |
 
 What implementing this proposal in full changes for `tile-io-structural-roots`:
 
@@ -2013,6 +2014,42 @@ is a separate follow-up).
 - **Not done.** The optional piece-compaction threshold for long chains. The recorder does not
   recompute the tail's element roots — the same trust it gives a contiguous object's bytes.
   `raster-inference`'s `.rindex` artifacts are `rindex03` and must be regenerated (follow-up).
+
+**Batch E — done 2026-10-01, without GPU proving** (verification). Each item of §Verification,
+and where it is held:
+
+| §Verification item | where |
+| --- | --- |
+| sealed draft byte-identical to whole encoding, growth 0..1024 | `draft_buffer::sealing_matches_whole_encoding_at_every_length_to_1024` (payload, root, first/last/range selections at every length) |
+| each element hashed once, create → seal → close event | `storage::each_element_is_hashed_once_from_push_to_close`, on a `hash-count` leaf counter in `raster_core::tree` (test-only feature) |
+| sharing: deriving hashes k elements, not N + k | same test, the derived half (7 of 107) |
+| `hello-tiles` and `chain-example` through the ladder, fraud detected **and the receipt built** | commit + audit both; dev-mode windows build the (dev) receipt: `hello-tiles` steps 33–81 in two whole windows plus spot windows, `phase1-normalize` steps 2–13; chain run + `chain audit --execution` |
+| derived object's first `root_before` = base commitment | guest `opening_draft` + `a_draft_transition_from_another_root_is_rejected_by_the_frame`; `DraftBuffer::derive` asserts it |
+| window-open attacks on the draft entry (forged, omitted, spliced at the close) | `recur_progress::a_seed_forging_or_omitting_the_draft_entry_commits_differently`, `a_spliced_seed_cannot_close_on_the_written_object` |
+| close: object ≠ frame root rejected, incl. zero-iteration | `a_draft_chains_through_iterations_and_the_close_checks_the_object`, `a_zero_iteration_creating_site_stores_its_opening_root` |
+| site step kinds and ordering | existing batch-A tests, plus `a_sequence_scope_witness_naming_a_recur_start_is_rejected`, `a_recur_end_naming_the_site_as_its_sequence_is_rejected`, `a_site_that_stores_nothing_is_rejected`; an `End` with inputs is not constructible (`RecurEndStep` has no input fields) |
+| one append per sweep; iteration with a commitment and no write rejected; no draft id | `recorder::a_sweep_of_n_iterations_appends_once`, `a_step_that_wrote_nothing_may_not_record_a_commitment`, `a_tile_that_returned_nothing_may_not_claim_a_commitment`; no draft id exists in the types |
+| recorder-side close panics at record time | `recorder::a_close_writing_another_object_panics_at_record_time` |
+| schema binding | `recur_draft::a_replayed_draft_handle_naming_another_schema_is_refused`; `a_transition_for_another_schema_is_rejected`; zero-iteration `empty_root` as above |
+| carried state `{6}`/`{7}`, tile and sequence; stored seed pins iteration 0 | `a_state_only_tile_site_must_store_its_final_state`, `a_state_only_site_must_store_the_state_its_chain_reached`, `a_stored_seed_pins_iteration_zero` |
+| return binding | in place since `5e0bf83`/`923aa9f` (`a_sequence_argument_rejects_an_object_the_sequence_did_not_return`, `a_nested_return_resolves_to_the_step_that_wrote_it`, `program_end` module); recur-sequence state: `an_iteration_returning_another_object_is_rejected`, `an_iteration_claiming_another_state_out_is_rejected`, `an_iteration_without_a_read_of_its_returned_state_is_rejected`, `an_iteration_reading_another_state_is_rejected`, `an_iteration_carrying_state_inline_after_the_chain_started_is_rejected`; **an unresolvable return is now a build error** (`an_unbindable_return_is_a_build_error`) — it was a warning only while `finalize` existed |
+| sequence and site ordering | batch-A tests (`cfs.rs`, `a_recur_site_cannot_be_entered_or_left_around_its_boundary_steps`) |
+| recorder/guest parity over creating, deriving and state-only sites | every step of the `hello-tiles` windows: the guest asserts the recorder's stamped `recur_progress_commitment` at each |
+| frontier from stored levels, every length to 1024 | `the_frontier_from_stored_levels_matches_pushing_at_every_length_to_1024` |
+| continuation: deriver's `Set` rejected; close carries `O(k)`; derived proofs identical; tampered delta refused | `a_derived_draft_refuses_a_set`, `a_deriving_site_refuses_a_set`, `draft_iterations_publish_no_output_and_the_close_publishes_the_object`, `a_derived_object_is_its_base_plus_appends_encoded_whole`, `a_tampered_delta_is_refused_by_the_rebuild` |
+| derived mapping over a chain; export round-trips through the reader | `a_chain_of_derivations_is_the_whole_object`, `an_exported_derived_object_round_trips_through_the_reader` |
+
+**Found by it, and fixed.** The step-2 input check (`tile-io-structural-roots`) rejected an honest
+step: a tile consuming a fallible call's result after `?` (`hello-tiles`' `concat_messages` at
+`[3,3]`). The stored object is the whole `Result`, `Ok(v)`, and the selection proves it; the
+tile decoded `v`. The guest now also accepts the root of an `Ok` payload's inner value — a slice of
+the proven bytes (`checks::io::ok_payload`); an `Err` payload's, or another value's, is still
+refused (three guest tests). No earlier window had covered such a step.
+
+**Not covered here.** GPU proving and CPU proving of real receipts (dev mode runs the same guests
+and builds dev receipts). `hello-tiles` steps 1–32 stay blocked by
+[`sequence-scope-forbids-narrowing`](../issues/sequence-scope-forbids-narrowing.md), unchanged.
+`raster-inference`: its programs and `rindex03` artifacts, a separate follow-up.
 
 ## Costs
 

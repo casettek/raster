@@ -988,7 +988,7 @@ fn decode_list_metadata_len(bytes: &[u8]) -> Option<u64> {
 /// The binding is not read here: a sequence boundary has no storage roots. A
 /// body tile that consumes the state reads it from storage, and
 /// `verify_sequence_scope_parent` ties that read to this binding.
-fn check_iteration_state_binding(
+pub(crate) fn check_iteration_state_binding(
     step_record: &StepRecord,
     progress: &RecurProgressStack,
     input_source_witness: Option<&FnInput>,
@@ -1050,7 +1050,7 @@ fn check_iteration_state_binding(
 /// step 2) — and the last link to the site's stored result, at `RecurEnd`.
 ///
 /// A body returning its state parameter unchanged returns the state it read.
-fn verify_returned_state(
+pub(crate) fn verify_returned_state(
     cfs_cursor: &CfsCursor,
     step_record: &StepRecord,
     body_id: &str,

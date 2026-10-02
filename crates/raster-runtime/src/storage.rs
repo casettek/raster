@@ -33,7 +33,6 @@ use crate::input::{
 };
 use crate::draft_buffer::{derived_object, overlay_nodes, DerivationBase, DraftBuffer};
 use raster_core::trace::DerivedPayload;
-use crate::raster_index::RasterIndex;
 use crate::source::SourceResolver;
 use crate::Sha256Commitment;
 
@@ -2079,5 +2078,38 @@ mod tests {
                 delta,
             );
         }
+    }
+
+    /// Each element is hashed exactly once from its push to its site's close
+    /// — the seal, the store and the close event's payload add none
+    /// (`incremental-draft-materialization` §Verification).
+    #[test]
+    fn each_element_is_hashed_once_from_push_to_close() {
+        let _scope = SequenceScopeGuard::enter("hash_once");
+        enter_recur_site_scope().expect("site scope");
+        let count = raster_core::tree::leaf_hash_count;
+        let before = count();
+        let (anchor, mut root) = create_site_draft::<BigDraft>().expect("draft");
+        for i in 0..100 {
+            root = apply_draft_push::<BigDraft, String>(&anchor, &root, "lines", &format!("l{i}"))
+                .expect("push");
+        }
+        let base = finalize_draft::<BigDraft>(&anchor, &root).expect("seal");
+        let _ = stored_object_output(&base, "BigDraft").expect("close output");
+        assert_eq!(count() - before, 100);
+        exit_recur_site_scope();
+
+        // A derivation hashes what it appends — not the base it continues.
+        enter_recur_site_scope().expect("site scope");
+        let before = count();
+        let (anchor, mut root) = derive_site_draft_from::<BigDraft>(&base).expect("derive");
+        for i in 0..7 {
+            root = apply_draft_push::<BigDraft, String>(&anchor, &root, "lines", &format!("m{i}"))
+                .expect("push");
+        }
+        let derived = finalize_draft::<BigDraft>(&anchor, &root).expect("seal");
+        let _ = stored_object_output(&derived, "BigDraft").expect("close output");
+        assert_eq!(count() - before, 7);
+        exit_recur_site_scope();
     }
 }

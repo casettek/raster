@@ -139,7 +139,7 @@ pub fn verify_step_record(
 /// (D3) — must record an empty commitment, and `checks::store` requires a step
 /// with an empty commitment to write nothing: together, a tile writes iff its
 /// replay produced an output, and writes exactly that.
-fn verify_output_root(step_record: &StepRecord, replay_journal: &TileReplayJournal) {
+pub(crate) fn verify_output_root(step_record: &StepRecord, replay_journal: &TileReplayJournal) {
     let recorded = step_record
         .output_commitment()
         .expect("a tile step records an output commitment");
@@ -162,7 +162,7 @@ fn verify_output_root(step_record: &StepRecord, replay_journal: &TileReplayJourn
 /// replay committed the root of each decoded argument; this requires the two
 /// to be the same root, so the bytes the selection proves and the value the
 /// binary executed are the same value.
-fn verify_input_roots(
+pub(crate) fn verify_input_roots(
     step_record: &StepRecord,
     replay_journal: &TileReplayJournal,
     input_source_witness: Option<&FnInput>,
@@ -218,12 +218,42 @@ fn verify_input_roots(
                 step_record.coordinates, name
             )
         });
-        assert_eq!(
-            selected_root,
-            Some(replayed),
+        // A fallible call's result is stored whole, `Ok(v)`, and the sequence
+        // that consumes it with `?` hands the next tile `v`: the selection
+        // proves the `Result`, the tile decoded the value inside it. `v`'s
+        // payload is a slice of the proven bytes, so its root is proven too.
+        let ok_inner_root = witness
+            .selected_root
+            .is_none()
+            .then(|| ok_payload(&witness.bytes))
+            .flatten()
+            .and_then(payload_structural_root);
+        assert!(
+            selected_root == Some(replayed) || ok_inner_root == Some(replayed),
             "Tile step {:?}'s argument '{}' is not the value its selection proves",
             step_record.coordinates,
             name,
         );
     }
+}
+
+/// The value inside an `Ok(..)` payload — an enum newtype (`0x06 ‖ variant
+/// length ‖ variant ‖ value length ‖ value`) whose variant is `Ok` — or
+/// `None` for any other payload.
+fn ok_payload(bytes: &[u8]) -> Option<&[u8]> {
+    let read_u64 = |at: usize| -> Option<usize> {
+        usize::try_from(u64::from_le_bytes(bytes.get(at..at + 8)?.try_into().ok()?)).ok()
+    };
+    if *bytes.first()? != 0x06 {
+        return None;
+    }
+    let variant_len = read_u64(1)?;
+    let variant = bytes.get(9..9 + variant_len)?;
+    if variant != b"Ok" {
+        return None;
+    }
+    let value_len = read_u64(9 + variant_len)?;
+    let start = 9 + variant_len + 8;
+    let value = bytes.get(start..start.checked_add(value_len)?)?;
+    (start + value_len == bytes.len()).then_some(value)
 }
