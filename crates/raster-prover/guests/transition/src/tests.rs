@@ -2155,6 +2155,7 @@ fn verify_draft_transition_tracks_multi_step_chain() {
     frame.open_draft(SiteDraft {
         schema_hash,
         root: empty_root,
+        derived: false,
     });
 
     let step_one = TileReplayJournal {
@@ -2245,6 +2246,7 @@ fn a_draft_transition_from_another_root_is_rejected_by_the_frame() {
     frame.open_draft(SiteDraft {
         schema_hash: [4; 32],
         root: [1; 32],
+        derived: false,
     });
     assert_eq!(
         frame.advance_draft(
@@ -2253,6 +2255,7 @@ fn a_draft_transition_from_another_root_is_rejected_by_the_frame() {
                 schema_hash: [4; 32],
                 root_before: [2; 32],
                 root_after: [3; 32],
+                sets: false,
             }),
             true,
         ),

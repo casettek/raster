@@ -483,7 +483,7 @@ fn parse_utf8(bytes: &[u8], offset: &mut usize) -> Option<Vec<u8>> {
 /// root must reuse this function rather than restate it. A divergence between
 /// the two spellings would be a metadata record that verifies against a root no
 /// list can produce.
-fn list_root_from_elements_root(len: u64, elements_root: Option<&Hash32>) -> Hash32 {
+pub fn list_root_from_elements_root(len: u64, elements_root: Option<&Hash32>) -> Hash32 {
     match elements_root {
         Some(root) => selection_hash(&[b"list-root", &len.to_le_bytes(), root.as_slice()]),
         None => selection_hash(&[b"list-root", &len.to_le_bytes(), b"empty"]),
@@ -2658,4 +2658,11 @@ mod tests {
             encoded.len()
         );
     }
+}
+
+/// One interior node of a list's element tree — the same hash
+/// `list_root_from_hashes` and [`AppendFrontier`] fold with, exposed so the
+/// runtime's draft buffer maintains stored Merkle levels without restating it.
+pub fn list_node_hash(left: &Hash32, right: &Hash32) -> Hash32 {
+    selection_hash(&[b"list-node", left.as_slice(), right.as_slice()])
 }

@@ -73,5 +73,6 @@ pub fn verify_draft_transition(
         schema_hash: *schema_hash,
         root_before: *root_before,
         root_after,
+        sets: ops.iter().any(|op| matches!(op, raster_core::draft::DraftOp::Set { .. })),
     })
 }

@@ -1286,6 +1286,7 @@ fn opening_draft(
         return SiteDraft {
             schema_hash: decl.schema_hash,
             root: decl.empty_root,
+            derived: false,
         };
     }
     let base = input_source_witness
@@ -1303,6 +1304,7 @@ fn opening_draft(
     );
     SiteDraft {
         schema_hash: decl.schema_hash,
+        derived: true,
         root: base
             .commitment
             .as_slice()

@@ -766,17 +766,14 @@ pub(crate) fn gen_recur_driver_function(
                 let result = #run_driver;
                 drop(__raster_recur_trace_scope);
 
-                let __raster_resolved_output = ::raster::resolve_storage_value::<#result_ty>(result.reference().clone())
-                    .unwrap_or_else(|e| panic!("Failed to resolve recur output for trace: {}", e));
-                let __raster_output_bytes = __raster_resolved_output.bytes.clone();
+                // The site's object as storage holds it: one encoding for the
+                // child's store and this event (§Where the seal runs).
                 let __raster_output = ::core::option::Option::Some(
-                    ::raster::core::trace::FnOutput::new(
-                        __raster_output_bytes,
+                    ::raster::stored_object_output(
+                        result.reference(),
                         stringify!(::raster::AuthRef<#result_ty>),
-                    ).with_raster(
-                        ::raster::raster_trace_payload(&__raster_resolved_output.value)
-                            .unwrap_or_else(|e| panic!("Failed to build raster recur output payload: {}", e))
                     )
+                    .unwrap_or_else(|e| panic!("Failed to read the recur site's object for trace: {}", e)),
                 );
                 ::raster::publish_trace_event(::raster::core::trace::TraceEvent::RecurTileEnd(
                     ::raster::core::trace::FnCallRecord {
@@ -883,13 +880,6 @@ pub(crate) fn gen_recur_sequence_step_function(
     }
     let body = &item_fn.block;
     let input_serialization = gen_recur_sequence_input_serialization(item_fn);
-    let output_type_expr = match &item_fn.sig.output {
-        ReturnType::Default => quote! { "()" },
-        ReturnType::Type(_, ty) => {
-            let ty_str = ty.to_token_stream().to_string();
-            quote! { #ty_str }
-        }
-    };
     let result_binding = match shape.mode {
         RecurTileMode::OutputOnly => {
             let output_schema = shape
@@ -1310,17 +1300,14 @@ pub(crate) fn gen_recur_sequence_driver_function(
                 #open_site_output
                 let result = #run_driver;
 
-                let __raster_resolved_output = ::raster::resolve_storage_value::<#result_ty>(result.reference().clone())
-                    .unwrap_or_else(|e| panic!("Failed to resolve recur sequence output for trace: {}", e));
-                let __raster_output_bytes = __raster_resolved_output.bytes.clone();
+                // The site's object as storage holds it: one encoding for the
+                // child's store and this event (§Where the seal runs).
                 let __raster_output = ::core::option::Option::Some(
-                    ::raster::core::trace::FnOutput::new(
-                        __raster_output_bytes,
+                    ::raster::stored_object_output(
+                        result.reference(),
                         stringify!(::raster::AuthRef<#result_ty>),
-                    ).with_raster(
-                        ::raster::raster_trace_payload(&__raster_resolved_output.value)
-                            .unwrap_or_else(|e| panic!("Failed to build raster recur sequence output payload: {}", e))
                     )
+                    .unwrap_or_else(|e| panic!("Failed to read the recur site's object for trace: {}", e)),
                 );
                 ::raster::publish_trace_event(::raster::core::trace::TraceEvent::RecurSequenceEnd(
                     ::raster::core::trace::FnCallRecord {

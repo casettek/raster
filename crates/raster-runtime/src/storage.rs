@@ -1,14 +1,11 @@
 use raster_core::cfs::{CfsCoordinate, CfsCoordinates, FIRST_COORDINATE};
 use raster_core::coordinate_index::IncrementalCoordinateIndex;
 use raster_core::draft::{
-    draft_root_from_field_roots, draft_tree_from_fields, draft_value_from_serialize,
-    draft_value_root, schema_hash as compute_schema_hash, DraftFieldValue, DraftOp,
-    DraftReplayTransition, DraftStateWitness, DraftTransitionWitness, DraftValue,
-    DraftWitnessField,
+    draft_value_from_serialize, schema_hash as compute_schema_hash, DraftReplayTransition,
+    DraftStateWitness, DraftTransitionWitness, DraftValue,
 };
 use raster_core::input::{
-    AppendFrontier, AuthenticatedListMetadata, ExternalEncoding, Schema, SchemaFieldMode,
-    SchemaNode, SelectionPayloadKind, SelectionWitness, SelectorPath, StorageRef, StorageValue,
+    AuthenticatedListMetadata, ExternalEncoding, Schema, SelectionPayloadKind, SelectionWitness, SelectorPath, StorageRef, StorageValue,
 };
 use raster_core::trace::RasterPayload;
 use raster_core::transition::{SerializableFrontier, StorageEntry, StorageIndexValue};
@@ -26,91 +23,21 @@ use std::sync::Arc;
 use std::vec::Vec;
 
 use crate::backing::{
-    ObjectBacking, OwnedObject, ReferencedObject, ReferencedSource, ReferencedSourceKind,
+    resolve_whole_view, ObjectBacking, ObjectBytes, OwnedObject, RasterObject, RasterView,
+    ReferencedObject, ReferencedSource, ReferencedSourceKind,
 };
 use crate::input::{
     encode_raster_value, list_metadata_payload, list_metadata_witness,
     selected_payload_from_raster_location, selection_witness_from_raster_selection,
-    tree_value_from_raster_location, typed_value_from_tree, TreeValue,
+    tree_value_from_raster_location, typed_value_from_tree,
 };
+use crate::draft_buffer::{derived_object, overlay_nodes, DerivationBase, DraftBuffer};
+use raster_core::trace::DerivedPayload;
 use crate::raster_index::RasterIndex;
 use crate::source::SourceResolver;
 use crate::Sha256Commitment;
 
 type Anchor = [u8; 32];
-
-/// One draft field as the runtime holds it: the real value, plus the digest
-/// state needed to move the draft root forward without re-reading the value.
-///
-/// Keeping both is what makes a push O(log N) here as well as in the guest. The
-/// values are still the truth — `finalize` materializes the whole object from
-/// them — but they are no longer walked on every op. See
-/// `docs/proposals/incremental-draft-witness.md`.
-#[derive(Debug, Clone)]
-enum DraftFieldRuntime {
-    Set {
-        value: DraftValue,
-        root: [u8; 32],
-    },
-    Append {
-        values: Vec<DraftValue>,
-        frontier: AppendFrontier,
-    },
-}
-
-impl DraftFieldRuntime {
-    fn root(&self) -> Result<[u8; 32]> {
-        match self {
-            Self::Set { root, .. } => Ok(*root),
-            Self::Append { frontier, .. } => frontier
-                .root()
-                .ok_or_else(|| Error::Other("Draft append frontier is malformed".into())),
-        }
-    }
-
-    /// The runtime's own representation, rebuilt for the finalize path.
-    fn field_value(&self) -> DraftFieldValue {
-        match self {
-            Self::Set { value, .. } => DraftFieldValue::Set(value.clone()),
-            Self::Append { values, .. } => DraftFieldValue::Append(values.clone()),
-        }
-    }
-
-    /// What crosses into the trace: a frontier, never the accumulated log.
-    fn witness_field(&self) -> DraftWitnessField {
-        match self {
-            Self::Set { value, .. } => DraftWitnessField::Set(value.clone()),
-            Self::Append { frontier, .. } => DraftWitnessField::Append(frontier.clone()),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct DraftRuntimeState {
-    schema: SchemaNode,
-    current_root: [u8; 32],
-    fields: BTreeMap<String, DraftFieldRuntime>,
-    ops: Vec<DraftOp>,
-}
-
-impl DraftRuntimeState {
-    /// Recompose the draft root from the per-field roots the fields already
-    /// hold — O(#fields), with no element ever touched.
-    fn recompose_root(&self) -> Result<[u8; 32]> {
-        let mut roots = BTreeMap::new();
-        for (name, field) in &self.fields {
-            roots.insert(name.clone(), field.root()?);
-        }
-        draft_root_from_field_roots(&self.schema, &roots)
-    }
-
-    fn field_values(&self) -> BTreeMap<String, DraftFieldValue> {
-        self.fields
-            .iter()
-            .map(|(name, field)| (name.clone(), field.field_value()))
-            .collect()
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct DraftCaptureSnapshot {
@@ -264,7 +191,7 @@ fn owned_backing(bytes: &[u8], raster: Option<RasterPayload>) -> (ObjectBacking,
     let object_commitment = internal_object_commitment(bytes, raster.as_ref());
     let owned = OwnedObject {
         bytes: bytes.to_vec(),
-        raster,
+        raster: raster.map(|payload| Arc::new(RasterObject::new(payload))),
     };
     (ObjectBacking::Owned(owned), object_commitment)
 }
@@ -297,54 +224,6 @@ fn anchor_for_schema(coordinates: &CfsCoordinates, schema_hash: [u8; 32]) -> Anc
     hasher.finalize().into()
 }
 
-fn schema_struct_fields(schema: &SchemaNode) -> Result<&[raster_core::input::SchemaField]> {
-    match schema {
-        SchemaNode::Struct { fields, .. } => Ok(fields.as_slice()),
-        _ => Err(Error::Other(
-            "Drafts currently support only struct schemas at the root".into(),
-        )),
-    }
-}
-
-fn build_draft_tree(
-    schema: &SchemaNode,
-    fields: &BTreeMap<String, DraftFieldValue>,
-    require_complete: bool,
-) -> Result<TreeValue> {
-    draft_tree_from_fields(schema, fields, require_complete)
-}
-
-fn locate_schema_field<'a>(
-    schema: &'a SchemaNode,
-    name: &str,
-) -> Result<&'a raster_core::input::SchemaField> {
-    schema_struct_fields(schema)?
-        .iter()
-        .find(|field| field.name == name)
-        .ok_or_else(|| Error::Other(format!("Unknown draft field '{}'", name)))
-}
-
-fn first_unset_set_once_field<'a>(
-    schema: &'a SchemaNode,
-    fields: &BTreeMap<String, DraftFieldRuntime>,
-) -> Result<Option<&'a str>> {
-    for field in schema_struct_fields(schema)? {
-        if field.mode == SchemaFieldMode::SetOnce && !fields.contains_key(&field.name) {
-            return Ok(Some(field.name.as_str()));
-        }
-    }
-    Ok(None)
-}
-
-/// Stand-in root for a draft in an unauthenticated run.
-///
-/// The root is a commitment, and an unauthenticated run computes none — but
-/// `Draft<S>` still threads a `[u8; 32]` from op to op, and the trace-facing
-/// mismatch checks compare against it. Rather than make the field optional
-/// through every signature, the mode uses one fixed value and skips the
-/// comparisons. See `docs/proposals/unauthenticated-execution.md` §7.
-const UNAUTHENTICATED_DRAFT_ROOT: [u8; 32] = [0u8; 32];
-
 /// Whether draft operations should compute and check commitments.
 fn drafts_are_authenticated() -> bool {
     crate::auth::auth_mode().is_authenticated()
@@ -354,7 +233,7 @@ fn take_draft_state(
     anchor: &Anchor,
     expected_root: &[u8; 32],
     operation: &str,
-) -> Result<DraftRuntimeState> {
+) -> Result<DraftBuffer> {
     THREAD_DRAFT_STORAGE.with(|drafts| {
         let mut drafts = drafts.borrow_mut();
         let state = drafts
@@ -368,22 +247,6 @@ fn take_draft_state(
         }
         Ok(state)
     })
-}
-
-/// The pre-state a tile step carries into the trace.
-///
-/// This used to clone `state.fields` wholesale — every element pushed so far,
-/// on every step, which is what made a draft cost O(N) trace bytes per step and
-/// O(N²) overall. It is now O(#fields · log N).
-fn draft_state_witness(state: &DraftRuntimeState) -> DraftStateWitness {
-    DraftStateWitness {
-        schema: state.schema.clone(),
-        fields: state
-            .fields
-            .iter()
-            .map(|(name, field)| (name.clone(), field.witness_field()))
-            .collect(),
-    }
 }
 
 impl ObjectStore {
@@ -450,6 +313,48 @@ impl ObjectStore {
         self.put(coordinates, object_commitment, backing)
     }
 
+    /// The object a deriving site extends, read as a view: its index and bytes
+    /// are shared, not copied. A whole object only — a selection inside one
+    /// is not a base (the guest requires the same, `opening_draft`).
+    pub(crate) fn derivation_base(&self, reference: &StorageRef) -> Result<DerivationBase> {
+        let stored = self.verify_reference(reference)?;
+        let view = Self::raster_view(stored, &reference.coordinates)?;
+        Ok(DerivationBase {
+            coordinates: reference.coordinates.clone(),
+            commitment: reference.commitment.clone(),
+            index: view.index,
+            bytes: view.bytes,
+        })
+    }
+
+    /// Store a derived object built from `delta` over the base this store
+    /// holds — the recorder's side of a deriving site's close.
+    fn derived_backing(&self, delta: &DerivedPayload) -> Result<(ObjectBacking, Vec<u8>)> {
+        let base = self.derivation_base(&StorageRef::new(
+            delta.base_coordinates.clone(),
+            delta.base_commitment.clone(),
+        ))?;
+        let object = derived_object(&base.index, &base.bytes, delta, overlay_nodes(delta)?)?;
+        let commitment = object.root.to_vec();
+        Ok((ObjectBacking::Derived(object), commitment))
+    }
+
+    /// A site's close output, whatever its form: a contiguous object's raster
+    /// payload, or a derived object's delta.
+    pub fn append_output(
+        &mut self,
+        output: &raster_core::trace::FnOutput,
+        coordinates: CfsCoordinates,
+    ) -> Result<StorageEntry> {
+        match &output.derived {
+            Some(delta) => {
+                let (backing, commitment) = self.derived_backing(delta)?;
+                Ok(self.put(coordinates, commitment, backing))
+            }
+            None => Ok(self.append_serialized_bytes(&output.data, coordinates, output.raster.clone())),
+        }
+    }
+
     /// Loads an authorized set of named sources as one storage object. Today
     /// this is called only for `main`'s entrypoint binding, at the sequence
     /// root `[]` that `ProgramStart` binds.
@@ -475,6 +380,17 @@ impl ObjectStore {
                     value,
                 ))
             }
+            ObjectBacking::Derived(_) => {
+                let view = Self::raster_view(stored, &reference.coordinates)?;
+                let (bytes, selection, value) = resolve_whole_view::<T>(&view)?;
+                Ok(StorageValue::new_with_selection(
+                    reference.clone(),
+                    bytes,
+                    SelectorPath::default(),
+                    selection,
+                    value,
+                ))
+            }
             ObjectBacking::Referenced(_) => Err(Error::Other(
                 "Referenced object requires a field selector naming a declared entry argument"
                     .into(),
@@ -485,13 +401,39 @@ impl ObjectStore {
     fn require_raster<'a>(
         owned: &'a OwnedObject,
         coordinates: &CfsCoordinates,
-    ) -> Result<&'a RasterPayload> {
+    ) -> Result<&'a Arc<RasterObject>> {
         owned.raster.as_ref().ok_or_else(|| {
             Error::Other(format!(
                 "Storage object at coordinates {:?} is missing raster selection metadata",
                 coordinates
             ))
         })
+    }
+
+    /// A program-written object as a raster read sees it — index (parsed once
+    /// and cached), bytes and root — whether it is stored contiguously or
+    /// derived from another. `Referenced` objects resolve through their
+    /// sources instead and have none.
+    fn raster_view(stored: &StoredObject, coordinates: &CfsCoordinates) -> Result<RasterView> {
+        match &stored.backing {
+            ObjectBacking::Owned(owned) => {
+                let raster = Self::require_raster(owned, coordinates)?;
+                Ok(RasterView {
+                    index: raster.index()?,
+                    bytes: ObjectBytes::Contiguous(raster.clone()),
+                    root: raster.payload.root_hash,
+                })
+            }
+            ObjectBacking::Derived(derived) => Ok(RasterView {
+                index: derived.index.clone(),
+                bytes: ObjectBytes::Pieces(derived.pieces.clone()),
+                root: derived.root,
+            }),
+            ObjectBacking::Referenced(_) => Err(Error::Other(format!(
+                "Object at coordinates {:?} holds entry arguments, not raster bytes",
+                coordinates
+            ))),
+        }
     }
 
     fn verify_reference(&self, reference: &StorageRef) -> Result<&StoredObject> {
@@ -512,8 +454,10 @@ impl ObjectStore {
         // bytes here to recompute it from. Only `Owned` objects hold bytes
         // to double-check against.
         if let ObjectBacking::Owned(owned) = &stored.backing {
-            let actual_commitment =
-                internal_object_commitment(owned.bytes.as_slice(), owned.raster.as_ref());
+            let actual_commitment = internal_object_commitment(
+                owned.bytes.as_slice(),
+                owned.raster.as_ref().map(|raster| &raster.payload),
+            );
             if actual_commitment != reference.commitment {
                 return Err(Error::Other(format!(
                     "Storage object at coordinates {:?} failed integrity check",
@@ -542,13 +486,13 @@ impl ObjectStore {
     ) -> Result<SelectionWitness> {
         let stored = self.verify_reference(reference)?;
         match &stored.backing {
-            ObjectBacking::Owned(owned) => {
-                let raster = Self::require_raster(owned, &reference.coordinates)?;
-                let index = RasterIndex::from_bytes(&raster.index_bytes)?;
+            ObjectBacking::Owned(_) | ObjectBacking::Derived(_) => {
+                let view = Self::raster_view(stored, &reference.coordinates)?;
+                let index = view.index;
                 let selection = index.select(selector)?;
                 match payload_kind {
                     SelectionPayloadKind::Raw => {
-                        selection_witness_from_raster_selection(&raster.bytes, selector, selection)
+                        selection_witness_from_raster_selection(&view.bytes, selector, selection)
                     }
                     SelectionPayloadKind::List => {
                         let (len, elements_root) = index.list_metadata(selector)?;
@@ -580,9 +524,8 @@ impl ObjectStore {
     ) -> Result<AuthenticatedListMetadata> {
         let stored = self.verify_reference(reference)?;
         match &stored.backing {
-            ObjectBacking::Owned(owned) => {
-                let raster = Self::require_raster(owned, &reference.coordinates)?;
-                let index = RasterIndex::from_bytes(&raster.index_bytes)?;
+            ObjectBacking::Owned(_) | ObjectBacking::Derived(_) => {
+                let index = Self::raster_view(stored, &reference.coordinates)?.index;
                 let (len, elements_root) = index.list_metadata(selector)?;
                 // Every selection into an owned object anchors to the object's
                 // own root, which is what `locate` returns as `root_hash`.
@@ -611,13 +554,13 @@ impl ObjectStore {
     ) -> Result<StorageValue<T>> {
         let stored = self.verify_reference(reference)?;
         match &stored.backing {
-            ObjectBacking::Owned(owned) => {
-                let raster = Self::require_raster(owned, &reference.coordinates)?;
-                let index = RasterIndex::from_bytes(&raster.index_bytes)?;
+            ObjectBacking::Owned(_) | ObjectBacking::Derived(_) => {
+                let view = Self::raster_view(stored, &reference.coordinates)?;
+                let index = view.index;
                 let selection = index.locate(selector)?;
-                let tree = tree_value_from_raster_location(&index, &raster.bytes, &selection)?;
+                let tree = tree_value_from_raster_location(&index, &view.bytes, &selection)?;
                 let selected =
-                    selected_payload_from_raster_location(&raster.bytes, selector, selection)?;
+                    selected_payload_from_raster_location(&view.bytes, selector, selection)?;
                 if selected.commitment.source_root_hash.to_vec() != reference.commitment {
                     return Err(Error::Other(format!(
                         "Storage selection root mismatch at coordinates {:?}",
@@ -779,6 +722,23 @@ impl AuthenticatedObjectStore {
     ) -> StorageWriteRecord {
         let (backing, object_commitment) = owned_backing(bytes, raster);
         self.append(backing, object_commitment, coordinates)
+    }
+
+    /// The recorder's write of a site close's output: a contiguous object, or
+    /// a derived object rebuilt from its delta over the base this store
+    /// already holds — the recorder's own replica, never the child's.
+    pub fn append_output(
+        &mut self,
+        output: &raster_core::trace::FnOutput,
+        coordinates: CfsCoordinates,
+    ) -> Result<StorageWriteRecord> {
+        match &output.derived {
+            Some(delta) => {
+                let (backing, commitment) = self.objects.derived_backing(delta)?;
+                Ok(self.append(backing, commitment, coordinates))
+            }
+            None => Ok(self.append_serialized_bytes(&output.data, coordinates, output.raster.clone())),
+        }
     }
 
     /// Loads an authorized set of named sources as one storage object. Today
@@ -1050,7 +1010,9 @@ std::thread_local! {
     static THREAD_PENDING_OUTPUT_COORDINATES: RefCell<Option<CfsCoordinates>> = const { RefCell::new(None) };
     static THREAD_PENDING_OUTPUT_ENCODING: RefCell<Option<PendingOutputEncoding>> = const { RefCell::new(None) };
     static THREAD_PENDING_RECUR_ITEM: RefCell<Option<PendingRecurItemBinding>> = const { RefCell::new(None) };
-    static THREAD_DRAFT_STORAGE: RefCell<BTreeMap<Anchor, DraftRuntimeState>> =
+    /// Each live recur site's `DraftBuffer`, keyed by its anchor (§Draft
+    /// identity) — a host-side key no step can select.
+    static THREAD_DRAFT_STORAGE: RefCell<BTreeMap<Anchor, DraftBuffer>> =
         RefCell::new(BTreeMap::new());
 }
 
@@ -1130,7 +1092,7 @@ fn site_draft_anchor<S: Schema>() -> Result<Anchor> {
     Ok(anchor_for_schema(&site, S::schema_hash()))
 }
 
-fn insert_draft(anchor: Anchor, state: DraftRuntimeState) -> Result<()> {
+fn insert_draft(anchor: Anchor, state: DraftBuffer) -> Result<()> {
     THREAD_DRAFT_STORAGE.with(|drafts| {
         let mut drafts = drafts.borrow_mut();
         if drafts.contains_key(&anchor) {
@@ -1149,103 +1111,58 @@ pub fn create_site_draft<S>() -> Result<(Anchor, [u8; 32])>
 where
     S: Schema,
 {
-    let schema = S::schema();
     let anchor = site_draft_anchor::<S>()?;
-    let current_root = if drafts_are_authenticated() {
-        draft_root_from_field_roots(&schema, &BTreeMap::new())?
-    } else {
-        UNAUTHENTICATED_DRAFT_ROOT
-    };
-    insert_draft(
-        anchor,
-        DraftRuntimeState {
-            schema,
-            current_root,
-            fields: BTreeMap::new(),
-            ops: Vec::new(),
-        },
-    )?;
+    let buffer = DraftBuffer::new(S::schema(), drafts_are_authenticated())?;
+    let current_root = buffer.current_root;
+    insert_draft(anchor, buffer)?;
+    Ok((anchor, current_root))
+}
+
+/// Open a recur site that **derives** from the stored object `base`
+/// (`output = base`), on the object itself: its index and bytes are shared,
+/// set-once fields decoded, each list continued from its stored Merkle levels
+/// — `O(#fields + log N)`, no element decoded or hashed
+/// (`incremental-draft-materialization` §Continuation on the draft buffer).
+/// Authenticated runs only; the root is the base's commitment.
+pub fn derive_site_draft_from<S>(base: &StorageRef) -> Result<(Anchor, [u8; 32])>
+where
+    S: Schema,
+{
+    let anchor = site_draft_anchor::<S>()?;
+    let base = THREAD_STORAGE.with(|storage| storage.borrow().derivation_base(base))?;
+    let buffer = DraftBuffer::derive(S::schema(), base)?;
+    let current_root = buffer.current_root;
+    insert_draft(anchor, buffer)?;
     Ok((anchor, current_root))
 }
 
 /// Open a recur site that **derives** from `base` (`output = base` in
 /// `call_recur!`): a draft holding `base`'s every field, so the site's
-/// object is `base` plus what the sweep appends.
+/// object is `base` plus what the sweep appends. The value-based form, for an
+/// unauthenticated run (which stores nothing to share) and a base that is a
+/// selection inside an object.
 ///
 /// Push-only falls out of the state rather than a flag: every set-once field
-/// is already written, and a second write to one is refused
-/// (`apply_draft_set`). The returned root is `base`'s raster root, which is
-/// what a derived object's chain must start from (§Extension is derivation).
-///
-/// `O(N)` in `base` — every element is hashed again to rebuild the append
-/// frontiers. Batch D's continuation reads them from the base's stored index
-/// instead.
+/// is already written, and a second write to one is refused. The returned
+/// root is `base`'s raster root, which is what a derived object's chain must
+/// start from (§Extension is derivation).
 pub fn derive_site_draft<S>(base: &S) -> Result<(Anchor, [u8; 32])>
 where
     S: Schema + Serialize,
 {
-    let schema = S::schema();
     let anchor = site_draft_anchor::<S>()?;
-    let authenticated = drafts_are_authenticated();
+    let mut buffer = DraftBuffer::new(S::schema(), drafts_are_authenticated())?;
     let DraftValue::Struct(values) = draft_value_from_serialize(base)? else {
         return Err(Error::Other(format!(
             "A derived draft's base '{}' is not a struct",
             core::any::type_name::<S>()
         )));
     };
-    let mut fields = BTreeMap::new();
-    for field in schema_struct_fields(&schema)? {
-        let value = values
-            .iter()
-            .find(|(name, _)| name == &field.name)
-            .map(|(_, value)| value.clone())
-            .ok_or_else(|| {
-                Error::Other(format!("Derived draft base lacks field '{}'", field.name))
-            })?;
-        let runtime = match field.mode {
-            SchemaFieldMode::SetOnce => DraftFieldRuntime::Set {
-                root: if authenticated {
-                    draft_value_root(&value)?
-                } else {
-                    UNAUTHENTICATED_DRAFT_ROOT
-                },
-                value,
-            },
-            SchemaFieldMode::AppendOnlyVec => {
-                let elements = match value {
-                    DraftValue::ListHandle(elements) | DraftValue::List(elements) => elements,
-                    _ => {
-                        return Err(Error::Other(format!(
-                            "Derived draft base field '{}' is not a list",
-                            field.name
-                        )))
-                    }
-                };
-                let mut frontier = AppendFrontier::empty();
-                if authenticated {
-                    for element in &elements {
-                        frontier.push(draft_value_root(element)?);
-                    }
-                }
-                DraftFieldRuntime::Append {
-                    values: elements,
-                    frontier,
-                }
-            }
-        };
-        fields.insert(field.name.clone(), runtime);
+    for (name, value) in values {
+        buffer.adopt(&name, value)?;
     }
-    let mut state = DraftRuntimeState {
-        schema,
-        current_root: UNAUTHENTICATED_DRAFT_ROOT,
-        fields,
-        ops: Vec::new(),
-    };
-    if authenticated {
-        state.current_root = state.recompose_root()?;
-    }
-    let current_root = state.current_root;
-    insert_draft(anchor, state)?;
+    let current_root = buffer.current_root;
+    insert_draft(anchor, buffer)?;
     Ok((anchor, current_root))
 }
 
@@ -1271,7 +1188,7 @@ where
             anchor: *anchor,
             schema_hash: compute_schema_hash(&state.schema),
             root_before: *expected_root,
-            pre_state: draft_state_witness(state),
+            pre_state: state.witness(),
             op_count_before: state.ops.len(),
         })
     })
@@ -1318,59 +1235,7 @@ where
     S: Schema,
     T: Serialize,
 {
-    let tree = draft_value_from_serialize(value)?;
-    THREAD_DRAFT_STORAGE.with(|drafts| {
-        let mut drafts = drafts.borrow_mut();
-        let state = drafts
-            .get_mut(anchor)
-            .ok_or_else(|| Error::Other("Unknown draft anchor".into()))?;
-        let authenticated = drafts_are_authenticated();
-        if authenticated && state.current_root != *expected_root {
-            return Err(Error::Other(format!(
-                "Draft root mismatch for field '{}': expected {:?}, found {:?}",
-                field, expected_root, state.current_root
-            )));
-        }
-        // Schema and set-once checks run in both modes: they are the draft's
-        // semantics, not its authentication.
-        let schema_field = locate_schema_field(&state.schema, field)?;
-        if schema_field.mode != SchemaFieldMode::SetOnce {
-            return Err(Error::Other(format!(
-                "Draft field '{}' does not support set; use push",
-                field
-            )));
-        }
-        if state.fields.contains_key(field) {
-            return Err(Error::Other(format!(
-                "Draft field '{}' can only be written once",
-                field
-            )));
-        }
-        if !authenticated {
-            // The field value is what `finalize` materializes from, so it is
-            // kept. The per-value root, the op log (replay only) and the root
-            // recomposition are all commitment work with no reader here.
-            state.fields.insert(
-                field.to_string(),
-                DraftFieldRuntime::Set {
-                    value: tree,
-                    root: UNAUTHENTICATED_DRAFT_ROOT,
-                },
-            );
-            return Ok(UNAUTHENTICATED_DRAFT_ROOT);
-        }
-        let root = draft_value_root(&tree)?;
-        state.fields.insert(
-            field.to_string(),
-            DraftFieldRuntime::Set { value: tree, root },
-        );
-        state.ops.push(DraftOp::Set {
-            field: field.to_string(),
-            value: draft_value_from_serialize(value)?,
-        });
-        state.current_root = state.recompose_root()?;
-        Ok(state.current_root)
-    })
+    apply_draft_write(anchor, expected_root, field, value, DraftBuffer::set)
 }
 
 pub fn apply_draft_push<S, T>(
@@ -1383,71 +1248,32 @@ where
     S: Schema,
     T: Serialize,
 {
+    apply_draft_write(anchor, expected_root, field, value, DraftBuffer::push)
+}
+
+/// One `set` or `push` on a live draft. Schema and set-once checks run in
+/// both modes — they are the draft's semantics; the root check and the op log
+/// only when authenticated.
+fn apply_draft_write<T: Serialize>(
+    anchor: &Anchor,
+    expected_root: &[u8; 32],
+    field: &str,
+    value: &T,
+    write: fn(&mut DraftBuffer, &str, DraftValue) -> Result<()>,
+) -> Result<[u8; 32]> {
     let tree = draft_value_from_serialize(value)?;
     THREAD_DRAFT_STORAGE.with(|drafts| {
         let mut drafts = drafts.borrow_mut();
         let state = drafts
             .get_mut(anchor)
             .ok_or_else(|| Error::Other("Unknown draft anchor".into()))?;
-        let authenticated = drafts_are_authenticated();
-        if authenticated && state.current_root != *expected_root {
+        if state.is_authenticated() && state.current_root != *expected_root {
             return Err(Error::Other(format!(
                 "Draft root mismatch for field '{}': expected {:?}, found {:?}",
                 field, expected_root, state.current_root
             )));
         }
-        let schema_field = locate_schema_field(&state.schema, field)?;
-        if schema_field.mode != SchemaFieldMode::AppendOnlyVec {
-            return Err(Error::Other(format!(
-                "Draft field '{}' does not support push; use set",
-                field
-            )));
-        }
-        // Hash the new element once, then move the frontier — O(log N). This
-        // used to re-Merkleize the entire accumulated list on every push, which
-        // dominated the host cost of a large draft. Unauthenticated runs skip
-        // the leaf hash and leave the frontier empty: nothing reads it, since
-        // `root()` is only reached through root recomposition and the witness,
-        // both of which are off.
-        let leaf = if authenticated {
-            draft_value_root(&tree)?
-        } else {
-            UNAUTHENTICATED_DRAFT_ROOT
-        };
-        match state.fields.entry(field.to_string()) {
-            std::collections::btree_map::Entry::Vacant(entry) => {
-                let mut frontier = AppendFrontier::empty();
-                if authenticated {
-                    frontier.push(leaf);
-                }
-                entry.insert(DraftFieldRuntime::Append {
-                    values: vec![tree],
-                    frontier,
-                });
-            }
-            std::collections::btree_map::Entry::Occupied(mut entry) => match entry.get_mut() {
-                DraftFieldRuntime::Append { values, frontier } => {
-                    values.push(tree);
-                    if authenticated {
-                        frontier.push(leaf);
-                    }
-                }
-                DraftFieldRuntime::Set { .. } => {
-                    return Err(Error::Other(format!(
-                        "Draft field '{}' is not appendable",
-                        field
-                    )))
-                }
-            },
-        }
-        if !authenticated {
-            return Ok(UNAUTHENTICATED_DRAFT_ROOT);
-        }
-        state.ops.push(DraftOp::Push {
-            field: field.to_string(),
-            value: draft_value_from_serialize(value)?,
-        });
-        state.current_root = state.recompose_root()?;
+        write(state, field, tree)?;
         Ok(state.current_root)
     })
 }
@@ -1687,28 +1513,32 @@ where
         "empty finalize"
     };
     let state = take_draft_state(anchor, expected_root, operation)?;
-    // Materializing the whole object here is correct and stays: it is O(N)
-    // once, which was never the problem.
-    let tree = build_draft_tree(&state.schema, &state.field_values(), require_complete)?;
+    let tree = state.materialize(require_complete)?;
     typed_value_from_tree::<S>(&tree).map_err(|error| {
-        if !require_complete {
-            if let Ok(Some(field)) = first_unset_set_once_field(&state.schema, &state.fields) {
-                return Error::Other(format!(
-                    "Empty recur input cannot finalize draft '{}': field '{}' was never written and the schema cannot materialize a default value",
-                    core::any::type_name::<S>(),
-                    field
-                ));
-            }
-            return Error::Serialization(format!(
-                "Failed to materialize finalized empty draft value: {}",
-                error
+        partial_object_error::<S>(&state, require_complete, error)
+    })
+}
+
+/// Why a draft could not become an `S`: for an empty sweep, the set-once
+/// field the schema cannot leave unwritten.
+fn partial_object_error<S>(state: &DraftBuffer, require_complete: bool, error: Error) -> Error {
+    if !require_complete {
+        if let Ok(Some(field)) = state.first_unset_set_once_field() {
+            return Error::Other(format!(
+                "Empty recur input cannot finalize draft '{}': field '{}' was never written and the schema cannot materialize a default value",
+                core::any::type_name::<S>(),
+                field
             ));
         }
-        Error::Serialization(format!(
-            "Failed to materialize finalized draft value: {}",
+        return Error::Serialization(format!(
+            "Failed to materialize finalized empty draft value: {}",
             error
-        ))
-    })
+        ));
+    }
+    Error::Serialization(format!(
+        "Failed to materialize finalized draft value: {}",
+        error
+    ))
 }
 
 /// A draft completes only at its recur site's close, as the site's object at
@@ -1756,15 +1586,41 @@ fn finalize_and_store<S>(
 where
     S: Schema + DeserializeOwned + Serialize,
 {
+    if !drafts_are_authenticated() {
+        let value = finalize_draft_value::<S>(anchor, expected_root, require_complete)?;
+        return store_finalized_draft(&value);
+    }
     let profiling_enabled = crate::profiling::profiling_enabled();
 
     let materialize_start = profiling_enabled.then(std::time::Instant::now);
-    let value = finalize_draft_value::<S>(anchor, expected_root, require_complete)?;
+    let operation = if require_complete { "finalize" } else { "empty finalize" };
+    let state = take_draft_state(anchor, expected_root, operation)?;
+    // An empty sweep may leave set-once fields unwritten; the object must
+    // still be an `S`. Checked on the object with its lists emptied — the
+    // only part a partial draft can get wrong — not on all N elements.
+    if !require_complete && state.first_unset_set_once_field()?.is_some() {
+        typed_value_from_tree::<S>(&state.shape_without_lists()?)
+            .map_err(|error| partial_object_error::<S>(&state, require_complete, error))?;
+    }
+    if state.is_derived() {
+        let (mut object, delta) = state.seal_derived()?;
+        object.delta = Some(Arc::new(delta));
+        let materialize_ns = elapsed_ns(materialize_start);
+        let store_start = profiling_enabled.then(std::time::Instant::now);
+        let reference = store_derived_at_site(object);
+        crate::profiling::record_sequence_draft_finalize(
+            materialize_ns,
+            elapsed_ns(store_start),
+            Default::default(),
+        );
+        return reference;
+    }
+    let sealed = state.seal(require_complete)?;
     let materialize_ns = elapsed_ns(materialize_start);
 
     crate::profiling::arm_draft_store_phases();
     let store_start = profiling_enabled.then(std::time::Instant::now);
-    let reference = store_finalized_draft(&value);
+    let reference = store_sealed_at_site(sealed);
     let store_ns = elapsed_ns(store_start);
     let phases = crate::profiling::take_draft_store_phases();
 
@@ -1772,10 +1628,86 @@ where
     reference
 }
 
+/// Store a derived object at the current recur site's coordinate.
+fn store_derived_at_site(object: crate::backing::DerivedObject) -> Result<StorageRef> {
+    let coordinates = current_recur_site_coordinates().ok_or_else(|| {
+        Error::Other("A draft can only be completed at its recur site's close".into())
+    })?;
+    let commitment = object.root.to_vec();
+    THREAD_STORAGE.with(|storage| {
+        let entry = storage.borrow_mut().put(
+            coordinates.clone(),
+            commitment,
+            ObjectBacking::Derived(object),
+        );
+        Ok(StorageRef::new(coordinates, entry.object_commitment))
+    })
+}
+
+/// Store a sealed object at the current recur site's coordinate. Its raster
+/// payload is the object; there are no postcard bytes to keep — every read of
+/// an object with a raster payload goes through it.
+fn store_sealed_at_site(sealed: crate::draft_buffer::SealedObject) -> Result<StorageRef> {
+    let coordinates = current_recur_site_coordinates().ok_or_else(|| {
+        Error::Other("A draft can only be completed at its recur site's close".into())
+    })?;
+    let raster = RasterPayload {
+        bytes: sealed.payload,
+        index_bytes: sealed.index.encode()?,
+        root_hash: sealed.root,
+    };
+    // Stored with the seal's index in hand, so no read of this object — and
+    // no site deriving from it — ever parses it back from its bytes.
+    let object = Arc::new(RasterObject::with_index(raster, sealed.index));
+    THREAD_STORAGE.with(|storage| {
+        let entry = storage.borrow_mut().put(
+            coordinates.clone(),
+            sealed.root.to_vec(),
+            ObjectBacking::Owned(OwnedObject {
+                bytes: Vec::new(),
+                raster: Some(object),
+            }),
+        );
+        Ok(StorageRef::new(coordinates, entry.object_commitment))
+    })
+}
+
 fn elapsed_ns(start: Option<std::time::Instant>) -> u64 {
     start
         .map(|start| u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX))
         .unwrap_or(0)
+}
+
+/// A recur site's close event output: the stored object's raster payload,
+/// cloned as storage holds it — the seal's bytes, index and root — with no
+/// decode and no re-encode. One encoding feeds both the child's store and the
+/// trace (`incremental-draft-materialization` §Where the seal runs). The
+/// output carries no postcard bytes: an object with a raster payload is read
+/// through it.
+pub fn stored_object_output(
+    reference: &StorageRef,
+    ty: &str,
+) -> Result<raster_core::trace::FnOutput> {
+    THREAD_STORAGE.with(|storage| {
+        let storage = storage.borrow();
+        let stored = storage.verify_reference(reference)?;
+        if let ObjectBacking::Derived(derived) = &stored.backing {
+            let delta = derived.delta.as_ref().ok_or_else(|| {
+                Error::Other("A derived object holds no delta to publish".into())
+            })?;
+            return Ok(raster_core::trace::FnOutput::new(Vec::new(), ty.to_string())
+                .with_derived((**delta).clone()));
+        }
+        let ObjectBacking::Owned(owned) = &stored.backing else {
+            return Err(Error::Other(format!(
+                "Object at coordinates {:?} is not one the program wrote",
+                reference.coordinates
+            )));
+        };
+        let raster = ObjectStore::require_raster(owned, &reference.coordinates)?;
+        Ok(raster_core::trace::FnOutput::new(Vec::new(), ty.to_string())
+            .with_raster(raster.payload.clone()))
+    })
 }
 
 pub fn resolve_storage_value<T: DeserializeOwned>(
@@ -1996,7 +1928,7 @@ mod tests {
     /// A draft with a `List<String>` field, for the large-draft measurement.
     #[derive(Debug, Deserialize, Serialize)]
     struct BigDraft {
-        lines: Vec<String>,
+        lines: raster_core::collections::List<String>,
     }
 
     impl Selectable for BigDraft {
@@ -2032,57 +1964,120 @@ mod tests {
     fn large_draft_finalize_scaling() {
         println!();
         println!(
-            "{:>8}  {:>12}  {:>12}  {:>12}  {:>12}  {:>12}  {:>10}",
-            "N", "push_total", "materialize", "encode", "append", "finalize", "ns/element"
+            "{:>8}  {:>12}  {:>12}  {:>14}  {:>14}",
+            "N", "push_total", "finalize", "finalize ns/el", "encode whole"
         );
 
-        for n in [1usize, 16, 64, 256, 1024, 4096, 16384] {
+        for n in [1usize, 16, 64, 256, 1024, 4096, 16384, 65536] {
             let _scope = SequenceScopeGuard::enter("bench");
             enter_recur_site_scope().expect("site scope");
             let (anchor, mut root) =
                 create_site_draft::<BigDraft>().expect("draft is created");
 
+            let lines: Vec<String> = (0..n).map(|index| format!("line-{index:08}")).collect();
             let push_start = std::time::Instant::now();
-            for index in 0..n {
-                let line = format!("line-{index:08}");
-                root = apply_draft_push::<BigDraft, String>(&anchor, &root, "lines", &line)
+            for line in &lines {
+                root = apply_draft_push::<BigDraft, String>(&anchor, &root, "lines", line)
                     .expect("push applies");
             }
             let push_ns = push_start.elapsed().as_nanos() as u64;
 
-            // The two halves of the close, timed apart exactly as
-            // `finalize_and_store` times them in a real run.
-            let materialize_start = std::time::Instant::now();
-            let value = finalize_draft_value::<BigDraft>(&anchor, &root, true)
-                .expect("draft materializes");
-            let materialize_ns = materialize_start.elapsed().as_nanos() as u64;
-            assert_eq!(value.lines.len(), n, "draft holds every pushed element");
+            // The close: seal the buffer and store the object.
+            let finalize_start = std::time::Instant::now();
+            let stored = finalize_draft::<BigDraft>(&anchor, &root).expect("draft seals");
+            let finalize_ns = finalize_start.elapsed().as_nanos() as u64;
+            assert_eq!(stored.commitment, root.to_vec());
 
-            // `encode_raster_value` is Stage 1's target: the second hash of
-            // every element. Measured on its own, outside the storage write.
+            // What the close cost before the buffer: encoding the whole value.
+            let value = BigDraft {
+                lines: raster_core::collections::List::from(lines),
+            };
             let encode_start = std::time::Instant::now();
             let _payload = raster_payload_for_value(&value).expect("value encodes");
             let encode_ns = encode_start.elapsed().as_nanos() as u64;
 
-            let append_start = std::time::Instant::now();
-            let stored = store_finalized_draft(&value).expect("value stores");
-            let append_ns = append_start.elapsed().as_nanos() as u64;
-            let _ = stored;
-
-            let finalize_ns = materialize_ns + append_ns;
             println!(
-                "{:>8}  {:>10.2}ms  {:>10.2}ms  {:>10.2}ms  {:>10.2}ms  {:>10.2}ms  {:>10}",
+                "{:>8}  {:>10.2}ms  {:>10.2}ms  {:>14}  {:>12.2}ms",
                 n,
                 push_ns as f64 / 1e6,
-                materialize_ns as f64 / 1e6,
-                encode_ns as f64 / 1e6,
-                append_ns as f64 / 1e6,
                 finalize_ns as f64 / 1e6,
                 finalize_ns / n as u64,
+                encode_ns as f64 / 1e6,
             );
             exit_recur_site_scope();
         }
+    }
+
+    /// How a derived site's cost scales in its base's size: open, 16 pushes,
+    /// close — on the stored object (shared) and on its decoded value (the
+    /// rebuild it replaces), with the close's delta size.
+    ///
+    /// `cargo test -p raster-runtime --release --lib derived_site_scaling -- --ignored --nocapture`
+    #[test]
+    #[ignore = "measurement, not an assertion"]
+    fn derived_site_scaling() {
         println!();
-        println!("`encode` is included in `append` (append calls it); it is timed twice on purpose.");
+        println!(
+            "{:>8}  {:>12}  {:>12}  {:>12}  {:>12}  {:>10}",
+            "base N", "open", "push 16", "close", "rebuild open", "delta B"
+        );
+        for n in [1024usize, 16384, 65536, 262144] {
+            let _scope = SequenceScopeGuard::enter("bench");
+            // The base: a creating site's object of N lines.
+            enter_recur_site_scope().expect("site scope");
+            let (anchor, mut root) = create_site_draft::<BigDraft>().expect("draft");
+            let lines: Vec<String> = (0..n).map(|i| format!("line-{i:08}")).collect();
+            for line in &lines {
+                root = apply_draft_push::<BigDraft, String>(&anchor, &root, "lines", line)
+                    .expect("push");
+            }
+            let base = finalize_draft::<BigDraft>(&anchor, &root).expect("base seals");
+            exit_recur_site_scope();
+
+            // A deriving site on the stored base.
+            enter_recur_site_scope().expect("site scope");
+            let open_start = std::time::Instant::now();
+            let (anchor, mut root) = derive_site_draft_from::<BigDraft>(&base).expect("derive");
+            let open_ns = open_start.elapsed().as_nanos() as u64;
+            let push_start = std::time::Instant::now();
+            for i in 0..16 {
+                root = apply_draft_push::<BigDraft, String>(
+                    &anchor,
+                    &root,
+                    "lines",
+                    &format!("more-{i}"),
+                )
+                .expect("push");
+            }
+            let push_ns = push_start.elapsed().as_nanos() as u64;
+            let close_start = std::time::Instant::now();
+            let derived = finalize_draft::<BigDraft>(&anchor, &root).expect("derived seals");
+            let close_ns = close_start.elapsed().as_nanos() as u64;
+            let delta = stored_object_output(&derived, "BigDraft")
+                .expect("output")
+                .derived
+                .expect("a delta")
+                .tail
+                .len();
+            exit_recur_site_scope();
+
+            // The rebuild it replaces: open from the decoded value.
+            enter_recur_site_scope().expect("site scope");
+            let value: BigDraft = resolve_storage_value::<BigDraft>(&base).expect("base").into_inner();
+            let rebuild_start = std::time::Instant::now();
+            let _ = derive_site_draft::<BigDraft>(&value).expect("rebuild");
+            let rebuild_ns = rebuild_start.elapsed().as_nanos() as u64;
+            exit_recur_site_scope();
+
+            println!(
+                "{:>8}  {:>10.3}ms  {:>10.3}ms  {:>10.3}ms  {:>10.2}ms  {:>10}",
+                n,
+                open_ns as f64 / 1e6,
+                push_ns as f64 / 1e6,
+                close_ns as f64 / 1e6,
+                rebuild_ns as f64 / 1e6,
+                delta,
+            );
+        }
     }
 }

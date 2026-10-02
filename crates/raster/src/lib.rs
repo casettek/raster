@@ -34,6 +34,8 @@ pub fn auth_mode() -> AuthMode {
 }
 
 pub mod input;
+#[cfg(feature = "std")]
+pub use input::stored_object_output;
 pub use input::{
     __raster_clone, attach_index_bindings, auth_ref_result_trace, auth_ref_trace,
     complete_tile_draft, draft_replay_handle, draft_replay_transition, entry_argument_auth_ref,

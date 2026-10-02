@@ -239,11 +239,43 @@ pub struct RasterPayload {
     pub root_hash: Hash32,
 }
 
+/// What a derived object adds over its base: the delta a deriving site's close
+/// carries. `O(k + #fields + log N)` for k appended elements onto a base of N.
+///
+/// The recorder rebuilds the object from its own copy of the base: the
+/// logical payload is `segments` in order — base ranges are offsets into the
+/// base object's logical payload, tail ranges into `tail` — and the index is
+/// `overlay_nodes` (the runtime's index nodes, postcard-encoded) layered over
+/// the base's `base_node_count` nodes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct DerivedPayload {
+    pub base_coordinates: CfsCoordinates,
+    pub base_commitment: Vec<u8>,
+    pub base_node_count: u64,
+    pub tail: Vec<u8>,
+    pub segments: Vec<DerivedSegment>,
+    pub overlay_nodes: Vec<u8>,
+    pub root_node: u64,
+    pub root_hash: Hash32,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum DerivedSegment {
+    Base { offset: u64, len: u64 },
+    Tail { offset: u64, len: u64 },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct FnOutput {
     pub data: Vec<u8>,
     pub ty: String,
     pub raster: Option<RasterPayload>,
+    /// A derived object (`output = base`) travels as what derivation added
+    /// over its base, which the recorder already holds, instead of the whole
+    /// object (`incremental-draft-materialization` §Continuation on the draft
+    /// buffer). `None` for every other output.
+    #[serde(default)]
+    pub derived: Option<DerivedPayload>,
 }
 
 impl FnOutput {
@@ -252,11 +284,17 @@ impl FnOutput {
             data,
             ty: ty.into(),
             raster: None,
+            derived: None,
         }
     }
 
     pub fn with_raster(mut self, raster: RasterPayload) -> Self {
         self.raster = Some(raster);
+        self
+    }
+
+    pub fn with_derived(mut self, derived: DerivedPayload) -> Self {
+        self.derived = Some(derived);
         self
     }
 

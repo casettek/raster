@@ -24,8 +24,9 @@ use crate::source::SourceFile;
 
 pub(crate) use raster_core::tree::{
     subtree_payload_and_root, tree_value_from_serialize, typed_value_from_tree, TreeValue,
-    LIST_HANDLE_HEADER_LEN,
 };
+#[cfg(test)]
+use raster_core::tree::LIST_HANDLE_HEADER_LEN;
 
 
 fn parse_leaf_value(type_name: &str, subtree_bytes: &[u8]) -> CoreResult<TreeValue> {
@@ -178,30 +179,27 @@ pub(crate) fn tree_value_from_raster_location(
     selection: &RasterSelectionLocation,
 ) -> CoreResult<TreeValue> {
     let Some(range) = selection.range else {
-        return tree_value_from_raster_node(index, data, selection.node_id);
+        return tree_value_from_raster_node(index, data, selection.node_id, selection.offset);
     };
 
     // A range selects a slice of a list node's elements, which is a `List`
     // value of its own — never a `ListHandle`, since the slice is not the
     // committed collection and carries no stored root.
-    let node = index.get_node(selection.node_id)?;
-    let RasterNodeKind::List { elements, .. } = &node.kind else {
+    if index.list_len(selection.node_id)?.is_none() {
         return Err(Error::Other(
             "Range selection resolved to a non-list raster node".into(),
         ));
-    };
-    let slice = elements
-        .get(range.start as usize..range.end as usize)
-        .ok_or_else(|| {
-            Error::Serialization(format!(
-                "Malformed raster index: list range '{}..{}' exceeds its element table",
-                range.start, range.end
-            ))
-        })?;
+    }
+    let slice = index.list_elements(selection.node_id, range.start, range.end)?;
 
     let mut values = Vec::with_capacity(slice.len());
     for child in slice {
-        values.push(tree_value_from_raster_node(index, data, *child)?);
+        values.push(tree_value_from_raster_node(
+            index,
+            data,
+            child,
+            index.child_position(selection.node_position, child)?,
+        )?);
     }
     Ok(TreeValue::List(values))
 }
@@ -229,16 +227,19 @@ fn raster_selection_payload(
     Ok(payload)
 }
 
-fn tree_value_from_raster_node<D: RasterData + ?Sized>(
+/// `position` is the node's data-file position, computed on descent: index
+/// offsets are parent-relative (`rindex04`).
+pub(crate) fn tree_value_from_raster_node<D: RasterData + ?Sized>(
     index: &RasterIndex,
     data: &D,
     node_id: u64,
+    position: u64,
 ) -> CoreResult<TreeValue> {
     let node = index.get_node(node_id)?;
     match &node.kind {
         RasterNodeKind::Unit => Ok(TreeValue::Unit),
         RasterNodeKind::Leaf { type_name } => {
-            let subtree = data.read_subtree(node.offset, node.len)?;
+            let subtree = data.read_subtree(position, node.len)?;
             parse_leaf_value(type_name, &subtree)
         }
         RasterNodeKind::Struct { fields } => {
@@ -246,15 +247,20 @@ fn tree_value_from_raster_node<D: RasterData + ?Sized>(
             for field in fields {
                 values.push((
                     field.name.clone(),
-                    tree_value_from_raster_node(index, data, field.child)?,
+                    tree_value_from_raster_node(index, data, field.child, index.child_position(position, field.child)?)?,
                 ));
             }
             Ok(TreeValue::Struct(values))
         }
-        RasterNodeKind::List { elements, .. } => {
-            let mut values = Vec::with_capacity(elements.len());
-            for child in elements {
-                values.push(tree_value_from_raster_node(index, data, *child)?);
+        RasterNodeKind::List { len, .. } | RasterNodeKind::ListContinuation { len, .. } => {
+            let mut values = Vec::with_capacity(*len as usize);
+            for child in index.list_elements(node_id, 0, *len)? {
+                values.push(tree_value_from_raster_node(
+                    index,
+                    data,
+                    child,
+                    index.child_position(position, child)?,
+                )?);
             }
             Ok(TreeValue::List(values))
         }
@@ -262,8 +268,8 @@ fn tree_value_from_raster_node<D: RasterData + ?Sized>(
             let mut values = Vec::with_capacity(entries.len());
             for entry in entries {
                 values.push((
-                    tree_value_from_raster_node(index, data, entry.key)?,
-                    tree_value_from_raster_node(index, data, entry.value)?,
+                    tree_value_from_raster_node(index, data, entry.key, index.child_position(position, entry.key)?)?,
+                    tree_value_from_raster_node(index, data, entry.value, index.child_position(position, entry.value)?)?,
                 ));
             }
             Ok(TreeValue::Map(values))
@@ -271,12 +277,12 @@ fn tree_value_from_raster_node<D: RasterData + ?Sized>(
         RasterNodeKind::EnumUnit { variant } => Ok(TreeValue::EnumUnit(variant.clone())),
         RasterNodeKind::EnumNewtype { variant, child } => Ok(TreeValue::EnumNewtype(
             variant.clone(),
-            Box::new(tree_value_from_raster_node(index, data, *child)?),
+            Box::new(tree_value_from_raster_node(index, data, *child, index.child_position(position, *child)?)?),
         )),
         RasterNodeKind::EnumTuple { variant, elements } => {
             let mut values = Vec::with_capacity(elements.len());
             for child in elements {
-                values.push(tree_value_from_raster_node(index, data, *child)?);
+                values.push(tree_value_from_raster_node(index, data, *child, index.child_position(position, *child)?)?);
             }
             Ok(TreeValue::EnumTuple(variant.clone(), values))
         }
@@ -285,7 +291,7 @@ fn tree_value_from_raster_node<D: RasterData + ?Sized>(
             for field in fields {
                 values.push((
                     field.name.clone(),
-                    tree_value_from_raster_node(index, data, field.child)?,
+                    tree_value_from_raster_node(index, data, field.child, index.child_position(position, field.child)?)?,
                 ));
             }
             Ok(TreeValue::EnumStruct(variant.clone(), values))
@@ -365,13 +371,14 @@ pub(crate) fn raster_value_from_node<D: RasterData + ?Sized>(
     node_id: u64,
     limits: &ReadLimits,
 ) -> CoreResult<RasterValue> {
-    raster_value_at_depth(index, data, node_id, limits, 0)
+    raster_value_at_depth(index, data, node_id, index.root_position()?, limits, 0)
 }
 
 fn raster_value_at_depth<D: RasterData + ?Sized>(
     index: &RasterIndex,
     data: &D,
     node_id: u64,
+    position: u64,
     limits: &ReadLimits,
     depth: usize,
 ) -> CoreResult<RasterValue> {
@@ -387,20 +394,21 @@ fn raster_value_at_depth<D: RasterData + ?Sized>(
     match &node.kind {
         RasterNodeKind::Unit => Ok(RasterValue::Unit),
         RasterNodeKind::Leaf { type_name } => {
-            let subtree = data.read_subtree(node.offset, node.len)?;
+            let subtree = data.read_subtree(position, node.len)?;
             raster_value_from_leaf(parse_leaf_value(type_name, &subtree)?, limits)
         }
         RasterNodeKind::Struct { fields } => {
-            raster_value_fields(index, data, fields, limits, child_depth)
+            raster_value_fields(index, data, fields, position, limits, child_depth)
         }
-        RasterNodeKind::List { len, elements, .. } => {
-            let kept = elements.len().min(limits.max_list_elements);
+        RasterNodeKind::List { len, .. } | RasterNodeKind::ListContinuation { len, .. } => {
+            let kept = (*len as usize).min(limits.max_list_elements);
             let mut values = Vec::with_capacity(kept);
-            for child in &elements[..kept] {
+            for child in index.list_elements(node_id, 0, kept as u64)? {
                 values.push(raster_value_at_depth(
                     index,
                     data,
-                    *child,
+                    child,
+                    index.child_position(position, child)?,
                     limits,
                     child_depth,
                 )?);
@@ -408,7 +416,7 @@ fn raster_value_at_depth<D: RasterData + ?Sized>(
             Ok(RasterValue::List {
                 len: *len,
                 elements: values,
-                truncated: kept < elements.len(),
+                truncated: kept < *len as usize,
             })
         }
         RasterNodeKind::Map { entries } => {
@@ -416,8 +424,8 @@ fn raster_value_at_depth<D: RasterData + ?Sized>(
             let mut values = Vec::with_capacity(kept);
             for entry in &entries[..kept] {
                 values.push((
-                    raster_value_at_depth(index, data, entry.key, limits, child_depth)?,
-                    raster_value_at_depth(index, data, entry.value, limits, child_depth)?,
+                    raster_value_at_depth(index, data, entry.key, index.child_position(position, entry.key)?, limits, child_depth)?,
+                    raster_value_at_depth(index, data, entry.value, index.child_position(position, entry.value)?, limits, child_depth)?,
                 ));
             }
             Ok(RasterValue::Map {
@@ -432,25 +440,13 @@ fn raster_value_at_depth<D: RasterData + ?Sized>(
         }),
         RasterNodeKind::EnumNewtype { variant, child } => Ok(RasterValue::Enum {
             variant: variant.clone(),
-            payload: Some(Box::new(raster_value_at_depth(
-                index,
-                data,
-                *child,
-                limits,
-                child_depth,
-            )?)),
+            payload: Some(Box::new(raster_value_at_depth(index, data, *child, index.child_position(position, *child)?, limits, child_depth)?)),
         }),
         RasterNodeKind::EnumTuple { variant, elements } => {
             let kept = elements.len().min(limits.max_list_elements);
             let mut values = Vec::with_capacity(kept);
             for child in &elements[..kept] {
-                values.push(raster_value_at_depth(
-                    index,
-                    data,
-                    *child,
-                    limits,
-                    child_depth,
-                )?);
+                values.push(raster_value_at_depth(index, data, *child, index.child_position(position, *child)?, limits, child_depth)?);
             }
             Ok(RasterValue::Enum {
                 variant: variant.clone(),
@@ -463,13 +459,7 @@ fn raster_value_at_depth<D: RasterData + ?Sized>(
         }
         RasterNodeKind::EnumStruct { variant, fields } => Ok(RasterValue::Enum {
             variant: variant.clone(),
-            payload: Some(Box::new(raster_value_fields(
-                index,
-                data,
-                fields,
-                limits,
-                child_depth,
-            )?)),
+            payload: Some(Box::new(raster_value_fields(index, data, fields, position, limits, child_depth)?)),
         }),
     }
 }
@@ -478,6 +468,7 @@ fn raster_value_fields<D: RasterData + ?Sized>(
     index: &RasterIndex,
     data: &D,
     fields: &[RasterStructField],
+    position: u64,
     limits: &ReadLimits,
     depth: usize,
 ) -> CoreResult<RasterValue> {
@@ -486,7 +477,7 @@ fn raster_value_fields<D: RasterData + ?Sized>(
     for field in &fields[..kept] {
         values.push((
             field.name.clone(),
-            raster_value_at_depth(index, data, field.child, limits, depth)?,
+            raster_value_at_depth(index, data, field.child, index.child_position(position, field.child)?, limits, depth)?,
         ));
     }
     Ok(RasterValue::Struct {
@@ -1170,15 +1161,20 @@ fn merkle_levels_from_hashes(hashes: &[Hash32]) -> Vec<crate::raster_index::Rast
 /// A child to be turned into a raster node, with its precomputed byte offset
 /// inside the parent's payload.
 #[derive(Clone, Copy)]
+#[cfg(test)]
 struct RasterChildPlan<'a> {
     value: &'a TreeValue,
     node_offset: u64,
 }
 
 /// In-progress node on the explicit build stack (replaces a recursive frame).
+#[cfg(test)]
 struct RasterFrame<'a> {
     value: &'a TreeValue,
     node_id: u64,
+    /// This node's data-file position; its children record theirs relative to
+    /// it (`rindex04`).
+    node_position: u64,
     root_hash: Hash32,
     children: RasterChildren<'a>,
     next: usize,
@@ -1186,6 +1182,7 @@ struct RasterFrame<'a> {
     child_ids: Vec<u64>,
 }
 
+#[cfg(test)]
 struct RasterChildren<'a> {
     plans: Vec<RasterChildPlan<'a>>,
     /// Child root hashes in element order (only consumed by `List` nodes).
@@ -1195,6 +1192,7 @@ struct RasterChildren<'a> {
 /// Compute the ordered children of `value` together with the byte offset each
 /// child node occupies inside `value`'s payload. The offset arithmetic and the
 /// `Map` ordering match the previous recursive implementation exactly.
+#[cfg(test)]
 fn prepare_raster_children<'a>(
     value: &'a TreeValue,
     offset: u64,
@@ -1308,7 +1306,7 @@ fn prepare_raster_children<'a>(
 /// Build a node's `RasterNodeKind` from its completed children. `child_ids` is
 /// in [`prepare_raster_children`] order; for `Map` that is the sorted
 /// [key0, value0, key1, value1, ...] sequence.
-fn finalize_raster_kind(
+pub(crate) fn finalize_raster_kind(
     value: &TreeValue,
     child_ids: &[u64],
     child_hashes: &[Hash32],
@@ -1375,10 +1373,12 @@ fn finalize_raster_kind(
 
 /// Reserve a node slot for `value` (pre-order id assignment) and prepare its
 /// children for the build stack.
+#[cfg(test)]
 fn enter_raster_frame<'a>(
     nodes: &mut Vec<crate::raster_index::RasterNode>,
     value: &'a TreeValue,
     offset: u64,
+    parent_position: u64,
 ) -> CoreResult<RasterFrame<'a>> {
     use crate::raster_index::{RasterNode, RasterNodeKind};
 
@@ -1397,7 +1397,7 @@ fn enter_raster_frame<'a>(
     };
     let node_id = nodes.len() as u64;
     nodes.push(RasterNode {
-        offset: node_offset,
+        offset: node_offset - parent_position,
         len: node_len,
         root_hash,
         kind: RasterNodeKind::Unit,
@@ -1406,6 +1406,7 @@ fn enter_raster_frame<'a>(
     Ok(RasterFrame {
         value,
         node_id,
+        node_position: node_offset,
         root_hash,
         children,
         next: 0,
@@ -1413,6 +1414,7 @@ fn enter_raster_frame<'a>(
     })
 }
 
+#[cfg(test)]
 fn build_raster_index_node(
     nodes: &mut Vec<crate::raster_index::RasterNode>,
     root_value: &TreeValue,
@@ -1421,7 +1423,7 @@ fn build_raster_index_node(
     // Iterative pre-order build with an explicit heap stack. Node ids are still
     // assigned in pre-order (parent before its children, children left to
     // right), so the on-disk layout is unchanged; only the call stack is gone.
-    let root_frame = enter_raster_frame(nodes, root_value, root_offset)?;
+    let root_frame = enter_raster_frame(nodes, root_value, root_offset, 0)?;
     let root_id = root_frame.node_id;
     let root_hash = root_frame.root_hash;
     let mut stack: Vec<RasterFrame> = vec![root_frame];
@@ -1437,15 +1439,16 @@ fn build_raster_index_node(
             if frame.next < frame.children.plans.len() {
                 let plan = frame.children.plans[frame.next];
                 frame.next += 1;
-                Some(plan)
+                Some((plan, frame.node_position))
             } else {
                 None
             }
         };
 
         match next_child {
-            Some(plan) => {
-                let child_frame = enter_raster_frame(nodes, plan.value, plan.node_offset)?;
+            Some((plan, parent_position)) => {
+                let child_frame =
+                    enter_raster_frame(nodes, plan.value, plan.node_offset, parent_position)?;
                 stack.push(child_frame);
             }
             None => {
@@ -1463,11 +1466,23 @@ fn build_raster_index_node(
 
 pub fn encode_raster_value<T: Serialize>(value: &T) -> CoreResult<(Vec<u8>, Vec<u8>, String)> {
     let tree = tree_value_from_serialize(value)?;
+    let mut nodes = Vec::new();
+    let encoded = crate::raster_encode::encode_indexed(&tree, &mut nodes)?;
+    let index = RasterIndex::new(encoded.node, encoded.root, nodes);
+    Ok((encoded.payload, index.encode()?, hex_string(&encoded.root)))
+}
+
+/// The builder [`crate::raster_encode::encode_indexed`] replaced, kept as the
+/// oracle its tests compare against: every selection must agree.
+#[cfg(test)]
+pub(crate) fn encode_raster_value_reference<T: Serialize>(
+    value: &T,
+) -> CoreResult<(Vec<u8>, RasterIndex)> {
+    let tree = tree_value_from_serialize(value)?;
     let (payload, root_hash) = subtree_payload_and_root(&tree)?;
     let mut nodes = Vec::new();
     let root_node = build_raster_index_node(&mut nodes, &tree, 0)?.0;
-    let index = RasterIndex::new(root_node, root_hash.clone(), nodes);
-    Ok((payload, index.encode()?, hex_string(&root_hash)))
+    Ok((payload, RasterIndex::new(root_node, root_hash, nodes)))
 }
 
 pub fn write_raster_files<T: Serialize>(
@@ -1994,7 +2009,9 @@ mod tests {
         let (data_bytes, index_bytes, _commitment) = encode_raster_value(&value).unwrap();
         let index = RasterIndex::from_bytes(&index_bytes).unwrap();
         let selection = index.root_selection().unwrap();
-        let tree = tree_value_from_raster_node(&index, &data_bytes, selection.node_id).unwrap();
+        let tree =
+            tree_value_from_raster_node(&index, &data_bytes, selection.node_id, selection.offset)
+                .unwrap();
         let decoded: ComplexSerdeValue = typed_value_from_tree(&tree).unwrap();
         let selected_hash = raster_core::input::selection_payload_hash(&data_bytes);
         let selected_len = data_bytes.len() as u64;
@@ -2078,7 +2095,7 @@ mod tests {
         let commitment = write_raster_files(&region, &data_path, &index_path).unwrap();
 
         let index_bytes = fs::read(&index_path).unwrap();
-        assert!(index_bytes.starts_with(b"rindex03"));
+        assert!(index_bytes.starts_with(b"rindex04"));
         let index = RasterIndex::from_bytes(&index_bytes).unwrap();
         assert_eq!(index.root_commitment_hex(), commitment);
 
@@ -2140,6 +2157,47 @@ mod tests {
                 );
                 assert_eq!(direct_payload.first().copied(), Some(0x0B));
             }
+        }
+    }
+
+    #[test]
+    fn rindex03_is_a_clean_version_error() {
+        let err = RasterIndex::from_bytes(b"rindex03xxxx").unwrap_err();
+        assert!(format!("{err}").contains("rindex03 is no longer supported; re-import as rindex04"));
+    }
+
+    /// The property `rindex04` exists for: offsets are parent-relative, so a
+    /// list growing moves no recorded offset in a sibling declared after it —
+    /// with absolute offsets every node of `b` would shift.
+    #[test]
+    fn growing_a_list_moves_no_recorded_offset_in_a_later_sibling() {
+        #[derive(Serialize)]
+        struct Two {
+            a: Vec<String>,
+            b: Vec<String>,
+        }
+        let index_of = |a: Vec<&str>| {
+            let value = Two {
+                a: a.into_iter().map(String::from).collect(),
+                b: vec!["x".into(), "yy".into()],
+            };
+            let (data, index_bytes, _) = encode_raster_value(&value).unwrap();
+            (data, RasterIndex::from_bytes(&index_bytes).unwrap())
+        };
+        let (short_data, short) = index_of(vec!["1"]);
+        let (long_data, long) = index_of(vec!["1", "2", "3"]);
+        for index in 0..2u64 {
+            let path = SelectorPath::new(vec![
+                SelectorSegment::Field("b".into()),
+                SelectorSegment::Index(index),
+            ]);
+            let short_node = short.get_node(short.locate(&path).unwrap().node_id).unwrap();
+            let long_node = long.get_node(long.locate(&path).unwrap().node_id).unwrap();
+            assert_eq!(short_node.offset, long_node.offset);
+            // ...while the positions computed on descent still read the right bytes.
+            let short_value = tree_value_from_raster_location(&short, &short_data, &short.locate(&path).unwrap()).unwrap();
+            let long_value = tree_value_from_raster_location(&long, &long_data, &long.locate(&path).unwrap()).unwrap();
+            assert_eq!(short_value, long_value);
         }
     }
 

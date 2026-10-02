@@ -2635,6 +2635,13 @@ where
     {
         let opened = match output {
             SiteOutput::Create => raster_runtime::create_site_draft::<S>(),
+            // A whole stored object, authenticated: open on the object itself,
+            // sharing its bytes and index (§Continuation on the draft buffer).
+            SiteOutput::Derive(AuthRef::Storage(binding))
+                if crate::auth_mode().is_authenticated() && binding.selector.segments.is_empty() =>
+            {
+                raster_runtime::derive_site_draft_from::<S>(&binding.reference)
+            }
             SiteOutput::Derive(base) => {
                 let (base, commitment) = match into_auth_value::<S, _>(base).unwrap_or_else(|error| {
                     panic!(
@@ -3400,4 +3407,14 @@ pub fn write_raster_files<T: Serialize>(
 #[cfg(feature = "std")]
 pub fn postcard_structural_commitment<T: Serialize>(value: &T) -> raster_core::Result<String> {
     raster_runtime::postcard_structural_commitment(value)
+}
+
+/// A recur site's close output: the stored object's raster payload, as is.
+#[cfg(feature = "std")]
+#[doc(hidden)]
+pub fn stored_object_output(
+    reference: &StorageRef,
+    ty: &str,
+) -> raster_core::Result<raster_core::trace::FnOutput> {
+    raster_runtime::stored_object_output(reference, ty)
 }

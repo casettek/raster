@@ -1802,7 +1802,7 @@ they break; the same table is in that proposal's §Order.
 | **A — trace shape** | `RecurStart`/`RecurEnd` step kinds, site closes at `[-s]`, `ExecTarget::RecurTile`/`RecurSequence` removed; D4 (nested `SequenceEnd` at `[-s]`); `RecurStartStep.storage` (read-only) takes over the interim `SequenceStart.storage` (landed 2026-09-30), which is removed again; site-ordering checks | trace shape, transition guest; **done 2026-09-30** — moves the image ids of tiles that link the edited code (see below) |
 | **B — language and object ownership** (**done 2026-10-01**) | §One storage rule and §The restriction: `new!`/`finalize`/`finalize = false` removed, a site owns its object at `[s]` (creates, or derives with `output = base`), plain tiles return values, `DRAFT_NAMESPACE` deleted, host anchor `anchor_for_schema([s], S)`; D1b (`RecurOutputDecl` in the CFS via `schema_walk`); programs rewritten (`examples/`, `crates/raster/tests`, `raster-inference`) | CFS, programs, `program_commitment` |
 | **C — tile journal** (one tile-image-id break) (**done 2026-10-01**) | D3 (recur iterations publish no output; an `Exec` with no write has an empty `output_commitment`); D2 (`draft_id` removed); D1a (replay tile asserts its schema); D5b (replayed state as raster roots, recur-sequence state by reference); **`tile-io-structural-roots` step 2** (`output_root`, `input_roots`); guest: the frame's draft entry replaces `active_drafts`, `RecurEnd` writes exactly one object | every tile image id, `program_commitment` |
-| **D — materialization** | `DraftBuffer`, one seal for store and `RecurEnd` output, `rindex04` relative offsets, derivation sharing (`Derived` backing, delta output) | `.rindex` format; no guest or tile change |
+| **D — materialization** (**done 2026-10-01**) | `DraftBuffer`, one seal for store and `RecurEnd` output, `rindex04` relative offsets, derivation sharing (`Derived` backing, delta output) | `.rindex` format; no guest or tile change |
 | **E — verification** | both proposals' Verification lists; `tile-io-structural-roots` step 3; GPU proving; all locks, `raster-inference` included | — |
 
 What implementing this proposal in full changes for `tile-io-structural-roots`:
@@ -1949,6 +1949,70 @@ is a separate follow-up).
 - **Limits, recorded.** A derive base, a stored seed, and a recur sequence's state must be whole
   objects: a binding carries the object commitment, not a selected value's root. A selected seed
   falls back to adoption for a recur tile and is refused for a recur sequence.
+
+**Batch D — done 2026-10-01** (materialization; `.rindex` format).
+
+- **`rindex04`.** `RasterNode.offset` is relative to the parent node's position (the root's to the
+  file); every reader computes positions on descent (`RasterIndex::child_position`). `rindex02`
+  and `rindex03` are refused with a re-import message. The four committed `.rindex` artifacts
+  (`hello-tiles`, `chain-example/phase1-normalize`) were regenerated; their data bytes and
+  commitments are unchanged. The relative offset lives in the child node (§Still open, left to
+  implementation).
+- **One-pass encoder** (`raster-runtime/src/raster_encode.rs`). Payload and root come from
+  `raster_core::tree::assemble_subtree`, so they are byte-identical by construction; the index is
+  built in the same post-order walk. It replaces a builder that re-encoded every subtree once per
+  ancestor, kept as the test oracle: every selection (fields, elements, ranges, through `List`
+  handles, nested lists, maps and enums) agrees. Whole-object encoding: 1.5 → 0.64 µs/element.
+- **`DraftBuffer`** (`draft_buffer.rs`), replacing `THREAD_DRAFT_STORAGE`'s decoded values. Per
+  list field: the encoded element region, element nodes in one draft-wide arena (ids final at
+  push), and the Merkle levels updated along the right spine; the witness frontier is read off the
+  levels. The seal writes the struct and handle headers around the buffers — no element encoded
+  or hashed again — and checks its root against the draft's. Tested equal to encoding the value
+  whole (payload, root, every selection) under interleaved writes. Unauthenticated runs keep
+  values. Measured (`large_draft_finalize_scaling`): finalize 1.5 → ~0.22 µs/element at 16k–65k
+  elements; a push is unchanged at ~1.6 µs (one encode and one hash of the element).
+- **One payload, two consumers.** A site's close event carries the stored object's raster payload
+  as storage holds it (`stored_object_output`) — no decode, no re-encode, no postcard copy. A
+  sealed object has no postcard bytes at all: every read of an object with a raster payload goes
+  through it.
+- **Index caching.** A stored raster object parses its index once (`RasterObject`, `OnceLock`), and
+  a sealed object is stored with the seal's index in hand. Before, every selection into an owned
+  object re-parsed its whole index.
+- **Derivation sharing.** `ObjectBacking::Derived { pieces, index, root, delta }` in both stores.
+  The index is layered over the base's (`RasterIndex::base`, ids continue past it) with
+  `ListContinuation` nodes — base list, extra element ids, per-level tails — so nothing `O(N)` is
+  copied; export flattens to a standalone `rindex04`. The bytes are a `PieceTable` over the first
+  object's bytes and each derivation's tail, flattened at derivation. A deriving site opens on the
+  base object's view (`derive_site_draft_from`): set-once fields decoded, lists continued from the
+  stored levels. Its seal writes overlay nodes only where an offset moved (a grown list's
+  continuation, later fields, the struct root). The close carries a `DerivedPayload`
+  (`FnOutput.derived` — the delta's wire format, left open above, is a separate field), and the
+  recorder rebuilds the object from its own copy of the base (`derived_object`), checking the
+  base's node count, the index, piece coverage and that the root folds from the fields. Tested
+  equal to contiguous encoding for growth in the first of several lists, in two lists, from empty,
+  with nothing appended, and along a chain of three derivations.
+  Measured (`derived_site_scaling`, 16 pushes onto a base of N):
+
+  | base N | open | push 16 | close | delta | rebuild (before) |
+  | --- | --- | --- | --- | --- | --- |
+  | 1 024 | 0.004 ms | 0.028 ms | 0.009 ms | 568 B | 1.35 ms |
+  | 262 144 | 0.012 ms | 0.045 ms | 0.012 ms | 568 B | 495 ms |
+
+- **Push-only, explicitly** (§Continuation item 3 — missed in batch C). `SiteDraft.derived` comes
+  from the CFS, `DraftStep.sets` from the ops; the frame refuses a `Set` in a deriving site's
+  transition (`DerivedSiteSets`), in the guest and the recorder. Moves the transition guest's
+  image id.
+- **Verified.** Suites green. `hello-tiles` now reads its derived object back (`[14]`: the title
+  from the base's bytes, line 1 from the tail); commit + audit verify; 16 dev-mode fraud windows
+  prove, over creating tiles, create and derive sites, the read of the derived object, state sites
+  with stored and inline seeds, an early `Break`, and the stateful recur sequence. A negative
+  control fires the push-only check on the derive site's body tile and not on a create site's.
+  Chain run and `chain audit --execution` pass.
+- **Tile image ids** moved only through panic-location shifts in sources compiled into tiles; no
+  tile's behaviour changed. All locks rebuilt.
+- **Not done.** The optional piece-compaction threshold for long chains. The recorder does not
+  recompute the tail's element roots — the same trust it gives a contiguous object's bytes.
+  `raster-inference`'s `.rindex` artifacts are `rindex03` and must be regenerated (follow-up).
 
 ## Costs
 

@@ -1094,12 +1094,14 @@ impl TraceRecorder {
                 // A site's close binds no inputs: they were bound once, at
                 // `RecurStart`.
                 let output = fn_call_record.output;
+                // A contiguous object, or a derived one rebuilt from its delta
+                // over the base this replica already holds.
                 let storage_write = output.as_ref().map(|output| {
-                    self.storage.append_serialized_bytes(
-                        &output.data,
-                        site_coordinates.clone(),
-                        output.raster.clone(),
-                    )
+                    self.storage
+                        .append_output(output, site_coordinates.clone())
+                        .unwrap_or_else(|error| {
+                            panic!("Failed to store recur site object at {:?}: {}", site_coordinates, error)
+                        })
                 });
 
 
@@ -1185,12 +1187,14 @@ impl TraceRecorder {
                 // A site's close binds no inputs: they were bound once, at
                 // `RecurStart`.
                 let output = fn_call_record.output;
+                // A contiguous object, or a derived one rebuilt from its delta
+                // over the base this replica already holds.
                 let storage_write = output.as_ref().map(|output| {
-                    self.storage.append_serialized_bytes(
-                        &output.data,
-                        site_coordinates.clone(),
-                        output.raster.clone(),
-                    )
+                    self.storage
+                        .append_output(output, site_coordinates.clone())
+                        .unwrap_or_else(|error| {
+                            panic!("Failed to store recur site object at {:?}: {}", site_coordinates, error)
+                        })
                 });
 
                 // Close the site: S4 (`count == L`) runs here.
@@ -1409,6 +1413,7 @@ impl TraceRecorder {
         Some(SiteDraft {
             schema_hash: decl.schema_hash,
             root,
+            derived: decl.derives,
         })
     }
 

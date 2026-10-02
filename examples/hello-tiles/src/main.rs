@@ -148,6 +148,12 @@ fn main(personal_data: PersonalData, personal_data_bin: PersonalData, seed: u64)
         args = ("*".to_string(),)
     );
     println!("recur sequence greeting: {:?}", sequence_greeting);
+    // Read the derived object back: its title is the base's bytes, its second
+    // line an appended element — both proven out of an object stored as the
+    // base plus a delta.
+    let sequence_title = select!(String, sequence_greeting.clone().title);
+    let sequence_line = select!(String, sequence_greeting.lines[1]);
+    call!(concat_messages, sequence_title, sequence_line);
 
     // A stored seed: the site's `RecurStart` reads it, so the carried-state
     // chain opens at its commitment. (`limited_recur_greeting` below keeps an

@@ -146,6 +146,14 @@ pub struct RecurProgressFrame {
 pub struct SiteDraft {
     pub schema_hash: [u8; 32],
     pub root: DraftRoot,
+    /// The site derives from a base (`output = base`), from the CFS: it may
+    /// only push. Set-once fields cannot enforce that on their own — a base
+    /// field never written stores `Unit`, whose root is the absent-field root,
+    /// so a witness could present it as absent and a `Set` would apply
+    /// (`incremental-draft-materialization` §Continuation on the draft
+    /// buffer, item 3).
+    #[serde(default)]
+    pub derived: bool,
 }
 
 /// One step's draft transition, as both the guest (replay journal + witness)
@@ -156,6 +164,8 @@ pub struct DraftStep {
     pub schema_hash: [u8; 32],
     pub root_before: DraftRoot,
     pub root_after: DraftRoot,
+    /// Whether the transition writes a set-once field.
+    pub sets: bool,
 }
 
 impl DraftStep {
@@ -176,6 +186,10 @@ impl DraftStep {
             schema_hash: native.schema_hash,
             root_before: native.root_before,
             root_after,
+            sets: native
+                .ops
+                .iter()
+                .any(|op| matches!(op, crate::draft::DraftOp::Set { .. })),
         }))
     }
 }
@@ -307,6 +321,9 @@ pub enum RecurProgressViolation {
     DraftOutputMismatch { expected: DraftRoot, actual: [u8; 32] },
     /// A site closed without writing its object.
     SiteOutputMissing,
+    /// A deriving site's transition writes a set-once field: derivation is
+    /// push-only.
+    DerivedSiteSets,
 }
 
 impl fmt::Display for RecurProgressViolation {
@@ -425,6 +442,10 @@ impl fmt::Display for RecurProgressViolation {
                 actual, expected
             ),
             Self::SiteOutputMissing => write!(f, "recur site closed without writing its object"),
+            Self::DerivedSiteSets => write!(
+                f,
+                "a recur site deriving from a base wrote a set-once field; derivation only pushes"
+            ),
         }
     }
 }
@@ -605,6 +626,9 @@ impl RecurProgressStack {
                         expected: draft.root,
                         actual: step.root_before,
                     });
+                }
+                if draft.derived && step.sets {
+                    return Err(RecurProgressViolation::DerivedSiteSets);
                 }
                 draft.root = step.root_after;
                 Ok(())
@@ -1584,6 +1608,7 @@ mod tests {
         stack.open_draft(SiteDraft {
             schema_hash: [7u8; 32],
             root: [1u8; 32],
+            derived: false,
         });
         stack
     }
@@ -1597,6 +1622,7 @@ mod tests {
             schema_hash: [7u8; 32],
             root_before: [before; 32],
             root_after: [after; 32],
+            sets: false,
         }
     }
 
@@ -1706,5 +1732,23 @@ mod tests {
             )
             .expect("continues the seed");
         assert!(stack.close_site(&site(), &[7u8; 32]).is_ok());
+    }
+
+    /// Derivation is push-only even where set-once cannot tell: a `Set` in a
+    /// deriving site's transition is refused, a creating site's is not.
+    #[test]
+    fn a_deriving_site_refuses_a_set() {
+        let mut stack = draft_site(1);
+        if let Some(frame) = stack.0.last_mut() {
+            frame.draft.as_mut().unwrap().derived = true;
+        }
+        let mut step = draft_step(1, 2);
+        step.sets = true;
+        assert_eq!(
+            stack.clone().advance_draft(&at_iteration(1), Some(&step), true),
+            Err(RecurProgressViolation::DerivedSiteSets),
+        );
+        step.sets = false;
+        assert!(stack.advance_draft(&at_iteration(1), Some(&step), true).is_ok());
     }
 }

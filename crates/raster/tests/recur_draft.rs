@@ -1361,7 +1361,13 @@ fn draft_iterations_publish_no_output_and_the_close_publishes_the_object() {
             _ => None,
         })
         .expect("the site closes");
-    assert!(close.output.is_some());
+    // A deriving site's close carries what it added over its base — the
+    // recorder rebuilds the object from its own copy of the base — not the
+    // whole object.
+    let output = close.output.as_ref().expect("the site writes its object");
+    assert!(output.raster.is_none());
+    let delta = output.derived.as_ref().expect("a derived object travels as a delta");
+    assert!(delta.tail.len() < 200, "tail of {} bytes", delta.tail.len());
 }
 
 #[sequence]
