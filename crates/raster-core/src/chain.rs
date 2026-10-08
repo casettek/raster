@@ -11,7 +11,7 @@ use std::string::String;
 use std::vec::Vec;
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use crate::hash::{Digest, Sha256};
 
 use crate::authorization::AuthorizationJournal;
 use crate::input::IndexWidth;

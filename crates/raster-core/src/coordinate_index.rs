@@ -1,5 +1,5 @@
 use alloc::vec;
-use sha2::{Digest, Sha256};
+use crate::hash::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::vec::Vec;
 

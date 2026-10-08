@@ -33,7 +33,7 @@
 use alloc::vec::Vec;
 use core::fmt;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use crate::hash::{Digest, Sha256};
 
 use crate::cfs::{CfsCoordinate, CfsCoordinates};
 use crate::draft::RecurControlKind;

@@ -4,7 +4,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use crate::hash::{Digest, Sha256};
 
 use crate::input::{AppendFrontier, Schema, SchemaField, SchemaFieldMode, SchemaNode};
 use crate::tree::{subtree_payload_and_root, tree_value_from_serialize, TreeValue};

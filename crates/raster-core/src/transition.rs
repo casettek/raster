@@ -4,7 +4,7 @@
 //! They live in raster-core to avoid circular dependencies (guest cannot depend on prover).
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use crate::hash::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::string::String;

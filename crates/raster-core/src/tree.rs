@@ -24,7 +24,7 @@ use serde::ser::{
     SerializeTupleStruct, SerializeTupleVariant,
 };
 use serde::{Deserialize, Serialize, Serializer};
-use sha2::{Digest, Sha256};
+use crate::hash::{Digest, Sha256};
 
 use crate::collections::BYTES_PAGE_NEWTYPE_NAME;
 use crate::input::{bytes_page_root, encode_bytes_page_payload, struct_commitments_root, Hash32};

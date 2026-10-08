@@ -285,7 +285,7 @@ impl GuestBuilder {
     /// together with the tile source hash, so a template/toolchain/macro change
     /// invalidates stale image ids.
     pub fn recipe_fingerprint(&self) -> String {
-        use raster_core::sha2::{Digest, Sha256};
+        use raster_core::hash::{Digest, Sha256};
         let mut hasher = Sha256::new();
         hasher.update(GUEST_BUILD_ABI.as_bytes());
         hasher.update(Self::toolchain_id().as_bytes());
@@ -313,7 +313,7 @@ impl GuestBuilder {
     /// Not covered: external crate versions, which the guest resolves fresh
     /// with no lockfile.
     fn sources_fingerprint(&self) -> Vec<u8> {
-        use raster_core::sha2::{Digest, Sha256};
+        use raster_core::hash::{Digest, Sha256};
         let mut files: Vec<(String, PathBuf)> = Vec::new();
         if let Some(workspace) = &self.raster_workspace {
             collect_file(&mut files, "raster:", workspace, Path::new("Cargo.toml"));
