@@ -430,6 +430,7 @@ mod tests {
                 arguments: vec!["personal_data".to_string()],
                 argument_kinds: vec![CallArgumentKind::Rooted {
                     root: "personal_data".to_string(),
+                    path: Some(Vec::new()),
                 }],
                 call_kind: CallKind::Tile,
                 chunk: None,
@@ -466,7 +467,7 @@ mod tests {
             SequenceChildItem::Tile(tile_item) => {
                 assert_eq!(tile_item.id, "greet");
                 match &tile_item.sources[0] {
-                    InputBinding::EntryArgument => {}
+                    InputBinding::EntryArgument { .. } => {}
                     other => panic!("Expected EntryArgument binding, got {:?}", other),
                 }
             }

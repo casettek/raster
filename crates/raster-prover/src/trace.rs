@@ -782,7 +782,7 @@ fn resolve_inputs_sources(
             InputBinding::Direct(InputSource::Storage) => {
                 panic!("Direct storage bindings are not yet supported in trace source resolution");
             }
-            InputBinding::EntryArgument => {
+            InputBinding::EntryArgument { .. } => {
                 // The source is the program's `ProgramStart` step, which bound
                 // the authorized entry object at the sequence root `[]` — the
                 // same record that opens the root frame above.
@@ -794,7 +794,7 @@ fn resolve_inputs_sources(
                 });
                 source_records.push((index, trace[index].clone()));
             }
-            InputBinding::SequenceScope { input_index } => {
+            InputBinding::SequenceScope { input_index, .. } => {
                 // A scope input is a value the frame's *caller* supplied, so the
                 // root frame can never carry one: `main` has no caller, and the
                 // compiler resolves its declared parameters to `EntryArgument`
@@ -829,6 +829,7 @@ fn resolve_inputs_sources(
             }
             InputBinding::PriorItemOutput {
                 intra_sequence_item_index,
+                ..
             } => {
                 // 0-based index into `items` becomes a 1-based coordinate; the
                 // guest crosses the same boundary in `checks::cfs`.

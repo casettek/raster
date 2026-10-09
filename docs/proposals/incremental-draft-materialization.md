@@ -785,10 +785,11 @@ zero-length selection used to skip it, leaving the output commitment free (`923a
 leaf) and the static walk, used by `ProgramEnd` (fails closed on any unfollowable chain) and by
 every prior-item argument. Not yet:
 
-- **A path through a parameter is only a suffix.** Argument bindings carry no path, so once the
-  walk crosses a sequence parameter only the trailing segments are known (`path_complete =
-  false`); prior-item arguments get no path check at all. Giving bindings a path is a separate
-  change, and also closes [`sequence-scope-forbids-narrowing`](../issues/sequence-scope-forbids-narrowing.md).
+- ~~**A path through a parameter is only a suffix.**~~ **Done 2026-10-08.** Argument bindings now
+  carry their path (`InputBinding::{SequenceScope, PriorItemOutput, EntryArgument}::path`), so the
+  walk composes the whole selector across parameters, `path_complete` is gone, and `ProgramEnd`,
+  entry-argument and prior-item arguments are all held to an exact `selection.path`. Closed
+  [`sequence-scope-forbids-narrowing`](../issues/sequence-scope-forbids-narrowing.md).
 - **Two chains are not followed**: a nested return the CFS could not bind, and a recur-sequence
   body's parameter. `ProgramEnd` fails closed on both; a prior-item argument falls back to the
   old "inside the source item" rule, so no honest program regresses.

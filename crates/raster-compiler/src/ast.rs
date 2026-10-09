@@ -58,7 +58,15 @@ pub enum CallKind {
 pub enum CallArgumentKind {
     /// The value flows from `root`: a bare identifier, or any expression
     /// rooted at one — `x.field[0]`, `x.clone()`, `select!(T, x.field)`.
-    Rooted { root: String },
+    ///
+    /// `path` is the static selector the expression itself appends to `root`
+    /// (`[field]` for `select!(T, x.field)`, empty for `x` or `clone!(x)`);
+    /// the resolver prefixes the paths of `root`'s alias chain. `None` for a
+    /// `select!` with a data-sourced index, which has no static path.
+    Rooted {
+        root: String,
+        path: Option<Vec<SelectorSegment>>,
+    },
     /// A literal, or an expression with no identifier at its root: the value
     /// is materialized in the sequence body itself.
     Inline,
@@ -872,8 +880,32 @@ impl CallVisitor {
 
     fn classify_argument(expr: &Expr) -> CallArgumentKind {
         match Self::expr_root_ident(expr) {
-            Some(root) => CallArgumentKind::Rooted { root },
+            Some(root) => CallArgumentKind::Rooted {
+                root,
+                path: Self::argument_path(expr),
+            },
             None => CallArgumentKind::Inline,
+        }
+    }
+
+    /// The static selector path an argument expression appends to its root —
+    /// what the runtime appends to the root's selector when the argument is
+    /// bound. Only `select!` narrows: `clone!`, `into_ref!`, `.clone()`, `&x`
+    /// and parentheses re-point at the same value, so they pass through.
+    ///
+    /// A raw `x.f` or `x[0]` does not compile on a sequence binding (an
+    /// `AuthRef` has no `Deref`), so it is read as passing `x` whole rather
+    /// than given a path no run could record.
+    fn argument_path(expr: &Expr) -> Option<Vec<SelectorSegment>> {
+        match expr {
+            Expr::Macro(expr_macro) if Self::is_selection_macro(&expr_macro.mac) => {
+                Self::selection_macro_path(&expr_macro.mac)
+            }
+            Expr::Paren(paren) => Self::argument_path(&paren.expr),
+            Expr::Reference(reference) => Self::argument_path(&reference.expr),
+            Expr::Try(try_expr) => Self::argument_path(&try_expr.expr),
+            Expr::MethodCall(call) => Self::argument_path(&call.receiver),
+            _ => Some(Vec::new()),
         }
     }
 
@@ -1178,8 +1210,13 @@ mod tests {
     }
 
     fn rooted(root: &str) -> CallArgumentKind {
+        rooted_at(root, Some(Vec::new()))
+    }
+
+    fn rooted_at(root: &str, path: Option<Vec<SelectorSegment>>) -> CallArgumentKind {
         CallArgumentKind::Rooted {
             root: root.to_string(),
+            path,
         }
     }
 
@@ -1399,7 +1436,8 @@ mod tests {
         assert_eq!(
             calls[0].argument_kinds[1],
             CallArgumentKind::Rooted {
-                root: "base".to_string()
+                root: "base".to_string(),
+                path: Some(Vec::new()),
             }
         );
         assert_eq!(calls[0].output, Some(SiteOutputKind::Derive));
@@ -1443,10 +1481,37 @@ mod tests {
         );
         assert_eq!(calls.len(), 1);
         // A selection is a view of `source`, so it carries `source`'s
-        // provenance; a literal has none.
+        // provenance and the path it narrows by; a literal has neither.
         assert_eq!(
             calls[0].argument_kinds,
-            vec![rooted("source"), CallArgumentKind::Inline]
+            vec![
+                rooted_at("source", Some(vec![SelectorSegment::Field("name".into())])),
+                CallArgumentKind::Inline,
+            ]
+        );
+    }
+
+    /// A data-sourced index has no static path: the argument stays rooted, and
+    /// the path is unknown rather than empty.
+    #[test]
+    fn test_argument_path_is_unknown_through_a_data_sourced_index() {
+        let calls = parse_calls(
+            r#"fn seq() { let r = call!(t, select!(Row, table.rows[wanted]), select!(Row, table.rows[3].cells[0..2])); }"#,
+        );
+        assert_eq!(
+            calls[0].argument_kinds,
+            vec![
+                rooted_at("table", None),
+                rooted_at(
+                    "table",
+                    Some(vec![
+                        SelectorSegment::Field("rows".into()),
+                        SelectorSegment::Index(3),
+                        SelectorSegment::Field("cells".into()),
+                        SelectorSegment::Range { start: 0, end: 2 },
+                    ])
+                ),
+            ]
         );
     }
 
@@ -1460,9 +1525,11 @@ mod tests {
             calls[0].argument_kinds,
             vec![
                 rooted("data"),
+                // Raw field access passes the root whole (it does not compile
+                // on a sequence binding; only `select!` narrows).
                 rooted("other"),
                 rooted("third"),
-                rooted("nested"),
+                rooted_at("nested", Some(vec![SelectorSegment::Field("id".into())])),
             ]
         );
     }

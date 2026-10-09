@@ -129,6 +129,21 @@ fn authorization_journal(binding_name: &str, commitment: &[u8]) -> Authorization
     }
 }
 
+fn field_path(names: &[&str]) -> Vec<SelectorSegment> {
+    names.iter().map(|name| SelectorSegment::Field(name.to_string())).collect()
+}
+
+/// `witness` with every storage argument read through `path` — the recorded
+/// `selector` and the `selection.path` its proof is pinned to, which agree on
+/// every honest run.
+fn selecting(mut witness: FnInput, path: Vec<SelectorSegment>) -> FnInput {
+    for data in witness.storage.values_mut() {
+        data.selector = raster_core::input::SelectorPath::new(path.clone());
+        data.selection.path = raster_core::input::SelectorPath::new(path.clone());
+    }
+    witness
+}
+
 fn storage_input_witness(coordinates: CfsCoordinates, commitment: Vec<u8>) -> FnInput {
     // A whole-object storage binding's commitment *is* its raster selection
     // root (see `checks::store`'s structural-consistency assertion), so the
@@ -166,6 +181,12 @@ fn storage_input_witness(coordinates: CfsCoordinates, commitment: Vec<u8>) -> Fn
 /// parameters resolve to `EntryArgument`; a scope binding at the root frame is
 /// unreachable.)
 fn scope_binding_cfs() -> CfsCursor {
+    scope_binding_cfs_reading(InputBinding::seq_input(0))
+}
+
+/// [`scope_binding_cfs`] with the consumer's binding replaced — a parameter
+/// narrowed by a path, say.
+fn scope_binding_cfs_reading(consumer_source: InputBinding) -> CfsCursor {
     CfsCursor::new(ControlFlowSchema {
         version: "1.0".into(),
         project: "test".into(),
@@ -188,7 +209,7 @@ fn scope_binding_cfs() -> CfsCursor {
                 input_sources: vec![InputBinding::Direct(InputSource::Inline)],
                 items: vec![SequenceChildItem::Tile(TileItem {
                     id: "consumer".into(),
-                    sources: vec![InputBinding::seq_input(0)],
+                    sources: vec![consumer_source],
                 })],
                 entry_arguments: vec![],
                 produces_output: false,
@@ -522,6 +543,207 @@ fn poc_the_sequence_scope_witness_is_bound_to_nothing() {
     );
 }
 
+/// `sub`'s consumer reads `sub`'s parameter 0 narrowed by `declared` — the
+/// shape of `greet_sequence` in `examples/hello-tiles`
+/// (`select!(String, personal_data.name)` on its own parameter). The caller
+/// passed the entry object's `caller` part; the step recorded a read of
+/// `read` from an object with commitment `read_from`.
+fn verify_narrowed_scope_read(declared: &[&str], caller: &[&str], read: &[&str], read_from: &[u8]) {
+    let cfs_cursor = scope_binding_cfs_reading(InputBinding::seq_input(0).with_path(field_path(declared)));
+    let (step_record, _, _, _) =
+        scope_binding_scenario(CfsCoordinates(vec![]), sha(b"personal-data"));
+    let caller_argument = selecting(
+        storage_input_witness(CfsCoordinates(vec![]), sha(b"personal-data")),
+        field_path(caller),
+    );
+    let step_source = selecting(
+        storage_input_witness(CfsCoordinates(vec![]), sha(read_from)),
+        field_path(read),
+    );
+    verify_step_record_inputs(
+        &cfs_cursor,
+        &step_record,
+        Some(&step_source),
+        Some(&caller_argument),
+        None,
+    );
+}
+
+/// Regression for `docs/issues/sequence-scope-forbids-narrowing.md`: the read
+/// is the caller's `[personal_data]` followed by the declared `[name]`. This
+/// panicked with "Storage sequence scope input does not match consumer
+/// binding" while scope bindings carried no path.
+#[test]
+fn a_scope_parameter_narrowed_by_its_declared_path_verifies() {
+    verify_narrowed_scope_read(
+        &["name"],
+        &["personal_data"],
+        &["personal_data", "name"],
+        b"personal-data",
+    );
+}
+
+/// Same object, same root, a sibling field: only the path tells them apart.
+#[test]
+#[should_panic(expected = "selects a different part of the caller's value than the CFS declares")]
+fn a_scope_parameter_narrowed_to_another_field_is_refused() {
+    verify_narrowed_scope_read(
+        &["name"],
+        &["personal_data"],
+        &["personal_data", "addresses"],
+        b"personal-data",
+    );
+}
+
+/// The CFS declares a narrowing the step did not perform.
+#[test]
+#[should_panic(expected = "selects a different part of the caller's value than the CFS declares")]
+fn a_declared_narrowing_the_step_skipped_is_refused() {
+    verify_narrowed_scope_read(&["name"], &["personal_data"], &["personal_data"], b"personal-data");
+}
+
+/// The step narrowed where the CFS declares the parameter passed whole.
+#[test]
+#[should_panic(expected = "Storage sequence scope input does not match consumer binding")]
+fn an_undeclared_narrowing_is_refused() {
+    verify_narrowed_scope_read(&[], &["personal_data"], &["personal_data", "name"], b"personal-data");
+}
+
+/// The declared path, read out of a different object.
+#[test]
+#[should_panic(expected = "reads a different object than the caller passed")]
+fn a_narrowed_read_of_another_object_is_refused() {
+    verify_narrowed_scope_read(
+        &["name"],
+        &["personal_data"],
+        &["personal_data", "name"],
+        b"another-object",
+    );
+}
+
+/// There is no selector over inline bytes, so a narrowed inline parameter
+/// cannot be checked: fail closed.
+#[test]
+#[should_panic(expected = "narrowing is only verifiable on a stored value")]
+fn narrowing_an_inline_scope_parameter_fails_closed() {
+    let cfs_cursor =
+        scope_binding_cfs_reading(InputBinding::seq_input(0).with_path(field_path(&["name"])));
+    let (step_record, _, _, _) =
+        scope_binding_scenario(CfsCoordinates(vec![]), sha(b"personal-data"));
+    let inline = |bytes: &[u8]| FnInput {
+        data: Vec::new(),
+        values: vec![FnInputValue::Inline(bytes.to_vec())],
+        args: vec![FnInputArg {
+            name: "arg".to_string(),
+            ty: "Vec<u8>".to_string(),
+        }],
+        storage: Default::default(),
+    };
+    verify_step_record_inputs(
+        &cfs_cursor,
+        &step_record,
+        Some(&inline(b"John")),
+        Some(&inline(b"{name: John}")),
+        None,
+    );
+}
+
+/// `main = [consumer(entry argument)]`, the consumer reading `read`.
+fn verify_entry_argument_read(declared: &[&str], read: &[&str]) {
+    let cfs_cursor = CfsCursor::new(ControlFlowSchema {
+        version: "1.0".into(),
+        project: "test".into(),
+        encoding: "postcard".into(),
+        tiles: vec![TileDef::iter("consumer", 1, 1)],
+        sequences: vec![SequenceDef {
+            id: "main".into(),
+            input_sources: vec![],
+            items: vec![tile_item(
+                "consumer",
+                vec![InputBinding::entry_argument().with_path(field_path(declared))],
+            )],
+            entry_arguments: vec![],
+            produces_output: false,
+            returns: None,
+        }],
+    });
+    let mut step_record = exec_index_fixture(1);
+    step_record.coordinates = CfsCoordinates(vec![1]);
+    verify_step_record_inputs(
+        &cfs_cursor,
+        &step_record,
+        Some(&selecting(
+            storage_input_witness(CfsCoordinates(vec![]), sha(b"entry-object")),
+            field_path(read),
+        )),
+        None,
+        None,
+    );
+}
+
+#[test]
+fn an_entry_argument_read_through_its_declared_path_verifies() {
+    verify_entry_argument_read(&["personal_data", "name"], &["personal_data", "name"]);
+}
+
+/// Before argument paths the guest checked only the coordinate `[]`, so any
+/// part of the entry object passed as any argument.
+#[test]
+#[should_panic(expected = "selects a different part of the entry object than the CFS declares")]
+fn an_entry_argument_read_through_another_path_is_refused() {
+    verify_entry_argument_read(&["personal_data", "name"], &["seed"]);
+}
+
+/// `main = [producer, consumer(select!(produced.<declared>))]`, the consumer
+/// reading `read` of the producer's output at `[1]`.
+fn verify_prior_item_read(declared: &[&str], read: &[&str]) {
+    let cfs_cursor = CfsCursor::new(ControlFlowSchema {
+        version: "1.0".into(),
+        project: "test".into(),
+        encoding: "postcard".into(),
+        tiles: vec![TileDef::iter("producer", 0, 1), TileDef::iter("consumer", 1, 1)],
+        sequences: vec![SequenceDef {
+            id: "main".into(),
+            input_sources: vec![],
+            items: vec![
+                tile_item("producer", vec![]),
+                tile_item(
+                    "consumer",
+                    vec![InputBinding::prior_item_output(0).with_path(field_path(declared))],
+                ),
+            ],
+            entry_arguments: vec![],
+            produces_output: false,
+            returns: None,
+        }],
+    });
+    let mut step_record = exec_index_fixture(1);
+    step_record.coordinates = CfsCoordinates(vec![2]);
+    verify_step_record_inputs(
+        &cfs_cursor,
+        &step_record,
+        Some(&selecting(
+            storage_input_witness(CfsCoordinates(vec![1]), sha(b"producer-output")),
+            field_path(read),
+        )),
+        None,
+        None,
+    );
+}
+
+#[test]
+fn a_prior_item_read_through_its_declared_path_verifies() {
+    verify_prior_item_read(&["title"], &["title"]);
+}
+
+/// Before argument paths the guest checked only the source coordinates, so
+/// any field of the producer's output passed.
+#[test]
+#[should_panic(expected = "selects a different part of the source than the CFS declares")]
+fn a_prior_item_read_through_another_path_is_refused() {
+    verify_prior_item_read(&["title"], &["lines"]);
+}
+
 fn producer_sequence_cfs() -> CfsCursor {
     CfsCursor::new(ControlFlowSchema {
         version: "1.0".into(),
@@ -544,6 +766,7 @@ fn producer_sequence_cfs() -> CfsCursor {
                         id: "consumer".into(),
                         sources: vec![InputBinding::PriorItemOutput {
                             intra_sequence_item_index: 0,
+                            path: Vec::new(),
                         }],
                     }),
                 ],
@@ -3785,8 +4008,8 @@ mod program_end {
     /// `main = [produce, pass(produce)]` returning `select!(passed.max)`: `pass`
     /// returns its parameter, so the output is `produce`'s object at `[1]` —
     /// outside the call at `[2]`, which the old "inside the item" rule refused.
-    /// The argument binding records no path, so the path is checked as a
-    /// suffix.
+    /// The argument passes `produce`'s output whole, so the path is `main`'s
+    /// alone.
     fn pass_through_cfs() -> CfsCursor {
         cfs_returning(
             vec![
@@ -3812,6 +4035,38 @@ mod program_end {
     #[should_panic(expected = "selects a different part of the object than main returns")]
     fn rejects_another_field_of_a_passed_through_value() {
         verify_output(&pass_through_cfs(), vec![1], Some("sum"));
+    }
+
+    /// `main = [produce, pass(select!(produced.max))]` returning what `pass`
+    /// returns: the argument narrows on the way in, and its path composes into
+    /// the output's.
+    fn narrowing_pass_through_cfs() -> CfsCursor {
+        cfs_returning(
+            vec![
+                tile_item("produce"),
+                SequenceChildItem::Sequence(SequenceItem {
+                    id: "pass".into(),
+                    sources: vec![InputBinding::prior_item_output(0).with_path(fields(&["max"]))],
+                }),
+            ],
+            returning(InputBinding::prior_item_output(1), &[]),
+        )
+    }
+
+    #[test]
+    fn accepts_a_value_narrowed_on_the_way_into_a_nested_sequence() {
+        assert!(matches!(
+            verify_output(&narrowing_pass_through_cfs(), vec![1], Some("max")),
+            OutputAuthorization::Established { .. }
+        ));
+    }
+
+    /// While argument bindings carried no path, crossing `pass`'s parameter
+    /// left only `main`'s (empty) suffix to check, and every field passed.
+    #[test]
+    #[should_panic(expected = "selects a different part of the object than main returns")]
+    fn rejects_another_field_than_the_argument_narrowed_to() {
+        verify_output(&narrowing_pass_through_cfs(), vec![1], Some("sum"));
     }
 
     /// A unit `main` binds nothing and carries no value — the variant stays
