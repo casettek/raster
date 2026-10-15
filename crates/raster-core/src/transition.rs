@@ -220,7 +220,10 @@ pub struct TransitionInput {
     /// two different witnesses. Keyed by the source record alone, the later
     /// step's `insert` silently overwrote the earlier one's and the earlier
     /// step's fold could never reach its own root.
-    pub input_sources_witnesses: HashMap<(u64, StepRecord), Vec<u8>>,
+    ///
+    /// The host sends each step only its own entries (keyed by its own
+    /// `exec_index`); the guest's lookup can match no other.
+    pub input_sources_witnesses: HashMap<(u64, StepRecord), StepRecordWitness>,
 
     #[serde(with = "serde_bytes")]
     pub authorization_image_id: Vec<u8>,

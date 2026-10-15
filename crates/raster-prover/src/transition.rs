@@ -16,8 +16,8 @@ use raster_core::input::SelectionWitness;
 use raster_core::trace::{FnInput, StepRecord};
 use raster_core::recur_progress::RecurProgressStack;
 use raster_core::transition::{
-    FingerprintSliceWitness, InitTransition, StorageReadWitness, StorageWitness,
-    TraceCommitmentHeader, TransitionInput, TransitionJournal, TransitionState,
+    FingerprintSliceWitness, InitTransition, StepRecordWitness, StorageReadWitness,
+    StorageWitness, TraceCommitmentHeader, TransitionInput, TransitionJournal, TransitionState,
 };
 use std::collections::{BTreeMap, HashMap};
 
@@ -56,7 +56,7 @@ type RecordedStepIo = HashMap<StepRecord, StepIo>;
 
 fn build_transition_input(
     step_record: &StepRecord,
-    input_sources_witnesses: &HashMap<(u64, StepRecord), Vec<u8>>,
+    input_sources_witnesses: &HashMap<(u64, StepRecord), StepRecordWitness>,
     recorded_step_io: &RecordedStepIo,
     replayed_results: &HashMap<StepRecord, ReplayResult>,
     authorization_journal: &AuthorizationJournal,
@@ -112,7 +112,14 @@ fn build_transition_input(
         storage_witness,
         draft_transition_witness,
         authorization_journal: authorization_journal.clone(),
-        input_sources_witnesses: input_sources_witnesses.clone(),
+        // Only this step's own witnesses. The guest looks one up by its own
+        // `exec_index` (`checks::cfs::verify_sequence_scope_parent`), so the
+        // window's other entries are data it would decode and never read.
+        input_sources_witnesses: input_sources_witnesses
+            .iter()
+            .filter(|((verifier_exec_index, _), _)| *verifier_exec_index == step_record.exec_index)
+            .map(|(key, witness)| (key.clone(), witness.clone()))
+            .collect(),
         entrypoint_membership_witness: entrypoint_membership_witness.cloned(),
         program_output_read_witness,
         program_output_selection_witness,
@@ -206,7 +213,7 @@ pub fn step_transitions(
     // written to the guest, which hashes it to derive `program_commitment` and
     // decodes it for the CFS + tile registry. See program-identity.md.
     program_frame: &[u8],
-    input_sources_witnesses: &HashMap<(u64, StepRecord), Vec<u8>>,
+    input_sources_witnesses: &HashMap<(u64, StepRecord), StepRecordWitness>,
     recorded_step_io: &RecordedStepIo,
     replayed_results: &HashMap<StepRecord, ReplayResult>,
     authorization_journal: &AuthorizationJournal,
@@ -395,6 +402,65 @@ mod tests {
             args: Vec::new(),
             storage: Default::default(),
         }
+    }
+
+    /// A step's input carries only the witnesses keyed by its own
+    /// `exec_index`. The guest's lookup (`checks::cfs::verify_sequence_scope_parent`)
+    /// requires that same key, so this keeps a superset of what it can match
+    /// and drops the rest of the window's entries.
+    #[test]
+    fn build_transition_input_keeps_only_this_steps_witnesses() {
+        let step = make_tile_step(2, vec![1]);
+        let source = make_tile_step(0, vec![2]);
+        let other_source = make_tile_step(3, vec![3]);
+        let witness = |position: u64| StepRecordWitness {
+            position,
+            path_elems: vec![[position as u8; 32].into()],
+        };
+        let window_witnesses = HashMap::from([
+            ((1, source.clone()), witness(10)),
+            ((2, source.clone()), witness(20)),
+            ((2, other_source.clone()), witness(21)),
+            ((4, other_source.clone()), witness(40)),
+        ]);
+        let recorded_step_io = HashMap::from([(step.clone(), io_witnesses(None, None))]);
+        let replayed_results = HashMap::from([(
+            step.clone(),
+            ReplayResult {
+                fn_name: "shared_tile".to_string(),
+                receipt: vec![],
+                image_id: vec![9; 32],
+                input: vec![],
+                output: vec![],
+                replay_journal: TileReplayJournal {
+                    input_commitment: [0u8; 32],
+                    output_bytes: vec![],
+                    output_root: None,
+                    input_roots: Vec::new(),
+                    draft_transition: None,
+                    recur: None,
+                },
+            },
+        )]);
+
+        let input = build_transition_input(
+            &step,
+            &window_witnesses,
+            &recorded_step_io,
+            &replayed_results,
+            &make_authorization_journal(),
+            None,
+            None,
+            None,
+        );
+
+        let mut kept: Vec<(u64, u64, u64)> = input
+            .input_sources_witnesses
+            .iter()
+            .map(|((verifier, record), witness)| (*verifier, record.exec_index, witness.position))
+            .collect();
+        kept.sort();
+        assert_eq!(kept, vec![(2, 0, 20), (2, 3, 21)]);
     }
 
     #[test]

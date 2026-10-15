@@ -301,7 +301,7 @@ fn sequence_scope_parent_binding_accepts_the_real_parent() {
     let mut witnesses = HashMap::new();
     witnesses.insert(
         (step_record.exec_index, parent_record),
-        postcard::to_allocvec(&witness).expect("witness serializes"),
+        witness,
     );
 
     verify_sequence_scope_parent(
@@ -348,11 +348,11 @@ fn two_steps_sharing_a_scope_parent_each_verify_at_their_own_trace_root() {
     let mut witnesses = HashMap::new();
     witnesses.insert(
         (first_step.exec_index, parent_record.clone()),
-        postcard::to_allocvec(&witness_at_first).expect("witness serializes"),
+        witness_at_first,
     );
     witnesses.insert(
         (second_step.exec_index, parent_record),
-        postcard::to_allocvec(&witness_at_second).expect("witness serializes"),
+        witness_at_second,
     );
 
     verify_sequence_scope_parent(
@@ -387,7 +387,7 @@ fn a_step_cannot_borrow_another_steps_witness_for_the_same_parent() {
     let mut witnesses = HashMap::new();
     witnesses.insert(
         (first_step.exec_index, parent_record),
-        postcard::to_allocvec(&witness_at_first).expect("witness serializes"),
+        witness_at_first,
     );
 
     verify_sequence_scope_parent(
@@ -417,7 +417,7 @@ fn sequence_scope_parent_binding_refuses_a_fabricated_witness() {
     let mut witnesses = HashMap::new();
     witnesses.insert(
         (step_record.exec_index, parent_record),
-        postcard::to_allocvec(&witness).expect("witness serializes"),
+        witness,
     );
 
     verify_sequence_scope_parent(
@@ -452,7 +452,7 @@ fn sequence_scope_parent_binding_refuses_a_parent_not_in_the_trace() {
     let mut witnesses = HashMap::new();
     witnesses.insert(
         (step_record.exec_index, parent_record),
-        postcard::to_allocvec(&witness).expect("witness serializes"),
+        witness,
     );
 
     verify_sequence_scope_parent(
@@ -5465,7 +5465,7 @@ fn a_sequence_scope_witness_naming_a_recur_start_is_rejected() {
     let mut witnesses = HashMap::new();
     witnesses.insert(
         (step_record.exec_index, recur_start),
-        postcard::to_allocvec(&witness).expect("witness serializes"),
+        witness,
     );
     verify_sequence_scope_parent(
         &cfs_cursor,

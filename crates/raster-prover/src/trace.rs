@@ -875,9 +875,9 @@ fn witness_record_inputs(
     fraud_window: &TraceWindow,
     cfs_cursor: &CfsCursor,
     seed: &[u8],
-) -> HashMap<(u64, StepRecord), Vec<u8>> {
+) -> HashMap<(u64, StepRecord), StepRecordWitness> {
     let window_start_index = window_end_index + 1 - fraud_window.items.len();
-    let mut source_records_witnesses: HashMap<(u64, StepRecord), Vec<u8>> = HashMap::new();
+    let mut source_records_witnesses: HashMap<(u64, StepRecord), StepRecordWitness> = HashMap::new();
 
     for (offset, step_record) in fraud_window.items.iter().enumerate() {
         // The two steps that bind no CFS inputs, skipped in the order the guest
@@ -932,22 +932,21 @@ fn witness_record_inputs(
             let trace_prefix = Trace(trace[..step_index].to_vec());
             let merkle_path = TraceCommitment::witness(&trace_prefix, trace_index, seed)
                 .expect("Failed to derive merkle path for source record");
-            let witness_bytes = postcard::to_allocvec(&StepRecordWitness {
+            let witness = StepRecordWitness {
                 position: u64::from(merkle_path.position()),
                 path_elems: merkle_path
                     .path_elems()
                     .iter()
                     .map(|elem| to_node_hash(&elem.0))
                     .collect(),
-            })
-            .expect("Failed to serialize source record witness");
+            };
 
             // Keyed by the *verifying* step as well as the source, because the
             // witness is only valid at that step's trace root. Two window steps
             // resolving the same source get two witnesses; keyed by the source
             // alone, this `insert` overwrote the earlier step's and left it
             // folding a proof built over a longer prefix than its own root.
-            source_records_witnesses.insert((step_record.exec_index, source_record), witness_bytes);
+            source_records_witnesses.insert((step_record.exec_index, source_record), witness);
         }
     }
 
@@ -970,7 +969,7 @@ pub struct TraceVerifier<'a> {
 #[derive(Debug, Clone)]
 pub struct FraudEvidence {
     pub window: TraceWindow,
-    pub input_sources_witnesses: HashMap<(u64, StepRecord), Vec<u8>>,
+    pub input_sources_witnesses: HashMap<(u64, StepRecord), StepRecordWitness>,
 }
 
 pub enum VerificationResult {

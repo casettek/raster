@@ -183,11 +183,14 @@ refuses.
 
 ## Outstanding
 
-- **`input_sources_witnesses` is still cloned whole into every step**
-  (`raster-prover/src/transition.rs`), so a window of `w` steps carries roughly `w²` entries. Now
-  that the guest reads the map this is worth narrowing, but narrowing it wrongly drops a witness
-  an honest proof needs — a liveness break, worse than the size. Measure first; keep the filter a
-  superset.
+- ~~**`input_sources_witnesses` is still cloned whole into every step**~~ **Done 2026-10-15.**
+  `build_transition_input` now keeps only the entries keyed by the step's own `exec_index`. That
+  is a superset of what the guest's lookup can match, since the lookup requires the same key
+  (`build_transition_input_keeps_only_this_steps_witnesses` pins it). The values are typed
+  `StepRecordWitness`es rather than postcard bytes, so the guest decodes each witness once.
+  Measured on a 32-step `hello-tiles` window in dev mode: user cycles 61.35M → 45.94M (−25%),
+  segments 90 → 69. The saving is a flat 445–495k user cycles per step, and `commit.bin` is
+  byte-identical.
 - `verify_sequence_scope_parent` identifies the parent by coordinates, which name one invocation
   because recur coordinates carry the iteration index. That reasoning should be checked against
   any future construct that reuses coordinates across invocations.
