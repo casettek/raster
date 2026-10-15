@@ -22,7 +22,7 @@ use raster_core::transition::{
 use std::collections::{BTreeMap, HashMap};
 
 use crate::authorization::authorization_guest_image_id;
-use crate::precomputed::EMPTY_TRIE_NODES;
+use raster_core::merkle::EMPTY_LEAF;
 use crate::replay::ReplayResult;
 use crate::trace::{
     frontier_root, serializable_frontier_into_trace_frontier, SerializableFrontier,
@@ -131,7 +131,7 @@ fn image_id_bytes(image_id: [u32; 8]) -> Vec<u8> {
 fn empty_storage_frontier() -> SerializableFrontier {
     SerializableFrontier {
         position: 0,
-        leaf: EMPTY_TRIE_NODES[0].to_vec(),
+        leaf: EMPTY_LEAF.to_vec(),
         ommers: Vec::new(),
     }
 }
@@ -305,7 +305,7 @@ pub fn step_transitions(
 mod tests {
     use super::*;
     use crate::authorization::authorize_external_inputs;
-    use crate::precomputed::EMPTY_TRIE_NODES;
+    use raster_core::merkle::EMPTY_LEAF;
     use raster_core::authorization::{AuthorizationJournal, ManifestedInputs};
     use raster_core::cfs::{
         CfsCoordinate, CfsCoordinates, ControlFlowSchema, SequenceDef, FIRST_COORDINATE,
@@ -318,8 +318,8 @@ mod tests {
 
     fn empty_store_roots() -> StorageRoots {
         StorageRoots {
-            root_before: EMPTY_TRIE_NODES[0].to_vec(),
-            root_after: EMPTY_TRIE_NODES[0].to_vec(),
+            root_before: EMPTY_LEAF.to_vec(),
+            root_after: EMPTY_LEAF.to_vec(),
             index_root_before: Vec::new(),
             index_root_after: Vec::new(),
         }
@@ -579,7 +579,7 @@ mod tests {
     fn make_init_frontier() -> SerializableFrontier {
         SerializableFrontier {
             position: 0,
-            leaf: crate::precomputed::EMPTY_TRIE_NODES[0].to_vec(),
+            leaf: EMPTY_LEAF.to_vec(),
             ommers: Vec::new(),
         }
     }

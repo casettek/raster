@@ -297,8 +297,8 @@ impl FraudProofWindowContext {
 ///
 /// It does not need one. At index 0 the opening state is not the challenger's
 /// to choose: the trace tree holds only the seed, which is the same public
-/// constant for every program (`EMPTY_TRIE_NODES[0]` host-side, `EMPTY_LEAF`
-/// here), storage is empty, and no draft or loop is in flight. Asserting that
+/// constant for every program (`raster_core::merkle::EMPTY_LEAF`, on both
+/// sides), storage is empty, and no draft or loop is in flight. Asserting that
 /// removes the need for the margin rather than excusing its absence.
 ///
 /// What the seed does *not* say is which program ran with which inputs — the

@@ -39,7 +39,7 @@ use raster_core::transition::TransitionJournal;
 use raster_core::{Error, Result};
 use raster_prover::authorization::{authorization_guest_image_id, authorize_external_inputs};
 use raster_prover::chain_fraud::{prove_chain_fraud, verify_chain_fraud_receipt};
-use raster_prover::precomputed::EMPTY_TRIE_NODES;
+use raster_core::merkle::EMPTY_LEAF;
 use raster_prover::replay::Replayer;
 use raster_prover::trace::{
     FraudProofConfig, TraceCommitment, TraceCommitmentExt, TraceVerifier,
@@ -568,7 +568,7 @@ pub fn run(
         // stage somebody contests. See `docs/proposals/chain-io-commitment.md`.
         if let Some((trace, _recorder)) = replay {
             let trace_commitment =
-                TraceCommitment::try_build(&trace, &EMPTY_TRIE_NODES[0], fraud_proof_config)
+                TraceCommitment::try_build(&trace, &EMPTY_LEAF, fraud_proof_config)
                     .map_err(|e| Error::Other(e.to_string()))?;
             let commit_path = stage_dir.join("commit.bin");
             std::fs::write(
@@ -1316,9 +1316,9 @@ fn prove_terminal_window(
     let (trace, recorder) = replay.expect("an authenticated stage run produces a trace");
 
     let trace_commitment =
-        TraceCommitment::try_build(&trace, &EMPTY_TRIE_NODES[0], fraud_proof_config)
+        TraceCommitment::try_build(&trace, &EMPTY_LEAF, fraud_proof_config)
             .map_err(|e| Error::Other(e.to_string()))?;
-    let mut verifier = TraceVerifier::new(trace_commitment.clone(), &EMPTY_TRIE_NODES[0], &cfs)
+    let mut verifier = TraceVerifier::new(trace_commitment.clone(), &EMPTY_LEAF, &cfs)
         .map_err(|e| Error::Other(e.to_string()))?;
     let window = verifier
         .terminal_window(&trace)

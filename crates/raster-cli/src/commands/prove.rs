@@ -22,7 +22,7 @@ use raster_core::transition::{
 use raster_core::{Error, Result};
 
 use raster_prover::authorization::authorize_external_inputs;
-use raster_prover::precomputed::EMPTY_TRIE_NODES;
+use raster_core::merkle::EMPTY_LEAF;
 use raster_prover::replay::{ReplayResult, Replayer};
 use raster_prover::trace::{
     Bytes, FraudEvidence, FraudProofConfig, SerializableFrontier, TraceCommitment,
@@ -39,7 +39,7 @@ pub fn commit(
     fraud_proof_config: FraudProofConfig,
 ) -> Result<()> {
     let trace_commitment =
-        TraceCommitment::try_build(trace, &EMPTY_TRIE_NODES[0], fraud_proof_config)
+        TraceCommitment::try_build(trace, &EMPTY_LEAF, fraud_proof_config)
             .map_err(|e| Error::Other(e.to_string()))?;
     let bytes = postcard::to_allocvec(&trace_commitment).unwrap();
 
@@ -59,7 +59,7 @@ pub fn verify(
 ) -> Result<VerificationResult> {
     let trace_commitment = read_trace_commitment(commit_path)?;
 
-    let mut trace_verifier = TraceVerifier::new(trace_commitment, &EMPTY_TRIE_NODES[0], cfs)
+    let mut trace_verifier = TraceVerifier::new(trace_commitment, &EMPTY_LEAF, cfs)
         .map_err(|e| Error::Other(e.to_string()))?;
 
     Ok(trace_verifier.verify(trace))
@@ -125,7 +125,7 @@ struct ProofStorageState {
 fn empty_storage_frontier() -> SerializableFrontier {
     SerializableFrontier {
         position: 0,
-        leaf: EMPTY_TRIE_NODES[0].to_vec(),
+        leaf: EMPTY_LEAF.to_vec(),
         ommers: Vec::new(),
     }
 }
@@ -139,7 +139,7 @@ fn build_storage_log_witness(
     log_position: u64,
 ) -> StorageLogWitness {
     let mut tree = TraceTree::new(1);
-    tree.append(Bytes(EMPTY_TRIE_NODES[0].to_vec()));
+    tree.append(Bytes(EMPTY_LEAF.to_vec()));
     let mut marked_position = None;
 
     for (index, entry) in append_entries.iter().enumerate() {

@@ -68,6 +68,15 @@ table. Only `EMPTY_TRIE_NODES[0]` is load-bearing here (it is `empty_leaf`, and 
 guest's `EMPTY_LEAF`); what the rest of the table actually is has not been established and is
 worth its own look.
 
+> **Resolved 2026-10-15.** `EMPTY_TRIE_NODES` is gone. Entries 1–31 match none of eight hashing
+> rules tried (SHA-256 with and without a level prefix, level offset by one, level as a u64,
+> SHA3-256, BLAKE2s, BLAKE2b; Keccak-256 was not tried), and nothing ever read them: every use was
+> `EMPTY_TRIE_NODES[0]`. That value is now `raster_core::merkle::EMPTY_LEAF`, next to the correct
+> `EMPTY_ROOTS` table, which the host and the transition guest share. The guest's runtime memo is
+> replaced by that compiled-in table, because each transition step is a fresh execution and
+> rebuilt the memo every time: 0.42M of ~2.4M user cycles per step (−17.5% over a 16-step
+> window). `empty_roots_match_fold` pins the table on both sides.
+
 ### Measured
 
 In-process A/B in release, against a twin type identical but for the override, with the two roots
