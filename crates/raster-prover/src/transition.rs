@@ -22,7 +22,7 @@ use raster_core::transition::{
 use std::collections::{BTreeMap, HashMap};
 
 use crate::authorization::authorization_guest_image_id;
-use raster_core::merkle::EMPTY_LEAF;
+use raster_core::merkle::{NodeHash, EMPTY_LEAF};
 use crate::replay::ReplayResult;
 use crate::trace::{
     frontier_root, serializable_frontier_into_trace_frontier, SerializableFrontier,
@@ -67,7 +67,7 @@ fn build_transition_input(
     // The commitment's revealed tail roots. `Some` only on the first step —
     // the only one holding the header to bind them against; the root the
     // terminal step needs is carried forward on the journal.
-    revealed_tail_roots: Option<Vec<Vec<u8>>>,
+    revealed_tail_roots: Option<Vec<NodeHash>>,
 ) -> TransitionInput {
     let StepIo {
         input_witness,
@@ -216,7 +216,7 @@ pub fn step_transitions(
     // The commitment's revealed tail roots, so a divergence the packed
     // fingerprint is blind to can still be proven. See
     // `TransitionJournal::final_committed_root`.
-    revealed_tail_roots: &[Vec<u8>],
+    revealed_tail_roots: &[NodeHash],
 ) -> Option<risc0_zkvm::Receipt> {
     let prover = risc0_zkvm::default_prover();
 
@@ -681,7 +681,7 @@ mod tests {
         let trace_commitment = TraceCommitment {
             fingerprint: window_fingerprint,
             revealed_items: vec![make_sequence_start_step()],
-            revealed_tail_roots: vec![vec![0u8; 32]],
+            revealed_tail_roots: vec![[0u8; 32].into()],
         };
         let commitment_header = trace_commitment.header();
         let fingerprint_slice = trace_commitment.fingerprint_slice_witness(0, 1);

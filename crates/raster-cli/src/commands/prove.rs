@@ -22,7 +22,7 @@ use raster_core::transition::{
 use raster_core::{Error, Result};
 
 use raster_prover::authorization::authorize_external_inputs;
-use raster_core::merkle::EMPTY_LEAF;
+use raster_core::merkle::{to_node_hash, EMPTY_LEAF};
 use raster_prover::replay::{ReplayResult, Replayer};
 use raster_prover::trace::{
     Bytes, FraudEvidence, FraudProofConfig, SerializableFrontier, TraceCommitment,
@@ -161,7 +161,7 @@ fn build_storage_log_witness(
 
     StorageLogWitness {
         position: u64::from(marked_position),
-        path_elems: auth_path.iter().map(|elem| elem.0.clone()).collect(),
+        path_elems: auth_path.iter().map(|elem| to_node_hash(&elem.0)).collect(),
     }
 }
 

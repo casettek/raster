@@ -794,7 +794,7 @@ pub struct TraceCommitment {
     /// commit to, and `validate` holds each one to the entry it squeezes to, so
     /// a commitment whose roots and bits disagree is unrepresentable.
     #[serde(default)]
-    pub revealed_tail_roots: Vec<Vec<u8>>,
+    pub revealed_tail_roots: Vec<crate::merkle::NodeHash>,
 }
 
 impl TraceCommitment {

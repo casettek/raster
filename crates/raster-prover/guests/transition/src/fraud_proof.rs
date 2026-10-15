@@ -29,6 +29,7 @@ use raster_core::transition::{
 
 use crate::checks;
 use crate::frame;
+use raster_core::merkle::NodeHash;
 use crate::merkle_tree::{
     combine_merkle_level, deserialize_frontier, frontier_root, hash_trace_item, serialize_frontier,
     sha256_bytes, Bytes, EMPTY_LEAF,
@@ -341,7 +342,7 @@ pub(crate) fn assert_window_is_commitment_slice(
     init_transition: &InitTransition,
     header: &TraceCommitmentHeader,
     slice_witness: &FingerprintSliceWitness,
-    revealed_tail_roots: Option<&Vec<Vec<u8>>>,
+    revealed_tail_roots: Option<&Vec<NodeHash>>,
 ) -> WindowBinding {
     let window_fingerprint = &init_transition.fingerprint;
     assert!(
@@ -416,9 +417,9 @@ pub(crate) fn assert_window_is_commitment_slice(
         let mut current = sha256_bytes(&block_witness.block.to_le_bytes());
         for (level, sibling) in block_witness.path_elems.iter().enumerate() {
             current = if ((block_witness.position >> level) & 1) == 0 {
-                combine_merkle_level(level, &current, sibling)
+                combine_merkle_level(level, &current, sibling.as_slice())
             } else {
-                combine_merkle_level(level, sibling, &current)
+                combine_merkle_level(level, sibling.as_slice(), &current)
             };
         }
         assert!(
@@ -466,7 +467,7 @@ pub(crate) fn assert_window_is_commitment_slice(
         final_index
             .checked_sub(tail_start)
             .and_then(|offset| roots.get(offset))
-            .cloned()
+            .map(|root| root.to_vec())
     });
 
     WindowBinding {

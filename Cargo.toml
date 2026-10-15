@@ -67,6 +67,9 @@ clap = { version = "4.5", features = ["derive"] }
 # ABI dependencies
 # postcard is no_std compatible, used for serialization in tiles
 postcard = { version = "1.0", default-features = false, features = ["alloc"] }
+# Byte strings in protocol types: `Vec<u8>` and `[u8; N]` serialized as one
+# byte string instead of a sequence of `u8` (see `raster_core::merkle::Hash32`).
+serde_bytes = { version = "0.11", default-features = false, features = ["alloc"] }
 # bincode is used by std-only code (CLI, backend)
 bincode = "1.3"
 walkdir = "2"

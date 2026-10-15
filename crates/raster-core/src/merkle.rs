@@ -33,6 +33,24 @@ const fn hex(digits: &str) -> [u8; HASH_SIZE] {
     out
 }
 
+/// A 32-byte hash inside a protocol type: a merkle node, root or path element.
+///
+/// `serde_bytes::ByteArray` serializes as one byte string instead of a
+/// sequence of 32 `u8`. postcard writes both the same way (length, then the
+/// raw bytes), so commitments over postcard encodings are unchanged; decoding
+/// becomes one copy instead of 32 element visits. risc0's serializer packs the
+/// bytes into 8 words instead of spending one word per byte. It derefs to
+/// `[u8; 32]` and converts from it with `.into()`, so code outside the protocol
+/// types never names `serde_bytes`.
+pub type NodeHash = serde_bytes::ByteArray<HASH_SIZE>;
+
+/// A [`NodeHash`] from a hash held as bytes. Panics unless it is 32 bytes long:
+/// every caller passes a SHA-256 output.
+pub fn to_node_hash(bytes: &[u8]) -> NodeHash {
+    let array: [u8; HASH_SIZE] = bytes.try_into().expect("a hash is 32 bytes");
+    array.into()
+}
+
 /// Depth of the trace and storage trees: the level a frontier's root is folded
 /// to.
 pub const TRACE_TREE_DEPTH: u8 = 32;
@@ -92,6 +110,29 @@ pub const EMPTY_ROOTS: [[u8; HASH_SIZE]; TRACE_TREE_DEPTH as usize + 1] = [
 mod tests {
     use super::*;
     use crate::hash::{Digest, Sha256};
+    use alloc::{vec, vec::Vec};
+
+    /// postcard writes a [`NodeHash`] exactly like the `Vec<u8>` it replaced
+    /// (length, then raw bytes), so every commitment computed over a postcard
+    /// encoding (`TraceCommitmentHeader::digest`, `StorageEntry::to_bytes`,
+    /// `revealed_tail_roots_commitment`) is unchanged by the switch.
+    #[test]
+    fn hash32_postcard_matches_vec_u8() {
+        let hashes: Vec<[u8; HASH_SIZE]> = (0..3u8).map(|n| [n; HASH_SIZE]).collect();
+        let as_vecs: Vec<Vec<u8>> = hashes.iter().map(|h| h.to_vec()).collect();
+        let as_node_hashes: Vec<NodeHash> = hashes.iter().map(|h| (*h).into()).collect();
+        assert_eq!(
+            postcard::to_allocvec(&as_node_hashes).unwrap(),
+            postcard::to_allocvec(&as_vecs).unwrap()
+        );
+    }
+
+    /// Decoding enforces the length: a 31-byte "hash" is rejected, not padded.
+    #[test]
+    fn hash32_rejects_wrong_length() {
+        let short = postcard::to_allocvec(&vec![7u8; HASH_SIZE - 1]).unwrap();
+        assert!(postcard::from_bytes::<NodeHash>(&short).is_err());
+    }
 
     /// Recompute the recurrence from scratch. The host and guest tests pin
     /// the table to their own `combine`; this one pins it to the definition.

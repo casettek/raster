@@ -18,7 +18,7 @@ pub type TraceBridgeTree = bridgetree::BridgeTree<Bytes, u64, 32>;
 /// Shared with the host prover, so both fold to the same depth and use the
 /// same empty roots.
 pub use raster_core::merkle::{EMPTY_LEAF, EMPTY_ROOTS, TRACE_TREE_DEPTH};
-use raster_core::merkle::HASH_SIZE;
+use raster_core::merkle::{to_node_hash, HASH_SIZE};
 
 // ============================================================================
 // Bytes + Hashable for bridgetree (matches prover's empty leaf and combine)
@@ -108,7 +108,7 @@ pub fn deserialize_frontier(ser: &SerializableFrontier) -> Option<NonEmptyFronti
     NonEmptyFrontier::from_parts(
         Position::from(ser.position),
         Bytes(ser.leaf.clone()),
-        ser.ommers.iter().map(|o| Bytes(o.clone())).collect(),
+        ser.ommers.iter().map(|o| Bytes(o.to_vec())).collect(),
     )
     .ok()
 }
@@ -117,7 +117,7 @@ pub fn serialize_frontier(frontier: &NonEmptyFrontier<Bytes>) -> SerializableFro
     SerializableFrontier {
         position: frontier.position().into(),
         leaf: frontier.leaf().0.clone(),
-        ommers: frontier.ommers().iter().map(|o| o.0.clone()).collect(),
+        ommers: frontier.ommers().iter().map(|o| to_node_hash(&o.0)).collect(),
     }
 }
 

@@ -610,9 +610,9 @@ fn assert_record_in_trace(record: &StepRecord, witness: &StepRecordWitness, trac
     let mut current = hash_trace_item(record);
     for (level, sibling) in witness.path_elems.iter().enumerate() {
         current = if ((witness.position >> level) & 1) == 0 {
-            combine_merkle_level(level, &current, sibling)
+            combine_merkle_level(level, &current, sibling.as_slice())
         } else {
-            combine_merkle_level(level, sibling, &current)
+            combine_merkle_level(level, sibling.as_slice(), &current)
         };
     }
     assert!(

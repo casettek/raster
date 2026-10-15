@@ -17,7 +17,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt::Debug;
 
 use crate::error::{BitPackerError, Result};
-use raster_core::merkle::{EMPTY_LEAF, EMPTY_ROOTS, HASH_SIZE};
+use raster_core::merkle::{to_node_hash, EMPTY_LEAF, EMPTY_ROOTS, HASH_SIZE};
 
 use raster_core::fingerprint::BitPacker;
 use raster_core::trace::{ExecStep, ExecTarget, StepKind, StepRecord, Trace, TraceWindow};
@@ -126,7 +126,7 @@ pub fn serializable_frontier_from_trace_frontier(
     SerializableFrontier {
         position: frontier.position().into(),
         leaf: frontier.leaf().clone().0,
-        ommers: frontier.ommers().iter().map(|o| o.clone().0).collect(),
+        ommers: frontier.ommers().iter().map(|o| to_node_hash(&o.0)).collect(),
     }
 }
 
@@ -138,7 +138,7 @@ pub fn serializable_frontier_into_trace_frontier(
     TraceTreeFrontier::from_parts(
         Position::from(s.position),
         Bytes(s.leaf.clone()),
-        s.ommers.iter().map(|o| Bytes(o.clone())).collect(),
+        s.ommers.iter().map(|o| Bytes(o.to_vec())).collect(),
     )
     .ok()
 }
@@ -313,7 +313,7 @@ impl TraceCommitmentExt for TraceCommitment {
             trace_tree.append(Bytes(item_hash.clone()));
             if let Some(root) = trace_tree.root(0) {
                 if index >= tail_start {
-                    revealed_tail_roots.push(root.0.clone());
+                    revealed_tail_roots.push(to_node_hash(&root.0));
                 }
                 fingerprint_acc.append(&root.0);
             }
@@ -426,7 +426,7 @@ impl TraceCommitmentExt for TraceCommitment {
                         index, error
                     ))
                 })?;
-            let derived = fingerprint_value(root, bits_per_item);
+            let derived = fingerprint_value(root.as_slice(), bits_per_item);
             if derived != committed {
                 return Err(BitPackerError::InvalidCommitment(format!(
                     "Revealed tail root at index {} squeezes to {} but the fingerprint \
@@ -559,7 +559,7 @@ impl TraceCommitmentExt for TraceCommitment {
                 FingerprintBlockWitness {
                     block: self.fingerprint.bits[index],
                     position: u64::from(position),
-                    path_elems: path.iter().map(|elem| elem.0.clone()).collect(),
+                    path_elems: path.iter().map(|elem| to_node_hash(&elem.0)).collect(),
                 }
             })
             .collect();
@@ -937,7 +937,7 @@ fn witness_record_inputs(
                 path_elems: merkle_path
                     .path_elems()
                     .iter()
-                    .map(|elem| elem.0.clone())
+                    .map(|elem| to_node_hash(&elem.0))
                     .collect(),
             })
             .expect("Failed to serialize source record witness");
@@ -1809,7 +1809,7 @@ mod tests {
         assert_eq!(commitment.revealed_tail_roots.len(), config.window_size);
         // The last revealed root is the trace's final root.
         assert_eq!(
-            *commitment.revealed_tail_roots.last().unwrap(),
+            commitment.revealed_tail_roots.last().unwrap().to_vec(),
             final_trace_root(&trace, &EMPTY_LEAF),
         );
         // And the commitment is internally consistent.
@@ -1829,7 +1829,7 @@ mod tests {
         );
 
         // Flip enough bits to change the squeezed value, not just the root.
-        commitment.revealed_tail_roots[0] = vec![0xFF; 32];
+        commitment.revealed_tail_roots[0] = [0xFF; 32].into();
 
         assert!(matches!(
             commitment.validate(),

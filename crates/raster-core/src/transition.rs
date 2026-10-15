@@ -16,6 +16,7 @@ use crate::draft::{DraftTransitionWitness, TileReplayJournal};
 use crate::recur_progress::RecurProgressStack;
 use crate::fingerprint::{Fingerprint, FingerprintAccumulator};
 use crate::input::SelectionWitness;
+use crate::merkle::NodeHash;
 use crate::trace::{FnInput, StepRecord};
 
 /// Serializable representation of a Merkle frontier (position, leaf, ommers).
@@ -25,8 +26,9 @@ use crate::trace::{FnInput, StepRecord};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SerializableFrontier {
     pub position: u64,
+    #[serde(with = "serde_bytes")]
     pub leaf: Vec<u8>,
-    pub ommers: Vec<Vec<u8>>,
+    pub ommers: Vec<NodeHash>,
 }
 
 impl SerializableFrontier {
@@ -44,7 +46,7 @@ impl SerializableFrontier {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StepRecordWitness {
     pub position: u64,
-    pub path_elems: Vec<Vec<u8>>,
+    pub path_elems: Vec<NodeHash>,
 }
 
 /// Domain prefix for [`TraceCommitmentHeader::digest`].
@@ -72,8 +74,10 @@ pub struct TraceCommitmentHeader {
     /// Trace items the fingerprint covers (`fingerprint.len`).
     pub fingerprint_len: u64,
     /// Merkle root over the fingerprint's packed `u64` blocks.
+    #[serde(with = "serde_bytes")]
     pub fingerprint_root: Vec<u8>,
     /// `sha256(postcard(revealed_items))`.
+    #[serde(with = "serde_bytes")]
     pub revealed_items_commitment: Vec<u8>,
     /// The fraud-proof window size this commitment was built with —
     /// `revealed_items.len()` host-side.
@@ -90,6 +94,7 @@ pub struct TraceCommitmentHeader {
     /// The roots themselves are O(window), so they travel as a witness when a
     /// tail divergence is proven; the header stays constant-size, which is its
     /// whole purpose.
+    #[serde(with = "serde_bytes")]
     pub revealed_tail_roots_commitment: Vec<u8>,
 }
 
@@ -114,7 +119,7 @@ pub struct FingerprintBlockWitness {
     pub block: u64,
     /// The block's index in the commitment's packed `bits` array.
     pub position: u64,
-    pub path_elems: Vec<Vec<u8>>,
+    pub path_elems: Vec<NodeHash>,
 }
 
 /// The contiguous run of proven fingerprint blocks covering a fraud window's
@@ -129,6 +134,7 @@ pub struct FingerprintSliceWitness {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StorageEntry {
     pub coordinates: CfsCoordinates,
+    #[serde(with = "serde_bytes")]
     pub object_commitment: Vec<u8>,
 }
 
@@ -141,6 +147,7 @@ impl StorageEntry {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StorageIndexValue {
     pub log_position: u64,
+    #[serde(with = "serde_bytes")]
     pub object_commitment: Vec<u8>,
 }
 
@@ -148,19 +155,19 @@ pub struct StorageIndexValue {
 pub struct CoordinateIndexMembershipProof {
     pub coordinates: CfsCoordinates,
     pub value: StorageIndexValue,
-    pub siblings: Vec<Vec<u8>>,
+    pub siblings: Vec<NodeHash>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CoordinateIndexNonMembershipProof {
     pub coordinates: CfsCoordinates,
-    pub siblings: Vec<Vec<u8>>,
+    pub siblings: Vec<NodeHash>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StorageLogWitness {
     pub position: u64,
-    pub path_elems: Vec<Vec<u8>>,
+    pub path_elems: Vec<NodeHash>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -193,7 +200,9 @@ pub struct TransitionInput {
     /// `docs/proposals/program-identity.md`.
     pub replay_journal: Option<TileReplayJournal>,
 
+    #[serde(with = "serde_bytes")]
     pub input_witness: Option<Vec<u8>>,
+    #[serde(with = "serde_bytes")]
     pub output_witness: Option<Vec<u8>>,
     pub input_source_witness: Option<FnInput>,
     pub sequence_scope_witness: Option<FnInput>,
@@ -213,6 +222,7 @@ pub struct TransitionInput {
     /// step's fold could never reach its own root.
     pub input_sources_witnesses: HashMap<(u64, StepRecord), Vec<u8>>,
 
+    #[serde(with = "serde_bytes")]
     pub authorization_image_id: Vec<u8>,
     pub authorization_journal: AuthorizationJournal,
 
@@ -257,7 +267,7 @@ pub struct TransitionInput {
     /// falls inside the revealed tail. Omitting them costs the challenger the
     /// root-divergence route and nothing else, so absence is never an attack.
     #[serde(default)]
-    pub revealed_tail_roots: Option<Vec<Vec<u8>>>,
+    pub revealed_tail_roots: Option<Vec<NodeHash>>,
 }
 
 /// Result of applying one transition (new frontier and fingerprint state).
@@ -265,7 +275,9 @@ pub struct TransitionInput {
 pub struct Transition {
     pub frontier: SerializableFrontier,
     pub storage_frontier: SerializableFrontier,
+    #[serde(with = "serde_bytes")]
     pub storage_root: Vec<u8>,
+    #[serde(with = "serde_bytes")]
     pub storage_index_root: Vec<u8>,
     pub actual_fingerprint_acc: FingerprintAccumulator,
     pub next_expected_coordinates: Vec<CfsCoordinates>,
@@ -284,7 +296,9 @@ pub struct Transition {
 pub struct InitTransition {
     pub init_frontier: SerializableFrontier,
     pub init_storage_frontier: SerializableFrontier,
+    #[serde(with = "serde_bytes")]
     pub init_storage_root: Vec<u8>,
+    #[serde(with = "serde_bytes")]
     pub init_storage_index_root: Vec<u8>,
     pub fingerprint: Fingerprint,
 }
@@ -355,7 +369,10 @@ pub enum OutputAuthorization {
     /// symmetric: [`TransitionJournal::input_manifest_commitment`] names the
     /// authorized *input* the same window is bound to, and this names the
     /// output it produced. See `docs/proposals/chain-io-commitment.md`.
-    Established { output_commitment: Vec<u8> },
+    Established {
+        #[serde(with = "serde_bytes")]
+        output_commitment: Vec<u8>,
+    },
 }
 
 /// Journal produced by the transition guest (init state + current state + image id).
@@ -363,14 +380,18 @@ pub enum OutputAuthorization {
 pub struct TransitionJournal {
     pub init_state: InitTransition,
     pub current_state: TransitionState,
+    #[serde(with = "serde_bytes")]
     pub transition_image_id: Vec<u8>,
+    #[serde(with = "serde_bytes")]
     pub authorization_image_id: Vec<u8>,
+    #[serde(with = "serde_bytes")]
     pub input_manifest_commitment: Vec<u8>,
 
     /// `sha256(domain || program.bin)` — the identity of the program this
     /// chain proves execution of. Derived in-guest from the `ProgramDefinition`
     /// frame bytes, and asserted continuous across `Next` steps. See
     /// `docs/proposals/program-identity.md`.
+    #[serde(with = "serde_bytes")]
     pub program_commitment: Vec<u8>,
 
     /// `sha256(postcard(TraceCommitment))` — the identity of the `commit.bin`
@@ -381,6 +402,7 @@ pub struct TransitionJournal {
     /// journal therefore refutes exactly this commitment — a downstream
     /// verifier (the chain-fraud guest) binds it to a stage checkpoint by
     /// hash equality alone. See `docs/proposals/chain-fraud-proof.md`.
+    #[serde(with = "serde_bytes")]
     pub refuted_trace_commitment: Vec<u8>,
 
     /// Whether this chain has tied `main`'s entry-argument binding to the
@@ -422,6 +444,6 @@ pub struct TransitionJournal {
     /// every entry from the divergence to the end collides there is nothing
     /// left in the fingerprint to diverge on, and at `window_size >= 128`
     /// (`bits_per_item == 1`) that is a coin flip rather than a rarity.
-    #[serde(default)]
+    #[serde(default, with = "serde_bytes")]
     pub final_committed_root: Option<Vec<u8>>,
 }
