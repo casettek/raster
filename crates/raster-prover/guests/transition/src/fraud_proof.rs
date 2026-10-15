@@ -28,6 +28,7 @@ use raster_core::transition::{
 };
 
 use crate::checks;
+use crate::frame;
 use crate::merkle_tree::{
     combine_merkle_level, deserialize_frontier, frontier_root, hash_trace_item, serialize_frontier,
     sha256_bytes, Bytes, EMPTY_LEAF,
@@ -57,11 +58,11 @@ impl PublicParams {
     /// `program_commitment` is bound to the exact bytes verified against — a
     /// host cannot name one program and verify against another.
     pub fn read() -> Self {
-        let program_bytes: Vec<u8> = env::read();
+        let program_bytes = frame::read_bytes();
         let program_commitment = commitment_of_bytes(&program_bytes).to_vec();
         let program = ProgramDefinition::decode(&program_bytes)
             .expect("host must supply a valid ProgramDefinition frame");
-        let transition_image_id: Vec<u8> = env::read();
+        let transition_image_id = frame::read_bytes();
         let cfs_cursor = CfsCursor::new(program.cfs.clone());
         Self {
             program,
@@ -241,7 +242,7 @@ impl FraudProofWindowContext {
                 )
             }
             TransitionState::Next(transition) => {
-                let prev_journal: TransitionJournal = env::read();
+                let prev_journal: TransitionJournal = frame::read();
                 verify_previous_journal(&prev_journal, &params.transition_image_id);
                 assert_state_continuity(&prev_journal, &transition);
                 assert_manifest_continuity(&prev_journal, input);

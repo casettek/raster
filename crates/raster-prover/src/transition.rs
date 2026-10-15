@@ -128,6 +128,23 @@ fn image_id_bytes(image_id: [u32; 8]) -> Vec<u8> {
         .collect()
 }
 
+/// Write one transition guest input as a frame: a `u32` byte length, then the
+/// bytes. The guest reads it back with two bulk `read_slice` calls (its
+/// `frame` module). Not `builder.write`: risc0's serde makes the guest fetch one
+/// word per syscall, one per `u8` of a `Vec<u8>`, and on risc0 3.x every
+/// syscall traps through the v1compat kernel. That was 68% of a step's cycles.
+fn write_frame(builder: &mut risc0_zkvm::ExecutorEnvBuilder<'_>, bytes: &[u8]) {
+    let len = u32::try_from(bytes.len()).expect("transition input frame exceeds u32::MAX bytes");
+    builder.write_slice(&[len]);
+    builder.write_slice(bytes);
+}
+
+/// [`write_frame`] of `value`'s postcard encoding.
+fn write_postcard<T: serde::Serialize>(builder: &mut risc0_zkvm::ExecutorEnvBuilder<'_>, value: &T) {
+    let bytes = postcard::to_allocvec(value).expect("transition input must encode with postcard");
+    write_frame(builder, &bytes);
+}
+
 fn empty_storage_frontier() -> SerializableFrontier {
     SerializableFrontier {
         position: 0,
@@ -276,17 +293,17 @@ pub fn step_transitions(
             });
             builder.add_assumption(transition_receipt);
         }
-        builder.write(&program_frame.to_vec()).unwrap();
-        builder.write(&transition_image_id).unwrap();
-        builder.write(&input).unwrap();
-        builder.write(&current_state).unwrap();
+        write_frame(&mut builder, program_frame);
+        write_frame(&mut builder, &transition_image_id);
+        write_postcard(&mut builder, &input);
+        write_postcard(&mut builder, &current_state);
         if let Some(previous_journal) = current_journal {
-            builder.write(&previous_journal).unwrap();
+            write_postcard(&mut builder, &previous_journal);
         } else {
             // The window-opening `Init` step reads the commitment binding
             // right after the state (see the guest's `main`).
-            builder.write(commitment_header).unwrap();
-            builder.write(fingerprint_slice).unwrap();
+            write_postcard(&mut builder, commitment_header);
+            write_postcard(&mut builder, fingerprint_slice);
         }
         let env = builder.build().unwrap();
         let receipt = prover.prove(env, &TRANSITION_GUEST_ELF).unwrap().receipt;
@@ -673,12 +690,12 @@ mod tests {
         if let Some(receipt) = authorization_receipt {
             builder.add_assumption(receipt);
         }
-        builder.write(&make_minimal_program_frame()).unwrap();
-        builder.write(&image_id_bytes(TRANSITION_GUEST_ID)).unwrap();
-        builder.write(&input).unwrap();
-        builder.write(&state).unwrap();
-        builder.write(&commitment_header).unwrap();
-        builder.write(&fingerprint_slice).unwrap();
+        write_frame(&mut builder, &make_minimal_program_frame());
+        write_frame(&mut builder, &image_id_bytes(TRANSITION_GUEST_ID));
+        write_postcard(&mut builder, &input);
+        write_postcard(&mut builder, &state);
+        write_postcard(&mut builder, &commitment_header);
+        write_postcard(&mut builder, &fingerprint_slice);
         let env = builder.build().unwrap();
 
         prover.prove(env, &TRANSITION_GUEST_ELF)
