@@ -1553,14 +1553,18 @@ impl<'ast> Visit<'ast> for CallVisitor {
         self.record_const(node);
     }
 
-    /// A nested block's `let`s and `const`s go out of scope at its end. The
-    /// body's own block keeps them: the return is classified after the visit.
+    /// A nested block's `let`s and `const`s go out of scope at its end: the
+    /// constants and local types they bound or shadowed revert to the outer
+    /// ones. The body's own block keeps them: the return is classified after
+    /// the visit.
     fn visit_block(&mut self, node: &'ast syn::Block) {
         self.block_depth += 1;
-        let outer = (self.block_depth > 1).then(|| self.constants.clone());
+        let outer = (self.block_depth > 1)
+            .then(|| (self.constants.clone(), self.types.locals.clone()));
         syn::visit::visit_block(self, node);
-        if let Some(outer) = outer {
-            self.constants = outer;
+        if let Some((constants, locals)) = outer {
+            self.constants = constants;
+            self.types.locals = locals;
         }
         self.block_depth -= 1;
     }
@@ -1914,6 +1918,25 @@ mod tests {
                 // A data-sourced index has no static path either way.
                 rooted_at("model", None),
             ]
+        );
+    }
+
+    /// A binding inside a nested block does not outlive it: the outer `model`
+    /// is in scope again after the block, with its type.
+    #[test]
+    fn byte_page_selection_sees_the_outer_type_after_a_shadowing_block() {
+        let visitor = byte_page_visitor(
+            "fn s(model: Model) { \
+             { let model = 0usize; } \
+             call!(t, select!(BytesPage, model.weights[4])); }",
+        );
+        assert!(visitor.get_selection_errors().is_empty(), "{:?}", visitor.get_selection_errors());
+        assert_eq!(
+            visitor.get_call_infos()[0].argument_kinds,
+            vec![rooted_at(
+                "model",
+                Some(vec![field("weights"), field("pages"), SelectorSegment::Index(1)])
+            )]
         );
     }
 
