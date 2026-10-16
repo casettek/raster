@@ -40,6 +40,7 @@ use crate::checks::cfs::{
 use crate::checks::drafts::verify_draft_transition;
 use crate::checks::io::{input_source_commitment, verify_io_witness, verify_step_record};
 use crate::checks::store::{storage_leaf_hash, verify_storage_transition};
+use raster_core::merkle::{to_node_hash, NodeHash};
 use crate::merkle_tree::{
     deserialize_frontier, frontier_root, sha256_bytes, sha256_hex, Bytes, TraceBridgeTree,
     EMPTY_LEAF,
@@ -241,7 +242,7 @@ fn trace_root_and_witness(
         root,
         raster_core::transition::StepRecordWitness {
             position: u64::from(position),
-            path_elems: path.iter().map(|elem| elem.0.clone()).collect(),
+            path_elems: path.iter().map(|elem| to_node_hash(&elem.0)).collect(),
         },
     )
 }
@@ -300,7 +301,7 @@ fn sequence_scope_parent_binding_accepts_the_real_parent() {
     let mut witnesses = HashMap::new();
     witnesses.insert(
         (step_record.exec_index, parent_record),
-        postcard::to_allocvec(&witness).expect("witness serializes"),
+        witness,
     );
 
     verify_sequence_scope_parent(
@@ -347,11 +348,11 @@ fn two_steps_sharing_a_scope_parent_each_verify_at_their_own_trace_root() {
     let mut witnesses = HashMap::new();
     witnesses.insert(
         (first_step.exec_index, parent_record.clone()),
-        postcard::to_allocvec(&witness_at_first).expect("witness serializes"),
+        witness_at_first,
     );
     witnesses.insert(
         (second_step.exec_index, parent_record),
-        postcard::to_allocvec(&witness_at_second).expect("witness serializes"),
+        witness_at_second,
     );
 
     verify_sequence_scope_parent(
@@ -386,7 +387,7 @@ fn a_step_cannot_borrow_another_steps_witness_for_the_same_parent() {
     let mut witnesses = HashMap::new();
     witnesses.insert(
         (first_step.exec_index, parent_record),
-        postcard::to_allocvec(&witness_at_first).expect("witness serializes"),
+        witness_at_first,
     );
 
     verify_sequence_scope_parent(
@@ -416,7 +417,7 @@ fn sequence_scope_parent_binding_refuses_a_fabricated_witness() {
     let mut witnesses = HashMap::new();
     witnesses.insert(
         (step_record.exec_index, parent_record),
-        postcard::to_allocvec(&witness).expect("witness serializes"),
+        witness,
     );
 
     verify_sequence_scope_parent(
@@ -451,7 +452,7 @@ fn sequence_scope_parent_binding_refuses_a_parent_not_in_the_trace() {
     let mut witnesses = HashMap::new();
     witnesses.insert(
         (step_record.exec_index, parent_record),
-        postcard::to_allocvec(&witness).expect("witness serializes"),
+        witness,
     );
 
     verify_sequence_scope_parent(
@@ -1833,7 +1834,7 @@ fn build_storage_log_witness_for_entries(
         .expect("append-log witness should exist");
     StorageLogWitness {
         position: u64::from(marked_position),
-        path_elems: auth_path.iter().map(|elem| elem.0.clone()).collect(),
+        path_elems: auth_path.iter().map(|elem| to_node_hash(&elem.0)).collect(),
     }
 }
 
@@ -2155,7 +2156,7 @@ fn verify_storage_transition_rejects_duplicate_coordinates() {
             index_non_membership_witness:
                 raster_core::transition::CoordinateIndexNonMembershipProof {
                     coordinates: existing_entry.coordinates.clone(),
-                    siblings: vec![vec![0; 32]; 256],
+                    siblings: vec![[0; 32].into(); 256],
                 },
             index_membership_witness: coordinate_index_membership_proof(
                 &before_index,
@@ -3062,7 +3063,7 @@ mod fingerprint_slice {
         fingerprint_len: usize,
         window_start: usize,
         window_len: usize,
-        tail_roots: &[Vec<u8>],
+        tail_roots: &[NodeHash],
     ) -> (TraceCommitmentHeader, FingerprintSliceWitness) {
         let (mut header, witness) = build_header_and_witness_for_window(
             bits,
@@ -3108,7 +3109,7 @@ mod fingerprint_slice {
                 FingerprintBlockWitness {
                     block: bits[index],
                     position: u64::from(position),
-                    path_elems: path.iter().map(|elem| elem.0.clone()).collect(),
+                    path_elems: path.iter().map(|elem| to_node_hash(&elem.0)).collect(),
                 }
             })
             .collect();
@@ -3209,7 +3210,7 @@ mod fingerprint_slice {
         // The commitment's window is 4, so its tail covers items 36..40.
         // A window ending at item 39 ends inside it.
         let (window_start, window_len) = (36, 4);
-        let tail_roots: Vec<Vec<u8>> = (36..40u8).map(|i| vec![i; 32]).collect();
+        let tail_roots: Vec<NodeHash> = (36..40u8).map(|i| [i; 32].into()).collect();
 
         let packer = BitPacker::new(bits_per_item);
         let window_bits = packer
@@ -3244,7 +3245,7 @@ mod fingerprint_slice {
         let (bits_per_item, items) = (4, 40);
         let bits = fixture_bits(bits_per_item, items);
         let (window_start, window_len) = (10, 4);
-        let tail_roots: Vec<Vec<u8>> = (36..40u8).map(|i| vec![i; 32]).collect();
+        let tail_roots: Vec<NodeHash> = (36..40u8).map(|i| [i; 32].into()).collect();
 
         let packer = BitPacker::new(bits_per_item);
         let window_bits = packer
@@ -3279,7 +3280,7 @@ mod fingerprint_slice {
         let (bits_per_item, items) = (4, 40);
         let bits = fixture_bits(bits_per_item, items);
         let (window_start, window_len) = (36, 4);
-        let committed: Vec<Vec<u8>> = (36..40u8).map(|i| vec![i; 32]).collect();
+        let committed: Vec<NodeHash> = (36..40u8).map(|i| [i; 32].into()).collect();
 
         let packer = BitPacker::new(bits_per_item);
         let window_bits = packer
@@ -3298,7 +3299,7 @@ mod fingerprint_slice {
 
         // A different story about the tail, so the terminal step could claim a
         // divergence that never happened.
-        let invented: Vec<Vec<u8>> = (36..40u8).map(|i| vec![i ^ 0xFF; 32]).collect();
+        let invented: Vec<NodeHash> = (36..40u8).map(|i| [i ^ 0xFF; 32].into()).collect();
         assert_window_is_commitment_slice(
             &init_transition_with_window(window_start, window),
             &header,
@@ -5464,7 +5465,7 @@ fn a_sequence_scope_witness_naming_a_recur_start_is_rejected() {
     let mut witnesses = HashMap::new();
     witnesses.insert(
         (step_record.exec_index, recur_start),
-        postcard::to_allocvec(&witness).expect("witness serializes"),
+        witness,
     );
     verify_sequence_scope_parent(
         &cfs_cursor,

@@ -17,7 +17,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt::Debug;
 
 use crate::error::{BitPackerError, Result};
-use crate::precomputed::{EMPTY_TRIE_NODES, HASH_SIZE};
+use raster_core::merkle::{to_node_hash, EMPTY_LEAF, EMPTY_ROOTS, HASH_SIZE};
 
 use raster_core::fingerprint::BitPacker;
 use raster_core::trace::{ExecStep, ExecTarget, StepKind, StepRecord, Trace, TraceWindow};
@@ -75,24 +75,19 @@ impl Ord for Bytes {
 
 impl Hashable for Bytes {
     fn empty_leaf() -> Self {
-        Bytes(EMPTY_TRIE_NODES[0].to_vec())
+        Bytes(EMPTY_LEAF.to_vec())
     }
 
-    /// Memoized empty-subtree root.
+    /// Empty-subtree root, read from [`EMPTY_ROOTS`].
     ///
     /// The trait's default is an unmemoized fold from level 0, and
     /// `NonEmptyFrontier::root` calls it once per level — so folding a
     /// depth-32 frontier spent 0+1+..+31 = 496 hashes rederiving the same
-    /// constants, against ~32 hashes of actual spine. The memo is built by
-    /// that same fold, so the values are identical by construction.
-    ///
-    /// Note this is *not* `EMPTY_TRIE_NODES`: despite that table's doc
-    /// comment, its entries above level 0 are not this `combine`'s empty
-    /// roots (`empty_root_memo_matches_fold` is the guard that would catch a
-    /// swap).
+    /// constants, against ~32 hashes of actual spine.
+    /// `empty_roots_match_fold` pins the table to this `combine`.
     fn empty_root(level: Level) -> Self {
         let idx = usize::from(u8::from(level));
-        match empty_root_memo().get(idx) {
+        match EMPTY_ROOTS.get(idx) {
             Some(node) => Bytes(node.to_vec()),
             // Above the memo: fold, so a deeper tree stays correct.
             None => empty_root_fold(level),
@@ -117,21 +112,6 @@ fn empty_root_fold(level: Level) -> Bytes {
         .fold(Bytes::empty_leaf(), |v, lvl| Bytes::combine(lvl, &v, &v))
 }
 
-/// Empty-subtree roots for levels `0..=TRACE_TREE_DEPTH`, folded once.
-fn empty_root_memo() -> &'static [[u8; HASH_SIZE]] {
-    static MEMO: std::sync::OnceLock<Vec<[u8; HASH_SIZE]>> = std::sync::OnceLock::new();
-    MEMO.get_or_init(|| {
-        (0..=TRACE_TREE_DEPTH)
-            .map(|level| {
-                let root = empty_root_fold(Level::from(level));
-                let mut out = [0u8; HASH_SIZE];
-                out.copy_from_slice(&root.0);
-                out
-            })
-            .collect()
-    })
-}
-
 fn sha256_bytes(bytes: &[u8]) -> Vec<u8> {
     Sha256::digest(bytes).to_vec()
 }
@@ -146,7 +126,7 @@ pub fn serializable_frontier_from_trace_frontier(
     SerializableFrontier {
         position: frontier.position().into(),
         leaf: frontier.leaf().clone().0,
-        ommers: frontier.ommers().iter().map(|o| o.clone().0).collect(),
+        ommers: frontier.ommers().iter().map(|o| to_node_hash(&o.0)).collect(),
     }
 }
 
@@ -158,7 +138,7 @@ pub fn serializable_frontier_into_trace_frontier(
     TraceTreeFrontier::from_parts(
         Position::from(s.position),
         Bytes(s.leaf.clone()),
-        s.ommers.iter().map(|o| Bytes(o.clone())).collect(),
+        s.ommers.iter().map(|o| Bytes(o.to_vec())).collect(),
     )
     .ok()
 }
@@ -168,7 +148,7 @@ pub type TraceTree = bridgetree::BridgeTree<Bytes, u64, 32>;
 pub type TraceTreeFrontier = NonEmptyFrontier<Bytes>;
 
 /// Depth of [`TraceTree`]; the root level a frontier must be folded to.
-pub const TRACE_TREE_DEPTH: u8 = 32;
+pub use raster_core::merkle::TRACE_TREE_DEPTH;
 
 /// Root of a frontier, folded directly against the empty-subtree roots.
 ///
@@ -333,7 +313,7 @@ impl TraceCommitmentExt for TraceCommitment {
             trace_tree.append(Bytes(item_hash.clone()));
             if let Some(root) = trace_tree.root(0) {
                 if index >= tail_start {
-                    revealed_tail_roots.push(root.0.clone());
+                    revealed_tail_roots.push(to_node_hash(&root.0));
                 }
                 fingerprint_acc.append(&root.0);
             }
@@ -446,7 +426,7 @@ impl TraceCommitmentExt for TraceCommitment {
                         index, error
                     ))
                 })?;
-            let derived = fingerprint_value(root, bits_per_item);
+            let derived = fingerprint_value(root.as_slice(), bits_per_item);
             if derived != committed {
                 return Err(BitPackerError::InvalidCommitment(format!(
                     "Revealed tail root at index {} squeezes to {} but the fingerprint \
@@ -579,7 +559,7 @@ impl TraceCommitmentExt for TraceCommitment {
                 FingerprintBlockWitness {
                     block: self.fingerprint.bits[index],
                     position: u64::from(position),
-                    path_elems: path.iter().map(|elem| elem.0.clone()).collect(),
+                    path_elems: path.iter().map(|elem| to_node_hash(&elem.0)).collect(),
                 }
             })
             .collect();
@@ -895,9 +875,9 @@ fn witness_record_inputs(
     fraud_window: &TraceWindow,
     cfs_cursor: &CfsCursor,
     seed: &[u8],
-) -> HashMap<(u64, StepRecord), Vec<u8>> {
+) -> HashMap<(u64, StepRecord), StepRecordWitness> {
     let window_start_index = window_end_index + 1 - fraud_window.items.len();
-    let mut source_records_witnesses: HashMap<(u64, StepRecord), Vec<u8>> = HashMap::new();
+    let mut source_records_witnesses: HashMap<(u64, StepRecord), StepRecordWitness> = HashMap::new();
 
     for (offset, step_record) in fraud_window.items.iter().enumerate() {
         // The two steps that bind no CFS inputs, skipped in the order the guest
@@ -952,22 +932,21 @@ fn witness_record_inputs(
             let trace_prefix = Trace(trace[..step_index].to_vec());
             let merkle_path = TraceCommitment::witness(&trace_prefix, trace_index, seed)
                 .expect("Failed to derive merkle path for source record");
-            let witness_bytes = postcard::to_allocvec(&StepRecordWitness {
+            let witness = StepRecordWitness {
                 position: u64::from(merkle_path.position()),
                 path_elems: merkle_path
                     .path_elems()
                     .iter()
-                    .map(|elem| elem.0.clone())
+                    .map(|elem| to_node_hash(&elem.0))
                     .collect(),
-            })
-            .expect("Failed to serialize source record witness");
+            };
 
             // Keyed by the *verifying* step as well as the source, because the
             // witness is only valid at that step's trace root. Two window steps
             // resolving the same source get two witnesses; keyed by the source
             // alone, this `insert` overwrote the earlier step's and left it
             // folding a proof built over a longer prefix than its own root.
-            source_records_witnesses.insert((step_record.exec_index, source_record), witness_bytes);
+            source_records_witnesses.insert((step_record.exec_index, source_record), witness);
         }
     }
 
@@ -990,7 +969,7 @@ pub struct TraceVerifier<'a> {
 #[derive(Debug, Clone)]
 pub struct FraudEvidence {
     pub window: TraceWindow,
-    pub input_sources_witnesses: HashMap<(u64, StepRecord), Vec<u8>>,
+    pub input_sources_witnesses: HashMap<(u64, StepRecord), StepRecordWitness>,
 }
 
 pub enum VerificationResult {
@@ -1261,7 +1240,6 @@ mod tests {
     use raster_core::trace::{ProgramStartStep, StorageRoots};
 
     use super::*;
-    use crate::precomputed;
 
     /// Window config used by the tests: wide enough fingerprint bits to make
     /// fraud detection deterministic on the small fixed traces below.
@@ -1519,12 +1497,12 @@ mod tests {
 
         let binded_trace = TraceCommitment::build(
             &items,
-            &precomputed::EMPTY_TRIE_NODES[0],
+            &EMPTY_LEAF,
             test_fraud_proof_config(),
         );
         let ref_binded_trace = TraceCommitment::build(
             &ref_items,
-            &precomputed::EMPTY_TRIE_NODES[0],
+            &EMPTY_LEAF,
             test_fraud_proof_config(),
         );
 
@@ -1544,7 +1522,7 @@ mod tests {
         let items = Trace::new();
         let result = TraceCommitment::try_build(
             &items,
-            &precomputed::EMPTY_TRIE_NODES[0],
+            &EMPTY_LEAF,
             test_fraud_proof_config(),
         );
         assert!(matches!(result, Err(BitPackerError::EmptyTrace)));
@@ -1558,7 +1536,7 @@ mod tests {
             let items = Trace((0..trace_len).map(|i| make_tile_trace_item(i, i)).collect());
             let result = TraceCommitment::try_build(
                 &items,
-                &precomputed::EMPTY_TRIE_NODES[0],
+                &EMPTY_LEAF,
                 test_fraud_proof_config(),
             );
             assert!(matches!(result, Err(BitPackerError::InvalidWindow(_))));
@@ -1570,7 +1548,7 @@ mod tests {
     fn test_compute_root_matches_bridgetree() {
         fn empty_at_level(level: u8) -> Vec<u8> {
             if level == 0 {
-                return precomputed::EMPTY_TRIE_NODES[0].to_vec();
+                return EMPTY_LEAF.to_vec();
             }
             let child = empty_at_level(level - 1);
             combine_level(level - 1, &child, &child)
@@ -1604,7 +1582,7 @@ mod tests {
             cur
         }
 
-        let seed = precomputed::EMPTY_TRIE_NODES[0];
+        let seed = EMPTY_LEAF;
         let items: Vec<StepRecord> = (0..10).map(|i| make_tile_trace_item(i, i)).collect();
 
         let mut tree = TraceTree::new(1);
@@ -1641,7 +1619,7 @@ mod tests {
 
     #[test]
     fn test_wittnes_returns_proof_for_requested_trace_item() {
-        let seed = precomputed::EMPTY_TRIE_NODES[0];
+        let seed = EMPTY_LEAF;
         let trace = Trace((0..6).map(|i| make_tile_trace_item(i, i)).collect());
 
         let witness = TraceCommitment::witness(&trace, 2, &seed).expect("witness");
@@ -1665,12 +1643,12 @@ mod tests {
         let trace = Trace((0..5).map(|i| make_tile_trace_item(i, i)).collect());
         let trace_commitment = TraceCommitment::build(
             &trace,
-            &precomputed::EMPTY_TRIE_NODES[0],
+            &EMPTY_LEAF,
             test_fraud_proof_config(),
         );
         let cfs = make_test_cfs();
         let mut trace_verifier =
-            TraceVerifier::new(trace_commitment, &precomputed::EMPTY_TRIE_NODES[0], &cfs)
+            TraceVerifier::new(trace_commitment, &EMPTY_LEAF, &cfs)
                 .expect("valid commitment");
 
         let verification_result = trace_verifier.verify(&trace);
@@ -1690,7 +1668,7 @@ mod tests {
         let trace = Trace((0..8).map(|i| make_tile_trace_item(i, i)).collect());
         let trace_commitment = TraceCommitment::build(
             &trace,
-            &precomputed::EMPTY_TRIE_NODES[0],
+            &EMPTY_LEAF,
             test_fraud_proof_config(),
         );
         let fingerprint_len = trace_commitment.fingerprint.len();
@@ -1698,7 +1676,7 @@ mod tests {
         let cfs = make_test_cfs();
         let mut trace_verifier = TraceVerifier::new(
             trace_commitment,
-            &precomputed::EMPTY_TRIE_NODES[0],
+            &EMPTY_LEAF,
             &cfs,
         )
         .expect("valid commitment");
@@ -1731,13 +1709,13 @@ mod tests {
         let trace = Trace((0..8).map(|i| make_tile_trace_item(i, i)).collect());
         let trace_commitment = TraceCommitment::build(
             &trace,
-            &precomputed::EMPTY_TRIE_NODES[0],
+            &EMPTY_LEAF,
             test_fraud_proof_config(),
         );
         let cfs = make_test_cfs();
         let mut trace_verifier = TraceVerifier::new(
             trace_commitment,
-            &precomputed::EMPTY_TRIE_NODES[0],
+            &EMPTY_LEAF,
             &cfs,
         )
         .expect("valid commitment");
@@ -1759,7 +1737,7 @@ mod tests {
     /// `index.saturating_sub(w) + 1` produced below `w`.
     #[test]
     fn fraud_window_geometry_agrees_across_the_head_boundary() {
-        let seed = precomputed::EMPTY_TRIE_NODES[0];
+        let seed = EMPTY_LEAF;
         let config = test_fraud_proof_config();
         let window_size = config.window_size;
         let committed = Trace((0..12).map(|i| make_tile_trace_item(i, i)).collect());
@@ -1825,13 +1803,13 @@ mod tests {
         let trace = Trace((0..10).map(|i| make_tile_trace_item(i, i)).collect());
         let config = test_fraud_proof_config();
         let commitment =
-            TraceCommitment::build(&trace, &precomputed::EMPTY_TRIE_NODES[0], config);
+            TraceCommitment::build(&trace, &EMPTY_LEAF, config);
 
         assert_eq!(commitment.revealed_tail_roots.len(), config.window_size);
         // The last revealed root is the trace's final root.
         assert_eq!(
-            *commitment.revealed_tail_roots.last().unwrap(),
-            final_trace_root(&trace, &precomputed::EMPTY_TRIE_NODES[0]),
+            commitment.revealed_tail_roots.last().unwrap().to_vec(),
+            final_trace_root(&trace, &EMPTY_LEAF),
         );
         // And the commitment is internally consistent.
         commitment.validate().expect("freshly built commitment");
@@ -1845,12 +1823,12 @@ mod tests {
         let trace = Trace((0..10).map(|i| make_tile_trace_item(i, i)).collect());
         let mut commitment = TraceCommitment::build(
             &trace,
-            &precomputed::EMPTY_TRIE_NODES[0],
+            &EMPTY_LEAF,
             test_fraud_proof_config(),
         );
 
         // Flip enough bits to change the squeezed value, not just the root.
-        commitment.revealed_tail_roots[0] = vec![0xFF; 32];
+        commitment.revealed_tail_roots[0] = [0xFF; 32].into();
 
         assert!(matches!(
             commitment.validate(),
@@ -1863,7 +1841,7 @@ mod tests {
         let trace = Trace((0..10).map(|i| make_tile_trace_item(i, i)).collect());
         let mut commitment = TraceCommitment::build(
             &trace,
-            &precomputed::EMPTY_TRIE_NODES[0],
+            &EMPTY_LEAF,
             test_fraud_proof_config(),
         );
 
@@ -1884,7 +1862,7 @@ mod tests {
     /// detection missed, and asserts it is now caught.
     #[test]
     fn a_final_step_divergence_is_detected_when_its_fingerprint_bit_collides() {
-        let seed = precomputed::EMPTY_TRIE_NODES[0];
+        let seed = EMPTY_LEAF;
         let config = FraudProofConfig::from_window_size(128).expect("power-of-two window");
         assert_eq!(config.bits_per_item, 1, "the degenerate case this is about");
 
@@ -1928,12 +1906,12 @@ mod tests {
 
         let trace_commitment = TraceCommitment::build(
             &committed_trace,
-            &precomputed::EMPTY_TRIE_NODES[0],
+            &EMPTY_LEAF,
             test_fraud_proof_config(),
         );
         let cfs = make_test_cfs();
         let mut trace_verifier =
-            TraceVerifier::new(trace_commitment, &precomputed::EMPTY_TRIE_NODES[0], &cfs)
+            TraceVerifier::new(trace_commitment, &EMPTY_LEAF, &cfs)
                 .expect("valid commitment");
 
         let verification_result = trace_verifier.verify(&runtime_trace);
@@ -1946,7 +1924,7 @@ mod tests {
         let cfs = make_test_cfs();
         let valid = TraceCommitment::build(
             &trace,
-            &precomputed::EMPTY_TRIE_NODES[0],
+            &EMPTY_LEAF,
             test_fraud_proof_config(),
         );
 
@@ -1973,7 +1951,7 @@ mod tests {
             truncated_bits,
         ] {
             assert!(matches!(
-                TraceVerifier::new(malformed, &precomputed::EMPTY_TRIE_NODES[0], &cfs),
+                TraceVerifier::new(malformed, &EMPTY_LEAF, &cfs),
                 Err(BitPackerError::InvalidCommitment(_))
             ));
         }
@@ -1990,12 +1968,12 @@ mod tests {
         ]);
         let trace_commitment = TraceCommitment::build(
             &trace,
-            &precomputed::EMPTY_TRIE_NODES[0],
+            &EMPTY_LEAF,
             test_fraud_proof_config(),
         );
         let cfs = make_producer_dependency_cfs();
         let mut trace_verifier =
-            TraceVerifier::new(trace_commitment, &precomputed::EMPTY_TRIE_NODES[0], &cfs)
+            TraceVerifier::new(trace_commitment, &EMPTY_LEAF, &cfs)
                 .expect("valid commitment");
 
         let verification_result = trace_verifier.verify(&trace);
@@ -2014,12 +1992,12 @@ mod tests {
         ]);
         let trace_commitment = TraceCommitment::build(
             &trace,
-            &precomputed::EMPTY_TRIE_NODES[0],
+            &EMPTY_LEAF,
             test_fraud_proof_config(),
         );
         let cfs = make_sequence_input_dependency_cfs();
         let mut trace_verifier =
-            TraceVerifier::new(trace_commitment, &precomputed::EMPTY_TRIE_NODES[0], &cfs)
+            TraceVerifier::new(trace_commitment, &EMPTY_LEAF, &cfs)
                 .expect("valid commitment");
 
         let verification_result = trace_verifier.verify(&trace);
@@ -2038,12 +2016,12 @@ mod tests {
         ]);
         let trace_commitment = TraceCommitment::build(
             &trace,
-            &precomputed::EMPTY_TRIE_NODES[0],
+            &EMPTY_LEAF,
             test_fraud_proof_config(),
         );
         let cfs = make_nested_sequence_output_dependency_cfs();
         let mut trace_verifier =
-            TraceVerifier::new(trace_commitment, &precomputed::EMPTY_TRIE_NODES[0], &cfs)
+            TraceVerifier::new(trace_commitment, &EMPTY_LEAF, &cfs)
                 .expect("valid commitment");
 
         let verification_result = trace_verifier.verify(&trace);
@@ -2135,12 +2113,12 @@ mod tests {
 
         let trace_commitment = TraceCommitment::build(
             &committed_trace,
-            &precomputed::EMPTY_TRIE_NODES[0],
+            &EMPTY_LEAF,
             test_fraud_proof_config(),
         );
         let cfs = make_producer_dependency_cfs();
         let mut trace_verifier =
-            TraceVerifier::new(trace_commitment, &precomputed::EMPTY_TRIE_NODES[0], &cfs)
+            TraceVerifier::new(trace_commitment, &EMPTY_LEAF, &cfs)
                 .expect("valid commitment");
 
         let VerificationResult::Fraud(evidence) = trace_verifier.verify(&runtime_trace) else {
@@ -2171,12 +2149,12 @@ mod tests {
         ]);
         let trace_commitment = TraceCommitment::build(
             &trace,
-            &precomputed::EMPTY_TRIE_NODES[0],
+            &EMPTY_LEAF,
             test_fraud_proof_config(),
         );
         let cfs = make_top_level_tail_dependency_cfs();
         let mut trace_verifier =
-            TraceVerifier::new(trace_commitment, &precomputed::EMPTY_TRIE_NODES[0], &cfs)
+            TraceVerifier::new(trace_commitment, &EMPTY_LEAF, &cfs)
                 .expect("valid commitment");
 
         let evidence = trace_verifier
@@ -2248,12 +2226,12 @@ mod tests {
 
         let trace_commitment = TraceCommitment::build(
             &committed_trace,
-            &precomputed::EMPTY_TRIE_NODES[0],
+            &EMPTY_LEAF,
             test_fraud_proof_config(),
         );
         let cfs = make_recur_site_cfs();
         let mut trace_verifier =
-            TraceVerifier::new(trace_commitment, &precomputed::EMPTY_TRIE_NODES[0], &cfs)
+            TraceVerifier::new(trace_commitment, &EMPTY_LEAF, &cfs)
                 .expect("valid commitment");
 
         let VerificationResult::Fraud(evidence) = trace_verifier.verify(&runtime_trace) else {
@@ -2284,12 +2262,12 @@ mod tests {
 
         let trace_commitment = TraceCommitment::build(
             &committed_trace,
-            &precomputed::EMPTY_TRIE_NODES[0],
+            &EMPTY_LEAF,
             test_fraud_proof_config(),
         );
         let cfs = make_top_level_entry_argument_cfs();
         let mut trace_verifier =
-            TraceVerifier::new(trace_commitment, &precomputed::EMPTY_TRIE_NODES[0], &cfs)
+            TraceVerifier::new(trace_commitment, &EMPTY_LEAF, &cfs)
                 .expect("valid commitment");
 
         let VerificationResult::Fraud(evidence) = trace_verifier.verify(&runtime_trace) else {
@@ -2336,14 +2314,14 @@ mod tests {
         let cfs = make_producer_dependency_cfs();
         let trace_commitment = TraceCommitment::build(
             &honest,
-            &precomputed::EMPTY_TRIE_NODES[0],
+            &EMPTY_LEAF,
             test_fraud_proof_config(),
         );
 
         // Baseline: the honest trace agrees with its own commitment everywhere.
         let mut honest_verifier = TraceVerifier::new(
             trace_commitment.clone(),
-            &precomputed::EMPTY_TRIE_NODES[0],
+            &EMPTY_LEAF,
             &cfs,
         )
         .expect("valid commitment");
@@ -2367,7 +2345,7 @@ mod tests {
         );
 
         let mut forged_verifier =
-            TraceVerifier::new(trace_commitment, &precomputed::EMPTY_TRIE_NODES[0], &cfs)
+            TraceVerifier::new(trace_commitment, &EMPTY_LEAF, &cfs)
                 .expect("valid commitment");
         let VerificationResult::Fraud(evidence) = forged_verifier.verify(&forged) else {
             panic!(
@@ -2414,12 +2392,12 @@ mod tests {
 
         let trace_commitment = TraceCommitment::build(
             &committed_trace,
-            &precomputed::EMPTY_TRIE_NODES[0],
+            &EMPTY_LEAF,
             test_fraud_proof_config(),
         );
         let cfs = make_sequence_input_dependency_cfs();
         let mut trace_verifier =
-            TraceVerifier::new(trace_commitment, &precomputed::EMPTY_TRIE_NODES[0], &cfs)
+            TraceVerifier::new(trace_commitment, &EMPTY_LEAF, &cfs)
                 .expect("valid commitment");
 
         let VerificationResult::Fraud(evidence) = trace_verifier.verify(&runtime_trace) else {
@@ -2452,12 +2430,12 @@ mod tests {
 
         let trace_commitment = TraceCommitment::build(
             &committed_trace,
-            &precomputed::EMPTY_TRIE_NODES[0],
+            &EMPTY_LEAF,
             test_fraud_proof_config(),
         );
         let cfs = make_root_sequence_scope_cfs();
         let mut trace_verifier =
-            TraceVerifier::new(trace_commitment, &precomputed::EMPTY_TRIE_NODES[0], &cfs)
+            TraceVerifier::new(trace_commitment, &EMPTY_LEAF, &cfs)
                 .expect("valid commitment");
 
         let _ = trace_verifier.verify(&runtime_trace);
@@ -2480,12 +2458,12 @@ mod tests {
         ]);
         let trace_commitment = TraceCommitment::build(
             &committed_trace,
-            &precomputed::EMPTY_TRIE_NODES[0],
+            &EMPTY_LEAF,
             test_fraud_proof_config(),
         );
         let cfs = make_producer_dependency_cfs();
         let mut trace_verifier =
-            TraceVerifier::new(trace_commitment, &precomputed::EMPTY_TRIE_NODES[0], &cfs)
+            TraceVerifier::new(trace_commitment, &EMPTY_LEAF, &cfs)
                 .expect("valid commitment");
 
         let _ = trace_verifier.verify(&runtime_trace);
@@ -2496,18 +2474,19 @@ mod tests {
 mod frontier_root_tests {
     use super::*;
 
-    /// The memo must equal the fold it replaced at every level. It is built
-    /// from that fold, so this guards a future edit that swaps in a table —
-    /// which is exactly what `EMPTY_TRIE_NODES` looked like it could be, and
-    /// is not.
+    /// [`EMPTY_ROOTS`] must equal this `combine`'s fold at every level. It
+    /// is compiled in, so this is what ties it to the hashing rule; it is
+    /// also why `EMPTY_TRIE_NODES`, a table that looked like this one but
+    /// was not, could not be swapped in.
     #[test]
-    fn empty_root_memo_matches_fold() {
+    fn empty_roots_match_fold() {
+        assert_eq!(EMPTY_ROOTS[0], EMPTY_LEAF);
         for level in 0..=TRACE_TREE_DEPTH {
             let level = Level::from(level);
             assert_eq!(
                 Bytes::empty_root(level).0,
                 empty_root_fold(level).0,
-                "memo diverges from the fold at level {}",
+                "EMPTY_ROOTS diverges from the fold at level {}",
                 u8::from(level)
             );
         }

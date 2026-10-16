@@ -15,19 +15,14 @@ pub struct Bytes(pub Vec<u8>);
 
 pub type TraceBridgeTree = bridgetree::BridgeTree<Bytes, u64, 32>;
 
-/// Depth of [`TraceBridgeTree`]; the root level a frontier must be folded to.
-/// Mirrors `raster_prover::trace::TRACE_TREE_DEPTH`.
-pub const TRACE_TREE_DEPTH: u8 = 32;
+/// Shared with the host prover, so both fold to the same depth and use the
+/// same empty roots.
+pub use raster_core::merkle::{EMPTY_LEAF, EMPTY_ROOTS, TRACE_TREE_DEPTH};
+use raster_core::merkle::{to_node_hash, HASH_SIZE};
 
 // ============================================================================
 // Bytes + Hashable for bridgetree (matches prover's empty leaf and combine)
 // ============================================================================
-
-const HASH_SIZE: usize = 32;
-
-/// Empty leaf hash (precomputed SHA256 of "empty"); matches prover EMPTY_TRIE_NODES[0].
-pub const EMPTY_LEAF: [u8; 32] =
-    hex_literal::hex!("6d97a6c02676a41a9636c6cd4e5d2d47d14d27a35d18e608115fd93cd42e6b3a");
 
 impl PartialEq for Bytes {
     fn eq(&self, other: &Self) -> bool {
@@ -62,17 +57,20 @@ impl Hashable for Bytes {
         Bytes(sha256_bytes(&data))
     }
 
-    /// Memoized empty-subtree root; mirrors `raster_prover::trace::Bytes`.
+    /// Empty-subtree root, read from [`EMPTY_ROOTS`].
     ///
     /// The trait's default folds from level 0 on every call, and
     /// `NonEmptyFrontier::root` calls it once per level — 0+1+..+31 = 496
     /// hashes of rederived constants per fold, against ~32 of actual spine.
-    /// In the guest those are proven cycles, and `frontier_root` runs several
-    /// times per execution, so the memo is built once and read thereafter.
+    /// A runtime memo still pays its own 0+1+..+32 = 528 hashes (~0.4M cycles)
+    /// on every step, since each step is a fresh guest execution; the table
+    /// is compiled in and costs nothing. `empty_roots_match_fold` pins it to
+    /// this `combine`.
     fn empty_root(level: Level) -> Self {
         let idx = usize::from(u8::from(level));
-        match empty_root_memo().get(idx) {
+        match EMPTY_ROOTS.get(idx) {
             Some(node) => Bytes(node.to_vec()),
+            // Above the table: fold, so a deeper tree stays correct.
             None => empty_root_fold(level),
         }
     }
@@ -85,19 +83,21 @@ fn empty_root_fold(level: Level) -> Bytes {
         .fold(Bytes::empty_leaf(), |v, lvl| Bytes::combine(lvl, &v, &v))
 }
 
-/// Empty-subtree roots for levels `0..=TRACE_TREE_DEPTH`, folded once.
-fn empty_root_memo() -> &'static [[u8; HASH_SIZE]] {
-    static MEMO: std::sync::OnceLock<Vec<[u8; HASH_SIZE]>> = std::sync::OnceLock::new();
-    MEMO.get_or_init(|| {
-        (0..=TRACE_TREE_DEPTH)
-            .map(|level| {
-                let root = empty_root_fold(Level::from(level));
-                let mut out = [0u8; HASH_SIZE];
-                out.copy_from_slice(&root.0);
-                out
-            })
-            .collect()
-    })
+#[cfg(test)]
+mod empty_roots_tests {
+    use super::*;
+
+    #[test]
+    fn empty_roots_match_fold() {
+        assert_eq!(EMPTY_ROOTS[0], EMPTY_LEAF);
+        for (level, root) in EMPTY_ROOTS.iter().enumerate() {
+            assert_eq!(
+                empty_root_fold(Level::from(level as u8)).0,
+                root.to_vec(),
+                "EMPTY_ROOTS[{level}]"
+            );
+        }
+    }
 }
 
 // ============================================================================
@@ -108,7 +108,7 @@ pub fn deserialize_frontier(ser: &SerializableFrontier) -> Option<NonEmptyFronti
     NonEmptyFrontier::from_parts(
         Position::from(ser.position),
         Bytes(ser.leaf.clone()),
-        ser.ommers.iter().map(|o| Bytes(o.clone())).collect(),
+        ser.ommers.iter().map(|o| Bytes(o.to_vec())).collect(),
     )
     .ok()
 }
@@ -117,7 +117,7 @@ pub fn serialize_frontier(frontier: &NonEmptyFrontier<Bytes>) -> SerializableFro
     SerializableFrontier {
         position: frontier.position().into(),
         leaf: frontier.leaf().0.clone(),
-        ommers: frontier.ommers().iter().map(|o| o.0.clone()).collect(),
+        ommers: frontier.ommers().iter().map(|o| to_node_hash(&o.0)).collect(),
     }
 }
 

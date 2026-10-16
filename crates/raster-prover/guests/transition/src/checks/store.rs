@@ -32,9 +32,9 @@ fn append_log_root_from_witness(entry: &StorageEntry, witness: &StorageLogWitnes
     let mut current = storage_leaf_hash(entry);
     for (level, sibling) in witness.path_elems.iter().enumerate() {
         current = if ((witness.position >> level) & 1) == 0 {
-            combine_merkle_level(level, &current, sibling)
+            combine_merkle_level(level, &current, sibling.as_slice())
         } else {
-            combine_merkle_level(level, sibling, &current)
+            combine_merkle_level(level, sibling.as_slice(), &current)
         };
     }
     current

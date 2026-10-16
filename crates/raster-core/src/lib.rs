@@ -22,6 +22,7 @@ pub mod error;
 pub mod fingerprint;
 pub mod hash;
 pub mod input;
+pub mod merkle;
 pub mod program;
 pub mod recur_progress;
 pub mod tile;

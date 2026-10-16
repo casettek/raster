@@ -610,9 +610,9 @@ fn assert_record_in_trace(record: &StepRecord, witness: &StepRecordWitness, trac
     let mut current = hash_trace_item(record);
     for (level, sibling) in witness.path_elems.iter().enumerate() {
         current = if ((witness.position >> level) & 1) == 0 {
-            combine_merkle_level(level, &current, sibling)
+            combine_merkle_level(level, &current, sibling.as_slice())
         } else {
-            combine_merkle_level(level, sibling, &current)
+            combine_merkle_level(level, sibling.as_slice(), &current)
         };
     }
     assert!(
@@ -655,7 +655,7 @@ pub fn verify_sequence_scope_parent(
     cfs_cursor: &CfsCursor,
     step_record: &StepRecord,
     sequence_scope_witness: Option<&FnInput>,
-    input_sources_witnesses: &HashMap<(u64, StepRecord), Vec<u8>>,
+    input_sources_witnesses: &HashMap<(u64, StepRecord), StepRecordWitness>,
     trace_root: &[u8],
 ) {
     let coordinates = step_record.coordinates();
@@ -691,16 +691,16 @@ pub fn verify_sequence_scope_parent(
         )
     };
 
-    let (parent_record, witness_bytes) = input_sources_witnesses
+    let (parent_record, witness) = input_sources_witnesses
         .iter()
-        .find_map(|((verifier_exec_index, record), bytes)| {
+        .find_map(|((verifier_exec_index, record), witness)| {
             // This step's own witness, not merely one for this parent: a
             // witness folds to the trace root of the step it was built for,
             // and the frontier has grown by then for any other step.
             (*verifier_exec_index == step_record.exec_index
                 && matches!(record.kind, StepKind::SequenceStart { .. })
                 && *record.coordinates() == parent_coordinates)
-                .then_some((record, bytes))
+                .then_some((record, witness))
         })
         .unwrap_or_else(|| {
             panic!(
@@ -710,9 +710,7 @@ pub fn verify_sequence_scope_parent(
             )
         });
 
-    let witness: StepRecordWitness = postcard::from_bytes(witness_bytes)
-        .expect("Sequence-scope parent witness is not a StepRecordWitness");
-    assert_record_in_trace(parent_record, &witness, trace_root);
+    assert_record_in_trace(parent_record, witness, trace_root);
 
     let recorded = parent_record
         .input_source_commitment()

@@ -230,9 +230,13 @@ pub fn write_program_artifacts(
             // The risc0 toolchain that produced these image ids. Recorded so a
             // verifier can detect a mismatch; exact provenance/reproducibility
             // (docker builds) is future work (see program-identity.md).
+            // Defaults to the risc0-zkvm this CLI links, so the label follows
+            // the dependency instead of going stale on a version bump. Tile
+            // guests resolve `risc0-zkvm` on their own, so it can trail a
+            // guest's exact patch release.
             risc0: option_env!("RISC0_VERSION")
-                .unwrap_or("risc0-zkvm-1.2")
-                .to_string(),
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("risc0-zkvm-{}", risc0_zkvm::VERSION)),
             // Local builds are dev-grade; docker reproducible builds are future
             // work (see program-identity.md).
             build_mode: "local".to_string(),
