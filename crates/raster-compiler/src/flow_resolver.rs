@@ -811,22 +811,11 @@ mod tests {
         );
     }
 
-    /// `main` reading `table.rows[start..end]` with constant local bounds:
-    /// the runtime records `[table, rows, Range(0, 2)]` with no index citation,
-    /// and the guest holds the entry argument to its declared path exactly, so
-    /// the CFS must declare that path — directly and through an alias.
-    #[test]
-    fn local_range_bounds_resolve_to_the_recorded_entry_path() {
-        let file: syn::File = syn::parse_str(
-            r#"fn main(table: Table) {
-                let start = 0usize;
-                let end = 2usize;
-                call!(consume, select!(Block<Row>, table.rows[start..end]));
-                let rows = select!(Block<Row>, table.rows[start..end]);
-                call!(consume, rows);
-            }"#,
-        )
-        .unwrap();
+    /// Parse `code`'s single function as `main` — every parameter an entry
+    /// argument — and resolve it, each `call!` a tile step. Returns each step's
+    /// first source and the resolved return.
+    fn resolve_parsed_main(code: &str) -> (Vec<InputBinding>, Option<SequenceReturn>) {
+        let file: syn::File = syn::parse_str(code).unwrap();
         let main = ProjectAst::parse_functions(
             &file,
             PathBuf::from("main.rs"),
@@ -837,35 +826,179 @@ mod tests {
         assert!(main.selection_errors.is_empty(), "{:?}", main.selection_errors);
 
         let project = make_mock_project();
-        let consume = make_tile_function("consume", vec!["rows"], false);
+        let callees: Vec<String> = main.call_infos.iter().map(|call| call.callee.clone()).collect();
+        let functions: Vec<FunctionAstItem> = callees
+            .iter()
+            .map(|callee| make_tile_function(callee, vec!["arg"], true))
+            .collect();
         let tile_discovery = TileDiscovery {
             project: &project,
-            tiles: vec![Tile {
-                function: &consume,
-                tile_type: "iter".to_string(),
-                estimated_cycles: None,
-                max_memory: None,
-                description: None,
-            }],
+            tiles: functions
+                .iter()
+                .map(|function| Tile {
+                    function,
+                    tile_type: "iter".to_string(),
+                    estimated_cycles: None,
+                    max_memory: None,
+                    description: None,
+                })
+                .collect(),
         };
         let sequence = Sequence {
             function: &main,
-            steps: vec![
-                SequenceStep::Tile(&tile_discovery.tiles[0]),
-                SequenceStep::Tile(&tile_discovery.tiles[0]),
-            ],
+            steps: tile_discovery.tiles.iter().map(SequenceStep::Tile).collect(),
             description: None,
         };
-        let items =
-            FlowResolver::new().resolve_with_entry_arguments(&sequence, &["table".to_string()]);
-        let expected = InputBinding::entry_argument().with_path(vec![
-            SelectorSegment::Field("table".into()),
-            SelectorSegment::Field("rows".into()),
+        let mut resolver = FlowResolver::new();
+        let items = resolver.resolve_with_entry_arguments(&sequence, &main.input_names);
+        let returns = main
+            .return_expr
+            .as_ref()
+            .and_then(|ret| resolver.resolve_return(ret, items.len()));
+        let sources = items
+            .iter()
+            .map(|item| item.inputs().first().cloned().unwrap_or_else(InputBinding::inline))
+            .collect();
+        (sources, returns)
+    }
+
+    fn field(name: &str) -> SelectorSegment {
+        SelectorSegment::Field(name.to_string())
+    }
+
+    fn entry_at(path: &[SelectorSegment]) -> InputBinding {
+        InputBinding::entry_argument().with_path(path.to_vec())
+    }
+
+    /// `main` reading `table.rows[start..end]` with constant local bounds:
+    /// the runtime records `[table, rows, Range(0, 2)]` with no index citation,
+    /// and the guest holds the entry argument to its declared path exactly, so
+    /// the CFS must declare that path — directly and through an alias.
+    #[test]
+    fn local_range_bounds_resolve_to_the_recorded_entry_path() {
+        let (sources, _) = resolve_parsed_main(
+            r#"fn main(table: Table) {
+                let start = 0usize;
+                let end = 2usize;
+                call!(consume, select!(Block<Row>, table.rows[start..end]));
+                let rows = select!(Block<Row>, table.rows[start..end]);
+                call!(consume, rows);
+            }"#,
+        );
+        let expected = entry_at(&[
+            field("table"),
+            field("rows"),
             SelectorSegment::Range { start: 0, end: 2 },
         ]);
-        let sources: Vec<InputBinding> =
-            items.iter().map(|item| item.inputs()[0].clone()).collect();
         assert_eq!(sources, vec![expected.clone(), expected]);
+    }
+
+    /// Each use of a shadowed name resolves through the binding in scope at
+    /// that statement, not through the name's last binding in the body.
+    #[test]
+    fn a_shadowed_selection_resolves_through_the_binding_in_scope() {
+        let (sources, _) = resolve_parsed_main(
+            r#"fn main(table: Table) {
+                let line = select!(String, table.lines[0]);
+                call!(consume, line);
+                let line = select!(String, table.lines[1]);
+                call!(consume, line);
+                let line = select!(String, line.text);
+                call!(consume, line);
+            }"#,
+        );
+        let line = |index| [field("table"), field("lines"), SelectorSegment::Index(index)];
+        assert_eq!(
+            sources,
+            vec![
+                entry_at(&line(0)),
+                entry_at(&line(1)),
+                // A selection out of the shadowed binding composes with it.
+                entry_at(&[line(1).as_slice(), &[field("text")]].concat()),
+            ]
+        );
+    }
+
+    /// A call result and a selection alias of the same name each hold for
+    /// their own stretch of the body, whichever comes first.
+    #[test]
+    fn call_results_and_aliases_shadow_one_another_in_order() {
+        let (sources, returns) = resolve_parsed_main(
+            r#"fn main(table: Table) {
+                let x = call!(produce, table);
+                call!(consume, x);
+                let x = select!(Row, table.rows[0]);
+                call!(consume, x);
+                let x = call!(produce, x);
+                let x = select!(u64, x.count);
+                x
+            }"#,
+        );
+        let row = [field("table"), field("rows"), SelectorSegment::Index(0)];
+        assert_eq!(
+            sources,
+            vec![
+                entry_at(&[field("table")]),
+                InputBinding::prior_item_output(0),
+                entry_at(&row),
+                entry_at(&row),
+            ]
+        );
+        assert_eq!(
+            returns,
+            Some(SequenceReturn {
+                source: InputBinding::prior_item_output(3),
+                path: vec![field("count")],
+            })
+        );
+    }
+
+    /// A nested block's bindings end with it, and a `let` shadowing an entry
+    /// argument with a plain value is that value, not the argument.
+    #[test]
+    fn block_bindings_end_with_the_block_and_plain_shadows_are_inline() {
+        let (sources, _) = resolve_parsed_main(
+            r#"fn main(table: Table, x: Row) {
+                {
+                    let x = select!(Row, table.rows[3]);
+                    call!(consume, x);
+                }
+                call!(consume, x);
+                let table = 7u64;
+                call!(consume, table);
+            }"#,
+        );
+        assert_eq!(
+            sources,
+            vec![
+                entry_at(&[field("table"), field("rows"), SelectorSegment::Index(3)]),
+                entry_at(&[field("x")]),
+                InputBinding::inline(),
+            ]
+        );
+    }
+
+    /// An index cites the binding that supplied it when the selection was
+    /// made, not a later binding of the same name.
+    #[test]
+    fn an_index_cites_the_binding_in_scope_at_its_selection() {
+        let (sources, _) = resolve_parsed_main(
+            r#"fn main(table: Table, ids: Ids) {
+                let i = select!(u64, ids.first);
+                let row = select!(Row, table.rows[i]);
+                let i = select!(u64, ids.second);
+                call!(consume, row);
+                call!(consume, i);
+            }"#,
+        );
+        assert_eq!(
+            sources,
+            vec![
+                InputBinding::entry_argument()
+                    .indexed_by(vec![entry_at(&[field("ids"), field("first")])]),
+                entry_at(&[field("ids"), field("second")]),
+            ]
+        );
     }
 
     /// A value reached through a data-sourced index records no path — its

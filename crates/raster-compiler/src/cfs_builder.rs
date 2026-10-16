@@ -223,6 +223,7 @@ fn sequence_returns(
         let form = match &seq.function.return_expr {
             Some(crate::ast::ReturnExpr::Unbound { expr }) => format!("`{expr}`"),
             Some(crate::ast::ReturnExpr::Rooted { root, .. }) => {
+                let root = crate::ast::source_name(root);
                 format!("`{root}` (a name no step produced)")
             }
             Some(crate::ast::ReturnExpr::TailCall) => "its final call".to_string(),

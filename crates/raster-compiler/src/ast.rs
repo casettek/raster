@@ -441,6 +441,16 @@ impl TypeContext {
     }
 }
 
+/// Separates a shadowing binding's source name from its ordinal (`x#1`). Not
+/// an identifier character, so a binding name never collides with a source
+/// name.
+const BINDING_SUFFIX: char = '#';
+
+/// The source name of a binding name, for messages: `x` for `x#1`.
+pub(crate) fn source_name(binding: &str) -> &str {
+    binding.split(BINDING_SUFFIX).next().unwrap_or(binding)
+}
+
 pub struct CallVisitor {
     call_infos: Vec<CallInfo>,
     /// Tracks the current let binding name when visiting let statements
@@ -470,6 +480,13 @@ pub struct CallVisitor {
     constants: HashMap<String, u64>,
     /// How many blocks deep the visit is, for scoping `constants`.
     block_depth: usize,
+    /// Each source name in scope, to the binding it currently names (see
+    /// [`Self::bind_name`]). A name absent here names its first binding.
+    scope: HashMap<String, String>,
+    /// How many times each source name has been bound so far in the function,
+    /// parameters included. Never restored at a block's end, so a binding
+    /// name is never reused.
+    binding_counts: HashMap<String, usize>,
 }
 
 impl CallVisitor {
@@ -490,6 +507,8 @@ impl CallVisitor {
             selection_errors: RefCell::new(Vec::new()),
             constants: HashMap::new(),
             block_depth: 0,
+            scope: HashMap::new(),
+            binding_counts: HashMap::new(),
         }
     }
 
@@ -538,11 +557,47 @@ impl CallVisitor {
         if let Some(path) = self.argument_path(view) {
             self.selection_paths.push((name.to_string(), path));
         }
-        let index_roots = Self::view_index_roots(view);
+        let index_roots = self.bindings_of(Self::view_index_roots(view));
         if !index_roots.is_empty() {
             self.selection_index_sources
                 .push((name.to_string(), index_roots));
         }
+    }
+
+    fn bindings_of(&self, names: Vec<String>) -> Vec<String> {
+        names.iter().map(|name| self.binding_of(name)).collect()
+    }
+
+    /// The binding a source name refers to at this point of the body.
+    ///
+    /// Everything this visitor records about a body — call arguments, results,
+    /// selection aliases and their index sources, the return — names
+    /// *bindings*, not source names: the resolver looks them up in flat maps
+    /// after the whole body has been read, so `let x = select!(T, a.f); use(x);
+    /// let x = select!(T, a.g); use(x);` would otherwise resolve both uses
+    /// through the last `x`. Renaming at each use to the binding then in scope
+    /// keeps Rust's shadowing and block scoping.
+    fn binding_of(&self, name: &str) -> String {
+        self.scope.get(name).cloned().unwrap_or_else(|| name.to_string())
+    }
+
+    /// A new binding of `name`: its first keeps the source name — so a body
+    /// that never shadows records exactly the names it is written with, and a
+    /// parameter is always its own name — and each later one is `name#k`,
+    /// which no source name can collide with. Not in scope until
+    /// [`Self::enter_binding`]: the `let`'s initializer still sees the old one.
+    fn bind_name(&mut self, name: &str) -> String {
+        let count = self.binding_counts.entry(name.to_string()).or_insert(0);
+        let binding = match *count {
+            0 => name.to_string(),
+            k => format!("{name}{BINDING_SUFFIX}{k}"),
+        };
+        *count += 1;
+        binding
+    }
+
+    fn enter_binding(&mut self, name: &str, binding: String) {
+        self.scope.insert(name.to_string(), binding);
     }
 
     /// `x` in `x: T`.
@@ -613,7 +668,10 @@ impl CallVisitor {
                     Self::selection_macro_root(&expr_macro.mac),
                     self.selection_macro_path(&expr_macro.mac),
                 ) {
-                    (Some(root), Some(path)) => ReturnExpr::Rooted { root, path },
+                    (Some(root), Some(path)) => ReturnExpr::Rooted {
+                        root: self.binding_of(&root),
+                        path,
+                    },
                     _ => ReturnExpr::Unbound {
                         expr: Self::expr_to_string(expr),
                     },
@@ -634,7 +692,7 @@ impl CallVisitor {
                 self.classify_return_expr(&call.receiver)
             }
             Expr::Path(path) if path.path.get_ident().is_some() => ReturnExpr::Rooted {
-                root: path.path.get_ident().expect("checked above").to_string(),
+                root: self.binding_of(&path.path.get_ident().expect("checked above").to_string()),
                 path: Vec::new(),
             },
             // Anything else — including a raw `x.f` or `x[0]`, which would
@@ -1243,7 +1301,7 @@ impl CallVisitor {
     fn classify_argument(&self, expr: &Expr) -> CallArgumentKind {
         match Self::expr_root_ident(expr) {
             Some(root) => CallArgumentKind::Rooted {
-                root,
+                root: self.binding_of(&root),
                 path: self.argument_path(expr),
             },
             None => CallArgumentKind::Inline,
@@ -1455,7 +1513,10 @@ impl CallVisitor {
 
 impl<'ast> Visit<'ast> for CallVisitor {
     fn visit_local(&mut self, node: &'ast Local) {
-        let binding_name = Self::extract_binding_name(&node.pat);
+        let source_name = Self::extract_binding_name(&node.pat);
+        // What this `let` records is named for the binding it introduces, and
+        // what its initializer reads for the bindings already in scope.
+        let binding_name = source_name.as_ref().map(|name| self.bind_name(name));
 
         // `let name = select!(T, root.field)` and `let name = into_ref!(root)`
         // both bind a *view* of `root`, not a new value — record it so uses of
@@ -1469,18 +1530,21 @@ impl<'ast> Visit<'ast> for CallVisitor {
             if let Expr::Macro(expr_macro) = init.expr.as_ref() {
                 if Self::is_selection_macro(&expr_macro.mac) {
                     if let Some(root) = Self::selection_macro_root(&expr_macro.mac) {
+                        let root = self.binding_of(&root);
                         self.selection_aliases.push((name.clone(), root));
                     }
                     if let Some(path) = self.selection_macro_path(&expr_macro.mac) {
                         self.selection_paths.push((name.clone(), path));
                     }
-                    let index_roots = Self::selection_macro_index_roots(&expr_macro.mac);
+                    let index_roots =
+                        self.bindings_of(Self::selection_macro_index_roots(&expr_macro.mac));
                     if !index_roots.is_empty() {
                         self.selection_index_sources
                             .push((name.clone(), index_roots));
                     }
                 } else if Self::is_reference_macro(&expr_macro.mac) {
                     if let Some(root) = Self::reference_macro_root(&expr_macro.mac) {
+                        let root = self.binding_of(&root);
                         self.record_view_alias(name, root, &init.expr);
                     }
                 }
@@ -1494,6 +1558,7 @@ impl<'ast> Visit<'ast> for CallVisitor {
             } else if let Expr::MethodCall(call) = init.expr.as_ref() {
                 if call.method == "clone" {
                     if let Some(root) = Self::expr_root_ident(&call.receiver) {
+                        let root = self.binding_of(&root);
                         self.record_view_alias(name, root, &init.expr);
                     }
                 }
@@ -1528,18 +1593,28 @@ impl<'ast> Visit<'ast> for CallVisitor {
         Self::pattern_bindings(&node.pat, &mut bound);
         for name in bound {
             self.constants.remove(&name);
+            // Every name the pattern binds shadows the old binding; one that
+            // is not the `let`'s single name records nothing, so it resolves
+            // as a value with no upstream.
+            if source_name.as_deref() != Some(name.as_str()) {
+                let binding = self.bind_name(&name);
+                self.enter_binding(&name, binding);
+            }
         }
-        if let (Some(name), Some(value)) = (binding_name.as_ref(), constant) {
+        if let (Some(name), Some(binding)) = (source_name.as_ref(), binding_name.as_ref()) {
+            self.enter_binding(name, binding.clone());
+        }
+        if let (Some(name), Some(value)) = (source_name.as_ref(), constant) {
             if matches!(Self::unwrap_type_pat(&node.pat), Pat::Ident(_)) {
                 self.constants.insert(name.clone(), value);
             }
         }
 
-        if let Some(name) = binding_name {
+        if let (Some(name), Some(binding)) = (source_name, binding_name) {
             let call_ty = self.call_infos[calls_before..]
                 .iter()
                 .rev()
-                .find(|call| call.result_binding.as_deref() == Some(name.as_str()))
+                .find(|call| call.result_binding.as_deref() == Some(binding.as_str()))
                 .and_then(|call| self.types.fn_outputs.get(&call.callee).cloned());
             // A shadowing `let` with no known type must not keep the old one.
             match view_ty.or(call_ty) {
@@ -1549,22 +1624,44 @@ impl<'ast> Visit<'ast> for CallVisitor {
         }
     }
 
+    /// Parameters are a body's first bindings: a `let` of the same name
+    /// shadows them.
+    fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
+        for input in &node.sig.inputs {
+            if let FnArg::Typed(pat_type) = input {
+                let mut names = Vec::new();
+                Self::pattern_bindings(&pat_type.pat, &mut names);
+                for name in names {
+                    let binding = self.bind_name(&name);
+                    self.enter_binding(&name, binding);
+                }
+            }
+        }
+        syn::visit::visit_item_fn(self, node);
+    }
+
     fn visit_item_const(&mut self, node: &'ast syn::ItemConst) {
         self.record_const(node);
     }
 
     /// A nested block's `let`s and `const`s go out of scope at its end: the
-    /// constants and local types they bound or shadowed revert to the outer
-    /// ones. The body's own block keeps them: the return is classified after
+    /// constants, local types and bindings they bound or shadowed revert to
+    /// the outer ones. The body's own block keeps them: the return is classified after
     /// the visit.
     fn visit_block(&mut self, node: &'ast syn::Block) {
         self.block_depth += 1;
-        let outer = (self.block_depth > 1)
-            .then(|| (self.constants.clone(), self.types.locals.clone()));
+        let outer = (self.block_depth > 1).then(|| {
+            (
+                self.constants.clone(),
+                self.types.locals.clone(),
+                self.scope.clone(),
+            )
+        });
         syn::visit::visit_block(self, node);
-        if let Some((constants, locals)) = outer {
+        if let Some((constants, locals, scope)) = outer {
             self.constants = constants;
             self.types.locals = locals;
+            self.scope = scope;
         }
         self.block_depth -= 1;
     }
