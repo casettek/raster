@@ -1600,6 +1600,8 @@ impl<'ast> Visit<'ast> for CallVisitor {
 
         // A `let` binding an integer constant brings it into scope for later
         // range bounds; any other `let` shadows whatever constant it names.
+        // A `let mut` is no constant: a later assignment would leave the
+        // declared bound stale while the macro records the new value.
         let constant = node
             .init
             .as_ref()
@@ -1620,7 +1622,10 @@ impl<'ast> Visit<'ast> for CallVisitor {
             self.enter_binding(name, binding.clone());
         }
         if let (Some(name), Some(value)) = (source_name.as_ref(), constant) {
-            if matches!(Self::unwrap_type_pat(&node.pat), Pat::Ident(_)) {
+            if matches!(
+                Self::unwrap_type_pat(&node.pat),
+                Pat::Ident(pat_ident) if pat_ident.mutability.is_none()
+            ) {
                 self.constants.insert(name.clone(), value);
             }
         }
@@ -2370,6 +2375,12 @@ mod tests {
             const END: usize = 2;
             fn main(table: Table, END: u64) {
                 call!(consume, select!(Block<Row>, table.rows[0..END]));
+            }"#,
+            // A mutable local may be reassigned before the selection.
+            r#"fn main(table: Table) {
+                let mut end = 2usize;
+                end = 3;
+                call!(consume, select!(Block<Row>, table.rows[0..end]));
             }"#,
             // Constants that only name each other never resolve.
             r#"
