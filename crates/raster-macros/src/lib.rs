@@ -1359,7 +1359,7 @@ fn gen_replay_output_serialization(kind: &ProtocolReturnKind) -> proc_macro2::To
         #recur_control_capture
         #recur_state_finish
         let __raster_input_commitment: [u8; 32] =
-            <::raster::core::sha2::Sha256 as ::raster::core::sha2::Digest>::digest(
+            <::raster::core::hash::Sha256 as ::raster::core::hash::Digest>::digest(
                 __raster_replay_input_bytes,
             )
             .into();

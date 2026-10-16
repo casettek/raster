@@ -330,8 +330,8 @@ pub fn verify_program_end(
 ///
 /// The part is held on `selection.path` — the path the selection proof is
 /// pinned to (`verify_selection_witness`) — not on `selector`, which no proof
-/// constrains: exactly, unless the chain crossed a sequence parameter, whose
-/// argument binding records no path; then only the known trailing segments.
+/// constrains, and exactly: every binding on the chain carries its own path,
+/// so the walk composes the whole selector even across sequence parameters.
 fn verify_program_output_source(
     cfs_cursor: &CfsCursor,
     returns: &SequenceReturn,
@@ -353,17 +353,9 @@ fn verify_program_output_source(
         output.coordinates, resolved.coordinates,
         "Program output is not the object main returns",
     );
-    let selected_path = output.selection.path.segments.as_slice();
-    if resolved.path_complete {
-        assert_eq!(
-            selected_path,
-            resolved.path.as_slice(),
-            "Program output selects a different part of the object than main returns",
-        );
-    } else {
-        assert!(
-            selected_path.ends_with(&resolved.path),
-            "Program output selects a different part of the object than main returns",
-        );
-    }
+    assert_eq!(
+        output.selection.path.segments.as_slice(),
+        resolved.path.as_slice(),
+        "Program output selects a different part of the object than main returns",
+    );
 }

@@ -28,6 +28,8 @@ use raster_core::transition::{
 };
 
 use crate::checks;
+use crate::frame;
+use raster_core::merkle::NodeHash;
 use crate::merkle_tree::{
     combine_merkle_level, deserialize_frontier, frontier_root, hash_trace_item, serialize_frontier,
     sha256_bytes, Bytes, EMPTY_LEAF,
@@ -57,11 +59,11 @@ impl PublicParams {
     /// `program_commitment` is bound to the exact bytes verified against — a
     /// host cannot name one program and verify against another.
     pub fn read() -> Self {
-        let program_bytes: Vec<u8> = env::read();
+        let program_bytes = frame::read_bytes();
         let program_commitment = commitment_of_bytes(&program_bytes).to_vec();
         let program = ProgramDefinition::decode(&program_bytes)
             .expect("host must supply a valid ProgramDefinition frame");
-        let transition_image_id: Vec<u8> = env::read();
+        let transition_image_id = frame::read_bytes();
         let cfs_cursor = CfsCursor::new(program.cfs.clone());
         Self {
             program,
@@ -241,7 +243,7 @@ impl FraudProofWindowContext {
                 )
             }
             TransitionState::Next(transition) => {
-                let prev_journal: TransitionJournal = env::read();
+                let prev_journal: TransitionJournal = frame::read();
                 verify_previous_journal(&prev_journal, &params.transition_image_id);
                 assert_state_continuity(&prev_journal, &transition);
                 assert_manifest_continuity(&prev_journal, input);
@@ -297,8 +299,8 @@ impl FraudProofWindowContext {
 ///
 /// It does not need one. At index 0 the opening state is not the challenger's
 /// to choose: the trace tree holds only the seed, which is the same public
-/// constant for every program (`EMPTY_TRIE_NODES[0]` host-side, `EMPTY_LEAF`
-/// here), storage is empty, and no draft or loop is in flight. Asserting that
+/// constant for every program (`raster_core::merkle::EMPTY_LEAF`, on both
+/// sides), storage is empty, and no draft or loop is in flight. Asserting that
 /// removes the need for the margin rather than excusing its absence.
 ///
 /// What the seed does *not* say is which program ran with which inputs — the
@@ -340,7 +342,7 @@ pub(crate) fn assert_window_is_commitment_slice(
     init_transition: &InitTransition,
     header: &TraceCommitmentHeader,
     slice_witness: &FingerprintSliceWitness,
-    revealed_tail_roots: Option<&Vec<Vec<u8>>>,
+    revealed_tail_roots: Option<&Vec<NodeHash>>,
 ) -> WindowBinding {
     let window_fingerprint = &init_transition.fingerprint;
     assert!(
@@ -415,9 +417,9 @@ pub(crate) fn assert_window_is_commitment_slice(
         let mut current = sha256_bytes(&block_witness.block.to_le_bytes());
         for (level, sibling) in block_witness.path_elems.iter().enumerate() {
             current = if ((block_witness.position >> level) & 1) == 0 {
-                combine_merkle_level(level, &current, sibling)
+                combine_merkle_level(level, &current, sibling.as_slice())
             } else {
-                combine_merkle_level(level, sibling, &current)
+                combine_merkle_level(level, sibling.as_slice(), &current)
             };
         }
         assert!(
@@ -465,7 +467,7 @@ pub(crate) fn assert_window_is_commitment_slice(
         final_index
             .checked_sub(tail_start)
             .and_then(|offset| roots.get(offset))
-            .cloned()
+            .map(|root| root.to_vec())
     });
 
     WindowBinding {

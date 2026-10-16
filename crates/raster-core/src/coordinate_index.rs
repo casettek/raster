@@ -1,9 +1,10 @@
 use alloc::vec;
-use sha2::{Digest, Sha256};
+use crate::hash::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::vec::Vec;
 
 use crate::cfs::CfsCoordinates;
+use crate::merkle::{to_node_hash, NodeHash};
 use crate::transition::{
     CoordinateIndexMembershipProof, CoordinateIndexNonMembershipProof, StorageIndexValue,
 };
@@ -136,10 +137,10 @@ impl IncrementalCoordinateIndex {
             .unwrap_or_else(|| self.empty_hashes[depth + 1].clone())
     }
 
-    fn sibling_path(&self, key: &[u8; 32]) -> Vec<Vec<u8>> {
+    fn sibling_path(&self, key: &[u8; 32]) -> Vec<NodeHash> {
         let mut siblings = Vec::with_capacity(INDEX_BITS);
         for depth in 0..INDEX_BITS {
-            siblings.push(self.child_hash(key, depth, !bit_at(key, depth)));
+            siblings.push(to_node_hash(&self.child_hash(key, depth, !bit_at(key, depth))));
         }
         siblings.reverse();
         siblings
@@ -244,7 +245,7 @@ pub fn coordinate_index_non_membership_proof(
 
 fn root_from_proof(
     coordinates: &CfsCoordinates,
-    siblings: &[Vec<u8>],
+    siblings: &[NodeHash],
     leaf: Vec<u8>,
 ) -> Option<Vec<u8>> {
     if siblings.len() != INDEX_BITS {
@@ -256,9 +257,9 @@ fn root_from_proof(
     for (offset, sibling) in siblings.iter().enumerate() {
         let depth = INDEX_BITS - 1 - offset;
         current = if bit_at(&key, depth) {
-            combine_node_hash(depth, sibling, &current)
+            combine_node_hash(depth, sibling.as_slice(), &current)
         } else {
-            combine_node_hash(depth, &current, sibling)
+            combine_node_hash(depth, &current, sibling.as_slice())
         };
     }
     Some(current)
@@ -340,7 +341,7 @@ mod tests {
         key: &[u8; 32],
         depth: usize,
         empty: &[Vec<u8>],
-        siblings: &mut Vec<Vec<u8>>,
+        siblings: &mut Vec<NodeHash>,
     ) {
         if depth == INDEX_BITS {
             return;
@@ -358,10 +359,10 @@ mod tests {
 
         if bit_at(key, depth) {
             legacy_collect_siblings(&right, key, depth + 1, empty, siblings);
-            siblings.push(legacy_subtree_hash(&left, depth + 1, empty));
+            siblings.push(to_node_hash(&legacy_subtree_hash(&left, depth + 1, empty)));
         } else {
             legacy_collect_siblings(&left, key, depth + 1, empty, siblings);
-            siblings.push(legacy_subtree_hash(&right, depth + 1, empty));
+            siblings.push(to_node_hash(&legacy_subtree_hash(&right, depth + 1, empty)));
         }
     }
 

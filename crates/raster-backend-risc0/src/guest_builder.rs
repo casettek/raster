@@ -17,7 +17,34 @@ use std::process::Command;
 ///
 /// v2: replay wrapper now commits `sha256(input)` (`input_commitment`); guest
 /// manifest uses risc0-zkvm default features + resolver v2.
-const GUEST_BUILD_ABI: &str = "2";
+/// v3: risc0 3.0 — risc0-build's guest rustflags; the ELF is packaged with the
+/// v1compat kernel as a `ProgramBinary`.
+const GUEST_BUILD_ABI: &str = "3";
+
+/// The guest rustflags, as `CARGO_ENCODED_RUSTFLAGS`. Mirrors risc0-build 3.0's
+/// private `encode_rust_flags` for a user (non-kernel) guest; keep in sync on a
+/// risc0 bump.
+fn guest_rustflags() -> String {
+    [
+        // The guest is single-threaded: replace atomics with plain ops.
+        "-C".to_string(),
+        "passes=lower-atomic".to_string(),
+        "-C".to_string(),
+        format!(
+            "link-arg=-Ttext={:#010x}",
+            risc0_zkvm_platform::memory::TEXT_START
+        ),
+        // A missing entry point is only a linker warning otherwise.
+        "-C".to_string(),
+        "link-arg=--fatal-warnings".to_string(),
+        "-C".to_string(),
+        "panic=abort".to_string(),
+        // getrandom 0.3 picks its backend by cfg; risc0-zkvm provides `custom`.
+        "--cfg".to_string(),
+        "getrandom_backend=\"custom\"".to_string(),
+    ]
+    .join("\x1f")
+}
 
 /// Record `root/relative` under the name `label ++ relative`, if it exists.
 fn collect_file(files: &mut Vec<(String, PathBuf)>, label: &str, root: &Path, relative: &Path) {
@@ -246,7 +273,7 @@ impl GuestBuilder {
             # risc0-groth16 → ark) — a duplicate `panic_impl` (E0152). std is
             # available for the riscv32im-risc0-zkvm-elf target, so deferring to
             # it is the guest-safe choice.
-            risc0-zkvm = "1.2"
+            risc0-zkvm = "3.0"
             raster = {{ path = "{raster_path}", default-features = false }}
             {user_crate_dep}
 
@@ -285,7 +312,7 @@ impl GuestBuilder {
     /// together with the tile source hash, so a template/toolchain/macro change
     /// invalidates stale image ids.
     pub fn recipe_fingerprint(&self) -> String {
-        use raster_core::sha2::{Digest, Sha256};
+        use raster_core::hash::{Digest, Sha256};
         let mut hasher = Sha256::new();
         hasher.update(GUEST_BUILD_ABI.as_bytes());
         hasher.update(Self::toolchain_id().as_bytes());
@@ -313,7 +340,7 @@ impl GuestBuilder {
     /// Not covered: external crate versions, which the guest resolves fresh
     /// with no lockfile.
     fn sources_fingerprint(&self) -> Vec<u8> {
-        use raster_core::sha2::{Digest, Sha256};
+        use raster_core::hash::{Digest, Sha256};
         let mut files: Vec<(String, PathBuf)> = Vec::new();
         if let Some(workspace) = &self.raster_workspace {
             collect_file(&mut files, "raster:", workspace, Path::new("Cargo.toml"));
@@ -389,7 +416,8 @@ impl GuestBuilder {
         None
     }
 
-    /// Build a guest crate and return the path to the ELF.
+    /// Build a guest crate and return the path to its `ProgramBinary` (the
+    /// user ELF packaged with the v1compat kernel).
     pub fn build_guest(&self, tile_id: &str, guest_dir: &Path) -> Result<PathBuf, GuestBuildError> {
         // Create guest source directory
         let src_dir = guest_dir.join("src");
@@ -427,6 +455,10 @@ impl GuestBuilder {
             .current_dir(guest_dir)
             .args(["build", "--release", "--target", "riscv32im-risc0-zkvm-elf"])
             .env("RUSTC", &rustc_path)
+            .env("CARGO_ENCODED_RUSTFLAGS", guest_rustflags())
+            .env("CFLAGS_riscv32im_risc0_zkvm_elf", "-march=rv32im -nostdlib")
+            // Lets crypto patches use the bigint2 accelerator.
+            .env("RISC0_FEATURE_bigint2", "")
             .output()?;
 
         if !output.status.success() {
@@ -446,7 +478,15 @@ impl GuestBuilder {
             return Err(GuestBuildError::ElfNotFound(elf_path));
         }
 
-        Ok(elf_path)
+        // risc0 2.0+ loads a `ProgramBinary`: the user ELF packaged with the
+        // kernel it runs on. risc0-build writes the same `.bin` next to the ELF.
+        let user_elf = fs::read(&elf_path)?;
+        let binary =
+            risc0_binfmt::ProgramBinary::new(&user_elf, risc0_zkos_v1compat::V1COMPAT_ELF);
+        let bin_path = elf_path.with_extension("bin");
+        fs::write(&bin_path, binary.encode())?;
+
+        Ok(bin_path)
     }
 
     /// Copy artifacts to the output directory.

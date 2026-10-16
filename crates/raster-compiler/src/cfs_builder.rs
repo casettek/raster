@@ -46,6 +46,17 @@ impl<'a> CfsBuilder<'a> {
         // Build sequence definitions with resolved data flow
         let mut sequences = Vec::new();
         for seq in &sequence_discovery.sequences {
+            // A selection whose path the compiler could not lower (a byte-page
+            // offset, a range bound it cannot evaluate) would be declared with
+            // a path no run records, and the guest's exact path checks would
+            // reject the honest step.
+            if !seq.function.selection_errors.is_empty() {
+                return Err(Error::Other(format!(
+                    "sequence `{}`: {}",
+                    seq.function.name,
+                    seq.function.selection_errors.join("; ")
+                )));
+            }
             let mut seq_def = self.build_sequence_def(seq)?;
             self.fill_site_output_schemas(&mut seq_def)?;
             sequences.push(seq_def);
@@ -212,6 +223,7 @@ fn sequence_returns(
         let form = match &seq.function.return_expr {
             Some(crate::ast::ReturnExpr::Unbound { expr }) => format!("`{expr}`"),
             Some(crate::ast::ReturnExpr::Rooted { root, .. }) => {
+                let root = crate::ast::source_name(root);
                 format!("`{root}` (a name no step produced)")
             }
             Some(crate::ast::ReturnExpr::TailCall) => "its final call".to_string(),
@@ -381,6 +393,7 @@ mod tests {
             selection_index_sources: vec![],
             selection_paths: vec![],
             return_expr: None,
+            selection_errors: Vec::new(),
         }
     }
 
@@ -407,6 +420,7 @@ mod tests {
             selection_index_sources: vec![],
             selection_paths: vec![],
             return_expr: None,
+            selection_errors: Vec::new(),
         }
     }
 
@@ -430,6 +444,7 @@ mod tests {
                 arguments: vec!["personal_data".to_string()],
                 argument_kinds: vec![CallArgumentKind::Rooted {
                     root: "personal_data".to_string(),
+                    path: Some(Vec::new()),
                 }],
                 call_kind: CallKind::Tile,
                 chunk: None,
@@ -466,7 +481,7 @@ mod tests {
             SequenceChildItem::Tile(tile_item) => {
                 assert_eq!(tile_item.id, "greet");
                 match &tile_item.sources[0] {
-                    InputBinding::EntryArgument => {}
+                    InputBinding::EntryArgument { .. } => {}
                     other => panic!("Expected EntryArgument binding, got {:?}", other),
                 }
             }

@@ -4,7 +4,7 @@ use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use crate::hash::{Digest, Sha256};
 
 use crate::cfs::CfsCoordinates;
 

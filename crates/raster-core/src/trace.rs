@@ -379,8 +379,11 @@ pub struct ExecStep {
     pub target: ExecTarget,
     pub intra_sequence_index: CfsCoordinate,
 
+    #[serde(with = "serde_bytes")]
     pub input_commitment: Vec<u8>,
+    #[serde(with = "serde_bytes")]
     pub input_source_commitment: Vec<u8>,
+    #[serde(with = "serde_bytes")]
     pub output_commitment: Vec<u8>,
 
     pub storage: StorageRoots,
@@ -404,6 +407,7 @@ pub struct ProgramStartStep {
     /// The struct-of-commitments root over the authorized per-argument
     /// commitments — the commitment of the combined entry object written at
     /// coordinates `[]`. Empty when there are no arguments (no write).
+    #[serde(with = "serde_bytes")]
     pub output_commitment: Vec<u8>,
 
     /// Genesis roots -> roots containing the entry object, or unchanged when
@@ -428,6 +432,7 @@ pub struct ProgramEndStep {
 
     /// The committed program output: the `selected_hash` of `output`'s
     /// selection. Empty when `main` returns unit.
+    #[serde(with = "serde_bytes")]
     pub output_commitment: Vec<u8>,
 
     /// Storage roots — unchanged; a program end reads its output but writes
@@ -451,11 +456,14 @@ pub enum StepKind {
     /// A nested sequence (at `[s]`) or a recur-sequence iteration (at
     /// `[s][i]`) opens.
     SequenceStart {
+        #[serde(with = "serde_bytes")]
         input_commitment: Vec<u8>,
+        #[serde(with = "serde_bytes")]
         input_source_commitment: Vec<u8>,
     },
     /// …and closes, at `[-s]` / `[s][-i]`.
     SequenceEnd {
+        #[serde(with = "serde_bytes")]
         output_commitment: Vec<u8>,
     },
     Exec(ExecStep),
@@ -476,7 +484,9 @@ pub struct RecurStartStep {
     /// The CFS item id at `[s]`. The record's `sequence_id` names the
     /// *enclosing* sequence, as on every step that is not a sequence boundary.
     pub site_id: String,
+    #[serde(with = "serde_bytes")]
     pub input_commitment: Vec<u8>,
+    #[serde(with = "serde_bytes")]
     pub input_source_commitment: Vec<u8>,
     /// **Read-only** storage roots (`root_before == root_after`).
     ///
@@ -501,6 +511,7 @@ pub struct RecurEndStep {
     /// The object written at `[s]`, or empty when the site writes none
     /// (`finalize = false`, until `incremental-draft-materialization`'s
     /// language change makes every site write exactly one).
+    #[serde(with = "serde_bytes")]
     pub output_commitment: Vec<u8>,
     pub storage: StorageRoots,
 }
@@ -794,7 +805,7 @@ pub struct TraceCommitment {
     /// commit to, and `validate` holds each one to the entry it squeezes to, so
     /// a commitment whose roots and bits disagree is unrepresentable.
     #[serde(default)]
-    pub revealed_tail_roots: Vec<Vec<u8>>,
+    pub revealed_tail_roots: Vec<crate::merkle::NodeHash>,
 }
 
 impl TraceCommitment {
