@@ -30,16 +30,24 @@ cd examples/chain-example
 cargo raster chain run --no-auth          # unattested, fast — the dev loop
 ```
 
-This is the path the integration test covers and the one that works from a
-clone. The **authenticated** path additionally needs each stage's program
-identity, which is read from a `Raster.lock` (or a cached
-`target/raster/program.bin`). Neither is checked in here, because generating
-them means compiling every tile into a RISC0 guest — so build the stages first:
+This is the path the integration test covers. The **authenticated** path
+additionally needs each stage's program identity, which is read from its
+`Raster.lock` (or a cached `target/raster/program.bin`). Every member's lock is
+checked in, including `planner` and `step` for `Raster-dynamic.toml`, so it
+runs from a clone:
 
 ```bash
-(cd phase1-normalize && cargo raster build)   # and phase2-, phase3-
 cargo raster chain run                        # writes a chain-commitment
 cargo raster chain audit                      # links + identities, no proving
+```
+
+A lock records each tile's image ID, so it goes stale when a stage's tiles,
+Raster itself or the RISC0 toolchain changes, and the drift check then refuses
+the run. Regenerate it by building the stage with the RISC0 backend, which
+compiles every tile into a guest (the default `native` backend writes no lock):
+
+```bash
+(cd phase1-normalize && cargo raster build --backend risc0)   # likewise phase2-, phase3-, planner, step
 ```
 
 Re-run a single stage in place, against the artifacts already on disk. Stages

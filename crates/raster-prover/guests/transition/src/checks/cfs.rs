@@ -140,6 +140,63 @@ fn assert_same_source(left: ResolvedSource<'_>, right: ResolvedSource<'_>) {
     }
 }
 
+/// Hold a scope argument to the caller's: the same stored object, read through
+/// the caller's selection followed by the path the CFS declares.
+///
+/// `selection.path` is compared, not `selector`: it is the path the selection
+/// proof is pinned to (`verify_selection_witness`), and each side's proof folds
+/// to the shared `source_root_hash`, so an exact path is what makes the
+/// argument's value the declared part of the caller's — any other selection
+/// under the same root (a sibling field) is refused. An index-sourced argument
+/// declares no static path; it is held to the caller's prefix, and its index
+/// values to their own citations.
+///
+/// A path with nothing to narrow (`path` empty, no index) is the old identity
+/// check, unchanged. Narrowing an inline value cannot be checked here — the
+/// guest has no selector over inline bytes — so it fails closed.
+fn assert_scope_source(
+    consumer: ResolvedSource<'_>,
+    scope: ResolvedSource<'_>,
+    path: &[SelectorSegment],
+    indexed: bool,
+) {
+    if path.is_empty() && !indexed {
+        return assert_same_source(consumer, scope);
+    }
+    let (ResolvedSource::Storage(consumer), ResolvedSource::Storage(scope)) = (consumer, scope)
+    else {
+        panic!(
+            "Sequence scope input narrows its parameter by {:?}, but narrowing is only \
+             verifiable on a stored value",
+            path
+        );
+    };
+    assert_eq!(
+        (&consumer.coordinates, &consumer.commitment, &consumer.selection.source_root_hash),
+        (&scope.coordinates, &scope.commitment, &scope.selection.source_root_hash),
+        "Narrowed sequence scope input reads a different object than the caller passed",
+    );
+    let scope_path = scope.selection.path.segments.as_slice();
+    let consumer_path = consumer.selection.path.segments.as_slice();
+    if indexed {
+        assert!(
+            consumer_path.starts_with(scope_path),
+            "Index-sourced sequence scope input selects {:?}, outside the caller's {:?}",
+            consumer_path,
+            scope_path,
+        );
+    } else {
+        let expected: Vec<SelectorSegment> =
+            scope_path.iter().chain(path.iter()).cloned().collect();
+        assert_eq!(
+            consumer_path,
+            expected.as_slice(),
+            "Narrowed sequence scope input selects a different part of the caller's value \
+             than the CFS declares",
+        );
+    }
+}
+
 fn has_coordinate_prefix(coordinates: &CfsCoordinates, prefix: &CfsCoordinates) -> bool {
     coordinates.len() >= prefix.len()
         && coordinates
@@ -553,9 +610,9 @@ fn assert_record_in_trace(record: &StepRecord, witness: &StepRecordWitness, trac
     let mut current = hash_trace_item(record);
     for (level, sibling) in witness.path_elems.iter().enumerate() {
         current = if ((witness.position >> level) & 1) == 0 {
-            combine_merkle_level(level, &current, sibling)
+            combine_merkle_level(level, &current, sibling.as_slice())
         } else {
-            combine_merkle_level(level, sibling, &current)
+            combine_merkle_level(level, sibling.as_slice(), &current)
         };
     }
     assert!(
@@ -598,7 +655,7 @@ pub fn verify_sequence_scope_parent(
     cfs_cursor: &CfsCursor,
     step_record: &StepRecord,
     sequence_scope_witness: Option<&FnInput>,
-    input_sources_witnesses: &HashMap<(u64, StepRecord), Vec<u8>>,
+    input_sources_witnesses: &HashMap<(u64, StepRecord), StepRecordWitness>,
     trace_root: &[u8],
 ) {
     let coordinates = step_record.coordinates();
@@ -634,16 +691,16 @@ pub fn verify_sequence_scope_parent(
         )
     };
 
-    let (parent_record, witness_bytes) = input_sources_witnesses
+    let (parent_record, witness) = input_sources_witnesses
         .iter()
-        .find_map(|((verifier_exec_index, record), bytes)| {
+        .find_map(|((verifier_exec_index, record), witness)| {
             // This step's own witness, not merely one for this parent: a
             // witness folds to the trace root of the step it was built for,
             // and the frontier has grown by then for any other step.
             (*verifier_exec_index == step_record.exec_index
                 && matches!(record.kind, StepKind::SequenceStart { .. })
                 && *record.coordinates() == parent_coordinates)
-                .then_some((record, bytes))
+                .then_some((record, witness))
         })
         .unwrap_or_else(|| {
             panic!(
@@ -653,9 +710,7 @@ pub fn verify_sequence_scope_parent(
             )
         });
 
-    let witness: StepRecordWitness = postcard::from_bytes(witness_bytes)
-        .expect("Sequence-scope parent witness is not a StepRecordWitness");
-    assert_record_in_trace(parent_record, &witness, trace_root);
+    assert_record_in_trace(parent_record, witness, trace_root);
 
     let recorded = parent_record
         .input_source_commitment()
@@ -727,6 +782,10 @@ fn verify_one_binding(
     // index (or drop one the program wrote), and every other check would still
     // pass because each is satisfied by *some* consistent index.
     let declared_indexes = step_input.index_bindings();
+    // An index-sourced value declares no static path (`InputBinding`): its
+    // selector is not fixed by the program, so the path checks below hold it
+    // only to its source's prefix.
+    let indexed = !declared_indexes.is_empty();
     let recorded_indexes = bound_index_count(&resolved_source);
     assert_eq!(
         declared_indexes.len(),
@@ -784,13 +843,14 @@ fn verify_one_binding(
                 input_index,
             );
         }
-        InputBinding::EntryArgument => {
+        InputBinding::EntryArgument { path } => {
             // One of `main`'s entry arguments: it must be sourced from
             // the authorized entry object at the sequence root `[]` that
-            // the `ProgramStart` step bound. The selector into that
-            // object (and its selection proof) is verified separately by
-            // the storage checks; here we hold the binding to the one
-            // coordinate the entry object can legitimately come from.
+            // the `ProgramStart` step bound, and read through exactly the
+            // path the CFS declares — the argument's name, then whatever it
+            // selects. The selection proof itself is verified separately by
+            // the storage checks; it pins `selection.path`, which is why that
+            // is the path compared.
             let storage_meta = match resolved_source {
                 ResolvedSource::Storage(meta) => meta,
                 _ => panic!(
@@ -804,8 +864,16 @@ fn verify_one_binding(
                 step_record,
                 input_index,
             );
+            if !indexed {
+                assert_eq!(
+                    storage_meta.selection.path.segments, *path,
+                    "Entry-argument input for step {:?} arg {} selects a different part of the \
+                     entry object than the CFS declares",
+                    step_record, input_index,
+                );
+            }
         }
-        InputBinding::SequenceScope { input_index } => {
+        InputBinding::SequenceScope { input_index, path } => {
             let sequence_scope_witness = sequence_scope_witness.unwrap_or_else(|| {
                 panic!(
                     "Missing sequence scope witness for step record {:?}",
@@ -819,10 +887,11 @@ fn verify_one_binding(
             } else {
                 resolved_source_at(sequence_scope_witness, *input_index)
             };
-            assert_same_source(resolved_source, scope_source);
+            assert_scope_source(resolved_source, scope_source, path, indexed);
         }
         InputBinding::PriorItemOutput {
             intra_sequence_item_index,
+            path,
         } => {
             // `intra_sequence_item_index` is a 0-based index into the
             // sequence's `items`, which is what the CFS stores; coordinates are
@@ -854,22 +923,51 @@ fn verify_one_binding(
             // return the CFS could not bind, or a recur body's parameter — fall
             // back to the looser "inside the source item" rule rather than
             // refuse an honest program.
+            //
+            // The walk composes the whole selector: what the written value is
+            // read through (a nested return's path), then the argument's own
+            // `path`. Where it cannot be followed only the argument's own path
+            // is known, as the selection's trailing segments.
+            let selected_path = storage_meta.selection.path.segments.as_slice();
             match cfs_cursor.resolve_value(
                 parent_sequence_coordinates,
-                &InputBinding::prior_item_output(*intra_sequence_item_index),
+                step_input.value_binding(),
                 &[],
             ) {
-                Ok(resolved) => assert_eq!(
-                    storage_meta.coordinates, resolved.coordinates,
-                    "Storage input prior-item-output coordinates do not match expected CFS source",
-                ),
+                Ok(resolved) => {
+                    assert_eq!(
+                        storage_meta.coordinates, resolved.coordinates,
+                        "Storage input prior-item-output coordinates do not match expected CFS source",
+                    );
+                    if !indexed {
+                        assert_eq!(
+                            selected_path,
+                            resolved.path.as_slice(),
+                            "Prior-item-output input for step {:?} arg {} selects a different \
+                             part of the source than the CFS declares",
+                            step_record,
+                            input_index,
+                        );
+                    }
+                }
                 Err(ResolveError::UnboundReturn(_) | ResolveError::RecurBodyParameter) => {
                     assert_prior_item_output_coordinates(
                         cfs_cursor,
                         parent_sequence_coordinates,
                         source_coordinate,
                         &storage_meta.coordinates,
-                    )
+                    );
+                    if !indexed {
+                        assert!(
+                            selected_path.ends_with(path),
+                            "Prior-item-output input for step {:?} arg {} selects {:?}, which \
+                             does not end with the CFS path {:?}",
+                            step_record,
+                            input_index,
+                            selected_path,
+                            path,
+                        );
+                    }
                 }
                 Err(error) => panic!(
                     "Step {:?} arg {} names a source the CFS cannot follow: {:?}",
@@ -1066,7 +1164,7 @@ pub(crate) fn verify_returned_state(
             body_id
         )
     });
-    if matches!(returns.source, InputBinding::SequenceScope { input_index: 1 })
+    if matches!(returns.source, InputBinding::SequenceScope { input_index: 1, .. })
         && returns.path.is_empty()
     {
         assert_eq!(
@@ -1086,7 +1184,7 @@ pub(crate) fn verify_returned_state(
             )
         });
     assert!(
-        resolved.path.is_empty() && resolved.path_complete,
+        resolved.path.is_empty(),
         "Recur sequence `{}` must return its state as a whole object",
         body_id,
     );

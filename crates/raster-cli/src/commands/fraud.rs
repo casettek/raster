@@ -8,7 +8,7 @@ use raster_core::cfs::CfsCoordinates;
 use raster_core::trace::{ExecStep, ExecTarget, StepKind, StepRecord, Trace};
 use raster_core::{Error, Result};
 
-use raster_prover::precomputed::EMPTY_TRIE_NODES;
+use raster_core::merkle::EMPTY_LEAF;
 use raster_prover::trace::{FraudProofConfig, TraceCommitment, TraceCommitmentExt};
 
 /// Which executed step the injector should corrupt.
@@ -216,7 +216,7 @@ pub fn fraud(
     println!("  replay with --fraud-step {index}   (or exec:{exec_index})");
 
     let trace_commitment =
-        TraceCommitment::try_build(trace, &EMPTY_TRIE_NODES[0], fraud_proof_config)
+        TraceCommitment::try_build(trace, &EMPTY_LEAF, fraud_proof_config)
             .map_err(|e| Error::Other(e.to_string()))?;
 
     let bytes = postcard::to_allocvec(&trace_commitment).unwrap();

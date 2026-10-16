@@ -362,15 +362,19 @@ impl CfsCursor {
     /// index, never a coordinate — because one definition is called from many
     /// places). The walk descends one call at a time:
     ///
+    /// Every hop first prepends the binding's own `path` — the segments its
+    /// argument `select!`s from the value it names — so the composed path is
+    /// always the whole selector into the written object.
+    ///
     /// * `PriorItemOutput(k)` names item `F ++ [k + 1]`. A tile, recur tile or
     ///   recur sequence wrote its value exactly there; a nested sequence hands
     ///   on its own `returns`, prepending its path.
     /// * `SequenceScope(i)` is the caller's `i`-th argument at this frame's call
-    ///   site. Argument bindings record no path yet, so from here on only a
-    ///   *suffix* of the path is known (`path_complete = false`). A parameter of
-    ///   a recur sequence body is the site source's element for that iteration,
-    ///   which this walk does not follow (`RecurBodyParameter`).
-    /// * `EntryArgument` is the entry object at `[]`.
+    ///   site, which carries its own path. A parameter of a recur sequence body
+    ///   is the site source's element for that iteration, which this walk does
+    ///   not follow (`RecurBodyParameter`).
+    /// * `EntryArgument` is the entry object at `[]`; its path starts with the
+    ///   argument's name.
     pub fn resolve_value(
         &self,
         frame: &CfsCoordinates,
@@ -384,11 +388,12 @@ impl CfsCursor {
         let mut frame = frame.clone();
         let mut source = source.clone();
         let mut path = path.to_vec();
-        let mut path_complete = true;
         for _ in 0..MAX_HOPS {
+            path.splice(0..0, source.path().iter().cloned());
             match source {
                 InputBinding::PriorItemOutput {
                     intra_sequence_item_index,
+                    ..
                 } => {
                     let position = CfsCoordinate::try_from(intra_sequence_item_index)
                         .ok()
@@ -405,7 +410,6 @@ impl CfsCursor {
                             return Ok(ResolvedValue {
                                 coordinates: item_coordinates,
                                 path,
-                                path_complete,
                             })
                         }
                         Some(SequenceChildItem::Sequence(item)) => {
@@ -425,7 +429,7 @@ impl CfsCursor {
                         None => return Err(ResolveError::NotStorage),
                     }
                 }
-                InputBinding::SequenceScope { input_index } => {
+                InputBinding::SequenceScope { input_index, .. } => {
                     if self.try_get_recur_iteration_coordinates(&frame).is_some() {
                         return Err(ResolveError::RecurBodyParameter);
                     }
@@ -436,15 +440,13 @@ impl CfsCursor {
                         .cloned()
                         .ok_or(ResolveError::NotStorage)?;
                     let (caller_frame, _) = frame.try_parent().ok_or(ResolveError::NotStorage)?;
-                    path_complete = false;
                     source = argument;
                     frame = caller_frame;
                 }
-                InputBinding::EntryArgument => {
+                InputBinding::EntryArgument { .. } => {
                     return Ok(ResolvedValue {
                         coordinates: CfsCoordinates::new(),
                         path,
-                        path_complete,
                     })
                 }
                 InputBinding::Direct(_) | InputBinding::Indexed { .. } => {
@@ -818,12 +820,8 @@ pub struct SequenceDef {
 pub struct ResolvedValue {
     /// The coordinates of the step that wrote the object.
     pub coordinates: CfsCoordinates,
-    /// The selector into that object — all of it when `path_complete`, else
-    /// only its trailing segments.
+    /// The whole selector into that object.
     pub path: Vec<SelectorSegment>,
-    /// `false` once the walk crossed a sequence parameter, whose argument
-    /// binding records no path.
-    pub path_complete: bool,
 }
 
 /// Why [`CfsCursor::resolve_value`] could not follow a binding to a written
@@ -1017,21 +1015,45 @@ pub struct RecurOutputDecl {
     pub derives: bool,
 }
 
+/// Where an argument's value comes from, and which part of it the argument
+/// reads.
+///
+/// Each value variant carries `path`: the selector segments the argument
+/// appends to the selector of the value it names, composed along the
+/// argument's `select!` alias chain the way the runtime composes it. Empty for
+/// an argument that passes the value whole. A step's recorded selector for
+/// the argument is therefore *exactly* the named value's selector followed by
+/// `path`, which is what lets the guest hold a narrowing call site to the
+/// program instead of accepting any selection under the same root. See
+/// `docs/issues/sequence-scope-forbids-narrowing.md`.
+///
+/// A path holds only static segments. An argument reached through a
+/// data-sourced index is [`InputBinding::Indexed`] and records an empty path:
+/// its index values are cited and checked separately.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum InputBinding {
     Direct(InputSource),
+    /// Parameter `input_index` of the enclosing sequence, as the caller passed
+    /// it.
     SequenceScope {
         input_index: usize,
+        path: Vec<SelectorSegment>,
     },
     PriorItemOutput {
         intra_sequence_item_index: usize,
+        path: Vec<SelectorSegment>,
     },
     /// One of `main`'s entry arguments, reached from the single authorized
     /// entry object at the sequence root (coordinates `[]`) that the
     /// `ProgramStart` step bound. `main` has no caller, so its arguments are
     /// not `SequenceScope`; and the entry object sits at the sequence root
     /// itself, which no `PriorItemOutput` index can name.
-    EntryArgument,
+    ///
+    /// The entry object's selector is empty and each argument is one of its
+    /// fields, so `path` starts with the argument's name.
+    EntryArgument {
+        path: Vec<SelectorSegment>,
+    },
     /// A value whose selector reaches it through one or more **data-sourced**
     /// list indexes (`select!(Row, rows[token_id])`).
     ///
@@ -1072,21 +1094,55 @@ impl InputBinding {
         Self::new(InputSource::Storage)
     }
 
-    /// Create a sequence-scope binding.
+    /// Create a sequence-scope binding that passes the parameter whole.
     pub fn seq_input(input_index: usize) -> Self {
-        Self::SequenceScope { input_index }
-    }
-
-    /// Create a binding sourced from a prior item's committed output.
-    pub fn prior_item_output(intra_sequence_item_index: usize) -> Self {
-        Self::PriorItemOutput {
-            intra_sequence_item_index,
+        Self::SequenceScope {
+            input_index,
+            path: Vec::new(),
         }
     }
 
-    /// Create a binding to one of `main`'s entry arguments.
+    /// Create a binding sourced from a prior item's committed output, passed
+    /// whole.
+    pub fn prior_item_output(intra_sequence_item_index: usize) -> Self {
+        Self::PriorItemOutput {
+            intra_sequence_item_index,
+            path: Vec::new(),
+        }
+    }
+
+    /// Create a binding to one of `main`'s entry arguments, with no path yet.
+    /// A real argument names itself: `entry_argument().with_path([name, ..])`.
     pub fn entry_argument() -> Self {
-        Self::EntryArgument
+        Self::EntryArgument { path: Vec::new() }
+    }
+
+    /// Set the selector path this binding's argument reads, on the value
+    /// variant (through an `Indexed` wrapper). A no-op for `Direct`, which
+    /// names no value to select from.
+    pub fn with_path(mut self, new_path: Vec<SelectorSegment>) -> Self {
+        match &mut self {
+            Self::SequenceScope { path, .. }
+            | Self::PriorItemOutput { path, .. }
+            | Self::EntryArgument { path } => *path = new_path,
+            Self::Indexed { value, .. } => {
+                let inner = core::mem::replace(value.as_mut(), Self::inline());
+                **value = inner.with_path(new_path);
+            }
+            Self::Direct(_) => {}
+        }
+        self
+    }
+
+    /// The selector path this binding itself carries: empty for `Direct` and
+    /// for an `Indexed` wrapper (whose value's path is `value_binding().path()`).
+    pub fn path(&self) -> &[SelectorSegment] {
+        match self {
+            Self::SequenceScope { path, .. }
+            | Self::PriorItemOutput { path, .. }
+            | Self::EntryArgument { path } => path.as_slice(),
+            Self::Direct(_) | Self::Indexed { .. } => &[],
+        }
     }
 
     /// Wrap this binding as one reached through data-sourced list indexes.
@@ -1514,7 +1570,12 @@ mod tests {
                         tile("a", vec![]),
                         call("outer", vec![InputBinding::prior_item_output(0)]),
                         call("outer", vec![InputBinding::prior_item_output(0)]),
-                        call("choose", vec![InputBinding::prior_item_output(0)]),
+                        // Narrows `a`'s output to `.p` on the way in.
+                        call(
+                            "choose",
+                            vec![InputBinding::prior_item_output(0)
+                                .with_path(vec![SelectorSegment::Field("p".to_string())])],
+                        ),
                         SequenceChildItem::RecurSequence(RecurSequenceItem {
                             id: "rs".to_string(),
                             sources: vec![InputBinding::prior_item_output(0)],
@@ -1562,7 +1623,6 @@ mod tests {
         // prepends its own selection: c.y, then .x, then main's .m.
         assert_eq!(resolved.coordinates, CfsCoordinates(vec![2, 2, 1]));
         assert_eq!(resolved.path, fields(&["y", "x", "m"]));
-        assert!(resolved.path_complete);
     }
 
     /// One definition, two call sites: the relative `returns` resolves against
@@ -1578,7 +1638,8 @@ mod tests {
 
     /// A sequence returning its parameter hands the value back to the caller's
     /// argument — which here is `a`'s output at `[1]`, outside the call at
-    /// `[4]`. The argument binding records no path, so only a suffix is known.
+    /// `[4]`. The argument narrows it to `.p`, and that path composes in front
+    /// of the return's `.z`: the whole selector is known across the parameter.
     #[test]
     fn a_returned_parameter_resolves_through_the_callers_argument() {
         let cursor = returns_cursor();
@@ -1586,8 +1647,22 @@ mod tests {
             .resolve_value(&CfsCoordinates::new(), &InputBinding::prior_item_output(3), &[])
             .expect("resolves");
         assert_eq!(resolved.coordinates, CfsCoordinates(vec![1]));
-        assert_eq!(resolved.path, fields(&["z"]));
-        assert!(!resolved.path_complete);
+        assert_eq!(resolved.path, fields(&["p", "z"]));
+    }
+
+    /// The binding a walk starts from contributes its own path first.
+    #[test]
+    fn the_starting_bindings_path_leads_the_selector() {
+        let cursor = returns_cursor();
+        let resolved = cursor
+            .resolve_value(
+                &CfsCoordinates::new(),
+                &InputBinding::prior_item_output(1).with_path(fields(&["q"])),
+                &fields(&["m"]),
+            )
+            .expect("resolves");
+        assert_eq!(resolved.coordinates, CfsCoordinates(vec![2, 2, 1]));
+        assert_eq!(resolved.path, fields(&["y", "x", "q", "m"]));
     }
 
     #[test]

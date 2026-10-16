@@ -10,7 +10,7 @@ use raster_core::input::{
 use raster_core::trace::RasterPayload;
 use raster_core::transition::{SerializableFrontier, StorageEntry, StorageIndexValue};
 use raster_core::{Error, Result};
-use raster_prover::precomputed::EMPTY_TRIE_NODES;
+use raster_core::merkle::EMPTY_LEAF;
 use raster_prover::trace::{
     frontier_root, serializable_frontier_from_trace_frontier, Bytes, TraceTree, TraceTreeFrontier,
 };
@@ -598,7 +598,7 @@ impl ObjectStore {
 impl AuthenticatedObjectStore {
     pub fn new() -> Self {
         let mut tree = TraceTree::new(1);
-        tree.append(Bytes(EMPTY_TRIE_NODES[0].to_vec()));
+        tree.append(Bytes(EMPTY_LEAF.to_vec()));
         let frontier = tree
             .frontier()
             .cloned()

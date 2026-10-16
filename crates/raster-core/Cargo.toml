@@ -24,6 +24,7 @@ postcard.workspace = true
 # generated tile guest collides with risc0-zkvm's no_std guest panic handler
 # (duplicate `panic_impl`). `sha2::Digest` is still the shared trait there.
 sha2 = { workspace = true, default-features = false }
+serde_bytes.workspace = true
 
 # Optional std-only dependencies
 serde_json = { workspace = true, optional = true }
@@ -32,4 +33,4 @@ bincode = { workspace = true, optional = true }
 # Accelerated SHA-256 for `src/hash.rs`, only when building a guest. Guests
 # already depend on `risc0-zkvm` (default features), so features unify.
 [target.'cfg(target_os = "zkvm")'.dependencies]
-risc0-zkvm = { version = "1.2", default-features = false }
+risc0-zkvm = { version = "3.0", default-features = false }

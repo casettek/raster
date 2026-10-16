@@ -1,14 +1,14 @@
 {
   "format": 1,
-  "program_commitment": "dd0c4ad6d4901bd0498b0ac1870e6ffdd27b03ae7709f49e4fdf4023f17ab9ed",
+  "program_commitment": "4592bdb8c87a93341dbd3bda6ddce8d5ef1f55c38623fcc70aea29c527b3e527",
   "tiles": {
     "plan_steps": {
-      "image_id": "54ec11018e60be9f00e55f914b8e4ddf434d337c2f7f2bb504c4c2408fed70e5",
+      "image_id": "d92725ae0115e9bb1150f1308351202bc2dac1e69afaf94676bd17d6276e7776",
       "source_hash": "0ab58f5a69710ff90000000000000374"
     }
   },
   "toolchain": {
-    "risc0": "risc0-zkvm-1.2",
+    "risc0": "risc0-zkvm-3.0.6",
     "build_mode": "local"
   }
 }
