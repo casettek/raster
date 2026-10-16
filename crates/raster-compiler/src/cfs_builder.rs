@@ -46,6 +46,16 @@ impl<'a> CfsBuilder<'a> {
         // Build sequence definitions with resolved data flow
         let mut sequences = Vec::new();
         for seq in &sequence_discovery.sequences {
+            // A byte-page selection whose path the compiler could not lower
+            // would be declared with a path no run records, and the guest's
+            // exact path checks would reject the honest step.
+            if !seq.function.selection_errors.is_empty() {
+                return Err(Error::Other(format!(
+                    "sequence `{}`: {}",
+                    seq.function.name,
+                    seq.function.selection_errors.join("; ")
+                )));
+            }
             let mut seq_def = self.build_sequence_def(seq)?;
             self.fill_site_output_schemas(&mut seq_def)?;
             sequences.push(seq_def);
@@ -381,6 +391,7 @@ mod tests {
             selection_index_sources: vec![],
             selection_paths: vec![],
             return_expr: None,
+            selection_errors: Vec::new(),
         }
     }
 
@@ -407,6 +418,7 @@ mod tests {
             selection_index_sources: vec![],
             selection_paths: vec![],
             return_expr: None,
+            selection_errors: Vec::new(),
         }
     }
 

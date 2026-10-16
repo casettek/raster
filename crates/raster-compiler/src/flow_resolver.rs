@@ -409,6 +409,7 @@ mod tests {
             selection_index_sources: vec![],
             selection_paths: vec![],
             return_expr: None,
+            selection_errors: Vec::new(),
         }
     }
 
@@ -452,6 +453,7 @@ mod tests {
             selection_index_sources,
             selection_paths: vec![],
             return_expr: None,
+            selection_errors: Vec::new(),
         }
     }
 

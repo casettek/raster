@@ -1,5 +1,7 @@
 use cargo_toml::Manifest;
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::path::{Path, PathBuf};
 use syn::{
     parse::{Parse, ParseStream},
@@ -172,6 +174,11 @@ pub struct FunctionAstItem {
     /// The body's returned expression, classified. `None` when the body ends
     /// in a statement (a unit return).
     pub return_expr: Option<ReturnExpr>,
+    /// Byte-page selections the compiler could not lower to the path the
+    /// `select!` macro records: the page size of the `Bytes<N>` they index
+    /// could not be read from the source. Building a CFS fails on any of
+    /// these rather than declaring a path no run records.
+    pub selection_errors: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -190,13 +197,43 @@ impl ProjectAst {
 
         let files_paths = Self::find_all_rs_files(project_root);
 
+        // Two passes: every file's structs and function signatures first, so a
+        // function body can be read against the whole project's types.
+        let files: Vec<(PathBuf, syn::File)> = files_paths
+            .iter()
+            .map(|path| {
+                let content = std::fs::read_to_string(path).unwrap();
+                (path.clone(), parse_file(&content).unwrap())
+            })
+            .collect();
+        let structs: Vec<StructAstItem> = files
+            .iter()
+            .flat_map(|(_, ast)| crate::schema_walk::collect_structs(&ast.items))
+            .collect();
+        let fn_outputs: HashMap<String, String> = files
+            .iter()
+            .flat_map(|(_, ast)| ast.items.iter())
+            .filter_map(|item| match item {
+                syn::Item::Fn(func) => match &func.sig.output {
+                    syn::ReturnType::Type(_, ty) => {
+                        Some((func.sig.ident.to_string(), quote::quote!(#ty).to_string()))
+                    }
+                    syn::ReturnType::Default => None,
+                },
+                _ => None,
+            })
+            .collect();
+
+        let shared_structs = Rc::new(structs.clone());
+        let fn_outputs = Rc::new(fn_outputs);
         let mut functions = Vec::new();
-        let mut structs = Vec::new();
-        for path in &files_paths {
-            let content = std::fs::read_to_string(path).unwrap();
-            let ast = parse_file(&content).unwrap();
-            functions.extend(Self::parse_functions(&ast, path.to_path_buf()));
-            structs.extend(crate::schema_walk::collect_structs(&ast.items));
+        for (path, ast) in &files {
+            functions.extend(Self::parse_functions(
+                ast,
+                path.clone(),
+                &shared_structs,
+                &fn_outputs,
+            ));
         }
 
         Ok(Self {
@@ -219,7 +256,12 @@ impl ProjectAst {
             .collect()
     }
 
-    fn parse_functions(ast: &syn::File, path: PathBuf) -> Vec<FunctionAstItem> {
+    fn parse_functions(
+        ast: &syn::File,
+        path: PathBuf,
+        structs: &Rc<Vec<StructAstItem>>,
+        fn_outputs: &Rc<HashMap<String, String>>,
+    ) -> Vec<FunctionAstItem> {
         let mut functions = Vec::new();
 
         for item in &ast.items {
@@ -257,13 +299,19 @@ impl ProjectAst {
                 let sig = &func.sig;
                 let signature = quote::quote!(#sig).to_string();
 
-                let mut visitor = CallVisitor::new();
+                let types = TypeContext::for_function(
+                    Rc::clone(structs),
+                    Rc::clone(fn_outputs),
+                    input_names.iter().cloned().zip(inputs.iter().cloned()),
+                );
+                let mut visitor = CallVisitor::with_types(types);
                 visitor.visit_item_fn(func);
                 let call_infos = visitor.get_call_infos();
                 let selection_aliases = visitor.get_selection_aliases();
                 let selection_index_sources = visitor.get_selection_index_sources();
                 let selection_paths = visitor.get_selection_paths();
-                let return_expr = CallVisitor::classify_return(&func.block);
+                let return_expr = visitor.classify_return(&func.block);
+                let selection_errors = visitor.get_selection_errors();
                 let function_info = FunctionAstItem {
                     name,
                     path: path.clone(),
@@ -277,6 +325,7 @@ impl ProjectAst {
                     selection_index_sources,
                     selection_paths,
                     return_expr,
+                    selection_errors,
                 };
                 functions.push(function_info);
             }
@@ -344,16 +393,44 @@ impl ProjectAst {
 /// The body of a `select!(Type, expr)` — only `expr` matters here, since it
 /// is what the selection reads from.
 struct SelectionMacroArgs {
+    selected_ty: syn::Type,
     expr: Expr,
 }
 
 impl Parse for SelectionMacroArgs {
     fn parse(input: ParseStream) -> syn::Result<Self> {
-        let _selected_ty: syn::Type = input.parse()?;
+        let selected_ty: syn::Type = input.parse()?;
         input.parse::<Token![,]>()?;
         Ok(Self {
+            selected_ty,
             expr: input.parse()?,
         })
+    }
+}
+
+/// What the compiler can see of types while it reads one function body: the
+/// project's structs and function outputs, and each local's declared type in
+/// statement order. Enough to find the `Bytes<N>` a byte-page `select!`
+/// indexes, so its declared path can be lowered as the macro lowers it.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct TypeContext {
+    structs: Rc<Vec<StructAstItem>>,
+    fn_outputs: Rc<HashMap<String, String>>,
+    locals: HashMap<String, String>,
+}
+
+impl TypeContext {
+    /// A function's context: the project's types, and its own parameters.
+    pub(crate) fn for_function(
+        structs: Rc<Vec<StructAstItem>>,
+        fn_outputs: Rc<HashMap<String, String>>,
+        params: impl IntoIterator<Item = (String, String)>,
+    ) -> Self {
+        Self {
+            structs,
+            fn_outputs,
+            locals: params.into_iter().collect(),
+        }
     }
 }
 
@@ -374,17 +451,34 @@ pub struct CallVisitor {
     /// Per alias local, the static selector path it appends (see
     /// `FunctionAstItem::selection_paths`).
     selection_paths: Vec<(String, Vec<SelectorSegment>)>,
+    /// Types in scope, for lowering byte-page selections.
+    types: TypeContext,
+    /// Selections whose path could not be lowered (see
+    /// `FunctionAstItem::selection_errors`).
+    selection_errors: RefCell<Vec<String>>,
 }
 
 impl CallVisitor {
+    /// A visitor with no types in scope, for tests of everything else.
+    #[cfg(test)]
     fn new() -> Self {
+        Self::with_types(TypeContext::default())
+    }
+
+    fn with_types(types: TypeContext) -> Self {
         Self {
             call_infos: Vec::new(),
             current_binding: None,
             selection_aliases: Vec::new(),
             selection_index_sources: Vec::new(),
             selection_paths: Vec::new(),
+            types,
+            selection_errors: RefCell::new(Vec::new()),
         }
+    }
+
+    fn get_selection_errors(&self) -> Vec<String> {
+        self.selection_errors.borrow().clone()
     }
 
     fn get_call_infos(&self) -> Vec<CallInfo> {
@@ -410,7 +504,7 @@ impl CallVisitor {
     /// `select!` alias, a data-sourced index records no static path.
     fn record_view_alias(&mut self, name: &str, root: String, view: &Expr) {
         self.selection_aliases.push((name.to_string(), root));
-        if let Some(path) = Self::argument_path(view) {
+        if let Some(path) = self.argument_path(view) {
             self.selection_paths.push((name.to_string(), path));
         }
         let index_roots = Self::view_index_roots(view);
@@ -432,14 +526,14 @@ impl CallVisitor {
     /// Classify a function body's returned expression: its last statement
     /// when that statement is a value (no trailing `;`), or the operand of a
     /// final `return`.
-    pub(crate) fn classify_return(block: &syn::Block) -> Option<ReturnExpr> {
+    pub(crate) fn classify_return(&self, block: &syn::Block) -> Option<ReturnExpr> {
         match block.stmts.last()? {
-            Stmt::Expr(Expr::Return(ret), _) => ret.expr.as_deref().map(Self::classify_return_expr),
-            Stmt::Expr(expr, None) => Some(Self::classify_return_expr(expr)),
+            Stmt::Expr(Expr::Return(ret), _) => ret.expr.as_deref().map(|expr| self.classify_return_expr(expr)),
+            Stmt::Expr(expr, None) => Some(self.classify_return_expr(expr)),
             // A trailing macro invocation with no `;` parses as a statement
             // macro, not an expression.
             Stmt::Macro(stmt) if stmt.semi_token.is_none() => {
-                Some(Self::classify_return_expr(&Expr::Macro(ExprMacro {
+                Some(self.classify_return_expr(&Expr::Macro(ExprMacro {
                     attrs: stmt.attrs.clone(),
                     mac: stmt.mac.clone(),
                 })))
@@ -448,19 +542,19 @@ impl CallVisitor {
         }
     }
 
-    fn classify_return_expr(expr: &Expr) -> ReturnExpr {
+    fn classify_return_expr(&self, expr: &Expr) -> ReturnExpr {
         match expr {
             // `Ok(x)` from a fallible `main`, and `x?`, return `x`.
             Expr::Call(call) if call.args.len() == 1 && Self::expr_path_is(&call.func, "Ok") => {
-                Self::classify_return_expr(&call.args[0])
+                self.classify_return_expr(&call.args[0])
             }
-            Expr::Try(try_expr) => Self::classify_return_expr(&try_expr.expr),
-            Expr::Paren(paren) => Self::classify_return_expr(&paren.expr),
+            Expr::Try(try_expr) => self.classify_return_expr(&try_expr.expr),
+            Expr::Paren(paren) => self.classify_return_expr(&paren.expr),
             Expr::Tuple(tuple) => ReturnExpr::Tuple(
                 tuple
                     .elems
                     .iter()
-                    .map(|elem| match Self::classify_return_expr(elem) {
+                    .map(|elem| match self.classify_return_expr(elem) {
                         ReturnExpr::TailCall => ReturnExpr::Unbound {
                             expr: Self::expr_to_string(elem),
                         },
@@ -478,7 +572,7 @@ impl CallVisitor {
             Expr::Macro(expr_macro) if Self::is_selection_macro(&expr_macro.mac) => {
                 match (
                     Self::selection_macro_root(&expr_macro.mac),
-                    Self::selection_macro_path(&expr_macro.mac),
+                    self.selection_macro_path(&expr_macro.mac),
                 ) {
                     (Some(root), Some(path)) => ReturnExpr::Rooted { root, path },
                     _ => ReturnExpr::Unbound {
@@ -491,14 +585,14 @@ impl CallVisitor {
             // `x.f`, not the whole of `x`.
             Expr::Macro(expr_macro) if Self::is_reference_macro(&expr_macro.mac) => {
                 match Self::reference_macro_arg(&expr_macro.mac) {
-                    Some(inner) => Self::classify_return_expr(&inner),
+                    Some(inner) => self.classify_return_expr(&inner),
                     None => ReturnExpr::Unbound {
                         expr: Self::expr_to_string(expr),
                     },
                 }
             }
             Expr::MethodCall(call) if call.method == "clone" && call.args.is_empty() => {
-                Self::classify_return_expr(&call.receiver)
+                self.classify_return_expr(&call.receiver)
             }
             Expr::Path(path) if path.path.get_ident().is_some() => ReturnExpr::Rooted {
                 root: path.path.get_ident().expect("checked above").to_string(),
@@ -519,11 +613,127 @@ impl CallVisitor {
     /// literal index to `Index`, a literal `start..end` to `Range`. `None` for
     /// a data-sourced index (a bare binding), which is cited at run time rather
     /// than fixed by the program, and for anything the macro rejects.
-    fn selection_macro_path(mac: &syn::Macro) -> Option<Vec<SelectorSegment>> {
+    ///
+    /// A byte-page selection is lowered as well; see
+    /// [`Self::lower_byte_page_path`].
+    fn selection_macro_path(&self, mac: &syn::Macro) -> Option<Vec<SelectorSegment>> {
         let args = mac.parse_body_with(SelectionMacroArgs::parse).ok()?;
         let mut path = Vec::new();
         Self::collect_static_path(&args.expr, &mut path)?;
-        Some(path)
+        Some(self.lower_byte_page_path(&args, path))
+    }
+
+    /// Lower a byte-page selection's path the way `select!` does
+    /// (`page_insertion_plan` / `emit_index_lit` in `raster-macros`).
+    ///
+    /// A selection of `BytesPage` or `Block<BytesPage>` that ends in an index
+    /// or range, not already under `.pages`, reads the region's `pages` list:
+    /// the macro inserts that field before the last segment, and a literal
+    /// there is a byte offset (or byte range) that it divides by the region's
+    /// page size. So `select!(BytesPage, model.weights[4])` on a `Bytes<4>`
+    /// field is `[weights, pages, 1]`, and the CFS must declare the same.
+    ///
+    /// The page size is the `N` of the `Bytes<N>` the rest of the path
+    /// reaches, read from the root binding's declared type. When it cannot be
+    /// read, the selection is recorded in `selection_errors` rather than
+    /// declared with a path no run records.
+    fn lower_byte_page_path(
+        &self,
+        args: &SelectionMacroArgs,
+        mut path: Vec<SelectorSegment>,
+    ) -> Vec<SelectorSegment> {
+        if !Self::is_byte_page_type(&args.selected_ty) || path.is_empty() {
+            return path;
+        }
+        let last = path.len() - 1;
+        let already_pages = last > 0
+            && matches!(&path[last - 1], SelectorSegment::Field(name) if name == "pages");
+        if already_pages
+            || !matches!(
+                path[last],
+                SelectorSegment::Index(_) | SelectorSegment::Range { .. }
+            )
+        {
+            return path;
+        }
+
+        let root = Self::expr_root_ident(&args.expr);
+        let page_size = root.as_ref().and_then(|root| {
+            let root_ty = self.types.locals.get(root)?;
+            crate::schema_walk::bytes_page_size_at(root_ty, &path[..last], &self.types.structs)
+        });
+        let selection = Self::expr_to_string(&args.expr);
+        let Some(page_size) = page_size.filter(|size| *size > 0) else {
+            self.selection_errors.borrow_mut().push(format!(
+                "cannot read the page size of the `Bytes<N>` that `{selection}` indexes, so its \
+                 byte offset cannot be lowered to a page index; select the page explicitly \
+                 with `.pages[k]` or `.pages[a..b]`"
+            ));
+            return path;
+        };
+        let aligned = |offset: u64| offset % page_size == 0;
+        path[last] = match path[last] {
+            SelectorSegment::Index(offset) if aligned(offset) => {
+                SelectorSegment::Index(offset / page_size)
+            }
+            SelectorSegment::Range { start, end } if aligned(start) && aligned(end) => {
+                SelectorSegment::Range {
+                    start: start / page_size,
+                    end: end / page_size,
+                }
+            }
+            _ => {
+                // `select!` refuses to compile an unaligned offset.
+                self.selection_errors.borrow_mut().push(format!(
+                    "`{selection}` is not aligned to its page size {page_size}"
+                ));
+                return path;
+            }
+        };
+        path.insert(last, SelectorSegment::Field("pages".to_string()));
+        path
+    }
+
+    /// `BytesPage` or `Block<BytesPage>`: the targets `select!` lowers byte
+    /// offsets for.
+    fn is_byte_page_type(ty: &syn::Type) -> bool {
+        let syn::Type::Path(type_path) = ty else {
+            return false;
+        };
+        let Some(segment) = type_path.path.segments.last() else {
+            return false;
+        };
+        match segment.ident.to_string().as_str() {
+            "BytesPage" => true,
+            "Block" => match &segment.arguments {
+                syn::PathArguments::AngleBracketed(args) => args.args.iter().any(|arg| {
+                    matches!(arg, syn::GenericArgument::Type(inner) if Self::is_byte_page_type(inner))
+                }),
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
+    /// The declared type of a view expression: a local's, a `select!`'s
+    /// target, or what a `clone!` / `into_ref!` / `.clone()` wraps.
+    fn view_type(&self, expr: &Expr) -> Option<String> {
+        match expr {
+            Expr::Path(path) => self.types.locals.get(&path.path.get_ident()?.to_string()).cloned(),
+            Expr::Macro(expr_macro) if Self::is_selection_macro(&expr_macro.mac) => {
+                let args = expr_macro.mac.parse_body_with(SelectionMacroArgs::parse).ok()?;
+                let ty = &args.selected_ty;
+                Some(quote::quote!(#ty).to_string())
+            }
+            Expr::Macro(expr_macro) if Self::is_reference_macro(&expr_macro.mac) => {
+                self.view_type(&Self::reference_macro_arg(&expr_macro.mac)?)
+            }
+            Expr::MethodCall(call) if call.method == "clone" => self.view_type(&call.receiver),
+            Expr::Paren(paren) => self.view_type(&paren.expr),
+            Expr::Reference(reference) => self.view_type(&reference.expr),
+            Expr::Try(try_expr) => self.view_type(&try_expr.expr),
+            _ => None,
+        }
     }
 
     fn collect_static_path(expr: &Expr, path: &mut Vec<SelectorSegment>) -> Option<()> {
@@ -583,17 +793,16 @@ impl CallVisitor {
     ///
     /// The macro syntax is `call!(callee_fn, arg1, arg2, ...)`. The token stream
     /// is a comma-separated list; the first token is the callee identifier.
-    fn parse_call_macro_args(
-        mac: &syn::Macro,
+    fn parse_call_macro_args(&self, mac: &syn::Macro,
     ) -> Option<(String, Vec<String>, Vec<CallArgumentKind>, Option<u64>, Option<SiteOutputKind>, bool)> {
         if matches!(Self::macro_call_kind(mac), Some(CallKind::RecursiveTile)) {
-            return Self::parse_recur_call_macro_args(mac);
+            return self.parse_recur_call_macro_args(mac);
         }
         if matches!(
             Self::macro_call_kind(mac),
             Some(CallKind::RecursiveSequence)
         ) {
-            return Self::parse_recur_sequence_call_macro_args(mac)
+            return self.parse_recur_sequence_call_macro_args(mac)
                 .map(|(callee, args, kinds, output, carries_state)| {
                     (callee, args, kinds, None, output, carries_state)
                 });
@@ -618,14 +827,13 @@ impl CallVisitor {
         let arguments: Vec<String> = rest.iter().map(|expr| Self::expr_to_string(expr)).collect();
         let argument_kinds: Vec<CallArgumentKind> = rest
             .iter()
-            .map(|expr| Self::classify_argument(expr))
+            .map(|expr| self.classify_argument(expr))
             .collect();
 
         Some((callee, arguments, argument_kinds, None, None, false))
     }
 
-    fn parse_recur_call_macro_args(
-        mac: &syn::Macro,
+    fn parse_recur_call_macro_args(&self, mac: &syn::Macro,
     ) -> Option<(String, Vec<String>, Vec<CallArgumentKind>, Option<u64>, Option<SiteOutputKind>, bool)> {
         struct RecurCallInput {
             tile: syn::Ident,
@@ -726,18 +934,18 @@ impl CallVisitor {
         // from it and `output` at the visitor.
         let carries_state = parsed.state.is_some();
         let mut arguments = vec![Self::expr_to_string(&parsed.input)];
-        let mut argument_kinds = vec![Self::classify_argument(&parsed.input)];
+        let mut argument_kinds = vec![self.classify_argument(&parsed.input)];
 
         if let Some(state) = parsed.state {
             arguments.push(Self::expr_to_string(&state));
-            argument_kinds.push(Self::classify_argument(&state));
+            argument_kinds.push(self.classify_argument(&state));
         }
 
-        let output = Self::push_site_output(parsed.output, &mut arguments, &mut argument_kinds);
+        let output = self.push_site_output(parsed.output, &mut arguments, &mut argument_kinds);
 
         for expr in parsed.args {
             arguments.push(Self::expr_to_string(&expr));
-            argument_kinds.push(Self::classify_argument(&expr));
+            argument_kinds.push(self.classify_argument(&expr));
         }
 
         Some((
@@ -750,8 +958,7 @@ impl CallVisitor {
         ))
     }
 
-    fn parse_recur_sequence_call_macro_args(
-        mac: &syn::Macro,
+    fn parse_recur_sequence_call_macro_args(&self, mac: &syn::Macro,
     ) -> Option<(String, Vec<String>, Vec<CallArgumentKind>, Option<SiteOutputKind>, bool)> {
         struct RecurSequenceCallInput {
             sequence: syn::Ident,
@@ -810,18 +1017,18 @@ impl CallVisitor {
         // from it and `output` at the visitor.
         let carries_state = parsed.state.is_some();
         let mut arguments = vec![Self::expr_to_string(&parsed.input)];
-        let mut argument_kinds = vec![Self::classify_argument(&parsed.input)];
+        let mut argument_kinds = vec![self.classify_argument(&parsed.input)];
 
         if let Some(state) = parsed.state {
             arguments.push(Self::expr_to_string(&state));
-            argument_kinds.push(Self::classify_argument(&state));
+            argument_kinds.push(self.classify_argument(&state));
         }
 
-        let output = Self::push_site_output(parsed.output, &mut arguments, &mut argument_kinds);
+        let output = self.push_site_output(parsed.output, &mut arguments, &mut argument_kinds);
 
         for expr in parsed.args {
             arguments.push(Self::expr_to_string(&expr));
-            argument_kinds.push(Self::classify_argument(&expr));
+            argument_kinds.push(self.classify_argument(&expr));
         }
 
         Some((
@@ -856,8 +1063,7 @@ impl CallVisitor {
     /// Record a site's `output` as its call argument. A created object has no
     /// expression, so it takes an inline slot — the site still records one
     /// value for it, and the CFS one source.
-    fn push_site_output(
-        output: Option<Option<Expr>>,
+    fn push_site_output(&self, output: Option<Option<Expr>>,
         arguments: &mut Vec<String>,
         argument_kinds: &mut Vec<CallArgumentKind>,
     ) -> Option<SiteOutputKind> {
@@ -869,7 +1075,7 @@ impl CallVisitor {
             }
             Some(base) => {
                 arguments.push(Self::expr_to_string(&base));
-                argument_kinds.push(Self::classify_argument(&base));
+                argument_kinds.push(self.classify_argument(&base));
                 Some(SiteOutputKind::Derive)
             }
         }
@@ -887,11 +1093,11 @@ impl CallVisitor {
         Ok(())
     }
 
-    fn classify_argument(expr: &Expr) -> CallArgumentKind {
+    fn classify_argument(&self, expr: &Expr) -> CallArgumentKind {
         match Self::expr_root_ident(expr) {
             Some(root) => CallArgumentKind::Rooted {
                 root,
-                path: Self::argument_path(expr),
+                path: self.argument_path(expr),
             },
             None => CallArgumentKind::Inline,
         }
@@ -907,18 +1113,18 @@ impl CallVisitor {
     /// A raw `x.f` or `x[0]` does not compile on a sequence binding (an
     /// `AuthRef` has no `Deref`), so it is read as passing `x` whole rather
     /// than given a path no run could record.
-    fn argument_path(expr: &Expr) -> Option<Vec<SelectorSegment>> {
+    fn argument_path(&self, expr: &Expr) -> Option<Vec<SelectorSegment>> {
         match expr {
             Expr::Macro(expr_macro) if Self::is_selection_macro(&expr_macro.mac) => {
-                Self::selection_macro_path(&expr_macro.mac)
+                self.selection_macro_path(&expr_macro.mac)
             }
             Expr::Macro(expr_macro) if Self::is_reference_macro(&expr_macro.mac) => {
-                Self::argument_path(&Self::reference_macro_arg(&expr_macro.mac)?)
+                self.argument_path(&Self::reference_macro_arg(&expr_macro.mac)?)
             }
-            Expr::Paren(paren) => Self::argument_path(&paren.expr),
-            Expr::Reference(reference) => Self::argument_path(&reference.expr),
-            Expr::Try(try_expr) => Self::argument_path(&try_expr.expr),
-            Expr::MethodCall(call) => Self::argument_path(&call.receiver),
+            Expr::Paren(paren) => self.argument_path(&paren.expr),
+            Expr::Reference(reference) => self.argument_path(&reference.expr),
+            Expr::Try(try_expr) => self.argument_path(&try_expr.expr),
+            Expr::MethodCall(call) => self.argument_path(&call.receiver),
             _ => Some(Vec::new()),
         }
     }
@@ -1118,7 +1324,7 @@ impl<'ast> Visit<'ast> for CallVisitor {
                     if let Some(root) = Self::selection_macro_root(&expr_macro.mac) {
                         self.selection_aliases.push((name.clone(), root));
                     }
-                    if let Some(path) = Self::selection_macro_path(&expr_macro.mac) {
+                    if let Some(path) = self.selection_macro_path(&expr_macro.mac) {
                         self.selection_paths.push((name.clone(), path));
                     }
                     let index_roots = Self::selection_macro_index_roots(&expr_macro.mac);
@@ -1147,8 +1353,14 @@ impl<'ast> Visit<'ast> for CallVisitor {
             }
         }
 
+        // The local's declared type, for lowering later byte-page selections:
+        // a view's is known from the expression, a call result's from the
+        // callee's signature once the call has been recorded.
+        let view_ty = node.init.as_ref().and_then(|init| self.view_type(&init.expr));
+        let calls_before = self.call_infos.len();
+
         // Set the current binding context before visiting the initializer
-        self.current_binding = binding_name;
+        self.current_binding = binding_name.clone();
 
         // Visit the initializer expression (this will trigger visit_expr_call /
         // visit_expr_macro if there's a call or macro invocation)
@@ -1158,6 +1370,19 @@ impl<'ast> Visit<'ast> for CallVisitor {
 
         // Clear the binding context after processing
         self.current_binding = None;
+
+        if let Some(name) = binding_name {
+            let call_ty = self.call_infos[calls_before..]
+                .iter()
+                .rev()
+                .find(|call| call.result_binding.as_deref() == Some(name.as_str()))
+                .and_then(|call| self.types.fn_outputs.get(&call.callee).cloned());
+            // A shadowing `let` with no known type must not keep the old one.
+            match view_ty.or(call_ty) {
+                Some(ty) => self.types.locals.insert(name, ty),
+                None => self.types.locals.remove(&name),
+            };
+        }
     }
 
     fn visit_expr_macro(&mut self, node: &'ast ExprMacro) {
@@ -1170,7 +1395,7 @@ impl<'ast> Visit<'ast> for CallVisitor {
                 output,
                 carries_state,
             )) =
-                Self::parse_call_macro_args(&node.mac)
+                self.parse_call_macro_args(&node.mac)
             {
                 let result_binding = self.current_binding.take();
                 self.call_infos.push(CallInfo {
@@ -1209,7 +1434,7 @@ impl<'ast> Visit<'ast> for CallVisitor {
                 output,
                 carries_state,
             )) =
-                Self::parse_call_macro_args(&node.mac)
+                self.parse_call_macro_args(&node.mac)
             {
                 // current_binding is None here — bare statements have no let binding.
                 self.call_infos.push(CallInfo {
@@ -1261,7 +1486,7 @@ mod tests {
 
     fn classify_return_of(code: &str) -> Option<ReturnExpr> {
         let item: syn::ItemFn = syn::parse_str(code).expect("Failed to parse test fn");
-        CallVisitor::classify_return(&item.block)
+        CallVisitor::new().classify_return(&item.block)
     }
 
     fn rooted_return(root: &str) -> Option<ReturnExpr> {
@@ -1439,6 +1664,89 @@ mod tests {
             visitor.get_selection_index_sources(),
             vec![("q".to_string(), vec!["i".to_string()])]
         );
+    }
+
+    /// A visitor reading `code` with `model: Model` in scope, `Model` holding a
+    /// `weights: Bytes<4>` region, and a tile `load` returning a `Model`.
+    fn byte_page_visitor(code: &str) -> CallVisitor {
+        let structs = vec![StructAstItem {
+            name: "Model".to_string(),
+            fields: vec![StructFieldAst {
+                name: "weights".to_string(),
+                ty: "Bytes < 4 >".to_string(),
+            }],
+        }];
+        let outputs = HashMap::from([("load".to_string(), "Model".to_string())]);
+        let types = TypeContext::for_function(
+            Rc::new(structs),
+            Rc::new(outputs),
+            [("model".to_string(), "Model".to_string())],
+        );
+        let file: syn::File = syn::parse_str(code).expect("parse");
+        let mut visitor = CallVisitor::with_types(types);
+        visitor.visit_file(&file);
+        visitor
+    }
+
+    /// `select!` reads a byte offset into a `Bytes<N>` as a page of its
+    /// `pages` list, `[weights, 4]` becoming `[weights, pages, 1]`; the CFS must
+    /// declare the path the macro records, or the guest's exact path checks
+    /// reject the honest step.
+    #[test]
+    fn byte_page_selections_lower_like_the_macro() {
+        let visitor = byte_page_visitor(
+            "fn s(model: Model) { \
+             call!(t, select!(BytesPage, model.weights[4])); \
+             call!(t, select!(Block<BytesPage>, model.clone().weights[4..12])); \
+             call!(t, clone!(select!(BytesPage, model.weights[8]))); \
+             let w = select!(Bytes<4>, model.weights); \
+             call!(t, select!(BytesPage, w[12])); \
+             let m = call!(load, model); \
+             call!(t, select!(BytesPage, m.weights[0])); \
+             call!(t, select!(BytesPage, model.weights.pages[2])); \
+             call!(t, select!(List<BytesPage>, model.weights.pages)); \
+             call!(t, select!(BytesPage, model.weights[i])); }",
+        );
+        assert!(visitor.get_selection_errors().is_empty(), "{:?}", visitor.get_selection_errors());
+        let pages = || field("pages");
+        let kinds: Vec<CallArgumentKind> = visitor
+            .get_call_infos()
+            .into_iter()
+            .filter(|call| call.callee == "t")
+            .map(|call| call.argument_kinds[0].clone())
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                rooted_at("model", Some(vec![field("weights"), pages(), SelectorSegment::Index(1)])),
+                rooted_at(
+                    "model",
+                    Some(vec![field("weights"), pages(), SelectorSegment::Range { start: 1, end: 3 }])
+                ),
+                rooted_at("model", Some(vec![field("weights"), pages(), SelectorSegment::Index(2)])),
+                // The region itself, through an alias typed by its `select!`.
+                rooted_at("w", Some(vec![pages(), SelectorSegment::Index(3)])),
+                // A tile output, typed by the tile's signature.
+                rooted_at("m", Some(vec![field("weights"), pages(), SelectorSegment::Index(0)])),
+                // Already a page index: nothing to lower.
+                rooted_at("model", Some(vec![field("weights"), pages(), SelectorSegment::Index(2)])),
+                rooted_at("model", Some(vec![field("weights"), pages()])),
+                // A data-sourced index has no static path either way.
+                rooted_at("model", None),
+            ]
+        );
+    }
+
+    /// A byte offset whose region's page size the source does not show is an
+    /// error, not a guessed path.
+    #[test]
+    fn unresolvable_byte_page_selection_is_an_error() {
+        let visitor = byte_page_visitor(
+            "fn s(other: Unknown) { call!(t, select!(BytesPage, other.weights[4])); }",
+        );
+        let errors = visitor.get_selection_errors();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains(".pages[k]"), "{errors:?}");
     }
 
     #[test]
