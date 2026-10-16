@@ -1,18 +1,18 @@
 {
   "format": 1,
-  "program_commitment": "bb7224c10c45e8533d91ff643b4ac83673b5da45b8b9bbd19407494f6a2a6b1a",
+  "program_commitment": "712add1bccdb837679c1a4a448abb265b7189ea8d2c3c56b0f7d001245309829",
   "tiles": {
     "assemble_stats": {
-      "image_id": "0b05dabbfa7154beefa198ebb913b18cc48e2247e887f504bddf7323b83e6b9e",
+      "image_id": "cf9226a6175d30b7ebfbed835ac7e114c256143361f92d4fbcbeb2490e22acc2",
       "source_hash": "ed9e55e4bce873d10000000000000853"
     },
     "fold_stats": {
-      "image_id": "0fc2c92ae86ec5a73cd78de2efa3d6335af0d9e9837e47fce914513c18ee11eb",
+      "image_id": "4503cf4766becd81be548eb1c2466a6d669e09a59752a99bbd887f75837ff74b",
       "source_hash": "ed9e55e4bce873d10000000000000853"
     }
   },
   "toolchain": {
-    "risc0": "risc0-zkvm-1.2",
+    "risc0": "risc0-zkvm-3.0.6",
     "build_mode": "local"
   }
 }

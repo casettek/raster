@@ -1,18 +1,18 @@
 {
   "format": 1,
-  "program_commitment": "eb9593b3e6a2f081aaeb484e9b16dc1d7df4de21533b0d348d69412b7ded3d35",
+  "program_commitment": "0d965fdc03de592437876a81a261c4d8582a1bffd1d778225ee2fb381aeea6a2",
   "tiles": {
     "build_report": {
-      "image_id": "34bc3e2a52e3b93c8d21be252b41202082a27d522961e76d7c2240f414ab7b76",
+      "image_id": "ec0f81048b6d892cc9561d76f00aebf13f73d1f4d0c7084189f7881f7e6e63c7",
       "source_hash": "d7d8653fcece18c10000000000000a76"
     },
     "mean_scaled": {
-      "image_id": "86c085a8a568b714c5c7f6d83c7e00dd217483fd88ea997e28a5202267b8bc70",
+      "image_id": "f27bd88f6b3b5008ae49b5f8bca1a6170a44afadffadcd0e1fd9a5d29614732a",
       "source_hash": "d7d8653fcece18c10000000000000a76"
     }
   },
   "toolchain": {
-    "risc0": "risc0-zkvm-1.2",
+    "risc0": "risc0-zkvm-3.0.6",
     "build_mode": "local"
   }
 }

@@ -977,10 +977,7 @@ fn load_recorded_chain(
         Some(p) => PathBuf::from(p),
         None => latest_chain_commitment()?,
     };
-    let chain_dir = commitment_path
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
+    let chain_dir = parent_dir(&commitment_path);
     let chain_bytes = std::fs::read(&commitment_path)
         .map_err(|e| Error::Other(format!("failed to read {}: {e}", commitment_path.display())))?;
     let chain: ChainCommitment = postcard::from_bytes(&chain_bytes)
@@ -2504,13 +2501,20 @@ fn resolve_chain(path: Option<&str>) -> Result<(ChainManifest, PathBuf)> {
         None => discover_manifest()?,
     };
 
-    let base_dir = manifest
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
+    let base_dir = parent_dir(&manifest);
     let base_dir = std::fs::canonicalize(&base_dir).unwrap_or(base_dir);
 
     Ok((load_spec(&manifest)?, base_dir))
+}
+
+/// The directory containing `path`, or `.` for a bare file name.
+/// `Path::parent` returns `Some("")` for `Raster-dynamic.toml`, not `None`, and
+/// an empty base directory left stage projects unresolvable.
+fn parent_dir(path: &Path) -> PathBuf {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => PathBuf::from("."),
+    }
 }
 
 /// Load an **unexpanded** `ChainManifest` from either a `Raster.toml`
@@ -2735,6 +2739,17 @@ fn short_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parent_dir_of_a_bare_file_name_is_the_current_directory() {
+        assert_eq!(parent_dir(Path::new("Raster-dynamic.toml")), PathBuf::from("."));
+        assert_eq!(parent_dir(Path::new("chain-commitment")), PathBuf::from("."));
+        assert_eq!(
+            parent_dir(Path::new("examples/chain-example/Raster.toml")),
+            PathBuf::from("examples/chain-example")
+        );
+        assert_eq!(parent_dir(Path::new("/tmp/Raster.toml")), PathBuf::from("/tmp"));
+    }
 
     /// A `RecordedChain` carrying nothing but the commitment — enough for the
     /// detectors that read only that, and for nothing else.
