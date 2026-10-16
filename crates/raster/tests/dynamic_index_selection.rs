@@ -290,9 +290,10 @@ struct Gathered {
     values: List<String>,
 }
 
+/// The empty base the recur sequence below derives from.
 #[tile(kind = iter)]
-fn init_gathered(output: Draft<Gathered>) -> Draft<Gathered> {
-    output
+fn init_gathered() -> Draft<Gathered> {
+    Draft::<Gathered>::new()
 }
 
 #[tile(kind = iter)]
@@ -320,7 +321,7 @@ fn gather_each(
 fn gather_all() -> Gathered {
     let wanted_source = raster::store_value(&vec![3u32, 1, 2]).expect("index list stores");
     let row_source = raster::store_value(&table().rows).expect("row list stores");
-    let output = call!(init_gathered, new!(Gathered));
+    let output = call!(init_gathered);
 
     call_recur_seq!(
         sequence = gather_each,

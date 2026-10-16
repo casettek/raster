@@ -323,6 +323,15 @@ error[E0277]: `Vec<Row>` cannot be materialized into a tile: collections are ite
 
 ## Edge cases and their rules
 
+- **A tile may return a `List`-bearing struct it drafted itself** (added 2026-10-01 by
+  `incremental-draft-materialization` batch B). `Draft::<S>::new()` inside a tile, populated with
+  `set`/`push` and returned, is completed into `S` at the tile's close. The struct is still not
+  `Materializable` — it cannot be passed *into* a tile — but its construction is bounded by the
+  **draft budget** (`DRAFT_STEP_BUDGET`, 64 KiB of draft writes per tile run per consumed source
+  element), enforced in the shared `Draft` code and therefore in the replay. That is the same
+  argument as `Block`'s: boundedness is proven by the constructor, here a pinned constant instead of
+  a literal range.
+
 - **Struct with a `List` field as a tile argument: forbidden in v1** (the derive makes
   it non-`Materializable`); authors select the scalar fields, which the cost rules
   demand anyway. Later refinement, enabled by phase 2: materialize the `List` field

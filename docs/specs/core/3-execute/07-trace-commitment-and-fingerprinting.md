@@ -94,7 +94,7 @@ For each `TraceItem` \(t_i\), the current implementation computes:
 
 Raster constructs an incremental Merkle commitment stream over the item hashes using a bridge tree:
 
-- The tree is initialized by appending a fixed **seed** (currently `EMPTY_TRIE_NODES[0]` from `raster-prover` precomputed constants) as the first leaf.
+- The tree is initialized by appending a fixed **seed** (`EMPTY_LEAF` from `raster_core::merkle`, shared by the host prover and the transition guest) as the first leaf.
 - For each `item_hash_i`, append it as a leaf, and record the current root.
 - The commitment output is therefore a vector of roots \([root_0, root_1, ..., root_{n-1}]\) where `root_i` commits to the prefix up to and including item `i`.
 

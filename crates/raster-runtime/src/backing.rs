@@ -7,6 +7,7 @@
 //! enum is what lets every reader treat "a value at a coordinate" uniformly
 //! while only one of them can touch the filesystem.
 
+use std::sync::{Arc, OnceLock};
 use std::vec::Vec;
 
 use raster_core::cfs::CfsCoordinates;
@@ -38,12 +39,197 @@ pub(crate) enum ObjectBacking {
     /// over `main`'s declared entry arguments. A selection must name which
     /// argument it wants before anything can be resolved into it.
     Referenced(ReferencedObject),
+    /// An object a recur site derived from another (`output = base`): the
+    /// base's bytes and index nodes shared by reference, plus what the sweep
+    /// appended (`incremental-draft-materialization` §How a derived object
+    /// maps onto buffers). Reads answer exactly as for the same object stored
+    /// contiguously.
+    Derived(DerivedObject),
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct OwnedObject {
     pub bytes: Vec<u8>,
-    pub raster: Option<RasterPayload>,
+    pub raster: Option<Arc<RasterObject>>,
+}
+
+/// A raster payload as storage holds it, with its index parsed once, on the
+/// first read, and shared from then on — by every read of this object and by
+/// every object derived from it.
+#[derive(Debug)]
+pub(crate) struct RasterObject {
+    pub payload: RasterPayload,
+    index: OnceLock<Arc<RasterIndex>>,
+}
+
+impl RasterObject {
+    pub(crate) fn new(payload: RasterPayload) -> Self {
+        Self {
+            payload,
+            index: OnceLock::new(),
+        }
+    }
+
+    /// An object whose index is already in hand (a seal's), so it is never
+    /// parsed from its encoded bytes.
+    pub(crate) fn with_index(payload: RasterPayload, index: RasterIndex) -> Self {
+        let object = Self::new(payload);
+        let _ = object.index.set(Arc::new(index));
+        object
+    }
+
+    pub(crate) fn index(&self) -> Result<Arc<RasterIndex>> {
+        if let Some(index) = self.index.get() {
+            return Ok(index.clone());
+        }
+        let parsed = Arc::new(RasterIndex::from_bytes(&self.payload.index_bytes)?);
+        Ok(self.index.get_or_init(|| parsed).clone())
+    }
+}
+
+/// A derived object: its logical payload as pieces, and its index layered
+/// over its base's.
+#[derive(Debug, Clone)]
+pub(crate) struct DerivedObject {
+    pub pieces: Arc<PieceTable>,
+    pub index: Arc<RasterIndex>,
+    pub root: Hash32,
+    /// The delta this object was built from, for the site close event that
+    /// carries it to the recorder. Set on the child's side.
+    pub delta: Option<Arc<raster_core::trace::DerivedPayload>>,
+}
+
+/// A logical payload assembled from pieces of other buffers, in order and
+/// without gaps. A read that stays inside one piece is a slice of it; one that
+/// spans pieces gathers them. An element never straddles the base/tail
+/// boundary, so selecting one never gathers.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PieceTable {
+    pub pieces: Vec<Piece>,
+    pub len: u64,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct Piece {
+    /// Where the piece starts in the logical payload.
+    pub start: u64,
+    pub len: u64,
+    pub source: PieceSource,
+    pub source_offset: u64,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum PieceSource {
+    /// A contiguous stored object's bytes — the first object of a chain.
+    Object(Arc<RasterObject>),
+    /// Bytes a derivation added: headers it rewrote and elements it appended.
+    Tail(Arc<Vec<u8>>),
+}
+
+impl PieceSource {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Object(object) => &object.payload.bytes,
+            Self::Tail(bytes) => bytes,
+        }
+    }
+}
+
+impl PieceTable {
+    /// Append a piece, merging it into the previous one when it continues the
+    /// same source contiguously.
+    pub(crate) fn push(&mut self, source: PieceSource, source_offset: u64, len: u64) {
+        if len == 0 {
+            return;
+        }
+        if let Some(last) = self.pieces.last_mut() {
+            let same = match (&last.source, &source) {
+                (PieceSource::Object(a), PieceSource::Object(b)) => Arc::ptr_eq(a, b),
+                (PieceSource::Tail(a), PieceSource::Tail(b)) => Arc::ptr_eq(a, b),
+                _ => false,
+            };
+            if same && last.source_offset + last.len == source_offset {
+                last.len += len;
+                self.len += len;
+                return;
+            }
+        }
+        self.pieces.push(Piece {
+            start: self.len,
+            len,
+            source,
+            source_offset,
+        });
+        self.len += len;
+    }
+
+    /// The pieces covering logical `[offset, offset + len)`, each as its
+    /// source and range — what a derivation of a derivation copies, so a
+    /// chain's pieces always point at original buffers.
+    pub(crate) fn ranges(&self, offset: u64, len: u64) -> Result<Vec<(PieceSource, u64, u64)>> {
+        let end = offset
+            .checked_add(len)
+            .filter(|end| *end <= self.len)
+            .ok_or_else(|| Error::Serialization("Raster subtree points outside the object".into()))?;
+        let mut out = Vec::new();
+        let first = self
+            .pieces
+            .partition_point(|piece| piece.start + piece.len <= offset);
+        let mut cursor = offset;
+        for piece in &self.pieces[first..] {
+            if cursor >= end {
+                break;
+            }
+            let within = cursor - piece.start;
+            let take = (piece.len - within).min(end - cursor);
+            out.push((piece.source.clone(), piece.source_offset + within, take));
+            cursor += take;
+        }
+        Ok(out)
+    }
+}
+
+impl RasterData for PieceTable {
+    fn read_subtree(&self, offset: u64, len: u64) -> Result<Vec<u8>> {
+        let mut out = Vec::with_capacity(len as usize);
+        for (source, from, take) in self.ranges(offset, len)? {
+            out.extend_from_slice(&source.bytes()[from as usize..(from + take) as usize]);
+        }
+        Ok(out)
+    }
+}
+
+/// An object's bytes as a read sees them.
+#[derive(Debug, Clone)]
+pub(crate) enum ObjectBytes {
+    Contiguous(Arc<RasterObject>),
+    Pieces(Arc<PieceTable>),
+}
+
+impl RasterData for ObjectBytes {
+    fn read_subtree(&self, offset: u64, len: u64) -> Result<Vec<u8>> {
+        match self {
+            Self::Contiguous(object) => object.payload.bytes.read_subtree(offset, len),
+            Self::Pieces(pieces) => pieces.read_subtree(offset, len),
+        }
+    }
+}
+
+impl ObjectBytes {
+    pub(crate) fn len(&self) -> u64 {
+        match self {
+            Self::Contiguous(object) => object.payload.bytes.len() as u64,
+            Self::Pieces(pieces) => pieces.len,
+        }
+    }
+}
+
+/// A program-written object as a raster read sees it: its index, its bytes
+/// and its root — one shape for a contiguous object and a derived one.
+pub(crate) struct RasterView {
+    pub index: Arc<RasterIndex>,
+    pub bytes: ObjectBytes,
+    pub root: Hash32,
 }
 
 #[derive(Debug, Clone)]
@@ -298,14 +484,14 @@ impl ReferencedObject {
                     )));
                 }
                 let proven = prove_selection(&schema(), &tree, &remaining.segments)?;
-                SelectionWitness {
-                    bytes: proven.selected_bytes.clone(),
-                    proof: SelectionProof {
+                SelectionWitness::from_payload(
+                    proven.selected_bytes.clone(),
+                    SelectionProof {
                         path: remaining.clone(),
                         root_hash: proven.root_hash,
                         steps: proven.steps.clone(),
                     },
-                }
+                )
             }
             _ => {
                 return Err(Error::Other(format!(
@@ -321,9 +507,9 @@ impl ReferencedObject {
         // with its siblings into the combined root) must be the *first*
         // element, not appended after the source's own (more inner) steps.
         steps.insert(0, self.struct_step(&source.name)?);
-        Ok(SelectionWitness {
-            bytes: inner.bytes,
-            proof: SelectionProof {
+        Ok(SelectionWitness::from_payload(
+            inner.bytes,
+            SelectionProof {
                 path: full_selector_path(&source.name, &remaining),
                 root_hash: self
                     .combined_root()
@@ -331,7 +517,7 @@ impl ReferencedObject {
                     .map_err(|_| Error::Other("Combined root is not 32 bytes".into()))?,
                 steps,
             },
-        })
+        ))
     }
 
     /// A recur source's `(len, elements_root)` from an external input, without
@@ -354,7 +540,7 @@ impl ReferencedObject {
             (&source.kind, &resolved)
         else {
             return Err(Error::Other(format!(
-                "call_recur! requires a raster-indexed List source; \
+                "a recur source must be a raster-indexed List (call_recur! or call_recur_seq!); \
                  re-encode this input with encoding = \"raster\" (input '{}')",
                 source.name
             )));
@@ -390,9 +576,16 @@ fn parse_bytes_type_page_size(type_name: &str) -> Option<u64> {
         .ok()
 }
 
-fn read_u64_leaf(index: &RasterIndex, data: &impl RasterData, node_id: u64) -> Result<u64> {
+/// `position` is the leaf's data-file position (index offsets are
+/// parent-relative, `rindex04`).
+fn read_u64_leaf(
+    index: &RasterIndex,
+    data: &impl RasterData,
+    node_id: u64,
+    position: u64,
+) -> Result<u64> {
     let node = index.get_node(node_id)?;
-    let subtree = data.read_subtree(node.offset, node.len)?;
+    let subtree = data.read_subtree(position, node.len)?;
     if subtree.first().copied() != Some(0x00) || subtree.len() < 17 {
         return Err(Error::Other("expected a u64 leaf payload".into()));
     }
@@ -419,12 +612,13 @@ fn check_schema_page_sizes(
     index: &RasterIndex,
     data: &impl RasterData,
 ) -> Result<()> {
-    walk_schema_page_sizes(schema, index.root_node, index, data)
+    walk_schema_page_sizes(schema, index.root_node, index.root_position()?, index, data)
 }
 
 fn walk_schema_page_sizes(
     schema: &SchemaNode,
     node_id: u64,
+    position: u64,
     index: &RasterIndex,
     data: &impl RasterData,
 ) -> Result<()> {
@@ -444,7 +638,12 @@ fn walk_schema_page_sizes(
                     .find(|field| field.name == "page_size")
                     .map(|field| field.child)
                     .ok_or_else(|| Error::Other("Bytes artifact is missing page_size".into()))?;
-                let artifact = read_u64_leaf(index, data, page_size_id)?;
+                let artifact = read_u64_leaf(
+                    index,
+                    data,
+                    page_size_id,
+                    index.child_position(position, page_size_id)?,
+                )?;
                 if artifact != declared {
                     return Err(Error::PageSizeMismatch { declared, artifact });
                 }
@@ -458,10 +657,14 @@ fn walk_schema_page_sizes(
                         .find(|field| field.name == "pages")
                         .map(|field| field.child),
                 ) {
-                    let byte_len = read_u64_leaf(index, data, byte_len_id)?;
-                    let pages = index.get_node(pages_id)?;
-                    if let crate::raster_index::RasterNodeKind::List { len, .. } = &pages.kind {
-                        raster_core::check_page_partition(byte_len, declared, *len)?;
+                    let byte_len = read_u64_leaf(
+                        index,
+                        data,
+                        byte_len_id,
+                        index.child_position(position, byte_len_id)?,
+                    )?;
+                    if let Some(len) = index.list_len(pages_id)? {
+                        raster_core::check_page_partition(byte_len, declared, len)?;
                     }
                 }
             }
@@ -470,7 +673,13 @@ fn walk_schema_page_sizes(
             {
                 for field in fields {
                     if let Some(child) = idx_fields.iter().find(|f| f.name == field.name) {
-                        walk_schema_page_sizes(&field.schema, child.child, index, data)?;
+                        walk_schema_page_sizes(
+                            &field.schema,
+                            child.child,
+                            index.child_position(position, child.child)?,
+                            index,
+                            data,
+                        )?;
                     }
                 }
             }
@@ -480,11 +689,15 @@ fn walk_schema_page_sizes(
             if !schema_mentions_bytes(element) {
                 return Ok(());
             }
-            let node = index.get_node(node_id)?;
-            if let crate::raster_index::RasterNodeKind::List { elements, .. } = &node.kind {
-                if let Some(first) = elements.first() {
-                    walk_schema_page_sizes(element, *first, index, data)?;
-                }
+            if index.list_len(node_id)?.unwrap_or(0) > 0 {
+                let first = index.list_element(node_id, 0)?;
+                walk_schema_page_sizes(
+                    element,
+                    first,
+                    index.child_position(position, first)?,
+                    index,
+                    data,
+                )?;
             }
             Ok(())
         }
@@ -510,22 +723,11 @@ impl OwnedObject {
         coordinates: &CfsCoordinates,
     ) -> Result<(Vec<u8>, SelectionCommitment, T)> {
         if let Some(raster) = self.raster.as_ref() {
-            let index = RasterIndex::from_bytes(&raster.index_bytes)?;
-            let location = index.root_location()?;
-            let tree = tree_value_from_raster_location(&index, &raster.bytes, &location)?;
-            let value = typed_value_from_tree(&tree)?;
-            Ok((
-                raster.bytes.clone(),
-                SelectionCommitment {
-                    path: SelectorPath::default(),
-                    source_root_hash: raster.root_hash,
-                    selected_hash: raster_core::input::selection_payload_hash(&raster.bytes),
-                    selected_len: raster.bytes.len() as u64,
-                    payload_kind: SelectionPayloadKind::Raw,
-                },
-                value,
-            ))
-        } else {
+            resolve_whole_view(&RasterView {
+                index: raster.index()?,
+                bytes: ObjectBytes::Contiguous(raster.clone()),
+                root: raster.payload.root_hash,
+            })        } else {
             let value = raster_core::postcard::from_bytes(&self.bytes).map_err(|e| {
                 Error::Serialization(format!(
                     "Failed to deserialize storage object at coordinates {:?}: {}",
@@ -545,6 +747,28 @@ impl OwnedObject {
             ))
         }
     }
+}
+
+/// Whole-value resolve of a raster object: the root location, decoded.
+pub(crate) fn resolve_whole_view<T: DeserializeOwned>(
+    view: &RasterView,
+) -> Result<(Vec<u8>, SelectionCommitment, T)> {
+    let location = view.index.root_location()?;
+    let bytes = view.bytes.read_subtree(0, view.bytes.len())?;
+    let tree = tree_value_from_raster_location(&view.index, &view.bytes, &location)?;
+    let value = typed_value_from_tree(&tree)?;
+    Ok((
+        SelectionCommitment {
+            path: SelectorPath::default(),
+            source_root_hash: view.root,
+            selected_hash: raster_core::input::selection_payload_hash(&bytes),
+            selected_len: bytes.len() as u64,
+            payload_kind: SelectionPayloadKind::Raw,
+        },
+        bytes,
+        value,
+    ))
+    .map(|(commitment, bytes, value)| (bytes, commitment, value))
 }
 
 #[cfg(test)]
@@ -773,8 +997,10 @@ mod tests {
             .find(|f| f.name == field)
             .unwrap()
             .child;
-        let leaf = index.get_node(child).unwrap();
-        let start = leaf.offset as usize + 9;
+        let position = index
+            .child_position(index.root_position().unwrap(), child)
+            .unwrap();
+        let start = position as usize + 9;
         data[start..start + 8].copy_from_slice(&value.to_le_bytes());
     }
 

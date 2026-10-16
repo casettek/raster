@@ -96,7 +96,7 @@ fn main(readings: Measurements, threshold: u64) -> Filtered {
     let filtered = call_recur!(
         tile = keep_above,
         input = samples,
-        output = new!(Filtered),
+        output,
         args = (label, threshold)
     );
 
@@ -329,7 +329,7 @@ let output = call_recur!(
     tile = process_record_chunk,
     input = records,
     chunk = 64,
-    output = new!(FinalOutput),
+    output,
     args = ()
 );
 ```

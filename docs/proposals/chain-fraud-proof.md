@@ -349,6 +349,18 @@ single fault; multi-fault / DAG is future work.
   margin is the scheme's existing one — matching the committed fingerprint bits across
   the pre-divergence window (`FRAUD_DETECTION_SECURITY_BITS` = 128 revealed bits per
   window) under deterministic execution — unchanged by this proposal.
+
+  ⚠️ **Amended 2026-09-16 by [`trace-end-windows`](./trace-end-windows.md) and
+  [`trace-leaf-field-binding`](./trace-leaf-field-binding.md).** Two things this
+  paragraph assumed were not true when it was written. The margin was not the only
+  thing a window needed: the *shape* of a window was unbound (`window_len` and
+  `window_start` were challenger-supplied, and a two-item window has no matching
+  comparisons at all), and step records carried fields — `exec_index`, `sequence_id` —
+  that reached the trace leaf with nothing verifying them, so the *diverging* item could
+  be forged outright however wide the margin was. Both are fixed; the shape is now bound
+  to a `window_size` carried in the header. And the margin is no longer universal: a
+  window opening at trace index 0 cannot have one, and asserts the genesis opening state
+  instead, which is what makes the head of a trace provable.
 - **Image ids are threaded, never assumed** — see "image-id pinning" in §3. Every
   `env::verify` id in the design is either pinned by the relying party or committed to
   the journal that party checks.

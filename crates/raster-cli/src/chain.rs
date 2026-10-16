@@ -39,7 +39,7 @@ use raster_core::transition::TransitionJournal;
 use raster_core::{Error, Result};
 use raster_prover::authorization::{authorization_guest_image_id, authorize_external_inputs};
 use raster_prover::chain_fraud::{prove_chain_fraud, verify_chain_fraud_receipt};
-use raster_prover::precomputed::EMPTY_TRIE_NODES;
+use raster_core::merkle::EMPTY_LEAF;
 use raster_prover::replay::Replayer;
 use raster_prover::trace::{
     FraudProofConfig, TraceCommitment, TraceCommitmentExt, TraceVerifier,
@@ -568,7 +568,7 @@ pub fn run(
         // stage somebody contests. See `docs/proposals/chain-io-commitment.md`.
         if let Some((trace, _recorder)) = replay {
             let trace_commitment =
-                TraceCommitment::try_build(&trace, &EMPTY_TRIE_NODES[0], fraud_proof_config)
+                TraceCommitment::try_build(&trace, &EMPTY_LEAF, fraud_proof_config)
                     .map_err(|e| Error::Other(e.to_string()))?;
             let commit_path = stage_dir.join("commit.bin");
             std::fs::write(
@@ -977,10 +977,7 @@ fn load_recorded_chain(
         Some(p) => PathBuf::from(p),
         None => latest_chain_commitment()?,
     };
-    let chain_dir = commitment_path
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
+    let chain_dir = parent_dir(&commitment_path);
     let chain_bytes = std::fs::read(&commitment_path)
         .map_err(|e| Error::Other(format!("failed to read {}: {e}", commitment_path.display())))?;
     let chain: ChainCommitment = postcard::from_bytes(&chain_bytes)
@@ -1316,9 +1313,9 @@ fn prove_terminal_window(
     let (trace, recorder) = replay.expect("an authenticated stage run produces a trace");
 
     let trace_commitment =
-        TraceCommitment::try_build(&trace, &EMPTY_TRIE_NODES[0], fraud_proof_config)
+        TraceCommitment::try_build(&trace, &EMPTY_LEAF, fraud_proof_config)
             .map_err(|e| Error::Other(e.to_string()))?;
-    let mut verifier = TraceVerifier::new(trace_commitment.clone(), &EMPTY_TRIE_NODES[0], &cfs)
+    let mut verifier = TraceVerifier::new(trace_commitment.clone(), &EMPTY_LEAF, &cfs)
         .map_err(|e| Error::Other(e.to_string()))?;
     let window = verifier
         .terminal_window(&trace)
@@ -1327,7 +1324,7 @@ fn prove_terminal_window(
     let backend = raster_backend_risc0::Risc0Backend::new(project.output_dir.clone())
         .with_user_crate(project.root_dir.clone());
     let replayer = Replayer::new(&backend, &project);
-    Ok(crate::commands::run::prove(
+    Ok(crate::commands::prove::prove(
         window,
         &trace,
         &cfs,
@@ -2504,13 +2501,20 @@ fn resolve_chain(path: Option<&str>) -> Result<(ChainManifest, PathBuf)> {
         None => discover_manifest()?,
     };
 
-    let base_dir = manifest
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
+    let base_dir = parent_dir(&manifest);
     let base_dir = std::fs::canonicalize(&base_dir).unwrap_or(base_dir);
 
     Ok((load_spec(&manifest)?, base_dir))
+}
+
+/// The directory containing `path`, or `.` for a bare file name.
+/// `Path::parent` returns `Some("")` for `Raster-dynamic.toml`, not `None`, and
+/// an empty base directory left stage projects unresolvable.
+fn parent_dir(path: &Path) -> PathBuf {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => PathBuf::from("."),
+    }
 }
 
 /// Load an **unexpanded** `ChainManifest` from either a `Raster.toml`
@@ -2735,6 +2739,17 @@ fn short_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parent_dir_of_a_bare_file_name_is_the_current_directory() {
+        assert_eq!(parent_dir(Path::new("Raster-dynamic.toml")), PathBuf::from("."));
+        assert_eq!(parent_dir(Path::new("chain-commitment")), PathBuf::from("."));
+        assert_eq!(
+            parent_dir(Path::new("examples/chain-example/Raster.toml")),
+            PathBuf::from("examples/chain-example")
+        );
+        assert_eq!(parent_dir(Path::new("/tmp/Raster.toml")), PathBuf::from("/tmp"));
+    }
 
     /// A `RecordedChain` carrying nothing but the commitment — enough for the
     /// detectors that read only that, and for nothing else.

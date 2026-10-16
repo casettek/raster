@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use raster_core::collections::bytes_schema;
 use raster_core::draft::schema_hash;
-use raster_core::input::{SchemaField, SchemaNode, Selectable};
+use raster_core::input::{SchemaField, SchemaNode, Selectable, SelectorSegment};
 use raster_core::program::ProgramManifest;
 use raster_core::{Error, Result};
 use syn::{GenericArgument, Item, PathArguments, Type};
@@ -20,6 +20,97 @@ pub fn schema_of_type(type_path: &str, structs: &[StructAstItem]) -> Result<Sche
         .map(|item| (item.name.as_str(), item))
         .collect();
     resolve_ast_type(&parse_ast_type(type_path)?, &by_name)
+}
+
+/// The page size of the `Bytes<N>` that `path` reaches from a value of type
+/// `type_path`, following named fields through `structs`. `None` when the walk
+/// leaves what the source declares: an unknown struct or field, a selector
+/// segment that is not a field, index or range, or an end that is not `Bytes`.
+///
+/// This is the same `N` the `select!` macro divides a literal byte offset by
+/// (`page_index_for_field` / `page_index_for_region`), read from the source
+/// instead of from rustc's types.
+pub(crate) fn bytes_page_size_at(
+    type_path: &str,
+    path: &[SelectorSegment],
+    structs: &[StructAstItem],
+) -> Option<u64> {
+    let mut ty: Type = syn::parse_str(type_path).ok()?;
+    for segment in path {
+        ty = match segment {
+            SelectorSegment::Field(name) => {
+                let struct_name = type_head(peel_views(&ty))?;
+                let item = structs.iter().find(|item| item.name == struct_name)?;
+                let field = item.fields.iter().find(|field| field.name == *name)?;
+                syn::parse_str(&field.ty).ok()?
+            }
+            // An element of a `List<T>` / `Block<T>` is a `T`.
+            SelectorSegment::Index(_) => {
+                let inner = peel_views(&ty);
+                match type_head(inner)?.as_str() {
+                    "List" | "Block" => first_syn_type_arg(inner)?.clone(),
+                    _ => return None,
+                }
+            }
+            // A range of a list is still a list of the same elements.
+            SelectorSegment::Range { .. } => ty,
+            _ => return None,
+        };
+    }
+    let ty = peel_views(&ty);
+    if type_head(ty)? != "Bytes" {
+        return None;
+    }
+    let Type::Path(type_path) = ty else {
+        return None;
+    };
+    const_u64_arg(&type_path.path.segments.last()?.arguments).ok()
+}
+
+/// Look through the wrappers a binding's declared type can carry around the
+/// stored value: `AuthRef<T>`, `Result<T>`, a recur handle, a draft.
+fn peel_views(ty: &Type) -> &Type {
+    const VIEWS: [&str; 8] = [
+        "AuthRef",
+        "Result",
+        "Draft",
+        "Box",
+        "RecurInput",
+        "RecurOutput",
+        "RecurSequenceInput",
+        "RecurSequenceOutput",
+    ];
+    match type_head(ty) {
+        Some(head) if VIEWS.contains(&head.as_str()) => match first_syn_type_arg(ty) {
+            Some(inner) => peel_views(inner),
+            None => ty,
+        },
+        _ => ty,
+    }
+}
+
+/// The last path segment's name: `Model` for `crate::input::Model`.
+fn type_head(ty: &Type) -> Option<String> {
+    match ty {
+        Type::Path(type_path) => Some(type_path.path.segments.last()?.ident.to_string()),
+        Type::Reference(reference) => type_head(&reference.elem),
+        Type::Paren(paren) => type_head(&paren.elem),
+        _ => None,
+    }
+}
+
+/// The first type argument of the last path segment: `T` in `List<T>`.
+fn first_syn_type_arg(ty: &Type) -> Option<&Type> {
+    let Type::Path(type_path) = ty else {
+        return None;
+    };
+    let PathArguments::AngleBracketed(args) = &type_path.path.segments.last()?.arguments else {
+        return None;
+    };
+    args.args.iter().find_map(|arg| match arg {
+        GenericArgument::Type(ty) => Some(ty),
+        _ => None,
+    })
 }
 
 /// Fill every `InterfaceDecl.schema_hash` from the project's AST.
@@ -223,6 +314,33 @@ mod tests {
     /// each entry needs a test pinning it against the real one. This is the
     /// argument for deleting the walk rather than growing it — see
     /// `paged-bytes.md` §12.4.
+    /// The page size is read through struct fields, list elements and the
+    /// wrappers a binding's type carries.
+    #[test]
+    fn bytes_page_size_is_read_through_the_selected_path() {
+        let structs = vec![
+            StructAstItem {
+                name: "Layer".into(),
+                fields: vec![StructFieldAst { name: "weights".into(), ty: "Bytes < 196_608 >".into() }],
+            },
+            StructAstItem {
+                name: "Model".into(),
+                fields: vec![
+                    StructFieldAst { name: "layers".into(), ty: "List < Layer >".into() },
+                    StructFieldAst { name: "name".into(), ty: "String".into() },
+                ],
+            },
+        ];
+        let field = |name: &str| SelectorSegment::Field(name.into());
+        let path = [field("layers"), SelectorSegment::Index(2), field("weights")];
+        assert_eq!(bytes_page_size_at("Model", &path, &structs), Some(196_608));
+        assert_eq!(bytes_page_size_at("AuthRef<Model>", &path, &structs), Some(196_608));
+        assert_eq!(bytes_page_size_at("Bytes<4>", &[], &structs), Some(4));
+        assert_eq!(bytes_page_size_at("Model", &[field("name")], &structs), None);
+        assert_eq!(bytes_page_size_at("Model", &[field("missing")], &structs), None);
+        assert_eq!(bytes_page_size_at("Unknown", &[field("weights")], &structs), None);
+    }
+
     #[test]
     fn bytes_page_type_matches_selectable_hash() {
         let schema = schema_of_type("BytesPage", &[]).unwrap();

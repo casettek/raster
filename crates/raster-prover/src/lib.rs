@@ -13,9 +13,9 @@
 include!(concat!(env!("OUT_DIR"), "/methods.rs"));
 
 pub mod authorization;
+pub mod availability;
 pub mod chain_fraud;
 pub mod error;
-pub mod precomputed;
 pub mod replay;
 pub mod trace;
 pub mod transition;

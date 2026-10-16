@@ -11,6 +11,8 @@ mod entry_arguments;
 pub mod input;
 pub mod profiling;
 pub mod tile_census;
+mod draft_buffer;
+mod raster_encode;
 mod raster_index;
 pub mod reader;
 mod source;
@@ -37,16 +39,18 @@ pub use profiling::{
     TileProfileRecord, PROFILE_PATH_ENV, PROFILE_RUN_ID_ENV, PROFILE_STREAM_PATH_ENV,
 };
 pub use storage::{
-    apply_draft_push, apply_draft_set, begin_draft_step_capture, create_draft,
+    apply_draft_push, apply_draft_set, begin_draft_step_capture, create_site_draft, derive_site_draft, derive_site_draft_from,
+    in_tile_execution,
     enter_recur_sequence_iteration_scope, enter_recur_site_scope, enter_sequence_scope,
     exit_recur_sequence_iteration_scope, exit_recur_site_scope, exit_sequence_scope,
     finalize_draft, finalize_draft_value, finalize_empty_draft, finish_draft_step_capture,
-    global_storage_snapshot,
     publish_pending_output_coordinates, resolve_storage_ok_value, resolve_storage_value,
+    stored_object_output,
     select_stored_value, stash_pending_output_encoding, stash_recur_item_binding,
     store_execution_output_value, store_value, stored_list_metadata, take_recur_item_binding,
     PendingRecurItemBinding,
-    DraftCaptureSnapshot, StorageManager, StorageSnapshot, StorageWriteRecord, StoredObject,
+    AuthenticatedObjectStore, DraftCaptureSnapshot, ObjectStore, StorageSnapshot,
+    StorageWriteRecord, StoredObject,
     TileExecutionScopeGuard,
 };
 pub use tracing::{

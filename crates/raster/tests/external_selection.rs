@@ -275,7 +275,7 @@ fn nested_auth_ref_selection_matches_direct_internal_selection_trace() {
     let root_hash = [1; 32];
     let whole = StorageValue::new_with_selection(
         StorageRef::new(
-            raster::core::cfs::CfsCoordinates(vec![0]),
+            raster::core::cfs::CfsCoordinates(vec![1]),
             root_hash.to_vec(),
         ),
         postcard::to_allocvec(&personal).unwrap(),
@@ -363,7 +363,7 @@ fn infallible_call_binding_uses_tile_output_commitment() {
 
     assert_eq!(
         reference.coordinates,
-        raster::core::cfs::CfsCoordinates(vec![0])
+        raster::core::cfs::CfsCoordinates(vec![1])
     );
     assert_eq!(
         reference.commitment,
@@ -401,7 +401,7 @@ fn fallible_call_binding_resolves_ok_payload_from_stored_result() {
     assert_eq!(decoded, Ok("Raster".to_string()));
     assert_eq!(
         reference.coordinates,
-        raster::core::cfs::CfsCoordinates(vec![0])
+        raster::core::cfs::CfsCoordinates(vec![1])
     );
     assert_eq!(
         reference.commitment,

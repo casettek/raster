@@ -1,6 +1,6 @@
 # Proposal: `paged-bytes` — `Bytes`/`BytesPage`, byte data that is addressed, never materialized
 
-Status: implemented 2026-08-14 (revision 3), **with defects — see §12**. Gate 2 (chunked-sweep `ListRange` cross-check) and Gate 3 (selection↔replay bind) remain open, as do `BoundRange`, a framework `page_of` tile, lazy-list-recur rule 8, and window-seed-reconstruction.
+Status: implemented 2026-08-14 (revision 3), **with defects — see §12**. Gate 2 (chunked-sweep `ListRange` cross-check) and Gate 3 (selection↔replay bind) remain open, as do `BoundRange`, a framework `page_of` tile, lazy-list-recur rule 8, and window-seed-reconstruction. Gates 2 and 3 — which are lazy-list-recur rule 8 and §3.3, the same two things named twice — are tracked from 2026-09-16 by [`selection-unbound-from-execution`](../issues/selection-unbound-from-execution.md), **top priority**.
 
 Related:
 - [`bounded-collections.md`](./bounded-collections.md) — this is the same `List`/`Block`
@@ -556,6 +556,14 @@ guests commit the structural root of each decoded input and output in `TileRepla
 and the transition audit requires every storage-bound input root to equal its verified
 selection root. It may ship as a companion PR, but `Bytes` must not be described as
 end-to-end authorization-sound until it lands.
+
+Neither this gate nor Gate 2 shipped. Both are tracked as of 2026-09-16 by
+[`selection-unbound-from-execution`](../issues/selection-unbound-from-execution.md), **top
+priority**, which states them as one joint: Gate 2 anchors *where* a chunked iteration read, this
+gate anchors *what* it ran on, and a prover defeats the sweep with whichever one is missing. The
+sketch above is carried there as one direction among four, not as the answer — it moves every
+tile image id, therefore every `program_commitment`, which is the cost that has to be argued
+rather than assumed.
 
 ## 4. Modules touched
 

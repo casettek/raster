@@ -165,7 +165,7 @@ fn build_lines_reference() -> StorageRef {
     call_recur!(
         tile = collect_lines,
         input = storage!(List<String>, source),
-        output = new!(LineBundle),
+        output,
         args = ()
     )
     .reference()
@@ -193,7 +193,7 @@ fn long_lines_reference() -> StorageRef {
     call_recur!(
         tile = collect_lines,
         input = storage!(List<String>, source),
-        output = new!(LineBundle),
+        output,
         args = ()
     )
     .reference()
@@ -216,7 +216,7 @@ fn find_first_match(needle: String) -> SearchBundle {
     call_recur!(
         tile = collect_first_match,
         input = storage!(List<String>, source),
-        output = new!(SearchBundle),
+        output,
         args = (needle,)
     )
 }
@@ -228,7 +228,7 @@ fn collect_optional_lines_from_empty() -> UnitLineBundle {
     call_recur!(
         tile = collect_optional_lines,
         input = storage!(List<String>, source),
-        output = new!(UnitLineBundle),
+        output,
         args = ()
     )
 }
@@ -240,7 +240,7 @@ fn collect_required_lines_from_empty() -> LineBundle {
     call_recur!(
         tile = collect_lines,
         input = storage!(List<String>, source),
-        output = new!(LineBundle),
+        output,
         args = ()
     )
 }
@@ -320,9 +320,11 @@ fn prefix_line(line: String, prefix: String) -> String {
     format!("{}{}", prefix, line)
 }
 
+/// The base the recur sequence below derives from: drafted in this tile and
+/// stored at its coordinate.
 #[tile]
-fn init_prefixed_bundle(output: Draft<LineBundle>) -> Draft<LineBundle> {
-    let mut output = output;
+fn init_prefixed_bundle() -> Draft<LineBundle> {
+    let mut output = Draft::<LineBundle>::new();
     output.title().set("prefixed".to_string());
     output
 }
@@ -357,7 +359,7 @@ fn collect_two_items(limit: u64) -> LimitedBundle {
         tile = collect_until_limit,
         input = storage!(List<String>, source),
         state = LimitState { seen: 0 },
-        output = new!(LimitedBundle),
+        output,
         args = (limit,)
     )
 }
@@ -438,7 +440,7 @@ fn build_prefixed_lines_with_recur_sequence() -> LineBundle {
     let prefix_source =
         raster::store_value(&"line: ".to_string()).expect("prefix source should store");
 
-    let output = call!(init_prefixed_bundle, new!(LineBundle));
+    let output = call!(init_prefixed_bundle);
 
     call_recur_seq!(
         sequence = collect_prefixed_lines,
@@ -624,9 +626,10 @@ fn call_recur_never_materializes_its_source() {
     >(reference, resolve_counted_string_list));
 
     RECUR_TILE_RESOLVE_COUNT.store(0, Ordering::SeqCst);
+    let _site = raster::__private::RecurSiteScopeGuard::enter();
     let auth = raster::run_recur_list::<String, LineBundle, _, _>(
         source,
-        new!(LineBundle),
+        raster::open_site_draft::<LineBundle>(raster::SiteOutput::Create),
         |input, output| collect_lines(input, output),
     );
     let result = into_auth_value::<LineBundle, _>(auth).unwrap().into_inner();
@@ -667,9 +670,10 @@ fn recur_sequence_never_materializes_its_source() {
     // the *source* resolutions a full sweep costs — not just the ones an
     // untouched `AuthRef` would defer.
     let mut items = 0usize;
+    let _site = raster::__private::RecurSiteScopeGuard::enter();
     let _auth = raster::run_recur_sequence_list::<String, ItemsOnlyBundle, _, _>(
         source,
-        new!(ItemsOnlyBundle),
+        raster::open_site_draft::<ItemsOnlyBundle>(raster::SiteOutput::Create),
         |input, output| {
             input
                 .__raster_auth_trace()
@@ -857,24 +861,29 @@ fn recur_iterations_record_the_item_binding_they_ran_on() {
 #[test]
 fn recur_trace_emits_site_completion_event() {
     let (_reference, events) = capture_trace_events(run_build_lines_reference);
-    let site_events: Vec<_> = events
-        .into_iter()
+    let starts: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            TraceEvent::RecurTileStart(record) if record.fn_name == "collect_lines" => Some(record),
+            _ => None,
+        })
+        .collect();
+    let ends: Vec<_> = events
+        .iter()
         .filter_map(|event| match event {
             TraceEvent::RecurTileEnd(record) if record.fn_name == "collect_lines" => Some(record),
             _ => None,
         })
         .collect();
 
-    assert_eq!(site_events.len(), 1);
-    let site_event = &site_events[0];
-    assert!(
-        site_event.input.is_some(),
-        "recur site should capture input trace"
-    );
-    assert!(
-        site_event.output.is_some(),
-        "recur site should capture finalized output"
-    );
+    assert_eq!(starts.len(), 1);
+    assert_eq!(ends.len(), 1);
+    // The site's inputs are bound once, at its start; the end carries only the
+    // finalized output (`incremental-draft-materialization` §A recur site gets
+    // its own step kinds — the close used to re-publish the inputs).
+    assert!(starts[0].input.is_some(), "recur site start should capture input trace");
+    assert!(ends[0].input.is_none(), "recur site end must not re-bind the inputs");
+    assert!(ends[0].output.is_some(), "recur site should capture finalized output");
 }
 
 #[test]
@@ -1026,4 +1035,413 @@ fn recur_tile_reports_break_and_continue_distinctly() {
         broke.recur.expect("recur facts").control,
         raster::core::draft::RecurControlKind::Break,
     );
+}
+
+// ---------------------------------------------------------------------------
+// Stateful recur sequences
+//
+// The shape `raster-inference` organises every outer loop with — a recur
+// sequence carrying state, with tiles nested inside it — and the shape nothing
+// in this repo covered. Its site under-recorded its arguments, so the
+// transition guest rejected it on arity before any of this could be checked.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize, Selectable)]
+struct WordCursor {
+    seen: u64,
+    total_len: u64,
+}
+
+#[tile]
+fn advance_word_cursor(state: WordCursor, word: String) -> WordCursor {
+    let mut state = state;
+    state.seen += 1;
+    state.total_len += word.len() as u64;
+    state
+}
+
+#[sequence(kind = recur)]
+fn scan_words(
+    input: RecurSequenceInput<String>,
+    state: RecurSequenceState<WordCursor>,
+    marker: String,
+) -> RecurSequenceState<WordCursor> {
+    let word = call!(prefix_line, input, marker);
+    call!(advance_word_cursor, state, word)
+}
+
+#[sequence]
+fn scan_all_words() -> WordCursor {
+    let source = raster::store_value(&vec![
+        "alpha".to_string(),
+        "beta".to_string(),
+        "gamma".to_string(),
+    ])
+    .expect("list source should store");
+    let marker = raster::store_value(&">".to_string()).expect("marker should store");
+
+    let seed = call!(begin_word_cursor);
+
+    call_recur_seq!(
+        sequence = scan_words,
+        input = storage!(List<String>, source),
+        state = seed,
+        args = (storage!(String, marker),)
+    )
+}
+
+#[tile]
+fn begin_word_cursor() -> WordCursor {
+    WordCursor {
+        seen: 0,
+        total_len: 0,
+    }
+}
+
+fn run_scan_all_words() -> WordCursor {
+    materialize_auth_return::<WordCursor, _>(__raster_sequence_auth_scan_all_words())
+}
+
+#[test]
+fn a_stateful_recur_sequence_threads_its_state() {
+    let cursor = run_scan_all_words();
+    // ">" prefixed onto each of alpha/beta/gamma: 6 + 5 + 6.
+    assert_eq!(cursor.seen, 3);
+    assert_eq!(cursor.total_len, 17);
+}
+
+#[test]
+fn a_stateful_recur_sequence_site_records_every_declared_source() {
+    let (_, events) = capture_trace_events(run_scan_all_words);
+
+    let site_input = events
+        .iter()
+        .find_map(|event| match event {
+            TraceEvent::RecurSequenceStart(record) if record.fn_name == "scan_words" => {
+                record.input.clone()
+            }
+            _ => None,
+        })
+        .expect("the recur sequence site publishes a Start with its input");
+
+    // input, state, args.0 — one per `call_recur_seq!` argument, which is what
+    // the CFS declares and what the transition guest asserts against.
+    assert_eq!(site_input.values().len(), 3);
+    assert_eq!(
+        site_input
+            .args()
+            .iter()
+            .map(|arg| arg.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["input", "state", "marker"],
+    );
+}
+
+#[test]
+fn a_recur_sequence_site_commits_to_its_source_list_metadata() {
+    // `lazy-list-recur.md` §2–§3: *both* recur macros trace their source
+    // through the `0x0A` metadata selection. `call_recur_seq!` used
+    // `auth_ref_trace` instead, which resolves the binding — materializing the
+    // whole list before any runner runs, the earliest and largest of the eager
+    // paths — and records a `Raw` selection.
+    //
+    // The consequence was not only memory: `checks::cfs::authenticated_source_len`
+    // refuses anything but `List`, so no fraud proof covering a recur *sequence*
+    // site could be produced at all. No test caught it because the recorder's
+    // own fixture (`seed_recur_source`) hand-builds the metadata commitment
+    // rather than going through the macro.
+    let (_, events) = capture_trace_events(run_scan_all_words);
+
+    let site_input = events
+        .iter()
+        .find_map(|event| match event {
+            TraceEvent::RecurSequenceStart(record) if record.fn_name == "scan_words" => {
+                record.input.clone()
+            }
+            _ => None,
+        })
+        .expect("the recur sequence site publishes a Start with its input");
+
+    let source = site_input
+        .storage()
+        .get("input")
+        .expect("the site records its source under `input`");
+
+    assert_eq!(
+        source.selection.payload_kind,
+        raster::core::input::SelectionPayloadKind::List,
+        "a recur source must commit to list metadata, not the list itself",
+    );
+    // `1 + 8 + 32` — the tag, `len`, and `elements_root`. The point of the
+    // metadata form is that this is constant, not a function of list length.
+    assert_eq!(source.selection.selected_len, 41);
+}
+
+#[test]
+fn a_stateful_recur_sequence_iteration_chains_its_carried_state() {
+    let (_, events) = capture_trace_events(run_scan_all_words);
+
+    let transitions: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            TraceEvent::RecurSequenceIterationEnd(record) if record.fn_name == "scan_words" => {
+                record.recur_state
+            }
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(transitions.len(), 3, "one transition per iteration");
+    for pair in transitions.windows(2) {
+        assert_eq!(
+            pair[0].state_out, pair[1].state_in,
+            "each iteration must start from the state its predecessor produced",
+        );
+    }
+    assert_ne!(
+        transitions[0].state_in, transitions[0].state_out,
+        "a fold that changes the state must change its commitment",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Derivation: a recur site continuing a stored object
+// ---------------------------------------------------------------------------
+
+/// Only appends — the shape a site deriving from a stored object may take.
+#[tile(kind = recur)]
+fn append_only(input: RecurInput<String>, output: RecurOutput<LineBundle>) -> RecurOutput<LineBundle> {
+    let mut output = output;
+    output.items().push(input.into_value());
+    output
+}
+
+#[tile]
+fn titled_bundle_with_one_item() -> Draft<LineBundle> {
+    let mut bundle = Draft::<LineBundle>::new();
+    bundle.title().set("base".to_string());
+    bundle.items().push("zero".to_string());
+    bundle
+}
+
+#[sequence]
+fn derive_bundle() -> (StorageRef, StorageRef) {
+    let source = raster::store_value(&vec!["one".to_string(), "two".to_string()])
+        .expect("list source should store");
+    let base = call!(titled_bundle_with_one_item);
+    let base_reference = base.reference().clone();
+    let derived = call_recur!(
+        tile = append_only,
+        input = storage!(List<String>, source),
+        output = base,
+        args = ()
+    );
+    (base_reference, derived.reference().clone())
+}
+
+/// A site that sets a field on a derived object: the base already wrote it.
+#[sequence]
+fn derive_bundle_and_set_title() -> LineBundle {
+    let source = raster::store_value(&vec!["one".to_string()]).expect("list source should store");
+    let base = call!(titled_bundle_with_one_item);
+    call_recur!(
+        tile = collect_lines,
+        input = storage!(List<String>, source),
+        output = base,
+        args = ()
+    )
+}
+
+/// `[s]` is the base plus the sweep's appends, written as a new object at the
+/// site's own coordinate; the base at `[k]` is untouched.
+#[test]
+fn a_derived_site_extends_its_base_into_a_new_object() {
+    let (base, derived) = materialize_auth_return::<(StorageRef, StorageRef), _>(
+        __raster_sequence_auth_derive_bundle(),
+    );
+    assert_ne!(base.coordinates, derived.coordinates);
+
+    let base_value = into_auth_value::<LineBundle, _>(storage!(LineBundle, base)).unwrap().into_inner();
+    assert_eq!(base_value.title, "base");
+    assert_eq!(base_value.items.as_slice(), ["zero".to_string()]);
+
+    let derived_value =
+        into_auth_value::<LineBundle, _>(storage!(LineBundle, derived)).unwrap().into_inner();
+    assert_eq!(derived_value.title, "base");
+    assert_eq!(
+        derived_value.items.as_slice(),
+        ["zero".to_string(), "one".to_string(), "two".to_string()]
+    );
+}
+
+/// Derivation is push-only: every set-once field came written from the base.
+#[test]
+#[should_panic(expected = "can only be written once")]
+fn a_derived_site_cannot_set_a_field() {
+    let _ = materialize_auth_return::<LineBundle, _>(__raster_sequence_auth_derive_bundle_and_set_title());
+}
+
+// ---------------------------------------------------------------------------
+// Batch C: what a tile's replay commits, and what an iteration publishes
+// (`tile-io-structural-roots` step 2, `incremental-draft-materialization` D3/D5b)
+// ---------------------------------------------------------------------------
+
+fn root_of<T: Serialize>(value: &T) -> [u8; 32] {
+    raster::core::tree::value_root(value).expect("value encodes")
+}
+
+/// A plain tile's replay commits the raster root of what it returned — the
+/// commitment its write must carry — and of each argument it ran on.
+#[test]
+fn a_plain_tile_replay_commits_its_output_and_input_roots() {
+    let input = raster::core::postcard::to_allocvec(&(
+        String::from("line"),
+        String::from("prefix: "),
+    ))
+    .unwrap();
+    let journal = replay_journal(__raster_tile_replay_entry_prefix_line(&input).unwrap());
+    assert_eq!(journal.output_root, Some(root_of(&String::from("prefix: line"))));
+    assert_eq!(
+        journal.input_roots,
+        vec![
+            Some(root_of(&String::from("line"))),
+            Some(root_of(&String::from("prefix: "))),
+        ],
+    );
+}
+
+/// A state-returning iteration publishes nothing (D3); its carried state is
+/// committed by raster root, the function the site's stored result is
+/// committed by (D5b).
+#[test]
+fn a_state_returning_iteration_publishes_no_output() {
+    let input = raster::core::postcard::to_allocvec(&(
+        RecurInput::new(String::from("abcd"), 2u64, 5u64),
+        RecurState::new(MaxLenState { max_len: 1 }),
+    ))
+    .unwrap();
+    let journal = replay_journal(__raster_tile_replay_entry_track_max_len(&input).unwrap());
+    assert!(journal.output_bytes.is_empty());
+    assert_eq!(journal.output_root, None);
+    assert_eq!(
+        journal.input_roots,
+        vec![
+            Some(root_of(&String::from("abcd"))),
+            Some(root_of(&MaxLenState { max_len: 1 })),
+        ],
+    );
+    let state = journal.recur.and_then(|recur| recur.state).expect("a carried state");
+    assert_eq!(state.state_in, root_of(&MaxLenState { max_len: 1 }));
+    assert_eq!(state.state_out, root_of(&MaxLenState { max_len: 4 }));
+}
+
+/// Natively, a draft-returning iteration publishes no output, so the recorder
+/// writes nothing per iteration; the site's close publishes its one object.
+#[test]
+fn draft_iterations_publish_no_output_and_the_close_publishes_the_object() {
+    let (_, events) = capture_trace_events(|| {
+        materialize_auth_return::<LineBundle, _>(__raster_sequence_auth_derive_bundle_and_append())
+    });
+    let iterations: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            TraceEvent::RecurTileIterationExec(record) => Some(record),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(iterations.len(), 2);
+    assert!(iterations.iter().all(|record| record.output.is_none()));
+    assert!(iterations
+        .iter()
+        .all(|record| record.draft_transition_witness.is_some()));
+    let close = events
+        .iter()
+        .find_map(|event| match event {
+            TraceEvent::RecurTileEnd(record) => Some(record),
+            _ => None,
+        })
+        .expect("the site closes");
+    // A deriving site's close carries what it added over its base — the
+    // recorder rebuilds the object from its own copy of the base — not the
+    // whole object.
+    let output = close.output.as_ref().expect("the site writes its object");
+    assert!(output.raster.is_none());
+    let delta = output.derived.as_ref().expect("a derived object travels as a delta");
+    assert!(delta.tail.len() < 200, "tail of {} bytes", delta.tail.len());
+}
+
+#[sequence]
+fn derive_bundle_and_append() -> LineBundle {
+    let source = raster::store_value(&vec!["one".to_string(), "two".to_string()])
+        .expect("list source should store");
+    let base = call!(titled_bundle_with_one_item);
+    call_recur!(
+        tile = append_only,
+        input = storage!(List<String>, source),
+        output = base,
+        args = ()
+    )
+}
+
+/// A recur sequence's state crosses iterations by reference (D5b): each
+/// iteration reads the object the previous one returned, and its `End`
+/// records that returned binding, whose commitment is the claimed `state_out`.
+#[test]
+fn a_stateful_recur_sequence_passes_its_state_by_reference() {
+    let (_, events) = capture_trace_events(run_scan_all_words);
+
+    let starts: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            TraceEvent::RecurSequenceIterationStart(record) if record.fn_name == "scan_words" => {
+                record.input.clone()
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(starts.len(), 3);
+    for input in &starts {
+        assert_eq!(input.values()[1], FnInputValue::StorageBinding);
+        assert!(input.storage().contains_key("state"));
+    }
+
+    let ends: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            TraceEvent::RecurSequenceIterationEnd(record) if record.fn_name == "scan_words" => {
+                Some(record)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ends.len(), 3);
+    for (index, end) in ends.iter().enumerate() {
+        let output = end.output.as_ref().expect("a state iteration records its return");
+        let returned: Option<raster::core::trace::StorageData> =
+            raster::core::postcard::from_bytes(&output.data).expect("a returned binding");
+        let returned = returned.expect("the returned state is stored");
+        let transition = end.recur_state.expect("a state transition");
+        assert_eq!(transition.state_out.as_slice(), returned.commitment.as_slice());
+        // The next iteration reads exactly that object.
+        if let Some(next) = starts.get(index + 1) {
+            assert_eq!(next.storage()["state"].commitment, returned.commitment);
+        }
+    }
+}
+
+/// D1a: the replay tile binds its draft's schema. A handle naming another
+/// schema is refused in the replay itself, so no journal can carry a
+/// host-chosen `schema_hash`.
+#[test]
+#[should_panic(expected = "Draft handle names schema")]
+fn a_replayed_draft_handle_naming_another_schema_is_refused() {
+    let input = raster::core::postcard::to_allocvec(&(
+        RecurInput::new(String::from("line"), 0u64, 1u64),
+        DraftReplayHandle {
+            schema_hash: [9u8; 32],
+            root_before: [0u8; 32],
+        },
+    ))
+    .unwrap();
+    let _ = __raster_tile_replay_entry_append_only(&input);
 }

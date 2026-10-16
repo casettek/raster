@@ -4,12 +4,26 @@
 //! variable bindings and mapping them to `InputSource` references.
 
 use raster_core::cfs::{
-    InputBinding, RecurSequenceItem, RecurTileItem, SequenceChildItem, SequenceItem, TileItem,
+    InputBinding, RecurSequenceItem, RecurTileItem, SequenceChildItem, SequenceItem,
+    SequenceReturn, TileItem,
 };
+use raster_core::input::SelectorSegment;
 use std::collections::{HashMap, HashSet};
 
-use crate::ast::{CallArgumentKind, CallInfo, CallKind};
+use crate::ast::{CallArgumentKind, CallInfo, CallKind, ReturnExpr};
 use crate::sequence::Sequence;
+
+/// The declaration a recur site's `output` produces, with its schema left for
+/// the CFS builder: it resolves the site's output type against the project's
+/// structs (`CfsBuilder::fill_site_output_schemas`), which the resolver does
+/// not hold.
+fn site_output_decl(output: Option<crate::ast::SiteOutputKind>) -> Option<raster_core::cfs::RecurOutputDecl> {
+    output.map(|kind| raster_core::cfs::RecurOutputDecl {
+        schema_hash: [0u8; 32],
+        empty_root: [0u8; 32],
+        derives: kind == crate::ast::SiteOutputKind::Derive,
+    })
+}
 
 /// Resolves data flow within a sequence, producing `SequenceItem`s with
 /// correctly bound input sources.
@@ -26,6 +40,8 @@ pub struct FlowResolver {
     /// `let name = select!(T, rows[idx])` locals, mapping `name` to the names
     /// supplying its data-sourced indexes, in selector order.
     selection_index_sources: HashMap<String, Vec<String>>,
+    /// Per alias local, the static selector path it appends to its root.
+    selection_paths: HashMap<String, Vec<SelectorSegment>>,
 }
 
 impl FlowResolver {
@@ -67,6 +83,12 @@ impl FlowResolver {
         self.selection_index_sources = sequence
             .function
             .selection_index_sources
+            .iter()
+            .cloned()
+            .collect();
+        self.selection_paths = sequence
+            .function
+            .selection_paths
             .iter()
             .cloned()
             .collect();
@@ -119,12 +141,17 @@ impl FlowResolver {
                     id: call.callee.clone(),
                     sources: input_sources,
                     chunk: call.chunk,
-                    leaves_output_open: call.leaves_output_open,
+                    output: site_output_decl(call.output),
+                    state_is_output: call.state_is_output,
+                    carries_state: call.carries_state,
                 }),
                 CallKind::RecursiveSequence => {
                     SequenceChildItem::RecurSequence(RecurSequenceItem {
                         id: call.callee.clone(),
                         sources: input_sources,
+                        state_is_output: call.state_is_output,
+                        carries_state: call.carries_state,
+                        output: site_output_decl(call.output),
                     })
                 }
                 CallKind::Sequence => SequenceChildItem::Sequence(SequenceItem {
@@ -142,6 +169,72 @@ impl FlowResolver {
         }
 
         items
+    }
+
+    /// Resolve what a sequence body returns, the way an argument is resolved.
+    ///
+    /// Call after [`Self::resolve_with_entry_arguments`], which fills the
+    /// bindings this reads; `item_count` is the number of items it produced.
+    /// `None` when the return cannot be bound: an [`ReturnExpr::Unbound`]
+    /// form, or a name with no upstream (a finalized draft, a local computed
+    /// in the body). A returned value selected through a data-sourced index is
+    /// also `None` — the binding would need the index citations, and a
+    /// program output has nowhere to carry them.
+    pub fn resolve_return(&self, ret: &ReturnExpr, item_count: usize) -> Option<SequenceReturn> {
+        let (source, path) = match ret {
+            ReturnExpr::TailCall => (
+                InputBinding::prior_item_output(item_count.checked_sub(1)?),
+                Vec::new(),
+            ),
+            ReturnExpr::Rooted { root, path } => {
+                // The source carries no path of its own: the whole selector is
+                // `SequenceReturn::path`, which `resolve_value` prepends to.
+                let source = self.resolve_source(root);
+                let (final_root, mut full_path) = self.compose_alias_path(root, path)?;
+                // An entry argument is a field of the one entry object at `[]`,
+                // and the runtime binds it with its name as the selector prefix
+                // (`entry_argument_auth_ref`).
+                if matches!(source.value_binding(), InputBinding::EntryArgument { .. }) {
+                    full_path.insert(0, SelectorSegment::Field(final_root));
+                }
+                (source, full_path)
+            }
+            ReturnExpr::Unbound { .. } | ReturnExpr::Tuple(_) => return None,
+        };
+        let unbound = matches!(
+            source.value_binding(),
+            InputBinding::Direct(raster_core::cfs::InputSource::Inline)
+        ) || !source.index_bindings().is_empty();
+        (!unbound).then_some(SequenceReturn { source, path })
+    }
+
+    /// Walk `root`'s alias chain the way [`Self::resolve_alias`] does,
+    /// prefixing each alias's static path: `let acc = select!(A, stats.w);
+    /// let m = select!(u64, acc.max); m` composes to `[w, max]`, which is the
+    /// selector the runtime builds by appending each `select!`'s segments to
+    /// its base's. Returns the chain's root and the composed path, or `None`
+    /// when an alias on the chain has no static path (a data-sourced index).
+    fn compose_alias_path(
+        &self,
+        root: &str,
+        path: &[SelectorSegment],
+    ) -> Option<(String, Vec<SelectorSegment>)> {
+        let mut current = root;
+        let mut full_path = path.to_vec();
+        for _ in 0..self.selection_aliases.len() {
+            let Some(next) = self.selection_aliases.get(current) else {
+                break;
+            };
+            let prefix = self.selection_paths.get(current)?;
+            full_path.splice(0..0, prefix.iter().cloned());
+            // A self-alias (`let x = select!(T, x.f)`) shadows: its path
+            // applies once and the chain ends, as in `resolve_alias`.
+            if next == current {
+                break;
+            }
+            current = next.as_str();
+        }
+        Some((current.to_string(), full_path))
     }
 
     /// Resolve input sources for a function call's arguments.
@@ -172,16 +265,43 @@ impl FlowResolver {
         current
     }
 
-    /// Resolve a single argument to its input source.
+    /// Resolve a single argument to its input source and the path it reads.
+    ///
+    /// The path is the argument's own `select!` path, prefixed along `root`'s
+    /// alias chain — the selector the runtime appends to the named value's —
+    /// and, for an entry argument, led by the argument's name, which is how the
+    /// runtime selects it out of the entry object (`entry_argument_auth_ref`).
+    /// A value reached through a data-sourced index records no path: its
+    /// selector is not fixed by the program, and its index citations are
+    /// checked instead.
+    fn resolve_argument(&self, kind: &CallArgumentKind) -> InputBinding {
+        let CallArgumentKind::Rooted { root, path } = kind else {
+            return InputBinding::inline();
+        };
+        let source = self.resolve_source(root);
+        if !source.index_bindings().is_empty() {
+            return source;
+        }
+        let Some((final_root, mut full_path)) = path
+            .as_deref()
+            .and_then(|path| self.compose_alias_path(root.trim(), path))
+        else {
+            return source;
+        };
+        if matches!(source.value_binding(), InputBinding::EntryArgument { .. }) {
+            full_path.insert(0, SelectorSegment::Field(final_root));
+        }
+        source.with_path(full_path)
+    }
+
+    /// Resolve the name an argument or return is rooted at to its source,
+    /// without a path.
     ///
     /// Everything reachable from a name — a sequence parameter, a prior
     /// item's output, an entry argument — binds to that name's source, so
     /// that the guest can hold the recorded step to it. Only values with no
     /// upstream at all are `Inline`.
-    fn resolve_argument(&self, kind: &CallArgumentKind) -> InputBinding {
-        let CallArgumentKind::Rooted { root } = kind else {
-            return InputBinding::inline();
-        };
+    fn resolve_source(&self, root: &str) -> InputBinding {
         let name = root.trim();
         // Collected before aliasing collapses the chain: the citations belong to
         // the selection locals along it, not to the root the chain lands on.
@@ -227,6 +347,7 @@ impl FlowResolver {
                 for source in sources {
                     indexes.push(self.resolve_argument(&CallArgumentKind::Rooted {
                         root: source.clone(),
+                        path: Some(Vec::new()),
                     }));
                 }
             }
@@ -286,6 +407,9 @@ mod tests {
             signature: format!("fn {}()", name),
             selection_aliases: vec![],
             selection_index_sources: vec![],
+            selection_paths: vec![],
+            return_expr: None,
+            selection_errors: Vec::new(),
         }
     }
 
@@ -327,6 +451,9 @@ mod tests {
             signature: format!("fn {}()", name),
             selection_aliases,
             selection_index_sources,
+            selection_paths: vec![],
+            return_expr: None,
+            selection_errors: Vec::new(),
         }
     }
 
@@ -371,10 +498,13 @@ mod tests {
                     arguments: vec!["name".to_string()],
                     argument_kinds: vec![CallArgumentKind::Rooted {
                         root: "name".to_string(),
+                        path: Some(Vec::new()),
                     }],
                     call_kind: CallKind::Tile,
                     chunk: None,
-                    leaves_output_open: false,
+                    output: None,
+                    state_is_output: false,
+                    carries_state: false,
                 },
                 CallInfo {
                     callee: "exclaim".to_string(),
@@ -382,10 +512,13 @@ mod tests {
                     arguments: vec!["greeting".to_string()],
                     argument_kinds: vec![CallArgumentKind::Rooted {
                         root: "greeting".to_string(),
+                        path: Some(Vec::new()),
                     }],
                     call_kind: CallKind::Tile,
                     chunk: None,
-                    leaves_output_open: false,
+                    output: None,
+                    state_is_output: false,
+                    carries_state: false,
                 },
             ],
         );
@@ -410,7 +543,7 @@ mod tests {
                 assert_eq!(tile_item.id, "greet");
                 assert_eq!(tile_item.sources.len(), 1);
                 match &tile_item.sources[0] {
-                    InputBinding::SequenceScope { input_index } => assert_eq!(*input_index, 0),
+                    InputBinding::SequenceScope { input_index, .. } => assert_eq!(*input_index, 0),
                     _ => panic!("Expected SequenceScope"),
                 }
             }
@@ -425,6 +558,7 @@ mod tests {
                 match &tile_item.sources[0] {
                     InputBinding::PriorItemOutput {
                         intra_sequence_item_index,
+                        ..
                     } => {
                         assert_eq!(*intra_sequence_item_index, 0);
                     }
@@ -433,6 +567,500 @@ mod tests {
             }
             _ => panic!("Expected Tile item"),
         }
+
+        // What the body returns binds like an argument: a binding to its
+        // producing item, a tail call to the last item, a parameter to its
+        // scope slot; a name with no upstream, or an unbindable form, to
+        // nothing.
+        let rooted = |root: &str, path: Vec<SelectorSegment>| ReturnExpr::Rooted {
+            root: root.to_string(),
+            path,
+        };
+        let returned = |source: InputBinding, path: Vec<SelectorSegment>| {
+            Some(SequenceReturn { source, path })
+        };
+        assert_eq!(
+            resolver.resolve_return(&rooted("greeting", vec![]), items.len()),
+            returned(InputBinding::prior_item_output(0), vec![])
+        );
+        assert_eq!(
+            resolver.resolve_return(
+                &rooted("greeting", vec![SelectorSegment::Field("text".into())]),
+                items.len()
+            ),
+            returned(
+                InputBinding::prior_item_output(0),
+                vec![SelectorSegment::Field("text".into())]
+            )
+        );
+        assert_eq!(
+            resolver.resolve_return(&ReturnExpr::TailCall, items.len()),
+            returned(InputBinding::prior_item_output(1), vec![])
+        );
+        assert_eq!(
+            resolver.resolve_return(&rooted("name", vec![]), items.len()),
+            returned(InputBinding::seq_input(0), vec![])
+        );
+        assert_eq!(resolver.resolve_return(&rooted("report", vec![]), items.len()), None);
+        assert_eq!(
+            resolver.resolve_return(
+                &ReturnExpr::Unbound {
+                    expr: "42".to_string()
+                },
+                items.len()
+            ),
+            None
+        );
+    }
+
+    /// A returned value's path is composed along its alias chain the way the
+    /// runtime appends each `select!`'s segments to its base's selector, and an
+    /// entry argument's path starts with the argument's name.
+    #[test]
+    fn return_paths_compose_along_the_alias_chain() {
+        let project = make_mock_project();
+        let summarize = make_tile_function("summarize", vec!["values"], true);
+        let tile = Tile {
+            function: &summarize,
+            tile_type: "tile".to_string(),
+            estimated_cycles: None,
+            max_memory: None,
+            description: None,
+        };
+        let tile_discovery = TileDiscovery {
+            project: &project,
+            tiles: vec![tile],
+        };
+        let mut seq_func = make_sequence_function(
+            "main",
+            vec!["cfg"],
+            vec![CallInfo {
+                callee: "summarize".to_string(),
+                result_binding: Some("stats".to_string()),
+                arguments: vec!["cfg".to_string()],
+                argument_kinds: vec![CallArgumentKind::Rooted {
+                    root: "cfg".to_string(),
+                    path: Some(Vec::new()),
+                }],
+                call_kind: CallKind::Tile,
+                chunk: None,
+                output: None,
+                state_is_output: false,
+                carries_state: false,
+            }],
+        );
+        seq_func.selection_aliases = vec![
+            ("window".to_string(), "stats".to_string()),
+            ("m".to_string(), "window".to_string()),
+            ("limit".to_string(), "cfg".to_string()),
+        ];
+        seq_func.selection_paths = vec![
+            ("window".to_string(), vec![SelectorSegment::Field("window".into())]),
+            ("m".to_string(), vec![SelectorSegment::Field("max".into())]),
+            ("limit".to_string(), vec![SelectorSegment::Field("limit".into())]),
+        ];
+        let sequence = Sequence {
+            function: &seq_func,
+            steps: vec![SequenceStep::Tile(&tile_discovery.tiles[0])],
+            description: None,
+        };
+        let mut resolver = FlowResolver::new();
+        let items = resolver.resolve_with_entry_arguments(&sequence, &["cfg".to_string()]);
+
+        let rooted = |root: &str| ReturnExpr::Rooted {
+            root: root.to_string(),
+            path: vec![],
+        };
+        assert_eq!(
+            resolver.resolve_return(&rooted("m"), items.len()),
+            Some(SequenceReturn {
+                source: InputBinding::prior_item_output(0),
+                path: vec![
+                    SelectorSegment::Field("window".into()),
+                    SelectorSegment::Field("max".into())
+                ],
+            })
+        );
+        assert_eq!(
+            resolver.resolve_return(&rooted("limit"), items.len()),
+            Some(SequenceReturn {
+                source: InputBinding::entry_argument(),
+                path: vec![
+                    SelectorSegment::Field("cfg".into()),
+                    SelectorSegment::Field("limit".into())
+                ],
+            })
+        );
+        assert_eq!(
+            resolver.resolve_return(&rooted("cfg"), items.len()),
+            Some(SequenceReturn {
+                source: InputBinding::entry_argument(),
+                path: vec![SelectorSegment::Field("cfg".into())],
+            })
+        );
+    }
+
+    /// The path an argument records is the selector the runtime appends to the
+    /// named value's: its own `select!` path, prefixed along its alias chain.
+    /// The shape `greet_sequence` has in `examples/hello-tiles` — a sequence
+    /// selecting a field of its own parameter — plus a chain of literal-index
+    /// selects, a prior item's field, and a `clone!` that narrows nothing.
+    #[test]
+    fn argument_paths_compose_like_the_runtime_selector() {
+        let project = make_mock_project();
+        let funcs: Vec<FunctionAstItem> = ["personal_greet", "greet_line", "build", "show", "echo"]
+            .iter()
+            .map(|name| make_tile_function(name, vec!["x"], true))
+            .collect();
+        let tiles: Vec<Tile> = funcs
+            .iter()
+            .map(|function| Tile {
+                function,
+                tile_type: "iter".to_string(),
+                estimated_cycles: None,
+                max_memory: None,
+                description: None,
+            })
+            .collect();
+        let tile_discovery = TileDiscovery { project: &project, tiles };
+        let field = |name: &str| SelectorSegment::Field(name.to_string());
+        let call = |callee: &str, result: Option<&str>, root: &str, path: Vec<SelectorSegment>| CallInfo {
+            callee: callee.to_string(),
+            result_binding: result.map(str::to_string),
+            arguments: vec![root.to_string()],
+            argument_kinds: vec![CallArgumentKind::Rooted {
+                root: root.to_string(),
+                path: Some(path),
+            }],
+            call_kind: CallKind::Tile,
+            chunk: None,
+            output: None,
+            state_is_output: false,
+            carries_state: false,
+        };
+        //   fn seq(name, personal_data) {
+        //       call!(personal_greet, select!(String, personal_data.name));
+        //       let addresses = select!(List<Address>, personal_data.addresses);
+        //       let address = select!(Address, addresses[1]);
+        //       call!(greet_line, select!(String, address.lines[0]));
+        //       let doc = call!(build, name);
+        //       call!(show, select!(String, doc.title));
+        //       call!(echo, clone!(personal_data));
+        //   }
+        let mut seq_func = make_sequence_function(
+            "seq",
+            vec!["name", "personal_data"],
+            vec![
+                call("personal_greet", None, "personal_data", vec![field("name")]),
+                call("greet_line", None, "address", vec![field("lines"), SelectorSegment::Index(0)]),
+                call("build", Some("doc"), "name", vec![]),
+                call("show", None, "doc", vec![field("title")]),
+                call("echo", None, "personal_data", vec![]),
+            ],
+        );
+        seq_func.selection_aliases = vec![
+            ("addresses".to_string(), "personal_data".to_string()),
+            ("address".to_string(), "addresses".to_string()),
+        ];
+        seq_func.selection_paths = vec![
+            ("addresses".to_string(), vec![field("addresses")]),
+            ("address".to_string(), vec![SelectorSegment::Index(1)]),
+        ];
+        let sequence = Sequence {
+            function: &seq_func,
+            steps: tile_discovery.tiles.iter().map(SequenceStep::Tile).collect(),
+            description: None,
+        };
+
+        let sources = |items: &[SequenceChildItem]| -> Vec<InputBinding> {
+            items.iter().map(|item| item.inputs()[0].clone()).collect()
+        };
+
+        let items = FlowResolver::new().resolve(&sequence);
+        assert_eq!(
+            sources(&items),
+            vec![
+                InputBinding::seq_input(1).with_path(vec![field("name")]),
+                InputBinding::seq_input(1).with_path(vec![
+                    field("addresses"),
+                    SelectorSegment::Index(1),
+                    field("lines"),
+                    SelectorSegment::Index(0),
+                ]),
+                InputBinding::seq_input(0),
+                InputBinding::prior_item_output(2).with_path(vec![field("title")]),
+                InputBinding::seq_input(1),
+            ]
+        );
+
+        // As `main`, the same names are entry arguments: each path is led by
+        // the argument's name, the field it is in the entry object.
+        let items = FlowResolver::new().resolve_with_entry_arguments(
+            &sequence,
+            &["name".to_string(), "personal_data".to_string()],
+        );
+        let sources = sources(&items);
+        assert_eq!(
+            sources[0],
+            InputBinding::entry_argument().with_path(vec![field("personal_data"), field("name")])
+        );
+        assert_eq!(sources[2], InputBinding::entry_argument().with_path(vec![field("name")]));
+        assert_eq!(
+            sources[4],
+            InputBinding::entry_argument().with_path(vec![field("personal_data")])
+        );
+    }
+
+    /// Parse `code`'s single function as `main` — every parameter an entry
+    /// argument — and resolve it, each `call!` a tile step. Returns each step's
+    /// first source and the resolved return.
+    fn resolve_parsed_main(code: &str) -> (Vec<InputBinding>, Option<SequenceReturn>) {
+        let file: syn::File = syn::parse_str(code).unwrap();
+        let main = ProjectAst::parse_functions(
+            &file,
+            PathBuf::from("main.rs"),
+            &std::rc::Rc::new(Vec::new()),
+            &std::rc::Rc::new(HashMap::new()),
+        )
+        .remove(0);
+        assert!(main.selection_errors.is_empty(), "{:?}", main.selection_errors);
+
+        let project = make_mock_project();
+        let callees: Vec<String> = main.call_infos.iter().map(|call| call.callee.clone()).collect();
+        let functions: Vec<FunctionAstItem> = callees
+            .iter()
+            .map(|callee| make_tile_function(callee, vec!["arg"], true))
+            .collect();
+        let tile_discovery = TileDiscovery {
+            project: &project,
+            tiles: functions
+                .iter()
+                .map(|function| Tile {
+                    function,
+                    tile_type: "iter".to_string(),
+                    estimated_cycles: None,
+                    max_memory: None,
+                    description: None,
+                })
+                .collect(),
+        };
+        let sequence = Sequence {
+            function: &main,
+            steps: tile_discovery.tiles.iter().map(SequenceStep::Tile).collect(),
+            description: None,
+        };
+        let mut resolver = FlowResolver::new();
+        let items = resolver.resolve_with_entry_arguments(&sequence, &main.input_names);
+        let returns = main
+            .return_expr
+            .as_ref()
+            .and_then(|ret| resolver.resolve_return(ret, items.len()));
+        let sources = items
+            .iter()
+            .map(|item| item.inputs().first().cloned().unwrap_or_else(InputBinding::inline))
+            .collect();
+        (sources, returns)
+    }
+
+    fn field(name: &str) -> SelectorSegment {
+        SelectorSegment::Field(name.to_string())
+    }
+
+    fn entry_at(path: &[SelectorSegment]) -> InputBinding {
+        InputBinding::entry_argument().with_path(path.to_vec())
+    }
+
+    /// `main` reading `table.rows[start..end]` with constant local bounds:
+    /// the runtime records `[table, rows, Range(0, 2)]` with no index citation,
+    /// and the guest holds the entry argument to its declared path exactly, so
+    /// the CFS must declare that path — directly and through an alias.
+    #[test]
+    fn local_range_bounds_resolve_to_the_recorded_entry_path() {
+        let (sources, _) = resolve_parsed_main(
+            r#"fn main(table: Table) {
+                let start = 0usize;
+                let end = 2usize;
+                call!(consume, select!(Block<Row>, table.rows[start..end]));
+                let rows = select!(Block<Row>, table.rows[start..end]);
+                call!(consume, rows);
+            }"#,
+        );
+        let expected = entry_at(&[
+            field("table"),
+            field("rows"),
+            SelectorSegment::Range { start: 0, end: 2 },
+        ]);
+        assert_eq!(sources, vec![expected.clone(), expected]);
+    }
+
+    /// Each use of a shadowed name resolves through the binding in scope at
+    /// that statement, not through the name's last binding in the body.
+    #[test]
+    fn a_shadowed_selection_resolves_through_the_binding_in_scope() {
+        let (sources, _) = resolve_parsed_main(
+            r#"fn main(table: Table) {
+                let line = select!(String, table.lines[0]);
+                call!(consume, line);
+                let line = select!(String, table.lines[1]);
+                call!(consume, line);
+                let line = select!(String, line.text);
+                call!(consume, line);
+            }"#,
+        );
+        let line = |index| [field("table"), field("lines"), SelectorSegment::Index(index)];
+        assert_eq!(
+            sources,
+            vec![
+                entry_at(&line(0)),
+                entry_at(&line(1)),
+                // A selection out of the shadowed binding composes with it.
+                entry_at(&[line(1).as_slice(), &[field("text")]].concat()),
+            ]
+        );
+    }
+
+    /// A call result and a selection alias of the same name each hold for
+    /// their own stretch of the body, whichever comes first.
+    #[test]
+    fn call_results_and_aliases_shadow_one_another_in_order() {
+        let (sources, returns) = resolve_parsed_main(
+            r#"fn main(table: Table) {
+                let x = call!(produce, table);
+                call!(consume, x);
+                let x = select!(Row, table.rows[0]);
+                call!(consume, x);
+                let x = call!(produce, x);
+                let x = select!(u64, x.count);
+                x
+            }"#,
+        );
+        let row = [field("table"), field("rows"), SelectorSegment::Index(0)];
+        assert_eq!(
+            sources,
+            vec![
+                entry_at(&[field("table")]),
+                InputBinding::prior_item_output(0),
+                entry_at(&row),
+                entry_at(&row),
+            ]
+        );
+        assert_eq!(
+            returns,
+            Some(SequenceReturn {
+                source: InputBinding::prior_item_output(3),
+                path: vec![field("count")],
+            })
+        );
+    }
+
+    /// A nested block's bindings end with it, and a `let` shadowing an entry
+    /// argument with a plain value is that value, not the argument.
+    #[test]
+    fn block_bindings_end_with_the_block_and_plain_shadows_are_inline() {
+        let (sources, _) = resolve_parsed_main(
+            r#"fn main(table: Table, x: Row) {
+                {
+                    let x = select!(Row, table.rows[3]);
+                    call!(consume, x);
+                }
+                call!(consume, x);
+                let table = 7u64;
+                call!(consume, table);
+            }"#,
+        );
+        assert_eq!(
+            sources,
+            vec![
+                entry_at(&[field("table"), field("rows"), SelectorSegment::Index(3)]),
+                entry_at(&[field("x")]),
+                InputBinding::inline(),
+            ]
+        );
+    }
+
+    /// An index cites the binding that supplied it when the selection was
+    /// made, not a later binding of the same name.
+    #[test]
+    fn an_index_cites_the_binding_in_scope_at_its_selection() {
+        let (sources, _) = resolve_parsed_main(
+            r#"fn main(table: Table, ids: Ids) {
+                let i = select!(u64, ids.first);
+                let row = select!(Row, table.rows[i]);
+                let i = select!(u64, ids.second);
+                call!(consume, row);
+                call!(consume, i);
+            }"#,
+        );
+        assert_eq!(
+            sources,
+            vec![
+                InputBinding::entry_argument()
+                    .indexed_by(vec![entry_at(&[field("ids"), field("first")])]),
+                entry_at(&[field("ids"), field("second")]),
+            ]
+        );
+    }
+
+    /// A value reached through a data-sourced index records no path — its
+    /// selector is not fixed by the program — while the index supplier, a plain
+    /// static selection, records its own.
+    #[test]
+    fn an_indexed_argument_records_no_path_but_its_supplier_does() {
+        let project = make_mock_project();
+        let echo_func = make_tile_function("echo", vec!["row"], true);
+        let tile_discovery = TileDiscovery {
+            project: &project,
+            tiles: vec![Tile {
+                function: &echo_func,
+                tile_type: "iter".to_string(),
+                estimated_cycles: None,
+                max_memory: None,
+                description: None,
+            }],
+        };
+        //   fn seq(table) { let wanted = select!(u32, table.wanted);
+        //                   let row = select!(Row, table.rows[wanted]);
+        //                   call!(echo, row) }
+        let mut seq_func = make_sequence_function_with_indexes(
+            "seq",
+            vec!["table"],
+            vec![CallInfo {
+                callee: "echo".to_string(),
+                result_binding: None,
+                arguments: vec!["row".to_string()],
+                argument_kinds: vec![CallArgumentKind::Rooted {
+                    root: "row".to_string(),
+                    path: Some(Vec::new()),
+                }],
+                call_kind: CallKind::Tile,
+                chunk: None,
+                output: None,
+                state_is_output: false,
+                carries_state: false,
+            }],
+            vec![
+                ("row".to_string(), "table".to_string()),
+                ("wanted".to_string(), "table".to_string()),
+            ],
+            vec![("row".to_string(), vec!["wanted".to_string()])],
+        );
+        // `row`'s select has a data-sourced index, so the AST records no
+        // static path for it; `wanted`'s is static.
+        seq_func.selection_paths =
+            vec![("wanted".to_string(), vec![SelectorSegment::Field("wanted".into())])];
+        let sequence = Sequence {
+            function: &seq_func,
+            steps: vec![SequenceStep::Tile(&tile_discovery.tiles[0])],
+            description: None,
+        };
+
+        let items = FlowResolver::new().resolve(&sequence);
+        assert_eq!(
+            items[0].inputs()[0],
+            InputBinding::seq_input(0).indexed_by(vec![
+                InputBinding::seq_input(0).with_path(vec![SelectorSegment::Field("wanted".into())])
+            ])
+        );
     }
 
     #[test]
@@ -461,7 +1089,9 @@ mod tests {
                 argument_kinds: vec![CallArgumentKind::Inline],
                 call_kind: CallKind::Tile,
                 chunk: None,
-                leaves_output_open: false,
+                output: None,
+                state_is_output: false,
+                carries_state: false,
             }],
         );
 
@@ -522,10 +1152,13 @@ mod tests {
                     arguments: vec!["personal_data".to_string()],
                     argument_kinds: vec![CallArgumentKind::Rooted {
                         root: "personal_data".to_string(),
+                        path: Some(Vec::new()),
                     }],
                     call_kind: CallKind::Tile,
                     chunk: None,
-                    leaves_output_open: false,
+                    output: None,
+                    state_is_output: false,
+                    carries_state: false,
                 },
                 CallInfo {
                     callee: "exclaim".to_string(),
@@ -533,10 +1166,13 @@ mod tests {
                     arguments: vec!["greeting".to_string()],
                     argument_kinds: vec![CallArgumentKind::Rooted {
                         root: "greeting".to_string(),
+                        path: Some(Vec::new()),
                     }],
                     call_kind: CallKind::Tile,
                     chunk: None,
-                    leaves_output_open: false,
+                    output: None,
+                    state_is_output: false,
+                    carries_state: false,
                 },
             ],
         );
@@ -561,7 +1197,7 @@ mod tests {
             SequenceChildItem::Tile(tile_item) => {
                 assert_eq!(tile_item.id, "greet");
                 match &tile_item.sources[0] {
-                    InputBinding::EntryArgument => {}
+                    InputBinding::EntryArgument { .. } => {}
                     other => panic!("Expected EntryArgument, got {:?}", other),
                 }
             }
@@ -574,6 +1210,7 @@ mod tests {
             SequenceChildItem::Tile(tile_item) => match &tile_item.sources[0] {
                 InputBinding::PriorItemOutput {
                     intra_sequence_item_index,
+                    ..
                 } => assert_eq!(*intra_sequence_item_index, 0),
                 other => panic!("Expected PriorItemOutput{{0}}, got {:?}", other),
             },
@@ -610,10 +1247,13 @@ mod tests {
                 arguments: vec!["name".to_string()],
                 argument_kinds: vec![CallArgumentKind::Rooted {
                     root: "name".to_string(),
+                    path: Some(Vec::new()),
                 }],
                 call_kind: CallKind::Tile,
                 chunk: None,
-                leaves_output_open: false,
+                output: None,
+                state_is_output: false,
+                carries_state: false,
             }],
             vec![("name".to_string(), "personal_data".to_string())],
         );
@@ -629,7 +1269,7 @@ mod tests {
 
         match &items[0] {
             SequenceChildItem::Tile(tile_item) => match &tile_item.sources[0] {
-                InputBinding::EntryArgument => {}
+                InputBinding::EntryArgument { .. } => {}
                 other => panic!("Expected EntryArgument, got {:?}", other),
             },
             _ => panic!("Expected Tile item"),
@@ -664,10 +1304,13 @@ mod tests {
                 arguments: vec!["seed".to_string()],
                 argument_kinds: vec![CallArgumentKind::Rooted {
                     root: "seed".to_string(),
+                    path: Some(Vec::new()),
                 }],
                 call_kind: CallKind::Tile,
                 chunk: None,
-                leaves_output_open: false,
+                output: None,
+                state_is_output: false,
+                carries_state: false,
             }],
             vec![("seed".to_string(), "seed".to_string())],
         );
@@ -682,7 +1325,7 @@ mod tests {
 
         match &items[0] {
             SequenceChildItem::Tile(tile_item) => match &tile_item.sources[0] {
-                InputBinding::EntryArgument => {}
+                InputBinding::EntryArgument { .. } => {}
                 other => panic!("Expected EntryArgument, got {:?}", other),
             },
             _ => panic!("Expected Tile item"),
@@ -715,7 +1358,9 @@ mod tests {
                 argument_kinds: vec![CallArgumentKind::Inline],
                 call_kind: CallKind::Tile,
                 chunk: None,
-                leaves_output_open: false,
+                output: None,
+                state_is_output: false,
+                carries_state: false,
             }],
         );
         let sequence = Sequence {
@@ -771,10 +1416,13 @@ mod tests {
                 arguments: vec!["row".to_string()],
                 argument_kinds: vec![CallArgumentKind::Rooted {
                     root: "row".to_string(),
+                    path: Some(Vec::new()),
                 }],
                 call_kind: CallKind::Tile,
                 chunk: None,
-                leaves_output_open: false,
+                output: None,
+                state_is_output: false,
+                carries_state: false,
             }],
             vec![
                 ("row".to_string(), "table".to_string()),
@@ -803,18 +1451,18 @@ mod tests {
         // The row still comes from the caller's scope; only its *index* is new.
         assert!(matches!(
             value.as_ref(),
-            InputBinding::SequenceScope { input_index: 0 }
+            InputBinding::SequenceScope { input_index: 0, .. }
         ));
         // And the index is itself a value with provenance, recorded as such.
         assert_eq!(indexes.len(), 1);
         assert!(matches!(
             &indexes[0],
-            InputBinding::SequenceScope { input_index: 0 }
+            InputBinding::SequenceScope { input_index: 0, .. }
         ));
     }
 
-    /// A literal-index selection must keep emitting exactly the binding it emits
-    /// today, so no existing program's identity shifts under this feature.
+    /// A literal-index selection is not index-sourced: no `Indexed` wrapper,
+    /// only the binding (whose path carries the literal index).
     #[test]
     fn literal_index_resolves_without_a_wrapper() {
         let project = make_mock_project();
@@ -840,10 +1488,13 @@ mod tests {
                 arguments: vec!["row".to_string()],
                 argument_kinds: vec![CallArgumentKind::Rooted {
                     root: "row".to_string(),
+                    path: Some(Vec::new()),
                 }],
                 call_kind: CallKind::Tile,
                 chunk: None,
-                leaves_output_open: false,
+                output: None,
+                state_is_output: false,
+                carries_state: false,
             }],
             vec![("row".to_string(), "table".to_string())],
         );
@@ -861,7 +1512,7 @@ mod tests {
         };
         assert!(matches!(
             &tile_item.sources[0],
-            InputBinding::SequenceScope { input_index: 0 }
+            InputBinding::SequenceScope { input_index: 0, .. }
         ));
     }
 }

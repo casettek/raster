@@ -16,15 +16,17 @@ use raster_core::input::SelectionWitness;
 use raster_core::trace::{FnInput, StepRecord};
 use raster_core::recur_progress::RecurProgressStack;
 use raster_core::transition::{
-    FingerprintSliceWitness, InitTransition, StorageReadWitness, StorageWitness,
-    TraceCommitmentHeader, TransitionInput, TransitionJournal, TransitionState,
+    FingerprintSliceWitness, InitTransition, StepRecordWitness, StorageReadWitness,
+    StorageWitness, TraceCommitmentHeader, TransitionInput, TransitionJournal, TransitionState,
 };
 use std::collections::{BTreeMap, HashMap};
 
 use crate::authorization::authorization_guest_image_id;
-use crate::precomputed::EMPTY_TRIE_NODES;
+use raster_core::merkle::{NodeHash, EMPTY_LEAF};
 use crate::replay::ReplayResult;
-use crate::trace::{serializable_frontier_into_trace_frontier, SerializableFrontier, TraceTree};
+use crate::trace::{
+    frontier_root, serializable_frontier_into_trace_frontier, SerializableFrontier,
+};
 #[cfg(test)]
 use crate::trace::{TraceCommitment, TraceCommitmentExt};
 use crate::{TRANSITION_GUEST_ELF, TRANSITION_GUEST_ID};
@@ -45,13 +47,16 @@ pub struct StepIo {
     /// narrowing it to the returned value. `None` for every other step.
     pub program_output_read_witness: Option<StorageReadWitness>,
     pub program_output_selection_witness: Option<SelectionWitness>,
+    /// For a recur-sequence iteration's `SequenceEnd` that carries state: the
+    /// read proof of the object it returned as its state (D5b).
+    pub returned_state_read_witness: Option<StorageReadWitness>,
 }
 
 type RecordedStepIo = HashMap<StepRecord, StepIo>;
 
 fn build_transition_input(
     step_record: &StepRecord,
-    input_sources_witnesses: &HashMap<StepRecord, Vec<u8>>,
+    input_sources_witnesses: &HashMap<(u64, StepRecord), StepRecordWitness>,
     recorded_step_io: &RecordedStepIo,
     replayed_results: &HashMap<StepRecord, ReplayResult>,
     authorization_journal: &AuthorizationJournal,
@@ -59,6 +64,10 @@ fn build_transition_input(
     // Recur progress the window opens with. `Some` only on a window's first
     // step; every later step inherits the preimage through `Transition`.
     window_start_recur_progress: Option<RecurProgressStack>,
+    // The commitment's revealed tail roots. `Some` only on the first step —
+    // the only one holding the header to bind them against; the root the
+    // terminal step needs is carried forward on the journal.
+    revealed_tail_roots: Option<Vec<NodeHash>>,
 ) -> TransitionInput {
     let StepIo {
         input_witness,
@@ -70,6 +79,7 @@ fn build_transition_input(
         draft_transition_witness,
         program_output_read_witness,
         program_output_selection_witness,
+        returned_state_read_witness,
     } = recorded_step_io
         .get(step_record)
         .cloned()
@@ -102,10 +112,19 @@ fn build_transition_input(
         storage_witness,
         draft_transition_witness,
         authorization_journal: authorization_journal.clone(),
-        input_sources_witnesses: input_sources_witnesses.clone(),
+        // Only this step's own witnesses. The guest looks one up by its own
+        // `exec_index` (`checks::cfs::verify_sequence_scope_parent`), so the
+        // window's other entries are data it would decode and never read.
+        input_sources_witnesses: input_sources_witnesses
+            .iter()
+            .filter(|((verifier_exec_index, _), _)| *verifier_exec_index == step_record.exec_index)
+            .map(|(key, witness)| (key.clone(), witness.clone()))
+            .collect(),
         entrypoint_membership_witness: entrypoint_membership_witness.cloned(),
         program_output_read_witness,
         program_output_selection_witness,
+        returned_state_read_witness,
+        revealed_tail_roots,
     }
 }
 
@@ -116,10 +135,27 @@ fn image_id_bytes(image_id: [u32; 8]) -> Vec<u8> {
         .collect()
 }
 
+/// Write one transition guest input as a frame: a `u32` byte length, then the
+/// bytes. The guest reads it back with two bulk `read_slice` calls (its
+/// `frame` module). Not `builder.write`: risc0's serde makes the guest fetch one
+/// word per syscall, one per `u8` of a `Vec<u8>`, and on risc0 3.x every
+/// syscall traps through the v1compat kernel. That was 68% of a step's cycles.
+fn write_frame(builder: &mut risc0_zkvm::ExecutorEnvBuilder<'_>, bytes: &[u8]) {
+    let len = u32::try_from(bytes.len()).expect("transition input frame exceeds u32::MAX bytes");
+    builder.write_slice(&[len]);
+    builder.write_slice(bytes);
+}
+
+/// [`write_frame`] of `value`'s postcard encoding.
+fn write_postcard<T: serde::Serialize>(builder: &mut risc0_zkvm::ExecutorEnvBuilder<'_>, value: &T) {
+    let bytes = postcard::to_allocvec(value).expect("transition input must encode with postcard");
+    write_frame(builder, &bytes);
+}
+
 fn empty_storage_frontier() -> SerializableFrontier {
     SerializableFrontier {
         position: 0,
-        leaf: EMPTY_TRIE_NODES[0].to_vec(),
+        leaf: EMPTY_LEAF.to_vec(),
         ommers: Vec::new(),
     }
 }
@@ -127,10 +163,7 @@ fn empty_storage_frontier() -> SerializableFrontier {
 fn storage_root(frontier: &SerializableFrontier) -> Vec<u8> {
     let frontier = serializable_frontier_into_trace_frontier(frontier.clone())
         .expect("storage frontier should deserialize");
-    TraceTree::from_frontier(1, frontier)
-        .root(0)
-        .expect("storage root should exist")
-        .0
+    frontier_root(&frontier)
 }
 
 /// Replay trace transitions using the transition guest to prove merkle tree state transitions.
@@ -158,6 +191,13 @@ fn storage_root(frontier: &SerializableFrontier) -> Vec<u8> {
 ///   `TraceCommitmentExt::header` / `fingerprint_slice_witness`). Written to
 ///   the guest only at the window-opening `Init` step, which verifies the
 ///   slice and carries `refuted_trace_commitment` through the journal chain.
+/// * `window_start_recur_progress` - The recur-progress stack the window opens
+///   with, reconstructed from the trace prefix by the caller (see
+///   `TraceRecorder::recur_progress_after`). Required whenever the window's
+///   first step sits inside a live recur site; `None` means the canonical
+///   empty stack, which is itself a claim the guest checks. Read only at the
+///   `Init` step — later steps inherit it through `Transition`. See
+///   `window-seed-reconstruction.md`.
 ///
 /// # Returns
 /// A `TransitionReplayResult` with details about success or failure
@@ -173,12 +213,17 @@ pub fn step_transitions(
     // written to the guest, which hashes it to derive `program_commitment` and
     // decodes it for the CFS + tile registry. See program-identity.md.
     program_frame: &[u8],
-    input_sources_witnesses: &HashMap<StepRecord, Vec<u8>>,
+    input_sources_witnesses: &HashMap<(u64, StepRecord), StepRecordWitness>,
     recorded_step_io: &RecordedStepIo,
     replayed_results: &HashMap<StepRecord, ReplayResult>,
     authorization_journal: &AuthorizationJournal,
     authorization_receipt: &risc0_zkvm::Receipt,
     entrypoint_membership_witness: Option<&StorageReadWitness>,
+    window_start_recur_progress: Option<RecurProgressStack>,
+    // The commitment's revealed tail roots, so a divergence the packed
+    // fingerprint is blind to can still be proven. See
+    // `TransitionJournal::final_committed_root`.
+    revealed_tail_roots: &[NodeHash],
 ) -> Option<risc0_zkvm::Receipt> {
     let prover = risc0_zkvm::default_prover();
 
@@ -189,7 +234,6 @@ pub fn step_transitions(
         init_storage_frontier: initial_storage_frontier.clone(),
         init_storage_root: storage_root(initial_storage_frontier),
         init_storage_index_root: initial_storage_index_root.to_vec(),
-        active_drafts: Default::default(),
         fingerprint,
     };
 
@@ -212,17 +256,23 @@ pub fn step_transitions(
                 .is_none()
                 .then_some(entrypoint_membership_witness)
                 .flatten(),
-            // A window that opens *inside* a live loop needs its recur-progress
-            // seed reconstructed from the trace prefix, the way
-            // `storage_state_from_prefix` reconstructs the store. That is not
-            // built yet, so no seed is supplied.
+            // Only the window's first step reads the seed; every later step
+            // inherits the preimage through `Transition`. Same guard, and the
+            // same reason, as `entrypoint_membership_witness` above.
             //
-            // This fails **closed**, not open: the guest advances the empty
-            // stack by the step's own facts and compares against the recorded
-            // commitment, so a genuinely mid-loop window mismatches and is
-            // rejected. A window opening outside any loop — the common case —
-            // starts from the empty stack and verifies normally.
-            None,
+            // The seed is never believed: the guest advances it by the step's
+            // own facts and compares against the recorded
+            // `recur_progress_commitment`, so a wrong one is rejected exactly
+            // as an absent one is today.
+            current_journal
+                .is_none()
+                .then(|| window_start_recur_progress.clone())
+                .flatten(),
+            // Same guard again: bound at `Init` against the header, then
+            // carried forward as a single root on the journal.
+            current_journal
+                .is_none()
+                .then(|| revealed_tail_roots.to_vec()),
         );
         let replay_receipt_assumption: Option<risc0_zkvm::Receipt> =
             if step_record.requires_replay_proof() {
@@ -250,17 +300,17 @@ pub fn step_transitions(
             });
             builder.add_assumption(transition_receipt);
         }
-        builder.write(&program_frame.to_vec()).unwrap();
-        builder.write(&transition_image_id).unwrap();
-        builder.write(&input).unwrap();
-        builder.write(&current_state).unwrap();
+        write_frame(&mut builder, program_frame);
+        write_frame(&mut builder, &transition_image_id);
+        write_postcard(&mut builder, &input);
+        write_postcard(&mut builder, &current_state);
         if let Some(previous_journal) = current_journal {
-            builder.write(&previous_journal).unwrap();
+            write_postcard(&mut builder, &previous_journal);
         } else {
             // The window-opening `Init` step reads the commitment binding
             // right after the state (see the guest's `main`).
-            builder.write(commitment_header).unwrap();
-            builder.write(fingerprint_slice).unwrap();
+            write_postcard(&mut builder, commitment_header);
+            write_postcard(&mut builder, fingerprint_slice);
         }
         let env = builder.build().unwrap();
         let receipt = prover.prove(env, &TRANSITION_GUEST_ELF).unwrap().receipt;
@@ -279,9 +329,11 @@ pub fn step_transitions(
 mod tests {
     use super::*;
     use crate::authorization::authorize_external_inputs;
-    use crate::precomputed::EMPTY_TRIE_NODES;
+    use raster_core::merkle::EMPTY_LEAF;
     use raster_core::authorization::{AuthorizationJournal, ManifestedInputs};
-    use raster_core::cfs::{CfsCoordinates, ControlFlowSchema, SequenceDef};
+    use raster_core::cfs::{
+        CfsCoordinate, CfsCoordinates, ControlFlowSchema, SequenceDef, FIRST_COORDINATE,
+    };
     use raster_core::coordinate_index::coordinate_index_root;
     use raster_core::draft::TileReplayJournal;
     use raster_core::fingerprint::{BitPacker, Fingerprint};
@@ -290,8 +342,8 @@ mod tests {
 
     fn empty_store_roots() -> StorageRoots {
         StorageRoots {
-            root_before: EMPTY_TRIE_NODES[0].to_vec(),
-            root_after: EMPTY_TRIE_NODES[0].to_vec(),
+            root_before: EMPTY_LEAF.to_vec(),
+            root_after: EMPTY_LEAF.to_vec(),
             index_root_before: Vec::new(),
             index_root_after: Vec::new(),
         }
@@ -306,20 +358,21 @@ mod tests {
         }
     }
 
-    fn make_tile_step(exec_index: u64, coordinates: Vec<u32>) -> StepRecord {
+    fn make_tile_step(exec_index: u64, coordinates: Vec<CfsCoordinate>) -> StepRecord {
         StepRecord {
             exec_index,
             sequence_id: "main".to_string(),
             coordinates: CfsCoordinates(coordinates),
             kind: StepKind::Exec(ExecStep {
                 target: ExecTarget::Tile("shared_tile".to_string()),
-                intra_sequence_index: 0,
+                intra_sequence_index: FIRST_COORDINATE,
                 input_commitment: vec![exec_index as u8],
                 input_source_commitment: Vec::new(),
                 output_commitment: vec![exec_index as u8 + 1],
                 storage: empty_store_roots(),
             }),
             recur_progress_commitment: RecurProgressStack::new().commitment(),
+            recur_state: None,
         }
     }
 
@@ -351,6 +404,65 @@ mod tests {
         }
     }
 
+    /// A step's input carries only the witnesses keyed by its own
+    /// `exec_index`. The guest's lookup (`checks::cfs::verify_sequence_scope_parent`)
+    /// requires that same key, so this keeps a superset of what it can match
+    /// and drops the rest of the window's entries.
+    #[test]
+    fn build_transition_input_keeps_only_this_steps_witnesses() {
+        let step = make_tile_step(2, vec![1]);
+        let source = make_tile_step(0, vec![2]);
+        let other_source = make_tile_step(3, vec![3]);
+        let witness = |position: u64| StepRecordWitness {
+            position,
+            path_elems: vec![[position as u8; 32].into()],
+        };
+        let window_witnesses = HashMap::from([
+            ((1, source.clone()), witness(10)),
+            ((2, source.clone()), witness(20)),
+            ((2, other_source.clone()), witness(21)),
+            ((4, other_source.clone()), witness(40)),
+        ]);
+        let recorded_step_io = HashMap::from([(step.clone(), io_witnesses(None, None))]);
+        let replayed_results = HashMap::from([(
+            step.clone(),
+            ReplayResult {
+                fn_name: "shared_tile".to_string(),
+                receipt: vec![],
+                image_id: vec![9; 32],
+                input: vec![],
+                output: vec![],
+                replay_journal: TileReplayJournal {
+                    input_commitment: [0u8; 32],
+                    output_bytes: vec![],
+                    output_root: None,
+                    input_roots: Vec::new(),
+                    draft_transition: None,
+                    recur: None,
+                },
+            },
+        )]);
+
+        let input = build_transition_input(
+            &step,
+            &window_witnesses,
+            &recorded_step_io,
+            &replayed_results,
+            &make_authorization_journal(),
+            None,
+            None,
+            None,
+        );
+
+        let mut kept: Vec<(u64, u64, u64)> = input
+            .input_sources_witnesses
+            .iter()
+            .map(|((verifier, record), witness)| (*verifier, record.exec_index, witness.position))
+            .collect();
+        kept.sort();
+        assert_eq!(kept, vec![(2, 0, 20), (2, 3, 21)]);
+    }
+
     #[test]
     fn build_transition_input_uses_step_record_key_for_repeated_tiles() {
         let first_step = make_tile_step(1, vec![0]);
@@ -378,6 +490,8 @@ mod tests {
                     replay_journal: TileReplayJournal {
                         input_commitment: [0u8; 32],
                         output_bytes: vec![11],
+                        output_root: None,
+                        input_roots: Vec::new(),
                         draft_transition: None,
                         recur: None,
                     },
@@ -394,6 +508,8 @@ mod tests {
                     replay_journal: TileReplayJournal {
                         input_commitment: [0u8; 32],
                         output_bytes: vec![22],
+                        output_root: None,
+                        input_roots: Vec::new(),
                         draft_transition: None,
                         recur: None,
                     },
@@ -407,6 +523,7 @@ mod tests {
             &recorded_step_io,
             &replayed_results,
             &make_authorization_journal(),
+            None,
             None,
             None,
         );
@@ -441,6 +558,8 @@ mod tests {
                 replay_journal: TileReplayJournal {
                     input_commitment: [0u8; 32],
                     output_bytes: error_output.clone(),
+                    output_root: None,
+                    input_roots: Vec::new(),
                     draft_transition: None,
                     recur: None,
                 },
@@ -453,6 +572,7 @@ mod tests {
             &recorded_step_io,
             &replayed_results,
             &make_authorization_journal(),
+            None,
             None,
             None,
         );
@@ -476,6 +596,7 @@ mod tests {
                 input_source_commitment: Vec::new(),
             },
             recur_progress_commitment: RecurProgressStack::new().commitment(),
+            recur_state: None,
         };
         let sequence_end = StepRecord {
             exec_index: 2,
@@ -485,6 +606,7 @@ mod tests {
                 output_commitment: vec![2; 32],
             },
             recur_progress_commitment: RecurProgressStack::new().commitment(),
+            recur_state: None,
         };
         let recorded_step_io = HashMap::from([
             (sequence_start.clone(), io_witnesses(Some(vec![3, 4]), None)),
@@ -499,6 +621,7 @@ mod tests {
             &make_authorization_journal(),
             None,
             None,
+            None,
         );
         let end_input = build_transition_input(
             &sequence_end,
@@ -506,6 +629,7 @@ mod tests {
             &recorded_step_io,
             &HashMap::new(),
             &make_authorization_journal(),
+            None,
             None,
             None,
         );
@@ -538,7 +662,7 @@ mod tests {
     fn make_init_frontier() -> SerializableFrontier {
         SerializableFrontier {
             position: 0,
-            leaf: crate::precomputed::EMPTY_TRIE_NODES[0].to_vec(),
+            leaf: EMPTY_LEAF.to_vec(),
             ommers: Vec::new(),
         }
     }
@@ -579,6 +703,7 @@ mod tests {
                 .to_vec(),
             },
             recur_progress_commitment: RecurProgressStack::new().commitment(),
+            recur_state: None,
         }
     }
 
@@ -604,6 +729,8 @@ mod tests {
             entrypoint_membership_witness: None,
             program_output_read_witness: None,
             program_output_selection_witness: None,
+            returned_state_read_witness: None,
+            revealed_tail_roots: None,
         };
         let window_fingerprint = Fingerprint::from(vec![0], BitPacker::new(64), 1);
         let state = TransitionState::Init(InitTransition {
@@ -611,14 +738,16 @@ mod tests {
             init_storage_frontier: make_init_frontier(),
             init_storage_root: storage_root(&make_init_frontier()),
             init_storage_index_root: coordinate_index_root(&std::collections::BTreeMap::new()),
-            active_drafts: Default::default(),
-            fingerprint: window_fingerprint.clone(),
+                fingerprint: window_fingerprint.clone(),
         });
         // A minimal commitment whose fingerprint *is* the window (start 0),
-        // so the guest's Init-time slice check passes.
+        // so the guest's Init-time slice check passes. One revealed item, so
+        // the header's `window_size` agrees with the one-item window this
+        // proves — the guest asserts that agreement.
         let trace_commitment = TraceCommitment {
             fingerprint: window_fingerprint,
-            revealed_items: Vec::new(),
+            revealed_items: vec![make_sequence_start_step()],
+            revealed_tail_roots: vec![[0u8; 32].into()],
         };
         let commitment_header = trace_commitment.header();
         let fingerprint_slice = trace_commitment.fingerprint_slice_witness(0, 1);
@@ -627,12 +756,12 @@ mod tests {
         if let Some(receipt) = authorization_receipt {
             builder.add_assumption(receipt);
         }
-        builder.write(&make_minimal_program_frame()).unwrap();
-        builder.write(&image_id_bytes(TRANSITION_GUEST_ID)).unwrap();
-        builder.write(&input).unwrap();
-        builder.write(&state).unwrap();
-        builder.write(&commitment_header).unwrap();
-        builder.write(&fingerprint_slice).unwrap();
+        write_frame(&mut builder, &make_minimal_program_frame());
+        write_frame(&mut builder, &image_id_bytes(TRANSITION_GUEST_ID));
+        write_postcard(&mut builder, &input);
+        write_postcard(&mut builder, &state);
+        write_postcard(&mut builder, &commitment_header);
+        write_postcard(&mut builder, &fingerprint_slice);
         let env = builder.build().unwrap();
 
         prover.prove(env, &TRANSITION_GUEST_ELF)

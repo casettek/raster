@@ -11,13 +11,12 @@
 //!    the resulting journal (`Next`, or `Finished` on the proven divergence).
 
 mod checks;
+mod frame;
 mod fraud_proof;
 mod merkle_tree;
 
 #[cfg(test)]
 mod tests;
-
-use risc0_zkvm::guest::env;
 
 use raster_core::transition::{
     FingerprintSliceWitness, TraceCommitmentHeader, TransitionInput, TransitionState,
@@ -30,15 +29,15 @@ fn main() {
     // Host inputs, in write order. A `Next` step's previous journal is read
     // inside `ChainLink::establish`.
     let params = PublicParams::read();
-    let input: TransitionInput = env::read();
-    let state: TransitionState = env::read();
+    let input: TransitionInput = frame::read();
+    let state: TransitionState = frame::read();
     // Only the window-opening step binds the committed fingerprint to a
     // named `commit.bin`: it reads the commitment's compact header and the
     // slice witness covering this window. `Next` steps inherit the (already
     // verified) binding from the previous journal instead.
     let commitment_binding: Option<(TraceCommitmentHeader, FingerprintSliceWitness)> = match &state
     {
-        TransitionState::Init(_) => Some((env::read(), env::read())),
+        TransitionState::Init(_) => Some((frame::read(), frame::read())),
         _ => None,
     };
 
@@ -60,7 +59,7 @@ fn main() {
     // Continue the window, or finish on the proven fingerprint divergence.
     let current_state = next.finalize(
         &window_context.init_state.fingerprint,
-        &window_context.position,
+        window_context.final_committed_root.as_ref(),
     );
 
     commit_journal(
@@ -70,6 +69,7 @@ fn main() {
         params.program_commitment,
         window_context.refuted_trace_commitment,
         window_context.window_is_terminal,
+        window_context.final_committed_root,
         &input,
         entrypoint_authorization,
         output_authorization,
