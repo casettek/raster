@@ -933,24 +933,39 @@ impl CallVisitor {
         }
     }
 
-    /// The file's integer `const` items, evaluated in order: what a body can
-    /// name as a range bound before it binds any of its own.
+    /// The file's integer `const` items: what a body can name as a range
+    /// bound before it binds any of its own.
     fn file_constants(ast: &syn::File) -> HashMap<String, u64> {
         let mut visitor = Self::with_types(TypeContext::default());
-        for item in &ast.items {
-            if let syn::Item::Const(item) = item {
-                visitor.record_const(item);
-            }
-        }
+        visitor.record_consts(ast.items.iter().filter_map(|item| match item {
+            syn::Item::Const(item) => Some(item),
+            _ => None,
+        }));
         visitor.constants
     }
 
-    fn record_const(&mut self, item: &syn::ItemConst) {
-        let name = item.ident.to_string();
-        match self.eval_const(&item.expr) {
-            Some(value) => self.constants.insert(name, value),
-            None => self.constants.remove(&name),
-        };
+    /// Bring one scope's `const` items into scope together. An item may name
+    /// one declared after it, so they are evaluated until none more resolve,
+    /// not in source order. Each shadows the outer constant of its name; one
+    /// that never resolves (a cycle, an unsupported expression) is unknown.
+    fn record_consts<'a>(&mut self, items: impl IntoIterator<Item = &'a syn::ItemConst>) {
+        let mut pending: Vec<&syn::ItemConst> = items.into_iter().collect();
+        for item in &pending {
+            self.constants.remove(&item.ident.to_string());
+        }
+        loop {
+            let before = pending.len();
+            pending.retain(|item| match self.eval_const(&item.expr) {
+                Some(value) => {
+                    self.constants.insert(item.ident.to_string(), value);
+                    false
+                }
+                None => true,
+            });
+            if pending.len() == before {
+                break;
+            }
+        }
     }
 
     /// Every name a pattern binds, for forgetting the constants it shadows.
@@ -1640,9 +1655,9 @@ impl<'ast> Visit<'ast> for CallVisitor {
         syn::visit::visit_item_fn(self, node);
     }
 
-    fn visit_item_const(&mut self, node: &'ast syn::ItemConst) {
-        self.record_const(node);
-    }
+    /// A block's `const` items are in scope throughout it, so `visit_block`
+    /// records them all before its statements.
+    fn visit_item_const(&mut self, _node: &'ast syn::ItemConst) {}
 
     /// A nested block's `let`s and `const`s go out of scope at its end: the
     /// constants, local types and bindings they bound or shadowed revert to
@@ -1657,6 +1672,10 @@ impl<'ast> Visit<'ast> for CallVisitor {
                 self.scope.clone(),
             )
         });
+        self.record_consts(node.stmts.iter().filter_map(|stmt| match stmt {
+            syn::Stmt::Item(syn::Item::Const(item)) => Some(item),
+            _ => None,
+        }));
         syn::visit::visit_block(self, node);
         if let Some((constants, locals, scope)) = outer {
             self.constants = constants;
@@ -2304,6 +2323,32 @@ mod tests {
         );
     }
 
+    /// A `const` may name one declared after it, at file or block scope, and
+    /// a block's constants are in scope before their declaration.
+    #[test]
+    fn test_range_bounds_read_forward_constants() {
+        let function = parse_only_function(
+            r#"
+            const END: usize = START + 2;
+            const START: usize = 0;
+            fn main(table: Table) {
+                call!(consume, select!(Block<Row>, table.rows[START..END]));
+                call!(consume, select!(Block<Row>, table.rows[LOW..HIGH]));
+                const HIGH: usize = LOW + END;
+                const LOW: usize = 1;
+            }"#,
+        );
+        assert!(function.selection_errors.is_empty(), "{:?}", function.selection_errors);
+        assert_eq!(
+            function.call_infos[0].argument_kinds,
+            vec![rooted_at("table", Some(rows_range(0, 2)))]
+        );
+        assert_eq!(
+            function.call_infos[1].argument_kinds,
+            vec![rooted_at("table", Some(rows_range(1, 3)))]
+        );
+    }
+
     /// A bound the compiler cannot evaluate leaves the path unknown, and the
     /// selection is an error rather than a read of the whole root.
     #[test]
@@ -2325,6 +2370,13 @@ mod tests {
             const END: usize = 2;
             fn main(table: Table, END: u64) {
                 call!(consume, select!(Block<Row>, table.rows[0..END]));
+            }"#,
+            // Constants that only name each other never resolve.
+            r#"
+            const START: usize = END - 2;
+            const END: usize = START + 2;
+            fn main(table: Table) {
+                call!(consume, select!(Block<Row>, table.rows[START..END]));
             }"#,
             // Underflow.
             r#"fn main(table: Table) {
