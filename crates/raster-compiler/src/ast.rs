@@ -164,9 +164,10 @@ pub struct FunctionAstItem {
     pub selection_index_sources: Vec<(String, Vec<String>)>,
     /// `let name = select!(T, root.path)` locals, as `(name, path)` — the
     /// static selector path each selection appends to its root's selector,
-    /// in selector order. `clone!`/`into_ref!`/`.clone()` aliases append
-    /// nothing, so they record an empty path. A selection with a
-    /// data-sourced index records none.
+    /// in selector order. `clone!`/`into_ref!`/`.clone()` aliases record the
+    /// path of what they wrap: empty for `clone!(x)`, `[f]` for
+    /// `clone!(select!(T, x.f))`. A selection with a data-sourced index
+    /// records none.
     pub selection_paths: Vec<(String, Vec<SelectorSegment>)>,
     /// The body's returned expression, classified. `None` when the body ends
     /// in a statement (a unit return).
@@ -402,6 +403,23 @@ impl CallVisitor {
         self.selection_paths.clone()
     }
 
+    /// Record `name` as a view of `root` through `view`, a form that re-points
+    /// at the same value (`clone!(x)`, `into_ref!(x)`, `x.clone()`). It keeps
+    /// the path and index sources of any selection it wraps:
+    /// `clone!(select!(T, x.f))` is `x.f`, not the whole of `x`. Like a bare
+    /// `select!` alias, a data-sourced index records no static path.
+    fn record_view_alias(&mut self, name: &str, root: String, view: &Expr) {
+        self.selection_aliases.push((name.to_string(), root));
+        if let Some(path) = Self::argument_path(view) {
+            self.selection_paths.push((name.to_string(), path));
+        }
+        let index_roots = Self::view_index_roots(view);
+        if !index_roots.is_empty() {
+            self.selection_index_sources
+                .push((name.to_string(), index_roots));
+        }
+    }
+
     /// Extracts the binding name from a pattern (e.g., `x` from `let x = ...`)
     fn extract_binding_name(pat: &Pat) -> Option<String> {
         match pat {
@@ -468,28 +486,19 @@ impl CallVisitor {
                     },
                 }
             }
-            // Views that append nothing to the selector.
+            // Views re-point at the value they wrap, so they return whatever it
+            // is: `clone!(x)` returns `x`, and `clone!(select!(T, x.f))` returns
+            // `x.f`, not the whole of `x`.
             Expr::Macro(expr_macro) if Self::is_reference_macro(&expr_macro.mac) => {
-                match Self::reference_macro_root(&expr_macro.mac) {
-                    Some(root) => ReturnExpr::Rooted {
-                        root,
-                        path: Vec::new(),
-                    },
+                match Self::reference_macro_arg(&expr_macro.mac) {
+                    Some(inner) => Self::classify_return_expr(&inner),
                     None => ReturnExpr::Unbound {
                         expr: Self::expr_to_string(expr),
                     },
                 }
             }
             Expr::MethodCall(call) if call.method == "clone" && call.args.is_empty() => {
-                match Self::expr_root_ident(&call.receiver) {
-                    Some(root) => ReturnExpr::Rooted {
-                        root,
-                        path: Vec::new(),
-                    },
-                    None => ReturnExpr::Unbound {
-                        expr: Self::expr_to_string(expr),
-                    },
-                }
+                Self::classify_return_expr(&call.receiver)
             }
             Expr::Path(path) if path.path.get_ident().is_some() => ReturnExpr::Rooted {
                 root: path.path.get_ident().expect("checked above").to_string(),
@@ -891,7 +900,9 @@ impl CallVisitor {
     /// The static selector path an argument expression appends to its root —
     /// what the runtime appends to the root's selector when the argument is
     /// bound. Only `select!` narrows: `clone!`, `into_ref!`, `.clone()`, `&x`
-    /// and parentheses re-point at the same value, so they pass through.
+    /// and parentheses re-point at the same value, so they pass through to it.
+    /// That value may itself be a selection: `clone!(select!(T, x.f))` keeps
+    /// the selected reference, so its path is `[f]`, not empty.
     ///
     /// A raw `x.f` or `x[0]` does not compile on a sequence binding (an
     /// `AuthRef` has no `Deref`), so it is read as passing `x` whole rather
@@ -900,6 +911,9 @@ impl CallVisitor {
         match expr {
             Expr::Macro(expr_macro) if Self::is_selection_macro(&expr_macro.mac) => {
                 Self::selection_macro_path(&expr_macro.mac)
+            }
+            Expr::Macro(expr_macro) if Self::is_reference_macro(&expr_macro.mac) => {
+                Self::argument_path(&Self::reference_macro_arg(&expr_macro.mac)?)
             }
             Expr::Paren(paren) => Self::argument_path(&paren.expr),
             Expr::Reference(reference) => Self::argument_path(&reference.expr),
@@ -953,8 +967,35 @@ impl CallVisitor {
     /// carries exactly the provenance of its argument — which is why they
     /// resolve like selections rather than like calls.
     fn reference_macro_root(mac: &syn::Macro) -> Option<String> {
-        let expr = mac.parse_body_with(Expr::parse).ok()?;
-        Self::expr_root_ident(&expr)
+        Self::expr_root_ident(&Self::reference_macro_arg(mac)?)
+    }
+
+    /// The single expression a reference macro wraps: `x` in `clone!(x)`,
+    /// `select!(T, x.f)` in `clone!(select!(T, x.f))`.
+    fn reference_macro_arg(mac: &syn::Macro) -> Option<Expr> {
+        mac.parse_body_with(Expr::parse).ok()
+    }
+
+    /// The data-sourced index names of the selection a view expression wraps,
+    /// looking through the forms that re-point at the same value (`clone!`,
+    /// `into_ref!`, `.clone()`, `&x`, parentheses, `x?`). Empty when there is
+    /// no selection or its indexes are all literal.
+    fn view_index_roots(expr: &Expr) -> Vec<String> {
+        match expr {
+            Expr::Macro(expr_macro) if Self::is_selection_macro(&expr_macro.mac) => {
+                Self::selection_macro_index_roots(&expr_macro.mac)
+            }
+            Expr::Macro(expr_macro) if Self::is_reference_macro(&expr_macro.mac) => {
+                Self::reference_macro_arg(&expr_macro.mac)
+                    .map(|inner| Self::view_index_roots(&inner))
+                    .unwrap_or_default()
+            }
+            Expr::Paren(paren) => Self::view_index_roots(&paren.expr),
+            Expr::Reference(reference) => Self::view_index_roots(&reference.expr),
+            Expr::Try(try_expr) => Self::view_index_roots(&try_expr.expr),
+            Expr::MethodCall(call) => Self::view_index_roots(&call.receiver),
+            _ => Vec::new(),
+        }
     }
 
     /// The names supplying a `select!`'s **data-sourced** indexes, outermost
@@ -1087,8 +1128,7 @@ impl<'ast> Visit<'ast> for CallVisitor {
                     }
                 } else if Self::is_reference_macro(&expr_macro.mac) {
                     if let Some(root) = Self::reference_macro_root(&expr_macro.mac) {
-                        self.selection_aliases.push((name.clone(), root));
-                        self.selection_paths.push((name.clone(), Vec::new()));
+                        self.record_view_alias(name, root, &init.expr);
                     }
                 }
             // A bare `binding.clone()` is the pre-DSL spelling of `clone!`. It
@@ -1101,8 +1141,7 @@ impl<'ast> Visit<'ast> for CallVisitor {
             } else if let Expr::MethodCall(call) = init.expr.as_ref() {
                 if call.method == "clone" {
                     if let Some(root) = Self::expr_root_ident(&call.receiver) {
-                        self.selection_aliases.push((name.clone(), root));
-                        self.selection_paths.push((name.clone(), Vec::new()));
+                        self.record_view_alias(name, root, &init.expr);
                     }
                 }
             }
@@ -1292,6 +1331,15 @@ mod tests {
             classify_return_of("fn main() -> X { let s = call!(f, b); clone!(s) }"),
             rooted_return("s")
         );
+        // A cloned selection returns the selected field, not the whole binding.
+        assert_eq!(
+            classify_return_of("fn main() -> u64 { let s = call!(f, b); clone!(select!(u64, s.count)) }"),
+            rooted_return_at("s", vec![field("count")])
+        );
+        assert_eq!(
+            classify_return_of("fn main() -> u64 { let s = call!(f, b); select!(u64, s.count).clone() }"),
+            rooted_return_at("s", vec![field("count")])
+        );
         assert_eq!(
             classify_return_of("fn main() -> u64 { let s = call!(f, b); return s; }"),
             rooted_return("s")
@@ -1321,6 +1369,76 @@ mod tests {
         ));
         // A unit body returns nothing to bind.
         assert_eq!(classify_return_of("fn main() { call!(f, b); }"), None);
+    }
+
+    /// A reference macro keeps the selection it wraps. `clone!(select!(T,
+    /// data.name))` hands the tile `data.name`, so the argument's path is
+    /// `[name]`: an empty path would bind the whole of `data`, which the
+    /// runtime never passes, and reject the honest step.
+    #[test]
+    fn cloned_selection_arguments_keep_their_paths() {
+        let calls = parse_calls(
+            "fn s(data: D) { \
+             call!(t, clone!(select!(String, data.name))); \
+             call!(t, into_ref!(select!(String, data.name))); \
+             call!(t, clone!(select!(String, data.clone().name))); \
+             call!(t, select!(String, data.name).clone()); \
+             call!(t, clone!(data)); \
+             call!(t, clone!(select!(u64, data.rows[i]))); }",
+        );
+        let kinds: Vec<CallArgumentKind> = calls
+            .into_iter()
+            .map(|call| call.argument_kinds[0].clone())
+            .collect();
+        let name = || Some(vec![field("name")]);
+        assert_eq!(
+            kinds,
+            vec![
+                rooted_at("data", name()),
+                rooted_at("data", name()),
+                rooted_at("data", name()),
+                rooted_at("data", name()),
+                rooted("data"),
+                // A data-sourced index still has no static path.
+                rooted_at("data", None),
+            ]
+        );
+    }
+
+    /// The same for a local bound to a cloned selection: the alias carries
+    /// the selection's path and index sources, as a bare `select!` alias does.
+    #[test]
+    fn cloned_selection_aliases_keep_their_paths() {
+        let file: syn::File = syn::parse_str(
+            "fn seq() { let s = call!(f, b); \
+             let n = clone!(select!(String, s.name)); \
+             let k = select!(u64, s.count).clone(); \
+             let c = clone!(s); \
+             let q = clone!(select!(u64, s.rows[i])); }",
+        )
+        .expect("parse");
+        let mut visitor = CallVisitor::new();
+        visitor.visit_file(&file);
+        let aliases = visitor.get_selection_aliases();
+        for name in ["n", "k", "c", "q"] {
+            assert!(
+                aliases.contains(&(name.to_string(), "s".to_string())),
+                "{name} should alias s"
+            );
+        }
+        assert_eq!(
+            visitor.get_selection_paths(),
+            vec![
+                ("n".to_string(), vec![field("name")]),
+                ("k".to_string(), vec![field("count")]),
+                ("c".to_string(), vec![]),
+                // `q`'s index is data-sourced: no static path is recorded.
+            ]
+        );
+        assert_eq!(
+            visitor.get_selection_index_sources(),
+            vec![("q".to_string(), vec!["i".to_string()])]
+        );
     }
 
     #[test]
