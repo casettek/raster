@@ -174,10 +174,11 @@ pub struct FunctionAstItem {
     /// The body's returned expression, classified. `None` when the body ends
     /// in a statement (a unit return).
     pub return_expr: Option<ReturnExpr>,
-    /// Byte-page selections the compiler could not lower to the path the
-    /// `select!` macro records: the page size of the `Bytes<N>` they index
-    /// could not be read from the source. Building a CFS fails on any of
-    /// these rather than declaring a path no run records.
+    /// Selections the compiler could not lower to the path the `select!`
+    /// macro records: a byte offset into a `Bytes<N>` whose page size could
+    /// not be read from the source, or a range bound it cannot evaluate.
+    /// Building a CFS fails on any of these rather than declaring a path no
+    /// run records.
     pub selection_errors: Vec<String>,
 }
 
@@ -256,13 +257,14 @@ impl ProjectAst {
             .collect()
     }
 
-    fn parse_functions(
+    pub(crate) fn parse_functions(
         ast: &syn::File,
         path: PathBuf,
         structs: &Rc<Vec<StructAstItem>>,
         fn_outputs: &Rc<HashMap<String, String>>,
     ) -> Vec<FunctionAstItem> {
         let mut functions = Vec::new();
+        let file_constants = CallVisitor::file_constants(ast);
 
         for item in &ast.items {
             if let syn::Item::Fn(func) = item {
@@ -304,7 +306,12 @@ impl ProjectAst {
                     Rc::clone(fn_outputs),
                     input_names.iter().cloned().zip(inputs.iter().cloned()),
                 );
-                let mut visitor = CallVisitor::with_types(types);
+                // A parameter shadows the file constant it names.
+                let mut constants = file_constants.clone();
+                for name in &input_names {
+                    constants.remove(name);
+                }
+                let mut visitor = CallVisitor::with_types(types).with_constants(constants);
                 visitor.visit_item_fn(func);
                 let call_infos = visitor.get_call_infos();
                 let selection_aliases = visitor.get_selection_aliases();
@@ -456,6 +463,13 @@ pub struct CallVisitor {
     /// Selections whose path could not be lowered (see
     /// `FunctionAstItem::selection_errors`).
     selection_errors: RefCell<Vec<String>>,
+    /// Integer constants in scope, by name: the file's `const` items, then the
+    /// body's `let`s and `const`s in statement order. A `select!` range whose
+    /// bounds are locals (`rows[start..end]`) records the values those locals
+    /// hold, so the compiler reads them here to declare the same path.
+    constants: HashMap<String, u64>,
+    /// How many blocks deep the visit is, for scoping `constants`.
+    block_depth: usize,
 }
 
 impl CallVisitor {
@@ -474,6 +488,23 @@ impl CallVisitor {
             selection_paths: Vec::new(),
             types,
             selection_errors: RefCell::new(Vec::new()),
+            constants: HashMap::new(),
+            block_depth: 0,
+        }
+    }
+
+    /// Seed the integer constants in scope at the start of the body.
+    fn with_constants(mut self, constants: HashMap<String, u64>) -> Self {
+        self.constants = constants;
+        self
+    }
+
+    /// Record a selection error once: the same `select!` is lowered from
+    /// several places (its `let`, each argument naming it, the return).
+    fn push_selection_error(&self, message: String) {
+        let mut errors = self.selection_errors.borrow_mut();
+        if !errors.contains(&message) {
+            errors.push(message);
         }
     }
 
@@ -511,6 +542,14 @@ impl CallVisitor {
         if !index_roots.is_empty() {
             self.selection_index_sources
                 .push((name.to_string(), index_roots));
+        }
+    }
+
+    /// `x` in `x: T`.
+    fn unwrap_type_pat(pat: &Pat) -> &Pat {
+        match pat {
+            Pat::Type(pat_type) => Self::unwrap_type_pat(&pat_type.pat),
+            other => other,
         }
     }
 
@@ -616,10 +655,28 @@ impl CallVisitor {
     ///
     /// A byte-page selection is lowered as well; see
     /// [`Self::lower_byte_page_path`].
+    ///
+    /// A range bound may be a constant the body or file binds (`let start = 0;`
+    /// … `rows[start..end]`): the macro records the value it holds, and so
+    /// does this. When a selection with no data-sourced index still has no
+    /// static path — a bound the compiler cannot evaluate — it is recorded in
+    /// `selection_errors`: returning `None` would declare a read of the whole
+    /// root, which no run records.
     fn selection_macro_path(&self, mac: &syn::Macro) -> Option<Vec<SelectorSegment>> {
         let args = mac.parse_body_with(SelectionMacroArgs::parse).ok()?;
         let mut path = Vec::new();
-        Self::collect_static_path(&args.expr, &mut path)?;
+        if self.collect_static_path(&args.expr, &mut path).is_none() {
+            let mut index_roots = Vec::new();
+            Self::collect_index_roots(&args.expr, &mut index_roots);
+            if index_roots.is_empty() {
+                self.push_selection_error(format!(
+                    "cannot evaluate the selector path of `{}`: range bounds must be integer \
+                     literals, or locals and constants bound to integer constant expressions",
+                    Self::expr_to_string(&args.expr)
+                ));
+            }
+            return None;
+        }
         Some(self.lower_byte_page_path(&args, path))
     }
 
@@ -664,7 +721,7 @@ impl CallVisitor {
         });
         let selection = Self::expr_to_string(&args.expr);
         let Some(page_size) = page_size.filter(|size| *size > 0) else {
-            self.selection_errors.borrow_mut().push(format!(
+            self.push_selection_error(format!(
                 "cannot read the page size of the `Bytes<N>` that `{selection}` indexes, so its \
                  byte offset cannot be lowered to a page index; select the page explicitly \
                  with `.pages[k]` or `.pages[a..b]`"
@@ -684,7 +741,7 @@ impl CallVisitor {
             }
             _ => {
                 // `select!` refuses to compile an unaligned offset.
-                self.selection_errors.borrow_mut().push(format!(
+                self.push_selection_error(format!(
                     "`{selection}` is not aligned to its page size {page_size}"
                 ));
                 return path;
@@ -736,10 +793,10 @@ impl CallVisitor {
         }
     }
 
-    fn collect_static_path(expr: &Expr, path: &mut Vec<SelectorSegment>) -> Option<()> {
+    fn collect_static_path(&self, expr: &Expr, path: &mut Vec<SelectorSegment>) -> Option<()> {
         match expr {
             Expr::Field(field) => {
-                Self::collect_static_path(&field.base, path)?;
+                self.collect_static_path(&field.base, path)?;
                 path.push(match &field.member {
                     syn::Member::Named(ident) => SelectorSegment::Field(ident.to_string()),
                     syn::Member::Unnamed(index) => SelectorSegment::Index(u64::from(index.index)),
@@ -747,20 +804,16 @@ impl CallVisitor {
                 Some(())
             }
             Expr::Index(index) => {
-                Self::collect_static_path(&index.expr, path)?;
+                self.collect_static_path(&index.expr, path)?;
                 match index.index.as_ref() {
                     Expr::Lit(ExprLit {
                         lit: Lit::Int(value),
                         ..
                     }) => path.push(SelectorSegment::Index(value.base10_parse().ok()?)),
                     Expr::Range(range) => {
-                        let bound = |expr: &Option<Box<Expr>>| match expr.as_deref() {
-                            Some(Expr::Lit(ExprLit {
-                                lit: Lit::Int(value),
-                                ..
-                            })) => value.base10_parse::<u64>().ok(),
-                            _ => None,
-                        };
+                        // A literal bound, or one the macro evaluates at run
+                        // time (`(start) as u64`) from a constant in scope.
+                        let bound = |expr: &Option<Box<Expr>>| self.eval_const(expr.as_deref()?);
                         if !matches!(range.limits, syn::RangeLimits::HalfOpen(_)) {
                             return None;
                         }
@@ -776,6 +829,100 @@ impl CallVisitor {
             // The selection's base — the root binding, possibly `x.clone()` —
             // contributes no segments, as in the macro.
             _ => Some(()),
+        }
+    }
+
+    /// Evaluate an integer constant expression over the constants in scope:
+    /// literals, constant names, parentheses, `as` casts to an unsigned type
+    /// the value fits, and checked `+ - * / %`. `None` for anything else,
+    /// including arithmetic that would overflow or divide by zero.
+    fn eval_const(&self, expr: &Expr) -> Option<u64> {
+        match expr {
+            Expr::Lit(ExprLit {
+                lit: Lit::Int(value),
+                ..
+            }) => value.base10_parse::<u64>().ok(),
+            Expr::Path(path) => self.constants.get(&path.path.get_ident()?.to_string()).copied(),
+            Expr::Paren(paren) => self.eval_const(&paren.expr),
+            Expr::Group(group) => self.eval_const(&group.expr),
+            Expr::Cast(cast) => {
+                let value = self.eval_const(&cast.expr)?;
+                let syn::Type::Path(ty) = cast.ty.as_ref() else {
+                    return None;
+                };
+                let max = match ty.path.get_ident()?.to_string().as_str() {
+                    "u8" => u64::from(u8::MAX),
+                    "u16" => u64::from(u16::MAX),
+                    "u32" => u64::from(u32::MAX),
+                    "u64" | "usize" => u64::MAX,
+                    _ => return None,
+                };
+                (value <= max).then_some(value)
+            }
+            Expr::Binary(binary) => {
+                let left = self.eval_const(&binary.left)?;
+                let right = self.eval_const(&binary.right)?;
+                match binary.op {
+                    syn::BinOp::Add(_) => left.checked_add(right),
+                    syn::BinOp::Sub(_) => left.checked_sub(right),
+                    syn::BinOp::Mul(_) => left.checked_mul(right),
+                    syn::BinOp::Div(_) => left.checked_div(right),
+                    syn::BinOp::Rem(_) => left.checked_rem(right),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// The file's integer `const` items, evaluated in order: what a body can
+    /// name as a range bound before it binds any of its own.
+    fn file_constants(ast: &syn::File) -> HashMap<String, u64> {
+        let mut visitor = Self::with_types(TypeContext::default());
+        for item in &ast.items {
+            if let syn::Item::Const(item) = item {
+                visitor.record_const(item);
+            }
+        }
+        visitor.constants
+    }
+
+    fn record_const(&mut self, item: &syn::ItemConst) {
+        let name = item.ident.to_string();
+        match self.eval_const(&item.expr) {
+            Some(value) => self.constants.insert(name, value),
+            None => self.constants.remove(&name),
+        };
+    }
+
+    /// Every name a pattern binds, for forgetting the constants it shadows.
+    fn pattern_bindings(pat: &Pat, names: &mut Vec<String>) {
+        match pat {
+            Pat::Ident(pat_ident) => names.push(pat_ident.ident.to_string()),
+            Pat::Type(pat_type) => Self::pattern_bindings(&pat_type.pat, names),
+            Pat::Tuple(tuple) => tuple
+                .elems
+                .iter()
+                .for_each(|elem| Self::pattern_bindings(elem, names)),
+            Pat::TupleStruct(tuple) => tuple
+                .elems
+                .iter()
+                .for_each(|elem| Self::pattern_bindings(elem, names)),
+            Pat::Struct(pat_struct) => pat_struct
+                .fields
+                .iter()
+                .for_each(|field| Self::pattern_bindings(&field.pat, names)),
+            Pat::Reference(reference) => Self::pattern_bindings(&reference.pat, names),
+            Pat::Slice(slice) => slice
+                .elems
+                .iter()
+                .for_each(|elem| Self::pattern_bindings(elem, names)),
+            Pat::Paren(paren) => Self::pattern_bindings(&paren.pat, names),
+            Pat::Or(or) => or
+                .cases
+                .iter()
+                .for_each(|case| Self::pattern_bindings(case, names)),
+            _ => {}
         }
     }
 
@@ -1371,6 +1518,23 @@ impl<'ast> Visit<'ast> for CallVisitor {
         // Clear the binding context after processing
         self.current_binding = None;
 
+        // A `let` binding an integer constant brings it into scope for later
+        // range bounds; any other `let` shadows whatever constant it names.
+        let constant = node
+            .init
+            .as_ref()
+            .and_then(|init| self.eval_const(&init.expr));
+        let mut bound = Vec::new();
+        Self::pattern_bindings(&node.pat, &mut bound);
+        for name in bound {
+            self.constants.remove(&name);
+        }
+        if let (Some(name), Some(value)) = (binding_name.as_ref(), constant) {
+            if matches!(Self::unwrap_type_pat(&node.pat), Pat::Ident(_)) {
+                self.constants.insert(name.clone(), value);
+            }
+        }
+
         if let Some(name) = binding_name {
             let call_ty = self.call_infos[calls_before..]
                 .iter()
@@ -1383,6 +1547,22 @@ impl<'ast> Visit<'ast> for CallVisitor {
                 None => self.types.locals.remove(&name),
             };
         }
+    }
+
+    fn visit_item_const(&mut self, node: &'ast syn::ItemConst) {
+        self.record_const(node);
+    }
+
+    /// A nested block's `let`s and `const`s go out of scope at its end. The
+    /// body's own block keeps them: the return is classified after the visit.
+    fn visit_block(&mut self, node: &'ast syn::Block) {
+        self.block_depth += 1;
+        let outer = (self.block_depth > 1).then(|| self.constants.clone());
+        syn::visit::visit_block(self, node);
+        if let Some(outer) = outer {
+            self.constants = outer;
+        }
+        self.block_depth -= 1;
     }
 
     fn visit_expr_macro(&mut self, node: &'ast ExprMacro) {
@@ -1939,6 +2119,119 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    /// The single function in `code`, parsed the way a project file is: the
+    /// file's `const` items in scope, shadowed by the function's parameters.
+    fn parse_only_function(code: &str) -> FunctionAstItem {
+        let file: syn::File = syn::parse_str(code).expect("Failed to parse test code");
+        let mut functions = ProjectAst::parse_functions(
+            &file,
+            PathBuf::from("test.rs"),
+            &Rc::new(Vec::new()),
+            &Rc::new(HashMap::new()),
+        );
+        assert_eq!(functions.len(), 1);
+        functions.remove(0)
+    }
+
+    fn rows_range(start: u64, end: u64) -> Vec<SelectorSegment> {
+        vec![
+            SelectorSegment::Field("rows".into()),
+            SelectorSegment::Range { start, end },
+        ]
+    }
+
+    /// `select!` records a range with local bounds as the values they hold, so
+    /// the declared path must hold them too — not read the whole of `table`.
+    #[test]
+    fn test_range_bounds_bound_by_locals_are_evaluated() {
+        let function = parse_only_function(
+            r#"fn main(table: Table) {
+                let start = 0usize;
+                let end: usize = 2;
+                call!(consume, select!(Block<Row>, table.rows[start..end]));
+                let rows = select!(Block<Row>, table.rows[(start + 1)..(end * 2) as usize]);
+                call!(consume, rows);
+            }"#,
+        );
+        assert!(function.selection_errors.is_empty(), "{:?}", function.selection_errors);
+        assert_eq!(
+            function.call_infos[0].argument_kinds,
+            vec![rooted_at("table", Some(rows_range(0, 2)))]
+        );
+        assert_eq!(
+            function.selection_paths,
+            vec![("rows".to_string(), rows_range(1, 4))]
+        );
+    }
+
+    #[test]
+    fn test_range_bounds_read_file_and_body_constants() {
+        let function = parse_only_function(
+            r#"
+            const START: usize = 1;
+            const LEN: usize = START + 2;
+            fn main(table: Table) {
+                const END: usize = START + LEN;
+                call!(consume, select!(Block<Row>, table.rows[START..END]));
+            }"#,
+        );
+        assert!(function.selection_errors.is_empty(), "{:?}", function.selection_errors);
+        assert_eq!(
+            function.call_infos[0].argument_kinds,
+            vec![rooted_at("table", Some(rows_range(1, 4)))]
+        );
+    }
+
+    /// A bound the compiler cannot evaluate leaves the path unknown, and the
+    /// selection is an error rather than a read of the whole root.
+    #[test]
+    fn test_unevaluable_range_bounds_are_selection_errors() {
+        let cases = [
+            // A shadowing `let` with no constant value.
+            r#"fn main(table: Table) {
+                let start = 0usize;
+                let start = call!(first, table);
+                call!(consume, select!(Block<Row>, table.rows[start..2]));
+            }"#,
+            // A constant bound in a nested block is gone after it.
+            r#"fn main(table: Table) {
+                { let end = 2usize; }
+                call!(consume, select!(Block<Row>, table.rows[0..end]));
+            }"#,
+            // A parameter shadows the file constant it names.
+            r#"
+            const END: usize = 2;
+            fn main(table: Table, END: u64) {
+                call!(consume, select!(Block<Row>, table.rows[0..END]));
+            }"#,
+            // Underflow.
+            r#"fn main(table: Table) {
+                call!(consume, select!(Block<Row>, table.rows[0..(1 - 2)]));
+            }"#,
+        ];
+        for code in cases {
+            let function = parse_only_function(code);
+            assert_eq!(function.selection_errors.len(), 1, "{code}");
+            assert_eq!(
+                function.call_infos.last().unwrap().argument_kinds,
+                vec![rooted_at("table", None)],
+                "{code}"
+            );
+        }
+    }
+
+    /// A data-sourced index has no static path by design; its range bounds are
+    /// not an error.
+    #[test]
+    fn test_unknown_range_under_a_data_sourced_index_is_not_an_error() {
+        let function = parse_only_function(
+            r#"fn main(table: Table, i: u64) {
+                call!(consume, select!(Block<u64>, table.rows[i].cells[0..n]));
+            }"#,
+        );
+        assert!(function.selection_errors.is_empty(), "{:?}", function.selection_errors);
     }
 
     #[test]

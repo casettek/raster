@@ -811,6 +811,63 @@ mod tests {
         );
     }
 
+    /// `main` reading `table.rows[start..end]` with constant local bounds:
+    /// the runtime records `[table, rows, Range(0, 2)]` with no index citation,
+    /// and the guest holds the entry argument to its declared path exactly, so
+    /// the CFS must declare that path — directly and through an alias.
+    #[test]
+    fn local_range_bounds_resolve_to_the_recorded_entry_path() {
+        let file: syn::File = syn::parse_str(
+            r#"fn main(table: Table) {
+                let start = 0usize;
+                let end = 2usize;
+                call!(consume, select!(Block<Row>, table.rows[start..end]));
+                let rows = select!(Block<Row>, table.rows[start..end]);
+                call!(consume, rows);
+            }"#,
+        )
+        .unwrap();
+        let main = ProjectAst::parse_functions(
+            &file,
+            PathBuf::from("main.rs"),
+            &std::rc::Rc::new(Vec::new()),
+            &std::rc::Rc::new(HashMap::new()),
+        )
+        .remove(0);
+        assert!(main.selection_errors.is_empty(), "{:?}", main.selection_errors);
+
+        let project = make_mock_project();
+        let consume = make_tile_function("consume", vec!["rows"], false);
+        let tile_discovery = TileDiscovery {
+            project: &project,
+            tiles: vec![Tile {
+                function: &consume,
+                tile_type: "iter".to_string(),
+                estimated_cycles: None,
+                max_memory: None,
+                description: None,
+            }],
+        };
+        let sequence = Sequence {
+            function: &main,
+            steps: vec![
+                SequenceStep::Tile(&tile_discovery.tiles[0]),
+                SequenceStep::Tile(&tile_discovery.tiles[0]),
+            ],
+            description: None,
+        };
+        let items =
+            FlowResolver::new().resolve_with_entry_arguments(&sequence, &["table".to_string()]);
+        let expected = InputBinding::entry_argument().with_path(vec![
+            SelectorSegment::Field("table".into()),
+            SelectorSegment::Field("rows".into()),
+            SelectorSegment::Range { start: 0, end: 2 },
+        ]);
+        let sources: Vec<InputBinding> =
+            items.iter().map(|item| item.inputs()[0].clone()).collect();
+        assert_eq!(sources, vec![expected.clone(), expected]);
+    }
+
     /// A value reached through a data-sourced index records no path — its
     /// selector is not fixed by the program — while the index supplier, a plain
     /// static selection, records its own.
