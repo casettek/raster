@@ -1,4 +1,4 @@
-# Proposal: `transition-lanes` — one prover per check, and a transition guest that only aggregates
+# Proposal: `transition-split` — one prover per check, and a transition guest that only aggregates
 
 Status: **Proposed 2026-10-15.** Not measured. §Cost says what has to be measured before
 implementation, and step 0 of §Migration measures it.
@@ -8,10 +8,10 @@ Related:
   proposal keeps that journal's shape, so the chain-fraud guest changes only in the image id it is
   given.
 - [`program-identity`](./program-identity.md): `program_commitment` and the tile registry. Every
-  lane derives the commitment from the same frame bytes, and the aggregator equates them.
+  part derives the commitment from the same frame bytes, and the aggregator equates them.
 - [`window-seed-reconstruction`](./window-seed-reconstruction.md),
   [`recur-progress-commitment`](./recur-progress-commitment.md): the recur seed rules move into the
-  `recur` lane unchanged.
+  `recur` part unchanged.
 - [`storage-write-cost`](./storage-write-cost.md): source of the per-step cycle figure (~2.4M user
   cycles per step, after the framed-input and `EMPTY_ROOTS` fixes) used in §Cost.
 
@@ -56,8 +56,8 @@ This has five costs, and none of them is a correctness problem:
 
 ## Goal
 
-Split the transition guest into **lane provers**. Each lane runs exactly one check family over the
-**whole window**, and the transition guest becomes an **aggregator** that verifies the lane
+Split the transition guest into **part provers**. Each part runs exactly one check family over the
+**whole window**, and the transition guest becomes an **aggregator** that verifies the part
 receipts, checks that they agree with each other, and commits the same `TransitionJournal` that
 the chain-fraud guest already consumes.
 
@@ -71,42 +71,42 @@ Non-goals:
 
 ## Design
 
-### Lanes
+### Parts
 
-Each lane is a separate guest. It reads the window's public parameters once, then streams the
+Each part is a separate guest. It reads the window's public parameters once, then streams the
 window's steps and keeps only the state it owns.
 
-| lane | checks it runs (moved from) | state it owns across the window | witnesses only it reads |
+| part | checks it runs (moved from) | state it owns across the window | witnesses only it reads |
 | --- | --- | --- | --- |
 | `trace` | `verify_exec_index` (cfs.rs), `append_to_trace`, `finalize`, `assert_window_is_commitment_slice`, `assert_opens_at_genesis` (fraud_proof.rs) | trace frontier, fingerprint accumulator | `TraceCommitmentHeader`, `FingerprintSliceWitness`, revealed tail roots |
-| `cfs` | `verify_sequence_id`, `verify_sequence_scope_parent`, `verify_step_record_inputs`, `get_next_expected_coordinates` (cfs.rs) | `next_expected_coordinates` | `sequence_scope_witness`, `input_sources_witnesses` |
+| `control_flow` | `verify_sequence_id`, `verify_sequence_scope_parent`, `verify_step_record_inputs`, `get_next_expected_coordinates` (cfs.rs) | `next_expected_coordinates` | `sequence_scope_witness`, `input_sources_witnesses` |
 | `recur` | `advance_recur_progress` and its helpers, about lines 1091-1662 of cfs.rs; `assert_seed_present_for_mid_loop_open` (fraud_proof.rs) | `RecurProgressStack` | `window_start_recur_progress`, `returned_state_read_witness` |
 | `io` | `verify_io_witness`, `verify_step_record`'s replay half, `verify_output_root` (io.rs) | — | replay journals and replay receipts as assumptions, `input_witness` |
 | `store` | `verify_storage_transition`, `verify_input_roots` (moved here from io.rs, see §Columns) | storage frontier, coordinate-index root | `storage_witness`, `storage_selection_witnesses` |
 | `drafts` | `verify_draft_transition` (drafts.rs) | — | `draft_transition_witness` |
 | `entrypoint` | `verify_genesis_authorization`, `verify_step`, `verify_program_end` (entrypoint.rs) | `EntrypointAuthorization`, `OutputAuthorization` | `entrypoint_membership_witness`, `program_output_*_witness` |
 
-`recur` is split out of `cfs` because it is the only control-flow check that depends on storage
-roots and draft steps. Without it, `cfs` is pure CFS-conformance checking that depends only on the
-trace root. Merging the two back is a one-line change to the lane table if the extra receipt turns
+`recur` is split out of `control_flow` because it is the only control-flow check that depends on storage
+roots and draft steps. Without it, `control_flow` is pure CFS-conformance checking that depends only on the
+trace root. Merging the two back is a one-line change to the part table if the extra receipt turns
 out not to pay for itself.
 
-### Columns: every fact that crosses a lane boundary has one owner
+### Columns: every fact that crosses a part boundary has one owner
 
 The split is only sound if each value that a check used to read from another check's state still
 comes from that other check's proof. Each such value becomes a **column**. A column holds one
-value per window step, and exactly one lane **owns** it, meaning that lane computes it and proves
-it. Every other lane that needs the column **consumes** it: the host supplies the values,
-unverified, and the consumer hashes the complete column into a digest. The consumer lane commits
-the digest it consumed, the owner lane commits the digest it produced, and the aggregator asserts
+value per window step, and exactly one part **owns** it, meaning that part computes it and proves
+it. Every other part that needs the column **consumes** it: the host supplies the values,
+unverified, and the consumer hashes the complete column into a digest. The consumer part commits
+the digest it consumed, the owner part commits the digest it produced, and the aggregator asserts
 that the two are equal. If the host supplied a wrong value at any step, the consumer's digest
 differs from the owner's and the aggregator rejects the proof.
 
 | column | value at step `i` | owner (why it is true) | consumers (the call that reads it) |
 | --- | --- | --- | --- |
-| `trace_root_before` | `frontier_root` before step `i` is appended | `trace` | `cfs`: `verify_sequence_scope_parent` and the `input_sources_witnesses` folds |
+| `trace_root_before` | `frontier_root` before step `i` is appended | `trace` | `control_flow`: `verify_sequence_scope_parent` and the `input_sources_witnesses` folds |
 | `storage_roots_before` | (append-log root, index root) before step `i` | `store` | `recur`: the returned-state read in `advance_recur_progress`; `entrypoint`: `verify_program_end` |
-| `replay` | structured digest of the `TileReplayJournal`, or none | `io`: `env::verify` against the registry image id | `cfs`: `verify_step_record_inputs`; `recur`; `drafts`; `store`: `input_roots` |
+| `replay` | structured digest of the `TileReplayJournal`, or none | `io`: `env::verify` against the registry image id | `control_flow`: `verify_step_record_inputs`; `recur`; `drafts`; `store`: `input_roots` |
 | `draft_step` | `Option<DraftStep>` | `drafts` | `recur`: `advance_draft` |
 | `selection` | digest of the step's proven `storage_selection_witnesses` | `store` | `recur`: `recur_item_selection` |
 | `auth_journal` | constant for the whole window | **aggregator**: one `env::verify` of the authorization receipt | `entrypoint` |
@@ -114,20 +114,20 @@ differs from the owner's and the aggregator rejects the proof.
 The rules that decide what becomes a column:
 
 1. **Witnesses anchored in the record are re-checked locally, not shared as columns.** If a
-   witness is bound to the `StepRecord` by one hash, any lane that reads it re-checks that hash
+   witness is bound to the `StepRecord` by one hash, any part that reads it re-checks that hash
    itself. Examples are `input_source_witness` against `input_source_commitment`, and a
    non-execution step's I/O bytes against the record's commitments. This repeats a hash in several
-   lanes instead of adding a column and an equality check.
+   parts instead of adding a column and an equality check.
 2. **Anything that needs state or recursion to prove is a column.** Roots depend on all earlier
-   steps, and the replay journal's authenticity depends on an `env::verify`. A consumer lane cannot
+   steps, and the replay journal's authenticity depends on an `env::verify`. A consumer part cannot
    re-check either one locally.
 3. **Watch for witnesses that look record-anchored but are not.** An *execution* step's
    `output_witness` is not bound by the record: `verify_io_witness` returns early for execution
-   steps (`io.rs:37`). It is bound only through `replay.output_bytes`. A lane that reads it (for
+   steps (`io.rs:37`). It is bound only through `replay.output_bytes`. A part that reads it (for
    example `recur`) must compare it against the `replay` column. This is the main risk in the
    whole proposal: a dependency that nobody maps to a column turns into a host-supplied value that
    no proof checks. §Soundness describes how that risk is closed structurally.
-4. **When a check relates two columns, run it in the lane where the smaller column is the
+4. **When a check relates two columns, run it in the part where the smaller column is the
    consumed one.** `verify_input_roots` compares `replay.input_roots` (a few 32-byte roots) with
    the selection witnesses (payload bytes). If it stays in `io`, `io` has to consume the large
    `selection` column. Moved to `store`, it consumes only the small `input_roots` part of `replay`.
@@ -139,35 +139,35 @@ to re-read a large `output_bytes`. The structured digest is a host-side definiti
 guest's journal and `env::verify` stay the same, and `io` computes this digest from the journal
 bytes it has just verified.
 
-### Lane journal
+### Part journal
 
-Every lane commits the same envelope, which the aggregator can compare without knowing which lane
+Every part commits the same envelope, which the aggregator can compare without knowing which part
 produced it:
 
 ```rust
-// raster-core/src/lanes.rs
-pub struct LaneJournal {
-    pub lane: LaneKind,
+// raster-core/src/parts.rs
+pub struct PartJournal {
+    pub part: PartKind,
     pub program_commitment: [u8; 32], // sha256(domain ‖ program.bin), as today
     pub window_id: [u8; 32],          // sha256(postcard(InitTransition))
     pub steps: StepChain,             // (count, H(… H(H(seed, item(r0)), item(r1)) …))
     pub produced: Vec<(Column, [u8; 32])>,
     pub consumed: Vec<(Column, [u8; 32])>,
-    pub out: LaneOutput,              // lane-specific, see below
+    pub out: PartOutput,              // part-specific, see below
 }
 
-pub enum LaneOutput {
+pub enum PartOutput {
     Trace { verdict: WindowVerdict, refuted_trace_commitment: [u8; 32],
             window_is_terminal: bool, final_committed_root: Option<[u8; 32]> },
     Entrypoint { entrypoint: EntrypointAuthorization, output: OutputAuthorization },
     Store { root_after: [u8; 32], index_root_after: [u8; 32] },
-    Cfs, Recur, Io, Drafts,
+    ControlFlow, Recur, Io, Drafts,
 }
 ```
 
-`StepChain` uses `hash_trace_item`, the same per-record hash the trace frontier uses, so every lane
+`StepChain` uses `hash_trace_item`, the same per-record hash the trace frontier uses, so every part
 commits to the same records in the same order. The cost is one SHA over each record plus one chain
-hash per step in each lane.
+hash per step in each part.
 
 ### The aggregator (the new `guests/transition`)
 
@@ -175,23 +175,24 @@ hash per step in each lane.
 fn main() {
     let p = AggregatorParams::read();         // program frame, InitTransition, auth journal
     assert!(verify_authorization_journal(&p.auth, &p.auth_image_id));   // once, not per step
-    let lanes: [LaneJournal; 7] = read_framed();
+    let parts: Vec<PartJournal> = read_framed();
+    assert_one_per_kind(&parts);                                         // every PartKind, exactly once
 
-    for j in &lanes {
-        env::verify(LANE_IMAGE_IDS[j.lane], &to_vec(j)).unwrap();       // pinned, see §Pinning
+    for j in &parts {
+        env::verify(PART_IMAGE_IDS[j.part], &to_vec(j)).unwrap();       // pinned, see §Pinning
         assert_eq!(j.program_commitment, p.program_commitment);
         assert_eq!(j.window_id, sha256(&p.init_state));
-        assert_eq!(j.steps, lanes[0].steps);                             // same records, same order
+        assert_eq!(j.steps, parts[0].steps);                             // same records, same order
     }
     for column in Column::ALL {
-        let owned = produced_by(&lanes, column.owner());                 // exactly one
+        let owned = produced_by(&parts, column.owner());                 // exactly one
         for consumer in column.consumers() {
-            assert_eq!(consumed_by(&lanes, consumer, column), owned);
+            assert_eq!(consumed_by(&parts, consumer, column), owned);
         }
     }
-    assert_eq!(consumed_by(&lanes, Entrypoint, Column::AuthJournal), sha256(&p.auth));
+    assert_eq!(consumed_by(&parts, Entrypoint, Column::AuthJournal), sha256(&p.auth));
 
-    let trace = lanes.trace();
+    let trace = parts.trace();
     assert!(matches!(trace.verdict, WindowVerdict::DivergesAtLast));
 
     env::commit(&TransitionJournal {
@@ -200,27 +201,28 @@ fn main() {
         refuted_trace_commitment: trace.refuted_trace_commitment,
         window_is_terminal: trace.window_is_terminal,
         final_committed_root: trace.final_committed_root,
-        entrypoint_authorization: lanes.entrypoint().entrypoint,
-        output_authorization: lanes.entrypoint().output,
+        entrypoint_authorization: parts.entrypoint().entrypoint,
+        output_authorization: parts.entrypoint().output,
         /* image ids, manifest commitment, program_commitment as today */
     });
 }
 ```
 
-The aggregator runs no check of its own. Its cost depends on the number of lanes, not on the
-window length: it reads seven journals and column digests, never the columns themselves.
+The aggregator runs no check of its own. Its cost depends on the number of parts, not on the
+window length: it reads one journal per part and the column digests, never the columns
+themselves.
 
 `TransitionState::Next` and `Transition` drop out of the proving path. Nothing outside the guest
 consumes them (`step_transitions` in `src/transition.rs` is the only producer, and
 `commands/prove.rs:640` reads only the final receipt).
 
-### What one lane looks like
+### What one part looks like
 
-Each lane's `main.rs` is a loop of about 40 lines around the moved check functions. `store`:
+Each part's `main.rs` is a loop of about 40 lines around the moved check functions. `store`:
 
 ```rust
 fn main() {
-    let p: LaneParams = read_framed();                    // program frame, InitTransition, n_steps
+    let p: PartParams = read_framed();                    // program frame, InitTransition, n_steps
     let mut steps = StepChain::new();
     let mut frontier = deserialize_frontier(&p.init.init_storage_frontier).unwrap();
     let mut index_root = p.init.init_storage_index_root.clone();
@@ -243,9 +245,9 @@ fn main() {
         selection.push(&s.selections);
         index_root = next;
     }
-    commit_lane(LaneKind::Store, &p, steps,
+    commit_part(PartKind::Store, &p, steps,
                 [roots.finish(), selection.finish()], [replay.finish()],
-                LaneOutput::Store { root_after: frontier_root(&frontier), index_root_after: index_root });
+                PartOutput::Store { root_after: frontier_root(&frontier), index_root_after: index_root });
 }
 ```
 
@@ -254,12 +256,12 @@ fn main() {
 ```
 crates/raster-core/src/
 ├── transition.rs                 # unchanged: InitTransition, TransitionJournal (Finished)
-└── lanes.rs                      # NEW: LaneKind, LaneJournal, LaneOutput, Column (+ owner and
+└── parts.rs                      # NEW: PartKind, PartJournal, PartOutput, Column (+ owner and
                                   #      consumers tables), StepChain, ColumnWriter/Reader,
-                                  #      ReplayDigest, per-lane step input types
+                                  #      ReplayDigest, per-part step input types
 
 crates/raster-prover/
-├── build.rs                      # embeds lane guests, then the aggregator (§Pinning)
+├── build.rs                      # embeds part guests, then the aggregator (§Pinning)
 ├── checks/                       # NEW lib crate `transition-checks`, no `main`
 │   ├── Cargo.toml
 │   └── src/
@@ -279,26 +281,26 @@ crates/raster-prover/
 ├── guests/
 │   ├── authorization/            # unchanged
 │   ├── chain_fraud/              # unchanged source; pins TRANSITION_GUEST_ID (the aggregator)
-│   ├── lane_trace/src/main.rs
-│   ├── lane_cfs/src/main.rs
-│   ├── lane_recur/src/main.rs
-│   ├── lane_io/src/main.rs
-│   ├── lane_store/src/main.rs
-│   ├── lane_drafts/src/main.rs
-│   ├── lane_entrypoint/src/main.rs
+│   ├── part_trace/src/main.rs
+│   ├── part_control_flow/src/main.rs
+│   ├── part_recur/src/main.rs
+│   ├── part_io/src/main.rs
+│   ├── part_store/src/main.rs
+│   ├── part_drafts/src/main.rs
+│   ├── part_entrypoint/src/main.rs
 │   └── transition/src/main.rs    # the aggregator: keeps the name, so TRANSITION_GUEST_ID keeps
 │                                 #   meaning "the guest whose Finished journal is a fraud proof"
 └── src/
     ├── transition.rs             # step_transitions → prove_window (same arguments)
-    └── lanes/
-        ├── mod.rs                # prove_window: build table → prove lanes (parallel) → aggregate
+    └── parts/
+        ├── mod.rs                # prove_window: build table → prove parts (parallel) → aggregate
         ├── table.rs              # BoundaryTable: every column, computed host-side from the window
-        └── inputs.rs             # per-lane step inputs (build_transition_input, split seven ways)
+        └── inputs.rs             # per-part step inputs (build_transition_input, split per part)
 ```
 
 The host already has every column before any proving starts: it has the trace, the recorder's
 storage, and the replay results. Today it gets them by running the steps one after another.
-`BoundaryTable` computes them in a single pass, so all seven lanes can start at the same time.
+`BoundaryTable` computes them in a single pass, so all parts can start at the same time.
 
 ## Worked example: a three-step window
 
@@ -306,17 +308,17 @@ The window ends a recur-tile loop and the program. Step `i` is the loop's last t
 writes a draft. Step `i+1` is the `SequenceEnd` that returns the site's state. Step `i+2` is
 `ProgramEnd`, where the divergence is claimed.
 
-| lane | step `i`: tile iteration | step `i+1`: `SequenceEnd` with state | step `i+2`: `ProgramEnd` |
+| part | step `i`: tile iteration | step `i+1`: `SequenceEnd` with state | step `i+2`: `ProgramEnd` |
 | --- | --- | --- | --- |
 | `trace` | check exec index, append, compare: must **match** | append, compare: must **match** | append, compare: must **diverge** → `DivergesAtLast` |
-| `cfs` | sequence id; step inputs follow the CFS bindings, using `replay`; expected coordinates | sequence id; scope parent is in the trace, using `trace_root_before` | must be expected; nothing may follow it |
+| `control_flow` | sequence id; step inputs follow the CFS bindings, using `replay`; expected coordinates | sequence id; scope parent is in the trace, using `trace_root_before` | must be expected; nothing may follow it |
 | `recur` | iteration item against `selection`; draft continues the site root, using `draft_step`; recorded state = replay state | returned state read against `storage_roots_before`; pop frame | stack must be empty |
 | `io` | `env::verify` replay against the registry id; output bytes = witness → produces `replay` | I/O bytes against record commitments | — |
 | `store` | roots before = frontier; no write (D3) → roots unchanged; `input_roots` = selected roots | no roots, skip | no write |
 | `drafts` | pre-state against `replay.draft_transition.root_before`; re-apply the ops → produces `draft_step` | — | — |
 | `entrypoint` | — | — | output read against `storage_roots_before`; `Pending` → `Established` |
 
-Aggregator: seven receipts verified, the same `steps` in all of them, six columns closed, verdict
+Aggregator: every part's receipt verified, the same `steps` in all of them, every column closed, verdict
 `DivergesAtLast` → commits `Finished`.
 
 ## Soundness
@@ -324,33 +326,33 @@ Aggregator: seven receipts verified, the same `steps` in all of them, six column
 **Claim:** the aggregator accepts exactly when the monolithic guest would have reached `Finished`
 on the same window.
 
-The monolith is the conjunction of the per-step checks over one shared state. Each lane is the
-conjunction of its own checks over its own state, with the other lanes' state replaced by host
+The monolith is the conjunction of the per-step checks over one shared state. Each part is the
+conjunction of its own checks over its own state, with the other parts' state replaced by host
 values. The aggregator restores the conjunction:
-- every lane processed the same records in the same order (`steps`),
+- every part processed the same records in the same order (`steps`),
 - from the same initial state (`window_id`) and program (`program_commitment`),
-- and every host value a lane consumed equals the value the owning lane computed (column
+- and every host value a part consumed equals the value the owning part computed (column
   digests, which depend on collision resistance of SHA-256).
 
 Under those three conditions every consumed value is the value the monolith would have had in that
 local variable, so each check sees the same inputs as in the monolith.
 
-**The hazard is a missing column.** If some cross-check read is not mapped to a column, the lane
+**The hazard is a missing column.** If some cross-check read is not mapped to a column, the part
 reads a host value that no proof checks. Three structural defenses:
-1. **Lane input types contain no free state.** The `*Step` structs in `lanes.rs` can hold a root, a
+1. **Part input types contain no free state.** The `*Step` structs in `parts.rs` can hold a root, a
    journal or a `DraftStep` only as `Consumed<Column, T>`, and only `ColumnReader` can unwrap one.
    Unwrapping folds the value into the digest. Code review then only has to check the types, not
    every call.
-2. **`Column::consumers()` is the single source of truth.** Lanes use it to decide what they
-   commit, and the aggregator uses it to decide what it equates. A lane that consumes a column the
-   table does not list fails `commit_lane` with an assert.
+2. **`Column::consumers()` is the single source of truth.** Parts use it to decide what they
+   commit, and the aggregator uses it to decide what it equates. A part that consumes a column the
+   table does not list fails `commit_part` with an assert.
 3. **Tamper tests per column** (`checks/tests/columns.rs`) and a **differential test**: the
    monolith and the split pipeline must accept and reject the same set of fixtures, including the
    existing fraud fixtures and every negative test in today's `tests.rs`.
 
-**Ordering inside a step is preserved, because the ordering that matters is within a lane.** For
+**Ordering inside a step is preserved, because the ordering that matters is within a part.** For
 example, rule 8 runs before `advance_tile_iteration` in `recur`, and `verify_bound_index_bindings`
-runs after the per-binding loop in `store`. The ordering *between* lanes is fixed by how the columns
+runs after the per-binding loop in `store`. The ordering *between* parts is fixed by how the columns
 are defined: `storage_roots_before` and `trace_root_before` are the pre-step values, which is what
 the monolith passes today (the comments at the `advance_recur_progress` and `verify_program_end`
 call sites already state this).
@@ -361,13 +363,13 @@ Nothing here has been measured. What changes:
 
 | goes away | is added |
 | --- | --- |
-| N−1 `env::verify` of a previous `TransitionJournal` | 7 `env::verify` of lane journals in the aggregator |
-| N decodes of `program.bin` + `CfsCursor::new` | 7 (one per lane) |
+| N−1 `env::verify` of a previous `TransitionJournal` | one `env::verify` per part journal, in the aggregator |
+| N decodes of `program.bin` + `CfsCursor::new` | one per part |
 | N `env::verify` of the authorization journal | 1 |
-| N receipts, each lifted and resolved | 8 receipts (7 lanes + aggregator) |
-| every step deserializes all witnesses | each lane deserializes only its own; the record and anchored witnesses are read about 2–7× |
-| proving that is sequential across steps | lanes are independent: wall clock is the largest lane + the aggregator, given enough provers |
-| | per lane and step: `hash_trace_item` + chain hash + column digest updates |
+| N receipts, each lifted and resolved | one receipt per part, plus the aggregator's |
+| every step deserializes all witnesses | each part deserializes only its own; the record and anchored witnesses are read once by every part that needs them |
+| proving that is sequential across steps | parts are independent: wall clock is the largest part + the aggregator, given enough provers |
+| | per part and step: `hash_trace_item` + chain hash + column digest updates |
 
 On **one GPU**, parallelism does not help, and the gain is only the left column minus the right
 column. That gain grows with N, but how much depends on how the ~2.4M user cycles per step divide
@@ -377,15 +379,15 @@ shorter, and the case for the split rests on points 3–5 of §Problem rather th
 
 ## Image-id pinning
 
-The aggregator must accept only the real lane guests. Two options:
+The aggregator must accept only the real part guests. Two options:
 
-- **(a) Compile them in (recommended).** Embed the lanes in a first `risc0_build` pass, write their
-  ids to a generated `lane_ids.rs`, and build the aggregator in a second pass that `include!`s that
-  file. The aggregator's image id then commits to the full set of lanes, and `chain_fraud` and
+- **(a) Compile them in (recommended).** Embed the parts in a first `risc0_build` pass, write their
+  ids to a generated `part_ids.rs`, and build the aggregator in a second pass that `include!`s that
+  file. The aggregator's image id then commits to the full set of parts, and `chain_fraud` and
   relying parties go on pinning a single id. Open question: whether `risc0_build` 3.0 can pass the
   generated path to the guest build. This needs a prototype before implementation.
-- **(b) Read them as input.** The aggregator takes a `LaneSet`, hashes it into a new
-  `TransitionJournal::lane_set` field, and relying parties pin that value. This is the pattern
+- **(b) Read them as input.** The aggregator takes a `PartSet`, hashes it into a new
+  `TransitionJournal::part_set` field, and relying parties pin that value. This is the pattern
   `chain_fraud` already uses for its inner ids. It works without build changes, but it changes the
   journal and adds a second value every verifier has to pin.
 
@@ -402,9 +404,9 @@ not make check upgrades cheaper to deploy.
    the image id changes, as any dependency change does.
 2. **Make the columns explicit inside the monolith.** Change the signatures so that every
    cross-check value is passed as `Consumed<…>`, still inside one guest. This is where a missed
-   dependency shows up, as a compile error, before any lane exists. Commit this step on its own;
+   dependency shows up, as a compile error, before any part exists. Commit this step on its own;
    it is worth having even if the split stops here.
-3. **Add the lanes and the aggregator** behind `cargo raster prove --transition=lanes`, with the
+3. **Add the parts and the aggregator** behind `cargo raster prove --transition=split`, with the
    monolith as the default. Add `BoundaryTable` and `prove_window`.
 4. **Run the differential test** across every fraud fixture and negative test, and the step-0
    benchmark against both pipelines.
@@ -414,11 +416,11 @@ not make check upgrades cheaper to deploy.
 ## Open questions
 
 1. **Pinning:** option (a) or (b), see above.
-2. **Window length per lane.** Each lane is one execution over the whole window. risc0's
+2. **Window length per part.** Each part is one execution over the whole window. risc0's
    continuations split it into segments, but host executor memory grows with N. If windows grow
-   well beyond 32, a lane can be proven in chunks that resume from the previous chunk's journal,
-   which is today's `Next` mechanism applied per lane. This is deferred until needed.
-3. **Should `recur` stay a separate lane?** Answered by step 0.
+   well beyond 32, a part can be proven in chunks that resume from the previous chunk's journal,
+   which is today's `Next` mechanism applied per part. This is deferred until needed.
+3. **Should `recur` stay a separate part?** Answered by step 0.
 4. **Duplicate reads of anchored witnesses.** If step 0 shows that re-hashing large I/O bytes in
-   several lanes is significant, promote those witnesses to columns as well. That trades hashes for
+   several parts is significant, promote those witnesses to columns as well. That trades hashes for
    digest equalities.
