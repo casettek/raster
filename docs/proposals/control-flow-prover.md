@@ -1,7 +1,8 @@
 # Proposal: `control-flow-prover` — prove one step's CFS conformance in its own guest
 
-Status: **Proposed 2026-10-19** at `c049b76`. Not measured. Steps 1–5 of §Migration change only
-today's transition guest, and each one can land on its own. Step 6 adds the new guest.
+Status: **Proposed 2026-10-19** at `c049b76`. **Step 1 implemented 2026-10-19.** Steps 2–6 are
+open. Steps 1–5 of §Migration change only today's transition guest, and each one can land on its
+own. Step 6 adds the new guest.
 
 Scope: **one transition step.** The control-flow guest proves the CFS checks for exactly the step
 that one transition-guest execution proves, and the transition guest consumes that receipt.
@@ -103,7 +104,8 @@ forms, scope parent) are unchanged. They are described at the call sites listed 
 
 Each step keeps a single guest and can be merged on its own.
 
-**Step 1: close `fn-input-arg-names-unbound`.** Use direction 1 from the issue: commit the names.
+**Step 1: close `fn-input-arg-names-unbound`.** *Implemented 2026-10-19.* Use direction 1 from
+the issue: commit the names.
 
 ```rust
 // raster-core/src/trace.rs
@@ -112,11 +114,13 @@ impl FnInput {
         let names: Vec<&str> = self.args.iter().map(|arg| arg.name.as_str()).collect();
         postcard::to_allocvec(&(&self.values, &names, &self.storage)).unwrap_or_default()
     }
-    /// sha256 of the above. Replaces `checks::io::input_source_commitment`
-    /// and the recorder's private copy (recorder.rs:267).
-    pub fn source_commitment(&self) -> [u8; 32] { … }
 }
 ```
+
+The hash stays where it is on each side: the recorder hashes these bytes with `sha2`
+(`recorder.rs:267`), and the guest with risc0's accelerated SHA (`checks::io::input_source_commitment`,
+through `merkle_tree::sha256_bytes`). Moving the hash into `raster-core` would put software SHA
+into the guest. The preimage is what both sides must agree on, and it lives in one function.
 
 Direction 1 is chosen because it is one shared function. Recorder and guest cannot disagree, and
 it needs no type or CFS change. The cost is one change to every `input_source_commitment` and
@@ -202,9 +206,9 @@ pub struct ControlFlowInput {
 pub struct ControlFlowJournal {
     pub program_commitment: Vec<u8>,
     pub step_record_hash: Vec<u8>,     // hash_trace_item(step_record)
-    /// `FnInput::source_commitment()` of the `input_source_witness` the checks ran on,
+    /// `input_source_commitment(w)` of the `input_source_witness` the checks ran on,
     /// computed in this guest. `None` exactly when the step carries no witness.
-    pub input_source_commitment: Option<[u8; 32]>,
+    pub input_source_commitment: Option<Vec<u8>>,
     pub trace_position: u64,
     pub trace_root_before: Vec<u8>,
     pub expected_before: Option<Vec<CfsCoordinates>>,
@@ -234,7 +238,7 @@ fn main() {
     env::commit(&ControlFlowJournal {
         program_commitment,
         step_record_hash: hash_trace_item(&input.step_record).to_vec(),
-        input_source_commitment: input.input_source_witness.as_ref().map(FnInput::source_commitment),
+        input_source_commitment: input.input_source_witness.as_ref().map(input_source_commitment),
         trace_position: input.trace_position,
         trace_root_before: input.trace_root_before,
         expected_before: input.expected_before,
@@ -256,7 +260,7 @@ assert_eq!(cf.program_commitment, params.program_commitment);
 assert_eq!(cf.step_record_hash, hash_trace_item(&input.step_record));
 assert_eq!(
     cf.input_source_commitment,
-    input.input_source_witness.as_ref().map(FnInput::source_commitment),
+    input.input_source_witness.as_ref().map(input_source_commitment),
     "control-flow and transition checks ran on different step arguments",
 );
 assert_eq!(cf.trace_position, u64::from(self.frontier.position()));
@@ -279,11 +283,15 @@ next to the authorization and replay receipts (`raster-prover/src/transition.rs:
 
 ```
 crates/raster-core/src/control_flow.rs          # ControlFlowInput, ControlFlowJournal
+crates/raster-prover/guests/guest_common/       # new lib crate, no main: shared by both guests
+└── src/
+    ├── lib.rs
+    ├── frame.rs                                # moved from transition: framed postcard reader
+    └── merkle_tree.rs                          # moved from transition: hash_trace_item, frontier_root, …
 crates/raster-prover/guests/control_flow/       # new guest
 ├── Cargo.toml
 └── src/
     ├── main.rs
-    ├── frame.rs                                # same framed postcard reader as transition
     ├── checks.rs                               # the conformance half of cfs.rs, moved from transition
     └── tests.rs                                # the CFS tests from transition's tests.rs, moved
 crates/raster-prover/guests/transition/src/checks/
@@ -292,19 +300,24 @@ crates/raster-prover/guests/transition/src/checks/
 crates/raster-prover/src/control_flow.rs        # host: build inputs, prove one step
 ```
 
-`hash_trace_item`, `combine_merkle_level` and `frontier_root` move from
-`guests/transition/src/merkle_tree.rs` to `raster_core::merkle`, which already holds
-`EMPTY_ROOTS`, so both guests and the host share one definition. It adds no crate dependency,
-but changing `raster-core` moves every guest image ID, tile guests included.
+`frame.rs` and `merkle_tree.rs` (`hash_trace_item`, `combine_merkle_level`, `frontier_root`,
+`sha256_bytes`) move into a small guest-side library crate that both guests depend on by path.
+They can't go into `raster_core::merkle`: the guest's hashing uses risc0's accelerated SHA
+(`Risc0Sha256`), and `raster-core` uses software `sha2`. A guest-side crate also leaves
+`raster-core` untouched, so tile image IDs don't move.
 
 ### Image-id pinning
 
 The transition guest has to accept only the real control-flow guest. **Recommended for this
 step: the pattern `authorization_image_id` already uses.** `PublicParams::read` reads
 `control_flow_image_id` as one more frame. `TransitionJournal` commits it.
-`verify_previous_journal` asserts it is unchanged across the window. `chain_fraud` carries it
-into its journal, and the relying party pins it next to the authorization ID
-(`raster-prover/src/chain_fraud.rs:73`).
+`verify_previous_journal` asserts it is unchanged across the window. The relying party pins it
+wherever it pins `TRANSITION_GUEST_ID`: today that is only
+`raster-prover/examples/verify_fraud_proof.rs`, so step 6 adds a library function
+(`control_flow_guest_image_id()`, next to `authorization_guest_image_id()` in
+`raster-prover/src/authorization.rs:28`) and the example checks the journal against it.
+`chain_fraud` is not involved: it never verifies a transition receipt (its evidence is `Link`,
+which checks authorization only, or `Shape`), so its journal doesn't carry the ID.
 
 The continuity assertion is **required**, and the pattern being copied lacks it: nothing compares
 `input.authorization_image_id` with `prev_journal.authorization_image_id` on a `Next` step
@@ -347,7 +360,26 @@ A missing control-flow receipt is not possible: the `env::verify` call is uncond
 
 ## Cost
 
-Nothing here has been measured.
+**Measured 2026-10-19 (step 0)**, dev mode, `examples/hello-tiles`, a 32-step window
+(`--fraud-step 27`), with step 1 applied. `env::cycle_count()` was wrapped around the five CFS
+calls in `apply_verified_step` (the probe was not committed). User cycles per transition step:
+
+| | mean | max | window total |
+| --- | --- | --- | --- |
+| the five CFS calls | 39,030 | 74,232 | 1,248,981 |
+| `apply_verified_step` (all check families) | 884,779 | 1,745,666 | 28,312,938 |
+| whole guest execution | 1,411,160 | 2,526,267 | 45,157,134 |
+| before `apply_verified_step` (program decode, input decode, auth and previous-journal verify) | 495,241 | | |
+
+The CFS check is **4.4%** of `apply_verified_step` and **2.8%** of a step. The fixed work before
+any check runs is about **12×** the CFS check. Step 6 adds a second guest per step that pays its
+own share of that fixed work (program decode, `CfsCursor::new`, input decode) in exchange for
+removing about 39k cycles. On this program, step 6 costs more cycles than it removes. It can only
+be justified by isolation, not by speed. The whole-window design in §Deferred pays the fixed
+work once per window instead of once per step, which changes this ratio.
+
+The decode cost of `input_sources_witnesses` could not be separated from the rest of the input
+decode with this probe.
 
 | per step | removed from the transition guest | added |
 | --- | --- | --- |
@@ -365,24 +397,25 @@ tests, separate review, a guest that is about one question), by proving control-
 ahead of or alongside the transition chain, and as the base for §Deferred. It is not justified
 by speed.
 
-Step 0 of §Migration measures the CFS share of a step, so step 6 can be judged with numbers.
+The first table above is step 0's measurement. `prompt-prepare` on the GPU has not been measured.
 
 ## Migration
 
-0. **Measure.** Wrap the five calls in `env::cycle_count()` on the `prompt-prepare` 16-step
-   benchmark and the hello-tiles 32-step window. Record the CFS share of user cycles and the
-   decode cost of `input_sources_witnesses`.
-1. **Close the issue.** Change `source_witness_bytes` and add `FnInput::source_commitment`. Delete
-   `checks::io::input_source_commitment` and `recorder.rs:267`. Regenerate fixtures. Add the
-   §Reproduction test from the issue as a regression test.
+0. **Measure.** *Done 2026-10-19 for hello-tiles in dev mode (§Cost).* Wrap the five calls in
+   `env::cycle_count()` on the `prompt-prepare` 16-step benchmark and the hello-tiles 32-step
+   window. Record the CFS share of user cycles and the decode cost of `input_sources_witnesses`.
+1. **Close the issue.** *Done 2026-10-19.* Change `source_witness_bytes` to commit the argument
+   names. Add the §Reproduction tests from the issue as regression tests, written first and seen
+   to fail before the fix.
 2. **Move chunking** to the recur call site.
 3. **Extract `verify_input_source_anchored`.**
 4. **Narrow the scope-parent witness**, on both host and guest.
 5. **Introduce `ControlFlowInput` and `verify_step`.** Split `cfs.rs` into `control_flow.rs` and
    `recur.rs`. Split the CFS tests in `tests.rs` out by the function under test.
-6. **Add the control-flow guest.** Move `control_flow.rs` and its tests into it. Add
-   `control_flow_image_id` to `PublicParams`, `TransitionJournal`, and `chain_fraud`, with the
-   continuity assertion. Add host proving. Add one tamper test per journal field: change it by one
+6. **Add the control-flow guest.** Move `frame.rs` and `merkle_tree.rs` into `guest_common`, and
+   `control_flow.rs` and its tests into the new guest. Add `control_flow_image_id` to
+   `PublicParams` and `TransitionJournal`, with the continuity assertion, and pin it in
+   `verify_fraud_proof`. Add host proving. Add one tamper test per journal field: change it by one
    byte, and the transition guest must reject. For `input_source_commitment`, also test the
    case where the journal matches but the transition guest is given a different
    `input_source_witness`: one argument name changed, everything else the same.

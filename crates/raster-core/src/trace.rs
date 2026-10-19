@@ -64,8 +64,20 @@ impl FnInput {
         &self.storage
     }
 
+    /// The preimage of a step's `input_source_commitment`: the values, the
+    /// argument **names**, and the storage map.
+    ///
+    /// The names are what map argument `i` to its storage binding
+    /// (`FnInputValue::StorageBinding` carries none), so leaving them out let a
+    /// witness reorder or repeat bindings and still hash to the recorded
+    /// commitment. See `docs/issues/fn-input-arg-names-unbound.md`.
+    ///
+    /// `ty` is left out: nothing checks it, and it is `stringify!` output, which
+    /// is not stable across compiler versions. `data` is left out too: it is
+    /// committed separately, as the record's `input_commitment`.
     pub fn source_witness_bytes(&self) -> Vec<u8> {
-        postcard::to_allocvec(&(self.values.clone(), self.storage.clone())).unwrap_or_default()
+        let names: Vec<&str> = self.args.iter().map(|arg| arg.name.as_str()).collect();
+        postcard::to_allocvec(&(&self.values, &names, &self.storage)).unwrap_or_default()
     }
 }
 

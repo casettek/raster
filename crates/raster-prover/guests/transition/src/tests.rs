@@ -146,35 +146,57 @@ fn selecting(mut witness: FnInput, path: Vec<SelectorSegment>) -> FnInput {
 }
 
 fn storage_input_witness(coordinates: CfsCoordinates, commitment: Vec<u8>) -> FnInput {
-    // A whole-object storage binding's commitment *is* its raster selection
-    // root (see `checks::store`'s structural-consistency assertion), so the
-    // fixture mirrors that invariant.
-    let source_root_hash: [u8; 32] = commitment
-        .clone()
-        .try_into()
-        .expect("test commitments are 32 bytes");
+    storage_inputs_witness(&[("arg", coordinates, commitment)])
+}
+
+/// A witness whose argument `i` is the storage binding `bindings[i]`, named
+/// `bindings[i].0`.
+fn storage_inputs_witness(bindings: &[(&str, CfsCoordinates, Vec<u8>)]) -> FnInput {
     FnInput {
         data: Vec::new(),
-        values: vec![FnInputValue::StorageBinding],
-        args: vec![FnInputArg {
-            name: "arg".to_string(),
-            ty: "Vec<u8>".to_string(),
-        }],
-        storage: [(
-            "arg".to_string(),
-            StorageData {
-                coordinates,
-                commitment,
-                selector: Default::default(),
-                selection: raster_core::input::SelectionCommitment {
-                    source_root_hash,
-                    ..Default::default()
-                },
-            },
-        )]
-        .into_iter()
-        .collect(),
+        values: vec![FnInputValue::StorageBinding; bindings.len()],
+        args: bindings
+            .iter()
+            .map(|(name, _, _)| FnInputArg {
+                name: name.to_string(),
+                ty: "Vec<u8>".to_string(),
+            })
+            .collect(),
+        storage: bindings
+            .iter()
+            .map(|(name, coordinates, commitment)| {
+                // A whole-object storage binding's commitment *is* its raster
+                // selection root (see `checks::store`'s structural-consistency
+                // assertion), so the fixture mirrors that invariant.
+                let source_root_hash: [u8; 32] = commitment
+                    .clone()
+                    .try_into()
+                    .expect("test commitments are 32 bytes");
+                (
+                    name.to_string(),
+                    StorageData {
+                        coordinates: coordinates.clone(),
+                        commitment: commitment.clone(),
+                        selector: Default::default(),
+                        selection: raster_core::input::SelectionCommitment {
+                            source_root_hash,
+                            ..Default::default()
+                        },
+                    },
+                )
+            })
+            .collect(),
     }
+}
+
+/// `witness` with its argument names replaced and nothing else touched: the
+/// same `values` and `storage`, pointed at differently.
+fn renaming_args(mut witness: FnInput, names: &[&str]) -> FnInput {
+    assert_eq!(witness.args.len(), names.len(), "one name per argument");
+    for (arg, name) in witness.args.iter_mut().zip(names) {
+        arg.name = name.to_string();
+    }
+    witness
 }
 
 /// `sub`'s item reads `sub`'s own parameter 0 — a `SequenceScope` binding at a
@@ -188,18 +210,25 @@ fn scope_binding_cfs() -> CfsCursor {
 /// [`scope_binding_cfs`] with the consumer's binding replaced — a parameter
 /// narrowed by a path, say.
 fn scope_binding_cfs_reading(consumer_source: InputBinding) -> CfsCursor {
+    scope_binding_cfs_reading_all(vec![consumer_source])
+}
+
+/// [`scope_binding_cfs`] with `sub` taking one parameter per consumer
+/// binding, and the consumer declaring `consumer_sources` in order.
+fn scope_binding_cfs_reading_all(consumer_sources: Vec<InputBinding>) -> CfsCursor {
+    let parameters = vec![InputBinding::Direct(InputSource::Inline); consumer_sources.len()];
     CfsCursor::new(ControlFlowSchema {
         version: "1.0".into(),
         project: "test".into(),
         encoding: "postcard".into(),
-        tiles: vec![TileDef::iter("consumer", 1, 1)],
+        tiles: vec![TileDef::iter("consumer", consumer_sources.len(), 1)],
         sequences: vec![
             SequenceDef {
                 id: "main".into(),
                 input_sources: vec![],
                 items: vec![SequenceChildItem::Sequence(SequenceItem {
                     id: "sub".into(),
-                    sources: vec![InputBinding::Direct(InputSource::Inline)],
+                    sources: parameters.clone(),
                 })],
                 entry_arguments: vec![],
                 produces_output: false,
@@ -207,10 +236,10 @@ fn scope_binding_cfs_reading(consumer_source: InputBinding) -> CfsCursor {
             },
             SequenceDef {
                 id: "sub".into(),
-                input_sources: vec![InputBinding::Direct(InputSource::Inline)],
+                input_sources: parameters,
                 items: vec![SequenceChildItem::Tile(TileItem {
                     id: "consumer".into(),
-                    sources: vec![consumer_source],
+                    sources: consumer_sources,
                 })],
                 entry_arguments: vec![],
                 produces_output: false,
@@ -483,9 +512,9 @@ fn sequence_scope_parent_binding_refuses_a_parent_not_in_the_trace() {
 /// to agree with the step. Their `input_source_commitment`s differ, so a check
 /// that consulted the parent record would have separated them.
 ///
-/// Invert once the parent record's trace inclusion is verified and its
-/// `input_source_commitment` compared (`input_sources_witnesses`, currently
-/// shipped to the guest and read by nothing).
+/// The binding check alone still accepts both: separating them is
+/// [`verify_sequence_scope_parent`]'s job, which this test deliberately does not
+/// call. The tests above show that it does.
 #[test]
 fn poc_the_sequence_scope_witness_is_bound_to_nothing() {
     let cfs_cursor = scope_binding_cfs();
@@ -541,6 +570,157 @@ fn poc_the_sequence_scope_witness_is_bound_to_nothing() {
     assert_ne!(
         parent_commitments[0], parent_commitments[1],
         "the two fabricated parents must be distinguishable, or the test proves nothing"
+    );
+}
+
+/// `sub(p, q)` called with two stored objects `A` and `B`, and its consumer
+/// declared `[SequenceScope{0}, SequenceScope{1}]`, so it must read `(A, B)`.
+///
+/// Returns the CFS, the parent `SequenceStart` at `[1]` committing the honest
+/// arguments `[p, q]`, those arguments, the trace root after the parent, and
+/// the parent's inclusion witness keyed for a step at `exec_index` 2.
+fn two_parameter_scope_scenario() -> (
+    CfsCursor,
+    StepRecord,
+    FnInput,
+    Vec<u8>,
+    HashMap<(u64, StepRecord), raster_core::transition::StepRecordWitness>,
+) {
+    let cfs_cursor = scope_binding_cfs_reading_all(vec![
+        InputBinding::seq_input(0),
+        InputBinding::seq_input(1),
+    ]);
+    let parent_args = storage_inputs_witness(&[
+        ("p", CfsCoordinates(vec![10, 10]), sha(b"object-a")),
+        ("q", CfsCoordinates(vec![10, 11]), sha(b"object-b")),
+    ]);
+    let parent_record = StepRecord {
+        exec_index: 1,
+        sequence_id: "sub".into(),
+        coordinates: CfsCoordinates(vec![1]),
+        kind: StepKind::SequenceStart {
+            input_commitment: Vec::new(),
+            input_source_commitment: input_source_commitment(&parent_args),
+        },
+        recur_progress_commitment: RecurProgressStack::new().commitment(),
+        recur_state: None,
+    };
+    let (trace_root, witness) = trace_root_and_witness(&[parent_record.clone()], 0);
+    let mut witnesses = HashMap::new();
+    witnesses.insert((2, parent_record.clone()), witness);
+    (cfs_cursor, parent_record, parent_args, trace_root, witnesses)
+}
+
+/// The consumer at `[1, 1]` reading `reads` as its arguments, in order.
+fn two_parameter_consumer(reads: &[(&str, &str)]) -> (StepRecord, FnInput) {
+    let object = |label: &str| match label {
+        "A" => (CfsCoordinates(vec![10, 10]), sha(b"object-a")),
+        "B" => (CfsCoordinates(vec![10, 11]), sha(b"object-b")),
+        other => panic!("unknown object {other}"),
+    };
+    let bindings: Vec<(&str, CfsCoordinates, Vec<u8>)> = reads
+        .iter()
+        .map(|(name, label)| {
+            let (coordinates, commitment) = object(label);
+            (*name, coordinates, commitment)
+        })
+        .collect();
+    let step_source = storage_inputs_witness(&bindings);
+    let step_record = StepRecord {
+        exec_index: 2,
+        sequence_id: "sub".into(),
+        coordinates: CfsCoordinates(vec![1, 1]),
+        kind: StepKind::Exec(ExecStep {
+            target: ExecTarget::Tile("consumer".into()),
+            intra_sequence_index: FIRST_COORDINATE,
+            input_commitment: Vec::new(),
+            input_source_commitment: input_source_commitment(&step_source),
+            output_commitment: Vec::new(),
+            storage: StorageRoots {
+                root_before: Vec::new(),
+                root_after: Vec::new(),
+                index_root_before: Vec::new(),
+                index_root_after: Vec::new(),
+            },
+        }),
+        recur_progress_commitment: RecurProgressStack::new().commitment(),
+        recur_state: None,
+    };
+    (step_record, step_source)
+}
+
+#[test]
+fn the_honest_two_parameter_scope_witness_verifies() {
+    let (cfs_cursor, _, parent_args, trace_root, witnesses) = two_parameter_scope_scenario();
+    let (step_record, step_source) = two_parameter_consumer(&[("x", "A"), ("y", "B")]);
+
+    verify_step_record_inputs(
+        &cfs_cursor,
+        &step_record,
+        Some(&step_source),
+        Some(&parent_args),
+        None,
+    );
+    verify_sequence_scope_parent(
+        &cfs_cursor,
+        &step_record,
+        Some(&parent_args),
+        &witnesses,
+        &trace_root,
+    );
+}
+
+/// `docs/issues/fn-input-arg-names-unbound.md`: a consumer that ran on
+/// `(B, A)` passes the binding check when the caller's argument names are
+/// supplied as `[q, p]`. `values` and `storage` are untouched, so before the
+/// names were committed the reordered witness hashed to the parent's own
+/// commitment and `verify_sequence_scope_parent` accepted it too.
+#[test]
+#[should_panic(expected = "Sequence-scope witness is not the parent SequenceStart's recorded input source")]
+fn a_scope_witness_with_reordered_arg_names_is_refused() {
+    let (cfs_cursor, _, parent_args, trace_root, witnesses) = two_parameter_scope_scenario();
+    let (step_record, step_source) = two_parameter_consumer(&[("x", "B"), ("y", "A")]);
+    let reordered = renaming_args(parent_args, &["q", "p"]);
+
+    // The binding check alone accepts the swap: position 0 is `B` on both sides.
+    verify_step_record_inputs(
+        &cfs_cursor,
+        &step_record,
+        Some(&step_source),
+        Some(&reordered),
+        None,
+    );
+    verify_sequence_scope_parent(
+        &cfs_cursor,
+        &step_record,
+        Some(&reordered),
+        &witnesses,
+        &trace_root,
+    );
+}
+
+/// The same gap with one binding named twice: a consumer that read `A` for
+/// both arguments, checked against a caller whose names are `[p, p]`.
+#[test]
+#[should_panic(expected = "Sequence-scope witness is not the parent SequenceStart's recorded input source")]
+fn a_scope_witness_naming_one_binding_twice_is_refused() {
+    let (cfs_cursor, _, parent_args, trace_root, witnesses) = two_parameter_scope_scenario();
+    let (step_record, step_source) = two_parameter_consumer(&[("x", "A"), ("y", "A")]);
+    let duplicated = renaming_args(parent_args, &["p", "p"]);
+
+    verify_step_record_inputs(
+        &cfs_cursor,
+        &step_record,
+        Some(&step_source),
+        Some(&duplicated),
+        None,
+    );
+    verify_sequence_scope_parent(
+        &cfs_cursor,
+        &step_record,
+        Some(&duplicated),
+        &witnesses,
+        &trace_root,
     );
 }
 

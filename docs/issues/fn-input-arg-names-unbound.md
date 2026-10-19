@@ -1,9 +1,8 @@
 # Issue: `fn-input-arg-names-unbound` — which storage binding is argument `i` is the host's choice
 
-Status: **open — soundness, by reading.** Opened 2026-10-19 at `c049b76`. Not yet shown by a
-failing test. §Reproduction names the test that would show it. Found while mapping the data the
-CFS checks read, for [`control-flow-prover`](../proposals/control-flow-prover.md), whose step 1
-closes it.
+Status: **resolved 2026-10-19** — §Resolution. Opened the same day at `c049b76`, by reading, and
+reproduced by test before the fix. Found while mapping the data the CFS checks read, for
+[`control-flow-prover`](../proposals/control-flow-prover.md), whose step 1 closes it.
 
 Related:
 - [`control-flow-prover`](../proposals/control-flow-prover.md): extracts the CFS checks into
@@ -136,3 +135,32 @@ fixture as in §What it allows. Call `verify_sequence_scope_parent` and then
 `verify_step_record_inputs` with the scope witness's `args` reversed and the consumer's storage
 swapped to match. Today both return. After the fix, `verify_sequence_scope_parent` must panic on
 the commitment comparison.
+
+**Reproduced 2026-10-19**, before the fix, by the two `should_panic` tests in §Resolution: both
+reported "test did not panic as expected". The reordered (`[q, p]`) and the duplicated (`[p, p]`)
+caller witnesses passed `verify_step_record_inputs` and `verify_sequence_scope_parent`.
+
+## Resolution
+
+Direction 1: the names are committed. `FnInput::source_witness_bytes`
+(`raster-core/src/trace.rs`) now hashes `(values, arg names, storage)`. The recorder
+(`recorder.rs:267`) and the guest (`checks/io.rs:16`) both hash that one function's output, so
+they cannot disagree. `ty` stays out (it is `stringify!` output, which is not stable across
+compilers, and nothing checks it), and so does `data` (it is committed separately, as
+`input_commitment`).
+
+A reordered or duplicated name list now hashes to something other than the parent
+`SequenceStart`'s recorded commitment, so `verify_sequence_scope_parent` refuses it. The same
+change pins the step's **own** names on non-tile steps, through the anchor in
+`io::verify_step_record`.
+
+Tests, in the transition guest's `tests.rs`:
+- `a_scope_witness_with_reordered_arg_names_is_refused`
+- `a_scope_witness_naming_one_binding_twice_is_refused`
+- `the_honest_two_parameter_scope_witness_verifies` (positive control)
+
+Cost: every `input_source_commitment` changes, so traces and `commit.bin` files recorded before
+the change no longer verify against the new guests. Every tile image ID moved as well (tile
+guests compile `raster-core`), so all six tracked `Raster.lock` files were regenerated: hello-tiles
+(24 of 24 IDs changed) and the five chain-example stages (all of their IDs changed). The tracked
+`examples/hello-tiles/fraud_commit.bin.fraud-proof` is stale and was left as is.
