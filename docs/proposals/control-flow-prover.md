@@ -322,7 +322,8 @@ which checks authorization only, or `Shape`), so its journal doesn't carry the I
 The continuity assertion is **required**, and the pattern being copied lacks it: nothing compares
 `input.authorization_image_id` with `prev_journal.authorization_image_id` on a `Next` step
 (`fraud_proof.rs:245-250`). Only the last step's ID reaches the relying party. That is outside
-this proposal's scope and should get its own issue. The new ID must not repeat it.
+this proposal's scope, and is filed as
+[`authorization-image-id-unpinned`](../issues/authorization-image-id-unpinned.md). The new ID must not repeat it.
 
 The alternative is to compile the ID into the transition guest. That keeps `TransitionJournal`'s
 shape, but it needs a two-pass `risc0_build`, or a checked-in constant pinned by a test. A
