@@ -58,17 +58,20 @@ pub fn verify_authorization_journal(
     env::verify(image_id_digest, &journal_bytes).is_ok()
 }
 
-pub fn verify_step_record(
+/// Hold a step's input source witness to the record: present and equal to its
+/// recorded `input_source_commitment` exactly when the record declares one,
+/// absent otherwise.
+///
+/// Every check that reads the witness — the CFS bindings, the replay's input
+/// roots, the storage reads, recur — is only as sound as this anchor. It is a
+/// call of its own so each of those check groups can make it rather than rely
+/// on another group having made it in the same execution
+/// (`docs/proposals/control-flow-prover.md` step 3). While both groups share one
+/// guest the hash runs twice per step.
+pub fn verify_input_source_anchored(
     step_record: &StepRecord,
-    expected_image_id: Option<&[u8; 32]>,
-    replay_journal: Option<&raster_core::draft::TileReplayJournal>,
-
-    input_witness_bytes: Option<&Vec<u8>>,
-    output_witness_bytes: Option<&Vec<u8>>,
     input_source_witness: Option<&FnInput>,
-    storage_selection_witnesses: &BTreeMap<String, SelectionWitness>,
 ) {
-    verify_io_witness(step_record, input_witness_bytes, output_witness_bytes);
     if let Some(expected_input_source_commitment) = step_record.input_source_commitment() {
         let input_source_witness =
             input_source_witness.expect("Step input source witness is missing");
@@ -88,6 +91,20 @@ pub fn verify_step_record(
             step_record.coordinates,
         );
     }
+}
+
+pub fn verify_step_record(
+    step_record: &StepRecord,
+    expected_image_id: Option<&[u8; 32]>,
+    replay_journal: Option<&raster_core::draft::TileReplayJournal>,
+
+    input_witness_bytes: Option<&Vec<u8>>,
+    output_witness_bytes: Option<&Vec<u8>>,
+    input_source_witness: Option<&FnInput>,
+    storage_selection_witnesses: &BTreeMap<String, SelectionWitness>,
+) {
+    verify_io_witness(step_record, input_witness_bytes, output_witness_bytes);
+    verify_input_source_anchored(step_record, input_source_witness);
 
     if step_record.requires_replay_proof() {
         // The expected image id comes from the program's committed tile

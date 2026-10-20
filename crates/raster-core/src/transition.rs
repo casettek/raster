@@ -6,7 +6,6 @@
 use serde::{Deserialize, Serialize};
 use crate::hash::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::collections::HashMap;
 use std::string::String;
 use std::vec::Vec;
 
@@ -210,20 +209,18 @@ pub struct TransitionInput {
     pub storage_witness: Option<StorageWitness>,
     pub draft_transition_witness: Option<DraftTransitionWitness>,
 
-    /// Trace-inclusion witnesses for the records a step's bindings resolve to,
-    /// keyed by **(the verifying step's `exec_index`, the source record)**.
+    /// For a step whose CFS item binds a sequence-scope input: the
+    /// `SequenceStart` that opened the step's frame, with its trace-inclusion
+    /// witness. `None` for every other step.
     ///
-    /// The verifier is part of the key because a witness is only valid at the
-    /// trace root its verifier holds. The guest folds each one against
-    /// `frontier_root(self.frontier)` *at that step*, and the frontier grows by
-    /// one item per step — so two window steps resolving the same source need
-    /// two different witnesses. Keyed by the source record alone, the later
-    /// step's `insert` silently overwrote the earlier one's and the earlier
-    /// step's fold could never reach its own root.
+    /// The guest folds the witness against `frontier_root(self.frontier)` *at
+    /// this step*, and the frontier grows by one item per step — so two window
+    /// steps in one frame carry two different witnesses for the same parent.
     ///
-    /// The host sends each step only its own entries (keyed by its own
-    /// `exec_index`); the guest's lookup can match no other.
-    pub input_sources_witnesses: HashMap<(u64, StepRecord), StepRecordWitness>,
+    /// Replaces a map of witnesses for every source a step's bindings resolved
+    /// to, of which the guest only ever read this one entry. See
+    /// `docs/proposals/control-flow-prover.md` step 4.
+    pub sequence_scope_parent: Option<(StepRecord, StepRecordWitness)>,
 
     #[serde(with = "serde_bytes")]
     pub authorization_image_id: Vec<u8>,

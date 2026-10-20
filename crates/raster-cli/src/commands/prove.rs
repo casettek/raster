@@ -322,7 +322,7 @@ pub fn prove(
     let mode = ExecutionMode::prove_and_verify();
     let FraudEvidence {
         window: fraud_window,
-        input_sources_witnesses,
+        sequence_scope_parents,
     } = fraud_evidence;
     let mut replayed_results: HashMap<StepRecord, ReplayResult> = HashMap::new();
     let mut recorded_step_io: HashMap<StepRecord, StepIo> = HashMap::new();
@@ -646,7 +646,7 @@ pub fn prove(
             &commitment_header,
             &fingerprint_slice,
             &program_frame,
-            &input_sources_witnesses,
+            &sequence_scope_parents,
             &recorded_step_io,
             &replayed_results,
             &authorization_journal,

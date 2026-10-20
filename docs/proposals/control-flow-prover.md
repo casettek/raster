@@ -1,8 +1,8 @@
 # Proposal: `control-flow-prover` — prove one step's CFS conformance in its own guest
 
-Status: **Proposed 2026-10-19** at `c049b76`. **Step 1 implemented 2026-10-19.** Steps 2–6 are
-open. Steps 1–5 of §Migration change only today's transition guest, and each one can land on its
-own. Step 6 adds the new guest.
+Status: **Proposed 2026-10-19** at `c049b76`. **Step 1 implemented 2026-10-19. Steps 2–5
+implemented 2026-10-20** (§Implementation record). Step 6 is open. Steps 1–5 of §Migration change
+only today's transition guest, and each one can land on its own. Step 6 adds the new guest.
 
 Scope: **one transition step.** The control-flow guest proves the CFS checks for exactly the step
 that one transition-guest execution proves, and the transition guest consumes that receipt.
@@ -407,11 +407,12 @@ The first table above is step 0's measurement. `prompt-prepare` on the GPU has n
 1. **Close the issue.** *Done 2026-10-19.* Change `source_witness_bytes` to commit the argument
    names. Add the §Reproduction tests from the issue as regression tests, written first and seen
    to fail before the fix.
-2. **Move chunking** to the recur call site.
-3. **Extract `verify_input_source_anchored`.**
-4. **Narrow the scope-parent witness**, on both host and guest.
+2. **Move chunking** to the recur call site. *Done 2026-10-20.*
+3. **Extract `verify_input_source_anchored`.** *Done 2026-10-20.*
+4. **Narrow the scope-parent witness**, on both host and guest. *Done 2026-10-20.*
 5. **Introduce `ControlFlowInput` and `verify_step`.** Split `cfs.rs` into `control_flow.rs` and
-   `recur.rs`. Split the CFS tests in `tests.rs` out by the function under test.
+   `recur.rs`. Split the CFS tests in `tests.rs` out by the function under test. *Done
+   2026-10-20.*
 6. **Add the control-flow guest.** Move `frame.rs` and `merkle_tree.rs` into `guest_common`, and
    `control_flow.rs` and its tests into the new guest. Add `control_flow_image_id` to
    `PublicParams` and `TransitionJournal`, with the continuity assertion, and pin it in
@@ -421,6 +422,68 @@ The first table above is step 0's measurement. `prompt-prepare` on the GPU has n
    `input_source_witness`: one argument name changed, everything else the same.
 
 Each of steps 1–5 leaves one guest and a passing suite. Stopping after step 5 is a valid end state.
+
+## Implementation record (steps 2–5, 2026-10-20)
+
+Landed as designed, with the differences below. Line numbers elsewhere in this document refer to
+`c049b76` and are now stale: `cfs.rs` no longer exists.
+
+- **Step 2.** The rule is `checks::recur::verify_recur_iteration_chunking(cfs, record, replay)`.
+  It looks the site up itself and returns for any step that is not a recur iteration, so
+  `apply_verified_step` calls it unconditionally, next to `advance_recur_progress`.
+  `verify_step_record_inputs` keeps its early return for iterations and lost its `replay_journal`
+  parameter. The six chunking tests now target the new function, and
+  `verify_step_record_inputs_leaves_chunking_to_the_recur_call_site` pins the split: an iteration
+  of a chunked site passes the binding check with no journal at all.
+- **Step 3.** As written. `verify_step` calls the anchor first, and `io::verify_step_record` still
+  calls it, so the hash runs twice per step until step 6.
+- **Step 4.** Narrower than written, in two ways.
+  - **Entry arguments lost their paths too.** The host built trace paths for every resolved
+    source: `SequenceScope` parents, `PriorItemOutput` producers, and `ProgramStart` for every
+    `EntryArgument`. The guest read only the first kind. `witness_record_inputs` and
+    `resolve_inputs_sources` (with `flatten_binding`, `record_produces_item`,
+    `program_start_index`, `frame_opening_index`) are replaced by `witness_sequence_scope_parents`.
+    It mirrors the guest's guards, including `binds_sequence_scope`.
+  - **The type changed.** `FraudEvidence.input_sources_witnesses` became
+    `sequence_scope_parents: BTreeMap<u64, (StepRecord, StepRecordWitness)>`, keyed by the
+    verifying step's `exec_index`. `TransitionInput.input_sources_witnesses` became
+    `sequence_scope_parent: Option<(StepRecord, StepRecordWitness)>`.
+
+  The guest's `find_map` filter became explicit assertions on the one parent it receives: kind
+  `SequenceStart`, coordinates equal to the step's parent frame. The `exec_index` part of the old
+  key is gone. A witness borrowed from another step is still refused, now by the fold against
+  this step's root (`a_step_cannot_borrow_another_steps_witness_for_the_same_parent` was
+  rewritten to show exactly that).
+
+  One host behaviour changed: evidence for a window whose step reads a prior item with no producer
+  in the trace used to panic in the host. It now builds, and the guest's storage check is what
+  refuses the read (`a_window_over_an_unproduced_prior_item_builds_without_a_scope_parent`).
+- **Step 5.** `ControlFlowInput` is **borrowed** (`ControlFlowInput<'a>`, all references) and lives
+  in `checks/control_flow.rs`, not in `raster-core`. Inside the transition guest every field
+  already exists in the step input or the live state, so an owned copy would clone the record and
+  both `FnInput`s on every step. Step 6 needs the owned, serializable form in `raster-core` as
+  sketched in §Step 6. `verify_step` now runs first in `apply_verified_step`, ahead of the other
+  families, where `get_next_expected_coordinates` used to run last. Every check is an assertion
+  and none of them mutates state another reads, so this changes only which assertion fires first
+  on a step that fails several. Tests are split into `src/tests/mod.rs` (helpers, and tests that
+  cross families), `tests/control_flow.rs` and `tests/recur.rs`. A test moved when every check
+  function it reaches belongs to one family, so the site-`Start` tests that drive the control-flow,
+  storage and recur checks together stay in `mod.rs`. Five `verify_step` tests were added.
+
+**What moved.** `TransitionInput`'s serialized shape, and with it the transition guest's image
+id. `StepRecord`, the trace, `commit.bin`, `program_commitment` and the tile image ids did not
+move. The `raster-core` edits are a `TransitionInput` field and comments, and a `hello-tiles`
+tile ELF built with and without them is byte-identical. The committed
+`examples/hello-tiles/Raster.lock` fails the drift check in this checkout even with `raster-core`
+at HEAD, so that drift predates this change. Tile ELFs embed absolute source paths, so a lock
+generated from another checkout path does not match.
+
+**Verified.** Transition guest: 173 tests (168 before, plus the five `verify_step` tests).
+`raster-prover` host: `trace::` and `transition::tests::build_transition_input*`. End to end:
+`examples/hello-tiles`, `RISC0_DEV_MODE=1`, 32-step windows: `--fraud-step 47` (a recur-sequence
+body, `[21, 2, 1]`), `58` (nested sequences, `[23, 5, 4, 1]`) and `27` (top level, `[11]`) each
+commit, audit and generate a fraud proof. Run against a lock rebuilt in this checkout, for the
+reason above.
 
 ## Deferred
 

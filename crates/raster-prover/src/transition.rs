@@ -56,7 +56,7 @@ type RecordedStepIo = HashMap<StepRecord, StepIo>;
 
 fn build_transition_input(
     step_record: &StepRecord,
-    input_sources_witnesses: &HashMap<(u64, StepRecord), StepRecordWitness>,
+    sequence_scope_parents: &BTreeMap<u64, (StepRecord, StepRecordWitness)>,
     recorded_step_io: &RecordedStepIo,
     replayed_results: &HashMap<StepRecord, ReplayResult>,
     authorization_journal: &AuthorizationJournal,
@@ -112,14 +112,9 @@ fn build_transition_input(
         storage_witness,
         draft_transition_witness,
         authorization_journal: authorization_journal.clone(),
-        // Only this step's own witnesses. The guest looks one up by its own
-        // `exec_index` (`checks::cfs::verify_sequence_scope_parent`), so the
-        // window's other entries are data it would decode and never read.
-        input_sources_witnesses: input_sources_witnesses
-            .iter()
-            .filter(|((verifier_exec_index, _), _)| *verifier_exec_index == step_record.exec_index)
-            .map(|(key, witness)| (key.clone(), witness.clone()))
-            .collect(),
+        // Only this step's own parent: its witness folds to this step's trace
+        // root and no other (`checks::control_flow::verify_sequence_scope_parent`).
+        sequence_scope_parent: sequence_scope_parents.get(&step_record.exec_index).cloned(),
         entrypoint_membership_witness: entrypoint_membership_witness.cloned(),
         program_output_read_witness,
         program_output_selection_witness,
@@ -213,7 +208,7 @@ pub fn step_transitions(
     // written to the guest, which hashes it to derive `program_commitment` and
     // decodes it for the CFS + tile registry. See program-identity.md.
     program_frame: &[u8],
-    input_sources_witnesses: &HashMap<(u64, StepRecord), StepRecordWitness>,
+    sequence_scope_parents: &BTreeMap<u64, (StepRecord, StepRecordWitness)>,
     recorded_step_io: &RecordedStepIo,
     replayed_results: &HashMap<StepRecord, ReplayResult>,
     authorization_journal: &AuthorizationJournal,
@@ -245,7 +240,7 @@ pub fn step_transitions(
     for step_record in trace_window {
         let input = build_transition_input(
             step_record,
-            input_sources_witnesses,
+            sequence_scope_parents,
             recorded_step_io,
             replayed_results,
             authorization_journal,
@@ -404,48 +399,51 @@ mod tests {
         }
     }
 
-    /// A step's input carries only the witnesses keyed by its own
-    /// `exec_index`. The guest's lookup (`checks::cfs::verify_sequence_scope_parent`)
-    /// requires that same key, so this keeps a superset of what it can match
-    /// and drops the rest of the window's entries.
+    /// A step's input carries only the scope parent keyed by its own
+    /// `exec_index`: the witness folds to that step's trace root and no other
+    /// (`checks::control_flow::verify_sequence_scope_parent`).
     #[test]
-    fn build_transition_input_keeps_only_this_steps_witnesses() {
+    fn build_transition_input_takes_only_this_steps_scope_parent() {
         let step = make_tile_step(2, vec![1]);
-        let source = make_tile_step(0, vec![2]);
-        let other_source = make_tile_step(3, vec![3]);
+        let parent = make_tile_step(0, vec![2]);
+        let other_parent = make_tile_step(3, vec![3]);
         let witness = |position: u64| StepRecordWitness {
             position,
             path_elems: vec![[position as u8; 32].into()],
         };
-        let window_witnesses = HashMap::from([
-            ((1, source.clone()), witness(10)),
-            ((2, source.clone()), witness(20)),
-            ((2, other_source.clone()), witness(21)),
-            ((4, other_source.clone()), witness(40)),
+        let window_parents = BTreeMap::from([
+            (1, (parent.clone(), witness(10))),
+            (2, (parent.clone(), witness(20))),
+            (4, (other_parent.clone(), witness(40))),
         ]);
-        let recorded_step_io = HashMap::from([(step.clone(), io_witnesses(None, None))]);
-        let replayed_results = HashMap::from([(
-            step.clone(),
-            ReplayResult {
-                fn_name: "shared_tile".to_string(),
-                receipt: vec![],
-                image_id: vec![9; 32],
-                input: vec![],
-                output: vec![],
-                replay_journal: TileReplayJournal {
-                    input_commitment: [0u8; 32],
-                    output_bytes: vec![],
-                    output_root: None,
-                    input_roots: Vec::new(),
-                    draft_transition: None,
-                    recur: None,
-                },
+        let unrelated = make_tile_step(3, vec![4]);
+        let recorded_step_io = HashMap::from([
+            (step.clone(), io_witnesses(None, None)),
+            (unrelated.clone(), io_witnesses(None, None)),
+        ]);
+        let replay = ReplayResult {
+            fn_name: "shared_tile".to_string(),
+            receipt: vec![],
+            image_id: vec![9; 32],
+            input: vec![],
+            output: vec![],
+            replay_journal: TileReplayJournal {
+                input_commitment: [0u8; 32],
+                output_bytes: vec![],
+                output_root: None,
+                input_roots: Vec::new(),
+                draft_transition: None,
+                recur: None,
             },
-        )]);
+        };
+        let replayed_results = HashMap::from([
+            (step.clone(), replay.clone()),
+            (unrelated.clone(), replay),
+        ]);
 
         let input = build_transition_input(
             &step,
-            &window_witnesses,
+            &window_parents,
             &recorded_step_io,
             &replayed_results,
             &make_authorization_journal(),
@@ -454,13 +452,23 @@ mod tests {
             None,
         );
 
-        let mut kept: Vec<(u64, u64, u64)> = input
-            .input_sources_witnesses
-            .iter()
-            .map(|((verifier, record), witness)| (*verifier, record.exec_index, witness.position))
-            .collect();
-        kept.sort();
-        assert_eq!(kept, vec![(2, 0, 20), (2, 3, 21)]);
+        let (kept_parent, kept_witness) = input
+            .sequence_scope_parent
+            .expect("step 2 has a scope parent in the window");
+        assert_eq!(kept_parent, parent);
+        assert_eq!(kept_witness.position, 20);
+
+        let input = build_transition_input(
+            &unrelated,
+            &window_parents,
+            &recorded_step_io,
+            &replayed_results,
+            &make_authorization_journal(),
+            None,
+            None,
+            None,
+        );
+        assert!(input.sequence_scope_parent.is_none());
     }
 
     #[test]
@@ -519,7 +527,7 @@ mod tests {
 
         let input = build_transition_input(
             &second_step,
-            &HashMap::new(),
+            &BTreeMap::new(),
             &recorded_step_io,
             &replayed_results,
             &make_authorization_journal(),
@@ -568,7 +576,7 @@ mod tests {
 
         let input = build_transition_input(
             &tile_step,
-            &HashMap::new(),
+            &BTreeMap::new(),
             &recorded_step_io,
             &replayed_results,
             &make_authorization_journal(),
@@ -615,7 +623,7 @@ mod tests {
 
         let start_input = build_transition_input(
             &sequence_start,
-            &HashMap::new(),
+            &BTreeMap::new(),
             &recorded_step_io,
             &HashMap::new(),
             &make_authorization_journal(),
@@ -625,7 +633,7 @@ mod tests {
         );
         let end_input = build_transition_input(
             &sequence_end,
-            &HashMap::new(),
+            &BTreeMap::new(),
             &recorded_step_io,
             &HashMap::new(),
             &make_authorization_journal(),
@@ -725,7 +733,7 @@ mod tests {
             storage_witness: None,
             draft_transition_witness: None,
             authorization_journal: authorization,
-            input_sources_witnesses: HashMap::new(),
+            sequence_scope_parent: None,
             entrypoint_membership_witness: None,
             program_output_read_witness: None,
             program_output_selection_witness: None,

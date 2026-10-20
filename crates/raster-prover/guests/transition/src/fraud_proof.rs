@@ -123,7 +123,7 @@ pub struct FraudProofWindowContext {
 /// the cause.
 ///
 /// **Diagnostics only, no soundness weight.** The advance-and-compare in
-/// [`checks::cfs::advance_recur_progress`] remains the sole authority on
+/// [`checks::recur::advance_recur_progress`] remains the sole authority on
 /// whether a seed is correct — a wrong seed advances to a different stack and
 /// fails there, seeded or not.
 ///
@@ -642,24 +642,28 @@ impl LiveTransition {
         cfs_cursor: &CfsCursor,
         input: &TransitionInput,
     ) -> Self {
-        // Before `append_to_trace` advances it, the frontier's position is this
-        // step's trace index — which is what fixes its `exec_index`.
-        checks::cfs::verify_exec_index(self.frontier.position().into(), &input.step_record);
-        checks::cfs::verify_sequence_id(cfs_cursor, &input.step_record);
-        // The same pre-append frontier: its root is the root of the trace
-        // prefix the parent record must be provably in.
-        checks::cfs::verify_sequence_scope_parent(
+        // The control-flow check reads only what it is handed. Both trace facts
+        // are taken before `append_to_trace` advances the frontier: its position
+        // is this step's trace index, which fixes `exec_index`, and its root is
+        // the root of the prefix a scope parent must be provably in.
+        let trace_root_before = frontier_root(&self.frontier);
+        let control_flow = checks::control_flow::verify_step(
             cfs_cursor,
-            &input.step_record,
-            input.sequence_scope_witness.as_ref(),
-            &input.input_sources_witnesses,
-            &frontier_root(&self.frontier),
+            &checks::control_flow::ControlFlowInput {
+                step_record: &input.step_record,
+                trace_position: self.frontier.position().into(),
+                trace_root_before: &trace_root_before,
+                expected_before: self.next_expected_coordinates.as_ref(),
+                input_source_witness: input.input_source_witness.as_ref(),
+                sequence_scope_witness: input.sequence_scope_witness.as_ref(),
+                sequence_scope_parent: input.sequence_scope_parent.as_ref(),
+            },
         );
-        checks::cfs::verify_step_record_inputs(
+        // A recur rule that reads the replay journal, so it sits with the
+        // other recur checks rather than in the control-flow check above.
+        checks::recur::verify_recur_iteration_chunking(
             cfs_cursor,
             &input.step_record,
-            input.input_source_witness.as_ref(),
-            input.sequence_scope_witness.as_ref(),
             input.replay_journal.as_ref(),
         );
         // The draft transition on its own first; the site frame then chains it.
@@ -668,7 +672,7 @@ impl LiveTransition {
             input.replay_journal.as_ref(),
             input.draft_transition_witness.as_ref(),
         );
-        checks::cfs::advance_recur_progress(
+        checks::recur::advance_recur_progress(
             cfs_cursor,
             &mut self.recur_progress,
             &input.step_record,
@@ -725,21 +729,7 @@ impl LiveTransition {
             &self.storage_index_root,
         );
         self.storage_index_root = next_index_root;
-        // `get_next_expected_coordinates` both checks this step was expected
-        // and computes the successors. `ProgramEnd` is the unique terminal
-        // step: it must be expected, but nothing may follow it.
-        let next_coordinates = checks::cfs::get_next_expected_coordinates(
-            cfs_cursor,
-            &input.step_record,
-            self.next_expected_coordinates.as_ref(),
-        );
-        self.next_expected_coordinates = Some(
-            if matches!(input.step_record.kind, StepKind::ProgramEnd(_)) {
-                Vec::new()
-            } else {
-                next_coordinates
-            },
-        );
+        self.next_expected_coordinates = Some(control_flow.expected_after);
         self.append_to_trace(&input.step_record);
         self
     }

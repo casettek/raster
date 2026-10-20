@@ -1,7 +1,10 @@
 //! Per-step verification checks, grouped by the invariant they enforce:
 //!
-//! - [`cfs`]: the step sits at valid CFS coordinates and its inputs obey the
-//!   schema's input bindings.
+//! - [`control_flow`]: the step sits at valid CFS coordinates and its inputs
+//!   obey the schema's input bindings — one function, [`control_flow::verify_step`],
+//!   over an explicit input.
+//! - [`recur`]: recur iterations are chunked as declared and advance the
+//!   recur-progress stack.
 //! - [`io`]: recorded input/output/external commitments match the provided
 //!   witnesses, and tile steps carry a verified replay proof.
 //! - [`store`]: the storage transition (reads, optional write, roots)
@@ -11,8 +14,9 @@
 //!   the authorization journal, once per step and once per fraud-proof
 //!   chain genesis.
 
-pub mod cfs;
+pub mod control_flow;
 pub mod drafts;
 pub mod entrypoint;
 pub mod io;
+pub mod recur;
 pub mod store;

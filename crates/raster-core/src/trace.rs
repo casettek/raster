@@ -529,7 +529,7 @@ pub struct RecurEndStep {
 }
 
 /// The binding name a recur site's source is always recorded under. Shared so
-/// the payload rule below and `checks::cfs::authenticated_source_len` cannot
+/// the payload rule below and `checks::recur::authenticated_source_len` cannot
 /// disagree about which binding that is.
 pub const RECUR_SOURCE_BINDING: &str = "input";
 
@@ -543,7 +543,7 @@ pub const RECUR_SOURCE_BINDING: &str = "input";
 /// fact — *this reference resolves inside an object the store authenticates* —
 /// which folds from a root with no payload at all.
 ///
-/// The one exception is a recur site's source. `checks::cfs`'s
+/// The one exception is a recur site's source. `checks::recur`'s
 /// `authenticated_source_len` reads the sweep bound `L` out of that binding's
 /// payload, and `L` is the number every completeness rule holds the sweep to.
 /// That payload is the list's *metadata* view — `(len, elements_root)` — so it

@@ -2,7 +2,7 @@
 //! pre-state is authenticated by the draft witness, and the ops re-apply to a
 //! derived post-root. Which object the transition belongs to — and that it
 //! continues that object's root — is the site frame's business
-//! (`RecurProgressStack::advance_draft`, called from `checks::cfs`), so this
+//! (`RecurProgressStack::advance_draft`, called from `checks::recur`), so this
 //! returns the step for the frame to chain rather than tracking drafts itself.
 
 use raster_core::draft::{
