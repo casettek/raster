@@ -319,11 +319,13 @@ wherever it pins `TRANSITION_GUEST_ID`: today that is only
 `chain_fraud` is not involved: it never verifies a transition receipt (its evidence is `Link`,
 which checks authorization only, or `Shape`), so its journal doesn't carry the ID.
 
-The continuity assertion is **required**, and the pattern being copied lacks it: nothing compares
-`input.authorization_image_id` with `prev_journal.authorization_image_id` on a `Next` step
-(`fraud_proof.rs:245-250`). Only the last step's ID reaches the relying party. That is outside
-this proposal's scope, and is filed as
-[`authorization-image-id-unpinned`](../issues/authorization-image-id-unpinned.md). The new ID must not repeat it.
+The continuity assertion is **required**. The pattern being copied lacked it until 2026-10-21:
+nothing compared `input.authorization_image_id` with `prev_journal.authorization_image_id` on a
+`Next` step, and no single-program verifier checked the final id.
+[`authorization-image-id-unpinned`](../issues/authorization-image-id-unpinned.md) closed both
+gaps, with `assert_authorization_continuity` in the guest and `verify_fraud_proof_receipt` on the
+host. The new ID needs both: its own continuity assertion, and a pin in
+`verify_fraud_proof_receipt`.
 
 The alternative is to compile the ID into the transition guest. That keeps `TransitionJournal`'s
 shape, but it needs a two-pass `risc0_build`, or a checked-in constant pinned by a test. A

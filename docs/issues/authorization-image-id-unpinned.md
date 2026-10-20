@@ -1,6 +1,7 @@
 # Issue: `authorization-image-id-unpinned` — the authorization guest a fraud proof relies on is the prover's choice
 
-Status: open 2026-10-21. **Soundness gap**, found by reading and not probed. It was flagged in
+Status: **resolved 2026-10-21** with directions 1 and 2 (§Resolution). Opened the same day.
+**Soundness gap**, found by reading and not probed. It was flagged in
 [`control-flow-prover`](../proposals/control-flow-prover.md) §Image-id pinning ("the pattern
 being copied lacks it") and filed here so that step 6 does not copy it.
 
@@ -131,3 +132,27 @@ the manifest does not list, using that guest's receipt and id. Today `verify_fra
 the result. After direction 2 (or 3) it must reject it. For gap 1 alone: a two-step window whose
 `Init` step uses the forged id and whose second step uses the real one. After direction 1 the
 second step must panic.
+
+## Resolution
+
+Directions 1 and 2, with no format change.
+
+- **Gap 1.** `fraud_proof.rs` `assert_authorization_continuity` runs in the `Next` branch beside
+  the manifest and program continuity checks. It requires `input.authorization_image_id ==
+  prev_journal.authorization_image_id`, so the one id the `Finished` journal carries is the id
+  every step verified against. Tests: `tests::authorization_continuity` in the transition guest.
+- **Gap 2.** `raster_prover::transition::verify_fraud_proof_receipt` is the single-program
+  counterpart of `verify_chain_fraud_receipt`. It verifies the receipt against
+  `TRANSITION_GUEST_ID`, requires `Finished`, and requires the journal's `transition_image_id`
+  and `authorization_image_id` to be the known-good guests. Which commitment the proof refutes
+  stays the caller's check. `examples/verify_fraud_proof.rs` now goes through it. Tests:
+  `transition::tests::a_journal_naming_another_authorization_guest_is_refused` and three
+  siblings, on the journal half (`check_fraud_proof_journal`).
+
+The transition guest's image id moves, as any guest change does. Verified end to end on
+`examples/hello-tiles` in dev mode: `--fraud-step 58` audits, generates a proof, and
+`verify_fraud_proof` accepts it with both guests pinned.
+
+Still not done: the reproduction above (a second, forged authorization guest) was not built, so
+the attack itself has not been demonstrated. And direction 2 holds only for verifiers that call
+`verify_fraud_proof_receipt`. A settlement contract written later has to make the same check.

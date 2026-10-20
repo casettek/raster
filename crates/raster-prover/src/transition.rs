@@ -22,6 +22,7 @@ use raster_core::transition::{
 use std::collections::{BTreeMap, HashMap};
 
 use crate::authorization::authorization_guest_image_id;
+use crate::error::{BitPackerError, Result};
 use raster_core::merkle::{NodeHash, EMPTY_LEAF};
 use crate::replay::ReplayResult;
 use crate::trace::{
@@ -318,6 +319,56 @@ pub fn step_transitions(
     }
 
     transition_receipt
+}
+
+/// The relying party's verification of a single-program fraud proof: the
+/// receipt is a transition receipt, it reached `Finished`, and the inner guests
+/// its journal names are the known-good ones.
+///
+/// The authorization id is the check that matters. Every window step verifies
+/// its authorization journal against a host-supplied id, and the guest holds it
+/// continuous across the window, but only a relying party can say *which* id is
+/// acceptable. Without the pin, a receipt could rest on a guest the prover
+/// compiled — one that pairs the real manifest commitment with input
+/// commitments the manifest does not list. That is how a one-item genesis
+/// window forges a fraud proof against an honest trace. See
+/// `docs/issues/authorization-image-id-unpinned.md`; the chain path pins it the
+/// same way (`chain_fraud::verify_chain_fraud_receipt`).
+///
+/// Which commitment the proof refutes is the caller's question: compare
+/// `journal.refuted_trace_commitment` with the header digest of the
+/// `commit.bin` in dispute.
+pub fn verify_fraud_proof_receipt(receipt: &risc0_zkvm::Receipt) -> Result<TransitionJournal> {
+    receipt
+        .verify(TRANSITION_GUEST_ID)
+        .map_err(|e| BitPackerError::InvalidCommitment(format!("fraud-proof receipt: {e}")))?;
+    let journal: TransitionJournal = receipt
+        .journal
+        .decode()
+        .map_err(|e| BitPackerError::SerializationError(format!("fraud-proof journal: {e}")))?;
+    check_fraud_proof_journal(&journal)?;
+    Ok(journal)
+}
+
+/// The journal half of [`verify_fraud_proof_receipt`], apart from the receipt
+/// so it can be tested without proving.
+fn check_fraud_proof_journal(journal: &TransitionJournal) -> Result<()> {
+    if !matches!(journal.current_state, TransitionState::Finished) {
+        return Err(BitPackerError::InvalidCommitment(
+            "fraud-proof receipt did not reach Finished: no divergence is proven".to_string(),
+        ));
+    }
+    if journal.transition_image_id != image_id_bytes(TRANSITION_GUEST_ID) {
+        return Err(BitPackerError::InvalidCommitment(
+            "fraud-proof journal names an unknown transition guest".to_string(),
+        ));
+    }
+    if journal.authorization_image_id != authorization_guest_image_id() {
+        return Err(BitPackerError::InvalidCommitment(
+            "fraud-proof receipt verified an unknown authorization guest".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -665,6 +716,62 @@ mod tests {
             authorization_guest_image_id(),
             image_id_bytes(crate::AUTHORIZATION_GUEST_ID)
         );
+    }
+
+    /// A `Finished` journal naming the known-good guests, as an honest
+    /// fraud proof commits it.
+    fn finished_journal() -> TransitionJournal {
+        TransitionJournal {
+            init_state: InitTransition {
+                init_frontier: make_init_frontier(),
+                init_storage_frontier: make_init_frontier(),
+                init_storage_root: storage_root(&make_init_frontier()),
+                init_storage_index_root: coordinate_index_root(&BTreeMap::new()),
+                fingerprint: Fingerprint::from(vec![0], BitPacker::new(64), 1),
+            },
+            current_state: TransitionState::Finished,
+            transition_image_id: image_id_bytes(TRANSITION_GUEST_ID),
+            authorization_image_id: authorization_guest_image_id(),
+            input_manifest_commitment: vec![2; 32],
+            program_commitment: vec![3; 32],
+            refuted_trace_commitment: vec![4; 32],
+            entrypoint_authorization: raster_core::transition::EntrypointAuthorization::Established,
+            output_authorization: raster_core::transition::OutputAuthorization::NotRequired,
+            window_is_terminal: false,
+            final_committed_root: None,
+        }
+    }
+
+    #[test]
+    fn a_finished_journal_naming_the_known_guests_is_accepted() {
+        check_fraud_proof_journal(&finished_journal()).expect("honest journal");
+    }
+
+    /// `authorization-image-id-unpinned` gap 2: the receipt is a real
+    /// transition receipt, but its authorization journal came from a guest the
+    /// prover chose. The relying party is the only place that can refuse it.
+    #[test]
+    fn a_journal_naming_another_authorization_guest_is_refused() {
+        let mut journal = finished_journal();
+        journal.authorization_image_id = vec![0xAA; 32];
+        let error = check_fraud_proof_journal(&journal).expect_err("unknown guest");
+        assert!(error.to_string().contains("unknown authorization guest"), "{error}");
+    }
+
+    #[test]
+    fn a_journal_naming_another_transition_guest_is_refused() {
+        let mut journal = finished_journal();
+        journal.transition_image_id = vec![0xBB; 32];
+        let error = check_fraud_proof_journal(&journal).expect_err("unknown guest");
+        assert!(error.to_string().contains("unknown transition guest"), "{error}");
+    }
+
+    #[test]
+    fn a_journal_that_did_not_finish_is_refused() {
+        let mut journal = finished_journal();
+        journal.current_state = TransitionState::Init(journal.init_state.clone());
+        let error = check_fraud_proof_journal(&journal).expect_err("not finished");
+        assert!(error.to_string().contains("did not reach Finished"), "{error}");
     }
 
     fn make_init_frontier() -> SerializableFrontier {

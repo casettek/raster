@@ -4518,5 +4518,59 @@ fn a_tile_reading_the_value_inside_an_err_is_rejected() {
     );
 }
 
+
+/// `authorization-image-id-unpinned` gap 1: a `Next` step must verify its
+/// authorization journal against the same guest as the step before it.
+mod authorization_continuity {
+    use super::*;
+    use crate::fraud_proof::assert_authorization_continuity;
+    use raster_core::fingerprint::{BitPacker, Fingerprint};
+    use raster_core::transition::{
+        InitTransition, OutputAuthorization, TransitionJournal, TransitionState,
+    };
+
+    fn journal_naming(authorization_image_id: Vec<u8>) -> TransitionJournal {
+        let frontier = SerializableFrontier {
+            position: 0,
+            leaf: EMPTY_LEAF.to_vec(),
+            ommers: Vec::new(),
+        };
+        TransitionJournal {
+            init_state: InitTransition {
+                init_frontier: frontier.clone(),
+                init_storage_frontier: frontier,
+                init_storage_root: Vec::new(),
+                init_storage_index_root: coordinate_index_root(&BTreeMap::new()),
+                fingerprint: Fingerprint::from(vec![0], BitPacker::new(64), 1),
+            },
+            current_state: TransitionState::Finished,
+            transition_image_id: vec![1; 32],
+            authorization_image_id,
+            input_manifest_commitment: vec![2; 32],
+            program_commitment: vec![3; 32],
+            refuted_trace_commitment: vec![4; 32],
+            entrypoint_authorization: EntrypointAuthorization::Established,
+            output_authorization: OutputAuthorization::NotRequired,
+            window_is_terminal: false,
+            final_committed_root: None,
+        }
+    }
+
+    #[test]
+    fn the_same_authorization_guest_across_steps_is_accepted() {
+        assert_authorization_continuity(&journal_naming(vec![7; 32]), &[7; 32]);
+    }
+
+    /// The window's earlier step verified a journal from one guest; this step
+    /// names another. Only the last id reaches the `Finished` journal, so
+    /// accepting the switch would let the earlier step rest on a guest no
+    /// relying party ever sees.
+    #[test]
+    #[should_panic(expected = "Authorization image ID is not the same within the fraud proof")]
+    fn switching_authorization_guests_mid_window_is_refused() {
+        assert_authorization_continuity(&journal_naming(vec![6; 32]), &[7; 32]);
+    }
+}
+
 mod control_flow;
 mod recur;

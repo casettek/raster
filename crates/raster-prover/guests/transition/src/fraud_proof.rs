@@ -247,6 +247,7 @@ impl FraudProofWindowContext {
                 verify_previous_journal(&prev_journal, &params.transition_image_id);
                 assert_state_continuity(&prev_journal, &transition);
                 assert_manifest_continuity(&prev_journal, input);
+                assert_authorization_continuity(&prev_journal, &input.authorization_image_id);
                 assert_program_continuity(&prev_journal, params);
 
                 let live = LiveTransition::resume(
@@ -509,6 +510,29 @@ fn assert_manifest_continuity(prev_journal: &TransitionJournal, input: &Transiti
         input.authorization_journal.input_manifest_commitment
             == prev_journal.input_manifest_commitment,
         "Manifest commitment does not match"
+    );
+}
+
+/// Every step of the fraud proof must verify its authorization journal against
+/// the same authorization guest.
+///
+/// Each step verifies the journal against `input.authorization_image_id`, a
+/// host-supplied value, and only the final step's id reaches the `Finished`
+/// journal. Without this, a step before the last could rest on a receipt from a
+/// guest the prover compiled — one that pairs the real manifest commitment with
+/// input commitments the manifest does not list — while the journal a relying
+/// party pins names the real guest. Manifest continuity alone cannot catch
+/// that: the forged journal names the same manifest. The relying party pins the
+/// final id (`raster_prover::transition::verify_fraud_proof_receipt`); this
+/// makes that one id cover every step. See
+/// `docs/issues/authorization-image-id-unpinned.md`.
+pub(crate) fn assert_authorization_continuity(
+    prev_journal: &TransitionJournal,
+    authorization_image_id: &[u8],
+) {
+    assert!(
+        authorization_image_id == prev_journal.authorization_image_id,
+        "Authorization image ID is not the same within the fraud proof",
     );
 }
 
