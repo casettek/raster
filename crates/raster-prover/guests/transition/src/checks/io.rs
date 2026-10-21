@@ -13,9 +13,7 @@ use raster_core::trace::{FnInput, FnInputValue, StepRecord};
 
 use crate::merkle_tree::sha256_bytes;
 
-pub fn input_source_commitment(input: &FnInput) -> Vec<u8> {
-    sha256_bytes(&input.source_witness_bytes())
-}
+pub use guest_common::input_source::{input_source_commitment, verify_input_source_anchored};
 
 pub fn verify_io_witness(
     step_record: &StepRecord,
@@ -56,41 +54,6 @@ pub fn verify_authorization_journal(
         .expect("Failed to serialize authorization journal");
 
     env::verify(image_id_digest, &journal_bytes).is_ok()
-}
-
-/// Hold a step's input source witness to the record: present and equal to its
-/// recorded `input_source_commitment` exactly when the record declares one,
-/// absent otherwise.
-///
-/// Every check that reads the witness — the CFS bindings, the replay's input
-/// roots, the storage reads, recur — is only as sound as this anchor. It is a
-/// call of its own so each of those check groups can make it rather than rely
-/// on another group having made it in the same execution
-/// (`docs/proposals/control-flow-prover.md` step 3). While both groups share one
-/// guest the hash runs twice per step.
-pub fn verify_input_source_anchored(
-    step_record: &StepRecord,
-    input_source_witness: Option<&FnInput>,
-) {
-    if let Some(expected_input_source_commitment) = step_record.input_source_commitment() {
-        let input_source_witness =
-            input_source_witness.expect("Step input source witness is missing");
-        assert_eq!(
-            expected_input_source_commitment,
-            &input_source_commitment(input_source_witness),
-            "Step input source witness does not match recorded source commitment",
-        );
-    } else {
-        // `ProgramStart`, `ProgramEnd` and `SequenceEnd` all report `None`
-        // here. None of them binds a step input, so a witness supplied for one
-        // is unbound by construction — nothing in the record commits to it.
-        assert!(
-            input_source_witness.is_none(),
-            "Step {:?} declares no input source commitment, so it must not carry an input \
-             source witness",
-            step_record.coordinates,
-        );
-    }
 }
 
 pub fn verify_step_record(

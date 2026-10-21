@@ -28,6 +28,6 @@ postcard.workspace = true
 risc0-zkvm = { version = "3.0", default-features = false, features = ["prove", "std"] }
 
 [package.metadata.risc0]
-methods = ["guests/transition", "guests/authorization", "guests/chain_fraud"]
+methods = ["guests/transition", "guests/control_flow", "guests/authorization", "guests/chain_fraud"]
 
 

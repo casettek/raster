@@ -4,7 +4,7 @@ use bridgetree::NonEmptyFrontier;
 
 use raster_core::authorization::AuthorizationJournal;
 use raster_core::cfs::{
-    CfsCoordinate, CfsCoordinates, CfsCursor, ControlFlowSchema, InputBinding, InputSource,
+    CfsCoordinate, CfsCoordinates, CfsCursor, ControlFlowSchema, InputBinding,
     RecurSequenceItem, FIRST_COORDINATE,
     RecurTileItem, SequenceChildItem, SequenceDef, SequenceItem, TileDef, TileItem,
 };
@@ -25,7 +25,7 @@ use raster_core::recur_progress::{
     DraftStep, RecurProgressStack, RecurProgressViolation, RecurSiteKind, SiteDraft,
 };
 use raster_core::trace::{
-    ExecStep, ExecTarget, FnInput, FnInputArg, FnInputValue, ProgramEndStep, StepKind, StepRecord,
+    ExecStep, ExecTarget, FnInput, FnInputArg, FnInputValue, StepKind, StepRecord,
     StorageData, StorageRoots,
 };
 use raster_core::transition::{
@@ -33,10 +33,6 @@ use raster_core::transition::{
     StorageWriteWitness,
 };
 
-use crate::checks::control_flow::{
-    verify_exec_index, verify_sequence_id, verify_sequence_scope_parent,
-    verify_step_record_inputs,
-};
 use crate::checks::recur::verify_recur_iteration_chunking;
 use crate::checks::drafts::verify_draft_transition;
 use crate::checks::io::{
@@ -133,21 +129,6 @@ fn authorization_journal(binding_name: &str, commitment: &[u8]) -> Authorization
     }
 }
 
-fn field_path(names: &[&str]) -> Vec<SelectorSegment> {
-    names.iter().map(|name| SelectorSegment::Field(name.to_string())).collect()
-}
-
-/// `witness` with every storage argument read through `path` — the recorded
-/// `selector` and the `selection.path` its proof is pinned to, which agree on
-/// every honest run.
-fn selecting(mut witness: FnInput, path: Vec<SelectorSegment>) -> FnInput {
-    for data in witness.storage.values_mut() {
-        data.selector = raster_core::input::SelectorPath::new(path.clone());
-        data.selection.path = raster_core::input::SelectorPath::new(path.clone());
-    }
-    witness
-}
-
 fn storage_input_witness(coordinates: CfsCoordinates, commitment: Vec<u8>) -> FnInput {
     storage_inputs_witness(&[("arg", coordinates, commitment)])
 }
@@ -202,340 +183,6 @@ fn renaming_args(mut witness: FnInput, names: &[&str]) -> FnInput {
     witness
 }
 
-/// `sub`'s item reads `sub`'s own parameter 0 — a `SequenceScope` binding at a
-/// *nested* frame, which is the shape the compiler actually emits. (`main`'s
-/// parameters resolve to `EntryArgument`; a scope binding at the root frame is
-/// unreachable.)
-fn scope_binding_cfs() -> CfsCursor {
-    scope_binding_cfs_reading(InputBinding::seq_input(0))
-}
-
-/// [`scope_binding_cfs`] with the consumer's binding replaced — a parameter
-/// narrowed by a path, say.
-fn scope_binding_cfs_reading(consumer_source: InputBinding) -> CfsCursor {
-    scope_binding_cfs_reading_all(vec![consumer_source])
-}
-
-/// [`scope_binding_cfs`] with `sub` taking one parameter per consumer
-/// binding, and the consumer declaring `consumer_sources` in order.
-fn scope_binding_cfs_reading_all(consumer_sources: Vec<InputBinding>) -> CfsCursor {
-    let parameters = vec![InputBinding::Direct(InputSource::Inline); consumer_sources.len()];
-    CfsCursor::new(ControlFlowSchema {
-        version: "1.0".into(),
-        project: "test".into(),
-        encoding: "postcard".into(),
-        tiles: vec![TileDef::iter("consumer", consumer_sources.len(), 1)],
-        sequences: vec![
-            SequenceDef {
-                id: "main".into(),
-                input_sources: vec![],
-                items: vec![SequenceChildItem::Sequence(SequenceItem {
-                    id: "sub".into(),
-                    sources: parameters.clone(),
-                })],
-                entry_arguments: vec![],
-                produces_output: false,
-                returns: None,
-            },
-            SequenceDef {
-                id: "sub".into(),
-                input_sources: parameters,
-                items: vec![SequenceChildItem::Tile(TileItem {
-                    id: "consumer".into(),
-                    sources: consumer_sources,
-                })],
-                entry_arguments: vec![],
-                produces_output: false,
-                returns: None,
-            },
-        ],
-    })
-}
-
-/// Build the trace tree over `prefix` — seed at leaf 0, item `n` at `n + 1` —
-/// and return its root with a `StepRecordWitness` for `index`.
-fn trace_root_and_witness(
-    prefix: &[StepRecord],
-    index: usize,
-) -> (Vec<u8>, raster_core::transition::StepRecordWitness) {
-    let mut tree = TraceBridgeTree::new(1);
-    tree.append(Bytes(EMPTY_LEAF.to_vec()));
-    let mut marked = None;
-    for (i, record) in prefix.iter().enumerate() {
-        tree.append(Bytes(crate::merkle_tree::hash_trace_item(record)));
-        if i == index {
-            marked = tree.mark();
-        }
-    }
-    let position = marked.expect("marked position");
-    let root = tree.root(0).expect("trace root").0;
-    let path = tree.witness(position, 0).expect("trace witness");
-    (
-        root,
-        raster_core::transition::StepRecordWitness {
-            position: u64::from(position),
-            path_elems: path.iter().map(|elem| to_node_hash(&elem.0)).collect(),
-        },
-    )
-}
-
-/// The step at `[1, 1]` reading `sub`'s parameter 0, its own source witness,
-/// and the parent `SequenceStart` at `[1]` carrying `parent_args`.
-fn scope_binding_scenario(
-    read_from: CfsCoordinates,
-    commitment: Vec<u8>,
-) -> (StepRecord, FnInput, StepRecord, FnInput) {
-    let step_record = StepRecord {
-        exec_index: 2,
-        sequence_id: "sub".into(),
-        coordinates: CfsCoordinates(vec![1, 1]),
-        kind: StepKind::Exec(ExecStep {
-            target: ExecTarget::Tile("consumer".into()),
-            intra_sequence_index: FIRST_COORDINATE,
-            input_commitment: Vec::new(),
-            input_source_commitment: Vec::new(),
-            output_commitment: Vec::new(),
-            storage: StorageRoots {
-                root_before: Vec::new(),
-                root_after: Vec::new(),
-                index_root_before: Vec::new(),
-                index_root_after: Vec::new(),
-            },
-        }),
-        recur_progress_commitment: RecurProgressStack::new().commitment(),
-        recur_state: None,
-    };
-    let step_source = storage_input_witness(read_from.clone(), commitment.clone());
-    let parent_args = storage_input_witness(read_from, commitment);
-    let parent_record = StepRecord {
-        exec_index: 1,
-        sequence_id: "sub".into(),
-        coordinates: CfsCoordinates(vec![1]),
-        kind: StepKind::SequenceStart {
-            input_commitment: Vec::new(),
-            // The record commits its own argument list; that commitment is
-            // fingerprinted, which is what makes it an anchor.
-            input_source_commitment: input_source_commitment(&parent_args),
-        },
-        recur_progress_commitment: RecurProgressStack::new().commitment(),
-        recur_state: None,
-    };
-    (step_record, step_source, parent_record, parent_args)
-}
-
-/// `sub(p, q)` called with two stored objects `A` and `B`, and its consumer
-/// declared `[SequenceScope{0}, SequenceScope{1}]`, so it must read `(A, B)`.
-///
-/// Returns the CFS, the parent `SequenceStart` at `[1]` committing the honest
-/// arguments `[p, q]`, those arguments, the trace root after the parent, and
-/// the parent record with its inclusion witness against that root.
-fn two_parameter_scope_scenario() -> (
-    CfsCursor,
-    StepRecord,
-    FnInput,
-    Vec<u8>,
-    (StepRecord, raster_core::transition::StepRecordWitness),
-) {
-    let cfs_cursor = scope_binding_cfs_reading_all(vec![
-        InputBinding::seq_input(0),
-        InputBinding::seq_input(1),
-    ]);
-    let parent_args = storage_inputs_witness(&[
-        ("p", CfsCoordinates(vec![10, 10]), sha(b"object-a")),
-        ("q", CfsCoordinates(vec![10, 11]), sha(b"object-b")),
-    ]);
-    let parent_record = StepRecord {
-        exec_index: 1,
-        sequence_id: "sub".into(),
-        coordinates: CfsCoordinates(vec![1]),
-        kind: StepKind::SequenceStart {
-            input_commitment: Vec::new(),
-            input_source_commitment: input_source_commitment(&parent_args),
-        },
-        recur_progress_commitment: RecurProgressStack::new().commitment(),
-        recur_state: None,
-    };
-    let (trace_root, witness) = trace_root_and_witness(&[parent_record.clone()], 0);
-    let parent = (parent_record.clone(), witness);
-    (cfs_cursor, parent_record, parent_args, trace_root, parent)
-}
-
-/// The consumer at `[1, 1]` reading `reads` as its arguments, in order.
-fn two_parameter_consumer(reads: &[(&str, &str)]) -> (StepRecord, FnInput) {
-    let object = |label: &str| match label {
-        "A" => (CfsCoordinates(vec![10, 10]), sha(b"object-a")),
-        "B" => (CfsCoordinates(vec![10, 11]), sha(b"object-b")),
-        other => panic!("unknown object {other}"),
-    };
-    let bindings: Vec<(&str, CfsCoordinates, Vec<u8>)> = reads
-        .iter()
-        .map(|(name, label)| {
-            let (coordinates, commitment) = object(label);
-            (*name, coordinates, commitment)
-        })
-        .collect();
-    let step_source = storage_inputs_witness(&bindings);
-    let step_record = StepRecord {
-        exec_index: 2,
-        sequence_id: "sub".into(),
-        coordinates: CfsCoordinates(vec![1, 1]),
-        kind: StepKind::Exec(ExecStep {
-            target: ExecTarget::Tile("consumer".into()),
-            intra_sequence_index: FIRST_COORDINATE,
-            input_commitment: Vec::new(),
-            input_source_commitment: input_source_commitment(&step_source),
-            output_commitment: Vec::new(),
-            storage: StorageRoots {
-                root_before: Vec::new(),
-                root_after: Vec::new(),
-                index_root_before: Vec::new(),
-                index_root_after: Vec::new(),
-            },
-        }),
-        recur_progress_commitment: RecurProgressStack::new().commitment(),
-        recur_state: None,
-    };
-    (step_record, step_source)
-}
-
-/// `sub`'s consumer reads `sub`'s parameter 0 narrowed by `declared` — the
-/// shape of `greet_sequence` in `examples/hello-tiles`
-/// (`select!(String, personal_data.name)` on its own parameter). The caller
-/// passed the entry object's `caller` part; the step recorded a read of
-/// `read` from an object with commitment `read_from`.
-fn verify_narrowed_scope_read(declared: &[&str], caller: &[&str], read: &[&str], read_from: &[u8]) {
-    let cfs_cursor = scope_binding_cfs_reading(InputBinding::seq_input(0).with_path(field_path(declared)));
-    let (step_record, _, _, _) =
-        scope_binding_scenario(CfsCoordinates(vec![]), sha(b"personal-data"));
-    let caller_argument = selecting(
-        storage_input_witness(CfsCoordinates(vec![]), sha(b"personal-data")),
-        field_path(caller),
-    );
-    let step_source = selecting(
-        storage_input_witness(CfsCoordinates(vec![]), sha(read_from)),
-        field_path(read),
-    );
-    verify_step_record_inputs(
-        &cfs_cursor,
-        &step_record,
-        Some(&step_source),
-        Some(&caller_argument),
-    );
-}
-
-/// `main = [consumer(entry argument)]`, the consumer reading `read`.
-fn verify_entry_argument_read(declared: &[&str], read: &[&str]) {
-    let cfs_cursor = CfsCursor::new(ControlFlowSchema {
-        version: "1.0".into(),
-        project: "test".into(),
-        encoding: "postcard".into(),
-        tiles: vec![TileDef::iter("consumer", 1, 1)],
-        sequences: vec![SequenceDef {
-            id: "main".into(),
-            input_sources: vec![],
-            items: vec![tile_item(
-                "consumer",
-                vec![InputBinding::entry_argument().with_path(field_path(declared))],
-            )],
-            entry_arguments: vec![],
-            produces_output: false,
-            returns: None,
-        }],
-    });
-    let mut step_record = exec_index_fixture(1);
-    step_record.coordinates = CfsCoordinates(vec![1]);
-    verify_step_record_inputs(
-        &cfs_cursor,
-        &step_record,
-        Some(&selecting(
-            storage_input_witness(CfsCoordinates(vec![]), sha(b"entry-object")),
-            field_path(read),
-        )),
-        None,
-    );
-}
-
-/// `main = [producer, consumer(select!(produced.<declared>))]`, the consumer
-/// reading `read` of the producer's output at `[1]`.
-fn verify_prior_item_read(declared: &[&str], read: &[&str]) {
-    let cfs_cursor = CfsCursor::new(ControlFlowSchema {
-        version: "1.0".into(),
-        project: "test".into(),
-        encoding: "postcard".into(),
-        tiles: vec![TileDef::iter("producer", 0, 1), TileDef::iter("consumer", 1, 1)],
-        sequences: vec![SequenceDef {
-            id: "main".into(),
-            input_sources: vec![],
-            items: vec![
-                tile_item("producer", vec![]),
-                tile_item(
-                    "consumer",
-                    vec![InputBinding::prior_item_output(0).with_path(field_path(declared))],
-                ),
-            ],
-            entry_arguments: vec![],
-            produces_output: false,
-            returns: None,
-        }],
-    });
-    let mut step_record = exec_index_fixture(1);
-    step_record.coordinates = CfsCoordinates(vec![2]);
-    verify_step_record_inputs(
-        &cfs_cursor,
-        &step_record,
-        Some(&selecting(
-            storage_input_witness(CfsCoordinates(vec![1]), sha(b"producer-output")),
-            field_path(read),
-        )),
-        None,
-    );
-}
-
-fn producer_sequence_cfs() -> CfsCursor {
-    CfsCursor::new(ControlFlowSchema {
-        version: "1.0".into(),
-        project: "test".into(),
-        encoding: "postcard".into(),
-        tiles: vec![
-            TileDef::iter("producer", 0, 1),
-            TileDef::iter("consumer", 1, 1),
-        ],
-        sequences: vec![
-            SequenceDef {
-                id: "main".into(),
-                input_sources: vec![],
-                items: vec![
-                    SequenceChildItem::Sequence(SequenceItem {
-                        id: "sub".into(),
-                        sources: vec![],
-                    }),
-                    SequenceChildItem::Tile(TileItem {
-                        id: "consumer".into(),
-                        sources: vec![InputBinding::PriorItemOutput {
-                            intra_sequence_item_index: 0,
-                            path: Vec::new(),
-                        }],
-                    }),
-                ],
-                entry_arguments: vec![],
-                produces_output: false,
-                returns: None,
-            },
-            SequenceDef {
-                id: "sub".into(),
-                input_sources: vec![],
-                items: vec![SequenceChildItem::Tile(TileItem {
-                    id: "producer".into(),
-                    sources: vec![InputBinding::Direct(InputSource::Inline)],
-                })],
-                entry_arguments: vec![],
-                produces_output: false,
-                returns: None,
-            },
-        ],
-    })
-}
-
 #[test]
 fn verify_tile_commitments_accept_matching_recorded_io() {
     let step = StepRecord {
@@ -562,195 +209,6 @@ fn verify_tile_commitments_accept_matching_recorded_io() {
     verify_io_witness(&step, Some(&b"in".to_vec()), Some(&b"out".to_vec()));
 }
 
-/// `main = [<items>…, consumer(item k)]` over callee sequences `defs`; the
-/// consumer at `consumer_at` reads `input_coordinates`.
-fn verify_consumer_input(
-    main_items: Vec<SequenceChildItem>,
-    defs: Vec<SequenceDef>,
-    source_index: usize,
-    input_coordinates: Vec<CfsCoordinate>,
-) {
-    let mut items = main_items;
-    items.push(SequenceChildItem::Tile(TileItem {
-        id: "consumer".into(),
-        sources: vec![InputBinding::prior_item_output(source_index)],
-    }));
-    let consumer_at = items.len() as CfsCoordinate;
-    let mut sequences = vec![SequenceDef {
-        id: "main".into(),
-        input_sources: vec![],
-        items,
-        entry_arguments: vec![],
-        produces_output: false,
-        returns: None,
-    }];
-    sequences.extend(defs);
-    let cfs_cursor = CfsCursor::new(ControlFlowSchema {
-        version: "1.0".into(),
-        project: "test".into(),
-        encoding: "postcard".into(),
-        tiles: vec![
-            TileDef::iter("producer", 0, 1),
-            TileDef::iter("other", 0, 1),
-            TileDef::iter("consumer", 1, 1),
-        ],
-        sequences,
-    });
-    let mut step_record = exec_index_fixture(1);
-    step_record.coordinates = CfsCoordinates(vec![consumer_at]);
-    verify_step_record_inputs(
-        &cfs_cursor,
-        &step_record,
-        Some(&storage_input_witness(
-            CfsCoordinates(input_coordinates),
-            sha(b"source-output"),
-        )),
-        None,
-    );
-}
-
-fn tile_item(id: &str, sources: Vec<InputBinding>) -> SequenceChildItem {
-    SequenceChildItem::Tile(TileItem {
-        id: id.into(),
-        sources,
-    })
-}
-
-fn call_item(id: &str, sources: Vec<InputBinding>) -> SequenceChildItem {
-    SequenceChildItem::Sequence(SequenceItem {
-        id: id.into(),
-        sources,
-    })
-}
-
-/// `sub = [producer, other]`, returning `other`'s output.
-fn sub_returning_other() -> SequenceDef {
-    SequenceDef {
-        id: "sub".into(),
-        input_sources: vec![],
-        items: vec![
-            tile_item("producer", vec![InputBinding::Direct(InputSource::Inline)]),
-            tile_item("other", vec![InputBinding::Direct(InputSource::Inline)]),
-        ],
-        entry_arguments: vec![],
-        produces_output: false,
-        returns: Some(raster_core::cfs::SequenceReturn {
-            source: InputBinding::prior_item_output(1),
-            path: vec![],
-        }),
-    }
-}
-
-/// A step at trace index `t` carries `exec_index == t + 1`.
-fn exec_index_fixture(exec_index: u64) -> StepRecord {
-    StepRecord {
-        exec_index,
-        sequence_id: "main".into(),
-        coordinates: CfsCoordinates(vec![2]),
-        kind: StepKind::Exec(ExecStep {
-            target: ExecTarget::Tile("consumer".into()),
-            intra_sequence_index: 1,
-            input_commitment: Vec::new(),
-            input_source_commitment: Vec::new(),
-            output_commitment: Vec::new(),
-            storage: StorageRoots {
-                root_before: Vec::new(),
-                root_after: Vec::new(),
-                index_root_before: Vec::new(),
-                index_root_after: Vec::new(),
-            },
-        }),
-        recur_progress_commitment: RecurProgressStack::new().commitment(),
-        recur_state: None,
-    }
-}
-
-/// A recur **tile** site at `[1]` and a recur **sequence** site at `[2]`,
-/// so both frame rules are reachable from one schema.
-fn recur_frames_cfs() -> CfsCursor {
-    CfsCursor::new(ControlFlowSchema {
-        version: "1.0".into(),
-        project: "test".into(),
-        encoding: "postcard".into(),
-        tiles: vec![TileDef::iter("recur", 1, 1), TileDef::iter("inner", 1, 1)],
-        sequences: vec![
-            SequenceDef {
-                id: "main".into(),
-                input_sources: vec![],
-                items: vec![
-                    SequenceChildItem::RecurTile(RecurTileItem {
-                        id: "recur".into(),
-                        sources: vec![InputBinding::Direct(InputSource::Inline)],
-                        chunk: None,
-                        output: None,
-                        state_is_output: false,
-                        carries_state: false,
-                    }),
-                    SequenceChildItem::RecurSequence(RecurSequenceItem {
-                        id: "child".into(),
-                        sources: vec![InputBinding::Direct(InputSource::Inline)],
-                        state_is_output: false,
-                        carries_state: false,
-                        output: None,
-                    }),
-                ],
-                entry_arguments: vec![],
-                produces_output: false,
-                returns: None,
-            },
-            SequenceDef {
-                id: "child".into(),
-                input_sources: vec![InputBinding::Direct(InputSource::Inline)],
-                items: vec![SequenceChildItem::Tile(TileItem {
-                    id: "inner".into(),
-                    sources: vec![InputBinding::Direct(InputSource::Inline)],
-                })],
-                entry_arguments: vec![],
-                produces_output: false,
-                returns: None,
-            },
-        ],
-    })
-}
-
-fn step_with_sequence_id(
-    kind: StepKind,
-    coordinates: Vec<CfsCoordinate>,
-    sequence_id: &str,
-) -> StepRecord {
-    StepRecord {
-        exec_index: 1,
-        sequence_id: sequence_id.into(),
-        coordinates: CfsCoordinates(coordinates),
-        kind,
-        recur_progress_commitment: RecurProgressStack::new().commitment(),
-        recur_state: None,
-    }
-}
-
-fn exec_kind(target: ExecTarget) -> StepKind {
-    StepKind::Exec(ExecStep {
-        target,
-        intra_sequence_index: FIRST_COORDINATE,
-        input_commitment: Vec::new(),
-        input_source_commitment: Vec::new(),
-        output_commitment: Vec::new(),
-        storage: StorageRoots {
-            root_before: Vec::new(),
-            root_after: Vec::new(),
-            index_root_before: Vec::new(),
-            index_root_after: Vec::new(),
-        },
-    })
-}
-
-fn boundary_start_kind() -> StepKind {
-    StepKind::SequenceStart {
-        input_commitment: Vec::new(),
-        input_source_commitment: Vec::new(),
-    }
-}
-
 fn empty_roots() -> StorageRoots {
     StorageRoots {
         root_before: Vec::new(),
@@ -758,23 +216,6 @@ fn empty_roots() -> StorageRoots {
         index_root_before: Vec::new(),
         index_root_after: Vec::new(),
     }
-}
-
-fn recur_start_kind(site: &str) -> StepKind {
-    StepKind::RecurStart(raster_core::trace::RecurStartStep {
-        site_id: site.into(),
-        input_commitment: Vec::new(),
-        input_source_commitment: Vec::new(),
-        storage: empty_roots(),
-    })
-}
-
-fn recur_end_kind(site: &str) -> StepKind {
-    StepKind::RecurEnd(raster_core::trace::RecurEndStep {
-        site_id: site.into(),
-        output_commitment: Vec::new(),
-        storage: empty_roots(),
-    })
 }
 
 fn chunked_recur_cfs(chunk: Option<u64>) -> CfsCursor {
@@ -3446,72 +2887,6 @@ fn recur_sequence_site_cfs() -> CfsCursor {
     })
 }
 
-/// The site step the recorder writes for that call: `RecurSequenceStart`
-/// becomes a `SequenceStart` at the site coordinate `[1]`, carrying the site's
-/// own id (`recorder.rs`'s `RecurTileStart | RecurSequenceStart` arm).
-fn recur_sequence_site_step() -> StepRecord {
-    StepRecord {
-        exec_index: 1,
-        sequence_id: "main".into(),
-        coordinates: CfsCoordinates(vec![1]),
-        kind: StepKind::RecurStart(raster_core::trace::RecurStartStep {
-            site_id: "decorate_lines".into(),
-            input_commitment: sha(b"recur-seq-in"),
-            input_source_commitment: Vec::new(),
-            storage: empty_roots(),
-        }),
-        recur_progress_commitment: RecurProgressStack::new().commitment(),
-        recur_state: None,
-    }
-}
-
-/// What the fixed site wrapper records: one value per declared argument, in
-/// the CFS's order — input, output, args.0 — with the driving list's storage
-/// data under its own key.
-fn recur_sequence_site_witness() -> FnInput {
-    let commitment = sha(b"lines");
-    let source_root_hash: [u8; 32] = commitment
-        .clone()
-        .try_into()
-        .expect("test commitments are 32 bytes");
-    FnInput {
-        data: Vec::new(),
-        values: vec![
-            FnInputValue::StorageBinding,
-            FnInputValue::Inline(b"draft-handle".to_vec()),
-            FnInputValue::Inline(b"*".to_vec()),
-        ],
-        args: vec![
-            FnInputArg {
-                name: "input".to_string(),
-                ty: "AuthRef<List<String>>".to_string(),
-            },
-            FnInputArg {
-                name: "output".to_string(),
-                ty: "Draft<CollectiveGreeting>".to_string(),
-            },
-            FnInputArg {
-                name: "decoration".to_string(),
-                ty: "String".to_string(),
-            },
-        ],
-        storage: [(
-            "input".to_string(),
-            StorageData {
-                coordinates: CfsCoordinates(vec![1, 1]),
-                commitment,
-                selector: Default::default(),
-                selection: raster_core::input::SelectionCommitment {
-                    source_root_hash,
-                    ..Default::default()
-                },
-            },
-        )]
-        .into_iter()
-        .collect(),
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Carried-state chaining — `loop-carried-state.md` §4
 //
@@ -3909,55 +3284,6 @@ fn advance_lines_iteration(
 }
 
 // ---------------------------------------------------------------------------
-// A recur-sequence body reading its item
-//
-// The iteration `Start` records `RecurSequenceInput` as an inline handle; the
-// body tile that reads the item records the storage binding itself. The scope
-// check looks through the handle.
-// ---------------------------------------------------------------------------
-
-/// `decorate` at `[1, index + 1, 1]` reading the element `item_of` stored
-/// under its parameter.
-fn decorate_reading(index: u64, item_of: u64) -> (StepRecord, FnInput) {
-    let (_, iteration_input, _) = recur_sequence_iteration(item_of);
-    let item = iteration_input.storage["line"].clone();
-    let step = StepRecord {
-        exec_index: 20 + index,
-        sequence_id: "decorate_lines".into(),
-        coordinates: CfsCoordinates(vec![
-            1,
-            index as CfsCoordinate + FIRST_COORDINATE,
-            FIRST_COORDINATE,
-        ]),
-        kind: StepKind::Exec(ExecStep {
-            target: ExecTarget::Tile("decorate".into()),
-            intra_sequence_index: FIRST_COORDINATE,
-            input_commitment: Vec::new(),
-            input_source_commitment: Vec::new(),
-            output_commitment: Vec::new(),
-            storage: StorageRoots {
-                root_before: Vec::new(),
-                root_after: Vec::new(),
-                index_root_before: Vec::new(),
-                index_root_after: Vec::new(),
-            },
-        }),
-        recur_progress_commitment: RecurProgressStack::new().commitment(),
-        recur_state: None,
-    };
-    let input = FnInput {
-        data: Vec::new(),
-        values: vec![FnInputValue::StorageBinding],
-        args: vec![FnInputArg {
-            name: "line".to_string(),
-            ty: "AuthRef<String>".to_string(),
-        }],
-        storage: [("line".to_string(), item)].into_iter().collect(),
-    };
-    (step, input)
-}
-
-// ---------------------------------------------------------------------------
 // The site `Start`'s `L` — `tile-io-structural-roots.md` §Step 1, "Found, not
 // fixed".
 // ---------------------------------------------------------------------------
@@ -4111,8 +3437,9 @@ fn run_site_start(
     );
     start.recur_progress_commitment = expected.commitment();
 
+    // The start's bindings are the control-flow guest's to check
+    // (`a_site_start_naming_its_producer_satisfies_its_bindings` there).
     let cfs = produced_list_sweep_cfs();
-    verify_step_record_inputs(&cfs, &start, Some(&input), None);
     let mut progress = RecurProgressStack::new();
     crate::checks::recur::advance_recur_progress(
         &cfs,
@@ -4189,15 +3516,6 @@ fn an_honest_empty_source_reads_zero() {
         Some(&store[0]),
     );
     assert_eq!(progress.innermost().map(|frame| frame.source_len), Some(0));
-}
-
-// ---------------------------------------------------------------------------
-// Recur site step kinds and `[-s]` closes — `incremental-draft-materialization`
-// §A recur site gets its own step kinds (batch A).
-// ---------------------------------------------------------------------------
-
-fn kind_at(kind: StepKind, coordinates: Vec<CfsCoordinate>) -> StepRecord {
-    step_with_sequence_id(kind, coordinates, "main")
 }
 
 // ---------------------------------------------------------------------------
@@ -4518,12 +3836,12 @@ fn a_tile_reading_the_value_inside_an_err_is_rejected() {
     );
 }
 
-
 /// `authorization-image-id-unpinned` gap 1: a `Next` step must verify its
-/// authorization journal against the same guest as the step before it.
+/// authorization journal — and its control-flow receipt — against the same
+/// guests as the step before it.
 mod authorization_continuity {
     use super::*;
-    use crate::fraud_proof::assert_authorization_continuity;
+    use crate::fraud_proof::{assert_authorization_continuity, assert_control_flow_continuity};
     use raster_core::fingerprint::{BitPacker, Fingerprint};
     use raster_core::transition::{
         InitTransition, OutputAuthorization, TransitionJournal, TransitionState,
@@ -4546,6 +3864,7 @@ mod authorization_continuity {
             current_state: TransitionState::Finished,
             transition_image_id: vec![1; 32],
             authorization_image_id,
+            control_flow_image_id: vec![5; 32],
             input_manifest_commitment: vec![2; 32],
             program_commitment: vec![3; 32],
             refuted_trace_commitment: vec![4; 32],
@@ -4569,6 +3888,19 @@ mod authorization_continuity {
     #[should_panic(expected = "Authorization image ID is not the same within the fraud proof")]
     fn switching_authorization_guests_mid_window_is_refused() {
         assert_authorization_continuity(&journal_naming(vec![6; 32]), &[7; 32]);
+    }
+
+    /// The control-flow id follows the same rule (`control-flow-prover` step 6):
+    /// the previous journal names `[5; 32]`.
+    #[test]
+    fn the_same_control_flow_guest_across_steps_is_accepted() {
+        assert_control_flow_continuity(&journal_naming(vec![7; 32]), &[5; 32]);
+    }
+
+    #[test]
+    #[should_panic(expected = "Control-flow image ID is not the same within the fraud proof")]
+    fn switching_control_flow_guests_mid_window_is_refused() {
+        assert_control_flow_continuity(&journal_naming(vec![7; 32]), &[6; 32]);
     }
 }
 

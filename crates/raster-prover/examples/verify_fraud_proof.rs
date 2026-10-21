@@ -20,11 +20,15 @@ fn main() {
         _ => "other",
     });
 
-    // The receipt, `Finished`, and the transition and authorization guests the
-    // journal names — see `docs/issues/authorization-image-id-unpinned.md`.
+    // The receipt, `Finished`, and the transition, authorization and
+    // control-flow guests the journal names — see
+    // `docs/issues/authorization-image-id-unpinned.md`.
     let journal = match verify_fraud_proof_receipt(&receipt) {
         Ok(journal) => {
-            println!("receipt verifies; Finished; transition and authorization guests pinned: OK");
+            println!(
+                "receipt verifies; Finished; transition, authorization and control-flow \
+                 guests pinned: OK"
+            );
             journal
         }
         Err(error) => {

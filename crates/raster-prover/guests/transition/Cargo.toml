@@ -7,6 +7,7 @@ edition = "2021"
 
 [dependencies]
 raster-core = { path = "../../../raster-core", features = ["std"] }
+guest-common = { path = "../guest_common" }
 
 risc0-zkvm = "3.0"
 

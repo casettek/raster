@@ -47,13 +47,18 @@ pub struct PublicParams {
     pub program_commitment: Vec<u8>,
     pub cfs_cursor: CfsCursor,
     pub transition_image_id: Vec<u8>,
+    /// The guest every step's control-flow receipt is verified against.
+    /// Committed to the journal, asserted continuous across the window, and
+    /// pinned by the relying party (`verify_fraud_proof_receipt`).
+    pub control_flow_image_id: Vec<u8>,
 }
 
 impl PublicParams {
     /// Reads the leading host inputs. The host write order is: the program
-    /// definition frame (`program.bin` bytes), transition image id, transition
-    /// input, transition state, and — only for `Next` steps — the previous
-    /// journal (read in [`FraudProofWindowContext`]).
+    /// definition frame (`program.bin` bytes), transition image id,
+    /// control-flow image id, transition input, transition state, and — only
+    /// for `Next` steps — the previous journal (read in
+    /// [`FraudProofWindowContext`]).
     ///
     /// The frame is hashed *before* decoding, so the committed
     /// `program_commitment` is bound to the exact bytes verified against — a
@@ -64,12 +69,14 @@ impl PublicParams {
         let program = ProgramDefinition::decode(&program_bytes)
             .expect("host must supply a valid ProgramDefinition frame");
         let transition_image_id = frame::read_bytes();
+        let control_flow_image_id = frame::read_bytes();
         let cfs_cursor = CfsCursor::new(program.cfs.clone());
         Self {
             program,
             program_commitment,
             cfs_cursor,
             transition_image_id,
+            control_flow_image_id,
         }
     }
 }
@@ -248,6 +255,7 @@ impl FraudProofWindowContext {
                 assert_state_continuity(&prev_journal, &transition);
                 assert_manifest_continuity(&prev_journal, input);
                 assert_authorization_continuity(&prev_journal, &input.authorization_image_id);
+                assert_control_flow_continuity(&prev_journal, &params.control_flow_image_id);
                 assert_program_continuity(&prev_journal, params);
 
                 let live = LiveTransition::resume(
@@ -536,6 +544,21 @@ pub(crate) fn assert_authorization_continuity(
     );
 }
 
+/// Every step of the fraud proof must verify its control-flow receipt against
+/// the same control-flow guest. Only the final step's id reaches the
+/// `Finished` journal, so without this an earlier step could rest on a guest
+/// that accepts anything. The same rule as [`assert_authorization_continuity`],
+/// for the same reason.
+pub(crate) fn assert_control_flow_continuity(
+    prev_journal: &TransitionJournal,
+    control_flow_image_id: &[u8],
+) {
+    assert!(
+        control_flow_image_id == prev_journal.control_flow_image_id,
+        "Control-flow image ID is not the same within the fraud proof",
+    );
+}
+
 /// Every step of the fraud proof must prove execution of the same program —
 /// the frame this step verifies against must hash to the previous journal's
 /// committed program identity.
@@ -651,36 +674,39 @@ impl LiveTransition {
 
     /// Verify every recorded aspect of one step and advance the state:
     ///
-    /// - the step's inputs obey the CFS bindings at its coordinates,
+    /// - the control-flow guest's receipt proves the step sits at valid CFS
+    ///   coordinates, follows the previous step, and binds its inputs as the
+    ///   CFS declares — and its journal agrees with this guest's state,
     /// - a `ProgramStart` step binds exactly the CFS-declared entry arguments
     ///   to their authorized commitments,
     /// - recorded IO commitments match the witnesses, and tile steps carry
     ///   a verified replay proof,
     /// - the storage transition is consistent with the recorded roots,
-    /// - the step's coordinates are among the expected next coordinates,
     /// - the draft chain stays continuous,
     /// - the step record is appended to the trace frontier and fingerprint.
     pub fn apply_verified_step(
         mut self,
-        program: &ProgramDefinition,
-        cfs_cursor: &CfsCursor,
+        params: &PublicParams,
         input: &TransitionInput,
     ) -> Self {
-        // The control-flow check reads only what it is handed. Both trace facts
-        // are taken before `append_to_trace` advances the frontier: its position
-        // is this step's trace index, which fixes `exec_index`, and its root is
-        // the root of the prefix a scope parent must be provably in.
+        let program = &params.program;
+        let cfs_cursor = &params.cfs_cursor;
+        // The control-flow guest proved the CFS check for this step; hold its
+        // journal to this guest's own state. Both trace facts are taken before
+        // `append_to_trace` advances the frontier: its position is this step's
+        // trace index, which fixes `exec_index`, and its root is the root of the
+        // prefix a scope parent must be provably in.
         let trace_root_before = frontier_root(&self.frontier);
-        let control_flow = checks::control_flow::verify_step(
-            cfs_cursor,
-            &checks::control_flow::ControlFlowInput {
+        let expected_after = checks::control_flow::verify_control_flow(
+            &params.control_flow_image_id,
+            &input.control_flow_journal,
+            &checks::control_flow::ControlFlowFacts {
+                program_commitment: &params.program_commitment,
                 step_record: &input.step_record,
+                input_source_witness: input.input_source_witness.as_ref(),
                 trace_position: self.frontier.position().into(),
                 trace_root_before: &trace_root_before,
                 expected_before: self.next_expected_coordinates.as_ref(),
-                input_source_witness: input.input_source_witness.as_ref(),
-                sequence_scope_witness: input.sequence_scope_witness.as_ref(),
-                sequence_scope_parent: input.sequence_scope_parent.as_ref(),
             },
         );
         // A recur rule that reads the replay journal, so it sits with the
@@ -753,7 +779,7 @@ impl LiveTransition {
             &self.storage_index_root,
         );
         self.storage_index_root = next_index_root;
-        self.next_expected_coordinates = Some(control_flow.expected_after);
+        self.next_expected_coordinates = Some(expected_after);
         self.append_to_trace(&input.step_record);
         self
     }
@@ -842,6 +868,7 @@ pub fn commit_journal(
     init_state: InitTransition,
     current_state: TransitionState,
     transition_image_id: Vec<u8>,
+    control_flow_image_id: Vec<u8>,
     program_commitment: Vec<u8>,
     refuted_trace_commitment: Vec<u8>,
     window_is_terminal: bool,
@@ -855,6 +882,7 @@ pub fn commit_journal(
         current_state,
         transition_image_id,
         authorization_image_id: input.authorization_image_id.clone(),
+        control_flow_image_id,
         input_manifest_commitment: input
             .authorization_journal
             .input_manifest_commitment

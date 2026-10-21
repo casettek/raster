@@ -10,6 +10,7 @@
 
 use raster_core::authorization::AuthorizationJournal;
 use raster_core::cfs::ControlFlowSchema;
+use raster_core::control_flow::ControlFlowJournal;
 use raster_core::draft::DraftTransitionWitness;
 use raster_core::fingerprint::Fingerprint;
 use raster_core::input::SelectionWitness;
@@ -22,6 +23,7 @@ use raster_core::transition::{
 use std::collections::{BTreeMap, HashMap};
 
 use crate::authorization::authorization_guest_image_id;
+use crate::control_flow::{control_flow_guest_image_id, prove_control_flow_step, ControlFlowWalk};
 use crate::error::{BitPackerError, Result};
 use raster_core::merkle::{NodeHash, EMPTY_LEAF};
 use crate::replay::ReplayResult;
@@ -55,9 +57,17 @@ pub struct StepIo {
 
 type RecordedStepIo = HashMap<StepRecord, StepIo>;
 
+fn recorded_io<'a>(recorded_step_io: &'a RecordedStepIo, step_record: &StepRecord) -> &'a StepIo {
+    recorded_step_io
+        .get(step_record)
+        .unwrap_or_else(|| panic!("Missing recorded I/O for transition step {:?}", step_record))
+}
+
 fn build_transition_input(
     step_record: &StepRecord,
-    sequence_scope_parents: &BTreeMap<u64, (StepRecord, StepRecordWitness)>,
+    // The control-flow guest's journal for this step; its receipt is added as
+    // an assumption next to the authorization and replay receipts.
+    control_flow_journal: ControlFlowJournal,
     recorded_step_io: &RecordedStepIo,
     replayed_results: &HashMap<StepRecord, ReplayResult>,
     authorization_journal: &AuthorizationJournal,
@@ -70,21 +80,20 @@ fn build_transition_input(
     // terminal step needs is carried forward on the journal.
     revealed_tail_roots: Option<Vec<NodeHash>>,
 ) -> TransitionInput {
+    // The scope witness goes to the control-flow guest only, which is the
+    // only check that reads it (`ControlFlowWalk::input_for`).
     let StepIo {
         input_witness,
         output_witness,
         input_source_witness,
-        sequence_scope_witness,
+        sequence_scope_witness: _,
         storage_selection_witnesses,
         storage_witness,
         draft_transition_witness,
         program_output_read_witness,
         program_output_selection_witness,
         returned_state_read_witness,
-    } = recorded_step_io
-        .get(step_record)
-        .cloned()
-        .unwrap_or_else(|| panic!("Missing recorded I/O for transition step {:?}", step_record));
+    } = recorded_io(recorded_step_io, step_record).clone();
 
     // The expected image id is no longer shipped to the guest; it resolves the
     // image id from the committed program registry keyed by the step's tile id.
@@ -108,14 +117,11 @@ fn build_transition_input(
         input_witness,
         output_witness,
         input_source_witness,
-        sequence_scope_witness,
         storage_selection_witnesses,
         storage_witness,
         draft_transition_witness,
         authorization_journal: authorization_journal.clone(),
-        // Only this step's own parent: its witness folds to this step's trace
-        // root and no other (`checks::control_flow::verify_sequence_scope_parent`).
-        sequence_scope_parent: sequence_scope_parents.get(&step_record.exec_index).cloned(),
+        control_flow_journal,
         entrypoint_membership_witness: entrypoint_membership_witness.cloned(),
         program_output_read_witness,
         program_output_selection_witness,
@@ -131,19 +137,22 @@ fn image_id_bytes(image_id: [u32; 8]) -> Vec<u8> {
         .collect()
 }
 
-/// Write one transition guest input as a frame: a `u32` byte length, then the
+/// Write one guest input as a frame: a `u32` byte length, then the
 /// bytes. The guest reads it back with two bulk `read_slice` calls (its
 /// `frame` module). Not `builder.write`: risc0's serde makes the guest fetch one
 /// word per syscall, one per `u8` of a `Vec<u8>`, and on risc0 3.x every
 /// syscall traps through the v1compat kernel. That was 68% of a step's cycles.
-fn write_frame(builder: &mut risc0_zkvm::ExecutorEnvBuilder<'_>, bytes: &[u8]) {
+pub(crate) fn write_frame(builder: &mut risc0_zkvm::ExecutorEnvBuilder<'_>, bytes: &[u8]) {
     let len = u32::try_from(bytes.len()).expect("transition input frame exceeds u32::MAX bytes");
     builder.write_slice(&[len]);
     builder.write_slice(bytes);
 }
 
 /// [`write_frame`] of `value`'s postcard encoding.
-fn write_postcard<T: serde::Serialize>(builder: &mut risc0_zkvm::ExecutorEnvBuilder<'_>, value: &T) {
+pub(crate) fn write_postcard<T: serde::Serialize>(
+    builder: &mut risc0_zkvm::ExecutorEnvBuilder<'_>,
+    value: &T,
+) {
     let bytes = postcard::to_allocvec(value).expect("transition input must encode with postcard");
     write_frame(builder, &bytes);
 }
@@ -224,6 +233,8 @@ pub fn step_transitions(
     let prover = risc0_zkvm::default_prover();
 
     let transition_image_id = image_id_bytes(TRANSITION_GUEST_ID);
+    let control_flow_image_id = control_flow_guest_image_id();
+    let mut control_flow_walk = ControlFlowWalk::new(program_frame, initial_frontier);
 
     let init_transition = InitTransition {
         init_frontier: initial_frontier.clone(),
@@ -239,9 +250,21 @@ pub fn step_transitions(
     let mut current_state = TransitionState::Init(init_transition);
 
     for step_record in trace_window {
+        // The control-flow receipt depends on no transition receipt, only on
+        // the trace facts the walk tracks; it is proven first and becomes one
+        // more assumption of this step.
+        let control_flow_input = control_flow_walk.input_for(
+            step_record,
+            recorded_io(recorded_step_io, step_record),
+            sequence_scope_parents,
+        );
+        let (control_flow_receipt, control_flow_journal) =
+            prove_control_flow_step(program_frame, &control_flow_input);
+        control_flow_walk.advance(step_record);
+
         let input = build_transition_input(
             step_record,
-            sequence_scope_parents,
+            control_flow_journal,
             recorded_step_io,
             replayed_results,
             authorization_journal,
@@ -287,6 +310,7 @@ pub fn step_transitions(
 
         let mut builder = risc0_zkvm::ExecutorEnv::builder();
         builder.add_assumption(authorization_receipt.clone());
+        builder.add_assumption(control_flow_receipt);
         if let Some(replay_receipt) = replay_receipt_assumption {
             builder.add_assumption(replay_receipt);
         }
@@ -298,6 +322,7 @@ pub fn step_transitions(
         }
         write_frame(&mut builder, program_frame);
         write_frame(&mut builder, &transition_image_id);
+        write_frame(&mut builder, &control_flow_image_id);
         write_postcard(&mut builder, &input);
         write_postcard(&mut builder, &current_state);
         if let Some(previous_journal) = current_journal {
@@ -323,7 +348,8 @@ pub fn step_transitions(
 
 /// The relying party's verification of a single-program fraud proof: the
 /// receipt is a transition receipt, it reached `Finished`, and the inner guests
-/// its journal names are the known-good ones.
+/// its journal names — authorization and control flow — are the known-good
+/// ones.
 ///
 /// The authorization id is the check that matters. Every window step verifies
 /// its authorization journal against a host-supplied id, and the guest holds it
@@ -366,6 +392,11 @@ fn check_fraud_proof_journal(journal: &TransitionJournal) -> Result<()> {
     if journal.authorization_image_id != authorization_guest_image_id() {
         return Err(BitPackerError::InvalidCommitment(
             "fraud-proof receipt verified an unknown authorization guest".to_string(),
+        ));
+    }
+    if journal.control_flow_image_id != control_flow_guest_image_id() {
+        return Err(BitPackerError::InvalidCommitment(
+            "fraud-proof receipt verified an unknown control-flow guest".to_string(),
         ));
     }
     Ok(())
@@ -450,78 +481,6 @@ mod tests {
         }
     }
 
-    /// A step's input carries only the scope parent keyed by its own
-    /// `exec_index`: the witness folds to that step's trace root and no other
-    /// (`checks::control_flow::verify_sequence_scope_parent`).
-    #[test]
-    fn build_transition_input_takes_only_this_steps_scope_parent() {
-        let step = make_tile_step(2, vec![1]);
-        let parent = make_tile_step(0, vec![2]);
-        let other_parent = make_tile_step(3, vec![3]);
-        let witness = |position: u64| StepRecordWitness {
-            position,
-            path_elems: vec![[position as u8; 32].into()],
-        };
-        let window_parents = BTreeMap::from([
-            (1, (parent.clone(), witness(10))),
-            (2, (parent.clone(), witness(20))),
-            (4, (other_parent.clone(), witness(40))),
-        ]);
-        let unrelated = make_tile_step(3, vec![4]);
-        let recorded_step_io = HashMap::from([
-            (step.clone(), io_witnesses(None, None)),
-            (unrelated.clone(), io_witnesses(None, None)),
-        ]);
-        let replay = ReplayResult {
-            fn_name: "shared_tile".to_string(),
-            receipt: vec![],
-            image_id: vec![9; 32],
-            input: vec![],
-            output: vec![],
-            replay_journal: TileReplayJournal {
-                input_commitment: [0u8; 32],
-                output_bytes: vec![],
-                output_root: None,
-                input_roots: Vec::new(),
-                draft_transition: None,
-                recur: None,
-            },
-        };
-        let replayed_results = HashMap::from([
-            (step.clone(), replay.clone()),
-            (unrelated.clone(), replay),
-        ]);
-
-        let input = build_transition_input(
-            &step,
-            &window_parents,
-            &recorded_step_io,
-            &replayed_results,
-            &make_authorization_journal(),
-            None,
-            None,
-            None,
-        );
-
-        let (kept_parent, kept_witness) = input
-            .sequence_scope_parent
-            .expect("step 2 has a scope parent in the window");
-        assert_eq!(kept_parent, parent);
-        assert_eq!(kept_witness.position, 20);
-
-        let input = build_transition_input(
-            &unrelated,
-            &window_parents,
-            &recorded_step_io,
-            &replayed_results,
-            &make_authorization_journal(),
-            None,
-            None,
-            None,
-        );
-        assert!(input.sequence_scope_parent.is_none());
-    }
-
     #[test]
     fn build_transition_input_uses_step_record_key_for_repeated_tiles() {
         let first_step = make_tile_step(1, vec![0]);
@@ -578,7 +537,7 @@ mod tests {
 
         let input = build_transition_input(
             &second_step,
-            &BTreeMap::new(),
+            placeholder_control_flow_journal(),
             &recorded_step_io,
             &replayed_results,
             &make_authorization_journal(),
@@ -627,7 +586,7 @@ mod tests {
 
         let input = build_transition_input(
             &tile_step,
-            &BTreeMap::new(),
+            placeholder_control_flow_journal(),
             &recorded_step_io,
             &replayed_results,
             &make_authorization_journal(),
@@ -674,7 +633,7 @@ mod tests {
 
         let start_input = build_transition_input(
             &sequence_start,
-            &BTreeMap::new(),
+            placeholder_control_flow_journal(),
             &recorded_step_io,
             &HashMap::new(),
             &make_authorization_journal(),
@@ -684,7 +643,7 @@ mod tests {
         );
         let end_input = build_transition_input(
             &sequence_end,
-            &BTreeMap::new(),
+            placeholder_control_flow_journal(),
             &recorded_step_io,
             &HashMap::new(),
             &make_authorization_journal(),
@@ -718,6 +677,20 @@ mod tests {
         );
     }
 
+    /// A control-flow journal for tests that exercise only how the rest of the
+    /// transition input is assembled; nothing reads its fields.
+    fn placeholder_control_flow_journal() -> ControlFlowJournal {
+        ControlFlowJournal {
+            program_commitment: Vec::new(),
+            step_record_hash: Vec::new(),
+            input_source_commitment: None,
+            trace_position: 0,
+            trace_root_before: Vec::new(),
+            expected_before: None,
+            expected_after: Vec::new(),
+        }
+    }
+
     /// A `Finished` journal naming the known-good guests, as an honest
     /// fraud proof commits it.
     fn finished_journal() -> TransitionJournal {
@@ -732,6 +705,7 @@ mod tests {
             current_state: TransitionState::Finished,
             transition_image_id: image_id_bytes(TRANSITION_GUEST_ID),
             authorization_image_id: authorization_guest_image_id(),
+            control_flow_image_id: control_flow_guest_image_id(),
             input_manifest_commitment: vec![2; 32],
             program_commitment: vec![3; 32],
             refuted_trace_commitment: vec![4; 32],
@@ -756,6 +730,16 @@ mod tests {
         journal.authorization_image_id = vec![0xAA; 32];
         let error = check_fraud_proof_journal(&journal).expect_err("unknown guest");
         assert!(error.to_string().contains("unknown authorization guest"), "{error}");
+    }
+
+    /// The control-flow id follows the authorization id's rule
+    /// (`control-flow-prover` step 6).
+    #[test]
+    fn a_journal_naming_another_control_flow_guest_is_refused() {
+        let mut journal = finished_journal();
+        journal.control_flow_image_id = vec![0xCC; 32];
+        let error = check_fraud_proof_journal(&journal).expect_err("unknown guest");
+        assert!(error.to_string().contains("unknown control-flow guest"), "{error}");
     }
 
     #[test]
@@ -827,6 +811,19 @@ mod tests {
         authorization_receipt: Option<risc0_zkvm::Receipt>,
     ) -> risc0_zkvm::Result<risc0_zkvm::ProveInfo> {
         let prover = risc0_zkvm::default_prover();
+        // The step's control-flow receipt, proven the way `step_transitions`
+        // proves it: the walk starts at the window's initial frontier.
+        let control_flow_input =
+            ControlFlowWalk::new(&make_minimal_program_frame(), &make_init_frontier()).input_for(
+                &make_sequence_start_step(),
+                &StepIo {
+                    input_source_witness: Some(empty_input_source_witness()),
+                    ..StepIo::default()
+                },
+                &BTreeMap::new(),
+            );
+        let (control_flow_receipt, control_flow_journal) =
+            prove_control_flow_step(&make_minimal_program_frame(), &control_flow_input);
         let input = TransitionInput {
             window_start_recur_progress: None,
             step_record: make_sequence_start_step(),
@@ -835,12 +832,11 @@ mod tests {
             input_witness: Some(b"sequence-in".to_vec()),
             output_witness: None,
             input_source_witness: Some(empty_input_source_witness()),
-            sequence_scope_witness: None,
             storage_selection_witnesses: BTreeMap::new(),
             storage_witness: None,
             draft_transition_witness: None,
             authorization_journal: authorization,
-            sequence_scope_parent: None,
+            control_flow_journal,
             entrypoint_membership_witness: None,
             program_output_read_witness: None,
             program_output_selection_witness: None,
@@ -871,8 +867,10 @@ mod tests {
         if let Some(receipt) = authorization_receipt {
             builder.add_assumption(receipt);
         }
+        builder.add_assumption(control_flow_receipt);
         write_frame(&mut builder, &make_minimal_program_frame());
         write_frame(&mut builder, &image_id_bytes(TRANSITION_GUEST_ID));
+        write_frame(&mut builder, &control_flow_guest_image_id());
         write_postcard(&mut builder, &input);
         write_postcard(&mut builder, &state);
         write_postcard(&mut builder, &commitment_header);

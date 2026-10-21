@@ -1,0 +1,18 @@
+[package]
+name = "guest-common"
+version = "0.1.0"
+edition = "2021"
+
+# Not a workspace member of anything: each guest depends on it by path and
+# builds it inside its own workspace.
+[workspace]
+
+[dependencies]
+raster-core = { path = "../../../raster-core", features = ["std"] }
+
+risc0-zkvm = "3.0"
+
+serde = { version = "1.0", features = ["derive"] }
+postcard = { version = "1.0", features = ["alloc"] }
+
+bridgetree = "0.7"

@@ -11,6 +11,7 @@ use std::vec::Vec;
 
 use crate::authorization::AuthorizationJournal;
 use crate::cfs::CfsCoordinates;
+use crate::control_flow::ControlFlowJournal;
 use crate::draft::{DraftTransitionWitness, TileReplayJournal};
 use crate::recur_progress::RecurProgressStack;
 use crate::fingerprint::{Fingerprint, FingerprintAccumulator};
@@ -204,23 +205,16 @@ pub struct TransitionInput {
     #[serde(with = "serde_bytes")]
     pub output_witness: Option<Vec<u8>>,
     pub input_source_witness: Option<FnInput>,
-    pub sequence_scope_witness: Option<FnInput>,
     pub storage_selection_witnesses: BTreeMap<String, SelectionWitness>,
     pub storage_witness: Option<StorageWitness>,
     pub draft_transition_witness: Option<DraftTransitionWitness>,
 
-    /// For a step whose CFS item binds a sequence-scope input: the
-    /// `SequenceStart` that opened the step's frame, with its trace-inclusion
-    /// witness. `None` for every other step.
-    ///
-    /// The guest folds the witness against `frontier_root(self.frontier)` *at
-    /// this step*, and the frontier grows by one item per step — so two window
-    /// steps in one frame carry two different witnesses for the same parent.
-    ///
-    /// Replaces a map of witnesses for every source a step's bindings resolved
-    /// to, of which the guest only ever read this one entry. See
-    /// `docs/proposals/control-flow-prover.md` step 4.
-    pub sequence_scope_parent: Option<(StepRecord, StepRecordWitness)>,
+    /// The control-flow guest's journal for this step. Its receipt is an
+    /// assumption of this step's proof; the transition guest verifies it and
+    /// equates every field it also holds with its own state. The scope witness
+    /// and scope parent the control-flow check reads go to that guest only.
+    /// See `docs/proposals/control-flow-prover.md` step 6.
+    pub control_flow_journal: ControlFlowJournal,
 
     #[serde(with = "serde_bytes")]
     pub authorization_image_id: Vec<u8>,
@@ -384,6 +378,11 @@ pub struct TransitionJournal {
     pub transition_image_id: Vec<u8>,
     #[serde(with = "serde_bytes")]
     pub authorization_image_id: Vec<u8>,
+    /// The control-flow guest every step's control-flow receipt was verified
+    /// against, asserted continuous across `Next` steps. A relying party pins
+    /// it next to `authorization_image_id`.
+    #[serde(with = "serde_bytes")]
+    pub control_flow_image_id: Vec<u8>,
     #[serde(with = "serde_bytes")]
     pub input_manifest_commitment: Vec<u8>,
 

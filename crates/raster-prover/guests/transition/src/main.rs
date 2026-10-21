@@ -4,16 +4,18 @@
 //!
 //! 1. Attach to the chain: genesis state (`Init`) or a recursively verified
 //!    previous transition journal (`Next`).
-//! 2. Verify the step against every recorded commitment (CFS bindings,
-//!    IO/replay, storage, draft chain) and append it to the trace
-//!    frontier + fingerprint.
+//! 2. Verify the step against every recorded commitment (the control-flow
+//!    guest's receipt for the CFS bindings, IO/replay, storage, draft chain)
+//!    and append it to the trace frontier + fingerprint.
 //! 3. Compare the accumulated fingerprint with the committed one and commit
 //!    the resulting journal (`Next`, or `Finished` on the proven divergence).
 
 mod checks;
-mod frame;
 mod fraud_proof;
-mod merkle_tree;
+
+// Shared with the control-flow guest; imported at the crate root so the
+// `crate::frame` and `crate::merkle_tree` paths read as they always have.
+use guest_common::{frame, merkle_tree};
 
 #[cfg(test)]
 mod tests;
@@ -52,7 +54,7 @@ fn main() {
         FraudProofWindowContext::proceed(&params, &input, state, commitment_binding);
 
     // Verify every recorded aspect of the step and advance the state.
-    let next = current.apply_verified_step(&params.program, &params.cfs_cursor, &input);
+    let next = current.apply_verified_step(&params, &input);
     let entrypoint_authorization = next.entrypoint_authorization();
     let output_authorization = next.output_authorization();
 
@@ -66,6 +68,7 @@ fn main() {
         window_context.init_state,
         current_state,
         params.transition_image_id,
+        params.control_flow_image_id,
         params.program_commitment,
         window_context.refuted_trace_commitment,
         window_context.window_is_terminal,

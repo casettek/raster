@@ -1,8 +1,10 @@
 # Proposal: `control-flow-prover` — prove one step's CFS conformance in its own guest
 
-Status: **Proposed 2026-10-19** at `c049b76`. **Step 1 implemented 2026-10-19. Steps 2–5
-implemented 2026-10-20** (§Implementation record). Step 6 is open. Steps 1–5 of §Migration change
-only today's transition guest, and each one can land on its own. Step 6 adds the new guest.
+Status: **Implemented 2026-10-21.** Proposed 2026-10-19 at `c049b76`. Step 1 landed 2026-10-19,
+steps 2–5 2026-10-20, step 6 2026-10-21 (§Implementation record, §Implementation record: step 6).
+Step 0 and the cost of step 6 are measured on `hello-tiles` and `prompt-prepare`
+(§Measured after implementation). All three open questions are settled. Only §Deferred remains,
+and it belongs to a proposal of its own.
 
 Scope: **one transition step.** The control-flow guest proves the CFS checks for exactly the step
 that one transition-guest execution proves, and the transition guest consumes that receipt.
@@ -402,9 +404,61 @@ by speed.
 
 The first table above is step 0's measurement. `prompt-prepare` on the GPU has not been measured.
 
+### Measured after implementation (2026-10-21)
+
+Dev mode, user cycles from risc0's `SessionStats` per proof, plus `env::cycle_count()` inside the
+step-5 guest around `verify_step`. Temporary probes, not committed. Two windows:
+
+- `hello-tiles`, `--fraud-step 27`: 32 steps, exec 16–47, the window §Cost used.
+- `prompt-prepare`, `--fraud-step 796`: 16 steps ending at exec 1045, `emit_merged_piece` at
+  `[5, 2, 4, 5]`. That covers one full iteration of the merge loop, which is 85% of the trace's
+  eligible steps. The benchmark's old `--fraud-step 1786` no longer exists: the trace now has
+  1,621 eligible steps.
+
+Each program was built against this checkout, so tile ids are its own. "Step 5" is HEAD
+`6393fa8`, the step-5 guest plus `authorization-image-id-unpinned`.
+
+**Step 0, completed.** The CFS check's share of a step, in the step-5 guest:
+
+| per transition step | `hello-tiles` mean (max) | `prompt-prepare` mean (max) |
+| --- | --- | --- |
+| `verify_step` | 15,073 (50,206) | 28,764 (69,734) |
+| `apply_verified_step` | 888,898 | 1,038,698 |
+| before `apply_verified_step` | 484,641 | 606,869 |
+| whole guest execution | 1,418,988 | 1,712,946 |
+| CFS share of apply / of the step | 1.7% / 1.1% | 2.8% / 1.7% |
+
+That is below the 39,030 cycles §Cost measured at `c049b76`. Steps 2 and 4 took chunking and the
+witness-map scan out of the check, and step 3 put the anchor's hash in, but the probe doesn't
+separate those effects. The decode cost of `input_sources_witnesses` can no longer be measured,
+because step 4 removed the field.
+
+**Step 6's cost.** The same windows, one guest per step (step 5) against two (step 6):
+
+| window total | `hello-tiles` step 5 | step 6 | `prompt-prepare` step 5 | step 6 |
+| --- | --- | --- | --- | --- |
+| transition guest, user cycles | 45,768,923 | 45,668,260 | 27,596,540 | 27,040,992 |
+| control-flow guest, user cycles | — | 6,397,786 (199,931 / step) | — | 3,779,902 (236,244 / step) |
+| user cycles, both guests | 45.77M | 52.07M (+13.8%) | 27.60M | 30.82M (+11.7%) |
+| total cycles, both guests | 63.70M | 77.33M (+21.4%) | 36.70M | 44.30M (+20.7%) |
+| segments, both guests | 69 | 101 (+46%) | 38 | 52 (+37%) |
+
+This confirms §Cost's prediction.
+- **The control-flow guest is mostly fixed work.** It spends 200–236k user cycles per step to run
+  a check that costs 15–29k. The rest is the program decode, `CfsCursor::new`, the input decode
+  and the journal.
+- **The transition guest barely shrinks** (−0.2% and −2.0%). Verifying the receipt and the
+  equalities cost back most of what the check cost.
+- **Segments grow by about one per step,** because every control-flow execution is at least one
+  segment. On a GPU, prove time follows segments, so expect roughly +40% per window.
+
+Step 6 is paid for by isolation, as §Cost said. The way to recover the cost is §Deferred:
+one control-flow execution per window pays the fixed work once instead of 16–32 times.
+
 ## Migration
 
-0. **Measure.** *Done 2026-10-19 for hello-tiles in dev mode (§Cost).* Wrap the five calls in
+0. **Measure.** *Done: 2026-10-19 for hello-tiles (§Cost), 2026-10-21 for both programs
+   (§Measured after implementation).* Wrap the five calls in
    `env::cycle_count()` on the `prompt-prepare` 16-step benchmark and the hello-tiles 32-step
    window. Record the CFS share of user cycles and the decode cost of `input_sources_witnesses`.
 1. **Close the issue.** *Done 2026-10-19.* Change `source_witness_bytes` to commit the argument
@@ -422,7 +476,7 @@ The first table above is step 0's measurement. `prompt-prepare` on the GPU has n
    `verify_fraud_proof`. Add host proving. Add one tamper test per journal field: change it by one
    byte, and the transition guest must reject. For `input_source_commitment`, also test the
    case where the journal matches but the transition guest is given a different
-   `input_source_witness`: one argument name changed, everything else the same.
+   `input_source_witness`: one argument name changed, everything else the same. *Done 2026-10-21.*
 
 Each of steps 1–5 leaves one guest and a passing suite. Stopping after step 5 is a valid end state.
 
@@ -488,6 +542,73 @@ body, `[21, 2, 1]`), `58` (nested sequences, `[23, 5, 4, 1]`) and `27` (top leve
 commit, audit and generate a fraud proof. Run against a lock rebuilt in this checkout, for the
 reason above.
 
+## Implementation record: step 6 (2026-10-21)
+
+Landed as designed, with the differences below.
+
+**Layout.**
+- `raster-core/src/control_flow.rs` holds `ControlFlowInput` (owned, serializable) and
+  `ControlFlowJournal` exactly as sketched in §Step 6, plus `expected_successors`. The module is
+  `std`-gated like `transition`, so tile guests don't compile it.
+- `guests/guest_common` holds `frame.rs`, `merkle_tree.rs` and also `input_source.rs`:
+  `input_source_commitment` and `verify_input_source_anchored`, which both guests call. The
+  transition guest imports `frame` and `merkle_tree` at its crate root, so its `crate::frame`
+  paths are unchanged, and `checks::io` re-exports the two anchor functions.
+- `guests/control_flow` is the new guest. `checks.rs` holds the conformance half moved from the
+  transition guest, with `verify_step(cfs, &ControlFlowInput) -> Vec<CfsCoordinates>`.
+  `tests.rs` holds the 50 control-flow tests and the fixtures they need (copied, not shared:
+  the guests are separate crates). It adds
+  `a_site_start_naming_its_producer_satisfies_its_bindings`, because the transition guest's
+  `run_site_start` fixture no longer calls the binding check.
+
+**Transition guest.**
+- `checks/control_flow.rs` is now the consuming side. `verify_control_flow` does the unconditional
+  `env::verify` and then `assert_journal_matches`, one equality per field the proposal lists.
+- `PublicParams` reads `control_flow_image_id` as the frame after the transition image id.
+  `TransitionJournal` commits it, and `assert_control_flow_continuity` holds it across `Next`
+  steps, the rule `authorization-image-id-unpinned` added for the authorization id.
+- `TransitionInput` lost `sequence_scope_witness` and `sequence_scope_parent` and gained
+  `control_flow_journal`.
+
+**Host.**
+- `raster-prover/src/control_flow.rs` has `control_flow_guest_image_id`,
+  `prove_control_flow_step`, and `ControlFlowWalk`, which produces each step's input in window
+  order.
+- One difference from §Step 6's host paragraph: the host does **not** run `verify_step`
+  natively to get `expected_before`. The check is guest code with risc0 hashing and isn't linked
+  into the host. The walk computes the successor set with `expected_successors`, which is
+  `CfsCursor::try_get_next_coordinates` with `ProgramEnd` mapped to the empty set. It checks
+  nothing: if the host's set disagrees with the guest's, the next step's `expected_before`
+  equality refuses it.
+- `step_transitions` proves each step's control-flow receipt just before the transition step and
+  adds it as an assumption. They are proven one after another, not ahead of time or in parallel,
+  though nothing prevents that.
+
+**Pinning.** The relying party pins the id in `verify_fraud_proof_receipt` (added for
+`authorization-image-id-unpinned`), not only in the example. `verify_fraud_proof.rs` goes through
+that function.
+
+**What moved.** The transition guest's image id, and `TransitionInput`'s and
+`TransitionJournal`'s shapes. There is a new image id to pin: the control-flow guest's. The
+trace, `commit.bin` and `program_commitment` did not move.
+
+**Tests.**
+- Control-flow guest: 51.
+- Transition guest: 136. That is the non-control-flow tests, plus ten per-field tests on
+  `assert_journal_matches` (one byte changed in each field, the `None`/`Some` halves, and the
+  proposal's case of an honest journal with a transition witness whose argument is renamed), plus
+  two continuity tests.
+- Comparing test names against the step-5 suite: none dropped, 13 added.
+- `raster-prover`: new `control_flow::tests` for the walk, `check_fraud_proof_journal` refuses an
+  unknown control-flow guest, and the proving tests now prove a control-flow receipt too.
+
+**End to end.** `examples/hello-tiles`, `RISC0_DEV_MODE=1`, 32-step windows: `--fraud-step 58`,
+`47` and `27` each audit and generate a fraud proof, and `verify_fraud_proof` accepts the step-47
+proof with all three inner guests pinned. `Raster.lock` passes the drift check unchanged, so the
+`raster-core` additions moved no tile id.
+
+**Cost.** Measured in cycles and segments on both programs. See §Measured after implementation.
+
 ## Deferred
 
 - **Whole-window control flow.** One control-flow execution per window instead of per step. The
@@ -503,9 +624,15 @@ reason above.
 
 1. **Pinning.** Pass the ID in as input and commit it to the journal (recommended above), or
    compile it in. Compiling it in depends on whether guest image IDs are reproducible across
-   machines in this build setup.
+   machines in this build setup. *Resolved 2026-10-21: passed in and
+   committed, held continuous, and pinned in `verify_fraud_proof_receipt`.*
 2. **Should `exec_index` move?** It is a function of trace position, not of the CFS. It is here
    because it is in `cfs.rs` today and costs one comparison. If the trace checks are ever
-   extracted, it goes with them.
+   extracted, it goes with them. *Settled 2026-10-21: it stays.* The control-flow journal commits
+   `trace_position`, and the transition guest equates it, so the check reads no input it
+   wouldn't have anyway. Moving it would add nothing. Revisit only if the trace checks become
+   their own part ([`transition-split`](./transition-split.md)'s `trace`).
 3. **`ty` in the commitment.** Step 1 leaves it out (§Step 1). If a future check reads `ty`, it
-   has to be committed then, or the same gap reopens for that field.
+   has to be committed then, or the same gap reopens for that field. *Settled 2026-10-21: no
+   action.* Nothing reads `ty`. The rule stands: a change that makes a check read `ty` must add it
+   to `FnInput::source_witness_bytes` in the same change.
