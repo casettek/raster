@@ -16,7 +16,7 @@ use bridgetree::NonEmptyFrontier;
 
 use raster_core::cfs::CfsCoordinates;
 use raster_core::coordinate_index::{
-    verify_coordinate_index_membership, verify_coordinate_index_non_membership,
+    verify_coordinate_index_insert, verify_coordinate_index_membership,
 };
 use raster_core::input::{
     verify_bytes_page_geometry, verify_selection_reference_witness, verify_selection_witness,
@@ -25,8 +25,8 @@ use raster_core::input::{
 use raster_core::storage_check::StorageState;
 use raster_core::trace::{FnInput, StepRecord, StorageRoots};
 use raster_core::transition::{
-    SerializableFrontier, StorageEntry, StorageLogWitness, StorageReadWitness, StorageWitness,
-    StorageWriteWitness,
+    SerializableFrontier, StorageEntry, StorageIndexValue, StorageLogWitness, StorageReadWitness,
+    StorageWitness, StorageWriteWitness,
 };
 
 use crate::input_source::verify_input_source_anchored;
@@ -161,6 +161,11 @@ pub fn verify_storage_read_witness(
     );
 }
 
+/// A write: the entry is the one this step appends, its coordinates were
+/// absent from the index before, and the index root after is the one the
+/// record claims. That root is not taken from a second proof: it is computed
+/// from the non-membership proof and the entry's value, which this guest
+/// builds from its own append (`compact-coordinate-index` §Writes).
 fn verify_storage_write_witness(
     write_witness: &StorageWriteWitness,
     current_index_root: &[u8],
@@ -176,40 +181,20 @@ fn verify_storage_write_witness(
         write_witness.index_non_membership_witness.coordinates, expected_entry.coordinates,
         "Coordinate-index non-membership proof coordinates do not match write entry",
     );
-    assert!(
-        verify_coordinate_index_non_membership(
-            current_index_root,
-            &write_witness.index_non_membership_witness,
-        ),
-        "Coordinate-index non-membership proof is invalid before write",
-    );
+    let value = StorageIndexValue {
+        log_position: expected_log_position,
+        object_commitment: expected_entry.object_commitment.clone(),
+    };
+    let root_after = verify_coordinate_index_insert(
+        current_index_root,
+        &write_witness.index_non_membership_witness,
+        &value,
+    )
+    .unwrap_or_else(|| panic!("Coordinate-index non-membership proof is invalid before write"));
     assert_eq!(
-        write_witness.index_membership_witness.coordinates, expected_entry.coordinates,
-        "Coordinate-index membership proof coordinates do not match write entry",
-    );
-    assert_eq!(
-        write_witness
-            .index_membership_witness
-            .value
-            .object_commitment,
-        expected_entry.object_commitment,
-        "Coordinate-index membership proof commitment does not match write entry",
-    );
-    assert_eq!(
-        write_witness.index_membership_witness.value.log_position, expected_log_position,
-        "Coordinate-index membership proof log position does not match append-log position",
-    );
-    assert_eq!(
-        write_witness.index_non_membership_witness.siblings,
-        write_witness.index_membership_witness.siblings,
-        "Coordinate-index update proof siblings changed across insertion",
-    );
-    assert!(
-        verify_coordinate_index_membership(
-            next_index_root,
-            &write_witness.index_membership_witness
-        ),
-        "Coordinate-index membership proof is invalid after write",
+        root_after.as_slice(),
+        next_index_root,
+        "Coordinate-index root after write does not match the inserted entry",
     );
 }
 

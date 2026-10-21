@@ -248,8 +248,7 @@ mod tests {
     use raster_core::recur_progress::RecurProgressStack;
     use raster_core::trace::{ExecStep, ExecTarget, StepKind, StorageRoots};
     use raster_core::transition::{
-        CoordinateIndexMembershipProof, CoordinateIndexNonMembershipProof, StorageIndexValue,
-        StorageWitness, StorageWriteWitness,
+        CoordinateIndexNonMembershipProof, IndexTerminal, StorageWitness, StorageWriteWitness,
     };
 
     fn empty_frontier() -> SerializableFrontier {
@@ -296,14 +295,7 @@ mod tests {
                     entry: entry.clone(),
                     index_non_membership_witness: CoordinateIndexNonMembershipProof {
                         coordinates: entry.coordinates.clone(),
-                        siblings: Vec::new(),
-                    },
-                    index_membership_witness: CoordinateIndexMembershipProof {
-                        coordinates: entry.coordinates.clone(),
-                        value: StorageIndexValue {
-                            log_position: 0,
-                            object_commitment: entry.object_commitment.clone(),
-                        },
+                        terminal: IndexTerminal::Empty,
                         siblings: Vec::new(),
                     },
                 }),

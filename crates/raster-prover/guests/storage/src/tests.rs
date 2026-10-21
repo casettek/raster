@@ -294,6 +294,10 @@ fn verify_storage_transition_rejects_duplicate_coordinates() {
         index_root_before.clone(),
         index_root_before.clone(),
     );
+    // The existing key's own path, presented as an empty slot: the only
+    // non-membership a host could offer for coordinates already written.
+    let existing_path = coordinate_index_membership_proof(&before_index, &existing_entry.coordinates)
+        .expect("existing coordinate should have membership proof");
     let witness = StorageWitness {
         reads: Vec::new(),
         write: Some(StorageWriteWitness {
@@ -304,16 +308,50 @@ fn verify_storage_transition_rejects_duplicate_coordinates() {
             index_non_membership_witness:
                 raster_core::transition::CoordinateIndexNonMembershipProof {
                     coordinates: existing_entry.coordinates.clone(),
-                    siblings: vec![[0; 32].into(); 256],
+                    terminal: raster_core::transition::IndexTerminal::Empty,
+                    siblings: existing_path.siblings,
                 },
-            index_membership_witness: coordinate_index_membership_proof(
-                &before_index,
-                &existing_entry.coordinates,
-            )
-            .expect("existing coordinate should have membership proof"),
         }),
     };
 
+    let _ = verify(
+        &step,
+        Some(&inputs),
+        &BTreeMap::new(),
+        Some(&witness),
+        &before_frontier,
+        &index_root_before,
+    );
+}
+
+/// The index root after a write is computed, not proven: a record claiming
+/// any other root is refused, here one that dropped the write from the index.
+#[test]
+#[should_panic(expected = "Coordinate-index root after write does not match the inserted entry")]
+fn a_write_claiming_another_index_root_after_is_refused() {
+    let new_entry = StorageEntry {
+        coordinates: CfsCoordinates(vec![1]),
+        object_commitment: sha(b"out"),
+    };
+    let (before_frontier, root_before, _before_index, index_root_before) =
+        build_storage_context(&[]);
+    let (_after_frontier, root_after, _after_index, _index_root_after) =
+        build_storage_context(&[new_entry.clone()]);
+    let inputs = no_inputs();
+    let step = tile_step_with_store_roots(
+        1,
+        new_entry.coordinates.clone(),
+        input_source_commitment(&inputs),
+        new_entry.object_commitment.clone(),
+        root_before,
+        root_after,
+        index_root_before.clone(),
+        index_root_before.clone(),
+    );
+    let witness = StorageWitness {
+        reads: Vec::new(),
+        write: Some(build_write_witness(&[], &new_entry)),
+    };
     let _ = verify(
         &step,
         Some(&inputs),
@@ -664,9 +702,10 @@ fn one_segment_and_one_step_segments_commit_the_same_entries() {
 /// A frontier one position further on, ending in an empty leaf, folds to the
 /// same root as the empty store — which is why the entry commits the position
 /// too. Here the guest refuses it on its own: the first write lands at log
-/// position 2, and the honest index witness says 1.
+/// position 2, so the index leaf it builds differs from the one the record's
+/// index root after holds (position 1).
 #[test]
-#[should_panic(expected = "Coordinate-index membership proof log position does not match append-log position")]
+#[should_panic(expected = "Coordinate-index root after write does not match the inserted entry")]
 fn a_start_frontier_with_the_right_root_at_the_wrong_position_shifts_every_write() {
     let (mut header, steps) = three_step_window();
     let shifted = SerializableFrontier {

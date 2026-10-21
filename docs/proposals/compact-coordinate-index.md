@@ -1,9 +1,9 @@
 # Proposal: `compact-coordinate-index` — a coordinate index whose proofs are log₂(objects) deep, not 256
 
-Status: **Proposed 2026-10-21.** Not implemented. The guest-side cost it targets is measured
-(`storage-prover` §Where the storage guest's cycles go), and so is the host-side cost
-(`storage-write-cost` Term 2). The cost after the change is estimated (§Cost). Step 0 measures the
-one unknown, the actual depth distribution on real programs.
+Status: **Implemented 2026-10-21** (§Implementation record). Proposed the same day. Measured in
+dev mode on `hello-tiles` and `prompt-prepare` (§Measured after implementation): the storage guest
+is 86% and 80% smaller, and a fraud-proof window is 17 and 12 segments, against 40 and 28 before
+and 73 and 39 before this series (`0474a76`). The host-side insert is not measured yet.
 
 This is `storage-write-cost`'s **Term 2b**, which that proposal deferred as "a real proposal with a
 real payoff … and it should not be smuggled in as a performance tweak", because it changes every
@@ -314,3 +314,98 @@ one.
   witness, so revisit only if step 4 shows the index still matters.
 - **A 16-ary tree.** Fewer levels, but each node hashes 16 children,
   and SHA-256 cost follows bytes hashed, so binary is better for a guest.
+
+## Implementation record (2026-10-21)
+
+Steps 0–5 landed as one change (steps 1 and 2 were not merged separately), with the open questions
+settled as leaned: `EMPTY = [0; 32]`, `EMPTY` siblings carried, no depth in node hashes.
+
+**Step 0, measured.** Index keys printed from a temporary hook in `insert`, and each key's compact
+depth computed as one more than its longest shared prefix with any other key:
+
+| program | objects | mean leaf depth | max | before |
+| --- | --- | --- | --- | --- |
+| `hello-tiles` | 56 | 7.3 | 13 | 256 |
+| `prompt-prepare` | 823 | 11.1 | 17 | 256 |
+| `chain-example` (all stages) | 3 | 2.3 | 3 | 256 |
+
+**Code.**
+- `raster-core/src/coordinate_index.rs` is rewritten. The shared node functions are
+  `coordinates_key` (now public, unchanged), `leaf_hash`, `internal_hash` and `fold_up`. The
+  verifiers are `verify_coordinate_index_membership`, `verify_coordinate_index_non_membership` and
+  **`verify_coordinate_index_insert(root, proof, value) -> Option<Hash32>`**, which verifies the
+  non-membership proof and computes the root after the insert in one call, so no caller can compute
+  a root from an unverified proof. The key-level helpers (`key_is_absent`, `root_after_insert`)
+  stay private.
+- `IncrementalCoordinateIndex` keeps its API. It holds `leaves: BTreeMap<key, (leaf hash, value)>`
+  and `nodes: HashMap<(depth, prefix), hash>` for the internal nodes. An insert rehashes the path
+  from where the new key splits from its nearest ordered neighbour up to the root. The map still
+  uses the default hasher; `storage-write-cost` 2a's point about it applies if the host insert
+  shows up in a profile.
+- `raster-core/src/transition.rs`: `CoordinateIndexNonMembershipProof` gains `terminal:
+  IndexTerminal { Empty | Leaf { key, value } }`. `StorageWriteWitness` loses
+  `index_membership_witness`.
+- `guest_common::storage::verify_storage_write_witness` builds the leaf value from its own append
+  and asserts `verify_coordinate_index_insert(...) == index_root_after`. The membership-after, log
+  position and siblings-unchanged checks are gone, subsumed by that equality.
+- `commands/prove.rs` no longer builds the membership-after proof. The spec's storage-provenance
+  notes (`docs/specs/core/4-verify/02-what-must-run-next-algorithm.md`) describe the new index.
+
+**Tests.**
+- `raster-core`, 13 index tests replacing the 4 full-depth ones and their `legacy_*` reference:
+  - a recursive reference definition, with the incremental index held to its root and proofs after
+    every insert, up to 300 keys,
+  - order independence,
+  - insert-from-proof equal to insert, over random sets,
+  - a split at every depth from 0 to 255 with constructed keys, under a lone-leaf root and an
+    internal root,
+  - tampering: sibling, value, coordinates, a path one level too deep or too shallow, a member's
+    own leaf or an empty slot offered as absence, an off-path terminal, an insert from an
+    unverified proof, a path longer than a key.
+- Storage guest, 18: the duplicate-write forgery is now the existing key's path with an `Empty`
+  terminal, and a new test refuses a write whose record claims another index root after. The
+  wrong-position start frontier is still refused, now because the leaf the guest builds (log
+  position 2) is not the one in the record's root (position 1).
+- All suites pass: `raster-core` (203), `raster-runtime`, `raster-prover` (53), the storage (18),
+  transition (158) and control-flow (55) guests, and `raster-cli`.
+
+**What moved.** Every index root, so every `commit.bin` after a program's first write: commitments
+were regenerated for every run below. The index proofs, the write witness, and the transition and
+storage guests' image ids moved too. `program_commitment`, `Raster.lock` and the tile ids did not:
+both programs rebuild to their previous locks.
+
+**End to end.** `hello-tiles`: an honest commit/audit round trip ("Verification Success"), and
+fraud proofs at steps 27 (default and `--storage-segment 1`), 47 and 58, with the step-27 proof
+accepted by `verify_fraud_proof`. `chain-example`: an honest `chain run` and `chain audit`.
+`prompt-prepare --fraud-step 796`, recommitted, in default and `--storage-segment 1` modes. Every
+run generated its proof.
+
+## Measured after implementation (2026-10-21)
+
+Dev mode, risc0 `SessionStats` per proof (temporary probe, not committed). The same windows as
+`storage-prover` §Measured. Control flow and transition `window`. Cells are user cycles / total
+cycles / segments.
+
+| | storage guest before | after | window before | window after |
+| --- | --- | --- | --- | --- |
+| `hello-tiles` 27, default | 24.18M / 29.36M / 28 | **3.40M / 4.33M / 5** | 32.98M / 41.16M / 40 | **11.82M / 15.34M / 17** |
+| `hello-tiles` 27, `--storage-segment 1` | 25.21M / 33.95M / 46 | 4.43M / 10.09M / 32 | — / — / 58 | 12.92M / 21.36M / 44 |
+| `prompt-prepare` 796, default | 15.81M / 19.14M / 19 | **3.23M / 4.19M / 4** | 22.61M / 28.05M / 28 | **9.28M / 12.06M / 12** |
+| `prompt-prepare` 796, `--storage-segment 1` | — | 3.74M / 7.21M / 16 | — | 9.83M / 15.07M / 24 |
+
+Also `hello-tiles` 47 and 58: storage guest 3.77M and 3.37M, 5 segments each.
+
+- **The storage guest is 86% and 80% smaller**, beyond §Cost's estimate of 5–7M and 3–5M. Shallow
+  proofs also shrank the frame decode, and writes now prove one path instead of two.
+- **The transition guest shrank too** (6.23M → 5.86M and 4.69M → 3.95M): its genesis,
+  program-output and returned-state reads use the same proofs.
+- **The window, against `0474a76`** (before `storage-prover`, `transition-segments` and this):
+  `hello-tiles` 73 → 17 segments and 66.58M → 15.34M total cycles (−77%); `prompt-prepare` 39 →
+  12 segments and 39.58M → 12.06M (−70%).
+- **The largest receipt is now the transition guest** (8 and 5 segments), then storage (5 and 4)
+  and control flow (4 and 3). Per-step storage mode costs 27 and 12 extra segments for 1.0M and 0.5M
+  more user cycles, so `window` stays the default.
+
+**Not measured:** the host insert. `storage-write-cost`'s `append_index_ns` reads zero in this
+run's profile, because that counter isn't populated on this path. A direct timing of
+`IncrementalCoordinateIndex::insert` is the open item. Also real GPU proving.

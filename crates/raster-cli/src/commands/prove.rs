@@ -454,18 +454,15 @@ pub fn prove(
         if step_record.appends_to_storage() {
             if let Some(storage_write) = step_witness.storage_write() {
                 let entry = storage_write.entry.clone();
+                // The guest computes the index root after the write from this
+                // proof, so no membership proof against the new root is sent.
                 let index_non_membership_witness = before_state
                     .coordinate_index
                     .non_membership_proof(&entry.coordinates);
                 apply_storage_write_to_state(&mut current_storage_state, &storage_write);
-                let index_membership_witness = current_storage_state
-                    .coordinate_index
-                    .membership_proof(&entry.coordinates)
-                    .expect("Missing coordinate-index membership proof after write");
                 storage_write_witness = Some(StorageWriteWitness {
                     entry,
                     index_non_membership_witness,
-                    index_membership_witness,
                 });
             }
         }

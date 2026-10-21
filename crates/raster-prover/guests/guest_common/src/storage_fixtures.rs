@@ -98,20 +98,12 @@ pub fn build_write_witness(
 ) -> StorageWriteWitness {
     let (_frontier, _root, before_index, _before_index_root) =
         build_storage_context(before_entries);
-    let mut after_entries = before_entries.to_vec();
-    after_entries.push(new_entry.clone());
-    let (_frontier, _root, after_index, _after_index_root) = build_storage_context(&after_entries);
     StorageWriteWitness {
         entry: new_entry.clone(),
         index_non_membership_witness: coordinate_index_non_membership_proof(
             &before_index,
             &new_entry.coordinates,
         ),
-        index_membership_witness: coordinate_index_membership_proof(
-            &after_index,
-            &new_entry.coordinates,
-        )
-        .expect("membership proof should exist after write"),
     }
 }
 
