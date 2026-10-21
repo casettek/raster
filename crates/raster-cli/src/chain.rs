@@ -1332,6 +1332,9 @@ fn prove_terminal_window(
         &replayer,
         Some(&input_manifest_path.to_string_lossy().to_string()),
         &trace_commitment,
+        // Chain evidence proves its terminal window with the default segment
+        // length.
+        raster_prover::control_flow::ControlFlowSegments::default(),
     ))
 }
 

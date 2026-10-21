@@ -28,6 +28,7 @@ use raster_prover::trace::{
     Bytes, FraudEvidence, FraudProofConfig, SerializableFrontier, TraceCommitment,
     TraceCommitmentExt, TraceTree, TraceVerifier, VerificationResult,
 };
+use raster_prover::control_flow::ControlFlowSegments;
 use raster_prover::transition::{step_transitions, StepIo};
 use raster_runtime::TraceRecorder;
 
@@ -75,6 +76,7 @@ pub fn generate_fraud_proof(
     project: &Project,
     input_manifest: Option<&str>,
     commit_path: &str,
+    control_flow_segments: ControlFlowSegments,
 ) -> Result<PathBuf> {
     let backend =
         Risc0Backend::new(project.output_dir.clone()).with_user_crate(project.root_dir.clone());
@@ -88,6 +90,7 @@ pub fn generate_fraud_proof(
         &replayer,
         input_manifest,
         &trace_commitment,
+        control_flow_segments,
     );
     Ok(write_fraud_proof(&fraud_proof, commit_path))
 }
@@ -318,6 +321,7 @@ pub fn prove(
     replayer: &Replayer,
     input_manifest: Option<&str>,
     trace_commitment: &TraceCommitment,
+    control_flow_segments: ControlFlowSegments,
 ) -> risc0_zkvm::Receipt {
     let mode = ExecutionMode::prove_and_verify();
     let FraudEvidence {
@@ -656,6 +660,7 @@ pub fn prove(
             // Lets a divergence the packed fingerprint is blind to still be
             // proven — the tail's roots are revealed in full.
             &trace_commitment.revealed_tail_roots,
+            control_flow_segments,
         ) else {
             panic!("Failed to generate fraud proof");
         };

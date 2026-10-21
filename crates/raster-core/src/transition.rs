@@ -11,7 +11,7 @@ use std::vec::Vec;
 
 use crate::authorization::AuthorizationJournal;
 use crate::cfs::CfsCoordinates;
-use crate::control_flow::ControlFlowJournal;
+use crate::control_flow::ControlFlowEvidence;
 use crate::draft::{DraftTransitionWitness, TileReplayJournal};
 use crate::recur_progress::RecurProgressStack;
 use crate::fingerprint::{Fingerprint, FingerprintAccumulator};
@@ -209,12 +209,14 @@ pub struct TransitionInput {
     pub storage_witness: Option<StorageWitness>,
     pub draft_transition_witness: Option<DraftTransitionWitness>,
 
-    /// The control-flow guest's journal for this step. Its receipt is an
-    /// assumption of this step's proof; the transition guest verifies it and
-    /// equates every field it also holds with its own state. The scope witness
-    /// and scope parent the control-flow check reads go to that guest only.
-    /// See `docs/proposals/control-flow-prover.md` step 6.
-    pub control_flow_journal: ControlFlowJournal,
+    /// This step's control flow: the journal of the segment covering it (whose
+    /// receipt is an assumption of this step's proof), this step's entry, and
+    /// the path tying the entry to the journal's root. The transition guest
+    /// verifies all three and equates every entry field it also holds with its
+    /// own state. The scope witness and scope parent the control-flow check
+    /// reads go to that guest only. See `docs/proposals/control-flow-prover.md`
+    /// §Segments.
+    pub control_flow: ControlFlowEvidence,
 
     #[serde(with = "serde_bytes")]
     pub authorization_image_id: Vec<u8>,

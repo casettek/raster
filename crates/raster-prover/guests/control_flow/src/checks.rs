@@ -13,7 +13,7 @@ use raster_core::cfs::{
     CfsCoordinate, CfsCoordinates, CfsCursor, InputBinding, InputSource, ResolveError,
     SequenceChildItem, FIRST_COORDINATE,
 };
-use raster_core::control_flow::ControlFlowInput;
+use raster_core::control_flow::{ControlFlowEntry, ControlFlowInput, ControlFlowSegment};
 use raster_core::input::SelectorSegment;
 use raster_core::trace::{
     ExecStep, ExecTarget, FnInput, FnInputValue, StepKind, StepRecord, StorageData,
@@ -21,7 +21,50 @@ use raster_core::trace::{
 use raster_core::transition::StepRecordWitness;
 
 use guest_common::input_source::{input_source_commitment, verify_input_source_anchored};
-use guest_common::merkle_tree::{combine_merkle_level, hash_trace_item};
+use guest_common::merkle_tree::{
+    combine_merkle_level, deserialize_frontier, frontier_root, hash_trace_item, Bytes,
+};
+
+/// The control-flow check for a segment of consecutive steps. Returns one entry
+/// per step.
+///
+/// Only the segment's start — the trace frontier and the expected coordinates
+/// before its first step — comes from the host. Every later step's trace
+/// position and root come from appending the records before it, the way the
+/// transition guest's frontier grows, and its expected coordinates are the
+/// previous step's successors. Each entry still carries all of them, because
+/// each transition step equates its own entry by itself.
+pub fn verify_segment(cfs: &CfsCursor, segment: ControlFlowSegment) -> Vec<ControlFlowEntry> {
+    assert!(!segment.steps.is_empty(), "a control-flow segment must cover at least one step");
+    let mut frontier = deserialize_frontier(&segment.start_frontier)
+        .expect("host must supply a valid segment start frontier");
+    let mut expected_before = segment.expected_before;
+    let mut entries = Vec::with_capacity(segment.steps.len());
+    for step in segment.steps {
+        let step_record_hash = hash_trace_item(&step.step_record);
+        let input = ControlFlowInput {
+            step_record: step.step_record,
+            trace_position: frontier.position().into(),
+            trace_root_before: frontier_root(&frontier),
+            expected_before: expected_before.take(),
+            input_source_witness: step.input_source_witness,
+            sequence_scope_witness: step.sequence_scope_witness,
+            sequence_scope_parent: step.sequence_scope_parent,
+        };
+        let expected_after = verify_step(cfs, &input);
+        frontier.append(Bytes(step_record_hash.clone()));
+        expected_before = Some(expected_after.clone());
+        entries.push(ControlFlowEntry {
+            step_record_hash,
+            input_source_commitment: input.input_source_witness.as_ref().map(input_source_commitment),
+            trace_position: input.trace_position,
+            trace_root_before: input.trace_root_before,
+            expected_before: input.expected_before,
+            expected_after,
+        });
+    }
+    entries
+}
 
 /// The control-flow check for one step. Returns the coordinates the next step
 /// may take: empty after `ProgramEnd`, which nothing may follow.

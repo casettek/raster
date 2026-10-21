@@ -13,6 +13,7 @@ use raster_core::cfs::ControlFlowSchema;
 use raster_core::trace::{ExecTarget, StepKind, Trace, TraceEvent};
 use raster_core::{Error, Result};
 
+use raster_prover::control_flow::ControlFlowSegments;
 use raster_prover::trace::{FraudProofConfig, VerificationResult};
 use raster_runtime::TraceRecorder;
 
@@ -30,6 +31,7 @@ pub fn run(
     fraud_proof_config: Option<FraudProofConfig>,
     fraud_step: Option<&FraudTarget>,
     audit_flag: Option<&str>,
+    control_flow_segments: ControlFlowSegments,
     no_auth: bool,
     _verbose: bool,
     show_output: bool,
@@ -311,6 +313,7 @@ pub fn run(
                     &project,
                     input_manifest,
                     commit_path,
+                    control_flow_segments,
                 )?;
                 println!("Fraud proof generated: {}", fraud_proof_path.display());
             }

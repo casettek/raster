@@ -226,6 +226,14 @@ enum Commands {
         #[arg(long, conflicts_with = "commit")]
         audit: Option<String>,
 
+        /// How many fraud-proof window steps one control-flow receipt covers,
+        /// when an audit proves fraud: `window` (the default) proves the
+        /// window's control flow in one receipt; `<n>` proves it `n` steps at a
+        /// time, so `1` is one receipt per step. The proof is the same either
+        /// way; this only trades receipts against fixed proving work.
+        #[arg(long = "control-flow-segment", requires = "audit", default_value = "window")]
+        control_flow_segment: raster_prover::control_flow::ControlFlowSegments,
+
         /// Run without authenticated storage: tile outputs are passed as plain
         /// Rust values, nothing is hashed or stored between tiles, and no trace
         /// is written. Faster, and not authoritative — results cannot be
@@ -504,6 +512,7 @@ fn try_main() -> Result<()> {
             fraud_proof_config,
             fraud_step,
             audit,
+            control_flow_segment,
             no_auth,
             verbose,
             show_output,
@@ -519,6 +528,7 @@ fn try_main() -> Result<()> {
             fraud_proof_config,
             fraud_step.as_ref(),
             audit.as_deref(),
+            control_flow_segment,
             no_auth,
             verbose,
             show_output,

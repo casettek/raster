@@ -10,7 +10,7 @@
 
 use raster_core::authorization::AuthorizationJournal;
 use raster_core::cfs::ControlFlowSchema;
-use raster_core::control_flow::ControlFlowJournal;
+use raster_core::control_flow::ControlFlowEvidence;
 use raster_core::draft::DraftTransitionWitness;
 use raster_core::fingerprint::Fingerprint;
 use raster_core::input::SelectionWitness;
@@ -23,7 +23,7 @@ use raster_core::transition::{
 use std::collections::{BTreeMap, HashMap};
 
 use crate::authorization::authorization_guest_image_id;
-use crate::control_flow::{control_flow_guest_image_id, prove_control_flow_step, ControlFlowWalk};
+use crate::control_flow::{control_flow_guest_image_id, ControlFlowSegments, ProvenControlFlow};
 use crate::error::{BitPackerError, Result};
 use raster_core::merkle::{NodeHash, EMPTY_LEAF};
 use crate::replay::ReplayResult;
@@ -65,9 +65,10 @@ fn recorded_io<'a>(recorded_step_io: &'a RecordedStepIo, step_record: &StepRecor
 
 fn build_transition_input(
     step_record: &StepRecord,
-    // The control-flow guest's journal for this step; its receipt is added as
-    // an assumption next to the authorization and replay receipts.
-    control_flow_journal: ControlFlowJournal,
+    // This step's control-flow evidence; the receipt of the segment covering
+    // it is added as an assumption next to the authorization and replay
+    // receipts.
+    control_flow: ControlFlowEvidence,
     recorded_step_io: &RecordedStepIo,
     replayed_results: &HashMap<StepRecord, ReplayResult>,
     authorization_journal: &AuthorizationJournal,
@@ -121,7 +122,7 @@ fn build_transition_input(
         storage_witness,
         draft_transition_witness,
         authorization_journal: authorization_journal.clone(),
-        control_flow_journal,
+        control_flow,
         entrypoint_membership_witness: entrypoint_membership_witness.cloned(),
         program_output_read_witness,
         program_output_selection_witness,
@@ -229,12 +230,25 @@ pub fn step_transitions(
     // fingerprint is blind to can still be proven. See
     // `TransitionJournal::final_committed_root`.
     revealed_tail_roots: &[NodeHash],
+    // How many steps each control-flow receipt covers: the whole window by
+    // default, or any fixed number (one is the per-step mode). The proof says
+    // the same either way.
+    control_flow_segments: ControlFlowSegments,
 ) -> Option<risc0_zkvm::Receipt> {
     let prover = risc0_zkvm::default_prover();
 
     let transition_image_id = image_id_bytes(TRANSITION_GUEST_ID);
     let control_flow_image_id = control_flow_guest_image_id();
-    let mut control_flow_walk = ControlFlowWalk::new(program_frame, initial_frontier);
+    // Control-flow segments depend on no transition receipt, only on the trace
+    // facts the host can compute, so they are all proven before the chain.
+    let control_flow = ProvenControlFlow::prove(
+        program_frame,
+        initial_frontier,
+        trace_window,
+        recorded_step_io,
+        sequence_scope_parents,
+        control_flow_segments,
+    );
 
     let init_transition = InitTransition {
         init_frontier: initial_frontier.clone(),
@@ -249,22 +263,12 @@ pub fn step_transitions(
 
     let mut current_state = TransitionState::Init(init_transition);
 
-    for step_record in trace_window {
-        // The control-flow receipt depends on no transition receipt, only on
-        // the trace facts the walk tracks; it is proven first and becomes one
-        // more assumption of this step.
-        let control_flow_input = control_flow_walk.input_for(
-            step_record,
-            recorded_io(recorded_step_io, step_record),
-            sequence_scope_parents,
-        );
-        let (control_flow_receipt, control_flow_journal) =
-            prove_control_flow_step(program_frame, &control_flow_input);
-        control_flow_walk.advance(step_record);
+    for (index, step_record) in trace_window.iter().enumerate() {
+        let (control_flow_receipt, control_flow_evidence) = control_flow.for_step(index);
 
         let input = build_transition_input(
             step_record,
-            control_flow_journal,
+            control_flow_evidence,
             recorded_step_io,
             replayed_results,
             authorization_journal,
@@ -310,7 +314,7 @@ pub fn step_transitions(
 
         let mut builder = risc0_zkvm::ExecutorEnv::builder();
         builder.add_assumption(authorization_receipt.clone());
-        builder.add_assumption(control_flow_receipt);
+        builder.add_assumption(control_flow_receipt.clone());
         if let Some(replay_receipt) = replay_receipt_assumption {
             builder.add_assumption(replay_receipt);
         }
@@ -537,7 +541,7 @@ mod tests {
 
         let input = build_transition_input(
             &second_step,
-            placeholder_control_flow_journal(),
+            placeholder_control_flow_evidence(),
             &recorded_step_io,
             &replayed_results,
             &make_authorization_journal(),
@@ -586,7 +590,7 @@ mod tests {
 
         let input = build_transition_input(
             &tile_step,
-            placeholder_control_flow_journal(),
+            placeholder_control_flow_evidence(),
             &recorded_step_io,
             &replayed_results,
             &make_authorization_journal(),
@@ -633,7 +637,7 @@ mod tests {
 
         let start_input = build_transition_input(
             &sequence_start,
-            placeholder_control_flow_journal(),
+            placeholder_control_flow_evidence(),
             &recorded_step_io,
             &HashMap::new(),
             &make_authorization_journal(),
@@ -643,7 +647,7 @@ mod tests {
         );
         let end_input = build_transition_input(
             &sequence_end,
-            placeholder_control_flow_journal(),
+            placeholder_control_flow_evidence(),
             &recorded_step_io,
             &HashMap::new(),
             &make_authorization_journal(),
@@ -677,17 +681,25 @@ mod tests {
         );
     }
 
-    /// A control-flow journal for tests that exercise only how the rest of the
+    /// Control-flow evidence for tests that exercise only how the rest of the
     /// transition input is assembled; nothing reads its fields.
-    fn placeholder_control_flow_journal() -> ControlFlowJournal {
-        ControlFlowJournal {
-            program_commitment: Vec::new(),
-            step_record_hash: Vec::new(),
-            input_source_commitment: None,
-            trace_position: 0,
-            trace_root_before: Vec::new(),
-            expected_before: None,
-            expected_after: Vec::new(),
+    fn placeholder_control_flow_evidence() -> ControlFlowEvidence {
+        ControlFlowEvidence {
+            journal: raster_core::control_flow::ControlFlowJournal {
+                program_commitment: Vec::new(),
+                first_position: 0,
+                entry_count: 0,
+                entries_root: [0; 32],
+            },
+            entry: raster_core::control_flow::ControlFlowEntry {
+                step_record_hash: Vec::new(),
+                input_source_commitment: None,
+                trace_position: 0,
+                trace_root_before: Vec::new(),
+                expected_before: None,
+                expected_after: Vec::new(),
+            },
+            path: Vec::new(),
         }
     }
 
@@ -812,18 +824,24 @@ mod tests {
     ) -> risc0_zkvm::Result<risc0_zkvm::ProveInfo> {
         let prover = risc0_zkvm::default_prover();
         // The step's control-flow receipt, proven the way `step_transitions`
-        // proves it: the walk starts at the window's initial frontier.
-        let control_flow_input =
-            ControlFlowWalk::new(&make_minimal_program_frame(), &make_init_frontier()).input_for(
-                &make_sequence_start_step(),
-                &StepIo {
-                    input_source_witness: Some(empty_input_source_witness()),
-                    ..StepIo::default()
-                },
-                &BTreeMap::new(),
-            );
-        let (control_flow_receipt, control_flow_journal) =
-            prove_control_flow_step(&make_minimal_program_frame(), &control_flow_input);
+        // proves it: a one-step window, one segment from its initial frontier.
+        let step_io = HashMap::from([(
+            make_sequence_start_step(),
+            StepIo {
+                input_source_witness: Some(empty_input_source_witness()),
+                ..StepIo::default()
+            },
+        )]);
+        let control_flow = ProvenControlFlow::prove(
+            &make_minimal_program_frame(),
+            &make_init_frontier(),
+            &[make_sequence_start_step()],
+            &step_io,
+            &BTreeMap::new(),
+            ControlFlowSegments::Window,
+        );
+        let (control_flow_receipt, control_flow_evidence) = control_flow.for_step(0);
+        let control_flow_receipt = control_flow_receipt.clone();
         let input = TransitionInput {
             window_start_recur_progress: None,
             step_record: make_sequence_start_step(),
@@ -836,7 +854,7 @@ mod tests {
             storage_witness: None,
             draft_transition_witness: None,
             authorization_journal: authorization,
-            control_flow_journal,
+            control_flow: control_flow_evidence,
             entrypoint_membership_witness: None,
             program_output_read_witness: None,
             program_output_selection_witness: None,

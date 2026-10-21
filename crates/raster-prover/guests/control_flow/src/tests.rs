@@ -8,7 +8,8 @@ use raster_core::cfs::{
     RecurSequenceItem, RecurTileItem, SequenceChildItem, SequenceDef, SequenceItem, TileDef,
     TileItem, FIRST_COORDINATE,
 };
-use raster_core::control_flow::ControlFlowInput;
+use raster_core::control_flow::{ControlFlowInput, ControlFlowSegment, ControlFlowStep};
+use raster_core::transition::SerializableFrontier;
 use raster_core::input::{Hash32, SelectionWitness, SelectorSegment};
 use raster_core::merkle::to_node_hash;
 use raster_core::recur_progress::RecurProgressStack;
@@ -18,11 +19,15 @@ use raster_core::trace::{
 };
 
 use guest_common::input_source::input_source_commitment;
-use guest_common::merkle_tree::{sha256_bytes, Bytes, TraceBridgeTree, EMPTY_LEAF};
+use bridgetree::NonEmptyFrontier;
+use guest_common::merkle_tree::{
+    deserialize_frontier, frontier_root, hash_trace_item, serialize_frontier, sha256_bytes, Bytes,
+    TraceBridgeTree, EMPTY_LEAF,
+};
 
 use crate::checks::{
-    verify_exec_index, verify_sequence_id, verify_sequence_scope_parent, verify_step,
-    verify_step_record_inputs,
+    verify_exec_index, verify_segment, verify_sequence_id, verify_sequence_scope_parent,
+    verify_step, verify_step_record_inputs,
 };
 
 fn sha(bytes: &[u8]) -> Vec<u8> {
@@ -59,6 +64,142 @@ fn program_end_record(exec_index: u64) -> StepRecord {
         recur_progress_commitment: RecurProgressStack::new().commitment(),
         recur_state: None,
     }
+}
+
+/// `main` running one tile `t` on an inline argument.
+fn one_tile_cfs() -> CfsCursor {
+    let mut cfs = ControlFlowSchema::new("test");
+    cfs.tiles.push(TileDef::iter("t", 1, 1));
+    let mut main = SequenceDef::new("main");
+    main.items.push(SequenceChildItem::Tile(TileItem {
+        id: "t".to_string(),
+        sources: vec![InputBinding::inline()],
+    }));
+    cfs.sequences.push(main);
+    CfsCursor::new(cfs)
+}
+
+/// The three steps an honest run of [`one_tile_cfs`] records, as segment steps.
+fn one_tile_run() -> Vec<ControlFlowStep> {
+    let argument = FnInput {
+        data: Vec::new(),
+        values: vec![FnInputValue::Inline(vec![7])],
+        args: vec![FnInputArg {
+            name: "x".to_string(),
+            ty: "u8".to_string(),
+        }],
+        storage: Default::default(),
+    };
+    let tile = StepRecord {
+        exec_index: 2,
+        sequence_id: "main".to_string(),
+        coordinates: CfsCoordinates(vec![1]),
+        kind: StepKind::Exec(ExecStep {
+            target: ExecTarget::Tile("t".to_string()),
+            intra_sequence_index: FIRST_COORDINATE,
+            input_commitment: Vec::new(),
+            input_source_commitment: input_source_commitment(&argument),
+            output_commitment: Vec::new(),
+            storage: empty_roots(),
+        }),
+        recur_progress_commitment: RecurProgressStack::new().commitment(),
+        recur_state: None,
+    };
+    let step = |step_record: StepRecord, input_source_witness: Option<FnInput>| ControlFlowStep {
+        step_record,
+        input_source_witness,
+        sequence_scope_witness: None,
+        sequence_scope_parent: None,
+    };
+    vec![
+        step(program_start_record(program_start_step(Vec::new(), Vec::new())), None),
+        step(tile, Some(argument)),
+        step(program_end_record(3), None),
+    ]
+}
+
+/// The trace frontier before any step: the seed leaf alone.
+fn seed_frontier() -> NonEmptyFrontier<Bytes> {
+    deserialize_frontier(&SerializableFrontier {
+        position: 0,
+        leaf: EMPTY_LEAF.to_vec(),
+        ommers: Vec::new(),
+    })
+    .unwrap()
+}
+
+fn segment(
+    start: &NonEmptyFrontier<Bytes>,
+    expected_before: Option<Vec<CfsCoordinates>>,
+    steps: Vec<ControlFlowStep>,
+) -> ControlFlowSegment {
+    ControlFlowSegment {
+        start_frontier: serialize_frontier(start),
+        expected_before,
+        steps,
+    }
+}
+
+/// A segment derives every step's trace facts from its start: positions
+/// advance by one, each root is the frontier after the records before it, and
+/// each step expects what the previous step allowed.
+#[test]
+fn a_segment_derives_each_steps_trace_facts() {
+    let steps = one_tile_run();
+    let entries = verify_segment(&one_tile_cfs(), segment(&seed_frontier(), None, steps.clone()));
+
+    let mut frontier = seed_frontier();
+    for (k, (entry, step)) in entries.iter().zip(&steps).enumerate() {
+        assert_eq!(entry.trace_position, k as u64);
+        assert_eq!(entry.trace_root_before, frontier_root(&frontier));
+        assert_eq!(entry.step_record_hash, hash_trace_item(&step.step_record));
+        frontier.append(Bytes(hash_trace_item(&step.step_record)));
+    }
+    assert!(entries[0].expected_before.is_none());
+    assert_eq!(entries[1].expected_before.as_ref(), Some(&entries[0].expected_after));
+    assert_eq!(entries[2].expected_before.as_ref(), Some(&entries[1].expected_after));
+    assert!(entries[2].expected_after.is_empty(), "nothing follows ProgramEnd");
+}
+
+/// The modes agree: the window as one segment and as one-step segments — each
+/// started where the previous one left off — commit the same entries. Which
+/// mode the host picks changes the number of receipts, never what they say.
+#[test]
+fn one_segment_and_one_step_segments_commit_the_same_entries() {
+    let cfs = one_tile_cfs();
+    let steps = one_tile_run();
+    let whole = verify_segment(&cfs, segment(&seed_frontier(), None, steps.clone()));
+
+    let mut frontier = seed_frontier();
+    let mut expected = None;
+    let mut per_step = Vec::new();
+    for step in steps {
+        let record_hash = hash_trace_item(&step.step_record);
+        let entry = verify_segment(&cfs, segment(&frontier, expected.clone(), vec![step]))
+            .pop()
+            .unwrap();
+        expected = Some(entry.expected_after.clone());
+        frontier.append(Bytes(record_hash));
+        per_step.push(entry);
+    }
+    assert_eq!(whole, per_step);
+}
+
+/// Inside a segment the guest holds each step to the previous one's
+/// successors itself: skipping the tile is refused at `ProgramEnd`.
+#[test]
+#[should_panic(expected = "is not among the coordinates the previous step allows")]
+fn a_segment_skipping_a_step_is_refused() {
+    let mut steps = one_tile_run();
+    steps.remove(1);
+    steps[1].step_record.exec_index = 2;
+    verify_segment(&one_tile_cfs(), segment(&seed_frontier(), None, steps));
+}
+
+#[test]
+#[should_panic(expected = "must cover at least one step")]
+fn an_empty_segment_is_refused() {
+    verify_segment(&one_tile_cfs(), segment(&seed_frontier(), None, Vec::new()));
 }
 
 /// `verify_step` is the whole control-flow check behind one function

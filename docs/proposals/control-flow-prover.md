@@ -3,8 +3,10 @@
 Status: **Implemented 2026-10-21.** Proposed 2026-10-19 at `c049b76`. Step 1 landed 2026-10-19,
 steps 2–5 2026-10-20, step 6 2026-10-21 (§Implementation record, §Implementation record: step 6).
 Step 0 and the cost of step 6 are measured on `hello-tiles` and `prompt-prepare`
-(§Measured after implementation). All three open questions are settled. Only §Deferred remains,
-and it belongs to a proposal of its own.
+(§Measured after implementation). All three open questions are settled. **Segments added
+2026-10-21** (§Segments): one control-flow receipt covers a run of steps, the whole window by
+default, with a Merkle root over per-step entries. That takes §Deferred's whole-window item. The
+frame stack was profiled and not built, and GPU timing is still to run.
 
 Scope: **one transition step.** The control-flow guest proves the CFS checks for exactly the step
 that one transition-guest execution proves, and the transition guest consumes that receipt.
@@ -544,7 +546,10 @@ reason above.
 
 ## Implementation record: step 6 (2026-10-21)
 
-Landed as designed, with the differences below.
+Landed as designed, with the differences below. *The same day, §Segments changed the journal (a Merkle root over one
+entry per step), the guest's input (a segment), and the host (`ControlFlowWalk::input_for` and
+`prove_control_flow_step` became `plan_control_flow_segments` and `ProvenControlFlow`, with every
+segment proven before the chain). This record describes step 6 as it first landed.*
 
 **Layout.**
 - `raster-core/src/control_flow.rs` holds `ControlFlowInput` (owned, serializable) and
@@ -609,14 +614,132 @@ proof with all three inner guests pinned. `Raster.lock` passes the drift check u
 
 **Cost.** Measured in cycles and segments on both programs. See §Measured after implementation.
 
+## Segments (2026-10-21)
+
+Step 6 proved one step per control-flow execution, and §Measured after implementation showed what
+that costs: the guest's fixed work (200–236k cycles), and at least one segment, on every step. A
+**segment** is a run of consecutive steps proven in one control-flow execution. The host picks
+the length with `--control-flow-segment`: `window` (the default) for one receipt per window, or
+`<n>` for one per `n` steps, where `1` is step 6's per-step mode. The guests, the journal, the
+transition guest's check and the image ids are the same in every mode, so a relying party cannot
+tell which produced a proof and doesn't need to.
+
+**What the guest reads.** `ControlFlowSegment`: the trace frontier and the expected coordinates
+before the segment's first step, then each step's record and witnesses (`ControlFlowStep`).
+`checks::verify_segment` runs `verify_step` on each step in order. It derives every later step's
+trace position and root by appending the records before it, the way the transition guest's
+frontier grows, and its expected coordinates from the previous step's successors. Only the start
+is host-supplied.
+
+**What it commits.**
+- **One `ControlFlowEntry` per step,** with exactly step 6's per-step fields: record hash,
+  input-source commitment, trace position, trace root before, and expected coordinates before and
+  after.
+- **The journal commits only a Merkle root over them:** `ControlFlowJournal { program_commitment,
+  first_position, entry_count, entries_root }`.
+- **The tree.** Leaves are domain-separated hashes of each entry's postcard encoding
+  (`ControlFlowEntry::leaf_hash`), and inner nodes have their own domain. An odd last node is
+  carried up rather than duplicated, so `[a, b, c]` and `[a, b, c, c]` have different roots. The
+  code is `entries_root`, `entry_path` and `root_from_path` in `raster-core::control_flow`, using
+  `raster-core`'s hash, which is risc0's accelerated SHA inside a guest.
+- **The entries go to the host on stdout,** not into the journal. They are untrusted there:
+  `prove_control_flow_segment` refuses them unless they fold to the committed root, and every
+  transition step checks its own again.
+- **The journal is committed as raw postcard bytes** (`encode`, `env::commit_slice`), not with
+  risc0's serde.
+
+**What each transition step checks.** It gets `ControlFlowEvidence`: the journal, its own entry,
+and that entry's path. It then:
+1. verifies the receipt against the journal,
+2. checks that its trace position falls in the segment (`index_of`),
+3. checks that its entry folds along the path at that index to `entries_root`
+   (`entry_is_committed_at`),
+4. runs step 6's equalities on the entry.
+
+Every step does all of this itself, even when several steps share a segment. Each transition step
+is its own execution, handed its evidence by the host, so a check one step made on the segment
+says nothing about another. A design that checked the segment's start once, at its first step,
+would let a later step be given a different segment whose start is fabricated, and the
+control-flow guest would then fold scope parents against a trace root of the prover's choosing.
+Repeating the full equality per step is what makes the trace facts inside a segment safe to
+derive rather than supply.
+
+**Soundness.** The same as §Soundness, per entry. Each entry's position, root and expected set are
+equated with the transition step's own state, so the derived values are checked, not trusted.
+The path binds the entry to the receipt by collision resistance of the tree. The index is fixed
+by the step's trace position, and the entry repeats that position, so an entry can't be
+presented at another slot (`another_steps_entry_from_the_same_segment_is_refused`). The modes
+agree by construction, and `one_segment_and_one_step_segments_commit_the_same_entries` pins it:
+the window as one segment, and as one-step segments each started where the last ended, commit
+identical entries.
+
+**Host.** `plan_control_flow_segments` cuts the window and walks it, so each segment starts from
+the frontier and successor set the previous one ended in. `ProvenControlFlow` proves every segment
+before the transition chain starts, and `step_transitions` gives each step the covering receipt
+and its evidence. Chain evidence (`chain fraud-prove`) uses the default.
+`raster_prover::control_flow::ControlFlowSegments` is the setting, parsed from the flag.
+
+**Cost.** Every segment pays the control-flow guest's fixed work and at least one segment of
+proving. A transition step pays one entry and a path of log₂(n) hashes, whatever the segment's
+length.
+
+Measured 2026-10-21, dev mode, the windows of §Measured after implementation, totals over the
+window for both guests. Step 5 is HEAD `6393fa8`, one guest per step.
+
+| `hello-tiles`, 32 steps | user cycles | total cycles | segments |
+| --- | --- | --- | --- |
+| step 5 | 45.77M | 63.70M | 69 |
+| `1` (per step) | 52.80M (+15.4%) | 79.95M (+25.5%) | 101 (+46%) |
+| `8` | 48.87M (+6.8%) | 67.37M (+5.8%) | 73 (+5.8%) |
+| `window` (default) | 48.53M (+6.0%) | 66.58M (+4.5%) | 73 (+5.8%) |
+
+| `prompt-prepare`, 16 steps | user cycles | total cycles | segments |
+| --- | --- | --- | --- |
+| step 5 | 27.60M | 36.70M | 38 |
+| `1` (per step) | 31.21M (+13.1%) | 44.83M (+22.1%) | 52 (+37%) |
+| `8` | 29.40M (+6.5%) | 39.58M (+7.8%) | 40 (+5.3%) |
+| `window` (default) | 29.29M (+6.1%) | 39.58M (+7.8%) | 39 (+2.6%) |
+
+- **The whole window is the cheapest or tied** on both programs, which is why it is the default.
+- **Finding an entry costs a transition step about 7k cycles.** That's the difference between
+  window-mode and per-step transition totals on `hello-tiles`.
+- **Two earlier designs were worse.** Before the Merkle root, a step decoded, re-encoded and
+  hashed the whole journal: about 78k cycles per step at 32 entries, which made eight-step
+  segments the better default. Before the postcard journal it was about 141k, because risc0's
+  serde writes every byte as a word.
+- **Per step is the most expensive mode** and is kept for comparison and debugging.
+
+**Where the control-flow guest's cycles go** (window mode, temporary `env::cycle_count()`
+probe):
+
+| | `hello-tiles` (32 steps) | `prompt-prepare` (16 steps) |
+| --- | --- | --- |
+| whole guest | 2.57M | 2.11M |
+| setup: program and segment decode, `CfsCursor::new` | 691k | 859k |
+| `verify_step`, all steps | 488k | 465k |
+| of which scope-parent folding (5 steps each) | 193k | 231k |
+| rest of the step loop: record and leaf hashing, trace roots | 1.23M | 0.69M |
+| root, commit, entries to stdout | 157k | 97k |
+
+So **the frame stack is not worth building** at these sizes. It removes only the scope-parent
+share, 7–11% of the control-flow guest and under 1% of a window's total cycles. The larger share
+of the step loop is recomputing the trace root before each step (a 32-level fold). That could be
+made incremental if the control-flow guest ever matters more than it does now.
+
+**Not measured: real proving.** These are dev-mode user cycles and segment counts. GPU proving
+adds the recursion work they don't show: lifting each control-flow receipt, and resolving the
+control-flow assumption once per transition step in every mode. A real run per mode on
+`prompt-prepare` would confirm the ranking. It wasn't run on 2026-10-21 because the GPU was busy
+with other work.
+
 ## Deferred
 
-- **Whole-window control flow.** One control-flow execution per window instead of per step. The
-  scope-parent fold can then become a frame stack: the window opens with the `SequenceStart`
-  records of the frames already open, each proven once against the starting root, and they are
-  pushed and popped as the window runs. That removes per-step Merkle paths. It needs a journal
-  that commits to the window's records rather than one record, so it changes the interface this
-  proposal defines. Worth a proposal of its own once step 6's numbers exist.
+- **Whole-window control flow.** *Done as §Segments. The frame stack was profiled and not
+  built.* One control-flow execution per window instead of per step. The scope-parent fold could
+  then become a frame stack: the window opens with the `SequenceStart` records of the frames
+  already open, each proven once against the starting root, and they are pushed and popped as
+  the window runs. That would remove per-step Merkle paths. §Segments measured the folding at
+  7–11% of the control-flow guest and under 1% of a window, so it stays a per-step fold.
 - **Other families.** Whether `store`, `io`, `drafts`, recur and `entrypoint` follow is the
   question [`transition-split`](./transition-split.md) asks. This proposal does not answer it.
 

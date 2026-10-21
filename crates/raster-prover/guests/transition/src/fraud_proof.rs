@@ -699,7 +699,7 @@ impl LiveTransition {
         let trace_root_before = frontier_root(&self.frontier);
         let expected_after = checks::control_flow::verify_control_flow(
             &params.control_flow_image_id,
-            &input.control_flow_journal,
+            &input.control_flow,
             &checks::control_flow::ControlFlowFacts {
                 program_commitment: &params.program_commitment,
                 step_record: &input.step_record,
