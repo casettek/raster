@@ -8,9 +8,7 @@ use raster_core::cfs::{
     RecurSequenceItem, FIRST_COORDINATE,
     RecurTileItem, SequenceChildItem, SequenceDef, SequenceItem, TileDef, TileItem,
 };
-use raster_core::coordinate_index::{
-    coordinate_index_membership_proof, coordinate_index_non_membership_proof, coordinate_index_root,
-};
+use raster_core::coordinate_index::coordinate_index_root;
 use raster_core::draft::{
     draft_root_from_witness, draft_value_root, schema_hash as compute_schema_hash, DraftOp,
     DraftReplayTransition, DraftStateWitness, DraftTransitionWitness, DraftWitnessField,
@@ -29,8 +27,7 @@ use raster_core::trace::{
     StorageData, StorageRoots,
 };
 use raster_core::transition::{
-    SerializableFrontier, StorageEntry, StorageLogWitness, StorageReadWitness, StorageWitness,
-    StorageWriteWitness,
+    SerializableFrontier, StorageEntry, StorageWitness,
 };
 
 use crate::checks::recur::verify_recur_iteration_chunking;
@@ -38,10 +35,13 @@ use crate::checks::drafts::verify_draft_transition;
 use crate::checks::io::{
     input_source_commitment, verify_input_source_anchored, verify_io_witness, verify_step_record,
 };
-use crate::checks::store::{storage_leaf_hash, verify_storage_transition};
+use guest_common::storage::{StorageCursor, StorageInput};
+use guest_common::storage_fixtures::{
+    build_read_witness, build_storage_context, tile_step_with_store_roots,
+};
 use raster_core::merkle::{to_node_hash, NodeHash};
 use crate::merkle_tree::{
-    deserialize_frontier, frontier_root, sha256_bytes, sha256_hex, Bytes, TraceBridgeTree,
+    sha256_bytes, sha256_hex, Bytes, TraceBridgeTree,
     EMPTY_LEAF,
 };
 
@@ -497,132 +497,6 @@ fn verify_sequence_boundary_commitments_accept_matching_recorded_io() {
     verify_io_witness(&end, None, Some(&b"sequence-out".to_vec()));
 }
 
-fn empty_storage_frontier_for_test() -> NonEmptyFrontier<Bytes> {
-    deserialize_frontier(&SerializableFrontier {
-        position: 0,
-        leaf: EMPTY_LEAF.to_vec(),
-        ommers: Vec::new(),
-    })
-    .expect("empty storage frontier should deserialize")
-}
-
-fn build_storage_context(
-    entries: &[StorageEntry],
-) -> (
-    NonEmptyFrontier<Bytes>,
-    Vec<u8>,
-    BTreeMap<CfsCoordinates, raster_core::transition::StorageIndexValue>,
-    Vec<u8>,
-) {
-    let mut frontier = empty_storage_frontier_for_test();
-    let mut index = BTreeMap::new();
-    for entry in entries {
-        frontier.append(Bytes(storage_leaf_hash(entry)));
-        let log_position: u64 = frontier.position().into();
-        index.insert(
-            entry.coordinates.clone(),
-            raster_core::transition::StorageIndexValue {
-                log_position,
-                object_commitment: entry.object_commitment.clone(),
-            },
-        );
-    }
-    let root = frontier_root(&frontier);
-    let index_root = coordinate_index_root(&index);
-    (frontier, root, index, index_root)
-}
-
-fn build_storage_log_witness_for_entries(
-    entries: &[StorageEntry],
-    log_position: u64,
-) -> StorageLogWitness {
-    let mut tree = TraceBridgeTree::new(1);
-    tree.append(Bytes(EMPTY_LEAF.to_vec()));
-    let mut marked_position = None;
-    for (index, entry) in entries.iter().enumerate() {
-        tree.append(Bytes(storage_leaf_hash(entry)));
-        if u64::try_from(index).expect("index overflow") + 1 == log_position {
-            marked_position = tree.mark();
-        }
-    }
-    let marked_position = marked_position.expect("log position should exist in append tree");
-    let auth_path = tree
-        .witness(marked_position, 0)
-        .expect("append-log witness should exist");
-    StorageLogWitness {
-        position: u64::from(marked_position),
-        path_elems: auth_path.iter().map(|elem| to_node_hash(&elem.0)).collect(),
-    }
-}
-
-fn build_read_witness(entries: &[StorageEntry], entry: &StorageEntry) -> StorageReadWitness {
-    let (_frontier, _root, index, _index_root) = build_storage_context(entries);
-    let index_witness = coordinate_index_membership_proof(&index, &entry.coordinates)
-        .expect("membership proof should exist");
-    let log_witness =
-        build_storage_log_witness_for_entries(entries, index_witness.value.log_position);
-    StorageReadWitness {
-        entry: entry.clone(),
-        log_witness,
-        index_witness,
-    }
-}
-
-fn build_write_witness(
-    before_entries: &[StorageEntry],
-    new_entry: &StorageEntry,
-) -> StorageWriteWitness {
-    let (_frontier, _root, before_index, _before_index_root) =
-        build_storage_context(before_entries);
-    let mut after_entries = before_entries.to_vec();
-    after_entries.push(new_entry.clone());
-    let (_frontier, _root, after_index, _after_index_root) = build_storage_context(&after_entries);
-    StorageWriteWitness {
-        entry: new_entry.clone(),
-        index_non_membership_witness: coordinate_index_non_membership_proof(
-            &before_index,
-            &new_entry.coordinates,
-        ),
-        index_membership_witness: coordinate_index_membership_proof(
-            &after_index,
-            &new_entry.coordinates,
-        )
-        .expect("membership proof should exist after write"),
-    }
-}
-
-fn tile_step_with_store_roots(
-    exec_index: u64,
-    coordinates: CfsCoordinates,
-    input_source_commitment: Vec<u8>,
-    output_commitment: Vec<u8>,
-    root_before: Vec<u8>,
-    root_after: Vec<u8>,
-    index_root_before: Vec<u8>,
-    index_root_after: Vec<u8>,
-) -> StepRecord {
-    StepRecord {
-        exec_index,
-        sequence_id: "main".to_string(),
-        coordinates,
-        kind: StepKind::Exec(ExecStep {
-            target: ExecTarget::Tile("tile".to_string()),
-            intra_sequence_index: FIRST_COORDINATE,
-            input_commitment: Vec::new(),
-            input_source_commitment,
-            output_commitment,
-            storage: StorageRoots {
-                root_before,
-                root_after,
-                index_root_before,
-                index_root_after,
-            },
-        }),
-        recur_progress_commitment: RecurProgressStack::new().commitment(),
-        recur_state: None,
-    }
-}
-
 /// A storage binding with a *real* selection, unlike `storage_input_witness`
 /// whose `selected_len` is 0 and so never reaches the selection branch at all.
 /// Returns the input witness plus both witness shapes for it.
@@ -677,6 +551,27 @@ fn selecting_input_witness(
     (input, root.to_vec(), with_payload, as_reference)
 }
 
+/// The storage check as the storage guest runs it, on one step from
+/// `frontier`/`index_root`. For tests that drive it next to another family's
+/// check; its own tests live in the storage guest.
+fn verify_storage_transition(
+    step_record: &StepRecord,
+    input_source_witness: Option<&FnInput>,
+    storage_selection_witnesses: &BTreeMap<String, SelectionWitness>,
+    storage_witness: Option<&StorageWitness>,
+    frontier: &NonEmptyFrontier<Bytes>,
+    index_root: &[u8],
+) -> raster_core::storage_check::StorageState {
+    let mut store = StorageCursor::new(&crate::merkle_tree::serialize_frontier(frontier), index_root.to_vec());
+    store.verify_step(&StorageInput {
+        step_record,
+        input_source_witness,
+        storage_selection_witnesses,
+        storage_witness,
+    });
+    store.state()
+}
+
 fn sequence_start_step(coordinates: CfsCoordinates, input_source_commitment: Vec<u8>) -> StepRecord {
     StepRecord {
         exec_index: 1,
@@ -689,29 +584,6 @@ fn sequence_start_step(coordinates: CfsCoordinates, input_source_commitment: Vec
         recur_progress_commitment: RecurProgressStack::new().commitment(),
         recur_state: None,
     }
-}
-
-/// Drive only the witness-shape rule, which runs before the storage-roots
-/// guard and so is the only part of `verify_storage_transition` a
-/// `SequenceStart` reaches at all.
-fn check_witness_shape(
-    step: &StepRecord,
-    input: &FnInput,
-    witness: raster_core::input::SelectionWitness,
-    name: &str,
-) {
-    let (mut frontier, _root, _index, index_root) = build_storage_context(&[]);
-    let witnesses: BTreeMap<String, raster_core::input::SelectionWitness> =
-        [(name.to_string(), witness)].into_iter().collect();
-    let _ = verify_storage_transition(
-        step,
-        Some(input),
-        &witnesses,
-        None,
-        None,
-        &mut frontier,
-        &index_root,
-    );
 }
 
 #[test]
@@ -776,322 +648,6 @@ fn a_committed_input_source_must_carry_its_witness() {
     let (input, ..) = selecting_input_witness("arg", CfsCoordinates(vec![1]));
     let step = sequence_start_step(CfsCoordinates(vec![2]), input_source_commitment(&input));
     verify_input_source_anchored(&step, None);
-}
-
-#[test]
-fn a_forwarded_sequence_argument_may_omit_its_payload() {
-    // The `merge_buckets` shape: a sequence receives the binding as a
-    // reference and never consumes its bytes, so the root is all the guest
-    // needs and the payload never crosses into the zkVM.
-    let (input, _root, _payload, reference) =
-        selecting_input_witness("merge_buckets", CfsCoordinates(vec![]));
-    let step = sequence_start_step(CfsCoordinates(vec![3, 1, 15]), Vec::new());
-    check_witness_shape(&step, &input, reference, "merge_buckets");
-}
-
-#[test]
-#[should_panic(expected = "carries the wrong selection witness shape")]
-fn a_forwarded_sequence_argument_may_not_smuggle_a_payload() {
-    let (input, _root, payload, _reference) =
-        selecting_input_witness("merge_buckets", CfsCoordinates(vec![]));
-    let step = sequence_start_step(CfsCoordinates(vec![3, 1, 15]), Vec::new());
-    check_witness_shape(&step, &input, payload, "merge_buckets");
-}
-
-#[test]
-#[should_panic(expected = "carries the wrong selection witness shape")]
-fn a_recur_source_must_still_carry_its_payload() {
-    // `authenticated_source_len` reads the sweep bound `L` out of this
-    // binding's metadata payload, so it is the one sequence argument a
-    // reference cannot replace.
-    let (input, _root, _payload, reference) =
-        selecting_input_witness("input", CfsCoordinates(vec![]));
-    let step = sequence_start_step(CfsCoordinates(vec![3, 1]), Vec::new());
-    check_witness_shape(&step, &input, reference, "input");
-}
-
-#[test]
-#[should_panic(expected = "carries the wrong selection witness shape")]
-fn a_tile_step_may_not_replace_a_consumed_value_with_a_reference() {
-    // An `Exec` step's tile ran on these bytes, so the payload is the thing
-    // being proved and a root says nothing about it.
-    let (input, _root, _payload, reference) =
-        selecting_input_witness("arg", CfsCoordinates(vec![1]));
-    let step = tile_step_with_store_roots(
-        1,
-        CfsCoordinates(vec![2]),
-        Vec::new(),
-        sha(b"out"),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-    );
-    check_witness_shape(&step, &input, reference, "arg");
-}
-
-#[test]
-fn verify_storage_transition_uses_output_commitment_as_keyed_entry() {
-    let output_commitment = sha(b"out");
-    let new_entry = StorageEntry {
-        coordinates: CfsCoordinates(vec![1]),
-        object_commitment: output_commitment.clone(),
-    };
-    let (mut before_frontier, root_before, _before_index, index_root_before) =
-        build_storage_context(&[]);
-    let (_after_frontier, root_after, _after_index, index_root_after) =
-        build_storage_context(&[new_entry.clone()]);
-    let step = tile_step_with_store_roots(
-        1,
-        new_entry.coordinates.clone(),
-        Vec::new(),
-        output_commitment,
-        root_before.clone(),
-        root_after.clone(),
-        index_root_before.clone(),
-        index_root_after.clone(),
-    );
-    let witness = StorageWitness {
-        reads: Vec::new(),
-        write: Some(build_write_witness(&[], &new_entry)),
-    };
-
-    let (_next_frontier, next_root, next_index_root) = verify_storage_transition(
-        &step,
-        None,
-        &BTreeMap::new(),
-        Some(&b"out".to_vec()),
-        Some(&witness),
-        &mut before_frontier,
-        &index_root_before,
-    );
-
-    assert_eq!(next_root, root_after);
-    assert_eq!(next_index_root, index_root_after);
-}
-
-#[test]
-#[should_panic(expected = "Coordinate-index non-membership proof is invalid before write")]
-fn verify_storage_transition_rejects_duplicate_coordinates() {
-    let existing_entry = StorageEntry {
-        coordinates: CfsCoordinates(vec![1]),
-        object_commitment: sha(b"existing"),
-    };
-    let (mut before_frontier, root_before, before_index, index_root_before) =
-        build_storage_context(&[existing_entry.clone()]);
-    let step = tile_step_with_store_roots(
-        1,
-        existing_entry.coordinates.clone(),
-        Vec::new(),
-        sha(b"out"),
-        root_before.clone(),
-        root_before,
-        index_root_before.clone(),
-        index_root_before.clone(),
-    );
-    let witness = StorageWitness {
-        reads: Vec::new(),
-        write: Some(StorageWriteWitness {
-            entry: StorageEntry {
-                coordinates: existing_entry.coordinates.clone(),
-                object_commitment: sha(b"out"),
-            },
-            index_non_membership_witness:
-                raster_core::transition::CoordinateIndexNonMembershipProof {
-                    coordinates: existing_entry.coordinates.clone(),
-                    siblings: vec![[0; 32].into(); 256],
-                },
-            index_membership_witness: coordinate_index_membership_proof(
-                &before_index,
-                &existing_entry.coordinates,
-            )
-            .expect("existing coordinate should have membership proof"),
-        }),
-    };
-
-    let _ = verify_storage_transition(
-        &step,
-        None,
-        &BTreeMap::new(),
-        Some(&b"out".to_vec()),
-        Some(&witness),
-        &mut before_frontier,
-        &index_root_before,
-    );
-}
-
-#[test]
-#[should_panic(expected = "Missing storage read witness for coordinates CfsCoordinates([1])")]
-fn verify_storage_transition_rejects_wrong_coordinates_with_correct_bytes() {
-    let prior_entry = StorageEntry {
-        coordinates: CfsCoordinates(vec![10]),
-        object_commitment: sha(b"shared"),
-    };
-    let new_entry = StorageEntry {
-        coordinates: CfsCoordinates(vec![2]),
-        object_commitment: sha(b"out"),
-    };
-    let (mut before_frontier, root_before, _before_index, index_root_before) =
-        build_storage_context(&[prior_entry.clone()]);
-    let (_after_frontier, root_after, _after_index, index_root_after) =
-        build_storage_context(&[prior_entry.clone(), new_entry.clone()]);
-    let input_source_witness = storage_input_witness(
-        CfsCoordinates(vec![1]),
-        prior_entry.object_commitment.clone(),
-    );
-    let step = tile_step_with_store_roots(
-        2,
-        new_entry.coordinates.clone(),
-        input_source_commitment(&input_source_witness),
-        new_entry.object_commitment.clone(),
-        root_before.clone(),
-        root_after,
-        index_root_before.clone(),
-        index_root_after,
-    );
-    let witness = StorageWitness {
-        reads: vec![build_read_witness(&[prior_entry.clone()], &prior_entry)],
-        write: Some(build_write_witness(&[prior_entry], &new_entry)),
-    };
-
-    let _ = verify_storage_transition(
-        &step,
-        Some(&input_source_witness),
-        &BTreeMap::new(),
-        Some(&b"out".to_vec()),
-        Some(&witness),
-        &mut before_frontier,
-        &index_root_before,
-    );
-}
-
-#[test]
-#[should_panic(expected = "Execution-step storage root before does not match current storage root")]
-fn verify_storage_transition_rejects_stale_root() {
-    let new_entry = StorageEntry {
-        coordinates: CfsCoordinates(vec![1]),
-        object_commitment: sha(b"out"),
-    };
-    let (_before_frontier, root_before, _before_index, index_root_before) =
-        build_storage_context(&[]);
-    let (_after_frontier, root_after, _after_index, index_root_after) =
-        build_storage_context(&[new_entry.clone()]);
-    let step = tile_step_with_store_roots(
-        3,
-        new_entry.coordinates.clone(),
-        Vec::new(),
-        new_entry.object_commitment.clone(),
-        root_before,
-        root_after,
-        index_root_before.clone(),
-        index_root_after,
-    );
-    let stale_entry = StorageEntry {
-        coordinates: CfsCoordinates(vec![100]),
-        object_commitment: sha(b"stale"),
-    };
-    let (mut stale_frontier, _stale_root, _stale_index, _stale_index_root) =
-        build_storage_context(&[stale_entry]);
-    let witness = StorageWitness {
-        reads: Vec::new(),
-        write: Some(build_write_witness(&[], &new_entry)),
-    };
-
-    let _ = verify_storage_transition(
-        &step,
-        None,
-        &BTreeMap::new(),
-        Some(&b"out".to_vec()),
-        Some(&witness),
-        &mut stale_frontier,
-        &index_root_before,
-    );
-}
-
-#[test]
-#[should_panic(
-    expected = "Execution-step storage index root before does not match current index root"
-)]
-fn verify_storage_transition_rejects_stale_index_root() {
-    let new_entry = StorageEntry {
-        coordinates: CfsCoordinates(vec![1]),
-        object_commitment: sha(b"out"),
-    };
-    let (mut before_frontier, root_before, _before_index, index_root_before) =
-        build_storage_context(&[]);
-    let (_after_frontier, root_after, _after_index, index_root_after) =
-        build_storage_context(&[new_entry.clone()]);
-    let step = tile_step_with_store_roots(
-        33,
-        new_entry.coordinates.clone(),
-        Vec::new(),
-        new_entry.object_commitment.clone(),
-        root_before,
-        root_after,
-        index_root_before.clone(),
-        index_root_after,
-    );
-    let witness = StorageWitness {
-        reads: Vec::new(),
-        write: Some(build_write_witness(&[], &new_entry)),
-    };
-
-    let _ = verify_storage_transition(
-        &step,
-        None,
-        &BTreeMap::new(),
-        Some(&b"out".to_vec()),
-        Some(&witness),
-        &mut before_frontier,
-        &[9; 32],
-    );
-}
-
-#[test]
-fn verify_storage_transition_accepts_non_empty_initial_state() {
-    let prior_entry = StorageEntry {
-        coordinates: CfsCoordinates(vec![1]),
-        object_commitment: sha(b"prior"),
-    };
-    let new_entry = StorageEntry {
-        coordinates: CfsCoordinates(vec![2]),
-        object_commitment: sha(b"next"),
-    };
-    let (mut before_frontier, root_before, _before_index, index_root_before) =
-        build_storage_context(&[prior_entry.clone()]);
-    let (_after_frontier, root_after, _after_index, index_root_after) =
-        build_storage_context(&[prior_entry.clone(), new_entry.clone()]);
-    let input_source_witness = storage_input_witness(
-        prior_entry.coordinates.clone(),
-        prior_entry.object_commitment.clone(),
-    );
-    let step = tile_step_with_store_roots(
-        4,
-        new_entry.coordinates.clone(),
-        input_source_commitment(&input_source_witness),
-        new_entry.object_commitment.clone(),
-        root_before.clone(),
-        root_after.clone(),
-        index_root_before.clone(),
-        index_root_after.clone(),
-    );
-    let witness = StorageWitness {
-        reads: vec![build_read_witness(&[prior_entry.clone()], &prior_entry)],
-        write: Some(build_write_witness(&[prior_entry], &new_entry)),
-    };
-
-    let (_next_frontier, next_root, next_index_root) = verify_storage_transition(
-        &step,
-        Some(&input_source_witness),
-        &BTreeMap::new(),
-        Some(&b"next".to_vec()),
-        Some(&witness),
-        &mut before_frontier,
-        &index_root_before,
-    );
-
-    assert_eq!(next_root, root_after);
-    assert_eq!(next_index_root, index_root_after);
 }
 
 /// The witness form of an append field: the right edge of the list's Merkle
@@ -3413,7 +2969,7 @@ fn run_site_start(
     store: &[StorageEntry],
     read: Option<&StorageEntry>,
 ) -> RecurProgressStack {
-    let (mut frontier, root, _index, index_root) = build_storage_context(store);
+    let (frontier, root, _index, index_root) = build_storage_context(store);
     if let StepKind::RecurStart(recur_start) = &mut start.kind {
         recur_start.storage = StorageRoots {
             root_before: root.clone(),
@@ -3462,9 +3018,8 @@ fn run_site_start(
         &start,
         Some(&input),
         &witnesses,
-        None,
         storage_witness.as_ref(),
-        &mut frontier,
+        &frontier,
         &index_root,
     );
     progress
@@ -3578,33 +3133,6 @@ fn a_tile_that_returned_nothing_may_not_claim_a_commitment() {
     crate::checks::io::verify_output_root(
         &tile_with_commitment(sha(b"free bytes")),
         &journal_with(None, Vec::new()),
-    );
-}
-
-/// The store half: a writing step kind that wrote nothing records no
-/// commitment.
-#[test]
-#[should_panic(expected = "wrote nothing, so it must record no output commitment")]
-fn a_step_that_wrote_nothing_may_not_record_a_commitment() {
-    let (mut frontier, root, _index, index_root) = build_storage_context(&[]);
-    let step = tile_step_with_store_roots(
-        1,
-        CfsCoordinates(vec![1]),
-        Vec::new(),
-        sha(b"a write that never happened"),
-        root.clone(),
-        root,
-        index_root.clone(),
-        index_root.clone(),
-    );
-    let _ = verify_storage_transition(
-        &step,
-        None,
-        &BTreeMap::new(),
-        None,
-        None,
-        &mut frontier,
-        &index_root,
     );
 }
 
@@ -3837,11 +3365,13 @@ fn a_tile_reading_the_value_inside_an_err_is_rejected() {
 }
 
 /// `authorization-image-id-unpinned` gap 1: a `Next` step must verify its
-/// authorization journal — and its control-flow receipt — against the same
-/// guests as the step before it.
+/// authorization journal — and its control-flow and storage receipts — against
+/// the same guests as the step before it.
 mod authorization_continuity {
     use super::*;
-    use crate::fraud_proof::{assert_authorization_continuity, assert_control_flow_continuity};
+    use crate::fraud_proof::{
+        assert_authorization_continuity, assert_control_flow_continuity, assert_storage_continuity,
+    };
     use raster_core::fingerprint::{BitPacker, Fingerprint};
     use raster_core::transition::{
         InitTransition, OutputAuthorization, TransitionJournal, TransitionState,
@@ -3865,6 +3395,7 @@ mod authorization_continuity {
             transition_image_id: vec![1; 32],
             authorization_image_id,
             control_flow_image_id: vec![5; 32],
+            storage_image_id: vec![8; 32],
             input_manifest_commitment: vec![2; 32],
             program_commitment: vec![3; 32],
             refuted_trace_commitment: vec![4; 32],
@@ -3902,7 +3433,21 @@ mod authorization_continuity {
     fn switching_control_flow_guests_mid_window_is_refused() {
         assert_control_flow_continuity(&journal_naming(vec![7; 32]), &[6; 32]);
     }
+
+    /// And the storage id (`storage-prover` step 4): the previous journal
+    /// names `[8; 32]`.
+    #[test]
+    fn the_same_storage_guest_across_steps_is_accepted() {
+        assert_storage_continuity(&journal_naming(vec![7; 32]), &[8; 32]);
+    }
+
+    #[test]
+    #[should_panic(expected = "Storage image ID is not the same within the fraud proof")]
+    fn switching_storage_guests_mid_window_is_refused() {
+        assert_storage_continuity(&journal_naming(vec![7; 32]), &[9; 32]);
+    }
 }
 
 mod control_flow;
 mod recur;
+mod store;

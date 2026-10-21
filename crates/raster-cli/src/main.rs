@@ -232,7 +232,15 @@ enum Commands {
         /// time, so `1` is one receipt per step. The proof is the same either
         /// way; this only trades receipts against fixed proving work.
         #[arg(long = "control-flow-segment", requires = "audit", default_value = "window")]
-        control_flow_segment: raster_prover::control_flow::ControlFlowSegments,
+        control_flow_segment: raster_prover::segments::SegmentLength,
+
+        /// How many fraud-proof window steps one storage receipt covers, when
+        /// an audit proves fraud: `window` (the default) proves the window's
+        /// storage transitions in one receipt; `<n>` proves them `n` steps at a
+        /// time, so `1` is one receipt per step. Set independently of
+        /// `--control-flow-segment`; the proof is the same either way.
+        #[arg(long = "storage-segment", requires = "audit", default_value = "window")]
+        storage_segment: raster_prover::segments::SegmentLength,
 
         /// Run without authenticated storage: tile outputs are passed as plain
         /// Rust values, nothing is hashed or stored between tiles, and no trace
@@ -513,6 +521,7 @@ fn try_main() -> Result<()> {
             fraud_step,
             audit,
             control_flow_segment,
+            storage_segment,
             no_auth,
             verbose,
             show_output,
@@ -528,7 +537,10 @@ fn try_main() -> Result<()> {
             fraud_proof_config,
             fraud_step.as_ref(),
             audit.as_deref(),
-            control_flow_segment,
+            raster_prover::segments::SegmentLengths {
+                control_flow: control_flow_segment,
+                storage: storage_segment,
+            },
             no_auth,
             verbose,
             show_output,

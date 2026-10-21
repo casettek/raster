@@ -26,7 +26,7 @@ use raster_core::input::{struct_commitments_root, verify_selection_witness, Sele
 use raster_core::trace::{ProgramEndStep, ProgramStartStep, StepKind, StepRecord, StorageData};
 use raster_core::transition::{EntrypointAuthorization, OutputAuthorization, StorageReadWitness};
 
-use crate::checks::store::verify_storage_read_witness;
+use guest_common::storage::verify_storage_read_witness;
 
 /// The coordinate `main`'s entry-argument binding always occupies: the
 /// sequence root itself. The `ProgramStart` step loads the combined entry

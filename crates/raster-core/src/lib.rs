@@ -43,6 +43,10 @@ pub mod manifest;
 #[cfg(feature = "std")]
 pub mod schema;
 #[cfg(feature = "std")]
+pub mod segment_tree;
+#[cfg(feature = "std")]
+pub mod storage_check;
+#[cfg(feature = "std")]
 pub mod transition;
 
 pub use collections::{

@@ -14,6 +14,7 @@ use crate::cfs::CfsCoordinates;
 use crate::control_flow::ControlFlowEvidence;
 use crate::draft::{DraftTransitionWitness, TileReplayJournal};
 use crate::recur_progress::RecurProgressStack;
+use crate::storage_check::{StorageEvidence, StorageState};
 use crate::fingerprint::{Fingerprint, FingerprintAccumulator};
 use crate::input::SelectionWitness;
 use crate::merkle::NodeHash;
@@ -205,8 +206,9 @@ pub struct TransitionInput {
     #[serde(with = "serde_bytes")]
     pub output_witness: Option<Vec<u8>>,
     pub input_source_witness: Option<FnInput>,
+    /// Read here by recur and io, and by the storage guest, which folds them.
+    /// The storage entry commits them, so both guests read the same map.
     pub storage_selection_witnesses: BTreeMap<String, SelectionWitness>,
-    pub storage_witness: Option<StorageWitness>,
     pub draft_transition_witness: Option<DraftTransitionWitness>,
 
     /// This step's control flow: the journal of the segment covering it (whose
@@ -217,6 +219,15 @@ pub struct TransitionInput {
     /// reads go to that guest only. See `docs/proposals/control-flow-prover.md`
     /// §Segments.
     pub control_flow: ControlFlowEvidence,
+
+    /// This step's storage transition: the journal of the storage segment
+    /// covering it (whose receipt is an assumption of this step's proof), this
+    /// step's entry, and the path tying the entry to the journal's root. The
+    /// transition guest verifies all three, equates the entry with its own
+    /// state, and adopts the entry's state after. The append-log and
+    /// coordinate-index proofs go to the storage guest only. See
+    /// `docs/proposals/storage-prover.md`.
+    pub storage: StorageEvidence,
 
     #[serde(with = "serde_bytes")]
     pub authorization_image_id: Vec<u8>,
@@ -270,11 +281,9 @@ pub struct TransitionInput {
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct Transition {
     pub frontier: SerializableFrontier,
-    pub storage_frontier: SerializableFrontier,
-    #[serde(with = "serde_bytes")]
-    pub storage_root: Vec<u8>,
-    #[serde(with = "serde_bytes")]
-    pub storage_index_root: Vec<u8>,
+    /// The store after the last applied step. A state, not a frontier: the
+    /// storage guest appends, and this guest only equates and adopts.
+    pub storage: StorageState,
     pub actual_fingerprint_acc: FingerprintAccumulator,
     pub next_expected_coordinates: Vec<CfsCoordinates>,
     /// Live recur sites, carried across steps in the window.
@@ -385,6 +394,11 @@ pub struct TransitionJournal {
     /// it next to `authorization_image_id`.
     #[serde(with = "serde_bytes")]
     pub control_flow_image_id: Vec<u8>,
+    /// The storage guest every step's storage receipt was verified against,
+    /// asserted continuous across `Next` steps. A relying party pins it next
+    /// to `control_flow_image_id`.
+    #[serde(with = "serde_bytes")]
+    pub storage_image_id: Vec<u8>,
     #[serde(with = "serde_bytes")]
     pub input_manifest_commitment: Vec<u8>,
 

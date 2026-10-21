@@ -7,14 +7,12 @@
 //! take follow from the previous record and the CFS. So every segment can be
 //! proven before the transition chain starts.
 //!
-//! How many steps a segment covers is [`ControlFlowSegments`]: the whole window
+//! How many steps a segment covers is [`SegmentLength`]: the whole window
 //! by default, or any fixed number — one being the per-step mode. The guests
 //! and journals are the same either way. See
 //! `docs/proposals/control-flow-prover.md` §Segments.
 
 use std::collections::{BTreeMap, HashMap};
-use std::num::NonZeroUsize;
-use std::str::FromStr;
 
 use raster_core::cfs::{CfsCoordinates, CfsCursor};
 use raster_core::control_flow::{
@@ -29,6 +27,7 @@ use crate::trace::{
     serializable_frontier_from_trace_frontier, serializable_frontier_into_trace_frontier, Bytes,
     BytesHashable, SerializableFrontier, TraceTreeFrontier,
 };
+use crate::segments::SegmentLength;
 use crate::transition::{write_frame, write_postcard, StepIo};
 use crate::{CONTROL_FLOW_GUEST_ELF, CONTROL_FLOW_GUEST_ID};
 
@@ -42,60 +41,6 @@ fn image_id_bytes(image_id: [u32; 8]) -> Vec<u8> {
 /// The control-flow guest's image id, as the byte encoding journals carry.
 pub fn control_flow_guest_image_id() -> Vec<u8> {
     image_id_bytes(CONTROL_FLOW_GUEST_ID)
-}
-
-/// How many consecutive steps one control-flow receipt covers.
-///
-/// A host-side choice only: the guests, the journal and the transition guest's
-/// check are the same in every mode, so a relying party cannot tell — and need
-/// not care — which one produced a proof.
-///
-/// The default is the whole window. Every segment pays the control-flow
-/// guest's fixed work (program decode, `CfsCursor::new`) and at least one
-/// segment of proving, while a transition step's own cost is one entry and a
-/// logarithmic path whatever the segment's length. Measured on `hello-tiles`
-/// and `prompt-prepare` (dev mode, 2026-10-21), the whole window came out
-/// cheapest or tied — see `docs/proposals/control-flow-prover.md` §Segments.
-/// A fixed length still bounds a single control-flow execution on very long
-/// windows.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum ControlFlowSegments {
-    /// One receipt for the whole window: the guest's fixed work once.
-    #[default]
-    Window,
-    /// One receipt per `n` steps, the last segment possibly shorter. `Steps(1)`
-    /// is the per-step mode; a larger `n` bounds a segment's size on long
-    /// windows.
-    Steps(NonZeroUsize),
-}
-
-impl ControlFlowSegments {
-    /// `0` is the whole window; any other `n` is `n` steps per segment.
-    pub fn from_len(len: usize) -> Self {
-        NonZeroUsize::new(len).map_or(Self::Window, Self::Steps)
-    }
-
-    /// The segment length for a window of `window_len` steps.
-    fn len_for(self, window_len: usize) -> usize {
-        match self {
-            Self::Window => window_len.max(1),
-            Self::Steps(n) => n.get(),
-        }
-    }
-}
-
-impl FromStr for ControlFlowSegments {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "window" => Ok(Self::Window),
-            n => n
-                .parse::<usize>()
-                .map(Self::from_len)
-                .map_err(|_| format!("expected `window` or a number of steps, got `{n}`")),
-        }
-    }
 }
 
 /// One proven segment: its receipt, its journal, and the entries the journal's
@@ -221,7 +166,7 @@ pub fn plan_control_flow_segments(
     window: &[StepRecord],
     recorded_step_io: &HashMap<StepRecord, StepIo>,
     sequence_scope_parents: &BTreeMap<u64, (StepRecord, StepRecordWitness)>,
-    segments: ControlFlowSegments,
+    segments: SegmentLength,
 ) -> Vec<ControlFlowSegment> {
     let mut walk = ControlFlowWalk::new(program_frame, initial_frontier);
     window
@@ -263,7 +208,7 @@ impl ProvenControlFlow {
         window: &[StepRecord],
         recorded_step_io: &HashMap<StepRecord, StepIo>,
         sequence_scope_parents: &BTreeMap<u64, (StepRecord, StepRecordWitness)>,
-        segments: ControlFlowSegments,
+        segments: SegmentLength,
     ) -> Self {
         let planned = plan_control_flow_segments(
             program_frame,
@@ -351,7 +296,7 @@ mod tests {
         (steps, io)
     }
 
-    fn plan(segments: ControlFlowSegments) -> Vec<ControlFlowSegment> {
+    fn plan(segments: SegmentLength) -> Vec<ControlFlowSegment> {
         let (steps, io) = window();
         plan_control_flow_segments(
             &program_frame(),
@@ -363,26 +308,14 @@ mod tests {
         )
     }
 
-    #[test]
-    fn the_segment_length_parses_from_the_command_line() {
-        assert_eq!("window".parse(), Ok(ControlFlowSegments::Window));
-        assert_eq!("0".parse(), Ok(ControlFlowSegments::Window));
-        assert_eq!(
-            "1".parse(),
-            Ok(ControlFlowSegments::Steps(NonZeroUsize::new(1).unwrap()))
-        );
-        assert!("one".parse::<ControlFlowSegments>().is_err());
-        assert_eq!(ControlFlowSegments::default(), ControlFlowSegments::Window);
-    }
-
     /// The modes differ only in how the window is cut: one segment, one per
     /// step, or chunks with a shorter tail.
     #[test]
     fn a_window_is_cut_into_segments_by_mode() {
         let lens = |segments| plan(segments).iter().map(|s| s.steps.len()).collect::<Vec<_>>();
-        assert_eq!(lens(ControlFlowSegments::Window), vec![7]);
-        assert_eq!(lens(ControlFlowSegments::from_len(1)), vec![1; 7]);
-        assert_eq!(lens(ControlFlowSegments::from_len(3)), vec![3, 3, 1]);
+        assert_eq!(lens(SegmentLength::Window), vec![7]);
+        assert_eq!(lens(SegmentLength::from_len(1)), vec![1; 7]);
+        assert_eq!(lens(SegmentLength::from_len(3)), vec![3, 3, 1]);
     }
 
     /// Each segment starts where the previous one ended: the frontier has grown
@@ -390,14 +323,14 @@ mod tests {
     /// step's successors. The first starts at the window's own state.
     #[test]
     fn each_segment_starts_where_the_previous_one_ended() {
-        let segments = plan(ControlFlowSegments::from_len(3));
+        let segments = plan(SegmentLength::from_len(3));
         assert_eq!(segments[0].start_frontier.position, 0);
         assert!(segments[0].expected_before.is_none());
         assert_eq!(segments[1].start_frontier.position, 3);
         assert!(segments[1].expected_before.is_some());
         assert_eq!(segments[2].start_frontier.position, 6);
 
-        let whole = plan(ControlFlowSegments::Window);
+        let whole = plan(SegmentLength::Window);
         assert_eq!(whole[0].start_frontier, segments[0].start_frontier);
     }
 

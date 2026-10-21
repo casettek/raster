@@ -16,6 +16,9 @@ postcard = { version = "1.0", features = ["alloc"] }
 
 bridgetree = "0.7"
 
+[dev-dependencies]
+guest-common = { path = "../guest_common", features = ["test-fixtures"] }
+
 [profile.release]
 opt-level = 3
 lto = true

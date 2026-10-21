@@ -1,375 +1,111 @@
-//! Checks the storage transition of an execution step: read witnesses
-//! (append-log path + coordinate-index membership + selection witnesses) and
-//! the optional write witness (non-membership before, membership after),
-//! against the recorded before/after roots.
+//! The storage check, as the transition guest consumes it: the storage guest
+//! proves the storage transitions of a segment of steps and commits a root over
+//! one entry per step; this verifies that receipt, checks this step's entry
+//! against the root, holds every field of it the transition guest also holds to
+//! its own value, and returns the store after the step for the caller to adopt.
+//! The segment may be this step alone or the whole window; nothing here depends
+//! on which. See `docs/proposals/storage-prover.md`.
+//!
+//! The check itself — reads, the write, the witness shape — is
+//! `guest_common::storage`. Its read half stays callable here
+//! (`verify_storage_read_witness`) for the reads recur and entrypoint make
+//! against the roots this check vouches for.
 
 use std::collections::BTreeMap;
 
-use bridgetree::NonEmptyFrontier;
+use risc0_zkvm::guest::env;
 
-use raster_core::cfs::CfsCoordinates;
-use raster_core::coordinate_index::{
-    verify_coordinate_index_membership, verify_coordinate_index_non_membership,
+use raster_core::input::SelectionWitness;
+use raster_core::storage_check::{
+    selection_witnesses_commitment, StorageEvidence, StorageState, StorageStepEntry,
 };
-use raster_core::input::{
-    verify_bytes_page_geometry, verify_selection_reference_witness, verify_selection_witness,
-};
-use raster_core::trace::{FnInput, StepRecord, StorageRoots};
-use raster_core::transition::{
-    SerializableFrontier, StorageEntry, StorageLogWitness, StorageReadWitness, StorageWitness,
-    StorageWriteWitness,
-};
+use raster_core::trace::{FnInput, StepRecord};
 
-use crate::merkle_tree::{
-    combine_merkle_level, frontier_root, serialize_frontier, sha256_bytes, Bytes,
-};
+use crate::checks::io::input_source_commitment;
+use crate::merkle_tree::hash_trace_item;
 
-pub fn storage_leaf_hash(entry: &StorageEntry) -> Vec<u8> {
-    sha256_bytes(&entry.to_bytes())
+/// What the transition guest holds about the step the storage guest checked:
+/// its own copy of every input both guests read, and its own store before the
+/// step.
+pub struct StorageFacts<'a> {
+    pub step_record: &'a StepRecord,
+    pub input_source_witness: Option<&'a FnInput>,
+    /// Read again here by recur and io, which rely on the storage check having
+    /// folded them.
+    pub storage_selection_witnesses: &'a BTreeMap<String, SelectionWitness>,
+    /// The trace frontier's position before this step is appended.
+    pub trace_position: u64,
+    /// The store before this step.
+    pub before: &'a StorageState,
 }
 
-fn append_log_root_from_witness(entry: &StorageEntry, witness: &StorageLogWitness) -> Vec<u8> {
-    let mut current = storage_leaf_hash(entry);
-    for (level, sibling) in witness.path_elems.iter().enumerate() {
-        current = if ((witness.position >> level) & 1) == 0 {
-            combine_merkle_level(level, &current, sibling.as_slice())
-        } else {
-            combine_merkle_level(level, sibling.as_slice(), &current)
-        };
-    }
-    current
+/// Verify the storage receipt covering this step and return the store after
+/// it.
+///
+/// The `env::verify` is unconditional: every step carries evidence, so no step
+/// skips the storage check by omitting it. Every step verifies the receipt, its
+/// entry's path and its entry's fields itself, even when several steps share
+/// one segment: each transition step is its own execution, handed its evidence
+/// by the host, so a check another step made says nothing about this one.
+pub fn verify_storage(
+    storage_image_id: &[u8],
+    evidence: &StorageEvidence,
+    facts: &StorageFacts<'_>,
+) -> StorageState {
+    let image_id = risc0_zkvm::sha::Digest::try_from(storage_image_id)
+        .expect("storage image id must be 32 bytes");
+    env::verify(image_id, evidence.journal.encode().as_slice())
+        .expect("Failed to verify storage journal");
+    assert_evidence_matches(evidence, facts).after.clone()
 }
 
-/// Verify a trace-inclusion (append-log + coordinate-index membership) proof
-/// that `coordinates` commits to `commitment` in the store rooted at
-/// `current_log_root`/`current_index_root`. Shared by ordinary per-step
-/// storage reads and by the fraud-proof genesis check that a
-/// window's initial storage state really contains an authorized
-/// entry-argument binding (see `checks::entrypoint`).
-pub(crate) fn verify_storage_read_witness(
-    read_witness: &StorageReadWitness,
-    current_log_root: &[u8],
-    current_index_root: &[u8],
-    coordinates: &CfsCoordinates,
-    commitment: &[u8],
-) {
-    assert_eq!(
-        read_witness.entry.coordinates, *coordinates,
-        "Storage read witness coordinates do not match requested coordinates",
-    );
-    assert_eq!(
-        read_witness.entry.object_commitment, commitment,
-        "Storage read witness commitment does not match requested commitment",
+/// Check that the evidence's entry is the segment's entry for this step, then
+/// hold each field to the transition guest's own value. Returns the entry.
+///
+/// Each equality covers one input both guests hold, so a receipt for some
+/// other step, store or witness set is refused. The storage witness is absent
+/// by design: only the storage guest reads it, and it checked it against
+/// `before` and the record's roots, which are here.
+pub fn assert_evidence_matches<'e>(
+    evidence: &'e StorageEvidence,
+    facts: &StorageFacts<'_>,
+) -> &'e StorageStepEntry {
+    assert!(
+        evidence.journal.index_of(facts.trace_position).is_some(),
+        "storage segment does not cover trace position {}",
+        facts.trace_position,
     );
     assert!(
-        verify_coordinate_index_membership(current_index_root, &read_witness.index_witness),
-        "Storage coordinate-index membership proof is invalid",
+        evidence.entry_is_committed_at(facts.trace_position),
+        "storage entry for trace position {} is not the one the segment committed",
+        facts.trace_position,
+    );
+    let entry = &evidence.entry;
+    assert_eq!(
+        entry.step_record_hash,
+        hash_trace_item(facts.step_record),
+        "storage and transition checks ran on different step records",
     );
     assert_eq!(
-        read_witness.index_witness.coordinates, *coordinates,
-        "Coordinate-index witness coordinates do not match storage input",
+        entry.input_source_commitment,
+        facts.input_source_witness.map(input_source_commitment),
+        "storage and transition checks ran on different step arguments",
+    );
+    // Load-bearing: recur and io read these witnesses in this guest assuming
+    // the storage check folded them, and the record anchors them only through
+    // those folds.
+    assert_eq!(
+        entry.selection_witnesses_commitment,
+        selection_witnesses_commitment(facts.storage_selection_witnesses),
+        "storage and transition checks ran on different selection witnesses",
     );
     assert_eq!(
-        read_witness.index_witness.value.object_commitment, commitment,
-        "Coordinate-index witness commitment does not match storage input commitment",
+        entry.trace_position, facts.trace_position,
+        "storage check ran at a different trace position",
     );
     assert_eq!(
-        read_witness.index_witness.value.log_position, read_witness.log_witness.position,
-        "Coordinate-index witness log position does not match append-log witness position",
+        &entry.before, facts.before,
+        "storage check started from a different store",
     );
-    assert_eq!(
-        append_log_root_from_witness(&read_witness.entry, &read_witness.log_witness),
-        current_log_root,
-        "Append-log witness does not match current storage root",
-    );
-}
-
-fn verify_storage_write_witness(
-    write_witness: &StorageWriteWitness,
-    current_index_root: &[u8],
-    next_index_root: &[u8],
-    expected_entry: &StorageEntry,
-    expected_log_position: u64,
-) {
-    assert_eq!(
-        write_witness.entry, *expected_entry,
-        "Storage write witness entry does not match expected append entry",
-    );
-    assert_eq!(
-        write_witness.index_non_membership_witness.coordinates, expected_entry.coordinates,
-        "Coordinate-index non-membership proof coordinates do not match write entry",
-    );
-    assert!(
-        verify_coordinate_index_non_membership(
-            current_index_root,
-            &write_witness.index_non_membership_witness,
-        ),
-        "Coordinate-index non-membership proof is invalid before write",
-    );
-    assert_eq!(
-        write_witness.index_membership_witness.coordinates, expected_entry.coordinates,
-        "Coordinate-index membership proof coordinates do not match write entry",
-    );
-    assert_eq!(
-        write_witness
-            .index_membership_witness
-            .value
-            .object_commitment,
-        expected_entry.object_commitment,
-        "Coordinate-index membership proof commitment does not match write entry",
-    );
-    assert_eq!(
-        write_witness.index_membership_witness.value.log_position, expected_log_position,
-        "Coordinate-index membership proof log position does not match append-log position",
-    );
-    assert_eq!(
-        write_witness.index_non_membership_witness.siblings,
-        write_witness.index_membership_witness.siblings,
-        "Coordinate-index update proof siblings changed across insertion",
-    );
-    assert!(
-        verify_coordinate_index_membership(
-            next_index_root,
-            &write_witness.index_membership_witness
-        ),
-        "Coordinate-index membership proof is invalid after write",
-    );
-}
-
-pub fn verify_storage_transition(
-    step_record: &StepRecord,
-    input_source_witness: Option<&FnInput>,
-    storage_selection_witnesses: &BTreeMap<String, raster_core::input::SelectionWitness>,
-    _output_witness_bytes: Option<&Vec<u8>>,
-    storage_witness: Option<&StorageWitness>,
-    current_frontier: &mut NonEmptyFrontier<Bytes>,
-    current_index_root: &[u8],
-) -> (SerializableFrontier, Vec<u8>, Vec<u8>) {
-    // Runs for *every* step, before the storage-roots guard below. A
-    // `SequenceStart` carries no roots, so it exits that guard immediately —
-    // and a sequence step is exactly where a forwarded binding lives, so a
-    // check placed inside the guard would never see one. Without this, a host
-    // could still hand the guest a payload it has no use for, which is how a
-    // 106 MB `List<MergeBucket>` reached a step whose recorded input was 145
-    // bytes and exhausted the guest heap.
-    if let Some(input_source_witness) = input_source_witness {
-        for (binding_name, storage_meta) in input_source_witness.storage() {
-            if storage_meta.selection.selected_len == 0 {
-                continue;
-            }
-            let Some(witness) = storage_selection_witnesses.get(binding_name.as_str()) else {
-                continue;
-            };
-            let requires_payload = raster_core::trace::binding_requires_payload(
-                &step_record.kind,
-                binding_name.as_str(),
-                input_source_witness.storage(),
-            );
-            assert_eq!(
-                !witness.is_reference_only(),
-                requires_payload,
-                "Storage input '{}' on step {:?} carries the wrong selection witness shape: \
-                 a binding whose value the step consumes must carry its payload, and one the \
-                 step only forwards must omit it",
-                binding_name,
-                step_record.coordinates,
-            );
-        }
-    }
-
-    if let Some(StorageRoots {
-        root_before: storage_root_before,
-        root_after: storage_root_after,
-        index_root_before: storage_index_root_before,
-        index_root_after: storage_index_root_after,
-    }) = step_record.storage_roots()
-    {
-        let current_root = frontier_root(current_frontier);
-        assert_eq!(
-            storage_root_before, &current_root,
-            "Execution-step storage root before does not match current storage root",
-        );
-        assert_eq!(
-            storage_index_root_before, &current_index_root,
-            "Execution-step storage index root before does not match current index root",
-        );
-
-        if let Some(input_source_witness) = input_source_witness {
-            for (binding_name, storage_meta) in input_source_witness.storage() {
-                let read_witness = storage_witness
-                    .and_then(|witness| {
-                        witness.reads.iter().find(|read| {
-                            read.entry.coordinates == storage_meta.coordinates
-                                && read.entry.object_commitment == storage_meta.commitment
-                        })
-                    })
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "Missing storage read witness for coordinates {:?}",
-                            storage_meta.coordinates
-                        )
-                    });
-                verify_storage_read_witness(
-                    read_witness,
-                    &current_root,
-                    current_index_root,
-                    &storage_meta.coordinates,
-                    &storage_meta.commitment,
-                );
-                assert_eq!(
-                    storage_meta.commitment, storage_meta.selection.source_root_hash,
-                    "Storage input '{}' commitment must match raster selection root",
-                    binding_name,
-                );
-                if storage_meta.selection.selected_len > 0 {
-                    let witness = storage_selection_witnesses
-                        .get(binding_name.as_str())
-                        .unwrap_or_else(|| {
-                            panic!(
-                                "Missing storage selection witness for binding '{}'",
-                                binding_name
-                            )
-                        });
-                    // Which mode is legal is decided here, from the record's
-                    // own kind and this step's storage map — never from the
-                    // witness's shape. A prover that could pick would always
-                    // pick the cheaper one.
-                    let requires_payload = raster_core::trace::binding_requires_payload(
-                        &step_record.kind,
-                        binding_name.as_str(),
-                        input_source_witness.storage(),
-                    );
-                    if requires_payload {
-                        assert!(
-                            verify_selection_witness(&storage_meta.selection, witness),
-                            "Storage input '{}' selection witness is invalid",
-                            binding_name,
-                        );
-                        assert!(
-                            verify_bytes_page_geometry(witness),
-                            "Storage input '{}' bytes-page geometry is invalid",
-                            binding_name,
-                        );
-                    } else {
-                        // Forwarded as a reference: the step never saw the
-                        // bytes, so the fold runs from the selected value's
-                        // root and proves only that the reference resolves
-                        // inside an object the store authenticates. Demanding
-                        // the reference shape rather than merely accepting it
-                        // keeps a large payload from being smuggled back in.
-                        assert!(
-                            witness.is_reference_only(),
-                            "Storage input '{}' is forwarded as a reference, so its selection \
-                             witness must omit the payload and carry the selected root",
-                            binding_name,
-                        );
-                        assert!(
-                            verify_selection_reference_witness(&storage_meta.selection, witness),
-                            "Storage input '{}' selection reference witness is invalid",
-                            binding_name,
-                        );
-                    }
-                }
-            }
-
-            // Every binding above is now proved *individually*: its coordinates
-            // commit to its commitment in the store, and its selection witness
-            // folds its payload up to that commitment. What none of that
-            // establishes is where a data-sourced index came from — the element
-            // proof only pins the index the segment claims. Discharge that here,
-            // once, over the whole map, because the obligation is relational:
-            // it is about one binding citing another.
-            //
-            // Placed after the loop deliberately. Running it per-entry would let
-            // a `BoundIndex` cite a binding that had not yet been verified.
-            if let Err(violation) =
-                raster_core::trace::verify_bound_index_bindings(input_source_witness.storage())
-            {
-                panic!("Bound-index binding is invalid: {:?}", violation);
-            }
-        }
-
-        let write_witness = storage_witness.and_then(|witness| witness.write.as_ref());
-
-        match write_witness {
-            Some(write_witness) => {
-                assert!(
-                    step_record.appends_to_storage(),
-                    "Step {:?} does not append to storage, so it must not carry a write witness",
-                    step_record.coordinates,
-                );
-                let object_commitment = step_record
-                    .output_commitment()
-                    .expect("Execution step must expose output commitment")
-                    .clone();
-
-                let expected_entry = StorageEntry {
-                    // A `RecurEnd` sits at `[-s]` and writes the site's
-                    // object at `[s]`; every other writer writes where it sits.
-                    coordinates: step_record.coordinates().opened(),
-                    object_commitment,
-                };
-                current_frontier.append(Bytes(storage_leaf_hash(&expected_entry)));
-                let next_root = frontier_root(current_frontier);
-                let next_position: u64 = current_frontier.position().into();
-                verify_storage_write_witness(
-                    write_witness,
-                    current_index_root,
-                    storage_index_root_after,
-                    &expected_entry,
-                    next_position,
-                );
-                assert_eq!(
-                    storage_root_after, &next_root,
-                    "Execution-step storage root after does not match appended storage root",
-                );
-
-                (
-                    serialize_frontier(current_frontier),
-                    next_root,
-                    storage_index_root_after.clone(),
-                )
-            }
-            None => {
-                // A writing step kind that wrote nothing commits to nothing:
-                // otherwise its output commitment is a free 32-byte field —
-                // entropy for manufacturing a divergence — on every recur
-                // iteration, which never writes (D3).
-                if step_record.appends_to_storage()
-                    && !matches!(step_record.kind, raster_core::trace::StepKind::ProgramStart(_))
-                {
-                    assert!(
-                        step_record
-                            .output_commitment()
-                            .is_none_or(|commitment| commitment.is_empty()),
-                        "Step {:?} wrote nothing, so it must record no output commitment",
-                        step_record.coordinates,
-                    );
-                }
-                assert_eq!(
-                    storage_root_before, storage_root_after,
-                    "Execution-step without storage write must leave append-log root unchanged",
-                );
-                assert_eq!(
-                    storage_index_root_before, storage_index_root_after,
-                    "Execution-step without storage write must leave index root unchanged",
-                );
-                (
-                    serialize_frontier(current_frontier),
-                    current_root,
-                    current_index_root.to_vec(),
-                )
-            }
-        }
-    } else {
-        assert!(
-            storage_witness.is_none(),
-            "Only execution steps may carry storage witnesses",
-        );
-        (
-            serialize_frontier(current_frontier),
-            frontier_root(current_frontier),
-            current_index_root.to_vec(),
-        )
-    }
+    entry
 }

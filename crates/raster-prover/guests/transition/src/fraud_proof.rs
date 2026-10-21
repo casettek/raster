@@ -21,6 +21,7 @@ use raster_core::coordinate_index::coordinate_index_root;
 use raster_core::fingerprint::{Fingerprint, FingerprintAccumulator};
 use raster_core::program::{commitment_of_bytes, ImageId, ProgramDefinition};
 use raster_core::recur_progress::RecurProgressStack;
+use raster_core::storage_check::StorageState;
 use raster_core::trace::{ExecStep, ExecTarget, StepKind, StepRecord};
 use raster_core::transition::{
     EntrypointAuthorization, FingerprintSliceWitness, InitTransition, OutputAuthorization,
@@ -51,13 +52,16 @@ pub struct PublicParams {
     /// Committed to the journal, asserted continuous across the window, and
     /// pinned by the relying party (`verify_fraud_proof_receipt`).
     pub control_flow_image_id: Vec<u8>,
+    /// The guest every step's storage receipt is verified against. Committed,
+    /// held continuous and pinned the same way.
+    pub storage_image_id: Vec<u8>,
 }
 
 impl PublicParams {
     /// Reads the leading host inputs. The host write order is: the program
     /// definition frame (`program.bin` bytes), transition image id,
-    /// control-flow image id, transition input, transition state, and — only
-    /// for `Next` steps — the previous journal (read in
+    /// control-flow image id, storage image id, transition input, transition
+    /// state, and — only for `Next` steps — the previous journal (read in
     /// [`FraudProofWindowContext`]).
     ///
     /// The frame is hashed *before* decoding, so the committed
@@ -70,6 +74,7 @@ impl PublicParams {
             .expect("host must supply a valid ProgramDefinition frame");
         let transition_image_id = frame::read_bytes();
         let control_flow_image_id = frame::read_bytes();
+        let storage_image_id = frame::read_bytes();
         let cfs_cursor = CfsCursor::new(program.cfs.clone());
         Self {
             program,
@@ -77,6 +82,7 @@ impl PublicParams {
             cfs_cursor,
             transition_image_id,
             control_flow_image_id,
+            storage_image_id,
         }
     }
 }
@@ -256,6 +262,7 @@ impl FraudProofWindowContext {
                 assert_manifest_continuity(&prev_journal, input);
                 assert_authorization_continuity(&prev_journal, &input.authorization_image_id);
                 assert_control_flow_continuity(&prev_journal, &params.control_flow_image_id);
+                assert_storage_continuity(&prev_journal, &params.storage_image_id);
                 assert_program_continuity(&prev_journal, params);
 
                 let live = LiveTransition::resume(
@@ -559,6 +566,15 @@ pub(crate) fn assert_control_flow_continuity(
     );
 }
 
+/// Every step of the fraud proof must verify its storage receipt against the
+/// same storage guest, for the reason [`assert_control_flow_continuity`] gives.
+pub(crate) fn assert_storage_continuity(prev_journal: &TransitionJournal, storage_image_id: &[u8]) {
+    assert!(
+        storage_image_id == prev_journal.storage_image_id,
+        "Storage image ID is not the same within the fraud proof",
+    );
+}
+
 /// Every step of the fraud proof must prove execution of the same program —
 /// the frame this step verifies against must hash to the previous journal's
 /// committed program identity.
@@ -573,8 +589,9 @@ fn assert_program_continuity(prev_journal: &TransitionJournal, params: &PublicPa
 /// by applying one verified step.
 pub struct LiveTransition {
     frontier: NonEmptyFrontier<Bytes>,
-    storage_frontier: NonEmptyFrontier<Bytes>,
-    storage_index_root: Vec<u8>,
+    /// The store before the step being applied. The storage guest appends;
+    /// this guest equates its receipt's `before` with this and adopts `after`.
+    storage: StorageState,
     fingerprint_acc: FingerprintAccumulator,
     /// `None` only for the genesis state, where no coordinates are expected yet.
     next_expected_coordinates: Option<Vec<CfsCoordinates>>,
@@ -610,8 +627,11 @@ impl LiveTransition {
 
         Self {
             frontier,
-            storage_frontier,
-            storage_index_root: init_transition.init_storage_index_root.clone(),
+            storage: StorageState {
+                position: storage_frontier.position().into(),
+                root: init_transition.init_storage_root.clone(),
+                index_root: init_transition.init_storage_index_root.clone(),
+            },
             fingerprint_acc: FingerprintAccumulator::new(init_transition.fingerprint.bits_packer),
             next_expected_coordinates: None,
             entrypoint_authorization,
@@ -633,18 +653,10 @@ impl LiveTransition {
     ) -> Self {
         let frontier =
             deserialize_frontier(&transition.frontier).expect("Invalid frontier in input");
-        let storage_frontier = deserialize_frontier(&transition.storage_frontier)
-            .expect("Invalid storage frontier in input");
-        assert_eq!(
-            frontier_root(&storage_frontier),
-            transition.storage_root,
-            "Transition storage root does not match transition storage frontier",
-        );
 
         Self {
             frontier,
-            storage_frontier,
-            storage_index_root: transition.storage_index_root.clone(),
+            storage: transition.storage.clone(),
             fingerprint_acc: transition.actual_fingerprint_acc.clone(),
             next_expected_coordinates: Some(transition.next_expected_coordinates.clone()),
             entrypoint_authorization,
@@ -681,7 +693,9 @@ impl LiveTransition {
     ///   to their authorized commitments,
     /// - recorded IO commitments match the witnesses, and tile steps carry
     ///   a verified replay proof,
-    /// - the storage transition is consistent with the recorded roots,
+    /// - the storage guest's receipt proves the storage transition is
+    ///   consistent with the recorded roots — and its journal agrees with this
+    ///   guest's state, whose store it then advances,
     /// - the draft chain stays continuous,
     /// - the step record is appended to the trace frontier and fingerprint.
     pub fn apply_verified_step(
@@ -709,6 +723,21 @@ impl LiveTransition {
                 expected_before: self.next_expected_coordinates.as_ref(),
             },
         );
+        // The storage guest proved this step's storage transition; hold its
+        // entry to this guest's own state. Its `before` is equated here, ahead
+        // of the recur and entrypoint reads below, so those run against roots
+        // the receipt vouches for; its `after` is adopted at the end.
+        let storage_after = checks::store::verify_storage(
+            &params.storage_image_id,
+            &input.storage,
+            &checks::store::StorageFacts {
+                step_record: &input.step_record,
+                input_source_witness: input.input_source_witness.as_ref(),
+                storage_selection_witnesses: &input.storage_selection_witnesses,
+                trace_position: self.frontier.position().into(),
+                before: &self.storage,
+            },
+        );
         // A recur rule that reads the replay journal, so it sits with the
         // other recur checks rather than in the control-flow check above.
         checks::recur::verify_recur_iteration_chunking(
@@ -734,8 +763,8 @@ impl LiveTransition {
             input.returned_state_read_witness.as_ref(),
             // No step that reads a returned state writes, so the current
             // roots are the ones the read is against.
-            &frontier_root(&self.storage_frontier),
-            &self.storage_index_root,
+            &self.storage.root,
+            &self.storage.index_root,
         );
         if let StepKind::ProgramStart(program_start) = &input.step_record.kind {
             self.entrypoint_authorization = checks::entrypoint::verify_step(
@@ -749,13 +778,12 @@ impl LiveTransition {
             // The output object lives in the current storage state (the
             // frontier reflects every prior step's writes; `ProgramEnd` adds
             // none), so verify the read against the current roots.
-            let current_storage_root = frontier_root(&self.storage_frontier);
             self.output_authorization = checks::entrypoint::verify_program_end(
                 cfs_cursor,
                 &input.step_record,
                 program_end,
-                &current_storage_root,
-                &self.storage_index_root,
+                &self.storage.root,
+                &self.storage.index_root,
                 input.program_output_read_witness.as_ref(),
                 input.program_output_selection_witness.as_ref(),
             );
@@ -769,16 +797,7 @@ impl LiveTransition {
             input.input_source_witness.as_ref(),
             &input.storage_selection_witnesses,
         );
-        let (_, _, next_index_root) = checks::store::verify_storage_transition(
-            &input.step_record,
-            input.input_source_witness.as_ref(),
-            &input.storage_selection_witnesses,
-            input.output_witness.as_ref(),
-            input.storage_witness.as_ref(),
-            &mut self.storage_frontier,
-            &self.storage_index_root,
-        );
-        self.storage_index_root = next_index_root;
+        self.storage = storage_after;
         self.next_expected_coordinates = Some(expected_after);
         self.append_to_trace(&input.step_record);
         self
@@ -850,9 +869,7 @@ impl LiveTransition {
     fn into_transition(self) -> Transition {
         Transition {
             frontier: serialize_frontier(&self.frontier),
-            storage_frontier: serialize_frontier(&self.storage_frontier),
-            storage_root: frontier_root(&self.storage_frontier),
-            storage_index_root: self.storage_index_root,
+            storage: self.storage,
             actual_fingerprint_acc: self.fingerprint_acc,
             next_expected_coordinates: self
                 .next_expected_coordinates
@@ -869,6 +886,7 @@ pub fn commit_journal(
     current_state: TransitionState,
     transition_image_id: Vec<u8>,
     control_flow_image_id: Vec<u8>,
+    storage_image_id: Vec<u8>,
     program_commitment: Vec<u8>,
     refuted_trace_commitment: Vec<u8>,
     window_is_terminal: bool,
@@ -883,6 +901,7 @@ pub fn commit_journal(
         transition_image_id,
         authorization_image_id: input.authorization_image_id.clone(),
         control_flow_image_id,
+        storage_image_id,
         input_manifest_commitment: input
             .authorization_journal
             .input_manifest_commitment

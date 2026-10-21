@@ -18,8 +18,8 @@ use serde::{Deserialize, Serialize};
 use std::vec::Vec;
 
 use crate::cfs::{CfsCoordinates, CfsCursor};
-use crate::hash::{Digest, Sha256};
 use crate::input::Hash32;
+use crate::segment_tree::TreeDomain;
 use crate::trace::{FnInput, StepKind, StepRecord};
 use crate::transition::{SerializableFrontier, StepRecordWitness};
 
@@ -183,92 +183,33 @@ impl ControlFlowEntry {
     /// postcard encoding, so no leaf can be read as an inner node.
     pub fn leaf_hash(&self) -> Hash32 {
         let bytes = postcard::to_allocvec(self).expect("a control-flow entry always encodes");
-        let mut hasher = Sha256::new();
-        hasher.update(ENTRY_LEAF_DOMAIN);
-        hasher.update(&bytes);
-        hasher.finalize().into()
+        CONTROL_FLOW_TREE.leaf_hash(&bytes)
     }
 }
 
-const ENTRY_LEAF_DOMAIN: &[u8] = b"raster/control-flow/entry/v1";
-const ENTRY_NODE_DOMAIN: &[u8] = b"raster/control-flow/node/v1";
-
-fn node_hash(left: &Hash32, right: &Hash32) -> Hash32 {
-    let mut hasher = Sha256::new();
-    hasher.update(ENTRY_NODE_DOMAIN);
-    hasher.update(left);
-    hasher.update(right);
-    hasher.finalize().into()
-}
-
-/// The next level up: pairs hashed, an odd last node carried up unchanged.
-///
-/// Carrying rather than duplicating the odd node means no two different leaf
-/// lists share a root — the duplication ambiguity of Bitcoin's tree — and the
-/// committed `entry_count` fixes the shape on both sides.
-fn next_level(level: &[Hash32]) -> Vec<Hash32> {
-    level
-        .chunks(2)
-        .map(|pair| match pair {
-            [left, right] => node_hash(left, right),
-            [single] => *single,
-            _ => unreachable!("chunks(2) yields one or two"),
-        })
-        .collect()
-}
+/// The control-flow guest's tree over its entries. The domains are the ones it
+/// has always used, so moving the tree into [`crate::segment_tree`] changed no
+/// root.
+pub const CONTROL_FLOW_TREE: TreeDomain = TreeDomain {
+    leaf: b"raster/control-flow/entry/v1",
+    node: b"raster/control-flow/node/v1",
+};
 
 /// The Merkle root over a segment's leaves. Panics on an empty list: a segment
 /// covers at least one step.
 pub fn entries_root(leaves: &[Hash32]) -> Hash32 {
-    assert!(!leaves.is_empty(), "a control-flow segment has at least one entry");
-    let mut level = leaves.to_vec();
-    while level.len() > 1 {
-        level = next_level(&level);
-    }
-    level[0]
+    CONTROL_FLOW_TREE.root(leaves)
 }
 
-/// The sibling hashes from leaf `index` up to the root, skipping levels where
-/// the node is carried up without a sibling.
+/// The sibling hashes from leaf `index` up to the root.
 pub fn entry_path(leaves: &[Hash32], index: usize) -> Vec<Hash32> {
-    assert!(index < leaves.len(), "entry index out of range");
-    let mut path = Vec::new();
-    let mut level = leaves.to_vec();
-    let mut index = index;
-    while level.len() > 1 {
-        if let Some(sibling) = level.get(index ^ 1) {
-            path.push(*sibling);
-        }
-        level = next_level(&level);
-        index /= 2;
-    }
-    path
+    CONTROL_FLOW_TREE.path(leaves, index)
 }
 
 /// Fold `leaf` at `index` of a tree over `count` leaves along `path`. `None`
 /// when the path is the wrong length for that position.
 pub fn root_from_path(leaf: Hash32, index: u64, count: u64, path: &[Hash32]) -> Option<Hash32> {
-    if index >= count {
-        return None;
-    }
-    let mut node = leaf;
-    let mut index = index;
-    let mut len = count;
-    let mut siblings = path.iter();
-    while len > 1 {
-        let has_sibling = (index ^ 1) < len;
-        if has_sibling {
-            let sibling = siblings.next()?;
-            node = if index % 2 == 0 {
-                node_hash(&node, sibling)
-            } else {
-                node_hash(sibling, &node)
-            };
-        }
-        index /= 2;
-        len = len.div_ceil(2);
-    }
-    siblings.next().is_none().then_some(node)
+    CONTROL_FLOW_TREE.root_from_path(leaf, index, count, path)
 }
 
 /// The successor set the control-flow check commits for an honest step:
@@ -287,56 +228,20 @@ pub fn expected_successors(cfs: &CfsCursor, record: &StepRecord) -> Option<Vec<C
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hash::{Digest, Sha256};
 
-    fn leaves(n: u8) -> Vec<Hash32> {
-        (0..n).map(|i| [i; 32]).collect()
-    }
-
-    /// Every leaf of every tree shape up to 17 leaves folds back to the root,
-    /// odd levels included.
+    /// The tree's shape is tested in `segment_tree`; this pins the domains, so
+    /// that every control-flow root stays what it was before the move.
     #[test]
-    fn every_entry_path_folds_to_the_root() {
-        for n in 1..=17u8 {
-            let leaves = leaves(n);
-            let root = entries_root(&leaves);
-            for (index, leaf) in leaves.iter().enumerate() {
-                let path = entry_path(&leaves, index);
-                assert_eq!(
-                    root_from_path(*leaf, index as u64, n as u64, &path),
-                    Some(root),
-                    "n={n} index={index}",
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn a_path_at_another_index_or_with_another_leaf_does_not_fold() {
-        let leaves = leaves(8);
-        let root = entries_root(&leaves);
-        let path = entry_path(&leaves, 3);
-        assert_ne!(root_from_path(leaves[3], 4, 8, &path), Some(root));
-        assert_ne!(root_from_path([9; 32], 3, 8, &path), Some(root));
-        assert_eq!(root_from_path(leaves[3], 8, 8, &path), None, "index past the count");
-    }
-
-    #[test]
-    fn a_path_of_the_wrong_length_does_not_fold() {
-        let leaves = leaves(5);
-        let mut path = entry_path(&leaves, 0);
-        path.push([0; 32]);
-        assert_eq!(root_from_path(leaves[0], 0, 5, &path), None);
-        path.truncate(1);
-        assert_eq!(root_from_path(leaves[0], 0, 5, &path), None);
-    }
-
-    /// Carrying the odd node up, not duplicating it, keeps `[a, b, c]` and
-    /// `[a, b, c, c]` apart.
-    #[test]
-    fn a_duplicated_last_leaf_changes_the_root() {
-        let three = leaves(3);
-        let mut four = three.clone();
-        four.push(three[2]);
-        assert_ne!(entries_root(&three), entries_root(&four));
+    fn the_control_flow_tree_keeps_its_domains() {
+        let leaves: Vec<Hash32> = (0..3u8).map(|i| [i; 32]).collect();
+        let node = |left: &Hash32, right: &Hash32| -> Hash32 {
+            let mut hasher = Sha256::new();
+            hasher.update(b"raster/control-flow/node/v1");
+            hasher.update(left);
+            hasher.update(right);
+            hasher.finalize().into()
+        };
+        assert_eq!(entries_root(&leaves), node(&node(&leaves[0], &leaves[1]), &leaves[2]));
     }
 }

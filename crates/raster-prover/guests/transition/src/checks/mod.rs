@@ -7,8 +7,10 @@
 //!   recur-progress stack.
 //! - [`io`]: recorded input/output/external commitments match the provided
 //!   witnesses, and tile steps carry a verified replay proof.
-//! - [`store`]: the storage transition (reads, optional write, roots)
-//!   is consistent with the recorded before/after roots.
+//! - [`store`]: the storage guest's receipt proves the storage transition
+//!   (reads, optional write, roots) is consistent with the recorded
+//!   before/after roots; this checks the receipt and its entry against this
+//!   guest's state, and hands back the store after the step.
 //! - [`drafts`]: draft transitions chain correctly across tile steps.
 //! - [`entrypoint`]: `main`'s entry-argument binding is authorized against
 //!   the authorization journal, once per step and once per fraud-proof

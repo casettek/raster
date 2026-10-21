@@ -5,7 +5,8 @@
 //! 1. Attach to the chain: genesis state (`Init`) or a recursively verified
 //!    previous transition journal (`Next`).
 //! 2. Verify the step against every recorded commitment (the control-flow
-//!    guest's receipt for the CFS bindings, IO/replay, storage, draft chain)
+//!    guest's receipt for the CFS bindings, the storage guest's receipt for
+//!    the storage transition, IO/replay, draft chain)
 //!    and append it to the trace frontier + fingerprint.
 //! 3. Compare the accumulated fingerprint with the committed one and commit
 //!    the resulting journal (`Next`, or `Finished` on the proven divergence).
@@ -69,6 +70,7 @@ fn main() {
         current_state,
         params.transition_image_id,
         params.control_flow_image_id,
+        params.storage_image_id,
         params.program_commitment,
         window_context.refuted_trace_commitment,
         window_context.window_is_terminal,

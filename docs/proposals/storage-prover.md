@@ -1,7 +1,11 @@
 # Proposal: `storage-prover` — prove the storage transition of a segment of steps in its own guest
 
-Status: **Proposed 2026-10-21** at `0474a76`. Not measured. Step 0 (§Migration) measures the
-storage check's share of a step and has to come first.
+Status: **Implemented 2026-10-21** (§Implementation record). Proposed the same day at `0474a76`.
+Steps 1–4 landed together rather than as separate merges. Measured in dev mode on `hello-tiles`
+(§Measured after implementation): the storage check turned out to be **about two thirds of the
+transition guest's user cycles** on both `hello-tiles` and `prompt-prepare`, so moving it out
+shortens the sequential transition chain by about half while the window's total stays level
+(segments +0% and +7.7%). GPU timing is still to run.
 
 Scope: **a segment of transition steps**, of any length from one step to the whole window, chosen
 by the host. This is the shape [`control-flow-prover`](./control-flow-prover.md) ended with
@@ -386,7 +390,8 @@ with it, and the window's last step's state is never read again.
 
 ## Cost
 
-**Not measured.** What changes per step:
+*Written before implementation. §Measured after implementation has the numbers: the storage check
+was not a control-flow-sized share but most of a step.* What changes per step:
 
 | per step | removed from the transition guest | added |
 | --- | --- | --- |
@@ -429,6 +434,9 @@ isolation, as control-flow's step 6 was.
 | **Expected payoff** | Isolation only (1–2% of a step) | Isolation, plus taking a probably larger share off the sequential chain. Unmeasured |
 
 ## Migration
+
+*All of steps 0–4 are done (§Implementation record). Step 0 was answered by the step-4 build
+itself rather than by a probe inside the monolith.*
 
 0. **Measure.** Wrap `verify_storage_transition` in `env::cycle_count()` (temporary probe) and
    run the windows control-flow used: `hello-tiles --fraud-step 27` (32 steps) and
@@ -491,3 +499,136 @@ step 4 changes the serialized `TransitionInput`, `Transition` and `TransitionJou
   and one receipt once. The two share no checks and the control-flow guest's setup is the cost a
   merge would add to storage, so this is unlikely to pay. Listed because the host already plans
   both on the same window.
+
+## Implementation record (2026-10-21)
+
+Landed as designed, as one change rather than four merges, with the differences below.
+
+**Layout.**
+- `raster-core/src/segment_tree.rs`: `TreeDomain { leaf, node }` with `leaf_hash`, `root`, `path`
+  and `root_from_path`, moved out of `control_flow.rs`. `control_flow::{entries_root, entry_path,
+  root_from_path}` remain as wrappers over `CONTROL_FLOW_TREE`, whose domains are the ones it
+  always used, so no control-flow root moved (`the_control_flow_tree_keeps_its_domains`).
+- `raster-core/src/storage_check.rs`: `StorageState`, `StorageSegmentHeader`, `StorageStep`,
+  `StorageStepEntry`, `StorageJournal`, `StorageEvidence`, `STORAGE_TREE`
+  (`raster/storage/{entry,node}/v1`) and `selection_witnesses_commitment`
+  (`raster/storage/selection-witnesses/v1`).
+- `guest_common/src/storage.rs`: the check, moved from `transition/src/checks/store.rs`. Step 3's
+  `verify_step(frontier, before, input) -> StorageState` became **`StorageCursor`** (`new`,
+  `state`, `verify_step`): the cursor owns the frontier and index root, so `before` is always
+  `cursor.state()` and can't disagree with the frontier it describes. The body of
+  `verify_storage_transition` moved unchanged apart from its signature (it now returns only the
+  index root after) and the anchor call in front of it.
+- `guest_common/src/storage_fixtures.rs`, behind a `test-fixtures` feature: the store fixtures
+  (`build_storage_context`, read and write witnesses, `tile_step_with_store_roots`), shared by
+  both guests' tests instead of copied.
+- `guests/storage`: `main.rs` reads the header, then one frame per step through
+  `segment::verify_segment(header, frame::read)`, which takes a closure so tests can feed it a
+  `Vec`.
+- `transition/src/checks/store.rs` is now the consumer: `StorageFacts`, `verify_storage` and
+  `assert_evidence_matches`, mirroring `checks::control_flow`.
+- Host: `raster_prover::storage` (`storage_guest_image_id`, `plan_storage_segments`,
+  `prove_storage_segment`, `ProvenStorage`), and `raster_prover::segments` with `SegmentLength`
+  (`ControlFlowSegments`, renamed and moved) and `SegmentLengths { control_flow, storage }`.
+  `step_transitions` and the CLI take one `SegmentLengths` instead of a growing list of lengths.
+  CLI: `--storage-segment window|<n>`, next to `--control-flow-segment`. Chain evidence uses the
+  default for both.
+
+**Host walk.** The host appends `sha256(write.entry)` from each step's recorded write witness and
+takes `index_root_after` from each record with roots. It checks nothing: the guest repeats every
+step, and a wrong start is refused at the first step's roots.
+
+**Tests.**
+- Storage guest, 17: the 11 storage-only tests from the transition guest (4 witness-shape, 6
+  `verify_storage_transition_*`, and `a_step_that_wrote_nothing_may_not_record_a_commitment`), each
+  now carrying the input source witness its record commits to, because the check anchors it
+  itself. New: the anchor, `a_segment_carries_the_store_from_step_to_step`,
+  `one_segment_and_one_step_segments_commit_the_same_entries`, a start frontier with the right root
+  at the wrong position (`position 1, [EMPTY_LEAF]` folds to the empty store's root; the first
+  write then lands at log position 2 and the honest index witness is refused), a segment started
+  from another store, and an empty segment.
+- Transition guest, 151: `tests/store.rs` (18) mirrors `tests/control_flow.rs`, with one tamper
+  test per entry field and three cases for the new equality: a committed entry with another
+  selection commitment, an honest entry with one payload byte changed in the transition guest's
+  map, and an extra unread witness in that map. Also another step's entry, a path from the
+  control-flow tree, and a `before` differing only in log position. Two continuity tests for
+  `storage_image_id`. The one test that drives storage next to recur (a site `Start` reading
+  its source) keeps doing so through `StorageCursor`.
+- `raster-core`: the tree tests moved to `segment_tree` (5), plus `storage_check` (4).
+  `raster-prover` host: segment planning (3), `SegmentLength` (2) and the storage pin in
+  `check_fraud_proof_journal`. The in-zkVM `transition_guest_*_authorization_*` tests now prove a
+  real storage receipt as an assumption.
+- All suites pass: the storage, transition and control-flow guests, `raster-core`, `raster-prover`
+  and `raster-cli` (dev mode).
+
+**What moved.** `TransitionInput` (`storage_witness` out, `storage` in), `Transition` (frontier
+and root out, `StorageState` in), `TransitionJournal` (`storage_image_id`), and so the transition
+guest's image id. `StepRecord`, the trace, `commit.bin` and `program_commitment` did not move.
+`hello-tiles` rebuilt from this checkout writes a `Raster.lock` byte-identical to the committed
+one, so no tile id moved either.
+
+**End to end.** `hello-tiles`, `RISC0_DEV_MODE=1`, 32-step windows. `--fraud-step 27` (top level,
+`[11]`) in four modes (`window`/`window`, `window`/`8`, `window`/`1`, `1`/`1` for control
+flow/storage). `47` (a recur-sequence body, `[21, 2, 1]`) and `58` (nested, `[23, 5, 4, 1]`) in
+the default mode. Each one commits, audits and generates a fraud proof, and
+`examples/verify_fraud_proof` accepts the default-mode and `window`/`1` proofs with every inner
+guest pinned.
+
+## Measured after implementation (2026-10-21)
+
+Dev mode, risc0 `SessionStats` per proof (temporary probe, not committed). `hello-tiles
+--fraud-step 27`, the 32-step window (exec 16–47) control-flow §Segments measured. The baseline is
+that section's `window` row at `0474a76`, the same window: the control-flow guest's 2.57M user
+cycles match to the digit.
+
+| mode (control flow / storage) | storage guest | transition guest | control-flow guest | all guests |
+| --- | --- | --- | --- | --- |
+| baseline, no storage guest | — | 45.96M / 63.17M / 69 | 2.57M / 3.41M / 4 | 48.53M / 66.58M / 73 |
+| `window` / `window` (default) | 31.28M / 37.75M / 36 | 13.90M / 31.20M / 33 | 2.57M / 3.41M / 4 | 47.74M / 72.35M / 73 |
+| `window` / `8` | 31.30M / 38.01M / 38 | 13.80M / 31.20M / 33 | same | 47.66M / 72.61M / 75 |
+| `window` / `1` | 31.45M / 43.78M / 53 | 13.65M / 30.15M / 33 | same | 47.67M / 77.33M / 90 |
+| `1` / `1` | 31.45M / 43.78M / 53 | 13.40M / 28.57M / 33 | 7.09M / 16.78M / 32 | 51.94M / 89.13M / 118 |
+
+Each cell is user cycles / total cycles / risc0 segments, summed over the window.
+
+`prompt-prepare --fraud-step 796`: the 16-step window ending at exec 1045 (`emit_merged_piece`,
+`[5, 2, 4, 5]`), one full merge-loop iteration. Built against this checkout in a scratch copy of
+the benchmark project (`prompt-prepare-benchmark` procedure). The baseline is control-flow
+§Segments' `window` row at `0474a76`, 29.29M / 39.58M / 39. Its split by guest uses today's
+control-flow guest (2.11M user, matching that section's 2.11M to the digit), so the baseline
+transition row is derived, not measured on its own.
+
+| mode (control flow / storage) | storage guest | transition guest | control-flow guest | all guests |
+| --- | --- | --- | --- | --- |
+| baseline, no storage guest | — | 27.18M / 36.96M / 36 | 2.11M / 2.62M / 3 | 29.29M / 39.58M / 39 |
+| `window` / `window` (default) | 18.44M / 22.28M / 22 | 8.79M / 17.30M / 17 | 2.11M / 2.62M / 3 | 29.34M / 42.21M / 42 |
+| `window` / `8` | 18.45M / 22.54M / 22 | 8.77M / 17.30M / 17 | same | 29.32M / 42.47M / 42 |
+| `window` / `1` | 18.54M / 24.25M / 34 | 8.69M / 17.30M / 17 | same | 29.34M / 44.17M / 54 |
+| `1` / `1` | 18.54M / 24.25M / 34 | 8.59M / 17.30M / 17 | 4.13M / 8.39M / 16 | 31.26M / 49.94M / 67 |
+
+Every mode generated a fraud proof, and `verify_fraud_proof` accepted the default-mode one.
+
+- **Step 0's answer: the storage check is most of a step.** 31.3M of the transition guest's 46.0M
+  user cycles on `hello-tiles`, 18.4M of 27.2M on `prompt-prepare`: about 68% on both. The proposal expected "several times" control-flow's 1–2%, and the
+  actual share is far larger. The two other windows agree: storage 30.6M and 30.4M against
+  transition 15.2M and 14.9M (`--fraud-step 47` and `58`, default mode).
+- **The sequential chain halves.** The transition guest, which proves one step per execution with
+  each step depending on the last, goes from 46.0M to 13.9M user cycles (−70%), 63.2M to 31.2M
+  total (−51%), and 69 to 33 segments (−52%) on `hello-tiles`. On `prompt-prepare`: 27.2M to 8.8M
+  (−68%), 37.0M to 17.3M (−53%), 36 to 17 segments (−53%). It is now one segment per step plus
+  one.
+- **The window's total stays level.** `hello-tiles`: user cycles −1.6%, total cycles +8.7%,
+  segments unchanged at 73. `prompt-prepare`: user +0.2%, total +6.6%, segments 39 → 42 (+7.7%). The total-cycle increase is the storage guest's paging: one execution touching a window's
+  witnesses, 37.75M total for 31.28M user.
+- **The storage guest's fixed work is negligible.** 32 executions cost 0.17M user cycles more
+  than one (16 cost 0.10M more on `prompt-prepare`). Per-step mode still adds 17 and 12 segments
+  (36 → 53, 22 → 34), since every execution is at least one segment, so `window` stays the
+  default. `8` is within a segment or two of it.
+- **What the halved chain buys depends on provers.** Storage receipts depend on no transition
+  receipt. With two provers, the storage segment (36 and 22 segments) and the transition chain
+  (33 and 17) could run side by side: roughly half the window's wall clock. On one GPU the segment
+  count is the same or slightly higher (+0% and +7.7%), so expect about the same time. The host doesn't exploit this yet:
+  `step_transitions` proves the storage segments, then the chain, in sequence.
+
+**Not measured:** real GPU proving with recursion, where each transition step also resolves one
+more assumption.

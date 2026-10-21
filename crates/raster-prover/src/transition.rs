@@ -11,6 +11,7 @@
 use raster_core::authorization::AuthorizationJournal;
 use raster_core::cfs::ControlFlowSchema;
 use raster_core::control_flow::ControlFlowEvidence;
+use raster_core::storage_check::StorageEvidence;
 use raster_core::draft::DraftTransitionWitness;
 use raster_core::fingerprint::Fingerprint;
 use raster_core::input::SelectionWitness;
@@ -23,7 +24,9 @@ use raster_core::transition::{
 use std::collections::{BTreeMap, HashMap};
 
 use crate::authorization::authorization_guest_image_id;
-use crate::control_flow::{control_flow_guest_image_id, ControlFlowSegments, ProvenControlFlow};
+use crate::control_flow::{control_flow_guest_image_id, ProvenControlFlow};
+use crate::segments::SegmentLengths;
+use crate::storage::{storage_guest_image_id, ProvenStorage};
 use crate::error::{BitPackerError, Result};
 use raster_core::merkle::{NodeHash, EMPTY_LEAF};
 use crate::replay::ReplayResult;
@@ -69,6 +72,9 @@ fn build_transition_input(
     // it is added as an assumption next to the authorization and replay
     // receipts.
     control_flow: ControlFlowEvidence,
+    // This step's storage evidence, likewise; its segment's receipt is an
+    // assumption of this step too.
+    storage: StorageEvidence,
     recorded_step_io: &RecordedStepIo,
     replayed_results: &HashMap<StepRecord, ReplayResult>,
     authorization_journal: &AuthorizationJournal,
@@ -81,15 +87,15 @@ fn build_transition_input(
     // terminal step needs is carried forward on the journal.
     revealed_tail_roots: Option<Vec<NodeHash>>,
 ) -> TransitionInput {
-    // The scope witness goes to the control-flow guest only, which is the
-    // only check that reads it (`ControlFlowWalk::input_for`).
+    // The scope witness goes to the control-flow guest only, and the storage
+    // witness to the storage guest only: each is read by that check alone.
     let StepIo {
         input_witness,
         output_witness,
         input_source_witness,
         sequence_scope_witness: _,
         storage_selection_witnesses,
-        storage_witness,
+        storage_witness: _,
         draft_transition_witness,
         program_output_read_witness,
         program_output_selection_witness,
@@ -119,10 +125,10 @@ fn build_transition_input(
         output_witness,
         input_source_witness,
         storage_selection_witnesses,
-        storage_witness,
         draft_transition_witness,
         authorization_journal: authorization_journal.clone(),
         control_flow,
+        storage,
         entrypoint_membership_witness: entrypoint_membership_witness.cloned(),
         program_output_read_witness,
         program_output_selection_witness,
@@ -230,10 +236,10 @@ pub fn step_transitions(
     // fingerprint is blind to can still be proven. See
     // `TransitionJournal::final_committed_root`.
     revealed_tail_roots: &[NodeHash],
-    // How many steps each control-flow receipt covers: the whole window by
-    // default, or any fixed number (one is the per-step mode). The proof says
-    // the same either way.
-    control_flow_segments: ControlFlowSegments,
+    // How many steps each control-flow and each storage receipt covers: the
+    // whole window by default, or any fixed number (one is the per-step mode),
+    // set per guest. The proof says the same either way.
+    segments: SegmentLengths,
 ) -> Option<risc0_zkvm::Receipt> {
     let prover = risc0_zkvm::default_prover();
 
@@ -247,7 +253,18 @@ pub fn step_transitions(
         trace_window,
         recorded_step_io,
         sequence_scope_parents,
-        control_flow_segments,
+        segments.control_flow,
+    );
+    // Storage segments likewise: the store before each step follows from the
+    // window's initial store and the recorded writes before it.
+    let storage_image_id = storage_guest_image_id();
+    let storage = ProvenStorage::prove(
+        initial_storage_frontier,
+        initial_storage_index_root,
+        initial_frontier.position,
+        trace_window,
+        recorded_step_io,
+        segments.storage,
     );
 
     let init_transition = InitTransition {
@@ -265,10 +282,12 @@ pub fn step_transitions(
 
     for (index, step_record) in trace_window.iter().enumerate() {
         let (control_flow_receipt, control_flow_evidence) = control_flow.for_step(index);
+        let (storage_receipt, storage_evidence) = storage.for_step(index);
 
         let input = build_transition_input(
             step_record,
             control_flow_evidence,
+            storage_evidence,
             recorded_step_io,
             replayed_results,
             authorization_journal,
@@ -315,6 +334,7 @@ pub fn step_transitions(
         let mut builder = risc0_zkvm::ExecutorEnv::builder();
         builder.add_assumption(authorization_receipt.clone());
         builder.add_assumption(control_flow_receipt.clone());
+        builder.add_assumption(storage_receipt.clone());
         if let Some(replay_receipt) = replay_receipt_assumption {
             builder.add_assumption(replay_receipt);
         }
@@ -327,6 +347,7 @@ pub fn step_transitions(
         write_frame(&mut builder, program_frame);
         write_frame(&mut builder, &transition_image_id);
         write_frame(&mut builder, &control_flow_image_id);
+        write_frame(&mut builder, &storage_image_id);
         write_postcard(&mut builder, &input);
         write_postcard(&mut builder, &current_state);
         if let Some(previous_journal) = current_journal {
@@ -352,8 +373,8 @@ pub fn step_transitions(
 
 /// The relying party's verification of a single-program fraud proof: the
 /// receipt is a transition receipt, it reached `Finished`, and the inner guests
-/// its journal names — authorization and control flow — are the known-good
-/// ones.
+/// its journal names — authorization, control flow and storage — are the
+/// known-good ones.
 ///
 /// The authorization id is the check that matters. Every window step verifies
 /// its authorization journal against a host-supplied id, and the guest holds it
@@ -403,6 +424,11 @@ fn check_fraud_proof_journal(journal: &TransitionJournal) -> Result<()> {
             "fraud-proof receipt verified an unknown control-flow guest".to_string(),
         ));
     }
+    if journal.storage_image_id != storage_guest_image_id() {
+        return Err(BitPackerError::InvalidCommitment(
+            "fraud-proof receipt verified an unknown storage guest".to_string(),
+        ));
+    }
     Ok(())
 }
 
@@ -410,6 +436,7 @@ fn check_fraud_proof_journal(journal: &TransitionJournal) -> Result<()> {
 mod tests {
     use super::*;
     use crate::authorization::authorize_external_inputs;
+    use crate::segments::SegmentLength;
     use raster_core::merkle::EMPTY_LEAF;
     use raster_core::authorization::{AuthorizationJournal, ManifestedInputs};
     use raster_core::cfs::{
@@ -542,6 +569,7 @@ mod tests {
         let input = build_transition_input(
             &second_step,
             placeholder_control_flow_evidence(),
+            placeholder_storage_evidence(),
             &recorded_step_io,
             &replayed_results,
             &make_authorization_journal(),
@@ -591,6 +619,7 @@ mod tests {
         let input = build_transition_input(
             &tile_step,
             placeholder_control_flow_evidence(),
+            placeholder_storage_evidence(),
             &recorded_step_io,
             &replayed_results,
             &make_authorization_journal(),
@@ -638,6 +667,7 @@ mod tests {
         let start_input = build_transition_input(
             &sequence_start,
             placeholder_control_flow_evidence(),
+            placeholder_storage_evidence(),
             &recorded_step_io,
             &HashMap::new(),
             &make_authorization_journal(),
@@ -648,6 +678,7 @@ mod tests {
         let end_input = build_transition_input(
             &sequence_end,
             placeholder_control_flow_evidence(),
+            placeholder_storage_evidence(),
             &recorded_step_io,
             &HashMap::new(),
             &make_authorization_journal(),
@@ -703,6 +734,31 @@ mod tests {
         }
     }
 
+    /// Storage evidence for the same tests; nothing reads its fields.
+    fn placeholder_storage_evidence() -> StorageEvidence {
+        let state = raster_core::storage_check::StorageState {
+            position: 0,
+            root: Vec::new(),
+            index_root: Vec::new(),
+        };
+        StorageEvidence {
+            journal: raster_core::storage_check::StorageJournal {
+                first_position: 0,
+                entry_count: 0,
+                entries_root: [0; 32],
+            },
+            entry: raster_core::storage_check::StorageStepEntry {
+                step_record_hash: Vec::new(),
+                input_source_commitment: None,
+                selection_witnesses_commitment: [0; 32],
+                trace_position: 0,
+                before: state.clone(),
+                after: state,
+            },
+            path: Vec::new(),
+        }
+    }
+
     /// A `Finished` journal naming the known-good guests, as an honest
     /// fraud proof commits it.
     fn finished_journal() -> TransitionJournal {
@@ -718,6 +774,7 @@ mod tests {
             transition_image_id: image_id_bytes(TRANSITION_GUEST_ID),
             authorization_image_id: authorization_guest_image_id(),
             control_flow_image_id: control_flow_guest_image_id(),
+            storage_image_id: storage_guest_image_id(),
             input_manifest_commitment: vec![2; 32],
             program_commitment: vec![3; 32],
             refuted_trace_commitment: vec![4; 32],
@@ -752,6 +809,15 @@ mod tests {
         journal.control_flow_image_id = vec![0xCC; 32];
         let error = check_fraud_proof_journal(&journal).expect_err("unknown guest");
         assert!(error.to_string().contains("unknown control-flow guest"), "{error}");
+    }
+
+    /// And the storage id (`storage-prover` step 4).
+    #[test]
+    fn a_journal_naming_another_storage_guest_is_refused() {
+        let mut journal = finished_journal();
+        journal.storage_image_id = vec![0xDD; 32];
+        let error = check_fraud_proof_journal(&journal).expect_err("unknown guest");
+        assert!(error.to_string().contains("unknown storage guest"), "{error}");
     }
 
     #[test]
@@ -838,10 +904,22 @@ mod tests {
             &[make_sequence_start_step()],
             &step_io,
             &BTreeMap::new(),
-            ControlFlowSegments::Window,
+            SegmentLength::Window,
         );
         let (control_flow_receipt, control_flow_evidence) = control_flow.for_step(0);
         let control_flow_receipt = control_flow_receipt.clone();
+        // And its storage receipt: a sequence start touches nothing, so the
+        // store stays the window's empty initial store.
+        let storage = ProvenStorage::prove(
+            &make_init_frontier(),
+            &coordinate_index_root(&BTreeMap::new()),
+            make_init_frontier().position,
+            &[make_sequence_start_step()],
+            &step_io,
+            SegmentLength::Window,
+        );
+        let (storage_receipt, storage_evidence) = storage.for_step(0);
+        let storage_receipt = storage_receipt.clone();
         let input = TransitionInput {
             window_start_recur_progress: None,
             step_record: make_sequence_start_step(),
@@ -851,10 +929,10 @@ mod tests {
             output_witness: None,
             input_source_witness: Some(empty_input_source_witness()),
             storage_selection_witnesses: BTreeMap::new(),
-            storage_witness: None,
             draft_transition_witness: None,
             authorization_journal: authorization,
             control_flow: control_flow_evidence,
+            storage: storage_evidence,
             entrypoint_membership_witness: None,
             program_output_read_witness: None,
             program_output_selection_witness: None,
@@ -886,9 +964,11 @@ mod tests {
             builder.add_assumption(receipt);
         }
         builder.add_assumption(control_flow_receipt);
+        builder.add_assumption(storage_receipt);
         write_frame(&mut builder, &make_minimal_program_frame());
         write_frame(&mut builder, &image_id_bytes(TRANSITION_GUEST_ID));
         write_frame(&mut builder, &control_flow_guest_image_id());
+        write_frame(&mut builder, &storage_guest_image_id());
         write_postcard(&mut builder, &input);
         write_postcard(&mut builder, &state);
         write_postcard(&mut builder, &commitment_header);

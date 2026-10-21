@@ -18,6 +18,8 @@ pub mod chain_fraud;
 pub mod control_flow;
 pub mod error;
 pub mod replay;
+pub mod segments;
+pub mod storage;
 pub mod trace;
 pub mod transition;
 pub mod utils;

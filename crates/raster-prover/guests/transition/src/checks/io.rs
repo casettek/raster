@@ -116,8 +116,8 @@ pub fn verify_step_record(
 /// returned value, computed by the replay, so it is `Some` exactly when the
 /// tile publishes an output; the recorded commitment must then be it. A tile
 /// that publishes none — a recur iteration returning its site's draft or state
-/// (D3) — must record an empty commitment, and `checks::store` requires a step
-/// with an empty commitment to write nothing: together, a tile writes iff its
+/// (D3) — must record an empty commitment, and the storage check requires a
+/// step with an empty commitment to write nothing: together, a tile writes iff its
 /// replay produced an output, and writes exactly that.
 pub(crate) fn verify_output_root(step_record: &StepRecord, replay_journal: &TileReplayJournal) {
     let recorded = step_record
@@ -138,7 +138,8 @@ pub(crate) fn verify_output_root(step_record: &StepRecord, replay_journal: &Tile
 
 /// Every storage-bound argument is the value the tile ran on
 /// (`tile-io-structural-roots` step 2). Its selection witness folds to the
-/// stored object from the selected payload's root (`checks::store`); the
+/// stored object from the selected payload's root (the storage guest, whose
+/// witness map `checks::store` equates with this guest's); the
 /// replay committed the root of each decoded argument; this requires the two
 /// to be the same root, so the bytes the selection proves and the value the
 /// binary executed are the same value.

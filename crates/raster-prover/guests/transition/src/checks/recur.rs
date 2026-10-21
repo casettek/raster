@@ -99,10 +99,11 @@ pub fn verify_recur_iteration_chunking(
 /// a `Start` at all.
 ///
 /// **Authenticated by the same step, not by this function.** A site `Start`
-/// must claim read-only storage roots (`advance_recur_progress`), so
-/// `checks::store` reads the source object against the store and folds this
-/// metadata witness to its commitment. Those checks run later in the step, but
-/// any failure rejects the step, so the `L` read here only stands if they pass.
+/// must claim read-only storage roots (`advance_recur_progress`), so the
+/// storage guest reads the source object against the store and folds this
+/// metadata witness to its commitment, and `checks::store` holds this guest's
+/// witness map to the one it folded. Any failure rejects the step, so the `L`
+/// read here only stands if they pass.
 /// Before the roots, a boundary step got neither check, and a fabricated empty
 /// list swept zero times passed rule 7. See
 /// `docs/proposals/tile-io-structural-roots.md` §Step 1.
@@ -290,7 +291,7 @@ pub(crate) fn verify_returned_state(
             step_record
         )
     });
-    crate::checks::store::verify_storage_read_witness(
+    guest_common::storage::verify_storage_read_witness(
         read_witness,
         current_storage_root,
         current_index_root,
@@ -308,7 +309,8 @@ pub(crate) fn verify_returned_state(
 /// A recur tile iteration's item: its first parameter, the `RecurInput`,
 /// which the driver records as a storage binding under the parameter's own
 /// name — so it is found by position, never by a fixed name — together with
-/// its selection witness, already verified by `checks::store`.
+/// its selection witness, folded by the storage guest — `checks::store` holds
+/// this guest's witness map to the one it folded.
 fn recur_item_selection<'a>(
     step_record: &StepRecord,
     input_source_witness: Option<&'a FnInput>,
@@ -412,7 +414,7 @@ fn site_state_is_output(item: &SequenceChildItem) -> bool {
 
 /// A recur site's stored seed, at its `Start` (D5b): the commitment of its
 /// second argument when the CFS says it carries state and the seed is a whole
-/// stored object — read from storage by `checks::store`, since `RecurStart`
+/// stored object — read from storage by the storage guest, since `RecurStart`
 /// carries storage roots. `None` for an inline seed, which the chain adopts
 /// from iteration 0, and for a selection inside an object, whose value root
 /// the binding does not carry.
@@ -448,7 +450,7 @@ fn site_output_decl(item: &SequenceChildItem) -> Option<&RecurOutputDecl> {
 /// The root a site's object opens at: the CFS's empty root for a creating
 /// site; for a deriving one, the commitment of the base its `Start` reads as
 /// `"output"` — bound to its producer by the CFS input check and read from
-/// storage by `checks::store`, since `RecurStart` carries storage roots.
+/// storage by the storage guest, since `RecurStart` carries storage roots.
 ///
 /// A whole object only: a base selected out of a larger object would need the
 /// selected value's root, which the binding does not carry.
@@ -580,7 +582,7 @@ pub fn advance_recur_progress(
                     // which moves `consumed_total` past it.
                     //
                     // An iteration `Start` is a sequence boundary, so it has
-                    // no storage roots and `checks::store` never folds its
+                    // no storage roots and the storage guest never folds its
                     // witnesses — this check verifies the one it reads. The
                     // object the item names is authenticated when a body tile
                     // reads it, through `verify_sequence_scope_parent`.
@@ -661,8 +663,8 @@ pub fn advance_recur_progress(
         if let Some(kind) = kind {
             match &step_record.kind {
                 // `RecurStart`: open the frame with the authenticated `L`. The
-                // kind carries read-only storage roots, so `checks::store`
-                // reads the source object and folds its metadata witness in
+                // kind carries read-only storage roots, so the storage guest
+                // reads the source object and folds its metadata witness for
                 // this same step.
                 StepKind::RecurStart(_) => {
                     let chunk = match item {
