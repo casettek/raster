@@ -1,14 +1,19 @@
 //! The transition state machine.
 //!
-//! A fraud-proof window is proven one step per guest execution:
+//! A fraud-proof window is proven a segment of consecutive steps per guest
+//! execution — one step, the whole window, or anything between, chosen by the
+//! host (`docs/proposals/transition-segments.md`):
 //!
-//! 1. [`FraudProofWindowContext::establish`] attaches the step to the chain — either a
-//!    genesis state (`Init`) or a recursively verified previous journal
-//!    (`Next`) — and yields the [`LiveTransition`] to advance.
+//! 1. [`FraudProofWindowContext::proceed`] attaches the segment to the chain —
+//!    either a genesis state (`Init`) or a recursively verified previous
+//!    journal (`Next`) — and yields the [`LiveTransition`] to advance.
 //! 2. [`LiveTransition::apply_verified_step`] verifies every recorded aspect
-//!    of the step and folds it into the live state.
-//! 3. [`LiveTransition::finalize`] compares the accumulated fingerprint with
-//!    the committed window fingerprint and decides `Next` vs `Finished`.
+//!    of each step and folds it into the live state, which stays in memory
+//!    from step to step.
+//! 3. [`LiveTransition::reaches_window_end`] compares the accumulated
+//!    fingerprint with the committed window fingerprint after every step, and
+//!    [`LiveTransition::into_state`] decides `Next` vs `Finished` after the
+//!    execution's last one.
 //! 4. [`commit_journal`] commits the resulting [`TransitionJournal`].
 
 use std::collections::BTreeMap;
@@ -566,6 +571,42 @@ pub(crate) fn assert_control_flow_continuity(
     );
 }
 
+/// A step that is not a window's opening step must carry none of the inputs
+/// only that step reads: the recur seed, the entrypoint membership witness and
+/// the revealed tail roots. Nothing would read them anywhere else, so a value
+/// present there is refused rather than silently ignored — in a segment of
+/// steps as across executions.
+pub(crate) fn assert_init_only_inputs_absent(input: &TransitionInput) {
+    assert!(
+        input.window_start_recur_progress.is_none(),
+        "Only a window's opening step may carry a recur-progress seed",
+    );
+    assert!(
+        input.entrypoint_membership_witness.is_none(),
+        "Only a window's opening step may carry an entrypoint membership witness",
+    );
+    assert!(
+        input.revealed_tail_roots.is_none(),
+        "Only a window's opening step may carry the revealed tail roots",
+    );
+}
+
+/// Every step of a segment is authorized by the journal the segment verified
+/// once, against the same authorization guest: the within-execution form of
+/// [`assert_manifest_continuity`] and [`assert_authorization_continuity`]. The
+/// whole journal is compared, not only its manifest commitment, because the
+/// later steps' entrypoint checks read their own copy.
+pub(crate) fn assert_same_authorization(verified: &TransitionInput, input: &TransitionInput) {
+    assert!(
+        input.authorization_image_id == verified.authorization_image_id,
+        "Authorization image ID is not the same within the fraud proof",
+    );
+    assert!(
+        input.authorization_journal == verified.authorization_journal,
+        "Authorization journal is not the same within a transition segment",
+    );
+}
+
 /// Every step of the fraud proof must verify its storage receipt against the
 /// same storage guest, for the reason [`assert_control_flow_continuity`] gives.
 pub(crate) fn assert_storage_continuity(prev_journal: &TransitionJournal, storage_image_id: &[u8]) {
@@ -702,6 +743,7 @@ impl LiveTransition {
         mut self,
         params: &PublicParams,
         input: &TransitionInput,
+        journals: &mut checks::receipts::VerifiedJournals,
     ) -> Self {
         let program = &params.program;
         let cfs_cursor = &params.cfs_cursor;
@@ -722,6 +764,7 @@ impl LiveTransition {
                 trace_root_before: &trace_root_before,
                 expected_before: self.next_expected_coordinates.as_ref(),
             },
+            journals,
         );
         // The storage guest proved this step's storage transition; hold its
         // entry to this guest's own state. Its `before` is equated here, ahead
@@ -737,6 +780,7 @@ impl LiveTransition {
                 trace_position: self.frontier.position().into(),
                 before: &self.storage,
             },
+            journals,
         );
         // A recur rule that reads the replay journal, so it sits with the
         // other recur checks rather than in the control-flow check above.
@@ -812,21 +856,25 @@ impl LiveTransition {
         self.fingerprint_acc.append(&tree_root);
     }
 
-    /// Decide the next machine state against the committed window fingerprint.
+    /// The fingerprint verdict on the step just applied: `true` when it is the
+    /// window's last item, which must diverge from the commitment.
     ///
-    /// The first window step is committed without comparison. Every later
-    /// step must match the committed fingerprint at its index — except the
-    /// final window item, which must diverge: that divergence is the fraud
-    /// being proven, and it transitions the machine to `Finished`.
+    /// Every window item before the last must match the committed fingerprint
+    /// at its index, and the final item must diverge: that divergence is the
+    /// fraud being proven, and it transitions the machine to `Finished`. There
+    /// is no first-step exception (see [`FraudProofWindowContext`]).
     ///
     /// Entry-argument authorization needs no deadline here: it is
     /// `Established` (or `NotRequired`) from the moment the window opens, so
     /// there is never an unauthorized chain able to reach `Finished`.
-    pub fn finalize(
-        self,
+    ///
+    /// Applied after every step, whether the step ends an execution or not, so
+    /// a segment of steps holds each to the same rule the per-step chain does.
+    pub fn reaches_window_end(
+        &self,
         committed_fingerprint: &Fingerprint,
         final_committed_root: Option<&Vec<u8>>,
-    ) -> TransitionState {
+    ) -> bool {
         let actual_fingerprint: Fingerprint = self.fingerprint_acc.clone().into_fingerprint();
         let last_index = actual_fingerprint.len() - 1;
         let diverges = actual_fingerprint.diff_at_index(last_index, committed_fingerprint);
@@ -852,16 +900,25 @@ impl LiveTransition {
                 "A fraud proof's final step must diverge from the commitment, by fingerprint \
                  entry or by revealed trace root",
             );
-            TransitionState::Finished
+            true
         } else {
             assert!(
                 !diverges,
                 "Every window item before the last must match the commitment; a divergence \
                  here is not the one this window claims to prove",
             );
-            let mut transition = self.into_transition();
-            transition.actual_fingerprint_acc = FingerprintAccumulator::from(actual_fingerprint);
-            TransitionState::Next(transition)
+            false
+        }
+    }
+
+    /// The machine state to commit after the last step of an execution:
+    /// `Finished` on the window's last item, otherwise the live state for the
+    /// next execution to resume from.
+    pub fn into_state(self, reached_window_end: bool) -> TransitionState {
+        if reached_window_end {
+            TransitionState::Finished
+        } else {
+            TransitionState::Next(self.into_transition())
         }
     }
 

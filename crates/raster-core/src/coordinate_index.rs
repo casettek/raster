@@ -161,9 +161,14 @@ fn sha256(parts: &[&[u8]]) -> Vec<u8> {
     hasher.finalize().to_vec()
 }
 
+/// The leaf an empty slot holds: the bottom of [`empty_hashes`], on its own.
+fn empty_leaf_hash() -> Vec<u8> {
+    sha256(&[EMPTY_LEAF_DOMAIN])
+}
+
 fn empty_hashes() -> Vec<Vec<u8>> {
     let mut hashes = vec![Vec::new(); INDEX_BITS + 1];
-    hashes[INDEX_BITS] = sha256(&[EMPTY_LEAF_DOMAIN]);
+    hashes[INDEX_BITS] = empty_leaf_hash();
     for depth in (0..INDEX_BITS).rev() {
         hashes[depth] = combine_node_hash(depth, &hashes[depth + 1], &hashes[depth + 1]);
     }
@@ -279,18 +284,21 @@ pub fn verify_coordinate_index_non_membership(
     root: &[u8],
     proof: &CoordinateIndexNonMembershipProof,
 ) -> bool {
-    let empty = empty_hashes();
-    root_from_proof(
-        &proof.coordinates,
-        &proof.siblings,
-        empty[INDEX_BITS].clone(),
-    )
-    .is_some_and(|computed| computed == root)
+    // Only the empty leaf: the full table is 256 more hashes, which a guest
+    // paid on every write (`storage-prover` §Where the storage guest's
+    // cycles go).
+    root_from_proof(&proof.coordinates, &proof.siblings, empty_leaf_hash())
+        .is_some_and(|computed| computed == root)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_empty_leaf_is_the_bottom_of_the_empty_table() {
+        assert_eq!(empty_leaf_hash(), empty_hashes()[INDEX_BITS]);
+    }
 
     type IndexedEntries<'a> = Vec<(&'a CfsCoordinates, [u8; 32], &'a StorageIndexValue)>;
 

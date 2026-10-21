@@ -277,6 +277,15 @@ pub struct TransitionInput {
     pub revealed_tail_roots: Option<Vec<NodeHash>>,
 }
 
+/// How many window steps one transition-guest execution proves. Read once,
+/// right after the public parameters; the steps' `TransitionInput`s follow one
+/// frame each. One step is the per-step chain; the whole window is one
+/// transition receipt. See `docs/proposals/transition-segments.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransitionSegmentHeader {
+    pub step_count: u64,
+}
+
 /// Result of applying one transition (new frontier and fingerprint state).
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct Transition {

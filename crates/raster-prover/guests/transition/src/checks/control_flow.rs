@@ -6,13 +6,12 @@
 //! this step alone or the whole window; nothing here depends on which. See
 //! `docs/proposals/control-flow-prover.md` §Segments.
 
-use risc0_zkvm::guest::env;
-
 use raster_core::cfs::CfsCoordinates;
 use raster_core::control_flow::{ControlFlowEntry, ControlFlowEvidence};
 use raster_core::trace::{FnInput, StepRecord};
 
 use crate::checks::io::input_source_commitment;
+use crate::checks::receipts::VerifiedJournals;
 use crate::merkle_tree::hash_trace_item;
 
 /// What the transition guest holds about the step the control-flow guest
@@ -31,21 +30,19 @@ pub struct ControlFlowFacts<'a> {
 /// Verify the control-flow receipt covering this step and return the
 /// coordinates the next step may take.
 ///
-/// The `env::verify` is unconditional: every step carries evidence, so no step
-/// skips the control-flow check by omitting it. Every step verifies the
-/// receipt, its entry's path and its entry's fields itself, even when several
-/// steps share one segment: each transition step is its own execution, handed
-/// its evidence by the host, so a check another step made says nothing about
-/// this one.
+/// The receipt check is unconditional: every step carries evidence, so no step
+/// skips the control-flow check by omitting it. Every step checks its entry's
+/// path and fields itself, even when several steps share one segment: a check
+/// another step made says nothing about this one's entry. Only the
+/// `env::verify` of a journal is shared, within one transition execution
+/// (`journals`).
 pub fn verify_control_flow(
     control_flow_image_id: &[u8],
     evidence: &ControlFlowEvidence,
     facts: &ControlFlowFacts<'_>,
+    journals: &mut VerifiedJournals,
 ) -> Vec<CfsCoordinates> {
-    let image_id = risc0_zkvm::sha::Digest::try_from(control_flow_image_id)
-        .expect("control-flow image id must be 32 bytes");
-    env::verify(image_id, evidence.journal.encode().as_slice())
-        .expect("Failed to verify control-flow journal");
+    journals.verify(control_flow_image_id, evidence.journal.encode(), "control-flow");
     assert_evidence_matches(evidence, facts).expected_after.clone()
 }
 

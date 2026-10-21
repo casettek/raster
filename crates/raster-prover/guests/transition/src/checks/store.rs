@@ -13,8 +13,6 @@
 
 use std::collections::BTreeMap;
 
-use risc0_zkvm::guest::env;
-
 use raster_core::input::SelectionWitness;
 use raster_core::storage_check::{
     selection_witnesses_commitment, StorageEvidence, StorageState, StorageStepEntry,
@@ -22,6 +20,7 @@ use raster_core::storage_check::{
 use raster_core::trace::{FnInput, StepRecord};
 
 use crate::checks::io::input_source_commitment;
+use crate::checks::receipts::VerifiedJournals;
 use crate::merkle_tree::hash_trace_item;
 
 /// What the transition guest holds about the step the storage guest checked:
@@ -42,20 +41,19 @@ pub struct StorageFacts<'a> {
 /// Verify the storage receipt covering this step and return the store after
 /// it.
 ///
-/// The `env::verify` is unconditional: every step carries evidence, so no step
-/// skips the storage check by omitting it. Every step verifies the receipt, its
-/// entry's path and its entry's fields itself, even when several steps share
-/// one segment: each transition step is its own execution, handed its evidence
-/// by the host, so a check another step made says nothing about this one.
+/// The receipt check is unconditional: every step carries evidence, so no step
+/// skips the storage check by omitting it. Every step checks its entry's path
+/// and fields itself, even when several steps share one segment: a check
+/// another step made says nothing about this one's entry. Only the
+/// `env::verify` of a journal is shared, within one transition execution
+/// (`journals`).
 pub fn verify_storage(
     storage_image_id: &[u8],
     evidence: &StorageEvidence,
     facts: &StorageFacts<'_>,
+    journals: &mut VerifiedJournals,
 ) -> StorageState {
-    let image_id = risc0_zkvm::sha::Digest::try_from(storage_image_id)
-        .expect("storage image id must be 32 bytes");
-    env::verify(image_id, evidence.journal.encode().as_slice())
-        .expect("Failed to verify storage journal");
+    journals.verify(storage_image_id, evidence.journal.encode(), "storage");
     assert_evidence_matches(evidence, facts).after.clone()
 }
 

@@ -242,6 +242,15 @@ enum Commands {
         #[arg(long = "storage-segment", requires = "audit", default_value = "window")]
         storage_segment: raster_prover::segments::SegmentLength,
 
+        /// How many fraud-proof window steps one transition-guest execution
+        /// proves, when an audit proves fraud: `window` (the default) proves
+        /// the whole window in one transition receipt; `<n>` proves it `n`
+        /// steps at a time, each execution resuming from the previous one's
+        /// journal, so `1` is one receipt per step. The proof is the same
+        /// either way.
+        #[arg(long = "transition-segment", requires = "audit", default_value = "window")]
+        transition_segment: raster_prover::segments::SegmentLength,
+
         /// Run without authenticated storage: tile outputs are passed as plain
         /// Rust values, nothing is hashed or stored between tiles, and no trace
         /// is written. Faster, and not authoritative — results cannot be
@@ -522,6 +531,7 @@ fn try_main() -> Result<()> {
             audit,
             control_flow_segment,
             storage_segment,
+            transition_segment,
             no_auth,
             verbose,
             show_output,
@@ -540,6 +550,7 @@ fn try_main() -> Result<()> {
             raster_prover::segments::SegmentLengths {
                 control_flow: control_flow_segment,
                 storage: storage_segment,
+                transition: transition_segment,
             },
             no_auth,
             verbose,

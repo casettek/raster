@@ -19,7 +19,8 @@ use raster_core::trace::{FnInput, StepRecord};
 use raster_core::recur_progress::RecurProgressStack;
 use raster_core::transition::{
     FingerprintSliceWitness, InitTransition, StepRecordWitness, StorageReadWitness,
-    StorageWitness, TraceCommitmentHeader, TransitionInput, TransitionJournal, TransitionState,
+    StorageWitness, TraceCommitmentHeader, TransitionInput, TransitionJournal,
+    TransitionSegmentHeader, TransitionState,
 };
 use std::collections::{BTreeMap, HashMap};
 
@@ -144,6 +145,23 @@ fn image_id_bytes(image_id: [u32; 8]) -> Vec<u8> {
         .collect()
 }
 
+/// The replay receipt a tile step's transition proof assumes, or `None` for a
+/// step that replays nothing.
+fn replay_receipt(
+    step_record: &StepRecord,
+    replayed_results: &HashMap<StepRecord, ReplayResult>,
+) -> Option<risc0_zkvm::Receipt> {
+    step_record.requires_replay_proof().then(|| {
+        let replay_result = replayed_results.get(step_record).unwrap_or_else(|| {
+            panic!(
+                "Replayed receipt not found for transition step {:?}",
+                step_record
+            )
+        });
+        postcard::from_bytes(&replay_result.receipt).unwrap()
+    })
+}
+
 /// Write one guest input as a frame: a `u32` byte length, then the
 /// bytes. The guest reads it back with two bulk `read_slice` calls (its
 /// `frame` module). Not `builder.write`: risc0's serde makes the guest fetch one
@@ -236,9 +254,9 @@ pub fn step_transitions(
     // fingerprint is blind to can still be proven. See
     // `TransitionJournal::final_committed_root`.
     revealed_tail_roots: &[NodeHash],
-    // How many steps each control-flow and each storage receipt covers: the
-    // whole window by default, or any fixed number (one is the per-step mode),
-    // set per guest. The proof says the same either way.
+    // How many steps each control-flow, storage and transition receipt covers:
+    // the whole window, or any fixed number (one is the per-step mode), set
+    // per guest. The proof says the same either way.
     segments: SegmentLengths,
 ) -> Option<risc0_zkvm::Receipt> {
     let prover = risc0_zkvm::default_prover();
@@ -280,83 +298,88 @@ pub fn step_transitions(
 
     let mut current_state = TransitionState::Init(init_transition);
 
-    for (index, step_record) in trace_window.iter().enumerate() {
-        let (control_flow_receipt, control_flow_evidence) = control_flow.for_step(index);
-        let (storage_receipt, storage_evidence) = storage.for_step(index);
-
-        let input = build_transition_input(
-            step_record,
-            control_flow_evidence,
-            storage_evidence,
-            recorded_step_io,
-            replayed_results,
-            authorization_journal,
-            // Only the `Init` step proves anything about the window's
-            // *initial* store state; later steps inherit the established
-            // fact from the previous journal and never read this.
-            current_journal
-                .is_none()
-                .then_some(entrypoint_membership_witness)
-                .flatten(),
-            // Only the window's first step reads the seed; every later step
-            // inherits the preimage through `Transition`. Same guard, and the
-            // same reason, as `entrypoint_membership_witness` above.
-            //
-            // The seed is never believed: the guest advances it by the step's
-            // own facts and compares against the recorded
-            // `recur_progress_commitment`, so a wrong one is rejected exactly
-            // as an absent one is today.
-            current_journal
-                .is_none()
-                .then(|| window_start_recur_progress.clone())
-                .flatten(),
-            // Same guard again: bound at `Init` against the header, then
-            // carried forward as a single root on the journal.
-            current_journal
-                .is_none()
-                .then(|| revealed_tail_roots.to_vec()),
-        );
-        let replay_receipt_assumption: Option<risc0_zkvm::Receipt> =
-            if step_record.requires_replay_proof() {
-                let replay_result = replayed_results.get(step_record).unwrap_or_else(|| {
-                    panic!(
-                        "Replayed receipt not found for transition step {:?}",
-                        step_record
-                    )
-                });
-                let receipt: risc0_zkvm::Receipt =
-                    postcard::from_bytes(&replay_result.receipt).unwrap();
-                Some(receipt)
-            } else {
-                None
-            };
+    // Each transition execution proves a segment of consecutive steps, handing
+    // over to the next through its `Next` journal. One step is the per-step
+    // chain; the whole window is one transition receipt.
+    let segment_len = segments.transition.len_for(trace_window.len());
+    for (segment_index, segment) in trace_window.chunks(segment_len).enumerate() {
+        let first_index = segment_index * segment_len;
 
         let mut builder = risc0_zkvm::ExecutorEnv::builder();
         builder.add_assumption(authorization_receipt.clone());
-        builder.add_assumption(control_flow_receipt.clone());
-        builder.add_assumption(storage_receipt.clone());
-        if let Some(replay_receipt) = replay_receipt_assumption {
-            builder.add_assumption(replay_receipt);
+        // One assumption per distinct inner receipt: consecutive steps
+        // usually share a control-flow and a storage segment, and the guest
+        // verifies each shared journal once.
+        let mut inner_journals: Vec<Vec<u8>> = Vec::new();
+        let mut inputs = Vec::with_capacity(segment.len());
+        for (offset, step_record) in segment.iter().enumerate() {
+            let index = first_index + offset;
+            // Only the window's opening step reads these; every other step,
+            // in this segment or a later one, carries none.
+            let opens_window = index == 0;
+            let (control_flow_receipt, control_flow_evidence) = control_flow.for_step(index);
+            let (storage_receipt, storage_evidence) = storage.for_step(index);
+            for receipt in [control_flow_receipt, storage_receipt] {
+                if !inner_journals.contains(&receipt.journal.bytes) {
+                    inner_journals.push(receipt.journal.bytes.clone());
+                    builder.add_assumption(receipt.clone());
+                }
+            }
+            if let Some(replay_receipt) = replay_receipt(step_record, replayed_results) {
+                builder.add_assumption(replay_receipt);
+            }
+            inputs.push(build_transition_input(
+                step_record,
+                control_flow_evidence,
+                storage_evidence,
+                recorded_step_io,
+                replayed_results,
+                authorization_journal,
+                // Only the `Init` step proves anything about the window's
+                // *initial* store state; later steps inherit the established
+                // fact and never read this.
+                opens_window
+                    .then_some(entrypoint_membership_witness)
+                    .flatten(),
+                // The seed is never believed: the guest advances it by the
+                // step's own facts and compares against the recorded
+                // `recur_progress_commitment`, so a wrong one is rejected
+                // exactly as an absent one is.
+                opens_window
+                    .then(|| window_start_recur_progress.clone())
+                    .flatten(),
+                // Bound at `Init` against the header, then carried forward as
+                // a single root on the journal.
+                opens_window.then(|| revealed_tail_roots.to_vec()),
+            ));
         }
-        if current_journal.is_some() {
-            let transition_receipt = transition_receipt.unwrap_or_else(|| {
-                panic!("Previous transition receipt is required when previous journal is present")
-            });
-            builder.add_assumption(transition_receipt);
+        if let Some(previous) = transition_receipt.take() {
+            builder.add_assumption(previous);
         }
+
         write_frame(&mut builder, program_frame);
         write_frame(&mut builder, &transition_image_id);
         write_frame(&mut builder, &control_flow_image_id);
         write_frame(&mut builder, &storage_image_id);
-        write_postcard(&mut builder, &input);
+        write_postcard(
+            &mut builder,
+            &TransitionSegmentHeader {
+                step_count: inputs.len() as u64,
+            },
+        );
+        let mut inputs = inputs.into_iter();
+        write_postcard(&mut builder, &inputs.next().expect("a segment has a step"));
         write_postcard(&mut builder, &current_state);
         if let Some(previous_journal) = current_journal {
             write_postcard(&mut builder, &previous_journal);
         } else {
-            // The window-opening `Init` step reads the commitment binding
+            // The window-opening `Init` segment reads the commitment binding
             // right after the state (see the guest's `main`).
             write_postcard(&mut builder, commitment_header);
             write_postcard(&mut builder, fingerprint_slice);
+        }
+        for input in inputs {
+            write_postcard(&mut builder, &input);
         }
         let env = builder.build().unwrap();
         let receipt = prover.prove(env, &TRANSITION_GUEST_ELF).unwrap().receipt;
@@ -969,6 +992,7 @@ mod tests {
         write_frame(&mut builder, &image_id_bytes(TRANSITION_GUEST_ID));
         write_frame(&mut builder, &control_flow_guest_image_id());
         write_frame(&mut builder, &storage_guest_image_id());
+        write_postcard(&mut builder, &TransitionSegmentHeader { step_count: 1 });
         write_postcard(&mut builder, &input);
         write_postcard(&mut builder, &state);
         write_postcard(&mut builder, &commitment_header);

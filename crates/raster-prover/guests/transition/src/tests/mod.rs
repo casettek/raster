@@ -3448,6 +3448,138 @@ mod authorization_continuity {
     }
 }
 
+/// `transition-segments`: within one execution, a step after the first may
+/// carry none of the window-opening inputs, and is authorized by the journal
+/// the segment verified once.
+mod segment_inputs {
+    use super::*;
+    use crate::fraud_proof::{assert_init_only_inputs_absent, assert_same_authorization};
+    use raster_core::control_flow::{ControlFlowEntry, ControlFlowEvidence, ControlFlowJournal};
+    use raster_core::storage_check::{
+        StorageEvidence, StorageJournal, StorageState, StorageStepEntry,
+    };
+    use raster_core::transition::TransitionInput;
+
+    /// A later step's input as an honest host sends it: no window-opening
+    /// inputs. Its evidence is never read by the asserts under test.
+    fn later_step() -> TransitionInput {
+        let state = StorageState {
+            position: 0,
+            root: Vec::new(),
+            index_root: Vec::new(),
+        };
+        TransitionInput {
+            step_record: sequence_start_step(CfsCoordinates(vec![2]), Vec::new()),
+            replay_journal: None,
+            input_witness: None,
+            output_witness: None,
+            input_source_witness: None,
+            storage_selection_witnesses: BTreeMap::new(),
+            draft_transition_witness: None,
+            control_flow: ControlFlowEvidence {
+                journal: ControlFlowJournal {
+                    program_commitment: Vec::new(),
+                    first_position: 0,
+                    entry_count: 1,
+                    entries_root: [0; 32],
+                },
+                entry: ControlFlowEntry {
+                    step_record_hash: Vec::new(),
+                    input_source_commitment: None,
+                    trace_position: 0,
+                    trace_root_before: Vec::new(),
+                    expected_before: None,
+                    expected_after: Vec::new(),
+                },
+                path: Vec::new(),
+            },
+            storage: StorageEvidence {
+                journal: StorageJournal {
+                    first_position: 0,
+                    entry_count: 1,
+                    entries_root: [0; 32],
+                },
+                entry: StorageStepEntry {
+                    step_record_hash: Vec::new(),
+                    input_source_commitment: None,
+                    selection_witnesses_commitment: [0; 32],
+                    trace_position: 0,
+                    before: state.clone(),
+                    after: state,
+                },
+                path: Vec::new(),
+            },
+            authorization_image_id: vec![7; 32],
+            authorization_journal: authorization_journal("arg", &sha(b"arg")),
+            window_start_recur_progress: None,
+            entrypoint_membership_witness: None,
+            program_output_read_witness: None,
+            program_output_selection_witness: None,
+            returned_state_read_witness: None,
+            revealed_tail_roots: None,
+        }
+    }
+
+    #[test]
+    fn a_later_step_without_window_opening_inputs_is_accepted() {
+        assert_init_only_inputs_absent(&later_step());
+    }
+
+    #[test]
+    #[should_panic(expected = "Only a window's opening step may carry a recur-progress seed")]
+    fn a_later_step_carrying_a_recur_seed_is_refused() {
+        let mut input = later_step();
+        input.window_start_recur_progress = Some(RecurProgressStack::new());
+        assert_init_only_inputs_absent(&input);
+    }
+
+    #[test]
+    #[should_panic(expected = "Only a window's opening step may carry an entrypoint membership witness")]
+    fn a_later_step_carrying_an_entrypoint_witness_is_refused() {
+        let entry = StorageEntry {
+            coordinates: CfsCoordinates(vec![]),
+            object_commitment: sha(b"entry"),
+        };
+        let mut input = later_step();
+        input.entrypoint_membership_witness = Some(build_read_witness(&[entry.clone()], &entry));
+        assert_init_only_inputs_absent(&input);
+    }
+
+    #[test]
+    #[should_panic(expected = "Only a window's opening step may carry the revealed tail roots")]
+    fn a_later_step_carrying_tail_roots_is_refused() {
+        let mut input = later_step();
+        input.revealed_tail_roots = Some(Vec::new());
+        assert_init_only_inputs_absent(&input);
+    }
+
+    #[test]
+    fn a_later_step_under_the_verified_authorization_is_accepted() {
+        assert_same_authorization(&later_step(), &later_step());
+    }
+
+    /// A later step naming another authorization guest: the segment verified
+    /// the journal against the first step's id only.
+    #[test]
+    #[should_panic(expected = "Authorization image ID is not the same within the fraud proof")]
+    fn a_later_step_under_another_authorization_guest_is_refused() {
+        let mut input = later_step();
+        input.authorization_image_id = vec![8; 32];
+        assert_same_authorization(&later_step(), &input);
+    }
+
+    /// A later step carrying another journal — here one authorizing a
+    /// different commitment under the same manifest. The segment never
+    /// verified it, and the step's entrypoint check would read it.
+    #[test]
+    #[should_panic(expected = "Authorization journal is not the same within a transition segment")]
+    fn a_later_step_under_another_authorization_journal_is_refused() {
+        let mut input = later_step();
+        input.authorization_journal = authorization_journal("arg", &sha(b"another"));
+        assert_same_authorization(&later_step(), &input);
+    }
+}
+
 mod control_flow;
 mod recur;
 mod store;

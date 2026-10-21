@@ -1,11 +1,14 @@
 //! How many consecutive transition steps one segment guest receipt covers.
 //!
-//! Shared by the two segment guests, control flow
-//! (`--control-flow-segment`) and storage (`--storage-segment`). Each is set
-//! on its own, because their fixed costs differ: the control-flow guest
-//! decodes the program and builds a `CfsCursor` per segment, the storage guest
-//! reads no program. See `docs/proposals/control-flow-prover.md` §Segments and
-//! `docs/proposals/storage-prover.md`.
+//! Shared by the three guests that prove a run of window steps: control flow
+//! (`--control-flow-segment`), storage (`--storage-segment`) and the
+//! transition guest (`--transition-segment`). Each is set on its own, because
+//! their fixed costs differ: the control-flow guest decodes the program and
+//! builds a `CfsCursor` per segment, the storage guest reads no program, and a
+//! transition segment hands over to the next through a `Next` journal. See
+//! `docs/proposals/control-flow-prover.md` §Segments,
+//! `docs/proposals/storage-prover.md` and
+//! `docs/proposals/transition-segments.md`.
 
 use std::num::NonZeroUsize;
 use std::str::FromStr;
@@ -62,11 +65,14 @@ impl FromStr for SegmentLength {
     }
 }
 
-/// The segment length of each segment guest, set independently.
+/// The segment length of each guest that proves a run of window steps, set
+/// independently: the control-flow and storage guests, and the transition
+/// guest itself (`docs/proposals/transition-segments.md`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SegmentLengths {
     pub control_flow: SegmentLength,
     pub storage: SegmentLength,
+    pub transition: SegmentLength,
 }
 
 #[cfg(test)]

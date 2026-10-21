@@ -632,3 +632,68 @@ Every mode generated a fraud proof, and `verify_fraud_proof` accepted the defaul
 
 **Not measured:** real GPU proving with recursion, where each transition step also resolves one
 more assumption.
+
+### Where the storage guest's cycles go (2026-10-21)
+
+Temporary `env::cycle_count()` probes inside the storage guest, not committed. Default mode (one
+storage segment per window), the same two windows. User cycles:
+
+| | `hello-tiles`, 32 steps | `prompt-prepare`, 16 steps |
+| --- | --- | --- |
+| whole guest | 31.54M | 18.60M |
+| **coordinate index, read membership** | 6.64M (23 proofs, 288k each) | 7.51M (26, 289k) |
+| **coordinate index, write non-membership** | 9.64M (17, **567k** each) | 2.84M (5, **567k**) |
+| **coordinate index, write membership** | 4.91M (17, 289k) | 1.44M (5, 289k) |
+| *index proofs, subtotal* | *21.18M (67%)* | *11.79M (63%)* |
+| frame read and decode, per step | 4.59M (144k / step) | 3.19M (200k / step) |
+| append-log frontier roots (4 folds per step at ~27.5k) | 2.88M | 1.42M |
+| append-log read paths | 0.61M | 0.69M |
+| selection payload folds | 0.18M (23 folds, 1,343 bytes in all) | 0.36M (24, 2,135 bytes) |
+| selection-map commitment, record hash, anchor, input-source commitment | 0.52M | 0.50M |
+| journal root, commit, entries to stdout | 0.22M | 0.11M |
+
+- **The 256-level coordinate index is two thirds of the guest.** Each proof folds 256 levels
+  at about 1,130 cycles a level. A program holds hundreds to a few thousand objects, so about 10
+  of those levels carry information. The frame decode is mostly the same proofs' siblings: 8 KB per
+  proof, decoded byte by byte.
+- **A non-membership proof costs twice a membership proof, for no reason.**
+  `verify_coordinate_index_non_membership` (`raster-core/src/coordinate_index.rs:278`) calls
+  `empty_hashes()`, which hashes the full 256-level empty-subtree table, to read one entry: the
+  empty leaf, `sha256(EMPTY_LEAF_DOMAIN)`. That is 278k wasted cycles per write, 4.7M (15%) of
+  `hello-tiles`' storage guest and 1.4M (8%) of `prompt-prepare`'s. Computing the leaf alone
+  changes no commitment.
+- **The append-log root is folded four times a step** (the state before, the check's own
+  before-root, the root after the append, the state after) where one fold per write would do. A
+  `StorageCursor` that caches its root saves about two thirds of 2.9M and 1.4M.
+- **Selection payloads are negligible on these programs.** At most 178 bytes per fold. The
+  "payload-free" item in §Deferred is not motivated by these windows.
+
+What that leaves, by size and by cost:
+1. **Free fixes, no commitment change:** compute only the empty leaf in non-membership, and cache
+   the frontier root. Together about 22% of `hello-tiles`' storage guest and 14% of
+   `prompt-prepare`'s.
+2. **Cheaper levels, no commitment change:** `combine_node_hash` builds a `Vec` per level through
+   `sha256(&[…])`. At about 1,130 cycles for two accelerated SHA blocks, most of a level is
+   allocation and copying, not hashing. Fixed-size buffers would cut each level without touching
+   any root.
+3. **A shallower index, commitment change:** a sparse Merkle tree that stops at the depth where a
+   key becomes unique (Jellyfish/Patricia style) needs about log₂(objects) levels per proof
+   instead of 256. On these numbers that is most of the 21.2M and 11.8M, plus most of the frame
+   decode. It changes the index root, so the recorder, `commit.bin` and the guest move together.
+   It is also `storage-write-cost`'s Term 2 on the host side, where the same index is 93% of an
+   append.
+
+**Fix 1 landed (2026-10-21).** `verify_coordinate_index_non_membership` hashes only the empty leaf
+(`empty_leaf_hash`, pinned to the bottom of `empty_hashes` by a test), and `StorageCursor` keeps
+the append-log root, folding it once per write. No commitment moved, and both programs rebuild to
+an unchanged lock. Both functions run only in the guests. Default mode, dev mode:
+
+| | storage guest before | after | window, all guests, after |
+| --- | --- | --- | --- |
+| `hello-tiles`, 32 steps | 31.28M / 37.75M / 36 | **24.18M / 29.36M / 28** (−23% user) | 32.98M / 41.16M / 40 |
+| `prompt-prepare`, 16 steps | 18.44M / 22.28M / 22 | **15.81M / 19.14M / 19** (−14% user) | 22.61M / 28.05M / 28 |
+
+The predicted 22% and 14%. Against `0474a76`, before `storage-prover` and
+`transition-segments`, a window is now 73 → 40 and 39 → 28 segments, with total cycles −38% and
+−29%. Per-step storage (`--storage-segment 1`) on `hello-tiles`: 25.21M / 33.95M / 46. The index
+proofs are still the largest share, so fix 3 (a shallower index) is where the rest is.

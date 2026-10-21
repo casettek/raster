@@ -51,14 +51,20 @@ pub struct StorageInput<'a> {
 /// the previous step's result.
 pub struct StorageCursor {
     frontier: NonEmptyFrontier<Bytes>,
+    /// `frontier_root(&frontier)`, folded once per write rather than on every
+    /// read of the state (`storage-prover` §Where the storage guest's cycles
+    /// go): it changes only when the frontier does.
+    root: Vec<u8>,
     index_root: Vec<u8>,
 }
 
 impl StorageCursor {
     pub fn new(start_frontier: &SerializableFrontier, start_index_root: Vec<u8>) -> Self {
+        let frontier = deserialize_frontier(start_frontier)
+            .expect("host must supply a valid storage frontier");
         Self {
-            frontier: deserialize_frontier(start_frontier)
-                .expect("host must supply a valid storage frontier"),
+            root: frontier_root(&frontier),
+            frontier,
             index_root: start_index_root,
         }
     }
@@ -67,7 +73,7 @@ impl StorageCursor {
     pub fn state(&self) -> StorageState {
         StorageState {
             position: self.frontier.position().into(),
-            root: frontier_root(&self.frontier),
+            root: self.root.clone(),
             index_root: self.index_root.clone(),
         }
     }
@@ -83,12 +89,13 @@ impl StorageCursor {
         // The transition guest anchors its own copy; this anchors the one
         // checked here.
         verify_input_source_anchored(input.step_record, input.input_source_witness);
-        self.index_root = verify_transition(
+        (self.root, self.index_root) = verify_transition(
             input.step_record,
             input.input_source_witness,
             input.storage_selection_witnesses,
             input.storage_witness,
             &mut self.frontier,
+            &self.root,
             &self.index_root,
         );
     }
@@ -207,15 +214,18 @@ fn verify_storage_write_witness(
 }
 
 /// The storage transition of one step: advances `current_frontier` past the
-/// step's write, if any, and returns the coordinate-index root after it.
+/// step's write, if any, and returns the append-log and coordinate-index roots
+/// after it. `current_root` is `frontier_root(current_frontier)`, which the
+/// caller keeps.
 fn verify_transition(
     step_record: &StepRecord,
     input_source_witness: Option<&FnInput>,
     storage_selection_witnesses: &BTreeMap<String, SelectionWitness>,
     storage_witness: Option<&StorageWitness>,
     current_frontier: &mut NonEmptyFrontier<Bytes>,
+    current_root: &[u8],
     current_index_root: &[u8],
-) -> Vec<u8> {
+) -> (Vec<u8>, Vec<u8>) {
     // Runs for *every* step, before the storage-roots guard below. A
     // `SequenceStart` carries no roots, so it exits that guard immediately —
     // and a sequence step is exactly where a forwarded binding lives, so a
@@ -255,9 +265,8 @@ fn verify_transition(
         index_root_after: storage_index_root_after,
     }) = step_record.storage_roots()
     {
-        let current_root = frontier_root(current_frontier);
         assert_eq!(
-            storage_root_before, &current_root,
+            storage_root_before, current_root,
             "Execution-step storage root before does not match current storage root",
         );
         assert_eq!(
@@ -282,7 +291,7 @@ fn verify_transition(
                     });
                 verify_storage_read_witness(
                     read_witness,
-                    &current_root,
+                    current_root,
                     current_index_root,
                     &storage_meta.coordinates,
                     &storage_meta.commitment,
@@ -395,7 +404,7 @@ fn verify_transition(
                     "Execution-step storage root after does not match appended storage root",
                 );
 
-                storage_index_root_after.clone()
+                (next_root, storage_index_root_after.clone())
             }
             None => {
                 // A writing step kind that wrote nothing commits to nothing:
@@ -421,7 +430,7 @@ fn verify_transition(
                     storage_index_root_before, storage_index_root_after,
                     "Execution-step without storage write must leave index root unchanged",
                 );
-                current_index_root.to_vec()
+                (current_root.to_vec(), current_index_root.to_vec())
             }
         }
     } else {
@@ -429,6 +438,6 @@ fn verify_transition(
             storage_witness.is_none(),
             "Only execution steps may carry storage witnesses",
         );
-        current_index_root.to_vec()
+        (current_root.to_vec(), current_index_root.to_vec())
     }
 }
