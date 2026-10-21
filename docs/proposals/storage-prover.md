@@ -677,7 +677,7 @@ What that leaves, by size and by cost:
    allocation and copying, not hashing. Fixed-size buffers would cut each level without touching
    any root.
 3. **A shallower index, commitment change:** a sparse Merkle tree that stops at the depth where a
-   key becomes unique (Jellyfish/Patricia style) needs about log₂(objects) levels per proof
+   key becomes unique (a compact sparse Merkle tree, `compact-coordinate-index`) needs about log₂(objects) levels per proof
    instead of 256. On these numbers that is most of the 21.2M and 11.8M, plus most of the frame
    decode. It changes the index root, so the recorder, `commit.bin` and the guest move together.
    It is also `storage-write-cost`'s Term 2 on the host side, where the same index is 93% of an
