@@ -2,7 +2,7 @@
 //! advances — rule 8's item selection, the carried-state chain, the site draft,
 //! the returned state. Unlike the control-flow check these read the replay
 //! journal, storage roots and the draft step, which is why they live in the
-//! TRANSITION part rather than the control-flow guest. See
+//! transition part rather than the control-flow guest. See
 //! `docs/proposals/control-flow-prover.md` step 5.
 
 use std::collections::BTreeMap;

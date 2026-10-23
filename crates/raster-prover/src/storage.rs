@@ -2,7 +2,7 @@
 //!
 //! The storage guest proves the storage transitions of a segment of
 //! consecutive window steps and commits a `PartSegmentJournal`, producing the
-//! two columns the TRANSITION part consumes. Segments depend on no other
+//! two columns the transition part consumes. Segments depend on no other
 //! receipt: the store before each step follows from the window's initial store
 //! and the writes of the steps before it, all of which the host recorded. So
 //! every segment can be proven at once.
@@ -132,7 +132,7 @@ fn storage_step(step_record: &StepRecord, step_io: &StepIo) -> StorageStep {
 }
 
 /// The store before each step of a window, as the storage part produces it
-/// into the `StoreBefore` column: what the TRANSITION part is handed.
+/// into the `StoreBefore` column: what the transition part is handed.
 pub fn stores_before(
     init: &InitTransition,
     window: &[StepRecord],

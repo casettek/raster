@@ -1,5 +1,5 @@
 //! Shared types for a fraud window's guests and host: the window's initial
-//! state, the storage witnesses, the TRANSITION part's inputs, and the two
+//! state, the storage witnesses, the transition part's inputs, and the two
 //! authorization stages the window's journal reports.
 //!
 //! They live in raster-core to avoid circular dependencies (a guest cannot
@@ -217,7 +217,7 @@ pub struct StorageWitness {
     pub write: Option<StorageWriteWitness>,
 }
 
-/// The first frame the TRANSITION part's guest reads after the program frame
+/// The first frame the transition part's guest reads after the program frame
 /// (`transition-split`); the segment's steps follow, one
 /// [`TransitionStep`] frame each. A segment reads no receipt: FRAUD WINDOW
 /// stitches its chains and state to its neighbours', and verifies the replay
@@ -251,7 +251,7 @@ pub struct TransitionPartHeader {
     pub entrypoint_membership_witness: Option<StorageReadWitness>,
 }
 
-/// One step of a TRANSITION part segment: what the semantic checks read, and
+/// One step of a transition part segment: what the semantic checks read, and
 /// the `StoreBefore` column's value — the store before the step, as the
 /// storage part produced it.
 #[derive(Clone, Serialize, Deserialize)]
@@ -298,7 +298,7 @@ pub struct InitTransition {
 ///   is already at `[]` in the window's initial storage state.
 ///
 /// Either way authorization is `Established` before any later step runs, so
-/// there is no deferred debt to discharge at the window's end. The TRANSITION
+/// there is no deferred debt to discharge at the window's end. The transition
 /// part carries it in its state, so every later segment inherits the
 /// established fact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

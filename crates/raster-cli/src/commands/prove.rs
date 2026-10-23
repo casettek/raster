@@ -224,7 +224,7 @@ fn storage_state_from_prefix(
 /// coordinate `[]` (the sequence root) of the window's *initial* storage
 /// state, so a window that opens after the program start can still tie its
 /// execution to the public manifest (see `checks::entrypoint` in the
-/// TRANSITION part's guest).
+/// transition part's guest).
 ///
 /// `None` when the binding is not in the initial state — which is the normal
 /// case for a window covering the start of the trace, where the
@@ -322,6 +322,13 @@ fn build_program_frame(cfs: &ControlFlowSchema, replayer: &Replayer) -> Vec<u8> 
         .canonical_bytes()
 }
 
+// TEMP(cycle-probe)
+pub(crate) fn phase_probe(name: &str) {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let start = START.get_or_init(std::time::Instant::now);
+    eprintln!("PHASEPROBE {name} at_ms={}", start.elapsed().as_millis());
+}
+
 pub fn prove(
     fraud_evidence: FraudEvidence,
     trace: &Trace,
@@ -332,6 +339,7 @@ pub fn prove(
     trace_commitment: &TraceCommitment,
     options: ProveOptions,
 ) -> risc0_zkvm::Receipt {
+    phase_probe("prove-start"); // TEMP(cycle-probe)
     let mode = ExecutionMode::prove_and_verify();
     let FraudEvidence {
         window: fraud_window,
@@ -356,7 +364,7 @@ pub fn prove(
 
     // The recur-progress stack the window opens with, taken from the last step
     // *before* it. A window opening at index 0 has no predecessor and starts
-    // from the canonical empty stack, which the TRANSITION part reads as `None`.
+    // from the canonical empty stack, which the transition part reads as `None`.
     //
     // Reconstructed here, on the same prefix the store is rebuilt from, and
     // read off the recorder rather than re-derived: a second implementation of
@@ -367,6 +375,7 @@ pub fn prove(
         .checked_sub(1)
         .and_then(|previous| trace_recorder.recur_progress_after(trace[previous].exec_index));
 
+    phase_probe("prefix-storage-done"); // TEMP(cycle-probe)
     for step_record in &fraud_window.items {
         let step_witness = trace_recorder
             .step_witness_at(step_record.coordinates())
@@ -626,6 +635,7 @@ pub fn prove(
         .then(|| build_entrypoint_membership_witness(&initial_storage_state))
         .flatten();
 
+    phase_probe("witness-loop-done"); // TEMP(cycle-probe)
     if let Some(frontier) = SerializableFrontier::from_bytes(&fraud_window.frontier) {
         println!();
         println!("Proving the fraud window...");
@@ -660,9 +670,11 @@ pub fn prove(
             recorded_step_io: &recorded_step_io,
         };
 
+        phase_probe("program-frame-done"); // TEMP(cycle-probe)
         let planned = plan_parts(&setup, options.segments);
+        phase_probe("plan-parts-done"); // TEMP(cycle-probe)
 
-        // The TRANSITION part reads the tile replay journals and the
+        // The transition part reads the tile replay journals and the
         // authorization journal as values: execute them now, and plan its
         // segments, so they are proven in the batch below with everything
         // else rather than after the tiles.
@@ -678,6 +690,7 @@ pub fn prove(
             })
             .collect();
         let replays: ReplayJournals = run_jobs(options.workers, executed).into_iter().collect();
+        phase_probe("tile-exec-done"); // TEMP(cycle-probe)
         let executed_authorization = execute_authorization(&manifested_inputs);
         let transition = plan_transition_part(
             &setup,
@@ -690,6 +703,7 @@ pub fn prove(
             options.segments.transition,
             options.zkvm_segment_po2,
         );
+        phase_probe("plan-transition-done"); // TEMP(cycle-probe)
 
         // Every proof the window needs, none waiting for another: the tile
         // replays, the authorization, and every segment of the four parts.
@@ -729,9 +743,10 @@ pub fn prove(
         let (authorization_receipt, authorization_journal) =
             authorization.expect("the authorization job ran");
 
+        phase_probe("jobs-done"); // TEMP(cycle-probe)
         println!("Proving FRAUD WINDOW over every part's segments...");
         let replay_receipts = fraud_window_replay_receipts(&fraud_window.items, &replayed_results);
-        return prove_fraud_window(
+        let __receipt = prove_fraud_window(
             &setup,
             FraudWindowInputs {
                 segments: &segments,
@@ -742,6 +757,8 @@ pub fn prove(
             },
             options.zkvm_segment_po2,
         );
+        phase_probe("fraud-window-done"); // TEMP(cycle-probe)
+        return __receipt;
     }
 
     panic!("Failed to generate fraud proof");

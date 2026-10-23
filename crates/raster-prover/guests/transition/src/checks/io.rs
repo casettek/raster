@@ -1,7 +1,7 @@
 //! Checks that recorded step commitments (input, input source, output)
 //! match the provided witnesses, and that tile steps carry a replay journal
 //! whose output matches the recorded output witness. The replay receipt itself
-//! is not verified here: the check returns the [`ReplayClaim`] the TRANSITION
+//! is not verified here: the check returns the [`ReplayClaim`] the transition
 //! part folds into a chain, and FRAUD WINDOW verifies the receipt it names.
 
 use std::collections::BTreeMap;

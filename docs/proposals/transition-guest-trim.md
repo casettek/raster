@@ -143,8 +143,8 @@ the host input format. None changes a commitment, a journal shape or a segment g
    touches the host. Leaning: do 1 and 2, measure, and do 3 only if decode is still the largest
    row.
 2. **Should `transition-split` be closed?** *Settled 2026-10-22: rewritten instead.* It now splits by
-   data source into four parts (TRACE, CONTROL FLOW, STORAGE, TRANSITION) and a FRAUD WINDOW
-   aggregator. io, recur, drafts and entrypoint stay together as TRANSITION, as measured here.
+   data source into four parts (trace, control flow, storage, transition) and a FRAUD WINDOW
+   aggregator. io, recur, drafts and entrypoint stay together as the transition part, as measured here.
 
 ## Implementation record (2026-10-22)
 

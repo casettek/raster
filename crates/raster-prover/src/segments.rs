@@ -3,8 +3,8 @@
 //!
 //! Each of the four parts is set on its own: trace (`--trace-segment`),
 //! control flow (`--control-flow-segment`), storage (`--storage-segment`) and
-//! TRANSITION (`--transition-segment`), because their fixed costs differ: the
-//! control-flow and TRANSITION parts decode the program per segment, the
+//! transition (`--transition-segment`), because their fixed costs differ: the
+//! control-flow and transition parts decode the program per segment, the
 //! storage and trace parts read none. FRAUD WINDOW stitches the segments
 //! whatever their lengths. See `docs/proposals/transition-split.md`.
 

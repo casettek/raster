@@ -1,4 +1,4 @@
-//! The TRANSITION part (`docs/proposals/transition-split.md`): the semantic
+//! The transition part (`docs/proposals/transition-split.md`): the semantic
 //! checks — io, recur, drafts, entrypoint — over a segment of steps, with no
 //! receipt verified and no other part's state.
 //!

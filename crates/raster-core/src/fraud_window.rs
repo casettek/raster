@@ -64,7 +64,7 @@ impl PartKind {
 /// The complete list, from every cross-family read in the semantic checks
 /// (`transition-split` §Shared values). A value that crosses parts and isn't
 /// here would be read from the host with nothing checking it, so the consumer
-/// side only ever sees these through `Consumed` (in the TRANSITION part's
+/// side only ever sees these through `Consumed` (in the transition part's
 /// guest), which folds each value into its chain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Column {
@@ -236,9 +236,9 @@ impl Chain {
     }
 }
 
-/// The chains the storage and TRANSITION parts both fold over a window: the
+/// The chains the storage and transition parts both fold over a window: the
 /// record chain, and one chain per column (the storage part producing, the
-/// TRANSITION part consuming). Each segment commits them before and after.
+/// transition part consuming). Each segment commits them before and after.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WindowChains {
     pub records: Chain,
@@ -404,7 +404,7 @@ pub struct FraudWindowJournal {
     /// slice. Every segment of every part was bound to [`window_id`] of it.
     pub init_state: InitTransition,
     /// `sha256(domain || program.bin)` — the identity of the program the
-    /// window executes, as the control-flow and TRANSITION parts read it. See
+    /// window executes, as the control-flow and transition parts read it. See
     /// `docs/proposals/program-identity.md`.
     #[serde(with = "serde_bytes")]
     pub program_commitment: Vec<u8>,
@@ -1048,7 +1048,7 @@ mod tests {
             );
         }
 
-        /// Every TRANSITION segment's entrypoint checks read one authorization
+        /// Every transition segment's entrypoint checks read one authorization
         /// journal: a segment that read another doesn't stitch.
         #[test]
         fn transition_segments_that_read_other_authorization_journals_are_refused() {

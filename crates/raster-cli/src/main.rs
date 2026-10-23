@@ -250,7 +250,7 @@ enum Commands {
         #[arg(long = "storage-segment", requires = "audit", default_value = "window")]
         storage_segment: raster_prover::segments::SegmentLength,
 
-        /// How many fraud-proof window steps one TRANSITION receipt covers
+        /// How many fraud-proof window steps one transition receipt covers
         /// (io, recur, drafts, entrypoint), when an audit proves fraud:
         /// `window` (the default) checks the whole window in one receipt;
         /// `<n>` checks it `n` steps at a time, each segment starting from the
@@ -269,7 +269,7 @@ enum Commands {
 
         /// How many independent proofs run at once when an audit proves fraud:
         /// the tile replays, the authorization, and every trace, control-flow,
-        /// storage and TRANSITION segment, before FRAUD WINDOW. Default 1, in
+        /// storage and transition segment, before FRAUD WINDOW. Default 1, in
         /// order. More pays only with somewhere to run them: CPU cores, a GPU
         /// with memory for several proofs, or a remote prover. On an 8 GB GPU
         /// keep 1. The proof is the same either way.

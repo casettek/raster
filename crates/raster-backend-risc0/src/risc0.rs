@@ -301,10 +301,12 @@ impl Backend for Risc0Backend {
         match mode {
             ExecutionMode::Estimate => {
                 // Execute without proving - just get cycle count
+                let __probe_t = std::time::Instant::now(); // TEMP(cycle-probe)
                 let executor = default_executor();
                 let session = executor
                     .execute(env, &risc0.elf)
                     .map_err(|e| Error::Other(format!("Execution failed: {}", e)))?;
+                eprintln!("CYCLEPROBE label={} user={} total={} segments={} ms={}", format!("tile-exec:{}", risc0.tile_id), session.cycles(), session.segments.iter().map(|s| 1u64 << s.po2).sum::<u64>(), session.segments.len(), __probe_t.elapsed().as_millis()); // TEMP(cycle-probe)
 
                 // Get the journal (output)
                 let replay_output: TileReplayJournal = postcard::from_bytes(&session.journal.bytes)
@@ -316,10 +318,12 @@ impl Backend for Risc0Backend {
                     .with_journal(session.journal.bytes.clone()))
             }
             ExecutionMode::Prove { verify } => {
+                let __probe_t = std::time::Instant::now(); // TEMP(cycle-probe)
                 let prover = risc0_zkvm::default_prover();
                 let prove_info = prover
                     .prove(env, &risc0.elf)
                     .map_err(|e| Error::Other(format!("Proving failed: {}", e)))?;
+                eprintln!("CYCLEPROBE label={} user={} total={} segments={} ms={}", format!("tile-prove:{}", risc0.tile_id), prove_info.stats.user_cycles, prove_info.stats.total_cycles, prove_info.stats.segments, __probe_t.elapsed().as_millis()); // TEMP(cycle-probe)
 
                 let receipt = prove_info.receipt;
                 let replay_output: TileReplayJournal = postcard::from_bytes(&receipt.journal.bytes)

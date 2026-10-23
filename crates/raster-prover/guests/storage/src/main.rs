@@ -8,7 +8,7 @@
 //! the per-step mode; a segment covering the window is the whole-window mode.
 //! The journal (`PartSegmentJournal`) commits the record chain, the store
 //! before and after, and the two columns the storage part produces, which FRAUD
-//! WINDOW stitches and compares with the TRANSITION part's. See
+//! WINDOW stitches and compares with the transition part's. See
 //! `docs/proposals/storage-prover.md` and `transition-split.md`.
 
 mod segment;

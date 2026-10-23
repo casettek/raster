@@ -13,18 +13,18 @@ fn image_id_bytes(image_id: [u32; 8]) -> Vec<u8> {
 }
 
 /// The authorization journal for `manifested_inputs`, by executing the guest
-/// without proving it: what the TRANSITION part reads before the receipt
+/// without proving it: what the transition part reads before the receipt
 /// exists. FRAUD WINDOW holds the proven receipt to it.
 pub fn execute_authorization(manifested_inputs: &ManifestedInputs) -> AuthorizationJournal {
     let mut builder = risc0_zkvm::ExecutorEnv::builder();
     builder.write(manifested_inputs).unwrap();
     let env = builder.build().unwrap();
-    risc0_zkvm::default_executor()
+    let __probe_t = std::time::Instant::now(); // TEMP(cycle-probe)
+    let session = risc0_zkvm::default_executor()
         .execute(env, AUTHORIZATION_GUEST_ELF)
-        .unwrap()
-        .journal
-        .decode()
-        .unwrap()
+        .unwrap();
+    eprintln!("CYCLEPROBE label={} user={} total={} segments={} ms={}", "authorization-exec", session.cycles(), session.segments.iter().map(|s| 1u64 << s.po2).sum::<u64>(), session.segments.len(), __probe_t.elapsed().as_millis()); // TEMP(cycle-probe)
+    session.journal.decode().unwrap()
 }
 
 pub fn authorize_external_inputs(
@@ -36,7 +36,10 @@ pub fn authorize_external_inputs(
     builder.write(manifested_inputs).unwrap();
     let env = builder.build().unwrap();
 
-    let receipt = prover.prove(env, &AUTHORIZATION_GUEST_ELF).unwrap().receipt;
+    let __probe_t = std::time::Instant::now(); // TEMP(cycle-probe)
+    let info = prover.prove(env, &AUTHORIZATION_GUEST_ELF).unwrap();
+    eprintln!("CYCLEPROBE label={} user={} total={} segments={} ms={}", "authorization", info.stats.user_cycles, info.stats.total_cycles, info.stats.segments, __probe_t.elapsed().as_millis()); // TEMP(cycle-probe)
+    let receipt = info.receipt;
     let journal: AuthorizationJournal = receipt.journal.decode().unwrap();
 
     (receipt, journal)

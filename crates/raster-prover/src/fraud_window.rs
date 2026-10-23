@@ -2,8 +2,8 @@
 //! (`docs/proposals/transition-split.md`).
 //!
 //! Every part's segment is independent of every other: the trace, control-flow
-//! and storage segments (`window`), and the TRANSITION part's, which verify no
-//! receipt. A TRANSITION segment needs the tile replay journals as values,
+//! and storage segments (`window`), and the transition part's, which verify no
+//! receipt. A transition segment needs the tile replay journals as values,
 //! which the host gets by *executing* each tile (`Replayer::execute`), the
 //! authorization journal, likewise executed
 //! (`authorization::execute_authorization`), and the state the segment before
@@ -46,7 +46,7 @@ pub fn fraud_window_guest_image_id() -> Vec<u8> {
         .collect()
 }
 
-/// The TRANSITION part guest's image id, as journals carry it.
+/// The transition guest's image id, as journals carry it.
 pub fn transition_guest_image_id() -> Vec<u8> {
     TRANSITION_GUEST_ID
         .into_iter()
@@ -68,7 +68,7 @@ pub fn replay_claim(image_id: &[u8; 32], journal: &TileReplayJournal) -> ReplayC
     }
 }
 
-/// Every tile step's replay claim, in window order: the order the TRANSITION
+/// Every tile step's replay claim, in window order: the order the transition
 /// part folds them in.
 pub fn replay_claims(window: &[StepRecord], replays: &ReplayJournals) -> Vec<ReplayClaim> {
     window
@@ -90,14 +90,14 @@ fn replay_for<'a>(
         .unwrap_or_else(|| panic!("no executed replay for tile step {:?}", step.coordinates))
 }
 
-/// One planned TRANSITION part segment: its header and steps.
+/// One planned transition part segment: its header and steps.
 #[derive(Clone)]
 pub struct TransitionPartSegment {
     pub header: TransitionPartHeader,
     pub steps: Vec<TransitionStep>,
 }
 
-/// What the window's TRANSITION part reads besides the records and their I/O.
+/// What the window's transition part reads besides the records and their I/O.
 pub struct TransitionInputs<'a> {
     pub replays: &'a ReplayJournals,
     pub authorization_journal: &'a AuthorizationJournal,
@@ -105,7 +105,7 @@ pub struct TransitionInputs<'a> {
     pub window_start_recur_progress: Option<RecurProgressStack>,
 }
 
-/// One step as the TRANSITION part reads it: the record, the witnesses its
+/// One step as the transition part reads it: the record, the witnesses its
 /// checks read (not the scope witness or the storage witness, which only the
 /// control-flow and storage guests read), its executed replay journal if it
 /// runs a tile, and the store before it.
@@ -144,7 +144,7 @@ pub(crate) fn transition_step(
     }
 }
 
-/// Split the window into TRANSITION part segments.
+/// Split the window into transition part segments.
 ///
 /// Each segment starts from the chains the steps before it fold to, which the
 /// host computes, and — inside the window — from the part state the segment
@@ -236,7 +236,7 @@ fn transition_part_env<'a>(
     builder.build().unwrap()
 }
 
-/// Execute a TRANSITION part segment, without proving it, for the state it
+/// Execute a transition part segment, without proving it, for the state it
 /// ends on.
 fn execute_transition_part_segment(
     program_frame: &[u8],
@@ -246,16 +246,18 @@ fn execute_transition_part_segment(
     let mut stdout = Vec::new();
     {
         let env = transition_part_env(program_frame, segment, zkvm_segment_po2, &mut stdout);
-        risc0_zkvm::default_executor()
+        let __probe_t = std::time::Instant::now(); // TEMP(cycle-probe)
+        let session = risc0_zkvm::default_executor()
             .execute(env, TRANSITION_GUEST_ELF)
             .unwrap_or_else(|e| {
                 panic!(
-                    "the TRANSITION part refused the segment at trace position {}: {e}",
+                    "the transition part refused the segment at trace position {}: {e}",
                     segment.header.first_position
                 )
             });
+        eprintln!("CYCLEPROBE label={} user={} total={} segments={} ms={}", "transition-exec", session.cycles(), session.segments.iter().map(|s| 1u64 << s.po2).sum::<u64>(), session.segments.len(), __probe_t.elapsed().as_millis()); // TEMP(cycle-probe)
     }
-    postcard::from_bytes(&stdout).expect("the TRANSITION part writes its state after to stdout")
+    postcard::from_bytes(&stdout).expect("the transition part writes its state after to stdout")
 }
 
 pub fn prove_transition_part_segment(
@@ -276,13 +278,13 @@ pub fn prove_transition_part_segment(
         TRANSITION_GUEST_ELF,
         builder.build().unwrap(),
         format_args!(
-            "the TRANSITION part refused the segment at trace position {}",
+            "the transition part refused the segment at trace position {}",
             segment.header.first_position
         ),
     )
 }
 
-/// One job per TRANSITION part segment, for `schedule::run_jobs`.
+/// One job per transition part segment, for `schedule::run_jobs`.
 pub fn transition_part_jobs<'a>(
     program_frame: &'a [u8],
     planned: &'a [TransitionPartSegment],
@@ -367,9 +369,13 @@ pub fn prove_fraud_window_from(
     }
     write_postcard(&mut builder, &proof.params);
     let env = builder.build().map_err(|e| e.to_string())?;
+    let __probe_t = std::time::Instant::now(); // TEMP(cycle-probe)
     risc0_zkvm::default_prover()
         .prove(env, FRAUD_WINDOW_GUEST_ELF)
-        .map(|info| info.receipt)
+        .map(|info| {
+            eprintln!("CYCLEPROBE label={} user={} total={} segments={} ms={}", "fraud-window", info.stats.user_cycles, info.stats.total_cycles, info.stats.segments, __probe_t.elapsed().as_millis()); // TEMP(cycle-probe)
+            info.receipt
+        })
         .map_err(|e| e.to_string())
 }
 
@@ -735,7 +741,7 @@ mod tests {
             .len();
         assert_eq!(
             count, 5,
-            "trace, control flow, storage, TRANSITION, authorization"
+            "trace, control flow, storage, transition, authorization"
         );
         for dropped in 0..count {
             let mut missing = fraud_window_proof(&setup, inputs(&authorization));

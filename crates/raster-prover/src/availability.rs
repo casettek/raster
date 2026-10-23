@@ -18,7 +18,7 @@
 //! So the entire trust anchor for a program's external inputs is one value:
 //! `input_manifest_commitment = sha256(manifest_bytes)`. It is carried on the
 //! [`FraudWindowJournal`](raster_core::fraud_window::FraudWindowJournal), from
-//! the one authorization journal FRAUD WINDOW verifies and every TRANSITION
+//! the one authorization journal FRAUD WINDOW verifies and every transition
 //! segment of the window read. A verifier is expected to compare it against a manifest obtained
 //! **independently of the prover**.
 //!

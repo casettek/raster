@@ -1,4 +1,4 @@
-//! The TRANSITION part's checks: io, recur, drafts and entrypoint over a
+//! The transition part's checks: io, recur, drafts and entrypoint over a
 //! segment of steps (`part`), verifying no receipt. The guest binary
 //! (`main.rs`) runs them and commits a `PartSegmentJournal`, which FRAUD
 //! WINDOW stitches and compares with the other parts'

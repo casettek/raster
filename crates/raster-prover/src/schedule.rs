@@ -1,7 +1,7 @@
 //! Running independent proofs side by side (`transition-split`).
 //!
 //! A fraud window's leaf proofs — the tile replays, the authorization, and
-//! every trace, control-flow, storage and TRANSITION segment — read only the
+//! every trace, control-flow, storage and transition segment — read only the
 //! recorded trace, witnesses and executed journals: none needs another's
 //! receipt. FRAUD WINDOW needs their receipts as assumptions, so it runs after
 //! them. This runs the leaves on a pool of worker threads; with one worker it

@@ -1,4 +1,4 @@
-//! The TRANSITION part's segment (`transition-split`): the chains it commits,
+//! The transition part's segment (`transition-split`): the chains it commits,
 //! how its segments stitch, and the inputs only the window's opening segment
 //! may carry. Its per-step checks are tested in the rest of this suite.
 

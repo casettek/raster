@@ -30,7 +30,7 @@ sync point for everything:
 ```
 tile replays ─┐
 authorization ┤ receipts
-control flow ─┤ (assumptions) ──▶ TRANSITION GUEST ──▶ TransitionJournal(Finished)
+control flow ─┤ (assumptions) ──▶ transition GUEST ──▶ TransitionJournal(Finished)
 storage ──────┘                    trace + verdict, io, recur, drafts, entrypoint,
                                    and per-step checks of every inner guest's entry
 ```
@@ -58,10 +58,10 @@ state, and digests of the values other parts need. One guest, **FRAUD WINDOW**, 
 receipt, checks that the claims fit together, and commits the final journal.
 
 ```
- commit.bin ───────────▶ TRACE         trace tree, fingerprint, window ↔ commitment, verdict
- program (CFS) ────────▶ CONTROL FLOW  where steps sit, where arguments come from
- store witnesses ──────▶ STORAGE       reads, writes, roots
- tile replays ─────────▶ TRANSITION    io + recur + drafts + entrypoint: what the tiles computed
+ commit.bin ───────────▶ trace         trace tree, fingerprint, window ↔ commitment, verdict
+ program (CFS) ────────▶ control flow  where steps sit, where arguments come from
+ store witnesses ──────▶ storage       reads, writes, roots
+ tile replays ─────────▶ transition    io + recur + drafts + entrypoint: what the tiles computed
    (journal values)                      (+ the authorization journal, for entrypoint)
 
  every part's segment receipts ─┐
@@ -81,13 +81,13 @@ Non-goals:
 
 | part | runs (moved from) | state across steps | reads | per-step cost today |
 | --- | --- | --- | --- | --- |
-| **TRACE** | `assert_window_is_commitment_slice`, `assert_opens_at_genesis`, the trace append and fingerprint accumulation (`append_to_trace`), the verdict (`reaches_window_end`), all from the transition guest | trace frontier and root, fingerprint accumulator, the window binding (refuted commitment, terminal flag, final committed root) | `InitTransition`, the commitment header and slice witness, revealed tail roots, each step's record | ≈33k (one fold and one append) |
-| **CONTROL FLOW** | unchanged: the control-flow guest | trace frontier (to derive each step's root and position), expected coordinates | program, records, input-source and scope witnesses | 15–29k check |
-| **STORAGE** | unchanged: the storage guest | `StorageState` (append-log frontier, index root) | records, input-source and selection witnesses, storage witnesses | ≈100k on these programs (compact index) |
-| **TRANSITION** | io, recur, drafts, entrypoint, from the transition guest | recur-progress stack, entrypoint and output authorization | program, records, replay journals **as values**, I/O, input-source, selection and draft witnesses, the read witnesses for recur and `ProgramEnd`, the authorization journal | 15–40k |
+| **Trace** | `assert_window_is_commitment_slice`, `assert_opens_at_genesis`, the trace append and fingerprint accumulation (`append_to_trace`), the verdict (`reaches_window_end`), all from the transition guest | trace frontier and root, fingerprint accumulator, the window binding (refuted commitment, terminal flag, final committed root) | `InitTransition`, the commitment header and slice witness, revealed tail roots, each step's record | ≈33k (one fold and one append) |
+| **Control flow** | unchanged: the control-flow guest | trace frontier (to derive each step's root and position), expected coordinates | program, records, input-source and scope witnesses | 15–29k check |
+| **Storage** | unchanged: the storage guest | `StorageState` (append-log frontier, index root) | records, input-source and selection witnesses, storage witnesses | ≈100k on these programs (compact index) |
+| **Transition** | io, recur, drafts, entrypoint, from the transition guest | recur-progress stack, entrypoint and output authorization | program, records, replay journals **as values**, I/O, input-source, selection and draft witnesses, the read witnesses for recur and `ProgramEnd`, the authorization journal | 15–40k |
 
-TRANSITION keeps the name of today's guest because it keeps the checks that decide whether a step
-was a correct *transition* of the program. It loses the trace (to TRACE) and the composition (to
+Transition keeps the name of today's guest because it keeps the checks that decide whether a step
+was a correct *transition* of the program. It loses the trace (to trace) and the composition (to
 FRAUD WINDOW).
 
 ### What every segment commits
@@ -124,8 +124,8 @@ segment of every part can be proven at the same time**, at any window length, an
 use its own segment length. This replaces today's `Next` chain.
 
 **The opening segment** of each part reads `InitTransition` and asserts that its `state.0` is the
-state that `InitTransition` implies (TRACE: the window binding and initial frontier; CONTROL FLOW:
-the initial trace frontier and no expected coordinates; STORAGE: the initial store; TRANSITION:
+state that `InitTransition` implies (trace: the window binding and initial frontier; control flow:
+the initial trace frontier and no expected coordinates; storage: the initial store; transition:
 the genesis authorization check and the recur seed, validated by advancing it as today). Chains
 start from the same `window_id`-derived seed, so FRAUD WINDOW needs no part-specific knowledge of
 initial states.
@@ -148,19 +148,19 @@ The complete inventory, from reading every cross-family read in today's transiti
 
 | column | value at step `i` | producer (why it is true) | consumer (what reads it) |
 | --- | --- | --- | --- |
-| `store_before` | `StorageState` before step `i` | STORAGE: computed from checked reads and writes | TRANSITION: recur's returned-state read (`verify_returned_state`), `verify_program_end`, both against these roots |
-| `selections` | `selection_witnesses_commitment` of step `i`'s map | STORAGE: the map it folded | TRANSITION: recur's item and list length, io's input roots |
+| `store_before` | `StorageState` before step `i` | Storage: computed from checked reads and writes | Transition: recur's returned-state read (`verify_returned_state`), `verify_program_end`, both against these roots |
+| `selections` | `selection_witnesses_commitment` of step `i`'s map | Storage: the map it folded | Transition: recur's item and list length, io's input roots |
 
 That's all. Everything else a part needs is either its own state, the record (shared through the
 record chain), a witness anchored to the record (the input-source witness, checked by every part
 that reads it), or a receipt FRAUD WINDOW verifies:
-- **CONTROL FLOW ↔ TRACE:** control flow derives each step's trace root and position from the
+- **Control flow ↔ trace:** control flow derives each step's trace root and position from the
   shared start frontier and the record chain, so there's no `trace_root_before` column. The two
   must agree because both append the same record hashes to the same start.
-- **Expected coordinates:** internal to CONTROL FLOW. Nothing else reads them.
-- **The record's output commitment:** STORAGE writes it, TRANSITION ties it to the replay output
+- **Expected coordinates:** internal to control flow. Nothing else reads them.
+- **The record's output commitment:** storage writes it, transition ties it to the replay output
   root. Both read it from the record, so the record chain binds them.
-- **Recur ↔ drafts:** both in TRANSITION.
+- **Recur ↔ drafts:** both in transition.
 
 The column list is the soundness surface. §Soundness explains how a missing column is ruled out.
 
@@ -168,23 +168,23 @@ The column list is the soundness surface. §Soundness explains how a missing col
 
 | part | `PartOutput`, on the segment that holds it |
 | --- | --- |
-| TRACE | `refuted_trace_commitment`, `window_is_terminal`, `final_committed_root`, and the verdict: every step before the last matched, the last diverged |
-| TRANSITION | final `EntrypointAuthorization` and `OutputAuthorization`; `replay_claims`: a chain over every tile step's `(registry image id, sha256(journal))`; `authorization`: `sha256(authorization journal)` |
-| CONTROL FLOW, STORAGE | none: their whole contribution is their state, columns and record chain |
+| Trace | `refuted_trace_commitment`, `window_is_terminal`, `final_committed_root`, and the verdict: every step before the last matched, the last diverged |
+| Transition | final `EntrypointAuthorization` and `OutputAuthorization`; `replay_claims`: a chain over every tile step's `(registry image id, sha256(journal))`; `authorization`: `sha256(authorization journal)` |
+| Control flow, storage | none: their whole contribution is their state, columns and record chain |
 
 ### Tile replays leave the critical path
 
-TRANSITION reads each tile step's replay journal **as a value** and runs io, recur and drafts on it
+Transition reads each tile step's replay journal **as a value** and runs io, recur and drafts on it
 exactly as today. It looks up the tile's image id in the program's registry, as today, and folds
 `(image id, sha256(journal))` into `replay_claims`. It doesn't call `env::verify` on any replay.
 
 FRAUD WINDOW verifies one receipt per tile step for the claims it is given, recomputes the
-`replay_claims` chain from them, and compares it with TRANSITION's. By collision resistance, the
-journal TRANSITION checked is the one the registered binary produced: the same guarantee as
+`replay_claims` chain from them, and compares it with transition's. By collision resistance, the
+journal transition checked is the one the registered binary produced: the same guarantee as
 today's `env::verify` inside io, split between two guests and tied by the digest. The authorization
 journal works the same way.
 
-So **no part depends on a proof.** TRANSITION needs replay journals, which the host gets by
+So **no part depends on a proof.** transition needs replay journals, which the host gets by
 *executing* tiles. Tile receipts can be proven per tile, in any order, on any machine, even while
 the program runs, and they meet the rest only in FRAUD WINDOW.
 
@@ -234,7 +234,7 @@ steps, not with what the steps do.
 
 Each part has a segment length (`window`, `<n>`, `1`), as control flow and storage do now:
 `--trace-segment`, `--control-flow-segment`, `--storage-segment`, `--transition-segment`.
-- **Per tile** (`1`): maximum parallelism, and TRANSITION or STORAGE can follow a run step by
+- **Per tile** (`1`): maximum parallelism, and transition or storage can follow a run step by
   step.
 - **Window-wise** (`window`): minimum fixed cost.
 - **Mixed:** for example, storage per 8 steps and everything else window-wise.
@@ -297,11 +297,11 @@ and is unaffected.
 
 ### Changes to the existing guests
 
-- **CONTROL FLOW and STORAGE** commit a `PartSegmentJournal` instead of an entries root. The
+- **Control flow and storage** commit a `PartSegmentJournal` instead of an entries root. The
   per-step `ControlFlowEntry` / `StorageStepEntry`, their trees, paths and stdout entries, and
-  `VerifiedJournals` all go away. STORAGE produces the two columns.
-- **TRACE** is new, built from code moved out of `fraud_proof.rs`.
-- **TRANSITION** is today's transition guest minus the trace, the window binding, the evidence
+  `VerifiedJournals` all go away. Storage produces the two columns.
+- **Trace** is new, built from code moved out of `fraud_proof.rs`.
+- **Transition** is today's transition guest minus the trace, the window binding, the evidence
   checks, the `Next` chain (`proceed`, `verify_previous_journal`, the continuity asserts) and every
   `env::verify`. It gains the column chains, `replay_claims` and the record chain.
 - **The host** executes every guest first to get journals and replay values, then proves all
@@ -321,7 +321,7 @@ crates/raster-prover/guests/
 ├── trace/                               # the trace part
 ├── control_flow/                        # the control-flow part
 ├── storage/                             # the storage part, produces the two columns
-├── transition/                          # the TRANSITION part: io, recur, drafts, entrypoint
+├── transition/                          # the transition part: io, recur, drafts, entrypoint
 ├── fraud_window/                        # FRAUD WINDOW, part ids compiled in (src/ids.rs)
 ├── authorization/, chain_fraud/         # unchanged
 └── guest_common/
@@ -329,7 +329,7 @@ crates/raster-prover/
 ├── build.rs                             # second pass: part ids -> FRAUD WINDOW
 └── src/
     ├── window.rs                        # plan the three leaf parts, one proof job per segment
-    ├── fraud_window.rs                  # plan TRANSITION, prove FRAUD WINDOW, verify the proof
+    ├── fraud_window.rs                  # plan transition, prove FRAUD WINDOW, verify the proof
     ├── schedule.rs                      # run_jobs: the worker pool
     └── transition.rs                    # StepIo, frame writers
 ```
@@ -349,7 +349,7 @@ values. FRAUD WINDOW restores the conjunction:
   own checks produced, step after step,
 - every value one part read from another equals the value the producer computed (column chains,
   by collision resistance),
-- every replay journal and the authorization journal TRANSITION checked is one their guests
+- every replay journal and the authorization journal transition checked is one their guests
   produced (claims verified in FRAUD WINDOW, chained and compared).
 
 Under those, every check sees the inputs it sees today.
@@ -376,14 +376,14 @@ them: step 1 of §Migration introduces them inside the existing guests, before a
 
 | | today | split (estimate) |
 | --- | --- | --- |
-| `hello-tiles` 27 | CF 2.56M + storage 3.40M + transition 4.53M = 10.50M, **15 segments** | CF ≈2.4M, storage ≈3.3M, TRACE ≈1.2M, TRANSITION ≈1.8M, FRAUD WINDOW ≈0.5–1M: ≈9.5M, **≈15–17 segments** |
+| `hello-tiles` 27 | CF 2.56M + storage 3.40M + transition 4.53M = 10.50M, **15 segments** | CF ≈2.4M, storage ≈3.3M, trace ≈1.2M, transition ≈1.8M, FRAUD WINDOW ≈0.5–1M: ≈9.5M, **≈15–17 segments** |
 | `prompt-prepare` 796 | 8.50M, **11 segments** | ≈7.5M, **≈12–14 segments** |
 
 - **One GPU: about the same, possibly slightly more.** The per-step evidence checks (about a fifth
   of today's transition guest) and the inner guests' entry trees go away, but there's one more
   guest, each part pays its own setup, and every receipt is at least one risc0 segment.
 - **Several GPUs: the window takes as long as its largest proof**, about 4–6 segments (storage or
-  CONTROL FLOW), plus FRAUD WINDOW, instead of all of them in sequence. And tile replays, never
+  Control flow), plus FRAUD WINDOW, instead of all of them in sequence. And tile replays, never
   measured with real proving, run alongside instead of before.
 - **Long windows:** every part scales out by segments, with no chain anywhere. Only FRAUD WINDOW
   grows, by one stitch per segment and one claim per tile step.
@@ -401,13 +401,13 @@ them: step 1 of §Migration introduces them inside the existing guests, before a
    `Consumed<…>` (still checked against the storage entry as today), and add the record chain.
    No guest is added. If a cross-read was missed, this is where it fails to compile. Worth
    keeping even if the split stops here.
-2. **Extract TRACE.** *Done 2026-10-22 (§Step 2 record).* Move the trace, window binding and verdict into `guests/trace`. Until FRAUD
-   WINDOW exists, the transition guest verifies the TRACE receipt as it does control flow and
+2. **Extract trace.** *Done 2026-10-22 (§Step 2 record).* Move the trace, window binding and verdict into `guests/trace`. Until FRAUD
+   WINDOW exists, the transition guest verifies the trace receipt as it does control flow and
    storage today.
 3. **Parallel host scheduling** *(done 2026-10-22, §Step 3 record)* with unresolved assumptions, for today's guests. Host-only. It
    pays as soon as more than one prover is available.
-4. **FRAUD WINDOW.** *(done 2026-10-22, §Step 4 record)* Change the CONTROL FLOW and STORAGE journals, strip the transition guest down
-   to TRANSITION, add `guests/fraud_window` with compiled-in part ids and `FraudWindowJournal`,
+4. **FRAUD WINDOW.** *(done 2026-10-22, §Step 4 record)* Change the control flow and storage journals, strip the transition guest down
+   to transition, add `guests/fraud_window` with compiled-in part ids and `FraudWindowJournal`,
    behind `prove --fraud-window` with today's pipeline as the default. Add the per-column and per-stitch tamper tests and the differential test.
 5. **Measure** both pipelines in every mode, on CPU dev mode and on GPU. Switch the default, then
    delete the per-step evidence machinery, `Next`, `Transition` and the continuity asserts.
@@ -545,7 +545,7 @@ values are refused at parse time.
   `fingerprint_value(root_i)` with committed item `i`; today's accumulator only ever fed that one
   comparison. So the fingerprint accumulator left the protocol: `Transition` now carries only
   `trace_position` and `trace_root`.
-- **The transition guest** verifies the TRACE receipt per step (`checks/trace.rs`, receipt once per
+- **The transition guest** verifies the trace receipt per step (`checks/trace.rs`, receipt once per
   execution): the entry's path, its record hash, its position, and that its `trace_root_before`
   is the root the previous step ended on. That chaining, by position and root, binds the frontier
   every segment appended to, so a segment the host started elsewhere is refused. It also requires
@@ -560,18 +560,18 @@ values are refused at parse time.
 - **Tests:** trace guest 23 (16 moved, 7 new on the append and verdict: one and two segments
   commit identical entries, no divergence refused, an early divergence refused, an opening segment
   from another frontier refused, a segment past the window refused). Transition guest 155 (16
-  moved out, the tail-roots input test dropped, 10 on the TRACE consumer, 2 continuity).
-  `raster-core` 208 (2 `trace_check`), `raster-prover` 55 (the TRACE pin; the in-zkVM single-step
-  test proves a real TRACE receipt, which now carries that step's verdict).
+  moved out, the tail-roots input test dropped, 10 on the trace consumer, 2 continuity).
+  `raster-core` 208 (2 `trace_check`), `raster-prover` 55 (the trace pin; the in-zkVM single-step
+  test proves a real trace receipt, which now carries that step's verdict).
 - **End to end** (dev mode): `hello-tiles` fraud proofs at 27, 47 and 58; at 27 with every
   segment guest on a different length (`--trace-segment 5 --storage-segment 4
-  --control-flow-segment 3 --transition-segment 8`), and with TRACE and transition per step; an
+  --control-flow-segment 3 --transition-segment 8`), and with trace and transition per step; an
   honest audit; `prompt-prepare` 796. `verify_fraud_proof` accepts the mixed-mode proof. Both
   programs' locks were unchanged this time.
 - **Measured on the GPU** (RTX 3070, `--zkvm-segment-po2 18`, default modes; baseline is §GPU
   baseline):
 
-  | | transition | TRACE | all proving |
+  | | transition | trace | all proving |
   | --- | --- | --- | --- |
   | `hello-tiles` 27, before | 23.7 s / 33 segments | — | 54.5 s / 89 |
   | `hello-tiles` 27, after | **20.0 s / 30** | 4.6 s / 7 | **53.1 s / 93** |
@@ -580,7 +580,7 @@ values are refused at parse time.
 
   **Cost-neutral on one GPU**, within run-to-run noise: control flow and storage alone varied by
   about 7% between the two runs. That's as §Cost estimated. The transition guest is smaller, and
-  TRACE can be proven alongside it. The real GPU receipt verifies with all five guests pinned.
+  Trace can be proven alongside it. The real GPU receipt verifies with all five guests pinned.
 
 ## Step 3 record (2026-10-22)
 
@@ -632,7 +632,7 @@ Both pipelines are built and run side by side; today's stays the default, and `-
 
 - **Two-pass guest build.** A new `crates/raster-prover-guests` crate builds every guest but FRAUD
   WINDOW (`embed_methods`). `raster-prover` takes it as a build-dependency, sets the trace,
-  control-flow, storage, TRANSITION and authorization ids as `RASTER_PART_ID_*` environment
+  control-flow, storage, transition and authorization ids as `RASTER_PART_ID_*` environment
   variables in its `build.rs`, and builds `guests/fraud_window`, which compiles them in with
   `env!` (`src/ids.rs`). `risc0_build` passes the build script's environment to the guest build,
   stripping only `CARGO*` and `RUSTUP_TOOLCHAIN`; a Docker build would have to forward them
@@ -647,8 +647,8 @@ Both pipelines are built and run side by side; today's stays the default, and `-
   `InitTransition` and the chains before; each part's opening segment checks its start against
   `InitTransition` itself (control flow: initial frontier, nothing expected; storage: initial
   store, and its root is the frontier's).
-- **TRANSITION is a second binary of the transition guest crate.** The checks moved to a library
-  (`src/lib.rs`); `src/main.rs` is today's guest, `src/bin/transition_part.rs` the TRANSITION
+- **Transition is a second binary of the transition guest crate.** The checks moved to a library
+  (`src/lib.rs`); `src/main.rs` is today's guest, `src/bin/transition_part.rs` the transition
   part (`part::verify_segment`), so both run the same semantic checks and the transition suite
   covers both. The part verifies no receipt: it reads the store before each step and the
   selection witnesses through `Consumed` as before, now from the host; folds each tile step's
@@ -663,7 +663,7 @@ Both pipelines are built and run side by side; today's stays the default, and `-
 - **Host** (`raster_prover::fraud_window`). Tiles are *executed* first
   (`Replayer::execute`, a journal-returning estimate run; `TileExecutionResult::journal`), and the
   authorization guest too (`execute_authorization`). `plan_transition_part` executes each
-  TRANSITION segment but the last, in order, for the next one's start state. Then one
+  Transition segment but the last, in order, for the next one's start state. Then one
   `run_jobs` batch proves the tile replays, the authorization and every segment of all four parts,
   and `prove_fraud_window` proves the aggregator with every receipt as an assumption.
   `verify_fraud_window_receipt` pins `FRAUD_WINDOW_GUEST_ID` alone. The chain path
@@ -689,7 +689,7 @@ Both pipelines are built and run side by side; today's stays the default, and `-
   | `prompt-prepare` 796 | 57 s | 51 s |
 
   Both receipts are composite and verify; FRAUD WINDOW's is 24 MB against 31 MB. On one GPU the
-  split is already 10–18% faster, against §Cost's estimate of "about the same": TRANSITION drops
+  split is already 10–18% faster, against §Cost's estimate of "about the same": transition drops
   the per-step evidence checks and every `env::verify`, and nothing waits on a `Next` chain.
   Today's pipeline got slower than in step 3 (75 s on `hello-tiles`): its part guests now also
   fold the chains and hash `InitTransition`. Step 5 measures every mode properly.
@@ -711,7 +711,7 @@ FRAUD WINDOW is the only pipeline. `--fraud-window` is gone; `run --audit` and
   leaf hashes, and `raster-core::segment_tree`; `PartSegmentJournal::entries_root`; the part
   guests' entries on stdout; `VerifiedJournals` and the transition guest's evidence checks
   (`checks::{trace, control_flow, store, receipts}`, `fraud_proof.rs`).
-- **The transition guest is the TRANSITION part.** `src/bin/transition_part.rs` became
+- **The transition guest is the transition part.** `src/bin/transition_part.rs` became
   `src/main.rs`, so its image id is `TRANSITION_GUEST_ID` again. The library keeps the semantic
   checks and `part::verify_segment`; the two helpers it used from `fraud_proof.rs`
   (`expected_tile_image_id`, `assert_seed_present_for_mid_loop_open`) moved into `part.rs`.
@@ -728,7 +728,7 @@ FRAUD WINDOW is the only pipeline. `--fraud-window` is gone; `run --audit` and
   commitment, and the trace guest requires the last step to diverge. Filed as
   [`terminal-window-refused`](../issues/terminal-window-refused.md); the fix is a design choice
   between a verdict kind in the journal and a separate aggregator id.
-- **Tests.** raster-core 212 (one new: TRANSITION segments that read different authorization
+- **Tests.** raster-core 212 (one new: transition segments that read different authorization
   journals don't stitch), trace 24, control flow 58, storage 22, transition 105 (one new: a later
   segment may not carry an entrypoint witness; the evidence and continuity tests went with their
   code), raster-prover 50. The host tests now prove a window through FRAUD WINDOW, refuse it
@@ -783,7 +783,7 @@ What it shows:
 1. **The final journal is `FraudWindowJournal`** (§The final journal).
 2. **Part and authorization ids are compiled into FRAUD WINDOW** (§Image-id pinning). One pin for
    relying parties, at the cost of a two-pass build.
-3. **TRACE stays separate from CONTROL FLOW.** Both fold the same trace tree from the same records,
+3. **Trace stays separate from control flow.** Both fold the same trace tree from the same records,
    but control flow keeps no knowledge of `commit.bin`, and each answers one question.
 
 ## Deferred

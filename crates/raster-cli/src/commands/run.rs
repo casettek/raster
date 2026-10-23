@@ -300,7 +300,9 @@ pub fn run(
         }
     } else if audit_flag.is_some() {
         let commit_path = audit_flag.expect("Commitment path was provided");
+        crate::commands::prove::phase_probe("verify-start"); // TEMP(cycle-probe)
         let verification_result = verify(&trace, commit_path, &cfs)?;
+        crate::commands::prove::phase_probe("verify-done"); // TEMP(cycle-probe)
 
         match verification_result {
             VerificationResult::Ok => println!("Verification Success"),

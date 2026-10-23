@@ -4,7 +4,7 @@
 //! Every segment of the trace, control-flow and storage parts depends only on
 //! the recorded window: none waits for another's receipt. So the host plans
 //! them all first and hands one job per segment to `schedule::run_jobs`, next
-//! to the tile replays, the authorization and the TRANSITION part's segments
+//! to the tile replays, the authorization and the transition part's segments
 //! (`fraud_window`). Every job yields a [`ProvenPartSegment`]; FRAUD WINDOW
 //! takes them in any order, and refuses a window any of them is missing from.
 
@@ -75,12 +75,14 @@ pub(crate) fn prove_part_segment(
     env: risc0_zkvm::ExecutorEnv<'_>,
     refused: Arguments<'_>,
 ) -> ProvenPartSegment {
-    let receipt = risc0_zkvm::default_prover()
+    let __probe_t = std::time::Instant::now(); // TEMP(cycle-probe)
+    let info = risc0_zkvm::default_prover()
         .prove(env, elf)
-        .unwrap_or_else(|e| panic!("{refused}: {e}"))
-        .receipt;
+        .unwrap_or_else(|e| panic!("{refused}: {e}"));
+    let receipt = info.receipt.clone();
     let journal = PartSegmentJournal::decode(&receipt.journal.bytes)
         .expect("a part guest commits a postcard-encoded PartSegmentJournal");
+    eprintln!("CYCLEPROBE label={} user={} total={} segments={} ms={}", format!("part:{:?}", journal.part), info.stats.user_cycles, info.stats.total_cycles, info.stats.segments, __probe_t.elapsed().as_millis()); // TEMP(cycle-probe)
     ProvenPartSegment { receipt, journal }
 }
 

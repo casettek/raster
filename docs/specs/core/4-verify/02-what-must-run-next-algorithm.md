@@ -88,7 +88,7 @@ To derive next-step inputs mechanically, a verifier needs committed per-step I/O
 The current implementation carries the minimum proof boundary in two layers:
 
 - `StepRecord` commits the step ordering, I/O commitments, external-input commitment, input-source commitment, and storage roots.
-- The fraud window's part segments carry the witnesses: each `TransitionStep` (the TRANSITION part) carries the replay journal and structured input-source witnesses (`FnInput`), and each `StorageStep` (the storage part) the storage read/write witnesses.
+- The fraud window's part segments carry the witnesses: each `TransitionStep` (the transition part) carries the replay journal and structured input-source witnesses (`FnInput`), and each `StorageStep` (the storage part) the storage read/write witnesses.
 
 Minimum required record per tile execution (including each recursion iteration) is:
 

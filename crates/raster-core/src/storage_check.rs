@@ -6,7 +6,7 @@
 //! and the step's write (or its absence) moves the append log and the
 //! coordinate index to the roots the record claims. It derives one
 //! [`StorageStepEntry`] per step and commits the segment's record chain, its
-//! store before and after, and the two columns it produces for the TRANSITION
+//! store before and after, and the two columns it produces for the transition
 //! part ([`crate::fraud_window::PartSegmentJournal`]).
 //!
 //! A segment of one step is the per-step mode; a segment covering the window is
@@ -74,7 +74,7 @@ pub struct StorageStep {
     /// Anchored to `step_record.input_source_commitment`.
     pub input_source_witness: Option<FnInput>,
     /// Folded to the commitments `input_source_witness` binds. Also read by
-    /// the TRANSITION part, through the `Selections` column.
+    /// the transition part, through the `Selections` column.
     pub storage_selection_witnesses: BTreeMap<String, SelectionWitness>,
     /// Append-log and coordinate-index proofs. Only this guest reads them.
     pub storage_witness: Option<StorageWitness>,
@@ -95,10 +95,10 @@ pub struct StorageStepEntry {
     /// [`selection_witnesses_commitment`] of the selection witnesses the checks
     /// ran on: the `Selections` column's value.
     ///
-    /// **Load-bearing.** Recur and io read these witnesses in the TRANSITION
+    /// **Load-bearing.** Recur and io read these witnesses in the transition
     /// part assuming the storage check folded them, and the record anchors
     /// them only through those folds. The column chain is what makes the
-    /// TRANSITION part's copy the folded one.
+    /// transition part's copy the folded one.
     pub selection_witnesses_commitment: Hash32,
     pub trace_position: u64,
     pub before: StorageState,

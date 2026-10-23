@@ -1,7 +1,7 @@
 //! Cross-step recur loop state that a fraud-proof window can *verify* rather
 //! than inherit.
 //!
-//! The TRANSITION part proves a segment of steps per execution, so anything
+//! The transition part proves a segment of steps per execution, so anything
 //! holding across steps travels in its state — committed as a digest, and
 //! stitched by FRAUD WINDOW to the state the segment before ended on. A
 //! window's **first** step has no segment before it, so its starting state

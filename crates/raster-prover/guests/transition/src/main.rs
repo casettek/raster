@@ -1,4 +1,4 @@
-//! RISC0 guest program for the TRANSITION part of a fraud window
+//! RISC0 guest program for the transition part of a fraud window
 //! (`docs/proposals/transition-split.md`): io, recur, drafts and entrypoint
 //! over a segment of steps, verifying no receipt. Commits a
 //! `PartSegmentJournal` that FRAUD WINDOW stitches and compares.
