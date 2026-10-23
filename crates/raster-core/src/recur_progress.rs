@@ -1,10 +1,11 @@
 //! Cross-step recur loop state that a fraud-proof window can *verify* rather
 //! than inherit.
 //!
-//! The transition guest proves one step per execution, so anything holding
-//! across steps travels in `Transition` — pinned by the previous journal's
-//! receipt, which is sound for every `Next` step. A window's **first** step has
-//! no previous journal, so its starting state comes straight off the host.
+//! The TRANSITION part proves a segment of steps per execution, so anything
+//! holding across steps travels in its state — committed as a digest, and
+//! stitched by FRAUD WINDOW to the state the segment before ended on. A
+//! window's **first** step has no segment before it, so its starting state
+//! comes straight off the host.
 //!
 //! That is fine for fields that are re-derived or compared against something.
 //! It is not fine for a map that is only ever read. Give

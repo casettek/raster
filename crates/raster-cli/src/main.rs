@@ -226,6 +226,14 @@ enum Commands {
         #[arg(long, conflicts_with = "commit")]
         audit: Option<String>,
 
+        /// How many fraud-proof window steps one trace receipt covers, when an
+        /// audit proves fraud: `window` (the default) binds and judges the
+        /// whole window in one receipt; `<n>` does it `n` steps at a time, each
+        /// segment re-binding the window to the commitment. The proof is the
+        /// same either way.
+        #[arg(long = "trace-segment", requires = "audit", default_value = "window")]
+        trace_segment: raster_prover::segments::SegmentLength,
+
         /// How many fraud-proof window steps one control-flow receipt covers,
         /// when an audit proves fraud: `window` (the default) proves the
         /// window's control flow in one receipt; `<n>` proves it `n` steps at a
@@ -242,14 +250,31 @@ enum Commands {
         #[arg(long = "storage-segment", requires = "audit", default_value = "window")]
         storage_segment: raster_prover::segments::SegmentLength,
 
-        /// How many fraud-proof window steps one transition-guest execution
-        /// proves, when an audit proves fraud: `window` (the default) proves
-        /// the whole window in one transition receipt; `<n>` proves it `n`
-        /// steps at a time, each execution resuming from the previous one's
-        /// journal, so `1` is one receipt per step. The proof is the same
-        /// either way.
+        /// How many fraud-proof window steps one TRANSITION receipt covers
+        /// (io, recur, drafts, entrypoint), when an audit proves fraud:
+        /// `window` (the default) checks the whole window in one receipt;
+        /// `<n>` checks it `n` steps at a time, each segment starting from the
+        /// state the one before it ended on, so `1` is one receipt per step.
+        /// The proof is the same either way.
         #[arg(long = "transition-segment", requires = "audit", default_value = "window")]
         transition_segment: raster_prover::segments::SegmentLength,
+
+        /// The zkVM proving segment size when an audit proves fraud: 2^N
+        /// cycles per segment, N in 13..=22. risc0 defaults to 2^20; a smaller
+        /// size needs less GPU memory (an 8 GB GPU needs 18). Not related to
+        /// the `--*-segment` options above, which count window steps. The
+        /// proof is the same either way.
+        #[arg(long = "zkvm-segment-po2", requires = "audit")]
+        zkvm_segment_po2: Option<raster_prover::segments::ZkvmSegmentPo2>,
+
+        /// How many independent proofs run at once when an audit proves fraud:
+        /// the tile replays, the authorization, and every trace, control-flow,
+        /// storage and TRANSITION segment, before FRAUD WINDOW. Default 1, in
+        /// order. More pays only with somewhere to run them: CPU cores, a GPU
+        /// with memory for several proofs, or a remote prover. On an 8 GB GPU
+        /// keep 1. The proof is the same either way.
+        #[arg(long = "parallel-provers", requires = "audit")]
+        parallel_provers: Option<raster_prover::schedule::ProverWorkers>,
 
         /// Run without authenticated storage: tile outputs are passed as plain
         /// Rust values, nothing is hashed or stored between tiles, and no trace
@@ -369,6 +394,16 @@ enum ChainCommand {
         /// Path to the chain-commitment written by `chain run`. Omit to use the
         /// most recent run under `target/raster/chains/`.
         chain_commitment: Option<String>,
+
+        /// The zkVM proving segment size: 2^N cycles per segment, N in
+        /// 13..=22 (see `run --zkvm-segment-po2`).
+        #[arg(long = "zkvm-segment-po2")]
+        zkvm_segment_po2: Option<raster_prover::segments::ZkvmSegmentPo2>,
+
+        /// How many independent proofs run at once (see
+        /// `run --parallel-provers`).
+        #[arg(long = "parallel-provers")]
+        parallel_provers: Option<raster_prover::schedule::ProverWorkers>,
     },
 
     /// Verify a chain fraud receipt against the local chain-commitment and
@@ -510,7 +545,14 @@ fn try_main() -> Result<()> {
             ChainCommand::FraudProve {
                 chain,
                 chain_commitment,
-            } => chain::fraud_prove(chain.as_deref(), chain_commitment.as_deref()),
+                zkvm_segment_po2,
+                parallel_provers,
+            } => chain::fraud_prove(
+                chain.as_deref(),
+                chain_commitment.as_deref(),
+                zkvm_segment_po2.unwrap_or_default(),
+                parallel_provers.unwrap_or_default(),
+            ),
             ChainCommand::FraudVerify {
                 receipt,
                 chain,
@@ -529,9 +571,12 @@ fn try_main() -> Result<()> {
             fraud_proof_config,
             fraud_step,
             audit,
+            trace_segment,
             control_flow_segment,
             storage_segment,
             transition_segment,
+            zkvm_segment_po2,
+            parallel_provers,
             no_auth,
             verbose,
             show_output,
@@ -547,10 +592,15 @@ fn try_main() -> Result<()> {
             fraud_proof_config,
             fraud_step.as_ref(),
             audit.as_deref(),
-            raster_prover::segments::SegmentLengths {
-                control_flow: control_flow_segment,
-                storage: storage_segment,
-                transition: transition_segment,
+            raster_prover::segments::ProveOptions {
+                segments: raster_prover::segments::SegmentLengths {
+                    trace: trace_segment,
+                    control_flow: control_flow_segment,
+                    storage: storage_segment,
+                    transition: transition_segment,
+                },
+                zkvm_segment_po2: zkvm_segment_po2.unwrap_or_default(),
+                workers: parallel_provers.unwrap_or_default(),
             },
             no_auth,
             verbose,

@@ -8,7 +8,6 @@ use raster_core::cfs::{
     RecurSequenceItem, FIRST_COORDINATE,
     RecurTileItem, SequenceChildItem, SequenceDef, SequenceItem, TileDef, TileItem,
 };
-use raster_core::coordinate_index::coordinate_index_root;
 use raster_core::draft::{
     draft_root_from_witness, draft_value_root, schema_hash as compute_schema_hash, DraftOp,
     DraftReplayTransition, DraftStateWitness, DraftTransitionWitness, DraftWitnessField,
@@ -27,26 +26,41 @@ use raster_core::trace::{
     StorageData, StorageRoots,
 };
 use raster_core::transition::{
-    SerializableFrontier, StorageEntry, StorageWitness,
+    StorageEntry, StorageWitness,
 };
 
 use crate::checks::recur::verify_recur_iteration_chunking;
 use crate::checks::drafts::verify_draft_transition;
-use crate::checks::io::{
-    input_source_commitment, verify_input_source_anchored, verify_io_witness, verify_step_record,
-};
+use crate::checks::io::{input_source_commitment, verify_io_witness, verify_step_record};
+use guest_common::input_source::verify_input_source_anchored;
 use guest_common::storage::{StorageCursor, StorageInput};
 use guest_common::storage_fixtures::{
     build_read_witness, build_storage_context, tile_step_with_store_roots,
 };
-use raster_core::merkle::{to_node_hash, NodeHash};
-use crate::merkle_tree::{
-    sha256_bytes, sha256_hex, Bytes, TraceBridgeTree,
-    EMPTY_LEAF,
-};
+use crate::merkle_tree::{sha256_bytes, Bytes, EMPTY_LEAF};
 
 fn sha(bytes: &[u8]) -> Vec<u8> {
     sha256_bytes(bytes)
+}
+
+/// Selection witnesses as a check consumes them from the storage check, for a
+/// test that drives the check on its own (`checks::columns`).
+fn consumed_selections(
+    witnesses: &BTreeMap<String, SelectionWitness>,
+) -> crate::checks::columns::Selections<'_> {
+    crate::checks::columns::Consumed::unchecked(witnesses)
+}
+
+/// The store before a step as a check consumes it. Only the roots are read.
+fn consumed_store(
+    root: &[u8],
+    index_root: &[u8],
+) -> crate::checks::columns::Consumed<raster_core::storage_check::StorageState> {
+    crate::checks::columns::Consumed::unchecked(raster_core::storage_check::StorageState {
+        position: 0,
+        root: root.to_vec(),
+        index_root: index_root.to_vec(),
+    })
 }
 
 struct DemoDraft;
@@ -150,7 +164,7 @@ fn storage_inputs_witness(bindings: &[(&str, CfsCoordinates, Vec<u8>)]) -> FnInp
             .iter()
             .map(|(name, coordinates, commitment)| {
                 // A whole-object storage binding's commitment *is* its raster
-                // selection root (see `checks::store`'s structural-consistency
+                // selection root (see the storage guest's structural-consistency
                 // assertion), so the fixture mirrors that invariant.
                 let source_root_hash: [u8; 32] = commitment
                     .clone()
@@ -316,7 +330,7 @@ fn sweep_source_binding() -> StorageData {
 
 /// What a chunked iteration records for its item: `RecurInput` as argument 0,
 /// selecting `[start, start + width)` of the 6-element source, with the
-/// selection witness `checks::store` has already verified. Rule 8 reads only
+/// selection witness the storage guest has already verified. Rule 8 reads only
 /// the path, the proof's final step and the payload's element count.
 fn sweep_item_witness(start: u64, width: u64) -> (FnInput, BTreeMap<String, SelectionWitness>) {
     let source = sweep_source_binding();
@@ -410,10 +424,9 @@ fn advance_seeded(seed: &mut RecurProgressStack, iteration: CfsCoordinate, recor
         None,
         Some(&input),
         None,
-        &witnesses,
+        &consumed_selections(&witnesses),
         None,
-        &[],
-        &[],
+        &consumed_store(&[], &[]),
     );
 }
 
@@ -604,7 +617,17 @@ fn a_sequence_end_may_not_carry_an_input_source_witness() {
         recur_progress_commitment: RecurProgressStack::new().commitment(),
         recur_state: None,
     };
-    verify_step_record(&step, None, None, None, None, Some(&input), &BTreeMap::new());
+    let commitment = input_source_commitment(&input);
+    let _ = verify_step_record(
+        &step,
+        None,
+        None,
+        None,
+        None,
+        Some(&input),
+        Some(commitment.as_slice()),
+        &consumed_selections(&BTreeMap::new()),
+    );
 }
 
 #[test]
@@ -621,7 +644,16 @@ fn a_sequence_end_without_an_input_source_witness_is_accepted() {
     };
     // `output_commitment` is still checked against the recorded output bytes —
     // dropping the *input* side leaves the end's own fact intact.
-    verify_step_record(&step, None, None, None, Some(&b"".to_vec()), None, &BTreeMap::new());
+    let _ = verify_step_record(
+        &step,
+        None,
+        None,
+        None,
+        Some(&b"".to_vec()),
+        None,
+        None,
+        &consumed_selections(&BTreeMap::new()),
+    );
 }
 
 /// The input source anchor on its own (`control-flow-prover` step 3). The CFS
@@ -1317,573 +1349,6 @@ fn genesis_authorization_rejects_forged_entry_object_commitment() {
 }
 
 // ============================================================================
-// Fingerprint slice binding (`assert_window_is_commitment_slice`)
-// ============================================================================
-
-mod fingerprint_slice {
-    use super::*;
-    use raster_core::fingerprint::{BitPacker, Fingerprint};
-    use raster_core::transition::InitTransition;
-    use raster_core::transition::{
-        FingerprintBlockWitness, FingerprintSliceWitness, TraceCommitmentHeader,
-    };
-
-    use crate::fraud_proof::assert_window_is_commitment_slice;
-
-    /// Mirror of the prover's fingerprint-block tree: leaf `i` =
-    /// `sha256(bits[i].to_le_bytes())`, combined by the shared trace-tree
-    /// convention. Rebuilt here so the guest-side check is exercised against
-    /// an independently constructed witness.
-    /// A header whose declared window size matches the window being built —
-    /// the ordinary case, and what every slice test other than the shape tests
-    /// wants.
-    fn build_header_and_witness(
-        bits: &[u64],
-        bits_per_item: usize,
-        fingerprint_len: usize,
-        window_start: usize,
-        window_len: usize,
-    ) -> (TraceCommitmentHeader, FingerprintSliceWitness) {
-        build_header_and_witness_for_window(
-            bits,
-            bits_per_item,
-            fingerprint_len,
-            window_start,
-            window_len,
-            window_len,
-        )
-    }
-
-    /// A header whose tail-roots commitment matches `tail_roots`, so the
-    /// revealed-tail binding can be exercised.
-    fn build_header_and_witness_with_tail(
-        bits: &[u64],
-        bits_per_item: usize,
-        fingerprint_len: usize,
-        window_start: usize,
-        window_len: usize,
-        tail_roots: &[NodeHash],
-    ) -> (TraceCommitmentHeader, FingerprintSliceWitness) {
-        let (mut header, witness) = build_header_and_witness_for_window(
-            bits,
-            bits_per_item,
-            fingerprint_len,
-            window_start,
-            window_len,
-            tail_roots.len(),
-        );
-        header.revealed_tail_roots_commitment = sha256_bytes(
-            &postcard::to_allocvec(&tail_roots.to_vec()).expect("tail roots serialize"),
-        );
-        (header, witness)
-    }
-
-    /// As above, but the commitment declares `window_size` independently of the
-    /// window actually presented — which is what the shape check is about.
-    fn build_header_and_witness_for_window(
-        bits: &[u64],
-        bits_per_item: usize,
-        fingerprint_len: usize,
-        window_start: usize,
-        window_len: usize,
-        window_size: usize,
-    ) -> (TraceCommitmentHeader, FingerprintSliceWitness) {
-        let first_block = (window_start * bits_per_item) / 64;
-        let last_block = ((window_start + window_len) * bits_per_item - 1) / 64;
-
-        let mut tree = TraceBridgeTree::new(1);
-        let mut marked = Vec::new();
-        for (index, block) in bits.iter().enumerate() {
-            tree.append(Bytes(sha256_bytes(&block.to_le_bytes())));
-            if (first_block..=last_block).contains(&index) {
-                marked.push(tree.mark().expect("mark fingerprint block"));
-            }
-        }
-        let fingerprint_root = tree.root(0).expect("fingerprint root").0;
-
-        let blocks = (first_block..=last_block)
-            .zip(marked)
-            .map(|(index, position)| {
-                let path = tree.witness(position, 0).expect("block witness");
-                FingerprintBlockWitness {
-                    block: bits[index],
-                    position: u64::from(position),
-                    path_elems: path.iter().map(|elem| to_node_hash(&elem.0)).collect(),
-                }
-            })
-            .collect();
-
-        let header = TraceCommitmentHeader {
-            bits_packer: BitPacker::new(bits_per_item),
-            fingerprint_len: fingerprint_len as u64,
-            fingerprint_root,
-            revealed_items_commitment: vec![9; 32],
-            window_size: window_size as u64,
-            revealed_tail_roots_commitment: vec![8; 32],
-        };
-        (header, FingerprintSliceWitness { blocks })
-    }
-
-    fn init_transition_with_window(window_start: usize, window: Fingerprint) -> InitTransition {
-        InitTransition {
-            // Only the frontier's position matters to the slice check: it is
-            // what fixes the window's offset in the committed fingerprint.
-            init_frontier: SerializableFrontier {
-                position: window_start as u64,
-                leaf: EMPTY_LEAF.to_vec(),
-                ommers: Vec::new(),
-            },
-            init_storage_frontier: SerializableFrontier {
-                position: 0,
-                leaf: EMPTY_LEAF.to_vec(),
-                ommers: Vec::new(),
-            },
-            init_storage_root: Vec::new(),
-            init_storage_index_root: Vec::new(),
-            fingerprint: window,
-        }
-    }
-
-    /// 40 items at 4 bits each = 160 bits = 3 packed blocks, with per-item
-    /// values `i & 0xf` so every offset mistake changes some value.
-    fn fixture_bits(bits_per_item: usize, items: usize) -> Vec<u64> {
-        let packer = BitPacker::new(bits_per_item);
-        let hashes: Vec<Vec<u8>> = (0..items).map(|i| vec![i as u8; 32]).collect();
-        packer.pack(&hashes)
-    }
-
-    /// Regression for the unbound-shape hole (was a proof of concept).
-    ///
-    /// `window_len` comes from the challenger's `Fingerprint::len` — a metadata
-    /// field `Fingerprint::from` stores verbatim without checking it against
-    /// `bits` — and `window_start` from the challenger's frontier position. The
-    /// only constraint used to be `window_start + window_len <=
-    /// fingerprint_len`: an upper bound, not a shape.
-    ///
-    /// A two-item window is the degenerate case, not a merely unusual one. Over
-    /// `L` items `finalize` never compares item 0, requires items `1..L-2` to
-    /// match, and requires item `L-1` to diverge — so at `L = 2` there are
-    /// **zero** matching comparisons, nothing pins the challenger's opening
-    /// state to reality, and a window fabricated anywhere in the trace reaches
-    /// `Finished`.
-    ///
-    /// Note the slice itself is *genuine* here: no bits are tampered, no
-    /// witness is forged. The lie is only the window's shape, which is why no
-    /// other check catches it.
-    #[test]
-    #[should_panic(expected = "against a commitment built with a window of")]
-    fn a_short_window_is_refused_anywhere_in_the_commitment() {
-        let (bits_per_item, items) = (4, 40);
-        let bits = fixture_bits(bits_per_item, items);
-        // Mid-commitment, arbitrary, and nothing like a head or terminal window.
-        let (window_start, window_len, window_size) = (20, 2, 4);
-
-        let packer = BitPacker::new(bits_per_item);
-        let window_bits = packer
-            .get_range(window_start, window_start + window_len, &bits)
-            .expect("window slice");
-        let window = Fingerprint::from(window_bits, packer, window_len);
-
-        let (header, witness) = build_header_and_witness_for_window(
-            &bits,
-            bits_per_item,
-            items,
-            window_start,
-            window_len,
-            window_size,
-        );
-        assert_window_is_commitment_slice(
-            &init_transition_with_window(window_start, window),
-            &header,
-            &witness,
-            None,
-        );
-    }
-
-    /// The tail roots, when supplied, are bound to the commitment — and the
-    /// root the terminal step will need is picked out at the same time.
-    #[test]
-    fn a_window_ending_in_the_tail_carries_its_committed_root() {
-        let (bits_per_item, items) = (4, 40);
-        let bits = fixture_bits(bits_per_item, items);
-        // The commitment's window is 4, so its tail covers items 36..40.
-        // A window ending at item 39 ends inside it.
-        let (window_start, window_len) = (36, 4);
-        let tail_roots: Vec<NodeHash> = (36..40u8).map(|i| [i; 32].into()).collect();
-
-        let packer = BitPacker::new(bits_per_item);
-        let window_bits = packer
-            .get_range(window_start, window_start + window_len, &bits)
-            .expect("window slice");
-        let window = Fingerprint::from(window_bits, packer, window_len);
-
-        let (header, witness) = build_header_and_witness_with_tail(
-            &bits,
-            bits_per_item,
-            items,
-            window_start,
-            window_len,
-            &tail_roots,
-        );
-        let binding = assert_window_is_commitment_slice(
-            &init_transition_with_window(window_start, window),
-            &header,
-            &witness,
-            Some(&tail_roots),
-        );
-
-        assert!(binding.window_is_terminal);
-        // Item 39 is the last of the tail.
-        assert_eq!(binding.final_committed_root, Some(vec![39u8; 32]));
-    }
-
-    /// A window that ends before the revealed tail gets no root, and so keeps
-    /// proving divergence the only way it can — on fingerprint entries.
-    #[test]
-    fn a_window_ending_before_the_tail_carries_no_committed_root() {
-        let (bits_per_item, items) = (4, 40);
-        let bits = fixture_bits(bits_per_item, items);
-        let (window_start, window_len) = (10, 4);
-        let tail_roots: Vec<NodeHash> = (36..40u8).map(|i| [i; 32].into()).collect();
-
-        let packer = BitPacker::new(bits_per_item);
-        let window_bits = packer
-            .get_range(window_start, window_start + window_len, &bits)
-            .expect("window slice");
-        let window = Fingerprint::from(window_bits, packer, window_len);
-
-        let (header, witness) = build_header_and_witness_with_tail(
-            &bits,
-            bits_per_item,
-            items,
-            window_start,
-            window_len,
-            &tail_roots,
-        );
-        let binding = assert_window_is_commitment_slice(
-            &init_transition_with_window(window_start, window),
-            &header,
-            &witness,
-            Some(&tail_roots),
-        );
-
-        assert!(!binding.window_is_terminal);
-        assert_eq!(binding.final_committed_root, None);
-    }
-
-    /// Supplying roots the commitment did not commit to is refused — otherwise
-    /// a challenger could invent a root to "diverge" from.
-    #[test]
-    #[should_panic(expected = "do not match the commitment's tail-roots commitment")]
-    fn fabricated_tail_roots_are_refused() {
-        let (bits_per_item, items) = (4, 40);
-        let bits = fixture_bits(bits_per_item, items);
-        let (window_start, window_len) = (36, 4);
-        let committed: Vec<NodeHash> = (36..40u8).map(|i| [i; 32].into()).collect();
-
-        let packer = BitPacker::new(bits_per_item);
-        let window_bits = packer
-            .get_range(window_start, window_start + window_len, &bits)
-            .expect("window slice");
-        let window = Fingerprint::from(window_bits, packer, window_len);
-
-        let (header, witness) = build_header_and_witness_with_tail(
-            &bits,
-            bits_per_item,
-            items,
-            window_start,
-            window_len,
-            &committed,
-        );
-
-        // A different story about the tail, so the terminal step could claim a
-        // divergence that never happened.
-        let invented: Vec<NodeHash> = (36..40u8).map(|i| [i ^ 0xFF; 32].into()).collect();
-        assert_window_is_commitment_slice(
-            &init_transition_with_window(window_start, window),
-            &header,
-            &witness,
-            Some(&invented),
-        );
-    }
-
-    /// A window opening at the genesis state — the one place a short window is
-    /// legitimate.
-    fn genesis_init_transition(window: Fingerprint) -> InitTransition {
-        InitTransition {
-            init_frontier: SerializableFrontier {
-                position: 0,
-                leaf: EMPTY_LEAF.to_vec(),
-                ommers: Vec::new(),
-            },
-            init_storage_frontier: SerializableFrontier {
-                position: 0,
-                leaf: EMPTY_LEAF.to_vec(),
-                ommers: Vec::new(),
-            },
-            init_storage_root: Vec::new(),
-            init_storage_index_root: coordinate_index_root(&BTreeMap::new()),
-            fingerprint: window,
-        }
-    }
-
-    fn short_genesis_window(
-        bits: &[u64],
-        bits_per_item: usize,
-        items: usize,
-        window_len: usize,
-        window_size: usize,
-    ) -> (InitTransition, TraceCommitmentHeader, FingerprintSliceWitness) {
-        let packer = BitPacker::new(bits_per_item);
-        let window_bits = packer
-            .get_range(0, window_len, bits)
-            .expect("window slice");
-        let window = Fingerprint::from(window_bits, packer, window_len);
-        let (header, witness) = build_header_and_witness_for_window(
-            bits, bits_per_item, items, 0, window_len, window_size,
-        );
-        (genesis_init_transition(window), header, witness)
-    }
-
-    /// A divergence inside the trace's first `window_size` steps has no room
-    /// for a full window behind it, so the honest host emits a short one — and
-    /// it can only ever do so at trace index 0.
-    ///
-    /// It carries no pre-divergence margin, and needs none: the margin exists
-    /// to pin a *challenger-supplied* opening state, and at index 0 the opening
-    /// state is the public genesis constant instead.
-    #[test]
-    fn a_short_window_at_genesis_is_accepted() {
-        let (bits_per_item, items) = (4, 40);
-        let bits = fixture_bits(bits_per_item, items);
-        let (init, header, witness) = short_genesis_window(&bits, bits_per_item, items, 2, 4);
-
-        let binding = assert_window_is_commitment_slice(&init, &header, &witness, None);
-        assert!(!binding.window_is_terminal);
-    }
-
-    /// Even a one-item window, which is what a divergence in the trace's very
-    /// first step produces.
-    #[test]
-    fn a_one_item_genesis_window_is_accepted() {
-        let (bits_per_item, items) = (4, 40);
-        let bits = fixture_bits(bits_per_item, items);
-        let (init, header, witness) = short_genesis_window(&bits, bits_per_item, items, 1, 4);
-
-        assert_window_is_commitment_slice(&init, &header, &witness, None);
-    }
-
-    /// Position 0 alone is not enough: the opening *state* has to be genesis,
-    /// or the missing margin would be a hole rather than an irrelevance.
-    #[test]
-    #[should_panic(expected = "must open on an empty coordinate index")]
-    fn a_short_window_claiming_genesis_with_dirty_storage_is_refused() {
-        let (bits_per_item, items) = (4, 40);
-        let bits = fixture_bits(bits_per_item, items);
-        let (mut init, header, witness) = short_genesis_window(&bits, bits_per_item, items, 2, 4);
-
-        // Storage that already holds something cannot be the state before the
-        // program's first step.
-        init.init_storage_index_root = vec![7u8; 32];
-
-        assert_window_is_commitment_slice(&init, &header, &witness, None);
-    }
-
-    /// The other direction: claiming more items than the commitment's window.
-    #[test]
-    #[should_panic(expected = "against a commitment built with a window of")]
-    fn a_window_longer_than_the_commitments_is_refused() {
-        let (bits_per_item, items) = (4, 40);
-        let bits = fixture_bits(bits_per_item, items);
-        let (window_start, window_len, window_size) = (20, 8, 4);
-
-        let packer = BitPacker::new(bits_per_item);
-        let window_bits = packer
-            .get_range(window_start, window_start + window_len, &bits)
-            .expect("window slice");
-        let window = Fingerprint::from(window_bits, packer, window_len);
-
-        let (header, witness) = build_header_and_witness_for_window(
-            &bits,
-            bits_per_item,
-            items,
-            window_start,
-            window_len,
-            window_size,
-        );
-        assert_window_is_commitment_slice(
-            &init_transition_with_window(window_start, window),
-            &header,
-            &witness,
-            None,
-        );
-    }
-
-    #[test]
-    fn accepts_a_window_slice_crossing_a_block_boundary() {
-        let (bits_per_item, items) = (4, 40);
-        let bits = fixture_bits(bits_per_item, items);
-        // Items [14, 18) span bits [56, 72) — blocks 0 and 1.
-        let (window_start, window_len) = (14, 4);
-
-        let packer = BitPacker::new(bits_per_item);
-        let window_bits = packer
-            .get_range(window_start, window_start + window_len, &bits)
-            .expect("window slice");
-        let window = Fingerprint::from(window_bits, packer, window_len);
-
-        let (header, witness) =
-            build_header_and_witness(&bits, bits_per_item, items, window_start, window_len);
-        assert_window_is_commitment_slice(
-            &init_transition_with_window(window_start, window),
-            &header,
-            &witness,
-            None,
-        );
-    }
-
-    #[test]
-    #[should_panic(expected = "diverges from the committed fingerprint slice")]
-    fn rejects_a_window_fingerprint_not_in_the_commitment() {
-        let (bits_per_item, items) = (4, 40);
-        let bits = fixture_bits(bits_per_item, items);
-        let (window_start, window_len) = (14, 4);
-
-        let packer = BitPacker::new(bits_per_item);
-        let mut window_bits = packer
-            .get_range(window_start, window_start + window_len, &bits)
-            .expect("window slice");
-        // A challenger-fabricated "committed" fingerprint: one flipped value.
-        window_bits[0] ^= 0b1;
-        let window = Fingerprint::from(window_bits, packer, window_len);
-
-        let (header, witness) =
-            build_header_and_witness(&bits, bits_per_item, items, window_start, window_len);
-        assert_window_is_commitment_slice(
-            &init_transition_with_window(window_start, window),
-            &header,
-            &witness,
-            None,
-        );
-    }
-
-    #[test]
-    #[should_panic(expected = "diverges from the committed fingerprint slice")]
-    fn rejects_a_genuine_slice_claimed_at_the_wrong_offset() {
-        let (bits_per_item, items) = (4, 40);
-        let bits = fixture_bits(bits_per_item, items);
-        let (window_start, window_len) = (14, 4);
-
-        let packer = BitPacker::new(bits_per_item);
-        let window_bits = packer
-            .get_range(window_start, window_start + window_len, &bits)
-            .expect("window slice");
-        let window = Fingerprint::from(window_bits, packer, window_len);
-
-        // The frontier (and thus the derived offset) says one item later:
-        // the same committed blocks yield different values there.
-        let (header, witness) =
-            build_header_and_witness(&bits, bits_per_item, items, window_start + 1, window_len);
-        assert_window_is_commitment_slice(
-            &init_transition_with_window(window_start + 1, window),
-            &header,
-            &witness,
-            None,
-        );
-    }
-
-    #[test]
-    #[should_panic(expected = "block inclusion proof is invalid")]
-    fn rejects_a_tampered_block_value() {
-        let (bits_per_item, items) = (4, 40);
-        let bits = fixture_bits(bits_per_item, items);
-        let (window_start, window_len) = (14, 4);
-
-        let packer = BitPacker::new(bits_per_item);
-        let window_bits = packer
-            .get_range(window_start, window_start + window_len, &bits)
-            .expect("window slice");
-        let window = Fingerprint::from(window_bits, packer, window_len);
-
-        let (header, mut witness) =
-            build_header_and_witness(&bits, bits_per_item, items, window_start, window_len);
-        witness.blocks[0].block ^= 0b1;
-        assert_window_is_commitment_slice(
-            &init_transition_with_window(window_start, window),
-            &header,
-            &witness,
-            None,
-        );
-    }
-
-    #[test]
-    #[should_panic(expected = "Window range exceeds the committed fingerprint")]
-    fn rejects_a_window_past_the_committed_fingerprint() {
-        let (bits_per_item, items) = (4, 40);
-        let bits = fixture_bits(bits_per_item, items);
-        let (window_start, window_len) = (38, 4);
-
-        let packer = BitPacker::new(bits_per_item);
-        let window_bits = packer.get_range(36, 40, &bits).expect("window slice");
-        let window = Fingerprint::from(window_bits, packer, window_len);
-
-        let (header, witness) = build_header_and_witness(&bits, bits_per_item, items, 36, 4);
-        assert_window_is_commitment_slice(
-            &init_transition_with_window(window_start, window),
-            &header,
-            &witness,
-            None,
-        );
-    }
-
-    /// Build a valid window at `[window_start, window_start + window_len)` of
-    /// a `items`-long commitment and report whether the check calls it
-    /// terminal.
-    fn terminality_of(window_start: usize, window_len: usize) -> bool {
-        let (bits_per_item, items) = (4, 40);
-        let bits = fixture_bits(bits_per_item, items);
-
-        let packer = BitPacker::new(bits_per_item);
-        let window_bits = packer
-            .get_range(window_start, window_start + window_len, &bits)
-            .expect("window slice");
-        let window = Fingerprint::from(window_bits, packer, window_len);
-
-        let (header, witness) =
-            build_header_and_witness(&bits, bits_per_item, items, window_start, window_len);
-        assert_window_is_commitment_slice(
-            &init_transition_with_window(window_start, window),
-            &header,
-            &witness,
-            None,
-        )
-        .window_is_terminal
-    }
-
-    /// A window ending exactly at the committed fingerprint's end is terminal:
-    /// a `ProgramEnd` inside it is the commitment's last item.
-    #[test]
-    fn a_window_ending_at_the_commitment_end_is_terminal() {
-        // Items [36, 40) of a 40-item commitment.
-        assert!(terminality_of(36, 4));
-    }
-
-    /// The case the flag exists for. This window is a perfectly valid slice —
-    /// the check passes — but it sits mid-commitment, so a `ProgramEnd` found
-    /// inside it would *not* be the trace's result.
-    #[test]
-    fn a_valid_mid_commitment_window_is_not_terminal() {
-        assert!(!terminality_of(14, 4));
-    }
-
-    /// Off by exactly one item. Terminality is an equality, not a bound.
-    #[test]
-    fn a_window_one_item_short_of_the_end_is_not_terminal() {
-        assert!(!terminality_of(35, 4));
-    }
-}
-
-// ============================================================================
 // Program output binding (`verify_program_end`)
 // ============================================================================
 
@@ -2120,8 +1585,7 @@ mod program_end {
             cfs,
             &record,
             &program_end,
-            &root,
-            &index_root,
+            &consumed_store(&root, &index_root),
             Some(&read_witness),
             witness,
         )
@@ -2387,8 +1851,7 @@ mod program_end {
                 &no_entrypoint_cfs(),
                 &record,
                 &program_end,
-                &EMPTY_LEAF.to_vec(),
-                &Vec::new(),
+                &consumed_store(&EMPTY_LEAF.to_vec(), &Vec::new()),
                 None,
                 None,
             ),
@@ -2677,7 +2140,7 @@ fn a_state_plus_output_site_is_not_pinned_by_its_state() {
 // Rule 8 for recur-sequence iterations
 //
 // An iteration `Start` is a sequence boundary: no storage roots, so
-// `checks::store` folds none of its witnesses. The item check verifies the one
+// the storage guest folds none of its witnesses. The item check verifies the one
 // it reads, then holds it to the site's source and the sweep position.
 // ---------------------------------------------------------------------------
 
@@ -2832,10 +2295,9 @@ fn advance_lines_iteration(
         None,
         Some(input),
         None,
-        witnesses,
+        &consumed_selections(witnesses),
         None,
-        &[],
-        &[],
+        &consumed_store(&[], &[]),
     );
 }
 
@@ -3005,10 +2467,9 @@ fn run_site_start(
         None,
         Some(&input),
         None,
-        &witnesses,
+        &consumed_selections(&witnesses),
         None,
-        &[],
-        &[],
+        &consumed_store(&[], &[]),
     );
     let storage_witness = read.map(|entry| StorageWitness {
         reads: vec![build_read_witness(store, entry)],
@@ -3364,222 +2825,6 @@ fn a_tile_reading_the_value_inside_an_err_is_rejected() {
     );
 }
 
-/// `authorization-image-id-unpinned` gap 1: a `Next` step must verify its
-/// authorization journal — and its control-flow and storage receipts — against
-/// the same guests as the step before it.
-mod authorization_continuity {
-    use super::*;
-    use crate::fraud_proof::{
-        assert_authorization_continuity, assert_control_flow_continuity, assert_storage_continuity,
-    };
-    use raster_core::fingerprint::{BitPacker, Fingerprint};
-    use raster_core::transition::{
-        InitTransition, OutputAuthorization, TransitionJournal, TransitionState,
-    };
-
-    fn journal_naming(authorization_image_id: Vec<u8>) -> TransitionJournal {
-        let frontier = SerializableFrontier {
-            position: 0,
-            leaf: EMPTY_LEAF.to_vec(),
-            ommers: Vec::new(),
-        };
-        TransitionJournal {
-            init_state: InitTransition {
-                init_frontier: frontier.clone(),
-                init_storage_frontier: frontier,
-                init_storage_root: Vec::new(),
-                init_storage_index_root: coordinate_index_root(&BTreeMap::new()),
-                fingerprint: Fingerprint::from(vec![0], BitPacker::new(64), 1),
-            },
-            current_state: TransitionState::Finished,
-            transition_image_id: vec![1; 32],
-            authorization_image_id,
-            control_flow_image_id: vec![5; 32],
-            storage_image_id: vec![8; 32],
-            input_manifest_commitment: vec![2; 32],
-            program_commitment: vec![3; 32],
-            refuted_trace_commitment: vec![4; 32],
-            entrypoint_authorization: EntrypointAuthorization::Established,
-            output_authorization: OutputAuthorization::NotRequired,
-            window_is_terminal: false,
-            final_committed_root: None,
-        }
-    }
-
-    #[test]
-    fn the_same_authorization_guest_across_steps_is_accepted() {
-        assert_authorization_continuity(&journal_naming(vec![7; 32]), &[7; 32]);
-    }
-
-    /// The window's earlier step verified a journal from one guest; this step
-    /// names another. Only the last id reaches the `Finished` journal, so
-    /// accepting the switch would let the earlier step rest on a guest no
-    /// relying party ever sees.
-    #[test]
-    #[should_panic(expected = "Authorization image ID is not the same within the fraud proof")]
-    fn switching_authorization_guests_mid_window_is_refused() {
-        assert_authorization_continuity(&journal_naming(vec![6; 32]), &[7; 32]);
-    }
-
-    /// The control-flow id follows the same rule (`control-flow-prover` step 6):
-    /// the previous journal names `[5; 32]`.
-    #[test]
-    fn the_same_control_flow_guest_across_steps_is_accepted() {
-        assert_control_flow_continuity(&journal_naming(vec![7; 32]), &[5; 32]);
-    }
-
-    #[test]
-    #[should_panic(expected = "Control-flow image ID is not the same within the fraud proof")]
-    fn switching_control_flow_guests_mid_window_is_refused() {
-        assert_control_flow_continuity(&journal_naming(vec![7; 32]), &[6; 32]);
-    }
-
-    /// And the storage id (`storage-prover` step 4): the previous journal
-    /// names `[8; 32]`.
-    #[test]
-    fn the_same_storage_guest_across_steps_is_accepted() {
-        assert_storage_continuity(&journal_naming(vec![7; 32]), &[8; 32]);
-    }
-
-    #[test]
-    #[should_panic(expected = "Storage image ID is not the same within the fraud proof")]
-    fn switching_storage_guests_mid_window_is_refused() {
-        assert_storage_continuity(&journal_naming(vec![7; 32]), &[9; 32]);
-    }
-}
-
-/// `transition-segments`: within one execution, a step after the first may
-/// carry none of the window-opening inputs, and is authorized by the journal
-/// the segment verified once.
-mod segment_inputs {
-    use super::*;
-    use crate::fraud_proof::{assert_init_only_inputs_absent, assert_same_authorization};
-    use raster_core::control_flow::{ControlFlowEntry, ControlFlowEvidence, ControlFlowJournal};
-    use raster_core::storage_check::{
-        StorageEvidence, StorageJournal, StorageState, StorageStepEntry,
-    };
-    use raster_core::transition::TransitionInput;
-
-    /// A later step's input as an honest host sends it: no window-opening
-    /// inputs. Its evidence is never read by the asserts under test.
-    fn later_step() -> TransitionInput {
-        let state = StorageState {
-            position: 0,
-            root: Vec::new(),
-            index_root: Vec::new(),
-        };
-        TransitionInput {
-            step_record: sequence_start_step(CfsCoordinates(vec![2]), Vec::new()),
-            replay_journal: None,
-            input_witness: None,
-            output_witness: None,
-            input_source_witness: None,
-            storage_selection_witnesses: BTreeMap::new(),
-            draft_transition_witness: None,
-            control_flow: ControlFlowEvidence {
-                journal: ControlFlowJournal {
-                    program_commitment: Vec::new(),
-                    first_position: 0,
-                    entry_count: 1,
-                    entries_root: [0; 32],
-                },
-                entry: ControlFlowEntry {
-                    step_record_hash: Vec::new(),
-                    input_source_commitment: None,
-                    trace_position: 0,
-                    trace_root_before: Vec::new(),
-                    expected_before: None,
-                    expected_after: Vec::new(),
-                },
-                path: Vec::new(),
-            },
-            storage: StorageEvidence {
-                journal: StorageJournal {
-                    first_position: 0,
-                    entry_count: 1,
-                    entries_root: [0; 32],
-                },
-                entry: StorageStepEntry {
-                    step_record_hash: Vec::new(),
-                    input_source_commitment: None,
-                    selection_witnesses_commitment: [0; 32],
-                    trace_position: 0,
-                    before: state.clone(),
-                    after: state,
-                },
-                path: Vec::new(),
-            },
-            authorization_image_id: vec![7; 32],
-            authorization_journal: authorization_journal("arg", &sha(b"arg")),
-            window_start_recur_progress: None,
-            entrypoint_membership_witness: None,
-            program_output_read_witness: None,
-            program_output_selection_witness: None,
-            returned_state_read_witness: None,
-            revealed_tail_roots: None,
-        }
-    }
-
-    #[test]
-    fn a_later_step_without_window_opening_inputs_is_accepted() {
-        assert_init_only_inputs_absent(&later_step());
-    }
-
-    #[test]
-    #[should_panic(expected = "Only a window's opening step may carry a recur-progress seed")]
-    fn a_later_step_carrying_a_recur_seed_is_refused() {
-        let mut input = later_step();
-        input.window_start_recur_progress = Some(RecurProgressStack::new());
-        assert_init_only_inputs_absent(&input);
-    }
-
-    #[test]
-    #[should_panic(expected = "Only a window's opening step may carry an entrypoint membership witness")]
-    fn a_later_step_carrying_an_entrypoint_witness_is_refused() {
-        let entry = StorageEntry {
-            coordinates: CfsCoordinates(vec![]),
-            object_commitment: sha(b"entry"),
-        };
-        let mut input = later_step();
-        input.entrypoint_membership_witness = Some(build_read_witness(&[entry.clone()], &entry));
-        assert_init_only_inputs_absent(&input);
-    }
-
-    #[test]
-    #[should_panic(expected = "Only a window's opening step may carry the revealed tail roots")]
-    fn a_later_step_carrying_tail_roots_is_refused() {
-        let mut input = later_step();
-        input.revealed_tail_roots = Some(Vec::new());
-        assert_init_only_inputs_absent(&input);
-    }
-
-    #[test]
-    fn a_later_step_under_the_verified_authorization_is_accepted() {
-        assert_same_authorization(&later_step(), &later_step());
-    }
-
-    /// A later step naming another authorization guest: the segment verified
-    /// the journal against the first step's id only.
-    #[test]
-    #[should_panic(expected = "Authorization image ID is not the same within the fraud proof")]
-    fn a_later_step_under_another_authorization_guest_is_refused() {
-        let mut input = later_step();
-        input.authorization_image_id = vec![8; 32];
-        assert_same_authorization(&later_step(), &input);
-    }
-
-    /// A later step carrying another journal — here one authorizing a
-    /// different commitment under the same manifest. The segment never
-    /// verified it, and the step's entrypoint check would read it.
-    #[test]
-    #[should_panic(expected = "Authorization journal is not the same within a transition segment")]
-    fn a_later_step_under_another_authorization_journal_is_refused() {
-        let mut input = later_step();
-        input.authorization_journal = authorization_journal("arg", &sha(b"another"));
-        assert_same_authorization(&later_step(), &input);
-    }
-}
-
-mod control_flow;
+mod columns;
+mod part;
 mod recur;
-mod store;

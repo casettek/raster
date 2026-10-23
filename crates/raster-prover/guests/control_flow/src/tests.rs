@@ -9,7 +9,7 @@ use raster_core::cfs::{
     TileItem, FIRST_COORDINATE,
 };
 use raster_core::control_flow::{ControlFlowInput, ControlFlowSegment, ControlFlowStep};
-use raster_core::transition::SerializableFrontier;
+use raster_core::transition::{InitTransition, SerializableFrontier};
 use raster_core::input::{Hash32, SelectionWitness, SelectorSegment};
 use raster_core::merkle::to_node_hash;
 use raster_core::recur_progress::RecurProgressStack;
@@ -26,7 +26,8 @@ use guest_common::merkle_tree::{
 };
 
 use crate::checks::{
-    verify_exec_index, verify_segment, verify_sequence_id, verify_sequence_scope_parent,
+    segment_journal, verify_exec_index, verify_segment, verify_segment_to_end, verify_sequence_id,
+    verify_sequence_scope_parent,
     verify_step, verify_step_record_inputs,
 };
 
@@ -133,7 +134,25 @@ fn segment(
     expected_before: Option<Vec<CfsCoordinates>>,
     steps: Vec<ControlFlowStep>,
 ) -> ControlFlowSegment {
+    // The window opens here exactly when nothing is expected yet; otherwise
+    // the segment sits inside a window that opened earlier.
+    let mut init_frontier = serialize_frontier(start);
+    if expected_before.is_some() {
+        init_frontier.position += 1000;
+    }
     ControlFlowSegment {
+        init: InitTransition {
+            init_frontier,
+            init_storage_frontier: serialize_frontier(start),
+            init_storage_root: vec![0; 32],
+            init_storage_index_root: vec![0; 32],
+            fingerprint: raster_core::fingerprint::Fingerprint {
+                bits_packer: raster_core::fingerprint::BitPacker::new(8),
+                bits: vec![0],
+                len: 1,
+            },
+        },
+        records_before: [0; 32],
         start_frontier: serialize_frontier(start),
         expected_before,
         steps,
@@ -183,6 +202,67 @@ fn one_segment_and_one_step_segments_commit_the_same_entries() {
         per_step.push(entry);
     }
     assert_eq!(whole, per_step);
+}
+
+/// The segment opening the window starts from its initial frontier with
+/// nothing expected, not from a state of the host's choosing.
+#[test]
+#[should_panic(expected = "a segment opening the window must start from the window's initial frontier")]
+fn an_opening_segment_with_expected_coordinates_is_refused() {
+    let mut opening = segment(&seed_frontier(), None, one_tile_run());
+    opening.expected_before = Some(Vec::new());
+    verify_segment(&one_tile_cfs(), opening);
+}
+
+#[test]
+#[should_panic(expected = "a segment opening the window must start from the window's initial frontier")]
+fn an_opening_segment_from_another_frontier_is_refused() {
+    let mut opening = segment(&seed_frontier(), None, one_tile_run());
+    opening.start_frontier.leaf = vec![1; 32];
+    verify_segment(&one_tile_cfs(), opening);
+}
+
+/// One-step segments' journals continue each other and end where the whole
+/// window's journal does: what FRAUD WINDOW stitches.
+#[test]
+fn one_step_segment_journals_stitch_to_the_whole() {
+    let cfs = one_tile_cfs();
+    let steps = one_tile_run();
+    let program = vec![7; 32];
+    let journal = |segment: ControlFlowSegment| {
+        let (window, records_before) = (raster_core::fraud_window::window_id(&segment.init), segment.records_before);
+        let (entries, end_root) = verify_segment_to_end(&cfs, segment);
+        segment_journal(window, program.clone(), records_before, &entries, &end_root)
+    };
+    let whole = journal(segment(&seed_frontier(), None, steps.clone()));
+
+    let mut frontier = seed_frontier();
+    let mut expected = None;
+    let mut records_before = [0; 32];
+    let mut previous: Option<raster_core::fraud_window::PartSegmentJournal> = None;
+    for step in steps {
+        let record_hash = hash_trace_item(&step.step_record);
+        let mut one = segment(&frontier, expected.clone(), vec![step.clone()]);
+        one.records_before = records_before;
+        let next = journal(one);
+        if let Some(previous) = &previous {
+            assert_eq!(previous.state.after, next.state.before);
+            assert_eq!(previous.records.after, next.records.before);
+        }
+        expected = Some(
+            verify_segment(&cfs, segment(&frontier, expected.clone(), vec![step]))
+                .pop()
+                .unwrap()
+                .expected_after,
+        );
+        frontier.append(Bytes(record_hash));
+        records_before = next.records.after;
+        previous = Some(next);
+    }
+    let last = previous.unwrap();
+    assert_eq!(last.state.after, whole.state.after);
+    assert_eq!(last.records.after, whole.records.after);
+    assert_eq!(whole.program_commitment, Some(program));
 }
 
 /// Inside a segment the guest holds each step to the previous one's

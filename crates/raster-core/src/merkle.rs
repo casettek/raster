@@ -1,5 +1,5 @@
 //! Constants of the bridgetree Merkle trees behind trace and storage
-//! commitments, shared by the host prover and the transition guest.
+//! commitments, shared by the host prover and the guests.
 //!
 //! Both sides hash an inner node as `sha256(level ‖ left ‖ right)` (`combine`
 //! on `Bytes` in `raster-prover`'s `trace.rs` and in the transition guest's

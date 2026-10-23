@@ -1,8 +1,9 @@
 //! The recur checks: chunking, and the recur-progress stack every recur step
 //! advances — rule 8's item selection, the carried-state chain, the site draft,
 //! the returned state. Unlike the control-flow check these read the replay
-//! journal, storage roots and the draft step, which is why they live apart from
-//! `checks::control_flow`. See `docs/proposals/control-flow-prover.md` step 5.
+//! journal, storage roots and the draft step, which is why they live in the
+//! TRANSITION part rather than the control-flow guest. See
+//! `docs/proposals/control-flow-prover.md` step 5.
 
 use std::collections::BTreeMap;
 
@@ -17,8 +18,11 @@ use raster_core::input::{
 use raster_core::recur_progress::{
     source_identity, DraftStep, RecurProgressStack, RecurSiteKind, SiteDraft,
 };
+use raster_core::storage_check::StorageState;
 use raster_core::trace::{FnInput, FnInputValue, StepKind, StepRecord, StorageData};
 use raster_core::transition::StorageReadWitness;
+
+use crate::checks::columns::{Consumed, Selections};
 
 /// For an iteration of a recur site with a CFS-declared chunk size, verify the
 /// iteration consumed a chunk of `1..=declared` elements.
@@ -101,8 +105,8 @@ pub fn verify_recur_iteration_chunking(
 /// **Authenticated by the same step, not by this function.** A site `Start`
 /// must claim read-only storage roots (`advance_recur_progress`), so the
 /// storage guest reads the source object against the store and folds this
-/// metadata witness to its commitment, and `checks::store` holds this guest's
-/// witness map to the one it folded. Any failure rejects the step, so the `L`
+/// metadata witness to its commitment, and the `Selections` column ties this
+/// part's witness map to the one it folded. Any failure rejects the step, so the `L`
 /// read here only stands if they pass.
 /// Before the roots, a boundary step got neither check, and a fabricated empty
 /// list swept zero times passed rule 7. See
@@ -309,8 +313,8 @@ pub(crate) fn verify_returned_state(
 /// A recur tile iteration's item: its first parameter, the `RecurInput`,
 /// which the driver records as a storage binding under the parameter's own
 /// name — so it is found by position, never by a fixed name — together with
-/// its selection witness, folded by the storage guest — `checks::store` holds
-/// this guest's witness map to the one it folded.
+/// its selection witness, folded by the storage guest — the `Selections` column
+/// ties this part's witness map to the one it folded.
 fn recur_item_selection<'a>(
     step_record: &StepRecord,
     input_source_witness: Option<&'a FnInput>,
@@ -498,11 +502,16 @@ pub fn advance_recur_progress(
     draft_step: Option<&DraftStep>,
     input_source_witness: Option<&FnInput>,
     output_witness: Option<&Vec<u8>>,
-    storage_selection_witnesses: &BTreeMap<String, SelectionWitness>,
+    // Both consumed from the storage check (`checks::columns`).
+    selections: &Selections<'_>,
     returned_state_read_witness: Option<&StorageReadWitness>,
-    current_storage_root: &[u8],
-    current_index_root: &[u8],
+    // No step that reads a returned state writes, so the store before the
+    // step is the one the read is against.
+    store_before: &Consumed<StorageState>,
 ) {
+    let storage_selection_witnesses: &BTreeMap<String, SelectionWitness> = selections.get();
+    let current_storage_root: &[u8] = &store_before.get().root;
+    let current_index_root: &[u8] = &store_before.get().index_root;
     let coordinates = step_record.coordinates();
     // Set for a recur tile's iteration: its return is the site's draft, so a
     // site owning an object requires a transition from every one.

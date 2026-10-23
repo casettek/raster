@@ -151,6 +151,9 @@ pub struct Risc0Backend {
     user_crate_path: Option<PathBuf>,
     /// Artifact store for caching compiled artifacts.
     artifact_store: Risc0ArtifactStore,
+    /// The zkVM proving segment size, 2^po2 cycles; `None` for risc0's default
+    /// (2^20). See `raster_prover::segments::ZkvmSegmentPo2`.
+    segment_limit_po2: Option<u32>,
 }
 
 impl Risc0Backend {
@@ -160,7 +163,14 @@ impl Risc0Backend {
             output_dir,
             user_crate_path: None,
             artifact_store: Risc0ArtifactStore::new(),
+            segment_limit_po2: None,
         }
+    }
+
+    /// Prove tiles with 2^po2-cycle zkVM segments instead of risc0's default.
+    pub fn with_segment_limit_po2(mut self, po2: Option<u32>) -> Self {
+        self.segment_limit_po2 = po2;
+        self
     }
 
     /// Set the path to the user's crate containing tiles.
@@ -277,7 +287,11 @@ impl Backend for Risc0Backend {
         // Build the executor environment with the input
         // Write length first, then raw bytes (guest expects this format)
         let input_len = input.len() as u32;
-        let env = ExecutorEnv::builder()
+        let mut builder = ExecutorEnv::builder();
+        if let Some(po2) = self.segment_limit_po2 {
+            builder.segment_limit_po2(po2);
+        }
+        let env = builder
             .write(&input_len)
             .map_err(|e| Error::Other(format!("Failed to write input length: {}", e)))?
             .write_slice(input)
@@ -298,7 +312,8 @@ impl Backend for Risc0Backend {
                 let output = replay_output.output_bytes;
                 let cycles = session.cycles();
 
-                Ok(TileExecutionResult::estimate(output, cycles))
+                Ok(TileExecutionResult::estimate(output, cycles)
+                    .with_journal(session.journal.bytes.clone()))
             }
             ExecutionMode::Prove { verify } => {
                 let prover = risc0_zkvm::default_prover();

@@ -16,10 +16,10 @@
 //! hash to its declared commitment — it is not given the inputs, and could not.
 //!
 //! So the entire trust anchor for a program's external inputs is one value:
-//! `input_manifest_commitment = sha256(manifest_bytes)`. It is carried on every
-//! [`TransitionJournal`](raster_core::transition::TransitionJournal) and held
-//! continuous across a window by `assert_manifest_continuity` in the transition
-//! guest. A verifier is expected to compare it against a manifest obtained
+//! `input_manifest_commitment = sha256(manifest_bytes)`. It is carried on the
+//! [`FraudWindowJournal`](raster_core::fraud_window::FraudWindowJournal), from
+//! the one authorization journal FRAUD WINDOW verifies and every TRANSITION
+//! segment of the window read. A verifier is expected to compare it against a manifest obtained
 //! **independently of the prover**.
 //!
 //! That comparison is the data-availability layer. Nothing in this workspace

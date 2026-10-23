@@ -156,3 +156,11 @@ The transition guest's image id moves, as any guest change does. Verified end to
 Still not done: the reproduction above (a second, forged authorization guest) was not built, so
 the attack itself has not been demonstrated. And direction 2 holds only for verifiers that call
 `verify_fraud_proof_receipt`. A settlement contract written later has to make the same check.
+
+**Superseded 2026-10-22 by FRAUD WINDOW** (`transition-split` migration steps 4–5). The fraud
+proof is now a FRAUD WINDOW receipt, and every inner guest id — the authorization guest's among
+them — is compiled into that guest rather than read from the host or a journal. The bug class
+can't recur: no image id is an input anywhere in the single-program path, and a relying party
+pins one id, `FRAUD_WINDOW_GUEST_ID` (`raster_prover::fraud_window::verify_fraud_window_receipt`).
+The continuity asserts, `verify_fraud_proof_receipt` and the transition chain they protected are
+deleted.

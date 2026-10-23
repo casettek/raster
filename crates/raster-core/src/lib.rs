@@ -39,13 +39,15 @@ pub mod control_flow;
 #[cfg(feature = "std")]
 pub mod coordinate_index;
 #[cfg(feature = "std")]
+pub mod fraud_window;
+#[cfg(feature = "std")]
 pub mod manifest;
 #[cfg(feature = "std")]
 pub mod schema;
 #[cfg(feature = "std")]
-pub mod segment_tree;
-#[cfg(feature = "std")]
 pub mod storage_check;
+#[cfg(feature = "std")]
+pub mod trace_check;
 #[cfg(feature = "std")]
 pub mod transition;
 

@@ -72,10 +72,9 @@ fn a_forged_seed_is_rejected() {
         None,
         Some(&input),
         None,
-        &witnesses,
+        &consumed_selections(&witnesses),
         None,
-        &[],
-        &[],
+        &consumed_store(&[], &[]),
     );
 }
 
@@ -97,10 +96,9 @@ fn a_seeded_window_that_rereads_the_first_chunk_is_rejected() {
         None,
         Some(&input),
         None,
-        &witnesses,
+        &consumed_selections(&witnesses),
         None,
-        &[],
-        &[],
+        &consumed_store(&[], &[]),
     );
 }
 
@@ -120,10 +118,9 @@ fn a_recur_iteration_without_an_item_is_rejected() {
         None,
         None,
         None,
-        &BTreeMap::new(),
+        &consumed_selections(&BTreeMap::new()),
         None,
-        &[],
-        &[],
+        &consumed_store(&[], &[]),
     );
 }
 

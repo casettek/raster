@@ -35,7 +35,6 @@ use raster_core::chain::{
 use raster_core::input::{payload_structural_root, scalar_leaf_root, IndexWidth};
 use raster_core::program::commitment_of_bytes;
 use raster_core::trace::Trace;
-use raster_core::transition::TransitionJournal;
 use raster_core::{Error, Result};
 use raster_prover::authorization::{authorization_guest_image_id, authorize_external_inputs};
 use raster_prover::chain_fraud::{prove_chain_fraud, verify_chain_fraud_receipt};
@@ -1287,6 +1286,8 @@ fn prove_terminal_window(
     recorded: &RecordedChain,
     stage_index: usize,
     fraud_proof_config: FraudProofConfig,
+    zkvm_segment_po2: raster_prover::segments::ZkvmSegmentPo2,
+    workers: raster_prover::schedule::ProverWorkers,
 ) -> Result<risc0_zkvm::Receipt> {
     let stage = &recorded.spec.stages[stage_index];
     let stage_dir = recorded.chain_dir.join(&stage.name);
@@ -1322,7 +1323,8 @@ fn prove_terminal_window(
         .map_err(|e| Error::Other(e.to_string()))?;
 
     let backend = raster_backend_risc0::Risc0Backend::new(project.output_dir.clone())
-        .with_user_crate(project.root_dir.clone());
+        .with_user_crate(project.root_dir.clone())
+        .with_segment_limit_po2(zkvm_segment_po2.po2());
     let replayer = Replayer::new(&backend, &project);
     Ok(crate::commands::prove::prove(
         window,
@@ -1333,8 +1335,12 @@ fn prove_terminal_window(
         Some(&input_manifest_path.to_string_lossy().to_string()),
         &trace_commitment,
         // Chain evidence proves its terminal window with the default segment
-        // lengths.
-        raster_prover::segments::SegmentLengths::default(),
+        // lengths, and the zkVM segment size the caller chose.
+        raster_prover::segments::ProveOptions {
+            segments: Default::default(),
+            zkvm_segment_po2,
+            workers,
+        },
     ))
 }
 
@@ -1498,7 +1504,12 @@ fn write_chain_fraud_receipt(
 /// single succinct chain fraud receipt: link faults first (no re-execution
 /// needed), then execution fraud via the single-program pipeline aggregated
 /// by the chain-fraud guest.
-pub fn fraud_prove(manifest: Option<&str>, chain_commitment: Option<&str>) -> Result<()> {
+pub fn fraud_prove(
+    manifest: Option<&str>,
+    chain_commitment: Option<&str>,
+    zkvm_segment_po2: raster_prover::segments::ZkvmSegmentPo2,
+    workers: raster_prover::schedule::ProverWorkers,
+) -> Result<()> {
     // Loaded as the claimer asserts it, not as a verifier would accept it: the
     // first thing checked below is whether that assertion is even self-consistent.
     let recorded = load_recorded_chain(manifest, chain_commitment, ShapePolicy::AsClaimed)?;
@@ -1528,7 +1539,7 @@ pub fn fraud_prove(manifest: Option<&str>, chain_commitment: Option<&str>) -> Re
                 repeat_index: repeat_index as u32,
             },
         };
-        let receipt = prove_chain_fraud(&input, None);
+        let receipt = prove_chain_fraud(&input, None, zkvm_segment_po2);
         return write_chain_fraud_receipt(&recorded, &receipt);
     }
 
@@ -1538,7 +1549,7 @@ pub fn fraud_prove(manifest: Option<&str>, chain_commitment: Option<&str>) -> Re
             stage_index, recorded.chain.stages[stage_index].name
         );
         let (authorization_receipt, authorization_journal) =
-            authorize_external_inputs(&ManifestedInputs { manifest_bytes });
+            authorize_external_inputs(&ManifestedInputs { manifest_bytes }, zkvm_segment_po2);
         let input = ChainFraudInput {
             chain_commitment_bytes: recorded.chain_bytes.clone(),
             faulty_stage: stage_index as u32,
@@ -1548,7 +1559,7 @@ pub fn fraud_prove(manifest: Option<&str>, chain_commitment: Option<&str>) -> Re
                 authorization_image_id: authorization_guest_image_id(),
             },
         };
-        let receipt = prove_chain_fraud(&input, Some(authorization_receipt));
+        let receipt = prove_chain_fraud(&input, Some(authorization_receipt), zkvm_segment_po2);
         return write_chain_fraud_receipt(&recorded, &receipt);
     }
 
@@ -1572,14 +1583,19 @@ pub fn fraud_prove(manifest: Option<&str>, chain_commitment: Option<&str>) -> Re
     // challenge/response protocol, not by a single self-contained receipt
     // (`docs/proposals/chain-io-commitment.md` §3, §7). What is produced here
     // is the object that protocol opens a challenge with.
-    println!("proving stage '{stage_name}' terminal window (transition guest)…");
+    println!("proving stage '{stage_name}' terminal window (FRAUD WINDOW)…");
     let fraud_proof_config = FraudProofConfig::from_window_size(EVIDENCE_WINDOW_SIZE)
         .map_err(|e| Error::Other(e.to_string()))?;
-    let receipt = prove_terminal_window(&recorded, fraud.stage_index, fraud_proof_config)?;
-    let journal: TransitionJournal = receipt
-        .journal
-        .decode()
-        .map_err(|e| Error::Other(format!("failed to decode terminal-window journal: {e}")))?;
+    let receipt =
+        prove_terminal_window(
+            &recorded,
+            fraud.stage_index,
+            fraud_proof_config,
+            zkvm_segment_po2,
+            workers,
+        )?;
+    let journal = raster_prover::fraud_window::verify_fraud_window_receipt(&receipt)
+        .map_err(|e| Error::Other(format!("terminal-window receipt: {e}")))?;
 
     let evidence_path = recorded.chain_dir.join("execution-fraud.receipt");
     std::fs::write(&evidence_path, postcard::to_allocvec(&receipt).unwrap())

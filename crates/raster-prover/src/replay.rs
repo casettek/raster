@@ -66,6 +66,32 @@ impl<'a> Replayer<'a> {
             .map_err(|_| Error::Other("Tile image id must be 32 bytes".into()))
     }
 
+    /// Execute a tile on `input` without proving it, and return its image id
+    /// and replay journal: what a fraud window's semantic checks read. The
+    /// receipt is proven separately; FRAUD WINDOW holds it to this journal.
+    pub fn execute(&self, tile_id: &str, input_bytes: &[u8]) -> Result<([u8; 32], TileReplayJournal)> {
+        let discovery = TileDiscovery::new(self.project);
+        let tile = discovery.get(tile_id).ok_or_else(|| {
+            Error::InvalidTileId(format!("Tile '{}' not found in project", tile_id))
+        })?;
+        let artifact = self
+            .backend
+            .compile_tile(&tile.to_metadata(), tile.to_content_hash())?;
+        let image_id: [u8; 32] = hex::decode(artifact.artifact_id())
+            .ok()
+            .and_then(|bytes| bytes.try_into().ok())
+            .ok_or_else(|| Error::Other("Tile image id must be 32 hex-encoded bytes".into()))?;
+        let result = self
+            .backend
+            .execute_tile(artifact.as_ref(), input_bytes, ExecutionMode::Estimate)?;
+        let journal = result.journal.ok_or_else(|| {
+            Error::Other("This backend does not return a tile's journal without proving".into())
+        })?;
+        let replay_journal = raster_core::postcard::from_bytes(&journal)
+            .map_err(|e| Error::Other(format!("Failed to decode replay journal: {}", e)))?;
+        Ok((image_id, replay_journal))
+    }
+
     /// Replay a single trace item.
     ///
     /// This method:

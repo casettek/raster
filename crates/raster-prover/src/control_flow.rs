@@ -1,11 +1,11 @@
 //! Host driver for the control-flow guest.
 //!
 //! The control-flow guest proves the CFS conformance of a segment of
-//! consecutive transition steps, and every transition step in the segment takes
-//! that receipt as an assumption. Segments depend on no transition receipt: the
+//! consecutive window steps and commits a `PartSegmentJournal`, which FRAUD
+//! WINDOW stitches to its neighbours'. Segments depend on no other receipt: the
 //! trace frontier advances by each record's hash, and the coordinates a step may
 //! take follow from the previous record and the CFS. So every segment can be
-//! proven before the transition chain starts.
+//! proven at once.
 //!
 //! How many steps a segment covers is [`SegmentLength`]: the whole window
 //! by default, or any fixed number — one being the per-step mode. The guests
@@ -15,10 +15,9 @@
 use std::collections::{BTreeMap, HashMap};
 
 use raster_core::cfs::{CfsCoordinates, CfsCursor};
-use raster_core::control_flow::{
-    entries_root, entry_path, expected_successors, ControlFlowEntry, ControlFlowEvidence,
-    ControlFlowJournal, ControlFlowSegment, ControlFlowStep,
-};
+use raster_core::control_flow::{expected_successors, ControlFlowSegment, ControlFlowStep};
+use raster_core::fraud_window::{window_id, Chain};
+use raster_core::transition::InitTransition;
 use raster_core::program::ProgramDefinition;
 use raster_core::trace::StepRecord;
 use raster_core::transition::StepRecordWitness;
@@ -27,8 +26,9 @@ use crate::trace::{
     serializable_frontier_from_trace_frontier, serializable_frontier_into_trace_frontier, Bytes,
     BytesHashable, SerializableFrontier, TraceTreeFrontier,
 };
-use crate::segments::SegmentLength;
+use crate::segments::{SegmentLength, ZkvmSegmentPo2};
 use crate::transition::{write_frame, write_postcard, StepIo};
+use crate::window::{prove_part_segment, ProvenPartSegment};
 use crate::{CONTROL_FLOW_GUEST_ELF, CONTROL_FLOW_GUEST_ID};
 
 fn image_id_bytes(image_id: [u32; 8]) -> Vec<u8> {
@@ -43,76 +43,29 @@ pub fn control_flow_guest_image_id() -> Vec<u8> {
     image_id_bytes(CONTROL_FLOW_GUEST_ID)
 }
 
-/// One proven segment: its receipt, its journal, and the entries the journal's
-/// root is over.
-pub struct ProvenSegment {
-    pub receipt: risc0_zkvm::Receipt,
-    pub journal: ControlFlowJournal,
-    pub entries: Vec<ControlFlowEntry>,
-}
-
-impl ProvenSegment {
-    /// The evidence for the segment's entry `index`: the journal, the entry,
-    /// and its path to the journal's root.
-    pub fn evidence(&self, index: usize) -> ControlFlowEvidence {
-        let leaves: Vec<_> = self.entries.iter().map(ControlFlowEntry::leaf_hash).collect();
-        ControlFlowEvidence {
-            journal: self.journal.clone(),
-            entry: self.entries[index].clone(),
-            path: entry_path(&leaves, index),
-        }
-    }
-}
-
 /// Prove the control-flow check for one segment. The host write order is the
 /// one the guest reads: the program frame, then the segment.
-///
-/// The guest commits only a root over its entries and writes the entries to
-/// stdout. They are not trusted: this refuses them unless they fold to the
-/// committed root, and every transition step checks its own against it again.
 pub fn prove_control_flow_segment(
     program_frame: &[u8],
     segment: &ControlFlowSegment,
-) -> ProvenSegment {
-    let prover = risc0_zkvm::default_prover();
-    let mut stdout = Vec::new();
-    let receipt = {
-        // Scoped: the builder borrows `stdout` until it is dropped.
-        let mut builder = risc0_zkvm::ExecutorEnv::builder();
-        write_frame(&mut builder, program_frame);
-        write_postcard(&mut builder, segment);
-        builder.stdout(&mut stdout);
-        let env = builder.build().unwrap();
-        prover
-            .prove(env, &CONTROL_FLOW_GUEST_ELF)
-            .unwrap_or_else(|e| {
-                let first = segment.steps.first().map(|step| &step.step_record.coordinates);
-                panic!("control-flow guest refused the segment starting at {first:?}: {e}")
-            })
-            .receipt
-    };
-    let journal = ControlFlowJournal::decode(&receipt.journal.bytes)
-        .expect("the control-flow guest commits a postcard-encoded journal");
-    let entries: Vec<ControlFlowEntry> = postcard::from_bytes(&stdout)
-        .expect("the control-flow guest writes its entries to stdout");
-    let leaves: Vec<_> = entries.iter().map(ControlFlowEntry::leaf_hash).collect();
-    assert_eq!(
-        (entries.len() as u64, entries_root(&leaves)),
-        (journal.entry_count, journal.entries_root),
-        "the control-flow guest's entries are not the ones its journal commits",
-    );
-    ProvenSegment {
-        receipt,
-        journal,
-        entries,
-    }
+    zkvm_segment_po2: ZkvmSegmentPo2,
+) -> ProvenPartSegment {
+    let mut builder = zkvm_segment_po2.env_builder();
+    write_frame(&mut builder, program_frame);
+    write_postcard(&mut builder, segment);
+    let first = segment.steps.first().map(|step| step.step_record.coordinates.clone());
+    prove_part_segment(
+        CONTROL_FLOW_GUEST_ELF,
+        builder.build().unwrap(),
+        format_args!("control-flow guest refused the segment starting at {first:?}"),
+    )
 }
 
 /// The trace state before each step of a window, tracked the way the
-/// transition guest tracks it: the frontier starts at the window's initial
+/// control-flow guest tracks it: the frontier starts at the window's initial
 /// frontier and grows by one record hash per step, and the expected coordinates
-/// start at `None` — the transition guest's state at `Init` — and become each
-/// step's successor set.
+/// start at `None` — nothing is expected where the window opens — and become
+/// each step's successor set.
 struct ControlFlowWalk {
     cfs: CfsCursor,
     frontier: TraceTreeFrontier,
@@ -162,18 +115,20 @@ fn control_flow_step(
 /// state the previous one ends in.
 pub fn plan_control_flow_segments(
     program_frame: &[u8],
-    initial_frontier: &SerializableFrontier,
+    init: &InitTransition,
     window: &[StepRecord],
     recorded_step_io: &HashMap<StepRecord, StepIo>,
     sequence_scope_parents: &BTreeMap<u64, (StepRecord, StepRecordWitness)>,
     segments: SegmentLength,
 ) -> Vec<ControlFlowSegment> {
-    let mut walk = ControlFlowWalk::new(program_frame, initial_frontier);
+    let mut walk = ControlFlowWalk::new(program_frame, &init.init_frontier);
+    let mut records = Chain::records(&window_id(init));
     window
         .chunks(segments.len_for(window.len()))
         .map(|chunk| {
             let start_frontier = serializable_frontier_from_trace_frontier(walk.frontier.clone());
             let expected_before = walk.expected.clone();
+            let records_before = records.value();
             let steps = chunk
                 .iter()
                 .map(|step_record| {
@@ -182,57 +137,19 @@ pub fn plan_control_flow_segments(
                     });
                     let step = control_flow_step(step_record, step_io, sequence_scope_parents);
                     walk.advance(step_record);
+                    records.fold(&step_record.hash());
                     step
                 })
                 .collect();
             ControlFlowSegment {
+                init: init.clone(),
+                records_before,
                 start_frontier,
                 expected_before,
                 steps,
             }
         })
         .collect()
-}
-
-/// The proven segments of a window, and which one covers each step.
-pub struct ProvenControlFlow {
-    segment_len: usize,
-    segments: Vec<ProvenSegment>,
-}
-
-impl ProvenControlFlow {
-    /// Plan and prove every segment of `window`.
-    pub fn prove(
-        program_frame: &[u8],
-        initial_frontier: &SerializableFrontier,
-        window: &[StepRecord],
-        recorded_step_io: &HashMap<StepRecord, StepIo>,
-        sequence_scope_parents: &BTreeMap<u64, (StepRecord, StepRecordWitness)>,
-        segments: SegmentLength,
-    ) -> Self {
-        let planned = plan_control_flow_segments(
-            program_frame,
-            initial_frontier,
-            window,
-            recorded_step_io,
-            sequence_scope_parents,
-            segments,
-        );
-        Self {
-            segment_len: segments.len_for(window.len()),
-            segments: planned
-                .iter()
-                .map(|segment| prove_control_flow_segment(program_frame, segment))
-                .collect(),
-        }
-    }
-
-    /// The receipt covering the window's step at `index`, and that step's
-    /// evidence.
-    pub fn for_step(&self, index: usize) -> (&risc0_zkvm::Receipt, ControlFlowEvidence) {
-        let segment = &self.segments[index / self.segment_len];
-        (&segment.receipt, segment.evidence(index % self.segment_len))
-    }
 }
 
 #[cfg(test)]
@@ -296,11 +213,26 @@ mod tests {
         (steps, io)
     }
 
+    /// A seven-step window opening at `frontier`, over `storage_frontier`.
+    fn window_init(frontier: SerializableFrontier, storage_frontier: SerializableFrontier) -> InitTransition {
+        InitTransition {
+            init_frontier: frontier,
+            init_storage_frontier: storage_frontier,
+            init_storage_root: vec![0; 32],
+            init_storage_index_root: vec![0; 32],
+            fingerprint: raster_core::fingerprint::Fingerprint::from(
+                vec![0],
+                raster_core::fingerprint::BitPacker::new(8),
+                7,
+            ),
+        }
+    }
+
     fn plan(segments: SegmentLength) -> Vec<ControlFlowSegment> {
         let (steps, io) = window();
         plan_control_flow_segments(
             &program_frame(),
-            &seed_frontier(),
+            &window_init(seed_frontier(), seed_frontier()),
             &steps,
             &io,
             &BTreeMap::new(),

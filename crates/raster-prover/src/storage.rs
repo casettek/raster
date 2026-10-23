@@ -1,11 +1,11 @@
 //! Host driver for the storage guest.
 //!
 //! The storage guest proves the storage transitions of a segment of
-//! consecutive transition steps, and every transition step in the segment takes
-//! that receipt as an assumption. Segments depend on no transition receipt: the
-//! store before each step follows from the window's initial store and the
-//! writes of the steps before it, all of which the host recorded. So every
-//! segment can be proven before the transition chain starts.
+//! consecutive window steps and commits a `PartSegmentJournal`, producing the
+//! two columns the TRANSITION part consumes. Segments depend on no other
+//! receipt: the store before each step follows from the window's initial store
+//! and the writes of the steps before it, all of which the host recorded. So
+//! every segment can be proven at once.
 //!
 //! How many steps a segment covers is [`SegmentLength`]: the whole window by
 //! default, or any fixed number — one being the per-step mode. The guests and
@@ -15,19 +15,21 @@ use std::collections::HashMap;
 
 use sha2::{Digest, Sha256};
 
+use raster_core::fraud_window::{storage_state_digest, window_id, WindowChains};
 use raster_core::storage_check::{
-    entries_root, entry_path, StorageEvidence, StorageJournal, StorageSegmentHeader, StorageStep,
-    StorageStepEntry,
+    selection_witnesses_commitment, StorageSegmentHeader, StorageState, StorageStep,
 };
 use raster_core::trace::StepRecord;
-use raster_core::transition::StorageEntry;
+use raster_core::transition::{InitTransition, StorageEntry};
 
-use crate::segments::SegmentLength;
+use crate::segments::{SegmentLength, ZkvmSegmentPo2};
 use crate::trace::{
-    serializable_frontier_from_trace_frontier, serializable_frontier_into_trace_frontier, Bytes,
-    SerializableFrontier, TraceTreeFrontier,
+    frontier_root, serializable_frontier_from_trace_frontier,
+    serializable_frontier_into_trace_frontier, Bytes, BytesHashable, SerializableFrontier,
+    TraceTreeFrontier,
 };
 use crate::transition::{write_postcard, StepIo};
+use crate::window::{prove_part_segment, ProvenPartSegment};
 use crate::{STORAGE_GUEST_ELF, STORAGE_GUEST_ID};
 
 /// The storage guest's image id, as the byte encoding journals carry.
@@ -46,67 +48,23 @@ pub struct StorageSegment {
     pub steps: Vec<StorageStep>,
 }
 
-/// One proven segment: its receipt, its journal, and the entries the journal's
-/// root is over.
-pub struct ProvenStorageSegment {
-    pub receipt: risc0_zkvm::Receipt,
-    pub journal: StorageJournal,
-    pub entries: Vec<StorageStepEntry>,
-}
-
-impl ProvenStorageSegment {
-    /// The evidence for the segment's entry `index`: the journal, the entry,
-    /// and its path to the journal's root.
-    pub fn evidence(&self, index: usize) -> StorageEvidence {
-        let leaves: Vec<_> = self.entries.iter().map(StorageStepEntry::leaf_hash).collect();
-        StorageEvidence {
-            journal: self.journal.clone(),
-            entry: self.entries[index].clone(),
-            path: entry_path(&leaves, index),
-        }
+/// Prove the storage check for one segment: the header frame, then one frame
+/// per step.
+pub fn prove_storage_segment(
+    segment: &StorageSegment,
+    zkvm_segment_po2: ZkvmSegmentPo2,
+) -> ProvenPartSegment {
+    let mut builder = zkvm_segment_po2.env_builder();
+    write_postcard(&mut builder, &segment.header);
+    for step in &segment.steps {
+        write_postcard(&mut builder, step);
     }
-}
-
-/// Prove the storage check for one segment.
-///
-/// The guest commits only a root over its entries and writes the entries to
-/// stdout. They are not trusted: this refuses them unless they fold to the
-/// committed root, and every transition step checks its own against it again.
-pub fn prove_storage_segment(segment: &StorageSegment) -> ProvenStorageSegment {
-    let prover = risc0_zkvm::default_prover();
-    let mut stdout = Vec::new();
-    let receipt = {
-        // Scoped: the builder borrows `stdout` until it is dropped.
-        let mut builder = risc0_zkvm::ExecutorEnv::builder();
-        write_postcard(&mut builder, &segment.header);
-        for step in &segment.steps {
-            write_postcard(&mut builder, step);
-        }
-        builder.stdout(&mut stdout);
-        let env = builder.build().unwrap();
-        prover
-            .prove(env, &STORAGE_GUEST_ELF)
-            .unwrap_or_else(|e| {
-                let first = segment.steps.first().map(|step| &step.step_record.coordinates);
-                panic!("storage guest refused the segment starting at {first:?}: {e}")
-            })
-            .receipt
-    };
-    let journal = StorageJournal::decode(&receipt.journal.bytes)
-        .expect("the storage guest commits a postcard-encoded journal");
-    let entries: Vec<StorageStepEntry> =
-        postcard::from_bytes(&stdout).expect("the storage guest writes its entries to stdout");
-    let leaves: Vec<_> = entries.iter().map(StorageStepEntry::leaf_hash).collect();
-    assert_eq!(
-        (entries.len() as u64, entries_root(&leaves)),
-        (journal.entry_count, journal.entries_root),
-        "the storage guest's entries are not the ones its journal commits",
-    );
-    ProvenStorageSegment {
-        receipt,
-        journal,
-        entries,
-    }
+    let first = segment.steps.first().map(|step| step.step_record.coordinates.clone());
+    prove_part_segment(
+        STORAGE_GUEST_ELF,
+        builder.build().unwrap(),
+        format_args!("storage guest refused the segment starting at {first:?}"),
+    )
 }
 
 /// `sha256(entry)`: the append log's leaf for a write, as the guest hashes it
@@ -137,6 +95,15 @@ impl StorageWalk {
         }
     }
 
+    /// The store now, as the storage guest's entries and columns name it.
+    fn state(&self) -> StorageState {
+        StorageState {
+            position: self.frontier.position().into(),
+            root: frontier_root(&self.frontier),
+            index_root: self.index_root.clone(),
+        }
+    }
+
     /// Move past `step_record`: append its write, if any, and take its index
     /// root after.
     fn advance(&mut self, step_record: &StepRecord, step_io: &StepIo) {
@@ -164,24 +131,50 @@ fn storage_step(step_record: &StepRecord, step_io: &StepIo) -> StorageStep {
     }
 }
 
+/// The store before each step of a window, as the storage part produces it
+/// into the `StoreBefore` column: what the TRANSITION part is handed.
+pub fn stores_before(
+    init: &InitTransition,
+    window: &[StepRecord],
+    recorded_step_io: &HashMap<StepRecord, StepIo>,
+) -> Vec<StorageState> {
+    let mut walk = StorageWalk::new(&init.init_storage_frontier, &init.init_storage_index_root);
+    window
+        .iter()
+        .map(|step_record| {
+            let before = walk.state();
+            walk.advance(step_record, step_io_for(recorded_step_io, step_record));
+            before
+        })
+        .collect()
+}
+
+fn step_io_for<'a>(recorded_step_io: &'a HashMap<StepRecord, StepIo>, step_record: &StepRecord) -> &'a StepIo {
+    recorded_step_io
+        .get(step_record)
+        .unwrap_or_else(|| panic!("Missing recorded I/O for transition step {:?}", step_record))
+}
+
 /// Split a window into storage segments, each starting from the store the
-/// previous one ends in. `first_position` is the trace position of the
-/// window's first step: the initial trace frontier's position.
+/// previous one ends in, and from the chains the steps before it fold to.
 pub fn plan_storage_segments(
-    initial_storage_frontier: &SerializableFrontier,
-    initial_storage_index_root: &[u8],
-    first_position: u64,
+    init: &InitTransition,
     window: &[StepRecord],
     recorded_step_io: &HashMap<StepRecord, StepIo>,
     segments: SegmentLength,
 ) -> Vec<StorageSegment> {
-    let mut walk = StorageWalk::new(initial_storage_frontier, initial_storage_index_root);
+    let mut walk = StorageWalk::new(&init.init_storage_frontier, &init.init_storage_index_root);
+    let mut chains = WindowChains::new(&window_id(init));
+    let first_position = init.init_frontier.position;
     let segment_len = segments.len_for(window.len());
     window
         .chunks(segment_len)
         .enumerate()
         .map(|(chunk_index, chunk)| {
             let header = StorageSegmentHeader {
+                init: init.clone(),
+                records_before: chains.records.value(),
+                columns_before: [chains.store_before.value(), chains.selections.value()],
                 start_frontier: serializable_frontier_from_trace_frontier(walk.frontier.clone()),
                 start_index_root: walk.index_root.clone(),
                 first_position: first_position + (chunk_index * segment_len) as u64,
@@ -190,10 +183,13 @@ pub fn plan_storage_segments(
             let steps = chunk
                 .iter()
                 .map(|step_record| {
-                    let step_io = recorded_step_io.get(step_record).unwrap_or_else(|| {
-                        panic!("Missing recorded I/O for transition step {:?}", step_record)
-                    });
+                    let step_io = step_io_for(recorded_step_io, step_record);
                     let step = storage_step(step_record, step_io);
+                    chains.records.fold(&step_record.hash());
+                    chains.store_before.fold(&storage_state_digest(&walk.state()));
+                    chains
+                        .selections
+                        .fold(&selection_witnesses_commitment(&step_io.storage_selection_witnesses));
                     walk.advance(step_record, step_io);
                     step
                 })
@@ -201,44 +197,6 @@ pub fn plan_storage_segments(
             StorageSegment { header, steps }
         })
         .collect()
-}
-
-/// The proven segments of a window, and which one covers each step.
-pub struct ProvenStorage {
-    segment_len: usize,
-    segments: Vec<ProvenStorageSegment>,
-}
-
-impl ProvenStorage {
-    /// Plan and prove every segment of `window`.
-    pub fn prove(
-        initial_storage_frontier: &SerializableFrontier,
-        initial_storage_index_root: &[u8],
-        first_position: u64,
-        window: &[StepRecord],
-        recorded_step_io: &HashMap<StepRecord, StepIo>,
-        segments: SegmentLength,
-    ) -> Self {
-        let planned = plan_storage_segments(
-            initial_storage_frontier,
-            initial_storage_index_root,
-            first_position,
-            window,
-            recorded_step_io,
-            segments,
-        );
-        Self {
-            segment_len: segments.len_for(window.len()),
-            segments: planned.iter().map(prove_storage_segment).collect(),
-        }
-    }
-
-    /// The receipt covering the window's step at `index`, and that step's
-    /// evidence.
-    pub fn for_step(&self, index: usize) -> (&risc0_zkvm::Receipt, StorageEvidence) {
-        let segment = &self.segments[index / self.segment_len];
-        (&segment.receipt, segment.evidence(index % self.segment_len))
-    }
 }
 
 #[cfg(test)]
@@ -317,9 +275,26 @@ mod tests {
         (steps, io)
     }
 
+    /// A seven-step window opening at `frontier`, over `storage_frontier`.
+    fn window_init(frontier: SerializableFrontier, storage_frontier: SerializableFrontier) -> InitTransition {
+        InitTransition {
+            init_frontier: frontier,
+            init_storage_frontier: storage_frontier,
+            init_storage_root: vec![0; 32],
+            init_storage_index_root: vec![0; 32],
+            fingerprint: raster_core::fingerprint::Fingerprint::from(
+                vec![0],
+                raster_core::fingerprint::BitPacker::new(8),
+                7,
+            ),
+        }
+    }
+
     fn plan(segments: SegmentLength) -> Vec<StorageSegment> {
         let (steps, io) = window();
-        plan_storage_segments(&empty_frontier(), &[0; 32], 20, &steps, &io, segments)
+        let mut frontier = empty_frontier();
+        frontier.position = 20;
+        plan_storage_segments(&window_init(frontier, empty_frontier()), &steps, &io, segments)
     }
 
     /// The modes differ only in how the window is cut: one segment, one per

@@ -649,8 +649,8 @@ fn binds_sequence_scope(item: &SequenceChildItem) -> bool {
 /// step's trace root — two steps in one frame get two witnesses for the same
 /// parent.
 ///
-/// This is the only trace-inclusion witness the transition guest reads
-/// (`checks::control_flow::verify_sequence_scope_parent`). The host used to build one
+/// This is the only trace-inclusion witness the control-flow guest reads
+/// (`checks::verify_sequence_scope_parent`). The host used to build one
 /// for every source a step's bindings resolved to — every `PriorItemOutput`
 /// producer, and `ProgramStart` for every entry argument — and ship them all;
 /// the guest never read those. A prior item's value is held to its producer's
@@ -952,7 +952,7 @@ impl<'a> TraceVerifier<'a> {
     /// **terminal-window receipt** is proven over: the one whose last step is
     /// `ProgramEnd`, and which the guest recognises as terminal because it
     /// ends exactly where the committed fingerprint ends (see
-    /// `TransitionJournal::window_is_terminal` and
+    /// `FraudWindowJournal::window_is_terminal` and
     /// `docs/proposals/chain-io-commitment.md`).
     ///
     /// Shares `verify`'s walk deliberately: the trailing `Window` buffers, the

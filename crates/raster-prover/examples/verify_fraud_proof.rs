@@ -4,7 +4,7 @@
 
 use raster_core::trace::TraceCommitment;
 use raster_prover::trace::TraceCommitmentExt;
-use raster_prover::transition::verify_fraud_proof_receipt;
+use raster_prover::fraud_window::verify_fraud_window_receipt;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -20,16 +20,12 @@ fn main() {
         _ => "other",
     });
 
-    // The receipt, `Finished`, and the transition, authorization, control-flow
-    // and storage guests the journal names — see
-    // `docs/issues/authorization-image-id-unpinned.md`.
-    let journal = match verify_fraud_proof_receipt(&receipt) {
+    // The receipt against FRAUD WINDOW's one id, with every part guest's
+    // compiled into it.
+    let (refuted, program) = match verify_fraud_window_receipt(&receipt) {
         Ok(journal) => {
-            println!(
-                "receipt verifies; Finished; transition, authorization, control-flow and \
-                 storage guests pinned: OK"
-            );
-            journal
+            println!("receipt verifies; FRAUD WINDOW, every part guest compiled in: OK");
+            (journal.refuted_trace_commitment, journal.program_commitment)
         }
         Err(error) => {
             println!("receipt verification FAILED: {error}");
@@ -39,13 +35,13 @@ fn main() {
 
     let commitment: TraceCommitment = postcard::from_bytes(&commit_bytes).expect("decode commit.bin");
     let expected = commitment.header().digest();
-    let binds = journal.refuted_trace_commitment == expected;
+    let binds = refuted == expected;
     println!(
         "refuted commitment: {} ({})",
-        hex::encode(&journal.refuted_trace_commitment),
+        hex::encode(&refuted),
         if binds { "matches the given commit.bin" } else { "DOES NOT match the given commit.bin" }
     );
-    println!("program commitment: {}", hex::encode(&journal.program_commitment));
+    println!("program commitment: {}", hex::encode(&program));
 
     if !binds {
         std::process::exit(1);

@@ -24,12 +24,25 @@ pub fn verify_input_source_anchored(
     step_record: &StepRecord,
     input_source_witness: Option<&FnInput>,
 ) {
+    verify_input_source_commitment_anchored(
+        step_record,
+        input_source_witness.map(input_source_commitment).as_deref(),
+    );
+}
+
+/// [`verify_input_source_anchored`] for a caller that has already hashed the
+/// witness: `commitment` is `input_source_commitment(witness)`, `None` exactly
+/// when the step carries no witness. The transition guest hashes the witness
+/// once per step and hands the hash to every check that anchors it.
+pub fn verify_input_source_commitment_anchored(
+    step_record: &StepRecord,
+    commitment: Option<&[u8]>,
+) {
     if let Some(expected_input_source_commitment) = step_record.input_source_commitment() {
-        let input_source_witness =
-            input_source_witness.expect("Step input source witness is missing");
+        let commitment = commitment.expect("Step input source witness is missing");
         assert_eq!(
-            expected_input_source_commitment,
-            &input_source_commitment(input_source_witness),
+            expected_input_source_commitment.as_slice(),
+            commitment,
             "Step input source witness does not match recorded source commitment",
         );
     } else {
@@ -37,7 +50,7 @@ pub fn verify_input_source_anchored(
         // here. None of them binds a step input, so a witness supplied for one
         // is unbound by construction — nothing in the record commits to it.
         assert!(
-            input_source_witness.is_none(),
+            commitment.is_none(),
             "Step {:?} declares no input source commitment, so it must not carry an input \
              source witness",
             step_record.coordinates,

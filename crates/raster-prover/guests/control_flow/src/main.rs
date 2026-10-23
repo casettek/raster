@@ -1,12 +1,12 @@
-//! RISC0 guest program for the control flow of a segment of transition steps.
+//! RISC0 guest program for the control flow of a segment of fraud-window steps.
 //!
 //! Proves that each step record sits where the program's control flow schema
 //! says it can, and that its arguments come from where the schema says they
 //! do. A segment of one step is the per-step mode; a segment covering the
-//! window is the whole-window mode. The journal commits a Merkle root over one
-//! entry per step; each transition step verifies this receipt, checks its own
-//! entry against the root, and equates the entry with its own state. See
-//! `docs/proposals/control-flow-prover.md` §Segments.
+//! window is the whole-window mode. The journal (`PartSegmentJournal`) commits
+//! the record chain and the part's state before and after, which FRAUD WINDOW
+//! stitches to its neighbours'. See
+//! `docs/proposals/control-flow-prover.md` §Segments and `transition-split.md`.
 
 mod checks;
 
@@ -17,7 +17,8 @@ use risc0_zkvm::guest::env;
 
 use guest_common::frame;
 use raster_core::cfs::CfsCursor;
-use raster_core::control_flow::{entries_root, ControlFlowJournal, ControlFlowSegment};
+use raster_core::control_flow::ControlFlowSegment;
+use raster_core::fraud_window::window_id;
 use raster_core::program::{commitment_of_bytes, ProgramDefinition};
 
 fn main() {
@@ -30,20 +31,11 @@ fn main() {
         .expect("host must supply a valid ProgramDefinition frame");
     let cfs = CfsCursor::new(program.cfs);
     let segment: ControlFlowSegment = frame::read();
+    let window = window_id(&segment.init);
+    let records_before = segment.records_before;
 
-    let entries = checks::verify_segment(&cfs, segment);
-
-    // Commit a root over the entries, not the entries: each transition step is
-    // handed its own entry with a path, so its work doesn't grow with the
-    // segment. The entries go to the host on stdout, untrusted — the host can
-    // only use them if they fold to the committed root.
-    let leaves: Vec<_> = entries.iter().map(|entry| entry.leaf_hash()).collect();
-    let journal = ControlFlowJournal {
-        program_commitment,
-        first_position: entries[0].trace_position,
-        entry_count: entries.len() as u64,
-        entries_root: entries_root(&leaves),
-    };
+    let (entries, end_root) = checks::verify_segment_to_end(&cfs, segment);
+    let journal =
+        checks::segment_journal(window, program_commitment, records_before, &entries, &end_root);
     env::commit_slice(&journal.encode());
-    env::write_slice(&postcard::to_allocvec(&entries).expect("entries always encode"));
 }

@@ -17,16 +17,19 @@
 //! Which route applies is not the host's choice to declare — the guest
 //! derives it from the CFS and the supplied witness. Because `ProgramStart`
 //! is always the first step, authorization is `Established` before any later
-//! step runs (see `fraud_proof::FraudProofWindowContext`), so there is no
+//! step runs (see `part::verify_segment`), so there is no
 //! deferred debt to discharge at the end of the chain.
 
 use raster_core::authorization::AuthorizationJournal;
 use raster_core::cfs::{CfsCoordinates, CfsCursor, SequenceReturn};
 use raster_core::input::{struct_commitments_root, verify_selection_witness, SelectionWitness};
+use raster_core::storage_check::StorageState;
 use raster_core::trace::{ProgramEndStep, ProgramStartStep, StepKind, StepRecord, StorageData};
 use raster_core::transition::{EntrypointAuthorization, OutputAuthorization, StorageReadWitness};
 
 use guest_common::storage::verify_storage_read_witness;
+
+use crate::checks::columns::Consumed;
 
 /// The coordinate `main`'s entry-argument binding always occupies: the
 /// sequence root itself. The `ProgramStart` step loads the combined entry
@@ -229,11 +232,14 @@ pub fn verify_program_end(
     cfs_cursor: &CfsCursor,
     record: &StepRecord,
     program_end: &ProgramEndStep,
-    current_storage_root: &[u8],
-    current_storage_index_root: &[u8],
+    // Consumed from the storage check (`checks::columns`): the output object
+    // lives in the store as it stands before `ProgramEnd`, which writes none.
+    store_before: &Consumed<StorageState>,
     read_witness: Option<&StorageReadWitness>,
     selection_witness: Option<&SelectionWitness>,
 ) -> OutputAuthorization {
+    let current_storage_root: &[u8] = &store_before.get().root;
+    let current_storage_index_root: &[u8] = &store_before.get().index_root;
     assert_eq!(
         record.coordinates,
         entrypoint_coordinates(),

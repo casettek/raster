@@ -1,0 +1,24 @@
+[package]
+name = "raster-prover-guests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "The fraud-window part guests, built in the first pass so FRAUD WINDOW can compile their image ids in."
+
+[build-dependencies]
+risc0-build = "3.0"
+
+[package.metadata.risc0]
+# Paths are relative to this manifest. The FRAUD WINDOW aggregator is not
+# here: `raster-prover` builds it in a second pass, with these guests' image
+# ids compiled in (`docs/proposals/transition-split.md` §Image-id pinning).
+methods = [
+    "../raster-prover/guests/transition",
+    "../raster-prover/guests/trace",
+    "../raster-prover/guests/control_flow",
+    "../raster-prover/guests/storage",
+    "../raster-prover/guests/authorization",
+    "../raster-prover/guests/chain_fraud",
+]

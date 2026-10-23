@@ -25,7 +25,30 @@ use guest_common::storage_fixtures::{
     build_read_witness, build_storage_context, build_write_witness, tile_step_with_store_roots,
 };
 
-use crate::segment::verify_segment;
+use raster_core::fingerprint::{BitPacker, Fingerprint};
+use raster_core::fraud_window::{window_id, Column, WindowChains};
+use raster_core::transition::InitTransition;
+
+use crate::segment::{segment_journal, verify_segment};
+
+/// A window opening at trace position 10 over the given store.
+fn window_init(storage_frontier: SerializableFrontier, storage_root: Vec<u8>, index_root: Vec<u8>) -> InitTransition {
+    InitTransition {
+        init_frontier: SerializableFrontier {
+            position: 10,
+            leaf: vec![0; 32],
+            ommers: Vec::new(),
+        },
+        init_storage_frontier: storage_frontier,
+        init_storage_root: storage_root,
+        init_storage_index_root: index_root,
+        fingerprint: Fingerprint {
+            bits_packer: BitPacker::new(8),
+            bits: vec![0],
+            len: 3,
+        },
+    }
+}
 
 fn sha(bytes: &[u8]) -> Vec<u8> {
     sha256_bytes(bytes)
@@ -581,7 +604,7 @@ fn three_step_window() -> (StorageSegmentHeader, Vec<StorageStep>) {
         first.coordinates.clone(),
         input_source_commitment(&inputs),
         first.object_commitment.clone(),
-        root_0,
+        root_0.clone(),
         root_1.clone(),
         index_0.clone(),
         index_1.clone(),
@@ -624,7 +647,12 @@ fn three_step_window() -> (StorageSegmentHeader, Vec<StorageStep>) {
             }),
         },
     ];
+    let init = window_init(serialize_frontier(&empty), root_0, index_0.clone());
+    let chains = WindowChains::new(&window_id(&init));
     let header = StorageSegmentHeader {
+        init,
+        records_before: chains.records.value(),
+        columns_before: [chains.store_before.value(), chains.selections.value()],
         start_frontier: serialize_frontier(&empty),
         start_index_root: index_0,
         first_position: 10,
@@ -680,6 +708,9 @@ fn one_segment_and_one_step_segments_commit_the_same_entries() {
         let entry = run(
             StorageSegmentHeader {
                 start_frontier: frontier.clone(),
+                init: header.init.clone(),
+                records_before: header.records_before,
+                columns_before: header.columns_before,
                 start_index_root: index_root.clone(),
                 first_position: header.first_position + offset as u64,
                 step_count: 1,
@@ -708,6 +739,9 @@ fn one_segment_and_one_step_segments_commit_the_same_entries() {
 #[should_panic(expected = "Coordinate-index root after write does not match the inserted entry")]
 fn a_start_frontier_with_the_right_root_at_the_wrong_position_shifts_every_write() {
     let (mut header, steps) = three_step_window();
+    // A segment inside the window, not its opening one, which the window's
+    // initial store would pin outright.
+    header.init.init_frontier.position = 5;
     let shifted = SerializableFrontier {
         position: 1,
         leaf: EMPTY_LEAF.to_vec(),
@@ -724,6 +758,7 @@ fn a_start_frontier_with_the_right_root_at_the_wrong_position_shifts_every_write
 #[should_panic(expected = "Execution-step storage root before does not match current storage root")]
 fn a_segment_started_from_another_store_is_refused() {
     let (mut header, steps) = three_step_window();
+    header.init.init_frontier.position = 5;
     let (elsewhere, ..) = build_storage_context(&[StorageEntry {
         coordinates: CfsCoordinates(vec![9]),
         object_commitment: sha(b"elsewhere"),
@@ -738,4 +773,101 @@ fn an_empty_segment_is_refused() {
     let (mut header, _) = three_step_window();
     header.step_count = 0;
     let _ = run(header, Vec::new());
+}
+
+/// The segment opening the window must start from the window's initial
+/// store, not one of the host's choosing.
+#[test]
+#[should_panic(expected = "must start from the window's initial store")]
+fn an_opening_segment_from_another_store_is_refused() {
+    let (mut header, steps) = three_step_window();
+    header.start_index_root[0] ^= 1;
+    run(header, steps);
+}
+
+#[test]
+#[should_panic(expected = "Initial storage root does not match")]
+fn a_window_whose_storage_root_is_not_its_frontier_s_is_refused() {
+    let (mut header, steps) = three_step_window();
+    header.init.init_storage_root[0] ^= 1;
+    run(header, steps);
+}
+
+/// The journal's columns fold exactly what the transition side folds when it
+/// consumes them: the store before each step and its selection commitment.
+#[test]
+fn the_journal_produces_both_columns_and_the_record_chain() {
+    let (header, steps) = three_step_window();
+    let window = window_id(&header.init);
+    let (records_before, columns_before) = (header.records_before, header.columns_before);
+    let entries = run(header, steps);
+    let journal = segment_journal(window, records_before, columns_before, &entries);
+
+    let expected = WindowChains::fold_all(
+        &window,
+        entries
+            .iter()
+            .map(|e| (e.step_record_hash.as_slice(), &e.before, &e.selection_witnesses_commitment)),
+    );
+    assert_eq!(journal.records.after, expected.records.value());
+    assert_eq!(journal.column(Column::StoreBefore).unwrap().after, expected.store_before.value());
+    assert_eq!(journal.column(Column::Selections).unwrap().after, expected.selections.value());
+    assert_eq!((journal.first_position, journal.step_count), (10, 3));
+    assert!(journal.out.is_none() && journal.program_commitment.is_none());
+}
+
+/// One-step segments, each started where the last ended, stitch end to start
+/// and end where the whole segment does.
+#[test]
+fn one_step_segment_journals_stitch_to_the_whole() {
+    let (header, steps) = three_step_window();
+    let window = window_id(&header.init);
+    let whole = segment_journal(
+        window,
+        header.records_before,
+        header.columns_before,
+        &run(header.clone(), steps.clone()),
+    );
+    let mut records_before = header.records_before;
+    let mut columns_before = header.columns_before;
+    let mut previous: Option<raster_core::fraud_window::PartSegmentJournal> = None;
+    let mut store = (header.start_frontier.clone(), header.start_index_root.clone());
+    for (offset, step) in steps.into_iter().enumerate() {
+        let write = step
+            .storage_witness
+            .as_ref()
+            .and_then(|witness| witness.write.as_ref())
+            .map(|write| write.entry.clone());
+        let entries = run(
+            StorageSegmentHeader {
+                init: header.init.clone(),
+                records_before,
+                columns_before,
+                start_frontier: store.0.clone(),
+                start_index_root: store.1.clone(),
+                first_position: 10 + offset as u64,
+                step_count: 1,
+            },
+            vec![step],
+        );
+        let journal = segment_journal(window, records_before, columns_before, &entries);
+        if let Some(previous) = &previous {
+            assert_eq!(previous.state.after, journal.state.before);
+            assert_eq!(previous.records.after, journal.records.before);
+        }
+        if let Some(entry) = write {
+            let mut live = guest_common::merkle_tree::deserialize_frontier(&store.0).unwrap();
+            live.append(Bytes(guest_common::storage::storage_leaf_hash(&entry)));
+            store.0 = serialize_frontier(&live);
+        }
+        store.1 = entries[0].after.index_root.clone();
+        records_before = journal.records.after;
+        columns_before = [journal.columns[0].1.after, journal.columns[1].1.after];
+        previous = Some(journal);
+    }
+    let last = previous.unwrap();
+    assert_eq!(last.records.after, whole.records.after);
+    assert_eq!(last.state.after, whole.state.after);
+    assert_eq!(last.columns.iter().map(|c| c.1.after).collect::<Vec<_>>(),
+               whole.columns.iter().map(|c| c.1.after).collect::<Vec<_>>());
 }

@@ -792,8 +792,8 @@ pub struct TraceWindow {
 /// steps revealed in the clear.
 ///
 /// The struct lives in `raster-core` (not `raster-prover`) because the
-/// transition guest must decode the exact `commit.bin` bytes it refutes: at
-/// `Init` it hashes them into the journal's `refuted_trace_commitment` and
+/// trace guest must decode the exact `commit.bin` bytes it refutes: it hashes
+/// them into the window binding's `refuted_trace_commitment` and
 /// asserts the window fingerprint is a slice of `fingerprint` at the offset
 /// fixed by the window's initial frontier (see
 /// `docs/proposals/chain-fraud-proof.md`). Construction and verification

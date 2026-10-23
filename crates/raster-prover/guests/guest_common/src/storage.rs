@@ -34,8 +34,8 @@ use crate::merkle_tree::{combine_merkle_level, deserialize_frontier, frontier_ro
 
 /// Everything the storage check reads for one step besides the store itself.
 ///
-/// Every field is either the record — which the transition guest equates by
-/// hash — or a witness the check anchors to it: the input source witness to
+/// Every field is either the record — which every part folds into the record
+/// chain FRAUD WINDOW compares — or a witness the check anchors to it: the input source witness to
 /// `input_source_commitment`, the selection witnesses to the bindings the input
 /// source names, the storage witness to the store before the step and the
 /// roots the record claims after.

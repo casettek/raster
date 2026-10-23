@@ -13,7 +13,13 @@ use raster_core::cfs::{
     CfsCoordinate, CfsCoordinates, CfsCursor, InputBinding, InputSource, ResolveError,
     SequenceChildItem, FIRST_COORDINATE,
 };
-use raster_core::control_flow::{ControlFlowEntry, ControlFlowInput, ControlFlowSegment};
+use raster_core::control_flow::{
+    ControlFlowEntry, ControlFlowInput, ControlFlowSegment,
+};
+use raster_core::fraud_window::{
+    control_flow_state_digest, Chain, ChainKind, PartKind, PartSegmentJournal, Span,
+};
+use raster_core::input::Hash32;
 use raster_core::input::SelectorSegment;
 use raster_core::trace::{
     ExecStep, ExecTarget, FnInput, FnInputValue, StepKind, StepRecord, StorageData,
@@ -30,12 +36,32 @@ use guest_common::merkle_tree::{
 ///
 /// Only the segment's start — the trace frontier and the expected coordinates
 /// before its first step — comes from the host. Every later step's trace
-/// position and root come from appending the records before it, the way the
-/// transition guest's frontier grows, and its expected coordinates are the
-/// previous step's successors. Each entry still carries all of them, because
-/// each transition step equates its own entry by itself.
+/// position and root come from appending the records before it, and its
+/// expected coordinates are the previous step's successors. The start is
+/// checked against the window when the segment opens it, and otherwise
+/// stitched by FRAUD WINDOW to the state the segment before it ended on.
 pub fn verify_segment(cfs: &CfsCursor, segment: ControlFlowSegment) -> Vec<ControlFlowEntry> {
+    verify_segment_to_end(cfs, segment).0
+}
+
+/// [`verify_segment`], also returning the trace root after the segment's last
+/// step: with the last entry's position and successors, the part's state
+/// after the segment.
+pub fn verify_segment_to_end(
+    cfs: &CfsCursor,
+    segment: ControlFlowSegment,
+) -> (Vec<ControlFlowEntry>, Vec<u8>) {
     assert!(!segment.steps.is_empty(), "a control-flow segment must cover at least one step");
+    let init = &segment.init;
+    if segment.start_frontier.position == init.init_frontier.position {
+        // The segment opening the window starts from the window's initial
+        // frontier, where no step has set any expectation yet.
+        assert!(
+            segment.start_frontier == init.init_frontier && segment.expected_before.is_none(),
+            "a segment opening the window must start from the window's initial frontier, \
+             with no expected coordinates",
+        );
+    }
     let mut frontier = deserialize_frontier(&segment.start_frontier)
         .expect("host must supply a valid segment start frontier");
     let mut expected_before = segment.expected_before;
@@ -63,15 +89,58 @@ pub fn verify_segment(cfs: &CfsCursor, segment: ControlFlowSegment) -> Vec<Contr
             expected_after,
         });
     }
-    entries
+    (entries, frontier_root(&frontier))
+}
+
+/// What the segment commits: the program it checked against, the record
+/// chain, and the state (trace frontier and expected coordinates) before and
+/// after.
+pub fn segment_journal(
+    window: Hash32,
+    program_commitment: Vec<u8>,
+    records_before: Hash32,
+    entries: &[ControlFlowEntry],
+    end_root: &[u8],
+) -> PartSegmentJournal {
+    let mut records = Chain::resume(ChainKind::Records, records_before);
+    for entry in entries {
+        records.fold(&entry.step_record_hash);
+    }
+    let first = entries.first().expect("a segment covers at least one step");
+    let last = entries.last().expect("a segment covers at least one step");
+    PartSegmentJournal {
+        part: PartKind::ControlFlow,
+        window_id: window,
+        program_commitment: Some(program_commitment),
+        first_position: first.trace_position,
+        step_count: entries.len() as u64,
+        records: Span {
+            before: records_before,
+            after: records.value(),
+        },
+        state: Span {
+            before: control_flow_state_digest(
+                first.trace_position,
+                &first.trace_root_before,
+                first.expected_before.as_ref(),
+            ),
+            after: control_flow_state_digest(
+                last.trace_position + 1,
+                end_root,
+                Some(&last.expected_after),
+            ),
+        },
+        columns: Vec::new(),
+        out: None,
+    }
 }
 
 /// The control-flow check for one step. Returns the coordinates the next step
 /// may take: empty after `ProgramEnd`, which nothing may follow.
 ///
 /// Reads nothing but its arguments, so a future check that needs more has to
-/// add it to [`ControlFlowInput`], where the transition guest has to supply it
-/// and bind it through the journal.
+/// add it to [`ControlFlowInput`], where the host has to supply it and the
+/// segment has to bind it.
 pub fn verify_step(cfs: &CfsCursor, input: &ControlFlowInput) -> Vec<CfsCoordinates> {
     let record = &input.step_record;
     // Every binding check below reads the input source witness. The transition
