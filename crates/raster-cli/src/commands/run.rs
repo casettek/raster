@@ -82,6 +82,7 @@ pub fn run(
         Stdio::inherit as fn() -> Stdio
     };
     build_command.stdout(build_stdio()).stderr(build_stdio());
+    crate::utils::native_build::configure(&mut build_command);
     crate::utils::quiet_guest_build(&mut build_command);
     let build = build_command
         .output()
@@ -99,7 +100,10 @@ pub fn run(
         )));
     }
 
-    let binary_path = project.target_dir.join("release").join(&project.name);
+    let binary_path = project
+        .target_dir
+        .join("release")
+        .join(format!("{}{}", project.name, std::env::consts::EXE_SUFFIX));
 
     if !binary_path.exists() {
         return Err(Error::Other(format!(

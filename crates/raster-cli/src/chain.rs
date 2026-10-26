@@ -1696,6 +1696,7 @@ fn build_and_run_stage(
         .args(["build", "--release"])
         .stdout(build_stdio())
         .stderr(build_stdio());
+    crate::utils::native_build::configure(&mut build_command);
     crate::utils::quiet_guest_build(&mut build_command);
     let build = build_command
         .output()

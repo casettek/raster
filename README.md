@@ -42,6 +42,16 @@ Raster is organized as a Rust workspace with the following crates:
 cargo install raster-cli
 ```
 
+Native builds launched by `cargo raster run` and `cargo raster chain run`
+automatically configure Windows MSVC with `/DNOMINMAX /std:c++20 /EHsc` for
+the RISC Zero host dependencies. Existing compiler flags are retained, with
+these required flags appended. Native Windows builds also default
+`RISC0_SKIP_BUILD` to `1` (unless explicitly set), since replay does not need
+RISC-V proof guests. Executable names use the host's suffix (`.exe` on Windows).
+macOS and Linux retain their existing build environment. Windows still requires
+the Visual Studio C++ build tools. This setup applies to child builds launched
+by the installed CLI, not to bootstrapping the CLI itself with Cargo.
+
 ## Quick Start
 
 ### 1. Initialize a new project

@@ -1,5 +1,6 @@
 pub mod authorization;
 pub mod encode;
+pub mod native_build;
 
 /// Whether the CLI should print raw toolchain output — child `cargo build`
 /// progress, dependency warnings, guest-build chatter — alongside its own
@@ -25,7 +26,10 @@ pub fn verbose_output() -> bool {
 /// and are lost — hence the `RASTER_VERBOSE=1` hint on build failures.
 pub fn quiet_guest_build(command: &mut std::process::Command) {
     if !verbose_output() {
-        command.env("RISC0_GUEST_LOGFILE", "/dev/null");
+        command.env(
+            "RISC0_GUEST_LOGFILE",
+            if cfg!(windows) { "NUL" } else { "/dev/null" },
+        );
     }
 }
 
