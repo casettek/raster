@@ -112,8 +112,11 @@ impl GuestBuilder {
 
             // Look for raster dependency path
             if let Some(raster_path) = Self::extract_raster_path(&cargo_toml) {
-                let absolute_raster = path.join(&raster_path).canonicalize().ok();
-                if let Some(raster_crate_path) = absolute_raster {
+                // Not canonicalized: the user crate reaches raster through this
+                // same path, and Cargo treats a symlink-resolved copy of it as a
+                // different package (a lockfile collision in the guest build).
+                let raster_crate_path = path.join(&raster_path);
+                if raster_crate_path.exists() {
                     // The raster workspace is two levels up from crates/raster
                     self.raster_workspace = raster_crate_path
                         .parent()

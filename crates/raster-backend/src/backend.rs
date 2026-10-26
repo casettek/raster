@@ -152,6 +152,11 @@ pub struct TileExecutionResult {
 
     /// Whether the proof was verified (if proof was generated).
     pub verified: Option<bool>,
+
+    /// The guest's raw journal, when the backend has one: a zkVM backend
+    /// executing without proving still commits it, and a fraud window's
+    /// semantic checks read it before any tile is proven.
+    pub journal: Option<Vec<u8>>,
 }
 
 impl TileExecutionResult {
@@ -164,7 +169,14 @@ impl TileExecutionResult {
             proof_cycles: Some(calculate_proof_cycles(cycles)),
             receipt: None,
             verified: None,
+            journal: None,
         }
+    }
+
+    /// The same result, carrying the guest's raw journal.
+    pub fn with_journal(mut self, journal: Vec<u8>) -> Self {
+        self.journal = Some(journal);
+        self
     }
 
     /// Create a new execution result with output and receipt (for prove mode).
@@ -176,6 +188,7 @@ impl TileExecutionResult {
             proof_cycles,
             receipt: Some(receipt),
             verified: Some(verified),
+            journal: None,
         }
     }
 }

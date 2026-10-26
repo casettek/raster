@@ -5,22 +5,19 @@
 
 use bridgetree::{Hashable, Level, NonEmptyFrontier};
 use incrementalmerkletree::{MerklePath, Position};
-use raster_core::cfs::{
-    CfsCoordinate, CfsCoordinates, CfsCursor, ControlFlowSchema, InputBinding, InputSource,
-    SequenceChildItem, FIRST_COORDINATE,
-};
+use raster_core::cfs::{CfsCursor, ControlFlowSchema, InputBinding, SequenceChildItem};
 use raster_core::fingerprint::{fingerprint_value, Fingerprint, FingerprintAccumulator};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt::Debug;
 
 use crate::error::{BitPackerError, Result};
 use raster_core::merkle::{to_node_hash, EMPTY_LEAF, EMPTY_ROOTS, HASH_SIZE};
 
 use raster_core::fingerprint::BitPacker;
-use raster_core::trace::{ExecStep, ExecTarget, StepKind, StepRecord, Trace, TraceWindow};
+use raster_core::trace::{StepKind, StepRecord, Trace, TraceWindow};
 use raster_core::transition::{
     FingerprintBlockWitness, FingerprintSliceWitness, StepRecordWitness, TraceCommitmentHeader,
 };
@@ -626,331 +623,131 @@ impl<T: Clone> Window<T> {
     }
 }
 
-fn sequence_coordinates(step_record: &StepRecord) -> Option<(CfsCoordinates, CfsCoordinate)> {
-    let coordinates = step_record.coordinates();
-    let (&current_child_index, parent_coords) = coordinates.split_last()?;
-
-    Some((CfsCoordinates(parent_coords.to_vec()), current_child_index))
-}
-
-/// Whether `record` is the step that produced `cfs_item`'s output — i.e.
-/// whether a `PriorItemOutput` binding on `cfs_item` resolves to it.
+/// Whether any of `item`'s declared inputs is a scope binding, flattening
+/// `Indexed` so an index sourced from the caller's scope counts too.
 ///
-/// A tile produces at its own coordinate `[k]`; a nested sequence and a recur
-/// site report their output on the way out, at `[-k]` (the caller compares
-/// `record.coordinates.opened()`). A site's object is stored at `[k]`, but
-/// the record that wrote it is the `RecurEnd`.
-fn record_produces_item(record: &StepRecord, cfs_item: &SequenceChildItem) -> bool {
-    match (&record.kind, cfs_item) {
-        (
-            StepKind::Exec(ExecStep {
-                target: ExecTarget::Tile(_),
-                ..
-            }),
-            SequenceChildItem::Tile(_),
-        ) => true,
-        (StepKind::SequenceEnd { .. }, SequenceChildItem::Sequence(_)) => true,
-        (
-            StepKind::RecurEnd(_),
-            SequenceChildItem::RecurTile(_) | SequenceChildItem::RecurSequence(_),
-        ) => true,
-        _ => false,
-    }
-}
-
-/// Flatten a binding into the leaf bindings a step actually depends on.
-///
-/// An `Indexed` binding is *two or more* dependencies, not one: the step reads
-/// the value and every authorized index that located it. Flattening here rather
-/// than special-casing below keeps a fraud window self-contained — omitting an
-/// index's source record would leave the window unable to re-derive the read.
-fn flatten_binding<'a>(binding: &'a InputBinding, out: &mut Vec<&'a InputBinding>) {
-    match binding {
-        InputBinding::Indexed { value, indexes } => {
-            flatten_binding(value, out);
-            for index in indexes {
-                flatten_binding(index, out);
+/// The same rule as the guest's `checks::control_flow::binds_sequence_scope`: the guest
+/// reads a scope parent for a step exactly when this holds, so the host
+/// supplies one exactly then.
+fn binds_sequence_scope(item: &SequenceChildItem) -> bool {
+    fn any_scope(binding: &InputBinding) -> bool {
+        match binding {
+            InputBinding::SequenceScope { .. } => true,
+            InputBinding::Indexed { value, indexes } => {
+                any_scope(value) || indexes.iter().any(any_scope)
             }
-        }
-        leaf => out.push(leaf),
-    }
-}
-
-/// Index of the program's `ProgramStart` step — the record that opens the root
-/// frame and binds the authorized entry object at coordinates `[]`.
-///
-/// Unique and first by construction (`StepKind::ProgramStart`: "The trace's
-/// first step"), so `position` and `rposition` agree here.
-fn program_start_index(trace: &[StepRecord]) -> Option<usize> {
-    trace
-        .iter()
-        .position(|record| matches!(record.kind, StepKind::ProgramStart(_)))
-}
-
-/// Index of the record that opened `frame`, bounding the search for sources
-/// produced inside it to the invocation currently in flight.
-///
-/// Every frame but the root is opened by the `SequenceStart` carrying its
-/// coordinates, and `rposition` is what picks the *current* invocation: a
-/// sequence called more than once has one such record per entry, and only the
-/// latest is open.
-///
-/// The root frame `[]` is the exception, and it is why scanning for a
-/// `SequenceStart` alone used to fail every top-level step: no record ever
-/// carries `SequenceStart` at `[]`. `ProgramStart` opens `main`'s frame
-/// ("nothing else has yet" — `raster_runtime::tracing::recorder`), and the root
-/// is entered exactly once, so first and last coincide.
-fn frame_opening_index(trace: &[StepRecord], frame: &CfsCoordinates) -> Option<usize> {
-    if frame.is_empty() {
-        return program_start_index(trace);
-    }
-
-    trace.iter().rposition(|record| {
-        matches!(record.kind, StepKind::SequenceStart { .. }) && record.coordinates == *frame
-    })
-}
-
-/// The trace records that produced each of `declared_inputs`, so the fraud
-/// window can carry a witness for every value the step read.
-///
-/// `step_record` must name a real CFS item in a real frame — the caller skips
-/// the two kinds of step that do not (the program boundaries at `[]` and recur
-/// iterations at `site ++ [i]`), because it is the caller that also has to
-/// decide whether to look the item up at all. Everything below reads the last
-/// coordinate as an item index within its parent frame
-/// (`sequence_coordinates`), which is true exactly under that precondition.
-fn resolve_inputs_sources(
-    step_record: &StepRecord,
-    trace: &[StepRecord],
-    cfs_cursor: &CfsCursor,
-    declared_inputs: &[InputBinding],
-) -> Vec<(usize, StepRecord)> {
-    let mut step_inputs: Vec<&InputBinding> = Vec::new();
-    for binding in declared_inputs {
-        flatten_binding(binding, &mut step_inputs);
-    }
-
-    if step_inputs
-        .iter()
-        .all(|input| matches!(input, InputBinding::Direct(InputSource::Inline)))
-    {
-        return Vec::new();
-    }
-
-    let Some((sequence_coordinates, item_coordinate)) = sequence_coordinates(&step_record) else {
-        // Entrypoint SequenceStart/SequenceEnd
-        return Vec::new();
-    };
-
-    // Find the record that opened this step's frame — `SequenceStart` for a
-    // nested frame, `ProgramStart` for the root.
-    let current_sequence_start_index = frame_opening_index(trace, &sequence_coordinates)
-        .unwrap_or_else(|| {
-            panic!(
-                "Failed to resolve active sequence invocation for step {:?} in frame {:?}",
-                step_record, sequence_coordinates
-            )
-        });
-
-    let current_sequence_trace_suffix = &trace[current_sequence_start_index..];
-
-    let mut source_records = Vec::new();
-
-    for step_input in step_inputs {
-        match step_input {
-            InputBinding::Direct(InputSource::Inline) => {}
-            InputBinding::Direct(InputSource::Storage) => {
-                panic!("Direct storage bindings are not yet supported in trace source resolution");
-            }
-            InputBinding::EntryArgument { .. } => {
-                // The source is the program's `ProgramStart` step, which bound
-                // the authorized entry object at the sequence root `[]` — the
-                // same record that opens the root frame above.
-                let index = program_start_index(trace).unwrap_or_else(|| {
-                    panic!(
-                        "Failed to resolve ProgramStart source for entry-argument input of step {:?}",
-                        step_record
-                    )
-                });
-                source_records.push((index, trace[index].clone()));
-            }
-            InputBinding::SequenceScope { input_index, .. } => {
-                // A scope input is a value the frame's *caller* supplied, so the
-                // root frame can never carry one: `main` has no caller, and the
-                // compiler resolves its declared parameters to `EntryArgument`
-                // instead (`FlowResolver::resolve_with_entry_arguments` — "since
-                // `main` has no caller to supply them"). Asserting it names the
-                // broken assumption; without it the lookup below would meet
-                // `ProgramStart` where it expects a `SequenceStart` and report a
-                // missing sequence input, which points at the wrong thing.
-                assert!(
-                    !sequence_coordinates.is_empty(),
-                    "Step {:?} binds sequence-scope input {} at the root frame, but `main` \
-                     has no caller to supply one; its parameters resolve to `EntryArgument`",
-                    step_record,
-                    input_index
-                );
-
-                let (parent_index, source_record) = current_sequence_trace_suffix
-                    .first()
-                    .filter(|record| {
-                        matches!(record.kind, StepKind::SequenceStart { .. })
-                            && record.coordinates == sequence_coordinates
-                    })
-                    .map(|record| (current_sequence_start_index, record.clone()))
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "Failed to resolve sequence input {input_index} for step {:?} in frame {:?}",
-                            step_record, sequence_coordinates
-                        )
-                    });
-
-                source_records.push((parent_index, source_record));
-            }
-            InputBinding::PriorItemOutput {
-                intra_sequence_item_index,
-                ..
-            } => {
-                // 0-based index into `items` becomes a 1-based coordinate; the
-                // guest crosses the same boundary in `checks::cfs`.
-                let source_coordinate = CfsCoordinate::try_from(*intra_sequence_item_index)
-                    .expect("Prior item output index exceeds CFS coordinate bounds")
-                    + FIRST_COORDINATE;
-                if source_coordinate >= item_coordinate {
-                    panic!(
-                        "Step {:?} cannot depend on sibling item {} from the same or a future index {}",
-                        step_record, intra_sequence_item_index, item_coordinate
-                    );
-                }
-
-                let mut source_record_coordinates = sequence_coordinates.clone();
-                source_record_coordinates.push(source_coordinate);
-
-                let source_record_cfs_item = cfs_cursor
-                    .try_get_item(&source_record_coordinates)
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "Failed to resolve prior item output {} for step {:?} in frame {:?}",
-                            intra_sequence_item_index, step_record, sequence_coordinates
-                        )
-                    });
-
-                let source_record = current_sequence_trace_suffix
-                    .iter()
-                    .enumerate()
-                    .find(|(_, record)| {
-                        record.coordinates.opened() == source_record_coordinates
-                            && record_produces_item(record, source_record_cfs_item)
-                    })
-                    .map(|(intra_sequence_offset, record)| {
-                        (
-                            current_sequence_start_index + intra_sequence_offset,
-                            record.clone(),
-                        )
-                    })
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "Failed to resolve source record for step {:?} from source item {} at {:?}",
-                            step_record,
-                            intra_sequence_item_index,
-                            source_record_coordinates
-                        )
-                    });
-
-                source_records.push(source_record);
-            }
-            // Flattened away above: `Indexed` is never a leaf here.
-            InputBinding::Indexed { .. } => {
-                unreachable!("flatten_binding removes Indexed before this match")
-            }
+            _ => false,
         }
     }
-
-    source_records
+    item.inputs().iter().any(any_scope)
 }
 
-fn witness_record_inputs(
+/// For every window step whose CFS item binds a sequence-scope input: the
+/// `SequenceStart` that opened the step's frame, with its trace-inclusion
+/// witness against the prefix the step is appended to. Keyed by the
+/// *verifying* step's `exec_index`, because a witness is only valid at that
+/// step's trace root — two steps in one frame get two witnesses for the same
+/// parent.
+///
+/// This is the only trace-inclusion witness the control-flow guest reads
+/// (`checks::verify_sequence_scope_parent`). The host used to build one
+/// for every source a step's bindings resolved to — every `PriorItemOutput`
+/// producer, and `ProgramStart` for every entry argument — and ship them all;
+/// the guest never read those. A prior item's value is held to its producer's
+/// coordinates statically and proven by the storage check, and an entry
+/// argument to the root coordinate. See `docs/proposals/control-flow-prover.md`
+/// step 4.
+fn witness_sequence_scope_parents(
     trace: &Trace,
     window_end_index: usize,
     fraud_window: &TraceWindow,
     cfs_cursor: &CfsCursor,
     seed: &[u8],
-) -> HashMap<(u64, StepRecord), StepRecordWitness> {
+) -> BTreeMap<u64, (StepRecord, StepRecordWitness)> {
     let window_start_index = window_end_index + 1 - fraud_window.items.len();
-    let mut source_records_witnesses: HashMap<(u64, StepRecord), StepRecordWitness> = HashMap::new();
+    let mut parents = BTreeMap::new();
 
     for (offset, step_record) in fraud_window.items.iter().enumerate() {
-        // The two steps that bind no CFS inputs, skipped in the order the guest
-        // skips them (`checks::cfs::verify_step_record_inputs`). Both sides must
-        // agree on which steps have inputs to resolve: a witness the guest never
-        // reads is dead weight in the evidence, and a witness it reads and does
-        // not get is a panic.
-        if step_record.input_source_commitment().is_none() || step_record.coordinates().is_empty()
-        {
-            // Steps that bind no inputs — the program boundaries at `[]`, and
-            // every close (`SequenceEnd`, `RecurEnd`), whose inputs belong to
-            // the matching open.
+        let coordinates = step_record.coordinates();
+        // The guest's guards, in its order: steps that bind no inputs — the
+        // program boundaries at `[]`, and every close (`SequenceEnd`,
+        // `RecurEnd`), whose inputs belong to the matching open — and recur
+        // iterations. Both sides must agree on which steps read a parent: one
+        // the guest never reads is dead weight in every step's input, and one it
+        // reads and does not get is a panic.
+        if step_record.input_source_commitment().is_none() || coordinates.is_empty() {
             continue;
         }
-
         if cfs_cursor
-            .try_get_recur_iteration_coordinates(step_record.coordinates())
+            .try_get_recur_iteration_coordinates(coordinates)
             .is_some()
         {
-            // An iteration of a recur site is not a CFS item either: `site ++ [i]`
-            // addresses a run of the site, and the site's own bindings are resolved
-            // once at `[site]`. What an iteration must prove instead is chunking
-            // and recur progress, which the guest checks against its replay journal
-            // (`verify_recur_iteration_chunking`, `advance_recur_progress`) and
-            // which needs no source record.
-            //
-            // Skipping *before* `try_get_item` is the point: that lookup folds
-            // iteration coordinates back to the site (`CfsCursor::try_get_item`),
-            // so resolving here would hand `resolve_inputs_sources` the site's
-            // bindings under the iteration's coordinates — a frame of `[site]` and
-            // an item index of `i`, which is an iteration counter, not a sibling
-            // index.
+            // An iteration of a recur site is not a CFS item: `site ++ [i]`
+            // addresses a run of the site, and the site's own bindings are
+            // checked once at `[site]`. Skipping *before* `try_get_item` is the
+            // point: that lookup folds iteration coordinates back to the site
+            // (`CfsCursor::try_get_item`), and would hand this step the site's
+            // bindings under the iteration's coordinates.
             continue;
         }
 
-        let cfs_item = cfs_cursor
-            .try_get_item(step_record.coordinates())
+        let cfs_item = cfs_cursor.try_get_item(coordinates).unwrap_or_else(|| {
+            panic!(
+                "Failed to resolve cfs item for fraud window coordinates: {:?}",
+                coordinates
+            )
+        });
+        if !binds_sequence_scope(cfs_item) {
+            continue;
+        }
+
+        let (parent_coordinates, _) = coordinates
+            .try_parent()
+            .expect("non-empty coordinates have a parent frame");
+        // A scope input is a value the frame's *caller* supplied, so the root
+        // frame can never carry one: `main` has no caller, and the compiler
+        // resolves its declared parameters to `EntryArgument` instead
+        // (`FlowResolver::resolve_with_entry_arguments`). Asserting it names the
+        // broken assumption rather than reporting a missing `SequenceStart`.
+        assert!(
+            !parent_coordinates.is_empty(),
+            "Step {:?} binds a sequence-scope input at the root frame, but `main` has no caller \
+             to supply one; its parameters resolve to `EntryArgument`",
+            step_record,
+        );
+
+        // `rposition` picks the invocation in flight: a sequence called more
+        // than once has one `SequenceStart` per entry, and only the latest is
+        // open.
+        let step_index = window_start_index + offset;
+        let parent_index = trace[..step_index]
+            .iter()
+            .rposition(|record| {
+                matches!(record.kind, StepKind::SequenceStart { .. })
+                    && record.coordinates == parent_coordinates
+            })
             .unwrap_or_else(|| {
                 panic!(
-                    "Failed to resolve cfs item for fraud window coordinates: {:?}",
-                    step_record.coordinates()
+                    "Failed to resolve the SequenceStart opening frame {:?} for step {:?}",
+                    parent_coordinates, step_record
                 )
             });
-        let step_index = window_start_index + offset;
 
-        for (trace_index, source_record) in resolve_inputs_sources(
-            step_record,
-            &trace[..step_index],
-            cfs_cursor,
-            cfs_item.inputs(),
-        ) {
-            let trace_prefix = Trace(trace[..step_index].to_vec());
-            let merkle_path = TraceCommitment::witness(&trace_prefix, trace_index, seed)
-                .expect("Failed to derive merkle path for source record");
-            let witness = StepRecordWitness {
-                position: u64::from(merkle_path.position()),
-                path_elems: merkle_path
-                    .path_elems()
-                    .iter()
-                    .map(|elem| to_node_hash(&elem.0))
-                    .collect(),
-            };
-
-            // Keyed by the *verifying* step as well as the source, because the
-            // witness is only valid at that step's trace root. Two window steps
-            // resolving the same source get two witnesses; keyed by the source
-            // alone, this `insert` overwrote the earlier step's and left it
-            // folding a proof built over a longer prefix than its own root.
-            source_records_witnesses.insert((step_record.exec_index, source_record), witness);
-        }
+        let trace_prefix = Trace(trace[..step_index].to_vec());
+        let merkle_path = TraceCommitment::witness(&trace_prefix, parent_index, seed)
+            .expect("Failed to derive merkle path for the sequence-scope parent");
+        let witness = StepRecordWitness {
+            position: u64::from(merkle_path.position()),
+            path_elems: merkle_path
+                .path_elems()
+                .iter()
+                .map(|elem| to_node_hash(&elem.0))
+                .collect(),
+        };
+        parents.insert(step_record.exec_index, (trace[parent_index].clone(), witness));
     }
 
-    source_records_witnesses
+    parents
 }
 
 pub struct TraceVerifier<'a> {
@@ -969,7 +766,10 @@ pub struct TraceVerifier<'a> {
 #[derive(Debug, Clone)]
 pub struct FraudEvidence {
     pub window: TraceWindow,
-    pub input_sources_witnesses: HashMap<(u64, StepRecord), StepRecordWitness>,
+    /// The `SequenceStart` each scope-binding window step's frame was opened
+    /// by, with its trace-inclusion witness, keyed by the step's `exec_index`.
+    /// See [`witness_sequence_scope_parents`].
+    pub sequence_scope_parents: BTreeMap<u64, (StepRecord, StepRecordWitness)>,
 }
 
 pub enum VerificationResult {
@@ -1125,7 +925,7 @@ impl<'a> TraceVerifier<'a> {
                     fingerprint: window_fingerprint,
                 };
 
-                let input_sources_witnesses = witness_record_inputs(
+                let sequence_scope_parents = witness_sequence_scope_parents(
                     trace,
                     step_index,
                     &fraud_window,
@@ -1135,7 +935,7 @@ impl<'a> TraceVerifier<'a> {
 
                 return VerificationResult::Fraud(FraudEvidence {
                     window: fraud_window,
-                    input_sources_witnesses,
+                    sequence_scope_parents,
                 });
             }
         }
@@ -1152,12 +952,12 @@ impl<'a> TraceVerifier<'a> {
     /// **terminal-window receipt** is proven over: the one whose last step is
     /// `ProgramEnd`, and which the guest recognises as terminal because it
     /// ends exactly where the committed fingerprint ends (see
-    /// `TransitionJournal::window_is_terminal` and
+    /// `FraudWindowJournal::window_is_terminal` and
     /// `docs/proposals/chain-io-commitment.md`).
     ///
     /// Shares `verify`'s walk deliberately: the trailing `Window` buffers, the
     /// frontier alignment (`window_frontiers.first()` is the frontier *before*
-    /// the first window item) and the input-source witnessing are the same
+    /// the first window item) and the scope-parent witnessing are the same
     /// mechanism, and both feed the same prover.
     ///
     /// They differ in exactly one way, and it is worth naming because this
@@ -1221,12 +1021,12 @@ impl<'a> TraceVerifier<'a> {
             fingerprint: window_fingerprint,
         };
 
-        let input_sources_witnesses =
-            witness_record_inputs(trace, last_index, &window, &cfs_cursor, &self.seed);
+        let sequence_scope_parents =
+            witness_sequence_scope_parents(trace, last_index, &window, &cfs_cursor, &self.seed);
 
         Ok(FraudEvidence {
             window,
-            input_sources_witnesses,
+            sequence_scope_parents,
         })
     }
 }
@@ -1237,7 +1037,7 @@ mod tests {
         CfsCoordinate, CfsCoordinates, InputBinding, RecurTileItem, SequenceChildItem, SequenceDef,
         SequenceItem, TileDef, TileItem,
     };
-    use raster_core::trace::{ProgramStartStep, StorageRoots};
+    use raster_core::trace::{ExecStep, ExecTarget, ProgramStartStep, StorageRoots};
 
     use super::*;
 
@@ -1418,7 +1218,7 @@ mod tests {
     /// the compiler never emits, because `main` has no caller and its
     /// parameters resolve to `EntryArgument`
     /// (`FlowResolver::resolve_with_entry_arguments`). Unreachable there, so it
-    /// left the `SequenceScope` arm of `resolve_inputs_sources` untested while
+    /// left the `SequenceScope` arm of the host's source resolution untested while
     /// appearing to cover it.
     fn make_sequence_input_dependency_cfs() -> ControlFlowSchema {
         let mut cfs = ControlFlowSchema::new("test");
@@ -2094,10 +1894,15 @@ mod tests {
 
     /// A divergence whose window holds a *top-level* step with a non-inline
     /// input used to panic in evidence construction, before any window was
-    /// produced: `resolve_inputs_sources` scanned for the `SequenceStart` that
-    /// opened frame `[]`, and `ProgramStart` opens it.
+    /// produced: the host scanned for the `SequenceStart` that opened frame
+    /// `[]`, and `ProgramStart` opens it.
+    ///
+    /// The host no longer resolves a prior item's producer at all: the guest
+    /// holds that read to the producer's coordinates statically and never read
+    /// the witness it was shipped (`control-flow-prover` step 4). The window is
+    /// built, and carries no scope parent.
     #[test]
-    fn fraud_window_resolves_top_level_step_inputs() {
+    fn fraud_window_over_a_prior_item_read_carries_no_scope_parent() {
         let committed_trace = Trace(vec![
             make_program_start_record(1, Vec::new()),
             make_tile_trace_item_at(2, "main", 1, vec![1], "producer".to_string(), 1, 10),
@@ -2125,22 +1930,17 @@ mod tests {
             panic!("expected a divergence at the consumer step");
         };
 
-        // The producer is the resolved source, and it is witnessed.
-        // Keyed by (verifying step, source), so look the producer up under the
-        // consumer that reads it rather than on its own.
         assert!(
-            evidence
-                .input_sources_witnesses
-                .keys()
-                .any(|(_, record)| *record == committed_trace.0[1]),
-            "producer step should be witnessed as the consumer's input source",
+            evidence.sequence_scope_parents.is_empty(),
+            "a prior-item read needs no trace-inclusion witness: {:?}",
+            evidence.sequence_scope_parents,
         );
     }
 
-    /// The same defect on the non-fraud path: `terminal_window` witnesses its
-    /// window through the identical resolution.
+    /// The same on the non-fraud path: `terminal_window` witnesses its window
+    /// through the identical rule.
     #[test]
-    fn terminal_window_resolves_top_level_step_inputs() {
+    fn terminal_window_over_a_prior_item_read_carries_no_scope_parent() {
         let trace = Trace(vec![
             make_program_start_record(1, Vec::new()),
             make_tile_trace_item_at(2, "main", 1, vec![1], "producer".to_string(), 1, 10),
@@ -2162,31 +1962,33 @@ mod tests {
             .expect("terminal window over a trace longer than the window");
 
         assert!(
-            evidence
-                .input_sources_witnesses
-                .keys()
-                .any(|(_, record)| *record == trace.0[1]),
-            "producer step should be witnessed as the consumer's input source",
+            evidence.sequence_scope_parents.is_empty(),
+            "a prior-item read needs no trace-inclusion witness: {:?}",
+            evidence.sequence_scope_parents,
         );
     }
 
-    /// A recur site whose own binding reads a prior sibling. The site's
-    /// `sources` are deliberately **not** inline, because the point is that they
+    /// A recur site inside a nested frame whose own binding reads that frame's
+    /// parameter. The site's `sources` are deliberately a **scope** binding —
+    /// the one kind the host still witnesses — because the point is that they
     /// are resolved once at the site and never per iteration.
     fn make_recur_site_cfs() -> ControlFlowSchema {
         let mut cfs = ControlFlowSchema::new("test");
-        cfs.tiles.push(TileDef::iter("producer", 1, 1));
         cfs.tiles.push(TileDef::iter("sweep", 1, 1));
 
         let mut main = SequenceDef::new("main");
-        main.items.push(SequenceChildItem::Tile(TileItem {
-            id: "producer".to_string(),
+        main.items.push(SequenceChildItem::Sequence(SequenceItem {
+            id: "outer".to_string(),
             sources: vec![InputBinding::inline()],
         }));
-        main.items
+
+        let mut outer = SequenceDef::new("outer");
+        outer.input_sources = vec![InputBinding::inline()];
+        outer
+            .items
             .push(SequenceChildItem::RecurTile(RecurTileItem {
                 id: "sweep".to_string(),
-                sources: vec![InputBinding::prior_item_output(0)],
+                sources: vec![InputBinding::seq_input(0)],
                 chunk: Some(2),
                 output: None,
                 state_is_output: false,
@@ -2194,35 +1996,35 @@ mod tests {
             }));
 
         cfs.sequences.push(main);
+        cfs.sequences.push(outer);
         cfs
     }
 
-    /// An iteration of a recur site binds no CFS inputs, so it contributes no
-    /// source witness — the same classification the guest makes, in the same
-    /// order (`checks::cfs::verify_step_record_inputs`: root coordinates first,
+    /// An iteration of a recur site binds no CFS inputs, so it carries no scope
+    /// parent — the same classification the guest makes, in the same order
+    /// (`checks::control_flow::verify_sequence_scope_parent`: root coordinates first,
     /// then recur iterations, then the CFS item).
     ///
     /// The fixture is built so the skip is load-bearing rather than incidental.
-    /// `try_get_item` folds `[2, i]` back to the site, so an iteration resolved
-    /// as an ordinary step would be handed the *site's* `PriorItemOutput(0)` —
-    /// the producer at `[1]` — under a frame of `[2]` and an item coordinate of
-    /// `i`: the iteration counter read as a sibling index. At `i = 1` that trips
-    /// the same-or-future-index panic; at `i = 2` it silently resolves to
-    /// `[2, 1]`, which is the previous *iteration*, not the producer.
+    /// `try_get_item` folds `[1, 1, i]` back to the site, whose binding is a
+    /// scope binding, so an iteration resolved as an ordinary step would be
+    /// handed the `SequenceStart` at `[1, 1]` — the site's own open — as the
+    /// frame that supplied its argument.
     #[test]
-    fn recur_iterations_contribute_no_input_source_witness() {
+    fn recur_iterations_carry_no_scope_parent() {
         let committed_trace = Trace(vec![
             make_program_start_record(1, Vec::new()),
-            make_tile_trace_item_at(2, "main", 1, vec![1], "producer".to_string(), 1, 10),
-            make_sequence_start_record(3, "main", vec![2], 1),
-            make_tile_trace_item_at(4, "main", 1, vec![2, 1], "sweep".to_string(), 1, 20),
-            make_tile_trace_item_at(5, "main", 2, vec![2, 2], "sweep".to_string(), 1, 30),
-            make_sequence_end_record(6, "main", vec![]),
+            make_sequence_start_record(2, "outer", vec![1], 1),
+            make_sequence_start_record(3, "outer", vec![1, 1], 1),
+            make_tile_trace_item_at(4, "outer", 1, vec![1, 1, 1], "sweep".to_string(), 1, 20),
+            make_tile_trace_item_at(5, "outer", 2, vec![1, 1, 2], "sweep".to_string(), 1, 30),
+            make_sequence_end_record(6, "outer", vec![-1]),
+            make_sequence_end_record(7, "main", vec![]),
         ]);
         // Diverges at index 4, so the window is the two iteration steps.
         let mut runtime_trace = committed_trace.clone();
         runtime_trace.0[4] =
-            make_tile_trace_item_at(5, "main", 2, vec![2, 2], "sweep".to_string(), 1, 999);
+            make_tile_trace_item_at(5, "outer", 2, vec![1, 1, 2], "sweep".to_string(), 1, 999);
 
         let trace_commitment = TraceCommitment::build(
             &committed_trace,
@@ -2238,18 +2040,20 @@ mod tests {
             panic!("expected a divergence at the second iteration");
         };
 
+        assert_eq!(evidence.window.items.len(), 2);
         assert!(
-            evidence.input_sources_witnesses.is_empty(),
-            "recur iterations bind no CFS inputs, so the window carries no source witnesses: {:?}",
-            evidence.input_sources_witnesses,
+            evidence.sequence_scope_parents.is_empty(),
+            "recur iterations bind no CFS inputs, so the window carries no scope parent: {:?}",
+            evidence.sequence_scope_parents,
         );
     }
 
-    /// `EntryArgument` at a top-level step resolves to `ProgramStart` — the same
-    /// record that opens the root frame. Unreachable before the frame lookup was
-    /// fixed: the scan panicked before this arm ran.
+    /// An `EntryArgument` read at a top-level step used to be witnessed by
+    /// `ProgramStart`'s trace path, which the guest never read: it holds the
+    /// read to the root coordinate and the storage check proves it. The window
+    /// carries no scope parent.
     #[test]
-    fn entry_argument_at_top_level_resolves_to_program_start() {
+    fn an_entry_argument_read_carries_no_scope_parent() {
         let committed_trace = Trace(vec![
             make_program_start_record(1, vec!["arg".to_string()]),
             make_tile_trace_item_at(2, "main", 1, vec![1], "consumer".to_string(), 1, 20),
@@ -2275,11 +2079,9 @@ mod tests {
         };
 
         assert!(
-            evidence
-                .input_sources_witnesses
-                .keys()
-                .any(|(_, record)| *record == committed_trace.0[0]),
-            "ProgramStart should be witnessed as the entry-argument source",
+            evidence.sequence_scope_parents.is_empty(),
+            "an entry-argument read needs no trace-inclusion witness: {:?}",
+            evidence.sequence_scope_parents,
         );
     }
 
@@ -2295,7 +2097,7 @@ mod tests {
     /// condition — on a field the guest never read. The margin pins the
     /// window's *opening state*; it never pinned the *diverging item*.
     ///
-    /// That is now closed on the guest side: `checks::cfs::verify_exec_index`
+    /// That is now closed on the guest side: `checks::control_flow::verify_exec_index`
     /// fixes the field from the step's trace index, so a window built from this
     /// evidence is refused before `finalize` is reached. See
     /// `exec_index_tampering_is_refused` in the transition guest's tests.
@@ -2367,8 +2169,7 @@ mod tests {
         }
     }
 
-    /// The `SequenceScope` arm of `resolve_inputs_sources`, exercised for the
-    /// first time.
+    /// The one source the host still witnesses.
     ///
     /// A scope value is not produced inside the frame — it arrives *with* it —
     /// so the only record holding it is the frame's opening `SequenceStart`.
@@ -2404,13 +2205,15 @@ mod tests {
             panic!("expected a divergence at the inner tile");
         };
 
-        assert!(
-            evidence
-                .input_sources_witnesses
-                .keys()
-                .any(|(_, record)| *record == committed_trace.0[1]),
-            "the frame-opening SequenceStart is the scope input's source, and must be witnessed",
-        );
+        // Keyed by the verifying step — `inner_tile`, exec 3 — and positioned
+        // where trace item 1 sits in the Merkle tree: position 0 is the seed.
+        let (parent, witness) = evidence
+            .sequence_scope_parents
+            .get(&committed_trace.0[2].exec_index)
+            .expect("the frame-opening SequenceStart is the scope input's source, and must be witnessed");
+        assert_eq!(*parent, committed_trace.0[1]);
+        assert_eq!(witness.position, 2);
+        assert_eq!(evidence.sequence_scope_parents.len(), 1);
     }
 
     /// `main` has no caller, so a scope binding at the root frame is a broken
@@ -2441,9 +2244,13 @@ mod tests {
         let _ = trace_verifier.verify(&runtime_trace);
     }
 
+    /// A step reading a prior item whose producer is not in the trace. Evidence
+    /// construction used to panic here, resolving the producer for a witness the
+    /// guest never read. The host no longer looks: the guest holds the read to
+    /// the producer's coordinates and proves the object there in its storage
+    /// check, which is what refuses a read of an object nothing wrote.
     #[test]
-    #[should_panic(expected = "Failed to resolve source record")]
-    fn test_verify_trace_returns_failure_for_unresolved_required_prior_item_output() {
+    fn a_window_over_an_unproduced_prior_item_builds_without_a_scope_parent() {
         let runtime_trace = Trace(vec![
             make_program_start_record(1, Vec::new()),
             make_tile_trace_item_at(2, "main", 2, vec![2], "consumer".to_string(), 1, 20),
@@ -2466,7 +2273,10 @@ mod tests {
             TraceVerifier::new(trace_commitment, &EMPTY_LEAF, &cfs)
                 .expect("valid commitment");
 
-        let _ = trace_verifier.verify(&runtime_trace);
+        let VerificationResult::Fraud(evidence) = trace_verifier.verify(&runtime_trace) else {
+            panic!("expected a divergence at the consumer step");
+        };
+        assert!(evidence.sequence_scope_parents.is_empty());
     }
 }
 

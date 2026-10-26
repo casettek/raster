@@ -28,7 +28,16 @@ use raster_prover::trace::{
     Bytes, FraudEvidence, FraudProofConfig, SerializableFrontier, TraceCommitment,
     TraceCommitmentExt, TraceTree, TraceVerifier, VerificationResult,
 };
-use raster_prover::transition::{step_transitions, StepIo};
+use raster_core::draft::TileReplayJournal;
+use raster_prover::authorization::execute_authorization;
+use raster_prover::fraud_window::{
+    plan_transition_part, prove_fraud_window, replay_claims, transition_part_jobs,
+    FraudWindowInputs, ReplayJournals, TransitionInputs,
+};
+use raster_prover::schedule::{run_jobs, Job};
+use raster_prover::segments::ProveOptions;
+use raster_prover::window::{part_jobs, plan_parts, ProvenPartSegment, WindowSetup};
+use raster_prover::transition::StepIo;
 use raster_runtime::TraceRecorder;
 
 use crate::utils::authorization::build_manifested_inputs;
@@ -75,9 +84,11 @@ pub fn generate_fraud_proof(
     project: &Project,
     input_manifest: Option<&str>,
     commit_path: &str,
+    options: ProveOptions,
 ) -> Result<PathBuf> {
-    let backend =
-        Risc0Backend::new(project.output_dir.clone()).with_user_crate(project.root_dir.clone());
+    let backend = Risc0Backend::new(project.output_dir.clone())
+        .with_user_crate(project.root_dir.clone())
+        .with_segment_limit_po2(options.zkvm_segment_po2.po2());
     let replayer = Replayer::new(&backend, project);
     let trace_commitment = read_trace_commitment(commit_path)?;
     let fraud_proof = prove(
@@ -88,6 +99,7 @@ pub fn generate_fraud_proof(
         &replayer,
         input_manifest,
         &trace_commitment,
+        options,
     );
     Ok(write_fraud_proof(&fraud_proof, commit_path))
 }
@@ -212,7 +224,7 @@ fn storage_state_from_prefix(
 /// coordinate `[]` (the sequence root) of the window's *initial* storage
 /// state, so a window that opens after the program start can still tie its
 /// execution to the public manifest (see `checks::entrypoint` in the
-/// transition guest).
+/// transition part's guest).
 ///
 /// `None` when the binding is not in the initial state — which is the normal
 /// case for a window covering the start of the trace, where the
@@ -310,6 +322,13 @@ fn build_program_frame(cfs: &ControlFlowSchema, replayer: &Replayer) -> Vec<u8> 
         .canonical_bytes()
 }
 
+// TEMP(cycle-probe)
+pub(crate) fn phase_probe(name: &str) {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let start = START.get_or_init(std::time::Instant::now);
+    eprintln!("PHASEPROBE {name} at_ms={}", start.elapsed().as_millis());
+}
+
 pub fn prove(
     fraud_evidence: FraudEvidence,
     trace: &Trace,
@@ -318,13 +337,17 @@ pub fn prove(
     replayer: &Replayer,
     input_manifest: Option<&str>,
     trace_commitment: &TraceCommitment,
+    options: ProveOptions,
 ) -> risc0_zkvm::Receipt {
+    phase_probe("prove-start"); // TEMP(cycle-probe)
     let mode = ExecutionMode::prove_and_verify();
     let FraudEvidence {
         window: fraud_window,
-        input_sources_witnesses,
+        sequence_scope_parents,
     } = fraud_evidence;
-    let mut replayed_results: HashMap<StepRecord, ReplayResult> = HashMap::new();
+    // Tile steps to replay, collected while the witnesses are built and proven
+    // afterwards with the window's other leaf proofs (`schedule::run_jobs`).
+    let mut tile_replays: Vec<(StepRecord, String, Vec<u8>)> = Vec::new();
     let mut recorded_step_io: HashMap<StepRecord, StepIo> = HashMap::new();
     let window_start_index = fraud_window
         .items
@@ -341,7 +364,7 @@ pub fn prove(
 
     // The recur-progress stack the window opens with, taken from the last step
     // *before* it. A window opening at index 0 has no predecessor and starts
-    // from the canonical empty stack, which `step_transitions` reads as `None`.
+    // from the canonical empty stack, which the transition part reads as `None`.
     //
     // Reconstructed here, on the same prefix the store is rebuilt from, and
     // read off the recorder rather than re-derived: a second implementation of
@@ -352,6 +375,7 @@ pub fn prove(
         .checked_sub(1)
         .and_then(|previous| trace_recorder.recur_progress_after(trace[previous].exec_index));
 
+    phase_probe("prefix-storage-done"); // TEMP(cycle-probe)
     for step_record in &fraud_window.items {
         let step_witness = trace_recorder
             .step_witness_at(step_record.coordinates())
@@ -450,18 +474,15 @@ pub fn prove(
         if step_record.appends_to_storage() {
             if let Some(storage_write) = step_witness.storage_write() {
                 let entry = storage_write.entry.clone();
+                // The guest computes the index root after the write from this
+                // proof, so no membership proof against the new root is sent.
                 let index_non_membership_witness = before_state
                     .coordinate_index
                     .non_membership_proof(&entry.coordinates);
                 apply_storage_write_to_state(&mut current_storage_state, &storage_write);
-                let index_membership_witness = current_storage_state
-                    .coordinate_index
-                    .membership_proof(&entry.coordinates)
-                    .expect("Missing coordinate-index membership proof after write");
                 storage_write_witness = Some(StorageWriteWitness {
                     entry,
                     index_non_membership_witness,
-                    index_membership_witness,
                 });
             }
         }
@@ -594,23 +615,16 @@ pub fn prove(
             ..
         }) = &step_record.kind
         {
-            let replay_input = input_witness.unwrap_or_default();
-            match replayer.replay(tile_id, replay_input.as_slice(), mode) {
-                Ok(replay_result) => {
-                    replayed_results.insert(step_record.clone(), replay_result);
-                }
-                Err(e) => {
-                    println!("FAILED to replay: {}", e);
-                }
-            }
+            tile_replays.push((
+                step_record.clone(),
+                tile_id.clone(),
+                input_witness.unwrap_or_default(),
+            ));
         }
     }
 
     let manifested_inputs = build_manifested_inputs(input_manifest)
         .unwrap_or_else(|e| panic!("Failed to load authorization source: {}", e));
-
-    let (authorization_receipt, authorization_journal) =
-        authorize_external_inputs(&manifested_inputs);
 
     // Only meaningful when `main` declares entry arguments at all; without a
     // declaration the guest requires no witness (and rejects one: with no
@@ -621,49 +635,157 @@ pub fn prove(
         .then(|| build_entrypoint_membership_witness(&initial_storage_state))
         .flatten();
 
+    phase_probe("witness-loop-done"); // TEMP(cycle-probe)
     if let Some(frontier) = SerializableFrontier::from_bytes(&fraud_window.frontier) {
         println!();
-        println!("Replaying transition frontier with transition guest...");
+        println!("Proving the fraud window...");
 
+        // Compiles every tile of the program (its registry), so the replays
+        // below find their ELFs cached and never build one concurrently.
         let program_frame = build_program_frame(cfs, replayer);
 
         // Bind the window to the commitment it refutes: the window's start is
         // the initial frontier's position (seed + one leaf per pre-window
         // step), and the slice witness proves the window fingerprint occurs
-        // in the commitment there. The guest re-derives and checks both.
+        // in the commitment there. The trace guest re-derives and checks both.
         let commitment_header = trace_commitment.header();
         let window_start =
             usize::try_from(frontier.position).expect("window start position overflows usize");
         let fingerprint_slice = trace_commitment
             .fingerprint_slice_witness(window_start, fraud_window.fingerprint.len());
-
-        let Some(receipt) = step_transitions(
-            &frontier,
-            &initial_storage_state.frontier,
-            &initial_storage_state.coordinate_index.root(),
-            &fraud_window.items,
-            fraud_window.fingerprint,
-            &commitment_header,
-            &fingerprint_slice,
-            &program_frame,
-            &input_sources_witnesses,
-            &recorded_step_io,
-            &replayed_results,
-            &authorization_journal,
-            &authorization_receipt,
-            entrypoint_membership_witness.as_ref(),
-            window_start_recur_progress,
+        let initial_index_root = initial_storage_state.coordinate_index.root();
+        let setup = WindowSetup {
+            initial_frontier: &frontier,
+            initial_storage_frontier: &initial_storage_state.frontier,
+            initial_storage_index_root: &initial_index_root,
+            trace_window: &fraud_window.items,
+            fingerprint: fraud_window.fingerprint.clone(),
+            commitment_header: &commitment_header,
+            fingerprint_slice: &fingerprint_slice,
             // Lets a divergence the packed fingerprint is blind to still be
             // proven — the tail's roots are revealed in full.
-            &trace_commitment.revealed_tail_roots,
-        ) else {
-            panic!("Failed to generate fraud proof");
+            revealed_tail_roots: &trace_commitment.revealed_tail_roots,
+            program_frame: &program_frame,
+            sequence_scope_parents: &sequence_scope_parents,
+            recorded_step_io: &recorded_step_io,
         };
 
-        return receipt;
+        phase_probe("program-frame-done"); // TEMP(cycle-probe)
+        let planned = plan_parts(&setup, options.segments);
+        phase_probe("plan-parts-done"); // TEMP(cycle-probe)
+
+        // The transition part reads the tile replay journals and the
+        // authorization journal as values: execute them now, and plan its
+        // segments, so they are proven in the batch below with everything
+        // else rather than after the tiles.
+        let executed: Vec<Job<'_, (StepRecord, ([u8; 32], TileReplayJournal))>> = tile_replays
+            .iter()
+            .map(|(step_record, tile_id, input)| {
+                Box::new(move || {
+                    let executed = replayer
+                        .execute(tile_id, input)
+                        .unwrap_or_else(|e| panic!("FAILED to execute tile {tile_id}: {e}"));
+                    (step_record.clone(), executed)
+                }) as Job<'_, _>
+            })
+            .collect();
+        let replays: ReplayJournals = run_jobs(options.workers, executed).into_iter().collect();
+        phase_probe("tile-exec-done"); // TEMP(cycle-probe)
+        let executed_authorization = execute_authorization(&manifested_inputs);
+        let transition = plan_transition_part(
+            &setup,
+            &TransitionInputs {
+                replays: &replays,
+                authorization_journal: &executed_authorization,
+                entrypoint_membership_witness: entrypoint_membership_witness.as_ref(),
+                window_start_recur_progress: window_start_recur_progress.clone(),
+            },
+            options.segments.transition,
+            options.zkvm_segment_po2,
+        );
+        phase_probe("plan-transition-done"); // TEMP(cycle-probe)
+
+        // Every proof the window needs, none waiting for another: the tile
+        // replays, the authorization, and every segment of the four parts.
+        // They run on `options.workers` provers; FRAUD WINDOW takes their
+        // receipts as assumptions once they all exist.
+        let mut jobs: Vec<Job<'_, Leaf>> = Vec::new();
+        for (step_record, tile_id, input) in &tile_replays {
+            jobs.push(Box::new(move || {
+                Leaf::Tile(step_record.clone(), replayer.replay(tile_id, input, mode))
+            }));
+        }
+        jobs.push(Box::new(|| {
+            let (receipt, journal) =
+                authorize_external_inputs(&manifested_inputs, options.zkvm_segment_po2);
+            Leaf::Authorization(receipt, journal)
+        }));
+        for job in part_jobs(&planned, &program_frame, options.zkvm_segment_po2)
+            .into_iter()
+            .chain(transition_part_jobs(&program_frame, &transition, options.zkvm_segment_po2))
+        {
+            jobs.push(Box::new(move || Leaf::Segment(job())));
+        }
+
+        let mut replayed_results: HashMap<StepRecord, ReplayResult> = HashMap::new();
+        let mut authorization = None;
+        let mut segments = Vec::new();
+        for leaf in run_jobs(options.workers, jobs) {
+            match leaf {
+                Leaf::Tile(step_record, Ok(replay_result)) => {
+                    replayed_results.insert(step_record, replay_result);
+                }
+                Leaf::Tile(_, Err(e)) => println!("FAILED to replay: {}", e),
+                Leaf::Authorization(receipt, journal) => authorization = Some((receipt, journal)),
+                Leaf::Segment(segment) => segments.push(segment),
+            }
+        }
+        let (authorization_receipt, authorization_journal) =
+            authorization.expect("the authorization job ran");
+
+        phase_probe("jobs-done"); // TEMP(cycle-probe)
+        println!("Proving FRAUD WINDOW over every part's segments...");
+        let replay_receipts = fraud_window_replay_receipts(&fraud_window.items, &replayed_results);
+        let __receipt = prove_fraud_window(
+            &setup,
+            FraudWindowInputs {
+                segments: &segments,
+                replay_receipts,
+                replay_claims: replay_claims(&fraud_window.items, &replays),
+                authorization_receipt: &authorization_receipt,
+                authorization_journal: &authorization_journal,
+            },
+            options.zkvm_segment_po2,
+        );
+        phase_probe("fraud-window-done"); // TEMP(cycle-probe)
+        return __receipt;
     }
 
     panic!("Failed to generate fraud proof");
+}
+
+/// One leaf proof of a fraud window, as the pool hands it back.
+enum Leaf {
+    Tile(StepRecord, raster_core::Result<ReplayResult>),
+    Authorization(risc0_zkvm::Receipt, raster_core::authorization::AuthorizationJournal),
+    Segment(ProvenPartSegment),
+}
+
+/// Every tile step's replay receipt, for FRAUD WINDOW to assume.
+fn fraud_window_replay_receipts(
+    window: &[StepRecord],
+    replayed_results: &HashMap<StepRecord, ReplayResult>,
+) -> Vec<risc0_zkvm::Receipt> {
+    window
+        .iter()
+        .filter(|step| step.requires_replay_proof())
+        .map(|step| {
+            let replayed = replayed_results
+                .get(step)
+                .unwrap_or_else(|| panic!("no replay receipt for tile step {:?}", step.coordinates));
+            raster_core::postcard::from_bytes(&replayed.receipt).expect("a replay receipt decodes")
+        })
+        .collect()
 }
 
 pub fn read_trace_commitment(commit_path: &str) -> Result<TraceCommitment> {

@@ -12,6 +12,28 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+/// Second pass of the two-pass guest build (`docs/proposals/transition-split.md`
+/// §Image-id pinning): the part guests are built by the `raster-prover-guests`
+/// build-dependency, and their image ids are handed to the FRAUD WINDOW guest
+/// build as environment variables, which it compiles in. `risc0_build` strips
+/// only `CARGO*` and `RUSTUP_TOOLCHAIN` from the guest's environment. (A Docker
+/// guest build forwards only `DockerOptions`' variables; pass them there too if
+/// these builds move to Docker.)
 fn main() {
+    use raster_prover_guests as guests;
+    for (name, id) in [
+        ("RASTER_PART_ID_TRACE", guests::TRACE_GUEST_ID),
+        ("RASTER_PART_ID_CONTROL_FLOW", guests::CONTROL_FLOW_GUEST_ID),
+        ("RASTER_PART_ID_STORAGE", guests::STORAGE_GUEST_ID),
+        ("RASTER_PART_ID_TRANSITION", guests::TRANSITION_GUEST_ID),
+        ("RASTER_PART_ID_AUTHORIZATION", guests::AUTHORIZATION_GUEST_ID),
+    ] {
+        let hex: String = id
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        std::env::set_var(name, hex);
+    }
     risc0_build::embed_methods();
 }

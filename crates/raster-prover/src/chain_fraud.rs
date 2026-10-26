@@ -4,26 +4,14 @@
 //! stage-level evidence receipt as an assumption); `verify_chain_fraud_receipt`
 //! performs the relying party's checks — receipt against the pinned
 //! chain-fraud image id, then the committed inner image ids against the
-//! known-good transition/authorization guests. See
+//! known-good authorization guest. See
 //! `docs/proposals/chain-fraud-proof.md`.
 
 use raster_core::chain::{ChainFaultKind, ChainFraudInput, ChainFraudJournal};
 
 use crate::authorization::authorization_guest_image_id;
 use crate::error::{BitPackerError, Result};
-use crate::{CHAIN_FRAUD_GUEST_ELF, CHAIN_FRAUD_GUEST_ID, TRANSITION_GUEST_ID};
-
-fn image_id_bytes(image_id: [u32; 8]) -> Vec<u8> {
-    image_id
-        .into_iter()
-        .flat_map(|val| val.to_le_bytes())
-        .collect()
-}
-
-/// The transition guest's image id, as the byte encoding journals carry.
-pub fn transition_guest_image_id() -> Vec<u8> {
-    image_id_bytes(TRANSITION_GUEST_ID)
-}
+use crate::{CHAIN_FRAUD_GUEST_ELF, CHAIN_FRAUD_GUEST_ID};
 
 /// Prove a chain fraud: verify the stage-level evidence in-guest and bind it to
 /// the named chain checkpoint.
@@ -37,9 +25,10 @@ pub fn transition_guest_image_id() -> Vec<u8> {
 pub fn prove_chain_fraud(
     input: &ChainFraudInput,
     evidence_receipt: Option<risc0_zkvm::Receipt>,
+    zkvm_segment_po2: crate::segments::ZkvmSegmentPo2,
 ) -> risc0_zkvm::Receipt {
     let prover = risc0_zkvm::default_prover();
-    let mut builder = risc0_zkvm::ExecutorEnv::builder();
+    let mut builder = zkvm_segment_po2.env_builder();
     if let Some(receipt) = evidence_receipt {
         builder.add_assumption(receipt);
     }

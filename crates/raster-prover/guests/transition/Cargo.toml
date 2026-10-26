@@ -7,6 +7,7 @@ edition = "2021"
 
 [dependencies]
 raster-core = { path = "../../../raster-core", features = ["std"] }
+guest-common = { path = "../guest_common" }
 
 risc0-zkvm = "3.0"
 
@@ -14,6 +15,9 @@ serde = { version = "1.0", features = ["derive"] }
 postcard = { version = "1.0", features = ["alloc"] }
 
 bridgetree = "0.7"
+
+[dev-dependencies]
+guest-common = { path = "../guest_common", features = ["test-fixtures"] }
 
 [profile.release]
 opt-level = 3

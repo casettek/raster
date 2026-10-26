@@ -9,11 +9,15 @@ authors.workspace = true
 
 [build-dependencies]
 risc0-build = "3.0"
+# The first pass of the two-pass guest build: its image ids are compiled into
+# the FRAUD WINDOW guest built here.
+raster-prover-guests = { workspace = true }
 
 [dependencies]
 raster-core = { workspace = true, features = ["std"] }
 raster-compiler = { workspace = true }
 raster-backend = { workspace = true }
+raster-prover-guests = { workspace = true }
 
 bincode.workspace = true
 bridgetree.workspace = true
@@ -28,6 +32,6 @@ postcard.workspace = true
 risc0-zkvm = { version = "3.0", default-features = false, features = ["prove", "std"] }
 
 [package.metadata.risc0]
-methods = ["guests/transition", "guests/authorization", "guests/chain_fraud"]
+methods = ["guests/fraud_window"]
 
 

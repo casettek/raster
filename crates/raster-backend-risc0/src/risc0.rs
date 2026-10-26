@@ -151,6 +151,9 @@ pub struct Risc0Backend {
     user_crate_path: Option<PathBuf>,
     /// Artifact store for caching compiled artifacts.
     artifact_store: Risc0ArtifactStore,
+    /// The zkVM proving segment size, 2^po2 cycles; `None` for risc0's default
+    /// (2^20). See `raster_prover::segments::ZkvmSegmentPo2`.
+    segment_limit_po2: Option<u32>,
 }
 
 impl Risc0Backend {
@@ -160,7 +163,14 @@ impl Risc0Backend {
             output_dir,
             user_crate_path: None,
             artifact_store: Risc0ArtifactStore::new(),
+            segment_limit_po2: None,
         }
+    }
+
+    /// Prove tiles with 2^po2-cycle zkVM segments instead of risc0's default.
+    pub fn with_segment_limit_po2(mut self, po2: Option<u32>) -> Self {
+        self.segment_limit_po2 = po2;
+        self
     }
 
     /// Set the path to the user's crate containing tiles.
@@ -277,7 +287,11 @@ impl Backend for Risc0Backend {
         // Build the executor environment with the input
         // Write length first, then raw bytes (guest expects this format)
         let input_len = input.len() as u32;
-        let env = ExecutorEnv::builder()
+        let mut builder = ExecutorEnv::builder();
+        if let Some(po2) = self.segment_limit_po2 {
+            builder.segment_limit_po2(po2);
+        }
+        let env = builder
             .write(&input_len)
             .map_err(|e| Error::Other(format!("Failed to write input length: {}", e)))?
             .write_slice(input)
@@ -287,10 +301,12 @@ impl Backend for Risc0Backend {
         match mode {
             ExecutionMode::Estimate => {
                 // Execute without proving - just get cycle count
+                let __probe_t = std::time::Instant::now(); // TEMP(cycle-probe)
                 let executor = default_executor();
                 let session = executor
                     .execute(env, &risc0.elf)
                     .map_err(|e| Error::Other(format!("Execution failed: {}", e)))?;
+                eprintln!("CYCLEPROBE label={} user={} total={} segments={} ms={}", format!("tile-exec:{}", risc0.tile_id), session.cycles(), session.segments.iter().map(|s| 1u64 << s.po2).sum::<u64>(), session.segments.len(), __probe_t.elapsed().as_millis()); // TEMP(cycle-probe)
 
                 // Get the journal (output)
                 let replay_output: TileReplayJournal = postcard::from_bytes(&session.journal.bytes)
@@ -298,13 +314,16 @@ impl Backend for Risc0Backend {
                 let output = replay_output.output_bytes;
                 let cycles = session.cycles();
 
-                Ok(TileExecutionResult::estimate(output, cycles))
+                Ok(TileExecutionResult::estimate(output, cycles)
+                    .with_journal(session.journal.bytes.clone()))
             }
             ExecutionMode::Prove { verify } => {
+                let __probe_t = std::time::Instant::now(); // TEMP(cycle-probe)
                 let prover = risc0_zkvm::default_prover();
                 let prove_info = prover
                     .prove(env, &risc0.elf)
                     .map_err(|e| Error::Other(format!("Proving failed: {}", e)))?;
+                eprintln!("CYCLEPROBE label={} user={} total={} segments={} ms={}", format!("tile-prove:{}", risc0.tile_id), prove_info.stats.user_cycles, prove_info.stats.total_cycles, prove_info.stats.segments, __probe_t.elapsed().as_millis()); // TEMP(cycle-probe)
 
                 let receipt = prove_info.receipt;
                 let replay_output: TileReplayJournal = postcard::from_bytes(&receipt.journal.bytes)

@@ -1923,7 +1923,7 @@ mod tests {
     ///
     /// The field means two different things depending on the step kind, and the
     /// transition guest derives it to stop it being free entropy in the trace
-    /// leaf (`checks::cfs::verify_sequence_id`), so the rule it derives against
+    /// leaf (`checks::control_flow::verify_sequence_id`), so the rule it derives against
     /// belongs in a test rather than in a reader's head:
     ///
     /// - a **boundary** step (`SequenceStart`/`SequenceEnd`) names the sequence

@@ -1,6 +1,6 @@
 # Proposal: `storage-write-cost` — a storage append costs 200–360 µs, and almost none of it is the append
 
-Status: Term 1 **implemented** 2026-09-21; Term 2 open. **Measured, not estimated** — see §Measurement.
+Status: Term 1 **implemented** 2026-09-21; Term 2 **implemented as 2b** 2026-10-21 by [`compact-coordinate-index`](./compact-coordinate-index.md) (the index redefined as a compact sparse Merkle tree; 2a subsumed). Its host-side gain is not yet measured. **Measured, not estimated** — see §Measurement.
 
 Related:
 - [`incremental-draft-materialization`](./incremental-draft-materialization.md) — found this while

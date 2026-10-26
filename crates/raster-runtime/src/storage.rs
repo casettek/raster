@@ -751,10 +751,9 @@ impl AuthenticatedObjectStore {
         self.append(backing, object_commitment, coordinates)
     }
 
-    /// Injects the resolver a `Referenced` object dispatches to. Set once
-    /// per runtime — by runtime initialization in production, or
-    /// directly by a caller that supplies its own input context (the trace
-    /// recorder, tests).
+    /// Injects the resolver a `Referenced` object dispatches to. Installed
+    /// by runtime initialization or replaced between program runs by an
+    /// embedding caller that supplies its own input context.
     pub(crate) fn set_source_resolver(&mut self, resolver: Arc<dyn SourceResolver>) {
         self.objects.set_source_resolver(resolver);
     }

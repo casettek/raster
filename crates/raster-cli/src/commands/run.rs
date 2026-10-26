@@ -13,6 +13,7 @@ use raster_core::cfs::ControlFlowSchema;
 use raster_core::trace::{ExecTarget, StepKind, Trace, TraceEvent};
 use raster_core::{Error, Result};
 
+use raster_prover::segments::ProveOptions;
 use raster_prover::trace::{FraudProofConfig, VerificationResult};
 use raster_runtime::TraceRecorder;
 
@@ -30,6 +31,7 @@ pub fn run(
     fraud_proof_config: Option<FraudProofConfig>,
     fraud_step: Option<&FraudTarget>,
     audit_flag: Option<&str>,
+    prove_options: ProveOptions,
     no_auth: bool,
     _verbose: bool,
     show_output: bool,
@@ -298,7 +300,9 @@ pub fn run(
         }
     } else if audit_flag.is_some() {
         let commit_path = audit_flag.expect("Commitment path was provided");
+        crate::commands::prove::phase_probe("verify-start"); // TEMP(cycle-probe)
         let verification_result = verify(&trace, commit_path, &cfs)?;
+        crate::commands::prove::phase_probe("verify-done"); // TEMP(cycle-probe)
 
         match verification_result {
             VerificationResult::Ok => println!("Verification Success"),
@@ -311,6 +315,7 @@ pub fn run(
                     &project,
                     input_manifest,
                     commit_path,
+                    prove_options,
                 )?;
                 println!("Fraud proof generated: {}", fraud_proof_path.display());
             }

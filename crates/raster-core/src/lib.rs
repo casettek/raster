@@ -35,11 +35,19 @@ pub mod authorization;
 #[cfg(feature = "std")]
 pub mod chain;
 #[cfg(feature = "std")]
+pub mod control_flow;
+#[cfg(feature = "std")]
 pub mod coordinate_index;
+#[cfg(feature = "std")]
+pub mod fraud_window;
 #[cfg(feature = "std")]
 pub mod manifest;
 #[cfg(feature = "std")]
 pub mod schema;
+#[cfg(feature = "std")]
+pub mod storage_check;
+#[cfg(feature = "std")]
+pub mod trace_check;
 #[cfg(feature = "std")]
 pub mod transition;
 

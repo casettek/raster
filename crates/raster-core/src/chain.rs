@@ -2,7 +2,7 @@
 //!
 //! The checkpoint types were born in `raster-cli`'s `chain` module; they live
 //! here because the chain-fraud guest must decode the exact `ChainCommitment`
-//! bytes it attributes a fault to (the same reason `TransitionJournal` lives
+//! bytes it attributes a fault to (the same reason `FraudWindowJournal` lives
 //! here). The CLI re-imports them. See `docs/proposals/program-chain.md` and
 //! `docs/proposals/chain-fraud-proof.md`.
 
@@ -188,9 +188,9 @@ pub struct ChainFraudJournal {
     /// `== ChainCommitment.stages[faulty_stage].program_commitment`.
     pub stage_program_commitment: Vec<u8>,
     pub fault: ChainFaultKind,
-    /// Reserved for a fault kind that verifies a transition receipt. Always
-    /// empty today: `Link` is the only kind, and it verifies an authorization
-    /// journal. Kept so the journal shape survives the dispute protocol
+    /// Reserved for a fault kind that verifies a fraud-window receipt (a
+    /// FRAUD WINDOW id). Always empty today: `Link` verifies an authorization
+    /// journal and `Shape` nothing. Kept so the journal shape survives the dispute protocol
     /// landing (`docs/proposals/chain-io-commitment.md` §5).
     pub transition_image_id: Vec<u8>,
     /// The authorization-guest image id the manifest journal was verified

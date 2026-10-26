@@ -64,8 +64,20 @@ impl FnInput {
         &self.storage
     }
 
+    /// The preimage of a step's `input_source_commitment`: the values, the
+    /// argument **names**, and the storage map.
+    ///
+    /// The names are what map argument `i` to its storage binding
+    /// (`FnInputValue::StorageBinding` carries none), so leaving them out let a
+    /// witness reorder or repeat bindings and still hash to the recorded
+    /// commitment. See `docs/issues/fn-input-arg-names-unbound.md`.
+    ///
+    /// `ty` is left out: nothing checks it, and it is `stringify!` output, which
+    /// is not stable across compiler versions. `data` is left out too: it is
+    /// committed separately, as the record's `input_commitment`.
     pub fn source_witness_bytes(&self) -> Vec<u8> {
-        postcard::to_allocvec(&(self.values.clone(), self.storage.clone())).unwrap_or_default()
+        let names: Vec<&str> = self.args.iter().map(|arg| arg.name.as_str()).collect();
+        postcard::to_allocvec(&(&self.values, &names, &self.storage)).unwrap_or_default()
     }
 }
 
@@ -517,7 +529,7 @@ pub struct RecurEndStep {
 }
 
 /// The binding name a recur site's source is always recorded under. Shared so
-/// the payload rule below and `checks::cfs::authenticated_source_len` cannot
+/// the payload rule below and `checks::recur::authenticated_source_len` cannot
 /// disagree about which binding that is.
 pub const RECUR_SOURCE_BINDING: &str = "input";
 
@@ -531,7 +543,7 @@ pub const RECUR_SOURCE_BINDING: &str = "input";
 /// fact — *this reference resolves inside an object the store authenticates* —
 /// which folds from a root with no payload at all.
 ///
-/// The one exception is a recur site's source. `checks::cfs`'s
+/// The one exception is a recur site's source. `checks::recur`'s
 /// `authenticated_source_len` reads the sweep bound `L` out of that binding's
 /// payload, and `L` is the number every completeness rule holds the sweep to.
 /// That payload is the list's *metadata* view — `(len, elements_root)` — so it
@@ -780,8 +792,8 @@ pub struct TraceWindow {
 /// steps revealed in the clear.
 ///
 /// The struct lives in `raster-core` (not `raster-prover`) because the
-/// transition guest must decode the exact `commit.bin` bytes it refutes: at
-/// `Init` it hashes them into the journal's `refuted_trace_commitment` and
+/// trace guest must decode the exact `commit.bin` bytes it refutes: it hashes
+/// them into the window binding's `refuted_trace_commitment` and
 /// asserts the window fingerprint is a slice of `fingerprint` at the offset
 /// fixed by the window's initial frontier (see
 /// `docs/proposals/chain-fraud-proof.md`). Construction and verification

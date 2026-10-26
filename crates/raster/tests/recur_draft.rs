@@ -1145,7 +1145,7 @@ fn a_recur_sequence_site_commits_to_its_source_list_metadata() {
     // whole list before any runner runs, the earliest and largest of the eager
     // paths — and records a `Raw` selection.
     //
-    // The consequence was not only memory: `checks::cfs::authenticated_source_len`
+    // The consequence was not only memory: `checks::recur::authenticated_source_len`
     // refuses anything but `List`, so no fraud proof covering a recur *sequence*
     // site could be produced at all. No test caught it because the recorder's
     // own fixture (`seed_recur_source`) hand-builds the metadata commitment

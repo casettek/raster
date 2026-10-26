@@ -1233,7 +1233,7 @@ pub(crate) fn gen_recur_sequence_driver_function(
                 // materializes the whole list before any runner runs — the
                 // earliest and largest of the eager paths — and it records a
                 // `Raw` selection, so the site's `L` is index-trusted rather
-                // than authenticated. `checks::cfs::authenticated_source_len`
+                // than authenticated. `checks::recur::authenticated_source_len`
                 // requires the `0x0A` metadata form and refuses `Raw`, so no
                 // fraud proof covering a recur *sequence* site could be built
                 // at all while this used the ordinary tracer.

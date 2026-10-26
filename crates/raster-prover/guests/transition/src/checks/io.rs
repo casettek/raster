@@ -1,21 +1,20 @@
 //! Checks that recorded step commitments (input, input source, output)
-//! match the provided witnesses, and that tile steps carry a verified
-//! replay proof whose output matches the recorded output witness.
-
-use risc0_zkvm::guest::env;
+//! match the provided witnesses, and that tile steps carry a replay journal
+//! whose output matches the recorded output witness. The replay receipt itself
+//! is not verified here: the check returns the [`ReplayClaim`] the transition
+//! part folds into a chain, and FRAUD WINDOW verifies the receipt it names.
 
 use std::collections::BTreeMap;
 
-use raster_core::authorization::AuthorizationJournal;
 use raster_core::draft::TileReplayJournal;
+use raster_core::fraud_window::ReplayClaim;
 use raster_core::input::{payload_structural_root, SelectionWitness};
 use raster_core::trace::{FnInput, FnInputValue, StepRecord};
 
+use crate::checks::columns::Selections;
 use crate::merkle_tree::sha256_bytes;
 
-pub fn input_source_commitment(input: &FnInput) -> Vec<u8> {
-    sha256_bytes(&input.source_witness_bytes())
-}
+pub use guest_common::input_source::{input_source_commitment, verify_input_source_commitment_anchored};
 
 pub fn verify_io_witness(
     step_record: &StepRecord,
@@ -45,19 +44,10 @@ pub fn verify_io_witness(
     }
 }
 
-pub fn verify_authorization_journal(
-    authorization_journal: &AuthorizationJournal,
-    authorization_image_id: &[u8],
-) -> bool {
-    let image_id_digest = risc0_zkvm::sha::Digest::try_from(authorization_image_id)
-        .expect("authorization image id must be 32 bytes");
-
-    let journal_bytes = risc0_zkvm::serde::to_vec(authorization_journal)
-        .expect("Failed to serialize authorization journal");
-
-    env::verify(image_id_digest, &journal_bytes).is_ok()
-}
-
+/// Check one step's recorded commitments against its witnesses. A tile step's
+/// replay journal is checked against the record and witnesses here, and
+/// returned as the claim the caller must have verified.
+#[must_use = "a tile step's replay claim must be verified or folded"]
 pub fn verify_step_record(
     step_record: &StepRecord,
     expected_image_id: Option<&[u8; 32]>,
@@ -66,28 +56,15 @@ pub fn verify_step_record(
     input_witness_bytes: Option<&Vec<u8>>,
     output_witness_bytes: Option<&Vec<u8>>,
     input_source_witness: Option<&FnInput>,
-    storage_selection_witnesses: &BTreeMap<String, SelectionWitness>,
-) {
+    // `input_source_commitment(input_source_witness)`, hashed once per step
+    // by the caller.
+    input_source_commitment: Option<&[u8]>,
+    // Consumed from the storage check (`checks::columns`).
+    selections: &Selections<'_>,
+) -> Option<ReplayClaim> {
+    let storage_selection_witnesses: &BTreeMap<String, SelectionWitness> = selections.get();
     verify_io_witness(step_record, input_witness_bytes, output_witness_bytes);
-    if let Some(expected_input_source_commitment) = step_record.input_source_commitment() {
-        let input_source_witness =
-            input_source_witness.expect("Step input source witness is missing");
-        assert_eq!(
-            expected_input_source_commitment,
-            &input_source_commitment(input_source_witness),
-            "Step input source witness does not match recorded source commitment",
-        );
-    } else {
-        // `ProgramStart`, `ProgramEnd` and `SequenceEnd` all report `None`
-        // here. None of them binds a step input, so a witness supplied for one
-        // is unbound by construction — nothing in the record commits to it.
-        assert!(
-            input_source_witness.is_none(),
-            "Step {:?} declares no input source commitment, so it must not carry an input \
-             source witness",
-            step_record.coordinates,
-        );
-    }
+    verify_input_source_commitment_anchored(step_record, input_source_commitment);
 
     if step_record.requires_replay_proof() {
         // The expected image id comes from the program's committed tile
@@ -98,13 +75,14 @@ pub fn verify_step_record(
             expected_image_id.expect("tile step must resolve a registry image id");
         let replay_journal =
             replay_journal.expect("tile execution should provide a replay journal witness");
-        let replay_image_id_digest =
-            risc0_zkvm::sha::Digest::try_from(expected_image_id.as_slice())
-                .expect("image_id must be 32 bytes");
         let replay_journal_bytes = postcard::to_allocvec(replay_journal)
             .expect("Failed to encode replay journal for receipt verification");
-        env::verify(replay_image_id_digest, &replay_journal_bytes)
-            .expect("Failed to verify trace replay image id");
+        let claim = ReplayClaim {
+            image_id: *expected_image_id,
+            journal_digest: sha256_bytes(&replay_journal_bytes)
+                .try_into()
+                .expect("sha256 is 32 bytes"),
+        };
         let output_bytes = output_witness_bytes.map(Vec::as_slice).unwrap_or(&[]);
         assert_eq!(
             replay_journal.output_bytes.as_slice(),
@@ -128,7 +106,9 @@ pub fn verify_step_record(
             input_source_witness,
             storage_selection_witnesses,
         );
+        return Some(claim);
     }
+    None
 }
 
 /// The tile's write is the object its replay returned
@@ -136,8 +116,8 @@ pub fn verify_step_record(
 /// returned value, computed by the replay, so it is `Some` exactly when the
 /// tile publishes an output; the recorded commitment must then be it. A tile
 /// that publishes none — a recur iteration returning its site's draft or state
-/// (D3) — must record an empty commitment, and `checks::store` requires a step
-/// with an empty commitment to write nothing: together, a tile writes iff its
+/// (D3) — must record an empty commitment, and the storage check requires a
+/// step with an empty commitment to write nothing: together, a tile writes iff its
 /// replay produced an output, and writes exactly that.
 pub(crate) fn verify_output_root(step_record: &StepRecord, replay_journal: &TileReplayJournal) {
     let recorded = step_record
@@ -158,7 +138,8 @@ pub(crate) fn verify_output_root(step_record: &StepRecord, replay_journal: &Tile
 
 /// Every storage-bound argument is the value the tile ran on
 /// (`tile-io-structural-roots` step 2). Its selection witness folds to the
-/// stored object from the selected payload's root (`checks::store`); the
+/// stored object from the selected payload's root (the storage guest, whose
+/// witness map the `Selections` column ties to this part's); the
 /// replay committed the root of each decoded argument; this requires the two
 /// to be the same root, so the bytes the selection proves and the value the
 /// binary executed are the same value.

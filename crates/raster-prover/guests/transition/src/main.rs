@@ -1,77 +1,23 @@
-//! RISC0 guest program for trace state transitions.
-//!
-//! Each execution proves one step of a fraud-proof window:
-//!
-//! 1. Attach to the chain: genesis state (`Init`) or a recursively verified
-//!    previous transition journal (`Next`).
-//! 2. Verify the step against every recorded commitment (CFS bindings,
-//!    IO/replay, storage, draft chain) and append it to the trace
-//!    frontier + fingerprint.
-//! 3. Compare the accumulated fingerprint with the committed one and commit
-//!    the resulting journal (`Next`, or `Finished` on the proven divergence).
+//! RISC0 guest program for the transition part of a fraud window
+//! (`docs/proposals/transition-split.md`): io, recur, drafts and entrypoint
+//! over a segment of steps, verifying no receipt. Commits a
+//! `PartSegmentJournal` that FRAUD WINDOW stitches and compares.
 
-mod checks;
-mod frame;
-mod fraud_proof;
-mod merkle_tree;
+use risc0_zkvm::guest::env;
 
-#[cfg(test)]
-mod tests;
+use guest_common::frame;
+use raster_core::transition::TransitionPartHeader;
 
-use raster_core::transition::{
-    FingerprintSliceWitness, TraceCommitmentHeader, TransitionInput, TransitionState,
-};
-
-use crate::checks::io::verify_authorization_journal;
-use crate::fraud_proof::{commit_journal, FraudProofWindowContext, PublicParams};
+use transition_guest::part::{verify_segment, PartProgram};
 
 fn main() {
-    // Host inputs, in write order. A `Next` step's previous journal is read
-    // inside `ChainLink::establish`.
-    let params = PublicParams::read();
-    let input: TransitionInput = frame::read();
-    let state: TransitionState = frame::read();
-    // Only the window-opening step binds the committed fingerprint to a
-    // named `commit.bin`: it reads the commitment's compact header and the
-    // slice witness covering this window. `Next` steps inherit the (already
-    // verified) binding from the previous journal instead.
-    let commitment_binding: Option<(TraceCommitmentHeader, FingerprintSliceWitness)> = match &state
-    {
-        TransitionState::Init(_) => Some((frame::read(), frame::read())),
-        _ => None,
-    };
-
-    // Precondition: external inputs were authorized against a manifest.
-    assert!(verify_authorization_journal(
-        &input.authorization_journal,
-        &input.authorization_image_id
-    ));
-
-    // Attach this step to the fraud-proof chain.
-    let (window_context, current) =
-        FraudProofWindowContext::proceed(&params, &input, state, commitment_binding);
-
-    // Verify every recorded aspect of the step and advance the state.
-    let next = current.apply_verified_step(&params.program, &params.cfs_cursor, &input);
-    let entrypoint_authorization = next.entrypoint_authorization();
-    let output_authorization = next.output_authorization();
-
-    // Continue the window, or finish on the proven fingerprint divergence.
-    let current_state = next.finalize(
-        &window_context.init_state.fingerprint,
-        window_context.final_committed_root.as_ref(),
-    );
-
-    commit_journal(
-        window_context.init_state,
-        current_state,
-        params.transition_image_id,
-        params.program_commitment,
-        window_context.refuted_trace_commitment,
-        window_context.window_is_terminal,
-        window_context.final_committed_root,
-        &input,
-        entrypoint_authorization,
-        output_authorization,
-    );
+    // Host inputs, in write order: the program frame, the segment header,
+    // then one `TransitionStep` frame per step.
+    let program = PartProgram::from_frame(&frame::read_bytes());
+    let header: TransitionPartHeader = frame::read();
+    let (journal, state_after) = verify_segment(&program, header, frame::read);
+    env::commit_slice(&journal.encode());
+    // The state after, for the host to start the next segment from: untrusted
+    // there, since that segment's state before must stitch to this digest.
+    env::write_slice(&postcard::to_allocvec(&state_after).expect("a state always encodes"));
 }
