@@ -141,6 +141,21 @@ fn capture_success_reference(name: String) -> Result<StorageRef> {
     Ok(echoed.reference().clone())
 }
 
+#[tile(kind = iter)]
+fn checked_personal(personal: PersonalData) -> Result<PersonalData> {
+    Ok(personal)
+}
+
+/// The shape iris's stages use everywhere: a validator tile's `?`-unwrapped
+/// output, selected into by a later step.
+#[sequence]
+fn select_through_fallible_output(personal: PersonalData) -> Result<String> {
+    let checked = call!(checked_personal, personal)?;
+    let name = select!(String, checked.name);
+    let echoed = call!(echo_name, name);
+    Ok(echoed)
+}
+
 fn run_echo_sequence<A>(name: A) -> String
 where
     A: IntoAuthRef<String>,
@@ -174,6 +189,15 @@ where
     A: IntoAuthRef<String>,
 {
     materialize_auth_result::<String, _>(__raster_sequence_auth_traced_error_outer(name))
+}
+
+fn run_select_through_fallible_output<A>(personal: A) -> Result<String>
+where
+    A: IntoAuthRef<PersonalData>,
+{
+    materialize_auth_result::<String, _>(__raster_sequence_auth_select_through_fallible_output(
+        personal,
+    ))
 }
 
 #[test]
@@ -537,4 +561,57 @@ fn sequence_wrapper_panics_on_runtime_trace_failure() {
 #[test]
 fn zero_arg_sequence_wrapper_accepts_no_arguments() {
     __raster_sequence_auth_zero_arg_sequence();
+}
+
+/// A `select!` through `call!(tile, …)?` records a path that exists in the
+/// stored tree. The stored object is the tile's whole `Result<T>`, so the path
+/// leads with `Ok`; the recorded commitment's root is that stored object's,
+/// and its selected hash is the hash of the selected field's subtree there.
+/// Before the fix the path was `[name]` from an enum root: no witness could be
+/// built for it, and no verifier could have authenticated the read.
+#[test]
+fn a_selection_through_a_fallible_output_records_a_provable_path() {
+    let personal = PersonalData {
+        name: "Raster".to_string(),
+        address: Address {
+            line: "Main Plaza".to_string(),
+        },
+    };
+    let (result, events) =
+        capture_trace_events(|| run_select_through_fallible_output(personal.clone()));
+    assert_eq!(result, Ok("Raster".to_string()));
+
+    let echo = events
+        .into_iter()
+        .find_map(|event| match event {
+            TraceEvent::TileExec(record) if record.fn_name == "echo_name" => Some(record),
+            _ => None,
+        })
+        .expect("expected echo_name tile event");
+    let input = echo.input.expect("echo_name input should be recorded");
+    let storage: Vec<_> = input.storage().values().cloned().collect();
+    assert_eq!(storage.len(), 1, "{storage:?}");
+    let read = &storage[0];
+
+    let expected_path = SelectorPath::new(vec![
+        SelectorSegment::Variant("Ok".to_string()),
+        SelectorSegment::Field("name".to_string()),
+    ]);
+    assert_eq!(read.selector, expected_path);
+    assert_eq!(read.selection.path, expected_path);
+
+    // Recompute both ends from the stored value itself.
+    let stored: core::result::Result<PersonalData, String> = Ok(personal);
+    let tree = raster::core::tree::tree_value_from_serialize(&stored).unwrap();
+    let (_, root) = raster::core::tree::subtree_payload_and_root(&tree).unwrap();
+    let payload = raster::core::tree::subtree_children(&tree)[0];
+    let name = raster::core::tree::subtree_children(payload)[0];
+    let (name_bytes, _) = raster::core::tree::subtree_payload_and_root(name).unwrap();
+
+    assert_eq!(read.selection.source_root_hash, root);
+    assert_eq!(read.commitment, root.to_vec());
+    assert_eq!(
+        read.selection.selected_hash,
+        raster::core::input::selection_payload_hash(&name_bytes)
+    );
 }

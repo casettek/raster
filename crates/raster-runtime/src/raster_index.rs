@@ -588,6 +588,33 @@ impl RasterIndex {
                         field_name
                     )));
                 }
+                (SelectorDescent::Variant(name), None) => {
+                    let RasterNodeKind::EnumNewtype { variant, child } = &self.node(current_id)?.kind
+                    else {
+                        return Err(Error::Other(format!(
+                            "Selector variant '{}' requires an enum newtype value",
+                            name
+                        )));
+                    };
+                    if variant != name {
+                        return Err(Error::Other(format!(
+                            "Selector variant '{}' does not match the stored variant '{}'",
+                            name, variant
+                        )));
+                    }
+                    if prove {
+                        steps.push(SelectionProofStep::EnumNewtype {
+                            variant: variant.clone(),
+                        });
+                    }
+                    current_id = *child;
+                }
+                (SelectorDescent::Variant(name), Some(_)) => {
+                    return Err(Error::Other(format!(
+                        "Selector variant '{}' requires an enum newtype value",
+                        name
+                    )));
+                }
                 (SelectorDescent::Index(index), None) => {
                     return Err(Error::Other(format!(
                         "Selector index '{}' was not found in selected value",

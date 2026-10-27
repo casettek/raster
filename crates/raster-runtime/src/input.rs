@@ -1,5 +1,5 @@
 use raster_core::input::{
-    encode_list_metadata_payload, selection_payload_hash, struct_commitments_root,
+    encode_list_metadata_payload, enum_newtype_root, selection_payload_hash, struct_commitments_root,
     AuthenticatedListMetadata, Hash32, ListProofDirection, ListProofSibling, SchemaNode,
     Selectable, SelectedPayload, SelectionCommitment, SelectionPayloadKind, SelectionProof,
     SelectionProofStep, SelectionWitness, SelectorDescent, SelectorPath, SelectorSegment,
@@ -924,6 +924,30 @@ pub(crate) fn prove_selection(
                 }],
             })
         }
+        // A `Result<T>`-backed value carries `T`'s schema (a fallible output's
+        // identity is its payload's), so the variant step walks into the
+        // payload with the same schema.
+        (SelectorDescent::Variant(name), _, TreeValue::EnumNewtype(variant, child_value))
+            if variant == name =>
+        {
+            let child = prove_selection(schema, child_value, &segments[1..])?;
+            let root_hash = enum_newtype_root(variant, &child.root_hash);
+            let mut steps = Vec::with_capacity(child.steps.len() + 1);
+            steps.push(SelectionProofStep::EnumNewtype {
+                variant: variant.clone(),
+            });
+            steps.extend(child.steps);
+            Ok(ProvenSelection {
+                selected_value: child.selected_value,
+                selected_bytes: child.selected_bytes,
+                root_hash,
+                steps,
+            })
+        }
+        (SelectorDescent::Variant(name), _, _) => Err(Error::Other(format!(
+            "Selector variant '{}' was not found in an enum newtype value",
+            name
+        ))),
         (SelectorDescent::Field(field_name), _, _) => Err(Error::Other(format!(
             "Selector field '{}' was not found in selected value",
             field_name
@@ -2082,6 +2106,70 @@ mod tests {
 
         // And the slice folds through `ListRange` to the committed root.
         assert!(verify_selection_proof(&witness.bytes, &witness.proof));
+    }
+
+    /// A fallible tile's stored object: the whole `Result<T>`. A selection
+    /// into the `T` names the `Ok` variant first, and the index serves it as
+    /// a proof that folds through `EnumNewtype` to the stored root — the
+    /// witness the prover builds for `select!` through `call!(tile, …)?`.
+    fn stored_fallible_output() -> (Vec<u8>, RasterIndex) {
+        let value: core::result::Result<Address, String> = Ok(Address {
+            lines: vec!["a".to_string(), "b".to_string(), "c".to_string()].into(),
+            indexes: vec![1, 2, 3].into(),
+        });
+        let (data_bytes, index_bytes, _commitment) = encode_raster_value(&value).unwrap();
+        (data_bytes, RasterIndex::from_bytes(&index_bytes).unwrap())
+    }
+
+    #[test]
+    fn raster_index_selects_through_an_ok_variant_into_a_verifiable_proof() {
+        let (data_bytes, index) = stored_fallible_output();
+        for selector in [
+            SelectorPath::new(vec![SelectorSegment::Variant("Ok".to_string())]),
+            SelectorPath::new(vec![
+                SelectorSegment::Variant("Ok".to_string()),
+                SelectorSegment::from("lines"),
+                SelectorSegment::Index(1),
+            ]),
+        ] {
+            let selection = index.select(&selector).unwrap();
+            let witness =
+                selection_witness_from_raster_selection(&data_bytes, &selector, selection).unwrap();
+            assert!(
+                matches!(
+                    witness.proof.steps.first(),
+                    Some(SelectionProofStep::EnumNewtype { variant }) if variant == "Ok"
+                ),
+                "{:?}",
+                witness.proof.steps
+            );
+            assert!(verify_selection_proof(&witness.bytes, &witness.proof), "{selector:?}");
+        }
+
+        // The selected bytes are the `T`'s own: they decode as the payload.
+        let selector = SelectorPath::new(vec![
+            SelectorSegment::Variant("Ok".to_string()),
+            SelectorSegment::from("lines"),
+            SelectorSegment::Index(1),
+        ]);
+        let selection = index.select(&selector).unwrap();
+        let tree =
+            tree_value_from_raster_node(&index, &data_bytes, selection.node_id, selection.offset)
+                .unwrap();
+        let line: String = typed_value_from_tree(&tree).unwrap();
+        assert_eq!(line, "b");
+    }
+
+    /// The variant must be the one stored, and it cannot be skipped: the
+    /// stored root is the enum, so a path starting at the payload — what the
+    /// runtime used to record — is not a path in this tree.
+    #[test]
+    fn raster_index_refuses_a_wrong_or_missing_variant() {
+        let (_, index) = stored_fallible_output();
+        let wrong = SelectorPath::new(vec![SelectorSegment::Variant("Err".to_string())]);
+        assert!(index.select(&wrong).is_err());
+        let skipped = SelectorPath::new(vec![SelectorSegment::from("lines")]);
+        assert!(index.select(&skipped).is_err());
     }
 
     #[test]

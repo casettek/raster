@@ -605,9 +605,55 @@ fn a_declared_narrowing_the_step_skipped_is_refused() {
 
 /// The step narrowed where the CFS declares the parameter passed whole.
 #[test]
-#[should_panic(expected = "Storage sequence scope input does not match consumer binding")]
+#[should_panic(expected = "selects a different part of the caller's value than the CFS declares")]
 fn an_undeclared_narrowing_is_refused() {
     verify_narrowed_scope_read(&[], &["personal_data"], &["personal_data", "name"], b"personal-data");
+}
+
+/// `sub`'s consumer reads `sub`'s parameter 0 whole, as list metadata (`List`,
+/// a 41-byte `0x0A` payload), where the caller forwarded it as `Raw` — the
+/// shape of a recur site inside a recur sequence sweeping a list the caller
+/// passed in (iris's `prefill-range`, `layer.w_v.pages`). `read_from` is the
+/// commitment of the object the consumer read.
+fn verify_whole_scope_read_as_list_metadata(read_from: &[u8]) {
+    let cfs_cursor = scope_binding_cfs_reading(InputBinding::seq_input(0));
+    let (step_record, _, _, _) =
+        scope_binding_scenario(CfsCoordinates(vec![]), sha(b"personal-data"));
+    let caller_argument = selecting(
+        storage_input_witness(CfsCoordinates(vec![]), sha(b"personal-data")),
+        field_path(&["lines"]),
+    );
+    let mut step_source = selecting(
+        storage_input_witness(CfsCoordinates(vec![]), sha(read_from)),
+        field_path(&["lines"]),
+    );
+    for data in step_source.storage.values_mut() {
+        data.selection.payload_kind = raster_core::input::SelectionPayloadKind::List;
+        data.selection.selected_len = 41;
+        data.selection.selected_hash = [0x0A; 32];
+    }
+    verify_step_record_inputs(
+        &cfs_cursor,
+        &step_record,
+        Some(&step_source),
+        Some(&caller_argument),
+        None,
+    );
+}
+
+/// Same node, a different view of it: accepted. Each view is proven against
+/// the store by the step that recorded it; what this check establishes is
+/// that both name the same node.
+#[test]
+fn a_whole_scope_parameter_read_through_another_view_verifies() {
+    verify_whole_scope_read_as_list_metadata(b"personal-data");
+}
+
+/// A different view is not a licence to read a different object.
+#[test]
+#[should_panic(expected = "reads a different object than the caller passed")]
+fn a_whole_scope_parameter_read_from_another_object_is_refused() {
+    verify_whole_scope_read_as_list_metadata(b"another-object");
 }
 
 /// The declared path, read out of a different object.
@@ -4742,7 +4788,7 @@ fn a_recur_sequence_body_reading_its_item_is_accepted() {
 }
 
 #[test]
-#[should_panic(expected = "Storage sequence scope input does not match consumer binding")]
+#[should_panic(expected = "selects a different part of the caller's value than the CFS declares")]
 fn a_recur_sequence_body_reading_another_element_is_rejected() {
     let (_, scope, _) = recur_sequence_iteration(1);
     let (step, input) = decorate_reading(1, 0);

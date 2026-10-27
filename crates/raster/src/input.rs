@@ -1024,6 +1024,32 @@ where
     })
 }
 
+/// Binds the `T` inside a fallible tile's stored output.
+///
+/// A fallible tile's storage object is its whole `Result<T>` — that is what
+/// its replay produces and what its output commitment binds — so the `T` a
+/// `call!(tile, …)?` hands back sits under the `Ok` variant. Naming `Ok` as
+/// the binding's selector prefix keeps every later `select!` a path into the
+/// stored tree, `[Ok, …]`, which storage serves as one indexed read and a
+/// verifier can prove. Without it the path would start at the `T`, which the
+/// stored tree does not hold at its root.
+#[doc(hidden)]
+pub fn fallible_output_auth_ref<T>(reference: StorageRef) -> AuthRef<T>
+where
+    T: DeserializeOwned + Serialize + 'static,
+{
+    let selector = SelectorPath::new(Vec::from([SelectorSegment::Variant(String::from("Ok"))]));
+    let resolve_selector = selector.clone();
+    AuthRef::Storage(DeferredAuthStorage {
+        reference,
+        selector,
+        // `Ok` names a variant, not a data-sourced index — nothing to bind.
+        index_bindings: Vec::new(),
+        resolve: Rc::new(move |reference| select_stored_value::<T>(&reference, &resolve_selector)),
+        marker: PhantomData,
+    })
+}
+
 pub fn typed_selector_path<Root, Selected>(
     path: SelectorPath,
 ) -> TypedSelectorPath<Root, Selected> {
@@ -1320,15 +1346,28 @@ where
                     index_bindings: binding.index_bindings.clone(),
                     resolve: Rc::new(move |reference| {
                         // The composed path is anchored to the stored root
-                        // `reference` names, so storage can serve the whole
-                        // select chain as one indexed read; only when the
-                        // root isn't path-addressable (e.g. behind a custom
-                        // resolver) does this fall back to materializing the
-                        // parent and selecting in memory.
-                        if let Ok(selected) =
-                            select_stored_value::<Selected>(&reference, &resolve_selector)
-                        {
-                            return Ok(selected);
+                        // `reference` names, so storage serves the whole
+                        // select chain as one indexed read — and that path is
+                        // what the step records and a verifier must prove.
+                        let direct = select_stored_value::<Selected>(&reference, &resolve_selector);
+                        match direct {
+                            Ok(selected) => return Ok(selected),
+                            // Authenticated, a path the stored object does not
+                            // have must fail here. Materializing the parent and
+                            // selecting in memory would still hand back a
+                            // value, but the trace would record this path
+                            // against the stored root: no witness can be built
+                            // for it and no verifier could authenticate the
+                            // read. That is how `select!` through
+                            // `call!(tile, …)?` went unnoticed before its path
+                            // gained the `Ok` variant.
+                            Err(error) if crate::auth_mode().is_authenticated() => {
+                                return Err(raster_core::Error::Other(alloc::format!(
+                                    "select! path {:?} is not a path in the stored object at {:?}, so its read could not be proven: {}",
+                                    resolve_selector.segments, reference.coordinates, error
+                                )));
+                            }
+                            Err(_) => {}
                         }
                         let current = (resolve_current.as_ref())(reference.clone())?;
                         select_storage_value::<Current, Selected>(&current, &relative_selector)
