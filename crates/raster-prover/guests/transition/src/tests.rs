@@ -1903,20 +1903,12 @@ fn build_write_witness(
 ) -> StorageWriteWitness {
     let (_frontier, _root, before_index, _before_index_root) =
         build_storage_context(before_entries);
-    let mut after_entries = before_entries.to_vec();
-    after_entries.push(new_entry.clone());
-    let (_frontier, _root, after_index, _after_index_root) = build_storage_context(&after_entries);
     StorageWriteWitness {
         entry: new_entry.clone(),
         index_non_membership_witness: coordinate_index_non_membership_proof(
             &before_index,
             &new_entry.coordinates,
         ),
-        index_membership_witness: coordinate_index_membership_proof(
-            &after_index,
-            &new_entry.coordinates,
-        )
-        .expect("membership proof should exist after write"),
     }
 }
 
@@ -2192,6 +2184,10 @@ fn verify_storage_transition_rejects_duplicate_coordinates() {
         index_root_before.clone(),
         index_root_before.clone(),
     );
+    // The existing key's own path, presented as an empty slot: the only
+    // non-membership a host could offer for coordinates already written.
+    let existing_path = coordinate_index_membership_proof(&before_index, &existing_entry.coordinates)
+        .expect("existing coordinate should have membership proof");
     let witness = StorageWitness {
         reads: Vec::new(),
         write: Some(StorageWriteWitness {
@@ -2202,16 +2198,50 @@ fn verify_storage_transition_rejects_duplicate_coordinates() {
             index_non_membership_witness:
                 raster_core::transition::CoordinateIndexNonMembershipProof {
                     coordinates: existing_entry.coordinates.clone(),
-                    siblings: vec![[0; 32].into(); 256],
+                    terminal: raster_core::transition::IndexTerminal::Empty,
+                    siblings: existing_path.siblings,
                 },
-            index_membership_witness: coordinate_index_membership_proof(
-                &before_index,
-                &existing_entry.coordinates,
-            )
-            .expect("existing coordinate should have membership proof"),
         }),
     };
 
+    let _ = verify_storage_transition(
+        &step,
+        None,
+        &BTreeMap::new(),
+        Some(&b"out".to_vec()),
+        Some(&witness),
+        &mut before_frontier,
+        &index_root_before,
+    );
+}
+
+/// The index root after a write is computed, not proven: a record claiming
+/// any other root is refused, here one that dropped the write from the index.
+#[test]
+#[should_panic(expected = "Coordinate-index root after write does not match the inserted entry")]
+fn a_write_claiming_another_index_root_after_is_refused() {
+    let new_entry = StorageEntry {
+        coordinates: CfsCoordinates(vec![1]),
+        object_commitment: sha(b"out"),
+    };
+    let (mut before_frontier, root_before, _before_index, index_root_before) =
+        build_storage_context(&[]);
+    let (_after_frontier, root_after, _after_index, _index_root_after) =
+        build_storage_context(&[new_entry.clone()]);
+    let step = tile_step_with_store_roots(
+        1,
+        new_entry.coordinates.clone(),
+        Vec::new(),
+        new_entry.object_commitment.clone(),
+        root_before,
+        root_after,
+        index_root_before.clone(),
+        index_root_before.clone(),
+    );
+    let witness = StorageWitness {
+        reads: Vec::new(),
+        write: Some(build_write_witness(&[], &new_entry)),
+    };
     let _ = verify_storage_transition(
         &step,
         None,

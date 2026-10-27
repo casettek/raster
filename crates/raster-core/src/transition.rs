@@ -151,17 +151,40 @@ pub struct StorageIndexValue {
     pub object_commitment: Vec<u8>,
 }
 
+/// `(coordinates, value)` is in the coordinate index: the leaf for
+/// `key(coordinates)` sits at depth `siblings.len()`, and folds up through
+/// `siblings` to the root. See `crate::coordinate_index`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CoordinateIndexMembershipProof {
     pub coordinates: CfsCoordinates,
     pub value: StorageIndexValue,
+    /// From the leaf's level up: `siblings[0]` is the leaf's sibling,
+    /// `siblings.last()` a child of the root.
     pub siblings: Vec<NodeHash>,
 }
 
+/// `coordinates` is not in the coordinate index: `terminal` is what sits at
+/// depth `siblings.len()` on `key(coordinates)`'s path, and it holds no other
+/// key there.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CoordinateIndexNonMembershipProof {
     pub coordinates: CfsCoordinates,
+    pub terminal: IndexTerminal,
+    /// From the terminal's level up, as in a membership proof.
     pub siblings: Vec<NodeHash>,
+}
+
+/// The subtree a non-membership proof stops at.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum IndexTerminal {
+    /// No key has this prefix.
+    Empty,
+    /// Exactly one key has this prefix, and it is not the one being proven
+    /// absent.
+    Leaf {
+        key: [u8; 32],
+        value: StorageIndexValue,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -177,11 +200,13 @@ pub struct StorageReadWitness {
     pub index_witness: CoordinateIndexMembershipProof,
 }
 
+/// A write's proof: the entry, and that its coordinates were absent from the
+/// index before. The index root after the write is not proven by a second
+/// proof: the guest computes it from this one (`verify_coordinate_index_insert`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StorageWriteWitness {
     pub entry: StorageEntry,
     pub index_non_membership_witness: CoordinateIndexNonMembershipProof,
-    pub index_membership_witness: CoordinateIndexMembershipProof,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
