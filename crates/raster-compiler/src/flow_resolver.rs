@@ -191,10 +191,15 @@ impl FlowResolver {
     /// program output has nowhere to carry them.
     pub fn resolve_return(&self, ret: &ReturnExpr, item_count: usize) -> Option<SequenceReturn> {
         let (source, path) = match ret {
-            ReturnExpr::TailCall => (
-                InputBinding::prior_item_output(item_count.checked_sub(1)?),
-                Vec::new(),
-            ),
+            ReturnExpr::TailCall => {
+                let source = InputBinding::prior_item_output(item_count.checked_sub(1)?);
+                // `Ok(call!(tile, …)?)` returns the unwrapped `T`, which the
+                // runtime binds through `Ok` exactly as it does a named
+                // `call!(tile, …)?` binding.
+                let mut path = Vec::new();
+                self.prefix_ok_variant(&source, &mut path);
+                (source, path)
+            }
             ReturnExpr::Rooted { root, path } => {
                 // The source carries no path of its own: the whole selector is
                 // `SequenceReturn::path`, which `resolve_value` prepends to.
@@ -950,6 +955,46 @@ mod tests {
             Some(SequenceReturn {
                 source: InputBinding::prior_item_output(0),
                 path: vec![ok_variant()],
+            })
+        );
+    }
+
+    /// The same unwrapped value returned as a tail call, `Ok(call!(tile, …)?)`:
+    /// the return reads through `Ok` too, so `ProgramEnd` (and a caller
+    /// consuming a nested sequence's result) agrees with the runtime's path.
+    #[test]
+    fn returning_a_try_unwrapped_tail_call_reads_through_ok() {
+        let (_, returns) = resolve_parsed_main(
+            r#"
+            fn main(x: In) -> Result<P> {
+                Ok(call!(validate, x)?)
+            }
+            "#,
+        );
+        assert_eq!(
+            returns,
+            Some(SequenceReturn {
+                source: InputBinding::prior_item_output(0),
+                path: vec![ok_variant()],
+            })
+        );
+    }
+
+    /// A tail call that is not unwrapped returns the stored value itself.
+    #[test]
+    fn a_tail_call_without_try_has_no_variant_prefix() {
+        let (_, returns) = resolve_parsed_main(
+            r#"
+            fn main(x: In) -> P {
+                call!(validate, x)
+            }
+            "#,
+        );
+        assert_eq!(
+            returns,
+            Some(SequenceReturn {
+                source: InputBinding::prior_item_output(0),
+                path: vec![],
             })
         );
     }
