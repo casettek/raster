@@ -140,6 +140,13 @@ pub struct CallInfo {
     /// an `output`. Recorded in the CFS so a stored seed is found by position
     /// at `RecurStart` (`incremental-draft-materialization` D5b).
     pub carries_state: bool,
+    /// Whether the call's result is unwrapped with `?` (`call!(tile, …)?`).
+    ///
+    /// On a tile call this picks the fallible binding: the stored object is
+    /// the tile's whole `Result<T>`, and the `T` the caller receives is read
+    /// through the `Ok` variant (`raster::__private::bind_fallible_call`), so
+    /// every path into it starts with `Variant("Ok")`.
+    pub try_unwrapped: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -455,6 +462,9 @@ pub struct CallVisitor {
     call_infos: Vec<CallInfo>,
     /// Tracks the current let binding name when visiting let statements
     current_binding: Option<String>,
+    /// Set by `visit_expr_try` while its operand is a macro, and taken by the
+    /// call it records: `call!(tile, …)?` (see [`CallInfo::try_unwrapped`]).
+    try_operand: bool,
     /// `let name = select!(T, root.field)` — maps `name` to `root`.
     ///
     /// A selection's result carries its source's provenance, so a local
@@ -500,6 +510,7 @@ impl CallVisitor {
         Self {
             call_infos: Vec::new(),
             current_binding: None,
+            try_operand: false,
             selection_aliases: Vec::new(),
             selection_index_sources: Vec::new(),
             selection_paths: Vec::new(),
@@ -1690,6 +1701,15 @@ impl<'ast> Visit<'ast> for CallVisitor {
         self.block_depth -= 1;
     }
 
+    fn visit_expr_try(&mut self, node: &'ast syn::ExprTry) {
+        // Only a macro directly under `?` is unwrapped by it; anything deeper
+        // (`foo(call!(…))?`) is not, so the flag is set for the operand alone
+        // and cleared again whether or not a call consumed it.
+        let outer = core::mem::replace(&mut self.try_operand, matches!(*node.expr, Expr::Macro(_)));
+        self.visit_expr(&node.expr);
+        self.try_operand = outer;
+    }
+
     fn visit_expr_macro(&mut self, node: &'ast ExprMacro) {
         if let Some(call_kind) = Self::macro_call_kind(&node.mac) {
             if let Some((
@@ -1703,6 +1723,7 @@ impl<'ast> Visit<'ast> for CallVisitor {
                 self.parse_call_macro_args(&node.mac)
             {
                 let result_binding = self.current_binding.take();
+                let try_unwrapped = core::mem::take(&mut self.try_operand);
                 self.call_infos.push(CallInfo {
                     callee,
                     arguments,
@@ -1715,6 +1736,7 @@ impl<'ast> Visit<'ast> for CallVisitor {
                     state_is_output: carries_state && output.is_none(),
                     output,
                     carries_state,
+                    try_unwrapped,
                 });
                 // Do not recurse into the macro body — arguments are already captured above.
                 return;
@@ -1754,6 +1776,8 @@ impl<'ast> Visit<'ast> for CallVisitor {
                     state_is_output: carries_state && output.is_none(),
                     output,
                     carries_state,
+                    // A bare statement macro has no `?` around it.
+                    try_unwrapped: false,
                 });
                 return;
             }

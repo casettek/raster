@@ -43,11 +43,14 @@ It is written to match the current codebase. Where the intended behavior is not 
     - `StorageEntry { coordinates, object_commitment }`
     - `StorageWitness { reads, write }`
     - `StorageLogWitness`
-    - coordinate-index membership / non-membership proofs
+    - coordinate-index membership / non-membership proofs (a write carries only the
+      non-membership proof; the verifier computes the index root after the write from it)
   - `crates/raster-runtime/src/storage.rs`
     - raw bytes are keyed by execution coordinates
     - the committed storage log root comes from an append-only incremental Merkle frontier
-    - a separate authenticated coordinate index maps `coordinates -> { log_position, object_commitment }`
+    - a separate authenticated coordinate index maps `coordinates -> { log_position, object_commitment }`:
+      a compact sparse Merkle tree (`crates/raster-core/src/coordinate_index.rs`), whose leaves sit at
+      the shallowest depth where their key is alone, so proofs are about log₂(objects) levels deep
 - **Runtime/verification implementation status**
   - There is no schema-driven runtime/executor in this workspace that consumes `SequenceSchema` or enforces CFS determinism at runtime.
   - No verifier-side API exists today that consumes a CFS + committed step outputs and enforces “next step” determinism.

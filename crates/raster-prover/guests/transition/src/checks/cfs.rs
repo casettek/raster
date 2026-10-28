@@ -160,7 +160,21 @@ fn assert_scope_source(
     path: &[SelectorSegment],
     indexed: bool,
 ) {
-    if path.is_empty() && !indexed {
+    // A stored parameter passed whole is the narrowing case with an empty
+    // path, and is checked the same way: the same stored object, read through
+    // exactly the caller's path. Comparing the whole recorded records instead
+    // also compared *which view* of that node each side read, and the views
+    // legitimately differ: a caller forwards a list as `Raw`, while a recur
+    // site inside the sequence reads the same list as `0x0A` metadata
+    // (`List`) — same coordinates, commitment, root and path, different
+    // payload. Each view is proven against the store by the step that
+    // recorded it, so identity is what this check has to establish.
+    // Inline bytes have no selector to compare, so they still must be equal.
+    let both_stored = matches!(
+        (&consumer, &scope),
+        (ResolvedSource::Storage(_), ResolvedSource::Storage(_))
+    );
+    if path.is_empty() && !indexed && !both_stored {
         return assert_same_source(consumer, scope);
     }
     let (ResolvedSource::Storage(consumer), ResolvedSource::Storage(scope)) = (consumer, scope)
@@ -174,7 +188,7 @@ fn assert_scope_source(
     assert_eq!(
         (&consumer.coordinates, &consumer.commitment, &consumer.selection.source_root_hash),
         (&scope.coordinates, &scope.commitment, &scope.selection.source_root_hash),
-        "Narrowed sequence scope input reads a different object than the caller passed",
+        "Sequence scope input reads a different object than the caller passed",
     );
     let scope_path = scope.selection.path.segments.as_slice();
     let consumer_path = consumer.selection.path.segments.as_slice();
@@ -191,8 +205,8 @@ fn assert_scope_source(
         assert_eq!(
             consumer_path,
             expected.as_slice(),
-            "Narrowed sequence scope input selects a different part of the caller's value \
-             than the CFS declares",
+            "Sequence scope input selects a different part of the caller's value than the CFS \
+             declares",
         );
     }
 }

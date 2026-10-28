@@ -27,7 +27,9 @@ use serde::{Deserialize, Serialize, Serializer};
 use crate::hash::{Digest, Sha256};
 
 use crate::collections::BYTES_PAGE_NEWTYPE_NAME;
-use crate::input::{bytes_page_root, encode_bytes_page_payload, struct_commitments_root, Hash32};
+use crate::input::{
+    bytes_page_root, encode_bytes_page_payload, enum_newtype_root, struct_commitments_root, Hash32,
+};
 use crate::{Error, Result as CoreResult};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -665,10 +667,7 @@ pub fn assemble_subtree(
             payload.extend_from_slice(variant.as_bytes());
             push_u64(&mut payload, child_payload.len() as u64);
             payload.extend_from_slice(child_payload);
-            (
-                payload,
-                selection_hash(&[b"enum-newtype", variant.as_bytes(), child_root.as_slice()]),
-            )
+            (payload, enum_newtype_root(variant, child_root))
         }
         TreeValue::EnumTuple(variant, _) => {
             let mut payload = Vec::new();
