@@ -80,3 +80,8 @@ rayon = "1.8"
 opt-level = 3
 lto = true
 codegen-units = 1
+
+[patch.crates-io]
+risc0-zkvm-platform = { path = "vendor/risc0-zkvm-platform" }
+risc0-circuit-keccak = { path = "vendor/risc0-circuit-keccak" }
+risc0-zkvm = { path = "vendor/risc0-zkvm" }

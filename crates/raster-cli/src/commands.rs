@@ -1,4 +1,5 @@
 //! Command implementations for the Raster CLI.
+pub mod audit;
 pub mod fraud;
 pub mod prove;
 pub mod run;

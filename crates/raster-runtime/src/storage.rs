@@ -1,16 +1,16 @@
 use raster_core::cfs::{CfsCoordinate, CfsCoordinates, FIRST_COORDINATE};
-use raster_core::coordinate_index::IncrementalCoordinateIndex;
 use raster_core::draft::{
     draft_value_from_serialize, schema_hash as compute_schema_hash, DraftReplayTransition,
     DraftStateWitness, DraftTransitionWitness, DraftValue,
 };
 use raster_core::input::{
-    AuthenticatedListMetadata, ExternalEncoding, Schema, SelectionPayloadKind, SelectionWitness, SelectorPath, StorageRef, StorageValue,
+    AuthenticatedListMetadata, ExternalEncoding, Schema, SelectionPayloadKind, SelectionWitness,
+    SelectorPath, StorageRef, StorageValue,
 };
+use raster_core::merkle::EMPTY_LEAF;
 use raster_core::trace::RasterPayload;
 use raster_core::transition::{SerializableFrontier, StorageEntry, StorageIndexValue};
 use raster_core::{Error, Result};
-use raster_core::merkle::EMPTY_LEAF;
 use raster_prover::trace::{
     frontier_root, serializable_frontier_from_trace_frontier, Bytes, TraceTree, TraceTreeFrontier,
 };
@@ -26,15 +26,15 @@ use crate::backing::{
     resolve_whole_view, ObjectBacking, ObjectBytes, OwnedObject, RasterObject, RasterView,
     ReferencedObject, ReferencedSource, ReferencedSourceKind,
 };
+use crate::draft_buffer::{derived_object, overlay_nodes, DerivationBase, DraftBuffer};
 use crate::input::{
     encode_raster_value, list_metadata_payload, list_metadata_witness,
     selected_payload_from_raster_location, selection_witness_from_raster_selection,
     tree_value_from_raster_location, typed_value_from_tree,
 };
-use crate::draft_buffer::{derived_object, overlay_nodes, DerivationBase, DraftBuffer};
-use raster_core::trace::DerivedPayload;
 use crate::source::SourceResolver;
 use crate::Sha256Commitment;
+use raster_core::trace::DerivedPayload;
 
 type Anchor = [u8; 32];
 
@@ -60,7 +60,7 @@ pub struct StorageSnapshot {
     pub index_root: Vec<u8>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct StorageWriteRecord {
     pub entry: StorageEntry,
     pub log_position: u64,
@@ -93,9 +93,16 @@ pub(crate) struct AuthorizedSourceLoad {
 /// no coordinate index, no roots. [`AuthenticatedObjectStore`] wraps it with
 /// those, for the one role that reads them.
 /// See `docs/proposals/storage-role-split.md`.
-#[derive(Clone)]
 pub struct ObjectStore {
-    objects: BTreeMap<CfsCoordinates, StoredObject>,
+    objects: Option<
+        raster_prover::archive::DiskMap<
+            CfsCoordinates,
+            (StorageRef, crate::backing::PersistedBacking),
+        >,
+    >,
+    memory: BTreeMap<CfsCoordinates, Arc<StoredObject>>,
+    referenced: BTreeMap<CfsCoordinates, StoredObject>,
+    archive: Option<raster_prover::archive::Archive>,
     /// Set once (via `start_program`) for programs that declare `main` entry
     /// arguments; `None` otherwise, and never consulted unless a `Referenced`
     /// object actually needs resolving.
@@ -118,7 +125,6 @@ impl std::fmt::Debug for ObjectStore {
 /// The trace recorder holds one of these, because it is the only role that
 /// reads those roots — it commits them per step and builds the membership and
 /// selection witnesses the guest checks against them.
-#[derive(Clone)]
 pub struct AuthenticatedObjectStore {
     objects: ObjectStore,
     frontier: TraceTreeFrontier,
@@ -133,7 +139,7 @@ pub struct AuthenticatedObjectStore {
     /// is ever needed.
     /// See `docs/proposals/storage-write-cost.md`.
     cached_root: Vec<u8>,
-    coordinate_index: IncrementalCoordinateIndex,
+    coordinate_index: raster_core::coordinate_index::IncrementalCoordinateIndex,
 }
 
 impl std::fmt::Debug for AuthenticatedObjectStore {
@@ -250,8 +256,15 @@ fn take_draft_state(
 
 impl ObjectStore {
     pub fn new() -> Self {
+        Self::with_storage(crate::working_storage::current())
+    }
+    pub fn with_storage(policy: crate::WorkingStorage) -> Self {
+        let disk = policy == crate::WorkingStorage::Disk;
         Self {
-            objects: BTreeMap::new(),
+            objects: disk.then(raster_prover::archive::DiskMap::new),
+            memory: BTreeMap::new(),
+            referenced: BTreeMap::new(),
+            archive: disk.then(raster_prover::archive::Archive::current),
             source_resolver: None,
         }
     }
@@ -284,13 +297,35 @@ impl ObjectStore {
         // outstanding references still point at, surfacing later as a
         // commitment mismatch in `verify_reference` with nothing to say why.
         assert!(
-            !self.objects.contains_key(&coordinates),
+            !self
+                .objects
+                .as_ref()
+                .is_some_and(|s| s.contains_key(&coordinates))
+                && !self.memory.contains_key(&coordinates)
+                && !self.referenced.contains_key(&coordinates),
             "Duplicate storage write at coordinates {:?}",
             coordinates
         );
         let reference = StorageRef::new(coordinates.clone(), object_commitment.clone());
-        self.objects
-            .insert(coordinates.clone(), StoredObject { reference, backing });
+        if self.archive.is_none() {
+            self.memory.insert(
+                coordinates.clone(),
+                Arc::new(StoredObject { reference, backing }),
+            );
+        } else if matches!(&backing, ObjectBacking::Referenced(_)) {
+            self.referenced
+                .insert(coordinates.clone(), StoredObject { reference, backing });
+        } else {
+            let persisted = crate::backing::PersistedBacking::store(
+                &backing,
+                self.archive.as_ref().expect("disk storage"),
+            )
+            .expect("persist Raster object (check free disk space)");
+            self.objects
+                .as_mut()
+                .expect("disk storage")
+                .insert(coordinates.clone(), (reference, persisted));
+        }
         StorageEntry {
             coordinates,
             object_commitment,
@@ -316,7 +351,7 @@ impl ObjectStore {
     /// is not a base (the guest requires the same, `opening_draft`).
     pub(crate) fn derivation_base(&self, reference: &StorageRef) -> Result<DerivationBase> {
         let stored = self.verify_reference(reference)?;
-        let view = Self::raster_view(stored, &reference.coordinates)?;
+        let view = Self::raster_view(&stored, &reference.coordinates)?;
         Ok(DerivationBase {
             coordinates: reference.coordinates.clone(),
             commitment: reference.commitment.clone(),
@@ -349,7 +384,9 @@ impl ObjectStore {
                 let (backing, commitment) = self.derived_backing(delta)?;
                 Ok(self.put(coordinates, commitment, backing))
             }
-            None => Ok(self.append_serialized_bytes(&output.data, coordinates, output.raster.clone())),
+            None => {
+                Ok(self.append_serialized_bytes(&output.data, coordinates, output.raster.clone()))
+            }
         }
     }
 
@@ -379,7 +416,7 @@ impl ObjectStore {
                 ))
             }
             ObjectBacking::Derived(_) => {
-                let view = Self::raster_view(stored, &reference.coordinates)?;
+                let view = Self::raster_view(&stored, &reference.coordinates)?;
                 let (bytes, selection, value) = resolve_whole_view::<T>(&view)?;
                 Ok(StorageValue::new_with_selection(
                     reference.clone(),
@@ -434,8 +471,24 @@ impl ObjectStore {
         }
     }
 
-    fn verify_reference(&self, reference: &StorageRef) -> Result<&StoredObject> {
-        let stored = self.objects.get(&reference.coordinates).ok_or_else(|| {
+    fn verify_reference(&self, reference: &StorageRef) -> Result<Arc<StoredObject>> {
+        let stored = if let Some(stored) = self.memory.get(&reference.coordinates) {
+            Some(Arc::clone(stored))
+        } else if let Some(stored) = self.referenced.get(&reference.coordinates) {
+            Some(Arc::new(stored.clone()))
+        } else if let Some((reference, backing)) = self
+            .objects
+            .as_ref()
+            .and_then(|s| s.get(&reference.coordinates))
+        {
+            Some(Arc::new(StoredObject {
+                reference,
+                backing: backing.load(self.archive.as_ref().expect("disk storage"))?,
+            }))
+        } else {
+            None
+        };
+        let stored = stored.ok_or_else(|| {
             Error::Other(format!(
                 "Missing storage object at coordinates {:?}",
                 reference.coordinates
@@ -485,7 +538,7 @@ impl ObjectStore {
         let stored = self.verify_reference(reference)?;
         match &stored.backing {
             ObjectBacking::Owned(_) | ObjectBacking::Derived(_) => {
-                let view = Self::raster_view(stored, &reference.coordinates)?;
+                let view = Self::raster_view(&stored, &reference.coordinates)?;
                 let index = view.index;
                 let selection = index.select(selector)?;
                 match payload_kind {
@@ -494,7 +547,12 @@ impl ObjectStore {
                     }
                     SelectionPayloadKind::List => {
                         let (len, elements_root) = index.list_metadata(selector)?;
-                        Ok(list_metadata_witness(selector, selection, len, elements_root))
+                        Ok(list_metadata_witness(
+                            selector,
+                            selection,
+                            len,
+                            elements_root,
+                        ))
                     }
                 }
             }
@@ -523,7 +581,7 @@ impl ObjectStore {
         let stored = self.verify_reference(reference)?;
         match &stored.backing {
             ObjectBacking::Owned(_) | ObjectBacking::Derived(_) => {
-                let index = Self::raster_view(stored, &reference.coordinates)?.index;
+                let index = Self::raster_view(&stored, &reference.coordinates)?.index;
                 let (len, elements_root) = index.list_metadata(selector)?;
                 // Every selection into an owned object anchors to the object's
                 // own root, which is what `locate` returns as `root_hash`.
@@ -553,7 +611,7 @@ impl ObjectStore {
         let stored = self.verify_reference(reference)?;
         match &stored.backing {
             ObjectBacking::Owned(_) | ObjectBacking::Derived(_) => {
-                let view = Self::raster_view(stored, &reference.coordinates)?;
+                let view = Self::raster_view(&stored, &reference.coordinates)?;
                 let index = view.index;
                 let selection = index.locate(selector)?;
                 let tree = tree_value_from_raster_location(&index, &view.bytes, &selection)?;
@@ -596,6 +654,9 @@ impl ObjectStore {
 
 impl AuthenticatedObjectStore {
     pub fn new() -> Self {
+        Self::with_storage(crate::working_storage::current())
+    }
+    pub fn with_storage(policy: crate::WorkingStorage) -> Self {
         let mut tree = TraceTree::new(1);
         tree.append(Bytes(EMPTY_LEAF.to_vec()));
         let frontier = tree
@@ -604,10 +665,11 @@ impl AuthenticatedObjectStore {
             .expect("storage frontier should exist after seed append");
         let cached_root = frontier_root(&frontier);
         Self {
-            objects: ObjectStore::new(),
+            objects: ObjectStore::with_storage(policy),
             frontier,
             cached_root,
-            coordinate_index: IncrementalCoordinateIndex::new(),
+            // Use main's compact in-memory index for both object-store policies.
+            coordinate_index: raster_core::coordinate_index::IncrementalCoordinateIndex::new(),
         }
     }
 
@@ -656,6 +718,10 @@ impl AuthenticatedObjectStore {
 
         let frontier_start = timing.then(std::time::Instant::now);
         let leaf_hash: Vec<u8> = Sha256Commitment::from(entry.to_bytes().as_slice()).into();
+        assert!(
+            u64::from(self.frontier.position()) < u32::MAX as u64,
+            "storage tree capacity exceeded"
+        );
         self.frontier.append(Bytes(leaf_hash));
         let frontier_ns = elapsed_ns(frontier_start);
 
@@ -735,7 +801,9 @@ impl AuthenticatedObjectStore {
                 let (backing, commitment) = self.objects.derived_backing(delta)?;
                 Ok(self.append(backing, commitment, coordinates))
             }
-            None => Ok(self.append_serialized_bytes(&output.data, coordinates, output.raster.clone())),
+            None => {
+                Ok(self.append_serialized_bytes(&output.data, coordinates, output.raster.clone()))
+            }
         }
     }
 
@@ -1511,9 +1579,8 @@ where
     };
     let state = take_draft_state(anchor, expected_root, operation)?;
     let tree = state.materialize(require_complete)?;
-    typed_value_from_tree::<S>(&tree).map_err(|error| {
-        partial_object_error::<S>(&state, require_complete, error)
-    })
+    typed_value_from_tree::<S>(&tree)
+        .map_err(|error| partial_object_error::<S>(&state, require_complete, error))
 }
 
 /// Why a draft could not become an `S`: for an empty sweep, the set-once
@@ -1590,7 +1657,11 @@ where
     let profiling_enabled = crate::profiling::profiling_enabled();
 
     let materialize_start = profiling_enabled.then(std::time::Instant::now);
-    let operation = if require_complete { "finalize" } else { "empty finalize" };
+    let operation = if require_complete {
+        "finalize"
+    } else {
+        "empty finalize"
+    };
     let state = take_draft_state(anchor, expected_root, operation)?;
     // An empty sweep may leave set-once fields unwritten; the object must
     // still be an `S`. Checked on the object with its lists emptied — the
@@ -1689,11 +1760,14 @@ pub fn stored_object_output(
         let storage = storage.borrow();
         let stored = storage.verify_reference(reference)?;
         if let ObjectBacking::Derived(derived) = &stored.backing {
-            let delta = derived.delta.as_ref().ok_or_else(|| {
-                Error::Other("A derived object holds no delta to publish".into())
-            })?;
-            return Ok(raster_core::trace::FnOutput::new(Vec::new(), ty.to_string())
-                .with_derived((**delta).clone()));
+            let delta = derived
+                .delta
+                .as_ref()
+                .ok_or_else(|| Error::Other("A derived object holds no delta to publish".into()))?;
+            return Ok(
+                raster_core::trace::FnOutput::new(Vec::new(), ty.to_string())
+                    .with_derived((**delta).clone()),
+            );
         }
         let ObjectBacking::Owned(owned) = &stored.backing else {
             return Err(Error::Other(format!(
@@ -1702,8 +1776,10 @@ pub fn stored_object_output(
             )));
         };
         let raster = ObjectStore::require_raster(owned, &reference.coordinates)?;
-        Ok(raster_core::trace::FnOutput::new(Vec::new(), ty.to_string())
-            .with_raster(raster.payload.clone()))
+        Ok(
+            raster_core::trace::FnOutput::new(Vec::new(), ty.to_string())
+                .with_raster(raster.payload.clone()),
+        )
     })
 }
 
@@ -1730,7 +1806,11 @@ pub fn stored_list_metadata(
     reference: &StorageRef,
     selector: &SelectorPath,
 ) -> Result<AuthenticatedListMetadata> {
-    THREAD_STORAGE.with(|storage| storage.borrow().list_metadata_selection(reference, selector))
+    THREAD_STORAGE.with(|storage| {
+        storage
+            .borrow()
+            .list_metadata_selection(reference, selector)
+    })
 }
 
 pub fn resolve_storage_ok_value<T: DeserializeOwned>(
@@ -1796,6 +1876,112 @@ mod tests {
                     },
                 )],
             }
+        }
+    }
+
+    #[test]
+    fn successful_result_field_selection_keeps_the_original_root() {
+        use raster_core::input::{
+            verify_selection_proof, verify_selection_reference, SelectionProofStep, SelectorSegment,
+        };
+        for policy in [crate::WorkingStorage::Memory, crate::WorkingStorage::Disk] {
+            let value: std::result::Result<RequiredFieldDraft, String> =
+                Ok(RequiredFieldDraft { value: 42 });
+            let (bytes, index_bytes, root) = crate::encode_raster_value(&value).unwrap();
+            let root_hash: [u8; 32] = (0..32)
+                .map(|i| u8::from_str_radix(&root[i * 2..i * 2 + 2], 16).unwrap())
+                .collect::<Vec<_>>()
+                .try_into()
+                .unwrap();
+            let mut store = ObjectStore::with_storage(policy);
+            let entry = store.append_serialized_bytes(
+                &raster_core::postcard::to_allocvec(&value).unwrap(),
+                CfsCoordinates(vec![1]),
+                Some(raster_core::trace::RasterPayload {
+                    bytes,
+                    index_bytes,
+                    root_hash,
+                }),
+            );
+            let reference = StorageRef::new(entry.coordinates, entry.object_commitment);
+            let selector = SelectorPath::new(vec![
+                SelectorSegment::Variant("Ok".into()),
+                SelectorSegment::Field("value".into()),
+            ]);
+            let witness = store
+                .selection_witness(&reference, &selector, SelectionPayloadKind::Raw)
+                .unwrap();
+            assert_eq!(witness.proof.root_hash, root_hash);
+            let mut wrong_value = witness.clone();
+            *wrong_value.bytes.last_mut().unwrap() ^= 1;
+            assert!(!verify_selection_proof(
+                &wrong_value.bytes,
+                &wrong_value.proof
+            ));
+            let tagged_error: std::result::Result<(), RequiredFieldDraft> =
+                Err(RequiredFieldDraft { value: 42 });
+            let (_, _, error_root) = crate::encode_raster_value(&tagged_error).unwrap();
+            let mut wrong_tag = witness.clone();
+            wrong_tag.proof.root_hash = (0..32)
+                .map(|i| u8::from_str_radix(&error_root[i * 2..i * 2 + 2], 16).unwrap())
+                .collect::<Vec<_>>()
+                .try_into()
+                .unwrap();
+            assert!(!verify_selection_proof(&wrong_tag.bytes, &wrong_tag.proof));
+            assert!(matches!(
+                &witness.proof.steps[0],
+                SelectionProofStep::EnumNewtype { variant } if variant == "Ok"
+            ));
+            assert!(verify_selection_proof(&witness.bytes, &witness.proof));
+            let selected_root = raster_core::input::selected_subtree_root(&witness.bytes).unwrap();
+            assert!(verify_selection_reference(&selected_root, &witness.proof));
+            let mut repeated = witness.clone();
+            repeated.proof.steps.insert(
+                0,
+                SelectionProofStep::EnumNewtype { variant: "Ok".into() },
+            );
+            assert!(!verify_selection_proof(&repeated.bytes, &repeated.proof));
+            let mut tampered = witness.clone();
+            tampered.proof.steps.remove(0);
+            assert!(!verify_selection_proof(&tampered.bytes, &tampered.proof));
+            let mut tampered = witness.clone();
+            tampered.proof.path = SelectorPath::new(vec![SelectorSegment::Field("other".into())]);
+            assert!(!verify_selection_proof(&tampered.bytes, &tampered.proof));
+            let mut tampered = witness.clone();
+            tampered.proof.path = SelectorPath::default();
+            assert!(!verify_selection_proof(&tampered.bytes, &tampered.proof));
+            let whole = store
+                .selection_witness(
+                    &reference,
+                    &SelectorPath::default(),
+                    SelectionPayloadKind::Raw,
+                )
+                .unwrap();
+            assert!(whole.proof.steps.is_empty());
+            assert!(verify_selection_proof(&whole.bytes, &whole.proof));
+            let error: std::result::Result<RequiredFieldDraft, String> = Err("bad params".into());
+            let (bytes, index_bytes, root) = crate::encode_raster_value(&error).unwrap();
+            let root_hash = (0..32)
+                .map(|i| u8::from_str_radix(&root[i * 2..i * 2 + 2], 16).unwrap())
+                .collect::<Vec<_>>()
+                .try_into()
+                .unwrap();
+            let entry = store.append_serialized_bytes(
+                &raster_core::postcard::to_allocvec(&error).unwrap(),
+                CfsCoordinates(vec![2]),
+                Some(raster_core::trace::RasterPayload {
+                    bytes,
+                    index_bytes,
+                    root_hash,
+                }),
+            );
+            assert!(store
+                .selection_witness(
+                    &StorageRef::new(entry.coordinates, entry.object_commitment),
+                    &selector,
+                    SelectionPayloadKind::Raw
+                )
+                .is_err());
         }
     }
 
@@ -1968,8 +2154,7 @@ mod tests {
         for n in [1usize, 16, 64, 256, 1024, 4096, 16384, 65536] {
             let _scope = SequenceScopeGuard::enter("bench");
             enter_recur_site_scope().expect("site scope");
-            let (anchor, mut root) =
-                create_site_draft::<BigDraft>().expect("draft is created");
+            let (anchor, mut root) = create_site_draft::<BigDraft>().expect("draft is created");
 
             let lines: Vec<String> = (0..n).map(|index| format!("line-{index:08}")).collect();
             let push_start = std::time::Instant::now();
@@ -2060,7 +2245,9 @@ mod tests {
 
             // The rebuild it replaces: open from the decoded value.
             enter_recur_site_scope().expect("site scope");
-            let value: BigDraft = resolve_storage_value::<BigDraft>(&base).expect("base").into_inner();
+            let value: BigDraft = resolve_storage_value::<BigDraft>(&base)
+                .expect("base")
+                .into_inner();
             let rebuild_start = std::time::Instant::now();
             let _ = derive_site_draft::<BigDraft>(&value).expect("rebuild");
             let rebuild_ns = rebuild_start.elapsed().as_nanos() as u64;

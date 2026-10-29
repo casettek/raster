@@ -19,6 +19,7 @@ name = "cargo-raster"
 path = "src/main.rs"
 
 [dependencies]
+tempfile = "3"
 raster-core = { workspace = true, features = ["std"] }
 raster-backend.workspace = true
 raster-backend-native.workspace = true

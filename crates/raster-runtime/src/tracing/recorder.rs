@@ -2,20 +2,22 @@ use raster_core::cfs::{
     CfsCoordinate, CfsCoordinates, CfsCursor, ControlFlowSchema, SequenceChildId,
     SequenceChildItem, FIRST_COORDINATE,
 };
-use raster_core::recur_progress::{DraftStep, RecurProgressStack, RecurSiteKind, SiteDraft};
 use raster_core::draft::DraftTransitionWitness;
 use raster_core::input::{SelectionPayloadKind, SelectionWitness, SelectorPath, StorageRef};
+use raster_core::recur_progress::{DraftStep, RecurProgressStack, RecurSiteKind, SiteDraft};
 use raster_core::trace::{
     ExecStep, ExecTarget, FnInput, ProgramEndStep, ProgramStartStep, RecurEndStep, RecurStartStep,
-    StepKind, StepRecord,
-    StorageData, StorageInput, StorageRoots, TraceEvent,
+    StepKind, StepRecord, StorageData, StorageInput, StorageRoots, TraceEvent,
 };
 use sha2::{Digest, Sha256};
 
+use raster_prover::archive::DiskMap;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 
 use crate::storage::{
-    AuthorizedSource, AuthorizedSourceLoad, AuthenticatedObjectStore, StorageSnapshot, StorageWriteRecord,
+    AuthenticatedObjectStore, AuthorizedSource, AuthorizedSourceLoad, StorageSnapshot,
+    StorageWriteRecord,
 };
 use crate::tracing::commitment::Sha256Commitment;
 
@@ -99,7 +101,7 @@ impl SequenceCallstack {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StepWitnessData {
     input_data: Option<Vec<u8>>,
     input_source_witness: Option<FnInput>,
@@ -135,12 +137,22 @@ impl StepWitnessData {
     }
 }
 
-#[derive(Debug, Default, Clone)]
-pub struct StepWitnessStore(HashMap<CfsCoordinates, StepWitnessData>);
+#[derive(Debug)]
+pub struct StepWitnessStore(
+    Option<DiskMap<CfsCoordinates, raster_prover::archive::Blob>>,
+    bool,
+    Option<HashMap<CfsCoordinates, StepWitnessData>>,
+);
+
+impl Default for StepWitnessStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl StepWitnessStore {
     fn new() -> Self {
-        StepWitnessStore(HashMap::new())
+        StepWitnessStore(Some(DiskMap::new()), true, None)
     }
 
     pub fn insert(
@@ -149,12 +161,15 @@ impl StepWitnessStore {
         event: TraceEvent,
         storage_write: Option<StorageWriteRecord>,
     ) {
+        if !self.1 {
+            return;
+        }
         match event {
             TraceEvent::SequenceStart(trace_item)
             | TraceEvent::RecurSequenceIterationStart(trace_item)
             | TraceEvent::RecurTileStart(trace_item)
             | TraceEvent::RecurSequenceStart(trace_item) => {
-                self.0.insert(
+                self.put(
                     coordinates,
                     StepWitnessData {
                         input_data: trace_item.input.as_ref().map(|input| input.data().to_vec()),
@@ -180,7 +195,7 @@ impl StepWitnessStore {
             | TraceEvent::SequenceEnd(trace_item)
             | TraceEvent::RecurTileEnd(trace_item)
             | TraceEvent::RecurSequenceEnd(trace_item) => {
-                self.0.insert(
+                self.put(
                     coordinates,
                     StepWitnessData {
                         input_data: None,
@@ -193,7 +208,7 @@ impl StepWitnessStore {
                 );
             }
             TraceEvent::TileExec(trace_item) => {
-                self.0.insert(
+                self.put(
                     coordinates,
                     StepWitnessData {
                         input_data: trace_item.input.as_ref().map(|input| input.data().to_vec()),
@@ -213,7 +228,7 @@ impl StepWitnessStore {
                 );
             }
             TraceEvent::RecurTileIterationExec(trace_item) => {
-                self.0.insert(
+                self.put(
                     coordinates,
                     StepWitnessData {
                         input_data: trace_item.input.as_ref().map(|input| input.data().to_vec()),
@@ -237,7 +252,7 @@ impl StepWitnessStore {
                 // consumes no CFS inputs and makes no input commitment of its
                 // own (`StepRecord::input_source_commitment` is `None` for
                 // `ProgramStart`), so it carries no input source witness.
-                self.0.insert(
+                self.put(
                     coordinates,
                     StepWitnessData {
                         input_data: None,
@@ -259,8 +274,37 @@ impl StepWitnessStore {
         }
     }
 
-    pub fn get(&self, coordinates: &CfsCoordinates) -> Option<&StepWitnessData> {
-        self.0.get(coordinates)
+    pub fn get(&self, coordinates: &CfsCoordinates) -> Option<StepWitnessData> {
+        if let Some(memory) = &self.2 {
+            return memory.get(coordinates).cloned();
+        }
+        self.reference(coordinates).map(Self::read)
+    }
+
+    fn reference(&self, coordinates: &CfsCoordinates) -> Option<raster_prover::archive::Blob> {
+        self.0.as_ref()?.get(coordinates)
+    }
+
+    fn put(&mut self, coordinates: CfsCoordinates, witness: StepWitnessData) {
+        if let Some(memory) = &mut self.2 {
+            memory.insert(coordinates, witness);
+            return;
+        }
+        let bytes = raster_core::bincode::serialize(&witness).expect("encode step witness");
+        let blob = raster_prover::archive::Archive::current()
+            .append(&bytes)
+            .expect("persist step witness");
+        self.0
+            .as_mut()
+            .expect("retained witnesses")
+            .insert(coordinates, blob);
+    }
+
+    fn read(blob: raster_prover::archive::Blob) -> StepWitnessData {
+        let bytes = raster_prover::archive::Archive::current()
+            .read(blob, 0, blob.len)
+            .expect("read step witness");
+        raster_core::bincode::deserialize(&bytes).expect("decode step witness")
     }
 }
 
@@ -268,7 +312,7 @@ fn input_source_commitment(input: &FnInput) -> Vec<u8> {
     Sha256::digest(input.source_witness_bytes()).to_vec()
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct TraceRecorder {
     exec_index: u64,
     sequence_callstack: SequenceCallstack,
@@ -276,6 +320,15 @@ pub struct TraceRecorder {
     active_recur_sequence: HashMap<(CfsCoordinates, String), RecurExecutionState>,
     cfs_cursor: CfsCursor,
     witness_store: StepWitnessStore,
+    execution_witnesses: Option<
+        DiskMap<
+            u64,
+            (
+                raster_prover::archive::Blob,
+                Option<raster_prover::archive::Blob>,
+            ),
+        >,
+    >,
     storage: AuthenticatedObjectStore,
     /// Live recur sites, advanced in step with the guest so both compute the
     /// same `recur_progress_commitment`. Revision 1 of
@@ -301,21 +354,69 @@ pub struct TraceRecorder {
     /// `window-seed-reconstruction.md` §2 — a second implementation of these
     /// rules would fail as a commitment mismatch, indistinguishable from the
     /// bug it exists to fix.
-    recur_progress_store: HashMap<u64, RecurProgressStack>,
+    recur_progress_store: Option<DiskMap<u64, RecurProgressStack>>,
 }
 
 impl TraceRecorder {
     pub fn new(cfs: ControlFlowSchema) -> Self {
+        Self::with_options(cfs, crate::WorkingStorage::Disk, true)
+    }
+    fn with_options(cfs: ControlFlowSchema, policy: crate::WorkingStorage, history: bool) -> Self {
         Self {
             exec_index: 0,
             sequence_callstack: SequenceCallstack::new(),
             active_recur: None,
             active_recur_sequence: HashMap::new(),
             cfs_cursor: CfsCursor::new(cfs),
-            witness_store: StepWitnessStore::new(),
-            storage: AuthenticatedObjectStore::new(),
+            witness_store: if history {
+                StepWitnessStore::new()
+            } else {
+                StepWitnessStore(None, false, None)
+            },
+            execution_witnesses: history.then(DiskMap::new),
+            storage: AuthenticatedObjectStore::with_storage(policy),
             recur_progress: RecurProgressStack::new(),
-            recur_progress_store: HashMap::new(),
+            recur_progress_store: history.then(DiskMap::new),
+        }
+    }
+
+    /// Keep the live state required to derive identical steps, without retaining
+    /// proof witnesses or historical recursion snapshots.
+    pub fn for_commitment(cfs: ControlFlowSchema) -> Self {
+        Self::for_commitment_with_storage(cfs, crate::WorkingStorage::Disk)
+    }
+    pub fn for_commitment_with_storage(
+        cfs: ControlFlowSchema,
+        policy: crate::WorkingStorage,
+    ) -> Self {
+        Self::with_options(cfs, policy, false)
+    }
+
+    /// Retain only current/active-scope witnesses, with no disk history.
+    pub fn for_live_audit(cfs: ControlFlowSchema) -> Self {
+        let mut recorder = Self::with_options(cfs, crate::WorkingStorage::Memory, false);
+        recorder.witness_store = StepWitnessStore(None, true, Some(HashMap::new()));
+        recorder
+    }
+    pub fn live_recur_progress(&self) -> RecurProgressStack {
+        self.recur_progress.clone()
+    }
+    pub fn release_live_step(&mut self, step: &StepRecord) {
+        if let Some(memory) = &mut self.witness_store.2 {
+            match &step.kind {
+                StepKind::ProgramStart(_)
+                | StepKind::SequenceStart { .. }
+                | StepKind::RecurStart(_) => {}
+                _ => {
+                    memory.remove(step.coordinates());
+                }
+            }
+            if matches!(
+                &step.kind,
+                StepKind::SequenceEnd { .. } | StepKind::RecurEnd(_)
+            ) {
+                memory.remove(&step.coordinates().opened());
+            }
         }
     }
 
@@ -328,6 +429,15 @@ impl TraceRecorder {
     /// arguments, so it passes them in rather than the recorder rediscovering
     /// them from `std::env::args`. Required before replaying a trace whose
     /// `main` declares entry arguments.
+    pub(crate) fn set_source_resolver(
+        &mut self,
+        resolver: Option<std::sync::Arc<dyn crate::source::SourceResolver>>,
+    ) {
+        if let Some(resolver) = resolver {
+            self.storage.set_source_resolver(resolver);
+        }
+    }
+
     pub fn set_external_input(
         &mut self,
         raw_input: Option<&str>,
@@ -353,7 +463,32 @@ impl TraceRecorder {
     }
 
     pub fn step_witness_at(&self, coordinates: &CfsCoordinates) -> Option<StepWitnessData> {
-        self.witness_store.get(coordinates).cloned()
+        self.witness_store.get(coordinates)
+    }
+
+    pub fn step_witness_for(&self, step: &StepRecord) -> Option<StepWitnessData> {
+        if self.witness_store.2.is_some() {
+            return self.witness_store.get(step.coordinates());
+        }
+        self.execution_witnesses
+            .as_ref()?
+            .get(&step.exec_index)
+            .map(|(witness, _)| StepWitnessStore::read(witness))
+    }
+
+    pub fn sequence_scope_for(&self, step: &StepRecord) -> Option<FnInput> {
+        if self.witness_store.2.is_some() {
+            return step
+                .coordinates()
+                .try_parent()
+                .and_then(|(parent, _)| self.witness_store.get(&parent))
+                .and_then(|w| w.input_source_witness());
+        }
+        self.execution_witnesses
+            .as_ref()?
+            .get(&step.exec_index)
+            .and_then(|(_, scope)| scope)
+            .and_then(|blob| StepWitnessStore::read(blob).input_source_witness())
     }
 
     /// The recur-progress stack as it stood **after** the step with this
@@ -364,7 +499,7 @@ impl TraceRecorder {
     /// `Some(RecurProgressStack::new())`, which is the positive claim "no loop
     /// in flight" that the guest checks like any other.
     pub fn recur_progress_after(&self, exec_index: u64) -> Option<RecurProgressStack> {
-        self.recur_progress_store.get(&exec_index).cloned()
+        self.recur_progress_store.as_ref()?.get(&exec_index)
     }
 
     pub fn storage_snapshot(&self) -> StorageSnapshot {
@@ -487,7 +622,9 @@ impl TraceRecorder {
                     self.recur_site_state_is_output(&site_coordinates),
                     recur_source_identity(input.as_ref()),
                 );
-                if let Some(draft) = self.recur_site_opening_draft(&site_coordinates, input.as_ref()) {
+                if let Some(draft) =
+                    self.recur_site_opening_draft(&site_coordinates, input.as_ref())
+                {
                     self.recur_progress.open_draft(draft);
                 }
                 if let Some(seed) = self.recur_site_stored_seed(&site_coordinates, input.as_ref()) {
@@ -584,7 +721,10 @@ impl TraceRecorder {
                     .cfs_cursor
                     .closing_coordinates_of(&sequence_coordinates)
                     .unwrap_or_else(|| {
-                        panic!("Sequence at {:?} has no closing coordinate", sequence_coordinates)
+                        panic!(
+                            "Sequence at {:?} has no closing coordinate",
+                            sequence_coordinates
+                        )
                     });
 
                 let record = StepRecord {
@@ -1002,7 +1142,11 @@ impl TraceRecorder {
                 // the two agree. Only `next_iteration_index` and `last_control`
                 // actually move the frame.
                 {
-                    let frame_chunk = self.recur_progress.innermost().map(|f| f.chunk).unwrap_or(1);
+                    let frame_chunk = self
+                        .recur_progress
+                        .innermost()
+                        .map(|f| f.chunk)
+                        .unwrap_or(1);
                     let frame_len = self
                         .recur_progress
                         .innermost()
@@ -1100,10 +1244,12 @@ impl TraceRecorder {
                     self.storage
                         .append_output(output, site_coordinates.clone())
                         .unwrap_or_else(|error| {
-                            panic!("Failed to store recur site object at {:?}: {}", site_coordinates, error)
+                            panic!(
+                                "Failed to store recur site object at {:?}: {}",
+                                site_coordinates, error
+                            )
                         })
                 });
-
 
                 // Close the site: this is where the terminal rules run —
                 // rule 5/7 for a tile site, S4 for a sequence site.
@@ -1111,10 +1257,14 @@ impl TraceRecorder {
                     .as_ref()
                     .map(|write| write.entry.object_commitment.clone())
                     .unwrap_or_default();
-                if let Err(violation) =
-                    self.recur_progress.close_site(&site_coordinates, &site_output_commitment)
+                if let Err(violation) = self
+                    .recur_progress
+                    .close_site(&site_coordinates, &site_output_commitment)
                 {
-                    panic!("Recur progress violation at site {:?}: {}", site_coordinates, violation);
+                    panic!(
+                        "Recur progress violation at site {:?}: {}",
+                        site_coordinates, violation
+                    );
                 }
                 // The close is recorded at `[-s]`; the object stays at `[s]`.
                 let closing_coordinates = self
@@ -1193,7 +1343,10 @@ impl TraceRecorder {
                     self.storage
                         .append_output(output, site_coordinates.clone())
                         .unwrap_or_else(|error| {
-                            panic!("Failed to store recur site object at {:?}: {}", site_coordinates, error)
+                            panic!(
+                                "Failed to store recur site object at {:?}: {}",
+                                site_coordinates, error
+                            )
                         })
                 });
 
@@ -1202,8 +1355,9 @@ impl TraceRecorder {
                     .as_ref()
                     .map(|write| write.entry.object_commitment.clone())
                     .unwrap_or_default();
-                if let Err(violation) =
-                    self.recur_progress.close_site(&site_coordinates, &site_output_commitment)
+                if let Err(violation) = self
+                    .recur_progress
+                    .close_site(&site_coordinates, &site_output_commitment)
                 {
                     panic!(
                         "Recur progress violation at site {:?}: {}",
@@ -1354,8 +1508,22 @@ impl TraceRecorder {
         // than by matching a predecessor record the window does not contain.
         let mut step_record = step_record;
         step_record.recur_progress_commitment = self.recur_progress.commitment();
-        self.recur_progress_store
-            .insert(step_record.exec_index, self.recur_progress.clone());
+        if self.witness_store.1 && self.witness_store.2.is_none() {
+            self.recur_progress_store
+                .as_mut()
+                .expect("retained history")
+                .insert(step_record.exec_index, self.recur_progress.clone());
+        }
+        if let Some(witness) = self.witness_store.reference(step_record.coordinates()) {
+            let scope = step_record
+                .coordinates()
+                .try_parent()
+                .and_then(|(parent, _)| self.witness_store.reference(&parent));
+            self.execution_witnesses
+                .as_mut()
+                .expect("retained history")
+                .insert(step_record.exec_index, (witness, scope));
+        }
         step_record
     }
 
@@ -1374,7 +1542,10 @@ impl TraceRecorder {
         self.storage
             .list_metadata_selection(&reference, &binding.selector)
             .unwrap_or_else(|error| {
-                panic!("Failed to read recur source metadata at site open: {}", error)
+                panic!(
+                    "Failed to read recur source metadata at site open: {}",
+                    error
+                )
             })
             .len
     }
@@ -1396,7 +1567,10 @@ impl TraceRecorder {
             let base = input
                 .and_then(|input| input.storage().get("output"))
                 .unwrap_or_else(|| {
-                    panic!("Deriving recur site {:?} records no `output` base", site_coordinates)
+                    panic!(
+                        "Deriving recur site {:?} records no `output` base",
+                        site_coordinates
+                    )
                 });
             assert!(
                 base.selection.path.segments.is_empty(),
@@ -1434,7 +1608,10 @@ impl TraceRecorder {
             return None;
         }
         let input = input?;
-        if !matches!(input.values().get(1), Some(raster_core::trace::FnInputValue::StorageBinding)) {
+        if !matches!(
+            input.values().get(1),
+            Some(raster_core::trace::FnInputValue::StorageBinding)
+        ) {
             return None;
         }
         let binding = input.storage().get(input.args().get(1)?.name.as_str())?;
@@ -1454,13 +1631,19 @@ impl TraceRecorder {
         is_tile_iteration: bool,
     ) {
         let step = DraftStep::from_native_witness(witness).unwrap_or_else(|error| {
-            panic!("Draft ops at {:?} do not apply to their witness: {}", coordinates, error)
+            panic!(
+                "Draft ops at {:?} do not apply to their witness: {}",
+                coordinates, error
+            )
         });
         if let Err(violation) =
             self.recur_progress
                 .advance_draft(coordinates, step.as_ref(), is_tile_iteration)
         {
-            panic!("Recur progress violation at {:?}: {}", coordinates, violation);
+            panic!(
+                "Recur progress violation at {:?}: {}",
+                coordinates, violation
+            );
         }
     }
 
@@ -1500,7 +1683,11 @@ mod tests {
     /// source binding is a malformed trace, and the recorder says so rather
     /// than defaulting `L`, which is the failure mode revision 1 of
     /// `recur-progress-commitment.md` was built to avoid.
-    fn seed_recur_source(recorder: &mut TraceRecorder, site: &str, elements: usize) -> FnCallRecord {
+    fn seed_recur_source(
+        recorder: &mut TraceRecorder,
+        site: &str,
+        elements: usize,
+    ) -> FnCallRecord {
         let value: Vec<String> = (0..elements).map(|i| format!("item-{}", i)).collect();
         let bytes = raster_core::postcard::to_allocvec(&value).unwrap();
         let (raster_bytes, index_bytes, root_hex) =
@@ -1643,7 +1830,6 @@ mod tests {
             None,
         );
         assert!(store
-            .0
             .get(&CfsCoordinates(vec![3, -1]))
             .expect("the End has its own entry")
             .input_source_witness
@@ -1658,7 +1844,6 @@ mod tests {
         ));
     }
 
-
     /// `main` containing one ordinary nested sequence — the shape that makes
     /// the `SequenceStart`/`SequenceEnd` coordinate collision observable.
     fn recorder_with_nested_sequence() -> TraceRecorder {
@@ -1671,10 +1856,12 @@ mod tests {
                 SequenceDef {
                     id: "main".to_string(),
                     input_sources: vec![],
-                    items: vec![SequenceChildItem::Sequence(raster_core::cfs::SequenceItem {
-                        id: "child".to_string(),
-                        sources: vec![],
-                    })],
+                    items: vec![SequenceChildItem::Sequence(
+                        raster_core::cfs::SequenceItem {
+                            id: "child".to_string(),
+                            sources: vec![],
+                        },
+                    )],
                     entry_arguments: vec![],
                     produces_output: false,
                     returns: None,
@@ -1737,9 +1924,9 @@ mod tests {
             .step_witness_at(&CfsCoordinates(vec![]))
             .expect("ProgramStart created the root entry");
 
-        recorder.record(TraceEvent::ProgramEnd(raster_core::trace::ProgramEndEvent {
-            output: None,
-        }));
+        recorder.record(TraceEvent::ProgramEnd(
+            raster_core::trace::ProgramEndEvent { output: None },
+        ));
 
         let after = recorder
             .step_witness_at(&CfsCoordinates(vec![]))
@@ -2073,14 +2260,26 @@ mod tests {
 
         let start = seed_recur_source(&mut recorder, "recur", 2);
         let site_start = recorder.record(TraceEvent::RecurTileStart(start));
-        let iter0 = recorder.record(TraceEvent::RecurTileIterationExec(recur_call("recur", raster_core::draft::RecurControlKind::Continue)));
-        let iter1 = recorder.record(TraceEvent::RecurTileIterationExec(recur_call("recur", raster_core::draft::RecurControlKind::Continue)));
+        let iter0 = recorder.record(TraceEvent::RecurTileIterationExec(recur_call(
+            "recur",
+            raster_core::draft::RecurControlKind::Continue,
+        )));
+        let iter1 = recorder.record(TraceEvent::RecurTileIterationExec(recur_call(
+            "recur",
+            raster_core::draft::RecurControlKind::Continue,
+        )));
         let site_end = recorder.record(TraceEvent::RecurTileEnd(site_end("recur")));
 
         // Open, and each iteration, must move it.
         assert_ne!(site_start.recur_progress_commitment, empty, "site open");
-        assert_ne!(iter0.recur_progress_commitment, site_start.recur_progress_commitment);
-        assert_ne!(iter1.recur_progress_commitment, iter0.recur_progress_commitment);
+        assert_ne!(
+            iter0.recur_progress_commitment,
+            site_start.recur_progress_commitment
+        );
+        assert_ne!(
+            iter1.recur_progress_commitment,
+            iter0.recur_progress_commitment
+        );
 
         // Closing pops the frame, so the stack is empty again — "no loop in
         // flight" as a positive statement, not an absent field.
@@ -2104,8 +2303,14 @@ mod tests {
         let start = seed_recur_source(&mut recorder, "recur", 2);
         let steps = vec![
             recorder.record(TraceEvent::RecurTileStart(start)),
-            recorder.record(TraceEvent::RecurTileIterationExec(recur_call("recur", raster_core::draft::RecurControlKind::Continue))),
-            recorder.record(TraceEvent::RecurTileIterationExec(recur_call("recur", raster_core::draft::RecurControlKind::Continue))),
+            recorder.record(TraceEvent::RecurTileIterationExec(recur_call(
+                "recur",
+                raster_core::draft::RecurControlKind::Continue,
+            ))),
+            recorder.record(TraceEvent::RecurTileIterationExec(recur_call(
+                "recur",
+                raster_core::draft::RecurControlKind::Continue,
+            ))),
             recorder.record(TraceEvent::RecurTileEnd(site_end("recur"))),
         ];
 
@@ -2164,13 +2369,21 @@ mod tests {
 
         let start = seed_recur_source(&mut recorder, "recur", 2);
         recorder.record(TraceEvent::RecurTileStart(start));
-        let iter0 = recorder.record(TraceEvent::RecurTileIterationExec(recur_call("recur", raster_core::draft::RecurControlKind::Continue)));
-        let site_end_before_close = recorder.record(TraceEvent::RecurTileIterationExec(recur_call("recur", raster_core::draft::RecurControlKind::Continue)));
+        let iter0 = recorder.record(TraceEvent::RecurTileIterationExec(recur_call(
+            "recur",
+            raster_core::draft::RecurControlKind::Continue,
+        )));
+        let site_end_before_close = recorder.record(TraceEvent::RecurTileIterationExec(
+            recur_call("recur", raster_core::draft::RecurControlKind::Continue),
+        ));
 
         let seed = recorder
             .recur_progress_after(iter0.exec_index)
             .expect("iteration 0 retained a stack");
-        assert!(!seed.is_empty(), "a window opening after iteration 0 is mid-loop");
+        assert!(
+            !seed.is_empty(),
+            "a window opening after iteration 0 is mid-loop"
+        );
         assert_eq!(seed.depth(), 1);
 
         // And the last iteration is still inside the site: only the site's
@@ -2189,7 +2402,10 @@ mod tests {
         start_main(&mut recorder);
         let start = seed_recur_source(&mut recorder, "recur", 3);
         recorder.record(TraceEvent::RecurTileStart(start));
-        recorder.record(TraceEvent::RecurTileIterationExec(recur_call("recur", raster_core::draft::RecurControlKind::Continue)));
+        recorder.record(TraceEvent::RecurTileIterationExec(recur_call(
+            "recur",
+            raster_core::draft::RecurControlKind::Continue,
+        )));
         // Only one of three elements covered, and no Break.
         recorder.record(TraceEvent::RecurTileEnd(site_end("recur")));
     }
@@ -2240,7 +2456,10 @@ mod tests {
         start_main(&mut recorder);
         let __start = seed_recur_source(&mut recorder, "recur", 1);
         recorder.record(TraceEvent::RecurTileStart(__start));
-        let tile_iteration = recorder.record(TraceEvent::RecurTileIterationExec(recur_call("recur", raster_core::draft::RecurControlKind::Continue)));
+        let tile_iteration = recorder.record(TraceEvent::RecurTileIterationExec(recur_call(
+            "recur",
+            raster_core::draft::RecurControlKind::Continue,
+        )));
         let tile_site = recorder.record(TraceEvent::RecurTileEnd(site_end("recur")));
         let tile = recorder.record(TraceEvent::TileExec(call("after")));
 
@@ -2277,7 +2496,8 @@ mod tests {
             fields: vec![raster_core::input::SchemaField::new(
                 "lines",
                 "lines",
-                <raster_core::collections::List<String> as raster_core::input::Selectable>::schema(),
+                <raster_core::collections::List<String> as raster_core::input::Selectable>::schema(
+                ),
             )],
         };
         let decl = raster_core::cfs::RecurOutputDecl {

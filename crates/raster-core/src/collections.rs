@@ -850,6 +850,12 @@ impl BytesPage {
     pub fn as_slice(&self) -> &[u8] {
         &self.bytes
     }
+
+    /// Heap allocation retained by this page, excluding the page struct itself.
+    /// This is host-side accounting only and does not affect its wire format.
+    pub fn allocated_bytes(&self) -> usize {
+        self.bytes.capacity()
+    }
 }
 
 impl core::fmt::Debug for BytesPage {

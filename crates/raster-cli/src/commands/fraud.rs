@@ -1,15 +1,20 @@
 //! Fraud injection: corrupt a chosen step of an honest trace and commit it.
 
 use rand::seq::IteratorRandom;
+use raster_prover::trace::{TraceRead, TraceWrite};
 
-use std::io::Write;
+use raster_prover::archive::DiskVec;
+use raster_prover::commitment_file::CommitmentFile;
 
+#[cfg(test)]
 use raster_core::cfs::CfsCoordinates;
-use raster_core::trace::{ExecStep, ExecTarget, StepKind, StepRecord, Trace};
+#[cfg(test)]
+use raster_core::trace::{ExecStep, StepRecord, Trace};
+use raster_core::trace::{ExecTarget, StepKind};
 use raster_core::{Error, Result};
 
 use raster_core::merkle::EMPTY_LEAF;
-use raster_prover::trace::{FraudProofConfig, TraceCommitment, TraceCommitmentExt};
+use raster_prover::trace::FraudProofConfig;
 
 /// Which executed step the injector should corrupt.
 ///
@@ -81,9 +86,10 @@ fn step_target(kind: &StepKind) -> Option<(&'static str, &str)> {
 
 /// Steps worth corrupting: a tile run with an input, or a recur site's close.
 /// A sequence boundary or a program start has no output to contradict.
-fn eligible_fraud_steps(trace: &Trace) -> Vec<usize> {
-    trace
-        .iter()
+fn eligible_fraud_steps(trace: &impl TraceRead) -> DiskVec<usize> {
+    let mut eligible = DiskVec::new();
+    for position in trace
+        .records()
         .enumerate()
         .filter(|(_, step_record)| match &step_record.kind {
             StepKind::Exec(exec) => !exec.input_commitment.is_empty(),
@@ -91,10 +97,13 @@ fn eligible_fraud_steps(trace: &Trace) -> Vec<usize> {
             _ => false,
         })
         .map(|(position, _)| position)
-        .collect()
+    {
+        eligible.push(position);
+    }
+    eligible
 }
 
-fn print_eligible_fraud_steps(trace: &Trace, eligible: &[usize]) {
+fn print_eligible_fraud_steps(trace: &impl TraceRead, eligible: &DiskVec<usize>) {
     println!();
     println!("Eligible fraud steps ({}):", eligible.len());
     println!(
@@ -102,7 +111,7 @@ fn print_eligible_fraud_steps(trace: &Trace, eligible: &[usize]) {
         "index", "exec_index", "kind", "target", "coordinates"
     );
     for (index, position) in eligible.iter().enumerate() {
-        let step_record = &trace[*position];
+        let step_record = &trace.record(position).expect("eligible record");
         let Some((kind, name)) = step_target(&step_record.kind) else {
             continue;
         };
@@ -116,10 +125,14 @@ fn print_eligible_fraud_steps(trace: &Trace, eligible: &[usize]) {
 }
 
 /// Resolve a target to a position in `trace`, or explain why it did not match.
-fn resolve_fraud_step(trace: &Trace, eligible: &[usize], target: &FraudTarget) -> Result<usize> {
+fn resolve_fraud_step(
+    trace: &impl TraceRead,
+    eligible: &DiskVec<usize>,
+    target: &FraudTarget,
+) -> Result<usize> {
     match target {
         FraudTarget::List => unreachable!("list is handled before resolution"),
-        FraudTarget::Index(index) => eligible.get(*index).copied().ok_or_else(|| {
+        FraudTarget::Index(index) => eligible.get(*index).ok_or_else(|| {
             Error::Other(format!(
                 "--fraud-step {index} is out of range: the trace has {} eligible steps (0..{})",
                 eligible.len(),
@@ -128,8 +141,7 @@ fn resolve_fraud_step(trace: &Trace, eligible: &[usize], target: &FraudTarget) -
         }),
         FraudTarget::ExecIndex(exec_index) => eligible
             .iter()
-            .copied()
-            .find(|position| trace[*position].exec_index == *exec_index)
+            .find(|position| trace.record(*position).expect("eligible record").exec_index == *exec_index)
             .ok_or_else(|| {
                 Error::Other(format!(
                     "--fraud-step exec:{exec_index} matched no eligible step;                      run with --fraud-step list to see them"
@@ -137,9 +149,8 @@ fn resolve_fraud_step(trace: &Trace, eligible: &[usize], target: &FraudTarget) -
             }),
         FraudTarget::Named(name) => eligible
             .iter()
-            .copied()
             .find(|position| {
-                step_target(&trace[*position].kind).is_some_and(|(_, target)| target == name)
+                step_target(&trace.record(*position).expect("eligible record").kind).is_some_and(|(_, target)| target == name)
             })
             .ok_or_else(|| {
                 Error::Other(format!(
@@ -149,7 +160,7 @@ fn resolve_fraud_step(trace: &Trace, eligible: &[usize], target: &FraudTarget) -
         FraudTarget::Seed(seed) => {
             use rand::SeedableRng;
             let mut rng = rand::rngs::StdRng::seed_from_u64(*seed);
-            eligible.iter().copied().choose(&mut rng).ok_or_else(|| {
+            eligible.iter().choose(&mut rng).ok_or_else(|| {
                 Error::Other("The trace has no step worth corrupting".into())
             })
         }
@@ -157,7 +168,7 @@ fn resolve_fraud_step(trace: &Trace, eligible: &[usize], target: &FraudTarget) -
 }
 
 pub fn fraud(
-    trace: &mut Trace,
+    trace: &mut impl TraceWrite,
     commit_path: &str,
     fraud_proof_config: FraudProofConfig,
     target: Option<&FraudTarget>,
@@ -169,7 +180,7 @@ pub fn fraud(
         return Ok(());
     }
 
-    if eligible.is_empty() {
+    if eligible.len() == 0 {
         return Err(Error::Other(
             "The trace has no step worth corrupting: every step is a boundary \
              with no replayed output to contradict"
@@ -186,21 +197,23 @@ pub fn fraud(
     let position = resolve_fraud_step(trace, &eligible, &effective)?;
     let index = eligible
         .iter()
-        .position(|candidate| *candidate == position)
+        .position(|candidate| candidate == position)
         .expect("resolved position comes from the eligible list");
 
-    let exec_index = trace[position].exec_index;
-    let coordinates = trace[position].coordinates.clone();
-    let (kind, name) = step_target(&trace[position].kind)
+    let mut record = trace.record(position).expect("eligible record");
+    let exec_index = record.exec_index;
+    let coordinates = record.coordinates.clone();
+    let (kind, name) = step_target(&record.kind)
         .map(|(kind, name)| (kind, name.to_string()))
         .expect("eligible steps are tile runs or site closes");
 
-    match &mut trace[position].kind {
+    match &mut record.kind {
         StepKind::Exec(exec) => exec.output_commitment = vec![0u8, 1u8],
         StepKind::RecurEnd(end) => end.output_commitment = vec![0u8, 1u8],
         _ => unreachable!("eligible steps are tile runs or site closes"),
     }
 
+    trace.set_record(position, record);
     println!();
     println!(
         "Fraud injected into 1 of {} eligible steps:",
@@ -215,17 +228,12 @@ pub fn fraud(
     }
     println!("  replay with --fraud-step {index}   (or exec:{exec_index})");
 
-    let trace_commitment =
-        TraceCommitment::try_build(trace, &EMPTY_LEAF, fraud_proof_config)
-            .map_err(|e| Error::Other(e.to_string()))?;
+    let trace_commitment = CommitmentFile::build(trace, &EMPTY_LEAF, fraud_proof_config)
+        .map_err(|e| Error::Other(e.to_string()))?;
 
-    let bytes = postcard::to_allocvec(&trace_commitment).unwrap();
-
-    let mut commitment_file =
-        std::fs::File::create(commit_path).expect("Failed to create commitemt file");
-    commitment_file
-        .write_all(&bytes)
-        .expect("Failed to save commitment");
+    trace_commitment
+        .write(std::path::Path::new(commit_path))
+        .map_err(Error::Io)?;
 
     Ok(())
 }

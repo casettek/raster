@@ -13,5 +13,15 @@
 // limitations under the License.
 
 fn main() {
+    // embed_methods watches its generated methods.rs; also rebuild the guests
+    // when shared verification rules change, so the host and guest cannot drift.
+    println!("cargo:rerun-if-changed=Cargo.toml");
+    println!("cargo:rerun-if-changed=../raster-core/src");
+    println!("cargo:rerun-if-changed=../raster-core/Cargo.toml");
+    for guest in ["authorization", "chain_fraud", "transition"] {
+        for source in ["src", "Cargo.toml", "Cargo.lock"] {
+            println!("cargo:rerun-if-changed=guests/{guest}/{source}");
+        }
+    }
     risc0_build::embed_methods();
 }

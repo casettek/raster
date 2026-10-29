@@ -9,7 +9,7 @@ use raster_core::cfs::{
     CfsCoordinate, CfsCoordinates, CfsCursor, ControlFlowSchema, InputBinding, InputSource,
     SequenceChildItem, FIRST_COORDINATE,
 };
-use raster_core::fingerprint::{fingerprint_value, Fingerprint, FingerprintAccumulator};
+use raster_core::fingerprint::{fingerprint_value, Fingerprint};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
@@ -24,6 +24,76 @@ use raster_core::trace::{ExecStep, ExecTarget, StepKind, StepRecord, Trace, Trac
 use raster_core::transition::{
     FingerprintBlockWitness, FingerprintSliceWitness, StepRecordWitness, TraceCommitmentHeader,
 };
+
+/// Random access to execution records without retaining decoded history.
+pub trait TraceRead {
+    fn len(&self) -> usize;
+    fn record(&self, index: usize) -> Option<StepRecord>;
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    fn records(&self) -> impl DoubleEndedIterator<Item = StepRecord> + ExactSizeIterator {
+        (0..self.len()).map(|i| self.record(i).expect("missing execution record"))
+    }
+    fn prefix(&self, len: usize) -> TracePrefix<'_, Self>
+    where
+        Self: Sized,
+    {
+        assert!(len <= self.len());
+        TracePrefix { trace: self, len }
+    }
+}
+impl TraceRead for Trace {
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+    fn record(&self, index: usize) -> Option<StepRecord> {
+        self.0.get(index).cloned()
+    }
+}
+impl TraceRead for [StepRecord] {
+    fn len(&self) -> usize {
+        <[StepRecord]>::len(self)
+    }
+    fn record(&self, index: usize) -> Option<StepRecord> {
+        self.get(index).cloned()
+    }
+}
+impl TraceRead for crate::archive::DiskVec<StepRecord> {
+    fn len(&self) -> usize {
+        self.len()
+    }
+    fn record(&self, index: usize) -> Option<StepRecord> {
+        self.get(index)
+    }
+}
+pub trait TraceWrite: TraceRead {
+    fn set_record(&mut self, index: usize, record: StepRecord);
+}
+impl TraceWrite for Trace {
+    fn set_record(&mut self, index: usize, record: StepRecord) {
+        self.0[index] = record;
+    }
+}
+impl TraceWrite for crate::archive::DiskVec<StepRecord> {
+    fn set_record(&mut self, index: usize, record: StepRecord) {
+        self.set(index, record);
+    }
+}
+pub struct TracePrefix<'a, T: TraceRead + ?Sized> {
+    trace: &'a T,
+    len: usize,
+}
+impl<T: TraceRead + ?Sized> TraceRead for TracePrefix<'_, T> {
+    fn len(&self) -> usize {
+        self.len
+    }
+    fn record(&self, index: usize) -> Option<StepRecord> {
+        (index < self.len)
+            .then(|| self.trace.record(index))
+            .flatten()
+    }
+}
 
 /// Trait for types that can be hashed to bytes.
 pub trait BytesHashable {
@@ -126,7 +196,11 @@ pub fn serializable_frontier_from_trace_frontier(
     SerializableFrontier {
         position: frontier.position().into(),
         leaf: frontier.leaf().clone().0,
-        ommers: frontier.ommers().iter().map(|o| to_node_hash(&o.0)).collect(),
+        ommers: frontier
+            .ommers()
+            .iter()
+            .map(|o| to_node_hash(&o.0))
+            .collect(),
     }
 }
 
@@ -235,12 +309,16 @@ pub use raster_core::trace::TraceCommitment;
 /// struct was local; the rename avoids ambiguity with the prelude's
 /// `From`/`TryFrom` now that these are trait methods.
 pub trait TraceCommitmentExt: Sized {
-    fn build(trace: &Trace, seed: &[u8], fraud_proof_config: FraudProofConfig) -> Self;
-    fn try_build(trace: &Trace, seed: &[u8], fraud_proof_config: FraudProofConfig) -> Result<Self>;
+    fn build(trace: &impl TraceRead, seed: &[u8], fraud_proof_config: FraudProofConfig) -> Self;
+    fn try_build(
+        trace: &impl TraceRead,
+        seed: &[u8],
+        fraud_proof_config: FraudProofConfig,
+    ) -> Result<Self>;
     fn validate(&self) -> Result<()>;
-    fn frontier(trace: &Trace, n: usize, seed: &[u8]) -> Option<TraceTreeFrontier>;
-    fn witness(trace: &Trace, n: usize, seed: &[u8]) -> Option<MerklePath<Bytes, 32>>;
-    fn try_frontier(trace: &Trace, n: usize, seed: &[u8]) -> Result<TraceTreeFrontier>;
+    fn frontier(trace: &impl TraceRead, n: usize, seed: &[u8]) -> Option<TraceTreeFrontier>;
+    fn witness(trace: &impl TraceRead, n: usize, seed: &[u8]) -> Option<MerklePath<Bytes, 32>>;
+    fn try_frontier(trace: &impl TraceRead, n: usize, seed: &[u8]) -> Result<TraceTreeFrontier>;
     fn diff(&self, other: &TraceCommitment) -> Option<usize>;
     /// The commitment's compact identity (see [`TraceCommitmentHeader`]):
     /// what journals and chain checkpoints hash instead of the whole file.
@@ -276,62 +354,232 @@ pub fn fingerprint_block_range(
 
 /// Merkle root over the fingerprint's packed `u64` blocks.
 pub fn fingerprint_blocks_root(bits: &[u64]) -> Vec<u8> {
-    assert!(
-        !bits.is_empty(),
-        "a trace commitment fingerprint is never empty"
-    );
+    fingerprint_blocks_root_iter(bits.iter().copied())
+}
+
+fn fingerprint_blocks_root_iter(bits: impl IntoIterator<Item = u64>) -> Vec<u8> {
     let mut tree = TraceTree::new(1);
     for block in bits {
-        tree.append(fingerprint_block_leaf(*block));
+        assert!(
+            tree.append(fingerprint_block_leaf(block)),
+            "fingerprint tree capacity exceeded"
+        );
     }
     tree.root(0).expect("fingerprint blocks root").0
 }
 
-impl TraceCommitmentExt for TraceCommitment {
-    fn build(trace: &Trace, seed: &[u8], fraud_proof_config: FraudProofConfig) -> TraceCommitment {
-        assert!(
-            trace.len() > fraud_proof_config.window_size,
-            "Trace length can't be less than verification window"
-        );
+pub trait CommitmentRead {
+    fn len(&self) -> usize;
+    fn packer(&self) -> BitPacker;
+    fn block_count(&self) -> usize;
+    fn block(&self, index: usize) -> u64;
+    fn head(&self) -> &[StepRecord];
+    fn tail(&self) -> &[raster_core::merkle::NodeHash];
+    fn entry(&self, index: usize) -> Result<u64> {
+        if index >= self.len() {
+            return Err(BitPackerError::InvalidCommitment(
+                "fingerprint index outside commitment".into(),
+            ));
+        }
+        let bits = self.packer().bits_per_item();
+        let first = index * bits / 64;
+        let last = (index * bits + bits - 1) / 64;
+        let blocks: Vec<_> = (first..=last).map(|i| self.block(i)).collect();
+        self.packer()
+            .try_get_at_bit_offset(index * bits % 64, &blocks)
+            .map_err(|e| BitPackerError::InvalidCommitment(e.to_string()))
+    }
+    fn slice(&self, start: usize, end: usize) -> Vec<u64> {
+        assert!(start < end && end <= self.len());
+        // Align to an item boundary that is also a word boundary (64 items always is).
+        let aligned = start / 64 * 64;
+        let bits = self.packer().bits_per_item();
+        let blocks: Vec<_> = (aligned * bits / 64..(end * bits).div_ceil(64))
+            .map(|i| self.block(i))
+            .collect();
+        self.packer()
+            .get_range(start - aligned, end - aligned, &blocks)
+            .expect("fingerprint window")
+    }
+}
+impl CommitmentRead for TraceCommitment {
+    fn len(&self) -> usize {
+        self.fingerprint.len()
+    }
+    fn packer(&self) -> BitPacker {
+        self.fingerprint.bits_packer
+    }
+    fn block_count(&self) -> usize {
+        self.fingerprint.bits.len()
+    }
+    fn block(&self, index: usize) -> u64 {
+        self.fingerprint.bits[index]
+    }
+    fn head(&self) -> &[StepRecord] {
+        &self.revealed_items
+    }
+    fn tail(&self) -> &[raster_core::merkle::NodeHash] {
+        &self.revealed_tail_roots
+    }
+}
 
-        let revealed_items = trace[..fraud_proof_config.window_size].to_vec();
+pub fn commitment_slice_witness(
+    commitment: &impl CommitmentRead,
+    window_start: usize,
+    window_len: usize,
+) -> FingerprintSliceWitness {
+    assert!(window_len > 0, "empty fraud window");
+    assert!(
+        window_start + window_len <= commitment.len(),
+        "fraud window [{}, {}) exceeds the committed fingerprint ({} items)",
+        window_start,
+        window_start + window_len,
+        commitment.len()
+    );
+    let (first_block, last_block) = fingerprint_block_range(
+        commitment.packer().bits_per_item(),
+        window_start,
+        window_len,
+    );
 
-        let items_hashes: Vec<Vec<u8>> = trace.iter().map(|item| item.hash()).collect();
+    let mut tree = TraceTree::new(1);
+    let mut marked = Vec::with_capacity(last_block - first_block + 1);
+    for (index, block) in (0..commitment.block_count()).map(|i| (i, commitment.block(i))) {
+        tree.append(fingerprint_block_leaf(block));
+        if (first_block..=last_block).contains(&index) {
+            marked.push(tree.mark().expect("mark fingerprint block"));
+        }
+    }
 
-        let mut trace_tree = TraceTree::new(1);
-        trace_tree.append(Bytes(seed.to_vec()));
-
-        let mut fingerprint_acc =
-            FingerprintAccumulator::new(BitPacker(fraud_proof_config.bits_per_item));
-
-        // The tail's roots are revealed in full. Captured on the walk that
-        // already computes them, so there is no second pass over the trace.
-        let tail_start = items_hashes.len() - fraud_proof_config.window_size;
-        let mut revealed_tail_roots = Vec::with_capacity(fraud_proof_config.window_size);
-
-        for (index, item_hash) in items_hashes.iter().enumerate() {
-            trace_tree.append(Bytes(item_hash.clone()));
-            if let Some(root) = trace_tree.root(0) {
-                if index >= tail_start {
-                    revealed_tail_roots.push(to_node_hash(&root.0));
-                }
-                fingerprint_acc.append(&root.0);
+    let blocks = (first_block..=last_block)
+        .zip(marked)
+        .map(|(index, position)| {
+            let path = tree
+                .witness(position, 0)
+                .expect("fingerprint block witness");
+            FingerprintBlockWitness {
+                block: commitment.block(index),
+                position: u64::from(position),
+                path_elems: path.iter().map(|elem| to_node_hash(&elem.0)).collect(),
             }
-        }
+        })
+        .collect();
 
-        let fingerprint = fingerprint_acc.into_fingerprint();
+    FingerprintSliceWitness { blocks }
+}
+pub fn commitment_header(commitment: &impl CommitmentRead) -> TraceCommitmentHeader {
+    let revealed_bytes =
+        postcard::to_allocvec(commitment.head()).expect("revealed items are serializable");
+    let tail_roots_bytes =
+        postcard::to_allocvec(commitment.tail()).expect("revealed tail roots are serializable");
+    TraceCommitmentHeader {
+        bits_packer: commitment.packer(),
+        fingerprint_len: commitment.len() as u64,
+        fingerprint_root: fingerprint_blocks_root_iter(
+            (0..commitment.block_count()).map(|i| commitment.block(i)),
+        ),
+        revealed_items_commitment: sha256_bytes(&revealed_bytes),
+        window_size: commitment.head().len() as u64,
+        revealed_tail_roots_commitment: sha256_bytes(&tail_roots_bytes),
+    }
+}
+pub fn validate_commitment(commitment: &impl CommitmentRead) -> Result<()> {
+    let bits_per_item = commitment.packer().bits_per_item();
+    if !(MIN_BITS_PER_ITEM..=MAX_BITS_PER_ITEM).contains(&bits_per_item) {
+        return Err(BitPackerError::InvalidCommitment(format!(
+            "Fingerprint claims {} bits per item, expected between {} and {}",
+            bits_per_item, MIN_BITS_PER_ITEM, MAX_BITS_PER_ITEM
+        )));
+    }
 
-        TraceCommitment {
-            fingerprint,
-            revealed_items,
-            revealed_tail_roots,
+    let window_size = commitment.head().len();
+    if window_size == 0 || window_size > MAX_FRAUD_PROOF_WINDOW_SIZE {
+        return Err(BitPackerError::InvalidCommitment(format!(
+            "Commitment reveals {} items, expected between 1 and {}",
+            window_size, MAX_FRAUD_PROOF_WINDOW_SIZE
+        )));
+    }
+
+    // The fingerprint holds one entry per trace step and a valid
+    // commitment requires the trace to be strictly longer than the
+    // window, so the window can never outgrow the fingerprint.
+    if commitment.len() <= window_size {
+        return Err(BitPackerError::InvalidCommitment(format!(
+            "Fingerprint covers {} trace steps but the fraud-proof window \
+                 reveals {} items and requires at least {}",
+            commitment.len(),
+            window_size,
+            window_size + 1
+        )));
+    }
+
+    if commitment.len() > u32::MAX as usize {
+        return Err(BitPackerError::InvalidCommitment(
+            "trace tree capacity exceeded".into(),
+        ));
+    }
+    let expected_blocks = commitment
+        .len()
+        .checked_mul(bits_per_item)
+        .ok_or_else(|| BitPackerError::InvalidCommitment("fingerprint length overflow".into()))?
+        .div_ceil(64);
+    if commitment.block_count() != expected_blocks {
+        return Err(BitPackerError::InvalidCommitment(format!(
+            "Fingerprint claims {} items of {} bits ({} packed blocks) but holds {} blocks",
+            commitment.len(),
+            bits_per_item,
+            expected_blocks,
+            commitment.block_count()
+        )));
+    }
+
+    // The revealed tail covers exactly the final window.
+    if commitment.tail().len() != window_size {
+        return Err(BitPackerError::InvalidCommitment(format!(
+            "Commitment reveals {} tail roots but the fraud-proof window covers {}",
+            commitment.tail().len(),
+            window_size
+        )));
+    }
+
+    // Each revealed root must squeeze to the fingerprint entry already
+    // committed at its index. The roots are strictly more information than
+    // the entries — the entries are derived from them — so this is what
+    // stops a commitment carrying a tail that contradicts its own
+    // fingerprint. `fingerprint_value` is the same function the accumulator
+    // used to produce those entries.
+    let tail_start = commitment.len() - window_size;
+    for (offset, root) in commitment.tail().iter().enumerate() {
+        let index = tail_start + offset;
+        let committed = commitment.entry(index).map_err(|error| {
+            BitPackerError::InvalidCommitment(format!(
+                "Fingerprint has no entry at tail index {}: {}",
+                index, error
+            ))
+        })?;
+        let derived = fingerprint_value(root.as_slice(), bits_per_item);
+        if derived != committed {
+            return Err(BitPackerError::InvalidCommitment(format!(
+                "Revealed tail root at index {} squeezes to {} but the fingerprint \
+                     commits {}",
+                index, derived, committed
+            )));
         }
+    }
+
+    Ok(())
+}
+impl TraceCommitmentExt for TraceCommitment {
+    fn build(trace: &impl TraceRead, seed: &[u8], config: FraudProofConfig) -> TraceCommitment {
+        crate::commitment_file::CommitmentFile::build(trace, seed, config)
+            .expect("build commitment")
+            .into_memory()
     }
 
     /// Try to create a commitment from items, returning an error if the trace
     /// is empty or too short for the fraud-proof window.
     fn try_build(
-        trace: &Trace,
+        trace: &impl TraceRead,
         seed: &[u8],
         fraud_proof_config: FraudProofConfig,
     ) -> Result<TraceCommitment> {
@@ -358,104 +606,26 @@ impl TraceCommitmentExt for TraceCommitment {
     /// or fingerprints is verification's job — only that its fields are
     /// consistent with each other.
     fn validate(&self) -> Result<()> {
-        let bits_per_item = self.fingerprint.bits_per_item();
-        if !(MIN_BITS_PER_ITEM..=MAX_BITS_PER_ITEM).contains(&bits_per_item) {
-            return Err(BitPackerError::InvalidCommitment(format!(
-                "Fingerprint claims {} bits per item, expected between {} and {}",
-                bits_per_item, MIN_BITS_PER_ITEM, MAX_BITS_PER_ITEM
-            )));
-        }
-
-        let window_size = self.window_size();
-        if window_size == 0 || window_size > MAX_FRAUD_PROOF_WINDOW_SIZE {
-            return Err(BitPackerError::InvalidCommitment(format!(
-                "Commitment reveals {} items, expected between 1 and {}",
-                window_size, MAX_FRAUD_PROOF_WINDOW_SIZE
-            )));
-        }
-
-        // The fingerprint holds one entry per trace step and a valid
-        // commitment requires the trace to be strictly longer than the
-        // window, so the window can never outgrow the fingerprint.
-        if self.fingerprint.len() <= window_size {
-            return Err(BitPackerError::InvalidCommitment(format!(
-                "Fingerprint covers {} trace steps but the fraud-proof window \
-                 reveals {} items and requires at least {}",
-                self.fingerprint.len(),
-                window_size,
-                window_size + 1
-            )));
-        }
-
-        let expected_blocks = (self.fingerprint.len() * bits_per_item).div_ceil(64);
-        if self.fingerprint.bits.len() != expected_blocks {
-            return Err(BitPackerError::InvalidCommitment(format!(
-                "Fingerprint claims {} items of {} bits ({} packed blocks) but holds {} blocks",
-                self.fingerprint.len(),
-                bits_per_item,
-                expected_blocks,
-                self.fingerprint.bits.len()
-            )));
-        }
-
-        // The revealed tail covers exactly the final window.
-        if self.revealed_tail_roots.len() != window_size {
-            return Err(BitPackerError::InvalidCommitment(format!(
-                "Commitment reveals {} tail roots but the fraud-proof window covers {}",
-                self.revealed_tail_roots.len(),
-                window_size
-            )));
-        }
-
-        // Each revealed root must squeeze to the fingerprint entry already
-        // committed at its index. The roots are strictly more information than
-        // the entries — the entries are derived from them — so this is what
-        // stops a commitment carrying a tail that contradicts its own
-        // fingerprint. `fingerprint_value` is the same function the accumulator
-        // used to produce those entries.
-        let tail_start = self.fingerprint.len() - window_size;
-        for (offset, root) in self.revealed_tail_roots.iter().enumerate() {
-            let index = tail_start + offset;
-            let committed = self
-                .fingerprint
-                .bits_packer
-                .try_get(index, &self.fingerprint.bits)
-                .map_err(|error| {
-                    BitPackerError::InvalidCommitment(format!(
-                        "Fingerprint has no entry at tail index {}: {}",
-                        index, error
-                    ))
-                })?;
-            let derived = fingerprint_value(root.as_slice(), bits_per_item);
-            if derived != committed {
-                return Err(BitPackerError::InvalidCommitment(format!(
-                    "Revealed tail root at index {} squeezes to {} but the fingerprint \
-                     commits {}",
-                    index, derived, committed
-                )));
-            }
-        }
-
-        Ok(())
+        validate_commitment(self)
     }
 
     /// Get the frontier (partial Merkle path) at position n.
     ///
     /// This can be used to continue building the tree from position n.
-    fn frontier(trace: &Trace, n: usize, seed: &[u8]) -> Option<TraceTreeFrontier> {
-        let items_hashes: Vec<Vec<u8>> = trace.iter().map(|item| item.hash()).collect();
-
+    fn frontier(trace: &impl TraceRead, n: usize, seed: &[u8]) -> Option<TraceTreeFrontier> {
         let mut trace_tree = TraceTree::new(1);
         trace_tree.append(Bytes(seed.to_vec()));
 
-        for item_hash in items_hashes.iter().take(n) {
-            trace_tree.append(Bytes(item_hash.clone()));
+        for item in trace.records().take(n) {
+            if !trace_tree.append(Bytes(item.hash())) {
+                return None;
+            }
         }
 
         trace_tree.frontier().cloned()
     }
 
-    fn witness(trace: &Trace, n: usize, seed: &[u8]) -> Option<MerklePath<Bytes, 32>> {
+    fn witness(trace: &impl TraceRead, n: usize, seed: &[u8]) -> Option<MerklePath<Bytes, 32>> {
         if n >= trace.len() {
             return None;
         }
@@ -465,7 +635,7 @@ impl TraceCommitmentExt for TraceCommitment {
 
         let mut marked_position = None;
 
-        for (idx, item) in trace.iter().enumerate() {
+        for (idx, item) in trace.records().enumerate() {
             trace_tree.append(Bytes(item.hash()));
 
             if idx == n {
@@ -483,7 +653,7 @@ impl TraceCommitmentExt for TraceCommitment {
     }
 
     /// Try to get the frontier, returning an error on failure.
-    fn try_frontier(trace: &Trace, n: usize, seed: &[u8]) -> Result<TraceTreeFrontier> {
+    fn try_frontier(trace: &impl TraceRead, n: usize, seed: &[u8]) -> Result<TraceTreeFrontier> {
         if n > trace.len() {
             return Err(BitPackerError::InvalidRange {
                 start: 0,
@@ -492,16 +662,14 @@ impl TraceCommitmentExt for TraceCommitment {
             });
         }
 
-        let mut items_hashes: Vec<Vec<u8>> = Vec::with_capacity(n);
-        for item in trace.iter().take(n) {
-            items_hashes.push(item.try_hash()?);
-        }
-
         let mut trace_tree = TraceTree::new(1);
         trace_tree.append(Bytes(seed.to_vec()));
 
-        for item_hash in &items_hashes {
-            trace_tree.append(Bytes(item_hash.clone()));
+        for item in trace.records().take(n) {
+            assert!(
+                trace_tree.append(Bytes(item.try_hash()?)),
+                "trace tree capacity exceeded"
+            );
         }
 
         trace_tree
@@ -511,18 +679,7 @@ impl TraceCommitmentExt for TraceCommitment {
     }
 
     fn header(&self) -> TraceCommitmentHeader {
-        let revealed_bytes =
-            postcard::to_allocvec(&self.revealed_items).expect("revealed items are serializable");
-        let tail_roots_bytes = postcard::to_allocvec(&self.revealed_tail_roots)
-            .expect("revealed tail roots are serializable");
-        TraceCommitmentHeader {
-            bits_packer: self.fingerprint.bits_packer,
-            fingerprint_len: self.fingerprint.len() as u64,
-            fingerprint_root: fingerprint_blocks_root(&self.fingerprint.bits),
-            revealed_items_commitment: sha256_bytes(&revealed_bytes),
-            window_size: self.window_size() as u64,
-            revealed_tail_roots_commitment: sha256_bytes(&tail_roots_bytes),
-        }
+        commitment_header(self)
     }
 
     fn fingerprint_slice_witness(
@@ -530,41 +687,7 @@ impl TraceCommitmentExt for TraceCommitment {
         window_start: usize,
         window_len: usize,
     ) -> FingerprintSliceWitness {
-        assert!(window_len > 0, "empty fraud window");
-        assert!(
-            window_start + window_len <= self.fingerprint.len(),
-            "fraud window [{}, {}) exceeds the committed fingerprint ({} items)",
-            window_start,
-            window_start + window_len,
-            self.fingerprint.len()
-        );
-        let (first_block, last_block) =
-            fingerprint_block_range(self.fingerprint.bits_per_item(), window_start, window_len);
-
-        let mut tree = TraceTree::new(1);
-        let mut marked = Vec::with_capacity(last_block - first_block + 1);
-        for (index, block) in self.fingerprint.bits.iter().enumerate() {
-            tree.append(fingerprint_block_leaf(*block));
-            if (first_block..=last_block).contains(&index) {
-                marked.push(tree.mark().expect("mark fingerprint block"));
-            }
-        }
-
-        let blocks = (first_block..=last_block)
-            .zip(marked)
-            .map(|(index, position)| {
-                let path = tree
-                    .witness(position, 0)
-                    .expect("fingerprint block witness");
-                FingerprintBlockWitness {
-                    block: self.fingerprint.bits[index],
-                    position: u64::from(position),
-                    path_elems: path.iter().map(|elem| to_node_hash(&elem.0)).collect(),
-                }
-            })
-            .collect();
-
-        FingerprintSliceWitness { blocks }
+        commitment_slice_witness(self, window_start, window_len)
     }
 
     fn diff(&self, other: &TraceCommitment) -> Option<usize> {
@@ -681,9 +804,9 @@ fn flatten_binding<'a>(binding: &'a InputBinding, out: &mut Vec<&'a InputBinding
 ///
 /// Unique and first by construction (`StepKind::ProgramStart`: "The trace's
 /// first step"), so `position` and `rposition` agree here.
-fn program_start_index(trace: &[StepRecord]) -> Option<usize> {
+fn program_start_index(trace: &impl TraceRead) -> Option<usize> {
     trace
-        .iter()
+        .records()
         .position(|record| matches!(record.kind, StepKind::ProgramStart(_)))
 }
 
@@ -700,12 +823,12 @@ fn program_start_index(trace: &[StepRecord]) -> Option<usize> {
 /// carries `SequenceStart` at `[]`. `ProgramStart` opens `main`'s frame
 /// ("nothing else has yet" — `raster_runtime::tracing::recorder`), and the root
 /// is entered exactly once, so first and last coincide.
-fn frame_opening_index(trace: &[StepRecord], frame: &CfsCoordinates) -> Option<usize> {
+fn frame_opening_index(trace: &impl TraceRead, frame: &CfsCoordinates) -> Option<usize> {
     if frame.is_empty() {
         return program_start_index(trace);
     }
 
-    trace.iter().rposition(|record| {
+    trace.records().rposition(|record| {
         matches!(record.kind, StepKind::SequenceStart { .. }) && record.coordinates == *frame
     })
 }
@@ -721,7 +844,7 @@ fn frame_opening_index(trace: &[StepRecord], frame: &CfsCoordinates) -> Option<u
 /// (`sequence_coordinates`), which is true exactly under that precondition.
 fn resolve_inputs_sources(
     step_record: &StepRecord,
-    trace: &[StepRecord],
+    trace: &impl TraceRead,
     cfs_cursor: &CfsCursor,
     declared_inputs: &[InputBinding],
 ) -> Vec<(usize, StepRecord)> {
@@ -752,8 +875,6 @@ fn resolve_inputs_sources(
             )
         });
 
-    let current_sequence_trace_suffix = &trace[current_sequence_start_index..];
-
     let mut source_records = Vec::new();
 
     for step_input in step_inputs {
@@ -772,7 +893,7 @@ fn resolve_inputs_sources(
                         step_record
                     )
                 });
-                source_records.push((index, trace[index].clone()));
+                source_records.push((index, trace.record(index).expect("source record")));
             }
             InputBinding::SequenceScope { input_index, .. } => {
                 // A scope input is a value the frame's *caller* supplied, so the
@@ -791,8 +912,7 @@ fn resolve_inputs_sources(
                     input_index
                 );
 
-                let (parent_index, source_record) = current_sequence_trace_suffix
-                    .first()
+                let (parent_index, source_record) = trace.record(current_sequence_start_index)
                     .filter(|record| {
                         matches!(record.kind, StepKind::SequenceStart { .. })
                             && record.coordinates == sequence_coordinates
@@ -835,8 +955,7 @@ fn resolve_inputs_sources(
                         )
                     });
 
-                let source_record = current_sequence_trace_suffix
-                    .iter()
+                let source_record = trace.records().skip(current_sequence_start_index)
                     .enumerate()
                     .find(|(_, record)| {
                         record.coordinates.opened() == source_record_coordinates
@@ -870,14 +989,15 @@ fn resolve_inputs_sources(
 }
 
 fn witness_record_inputs(
-    trace: &Trace,
+    trace: &impl TraceRead,
     window_end_index: usize,
     fraud_window: &TraceWindow,
     cfs_cursor: &CfsCursor,
     seed: &[u8],
 ) -> HashMap<(u64, StepRecord), StepRecordWitness> {
     let window_start_index = window_end_index + 1 - fraud_window.items.len();
-    let mut source_records_witnesses: HashMap<(u64, StepRecord), StepRecordWitness> = HashMap::new();
+    let mut source_records_witnesses: HashMap<(u64, StepRecord), StepRecordWitness> =
+        HashMap::new();
 
     for (offset, step_record) in fraud_window.items.iter().enumerate() {
         // The two steps that bind no CFS inputs, skipped in the order the guest
@@ -885,8 +1005,7 @@ fn witness_record_inputs(
         // agree on which steps have inputs to resolve: a witness the guest never
         // reads is dead weight in the evidence, and a witness it reads and does
         // not get is a panic.
-        if step_record.input_source_commitment().is_none() || step_record.coordinates().is_empty()
-        {
+        if step_record.input_source_commitment().is_none() || step_record.coordinates().is_empty() {
             // Steps that bind no inputs — the program boundaries at `[]`, and
             // every close (`SequenceEnd`, `RecurEnd`), whose inputs belong to
             // the matching open.
@@ -925,11 +1044,11 @@ fn witness_record_inputs(
 
         for (trace_index, source_record) in resolve_inputs_sources(
             step_record,
-            &trace[..step_index],
+            &trace.prefix(step_index),
             cfs_cursor,
             cfs_item.inputs(),
         ) {
-            let trace_prefix = Trace(trace[..step_index].to_vec());
+            let trace_prefix = trace.prefix(step_index);
             let merkle_path = TraceCommitment::witness(&trace_prefix, trace_index, seed)
                 .expect("Failed to derive merkle path for source record");
             let witness = StepRecordWitness {
@@ -953,13 +1072,12 @@ fn witness_record_inputs(
     source_records_witnesses
 }
 
-pub struct TraceVerifier<'a> {
-    pub trace_commitment: TraceCommitment,
-    pub cfs: &'a ControlFlowSchema,
+pub struct TraceVerifier<C = TraceCommitment> {
+    pub trace_commitment: C,
+    pub cfs: ControlFlowSchema,
     pub seed: Vec<u8>,
 
     pub window_size: usize,
-    pub fingerprint_acc: FingerprintAccumulator,
     pub latest_frontier: TraceTreeFrontier,
 
     pub window_frontiers: Window<TraceTreeFrontier>,
@@ -977,26 +1095,19 @@ pub enum VerificationResult {
     Fraud(FraudEvidence),
 }
 
-impl<'a> TraceVerifier<'a> {
-    pub fn new(
-        trace_commitment: TraceCommitment,
-        seed: &[u8],
-        cfs: &'a ControlFlowSchema,
-    ) -> Result<Self> {
-        trace_commitment.validate()?;
+impl<C: CommitmentRead> TraceVerifier<C> {
+    pub fn new(trace_commitment: C, seed: &[u8], cfs: &ControlFlowSchema) -> Result<Self> {
+        validate_commitment(&trace_commitment)?;
 
         let mut trace_tree = TraceTree::new(1);
         trace_tree.append(Bytes(seed.to_vec()));
 
         let init_frontier = trace_tree.frontier().cloned().unwrap();
 
-        let bit_packer = trace_commitment.fingerprint.bits_packer.clone();
-        let fingerprint_acc = FingerprintAccumulator::new(bit_packer);
-
         // The commitment carries the fraud-proof window parameters it was
         // built with: the window size as the number of revealed items and the
         // bits per item inside the fingerprint's bit packer.
-        let window_size = trace_commitment.window_size();
+        let window_size = trace_commitment.head().len();
 
         let mut window_frontiers: Window<TraceTreeFrontier> = Window::new(window_size);
         let window_items: Window<StepRecord> = Window::new(window_size);
@@ -1005,11 +1116,10 @@ impl<'a> TraceVerifier<'a> {
 
         Ok(Self {
             trace_commitment,
-            cfs,
+            cfs: cfs.clone(),
             seed: seed.to_vec(),
 
             window_size,
-            fingerprint_acc,
             latest_frontier: init_frontier,
 
             window_frontiers,
@@ -1026,120 +1136,115 @@ impl<'a> TraceVerifier<'a> {
     fn revealed_tail_root_at(&self, index: usize) -> Option<&[u8]> {
         let tail_start = self
             .trace_commitment
-            .fingerprint
             .len()
-            .checked_sub(self.trace_commitment.revealed_tail_roots.len())?;
+            .checked_sub(self.trace_commitment.tail().len())?;
         index
             .checked_sub(tail_start)
-            .and_then(|offset| self.trace_commitment.revealed_tail_roots.get(offset))
+            .and_then(|offset| self.trace_commitment.tail().get(offset))
             .map(|root| root.as_slice())
     }
 
-    pub fn verify(&mut self, trace: &Trace) -> VerificationResult {
-        let cfs_cursor = CfsCursor::new(self.cfs.clone());
+    /// Compare one ordered execution record without reading execution history.
+    pub fn push(&mut self, step_index: usize, step_record: &StepRecord) -> Option<TraceWindow> {
+        assert!(
+            step_index < self.trace_commitment.len(),
+            "execution exceeds commitment length"
+        );
+        let item_frontier = self.latest_frontier.clone();
 
-        for (step_index, step_record) in trace.iter().enumerate() {
-            let item_frontier = self.latest_frontier.clone();
+        self.window_frontiers.push(item_frontier);
+        self.window_items.push(step_record.clone());
 
-            self.window_frontiers.push(item_frontier);
-            self.window_items.push(step_record.clone());
+        let step_record_hash = step_record.hash();
+        self.latest_frontier.append(Bytes(step_record_hash));
 
-            let step_record_hash = step_record.hash();
-            self.latest_frontier.append(Bytes(step_record_hash));
+        let root = Bytes(frontier_root(&self.latest_frontier));
 
-            let root = Bytes(frontier_root(&self.latest_frontier));
+        let index = step_index;
 
-            self.fingerprint_acc.append(&root.0);
+        // Across the final window the committed roots are revealed in full,
+        // so compare those: detection there is exact rather than
+        // `bits_per_item` bits, which at `window_size >= 128` was one bit.
+        // Elsewhere the packed entry is all there is.
+        //
+        // Root equality implies entry equality — the entry is derived from
+        // the root — so this strictly replaces the weaker test rather than
+        // sitting alongside it.
+        let diverges = match self.revealed_tail_root_at(index) {
+            Some(committed_root) => committed_root != root.0.as_slice(),
+            None => {
+                self.trace_commitment
+                    .entry(index)
+                    .expect("validated fingerprint entry")
+                    != fingerprint_value(&root.0, self.trace_commitment.packer().bits_per_item())
+            }
+        };
 
-            let latest_fingerprint = self.fingerprint_acc.clone().into_fingerprint();
-
-            let index = latest_fingerprint.len() - 1;
-
-            // Across the final window the committed roots are revealed in full,
-            // so compare those: detection there is exact rather than
-            // `bits_per_item` bits, which at `window_size >= 128` was one bit.
-            // Elsewhere the packed entry is all there is.
+        if diverges {
+            // The rolling buffers *measure* the window; this slice has to
+            // reproduce what they already know. `index.saturating_sub(w) + 1`
+            // did not: below `w` the `saturating_sub` floors to 0 and the
+            // `+ 1` lands on **1**, giving one entry too few *and* starting
+            // one item late, so window item 0 was compared against
+            // committed item 1. At `index == 0` the range was `1..1` and
+            // the slice came back empty while still declaring `w` items.
             //
-            // Root equality implies entry equality — the entry is derived from
-            // the root — so this strictly replaces the weaker test rather than
-            // sitting alongside it.
-            let diverges = match self.revealed_tail_root_at(index) {
-                Some(committed_root) => committed_root != root.0.as_slice(),
-                None => latest_fingerprint.bits_packer.diff_at_index(
-                    index,
-                    &latest_fingerprint.bits,
-                    &self.trace_commitment.fingerprint.bits,
-                ),
+            // Clamping instead is identical for `index >= w` and yields 0
+            // at the head, which is where the window genuinely starts.
+            let window_len = self.window_items.len();
+            let diff_bits = self
+                .trace_commitment
+                .slice((index + 1).saturating_sub(self.window_size), index + 1);
+
+            // Declare what the slice holds, not the window's capacity.
+            // `Fingerprint::from` stores `len` verbatim without checking it
+            // against `bits`, and the guest reads that declared length as
+            // authoritative — which is how a head window used to travel all
+            // the way there claiming items it did not carry.
+            assert_eq!(
+                diff_bits.len(),
+                (window_len * self.trace_commitment.packer().bits_per_item()).div_ceil(64),
+                "fraud window slice holds {} blocks but declares {} items",
+                diff_bits.len(),
+                window_len,
+            );
+            let window_fingerprint =
+                Fingerprint::from(diff_bits, self.trace_commitment.packer(), window_len);
+
+            let window_frontier = self.window_frontiers.first().unwrap().clone();
+            let ser_window_frontier =
+                serializable_frontier_from_trace_frontier(window_frontier).to_bytes();
+
+            // TODO: consider renaming Window struct and TraceWindow have different behavior but
+            // similiar naming
+            let fraud_window = TraceWindow {
+                frontier: ser_window_frontier,
+                items: self.window_items.to_vec(),
+                fingerprint: window_fingerprint,
             };
 
-            if diverges {
-                // The rolling buffers *measure* the window; this slice has to
-                // reproduce what they already know. `index.saturating_sub(w) + 1`
-                // did not: below `w` the `saturating_sub` floors to 0 and the
-                // `+ 1` lands on **1**, giving one entry too few *and* starting
-                // one item late, so window item 0 was compared against
-                // committed item 1. At `index == 0` the range was `1..1` and
-                // the slice came back empty while still declaring `w` items.
-                //
-                // Clamping instead is identical for `index >= w` and yields 0
-                // at the head, which is where the window genuinely starts.
-                let window_len = self.window_items.len();
-                let diff_bits = self
-                    .trace_commitment
-                    .fingerprint
-                    .bits_packer
-                    .get_range(
-                        (index + 1).saturating_sub(self.window_size),
-                        index + 1,
-                        &self.trace_commitment.fingerprint.bits,
-                    )
-                    .unwrap();
+            return Some(fraud_window);
+        }
+        None
+    }
 
-                // Declare what the slice holds, not the window's capacity.
-                // `Fingerprint::from` stores `len` verbatim without checking it
-                // against `bits`, and the guest reads that declared length as
-                // authoritative — which is how a head window used to travel all
-                // the way there claiming items it did not carry.
-                assert_eq!(
-                    diff_bits.len(),
-                    (window_len * self.trace_commitment.fingerprint.bits_per_item()).div_ceil(64),
-                    "fraud window slice holds {} blocks but declares {} items",
-                    diff_bits.len(),
-                    window_len,
-                );
-                let window_fingerprint = Fingerprint::from(
-                    diff_bits,
-                    self.trace_commitment.fingerprint.bits_packer,
-                    window_len,
-                );
-
-                let window_frontier = self.window_frontiers.first().unwrap().clone();
-                let ser_window_frontier =
-                    serializable_frontier_from_trace_frontier(window_frontier).to_bytes();
-
-                // TODO: consider renaming Window struct and TraceWindow have different behavior but
-                // similiar naming
-                let fraud_window = TraceWindow {
-                    frontier: ser_window_frontier,
-                    items: self.window_items.to_vec(),
-                    fingerprint: window_fingerprint,
-                };
-
-                let input_sources_witnesses = witness_record_inputs(
-                    trace,
-                    step_index,
-                    &fraud_window,
-                    &cfs_cursor,
-                    &self.seed,
-                );
-
+    pub fn verify(&mut self, trace: &impl TraceRead) -> VerificationResult {
+        assert_eq!(
+            trace.len(),
+            self.trace_commitment.len(),
+            "execution and commitment lengths differ"
+        );
+        let cursor = CfsCursor::new(self.cfs.clone());
+        for (index, step) in trace.records().enumerate() {
+            if let Some(window) = self.push(index, &step) {
+                let input_sources_witnesses =
+                    witness_record_inputs(trace, index, &window, &cursor, &self.seed);
                 return VerificationResult::Fraud(FraudEvidence {
-                    window: fraud_window,
+                    window,
                     input_sources_witnesses,
                 });
             }
         }
-
         VerificationResult::Ok
     }
 
@@ -1167,7 +1272,7 @@ impl<'a> TraceVerifier<'a> {
     /// trace's first `window_size` steps. Such a window opens at trace index 0,
     /// where the guest asserts the genesis opening state instead of relying on
     /// a pre-divergence margin it cannot have.
-    pub fn terminal_window(&mut self, trace: &Trace) -> Result<FraudEvidence> {
+    pub fn terminal_window(&mut self, trace: &impl TraceRead) -> Result<FraudEvidence> {
         if trace.len() < self.window_size {
             return Err(BitPackerError::InvalidWindow(format!(
                 "Trace has {} steps but a terminal window needs at least {}",
@@ -1178,35 +1283,19 @@ impl<'a> TraceVerifier<'a> {
 
         let cfs_cursor = CfsCursor::new(self.cfs.clone());
 
-        for step_record in trace.iter() {
+        for step_record in trace.records() {
             self.window_frontiers.push(self.latest_frontier.clone());
             self.window_items.push(step_record.clone());
 
             self.latest_frontier.append(Bytes(step_record.hash()));
-
-            let root = Bytes(frontier_root(&self.latest_frontier));
-            self.fingerprint_acc.append(&root.0);
         }
 
         let last_index = trace.len() - 1;
         let window_start = trace.len() - self.window_size;
-        let committed_bits = self
-            .trace_commitment
-            .fingerprint
-            .bits_packer
-            .get_range(
-                window_start,
-                last_index + 1,
-                &self.trace_commitment.fingerprint.bits,
-            )
-            .ok_or_else(|| {
-                BitPackerError::InvalidWindow(
-                    "Committed fingerprint is shorter than the trace".to_string(),
-                )
-            })?;
+        let committed_bits = self.trace_commitment.slice(window_start, trace.len());
         let window_fingerprint = Fingerprint::from(
             committed_bits,
-            self.trace_commitment.fingerprint.bits_packer,
+            self.trace_commitment.packer(),
             self.window_size,
         );
 
@@ -1495,16 +1584,9 @@ mod tests {
             make_tile_trace_item(4, 4),
         ]);
 
-        let binded_trace = TraceCommitment::build(
-            &items,
-            &EMPTY_LEAF,
-            test_fraud_proof_config(),
-        );
-        let ref_binded_trace = TraceCommitment::build(
-            &ref_items,
-            &EMPTY_LEAF,
-            test_fraud_proof_config(),
-        );
+        let binded_trace = TraceCommitment::build(&items, &EMPTY_LEAF, test_fraud_proof_config());
+        let ref_binded_trace =
+            TraceCommitment::build(&ref_items, &EMPTY_LEAF, test_fraud_proof_config());
 
         // Check that different items produce different commitments
         assert_ne!(binded_trace.fingerprint, ref_binded_trace.fingerprint);
@@ -1520,11 +1602,7 @@ mod tests {
     #[test]
     fn test_try_from_empty_trace() {
         let items = Trace::new();
-        let result = TraceCommitment::try_build(
-            &items,
-            &EMPTY_LEAF,
-            test_fraud_proof_config(),
-        );
+        let result = TraceCommitment::try_build(&items, &EMPTY_LEAF, test_fraud_proof_config());
         assert!(matches!(result, Err(BitPackerError::EmptyTrace)));
     }
 
@@ -1534,11 +1612,7 @@ mod tests {
         // shorter and an equal-length trace are rejected.
         for trace_len in [1, 2] {
             let items = Trace((0..trace_len).map(|i| make_tile_trace_item(i, i)).collect());
-            let result = TraceCommitment::try_build(
-                &items,
-                &EMPTY_LEAF,
-                test_fraud_proof_config(),
-            );
+            let result = TraceCommitment::try_build(&items, &EMPTY_LEAF, test_fraud_proof_config());
             assert!(matches!(result, Err(BitPackerError::InvalidWindow(_))));
         }
     }
@@ -1641,15 +1715,71 @@ mod tests {
     #[test]
     fn test_verify_trace_returns_ok_for_matching_trace() {
         let trace = Trace((0..5).map(|i| make_tile_trace_item(i, i)).collect());
-        let trace_commitment = TraceCommitment::build(
-            &trace,
+        let trace_commitment =
+            TraceCommitment::build(&trace, &EMPTY_LEAF, test_fraud_proof_config());
+        let mut stored = crate::archive::DiskVec::new();
+        for record in trace.iter() {
+            stored.push(record.clone());
+        }
+        crate::archive::Archive::current().reopen();
+        let disk_commitment =
+            TraceCommitment::build(&stored, &EMPTY_LEAF, test_fraud_proof_config());
+        assert_eq!(
+            postcard::to_allocvec(&trace_commitment).unwrap(),
+            postcard::to_allocvec(&disk_commitment).unwrap()
+        );
+        assert_eq!(
+            trace_commitment.header().digest(),
+            disk_commitment.header().digest()
+        );
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let streamed = crate::commitment_file::CommitmentFile::build(
+            &stored,
             &EMPTY_LEAF,
             test_fraud_proof_config(),
+        )
+        .unwrap();
+        streamed.write(file.path()).unwrap();
+        assert_eq!(
+            std::fs::read(file.path()).unwrap(),
+            postcard::to_allocvec(&trace_commitment).unwrap()
         );
+        let reopened = crate::commitment_file::CommitmentFile::read(file.path()).unwrap();
+        assert_eq!(
+            reopened.header().digest(),
+            trace_commitment.header().digest()
+        );
+        assert_eq!(
+            postcard::to_allocvec(&reopened.fingerprint_slice_witness(1, 2)).unwrap(),
+            postcard::to_allocvec(&trace_commitment.fingerprint_slice_witness(1, 2)).unwrap()
+        );
+        let trace = stored;
         let cfs = make_test_cfs();
+        let mut corrupted = reopened.clone();
+        let bit = 2 * corrupted.fingerprint.bits_per_item();
+        let word = corrupted.fingerprint.bits.get(bit / 64);
+        corrupted
+            .fingerprint
+            .bits
+            .set(bit / 64, word ^ (1u64 << (bit % 64)));
+        let VerificationResult::Fraud(evidence) = TraceVerifier::new(corrupted, &EMPTY_LEAF, &cfs)
+            .unwrap()
+            .verify(&trace)
+        else {
+            panic!("corrupted fingerprint must diverge");
+        };
+        assert_eq!(
+            evidence.window.items,
+            vec![trace.get(1).unwrap(), trace.get(2).unwrap()]
+        );
+        assert!(matches!(
+            TraceVerifier::new(reopened, &EMPTY_LEAF, &cfs)
+                .unwrap()
+                .verify(&trace),
+            VerificationResult::Ok
+        ));
         let mut trace_verifier =
-            TraceVerifier::new(trace_commitment, &EMPTY_LEAF, &cfs)
-                .expect("valid commitment");
+            TraceVerifier::new(trace_commitment, &EMPTY_LEAF, &cfs).expect("valid commitment");
 
         let verification_result = trace_verifier.verify(&trace);
         assert!(matches!(verification_result, VerificationResult::Ok));
@@ -1666,20 +1796,13 @@ mod tests {
     #[test]
     fn terminal_window_ends_where_the_committed_fingerprint_ends() {
         let trace = Trace((0..8).map(|i| make_tile_trace_item(i, i)).collect());
-        let trace_commitment = TraceCommitment::build(
-            &trace,
-            &EMPTY_LEAF,
-            test_fraud_proof_config(),
-        );
+        let trace_commitment =
+            TraceCommitment::build(&trace, &EMPTY_LEAF, test_fraud_proof_config());
         let fingerprint_len = trace_commitment.fingerprint.len();
-        let window_size = trace_commitment.window_size();
+        let window_size = trace_commitment.head().len();
         let cfs = make_test_cfs();
-        let mut trace_verifier = TraceVerifier::new(
-            trace_commitment,
-            &EMPTY_LEAF,
-            &cfs,
-        )
-        .expect("valid commitment");
+        let mut trace_verifier =
+            TraceVerifier::new(trace_commitment, &EMPTY_LEAF, &cfs).expect("valid commitment");
 
         let evidence = trace_verifier
             .terminal_window(&trace)
@@ -1707,18 +1830,11 @@ mod tests {
     #[test]
     fn terminal_window_rejects_a_trace_shorter_than_the_window() {
         let trace = Trace((0..8).map(|i| make_tile_trace_item(i, i)).collect());
-        let trace_commitment = TraceCommitment::build(
-            &trace,
-            &EMPTY_LEAF,
-            test_fraud_proof_config(),
-        );
+        let trace_commitment =
+            TraceCommitment::build(&trace, &EMPTY_LEAF, test_fraud_proof_config());
         let cfs = make_test_cfs();
-        let mut trace_verifier = TraceVerifier::new(
-            trace_commitment,
-            &EMPTY_LEAF,
-            &cfs,
-        )
-        .expect("valid commitment");
+        let mut trace_verifier =
+            TraceVerifier::new(trace_commitment, &EMPTY_LEAF, &cfs).expect("valid commitment");
 
         let short = Trace(trace.iter().take(1).cloned().collect());
         assert!(trace_verifier.terminal_window(&short).is_err());
@@ -1746,10 +1862,11 @@ mod tests {
 
         for divergence in 0..=window_size + 1 {
             let mut runtime = committed.clone();
-            runtime.0[divergence] = make_tile_trace_item(divergence as u64, 900 + divergence as u64);
+            runtime.0[divergence] =
+                make_tile_trace_item(divergence as u64, 900 + divergence as u64);
 
-            let mut verifier = TraceVerifier::new(commitment.clone(), &seed, &cfs)
-                .expect("valid commitment");
+            let mut verifier =
+                TraceVerifier::new(commitment.clone(), &seed, &cfs).expect("valid commitment");
             let VerificationResult::Fraud(evidence) = verifier.verify(&runtime) else {
                 panic!("expected a divergence at index {divergence}");
             };
@@ -1762,7 +1879,11 @@ mod tests {
 
             // How many: the declared length is the measured item count.
             assert_eq!(window.items.len(), expected_len, "items at {divergence}");
-            assert_eq!(window.fingerprint.len(), expected_len, "declared at {divergence}");
+            assert_eq!(
+                window.fingerprint.len(),
+                expected_len,
+                "declared at {divergence}"
+            );
             assert_eq!(
                 window.fingerprint.bits.len(),
                 (expected_len * config.bits_per_item).div_ceil(64),
@@ -1770,7 +1891,11 @@ mod tests {
             );
 
             // Where: the frontier and the slice agree on the first item.
-            assert_eq!(window_start, divergence + 1 - expected_len, "start at {divergence}");
+            assert_eq!(
+                window_start,
+                divergence + 1 - expected_len,
+                "start at {divergence}"
+            );
             let committed_at_start = commitment
                 .fingerprint
                 .bits_packer
@@ -1789,6 +1914,39 @@ mod tests {
     }
 
     /// The cumulative root after every step of `trace`.
+    #[test]
+    fn live_memory_commitment_matches_disk_and_legacy_at_batch_boundaries() {
+        use crate::commitment_file::{CommitmentBuilder, CommitmentFile};
+        for window in [2, 128] {
+            let config = FraudProofConfig::from_window_size(window).unwrap();
+            for len in [2, 3, 63, 64, 65, 128, 129, 191, 192, 193, 257] {
+                let trace = Trace((0..len).map(|i| make_tile_trace_item(i, i)).collect());
+                let mut live = CommitmentBuilder::in_memory(&EMPTY_LEAF, config);
+                for record in trace.iter() {
+                    live.push(record.clone()).unwrap();
+                }
+                if len as usize <= window {
+                    assert!(live.finish().is_err());
+                    continue;
+                }
+                let live = live.finish().unwrap();
+                let disk = CommitmentFile::build(&trace, &EMPTY_LEAF, config).unwrap();
+                let legacy = TraceCommitment::build(&trace, &EMPTY_LEAF, config);
+                let bytes = postcard::to_allocvec(&live).unwrap();
+                assert_eq!(bytes, postcard::to_allocvec(&disk).unwrap());
+                assert_eq!(bytes, postcard::to_allocvec(&legacy).unwrap());
+                let file = tempfile::NamedTempFile::new().unwrap();
+                live.write(file.path()).unwrap();
+                let read = CommitmentFile::read_memory(file.path()).unwrap();
+                assert_eq!(bytes, postcard::to_allocvec(&read).unwrap());
+                let mut copy = read.clone();
+                let before = copy.fingerprint.bits.get(0);
+                copy.fingerprint.bits.set(0, before ^ 1);
+                assert_eq!(read.fingerprint.bits.get(0), before);
+            }
+        }
+    }
+
     fn final_trace_root(trace: &Trace, seed: &[u8]) -> Vec<u8> {
         let mut tree = TraceTree::new(1);
         tree.append(Bytes(seed.to_vec()));
@@ -1802,8 +1960,7 @@ mod tests {
     fn build_reveals_the_final_window_of_trace_roots() {
         let trace = Trace((0..10).map(|i| make_tile_trace_item(i, i)).collect());
         let config = test_fraud_proof_config();
-        let commitment =
-            TraceCommitment::build(&trace, &EMPTY_LEAF, config);
+        let commitment = TraceCommitment::build(&trace, &EMPTY_LEAF, config);
 
         assert_eq!(commitment.revealed_tail_roots.len(), config.window_size);
         // The last revealed root is the trace's final root.
@@ -1821,11 +1978,7 @@ mod tests {
     #[test]
     fn validate_rejects_a_tail_root_that_contradicts_the_fingerprint() {
         let trace = Trace((0..10).map(|i| make_tile_trace_item(i, i)).collect());
-        let mut commitment = TraceCommitment::build(
-            &trace,
-            &EMPTY_LEAF,
-            test_fraud_proof_config(),
-        );
+        let mut commitment = TraceCommitment::build(&trace, &EMPTY_LEAF, test_fraud_proof_config());
 
         // Flip enough bits to change the squeezed value, not just the root.
         commitment.revealed_tail_roots[0] = [0xFF; 32].into();
@@ -1839,11 +1992,7 @@ mod tests {
     #[test]
     fn validate_rejects_a_tail_that_does_not_cover_the_window() {
         let trace = Trace((0..10).map(|i| make_tile_trace_item(i, i)).collect());
-        let mut commitment = TraceCommitment::build(
-            &trace,
-            &EMPTY_LEAF,
-            test_fraud_proof_config(),
-        );
+        let mut commitment = TraceCommitment::build(&trace, &EMPTY_LEAF, test_fraud_proof_config());
 
         commitment.revealed_tail_roots.pop();
 
@@ -1889,8 +2038,7 @@ mod tests {
 
         let commitment = TraceCommitment::build(&honest, &seed, config);
         let cfs = make_test_cfs();
-        let mut verifier =
-            TraceVerifier::new(commitment, &seed, &cfs).expect("valid commitment");
+        let mut verifier = TraceVerifier::new(commitment, &seed, &cfs).expect("valid commitment");
 
         assert!(
             matches!(verifier.verify(&runtime), VerificationResult::Fraud(_)),
@@ -1904,15 +2052,11 @@ mod tests {
         let mut runtime_trace = committed_trace.clone();
         runtime_trace[2] = make_tile_trace_item(2, 999);
 
-        let trace_commitment = TraceCommitment::build(
-            &committed_trace,
-            &EMPTY_LEAF,
-            test_fraud_proof_config(),
-        );
+        let trace_commitment =
+            TraceCommitment::build(&committed_trace, &EMPTY_LEAF, test_fraud_proof_config());
         let cfs = make_test_cfs();
         let mut trace_verifier =
-            TraceVerifier::new(trace_commitment, &EMPTY_LEAF, &cfs)
-                .expect("valid commitment");
+            TraceVerifier::new(trace_commitment, &EMPTY_LEAF, &cfs).expect("valid commitment");
 
         let verification_result = trace_verifier.verify(&runtime_trace);
         assert!(matches!(verification_result, VerificationResult::Fraud(_)));
@@ -1922,11 +2066,7 @@ mod tests {
     fn test_verifier_rejects_structurally_malformed_commitment() {
         let trace = Trace((0..5).map(|i| make_tile_trace_item(i, i)).collect());
         let cfs = make_test_cfs();
-        let valid = TraceCommitment::build(
-            &trace,
-            &EMPTY_LEAF,
-            test_fraud_proof_config(),
-        );
+        let valid = TraceCommitment::build(&trace, &EMPTY_LEAF, test_fraud_proof_config());
 
         // More revealed items than the fingerprint covers.
         let mut oversized_window = valid.clone();
@@ -1966,15 +2106,11 @@ mod tests {
             make_tile_trace_item_at(4, "main", 3, vec![3], "tail".to_string(), 1, 30),
             make_sequence_end_record(5, "main", vec![]),
         ]);
-        let trace_commitment = TraceCommitment::build(
-            &trace,
-            &EMPTY_LEAF,
-            test_fraud_proof_config(),
-        );
+        let trace_commitment =
+            TraceCommitment::build(&trace, &EMPTY_LEAF, test_fraud_proof_config());
         let cfs = make_producer_dependency_cfs();
         let mut trace_verifier =
-            TraceVerifier::new(trace_commitment, &EMPTY_LEAF, &cfs)
-                .expect("valid commitment");
+            TraceVerifier::new(trace_commitment, &EMPTY_LEAF, &cfs).expect("valid commitment");
 
         let verification_result = trace_verifier.verify(&trace);
         assert!(matches!(verification_result, VerificationResult::Ok));
@@ -1990,15 +2126,11 @@ mod tests {
             make_tile_trace_item_at(5, "main", 2, vec![2], "tail".to_string(), 1, 20),
             make_sequence_end_record(6, "main", vec![]),
         ]);
-        let trace_commitment = TraceCommitment::build(
-            &trace,
-            &EMPTY_LEAF,
-            test_fraud_proof_config(),
-        );
+        let trace_commitment =
+            TraceCommitment::build(&trace, &EMPTY_LEAF, test_fraud_proof_config());
         let cfs = make_sequence_input_dependency_cfs();
         let mut trace_verifier =
-            TraceVerifier::new(trace_commitment, &EMPTY_LEAF, &cfs)
-                .expect("valid commitment");
+            TraceVerifier::new(trace_commitment, &EMPTY_LEAF, &cfs).expect("valid commitment");
 
         let verification_result = trace_verifier.verify(&trace);
         assert!(matches!(verification_result, VerificationResult::Ok));
@@ -2014,15 +2146,11 @@ mod tests {
             make_tile_trace_item_at(5, "main", 2, vec![2], "tail".to_string(), 1, 20),
             make_sequence_end_record(6, "main", vec![]),
         ]);
-        let trace_commitment = TraceCommitment::build(
-            &trace,
-            &EMPTY_LEAF,
-            test_fraud_proof_config(),
-        );
+        let trace_commitment =
+            TraceCommitment::build(&trace, &EMPTY_LEAF, test_fraud_proof_config());
         let cfs = make_nested_sequence_output_dependency_cfs();
         let mut trace_verifier =
-            TraceVerifier::new(trace_commitment, &EMPTY_LEAF, &cfs)
-                .expect("valid commitment");
+            TraceVerifier::new(trace_commitment, &EMPTY_LEAF, &cfs).expect("valid commitment");
 
         let verification_result = trace_verifier.verify(&trace);
         assert!(matches!(verification_result, VerificationResult::Ok));
@@ -2111,15 +2239,11 @@ mod tests {
         runtime_trace.0[2] =
             make_tile_trace_item_at(3, "main", 2, vec![2], "consumer".to_string(), 1, 999);
 
-        let trace_commitment = TraceCommitment::build(
-            &committed_trace,
-            &EMPTY_LEAF,
-            test_fraud_proof_config(),
-        );
+        let trace_commitment =
+            TraceCommitment::build(&committed_trace, &EMPTY_LEAF, test_fraud_proof_config());
         let cfs = make_producer_dependency_cfs();
         let mut trace_verifier =
-            TraceVerifier::new(trace_commitment, &EMPTY_LEAF, &cfs)
-                .expect("valid commitment");
+            TraceVerifier::new(trace_commitment, &EMPTY_LEAF, &cfs).expect("valid commitment");
 
         let VerificationResult::Fraud(evidence) = trace_verifier.verify(&runtime_trace) else {
             panic!("expected a divergence at the consumer step");
@@ -2147,15 +2271,11 @@ mod tests {
             make_tile_trace_item_at(3, "main", 2, vec![2], "consumer".to_string(), 1, 20),
             make_sequence_end_record(4, "main", vec![]),
         ]);
-        let trace_commitment = TraceCommitment::build(
-            &trace,
-            &EMPTY_LEAF,
-            test_fraud_proof_config(),
-        );
+        let trace_commitment =
+            TraceCommitment::build(&trace, &EMPTY_LEAF, test_fraud_proof_config());
         let cfs = make_top_level_tail_dependency_cfs();
         let mut trace_verifier =
-            TraceVerifier::new(trace_commitment, &EMPTY_LEAF, &cfs)
-                .expect("valid commitment");
+            TraceVerifier::new(trace_commitment, &EMPTY_LEAF, &cfs).expect("valid commitment");
 
         let evidence = trace_verifier
             .terminal_window(&trace)
@@ -2183,15 +2303,14 @@ mod tests {
             id: "producer".to_string(),
             sources: vec![InputBinding::inline()],
         }));
-        main.items
-            .push(SequenceChildItem::RecurTile(RecurTileItem {
-                id: "sweep".to_string(),
-                sources: vec![InputBinding::prior_item_output(0)],
-                chunk: Some(2),
-                output: None,
-                state_is_output: false,
-                carries_state: false,
-            }));
+        main.items.push(SequenceChildItem::RecurTile(RecurTileItem {
+            id: "sweep".to_string(),
+            sources: vec![InputBinding::prior_item_output(0)],
+            chunk: Some(2),
+            output: None,
+            state_is_output: false,
+            carries_state: false,
+        }));
 
         cfs.sequences.push(main);
         cfs
@@ -2224,15 +2343,11 @@ mod tests {
         runtime_trace.0[4] =
             make_tile_trace_item_at(5, "main", 2, vec![2, 2], "sweep".to_string(), 1, 999);
 
-        let trace_commitment = TraceCommitment::build(
-            &committed_trace,
-            &EMPTY_LEAF,
-            test_fraud_proof_config(),
-        );
+        let trace_commitment =
+            TraceCommitment::build(&committed_trace, &EMPTY_LEAF, test_fraud_proof_config());
         let cfs = make_recur_site_cfs();
         let mut trace_verifier =
-            TraceVerifier::new(trace_commitment, &EMPTY_LEAF, &cfs)
-                .expect("valid commitment");
+            TraceVerifier::new(trace_commitment, &EMPTY_LEAF, &cfs).expect("valid commitment");
 
         let VerificationResult::Fraud(evidence) = trace_verifier.verify(&runtime_trace) else {
             panic!("expected a divergence at the second iteration");
@@ -2260,15 +2375,11 @@ mod tests {
         runtime_trace.0[1] =
             make_tile_trace_item_at(2, "main", 1, vec![1], "consumer".to_string(), 1, 999);
 
-        let trace_commitment = TraceCommitment::build(
-            &committed_trace,
-            &EMPTY_LEAF,
-            test_fraud_proof_config(),
-        );
+        let trace_commitment =
+            TraceCommitment::build(&committed_trace, &EMPTY_LEAF, test_fraud_proof_config());
         let cfs = make_top_level_entry_argument_cfs();
         let mut trace_verifier =
-            TraceVerifier::new(trace_commitment, &EMPTY_LEAF, &cfs)
-                .expect("valid commitment");
+            TraceVerifier::new(trace_commitment, &EMPTY_LEAF, &cfs).expect("valid commitment");
 
         let VerificationResult::Fraud(evidence) = trace_verifier.verify(&runtime_trace) else {
             panic!("expected a divergence at the consumer step");
@@ -2312,19 +2423,12 @@ mod tests {
             make_sequence_end_record(5, "main", vec![]),
         ]);
         let cfs = make_producer_dependency_cfs();
-        let trace_commitment = TraceCommitment::build(
-            &honest,
-            &EMPTY_LEAF,
-            test_fraud_proof_config(),
-        );
+        let trace_commitment =
+            TraceCommitment::build(&honest, &EMPTY_LEAF, test_fraud_proof_config());
 
         // Baseline: the honest trace agrees with its own commitment everywhere.
-        let mut honest_verifier = TraceVerifier::new(
-            trace_commitment.clone(),
-            &EMPTY_LEAF,
-            &cfs,
-        )
-        .expect("valid commitment");
+        let mut honest_verifier = TraceVerifier::new(trace_commitment.clone(), &EMPTY_LEAF, &cfs)
+            .expect("valid commitment");
         assert!(matches!(
             honest_verifier.verify(&honest),
             VerificationResult::Ok
@@ -2345,8 +2449,7 @@ mod tests {
         );
 
         let mut forged_verifier =
-            TraceVerifier::new(trace_commitment, &EMPTY_LEAF, &cfs)
-                .expect("valid commitment");
+            TraceVerifier::new(trace_commitment, &EMPTY_LEAF, &cfs).expect("valid commitment");
         let VerificationResult::Fraud(evidence) = forged_verifier.verify(&forged) else {
             panic!(
                 "expected the tampered exec_index to manufacture a divergence; \
@@ -2390,15 +2493,11 @@ mod tests {
         runtime_trace.0[2] =
             make_tile_trace_item_at(3, "inner", 1, vec![1, 1], "inner_tile".to_string(), 1, 999);
 
-        let trace_commitment = TraceCommitment::build(
-            &committed_trace,
-            &EMPTY_LEAF,
-            test_fraud_proof_config(),
-        );
+        let trace_commitment =
+            TraceCommitment::build(&committed_trace, &EMPTY_LEAF, test_fraud_proof_config());
         let cfs = make_sequence_input_dependency_cfs();
         let mut trace_verifier =
-            TraceVerifier::new(trace_commitment, &EMPTY_LEAF, &cfs)
-                .expect("valid commitment");
+            TraceVerifier::new(trace_commitment, &EMPTY_LEAF, &cfs).expect("valid commitment");
 
         let VerificationResult::Fraud(evidence) = trace_verifier.verify(&runtime_trace) else {
             panic!("expected a divergence at the inner tile");
@@ -2428,15 +2527,11 @@ mod tests {
         runtime_trace.0[1] =
             make_tile_trace_item_at(2, "main", 1, vec![1], "consumer".to_string(), 1, 999);
 
-        let trace_commitment = TraceCommitment::build(
-            &committed_trace,
-            &EMPTY_LEAF,
-            test_fraud_proof_config(),
-        );
+        let trace_commitment =
+            TraceCommitment::build(&committed_trace, &EMPTY_LEAF, test_fraud_proof_config());
         let cfs = make_root_sequence_scope_cfs();
         let mut trace_verifier =
-            TraceVerifier::new(trace_commitment, &EMPTY_LEAF, &cfs)
-                .expect("valid commitment");
+            TraceVerifier::new(trace_commitment, &EMPTY_LEAF, &cfs).expect("valid commitment");
 
         let _ = trace_verifier.verify(&runtime_trace);
     }
@@ -2456,15 +2551,11 @@ mod tests {
             make_tile_trace_item_at(3, "main", 3, vec![3], "tail".to_string(), 1, 30),
             make_sequence_end_record(4, "main", vec![]),
         ]);
-        let trace_commitment = TraceCommitment::build(
-            &committed_trace,
-            &EMPTY_LEAF,
-            test_fraud_proof_config(),
-        );
+        let trace_commitment =
+            TraceCommitment::build(&committed_trace, &EMPTY_LEAF, test_fraud_proof_config());
         let cfs = make_producer_dependency_cfs();
         let mut trace_verifier =
-            TraceVerifier::new(trace_commitment, &EMPTY_LEAF, &cfs)
-                .expect("valid commitment");
+            TraceVerifier::new(trace_commitment, &EMPTY_LEAF, &cfs).expect("valid commitment");
 
         let _ = trace_verifier.verify(&runtime_trace);
     }
@@ -2515,5 +2606,213 @@ mod frontier_root_tests {
             );
             frontier.append(leaf(i));
         }
+    }
+}
+
+/// Append-only authentication tree with cached partial subtrees. Updating and
+/// witnessing touch only the 32-level path, never the execution prefix.
+/// BridgeTree remains the commitment implementation; its bridge fusion is not
+/// suitable for repeatedly witnessing old leaves when every leaf is marked.
+pub struct MemoryWitnessTree {
+    levels: Vec<Vec<[u8; 32]>>,
+}
+impl MemoryWitnessTree {
+    pub fn new() -> Self {
+        Self {
+            levels: (0..=32).map(|_| Vec::new()).collect(),
+        }
+    }
+    pub fn append(&mut self, leaf: Bytes) -> bool {
+        if self.levels[0].len() as u64 == 1u64 << 32 {
+            return false;
+        }
+        let mut position = self.levels[0].len();
+        self.levels[0].push(leaf.0.as_slice().try_into().expect("32-byte leaf"));
+        for level in 0..32 {
+            let left_index = position & !1;
+            let left = self.levels[level][left_index];
+            let right = self.levels[level]
+                .get(left_index + 1)
+                .copied()
+                .unwrap_or(EMPTY_ROOTS[level]);
+            let mut bytes = [0u8; 65];
+            bytes[0] = level as u8;
+            bytes[1..33].copy_from_slice(&left);
+            bytes[33..].copy_from_slice(&right);
+            let parent = Sha256::digest(bytes).into();
+            position >>= 1;
+            if position == self.levels[level + 1].len() {
+                self.levels[level + 1].push(parent);
+            } else {
+                self.levels[level + 1][position] = parent;
+            }
+        }
+        true
+    }
+    pub fn witness(&self, position: u64) -> Option<Vec<Bytes>> {
+        if position >= self.levels[0].len() as u64 {
+            return None;
+        }
+        Some(
+            (0..32)
+                .map(|level| {
+                    let sibling = ((position >> level) ^ 1) as usize;
+                    Bytes(
+                        self.levels[level]
+                            .get(sibling)
+                            .copied()
+                            .unwrap_or(EMPTY_ROOTS[level])
+                            .to_vec(),
+                    )
+                })
+                .collect(),
+        )
+    }
+}
+
+#[cfg(test)]
+mod memory_witness_tests {
+    use super::*;
+    #[test]
+    fn cached_paths_match_bridge_paths_across_partial_subtrees() {
+        let mut cached = MemoryWitnessTree::new();
+        let mut bridges = TraceTree::new(1);
+        for index in 0..1025usize {
+            let leaf = Bytes(Sha256::digest(index.to_le_bytes()).to_vec());
+            assert!(cached.append(leaf.clone()));
+            assert!(bridges.append(leaf));
+            bridges.mark();
+            assert_eq!(
+                cached.levels[32][0].as_slice(),
+                bridges.root(0).unwrap().0.as_slice()
+            );
+            if index < 128 || index.is_power_of_two() || (index + 1).is_power_of_two() {
+                for position in [0, index / 2, index] {
+                    assert_eq!(
+                        cached.witness(position as u64).unwrap(),
+                        bridges.witness(Position::from(position as u64), 0).unwrap()
+                    );
+                }
+            }
+            assert!(cached.witness(index as u64 + 1).is_none());
+        }
+    }
+}
+
+/// Source records indexed by active frame, with an incrementally maintained
+/// authentication tree. Contains metadata/hashes, never event payloads.
+pub struct SourceTracker {
+    tree: MemoryWitnessTree,
+    next: usize,
+    frames: HashMap<CfsCoordinates, (usize, StepRecord)>,
+    producers: HashMap<(usize, CfsCoordinates), (usize, StepRecord)>,
+}
+impl SourceTracker {
+    pub fn new() -> Self {
+        let mut tree = MemoryWitnessTree::new();
+        assert!(tree.append(Bytes(EMPTY_LEAF.to_vec())));
+        Self {
+            tree,
+            next: 0,
+            frames: HashMap::new(),
+            producers: HashMap::new(),
+        }
+    }
+    pub fn witnesses(
+        &self,
+        step: &StepRecord,
+        cfs: &CfsCursor,
+    ) -> HashMap<(u64, StepRecord), StepRecordWitness> {
+        let mut result = HashMap::new();
+        if step.input_source_commitment().is_none()
+            || step.coordinates().is_empty()
+            || cfs
+                .try_get_recur_iteration_coordinates(step.coordinates())
+                .is_some()
+        {
+            return result;
+        }
+        let item = cfs
+            .try_get_item(step.coordinates())
+            .expect("source CFS item");
+        let mut bindings = Vec::new();
+        for input in item.inputs() {
+            flatten_binding(input, &mut bindings);
+        }
+        let (frame, item_coordinate) = sequence_coordinates(step).expect("step frame");
+        for binding in bindings {
+            let source = match binding {
+                InputBinding::Direct(InputSource::Inline) => continue,
+                InputBinding::EntryArgument { .. } => self
+                    .frames
+                    .get(&CfsCoordinates(vec![]))
+                    .expect("entry source"),
+                InputBinding::SequenceScope { .. } => {
+                    self.frames.get(&frame).expect("scope source")
+                }
+                InputBinding::PriorItemOutput {
+                    intra_sequence_item_index,
+                    ..
+                } => {
+                    let coordinate = CfsCoordinate::try_from(*intra_sequence_item_index)
+                        .expect("source coordinate")
+                        + FIRST_COORDINATE;
+                    assert!(coordinate < item_coordinate);
+                    let mut source_coords = frame.clone();
+                    source_coords.push(coordinate);
+                    let frame_start = self.frames.get(&frame).expect("source frame").0;
+                    let source = self
+                        .producers
+                        .get(&(frame_start, source_coords.clone()))
+                        .expect("prior producer");
+                    assert!(record_produces_item(
+                        &source.1,
+                        cfs.try_get_item(&source_coords).expect("producer CFS")
+                    ));
+                    source
+                }
+                _ => panic!("unsupported source binding"),
+            };
+            let position = Position::from(source.0 as u64 + 1);
+            let path = self
+                .tree
+                .witness(u64::from(position))
+                .expect("source authentication path");
+            result.insert(
+                (step.exec_index, source.1.clone()),
+                StepRecordWitness {
+                    position: u64::from(position),
+                    path_elems: path.iter().map(|h| to_node_hash(&h.0)).collect(),
+                },
+            );
+        }
+        result
+    }
+    pub fn append(&mut self, step: &StepRecord) {
+        assert!(
+            self.tree.append(Bytes(step.hash())),
+            "trace capacity exceeded"
+        );
+        if matches!(
+            &step.kind,
+            StepKind::ProgramStart(_) | StepKind::SequenceStart { .. }
+        ) {
+            self.frames
+                .insert(step.coordinates.clone(), (self.next, step.clone()));
+        }
+        if matches!(
+            &step.kind,
+            StepKind::Exec(_) | StepKind::SequenceEnd { .. } | StepKind::RecurEnd(_)
+        ) {
+            let coords = step.coordinates().opened();
+            if let Some((frame, _)) = coords.try_parent() {
+                if let Some((start, _)) = self.frames.get(&frame) {
+                    self.producers
+                        .entry((*start, coords))
+                        .or_insert((self.next, step.clone()));
+                }
+            }
+        }
+        self.next += 1;
     }
 }

@@ -4,6 +4,7 @@
 
 mod chain;
 mod commands;
+mod live_commitment;
 mod program;
 mod runtime_env;
 mod utils;
@@ -23,7 +24,51 @@ enum Cli {
 }
 
 #[derive(Parser)]
+enum TraceCommand {
+    /// Commit an existing complete trace without executing the program again.
+    Commit {
+        #[arg(long)]
+        project: std::path::PathBuf,
+        #[arg(long)]
+        trace: std::path::PathBuf,
+        #[arg(long)]
+        input: String,
+        #[arg(long)]
+        input_manifest: String,
+        #[arg(long)]
+        output: std::path::PathBuf,
+        #[arg(long, default_value_t = 2)]
+        fraud_proof_window_size: usize,
+        #[arg(long, value_enum, default_value = "binary")]
+        trace_format: TraceFormat,
+    },
+    Audit {
+        #[arg(long)]
+        project: std::path::PathBuf,
+        #[arg(long)]
+        trace: std::path::PathBuf,
+        #[arg(long)]
+        input: String,
+        #[arg(long)]
+        input_manifest: String,
+        #[arg(long)]
+        commitment: String,
+        #[arg(long)]
+        proof_output: std::path::PathBuf,
+        #[arg(long)]
+        report: std::path::PathBuf,
+        #[arg(long, value_enum, default_value = "binary")]
+        trace_format: TraceFormat,
+    },
+}
+
+#[derive(Parser)]
 enum Commands {
+    /// Audit a recorded execution without running the stage again.
+    Trace {
+        #[command(subcommand)]
+        command: TraceCommand,
+    },
     /// Build tiles and generate schemas
     Build {
         /// Backend to use for compilation
@@ -192,7 +237,7 @@ enum Commands {
         #[arg(long = "input-manifest")]
         input_manifest: Option<String>,
 
-        /// Write trace to file (mutually exclusive with --audit)
+        /// Execute and write a commitment; raw traces require --save-trace
         #[arg(long, conflicts_with = "audit", requires = "fraud_proof_config")]
         commit: Option<String>,
 
@@ -222,9 +267,17 @@ enum Commands {
         #[arg(long = "fraud-step", requires = "commit")]
         fraud_step: Option<commands::fraud::FraudTarget>,
 
-        /// Read and verify trace from file (mutually exclusive with --commit)
+        /// Audit events live against this commitment; stop at divergence and prove it.
         #[arg(long, conflicts_with = "commit")]
         audit: Option<String>,
+
+        /// Verified fault receipt destination (default: run artifacts/fault.receipt).
+        #[arg(long, requires = "audit")]
+        proof_output: Option<std::path::PathBuf>,
+
+        /// Audit result report (default: run artifacts/audit.json).
+        #[arg(long, requires = "audit")]
+        report: Option<std::path::PathBuf>,
 
         /// Run without authenticated storage: tile outputs are passed as plain
         /// Rust values, nothing is hashed or stored between tiles, and no trace
@@ -243,7 +296,11 @@ enum Commands {
         #[arg(long = "show-output")]
         show_output: bool,
 
-        /// Trace transport format used between the user process and Raster CLI
+        /// Retain the raw trace alongside a live-generated commitment.
+        #[arg(long, requires = "commit", conflicts_with = "no_auth")]
+        save_trace: bool,
+
+        /// Raw trace format, used when a trace is recorded (including --save-trace).
         #[arg(long = "trace-format", value_enum, default_value = "binary")]
         trace_format: TraceFormat,
 
@@ -310,10 +367,12 @@ enum ChainCommand {
         #[arg(long = "show-output")]
         show_output: bool,
 
-        /// Trace transport format used between each stage process and the
-        /// Raster CLI. Transport only: every stage's commitment is built from
-        /// the decoded trace, so this changes no commitment and no audit.
-        /// Ignored under `--no-auth`, which records no trace at all.
+        /// Retain each stage's raw trace for later auditing or debugging.
+        #[arg(long, conflicts_with = "no_auth")]
+        save_trace: bool,
+
+        /// Saved trace format; only used with --save-trace.
+        /// The commitment is built live and is independent of this format.
         #[arg(long = "trace-format", value_enum, default_value = "binary")]
         trace_format: TraceFormat,
     },
@@ -432,6 +491,48 @@ fn try_main() -> Result<()> {
 
     match cmd {
         Commands::Build { backend, tile } => commands::build(backend, tile),
+        Commands::Trace {
+            command:
+                TraceCommand::Commit {
+                    project,
+                    trace,
+                    input,
+                    input_manifest,
+                    output,
+                    fraud_proof_window_size,
+                    trace_format,
+                },
+        } => commands::audit::commit_recorded(
+            project,
+            trace,
+            &input,
+            &input_manifest,
+            output,
+            fraud_proof_window_size,
+            trace_format,
+        ),
+        Commands::Trace {
+            command:
+                TraceCommand::Audit {
+                    project,
+                    trace,
+                    input,
+                    input_manifest,
+                    commitment,
+                    proof_output,
+                    report,
+                    trace_format,
+                },
+        } => commands::audit::audit(
+            project,
+            trace,
+            &input,
+            &input_manifest,
+            &commitment,
+            proof_output,
+            report,
+            trace_format,
+        ),
         Commands::RunTile {
             backend,
             tile,
@@ -468,6 +569,7 @@ fn try_main() -> Result<()> {
                 run_dir,
                 show_output,
                 trace_format,
+                save_trace,
             } => chain::run(
                 chain.as_deref(),
                 fraud_proof_window_size,
@@ -476,6 +578,7 @@ fn try_main() -> Result<()> {
                 run_dir.as_deref(),
                 show_output,
                 trace_format,
+                save_trace,
             ),
             ChainCommand::Audit {
                 chain,
@@ -504,10 +607,13 @@ fn try_main() -> Result<()> {
             fraud_proof_config,
             fraud_step,
             audit,
+            proof_output,
+            report,
             no_auth,
             verbose,
             show_output,
             trace_format,
+            save_trace,
             features,
             all_features,
             no_default_features,
@@ -519,10 +625,13 @@ fn try_main() -> Result<()> {
             fraud_proof_config,
             fraud_step.as_ref(),
             audit.as_deref(),
+            proof_output.as_deref(),
+            report.as_deref(),
             no_auth,
             verbose,
             show_output,
             trace_format,
+            save_trace,
             &features,
             all_features,
             no_default_features,

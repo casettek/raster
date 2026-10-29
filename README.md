@@ -42,6 +42,16 @@ Raster is organized as a Rust workspace with the following crates:
 cargo install raster-cli
 ```
 
+Native builds launched by `cargo raster run` and `cargo raster chain run`
+automatically configure Windows MSVC with `/DNOMINMAX /std:c++20 /EHsc` for
+the RISC Zero host dependencies. Existing compiler flags are retained, with
+these required flags appended. Native Windows builds also default
+`RISC0_SKIP_BUILD` to `1` (unless explicitly set), since replay does not need
+RISC-V proof guests. Executable names use the host's suffix (`.exe` on Windows).
+macOS and Linux retain their existing build environment. Windows still requires
+the Visual Studio C++ build tools. This setup applies to child builds launched
+by the installed CLI, not to bootstrapping the CLI itself with Cargo.
+
 ## Quick Start
 
 ### 1. Initialize a new project
@@ -136,3 +146,53 @@ v0 - Initial implementation in progress. Core functionality includes:
 
 
 at your option.
+
+### Live commitments and trace retention
+
+`cargo raster run --commit commit.bin --fraud-proof-window-size 128` builds the
+commitment as the program emits events. Authenticated `cargo raster chain run`
+uses the same path for every stage. Add the usual `--input` and `--input-manifest`
+arguments when the program needs them. General window defaults are unchanged.
+
+These runs keep working objects, indexes, and fingerprint blocks in RAM; they do
+not spill to disk. Memory use can grow with the program. The finished commitment
+is published only after successful execution. Normal output artifacts are still
+written. No raw trace is saved by default.
+
+Add `--save-trace` to retain `trace.bin` (or `--trace-format json` for
+`trace.ndjson`) for debugging, `trace commit`, or `trace audit`. Recording a trace
+still builds the commitment live. Plain `run` and deliberate fraud injection retain their recorded-execution paths. Without a saved
+trace, later proof generation requires executing the program again.
+
+### Live audit and fault proof
+
+Commitment generation and audit must use matching Raster versions. The compact
+coordinate index and explicit fallible-result selections adopted from main change
+execution commitments and proof inputs. Regenerate commitments and program locks
+from source when upgrading from the earlier index/implicit-selection implementation;
+do not reuse its disputed commitments with the new prover. Existing receipts must
+be verified with their matching proof-program version.
+
+Live recording and proof preparation use main's compact in-memory coordinate
+index directly. Saved-trace workflows may still use disk storage for other data,
+but their coordinate indexes also reside in RAM.
+
+From a Raster program directory, run:
+
+```sh
+cargo raster run --input input.json --input-manifest input_manifest.json \
+  --audit disputed.bin --proof-output fault.receipt --report audit.json
+```
+
+The supplied commitment determines the window size. Execution compares each
+step as it happens and stops at the first detected mismatch; Raster then proves
+and verifies that window. It creates neither another commitment nor a raw trace.
+The report distinguishes `proved` from `no-fault`. An honest audit runs through
+the final boundary and checks the complete length. Failed or interrupted native
+execution is never treated as divergence.
+
+Audit working state stays in RAM and may grow with the program. A temporary
+proof-evidence artifact connects native execution to the prover; proof generation
+may use its normal working files. Proof and report destinations default to the
+run artifact directory. Saved-trace commands remain available for existing files,
+but live audit does not invoke them. Retrying a failed live proof reruns the audit.

@@ -1,4 +1,6 @@
+pub mod audit;
 pub mod binary;
+pub mod commitment;
 pub mod json;
 
 use raster_core::trace::TraceEvent;
