@@ -4,7 +4,8 @@ Status: **Phases 1–3 implemented** (Phases 1–2 on 2026-10-28, Phase 3 on 202
 `TransitionState::TerminalMatch`; the host `WindowProver`; both forms of challenge (`chain
 challenge`, `chain challenge-verify`); and the defence (`chain defend`, `chain defend-verify`, the
 `defence` guest), with the trace's end tied to the commitment's. Phase 4 (the timeout) is
-specified, not built. See §Implementation status.
+specified, not built, and deferred to [`settlement-layer.md`](./settlement-layer.md). See
+§Implementation status.
 
 Parties: the **claimer** publishes a chain commitment, a **challenger** challenges it, a
 **defender** — the claimer, or anyone — defends against a disputed challenge.
@@ -497,6 +498,16 @@ step 3 can move tile ids).
 
 ### Phase 4 — the timeout, specified not built
 
+Moved to its own deferred proposal, [`settlement-layer.md`](./settlement-layer.md) (2026-10-29). It
+covers:
+- the decision rule as a state machine;
+- `T`, sized from the measured defence cost;
+- bonds and data availability, including the defender's public bundle;
+- receipt verification where the settlement runs;
+- defender liveness, which depends on open question 6.
+
+The summary below stays for context.
+
 The decision rule, for a settlement layer to implement: an admitted challenge with no verified
 `DefenceJournal` before `T` condemns the chain, `challenged_stage` to blame; a verified one
 dismisses the challenge and forfeits the challenger's bond. Clock, bonds and data availability of
@@ -721,7 +732,7 @@ Phases 2–3 depend on Phase 1 and on nothing else unbuilt.
   moved, as raster-core edits do. There was no baseline re-lock, so whether this phase moved them is
   not established.
 
-**Phase 4** — specified, not built.
+**Phase 4** — specified, not built; deferred to [`settlement-layer.md`](./settlement-layer.md).
 
 ## Verification
 
@@ -746,12 +757,57 @@ Phases 2–3 depend on Phase 1 and on nothing else unbuilt.
   manifest are each rejected by the aggregation, asserting the check that fired.
 - **Admission** *(done, unit tests)*. `claimed_output == s.output_payload_commitment`, a unit-output stage, and a
   malformed header are inadmissible.
-- **Anyone defends.** A defence produced by a party holding only the public artifacts verifies
-  identically to the claimer's.
-- **Recur stage.** A challenge on iris `parity-gemma`'s `prefill_range` stage, whose terminal
-  window opens mid-loop, can be defended both ways (S3 closed by `window-seed-reconstruction`).
-- **Byte-identity.** Honest `chain run` commitments and single-program `commit.bin`s are unchanged
-  by every phase.
+- **Anyone defends** *(partly holds, 2026-10-29; see open question 6)*. A defence produced by a
+  party holding only the public artifacts verifies identically to the claimer's.
+
+  **The files are enough.** On `chain-example`, the claimer's run directory was hidden and the
+  defence came from a bundle of:
+  - `chain-commitment`;
+  - `challenge.bin`, and `H_C`'s `commit.bin`;
+  - the stage's `input_manifest.json`;
+  - its input data: the chain's own external files, or the producer's `output.bin` and `.rindex`
+    for a chained stage;
+  - an `input.json` written by the defender, since it is not committed and holds absolute paths.
+
+  From the same checkout path, `aggregate` (a chained stage) was defended and verified that way,
+  with the same chain digest and `H_C` as the claimer's.
+
+  **The checkout path is not.** From a second worktree (`/tmp/defender-raster`, same commit), the
+  re-run and the walk succeed and find the mislabel. Proving then stops on `program identity
+  drift`, on both `normalize` and `aggregate`. The tile ELFs embed the checkout path of `raster`
+  and `raster-core` sources (panic locations), so the same source built elsewhere gets other
+  image ids and another `program_commitment`. A defender who re-locks would fail `defend`'s
+  `AnotherProgram` check instead.
+- **Recur stage** *(done, 2026-10-29)*. A challenge on iris `prefill_range_l0` (2043 items, window
+  128), whose terminal window opens mid-loop, can be defended both ways (S3 closed by
+  `window-seed-reconstruction`).
+  - In dev mode, every case `defend-verify`s:
+    - `--forge claimed-output`: mislabelled, attesting `b20e1a1e…`;
+    - `--forge item`: refuted;
+    - `--forge pad` (2044 items): refuted;
+    - `--forge truncate` (2042 items): refuted.
+
+    The true challenge gets "no defence exists". Each defence takes about 25 s.
+  - **Real GPU proofs** (RTX 3070, 2^18-cycle segments):
+    - **Mislabel:** 1218 segments in 2359 s for the window. The defence guest took one
+      segment (131,072 cycles) in 25 s. The real transition receipt was accepted by `prove()`
+      as an assumption, so the manual resolve path is not needed. `defend-verify` passed with
+      dev mode off.
+    - **Refutation of a padded `H_C`** (2044 items; the length rule): 1218 segments in 2421 s,
+      and the defence guest one segment in 26 s. `defend-verify` passed with dev mode off.
+    - A dev-mode defence is refused with dev mode off ("proof is invalid").
+- **Byte-identity** *(done, 2026-10-29)*. Honest `chain run` commitments and single-program
+  `commit.bin`s are unchanged by every phase.
+
+  At `cdab597` (before Phase 1) and at `8c81c47` (Phase 3), built in the same checkout, these are
+  byte-identical:
+  - `chain-example`'s `chain-commitment`, and each stage's `commit.bin`, `output.bin` and
+    `input_manifest.json`;
+  - `hello-tiles`' `commit.bin` (window 2);
+  - all four freshly built `Raster.lock`s.
+
+  So no phase moved a tile image id. The `chain-example` lock changes seen after Phase 3 were
+  committed locks that were already stale.
 
 ## Decisions (2026-10-28)
 
@@ -837,3 +893,10 @@ At the protocol window, the same stage end to end (`chain challenge` on the tamp
    that is not terminal, or a terminal window whose last item is not `ProgramEnd`, ends `Finished`
    (a refutation: `H_C` misstates the trace's length) — and `TraceVerifier` yields that window.
    Reproduce first with a padded and a truncated `H_C`.
+6. **A defender must build at the claimer's checkout path** (found 2026-10-29, §Verification,
+   "Anyone defends"). Tile image ids, and with them `program_commitment`, depend on the absolute
+   source paths compiled into the tile ELFs. So "anyone may defend" holds only for a defender
+   whose build reproduces the claimer's paths. The fix belongs to program identity, not to this
+   protocol. Candidates are path-independent tile builds (`--remap-path-prefix` for the
+   checkout and `$CARGO_HOME`, or risc0's Docker build) and a recorded, rebuildable build
+   environment. Either changes every `program_commitment` once.
