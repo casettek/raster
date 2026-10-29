@@ -5611,41 +5611,66 @@ fn a_tile_reading_the_value_inside_an_err_is_rejected() {
     );
 }
 
-/// How a window ends at its last item (`fraud_proof::window_end`): the two
-/// endings come from disjoint conditions, and a matching window ends only if
-/// it is the trace's end.
+/// How a window ends at its last item (`fraud_proof::window_end`): the endings
+/// come from disjoint conditions, a matching window ends only where the trace
+/// or the commitment ends, and when those two disagree the commitment is the
+/// one refuted.
 mod window_end {
     use crate::fraud_proof::window_end;
     use raster_core::transition::TransitionState;
 
-    /// A divergence is the fraud being proven — terminal or not.
+    /// A divergence is the fraud being proven — wherever the window sits.
     #[test]
     fn a_diverging_last_item_ends_finished() {
         for window_is_terminal in [false, true] {
-            assert!(matches!(
-                window_end(true, window_is_terminal),
-                TransitionState::Finished
-            ));
+            for ends_program in [false, true] {
+                assert!(matches!(
+                    window_end(true, window_is_terminal, ends_program),
+                    TransitionState::Finished
+                ));
+            }
         }
     }
 
-    /// The stage-challenge receipt: the challenger's own honest trace, proven
-    /// at its end against its own commitment. Every item matches, so it can
-    /// never be `Finished` — and before `TerminalMatch` it could not be proven
-    /// at all.
+    /// The mislabel defence: the challenger's own honest trace, proven at its
+    /// end against its own commitment. Every item matches, so it can never be
+    /// `Finished` — and before `TerminalMatch` it could not be proven at all.
     #[test]
-    fn a_matching_terminal_window_ends_terminal_match() {
+    fn a_matching_terminal_window_ending_the_program_ends_terminal_match() {
         assert!(matches!(
-            window_end(false, true),
+            window_end(false, true, true),
             TransitionState::TerminalMatch
         ));
     }
 
-    /// Matching anywhere but the trace's end attests nothing usable, and
-    /// proves no fraud: refused, as before.
+    /// A truncated commitment: its terminal window matches the honest items,
+    /// but the honest program has not ended there. Before, this ended
+    /// `TerminalMatch` with the output still `Pending` — an attestation no
+    /// defence could use, leaving an honest claimer undefended.
+    #[test]
+    fn a_terminal_window_that_does_not_end_the_program_ends_finished() {
+        assert!(matches!(
+            window_end(false, true, false),
+            TransitionState::Finished
+        ));
+    }
+
+    /// A padded commitment: the honest program ends inside it, at a window
+    /// that is not the commitment's last. Before, this was refused, and a
+    /// padded commitment had no refutation.
+    #[test]
+    fn a_program_end_short_of_the_commitment_end_ends_finished() {
+        assert!(matches!(
+            window_end(false, false, true),
+            TransitionState::Finished
+        ));
+    }
+
+    /// Matching where neither the trace nor the commitment ends attests
+    /// nothing usable, and proves no fraud: refused, as before.
     #[test]
     #[should_panic(expected = "final step must diverge from the commitment")]
-    fn a_matching_window_that_is_not_terminal_is_refused() {
-        let _ = window_end(false, false);
+    fn a_matching_window_ending_nothing_is_refused() {
+        let _ = window_end(false, false, false);
     }
 }

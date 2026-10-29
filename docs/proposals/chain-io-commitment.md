@@ -1,7 +1,9 @@
 # Proposal: `chain-io-commitment` — an I/O-only chain commitment, with the trace as a dispute artifact
 
 Status: **partly implemented** (2026-08-27) — §1's checkpoint narrowing and the journal work
-it rests on have landed; §3's dispute protocol has not. See §Implementation status.
+it rests on have landed. §3's dispute protocol landed on 2026-10-29 under the cheap-challenge rule
+instead of §3's admission rule ([`stage-challenge.md`](./stage-challenge.md)). The settlement clock
+is still not built. See §Implementation status.
 
 Companion to:
 - [`chain-fraud-proof.md`](./chain-fraud-proof.md) (implemented) — supplies the window/commitment
@@ -659,7 +661,7 @@ Landed 2026-08-27 — phases 1–4 of the plan, i.e. everything except §3's dis
 | `chain audit` commitment-binding check | **removed** — no checkpoint field left to compare |
 | `detect_execution_fraud` → `detect_output_fraud` | **landed.** Cheap unauthenticated re-run, output-hash comparison |
 | `ChainFaultKind::Execution` | **removed**, with the replacement below |
-| §3 challenge/response, `StageChallenge`, `ChallengeFraudJournal` | **not built.** Inert without a settlement clock |
+| §3 challenge/response, `StageChallenge`, `ChallengeFraudJournal` | **built under the cheap-challenge rule** by [`stage-challenge.md`](./stage-challenge.md) (2026-10-29): `StageChallenge` with no proof attached, and a defence (`DefenceJournal`, `chain defend`) in place of the challenger's receipt. The settlement clock is still not built |
 
 **Two decisions the implementation forced, neither in the original design.**
 

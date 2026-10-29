@@ -7,7 +7,7 @@
 //! `docs/proposals/chain-fraud-proof.md`.
 
 use std::collections::BTreeMap;
-use std::string::String;
+use std::string::{String, ToString};
 use std::vec::Vec;
 
 use serde::{Deserialize, Serialize};
@@ -256,4 +256,433 @@ pub struct ChainFraudInput {
     pub chain_commitment_bytes: Vec<u8>,
     pub faulty_stage: u32,
     pub evidence: ChainFraudEvidence,
+}
+
+// ---------------------------------------------------------------------------
+// The defence (`docs/proposals/stage-challenge.md` §Phase 3)
+// ---------------------------------------------------------------------------
+
+/// Which defence dismissed a disputed challenge. Read from the transition
+/// journal's final state, never offered by the defender: `Finished` is a
+/// refutation, `TerminalMatch` a mislabel proof, and no other state is either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DefenceReason {
+    /// `H_C` is not an honest, complete execution of the stage: a window of
+    /// it diverges from honest execution, or it misstates the trace's length.
+    Refuted,
+    /// `H_C` is honest, but ends in an output other than `claimed_output`.
+    Mislabelled,
+}
+
+/// Everything the defence guest reads from the host. The transition receipt
+/// whose journal this carries must be supplied to the prover as an assumption.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct DefenceInput {
+    /// The challenge exactly as posted (`postcard(StageChallenge)`); hashed
+    /// into `challenge_digest` before it is decoded, so the journal names
+    /// the bytes it checked.
+    #[serde(with = "serde_bytes")]
+    pub challenge_bytes: Vec<u8>,
+    pub transition_journal: crate::transition::TransitionJournal,
+    /// The image id the transition journal is verified against.
+    #[serde(with = "serde_bytes")]
+    pub transition_image_id: Vec<u8>,
+}
+
+/// The defence guest's journal: *"challenge `challenge_digest`, against stage
+/// `challenged_stage` of chain `chain_commitment_digest`, is false."*
+///
+/// Every field is computed or checked in the guest ([`defend`]). The inner
+/// image ids are committed for the relying party to pin against known-good
+/// values, as `ChainFraudJournal` does: the guest guarantees they are what it
+/// verified against, not that they are honest guests.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DefenceJournal {
+    /// `sha256(postcard(StageChallenge))` — which challenge this answers.
+    pub challenge_digest: [u8; 32],
+    /// `sha256(challenge.chain_commitment_bytes)` — the chain it defends.
+    pub chain_commitment_digest: [u8; 32],
+    pub challenged_stage: u32,
+    /// `H_C`'s digest, the commitment the window was proven against.
+    #[serde(with = "serde_bytes")]
+    pub trace_commitment: Vec<u8>,
+    pub reason: DefenceReason,
+    /// `X`, the output honest execution of `H_C` ends in: `Some` exactly for
+    /// [`DefenceReason::Mislabelled`], and never the challenge's
+    /// `claimed_output`.
+    pub attested_output: Option<Vec<u8>>,
+    #[serde(with = "serde_bytes")]
+    pub transition_image_id: Vec<u8>,
+    /// The authorization guest the window's input manifest was verified
+    /// against. Pinned like the transition guest's: the manifest equality
+    /// below is only as good as the guest that produced the manifest journal.
+    #[serde(with = "serde_bytes")]
+    pub authorization_image_id: Vec<u8>,
+}
+
+/// Why a transition journal does not defend against a challenge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DefenceRefusal {
+    UndecodableChallenge(String),
+    UndecodableChainCommitment(String),
+    StageOutOfRange { stage: u32, stages: usize },
+    /// The journal names a transition image id other than the one it was
+    /// verified against: its earlier steps were checked by another guest.
+    TransitionImageIdMismatch,
+    /// The window was proven against a commitment other than `H_C`.
+    AnotherTraceCommitment,
+    /// The window executes a program other than the challenged stage's.
+    AnotherProgram,
+    /// The window executes on inputs other than the challenged stage's.
+    AnotherInputManifest,
+    /// The window has not ended (`Init` or `Next`).
+    WindowNotEnded,
+    /// A `TerminalMatch` window that is not terminal — unreachable from an
+    /// honest transition guest, checked so the reason never rests on it.
+    NotTerminal,
+    /// A mislabel proof whose output is not `Established`.
+    OutputNotEstablished,
+    /// A mislabel proof ending in the claimed output: `H_C` is honest and the
+    /// challenger labelled it correctly, so this window confirms the challenge
+    /// rather than dismissing it.
+    OutputIsTheClaimed,
+}
+
+impl core::fmt::Display for DefenceRefusal {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::UndecodableChallenge(e) => write!(f, "the challenge does not decode: {e}"),
+            Self::UndecodableChainCommitment(e) => {
+                write!(f, "the challenge's chain commitment does not decode: {e}")
+            }
+            Self::StageOutOfRange { stage, stages } => {
+                write!(f, "the challenge names stage {stage} of a {stages}-stage chain")
+            }
+            Self::TransitionImageIdMismatch => write!(
+                f,
+                "the transition journal names a different transition image id than it was \
+                 verified against"
+            ),
+            Self::AnotherTraceCommitment => {
+                write!(f, "the window was proven against another trace commitment, not H_C")
+            }
+            Self::AnotherProgram => {
+                write!(f, "the window executes another program than the challenged stage's")
+            }
+            Self::AnotherInputManifest => {
+                write!(f, "the window executes on other inputs than the challenged stage's")
+            }
+            Self::WindowNotEnded => write!(f, "the window has not ended"),
+            Self::NotTerminal => write!(f, "a TerminalMatch window that is not terminal"),
+            Self::OutputNotEstablished => {
+                write!(f, "the mislabel proof establishes no output")
+            }
+            Self::OutputIsTheClaimed => write!(
+                f,
+                "H_C ends in the claimed output: the challenge is true, and no defence exists"
+            ),
+        }
+    }
+}
+
+/// Check a proven transition window against a posted challenge, and build the
+/// journal that dismisses it. The defence guest's whole decision — run by the
+/// guest after verifying the window's receipt, and by the host before proving,
+/// so the two cannot disagree.
+///
+/// Common to both defences: the window was proven against `H_C`, on the
+/// challenged stage's program and committed inputs. Those equalities are what
+/// make the window *about this challenge*: a refutation of another commitment
+/// says nothing about `H_C`, and an honest output of another program or input
+/// says nothing about this stage. Then by the window's final state:
+/// - `Finished` — a refutation: `H_C` is not an honest, complete execution.
+/// - `TerminalMatch` — a mislabel proof: honest execution of `H_C` ends in an
+///   established output `X`, and `X` is not `claimed_output`.
+pub fn defend(input: &DefenceInput) -> Result<DefenceJournal, DefenceRefusal> {
+    use crate::transition::{OutputAuthorization, TransitionState};
+
+    let challenge_digest: [u8; 32] = Sha256::digest(&input.challenge_bytes).into();
+    let challenge: StageChallenge = postcard::from_bytes(&input.challenge_bytes)
+        .map_err(|e| DefenceRefusal::UndecodableChallenge(e.to_string()))?;
+    let chain_commitment_digest: [u8; 32] =
+        Sha256::digest(&challenge.chain_commitment_bytes).into();
+    let chain: ChainCommitment = postcard::from_bytes(&challenge.chain_commitment_bytes)
+        .map_err(|e| DefenceRefusal::UndecodableChainCommitment(e.to_string()))?;
+    let stage = usize::try_from(challenge.challenged_stage)
+        .ok()
+        .and_then(|index| chain.stages.get(index))
+        .ok_or(DefenceRefusal::StageOutOfRange {
+            stage: challenge.challenged_stage,
+            stages: chain.stages.len(),
+        })?;
+
+    let journal = &input.transition_journal;
+    if journal.transition_image_id != input.transition_image_id {
+        return Err(DefenceRefusal::TransitionImageIdMismatch);
+    }
+    let trace_commitment = challenge.trace_commitment_header.digest();
+    if journal.refuted_trace_commitment != trace_commitment {
+        return Err(DefenceRefusal::AnotherTraceCommitment);
+    }
+    if journal.program_commitment != stage.program_commitment {
+        return Err(DefenceRefusal::AnotherProgram);
+    }
+    if journal.input_manifest_commitment != stage.input_manifest_commitment {
+        return Err(DefenceRefusal::AnotherInputManifest);
+    }
+    // `entrypoint_authorization` needs no check: both of its values mean the
+    // entry arguments are bound (`Established`) or there are none
+    // (`NotRequired`), and the window has it from the moment it opens.
+
+    let (reason, attested_output) = match &journal.current_state {
+        TransitionState::Finished => (DefenceReason::Refuted, None),
+        TransitionState::TerminalMatch => {
+            if !journal.window_is_terminal {
+                return Err(DefenceRefusal::NotTerminal);
+            }
+            let OutputAuthorization::Established { output_commitment } =
+                &journal.output_authorization
+            else {
+                return Err(DefenceRefusal::OutputNotEstablished);
+            };
+            if *output_commitment == challenge.claimed_output {
+                return Err(DefenceRefusal::OutputIsTheClaimed);
+            }
+            (DefenceReason::Mislabelled, Some(output_commitment.clone()))
+        }
+        TransitionState::Init(_) | TransitionState::Next(_) => {
+            return Err(DefenceRefusal::WindowNotEnded)
+        }
+    };
+
+    Ok(DefenceJournal {
+        challenge_digest,
+        chain_commitment_digest,
+        challenged_stage: challenge.challenged_stage,
+        trace_commitment,
+        reason,
+        attested_output,
+        transition_image_id: input.transition_image_id.clone(),
+        authorization_image_id: journal.authorization_image_id.clone(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::vec;
+    use crate::fingerprint::{BitPacker, Fingerprint};
+    use crate::transition::{
+        EntrypointAuthorization, InitTransition, OutputAuthorization, SerializableFrontier,
+        TraceCommitmentHeader, TransitionJournal, TransitionState,
+    };
+
+    const TRANSITION_ID: [u8; 32] = [0x7a; 32];
+    const PROGRAM: [u8; 32] = [0x10; 32];
+    const MANIFEST: [u8; 32] = [0x11; 32];
+    const COMMITTED_OUTPUT: [u8; 32] = [0x12; 32];
+    const CLAIMED_OUTPUT: [u8; 32] = [0x13; 32];
+
+    fn header() -> TraceCommitmentHeader {
+        TraceCommitmentHeader {
+            bits_packer: BitPacker::new(1),
+            fingerprint_len: 200,
+            fingerprint_root: vec![1; 32],
+            revealed_items_commitment: vec![2; 32],
+            window_size: 128,
+            revealed_tail_roots_commitment: vec![3; 32],
+        }
+    }
+
+    fn challenge() -> StageChallenge {
+        let chain = ChainCommitment {
+            stages: vec![StageCheckpoint {
+                name: "stage".into(),
+                program_commitment: PROGRAM.to_vec(),
+                input_manifest_commitment: MANIFEST.to_vec(),
+                input_bindings: BTreeMap::new(),
+                output_payload_commitment: COMMITTED_OUTPUT.to_vec(),
+                output_structural_commitment: vec![0x14; 32],
+            }],
+            shape: ChainShape {
+                spec_digest: vec![0x15; 32],
+                repeats: Vec::new(),
+            },
+        };
+        StageChallenge {
+            chain_commitment_bytes: postcard::to_allocvec(&chain).unwrap(),
+            challenged_stage: 0,
+            trace_commitment_header: header(),
+            claimed_output: CLAIMED_OUTPUT.to_vec(),
+        }
+    }
+
+    fn frontier() -> SerializableFrontier {
+        SerializableFrontier {
+            position: 0,
+            leaf: vec![0; 32],
+            ommers: Vec::new(),
+        }
+    }
+
+    /// The window a defence over `challenge()`'s `H_C` ends in, with
+    /// `output` attested — before any field is spoiled.
+    fn journal(current_state: TransitionState, output: &[u8]) -> TransitionJournal {
+        TransitionJournal {
+            init_state: InitTransition {
+                init_frontier: frontier(),
+                init_storage_frontier: frontier(),
+                init_storage_root: vec![0; 32],
+                init_storage_index_root: vec![0; 32],
+                fingerprint: Fingerprint {
+                    bits_packer: BitPacker::new(1),
+                    bits: Vec::new(),
+                    len: 0,
+                },
+            },
+            current_state,
+            transition_image_id: TRANSITION_ID.to_vec(),
+            authorization_image_id: vec![0xa0; 32],
+            input_manifest_commitment: MANIFEST.to_vec(),
+            program_commitment: PROGRAM.to_vec(),
+            refuted_trace_commitment: header().digest(),
+            entrypoint_authorization: EntrypointAuthorization::Established,
+            output_authorization: OutputAuthorization::Established {
+                output_commitment: output.to_vec(),
+            },
+            window_is_terminal: true,
+            final_committed_root: None,
+        }
+    }
+
+    fn input(challenge: &StageChallenge, journal: TransitionJournal) -> DefenceInput {
+        DefenceInput {
+            challenge_bytes: postcard::to_allocvec(challenge).unwrap(),
+            transition_journal: journal,
+            transition_image_id: TRANSITION_ID.to_vec(),
+        }
+    }
+
+    fn mislabel() -> TransitionJournal {
+        journal(TransitionState::TerminalMatch, &COMMITTED_OUTPUT)
+    }
+
+    #[test]
+    fn a_refutation_of_h_c_dismisses_the_challenge() {
+        let challenge = challenge();
+        let mut window = journal(TransitionState::Finished, &[]);
+        // A mid-trace refutation has no output yet, and is not terminal.
+        window.output_authorization = OutputAuthorization::Pending;
+        window.window_is_terminal = false;
+        let defence = defend(&input(&challenge, window)).expect("a refutation");
+        assert_eq!(defence.reason, DefenceReason::Refuted);
+        assert_eq!(defence.attested_output, None);
+        assert_eq!(defence.challenged_stage, 0);
+        assert_eq!(defence.trace_commitment, header().digest());
+        let challenge_bytes = postcard::to_allocvec(&challenge).unwrap();
+        assert_eq!(defence.challenge_digest, <[u8; 32]>::from(Sha256::digest(&challenge_bytes)));
+        assert_eq!(
+            defence.chain_commitment_digest,
+            <[u8; 32]>::from(Sha256::digest(&challenge.chain_commitment_bytes))
+        );
+        assert_eq!(defence.transition_image_id, TRANSITION_ID.to_vec());
+    }
+
+    #[test]
+    fn an_honest_end_other_than_the_claimed_output_is_a_mislabel_proof() {
+        let defence = defend(&input(&challenge(), mislabel())).expect("a mislabel proof");
+        assert_eq!(defence.reason, DefenceReason::Mislabelled);
+        assert_eq!(defence.attested_output, Some(COMMITTED_OUTPUT.to_vec()));
+    }
+
+    /// The true challenge: `H_C` is honest and ends where the challenger said.
+    #[test]
+    fn an_honest_end_in_the_claimed_output_defends_nothing() {
+        let window = journal(TransitionState::TerminalMatch, &CLAIMED_OUTPUT);
+        assert_eq!(
+            defend(&input(&challenge(), window)),
+            Err(DefenceRefusal::OutputIsTheClaimed)
+        );
+    }
+
+    #[test]
+    fn a_mislabel_proof_must_establish_an_output() {
+        for output in [OutputAuthorization::Pending, OutputAuthorization::NotRequired] {
+            let mut window = mislabel();
+            window.output_authorization = output;
+            assert_eq!(
+                defend(&input(&challenge(), window)),
+                Err(DefenceRefusal::OutputNotEstablished)
+            );
+        }
+    }
+
+    #[test]
+    fn a_mislabel_proof_must_be_terminal() {
+        let mut window = mislabel();
+        window.window_is_terminal = false;
+        assert_eq!(defend(&input(&challenge(), window)), Err(DefenceRefusal::NotTerminal));
+    }
+
+    /// The reason is read from the state, so a window that has not ended is
+    /// neither defence — there is no way to offer it as one.
+    #[test]
+    fn a_window_that_has_not_ended_is_no_defence() {
+        let window = mislabel();
+        let state = TransitionState::Init(window.init_state.clone());
+        let window = TransitionJournal {
+            current_state: state,
+            ..window
+        };
+        assert_eq!(defend(&input(&challenge(), window)), Err(DefenceRefusal::WindowNotEnded));
+    }
+
+    #[test]
+    fn a_window_over_another_commitment_program_or_manifest_is_no_defence() {
+        for state in [TransitionState::Finished, TransitionState::TerminalMatch] {
+            let base = || journal(state.clone(), &COMMITTED_OUTPUT);
+
+            let mut window = base();
+            window.refuted_trace_commitment = vec![0xee; 32];
+            assert_eq!(
+                defend(&input(&challenge(), window)),
+                Err(DefenceRefusal::AnotherTraceCommitment)
+            );
+
+            let mut window = base();
+            window.program_commitment = vec![0xee; 32];
+            assert_eq!(defend(&input(&challenge(), window)), Err(DefenceRefusal::AnotherProgram));
+
+            let mut window = base();
+            window.input_manifest_commitment = vec![0xee; 32];
+            assert_eq!(
+                defend(&input(&challenge(), window)),
+                Err(DefenceRefusal::AnotherInputManifest)
+            );
+        }
+    }
+
+    /// A journal whose earlier steps were verified against another guest.
+    #[test]
+    fn a_window_naming_another_transition_guest_is_no_defence() {
+        let mut window = mislabel();
+        window.transition_image_id = vec![0xee; 32];
+        assert_eq!(
+            defend(&input(&challenge(), window)),
+            Err(DefenceRefusal::TransitionImageIdMismatch)
+        );
+    }
+
+    #[test]
+    fn a_challenge_naming_a_missing_stage_is_refused() {
+        let mut challenge = challenge();
+        challenge.challenged_stage = 1;
+        assert_eq!(
+            defend(&input(&challenge, mislabel())),
+            Err(DefenceRefusal::StageOutOfRange {
+                stage: 1,
+                stages: 1
+            })
+        );
+    }
 }

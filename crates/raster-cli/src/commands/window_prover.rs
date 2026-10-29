@@ -40,8 +40,6 @@ impl WindowOutcome {
 }
 
 /// A proven window: the receipt, its decoded journal, and how it ended.
-// `run --audit` reads only the receipt; the defence reads all three.
-#[allow(dead_code)]
 pub struct WindowProof {
     pub receipt: risc0_zkvm::Receipt,
     pub journal: TransitionJournal,
@@ -85,8 +83,7 @@ impl<'a> WindowProver<'a> {
 
     /// The commitment's terminal window: an attestation that honest execution
     /// ends the trace, and with which output. Errors unless the guest ended it
-    /// `TerminalMatch`. The mislabel proof (`chain defend`, Phase 3).
-    #[allow(dead_code)]
+    /// `TerminalMatch`. The mislabel proof (`chain defend`).
     pub fn prove_terminal(&self) -> Result<WindowProof> {
         let mut verifier = TraceVerifier::new(self.commitment.clone(), &EMPTY_LEAF, self.cfs)
             .map_err(|e| Error::Other(e.to_string()))?;

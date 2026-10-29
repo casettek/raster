@@ -8,7 +8,8 @@
 //!    IO/replay, storage, draft chain) and append it to the trace
 //!    frontier + fingerprint.
 //! 3. Compare the accumulated fingerprint with the committed one and commit
-//!    the resulting journal (`Next`, or `Finished` on the proven divergence).
+//!    the resulting journal (`Next`; at the window's last item `Finished` on
+//!    the proven divergence, or `TerminalMatch` on a matching terminal window).
 
 mod checks;
 mod frame;
@@ -18,6 +19,7 @@ mod merkle_tree;
 #[cfg(test)]
 mod tests;
 
+use raster_core::trace::StepKind;
 use raster_core::transition::{
     FingerprintSliceWitness, TraceCommitmentHeader, TransitionInput, TransitionState,
 };
@@ -56,12 +58,14 @@ fn main() {
     let entrypoint_authorization = next.entrypoint_authorization();
     let output_authorization = next.output_authorization();
 
-    // Continue the window, or end it: `Finished` on a proven divergence,
-    // `TerminalMatch` on a terminal window that matched throughout.
+    // Continue the window, or end it: `Finished` on a proven divergence (or a
+    // commitment whose end is not the program's), `TerminalMatch` on a
+    // terminal window that matched throughout and ends in `ProgramEnd`.
     let current_state = next.finalize(
         &window_context.init_state.fingerprint,
         window_context.final_committed_root.as_ref(),
         window_context.window_is_terminal,
+        matches!(input.step_record.kind, StepKind::ProgramEnd(_)),
     );
 
     commit_journal(

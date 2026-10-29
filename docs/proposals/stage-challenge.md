@@ -1,8 +1,10 @@
 # Proposal: `stage-challenge` — a cheap stage challenge, disproved in the zkVM by its defence
 
-Status: **Phases 1–2 implemented** (2026-10-28) — `TransitionState::TerminalMatch`, the host
-`WindowProver`, both forms of challenge (`chain challenge`, `chain challenge-verify`); Phases 3–4
-(the defence, the timeout) proposed. See §Implementation status.
+Status: **Phases 1–3 implemented** (Phases 1–2 on 2026-10-28, Phase 3 on 2026-10-29). Landed:
+`TransitionState::TerminalMatch`; the host `WindowProver`; both forms of challenge (`chain
+challenge`, `chain challenge-verify`); and the defence (`chain defend`, `chain defend-verify`, the
+`defence` guest), with the trace's end tied to the commitment's. Phase 4 (the timeout) is
+specified, not built. See §Implementation status.
 
 Parties: the **claimer** publishes a chain commitment, a **challenger** challenges it, a
 **defender** — the claimer, or anyone — defends against a disputed challenge.
@@ -357,8 +359,8 @@ which proves nothing about the claimer — is replaced by the disputed form.
    - `X ≠ claimed_output` → this is a **mislabel proof**.
    - `X == claimed_output` → **no defence exists**: `H_C` is honest and ends where the challenger
      said, so the claimed output is false. `chain defend` reports this rather than proving it.
-5. Aggregate the defence with the chain-fraud guest into a `DefenceJournal` — *this
-   challenge is fraudulent* — by one of two checks, after the common ones:
+5. Aggregate the defence into a `DefenceJournal` (in its own guest — §Phase 3 plan, change 2):
+   *this challenge is fraudulent*, by one of two checks, after the common ones:
 
 ```text
 common      verify(transition_image_id, receipt)
@@ -377,8 +379,121 @@ The journal records which defence it was (`reason: Refuted | Mislabelled`). The 
 manifest equalities are what make `X` *this stage's* honest output, so a mislabel proof over some
 other program's trace cannot dismiss the challenge.
 
-CLI: `chain defend-verify <defence>` checks the aggregated receipt against the pinned chain-fraud
+CLI: `chain defend-verify <defence>` checks the aggregated receipt against the pinned defence
 image id.
+
+#### Phase 3 plan (2026-10-29)
+
+Three changes to the design above, each labelled; then the steps.
+
+**Change 1 — the trace's end is tied to the commitment's (open question 5).** Without it an
+honest claimer has no defence against an `H_C` of the wrong length. Confirmed in the code, not yet
+reproduced: for a *padded* `H_C`, `TraceVerifier::verify` returns `Ok`, and the window
+`terminal_window` builds over the honest trace is not `H_C`'s terminal window, so the guest
+refuses it. For a *truncated* `H_C`, `H_C`'s terminal window does not end in `ProgramEnd`: it
+ends `TerminalMatch` with `output_authorization = Pending`, which no mislabel check accepts.
+`window_end` gains the step's kind, and the two length faults become refutations:
+
+```text
+diverges                                  Finished        (unchanged)
+matches, terminal,     ends in ProgramEnd TerminalMatch   (unchanged)
+matches, terminal,     not ProgramEnd     Finished        H_C ends before the program does
+matches, not terminal, ends in ProgramEnd Finished        H_C goes on after the program ended
+matches, not terminal, not ProgramEnd     refused         (unchanged)
+```
+
+This is sound because an honest commitment always ends in `ProgramEnd`, at its last index and
+nowhere else. `ProgramEnd` is the unique terminal step: the guest lets nothing follow it, and a
+`main` that fails produces no `ProgramEnd` (`trace.rs`, `ProgramEndStep`). So neither new case can
+fire against an honest commitment of a complete run. `TraceVerifier::verify` yields both windows.
+If the honest walk reaches `H_C`'s length with items still to come, it yields `H_C`'s terminal
+window. If the walk ends before `H_C` does, it yields the window ending at the honest
+`ProgramEnd`. One consequence: a `Finished` window means "`H_C` is not an honest, complete
+execution", which is the claim a refutation needs.
+
+**Change 2 — the defence aggregates in its own guest, not in the chain-fraud guest.** One
+image id would then commit two journal types (`ChainFraudJournal`, `DefenceJournal`), and a
+consumer decoding the wrong one is the same fail-open hazard Phase 1 avoided with a separate
+state. A `defence` guest (`guests/defence`, `DEFENCE_GUEST_ID`) commits only `DefenceJournal`. As a
+side effect the chain-fraud image id does not change, so posted `Link`/`Shape` receipts stay valid.
+
+**Change 3 — the defence's kind is read from the journal, never offered.** The guest derives
+`reason` from `j.current_state`: `Finished` gives `Refuted`, `TerminalMatch` gives `Mislabelled`,
+and any other state is refused. A `TerminalMatch` offered as a refutation therefore cannot be
+expressed at all. The wrong-defence tests become: a mislabel with `X == claimed_output`, one whose
+output is not `Established`, a non-terminal mislabel, and any defence over another commitment,
+program or manifest.
+
+`DefenceJournal`, all of it computed or checked in the guest:
+
+```rust
+pub struct DefenceJournal {
+    pub challenge_digest: [u8; 32],        // sha256(postcard(StageChallenge)) — which challenge
+    pub chain_commitment_digest: [u8; 32], // sha256(challenge.chain_commitment_bytes)
+    pub challenged_stage: u32,
+    pub trace_commitment: Vec<u8>,         // digest(H_C's header)
+    pub reason: DefenceReason,             // Refuted | Mislabelled
+    pub attested_output: Option<Vec<u8>>,  // X, for Mislabelled
+    pub transition_image_id: Vec<u8>,      // checked against the known-good id by the verifier
+    pub authorization_image_id: Vec<u8>,   // likewise: the window's manifest is only as good as it
+}
+```
+
+The checks are one pure function in `raster-core`, `chain::check_defence`, called by the
+guest and by `chain defend` before it proves. The guest and the host therefore cannot disagree,
+and the wrong-defence cases are unit tests that need no zkVM.
+
+**Steps**
+
+1. **Guest ending rule** (Change 1). `window_end(diverges, window_is_terminal, ends_program)`;
+   `main.rs` passes the step's kind; `window_end` unit tests cover all five rows.
+2. **Host windows for length faults.** `TraceVerifier::verify` yields the two windows above.
+   The divergence window builder is factored out and shared, and `trace.rs` unit tests cover a
+   padded and a truncated commitment.
+3. **Defence types** (`raster-core/src/chain.rs`): `DefenceInput`, `DefenceJournal`,
+   `DefenceReason`, `DefenceRefusal`, `check_defence`, and unit tests for every common and
+   per-reason check.
+4. **Defence guest and host driver.** `guests/defence` (in `[package.metadata.risc0]`) calls
+   `env::verify` on the transition journal, then `check_defence`, and commits.
+   `raster-prover/src/defence.rs` has `prove_defence` and `verify_defence`: the pinned
+   `DEFENCE_GUEST_ID`, then the committed transition and authorization image ids against the
+   known-good ones.
+5. **CLI.** `chain defend [CHAIN] [CHAIN_COMMITMENT] [--challenge PATH]`:
+   - Admit the challenge, and load the chain the challenge carries (refusing a mismatched run
+     directory).
+   - Read `H_C`'s body from beside the challenge, and re-run the stage authenticated into
+     `<stage>/defence/`.
+   - Walk the honest trace against `H_C`:
+     - **divergence:** `prove_divergence`, giving `Refuted`;
+     - **no divergence, honest output == `claimed_output`:** report that no defence exists, with
+       no proving;
+     - **otherwise:** `prove_terminal`, giving `Mislabelled`.
+   - Aggregate and write `<run>/challenge/defence.bin`.
+
+   `chain defend-verify <defence> [--challenge PATH]` runs `verify_defence`, plus that the
+   defence answers the challenge beside it (by `challenge_digest`).
+6. **Adversarial challenges for the end-to-end checks.** `chain challenge --stage S --forge K`,
+   a hidden, test-only flag, posts a false challenge. It disputes the honest output with a flipped
+   one, over `H_C` built from the honest trace with one change, chosen by `K`:
+   - `claimed-output`: no change; the honest `H_C`, mislabelled (H1);
+   - `item`: one item replaced by its predecessor (H12);
+   - `pad`: one item appended after `ProgramEnd`;
+   - `truncate`: the last item dropped.
+
+   `H_C` is committed at the protocol window for its own length, so each forged challenge stays
+   admissible. It is a flag rather than the planned `raster-prover` example, because forging
+   needs the full honest trace, and only the CLI can load one (through `raster-runtime`'s
+   recorder, which depends on `raster-prover`). It forges nothing a challenger could not: the
+   protocol must survive any challenge bytes.
+7. **End to end, in dev mode** on `chain-example`, with stage `normalize`'s output tampered in the
+   chain commitment: a true challenge gets no defence, and the four tampered challenges are each
+   defended and `defend-verify`'d. Then the honest-chain byte-identity check.
+8. **Docs.** Implementation status here; chain-io's status (§3's admission rule replaced); open
+   question 5 closed.
+
+Every guest edit changes image ids. Rebuild `cargo-raster` and the `verify_fraud_proof` example
+together, and re-lock `chain-example`'s stages before the end-to-end run (raster-core changes in
+step 3 can move tile ids).
 
 ### Phase 4 — the timeout, specified not built
 
@@ -437,7 +552,12 @@ defender** within `T`, and **the challenger's bond** to price false challenges. 
 - `TransitionState` gains a variant *(landed)*: the transition guest's image id changes, and so
   does every journal encoding that matches on the enum exhaustively in code (compile errors, not
   silent).
-- The chain-fraud guest gains the defence aggregation: its image id changes.
+- `window_end` ties the trace's end to the commitment's (Phase 3, change 1): the transition
+  guest's image id changes again. A non-terminal window ending in `ProgramEnd`, and a terminal one
+  that does not, now end `Finished` instead of being refused or ending `TerminalMatch`. Neither
+  can occur against an honest commitment of a complete run.
+- The defence aggregation is a new guest (`guests/defence`, `DEFENCE_GUEST_ID`), not a mode of the
+  chain-fraud guest (Phase 3, change 2). The chain-fraud guest and its image id are unchanged.
 - No `ChainCommitment`, `StageCheckpoint` or `commit.bin` changes. Honest chains and single-program
   commitments are byte-identical before and after.
 
@@ -555,7 +675,53 @@ Phases 2–3 depend on Phase 1 and on nothing else unbuilt.
   `chain audit --execution` too) — the stage process resolves input paths from another directory.
   Absolute paths, or the default latest run, work.
 
-**Phases 3–4** — not started.
+**Phase 3 — landed 2026-10-29** (§Phase 3 plan; its three changes are labelled there).
+- **Length binding** (change 1, open question 5): `window_end(diverges, window_is_terminal,
+  ends_program)`. A terminal window not ending in `ProgramEnd`, and a non-terminal one that does,
+  end `Finished`. `TraceVerifier::verify` yields both windows: when the walk outruns the commitment,
+  and when it ends short of it. The divergence window builder is factored into `fraud_window`.
+- **Defence types and check** (`raster-core/src/chain.rs`): `DefenceInput`, `DefenceJournal`,
+  `DefenceReason`, `DefenceRefusal`, and `defend`, the one function both the guest and the host
+  run.
+- **Defence guest** (`guests/defence`, change 2): it calls `env::verify` on the transition journal
+  against the committed transition image id, then `defend`, then commits. The host side
+  (`raster-prover/src/defence.rs`) has `prove_defence`, which checks the host's `defend` before
+  proving and compares the guest's journal with it, and `verify_defence`, which pins
+  `DEFENCE_GUEST_ID` and then the known-good transition and authorization ids.
+- **CLI**:
+  - `chain defend [CHAIN] [CHAIN_COMMITMENT] [--challenge]`: admits the challenge, refuses a
+    challenge against another chain, re-runs the stage into `<stage>/defence/`, and walks it
+    against `H_C`. It then either proves a refutation, proves a mislabel, or reports that no
+    defence exists (exit code 1, nothing proven), and writes `challenge/defence.bin`.
+  - `chain defend-verify <defence> [--challenge]`: checks the receipt and the challenge digest.
+  - `chain challenge --forge` (hidden, test only; plan step 6).
+- **Tests**:
+  - transition guest: 168 passed (`window_end`: all five rows);
+  - raster-core: 207 passed (9 `defend` tests: both defences; the true challenge; output not
+    established; not terminal; window not ended; another commitment, program or manifest for both
+    defences; another transition guest; a missing stage);
+  - raster-prover: 52 passed (a padded and a truncated commitment yield their windows);
+  - raster-cli: 123 passed (84 unit, 39 integration including `chain_repeat_cli`; 1 ignored).
+- **End to end** (dev mode, `chain-example`, stage `normalize`, a 14-item trace at window 8):
+  - honest chain: `chain challenge` finds nothing;
+  - `--forge claimed-output` (H1): defended as **mislabelled**, attesting the honest output
+    `41f002…`;
+  - `--forge item` (H12): **refuted**;
+  - `--forge pad` (`H_C` of 15 items): **refuted**;
+  - `--forge truncate` (13 items): **refuted**.
+
+  The padded and truncated `H_C`s carry only honest items, so the length rule is the only thing
+  that can refute them. Each defence passes `defend-verify`.
+- **End to end, the refusals**:
+  - True challenge (stage output tampered in the chain commitment): `chain defend` reports "no
+    defence exists" and proves nothing.
+  - A defence verified against another challenge is refused (challenge digest).
+  - `chain defend` against a challenge on another chain is refused.
+- `chain-example`'s three `Raster.lock`s were re-locked: every tile image id and program commitment
+  moved, as raster-core edits do. There was no baseline re-lock, so whether this phase moved them is
+  not established.
+
+**Phase 4** — specified, not built.
 
 ## Verification
 
@@ -566,16 +732,16 @@ Phases 2–3 depend on Phase 1 and on nothing else unbuilt.
 - **Guest unit** *(done)*. A terminal window whose items all match ends `TerminalMatch` with
   `Established { O }`; with a diverging last item it ends `Finished`; a non-terminal matching
   window still panics; neither can be continued.
-- **True challenge.** One-stage chain, stage output tampered in the chain commitment (the
+- **True challenge** *(done, 2026-10-29, on `chain-example`)*. One-stage chain, stage output tampered in the chain commitment (the
   2026-10-27 scratch case): `chain challenge` produces an admissible challenge with no proof;
   `chain defend` finds no divergence, proves the terminal window, finds `X == claimed_output`,
   and reports that no defence exists.
-- **H1, mislabel.** Honest chain; a challenge carrying the honest `H_C` and an invented
+- **H1, mislabel** *(done)*. Honest chain; a challenge carrying the honest `H_C` and an invented
   `claimed_output` is admitted; `chain defend` produces a mislabel proof and `chain defend-verify`
   accepts it.
-- **H12, refutation.** Honest chain; a challenge whose `H_C` has one fabricated item (and,
+- **H12, refutation** *(done: one fabricated item; padded and truncated `H_C` too)*. Honest chain; a challenge whose `H_C` has one fabricated item (and,
   separately, random fingerprint bits) is admitted; `chain defend` refutes it.
-- **Wrong defences.** A `TerminalMatch` offered as a refutation, a `Finished` offered as a mislabel,
+- **Wrong defences** *(done, as `defend` unit tests; plus a defence against another challenge and another chain, end to end)*. A `TerminalMatch` offered as a refutation, a `Finished` offered as a mislabel,
   a mislabel with `X == claimed_output`, and a defence over another commitment, program or
   manifest are each rejected by the aggregation, asserting the check that fired.
 - **Admission** *(done, unit tests)*. `claimed_output == s.output_payload_commitment`, a unit-output stage, and a
@@ -658,8 +824,8 @@ At the protocol window, the same stage end to end (`chain challenge` on the tamp
    the claimer and for first-proof initialisation (~2 min here). Decision 6 bounds the proof; it
    does not choose `T`.
 4. ~~Who chooses the window size?~~ The protocol — decision 6.
-5. **A `H_C` of the wrong length may be undefendable** (found 2026-10-28 reading the code; not yet
-   reproduced). Completeness assumes every dishonest `H_C` diverges at some item. One with the honest
+5. ~~**A `H_C` of the wrong length may be undefendable**~~ — closed 2026-10-29 by §Phase 3 plan,
+   change 1, and checked end to end (`--forge pad`, `--forge truncate`). As found (2026-10-28): Completeness assumes every dishonest `H_C` diverges at some item. One with the honest
    items but a different `fingerprint_len` does not:
    - *padded* (honest items, then extra ones): the honest walk ends at `ProgramEnd` with no
      divergence, and that window is not `H_C`'s terminal one, so the guest refuses it — no refutation;

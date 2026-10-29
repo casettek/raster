@@ -29,24 +29,29 @@ use raster_compiler::{CfsBuilder, Project};
 use raster_core::authorization::ManifestedInputs;
 use raster_core::cfs::{CfsCursor, ControlFlowSchema};
 use raster_core::chain::{
-    ChainCommitment, ChainFraudEvidence, ChainFraudInput, ChainShape, InputBindingSource,
-    RepeatResolution, StageChallenge, StageCheckpoint,
+    ChainCommitment, ChainFraudEvidence, ChainFraudInput, ChainShape, DefenceInput,
+    DefenceJournal, DefenceReason, InputBindingSource, RepeatResolution, StageChallenge,
+    StageCheckpoint,
 };
 use raster_core::input::{payload_structural_root, scalar_leaf_root, IndexWidth};
 use raster_core::program::commitment_of_bytes;
 use raster_core::trace::Trace;
 use raster_core::{Error, Result};
 use raster_prover::authorization::{authorization_guest_image_id, authorize_external_inputs};
-use raster_prover::chain_fraud::prove_chain_fraud;
+use raster_prover::chain_fraud::{prove_chain_fraud, transition_guest_image_id};
 use raster_prover::challenge::{
-    protocol_window_size, verify, AdmissionRefusal, Challenge, ProvenChallenge, Verdict,
-    PROTOCOL_WINDOW_SIZE,
+    protocol_window_size, verify, verify_challenge, AdmissionRefusal, AdmittedChallenge,
+    Challenge, ProvenChallenge, Verdict, PROTOCOL_WINDOW_SIZE,
 };
 use raster_core::merkle::EMPTY_LEAF;
-use raster_prover::trace::{FraudProofConfig, TraceCommitment, TraceCommitmentExt};
+use raster_prover::defence::{prove_defence, verify_defence};
+use raster_prover::trace::{
+    FraudProofConfig, TraceCommitment, TraceCommitmentExt, TraceVerifier, VerificationResult,
+};
 use raster_runtime::TraceRecorder;
 
 use crate::commands::run::load_trace_from_file;
+use crate::commands::window_prover::WindowProver;
 use crate::runtime_env::RuntimeEnv;
 use crate::TraceFormat;
 
@@ -1264,9 +1269,6 @@ fn detect_output_fraud(recorded: &RecordedChain) -> Result<Option<StageOutputFra
 /// inputs into `<stage dir>/<subdir>`: the trace a challenger commits to, or a
 /// defender walks against the challenger's. Leaves the chain's own artifacts
 /// untouched.
-// The proving context (`project`, `cfs`, `recorder`, the manifest) is read by
-// the defence, `chain defend` (stage-challenge.md §Phase 3).
-#[allow(dead_code)]
 struct StageRerun {
     project: Project,
     cfs: ControlFlowSchema,
@@ -1439,6 +1441,10 @@ fn detect_link_fraud(recorded: &RecordedChain) -> Result<Option<(usize, String, 
 const CHALLENGE_DIR: &str = "challenge";
 const CHALLENGE_FILE: &str = "challenge.bin";
 const CHALLENGE_BODY_FILE: &str = "commit.bin";
+const DEFENCE_FILE: &str = "defence.bin";
+/// Where `chain defend` re-runs the challenged stage, beside the challenger's
+/// `challenge/` re-run in the stage directory.
+const DEFENCE_DIR: &str = "defence";
 
 /// `cargo raster chain challenge` — the challenger's move against a chain
 /// commitment (`docs/proposals/stage-challenge.md`), in the one form the fault
@@ -1456,10 +1462,27 @@ const CHALLENGE_BODY_FILE: &str = "commit.bin";
 ///
 /// Faults are looked for in that order. `stage` skips the search and disputes
 /// that stage's output.
+/// A false challenge `chain challenge --forge` posts, to exercise each defence
+/// end to end. Test only: the protocol must survive any challenge bytes, so
+/// this forges nothing a challenger could not — it only saves writing them by
+/// hand. Every forged challenge disputes the honest output with a flipped one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum Forge {
+    /// The honest `H_C`, mislabelled (H1): answered by a mislabel proof.
+    ClaimedOutput,
+    /// One item of `H_C` fabricated (H12): answered by a refutation.
+    Item,
+    /// `H_C` with an item after the program's end: answered by a refutation.
+    Pad,
+    /// `H_C` stopping before the program's end: answered by a refutation.
+    Truncate,
+}
+
 pub fn challenge(
     manifest: Option<&str>,
     chain_commitment: Option<&str>,
     stage: Option<&str>,
+    forge: Option<Forge>,
 ) -> Result<()> {
     if stage.is_none() {
         // Loaded as the claimer asserts it, not as a verifier would accept it:
@@ -1507,18 +1530,39 @@ pub fn challenge(
 
     println!("re-running stage {stage_index} '{stage_name}' authenticated…");
     let rerun = rerun_stage_authenticated(&recorded, stage_index, CHALLENGE_DIR)?;
-    let window_size = protocol_window_size(rerun.trace.len()).ok_or_else(|| {
+    let mut trace = rerun.trace.clone();
+    let mut claimed_output = collect_output(&rerun.out_dir)?.payload_commitment;
+    if let Some(forge) = forge {
+        println!("forging a false challenge ({forge:?}) — for testing the defences");
+        if let Some(byte) = claimed_output.first_mut() {
+            *byte ^= 0xff;
+        }
+        match forge {
+            Forge::ClaimedOutput => {}
+            Forge::Item => {
+                let index = trace.len() / 2;
+                trace.0[index] = trace.0[index - 1].clone();
+            }
+            Forge::Pad => {
+                let last = trace.last().cloned().expect("an authenticated run has a trace");
+                trace.0.push(last);
+            }
+            Forge::Truncate => {
+                trace.0.pop();
+            }
+        }
+    }
+    let window_size = protocol_window_size(trace.len()).ok_or_else(|| {
         Error::Other(format!(
             "stage '{stage_name}' has a trace of {} item(s), too short for any fraud-proof \
              window: its output cannot be disputed",
-            rerun.trace.len()
+            trace.len()
         ))
     })?;
     let fraud_proof_config =
         FraudProofConfig::from_window_size(window_size).map_err(|e| Error::Other(e.to_string()))?;
-    let trace_commitment = TraceCommitment::try_build(&rerun.trace, &EMPTY_LEAF, fraud_proof_config)
+    let trace_commitment = TraceCommitment::try_build(&trace, &EMPTY_LEAF, fraud_proof_config)
         .map_err(|e| Error::Other(e.to_string()))?;
-    let claimed_output = collect_output(&rerun.out_dir)?.payload_commitment;
 
     let challenge = Challenge::Disputed(StageChallenge {
         chain_commitment_bytes: recorded.chain_bytes.clone(),
@@ -1536,7 +1580,7 @@ pub fn challenge(
     print_verdict(&challenge, &verdict);
     println!(
         "  window size      {window_size}  (protocol {PROTOCOL_WINDOW_SIZE}, trace of {} items)",
-        rerun.trace.len()
+        trace.len()
     );
     println!();
     println!(
@@ -1665,11 +1709,7 @@ fn print_verdict(challenge: &Challenge, verdict: &Verdict) {
 /// With `chain_commitment`, also that the challenge is against that chain.
 pub fn challenge_verify(challenge_path: &str, chain_commitment: Option<&str>) -> Result<()> {
     let challenge_path = PathBuf::from(challenge_path);
-    let bytes = std::fs::read(&challenge_path)
-        .map_err(|e| Error::Other(format!("failed to read {}: {e}", challenge_path.display())))?;
-    let challenge: Challenge = postcard::from_bytes(&bytes).map_err(|e| {
-        Error::Other(format!("{} is not a challenge: {e}", challenge_path.display()))
-    })?;
+    let challenge = read_challenge(&challenge_path)?;
 
     let verdict = verify(&challenge).map_err(|refusal: AdmissionRefusal| {
         Error::Other(format!("challenge refused: {refusal}"))
@@ -1689,23 +1729,7 @@ pub fn challenge_verify(challenge_path: &str, chain_commitment: Option<&str>) ->
     }
 
     if let Verdict::AwaitingDefence(admitted) = &verdict {
-        // Data availability, locally: the body must be present and be `H_C`.
-        let body_path = challenge_path.with_file_name(CHALLENGE_BODY_FILE);
-        let body: TraceCommitment = std::fs::read(&body_path)
-            .map_err(|e| {
-                Error::Other(format!("H_C's body is not available at {}: {e}", body_path.display()))
-            })
-            .and_then(|bytes| {
-                postcard::from_bytes(&bytes).map_err(|e| {
-                    Error::Other(format!("{} is not a trace commitment: {e}", body_path.display()))
-                })
-            })?;
-        if body.header().digest() != admitted.trace_commitment {
-            return Err(Error::Other(format!(
-                "{} is not the trace commitment the challenge names",
-                body_path.display()
-            )));
-        }
+        read_challenge_body(&challenge_path, admitted)?;
     }
 
     match &verdict {
@@ -1715,6 +1739,212 @@ pub fn challenge_verify(challenge_path: &str, chain_commitment: Option<&str>) ->
         }
     }
     print_verdict(&challenge, &verdict);
+    Ok(())
+}
+
+/// `H_C`'s body, from beside the challenge — data availability, locally: it
+/// must be present and be the commitment the challenge names.
+fn read_challenge_body(challenge_path: &Path, admitted: &AdmittedChallenge) -> Result<TraceCommitment> {
+    let body_path = challenge_path.with_file_name(CHALLENGE_BODY_FILE);
+    let body: TraceCommitment = std::fs::read(&body_path)
+        .map_err(|e| {
+            Error::Other(format!("H_C's body is not available at {}: {e}", body_path.display()))
+        })
+        .and_then(|bytes| {
+            postcard::from_bytes(&bytes).map_err(|e| {
+                Error::Other(format!("{} is not a trace commitment: {e}", body_path.display()))
+            })
+        })?;
+    if body.header().digest() != admitted.trace_commitment {
+        return Err(Error::Other(format!(
+            "{} is not the trace commitment the challenge names",
+            body_path.display()
+        )));
+    }
+    Ok(body)
+}
+
+fn read_challenge(challenge_path: &Path) -> Result<Challenge> {
+    let bytes = std::fs::read(challenge_path)
+        .map_err(|e| Error::Other(format!("failed to read {}: {e}", challenge_path.display())))?;
+    postcard::from_bytes(&bytes).map_err(|e| {
+        Error::Other(format!("{} is not a challenge: {e}", challenge_path.display()))
+    })
+}
+
+/// `cargo raster chain defend` — answer a disputed challenge, as the claimer
+/// or as anyone holding the public artifacts (`docs/proposals/stage-challenge.md`
+/// §Phase 3).
+///
+/// Re-runs the challenged stage authenticated from its committed inputs and
+/// walks the honest trace against `H_C`:
+/// - **it diverges** (or `H_C` misstates the trace's length) — a refutation:
+///   the fraud window, proven against `H_C`;
+/// - **it matches, and the honest output is not the claimed one** — a mislabel
+///   proof: `H_C`'s terminal window, attesting the output it really ends in;
+/// - **it matches, and the honest output is the claimed one** — the challenge
+///   is true and no defence exists. Reported, with nothing proven.
+///
+/// The window is then aggregated by the defence guest into a `DefenceJournal`,
+/// written to `defence.bin` beside the challenge.
+pub fn defend(
+    manifest: Option<&str>,
+    chain_commitment: Option<&str>,
+    challenge_path: Option<&str>,
+) -> Result<()> {
+    let recorded = load_recorded_chain(manifest, chain_commitment, ShapePolicy::Verify)?;
+    let challenge_path = match challenge_path {
+        Some(path) => PathBuf::from(path),
+        None => recorded.chain_dir.join(CHALLENGE_DIR).join(CHALLENGE_FILE),
+    };
+    let disputed = match read_challenge(&challenge_path)? {
+        Challenge::Disputed(disputed) => disputed,
+        Challenge::Proven(_) => {
+            return Err(Error::Other(
+                "a proven challenge has no defence: verifying it condemns the chain".into(),
+            ))
+        }
+    };
+    let admitted = verify_challenge(&disputed)
+        .map_err(|refusal| Error::Other(format!("the challenge is not admissible: {refusal}")))?;
+    let local_digest: [u8; 32] = Sha256::digest(&recorded.chain_bytes).into();
+    if local_digest != admitted.chain_digest {
+        return Err(Error::Other(format!(
+            "the challenge is against chain {}, but this run is chain {}",
+            hex::encode(admitted.chain_digest),
+            hex::encode(local_digest)
+        )));
+    }
+    let body = read_challenge_body(&challenge_path, &admitted)?;
+    let stage_name = admitted.stage.name.clone();
+
+    println!("challenge against stage {} '{stage_name}'", admitted.stage_index);
+    println!("  claimed output   {}", hex::encode(&disputed.claimed_output));
+    println!("  H_C              {}", short_hex(&admitted.trace_commitment));
+    println!("re-running stage {} '{stage_name}' authenticated…", admitted.stage_index);
+    let rerun = rerun_stage_authenticated(&recorded, admitted.stage_index, DEFENCE_DIR)?;
+    let honest_output = collect_output(&rerun.out_dir)?.payload_commitment;
+
+    let backend = raster_backend_risc0::Risc0Backend::new(rerun.project.output_dir.clone())
+        .with_user_crate(rerun.project.root_dir.clone());
+    let replayer = raster_prover::replay::Replayer::new(&backend, &rerun.project);
+    let input_manifest = rerun.input_manifest_path.to_string_lossy().into_owned();
+    let window_prover = WindowProver::new(
+        &rerun.trace,
+        &body,
+        &rerun.cfs,
+        &rerun.recorder,
+        &replayer,
+        Some(&input_manifest),
+    );
+
+    let mut verifier = TraceVerifier::new(body.clone(), &EMPTY_LEAF, &rerun.cfs)
+        .map_err(|e| Error::Other(e.to_string()))?;
+    let window = match verifier.verify(&rerun.trace) {
+        VerificationResult::Fraud(evidence) => {
+            println!(
+                "H_C is not an honest execution of the stage (trace of {} items, H_C of {}) — \
+                 proving the refutation…",
+                rerun.trace.len(),
+                body.fingerprint.len()
+            );
+            window_prover.prove_divergence(evidence)?
+        }
+        VerificationResult::Ok if honest_output == disputed.claimed_output => {
+            return Err(Error::Other(format!(
+                "no defence exists: H_C is an honest execution of stage '{stage_name}' and ends \
+                 in the claimed output {} — the challenge is true",
+                hex::encode(&honest_output)
+            )));
+        }
+        VerificationResult::Ok => {
+            println!(
+                "H_C is honest, but ends in {} — proving the mislabel (its terminal window)…",
+                hex::encode(&honest_output)
+            );
+            window_prover.prove_terminal()?
+        }
+    };
+
+    println!("aggregating the defence (defence guest)…");
+    let input = DefenceInput {
+        challenge_bytes: postcard::to_allocvec(&disputed)
+            .map_err(|e| Error::Other(format!("failed to serialize the challenge: {e}")))?,
+        transition_journal: window.journal,
+        transition_image_id: transition_guest_image_id(),
+    };
+    let (receipt, journal) =
+        prove_defence(&input, window.receipt).map_err(|e| Error::Other(e.to_string()))?;
+    let defence_path = challenge_path.with_file_name(DEFENCE_FILE);
+    write_bytes(
+        &defence_path,
+        &postcard::to_allocvec(&receipt)
+            .map_err(|e| Error::Other(format!("failed to serialize the defence: {e}")))?,
+    )?;
+
+    println!();
+    println!("defence → {}", defence_path.display());
+    print_defence(&journal);
+    Ok(())
+}
+
+fn print_defence(journal: &DefenceJournal) {
+    let reason = match journal.reason {
+        DefenceReason::Refuted => "refuted — H_C is not an honest, complete execution",
+        DefenceReason::Mislabelled => "mislabelled — H_C is honest but ends elsewhere",
+    };
+    println!("  reason           {reason}");
+    println!("  chain digest     {}", hex::encode(journal.chain_commitment_digest));
+    println!("  stage            {}", journal.challenged_stage);
+    println!("  challenge        {}", short_hex(&journal.challenge_digest));
+    println!("  H_C              {}", short_hex(&journal.trace_commitment));
+    if let Some(output) = &journal.attested_output {
+        println!("  attested output  {}", hex::encode(output));
+    }
+}
+
+/// `cargo raster chain defend-verify` — what anyone (and later a settlement
+/// contract) checks about a posted defence: the receipt against the pinned
+/// defence image id and the known-good inner guests, and that it answers the
+/// challenge — by default the `challenge.bin` beside it.
+pub fn defend_verify(defence_path: &str, challenge_path: Option<&str>) -> Result<()> {
+    let defence_path = PathBuf::from(defence_path);
+    let receipt: risc0_zkvm::Receipt = std::fs::read(&defence_path)
+        .map_err(|e| Error::Other(format!("failed to read {}: {e}", defence_path.display())))
+        .and_then(|bytes| {
+            postcard::from_bytes(&bytes).map_err(|e| {
+                Error::Other(format!("{} is not a defence: {e}", defence_path.display()))
+            })
+        })?;
+    let journal = verify_defence(&receipt)
+        .map_err(|e| Error::Other(format!("defence refused: {e}")))?;
+
+    let challenge_path = match challenge_path {
+        Some(path) => PathBuf::from(path),
+        None => defence_path.with_file_name(CHALLENGE_FILE),
+    };
+    let Challenge::Disputed(disputed) = read_challenge(&challenge_path)? else {
+        return Err(Error::Other(format!(
+            "{} is a proven challenge, which no defence answers",
+            challenge_path.display()
+        )));
+    };
+    let challenge_digest: [u8; 32] = Sha256::digest(
+        postcard::to_allocvec(&disputed)
+            .map_err(|e| Error::Other(format!("failed to serialize the challenge: {e}")))?,
+    )
+    .into();
+    if challenge_digest != journal.challenge_digest {
+        return Err(Error::Other(format!(
+            "the defence answers challenge {}, not {} ({})",
+            short_hex(&journal.challenge_digest),
+            short_hex(&challenge_digest),
+            challenge_path.display()
+        )));
+    }
+
+    println!("defence verified ✓ — the challenge is dismissed");
+    print_defence(&journal);
     Ok(())
 }
 

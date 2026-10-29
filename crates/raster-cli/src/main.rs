@@ -356,6 +356,14 @@ enum ChainCommand {
         /// protocol's window size (128, capped below the trace length).
         #[arg(long)]
         stage: Option<String>,
+
+        /// Test only: post a *false* challenge, to exercise the defences.
+        /// Disputes the honest output with a flipped one, over `H_C` built
+        /// from the honest trace (`claimed-output`), with one item replaced
+        /// (`item`), one item appended (`pad`) or the last one dropped
+        /// (`truncate`). Requires `--stage`.
+        #[arg(long, value_enum, hide = true, requires = "stage")]
+        forge: Option<chain::Forge>,
     },
 
     /// Verify a challenge of either form: a proven one's receipt against the
@@ -369,6 +377,40 @@ enum ChainCommand {
         /// Also check that the challenge is against this chain-commitment.
         #[arg(long)]
         chain_commitment: Option<String>,
+    },
+
+    /// Defender (the claimer, or anyone): answer a disputed challenge. Re-runs
+    /// the challenged stage and walks it against the challenger's `H_C`: a
+    /// divergence is proven as a refutation; an honest `H_C` ending in another
+    /// output than the claimed one, as a mislabel proof (its terminal window).
+    /// The window is aggregated by the defence guest and written to
+    /// `defence.bin` beside the challenge. When `H_C` is honest and ends in the
+    /// claimed output the challenge is true: no defence exists, and nothing is
+    /// proven. See `docs/proposals/stage-challenge.md` §Phase 3.
+    Defend {
+        /// Chain manifest (see `chain run`).
+        chain: Option<String>,
+
+        /// Path to the chain-commitment being defended. Omit to use the most
+        /// recent run under `target/raster/chains/`.
+        chain_commitment: Option<String>,
+
+        /// Path to the challenge. Defaults to the run's
+        /// `challenge/challenge.bin`, with `H_C`'s `commit.bin` beside it.
+        #[arg(long)]
+        challenge: Option<String>,
+    },
+
+    /// Verify a defence: the receipt against the pinned defence image id and
+    /// the known-good inner guests, and that it answers the challenge.
+    DefendVerify {
+        /// Path to the `defence.bin` written by `chain defend`.
+        defence: String,
+
+        /// The challenge it must answer. Defaults to the `challenge.bin`
+        /// beside the defence.
+        #[arg(long)]
+        challenge: Option<String>,
     },
 }
 
@@ -495,11 +537,25 @@ fn try_main() -> Result<()> {
                 chain,
                 chain_commitment,
                 stage,
-            } => chain::challenge(chain.as_deref(), chain_commitment.as_deref(), stage.as_deref()),
+                forge,
+            } => chain::challenge(
+                chain.as_deref(),
+                chain_commitment.as_deref(),
+                stage.as_deref(),
+                forge,
+            ),
             ChainCommand::ChallengeVerify {
                 challenge,
                 chain_commitment,
             } => chain::challenge_verify(&challenge, chain_commitment.as_deref()),
+            ChainCommand::Defend {
+                chain,
+                chain_commitment,
+                challenge,
+            } => chain::defend(chain.as_deref(), chain_commitment.as_deref(), challenge.as_deref()),
+            ChainCommand::DefendVerify { defence, challenge } => {
+                chain::defend_verify(&defence, challenge.as_deref())
+            }
         },
         Commands::Run {
             backend,

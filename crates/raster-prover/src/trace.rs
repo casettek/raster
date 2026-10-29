@@ -1035,10 +1035,39 @@ impl<'a> TraceVerifier<'a> {
             .map(|root| root.as_slice())
     }
 
+    /// Walk `trace` — the honest execution — against the commitment, and
+    /// return the first window that refutes it, or `Ok` when none does.
+    ///
+    /// Three ways to refute it, all proven by the same transition guest (its
+    /// `window_end` decides which ending each window reaches):
+    /// - **An item diverges** — by fingerprint entry, or by revealed root in
+    ///   the tail. The window ends at that item.
+    /// - **The commitment ends first**: the walk reaches the commitment's
+    ///   length with honest items still to come. The window is the
+    ///   commitment's terminal one, whose last item is then not `ProgramEnd`.
+    /// - **The trace ends first**: the walk ends at the honest `ProgramEnd`
+    ///   with the commitment still going. The window ends at that
+    ///   `ProgramEnd`, short of the commitment's end.
+    ///
+    /// The last two refute a commitment of the wrong length whose items are
+    /// otherwise honest — which no item can diverge from. See
+    /// `docs/proposals/stage-challenge.md` §Phase 3 plan, change 1.
     pub fn verify(&mut self, trace: &Trace) -> VerificationResult {
         let cfs_cursor = CfsCursor::new(self.cfs.clone());
+        let committed_len = self.trace_commitment.fingerprint.len();
 
         for (step_index, step_record) in trace.iter().enumerate() {
+            if step_index == committed_len {
+                // Every committed item matched, and honest execution goes on:
+                // the commitment stops before the program does. The buffers
+                // still hold the window ending at its last item.
+                return VerificationResult::Fraud(self.fraud_window(
+                    trace,
+                    step_index - 1,
+                    &cfs_cursor,
+                ));
+            }
+
             let item_frontier = self.latest_frontier.clone();
 
             self.window_frontiers.push(item_frontier);
@@ -1073,74 +1102,86 @@ impl<'a> TraceVerifier<'a> {
             };
 
             if diverges {
-                // The rolling buffers *measure* the window; this slice has to
-                // reproduce what they already know. `index.saturating_sub(w) + 1`
-                // did not: below `w` the `saturating_sub` floors to 0 and the
-                // `+ 1` lands on **1**, giving one entry too few *and* starting
-                // one item late, so window item 0 was compared against
-                // committed item 1. At `index == 0` the range was `1..1` and
-                // the slice came back empty while still declaring `w` items.
-                //
-                // Clamping instead is identical for `index >= w` and yields 0
-                // at the head, which is where the window genuinely starts.
-                let window_len = self.window_items.len();
-                let diff_bits = self
-                    .trace_commitment
-                    .fingerprint
-                    .bits_packer
-                    .get_range(
-                        (index + 1).saturating_sub(self.window_size),
-                        index + 1,
-                        &self.trace_commitment.fingerprint.bits,
-                    )
-                    .unwrap();
-
-                // Declare what the slice holds, not the window's capacity.
-                // `Fingerprint::from` stores `len` verbatim without checking it
-                // against `bits`, and the guest reads that declared length as
-                // authoritative — which is how a head window used to travel all
-                // the way there claiming items it did not carry.
-                assert_eq!(
-                    diff_bits.len(),
-                    (window_len * self.trace_commitment.fingerprint.bits_per_item()).div_ceil(64),
-                    "fraud window slice holds {} blocks but declares {} items",
-                    diff_bits.len(),
-                    window_len,
-                );
-                let window_fingerprint = Fingerprint::from(
-                    diff_bits,
-                    self.trace_commitment.fingerprint.bits_packer,
-                    window_len,
-                );
-
-                let window_frontier = self.window_frontiers.first().unwrap().clone();
-                let ser_window_frontier =
-                    serializable_frontier_from_trace_frontier(window_frontier).to_bytes();
-
-                // TODO: consider renaming Window struct and TraceWindow have different behavior but
-                // similiar naming
-                let fraud_window = TraceWindow {
-                    frontier: ser_window_frontier,
-                    items: self.window_items.to_vec(),
-                    fingerprint: window_fingerprint,
-                };
-
-                let input_sources_witnesses = witness_record_inputs(
-                    trace,
-                    step_index,
-                    &fraud_window,
-                    &cfs_cursor,
-                    &self.seed,
-                );
-
-                return VerificationResult::Fraud(FraudEvidence {
-                    window: fraud_window,
-                    input_sources_witnesses,
-                });
+                return VerificationResult::Fraud(self.fraud_window(trace, index, &cfs_cursor));
             }
         }
 
+        if !trace.is_empty() && trace.len() < committed_len {
+            // Every honest item matched, and the commitment goes on past the
+            // program's end: the window ends at the honest `ProgramEnd`.
+            return VerificationResult::Fraud(self.fraud_window(
+                trace,
+                trace.len() - 1,
+                &cfs_cursor,
+            ));
+        }
+
         VerificationResult::Ok
+    }
+
+    /// The window ending at trace item `index`, as the walk's buffers hold it
+    /// (they must have just taken item `index`), paired with the committed
+    /// fingerprint slice over the same range.
+    fn fraud_window(&self, trace: &Trace, index: usize, cfs_cursor: &CfsCursor) -> FraudEvidence {
+        // The rolling buffers *measure* the window; this slice has to
+        // reproduce what they already know. `index.saturating_sub(w) + 1`
+        // did not: below `w` the `saturating_sub` floors to 0 and the
+        // `+ 1` lands on **1**, giving one entry too few *and* starting
+        // one item late, so window item 0 was compared against
+        // committed item 1. At `index == 0` the range was `1..1` and
+        // the slice came back empty while still declaring `w` items.
+        //
+        // Clamping instead is identical for `index >= w` and yields 0
+        // at the head, which is where the window genuinely starts.
+        let window_len = self.window_items.len();
+        let diff_bits = self
+            .trace_commitment
+            .fingerprint
+            .bits_packer
+            .get_range(
+                (index + 1).saturating_sub(self.window_size),
+                index + 1,
+                &self.trace_commitment.fingerprint.bits,
+            )
+            .unwrap();
+
+        // Declare what the slice holds, not the window's capacity.
+        // `Fingerprint::from` stores `len` verbatim without checking it
+        // against `bits`, and the guest reads that declared length as
+        // authoritative — which is how a head window used to travel all
+        // the way there claiming items it did not carry.
+        assert_eq!(
+            diff_bits.len(),
+            (window_len * self.trace_commitment.fingerprint.bits_per_item()).div_ceil(64),
+            "fraud window slice holds {} blocks but declares {} items",
+            diff_bits.len(),
+            window_len,
+        );
+        let window_fingerprint = Fingerprint::from(
+            diff_bits,
+            self.trace_commitment.fingerprint.bits_packer,
+            window_len,
+        );
+
+        let window_frontier = self.window_frontiers.first().unwrap().clone();
+        let ser_window_frontier =
+            serializable_frontier_from_trace_frontier(window_frontier).to_bytes();
+
+        // TODO: consider renaming Window struct and TraceWindow have different behavior but
+        // similiar naming
+        let fraud_window = TraceWindow {
+            frontier: ser_window_frontier,
+            items: self.window_items.to_vec(),
+            fingerprint: window_fingerprint,
+        };
+
+        let input_sources_witnesses =
+            witness_record_inputs(trace, index, &fraud_window, cfs_cursor, &self.seed);
+
+        FraudEvidence {
+            window: fraud_window,
+            input_sources_witnesses,
+        }
     }
 
     /// The window covering the trace's final `window_size` items, paired with
@@ -1722,6 +1763,65 @@ mod tests {
 
         let short = Trace(trace.iter().take(1).cloned().collect());
         assert!(trace_verifier.terminal_window(&short).is_err());
+    }
+
+    /// `(window_start, window_len, fingerprint_len)` the guest would derive.
+    fn window_geometry(evidence: &FraudEvidence) -> (usize, usize) {
+        let frontier = SerializableFrontier::from_bytes(&evidence.window.frontier)
+            .expect("window frontier deserializes");
+        let window_start = usize::try_from(frontier.position).expect("position fits");
+        (window_start, evidence.window.fingerprint.len())
+    }
+
+    /// A commitment that stops before the honest trace does, every committed
+    /// item honest: no item diverges, so before this the walk ran past the
+    /// committed fingerprint. It must yield the commitment's terminal window —
+    /// terminal by the guest's equality, ending on an item that is not the
+    /// trace's last (so not `ProgramEnd`), which the guest ends `Finished`.
+    #[test]
+    fn a_truncated_commitment_yields_its_terminal_window() {
+        let trace = Trace((0..8).map(|i| make_tile_trace_item(i, i)).collect());
+        let truncated = Trace(trace.iter().take(6).cloned().collect());
+        let commitment =
+            TraceCommitment::build(&truncated, &EMPTY_LEAF, test_fraud_proof_config());
+        let fingerprint_len = commitment.fingerprint.len();
+        let cfs = make_test_cfs();
+        let mut verifier =
+            TraceVerifier::new(commitment, &EMPTY_LEAF, &cfs).expect("valid commitment");
+
+        let VerificationResult::Fraud(evidence) = verifier.verify(&trace) else {
+            panic!("a truncated commitment must be refutable");
+        };
+
+        let (window_start, window_len) = window_geometry(&evidence);
+        assert_eq!(window_start + window_len, fingerprint_len, "terminal window");
+        assert_eq!(evidence.window.items.as_slice(), &trace[6 - window_len..6]);
+        assert_ne!(evidence.window.items.last(), trace.last());
+    }
+
+    /// A commitment that goes on after the honest trace ends, every honest
+    /// item matching: the walk used to end `Ok`. It must yield the window
+    /// ending at the honest trace's last item (`ProgramEnd` in a real trace),
+    /// short of the commitment's end, which the guest ends `Finished`.
+    #[test]
+    fn a_padded_commitment_yields_the_window_ending_the_honest_trace() {
+        let trace = Trace((0..6).map(|i| make_tile_trace_item(i, i)).collect());
+        let mut padded = trace.clone();
+        padded.0.extend((6..9).map(|i| make_tile_trace_item(i, i)));
+        let commitment = TraceCommitment::build(&padded, &EMPTY_LEAF, test_fraud_proof_config());
+        let fingerprint_len = commitment.fingerprint.len();
+        let cfs = make_test_cfs();
+        let mut verifier =
+            TraceVerifier::new(commitment, &EMPTY_LEAF, &cfs).expect("valid commitment");
+
+        let VerificationResult::Fraud(evidence) = verifier.verify(&trace) else {
+            panic!("a padded commitment must be refutable");
+        };
+
+        let (window_start, window_len) = window_geometry(&evidence);
+        assert_eq!(window_start + window_len, trace.len(), "ends at the honest end");
+        assert!(window_start + window_len < fingerprint_len, "not terminal");
+        assert_eq!(evidence.window.items.last(), trace.last());
     }
 
     /// Window geometry across the head boundary.
