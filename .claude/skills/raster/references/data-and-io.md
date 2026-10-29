@@ -208,8 +208,8 @@ Commands:
 cargo raster chain run                      # run all stages, thread outputs, commit
 cargo raster chain audit                    # verify links + identities (public)
 cargo raster chain audit --execution        # + re-run stages against commits
-cargo raster chain fraud-prove              # produce a chain fraud receipt
-cargo raster chain fraud-verify             # verify a receipt
+cargo raster chain challenge                # challenge it: proven (link/shape) or disputed (output)
+cargo raster chain challenge-verify <file>  # verify a challenge of either form
 ```
 
 ## 6. Program identity — what it is, why it exists, how it's used

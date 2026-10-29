@@ -5610,3 +5610,42 @@ fn a_tile_reading_the_value_inside_an_err_is_rejected() {
         &witnesses,
     );
 }
+
+/// How a window ends at its last item (`fraud_proof::window_end`): the two
+/// endings come from disjoint conditions, and a matching window ends only if
+/// it is the trace's end.
+mod window_end {
+    use crate::fraud_proof::window_end;
+    use raster_core::transition::TransitionState;
+
+    /// A divergence is the fraud being proven — terminal or not.
+    #[test]
+    fn a_diverging_last_item_ends_finished() {
+        for window_is_terminal in [false, true] {
+            assert!(matches!(
+                window_end(true, window_is_terminal),
+                TransitionState::Finished
+            ));
+        }
+    }
+
+    /// The stage-challenge receipt: the challenger's own honest trace, proven
+    /// at its end against its own commitment. Every item matches, so it can
+    /// never be `Finished` — and before `TerminalMatch` it could not be proven
+    /// at all.
+    #[test]
+    fn a_matching_terminal_window_ends_terminal_match() {
+        assert!(matches!(
+            window_end(false, true),
+            TransitionState::TerminalMatch
+        ));
+    }
+
+    /// Matching anywhere but the trace's end attests nothing usable, and
+    /// proves no fraud: refused, as before.
+    #[test]
+    #[should_panic(expected = "final step must diverge from the commitment")]
+    fn a_matching_window_that_is_not_terminal_is_refused() {
+        let _ = window_end(false, false);
+    }
+}

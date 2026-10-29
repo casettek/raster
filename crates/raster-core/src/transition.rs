@@ -336,7 +336,16 @@ pub struct InitTransition {
 pub enum TransitionState {
     Init(InitTransition),
     Next(Transition),
+    /// The window's last item diverged from the commitment it names: fraud
+    /// proven. The only state a fraud-proof consumer may accept.
     Finished,
+    /// A terminal window whose every item matched the commitment it names:
+    /// honest execution of this window ends the trace, with the journal's
+    /// `output_authorization`. An attestation — what a stage challenge
+    /// carries (`docs/proposals/stage-challenge.md`) — and never a fraud
+    /// proof: a consumer testing for `Finished` refuses it without knowing it
+    /// exists. After `Finished` so existing encodings are unchanged.
+    TerminalMatch,
 }
 
 /// Whether `main`'s entry-argument binding has been tied to the authorization

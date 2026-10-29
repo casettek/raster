@@ -80,16 +80,16 @@ pub fn generate_fraud_proof(
         Risc0Backend::new(project.output_dir.clone()).with_user_crate(project.root_dir.clone());
     let replayer = Replayer::new(&backend, project);
     let trace_commitment = read_trace_commitment(commit_path)?;
-    let fraud_proof = prove(
-        fraud_evidence,
+    let proof = crate::commands::window_prover::WindowProver::new(
         trace,
+        &trace_commitment,
         cfs,
         trace_recorder,
         &replayer,
         input_manifest,
-        &trace_commitment,
-    );
-    Ok(write_fraud_proof(&fraud_proof, commit_path))
+    )
+    .prove_divergence(fraud_evidence)?;
+    Ok(write_fraud_proof(&proof.receipt, commit_path))
 }
 
 pub fn fraud_proof_path(commit_path: &str) -> PathBuf {

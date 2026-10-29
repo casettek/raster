@@ -531,7 +531,7 @@ fn a_tampered_trip_count_is_rejected_with_no_prover() {
 
 #[test]
 fn a_shape_record_that_cannot_be_read_is_reported_not_proved() {
-    // `fraud-prove` loads the chain *as claimed*, so it is the one path where a
+    // `challenge` loads the chain *as claimed*, so it is the one path where a
     // shape record that is invalid on its face still reaches the detectors. A
     // `source_stage` past the end of the chain is not a fault — a `Shape` fault
     // is an inequality against what the producing stage committed, and there is
@@ -548,7 +548,7 @@ fn a_shape_record_that_cannot_be_read_is_reported_not_proved() {
 
     let out = scratch.cargo_raster(&[
         "chain",
-        "fraud-prove",
+        "challenge",
         manifest(DYNAMIC).to_str().expect("utf-8 path"),
         commitment_path.to_str().expect("utf-8 path"),
     ]);
@@ -617,26 +617,34 @@ fn a_shape_fault_produces_a_verifiable_receipt() {
 
     let out = scratch.cargo_raster(&[
         "chain",
-        "fraud-prove",
+        "challenge",
         manifest(DYNAMIC).to_str().expect("utf-8 path"),
         commitment_path.to_str().expect("utf-8 path"),
     ]);
-    let stdout = assert_ok(&out, "chain fraud-prove");
+    let stdout = assert_ok(&out, "chain challenge");
     assert!(stdout.contains("shape fraud"), "{stdout}");
     assert!(
         stdout.contains("stage 0 ('planner') did not commit"),
         "{stdout}"
     );
 
-    // And the receipt checks out against the pinned image ids.
+    assert!(stdout.contains("proven challenge"), "{stdout}");
+
+    // And the receipt checks out against the pinned image ids, and condemns
+    // this chain.
+    let challenge_path = commitment_path
+        .parent()
+        .expect("the commitment lives in its run directory")
+        .join("challenge")
+        .join("challenge.bin");
     let out = scratch.cargo_raster(&[
         "chain",
-        "fraud-verify",
-        "--chain",
-        manifest(DYNAMIC).to_str().expect("utf-8 path"),
+        "challenge-verify",
+        challenge_path.to_str().expect("utf-8 path"),
         "--chain-commitment",
         commitment_path.to_str().expect("utf-8 path"),
     ]);
-    let stdout = assert_ok(&out, "chain fraud-verify");
+    let stdout = assert_ok(&out, "chain challenge-verify");
+    assert!(stdout.contains("the chain is condemned"), "{stdout}");
     assert!(stdout.contains("Shape"), "the verdict must name the fault\n{stdout}");
 }

@@ -257,6 +257,13 @@ trace's actual result, with **no new guest assertion and no plumbing into `apply
 Nothing else in the guest changes. The slice check's own assertions, the divergence logic,
 `finalize`, `assert_program_continuity`, and `assert_manifest_continuity` are untouched.
 
+> **Amended by [`stage-challenge.md`](./stage-challenge.md) (2026-10-28).** `finalize` could
+> not stay untouched: it required every window's last item to diverge, so the terminal window of
+> an honest trace — §3's challenge receipt, and §4b's interim evidence — always panicked. It now
+> ends a terminal, fully matching window `TerminalMatch`, a state distinct from `Finished`.
+> `stage-challenge` also replaces §3's admission rule with the cheap-challenge rule: the challenge
+> carries no proof, and that window becomes the answerer's **mislabel proof** instead.
+
 ### 3. The dispute protocol
 
 **Opening.** A challenger who believes stage *i*'s output is wrong:

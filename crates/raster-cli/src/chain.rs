@@ -30,20 +30,20 @@ use raster_core::authorization::ManifestedInputs;
 use raster_core::cfs::{CfsCursor, ControlFlowSchema};
 use raster_core::chain::{
     ChainCommitment, ChainFraudEvidence, ChainFraudInput, ChainShape, InputBindingSource,
-    RepeatResolution, StageCheckpoint,
+    RepeatResolution, StageChallenge, StageCheckpoint,
 };
 use raster_core::input::{payload_structural_root, scalar_leaf_root, IndexWidth};
 use raster_core::program::commitment_of_bytes;
 use raster_core::trace::Trace;
-use raster_core::transition::TransitionJournal;
 use raster_core::{Error, Result};
 use raster_prover::authorization::{authorization_guest_image_id, authorize_external_inputs};
-use raster_prover::chain_fraud::{prove_chain_fraud, verify_chain_fraud_receipt};
-use raster_core::merkle::EMPTY_LEAF;
-use raster_prover::replay::Replayer;
-use raster_prover::trace::{
-    FraudProofConfig, TraceCommitment, TraceCommitmentExt, TraceVerifier,
+use raster_prover::chain_fraud::prove_chain_fraud;
+use raster_prover::challenge::{
+    protocol_window_size, verify, AdmissionRefusal, Challenge, ProvenChallenge, Verdict,
+    PROTOCOL_WINDOW_SIZE,
 };
+use raster_core::merkle::EMPTY_LEAF;
+use raster_prover::trace::{FraudProofConfig, TraceCommitment, TraceCommitmentExt};
 use raster_runtime::TraceRecorder;
 
 use crate::commands::run::load_trace_from_file;
@@ -320,7 +320,6 @@ struct ExternalRef {
 // can decode the same bytes this module writes.
 
 const CHAIN_COMMITMENT_FILE: &str = "chain-commitment";
-const CHAIN_FRAUD_RECEIPT_FILE: &str = "chain-fraud.receipt";
 
 // ---------------------------------------------------------------------------
 // `cargo raster chain run <chain.json>`
@@ -1008,10 +1007,10 @@ fn load_recorded_chain(
 /// stage's program identity from its project (cached `program.bin`, else
 /// regenerated from source + `Raster.lock`).
 ///
-/// With `execution`, additionally re-runs every stage natively and verifies
-/// the honest trace against the stage's committed `commit.bin` — the
-/// challenger path that catches intra-stage execution fraud (reported, not
-/// proven; `chain fraud-prove` produces the receipt).
+/// With `execution`, additionally re-runs every stage natively and compares
+/// the output it produces against the one its checkpoint commits — how a
+/// challenger finds a stage to dispute (reported, not proven; `chain
+/// challenge` posts the challenge).
 pub fn audit(
     manifest: Option<&str>,
     chain_commitment: Option<&str>,
@@ -1153,7 +1152,7 @@ pub fn audit(
                 );
                 println!("    committed  {}", short_hex(&fraud.committed));
                 println!("    recomputed {}", short_hex(&fraud.recomputed));
-                println!("run `cargo raster chain fraud-prove` to produce the evidence receipt");
+                println!("run `cargo raster chain challenge` to dispute it");
                 return Err(Error::Other(format!(
                     "stage '{}': execution fraud detected",
                     spec.stages[fraud.stage_index].name
@@ -1167,15 +1166,6 @@ pub fn audit(
 // ---------------------------------------------------------------------------
 // Fraud: detection (`audit --execution`), proving, verification
 // ---------------------------------------------------------------------------
-
-/// Fraud-proof window the auditor builds its own commitment with.
-///
-/// The auditor picks this, not the chain: a checkpoint no longer records a
-/// window size because it no longer records a trace commitment at all. It only
-/// has to be a legal window (`FraudProofConfig::from_window_size`) shorter than
-/// the stage's trace — the security margin is fixed at
-/// `FRAUD_DETECTION_SECURITY_BITS` per window however the size is split.
-const EVIDENCE_WINDOW_SIZE: usize = 2;
 
 /// A stage whose recomputed output disagrees with what the chain committed.
 struct StageOutputFraud {
@@ -1191,14 +1181,14 @@ struct StageOutputFraud {
 /// of the committed program and the committed inputs, so a stage whose honest
 /// re-run yields a different `output.bin` is a stage whose checkpoint is
 /// false — no trace, no commitment and no proving needed to *find* it. Only
-/// arguing about it costs anything, and only for the one stage
-/// (`prove_terminal_window`).
+/// arguing about it costs anything, and only for the one stage (`chain
+/// challenge`, then a defence).
 ///
 /// The first disagreeing stage is returned; later stages are not checked, since
 /// one false checkpoint already condemns the chain and the stages after it
 /// consumed committed inputs.
 fn detect_output_fraud(recorded: &RecordedChain) -> Result<Option<StageOutputFraud>> {
-    // `audit` checks this before calling; `fraud_prove` does not, and indexing
+    // `audit` checks this before calling; `challenge` does not, and indexing
     // the checkpoints by a spec position would panic rather than report. The
     // mismatch is itself a finding, so it gets a message rather than an
     // assertion.
@@ -1270,24 +1260,27 @@ fn detect_output_fraud(recorded: &RecordedChain) -> Result<Option<StageOutputFra
     Ok(None)
 }
 
-/// Re-run one stage **authenticated** and prove its terminal window.
-///
-/// The receipt says: *honest execution of this checkpoint's committed program,
-/// on its committed inputs, terminates in `output_commitment`.* Paired with the
-/// checkpoint's disagreeing `output_payload_commitment`, that is the evidence a
-/// stage's execution is fraudulent.
-///
-/// It is **evidence, not a self-contained fraud proof**: nothing in it shows the
-/// trace it was proven over is the honest one, which is what the
-/// challenge/response timeout supplies (`chain-io-commitment.md` §3). For a
-/// local auditor — the same party proving and checking — that gap costs
-/// nothing. The artifact is unchanged when the protocol lands: it *is* the
-/// challenge receipt.
-fn prove_terminal_window(
+/// One stage of a recorded chain, re-run authenticated from its committed
+/// inputs into `<stage dir>/<subdir>`: the trace a challenger commits to, or a
+/// defender walks against the challenger's. Leaves the chain's own artifacts
+/// untouched.
+// The proving context (`project`, `cfs`, `recorder`, the manifest) is read by
+// the defence, `chain defend` (stage-challenge.md §Phase 3).
+#[allow(dead_code)]
+struct StageRerun {
+    project: Project,
+    cfs: ControlFlowSchema,
+    trace: Trace,
+    recorder: TraceRecorder,
+    input_manifest_path: PathBuf,
+    out_dir: PathBuf,
+}
+
+fn rerun_stage_authenticated(
     recorded: &RecordedChain,
     stage_index: usize,
-    fraud_proof_config: FraudProofConfig,
-) -> Result<risc0_zkvm::Receipt> {
+    subdir: &str,
+) -> Result<StageRerun> {
     let stage = &recorded.spec.stages[stage_index];
     let stage_dir = recorded.chain_dir.join(&stage.name);
     let project = Project::new(recorded.base_dir.join(&stage.project))
@@ -1296,9 +1289,9 @@ fn prove_terminal_window(
         .build()
         .map_err(|e| Error::Other(format!("stage '{}': failed to build CFS: {e}", stage.name)))?;
 
-    let evidence_dir = stage_dir.join("evidence");
-    std::fs::create_dir_all(&evidence_dir)
-        .map_err(|e| Error::Other(format!("failed to create {}: {e}", evidence_dir.display())))?;
+    let out_dir = stage_dir.join(subdir);
+    std::fs::create_dir_all(&out_dir)
+        .map_err(|e| Error::Other(format!("failed to create {}: {e}", out_dir.display())))?;
 
     let input_manifest_path = stage_dir.join("input_manifest.json");
     let (replay, _execution_time) = build_and_run_stage(
@@ -1306,33 +1299,19 @@ fn prove_terminal_window(
         &cfs,
         &stage_dir.join("input.json"),
         &input_manifest_path,
-        &evidence_dir,
+        &out_dir,
         false,
         TraceFormat::Binary,
     )?;
     let (trace, recorder) = replay.expect("an authenticated stage run produces a trace");
-
-    let trace_commitment =
-        TraceCommitment::try_build(&trace, &EMPTY_LEAF, fraud_proof_config)
-            .map_err(|e| Error::Other(e.to_string()))?;
-    let mut verifier = TraceVerifier::new(trace_commitment.clone(), &EMPTY_LEAF, &cfs)
-        .map_err(|e| Error::Other(e.to_string()))?;
-    let window = verifier
-        .terminal_window(&trace)
-        .map_err(|e| Error::Other(e.to_string()))?;
-
-    let backend = raster_backend_risc0::Risc0Backend::new(project.output_dir.clone())
-        .with_user_crate(project.root_dir.clone());
-    let replayer = Replayer::new(&backend, &project);
-    Ok(crate::commands::prove::prove(
-        window,
-        &trace,
-        &cfs,
-        &recorder,
-        &replayer,
-        Some(&input_manifest_path.to_string_lossy().to_string()),
-        &trace_commitment,
-    ))
+    Ok(StageRerun {
+        project,
+        cfs,
+        trace,
+        recorder,
+        input_manifest_path,
+        out_dir,
+    })
 }
 
 
@@ -1355,7 +1334,7 @@ struct ShapeFault {
 /// against the manifest in `verify_shape`, where it needs no receipt at all.
 ///
 /// In practice `load_recorded_chain` has already refused such a chain — this
-/// exists so `fraud-prove` can produce the *receipt* for a fault a relying
+/// exists so `challenge` can produce the *receipt* for a fault a relying
 /// party can then check without the manifest.
 ///
 /// `Err` is a **malformed** record, not a fault: a `source_stage` past the end
@@ -1454,61 +1433,131 @@ fn detect_link_fraud(recorded: &RecordedChain) -> Result<Option<(usize, String, 
     Ok(None)
 }
 
-/// Write the chain fraud receipt, re-verify it as a relying party would, and
-/// print the journal.
-fn write_chain_fraud_receipt(
-    recorded: &RecordedChain,
-    receipt: &risc0_zkvm::Receipt,
+/// Where `chain challenge` writes, under the chain run directory: the
+/// challenge and, for a disputed one, `H_C`'s body beside it (decision 4:
+/// local files for now).
+const CHALLENGE_DIR: &str = "challenge";
+const CHALLENGE_FILE: &str = "challenge.bin";
+const CHALLENGE_BODY_FILE: &str = "commit.bin";
+
+/// `cargo raster chain challenge` — the challenger's move against a chain
+/// commitment (`docs/proposals/stage-challenge.md`), in the one form the fault
+/// allows:
+///
+/// - **Proven** — a `Shape` or `Link` fault, which the commitment exhibits by
+///   itself. Proven on the spot by the chain-fraud guest; there is nothing to
+///   defend, so verifying it condemns the chain.
+/// - **Disputed** — a stage whose committed output its honest re-run does not
+///   reproduce. Re-runs the stage authenticated, commits to its trace (`H_C`)
+///   at the protocol's window size (`protocol_window_size`: 128, capped below
+///   the trace length — not the challenger's choice) and posts the stage,
+///   `H_C`'s header and the output `H_C` ends in, with **no proof**: the zkVM
+///   runs only in a defence.
+///
+/// Faults are looked for in that order. `stage` skips the search and disputes
+/// that stage's output.
+pub fn challenge(
+    manifest: Option<&str>,
+    chain_commitment: Option<&str>,
+    stage: Option<&str>,
 ) -> Result<()> {
-    let journal = verify_chain_fraud_receipt(receipt).map_err(|e| Error::Other(e.to_string()))?;
+    if stage.is_none() {
+        // Loaded as the claimer asserts it, not as a verifier would accept it:
+        // the first thing checked is whether that assertion is even
+        // self-consistent.
+        let recorded = load_recorded_chain(manifest, chain_commitment, ShapePolicy::AsClaimed)?;
+        if let Some(receipt) = prove_commitment_fault(&recorded)? {
+            let challenge = Challenge::Proven(ProvenChallenge {
+                chain_commitment_bytes: recorded.chain_bytes.clone(),
+                receipt,
+            });
+            let verdict = verify(&challenge).map_err(|refusal| {
+                Error::Other(format!("the proven challenge does not verify: {refusal}"))
+            })?;
+            let challenge_path = write_challenge(&recorded, &challenge, None)?;
+            println!();
+            println!("proven challenge → {}", challenge_path.display());
+            print_verdict(&challenge, &verdict);
+            return Ok(());
+        }
+        println!("the commitment is self-consistent — re-running stages against their committed outputs");
+    }
 
-    let receipt_path = recorded.chain_dir.join(CHAIN_FRAUD_RECEIPT_FILE);
-    let bytes = postcard::to_allocvec(receipt)
-        .map_err(|e| Error::Other(format!("failed to serialize chain fraud receipt: {e}")))?;
-    std::fs::write(&receipt_path, bytes)
-        .map_err(|e| Error::Other(format!("failed to write {}: {e}", receipt_path.display())))?;
+    // A disputed challenge argues about one of the stages, so the stage list
+    // must be the one the manifest derives: re-load as a verifier would, which
+    // also refuses a chain whose shape is invalid on its face (no receipt can
+    // exhibit that, and no challenge is needed to reject it).
+    let recorded = load_recorded_chain(manifest, chain_commitment, ShapePolicy::Verify)?;
+    let stage_index = match stage {
+        Some(name) => recorded
+            .spec
+            .stages
+            .iter()
+            .position(|candidate| candidate.name == name)
+            .ok_or_else(|| Error::Other(format!("the chain has no stage '{name}'")))?,
+        None => match detect_output_fraud(&recorded)? {
+            Some(fraud) => fraud.stage_index,
+            None => {
+                println!("no fault found — every stage reproduces its committed output; nothing to challenge");
+                return Ok(());
+            }
+        },
+    };
+    let stage_name = recorded.spec.stages[stage_index].name.clone();
 
-    let stage_name = recorded
-        .chain
-        .stages
-        .get(journal.faulty_stage as usize)
-        .map(|s| s.name.as_str())
-        .unwrap_or("?");
+    println!("re-running stage {stage_index} '{stage_name}' authenticated…");
+    let rerun = rerun_stage_authenticated(&recorded, stage_index, CHALLENGE_DIR)?;
+    let window_size = protocol_window_size(rerun.trace.len()).ok_or_else(|| {
+        Error::Other(format!(
+            "stage '{stage_name}' has a trace of {} item(s), too short for any fraud-proof \
+             window: its output cannot be disputed",
+            rerun.trace.len()
+        ))
+    })?;
+    let fraud_proof_config =
+        FraudProofConfig::from_window_size(window_size).map_err(|e| Error::Other(e.to_string()))?;
+    let trace_commitment = TraceCommitment::try_build(&rerun.trace, &EMPTY_LEAF, fraud_proof_config)
+        .map_err(|e| Error::Other(e.to_string()))?;
+    let claimed_output = collect_output(&rerun.out_dir)?.payload_commitment;
+
+    let challenge = Challenge::Disputed(StageChallenge {
+        chain_commitment_bytes: recorded.chain_bytes.clone(),
+        challenged_stage: stage_index as u32,
+        trace_commitment_header: trace_commitment.header(),
+        claimed_output,
+    });
+    // Never publish a challenge its own admission would refuse.
+    let verdict = verify(&challenge)
+        .map_err(|refusal| Error::Other(format!("challenge would not be admitted: {refusal}")))?;
+    let challenge_path = write_challenge(&recorded, &challenge, Some(&trace_commitment))?;
+
     println!();
-    println!("chain fraud proven ✓ → {}", receipt_path.display());
+    println!("disputed challenge → {}", challenge_path.display());
+    print_verdict(&challenge, &verdict);
     println!(
-        "  chain digest: {}",
-        hex::encode(journal.chain_commitment_digest)
+        "  window size      {window_size}  (protocol {PROTOCOL_WINDOW_SIZE}, trace of {} items)",
+        rerun.trace.len()
     );
+    println!();
     println!(
-        "  faulty stage: {} '{}'  ({:?})",
-        journal.faulty_stage, stage_name, journal.fault
-    );
-    println!(
-        "  program:      {}",
-        short_hex(&journal.stage_program_commitment)
+        "No proof is attached: anyone may defend against it with a refutation or a mislabel\n\
+         proof (`chain defend`); undefended, it condemns the stage."
     );
     Ok(())
 }
 
-/// `cargo raster chain fraud-prove` — detect a chain fault and produce the
-/// single succinct chain fraud receipt: link faults first (no re-execution
-/// needed), then execution fraud via the single-program pipeline aggregated
-/// by the chain-fraud guest.
-pub fn fraud_prove(manifest: Option<&str>, chain_commitment: Option<&str>) -> Result<()> {
-    // Loaded as the claimer asserts it, not as a verifier would accept it: the
-    // first thing checked below is whether that assertion is even self-consistent.
-    let recorded = load_recorded_chain(manifest, chain_commitment, ShapePolicy::AsClaimed)?;
-
-    // Shape first. It is the cheapest of the three — pure re-derivation from
-    // the commitment, no re-execution and no receipt to verify — and it is the
-    // only one that can be answered *before* the stage list is agreed: an
-    // output comparison is meaningless against a chain with the wrong number of
+/// Look for a fault the commitment exhibits by itself and prove it: `Shape`
+/// first, then `Link`. `None` when the commitment is self-consistent.
+fn prove_commitment_fault(recorded: &RecordedChain) -> Result<Option<risc0_zkvm::Receipt>> {
+    // Shape first. It is the cheapest — pure re-derivation from the
+    // commitment, no re-execution and no receipt to verify — and the only one
+    // that can be answered *before* the stage list is agreed: an output
+    // comparison is meaningless against a chain with the wrong number of
     // stages. See `docs/proposals/chain-repeat.md` §6.1.
     if let Some(ShapeFault {
         repeat_index,
         source_stage,
-    }) = detect_shape_fraud(&recorded)?
+    }) = detect_shape_fraud(recorded)?
     {
         let repeat = &recorded.chain.shape.repeats[repeat_index];
         println!(
@@ -1525,11 +1574,11 @@ pub fn fraud_prove(manifest: Option<&str>, chain_commitment: Option<&str>) -> Re
                 repeat_index: repeat_index as u32,
             },
         };
-        let receipt = prove_chain_fraud(&input, None);
-        return write_chain_fraud_receipt(&recorded, &receipt);
+        println!("proving it (chain-fraud guest)…");
+        return Ok(Some(prove_chain_fraud(&input, None)));
     }
 
-    if let Some((stage_index, parameter, manifest_bytes)) = detect_link_fraud(&recorded)? {
+    if let Some((stage_index, parameter, manifest_bytes)) = detect_link_fraud(recorded)? {
         println!(
             "link fraud: stage {} '{}' parameter '{parameter}' does not commit its producer's output",
             stage_index, recorded.chain.stages[stage_index].name
@@ -1545,113 +1594,133 @@ pub fn fraud_prove(manifest: Option<&str>, chain_commitment: Option<&str>) -> Re
                 authorization_image_id: authorization_guest_image_id(),
             },
         };
-        let receipt = prove_chain_fraud(&input, Some(authorization_receipt));
-        return write_chain_fraud_receipt(&recorded, &receipt);
+        println!("proving it (chain-fraud guest)…");
+        return Ok(Some(prove_chain_fraud(&input, Some(authorization_receipt))));
     }
 
-    println!("no link fraud — re-running stages against their committed outputs");
-    let Some(fraud) = detect_output_fraud(&recorded)? else {
-        println!("no fraud found — every stage reproduces its committed output");
-        return Ok(());
-    };
+    Ok(None)
+}
 
-    let stage_name = &recorded.spec.stages[fraud.stage_index].name;
-    println!(
-        "output fraud: stage {} '{stage_name}' committed {} but honest execution yields {}",
-        fraud.stage_index,
-        short_hex(&fraud.committed),
-        short_hex(&fraud.recomputed),
-    );
+/// Write `challenge` to `<run>/challenge/challenge.bin`, and a disputed one's
+/// `H_C` body beside it. The directory is cleared first, so a body left by an
+/// earlier challenge can never sit beside a later one.
+fn write_challenge(
+    recorded: &RecordedChain,
+    challenge: &Challenge,
+    body: Option<&TraceCommitment>,
+) -> Result<PathBuf> {
+    let dir = recorded.chain_dir.join(CHALLENGE_DIR);
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir)
+            .map_err(|e| Error::Other(format!("failed to clear {}: {e}", dir.display())))?;
+    }
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| Error::Other(format!("failed to create {}: {e}", dir.display())))?;
+    let challenge_path = dir.join(CHALLENGE_FILE);
+    let bytes = postcard::to_allocvec(challenge)
+        .map_err(|e| Error::Other(format!("failed to serialize the challenge: {e}")))?;
+    write_bytes(&challenge_path, &bytes)?;
+    if let Some(body) = body {
+        write_bytes(&dir.join(CHALLENGE_BODY_FILE), &postcard::to_allocvec(body).unwrap())?;
+    }
+    Ok(challenge_path)
+}
 
-    // No chain-fraud aggregation for this fault. The chain-fraud guest can only
-    // attribute what the `ChainCommitment` names, and it no longer names a
-    // trace commitment — so execution fraud is established by the
-    // challenge/response protocol, not by a single self-contained receipt
-    // (`docs/proposals/chain-io-commitment.md` §3, §7). What is produced here
-    // is the object that protocol opens a challenge with.
-    println!("proving stage '{stage_name}' terminal window (transition guest)…");
-    let fraud_proof_config = FraudProofConfig::from_window_size(EVIDENCE_WINDOW_SIZE)
-        .map_err(|e| Error::Other(e.to_string()))?;
-    let receipt = prove_terminal_window(&recorded, fraud.stage_index, fraud_proof_config)?;
-    let journal: TransitionJournal = receipt
-        .journal
-        .decode()
-        .map_err(|e| Error::Other(format!("failed to decode terminal-window journal: {e}")))?;
+fn print_verdict(challenge: &Challenge, verdict: &Verdict) {
+    match (challenge, verdict) {
+        (_, Verdict::Condemned { chain, chain_digest, journal }) => {
+            let stage_name = chain
+                .stages
+                .get(journal.faulty_stage as usize)
+                .map(|s| s.name.as_str())
+                .unwrap_or("?");
+            println!("  chain digest     {}", hex::encode(chain_digest));
+            println!(
+                "  faulty stage     {} '{stage_name}'  ({:?})",
+                journal.faulty_stage, journal.fault
+            );
+            println!("  program          {}", short_hex(&journal.stage_program_commitment));
+        }
+        (Challenge::Disputed(disputed), Verdict::AwaitingDefence(admitted)) => {
+            println!("  chain digest     {}", hex::encode(admitted.chain_digest));
+            println!("  stage            {} '{}'", admitted.stage_index, admitted.stage.name);
+            println!("  committed output {}", hex::encode(&admitted.stage.output_payload_commitment));
+            println!("  claimed output   {}", hex::encode(&disputed.claimed_output));
+            println!("  H_C              {}", short_hex(&admitted.trace_commitment));
+        }
+        (Challenge::Proven(_), Verdict::AwaitingDefence(_)) => {
+            unreachable!("a proven challenge verifies to a condemnation")
+        }
+    }
+}
 
-    let evidence_path = recorded.chain_dir.join("execution-fraud.receipt");
-    std::fs::write(&evidence_path, postcard::to_allocvec(&receipt).unwrap())
-        .map_err(|e| Error::Other(format!("failed to write {}: {e}", evidence_path.display())))?;
+/// `cargo raster chain challenge-verify` — what anyone (and later a settlement
+/// contract) checks about a posted challenge, of either form:
+///
+/// - **proven** — the chain-fraud receipt against the pinned image ids, and
+///   that it condemns the chain the challenge carries: the chain is condemned;
+/// - **disputed** — admission, plus that `H_C`'s body is available beside the
+///   challenge and is the commitment it names: it awaits a defence.
+///
+/// With `chain_commitment`, also that the challenge is against that chain.
+pub fn challenge_verify(challenge_path: &str, chain_commitment: Option<&str>) -> Result<()> {
+    let challenge_path = PathBuf::from(challenge_path);
+    let bytes = std::fs::read(&challenge_path)
+        .map_err(|e| Error::Other(format!("failed to read {}: {e}", challenge_path.display())))?;
+    let challenge: Challenge = postcard::from_bytes(&bytes).map_err(|e| {
+        Error::Other(format!("{} is not a challenge: {e}", challenge_path.display()))
+    })?;
 
-    println!();
-    println!("execution-fraud evidence → {}", evidence_path.display());
-    println!("  stage            {} '{stage_name}'", fraud.stage_index);
-    println!("  program          {}", short_hex(&journal.program_commitment));
-    println!("  input manifest   {}", short_hex(&journal.input_manifest_commitment));
-    println!("  honest output    {}", short_hex(&fraud.recomputed));
-    println!("  committed output {}", short_hex(&fraud.committed));
-    println!("  window terminal  {}", journal.window_is_terminal);
-    println!();
-    println!(
-        "Evidence, not a self-contained fraud proof: it shows honest execution of this \n\
-         checkpoint's program and inputs ends in a different output, but not that the trace \n\
-         it was proven over is the honest one. A settlement layer supplies that by timeout."
-    );
+    let verdict = verify(&challenge).map_err(|refusal: AdmissionRefusal| {
+        Error::Other(format!("challenge refused: {refusal}"))
+    })?;
+
+    if let Some(path) = chain_commitment {
+        let local = std::fs::read(path)
+            .map_err(|e| Error::Other(format!("failed to read {path}: {e}")))?;
+        let local_digest: [u8; 32] = Sha256::digest(&local).into();
+        if local_digest != verdict.chain_digest() {
+            return Err(Error::Other(format!(
+                "the challenge is against chain {}, but {path} is chain {}",
+                hex::encode(verdict.chain_digest()),
+                hex::encode(local_digest)
+            )));
+        }
+    }
+
+    if let Verdict::AwaitingDefence(admitted) = &verdict {
+        // Data availability, locally: the body must be present and be `H_C`.
+        let body_path = challenge_path.with_file_name(CHALLENGE_BODY_FILE);
+        let body: TraceCommitment = std::fs::read(&body_path)
+            .map_err(|e| {
+                Error::Other(format!("H_C's body is not available at {}: {e}", body_path.display()))
+            })
+            .and_then(|bytes| {
+                postcard::from_bytes(&bytes).map_err(|e| {
+                    Error::Other(format!("{} is not a trace commitment: {e}", body_path.display()))
+                })
+            })?;
+        if body.header().digest() != admitted.trace_commitment {
+            return Err(Error::Other(format!(
+                "{} is not the trace commitment the challenge names",
+                body_path.display()
+            )));
+        }
+    }
+
+    match &verdict {
+        Verdict::Condemned { .. } => println!("proven challenge verified ✓ — the chain is condemned"),
+        Verdict::AwaitingDefence(_) => {
+            println!("disputed challenge admitted ✓ — awaiting a defence (H_C's body available)")
+        }
+    }
+    print_verdict(&challenge, &verdict);
     Ok(())
 }
 
-/// `cargo raster chain fraud-verify` — the relying party's checks: the
-/// receipt against the pinned chain-fraud image id, the committed inner
-/// image ids against the known-good guests, and the journal's chain digest
-/// against the local `chain-commitment`.
-pub fn fraud_verify(
-    receipt_path: Option<&str>,
-    manifest: Option<&str>,
-    chain_commitment: Option<&str>,
-) -> Result<()> {
-    // The receipt on the table condemns this chain, so refusing to load a chain
-    // whose shape is wrong would make exactly the receipts worth checking
-    // uncheckable. What is verified here is the receipt, against the recorded
-    // digest — not the chain's honesty, which the receipt is the answer to.
-    let recorded = load_recorded_chain(manifest, chain_commitment, ShapePolicy::AsClaimed)?;
-    let receipt_path = receipt_path
-        .map(PathBuf::from)
-        .unwrap_or_else(|| recorded.chain_dir.join(CHAIN_FRAUD_RECEIPT_FILE));
-    let bytes = std::fs::read(&receipt_path)
-        .map_err(|e| Error::Other(format!("failed to read {}: {e}", receipt_path.display())))?;
-    let receipt: risc0_zkvm::Receipt = postcard::from_bytes(&bytes)
-        .map_err(|e| Error::Other(format!("failed to decode {}: {e}", receipt_path.display())))?;
-
-    let journal = verify_chain_fraud_receipt(&receipt).map_err(|e| Error::Other(e.to_string()))?;
-
-    let local_digest = recorded.chain.digest();
-    if journal.chain_commitment_digest != local_digest {
-        return Err(Error::Other(format!(
-            "receipt condemns chain {} but the local chain-commitment digest is {}",
-            hex::encode(journal.chain_commitment_digest),
-            hex::encode(local_digest)
-        )));
-    }
-
-    let stage_name = recorded
-        .chain
-        .stages
-        .get(journal.faulty_stage as usize)
-        .map(|s| s.name.as_str())
-        .unwrap_or("?");
-    println!("chain fraud receipt verified ✓");
-    println!(
-        "  chain digest: {}",
-        hex::encode(journal.chain_commitment_digest)
-    );
-    println!(
-        "  faulty stage: {} '{}'  ({:?})",
-        journal.faulty_stage, stage_name, journal.fault
-    );
-    println!(
-        "  program:      {}",
-        short_hex(&journal.stage_program_commitment)
-    );
-    Ok(())
+fn write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
+    std::fs::write(path, bytes)
+        .map_err(|e| Error::Other(format!("failed to write {}: {e}", path.display())))
 }
 
 // ---------------------------------------------------------------------------
@@ -1666,7 +1735,7 @@ pub fn fraud_verify(
 ///
 /// `trace_format` is transport only: this function writes the trace and reads
 /// it back within the one call, and nothing downstream reads the file again —
-/// `chain audit` and `chain fraud-prove` work from the stage's `commit.bin`.
+/// `chain audit` and `chain challenge` re-run the stage themselves.
 /// So the choice is per-invocation and changes no commitment.
 ///
 /// With `no_auth` the stage runs with authenticated storage off and the trace
@@ -2817,7 +2886,7 @@ mod tests {
     #[test]
     fn a_source_stage_past_the_end_is_malformed_not_a_fault() {
         // Reported, not proved, and above all not indexed: treating this as a
-        // fault would have `fraud_prove` index `chain.stages[7]` to name the
+        // fault would have `challenge` index `chain.stages[7]` to name the
         // stage to blame.
         let recorded = recorded_from(shape_chain(7, IndexWidth::U32, 3, 3));
         let err = detect_shape_fraud(&recorded).unwrap_err().to_string();

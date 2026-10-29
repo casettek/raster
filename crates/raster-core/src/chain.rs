@@ -135,6 +135,32 @@ impl ChainCommitment {
     }
 }
 
+/// A cheap stage challenge (`docs/proposals/stage-challenge.md` §Phase 2):
+/// *stage `challenged_stage` of this chain does not output what the chain
+/// claims — here is a trace commitment `H_C` of the stage, and the output it
+/// ends in.*
+///
+/// It carries **no proof**. Whether `H_C` is an honest execution, and whether
+/// it ends in `claimed_output`, is exactly what an answer disproves: a
+/// refutation (`H_C` diverges) or a mislabel proof (`H_C` is honest but ends
+/// elsewhere). Admission checks only what public data can settle
+/// (`raster_prover::challenge::verify_challenge`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StageChallenge {
+    /// The chain commitment under challenge, whole, so admission and the
+    /// answer's aggregation recompute its digest rather than trust one.
+    #[serde(with = "serde_bytes")]
+    pub chain_commitment_bytes: Vec<u8>,
+    pub challenged_stage: u32,
+    /// `H_C`'s header; its body is published alongside (locally, for now:
+    /// `chain challenge` writes it beside the challenge).
+    pub trace_commitment_header: crate::transition::TraceCommitmentHeader,
+    /// The output the challenger says `H_C` ends in — an assertion, not a
+    /// proof. `sha256(output.bin)`, the form of `output_payload_commitment`.
+    #[serde(with = "serde_bytes")]
+    pub claimed_output: Vec<u8>,
+}
+
 /// Which committed chain fault a chain fraud proof exhibits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ChainFaultKind {
@@ -147,9 +173,8 @@ pub enum ChainFaultKind {
     /// fraud is not among them: with no trace commitment in the checkpoint
     /// there is nothing for a stage fraud receipt to be attributed against,
     /// so a divergent stage is established by the challenge/response protocol
-    /// instead — see `docs/proposals/chain-io-commitment.md` §3. Until that
-    /// lands, `chain audit --execution` detects it and `chain fraud-prove`
-    /// emits a terminal-window receipt as evidence.
+    /// instead — see `docs/proposals/stage-challenge.md`: a `Link` or `Shape`
+    /// receipt is a *proven* challenge, a wrong stage output a *disputed* one.
     Link,
     /// A repeat block's recorded trip count is not the one the stage that
     /// produced it committed — so the chain has the wrong *number of stages*,

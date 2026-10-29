@@ -56,10 +56,12 @@ fn main() {
     let entrypoint_authorization = next.entrypoint_authorization();
     let output_authorization = next.output_authorization();
 
-    // Continue the window, or finish on the proven fingerprint divergence.
+    // Continue the window, or end it: `Finished` on a proven divergence,
+    // `TerminalMatch` on a terminal window that matched throughout.
     let current_state = next.finalize(
         &window_context.init_state.fingerprint,
         window_context.final_committed_root.as_ref(),
+        window_context.window_is_terminal,
     );
 
     commit_journal(
