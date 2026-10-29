@@ -14,8 +14,8 @@ use std::collections::BTreeMap;
 pub struct ProofStorageState {
     frontier: SerializableFrontier,
     append_tree: ProofLog,
-    coordinate_index:
-        raster_core::coordinate_index::IncrementalCoordinateIndex<crate::storage::IndexStorage>,
+    // Share the reviewed compact index with the recorder and proof verifier.
+    coordinate_index: raster_core::coordinate_index::IncrementalCoordinateIndex,
 }
 
 fn empty_storage_frontier() -> SerializableFrontier {
@@ -91,9 +91,7 @@ impl ProofStorageState {
             frontier: empty_storage_frontier(),
             append_tree: ProofLog::Memory(append_tree),
             coordinate_index:
-                raster_core::coordinate_index::IncrementalCoordinateIndex::with_storage(
-                    crate::storage::IndexStorage::Memory(Default::default()),
-                ),
+                raster_core::coordinate_index::IncrementalCoordinateIndex::new(),
         }
     }
     pub fn for_recorded() -> Self {
@@ -101,9 +99,7 @@ impl ProofStorageState {
             frontier: empty_storage_frontier(),
             append_tree: ProofLog::Recorded(raster_prover::archive::DiskVec::new()),
             coordinate_index:
-                raster_core::coordinate_index::IncrementalCoordinateIndex::with_storage(
-                    crate::storage::IndexStorage::Disk(Default::default()),
-                ),
+                raster_core::coordinate_index::IncrementalCoordinateIndex::new(),
         }
     }
     pub fn advance(&mut self, step: &StepRecord, recorder: &TraceRecorder) {
@@ -405,15 +401,12 @@ pub fn prepare_step_io(
             let index_non_membership_witness = current_storage_state
                 .coordinate_index
                 .non_membership_proof(&entry.coordinates);
+            // The guest derives the new index root from this insertion proof;
+            // main no longer sends a second membership proof after the write.
             apply_storage_write_to_state(current_storage_state, &storage_write);
-            let index_membership_witness = current_storage_state
-                .coordinate_index
-                .membership_proof(&entry.coordinates)
-                .expect("Missing coordinate-index membership proof after write");
             storage_write_witness = Some(StorageWriteWitness {
                 entry,
                 index_non_membership_witness,
-                index_membership_witness,
             });
         }
     }

@@ -139,51 +139,7 @@ pub struct AuthenticatedObjectStore {
     /// is ever needed.
     /// See `docs/proposals/storage-write-cost.md`.
     cached_root: Vec<u8>,
-    coordinate_index: raster_core::coordinate_index::IncrementalCoordinateIndex<IndexStorage>,
-}
-
-#[derive(Debug)]
-pub(crate) enum IndexStorage {
-    Memory(raster_core::coordinate_index::MemoryIndexStorage),
-    Disk(raster_prover::archive::DiskIndexStorage),
-}
-impl raster_core::coordinate_index::CoordinateIndexStorage for IndexStorage {
-    fn entry(&self, coordinates: &CfsCoordinates) -> Option<StorageIndexValue> {
-        match self {
-            Self::Memory(s) => s.entry(coordinates),
-            Self::Disk(s) => s.entry(coordinates),
-        }
-    }
-    fn occupied(&self, key: &[u8; 32]) -> Option<CfsCoordinates> {
-        match self {
-            Self::Memory(s) => s.occupied(key),
-            Self::Disk(s) => s.occupied(key),
-        }
-    }
-    fn node(&self, key: &raster_core::coordinate_index::NodeKey) -> Option<Vec<u8>> {
-        match self {
-            Self::Memory(s) => s.node(key),
-            Self::Disk(s) => s.node(key),
-        }
-    }
-    fn put_entry(&mut self, coordinates: CfsCoordinates, value: StorageIndexValue) -> () {
-        match self {
-            Self::Memory(s) => s.put_entry(coordinates, value),
-            Self::Disk(s) => s.put_entry(coordinates, value),
-        }
-    }
-    fn put_occupied(&mut self, key: [u8; 32], value: CfsCoordinates) -> () {
-        match self {
-            Self::Memory(s) => s.put_occupied(key, value),
-            Self::Disk(s) => s.put_occupied(key, value),
-        }
-    }
-    fn put_node(&mut self, key: raster_core::coordinate_index::NodeKey, value: Vec<u8>) -> () {
-        match self {
-            Self::Memory(s) => s.put_node(key, value),
-            Self::Disk(s) => s.put_node(key, value),
-        }
-    }
+    coordinate_index: raster_core::coordinate_index::IncrementalCoordinateIndex,
 }
 
 impl std::fmt::Debug for AuthenticatedObjectStore {
@@ -712,13 +668,8 @@ impl AuthenticatedObjectStore {
             objects: ObjectStore::with_storage(policy),
             frontier,
             cached_root,
-            coordinate_index:
-                raster_core::coordinate_index::IncrementalCoordinateIndex::with_storage(
-                    match policy {
-                        crate::WorkingStorage::Memory => IndexStorage::Memory(Default::default()),
-                        crate::WorkingStorage::Disk => IndexStorage::Disk(Default::default()),
-                    },
-                ),
+            // Use main's compact in-memory index for both object-store policies.
+            coordinate_index: raster_core::coordinate_index::IncrementalCoordinateIndex::new(),
         }
     }
 
@@ -1953,26 +1904,14 @@ mod tests {
                 }),
             );
             let reference = StorageRef::new(entry.coordinates, entry.object_commitment);
-            let selector = SelectorPath::new(vec![SelectorSegment::Field("value".into())]);
+            let selector = SelectorPath::new(vec![
+                SelectorSegment::Variant("Ok".into()),
+                SelectorSegment::Field("value".into()),
+            ]);
             let witness = store
                 .selection_witness(&reference, &selector, SelectionPayloadKind::Raw)
                 .unwrap();
             assert_eq!(witness.proof.root_hash, root_hash);
-            let resolved = store
-                .resolve::<std::result::Result<RequiredFieldDraft, String>>(&reference)
-                .unwrap();
-            let unwrapped = StorageValue::new_with_selection(
-                resolved.reference,
-                resolved.bytes,
-                resolved.selector,
-                resolved.selection,
-                resolved.value.unwrap(),
-            );
-            let native: StorageValue<u64> =
-                crate::input::select_storage_value(&unwrapped, &selector).unwrap();
-            assert_eq!(native.value, 42);
-            assert_eq!(native.bytes, witness.bytes);
-            assert_eq!(native.selection.source_root_hash, witness.proof.root_hash);
             let mut wrong_value = witness.clone();
             *wrong_value.bytes.last_mut().unwrap() ^= 1;
             assert!(!verify_selection_proof(
@@ -1990,14 +1929,17 @@ mod tests {
                 .unwrap();
             assert!(!verify_selection_proof(&wrong_tag.bytes, &wrong_tag.proof));
             assert!(matches!(
-                witness.proof.steps[0],
-                SelectionProofStep::ResultOk
+                &witness.proof.steps[0],
+                SelectionProofStep::EnumNewtype { variant } if variant == "Ok"
             ));
             assert!(verify_selection_proof(&witness.bytes, &witness.proof));
             let selected_root = raster_core::input::selected_subtree_root(&witness.bytes).unwrap();
             assert!(verify_selection_reference(&selected_root, &witness.proof));
             let mut repeated = witness.clone();
-            repeated.proof.steps.insert(0, SelectionProofStep::ResultOk);
+            repeated.proof.steps.insert(
+                0,
+                SelectionProofStep::EnumNewtype { variant: "Ok".into() },
+            );
             assert!(!verify_selection_proof(&repeated.bytes, &repeated.proof));
             let mut tampered = witness.clone();
             tampered.proof.steps.remove(0);

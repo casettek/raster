@@ -605,9 +605,55 @@ fn a_declared_narrowing_the_step_skipped_is_refused() {
 
 /// The step narrowed where the CFS declares the parameter passed whole.
 #[test]
-#[should_panic(expected = "Storage sequence scope input does not match consumer binding")]
+#[should_panic(expected = "selects a different part of the caller's value than the CFS declares")]
 fn an_undeclared_narrowing_is_refused() {
     verify_narrowed_scope_read(&[], &["personal_data"], &["personal_data", "name"], b"personal-data");
+}
+
+/// `sub`'s consumer reads `sub`'s parameter 0 whole, as list metadata (`List`,
+/// a 41-byte `0x0A` payload), where the caller forwarded it as `Raw` — the
+/// shape of a recur site inside a recur sequence sweeping a list the caller
+/// passed in (iris's `prefill-range`, `layer.w_v.pages`). `read_from` is the
+/// commitment of the object the consumer read.
+fn verify_whole_scope_read_as_list_metadata(read_from: &[u8]) {
+    let cfs_cursor = scope_binding_cfs_reading(InputBinding::seq_input(0));
+    let (step_record, _, _, _) =
+        scope_binding_scenario(CfsCoordinates(vec![]), sha(b"personal-data"));
+    let caller_argument = selecting(
+        storage_input_witness(CfsCoordinates(vec![]), sha(b"personal-data")),
+        field_path(&["lines"]),
+    );
+    let mut step_source = selecting(
+        storage_input_witness(CfsCoordinates(vec![]), sha(read_from)),
+        field_path(&["lines"]),
+    );
+    for data in step_source.storage.values_mut() {
+        data.selection.payload_kind = raster_core::input::SelectionPayloadKind::List;
+        data.selection.selected_len = 41;
+        data.selection.selected_hash = [0x0A; 32];
+    }
+    verify_step_record_inputs(
+        &cfs_cursor,
+        &step_record,
+        Some(&step_source),
+        Some(&caller_argument),
+        None,
+    );
+}
+
+/// Same node, a different view of it: accepted. Each view is proven against
+/// the store by the step that recorded it; what this check establishes is
+/// that both name the same node.
+#[test]
+fn a_whole_scope_parameter_read_through_another_view_verifies() {
+    verify_whole_scope_read_as_list_metadata(b"personal-data");
+}
+
+/// A different view is not a licence to read a different object.
+#[test]
+#[should_panic(expected = "reads a different object than the caller passed")]
+fn a_whole_scope_parameter_read_from_another_object_is_refused() {
+    verify_whole_scope_read_as_list_metadata(b"another-object");
 }
 
 /// The declared path, read out of a different object.
@@ -1857,20 +1903,12 @@ fn build_write_witness(
 ) -> StorageWriteWitness {
     let (_frontier, _root, before_index, _before_index_root) =
         build_storage_context(before_entries);
-    let mut after_entries = before_entries.to_vec();
-    after_entries.push(new_entry.clone());
-    let (_frontier, _root, after_index, _after_index_root) = build_storage_context(&after_entries);
     StorageWriteWitness {
         entry: new_entry.clone(),
         index_non_membership_witness: coordinate_index_non_membership_proof(
             &before_index,
             &new_entry.coordinates,
         ),
-        index_membership_witness: coordinate_index_membership_proof(
-            &after_index,
-            &new_entry.coordinates,
-        )
-        .expect("membership proof should exist after write"),
     }
 }
 
@@ -2146,6 +2184,10 @@ fn verify_storage_transition_rejects_duplicate_coordinates() {
         index_root_before.clone(),
         index_root_before.clone(),
     );
+    // The existing key's own path, presented as an empty slot: the only
+    // non-membership a host could offer for coordinates already written.
+    let existing_path = coordinate_index_membership_proof(&before_index, &existing_entry.coordinates)
+        .expect("existing coordinate should have membership proof");
     let witness = StorageWitness {
         reads: Vec::new(),
         write: Some(StorageWriteWitness {
@@ -2156,16 +2198,50 @@ fn verify_storage_transition_rejects_duplicate_coordinates() {
             index_non_membership_witness:
                 raster_core::transition::CoordinateIndexNonMembershipProof {
                     coordinates: existing_entry.coordinates.clone(),
-                    siblings: vec![[0; 32].into(); 256],
+                    terminal: raster_core::transition::IndexTerminal::Empty,
+                    siblings: existing_path.siblings,
                 },
-            index_membership_witness: coordinate_index_membership_proof(
-                &before_index,
-                &existing_entry.coordinates,
-            )
-            .expect("existing coordinate should have membership proof"),
         }),
     };
 
+    let _ = verify_storage_transition(
+        &step,
+        None,
+        &BTreeMap::new(),
+        Some(&b"out".to_vec()),
+        Some(&witness),
+        &mut before_frontier,
+        &index_root_before,
+    );
+}
+
+/// The index root after a write is computed, not proven: a record claiming
+/// any other root is refused, here one that dropped the write from the index.
+#[test]
+#[should_panic(expected = "Coordinate-index root after write does not match the inserted entry")]
+fn a_write_claiming_another_index_root_after_is_refused() {
+    let new_entry = StorageEntry {
+        coordinates: CfsCoordinates(vec![1]),
+        object_commitment: sha(b"out"),
+    };
+    let (mut before_frontier, root_before, _before_index, index_root_before) =
+        build_storage_context(&[]);
+    let (_after_frontier, root_after, _after_index, _index_root_after) =
+        build_storage_context(&[new_entry.clone()]);
+    let step = tile_step_with_store_roots(
+        1,
+        new_entry.coordinates.clone(),
+        Vec::new(),
+        new_entry.object_commitment.clone(),
+        root_before,
+        root_after,
+        index_root_before.clone(),
+        index_root_before.clone(),
+    );
+    let witness = StorageWitness {
+        reads: Vec::new(),
+        write: Some(build_write_witness(&[], &new_entry)),
+    };
     let _ = verify_storage_transition(
         &step,
         None,
@@ -4742,7 +4818,7 @@ fn a_recur_sequence_body_reading_its_item_is_accepted() {
 }
 
 #[test]
-#[should_panic(expected = "Storage sequence scope input does not match consumer binding")]
+#[should_panic(expected = "selects a different part of the caller's value than the CFS declares")]
 fn a_recur_sequence_body_reading_another_element_is_rejected() {
     let (_, scope, _) = recur_sequence_iteration(1);
     let (step, input) = decorate_reading(1, 0);
@@ -5533,70 +5609,4 @@ fn a_tile_reading_the_value_inside_an_err_is_rejected() {
         Some(&input),
         &witnesses,
     );
-}
-
-
-// A scope may forward a full list which a recurrence consumes as metadata.
-// View conversion must never allow changing the stored object or selection.
-#[test]
-fn scope_list_views_preserve_source_identity() {
-    use raster_core::input::SelectionPayloadKind;
-    let (step, _, _, _) = scope_binding_scenario(CfsCoordinates(vec![]), sha(b"list"));
-    let scope = selecting(storage_input_witness(CfsCoordinates(vec![]), sha(b"list")),
-        field_path(&["donor_b_kv", "kv"]));
-    let mut consumer = scope.clone();
-    let selection = &mut consumer.storage.get_mut("arg").unwrap().selection;
-    selection.payload_kind = SelectionPayloadKind::List;
-    selection.selected_len = 41;
-    selection.selected_hash = [7; 32];
-    let check = |consumer: &FnInput, scope: &FnInput| {
-        verify_step_record_inputs(&scope_binding_cfs(), &step, Some(consumer), Some(scope), None);
-    };
-    check(&consumer, &scope);
-    check(&scope, &consumer);
-    for mutation in 0..5 {
-        let mut changed = consumer.clone();
-        let meta = changed.storage.get_mut("arg").unwrap();
-        match mutation {
-            0 => meta.coordinates = CfsCoordinates(vec![99]),
-            1 => meta.commitment[0] ^= 1,
-            2 => meta.selection.source_root_hash[0] ^= 1,
-            3 => meta.selection.path = raster_core::input::SelectorPath::new(field_path(&["sibling"])),
-            _ => meta.selector = raster_core::input::SelectorPath::new(field_path(&["sibling"])),
-        }
-        assert!(std::panic::catch_unwind(|| check(&changed, &scope)).is_err());
-    }
-    for mutation in 0..2 {
-        let mut changed = consumer.clone();
-        let selection = &mut changed.storage.get_mut("arg").unwrap().selection;
-        if mutation == 0 { selection.selected_hash[0] ^= 1; }
-        else { selection.selected_len += 1; }
-        assert!(std::panic::catch_unwind(|| check(&changed, &consumer)).is_err());
-    }
-}
-
-#[test]
-fn list_metadata_view_still_requires_authentic_payload() {
-    use raster_core::input::verify_selection_witness;
-    let root = swept_lines().0;
-    let (_, input, witnesses) = site_start_reading(root, swept_lines_metadata());
-    let commitment = &input.storage.get("input").unwrap().selection;
-    let witness = witnesses.get("input").unwrap();
-    assert!(verify_selection_witness(commitment, witness));
-    for mutation in 0..5 {
-        let mut changed = commitment.clone();
-        match mutation {
-            0 => changed.selected_hash[0] ^= 1,
-            1 => changed.selected_len += 1,
-            2 => changed.source_root_hash[0] ^= 1,
-            3 => changed.path = raster_core::input::SelectorPath::new(field_path(&["sibling"])),
-            _ => changed.payload_kind = raster_core::input::SelectionPayloadKind::Raw,
-        }
-        assert!(!verify_selection_witness(&changed, witness));
-    }
-    let mut tampered = witness.clone();
-    tampered.bytes[9] ^= 1;
-    let mut changed = commitment.clone();
-    changed.selected_hash = raster_core::input::selection_payload_hash(&tampered.bytes);
-    assert!(!verify_selection_witness(&changed, &tampered));
 }

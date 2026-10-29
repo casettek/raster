@@ -512,12 +512,7 @@ pub mod __private {
         #[cfg(feature = "profiling")]
         raster_runtime::record_tile_output_store_profile(output_store_duration_ns);
         match result {
-            Ok(_) => Ok(crate::into_auth_ref::<T, _>(
-                crate::typed_storage_with_resolver::<T>(
-                    reference,
-                    crate::resolve_storage_ok_value::<T>,
-                ),
-            )),
+            Ok(_) => Ok(crate::input::fallible_output_auth_ref::<T>(reference)),
             Err(error) => Err(error),
         }
     }

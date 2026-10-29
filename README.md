@@ -166,6 +166,17 @@ trace, later proof generation requires executing the program again.
 
 ### Live audit and fault proof
 
+Commitment generation and audit must use matching Raster versions. The compact
+coordinate index and explicit fallible-result selections adopted from main change
+execution commitments and proof inputs. Regenerate commitments and program locks
+from source when upgrading from the earlier index/implicit-selection implementation;
+do not reuse its disputed commitments with the new prover. Existing receipts must
+be verified with their matching proof-program version.
+
+Live recording and proof preparation use main's compact in-memory coordinate
+index directly. Saved-trace workflows may still use disk storage for other data,
+but their coordinate indexes also reside in RAM.
+
 From a Raster program directory, run:
 
 ```sh

@@ -129,30 +129,10 @@ fn assert_same_source(left: ResolvedSource<'_>, right: ResolvedSource<'_>) {
             );
         }
         (ResolvedSource::Storage(left_meta), ResolvedSource::Storage(right_meta)) => {
-            // A recurrence consumes list metadata, while its caller may have
-            // forwarded the full list. These payloads have different hashes
-            // and lengths but select the same immutable subtree. Payload
-            // authentication remains mandatory in verify_storage_transition;
-            // here we bind the source, not its serialization view.
-            let list_view_change = matches!(
-                (left_meta.selection.payload_kind, right_meta.selection.payload_kind),
-                (SelectionPayloadKind::List, SelectionPayloadKind::Raw)
-                    | (SelectionPayloadKind::Raw, SelectionPayloadKind::List)
+            assert_eq!(
+                left_meta, right_meta,
+                "Storage sequence scope input does not match consumer binding",
             );
-            if list_view_change {
-                assert_eq!(
-                    (&left_meta.coordinates, &left_meta.commitment, &left_meta.selector,
-                     &left_meta.selection.path, &left_meta.selection.source_root_hash),
-                    (&right_meta.coordinates, &right_meta.commitment, &right_meta.selector,
-                     &right_meta.selection.path, &right_meta.selection.source_root_hash),
-                    "Storage sequence scope input does not match consumer binding",
-                );
-            } else {
-                assert_eq!(
-                    left_meta, right_meta,
-                    "Storage sequence scope input does not match consumer binding",
-                );
-            }
         }
         _ => {
             panic!("Sequence scope source kind does not match consumer binding");
@@ -171,8 +151,8 @@ fn assert_same_source(left: ResolvedSource<'_>, right: ResolvedSource<'_>) {
 /// declares no static path; it is held to the caller's prefix, and its index
 /// values to their own citations.
 ///
-/// A path with nothing to narrow (`path` empty, no index) requires the same
-/// source, allowing the authenticated raw/list-metadata views of that source. Narrowing an inline value cannot be checked here — the
+/// A path with nothing to narrow (`path` empty, no index) is the old identity
+/// check, unchanged. Narrowing an inline value cannot be checked here — the
 /// guest has no selector over inline bytes — so it fails closed.
 fn assert_scope_source(
     consumer: ResolvedSource<'_>,
@@ -180,7 +160,21 @@ fn assert_scope_source(
     path: &[SelectorSegment],
     indexed: bool,
 ) {
-    if path.is_empty() && !indexed {
+    // A stored parameter passed whole is the narrowing case with an empty
+    // path, and is checked the same way: the same stored object, read through
+    // exactly the caller's path. Comparing the whole recorded records instead
+    // also compared *which view* of that node each side read, and the views
+    // legitimately differ: a caller forwards a list as `Raw`, while a recur
+    // site inside the sequence reads the same list as `0x0A` metadata
+    // (`List`) — same coordinates, commitment, root and path, different
+    // payload. Each view is proven against the store by the step that
+    // recorded it, so identity is what this check has to establish.
+    // Inline bytes have no selector to compare, so they still must be equal.
+    let both_stored = matches!(
+        (&consumer, &scope),
+        (ResolvedSource::Storage(_), ResolvedSource::Storage(_))
+    );
+    if path.is_empty() && !indexed && !both_stored {
         return assert_same_source(consumer, scope);
     }
     let (ResolvedSource::Storage(consumer), ResolvedSource::Storage(scope)) = (consumer, scope)
@@ -194,7 +188,7 @@ fn assert_scope_source(
     assert_eq!(
         (&consumer.coordinates, &consumer.commitment, &consumer.selection.source_root_hash),
         (&scope.coordinates, &scope.commitment, &scope.selection.source_root_hash),
-        "Narrowed sequence scope input reads a different object than the caller passed",
+        "Sequence scope input reads a different object than the caller passed",
     );
     let scope_path = scope.selection.path.segments.as_slice();
     let consumer_path = consumer.selection.path.segments.as_slice();
@@ -211,8 +205,8 @@ fn assert_scope_source(
         assert_eq!(
             consumer_path,
             expected.as_slice(),
-            "Narrowed sequence scope input selects a different part of the caller's value \
-             than the CFS declares",
+            "Sequence scope input selects a different part of the caller's value than the CFS \
+             declares",
         );
     }
 }

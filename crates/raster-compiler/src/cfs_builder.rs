@@ -451,6 +451,7 @@ mod tests {
                 output: None,
                 state_is_output: false,
                 carries_state: false,
+                try_unwrapped: false,
             }],
         );
         let sequence = Sequence {
@@ -516,6 +517,7 @@ mod tests {
                     output: None,
                     state_is_output: false,
                     carries_state: false,
+                    try_unwrapped: false,
                 }],
             );
             function.name = name.to_string();
@@ -657,6 +659,7 @@ mod tests {
                 output: None,
                 state_is_output: false,
                 carries_state: false,
+                try_unwrapped: false,
             }],
         );
         let sequence = Sequence {

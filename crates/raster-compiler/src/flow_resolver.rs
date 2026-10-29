@@ -42,6 +42,11 @@ pub struct FlowResolver {
     selection_index_sources: HashMap<String, Vec<String>>,
     /// Per alias local, the static selector path it appends to its root.
     selection_paths: HashMap<String, Vec<SelectorSegment>>,
+    /// Items that are a fallible tile call unwrapped with `?`. Their stored
+    /// object is the whole `Result<T>`, and the runtime binds the `T` through
+    /// the `Ok` variant (`fallible_output_auth_ref`), so every path read from
+    /// one starts with `Variant("Ok")`.
+    ok_rooted_items: HashSet<usize>,
 }
 
 impl FlowResolver {
@@ -72,6 +77,7 @@ impl FlowResolver {
     ) -> Vec<SequenceChildItem> {
         // Reset state for this sequence
         self.bindings.clear();
+        self.ok_rooted_items.clear();
         self.param_indices.clear();
         self.entry_arguments.clear();
         self.selection_aliases = sequence
@@ -166,6 +172,9 @@ impl FlowResolver {
             if let Some(ref binding_name) = call.result_binding {
                 self.bindings.insert(binding_name.clone(), item_index);
             }
+            if call.call_kind == CallKind::Tile && call.try_unwrapped {
+                self.ok_rooted_items.insert(item_index);
+            }
         }
 
         items
@@ -182,10 +191,15 @@ impl FlowResolver {
     /// program output has nowhere to carry them.
     pub fn resolve_return(&self, ret: &ReturnExpr, item_count: usize) -> Option<SequenceReturn> {
         let (source, path) = match ret {
-            ReturnExpr::TailCall => (
-                InputBinding::prior_item_output(item_count.checked_sub(1)?),
-                Vec::new(),
-            ),
+            ReturnExpr::TailCall => {
+                let source = InputBinding::prior_item_output(item_count.checked_sub(1)?);
+                // `Ok(call!(tile, …)?)` returns the unwrapped `T`, which the
+                // runtime binds through `Ok` exactly as it does a named
+                // `call!(tile, …)?` binding.
+                let mut path = Vec::new();
+                self.prefix_ok_variant(&source, &mut path);
+                (source, path)
+            }
             ReturnExpr::Rooted { root, path } => {
                 // The source carries no path of its own: the whole selector is
                 // `SequenceReturn::path`, which `resolve_value` prepends to.
@@ -197,6 +211,7 @@ impl FlowResolver {
                 if matches!(source.value_binding(), InputBinding::EntryArgument { .. }) {
                     full_path.insert(0, SelectorSegment::Field(final_root));
                 }
+                self.prefix_ok_variant(&source, &mut full_path);
                 (source, full_path)
             }
             ReturnExpr::Unbound { .. } | ReturnExpr::Tuple(_) => return None,
@@ -291,7 +306,24 @@ impl FlowResolver {
         if matches!(source.value_binding(), InputBinding::EntryArgument { .. }) {
             full_path.insert(0, SelectorSegment::Field(final_root));
         }
+        self.prefix_ok_variant(&source, &mut full_path);
         source.with_path(full_path)
+    }
+
+    /// Lead `path` with `Variant("Ok")` when `source` is a `?`-unwrapped
+    /// fallible tile's output, mirroring the runtime's selector prefix for it
+    /// (`raster::input::fallible_output_auth_ref`). The guest compares the
+    /// recorded path with this one exactly, so the two must agree.
+    fn prefix_ok_variant(&self, source: &InputBinding, path: &mut Vec<SelectorSegment>) {
+        if let InputBinding::PriorItemOutput {
+            intra_sequence_item_index,
+            ..
+        } = source.value_binding()
+        {
+            if self.ok_rooted_items.contains(intra_sequence_item_index) {
+                path.insert(0, SelectorSegment::Variant(String::from("Ok")));
+            }
+        }
     }
 
     /// Resolve the name an argument or return is rooted at to its source,
@@ -505,6 +537,7 @@ mod tests {
                     output: None,
                     state_is_output: false,
                     carries_state: false,
+                    try_unwrapped: false,
                 },
                 CallInfo {
                     callee: "exclaim".to_string(),
@@ -519,6 +552,7 @@ mod tests {
                     output: None,
                     state_is_output: false,
                     carries_state: false,
+                    try_unwrapped: false,
                 },
             ],
         );
@@ -647,6 +681,7 @@ mod tests {
                 output: None,
                 state_is_output: false,
                 carries_state: false,
+                try_unwrapped: false,
             }],
         );
         seq_func.selection_aliases = vec![
@@ -737,6 +772,7 @@ mod tests {
             output: None,
             state_is_output: false,
             carries_state: false,
+            try_unwrapped: false,
         };
         //   fn seq(name, personal_data) {
         //       call!(personal_greet, select!(String, personal_data.name));
@@ -860,6 +896,107 @@ mod tests {
             .map(|item| item.inputs().first().cloned().unwrap_or_else(InputBinding::inline))
             .collect();
         (sources, returns)
+    }
+
+    fn ok_variant() -> SelectorSegment {
+        SelectorSegment::Variant("Ok".to_string())
+    }
+
+    /// `call!(tile, …)?` hands back the `T` inside the stored `Result<T>`, which
+    /// the runtime binds through the `Ok` variant. Every path read from it —
+    /// a field, the whole value, through a `select!` local or inline — must
+    /// lead with `Ok`, or the guest's exact path check refuses honest steps.
+    #[test]
+    fn paths_from_a_try_unwrapped_tile_lead_with_the_ok_variant() {
+        let (sources, _) = resolve_parsed_main(
+            r#"
+            fn main(x: In) {
+                let params = call!(validate, x)?;
+                let hidden = select!(u32, params.hidden_size);
+                call!(use_alias, hidden);
+                call!(use_inline, select!(u32, params.hidden_size));
+                call!(use_whole, params);
+            }
+            "#,
+        );
+        let inside = vec![ok_variant(), field("hidden_size")];
+        assert_eq!(sources[1], InputBinding::prior_item_output(0).with_path(inside.clone()));
+        assert_eq!(sources[2], InputBinding::prior_item_output(0).with_path(inside));
+        assert_eq!(sources[3], InputBinding::prior_item_output(0).with_path(vec![ok_variant()]));
+    }
+
+    /// Without `?` the caller holds the stored `Result<T>` itself, bound with
+    /// an empty selector: no variant prefix.
+    #[test]
+    fn a_tile_result_used_without_try_has_no_variant_prefix() {
+        let (sources, _) = resolve_parsed_main(
+            r#"
+            fn main(x: In) {
+                let result = call!(validate, x);
+                call!(use_whole, result);
+            }
+            "#,
+        );
+        assert_eq!(sources[1], InputBinding::prior_item_output(0).with_path(vec![]));
+    }
+
+    #[test]
+    fn returning_a_try_unwrapped_tile_output_reads_through_ok() {
+        let (_, returns) = resolve_parsed_main(
+            r#"
+            fn main(x: In) -> Result<P> {
+                let params = call!(validate, x)?;
+                Ok(params)
+            }
+            "#,
+        );
+        assert_eq!(
+            returns,
+            Some(SequenceReturn {
+                source: InputBinding::prior_item_output(0),
+                path: vec![ok_variant()],
+            })
+        );
+    }
+
+    /// The same unwrapped value returned as a tail call, `Ok(call!(tile, …)?)`:
+    /// the return reads through `Ok` too, so `ProgramEnd` (and a caller
+    /// consuming a nested sequence's result) agrees with the runtime's path.
+    #[test]
+    fn returning_a_try_unwrapped_tail_call_reads_through_ok() {
+        let (_, returns) = resolve_parsed_main(
+            r#"
+            fn main(x: In) -> Result<P> {
+                Ok(call!(validate, x)?)
+            }
+            "#,
+        );
+        assert_eq!(
+            returns,
+            Some(SequenceReturn {
+                source: InputBinding::prior_item_output(0),
+                path: vec![ok_variant()],
+            })
+        );
+    }
+
+    /// A tail call that is not unwrapped returns the stored value itself.
+    #[test]
+    fn a_tail_call_without_try_has_no_variant_prefix() {
+        let (_, returns) = resolve_parsed_main(
+            r#"
+            fn main(x: In) -> P {
+                call!(validate, x)
+            }
+            "#,
+        );
+        assert_eq!(
+            returns,
+            Some(SequenceReturn {
+                source: InputBinding::prior_item_output(0),
+                path: vec![],
+            })
+        );
     }
 
     fn field(name: &str) -> SelectorSegment {
@@ -1037,6 +1174,7 @@ mod tests {
                 output: None,
                 state_is_output: false,
                 carries_state: false,
+                try_unwrapped: false,
             }],
             vec![
                 ("row".to_string(), "table".to_string()),
@@ -1092,6 +1230,7 @@ mod tests {
                 output: None,
                 state_is_output: false,
                 carries_state: false,
+                try_unwrapped: false,
             }],
         );
 
@@ -1159,6 +1298,7 @@ mod tests {
                     output: None,
                     state_is_output: false,
                     carries_state: false,
+                    try_unwrapped: false,
                 },
                 CallInfo {
                     callee: "exclaim".to_string(),
@@ -1173,6 +1313,7 @@ mod tests {
                     output: None,
                     state_is_output: false,
                     carries_state: false,
+                    try_unwrapped: false,
                 },
             ],
         );
@@ -1254,6 +1395,7 @@ mod tests {
                 output: None,
                 state_is_output: false,
                 carries_state: false,
+                try_unwrapped: false,
             }],
             vec![("name".to_string(), "personal_data".to_string())],
         );
@@ -1311,6 +1453,7 @@ mod tests {
                 output: None,
                 state_is_output: false,
                 carries_state: false,
+                try_unwrapped: false,
             }],
             vec![("seed".to_string(), "seed".to_string())],
         );
@@ -1361,6 +1504,7 @@ mod tests {
                 output: None,
                 state_is_output: false,
                 carries_state: false,
+                try_unwrapped: false,
             }],
         );
         let sequence = Sequence {
@@ -1423,6 +1567,7 @@ mod tests {
                 output: None,
                 state_is_output: false,
                 carries_state: false,
+                try_unwrapped: false,
             }],
             vec![
                 ("row".to_string(), "table".to_string()),
@@ -1495,6 +1640,7 @@ mod tests {
                 output: None,
                 state_is_output: false,
                 carries_state: false,
+                try_unwrapped: false,
             }],
             vec![("row".to_string(), "table".to_string())],
         );

@@ -112,9 +112,10 @@ fn bound_indexes(path: &SelectorPath) -> impl Iterator<Item = (u64, &str, IndexW
             source,
             width,
         } => Some((*index, source.as_str(), *width)),
-        SelectorSegment::Field(_) | SelectorSegment::Index(_) | SelectorSegment::Range { .. } => {
-            None
-        }
+        SelectorSegment::Field(_)
+        | SelectorSegment::Index(_)
+        | SelectorSegment::Range { .. }
+        | SelectorSegment::Variant(_) => None,
     })
 }
 

@@ -1,10 +1,10 @@
 //! External input marker and resolved value types.
 
-use crate::hash::{Digest, Sha256};
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 use serde::{Deserialize, Serialize};
+use crate::hash::{Digest, Sha256};
 
 use crate::cfs::CfsCoordinates;
 
@@ -112,6 +112,17 @@ pub enum SelectorSegment {
         source: String,
         width: IndexWidth,
     },
+    /// The payload of an enum's newtype variant, by variant name.
+    ///
+    /// A fallible tile stores its whole `Result<T>`, so the `T` a caller
+    /// receives from `call!(tile, …)?` sits under `Ok`. Naming the variant in
+    /// the path is what lets a selection into that `T` be read and proved
+    /// against the stored root, instead of against a value the stored tree
+    /// does not hold. Selecting a variant the value does not have fails.
+    ///
+    /// Last on purpose: postcard encodes variants by position, so appending
+    /// keeps every existing selector, and every commitment over one, unchanged.
+    Variant(String),
 }
 
 /// What a [`SelectorSegment`] does to the tree, with provenance projected away.
@@ -129,6 +140,7 @@ pub enum SelectorDescent<'a> {
     Field(&'a str),
     Index(u64),
     Range { start: u64, end: u64 },
+    Variant(&'a str),
 }
 
 impl SelectorSegment {
@@ -141,6 +153,7 @@ impl SelectorSegment {
                 start: *start,
                 end: *end,
             },
+            Self::Variant(name) => SelectorDescent::Variant(name.as_str()),
         }
     }
 }
@@ -261,9 +274,11 @@ pub enum SelectionProofStep {
         len: u64,
         siblings: Vec<ListProofSibling>,
     },
-    /// Authenticate the successful wrapper removed by a fallible call binding.
-    /// This leading step consumes no selector segment and binds the `Ok` tag.
-    ResultOk,
+    /// Descent into an enum's newtype variant: the parent is
+    /// [`enum_newtype_root`] of `variant` over the child's root. No siblings —
+    /// a newtype variant has one child. Appended last, like
+    /// [`SelectorSegment::Variant`], so existing proofs encode unchanged.
+    EnumNewtype { variant: String },
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -460,6 +475,16 @@ pub fn struct_commitments_root<'a>(
         hasher.update(child_root);
     }
     hasher.finalize().into()
+}
+
+/// The one definition of an enum newtype variant's commitment: the
+/// `b"enum-newtype"` domain tag, the variant name, then the payload's root.
+///
+/// Shared by the tree builder (`tree.rs`) and the selection verifier, for the
+/// same reason as [`struct_commitments_root`]: a selection proof through a
+/// variant only verifies if both sides hash it identically.
+pub fn enum_newtype_root(variant: &str, child_root: &Hash32) -> Hash32 {
+    selection_hash(&[b"enum-newtype", variant.as_bytes(), child_root.as_slice()])
 }
 
 fn parse_u64(bytes: &[u8], offset: &mut usize) -> Option<u64> {
@@ -970,6 +995,12 @@ fn step_proves_segment(step: &SelectionProofStep, segment: &SelectorSegment) -> 
             SelectionProofStep::ListRange { start, .. },
             SelectorSegment::Range { start: claimed, .. },
         ) => start == claimed,
+        // The variant name is hashed into the parent, so pinning it here is
+        // what stops a proof through `Err` from claiming the path of `Ok`.
+        (
+            SelectionProofStep::EnumNewtype { variant },
+            SelectorSegment::Variant(claimed),
+        ) => variant == claimed,
         _ => false,
     }
 }
@@ -1073,24 +1104,15 @@ fn fold_list_range(
     ]))
 }
 
-/// Do the proof's steps describe the path it claims, one step per segment after
-/// an optional authenticated leading Ok wrapper, outermost first? Shared by
-/// both entry points below, since a proof that
+/// Do the proof's steps describe the path it claims, one step per segment,
+/// outermost first? Shared by both entry points below, since a proof that
 /// does not describe its own path is invalid however its leaf is obtained.
 fn proof_steps_match_path(proof: &SelectionProof) -> bool {
-    let mut steps = proof.steps.as_slice();
-    if matches!(steps.first(), Some(SelectionProofStep::ResultOk)) {
-        // One successful-call unwrap, matching resolve_storage_ok_value.
-        // Empty paths still mean the complete stored Result.
-        if proof.path.segments.is_empty() {
-            return false;
-        }
-        steps = &steps[1..];
-    }
-    steps.len() == proof.path.segments.len()
-        && steps
+    proof.steps.len() == proof.path.segments.len()
+        && proof
+            .steps
             .iter()
-            .zip(&proof.path.segments)
+            .zip(proof.path.segments.iter())
             .all(|(step, segment)| step_proves_segment(step, segment))
 }
 
@@ -1111,13 +1133,11 @@ pub fn verify_selection_reference(selected_root: &Hash32, proof: &SelectionProof
     if !proof_steps_match_path(proof) {
         return false;
     }
-    if matches!(
-        proof.steps.last(),
-        Some(SelectionProofStep::ListRange { .. })
-    ) {
+    if matches!(proof.steps.last(), Some(SelectionProofStep::ListRange { .. })) {
         return false;
     }
-    fold_selection_steps(*selected_root, &proof.steps).is_some_and(|hash| hash == proof.root_hash)
+    fold_selection_steps(*selected_root, &proof.steps)
+        .is_some_and(|hash| hash == proof.root_hash)
 }
 
 pub fn verify_selection_proof(selected_bytes: &[u8], proof: &SelectionProof) -> bool {
@@ -1164,9 +1184,6 @@ fn fold_selection_steps(start: Hash32, steps: &[SelectionProofStep]) -> Option<H
     let mut current_hash = start;
     for step in steps.iter().rev() {
         current_hash = match step {
-            SelectionProofStep::ResultOk => {
-                selection_hash(&[b"enum-newtype", b"Ok", current_hash.as_slice()])
-            }
             SelectionProofStep::Struct {
                 field_index,
                 field_names,
@@ -1226,6 +1243,9 @@ fn fold_selection_steps(start: Hash32, steps: &[SelectionProofStep]) -> Option<H
             // A range step is only valid as the final step, which was consumed
             // before this loop.
             SelectionProofStep::ListRange { .. } => return None,
+            SelectionProofStep::EnumNewtype { variant } => {
+                enum_newtype_root(variant, &current_hash)
+            }
         };
     }
     Some(current_hash)
@@ -1770,12 +1790,7 @@ mod tests {
         // stage's `output.bin` with `parse_scalar_leaf`, and every verifier
         // afterwards re-encodes it with `scalar_leaf_root` and compares against
         // what that stage committed.
-        for width in [
-            IndexWidth::U8,
-            IndexWidth::U16,
-            IndexWidth::U32,
-            IndexWidth::U64,
-        ] {
+        for width in [IndexWidth::U8, IndexWidth::U16, IndexWidth::U32, IndexWidth::U64] {
             let payload = encode_index_leaf_payload(7, width).unwrap();
             assert_eq!(parse_scalar_leaf(&payload), Some((width, 7)));
             assert_eq!(
@@ -1795,20 +1810,12 @@ mod tests {
         let mut trailing = payload.clone();
         trailing.push(0xff);
         assert_eq!(parse_scalar_leaf(&trailing), None, "trailing bytes");
-        assert_eq!(
-            parse_scalar_leaf(&payload[..payload.len() - 1]),
-            None,
-            "truncated"
-        );
+        assert_eq!(parse_scalar_leaf(&payload[..payload.len() - 1]), None, "truncated");
 
         let mut odd_width = payload.clone();
         odd_width[1] = 3;
         odd_width.truncate(1 + 8 + 3);
-        assert_eq!(
-            parse_scalar_leaf(&odd_width),
-            None,
-            "3-byte leaf is no scalar"
-        );
+        assert_eq!(parse_scalar_leaf(&odd_width), None, "3-byte leaf is no scalar");
 
         let mut not_a_leaf = payload.clone();
         not_a_leaf[0] = 0x01;
@@ -2467,6 +2474,99 @@ mod tests {
             payload_kind: SelectionPayloadKind::List,
         };
         (commitment, SelectionWitness::from_payload(payload, proof))
+    }
+
+    /// A real `Ok(Pair { a, b })`, built by the tree builder, and a proof of
+    /// `[Ok, b]` against its root: the payload is `b`'s own subtree, the root
+    /// is the stored value's. This is the shape a fallible tile's output has
+    /// in storage, and what a `select!` through `call!(tile, …)?` reads.
+    fn fallible_output_proof() -> (Vec<u8>, SelectionProof) {
+        #[derive(serde::Serialize)]
+        struct Pair {
+            a: u32,
+            b: u32,
+        }
+        let stored: core::result::Result<Pair, String> = Ok(Pair { a: 7, b: 42 });
+        let tree = crate::tree::tree_value_from_serialize(&stored).unwrap();
+        let (_, root) = crate::tree::subtree_payload_and_root(&tree).unwrap();
+
+        let pair = crate::tree::subtree_children(&tree)[0];
+        let fields = crate::tree::subtree_children(pair);
+        let (_, a_root) = crate::tree::subtree_payload_and_root(fields[0]).unwrap();
+        let (b_payload, _) = crate::tree::subtree_payload_and_root(fields[1]).unwrap();
+
+        let proof = SelectionProof {
+            path: SelectorPath::new(alloc::vec![
+                SelectorSegment::Variant("Ok".into()),
+                SelectorSegment::Field("b".into()),
+            ]),
+            root_hash: root,
+            steps: alloc::vec![
+                SelectionProofStep::EnumNewtype {
+                    variant: "Ok".into(),
+                },
+                SelectionProofStep::Struct {
+                    field_index: 1,
+                    field_names: alloc::vec!["a".into(), "b".into()],
+                    siblings: alloc::vec![a_root],
+                },
+            ],
+        };
+        (b_payload, proof)
+    }
+
+    #[test]
+    fn a_selection_through_an_ok_variant_verifies_against_the_stored_root() {
+        let (payload, proof) = fallible_output_proof();
+        assert!(verify_selection_proof(&payload, &proof));
+    }
+
+    /// The variant name is part of the parent's hash, so a proof cannot
+    /// claim `Ok` for a value stored as `Err`, or the reverse.
+    #[test]
+    fn a_selection_through_the_wrong_variant_is_refused() {
+        let (payload, mut proof) = fallible_output_proof();
+        proof.path.segments[0] = SelectorSegment::Variant("Err".into());
+        proof.steps[0] = SelectionProofStep::EnumNewtype {
+            variant: "Err".into(),
+        };
+        assert!(!verify_selection_proof(&payload, &proof));
+    }
+
+    /// Each step is pinned to its path segment: an enum step cannot stand in
+    /// for a field segment, nor name a different variant than the path.
+    #[test]
+    fn an_enum_step_that_does_not_match_its_segment_is_refused() {
+        let (payload, proof) = fallible_output_proof();
+
+        let mut as_field = proof.clone();
+        as_field.path.segments[0] = SelectorSegment::Field("Ok".into());
+        assert!(!verify_selection_proof(&payload, &as_field));
+
+        let mut other_variant = proof;
+        other_variant.path.segments[0] = SelectorSegment::Variant("Err".into());
+        assert!(!verify_selection_proof(&payload, &other_variant));
+    }
+
+    /// Dropping the variant step from both the path and the proof is how the
+    /// unfixed runtime recorded these reads: `[b]` from a root that is an
+    /// enum, not a struct. It must not verify.
+    #[test]
+    fn a_selection_that_skips_the_variant_is_refused() {
+        let (payload, mut proof) = fallible_output_proof();
+        proof.path.segments.remove(0);
+        proof.steps.remove(0);
+        assert!(!verify_selection_proof(&payload, &proof));
+    }
+
+    #[test]
+    fn the_tree_builder_and_the_verifier_agree_on_an_enum_newtype_root() {
+        let stored: core::result::Result<u32, String> = Ok(5);
+        let tree = crate::tree::tree_value_from_serialize(&stored).unwrap();
+        let (_, root) = crate::tree::subtree_payload_and_root(&tree).unwrap();
+        let (_, child_root) =
+            crate::tree::subtree_payload_and_root(crate::tree::subtree_children(&tree)[0]).unwrap();
+        assert_eq!(root, enum_newtype_root("Ok", &child_root));
     }
 
     #[test]

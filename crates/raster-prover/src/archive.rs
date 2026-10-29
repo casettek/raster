@@ -467,42 +467,6 @@ impl<T: Serialize + DeserializeOwned> Default for DiskVec<T> {
     }
 }
 
-use raster_core::{
-    cfs::CfsCoordinates,
-    coordinate_index::{CoordinateIndexStorage, IncrementalCoordinateIndex, NodeKey},
-    transition::StorageIndexValue,
-};
-#[derive(Debug, Default)]
-pub struct DiskIndexStorage {
-    entries: DiskMap<CfsCoordinates, StorageIndexValue>,
-    occupied: DiskMap<[u8; 32], CfsCoordinates>,
-    nodes: DiskMap<NodeKey, Vec<u8>>,
-}
-impl CoordinateIndexStorage for DiskIndexStorage {
-    fn entry(&self, key: &CfsCoordinates) -> Option<StorageIndexValue> {
-        self.entries.get(key)
-    }
-    fn occupied(&self, key: &[u8; 32]) -> Option<CfsCoordinates> {
-        self.occupied.get(key)
-    }
-    fn node(&self, key: &NodeKey) -> Option<Vec<u8>> {
-        self.nodes.get(key)
-    }
-    fn put_entry(&mut self, key: CfsCoordinates, value: StorageIndexValue) {
-        self.entries.insert(key, value);
-    }
-    fn put_occupied(&mut self, key: [u8; 32], value: CfsCoordinates) {
-        self.occupied.insert(key, value);
-    }
-    fn put_node(&mut self, key: NodeKey, value: Vec<u8>) {
-        self.nodes.insert(key, value);
-    }
-}
-pub type DiskCoordinateIndex = IncrementalCoordinateIndex<DiskIndexStorage>;
-pub fn coordinate_index() -> DiskCoordinateIndex {
-    IncrementalCoordinateIndex::with_storage(DiskIndexStorage::default())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
