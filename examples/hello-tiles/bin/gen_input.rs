@@ -7,12 +7,22 @@ fn main() -> Result<(), Box<dyn Error>> {
     let out_dir = PathBuf::from(std::env::args().nth(1).unwrap_or_else(|| ".".to_string()));
     fs::create_dir_all(&out_dir)?;
 
+    // Optional fixture size for exercising proof windows across longer recur runs.
+    let line_count: usize = std::env::args()
+        .nth(2)
+        .map(|s| s.parse())
+        .transpose()?
+        .unwrap_or(2);
+    let mut lines = vec!["221B Baker Street".to_string(), "Flat B".to_string()];
+    for index in 2..line_count {
+        lines.push(format!("Address line {index}"));
+    }
     let data = PersonalData {
         age: 25,
         name: "John".to_string(),
         addresses: vec![
             Address {
-                lines: vec!["221B Baker Street".to_string(), "Flat B".to_string()].into(),
+                lines: lines.into(),
                 indexes: vec![7, 42].into(),
             },
             Address {

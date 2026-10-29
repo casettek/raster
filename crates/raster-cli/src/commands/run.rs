@@ -10,15 +10,16 @@ use raster_analysis::{Analyzer, Report};
 use raster_compiler::{CfsBuilder, Project};
 
 use raster_core::cfs::ControlFlowSchema;
-use raster_core::trace::{ExecTarget, StepKind, Trace, TraceEvent};
+use raster_core::trace::{ExecTarget, StepKind, TraceEvent};
 use raster_core::{Error, Result};
+use raster_prover::archive::DiskVec;
 
-use raster_prover::trace::{FraudProofConfig, VerificationResult};
+use raster_prover::trace::FraudProofConfig;
 use raster_runtime::TraceRecorder;
 
 use crate::commands::create_run_artifacts;
 use crate::commands::fraud::{fraud, FraudTarget};
-use crate::commands::prove::{commit, generate_fraud_proof, verify};
+use crate::commands::prove::commit;
 use crate::runtime_env::RuntimeEnv;
 use crate::{BackendType, TraceFormat};
 
@@ -30,10 +31,13 @@ pub fn run(
     fraud_proof_config: Option<FraudProofConfig>,
     fraud_step: Option<&FraudTarget>,
     audit_flag: Option<&str>,
+    proof_output: Option<&std::path::Path>,
+    audit_report: Option<&std::path::Path>,
     no_auth: bool,
     _verbose: bool,
     show_output: bool,
     trace_format: TraceFormat,
+    save_trace: bool,
     features: &[String],
     all_features: bool,
     no_default_features: bool,
@@ -100,10 +104,11 @@ pub fn run(
         )));
     }
 
-    let binary_path = project
-        .target_dir
-        .join("release")
-        .join(format!("{}{}", project.name, std::env::consts::EXE_SUFFIX));
+    let binary_path = project.target_dir.join("release").join(format!(
+        "{}{}",
+        project.name,
+        std::env::consts::EXE_SUFFIX
+    ));
 
     if !binary_path.exists() {
         return Err(Error::Other(format!(
@@ -111,7 +116,25 @@ pub fn run(
             binary_path.display()
         )));
     }
+    let pending = commit_flag
+        .filter(|path| !path.starts_with("fraud_") && fraud_step.is_none())
+        .map(|path| crate::live_commitment::PendingCommitment::new(std::path::Path::new(path)))
+        .transpose()?;
     let artifacts = create_run_artifacts(trace_format)?;
+    if let Some(disputed) = audit_flag {
+        println!("Run artifacts dir: {}", artifacts.run_dir.display());
+        return super::audit::run_live(
+            &project,
+            &cfs,
+            &binary_path,
+            &artifacts,
+            input,
+            input_manifest,
+            disputed,
+            proof_output,
+            audit_report,
+        );
+    }
     let trace_path = artifacts.trace_path.clone();
     let profile_path = artifacts.profile_path.clone();
     let profile_stream_path = artifacts.profile_stream_path.clone();
@@ -120,7 +143,11 @@ pub fn run(
     println!("  Project: {}", &project.name);
     println!("  Run ID: {}", artifacts.run_id);
     println!("  Run artifacts dir: {}", artifacts.run_dir.display());
-    println!("  Trace path: {}", trace_path.display());
+    if pending.is_none() || save_trace {
+        println!("  Trace path: {}", trace_path.display());
+    } else {
+        println!("  Commitment: live, memory storage; raw trace disabled");
+    }
     if profiling_enabled(features, all_features) && !no_auth {
         println!(
             "  Expected live profile stream: {}",
@@ -151,6 +178,17 @@ pub fn run(
     let runtime_env = RuntimeEnv::new(&artifacts.run_dir);
     if no_auth {
         runtime_env.apply(&mut cmd);
+    } else if let Some(pending) = &pending {
+        runtime_env
+            .committing(
+                &project.root_dir,
+                pending.path(),
+                fraud_proof_config.expect("commit window").window_size,
+                save_trace.then_some(trace_path.as_path()),
+                trace_format,
+            )
+            .profiling(&artifacts)
+            .apply(&mut cmd);
     } else {
         runtime_env
             .authenticated(&trace_path, trace_format)
@@ -239,6 +277,12 @@ pub fn run(
         }
     }
 
+    if !status.success() {
+        return Err(Error::Other(format!(
+            "program exited unsuccessfully ({status}); no commitment published"
+        )));
+    }
+
     // A program that returns a value writes its authorized output artifact to
     // the run dir, in the same format external input takes — so it can be a
     // following program's `--input`/`--input-manifest`.
@@ -280,60 +324,45 @@ pub fn run(
         return Ok(());
     }
 
-    let (mut trace, trace_recorder) =
-        load_trace_from_file(&trace_path, trace_format, &cfs, input, input_manifest)?;
-
-    if commit_flag.is_some() {
-        let commit_path = commit_flag.expect("Commitment path was provided");
-        let fraud_proof_config =
-            fraud_proof_config.expect("--fraud-proof-window-size is required alongside --commit");
-
-        // TODO: temprorary way to generate "fraud" trace commitment
-        // prefix file with fraud_{NAME}
-        //
-        // The injector is still selected by a `fraud_` filename prefix, but
-        // `--fraud-step` now also turns it on: passing the flag and forgetting
-        // the prefix used to write an honest commitment and audit clean, which
-        // reads as a passing fraud test and is not one.
-        if commit_path.starts_with("fraud_") || fraud_step.is_some() {
-            fraud(&mut trace, commit_path, fraud_proof_config, fraud_step)?;
-        } else {
-            commit(&trace, commit_path, fraud_proof_config)?;
-        }
-    } else if audit_flag.is_some() {
-        let commit_path = audit_flag.expect("Commitment path was provided");
-        let verification_result = verify(&trace, commit_path, &cfs)?;
-
-        match verification_result {
-            VerificationResult::Ok => println!("Verification Success"),
-            VerificationResult::Fraud(fraud_evidence) => {
-                let fraud_proof_path = generate_fraud_proof(
-                    fraud_evidence,
-                    &trace,
-                    &cfs,
-                    &trace_recorder,
-                    &project,
-                    input_manifest,
-                    commit_path,
-                )?;
-                println!("Fraud proof generated: {}", fraud_proof_path.display());
-            }
-        }
+    if let Some(pending) = pending {
+        pending.publish()?;
     } else {
-        // TODO: in case of just simple execution did printing out trace items is enough or save
-        // them to file
+        let (mut trace, trace_recorder) =
+            load_trace_from_file(&trace_path, trace_format, &cfs, input, input_manifest)?;
 
-        for step_record in trace {
-            println!();
-            println!("exec_index: {}", step_record.exec_index);
-            println!("sequence_id: {}", step_record.sequence_id);
-            println!(
-                "{}: {:?}",
-                step_coordinate_label(&step_record.kind),
-                step_record.coordinates
-            );
-            if let Some(target_id) = step_target_id(&step_record.kind) {
-                println!("id: {}", target_id);
+        if commit_flag.is_some() {
+            let commit_path = commit_flag.expect("Commitment path was provided");
+            let fraud_proof_config = fraud_proof_config
+                .expect("--fraud-proof-window-size is required alongside --commit");
+
+            // TODO: temprorary way to generate "fraud" trace commitment
+            // prefix file with fraud_{NAME}
+            //
+            // The injector is still selected by a `fraud_` filename prefix, but
+            // `--fraud-step` now also turns it on: passing the flag and forgetting
+            // the prefix used to write an honest commitment and audit clean, which
+            // reads as a passing fraud test and is not one.
+            if commit_path.starts_with("fraud_") || fraud_step.is_some() {
+                fraud(&mut trace, commit_path, fraud_proof_config, fraud_step)?;
+            } else {
+                commit(&trace, commit_path, fraud_proof_config)?;
+            }
+        } else {
+            // TODO: in case of just simple execution did printing out trace items is enough or save
+            // them to file
+
+            for step_record in trace.iter() {
+                println!();
+                println!("exec_index: {}", step_record.exec_index);
+                println!("sequence_id: {}", step_record.sequence_id);
+                println!(
+                    "{}: {:?}",
+                    step_coordinate_label(&step_record.kind),
+                    step_record.coordinates
+                );
+                if let Some(target_id) = step_target_id(&step_record.kind) {
+                    println!("id: {}", target_id);
+                }
             }
         }
     }
@@ -405,8 +434,8 @@ pub(crate) fn load_trace_from_file(
     cfs: &ControlFlowSchema,
     input: Option<&str>,
     input_manifest: Option<&str>,
-) -> Result<(Trace, TraceRecorder)> {
-    let mut trace = Trace::new();
+) -> Result<(DiskVec<raster_core::trace::StepRecord>, TraceRecorder)> {
+    let mut trace = DiskVec::new();
     let mut trace_recorder = TraceRecorder::new(cfs.clone());
     // Replaying an entry-argument binding needs the same input context the
     // traced run had; we already parsed it, so hand it over rather than
@@ -415,25 +444,41 @@ pub(crate) fn load_trace_from_file(
         trace_recorder.set_external_input(input, input_manifest)?;
     }
 
-    match trace_format {
-        TraceFormat::Binary => {
-            load_binary_trace_from_file(trace_path, &mut trace, &mut trace_recorder)?
-        }
-        TraceFormat::Json => {
-            load_json_trace_from_file(trace_path, &mut trace, &mut trace_recorder)?
-        }
-    }
+    read_trace_events(trace_path, trace_format, |event| {
+        record_trace_event(&mut trace, &mut trace_recorder, event);
+        Ok(())
+    })?;
 
+    if !matches!(
+        trace.get(0).map(|s| s.kind),
+        Some(StepKind::ProgramStart(_))
+    ) || !matches!(
+        trace
+            .len()
+            .checked_sub(1)
+            .and_then(|i| trace.get(i))
+            .map(|s| s.kind),
+        Some(StepKind::ProgramEnd(_))
+    ) {
+        return Err(Error::Other(
+            "trace is missing program start or completion".into(),
+        ));
+    }
     Ok((trace, trace_recorder))
 }
 
-fn load_binary_trace_from_file(
+fn read_trace_events(
     trace_path: &PathBuf,
-    trace: &mut Trace,
-    trace_recorder: &mut TraceRecorder,
+    format: TraceFormat,
+    mut consume: impl FnMut(TraceEvent) -> Result<()>,
 ) -> Result<()> {
-    let mut file = std::fs::File::open(trace_path).map_err(raster_core::Error::Io)?;
+    if matches!(format, TraceFormat::Json) {
+        return read_json_trace_events(trace_path, consume);
+    }
+    let mut file = BufReader::new(std::fs::File::open(trace_path).map_err(raster_core::Error::Io)?);
 
+    let mut remaining = file.get_ref().metadata().map_err(Error::Io)?.len();
+    let mut steps = 0usize;
     loop {
         let mut len_buf = [0u8; 4];
         let mut header_bytes_read = 0usize;
@@ -458,6 +503,10 @@ fn load_binary_trace_from_file(
         }
 
         let frame_len = u32::from_le_bytes(len_buf) as usize;
+        remaining = remaining
+            .checked_sub(4)
+            .and_then(|n| n.checked_sub(frame_len as u64))
+            .ok_or_else(|| Error::Other("trace frame exceeds remaining file length".into()))?;
         let mut frame = vec![0u8; frame_len];
         file.read_exact(&mut frame).map_err(|error| {
             if error.kind() == std::io::ErrorKind::UnexpectedEof {
@@ -474,16 +523,20 @@ fn load_binary_trace_from_file(
                 error
             ))
         })?;
-        record_trace_event(trace, trace_recorder, event);
+        consume(event)?;
+        steps += 1;
+        if steps % 4096 == 0 {
+            eprintln!("RASTER_TRACE_PROGRESS {{\"steps\":{},\"remaining_trace_bytes\":{},\"scratch_bytes\":{}}}",
+                steps, remaining, raster_prover::archive::Archive::current().stored_bytes().map_err(Error::Io)?);
+        }
     }
 
     Ok(())
 }
 
-fn load_json_trace_from_file(
+fn read_json_trace_events(
     trace_path: &PathBuf,
-    trace: &mut Trace,
-    trace_recorder: &mut TraceRecorder,
+    mut consume: impl FnMut(TraceEvent) -> Result<()>,
 ) -> Result<()> {
     let file = std::fs::File::open(trace_path).map_err(raster_core::Error::Io)?;
     let reader = BufReader::new(file);
@@ -502,13 +555,55 @@ fn load_json_trace_from_file(
                 error
             ))
         })?;
-        record_trace_event(trace, trace_recorder, event);
+        consume(event)?;
     }
 
     Ok(())
 }
 
-fn record_trace_event(trace: &mut Trace, trace_recorder: &mut TraceRecorder, event: TraceEvent) {
+/// Commitment-only replay shares the same event decoder and step computation,
+/// but sends each step straight to the bounded commitment accumulator.
+pub(crate) fn commit_trace_file(
+    trace_path: &PathBuf,
+    format: TraceFormat,
+    cfs: &ControlFlowSchema,
+    input: Option<&str>,
+    manifest: Option<&str>,
+    config: raster_prover::trace::FraudProofConfig,
+) -> Result<raster_prover::commitment_file::CommitmentFile> {
+    let mut recorder = TraceRecorder::for_commitment(cfs.clone());
+    recorder.set_external_input(input, manifest)?;
+    let mut builder = raster_prover::commitment_file::CommitmentBuilder::new(
+        &raster_core::merkle::EMPTY_LEAF,
+        config,
+    );
+    let mut started = false;
+    let mut completed = false;
+    read_trace_events(trace_path, format, |event| {
+        let step = recorder.record(event);
+        if completed || (!started && !matches!(step.kind, StepKind::ProgramStart(_))) {
+            return Err(Error::Other(
+                "trace is missing program start or has events after completion".into(),
+            ));
+        }
+        started = true;
+        completed = matches!(step.kind, StepKind::ProgramEnd(_));
+        builder.push(step).map_err(|e| Error::Other(e.to_string()))
+    })?;
+    if !completed {
+        return Err(Error::Other("trace is missing program completion".into()));
+    }
+    raster_prover::archive::Archive::current()
+        .flush()
+        .map_err(Error::Io)?;
+    builder.finish().map_err(|e| Error::Other(e.to_string()))
+}
+
+fn record_trace_event(
+    trace: &mut DiskVec<raster_core::trace::StepRecord>,
+    trace_recorder: &mut TraceRecorder,
+    event: TraceEvent,
+) {
     let step_record = trace_recorder.record(event);
     trace.push(step_record);
 }

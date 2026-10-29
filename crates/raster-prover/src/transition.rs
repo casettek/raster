@@ -13,16 +13,15 @@ use raster_core::cfs::ControlFlowSchema;
 use raster_core::draft::DraftTransitionWitness;
 use raster_core::fingerprint::Fingerprint;
 use raster_core::input::SelectionWitness;
-use raster_core::trace::{FnInput, StepRecord};
 use raster_core::recur_progress::RecurProgressStack;
+use raster_core::trace::{FnInput, StepRecord};
 use raster_core::transition::{
-    FingerprintSliceWitness, InitTransition, StepRecordWitness, StorageReadWitness,
-    StorageWitness, TraceCommitmentHeader, TransitionInput, TransitionJournal, TransitionState,
+    FingerprintSliceWitness, InitTransition, StepRecordWitness, StorageReadWitness, StorageWitness,
+    TraceCommitmentHeader, TransitionInput, TransitionJournal, TransitionState,
 };
 use std::collections::{BTreeMap, HashMap};
 
 use crate::authorization::authorization_guest_image_id;
-use raster_core::merkle::{NodeHash, EMPTY_LEAF};
 use crate::replay::ReplayResult;
 use crate::trace::{
     frontier_root, serializable_frontier_into_trace_frontier, SerializableFrontier,
@@ -30,10 +29,11 @@ use crate::trace::{
 #[cfg(test)]
 use crate::trace::{TraceCommitment, TraceCommitmentExt};
 use crate::{TRANSITION_GUEST_ELF, TRANSITION_GUEST_ID};
+use raster_core::merkle::{NodeHash, EMPTY_LEAF};
 
 /// Everything the host recorded about one executed step, to be handed to the
 /// guest as that step's witnesses.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct StepIo {
     pub input_witness: Option<Vec<u8>>,
     pub output_witness: Option<Vec<u8>>,
@@ -147,7 +147,10 @@ fn write_frame(builder: &mut risc0_zkvm::ExecutorEnvBuilder<'_>, bytes: &[u8]) {
 }
 
 /// [`write_frame`] of `value`'s postcard encoding.
-fn write_postcard<T: serde::Serialize>(builder: &mut risc0_zkvm::ExecutorEnvBuilder<'_>, value: &T) {
+fn write_postcard<T: serde::Serialize>(
+    builder: &mut risc0_zkvm::ExecutorEnvBuilder<'_>,
+    value: &T,
+) {
     let bytes = postcard::to_allocvec(value).expect("transition input must encode with postcard");
     write_frame(builder, &bytes);
 }
@@ -225,6 +228,53 @@ pub fn step_transitions(
     // `TransitionJournal::final_committed_root`.
     revealed_tail_roots: &[NodeHash],
 ) -> Option<risc0_zkvm::Receipt> {
+    step_transitions_with(
+        initial_frontier,
+        initial_storage_frontier,
+        initial_storage_index_root,
+        trace_window,
+        fingerprint,
+        commitment_header,
+        fingerprint_slice,
+        program_frame,
+        input_sources_witnesses,
+        &mut |step| {
+            (
+                recorded_step_io.get(step).expect("step IO").clone(),
+                replayed_results.get(step).cloned(),
+            )
+        },
+        authorization_journal,
+        authorization_receipt,
+        entrypoint_membership_witness,
+        window_start_recur_progress,
+        revealed_tail_roots,
+    )
+}
+
+pub fn step_transitions_with(
+    initial_frontier: &SerializableFrontier,
+    initial_storage_frontier: &SerializableFrontier,
+    initial_storage_index_root: &[u8],
+    trace_window: &[StepRecord],
+    fingerprint: Fingerprint,
+    commitment_header: &TraceCommitmentHeader,
+    fingerprint_slice: &FingerprintSliceWitness,
+    // The canonical `program.bin` frame (bytes of the `ProgramDefinition`),
+    // written to the guest, which hashes it to derive `program_commitment` and
+    // decodes it for the CFS + tile registry. See program-identity.md.
+    program_frame: &[u8],
+    input_sources_witnesses: &HashMap<(u64, StepRecord), StepRecordWitness>,
+    evidence: &mut impl FnMut(&StepRecord) -> (StepIo, Option<ReplayResult>),
+    authorization_journal: &AuthorizationJournal,
+    authorization_receipt: &risc0_zkvm::Receipt,
+    entrypoint_membership_witness: Option<&StorageReadWitness>,
+    window_start_recur_progress: Option<RecurProgressStack>,
+    // The commitment's revealed tail roots, so a divergence the packed
+    // fingerprint is blind to can still be proven. See
+    // `TransitionJournal::final_committed_root`.
+    revealed_tail_roots: &[NodeHash],
+) -> Option<risc0_zkvm::Receipt> {
     let prover = risc0_zkvm::default_prover();
 
     let transition_image_id = image_id_bytes(TRANSITION_GUEST_ID);
@@ -243,11 +293,17 @@ pub fn step_transitions(
     let mut current_state = TransitionState::Init(init_transition);
 
     for step_record in trace_window {
+        let (io, replay) = evidence(step_record);
+        let recorded_step_io = HashMap::from([(step_record.clone(), io)]);
+        let replayed_results: HashMap<_, _> = replay
+            .into_iter()
+            .map(|r| (step_record.clone(), r))
+            .collect();
         let input = build_transition_input(
             step_record,
             input_sources_witnesses,
-            recorded_step_io,
-            replayed_results,
+            &recorded_step_io,
+            &replayed_results,
             authorization_journal,
             // Only the `Init` step proves anything about the window's
             // *initial* store state; later steps inherit the established
@@ -329,7 +385,6 @@ pub fn step_transitions(
 mod tests {
     use super::*;
     use crate::authorization::authorize_external_inputs;
-    use raster_core::merkle::EMPTY_LEAF;
     use raster_core::authorization::{AuthorizationJournal, ManifestedInputs};
     use raster_core::cfs::{
         CfsCoordinate, CfsCoordinates, ControlFlowSchema, SequenceDef, FIRST_COORDINATE,
@@ -337,6 +392,7 @@ mod tests {
     use raster_core::coordinate_index::coordinate_index_root;
     use raster_core::draft::TileReplayJournal;
     use raster_core::fingerprint::{BitPacker, Fingerprint};
+    use raster_core::merkle::EMPTY_LEAF;
     use raster_core::trace::{ExecStep, ExecTarget, FnInput, StepKind, StorageRoots};
     use sha2::{Digest, Sha256};
 
@@ -738,7 +794,7 @@ mod tests {
             init_storage_frontier: make_init_frontier(),
             init_storage_root: storage_root(&make_init_frontier()),
             init_storage_index_root: coordinate_index_root(&std::collections::BTreeMap::new()),
-                fingerprint: window_fingerprint.clone(),
+            fingerprint: window_fingerprint.clone(),
         });
         // A minimal commitment whose fingerprint *is* the window (start 0),
         // so the guest's Init-time slice check passes. One revealed item, so
@@ -804,4 +860,24 @@ mod tests {
         )
         .is_err());
     }
+}
+
+/// Proof-ready evidence for one detected window; no complete execution history.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct PreparedFault {
+    pub window: raster_core::trace::TraceWindow,
+    pub input_sources_witnesses: HashMap<(u64, StepRecord), StepRecordWitness>,
+    pub io: Vec<StepIo>,
+    pub initial_storage_frontier: SerializableFrontier,
+    pub initial_index_root: Vec<u8>,
+    pub entrypoint_membership_witness: Option<StorageReadWitness>,
+    pub window_start_recur_progress: Option<RecurProgressStack>,
+}
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct AuditHandoff {
+    pub version: u32,
+    pub binding: String,
+    pub commitment_digest: Vec<u8>,
+    pub steps: usize,
+    pub fault: Option<PreparedFault>,
 }

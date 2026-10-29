@@ -1,5 +1,5 @@
-use alloc::vec;
 use crate::hash::{Digest, Sha256};
+use alloc::vec;
 use std::collections::{BTreeMap, HashMap};
 use std::vec::Vec;
 
@@ -14,31 +14,60 @@ const EMPTY_LEAF_DOMAIN: &[u8] = b"raster-storage-index-empty";
 const LEAF_DOMAIN: &[u8] = b"raster-storage-index-leaf";
 const NODE_DOMAIN: &[u8] = b"raster-storage-index-node";
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct NodeKey {
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct NodeKey {
     depth: usize,
     prefix: [u8; 32],
 }
 
-#[derive(Debug, Clone)]
-pub struct IncrementalCoordinateIndex {
+/// Host storage access; hashing and path construction remain in this module.
+pub trait CoordinateIndexStorage {
+    fn entry(&self, coordinates: &CfsCoordinates) -> Option<StorageIndexValue>;
+    fn occupied(&self, key: &[u8; 32]) -> Option<CfsCoordinates>;
+    fn node(&self, key: &NodeKey) -> Option<Vec<u8>>;
+    fn put_entry(&mut self, coordinates: CfsCoordinates, value: StorageIndexValue);
+    fn put_occupied(&mut self, key: [u8; 32], coordinates: CfsCoordinates);
+    fn put_node(&mut self, key: NodeKey, hash: Vec<u8>);
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct MemoryIndexStorage {
     entries: BTreeMap<CfsCoordinates, StorageIndexValue>,
     occupied_keys: HashMap<[u8; 32], CfsCoordinates>,
     node_hashes: HashMap<NodeKey, Vec<u8>>,
+}
+
+impl CoordinateIndexStorage for MemoryIndexStorage {
+    fn entry(&self, key: &CfsCoordinates) -> Option<StorageIndexValue> {
+        self.entries.get(key).cloned()
+    }
+    fn occupied(&self, key: &[u8; 32]) -> Option<CfsCoordinates> {
+        self.occupied_keys.get(key).cloned()
+    }
+    fn node(&self, key: &NodeKey) -> Option<Vec<u8>> {
+        self.node_hashes.get(key).cloned()
+    }
+    fn put_entry(&mut self, key: CfsCoordinates, value: StorageIndexValue) {
+        self.entries.insert(key, value);
+    }
+    fn put_occupied(&mut self, key: [u8; 32], value: CfsCoordinates) {
+        self.occupied_keys.insert(key, value);
+    }
+    fn put_node(&mut self, key: NodeKey, value: Vec<u8>) {
+        self.node_hashes.insert(key, value);
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct IncrementalCoordinateIndex<S = MemoryIndexStorage> {
+    storage: S,
     empty_hashes: Vec<Vec<u8>>,
     root: Vec<u8>,
 }
 
 impl IncrementalCoordinateIndex {
     pub fn new() -> Self {
-        let empty_hashes = empty_hashes();
-        Self {
-            entries: BTreeMap::new(),
-            occupied_keys: HashMap::new(),
-            node_hashes: HashMap::new(),
-            root: empty_hashes[0].clone(),
-            empty_hashes,
-        }
+        Self::with_storage(MemoryIndexStorage::default())
     }
 
     pub fn from_entries(entries: &BTreeMap<CfsCoordinates, StorageIndexValue>) -> Self {
@@ -48,38 +77,50 @@ impl IncrementalCoordinateIndex {
         }
         index
     }
+}
+
+impl<S: CoordinateIndexStorage> IncrementalCoordinateIndex<S> {
+    pub fn with_storage(storage: S) -> Self {
+        let empty_hashes = empty_hashes();
+        Self {
+            storage,
+            root: empty_hashes[0].clone(),
+            empty_hashes,
+        }
+    }
 
     pub fn root(&self) -> Vec<u8> {
         self.root.clone()
     }
 
     pub fn contains_key(&self, coordinates: &CfsCoordinates) -> bool {
-        self.entries.contains_key(coordinates)
+        self.storage.entry(coordinates).is_some()
     }
 
-    pub fn get(&self, coordinates: &CfsCoordinates) -> Option<&StorageIndexValue> {
-        self.entries.get(coordinates)
+    pub fn get(&self, coordinates: &CfsCoordinates) -> Option<StorageIndexValue> {
+        self.storage.entry(coordinates)
     }
 
     pub fn insert(&mut self, coordinates: CfsCoordinates, value: StorageIndexValue) {
         assert!(
-            !self.entries.contains_key(&coordinates),
+            !self.contains_key(&coordinates),
             "Duplicate storage write at coordinates {:?}",
             coordinates
         );
 
         let key = coordinates_key(&coordinates);
-        if let Some(existing_coordinates) = self.occupied_keys.get(&key) {
+        if let Some(existing_coordinates) = self.storage.occupied(&key) {
             assert_eq!(
-                existing_coordinates, &coordinates,
+                existing_coordinates, coordinates,
                 "Coordinate index hash collision for storage entries",
             );
         }
 
         let leaf = leaf_hash(&key, &value);
-        self.node_hashes
-            .insert(node_key(&key, INDEX_BITS), leaf.clone());
-        let previous = self.occupied_keys.insert(key, coordinates.clone());
+        self.storage
+            .put_node(node_key(&key, INDEX_BITS), leaf.clone());
+        let previous = self.storage.occupied(&key);
+        self.storage.put_occupied(key, coordinates.clone());
         assert!(
             previous.is_none(),
             "Coordinate index hash collision for storage entries",
@@ -94,19 +135,19 @@ impl IncrementalCoordinateIndex {
             } else {
                 combine_node_hash(depth, &current, &sibling)
             };
-            self.node_hashes
-                .insert(node_key(&key, depth), current.clone());
+            self.storage
+                .put_node(node_key(&key, depth), current.clone());
         }
 
         self.root = current;
-        self.entries.insert(coordinates, value);
+        self.storage.put_entry(coordinates, value);
     }
 
     pub fn membership_proof(
         &self,
         coordinates: &CfsCoordinates,
     ) -> Option<CoordinateIndexMembershipProof> {
-        let value = self.entries.get(coordinates)?.clone();
+        let value = self.storage.entry(coordinates)?;
         Some(CoordinateIndexMembershipProof {
             coordinates: coordinates.clone(),
             value,
@@ -119,7 +160,7 @@ impl IncrementalCoordinateIndex {
         coordinates: &CfsCoordinates,
     ) -> CoordinateIndexNonMembershipProof {
         assert!(
-            !self.entries.contains_key(coordinates),
+            !self.contains_key(coordinates),
             "Coordinate index non-membership proof requested for existing coordinates {:?}",
             coordinates
         );
@@ -131,9 +172,8 @@ impl IncrementalCoordinateIndex {
     }
 
     fn child_hash(&self, key: &[u8; 32], depth: usize, bit: bool) -> Vec<u8> {
-        self.node_hashes
-            .get(&child_node_key(key, depth, bit))
-            .cloned()
+        self.storage
+            .node(&child_node_key(key, depth, bit))
             .unwrap_or_else(|| self.empty_hashes[depth + 1].clone())
     }
 

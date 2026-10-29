@@ -16,6 +16,10 @@ raster-compiler = { workspace = true }
 raster-backend = { workspace = true }
 
 bincode.workspace = true
+rusqlite = { version = "0.37", features = ["bundled"] }
+tempfile = "3"
+libc = "0.2"
+bumpalo = "3"
 bridgetree.workspace = true
 hex.workspace = true
 incrementalmerkletree.workspace = true
@@ -23,7 +27,7 @@ itertools.workspace = true
 rand.workspace = true
 sha2.workspace = true
 serde.workspace = true
-postcard.workspace = true
+postcard = { workspace = true, features = ["use-std"] }
 
 risc0-zkvm = { version = "3.0", default-features = false, features = ["prove", "std"] }
 

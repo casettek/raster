@@ -146,3 +146,42 @@ v0 - Initial implementation in progress. Core functionality includes:
 
 
 at your option.
+
+### Live commitments and trace retention
+
+`cargo raster run --commit commit.bin --fraud-proof-window-size 128` builds the
+commitment as the program emits events. Authenticated `cargo raster chain run`
+uses the same path for every stage. Add the usual `--input` and `--input-manifest`
+arguments when the program needs them. General window defaults are unchanged.
+
+These runs keep working objects, indexes, and fingerprint blocks in RAM; they do
+not spill to disk. Memory use can grow with the program. The finished commitment
+is published only after successful execution. Normal output artifacts are still
+written. No raw trace is saved by default.
+
+Add `--save-trace` to retain `trace.bin` (or `--trace-format json` for
+`trace.ndjson`) for debugging, `trace commit`, or `trace audit`. Recording a trace
+still builds the commitment live. Plain `run` and deliberate fraud injection retain their recorded-execution paths. Without a saved
+trace, later proof generation requires executing the program again.
+
+### Live audit and fault proof
+
+From a Raster program directory, run:
+
+```sh
+cargo raster run --input input.json --input-manifest input_manifest.json \
+  --audit disputed.bin --proof-output fault.receipt --report audit.json
+```
+
+The supplied commitment determines the window size. Execution compares each
+step as it happens and stops at the first detected mismatch; Raster then proves
+and verifies that window. It creates neither another commitment nor a raw trace.
+The report distinguishes `proved` from `no-fault`. An honest audit runs through
+the final boundary and checks the complete length. Failed or interrupted native
+execution is never treated as divergence.
+
+Audit working state stays in RAM and may grow with the program. A temporary
+proof-evidence artifact connects native execution to the prover; proof generation
+may use its normal working files. Proof and report destinations default to the
+run artifact directory. Saved-trace commands remain available for existing files,
+but live audit does not invoke them. Retrying a failed live proof reruns the audit.

@@ -217,7 +217,10 @@ impl RasterIndex {
     /// Element `i` of the list at `id`.
     pub(crate) fn list_element(&self, id: u64, i: u64) -> Result<u64> {
         let missing = || {
-            Error::Serialization(format!("Malformed raster index: missing list element {}", i))
+            Error::Serialization(format!(
+                "Malformed raster index: missing list element {}",
+                i
+            ))
         };
         match &self.node(id)?.kind {
             RasterNodeKind::List { elements, .. } => {
@@ -397,7 +400,11 @@ impl RasterIndex {
                 kind,
             });
         }
-        Ok(RasterIndex::new(self.root_node, self.root_commitment, nodes))
+        Ok(RasterIndex::new(
+            self.root_node,
+            self.root_commitment,
+            nodes,
+        ))
     }
 
     pub(crate) fn root_commitment_hex(&self) -> String {
@@ -455,12 +462,18 @@ impl RasterIndex {
 
         // Back up over the first element's 8-byte length prefix; element
         // offsets point past it.
-        let region_start = (list_position + first.offset).checked_sub(8).ok_or_else(|| {
-            Error::Serialization("Malformed raster index: list element precedes its length prefix".into())
-        })?;
-        let region_end = (list_position + last.offset).checked_add(last.len).ok_or_else(|| {
-            Error::Serialization("Malformed raster index: list element region overflows".into())
-        })?;
+        let region_start = (list_position + first.offset)
+            .checked_sub(8)
+            .ok_or_else(|| {
+                Error::Serialization(
+                    "Malformed raster index: list element precedes its length prefix".into(),
+                )
+            })?;
+        let region_end = (list_position + last.offset)
+            .checked_add(last.len)
+            .ok_or_else(|| {
+                Error::Serialization("Malformed raster index: list element region overflows".into())
+            })?;
         let region_len = region_end.checked_sub(region_start).ok_or_else(|| {
             Error::Serialization("Malformed raster index: list elements are not in order".into())
         })?;
@@ -501,6 +514,22 @@ impl RasterIndex {
         let mut current_position = self.node(self.root_node)?.offset;
         let mut steps = Vec::with_capacity(if prove { selector.segments.len() } else { 0 });
         let last_segment = selector.segments.len().saturating_sub(1);
+
+        // `call!(fallible, ...)?` exposes the successful value while keeping
+        // the authenticated reference to the complete Result. Field selections
+        // retain that root, so their evidence must also authenticate the Ok tag.
+        if !selector.segments.is_empty() {
+            if let RasterNodeKind::EnumNewtype { variant, child } = &self.node(current_id)?.kind {
+                if variant == "Ok" {
+                    let child = *child;
+                    if prove {
+                        steps.push(SelectionProofStep::ResultOk);
+                    }
+                    current_position = self.child_position(current_position, child)?;
+                    current_id = child;
+                }
+            }
+        }
 
         for (position, segment) in selector.segments.iter().enumerate() {
             let list_len = self.list_len(current_id)?;
@@ -753,8 +782,10 @@ impl RasterIndex {
                         }
                         width = width / 2 + width % 2;
                     }
-                    let actual: Vec<u64> =
-                        level_tails.iter().map(|level| level.hashes.len() as u64).collect();
+                    let actual: Vec<u64> = level_tails
+                        .iter()
+                        .map(|level| level.hashes.len() as u64)
+                        .collect();
                     if actual != expected_levels {
                         return Err(Error::Serialization(format!(
                             "Raster list continuation level tails {:?} do not fit a list of {} over {}",
@@ -854,7 +885,11 @@ fn list_range_proof_siblings(
     Ok(siblings)
 }
 
-fn list_proof_siblings(index: &RasterIndex, list: u64, element: usize) -> Result<Vec<ListProofSibling>> {
+fn list_proof_siblings(
+    index: &RasterIndex,
+    list: u64,
+    element: usize,
+) -> Result<Vec<ListProofSibling>> {
     let mut siblings = Vec::new();
     let mut idx = element;
     for height in 0..index.list_level_count(list)? {

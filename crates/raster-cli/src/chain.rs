@@ -33,17 +33,17 @@ use raster_core::chain::{
     RepeatResolution, StageCheckpoint,
 };
 use raster_core::input::{payload_structural_root, scalar_leaf_root, IndexWidth};
+use raster_core::merkle::EMPTY_LEAF;
 use raster_core::program::commitment_of_bytes;
-use raster_core::trace::Trace;
+use raster_core::trace::StepRecord;
 use raster_core::transition::TransitionJournal;
 use raster_core::{Error, Result};
+use raster_prover::archive::DiskVec;
 use raster_prover::authorization::{authorization_guest_image_id, authorize_external_inputs};
 use raster_prover::chain_fraud::{prove_chain_fraud, verify_chain_fraud_receipt};
-use raster_core::merkle::EMPTY_LEAF;
+use raster_prover::commitment_file::CommitmentFile;
 use raster_prover::replay::Replayer;
-use raster_prover::trace::{
-    FraudProofConfig, TraceCommitment, TraceCommitmentExt, TraceVerifier,
-};
+use raster_prover::trace::{FraudProofConfig, TraceVerifier};
 use raster_runtime::TraceRecorder;
 
 use crate::commands::run::load_trace_from_file;
@@ -346,6 +346,7 @@ pub fn run(
     run_dir: Option<&str>,
     show_output: bool,
     trace_format: TraceFormat,
+    save_trace: bool,
 ) -> Result<()> {
     let (manifest, base_dir) = resolve_chain(chain)?;
 
@@ -475,7 +476,11 @@ pub fn run(
                 Error::Other(format!(
                     "no stage named '{name}' in this chain — stages are: {}",
                     summarize_names(
-                        &spec.stages.iter().map(|s| s.name.as_str()).collect::<Vec<_>>()
+                        &spec
+                            .stages
+                            .iter()
+                            .map(|s| s.name.as_str())
+                            .collect::<Vec<_>>()
                     )
                 ))
             })?],
@@ -496,133 +501,120 @@ pub fn run(
 
         let stage_count = spec.stages.len();
         for &idx in &selected {
-        let stage = &spec.stages[idx];
-        // Only meaningful once the shape is settled: mid-expansion the last
-        // stage of the partial list is not the chain's last, and treating it as
-        // terminal would let a unit-output stage through with nothing to feed
-        // the block that follows it.
-        let is_terminal = partial.pending.is_none() && idx + 1 == stage_count;
-        println!(
-            "▸ stage {}/{}  {}   ({}){}",
-            idx + 1,
-            stage_count,
-            stage.name,
-            stage.project,
-            if stage_selection.is_some() {
-                "   (re-run in place)"
-            } else {
-                ""
-            }
-        );
+            let stage = &spec.stages[idx];
+            // Only meaningful once the shape is settled: mid-expansion the last
+            // stage of the partial list is not the chain's last, and treating it as
+            // terminal would let a unit-output stage through with nothing to feed
+            // the block that follows it.
+            let is_terminal = partial.pending.is_none() && idx + 1 == stage_count;
+            println!(
+                "▸ stage {}/{}  {}   ({}){}",
+                idx + 1,
+                stage_count,
+                stage.name,
+                stage.project,
+                if stage_selection.is_some() {
+                    "   (re-run in place)"
+                } else {
+                    ""
+                }
+            );
 
-        let project = Project::new(base_dir.join(&stage.project))
-            .map_err(|e| Error::Other(format!("stage '{}': {e}", stage.name)))?;
-        let cfs = CfsBuilder::new(&project).build().map_err(|e| {
-            Error::Other(format!("stage '{}': failed to build CFS: {e}", stage.name))
-        })?;
+            let project = Project::new(base_dir.join(&stage.project))
+                .map_err(|e| Error::Other(format!("stage '{}': {e}", stage.name)))?;
+            let cfs = CfsBuilder::new(&project).build().map_err(|e| {
+                Error::Other(format!("stage '{}': failed to build CFS: {e}", stage.name))
+            })?;
 
-        // Fail fast, before running anything, if a non-terminal stage produces
-        // no output to feed downstream (rather than discovering it mid-chain).
-        let produces_output = CfsCursor::new(cfs.clone()).main_produces_output();
-        if !is_terminal && !produces_output {
-            return Err(Error::Other(format!(
+            // Fail fast, before running anything, if a non-terminal stage produces
+            // no output to feed downstream (rather than discovering it mid-chain).
+            let produces_output = CfsCursor::new(cfs.clone()).main_produces_output();
+            if !is_terminal && !produces_output {
+                return Err(Error::Other(format!(
                 "stage '{}' is non-terminal but its main returns unit — nothing to feed the next stage",
                 stage.name
             )));
-        }
+            }
 
-        let stage_dir = chain_dir.join(&stage.name);
-        std::fs::create_dir_all(&stage_dir)
-            .map_err(|e| Error::Other(format!("failed to create {}: {e}", stage_dir.display())))?;
-
-        // Synthesize this stage's `input.json` + `input_manifest.json` from its
-        // bindings: external inputs copy through; `from` inputs resolve to the
-        // producing stage's `output.bin`/`output.rindex` and its structural
-        // commitment, under this parameter's name.
-        let synth = synthesize_inputs(
-            stage,
-            &stage_dir,
-            &base_dir,
-            &chain_dir,
-            &outputs,
-            &stage_index,
-            &spec.inputs,
-        )?;
-        println!("    build & run …");
-
-        let (replay, execution_time) = build_and_run_stage(
-            &project,
-            &cfs,
-            &synth.input_json_path,
-            &synth.input_manifest_path,
-            &stage_dir,
-            no_auth,
-            trace_format,
-        )?;
-        execution_times.push((stage.name.clone(), execution_time));
-        println!("    exec {}", format_duration(execution_time));
-
-        // A recorded trace still yields a `commit.bin`, but nothing in the
-        // checkpoint names it any more: it is this stage's *dispute* artifact,
-        // the thing a divergence is proven against, and it is needed only for a
-        // stage somebody contests. See `docs/proposals/chain-io-commitment.md`.
-        if let Some((trace, _recorder)) = replay {
-            let trace_commitment =
-                TraceCommitment::try_build(&trace, &EMPTY_LEAF, fraud_proof_config)
-                    .map_err(|e| Error::Other(e.to_string()))?;
-            let commit_path = stage_dir.join("commit.bin");
-            std::fs::write(
-                &commit_path,
-                postcard::to_allocvec(&trace_commitment).unwrap(),
-            )
-            .map_err(|e| {
-                Error::Other(format!("failed to write {}: {e}", commit_path.display()))
+            let stage_dir = chain_dir.join(&stage.name);
+            std::fs::create_dir_all(&stage_dir).map_err(|e| {
+                Error::Other(format!("failed to create {}: {e}", stage_dir.display()))
             })?;
-        }
 
-        let (output_payload_commitment, output_structural_commitment) = if produces_output {
-            let out = collect_output(&stage_dir)?;
-            println!(
-                "    output.bin  payload={}  structural={}",
-                short_hex(&out.payload_commitment),
-                short_hex(&out.structural_commitment)
-            );
-            (out.payload_commitment, out.structural_commitment)
-        } else {
-            println!("    (unit output — nothing to link downstream)");
-            (Vec::new(), Vec::new())
-        };
+            // Synthesize this stage's `input.json` + `input_manifest.json` from its
+            // bindings: external inputs copy through; `from` inputs resolve to the
+            // producing stage's `output.bin`/`output.rindex` and its structural
+            // commitment, under this parameter's name.
+            let synth = synthesize_inputs(
+                stage,
+                &stage_dir,
+                &base_dir,
+                &chain_dir,
+                &outputs,
+                &stage_index,
+                &spec.inputs,
+            )?;
+            println!("    build & run …");
 
-        outputs[idx] = if produces_output {
-            Some(output_structural_commitment.clone())
-        } else {
-            None
-        };
+            let (_replay, execution_time) = build_and_run_stage(
+                &project,
+                &cfs,
+                &synth.input_json_path,
+                &synth.input_manifest_path,
+                &stage_dir,
+                if no_auth {
+                    StageExecution::Unauthenticated
+                } else {
+                    StageExecution::Commit(fraud_proof_config, save_trace)
+                },
+                trace_format,
+            )?;
+            execution_times.push((stage.name.clone(), execution_time));
+            println!("    exec {}", format_duration(execution_time));
 
-        // "Final stage" for `--show-output` means the last stage that actually
-        // ran and produced something — which under `--stage` is the single
-        // re-run stage, so one rule serves both the whole-chain and the
-        // dev-loop case. See `artifact-inspection.md` §6.
-        if produces_output {
-            last_output = Some((stage.name.clone(), stage_dir.clone()));
-        }
+            let (output_payload_commitment, output_structural_commitment) = if produces_output {
+                let out = collect_output(&stage_dir)?;
+                println!(
+                    "    output.bin  payload={}  structural={}",
+                    short_hex(&out.payload_commitment),
+                    short_hex(&out.structural_commitment)
+                );
+                (out.payload_commitment, out.structural_commitment)
+            } else {
+                println!("    (unit output — nothing to link downstream)");
+                (Vec::new(), Vec::new())
+            };
 
-        // Every field here is a pure function of public artifacts, so this is
-        // the same checkpoint in either posture — the property `chain audit`
-        // and the equivalence test both rest on.
-        if commit_chain {
-            let program_commitment = program_identity_with_cfs(&project, &cfs, &stage.name)?;
-            checkpoints.push(StageCheckpoint {
-                name: stage.name.clone(),
-                program_commitment,
-                input_manifest_commitment: synth.input_manifest_commitment,
-                input_bindings: synth.bindings,
-                output_payload_commitment,
-                output_structural_commitment,
-            });
-            println!("    commit ✓");
-        }
-        println!();
+            outputs[idx] = if produces_output {
+                Some(output_structural_commitment.clone())
+            } else {
+                None
+            };
+
+            // "Final stage" for `--show-output` means the last stage that actually
+            // ran and produced something — which under `--stage` is the single
+            // re-run stage, so one rule serves both the whole-chain and the
+            // dev-loop case. See `artifact-inspection.md` §6.
+            if produces_output {
+                last_output = Some((stage.name.clone(), stage_dir.clone()));
+            }
+
+            // Every field here is a pure function of public artifacts, so this is
+            // the same checkpoint in either posture — the property `chain audit`
+            // and the equivalence test both rest on.
+            if commit_chain {
+                let program_commitment = program_identity_with_cfs(&project, &cfs, &stage.name)?;
+                checkpoints.push(StageCheckpoint {
+                    name: stage.name.clone(),
+                    program_commitment,
+                    input_manifest_commitment: synth.input_manifest_commitment,
+                    input_bindings: synth.bindings,
+                    output_payload_commitment,
+                    output_structural_commitment,
+                });
+                println!("    commit ✓");
+            }
+            println!();
         }
 
         cursor = spec.stages.len();
@@ -1252,13 +1244,16 @@ fn detect_output_fraud(recorded: &RecordedChain) -> Result<Option<StageOutputFra
             &stage_dir.join("input.json"),
             &stage_dir.join("input_manifest.json"),
             &audit_dir,
-            true,
+            StageExecution::Unauthenticated,
             TraceFormat::Binary,
         )?;
 
         let recomputed = collect_output(&audit_dir)?;
         if recomputed.payload_commitment != checkpoint.output_payload_commitment {
-            println!("    output ✗  recomputed {}", short_hex(&recomputed.payload_commitment));
+            println!(
+                "    output ✗  recomputed {}",
+                short_hex(&recomputed.payload_commitment)
+            );
             return Ok(Some(StageOutputFraud {
                 stage_index,
                 committed: checkpoint.output_payload_commitment.clone(),
@@ -1307,14 +1302,13 @@ fn prove_terminal_window(
         &stage_dir.join("input.json"),
         &input_manifest_path,
         &evidence_dir,
-        false,
+        StageExecution::RetainHistory,
         TraceFormat::Binary,
     )?;
     let (trace, recorder) = replay.expect("an authenticated stage run produces a trace");
 
-    let trace_commitment =
-        TraceCommitment::try_build(&trace, &EMPTY_LEAF, fraud_proof_config)
-            .map_err(|e| Error::Other(e.to_string()))?;
+    let trace_commitment = CommitmentFile::build(&trace, &EMPTY_LEAF, fraud_proof_config)
+        .map_err(|e| Error::Other(e.to_string()))?;
     let mut verifier = TraceVerifier::new(trace_commitment.clone(), &EMPTY_LEAF, &cfs)
         .map_err(|e| Error::Other(e.to_string()))?;
     let window = verifier
@@ -1334,7 +1328,6 @@ fn prove_terminal_window(
         &trace_commitment,
     ))
 }
-
 
 /// One exhibitable `Shape` fault: which repeat block, and the stage blame lands
 /// on.
@@ -1390,8 +1383,8 @@ fn detect_shape_fraud(recorded: &RecordedChain) -> Result<Option<ShapeFault>> {
                     recorded.chain.stages.len()
                 ))
             })?;
-        let claimed = scalar_leaf_root(repeat.width, u64::from(repeat.resolved_count))
-            .ok_or_else(|| {
+        let claimed =
+            scalar_leaf_root(repeat.width, u64::from(repeat.resolved_count)).ok_or_else(|| {
                 malformed(format!(
                     "it records {} iteration(s), which its recorded width {:?} cannot represent",
                     repeat.resolved_count, repeat.width
@@ -1514,9 +1507,7 @@ pub fn fraud_prove(manifest: Option<&str>, chain_commitment: Option<&str>) -> Re
         println!(
             "shape fraud: repeat block '{}' records {} iteration(s), which stage {source_stage} \
              ('{}') did not commit",
-            repeat.name,
-            repeat.resolved_count,
-            recorded.chain.stages[source_stage as usize].name,
+            repeat.name, repeat.resolved_count, recorded.chain.stages[source_stage as usize].name,
         );
         let input = ChainFraudInput {
             chain_commitment_bytes: recorded.chain_bytes.clone(),
@@ -1585,8 +1576,14 @@ pub fn fraud_prove(manifest: Option<&str>, chain_commitment: Option<&str>) -> Re
     println!();
     println!("execution-fraud evidence → {}", evidence_path.display());
     println!("  stage            {} '{stage_name}'", fraud.stage_index);
-    println!("  program          {}", short_hex(&journal.program_commitment));
-    println!("  input manifest   {}", short_hex(&journal.input_manifest_commitment));
+    println!(
+        "  program          {}",
+        short_hex(&journal.program_commitment)
+    );
+    println!(
+        "  input manifest   {}",
+        short_hex(&journal.input_manifest_commitment)
+    );
     println!("  honest output    {}", short_hex(&fraud.recomputed));
     println!("  committed output {}", short_hex(&fraud.committed));
     println!("  window terminal  {}", journal.window_is_terminal);
@@ -1672,15 +1669,27 @@ pub fn fraud_verify(
 /// With `no_auth` the stage runs with authenticated storage off and the trace
 /// is `None`: the runtime installs no publisher in that mode, so there would be
 /// no file to load. The output artifact is written either way.
+enum StageExecution {
+    Unauthenticated,
+    Commit(FraudProofConfig, bool),
+    RetainHistory,
+}
+
 fn build_and_run_stage(
     project: &Project,
     cfs: &ControlFlowSchema,
     input_json_path: &Path,
     input_manifest_path: &Path,
     stage_dir: &Path,
-    no_auth: bool,
+    mode: StageExecution,
     trace_format: TraceFormat,
-) -> Result<(Option<(Trace, TraceRecorder)>, Duration)> {
+) -> Result<(Option<(DiskVec<StepRecord>, TraceRecorder)>, Duration)> {
+    let no_auth = matches!(mode, StageExecution::Unauthenticated);
+    let retain_history = matches!(mode, StageExecution::RetainHistory);
+    let live = match mode {
+        StageExecution::Commit(config, save) => Some((config, save)),
+        _ => None,
+    };
     // The stage build is plumbing, not chain output: its cargo progress,
     // dependency warnings, and protocol-guest build chatter would bury the
     // per-stage lines this command exists to print. Capture it and surface it
@@ -1714,10 +1723,11 @@ fn build_and_run_stage(
         )));
     }
 
-    let binary_path = project
-        .target_dir
-        .join("release")
-        .join(format!("{}{}", project.name, std::env::consts::EXE_SUFFIX));
+    let binary_path = project.target_dir.join("release").join(format!(
+        "{}{}",
+        project.name,
+        std::env::consts::EXE_SUFFIX
+    ));
     if !binary_path.exists() {
         return Err(Error::Other(format!(
             "binary not found at {}",
@@ -1726,6 +1736,24 @@ fn build_and_run_stage(
     }
 
     let trace_path = stage_dir.join(trace_format.trace_file_name());
+    let pending = if !no_auth && live.is_some() {
+        Some(crate::live_commitment::PendingCommitment::new(
+            &stage_dir.join("commit.bin"),
+        )?)
+    } else {
+        None
+    };
+    // A re-run must not leave an old recording looking like the new run's trace.
+    if pending.is_some() && !live.expect("live configuration").1 {
+        for name in ["trace.bin", "trace.ndjson"] {
+            let path = stage_dir.join(name);
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(Error::Io(e)),
+            }
+        }
+    }
     let input_json = input_json_path.to_string_lossy().to_string();
     let input_manifest = input_manifest_path.to_string_lossy().to_string();
 
@@ -1744,6 +1772,17 @@ fn build_and_run_stage(
     let runtime_env = RuntimeEnv::new(stage_dir);
     if no_auth {
         runtime_env.apply(&mut command);
+    } else if let Some(pending) = &pending {
+        let (config, save_trace) = live.expect("live configuration");
+        runtime_env
+            .committing(
+                &project.root_dir,
+                pending.path(),
+                config.window_size,
+                save_trace.then_some(trace_path.as_path()),
+                trace_format,
+            )
+            .apply(&mut command);
     } else {
         runtime_env
             .authenticated(&trace_path, trace_format)
@@ -1765,6 +1804,13 @@ fn build_and_run_stage(
     }
 
     if no_auth {
+        return Ok((None, execution_time));
+    }
+
+    if let Some(pending) = pending {
+        pending.publish()?;
+    }
+    if !retain_history {
         return Ok((None, execution_time));
     }
 
@@ -2275,7 +2321,11 @@ fn program_identity_with_cfs(
 /// stage 1 runs, and that failure is always a missing artifact — neither a
 /// cached frame nor a lock to rebuild one from.
 fn program_identity_resolvable(stage_root: &Path) -> bool {
-    stage_root.join("target").join("raster").join("program.bin").is_file()
+    stage_root
+        .join("target")
+        .join("raster")
+        .join("program.bin")
+        .is_file()
         || stage_root.join("Raster.lock").is_file()
 }
 
@@ -2456,7 +2506,9 @@ impl IndexedInputDecl {
 /// `layer` are the same name — and which one won would otherwise depend on
 /// `BTreeMap` ordering, i.e. on the spelling of the *other* key. Refusing costs
 /// nothing and the alternative is a commitment silently replaced.
-fn flatten_input_decls(decls: BTreeMap<String, InputDecl>) -> Result<BTreeMap<String, ExternalRef>> {
+fn flatten_input_decls(
+    decls: BTreeMap<String, InputDecl>,
+) -> Result<BTreeMap<String, ExternalRef>> {
     let mut inputs: BTreeMap<String, ExternalRef> = BTreeMap::new();
     // Which declaration produced each name, for the error message.
     let mut origin: BTreeMap<String, String> = BTreeMap::new();
@@ -2660,12 +2712,7 @@ fn validate_spec(spec: &ChainSpec) -> Result<()> {
             // live here.
             if let InputBinding::Input(name) = binding {
                 if !spec.inputs.contains_key(name) {
-                    return Err(unknown_chain_input(
-                        &stage.name,
-                        param,
-                        name,
-                        &spec.inputs,
-                    ));
+                    return Err(unknown_chain_input(&stage.name, param, name, &spec.inputs));
                 }
             }
             let InputBinding::From(producer) = binding else {
@@ -2746,13 +2793,22 @@ mod tests {
 
     #[test]
     fn parent_dir_of_a_bare_file_name_is_the_current_directory() {
-        assert_eq!(parent_dir(Path::new("Raster-dynamic.toml")), PathBuf::from("."));
-        assert_eq!(parent_dir(Path::new("chain-commitment")), PathBuf::from("."));
+        assert_eq!(
+            parent_dir(Path::new("Raster-dynamic.toml")),
+            PathBuf::from(".")
+        );
+        assert_eq!(
+            parent_dir(Path::new("chain-commitment")),
+            PathBuf::from(".")
+        );
         assert_eq!(
             parent_dir(Path::new("examples/chain-example/Raster.toml")),
             PathBuf::from("examples/chain-example")
         );
-        assert_eq!(parent_dir(Path::new("/tmp/Raster.toml")), PathBuf::from("/tmp"));
+        assert_eq!(
+            parent_dir(Path::new("/tmp/Raster.toml")),
+            PathBuf::from("/tmp")
+        );
     }
 
     /// A `RecordedChain` carrying nothing but the commitment — enough for the
@@ -2965,10 +3021,8 @@ project = "p"
 
         // `items` is the general spelling; `stages` remains the shorthand every
         // chain.json written to date uses, and both reach the same manifest.
-        let spec = spec_from_json(
-            r#"{ "items": [{ "stage": { "name": "a", "project": "p" } }] }"#,
-        )
-        .unwrap();
+        let spec = spec_from_json(r#"{ "items": [{ "stage": { "name": "a", "project": "p" } }] }"#)
+            .unwrap();
         assert_eq!(spec.stages.len(), 1);
         assert_eq!(spec.stages[0].name, "a");
     }
@@ -3226,7 +3280,11 @@ encoding = "raster"
         let b = commitment(9, vec![0xaa]);
         let c = commitment(10, vec![0xaa]);
         assert_eq!(a.digest(), b.digest());
-        assert_ne!(a.digest(), c.digest(), "a stage's output must move the digest");
+        assert_ne!(
+            a.digest(),
+            c.digest(),
+            "a stage's output must move the digest"
+        );
 
         // The shape is inside the digest too, so a chain expanded from a
         // different manifest is a different chain even when the stages it
@@ -3324,9 +3382,17 @@ encoding = "raster"
         // in this run directory.
         let outputs = vec![None, None];
 
-        let err = synthesize_inputs(&stage, &dir, &dir, &dir, &outputs, &stage_index, &BTreeMap::new())
-            .unwrap_err()
-            .to_string();
+        let err = synthesize_inputs(
+            &stage,
+            &dir,
+            &dir,
+            &dir,
+            &outputs,
+            &stage_index,
+            &BTreeMap::new(),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("has no output.bin"), "{err}");
         assert!(err.contains("--stage a"), "{err}");
         std::fs::remove_dir_all(&dir).ok();
@@ -3344,7 +3410,16 @@ encoding = "raster"
             .collect();
         let outputs = vec![Some(vec![0xab, 0xcd]), None];
 
-        let synth = synthesize_inputs(&stage, &dir, &dir, &dir, &outputs, &stage_index, &BTreeMap::new()).unwrap();
+        let synth = synthesize_inputs(
+            &stage,
+            &dir,
+            &dir,
+            &dir,
+            &outputs,
+            &stage_index,
+            &BTreeMap::new(),
+        )
+        .unwrap();
         assert!(matches!(
             synth.bindings["kv"],
             InputBindingSource::Chained { stage: 0 }
@@ -3449,7 +3524,10 @@ count = { from = "planner", max = 3 }
         let manifest = manifest_from_toml(SHAPE_MANIFEST).unwrap();
         let read = read_chain_shape(&dir, &manifest);
         assert!(read.counts.is_empty());
-        assert!(!read.stale, "nothing recorded is not the same as recorded for another chain");
+        assert!(
+            !read.stale,
+            "nothing recorded is not the same as recorded for another chain"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

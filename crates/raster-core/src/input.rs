@@ -1,10 +1,10 @@
 //! External input marker and resolved value types.
 
+use crate::hash::{Digest, Sha256};
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 use serde::{Deserialize, Serialize};
-use crate::hash::{Digest, Sha256};
 
 use crate::cfs::CfsCoordinates;
 
@@ -261,6 +261,9 @@ pub enum SelectionProofStep {
         len: u64,
         siblings: Vec<ListProofSibling>,
     },
+    /// Authenticate the successful wrapper removed by a fallible call binding.
+    /// This leading step consumes no selector segment and binds the `Ok` tag.
+    ResultOk,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -1070,15 +1073,24 @@ fn fold_list_range(
     ]))
 }
 
-/// Do the proof's steps describe the path it claims, one step per segment,
-/// outermost first? Shared by both entry points below, since a proof that
+/// Do the proof's steps describe the path it claims, one step per segment after
+/// an optional authenticated leading Ok wrapper, outermost first? Shared by
+/// both entry points below, since a proof that
 /// does not describe its own path is invalid however its leaf is obtained.
 fn proof_steps_match_path(proof: &SelectionProof) -> bool {
-    proof.steps.len() == proof.path.segments.len()
-        && proof
-            .steps
+    let mut steps = proof.steps.as_slice();
+    if matches!(steps.first(), Some(SelectionProofStep::ResultOk)) {
+        // One successful-call unwrap, matching resolve_storage_ok_value.
+        // Empty paths still mean the complete stored Result.
+        if proof.path.segments.is_empty() {
+            return false;
+        }
+        steps = &steps[1..];
+    }
+    steps.len() == proof.path.segments.len()
+        && steps
             .iter()
-            .zip(proof.path.segments.iter())
+            .zip(&proof.path.segments)
             .all(|(step, segment)| step_proves_segment(step, segment))
 }
 
@@ -1099,11 +1111,13 @@ pub fn verify_selection_reference(selected_root: &Hash32, proof: &SelectionProof
     if !proof_steps_match_path(proof) {
         return false;
     }
-    if matches!(proof.steps.last(), Some(SelectionProofStep::ListRange { .. })) {
+    if matches!(
+        proof.steps.last(),
+        Some(SelectionProofStep::ListRange { .. })
+    ) {
         return false;
     }
-    fold_selection_steps(*selected_root, &proof.steps)
-        .is_some_and(|hash| hash == proof.root_hash)
+    fold_selection_steps(*selected_root, &proof.steps).is_some_and(|hash| hash == proof.root_hash)
 }
 
 pub fn verify_selection_proof(selected_bytes: &[u8], proof: &SelectionProof) -> bool {
@@ -1150,6 +1164,9 @@ fn fold_selection_steps(start: Hash32, steps: &[SelectionProofStep]) -> Option<H
     let mut current_hash = start;
     for step in steps.iter().rev() {
         current_hash = match step {
+            SelectionProofStep::ResultOk => {
+                selection_hash(&[b"enum-newtype", b"Ok", current_hash.as_slice()])
+            }
             SelectionProofStep::Struct {
                 field_index,
                 field_names,
@@ -1753,7 +1770,12 @@ mod tests {
         // stage's `output.bin` with `parse_scalar_leaf`, and every verifier
         // afterwards re-encodes it with `scalar_leaf_root` and compares against
         // what that stage committed.
-        for width in [IndexWidth::U8, IndexWidth::U16, IndexWidth::U32, IndexWidth::U64] {
+        for width in [
+            IndexWidth::U8,
+            IndexWidth::U16,
+            IndexWidth::U32,
+            IndexWidth::U64,
+        ] {
             let payload = encode_index_leaf_payload(7, width).unwrap();
             assert_eq!(parse_scalar_leaf(&payload), Some((width, 7)));
             assert_eq!(
@@ -1773,12 +1795,20 @@ mod tests {
         let mut trailing = payload.clone();
         trailing.push(0xff);
         assert_eq!(parse_scalar_leaf(&trailing), None, "trailing bytes");
-        assert_eq!(parse_scalar_leaf(&payload[..payload.len() - 1]), None, "truncated");
+        assert_eq!(
+            parse_scalar_leaf(&payload[..payload.len() - 1]),
+            None,
+            "truncated"
+        );
 
         let mut odd_width = payload.clone();
         odd_width[1] = 3;
         odd_width.truncate(1 + 8 + 3);
-        assert_eq!(parse_scalar_leaf(&odd_width), None, "3-byte leaf is no scalar");
+        assert_eq!(
+            parse_scalar_leaf(&odd_width),
+            None,
+            "3-byte leaf is no scalar"
+        );
 
         let mut not_a_leaf = payload.clone();
         not_a_leaf[0] = 0x01;

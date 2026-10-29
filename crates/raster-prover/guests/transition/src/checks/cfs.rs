@@ -129,10 +129,30 @@ fn assert_same_source(left: ResolvedSource<'_>, right: ResolvedSource<'_>) {
             );
         }
         (ResolvedSource::Storage(left_meta), ResolvedSource::Storage(right_meta)) => {
-            assert_eq!(
-                left_meta, right_meta,
-                "Storage sequence scope input does not match consumer binding",
+            // A recurrence consumes list metadata, while its caller may have
+            // forwarded the full list. These payloads have different hashes
+            // and lengths but select the same immutable subtree. Payload
+            // authentication remains mandatory in verify_storage_transition;
+            // here we bind the source, not its serialization view.
+            let list_view_change = matches!(
+                (left_meta.selection.payload_kind, right_meta.selection.payload_kind),
+                (SelectionPayloadKind::List, SelectionPayloadKind::Raw)
+                    | (SelectionPayloadKind::Raw, SelectionPayloadKind::List)
             );
+            if list_view_change {
+                assert_eq!(
+                    (&left_meta.coordinates, &left_meta.commitment, &left_meta.selector,
+                     &left_meta.selection.path, &left_meta.selection.source_root_hash),
+                    (&right_meta.coordinates, &right_meta.commitment, &right_meta.selector,
+                     &right_meta.selection.path, &right_meta.selection.source_root_hash),
+                    "Storage sequence scope input does not match consumer binding",
+                );
+            } else {
+                assert_eq!(
+                    left_meta, right_meta,
+                    "Storage sequence scope input does not match consumer binding",
+                );
+            }
         }
         _ => {
             panic!("Sequence scope source kind does not match consumer binding");
@@ -151,8 +171,8 @@ fn assert_same_source(left: ResolvedSource<'_>, right: ResolvedSource<'_>) {
 /// declares no static path; it is held to the caller's prefix, and its index
 /// values to their own citations.
 ///
-/// A path with nothing to narrow (`path` empty, no index) is the old identity
-/// check, unchanged. Narrowing an inline value cannot be checked here — the
+/// A path with nothing to narrow (`path` empty, no index) requires the same
+/// source, allowing the authenticated raw/list-metadata views of that source. Narrowing an inline value cannot be checked here — the
 /// guest has no selector over inline bytes — so it fails closed.
 fn assert_scope_source(
     consumer: ResolvedSource<'_>,

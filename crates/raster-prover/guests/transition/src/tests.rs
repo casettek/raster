@@ -5534,3 +5534,69 @@ fn a_tile_reading_the_value_inside_an_err_is_rejected() {
         &witnesses,
     );
 }
+
+
+// A scope may forward a full list which a recurrence consumes as metadata.
+// View conversion must never allow changing the stored object or selection.
+#[test]
+fn scope_list_views_preserve_source_identity() {
+    use raster_core::input::SelectionPayloadKind;
+    let (step, _, _, _) = scope_binding_scenario(CfsCoordinates(vec![]), sha(b"list"));
+    let scope = selecting(storage_input_witness(CfsCoordinates(vec![]), sha(b"list")),
+        field_path(&["donor_b_kv", "kv"]));
+    let mut consumer = scope.clone();
+    let selection = &mut consumer.storage.get_mut("arg").unwrap().selection;
+    selection.payload_kind = SelectionPayloadKind::List;
+    selection.selected_len = 41;
+    selection.selected_hash = [7; 32];
+    let check = |consumer: &FnInput, scope: &FnInput| {
+        verify_step_record_inputs(&scope_binding_cfs(), &step, Some(consumer), Some(scope), None);
+    };
+    check(&consumer, &scope);
+    check(&scope, &consumer);
+    for mutation in 0..5 {
+        let mut changed = consumer.clone();
+        let meta = changed.storage.get_mut("arg").unwrap();
+        match mutation {
+            0 => meta.coordinates = CfsCoordinates(vec![99]),
+            1 => meta.commitment[0] ^= 1,
+            2 => meta.selection.source_root_hash[0] ^= 1,
+            3 => meta.selection.path = raster_core::input::SelectorPath::new(field_path(&["sibling"])),
+            _ => meta.selector = raster_core::input::SelectorPath::new(field_path(&["sibling"])),
+        }
+        assert!(std::panic::catch_unwind(|| check(&changed, &scope)).is_err());
+    }
+    for mutation in 0..2 {
+        let mut changed = consumer.clone();
+        let selection = &mut changed.storage.get_mut("arg").unwrap().selection;
+        if mutation == 0 { selection.selected_hash[0] ^= 1; }
+        else { selection.selected_len += 1; }
+        assert!(std::panic::catch_unwind(|| check(&changed, &consumer)).is_err());
+    }
+}
+
+#[test]
+fn list_metadata_view_still_requires_authentic_payload() {
+    use raster_core::input::verify_selection_witness;
+    let root = swept_lines().0;
+    let (_, input, witnesses) = site_start_reading(root, swept_lines_metadata());
+    let commitment = &input.storage.get("input").unwrap().selection;
+    let witness = witnesses.get("input").unwrap();
+    assert!(verify_selection_witness(commitment, witness));
+    for mutation in 0..5 {
+        let mut changed = commitment.clone();
+        match mutation {
+            0 => changed.selected_hash[0] ^= 1,
+            1 => changed.selected_len += 1,
+            2 => changed.source_root_hash[0] ^= 1,
+            3 => changed.path = raster_core::input::SelectorPath::new(field_path(&["sibling"])),
+            _ => changed.payload_kind = raster_core::input::SelectionPayloadKind::Raw,
+        }
+        assert!(!verify_selection_witness(&changed, witness));
+    }
+    let mut tampered = witness.clone();
+    tampered.bytes[9] ^= 1;
+    let mut changed = commitment.clone();
+    changed.selected_hash = raster_core::input::selection_payload_hash(&tampered.bytes);
+    assert!(!verify_selection_witness(&changed, &tampered));
+}

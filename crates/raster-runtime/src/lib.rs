@@ -6,6 +6,8 @@
 //! - Trace capture and storage
 
 pub mod auth;
+mod working_storage;
+pub use working_storage::WorkingStorage;
 mod backing;
 mod entry_arguments;
 pub mod input;
