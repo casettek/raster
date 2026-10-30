@@ -35,13 +35,19 @@ For each tile, its **10 largest recorded calls by input + output bytes**. A tile
 or fewer is replayed in full. Every call is still counted in that tile's size histogram.
 
 Size is the selection key because it predicts zkVM cost: guest cycles are dominated by decoding
-and hashing the input. On iris `prefill_range_l0`, ranking by size found the true 10 heaviest
-calls and every tile's heaviest call. Native time was a weaker predictor
-(tile-cost-estimator §3).
+and hashing the input. Native time was a weaker predictor (tile-cost-estimator §3). On iris
+`prefill_range_l0` (1,119 calls), the top 10 held the exact heaviest call for 18 of 28 tiles,
+and came within 0.2% of it for the rest.
 
-The limit: a tile whose cost depends on its *values* rather than its size can have its heaviest
-call outside the top 10. The report shows each heaviest call's byte rank next to its cycle rank,
-so a disagreement is visible.
+The limits:
+- **Ties.** When more than 10 calls have the same size, the top 10 are the earliest in trace
+  order. On iris every miss was such a tie, where many calls share one size and differ in
+  cycles by up to about 2%.
+- **Value-dependent cost.** A tile whose cost depends on its *values* rather than its size can
+  have its heaviest call outside the top 10.
+
+The report shows each heaviest call's byte rank next to its cycle rank, so a disagreement is
+visible.
 
 Every replay must reproduce the recording: the guest's input commitment must be
 `sha256(input)`, and its output must equal the recorded output. A call that does not, for

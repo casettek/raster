@@ -54,6 +54,17 @@ naming a path that appears nowhere in the project. Cases that reach it:
 - **A path that no longer exists** (reproduced): for example a dependency into a removed git
   worktree. The native build fails too, but with cargo's correct message. The guest build reports
   `/crates/raster` instead.
+- **A symlink in the `raster` path** (reproduced 2026-10-30, iris `prefill-range` with
+  `../../../raster` pointing at a symlink to the checkout). Here the scan *does* find the path,
+  but `:115` canonicalizes it, so the generated guest names `raster` by its real location. The
+  user crate, a dependency of the same guest, still reaches `raster` through the symlinked
+  path. Cargo keeps paths as written, so it sees two packages and refuses:
+  ```
+  error: package collision in the lockfile: packages raster v0.1.0 (…/bench-iris/rp/raster/crates/raster)
+  and raster v0.1.0 (…/raster-project/raster/crates/raster) are different, but only one can be
+  written to lockfile unambiguously
+  ```
+  The native build works.
 - **Not covered by the scan, by reading:** a `raster` from git or a registry (no `path`), and any
   layout where `raster` is not two levels below the workspace root.
 - **Matched by accident:** the `[dependencies.raster]` table form, whose `path = "…"` line does

@@ -1,7 +1,7 @@
 # Proposal: `tile-cost-estimator` — what the `risc0-estimator` branch should be
 
-Status: implemented 2026-10-30 on branch `replay-profile` (§6 steps 1–6). Step 7, verification on
-iris, is pending. Began as the scope document for `origin/risc0-estimator` (`c826103`). Usage:
+Status: implemented and verified 2026-10-30 on branch `replay-profile` (§6, steps 1–7; step 7
+results in §6). Began as the scope document for `origin/risc0-estimator` (`c826103`). Usage:
 [`replay-profiling.md`](../replay-profiling.md).
 
 Related:
@@ -93,8 +93,9 @@ resolution, output store, trace). The executor column covers everything the gues
    | native body time | 0.86 | 6/10 | 32% of max |
 
    Within one tile, cycles vary up to 36× (`mac_weight_page`: 185k to 6.7M), so which call
-   gets measured matters. Byte counts picked the true heaviest call in each of the three
-   tiles with more than two calls. Body-only native time is the weakest signal.
+   gets measured matters. In this 68-step sample, byte counts picked the true heaviest call
+   in each of the three tiles with more than two calls. The full run is less clean: see the
+   step 7 results in §6. Body-only native time is the weakest signal.
 4. **Replaying every invocation is affordable.** The stage makes 1,119 tile calls, and
    native tile work totals 60 ms. Extrapolating from these averages, replaying all of them
    costs about 40 s single-threaded. That is about 4× the 11 s native run, before
@@ -215,8 +216,8 @@ call (it matched the profile's `input_bytes` on all 68 iris steps in §3).
 
 - For each tile, rank all calls by **input + output witness bytes** and replay the **top
   10**. Ties keep trace order. A tile with 10 calls or fewer is replayed in full. On iris,
-  this ranking found the true 10 heaviest steps and picked the true heaviest call in every
-  multi-call tile (§3.3).
+  the top 10 held the exact heaviest call for 18 of 28 tiles, and came within 0.2% of it
+  for the rest. Every miss was a tie on size (§6, step 7 results).
 - No replay-all mode in version 1. Checking the ranking against every call is a one-off
   development check on iris: raise the constant temporarily and compare.
 - A tile whose cost depends on values rather than size can hide its heaviest call outside
@@ -307,7 +308,7 @@ them.
    - `replay check <run-dir>`: replay every call, pass/fail only (`zkvm-dry-run`).
 2. **Self-check by random sample.** Add calls picked at random with a fixed seed to the top
    10. If one costs more than the top 10, or bytes and cycles disagree in ranking, replay every
-   call of that tile.
+   call of that tile. This also catches heavier calls hidden in a size tie (§7 Q2).
 3. **Parallel replay.** Calls are independent (`zkvm-dry-run` §10.2).
 4. **Heavy-call set.** Save each tile's heaviest calls to re-measure them without a native
    run. Synthetic stress inputs (§4.3) join the same set.
@@ -446,11 +447,49 @@ uncalled tile, a partial report, and narrow-terminal truncation of long tile nam
    top 10 contained every tile's true heaviest call. Record the result in §3, then revert.
 4. Re-lock hello-tiles and compare against a baseline lock built at the same path.
 
+### Step 7 results (2026-10-30)
+
+Setup: iris `prefill_range_l0`, release `cargo-raster` from this branch, risc0 3.0.6. The iris
+copy is `bench-iris/rp/iris`. Its `raster` dependency points at the checkout's real path,
+because a symlinked path breaks guest builds (`build-path-dependence` §1).
+
+- **End to end.** A native authenticated run took 248 s, including the stage's first release
+  build. `replay profile` replayed 233 of 1,119 calls with status complete, and showed the
+  stage's 5 uncalled tiles as `not executed`. That took 919 s, almost all of it compiling 28
+  tile guests the first time.
+- **Cycles match the earlier measurement exactly.** 20 calls appear both here and in the
+  §3 probe measurement. All 20 have identical tile, user cycles and segments. That is
+  expected: no guest source changed between the probe's `8c81c47` and this branch.
+- **Replaying every call.** With `TOP_CALLS_PER_TILE` temporarily raised, all 1,119 calls
+  replayed in **38 s**, single-threaded (§3's estimate was about 40 s).
+- **Top 10 by size against every call.** The top 10 held the tile's exact heaviest call for
+  **18 of 28** tiles. For the other 10, the top 10's maximum was **99.8–100%** of the true
+  maximum. Every miss was a **tie on size**:
+  - 9 tiles have 24 calls of one identical size, whose cycles differ by 0.1–1.8%;
+  - `mac_weight_page` has 72 calls tied at its largest size, differing by 1.3%.
+
+  Ties keep trace order, so the top 10 are the earliest of the tied calls, and the heaviest
+  sat later (byte ranks 13–24). `finish_qkv` looked value-dependent, at 405k–968k for one
+  size, but only its first call is cheap; the other 23 are within 0.6% of each other.
+  Selecting by size finds the right size class. Within a class it does not choose, and on
+  iris that costs at most 0.2%.
+- **Image ids.** No guest input changed against main: `raster`, `raster-core` and
+  `raster-macros` (the crates guests link), and `guest_builder.rs`, have no diff against
+  `7b8230c`. So no tile image id can move. On hello-tiles, the measured ids equal a freshly
+  built lock 23/23 (step 5).
+
 ## 7. Open questions
 
 1. **Executor fixed cost.** At about 20 ms per invocation it dominates small tiles. Can the
    memory image be built once per tile and reused across executions? If so, a full replay
    gets cheaper by roughly the fixed-cost share (our estimate, not measured).
-2. **Budget unit.** User cycles are what the guest controls. Padded proof cycles are what
+2. **Ties on size — decided 2026-10-30: keep trace order.** When more than 10 calls tie at a
+   tile's largest size, the top 10 are the earliest in trace order. On iris the heaviest tied
+   call sat later, costing up to 0.2%. That is documented in `replay-profiling.md`. Rejected
+   for version 1, to keep the selection rule simple: breaking ties latest first (a
+   heuristic), spreading the picks across the tie, and replaying every call tied at the
+   cut-off (exact for size classes, but its cost grows with the tie). The random-sample
+   self-check (§5.6) covers ties as well.
+3. **Budget unit.** User cycles are what the guest controls. Padded proof cycles are what
    proving pays. A budget in user cycles is simpler to state. A budget in segments matches
    the prover.
