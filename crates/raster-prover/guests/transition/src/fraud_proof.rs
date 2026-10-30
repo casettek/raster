@@ -267,6 +267,11 @@ impl FraudProofWindowContext {
             TransitionState::Finished => {
                 panic!("Finished Transition");
             }
+            // An attestation ends its window exactly as a fraud proof does:
+            // nothing may be chained after it.
+            TransitionState::TerminalMatch => {
+                panic!("TerminalMatch Transition");
+            }
         }
     }
 }
@@ -756,17 +761,22 @@ impl LiveTransition {
     /// Decide the next machine state against the committed window fingerprint.
     ///
     /// The first window step is committed without comparison. Every later
-    /// step must match the committed fingerprint at its index — except the
-    /// final window item, which must diverge: that divergence is the fraud
-    /// being proven, and it transitions the machine to `Finished`.
+    /// step must match the committed fingerprint at its index. The final
+    /// window item decides how the window ends ([`window_end`]): a divergence,
+    /// or a trace end that is not the commitment's end, is the fraud being
+    /// proven and ends it `Finished`; a terminal window that matches
+    /// throughout and ends in `ProgramEnd` ends it `TerminalMatch`, an
+    /// attestation of the trace's honest end.
     ///
     /// Entry-argument authorization needs no deadline here: it is
     /// `Established` (or `NotRequired`) from the moment the window opens, so
-    /// there is never an unauthorized chain able to reach `Finished`.
+    /// there is never an unauthorized chain able to reach either end.
     pub fn finalize(
         self,
         committed_fingerprint: &Fingerprint,
         final_committed_root: Option<&Vec<u8>>,
+        window_is_terminal: bool,
+        ends_program: bool,
     ) -> TransitionState {
         let actual_fingerprint: Fingerprint = self.fingerprint_acc.clone().into_fingerprint();
         let last_index = actual_fingerprint.len() - 1;
@@ -788,12 +798,7 @@ impl LiveTransition {
             // provable, never what is accepted as a match.
             let diverges_by_root = final_committed_root
                 .is_some_and(|committed_root| frontier_root(&self.frontier) != *committed_root);
-            assert!(
-                diverges || diverges_by_root,
-                "A fraud proof's final step must diverge from the commitment, by fingerprint \
-                 entry or by revealed trace root",
-            );
-            TransitionState::Finished
+            window_end(diverges || diverges_by_root, window_is_terminal, ends_program)
         } else {
             assert!(
                 !diverges,
@@ -819,6 +824,46 @@ impl LiveTransition {
                 .expect("Step must produce next expected coordinates"),
             recur_progress: self.recur_progress,
         }
+    }
+}
+
+/// How a window ends, decided at its last item.
+///
+/// - The item diverged from the commitment (by fingerprint entry or by
+///   revealed root): `Finished`, the fraud being proven.
+/// - It matched, but the trace and the commitment end in different places:
+///   `Finished`. Either the window ends where the commitment ends but its last
+///   item is not `ProgramEnd` (the commitment stops before the program does),
+///   or its last item is `ProgramEnd` but the commitment goes on (it claims
+///   items after the program ended). An honest commitment ends in `ProgramEnd`
+///   at its last index and nowhere else (nothing may follow `ProgramEnd`, and a
+///   failed `main` never reaches it), so neither can fire against one.
+/// - It matched, ends where the commitment ends, and ends in `ProgramEnd`:
+///   `TerminalMatch`, an attestation that honest execution of the window ends
+///   the trace. A stage challenge's mislabel defence; never a fraud proof.
+/// - It matched, and neither the commitment nor the program ends here:
+///   refused. Such a window attests nothing a consumer could use.
+///
+/// The endings come from disjoint conditions, so no window can reach two, and
+/// `window_is_terminal` is guest-derived at `Init`, never host-claimed. See
+/// `docs/proposals/stage-challenge.md` §Phase 3 plan, change 1.
+pub(crate) fn window_end(
+    diverges: bool,
+    window_is_terminal: bool,
+    ends_program: bool,
+) -> TransitionState {
+    if diverges {
+        return TransitionState::Finished;
+    }
+    match (window_is_terminal, ends_program) {
+        (true, true) => TransitionState::TerminalMatch,
+        // The trace's end and the commitment's disagree: the commitment
+        // misstates the trace's length.
+        (true, false) | (false, true) => TransitionState::Finished,
+        (false, false) => panic!(
+            "A fraud proof's final step must diverge from the commitment, by fingerprint entry \
+             or by revealed trace root",
+        ),
     }
 }
 

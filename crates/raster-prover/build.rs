@@ -18,7 +18,7 @@ fn main() {
     println!("cargo:rerun-if-changed=Cargo.toml");
     println!("cargo:rerun-if-changed=../raster-core/src");
     println!("cargo:rerun-if-changed=../raster-core/Cargo.toml");
-    for guest in ["authorization", "chain_fraud", "transition"] {
+    for guest in ["authorization", "chain_fraud", "transition", "defence"] {
         for source in ["src", "Cargo.toml", "Cargo.lock"] {
             println!("cargo:rerun-if-changed=guests/{guest}/{source}");
         }

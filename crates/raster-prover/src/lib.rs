@@ -16,6 +16,8 @@ pub mod archive;
 pub mod authorization;
 pub mod availability;
 pub mod chain_fraud;
+pub mod defence;
+pub mod challenge;
 pub mod error;
 pub mod replay;
 pub mod trace;

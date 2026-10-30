@@ -324,6 +324,20 @@ pub fn run(
         return Ok(());
     }
 
+    // Only a completed run with a saved trace gets one: its presence says the trace is whole, so
+    // a later command can work from the run directory alone.
+    if status.success() && (pending.is_none() || save_trace) {
+        crate::run_manifest::RunManifest::new(
+            &artifacts.run_id,
+            &project.root_dir,
+            input,
+            input_manifest,
+            trace_format,
+            &cfs,
+        )?
+        .write(&artifacts.run_dir)?;
+    }
+
     if let Some(pending) = pending {
         pending.publish()?;
     } else {

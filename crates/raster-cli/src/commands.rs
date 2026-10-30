@@ -2,9 +2,11 @@
 pub mod audit;
 pub mod fraud;
 pub mod prove;
+pub mod replay;
 pub mod run;
 pub mod show;
 pub mod tile;
+pub mod window_prover;
 
 use crate::utils::encode::{decode_execution_output, encode_input};
 

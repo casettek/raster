@@ -1,8 +1,14 @@
-//! Trace replayer for re-executing tiles with proof generation.
+//! Trace replayer for re-executing tiles with proof generation, and for
+//! measuring recorded calls in the zkVM executor without proving.
 
-use raster_backend::{Backend, ExecutionMode};
+use std::time::{Duration, Instant};
+
+use raster_backend::{
+    padded_proof_cycles, Backend, CompilationArtifact, ExecutionMode, SegmentStat,
+};
 use raster_compiler::tile::TileDiscovery;
 use raster_compiler::Project;
+use sha2::{Digest, Sha256};
 
 use raster_core::draft::TileReplayJournal;
 use raster_core::{Error, Result};
@@ -17,6 +23,75 @@ pub struct ReplayResult {
     pub input: Vec<u8>,
     pub output: Vec<u8>,
     pub replay_journal: TileReplayJournal,
+}
+
+/// One recorded call, executed in the zkVM executor without proving.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallMeasure {
+    /// Guest user cycles, including the tile wrapper (decode, input hash, output encode).
+    pub user_cycles: u64,
+    pub segments: Vec<SegmentStat>,
+    /// `Σ 2^po2` over `segments`: what proving this call would pay.
+    pub padded_cycles: u64,
+    /// Host wall time of the executor call, on this machine.
+    pub exec_time: Duration,
+}
+
+/// A tile compiled (or loaded from the cache) once, for measuring any number of
+/// its recorded calls. Never produces or accepts a receipt.
+pub struct PreparedTileProfile<'a> {
+    backend: &'a dyn Backend,
+    artifact: Box<dyn CompilationArtifact>,
+}
+
+impl PreparedTileProfile<'_> {
+    pub fn image_id(&self) -> String {
+        self.artifact.artifact_id()
+    }
+
+    /// Execute one recorded call and measure it. The guest must reproduce the
+    /// recording: its input commitment must be `sha256(input)` and its output the
+    /// recorded output. A call that does not is an error, not a measurement.
+    pub fn measure(&self, input: &[u8], expected_output: &[u8]) -> Result<CallMeasure> {
+        let started = Instant::now();
+        let result =
+            self.backend
+                .execute_tile(self.artifact.as_ref(), input, ExecutionMode::Estimate)?;
+        let exec_time = started.elapsed();
+        if result.receipt.is_some() {
+            return Err(Error::Other(
+                "Measurement unexpectedly generated a receipt".into(),
+            ));
+        }
+        let journal = result
+            .journal
+            .ok_or_else(|| Error::Other("Executor returned no journal".into()))?;
+        let journal: TileReplayJournal = raster_core::postcard::from_bytes(&journal)
+            .map_err(|e| Error::Other(format!("Failed to decode replay journal: {e}")))?;
+        let expected_commitment: [u8; 32] = Sha256::digest(input).into();
+        if journal.input_commitment != expected_commitment {
+            return Err(Error::Other("Replay input commitment mismatch".into()));
+        }
+        if journal.output_bytes != expected_output {
+            return Err(Error::Other(format!(
+                "Replay output mismatch (recorded {} bytes, guest {} bytes)",
+                expected_output.len(),
+                journal.output_bytes.len(),
+            )));
+        }
+        let user_cycles = result
+            .cycles
+            .ok_or_else(|| Error::Other("Executor reported no cycles".into()))?;
+        if result.segments.is_empty() {
+            return Err(Error::Other("Executor reported no segments".into()));
+        }
+        Ok(CallMeasure {
+            user_cycles,
+            padded_cycles: padded_proof_cycles(&result.segments),
+            segments: result.segments,
+            exec_time,
+        })
+    }
 }
 
 /// Result of replaying a trace item.
@@ -64,6 +139,21 @@ impl<'a> Replayer<'a> {
         bytes
             .try_into()
             .map_err(|_| Error::Other("Tile image id must be 32 bytes".into()))
+    }
+
+    /// Compile or load a tile once, for measuring its recorded calls.
+    pub fn prepare_profile(&self, tile_id: &str) -> Result<PreparedTileProfile<'a>> {
+        let discovery = TileDiscovery::new(self.project);
+        let tile = discovery.get(tile_id).ok_or_else(|| {
+            Error::InvalidTileId(format!("Tile '{tile_id}' not found in project"))
+        })?;
+        let artifact = self
+            .backend
+            .compile_tile(&tile.to_metadata(), tile.to_content_hash())?;
+        Ok(PreparedTileProfile {
+            backend: self.backend,
+            artifact,
+        })
     }
 
     /// Replay a single trace item.
@@ -120,5 +210,171 @@ impl<'a> Replayer<'a> {
             output: replay_journal.output_bytes.clone(),
             replay_journal,
         })
+    }
+}
+
+#[cfg(test)]
+mod measure_tests {
+    use super::*;
+    use raster_backend::{ArtifactStore, ResourceEstimate, TileExecutionResult};
+    use raster_core::tile::TileMetadata;
+    use std::any::Any;
+
+    const INPUT: &[u8] = b"recorded input";
+    const OUTPUT: &[u8] = b"recorded output";
+
+    struct Artifact;
+    impl CompilationArtifact for Artifact {
+        fn id(&self) -> &str {
+            "tile"
+        }
+        fn artifact_id(&self) -> String {
+            "ab".repeat(32)
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+        fn as_any_mut(&mut self) -> &mut dyn Any {
+            self
+        }
+    }
+
+    /// Executes by returning a canned result; everything else is off limits
+    /// to a prepared measurement.
+    struct BackendStub {
+        result: TileExecutionResult,
+        abort: bool,
+    }
+    impl Backend for BackendStub {
+        fn name(&self) -> &'static str {
+            "stub"
+        }
+        fn compile_tile(
+            &self,
+            _: &TileMetadata,
+            _: Option<String>,
+        ) -> Result<Box<dyn CompilationArtifact>> {
+            panic!("a prepared measurement must never compile")
+        }
+        fn execute_tile(
+            &self,
+            _: &dyn CompilationArtifact,
+            input: &[u8],
+            mode: ExecutionMode,
+        ) -> Result<TileExecutionResult> {
+            assert_eq!(input, INPUT);
+            assert_eq!(mode, ExecutionMode::Estimate);
+            if self.abort {
+                Err(Error::Other("guest aborted".into()))
+            } else {
+                Ok(self.result.clone())
+            }
+        }
+        fn artifact_store(&self) -> &dyn ArtifactStore {
+            panic!("a prepared measurement has its artifact")
+        }
+        fn estimate_resources(&self, _: &TileMetadata) -> Result<ResourceEstimate> {
+            panic!("a measurement executes, it does not estimate")
+        }
+        fn verify_receipt(&self, _: &dyn CompilationArtifact, _: &[u8]) -> Result<bool> {
+            panic!("no proof is made")
+        }
+    }
+
+    fn journal() -> TileReplayJournal {
+        TileReplayJournal {
+            input_commitment: Sha256::digest(INPUT).into(),
+            output_bytes: OUTPUT.to_vec(),
+            output_root: None,
+            input_roots: Vec::new(),
+            draft_transition: None,
+            recur: None,
+        }
+    }
+
+    fn stub() -> BackendStub {
+        let mut result = TileExecutionResult::estimate(OUTPUT.to_vec(), 1_500_000);
+        result.journal = Some(raster_core::postcard::to_allocvec(&journal()).unwrap());
+        result.segments = vec![
+            SegmentStat {
+                po2: 20,
+                cycles: 1_000_000,
+            },
+            SegmentStat {
+                po2: 19,
+                cycles: 500_000,
+            },
+        ];
+        BackendStub {
+            result,
+            abort: false,
+        }
+    }
+
+    fn measure(backend: &BackendStub, output: &[u8]) -> Result<CallMeasure> {
+        PreparedTileProfile {
+            backend,
+            artifact: Box::new(Artifact),
+        }
+        .measure(INPUT, output)
+    }
+
+    fn error(backend: &BackendStub) -> String {
+        measure(backend, OUTPUT).unwrap_err().to_string()
+    }
+
+    #[test]
+    fn measures_cycles_segments_and_padding_without_recompiling() {
+        let backend = stub();
+        let first = measure(&backend, OUTPUT).unwrap();
+        assert_eq!(first.user_cycles, 1_500_000);
+        assert_eq!(first.segments.len(), 2);
+        assert_eq!(first.padded_cycles, (1 << 20) + (1 << 19));
+        // Not the single-segment estimate the result also carries.
+        assert_ne!(Some(first.padded_cycles), backend.result.proof_cycles);
+        // A second call reuses the artifact; the stub panics on any compile.
+        assert_eq!(measure(&backend, OUTPUT).unwrap().user_cycles, 1_500_000);
+    }
+
+    #[test]
+    fn rejects_a_guest_that_does_not_reproduce_the_recording() {
+        let backend = stub();
+        assert!(measure(&backend, b"different output")
+            .unwrap_err()
+            .to_string()
+            .contains("output mismatch"));
+
+        let mut backend = stub();
+        let mut wrong = journal();
+        wrong.input_commitment = [0; 32];
+        backend.result.journal = Some(raster_core::postcard::to_allocvec(&wrong).unwrap());
+        assert!(error(&backend).contains("input commitment mismatch"));
+    }
+
+    #[test]
+    fn rejects_incomplete_or_proved_results_and_guest_failures() {
+        let mut backend = stub();
+        backend.result.journal = None;
+        assert!(error(&backend).contains("no journal"));
+
+        let mut backend = stub();
+        backend.result.journal = Some(vec![0]);
+        assert!(error(&backend).contains("decode"));
+
+        let mut backend = stub();
+        backend.result.cycles = None;
+        assert!(error(&backend).contains("no cycles"));
+
+        let mut backend = stub();
+        backend.result.segments.clear();
+        assert!(error(&backend).contains("no segments"));
+
+        let mut backend = stub();
+        backend.result.receipt = Some(vec![1]);
+        assert!(error(&backend).contains("receipt"));
+
+        let mut backend = stub();
+        backend.abort = true;
+        assert!(error(&backend).contains("guest aborted"));
     }
 }

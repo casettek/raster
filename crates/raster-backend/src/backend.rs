@@ -118,6 +118,20 @@ pub fn calculate_proof_cycles(actual_cycles: u64) -> u64 {
     }
 }
 
+/// One zkVM execution segment. RISC Zero proves each segment separately, at
+/// its own power-of-two size `2^po2`; `cycles` is the user cycles it ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SegmentStat {
+    pub po2: u32,
+    pub cycles: u32,
+}
+
+/// What proving these segments pays for: `Σ 2^po2`. Unlike
+/// [`calculate_proof_cycles`], this is exact for a multi-segment execution.
+pub fn padded_proof_cycles(segments: &[SegmentStat]) -> u64 {
+    segments.iter().map(|segment| 1u64 << segment.po2).sum()
+}
+
 /// Host-facing distinction between user-defined failures and runtime failures.
 #[derive(Debug)]
 pub enum ExecutionFailure<E> {
@@ -152,6 +166,14 @@ pub struct TileExecutionResult {
 
     /// Whether the proof was verified (if proof was generated).
     pub verified: Option<bool>,
+
+    /// The raw guest journal, in both modes. Estimate mode has no receipt, so
+    /// this is the only way back to the journal there.
+    pub journal: Option<Vec<u8>>,
+
+    /// The execution's segments. Filled by zkVM backends in estimate mode;
+    /// empty otherwise.
+    pub segments: Vec<SegmentStat>,
 }
 
 impl TileExecutionResult {
@@ -164,6 +186,8 @@ impl TileExecutionResult {
             proof_cycles: Some(calculate_proof_cycles(cycles)),
             receipt: None,
             verified: None,
+            journal: None,
+            segments: Vec::new(),
         }
     }
 
@@ -176,6 +200,8 @@ impl TileExecutionResult {
             proof_cycles,
             receipt: Some(receipt),
             verified: Some(verified),
+            journal: None,
+            segments: Vec::new(),
         }
     }
 }
@@ -242,4 +268,37 @@ pub trait Backend: Send + Sync {
     /// # Returns
     /// True if the proof is valid, false otherwise.
     fn verify_receipt(&self, executable: &dyn CompilationArtifact, receipt: &[u8]) -> Result<bool>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn padded_proof_cycles_sums_each_segment_at_its_own_size() {
+        assert_eq!(padded_proof_cycles(&[]), 0);
+        // A 10M-cycle run in 10 segments of 2^20 pays 10 × 2^20, not
+        // next_power_of_two(10M) = 2^24.
+        let segments = vec![
+            SegmentStat {
+                po2: 20,
+                cycles: 1_000_000
+            };
+            10
+        ];
+        assert_eq!(padded_proof_cycles(&segments), 10 << 20);
+        assert_eq!(calculate_proof_cycles(10_000_000), 1 << 24);
+        // Mixed sizes, as a short final segment produces.
+        let mixed = [
+            SegmentStat {
+                po2: 20,
+                cycles: 900_000,
+            },
+            SegmentStat {
+                po2: 17,
+                cycles: 70_000,
+            },
+        ];
+        assert_eq!(padded_proof_cycles(&mixed), (1 << 20) + (1 << 17));
+    }
 }

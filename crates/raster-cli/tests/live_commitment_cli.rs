@@ -78,6 +78,7 @@ fn live_recurrence_and_drafts_match_saved_trace_without_scratch() {
     let stdout = success(cli(&project, &args, &forbidden));
     let dir = run_dir(&stdout);
     assert!(!dir.join("trace.bin").exists());
+    assert!(!dir.join("run.json").exists());
     let expected = fs::read(&commit).unwrap();
     for format in ["binary", "json"] {
         let mut saved = args.to_vec();
@@ -91,6 +92,9 @@ fn live_recurrence_and_drafts_match_saved_trace_without_scratch() {
             "trace.ndjson"
         });
         assert!(trace.is_file());
+        let run: serde_json::Value =
+            serde_json::from_slice(&fs::read(dir.join("run.json")).unwrap()).unwrap();
+        assert_eq!(run["trace_format"], format);
         if format == "binary" {
             assert_live_evidence(&project, &input, &manifest, &trace, temp.path(), &forbidden);
         }
@@ -242,6 +246,7 @@ fn live_recurrence_and_drafts_match_saved_trace_without_scratch() {
         assert!(!report.exists());
         if let Some(dir) = cancelled_dir {
             assert!(!dir.join("trace.bin").exists());
+            assert!(!dir.join("run.json").exists());
             for entry in fs::read_dir(dir).unwrap().flatten() {
                 if entry
                     .file_name()

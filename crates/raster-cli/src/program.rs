@@ -306,7 +306,7 @@ fn decode_image_id(hex_str: &str, tile_id: &str) -> Result<ImageId> {
 
 /// Read and parse `Raster.lock`. A missing lock is an error here (callers that
 /// tolerate absence check existence first, e.g. [`check_lock_drift`]).
-fn read_lock(lock_path: &Path) -> Result<RasterLock> {
+pub(crate) fn read_lock(lock_path: &Path) -> Result<RasterLock> {
     let text = std::fs::read_to_string(lock_path).map_err(|_| {
         Error::Other(format!(
             "{} not found — run `cargo raster build --backend risc0`",
