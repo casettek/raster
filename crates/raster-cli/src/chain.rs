@@ -40,8 +40,8 @@ use raster_core::{Error, Result};
 use raster_prover::authorization::{authorization_guest_image_id, authorize_external_inputs};
 use raster_prover::chain_fraud::{prove_chain_fraud, transition_guest_image_id};
 use raster_prover::challenge::{
-    protocol_window_size, verify, verify_challenge, AdmissionRefusal, AdmittedChallenge,
-    Challenge, ProvenChallenge, Verdict, PROTOCOL_WINDOW_SIZE,
+    admit_body, protocol_window_size, verify, verify_challenge, AdmissionRefusal,
+    AdmittedChallenge, Challenge, ProvenChallenge, Verdict, PROTOCOL_WINDOW_SIZE,
 };
 use raster_core::merkle::EMPTY_LEAF;
 use raster_prover::defence::{prove_defence, verify_defence};
@@ -1476,6 +1476,11 @@ pub enum Forge {
     Pad,
     /// `H_C` stopping before the program's end: answered by a refutation.
     Truncate,
+    /// The honest `H_C` one revealed tail root short, under the header
+    /// recomputed from it. Admission sees only the header, so this is
+    /// admitted, but its body is malformed: `chain challenge` refuses to write
+    /// it, and a hand-written copy is refused by `challenge-verify`.
+    DropTailRoot,
 }
 
 pub fn challenge(
@@ -1538,7 +1543,8 @@ pub fn challenge(
             *byte ^= 0xff;
         }
         match forge {
-            Forge::ClaimedOutput => {}
+            // The tail root is dropped from the built commitment, below.
+            Forge::ClaimedOutput | Forge::DropTailRoot => {}
             Forge::Item => {
                 let index = trace.len() / 2;
                 trace.0[index] = trace.0[index - 1].clone();
@@ -1561,8 +1567,11 @@ pub fn challenge(
     })?;
     let fraud_proof_config =
         FraudProofConfig::from_window_size(window_size).map_err(|e| Error::Other(e.to_string()))?;
-    let trace_commitment = TraceCommitment::try_build(&trace, &EMPTY_LEAF, fraud_proof_config)
+    let mut trace_commitment = TraceCommitment::try_build(&trace, &EMPTY_LEAF, fraud_proof_config)
         .map_err(|e| Error::Other(e.to_string()))?;
+    if forge == Some(Forge::DropTailRoot) {
+        trace_commitment.revealed_tail_roots.pop();
+    }
 
     let challenge = Challenge::Disputed(StageChallenge {
         chain_commitment_bytes: recorded.chain_bytes.clone(),
@@ -1570,9 +1579,15 @@ pub fn challenge(
         trace_commitment_header: trace_commitment.header(),
         claimed_output,
     });
-    // Never publish a challenge its own admission would refuse.
+    // Never publish a challenge its own admission would refuse, nor a body
+    // that would not count as available.
     let verdict = verify(&challenge)
         .map_err(|refusal| Error::Other(format!("challenge would not be admitted: {refusal}")))?;
+    if let Verdict::AwaitingDefence(admitted) = &verdict {
+        admit_body(&postcard::to_allocvec(&trace_commitment).unwrap(), admitted).map_err(
+            |refusal| Error::Other(format!("challenge body would not be available: {refusal}")),
+        )?;
+    }
     let challenge_path = write_challenge(&recorded, &challenge, Some(&trace_commitment))?;
 
     println!();
@@ -1743,25 +1758,17 @@ pub fn challenge_verify(challenge_path: &str, chain_commitment: Option<&str>) ->
 }
 
 /// `H_C`'s body, from beside the challenge — data availability, locally: it
-/// must be present and be the commitment the challenge names.
+/// must be present and pass `admit_body` (the commitment the challenge names,
+/// and well-formed). `challenge-verify` and `defend` both read it here, so a
+/// body reported available is one `defend` can walk.
 fn read_challenge_body(challenge_path: &Path, admitted: &AdmittedChallenge) -> Result<TraceCommitment> {
     let body_path = challenge_path.with_file_name(CHALLENGE_BODY_FILE);
-    let body: TraceCommitment = std::fs::read(&body_path)
-        .map_err(|e| {
-            Error::Other(format!("H_C's body is not available at {}: {e}", body_path.display()))
-        })
-        .and_then(|bytes| {
-            postcard::from_bytes(&bytes).map_err(|e| {
-                Error::Other(format!("{} is not a trace commitment: {e}", body_path.display()))
-            })
-        })?;
-    if body.header().digest() != admitted.trace_commitment {
-        return Err(Error::Other(format!(
-            "{} is not the trace commitment the challenge names",
-            body_path.display()
-        )));
-    }
-    Ok(body)
+    let bytes = std::fs::read(&body_path).map_err(|e| {
+        Error::Other(format!("H_C's body is not available at {}: {e}", body_path.display()))
+    })?;
+    admit_body(&bytes, admitted).map_err(|refusal| {
+        Error::Other(format!("H_C's body at {} is not available: {refusal}", body_path.display()))
+    })
 }
 
 fn read_challenge(challenge_path: &Path) -> Result<Challenge> {

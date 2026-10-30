@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::chain_fraud::verify_chain_fraud_receipt;
-use crate::trace::FraudProofConfig;
+use crate::trace::{FraudProofConfig, TraceCommitment, TraceCommitmentExt};
 
 /// The protocol's fraud-proof window size: every disputed challenge's `H_C`
 /// is committed at it, so its defence costs one window proof of a known size.
@@ -269,11 +269,79 @@ pub fn verify_challenge(challenge: &StageChallenge) -> Result<AdmittedChallenge,
     })
 }
 
+/// Why `H_C`'s body does not count as available.
+///
+/// Availability is what starts a disputed challenge's clock
+/// (`docs/proposals/settlement-layer.md`), and a defence can only be built
+/// from a body the defender can walk. A body that is present but malformed is
+/// no more available than a missing one. Admission cannot rule it out: the
+/// header it checks hashes the body's parts without describing them, so a body
+/// short one tail root is admitted under the header recomputed from it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BodyRefusal {
+    /// The bytes do not decode as a `TraceCommitment`.
+    Undecodable(String),
+    /// The body's header digest is not the `H_C` the challenge names.
+    NotTheNamedCommitment { body: Vec<u8>, named: Vec<u8> },
+    /// The body is `H_C`, but fails `TraceCommitmentExt::validate`, so no
+    /// defender can walk it.
+    Malformed(String),
+}
+
+impl fmt::Display for BodyRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Undecodable(error) => {
+                write!(f, "the body does not decode as a trace commitment: {error}")
+            }
+            Self::NotTheNamedCommitment { body, named } => write!(
+                f,
+                "the body is trace commitment {}, but the challenge names {}",
+                hex::encode(body),
+                hex::encode(named)
+            ),
+            Self::Malformed(error) => {
+                write!(f, "the body is the named trace commitment, but malformed: {error}")
+            }
+        }
+    }
+}
+
+/// Accept `H_C`'s body as available for an admitted challenge: it decodes, it
+/// is the commitment the challenge names, and it is well-formed — the body
+/// `TraceVerifier::new` accepts, so a defence can be built from it.
+///
+/// The one definition of availability. Whatever decides that a body is
+/// available — the CLI today, a settlement layer or a check of a
+/// data-availability posting later — must apply this, or an admitted challenge
+/// can name a body no one can defend against.
+pub fn admit_body(
+    bytes: &[u8],
+    admitted: &AdmittedChallenge,
+) -> Result<TraceCommitment, BodyRefusal> {
+    let body: TraceCommitment =
+        postcard::from_bytes(bytes).map_err(|e| BodyRefusal::Undecodable(e.to_string()))?;
+    let digest = body.header().digest();
+    if digest != admitted.trace_commitment {
+        return Err(BodyRefusal::NotTheNamedCommitment {
+            body: digest,
+            named: admitted.trace_commitment.clone(),
+        });
+    }
+    body.validate()
+        .map_err(|e| BodyRefusal::Malformed(e.to_string()))?;
+    Ok(body)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::trace::TraceVerifier;
+    use raster_core::cfs::{CfsCoordinates, ControlFlowSchema};
     use raster_core::chain::ChainShape;
     use raster_core::fingerprint::BitPacker;
+    use raster_core::merkle::EMPTY_LEAF;
+    use raster_core::trace::{ExecStep, ExecTarget, StepKind, StepRecord, StorageRoots, Trace};
     use raster_core::transition::TraceCommitmentHeader;
     use std::collections::BTreeMap;
 
@@ -444,6 +512,118 @@ mod tests {
         assert!(matches!(
             verify_challenge(&c).unwrap_err(),
             AdmissionRefusal::UndecodableChainCommitment(_)
+        ));
+    }
+
+    fn tile_step(index: u64) -> StepRecord {
+        StepRecord {
+            exec_index: index,
+            sequence_id: "main".into(),
+            coordinates: CfsCoordinates(vec![1]),
+            kind: StepKind::Exec(ExecStep {
+                target: ExecTarget::Tile(format!("tile_{index}")),
+                intra_sequence_index: 1,
+                input_commitment: Vec::new(),
+                input_source_commitment: Vec::new(),
+                output_commitment: index.to_le_bytes().to_vec(),
+                storage: StorageRoots {
+                    root_before: Vec::new(),
+                    root_after: Vec::new(),
+                    index_root_before: Vec::new(),
+                    index_root_after: Vec::new(),
+                },
+            }),
+            recur_progress_commitment: [0; 32],
+            recur_state: None,
+        }
+    }
+
+    /// An honest `H_C` for a 10-item trace: protocol window 8.
+    fn honest_body() -> TraceCommitment {
+        let trace = Trace((0..10).map(tile_step).collect());
+        let window = protocol_window_size(trace.len()).unwrap();
+        let config = FraudProofConfig::from_window_size(window).unwrap();
+        TraceCommitment::try_build(&trace, &EMPTY_LEAF, config).unwrap()
+    }
+
+    /// Admit a challenge naming `body`, as the challenger who built it posts
+    /// it: under the header recomputed from the body.
+    fn admit(body: &TraceCommitment) -> AdmittedChallenge {
+        verify_challenge(&challenge(vec![stage(COMMITTED.to_vec())], vec![8; 32], body.header()))
+            .expect("admission sees only the header")
+    }
+
+    fn body_bytes(body: &TraceCommitment) -> Vec<u8> {
+        postcard::to_allocvec(body).unwrap()
+    }
+
+    /// What availability promises: the defender can walk the body.
+    #[test]
+    fn an_honest_body_is_available_and_can_be_walked() {
+        let body = honest_body();
+        let admitted = admit(&body);
+        let available = admit_body(&body_bytes(&body), &admitted).expect("available");
+        let cfs = ControlFlowSchema::new("test");
+        assert!(TraceVerifier::new(available, &EMPTY_LEAF, &cfs).is_ok());
+    }
+
+    /// The header hashes the tail roots without counting them, so a body short
+    /// one root is admitted under its recomputed header and is the commitment
+    /// the challenge names, yet no defender can walk it.
+    #[test]
+    fn a_body_short_a_tail_root_is_not_available() {
+        let mut body = honest_body();
+        body.revealed_tail_roots.pop();
+        let admitted = admit(&body);
+        assert_eq!(body.header().digest(), admitted.trace_commitment);
+
+        assert!(matches!(
+            admit_body(&body_bytes(&body), &admitted),
+            Err(BodyRefusal::Malformed(_))
+        ));
+        let cfs = ControlFlowSchema::new("test");
+        assert!(TraceVerifier::new(body, &EMPTY_LEAF, &cfs).is_err());
+    }
+
+    #[test]
+    fn a_body_with_a_wrong_block_count_is_not_available() {
+        let mut body = honest_body();
+        body.fingerprint.bits.push(0);
+        let admitted = admit(&body);
+        assert!(matches!(
+            admit_body(&body_bytes(&body), &admitted),
+            Err(BodyRefusal::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn a_body_whose_tail_contradicts_its_fingerprint_is_not_available() {
+        let mut body = honest_body();
+        body.revealed_tail_roots[0] = [0xff; 32].into();
+        let admitted = admit(&body);
+        assert!(matches!(
+            admit_body(&body_bytes(&body), &admitted),
+            Err(BodyRefusal::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn a_body_other_than_the_named_commitment_is_not_available() {
+        let admitted = admit(&honest_body());
+        let mut other = honest_body();
+        other.revealed_items.pop();
+        assert!(matches!(
+            admit_body(&body_bytes(&other), &admitted),
+            Err(BodyRefusal::NotTheNamedCommitment { .. })
+        ));
+    }
+
+    #[test]
+    fn bytes_that_are_not_a_trace_commitment_are_not_available() {
+        let admitted = admit(&honest_body());
+        assert!(matches!(
+            admit_body(&[0xff; 3], &admitted),
+            Err(BodyRefusal::Undecodable(_))
         ));
     }
 }
