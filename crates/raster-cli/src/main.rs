@@ -5,6 +5,7 @@
 mod chain;
 mod commands;
 mod program;
+mod run_manifest;
 mod runtime_env;
 mod utils;
 
@@ -447,7 +448,8 @@ pub enum BackendType {
     Risc0,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum TraceFormat {
     /// Length-prefixed postcard-encoded TraceEvent frames
     Binary,

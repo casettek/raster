@@ -182,6 +182,61 @@ fn hello_tiles_run_uses_distinct_run_scoped_artifact_dirs() {
 }
 
 #[test]
+fn hello_tiles_run_writes_a_run_manifest_only_when_authenticated() {
+    let output = run_hello_tiles(&[]);
+    assert!(
+        output.status.success(),
+        "run should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let run_dir = PathBuf::from(extract_stdout_path(&stdout, "Run artifacts dir: "));
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &fs::read(run_dir.join("run.json")).expect("an authenticated run writes run.json"),
+    )
+    .expect("run.json should be JSON");
+
+    assert_eq!(manifest["version"], 1);
+    assert_eq!(
+        manifest["run_id"].as_str(),
+        run_dir.file_name().and_then(|name| name.to_str())
+    );
+    let project_root = PathBuf::from(manifest["project_root"].as_str().unwrap());
+    assert_eq!(
+        project_root.canonicalize().unwrap(),
+        hello_tiles_dir().canonicalize().unwrap()
+    );
+    for (key, file) in [
+        ("input", "input.json"),
+        ("input_manifest", "input_manifest.json"),
+    ] {
+        let path = PathBuf::from(manifest[key].as_str().unwrap());
+        assert!(
+            path.is_absolute(),
+            "{key} should be stored absolute: {path:?}"
+        );
+        assert_eq!(
+            path.canonicalize().unwrap(),
+            hello_tiles_dir().join(file).canonicalize().unwrap()
+        );
+    }
+    assert_eq!(manifest["trace_format"], "binary");
+    let digest = manifest["cfs_digest"].as_str().unwrap();
+    assert_eq!(digest.len(), 64);
+    assert!(digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
+
+    // No trace, so nothing for a later command to work from.
+    let no_auth = run_hello_tiles(&["--no-auth"]);
+    assert!(no_auth.status.success());
+    let no_auth_dir = PathBuf::from(extract_stdout_path(
+        &String::from_utf8_lossy(&no_auth.stdout),
+        "Run artifacts dir: ",
+    ));
+    assert!(!no_auth_dir.join("run.json").exists());
+}
+
+#[test]
 fn hello_tiles_run_can_use_json_trace_format() {
     let output = run_hello_tiles(&["--trace-format", "json"]);
     assert!(

@@ -276,6 +276,20 @@ pub fn run(
         return Ok(());
     }
 
+    // Only a completed run gets one: its presence says the trace is whole, so
+    // a later command can work from the run directory alone.
+    if status.success() {
+        crate::run_manifest::RunManifest::new(
+            &artifacts.run_id,
+            &project.root_dir,
+            input,
+            input_manifest,
+            trace_format,
+            &cfs,
+        )?
+        .write(&artifacts.run_dir)?;
+    }
+
     let (mut trace, trace_recorder) =
         load_trace_from_file(&trace_path, trace_format, &cfs, input, input_manifest)?;
 
