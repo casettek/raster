@@ -237,6 +237,43 @@ fn hello_tiles_run_writes_a_run_manifest_only_when_authenticated() {
 }
 
 #[test]
+fn hello_tiles_run_manifest_keeps_inline_json_inputs_verbatim() {
+    // The input reader takes an argument naming a file as that file and
+    // anything else as inline JSON, so run.json must keep inline JSON as given.
+    let input = fs::read_to_string(hello_tiles_dir().join("input.json")).unwrap();
+    let manifest_json = fs::read_to_string(hello_tiles_dir().join("input_manifest.json")).unwrap();
+    let output = Command::new(cargo_raster_bin())
+        .current_dir(hello_tiles_dir())
+        .args([
+            "raster",
+            "run",
+            "--input",
+            &input,
+            "--input-manifest",
+            &manifest_json,
+        ])
+        .output()
+        .expect("hello-tiles command should execute");
+    assert!(
+        output.status.success(),
+        "inline-input run should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let run_dir = PathBuf::from(extract_stdout_path(
+        &String::from_utf8_lossy(&output.stdout),
+        "Run artifacts dir: ",
+    ));
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(run_dir.join("run.json")).unwrap()).unwrap();
+    assert_eq!(manifest["input"].as_str(), Some(input.as_str()));
+    assert_eq!(
+        manifest["input_manifest"].as_str(),
+        Some(manifest_json.as_str())
+    );
+}
+
+#[test]
 fn hello_tiles_run_can_use_json_trace_format() {
     let output = run_hello_tiles(&["--trace-format", "json"]);
     assert!(

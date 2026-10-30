@@ -16,7 +16,7 @@ Related:
   "two docker-mode builds from different checkout paths produce equal tile image ids" as a goal
   (`:466`). Nothing in the default build path delivers it today (§2).
 - [`tile-cost-estimator.md`](../proposals/tile-cost-estimator.md) §6 step 3 — the planned
-  `run.json` stores absolute paths, which adds to §3.
+  `run.json` stores absolute file paths, which adds to §3.
 
 ## 1. The guest builder cannot find `raster` for some valid projects, and falls back to a path that never exists
 
@@ -126,8 +126,8 @@ of the ELF, so it inherits both paths.
 A run directory cannot be moved or handed to another machine as is:
 - `input.json` holds absolute paths. `stage-challenge.md` (`:779`) has the defender write its
   own, for that reason.
-- The planned `run.json` (`tile-cost-estimator.md` §6 step 3) stores `project_root`, `input` and
-  `input_manifest` as absolute paths.
+- `run.json` (`tile-cost-estimator.md` §6 step 3) stores `project_root`, and any `input` or
+  `input_manifest` that names a file, as absolute paths. Inline JSON inputs are kept verbatim.
 
 This does not change identity or soundness; it only limits where a run directory can be used.
 

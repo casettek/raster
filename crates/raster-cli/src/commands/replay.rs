@@ -6,7 +6,7 @@
 //! See `docs/proposals/tile-cost-estimator.md` §5.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use raster_analysis::replay_profile::{
@@ -58,18 +58,12 @@ pub fn profile(run_dir: &str) -> Result<()> {
         );
     }
 
-    let input = manifest.input.as_deref().map(path_str).transpose()?;
-    let input_manifest = manifest
-        .input_manifest
-        .as_deref()
-        .map(path_str)
-        .transpose()?;
     let (trace, recorder) = load_trace_from_file(
         &manifest.trace_path(&run_dir),
         manifest.trace_format,
         &cfs,
-        input.as_deref(),
-        input_manifest.as_deref(),
+        manifest.input.as_deref(),
+        manifest.input_manifest.as_deref(),
     )?;
 
     let mut report = ReplayProfile::new(
@@ -266,12 +260,6 @@ fn lock_image_ids(project: &Project) -> BTreeMap<String, String> {
             BTreeMap::new()
         }
     }
-}
-
-fn path_str(path: &Path) -> Result<String> {
-    path.to_str()
-        .map(str::to_string)
-        .ok_or_else(|| Error::Other(format!("Path is not UTF-8: {}", path.display())))
 }
 
 fn duration_ns(duration: Duration) -> u64 {

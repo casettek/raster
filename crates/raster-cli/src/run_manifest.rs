@@ -23,11 +23,12 @@ pub struct RunManifest {
     pub run_id: String,
     /// The project the run built and executed. Absolute.
     pub project_root: PathBuf,
-    /// The `--input` the run was given, made absolute. Replaying an
+    /// The `--input` the run was given, as the input reader takes it: a file
+    /// path, made absolute, or inline JSON, kept verbatim. Replaying an
     /// entry-argument binding needs the same input context.
-    pub input: Option<PathBuf>,
-    /// The `--input-manifest` the run was given, made absolute.
-    pub input_manifest: Option<PathBuf>,
+    pub input: Option<String>,
+    /// The `--input-manifest` the run was given, stored like `input`.
+    pub input_manifest: Option<String>,
     pub trace_format: TraceFormat,
     /// Hex sha256 of the CFS's JSON. A reader rebuilding the CFS from the
     /// project compares against it to notice that the project changed since
@@ -45,14 +46,17 @@ impl RunManifest {
         trace_format: TraceFormat,
         cfs: &ControlFlowSchema,
     ) -> Result<Self> {
+        let project_root = absolute(project_root)?;
         Ok(Self {
             version: RUN_MANIFEST_VERSION,
             run_id: run_id.to_string(),
-            project_root: absolute(Path::new(project_root))?,
-            input: input.map(|path| absolute(Path::new(path))).transpose()?,
-            input_manifest: input_manifest
-                .map(|path| absolute(Path::new(path)))
+            input: input
+                .map(|raw| input_argument(&project_root, raw))
                 .transpose()?,
+            input_manifest: input_manifest
+                .map(|raw| input_argument(&project_root, raw))
+                .transpose()?,
+            project_root,
             trace_format,
             cfs_digest: cfs_digest(cfs)?,
         })
@@ -96,6 +100,23 @@ pub fn cfs_digest(cfs: &ControlFlowSchema) -> Result<String> {
     Ok(hex::encode(Sha256::digest(serde_json::to_vec(cfs)?)))
 }
 
+/// Store an `--input`/`--input-manifest` argument so that it reads back the
+/// same way. The input reader (`raster-runtime`, `source/document.rs`) takes an
+/// argument that names a file as that file, and anything else as inline JSON.
+/// The run's program reads it from the project root, so a relative path is
+/// resolved there. Inline JSON must stay verbatim: made "absolute", it would
+/// no longer parse.
+fn input_argument(project_root: &Path, raw: &str) -> Result<String> {
+    let path = project_root.join(raw);
+    if !path.is_file() {
+        return Ok(raw.to_string());
+    }
+    let path = absolute(&path)?;
+    path.to_str()
+        .map(str::to_string)
+        .ok_or_else(|| Error::Other(format!("Input path is not UTF-8: {}", path.display())))
+}
+
 fn absolute(path: &Path) -> Result<PathBuf> {
     std::path::absolute(path)
         .map_err(|error| Error::Other(format!("Cannot resolve {}: {error}", path.display())))
@@ -126,22 +147,55 @@ mod tests {
     #[test]
     fn round_trips_through_the_run_directory() {
         let dir = scratch("round-trip");
+        std::fs::write(dir.join("input.json"), b"{}").unwrap();
         let manifest = RunManifest::new(
             "run-1",
-            Path::new("/project"),
+            &dir,
             Some("input.json"),
             None,
             TraceFormat::Json,
             &cfs(),
         )
         .unwrap();
-        // Relative inputs are stored absolute.
-        assert!(manifest.input.as_ref().unwrap().is_absolute());
-        assert!(manifest.input.as_ref().unwrap().ends_with("input.json"));
         manifest.write(&dir).unwrap();
         assert_eq!(RunManifest::read(&dir).unwrap(), manifest);
         assert_eq!(manifest.trace_path(&dir), dir.join("trace.ndjson"));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn input_arguments_read_back_the_way_the_run_read_them() {
+        let project = scratch("inputs");
+        std::fs::write(project.join("input.json"), b"{}").unwrap();
+        let inline = "{\n  \"seed\": { \"path\": \"seed.rastered\" }\n}";
+        let manifest = RunManifest::new(
+            "run-1",
+            &project,
+            Some("input.json"),
+            Some(inline),
+            TraceFormat::Binary,
+            &cfs(),
+        )
+        .unwrap();
+        // A file, named relative to the project root, is stored absolute.
+        let input = PathBuf::from(manifest.input.as_deref().unwrap());
+        assert!(input.is_absolute());
+        assert_eq!(input, project.join("input.json"));
+        // Inline JSON is stored verbatim, so it still parses.
+        assert_eq!(manifest.input_manifest.as_deref(), Some(inline));
+
+        // A name that is no file is what the reader parses as JSON: kept as is.
+        let missing = RunManifest::new(
+            "run-2",
+            &project,
+            Some("missing.json"),
+            None,
+            TraceFormat::Binary,
+            &cfs(),
+        )
+        .unwrap();
+        assert_eq!(missing.input.as_deref(), Some("missing.json"));
+        std::fs::remove_dir_all(project).unwrap();
     }
 
     #[test]

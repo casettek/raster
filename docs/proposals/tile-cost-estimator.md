@@ -382,7 +382,9 @@ review after each step.
 - New `RunManifest` (serde) in `raster-cli`. It is written next to `trace.bin` by
   authenticated runs only, since `--no-auth` has no trace. It holds:
   - `version: 1`, `run_id`;
-  - `project_root`, `input`, `input_manifest`, as absolute paths;
+  - `project_root`, as an absolute path;
+  - `input`, `input_manifest`, as the input reader takes them: a file path made absolute, or
+    inline JSON kept verbatim (an inline argument made "absolute" no longer parses);
   - `trace_format`;
   - `cfs_digest`: sha256 of the CFS's JSON, which every run builds anyway. This deliberately
     replaces the program commitment proposed earlier. The commitment needs `program.bin` or
