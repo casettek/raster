@@ -25,3 +25,5 @@ pub mod utils;
 pub use error::{BitPackerError, Result};
 
 pub mod commitment_file;
+
+pub mod compression;

@@ -59,9 +59,11 @@ cuda = [
     "risc0-circuit-keccak/cuda",
     "risc0-circuit-recursion/cuda",
     "risc0-circuit-rv32im/cuda",
-    "risc0-groth16/cuda",
     "risc0-zkp/cuda",
 ]
+# Keep STARK/recursion acceleration independent of the optional native Groth16
+# wrapper. The Docker wrapper remains usable on GPUs unsupported by sppark.
+cuda-groth16 = ["cuda", "risc0-groth16/cuda"]
 default = [
     "client",
     "bonsai",

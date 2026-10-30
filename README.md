@@ -196,3 +196,58 @@ proof-evidence artifact connects native execution to the prover; proof generatio
 may use its normal working files. Proof and report destinations default to the
 run artifact directory. Saved-trace commands remain available for existing files,
 but live audit does not invoke them. Retrying a failed live proof reruns the audit.
+
+### Compress a saved fault proof
+
+Convert an already-produced fault receipt into a locally verified Groth16 receipt:
+
+```bash
+cargo raster proof compress \
+  --receipt /path/to/fault.receipt \
+  --commitment /path/to/disputed-commit.bin \
+  --output /path/to/new-compression-directory
+```
+
+This command works outside a Raster project. It does not execute the program,
+rerun audit, or regenerate fault-window proofs. It verifies the input against the
+transition verifier embedded in the installed Raster version, checks the finished
+fault verdict against the disputed commitment's canonical header digest, compresses
+locally, then independently verifies the output and unchanged claim and public
+journal. Receipts from incompatible verifier versions are rejected; use their
+matching Raster build. Development mode and fake receipts are forbidden.
+
+For composite or succinct inputs, the Groth16 wrapping step requires a working
+local Docker engine: `docker info` must succeed. On Windows, enable Docker
+Desktop's WSL integration for Ubuntu. Build Raster with `--features cuda` to
+accelerate STARK proof compression on the GPU; the final Groth16 wrapper uses
+Docker. The vendored RISC Zero CUDA feature deliberately leaves its native
+Groth16 wrapper opt-in (`cuda-groth16`): that wrapper hit an illegal CUDA memory
+access on the validation machine's RTX 5080. This changes backend selection,
+not proof circuits or verification rules. The first run may download proving
+assets/container images. Remote proving settings are not used.
+Already-Groth16 inputs are verified and exported without recompression or Docker.
+
+
+The output parent must exist and the destination must be new. The command writes
+`fault.groth16.receipt` and `compression.json` into a unique temporary sibling,
+then publishes the directory atomically without replacing an existing path.
+Neither input is modified. Cancellation before publication produces no final
+output; abrupt process termination may leave a temporary directory to clean up.
+Compression can require substantial memory, disk space, and time; no runtime or
+memory bound is promised.
+
+The report distinguishes proof-only seal bytes from serialized receipt bytes,
+records file hashes, verifier/program/commitment identities, and separates input
+verification, compression, and output verification timings. The receipt remains
+Raster's Postcard receipt format: it is **not** encoded contract calldata. This
+command does not deploy contracts, submit transactions, update Iris/backend/UI
+metrics.
+
+`run --audit` and `trace audit` now automatically compress and verify completed
+fault proofs before publishing `fault.receipt`. Docker must be available before
+fault proving starts. The receipt path and Postcard encoding remain unchanged;
+the receipt now contains a Groth16 proof. Compression failures publish no new
+fault receipt. Audit reports include `receipt_format` and `proof_seal_bytes`,
+and `proof_duration_ms` includes compression and verification. Compression
+progress stays within the existing `proving` phase. Intermediate transition
+receipts and chain evidence construction are unchanged.

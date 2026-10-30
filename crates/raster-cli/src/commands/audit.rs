@@ -77,6 +77,7 @@ fn audit_inner(
             println!(
                 "RASTER_AUDIT_PROGRESS {{\"phase\":\"proving\",\"audit_duration_ms\":{audit_ms}}}"
             );
+            raster_prover::compression::compression_ready()?;
             let proving = Instant::now();
             let backend = raster_backend_risc0::Risc0Backend::new(project.output_dir.clone())
                 .with_user_crate(project.root_dir.clone());
@@ -90,6 +91,7 @@ fn audit_inner(
                 Some(manifest),
                 &disputed,
             );
+            let receipt = finalize_fault(receipt, &disputed.header().digest())?;
             receipt
                 .verify(raster_prover::TRANSITION_GUEST_ID)
                 .map_err(|e| Error::Other(e.to_string()))?;
@@ -108,7 +110,7 @@ fn audit_inner(
                 &proof_output,
                 &postcard::to_allocvec(&receipt).map_err(|e| Error::Other(e.to_string()))?,
             )?;
-            serde_json::json!({"version":1,"outcome":"proved","verified":true,"proof_path":proof_output,
+            serde_json::json!({"version":1,"outcome":"proved","verified":true,"proof_path":proof_output,"receipt_format":"groth16","proof_seal_bytes":receipt.seal_size(),
                 "audit_duration_ms":audit_ms,"proof_duration_ms":proving.elapsed().as_secs_f64()*1000.0})
         }
     };
@@ -117,6 +119,31 @@ fn audit_inner(
         &serde_json::to_vec_pretty(&outcome).map_err(|e| Error::Other(e.to_string()))?,
     )
 }
+// Keep the outer proving phase stable for Iris while exposing compression details.
+fn finalize_fault(receipt: risc0_zkvm::Receipt, digest: &[u8]) -> Result<risc0_zkvm::Receipt> {
+    let started = Instant::now();
+    let input_seal_bytes = receipt.seal_size();
+    let compressed =
+        raster_prover::compression::compress_fault_receipt(&receipt, digest, |phase| {
+            println!(
+                "RASTER_COMPRESSION_PROGRESS {}",
+                serde_json::json!({
+                    "phase":"proving", "operation":"compression", "compression_phase":phase
+                })
+            );
+            Ok(())
+        })?;
+    println!(
+        "RASTER_COMPRESSION_PROGRESS {}",
+        serde_json::json!({
+            "phase":"proving", "operation":"compression", "compression_phase":"complete",
+            "compression_duration_ms":started.elapsed().as_secs_f64()*1000.0,
+            "input_seal_bytes":input_seal_bytes, "output_seal_bytes":compressed.seal_size()
+        })
+    );
+    Ok(compressed)
+}
+
 fn publish(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
     raster_prover::archive::Archive::current()
         .flush()
@@ -270,11 +297,13 @@ pub fn run_live(
         "RASTER_AUDIT_PROGRESS {}",
         serde_json::json!({"phase":"proving","audit_duration_ms":audit_ms,"detected_step":handoff.steps-1,"window_start":window_start,"window_end":handoff.steps})
     );
+    raster_prover::compression::compression_ready()?;
     let proving = Instant::now();
     let backend = raster_backend_risc0::Risc0Backend::new(project.output_dir.clone())
         .with_user_crate(project.root_dir.clone());
     let replayer = Replayer::new(&backend, project);
     let receipt = super::prove::prove_prepared(prepared, cfs, &replayer, manifest, &disputed);
+    let receipt = finalize_fault(receipt, &disputed.header().digest())?;
     receipt
         .verify(raster_prover::TRANSITION_GUEST_ID)
         .map_err(|e| Error::Other(e.to_string()))?;
@@ -289,7 +318,7 @@ pub fn run_live(
             "receipt does not refute supplied commitment".into(),
         ));
     }
-    let report_bytes = serde_json::to_vec_pretty(&serde_json::json!({"version":1,"outcome":"proved","verified":true,"proof_path":proof_output,
+    let report_bytes = serde_json::to_vec_pretty(&serde_json::json!({"version":1,"outcome":"proved","verified":true,"proof_path":proof_output,"receipt_format":"groth16","proof_seal_bytes":receipt.seal_size(),
         "audit_duration_ms":audit_ms,"proof_duration_ms":proving.elapsed().as_secs_f64()*1000.0,
         "detected_step":handoff.steps-1,"window_start":window_start,"window_end":handoff.steps,"execution_artifacts":artifacts.run_dir})).unwrap();
     // Prepare both artifacts before publishing either one.

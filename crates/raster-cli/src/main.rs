@@ -63,7 +63,26 @@ enum TraceCommand {
 }
 
 #[derive(Parser)]
+enum ProofCommand {
+    /// Compress a saved, verified fault receipt to Groth16 without replaying execution.
+    Compress {
+        #[arg(long)]
+        receipt: std::path::PathBuf,
+        #[arg(long)]
+        commitment: std::path::PathBuf,
+        /// New output directory; existing paths are never overwritten.
+        #[arg(long)]
+        output: std::path::PathBuf,
+    },
+}
+
+#[derive(Parser)]
 enum Commands {
+    /// Operations on saved fault proofs; no project directory is required.
+    Proof {
+        #[command(subcommand)]
+        command: ProofCommand,
+    },
     /// Audit a recorded execution without running the stage again.
     Trace {
         #[command(subcommand)]
@@ -271,7 +290,7 @@ enum Commands {
         #[arg(long, conflicts_with = "commit")]
         audit: Option<String>,
 
-        /// Verified fault receipt destination (default: run artifacts/fault.receipt).
+        /// Verified Groth16 fault receipt destination (default: run artifacts/fault.receipt). Requires Docker.
         #[arg(long, requires = "audit")]
         proof_output: Option<std::path::PathBuf>,
 
@@ -490,6 +509,35 @@ fn try_main() -> Result<()> {
     let Cli::Raster(cmd) = Cli::parse();
 
     match cmd {
+        Commands::Proof {
+            command:
+                ProofCommand::Compress {
+                    receipt,
+                    commitment,
+                    output,
+                },
+        } => {
+            let report = raster_prover::compression::compress_fault(
+                &receipt,
+                &commitment,
+                &output,
+                |phase| {
+                    println!("Compression: {phase}");
+                    Ok(())
+                },
+            )?;
+            println!(
+                "Verified Groth16 receipt: {}",
+                output.join("fault.groth16.receipt").display()
+            );
+            println!(
+                "Proof seals: {} -> {} bytes; compression: {:.3}s",
+                report.input.seal_bytes,
+                report.output.seal_bytes,
+                report.compression_ms / 1000.0
+            );
+            Ok(())
+        }
         Commands::Build { backend, tile } => commands::build(backend, tile),
         Commands::Trace {
             command:
