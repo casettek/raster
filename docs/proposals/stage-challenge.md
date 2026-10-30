@@ -755,6 +755,15 @@ Phases 2–3 depend on Phase 1 and on nothing else unbuilt.
 - **Wrong defences** *(done, as `defend` unit tests; plus a defence against another challenge and another chain, end to end)*. A `TerminalMatch` offered as a refutation, a `Finished` offered as a mislabel,
   a mislabel with `X == claimed_output`, and a defence over another commitment, program or
   manifest are each rejected by the aggregation, asserting the check that fired.
+- **Repeatable end to end** *(done, 2026-10-30)*. `raster-cli/tests/stage_challenge_cli.rs`
+  (`#[ignore]`, dev mode; `cargo test -p raster-cli --test stage_challenge_cli -- --ignored`, about
+  11 minutes) runs the CLI on `chain-example`:
+  - a true challenge on `report`, found without `--stage`, admitted, and answered "no defence
+    exists" with no `defence.bin`;
+  - `--forge claimed-output` (mislabelled), `item`, `pad` and `truncate` (refuted) on `normalize`,
+    each defended and passing `defend-verify`;
+  - a defence refused against another challenge, and cleared when that challenge is posted;
+  - `--forge drop-tail-root` refused before anything is written.
 - **Admission** *(done, unit tests)*. `claimed_output == s.output_payload_commitment`, a unit-output stage, and a
   malformed header are inadmissible.
 - **Anyone defends** *(partly holds, 2026-10-29; see open question 6)*. A defence produced by a
