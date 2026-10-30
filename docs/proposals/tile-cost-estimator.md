@@ -1,7 +1,8 @@
 # Proposal: `tile-cost-estimator` — what the `risc0-estimator` branch should be
 
-Status: proposed 2026-10-30. Scope document for `origin/risc0-estimator` (`c826103`) before it
-is rebased onto main.
+Status: implemented 2026-10-30 on branch `replay-profile` (§6 steps 1–6). Step 7, verification on
+iris, is pending. Began as the scope document for `origin/risc0-estimator` (`c826103`). Usage:
+[`replay-profiling.md`](../replay-profiling.md).
 
 Related:
 - [`zkvm-dry-run.md`](./zkvm-dry-run.md) — executor replay without proving; §4's blockers and

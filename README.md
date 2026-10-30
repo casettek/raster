@@ -34,6 +34,7 @@ Raster is organized as a Rust workspace with the following crates:
 
 - `docs/architecture.md`: technical architecture notes
 - `docs/tile-authoring.md`: authoring guide for tiles/sequences
+- `docs/replay-profiling.md`: measure what a run's tiles cost in the RISC Zero zkVM (executor only, no proving)
 - `docs/specs/README.md`: canonical, code-adjacent specs
 
 ## Installation
@@ -91,6 +92,9 @@ cargo raster run --no-trace
 
 # Analyze execution
 cargo raster analyze
+
+# Measure a run's tiles in the RISC Zero executor (no proving); see docs/replay-profiling.md
+cargo raster replay profile target/raster/runs/<run-id>
 ```
 
 ### 5. Read what it produced
