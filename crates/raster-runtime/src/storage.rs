@@ -834,6 +834,10 @@ struct RecurFrame {
     /// numbering drifted on top. See
     /// `docs/issues/fraud-evidence-storage-unavailable.md` §2b.
     iteration_open: bool,
+    /// Depth of the sequence stack when this site was entered. A sequence
+    /// called from inside one of its iterations is deeper, and may exit while
+    /// the site stays active.
+    sequence_depth: usize,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -862,7 +866,9 @@ impl SequenceExecutionContext {
 
     fn exit_sequence(&mut self) {
         assert!(
-            self.recur_stack.is_empty(),
+            self.recur_stack
+                .last()
+                .is_none_or(|recur| recur.sequence_depth < self.stack.len()),
             "Cannot exit a sequence while a recur site is still active"
         );
         self.stack
@@ -881,6 +887,7 @@ impl SequenceExecutionContext {
             site_coordinates,
             next_iteration_index: FIRST_COORDINATE,
             iteration_open: false,
+            sequence_depth: self.stack.len(),
         });
         Ok(())
     }
@@ -1765,6 +1772,54 @@ mod tests {
     use serde::{Deserialize, Serialize};
 
     struct SequenceScopeGuard;
+
+    #[test]
+    fn recursive_sequence_children_keep_their_own_coordinate_scope() {
+        // Expected paths below are written 0-based; `c` shifts them to FIRST_COORDINATE.
+        let c = |v: &[CfsCoordinate]| v.iter().map(|x| x + FIRST_COORDINATE).collect::<Vec<_>>();
+        let mut context = SequenceExecutionContext::default();
+        context.enter_sequence();
+        context.enter_recur_site().unwrap(); // outer sequence site [0]
+        for iteration in 0..2 as CfsCoordinate {
+            context.enter_recur_sequence_iteration().unwrap();
+            assert_eq!(
+                context.reserve_execution_coordinates().unwrap().0,
+                c(&[0, iteration, 0])
+            );
+            context.enter_recur_site().unwrap(); // tile site [0, iteration, 1]
+            for inner in 0..3 as CfsCoordinate {
+                assert_eq!(
+                    context.reserve_execution_coordinates().unwrap().0,
+                    c(&[0, iteration, 1, inner])
+                );
+            }
+            context.exit_recur_site();
+            assert_eq!(
+                context.reserve_execution_coordinates().unwrap().0,
+                c(&[0, iteration, 2])
+            );
+            context.enter_recur_site().unwrap(); // nested sequence site
+            for inner in 0..2 as CfsCoordinate {
+                context.enter_recur_sequence_iteration().unwrap();
+                assert_eq!(
+                    context.reserve_execution_coordinates().unwrap().0,
+                    c(&[0, iteration, 3, inner, 0])
+                );
+                context.exit_recur_sequence_iteration();
+            }
+            context.exit_recur_site();
+            context.enter_sequence(); // ordinary sequence inside the iteration
+            assert_eq!(
+                context.reserve_execution_coordinates().unwrap().0,
+                c(&[0, iteration, 4, 0])
+            );
+            context.exit_sequence();
+            context.exit_recur_sequence_iteration();
+        }
+        context.exit_recur_site();
+        assert_eq!(context.reserve_execution_coordinates().unwrap().0, c(&[1]));
+        context.exit_sequence();
+    }
 
     impl SequenceScopeGuard {
         fn enter(sequence_id: &str) -> Self {
