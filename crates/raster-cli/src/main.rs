@@ -328,38 +328,89 @@ enum ChainCommand {
         /// most recent run under `target/raster/chains/`.
         chain_commitment: Option<String>,
 
-        /// Additionally re-run every stage natively and verify the honest
-        /// trace against the stage's committed `commit.bin` (detects
-        /// intra-stage execution fraud; use `chain fraud-prove` for a receipt).
+        /// Additionally re-run every stage natively and compare its output
+        /// against the committed one (finds a stage to dispute; use
+        /// `chain challenge` to post the challenge).
         #[arg(long)]
         execution: bool,
     },
 
-    /// Detect a chain fault (link, then execution) and produce a single
-    /// succinct chain fraud receipt naming the faulty stage.
-    FraudProve {
+    /// Challenger: challenge a chain commitment. A fault the commitment
+    /// exhibits by itself (shape, then link) is proven on the spot with the
+    /// chain-fraud guest — a proven challenge, which condemns the chain. Failing
+    /// that, a stage whose re-run does not reproduce its committed output gets
+    /// a disputed challenge: the stage, a trace commitment `H_C` of the re-run
+    /// and the output it ends in, with no proof — the zkVM runs only in a
+    /// defence. Writes `<run>/.challenge/challenge.bin`. See
+    /// `docs/proposals/stage-challenge.md`.
+    Challenge {
         /// Chain manifest (see `chain run`).
         chain: Option<String>,
 
-        /// Path to the chain-commitment written by `chain run`. Omit to use the
-        /// most recent run under `target/raster/chains/`.
+        /// Path to the chain-commitment under challenge. Omit to use the most
+        /// recent run under `target/raster/chains/`.
+        chain_commitment: Option<String>,
+
+        /// Dispute this stage's output, skipping the search for a fault the
+        /// commitment exhibits by itself. `H_C` is committed at the
+        /// protocol's window size (128, capped below the trace length).
+        #[arg(long)]
+        stage: Option<String>,
+
+        /// Test only: post a *false* challenge, to exercise the defences.
+        /// Disputes the honest output with a flipped one, over `H_C` built
+        /// from the honest trace (`claimed-output`), with one item replaced
+        /// (`item`), one item appended (`pad`) or the last one dropped
+        /// (`truncate`). Requires `--stage`.
+        #[arg(long, value_enum, hide = true, requires = "stage")]
+        forge: Option<chain::Forge>,
+    },
+
+    /// Verify a challenge of either form: a proven one's receipt against the
+    /// pinned image ids (the chain is condemned), or a disputed one's
+    /// admission and that `H_C`'s body is available beside it (it awaits a
+    /// defence).
+    ChallengeVerify {
+        /// Path to the `challenge.bin` written by `chain challenge`.
+        challenge: String,
+
+        /// Also check that the challenge is against this chain-commitment.
+        #[arg(long)]
         chain_commitment: Option<String>,
     },
 
-    /// Verify a chain fraud receipt against the local chain-commitment and
-    /// the known-good guest image ids.
-    FraudVerify {
-        /// Path to the `chain-fraud.receipt`. Omit to use the one next to the
-        /// chain-commitment.
-        receipt: Option<String>,
-
+    /// Defender (the claimer, or anyone): answer a disputed challenge. Re-runs
+    /// the challenged stage and walks it against the challenger's `H_C`: a
+    /// divergence is proven as a refutation; an honest `H_C` ending in another
+    /// output than the claimed one, as a mislabel proof (its terminal window).
+    /// The window is aggregated by the defence guest and written to
+    /// `defence.bin` beside the challenge. When `H_C` is honest and ends in the
+    /// claimed output the challenge is true: no defence exists, and nothing is
+    /// proven. See `docs/proposals/stage-challenge.md` §Phase 3.
+    Defend {
         /// Chain manifest (see `chain run`).
-        #[arg(long)]
         chain: Option<String>,
 
-        /// Path to the chain-commitment written by `chain run`.
-        #[arg(long)]
+        /// Path to the chain-commitment being defended. Omit to use the most
+        /// recent run under `target/raster/chains/`.
         chain_commitment: Option<String>,
+
+        /// Path to the challenge. Defaults to the run's
+        /// `.challenge/challenge.bin`, with `H_C`'s `commit.bin` beside it.
+        #[arg(long)]
+        challenge: Option<String>,
+    },
+
+    /// Verify a defence: the receipt against the pinned defence image id and
+    /// the known-good inner guests, and that it answers the challenge.
+    DefendVerify {
+        /// Path to the `defence.bin` written by `chain defend`.
+        defence: String,
+
+        /// The challenge it must answer. Defaults to the `challenge.bin`
+        /// beside the defence.
+        #[arg(long)]
+        challenge: Option<String>,
     },
 }
 
@@ -482,19 +533,29 @@ fn try_main() -> Result<()> {
                 chain_commitment,
                 execution,
             } => chain::audit(chain.as_deref(), chain_commitment.as_deref(), execution),
-            ChainCommand::FraudProve {
+            ChainCommand::Challenge {
                 chain,
                 chain_commitment,
-            } => chain::fraud_prove(chain.as_deref(), chain_commitment.as_deref()),
-            ChainCommand::FraudVerify {
-                receipt,
-                chain,
-                chain_commitment,
-            } => chain::fraud_verify(
-                receipt.as_deref(),
+                stage,
+                forge,
+            } => chain::challenge(
                 chain.as_deref(),
                 chain_commitment.as_deref(),
+                stage.as_deref(),
+                forge,
             ),
+            ChainCommand::ChallengeVerify {
+                challenge,
+                chain_commitment,
+            } => chain::challenge_verify(&challenge, chain_commitment.as_deref()),
+            ChainCommand::Defend {
+                chain,
+                chain_commitment,
+                challenge,
+            } => chain::defend(chain.as_deref(), chain_commitment.as_deref(), challenge.as_deref()),
+            ChainCommand::DefendVerify { defence, challenge } => {
+                chain::defend_verify(&defence, challenge.as_deref())
+            }
         },
         Commands::Run {
             backend,

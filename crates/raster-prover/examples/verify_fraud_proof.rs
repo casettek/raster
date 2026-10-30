@@ -30,8 +30,15 @@ fn main() {
     }
 
     let journal: TransitionJournal = receipt.journal.decode().expect("decode journal");
+    // Only `Finished` proves fraud. `TerminalMatch` is an attestation of an
+    // honest end (a stage challenge's receipt) and must not pass as one.
     let finished = matches!(journal.current_state, TransitionState::Finished);
-    println!("journal state: {}", if finished { "Finished (fraud proven)" } else { "NOT Finished" });
+    let state = match journal.current_state {
+        TransitionState::Finished => "Finished (fraud proven)",
+        TransitionState::TerminalMatch => "NOT Finished — TerminalMatch (an attestation, not a fraud proof)",
+        _ => "NOT Finished",
+    };
+    println!("journal state: {state}");
 
     let commitment: TraceCommitment = postcard::from_bytes(&commit_bytes).expect("decode commit.bin");
     let expected = commitment.header().digest();
