@@ -335,7 +335,7 @@ CLI:
   verifier would (refusing a shape invalid on its face), re-runs the stage authenticated, builds
   `H_C` at the protocol window for its trace length (decision 6), and writes a **disputed** challenge with `claimed_output` read from its own
   `output.bin` — no proving. `--stage` skips the search and disputes that stage. Either form goes
-  to `<run>/challenge/challenge.bin`, a disputed one with `H_C`'s `commit.bin` beside it; the
+  to `<run>/.challenge/challenge.bin`, a disputed one with `H_C`'s `commit.bin` beside it; the
   challenge is verified first, and one that would be refused is never written.
 - `chain challenge-verify <challenge> [--chain-commitment PATH]` — `verify`: a proven challenge
   reports the chain condemned (stage, fault kind); a disputed one is admitted, plus local
@@ -469,7 +469,7 @@ and the wrong-defence cases are unit tests that need no zkVM.
      - **no divergence, honest output == `claimed_output`:** report that no defence exists, with
        no proving;
      - **otherwise:** `prove_terminal`, giving `Mislabelled`.
-   - Aggregate and write `<run>/challenge/defence.bin`.
+   - Aggregate and write `<run>/.challenge/defence.bin`.
 
    `chain defend-verify <defence> [--challenge PATH]` runs `verify_defence`, plus that the
    defence answers the challenge beside it (by `challenge_digest`).
@@ -672,7 +672,7 @@ Phases 2–3 depend on Phase 1 and on nothing else unbuilt.
   stage's own window-2 `commit.bin`), and a file that is not a challenge.
 - **`fraud-prove`/`fraud-verify` folded in** (same day): `Challenge { Proven, Disputed }`,
   `ProvenChallenge`, `Verdict`, `verify` (`raster-prover/src/challenge.rs`); `chain challenge`
-  searches `Shape` → `Link` → output; one file, `<run>/challenge/challenge.bin`;
+  searches `Shape` → `Link` → output; one file, `<run>/.challenge/challenge.bin`;
   `challenge-verify --chain-commitment`. The evidence-receipt path (`prove_terminal_window`,
   `execution-fraud.receipt`) is removed. Re-checked on the scratch chain: honest → nothing to
   challenge; tampered → a disputed challenge, admitted; refused against a different chain
@@ -703,7 +703,7 @@ Phases 2–3 depend on Phase 1 and on nothing else unbuilt.
   - `chain defend [CHAIN] [CHAIN_COMMITMENT] [--challenge]`: admits the challenge, refuses a
     challenge against another chain, re-runs the stage into `<stage>/defence/`, and walks it
     against `H_C`. It then either proves a refutation, proves a mislabel, or reports that no
-    defence exists (exit code 1, nothing proven), and writes `challenge/defence.bin`.
+    defence exists (exit code 1, nothing proven), and writes `.challenge/defence.bin`.
   - `chain defend-verify <defence> [--challenge]`: checks the receipt and the challenge digest.
   - `chain challenge --forge` (hidden, test only; plan step 6).
 - **Tests**:

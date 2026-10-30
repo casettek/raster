@@ -341,7 +341,7 @@ enum ChainCommand {
     /// that, a stage whose re-run does not reproduce its committed output gets
     /// a disputed challenge: the stage, a trace commitment `H_C` of the re-run
     /// and the output it ends in, with no proof — the zkVM runs only in a
-    /// defence. Writes `<run>/challenge/challenge.bin`. See
+    /// defence. Writes `<run>/.challenge/challenge.bin`. See
     /// `docs/proposals/stage-challenge.md`.
     Challenge {
         /// Chain manifest (see `chain run`).
@@ -396,7 +396,7 @@ enum ChainCommand {
         chain_commitment: Option<String>,
 
         /// Path to the challenge. Defaults to the run's
-        /// `challenge/challenge.bin`, with `H_C`'s `commit.bin` beside it.
+        /// `.challenge/challenge.bin`, with `H_C`'s `commit.bin` beside it.
         #[arg(long)]
         challenge: Option<String>,
     },

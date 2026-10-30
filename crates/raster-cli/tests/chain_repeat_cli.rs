@@ -635,7 +635,7 @@ fn a_shape_fault_produces_a_verifiable_receipt() {
     let challenge_path = commitment_path
         .parent()
         .expect("the commitment lives in its run directory")
-        .join("challenge")
+        .join(".challenge")
         .join("challenge.bin");
     let out = scratch.cargo_raster(&[
         "chain",

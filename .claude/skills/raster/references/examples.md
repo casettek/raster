@@ -263,7 +263,7 @@ cargo raster chain run                  # run stages, thread outputs, commit
 cargo raster chain audit                # links + identities, no proving
 cargo raster chain audit --execution    # + re-run stages against commits
 cargo raster chain challenge            # proven (link/shape receipt) or disputed (output) challenge
-cargo raster chain challenge-verify <run>/challenge/challenge.bin
+cargo raster chain challenge-verify <run>/.challenge/challenge.bin
 ```
 
 ## 4. Negative example — the "fake Raster program"

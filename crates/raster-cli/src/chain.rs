@@ -996,6 +996,10 @@ fn load_recorded_chain(
         ShapePolicy::AsClaimed => VerifiedCounts::as_claimed(&chain),
     };
     let spec = expand(&manifest, &counts)?;
+    // The run directory is about to be read from, and `chain challenge` and
+    // `chain defend` write into it: refuse a stage name that could alias a run
+    // artifact, as a fresh run would.
+    validate_stage_names(&spec)?;
 
     Ok(RecordedChain {
         spec,
@@ -1437,8 +1441,9 @@ fn detect_link_fraud(recorded: &RecordedChain) -> Result<Option<(usize, String, 
 
 /// Where `chain challenge` writes, under the chain run directory: the
 /// challenge and, for a disputed one, `H_C`'s body beside it (decision 4:
-/// local files for now).
-const CHALLENGE_DIR: &str = "challenge";
+/// local files for now). Dot-prefixed so it can never be a stage directory —
+/// `validate_stage_names` refuses a stage name starting with `.`.
+const CHALLENGE_DIR: &str = ".challenge";
 const CHALLENGE_FILE: &str = "challenge.bin";
 const CHALLENGE_BODY_FILE: &str = "commit.bin";
 const DEFENCE_FILE: &str = "defence.bin";
@@ -1660,18 +1665,25 @@ fn prove_commitment_fault(recorded: &RecordedChain) -> Result<Option<risc0_zkvm:
     Ok(None)
 }
 
-/// Write `challenge` to `<run>/challenge/challenge.bin`, and a disputed one's
-/// `H_C` body beside it. The directory is cleared first, so a body left by an
-/// earlier challenge can never sit beside a later one.
+/// Write `challenge` to `<run>/.challenge/challenge.bin`, and a disputed one's
+/// `H_C` body beside it. The files an earlier challenge left are removed
+/// first, so its body or defence can never sit beside a later challenge. Only
+/// those files: nothing else in the directory is ours to delete.
 fn write_challenge(
     recorded: &RecordedChain,
     challenge: &Challenge,
     body: Option<&TraceCommitment>,
 ) -> Result<PathBuf> {
     let dir = recorded.chain_dir.join(CHALLENGE_DIR);
-    if dir.exists() {
-        std::fs::remove_dir_all(&dir)
-            .map_err(|e| Error::Other(format!("failed to clear {}: {e}", dir.display())))?;
+    for name in [CHALLENGE_FILE, CHALLENGE_BODY_FILE, DEFENCE_FILE] {
+        let path = dir.join(name);
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(Error::Other(format!("failed to clear {}: {e}", path.display())))
+            }
+        }
     }
     std::fs::create_dir_all(&dir)
         .map_err(|e| Error::Other(format!("failed to create {}: {e}", dir.display())))?;
@@ -2916,12 +2928,28 @@ fn latest_chain_commitment() -> Result<PathBuf> {
     Ok(dir.join(CHAIN_COMMITMENT_FILE))
 }
 
+/// Every stage name is also the stage's directory, `<run>/<name>`, beside the
+/// run's own artifacts. So a name must be one plain path component, must not
+/// start with `.` (the namespace `CHALLENGE_DIR` lives in) and must not be one
+/// of the run-level files.
 fn validate_stage_names(spec: &ChainSpec) -> Result<()> {
     if spec.stages.is_empty() {
         return Err(Error::Other("chain has no stages".into()));
     }
     let mut seen = std::collections::HashSet::new();
     for stage in &spec.stages {
+        let name = stage.name.as_str();
+        if name.is_empty() || name.starts_with('.') || name.contains(['/', '\\']) {
+            return Err(Error::Other(format!(
+                "stage name '{name}' is not a plain directory name \
+                 (no path separators, no leading '.')"
+            )));
+        }
+        if [CHAIN_COMMITMENT_FILE, CHAIN_SHAPE_FILE].contains(&name) {
+            return Err(Error::Other(format!(
+                "stage name '{name}' is reserved for the chain run's own artifacts"
+            )));
+        }
         if !seen.insert(stage.name.as_str()) {
             return Err(Error::Other(format!(
                 "duplicate stage name '{}'",
@@ -3505,6 +3533,23 @@ encoding = "raster"
             ],
         };
         assert!(validate_stage_names(&spec).is_err());
+    }
+
+    #[test]
+    fn stage_names_cannot_alias_run_artifacts() {
+        let spec_named = |name: &str| ChainSpec {
+            inputs: BTreeMap::new(),
+            stages: vec![StageSpec {
+                name: name.into(),
+                project: "a".into(),
+                inputs: BTreeMap::new(),
+            }],
+        };
+        for name in ["", ".", "..", CHALLENGE_DIR, "a/b", "../x", "a\\b", CHAIN_COMMITMENT_FILE, CHAIN_SHAPE_FILE] {
+            assert!(validate_stage_names(&spec_named(name)).is_err(), "'{name}' was accepted");
+        }
+        // The challenge directory's old name is an ordinary stage name now.
+        assert!(validate_stage_names(&spec_named("challenge")).is_ok());
     }
 
     #[test]
