@@ -33,6 +33,10 @@ pub struct ReplayProfile {
     pub calls_per_tile: usize,
     /// Every selected call was replayed. False when a replay failed.
     pub complete: bool,
+    /// Whether the measuring `cargo-raster` was a release build. The executor
+    /// runs in its process, so a debug build's `exec` times are many times
+    /// slower; its cycle counts are unaffected.
+    pub release_build: bool,
     pub failure: Option<ReplayFailure>,
     /// Every tile the CFS declares, keyed by tile id.
     pub tiles: BTreeMap<String, TileReplay>,
@@ -97,6 +101,7 @@ impl ReplayProfile {
             run_id: run_id.into(),
             calls_per_tile,
             complete: false,
+            release_build: true,
             failure: None,
             tiles: tile_ids
                 .into_iter()
@@ -155,6 +160,13 @@ impl ReplayProfile {
             "  Cycles are guest user cycles, including the tile wrapper (input decode and hash, \
              output encode)."
                 .to_string(),
+            if self.release_build {
+                "  Exec: executor wall time on the measuring machine, release build.".to_string()
+            } else {
+                "  Exec: measured by a DEBUG build of cargo-raster, many times slower than \
+                 release. Compare cycles, not times."
+                    .to_string()
+            },
             String::new(),
             format!(
                 "{:<name_width$}  {:<37}  {:>3} {:>7} {:>6} {:>6}",
@@ -527,6 +539,7 @@ Replay profile — RISC Zero executor, no proving
   Status: PARTIAL — stopped at the failure below
   Calls: top 10 per tile by input + output bytes; 4 of 8 replayed
   Cycles are guest user cycles, including the tile wrapper (input decode and hash, output encode).
+  Exec: executor wall time on the measuring machine, release build.
 
 tile                              heaviest call, user cycles (% of max)  seg  padded   exec  calls
 mac_weight_page                   ████████████████████████  6.71M  100%    8   7.08M  127ms      5
@@ -569,6 +582,14 @@ FAILED: finish_layer at [16, 2] (exec 40): Replay output mismatch (recorded 8 by
         let text = profile.to_text();
         assert!(text.contains("  Status: complete\n"));
         assert!(!text.contains("FAILED"));
+    }
+
+    #[test]
+    fn debug_build_timings_are_flagged() {
+        let mut profile = fixture();
+        profile.release_build = false;
+        assert!(profile.to_text().contains("DEBUG build"));
+        assert!(!fixture().to_text().contains("DEBUG"));
     }
 
     #[test]

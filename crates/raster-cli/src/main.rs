@@ -172,6 +172,12 @@ enum Commands {
         depth: Option<usize>,
     },
 
+    /// zkVM work on a finished run's recorded tile calls, without proving
+    Replay {
+        #[command(subcommand)]
+        command: ReplayCommand,
+    },
+
     /// Run or audit a multi-program chain, defined by a `Raster.toml` `[chain]`
     /// table or a `chain.json` (see docs/proposals/program-chain.md)
     Chain {
@@ -259,6 +265,25 @@ enum Commands {
         /// Disable default Cargo features when building the target project
         #[arg(long)]
         no_default_features: bool,
+    },
+}
+
+#[derive(Parser)]
+enum ReplayCommand {
+    /// Measure what the run's tiles cost in the RISC Zero executor, without
+    /// proving. Replays each tile's 10 largest recorded calls by input +
+    /// output bytes, and writes `replay-profile.json` into the run directory.
+    /// Needs a completed authenticated `cargo raster run` (its `run.json`).
+    Profile {
+        /// The run directory, e.g. `target/raster/runs/<run-id>`.
+        run_dir: String,
+    },
+
+    /// Print a saved replay profile: a `replay-profile.json`, or the one in a
+    /// run directory.
+    Report {
+        /// `replay-profile.json`, or the run directory holding it.
+        path: String,
     },
 }
 
@@ -512,6 +537,10 @@ fn try_main() -> Result<()> {
         } => commands::run_sequence(backend, &sequence, input.as_deref(), prove, verify),
         Commands::Cfs { output } => commands::cfs(output),
         Commands::Program { verify } => commands::program(verify),
+        Commands::Replay { command } => match command {
+            ReplayCommand::Profile { run_dir } => commands::replay::profile(&run_dir),
+            ReplayCommand::Report { path } => commands::replay::report(&path),
+        },
         Commands::Chain { command } => match command {
             ChainCommand::Run {
                 chain,
