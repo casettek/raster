@@ -932,6 +932,28 @@ fn recur_sequence_trace_keeps_inner_tiles_replayable() {
     assert_eq!(inner_tile_execs, 3);
     assert_eq!(site_completions, 1);
 
+    // The consumer's storage binding must name the producer inside the same
+    // iteration, not consume another index from the enclosing recur site.
+    let consumer_inputs: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            TraceEvent::TileExec(record) if record.fn_name == "append_prefixed_line" => {
+                Some(record.input.as_ref().unwrap())
+            }
+            _ => None,
+        })
+        .collect();
+    // Shape: [site, iteration, first body step], numbered from FIRST_COORDINATE.
+    let first = raster::core::cfs::FIRST_COORDINATE;
+    let sites: Vec<_> = consumer_inputs.iter().map(|i| i.storage["line"].coordinates.0[0]).collect();
+    for (iteration, input) in consumer_inputs.iter().enumerate() {
+        let producer = &input.storage["line"];
+        assert_eq!(
+            producer.coordinates.0,
+            vec![sites[0], iteration as i32 + first, first]
+        );
+    }
+
     for (expected_index, record) in iteration_start_records.iter().enumerate() {
         let input = record
             .input
@@ -1444,4 +1466,67 @@ fn a_replayed_draft_handle_naming_another_schema_is_refused() {
     ))
     .unwrap();
     let _ = __raster_tile_replay_entry_append_only(&input);
+}
+
+// An ordinary sequence called from inside a recur-sequence body: it enters and
+// exits its own sequence scope while the recur site stays active.
+#[tile]
+fn echo_line(line: String) -> String {
+    line
+}
+
+#[sequence]
+fn echo_line_seq(line: String) -> String {
+    call!(echo_line, line)
+}
+
+#[sequence(kind = recur)]
+fn collect_prefixed_lines_via_seq(
+    input: RecurSequenceInput<String>,
+    output: RecurSequenceOutput<LineBundle>,
+    prefix: String,
+) -> RecurSequenceOutput<LineBundle> {
+    let line = call!(prefix_line, input, prefix);
+    let echoed = call_seq!(echo_line_seq, line);
+    call!(append_prefixed_line, output, echoed)
+}
+
+#[sequence]
+fn build_prefixed_lines_via_nested_sequence() -> LineBundle {
+    let source = raster::store_value(&vec![
+        "one".to_string(),
+        "two".to_string(),
+        "three".to_string(),
+    ])
+    .expect("list source should store");
+    let prefix_source =
+        raster::store_value(&"line: ".to_string()).expect("prefix source should store");
+
+    let output = call!(init_prefixed_bundle);
+
+    call_recur_seq!(
+        sequence = collect_prefixed_lines_via_seq,
+        input = storage!(List<String>, source),
+        output = output,
+        args = (storage!(String, prefix_source),)
+    )
+}
+
+fn run_build_prefixed_lines_via_nested_sequence() -> LineBundle {
+    materialize_auth_return::<LineBundle, _>(
+        __raster_sequence_auth_build_prefixed_lines_via_nested_sequence(),
+    )
+}
+
+#[test]
+fn recur_sequence_body_may_call_an_ordinary_sequence() {
+    let (result, _events) = capture_trace_events(run_build_prefixed_lines_via_nested_sequence);
+    assert_eq!(
+        result.items.into_vec(),
+        vec![
+            "line: one".to_string(),
+            "line: two".to_string(),
+            "line: three".to_string(),
+        ]
+    );
 }
