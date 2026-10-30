@@ -279,11 +279,26 @@ mod tests {
         assert_eq!(padded_proof_cycles(&[]), 0);
         // A 10M-cycle run in 10 segments of 2^20 pays 10 × 2^20, not
         // next_power_of_two(10M) = 2^24.
-        let segments = vec![SegmentStat { po2: 20, cycles: 1_000_000 }; 10];
+        let segments = vec![
+            SegmentStat {
+                po2: 20,
+                cycles: 1_000_000
+            };
+            10
+        ];
         assert_eq!(padded_proof_cycles(&segments), 10 << 20);
         assert_eq!(calculate_proof_cycles(10_000_000), 1 << 24);
         // Mixed sizes, as a short final segment produces.
-        let mixed = [SegmentStat { po2: 20, cycles: 900_000 }, SegmentStat { po2: 17, cycles: 70_000 }];
+        let mixed = [
+            SegmentStat {
+                po2: 20,
+                cycles: 900_000,
+            },
+            SegmentStat {
+                po2: 17,
+                cycles: 70_000,
+            },
+        ];
         assert_eq!(padded_proof_cycles(&mixed), (1 << 20) + (1 << 17));
     }
 }
