@@ -38,6 +38,7 @@ pub fn run(
     show_output: bool,
     trace_format: TraceFormat,
     save_trace: bool,
+    selective: super::selective::Options,
     features: &[String],
     all_features: bool,
     no_default_features: bool,
@@ -50,6 +51,18 @@ pub fn run(
         ));
     }
 
+    selective.validate(
+        no_auth,
+        commit_flag,
+        audit_flag,
+        save_trace,
+        fraud_step.is_some(),
+    )?;
+    let mut selected_features = features.to_vec();
+    if selective.timing && !profiling_enabled(features, all_features) {
+        selected_features.push("profiling".into());
+    }
+    let features = selected_features.as_slice();
     let project_path = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let project = Project::new(project_path).expect("Failed to read project");
 
@@ -148,7 +161,7 @@ pub fn run(
     } else {
         println!("  Commitment: live, memory storage; raw trace disabled");
     }
-    if profiling_enabled(features, all_features) && !no_auth {
+    if profiling_enabled(features, all_features) && !no_auth && !selective.enabled() {
         println!(
             "  Expected live profile stream: {}",
             profile_stream_path.display()
@@ -168,6 +181,14 @@ pub fn run(
     }
     println!();
 
+    let selective_config = super::selective::prepare(
+        &selective,
+        &artifacts.run_dir,
+        &project,
+        &cfs,
+        input,
+        input_manifest,
+    )?;
     let mut cmd = Command::new(&binary_path);
     cmd.current_dir(&project.root_dir);
     // The mode belongs to the run, and this is where the run is launched — the
@@ -179,21 +200,26 @@ pub fn run(
     if no_auth {
         runtime_env.apply(&mut cmd);
     } else if let Some(pending) = &pending {
-        runtime_env
-            .committing(
-                &project.root_dir,
-                pending.path(),
-                fraud_proof_config.expect("commit window").window_size,
-                save_trace.then_some(trace_path.as_path()),
-                trace_format,
-            )
-            .profiling(&artifacts)
-            .apply(&mut cmd);
+        let env = runtime_env.committing(
+            &project.root_dir,
+            pending.path(),
+            fraud_proof_config.expect("commit window").window_size,
+            save_trace.then_some(trace_path.as_path()),
+            trace_format,
+        );
+        if selective.enabled() {
+            env.apply(&mut cmd);
+        } else {
+            env.profiling(&artifacts).apply(&mut cmd);
+        }
     } else {
         runtime_env
             .authenticated(&trace_path, trace_format)
             .profiling(&artifacts)
             .apply(&mut cmd);
+    }
+    if let Some(config) = &selective_config {
+        cmd.env(raster_runtime::selective_profile::CONFIG_ENV, config);
     }
     if let Some(input_json) = input {
         cmd.args(["--input", input_json]);
@@ -340,6 +366,19 @@ pub fn run(
 
     if let Some(pending) = pending {
         pending.publish()?;
+        if selective.enabled() {
+            super::selective::finalize(
+                &selective,
+                &artifacts.run_dir,
+                &artifacts.run_id,
+                &project,
+                &cfs,
+                input,
+                input_manifest,
+                commit_flag.unwrap(),
+                trace_format,
+            )?;
+        }
     } else {
         let (mut trace, trace_recorder) =
             load_trace_from_file(&trace_path, trace_format, &cfs, input, input_manifest)?;

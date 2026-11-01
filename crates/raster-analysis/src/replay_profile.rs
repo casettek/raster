@@ -28,6 +28,8 @@ const MAX_NAME_WIDTH: usize = 32;
 pub struct ReplayProfile {
     pub kind: String,
     pub version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection: Option<serde_json::Value>,
     pub run_id: String,
     /// How many calls per tile were selected, largest by input + output bytes.
     pub calls_per_tile: usize,
@@ -98,6 +100,7 @@ impl ReplayProfile {
         Self {
             kind: REPLAY_PROFILE_KIND.into(),
             version: REPLAY_PROFILE_VERSION,
+            selection: None,
             run_id: run_id.into(),
             calls_per_tile,
             complete: false,
@@ -113,7 +116,7 @@ impl ReplayProfile {
     pub fn from_json(bytes: &[u8]) -> Result<Self> {
         let profile: Self = serde_json::from_slice(bytes)
             .map_err(|error| Error::Other(format!("Not a replay profile: {error}")))?;
-        if profile.kind != REPLAY_PROFILE_KIND || profile.version != REPLAY_PROFILE_VERSION {
+        if profile.kind != REPLAY_PROFILE_KIND || !matches!(profile.version, 4 | 5) {
             return Err(Error::Other(format!(
                 "Expected a {REPLAY_PROFILE_KIND} version {REPLAY_PROFILE_VERSION}, found {} \
                  version {}",
@@ -143,7 +146,8 @@ impl ReplayProfile {
         let replayed: usize = self.tiles.values().map(|tile| tile.replayed.len()).sum();
         let recorded: u64 = self.tiles.values().map(|tile| tile.calls_recorded).sum();
 
-        let mut out = vec![
+        let mut out =
+            vec![
             "Replay profile — RISC Zero executor, no proving".to_string(),
             format!("  Run: {}", self.run_id),
             if self.complete {
@@ -152,8 +156,9 @@ impl ReplayProfile {
                 "  Status: PARTIAL — stopped at the failure below".to_string()
             },
             format!(
-                "  Calls: top {} per tile by input + output bytes; {} of {} replayed",
+                "  Calls: up to {} per selected tile by {}; {} of {} replayed",
                 self.calls_per_tile,
+                if self.version==5 {"native runtime"} else {"input + output bytes"},
                 count(replayed as u64),
                 count(recorded)
             ),

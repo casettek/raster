@@ -202,6 +202,7 @@ fn clear_execution_env(command: &mut Command) {
 
     for name in [
         raster_runtime::TRACE_PATH_ENV,
+        raster_runtime::selective_profile::CONFIG_ENV,
         raster_runtime::TRACE_FORMAT_ENV,
         raster_runtime::tracing::COMMIT_PATH_ENV,
         raster_runtime::tracing::COMMIT_PROJECT_ENV,

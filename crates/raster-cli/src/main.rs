@@ -326,6 +326,19 @@ enum Commands {
         #[arg(long, requires = "commit", conflicts_with = "no_auth")]
         save_trace: bool,
 
+        /// Measure all native calls while retaining bounded top candidates.
+        #[arg(long, requires="commit", conflicts_with_all=["capture_profile_calls","no_auth","audit","save_trace","fraud_step"])]
+        profile_native_top: bool,
+        #[arg(long, default_value_t = 3)]
+        profile_top_tiles: usize,
+        #[arg(long, default_value_t = 1)]
+        profile_calls_per_tile: usize,
+        /// Capture only exact invocations from a native selection document.
+        #[arg(long, requires="commit", conflicts_with_all=["profile_native_top","no_auth","audit","save_trace","fraud_step"])]
+        capture_profile_calls: Option<std::path::PathBuf>,
+        #[arg(long, default_value_t = 8589934592u64)]
+        sample_max_bytes: u64,
+
         /// Raw trace format, used when a trace is recorded (including --save-trace).
         #[arg(long = "trace-format", value_enum, default_value = "binary")]
         trace_format: TraceFormat,
@@ -734,7 +747,11 @@ fn try_main() -> Result<()> {
                 chain,
                 chain_commitment,
                 challenge,
-            } => chain::defend(chain.as_deref(), chain_commitment.as_deref(), challenge.as_deref()),
+            } => chain::defend(
+                chain.as_deref(),
+                chain_commitment.as_deref(),
+                challenge.as_deref(),
+            ),
             ChainCommand::DefendVerify { defence, challenge } => {
                 chain::defend_verify(&defence, challenge.as_deref())
             }
@@ -754,6 +771,11 @@ fn try_main() -> Result<()> {
             show_output,
             trace_format,
             save_trace,
+            profile_native_top,
+            profile_top_tiles,
+            profile_calls_per_tile,
+            capture_profile_calls,
+            sample_max_bytes,
             features,
             all_features,
             no_default_features,
@@ -772,6 +794,13 @@ fn try_main() -> Result<()> {
             show_output,
             trace_format,
             save_trace,
+            commands::selective::Options {
+                timing: profile_native_top,
+                top_tiles: profile_top_tiles,
+                calls_per_tile: profile_calls_per_tile,
+                capture: capture_profile_calls,
+                max_bytes: sample_max_bytes,
+            },
             &features,
             all_features,
             no_default_features,

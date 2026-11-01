@@ -2252,6 +2252,33 @@ mod tests {
     /// once the site closes — is the cheapest check that the producer half is
     /// real.
     #[test]
+    fn selective_live_recorder_releases_completed_recursive_witnesses() {
+        let mut recorder = recorder_with_recur_site();
+        recorder.witness_store = StepWitnessStore(None, true, Some(HashMap::new()));
+        recorder.execution_witnesses = None;
+        recorder.recur_progress_store = None;
+        recorder.storage = AuthenticatedObjectStore::with_storage(crate::WorkingStorage::Memory);
+        start_main(&mut recorder);
+        let start = seed_recur_source(&mut recorder, "recur", 1000);
+        let step = recorder.record(TraceEvent::RecurTileStart(start));
+        recorder.release_live_step(&step);
+        let active = recorder.witness_store.2.as_ref().unwrap().len();
+        for _ in 0..1000 {
+            let step = recorder.record(TraceEvent::RecurTileIterationExec(recur_call(
+                "recur", raster_core::draft::RecurControlKind::Continue,
+            )));
+            assert!(recorder.step_witness_at(step.coordinates()).is_some());
+            recorder.release_live_step(&step);
+            assert!(recorder.step_witness_at(step.coordinates()).is_none());
+            assert_eq!(recorder.witness_store.2.as_ref().unwrap().len(), active);
+            assert!(recorder.execution_witnesses.is_none() && recorder.recur_progress_store.is_none());
+        }
+        let step = recorder.record(TraceEvent::RecurTileEnd(site_end("recur")));
+        recorder.release_live_step(&step);
+        assert!(recorder.active_recur.is_none());
+    }
+
+    #[test]
     fn recorder_stamps_a_live_recur_progress_commitment() {
         let empty = RecurProgressStack::new().commitment();
 

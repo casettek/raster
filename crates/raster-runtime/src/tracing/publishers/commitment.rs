@@ -16,6 +16,7 @@ struct State {
     builder: Option<CommitmentBuilder>,
     started: bool,
     completed: bool,
+    selective: bool,
 }
 impl CommitmentPublisher {
     pub fn new(
@@ -26,7 +27,12 @@ impl CommitmentPublisher {
     ) -> raster_core::Result<Self> {
         let project = Project::new(project)?;
         let cfs = CfsBuilder::new(&project).build()?;
-        let mut recorder = TraceRecorder::for_commitment_with_storage(cfs, WorkingStorage::Memory);
+        let selective = crate::selective_profile::initialize()?;
+        let mut recorder = if selective && !crate::selective_profile::timing() {
+            TraceRecorder::for_live_audit(cfs)
+        } else {
+            TraceRecorder::for_commitment_with_storage(cfs, WorkingStorage::Memory)
+        };
         crate::storage::THREAD_STORAGE.with(|storage| {
             recorder.set_source_resolver(storage.borrow().source_resolver());
         });
@@ -38,6 +44,7 @@ impl CommitmentPublisher {
                 builder: Some(CommitmentBuilder::in_memory(&EMPTY_LEAF, config)),
                 started: false,
                 completed: false,
+                selective,
             }),
         })
     }
@@ -57,6 +64,11 @@ impl Publisher for CommitmentPublisher {
         state.started = true;
         state.completed = matches!(&event, TraceEvent::ProgramEnd(_));
         let step = state.recorder.record(event);
+        if state.selective {
+            crate::selective_profile::on_step(&step, &state.recorder)
+                .expect("collect selective profile");
+            state.recorder.release_live_step(&step);
+        }
         state
             .builder
             .as_mut()
@@ -72,6 +84,9 @@ impl Publisher for CommitmentPublisher {
         );
         if let Some(trace) = &self.trace {
             trace.finish();
+        }
+        if state.selective {
+            crate::selective_profile::finish().expect("finish selective profile");
         }
         let commitment = state
             .builder
