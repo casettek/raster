@@ -31,6 +31,7 @@ pub fn run(
     fraud_proof_config: Option<FraudProofConfig>,
     fraud_step: Option<&FraudTarget>,
     audit_flag: Option<&str>,
+    estimate: Option<Option<usize>>,
     proof_output: Option<&std::path::Path>,
     audit_report: Option<&std::path::Path>,
     no_auth: bool,
@@ -144,6 +145,7 @@ pub fn run(
             input,
             input_manifest,
             disputed,
+            estimate,
             proof_output,
             audit_report,
         );

@@ -34,3 +34,5 @@ output and canonical commitment. replay profile verifies payload hashes and gues
 image IDs before measurement and writes report version 5, with selection policy
 native-runtime and original native timings. Version-1 trace runs and version-4
 reports remain supported. They continue to use the original size-based sampler.
+
+For whole-window tile versus transition overhead, see [fault-window estimation](fault-estimation.md). It uses live audit evidence and measures every selected window step without proving.

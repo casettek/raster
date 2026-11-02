@@ -1,4 +1,4 @@
-//! Bounded native timing and exact-invocation capture. No execution history.
+//! Full native timing history and bounded exact-invocation capture.
 use crate::TraceRecorder;
 use raster_core::{
     cfs::CfsCoordinates,
@@ -91,12 +91,19 @@ impl Manifest {
         Ok(())
     }
 }
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NativeTiming {
+    pub tile_id: String,
+    pub exec_index: u64,
+    pub native_duration_ns: u64,
+}
 #[derive(Default)]
 struct State {
     config: Option<Config>,
     counts: BTreeMap<String, u64>,
     top: BTreeMap<String, Vec<Call>>,
     pending: Option<Call>,
+    native_timings: Vec<NativeTiming>,
     captured: Vec<Call>,
     steps: u64,
     bytes: u64,
@@ -158,6 +165,11 @@ impl State {
     }
     fn flush(&mut self) {
         if let Some(call) = self.pending.take() {
+            self.native_timings.push(NativeTiming {
+                tile_id: call.tile_id.clone(),
+                exec_index: call.exec_index,
+                native_duration_ns: call.native_duration_ns,
+            });
             let k = self.config.as_ref().unwrap().calls_per_tile;
             let calls = self.top.entry(call.tile_id.clone()).or_default();
             calls.push(call);
@@ -314,6 +326,14 @@ pub fn finish() -> Result<()> {
         binding: serde_json::Value::Null,
     };
     manifest.validate()?;
+    if c.timing {
+        std::fs::write(
+            c.directory.join("native-timings.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1, "complete": true, "calls": s.native_timings,
+            })).map_err(|e| Error::Other(e.to_string()))?,
+        )?;
+    }
     std::fs::write(
         c.directory.join("profile-samples.pending.json"),
         serde_json::to_vec_pretty(&manifest).map_err(|e| Error::Other(e.to_string()))?,
@@ -357,6 +377,9 @@ mod tests {
         s.pending = Some(call(10001, 11));
         s.flush();
         assert_eq!(s.top["recur"][0].exec_index, 10001);
+        assert_eq!(s.native_timings.len(), 10001);
+        assert_eq!(s.native_timings[0].exec_index, 1);
+        assert_eq!(s.native_timings[10000].native_duration_ns, 11);
     }
     #[test]
     fn budget_and_free_space_are_enforced() {
@@ -384,6 +407,7 @@ mod tests {
         s.pending = Some(call(2, 8));
         s.adjust_output_store(5);
         s.flush();
+        assert_eq!(s.native_timings[1].native_duration_ns, 13);
         for i in 3..10003 {
             s.pending = Some(call(i, 10));
             s.flush();

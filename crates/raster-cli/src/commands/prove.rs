@@ -50,10 +50,8 @@ pub fn verify(
     Ok(trace_verifier.verify(trace))
 }
 
-fn build_program_frame(cfs: &ControlFlowSchema, replayer: &Replayer) -> Vec<u8> {
-    crate::program::reassemble_and_verify(replayer.project(), cfs, replayer)
-        .unwrap_or_else(|e| panic!("Failed to assemble program definition: {e}"))
-        .canonical_bytes()
+pub(super) fn build_program_frame(cfs: &ControlFlowSchema, replayer: &Replayer) -> Result<Vec<u8>> {
+    Ok(crate::program::reassemble_and_verify(replayer.project(), cfs, replayer)?.canonical_bytes())
 }
 
 pub fn prove(
@@ -178,7 +176,7 @@ pub fn prove_prepared(
         println!();
         println!("Replaying transition frontier with transition guest...");
 
-        let program_frame = build_program_frame(cfs, replayer);
+        let program_frame = build_program_frame(cfs, replayer).expect("program definition");
 
         // Bind the window to the commitment it refutes: the window's start is
         // the initial frontier's position (seed + one leaf per pre-window

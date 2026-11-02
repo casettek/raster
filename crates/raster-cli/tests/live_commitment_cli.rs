@@ -199,61 +199,62 @@ fn live_recurrence_and_drafts_match_saved_trace_without_scratch() {
             os::unix::process::{CommandExt, ExitStatusExt},
             process::Stdio,
         };
-        let mut child = Command::new(env!("CARGO_BIN_EXE_cargo-raster"))
-            .current_dir(&project)
-            .process_group(0)
-            .env("RASTER_SCRATCH_DIR", &forbidden)
-            .args([
-                "raster",
-                "run",
-                "--audit",
-                commit.to_str().unwrap(),
-                "--input",
-                input.to_str().unwrap(),
-                "--input-manifest",
-                manifest.to_str().unwrap(),
-                "--proof-output",
-                receipt.to_str().unwrap(),
-                "--report",
-                report.to_str().unwrap(),
-            ])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let reader = BufReader::new(child.stdout.take().unwrap());
-        let mut reached_native = false;
-        let mut cancelled_dir = None;
-        for line in reader.lines() {
-            let line = line.unwrap();
-            if let Some(path) = line.strip_prefix("Run artifacts dir: ") {
-                cancelled_dir = Some(PathBuf::from(path));
+        {
+            let phase = "audit";
+            let audit_path = &commit;
+            let mut child = Command::new(env!("CARGO_BIN_EXE_cargo-raster"))
+                .current_dir(&project)
+                .process_group(0)
+                .env("RASTER_SCRATCH_DIR", &forbidden)
+                .args([
+                    "raster",
+                    "run",
+                    "--audit",
+                    audit_path.to_str().unwrap(),
+                    "--input",
+                    input.to_str().unwrap(),
+                    "--input-manifest",
+                    manifest.to_str().unwrap(),
+                    "--proof-output",
+                    receipt.to_str().unwrap(),
+                    "--report",
+                    report.to_str().unwrap(),
+                ])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let reader = BufReader::new(child.stdout.take().unwrap());
+            let mut reached_native = false;
+            let mut cancelled_dir = None;
+            for line in reader.lines() {
+                let line = line.unwrap();
+                if let Some(path) = line.strip_prefix("Run artifacts dir: ") {
+                    cancelled_dir = Some(PathBuf::from(path));
+                }
+                if line.starts_with("RASTER_AUDIT_PROGRESS ") && line.contains(phase) {
+                    reached_native = true;
+                    assert!(Command::new("kill")
+                        .args(["-TERM", "--", &format!("-{}", child.id())])
+                        .status()
+                        .unwrap()
+                        .success());
+                    break;
+                }
             }
-            if line.starts_with("RASTER_AUDIT_PROGRESS ") {
-                reached_native = true;
-                assert!(Command::new("kill")
-                    .args(["-TERM", "--", &format!("-{}", child.id())])
-                    .status()
-                    .unwrap()
-                    .success());
-                break;
-            }
-        }
-        let status = child.wait().unwrap();
-        assert!(reached_native);
-        assert_eq!(status.signal(), Some(15));
-        assert_eq!(fs::read(&receipt).unwrap(), b"previous verified receipt");
-        assert!(!report.exists());
-        if let Some(dir) = cancelled_dir {
-            assert!(!dir.join("trace.bin").exists());
-            assert!(!dir.join("run.json").exists());
-            for entry in fs::read_dir(dir).unwrap().flatten() {
-                if entry
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with(".audit-evidence-")
-                {
-                    fs::remove_file(entry.path()).unwrap();
+            let status = child.wait().unwrap();
+            assert!(reached_native);
+            assert_eq!(status.signal(), Some(15));
+            assert_eq!(fs::read(&receipt).unwrap(), b"previous verified receipt");
+            assert!(!report.exists());
+            if let Some(dir) = cancelled_dir {
+                assert!(!dir.join("trace.bin").exists());
+                assert!(!dir.join("run.json").exists());
+                for entry in fs::read_dir(dir).unwrap().flatten() {
+                    assert!(
+                        !entry.file_name().to_string_lossy().starts_with(".audit-"),
+                        "cancelled audit leaked a private handoff"
+                    );
                 }
             }
         }

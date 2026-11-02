@@ -69,6 +69,44 @@ fn build_transition_input(
     // terminal step needs is carried forward on the journal.
     revealed_tail_roots: Option<Vec<NodeHash>>,
 ) -> TransitionInput {
+    let io = recorded_step_io
+        .get(step_record)
+        .expect("recorded step IO")
+        .clone();
+    let journal = if step_record.requires_replay_proof() {
+        Some(
+            replayed_results
+                .get(step_record)
+                .expect("replayed tile")
+                .replay_journal
+                .clone(),
+        )
+    } else {
+        None
+    };
+    build_step_input(
+        step_record,
+        input_sources_witnesses,
+        io,
+        journal,
+        authorization_journal,
+        entrypoint_membership_witness,
+        window_start_recur_progress,
+        revealed_tail_roots,
+    )
+}
+
+/// Shared witness construction for proving and executor-only measurement.
+pub(crate) fn build_step_input(
+    step_record: &StepRecord,
+    input_sources_witnesses: &HashMap<(u64, StepRecord), StepRecordWitness>,
+    io: StepIo,
+    replay_journal: Option<raster_core::draft::TileReplayJournal>,
+    authorization_journal: &AuthorizationJournal,
+    entrypoint_membership_witness: Option<&StorageReadWitness>,
+    window_start_recur_progress: Option<RecurProgressStack>,
+    revealed_tail_roots: Option<Vec<NodeHash>>,
+) -> TransitionInput {
     let StepIo {
         input_witness,
         output_witness,
@@ -80,24 +118,7 @@ fn build_transition_input(
         program_output_read_witness,
         program_output_selection_witness,
         returned_state_read_witness,
-    } = recorded_step_io
-        .get(step_record)
-        .cloned()
-        .unwrap_or_else(|| panic!("Missing recorded I/O for transition step {:?}", step_record));
-
-    // The expected image id is no longer shipped to the guest; it resolves the
-    // image id from the committed program registry keyed by the step's tile id.
-    let replay_journal = if step_record.requires_replay_proof() {
-        let replay_result = replayed_results.get(step_record).unwrap_or_else(|| {
-            panic!(
-                "Replayed result not found for transition step {:?}",
-                step_record
-            )
-        });
-        Some(replay_result.replay_journal.clone())
-    } else {
-        None
-    };
+    } = io;
 
     TransitionInput {
         step_record: step_record.clone(),
@@ -155,6 +176,28 @@ fn write_postcard<T: serde::Serialize>(
     write_frame(builder, &bytes);
 }
 
+/// Identical guest input frames in both execution modes. Assumptions are supplied separately.
+pub(crate) fn write_transition_inputs(
+    builder: &mut risc0_zkvm::ExecutorEnvBuilder<'_>,
+    program_frame: &[u8],
+    input: &TransitionInput,
+    state: &TransitionState,
+    previous: Option<&TransitionJournal>,
+    header: &TraceCommitmentHeader,
+    slice: &FingerprintSliceWitness,
+) {
+    write_frame(builder, program_frame);
+    write_frame(builder, &image_id_bytes(TRANSITION_GUEST_ID));
+    write_postcard(builder, input);
+    write_postcard(builder, state);
+    if let Some(previous) = previous {
+        write_postcard(builder, previous);
+    } else {
+        write_postcard(builder, header);
+        write_postcard(builder, slice);
+    }
+}
+
 fn empty_storage_frontier() -> SerializableFrontier {
     SerializableFrontier {
         position: 0,
@@ -163,7 +206,7 @@ fn empty_storage_frontier() -> SerializableFrontier {
     }
 }
 
-fn storage_root(frontier: &SerializableFrontier) -> Vec<u8> {
+pub(crate) fn storage_root(frontier: &SerializableFrontier) -> Vec<u8> {
     let frontier = serializable_frontier_into_trace_frontier(frontier.clone())
         .expect("storage frontier should deserialize");
     frontier_root(&frontier)
@@ -277,8 +320,6 @@ pub fn step_transitions_with(
 ) -> Option<risc0_zkvm::Receipt> {
     let prover = risc0_zkvm::default_prover();
 
-    let transition_image_id = image_id_bytes(TRANSITION_GUEST_ID);
-
     let init_transition = InitTransition {
         init_frontier: initial_frontier.clone(),
         init_storage_frontier: initial_storage_frontier.clone(),
@@ -356,18 +397,15 @@ pub fn step_transitions_with(
             });
             builder.add_assumption(transition_receipt);
         }
-        write_frame(&mut builder, program_frame);
-        write_frame(&mut builder, &transition_image_id);
-        write_postcard(&mut builder, &input);
-        write_postcard(&mut builder, &current_state);
-        if let Some(previous_journal) = current_journal {
-            write_postcard(&mut builder, &previous_journal);
-        } else {
-            // The window-opening `Init` step reads the commitment binding
-            // right after the state (see the guest's `main`).
-            write_postcard(&mut builder, commitment_header);
-            write_postcard(&mut builder, fingerprint_slice);
-        }
+        write_transition_inputs(
+            &mut builder,
+            program_frame,
+            &input,
+            &current_state,
+            current_journal.as_ref(),
+            commitment_header,
+            fingerprint_slice,
+        );
         let env = builder.build().unwrap();
         let receipt = prover.prove(env, &TRANSITION_GUEST_ELF).unwrap().receipt;
         let journal: TransitionJournal = receipt.journal.decode().unwrap();
@@ -763,12 +801,19 @@ mod tests {
         }
     }
 
-    fn prove_single_transition_with_authorization(
+    fn single_transition_env(
         authorization: AuthorizationJournal,
-        authorization_receipt: Option<risc0_zkvm::Receipt>,
-    ) -> risc0_zkvm::Result<risc0_zkvm::ProveInfo> {
-        let prover = risc0_zkvm::default_prover();
-        let input = TransitionInput {
+        authorization_receipt: Option<risc0_zkvm::AssumptionReceipt>,
+    ) -> risc0_zkvm::ExecutorEnv<'static> {
+        single_transition_env_with_witness(authorization, authorization_receipt, false)
+    }
+
+    fn single_transition_env_with_witness(
+        authorization: AuthorizationJournal,
+        authorization_receipt: Option<risc0_zkvm::AssumptionReceipt>,
+        corrupt_witness: bool,
+    ) -> risc0_zkvm::ExecutorEnv<'static> {
+        let mut input = TransitionInput {
             window_start_recur_progress: None,
             step_record: make_sequence_start_step(),
             authorization_image_id: authorization_guest_image_id(),
@@ -788,6 +833,9 @@ mod tests {
             returned_state_read_witness: None,
             revealed_tail_roots: None,
         };
+        if corrupt_witness {
+            input.input_witness = Some(b"wrong input".to_vec());
+        }
         let window_fingerprint = Fingerprint::from(vec![0], BitPacker::new(64), 1);
         let state = TransitionState::Init(InitTransition {
             init_frontier: make_init_frontier(),
@@ -818,9 +866,90 @@ mod tests {
         write_postcard(&mut builder, &state);
         write_postcard(&mut builder, &commitment_header);
         write_postcard(&mut builder, &fingerprint_slice);
-        let env = builder.build().unwrap();
+        builder.build().unwrap()
+    }
 
-        prover.prove(env, &TRANSITION_GUEST_ELF)
+    fn prove_single_transition_with_authorization(
+        authorization: AuthorizationJournal,
+        receipt: Option<risc0_zkvm::Receipt>,
+    ) -> risc0_zkvm::Result<risc0_zkvm::ProveInfo> {
+        risc0_zkvm::default_prover().prove(
+            single_transition_env(authorization, receipt.map(Into::into)),
+            TRANSITION_GUEST_ELF,
+        )
+    }
+
+    #[test]
+    #[ignore = "requires real RISC Zero proving; no Docker"]
+    fn estimation_matches_proof_cycles_and_rejects_bad_assumptions() {
+        assert!(!risc0_zkvm::ProverOpts::default().dev_mode());
+        let (receipt, journal) = authorize_external_inputs(&ManifestedInputs {
+            manifest_bytes: vec![],
+        });
+        let claim = risc0_zkvm::ReceiptClaim::ok(
+            crate::AUTHORIZATION_GUEST_ID,
+            receipt.journal.bytes.clone(),
+        );
+        let executor = risc0_zkvm::default_executor();
+        let measured = executor
+            .execute(
+                single_transition_env(journal.clone(), Some(claim.into())),
+                TRANSITION_GUEST_ELF,
+            )
+            .unwrap();
+        let proven =
+            prove_single_transition_with_authorization(journal.clone(), Some(receipt.clone()))
+                .unwrap();
+        proven.receipt.verify(TRANSITION_GUEST_ID).unwrap();
+        assert_eq!(measured.journal.bytes, proven.receipt.journal.bytes);
+        assert_eq!(measured.cycles(), proven.stats.user_cycles);
+        assert_eq!(measured.segments.len(), proven.stats.segments);
+        for claim in [
+            risc0_zkvm::ReceiptClaim::ok([0u32; 8], receipt.journal.bytes.clone()),
+            risc0_zkvm::ReceiptClaim::ok(crate::AUTHORIZATION_GUEST_ID, vec![0u8]),
+        ] {
+            assert!(executor
+                .execute(
+                    single_transition_env(journal.clone(), Some(claim.into())),
+                    TRANSITION_GUEST_ELF
+                )
+                .is_err());
+        }
+        let mut wrong = journal.clone();
+        wrong.input_manifest_commitment = vec![0; 32];
+        let claim = risc0_zkvm::ReceiptClaim::ok(
+            crate::AUTHORIZATION_GUEST_ID,
+            receipt.journal.bytes.clone(),
+        );
+        assert!(executor
+            .execute(
+                single_transition_env(wrong, Some(claim.into())),
+                TRANSITION_GUEST_ELF
+            )
+            .is_err());
+    }
+
+    #[test]
+    #[ignore = "requires compiled RISC Zero guests, executor only"]
+    fn estimation_rejects_invalid_step_witness() {
+        let inputs = ManifestedInputs {
+            manifest_bytes: vec![],
+        };
+        let session = risc0_zkvm::default_executor()
+            .execute(
+                crate::authorization::authorization_env(&inputs).unwrap(),
+                crate::AUTHORIZATION_GUEST_ELF,
+            )
+            .unwrap();
+        let journal: AuthorizationJournal = session.journal.decode().unwrap();
+        let claim =
+            risc0_zkvm::ReceiptClaim::ok(crate::AUTHORIZATION_GUEST_ID, session.journal.bytes);
+        assert!(risc0_zkvm::default_executor()
+            .execute(
+                single_transition_env_with_witness(journal, Some(claim.into()), true),
+                TRANSITION_GUEST_ELF
+            )
+            .is_err());
     }
 
     #[test]

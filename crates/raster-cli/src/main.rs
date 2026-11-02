@@ -297,6 +297,14 @@ enum Commands {
         #[arg(long, conflicts_with = "commit")]
         audit: Option<String>,
 
+        /// Execute fault-window guests and report cycles without generating proofs.
+        #[arg(long, requires = "audit", conflicts_with = "proof_output")]
+        estimate: bool,
+
+        /// Measure only the first N window steps (default: the complete window).
+        #[arg(long, requires = "estimate", value_parser = clap::value_parser!(u64).range(1..))]
+        estimate_steps: Option<u64>,
+
         /// Verified Groth16 fault receipt destination (default: run artifacts/fault.receipt). Requires Docker.
         #[arg(long, requires = "audit")]
         proof_output: Option<std::path::PathBuf>,
@@ -764,6 +772,8 @@ fn try_main() -> Result<()> {
             fraud_proof_config,
             fraud_step,
             audit,
+            estimate,
+            estimate_steps,
             proof_output,
             report,
             no_auth,
@@ -787,6 +797,9 @@ fn try_main() -> Result<()> {
             fraud_proof_config,
             fraud_step.as_ref(),
             audit.as_deref(),
+            estimate.then_some(
+                estimate_steps.map(|n| usize::try_from(n).expect("step limit fits usize")),
+            ),
             proof_output.as_deref(),
             report.as_deref(),
             no_auth,
@@ -822,5 +835,49 @@ fn try_main() -> Result<()> {
             max_fields,
             depth,
         ),
+    }
+}
+
+#[cfg(test)]
+mod estimation_arguments {
+    use super::*;
+    #[test]
+    fn estimation_is_explicit_and_live_only() {
+        let parse = |args: &[&str]| {
+            Cli::try_parse_from(
+                ["cargo-raster", "raster"]
+                    .into_iter()
+                    .chain(args.iter().copied()),
+            )
+        };
+        for args in [
+            vec!["run", "--estimate"],
+            vec!["run", "--audit", "c", "--estimate-steps", "1"],
+            vec!["run", "--audit", "c", "--estimate", "--estimate-steps", "0"],
+            vec!["run", "--audit", "c", "--estimate", "--proof-output", "p"],
+            vec!["trace", "audit", "--estimate"],
+        ] {
+            assert!(parse(&args).is_err(), "{args:?}");
+        }
+        for (args, expected, limit) in [
+            (vec!["run", "--audit", "c"], false, None),
+            (vec!["run", "--audit", "c", "--estimate"], true, None),
+            (
+                vec!["run", "--audit", "c", "--estimate", "--estimate-steps", "1"],
+                true,
+                Some(1),
+            ),
+        ] {
+            let Cli::Raster(Commands::Run {
+                estimate,
+                estimate_steps,
+                ..
+            }) = parse(&args).unwrap()
+            else {
+                panic!()
+            };
+            assert_eq!(estimate, expected);
+            assert_eq!(estimate_steps, limit);
+        }
     }
 }

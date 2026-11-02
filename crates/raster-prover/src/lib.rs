@@ -20,6 +20,7 @@ pub mod defence;
 pub mod challenge;
 pub mod error;
 pub mod replay;
+pub mod estimate;
 pub mod trace;
 pub mod transition;
 pub mod utils;
