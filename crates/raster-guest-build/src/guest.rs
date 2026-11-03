@@ -238,21 +238,28 @@ pub struct GuestBuild<'a> {
     pub target_dir: Option<&'a Path>,
 }
 
+/// Write `krate` into `stage`: its manifest, a generated crate's `main.rs`,
+/// and `lockfile` as the stage's `Cargo.lock`. [`GuestBuild::run`] does this
+/// first; a caller can also do it alone to resolve the staged guest's
+/// dependencies with [`crate::PathPackages::resolve_for_target`].
+pub fn prepare_stage(stage: &Stage, krate: &GuestCrate, lockfile: Option<&Path>) -> Result<()> {
+    let root = stage.root();
+    fs::write(root.join("Cargo.toml"), stage_manifest(stage.plan(), krate)?)?;
+    if let GuestCrate::Generated { main_rs, .. } = krate {
+        fs::create_dir_all(root.join("src"))?;
+        fs::write(root.join("src").join("main.rs"), main_rs)?;
+    }
+    if let Some(lockfile) = lockfile {
+        fs::copy(lockfile, root.join("Cargo.lock"))?;
+    }
+    Ok(())
+}
+
 impl GuestBuild<'_> {
     pub fn run(&self) -> Result<BuildOutput> {
         let root = self.stage.root();
-        fs::write(
-            root.join("Cargo.toml"),
-            stage_manifest(self.stage.plan(), &self.krate)?,
-        )?;
-        if let GuestCrate::Generated { main_rs, .. } = &self.krate {
-            fs::create_dir_all(root.join("src"))?;
-            fs::write(root.join("src").join("main.rs"), main_rs)?;
-        }
+        prepare_stage(self.stage, &self.krate, self.lockfile)?;
         let lock_path = root.join("Cargo.lock");
-        if let Some(lockfile) = self.lockfile {
-            fs::copy(lockfile, &lock_path)?;
-        }
         let target_dir = self
             .target_dir
             .map(Path::to_path_buf)

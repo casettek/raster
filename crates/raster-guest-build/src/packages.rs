@@ -35,6 +35,10 @@ pub struct PathPackages {
     pub packages: Vec<PathPackage>,
     /// The `Cargo.lock` of the root's workspace, if it exists.
     pub lockfile: Option<PathBuf>,
+    /// Every other reachable package (registry, git), as `name version source`,
+    /// sorted. With a pinned lockfile this is the exact set of external crates
+    /// a guest compiles.
+    pub external: Vec<String>,
 }
 
 impl PathPackages {
@@ -43,8 +47,18 @@ impl PathPackages {
     ///
     /// Dev-dependencies are not followed: a guest never compiles them.
     pub fn resolve(manifest_path: &Path) -> Result<Self> {
-        let metadata = MetadataCommand::new()
-            .manifest_path(manifest_path)
+        Self::resolve_for_target(manifest_path, None)
+    }
+
+    /// Like [`Self::resolve`], keeping only dependencies that apply to
+    /// `target` (`cargo metadata --filter-platform`), e.g. [`crate::TARGET`].
+    pub fn resolve_for_target(manifest_path: &Path, target: Option<&str>) -> Result<Self> {
+        let mut command = MetadataCommand::new();
+        command.manifest_path(manifest_path);
+        if let Some(target) = target {
+            command.other_options(vec!["--filter-platform".to_string(), target.to_string()]);
+        }
+        let metadata = command
             .exec()
             .map_err(|e| Error::Metadata(format!("{}: {e}", manifest_path.display())))?;
         let resolve = metadata.resolve.as_ref().ok_or_else(|| {
@@ -66,6 +80,7 @@ impl PathPackages {
         let mut seen: HashSet<&PackageId> = HashSet::new();
         let mut queue: VecDeque<&PackageId> = VecDeque::from([root_id]);
         let mut found = Vec::new();
+        let mut external = Vec::new();
         while let Some(id) = queue.pop_front() {
             if !seen.insert(id) {
                 continue;
@@ -86,6 +101,8 @@ impl PathPackages {
                     dir,
                     workspace_root,
                 });
+            } else if let Some(source) = &package.source {
+                external.push(format!("{} {} {}", package.name, package.version, source));
             }
             if let Some(node) = nodes.get(id) {
                 for dep in &node.deps {
@@ -115,11 +132,13 @@ impl PathPackages {
                 ))
             })?;
         found.sort_by(|a, b| (&a.name, &a.dir).cmp(&(&b.name, &b.dir)));
+        external.sort();
         let lockfile = Some(metadata_root.join("Cargo.lock")).filter(|p| p.is_file());
         Ok(Self {
             root,
             packages: found,
             lockfile,
+            external,
         })
     }
 
@@ -326,6 +345,11 @@ mod tests {
         assert_eq!(packages.workspace_roots(), vec![repo.clone()]);
         assert_eq!(packages.lockfile, Some(repo.join("Cargo.lock")));
         assert!(packages.packages.iter().all(|p| p.dir.is_absolute()));
+        assert!(
+            packages.external.iter().any(|e| e.starts_with("serde ")),
+            "registry dependencies are listed: {:?}",
+            &packages.external[..packages.external.len().min(5)]
+        );
     }
 
     #[test]

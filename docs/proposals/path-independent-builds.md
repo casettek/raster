@@ -316,7 +316,7 @@ tile, two checkout copies at different paths with different `$CARGO_HOME`s, equa
   - Packaging (`ProgramBinary` plus `risc0_binfmt::compute_image_id`, which `risc0_zkvm`
     re-exports) is checked only by the integration test, because a unit test has no real user ELF.
 
-### PR 3 — tile guests switch over; tile ids change (medium)
+### PR 3 — tile guests switch over; tile ids change (medium) — implemented 2026-11-03 on `feature/path-fixes`
 - **`GuestBuilder`:** becomes a thin adapter over `raster-guest-build`. Delete
   `extract_raster_path`, the `../../../../crates/raster` fallback and the `canonicalize`.
   `with_user_crate` stores the path, and resolution errors surface from `compile_tile`. The
@@ -337,6 +337,40 @@ tile, two checkout copies at different paths with different `$CARGO_HOME`s, equa
   - new: a symlinked sibling layout builds (the old `casettek` case).
 - **Accept:** the PR 2 ignored test passes. `stage-challenge` "anyone defends" succeeds from a
   second worktree at another path; today it fails with `program identity drift`.
+
+**Outcome (PR 3).**
+- **The builder.** `GuestBuilder` is an adapter over `raster-guest-build`. `Risc0Backend` resolves
+  it once, with a `OnceLock`, instead of rebuilding it for every tile.
+- **One guest target directory per project** (`target/raster/guest-target`; tiles compile one at a
+  time, `program.rs:174`). hello-tiles' 24 guests now build in **90 s**, instead of a from-scratch
+  build per tile (28 s each when built alone). A tile built alone with a fresh target directory
+  matches its shared-directory build exactly; checked for the first and the last tile.
+- **The cache key** covers the staged guest's own resolve for the guest target: the exact
+  external crate versions, plus `Cargo.toml` and library sources of every path package it
+  compiles, named by stage path. It replaces the fixed three-crate list, and the old docs' "not
+  covered: external crate versions" no longer holds.
+- **Across checkouts.** A git worktree at `/tmp/pr3-check/x/y/defender-raster` (same commit, plus
+  this checkout's `Cargo.lock`) builds a hello-tiles `Raster.lock` byte-identical to this
+  checkout's: `program_commitment` `8db95fff…`. The old `7a09d393…` and all 24 tile ids changed
+  once, as §5 expects.
+- **Locks regenerated:** all six committed locks. Backups of the old ones are outside the
+  repository.
+- **New unit tests** (no toolchain):
+  - `raster = { workspace = true }` reached through a symlinked sibling checkout resolves (both
+    issue §1 reproducers);
+  - a project without `raster` gets an error naming it;
+  - the fingerprint is equal at two checkout paths.
+- **Dependencies.** `risc0-binfmt`, `risc0-zkos-v1compat` and `risc0-zkvm-platform` moved out of
+  `raster-backend-risc0`; `tempfile` is now a dev-dependency. `cargo_metadata`, `risc0-build`,
+  `bincode` and `anyhow` were already unused there, and are left for a separate cleanup.
+- **Removed dead code:** `Risc0Backend::load_elf`, which read a `guest.elf` nothing writes, and
+  `GuestBuilder::write_artifacts`.
+- **For PR 5:** spec docs name functions that are gone:
+  - `docs/specs/core/2-compile/03-tile-artifact-generation-elfs.md` (`find_risc0_cargo`);
+  - `04-artifact-identity-and-reproducibility.md` (`write_artifacts`, `find_risc0_cargo`,
+    `build_guest`, `generate_guest_cargo_toml`);
+  - `05-program-bundle-and-manifests.md`;
+  - `docs/proposals/zkvm-dry-run.md:76`.
 
 ### PR 4 — protocol guests switch over; protocol ids change (medium; spike first)
 - **Spike (half a day):** build the real `transition` guest staged from two worktree paths and

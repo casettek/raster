@@ -34,7 +34,9 @@ mod recipe;
 mod stage;
 
 pub use fingerprint::{Fingerprint, Scope};
-pub use guest::{stage_manifest, BuildOutput, Dependency, GuestBinary, GuestBuild, GuestCrate};
+pub use guest::{
+    prepare_stage, stage_manifest, BuildOutput, Dependency, GuestBinary, GuestBuild, GuestCrate,
+};
 pub use packages::{PathPackage, PathPackages};
 pub use recipe::{
     cargo_home, encode_rustflags, rustflags, Toolchain, CARGO_HOME_REMAP, RECIPE_VERSION, TARGET,

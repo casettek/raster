@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use std::any::Any;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use raster_core::{tile::TileMetadata, Error, Result};
 
@@ -154,6 +155,9 @@ pub struct Risc0Backend {
     /// Whether guest stdout reaches the host terminal. The guest still runs
     /// its writes (and pays their cycles) when this is off.
     guest_stdout: bool,
+    /// The project's guest builder, resolved with cargo on first use and kept
+    /// for every later tile.
+    guest_builder: OnceLock<std::result::Result<GuestBuilder, String>>,
 }
 
 impl Risc0Backend {
@@ -164,6 +168,7 @@ impl Risc0Backend {
             user_crate_path: None,
             artifact_store: Risc0ArtifactStore::new(),
             guest_stdout: true,
+            guest_builder: OnceLock::new(),
         }
     }
 
@@ -180,28 +185,17 @@ impl Risc0Backend {
         self
     }
 
-    /// Get the guest builder.
-    fn guest_builder(&self) -> GuestBuilder {
-        let mut builder = GuestBuilder::new(self.output_dir.clone());
-        if let Some(ref path) = self.user_crate_path {
-            builder = builder.with_user_crate(path.clone());
-        }
-        builder
-    }
-
-    /// Load a compiled ELF from the artifact directory.
-    #[allow(dead_code)]
-    fn load_elf(&self, tile_id: &str) -> Result<Vec<u8>> {
-        let builder = self.guest_builder();
-        let elf_path = builder.artifact_dir(tile_id).join("guest.elf");
-        fs::read(&elf_path).map_err(|e| {
-            Error::Other(format!(
-                "Failed to load ELF for tile '{}' from {}: {}",
-                tile_id,
-                elf_path.display(),
-                e
-            ))
-        })
+    /// The project's guest builder, resolved on first use.
+    fn guest_builder(&self) -> Result<&GuestBuilder> {
+        self.guest_builder
+            .get_or_init(|| {
+                let user_crate = self.user_crate_path.as_deref().ok_or_else(|| {
+                    "the RISC0 backend needs the project's crate to build tile guests".to_string()
+                })?;
+                GuestBuilder::resolve(&self.output_dir, user_crate)
+            })
+            .as_ref()
+            .map_err(|e| Error::Other(format!("Cannot build tile guests: {e}")))
     }
 }
 
@@ -217,16 +211,15 @@ impl Backend for Risc0Backend {
     ) -> Result<Box<dyn CompilationArtifact>> {
         let tile_id = &metadata.id.0;
 
-        // Not cached, need to build
-        let builder = self.guest_builder();
+        let builder = self.guest_builder()?;
 
-        // Key the cache on the tile source *and* the build recipe (guest
-        // template + toolchain + macro ABI). Keying on source alone would serve
-        // a stale ELF/image id after a macro/template/toolchain change (see
-        // docs/proposals/program-identity.md).
+        // Key the cache on the tile source *and* everything else the guest
+        // compiles (see GuestBuilder::fingerprint). Keying on source alone
+        // would serve a stale ELF/image id after a dependency, template or
+        // toolchain change (see docs/proposals/program-identity.md).
         let cache_key = content_hash
             .as_ref()
-            .map(|src| format!("{src}-{}", builder.recipe_fingerprint()));
+            .map(|src| format!("{src}-{}", builder.fingerprint()));
 
         if let Some(cached) = self
             .artifact_store
@@ -235,31 +228,17 @@ impl Backend for Risc0Backend {
             return Ok(cached);
         }
 
-        // Create a temporary directory for building
-        let temp_dir = tempfile::tempdir()
-            .map_err(|e| Error::Other(format!("Failed to create temp directory: {}", e)))?;
-
-        let guest_dir = temp_dir.path().join(format!("guest-{}", tile_id));
-        fs::create_dir_all(&guest_dir)
-            .map_err(|e| Error::Other(format!("Failed to create guest directory: {}", e)))?;
-
-        // Build the guest
-        let elf_path = builder.build_guest(tile_id, &guest_dir).map_err(|e| {
+        let guest = builder.build_tile(tile_id).map_err(|e| {
             Error::Other(format!(
                 "Failed to build guest for tile '{}': {}",
                 tile_id, e
             ))
         })?;
 
-        // Read the ELF
-        let elf =
-            fs::read(&elf_path).map_err(|e| Error::Other(format!("Failed to read ELF: {}", e)))?;
-
-        // Compute the image ID (method ID)
-        let image_id = risc0_zkvm::compute_image_id(&elf)
-            .map_err(|e| Error::Other(format!("Failed to compute image ID: {}", e)))?;
-
-        let image_id = hex::encode(image_id);
+        // The stored "elf" is the encoded ProgramBinary (the user ELF with the
+        // v1compat kernel): what the executor loads and the image id hashes.
+        let elf = guest.program;
+        let image_id = hex::encode(guest.image_id);
 
         let artifact = Risc0CompilationArtifact {
             elf,
