@@ -34,6 +34,7 @@ Every path-related defect found so far. "New" means it is not in the issue.
 | P9 | Lock drift is only detected at prove time (`program identity drift`); `run --commit` does not check. | `raster-cli/src/program.rs:336` | late, confusing failure | issue §2 |
 | P10 | Run artifacts store absolute paths (`run.json` `project_root`, file inputs). | `raster-cli/src/run_manifest.rs:25` | a run directory cannot be moved | issue §3 — **out of scope** |
 | P11 | Not path-related, found along the way, and *revised 2026-11-03* after measuring. risc0-build registers its own `methods.rs` as a rebuild trigger and rewrites that file on every run. So `raster-prover`'s build script reruns on every build, and `raster-prover` recompiles every time. No guest or `raster-core` edit can be missed: the hand-written `defence` gap on `codex/windows-native` is harmless. The real cost is the opposite: a no-op `cargo build -p raster-cli` takes 3.3 s. That may be part of the "cargo no-op build check 8.4 s" recorded for `prompt-prepare`. | `risc0-build-3.0.6/src/lib.rs:820` | every build recompiles `raster-prover` and its dependents | new, measured |
+| P12 | raster's `Cargo.lock` is gitignored and was never committed (iris commits its own). Seeding a tile guest from the project's lockfile (P6) pins versions only where that lockfile is shared. For raster's own examples it is per-machine, so their committed `Raster.lock` ids can still differ between machines. | `.gitignore:5` | example ids depend on each machine's resolve | new, 2026-11-03 |
 
 ## 2. What a guest image id depends on today
 
@@ -255,7 +256,7 @@ lands second has to adapt to the other: windows-native adds `commands/audit.rs` 
   - each guest still resolves standalone (`cargo metadata` in its directory);
   - `cargo check --workspace --all-targets` passes.
 
-### PR 2 — `raster-guest-build` crate, library only, no caller yet (medium)
+### PR 2 — `raster-guest-build` crate, library only, no caller yet (medium) — done 2026-11-03 on `feature/path-fixes`
 
 Modules:
 - **`packages`:**
@@ -293,6 +294,28 @@ Tests, needing no toolchain:
 Ignored test, needing the risc0 toolchain: §3's staged experiment automated. One hello-tiles
 tile, two checkout copies at different paths with different `$CARGO_HOME`s, equal image id.
 
+**Outcome.**
+- **Unit tests:** 20 pass. They cover the stage layouts and the `raster` rename, workspace-root
+  discovery (`exclude`, explicit members, `package.workspace`), the real hello-tiles resolve, the
+  missing-`raster` error, and the generated and member manifests. They check that the fingerprint
+  tracks a `det-num`-style extra crate, ignores `main.rs` and `src/bin`, and is equal for the same
+  sources at two paths. They also check that a dropped stage removes its links and not the
+  checkout.
+- **Integration test:** `tests/two_checkouts.rs` (`--ignored`, 57 s) builds the
+  `advance_line_cursor` tile from copies at `a/raster` and `b/much/deeper/defender-raster`. Both
+  give image id `e9ce4c3d…`; neither ELF contains its checkout path or `$CARGO_HOME`; the byte and
+  word encodings of the id agree. It uses the developer's `$CARGO_HOME` for both copies; §3
+  measured the `$CARGO_HOME` case.
+- **Differences from the plan:**
+  - `rzup` is a dependency with `default-features = false`, as risc0-build has it. Its defaults
+    pull in the AWS SDK, which needs rustc 1.94.
+  - The C compiler is set as `CC_riscv32im_risc0_zkvm_elf`, not the global `CC` risc0-build sets,
+    so host build scripts keep the host compiler.
+  - The build removes every `CARGO*` variable and `RUSTUP_TOOLCHAIN`, then sets `CARGO_HOME`
+    explicitly, so the remap matches the path cargo uses even inside a build script.
+  - Packaging (`ProgramBinary` plus `risc0_binfmt::compute_image_id`, which `risc0_zkvm`
+    re-exports) is checked only by the integration test, because a unit test has no real user ELF.
+
 ### PR 3 — tile guests switch over; tile ids change (medium)
 - **`GuestBuilder`:** becomes a thin adapter over `raster-guest-build`. Delete
   `extract_raster_path`, the `../../../../crates/raster` fallback and the `canonicalize`.
@@ -303,7 +326,8 @@ tile, two checkout copies at different paths with different `$CARGO_HOME`s, equa
 - **`Risc0Backend::compile_tile`:** builds in a `Stage` instead of `tempfile::tempdir()`. The
   cache key becomes the tile source hash plus the new fingerprint.
 - **Lockfile:** the project workspace's `Cargo.lock` (`workspace_root` from metadata). If it is
-  missing, warn that ids will not be reproducible, and build.
+  missing, warn that ids will not be reproducible, and build. For raster's own examples this
+  needs P12 settled first (open question 5).
 - **Locks:** regenerate the six committed locks with
   `target/debug/cargo-raster raster build --backend risc0`.
 - **Tests:**
@@ -391,3 +415,9 @@ tile, two checkout copies at different paths with different `$CARGO_HOME`s, equa
    visible in review?
 4. **Drift check.** Should P9 ride along, so that `run --commit` compares the lock with the built
    ids?
+5. **Commit raster's `Cargo.lock` (P12)?** **Decided 2026-11-03: yes.** The line was removed from
+   `.gitignore`. The four real guests' lockfiles are committed too; the five leftover
+   `guests/*/Cargo.lock` without a `Cargo.toml` are not. Recommended because `raster-cli` is a
+   binary, and without a shared lock the examples' tile ids differ wherever the resolve differs.
+   The alternative is a committed per-guest lockfile. That is more files to keep current, and it
+   would not pin the native build.
