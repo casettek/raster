@@ -365,6 +365,12 @@ tile, two checkout copies at different paths with different `$CARGO_HOME`s, equa
   `bincode` and `anyhow` were already unused there, and are left for a separate cleanup.
 - **Removed dead code:** `Risc0Backend::load_elf`, which read a `guest.elf` nothing writes, and
   `GuestBuilder::write_artifacts`.
+- **Tests, all passing** (2026-11-03):
+  - `cargo test -p raster-cli`: 92 unit tests, `chain_repeat_cli` (12), `chain_stage_cli` (7),
+    `recur_cli` (11), `replay_profile_cli` (4), `show_cli` (11); 43 min;
+  - ignored `replay_profile_cli` (hello-tiles replayed in the RISC Zero executor with the new
+    guests);
+  - ignored `stage_challenge_cli`, dev mode: 7 claim, challenge and defend scenarios, 14 min.
 - **For PR 5:** spec docs name functions that are gone:
   - `docs/specs/core/2-compile/03-tile-artifact-generation-elfs.md` (`find_risc0_cargo`);
   - `04-artifact-identity-and-reproducibility.md` (`write_artifacts`, `find_risc0_cargo`,
