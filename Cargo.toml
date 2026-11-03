@@ -22,6 +22,11 @@ members = [
     "examples/chain-example/planner",
     "examples/chain-example/step",
 ]
+# The risc0 protocol guests are built for the zkVM target by raster-prover's
+# build script, never as members of this workspace. Excluding them lets a guest
+# drop its own `[workspace]` and still build on its own (see
+# docs/proposals/path-independent-builds.md §4.4).
+exclude = ["crates/raster-prover/guests"]
 
 [workspace.package]
 version = "0.1.0"

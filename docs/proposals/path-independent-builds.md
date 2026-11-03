@@ -33,7 +33,7 @@ Every path-related defect found so far. "New" means it is not in the issue.
 | P8 | The chain runner canonicalizes the stage base directory; direct commands use the path as given. Through a symlink, the same stage gets different ids depending on how it was built. | `raster-cli/src/chain.rs:2823` | ids depend on the entry point | new, minor (goes away with P4's fix) |
 | P9 | Lock drift is only detected at prove time (`program identity drift`); `run --commit` does not check. | `raster-cli/src/program.rs:336` | late, confusing failure | issue §2 |
 | P10 | Run artifacts store absolute paths (`run.json` `project_root`, file inputs). | `raster-cli/src/run_manifest.rs:25` | a run directory cannot be moved | issue §3 — **out of scope** |
-| P11 | Not path-related, found along the way. On `main`, `build.rs` is only `embed_methods()`. `codex/windows-native` adds a hand-written `rerun-if-changed` list (for `raster-core`) that omits `defence`. | `raster-prover/build.rs` (windows-native) | there, editing only the defence guest may not rebuild it | new |
+| P11 | Not path-related, found along the way, and *revised 2026-11-03* after measuring. risc0-build registers its own `methods.rs` as a rebuild trigger and rewrites that file on every run. So `raster-prover`'s build script reruns on every build, and `raster-prover` recompiles every time. No guest or `raster-core` edit can be missed: the hand-written `defence` gap on `codex/windows-native` is harmless. The real cost is the opposite: a no-op `cargo build -p raster-cli` takes 3.3 s. That may be part of the "cargo no-op build check 8.4 s" recorded for `prompt-prepare`. | `risc0-build-3.0.6/src/lib.rs:820` | every build recompiles `raster-prover` and its dependents | new, measured |
 
 ## 2. What a guest image id depends on today
 
@@ -244,14 +244,16 @@ lands second has to adapt to the other: windows-native adds `commands/audit.rs` 
 `with_user_crate` caller) and a hand-written `rerun-if-changed` list in `build.rs`. Use a separate
 `CARGO_TARGET_DIR` per worktree.
 
-### PR 1 — prep, no id change (small)
-- **Rebuild triggers (P11):** emit `build.rs`'s `rerun-if-changed` for every guest in
-  `[package.metadata.risc0].methods` and for `raster-core`, generated from that list. Then the
-  hand-written list that windows-native adds (which misses `defence`) is unnecessary.
+### PR 1 — prep, no id change (small) — done 2026-11-03 on `feature/path-fixes`
 - **Root workspace:** add `exclude = ["crates/raster-prover/guests"]` to the root `Cargo.toml`.
   The guests keep their own `[workspace]` for now.
-- **Accept:** `cargo build -p raster-prover` rebuilds the guests after an edit to
-  `guests/defence/src` or to `raster-core/src`.
+- **Dropped:** a generated `rerun-if-changed` list. On `main`, measured, the build script already
+  reruns on every build (P11), so the list would change nothing. The real fix belongs in PR 4.
+- **Verified:**
+  - the root workspace's members are unchanged;
+  - all four `*_GUEST_ID`s are unchanged after a real guest build;
+  - each guest still resolves standalone (`cargo metadata` in its directory);
+  - `cargo check --workspace --all-targets` passes.
 
 ### PR 2 — `raster-guest-build` crate, library only, no caller yet (medium)
 
@@ -319,6 +321,10 @@ tile, two checkout copies at different paths with different `$CARGO_HOME`s, equa
 - **`build.rs`:** replace `risc0_build::embed_methods()` with `raster-guest-build`, writing
   `methods.rs` with the same constant names. Keep the `RISC0_SKIP_BUILD` behaviour. Drop the
   `risc0-build` build-dependency.
+- **Always-rebuild (P11):** write `methods.rs` only when its content changes. Emit precise
+  `rerun-if-changed` lines for the guests' path packages, from the same `PathPackages` walk.
+  Accept: a no-op `cargo build -p raster-cli` does not recompile `raster-prover`; it takes
+  3.3 s today.
 - **Locks:** none move. `program_commitment` covers only the manifest, the CFS and the tile ids
   (`ProgramDefinition`, `raster-core/src/program.rs:72-77`). Stored fraud proofs and receipts do
   carry protocol ids, so they stop verifying.
