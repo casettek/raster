@@ -398,7 +398,10 @@ std = ["raster/std"]
 profiling = ["raster/profiling"]
 
 [dependencies]
-raster = {{ path = "../path/to/raster/crates/raster", default-features = false }}
+# Assumes this project sits next to the raster checkout (<dir>/{name} and
+# <dir>/raster). Edit the path if it does not. Use a real directory here, not
+# a symlink: a symlinked path breaks risc0 guest builds.
+raster = {{ path = "../raster/crates/raster", default-features = false }}
 serde = {{ version = "1.0", features = ["derive"] }}
 "#
     );

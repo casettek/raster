@@ -8,6 +8,9 @@ smaller relocation gap in run artifacts.
 Reproduced on `replay-profile` at main `7b8230c`. Every citation is committed code.
 
 Related:
+- [`path-independent-builds.md`](../proposals/path-independent-builds.md) — the proposed fix
+  for §1 and §2 (2026-11-03). It measured that `--remap-path-prefix` alone (§Directions) is not
+  enough, and found the same defect in the protocol guests.
 - [`stage-challenge.md`](../proposals/stage-challenge.md) — open question 6 and §Verification
   ("Anyone defends") record §2's consequence: a defender at another checkout path fails with
   `program identity drift`. That proposal places the fix in program identity, not in its own

@@ -52,6 +52,13 @@ cargo raster init my-project
 cd my-project
 ```
 
+> **Note:** the generated `Cargo.toml` depends on `raster` through
+> `path = "../raster/crates/raster"`, which assumes the project is created next
+> to the raster checkout (`<dir>/raster` and `<dir>/my-project`). Run
+> `cargo raster init` from that parent directory, or edit the path. Keep it a
+> real directory, not a symlink: a symlink in the path breaks risc0 guest builds
+> with a cargo "package collision".
+
 ### 2. Write tiles
 
 ```rust
