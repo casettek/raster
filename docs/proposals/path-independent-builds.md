@@ -431,10 +431,30 @@ tile, two checkout copies at different paths with different `$CARGO_HOME`s, equa
   These suites invoke the CLI many times, and each invocation's cargo build used to recompile
   `raster-prover` (P11), which is the likely main cause. Colder caches in the PR 3 run were not
   ruled out.
-- **Not done:**
-  - `verify_fraud_proof` on a proof from the other worktree, which follows from the equal ids but
-    was not run;
-  - the GPU fraud path.
+- **Cross-checkout checks** (2026-11-03, worktree at `~/.cache/xw/b/defender-raster`, commit
+  `7bbb25d`, its own binary and protocol guests):
+  - **Defence (PR 3's acceptance check).** The claimer ran chain-example in this checkout, and a
+    false challenge against `normalize` (`--forge item`) was admitted. The worktree got only the
+    public bundle (`chain-commitment`, `chain-shape`, `.challenge/{challenge,commit}.bin`, and the
+    stage's input manifest plus `input.json` pointed at its own checkout), with the claimer's run
+    directory hidden. It defended the challenge (refuted). Its defence verified with its own binary
+    and with this checkout's, against this checkout's challenge file.
+  - **`verify_fraud_proof`, dev mode.** A fraud proof made in the worktree (hello-tiles, step 1
+    falsified, window 2) verifies in this checkout: `Finished`, the refuted commitment matches, and
+    `program_commitment` is `8db95fff…`. A fake receipt's `verify` does compare the image id
+    (`risc0-zkvm-3.0.6/src/receipt.rs:188-189`). As a negative control, the committed
+    `examples/hello-tiles/fraud_commit.bin.fraud-proof`, a real proof made with the old guests,
+    fails against the new id ("claim digest does not match").
+  - **GPU.** At risc0's default segment size the transition guest's proof runs out of memory on the
+    RTX 3070 (8 GB, about 2 GB of it held by a running game), the known limit with no env knob in
+    risc0 3.0.6. With a temporary `segment_limit_po2(18)` knob, applied only in the scratch
+    worktree, the real fraud proof built in 157 s (GPU memory peak 7.1 GB). The 3.8 MB composite
+    receipt verifies in this checkout against its `TRANSITION_GUEST_ID`, not in dev mode.
+- **Follow-ups:**
+  - `examples/hello-tiles/fraud_commit.bin.fraud-proof` is a committed artifact that no longer
+    verifies, since PR 4 moved the protocol ids; regenerate or remove it.
+  - A segment-size setting (for example `RASTER_SEGMENT_PO2`) would let 8 GB cards prove the
+    transition guest without a patch.
 
 ### PR 5 — toolchain record, and docs (small) — implemented 2026-11-03 on `feature/path-fixes`
 - **`Raster.lock`:** gains `toolchain.rustc` (`#[serde(default)]`; `format` 2).
