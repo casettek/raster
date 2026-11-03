@@ -67,12 +67,68 @@ pub enum GuestCrate {
         dependencies: Vec<Dependency>,
         main_rs: String,
     },
-    /// An existing guest package in the real directory `dir`, built as the
-    /// stage workspace's only member: a protocol guest. It must not declare a
-    /// `[workspace]` of its own, and every workspace between it and the stage
-    /// root must exclude it. Its `[profile.*]` tables are carried to the stage
-    /// root, where cargo reads profiles.
-    Member { dir: PathBuf },
+    /// An existing guest package in the real directory `dir`, rehomed at the
+    /// stage root: a protocol guest. The stage root's manifest is the guest's
+    /// own, with every `path` dependency rewritten to its stage path and the
+    /// guest's `[workspace]` replaced by the stage's. Every other top-level
+    /// entry of `dir` (`src/`, ...) is linked beside it, so the guest's sources
+    /// are seen as `src/...` and its place in the checkout never reaches the
+    /// image id.
+    ///
+    /// (Making the guest a member of the stage workspace instead would need it
+    /// to drop its own `[workspace]`, and cargo then assigns it to the
+    /// enclosing repository workspace: a root `exclude` is ignored for a
+    /// package nested inside another member's directory, measured 2026-11-03.)
+    Package { dir: PathBuf },
+}
+
+/// The guest manifest's top-level entries that are not linked into the
+/// stage: the stage writes its own manifest and lockfile, and builds into its
+/// own target directory.
+const NOT_LINKED: [&str; 4] = ["Cargo.toml", "Cargo.lock", "target", ".git"];
+
+/// Rewrite every `path` dependency in `manifest` (a guest's, read from `dir`)
+/// to its stage path: `[dependencies]`, `[build-dependencies]`,
+/// `[dev-dependencies]`, their `[target.*]` forms, and `[patch.*]`.
+fn rehome_paths(manifest: &mut toml::Table, dir: &Path, plan: &StagePlan) -> Result<()> {
+    fn rewrite(table: &mut toml::Table, dir: &Path, plan: &StagePlan) -> Result<()> {
+        for (name, dependency) in table.iter_mut() {
+            let Some(dependency) = dependency.as_table_mut() else {
+                continue;
+            };
+            if let Some(path) = dependency.get("path").and_then(|p| p.as_str()) {
+                let real = crate::stage::normalize(&dir.join(path));
+                let staged = plan.stage_relative(&real).map_err(|e| {
+                    Error::Layout(format!("dependency `{name}` ({}): {e}", real.display()))
+                })?;
+                dependency.insert("path".into(), path_string(&staged)?.into());
+            }
+        }
+        Ok(())
+    }
+    const KINDS: [&str; 3] = ["dependencies", "build-dependencies", "dev-dependencies"];
+    for kind in KINDS {
+        if let Some(table) = manifest.get_mut(kind).and_then(|t| t.as_table_mut()) {
+            rewrite(table, dir, plan)?;
+        }
+    }
+    if let Some(targets) = manifest.get_mut("target").and_then(|t| t.as_table_mut()) {
+        for (_, target) in targets.iter_mut() {
+            for kind in KINDS {
+                if let Some(table) = target.get_mut(kind).and_then(|t| t.as_table_mut()) {
+                    rewrite(table, dir, plan)?;
+                }
+            }
+        }
+    }
+    if let Some(patches) = manifest.get_mut("patch").and_then(|t| t.as_table_mut()) {
+        for (_, source) in patches.iter_mut() {
+            if let Some(table) = source.as_table_mut() {
+                rewrite(table, dir, plan)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The stage root's `Cargo.toml` for `krate`.
@@ -135,30 +191,32 @@ pub fn stage_manifest(plan: &StagePlan, krate: &GuestCrate) -> Result<String> {
             profile.insert("release".into(), release.into());
             manifest.insert("profile".into(), profile.into());
         }
-        GuestCrate::Member { dir } => {
-            let member_manifest = dir.join("Cargo.toml");
-            let member: toml::Table = fs::read_to_string(&member_manifest)?
+        GuestCrate::Package { dir } => {
+            let dir = &absolute(dir)?;
+            let guest_manifest = dir.join("Cargo.toml");
+            manifest = fs::read_to_string(&guest_manifest)?
                 .parse()
-                .map_err(|e| Error::Layout(format!("{}: {e}", member_manifest.display())))?;
-            if member.contains_key("workspace") {
+                .map_err(|e| Error::Layout(format!("{}: {e}", guest_manifest.display())))?;
+            if !manifest.contains_key("package") {
                 return Err(Error::Layout(format!(
-                    "{} declares its own [workspace]; a staged guest must be a member of the \
-                     stage workspace (docs/proposals/path-independent-builds.md §4.4)",
-                    member_manifest.display()
+                    "{} is not a package manifest",
+                    guest_manifest.display()
                 )));
             }
-            if let Some(profile) = member.get("profile") {
-                manifest.insert("profile".into(), profile.clone());
-            }
-            workspace.insert(
-                "members".into(),
-                vec![toml::Value::String(path_string(&plan.stage_relative(dir)?)?)].into(),
-            );
+            rehome_paths(&mut manifest, dir, plan)?;
+            // The guest's own `[workspace]`, if any, is replaced by the stage's.
+            manifest.remove("workspace");
         }
     }
     workspace.insert("exclude".into(), entries);
     manifest.insert("workspace".into(), workspace.into());
     toml::to_string(&manifest).map_err(|e| Error::Layout(format!("stage manifest: {e}")))
+}
+
+/// `path` made absolute against the current directory, lexically: symlinks
+/// are kept, as cargo keeps them.
+fn absolute(path: &Path) -> Result<PathBuf> {
+    Ok(crate::stage::normalize(&std::path::absolute(path)?))
 }
 
 /// Forward slashes on every platform: cargo accepts them, and the manifest,
@@ -245,9 +303,28 @@ pub struct GuestBuild<'a> {
 pub fn prepare_stage(stage: &Stage, krate: &GuestCrate, lockfile: Option<&Path>) -> Result<()> {
     let root = stage.root();
     fs::write(root.join("Cargo.toml"), stage_manifest(stage.plan(), krate)?)?;
-    if let GuestCrate::Generated { main_rs, .. } = krate {
-        fs::create_dir_all(root.join("src"))?;
-        fs::write(root.join("src").join("main.rs"), main_rs)?;
+    match krate {
+        GuestCrate::Generated { main_rs, .. } => {
+            fs::create_dir_all(root.join("src"))?;
+            fs::write(root.join("src").join("main.rs"), main_rs)?;
+        }
+        GuestCrate::Package { dir } => {
+            let dir = &absolute(dir)?;
+            for entry in fs::read_dir(dir)? {
+                let name = entry?.file_name();
+                if NOT_LINKED.iter().any(|n| name == *n) {
+                    continue;
+                }
+                let at = root.join(&name);
+                if at.exists() {
+                    return Err(Error::Layout(format!(
+                        "the guest's `{}` collides with a stage entry",
+                        name.to_string_lossy()
+                    )));
+                }
+                crate::stage::link(&dir.join(&name), &at)?;
+            }
+        }
     }
     if let Some(lockfile) = lockfile {
         fs::copy(lockfile, root.join("Cargo.lock"))?;
@@ -273,7 +350,13 @@ impl GuestBuild<'_> {
                 command.env_remove(&key);
             }
         }
+        // A rustc wrapper from the outer build is for the host toolchain: under
+        // `cargo clippy`, RUSTC_WORKSPACE_WRAPPER is clippy-driver, which then
+        // compiles the guest with a sysroot that has no zkVM `std`. A caching
+        // wrapper (sccache) is dropped too: guest output must come from rustc.
         command
+            .env_remove("RUSTC_WRAPPER")
+            .env_remove("RUSTC_WORKSPACE_WRAPPER")
             .env_remove("RUSTUP_TOOLCHAIN")
             .current_dir(root)
             .env("CARGO_HOME", self.cargo_home)
@@ -386,38 +469,74 @@ mod tests {
     }
 
     #[test]
-    fn a_member_guest_is_listed_and_keeps_its_profile() {
+    fn a_package_guest_is_rehomed_with_stage_paths() {
         let tmp = tempfile::tempdir().unwrap();
-        let checkout = tmp.path().join("checkout");
+        let checkout = tmp.path().join("some-checkout");
         let guest = checkout.join("crates/raster-prover/guests/transition");
-        fs::create_dir_all(&guest).unwrap();
+        fs::create_dir_all(guest.join("src")).unwrap();
+        fs::create_dir_all(checkout.join("crates/raster-core")).unwrap();
         fs::write(
             guest.join("Cargo.toml"),
-            "[package]\nname = \"transition-guest\"\nversion = \"0.1.0\"\n\n\
+            "[package]\nname = \"transition-guest\"\nversion = \"0.1.0\"\n\n[workspace]\n\n\
+             [dependencies]\n\
+             raster-core = { path = \"../../../raster-core\", features = [\"std\"] }\n\
+             risc0-zkvm = \"3.0\"\n\n\
+             [target.'cfg(target_os = \"zkvm\")'.dependencies]\n\
+             raster-core-again = { package = \"raster-core\", path = \"../../../raster-core\" }\n\n\
              [profile.release]\nopt-level = 3\nlto = true\n",
         )
         .unwrap();
-        let plan = StagePlan::new(std::slice::from_ref(&checkout), Some(&checkout)).unwrap();
-        let manifest = stage_manifest(&plan, &GuestCrate::Member { dir: guest.clone() }).unwrap();
-        let parsed: toml::Table = manifest.parse().unwrap();
-        assert_eq!(
-            parsed["workspace"]["members"].as_array().unwrap(),
-            &vec![toml::Value::String(
-                "raster/crates/raster-prover/guests/transition".into()
-            )]
-        );
-        assert_eq!(parsed["profile"]["release"]["opt-level"].as_integer(), Some(3));
-        assert!(!parsed.contains_key("package"));
-
-        // A guest with its own [workspace] cannot be a member.
-        fs::write(
-            guest.join("Cargo.toml"),
-            "[package]\nname = \"transition-guest\"\nversion = \"0.1.0\"\n[workspace]\n",
+        let plan = StagePlan::new(
+            &[checkout.clone(), guest.clone()],
+            Some(&checkout),
         )
         .unwrap();
-        let error = stage_manifest(&plan, &GuestCrate::Member { dir: guest })
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("own [workspace]"), "{error}");
+        let manifest = stage_manifest(&plan, &GuestCrate::Package { dir: guest.clone() }).unwrap();
+        let parsed: toml::Table = manifest.parse().unwrap();
+        assert_eq!(parsed["package"]["name"].as_str(), Some("transition-guest"));
+        assert_eq!(
+            parsed["dependencies"]["raster-core"]["path"].as_str(),
+            Some("raster/crates/raster-core")
+        );
+        assert_eq!(
+            parsed["target"]["cfg(target_os = \"zkvm\")"]["dependencies"]["raster-core-again"]["path"]
+                .as_str(),
+            Some("raster/crates/raster-core")
+        );
+        assert_eq!(parsed["dependencies"]["risc0-zkvm"].as_str(), Some("3.0"));
+        assert_eq!(parsed["profile"]["release"]["opt-level"].as_integer(), Some(3));
+        assert_eq!(
+            parsed["workspace"]["exclude"].as_array().unwrap(),
+            &vec![toml::Value::String("raster".into())],
+            "the guest's own [workspace] is replaced by the stage's"
+        );
+        assert!(!manifest.contains("some-checkout"), "{manifest}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preparing_a_package_guest_links_its_sources() {
+        let tmp = tempfile::tempdir().unwrap();
+        let checkout = tmp.path().join("checkout");
+        let guest = checkout.join("guests/g");
+        fs::create_dir_all(guest.join("src")).unwrap();
+        fs::create_dir_all(guest.join("target")).unwrap();
+        fs::write(guest.join("src/main.rs"), "fn main() {}").unwrap();
+        fs::write(guest.join("Cargo.lock"), "# lock").unwrap();
+        fs::write(
+            guest.join("Cargo.toml"),
+            "[package]\nname = \"g\"\nversion = \"0.1.0\"\n[workspace]\n",
+        )
+        .unwrap();
+        let plan = StagePlan::new(&[checkout.clone(), guest.clone()], Some(&checkout)).unwrap();
+        let stage = Stage::create_in(plan, Some(tmp.path())).unwrap();
+        prepare_stage(&stage, &GuestCrate::Package { dir: guest.clone() }, Some(&guest.join("Cargo.lock")))
+            .unwrap();
+        assert_eq!(fs::read_link(stage.root().join("src")).unwrap(), guest.join("src"));
+        assert!(!stage.root().join("target").exists(), "build output is not linked");
+        assert_eq!(fs::read_to_string(stage.root().join("Cargo.lock")).unwrap(), "# lock");
+        assert!(fs::read_to_string(stage.root().join("Cargo.toml"))
+            .unwrap()
+            .contains("name = \"g\""));
     }
 }

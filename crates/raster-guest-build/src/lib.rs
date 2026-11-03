@@ -74,12 +74,14 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// The stage layout for a guest whose path packages are `packages`.
 ///
-/// The entry holding the `raster` workspace, if the guest depends on raster, is
-/// staged as [`RASTER_ENTRY`], so the raster checkout's own directory name
-/// never reaches an image id.
+/// The entry holding the raster workspace is staged as [`RASTER_ENTRY`], so the
+/// raster checkout's own directory name never reaches an image id. A tile
+/// guest finds that workspace through its `raster` dependency; a protocol
+/// guest, which links only `raster-core`, through that.
 pub fn stage_plan(packages: &PathPackages) -> Result<StagePlan> {
-    let raster_root = packages
-        .get("raster")
-        .map(|raster| raster.workspace_root.as_path());
+    let raster_root = ["raster", "raster-core"]
+        .iter()
+        .find_map(|name| packages.get(name))
+        .map(|package| package.workspace_root.as_path());
     StagePlan::new(&packages.workspace_roots(), raster_root)
 }

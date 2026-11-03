@@ -173,14 +173,14 @@ impl Stage {
 }
 
 #[cfg(unix)]
-fn link(target: &Path, at: &Path) -> Result<()> {
+pub(crate) fn link(target: &Path, at: &Path) -> Result<()> {
     std::os::unix::fs::symlink(target, at)?;
     Ok(())
 }
 
 /// Without unix symlinks, copy the tree, minus build output and VCS metadata.
 #[cfg(not(unix))]
-fn link(target: &Path, at: &Path) -> Result<()> {
+pub(crate) fn link(target: &Path, at: &Path) -> Result<()> {
     fn copy(from: &Path, to: &Path) -> std::io::Result<()> {
         std::fs::create_dir_all(to)?;
         for entry in std::fs::read_dir(from)? {

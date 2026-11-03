@@ -33,7 +33,7 @@ Every path-related defect found so far. "New" means it is not in the issue.
 | P8 | The chain runner canonicalizes the stage base directory; direct commands use the path as given. Through a symlink, the same stage gets different ids depending on how it was built. | `raster-cli/src/chain.rs:2823` | ids depend on the entry point | new, minor (goes away with P4's fix) |
 | P9 | Lock drift is only detected at prove time (`program identity drift`); `run --commit` does not check. | `raster-cli/src/program.rs:336` | late, confusing failure | issue §2 |
 | P10 | Run artifacts store absolute paths (`run.json` `project_root`, file inputs). | `raster-cli/src/run_manifest.rs:25` | a run directory cannot be moved | issue §3 — **out of scope** |
-| P11 | Not path-related, found along the way, and *revised 2026-11-03* after measuring. risc0-build registers its own `methods.rs` as a rebuild trigger and rewrites that file on every run. So `raster-prover`'s build script reruns on every build, and `raster-prover` recompiles every time. No guest or `raster-core` edit can be missed: the hand-written `defence` gap on `codex/windows-native` is harmless. The real cost is the opposite: a no-op `cargo build -p raster-cli` takes 3.3 s. That may be part of the "cargo no-op build check 8.4 s" recorded for `prompt-prepare`. | `risc0-build-3.0.6/src/lib.rs:820` | every build recompiles `raster-prover` and its dependents | new, measured |
+| P11 | **Fixed in PR 4** (no-op build 3.3 s → 0.32 s). Not path-related, found along the way, and *revised 2026-11-03* after measuring. risc0-build registers its own `methods.rs` as a rebuild trigger and rewrites that file on every run. So `raster-prover`'s build script reruns on every build, and `raster-prover` recompiles every time. No guest or `raster-core` edit can be missed: the hand-written `defence` gap on `codex/windows-native` is harmless. The real cost is the opposite: a no-op `cargo build -p raster-cli` takes 3.3 s. That may be part of the "cargo no-op build check 8.4 s" recorded for `prompt-prepare`. | `risc0-build-3.0.6/src/lib.rs:820` | every build recompiles `raster-prover` and its dependents | new, measured |
 | P12 | raster's `Cargo.lock` is gitignored and was never committed (iris commits its own). Seeding a tile guest from the project's lockfile (P6) pins versions only where that lockfile is shared. For raster's own examples it is per-machine, so their committed `Raster.lock` ids can still differ between machines. | `.gitignore:5` | example ids depend on each machine's resolve | new, 2026-11-03 |
 
 ## 2. What a guest image id depends on today
@@ -184,23 +184,33 @@ both, rustc received relative source paths.
 
 ### 4.4 Protocol guests (P5, P11)
 
-**Manifest changes.**
-- Remove `[workspace]` from the four guest manifests (`transition`, `authorization`,
-  `chain_fraud`, `defence`).
-- Add `exclude = ["crates/raster-prover/guests"]` to the root `Cargo.toml`.
+*Revised 2026-11-03, after the PR 4 spike.* The first design made each guest a member of the stage
+workspace. That needs the guest to drop its own `[workspace]`, and then cargo assigns it to the
+repository workspace and refuses ("believes it's in a workspace when it's not"). A root `exclude`
+does not help: cargo ignores it for a package nested inside another member's directory, and the
+guests sit inside `crates/raster-prover/`. A two-crate model without the intermediate package
+had passed; the real layout did not.
 
-A guest then still builds standalone in the checkout (measured on the model above), and in a stage
-it becomes a member of the stage workspace (§4.3 step 4). Each guest's committed `Cargo.lock`
-seeds the stage, and the resolved lock is copied back. That keeps today's behaviour, where a guest
-build updates its own lock.
+**Rehoming.** Each guest is rehomed at the stage root instead (`GuestCrate::Package`):
+- the stage root's `Cargo.toml` is the guest's own manifest, with every `path` dependency
+  rewritten to its stage path and its `[workspace]` replaced by the stage's;
+- the guest's other top-level entries (`src/`) are linked beside it.
+
+The guest's sources are then seen as `src/...`, and its place in the checkout never reaches the id.
+The guest manifests stay unchanged and keep their own `[workspace]`, so each guest still builds
+standalone. The root `exclude` added in PR 1 is no longer needed and is reverted. `stage_plan`
+finds the raster checkout through `raster-core` as well as `raster`, since protocol guests link
+only `raster-core`. Each guest's committed `Cargo.lock` seeds its stage, and the resolved lock is
+written back only if it changed.
 
 **Build script.** `build.rs` builds the guests through `raster-guest-build` instead of
-`risc0_build::embed_methods()`, and writes the same `methods.rs` constants, `*_GUEST_ELF` and
-`*_GUEST_ID`. They are the only ones read; `*_PATH` is unused. It computes ids with
-`risc0_binfmt::compute_image_id`, so no build-time `risc0-zkvm` is needed. It keeps
-`RISC0_SKIP_BUILD`'s empty ELF and zero id, which `commands/audit.rs:72` on
-`codex/windows-native` relies on. The `rerun-if-changed`
-list is generated from the guest list, which fixes P11.
+`risc0_build::embed_methods()`. It writes the same `methods.rs` constants, `<NAME>_ELF`,
+`<NAME>_PATH` and `<NAME>_ID`, with ids from `risc0_binfmt::compute_image_id`, so no build-time
+`risc0-zkvm` is needed. It keeps `RISC0_SKIP_BUILD`'s empty ELF and zero id, which
+`commands/audit.rs:72` on `codex/windows-native` relies on. It also fixes P11:
+- `methods.rs` and the packaged `.bin` files are written only when their content changes;
+- the rerun triggers are the guests' path packages' `Cargo.toml`, `src/` and `build.rs`, the
+  guests' lockfiles, and `RISC0_SKIP_BUILD`, `RISC0_RUST_TOOLCHAIN_PATH` and `CARGO_HOME`.
 
 risc0-build cannot do this itself:
 - it removes every `CARGO*` env var before running cargo;
@@ -247,7 +257,8 @@ lands second has to adapt to the other: windows-native adds `commands/audit.rs` 
 
 ### PR 1 — prep, no id change (small) — done 2026-11-03 on `feature/path-fixes`
 - **Root workspace:** add `exclude = ["crates/raster-prover/guests"]` to the root `Cargo.toml`.
-  The guests keep their own `[workspace]` for now.
+  The guests keep their own `[workspace]` for now. *Reverted in PR 4:* cargo ignores this
+  `exclude` for packages nested in `crates/raster-prover/`, and rehoming does not need it (§4.4).
 - **Dropped:** a generated `rerun-if-changed` list. On `main`, measured, the build script already
   reruns on every build (P11), so the list would change nothing. The real fix belongs in PR 4.
 - **Verified:**
@@ -378,17 +389,12 @@ tile, two checkout copies at different paths with different `$CARGO_HOME`s, equa
   - `05-program-bundle-and-manifests.md`;
   - `docs/proposals/zkvm-dry-run.md:76`.
 
-### PR 4 — protocol guests switch over; protocol ids change (medium; spike first)
-- **Spike (half a day):** build the real `transition` guest staged from two worktree paths and
-  compare `TRANSITION_GUEST_ID`. Measured so far only on the minimal model (§4.3).
-- **Guest manifests:** remove `[workspace]` from the four guest manifests (§4.4).
-- **`build.rs`:** replace `risc0_build::embed_methods()` with `raster-guest-build`, writing
-  `methods.rs` with the same constant names. Keep the `RISC0_SKIP_BUILD` behaviour. Drop the
-  `risc0-build` build-dependency.
-- **Always-rebuild (P11):** write `methods.rs` only when its content changes. Emit precise
-  `rerun-if-changed` lines for the guests' path packages, from the same `PathPackages` walk.
-  Accept: a no-op `cargo build -p raster-cli` does not recompile `raster-prover`; it takes
-  3.3 s today.
+### PR 4 — protocol guests switch over; protocol ids change (medium) — implemented 2026-11-03 on `feature/path-fixes`
+- **Spike:** build the real `transition` guest staged from two checkout copies and compare
+  `TRANSITION_GUEST_ID`.
+- **`build.rs`:** replace `risc0_build::embed_methods()` with `raster-guest-build`, keeping the
+  constant names and the `RISC0_SKIP_BUILD` behaviour. Drop the `risc0-build` build-dependency.
+- **Always-rebuild (P11):** see §4.4.
 - **Locks:** none move. `program_commitment` covers only the manifest, the CFS and the tile ids
   (`ProgramDefinition`, `raster-core/src/program.rs:72-77`). Stored fraud proofs and receipts do
   carry protocol ids, so they stop verifying.
@@ -396,6 +402,38 @@ tile, two checkout copies at different paths with different `$CARGO_HOME`s, equa
   - `raster-prover` built from two worktree paths gives equal `*_GUEST_ID`;
   - `verify_fraud_proof` accepts a proof made in the other worktree;
   - the GPU fraud path still proves.
+
+**Outcome (PR 4).**
+- **Spike.** The real `transition` guest, built from copies at `a/raster` and
+  `b/much/deeper/defender-raster`, has the same image id (`e100f900…`, about 30 s each). Neither
+  ELF contains its checkout path or `$CARGO_HOME`. The spike found the member-design failure and
+  led to rehoming (§4.4).
+- **Across checkouts.** This checkout's `build.rs` build gives the spike's `TRANSITION_GUEST_ID`
+  (`[16318689, 920494147, …]`). A git worktree at `/tmp/pr4-check/x/defender-raster`, with this
+  PR's changes applied, built `raster-prover` (113 s from clean) with **all four** `*_GUEST_ID`s
+  identical to this checkout's. The four ids changed once.
+- **No-op builds (P11).** The build script no longer reruns, `raster-prover` is not recompiled,
+  and a no-op `cargo build -p raster-cli` takes 0.32 s instead of 3.3 s.
+- **Under a rustc wrapper.** The first run under `cargo clippy` failed. clippy sets
+  `RUSTC_WORKSPACE_WRAPPER=clippy-driver`; the guest build inherited it and compiled the guest
+  with the host sysroot (`E0463: can't find crate for std`). Guest builds now strip
+  `RUSTC_WRAPPER` and `RUSTC_WORKSPACE_WRAPPER`, which also covers sccache and tile guests.
+  `cargo clippy -p raster-prover` passes.
+- **Lockfiles.** The committed guest lockfiles are unchanged after the build.
+- **Tests, all passing** with the new protocol ids:
+  - `raster-guest-build`: 21 unit tests;
+  - `raster-prover`: 61 tests (9 min);
+  - `cargo test -p raster-cli`: the same counts as in PR 3;
+  - ignored `stage_challenge_cli`: 7 claim, challenge and defend scenarios, in dev mode.
+- **Faster suites.** The CLI suites ran far faster than in PR 3: `chain_repeat_cli` 1207 → 78 s,
+  `show_cli` 641 → 4.5 s, the whole suite 43 min → 150 s, `stage_challenge_cli` 14 min → 93 s.
+  These suites invoke the CLI many times, and each invocation's cargo build used to recompile
+  `raster-prover` (P11), which is the likely main cause. Colder caches in the PR 3 run were not
+  ruled out.
+- **Not done:**
+  - `verify_fraud_proof` on a proof from the other worktree, which follows from the equal ids but
+    was not run;
+  - the GPU fraud path.
 
 ### PR 5 — toolchain record, and docs (small)
 - **`Raster.lock`:** gains `toolchain.rustc` (`#[serde(default)]`; `format` 2).

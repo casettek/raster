@@ -3793,10 +3793,11 @@ dependencies = [
  "raster-backend",
  "raster-compiler",
  "raster-core",
- "risc0-build",
+ "raster-guest-build",
  "risc0-zkvm",
  "serde",
  "sha2",
+ "toml 0.8.23",
 ]
 
 [[package]]
