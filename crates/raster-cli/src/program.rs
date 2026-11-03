@@ -78,6 +78,24 @@ pub struct LockTile {
 pub struct LockToolchain {
     pub risc0: String,
     pub build_mode: String,
+    /// The guest compiler's `rustc -V` line, e.g. `rustc 1.94.1-dev
+    /// (06e01cb0d 2026-04-09)`. Tile image ids depend on it, not only on the
+    /// sources: a lock built by another compiler drifts. Absent in format-1
+    /// locks, and when no risc0 toolchain was installed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rustc: Option<String>,
+}
+
+/// Current `Raster.lock` format. 2: `toolchain.rustc`.
+pub const LOCK_FORMAT: u32 = 2;
+
+/// The `rustc -V` line of the risc0 Rust toolchain tile guests build with: the
+/// same selection `raster-guest-build` makes. `None` when none is installed.
+fn guest_rustc() -> Option<String> {
+    raster_guest_build::Toolchain::find()
+        .ok()?
+        .rustc_version()
+        .ok()
 }
 
 /// Path of `Raster.toml` at the project root.
@@ -210,8 +228,21 @@ pub fn write_program_artifacts(
     std::fs::write(&bin_path, program.canonical_bytes())
         .map_err(|e| Error::Other(format!("failed to write {}: {e}", bin_path.display())))?;
 
+    let rustc = guest_rustc();
+    let lock_path = raster_lock_path(project);
+    if let (Ok(previous), Some(current)) = (read_lock(&lock_path), rustc.as_deref()) {
+        if let Some(recorded) = previous.toolchain.rustc.as_deref() {
+            if recorded != current {
+                eprintln!(
+                    "warning: {} was built with `{recorded}`; this build uses `{current}`. \
+                     Tile image ids depend on the guest compiler, so they may all change.",
+                    lock_path.display()
+                );
+            }
+        }
+    }
     let lock = RasterLock {
-        format: 1,
+        format: LOCK_FORMAT,
         program_commitment: hex::encode(program.commitment()),
         tiles: program
             .tiles
@@ -237,12 +268,13 @@ pub fn write_program_artifacts(
             risc0: option_env!("RISC0_VERSION")
                 .map(str::to_string)
                 .unwrap_or_else(|| format!("risc0-zkvm-{}", risc0_zkvm::VERSION)),
-            // Local builds are dev-grade; docker reproducible builds are future
-            // work (see program-identity.md).
+            // Local, but path-independent (path-independent-builds.md): equal
+            // ids from any checkout path, given the same sources, Cargo.lock
+            // and guest compiler (`rustc`).
             build_mode: "local".to_string(),
+            rustc,
         },
     };
-    let lock_path = raster_lock_path(project);
     let lock_json = serde_json::to_string_pretty(&lock)
         .map_err(|e| Error::Other(format!("failed to serialize Raster.lock: {e}")))?;
     std::fs::write(&lock_path, lock_json + "\n")
@@ -331,13 +363,34 @@ fn check_lock_drift(program: &ProgramDefinition, lock_path: &Path) -> Result<()>
     }
     let lock = read_lock(lock_path)?;
     let recomputed = hex::encode(program.commitment());
-    if recomputed != lock.program_commitment {
-        return Err(Error::Other(format!(
-            "program identity drift: reassembled commitment {recomputed} != Raster.lock {} — run `cargo raster build --backend risc0`",
-            lock.program_commitment
-        )));
+    match drift_error(&lock, &recomputed, guest_rustc().as_deref()) {
+        Some(message) => Err(Error::Other(message)),
+        None => Ok(()),
     }
-    Ok(())
+}
+
+/// The drift error for `lock` against the `recomputed` commitment, if they
+/// differ. When the lock records a different guest compiler than
+/// `current_rustc`, the error says so: that alone moves every tile id, and
+/// rebuilding the lock is then the wrong remedy for a verifier.
+fn drift_error(lock: &RasterLock, recomputed: &str, current_rustc: Option<&str>) -> Option<String> {
+    if recomputed == lock.program_commitment {
+        return None;
+    }
+    let mut message = format!(
+        "program identity drift: reassembled commitment {recomputed} != Raster.lock {}",
+        lock.program_commitment
+    );
+    match (lock.toolchain.rustc.as_deref(), current_rustc) {
+        (Some(recorded), Some(current)) if recorded != current => message.push_str(&format!(
+            ". Raster.lock was built with guest compiler `{recorded}`, this machine has \
+             `{current}`, and tile image ids depend on it: install the lock's toolchain \
+             (`rzup install rust <version>`) to reproduce it, or run \
+             `cargo raster build --backend risc0` to replace it"
+        )),
+        _ => message.push_str(" — run `cargo raster build --backend risc0`"),
+    }
+    Some(message)
 }
 
 #[cfg(test)]
@@ -440,6 +493,7 @@ encoding = "raster"
             toolchain: LockToolchain {
                 risc0: "test".to_string(),
                 build_mode: "local".to_string(),
+                rustc: None,
             },
         };
         std::fs::write(&lock_path, serde_json::to_string_pretty(&lock).unwrap()).unwrap();
@@ -458,6 +512,52 @@ encoding = "raster"
         std::fs::remove_file(&lock_path).unwrap();
         assert!(check_lock_drift(&program, &lock_path).is_ok());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn lock_with(commitment: [u8; 32], rustc: Option<&str>) -> RasterLock {
+        RasterLock {
+            format: LOCK_FORMAT,
+            program_commitment: hex::encode(commitment),
+            tiles: Default::default(),
+            toolchain: LockToolchain {
+                risc0: "test".to_string(),
+                build_mode: "local".to_string(),
+                rustc: rustc.map(str::to_string),
+            },
+        }
+    }
+
+    #[test]
+    fn drift_names_both_guest_compilers_when_they_differ() {
+        let recomputed = hex::encode([1u8; 32]);
+        let old = "rustc 1.93.0-dev (aaaaaaaaa 2026-01-01)";
+        let new = "rustc 1.94.1-dev (06e01cb0d 2026-04-09)";
+
+        assert_eq!(drift_error(&lock_with([1u8; 32], Some(old)), &recomputed, Some(new)), None,
+            "an equal commitment is not drift, whatever the compilers");
+
+        let message = drift_error(&lock_with([2u8; 32], Some(old)), &recomputed, Some(new)).unwrap();
+        assert!(message.contains(old) && message.contains(new), "{message}");
+        assert!(message.contains("rzup install rust"), "{message}");
+
+        for (recorded, current) in [(Some(new), Some(new)), (None, Some(new)), (Some(old), None)] {
+            let message = drift_error(&lock_with([2u8; 32], recorded), &recomputed, current).unwrap();
+            assert!(message.contains("run `cargo raster build --backend risc0`"), "{message}");
+            assert!(!message.contains("guest compiler"), "{message}");
+        }
+    }
+
+    /// A format-1 lock, without `toolchain.rustc`, still parses.
+    #[test]
+    fn format_one_locks_still_parse() {
+        let lock: RasterLock = serde_json::from_str(
+            r#"{"format":1,"program_commitment":"00","tiles":{},
+                "toolchain":{"risc0":"risc0-zkvm-3.0.6","build_mode":"local"}}"#,
+        )
+        .unwrap();
+        assert_eq!(lock.toolchain.rustc, None);
+        let written = serde_json::to_string(&lock_with([0u8; 32], None)).unwrap();
+        assert!(!written.contains("rustc"), "an unknown compiler is omitted: {written}");
     }
 
     #[test]

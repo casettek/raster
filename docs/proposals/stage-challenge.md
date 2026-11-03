@@ -786,7 +786,7 @@ Phases 2–3 depend on Phase 1 and on nothing else unbuilt.
   drift`, on both `normalize` and `aggregate`. The tile ELFs embed the checkout path of `raster`
   and `raster-core` sources (panic locations), so the same source built elsewhere gets other
   image ids and another `program_commitment`. A defender who re-locks would fail `defend`'s
-  `AnotherProgram` check instead.
+  `AnotherProgram` check instead. *Fixed 2026-11-03: see open question 6.*
 - **Recur stage** *(done, 2026-10-29)*. A challenge on iris `prefill_range_l0` (2043 items, window
   128), whose terminal window opens mid-loop, can be defended both ways (S3 closed by
   `window-seed-reconstruction`).
@@ -909,3 +909,8 @@ At the protocol window, the same stage end to end (`chain challenge` on the tamp
    protocol. Candidates are path-independent tile builds (`--remap-path-prefix` for the
    checkout and `$CARGO_HOME`, or risc0's Docker build) and a recorded, rebuildable build
    environment. Either changes every `program_commitment` once.
+   **Resolved 2026-11-03** by [`path-independent-builds`](./path-independent-builds.md), with
+   staged builds rather than either candidate (a remap alone was measured insufficient). A worktree
+   at `/tmp/pr3-check/x/y/defender-raster` built a hello-tiles `Raster.lock` byte-identical to the
+   claimer's checkout, and all seven `stage_challenge_cli` scenarios pass. A defender still needs
+   the claimer's `Cargo.lock` and guest compiler; `Raster.lock` records the compiler.

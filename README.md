@@ -55,9 +55,12 @@ cd my-project
 > **Note:** the generated `Cargo.toml` depends on `raster` through
 > `path = "../raster/crates/raster"`, which assumes the project is created next
 > to the raster checkout (`<dir>/raster` and `<dir>/my-project`). Run
-> `cargo raster init` from that parent directory, or edit the path. Keep it a
-> real directory, not a symlink: a symlink in the path breaks risc0 guest builds
-> with a cargo "package collision".
+> `cargo raster init` from that parent directory, or edit the path. cargo
+> resolves it, so any dependency form works, including one inherited from a
+> workspace or reached through a symlink. Tile image ids do not depend on where
+> the checkouts live. They do depend on the project's directory name and its
+> position relative to raster, on the `Cargo.lock`, and on the guest compiler
+> (see [path-independent builds](docs/proposals/path-independent-builds.md)).
 
 ### 2. Write tiles
 

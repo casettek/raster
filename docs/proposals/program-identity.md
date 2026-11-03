@@ -374,10 +374,12 @@ program-blind** — a clean separation of concerns:
 Honest caveat: tile image ids embed the risc0 toolchain and the full dependency graph
 (including the raster runtime itself), so program identity is
 `source ⊗ toolchain ⊗ deps`, not source alone — the same source under two raster versions
-is two program identities. Local builds are dev-grade (machine-local ids, sufficient for
-self-audit on one machine); third-party re-derivation of identity from source requires
-risc0 docker deterministic builds + pinned deps, and `Raster.lock` records
-toolchain/build_mode so a mismatch is *detectable* rather than silent.
+is two program identities. Local builds were dev-grade (machine-local ids) until 2026-11-03.
+Since [`path-independent-builds`](./path-independent-builds.md), a local build's ids depend on the
+sources, the `Cargo.lock` and the guest compiler, not on the checkout path, the user or
+`$CARGO_HOME`, so a third party with the same three re-derives the same identity. `Raster.lock`
+records the compiler (`toolchain.rustc`, format 2), so a toolchain mismatch is named, not only
+detected. Docker builds remain the way to pin the toolchain itself.
 
 ## Resulting shape
 

@@ -1,5 +1,5 @@
 {
-  "format": 1,
+  "format": 2,
   "program_commitment": "0c29276d6b53eb7a94a84c9d81580d9361a9bf13a29dff7e189eba6f4df6d93f",
   "tiles": {
     "build_report": {
@@ -13,6 +13,7 @@
   },
   "toolchain": {
     "risc0": "risc0-zkvm-3.0.6",
-    "build_mode": "local"
+    "build_mode": "local",
+    "rustc": "rustc 1.94.1-dev (06e01cb0d 2026-04-09)"
   }
 }

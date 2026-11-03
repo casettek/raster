@@ -131,6 +131,25 @@ impl Toolchain {
         self.dir.join("bin").join(exe("rustc"))
     }
 
+    /// The guest compiler's `rustc -V` line, e.g.
+    /// `rustc 1.94.1-dev (06e01cb0d 2026-04-09)`. It names the exact compiler
+    /// commit and no host platform, so it is what a `Raster.lock` records: tile
+    /// image ids depend on it.
+    pub fn rustc_version(&self) -> Result<String> {
+        let output = std::process::Command::new(self.rustc())
+            .arg("-V")
+            .output()
+            .map_err(|e| Error::Toolchain(format!("{}: {e}", self.rustc().display())))?;
+        if !output.status.success() {
+            return Err(Error::Toolchain(format!(
+                "{} -V failed: {}",
+                self.rustc().display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
     /// rzup's default C++ toolchain compiler, as risc0-build sets `CC`.
     pub fn cc() -> Option<PathBuf> {
         let rzup = rzup::Rzup::new().ok()?;
@@ -173,5 +192,32 @@ mod tests {
         std::fs::write(dir.join("bin").join(exe("rustc")), "").unwrap();
         let toolchain = Toolchain::from_dir(&dir).unwrap();
         assert_eq!(toolchain.id, "v9.9.9-rust-test");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_rustc_version_is_its_v_line() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("v9.9.9-rust-test");
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        std::fs::write(dir.join("bin/cargo"), "").unwrap();
+        let rustc = dir.join("bin/rustc");
+        std::fs::write(&rustc, "#!/bin/sh\necho 'rustc 9.9.9-dev (abcdef012 2030-01-01)'\n").unwrap();
+        std::fs::set_permissions(&rustc, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let toolchain = Toolchain::from_dir(&dir).unwrap();
+        // Executing a file just written can fail with ETXTBSY while a parallel
+        // test forks; a real toolchain's rustc is never freshly written.
+        let version = (0..50)
+            .find_map(|_| match toolchain.rustc_version() {
+                Err(e) if e.to_string().contains("busy") => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    None
+                }
+                other => Some(other),
+            })
+            .expect("rustc stayed busy")
+            .unwrap();
+        assert_eq!(version, "rustc 9.9.9-dev (abcdef012 2030-01-01)");
     }
 }

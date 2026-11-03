@@ -1,7 +1,8 @@
 # Proposal: `path-independent-builds` — guest image ids that do not depend on where things live
 
-Status: proposed 2026-11-03 — **mechanism measured** (§3), not implemented. Citations are against
-`main` at `7cfc909`. Files that exist only on `codex/windows-native` (`commands/audit.rs`,
+Status: **implemented** 2026-11-03 on `feature/path-fixes` (PR 1–5, §6), after the mechanism was
+measured (§3). Still open: §9's questions, iris re-locking, and the checks §6 lists as not run.
+Citations are against `main` at `7cfc909`. Files that exist only on `codex/windows-native` (`commands/audit.rs`,
 `utils/native_build.rs`) are marked as such.
 
 Related:
@@ -435,7 +436,7 @@ tile, two checkout copies at different paths with different `$CARGO_HOME`s, equa
     was not run;
   - the GPU fraud path.
 
-### PR 5 — toolchain record, and docs (small)
+### PR 5 — toolchain record, and docs (small) — implemented 2026-11-03 on `feature/path-fixes`
 - **`Raster.lock`:** gains `toolchain.rustc` (`#[serde(default)]`; `format` 2).
 - **Checking:** build warns on a lock and toolchain mismatch; prove fails with a message that
   names both toolchains.
@@ -444,6 +445,33 @@ tile, two checkout copies at different paths with different `$CARGO_HOME`s, equa
   - update `program-identity.md:377` and `stage-challenge.md` open question 6;
   - state in the README note that only the relative layout matters, and that the raster checkout
     may be named anything.
+
+**Outcome (PR 5).**
+- **What the lock records.** `LockToolchain.rustc` holds the guest compiler's `rustc -V` line,
+  e.g. `rustc 1.94.1-dev (06e01cb0d 2026-04-09)`. That line names the compiler commit and no host
+  platform. It comes from `Toolchain::rustc_version` in `raster-guest-build`, using the same
+  selection the guests build with. The field is optional, so format-1 locks still parse; the lock
+  `format` is now 2.
+- **Build.** Before overwriting a lock that records a different compiler, `build` warns that tile
+  ids may all change.
+- **Prove.** On drift, the error names both compilers and tells a verifier to install the lock's
+  toolchain (`rzup install rust <version>`), not to rebuild the lock. With the same or an unknown
+  compiler the message is unchanged. The message is a pure function (`drift_error`), with unit
+  tests.
+- **Locks.** All six committed locks were regenerated: `format` 1 → 2 and the new `rustc`. Every
+  image id and `program_commitment` is unchanged.
+- **Docs.**
+  - The issue's §1–§2 are marked fixed.
+  - Updated: `program-identity.md`'s caveat, `stage-challenge.md` open question 6 and its
+    §Verification note, `settlement-layer.md` §5 and its prerequisite list.
+  - The spec pages `2-compile/03`, `04` and `05` and `zkvm-dry-run.md:76` no longer name removed
+    functions.
+  - The README note and the `cargo raster init` template no longer say a symlinked raster path
+    breaks guest builds; since PR 3 it does not.
+- **A flaky test, fixed.** The new `rustc_version` test executes a script it has just written.
+  Under parallel tests that can fail with ETXTBSY: a sibling test's fork briefly holds the file
+  open. It failed once in 21 runs; the test now retries that error. A real toolchain's `rustc` is
+  never freshly written.
 
 ### Outside this repository, after PR 3 and PR 4
 - **iris:** re-lock all ten `raster-stages/*/Raster.lock` (the user commits in iris).

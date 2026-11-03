@@ -73,8 +73,8 @@ in the trace:
 5. record the session's segment vector for §5.
 
 `--dry-run` composes with `--commit` and conflicts with nothing. It requires the RISC0
-toolchain, and should degrade to a clear diagnostic — not a panic — when `find_risc0_cargo`
-returns `None`.
+toolchain, and should degrade to a clear diagnostic — not a panic — when no toolchain is
+found (`raster_guest_build::Toolchain::find` fails; `find_risc0_cargo` before 2026-11-03).
 
 ### Not windowed
 

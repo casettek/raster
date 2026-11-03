@@ -3711,6 +3711,7 @@ dependencies = [
  "raster-backend-risc0",
  "raster-compiler",
  "raster-core",
+ "raster-guest-build",
  "raster-prover",
  "raster-runtime",
  "rayon",
