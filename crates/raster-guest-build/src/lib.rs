@@ -35,7 +35,8 @@ mod stage;
 
 pub use fingerprint::{Fingerprint, Scope};
 pub use guest::{
-    prepare_stage, stage_manifest, BuildOutput, Dependency, GuestBinary, GuestBuild, GuestCrate,
+    path_string, prepare_stage, stage_manifest, BuildOutput, Dependency, GuestBinary, GuestBuild,
+    GuestCrate,
 };
 pub use packages::{PathPackage, PathPackages};
 pub use recipe::{

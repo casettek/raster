@@ -10,9 +10,9 @@
 use std::path::{Path, PathBuf};
 
 use raster_guest_build::{
-    cargo_home, prepare_stage, stage_manifest, stage_plan, Dependency, Fingerprint, GuestBinary,
-    GuestBuild, GuestCrate, PathPackage, PathPackages, Scope, Stage, StagePlan, Toolchain,
-    TARGET,
+    cargo_home, path_string, prepare_stage, stage_manifest, stage_plan, Dependency, Fingerprint,
+    GuestBinary, GuestBuild, GuestCrate, PathPackage, PathPackages, Scope, Stage, StagePlan,
+    Toolchain, TARGET,
 };
 
 /// Everything needed to build any tile guest of one project, resolved once.
@@ -23,7 +23,11 @@ pub struct GuestBuilder {
     target_dir: PathBuf,
     /// The user crate: the project's package.
     user: PathPackage,
-    raster: PathPackage,
+    /// The guest's `raster` dependency path, exactly as the user crate's own
+    /// manifests resolve it inside the stage: a stage path, or an absolute
+    /// path outside it when the project names raster absolutely. Any other
+    /// path would be a second `raster` package to cargo.
+    raster_dependency: String,
     plan: StagePlan,
     lockfile: Option<PathBuf>,
     /// `None` when no risc0 toolchain is installed: cached guests still load,
@@ -41,7 +45,8 @@ impl GuestBuilder {
     pub fn resolve(output_dir: &Path, user_crate_path: &Path) -> Result<Self, String> {
         let manifest = user_crate_path.join("Cargo.toml");
         let packages = PathPackages::resolve(&manifest).map_err(|e| e.to_string())?;
-        let raster = packages.require("raster").map_err(|e| e.to_string())?.clone();
+        // A guest needs `raster` as a local path dependency.
+        packages.require("raster").map_err(|e| e.to_string())?;
         let plan = stage_plan(&packages).map_err(|e| e.to_string())?;
         if packages.lockfile.is_none() {
             eprintln!(
@@ -53,15 +58,39 @@ impl GuestBuilder {
         let mut builder = Self {
             target_dir: output_dir.join("guest-target"),
             user: packages.root.clone(),
-            raster,
+            raster_dependency: String::new(),
             plan,
             lockfile: packages.lockfile.clone(),
             toolchain: Toolchain::find().ok(),
             cargo_home: cargo_home().map_err(|e| e.to_string())?,
             fingerprint: String::new(),
         };
+        builder.raster_dependency = builder.resolve_raster_dependency()?;
         builder.fingerprint = builder.compute_fingerprint()?;
         Ok(builder)
+    }
+
+    /// Where the user crate itself resolves `raster` inside a stage: from a
+    /// probe guest that depends on the user crate alone.
+    fn resolve_raster_dependency(&self) -> Result<String, String> {
+        let error = |e: raster_guest_build::Error| e.to_string();
+        let stage = Stage::create(self.plan.clone()).map_err(error)?;
+        let probe = GuestCrate::Generated {
+            package: "raster-guest-probe".into(),
+            dependencies: vec![
+                Dependency::version("risc0-zkvm", "3.0"),
+                Dependency::path(&self.user.name, &self.user.dir).no_default_features(),
+            ],
+            main_rs: String::new(),
+        };
+        prepare_stage(&stage, &probe, self.lockfile.as_deref()).map_err(error)?;
+        let staged = PathPackages::resolve_for_target(&stage.root().join("Cargo.toml"), Some(TARGET))
+            .map_err(error)?;
+        let raster = staged.require("raster").map_err(error)?;
+        match raster.dir.strip_prefix(stage.root()) {
+            Ok(relative) => path_string(relative).map_err(error),
+            Err(_) => Ok(raster.dir.display().to_string()),
+        }
     }
 
     /// A key over everything a tile guest compiles besides the tile's own
@@ -109,7 +138,7 @@ impl GuestBuilder {
                 // `digest/std` via risc0-groth16 → ark): a duplicate
                 // `panic_impl` (E0152).
                 Dependency::version("risc0-zkvm", "3.0"),
-                Dependency::path("raster", &self.raster.dir).no_default_features(),
+                Dependency::literal("raster", &self.raster_dependency).no_default_features(),
                 // No default features: the user crate's `std` feature pulls in
                 // the host runtime.
                 Dependency::path(&self.user.name, &self.user.dir).no_default_features(),
@@ -139,14 +168,29 @@ impl GuestBuilder {
         );
         fingerprint.bytes("main.rs", self.generate_guest_main(PLACEHOLDER).as_bytes());
         fingerprint.bytes("external", guest.external.join("\n").as_bytes());
+        let mut outside = Vec::new();
         for package in guest.packages.iter().filter(|p| p.dir != guest.root.dir) {
-            let label = package
-                .dir
-                .strip_prefix(stage.root())
-                .map_err(|_| format!("{} resolved outside the stage", package.dir.display()))?;
+            // A package outside the stage is named by an absolute path in some
+            // manifest; it is keyed (and compiled) by that absolute path.
+            let label = match package.dir.strip_prefix(stage.root()) {
+                Ok(relative) => relative.to_string_lossy().into_owned(),
+                Err(_) => {
+                    outside.push(package.name.as_str());
+                    package.dir.to_string_lossy().into_owned()
+                }
+            };
             fingerprint
-                .package(&label.to_string_lossy(), &package.dir, Scope::Library)
+                .package(&label, &package.dir, Scope::Library)
                 .map_err(error)?;
+        }
+        if !outside.is_empty() {
+            eprintln!(
+                "warning: `{}` reaches {} by an absolute path; its tile image ids will depend \
+                 on where {}. Use a relative path for ids that do not",
+                self.user.name,
+                outside.join(", "),
+                if outside.len() == 1 { "it lives" } else { "they live" }
+            );
         }
         Ok(fingerprint.finish_hex()[..16].to_string())
     }
@@ -272,12 +316,72 @@ mod tests {
 
         let builder = GuestBuilder::resolve(&tmp.path().join("out"), &workspace.join("app"))
             .unwrap_or_else(|e| panic!("{e}"));
-        // As cargo names it: through the symlink, not canonicalized.
-        assert_eq!(builder.raster.dir, tmp.path().join("raster/crates/raster"));
+        // As the project's own manifest reaches it, through the symlinked
+        // sibling: a stage path, not the canonical checkout.
+        assert_eq!(builder.raster_dependency, "raster/crates/raster");
         assert_eq!(builder.user.name, "hello-tiles");
         let names: Vec<&str> = builder.plan.entries().iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, vec!["raster", "ws"]);
         assert_eq!(builder.fingerprint().len(), 16);
+    }
+
+    /// A sibling project whose raster checkout is not named `raster`. Its
+    /// manifest names the checkout, so the stage must too: staging it as
+    /// `raster` left `../raster-main/...` dangling inside the stage.
+    #[cfg(unix)]
+    #[test]
+    fn a_renamed_sibling_checkout_resolves() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(repository(), tmp.path().join("raster-main")).unwrap();
+        let project = tmp.path().join("app");
+        app(
+            &project,
+            r#"raster = { path = "../raster-main/crates/raster", default-features = false }"#,
+        );
+        write(&project.join("Cargo.toml"), &format!(
+            "{}\n[workspace]\n",
+            fs::read_to_string(project.join("Cargo.toml")).unwrap()
+        ));
+        fs::rename(tmp.path().join("Cargo.lock"), project.join("Cargo.lock")).unwrap();
+
+        let builder = GuestBuilder::resolve(&tmp.path().join("out"), &project)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let names: Vec<&str> = builder.plan.entries().iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["app", "raster-main"], "the checkout keeps its name");
+        assert_eq!(builder.raster_dependency, "raster-main/crates/raster");
+    }
+
+    /// A project naming raster by an absolute path. Cargo resolves that path to
+    /// the real checkout, so the guest must name the same one: a stage path
+    /// alongside it would be a second `raster` package.
+    #[cfg(unix)]
+    #[test]
+    fn an_absolute_raster_path_resolves_without_a_second_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let checkout = tmp.path().join("elsewhere/raster");
+        fs::create_dir_all(checkout.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(repository(), &checkout).unwrap();
+        let project = tmp.path().join("app");
+        app(
+            &project,
+            &format!(
+                r#"raster = {{ path = "{}", default-features = false }}"#,
+                checkout.join("crates/raster").display()
+            ),
+        );
+        write(&project.join("Cargo.toml"), &format!(
+            "{}\n[workspace]\n",
+            fs::read_to_string(project.join("Cargo.toml")).unwrap()
+        ));
+        fs::rename(tmp.path().join("Cargo.lock"), project.join("Cargo.lock")).unwrap();
+
+        let builder = GuestBuilder::resolve(&tmp.path().join("out"), &project)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            builder.raster_dependency,
+            checkout.join("crates/raster").display().to_string(),
+            "the guest names raster exactly as the project does"
+        );
     }
 
     #[test]

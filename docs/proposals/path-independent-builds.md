@@ -145,11 +145,21 @@ workspace root inside a stage entry.
    itself in W, move it up one level. A must sit strictly above every workspace root.
 3. **Build the stage.** Create a fresh temp directory as the **stage**. For each top-level entry
    under A that contains an element of W, link `stage/<name>` to `A/<entry>`: a symlink on Unix, a
-   copy without `target/` elsewhere. The entry that contains the `raster` package is **always
-   named `raster`**; the others keep their real names.
+   copy without `target/` elsewhere. Entries keep their real names, except one case. When the
+   raster checkout is the **only** entry (an in-repo example, a protocol guest), it is staged as
+   `raster`, so the checkout's own name never reaches an id. *Revised 2026-11-04 after review:*
+   the first version always renamed it, which broke a sibling project depending on
+   `../raster-main/crates/raster`. Inside the stage, that path named an entry that did not exist,
+   and `compute_fingerprint` failed before any build. A sibling's manifests name the checkout, so
+   the name is part of its source anyway.
 4. **Write the stage root `Cargo.toml`.** It has `[workspace] exclude = [<names>]`, and:
    - for a **tile guest**, it is also the generated guest package, with dependencies by relative
-     path, such as `raster = { path = "raster/crates/raster" }`;
+     path, such as `raster = { path = "raster/crates/raster" }`. The guest's `raster` path is taken
+     from a probe resolve: the user crate's own manifests, resolved inside the stage. That gives
+     the stage path in the layouts above. When the project names raster by an **absolute** path it
+     gives that absolute path, so cargo never sees a second `raster` package (that case had also
+     regressed to a "package collision"). Those ids then depend on raster's location, and the
+     build warns;
    - for a **protocol guest**, it has no package and sets
      `members = ["raster/crates/raster-prover/guests/<g>"]` (§4.4).
 5. **Seed the lockfile.** Copy the right `Cargo.lock` to `stage/Cargo.lock` (P6): the project
@@ -170,7 +180,8 @@ Once this lands:
   (P8).
 - **It still depends on:**
   - the relative layout beneath A;
-  - the real names of entries other than `raster`, such as `iris` (open question 1);
+  - in a sibling layout, the real entry names, such as `iris` and the raster checkout's name
+    (open question 1), which the project's manifests spell out anyway;
   - the toolchain (§4.5);
   - the lockfile.
 

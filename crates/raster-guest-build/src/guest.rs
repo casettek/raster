@@ -25,6 +25,8 @@ enum Source {
     Version(String),
     /// A real directory; written as its stage-relative path.
     Path(PathBuf),
+    /// A path written exactly as given.
+    Literal(String),
 }
 
 impl Dependency {
@@ -36,6 +38,14 @@ impl Dependency {
     /// A path dependency on the package in the real directory `dir`.
     pub fn path(name: &str, dir: &Path) -> Self {
         Self::new(name, Source::Path(dir.to_path_buf()))
+    }
+
+    /// A path dependency written exactly as `path`: a stage-relative path, or
+    /// an absolute one outside the stage. For naming a package exactly as
+    /// another staged package's manifest resolves it, so cargo sees one
+    /// package and not two.
+    pub fn literal(name: &str, path: &str) -> Self {
+        Self::new(name, Source::Literal(path.into()))
     }
 
     pub fn no_default_features(mut self) -> Self {
@@ -165,6 +175,9 @@ pub fn stage_manifest(plan: &StagePlan, krate: &GuestCrate) -> Result<String> {
                     Source::Path(dir) => {
                         dep.insert("path".into(), path_string(&plan.stage_relative(dir)?)?.into());
                     }
+                    Source::Literal(path) => {
+                        dep.insert("path".into(), path.clone().into());
+                    }
                 }
                 if !dependency.default_features {
                     dep.insert("default-features".into(), false.into());
@@ -221,7 +234,7 @@ fn absolute(path: &Path) -> Result<PathBuf> {
 
 /// Forward slashes on every platform: cargo accepts them, and the manifest,
 /// which a fingerprint may hash, stays the same everywhere.
-fn path_string(path: &Path) -> Result<String> {
+pub fn path_string(path: &Path) -> Result<String> {
     let parts: Option<Vec<&str>> = path.components().map(|c| c.as_os_str().to_str()).collect();
     parts
         .map(|parts| parts.join("/"))

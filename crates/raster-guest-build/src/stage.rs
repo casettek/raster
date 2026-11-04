@@ -22,11 +22,18 @@ pub struct StageEntry {
 ///
 /// Let A be the common ancestor of the workspace roots, moved up one level if
 /// it is itself one of them. Each top-level entry under A that holds a
-/// workspace root is staged under its own name, except the one holding the
-/// `raster` workspace, which is staged as [`RASTER_ENTRY`]. A sits strictly
-/// above every workspace root so the stage root's own manifest never replaces
-/// one: raster's root manifest carries the `[workspace.dependencies]` its
-/// crates inherit.
+/// workspace root is staged under its own name. A sits strictly above every
+/// workspace root so the stage root's own manifest never replaces one:
+/// raster's root manifest carries the `[workspace.dependencies]` its crates
+/// inherit.
+///
+/// When the raster workspace's entry is the **only** entry (an in-repo example,
+/// a protocol guest), it is staged as [`RASTER_ENTRY`], so the checkout's own
+/// directory name never reaches an image id. With more than one entry (a
+/// sibling project) every entry keeps its real name: the sibling's manifests
+/// reach raster through it (`../raster-main/crates/raster`), and renaming it
+/// would leave those paths dangling inside the stage. The name is then part of
+/// the project's source anyway.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StagePlan {
     ancestor: PathBuf,
@@ -62,26 +69,19 @@ impl StagePlan {
                 .to_path_buf();
         }
 
-        let raster_entry = raster_root.map(|r| top_entry(&ancestor, &normalize(r)));
         let mut by_name: BTreeMap<String, PathBuf> = BTreeMap::new();
         for root in &roots {
             let entry = top_entry(&ancestor, root);
-            let name = if raster_entry.as_ref() == Some(&entry) {
-                RASTER_ENTRY.to_string()
-            } else {
-                entry.to_str().map(str::to_string).ok_or_else(|| {
-                    Error::Layout(format!("{} is not valid UTF-8", entry.to_string_lossy()))
-                })?
-            };
-            let target = ancestor.join(&entry);
-            if let Some(previous) = by_name.insert(name.clone(), target.clone()) {
-                if previous != target {
-                    return Err(Error::Layout(format!(
-                        "both {} and {} would be staged as `{name}`",
-                        previous.display(),
-                        target.display()
-                    )));
-                }
+            let name = entry.to_str().map(str::to_string).ok_or_else(|| {
+                Error::Layout(format!("{} is not valid UTF-8", entry.to_string_lossy()))
+            })?;
+            by_name.insert(name, ancestor.join(&entry));
+        }
+        // Rename only when nothing else in the stage can name the checkout.
+        if let (1, Some(raster_root)) = (by_name.len(), raster_root) {
+            let target = by_name.values().next().expect("one entry").clone();
+            if normalize(raster_root).starts_with(&target) {
+                by_name = BTreeMap::from([(RASTER_ENTRY.to_string(), target)]);
             }
         }
 
@@ -319,14 +319,28 @@ mod tests {
         assert_eq!(names(&plan), vec![("pkg", Path::new("/a/b/pkg"))]);
     }
 
+    /// A sibling project reaching a checkout named `raster-main`: the
+    /// checkout keeps its name, which the project's manifests use.
     #[test]
-    fn a_name_collision_with_raster_is_an_error() {
+    fn a_sibling_layout_keeps_the_checkout_name() {
         let raster = p("/p/raster-main");
+        let app = p("/p/app");
+        let plan = StagePlan::new(&[raster.clone(), app.clone()], Some(&raster)).unwrap();
+        assert_eq!(
+            names(&plan),
+            vec![("app", app.as_path()), ("raster-main", raster.as_path())]
+        );
+        assert_eq!(
+            plan.stage_relative(&raster.join("crates/raster")).unwrap(),
+            p("raster-main/crates/raster")
+        );
+        // A second directory really named `raster` is just another entry.
         let other = p("/p/raster");
-        let error = StagePlan::new(&[raster.clone(), other], Some(&raster))
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("staged as `raster`"), "{error}");
+        let plan = StagePlan::new(&[raster.clone(), other.clone()], Some(&raster)).unwrap();
+        assert_eq!(
+            names(&plan),
+            vec![("raster", other.as_path()), ("raster-main", raster.as_path())]
+        );
     }
 
     #[test]
