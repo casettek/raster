@@ -160,6 +160,88 @@ impl Toolchain {
     }
 }
 
+/// What selects and identifies the toolchain [`Toolchain::find`] returns. A
+/// build script that embeds guest ids must rerun when any of these change, or
+/// an incremental build keeps guests from the old compiler while a clean build
+/// uses the new one, and their ids disagree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolchainInputs {
+    /// Environment variables the selection reads.
+    pub env: Vec<&'static str>,
+    /// Files and directories that select the toolchain (rzup's settings, and
+    /// the installed toolchains when no default is set) or identify it (the
+    /// compilers themselves).
+    pub paths: Vec<PathBuf>,
+}
+
+impl Toolchain {
+    /// The inputs that chose and identify this toolchain, for
+    /// `cargo:rerun-if-env-changed` / `cargo:rerun-if-changed`.
+    pub fn inputs(&self) -> ToolchainInputs {
+        let explicit = env::var_os("RISC0_RUST_TOOLCHAIN_PATH").filter(|v| !v.is_empty());
+        let mut paths = vec![self.rustc(), self.cargo()];
+        if let Some(cc) = Self::cc() {
+            paths.push(cc);
+        }
+        // rzup's selection, unless the path is given outright. It also picks
+        // the C++ toolchain behind `cc()`, so it is read either way.
+        if let Some(risc0_home) = risc0_home() {
+            let selected = explicit.is_none().then_some(self.id.as_str());
+            paths.extend(rzup_selection_inputs(&risc0_home, selected));
+        }
+        ToolchainInputs {
+            env: vec!["RISC0_RUST_TOOLCHAIN_PATH", "RISC0_HOME", "HOME"],
+            paths,
+        }
+    }
+}
+
+/// rzup's home: `$RISC0_HOME`, else `~/.risc0` (rzup's `Environment`).
+fn risc0_home() -> Option<PathBuf> {
+    env::var_os("RISC0_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".risc0")))
+}
+
+/// What rzup's choice of `selected` (the chosen toolchain directory's name, or
+/// `None` when `RISC0_RUST_TOOLCHAIN_PATH` chose) depends on, under
+/// `risc0_home`. rzup takes `settings.toml`'s `[default_versions] rust` when
+/// that version is installed, and otherwise the highest installed version
+/// (`Registry::get_default_component_version`). So the settings file always
+/// counts; the installed toolchains count too whenever the selection did not
+/// come from that default (none set, or the default not installed), since
+/// installing another one can then change it. Cargo scans a tracked directory
+/// recursively, so the toolchains directory is tracked only then.
+fn rzup_selection_inputs(risc0_home: &Path, selected: Option<&str>) -> Vec<PathBuf> {
+    let settings = risc0_home.join("settings.toml");
+    let mut paths = Vec::new();
+    let rust_default = std::fs::read_to_string(&settings)
+        .ok()
+        .and_then(|text| text.parse::<toml::Table>().ok())
+        .and_then(|table| {
+            table
+                .get("default_versions")?
+                .get("rust")?
+                .as_str()
+                .map(str::to_string)
+        });
+    if settings.is_file() {
+        paths.push(settings);
+    }
+    let from_default = match (selected, rust_default.as_deref()) {
+        (Some(id), Some(version)) => id.starts_with(&format!("v{version}-")),
+        _ => false,
+    };
+    if selected.is_some() && !from_default {
+        let toolchains = risc0_home.join("toolchains");
+        if toolchains.is_dir() {
+            paths.push(toolchains);
+        }
+    }
+    paths
+}
+
 fn exe(name: &str) -> String {
     format!("{name}{}", env::consts::EXE_SUFFIX)
 }
@@ -167,6 +249,35 @@ fn exe(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_selection_inputs_follow_rzup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        std::fs::create_dir_all(home.join("toolchains/v1.94.1-rust-test")).unwrap();
+
+        let selected = Some("v1.94.1-rust-test");
+        let both = vec![home.join("settings.toml"), home.join("toolchains")];
+
+        // No settings file: rzup took the highest installed toolchain.
+        assert_eq!(rzup_selection_inputs(home, selected), vec![home.join("toolchains")]);
+
+        // The selection is the settings file's Rust default: it decides alone.
+        std::fs::write(home.join("settings.toml"), "[default_versions]\nrust = \"1.94.1\"\n").unwrap();
+        assert_eq!(rzup_selection_inputs(home, selected), vec![home.join("settings.toml")]);
+
+        // A default that is not installed: rzup fell back, so both count.
+        std::fs::write(home.join("settings.toml"), "[default_versions]\nrust = \"1.99.0\"\n").unwrap();
+        assert_eq!(rzup_selection_inputs(home, selected), both);
+
+        // Settings without a Rust default: both count.
+        std::fs::write(home.join("settings.toml"), "[default_versions]\ncpp = \"2024.1.5\"\n").unwrap();
+        assert_eq!(rzup_selection_inputs(home, selected), both);
+
+        // RISC0_RUST_TOOLCHAIN_PATH chose: only the settings file (it still
+        // picks the C++ toolchain), not the installed Rust toolchains.
+        assert_eq!(rzup_selection_inputs(home, None), vec![home.join("settings.toml")]);
+    }
 
     #[test]
     fn rustflags_remap_cargo_home_last() {

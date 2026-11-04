@@ -41,7 +41,8 @@ pub use guest::{
 };
 pub use packages::{PathPackage, PathPackages};
 pub use recipe::{
-    cargo_home, encode_rustflags, rustflags, Toolchain, CARGO_HOME_REMAP, RECIPE_VERSION, TARGET,
+    cargo_home, encode_rustflags, rustflags, Toolchain, ToolchainInputs, CARGO_HOME_REMAP,
+    RECIPE_VERSION, TARGET,
 };
 pub use stage::{Stage, StageEntry, StagePlan, RASTER_ENTRY};
 

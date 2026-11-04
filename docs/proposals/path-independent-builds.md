@@ -227,8 +227,20 @@ written back only if it changed.
 `risc0-zkvm` is needed. It keeps `RISC0_SKIP_BUILD`'s empty ELF and zero id, which
 `commands/audit.rs:72` on `codex/windows-native` relies on. It also fixes P11:
 - `methods.rs` and the packaged `.bin` files are written only when their content changes;
-- the rerun triggers are the guests' path packages' `Cargo.toml`, `src/` and `build.rs`, the
-  guests' lockfiles, and `RISC0_SKIP_BUILD`, `RISC0_RUST_TOOLCHAIN_PATH` and `CARGO_HOME`.
+- the rerun triggers are:
+  - the guests' path packages' `Cargo.toml`, `src/` and `build.rs`, and the guests' lockfiles;
+  - `RISC0_SKIP_BUILD` and `CARGO_HOME`;
+  - what selects and identifies the guest compiler (`Toolchain::inputs`):
+    - `RISC0_RUST_TOOLCHAIN_PATH`, `RISC0_HOME` and `HOME`;
+    - rzup's `settings.toml`, plus its `toolchains/` directory whenever the selection did not come
+      from the configured default (none set, or not installed), since an install can then change
+      it;
+    - the selected `rustc`, `cargo` and guest C compiler.
+
+  *Added 2026-11-04 after review.* Without these, switching rzup's default left an incremental
+  build with the old protocol guests and ids, while a clean build used the new compiler. Measured
+  with a scratch `RISC0_HOME`: the script reruns on a changed default and on a new install during
+  fallback, and on nothing else.
 
 risc0-build cannot do this itself:
 - it removes every `CARGO*` env var before running cargo;

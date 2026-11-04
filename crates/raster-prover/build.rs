@@ -8,9 +8,13 @@
 //! `$CARGO_HOME` (docs/proposals/path-independent-builds.md §4.4).
 //!
 //! Outputs are rewritten only when their content changes, and the rerun
-//! triggers name exactly the guests' sources and their local path packages.
-//! risc0-build registered its own `methods.rs`, rewritten on every run, so this
-//! crate used to recompile on every build.
+//! triggers name exactly what the guests depend on: their sources and local
+//! path packages, and what selects and identifies the guest compiler (rzup's
+//! default and the compiler binaries, `Toolchain::inputs`). Without the latter,
+//! switching rzup's default left an incremental build with the old guests and
+//! ids while a clean build used the new compiler. risc0-build registered its
+//! own `methods.rs`, rewritten on every run, so this crate used to recompile on
+//! every build.
 
 use std::env;
 use std::fs;
@@ -24,7 +28,7 @@ fn main() {
     let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
     println!("cargo:rerun-if-changed=Cargo.toml");
-    for var in ["RISC0_SKIP_BUILD", "RISC0_RUST_TOOLCHAIN_PATH", "CARGO_HOME"] {
+    for var in ["RISC0_SKIP_BUILD", "CARGO_HOME"] {
         println!("cargo:rerun-if-env-changed={var}");
     }
 
@@ -42,6 +46,13 @@ fn main() {
         }
     } else {
         let toolchain = Toolchain::find().unwrap_or_else(|e| panic!("{e}"));
+        let inputs = toolchain.inputs();
+        for var in &inputs.env {
+            println!("cargo:rerun-if-env-changed={var}");
+        }
+        for path in &inputs.paths {
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
         let cargo_home = cargo_home().unwrap_or_else(|e| panic!("{e}"));
         let target_dir = guest_target_dir(&out_dir);
         for dir in &guests {
