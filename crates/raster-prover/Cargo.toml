@@ -8,7 +8,9 @@ authors.workspace = true
 
 
 [build-dependencies]
-risc0-build = "3.0"
+# Builds the protocol guests (build.rs), path-independently.
+raster-guest-build.workspace = true
+toml = "0.8"
 
 [dependencies]
 raster-core = { workspace = true, features = ["std"] }

@@ -22,10 +22,11 @@ Today, the only backend that produces a real guest ELF is the **RISC0 backend**.
 - **Guest crate generation + toolchain selection (target triple; entrypoint; generated Cargo.toml)**:
   - `crates/raster-backend-risc0/src/guest_builder.rs`
     - `GuestBuilder::generate_guest_main` (guest entrypoint + I/O syscalls)
-    - `GuestBuilder::generate_guest_cargo_toml` (guest dependencies + `no_std`)
-    - `GuestBuilder::find_risc0_cargo` (toolchain discovery / `rzup`)
-    - `GuestBuilder::build_guest` (invokes `cargo build --release --target …`)
-    - `GuestBuilder::artifact_dir` + `write_artifacts` (prewrites artifacts)
+    - `GuestBuilder::resolve` (finds `raster` and every local path package with `cargo metadata`)
+    - `GuestBuilder::build_tile` (builds the guest in a stage; guest dependencies in `guest_crate`)
+  - `crates/raster-guest-build/src/` (staged, path-independent guest builds, 2026-11-03)
+    - `recipe.rs`: `Toolchain::find` (`RISC0_RUST_TOOLCHAIN_PATH`, else rzup's default), rustflags
+    - `guest.rs`: `stage_manifest`, `GuestBuild::run` (invokes `cargo build --release --target …`)
 - **Tile ABI wrapper naming + (de)serialization format**:
   - `crates/raster-macros/src/lib.rs`
     - `#[tile]` macro expansion: wrapper `__raster_tile_entry_<fn_ident>`

@@ -73,6 +73,13 @@ pub fn run(
         .build()
         .map_err(|e| Error::Other(format!("Failed to build CFS: {}", e)))?;
 
+    // A commitment is later proven against `Raster.lock`'s program identity.
+    // Refuse to make one from a lock the current sources no longer match,
+    // before running anything: today that would only surface at prove time.
+    if commit_flag.is_some() {
+        crate::program::check_lock_before_commit(&project, &cfs)?;
+    }
+
     println!("Building project...");
 
     let mut build_command = Command::new("cargo");

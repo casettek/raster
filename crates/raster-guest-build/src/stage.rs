@@ -1,0 +1,593 @@
+//! The stage: a temp directory a guest is built from, laid out so cargo sees
+//! every path package by a relative path.
+
+use std::collections::BTreeMap;
+use std::ffi::OsString;
+use std::path::{Component, Path, PathBuf};
+
+use crate::{Error, Result};
+
+/// The stage name of the entry that holds the `raster` workspace. Fixed, so
+/// the raster checkout's directory name never reaches an image id.
+pub const RASTER_ENTRY: &str = "raster";
+
+/// The stage name of the entry that holds the guest's own project (the user
+/// crate), when that is not the raster checkout. Fixed for the same reason:
+/// a project's folder may be called anything (`iris`, `iris-main`, ...).
+pub const PROJECT_ENTRY: &str = "project";
+
+/// One top-level stage entry: `stage/<name>` links to `target`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StageEntry {
+    pub name: String,
+    pub target: PathBuf,
+}
+
+/// Where each path package appears inside a stage.
+///
+/// Let A be the common ancestor of the workspace roots, moved up one level if
+/// it is itself one of them. Each top-level entry under A that holds a
+/// workspace root is staged under its own name, except the one holding the
+/// `raster` workspace, which is staged as [`RASTER_ENTRY`], so the checkout's
+/// own directory name never reaches an image id. A sits strictly above every
+/// workspace root so the stage root's own manifest never replaces one:
+/// raster's root manifest carries the `[workspace.dependencies]` its crates
+/// inherit.
+///
+/// A sibling project's manifests may name the checkout by its real name
+/// (`../raster-main/crates/raster`). The plan's [`manifests`](Self::manifests)
+/// are kept valid: [`Stage::create`] rewrites any of them whose local paths
+/// change under the rename, in a shadow copy inside the stage, so each package
+/// keeps a single path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StagePlan {
+    ancestor: PathBuf,
+    entries: Vec<StageEntry>,
+    manifests: Vec<PathBuf>,
+}
+
+impl StagePlan {
+    /// Plan a stage for path packages in `workspace_roots`. `raster_root` is
+    /// the workspace root holding the `raster` package, if the guest uses it.
+    pub fn new(workspace_roots: &[PathBuf], raster_root: Option<&Path>) -> Result<Self> {
+        let mut roots: Vec<PathBuf> = workspace_roots.iter().map(|r| normalize(r)).collect();
+        roots.sort();
+        roots.dedup();
+        if roots.is_empty() {
+            return Err(Error::Layout("no path packages to stage".into()));
+        }
+        if let Some(relative) = roots.iter().find(|r| !r.is_absolute()) {
+            return Err(Error::Layout(format!(
+                "workspace root {} is not absolute",
+                relative.display()
+            )));
+        }
+
+        let mut ancestor = common_ancestor(&roots).ok_or_else(|| {
+            Error::Layout("the path packages share no common directory".into())
+        })?;
+        if roots.contains(&ancestor) {
+            ancestor = ancestor
+                .parent()
+                .ok_or_else(|| {
+                    Error::Layout("a workspace root is the filesystem root".into())
+                })?
+                .to_path_buf();
+        }
+
+        let raster_entry = raster_root.map(|r| top_entry(&ancestor, &normalize(r)));
+        let mut by_name: BTreeMap<String, PathBuf> = BTreeMap::new();
+        for root in &roots {
+            let entry = top_entry(&ancestor, root);
+            let name = if raster_entry.as_ref() == Some(&entry) {
+                RASTER_ENTRY.to_string()
+            } else {
+                entry.to_str().map(str::to_string).ok_or_else(|| {
+                    Error::Layout(format!("{} is not valid UTF-8", entry.to_string_lossy()))
+                })?
+            };
+            let target = ancestor.join(&entry);
+            if let Some(previous) = by_name.insert(name.clone(), target.clone()) {
+                if previous != target {
+                    return Err(Error::Layout(format!(
+                        "both {} and {} would be staged as `{name}`",
+                        previous.display(),
+                        target.display()
+                    )));
+                }
+            }
+        }
+
+        Ok(Self {
+            ancestor,
+            entries: by_name
+                .into_iter()
+                .map(|(name, target)| StageEntry { name, target })
+                .collect(),
+            manifests: Vec::new(),
+        })
+    }
+
+    /// Keep these real `Cargo.toml` files valid inside the stage (see the type
+    /// docs): every path package's manifest and every workspace root's
+    /// manifest the guest's resolve reads.
+    pub fn with_manifests(mut self, manifests: Vec<PathBuf>) -> Self {
+        let mut manifests: Vec<PathBuf> = manifests.iter().map(|m| normalize(m)).collect();
+        manifests.sort();
+        manifests.dedup();
+        self.manifests = manifests;
+        self
+    }
+
+    /// The manifests [`Stage::create`] keeps valid.
+    pub fn manifests(&self) -> &[PathBuf] {
+        &self.manifests
+    }
+
+    /// Rename entries: `name_of` gets each entry's real directory and returns
+    /// its stage name, or `None` to keep the current one. Any manifest that
+    /// reaches a renamed entry by its real name is kept valid the same way as
+    /// for the raster rename ([`Self::with_manifests`]). Two entries may not
+    /// end up with one name.
+    pub fn with_entry_names(mut self, name_of: impl Fn(&Path) -> Option<String>) -> Result<Self> {
+        let mut by_name: BTreeMap<String, PathBuf> = BTreeMap::new();
+        for entry in &self.entries {
+            let name = name_of(&entry.target).unwrap_or_else(|| entry.name.clone());
+            if let Some(previous) = by_name.insert(name.clone(), entry.target.clone()) {
+                return Err(Error::Layout(format!(
+                    "both {} and {} would be staged as `{name}`",
+                    previous.display(),
+                    entry.target.display()
+                )));
+            }
+        }
+        self.entries = by_name
+            .into_iter()
+            .map(|(name, target)| StageEntry { name, target })
+            .collect();
+        Ok(self)
+    }
+
+    /// The directory the stage mirrors (A).
+    pub fn ancestor(&self) -> &Path {
+        &self.ancestor
+    }
+
+    /// The staged entries, sorted by name.
+    pub fn entries(&self) -> &[StageEntry] {
+        &self.entries
+    }
+
+    /// Where the real directory `real` appears in the stage, relative to the
+    /// stage root.
+    pub fn stage_relative(&self, real: &Path) -> Result<PathBuf> {
+        let real = normalize(real);
+        let outside = || {
+            Error::Layout(format!(
+                "{} is outside every staged entry under {}",
+                real.display(),
+                self.ancestor.display()
+            ))
+        };
+        let relative = real.strip_prefix(&self.ancestor).map_err(|_| outside())?;
+        let mut components = relative.components();
+        let first = components.next().ok_or_else(outside)?;
+        let target = self.ancestor.join(first);
+        let entry = self
+            .entries
+            .iter()
+            .find(|e| e.target == target)
+            .ok_or_else(outside)?;
+        Ok(Path::new(&entry.name).join(components.as_path()))
+    }
+}
+
+/// A created stage. The directory is removed on drop.
+pub struct Stage {
+    dir: tempfile::TempDir,
+    plan: StagePlan,
+}
+
+impl Stage {
+    /// Create the stage in the system temp directory.
+    pub fn create(plan: StagePlan) -> Result<Self> {
+        Self::create_in(plan, None)
+    }
+
+    /// Create the stage under `parent`, or the system temp directory.
+    pub fn create_in(plan: StagePlan, parent: Option<&Path>) -> Result<Self> {
+        let builder = {
+            let mut b = tempfile::Builder::new();
+            b.prefix("raster-stage-");
+            b
+        };
+        let dir = match parent {
+            Some(parent) => builder.tempdir_in(parent)?,
+            None => builder.tempdir()?,
+        };
+        for entry in &plan.entries {
+            link(&entry.target, &dir.path().join(&entry.name))?;
+        }
+        for manifest in &plan.manifests {
+            restage_manifest(dir.path(), &plan, manifest)?;
+        }
+        Ok(Self { dir, plan })
+    }
+
+    pub fn root(&self) -> &Path {
+        self.dir.path()
+    }
+
+    pub fn plan(&self) -> &StagePlan {
+        &self.plan
+    }
+
+    /// Where the real directory `real` appears in this stage, relative to its
+    /// root.
+    pub fn relative(&self, real: &Path) -> Result<PathBuf> {
+        self.plan.stage_relative(real)
+    }
+}
+
+/// If `manifest`'s local paths change under the stage's renames, write the
+/// rewritten copy at its place in the stage. Unchanged manifests stay linked.
+fn restage_manifest(root: &Path, plan: &StagePlan, manifest: &Path) -> Result<()> {
+    let Some(dir) = manifest.parent() else {
+        return Ok(());
+    };
+    let Ok(staged_dir) = plan.stage_relative(dir) else {
+        return Ok(()); // not inside a staged entry
+    };
+    let text = std::fs::read_to_string(manifest)?;
+    let mut table: toml::Table = text
+        .parse()
+        .map_err(|e| Error::Layout(format!("{}: {e}", manifest.display())))?;
+    if !crate::manifest::restage_paths(&mut table, dir, &staged_dir, plan, false)? {
+        return Ok(());
+    }
+    let rewritten = toml::to_string(&table)
+        .map_err(|e| Error::Layout(format!("{}: {e}", manifest.display())))?;
+    materialize(root, &staged_dir)?;
+    let at = root.join(&staged_dir).join("Cargo.toml");
+    // The directory is real now (materialize), but its `Cargo.toml` may still
+    // be a link to the real file: remove the link, never write through it.
+    if at.symlink_metadata().is_ok() {
+        std::fs::remove_file(&at)?;
+    }
+    std::fs::write(&at, rewritten)?;
+    Ok(())
+}
+
+/// Make `root/relative` a real directory, so a file in it can be replaced
+/// without touching the linked original: every symlinked directory on the way
+/// becomes a real directory whose children link to the original's children.
+fn materialize(root: &Path, relative: &Path) -> Result<()> {
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        current.push(component);
+        let metadata = current.symlink_metadata()?;
+        if !metadata.file_type().is_symlink() {
+            continue; // already real (or a copy, without unix symlinks)
+        }
+        let target = std::fs::read_link(&current)?;
+        std::fs::remove_file(&current)?;
+        std::fs::create_dir(&current)?;
+        for child in std::fs::read_dir(&target)? {
+            let name = child?.file_name();
+            link_one(&target.join(&name), &current.join(&name))?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn link_one(target: &Path, at: &Path) -> Result<()> {
+    std::os::unix::fs::symlink(target, at)?;
+    Ok(())
+}
+
+/// Never reached: without unix symlinks entries are copies, never links.
+#[cfg(not(unix))]
+fn link_one(target: &Path, at: &Path) -> Result<()> {
+    link(target, at)
+}
+
+#[cfg(unix)]
+pub(crate) fn link(target: &Path, at: &Path) -> Result<()> {
+    std::os::unix::fs::symlink(target, at)?;
+    Ok(())
+}
+
+/// Without unix symlinks, copy the tree, minus build output and VCS metadata.
+#[cfg(not(unix))]
+pub(crate) fn link(target: &Path, at: &Path) -> Result<()> {
+    fn copy(from: &Path, to: &Path) -> std::io::Result<()> {
+        std::fs::create_dir_all(to)?;
+        for entry in std::fs::read_dir(from)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            if name == "target" || name == ".git" {
+                continue;
+            }
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                copy(&entry.path(), &to.join(&name))?;
+            } else {
+                std::fs::copy(entry.path(), to.join(&name))?;
+            }
+        }
+        Ok(())
+    }
+    copy(target, at)?;
+    Ok(())
+}
+
+/// `path` with `.` dropped and `..` applied, without touching the filesystem.
+pub(crate) fn normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() {
+                    out.push("..");
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+fn common_ancestor(paths: &[PathBuf]) -> Option<PathBuf> {
+    let mut common: Vec<Component> = paths.first()?.components().collect();
+    for path in &paths[1..] {
+        let length = common
+            .iter()
+            .zip(path.components())
+            .take_while(|(a, b)| *a == b)
+            .count();
+        common.truncate(length);
+    }
+    (!common.is_empty()).then(|| common.iter().collect())
+}
+
+/// The first component of `root` below `ancestor`.
+fn top_entry(ancestor: &Path, root: &Path) -> OsString {
+    root.strip_prefix(ancestor)
+        .ok()
+        .and_then(|r| r.components().next())
+        .map(|c| c.as_os_str().to_os_string())
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn p(s: &str) -> PathBuf {
+        PathBuf::from(s)
+    }
+
+    fn names(plan: &StagePlan) -> Vec<(&str, &Path)> {
+        plan.entries()
+            .iter()
+            .map(|e| (e.name.as_str(), e.target.as_path()))
+            .collect()
+    }
+
+    /// An in-repo example: one workspace, the raster checkout.
+    #[test]
+    fn a_single_workspace_is_staged_one_level_up() {
+        let checkout = p("/home/u/dev/raster");
+        let plan = StagePlan::new(std::slice::from_ref(&checkout), Some(&checkout)).unwrap();
+        assert_eq!(plan.ancestor(), Path::new("/home/u/dev"));
+        assert_eq!(names(&plan), vec![("raster", checkout.as_path())]);
+        assert_eq!(
+            plan.stage_relative(&checkout.join("crates/raster-core")).unwrap(),
+            p("raster/crates/raster-core")
+        );
+    }
+
+    /// The raster checkout's own directory name does not reach the stage.
+    #[test]
+    fn the_raster_checkout_is_always_staged_as_raster() {
+        let checkout = p("/tmp/x/defender-raster");
+        let plan = StagePlan::new(std::slice::from_ref(&checkout), Some(&checkout)).unwrap();
+        assert_eq!(names(&plan), vec![("raster", checkout.as_path())]);
+        assert_eq!(
+            plan.stage_relative(&checkout.join("examples/hello-tiles")).unwrap(),
+            p("raster/examples/hello-tiles")
+        );
+    }
+
+    /// iris next to raster.
+    #[test]
+    fn a_sibling_project_keeps_its_name() {
+        let raster = p("/home/u/dev/raster-project/raster");
+        let iris = p("/home/u/dev/raster-project/iris");
+        let plan = StagePlan::new(&[iris.clone(), raster.clone()], Some(&raster)).unwrap();
+        assert_eq!(plan.ancestor(), Path::new("/home/u/dev/raster-project"));
+        assert_eq!(
+            names(&plan),
+            vec![("iris", iris.as_path()), ("raster", raster.as_path())]
+        );
+        assert_eq!(
+            plan.stage_relative(&iris.join("raster-stages/prefill-range")).unwrap(),
+            p("iris/raster-stages/prefill-range")
+        );
+    }
+
+    /// A protocol guest that still has its own `[workspace]` inside the
+    /// checkout: one entry, the checkout.
+    #[test]
+    fn a_nested_workspace_stays_inside_its_entry() {
+        let checkout = p("/w/raster");
+        let guest = checkout.join("crates/raster-prover/guests/transition");
+        let plan = StagePlan::new(&[checkout.clone(), guest.clone()], Some(&checkout)).unwrap();
+        assert_eq!(plan.ancestor(), Path::new("/w"));
+        assert_eq!(names(&plan), vec![("raster", checkout.as_path())]);
+        assert_eq!(
+            plan.stage_relative(&guest).unwrap(),
+            p("raster/crates/raster-prover/guests/transition")
+        );
+    }
+
+    #[test]
+    fn a_layout_without_raster_keeps_real_names() {
+        let plan = StagePlan::new(&[p("/a/b/pkg")], None).unwrap();
+        assert_eq!(names(&plan), vec![("pkg", Path::new("/a/b/pkg"))]);
+    }
+
+    /// A sibling project reaching a checkout named `raster-main`: the checkout
+    /// is still staged as `raster` (its manifests are kept valid on create).
+    #[test]
+    fn a_renamed_sibling_checkout_is_staged_as_raster() {
+        let raster = p("/p/raster-main");
+        let app = p("/p/app");
+        let plan = StagePlan::new(&[raster.clone(), app.clone()], Some(&raster)).unwrap();
+        assert_eq!(names(&plan), vec![("app", app.as_path()), ("raster", raster.as_path())]);
+        assert_eq!(
+            plan.stage_relative(&raster.join("crates/raster")).unwrap(),
+            p("raster/crates/raster")
+        );
+    }
+
+    /// The project's folder name stays out too, whatever it is.
+    #[test]
+    fn entries_can_be_renamed_to_fixed_names() {
+        let raster = p("/p/raster-main");
+        let iris = p("/p/iris-main");
+        let shared = p("/p/shared-libs");
+        let plan = StagePlan::new(&[raster.clone(), iris.clone(), shared.clone()], Some(&raster))
+            .unwrap()
+            .with_entry_names(|target| {
+                if target == iris {
+                    Some("project".into())
+                } else if target == shared {
+                    Some("dep-common".into())
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        assert_eq!(
+            names(&plan),
+            vec![
+                ("dep-common", shared.as_path()),
+                ("project", iris.as_path()),
+                ("raster", raster.as_path())
+            ]
+        );
+        assert_eq!(
+            plan.stage_relative(&iris.join("raster-stages/prefill-range")).unwrap(),
+            p("project/raster-stages/prefill-range")
+        );
+        let error = StagePlan::new(&[raster.clone(), iris.clone()], Some(&raster))
+            .unwrap()
+            .with_entry_names(|_| Some("same".into()))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("staged as `same`"), "{error}");
+    }
+
+    #[test]
+    fn a_name_collision_with_raster_is_an_error() {
+        let raster = p("/p/raster-main");
+        let other = p("/p/raster");
+        let error = StagePlan::new(&[raster.clone(), other], Some(&raster))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("staged as `raster`"), "{error}");
+    }
+
+    /// The reviewed bug: a sibling app depending on `../raster-main/...`.
+    /// Its manifest is rewritten inside the stage, its sources stay linked,
+    /// and nothing in the real tree changes.
+    #[cfg(unix)]
+    #[test]
+    fn a_sibling_manifest_is_restaged_without_touching_the_real_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let raster = tmp.path().join("raster-main");
+        let app = tmp.path().join("app");
+        let write = |path: PathBuf, text: &str| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        write(raster.join("Cargo.toml"), "[workspace]\nmembers = [\"crates/raster\"]\n");
+        write(raster.join("crates/raster/Cargo.toml"), "[package]\nname = \"raster\"\n");
+        write(raster.join("crates/raster/src/lib.rs"), "");
+        let app_manifest = "[package]\nname = \"app\"\n\n[dependencies]\n\
+                            raster = { path = \"../raster-main/crates/raster\" }\n";
+        write(app.join("Cargo.toml"), app_manifest);
+        write(app.join("src/lib.rs"), "// app");
+
+        let plan = StagePlan::new(&[app.clone(), raster.clone()], Some(&raster))
+            .unwrap()
+            .with_manifests(vec![
+                app.join("Cargo.toml"),
+                raster.join("Cargo.toml"),
+                raster.join("crates/raster/Cargo.toml"),
+            ]);
+        let stage = Stage::create_in(plan, Some(tmp.path())).unwrap();
+        let staged_app = stage.root().join("app");
+
+        assert!(!staged_app.symlink_metadata().unwrap().file_type().is_symlink(), "shadowed");
+        let rewritten: toml::Table =
+            std::fs::read_to_string(staged_app.join("Cargo.toml")).unwrap().parse().unwrap();
+        assert_eq!(
+            rewritten["dependencies"]["raster"]["path"].as_str(),
+            Some("../raster/crates/raster")
+        );
+        assert_eq!(std::fs::read_link(staged_app.join("src")).unwrap(), app.join("src"));
+        assert!(
+            stage.root().join("raster").symlink_metadata().unwrap().file_type().is_symlink(),
+            "an entry whose manifests stay valid is not shadowed"
+        );
+        assert!(staged_app.join("../raster/crates/raster/Cargo.toml").is_file());
+        assert_eq!(std::fs::read_to_string(app.join("Cargo.toml")).unwrap(), app_manifest);
+        drop(stage);
+        assert_eq!(
+            std::fs::read_to_string(app.join("Cargo.toml")).unwrap(),
+            app_manifest,
+            "the real manifest survives the stage's removal"
+        );
+        assert!(app.join("src/lib.rs").is_file());
+    }
+
+    #[test]
+    fn paths_outside_the_stage_are_errors() {
+        let plan = StagePlan::new(&[p("/p/raster")], Some(Path::new("/p/raster"))).unwrap();
+        assert!(plan.stage_relative(Path::new("/p/elsewhere")).is_err());
+        assert!(plan.stage_relative(Path::new("/q/raster")).is_err());
+    }
+
+    #[test]
+    fn normalize_is_lexical() {
+        assert_eq!(
+            normalize(Path::new("/a/b/../c/./d")),
+            p("/a/c/d")
+        );
+        assert_eq!(
+            normalize(Path::new("/p/iris/raster-stages/x/../../../raster/crates/raster")),
+            p("/p/raster/crates/raster")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_created_stage_links_its_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let checkout = tmp.path().join("some-checkout");
+        std::fs::create_dir_all(checkout.join("crates")).unwrap();
+        let plan = StagePlan::new(std::slice::from_ref(&checkout), Some(&checkout)).unwrap();
+        let stage = Stage::create_in(plan, Some(tmp.path())).unwrap();
+        let link = stage.root().join("raster");
+        assert_eq!(std::fs::read_link(&link).unwrap(), checkout);
+        assert!(link.join("crates").is_dir());
+        let root = stage.root().to_path_buf();
+        drop(stage);
+        assert!(!root.exists(), "the stage is removed on drop");
+        assert!(checkout.join("crates").is_dir(), "the checkout is untouched");
+    }
+}

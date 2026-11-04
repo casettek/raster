@@ -29,11 +29,11 @@ rayon.workspace = true
 # RISC0 zkVM dependencies
 risc0-zkvm = { version = "3.0", default-features = false, features = ["prove", "std"] }
 risc0-build = "3.0"
-risc0-binfmt = "3.0"
-risc0-zkos-v1compat = "2.2"
-risc0-zkvm-platform = "2.2"
 
-# For guest crate generation
-tempfile = "3.14"
+# Tile guests: staged, path-independent builds
+raster-guest-build.workspace = true
 cargo_metadata = "0.19"
 hex = "0.4"
+
+[dev-dependencies]
+tempfile = "3.14"
