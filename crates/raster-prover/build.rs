@@ -59,8 +59,14 @@ fn main() {
             let packages = PathPackages::resolve(&dir.join("Cargo.toml"))
                 .unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
             for package in &packages.packages {
-                for input in ["Cargo.toml", "src", "build.rs"] {
-                    let path = package.dir.join(input);
+                // The workspace root's manifest too: `workspace = true`
+                // dependencies take their versions and features from it.
+                let workspace_manifest = package.workspace_root.join("Cargo.toml");
+                for path in ["Cargo.toml", "src", "build.rs"]
+                    .map(|input| package.dir.join(input))
+                    .into_iter()
+                    .chain([workspace_manifest])
+                {
                     if path.exists() {
                         println!("cargo:rerun-if-changed={}", path.display());
                     }

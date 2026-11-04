@@ -15,3 +15,11 @@ mod guest_builder;
 mod risc0;
 
 pub use risc0::{Risc0ArtifactStore, Risc0Backend, Risc0CompilationArtifact};
+
+/// The toolchain-free digest of everything a tile guest of the project at
+/// `user_crate` compiles besides each tile's own source: what `Raster.lock`
+/// records as `guest_inputs`. Resolves the project with `cargo metadata` and
+/// builds nothing.
+pub fn guest_inputs(output_dir: &std::path::Path, user_crate: &std::path::Path) -> Result<String, String> {
+    guest_builder::GuestBuilder::resolve(output_dir, user_crate).map(|b| b.inputs().to_string())
+}

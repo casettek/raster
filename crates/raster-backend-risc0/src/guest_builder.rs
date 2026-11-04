@@ -35,6 +35,8 @@ pub struct GuestBuilder {
     toolchain: Option<Toolchain>,
     cargo_home: PathBuf,
     fingerprint: String,
+    /// The same inputs without the toolchain (see [`Self::inputs`]).
+    inputs: String,
 }
 
 impl GuestBuilder {
@@ -64,9 +66,10 @@ impl GuestBuilder {
             toolchain: Toolchain::find().ok(),
             cargo_home: cargo_home().map_err(|e| e.to_string())?,
             fingerprint: String::new(),
+            inputs: String::new(),
         };
         builder.raster_dependency = builder.resolve_raster_dependency()?;
-        builder.fingerprint = builder.compute_fingerprint()?;
+        (builder.fingerprint, builder.inputs) = builder.compute_fingerprint()?;
         Ok(builder)
     }
 
@@ -101,6 +104,16 @@ impl GuestBuilder {
     /// checkout path.
     pub fn fingerprint(&self) -> &str {
         &self.fingerprint
+    }
+
+    /// Everything [`Self::fingerprint`] covers except the toolchain: the guest
+    /// inputs that come from the project and its dependencies. `Raster.lock`
+    /// records it, and `run --commit` compares it without building anything to
+    /// catch a lock that no longer matches the sources. The toolchain is left
+    /// out so a machine without one can still check; the lock records the
+    /// compiler separately (`toolchain.rustc`).
+    pub fn inputs(&self) -> &str {
+        &self.inputs
     }
 
     /// Build the guest for `tile_id`.
@@ -147,7 +160,8 @@ impl GuestBuilder {
         }
     }
 
-    fn compute_fingerprint(&self) -> Result<String, String> {
+    /// The cache key and the toolchain-free inputs digest, from one pass.
+    fn compute_fingerprint(&self) -> Result<(String, String), String> {
         const PLACEHOLDER: &str = "__recipe__";
         let error = |e: raster_guest_build::Error| e.to_string();
 
@@ -162,12 +176,16 @@ impl GuestBuilder {
         let mut fingerprint = Fingerprint::new();
         let toolchain = self.toolchain.as_ref().map_or("none", |t| t.id.as_str());
         fingerprint.bytes("toolchain", toolchain.as_bytes());
-        fingerprint.bytes(
-            "manifest",
-            stage_manifest(&self.plan, &krate).map_err(error)?.as_bytes(),
-        );
-        fingerprint.bytes("main.rs", self.generate_guest_main(PLACEHOLDER).as_bytes());
-        fingerprint.bytes("external", guest.external.join("\n").as_bytes());
+        // Fed exactly what `fingerprint` is, after the toolchain.
+        let mut inputs = Fingerprint::new();
+        let manifest = stage_manifest(&self.plan, &krate).map_err(error)?;
+        let main_rs = self.generate_guest_main(PLACEHOLDER);
+        let external = guest.external.join("\n");
+        for key in [&mut fingerprint, &mut inputs] {
+            key.bytes("manifest", manifest.as_bytes());
+            key.bytes("main.rs", main_rs.as_bytes());
+            key.bytes("external", external.as_bytes());
+        }
         let mut outside = Vec::new();
         for package in guest.packages.iter().filter(|p| p.dir != guest.root.dir) {
             // A package outside the stage is named by an absolute path in some
@@ -179,9 +197,35 @@ impl GuestBuilder {
                     package.dir.to_string_lossy().into_owned()
                 }
             };
-            fingerprint
-                .package(&label, &package.dir, Scope::Library)
-                .map_err(error)?;
+            for key in [&mut fingerprint, &mut inputs] {
+                key.package(&label, &package.dir, Scope::Library)
+                    .map_err(error)?;
+            }
+        }
+        // Workspace-root manifests too: a `workspace = true` dependency takes
+        // its version and features from the root's `[workspace.dependencies]`,
+        // so editing those changes the guest without touching any package's
+        // own files. Named by stage path, like the packages.
+        let mut roots: Vec<&Path> = guest
+            .packages
+            .iter()
+            .filter(|p| p.dir != guest.root.dir)
+            .map(|p| p.workspace_root.as_path())
+            .filter(|root| *root != stage.root())
+            .collect();
+        roots.sort();
+        roots.dedup();
+        for root in roots {
+            let label = match root.strip_prefix(stage.root()) {
+                Ok(relative) => relative.to_string_lossy().into_owned(),
+                Err(_) => root.to_string_lossy().into_owned(),
+            };
+            let manifest = root.join("Cargo.toml");
+            let contents = std::fs::read(&manifest)
+                .map_err(|e| format!("{}: {e}", manifest.display()))?;
+            for key in [&mut fingerprint, &mut inputs] {
+                key.bytes(&format!("workspace:{label}/Cargo.toml"), &contents);
+            }
         }
         if !outside.is_empty() {
             eprintln!(
@@ -192,7 +236,10 @@ impl GuestBuilder {
                 if outside.len() == 1 { "it lives" } else { "they live" }
             );
         }
-        Ok(fingerprint.finish_hex()[..16].to_string())
+        Ok((
+            fingerprint.finish_hex()[..16].to_string(),
+            inputs.finish_hex(),
+        ))
     }
 
     /// Generate the guest crate source for a tile.
@@ -418,6 +465,45 @@ mod tests {
             checkout.join("crates/raster").display().to_string(),
             "the guest names raster exactly as the project does"
         );
+    }
+
+    /// A dependency inherited with `workspace = true` takes its features from
+    /// the workspace root: changing them there must move the cache key, or the
+    /// old guest is reused for new behaviour.
+    #[cfg(unix)]
+    #[test]
+    fn a_workspace_dependency_feature_moves_the_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(repository(), tmp.path().join("raster")).unwrap();
+        let workspace = tmp.path().join("ws");
+        let root_manifest = |features: &str| {
+            format!(
+                "[workspace]\nmembers = [\"app\"]\nresolver = \"2\"\n\n\
+                 [workspace.dependencies]\n\
+                 raster = {{ path = \"../raster/crates/raster\", default-features = false }}\n\
+                 serde = {{ version = \"1.0\", default-features = false, features = [{features}] }}\n"
+            )
+        };
+        write(&workspace.join("Cargo.toml"), &root_manifest(r#""derive", "alloc""#));
+        app(&workspace.join("app"), "raster = { workspace = true, default-features = false }");
+        let manifest = workspace.join("app/Cargo.toml");
+        let text = fs::read_to_string(&manifest).unwrap();
+        let text: Vec<String> = text
+            .lines()
+            .map(|l| if l.starts_with("serde =") { "serde = { workspace = true }".into() } else { l.into() })
+            .collect();
+        write(&manifest, &text.join("\n"));
+
+        let key = || {
+            GuestBuilder::resolve(&tmp.path().join("out"), &workspace.join("app"))
+                .unwrap_or_else(|e| panic!("{e}"))
+                .fingerprint()
+                .to_string()
+        };
+        let before = key();
+        assert_eq!(key(), before, "deterministic");
+        write(&workspace.join("Cargo.toml"), &root_manifest(r#""derive", "alloc", "rc""#));
+        assert_ne!(key(), before, "a feature in [workspace.dependencies] reaches the key");
     }
 
     #[test]

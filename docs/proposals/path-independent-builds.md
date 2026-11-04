@@ -32,7 +32,7 @@ Every path-related defect found so far. "New" means it is not in the issue.
 | P6 | The generated tile guest has no `Cargo.lock`, so dependency versions are resolved at build time. Tiles carry `anyhow-1.0.104`; the transition guest, which has a lockfile, carries `1.0.102`. | `generate_guest_cargo_toml`, `guest_builder.rs:231` | id depends on when it was built and on the registry cache | new |
 | P7 | The guest rustc is the lexically newest directory in `~/.risc0/toolchains`. `Raster.lock`'s `toolchain.risc0` records the CLI's `risc0-zkvm` crate version, not that rustc. | `find_risc0_cargo`, `guest_builder.rs:377-417`; `raster-cli/src/program.rs:229-237` | a toolchain mismatch moves ids without being detected | new |
 | P8 | The chain runner canonicalizes the stage base directory; direct commands use the path as given. Through a symlink, the same stage gets different ids depending on how it was built. | `raster-cli/src/chain.rs:2823` | ids depend on the entry point | new, minor (goes away with P4's fix) |
-| P9 | Lock drift is only detected at prove time (`program identity drift`); `run --commit` does not check. | `raster-cli/src/program.rs:336` | late, confusing failure | issue §2 |
+| P9 | **Fixed 2026-11-04** (open question 4). Lock drift is only detected at prove time (`program identity drift`); `run --commit` does not check. | `raster-cli/src/program.rs:336` | late, confusing failure | issue §2 |
 | P10 | Run artifacts store absolute paths (`run.json` `project_root`, file inputs). | `raster-cli/src/run_manifest.rs:25` | a run directory cannot be moved | issue §3 — **out of scope** |
 | P11 | **Fixed in PR 4** (no-op build 3.3 s → 0.32 s). Not path-related, found along the way, and *revised 2026-11-03* after measuring. risc0-build registers its own `methods.rs` as a rebuild trigger and rewrites that file on every run. So `raster-prover`'s build script reruns on every build, and `raster-prover` recompiles every time. No guest or `raster-core` edit can be missed: the hand-written `defence` gap on `codex/windows-native` is harmless. The real cost is the opposite: a no-op `cargo build -p raster-cli` takes 3.3 s. That may be part of the "cargo no-op build check 8.4 s" recorded for `prompt-prepare`. | `risc0-build-3.0.6/src/lib.rs:820` | every build recompiles `raster-prover` and its dependents | new, measured |
 | P12 | raster's `Cargo.lock` is gitignored and was never committed (iris commits its own). Seeding a tile guest from the project's lockfile (P6) pins versions only where that lockfile is shared. For raster's own examples it is per-machine, so their committed `Raster.lock` ids can still differ between machines. | `.gitignore:5` | example ids depend on each machine's resolve | new, 2026-11-03 |
@@ -129,7 +129,12 @@ Run `cargo metadata --format-version 1` with the full dependency resolve; this t
 - `raster` is the package named `raster` in that graph. If it is missing, report the project and
   say that no `raster` package was found in its dependency graph. There is **no fallback**.
 - The cache key hashes `Cargo.toml` and `src/` of every path package in the guest's graph,
-  replacing the fixed list of three crates.
+  replacing the fixed list of three crates. It also hashes every reachable workspace root's
+  `Cargo.toml`, by stage-relative name. A `workspace = true` dependency takes its version and
+  features from the root's `[workspace.dependencies]`, so a feature changed there changes the guest
+  without touching any package's own files. *Added 2026-11-04 after review:* the first version
+  omitted these (the old builder had hashed raster's root manifest), so such a change reused the
+  stale guest and image id. `raster-prover/build.rs` tracks the same manifests as rerun triggers.
 
 ### 4.3 Staged build (P3, P4, P6, P8)
 
@@ -262,7 +267,7 @@ risc0-build cannot do this itself:
 ### 4.6 Not in this proposal
 
 - P10, run artifacts (issue §3).
-- P9, an early drift check in `run --commit`. Open question 4 asks whether it should ride along.
+- P9, an early drift check in `run --commit`. *Done 2026-11-04*, as open question 4's cheap variant.
 - Docker builds (§8).
 
 ## 5. Migration: every id changes once
@@ -572,8 +577,27 @@ tile, two checkout copies at different paths with different `$CARGO_HOME`s, equa
 3. **Protocol ids.** Should the expected protocol guest ids be committed (for example
    `crates/raster-prover/guest-ids.json`) and checked by a test, so a change that moves them is
    visible in review?
-4. **Drift check.** Should P9 ride along, so that `run --commit` compares the lock with the built
-   ids?
+4. **Drift check.** **Decided 2026-11-04: the cheap variant, implemented.**
+   - **What the lock records:** `Raster.lock` format 3 adds `guest_inputs`, a digest of
+     everything a tile guest compiles besides each tile's own source and the compiler. It is the
+     cache key's inputs without the toolchain, so a machine without a risc0 compiler can still
+     check.
+   - **What is checked:** `run --commit`, and `chain run` once per stage project, check before
+     running anything and build no guest:
+     - each tile's source hash;
+     - the program commitment, recomputed from the current program and the lock's tile ids;
+     - `guest_inputs`, recomputed (two `cargo metadata` calls);
+     - the guest compiler.
+   - **What happens:** a stale lock is refused with one line per cause. A check that cannot run
+     (a format-2 lock, no compiler here, an unresolvable project) warns instead.
+   - **Measured:** a fresh lock commits; a tile edit, a feature changed only in raster's
+     `[workspace.dependencies]`, and a chain stage edited after locking are each refused before
+     anything runs.
+   - **A bug the check exposed, older than this work:** `reassemble_from_lock` never filled the
+     interface schema hashes that `assemble_program` adds (they went into the latter on
+     2026-08-14, `478d1b1`). So the commitment it rebuilt differed from the lock's for any program
+     with a typed input or output. `chain run` uses it whenever a stage's `program.bin` is not
+     cached, and so committed a wrong identity. Fixed alongside.
 5. **Commit raster's `Cargo.lock` (P12)?** **Decided 2026-11-03: yes.** The line was removed from
    `.gitignore`. The four real guests' lockfiles are committed too; the five leftover
    `guests/*/Cargo.lock` without a `Cargo.toml` are not. Recommended because `raster-cli` is a

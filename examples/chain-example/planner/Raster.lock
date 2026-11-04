@@ -1,5 +1,5 @@
 {
-  "format": 2,
+  "format": 3,
   "program_commitment": "6a99d29ddd0ce103783d0a8eaa6c7c2c09103651a95d0ff4c0283068cd17a5a5",
   "tiles": {
     "plan_steps": {
@@ -11,5 +11,6 @@
     "risc0": "risc0-zkvm-3.0.6",
     "build_mode": "local",
     "rustc": "rustc 1.94.1-dev (06e01cb0d 2026-04-09)"
-  }
+  },
+  "guest_inputs": "67fbcc0174204978ea459dce52a00daf4df70b76021c87d43099bb46ea3b2874"
 }
