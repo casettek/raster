@@ -262,7 +262,8 @@ pub struct GuestBuild<'a> {
     /// Must be the value from [`crate::cargo_home`]; the build runs with it.
     pub cargo_home: &'a Path,
     /// Defaults to `<stage>/target`. The target directory does not reach the
-    /// image id, so guests may share one.
+    /// image id, so guests may share one. A relative path is taken against the
+    /// caller's working directory (see [`Self::target_dir`]).
     pub target_dir: Option<&'a Path>,
 }
 
@@ -303,14 +304,22 @@ pub fn prepare_stage(stage: &Stage, krate: &GuestCrate, lockfile: Option<&Path>)
 }
 
 impl GuestBuild<'_> {
+    /// The target directory, absolute. cargo runs in the stage root, while the
+    /// ELF is read back from this process: a relative path would name a
+    /// directory under the stage for cargo and one under the caller's working
+    /// directory for the read, so the build would find no ELF, or an old one.
+    fn target_dir(&self) -> Result<PathBuf> {
+        match self.target_dir {
+            Some(dir) => absolute(dir),
+            None => Ok(self.stage.root().join("target")),
+        }
+    }
+
     pub fn run(&self) -> Result<BuildOutput> {
         let root = self.stage.root();
         prepare_stage(self.stage, &self.krate, self.lockfile)?;
         let lock_path = root.join("Cargo.lock");
-        let target_dir = self
-            .target_dir
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| root.join("target"));
+        let target_dir = self.target_dir()?;
 
         let mut command = Command::new(self.toolchain.cargo());
         // Called from a build script, the outer cargo's CARGO_* variables (its
@@ -481,6 +490,42 @@ mod tests {
             "the guest's own [workspace] is replaced by the stage's"
         );
         assert!(!manifest.contains("some-checkout"), "{manifest}");
+    }
+
+    /// A relative target directory is resolved once, against this process's
+    /// working directory, so cargo (run in the stage) writes where the ELF is
+    /// read back.
+    #[test]
+    fn a_relative_target_dir_is_made_absolute() {
+        let tmp = tempfile::tempdir().unwrap();
+        let toolchain_dir = tmp.path().join("v9.9.9-rust-test");
+        fs::create_dir_all(toolchain_dir.join("bin")).unwrap();
+        for tool in ["cargo", "rustc"] {
+            fs::write(toolchain_dir.join("bin").join(format!("{tool}{}", env::consts::EXE_SUFFIX)), "").unwrap();
+        }
+        let toolchain = Toolchain::from_dir(&toolchain_dir).unwrap();
+        let checkout = tmp.path().join("checkout");
+        fs::create_dir_all(&checkout).unwrap();
+        let plan = StagePlan::new(std::slice::from_ref(&checkout), Some(&checkout)).unwrap();
+        let stage = Stage::create_in(plan, Some(tmp.path())).unwrap();
+        let build = |target_dir| GuestBuild {
+            stage: &stage,
+            krate: GuestCrate::Generated {
+                package: "g".into(),
+                dependencies: Vec::new(),
+                main_rs: String::new(),
+            },
+            lockfile: None,
+            toolchain: &toolchain,
+            cargo_home: tmp.path(),
+            target_dir,
+        };
+
+        let relative = Path::new("target/raster/guest-target");
+        let resolved = build(Some(relative)).target_dir().unwrap();
+        assert!(resolved.is_absolute(), "{}", resolved.display());
+        assert_eq!(resolved, env::current_dir().unwrap().join(relative));
+        assert_eq!(build(None).target_dir().unwrap(), stage.root().join("target"));
     }
 
     #[cfg(unix)]
