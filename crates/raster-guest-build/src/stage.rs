@@ -22,22 +22,23 @@ pub struct StageEntry {
 ///
 /// Let A be the common ancestor of the workspace roots, moved up one level if
 /// it is itself one of them. Each top-level entry under A that holds a
-/// workspace root is staged under its own name. A sits strictly above every
+/// workspace root is staged under its own name, except the one holding the
+/// `raster` workspace, which is staged as [`RASTER_ENTRY`], so the checkout's
+/// own directory name never reaches an image id. A sits strictly above every
 /// workspace root so the stage root's own manifest never replaces one:
 /// raster's root manifest carries the `[workspace.dependencies]` its crates
 /// inherit.
 ///
-/// When the raster workspace's entry is the **only** entry (an in-repo example,
-/// a protocol guest), it is staged as [`RASTER_ENTRY`], so the checkout's own
-/// directory name never reaches an image id. With more than one entry (a
-/// sibling project) every entry keeps its real name: the sibling's manifests
-/// reach raster through it (`../raster-main/crates/raster`), and renaming it
-/// would leave those paths dangling inside the stage. The name is then part of
-/// the project's source anyway.
+/// A sibling project's manifests may name the checkout by its real name
+/// (`../raster-main/crates/raster`). The plan's [`manifests`](Self::manifests)
+/// are kept valid: [`Stage::create`] rewrites any of them whose local paths
+/// change under the rename, in a shadow copy inside the stage, so each package
+/// keeps a single path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StagePlan {
     ancestor: PathBuf,
     entries: Vec<StageEntry>,
+    manifests: Vec<PathBuf>,
 }
 
 impl StagePlan {
@@ -69,19 +70,26 @@ impl StagePlan {
                 .to_path_buf();
         }
 
+        let raster_entry = raster_root.map(|r| top_entry(&ancestor, &normalize(r)));
         let mut by_name: BTreeMap<String, PathBuf> = BTreeMap::new();
         for root in &roots {
             let entry = top_entry(&ancestor, root);
-            let name = entry.to_str().map(str::to_string).ok_or_else(|| {
-                Error::Layout(format!("{} is not valid UTF-8", entry.to_string_lossy()))
-            })?;
-            by_name.insert(name, ancestor.join(&entry));
-        }
-        // Rename only when nothing else in the stage can name the checkout.
-        if let (1, Some(raster_root)) = (by_name.len(), raster_root) {
-            let target = by_name.values().next().expect("one entry").clone();
-            if normalize(raster_root).starts_with(&target) {
-                by_name = BTreeMap::from([(RASTER_ENTRY.to_string(), target)]);
+            let name = if raster_entry.as_ref() == Some(&entry) {
+                RASTER_ENTRY.to_string()
+            } else {
+                entry.to_str().map(str::to_string).ok_or_else(|| {
+                    Error::Layout(format!("{} is not valid UTF-8", entry.to_string_lossy()))
+                })?
+            };
+            let target = ancestor.join(&entry);
+            if let Some(previous) = by_name.insert(name.clone(), target.clone()) {
+                if previous != target {
+                    return Err(Error::Layout(format!(
+                        "both {} and {} would be staged as `{name}`",
+                        previous.display(),
+                        target.display()
+                    )));
+                }
             }
         }
 
@@ -91,7 +99,24 @@ impl StagePlan {
                 .into_iter()
                 .map(|(name, target)| StageEntry { name, target })
                 .collect(),
+            manifests: Vec::new(),
         })
+    }
+
+    /// Keep these real `Cargo.toml` files valid inside the stage (see the type
+    /// docs): every path package's manifest and every workspace root's
+    /// manifest the guest's resolve reads.
+    pub fn with_manifests(mut self, manifests: Vec<PathBuf>) -> Self {
+        let mut manifests: Vec<PathBuf> = manifests.iter().map(|m| normalize(m)).collect();
+        manifests.sort();
+        manifests.dedup();
+        self.manifests = manifests;
+        self
+    }
+
+    /// The manifests [`Stage::create`] keeps valid.
+    pub fn manifests(&self) -> &[PathBuf] {
+        &self.manifests
     }
 
     /// The directory the stage mirrors (A).
@@ -154,6 +179,9 @@ impl Stage {
         for entry in &plan.entries {
             link(&entry.target, &dir.path().join(&entry.name))?;
         }
+        for manifest in &plan.manifests {
+            restage_manifest(dir.path(), &plan, manifest)?;
+        }
         Ok(Self { dir, plan })
     }
 
@@ -170,6 +198,69 @@ impl Stage {
     pub fn relative(&self, real: &Path) -> Result<PathBuf> {
         self.plan.stage_relative(real)
     }
+}
+
+/// If `manifest`'s local paths change under the stage's renames, write the
+/// rewritten copy at its place in the stage. Unchanged manifests stay linked.
+fn restage_manifest(root: &Path, plan: &StagePlan, manifest: &Path) -> Result<()> {
+    let Some(dir) = manifest.parent() else {
+        return Ok(());
+    };
+    let Ok(staged_dir) = plan.stage_relative(dir) else {
+        return Ok(()); // not inside a staged entry
+    };
+    let text = std::fs::read_to_string(manifest)?;
+    let mut table: toml::Table = text
+        .parse()
+        .map_err(|e| Error::Layout(format!("{}: {e}", manifest.display())))?;
+    if !crate::manifest::restage_paths(&mut table, dir, &staged_dir, plan, false)? {
+        return Ok(());
+    }
+    let rewritten = toml::to_string(&table)
+        .map_err(|e| Error::Layout(format!("{}: {e}", manifest.display())))?;
+    materialize(root, &staged_dir)?;
+    let at = root.join(&staged_dir).join("Cargo.toml");
+    // The directory is real now (materialize), but its `Cargo.toml` may still
+    // be a link to the real file: remove the link, never write through it.
+    if at.symlink_metadata().is_ok() {
+        std::fs::remove_file(&at)?;
+    }
+    std::fs::write(&at, rewritten)?;
+    Ok(())
+}
+
+/// Make `root/relative` a real directory, so a file in it can be replaced
+/// without touching the linked original: every symlinked directory on the way
+/// becomes a real directory whose children link to the original's children.
+fn materialize(root: &Path, relative: &Path) -> Result<()> {
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        current.push(component);
+        let metadata = current.symlink_metadata()?;
+        if !metadata.file_type().is_symlink() {
+            continue; // already real (or a copy, without unix symlinks)
+        }
+        let target = std::fs::read_link(&current)?;
+        std::fs::remove_file(&current)?;
+        std::fs::create_dir(&current)?;
+        for child in std::fs::read_dir(&target)? {
+            let name = child?.file_name();
+            link_one(&target.join(&name), &current.join(&name))?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn link_one(target: &Path, at: &Path) -> Result<()> {
+    std::os::unix::fs::symlink(target, at)?;
+    Ok(())
+}
+
+/// Never reached: without unix symlinks entries are copies, never links.
+#[cfg(not(unix))]
+fn link_one(target: &Path, at: &Path) -> Result<()> {
+    link(target, at)
 }
 
 #[cfg(unix)]
@@ -319,28 +410,82 @@ mod tests {
         assert_eq!(names(&plan), vec![("pkg", Path::new("/a/b/pkg"))]);
     }
 
-    /// A sibling project reaching a checkout named `raster-main`: the
-    /// checkout keeps its name, which the project's manifests use.
+    /// A sibling project reaching a checkout named `raster-main`: the checkout
+    /// is still staged as `raster` (its manifests are kept valid on create).
     #[test]
-    fn a_sibling_layout_keeps_the_checkout_name() {
+    fn a_renamed_sibling_checkout_is_staged_as_raster() {
         let raster = p("/p/raster-main");
         let app = p("/p/app");
         let plan = StagePlan::new(&[raster.clone(), app.clone()], Some(&raster)).unwrap();
-        assert_eq!(
-            names(&plan),
-            vec![("app", app.as_path()), ("raster-main", raster.as_path())]
-        );
+        assert_eq!(names(&plan), vec![("app", app.as_path()), ("raster", raster.as_path())]);
         assert_eq!(
             plan.stage_relative(&raster.join("crates/raster")).unwrap(),
-            p("raster-main/crates/raster")
+            p("raster/crates/raster")
         );
-        // A second directory really named `raster` is just another entry.
+    }
+
+    #[test]
+    fn a_name_collision_with_raster_is_an_error() {
+        let raster = p("/p/raster-main");
         let other = p("/p/raster");
-        let plan = StagePlan::new(&[raster.clone(), other.clone()], Some(&raster)).unwrap();
+        let error = StagePlan::new(&[raster.clone(), other], Some(&raster))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("staged as `raster`"), "{error}");
+    }
+
+    /// The reviewed bug: a sibling app depending on `../raster-main/...`.
+    /// Its manifest is rewritten inside the stage, its sources stay linked,
+    /// and nothing in the real tree changes.
+    #[cfg(unix)]
+    #[test]
+    fn a_sibling_manifest_is_restaged_without_touching_the_real_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let raster = tmp.path().join("raster-main");
+        let app = tmp.path().join("app");
+        let write = |path: PathBuf, text: &str| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        write(raster.join("Cargo.toml"), "[workspace]\nmembers = [\"crates/raster\"]\n");
+        write(raster.join("crates/raster/Cargo.toml"), "[package]\nname = \"raster\"\n");
+        write(raster.join("crates/raster/src/lib.rs"), "");
+        let app_manifest = "[package]\nname = \"app\"\n\n[dependencies]\n\
+                            raster = { path = \"../raster-main/crates/raster\" }\n";
+        write(app.join("Cargo.toml"), app_manifest);
+        write(app.join("src/lib.rs"), "// app");
+
+        let plan = StagePlan::new(&[app.clone(), raster.clone()], Some(&raster))
+            .unwrap()
+            .with_manifests(vec![
+                app.join("Cargo.toml"),
+                raster.join("Cargo.toml"),
+                raster.join("crates/raster/Cargo.toml"),
+            ]);
+        let stage = Stage::create_in(plan, Some(tmp.path())).unwrap();
+        let staged_app = stage.root().join("app");
+
+        assert!(!staged_app.symlink_metadata().unwrap().file_type().is_symlink(), "shadowed");
+        let rewritten: toml::Table =
+            std::fs::read_to_string(staged_app.join("Cargo.toml")).unwrap().parse().unwrap();
         assert_eq!(
-            names(&plan),
-            vec![("raster", other.as_path()), ("raster-main", raster.as_path())]
+            rewritten["dependencies"]["raster"]["path"].as_str(),
+            Some("../raster/crates/raster")
         );
+        assert_eq!(std::fs::read_link(staged_app.join("src")).unwrap(), app.join("src"));
+        assert!(
+            stage.root().join("raster").symlink_metadata().unwrap().file_type().is_symlink(),
+            "an entry whose manifests stay valid is not shadowed"
+        );
+        assert!(staged_app.join("../raster/crates/raster/Cargo.toml").is_file());
+        assert_eq!(std::fs::read_to_string(app.join("Cargo.toml")).unwrap(), app_manifest);
+        drop(stage);
+        assert_eq!(
+            std::fs::read_to_string(app.join("Cargo.toml")).unwrap(),
+            app_manifest,
+            "the real manifest survives the stage's removal"
+        );
+        assert!(app.join("src/lib.rs").is_file());
     }
 
     #[test]

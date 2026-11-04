@@ -325,9 +325,11 @@ mod tests {
         assert_eq!(builder.fingerprint().len(), 16);
     }
 
-    /// A sibling project whose raster checkout is not named `raster`. Its
-    /// manifest names the checkout, so the stage must too: staging it as
-    /// `raster` left `../raster-main/...` dangling inside the stage.
+    /// A sibling project whose raster checkout is not named `raster`: the
+    /// stage still names it `raster`, and keeps the project's
+    /// `../raster-main/...` valid by rewriting the manifest inside the stage,
+    /// so raster has one path. (Staging it as `raster` without that rewrite
+    /// left the path dangling and failed the resolve.)
     #[cfg(unix)]
     #[test]
     fn a_renamed_sibling_checkout_resolves() {
@@ -347,8 +349,8 @@ mod tests {
         let builder = GuestBuilder::resolve(&tmp.path().join("out"), &project)
             .unwrap_or_else(|e| panic!("{e}"));
         let names: Vec<&str> = builder.plan.entries().iter().map(|e| e.name.as_str()).collect();
-        assert_eq!(names, vec!["app", "raster-main"], "the checkout keeps its name");
-        assert_eq!(builder.raster_dependency, "raster-main/crates/raster");
+        assert_eq!(names, vec!["app", "raster"], "the checkout's name stays out");
+        assert_eq!(builder.raster_dependency, "raster/crates/raster");
     }
 
     /// A project naming raster by an absolute path. Cargo resolves that path to

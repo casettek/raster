@@ -145,13 +145,20 @@ workspace root inside a stage entry.
    itself in W, move it up one level. A must sit strictly above every workspace root.
 3. **Build the stage.** Create a fresh temp directory as the **stage**. For each top-level entry
    under A that contains an element of W, link `stage/<name>` to `A/<entry>`: a symlink on Unix, a
-   copy without `target/` elsewhere. Entries keep their real names, except one case. When the
-   raster checkout is the **only** entry (an in-repo example, a protocol guest), it is staged as
-   `raster`, so the checkout's own name never reaches an id. *Revised 2026-11-04 after review:*
-   the first version always renamed it, which broke a sibling project depending on
-   `../raster-main/crates/raster`. Inside the stage, that path named an entry that did not exist,
-   and `compute_fingerprint` failed before any build. A sibling's manifests name the checkout, so
-   the name is part of its source anyway.
+   copy without `target/` elsewhere. The entry that contains the `raster` package is **always
+   named `raster`**; the others keep their real names. A manifest outside that entry may name the
+   checkout by its real name (`../raster-main/crates/raster`), which does not exist inside the
+   stage. So every manifest the guest's resolve reads (each path package's, and each workspace
+   root's) is checked. One whose relative local paths change under the rename gets a rewritten
+   copy at its place in the stage. Its directory becomes a real "shadow" directory whose other
+   children link to the originals, so nothing is written to the real tree. The paths covered are
+   dependency tables, `[target.*]`, `[patch.*]`, `[workspace.dependencies]` and
+   `package.workspace`. Each package keeps a single path, and cargo never sees a second copy.
+   *Revised 2026-11-04 after review.* The first version renamed the checkout without the rewrite,
+   so `../raster-main/...` dangled and `compute_fingerprint` failed before any build. Commit
+   `30f9e84` then stopped renaming in sibling layouts, which made the checkout's name part of
+   their ids. Measured: the same sibling app built beside a `raster-main` checkout and beside a
+   `raster` checkout, at different paths, gives the same tile id.
 4. **Write the stage root `Cargo.toml`.** It has `[workspace] exclude = [<names>]`, and:
    - for a **tile guest**, it is also the generated guest package, with dependencies by relative
      path, such as `raster = { path = "raster/crates/raster" }`. The guest's `raster` path is taken
@@ -180,8 +187,7 @@ Once this lands:
   (P8).
 - **It still depends on:**
   - the relative layout beneath A;
-  - in a sibling layout, the real entry names, such as `iris` and the raster checkout's name
-    (open question 1), which the project's manifests spell out anyway;
+  - the real names of entries other than `raster`, such as `iris` (open question 1);
   - the toolchain (§4.5);
   - the lockfile.
 

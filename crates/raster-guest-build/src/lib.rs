@@ -29,6 +29,7 @@
 
 mod fingerprint;
 mod guest;
+mod manifest;
 mod packages;
 mod recipe;
 mod stage;
@@ -84,5 +85,13 @@ pub fn stage_plan(packages: &PathPackages) -> Result<StagePlan> {
         .iter()
         .find_map(|name| packages.get(name))
         .map(|package| package.workspace_root.as_path());
-    StagePlan::new(&packages.workspace_roots(), raster_root)
+    // Every manifest the guest's resolve reads: the path packages' own, and
+    // their workspace roots' (where `workspace = true` dependencies point).
+    let manifests = packages
+        .packages
+        .iter()
+        .flat_map(|p| [p.dir.join("Cargo.toml"), p.workspace_root.join("Cargo.toml")])
+        .filter(|m| m.is_file())
+        .collect();
+    Ok(StagePlan::new(&packages.workspace_roots(), raster_root)?.with_manifests(manifests))
 }

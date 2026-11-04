@@ -97,50 +97,6 @@ pub enum GuestCrate {
 /// own target directory.
 const NOT_LINKED: [&str; 4] = ["Cargo.toml", "Cargo.lock", "target", ".git"];
 
-/// Rewrite every `path` dependency in `manifest` (a guest's, read from `dir`)
-/// to its stage path: `[dependencies]`, `[build-dependencies]`,
-/// `[dev-dependencies]`, their `[target.*]` forms, and `[patch.*]`.
-fn rehome_paths(manifest: &mut toml::Table, dir: &Path, plan: &StagePlan) -> Result<()> {
-    fn rewrite(table: &mut toml::Table, dir: &Path, plan: &StagePlan) -> Result<()> {
-        for (name, dependency) in table.iter_mut() {
-            let Some(dependency) = dependency.as_table_mut() else {
-                continue;
-            };
-            if let Some(path) = dependency.get("path").and_then(|p| p.as_str()) {
-                let real = crate::stage::normalize(&dir.join(path));
-                let staged = plan.stage_relative(&real).map_err(|e| {
-                    Error::Layout(format!("dependency `{name}` ({}): {e}", real.display()))
-                })?;
-                dependency.insert("path".into(), path_string(&staged)?.into());
-            }
-        }
-        Ok(())
-    }
-    const KINDS: [&str; 3] = ["dependencies", "build-dependencies", "dev-dependencies"];
-    for kind in KINDS {
-        if let Some(table) = manifest.get_mut(kind).and_then(|t| t.as_table_mut()) {
-            rewrite(table, dir, plan)?;
-        }
-    }
-    if let Some(targets) = manifest.get_mut("target").and_then(|t| t.as_table_mut()) {
-        for (_, target) in targets.iter_mut() {
-            for kind in KINDS {
-                if let Some(table) = target.get_mut(kind).and_then(|t| t.as_table_mut()) {
-                    rewrite(table, dir, plan)?;
-                }
-            }
-        }
-    }
-    if let Some(patches) = manifest.get_mut("patch").and_then(|t| t.as_table_mut()) {
-        for (_, source) in patches.iter_mut() {
-            if let Some(table) = source.as_table_mut() {
-                rewrite(table, dir, plan)?;
-            }
-        }
-    }
-    Ok(())
-}
-
 /// The stage root's `Cargo.toml` for `krate`.
 pub fn stage_manifest(plan: &StagePlan, krate: &GuestCrate) -> Result<String> {
     let entries: toml::Value = plan
@@ -216,7 +172,8 @@ pub fn stage_manifest(plan: &StagePlan, krate: &GuestCrate) -> Result<String> {
                     guest_manifest.display()
                 )));
             }
-            rehome_paths(&mut manifest, dir, plan)?;
+            // Rehomed at the stage root: its paths become stage paths.
+            crate::manifest::restage_paths(&mut manifest, dir, Path::new(""), plan, true)?;
             // The guest's own `[workspace]`, if any, is replaced by the stage's.
             manifest.remove("workspace");
         }
