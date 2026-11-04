@@ -103,6 +103,7 @@ pub struct ObjectStore {
     memory: BTreeMap<CfsCoordinates, Arc<StoredObject>>,
     referenced: BTreeMap<CfsCoordinates, StoredObject>,
     archive: Option<raster_prover::archive::Archive>,
+    loaded: std::sync::Mutex<LoadedObjects>,
     /// Set once (via `start_program`) for programs that declare `main` entry
     /// arguments; `None` otherwise, and never consulted unless a `Referenced`
     /// object actually needs resolving.
@@ -115,6 +116,58 @@ impl std::fmt::Debug for ObjectStore {
             .field("objects", &self.objects)
             .field("has_source_resolver", &self.source_resolver.is_some())
             .finish()
+    }
+}
+
+/// Disk-backed objects recently read, so a run of small reads from one large
+/// object parses its index once and leaves its bytes on disk. An object never
+/// changes once written, so an entry is never stale; the budget bounds the
+/// indexes and small values held.
+#[derive(Default)]
+struct LoadedObjects {
+    objects: BTreeMap<CfsCoordinates, (Arc<StoredObject>, u64, usize)>,
+    by_use: BTreeMap<u64, CfsCoordinates>,
+    clock: u64,
+    resident: usize,
+}
+
+const LOADED_OBJECTS_BUDGET: usize = 256 << 20;
+/// Charged per entry, so many tiny objects cannot grow the cache unbounded.
+const LOADED_OBJECT_OVERHEAD: usize = 512;
+
+impl LoadedObjects {
+    fn get(&mut self, coordinates: &CfsCoordinates) -> Option<Arc<StoredObject>> {
+        let (stored, used, _) = self.objects.get_mut(coordinates)?;
+        self.by_use.remove(used);
+        self.clock += 1;
+        *used = self.clock;
+        self.by_use.insert(self.clock, coordinates.clone());
+        Some(Arc::clone(stored))
+    }
+
+    fn insert(&mut self, coordinates: CfsCoordinates, stored: Arc<StoredObject>, resident: usize) {
+        let resident = resident + LOADED_OBJECT_OVERHEAD;
+        if resident > LOADED_OBJECTS_BUDGET {
+            return;
+        }
+        while self.resident + resident > LOADED_OBJECTS_BUDGET {
+            let Some((_, oldest)) = self.by_use.pop_first() else {
+                break;
+            };
+            if let Some((_, _, size)) = self.objects.remove(&oldest) {
+                self.resident -= size;
+            }
+        }
+        self.clock += 1;
+        self.by_use.insert(self.clock, coordinates.clone());
+        self.resident += resident;
+        if let Some((_, used, size)) = self
+            .objects
+            .insert(coordinates, (stored, self.clock, resident))
+        {
+            self.by_use.remove(&used);
+            self.resident -= size;
+        }
     }
 }
 
@@ -265,6 +318,7 @@ impl ObjectStore {
             memory: BTreeMap::new(),
             referenced: BTreeMap::new(),
             archive: disk.then(raster_prover::archive::Archive::current),
+            loaded: Default::default(),
             source_resolver: None,
         }
     }
@@ -415,7 +469,7 @@ impl ObjectStore {
                     value,
                 ))
             }
-            ObjectBacking::Derived(_) => {
+            ObjectBacking::Derived(_) | ObjectBacking::Archived(_) => {
                 let view = Self::raster_view(&stored, &reference.coordinates)?;
                 let (bytes, selection, value) = resolve_whole_view::<T>(&view)?;
                 Ok(StorageValue::new_with_selection(
@@ -464,6 +518,11 @@ impl ObjectStore {
                 bytes: ObjectBytes::Pieces(derived.pieces.clone()),
                 root: derived.root,
             }),
+            ObjectBacking::Archived(archived) => Ok(RasterView {
+                index: archived.index.clone(),
+                bytes: ObjectBytes::Pieces(archived.pieces.clone()),
+                root: archived.root,
+            }),
             ObjectBacking::Referenced(_) => Err(Error::Other(format!(
                 "Object at coordinates {:?} holds entry arguments, not raster bytes",
                 coordinates
@@ -476,15 +535,24 @@ impl ObjectStore {
             Some(Arc::clone(stored))
         } else if let Some(stored) = self.referenced.get(&reference.coordinates) {
             Some(Arc::new(stored.clone()))
-        } else if let Some((reference, backing)) = self
-            .objects
-            .as_ref()
-            .and_then(|s| s.get(&reference.coordinates))
-        {
-            Some(Arc::new(StoredObject {
-                reference,
-                backing: backing.load(self.archive.as_ref().expect("disk storage"))?,
-            }))
+        } else if let Some(objects) = self.objects.as_ref() {
+            let mut loaded = self.loaded.lock().expect("loaded objects lock");
+            match loaded.get(&reference.coordinates) {
+                Some(stored) => Some(stored),
+                None => match objects.get(&reference.coordinates) {
+                    Some((stored_reference, persisted)) => {
+                        let (backing, resident) =
+                            persisted.load(self.archive.as_ref().expect("disk storage"))?;
+                        let stored = Arc::new(StoredObject {
+                            reference: stored_reference,
+                            backing,
+                        });
+                        loaded.insert(reference.coordinates.clone(), Arc::clone(&stored), resident);
+                        Some(stored)
+                    }
+                    None => None,
+                },
+            }
         } else {
             None
         };
@@ -516,6 +584,15 @@ impl ObjectStore {
                 )));
             }
         }
+        // The same check as an in-memory raster object: its commitment is its root.
+        if let ObjectBacking::Archived(archived) = &stored.backing {
+            if archived.root.as_slice() != reference.commitment.as_slice() {
+                return Err(Error::Other(format!(
+                    "Storage object at coordinates {:?} failed integrity check",
+                    reference.coordinates
+                )));
+            }
+        }
         Ok(stored)
     }
 
@@ -537,7 +614,7 @@ impl ObjectStore {
     ) -> Result<SelectionWitness> {
         let stored = self.verify_reference(reference)?;
         match &stored.backing {
-            ObjectBacking::Owned(_) | ObjectBacking::Derived(_) => {
+            ObjectBacking::Owned(_) | ObjectBacking::Derived(_) | ObjectBacking::Archived(_) => {
                 let view = Self::raster_view(&stored, &reference.coordinates)?;
                 let index = view.index;
                 let selection = index.select(selector)?;
@@ -580,7 +657,7 @@ impl ObjectStore {
     ) -> Result<AuthenticatedListMetadata> {
         let stored = self.verify_reference(reference)?;
         match &stored.backing {
-            ObjectBacking::Owned(_) | ObjectBacking::Derived(_) => {
+            ObjectBacking::Owned(_) | ObjectBacking::Derived(_) | ObjectBacking::Archived(_) => {
                 let index = Self::raster_view(&stored, &reference.coordinates)?.index;
                 let (len, elements_root) = index.list_metadata(selector)?;
                 // Every selection into an owned object anchors to the object's
@@ -610,7 +687,7 @@ impl ObjectStore {
     ) -> Result<StorageValue<T>> {
         let stored = self.verify_reference(reference)?;
         match &stored.backing {
-            ObjectBacking::Owned(_) | ObjectBacking::Derived(_) => {
+            ObjectBacking::Owned(_) | ObjectBacking::Derived(_) | ObjectBacking::Archived(_) => {
                 let view = Self::raster_view(&stored, &reference.coordinates)?;
                 let index = view.index;
                 let selection = index.locate(selector)?;
@@ -1776,6 +1853,12 @@ pub fn stored_object_output(
                     .with_derived((**delta).clone()),
             );
         }
+        if let ObjectBacking::Archived(archived) = &stored.backing {
+            return Ok(
+                raster_core::trace::FnOutput::new(Vec::new(), ty.to_string())
+                    .with_raster(archived.payload()?),
+            );
+        }
         let ObjectBacking::Owned(owned) = &stored.backing else {
             return Err(Error::Other(format!(
                 "Object at coordinates {:?} is not one the program wrote",
@@ -2351,5 +2434,95 @@ mod tests {
         let _ = stored_object_output(&derived, "BigDraft").expect("close output");
         assert_eq!(count() - before, 7);
         exit_recur_site_scope();
+    }
+
+    /// A disk-backed list is loaded once for a run of element reads: later
+    /// reads reuse its parsed index, and every read answers as from memory.
+    #[test]
+    fn disk_reads_of_one_list_reuse_one_load_and_match_memory() {
+        use raster_core::input::SelectorSegment;
+        let value: raster_core::List<u64> = (0..4096u64).map(|i| i * 3).collect();
+        let (bytes, index_bytes, root) = crate::encode_raster_value(&value).unwrap();
+        let root_hash: [u8; 32] = (0..32)
+            .map(|i| u8::from_str_radix(&root[i * 2..i * 2 + 2], 16).unwrap())
+            .collect::<Vec<_>>()
+            .try_into()
+            .unwrap();
+        let reads = |policy| {
+            let mut store = ObjectStore::with_storage(policy);
+            let entry = store.append_serialized_bytes(
+                &raster_core::postcard::to_allocvec(&value).unwrap(),
+                CfsCoordinates(vec![1]),
+                Some(raster_core::trace::RasterPayload {
+                    bytes: bytes.clone(),
+                    index_bytes: index_bytes.clone(),
+                    root_hash,
+                }),
+            );
+            let reference = StorageRef::new(entry.coordinates, entry.object_commitment);
+            let mut out = Vec::new();
+            for i in [0u64, 1, 2047, 4095] {
+                let selector = SelectorPath::new(vec![SelectorSegment::Index(i)]);
+                let selected = store.select::<u64>(&reference, &selector).unwrap();
+                assert_eq!(selected.value, i * 3);
+                let witness = store
+                    .selection_witness(&reference, &selector, SelectionPayloadKind::Raw)
+                    .unwrap();
+                out.push((selected.bytes, witness));
+            }
+            let metadata = store
+                .list_metadata_selection(&reference, &SelectorPath::default())
+                .unwrap();
+            let whole = store.resolve::<raster_core::List<u64>>(&reference).unwrap();
+            assert_eq!(whole.value.to_vec(), value.to_vec());
+            (store, reference, out, metadata, whole.bytes)
+        };
+        let (_, _, memory_reads, memory_metadata, memory_whole) =
+            reads(crate::WorkingStorage::Memory);
+        let (disk, reference, disk_reads, disk_metadata, disk_whole) =
+            reads(crate::WorkingStorage::Disk);
+        assert_eq!(disk_reads, memory_reads);
+        assert_eq!(disk_metadata, memory_metadata);
+        assert_eq!(disk_whole, memory_whole);
+
+        let first = disk.verify_reference(&reference).unwrap();
+        let second = disk.verify_reference(&reference).unwrap();
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "the second read reloaded the object"
+        );
+        assert!(matches!(first.backing, ObjectBacking::Archived(_)));
+        assert_eq!(disk.loaded.lock().unwrap().objects.len(), 1);
+    }
+
+    #[test]
+    fn loaded_objects_evict_the_least_recently_used_within_budget() {
+        let stored = Arc::new(StoredObject {
+            reference: StorageRef::new(CfsCoordinates(vec![0]), Vec::new()),
+            backing: ObjectBacking::Owned(OwnedObject {
+                bytes: Vec::new(),
+                raster: None,
+            }),
+        });
+        let third = LOADED_OBJECTS_BUDGET / 3;
+        let mut loaded = LoadedObjects::default();
+        for key in 1..=3 {
+            loaded.insert(CfsCoordinates(vec![key]), Arc::clone(&stored), third - 1024);
+        }
+        assert!(loaded.get(&CfsCoordinates(vec![1])).is_some()); // now most recent
+        loaded.insert(CfsCoordinates(vec![4]), Arc::clone(&stored), third - 1024);
+        assert!(
+            loaded.get(&CfsCoordinates(vec![2])).is_none(),
+            "oldest is evicted"
+        );
+        for key in [1, 3, 4] {
+            assert!(loaded.get(&CfsCoordinates(vec![key])).is_some());
+        }
+        assert!(loaded.resident <= LOADED_OBJECTS_BUDGET);
+        loaded.insert(CfsCoordinates(vec![5]), stored, LOADED_OBJECTS_BUDGET);
+        assert!(
+            loaded.get(&CfsCoordinates(vec![5])).is_none(),
+            "oversized is not cached"
+        );
     }
 }
