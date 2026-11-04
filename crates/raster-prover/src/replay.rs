@@ -37,6 +37,13 @@ pub struct CallMeasure {
     pub exec_time: Duration,
 }
 
+pub(crate) struct MeasuredTile {
+    pub measure: CallMeasure,
+    pub raw_journal: Vec<u8>,
+    pub journal: TileReplayJournal,
+    pub image_id: String,
+}
+
 /// A tile compiled (or loaded from the cache) once, for measuring any number of
 /// its recorded calls. Never produces or accepts a receipt.
 pub struct PreparedTileProfile<'a> {
@@ -53,6 +60,14 @@ impl PreparedTileProfile<'_> {
     /// recording: its input commitment must be `sha256(input)` and its output the
     /// recorded output. A call that does not is an error, not a measurement.
     pub fn measure(&self, input: &[u8], expected_output: &[u8]) -> Result<CallMeasure> {
+        Ok(self.measure_with_journal(input, expected_output)?.measure)
+    }
+
+    pub(crate) fn measure_with_journal(
+        &self,
+        input: &[u8],
+        expected_output: &[u8],
+    ) -> Result<MeasuredTile> {
         let started = Instant::now();
         let result =
             self.backend
@@ -66,7 +81,8 @@ impl PreparedTileProfile<'_> {
         let journal = result
             .journal
             .ok_or_else(|| Error::Other("Executor returned no journal".into()))?;
-        let journal: TileReplayJournal = raster_core::postcard::from_bytes(&journal)
+        let raw_journal = journal;
+        let journal: TileReplayJournal = raster_core::postcard::from_bytes(&raw_journal)
             .map_err(|e| Error::Other(format!("Failed to decode replay journal: {e}")))?;
         let expected_commitment: [u8; 32] = Sha256::digest(input).into();
         if journal.input_commitment != expected_commitment {
@@ -85,11 +101,16 @@ impl PreparedTileProfile<'_> {
         if result.segments.is_empty() {
             return Err(Error::Other("Executor reported no segments".into()));
         }
-        Ok(CallMeasure {
-            user_cycles,
-            padded_cycles: padded_proof_cycles(&result.segments),
-            segments: result.segments,
-            exec_time,
+        Ok(MeasuredTile {
+            raw_journal,
+            journal,
+            image_id: self.image_id(),
+            measure: CallMeasure {
+                user_cycles,
+                padded_cycles: padded_proof_cycles(&result.segments),
+                segments: result.segments,
+                exec_time,
+            },
         })
     }
 }

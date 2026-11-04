@@ -6,6 +6,8 @@
 //! - Trace capture and storage
 
 pub mod auth;
+mod working_storage;
+pub use working_storage::WorkingStorage;
 mod backing;
 mod entry_arguments;
 pub mod input;
@@ -60,3 +62,5 @@ pub use tracing::{
     recorder::TraceRecorder,
     RecurTraceScopeGuard, TraceFormat, OUTPUT_DIR_ENV, TRACE_FORMAT_ENV, TRACE_PATH_ENV,
 };
+
+pub mod selective_profile;

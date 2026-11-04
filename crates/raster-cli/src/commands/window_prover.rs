@@ -10,11 +10,13 @@
 
 use raster_core::cfs::ControlFlowSchema;
 use raster_core::merkle::EMPTY_LEAF;
-use raster_core::trace::Trace;
+
 use raster_core::transition::{TransitionJournal, TransitionState};
 use raster_core::{Error, Result};
 use raster_prover::replay::Replayer;
-use raster_prover::trace::{FraudEvidence, TraceCommitment, TraceCommitmentExt, TraceVerifier};
+use raster_prover::trace::{
+    commitment_header, CommitmentRead, FraudEvidence, TraceRead, TraceVerifier,
+};
 use raster_runtime::TraceRecorder;
 
 /// How a proven window ended — read from the journal, never assumed.
@@ -47,19 +49,19 @@ pub struct WindowProof {
 }
 
 /// Proves windows of one trace against one named commitment.
-pub struct WindowProver<'a> {
-    trace: &'a Trace,
-    commitment: &'a TraceCommitment,
+pub struct WindowProver<'a, T: TraceRead, C: CommitmentRead + Clone> {
+    trace: &'a T,
+    commitment: &'a C,
     cfs: &'a ControlFlowSchema,
     recorder: &'a TraceRecorder,
     replayer: &'a Replayer<'a>,
     input_manifest: Option<&'a str>,
 }
 
-impl<'a> WindowProver<'a> {
+impl<'a, T: TraceRead, C: CommitmentRead + Clone> WindowProver<'a, T, C> {
     pub fn new(
-        trace: &'a Trace,
-        commitment: &'a TraceCommitment,
+        trace: &'a T,
+        commitment: &'a C,
         cfs: &'a ControlFlowSchema,
         recorder: &'a TraceRecorder,
         replayer: &'a Replayer<'a>,
@@ -116,7 +118,7 @@ impl<'a> WindowProver<'a> {
             )));
         }
         // Every proof names the commitment this prover was built for.
-        if journal.refuted_trace_commitment != self.commitment.header().digest() {
+        if journal.refuted_trace_commitment != commitment_header(self.commitment).digest() {
             return Err(Error::Other(
                 "the proven window names a different trace commitment".into(),
             ));

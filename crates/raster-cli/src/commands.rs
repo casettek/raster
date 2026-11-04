@@ -1,4 +1,5 @@
 //! Command implementations for the Raster CLI.
+pub mod audit;
 pub mod fraud;
 pub mod prove;
 pub mod replay;
@@ -739,3 +740,5 @@ mod tests {
         assert_eq!(unique_run_ids.len(), artifacts.len());
     }
 }
+
+pub mod selective;

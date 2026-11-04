@@ -21,7 +21,9 @@ cargo raster replay report target/raster/runs/<run-id>
 Requirements:
 - **A completed authenticated run.** `run` writes `run.json` into the run directory only when the
   program completed. `run.json` records the input files and the CFS digest. `--no-auth` runs
-  record no trace, and failed runs are incomplete, so neither can be profiled.
+  record no trace, and failed runs are incomplete, so neither can be profiled. When using
+  `run --commit`, also pass `--save-trace`; live commitments alone do not retain replay data.
+  `run --audit` streams verification without retaining a replay trace.
 - **The RISC Zero guest toolchain.** Each tile's guest is compiled on first use and cached, the
   same as for `cargo raster build --backend risc0`.
 - **A release build of `cargo-raster` for meaningful times.** The executor runs inside the

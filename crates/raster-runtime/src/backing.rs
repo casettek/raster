@@ -124,13 +124,20 @@ pub(crate) enum PieceSource {
     Object(Arc<RasterObject>),
     /// Bytes a derivation added: headers it rewrote and elements it appended.
     Tail(Arc<Vec<u8>>),
+    Disk(
+        raster_prover::archive::Archive,
+        raster_prover::archive::Blob,
+    ),
 }
 
 impl PieceSource {
-    fn bytes(&self) -> &[u8] {
+    fn read(&self, from: u64, len: u64) -> Result<Vec<u8>> {
         match self {
-            Self::Object(object) => &object.payload.bytes,
-            Self::Tail(bytes) => bytes,
+            Self::Object(object) => object.payload.bytes.read_subtree(from, len),
+            Self::Tail(bytes) => bytes.read_subtree(from, len),
+            Self::Disk(archive, blob) => archive
+                .read(*blob, from, len)
+                .map_err(|e| Error::Other(format!("Read stored object: {e}"))),
         }
     }
 }
@@ -146,6 +153,7 @@ impl PieceTable {
             let same = match (&last.source, &source) {
                 (PieceSource::Object(a), PieceSource::Object(b)) => Arc::ptr_eq(a, b),
                 (PieceSource::Tail(a), PieceSource::Tail(b)) => Arc::ptr_eq(a, b),
+                (PieceSource::Disk(a, x), PieceSource::Disk(b, y)) => a.same_session(b) && x == y,
                 _ => false,
             };
             if same && last.source_offset + last.len == source_offset {
@@ -170,7 +178,9 @@ impl PieceTable {
         let end = offset
             .checked_add(len)
             .filter(|end| *end <= self.len)
-            .ok_or_else(|| Error::Serialization("Raster subtree points outside the object".into()))?;
+            .ok_or_else(|| {
+                Error::Serialization("Raster subtree points outside the object".into())
+            })?;
         let mut out = Vec::new();
         let first = self
             .pieces
@@ -193,7 +203,7 @@ impl RasterData for PieceTable {
     fn read_subtree(&self, offset: u64, len: u64) -> Result<Vec<u8>> {
         let mut out = Vec::with_capacity(len as usize);
         for (source, from, take) in self.ranges(offset, len)? {
-            out.extend_from_slice(&source.bytes()[from as usize..(from + take) as usize]);
+            out.extend_from_slice(&source.read(from, take)?);
         }
         Ok(out)
     }
@@ -1031,5 +1041,118 @@ mod tests {
         let err = check_schema_page_sizes(&raster_core::Bytes::<4>::schema(), &index, &data)
             .unwrap_err();
         assert!(matches!(err, Error::PageShape { .. }));
+    }
+}
+
+/// Only descriptors survive between operations; derived pieces never retain old buffers.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) enum PersistedBacking {
+    Owned {
+        bytes: raster_prover::archive::Blob,
+        raster: Option<RasterPayloadDescriptor>,
+    },
+    Derived {
+        pieces: Vec<(raster_prover::archive::Blob, u64, u64)>,
+        index: Vec<u8>,
+        root: Hash32,
+        delta: Option<raster_core::trace::DerivedPayload>,
+    },
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct RasterPayloadDescriptor {
+    bytes: raster_prover::archive::Blob,
+    index_bytes: Vec<u8>,
+    root_hash: Hash32,
+}
+
+impl PersistedBacking {
+    pub(crate) fn store(
+        backing: &ObjectBacking,
+        archive: &raster_prover::archive::Archive,
+    ) -> Result<Self> {
+        let append = |bytes: &[u8]| {
+            archive
+                .append(bytes)
+                .map_err(|e| Error::Other(format!("Persist stored object: {e}")))
+        };
+        Ok(match backing {
+            ObjectBacking::Owned(owned) => Self::Owned {
+                bytes: append(&owned.bytes)?,
+                raster: owned
+                    .raster
+                    .as_ref()
+                    .map(|object| {
+                        Ok::<_, Error>(RasterPayloadDescriptor {
+                            bytes: append(&object.payload.bytes)?,
+                            index_bytes: object.payload.index_bytes.clone(),
+                            root_hash: object.payload.root_hash,
+                        })
+                    })
+                    .transpose()?,
+            },
+            ObjectBacking::Derived(derived) => {
+                let mut pieces = Vec::with_capacity(derived.pieces.pieces.len());
+                for piece in &derived.pieces.pieces {
+                    let (blob, offset) = match &piece.source {
+                        PieceSource::Disk(owner, blob) if archive.same_session(owner) => {
+                            (*blob, piece.source_offset)
+                        }
+                        source => (append(&source.read(piece.source_offset, piece.len)?)?, 0),
+                    };
+                    pieces.push((blob, offset, piece.len));
+                }
+                Self::Derived {
+                    pieces,
+                    index: derived.index.encode()?,
+                    root: derived.root,
+                    delta: derived.delta.as_deref().cloned(),
+                }
+            }
+            ObjectBacking::Referenced(_) => {
+                return Err(Error::Other(
+                    "Referenced objects have no payload to persist".into(),
+                ))
+            }
+        })
+    }
+
+    pub(crate) fn load(self, archive: &raster_prover::archive::Archive) -> Result<ObjectBacking> {
+        let read = |blob: raster_prover::archive::Blob| {
+            archive
+                .read(blob, 0, blob.len)
+                .map_err(|e| Error::Other(format!("Read stored object: {e}")))
+        };
+        Ok(match self {
+            Self::Owned { bytes, raster } => ObjectBacking::Owned(OwnedObject {
+                bytes: read(bytes)?,
+                raster: raster
+                    .map(|payload| {
+                        Ok::<_, Error>(Arc::new(RasterObject::new(RasterPayload {
+                            bytes: read(payload.bytes)?,
+                            index_bytes: payload.index_bytes,
+                            root_hash: payload.root_hash,
+                        })))
+                    })
+                    .transpose()?,
+            }),
+            Self::Derived {
+                pieces,
+                index,
+                root,
+                delta,
+            } => {
+                let mut table = PieceTable::default();
+                for (blob, offset, len) in pieces {
+                    table.push(PieceSource::Disk(archive.clone(), blob), offset, len);
+                }
+                ObjectBacking::Derived(DerivedObject {
+                    pieces: Arc::new(table),
+                    index: Arc::new(RasterIndex::from_bytes(&index)?),
+                    root,
+                    delta: delta.map(Arc::new),
+                })
+            }
+        })
     }
 }

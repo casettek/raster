@@ -150,3 +150,106 @@ v0 - Initial implementation in progress. Core functionality includes:
 
 
 at your option.
+
+### Live commitments and trace retention
+
+`cargo raster run --commit commit.bin --fraud-proof-window-size 128` builds the
+commitment as the program emits events. Authenticated `cargo raster chain run`
+uses the same path for every stage. Add the usual `--input` and `--input-manifest`
+arguments when the program needs them. General window defaults are unchanged.
+
+These runs keep working objects, indexes, and fingerprint blocks in RAM; they do
+not spill to disk. Memory use can grow with the program. The finished commitment
+is published only after successful execution. Normal output artifacts are still
+written. No raw trace is saved by default.
+
+Add `--save-trace` to retain `trace.bin` (or `--trace-format json` for
+`trace.ndjson`) for debugging, `trace commit`, or `trace audit`. Recording a trace
+still builds the commitment live. Plain `run` and deliberate fraud injection retain their recorded-execution paths. Without a saved
+trace, later proof generation requires executing the program again.
+
+### Live audit and fault proof
+
+Commitment generation and audit must use matching Raster versions. The compact
+coordinate index and explicit fallible-result selections adopted from main change
+execution commitments and proof inputs. Regenerate commitments and program locks
+from source when upgrading from the earlier index/implicit-selection implementation;
+do not reuse its disputed commitments with the new prover. Existing receipts must
+be verified with their matching proof-program version.
+
+Live recording and proof preparation use main's compact in-memory coordinate
+index directly. Saved-trace workflows may still use disk storage for other data,
+but their coordinate indexes also reside in RAM.
+
+From a Raster program directory, run:
+
+```sh
+cargo raster run --input input.json --input-manifest input_manifest.json \
+  --audit disputed.bin --proof-output fault.receipt --report audit.json
+```
+
+The supplied commitment determines the window size. Execution compares each
+step as it happens and stops at the first detected mismatch; Raster then proves
+and verifies that window. It creates neither another commitment nor a raw trace.
+The report distinguishes `proved` from `no-fault`. An honest audit runs through
+the final boundary and checks the complete length. Failed or interrupted native
+execution is never treated as divergence.
+
+Audit working state stays in RAM and may grow with the program. A temporary
+proof-evidence artifact connects native execution to the prover; proof generation
+may use its normal working files. Proof and report destinations default to the
+run artifact directory. Saved-trace commands remain available for existing files,
+but live audit does not invoke them. Retrying a failed live proof reruns the audit.
+
+### Compress a saved fault proof
+
+Convert an already-produced fault receipt into a locally verified Groth16 receipt:
+
+```bash
+cargo raster proof compress \
+  --receipt /path/to/fault.receipt \
+  --commitment /path/to/disputed-commit.bin \
+  --output /path/to/new-compression-directory
+```
+
+This command works outside a Raster project. It does not execute the program,
+rerun audit, or regenerate fault-window proofs. It verifies the input against the
+transition verifier embedded in the installed Raster version, checks the finished
+fault verdict against the disputed commitment's canonical header digest, compresses
+locally, then independently verifies the output and unchanged claim and public
+journal. Receipts from incompatible verifier versions are rejected; use their
+matching Raster build. Development mode and fake receipts are forbidden.
+
+For composite or succinct inputs, the Groth16 wrapping step requires a working
+local Docker engine: `docker info` must succeed. Build Raster with
+`--features cuda` to accelerate STARK proof compression on the GPU. RISC Zero's
+`cuda` feature also switches the final Groth16 wrapper from Docker to its native
+CUDA prover, which hit an illegal CUDA memory access on an RTX 5080. The first
+run may download proving assets/container images. Remote proving settings are
+not used.
+Already-Groth16 inputs are verified and exported without recompression or Docker.
+
+
+The output parent must exist and the destination must be new. The command writes
+`fault.groth16.receipt` and `compression.json` into a unique temporary sibling,
+then publishes the directory atomically without replacing an existing path.
+Neither input is modified. Cancellation before publication produces no final
+output; abrupt process termination may leave a temporary directory to clean up.
+Compression can require substantial memory, disk space, and time; no runtime or
+memory bound is promised.
+
+The report distinguishes proof-only seal bytes from serialized receipt bytes,
+records file hashes, verifier/program/commitment identities, and separates input
+verification, compression, and output verification timings. The receipt remains
+Raster's Postcard receipt format: it is **not** encoded contract calldata. This
+command does not deploy contracts, submit transactions, update Iris/backend/UI
+metrics.
+
+`run --audit` and `trace audit` now automatically compress and verify completed
+fault proofs before publishing `fault.receipt`. Docker must be available before
+fault proving starts. The receipt path and Postcard encoding remain unchanged;
+the receipt now contains a Groth16 proof. Compression failures publish no new
+fault receipt. Audit reports include `receipt_format` and `proof_seal_bytes`,
+and `proof_duration_ms` includes compression and verification. Compression
+progress stays within the existing `proving` phase. Intermediate transition
+receipts and chain evidence construction are unchanged.

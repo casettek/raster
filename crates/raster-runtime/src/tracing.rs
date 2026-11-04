@@ -1,4 +1,5 @@
 pub mod commitment;
+pub mod proof_input;
 pub mod publishers;
 pub mod recorder;
 
@@ -12,6 +13,9 @@ use std::cell::Cell;
 use std::str::FromStr;
 use std::sync::Once;
 
+pub const COMMIT_PATH_ENV: &str = "RASTER_COMMIT_PATH";
+pub const COMMIT_PROJECT_ENV: &str = "RASTER_COMMIT_PROJECT";
+pub const COMMIT_WINDOW_ENV: &str = "RASTER_COMMIT_WINDOW_SIZE";
 pub const TRACE_FORMAT_ENV: &str = "RASTER_TRACE_FORMAT";
 pub const TRACE_PATH_ENV: &str = "RASTER_TRACE_PATH";
 /// Directory the program's output artifact (`output.bin` / `output.rindex` /
@@ -63,8 +67,8 @@ impl FromStr for TraceFormat {
 
 /// Initializes tracing for a program entry point.
 ///
-/// `cargo raster run` sets `RASTER_TRACE_PATH`, which enables trace capture
-/// for the CLI. `RASTER_TRACE_FORMAT` selects the file format and defaults to
+/// Commitment runs set `RASTER_COMMIT_PATH` and process events live in RAM.
+/// `RASTER_TRACE_PATH` optionally enables saved trace capture for the CLI. `RASTER_TRACE_FORMAT` selects the file format and defaults to
 /// `binary`. Plain Rust runs stay quiet by default.
 ///
 /// This function should be called once at the start of your program.
@@ -97,28 +101,64 @@ pub fn init() {
         return;
     }
 
+    if std::env::var_os(COMMIT_PATH_ENV).is_some()
+        || std::env::var_os(publishers::audit::AUDIT_PATH_ENV).is_some()
+    {
+        crate::working_storage::select(crate::WorkingStorage::Memory);
+    }
     init_runtime_state();
     if GLOBAL_PUBLISHER.get().is_some() {
         return;
     }
 
-    if let Some(trace_path) = std::env::var_os(TRACE_PATH_ENV) {
-        match trace_format_from_env() {
-            TraceFormat::Binary => {
-                let publisher = BinaryTraceEventPublisher::from_path(trace_path.into())
-                    .unwrap_or_else(|error| {
-                        panic!("Failed to initialize binary trace publisher: {}", error)
-                    });
-                install_publisher(publisher);
-            }
-            TraceFormat::Json => {
-                let publisher = JsonTraceEventPublisher::from_path(trace_path.into())
-                    .unwrap_or_else(|error| {
-                        panic!("Failed to initialize JSON trace publisher: {}", error)
-                    });
-                install_publisher(publisher);
-            }
-        }
+    if let Some(disputed) = std::env::var_os(publishers::audit::AUDIT_PATH_ENV) {
+        use publishers::audit::*;
+        install_publisher(
+            AuditPublisher::new(
+                std::env::var_os(AUDIT_PROJECT_ENV)
+                    .expect("audit project")
+                    .into(),
+                disputed.into(),
+                std::env::var_os(AUDIT_OUTPUT_ENV)
+                    .expect("audit pending output")
+                    .into(),
+                std::env::var(AUDIT_BINDING_ENV).expect("audit binding"),
+            )
+            .expect("initialize live audit"),
+        );
+        return;
+    }
+
+    let trace: Option<Box<dyn Publisher>> =
+        std::env::var_os(TRACE_PATH_ENV).map(|trace_path| match trace_format_from_env() {
+            TraceFormat::Binary => Box::new(
+                BinaryTraceEventPublisher::from_path(trace_path.into())
+                    .expect("initialize binary trace"),
+            ) as Box<dyn Publisher>,
+            TraceFormat::Json => Box::new(
+                JsonTraceEventPublisher::from_path(trace_path.into())
+                    .expect("initialize JSON trace"),
+            ) as Box<dyn Publisher>,
+        });
+    if let Some(output) = std::env::var_os(COMMIT_PATH_ENV) {
+        let project = std::env::var_os(COMMIT_PROJECT_ENV).expect("missing commitment project");
+        let window = std::env::var(COMMIT_WINDOW_ENV)
+            .expect("missing commitment window")
+            .parse()
+            .expect("invalid commitment window");
+        let config = raster_prover::trace::FraudProofConfig::from_window_size(window)
+            .expect("invalid commitment window");
+        install_publisher(
+            publishers::commitment::CommitmentPublisher::new(
+                project.into(),
+                output.into(),
+                config,
+                trace,
+            )
+            .expect("initialize live commitment"),
+        );
+    } else if let Some(trace) = trace {
+        let _ = GLOBAL_PUBLISHER.set(trace);
     }
 }
 
