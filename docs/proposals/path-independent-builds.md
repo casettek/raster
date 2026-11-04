@@ -189,7 +189,7 @@ workspace root inside a stage entry.
 Once this lands:
 - **An image id no longer depends on:** the absolute location, any folder's name (the raster
   checkout is staged as `raster`, the project's folder as `project`, any other folder of local
-  crates as `dep-<its first crate>`; open question 1, decided 2026-11-04), the user name,
+  crates as `dep-<its first crate>-<version>`; open question 1, decided 2026-11-04), the user name,
   `$CARGO_HOME`, the temp directory, or whether the layout is reached through a symlink (P8).
 - **It still depends on:**
   - the relative layout beneath A: how deep the project sits relative to raster, which its
@@ -566,11 +566,14 @@ tile, two checkout copies at different paths with different `$CARGO_HOME`s, equa
 
 1. **Names of entries other than `raster` are part of identity.** **Decided 2026-11-04: no,
    folder names can be anything.** The project's folder is staged as `project`, and any other
-   folder of local crates as `dep-<its first crate>`. A manifest that reaches a renamed folder by
+   folder of local crates as `dep-<its first crate>-<version>`. A manifest that reaches a renamed folder by
    its real name is rewritten inside the stage, the same mechanism as for `raster` (§4.3).
    Measured: the same project in folders `iris` and `iris-main` has the same cache key. iris's
    tile ids changed once (they had embedded `iris`); raster's examples and the protocol guests did
    not.
+   *Revised after review:* the version is in the name because cargo allows two local crates of
+   one name with different versions (`foo` 1 in `foo-v1`, `foo` 2 in `foo-v2`). Named by crate
+   alone, both became `dep-foo` and the plan rejected them; such a layout now builds.
 2. **Windows.** Stage by copy (the plan's default), or by directory junction? Native Windows
    builds skip guest builds today (`RISC0_SKIP_BUILD=1` in `utils/native_build.rs:45` on windows-native), so this is low
    stakes.

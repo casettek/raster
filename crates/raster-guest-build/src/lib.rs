@@ -97,7 +97,11 @@ pub fn stage_plan(packages: &PathPackages) -> Result<StagePlan> {
         .collect();
     // No folder name reaches an image id: the raster checkout is `raster`,
     // the project's folder `project`, and any other folder of local crates is
-    // named after the first crate it holds.
+    // named after the first crate it holds, by name and version. The version
+    // matters: cargo allows two local crates of one name in a graph when their
+    // versions differ (`foo` 1 in `foo-v1`, `foo` 2 in `foo-v2`), while a name
+    // and version pair is unique among them. A version bump changes the
+    // guest's ids anyway (cargo builds the version in), so this costs nothing.
     let project_dir = &packages.root.dir;
     StagePlan::new(&packages.workspace_roots(), raster_root)?
         .with_manifests(manifests)
@@ -111,9 +115,57 @@ pub fn stage_plan(packages: &PathPackages) -> Result<StagePlan> {
                     .packages
                     .iter()
                     .filter(|p| p.dir.starts_with(target))
-                    .map(|p| p.name.as_str())
+                    .map(|p| (p.name.as_str(), p.version.as_str()))
                     .min()
-                    .map(|first| format!("dep-{first}"))
+                    .map(|(name, version)| format!("dep-{name}-{version}"))
             }
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    fn package(name: &str, version: &str, dir: &str, workspace_root: &str) -> PathPackage {
+        PathPackage {
+            name: name.into(),
+            version: version.into(),
+            dir: PathBuf::from(dir),
+            workspace_root: PathBuf::from(workspace_root),
+        }
+    }
+
+    /// Two versions of one local crate in sibling folders keep separate stage
+    /// entries: named by crate and version, not by crate alone.
+    #[test]
+    fn two_versions_of_a_local_crate_get_separate_entries() {
+        let app = package("app", "0.1.0", "/p/app", "/p/app");
+        let packages = PathPackages {
+            root: app.clone(),
+            packages: vec![
+                app,
+                package("foo", "1.0.0", "/p/foo-v1", "/p/foo-v1"),
+                package("foo", "2.0.0", "/p/foo-v2", "/p/foo-v2"),
+                package("raster", "0.1.0", "/p/raster-main/crates/raster", "/p/raster-main"),
+            ],
+            lockfile: None,
+            external: Vec::new(),
+        };
+        let plan = stage_plan(&packages).unwrap_or_else(|e| panic!("{e}"));
+        let names: Vec<(&str, &Path)> = plan
+            .entries()
+            .iter()
+            .map(|e| (e.name.as_str(), e.target.as_path()))
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                ("dep-foo-1.0.0", Path::new("/p/foo-v1")),
+                ("dep-foo-2.0.0", Path::new("/p/foo-v2")),
+                ("project", Path::new("/p/app")),
+                ("raster", Path::new("/p/raster-main")),
+            ]
+        );
+    }
 }
