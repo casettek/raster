@@ -456,6 +456,9 @@ pub fn run(
     // invocation or a previous one.
     let mut cursor = 0usize;
     let mut commit_chain = true;
+    // Projects whose `Raster.lock` was checked against their sources: a chain
+    // runs many stages over few projects.
+    let mut locks_checked: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     let mut repeats: Vec<RepeatResolution> = Vec::new();
 
     // One round per stage-produced count, plus one. A chain whose shape is
@@ -524,6 +527,14 @@ pub fn run(
         let cfs = CfsBuilder::new(&project).build().map_err(|e| {
             Error::Other(format!("stage '{}': failed to build CFS: {e}", stage.name))
         })?;
+
+        // The chain commitment names each stage's program from its
+        // `Raster.lock`: refuse to commit one the sources no longer match,
+        // before running the stage.
+        if commit_chain && locks_checked.insert(project.root_dir.clone()) {
+            crate::program::check_lock_before_commit(&project, &cfs)
+                .map_err(|e| Error::Other(format!("stage '{}': {e}", stage.name)))?;
+        }
 
         // Fail fast, before running anything, if a non-terminal stage produces
         // no output to feed downstream (rather than discovering it mid-chain).

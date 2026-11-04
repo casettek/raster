@@ -1,0 +1,21 @@
+[package]
+name = "raster-guest-build"
+description = "Path-independent risc0 guest builds for raster tile and protocol guests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# Kept light enough to be a build-dependency of raster-prover (no risc0-zkvm).
+[dependencies]
+cargo_metadata = "0.19"
+hex.workspace = true
+risc0-binfmt = "3.0"
+risc0-zkos-v1compat = "2.2"
+risc0-zkvm-platform = "2.2"
+rzup = { version = "0.5", default-features = false }
+sha2.workspace = true
+tempfile = "3.14"
+thiserror.workspace = true
+toml = "0.8"

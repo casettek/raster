@@ -65,6 +65,13 @@ pub struct RasterLock {
     pub program_commitment: String,
     pub tiles: BTreeMap<String, LockTile>,
     pub toolchain: LockToolchain,
+    /// Digest of everything the tile guests compile besides each tile's own
+    /// source and the compiler: raster, the project's local crates, dependency
+    /// versions and features, the guest template. `run --commit` and
+    /// `chain run` recompute it, building nothing, and refuse to commit when
+    /// it differs ([`check_lock_before_commit`]). Absent before format 3.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guest_inputs: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -78,6 +85,29 @@ pub struct LockTile {
 pub struct LockToolchain {
     pub risc0: String,
     pub build_mode: String,
+    /// The guest compiler's `rustc -V` line, e.g. `rustc 1.94.1-dev
+    /// (06e01cb0d 2026-04-09)`. Tile image ids depend on it, not only on the
+    /// sources: a lock built by another compiler drifts. Absent in format-1
+    /// locks, and when no risc0 toolchain was installed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rustc: Option<String>,
+}
+
+/// Current `Raster.lock` format. 2: `toolchain.rustc`. 3: `guest_inputs`.
+pub const LOCK_FORMAT: u32 = 3;
+
+/// The project's current guest inputs ([`RasterLock::guest_inputs`]).
+fn guest_inputs(project: &Project) -> std::result::Result<String, String> {
+    raster_backend_risc0::guest_inputs(&project.output_dir, &project.root_dir)
+}
+
+/// The `rustc -V` line of the risc0 Rust toolchain tile guests build with: the
+/// same selection `raster-guest-build` makes. `None` when none is installed.
+fn guest_rustc() -> Option<String> {
+    raster_guest_build::Toolchain::find()
+        .ok()?
+        .rustc_version()
+        .ok()
 }
 
 /// Path of `Raster.toml` at the project root.
@@ -210,8 +240,30 @@ pub fn write_program_artifacts(
     std::fs::write(&bin_path, program.canonical_bytes())
         .map_err(|e| Error::Other(format!("failed to write {}: {e}", bin_path.display())))?;
 
+    let rustc = guest_rustc();
+    let lock_path = raster_lock_path(project);
+    if let (Ok(previous), Some(current)) = (read_lock(&lock_path), rustc.as_deref()) {
+        if let Some(recorded) = previous.toolchain.rustc.as_deref() {
+            if recorded != current {
+                eprintln!(
+                    "warning: {} was built with `{recorded}`; this build uses `{current}`. \
+                     Tile image ids depend on the guest compiler, so they may all change.",
+                    lock_path.display()
+                );
+            }
+        }
+    }
+    let inputs = guest_inputs(project)
+        .map_err(|e| {
+            eprintln!(
+                "warning: {} records no guest inputs ({e}); `run --commit` cannot check it",
+                lock_path.display()
+            )
+        })
+        .ok();
     let lock = RasterLock {
-        format: 1,
+        format: LOCK_FORMAT,
+        guest_inputs: inputs,
         program_commitment: hex::encode(program.commitment()),
         tiles: program
             .tiles
@@ -237,12 +289,13 @@ pub fn write_program_artifacts(
             risc0: option_env!("RISC0_VERSION")
                 .map(str::to_string)
                 .unwrap_or_else(|| format!("risc0-zkvm-{}", risc0_zkvm::VERSION)),
-            // Local builds are dev-grade; docker reproducible builds are future
-            // work (see program-identity.md).
+            // Local, but path-independent (path-independent-builds.md): equal
+            // ids from any checkout path, given the same sources, Cargo.lock
+            // and guest compiler (`rustc`).
             build_mode: "local".to_string(),
+            rustc,
         },
     };
-    let lock_path = raster_lock_path(project);
     let lock_json = serde_json::to_string_pretty(&lock)
         .map_err(|e| Error::Other(format!("failed to serialize Raster.lock: {e}")))?;
     std::fs::write(&lock_path, lock_json + "\n")
@@ -274,7 +327,12 @@ pub fn reassemble_from_lock(
     project: &Project,
     cfs: &ControlFlowSchema,
 ) -> Result<ProgramDefinition> {
-    let manifest = load_or_synthesize_manifest(project, cfs)?;
+    let mut manifest = load_or_synthesize_manifest(project, cfs)?;
+    // As `assemble_program` does: the interface's schema hashes are part of the
+    // commitment. Without them (missing here from 2026-08-14 until 2026-11-04)
+    // the reassembled commitment differed from the lock's for any program with
+    // a typed input or output.
+    raster_compiler::schema_walk::fill_schema_hashes(&project.ast, &mut manifest)?;
     let lock = read_lock(&raster_lock_path(project))?;
     let mut tiles = BTreeMap::new();
     for tile in &cfs.tiles {
@@ -331,13 +389,176 @@ fn check_lock_drift(program: &ProgramDefinition, lock_path: &Path) -> Result<()>
     }
     let lock = read_lock(lock_path)?;
     let recomputed = hex::encode(program.commitment());
-    if recomputed != lock.program_commitment {
-        return Err(Error::Other(format!(
-            "program identity drift: reassembled commitment {recomputed} != Raster.lock {} — run `cargo raster build --backend risc0`",
-            lock.program_commitment
-        )));
+    match drift_error(&lock, &recomputed, guest_rustc().as_deref()) {
+        Some(message) => Err(Error::Other(message)),
+        None => Ok(()),
     }
-    Ok(())
+}
+
+/// The drift error for `lock` against the `recomputed` commitment, if they
+/// differ. When the lock records a different guest compiler than
+/// `current_rustc`, the error says so: that alone moves every tile id, and
+/// rebuilding the lock is then the wrong remedy for a verifier.
+fn drift_error(lock: &RasterLock, recomputed: &str, current_rustc: Option<&str>) -> Option<String> {
+    if recomputed == lock.program_commitment {
+        return None;
+    }
+    let mut message = format!(
+        "program identity drift: reassembled commitment {recomputed} != Raster.lock {}",
+        lock.program_commitment
+    );
+    match (lock.toolchain.rustc.as_deref(), current_rustc) {
+        (Some(recorded), Some(current)) if recorded != current => message.push_str(&format!(
+            ". Raster.lock was built with guest compiler `{recorded}`, this machine has \
+             `{current}`, and tile image ids depend on it: install the lock's toolchain \
+             (`rzup install rust <version>`) to reproduce it, or run \
+             `cargo raster build --backend risc0` to replace it"
+        )),
+        _ => message.push_str(" — run `cargo raster build --backend risc0`"),
+    }
+    Some(message)
+}
+
+/// Before `run --commit` or `chain run` commits anything: is `Raster.lock`
+/// still what building the current sources would write? Checked without
+/// building any guest: the program commitment recomputed from the current
+/// program and the lock's tile ids, each tile's source hash, the lock's
+/// [`guest_inputs`](RasterLock::guest_inputs), and the guest compiler.
+///
+/// A stale lock is an error. A commitment made from it names a program
+/// identity that no one can reproduce, so it could later be neither proven nor
+/// defended; today that surfaces only at prove time, as `program identity
+/// drift`. No lock means no identity is claimed: nothing to check. When a
+/// check cannot run (a lock from before format 3, no risc0 compiler here, a
+/// project that does not resolve), it is skipped with a warning.
+pub fn check_lock_before_commit(project: &Project, cfs: &ControlFlowSchema) -> Result<()> {
+    let lock_path = raster_lock_path(project);
+    if !lock_path.exists() {
+        return Ok(());
+    }
+    let lock = read_lock(&lock_path)?;
+    let tiles: BTreeMap<String, Option<String>> = cfs
+        .tiles
+        .iter()
+        .map(|t| (t.id.clone(), tile_source_hash(project, &t.id)))
+        .collect();
+    let recomputed = reassemble_from_lock(project, cfs)
+        .ok()
+        .map(|program| hex::encode(program.commitment()));
+    let inputs = match lock.guest_inputs {
+        None => {
+            eprintln!(
+                "warning: {} (format {}) records no guest inputs, so only part of it can be \
+                 checked; `cargo raster build --backend risc0` re-locks it",
+                lock_path.display(),
+                lock.format
+            );
+            None
+        }
+        Some(_) => guest_inputs(project)
+            .map_err(|e| {
+                eprintln!(
+                    "warning: could not check {}'s guest inputs: {e}",
+                    lock_path.display()
+                )
+            })
+            .ok(),
+    };
+    let rustc = guest_rustc();
+    let reasons = lock_staleness(
+        &lock,
+        &tiles,
+        recomputed.as_deref(),
+        inputs.as_deref(),
+        rustc.as_deref(),
+    );
+    if reasons.is_empty() {
+        return Ok(());
+    }
+    let compiler_only = reasons.len() == 1 && reasons[0].starts_with("the guest compiler");
+    Err(Error::Other(format!(
+        "{} no longer matches this program, so a commitment made now could not be proven or \
+         defended:\n  - {}\n{}",
+        lock_path.display(),
+        reasons.join("\n  - "),
+        if compiler_only {
+            "Install the lock's toolchain (`rzup install rust <version>`), or re-lock with \
+             `cargo raster build --backend risc0` (new tile ids)"
+        } else {
+            "Re-lock with `cargo raster build --backend risc0`"
+        }
+    )))
+}
+
+/// Why `lock` does not match the current program: one line per difference,
+/// none when it matches. `tiles` maps each current tile to its source hash;
+/// `recomputed` is the program commitment from the current program and the
+/// lock's tile ids. A `None` input is not compared.
+fn lock_staleness(
+    lock: &RasterLock,
+    tiles: &BTreeMap<String, Option<String>>,
+    recomputed: Option<&str>,
+    inputs: Option<&str>,
+    rustc: Option<&str>,
+) -> Vec<String> {
+    let mut reasons = Vec::new();
+    let mut edited = Vec::new();
+    for (tile, source) in tiles {
+        match lock.tiles.get(tile) {
+            None => reasons.push(format!("tile `{tile}` is new: the lock has no image id for it")),
+            Some(entry) => {
+                if let (Some(locked), Some(current)) = (entry.source_hash.as_deref(), source) {
+                    if locked != current {
+                        edited.push(tile.as_str());
+                    }
+                }
+            }
+        }
+    }
+    // Tiles share source files, so one edit can touch many: name a few.
+    match edited.as_slice() {
+        [] => {}
+        few if few.len() <= 3 => {
+            reasons.extend(few.iter().map(|tile| format!("tile `{tile}`'s source changed")))
+        }
+        many => reasons.push(format!(
+            "{} tiles' sources changed: `{}`, `{}`, `{}` and {} more",
+            many.len(),
+            many[0],
+            many[1],
+            many[2],
+            many.len() - 3
+        )),
+    }
+    for tile in lock.tiles.keys().filter(|t| !tiles.contains_key(*t)) {
+        reasons.push(format!("tile `{tile}` is in the lock but no longer in the program"));
+    }
+    if let Some(recomputed) = recomputed {
+        if recomputed != lock.program_commitment {
+            reasons.push(
+                "the program's control flow or interface changed (its commitment no longer \
+                 matches the lock's)"
+                    .to_string(),
+            );
+        }
+    }
+    if let (Some(locked), Some(current)) = (lock.guest_inputs.as_deref(), inputs) {
+        if locked != current {
+            reasons.push(
+                "the guest inputs changed: raster, a local crate, a dependency version or \
+                 feature, or the guest template"
+                    .to_string(),
+            );
+        }
+    }
+    if let (Some(locked), Some(current)) = (lock.toolchain.rustc.as_deref(), rustc) {
+        if locked != current {
+            reasons.push(format!(
+                "the guest compiler changed: the lock has `{locked}`, this machine `{current}`"
+            ));
+        }
+    }
+    reasons
 }
 
 #[cfg(test)]
@@ -435,11 +656,13 @@ encoding = "raster"
         // Write a lock matching the program, then check drift passes.
         let lock = RasterLock {
             format: 1,
+            guest_inputs: None,
             program_commitment: hex::encode(program.commitment()),
             tiles: Default::default(),
             toolchain: LockToolchain {
                 risc0: "test".to_string(),
                 build_mode: "local".to_string(),
+                rustc: None,
             },
         };
         std::fs::write(&lock_path, serde_json::to_string_pretty(&lock).unwrap()).unwrap();
@@ -458,6 +681,128 @@ encoding = "raster"
         std::fs::remove_file(&lock_path).unwrap();
         assert!(check_lock_drift(&program, &lock_path).is_ok());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn lock_with(commitment: [u8; 32], rustc: Option<&str>) -> RasterLock {
+        RasterLock {
+            format: LOCK_FORMAT,
+            guest_inputs: None,
+            program_commitment: hex::encode(commitment),
+            tiles: Default::default(),
+            toolchain: LockToolchain {
+                risc0: "test".to_string(),
+                build_mode: "local".to_string(),
+                rustc: rustc.map(str::to_string),
+            },
+        }
+    }
+
+    #[test]
+    fn drift_names_both_guest_compilers_when_they_differ() {
+        let recomputed = hex::encode([1u8; 32]);
+        let old = "rustc 1.93.0-dev (aaaaaaaaa 2026-01-01)";
+        let new = "rustc 1.94.1-dev (06e01cb0d 2026-04-09)";
+
+        assert_eq!(drift_error(&lock_with([1u8; 32], Some(old)), &recomputed, Some(new)), None,
+            "an equal commitment is not drift, whatever the compilers");
+
+        let message = drift_error(&lock_with([2u8; 32], Some(old)), &recomputed, Some(new)).unwrap();
+        assert!(message.contains(old) && message.contains(new), "{message}");
+        assert!(message.contains("rzup install rust"), "{message}");
+
+        for (recorded, current) in [(Some(new), Some(new)), (None, Some(new)), (Some(old), None)] {
+            let message = drift_error(&lock_with([2u8; 32], recorded), &recomputed, current).unwrap();
+            assert!(message.contains("run `cargo raster build --backend risc0`"), "{message}");
+            assert!(!message.contains("guest compiler"), "{message}");
+        }
+    }
+
+    fn locked(tiles: &[(&str, &str)], inputs: &str, rustc: &str) -> RasterLock {
+        let mut lock = lock_with([1u8; 32], Some(rustc));
+        lock.guest_inputs = Some(inputs.to_string());
+        lock.tiles = tiles
+            .iter()
+            .map(|(id, source)| {
+                (
+                    id.to_string(),
+                    LockTile {
+                        image_id: "00".into(),
+                        source_hash: Some(source.to_string()),
+                    },
+                )
+            })
+            .collect();
+        lock
+    }
+
+    fn current(tiles: &[(&str, &str)]) -> BTreeMap<String, Option<String>> {
+        tiles
+            .iter()
+            .map(|(id, source)| (id.to_string(), Some(source.to_string())))
+            .collect()
+    }
+
+    #[test]
+    fn many_edited_tiles_are_summarized() {
+        let names: Vec<String> = (0..6).map(|i| format!("t{i}")).collect();
+        let old: Vec<(&str, &str)> = names.iter().map(|n| (n.as_str(), "s")).collect();
+        let new: Vec<(&str, &str)> = names.iter().map(|n| (n.as_str(), "s-edited")).collect();
+        let reasons = lock_staleness(&locked(&old, "in", "rustc 1"), &current(&new), None, None, None);
+        assert_eq!(reasons, vec!["6 tiles' sources changed: `t0`, `t1`, `t2` and 3 more".to_string()]);
+    }
+
+    #[test]
+    fn a_fresh_lock_has_no_staleness() {
+        let lock = locked(&[("greet", "s1"), ("exclaim", "s2")], "in", "rustc 1");
+        let commitment = hex::encode([1u8; 32]);
+        let reasons = lock_staleness(
+            &lock,
+            &current(&[("greet", "s1"), ("exclaim", "s2")]),
+            Some(&commitment),
+            Some("in"),
+            Some("rustc 1"),
+        );
+        assert!(reasons.is_empty(), "{reasons:?}");
+        // Inputs that could not be computed are not compared.
+        assert!(lock_staleness(&lock, &current(&[("greet", "s1"), ("exclaim", "s2")]), None, None, None)
+            .is_empty());
+    }
+
+    #[test]
+    fn each_kind_of_staleness_is_named() {
+        let lock = locked(&[("greet", "s1"), ("gone", "s3")], "in", "rustc 1");
+        let reasons = lock_staleness(
+            &lock,
+            &current(&[("greet", "s1-edited"), ("added", "s4")]),
+            Some(&hex::encode([2u8; 32])),
+            Some("in-edited"),
+            Some("rustc 2"),
+        );
+        let all = reasons.join("\n");
+        for expected in [
+            "tile `greet`'s source changed",
+            "tile `added` is new",
+            "tile `gone` is in the lock but no longer in the program",
+            "control flow or interface changed",
+            "the guest inputs changed",
+            "the lock has `rustc 1`, this machine `rustc 2`",
+        ] {
+            assert!(all.contains(expected), "missing `{expected}` in:\n{all}");
+        }
+        assert_eq!(reasons.len(), 6);
+    }
+
+    /// A format-1 lock, without `toolchain.rustc`, still parses.
+    #[test]
+    fn format_one_locks_still_parse() {
+        let lock: RasterLock = serde_json::from_str(
+            r#"{"format":1,"program_commitment":"00","tiles":{},
+                "toolchain":{"risc0":"risc0-zkvm-3.0.6","build_mode":"local"}}"#,
+        )
+        .unwrap();
+        assert_eq!(lock.toolchain.rustc, None);
+        let written = serde_json::to_string(&lock_with([0u8; 32], None)).unwrap();
+        assert!(!written.contains("rustc"), "an unknown compiler is omitted: {written}");
     }
 
     #[test]

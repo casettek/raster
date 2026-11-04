@@ -1,14 +1,16 @@
 {
-  "format": 1,
-  "program_commitment": "bd0c4273bdf8bee04a030063690bd476468bf19c1dcfa519aa61853aeda045d7",
+  "format": 3,
+  "program_commitment": "7a24d97bf9b33e9719c15ec0e769c222d1d0a35d54fdadc52b6d2831eae29071",
   "tiles": {
     "advance": {
-      "image_id": "676a2d0ec5c1ba6dbd0f0031b3df28afee8796259b4d1b6470c6a24c9d07ac64",
+      "image_id": "8820cccd8665fd5be7ef0818e893a71e46ce2ba7ce5a0ad2e7afdf1123703f6d",
       "source_hash": "1b168d132b03f3eb0000000000000245"
     }
   },
   "toolchain": {
     "risc0": "risc0-zkvm-3.0.6",
-    "build_mode": "local"
-  }
+    "build_mode": "local",
+    "rustc": "rustc 1.94.1-dev (06e01cb0d 2026-04-09)"
+  },
+  "guest_inputs": "1a8ccdc4994ff4b885efc129dc3b7e8f0f8f2d5f49085fd4ab0c4c56010b43a0"
 }

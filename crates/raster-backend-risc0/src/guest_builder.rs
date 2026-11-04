@@ -1,176 +1,245 @@
-//! Guest crate builder for RISC0 zkVM.
+//! Tile guests for the RISC0 zkVM.
 //!
-//! This module generates temporary guest crates that wrap tile functions
-//! for execution in the RISC0 zkVM.
+//! A tile guest is a generated crate whose `main` reads the tile's input,
+//! calls the tile's replay entry from the user crate and commits the output.
+//! It is built with `raster-guest-build`, from a stage where every local path
+//! package is seen by a relative path, so its image id does not depend on where
+//! the project, the raster checkout or `$CARGO_HOME` live
+//! (docs/proposals/path-independent-builds.md).
 
-use std::env;
-use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
-/// Guest build recipe version, folded into the artifact cache key (see
-/// docs/proposals/program-identity.md). Source changes to what a guest compiles
-/// — the `raster`, `raster-core` and `raster-macros` crates and the user
-/// crate's lib — are picked up automatically by
-/// [`GuestBuilder::recipe_fingerprint`]; bump this only for a change it cannot
-/// see, such as a build-environment change.
-///
-/// v2: replay wrapper now commits `sha256(input)` (`input_commitment`); guest
-/// manifest uses risc0-zkvm default features + resolver v2.
-/// v3: risc0 3.0 — risc0-build's guest rustflags; the ELF is packaged with the
-/// v1compat kernel as a `ProgramBinary`.
-const GUEST_BUILD_ABI: &str = "3";
+use raster_guest_build::{
+    cargo_home, path_string, prepare_stage, stage_manifest, stage_plan, Dependency, Fingerprint,
+    GuestBinary, GuestBuild, GuestCrate, PathPackage, PathPackages, Scope, Stage, StagePlan,
+    Toolchain, TARGET,
+};
 
-/// The guest rustflags, as `CARGO_ENCODED_RUSTFLAGS`. Mirrors risc0-build 3.0's
-/// private `encode_rust_flags` for a user (non-kernel) guest; keep in sync on a
-/// risc0 bump.
-fn guest_rustflags() -> String {
-    [
-        // The guest is single-threaded: replace atomics with plain ops.
-        "-C".to_string(),
-        "passes=lower-atomic".to_string(),
-        "-C".to_string(),
-        format!(
-            "link-arg=-Ttext={:#010x}",
-            risc0_zkvm_platform::memory::TEXT_START
-        ),
-        // A missing entry point is only a linker warning otherwise.
-        "-C".to_string(),
-        "link-arg=--fatal-warnings".to_string(),
-        "-C".to_string(),
-        "panic=abort".to_string(),
-        // getrandom 0.3 picks its backend by cfg; risc0-zkvm provides `custom`.
-        "--cfg".to_string(),
-        "getrandom_backend=\"custom\"".to_string(),
-    ]
-    .join("\x1f")
-}
-
-/// Record `root/relative` under the name `label ++ relative`, if it exists.
-fn collect_file(files: &mut Vec<(String, PathBuf)>, label: &str, root: &Path, relative: &Path) {
-    let path = root.join(relative);
-    if path.is_file() {
-        files.push((format!("{label}{}", relative.display()), path));
-    }
-}
-
-/// Record every file under `root/relative`, recursively, skipping the
-/// `excluded` paths (relative to `root`).
-fn collect_tree(
-    files: &mut Vec<(String, PathBuf)>,
-    label: &str,
-    root: &Path,
-    relative: &Path,
-    excluded: &[&Path],
-) {
-    if excluded.iter().any(|excluded| *excluded == relative) {
-        return;
-    }
-    let path = root.join(relative);
-    if path.is_file() {
-        files.push((format!("{label}{}", relative.display()), path));
-        return;
-    }
-    let Ok(entries) = fs::read_dir(&path) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        collect_tree(files, label, root, &relative.join(entry.file_name()), excluded);
-    }
-}
-
-/// Configuration for building guest crates.
+/// Everything needed to build any tile guest of one project, resolved once.
 pub struct GuestBuilder {
-    /// Output directory for artifacts.
-    output_dir: PathBuf,
-    /// Path to the user's crate that contains the tiles.
-    user_crate_path: Option<PathBuf>,
-    /// Name of the user's crate package.
-    user_crate_name: Option<String>,
-    /// Path to the raster workspace root.
-    raster_workspace: Option<PathBuf>,
+    /// Shared by every tile guest of the project. The target directory does not
+    /// reach an image id, and sharing it compiles the guest's dependencies once
+    /// instead of once per tile.
+    target_dir: PathBuf,
+    /// The user crate: the project's package.
+    user: PathPackage,
+    /// The guest's `raster` dependency path, exactly as the user crate's own
+    /// manifests resolve it inside the stage: a stage path, or an absolute
+    /// path outside it when the project names raster absolutely. Any other
+    /// path would be a second `raster` package to cargo.
+    raster_dependency: String,
+    plan: StagePlan,
+    lockfile: Option<PathBuf>,
+    /// `None` when no risc0 toolchain is installed: cached guests still load,
+    /// only building fails.
+    toolchain: Option<Toolchain>,
+    cargo_home: PathBuf,
+    fingerprint: String,
+    /// The same inputs without the toolchain (see [`Self::inputs`]).
+    inputs: String,
 }
 
 impl GuestBuilder {
-    /// Create a new guest builder with the given output directory.
-    pub fn new(output_dir: PathBuf) -> Self {
-        Self {
-            output_dir,
-            user_crate_path: None,
-            user_crate_name: None,
-            raster_workspace: None,
+    /// Resolve the project at `user_crate_path` with cargo: its `raster`
+    /// dependency in whatever form cargo accepts (inline, table, inherited
+    /// from a workspace, through a symlink), every other local path package,
+    /// and the project's `Cargo.lock`.
+    pub fn resolve(output_dir: &Path, user_crate_path: &Path) -> Result<Self, String> {
+        let manifest = user_crate_path.join("Cargo.toml");
+        let packages = PathPackages::resolve(&manifest).map_err(|e| e.to_string())?;
+        // A guest needs `raster` as a local path dependency.
+        packages.require("raster").map_err(|e| e.to_string())?;
+        let plan = stage_plan(&packages).map_err(|e| e.to_string())?;
+        if packages.lockfile.is_none() {
+            eprintln!(
+                "warning: `{}` has no Cargo.lock; its tile guests resolve dependency versions \
+                 when they are built, so their image ids can differ between machines",
+                packages.root.name
+            );
+        }
+        let mut builder = Self {
+            target_dir: output_dir.join("guest-target"),
+            user: packages.root.clone(),
+            raster_dependency: String::new(),
+            plan,
+            lockfile: packages.lockfile.clone(),
+            toolchain: Toolchain::find().ok(),
+            cargo_home: cargo_home().map_err(|e| e.to_string())?,
+            fingerprint: String::new(),
+            inputs: String::new(),
+        };
+        builder.raster_dependency = builder.resolve_raster_dependency()?;
+        (builder.fingerprint, builder.inputs) = builder.compute_fingerprint()?;
+        Ok(builder)
+    }
+
+    /// Where the user crate itself resolves `raster` inside a stage: from a
+    /// probe guest that depends on the user crate alone.
+    fn resolve_raster_dependency(&self) -> Result<String, String> {
+        let error = |e: raster_guest_build::Error| e.to_string();
+        let stage = Stage::create(self.plan.clone()).map_err(error)?;
+        let probe = GuestCrate::Generated {
+            package: "raster-guest-probe".into(),
+            dependencies: vec![
+                Dependency::version("risc0-zkvm", "3.0"),
+                Dependency::path(&self.user.name, &self.user.dir).no_default_features(),
+            ],
+            main_rs: String::new(),
+        };
+        prepare_stage(&stage, &probe, self.lockfile.as_deref()).map_err(error)?;
+        let staged = PathPackages::resolve_for_target(&stage.root().join("Cargo.toml"), Some(TARGET))
+            .map_err(error)?;
+        let raster = staged.require("raster").map_err(error)?;
+        match raster.dir.strip_prefix(stage.root()) {
+            Ok(relative) => path_string(relative).map_err(error),
+            Err(_) => Ok(raster.dir.display().to_string()),
         }
     }
 
-    /// Set the path to the user's crate containing tiles.
-    pub fn with_user_crate(mut self, path: PathBuf) -> Self {
-        self.user_crate_path = Some(path.clone());
-        // Try to find the raster workspace by looking at the user crate's Cargo.toml
-        if let Ok(cargo_toml) = fs::read_to_string(path.join("Cargo.toml")) {
-            // Extract the package name
-            self.user_crate_name = Self::extract_package_name(&cargo_toml);
+    /// A key over everything a tile guest compiles besides the tile's own
+    /// source: the recipe version, the toolchain, the guest templates, the
+    /// exact external crate versions, and `Cargo.toml` + library sources of
+    /// every local path package the staged guest resolves. Files are named by
+    /// their stage paths, so the key, like the image id, is the same at any
+    /// checkout path.
+    pub fn fingerprint(&self) -> &str {
+        &self.fingerprint
+    }
 
-            // Look for raster dependency path
-            if let Some(raster_path) = Self::extract_raster_path(&cargo_toml) {
-                let absolute_raster = path.join(&raster_path).canonicalize().ok();
-                if let Some(raster_crate_path) = absolute_raster {
-                    // The raster workspace is two levels up from crates/raster
-                    self.raster_workspace = raster_crate_path
-                        .parent()
-                        .and_then(|p| p.parent())
-                        .map(|p| p.to_path_buf());
+    /// Everything [`Self::fingerprint`] covers except the toolchain: the guest
+    /// inputs that come from the project and its dependencies. `Raster.lock`
+    /// records it, and `run --commit` compares it without building anything to
+    /// catch a lock that no longer matches the sources. The toolchain is left
+    /// out so a machine without one can still check; the lock records the
+    /// compiler separately (`toolchain.rustc`).
+    pub fn inputs(&self) -> &str {
+        &self.inputs
+    }
+
+    /// Build the guest for `tile_id`.
+    pub fn build_tile(&self, tile_id: &str) -> Result<GuestBinary, String> {
+        let toolchain = self
+            .toolchain
+            .as_ref()
+            .ok_or("RISC0 toolchain not found. Please install it with: rzup install rust")?;
+        let stage = Stage::create(self.plan.clone()).map_err(|e| e.to_string())?;
+        let output = GuestBuild {
+            stage: &stage,
+            krate: self.guest_crate(tile_id),
+            lockfile: self.lockfile.as_deref(),
+            toolchain,
+            cargo_home: &self.cargo_home,
+            target_dir: Some(&self.target_dir),
+        }
+        .run()
+        .map_err(|e| e.to_string())?;
+        output
+            .binaries
+            .into_iter()
+            .next()
+            .ok_or_else(|| format!("the guest for tile '{tile_id}' produced no binary"))
+    }
+
+    fn guest_crate(&self, tile_id: &str) -> GuestCrate {
+        GuestCrate::Generated {
+            package: format!("raster-guest-{tile_id}"),
+            dependencies: vec![
+                // risc0-zkvm's default features (which include `std`), matching
+                // the transition guest. With `default-features = false`,
+                // risc0-zkvm provides its own no_std guest `panic_impl`, which
+                // collides with the `std` that transitively leaks in (e.g.
+                // `digest/std` via risc0-groth16 → ark): a duplicate
+                // `panic_impl` (E0152).
+                Dependency::version("risc0-zkvm", "3.0"),
+                Dependency::literal("raster", &self.raster_dependency).no_default_features(),
+                // No default features: the user crate's `std` feature pulls in
+                // the host runtime.
+                Dependency::path(&self.user.name, &self.user.dir).no_default_features(),
+            ],
+            main_rs: self.generate_guest_main(tile_id),
+        }
+    }
+
+    /// The cache key and the toolchain-free inputs digest, from one pass.
+    fn compute_fingerprint(&self) -> Result<(String, String), String> {
+        const PLACEHOLDER: &str = "__recipe__";
+        let error = |e: raster_guest_build::Error| e.to_string();
+
+        // Resolve the staged guest itself, for the guest target: exactly the
+        // packages it compiles, with the features it uses.
+        let stage = Stage::create(self.plan.clone()).map_err(error)?;
+        let krate = self.guest_crate(PLACEHOLDER);
+        prepare_stage(&stage, &krate, self.lockfile.as_deref()).map_err(error)?;
+        let guest = PathPackages::resolve_for_target(&stage.root().join("Cargo.toml"), Some(TARGET))
+            .map_err(error)?;
+
+        let mut fingerprint = Fingerprint::new();
+        let toolchain = self.toolchain.as_ref().map_or("none", |t| t.id.as_str());
+        fingerprint.bytes("toolchain", toolchain.as_bytes());
+        // Fed exactly what `fingerprint` is, after the toolchain.
+        let mut inputs = Fingerprint::new();
+        let manifest = stage_manifest(&self.plan, &krate).map_err(error)?;
+        let main_rs = self.generate_guest_main(PLACEHOLDER);
+        let external = guest.external.join("\n");
+        for key in [&mut fingerprint, &mut inputs] {
+            key.bytes("manifest", manifest.as_bytes());
+            key.bytes("main.rs", main_rs.as_bytes());
+            key.bytes("external", external.as_bytes());
+        }
+        let mut outside = Vec::new();
+        for package in guest.packages.iter().filter(|p| p.dir != guest.root.dir) {
+            // A package outside the stage is named by an absolute path in some
+            // manifest; it is keyed (and compiled) by that absolute path.
+            let label = match package.dir.strip_prefix(stage.root()) {
+                Ok(relative) => relative.to_string_lossy().into_owned(),
+                Err(_) => {
+                    outside.push(package.name.as_str());
+                    package.dir.to_string_lossy().into_owned()
                 }
+            };
+            for key in [&mut fingerprint, &mut inputs] {
+                key.package(&label, &package.dir, Scope::Library)
+                    .map_err(error)?;
             }
         }
-        self
-    }
-
-    /// Extract the package name from Cargo.toml content.
-    fn extract_package_name(cargo_toml: &str) -> Option<String> {
-        // Simple parsing: look for name = "..."
-        let mut in_package_section = false;
-        for line in cargo_toml.lines() {
-            let trimmed = line.trim();
-            if trimmed == "[package]" {
-                in_package_section = true;
-                continue;
-            }
-            if trimmed.starts_with('[') {
-                in_package_section = false;
-                continue;
-            }
-            if in_package_section && trimmed.starts_with("name") {
-                if let Some(start) = line.find("\"") {
-                    let rest = &line[start + 1..];
-                    if let Some(end) = rest.find('"') {
-                        return Some(rest[..end].to_string());
-                    }
-                }
-            }
-        }
-        None
-    }
-
-    /// Extract the raster dependency path from Cargo.toml content.
-    fn extract_raster_path(cargo_toml: &str) -> Option<String> {
-        // Simple parsing: look for raster = { path = "..." }
-        for line in cargo_toml.lines() {
-            if line.contains("raster") && line.contains("path") {
-                // Extract the path value
-                if let Some(start) = line.find("path = \"") {
-                    let rest = &line[start + 8..];
-                    if let Some(end) = rest.find('"') {
-                        return Some(rest[..end].to_string());
-                    }
-                }
+        // Workspace-root manifests too: a `workspace = true` dependency takes
+        // its version and features from the root's `[workspace.dependencies]`,
+        // so editing those changes the guest without touching any package's
+        // own files. Named by stage path, like the packages.
+        let mut roots: Vec<&Path> = guest
+            .packages
+            .iter()
+            .filter(|p| p.dir != guest.root.dir)
+            .map(|p| p.workspace_root.as_path())
+            .filter(|root| *root != stage.root())
+            .collect();
+        roots.sort();
+        roots.dedup();
+        for root in roots {
+            let label = match root.strip_prefix(stage.root()) {
+                Ok(relative) => relative.to_string_lossy().into_owned(),
+                Err(_) => root.to_string_lossy().into_owned(),
+            };
+            let manifest = root.join("Cargo.toml");
+            let contents = std::fs::read(&manifest)
+                .map_err(|e| format!("{}: {e}", manifest.display()))?;
+            for key in [&mut fingerprint, &mut inputs] {
+                key.bytes(&format!("workspace:{label}/Cargo.toml"), &contents);
             }
         }
-        None
-    }
-
-    /// Get the artifact directory for a tile.
-    pub fn artifact_dir(&self, tile_id: &str) -> PathBuf {
-        self.output_dir.join("tiles").join(tile_id).join("risc0")
+        if !outside.is_empty() {
+            eprintln!(
+                "warning: `{}` reaches {} by an absolute path; its tile image ids will depend \
+                 on where {}. Use a relative path for ids that do not",
+                self.user.name,
+                outside.join(", "),
+                if outside.len() == 1 { "it lives" } else { "they live" }
+            );
+        }
+        Ok((
+            fingerprint.finish_hex()[..16].to_string(),
+            inputs.finish_hex(),
+        ))
     }
 
     /// Generate the guest crate source for a tile.
@@ -187,11 +256,7 @@ impl GuestBuilder {
         let wrapper_name = format!("__raster_tile_replay_entry_{}", fn_name);
 
         // Get the crate name for the import
-        let crate_name = self
-            .user_crate_name
-            .as_ref()
-            .map(|n| n.replace('-', "_"))
-            .unwrap_or_else(|| "user_crate".to_string());
+        let crate_name = self.user.name.replace('-', "_");
 
         format!(
             r##"//! Auto-generated RISC0 guest program for tile: {tile_id}
@@ -226,327 +291,18 @@ impl GuestBuilder {
             wrapper_name = wrapper_name
         )
     }
-
-    /// Generate Cargo.toml for a guest crate.
-    pub fn generate_guest_cargo_toml(&self, tile_id: &str) -> String {
-        // User crate dependency with default-features = false for no_std
-        let user_crate_dep = match (&self.user_crate_path, &self.user_crate_name) {
-            (Some(path), Some(name)) => {
-                format!(
-                    r#"{} = {{ path = "{}", default-features = false }}"#,
-                    name,
-                    path.display()
-                )
-            }
-            (Some(path), None) => {
-                format!(
-                    r#"user-crate = {{ path = "{}", default-features = false }}"#,
-                    path.display()
-                )
-            }
-            _ => String::new(),
-        };
-
-        // Use absolute path to the raster crate
-        let raster_path = if let Some(ref workspace) = self.raster_workspace {
-            workspace
-                .join("crates")
-                .join("raster")
-                .display()
-                .to_string()
-        } else {
-            // Fallback: assume we're in the raster workspace
-            "../../../../crates/raster".to_string()
-        };
-
-        format!(
-            r##"[package]
-            name = "raster-guest-{tile_id}"
-            version = "0.1.0"
-            edition = "2021"
-
-            [dependencies]
-            # Use risc0-zkvm's default features (which include `std`), matching
-            # the transition guest. With `default-features = false`, risc0-zkvm
-            # provides its own no_std guest `panic_impl`, which collides with the
-            # `std` that transitively leaks in (e.g. `digest/std` via
-            # risc0-groth16 → ark) — a duplicate `panic_impl` (E0152). std is
-            # available for the riscv32im-risc0-zkvm-elf target, so deferring to
-            # it is the guest-safe choice.
-            risc0-zkvm = "3.0"
-            raster = {{ path = "{raster_path}", default-features = false }}
-            {user_crate_dep}
-
-            [profile.release]
-            opt-level = 3
-            lto = true
-
-            [workspace]
-            resolver = "2"
-            "##,
-            tile_id = tile_id,
-            user_crate_dep = user_crate_dep,
-            raster_path = raster_path
-        )
-    }
-
-    /// Find the RISC0 toolchain's cargo binary.
-    /// The risc0 toolchain identifier (its directory name, e.g.
-    /// `v1.91.1-rust-...`), or `"unknown"`.
-    fn toolchain_id() -> String {
-        Self::find_risc0_cargo()
-            .and_then(|cargo| {
-                cargo
-                    .parent()?
-                    .parent()?
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-            })
-            .unwrap_or_else(|| "unknown".to_string())
-    }
-
-    /// A short fingerprint of everything *besides the tile source* that
-    /// determines the guest ELF: the generated Cargo.toml + main.rs templates
-    /// (risc0-zkvm version, resolver, raster path, wrapper shape), the risc0
-    /// toolchain, and [`GUEST_BUILD_ABI`]. The artifact cache keys on this
-    /// together with the tile source hash, so a template/toolchain/macro change
-    /// invalidates stale image ids.
-    pub fn recipe_fingerprint(&self) -> String {
-        use raster_core::hash::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(GUEST_BUILD_ABI.as_bytes());
-        hasher.update(Self::toolchain_id().as_bytes());
-        // Tile-independent view of the templates (fixed placeholder id).
-        hasher.update(self.generate_guest_cargo_toml("__recipe__").as_bytes());
-        hasher.update(self.generate_guest_main("__recipe__").as_bytes());
-        hasher.update(self.sources_fingerprint());
-        hex::encode(&hasher.finalize()[..8])
-    }
-
-    /// A hash of every source file a tile guest compiles from.
-    ///
-    /// The guest links the `raster` crate (without default features, so not
-    /// `raster-runtime`), which pulls in `raster-core` and `raster-macros`, and
-    /// the user crate's **lib** — all by path. Keying the cache on the tile's
-    /// own source file alone served stale ELFs, with stale image ids, whenever
-    /// any of those changed: measured 2026-09-28, 14 of 29 tile image ids in
-    /// the repository's locks were stale. Hashing the files is cheap next to a
-    /// guest build and needs no cargo invocation.
-    ///
-    /// Covered: the raster workspace's `Cargo.toml` (it pins the crates'
-    /// dependency versions) and `Cargo.toml` + `src/` of the three crates; the
-    /// user crate's `Cargo.toml` + `src/`, minus `src/main.rs` and `src/bin/`,
-    /// which are not part of the lib — an edit to a sequence rebuilds nothing.
-    /// Not covered: external crate versions, which the guest resolves fresh
-    /// with no lockfile.
-    fn sources_fingerprint(&self) -> Vec<u8> {
-        use raster_core::hash::{Digest, Sha256};
-        let mut files: Vec<(String, PathBuf)> = Vec::new();
-        if let Some(workspace) = &self.raster_workspace {
-            collect_file(&mut files, "raster:", workspace, Path::new("Cargo.toml"));
-            for krate in ["raster", "raster-core", "raster-macros"] {
-                let root = workspace.join("crates").join(krate);
-                let label = format!("raster:crates/{krate}/");
-                collect_file(&mut files, &label, &root, Path::new("Cargo.toml"));
-                collect_tree(&mut files, &label, &root, Path::new("src"), &[]);
-            }
-        }
-        if let Some(user) = &self.user_crate_path {
-            collect_file(&mut files, "user:", user, Path::new("Cargo.toml"));
-            collect_tree(
-                &mut files,
-                "user:",
-                user,
-                Path::new("src"),
-                &[Path::new("src/main.rs"), Path::new("src/bin")],
-            );
-        }
-        files.sort_by(|left, right| left.0.cmp(&right.0));
-
-        let mut hasher = Sha256::new();
-        for (name, path) in files {
-            let contents = fs::read(&path).unwrap_or_default();
-            hasher.update((name.len() as u64).to_le_bytes());
-            hasher.update(name.as_bytes());
-            hasher.update((contents.len() as u64).to_le_bytes());
-            hasher.update(&contents);
-        }
-        hasher.finalize().to_vec()
-    }
-
-    fn find_risc0_cargo() -> Option<PathBuf> {
-        // Check for RISC0_RUST_TOOLCHAIN_PATH env var first
-        if let Ok(path) = env::var("RISC0_RUST_TOOLCHAIN_PATH") {
-            let cargo = PathBuf::from(&path).join("bin").join("cargo");
-            if cargo.exists() {
-                return Some(cargo);
-            }
-        }
-
-        // Look in ~/.risc0/toolchains for the latest rust toolchain
-        let home = env::var("HOME").ok()?;
-        let toolchains_dir = PathBuf::from(&home).join(".risc0").join("toolchains");
-
-        if !toolchains_dir.exists() {
-            return None;
-        }
-
-        // Find the latest rust toolchain (sort by version)
-        let mut rust_toolchains: Vec<_> = fs::read_dir(&toolchains_dir)
-            .ok()?
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_string_lossy().contains("-rust-"))
-            .collect();
-
-        // Sort by name (versions are sortable as strings for semver-like versions)
-        rust_toolchains.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
-
-        for entry in rust_toolchains {
-            let cargo = entry.path().join("bin").join("cargo");
-            // Toolchain plumbing: one line per tile per command drowns the
-            // result the command was run for. `RASTER_VERBOSE=1` brings it back.
-            if std::env::var_os("RASTER_VERBOSE").is_some_and(|v| !v.is_empty() && v != "0") {
-                println!("Using RISC0 cargo: {}", cargo.display());
-            }
-            if cargo.exists() {
-                return Some(cargo);
-            }
-        }
-
-        None
-    }
-
-    /// Build a guest crate and return the path to its `ProgramBinary` (the
-    /// user ELF packaged with the v1compat kernel).
-    pub fn build_guest(&self, tile_id: &str, guest_dir: &Path) -> Result<PathBuf, GuestBuildError> {
-        // Create guest source directory
-        let src_dir = guest_dir.join("src");
-        fs::create_dir_all(&src_dir)?;
-
-        // Write main.rs
-        let main_rs = self.generate_guest_main(tile_id);
-        fs::write(src_dir.join("main.rs"), main_rs)?;
-
-        // Write Cargo.toml
-        let cargo_toml = self.generate_guest_cargo_toml(tile_id);
-        fs::write(guest_dir.join("Cargo.toml"), cargo_toml)?;
-
-        // Find RISC0's cargo with the riscv32im-risc0-zkvm-elf target
-        let cargo_path = Self::find_risc0_cargo().ok_or_else(|| {
-            GuestBuildError::CompilationFailed(
-                "RISC0 toolchain not found. Please install it with: rzup install".to_string(),
-            )
-        })?;
-
-        // Get the toolchain directory (parent of bin/)
-        let toolchain_dir = cargo_path
-            .parent()
-            .and_then(|p| p.parent())
-            .ok_or_else(|| {
-                GuestBuildError::CompilationFailed(
-                    "Invalid RISC0 toolchain path structure".to_string(),
-                )
-            })?;
-
-        // Build using RISC0's cargo for risc0 target
-        // We need to ensure cargo uses the RISC0 toolchain's rustc by setting RUSTC
-        let rustc_path = toolchain_dir.join("bin").join("rustc");
-        let output = Command::new(&cargo_path)
-            .current_dir(guest_dir)
-            .args(["build", "--release", "--target", "riscv32im-risc0-zkvm-elf"])
-            .env("RUSTC", &rustc_path)
-            .env("CARGO_ENCODED_RUSTFLAGS", guest_rustflags())
-            .env("CFLAGS_riscv32im_risc0_zkvm_elf", "-march=rv32im -nostdlib")
-            // Lets crypto patches use the bigint2 accelerator.
-            .env("RISC0_FEATURE_bigint2", "")
-            .output()?;
-
-        if !output.status.success() {
-            return Err(GuestBuildError::CompilationFailed(
-                String::from_utf8_lossy(&output.stderr).to_string(),
-            ));
-        }
-
-        // Find the ELF file
-        let elf_path = guest_dir
-            .join("target")
-            .join("riscv32im-risc0-zkvm-elf")
-            .join("release")
-            .join(format!("raster-guest-{}", tile_id));
-
-        if !elf_path.exists() {
-            return Err(GuestBuildError::ElfNotFound(elf_path));
-        }
-
-        // risc0 2.0+ loads a `ProgramBinary`: the user ELF packaged with the
-        // kernel it runs on. risc0-build writes the same `.bin` next to the ELF.
-        let user_elf = fs::read(&elf_path)?;
-        let binary =
-            risc0_binfmt::ProgramBinary::new(&user_elf, risc0_zkos_v1compat::V1COMPAT_ELF);
-        let bin_path = elf_path.with_extension("bin");
-        fs::write(&bin_path, binary.encode())?;
-
-        Ok(bin_path)
-    }
-
-    /// Copy artifacts to the output directory.
-    pub fn write_artifacts(
-        &self,
-        tile_id: &str,
-        elf_bytes: &[u8],
-        method_id: &[u8],
-    ) -> Result<PathBuf, GuestBuildError> {
-        let artifact_dir = self.artifact_dir(tile_id);
-        fs::create_dir_all(&artifact_dir)?;
-
-        // Write ELF
-        fs::write(artifact_dir.join("guest.elf"), elf_bytes)?;
-
-        // Write method ID as hex
-        let method_id_hex = hex::encode(method_id);
-        fs::write(artifact_dir.join("method_id"), &method_id_hex)?;
-
-        // Write manifest
-        let manifest = serde_json::json!({
-            "tile_id": tile_id,
-            "method_id": method_id_hex,
-            "elf_size": elf_bytes.len(),
-        });
-        fs::write(
-            artifact_dir.join("manifest.json"),
-            serde_json::to_string_pretty(&manifest)?,
-        )?;
-
-        Ok(artifact_dir)
-    }
-}
-
-/// Errors that can occur during guest building.
-#[derive(Debug, thiserror::Error)]
-pub enum GuestBuildError {
-    #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
-
-    #[error("Compilation failed: {0}")]
-    CompilationFailed(String),
-
-    #[error("ELF not found at: {0}")]
-    ElfNotFound(PathBuf),
-
-    #[error("JSON serialization error: {0}")]
-    Json(#[from] serde_json::Error),
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
-    /// A raster workspace and a user crate on disk, laid out as a guest sees
-    /// them.
-    struct Layout {
-        _dir: tempfile::TempDir,
-        workspace: PathBuf,
-        user: PathBuf,
+    fn repository() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .unwrap()
     }
 
     fn write(path: &Path, contents: &str) {
@@ -554,67 +310,234 @@ mod tests {
         fs::write(path, contents).unwrap();
     }
 
-    fn layout() -> Layout {
-        let dir = tempfile::tempdir().unwrap();
-        let workspace = dir.path().join("raster");
-        let user = dir.path().join("user");
-        write(&workspace.join("Cargo.toml"), "[workspace]");
-        for krate in ["raster", "raster-core", "raster-macros", "raster-runtime"] {
-            let root = workspace.join("crates").join(krate);
-            write(&root.join("Cargo.toml"), "[package]");
-            write(&root.join("src/lib.rs"), "// lib");
+    /// A copy of hello-tiles' sources in `app`, depending on `raster` as
+    /// `raster_dependency` says, with no workspace inheritance of its own.
+    fn app(app: &Path, raster_dependency: &str) {
+        let hello = repository().join("examples/hello-tiles");
+        let manifest: Vec<String> = fs::read_to_string(hello.join("Cargo.toml"))
+            .unwrap()
+            .lines()
+            .map(|line| match line.split([' ', '.']).next().unwrap_or("") {
+                "raster" => raster_dependency.to_string(),
+                "serde" => r#"serde = { version = "1.0", default-features = false, features = ["derive", "alloc"] }"#.into(),
+                "serde_json" => r#"serde_json = { version = "1.0", optional = true }"#.into(),
+                _ => line.to_string(),
+            })
+            .collect();
+        write(&app.join("Cargo.toml"), &manifest.join("\n"));
+        for dir in ["src", "bin"] {
+            for entry in fs::read_dir(hello.join(dir)).unwrap() {
+                let entry = entry.unwrap();
+                fs::create_dir_all(app.join(dir)).unwrap();
+                fs::copy(entry.path(), app.join(dir).join(entry.file_name())).unwrap();
+            }
         }
-        write(&user.join("Cargo.toml"), "[package]");
-        write(&user.join("src/lib.rs"), "// tiles");
-        write(&user.join("src/helpers/mod.rs"), "// helpers");
-        write(&user.join("src/main.rs"), "// sequences");
-        Layout {
-            _dir: dir,
-            workspace,
-            user,
-        }
+        // Same versions as this repository, without a network resolve.
+        fs::copy(
+            repository().join("Cargo.lock"),
+            app.parent().unwrap().join("Cargo.lock"),
+        )
+        .unwrap();
     }
 
-    fn fingerprint(layout: &Layout) -> String {
-        GuestBuilder {
-            output_dir: PathBuf::from("/unused"),
-            user_crate_path: Some(layout.user.clone()),
-            user_crate_name: Some("user".to_string()),
-            raster_workspace: Some(layout.workspace.clone()),
-        }
-        .recipe_fingerprint()
-    }
-
-    /// Everything a guest compiles moves the key; what it does not compile
-    /// leaves it alone.
+    /// build-path-dependence §1: `raster = { workspace = true }`, with the path
+    /// in the workspace root's manifest, reached through a symlinked sibling
+    /// checkout. The old line scan found no path and fell back to
+    /// `/crates/raster`; the symlink then made cargo see two `raster` packages.
+    #[cfg(unix)]
     #[test]
-    fn the_recipe_tracks_what_a_guest_compiles() {
-        let layout = layout();
-        let base = fingerprint(&layout);
-        assert_eq!(fingerprint(&layout), base, "the fingerprint is deterministic");
+    fn an_inherited_raster_through_a_symlink_resolves() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(repository(), tmp.path().join("raster")).unwrap();
+        let workspace = tmp.path().join("ws");
+        write(
+            &workspace.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"app\"]\nresolver = \"2\"\n\n\
+             [workspace.dependencies]\n\
+             raster = { path = \"../raster/crates/raster\", default-features = false }\n",
+        );
+        app(
+            &workspace.join("app"),
+            "raster = { workspace = true, default-features = false }",
+        );
 
-        let changed = |path: PathBuf| {
-            let before = fingerprint(&layout);
-            let original = fs::read_to_string(&path).unwrap();
-            write(&path, &format!("{original}\n// edited"));
-            let after = fingerprint(&layout);
-            write(&path, &original);
-            before != after
+        let builder = GuestBuilder::resolve(&tmp.path().join("out"), &workspace.join("app"))
+            .unwrap_or_else(|e| panic!("{e}"));
+        // As the project's own manifest reaches it, through the symlinked
+        // sibling: a stage path, not the canonical checkout.
+        assert_eq!(builder.raster_dependency, "raster/crates/raster");
+        assert_eq!(builder.user.name, "hello-tiles");
+        let names: Vec<&str> = builder.plan.entries().iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["project", "raster"]);
+        assert_eq!(builder.fingerprint().len(), 16);
+    }
+
+    /// A sibling project whose raster checkout is not named `raster`: the
+    /// stage still names it `raster`, and keeps the project's
+    /// `../raster-main/...` valid by rewriting the manifest inside the stage,
+    /// so raster has one path. (Staging it as `raster` without that rewrite
+    /// left the path dangling and failed the resolve.)
+    #[cfg(unix)]
+    #[test]
+    fn a_renamed_sibling_checkout_resolves() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(repository(), tmp.path().join("raster-main")).unwrap();
+        let project = tmp.path().join("app");
+        app(
+            &project,
+            r#"raster = { path = "../raster-main/crates/raster", default-features = false }"#,
+        );
+        write(&project.join("Cargo.toml"), &format!(
+            "{}\n[workspace]\n",
+            fs::read_to_string(project.join("Cargo.toml")).unwrap()
+        ));
+        fs::rename(tmp.path().join("Cargo.lock"), project.join("Cargo.lock")).unwrap();
+
+        let builder = GuestBuilder::resolve(&tmp.path().join("out"), &project)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let names: Vec<&str> = builder.plan.entries().iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["project", "raster"], "no folder name reaches the stage");
+        assert_eq!(builder.raster_dependency, "raster/crates/raster");
+    }
+
+    /// A standalone sibling project beside a `raster` checkout, in `folder`.
+    #[cfg(unix)]
+    fn sibling(root: &Path, folder: &str) -> PathBuf {
+        std::os::unix::fs::symlink(repository(), root.join("raster")).unwrap();
+        let project = root.join(folder);
+        app(
+            &project,
+            r#"raster = { path = "../raster/crates/raster", default-features = false }"#,
+        );
+        write(&project.join("Cargo.toml"), &format!(
+            "{}\n[workspace]\n",
+            fs::read_to_string(project.join("Cargo.toml")).unwrap()
+        ));
+        fs::rename(root.join("Cargo.lock"), project.join("Cargo.lock")).unwrap();
+        project
+    }
+
+    /// The project's folder may be called anything: it is staged as
+    /// `project`, so the cache key (like the image id) does not change.
+    #[cfg(unix)]
+    #[test]
+    fn the_project_folder_name_stays_out() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let key = |root: &Path, folder: &str| {
+            let builder = GuestBuilder::resolve(&root.join("out"), &sibling(root, folder))
+                .unwrap_or_else(|e| panic!("{e}"));
+            let names: Vec<String> = builder.plan.entries().iter().map(|e| e.name.clone()).collect();
+            assert_eq!(names, vec!["project", "raster"]);
+            builder.fingerprint().to_string()
         };
+        assert_eq!(key(a.path(), "iris"), key(b.path(), "iris-main"));
+    }
 
-        for krate in ["raster", "raster-core", "raster-macros"] {
-            assert!(
-                changed(layout.workspace.join("crates").join(krate).join("src/lib.rs")),
-                "a change to {krate} must invalidate cached guests"
-            );
-        }
-        assert!(changed(layout.workspace.join("Cargo.toml")));
-        assert!(changed(layout.user.join("src/helpers/mod.rs")), "a helper outside the tile's file");
-        assert!(changed(layout.user.join("Cargo.toml")));
+    /// A project naming raster by an absolute path. Cargo resolves that path to
+    /// the real checkout, so the guest must name the same one: a stage path
+    /// alongside it would be a second `raster` package.
+    #[cfg(unix)]
+    #[test]
+    fn an_absolute_raster_path_resolves_without_a_second_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let checkout = tmp.path().join("elsewhere/raster");
+        fs::create_dir_all(checkout.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(repository(), &checkout).unwrap();
+        let project = tmp.path().join("app");
+        app(
+            &project,
+            &format!(
+                r#"raster = {{ path = "{}", default-features = false }}"#,
+                checkout.join("crates/raster").display()
+            ),
+        );
+        write(&project.join("Cargo.toml"), &format!(
+            "{}\n[workspace]\n",
+            fs::read_to_string(project.join("Cargo.toml")).unwrap()
+        ));
+        fs::rename(tmp.path().join("Cargo.lock"), project.join("Cargo.lock")).unwrap();
 
-        // Not compiled into a guest: the runtime (std only) and the user
-        // crate's binary, where its sequences live.
-        assert!(!changed(layout.workspace.join("crates/raster-runtime/src/lib.rs")));
-        assert!(!changed(layout.user.join("src/main.rs")));
+        let builder = GuestBuilder::resolve(&tmp.path().join("out"), &project)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            builder.raster_dependency,
+            checkout.join("crates/raster").display().to_string(),
+            "the guest names raster exactly as the project does"
+        );
+    }
+
+    /// A dependency inherited with `workspace = true` takes its features from
+    /// the workspace root: changing them there must move the cache key, or the
+    /// old guest is reused for new behaviour.
+    #[cfg(unix)]
+    #[test]
+    fn a_workspace_dependency_feature_moves_the_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(repository(), tmp.path().join("raster")).unwrap();
+        let workspace = tmp.path().join("ws");
+        let root_manifest = |features: &str| {
+            format!(
+                "[workspace]\nmembers = [\"app\"]\nresolver = \"2\"\n\n\
+                 [workspace.dependencies]\n\
+                 raster = {{ path = \"../raster/crates/raster\", default-features = false }}\n\
+                 serde = {{ version = \"1.0\", default-features = false, features = [{features}] }}\n"
+            )
+        };
+        write(&workspace.join("Cargo.toml"), &root_manifest(r#""derive", "alloc""#));
+        app(&workspace.join("app"), "raster = { workspace = true, default-features = false }");
+        let manifest = workspace.join("app/Cargo.toml");
+        let text = fs::read_to_string(&manifest).unwrap();
+        let text: Vec<String> = text
+            .lines()
+            .map(|l| if l.starts_with("serde =") { "serde = { workspace = true }".into() } else { l.into() })
+            .collect();
+        write(&manifest, &text.join("\n"));
+
+        let key = || {
+            GuestBuilder::resolve(&tmp.path().join("out"), &workspace.join("app"))
+                .unwrap_or_else(|e| panic!("{e}"))
+                .fingerprint()
+                .to_string()
+        };
+        let before = key();
+        assert_eq!(key(), before, "deterministic");
+        write(&workspace.join("Cargo.toml"), &root_manifest(r#""derive", "alloc", "rc""#));
+        assert_ne!(key(), before, "a feature in [workspace.dependencies] reaches the key");
+    }
+
+    #[test]
+    fn a_project_without_raster_is_an_error_naming_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("plain");
+        write(
+            &project.join("Cargo.toml"),
+            "[package]\nname = \"plain\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[workspace]\n",
+        );
+        write(&project.join("src/lib.rs"), "");
+        let error = GuestBuilder::resolve(&tmp.path().join("out"), &project)
+            .err()
+            .expect("no raster dependency");
+        assert!(error.contains("no `raster` path package"), "{error}");
+        assert!(error.contains("`plain`"), "{error}");
+    }
+
+    /// The cache key is the same for the same sources at two checkout paths.
+    #[cfg(unix)]
+    #[test]
+    fn the_fingerprint_does_not_depend_on_the_checkout_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key = |at: &Path| {
+            fs::create_dir_all(at.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(repository(), at).unwrap();
+            GuestBuilder::resolve(&tmp.path().join("out"), &at.join("examples/hello-tiles"))
+                .unwrap_or_else(|e| panic!("{e}"))
+                .fingerprint()
+                .to_string()
+        };
+        assert_eq!(
+            key(&tmp.path().join("a/raster")),
+            key(&tmp.path().join("b/deeper/defender-raster"))
+        );
     }
 }

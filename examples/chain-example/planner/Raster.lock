@@ -1,14 +1,16 @@
 {
-  "format": 1,
-  "program_commitment": "4592bdb8c87a93341dbd3bda6ddce8d5ef1f55c38623fcc70aea29c527b3e527",
+  "format": 3,
+  "program_commitment": "6a99d29ddd0ce103783d0a8eaa6c7c2c09103651a95d0ff4c0283068cd17a5a5",
   "tiles": {
     "plan_steps": {
-      "image_id": "d92725ae0115e9bb1150f1308351202bc2dac1e69afaf94676bd17d6276e7776",
+      "image_id": "c188bb1b2537aceb7f1d489dc6f50a7eb2275a967b615ba87ee2442a796753a3",
       "source_hash": "0ab58f5a69710ff90000000000000374"
     }
   },
   "toolchain": {
     "risc0": "risc0-zkvm-3.0.6",
-    "build_mode": "local"
-  }
+    "build_mode": "local",
+    "rustc": "rustc 1.94.1-dev (06e01cb0d 2026-04-09)"
+  },
+  "guest_inputs": "67fbcc0174204978ea459dce52a00daf4df70b76021c87d43099bb46ea3b2874"
 }

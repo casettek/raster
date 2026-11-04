@@ -27,6 +27,8 @@ raster-compiler.workspace = true
 raster-runtime.workspace = true
 raster-prover = { workspace = true }
 raster-analysis.workspace = true
+# The guest toolchain a Raster.lock records (program.rs).
+raster-guest-build.workspace = true
 
 risc0-zkvm = { version = "3.0", features = ["prove", "std"] }
 

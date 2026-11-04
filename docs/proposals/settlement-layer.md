@@ -268,7 +268,9 @@ offline claimer is protected only if *someone else* can defend. Today that holds
 defender who builds the stage's tiles at the claimer's checkout path: tile image ids depend on the
 absolute source paths in the tile ELFs (`stage-challenge.md` open question 6). **This is a
 prerequisite for the settlement layer, not part of it.** Until program identity is
-path-independent, `T` protects only claimers who stay online.
+path-independent, `T` protects only claimers who stay online. *Met 2026-11-03*
+([`path-independent-builds`](./path-independent-builds.md)) for defenders with the claimer's
+`Cargo.lock` and guest compiler, which `Raster.lock` records.
 
 ### 6. The body format: revealed head and tail roots (header v3)
 
@@ -378,7 +380,7 @@ and `chain defend` (§3).
 
 - `stage-challenge.md` Phases 1–3: **done**.
 - Path-independent program identity (`stage-challenge.md` open question 6): needed for any
-  defender other than the claimer.
+  defender other than the claimer. **Done 2026-11-03** (`path-independent-builds`).
 - A portable, on-chain-verifiable receipt format (spec `05`): needed for an on-chain settlement;
   not needed for an off-chain arbiter.
 - A data-availability layer: needed before `T` can start for anyone but a local defender.

@@ -16,13 +16,13 @@ Where the current implementation does not fully support the desired properties (
 ### Identity / “method id” derivation
 
 - **RISC0 image id computation**
-  - `crates/raster-backend-risc0/src/risc0.rs`: `compile_tile()` calls `risc0_zkvm::compute_image_id(&elf)` and persists the result as `CompilationOutput.method_id`.
+  - `crates/raster-guest-build/src/guest.rs`: `GuestBinary::package` packages the user ELF with the v1compat kernel and calls `risc0_binfmt::compute_image_id` (which `risc0_zkvm` re-exports); `crates/raster-backend-risc0/src/risc0.rs`: `compile_tile()` persists it.
   - `crates/raster-backend-risc0/Cargo.toml`: pins the host-side `risc0-zkvm` crate dependency (currently `version = "1.2"`).
 - **Native backend “method id” placeholder**
   - `crates/raster-backend/src/native.rs`: `compile_tile()` returns `method_id = tile_id.as_bytes().to_vec()` and an empty ELF.
 - **Persistence format (hex file + manifest)**
   - `crates/raster-compiler/src/builder.rs`: `write_tile_artifacts()` writes `guest.elf`, `method_id` (hex), and `manifest.json`.
-  - `crates/raster-backend-risc0/src/guest_builder.rs`: `write_artifacts()` also writes `guest.elf`, `method_id`, and a minimal `manifest.json` (note: schema differs from the compiler’s).
+  - `crates/raster-backend-risc0/src/risc0.rs`: `Risc0ArtifactStore` writes `<cache key>.elf`, `image_id` and `manifest.json` under `target/raster/tiles/<tile>/risc0/`. (`guest_builder.rs`'s `write_artifacts()` was dead code, removed 2026-11-03.)
 
 ### What inputs are (and are not) hashed
 
@@ -34,15 +34,16 @@ Where the current implementation does not fully support the desired properties (
 ### Toolchain selection / version pinning
 
 - **RISC0 toolchain discovery**
-  - `crates/raster-backend-risc0/src/guest_builder.rs`: `find_risc0_cargo()`
-    - Uses `RISC0_RUST_TOOLCHAIN_PATH` if set, otherwise selects the “latest” toolchain under `~/.risc0/toolchains` by sorting directory names.
-  - `crates/raster-backend-risc0/src/guest_builder.rs`: `build_guest()`
-    - Calls RISC0 toolchain `cargo build --release --target riscv32im-risc0-zkvm-elf` and sets `RUSTC` to the toolchain’s `bin/rustc`.
+  - `crates/raster-guest-build/src/recipe.rs`: `Toolchain::find()`
+    - Uses `RISC0_RUST_TOOLCHAIN_PATH` if set, otherwise rzup's default Rust toolchain (the one risc0-build uses).
+    - `Raster.lock` records its `rustc -V` line as `toolchain.rustc` (lock format 2).
+  - `crates/raster-guest-build/src/guest.rs`: `GuestBuild::run()`
+    - Calls the toolchain's own `cargo build --release --target riscv32im-risc0-zkvm-elf` from a stage (docs/proposals/path-independent-builds.md) and sets `RUSTC` to the toolchain’s `bin/rustc`.
 - **Guest crate dependency versions**
   - `crates/raster-backend-risc0/src/guest_builder.rs`: `generate_guest_cargo_toml()`
     - Declares `risc0-zkvm = { version = "1.2", default-features = false }` and `raster = { path = "...", default-features = false }`.
     - Adds the user crate as a path dependency with `default-features = false`.
-  - **GAP**: the generated guest crate does not include a checked-in `Cargo.lock`, and the build does not use `cargo --locked`.
+  - The stage is seeded with the project's `Cargo.lock` (raster's own is committed since 2026-11-03), so a tile guest uses the project's pinned versions. **GAP**: the build does not use `cargo --locked`.
 
 ---
 

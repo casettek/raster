@@ -1,13 +1,19 @@
 # Issue: `build-path-dependence` — where a project and its `raster` checkout live changes what gets built, and sometimes whether it builds
 
-Status: **open** 2026-10-30. Unowned. Two defects with one cause: the build and program identity
-read filesystem paths that the source does not determine. §1 is a completeness defect with a
+Status: **§1 and §2 fixed** 2026-11-03 by
+[`path-independent-builds`](../proposals/path-independent-builds.md) (branch `feature/path-fixes`);
+§3 open. The sections below describe the code as it was at `7b8230c`, and their line citations
+refer to that revision. Opened 2026-10-30: two defects with one cause, the build and program
+identity read filesystem paths that the source does not determine. §1 is a completeness defect with a
 deterministic reproducer. §2 is a protocol defect that limits who can defend a challenge. §3 is a
 smaller relocation gap in run artifacts.
 
 Reproduced on `replay-profile` at main `7b8230c`. Every citation is committed code.
 
 Related:
+- [`path-independent-builds.md`](../proposals/path-independent-builds.md) — the proposed fix
+  for §1 and §2 (2026-11-03). It measured that `--remap-path-prefix` alone (§Directions) is not
+  enough, and found the same defect in the protocol guests.
 - [`stage-challenge.md`](../proposals/stage-challenge.md) — open question 6 and §Verification
   ("Anyone defends") record §2's consequence: a defender at another checkout path fails with
   `program identity drift`. That proposal places the fix in program identity, not in its own

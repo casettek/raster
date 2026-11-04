@@ -398,7 +398,9 @@ std = ["raster/std"]
 profiling = ["raster/profiling"]
 
 [dependencies]
-raster = {{ path = "../path/to/raster/crates/raster", default-features = false }}
+# Assumes this project sits next to the raster checkout (<dir>/{name} and
+# <dir>/raster). Edit the path if it does not.
+raster = {{ path = "../raster/crates/raster", default-features = false }}
 serde = {{ version = "1.0", features = ["derive"] }}
 "#
     );

@@ -19,7 +19,7 @@ Raster currently produces **an artifact directory tree**, not a single-file “b
   - `crates/raster-backend/src/backend.rs`: `trait Backend::name()`, `CompilationOutput`
   - `crates/raster-backend/src/native.rs`: native backend produces empty ELF and a placeholder method id
   - `crates/raster-backend-risc0/src/risc0.rs`: RISC0 backend computes image id from ELF and writes artifacts
-  - `crates/raster-backend-risc0/src/guest_builder.rs`: also writes `guest.elf`, `method_id`, `manifest.json` (a smaller schema) when used directly
+  - `crates/raster-backend-risc0/src/guest_builder.rs`: writes no artifacts; its `write_artifacts` (`guest.elf`, `method_id`, `manifest.json`) was dead code, removed 2026-11-03
 - **Project-level manifests (in-memory types; currently not written as a bundle file)**
   - `crates/raster-core/src/manifest.rs`: `Manifest { name, version, tiles, sequences }`
   - Consumers may also need `crates/raster-core/src/tile.rs` (`TileMetadata`) and `crates/raster-core/src/schema.rs` (`SequenceSchema`)
