@@ -58,9 +58,9 @@ cd my-project
 > `cargo raster init` from that parent directory, or edit the path. cargo
 > resolves it, so any dependency form works, including one inherited from a
 > workspace or reached through a symlink. Tile image ids do not depend on where
-> the checkouts live. They do depend on the project's directory name and its
-> position relative to raster, on the `Cargo.lock`, and on the guest compiler
-> (see [path-independent builds](docs/proposals/path-independent-builds.md)).
+> the checkouts live or what their folders are called. They do depend on the
+> project's position relative to raster, on the `Cargo.lock`, and on the guest
+> compiler (see [path-independent builds](docs/proposals/path-independent-builds.md)).
 
 ### 2. Write tiles
 

@@ -11,6 +11,11 @@ use crate::{Error, Result};
 /// the raster checkout's directory name never reaches an image id.
 pub const RASTER_ENTRY: &str = "raster";
 
+/// The stage name of the entry that holds the guest's own project (the user
+/// crate), when that is not the raster checkout. Fixed for the same reason:
+/// a project's folder may be called anything (`iris`, `iris-main`, ...).
+pub const PROJECT_ENTRY: &str = "project";
+
 /// One top-level stage entry: `stage/<name>` links to `target`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StageEntry {
@@ -117,6 +122,30 @@ impl StagePlan {
     /// The manifests [`Stage::create`] keeps valid.
     pub fn manifests(&self) -> &[PathBuf] {
         &self.manifests
+    }
+
+    /// Rename entries: `name_of` gets each entry's real directory and returns
+    /// its stage name, or `None` to keep the current one. Any manifest that
+    /// reaches a renamed entry by its real name is kept valid the same way as
+    /// for the raster rename ([`Self::with_manifests`]). Two entries may not
+    /// end up with one name.
+    pub fn with_entry_names(mut self, name_of: impl Fn(&Path) -> Option<String>) -> Result<Self> {
+        let mut by_name: BTreeMap<String, PathBuf> = BTreeMap::new();
+        for entry in &self.entries {
+            let name = name_of(&entry.target).unwrap_or_else(|| entry.name.clone());
+            if let Some(previous) = by_name.insert(name.clone(), entry.target.clone()) {
+                return Err(Error::Layout(format!(
+                    "both {} and {} would be staged as `{name}`",
+                    previous.display(),
+                    entry.target.display()
+                )));
+            }
+        }
+        self.entries = by_name
+            .into_iter()
+            .map(|(name, target)| StageEntry { name, target })
+            .collect();
+        Ok(self)
     }
 
     /// The directory the stage mirrors (A).
@@ -422,6 +451,44 @@ mod tests {
             plan.stage_relative(&raster.join("crates/raster")).unwrap(),
             p("raster/crates/raster")
         );
+    }
+
+    /// The project's folder name stays out too, whatever it is.
+    #[test]
+    fn entries_can_be_renamed_to_fixed_names() {
+        let raster = p("/p/raster-main");
+        let iris = p("/p/iris-main");
+        let shared = p("/p/shared-libs");
+        let plan = StagePlan::new(&[raster.clone(), iris.clone(), shared.clone()], Some(&raster))
+            .unwrap()
+            .with_entry_names(|target| {
+                if target == iris {
+                    Some("project".into())
+                } else if target == shared {
+                    Some("dep-common".into())
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        assert_eq!(
+            names(&plan),
+            vec![
+                ("dep-common", shared.as_path()),
+                ("project", iris.as_path()),
+                ("raster", raster.as_path())
+            ]
+        );
+        assert_eq!(
+            plan.stage_relative(&iris.join("raster-stages/prefill-range")).unwrap(),
+            p("project/raster-stages/prefill-range")
+        );
+        let error = StagePlan::new(&[raster.clone(), iris.clone()], Some(&raster))
+            .unwrap()
+            .with_entry_names(|_| Some("same".into()))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("staged as `same`"), "{error}");
     }
 
     #[test]

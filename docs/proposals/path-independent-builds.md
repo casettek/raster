@@ -182,12 +182,13 @@ workspace root inside a stage entry.
 | protocol guest | the checkout | its parent | `raster` | `raster/crates/raster-core/…`, `raster/crates/raster-prover/guests/…` |
 
 Once this lands:
-- **An image id no longer depends on:** the absolute location, the checkout's directory name, the
-  user name, `$CARGO_HOME`, the temp directory, or whether the layout is reached through a symlink
-  (P8).
+- **An image id no longer depends on:** the absolute location, any folder's name (the raster
+  checkout is staged as `raster`, the project's folder as `project`, any other folder of local
+  crates as `dep-<its first crate>`; open question 1, decided 2026-11-04), the user name,
+  `$CARGO_HOME`, the temp directory, or whether the layout is reached through a symlink (P8).
 - **It still depends on:**
-  - the relative layout beneath A;
-  - the real names of entries other than `raster`, such as `iris` (open question 1);
+  - the relative layout beneath A: how deep the project sits relative to raster, which its
+    manifests' `../` paths spell out anyway;
   - the toolchain (§4.5);
   - the lockfile.
 
@@ -480,8 +481,9 @@ tile, two checkout copies at different paths with different `$CARGO_HOME`s, equa
     worktree, the real fraud proof built in 157 s (GPU memory peak 7.1 GB). The 3.8 MB composite
     receipt verifies in this checkout against its `TRANSITION_GUEST_ID`, not in dev mode.
 - **Follow-ups:**
-  - `examples/hello-tiles/fraud_commit.bin.fraud-proof` is a committed artifact that no longer
-    verifies, since PR 4 moved the protocol ids; regenerate or remove it.
+  - `examples/hello-tiles/fraud_commit.bin.fraud-proof` was a committed artifact that no longer
+    verified, since PR 4 moved the protocol ids. **Deleted 2026-11-04**, and `*.fraud-proof` is
+    now gitignored, so a new one is not committed by accident.
   - A segment-size setting (for example `RASTER_SEGMENT_PO2`) would let 8 GB cards prove the
     transition guest without a patch.
 
@@ -557,11 +559,13 @@ tile, two checkout copies at different paths with different `$CARGO_HOME`s, equa
 
 ## 9. Open questions
 
-1. **Names of entries other than `raster` are part of identity.** For example, a sibling `iris`
-   checkout cloned as `iris-main` gets different ids. The raster checkout's own name no longer
-   matters (§4.3). Should this be accepted as convention? Or should the stage also give the
-   project's entry a fixed name? That is only possible when no manifest refers to it by name, and
-   raster never refers to iris.
+1. **Names of entries other than `raster` are part of identity.** **Decided 2026-11-04: no,
+   folder names can be anything.** The project's folder is staged as `project`, and any other
+   folder of local crates as `dep-<its first crate>`. A manifest that reaches a renamed folder by
+   its real name is rewritten inside the stage, the same mechanism as for `raster` (§4.3).
+   Measured: the same project in folders `iris` and `iris-main` has the same cache key. iris's
+   tile ids changed once (they had embedded `iris`); raster's examples and the protocol guests did
+   not.
 2. **Windows.** Stage by copy (the plan's default), or by directory junction? Native Windows
    builds skip guest builds today (`RISC0_SKIP_BUILD=1` in `utils/native_build.rs:45` on windows-native), so this is low
    stakes.

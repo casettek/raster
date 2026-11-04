@@ -292,7 +292,8 @@ the guest — it authenticated a root, and it still does.
    `examples/hello-tiles/fraud_commit.bin.fraud-proof` is **not** regenerated. It is a saved
    `risc0_zkvm::Receipt`, and a receipt's journal carries `TrackedDraftState` — untouched by
    this change — not the witness, so nothing in it fails to decode. It is stale for the
-   image-id reason above, which it already was before this change.
+   image-id reason above, which it already was before this change. *(Deleted 2026-11-04, and
+   `*.fraud-proof` is now gitignored: a receipt is run output tied to one build's protocol ids.)*
 
 ## Verification
 

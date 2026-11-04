@@ -17,6 +17,9 @@ target-cuda/
 # Raster artifacts
 *.trace
 *.raster
+# Fraud-proof receipts `run --audit` writes beside a commitment: run output, tied to
+# the protocol guest ids of the build that made them, so never committed.
+*.fraud-proof
 
 # Generated input fixtures (see examples/hello-tiles/bin/gen_input.rs)
 *.rastered

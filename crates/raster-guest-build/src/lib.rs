@@ -44,7 +44,7 @@ pub use recipe::{
     cargo_home, encode_rustflags, rustflags, Toolchain, ToolchainInputs, CARGO_HOME_REMAP,
     RECIPE_VERSION, TARGET,
 };
-pub use stage::{Stage, StageEntry, StagePlan, RASTER_ENTRY};
+pub use stage::{Stage, StageEntry, StagePlan, PROJECT_ENTRY, RASTER_ENTRY};
 
 /// Errors from resolving, staging or building a guest.
 #[derive(Debug, thiserror::Error)]
@@ -77,8 +77,9 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// The stage layout for a guest whose path packages are `packages`.
 ///
-/// The entry holding the raster workspace is staged as [`RASTER_ENTRY`], so the
-/// raster checkout's own directory name never reaches an image id. A tile
+/// The entry holding the raster workspace is staged as [`RASTER_ENTRY`] and the
+/// one holding the project as [`PROJECT_ENTRY`], so no folder name reaches an
+/// image id. A tile
 /// guest finds that workspace through its `raster` dependency; a protocol
 /// guest, which links only `raster-core`, through that.
 pub fn stage_plan(packages: &PathPackages) -> Result<StagePlan> {
@@ -94,5 +95,25 @@ pub fn stage_plan(packages: &PathPackages) -> Result<StagePlan> {
         .flat_map(|p| [p.dir.join("Cargo.toml"), p.workspace_root.join("Cargo.toml")])
         .filter(|m| m.is_file())
         .collect();
-    Ok(StagePlan::new(&packages.workspace_roots(), raster_root)?.with_manifests(manifests))
+    // No folder name reaches an image id: the raster checkout is `raster`,
+    // the project's folder `project`, and any other folder of local crates is
+    // named after the first crate it holds.
+    let project_dir = &packages.root.dir;
+    StagePlan::new(&packages.workspace_roots(), raster_root)?
+        .with_manifests(manifests)
+        .with_entry_names(|target| {
+            if raster_root.is_some_and(|root| root.starts_with(target)) {
+                None
+            } else if project_dir.starts_with(target) {
+                Some(PROJECT_ENTRY.to_string())
+            } else {
+                packages
+                    .packages
+                    .iter()
+                    .filter(|p| p.dir.starts_with(target))
+                    .map(|p| p.name.as_str())
+                    .min()
+                    .map(|first| format!("dep-{first}"))
+            }
+        })
 }

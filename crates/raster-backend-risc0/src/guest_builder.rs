@@ -321,7 +321,7 @@ mod tests {
         assert_eq!(builder.raster_dependency, "raster/crates/raster");
         assert_eq!(builder.user.name, "hello-tiles");
         let names: Vec<&str> = builder.plan.entries().iter().map(|e| e.name.as_str()).collect();
-        assert_eq!(names, vec!["raster", "ws"]);
+        assert_eq!(names, vec!["project", "raster"]);
         assert_eq!(builder.fingerprint().len(), 16);
     }
 
@@ -349,8 +349,42 @@ mod tests {
         let builder = GuestBuilder::resolve(&tmp.path().join("out"), &project)
             .unwrap_or_else(|e| panic!("{e}"));
         let names: Vec<&str> = builder.plan.entries().iter().map(|e| e.name.as_str()).collect();
-        assert_eq!(names, vec!["app", "raster"], "the checkout's name stays out");
+        assert_eq!(names, vec!["project", "raster"], "no folder name reaches the stage");
         assert_eq!(builder.raster_dependency, "raster/crates/raster");
+    }
+
+    /// A standalone sibling project beside a `raster` checkout, in `folder`.
+    #[cfg(unix)]
+    fn sibling(root: &Path, folder: &str) -> PathBuf {
+        std::os::unix::fs::symlink(repository(), root.join("raster")).unwrap();
+        let project = root.join(folder);
+        app(
+            &project,
+            r#"raster = { path = "../raster/crates/raster", default-features = false }"#,
+        );
+        write(&project.join("Cargo.toml"), &format!(
+            "{}\n[workspace]\n",
+            fs::read_to_string(project.join("Cargo.toml")).unwrap()
+        ));
+        fs::rename(root.join("Cargo.lock"), project.join("Cargo.lock")).unwrap();
+        project
+    }
+
+    /// The project's folder may be called anything: it is staged as
+    /// `project`, so the cache key (like the image id) does not change.
+    #[cfg(unix)]
+    #[test]
+    fn the_project_folder_name_stays_out() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let key = |root: &Path, folder: &str| {
+            let builder = GuestBuilder::resolve(&root.join("out"), &sibling(root, folder))
+                .unwrap_or_else(|e| panic!("{e}"));
+            let names: Vec<String> = builder.plan.entries().iter().map(|e| e.name.clone()).collect();
+            assert_eq!(names, vec!["project", "raster"]);
+            builder.fingerprint().to_string()
+        };
+        assert_eq!(key(a.path(), "iris"), key(b.path(), "iris-main"));
     }
 
     /// A project naming raster by an absolute path. Cargo resolves that path to
