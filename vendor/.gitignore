@@ -1,2 +1,0 @@
-# Upstream fixture data is part of the vendored package, not generated Raster output.
-!risc0-zkvm/examples/*.bin

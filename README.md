@@ -43,16 +43,6 @@ Raster is organized as a Rust workspace with the following crates:
 cargo install raster-cli
 ```
 
-Native builds launched by `cargo raster run` and `cargo raster chain run`
-automatically configure Windows MSVC with `/DNOMINMAX /std:c++20 /EHsc` for
-the RISC Zero host dependencies. Existing compiler flags are retained, with
-these required flags appended. Native Windows builds also default
-`RISC0_SKIP_BUILD` to `1` (unless explicitly set), since replay does not need
-RISC-V proof guests. Executable names use the host's suffix (`.exe` on Windows).
-macOS and Linux retain their existing build environment. Windows still requires
-the Visual Studio C++ build tools. This setup applies to child builds launched
-by the installed CLI, not to bootstrapping the CLI itself with Cargo.
-
 ## Quick Start
 
 ### 1. Initialize a new project
@@ -221,14 +211,12 @@ journal. Receipts from incompatible verifier versions are rejected; use their
 matching Raster build. Development mode and fake receipts are forbidden.
 
 For composite or succinct inputs, the Groth16 wrapping step requires a working
-local Docker engine: `docker info` must succeed. On Windows, enable Docker
-Desktop's WSL integration for Ubuntu. Build Raster with `--features cuda` to
-accelerate STARK proof compression on the GPU; the final Groth16 wrapper uses
-Docker. The vendored RISC Zero CUDA feature deliberately leaves its native
-Groth16 wrapper opt-in (`cuda-groth16`): that wrapper hit an illegal CUDA memory
-access on the validation machine's RTX 5080. This changes backend selection,
-not proof circuits or verification rules. The first run may download proving
-assets/container images. Remote proving settings are not used.
+local Docker engine: `docker info` must succeed. Build Raster with
+`--features cuda` to accelerate STARK proof compression on the GPU. RISC Zero's
+`cuda` feature also switches the final Groth16 wrapper from Docker to its native
+CUDA prover, which hit an illegal CUDA memory access on an RTX 5080. The first
+run may download proving assets/container images. Remote proving settings are
+not used.
 Already-Groth16 inputs are verified and exported without recompression or Docker.
 
 

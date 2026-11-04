@@ -89,15 +89,8 @@ std=["raster/std"]
 raster = {{ path = {:?}, default-features = false }}
 serde={{version="1",default-features=false,features=["derive","alloc"]}}
 serde_json={{version="1",default-features=false,features=["alloc"]}}
-[patch.crates-io]
-risc0-zkvm-platform={{path={:?}}}
-risc0-circuit-keccak={{path={:?}}}
-risc0-zkvm={{path={:?}}}
 "#,
-            root.join("crates/raster"),
-            root.join("vendor/risc0-zkvm-platform"),
-            root.join("vendor/risc0-circuit-keccak"),
-            root.join("vendor/risc0-zkvm")
+            root.join("crates/raster")
         ),
     )
     .unwrap();
