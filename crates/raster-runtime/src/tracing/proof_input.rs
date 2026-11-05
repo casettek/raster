@@ -1,3 +1,4 @@
+use crate::tracing::recorder::StepWitnessData;
 use crate::TraceRecorder;
 use raster_core::cfs::CfsCoordinates;
 use raster_core::input::{SelectionWitness, StorageRef};
@@ -18,7 +19,7 @@ pub struct ProofStorageState {
     coordinate_index: raster_core::coordinate_index::IncrementalCoordinateIndex,
 }
 
-fn empty_storage_frontier() -> SerializableFrontier {
+pub fn empty_storage_frontier() -> SerializableFrontier {
     SerializableFrontier {
         position: 0,
         leaf: EMPTY_LEAF.to_vec(),
@@ -73,12 +74,17 @@ fn apply_storage_write_to_state(
     storage_write: &crate::StorageWriteRecord,
 ) {
     state.frontier = storage_write.frontier_after.clone();
-    state.append_tree.append(&storage_write.entry);
+    apply_storage_entry(state, &storage_write.entry, storage_write.log_position);
+}
+
+/// The log and index half of a write; the frontier is the caller's.
+fn apply_storage_entry(state: &mut ProofStorageState, entry: &StorageEntry, log_position: u64) {
+    state.append_tree.append(entry);
     state.coordinate_index.insert(
-        storage_write.entry.coordinates.clone(),
+        entry.coordinates.clone(),
         StorageIndexValue {
-            log_position: storage_write.log_position,
-            object_commitment: storage_write.entry.object_commitment.clone(),
+            log_position,
+            object_commitment: entry.object_commitment.clone(),
         },
     );
 }
@@ -93,6 +99,18 @@ impl ProofStorageState {
             coordinate_index:
                 raster_core::coordinate_index::IncrementalCoordinateIndex::new(),
         }
+    }
+    /// The state after `writes`, applied in order, whose last write left
+    /// `frontier`: what [`Self::advance`] would have reached over the same
+    /// steps. Live audit rebuilds the state its window opens with this way
+    /// instead of maintaining it on every step.
+    pub fn rebuilt(writes: &[(StorageEntry, u64)], frontier: SerializableFrontier) -> Self {
+        let mut state = Self::new();
+        for (entry, log_position) in writes {
+            apply_storage_entry(&mut state, entry, *log_position);
+        }
+        state.frontier = frontier;
+        state
     }
     pub fn for_recorded() -> Self {
         Self {
@@ -215,14 +233,67 @@ pub fn prepare_step_io(
     trace_recorder: &TraceRecorder,
     current_storage_state: &mut ProofStorageState,
 ) -> StepIo {
+    build_step_io(
+        &capture_step_io(step_record, trace_recorder),
+        trace_recorder,
+        current_storage_state,
+    )
+}
+
+/// What a step's evidence needs that the recorder does not keep: the step's
+/// recorded I/O and its parent's scope input, which a live recorder releases
+/// once the step is recorded. Selections and storage proofs are rebuilt later
+/// from stores that only grow.
+#[derive(Debug, Clone)]
+pub struct CapturedStepIo {
+    step_record: StepRecord,
+    step_witness: StepWitnessData,
+    sequence_scope_witness: Option<FnInput>,
+}
+
+impl CapturedStepIo {
+    pub fn step_record(&self) -> &StepRecord {
+        &self.step_record
+    }
+
+    /// The write this step applies to the proof state, under the same
+    /// condition as [`build_step_io`] and [`ProofStorageState::advance`].
+    pub fn storage_write(&self) -> Option<crate::StorageWriteRecord> {
+        if self.step_record.appends_to_storage() {
+            self.step_witness.storage_write()
+        } else {
+            None
+        }
+    }
+}
+
+pub fn capture_step_io(step_record: &StepRecord, trace_recorder: &TraceRecorder) -> CapturedStepIo {
     let step_witness = trace_recorder
-        .step_witness_for(&step_record)
+        .step_witness_for(step_record)
         .unwrap_or_else(|| {
             panic!(
                 "Missing recorded I/O for fraud window step at coordinates {:?}",
                 step_record.coordinates()
             )
         });
+    CapturedStepIo {
+        step_record: step_record.clone(),
+        step_witness,
+        sequence_scope_witness: trace_recorder.sequence_scope_for(step_record),
+    }
+}
+
+/// A step's evidence against `current_storage_state`, the proof state as of
+/// that step, which it then advances past the step's write. The recorder
+/// supplies only selection witnesses, over objects that never change once
+/// written, so they are the same whenever they are built.
+pub fn build_step_io(
+    captured: &CapturedStepIo,
+    trace_recorder: &TraceRecorder,
+    current_storage_state: &mut ProofStorageState,
+) -> StepIo {
+    let step_record = &captured.step_record;
+    let step_witness = &captured.step_witness;
     // The witness store is keyed by coordinates alone, and a sequence's
     // `SequenceStart` and `SequenceEnd` share coordinates — the End does
     // `get_mut` on the Start's entry and fills in `output_data` only
@@ -239,7 +310,7 @@ pub fn prepare_step_io(
     let input_source_witness = step_record
         .input_source_commitment()
         .and_then(|_| step_witness.input_source_witness());
-    let sequence_scope_witness = trace_recorder.sequence_scope_for(step_record);
+    let sequence_scope_witness = captured.sequence_scope_witness.clone();
     let storage_selection_witnesses = build_storage_selection_witnesses(
         step_record,
         input_source_witness.as_ref(),
