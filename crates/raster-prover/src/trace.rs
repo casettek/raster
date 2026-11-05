@@ -2901,8 +2901,12 @@ pub struct SourceTracker {
     /// also reads its roots and frontiers instead of keeping a second tree.
     tree: MemoryWitnessTree,
     next: usize,
+    /// The record that opened each frame that is still open.
     frames: HashMap<CfsCoordinates, (usize, StepRecord)>,
-    producers: HashMap<(usize, CfsCoordinates), (usize, StepRecord)>,
+    /// The items produced so far in each open frame instance, keyed by the
+    /// position of the record that opened it. A closed instance's entries can
+    /// never be a source again, so they leave with it (`append_hashed`).
+    producers: HashMap<usize, HashMap<CfsCoordinates, (usize, StepRecord)>>,
 }
 impl SourceTracker {
     pub fn new() -> Self {
@@ -2964,7 +2968,8 @@ impl SourceTracker {
                     let frame_start = self.frames.get(&frame).expect("source frame").0;
                     let source = self
                         .producers
-                        .get(&(frame_start, source_coords.clone()))
+                        .get(&frame_start)
+                        .and_then(|items| items.get(&source_coords))
                         .expect("prior producer");
                     assert!(record_produces_item(
                         &source.1,
@@ -3011,8 +3016,18 @@ impl SourceTracker {
             if let Some((frame, _)) = coords.try_parent() {
                 if let Some((start, _)) = self.frames.get(&frame) {
                     self.producers
-                        .entry((*start, coords))
+                        .entry(*start)
+                        .or_default()
+                        .entry(coords.clone())
                         .or_insert((self.next, step.clone()));
+                }
+            }
+            // A `SequenceEnd` closes the frame instance it names: no later step
+            // runs inside it, and a reopened frame is a new instance. Its own
+            // record stays, as a producer in its parent frame.
+            if matches!(&step.kind, StepKind::SequenceEnd { .. }) {
+                if let Some((start, _)) = self.frames.remove(&coords) {
+                    self.producers.remove(&start);
                 }
             }
         }
