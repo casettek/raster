@@ -1159,9 +1159,41 @@ impl<C: CommitmentRead> TraceVerifier<C> {
         self.latest_frontier.append(Bytes(step_record_hash));
 
         let root = Bytes(frontier_root(&self.latest_frontier));
+        if self.diverges_at(step_index, &root.0) {
+            let window_frontier = self.window_frontiers.first().unwrap().clone();
+            return Some(self.window_at(step_index, window_frontier));
+        }
+        None
+    }
 
-        let index = step_index;
+    /// [`Self::push`] for a caller that keeps the trace tree itself: `root` is
+    /// the tree's root after this item, and `frontier_at(size)` the frontier
+    /// after its first `size` leaves (the seed is leaf 0). The verifier keeps
+    /// no frontier of its own, so drive one verifier through either `push` or
+    /// this, never both.
+    pub fn push_root(
+        &mut self,
+        step_index: usize,
+        step_record: &StepRecord,
+        root: &[u8],
+        frontier_at: impl FnOnce(u64) -> TraceTreeFrontier,
+    ) -> Option<TraceWindow> {
+        assert!(
+            step_index < self.trace_commitment.len(),
+            "execution exceeds commitment length"
+        );
+        self.window_items.push(step_record.clone());
+        if self.diverges_at(step_index, root) {
+            // The frontier before the window's first item, as `push`'s
+            // `window_frontiers.first()` holds it.
+            let first_item = (step_index + 1).saturating_sub(self.window_size);
+            return Some(self.window_at(step_index, frontier_at(first_item as u64 + 1)));
+        }
+        None
+    }
 
+    /// Whether the trace root after item `index` refutes the commitment there.
+    fn diverges_at(&self, index: usize, root: &[u8]) -> bool {
         // Across the final window the committed roots are revealed in full,
         // so compare those: detection there is exact rather than
         // `bits_per_item` bits, which at `window_size >= 128` was one bit.
@@ -1170,62 +1202,60 @@ impl<C: CommitmentRead> TraceVerifier<C> {
         // Root equality implies entry equality — the entry is derived from
         // the root — so this strictly replaces the weaker test rather than
         // sitting alongside it.
-        let diverges = match self.revealed_tail_root_at(index) {
-            Some(committed_root) => committed_root != root.0.as_slice(),
+        match self.revealed_tail_root_at(index) {
+            Some(committed_root) => committed_root != root,
             None => {
                 self.trace_commitment
                     .entry(index)
                     .expect("validated fingerprint entry")
-                    != fingerprint_value(&root.0, self.trace_commitment.packer().bits_per_item())
+                    != fingerprint_value(root, self.trace_commitment.packer().bits_per_item())
             }
-        };
-
-        if diverges {
-            // The rolling buffers *measure* the window; this slice has to
-            // reproduce what they already know. `index.saturating_sub(w) + 1`
-            // did not: below `w` the `saturating_sub` floors to 0 and the
-            // `+ 1` lands on **1**, giving one entry too few *and* starting
-            // one item late, so window item 0 was compared against
-            // committed item 1. At `index == 0` the range was `1..1` and
-            // the slice came back empty while still declaring `w` items.
-            //
-            // Clamping instead is identical for `index >= w` and yields 0
-            // at the head, which is where the window genuinely starts.
-            let window_len = self.window_items.len();
-            let diff_bits = self
-                .trace_commitment
-                .slice((index + 1).saturating_sub(self.window_size), index + 1);
-
-            // Declare what the slice holds, not the window's capacity.
-            // `Fingerprint::from` stores `len` verbatim without checking it
-            // against `bits`, and the guest reads that declared length as
-            // authoritative — which is how a head window used to travel all
-            // the way there claiming items it did not carry.
-            assert_eq!(
-                diff_bits.len(),
-                (window_len * self.trace_commitment.packer().bits_per_item()).div_ceil(64),
-                "fraud window slice holds {} blocks but declares {} items",
-                diff_bits.len(),
-                window_len,
-            );
-            let window_fingerprint =
-                Fingerprint::from(diff_bits, self.trace_commitment.packer(), window_len);
-
-            let window_frontier = self.window_frontiers.first().unwrap().clone();
-            let ser_window_frontier =
-                serializable_frontier_from_trace_frontier(window_frontier).to_bytes();
-
-            // TODO: consider renaming Window struct and TraceWindow have different behavior but
-            // similiar naming
-            let fraud_window = TraceWindow {
-                frontier: ser_window_frontier,
-                items: self.window_items.to_vec(),
-                fingerprint: window_fingerprint,
-            };
-
-            return Some(fraud_window);
         }
-        None
+    }
+
+    /// The window ending at item `index`, which opens on `window_frontier`.
+    fn window_at(&self, index: usize, window_frontier: TraceTreeFrontier) -> TraceWindow {
+        // The rolling buffers *measure* the window; this slice has to
+        // reproduce what they already know. `index.saturating_sub(w) + 1`
+        // did not: below `w` the `saturating_sub` floors to 0 and the
+        // `+ 1` lands on **1**, giving one entry too few *and* starting
+        // one item late, so window item 0 was compared against
+        // committed item 1. At `index == 0` the range was `1..1` and
+        // the slice came back empty while still declaring `w` items.
+        //
+        // Clamping instead is identical for `index >= w` and yields 0
+        // at the head, which is where the window genuinely starts.
+        let window_len = self.window_items.len();
+        let diff_bits = self
+            .trace_commitment
+            .slice((index + 1).saturating_sub(self.window_size), index + 1);
+
+        // Declare what the slice holds, not the window's capacity.
+        // `Fingerprint::from` stores `len` verbatim without checking it
+        // against `bits`, and the guest reads that declared length as
+        // authoritative — which is how a head window used to travel all
+        // the way there claiming items it did not carry.
+        assert_eq!(
+            diff_bits.len(),
+            (window_len * self.trace_commitment.packer().bits_per_item()).div_ceil(64),
+            "fraud window slice holds {} blocks but declares {} items",
+            diff_bits.len(),
+            window_len,
+        );
+        let window_fingerprint =
+            Fingerprint::from(diff_bits, self.trace_commitment.packer(), window_len);
+
+        let ser_window_frontier =
+            serializable_frontier_from_trace_frontier(window_frontier).to_bytes();
+
+        // TODO: consider renaming Window struct and TraceWindow have different behavior but
+        // similiar naming
+        let fraud_window = TraceWindow {
+            frontier: ser_window_frontier,
+            items: self.window_items.to_vec(),
+            fingerprint: window_fingerprint,
+        };
+        fraud_window
     }
 
     pub fn verify(&mut self, trace: &impl TraceRead) -> VerificationResult {
@@ -2766,6 +2796,27 @@ impl MemoryWitnessTree {
         }
         true
     }
+    /// The root over every leaf so far, which each `append` recomputes.
+    pub fn root(&self) -> Option<Bytes> {
+        self.levels[32].first().map(|root| Bytes(root.to_vec()))
+    }
+
+    /// The frontier as it stood after the first `size` leaves: that last leaf
+    /// and the complete subtrees to its left. Those subtrees never change in an
+    /// append-only tree, so the nodes held now are the ones it had then.
+    pub fn frontier_at(&self, size: u64) -> Option<TraceTreeFrontier> {
+        if size == 0 || size > self.levels[0].len() as u64 {
+            return None;
+        }
+        let position = size - 1;
+        let leaf = Bytes(self.levels[0][position as usize].to_vec());
+        let ommers = (0..32)
+            .filter(|level| (position >> level) & 1 == 1)
+            .map(|level| Bytes(self.levels[level][((position >> level) - 1) as usize].to_vec()))
+            .collect();
+        NonEmptyFrontier::from_parts(Position::from(position), leaf, ommers).ok()
+    }
+
     pub fn witness(&self, position: u64) -> Option<Vec<Bytes>> {
         if position >= self.levels[0].len() as u64 {
             return None;
@@ -2814,11 +2865,40 @@ mod memory_witness_tests {
             assert!(cached.witness(index as u64 + 1).is_none());
         }
     }
+
+    /// `push_root` reads the verifier's roots and window frontiers from this
+    /// tree instead of a frontier of its own, so both must equal what that
+    /// frontier held, including its serialized form, at every size.
+    #[test]
+    fn roots_and_past_frontiers_match_a_live_frontier() {
+        let mut cached = MemoryWitnessTree::new();
+        let mut frontier: Option<TraceTreeFrontier> = None;
+        let mut history = Vec::new();
+        for index in 0..1026usize {
+            let leaf = Bytes(Sha256::digest(index.to_le_bytes()).to_vec());
+            assert!(cached.append(leaf.clone()));
+            match frontier.as_mut() {
+                Some(frontier) => frontier.append(leaf),
+                None => frontier = Some(NonEmptyFrontier::new(leaf)),
+            }
+            let frontier = frontier.as_ref().unwrap();
+            assert_eq!(cached.root().unwrap().0, frontier_root(frontier));
+            history.push(serializable_frontier_from_trace_frontier(frontier.clone()).to_bytes());
+        }
+        for (index, expected) in history.iter().enumerate() {
+            let past = cached.frontier_at(index as u64 + 1).unwrap();
+            assert_eq!(&serializable_frontier_from_trace_frontier(past).to_bytes(), expected);
+        }
+        assert!(cached.frontier_at(0).is_none());
+        assert!(cached.frontier_at(history.len() as u64 + 1).is_none());
+    }
 }
 
 /// Source records indexed by active frame, with an incrementally maintained
 /// authentication tree. Contains metadata/hashes, never event payloads.
 pub struct SourceTracker {
+    /// The trace tree itself: the seed, then every appended step. Live audit
+    /// also reads its roots and frontiers instead of keeping a second tree.
     tree: MemoryWitnessTree,
     next: usize,
     frames: HashMap<CfsCoordinates, (usize, StepRecord)>,
@@ -2834,6 +2914,10 @@ impl SourceTracker {
             frames: HashMap::new(),
             producers: HashMap::new(),
         }
+    }
+    /// The trace tree over the seed and every appended step.
+    pub fn tree(&self) -> &MemoryWitnessTree {
+        &self.tree
     }
     pub fn witnesses(
         &self,
@@ -2906,10 +2990,12 @@ impl SourceTracker {
         result
     }
     pub fn append(&mut self, step: &StepRecord) {
-        assert!(
-            self.tree.append(Bytes(step.hash())),
-            "trace capacity exceeded"
-        );
+        self.append_hashed(step, step.hash());
+    }
+
+    /// [`Self::append`] for a caller that has already hashed `step`.
+    pub fn append_hashed(&mut self, step: &StepRecord, hash: Vec<u8>) {
+        assert!(self.tree.append(Bytes(hash)), "trace capacity exceeded");
         if matches!(
             &step.kind,
             StepKind::ProgramStart(_) | StepKind::SequenceStart { .. }

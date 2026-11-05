@@ -10,7 +10,7 @@ use raster_compiler::{CfsBuilder, Project};
 use raster_core::{cfs::CfsCursor, merkle::EMPTY_LEAF, trace::TraceEvent};
 use raster_prover::{
     commitment_file::CommitmentFile,
-    trace::{SourceTracker, TraceVerifier},
+    trace::{BytesHashable, SourceTracker, TraceVerifier},
     trace::SerializableFrontier,
     transition::{AuditHandoff, PreparedFault},
 };
@@ -142,8 +142,16 @@ impl Publisher for AuditPublisher {
         if std::env::var_os("RASTER_AUDIT_DEBUG").is_some() && (index < 20 || index % 4096 == 0) {
             eprintln!("Audit prepared step {}", index + 1);
         }
-        let divergence = state.verifier.push(index, &step);
-        state.sources.append(&step);
+        // One trace tree serves both: the source tracker's, which can witness
+        // any earlier step, also yields the root the verifier compares.
+        let State {
+            verifier, sources, ..
+        } = &mut *state;
+        sources.append_hashed(&step, step.hash());
+        let root = sources.tree().root().expect("trace root").0;
+        let divergence = verifier.push_root(index, &step, &root, |size| {
+            sources.tree().frontier_at(size).expect("window frontier")
+        });
         state.steps += 1;
         if let Some(window) = divergence {
             let first = state.window.front().expect("proof window");
