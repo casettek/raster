@@ -90,7 +90,7 @@ pub(crate) struct AuthorizedSourceLoad {
 /// This is what *executing* a program needs and no more: a sequence binds
 /// references rather than values, so a later tile's `call!` has to read back
 /// the bytes an earlier one produced. It authenticates nothing — no frontier,
-/// no coordinate index, no roots. [`AuthenticatedObjectStore`] wraps it with
+/// no coordinate index, no roots. [`StorageLedger`] adds
 /// those, for the one role that reads them.
 /// See `docs/proposals/storage-role-split.md`.
 pub struct ObjectStore {
@@ -171,15 +171,27 @@ impl LoadedObjects {
     }
 }
 
-/// An [`ObjectStore`] plus the structures that make its contents provable: an
-/// append-only log of `(coordinates, object_commitment)` entries and a
-/// coordinate-keyed Merkle index, whose roots every write reports.
+/// Where a [`StorageLedger`] reads object bytes from.
+pub enum ObjectSource {
+    /// Its own replica, filled from trace events: a recorder with no running
+    /// program to read from (offline replay of a saved trace, tests).
+    Owned(ObjectStore),
+    /// The running program's store (`THREAD_STORAGE`): a live recorder inside
+    /// the program process. The ledger keeps no bytes. Objects are written
+    /// once and never removed, so every object the ledger logged is there.
+    Program,
+}
+
+/// The structures that make stored objects provable: an append-only log of
+/// `(coordinates, object_commitment)` entries and a coordinate-keyed Merkle
+/// index, whose roots every write reports, over objects read from an
+/// [`ObjectSource`].
 ///
 /// The trace recorder holds one of these, because it is the only role that
 /// reads those roots — it commits them per step and builds the membership and
 /// selection witnesses the guest checks against them.
-pub struct AuthenticatedObjectStore {
-    objects: ObjectStore,
+pub struct StorageLedger {
+    objects: ObjectSource,
     frontier: TraceTreeFrontier,
     /// The storage root as of the last mutation.
     ///
@@ -195,11 +207,14 @@ pub struct AuthenticatedObjectStore {
     coordinate_index: raster_core::coordinate_index::IncrementalCoordinateIndex,
 }
 
-impl std::fmt::Debug for AuthenticatedObjectStore {
+impl std::fmt::Debug for StorageLedger {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AuthenticatedObjectStore")
-            .field("objects", &self.objects)
-            .finish()
+        let mut debug = f.debug_struct("StorageLedger");
+        match &self.objects {
+            ObjectSource::Owned(objects) => debug.field("objects", objects),
+            ObjectSource::Program => debug.field("objects", &"program"),
+        };
+        debug.finish()
     }
 }
 
@@ -345,7 +360,7 @@ impl ObjectStore {
     ) -> StorageEntry {
         // `objects` and the authenticated coordinate index are written in
         // lockstep, so their key sets are identical: this is the same guard
-        // `AuthenticatedObjectStore::append` states against the index, and the
+        // `StorageLedger::append` states against the index, and the
         // one a store without an index keeps. `insert` overwrites, and two
         // writes to one coordinate would silently replace an object that
         // outstanding references still point at, surfacing later as a
@@ -729,11 +744,12 @@ impl ObjectStore {
     }
 }
 
-impl AuthenticatedObjectStore {
+impl StorageLedger {
     pub fn new() -> Self {
-        Self::with_storage(crate::working_storage::current())
+        Self::owning(crate::working_storage::current())
     }
-    pub fn with_storage(policy: crate::WorkingStorage) -> Self {
+    /// A ledger over its own replica, kept under `policy`.
+    pub fn owning(policy: crate::WorkingStorage) -> Self {
         let mut tree = TraceTree::new(1);
         tree.append(Bytes(EMPTY_LEAF.to_vec()));
         let frontier = tree
@@ -742,11 +758,62 @@ impl AuthenticatedObjectStore {
             .expect("storage frontier should exist after seed append");
         let cached_root = frontier_root(&frontier);
         Self {
-            objects: ObjectStore::with_storage(policy),
+            objects: ObjectSource::Owned(ObjectStore::with_storage(policy)),
             frontier,
             cached_root,
             // Use main's compact in-memory index for both object-store policies.
             coordinate_index: raster_core::coordinate_index::IncrementalCoordinateIndex::new(),
+        }
+    }
+
+    /// Read objects from the running program's store from now on, keeping no
+    /// copy. Only a recorder inside the program process can do this, and only
+    /// before its first write.
+    pub(crate) fn read_program_objects(&mut self) {
+        assert!(
+            self.coordinate_index.root() == raster_core::coordinate_index::IncrementalCoordinateIndex::new().root(),
+            "a ledger switches to the program's objects before its first write"
+        );
+        self.objects = ObjectSource::Program;
+    }
+
+    /// Run `read` against the store that holds the objects. A program-backed
+    /// ledger first requires `reference` to be an object it logged, as an
+    /// owned replica holds exactly the logged objects.
+    fn read_objects<R>(
+        &self,
+        reference: &StorageRef,
+        read: impl FnOnce(&ObjectStore) -> Result<R>,
+    ) -> Result<R> {
+        match &self.objects {
+            ObjectSource::Owned(objects) => read(objects),
+            ObjectSource::Program => {
+                match self.coordinate_index.get(&reference.coordinates) {
+                    None => {
+                        return Err(Error::Other(format!(
+                            "Missing storage object at coordinates {:?}",
+                            reference.coordinates
+                        )))
+                    }
+                    Some(logged) if logged.object_commitment != reference.commitment => {
+                        return Err(Error::Other(format!(
+                            "Storage commitment mismatch at coordinates {:?}",
+                            reference.coordinates
+                        )))
+                    }
+                    Some(_) => {}
+                }
+                THREAD_STORAGE.with(|storage| {
+                    let storage = storage.try_borrow().map_err(|_| {
+                        Error::Other(
+                            "the recorder read the program's objects while the program was \
+                             writing them; trace events must be published outside storage calls"
+                                .into(),
+                        )
+                    })?;
+                    read(&storage)
+                })
+            }
         }
     }
 
@@ -766,9 +833,11 @@ impl AuthenticatedObjectStore {
         self.coordinate_index.root()
     }
 
+    /// Log a write. `backing` is the object itself, kept only by an owned
+    /// replica; a program-backed ledger needs its commitment alone.
     fn append(
         &mut self,
-        backing: ObjectBacking,
+        backing: Option<ObjectBacking>,
         object_commitment: Vec<u8>,
         coordinates: CfsCoordinates,
     ) -> StorageWriteRecord {
@@ -821,8 +890,9 @@ impl AuthenticatedObjectStore {
             .insert(coordinates.clone(), index_value);
         let index_ns = elapsed_ns(index_start);
 
-        self.objects
-            .put(coordinates, entry.object_commitment.clone(), backing);
+        if let (ObjectSource::Owned(objects), Some(backing)) = (&mut self.objects, backing) {
+            objects.put(coordinates, entry.object_commitment.clone(), backing);
+        }
 
         // `frontier_after` clones the frontier and converts it; timed apart
         // from the root recompute so the roots term says whether it is hashing
@@ -861,13 +931,22 @@ impl AuthenticatedObjectStore {
         coordinates: CfsCoordinates,
         raster: Option<RasterPayload>,
     ) -> StorageWriteRecord {
-        let (backing, object_commitment) = owned_backing(bytes, raster);
-        self.append(backing, object_commitment, coordinates)
+        match &self.objects {
+            ObjectSource::Owned(_) => {
+                let (backing, object_commitment) = owned_backing(bytes, raster);
+                self.append(Some(backing), object_commitment, coordinates)
+            }
+            ObjectSource::Program => {
+                let object_commitment = internal_object_commitment(bytes, raster.as_ref());
+                self.append(None, object_commitment, coordinates)
+            }
+        }
     }
 
     /// The recorder's write of a site close's output: a contiguous object, or
-    /// a derived object rebuilt from its delta over the base this store
-    /// already holds — the recorder's own replica, never the child's.
+    /// a derived object rebuilt from its delta over the base, which is read
+    /// from wherever this ledger's objects are. Rebuilding it checks the
+    /// delta and gives the commitment.
     pub fn append_output(
         &mut self,
         output: &raster_core::trace::FnOutput,
@@ -875,8 +954,11 @@ impl AuthenticatedObjectStore {
     ) -> Result<StorageWriteRecord> {
         match &output.derived {
             Some(delta) => {
-                let (backing, commitment) = self.objects.derived_backing(delta)?;
-                Ok(self.append(backing, commitment, coordinates))
+                let base =
+                    StorageRef::new(delta.base_coordinates.clone(), delta.base_commitment.clone());
+                let (backing, commitment) =
+                    self.read_objects(&base, |objects| objects.derived_backing(delta))?;
+                Ok(self.append(Some(backing), commitment, coordinates))
             }
             None => {
                 Ok(self.append_serialized_bytes(&output.data, coordinates, output.raster.clone()))
@@ -893,24 +975,31 @@ impl AuthenticatedObjectStore {
         coordinates: CfsCoordinates,
     ) -> StorageWriteRecord {
         let (backing, object_commitment) = referenced_backing(load);
-        self.append(backing, object_commitment, coordinates)
+        self.append(Some(backing), object_commitment, coordinates)
     }
 
     /// Injects the resolver a `Referenced` object dispatches to. Set once
     /// per runtime — by runtime initialization in production, or
     /// directly by a caller that supplies its own input context (the trace
-    /// recorder, tests).
+    /// recorder, tests). A program-backed ledger uses the program's.
     pub(crate) fn set_source_resolver(&mut self, resolver: Arc<dyn SourceResolver>) {
-        self.objects.set_source_resolver(resolver);
+        if let ObjectSource::Owned(objects) = &mut self.objects {
+            objects.set_source_resolver(resolver);
+        }
     }
 
     /// The installed input context, if this runtime has one.
     pub(crate) fn source_resolver(&self) -> Option<Arc<dyn SourceResolver>> {
-        self.objects.source_resolver()
+        match &self.objects {
+            ObjectSource::Owned(objects) => objects.source_resolver(),
+            ObjectSource::Program => {
+                THREAD_STORAGE.with(|storage| storage.borrow().source_resolver())
+            }
+        }
     }
 
     pub fn resolve<T: DeserializeOwned>(&self, reference: &StorageRef) -> Result<StorageValue<T>> {
-        self.objects.resolve(reference)
+        self.read_objects(reference, |objects| objects.resolve(reference))
     }
 
     pub fn select<T: DeserializeOwned>(
@@ -918,7 +1007,7 @@ impl AuthenticatedObjectStore {
         reference: &StorageRef,
         selector: &SelectorPath,
     ) -> Result<StorageValue<T>> {
-        self.objects.select(reference, selector)
+        self.read_objects(reference, |objects| objects.select(reference, selector))
     }
 
     pub fn selection_witness(
@@ -927,8 +1016,9 @@ impl AuthenticatedObjectStore {
         selector: &SelectorPath,
         payload_kind: SelectionPayloadKind,
     ) -> Result<SelectionWitness> {
-        self.objects
-            .selection_witness(reference, selector, payload_kind)
+        self.read_objects(reference, |objects| {
+            objects.selection_witness(reference, selector, payload_kind)
+        })
     }
 
     pub fn list_metadata_selection(
@@ -936,7 +1026,9 @@ impl AuthenticatedObjectStore {
         reference: &StorageRef,
         selector: &SelectorPath,
     ) -> Result<AuthenticatedListMetadata> {
-        self.objects.list_metadata_selection(reference, selector)
+        self.read_objects(reference, |objects| {
+            objects.list_metadata_selection(reference, selector)
+        })
     }
 }
 
@@ -946,7 +1038,7 @@ impl Default for ObjectStore {
     }
 }
 
-impl Default for AuthenticatedObjectStore {
+impl Default for StorageLedger {
     fn default() -> Self {
         Self::new()
     }
@@ -2126,7 +2218,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "Duplicate storage write at coordinates")]
     fn rejects_duplicate_coordinate_writes() {
-        let mut manager = AuthenticatedObjectStore::new();
+        let mut manager = StorageLedger::new();
         let coordinates = CfsCoordinates(vec![1, 2, 3]);
 
         manager.append_serialized_bytes(b"first", coordinates.clone(), None);
@@ -2172,7 +2264,7 @@ mod tests {
 
     #[test]
     fn authorized_source_load_commits_to_declared_sources_in_order() {
-        let mut manager = AuthenticatedObjectStore::new();
+        let mut manager = StorageLedger::new();
         let alpha_commitment = vec![1; 32];
         let beta_commitment = vec![2; 32];
         let coordinates = CfsCoordinates(vec![]);

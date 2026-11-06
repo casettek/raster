@@ -68,7 +68,7 @@ impl AuditPublisher {
         let verifier = TraceVerifier::new(disputed, &EMPTY_LEAF, &cfs)
             .map_err(|e| raster_core::Error::Other(e.to_string()))?;
         let cursor = CfsCursor::new(cfs.clone());
-        let mut recorder = TraceRecorder::for_live_audit(cfs);
+        let mut recorder = TraceRecorder::for_live_audit(cfs).reading_program_objects();
         crate::storage::THREAD_STORAGE
             .with(|storage| recorder.set_source_resolver(storage.borrow().source_resolver()));
         Ok(Self {

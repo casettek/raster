@@ -51,7 +51,7 @@ pub use storage::{
     select_stored_value, stash_pending_output_encoding, stash_recur_item_binding,
     store_execution_output_value, store_value, stored_list_metadata, take_recur_item_binding,
     PendingRecurItemBinding,
-    AuthenticatedObjectStore, DraftCaptureSnapshot, ObjectStore, StorageSnapshot,
+    DraftCaptureSnapshot, ObjectSource, ObjectStore, StorageLedger, StorageSnapshot,
     StorageWriteRecord, StoredObject,
     TileExecutionScopeGuard,
 };

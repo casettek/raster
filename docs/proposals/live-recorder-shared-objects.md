@@ -1,9 +1,38 @@
 # Proposal: `live-recorder-shared-objects` — a live recorder reads the program's objects instead of copying them
 
 Status: **Proposed 2026-11-04. Step 0 measured the same day** — §Measurement. The duplicate costs
-19–30% of a live run's heap. In audit the largest item is something else: `SourceTracker` keeps a
+19–30% of a live run's heap. In audit the largest item was something else: `SourceTracker` kept a
 `StepRecord` for every producing step of the run (§Finding: `SourceTracker` retains every
 producer).
+
+**Landed since (2026-11-05), outside this proposal's steps:**
+- `5f46131`: live audit builds proof evidence only for the divergent window. `ProofStorageState` is
+  no longer maintained per step; it's rebuilt at a divergence from a log of writes the audit
+  publisher keeps.
+- `b26b695`: `TraceVerifier` reads its roots and window frontier from `SourceTracker`'s trace tree
+  (`push_root`), so each step is hashed into one tree.
+- `541cd24`: `SourceTracker` drops a frame instance's records when the frame closes.
+
+Together these took a hello-tiles 20k live audit from 11.3 s and 410 MB to 5.6 s and 220 MB.
+
+**Step 1 implemented 2026-11-06.** The recorder's `AuthenticatedObjectStore` is now `StorageLedger`,
+with an `ObjectSource`: `Owned(ObjectStore)` keeps today's replica (offline replay, tests, the
+`live_commitment_cli` oracle) and `Program` reads `THREAD_STORAGE`. The two live publishers opt in
+with `TraceRecorder::reading_program_objects()`. A program-backed ledger checks each read against
+its coordinate index, then reads with `try_borrow`, so a read while the program holds the store is
+an error rather than a panic or a silent wrong value. Measured on hello-tiles 20k, run as the child
+process directly, back to back with the previous commit:
+
+| | before (`541cd24`) | after |
+| --- | --- | --- |
+| live commit, peak RSS | 193–196 MB | **142–144 MB** |
+| live audit (honest), peak RSS | 218–220 MB | **166–167 MB** |
+| live audit (late fault), peak RSS | 251–254 MB | **200 MB** |
+| live audit (honest), wall | 6.10–6.28 s | 6.07–6.24 s |
+
+`commit.bin` and the honest handoff are byte-identical, the late-fault handoff is equal in canonical
+form (128 window steps), and `live_commitment_cli` passes. §Next step describes the storage
+authentication layer this leads to.
 
 Related:
 - [`storage-role-split`](./storage-role-split.md) — split one `StorageManager` into the program's
@@ -147,7 +176,9 @@ is independent of this proposal. It should go first: it's the largest single sav
 ### Other duplicates found
 - **Two coordinate indexes in live audit.** The recorder's `AuthenticatedObjectStore` and the
   audit publisher's `ProofStorageState` each maintain an `IncrementalCoordinateIndex` over the same
-  writes: 28.5 MB each on hello-tiles. The proof state could read the recorder's.
+  writes: 28.5 MB each on hello-tiles. Since `5f46131` the second is no longer maintained live: it
+  is rebuilt at a divergence. What remains duplicated is the audit publisher's own log of writes,
+  which repeats what the recorder's index already holds (§Next step).
 - **The program's parsed indexes are cached forever.** 26.5 MB on hello-tiles. That's on main too
   (`RasterObject::index`), and a separate decision.
 
@@ -225,6 +256,44 @@ index and cached root as today, but **holds no object bytes**. Its reads go to t
 3. **Optional: fewer transient copies.** The stash clone and the second postcard encoding in
    `store_execution_output_value` exist only to hand the wrapper's encoding to the store. Measure
    them in step 0 before touching them.
+
+## Next step: one storage authentication layer, now and as of step k
+
+After step 1 the storage domain has two kinds of state:
+- the **current** state, in the recorder's authentication layer (storage log frontier, cached root,
+  coordinate index), which records every write and serves selection reads;
+- a **past** state, `ProofStorageState`, which the proof needs because a window's storage witnesses
+  must verify against the roots *as they were* when each window step ran. Live audit rebuilds it at
+  a divergence from its own log of writes (`AuditPublisher.writes`); the offline prover walks the
+  trace prefix (`ProofStorageState::advance`).
+
+Both describe the same append-only log and index, at different moments. The current layer already
+holds every entry with its log position (`StorageIndexValue { log_position, object_commitment }`),
+so the past state can be derived from it instead of from a second record:
+
+1. The authentication layer answers "as of `n` writes": `as_of(n)` returns a view holding the log
+   tree and index over the first `n` entries (in log-position order) and the frontier after entry
+   `n`. That view gives the membership, non-membership and log-path witnesses `build_step_io` uses
+   today, and advances past one write at a time through the window.
+2. `AuditPublisher.writes` goes away, and so does `ProofStorageState` as a separate concept: the
+   live audit asks the recorder's layer for the window's opening state.
+3. The offline prover asks the same question of its own (Disk-owned) layer instead of replaying the
+   trace prefix through `advance`.
+
+What it needs that is not there today:
+- **Entries in log order.** The coordinate index stores entries by coordinates. `as_of(n)` needs
+  them by log position. Either the layer keeps a position-ordered list of `(coordinates,
+  commitment)` (about the size of today's `AuditPublisher.writes`, which it replaces), or
+  `IncrementalCoordinateIndex` exposes its entries. The second edits `raster-core`, which moves
+  every project's `guest_inputs` and forces a re-lock, so the first is preferred.
+- **The frontier after entry `n`.** The layer keeps only the latest frontier. A past frontier can
+  be rebuilt from the log tree the same way `MemoryWitnessTree::frontier_at` rebuilds a trace
+  frontier (`b26b695`), if the log is kept as such a tree.
+
+Cost: a rebuild is `n` index inserts and log appends, paid only at a divergence or when the offline
+prover starts a window, the same as `ProofStorageState::rebuilt` today. Acceptance is the same as
+for step 1: byte-identical evidence in `live_commitment_cli`, and canonical equality of real-run
+handoffs.
 
 ## Risks and open questions
 - **Re-entrancy.** A `Program` read borrows `THREAD_STORAGE`. Today no event is published while
