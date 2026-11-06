@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 
 use crate::storage::{
-    AuthenticatedObjectStore, AuthorizedSource, AuthorizedSourceLoad, StorageSnapshot,
+    StorageLedger, AuthorizedSource, AuthorizedSourceLoad, StorageSnapshot,
     StorageWriteRecord,
 };
 use crate::tracing::commitment::Sha256Commitment;
@@ -329,7 +329,7 @@ pub struct TraceRecorder {
             ),
         >,
     >,
-    storage: AuthenticatedObjectStore,
+    storage: StorageLedger,
     /// Live recur sites, advanced in step with the guest so both compute the
     /// same `recur_progress_commitment`. Revision 1 of
     /// `recur-progress-commitment.md` failed because two of the frame's fields
@@ -374,7 +374,7 @@ impl TraceRecorder {
                 StepWitnessStore(None, false, None)
             },
             execution_witnesses: history.then(DiskMap::new),
-            storage: AuthenticatedObjectStore::with_storage(policy),
+            storage: StorageLedger::owning(policy),
             recur_progress: RecurProgressStack::new(),
             recur_progress_store: history.then(DiskMap::new),
         }
@@ -390,6 +390,38 @@ impl TraceRecorder {
         policy: crate::WorkingStorage,
     ) -> Self {
         Self::with_options(cfs, policy, false)
+    }
+
+    /// Read objects from the running program's store instead of keeping a
+    /// copy of each. Only for a recorder inside the program process (the live
+    /// publishers): a recorder replaying a saved trace has no program to read.
+    pub fn reading_program_objects(mut self) -> Self {
+        self.storage.read_program_objects();
+        self
+    }
+
+    /// Keep enough storage history to rewind over the last `writes` writes
+    /// ([`crate::StorageLedger::retain_undo`]).
+    pub fn retaining_storage_undo(mut self, writes: usize) -> Self {
+        self.storage.retain_undo(writes);
+        self
+    }
+
+    /// The number of storage writes recorded so far.
+    pub fn storage_writes(&self) -> usize {
+        self.storage.writes()
+    }
+
+    /// Storage as it was after the first `writes` writes; the recorder is unchanged.
+    pub fn storage_as_of(&self, writes: usize) -> crate::tracing::proof_input::LedgerAt {
+        self.storage.as_of(writes)
+    }
+
+    /// Storage as it was after the first `writes` writes, rewinding when it
+    /// can ([`crate::StorageLedger::rewind_to`]). The recorder records nothing
+    /// more afterwards.
+    pub fn storage_rewound_to(&mut self, writes: usize) -> crate::tracing::proof_input::LedgerAt {
+        self.storage.rewind_to(writes)
     }
 
     /// Retain only current/active-scope witnesses, with no disk history.
@@ -2257,7 +2289,7 @@ mod tests {
         recorder.witness_store = StepWitnessStore(None, true, Some(HashMap::new()));
         recorder.execution_witnesses = None;
         recorder.recur_progress_store = None;
-        recorder.storage = AuthenticatedObjectStore::with_storage(crate::WorkingStorage::Memory);
+        recorder.storage = StorageLedger::owning(crate::WorkingStorage::Memory);
         start_main(&mut recorder);
         let start = seed_recur_source(&mut recorder, "recur", 1000);
         let step = recorder.record(TraceEvent::RecurTileStart(start));

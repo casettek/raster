@@ -32,7 +32,8 @@ impl CommitmentPublisher {
             TraceRecorder::for_live_audit(cfs)
         } else {
             TraceRecorder::for_commitment_with_storage(cfs, WorkingStorage::Memory)
-        };
+        }
+        .reading_program_objects();
         crate::storage::THREAD_STORAGE.with(|storage| {
             recorder.set_source_resolver(storage.borrow().source_resolver());
         });

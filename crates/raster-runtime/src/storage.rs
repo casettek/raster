@@ -90,7 +90,7 @@ pub(crate) struct AuthorizedSourceLoad {
 /// This is what *executing* a program needs and no more: a sequence binds
 /// references rather than values, so a later tile's `call!` has to read back
 /// the bytes an earlier one produced. It authenticates nothing — no frontier,
-/// no coordinate index, no roots. [`AuthenticatedObjectStore`] wraps it with
+/// no coordinate index, no roots. [`StorageLedger`] adds
 /// those, for the one role that reads them.
 /// See `docs/proposals/storage-role-split.md`.
 pub struct ObjectStore {
@@ -103,6 +103,7 @@ pub struct ObjectStore {
     memory: BTreeMap<CfsCoordinates, Arc<StoredObject>>,
     referenced: BTreeMap<CfsCoordinates, StoredObject>,
     archive: Option<raster_prover::archive::Archive>,
+    loaded: std::sync::Mutex<LoadedObjects>,
     /// Set once (via `start_program`) for programs that declare `main` entry
     /// arguments; `None` otherwise, and never consulted unless a `Referenced`
     /// object actually needs resolving.
@@ -118,15 +119,79 @@ impl std::fmt::Debug for ObjectStore {
     }
 }
 
-/// An [`ObjectStore`] plus the structures that make its contents provable: an
-/// append-only log of `(coordinates, object_commitment)` entries and a
-/// coordinate-keyed Merkle index, whose roots every write reports.
+/// Disk-backed objects recently read, so a run of small reads from one large
+/// object parses its index once and leaves its bytes on disk. An object never
+/// changes once written, so an entry is never stale; the budget bounds the
+/// indexes and small values held.
+#[derive(Default)]
+struct LoadedObjects {
+    objects: BTreeMap<CfsCoordinates, (Arc<StoredObject>, u64, usize)>,
+    by_use: BTreeMap<u64, CfsCoordinates>,
+    clock: u64,
+    resident: usize,
+}
+
+const LOADED_OBJECTS_BUDGET: usize = 256 << 20;
+/// Charged per entry, so many tiny objects cannot grow the cache unbounded.
+const LOADED_OBJECT_OVERHEAD: usize = 512;
+
+impl LoadedObjects {
+    fn get(&mut self, coordinates: &CfsCoordinates) -> Option<Arc<StoredObject>> {
+        let (stored, used, _) = self.objects.get_mut(coordinates)?;
+        self.by_use.remove(used);
+        self.clock += 1;
+        *used = self.clock;
+        self.by_use.insert(self.clock, coordinates.clone());
+        Some(Arc::clone(stored))
+    }
+
+    fn insert(&mut self, coordinates: CfsCoordinates, stored: Arc<StoredObject>, resident: usize) {
+        let resident = resident + LOADED_OBJECT_OVERHEAD;
+        if resident > LOADED_OBJECTS_BUDGET {
+            return;
+        }
+        while self.resident + resident > LOADED_OBJECTS_BUDGET {
+            let Some((_, oldest)) = self.by_use.pop_first() else {
+                break;
+            };
+            if let Some((_, _, size)) = self.objects.remove(&oldest) {
+                self.resident -= size;
+            }
+        }
+        self.clock += 1;
+        self.by_use.insert(self.clock, coordinates.clone());
+        self.resident += resident;
+        if let Some((_, used, size)) = self
+            .objects
+            .insert(coordinates, (stored, self.clock, resident))
+        {
+            self.by_use.remove(&used);
+            self.resident -= size;
+        }
+    }
+}
+
+/// Where a [`StorageLedger`] reads object bytes from.
+pub enum ObjectSource {
+    /// Its own replica, filled from trace events: a recorder with no running
+    /// program to read from (offline replay of a saved trace, tests).
+    Owned(ObjectStore),
+    /// The running program's store (`THREAD_STORAGE`): a live recorder inside
+    /// the program process. The ledger keeps no bytes. Objects are written
+    /// once and never removed, so every object the ledger logged is there.
+    Program,
+}
+
+/// The structures that make stored objects provable: an append-only log of
+/// `(coordinates, object_commitment)` entries and a coordinate-keyed Merkle
+/// index, whose roots every write reports, over objects read from an
+/// [`ObjectSource`].
 ///
 /// The trace recorder holds one of these, because it is the only role that
 /// reads those roots — it commits them per step and builds the membership and
 /// selection witnesses the guest checks against them.
-pub struct AuthenticatedObjectStore {
-    objects: ObjectStore,
+pub struct StorageLedger {
+    objects: ObjectSource,
     frontier: TraceTreeFrontier,
     /// The storage root as of the last mutation.
     ///
@@ -139,14 +204,20 @@ pub struct AuthenticatedObjectStore {
     /// is ever needed.
     /// See `docs/proposals/storage-write-cost.md`.
     cached_root: Vec<u8>,
-    coordinate_index: raster_core::coordinate_index::IncrementalCoordinateIndex,
+    coordinate_index: raster_core::coordinate_index_journal::JournaledCoordinateIndex,
+    /// The storage log's leaves: its seed, then each write's entry hash. A
+    /// past log tree is built from a prefix of these ([`Self::as_of`]).
+    log_leaves: Vec<[u8; 32]>,
 }
 
-impl std::fmt::Debug for AuthenticatedObjectStore {
+impl std::fmt::Debug for StorageLedger {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AuthenticatedObjectStore")
-            .field("objects", &self.objects)
-            .finish()
+        let mut debug = f.debug_struct("StorageLedger");
+        match &self.objects {
+            ObjectSource::Owned(objects) => debug.field("objects", objects),
+            ObjectSource::Program => debug.field("objects", &"program"),
+        };
+        debug.finish()
     }
 }
 
@@ -265,6 +336,7 @@ impl ObjectStore {
             memory: BTreeMap::new(),
             referenced: BTreeMap::new(),
             archive: disk.then(raster_prover::archive::Archive::current),
+            loaded: Default::default(),
             source_resolver: None,
         }
     }
@@ -291,7 +363,7 @@ impl ObjectStore {
     ) -> StorageEntry {
         // `objects` and the authenticated coordinate index are written in
         // lockstep, so their key sets are identical: this is the same guard
-        // `AuthenticatedObjectStore::append` states against the index, and the
+        // `StorageLedger::append` states against the index, and the
         // one a store without an index keeps. `insert` overwrites, and two
         // writes to one coordinate would silently replace an object that
         // outstanding references still point at, surfacing later as a
@@ -415,7 +487,7 @@ impl ObjectStore {
                     value,
                 ))
             }
-            ObjectBacking::Derived(_) => {
+            ObjectBacking::Derived(_) | ObjectBacking::Archived(_) => {
                 let view = Self::raster_view(&stored, &reference.coordinates)?;
                 let (bytes, selection, value) = resolve_whole_view::<T>(&view)?;
                 Ok(StorageValue::new_with_selection(
@@ -464,6 +536,11 @@ impl ObjectStore {
                 bytes: ObjectBytes::Pieces(derived.pieces.clone()),
                 root: derived.root,
             }),
+            ObjectBacking::Archived(archived) => Ok(RasterView {
+                index: archived.index.clone(),
+                bytes: ObjectBytes::Pieces(archived.pieces.clone()),
+                root: archived.root,
+            }),
             ObjectBacking::Referenced(_) => Err(Error::Other(format!(
                 "Object at coordinates {:?} holds entry arguments, not raster bytes",
                 coordinates
@@ -476,15 +553,24 @@ impl ObjectStore {
             Some(Arc::clone(stored))
         } else if let Some(stored) = self.referenced.get(&reference.coordinates) {
             Some(Arc::new(stored.clone()))
-        } else if let Some((reference, backing)) = self
-            .objects
-            .as_ref()
-            .and_then(|s| s.get(&reference.coordinates))
-        {
-            Some(Arc::new(StoredObject {
-                reference,
-                backing: backing.load(self.archive.as_ref().expect("disk storage"))?,
-            }))
+        } else if let Some(objects) = self.objects.as_ref() {
+            let mut loaded = self.loaded.lock().expect("loaded objects lock");
+            match loaded.get(&reference.coordinates) {
+                Some(stored) => Some(stored),
+                None => match objects.get(&reference.coordinates) {
+                    Some((stored_reference, persisted)) => {
+                        let (backing, resident) =
+                            persisted.load(self.archive.as_ref().expect("disk storage"))?;
+                        let stored = Arc::new(StoredObject {
+                            reference: stored_reference,
+                            backing,
+                        });
+                        loaded.insert(reference.coordinates.clone(), Arc::clone(&stored), resident);
+                        Some(stored)
+                    }
+                    None => None,
+                },
+            }
         } else {
             None
         };
@@ -516,6 +602,15 @@ impl ObjectStore {
                 )));
             }
         }
+        // The same check as an in-memory raster object: its commitment is its root.
+        if let ObjectBacking::Archived(archived) = &stored.backing {
+            if archived.root.as_slice() != reference.commitment.as_slice() {
+                return Err(Error::Other(format!(
+                    "Storage object at coordinates {:?} failed integrity check",
+                    reference.coordinates
+                )));
+            }
+        }
         Ok(stored)
     }
 
@@ -537,7 +632,7 @@ impl ObjectStore {
     ) -> Result<SelectionWitness> {
         let stored = self.verify_reference(reference)?;
         match &stored.backing {
-            ObjectBacking::Owned(_) | ObjectBacking::Derived(_) => {
+            ObjectBacking::Owned(_) | ObjectBacking::Derived(_) | ObjectBacking::Archived(_) => {
                 let view = Self::raster_view(&stored, &reference.coordinates)?;
                 let index = view.index;
                 let selection = index.select(selector)?;
@@ -580,7 +675,7 @@ impl ObjectStore {
     ) -> Result<AuthenticatedListMetadata> {
         let stored = self.verify_reference(reference)?;
         match &stored.backing {
-            ObjectBacking::Owned(_) | ObjectBacking::Derived(_) => {
+            ObjectBacking::Owned(_) | ObjectBacking::Derived(_) | ObjectBacking::Archived(_) => {
                 let index = Self::raster_view(&stored, &reference.coordinates)?.index;
                 let (len, elements_root) = index.list_metadata(selector)?;
                 // Every selection into an owned object anchors to the object's
@@ -610,7 +705,7 @@ impl ObjectStore {
     ) -> Result<StorageValue<T>> {
         let stored = self.verify_reference(reference)?;
         match &stored.backing {
-            ObjectBacking::Owned(_) | ObjectBacking::Derived(_) => {
+            ObjectBacking::Owned(_) | ObjectBacking::Derived(_) | ObjectBacking::Archived(_) => {
                 let view = Self::raster_view(&stored, &reference.coordinates)?;
                 let index = view.index;
                 let selection = index.locate(selector)?;
@@ -652,11 +747,12 @@ impl ObjectStore {
     }
 }
 
-impl AuthenticatedObjectStore {
+impl StorageLedger {
     pub fn new() -> Self {
-        Self::with_storage(crate::working_storage::current())
+        Self::owning(crate::working_storage::current())
     }
-    pub fn with_storage(policy: crate::WorkingStorage) -> Self {
+    /// A ledger over its own replica, kept under `policy`.
+    pub fn owning(policy: crate::WorkingStorage) -> Self {
         let mut tree = TraceTree::new(1);
         tree.append(Bytes(EMPTY_LEAF.to_vec()));
         let frontier = tree
@@ -665,11 +761,111 @@ impl AuthenticatedObjectStore {
             .expect("storage frontier should exist after seed append");
         let cached_root = frontier_root(&frontier);
         Self {
-            objects: ObjectStore::with_storage(policy),
+            objects: ObjectSource::Owned(ObjectStore::with_storage(policy)),
             frontier,
             cached_root,
             // Use main's compact in-memory index for both object-store policies.
-            coordinate_index: raster_core::coordinate_index::IncrementalCoordinateIndex::new(),
+            coordinate_index: raster_core::coordinate_index_journal::JournaledCoordinateIndex::new(),
+            log_leaves: vec![EMPTY_LEAF],
+        }
+    }
+
+    /// The number of writes so far.
+    pub fn writes(&self) -> usize {
+        self.log_leaves.len() - 1
+    }
+
+    /// Keep enough history to rewind over the last `writes` writes
+    /// ([`Self::rewind_to`]). A live audit keeps its window's worth: a step
+    /// writes at most once.
+    pub fn retain_undo(&mut self, writes: usize) {
+        self.coordinate_index.retain_undo(writes);
+    }
+
+    /// Storage as it was after the first `writes` writes, rebuilt from the
+    /// ledger's own entries. Leaves the ledger as it is.
+    pub fn as_of(&self, writes: usize) -> crate::tracing::proof_input::LedgerAt {
+        assert!(writes <= self.writes(), "storage has only {} writes", self.writes());
+        let mut index = raster_core::coordinate_index::IncrementalCoordinateIndex::new();
+        for (coordinates, value) in self
+            .coordinate_index
+            .entries_by_position()
+            .into_iter()
+            .take(writes)
+        {
+            index.insert(coordinates, value);
+        }
+        crate::tracing::proof_input::LedgerAt::from_parts(
+            raster_prover::trace::MemoryWitnessTree::from_leaves(&self.log_leaves[..=writes]),
+            index,
+        )
+    }
+
+    /// Storage as it was after the first `writes` writes, by undoing the
+    /// later ones when the retained history reaches back that far
+    /// ([`Self::retain_undo`]), by [`Self::as_of`] otherwise. Rewinding hands
+    /// the ledger's index to the result: the ledger records nothing more.
+    pub fn rewind_to(&mut self, writes: usize) -> crate::tracing::proof_input::LedgerAt {
+        if !self.coordinate_index.can_rewind_to(writes) {
+            return self.as_of(writes);
+        }
+        let mut journaled = std::mem::take(&mut self.coordinate_index);
+        journaled.rewind_to(writes);
+        let index = journaled.into_index();
+        crate::tracing::proof_input::LedgerAt::from_parts(
+            raster_prover::trace::MemoryWitnessTree::from_leaves(&self.log_leaves[..=writes]),
+            index,
+        )
+    }
+
+    /// Read objects from the running program's store from now on, keeping no
+    /// copy. Only a recorder inside the program process can do this, and only
+    /// before its first write.
+    pub(crate) fn read_program_objects(&mut self) {
+        assert!(
+            self.coordinate_index.root() == raster_core::coordinate_index::IncrementalCoordinateIndex::new().root(),
+            "a ledger switches to the program's objects before its first write"
+        );
+        self.objects = ObjectSource::Program;
+    }
+
+    /// Run `read` against the store that holds the objects. A program-backed
+    /// ledger first requires `reference` to be an object it logged, as an
+    /// owned replica holds exactly the logged objects.
+    fn read_objects<R>(
+        &self,
+        reference: &StorageRef,
+        read: impl FnOnce(&ObjectStore) -> Result<R>,
+    ) -> Result<R> {
+        match &self.objects {
+            ObjectSource::Owned(objects) => read(objects),
+            ObjectSource::Program => {
+                match self.coordinate_index.get(&reference.coordinates) {
+                    None => {
+                        return Err(Error::Other(format!(
+                            "Missing storage object at coordinates {:?}",
+                            reference.coordinates
+                        )))
+                    }
+                    Some(logged) if logged.object_commitment != reference.commitment => {
+                        return Err(Error::Other(format!(
+                            "Storage commitment mismatch at coordinates {:?}",
+                            reference.coordinates
+                        )))
+                    }
+                    Some(_) => {}
+                }
+                THREAD_STORAGE.with(|storage| {
+                    let storage = storage.try_borrow().map_err(|_| {
+                        Error::Other(
+                            "the recorder read the program's objects while the program was \
+                             writing them; trace events must be published outside storage calls"
+                                .into(),
+                        )
+                    })?;
+                    read(&storage)
+                })
+            }
         }
     }
 
@@ -689,9 +885,11 @@ impl AuthenticatedObjectStore {
         self.coordinate_index.root()
     }
 
+    /// Log a write. `backing` is the object itself, kept only by an owned
+    /// replica; a program-backed ledger needs its commitment alone.
     fn append(
         &mut self,
-        backing: ObjectBacking,
+        backing: Option<ObjectBacking>,
         object_commitment: Vec<u8>,
         coordinates: CfsCoordinates,
     ) -> StorageWriteRecord {
@@ -718,6 +916,8 @@ impl AuthenticatedObjectStore {
 
         let frontier_start = timing.then(std::time::Instant::now);
         let leaf_hash: Vec<u8> = Sha256Commitment::from(entry.to_bytes().as_slice()).into();
+        self.log_leaves
+            .push(leaf_hash.as_slice().try_into().expect("32-byte storage leaf"));
         assert!(
             u64::from(self.frontier.position()) < u32::MAX as u64,
             "storage tree capacity exceeded"
@@ -744,8 +944,9 @@ impl AuthenticatedObjectStore {
             .insert(coordinates.clone(), index_value);
         let index_ns = elapsed_ns(index_start);
 
-        self.objects
-            .put(coordinates, entry.object_commitment.clone(), backing);
+        if let (ObjectSource::Owned(objects), Some(backing)) = (&mut self.objects, backing) {
+            objects.put(coordinates, entry.object_commitment.clone(), backing);
+        }
 
         // `frontier_after` clones the frontier and converts it; timed apart
         // from the root recompute so the roots term says whether it is hashing
@@ -784,13 +985,22 @@ impl AuthenticatedObjectStore {
         coordinates: CfsCoordinates,
         raster: Option<RasterPayload>,
     ) -> StorageWriteRecord {
-        let (backing, object_commitment) = owned_backing(bytes, raster);
-        self.append(backing, object_commitment, coordinates)
+        match &self.objects {
+            ObjectSource::Owned(_) => {
+                let (backing, object_commitment) = owned_backing(bytes, raster);
+                self.append(Some(backing), object_commitment, coordinates)
+            }
+            ObjectSource::Program => {
+                let object_commitment = internal_object_commitment(bytes, raster.as_ref());
+                self.append(None, object_commitment, coordinates)
+            }
+        }
     }
 
     /// The recorder's write of a site close's output: a contiguous object, or
-    /// a derived object rebuilt from its delta over the base this store
-    /// already holds — the recorder's own replica, never the child's.
+    /// a derived object rebuilt from its delta over the base, which is read
+    /// from wherever this ledger's objects are. Rebuilding it checks the
+    /// delta and gives the commitment.
     pub fn append_output(
         &mut self,
         output: &raster_core::trace::FnOutput,
@@ -798,8 +1008,11 @@ impl AuthenticatedObjectStore {
     ) -> Result<StorageWriteRecord> {
         match &output.derived {
             Some(delta) => {
-                let (backing, commitment) = self.objects.derived_backing(delta)?;
-                Ok(self.append(backing, commitment, coordinates))
+                let base =
+                    StorageRef::new(delta.base_coordinates.clone(), delta.base_commitment.clone());
+                let (backing, commitment) =
+                    self.read_objects(&base, |objects| objects.derived_backing(delta))?;
+                Ok(self.append(Some(backing), commitment, coordinates))
             }
             None => {
                 Ok(self.append_serialized_bytes(&output.data, coordinates, output.raster.clone()))
@@ -816,24 +1029,31 @@ impl AuthenticatedObjectStore {
         coordinates: CfsCoordinates,
     ) -> StorageWriteRecord {
         let (backing, object_commitment) = referenced_backing(load);
-        self.append(backing, object_commitment, coordinates)
+        self.append(Some(backing), object_commitment, coordinates)
     }
 
     /// Injects the resolver a `Referenced` object dispatches to. Set once
     /// per runtime — by runtime initialization in production, or
     /// directly by a caller that supplies its own input context (the trace
-    /// recorder, tests).
+    /// recorder, tests). A program-backed ledger uses the program's.
     pub(crate) fn set_source_resolver(&mut self, resolver: Arc<dyn SourceResolver>) {
-        self.objects.set_source_resolver(resolver);
+        if let ObjectSource::Owned(objects) = &mut self.objects {
+            objects.set_source_resolver(resolver);
+        }
     }
 
     /// The installed input context, if this runtime has one.
     pub(crate) fn source_resolver(&self) -> Option<Arc<dyn SourceResolver>> {
-        self.objects.source_resolver()
+        match &self.objects {
+            ObjectSource::Owned(objects) => objects.source_resolver(),
+            ObjectSource::Program => {
+                THREAD_STORAGE.with(|storage| storage.borrow().source_resolver())
+            }
+        }
     }
 
     pub fn resolve<T: DeserializeOwned>(&self, reference: &StorageRef) -> Result<StorageValue<T>> {
-        self.objects.resolve(reference)
+        self.read_objects(reference, |objects| objects.resolve(reference))
     }
 
     pub fn select<T: DeserializeOwned>(
@@ -841,7 +1061,7 @@ impl AuthenticatedObjectStore {
         reference: &StorageRef,
         selector: &SelectorPath,
     ) -> Result<StorageValue<T>> {
-        self.objects.select(reference, selector)
+        self.read_objects(reference, |objects| objects.select(reference, selector))
     }
 
     pub fn selection_witness(
@@ -850,8 +1070,9 @@ impl AuthenticatedObjectStore {
         selector: &SelectorPath,
         payload_kind: SelectionPayloadKind,
     ) -> Result<SelectionWitness> {
-        self.objects
-            .selection_witness(reference, selector, payload_kind)
+        self.read_objects(reference, |objects| {
+            objects.selection_witness(reference, selector, payload_kind)
+        })
     }
 
     pub fn list_metadata_selection(
@@ -859,7 +1080,9 @@ impl AuthenticatedObjectStore {
         reference: &StorageRef,
         selector: &SelectorPath,
     ) -> Result<AuthenticatedListMetadata> {
-        self.objects.list_metadata_selection(reference, selector)
+        self.read_objects(reference, |objects| {
+            objects.list_metadata_selection(reference, selector)
+        })
     }
 }
 
@@ -869,7 +1092,7 @@ impl Default for ObjectStore {
     }
 }
 
-impl Default for AuthenticatedObjectStore {
+impl Default for StorageLedger {
     fn default() -> Self {
         Self::new()
     }
@@ -1776,6 +1999,12 @@ pub fn stored_object_output(
                     .with_derived((**delta).clone()),
             );
         }
+        if let ObjectBacking::Archived(archived) = &stored.backing {
+            return Ok(
+                raster_core::trace::FnOutput::new(Vec::new(), ty.to_string())
+                    .with_raster(archived.payload()?),
+            );
+        }
         let ObjectBacking::Owned(owned) = &stored.backing else {
             return Err(Error::Other(format!(
                 "Object at coordinates {:?} is not one the program wrote",
@@ -2043,7 +2272,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "Duplicate storage write at coordinates")]
     fn rejects_duplicate_coordinate_writes() {
-        let mut manager = AuthenticatedObjectStore::new();
+        let mut manager = StorageLedger::new();
         let coordinates = CfsCoordinates(vec![1, 2, 3]);
 
         manager.append_serialized_bytes(b"first", coordinates.clone(), None);
@@ -2089,7 +2318,7 @@ mod tests {
 
     #[test]
     fn authorized_source_load_commits_to_declared_sources_in_order() {
-        let mut manager = AuthenticatedObjectStore::new();
+        let mut manager = StorageLedger::new();
         let alpha_commitment = vec![1; 32];
         let beta_commitment = vec![2; 32];
         let coordinates = CfsCoordinates(vec![]);
@@ -2351,5 +2580,137 @@ mod tests {
         let _ = stored_object_output(&derived, "BigDraft").expect("close output");
         assert_eq!(count() - before, 7);
         exit_recur_site_scope();
+    }
+
+    /// A disk-backed list is loaded once for a run of element reads: later
+    /// reads reuse its parsed index, and every read answers as from memory.
+    #[test]
+    fn disk_reads_of_one_list_reuse_one_load_and_match_memory() {
+        use raster_core::input::SelectorSegment;
+        let value: raster_core::List<u64> = (0..4096u64).map(|i| i * 3).collect();
+        let (bytes, index_bytes, root) = crate::encode_raster_value(&value).unwrap();
+        let root_hash: [u8; 32] = (0..32)
+            .map(|i| u8::from_str_radix(&root[i * 2..i * 2 + 2], 16).unwrap())
+            .collect::<Vec<_>>()
+            .try_into()
+            .unwrap();
+        let reads = |policy| {
+            let mut store = ObjectStore::with_storage(policy);
+            let entry = store.append_serialized_bytes(
+                &raster_core::postcard::to_allocvec(&value).unwrap(),
+                CfsCoordinates(vec![1]),
+                Some(raster_core::trace::RasterPayload {
+                    bytes: bytes.clone(),
+                    index_bytes: index_bytes.clone(),
+                    root_hash,
+                }),
+            );
+            let reference = StorageRef::new(entry.coordinates, entry.object_commitment);
+            let mut out = Vec::new();
+            for i in [0u64, 1, 2047, 4095] {
+                let selector = SelectorPath::new(vec![SelectorSegment::Index(i)]);
+                let selected = store.select::<u64>(&reference, &selector).unwrap();
+                assert_eq!(selected.value, i * 3);
+                let witness = store
+                    .selection_witness(&reference, &selector, SelectionPayloadKind::Raw)
+                    .unwrap();
+                out.push((selected.bytes, witness));
+            }
+            let metadata = store
+                .list_metadata_selection(&reference, &SelectorPath::default())
+                .unwrap();
+            let whole = store.resolve::<raster_core::List<u64>>(&reference).unwrap();
+            assert_eq!(whole.value.to_vec(), value.to_vec());
+            (store, reference, out, metadata, whole.bytes)
+        };
+        let (_, _, memory_reads, memory_metadata, memory_whole) =
+            reads(crate::WorkingStorage::Memory);
+        let (disk, reference, disk_reads, disk_metadata, disk_whole) =
+            reads(crate::WorkingStorage::Disk);
+        assert_eq!(disk_reads, memory_reads);
+        assert_eq!(disk_metadata, memory_metadata);
+        assert_eq!(disk_whole, memory_whole);
+
+        let first = disk.verify_reference(&reference).unwrap();
+        let second = disk.verify_reference(&reference).unwrap();
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "the second read reloaded the object"
+        );
+        assert!(matches!(first.backing, ObjectBacking::Archived(_)));
+        assert_eq!(disk.loaded.lock().unwrap().objects.len(), 1);
+    }
+
+    #[test]
+    fn loaded_objects_evict_the_least_recently_used_within_budget() {
+        let stored = Arc::new(StoredObject {
+            reference: StorageRef::new(CfsCoordinates(vec![0]), Vec::new()),
+            backing: ObjectBacking::Owned(OwnedObject {
+                bytes: Vec::new(),
+                raster: None,
+            }),
+        });
+        let third = LOADED_OBJECTS_BUDGET / 3;
+        let mut loaded = LoadedObjects::default();
+        for key in 1..=3 {
+            loaded.insert(CfsCoordinates(vec![key]), Arc::clone(&stored), third - 1024);
+        }
+        assert!(loaded.get(&CfsCoordinates(vec![1])).is_some()); // now most recent
+        loaded.insert(CfsCoordinates(vec![4]), Arc::clone(&stored), third - 1024);
+        assert!(
+            loaded.get(&CfsCoordinates(vec![2])).is_none(),
+            "oldest is evicted"
+        );
+        for key in [1, 3, 4] {
+            assert!(loaded.get(&CfsCoordinates(vec![key])).is_some());
+        }
+        assert!(loaded.resident <= LOADED_OBJECTS_BUDGET);
+        loaded.insert(CfsCoordinates(vec![5]), stored, LOADED_OBJECTS_BUDGET);
+        assert!(
+            loaded.get(&CfsCoordinates(vec![5])).is_none(),
+            "oversized is not cached"
+        );
+    }
+
+    /// Storage as of a past write count, by rewinding or by rebuilding, is
+    /// the storage the ledger had then: the same opening frontier and index
+    /// root as its snapshot at that count. Walking forward through the later
+    /// writes gives back the present, which an audit relies on when it builds
+    /// a window's evidence from the rewound state.
+    #[test]
+    fn storage_as_of_a_past_write_matches_the_ledger_then() {
+        let encode = |value: &SerializableFrontier| raster_core::bincode::serialize(value).unwrap();
+        let ledger_with = |undo: usize| {
+            let mut ledger = StorageLedger::owning(crate::WorkingStorage::Memory);
+            ledger.retain_undo(undo);
+            let mut writes = Vec::new();
+            let mut snapshots = vec![ledger.snapshot()];
+            for n in 0..40i32 {
+                writes.push(ledger.append_serialized_bytes(
+                    &[n as u8, 7],
+                    CfsCoordinates(vec![n % 5 + 1, n + 1]),
+                    None,
+                ));
+                snapshots.push(ledger.snapshot());
+            }
+            (ledger, writes, snapshots)
+        };
+        for n in [0usize, 1, 17, 23, 24, 39, 40] {
+            let (ledger, writes, snapshots) = ledger_with(0);
+            let (mut rewinding, _, _) = ledger_with(16);
+            let can_rewind = rewinding.coordinate_index.can_rewind_to(n);
+            assert_eq!(can_rewind, n >= 24, "the journal reaches back 16 writes");
+            for (how, mut storage) in [("rebuilt", ledger.as_of(n)), ("rewound", rewinding.rewind_to(n))] {
+                let (frontier, index_root, _) = storage.initial(false);
+                assert_eq!(index_root, snapshots[n].index_root, "{how} index root at {n}");
+                assert_eq!(encode(&frontier), encode(&snapshots[n].frontier), "{how} frontier at {n}");
+                for write in &writes[n..] {
+                    storage.apply(write);
+                }
+                let (frontier, index_root, _) = storage.initial(false);
+                assert_eq!(index_root, snapshots[40].index_root, "{how} from {n} to now");
+                assert_eq!(encode(&frontier), encode(&snapshots[40].frontier));
+            }
+        }
     }
 }

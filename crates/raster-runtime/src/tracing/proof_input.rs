@@ -1,3 +1,4 @@
+use crate::tracing::recorder::StepWitnessData;
 use crate::TraceRecorder;
 use raster_core::cfs::CfsCoordinates;
 use raster_core::input::{SelectionWitness, StorageRef};
@@ -7,18 +8,21 @@ use raster_core::transition::{
     StorageEntry, StorageIndexValue, StorageLogWitness, StorageReadWitness, StorageWitness,
     StorageWriteWitness,
 };
-use raster_prover::trace::{Bytes, MemoryWitnessTree, SerializableFrontier, TraceTree};
+use raster_prover::trace::{Bytes, MemoryWitnessTree, SerializableFrontier};
 use raster_prover::transition::StepIo;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-pub struct ProofStorageState {
+/// Storage as it stood at one moment of a run: the storage log tree, the
+/// coordinate index and the log frontier after a given number of writes,
+/// moving forward one write at a time ([`Self::apply`]). The proof state a
+/// fault window opens with comes from [`crate::StorageLedger::as_of`].
+pub struct LedgerAt {
     frontier: SerializableFrontier,
-    append_tree: ProofLog,
-    // Share the reviewed compact index with the recorder and proof verifier.
+    log: MemoryWitnessTree,
     coordinate_index: raster_core::coordinate_index::IncrementalCoordinateIndex,
 }
 
-fn empty_storage_frontier() -> SerializableFrontier {
+pub fn empty_storage_frontier() -> SerializableFrontier {
     SerializableFrontier {
         position: 0,
         leaf: EMPTY_LEAF.to_vec(),
@@ -30,88 +34,59 @@ fn storage_leaf_hash(entry: &StorageEntry) -> Vec<u8> {
     Sha256::digest(entry.to_bytes()).to_vec()
 }
 
-enum ProofLog {
-    Memory(MemoryWitnessTree),
-    Recorded(raster_prover::archive::DiskVec<StorageEntry>),
-}
-impl ProofLog {
-    fn append(&mut self, entry: &StorageEntry) {
-        match self {
-            Self::Memory(tree) => {
-                assert!(tree.append(Bytes(storage_leaf_hash(entry))));
-            }
-            Self::Recorded(entries) => entries.push(entry.clone()),
-        }
-    }
-}
-fn build_storage_log_witness(log: &ProofLog, log_position: u64) -> StorageLogWitness {
-    let path = match log {
-        ProofLog::Memory(tree) => tree.witness(log_position).expect("storage log witness"),
-        ProofLog::Recorded(entries) => {
-            // Preserve the disk-backed compatibility path. Live audit never
-            // constructs this variant or reconstructs an execution prefix.
-            let mut tree = TraceTree::new(1);
-            assert!(tree.append(Bytes(EMPTY_LEAF.to_vec())));
-            for (index, entry) in entries.iter().enumerate() {
-                assert!(tree.append(Bytes(storage_leaf_hash(&entry))));
-                if index as u64 + 1 == log_position {
-                    tree.mark();
-                }
-            }
-            tree.witness(log_position.into(), 0)
-                .expect("recorded storage witness")
-        }
-    };
+fn build_storage_log_witness(log: &MemoryWitnessTree, log_position: u64) -> StorageLogWitness {
+    let path = log.witness(log_position).expect("storage log witness");
     StorageLogWitness {
         position: log_position,
         path_elems: path.iter().map(|elem| to_node_hash(&elem.0)).collect(),
     }
 }
 
-fn apply_storage_write_to_state(
-    state: &mut ProofStorageState,
-    storage_write: &crate::StorageWriteRecord,
-) {
-    state.frontier = storage_write.frontier_after.clone();
-    state.append_tree.append(&storage_write.entry);
-    state.coordinate_index.insert(
-        storage_write.entry.coordinates.clone(),
-        StorageIndexValue {
-            log_position: storage_write.log_position,
-            object_commitment: storage_write.entry.object_commitment.clone(),
-        },
-    );
+impl Default for LedgerAt {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
-impl ProofStorageState {
+impl LedgerAt {
+    /// Storage before any write: the log holds only its seed.
     pub fn new() -> Self {
-        let mut append_tree = MemoryWitnessTree::new();
-        assert!(append_tree.append(Bytes(EMPTY_LEAF.to_vec())));
+        let mut log = MemoryWitnessTree::new();
+        assert!(log.append(Bytes(EMPTY_LEAF.to_vec())));
         Self {
             frontier: empty_storage_frontier(),
-            append_tree: ProofLog::Memory(append_tree),
-            coordinate_index:
-                raster_core::coordinate_index::IncrementalCoordinateIndex::new(),
+            log,
+            coordinate_index: raster_core::coordinate_index::IncrementalCoordinateIndex::new(),
         }
     }
-    pub fn for_recorded() -> Self {
+
+    /// Storage from its parts: `log` over the seed and the first `n` writes,
+    /// `coordinate_index` over the same `n` entries.
+    pub(crate) fn from_parts(
+        log: MemoryWitnessTree,
+        coordinate_index: raster_core::coordinate_index::IncrementalCoordinateIndex,
+    ) -> Self {
+        let frontier = log.frontier_at(log.len()).expect("storage log seed");
         Self {
-            frontier: empty_storage_frontier(),
-            append_tree: ProofLog::Recorded(raster_prover::archive::DiskVec::new()),
-            coordinate_index:
-                raster_core::coordinate_index::IncrementalCoordinateIndex::new(),
+            frontier: raster_prover::trace::serializable_frontier_from_trace_frontier(frontier),
+            log,
+            coordinate_index,
         }
     }
-    pub fn advance(&mut self, step: &StepRecord, recorder: &TraceRecorder) {
-        if step.appends_to_storage() {
-            if let Some(write) = recorder
-                .step_witness_for(step)
-                .and_then(|w| w.storage_write())
-            {
-                apply_storage_write_to_state(self, &write);
-            }
-        }
+
+    /// Move past one write.
+    pub fn apply(&mut self, storage_write: &crate::StorageWriteRecord) {
+        self.frontier = storage_write.frontier_after.clone();
+        assert!(self.log.append(Bytes(storage_leaf_hash(&storage_write.entry))));
+        self.coordinate_index.insert(
+            storage_write.entry.coordinates.clone(),
+            StorageIndexValue {
+                log_position: storage_write.log_position,
+                object_commitment: storage_write.entry.object_commitment.clone(),
+            },
+        );
     }
+
     pub fn initial(
         &self,
         with_entrypoint: bool,
@@ -125,11 +100,11 @@ impl ProofStorageState {
         )
     }
 }
-fn build_entrypoint_membership_witness(state: &ProofStorageState) -> Option<StorageReadWitness> {
+
+fn build_entrypoint_membership_witness(state: &LedgerAt) -> Option<StorageReadWitness> {
     let coordinates = CfsCoordinates(vec![]);
     let index_witness = state.coordinate_index.membership_proof(&coordinates)?;
-    let log_witness =
-        build_storage_log_witness(&state.append_tree, index_witness.value.log_position);
+    let log_witness = build_storage_log_witness(&state.log, index_witness.value.log_position);
     Some(StorageReadWitness {
         entry: StorageEntry {
             coordinates,
@@ -213,16 +188,132 @@ fn build_storage_selection_witnesses(
 pub fn prepare_step_io(
     step_record: &StepRecord,
     trace_recorder: &TraceRecorder,
-    current_storage_state: &mut ProofStorageState,
+    current_storage_state: &mut LedgerAt,
 ) -> StepIo {
+    build_step_io(
+        &capture_step_io(step_record, trace_recorder),
+        trace_recorder,
+        current_storage_state,
+    )
+}
+
+/// What a step's evidence needs that the recorder does not keep: the step's
+/// recorded I/O and its parent's scope input, which a live recorder releases
+/// once the step is recorded. Selections and storage proofs are rebuilt later
+/// from stores that only grow.
+#[derive(Debug, Clone)]
+pub struct CapturedStepIo {
+    step_record: StepRecord,
+    step_witness: StepWitnessData,
+    sequence_scope_witness: Option<FnInput>,
+}
+
+impl CapturedStepIo {
+    pub fn step_record(&self) -> &StepRecord {
+        &self.step_record
+    }
+
+    /// The write this step applies to the proof state, under the same
+    /// condition as [`build_step_storage`].
+    pub fn storage_write(&self) -> Option<crate::StorageWriteRecord> {
+        if self.step_record.appends_to_storage() {
+            self.step_witness.storage_write()
+        } else {
+            None
+        }
+    }
+}
+
+pub fn capture_step_io(step_record: &StepRecord, trace_recorder: &TraceRecorder) -> CapturedStepIo {
     let step_witness = trace_recorder
-        .step_witness_for(&step_record)
+        .step_witness_for(step_record)
         .unwrap_or_else(|| {
             panic!(
                 "Missing recorded I/O for fraud window step at coordinates {:?}",
                 step_record.coordinates()
             )
         });
+    CapturedStepIo {
+        step_record: step_record.clone(),
+        step_witness,
+        sequence_scope_witness: trace_recorder.sequence_scope_for(step_record),
+    }
+}
+
+/// A step's evidence: [`build_step_selections`], then [`build_step_storage`].
+pub fn build_step_io(
+    captured: &CapturedStepIo,
+    trace_recorder: &TraceRecorder,
+    current_storage_state: &mut LedgerAt,
+) -> StepIo {
+    build_step_storage(
+        captured,
+        build_step_selections(captured, trace_recorder),
+        current_storage_state,
+    )
+}
+
+/// A step's selection witnesses: reads of stored objects through the
+/// recorder. Objects never change once written, so these are the same
+/// whenever they are built. They do not depend on the proof state, so a
+/// window's can all be built before that state is rewound
+/// ([`crate::StorageLedger::rewind_to`]), while the recorder still holds every
+/// object the window wrote.
+pub struct StepSelections {
+    storage: BTreeMap<String, SelectionWitness>,
+    program_output: Option<SelectionWitness>,
+}
+
+pub fn build_step_selections(
+    captured: &CapturedStepIo,
+    trace_recorder: &TraceRecorder,
+) -> StepSelections {
+    let step_record = &captured.step_record;
+    let input_source_witness = step_record
+        .input_source_commitment()
+        .and_then(|_| captured.step_witness.input_source_witness());
+    let storage = build_storage_selection_witnesses(
+        step_record,
+        input_source_witness.as_ref(),
+        trace_recorder,
+    );
+    // A `ProgramEnd` step proves the selection that narrows its output
+    // object to the returned value; the read proof is the storage half.
+    let program_output = match &step_record.kind {
+        StepKind::ProgramEnd(program_end) => program_end
+            .output
+            .as_ref()
+            .filter(|output| output.selection.selected_len > 0)
+            .map(|output| {
+                let reference =
+                    StorageRef::new(output.coordinates.clone(), output.commitment.clone());
+                trace_recorder
+                    .storage_selection_witness(
+                        &reference,
+                        &output.selector,
+                        output.selection.payload_kind,
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!("Failed to build program output selection witness: {}", error)
+                    })
+            }),
+        _ => None,
+    };
+    StepSelections {
+        storage,
+        program_output,
+    }
+}
+
+/// A step's evidence against `current_storage_state`, the proof state as of
+/// that step, which it then advances past the step's write.
+pub fn build_step_storage(
+    captured: &CapturedStepIo,
+    selections: StepSelections,
+    current_storage_state: &mut LedgerAt,
+) -> StepIo {
+    let step_record = &captured.step_record;
+    let step_witness = &captured.step_witness;
     // The witness store is keyed by coordinates alone, and a sequence's
     // `SequenceStart` and `SequenceEnd` share coordinates — the End does
     // `get_mut` on the Start's entry and fills in `output_data` only
@@ -239,12 +330,8 @@ pub fn prepare_step_io(
     let input_source_witness = step_record
         .input_source_commitment()
         .and_then(|_| step_witness.input_source_witness());
-    let sequence_scope_witness = trace_recorder.sequence_scope_for(step_record);
-    let storage_selection_witnesses = build_storage_selection_witnesses(
-        step_record,
-        input_source_witness.as_ref(),
-        trace_recorder,
-    );
+    let sequence_scope_witness = captured.sequence_scope_witness.clone();
+    let storage_selection_witnesses = selections.storage;
     let draft_transition_witness = step_witness.draft_transition_witness();
 
     let mut storage_read_witnesses = Vec::new();
@@ -286,7 +373,7 @@ pub fn prepare_step_io(
                 object_commitment: storage_meta.commitment.clone(),
             };
             let log_witness = build_storage_log_witness(
-                &current_storage_state.append_tree,
+                &current_storage_state.log,
                 index_witness.value.log_position,
             );
             storage_read_witnesses.push(StorageReadWitness {
@@ -301,57 +388,34 @@ pub fn prepare_step_io(
     // narrows to the returned value — the same read + selection machinery
     // tile inputs use. The witnesses come straight from the recorded
     // output binding, not the shared `[]` witness-store entry.
-    let (program_output_read_witness, program_output_selection_witness) = match &step_record.kind {
-        StepKind::ProgramEnd(program_end) => match &program_end.output {
-            Some(output) => {
-                let index_witness = current_storage_state
-                    .coordinate_index
-                    .membership_proof(&output.coordinates)
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "Missing coordinate-index witness for program output at {:?}",
-                            output.coordinates
-                        )
-                    });
-                let entry = StorageEntry {
-                    coordinates: output.coordinates.clone(),
-                    object_commitment: output.commitment.clone(),
-                };
-                let log_witness = build_storage_log_witness(
-                    &current_storage_state.append_tree,
-                    index_witness.value.log_position,
-                );
-                let read = StorageReadWitness {
-                    entry,
-                    log_witness,
-                    index_witness,
-                };
-                let selection = if output.selection.selected_len > 0 {
-                    let reference =
-                        StorageRef::new(output.coordinates.clone(), output.commitment.clone());
-                    Some(
-                        trace_recorder
-                            .storage_selection_witness(
-                                &reference,
-                                &output.selector,
-                                output.selection.payload_kind,
-                            )
-                            .unwrap_or_else(|error| {
-                                panic!(
-                                    "Failed to build program output selection witness: {}",
-                                    error
-                                )
-                            }),
+    let program_output_read_witness = match &step_record.kind {
+        StepKind::ProgramEnd(program_end) => program_end.output.as_ref().map(|output| {
+            let index_witness = current_storage_state
+                .coordinate_index
+                .membership_proof(&output.coordinates)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "Missing coordinate-index witness for program output at {:?}",
+                        output.coordinates
                     )
-                } else {
-                    None
-                };
-                (Some(read), selection)
+                });
+            let entry = StorageEntry {
+                coordinates: output.coordinates.clone(),
+                object_commitment: output.commitment.clone(),
+            };
+            let log_witness = build_storage_log_witness(
+                &current_storage_state.log,
+                index_witness.value.log_position,
+            );
+            StorageReadWitness {
+                entry,
+                log_witness,
+                index_witness,
             }
-            None => (None, None),
-        },
-        _ => (None, None),
+        }),
+        _ => None,
     };
+    let program_output_selection_witness = selections.program_output;
 
     // A recur-sequence iteration's `End` that carries state reads the
     // object it returned as that state, against the current storage state
@@ -375,7 +439,7 @@ pub fn prepare_step_io(
                         )
                     });
                 let log_witness = build_storage_log_witness(
-                    &current_storage_state.append_tree,
+                    &current_storage_state.log,
                     index_witness.value.log_position,
                 );
                 StorageReadWitness {
@@ -403,7 +467,7 @@ pub fn prepare_step_io(
                 .non_membership_proof(&entry.coordinates);
             // The guest derives the new index root from this insertion proof;
             // main no longer sends a second membership proof after the write.
-            apply_storage_write_to_state(current_storage_state, &storage_write);
+            current_storage_state.apply(&storage_write);
             storage_write_witness = Some(StorageWriteWitness {
                 entry,
                 index_non_membership_witness,
