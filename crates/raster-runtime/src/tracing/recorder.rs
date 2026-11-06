@@ -400,6 +400,30 @@ impl TraceRecorder {
         self
     }
 
+    /// Keep enough storage history to rewind over the last `writes` writes
+    /// ([`crate::StorageLedger::retain_undo`]).
+    pub fn retaining_storage_undo(mut self, writes: usize) -> Self {
+        self.storage.retain_undo(writes);
+        self
+    }
+
+    /// The number of storage writes recorded so far.
+    pub fn storage_writes(&self) -> usize {
+        self.storage.writes()
+    }
+
+    /// Storage as it was after the first `writes` writes; the recorder is unchanged.
+    pub fn storage_as_of(&self, writes: usize) -> crate::tracing::proof_input::LedgerAt {
+        self.storage.as_of(writes)
+    }
+
+    /// Storage as it was after the first `writes` writes, rewinding when it
+    /// can ([`crate::StorageLedger::rewind_to`]). The recorder records nothing
+    /// more afterwards.
+    pub fn storage_rewound_to(&mut self, writes: usize) -> crate::tracing::proof_input::LedgerAt {
+        self.storage.rewind_to(writes)
+    }
+
     /// Retain only current/active-scope witnesses, with no disk history.
     pub fn for_live_audit(cfs: ControlFlowSchema) -> Self {
         let mut recorder = Self::with_options(cfs, crate::WorkingStorage::Memory, false);

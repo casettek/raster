@@ -259,6 +259,11 @@ index and cached root as today, but **holds no object bytes**. Its reads go to t
 
 ## Next step: one storage authentication layer, now and as of step k
 
+> **Superseded in part (2026-11-06) by [`storage-ledger-checkpoints`](./storage-ledger-checkpoints.md):**
+> the past state is reached by rewinding the ledger (an undo journal in the coordinate index, a
+> bulk-built log tree), not by rebuilding it from a second list of writes. The goal below, one
+> layer answering "now" and "as of n writes", is unchanged.
+
 After step 1 the storage domain has two kinds of state:
 - the **current** state, in the recorder's authentication layer (storage log frontier, cached root,
   coordinate index), which records every write and serves selection reads;

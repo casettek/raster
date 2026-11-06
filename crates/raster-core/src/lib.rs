@@ -57,3 +57,7 @@ pub use postcard;
 // Re-export bincode for std-only code that needs it
 #[cfg(feature = "std")]
 pub use bincode;
+
+// Host-side: a coordinate index that can rewind. Kept out of the guests.
+#[cfg(feature = "journal")]
+pub mod coordinate_index_journal;

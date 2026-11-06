@@ -69,10 +69,19 @@ pub fn prove(
             .position,
     )
     .expect("window position");
-    let mut storage = raster_runtime::tracing::proof_input::ProofStorageState::for_recorded();
-    for step in trace.prefix(window_start_index).records() {
-        storage.advance(&step, trace_recorder);
-    }
+    // Storage as the window opens: after the writes of every step before it.
+    let writes_before = trace
+        .prefix(window_start_index)
+        .records()
+        .filter(|step| {
+            step.appends_to_storage()
+                && trace_recorder
+                    .step_witness_for(step)
+                    .and_then(|witness| witness.storage_write())
+                    .is_some()
+        })
+        .count();
+    let mut storage = trace_recorder.storage_as_of(writes_before);
     let (initial_storage_frontier, initial_index_root, entrypoint_membership_witness) = storage
         .initial(
             raster_core::cfs::CfsCursor::new(cfs.clone())

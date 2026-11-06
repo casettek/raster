@@ -427,10 +427,19 @@ fn assert_live_evidence(
             }
             assert_eq!(fault.io.len(), fault.window.items.len());
             let start = result.steps - fault.window.items.len();
-            let mut storage =
-                raster_runtime::tracing::proof_input::ProofStorageState::for_recorded();
+            // An independent reference for the window's opening storage: the
+            // saved trace's prefix writes applied one by one to empty storage.
+            // Live audit reaches the same state by rewinding its ledger.
+            let mut storage = raster_runtime::tracing::proof_input::LedgerAt::new();
             for step in &trace.0[..start] {
-                storage.advance(step, &recorded);
+                if step.appends_to_storage() {
+                    if let Some(write) = recorded
+                        .step_witness_for(step)
+                        .and_then(|witness| witness.storage_write())
+                    {
+                        storage.apply(&write);
+                    }
+                }
             }
             let (frontier, index_root, entrypoint) = storage.initial(
                 raster_core::cfs::CfsCursor::new(cfs.clone())

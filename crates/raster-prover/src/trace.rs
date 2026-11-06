@@ -2796,6 +2796,34 @@ impl MemoryWitnessTree {
         }
         true
     }
+    /// The tree over `leaves`, built a level at a time: about one hash per node,
+    /// where appending them one by one costs 32 each. The same tree as those
+    /// appends build.
+    pub fn from_leaves(leaves: &[[u8; 32]]) -> Self {
+        assert!(leaves.len() as u64 <= 1u64 << 32, "trace capacity exceeded");
+        let mut levels = Vec::with_capacity(33);
+        levels.push(leaves.to_vec());
+        for level in 0..32 {
+            let parents = levels[level]
+                .chunks(2)
+                .map(|pair: &[[u8; 32]]| {
+                    let mut bytes = [0u8; 65];
+                    bytes[0] = level as u8;
+                    bytes[1..33].copy_from_slice(&pair[0]);
+                    bytes[33..].copy_from_slice(pair.get(1).unwrap_or(&EMPTY_ROOTS[level]));
+                    Sha256::digest(bytes).into()
+                })
+                .collect();
+            levels.push(parents);
+        }
+        Self { levels }
+    }
+
+    /// The number of leaves.
+    pub fn len(&self) -> u64 {
+        self.levels[0].len() as u64
+    }
+
     /// The root over every leaf so far, which each `append` recomputes.
     pub fn root(&self) -> Option<Bytes> {
         self.levels[32].first().map(|root| Bytes(root.to_vec()))
@@ -2891,6 +2919,22 @@ mod memory_witness_tests {
         }
         assert!(cached.frontier_at(0).is_none());
         assert!(cached.frontier_at(history.len() as u64 + 1).is_none());
+    }
+
+    /// A bulk-built tree is the tree the same appends build: every level, so
+    /// every root, path and past frontier, at every size.
+    #[test]
+    fn a_tree_built_from_leaves_equals_one_appended_leaf_by_leaf() {
+        let mut appended = MemoryWitnessTree::new();
+        let mut leaves = Vec::new();
+        assert_eq!(MemoryWitnessTree::from_leaves(&leaves).levels, appended.levels);
+        for index in 0..1100usize {
+            let leaf: [u8; 32] = Sha256::digest(index.to_le_bytes()).into();
+            leaves.push(leaf);
+            assert!(appended.append(Bytes(leaf.to_vec())));
+            let built = MemoryWitnessTree::from_leaves(&leaves);
+            assert_eq!(built.levels, appended.levels, "size {}", leaves.len());
+        }
     }
 }
 

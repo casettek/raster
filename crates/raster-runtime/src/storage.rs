@@ -204,7 +204,10 @@ pub struct StorageLedger {
     /// is ever needed.
     /// See `docs/proposals/storage-write-cost.md`.
     cached_root: Vec<u8>,
-    coordinate_index: raster_core::coordinate_index::IncrementalCoordinateIndex,
+    coordinate_index: raster_core::coordinate_index_journal::JournaledCoordinateIndex,
+    /// The storage log's leaves: its seed, then each write's entry hash. A
+    /// past log tree is built from a prefix of these ([`Self::as_of`]).
+    log_leaves: Vec<[u8; 32]>,
 }
 
 impl std::fmt::Debug for StorageLedger {
@@ -762,8 +765,57 @@ impl StorageLedger {
             frontier,
             cached_root,
             // Use main's compact in-memory index for both object-store policies.
-            coordinate_index: raster_core::coordinate_index::IncrementalCoordinateIndex::new(),
+            coordinate_index: raster_core::coordinate_index_journal::JournaledCoordinateIndex::new(),
+            log_leaves: vec![EMPTY_LEAF],
         }
+    }
+
+    /// The number of writes so far.
+    pub fn writes(&self) -> usize {
+        self.log_leaves.len() - 1
+    }
+
+    /// Keep enough history to rewind over the last `writes` writes
+    /// ([`Self::rewind_to`]). A live audit keeps its window's worth: a step
+    /// writes at most once.
+    pub fn retain_undo(&mut self, writes: usize) {
+        self.coordinate_index.retain_undo(writes);
+    }
+
+    /// Storage as it was after the first `writes` writes, rebuilt from the
+    /// ledger's own entries. Leaves the ledger as it is.
+    pub fn as_of(&self, writes: usize) -> crate::tracing::proof_input::LedgerAt {
+        assert!(writes <= self.writes(), "storage has only {} writes", self.writes());
+        let mut index = raster_core::coordinate_index::IncrementalCoordinateIndex::new();
+        for (coordinates, value) in self
+            .coordinate_index
+            .entries_by_position()
+            .into_iter()
+            .take(writes)
+        {
+            index.insert(coordinates, value);
+        }
+        crate::tracing::proof_input::LedgerAt::from_parts(
+            raster_prover::trace::MemoryWitnessTree::from_leaves(&self.log_leaves[..=writes]),
+            index,
+        )
+    }
+
+    /// Storage as it was after the first `writes` writes, by undoing the
+    /// later ones when the retained history reaches back that far
+    /// ([`Self::retain_undo`]), by [`Self::as_of`] otherwise. Rewinding hands
+    /// the ledger's index to the result: the ledger records nothing more.
+    pub fn rewind_to(&mut self, writes: usize) -> crate::tracing::proof_input::LedgerAt {
+        if !self.coordinate_index.can_rewind_to(writes) {
+            return self.as_of(writes);
+        }
+        let mut journaled = std::mem::take(&mut self.coordinate_index);
+        journaled.rewind_to(writes);
+        let index = journaled.into_index();
+        crate::tracing::proof_input::LedgerAt::from_parts(
+            raster_prover::trace::MemoryWitnessTree::from_leaves(&self.log_leaves[..=writes]),
+            index,
+        )
     }
 
     /// Read objects from the running program's store from now on, keeping no
@@ -864,6 +916,8 @@ impl StorageLedger {
 
         let frontier_start = timing.then(std::time::Instant::now);
         let leaf_hash: Vec<u8> = Sha256Commitment::from(entry.to_bytes().as_slice()).into();
+        self.log_leaves
+            .push(leaf_hash.as_slice().try_into().expect("32-byte storage leaf"));
         assert!(
             u64::from(self.frontier.position()) < u32::MAX as u64,
             "storage tree capacity exceeded"
@@ -2616,5 +2670,47 @@ mod tests {
             loaded.get(&CfsCoordinates(vec![5])).is_none(),
             "oversized is not cached"
         );
+    }
+
+    /// Storage as of a past write count, by rewinding or by rebuilding, is
+    /// the storage the ledger had then: the same opening frontier and index
+    /// root as its snapshot at that count. Walking forward through the later
+    /// writes gives back the present, which an audit relies on when it builds
+    /// a window's evidence from the rewound state.
+    #[test]
+    fn storage_as_of_a_past_write_matches_the_ledger_then() {
+        let encode = |value: &SerializableFrontier| raster_core::bincode::serialize(value).unwrap();
+        let ledger_with = |undo: usize| {
+            let mut ledger = StorageLedger::owning(crate::WorkingStorage::Memory);
+            ledger.retain_undo(undo);
+            let mut writes = Vec::new();
+            let mut snapshots = vec![ledger.snapshot()];
+            for n in 0..40i32 {
+                writes.push(ledger.append_serialized_bytes(
+                    &[n as u8, 7],
+                    CfsCoordinates(vec![n % 5 + 1, n + 1]),
+                    None,
+                ));
+                snapshots.push(ledger.snapshot());
+            }
+            (ledger, writes, snapshots)
+        };
+        for n in [0usize, 1, 17, 23, 24, 39, 40] {
+            let (ledger, writes, snapshots) = ledger_with(0);
+            let (mut rewinding, _, _) = ledger_with(16);
+            let can_rewind = rewinding.coordinate_index.can_rewind_to(n);
+            assert_eq!(can_rewind, n >= 24, "the journal reaches back 16 writes");
+            for (how, mut storage) in [("rebuilt", ledger.as_of(n)), ("rewound", rewinding.rewind_to(n))] {
+                let (frontier, index_root, _) = storage.initial(false);
+                assert_eq!(index_root, snapshots[n].index_root, "{how} index root at {n}");
+                assert_eq!(encode(&frontier), encode(&snapshots[n].frontier), "{how} frontier at {n}");
+                for write in &writes[n..] {
+                    storage.apply(write);
+                }
+                let (frontier, index_root, _) = storage.initial(false);
+                assert_eq!(index_root, snapshots[40].index_root, "{how} from {n} to now");
+                assert_eq!(encode(&frontier), encode(&snapshots[40].frontier));
+            }
+        }
     }
 }

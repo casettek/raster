@@ -214,7 +214,7 @@ fn root_after_insert(
 }
 
 /// Bits `[0, depth)` of `key`, the rest zero: a subtree's prefix.
-fn prefix(key: &IndexKey, depth: usize) -> IndexKey {
+pub(crate) fn prefix(key: &IndexKey, depth: usize) -> IndexKey {
     let mut out = [0u8; 32];
     let full = depth / 8;
     out[..full].copy_from_slice(&key[..full]);
@@ -257,10 +257,10 @@ fn child_prefix(prefix: &IndexKey, depth: usize, right: bool) -> IndexKey {
 /// rehashes only the new leaf's path: about log₂(objects) nodes.
 #[derive(Debug, Clone)]
 pub struct IncrementalCoordinateIndex {
-    entries: BTreeMap<CfsCoordinates, StorageIndexValue>,
-    leaves: BTreeMap<IndexKey, (Hash32, StorageIndexValue)>,
-    nodes: HashMap<(u16, IndexKey), Hash32>,
-    root: Hash32,
+    pub(crate) entries: BTreeMap<CfsCoordinates, StorageIndexValue>,
+    pub(crate) leaves: BTreeMap<IndexKey, (Hash32, StorageIndexValue)>,
+    pub(crate) nodes: HashMap<(u16, IndexKey), Hash32>,
+    pub(crate) root: Hash32,
 }
 
 impl Default for IncrementalCoordinateIndex {
@@ -383,7 +383,7 @@ impl IncrementalCoordinateIndex {
     /// The longest prefix `key` shares with any other key in the index, or
     /// `None` when it is the only one. Only the ordered neighbours can share
     /// the longest.
-    fn deepest_shared_prefix(&self, key: &IndexKey) -> Option<usize> {
+    pub(crate) fn deepest_shared_prefix(&self, key: &IndexKey) -> Option<usize> {
         let before = self.leaves.range(..*key).next_back().map(|(other, _)| other);
         let after = self
             .leaves

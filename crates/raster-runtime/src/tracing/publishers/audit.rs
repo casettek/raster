@@ -3,7 +3,7 @@
 //! at a divergence.
 use super::Publisher;
 use crate::tracing::proof_input::{
-    build_step_io, capture_step_io, empty_storage_frontier, CapturedStepIo, ProofStorageState,
+    build_step_selections, build_step_storage, capture_step_io, CapturedStepIo,
 };
 use crate::TraceRecorder;
 use raster_compiler::{CfsBuilder, Project};
@@ -11,13 +11,12 @@ use raster_core::{cfs::CfsCursor, merkle::EMPTY_LEAF, trace::TraceEvent};
 use raster_prover::{
     commitment_file::CommitmentFile,
     trace::{BytesHashable, SourceTracker, TraceVerifier},
-    trace::SerializableFrontier,
     transition::{AuditHandoff, PreparedFault},
 };
 use std::{
     collections::{HashMap, VecDeque},
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::Mutex,
 };
 
 pub const AUDIT_PATH_ENV: &str = "RASTER_AUDIT_PATH";
@@ -31,10 +30,9 @@ struct WindowEntry {
     captured: CapturedStepIo,
     sources:
         HashMap<(u64, raster_core::trace::StepRecord), raster_core::transition::StepRecordWitness>,
-    /// How many storage writes, and which frontier, precede this step: enough
-    /// to rebuild the proof state the window opens with if it opens here.
+    /// How many storage writes precede this step: where the recorder's storage
+    /// rewinds to if the window opens here.
     writes_before: usize,
-    frontier_before: Arc<SerializableFrontier>,
     recur: raster_core::recur_progress::RecurProgressStack,
 }
 struct State {
@@ -42,10 +40,6 @@ struct State {
     verifier: TraceVerifier<CommitmentFile>,
     sources: SourceTracker,
     cursor: CfsCursor,
-    /// Every storage write so far, as the proof state applies it.
-    writes: Vec<(raster_core::transition::StorageEntry, u64)>,
-    /// The frontier after the last write.
-    frontier: Arc<SerializableFrontier>,
     window: VecDeque<WindowEntry>,
     steps: usize,
     completed: bool,
@@ -68,7 +62,11 @@ impl AuditPublisher {
         let verifier = TraceVerifier::new(disputed, &EMPTY_LEAF, &cfs)
             .map_err(|e| raster_core::Error::Other(e.to_string()))?;
         let cursor = CfsCursor::new(cfs.clone());
-        let mut recorder = TraceRecorder::for_live_audit(cfs).reading_program_objects();
+        // A step writes storage at most once, so a window's worth of storage
+        // history is enough to rewind to any window's start.
+        let mut recorder = TraceRecorder::for_live_audit(cfs)
+            .reading_program_objects()
+            .retaining_storage_undo(verifier.window_size);
         crate::storage::THREAD_STORAGE
             .with(|storage| recorder.set_source_resolver(storage.borrow().source_resolver()));
         Ok(Self {
@@ -79,8 +77,6 @@ impl AuditPublisher {
                 verifier,
                 cursor,
                 sources: SourceTracker::new(),
-                writes: Vec::new(),
-                frontier: Arc::new(empty_storage_frontier()),
                 window: VecDeque::new(),
                 steps: 0,
                 completed: false,
@@ -118,21 +114,15 @@ impl Publisher for AuditPublisher {
         );
         state.completed = matches!(&event, TraceEvent::ProgramEnd(_));
         let recur = state.recorder.live_recur_progress();
-        let writes_before = state.writes.len();
-        let frontier_before = Arc::clone(&state.frontier);
+        let writes_before = state.recorder.storage_writes();
         let step = state.recorder.record(event);
         let sources = state.sources.witnesses(&step, &state.cursor);
         let captured = capture_step_io(&step, &state.recorder);
         state.recorder.release_live_step(&step);
-        if let Some(write) = captured.storage_write() {
-            state.frontier = Arc::new(write.frontier_after);
-            state.writes.push((write.entry, write.log_position));
-        }
         state.window.push_back(WindowEntry {
             captured,
             sources,
             writes_before,
-            frontier_before,
             recur,
         });
         if state.window.len() > state.verifier.window_size {
@@ -154,21 +144,30 @@ impl Publisher for AuditPublisher {
         });
         state.steps += 1;
         if let Some(window) = divergence {
-            let first = state.window.front().expect("proof window");
-            // The proof state as the window opens, then each step's evidence
-            // against it, advancing past the step's write: what building it on
-            // every step would have produced for these steps.
-            let mut storage = ProofStorageState::rebuilt(
-                &state.writes[..first.writes_before],
-                (*first.frontier_before).clone(),
-            );
-            let (initial_storage_frontier, initial_index_root, entrypoint_membership_witness) =
-                storage.initial(state.cursor.main_entrypoint_names().is_some());
-            let io = state
-                .window
+            let State {
+                recorder,
+                window: entries,
+                cursor,
+                ..
+            } = &mut *state;
+            // Selections first, while the recorder still holds every object
+            // the window wrote. Then storage rewound to the window's start,
+            // and each step's storage proofs against it, advancing past the
+            // step's write: what building them on every step would have given.
+            let selections: Vec<_> = entries
                 .iter()
-                .map(|e| build_step_io(&e.captured, &state.recorder, &mut storage))
+                .map(|e| build_step_selections(&e.captured, recorder))
                 .collect();
+            let first = entries.front().expect("proof window");
+            let mut storage = recorder.storage_rewound_to(first.writes_before);
+            let (initial_storage_frontier, initial_index_root, entrypoint_membership_witness) =
+                storage.initial(cursor.main_entrypoint_names().is_some());
+            let io = entries
+                .iter()
+                .zip(selections)
+                .map(|(e, selections)| build_step_storage(&e.captured, selections, &mut storage))
+                .collect();
+            let first = state.window.front().expect("proof window");
             let fault = PreparedFault {
                 window,
                 io,
