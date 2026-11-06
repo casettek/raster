@@ -50,6 +50,14 @@ impl CommitmentPublisher {
         })
     }
 }
+impl CommitmentPublisher {
+    /// Selective capture reads the program thread's profiling state, so the
+    /// publisher has to stay on that thread.
+    pub(crate) fn needs_program_thread(&self) -> bool {
+        self.state.lock().expect("commitment publisher lock").selective
+    }
+}
+
 impl Publisher for CommitmentPublisher {
     fn publish(&self, event: TraceEvent) {
         let mut state = self.state.lock().expect("commitment publisher lock");

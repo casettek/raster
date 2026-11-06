@@ -2,6 +2,7 @@ pub mod audit;
 pub mod binary;
 pub mod commitment;
 pub mod json;
+pub mod worker;
 
 use raster_core::trace::TraceEvent;
 use std::sync::OnceLock;

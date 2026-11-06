@@ -113,8 +113,8 @@ pub fn init() {
 
     if let Some(disputed) = std::env::var_os(publishers::audit::AUDIT_PATH_ENV) {
         use publishers::audit::*;
-        install_publisher(
-            AuditPublisher::new(
+        install_instrumentation(
+            Box::new(AuditPublisher::new(
                 std::env::var_os(AUDIT_PROJECT_ENV)
                     .expect("audit project")
                     .into(),
@@ -124,7 +124,8 @@ pub fn init() {
                     .into(),
                 std::env::var(AUDIT_BINDING_ENV).expect("audit binding"),
             )
-            .expect("initialize live audit"),
+            .expect("initialize live audit")),
+            false,
         );
         return;
     }
@@ -148,18 +149,34 @@ pub fn init() {
             .expect("invalid commitment window");
         let config = raster_prover::trace::FraudProofConfig::from_window_size(window)
             .expect("invalid commitment window");
-        install_publisher(
-            publishers::commitment::CommitmentPublisher::new(
-                project.into(),
-                output.into(),
-                config,
-                trace,
-            )
-            .expect("initialize live commitment"),
-        );
+        let publisher = publishers::commitment::CommitmentPublisher::new(
+            project.into(),
+            output.into(),
+            config,
+            trace,
+        )
+        .expect("initialize live commitment");
+        let program_thread = publisher.needs_program_thread();
+        install_instrumentation(Box::new(publisher), program_thread);
     } else if let Some(trace) = trace {
-        let _ = GLOBAL_PUBLISHER.set(trace);
+        install_instrumentation(trace, false);
     }
+}
+
+/// Install the run's publisher on its own thread, so the program does not wait
+/// for its instrumentation, unless it has to share the program's thread:
+/// profiling and selective capture read that thread's state.
+fn install_instrumentation(publisher: Box<dyn Publisher>, program_thread: bool) {
+    use publishers::worker::WorkerPublisher;
+    let publisher = if program_thread
+        || crate::profiling::profiling_enabled()
+        || !WorkerPublisher::enabled()
+    {
+        publisher
+    } else {
+        Box::new(WorkerPublisher::spawn(publisher))
+    };
+    let _ = GLOBAL_PUBLISHER.set(publisher);
 }
 
 /// Initializes the global subscriber with a custom subscriber.

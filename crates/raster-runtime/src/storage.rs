@@ -19,7 +19,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::vec::Vec;
 
 use crate::backing::{
@@ -100,8 +100,10 @@ pub struct ObjectStore {
             (StorageRef, crate::backing::PersistedBacking),
         >,
     >,
-    memory: BTreeMap<CfsCoordinates, Arc<StoredObject>>,
-    referenced: BTreeMap<CfsCoordinates, StoredObject>,
+    /// Shared with [`Self::shared_view`]s: objects are written once and never
+    /// removed, so a view on another thread can read whatever has been added.
+    memory: Arc<RwLock<BTreeMap<CfsCoordinates, Arc<StoredObject>>>>,
+    referenced: Arc<RwLock<BTreeMap<CfsCoordinates, StoredObject>>>,
     archive: Option<raster_prover::archive::Archive>,
     loaded: std::sync::Mutex<LoadedObjects>,
     /// Set once (via `start_program`) for programs that declare `main` entry
@@ -176,10 +178,12 @@ pub enum ObjectSource {
     /// Its own replica, filled from trace events: a recorder with no running
     /// program to read from (offline replay of a saved trace, tests).
     Owned(ObjectStore),
-    /// The running program's store (`THREAD_STORAGE`): a live recorder inside
-    /// the program process. The ledger keeps no bytes. Objects are written
-    /// once and never removed, so every object the ledger logged is there.
-    Program,
+    /// A view of the running program's store ([`ObjectStore::shared_view`]):
+    /// a live recorder inside the program process, on the program's thread or
+    /// another. The ledger keeps no bytes. Objects are written once and never
+    /// removed, and each is stored before the event that reads it is
+    /// published, so every object the ledger logged is there.
+    Program(ObjectStore),
 }
 
 /// The structures that make stored objects provable: an append-only log of
@@ -215,7 +219,7 @@ impl std::fmt::Debug for StorageLedger {
         let mut debug = f.debug_struct("StorageLedger");
         match &self.objects {
             ObjectSource::Owned(objects) => debug.field("objects", objects),
-            ObjectSource::Program => debug.field("objects", &"program"),
+            ObjectSource::Program(_) => debug.field("objects", &"program"),
         };
         debug.finish()
     }
@@ -329,12 +333,41 @@ impl ObjectStore {
     pub fn new() -> Self {
         Self::with_storage(crate::working_storage::current())
     }
+    /// Empty the store for a new program, keeping its input resolver and its
+    /// shared object maps, so views taken earlier see the new program's objects.
+    fn reset(&mut self) {
+        let fresh = Self::new();
+        self.memory.write().expect("objects lock").clear();
+        self.referenced.write().expect("objects lock").clear();
+        self.objects = fresh.objects;
+        self.archive = fresh.archive;
+        self.loaded = fresh.loaded;
+    }
+
+    /// A read-only view of this store's objects for another thread: the same
+    /// objects, including those added after the view is taken, and the same
+    /// input resolver. In-memory stores only; a running program's always is.
+    pub(crate) fn shared_view(&self) -> Self {
+        assert!(
+            self.archive.is_none(),
+            "only an in-memory object store can be shared"
+        );
+        Self {
+            objects: None,
+            memory: Arc::clone(&self.memory),
+            referenced: Arc::clone(&self.referenced),
+            archive: None,
+            loaded: Default::default(),
+            source_resolver: self.source_resolver.clone(),
+        }
+    }
+
     pub fn with_storage(policy: crate::WorkingStorage) -> Self {
         let disk = policy == crate::WorkingStorage::Disk;
         Self {
             objects: disk.then(raster_prover::archive::DiskMap::new),
-            memory: BTreeMap::new(),
-            referenced: BTreeMap::new(),
+            memory: Default::default(),
+            referenced: Default::default(),
             archive: disk.then(raster_prover::archive::Archive::current),
             loaded: Default::default(),
             source_resolver: None,
@@ -373,19 +406,21 @@ impl ObjectStore {
                 .objects
                 .as_ref()
                 .is_some_and(|s| s.contains_key(&coordinates))
-                && !self.memory.contains_key(&coordinates)
-                && !self.referenced.contains_key(&coordinates),
+                && !self.memory.read().expect("objects lock").contains_key(&coordinates)
+                && !self.referenced.read().expect("objects lock").contains_key(&coordinates),
             "Duplicate storage write at coordinates {:?}",
             coordinates
         );
         let reference = StorageRef::new(coordinates.clone(), object_commitment.clone());
         if self.archive.is_none() {
-            self.memory.insert(
+            self.memory.write().expect("objects lock").insert(
                 coordinates.clone(),
                 Arc::new(StoredObject { reference, backing }),
             );
         } else if matches!(&backing, ObjectBacking::Referenced(_)) {
             self.referenced
+                .write()
+                .expect("objects lock")
                 .insert(coordinates.clone(), StoredObject { reference, backing });
         } else {
             let persisted = crate::backing::PersistedBacking::store(
@@ -549,10 +584,23 @@ impl ObjectStore {
     }
 
     fn verify_reference(&self, reference: &StorageRef) -> Result<Arc<StoredObject>> {
-        let stored = if let Some(stored) = self.memory.get(&reference.coordinates) {
-            Some(Arc::clone(stored))
-        } else if let Some(stored) = self.referenced.get(&reference.coordinates) {
-            Some(Arc::new(stored.clone()))
+        let in_memory = self
+            .memory
+            .read()
+            .expect("objects lock")
+            .get(&reference.coordinates)
+            .cloned();
+        let referenced = || {
+            self.referenced
+                .read()
+                .expect("objects lock")
+                .get(&reference.coordinates)
+                .cloned()
+        };
+        let stored = if let Some(stored) = in_memory {
+            Some(stored)
+        } else if let Some(stored) = referenced() {
+            Some(Arc::new(stored))
         } else if let Some(objects) = self.objects.as_ref() {
             let mut loaded = self.loaded.lock().expect("loaded objects lock");
             match loaded.get(&reference.coordinates) {
@@ -826,7 +874,8 @@ impl StorageLedger {
             self.coordinate_index.root() == raster_core::coordinate_index::IncrementalCoordinateIndex::new().root(),
             "a ledger switches to the program's objects before its first write"
         );
-        self.objects = ObjectSource::Program;
+        self.objects =
+            ObjectSource::Program(THREAD_STORAGE.with(|storage| storage.borrow().shared_view()));
     }
 
     /// Run `read` against the store that holds the objects. A program-backed
@@ -839,7 +888,7 @@ impl StorageLedger {
     ) -> Result<R> {
         match &self.objects {
             ObjectSource::Owned(objects) => read(objects),
-            ObjectSource::Program => {
+            ObjectSource::Program(objects) => {
                 match self.coordinate_index.get(&reference.coordinates) {
                     None => {
                         return Err(Error::Other(format!(
@@ -855,16 +904,7 @@ impl StorageLedger {
                     }
                     Some(_) => {}
                 }
-                THREAD_STORAGE.with(|storage| {
-                    let storage = storage.try_borrow().map_err(|_| {
-                        Error::Other(
-                            "the recorder read the program's objects while the program was \
-                             writing them; trace events must be published outside storage calls"
-                                .into(),
-                        )
-                    })?;
-                    read(&storage)
-                })
+                read(objects)
             }
         }
     }
@@ -990,7 +1030,7 @@ impl StorageLedger {
                 let (backing, object_commitment) = owned_backing(bytes, raster);
                 self.append(Some(backing), object_commitment, coordinates)
             }
-            ObjectSource::Program => {
+            ObjectSource::Program(_) => {
                 let object_commitment = internal_object_commitment(bytes, raster.as_ref());
                 self.append(None, object_commitment, coordinates)
             }
@@ -1045,9 +1085,8 @@ impl StorageLedger {
     /// The installed input context, if this runtime has one.
     pub(crate) fn source_resolver(&self) -> Option<Arc<dyn SourceResolver>> {
         match &self.objects {
-            ObjectSource::Owned(objects) => objects.source_resolver(),
-            ObjectSource::Program => {
-                THREAD_STORAGE.with(|storage| storage.borrow().source_resolver())
+            ObjectSource::Owned(objects) | ObjectSource::Program(objects) => {
+                objects.source_resolver()
             }
         }
     }
@@ -1314,15 +1353,11 @@ std::thread_local! {
 
 fn reset_thread_storage() {
     THREAD_STORAGE.with(|storage| {
-        let mut storage = storage.borrow_mut();
         // The input context is installed by `init` or an embedding caller
-        // before entering the root sequence, so preserve it when resetting
-        // the previous program's storage.
-        let source_resolver = storage.source_resolver();
-        *storage = ObjectStore::new();
-        if let Some(resolver) = source_resolver {
-            storage.set_source_resolver(resolver);
-        }
+        // before entering the root sequence, so it survives the reset. So do
+        // the shared object maps: a live recorder took a view of them at
+        // `init`, and it must see this program's objects, not an orphaned map.
+        storage.borrow_mut().reset();
     });
     THREAD_ACTIVE_EXECUTION_COORDINATES.with(|coordinates| {
         coordinates.borrow_mut().clear();
