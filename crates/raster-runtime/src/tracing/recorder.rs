@@ -158,7 +158,7 @@ impl StepWitnessStore {
     pub fn insert(
         &mut self,
         coordinates: CfsCoordinates,
-        event: TraceEvent,
+        event: &TraceEvent,
         storage_write: Option<StorageWriteRecord>,
     ) {
         if !self.1 {
@@ -181,7 +181,7 @@ impl StepWitnessStore {
                             .map(|input| input.storage().clone())
                             .unwrap_or_default(),
                         storage_write,
-                        draft_transition_witness: trace_item.draft_transition_witness,
+                        draft_transition_witness: trace_item.draft_transition_witness.clone(),
                     },
                 );
             }
@@ -203,7 +203,7 @@ impl StepWitnessStore {
                         output_data: trace_item.output.as_ref().map(|output| output.data.clone()),
                         storage_input: StorageInput::new(),
                         storage_write,
-                        draft_transition_witness: trace_item.draft_transition_witness,
+                        draft_transition_witness: trace_item.draft_transition_witness.clone(),
                     },
                 );
             }
@@ -223,7 +223,7 @@ impl StepWitnessStore {
                             .map(|input| input.storage().clone())
                             .unwrap_or_default(),
                         storage_write,
-                        draft_transition_witness: trace_item.draft_transition_witness,
+                        draft_transition_witness: trace_item.draft_transition_witness.clone(),
                     },
                 );
             }
@@ -243,7 +243,7 @@ impl StepWitnessStore {
                             .map(|input| input.storage().clone())
                             .unwrap_or_default(),
                         storage_write,
-                        draft_transition_witness: trace_item.draft_transition_witness,
+                        draft_transition_witness: trace_item.draft_transition_witness.clone(),
                     },
                 );
             }
@@ -604,11 +604,13 @@ impl TraceRecorder {
         }
     }
 
-    pub fn record(&mut self, event: TraceEvent) -> StepRecord {
+    /// Record one event the caller keeps: the witness store copies what it
+    /// keeps of it, so recording never takes the event.
+    pub fn record(&mut self, event: &TraceEvent) -> StepRecord {
         self.exec_index += 1;
         let exec_index = self.exec_index;
 
-        let step_record = match event.clone() {
+        let step_record = match event {
             // A recur site opens here, *before* its first iteration. This is
             // the only point at which the loop bound `L` — carried by the
             // source's `0x0A` metadata selection in this event's input — is
@@ -637,7 +639,7 @@ impl TraceRecorder {
                     child_id,
                 );
 
-                let input = fn_call_record.input;
+                let input = &fn_call_record.input;
 
                 // Open the site here, where `L` first exists. `chunk` is a CFS
                 // literal and `kind` follows the event, so every frame field is
@@ -688,8 +690,7 @@ impl TraceRecorder {
                     recur_state: None,
                 };
 
-                self.witness_store
-                    .insert(site_coordinates, event.clone(), None);
+                self.witness_store.insert(site_coordinates, event, None);
 
                 record
             }
@@ -699,7 +700,7 @@ impl TraceRecorder {
 
                 let coordinates = self.sequence_callstack.current_sequence_coordinates.clone();
 
-                let input = fn_call_record.input;
+                let input = &fn_call_record.input;
                 let input_commitment = input
                     .as_ref()
                     .map(|output| Sha256Commitment::from(output).into())
@@ -721,7 +722,7 @@ impl TraceRecorder {
                     recur_state: None,
                 };
 
-                self.witness_store.insert(coordinates, event.clone(), None);
+                self.witness_store.insert(coordinates, event, None);
 
                 record
             }
@@ -740,7 +741,7 @@ impl TraceRecorder {
                     "Sequence ended while RecurSequence site trace was still active"
                 );
 
-                let output = fn_call_record.output;
+                let output = &fn_call_record.output;
                 let output_commitment = output
                     .as_ref()
                     .map(|output| Sha256Commitment::from(output).into())
@@ -827,7 +828,7 @@ impl TraceRecorder {
                     );
                 }
 
-                let output: Option<StorageData> = end_event.output;
+                let output: Option<StorageData> = end_event.output.clone();
                 let output_commitment = output
                     .as_ref()
                     .map(|output| output.selection.selected_hash.to_vec())
@@ -850,7 +851,7 @@ impl TraceRecorder {
                     .pop()
                     .expect("Corrupted sequence stack");
 
-                self.witness_store.insert(coordinates, event.clone(), None);
+                self.witness_store.insert(coordinates, event, None);
 
                 record
             }
@@ -923,7 +924,7 @@ impl TraceRecorder {
                     iteration_coordinates.clone(),
                 );
 
-                let input = fn_call_record.input;
+                let input = &fn_call_record.input;
                 let input_commitment = input
                     .as_ref()
                     .map(|output| Sha256Commitment::from(output).into())
@@ -945,8 +946,7 @@ impl TraceRecorder {
                     recur_state: None,
                 };
 
-                self.witness_store
-                    .insert(iteration_coordinates, event.clone(), None);
+                self.witness_store.insert(iteration_coordinates, event, None);
 
                 record
             }
@@ -958,7 +958,7 @@ impl TraceRecorder {
                 let sequence_coordinates =
                     self.sequence_callstack.current_sequence_coordinates.clone();
 
-                let output = fn_call_record.output;
+                let output = &fn_call_record.output;
                 let output_commitment = output
                     .as_ref()
                     .map(|output| Sha256Commitment::from(output).into())
@@ -1008,8 +1008,7 @@ impl TraceRecorder {
                     .pop()
                     .expect("Corrupted recur sequence stack");
 
-                self.witness_store
-                    .insert(closing_coordinates, event.clone(), None);
+                self.witness_store.insert(closing_coordinates, event, None);
 
                 record
             }
@@ -1051,8 +1050,8 @@ impl TraceRecorder {
 
                 current_sequence_state.current_index += 1;
 
-                let input = fn_call_record.input;
-                let output = fn_call_record.output;
+                let input = &fn_call_record.input;
+                let output = &fn_call_record.output;
                 let storage_write = output.as_ref().map(|output| {
                     self.storage.append_serialized_bytes(
                         &output.data,
@@ -1066,7 +1065,7 @@ impl TraceRecorder {
                     sequence_id,
                     coordinates: tile_coordinates.clone(),
                     kind: StepKind::Exec(self.exec_step(
-                        ExecTarget::Tile(fn_call_record.fn_name),
+                        ExecTarget::Tile(fn_call_record.fn_name.clone()),
                         parent_current_index,
                         input.as_ref(),
                         storage_write.as_ref(),
@@ -1082,8 +1081,7 @@ impl TraceRecorder {
                     false,
                 );
 
-                self.witness_store
-                    .insert(tile_coordinates, event.clone(), storage_write);
+                self.witness_store.insert(tile_coordinates, event, storage_write);
 
                 record
             }
@@ -1137,8 +1135,8 @@ impl TraceRecorder {
                 // would re-derive a weaker form of the same rule from data the
                 // recorder cannot authenticate. See `lazy-list-recur.md` §5.
 
-                let input = fn_call_record.input;
-                let output = fn_call_record.output;
+                let input = &fn_call_record.input;
+                let output = &fn_call_record.output;
                 let storage_write = output.as_ref().map(|output| {
                     self.storage.append_serialized_bytes(
                         &output.data,
@@ -1155,7 +1153,7 @@ impl TraceRecorder {
                     sequence_id,
                     coordinates: tile_coordinates.clone(),
                     kind: StepKind::Exec(self.exec_step(
-                        ExecTarget::Tile(fn_call_record.fn_name),
+                        ExecTarget::Tile(fn_call_record.fn_name.clone()),
                         intra_sequence_index,
                         input.as_ref(),
                         storage_write.as_ref(),
@@ -1224,8 +1222,7 @@ impl TraceRecorder {
                     true,
                 );
 
-                self.witness_store
-                    .insert(tile_coordinates, event.clone(), storage_write);
+                self.witness_store.insert(tile_coordinates, event, storage_write);
 
                 record
             }
@@ -1269,7 +1266,7 @@ impl TraceRecorder {
 
                 // A site's close binds no inputs: they were bound once, at
                 // `RecurStart`.
-                let output = fn_call_record.output;
+                let output = &fn_call_record.output;
                 // A contiguous object, or a derived one rebuilt from its delta
                 // over the base this replica already holds.
                 let storage_write = output.as_ref().map(|output| {
@@ -1308,7 +1305,7 @@ impl TraceRecorder {
                     sequence_id,
                     coordinates: closing_coordinates.clone(),
                     kind: StepKind::RecurEnd(RecurEndStep {
-                        site_id: fn_call_record.fn_name,
+                        site_id: fn_call_record.fn_name.clone(),
                         output_commitment: storage_write
                             .as_ref()
                             .map(|write| write.entry.object_commitment.clone())
@@ -1319,8 +1316,7 @@ impl TraceRecorder {
                     recur_state: None,
                 };
 
-                self.witness_store
-                    .insert(closing_coordinates, event.clone(), storage_write);
+                self.witness_store.insert(closing_coordinates, event, storage_write);
 
                 record
             }
@@ -1368,7 +1364,7 @@ impl TraceRecorder {
 
                 // A site's close binds no inputs: they were bound once, at
                 // `RecurStart`.
-                let output = fn_call_record.output;
+                let output = &fn_call_record.output;
                 // A contiguous object, or a derived one rebuilt from its delta
                 // over the base this replica already holds.
                 let storage_write = output.as_ref().map(|output| {
@@ -1407,7 +1403,7 @@ impl TraceRecorder {
                     sequence_id,
                     coordinates: closing_coordinates.clone(),
                     kind: StepKind::RecurEnd(RecurEndStep {
-                        site_id: fn_call_record.fn_name,
+                        site_id: fn_call_record.fn_name.clone(),
                         output_commitment: storage_write
                             .as_ref()
                             .map(|write| write.entry.object_commitment.clone())
@@ -1418,8 +1414,7 @@ impl TraceRecorder {
                     recur_state: None,
                 };
 
-                self.witness_store
-                    .insert(closing_coordinates, event.clone(), storage_write);
+                self.witness_store.insert(closing_coordinates, event, storage_write);
 
                 record
             }
@@ -1528,8 +1523,7 @@ impl TraceRecorder {
                     recur_state: None,
                 };
 
-                self.witness_store
-                    .insert(coordinates, event.clone(), storage_write);
+                self.witness_store.insert(coordinates, event, storage_write);
 
                 record
             }
@@ -1851,7 +1845,7 @@ mod tests {
         let mut store = StepWitnessStore::new();
         store.insert(
             CfsCoordinates(vec![3, -1]),
-            TraceEvent::SequenceEnd(FnCallRecord {
+            &TraceEvent::SequenceEnd(FnCallRecord {
                 fn_name: "child".to_string(),
                 input: None,
                 output: None,
@@ -1869,7 +1863,7 @@ mod tests {
     }
 
     fn start_main(recorder: &mut TraceRecorder) {
-        recorder.record(TraceEvent::ProgramStart(
+        recorder.record(&TraceEvent::ProgramStart(
             raster_core::trace::ProgramStartEvent {
                 arguments: Vec::new(),
             },
@@ -1956,7 +1950,7 @@ mod tests {
             .step_witness_at(&CfsCoordinates(vec![]))
             .expect("ProgramStart created the root entry");
 
-        recorder.record(TraceEvent::ProgramEnd(
+        recorder.record(&TraceEvent::ProgramEnd(
             raster_core::trace::ProgramEndEvent { output: None },
         ));
 
@@ -1977,7 +1971,7 @@ mod tests {
         let mut recorder = recorder_with_nested_sequence();
         start_main(&mut recorder);
 
-        let start = recorder.record(TraceEvent::SequenceStart(call_with_input("child")));
+        let start = recorder.record(&TraceEvent::SequenceStart(call_with_input("child")));
         let child_coordinates = start.coordinates().clone();
         let at_start = recorder
             .step_witness_at(&child_coordinates)
@@ -1985,7 +1979,7 @@ mod tests {
             .input_source_witness();
         assert!(at_start.is_some());
 
-        let end = recorder.record(TraceEvent::SequenceEnd(call("child")));
+        let end = recorder.record(&TraceEvent::SequenceEnd(call("child")));
         let closing = CfsCoordinates(vec![closing_coordinate(child_coordinates[0])]);
         assert_eq!(end.coordinates(), &closing);
         assert!(recorder
@@ -2009,8 +2003,8 @@ mod tests {
         start_main(&mut recorder);
 
         let __start = seed_recur_source(&mut recorder, "recur", 2);
-        recorder.record(TraceEvent::RecurTileStart(__start));
-        let iter0 = recorder.record(TraceEvent::RecurTileIterationExec(FnCallRecord {
+        recorder.record(&TraceEvent::RecurTileStart(__start));
+        let iter0 = recorder.record(&TraceEvent::RecurTileIterationExec(FnCallRecord {
             fn_name: "recur".to_string(),
             input: None,
             output: None,
@@ -2018,7 +2012,7 @@ mod tests {
             recur_control: Some(raster_core::draft::RecurControlKind::Continue),
             recur_state: None,
         }));
-        let iter1 = recorder.record(TraceEvent::RecurTileIterationExec(FnCallRecord {
+        let iter1 = recorder.record(&TraceEvent::RecurTileIterationExec(FnCallRecord {
             fn_name: "recur".to_string(),
             input: None,
             output: None,
@@ -2026,7 +2020,7 @@ mod tests {
             recur_control: Some(raster_core::draft::RecurControlKind::Continue),
             recur_state: None,
         }));
-        let site = recorder.record(TraceEvent::RecurTileEnd(FnCallRecord {
+        let site = recorder.record(&TraceEvent::RecurTileEnd(FnCallRecord {
             fn_name: "recur".to_string(),
             input: None,
             output: Some(site_object()),
@@ -2034,7 +2028,7 @@ mod tests {
             recur_control: Some(raster_core::draft::RecurControlKind::Continue),
             recur_state: None,
         }));
-        let after = recorder.record(TraceEvent::TileExec(FnCallRecord {
+        let after = recorder.record(&TraceEvent::TileExec(FnCallRecord {
             fn_name: "after".to_string(),
             input: None,
             output: None,
@@ -2056,8 +2050,8 @@ mod tests {
         start_main(&mut recorder);
 
         let __start = seed_recur_source(&mut recorder, "child", 2);
-        recorder.record(TraceEvent::RecurSequenceStart(__start));
-        let iter0_start = recorder.record(TraceEvent::RecurSequenceIterationStart(FnCallRecord {
+        recorder.record(&TraceEvent::RecurSequenceStart(__start));
+        let iter0_start = recorder.record(&TraceEvent::RecurSequenceIterationStart(FnCallRecord {
             fn_name: "child".to_string(),
             input: None,
             output: None,
@@ -2065,7 +2059,7 @@ mod tests {
             recur_control: None,
             recur_state: None,
         }));
-        let iter0_inner = recorder.record(TraceEvent::TileExec(FnCallRecord {
+        let iter0_inner = recorder.record(&TraceEvent::TileExec(FnCallRecord {
             fn_name: "inner".to_string(),
             input: None,
             output: None,
@@ -2073,7 +2067,7 @@ mod tests {
             recur_control: None,
             recur_state: None,
         }));
-        let iter0_end = recorder.record(TraceEvent::RecurSequenceIterationEnd(FnCallRecord {
+        let iter0_end = recorder.record(&TraceEvent::RecurSequenceIterationEnd(FnCallRecord {
             fn_name: "child".to_string(),
             input: None,
             output: None,
@@ -2081,7 +2075,7 @@ mod tests {
             recur_control: None,
             recur_state: None,
         }));
-        let iter1_start = recorder.record(TraceEvent::RecurSequenceIterationStart(FnCallRecord {
+        let iter1_start = recorder.record(&TraceEvent::RecurSequenceIterationStart(FnCallRecord {
             fn_name: "child".to_string(),
             input: None,
             output: None,
@@ -2089,7 +2083,7 @@ mod tests {
             recur_control: None,
             recur_state: None,
         }));
-        let iter1_inner = recorder.record(TraceEvent::TileExec(FnCallRecord {
+        let iter1_inner = recorder.record(&TraceEvent::TileExec(FnCallRecord {
             fn_name: "inner".to_string(),
             input: None,
             output: None,
@@ -2097,7 +2091,7 @@ mod tests {
             recur_control: None,
             recur_state: None,
         }));
-        let iter1_end = recorder.record(TraceEvent::RecurSequenceIterationEnd(FnCallRecord {
+        let iter1_end = recorder.record(&TraceEvent::RecurSequenceIterationEnd(FnCallRecord {
             fn_name: "child".to_string(),
             input: None,
             output: None,
@@ -2105,7 +2099,7 @@ mod tests {
             recur_control: None,
             recur_state: None,
         }));
-        let site = recorder.record(TraceEvent::RecurSequenceEnd(FnCallRecord {
+        let site = recorder.record(&TraceEvent::RecurSequenceEnd(FnCallRecord {
             fn_name: "child".to_string(),
             input: None,
             output: Some(site_object()),
@@ -2113,7 +2107,7 @@ mod tests {
             recur_control: None,
             recur_state: None,
         }));
-        let after = recorder.record(TraceEvent::TileExec(FnCallRecord {
+        let after = recorder.record(&TraceEvent::TileExec(FnCallRecord {
             fn_name: "after".to_string(),
             input: None,
             output: None,
@@ -2158,8 +2152,8 @@ mod tests {
         let mut recorder = recorder_with_recur_site();
         start_main(&mut recorder);
         let __start = seed_recur_source(&mut recorder, "recur", 1);
-        let site_start = recorder.record(TraceEvent::RecurTileStart(__start));
-        let iter = recorder.record(TraceEvent::RecurTileIterationExec(FnCallRecord {
+        let site_start = recorder.record(&TraceEvent::RecurTileStart(__start));
+        let iter = recorder.record(&TraceEvent::RecurTileIterationExec(FnCallRecord {
             fn_name: "recur".to_string(),
             input: None,
             output: None,
@@ -2167,7 +2161,7 @@ mod tests {
             recur_control: Some(raster_core::draft::RecurControlKind::Continue),
             recur_state: None,
         }));
-        let site_end = recorder.record(TraceEvent::RecurTileEnd(FnCallRecord {
+        let site_end = recorder.record(&TraceEvent::RecurTileEnd(FnCallRecord {
             fn_name: "recur".to_string(),
             input: None,
             output: Some(site_object()),
@@ -2186,9 +2180,9 @@ mod tests {
         let mut recorder = recorder_with_recur_sequence_site();
         start_main(&mut recorder);
         let __start = seed_recur_source(&mut recorder, "child", 1);
-        let site_start = recorder.record(TraceEvent::RecurSequenceStart(__start));
+        let site_start = recorder.record(&TraceEvent::RecurSequenceStart(__start));
         let iteration_start =
-            recorder.record(TraceEvent::RecurSequenceIterationStart(FnCallRecord {
+            recorder.record(&TraceEvent::RecurSequenceIterationStart(FnCallRecord {
                 fn_name: "child".to_string(),
                 input: None,
                 output: None,
@@ -2196,7 +2190,7 @@ mod tests {
                 recur_control: None,
                 recur_state: None,
             }));
-        let inner = recorder.record(TraceEvent::TileExec(FnCallRecord {
+        let inner = recorder.record(&TraceEvent::TileExec(FnCallRecord {
             fn_name: "inner".to_string(),
             input: None,
             output: None,
@@ -2204,7 +2198,7 @@ mod tests {
             recur_control: None,
             recur_state: None,
         }));
-        let iteration_end = recorder.record(TraceEvent::RecurSequenceIterationEnd(FnCallRecord {
+        let iteration_end = recorder.record(&TraceEvent::RecurSequenceIterationEnd(FnCallRecord {
             fn_name: "child".to_string(),
             input: None,
             output: None,
@@ -2212,7 +2206,7 @@ mod tests {
             recur_control: None,
             recur_state: None,
         }));
-        let site_end = recorder.record(TraceEvent::RecurSequenceEnd(FnCallRecord {
+        let site_end = recorder.record(&TraceEvent::RecurSequenceEnd(FnCallRecord {
             fn_name: "child".to_string(),
             input: None,
             output: Some(site_object()),
@@ -2292,11 +2286,11 @@ mod tests {
         recorder.storage = StorageLedger::owning(crate::WorkingStorage::Memory);
         start_main(&mut recorder);
         let start = seed_recur_source(&mut recorder, "recur", 1000);
-        let step = recorder.record(TraceEvent::RecurTileStart(start));
+        let step = recorder.record(&TraceEvent::RecurTileStart(start));
         recorder.release_live_step(&step);
         let active = recorder.witness_store.2.as_ref().unwrap().len();
         for _ in 0..1000 {
-            let step = recorder.record(TraceEvent::RecurTileIterationExec(recur_call(
+            let step = recorder.record(&TraceEvent::RecurTileIterationExec(recur_call(
                 "recur", raster_core::draft::RecurControlKind::Continue,
             )));
             assert!(recorder.step_witness_at(step.coordinates()).is_some());
@@ -2305,7 +2299,7 @@ mod tests {
             assert_eq!(recorder.witness_store.2.as_ref().unwrap().len(), active);
             assert!(recorder.execution_witnesses.is_none() && recorder.recur_progress_store.is_none());
         }
-        let step = recorder.record(TraceEvent::RecurTileEnd(site_end("recur")));
+        let step = recorder.record(&TraceEvent::RecurTileEnd(site_end("recur")));
         recorder.release_live_step(&step);
         assert!(recorder.active_recur.is_none());
     }
@@ -2318,16 +2312,16 @@ mod tests {
         start_main(&mut recorder);
 
         let start = seed_recur_source(&mut recorder, "recur", 2);
-        let site_start = recorder.record(TraceEvent::RecurTileStart(start));
-        let iter0 = recorder.record(TraceEvent::RecurTileIterationExec(recur_call(
+        let site_start = recorder.record(&TraceEvent::RecurTileStart(start));
+        let iter0 = recorder.record(&TraceEvent::RecurTileIterationExec(recur_call(
             "recur",
             raster_core::draft::RecurControlKind::Continue,
         )));
-        let iter1 = recorder.record(TraceEvent::RecurTileIterationExec(recur_call(
+        let iter1 = recorder.record(&TraceEvent::RecurTileIterationExec(recur_call(
             "recur",
             raster_core::draft::RecurControlKind::Continue,
         )));
-        let site_end = recorder.record(TraceEvent::RecurTileEnd(site_end("recur")));
+        let site_end = recorder.record(&TraceEvent::RecurTileEnd(site_end("recur")));
 
         // Open, and each iteration, must move it.
         assert_ne!(site_start.recur_progress_commitment, empty, "site open");
@@ -2361,16 +2355,16 @@ mod tests {
 
         let start = seed_recur_source(&mut recorder, "recur", 2);
         let steps = vec![
-            recorder.record(TraceEvent::RecurTileStart(start)),
-            recorder.record(TraceEvent::RecurTileIterationExec(recur_call(
+            recorder.record(&TraceEvent::RecurTileStart(start)),
+            recorder.record(&TraceEvent::RecurTileIterationExec(recur_call(
                 "recur",
                 raster_core::draft::RecurControlKind::Continue,
             ))),
-            recorder.record(TraceEvent::RecurTileIterationExec(recur_call(
+            recorder.record(&TraceEvent::RecurTileIterationExec(recur_call(
                 "recur",
                 raster_core::draft::RecurControlKind::Continue,
             ))),
-            recorder.record(TraceEvent::RecurTileEnd(site_end("recur"))),
+            recorder.record(&TraceEvent::RecurTileEnd(site_end("recur"))),
         ];
 
         for step in &steps {
@@ -2395,13 +2389,13 @@ mod tests {
         start_main(&mut recorder);
 
         let start = seed_recur_source(&mut recorder, "child", 2);
-        let mut steps = vec![recorder.record(TraceEvent::RecurSequenceStart(start))];
+        let mut steps = vec![recorder.record(&TraceEvent::RecurSequenceStart(start))];
         for _ in 0..2 {
-            steps.push(recorder.record(TraceEvent::RecurSequenceIterationStart(call("child"))));
-            steps.push(recorder.record(TraceEvent::TileExec(call("inner"))));
-            steps.push(recorder.record(TraceEvent::RecurSequenceIterationEnd(call("child"))));
+            steps.push(recorder.record(&TraceEvent::RecurSequenceIterationStart(call("child"))));
+            steps.push(recorder.record(&TraceEvent::TileExec(call("inner"))));
+            steps.push(recorder.record(&TraceEvent::RecurSequenceIterationEnd(call("child"))));
         }
-        steps.push(recorder.record(TraceEvent::RecurSequenceEnd(site_end("child"))));
+        steps.push(recorder.record(&TraceEvent::RecurSequenceEnd(site_end("child"))));
 
         for step in &steps {
             let retained = recorder
@@ -2427,12 +2421,12 @@ mod tests {
         start_main(&mut recorder);
 
         let start = seed_recur_source(&mut recorder, "recur", 2);
-        recorder.record(TraceEvent::RecurTileStart(start));
-        let iter0 = recorder.record(TraceEvent::RecurTileIterationExec(recur_call(
+        recorder.record(&TraceEvent::RecurTileStart(start));
+        let iter0 = recorder.record(&TraceEvent::RecurTileIterationExec(recur_call(
             "recur",
             raster_core::draft::RecurControlKind::Continue,
         )));
-        let site_end_before_close = recorder.record(TraceEvent::RecurTileIterationExec(
+        let site_end_before_close = recorder.record(&TraceEvent::RecurTileIterationExec(
             recur_call("recur", raster_core::draft::RecurControlKind::Continue),
         ));
 
@@ -2460,13 +2454,13 @@ mod tests {
         let mut recorder = recorder_with_recur_site();
         start_main(&mut recorder);
         let start = seed_recur_source(&mut recorder, "recur", 3);
-        recorder.record(TraceEvent::RecurTileStart(start));
-        recorder.record(TraceEvent::RecurTileIterationExec(recur_call(
+        recorder.record(&TraceEvent::RecurTileStart(start));
+        recorder.record(&TraceEvent::RecurTileIterationExec(recur_call(
             "recur",
             raster_core::draft::RecurControlKind::Continue,
         )));
         // Only one of three elements covered, and no Break.
-        recorder.record(TraceEvent::RecurTileEnd(site_end("recur")));
+        recorder.record(&TraceEvent::RecurTileEnd(site_end("recur")));
     }
 
     #[test]
@@ -2514,23 +2508,23 @@ mod tests {
         let mut recorder = recorder_with_recur_site();
         start_main(&mut recorder);
         let __start = seed_recur_source(&mut recorder, "recur", 1);
-        recorder.record(TraceEvent::RecurTileStart(__start));
-        let tile_iteration = recorder.record(TraceEvent::RecurTileIterationExec(recur_call(
+        recorder.record(&TraceEvent::RecurTileStart(__start));
+        let tile_iteration = recorder.record(&TraceEvent::RecurTileIterationExec(recur_call(
             "recur",
             raster_core::draft::RecurControlKind::Continue,
         )));
-        let tile_site = recorder.record(TraceEvent::RecurTileEnd(site_end("recur")));
-        let tile = recorder.record(TraceEvent::TileExec(call("after")));
+        let tile_site = recorder.record(&TraceEvent::RecurTileEnd(site_end("recur")));
+        let tile = recorder.record(&TraceEvent::TileExec(call("after")));
 
         // Sequence family, same shape: iterations first, then the site.
         let mut recorder = recorder_with_recur_sequence_site();
         start_main(&mut recorder);
         let __start = seed_recur_source(&mut recorder, "child", 1);
-        recorder.record(TraceEvent::RecurSequenceStart(__start));
-        let iter_start = recorder.record(TraceEvent::RecurSequenceIterationStart(call("child")));
-        let iter_tile = recorder.record(TraceEvent::TileExec(call("inner")));
-        let iter_end = recorder.record(TraceEvent::RecurSequenceIterationEnd(call("child")));
-        let seq_site = recorder.record(TraceEvent::RecurSequenceEnd(site_end("child")));
+        recorder.record(&TraceEvent::RecurSequenceStart(__start));
+        let iter_start = recorder.record(&TraceEvent::RecurSequenceIterationStart(call("child")));
+        let iter_tile = recorder.record(&TraceEvent::TileExec(call("inner")));
+        let iter_end = recorder.record(&TraceEvent::RecurSequenceIterationEnd(call("child")));
+        let seq_site = recorder.record(&TraceEvent::RecurSequenceEnd(site_end("child")));
 
         // Items land at their sequence's coordinates, [s].
         assert_row(&tile, "Exec(Tile)", &[2]);
@@ -2601,9 +2595,9 @@ mod tests {
         let (mut recorder, _) = recorder_with_object_site();
         start_main(&mut recorder);
         let start = seed_recur_source(&mut recorder, "recur", 0);
-        recorder.record(TraceEvent::RecurTileStart(start));
+        recorder.record(&TraceEvent::RecurTileStart(start));
         // Zero iterations: the object must be the empty one; this is not.
-        recorder.record(TraceEvent::RecurTileEnd(site_end("recur")));
+        recorder.record(&TraceEvent::RecurTileEnd(site_end("recur")));
     }
 
     /// A sweep of N iterations is one authenticated append: the iterations
@@ -2613,17 +2607,17 @@ mod tests {
         let mut recorder = recorder_with_recur_site();
         start_main(&mut recorder);
         let start = seed_recur_source(&mut recorder, "recur", 5);
-        recorder.record(TraceEvent::RecurTileStart(start));
+        recorder.record(&TraceEvent::RecurTileStart(start));
         let before = recorder.storage.snapshot().frontier.position;
         for _ in 0..5 {
-            let iteration = recorder.record(TraceEvent::RecurTileIterationExec(recur_call(
+            let iteration = recorder.record(&TraceEvent::RecurTileIterationExec(recur_call(
                 "recur",
                 raster_core::draft::RecurControlKind::Continue,
             )));
             assert!(iteration.output_commitment().unwrap().is_empty());
         }
         assert_eq!(recorder.storage.snapshot().frontier.position, before);
-        recorder.record(TraceEvent::RecurTileEnd(site_end("recur")));
+        recorder.record(&TraceEvent::RecurTileEnd(site_end("recur")));
         assert_eq!(recorder.storage.snapshot().frontier.position, before + 1);
     }
 }

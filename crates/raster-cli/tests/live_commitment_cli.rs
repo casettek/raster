@@ -353,8 +353,8 @@ fn assert_live_evidence(
     while !remaining.is_empty() {
         let size = u32::from_le_bytes(remaining[..4].try_into().unwrap()) as usize;
         let event: TraceEvent = postcard::from_bytes(&remaining[4..4 + size]).unwrap();
-        let step = recorder.record(event.clone());
-        assert_eq!(step, recorded.record(event));
+        let step = recorder.record(&event);
+        assert_eq!(step, recorded.record(&event));
         records.push(step);
         remaining = &remaining[4 + size..];
     }

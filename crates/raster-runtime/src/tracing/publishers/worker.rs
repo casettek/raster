@@ -6,6 +6,9 @@
 //! publisher that panics stops the program at its next event or at `finish`,
 //! with the publisher's own panic, so a failed recorder never lets a run end as
 //! if it had succeeded.
+//!
+//! The publisher hands each event back once it has recorded it, and the program
+//! frees it: memory is cheapest to free on the thread that allocated it.
 use super::Publisher;
 use raster_core::trace::TraceEvent;
 use std::sync::{mpsc, Mutex};
@@ -25,6 +28,8 @@ enum Message {
 pub struct WorkerPublisher {
     sender: Mutex<Option<mpsc::SyncSender<Message>>>,
     worker: Mutex<Option<JoinHandle<()>>>,
+    /// Events the publisher is done with, to be freed on the program's thread.
+    spent: Mutex<mpsc::Receiver<TraceEvent>>,
 }
 
 impl WorkerPublisher {
@@ -40,6 +45,9 @@ impl WorkerPublisher {
             .filter(|capacity| *capacity > 0)
             .unwrap_or(DEFAULT_QUEUE);
         let (sender, receiver) = mpsc::sync_channel(capacity);
+        // Unbounded, but drained at every event the program sends, so it holds
+        // about as many events as the queue does.
+        let (spend, spent) = mpsc::channel();
         let worker = std::thread::Builder::new()
             .name("raster-instrumentation".into())
             // The recorder recurses over the program's structure; give it the
@@ -48,7 +56,13 @@ impl WorkerPublisher {
             .spawn(move || {
                 for message in receiver {
                     match message {
-                        Message::Event(event) => inner.publish(event),
+                        Message::Event(event) => {
+                            if let Some(event) = inner.publish_returning(event) {
+                                // Gone only once the program stopped listening:
+                                // then this thread frees it.
+                                let _ = spend.send(event);
+                            }
+                        }
                         Message::Finish => return inner.finish(),
                     }
                 }
@@ -57,6 +71,7 @@ impl WorkerPublisher {
         Self {
             sender: Mutex::new(Some(sender)),
             worker: Mutex::new(Some(worker)),
+            spent: Mutex::new(spent),
         }
     }
 
@@ -71,6 +86,16 @@ impl WorkerPublisher {
             self.join();
             panic!("the instrumentation thread stopped before the program finished");
         }
+        self.free_spent();
+    }
+
+    /// Free, here on the program's thread, the events the publisher is done with.
+    fn free_spent(&self) {
+        self.spent
+            .lock()
+            .expect("instrumentation spent events")
+            .try_iter()
+            .for_each(drop);
     }
 
     /// Wait for the thread, re-raising its panic on the program's thread.
@@ -91,5 +116,6 @@ impl Publisher for WorkerPublisher {
         self.send(Message::Finish);
         drop(self.sender.lock().expect("instrumentation sender").take());
         self.join();
+        self.free_spent();
     }
 }

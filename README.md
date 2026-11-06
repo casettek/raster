@@ -163,6 +163,12 @@ not spill to disk. Memory use can grow with the program. The finished commitment
 is published only after successful execution. Normal output artifacts are still
 written. No raw trace is saved by default.
 
+The recording runs on its own thread, alongside the program, for live commits,
+live audits and recorded traces. `RASTER_INSTRUMENTATION_THREAD=0` keeps it on
+the program's thread, and `RASTER_INSTRUMENTATION_QUEUE` sets how many events
+may wait between the two (default 1024). Profiling and selective capture always
+record on the program's thread.
+
 Add `--save-trace` to retain `trace.bin` (or `--trace-format json` for
 `trace.ndjson`) for debugging, `trace commit`, or `trace audit`. Recording a trace
 still builds the commitment live. Plain `run` and deliberate fraud injection retain their recorded-execution paths. Without a saved

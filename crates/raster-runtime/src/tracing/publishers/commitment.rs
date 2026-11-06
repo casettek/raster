@@ -60,6 +60,10 @@ impl CommitmentPublisher {
 
 impl Publisher for CommitmentPublisher {
     fn publish(&self, event: TraceEvent) {
+        self.publish_returning(event);
+    }
+
+    fn publish_returning(&self, event: TraceEvent) -> Option<TraceEvent> {
         let mut state = self.state.lock().expect("commitment publisher lock");
         assert!(
             state.builder.is_some() && !state.completed,
@@ -72,7 +76,7 @@ impl Publisher for CommitmentPublisher {
         }
         state.started = true;
         state.completed = matches!(&event, TraceEvent::ProgramEnd(_));
-        let step = state.recorder.record(event);
+        let step = state.recorder.record(&event);
         if state.selective {
             crate::selective_profile::on_step(&step, &state.recorder)
                 .expect("collect selective profile");
@@ -84,6 +88,7 @@ impl Publisher for CommitmentPublisher {
             .unwrap()
             .push(step)
             .expect("update commitment");
+        Some(event)
     }
     fn finish(&self) {
         let mut state = self.state.lock().expect("commitment publisher lock");

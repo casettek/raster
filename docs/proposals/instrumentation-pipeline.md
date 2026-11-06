@@ -251,6 +251,60 @@ interleaved, four runs each:
   time (0.19 s in stage 0): the instrumentation is hidden.
 - **Memory:** +3–4 MB peak (the queue of in-flight events and the second stack).
 
+## Consumer profile after stage 1 (2026-11-06)
+
+Phase timers on the consumer (bench-only, `~/.cache/raster-mem-bench`), hello-tiles 20k, worker on:
+
+- **The consumer is saturated.** Commit: busy 2.79 s of 3.09 s, idle 0.27 s. Audit: busy 3.68 s of
+  3.81 s, idle 0.10 s. The program spends 0.54 s (commit) and 1.30 s (audit) blocked on a full
+  queue. Consumer cost is now the wall-clock bound.
+- **Where the consumer's time goes** (audit): `record` 1.86 s, of which the storage append is
+  0.67 s (journaled index insert 0.42 s, root 0.18 s). The trace-tree append is 0.61 s (~32
+  SHA-256 per step, inherent). Capturing window I/O is 0.37 s, source witnesses 0.19 s, the step
+  hash 0.12 s. Commit: `record` 1.69 s, commitment builder 1.03 s (trace-tree root 0.64 s, hash
+  0.29 s).
+- **The event's own lifecycle is the largest avoidable cost inside `record`:**
+  - **Two full copies of every event.** `record` matches on `event.clone()`, and the witness store
+    gets another `event.clone()`, which in commit mode it discards unused. 0.10 + 0.10 s, plus
+    freeing them.
+  - **Cross-thread frees.** The program allocates each event and the worker frees it. With the
+    worker on, the gap between `record` measured from outside and its body is 0.41 s; with it off,
+    0.07 s. About 0.34 s per run, ~1.6 µs per event, is glibc freeing memory another thread
+    allocated.
+- **Per event type:** `TileExec` 80,043 × 12.2 µs (storage append included), recur-tile iterations
+  50,002 × 5.2 µs, recur-sequence iteration start and end 40,000 × 3.6 µs and 2.3 µs.
+
+**Cheap fixes this points to:**
+1. Match on `&event` and **move** the event into the witness store at the end, only when the store
+   keeps it. That's zero copies instead of two.
+2. Don't free events on the worker. Either hand each consumed event back to the program's thread to
+   drop (the program has slack: it waits on the queue anyway), or use an allocator built for
+   cross-thread frees. The first needs no new dependency.
+
+Together these are ~0.5–0.6 s of a ~3.1 s commit consumer (~15–20%). After them, the remaining cost
+is real work: storage append, the trace tree, input commitments, draft bookkeeping. The next step
+is then the consumer split (recorder stage and trace stage).
+
+**Done, as built:**
+1. `TraceRecorder::record` and `StepWitnessStore::insert` take `&TraceEvent`. The store already
+   copied each field it keeps, so moving the event into it would have saved nothing. Recording
+   copies no event, and the caller keeps it.
+2. `Publisher::publish_returning` hands the event back once it is recorded. The commitment and
+   audit publishers implement it. `WorkerPublisher` sends returned events back over a second,
+   unbounded channel, which the program drains each time it sends an event and once more at
+   `finish`, so each event is freed on the thread that allocated it.
+
+Measured on hello-tiles 20k, five interleaved runs each, median, against the stage 1 binary:
+
+| | stage 1 | + fixes |
+|---|---|---|
+| commit wall / CPU | 2.96 s / 5.23 s | 2.37 s / 4.24 s (−20% / −19%) |
+| audit wall / CPU | 3.75 s / 6.23 s | 3.18 s / 5.42 s (−15% / −13%) |
+| peak RSS | 150 / 167 MB | 152 / 170 MB |
+
+`commit.bin` and the honest-audit handoff are byte-identical. The divergence handoff matches on
+canonical comparison (128 window steps, 128 io entries, 96 source witnesses).
+
 ## Risks and open questions
 
 - **The storage rewrite (stage 3)** is the main cost and risk. Today's store is heap structures:

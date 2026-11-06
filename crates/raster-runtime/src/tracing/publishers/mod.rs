@@ -17,5 +17,12 @@ pub(crate) static GLOBAL_PUBLISHER: OnceLock<Box<dyn Publisher>> = OnceLock::new
 pub trait Publisher: Send + Sync {
     fn publish(&self, event: TraceEvent);
 
+    /// [`Self::publish`], handing the event back when the publisher keeps none
+    /// of it, so the caller frees it on its own thread.
+    fn publish_returning(&self, event: TraceEvent) -> Option<TraceEvent> {
+        self.publish(event);
+        None
+    }
+
     fn finish(&self);
 }

@@ -637,7 +637,7 @@ pub(crate) fn commit_trace_file(
     let mut started = false;
     let mut completed = false;
     read_trace_events(trace_path, format, |event| {
-        let step = recorder.record(event);
+        let step = recorder.record(&event);
         if completed || (!started && !matches!(step.kind, StepKind::ProgramStart(_))) {
             return Err(Error::Other(
                 "trace is missing program start or has events after completion".into(),
@@ -661,7 +661,7 @@ fn record_trace_event(
     trace_recorder: &mut TraceRecorder,
     event: TraceEvent,
 ) {
-    let step_record = trace_recorder.record(event);
+    let step_record = trace_recorder.record(&event);
     trace.push(step_record);
 }
 
