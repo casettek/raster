@@ -542,7 +542,7 @@ mod tests {
 Replay profile — RISC Zero executor, no proving
   Run: run-42
   Status: PARTIAL — stopped at the failure below
-  Calls: top 10 per tile by input + output bytes; 4 of 8 replayed
+  Calls: up to 10 per selected tile by input + output bytes; 4 of 8 replayed
   Cycles are guest user cycles, including the tile wrapper (input decode and hash, output encode).
   Exec: executor wall time on the measuring machine, release build.
 
