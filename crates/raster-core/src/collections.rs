@@ -893,11 +893,18 @@ struct BytesPageWire {
 /// `serialize` from cloning the whole page payload. The struct *name* differs
 /// and is not observable: postcard ignores struct names, and so does
 /// [`bytes_page_parts`].
+///
+/// `bytes` goes out as a byte buffer, not as a sequence of `u8`, for the same
+/// reason [`BytesPageWire`] reads it as one: element by element, encoding a
+/// page cost far more than copying it. postcard and bincode write both forms as
+/// a length and the raw bytes, and JSON as an array of numbers, so the encoding
+/// is unchanged.
 #[derive(Serialize)]
 struct BytesPageWireRef<'a> {
     index: u64,
     offset: u64,
     len: u64,
+    #[serde(with = "serde_bytes")]
     bytes: &'a [u8],
 }
 
@@ -1382,6 +1389,45 @@ mod tests {
         .unwrap();
         assert_eq!(postcard::to_allocvec(&page).unwrap(), sequence);
         assert!(page == postcard::from_bytes::<BytesPage>(&sequence).unwrap());
+    }
+
+    /// Writing `bytes` as a byte buffer must not change a page in any format it
+    /// is stored or traced in. 300 bytes so postcard's length takes two bytes.
+    #[cfg(feature = "std")]
+    #[test]
+    fn bytes_page_encodes_as_the_sequence_struct_in_every_format() {
+        #[derive(Serialize)]
+        struct SequenceWire {
+            index: u64,
+            offset: u64,
+            len: u64,
+            bytes: Vec<u8>,
+        }
+        let payload: Vec<u8> = (0..300u32).map(|i| (i * 7) as u8).collect();
+        let page = BytesPage::__from_parts(3, 1200, payload.clone());
+        let sequence = SequenceWire {
+            index: 3,
+            offset: 1200,
+            len: 300,
+            bytes: payload,
+        };
+        assert_eq!(
+            postcard::to_allocvec(&page).unwrap(),
+            postcard::to_allocvec(&sequence).unwrap()
+        );
+        assert_eq!(
+            bincode::serialize(&page).unwrap(),
+            bincode::serialize(&sequence).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_string(&page).unwrap(),
+            serde_json::to_string(&sequence).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_string_pretty(&page).unwrap(),
+            serde_json::to_string_pretty(&sequence).unwrap()
+        );
+        assert_eq!(bytes_page_parts(&page).unwrap().bytes, sequence.bytes);
     }
 
     #[test]

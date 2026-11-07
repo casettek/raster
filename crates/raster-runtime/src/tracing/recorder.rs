@@ -6,7 +6,7 @@ use raster_core::draft::DraftTransitionWitness;
 use raster_core::input::{SelectionPayloadKind, SelectionWitness, SelectorPath, StorageRef};
 use raster_core::recur_progress::{DraftStep, RecurProgressStack, RecurSiteKind, SiteDraft};
 use raster_core::trace::{
-    ExecStep, ExecTarget, FnInput, ProgramEndStep, ProgramStartStep, RecurEndStep, RecurStartStep,
+    ExecStep, ExecTarget, FnInput, FnInputValue, ProgramEndStep, ProgramStartStep, RecurEndStep, RecurStartStep,
     StepKind, StepRecord, StorageData, StorageInput, StorageRoots, TraceEvent,
 };
 use sha2::{Digest, Sha256};
@@ -101,9 +101,13 @@ impl SequenceCallstack {
     }
 }
 
+/// What the recorder keeps of a step for its evidence. Serialized only into
+/// the run's own scratch archive, never read by another version.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StepWitnessData {
-    input_data: Option<Vec<u8>>,
+    /// The step's input, and with it the input bytes (`FnInput::data`): kept
+    /// once, not also as a copy beside it. On a model stage those bytes are
+    /// most of the entry, and a live audit holds a window of entries.
     input_source_witness: Option<FnInput>,
     output_data: Option<Vec<u8>>,
     storage_input: StorageInput,
@@ -113,7 +117,9 @@ pub struct StepWitnessData {
 
 impl StepWitnessData {
     pub fn input_data(&self) -> Option<Vec<u8>> {
-        self.input_data.clone()
+        self.input_source_witness
+            .as_ref()
+            .map(|input| input.data().to_vec())
     }
 
     pub fn output_data(&self) -> Option<Vec<u8>> {
@@ -172,7 +178,6 @@ impl StepWitnessStore {
                 self.put(
                     coordinates,
                     StepWitnessData {
-                        input_data: trace_item.input.as_ref().map(|input| input.data().to_vec()),
                         input_source_witness: trace_item.input.clone(),
                         output_data: None,
                         storage_input: trace_item
@@ -198,7 +203,6 @@ impl StepWitnessStore {
                 self.put(
                     coordinates,
                     StepWitnessData {
-                        input_data: None,
                         input_source_witness: None,
                         output_data: trace_item.output.as_ref().map(|output| output.data.clone()),
                         storage_input: StorageInput::new(),
@@ -211,7 +215,6 @@ impl StepWitnessStore {
                 self.put(
                     coordinates,
                     StepWitnessData {
-                        input_data: trace_item.input.as_ref().map(|input| input.data().to_vec()),
                         input_source_witness: trace_item.input.clone(),
                         output_data: trace_item
                             .output
@@ -231,7 +234,6 @@ impl StepWitnessStore {
                 self.put(
                     coordinates,
                     StepWitnessData {
-                        input_data: trace_item.input.as_ref().map(|input| input.data().to_vec()),
                         input_source_witness: trace_item.input.clone(),
                         output_data: trace_item
                             .output
@@ -255,7 +257,6 @@ impl StepWitnessStore {
                 self.put(
                     coordinates,
                     StepWitnessData {
-                        input_data: None,
                         input_source_witness: None,
                         output_data: None,
                         storage_input: StorageInput::new(),
@@ -279,6 +280,24 @@ impl StepWitnessStore {
             return memory.get(coordinates).cloned();
         }
         self.reference(coordinates).map(Self::read)
+    }
+
+    /// The entry's input source witness alone: in memory, without copying
+    /// the rest of the entry (its input bytes, often the bulk of it).
+    fn input_source_witness_at(&self, coordinates: &CfsCoordinates) -> Option<FnInput> {
+        if let Some(memory) = &self.2 {
+            return memory.get(coordinates)?.input_source_witness.clone();
+        }
+        self.get(coordinates)?.input_source_witness
+    }
+
+    /// The entry, moved out when `release` (the step is done with it), else
+    /// copied. Only the in-memory store releases entries.
+    fn take_or_get(&mut self, coordinates: &CfsCoordinates, release: bool) -> Option<StepWitnessData> {
+        match &mut self.2 {
+            Some(memory) if release => memory.remove(coordinates),
+            _ => self.get(coordinates),
+        }
     }
 
     fn reference(&self, coordinates: &CfsCoordinates) -> Option<raster_prover::archive::Blob> {
@@ -308,8 +327,75 @@ impl StepWitnessStore {
     }
 }
 
+/// SHA-256 of [`FnInput::source_witness_bytes`], which the transition guest
+/// hashes too, computed without building those bytes: the encoding streams
+/// into the hasher. `source_witness_bytes` clones the values and the storage
+/// map, then encodes each inline value one element at a time; on a model stage
+/// that cost more than the hash. [`SourceValue`] writes an inline value as one
+/// byte buffer instead, which postcard encodes the same way.
 fn input_source_commitment(input: &FnInput) -> Vec<u8> {
-    Sha256::digest(input.source_witness_bytes()).to_vec()
+    let witness = (SourceValues(&input.values), &input.storage);
+    raster_core::postcard::serialize_with_flavor(&witness, HashFlavor(Sha256::new()))
+        .unwrap_or_else(|_| Sha256::digest([]).to_vec())
+}
+
+/// A postcard output that hashes what it is given instead of keeping it.
+struct HashFlavor(Sha256);
+
+impl raster_core::postcard::ser_flavors::Flavor for HashFlavor {
+    type Output = Vec<u8>;
+
+    fn try_push(&mut self, data: u8) -> raster_core::postcard::Result<()> {
+        self.0.update([data]);
+        Ok(())
+    }
+
+    fn try_extend(&mut self, data: &[u8]) -> raster_core::postcard::Result<()> {
+        self.0.update(data);
+        Ok(())
+    }
+
+    fn finalize(self) -> raster_core::postcard::Result<Vec<u8>> {
+        Ok(self.0.finalize().to_vec())
+    }
+}
+
+/// `FnInput::values` as `#[derive(Serialize)]` writes it, but with each
+/// inline value's bytes as a byte buffer.
+struct SourceValues<'a>(&'a [FnInputValue]);
+
+impl Serialize for SourceValues<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.0.iter().map(SourceValue))
+    }
+}
+
+struct SourceValue<'a>(&'a FnInputValue);
+
+struct InlineBytes<'a>(&'a [u8]);
+
+impl Serialize for InlineBytes<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_bytes(self.0)
+    }
+}
+
+impl Serialize for SourceValue<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        // The derive's names and indices, in declaration order. Exhaustive, so
+        // a new variant fails to compile here rather than hashing differently.
+        match self.0 {
+            FnInputValue::Inline(bytes) => serializer.serialize_newtype_variant(
+                "FnInputValue",
+                0,
+                "Inline",
+                &InlineBytes(bytes),
+            ),
+            FnInputValue::StorageBinding => {
+                serializer.serialize_unit_variant("FnInputValue", 1, "StorageBinding")
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -433,15 +519,35 @@ impl TraceRecorder {
     pub fn live_recur_progress(&self) -> RecurProgressStack {
         self.recur_progress.clone()
     }
+    /// Whether [`Self::release_live_step`] drops the step's own entry. A
+    /// scope's `Start` entry stays: its children read their scope from it,
+    /// and its `End` releases it.
+    fn releases_own_entry(step: &StepRecord) -> bool {
+        !matches!(
+            &step.kind,
+            StepKind::ProgramStart(_) | StepKind::SequenceStart { .. } | StepKind::RecurStart(_)
+        )
+    }
+
+    /// [`Self::step_witness_for`] and [`Self::sequence_scope_for`], then
+    /// [`Self::release_live_step`], for a live audit's window. The step's
+    /// entry is moved out instead of copied when the release would drop it.
+    pub fn take_live_step_io(&mut self, step: &StepRecord) -> (Option<StepWitnessData>, Option<FnInput>) {
+        let scope = self.sequence_scope_for(step);
+        let witness = if self.witness_store.2.is_some() {
+            self.witness_store
+                .take_or_get(step.coordinates(), Self::releases_own_entry(step))
+        } else {
+            self.step_witness_for(step)
+        };
+        self.release_live_step(step);
+        (witness, scope)
+    }
+
     pub fn release_live_step(&mut self, step: &StepRecord) {
         if let Some(memory) = &mut self.witness_store.2 {
-            match &step.kind {
-                StepKind::ProgramStart(_)
-                | StepKind::SequenceStart { .. }
-                | StepKind::RecurStart(_) => {}
-                _ => {
-                    memory.remove(step.coordinates());
-                }
+            if Self::releases_own_entry(step) {
+                memory.remove(step.coordinates());
             }
             if matches!(
                 &step.kind,
@@ -485,7 +591,7 @@ impl TraceRecorder {
     pub fn input_data_at(&self, coordinates: &CfsCoordinates) -> Option<Option<Vec<u8>>> {
         self.witness_store
             .get(coordinates)
-            .map(|trace_io| trace_io.input_data.clone())
+            .map(|trace_io| trace_io.input_data())
     }
 
     pub fn output_data_at(&self, coordinates: &CfsCoordinates) -> Option<Option<Vec<u8>>> {
@@ -513,8 +619,7 @@ impl TraceRecorder {
             return step
                 .coordinates()
                 .try_parent()
-                .and_then(|(parent, _)| self.witness_store.get(&parent))
-                .and_then(|w| w.input_source_witness());
+                .and_then(|(parent, _)| self.witness_store.input_source_witness_at(&parent));
         }
         self.execution_witnesses
             .as_ref()?
@@ -554,7 +659,7 @@ impl TraceRecorder {
     ) -> Option<(Option<Vec<u8>>, Option<Vec<u8>>)> {
         self.witness_store
             .get(coordinates)
-            .map(|trace_io| (trace_io.input_data.clone(), trace_io.output_data.clone()))
+            .map(|trace_io| (trace_io.input_data(), trace_io.output_data.clone()))
     }
 
     /// The storage roots to record for a step that did (or did not)
@@ -1701,6 +1806,48 @@ mod tests {
     };
     use raster_core::trace::FnCallRecord;
 
+    /// The streamed commitment must hash exactly the bytes the transition guest
+    /// hashes, `source_witness_bytes`: inline values of every size (postcard's
+    /// length prefix grows at 128), storage bindings, and storage entries.
+    #[test]
+    fn input_source_commitment_hashes_the_source_witness_bytes() {
+        let binding = StorageData {
+            coordinates: CfsCoordinates(vec![3, -2, 7]),
+            commitment: vec![9; 32],
+            selector: SelectorPath::default(),
+            selection: Default::default(),
+        };
+        let inputs = [
+            (Vec::new(), StorageInput::new()),
+            (vec![FnInputValue::StorageBinding], StorageInput::new()),
+            (
+                vec![
+                    FnInputValue::Inline(Vec::new()),
+                    FnInputValue::Inline(vec![1, 2, 255]),
+                    FnInputValue::StorageBinding,
+                    FnInputValue::Inline((0..300u32).map(|i| i as u8).collect()),
+                    FnInputValue::Inline(vec![7; 25_000]),
+                ],
+                StorageInput::from([
+                    ("page".to_string(), binding.clone()),
+                    ("row".to_string(), binding),
+                ]),
+            ),
+        ];
+        for (values, storage) in inputs {
+            let input = FnInput {
+                data: vec![1, 2, 3],
+                values,
+                args: Vec::new(),
+                storage,
+            };
+            assert_eq!(
+                input_source_commitment(&input),
+                Sha256::digest(input.source_witness_bytes()).to_vec()
+            );
+        }
+    }
+
     /// A site `Start` event carrying a real source binding.
     ///
     /// A recur site opens against an authenticated source: `Start` records the
@@ -2302,6 +2449,61 @@ mod tests {
         let step = recorder.record(&TraceEvent::RecurTileEnd(site_end("recur")));
         recorder.release_live_step(&step);
         assert!(recorder.active_recur.is_none());
+    }
+
+    /// `take_live_step_io` must give a live audit exactly what capturing and
+    /// then releasing gave — the step's I/O and its scope — and leave the
+    /// store as the release did, across a site's start, iterations and end.
+    #[test]
+    fn taking_live_step_io_matches_capture_then_release() {
+        let live = || {
+            let mut recorder = recorder_with_recur_site();
+            recorder.witness_store = StepWitnessStore(None, true, Some(HashMap::new()));
+            recorder.execution_witnesses = None;
+            recorder.recur_progress_store = None;
+            recorder.storage = StorageLedger::owning(crate::WorkingStorage::Memory);
+            start_main(&mut recorder);
+            recorder
+        };
+        let (mut copying, mut taking) = (live(), live());
+        let start = seed_recur_source(&mut copying, "recur", 3);
+        assert!(start.input.is_some());
+        let taken_start = seed_recur_source(&mut taking, "recur", 3);
+        let mut events = vec![(
+            TraceEvent::RecurTileStart(start),
+            TraceEvent::RecurTileStart(taken_start),
+        )];
+        for control in [
+            raster_core::draft::RecurControlKind::Continue,
+            raster_core::draft::RecurControlKind::Continue,
+            raster_core::draft::RecurControlKind::Continue,
+        ] {
+            let event = TraceEvent::RecurTileIterationExec(recur_call("recur", control));
+            events.push((event.clone(), event));
+        }
+        let end = TraceEvent::RecurTileEnd(site_end("recur"));
+        events.push((end.clone(), end));
+
+        let encode = |witness: &Option<StepWitnessData>| raster_core::bincode::serialize(witness).unwrap();
+        let keys = |recorder: &TraceRecorder| {
+            let mut keys: Vec<_> = recorder.witness_store.2.as_ref().unwrap().keys().cloned().collect();
+            keys.sort();
+            keys
+        };
+        for (copied_event, taken_event) in events {
+            let step = copying.record(&copied_event);
+            let copied = (copying.step_witness_for(&step), copying.sequence_scope_for(&step));
+            copying.release_live_step(&step);
+
+            let taken_step = taking.record(&taken_event);
+            assert_eq!(taken_step, step);
+            let taken = taking.take_live_step_io(&taken_step);
+
+            assert!(copied.0.is_some(), "{:?} has recorded I/O", step.kind);
+            assert_eq!(encode(&taken.0), encode(&copied.0), "{:?}", step.kind);
+            assert_eq!(taken.1, copied.1, "{:?}", step.kind);
+            assert_eq!(keys(&taking), keys(&copying), "{:?}", step.kind);
+        }
     }
 
     #[test]

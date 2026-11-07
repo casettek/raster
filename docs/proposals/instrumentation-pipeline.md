@@ -561,10 +561,103 @@ queued event holds a weight page. At the old default of 1024 events the commit r
 (3.52–3.67 s) but peaked at 415 MB, against 268 MB at 64. The default is now 64; hello-tiles runs
 the same with it.
 
-What's left: the worker's encoding writes a page one byte at a time. Serializing
-`BytesPageWireRef.bytes` as a byte buffer (`serde_bytes`, as `806e8e2` did for decoding) would
-make it a copy. The wire bytes stay the same, but tile ids would move (they did for the decode
-fix), and `bytes_page_parts` would have to accept `serialize_bytes`.
+**Done: pages encode as a byte buffer (2026-11-07).** After option b the worker spent its time
+writing pages one byte at a time. `BytesPageWireRef.bytes` now serializes with `serde_bytes`, as
+`806e8e2` did for decoding. A 215 KB page encodes in 3.4 µs instead of 230 µs; hashing it
+(92 µs) is now most of what's left of an input.
+- The encoding is unchanged. postcard and bincode write a byte buffer and a `u8` sequence alike, as
+  a length and the raw bytes, and JSON writes both as an array of numbers. A new test checks all
+  three, with `postcard_wire_is_pinned` still passing. `risc0_zkvm::serde` would differ, but it
+  encodes only journals, which hold no pages. `bytes_page_parts` already accepted
+  `serialize_bytes`, and the tree serializer intercepts pages by name before reaching it.
+- No example tile id moved (the six locks change only `guest_inputs`), and the transition,
+  authorization, chain-fraud and defence guest ids are unchanged (`methods.rs` was not rewritten).
+
+Three-way A/B, as above (a third pair: option b plus this), five interleaved runs each, median:
+
+| | base `93fe38f` | + option b | + byte-buffer pages |
+| --- | --- | --- | --- |
+| Gemma `prefill_range_l0`, unauthenticated | 1.04 s | 1.04 s | 0.77 s (−26%) |
+| Gemma, live commit | 4.49 s, 257 MB | 3.60 s, 268 MB | 1.81 s, 257 MB (−60%) |
+| Gemma, live audit | 4.51 s, 313 MB | 4.25 s, 325 MB | 2.34 s, 325 MB (−48%) |
+| hello-tiles 20k, live commit | 2.42 s | 2.44 s | 2.42 s |
+| hello-tiles 20k, live audit | 3.36 s | 3.31 s | 3.33 s |
+
+Ranges were within ±0.1 s of the median except one base audit at 4.71 s. All commitments and
+honest-audit handoffs are byte-identical (15 of each per workload). The unauthenticated run gains
+too, so the program also encodes pages somewhere, probably in the recur state carrying the
+accumulator page; not broken down.
+
+**Profile after byte-buffer pages (2026-11-07).** Timers on the current code (a fourth pair,
+`ab/prof`), Gemma `prefill_range_l0`, WoW running at load 5, so read the split:
+- **Commit is bound by the program thread**: it waits on the queue 15 ms in 1.86 s. Of its time,
+  0.80 s is SHA-256 of each selected weight page (the selection commitment, authenticated runs
+  only); the rest is about what an unauthenticated run does. The worker hashes `data` (0.90 s),
+  runs `input_source_commitment` (0.39 s), and idles 0.39 s.
+- **Audit is bound by the worker**: the same two, plus 0.39 s capturing window I/O for every step.
+  The program waits 0.33 s on a full queue.
+- Each page is hashed twice, once per thread, over different preimages (the selection hashes the
+  page; `input_commitment` hashes the encoded arguments). Neither is removable without a protocol
+  change.
+
+**Done: `input_source_commitment` streams into the hasher (2026-11-07).** It hashed
+`source_witness_bytes()`, which clones the values and the storage map and encodes each inline
+value one element at a time: about 25 KB per Gemma step, 29 µs of encoding against 12 µs of
+hashing. The recorder now serializes borrowed values straight into SHA-256 through a postcard
+`Flavor`, writing inline bytes as one buffer. The bytes hashed are unchanged; the transition guest
+still calls `source_witness_bytes`, and a test checks the two agree. Host only: no guest, id or
+lock changes.
+
+Seven interleaved runs each, median, with WoW running (paired comparison only):
+
+| | byte-buffer pages | + streamed `input_source_commitment` |
+| --- | --- | --- |
+| Gemma, live commit | 1.86 s, CPU 3.28 s | 1.88 s, CPU 3.08 s |
+| Gemma, live audit | 2.44 s, CPU 4.29 s | 2.17 s, CPU 3.96 s (−11%) |
+| hello-tiles 20k, live commit | 2.55 s | 2.51 s |
+| hello-tiles 20k, live audit | 3.42 s | 3.34 s |
+
+As the profile predicted, the commit's wall time doesn't move (the program thread is its bound),
+while the worker-bound audit gains. Commitments and handoffs are byte-identical (14 of each).
+
+**Done: the audit moves a step's I/O into its window instead of copying it (2026-11-07).** Timers
+on the capture (`ab/prof`) showed three copies of each step's recorded I/O. The store builds an
+entry holding the encoded arguments twice (as `input_data` and inside `input_source_witness`);
+`capture_step_io` cloned that entry whole, about 433 KB per Gemma step and 34.7 µs; the scope
+lookup cloned the whole parent entry to read one field (1.23 µs per hello-tiles step, its largest
+capture cost); and `release_live_step` then dropped the store's entry. 97.6% of Gemma's steps and
+81% of hello-tiles' are released right after capture; the rest are `Start` steps, which stay.
+- `TraceRecorder::take_live_step_io` captures and releases in one call: it moves the entry out of
+  the store when the release would drop it, and copies it otherwise. Both use one rule,
+  `releases_own_entry`. The scope lookup clones only the parent's `FnInput`. The audit calls
+  `take_step_io` instead of `capture_step_io` and `release_live_step`.
+- A recorder test checks the taken I/O, scope and remaining store against capture-then-release
+  across a recur site's start, iterations and end.
+- Fault handoffs are canonically equal before and after (`cmp_handoff`) for five faults: two in
+  hello-tiles' default run (a tile and a recur iteration, 32-step windows), one deep in hello-tiles
+  20k, and an early and a deep one in Gemma. An executor replay of one gives identical tile cycles.
+
+Seven interleaved runs each, median, with WoW running (paired comparison only):
+
+| live audit | before | after |
+| --- | --- | --- |
+| Gemma `prefill_range_l0` | 2.14 s, CPU 3.90 s, 323 MB | 1.92 s, CPU 3.54 s, 314 MB (−10%) |
+| hello-tiles 20k | 3.40 s, CPU 5.86 s | 3.13 s, CPU 5.44 s (−8%) |
+
+**Done: the encoded arguments are kept once per step (2026-11-07).** `StepWitnessData.input_data`
+always equalled `input_source_witness.data`: every entry sets both from the same `FnInput`, or
+neither. The field is gone, and `input_data()` reads the bytes from the source witness. The
+entry's bincode form goes only into the run's own scratch archive (a `TempDir`), so nothing else
+reads it. The five fault handoffs above are again canonically equal.
+
+| live audit, seven interleaved runs, median, WoW running | before | after |
+| --- | --- | --- |
+| Gemma `prefill_range_l0` | 1.92 s, CPU 3.54 s, 314 MB | 1.90 s, CPU 3.38 s, 287 MB |
+| hello-tiles 20k | 3.11 s | 3.10 s |
+
+As expected, this is a memory change: Gemma's audit peaks 27 MB lower, now 30 MB above the commit
+(257 MB); the time is unchanged, since the audit is now bound by the program thread, as the
+commit is.
 
 ## Risks and open questions
 

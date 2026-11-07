@@ -240,6 +240,24 @@ pub fn capture_step_io(step_record: &StepRecord, trace_recorder: &TraceRecorder)
     }
 }
 
+/// [`capture_step_io`] for a live audit, which releases the step once captured
+/// ([`TraceRecorder::take_live_step_io`]): the recorder's copy of the step's
+/// I/O moves into the capture instead of being copied and then dropped.
+pub fn take_step_io(step_record: &StepRecord, trace_recorder: &mut TraceRecorder) -> CapturedStepIo {
+    let (step_witness, sequence_scope_witness) = trace_recorder.take_live_step_io(step_record);
+    let step_witness = step_witness.unwrap_or_else(|| {
+        panic!(
+            "Missing recorded I/O for fraud window step at coordinates {:?}",
+            step_record.coordinates()
+        )
+    });
+    CapturedStepIo {
+        step_record: step_record.clone(),
+        step_witness,
+        sequence_scope_witness,
+    }
+}
+
 /// A step's evidence: [`build_step_selections`], then [`build_step_storage`].
 pub fn build_step_io(
     captured: &CapturedStepIo,

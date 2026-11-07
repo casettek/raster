@@ -3,7 +3,7 @@
 //! at a divergence.
 use super::Publisher;
 use crate::tracing::proof_input::{
-    build_step_selections, build_step_storage, capture_step_io, CapturedStepIo,
+    build_step_selections, build_step_storage, take_step_io, CapturedStepIo,
 };
 use crate::TraceRecorder;
 use raster_compiler::{CfsBuilder, Project};
@@ -121,8 +121,7 @@ impl Publisher for AuditPublisher {
         let writes_before = state.recorder.storage_writes();
         let step = state.recorder.record(&event);
         let sources = state.sources.witnesses(&step, &state.cursor);
-        let captured = capture_step_io(&step, &state.recorder);
-        state.recorder.release_live_step(&step);
+        let captured = take_step_io(&step, &mut state.recorder);
         state.window.push_back(WindowEntry {
             captured,
             sources,
