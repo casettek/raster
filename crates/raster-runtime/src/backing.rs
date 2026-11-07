@@ -279,6 +279,28 @@ pub(crate) struct ReferencedSource {
     pub name: String,
     pub commitment: Vec<u8>,
     pub kind: ReferencedSourceKind,
+    /// Set once the source's `Bytes<N>` page sizes have passed
+    /// [`check_schema_page_sizes`]; shared by every clone of the source.
+    pub page_sizes_checked: Arc<OnceLock<()>>,
+}
+
+impl ReferencedSource {
+    /// [`check_schema_page_sizes`] for this source, once. The source's content
+    /// is fixed for the run (the resolver hands out one cached copy, checked
+    /// against the source's commitment before every read), so the first pass
+    /// holds for every later read; repeating it cost a schema walk per page.
+    fn check_page_sizes(
+        &self,
+        schema: fn() -> SchemaNode,
+        index: &RasterIndex,
+        data: &impl RasterData,
+    ) -> Result<()> {
+        if self.page_sizes_checked.get().is_none() {
+            check_schema_page_sizes(&schema(), index, data)?;
+            let _ = self.page_sizes_checked.set(());
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -432,7 +454,7 @@ impl ReferencedObject {
                 let data = resolved
                     .raster_data_file()
                     .ok_or_else(|| Error::Other("Expected raster data file".into()))?;
-                check_schema_page_sizes(&schema(), index, data)?;
+                source.check_page_sizes(*schema, index, data)?;
                 let location = index.locate(remaining)?;
                 let tree = tree_value_from_raster_location(index, data, &location)?;
                 let selected = selected_payload_from_raster_location(data, remaining, location)?;
@@ -485,7 +507,7 @@ impl ReferencedObject {
                 let data = resolved
                     .raster_data_file()
                     .ok_or_else(|| Error::Other("Expected raster data file".into()))?;
-                check_schema_page_sizes(&schema(), index, data)?;
+                source.check_page_sizes(*schema, index, data)?;
                 let selection = index.select(&remaining)?;
                 match payload_kind {
                     SelectionPayloadKind::Raw => {
@@ -587,7 +609,7 @@ impl ReferencedObject {
             .raster_index()
             .ok_or_else(|| Error::Other("Expected raster index metadata".into()))?;
         if let Some(data) = resolved.raster_data_file() {
-            check_schema_page_sizes(&schema(), index, data)?;
+            source.check_page_sizes(*schema, index, data)?;
         }
         let (len, elements_root) = index.list_metadata(&remaining)?;
 
@@ -905,6 +927,7 @@ mod tests {
                     to_tree: postcard_bytes_to_tree::<EntryA>,
                     schema: EntryA::schema,
                 },
+                page_sizes_checked: Default::default(),
             },
             ReferencedSource {
                 name: "entry_b".into(),
@@ -913,6 +936,7 @@ mod tests {
                     to_tree: postcard_bytes_to_tree::<EntryB>,
                     schema: EntryB::schema,
                 },
+                page_sizes_checked: Default::default(),
             },
         ];
         let referenced = ReferencedObject { sources };
@@ -1017,6 +1041,7 @@ mod tests {
                     name: format!("renamed_{}", index),
                     commitment: source.commitment.clone(),
                     kind: source.kind.clone(),
+                    page_sizes_checked: Default::default(),
                 })
                 .collect(),
         };

@@ -289,6 +289,7 @@ fn referenced_backing(load: AuthorizedSourceLoad) -> (ObjectBacking, Vec<u8>) {
                     let _authorized_encoding = source.encoding;
                     source.kind
                 },
+                page_sizes_checked: Default::default(),
             })
             .collect(),
     };

@@ -441,7 +441,9 @@ before. Tile image ids are unchanged; the six example `Raster.lock` files change
 
 Timers on the recur drivers and on the storage read path, unauthenticated run with the fix above
 (3.9–4.0 s). `call_recur!(tile = mac_weight_page, input = w_q, …)` walks a weight matrix's
-`List<BytesPage>` page by page: 8,832 pages of ~16 KB, the whole 145 MB layer.
+`List<BytesPage>` page by page: 8,832 page reads averaging ~210 KB, 1.88 GB in all, which is the
+145 MB layer read once per prompt token. (An earlier draft said 16 KB pages read once each; it
+divided the layer by the number of reads.)
 
 | per weight page, as the driver builds the iteration's input | total | per page |
 | --- | --- | --- |
@@ -498,6 +500,27 @@ and `serde_bytes` was already a dependency. A new test,
   need the Raster version they were made with.
 - **Not yet measured:** whether guests also get cheaper. A guest decodes its page from postcard
   through the same `Deserialize` impl, so replaying page tiles should cost fewer zkVM cycles.
+
+**Done: page reads in unauthenticated runs (2026-11-07).** Timing the copy and the hash
+separately showed the copy is 5–6 µs per page. SHA-256 runs at full hardware speed (2.3 GB/s,
+the same as OpenSSL on this machine), but it hashed 1.88 GB per run. Two changes, both in
+`raster-runtime`, so no guest and no lock is affected:
+- `selected_payload_from_raster_location` computes `selected_hash` only when the run is
+  authenticated. Nothing in an unauthenticated run reads it: the selection commitment is copied
+  into trace data only, and `verify_bound_index_bindings` runs in guests and tests.
+- `ReferencedSource::check_page_sizes` runs `check_schema_page_sizes` once per source, not on
+  every read. Every clone of the source shares the result. The source's content is fixed for the
+  run: the resolver hands out one cached copy, checked against the source's commitment before
+  each read.
+
+| Gemma 4 E2B `prefill_range_l0` | before | after |
+| --- | --- | --- |
+| unauthenticated (3 runs) | 2.0–2.1 s | 1.08–1.10 s (−47%) |
+| commit (2 runs) | 4.8–5.0 s | 4.63–4.70 s (the page-size check only) |
+
+`commit.bin` is byte-identical. All 668 tests pass, with no `Raster.lock` change. What's left of a
+page read in an unauthenticated run: a second copy into the tree value (18 µs), resolving the
+source (11 µs, it re-reads the input and manifest entries on each call) and the decode (11 µs).
 
 ## Risks and open questions
 
