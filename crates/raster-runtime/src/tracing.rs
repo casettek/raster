@@ -284,6 +284,29 @@ pub fn publish_trace_event(event: TraceEvent) {
     }
 }
 
+/// Whether anything reads trace events: only an installed publisher does.
+/// Without one (an unauthenticated run, or an authenticated one that records
+/// nothing) a tile's generated code skips building its event, the costliest
+/// part of which is serializing every argument once more, and calls
+/// [`note_untraced_tile`] instead.
+#[doc(hidden)]
+pub fn trace_events_consumed() -> bool {
+    GLOBAL_PUBLISHER.get().is_some()
+}
+
+/// What [`publish_trace_event`] does with a tile's event when nothing reads
+/// it: count it in the census, under the variant it would have been traced as.
+#[doc(hidden)]
+pub fn note_untraced_tile(fn_name: &str) {
+    crate::tile_census::note_tile_execution(fn_name);
+    let in_recur = RECUR_TRACE_DEPTH.with(|depth| depth.get() > 0);
+    crate::tile_census::note_trace_event(if in_recur {
+        "RecurTileIterationExec"
+    } else {
+        "TileExec"
+    });
+}
+
 /// The variant's own name, for the census. Kept exhaustive on purpose: a new
 /// `TraceEvent` variant should not silently land in an "other" bucket.
 fn trace_event_variant(event: &TraceEvent) -> &'static str {

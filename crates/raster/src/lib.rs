@@ -92,8 +92,9 @@ pub mod runtime {
 // Runtime helpers are only available with std feature.
 #[cfg(feature = "std")]
 pub use raster_runtime::{
-    entry_argument_spec, finish, init, init_with, publish_trace_event, start_program,
-    take_recur_item_binding, EntryArgumentSpec, EntryArgumentsBinding,
+    entry_argument_spec, finish, init, init_with, note_untraced_tile, publish_trace_event,
+    start_program, take_recur_item_binding, trace_events_consumed, EntryArgumentSpec,
+    EntryArgumentsBinding,
 };
 
 /// Guest tiles still expand `::raster::take_recur_item_binding()`; the host

@@ -873,11 +873,18 @@ impl Selectable for BytesPage {
 }
 
 /// Owning form — what `Deserialize` produces.
+///
+/// `bytes` is read as a byte buffer, not as a sequence of `u8`: a deserializer
+/// that holds the page whole hands it over in one piece instead of one element
+/// per byte, which made decoding a page cost more than the tile using it. Every
+/// format here writes a byte buffer and a `u8` sequence identically (postcard
+/// and bincode as a length and the raw bytes), so the encoding is unchanged.
 #[derive(Deserialize)]
 struct BytesPageWire {
     index: u64,
     offset: u64,
     len: u64,
+    #[serde(with = "serde_bytes")]
     bytes: Vec<u8>,
 }
 
@@ -1350,6 +1357,31 @@ mod tests {
         let parts = bytes_page_parts(&region.pages()[1]).unwrap();
         assert_eq!((parts.index, parts.offset, parts.len), (1, 4, 1));
         assert_eq!(parts.bytes, alloc::vec![5]);
+    }
+
+    /// Reading `bytes` as a byte buffer must not change what a page is on the
+    /// wire: pages encoded before the change decode the same, and a page
+    /// encodes to the same bytes as the plain `Vec<u8>` struct it replaced.
+    #[test]
+    fn bytes_page_wire_is_unchanged_by_reading_bytes_whole() {
+        #[derive(Serialize, Deserialize)]
+        struct SequenceWire {
+            index: u64,
+            offset: u64,
+            len: u64,
+            bytes: Vec<u8>,
+        }
+        let region = Bytes::<4>::paged(vec![1, 2, 3, 4, 250, 251]).unwrap();
+        let page = region.pages()[1].clone();
+        let sequence = postcard::to_allocvec(&SequenceWire {
+            index: 1,
+            offset: 4,
+            len: 2,
+            bytes: vec![250, 251],
+        })
+        .unwrap();
+        assert_eq!(postcard::to_allocvec(&page).unwrap(), sequence);
+        assert!(page == postcard::from_bytes::<BytesPage>(&sequence).unwrap());
     }
 
     #[test]

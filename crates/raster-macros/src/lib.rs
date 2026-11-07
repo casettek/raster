@@ -2887,27 +2887,40 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
                 #[cfg(all(feature = "std", not(target_arch = "riscv32")))]
                 {
                     let __raster_tile_execution_scope = ::raster::__private::TileExecutionScopeGuard::enter();
-                    #input_serialization
+                    // The event is built only for a publisher. Without one
+                    // nothing reads it, and serializing the arguments again
+                    // for it can cost more than the tile itself.
+                    let __raster_traced = ::raster::trace_events_consumed();
+                    let __raster_input = if __raster_traced {
+                        #input_serialization
+                        __raster_input
+                    } else {
+                        ::core::option::Option::None
+                    };
                     #native_draft_capture_start
                     #native_recur_capture_start
                     #function_call
                     #native_draft_capture_finish
                     #native_recur_capture_finish
                     #native_recur_control_capture
-                    #trace_output_serialization
-                    #native_output
+                    if __raster_traced {
+                        #trace_output_serialization
+                        #native_output
 
-                    let __raster_record = ::raster::core::trace::FnCallRecord {
-                        fn_name: ::raster::alloc::string::String::from(#fn_name_str),
-                        input: __raster_input,
-                        output: __raster_output,
-                        draft_transition_witness: __raster_draft_transition_witness,
-                        recur_control: __raster_recur_control_host,
-                        recur_state: __raster_recur_state,
-                    };
-                    ::raster::publish_trace_event(::raster::core::trace::TraceEvent::TileExec(
-                        __raster_record,
-                    ));
+                        let __raster_record = ::raster::core::trace::FnCallRecord {
+                            fn_name: ::raster::alloc::string::String::from(#fn_name_str),
+                            input: __raster_input,
+                            output: __raster_output,
+                            draft_transition_witness: __raster_draft_transition_witness,
+                            recur_control: __raster_recur_control_host,
+                            recur_state: __raster_recur_state,
+                        };
+                        ::raster::publish_trace_event(::raster::core::trace::TraceEvent::TileExec(
+                            __raster_record,
+                        ));
+                    } else {
+                        ::raster::note_untraced_tile(#fn_name_str);
+                    }
                     #publish_output_coordinates
                     let _ = &__raster_tile_execution_scope;
                     return result;

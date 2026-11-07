@@ -305,6 +305,200 @@ Measured on hello-tiles 20k, five interleaved runs each, median, against the sta
 `commit.bin` and the honest-audit handoff are byte-identical. The divergence handoff matches on
 canonical comparison (128 window steps, 128 io entries, 96 source witnesses).
 
+## Profile after the cheap fixes (2026-11-06)
+
+The same phase timers, on `0444a98`, hello-tiles 20k, two runs each (they agree within 2%). The
+timers add 7–12% to wall time, so read the split, not the absolute times. "Own work" is the
+program thread's time outside `send`; "blocked" is `send` minus freeing returned events.
+
+| | commit | audit |
+| --- | --- | --- |
+| program thread: own work | 2.19 s | 2.43 s |
+| program thread: freeing returned events | 0.14 s | 0.18 s |
+| program thread: blocked on a full queue | 0.21 s | 0.96 s |
+| worker: busy / idle | 2.03 s / 0.40 s | 3.21 s / 0.24 s |
+
+- **Commit is now about balanced.** Each side has ~2.0–2.3 s of work. Making the consumer cheaper
+  saves CPU, but at most ~0.2 s of wall time. What remains is the producer: ~0.4 s of live-mode
+  runtime work over the unauthenticated program (stage 0, finding 5), and the 0.14 s of frees,
+  which now sit on the program's side.
+- **Audit is still consumer-bound, by ~0.8 s.** The worker's 3.21 s:
+  - `record` 1.41 s: storage append 0.68 s (journaled index insert 0.44 s, root 0.18 s), input
+    commitments 0.21 s, exec steps 0.19 s, recur draft 0.14 s, witness insert 0.12 s;
+  - trace side 0.81 s: trace-tree append 0.62 s, step hash 0.13 s, `push_root` 0.04 s;
+  - source witnesses 0.19 s and window I/O capture 0.39 s;
+  - ~0.4 s outside the timed calls (recur-progress clone, window entries, the timers themselves).
+- **What would close the audit gap:**
+  - **Splitting the consumer.** A second stage takes the step records and runs the step hash,
+    the trace tree, `push_root` and the source witnesses (~1.0 s). That leaves ~2.2 s on the
+    recorder, below the program's own work, so audit would become producer-bound like commit.
+    The hard part is the divergence: it is detected by the second stage, which runs behind the
+    recorder. So storage must still rewind to the window's start, and the window's entries
+    (captured I/O from the first stage, source witnesses from the second) must be paired up by
+    step.
+  - **A cheaper storage append** (the journaled index insert is 7.4 µs per write). Halving the
+    append would close about half the gap, without a new thread.
+
+## Producer profile: what stage 2 can remove (2026-11-06)
+
+Bench-only timers around each part of the code `#[tile]` generates, and around the runtime calls it
+makes, on `0444a98`, program thread only. Timers add ~5–10%. `data` is `FnInput.data`, the
+arguments serialized once more for the event.
+
+| program thread | hello-tiles 20k, unauth | hello-tiles 20k, commit | Iris tiny, unauth | Iris tiny, commit |
+| --- | --- | --- | --- | --- |
+| total | 1.83 s | 2.72 s | 132 ms | 209 ms |
+| inside tile wrappers | 0.78 s | 1.21 s | 50 ms | 59 ms |
+| · inputs read from storage | 0.41 s | 0.47 s | 1 ms | 7 ms |
+| · output raster encoding (store needs it) | 0.12 s | 0.15 s | 3 ms | 3 ms |
+| · **event input `data`** | **0.04 s** | **0.04 s** | **28 ms** | **30 ms** |
+| · event input, rest (values, args, bindings) | 0.06 s | 0.07 s | 4 ms | 2 ms |
+| handing events to the worker (all events, incl. freeing) | — | 0.31 s (0.16 s freeing) | — | 4 ms (3 ms freeing) |
+| outside tile wrappers (sequences, recur sites, startup) | 1.05 s | 1.51 s | 82 ms | 150 ms |
+
+- **Stage 2's payoff depends on the workload.** On the tiny Iris stage, `data` alone is 15% of a
+  commit's program time (22% of an unauthenticated run). The run is producer-bound (the worker
+  idles 107 of 170 ms), so that time is wall time. On hello-tiles it's ~0.04 s, plus some of the
+  0.16 s of freeing: under 5%. The output-side copy (the waiting-slot copy) is 5 ms on hello-tiles,
+  negligible.
+- **An unauthenticated run builds every event and discards it.** `publish_trace_event` is called
+  without a publisher, so the Iris unauthenticated run spends 22% of its time on `data` that
+  nothing reads. Not building events when nothing consumes them is a separate, cheaper fix. It must
+  still feed the tile census, which needs only the tile name.
+- **The largest live-mode cost on the program side is not in events.** Outside tile wrappers, live
+  commit adds 0.46 s on hello-tiles and 68 ms on Iris over the unauthenticated run. That's
+  authenticated work in sequence and recur-site handling, and it's not yet broken down. Inside
+  wrappers, the user function itself takes 0.13 s in commit against 0.02 s unauthenticated on
+  hello-tiles, which is unexplained (perhaps the worker competing for cache and memory).
+
+**Correction: `data` is committed to.** The step's `input_commitment` is SHA-256 of `data`
+(`raster-runtime/src/tracing/commitment.rs`, `From<&FnInput>`), next to `input_source_commitment`
+over the values and bindings. A descriptor can't simply drop it: something must still produce that
+hash. The raster bytes in the store are a tree encoding, not postcard, so they can't stand in.
+
+### Real model: Gemma 4 E2B, `prefill_range_l0` (2026-11-06)
+
+`gemma-4-E2B-it` deterministic weights (`/data/llm/gemma-4-E2B-it-detwgt`; config and tokenizer
+hashes equal Iris's checked-in manifest), imported with `iris model import` into
+`/data/raster-bench/model-artifacts` (143 s, 20 GB; layer 0's weights are 145 MB). Stage inputs
+come from `iris claim build`, prompt "say ciao", 1 token, which generated "Ciao". Same bench
+timers, two runs each (within 1%).
+
+| | unauth | commit | audit |
+| --- | --- | --- | --- |
+| wall | 6.50 s | 6.74 s (+4%) | 6.86 s (+5%) |
+| CPU | — | 8.35 s | 9.14 s |
+| peak RSS | 253 MB | 258 MB | 314 MB |
+| worker busy / idle | — | 1.65 s / 5.03 s | 2.35 s / 4.42 s |
+
+Program thread (commit; inside tile wrappers, unauthenticated is within 2% on every line):
+- inside tile wrappers, 3.23 s:
+  - **`data` serialization: 2.10 s, 31% of the run;**
+  - inline values 0.26 s;
+  - draft capture 0.43 s;
+  - output serialization 0.16 s;
+  - **the tile bodies themselves: 0.22 s;**
+- handing events to the worker: 0.02 s;
+- outside tile wrappers (startup, loading inputs, recur-site driving): 3.48 s (3.25 s unauthenticated),
+  not broken down.
+
+Worker (commit): `record` 1.58 s, almost all in `exec_step`: SHA-256 of `data` ~1.07 s and
+`input_source_commitment` 0.48 s (it clones and serializes the inline values to hash them).
+
+What this shows:
+- **Stage 1 hides the instrumentation on real workloads.** The worker idles 75% of the run;
+  commit and audit cost 4–5% over unauthenticated.
+- **Building `data` is the single largest cost on the program**, in every mode, an order of
+  magnitude more than the tile bodies. In an unauthenticated run nothing reads it, so not building
+  events there would cut ~37% (2.4 s with the inline values).
+- **In live modes the protocol needs SHA-256 of `data` for every step**, so a descriptor needs the
+  bytes produced somewhere. The options:
+  - serialize into the hasher on the program and send 32 bytes: saves the buffer and the copy,
+    but moves ~1 s of hashing onto the program, which is the bound;
+  - send the argument values instead (a clone) and let the idle worker serialize and hash: needs
+    `Clone + Send + 'static` arguments, and cloning must turn out cheaper than encoding;
+  - change what `input_commitment` commits to, for example the selection commitments the step
+    already carries. That removes the serialization altogether, but it's a protocol change (guest,
+    image ids).
+
+**Done: no tile events without a publisher.** `raster_runtime::trace_events_consumed()` says
+whether a publisher is installed. Without one, the generated tile wrapper skips everything it does
+only for the event: serializing the arguments and the output, the output's raster payload, and
+the record itself. It calls `note_untraced_tile` instead, which keeps the tile census exact. The
+store doesn't depend on the skipped payload: with nothing stashed, `store_execution_output_value`
+encodes the value itself. Sequence and recur-site events are unchanged.
+
+| unauthenticated run | before | after |
+| --- | --- | --- |
+| hello-tiles 20k (5 runs each) | 1.75–1.83 s | 1.52–1.57 s (−14%) |
+| Gemma 4 E2B `prefill_range_l0` (3 runs) | 6.49–6.51 s | 3.91–3.96 s (−40%) |
+
+Live commits are byte-identical, on both workloads. The unauthenticated tile census is identical to
+before. Tile image ids are unchanged; the six example `Raster.lock` files changed only their
+`guest_inputs` fingerprint, because `raster` and `raster-macros` sources changed.
+
+### Real model: where the time outside tile wrappers goes (2026-11-06)
+
+Timers on the recur drivers and on the storage read path, unauthenticated run with the fix above
+(3.9–4.0 s). `call_recur!(tile = mac_weight_page, input = w_q, …)` walks a weight matrix's
+`List<BytesPage>` page by page: 8,832 pages of ~16 KB, the whole 145 MB layer.
+
+| per weight page, as the driver builds the iteration's input | total | per page |
+| --- | --- | --- |
+| reading and decoding the page (`into_auth_value`) | **2.93 s (74% of the run)** | 331 µs |
+| · fetching it (`ReferencedObject::select`) | 1.31 s | 146 µs |
+| · · copy the page out of the data file and SHA-256 it (`selected_payload`) | 0.90 s | 101 µs |
+| · · build its tree value, a second copy (`tree_value_from_raster_location`) | 0.20 s | 22 µs |
+| · · resolve the source and verify its commitment | 0.11 s | 12 µs |
+| · · re-check the schema's page sizes, on every page (`check_schema_page_sizes`) | 0.09 s | 10 µs |
+| · decoding the tree into `BytesPage` (`typed_value_from_tree`) | ~1.6 s | ~190 µs |
+| finding the page in the list (`select_item`), re-materializing the extra arguments | < 0.01 s | — |
+
+The decode line is the difference. The decode timer itself reads 1.99 s, but it also covers 79
+selections that aren't pages.
+
+- **The decode is the largest single cost:**
+  - `TreeValue::BytesPage` hands its bytes to serde as `PageWireField::Bytes(bytes.to_vec())`, a
+    third copy;
+  - `OwnedU8SeqDeserializer` then feeds them in one `u8` at a time, because `BytesPageWire.bytes`
+    is a `Vec<u8>`, which serde fills element by element.
+
+  Handing the buffer over whole would remove most of it. Decoding the field as bytes
+  (`serde_bytes`, or a byte-buffer visitor) would do that, and postcard encodes a byte sequence and
+  a byte string identically, so the wire format stays the same. That type lives in `raster-core`
+  and is compiled into guests, so it moves image ids.
+- **The page hash is computed in every mode.** `selected_hash` (SHA-256 of the page) belongs to
+  the selection commitment, which only an authenticated run records. An unauthenticated run
+  computes it and drops it.
+- **The schema's page-size check runs on every page.** It could run once per source.
+- Together, page reading and the argument serialization of the live modes (above) are what the
+  program spends its time on. The tile bodies take 0.22 s of the run.
+
+**Done: page bytes decoded whole (2026-11-07).** `BytesPageWire.bytes` is read with
+`#[serde(with = "serde_bytes")]` (`raster-core/src/collections.rs`). The tree's deserializer
+already moves the buffer in one piece for that request (`OwnedU8SeqDeserializer::deserialize_byte_buf`),
+and `serde_bytes` was already a dependency. A new test,
+`bytes_page_wire_is_unchanged_by_reading_bytes_whole`, pins the encoding to that of the plain
+`Vec<u8>` struct it replaced.
+
+| Gemma 4 E2B `prefill_range_l0` | before | after |
+| --- | --- | --- |
+| unauthenticated (3 runs) | 3.9–4.0 s | 2.0–2.1 s (−48%) |
+| commit (2 runs) | 6.7 s | 4.8–5.0 s (−27%) |
+| audit | 6.9 s | 4.8 s (−30%) |
+| decoding the pages | ~2.0 s | 0.1 s |
+
+- **Unchanged:** the real-model `commit.bin` (byte-identical), the audit verdict (honest), the
+  transition and defence guest ids (checked after their build script reran), and every tile image
+  id of the six example programs, which don't use `BytesPage`. Their `Raster.lock` files change
+  only `guest_inputs`.
+- **Iris must re-lock.** Every stage's `guest_inputs` changes, as it already did with the
+  unauthenticated-run fix above. On `prefill-range` all 33 tile image ids move, measured by locking
+  the stage with and without the attribute. So claims and commitments made under the old locks
+  need the Raster version they were made with.
+- **Not yet measured:** whether guests also get cheaper. A guest decodes its page from postcard
+  through the same `Deserialize` impl, so replaying page tiles should cost fewer zkVM cycles.
+
 ## Risks and open questions
 
 - **The storage rewrite (stage 3)** is the main cost and risk. Today's store is heap structures:
