@@ -1,8 +1,9 @@
 # Proposal: `instrumentation-pipeline` — run the recorder beside the program, not inside it
 
-Status: **Stage 1 implemented 2026-11-06 — measured** (§Stage 1 results). The publisher runs on
-its own thread by default: live commit −28%, live audit −30% on hello-tiles 20k, with identical
-commitments and handoffs. Stage 0 measured the same day (§Stage 0 results).
+Status: **stages 0–2 closed 2026-11-07** (§Stages 1–2 closed). The publisher runs on its own
+thread by default (stage 1); tile inputs are encoded on that thread, and unauthenticated runs build
+no tile events (stage 2, without the descriptor format, which is deferred to stage 3). Covered by
+unit tests and by the live CLI test in three modes. Stages 3–4 not started.
 
 Related:
 - [`live-recorder-shared-objects`](./live-recorder-shared-objects.md): the recorder already reads
@@ -658,6 +659,39 @@ reads it. The five fault handoffs above are again canonically equal.
 As expected, this is a memory change: Gemma's audit peaks 27 MB lower, now 30 MB above the commit
 (257 MB); the time is unchanged, since the audit is now bound by the program thread, as the
 commit is.
+
+## Stages 1–2 closed (2026-11-07)
+
+**What the in-process worker is, as built:**
+- `WorkerPublisher` (`publishers/worker.rs`) runs the run's publisher on its own thread behind a
+  bounded queue (`RASTER_INSTRUMENTATION_QUEUE`, default 64 events); `RASTER_INSTRUMENTATION_THREAD=0`
+  keeps it inline. Profiling and selective capture always stay on the program's thread.
+- Events reach the publisher in program order. A publisher panic resurfaces on the program's
+  thread, with its own message, at the next event or at `finish`; an event after `finish` is
+  refused. Audit's divergence exit (86) happens on the worker's thread.
+- The program allocates and frees events; the worker hands each one back once recorded.
+- Tile inputs travel as clones of the arguments and are encoded on the worker
+  (`deferred_input.rs`); a type that can't be cloned and sent is encoded in place. Runs without a
+  publisher build no tile events.
+
+**Tests:**
+- `publishers::worker::tests`: order and `finish` after the last event, with queues of 1 and 64;
+  deferred inputs encoded before the publisher sees them; a publisher panic and a `finish` panic
+  resurfacing on the program's thread; events after `finish` refused.
+- `deferred_input::tests`: the encoded parts equal the wrapper's tuple encoding, including the
+  encode-in-place fallback and a failing part.
+- `live_commitment_cli` runs the live commit and its ten fault audits (windows 2 and 128, five
+  divergence positions each) in three modes: worker on, worker off, and a queue of one event. The
+  commitment must be the same in all three, and each handoff must equal an independent oracle
+  rebuilt from the saved trace.
+
+**Deferred: the descriptor format itself.** Stage 2 was meant to replace event payloads with
+references into the program's store. Its motivation was the cost of building the payload on the
+program thread, and that is gone (no events without a publisher; argument encoding on the worker).
+What still travels is small next to the rest: a cloned page argument costs ~3 µs to copy, and
+output payloads ~5 ms per hello-tiles 20k run. References only pay once the consumer reads the
+store from another process, so the format moves to stage 3, where the store becomes a shared
+region.
 
 ## Risks and open questions
 

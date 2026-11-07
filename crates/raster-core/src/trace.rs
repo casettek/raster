@@ -22,8 +22,17 @@ pub struct FnInputArg {
 }
 
 /// Describes the input parameters for a tile function.
+///
+/// The byte fields here and in [`FnInputValue::Inline`] are read as byte
+/// buffers (`serde_bytes`), not as `u8` sequences: a step's evidence carries
+/// them into the transition guest, which otherwise decoded each byte as one
+/// element, and on a model stage that was most of the step's cycles. Every
+/// format they are stored in writes both forms identically (postcard and
+/// bincode as a length and the raw bytes, JSON as an array of numbers), so no
+/// commitment changes.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct FnInput {
+    #[serde(with = "serde_bytes")]
     pub data: Vec<u8>,
     pub values: Vec<FnInputValue>,
     pub args: Vec<FnInputArg>,
@@ -43,7 +52,7 @@ pub struct StorageData {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum FnInputValue {
-    Inline(Vec<u8>),
+    Inline(#[serde(with = "serde_bytes")] Vec<u8>),
     StorageBinding,
 }
 
@@ -937,6 +946,119 @@ pub enum TraceEvent {
     RecurSequenceEnd(FnCallRecord),
     RecurTileStart(FnCallRecord),
     RecurSequenceStart(FnCallRecord),
+}
+
+/// The byte fields read as byte buffers (`FnInput.data`, `FnInputValue::Inline`,
+/// `SelectionWitness.bytes`) must encode exactly as the plain `Vec<u8>` fields
+/// they were, in every format evidence and traces are stored in, and decode
+/// from those older bytes. 300 bytes so postcard's length takes two bytes.
+#[cfg(all(test, feature = "std"))]
+mod byte_field_wire_tests {
+    use super::*;
+    use crate::input::{SelectionProof, SelectionWitness};
+    use alloc::{string::String, vec, vec::Vec};
+
+    #[derive(Serialize, Deserialize)]
+    struct FnInputSeq {
+        data: Vec<u8>,
+        values: Vec<FnInputValueSeq>,
+        args: Vec<FnInputArg>,
+        storage: StorageInput,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(rename = "FnInputValue")]
+    enum FnInputValueSeq {
+        Inline(Vec<u8>),
+        StorageBinding,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct SelectionWitnessSeq {
+        bytes: Vec<u8>,
+        proof: SelectionProof,
+        #[serde(default)]
+        selected_root: Option<crate::input::Hash32>,
+    }
+
+    fn bytes(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i * 7) as u8).collect()
+    }
+
+    fn assert_same_wire<A: Serialize, B: Serialize>(new: &A, old: &B) {
+        assert_eq!(postcard::to_allocvec(new).unwrap(), postcard::to_allocvec(old).unwrap());
+        assert_eq!(bincode::serialize(new).unwrap(), bincode::serialize(old).unwrap());
+        assert_eq!(serde_json::to_string(new).unwrap(), serde_json::to_string(old).unwrap());
+    }
+
+    #[test]
+    fn byte_fields_keep_their_encoding() {
+        let input = FnInput {
+            data: bytes(300),
+            values: vec![
+                FnInputValue::Inline(bytes(300)),
+                FnInputValue::StorageBinding,
+                FnInputValue::Inline(Vec::new()),
+            ],
+            args: vec![FnInputArg {
+                name: String::from("page"),
+                ty: String::from("BytesPage"),
+            }],
+            storage: StorageInput::new(),
+        };
+        let old = FnInputSeq {
+            data: input.data.clone(),
+            values: vec![
+                FnInputValueSeq::Inline(bytes(300)),
+                FnInputValueSeq::StorageBinding,
+                FnInputValueSeq::Inline(Vec::new()),
+            ],
+            args: input.args.clone(),
+            storage: StorageInput::new(),
+        };
+        assert_same_wire(&input, &old);
+        let encoded = postcard::to_allocvec(&old).unwrap();
+        assert_eq!(postcard::from_bytes::<FnInput>(&encoded).unwrap(), input);
+        let encoded = bincode::serialize(&old).unwrap();
+        assert_eq!(bincode::deserialize::<FnInput>(&encoded).unwrap(), input);
+        let encoded = serde_json::to_string(&old).unwrap();
+        assert_eq!(serde_json::from_str::<FnInput>(&encoded).unwrap(), input);
+
+        let witness = SelectionWitness {
+            bytes: bytes(300),
+            proof: SelectionProof {
+                path: Default::default(),
+                root_hash: [3; 32],
+                steps: Vec::new(),
+            },
+            selected_root: Some([5; 32]),
+        };
+        let old = SelectionWitnessSeq {
+            bytes: witness.bytes.clone(),
+            proof: witness.proof.clone(),
+            selected_root: witness.selected_root,
+        };
+        assert_same_wire(&witness, &old);
+        let encoded = postcard::to_allocvec(&old).unwrap();
+        assert_eq!(postcard::from_bytes::<SelectionWitness>(&encoded).unwrap(), witness);
+    }
+
+    /// `source_witness_bytes` is what `input_source_commitment` hashes, in the
+    /// guest and on the host: pinned against the plain encoding.
+    #[test]
+    fn source_witness_bytes_are_unchanged() {
+        let input = FnInput {
+            data: bytes(10),
+            values: vec![FnInputValue::Inline(bytes(300)), FnInputValue::StorageBinding],
+            args: Vec::new(),
+            storage: StorageInput::new(),
+        };
+        let old_values = vec![FnInputValueSeq::Inline(bytes(300)), FnInputValueSeq::StorageBinding];
+        assert_eq!(
+            input.source_witness_bytes(),
+            postcard::to_allocvec(&(old_values, StorageInput::new())).unwrap()
+        );
+    }
 }
 
 #[cfg(test)]

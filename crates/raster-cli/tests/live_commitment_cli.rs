@@ -13,14 +13,28 @@ fn root() -> PathBuf {
         .to_owned()
 }
 fn cli(project: &Path, args: &[&str], scratch: &Path) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_cargo-raster"))
+    cli_with(project, args, scratch, &[])
+}
+fn cli_with(project: &Path, args: &[&str], scratch: &Path, envs: &[(&str, &str)]) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_cargo-raster"));
+    command
         .current_dir(project)
         .env("RASTER_SCRATCH_DIR", scratch)
         .args(["raster"])
-        .args(args)
-        .output()
-        .unwrap()
+        .args(args);
+    for (name, value) in envs {
+        command.env(name, value);
+    }
+    command.output().unwrap()
 }
+/// How the recorder runs beside the program: on its own thread (the default),
+/// on the program's thread, and on its own thread with a queue of one event.
+const INSTRUMENTATION_MODES: [&[(&str, &str)]; 3] = [
+    &[],
+    &[("RASTER_INSTRUMENTATION_THREAD", "0")],
+    &[("RASTER_INSTRUMENTATION_QUEUE", "1")],
+];
+
 fn success(output: Output) -> String {
     assert!(
         output.status.success(),
@@ -80,6 +94,17 @@ fn live_recurrence_and_drafts_match_saved_trace_without_scratch() {
     assert!(!dir.join("trace.bin").exists());
     assert!(!dir.join("run.json").exists());
     let expected = fs::read(&commit).unwrap();
+    // The recorder runs on its own thread by default. Inline, and with a queue
+    // of one event, the program waits on it differently; the commitment must
+    // not depend on that.
+    for envs in INSTRUMENTATION_MODES.iter().skip(1) {
+        success(cli_with(&project, &args, &forbidden, envs));
+        assert_eq!(
+            expected,
+            fs::read(&commit).unwrap(),
+            "live commit with {envs:?}"
+        );
+    }
     for format in ["binary", "json"] {
         let mut saved = args.to_vec();
         saved.extend(["--save-trace", "--trace-format", format]);
@@ -378,114 +403,123 @@ fn assert_live_evidence(
             let VerificationResult::Fraud(expected) = verifier.verify(&trace) else {
                 panic!("expected divergence")
             };
-            let handoff = temp.join("handoff.bin");
-            let output = Command::new(project.target_dir.join("release").join(&project.name))
-                .current_dir(&project.root_dir)
-                .args([
-                    "--input",
-                    input.to_str().unwrap(),
-                    "--input-manifest",
-                    manifest.to_str().unwrap(),
-                ])
-                .env("RASTER_AUTH", "1")
-                .env("RASTER_SCRATCH_DIR", forbidden)
-                .env(AUDIT_PATH_ENV, &disputed)
-                .env(AUDIT_PROJECT_ENV, &project.root_dir)
-                .env(AUDIT_OUTPUT_ENV, &handoff)
-                .env(AUDIT_BINDING_ENV, "test-binding")
-                .env_remove("RASTER_TRACE_PATH")
-                .env_remove("RASTER_COMMIT_PATH")
-                .env_remove("RASTER_OUTPUT_DIR")
-                .output()
-                .unwrap();
-            assert_eq!(
-                output.status.code(),
-                Some(DIVERGENCE_EXIT_CODE),
-                "{}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            let result: AuditHandoff =
-                raster_core::bincode::deserialize(&fs::read(&handoff).unwrap()).unwrap();
-            assert_eq!(result.binding, "test-binding");
-            let fault = result.fault.unwrap();
-            assert_eq!(
-                raster_core::bincode::serialize(&fault.window).unwrap(),
-                raster_core::bincode::serialize(&expected.window).unwrap()
-            );
-            assert_eq!(
-                fault.input_sources_witnesses.len(),
-                expected.input_sources_witnesses.len()
-            );
-            for (key, witness) in &expected.input_sources_witnesses {
-                assert_eq!(
-                    raster_core::bincode::serialize(
-                        fault.input_sources_witnesses.get(key).unwrap()
-                    )
-                    .unwrap(),
-                    raster_core::bincode::serialize(witness).unwrap()
-                );
-            }
-            assert_eq!(fault.io.len(), fault.window.items.len());
-            let start = result.steps - fault.window.items.len();
-            // An independent reference for the window's opening storage: the
-            // saved trace's prefix writes applied one by one to empty storage.
-            // Live audit reaches the same state by rewinding its ledger.
-            let mut storage = raster_runtime::tracing::proof_input::LedgerAt::new();
-            for step in &trace.0[..start] {
-                if step.appends_to_storage() {
-                    if let Some(write) = recorded
-                        .step_witness_for(step)
-                        .and_then(|witness| witness.storage_write())
-                    {
-                        storage.apply(&write);
-                    }
+            // The divergence exit (86) happens on the recorder's thread by
+            // default; the evidence must be the oracle's in every mode.
+            for envs in INSTRUMENTATION_MODES {
+                let handoff = temp.join("handoff.bin");
+                let mut command =
+                    Command::new(project.target_dir.join("release").join(&project.name));
+                for (name, value) in envs {
+                    command.env(name, value);
                 }
-            }
-            let (frontier, index_root, entrypoint) = storage.initial(
-                raster_core::cfs::CfsCursor::new(cfs.clone())
-                    .main_entrypoint_names()
-                    .is_some(),
-            );
-            assert_eq!(
-                raster_core::bincode::serialize(&fault.initial_storage_frontier).unwrap(),
-                raster_core::bincode::serialize(&frontier).unwrap()
-            );
-            assert_eq!(fault.initial_index_root, index_root);
-            assert_eq!(
-                raster_core::bincode::serialize(&fault.entrypoint_membership_witness).unwrap(),
-                raster_core::bincode::serialize(&entrypoint).unwrap()
-            );
-            let recur = start
-                .checked_sub(1)
-                .and_then(|i| recorded.recur_progress_after(trace.0[i].exec_index));
-            assert_eq!(
-                raster_core::bincode::serialize(&fault.window_start_recur_progress).unwrap(),
-                raster_core::bincode::serialize(&recur).unwrap()
-            );
-            for (step, io) in fault.window.items.iter().zip(&fault.io) {
-                let expected_io = raster_runtime::tracing::proof_input::prepare_step_io(
-                    step,
-                    &recorded,
-                    &mut storage,
+                let output = command
+                    .current_dir(&project.root_dir)
+                    .args([
+                        "--input",
+                        input.to_str().unwrap(),
+                        "--input-manifest",
+                        manifest.to_str().unwrap(),
+                    ])
+                    .env("RASTER_AUTH", "1")
+                    .env("RASTER_SCRATCH_DIR", forbidden)
+                    .env(AUDIT_PATH_ENV, &disputed)
+                    .env(AUDIT_PROJECT_ENV, &project.root_dir)
+                    .env(AUDIT_OUTPUT_ENV, &handoff)
+                    .env(AUDIT_BINDING_ENV, "test-binding")
+                    .env_remove("RASTER_TRACE_PATH")
+                    .env_remove("RASTER_COMMIT_PATH")
+                    .env_remove("RASTER_OUTPUT_DIR")
+                    .output()
+                    .unwrap();
+                assert_eq!(
+                    output.status.code(),
+                    Some(DIVERGENCE_EXIT_CODE),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
                 );
-                let actual_json = serde_json::to_value(io).unwrap();
-                let expected_json = serde_json::to_value(&expected_io).unwrap();
-                for (field, value) in actual_json.as_object().unwrap() {
-                    assert!(
-                        value == &expected_json[field],
-                        "IO mismatch at {} field {}",
-                        step.exec_index,
-                        field
+                let result: AuditHandoff =
+                    raster_core::bincode::deserialize(&fs::read(&handoff).unwrap()).unwrap();
+                assert_eq!(result.binding, "test-binding");
+                let fault = result.fault.unwrap();
+                assert_eq!(
+                    raster_core::bincode::serialize(&fault.window).unwrap(),
+                    raster_core::bincode::serialize(&expected.window).unwrap()
+                );
+                assert_eq!(
+                    fault.input_sources_witnesses.len(),
+                    expected.input_sources_witnesses.len()
+                );
+                for (key, witness) in &expected.input_sources_witnesses {
+                    assert_eq!(
+                        raster_core::bincode::serialize(
+                            fault.input_sources_witnesses.get(key).unwrap()
+                        )
+                        .unwrap(),
+                        raster_core::bincode::serialize(witness).unwrap()
                     );
                 }
-                assert!(
-                    raster_core::bincode::serialize(io).unwrap()
-                        == raster_core::bincode::serialize(&expected_io).unwrap()
+                assert_eq!(fault.io.len(), fault.window.items.len());
+                let start = result.steps - fault.window.items.len();
+                // An independent reference for the window's opening storage: the
+                // saved trace's prefix writes applied one by one to empty storage.
+                // Live audit reaches the same state by rewinding its ledger.
+                let mut storage = raster_runtime::tracing::proof_input::LedgerAt::new();
+                for step in &trace.0[..start] {
+                    if step.appends_to_storage() {
+                        if let Some(write) = recorded
+                            .step_witness_for(step)
+                            .and_then(|witness| witness.storage_write())
+                        {
+                            storage.apply(&write);
+                        }
+                    }
+                }
+                let (frontier, index_root, entrypoint) = storage.initial(
+                    raster_core::cfs::CfsCursor::new(cfs.clone())
+                        .main_entrypoint_names()
+                        .is_some(),
                 );
-            }
+                assert_eq!(
+                    raster_core::bincode::serialize(&fault.initial_storage_frontier).unwrap(),
+                    raster_core::bincode::serialize(&frontier).unwrap()
+                );
+                assert_eq!(fault.initial_index_root, index_root);
+                assert_eq!(
+                    raster_core::bincode::serialize(&fault.entrypoint_membership_witness).unwrap(),
+                    raster_core::bincode::serialize(&entrypoint).unwrap()
+                );
+                let recur = start
+                    .checked_sub(1)
+                    .and_then(|i| recorded.recur_progress_after(trace.0[i].exec_index));
+                assert_eq!(
+                    raster_core::bincode::serialize(&fault.window_start_recur_progress).unwrap(),
+                    raster_core::bincode::serialize(&recur).unwrap()
+                );
+                for (step, io) in fault.window.items.iter().zip(&fault.io) {
+                    let expected_io = raster_runtime::tracing::proof_input::prepare_step_io(
+                        step,
+                        &recorded,
+                        &mut storage,
+                    );
+                    let actual_json = serde_json::to_value(io).unwrap();
+                    let expected_json = serde_json::to_value(&expected_io).unwrap();
+                    for (field, value) in actual_json.as_object().unwrap() {
+                        assert!(
+                            value == &expected_json[field],
+                            "IO mismatch at {} field {}",
+                            step.exec_index,
+                            field
+                        );
+                    }
+                    assert!(
+                        raster_core::bincode::serialize(io).unwrap()
+                            == raster_core::bincode::serialize(&expected_io).unwrap()
+                    );
+                }
 
-            assert!(result.steps <= trace.0.len());
-            assert!(!temp.join("fault.receipt").exists());
+                assert!(result.steps <= trace.0.len());
+                assert!(!temp.join("fault.receipt").exists());
+            }
         }
     }
 }
