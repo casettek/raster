@@ -57,7 +57,8 @@ pub use storage::{
 };
 pub use tracing::{
     commitment::Sha256Commitment,
-    finish, init, init_with, note_untraced_tile, publish_trace_event,
+    deferred_input::{DeferArg, DeferByClone, DeferredInput, EncodeNow, InputPart},
+    finish, init, init_with, note_untraced_tile, publish_tile_event, publish_trace_event,
     publishers::{BinaryTraceEventPublisher, JsonTraceEventPublisher, Publisher},
     recorder::TraceRecorder,
     trace_events_consumed, RecurTraceScopeGuard, TraceFormat, OUTPUT_DIR_ENV, TRACE_FORMAT_ENV,

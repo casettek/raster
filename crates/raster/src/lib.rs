@@ -97,6 +97,16 @@ pub use raster_runtime::{
     EntryArgumentsBinding,
 };
 
+/// What a generated tile wrapper uses to leave its input `data` to the
+/// publisher. Not public API.
+#[cfg(feature = "std")]
+#[doc(hidden)]
+pub mod __deferred_input {
+    pub use raster_runtime::{
+        publish_tile_event, DeferArg, DeferByClone, DeferredInput, EncodeNow, InputPart,
+    };
+}
+
 /// Guest tiles still expand `::raster::take_recur_item_binding()`; the host
 /// driver is the only caller that ever stashes a binding. On `no_std` there is
 /// no thread-local stash, so every take is `None` and the wrapper falls back

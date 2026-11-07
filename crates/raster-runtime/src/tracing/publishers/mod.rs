@@ -4,6 +4,7 @@ pub mod commitment;
 pub mod json;
 pub mod worker;
 
+use super::deferred_input::DeferredInput;
 use raster_core::trace::TraceEvent;
 use std::sync::OnceLock;
 
@@ -22,6 +23,13 @@ pub trait Publisher: Send + Sync {
     fn publish_returning(&self, event: TraceEvent) -> Option<TraceEvent> {
         self.publish(event);
         None
+    }
+
+    /// [`Self::publish`] for a tile event whose input `data` is encoded from
+    /// `input` first. A publisher with its own thread encodes it there.
+    fn publish_deferred(&self, mut event: TraceEvent, mut input: DeferredInput) {
+        input.fill(&mut event);
+        self.publish(event);
     }
 
     fn finish(&self);

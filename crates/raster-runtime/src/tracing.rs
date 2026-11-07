@@ -1,4 +1,5 @@
 pub mod commitment;
+pub mod deferred_input;
 pub mod proof_input;
 pub mod publishers;
 pub mod recorder;
@@ -260,6 +261,23 @@ pub fn finish() {
 
 #[doc(hidden)]
 pub fn publish_trace_event(event: TraceEvent) {
+    let event = census_and_rewrite(event);
+    if let Some(publisher) = GLOBAL_PUBLISHER.get() {
+        publisher.publish(event);
+    }
+}
+
+/// [`publish_trace_event`] for a tile event whose `FnInput::data` is still to
+/// be encoded from `input`, by the publisher.
+#[doc(hidden)]
+pub fn publish_tile_event(event: TraceEvent, input: deferred_input::DeferredInput) {
+    let event = census_and_rewrite(event);
+    if let Some(publisher) = GLOBAL_PUBLISHER.get() {
+        publisher.publish_deferred(event, input);
+    }
+}
+
+fn census_and_rewrite(event: TraceEvent) -> TraceEvent {
     // Before the publisher check: an unauthenticated run installs no publisher,
     // and its tiles — and the events it would have traced — are exactly the
     // ones an authenticated run has.
@@ -279,9 +297,7 @@ pub fn publish_trace_event(event: TraceEvent) {
         }
     });
     crate::tile_census::note_trace_event(trace_event_variant(&event));
-    if let Some(publisher) = GLOBAL_PUBLISHER.get() {
-        publisher.publish(event);
-    }
+    event
 }
 
 /// Whether anything reads trace events: only an installed publisher does.

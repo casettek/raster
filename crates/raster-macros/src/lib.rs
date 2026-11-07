@@ -1644,7 +1644,10 @@ fn gen_output_serialization() -> proc_macro2::TokenStream {
 /// Generate input serialization code for tracing in the original function.
 ///
 /// This serializes the typed input parameters to bytes for the trace emission.
-fn gen_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream {
+/// With `deferred`, `FnInput::data` is left empty and its parts are bound as
+/// `__raster_input_deferred` instead, for the publisher to encode: see
+/// `raster_runtime::tracing::deferred_input`.
+fn gen_input_serialization(input: &ItemFn, deferred: bool) -> proc_macro2::TokenStream {
     let params = extract_params(input);
 
     let trace_value_defs: Vec<_> = params
@@ -1737,7 +1740,37 @@ fn gen_input_serialization(input: &ItemFn) -> proc_macro2::TokenStream {
         })
         .collect();
 
-    let input_bytes = if params.is_empty() {
+    let input_bytes = if deferred {
+        // One part per parameter, concatenated by the publisher into what
+        // the eager arm below encodes as a tuple.
+        let parts: Vec<_> = params
+            .iter()
+            .map(|param| {
+                let name = &param.ident;
+                match param_protocol_kind(&param.ty) {
+                    ParamProtocolKind::AuthValue(_) => quote! {
+                        (&::raster::__deferred_input::DeferArg(&#name)).__raster_input_part()
+                    },
+                    ParamProtocolKind::Draft(_) | ParamProtocolKind::RecurOutput(_) => {
+                        let schema_ty = draft_param_schema(param).expect("draft schema type");
+                        quote! {
+                            ::raster::__deferred_input::InputPart::now(
+                                &::raster::draft_replay_handle::<#schema_ty>(&#name)
+                            )
+                        }
+                    }
+                }
+            })
+            .collect();
+        quote! {
+            let __raster_input_bytes: ::raster::alloc::vec::Vec<u8> = ::raster::alloc::vec::Vec::new();
+            let __raster_input_deferred = {
+                #[allow(unused_imports)]
+                use ::raster::__deferred_input::{DeferByClone as _, EncodeNow as _};
+                ::raster::__deferred_input::DeferredInput::new(::raster::alloc::vec![#(#parts),*])
+            };
+        }
+    } else if params.is_empty() {
         quote! {
             let __raster_input_bytes: ::raster::alloc::vec::Vec<u8> = ::raster::alloc::vec::Vec::new();
         }
@@ -2755,8 +2788,11 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
-    // Generate input serialization code for tracing
-    let input_serialization = gen_input_serialization(&input_fn);
+    // Generate input serialization code for tracing. The profiling wrapper
+    // encodes `data` itself: it reports the input's size, and its publisher
+    // runs on the program's thread anyway.
+    let input_serialization = gen_input_serialization(&input_fn, false);
+    let deferred_input_serialization = gen_input_serialization(&input_fn, true);
 
     let implementation_function = quote! {
         #implementation_sig #fn_body
@@ -2891,11 +2927,13 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
                     // nothing reads it, and serializing the arguments again
                     // for it can cost more than the tile itself.
                     let __raster_traced = ::raster::trace_events_consumed();
-                    let __raster_input = if __raster_traced {
-                        #input_serialization
-                        __raster_input
+                    // `data` is left to the publisher: the arguments are
+                    // cloned here and encoded on its thread.
+                    let (__raster_input, __raster_input_deferred) = if __raster_traced {
+                        #deferred_input_serialization
+                        (__raster_input, ::core::option::Option::Some(__raster_input_deferred))
                     } else {
-                        ::core::option::Option::None
+                        (::core::option::Option::None, ::core::option::Option::None)
                     };
                     #native_draft_capture_start
                     #native_recur_capture_start
@@ -2915,9 +2953,10 @@ pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
                             recur_control: __raster_recur_control_host,
                             recur_state: __raster_recur_state,
                         };
-                        ::raster::publish_trace_event(::raster::core::trace::TraceEvent::TileExec(
-                            __raster_record,
-                        ));
+                        ::raster::__deferred_input::publish_tile_event(
+                            ::raster::core::trace::TraceEvent::TileExec(__raster_record),
+                            __raster_input_deferred.expect("built for every traced tile"),
+                        );
                     } else {
                         ::raster::note_untraced_tile(#fn_name_str);
                     }

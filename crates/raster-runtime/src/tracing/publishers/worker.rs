@@ -9,7 +9,12 @@
 //!
 //! The publisher hands each event back once it has recorded it, and the program
 //! frees it: memory is cheapest to free on the thread that allocated it.
+//!
+//! A tile event can arrive with its input `data` still to encode (stage 2,
+//! option b): this thread encodes it, frees the bytes itself, and hands the
+//! cloned arguments back with the event.
 use super::Publisher;
+use crate::tracing::deferred_input::{take_input_data, DeferredInput};
 use raster_core::trace::TraceEvent;
 use std::sync::{mpsc, Mutex};
 use std::thread::JoinHandle;
@@ -18,18 +23,26 @@ use std::thread::JoinHandle;
 pub const QUEUE_ENV: &str = "RASTER_INSTRUMENTATION_QUEUE";
 /// `0` keeps the publisher on the program's thread.
 pub const THREAD_ENV: &str = "RASTER_INSTRUMENTATION_THREAD";
-const DEFAULT_QUEUE: usize = 1024;
+/// A queued tile event holds clones of its arguments, a whole weight page on a
+/// model stage, and the queue is full whenever the publisher is the slower
+/// side. At 1024 that cost Gemma's `prefill_range_l0` 150 MB of peak memory;
+/// 64 runs as fast there and on hello-tiles.
+const DEFAULT_QUEUE: usize = 64;
 
 enum Message {
     Event(TraceEvent),
+    Tile(TraceEvent, DeferredInput),
     Finish,
 }
+
+/// What goes back to the program's thread to be freed there.
+type Spent = (Option<TraceEvent>, Option<DeferredInput>);
 
 pub struct WorkerPublisher {
     sender: Mutex<Option<mpsc::SyncSender<Message>>>,
     worker: Mutex<Option<JoinHandle<()>>>,
     /// Events the publisher is done with, to be freed on the program's thread.
-    spent: Mutex<mpsc::Receiver<TraceEvent>>,
+    spent: Mutex<mpsc::Receiver<Spent>>,
 }
 
 impl WorkerPublisher {
@@ -60,8 +73,16 @@ impl WorkerPublisher {
                             if let Some(event) = inner.publish_returning(event) {
                                 // Gone only once the program stopped listening:
                                 // then this thread frees it.
-                                let _ = spend.send(event);
+                                let _ = spend.send((Some(event), None));
                             }
+                        }
+                        Message::Tile(mut event, mut input) => {
+                            input.fill(&mut event);
+                            let event = inner.publish_returning(event).map(|mut event| {
+                                drop(take_input_data(&mut event));
+                                event
+                            });
+                            let _ = spend.send((event, Some(input)));
                         }
                         Message::Finish => return inner.finish(),
                     }
@@ -110,6 +131,10 @@ impl WorkerPublisher {
 impl Publisher for WorkerPublisher {
     fn publish(&self, event: TraceEvent) {
         self.send(Message::Event(event));
+    }
+
+    fn publish_deferred(&self, event: TraceEvent, input: DeferredInput) {
+        self.send(Message::Tile(event, input));
     }
 
     fn finish(&self) {

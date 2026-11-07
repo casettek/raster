@@ -166,7 +166,7 @@ written. No raw trace is saved by default.
 The recording runs on its own thread, alongside the program, for live commits,
 live audits and recorded traces. `RASTER_INSTRUMENTATION_THREAD=0` keeps it on
 the program's thread, and `RASTER_INSTRUMENTATION_QUEUE` sets how many events
-may wait between the two (default 1024). Profiling and selective capture always
+may wait between the two (default 64). Profiling and selective capture always
 record on the program's thread.
 
 Add `--save-trace` to retain `trace.bin` (or `--trace-format json` for

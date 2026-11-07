@@ -213,7 +213,7 @@ it is the bound.
 **What landed:**
 - **`publishers::worker::WorkerPublisher`** owns the run's publisher on a thread named
   `raster-instrumentation`, with a 64 MiB stack. It's fed in program order through a bounded
-  `mpsc::sync_channel` (`RASTER_INSTRUMENTATION_QUEUE`, default 1024 events). A publisher panic is
+  `mpsc::sync_channel` (`RASTER_INSTRUMENTATION_QUEUE`, default 1024 events, 64 since stage 2). A publisher panic is
   re-raised on the program's thread at its next event or at `finish`. `finish` drains the queue and
   joins the thread. Audit's divergence exit (86) now happens on the worker thread and ends the
   process as before.
@@ -521,6 +521,50 @@ the same as OpenSSL on this machine), but it hashed 1.88 GB per run. Two changes
 `commit.bin` is byte-identical. All 668 tests pass, with no `Raster.lock` change. What's left of a
 page read in an unauthenticated run: a second copy into the tree value (18 µs), resolving the
 source (11 µs, it re-reads the input and manifest entries on each call) and the decode (11 µs).
+
+**Done: stage 2, option b — the worker encodes `data` (2026-11-07).** The tile wrapper clones each
+argument and sends the clones with the event; the publisher encodes them into `FnInput::data`, on
+the worker thread when there is one. A Gemma `mac_weight_page` input (a 215 KB page, a 6 KB row, a
+`u32`) clones in 3.2 µs and encodes in 230 µs: postcard writes the page's `&[u8]` one element at a
+time.
+- `raster-runtime/src/tracing/deferred_input.rs`: `DeferredInput` holds one part per parameter.
+  Postcard encodes a tuple as its elements in sequence, so the parts concatenated are the bytes the
+  wrapper encoded before; a part that fails to encode empties the whole input, as
+  `unwrap_or_default` did. `DeferArg` picks the part by auto-reference: a boxed clone for a
+  `Serialize + Clone + Send + 'static` argument, else encoded on the spot. Drafts still encode their
+  replay handle in the wrapper.
+- `Publisher::publish_deferred` encodes in place by default. `WorkerPublisher` encodes on its
+  thread, frees the encoded bytes there, and hands the clones back with the event.
+- The profiling wrapper still encodes in place: it reports the input's size, and its publisher
+  runs on the program's thread.
+- `raster-core` is unchanged. Tile image ids are unchanged; the six example `Raster.lock` files
+  change only `guest_inputs`.
+
+A/B on two sibling pairs on `/data/raster-bench/ab` (base: `93fe38f`, with the page-read fix above;
+new: plus this, queue 64), release builds, no timers, five interleaved runs each, median (range).
+Measured on an otherwise idle machine; a first run alongside a game was discarded.
+
+| | base | new |
+| --- | --- | --- |
+| Gemma `prefill_range_l0`, unauthenticated | 1.05 s (1.04–1.07) | 1.05 s (1.04–1.07) |
+| Gemma, live commit | 4.56 s (4.52–4.72), 257 MB | 3.64 s (3.61–3.67), 268 MB (−20%) |
+| Gemma, live audit | 4.52 s (4.49–4.67), 313 MB | 4.28 s (4.25–4.34), 324 MB (−5%) |
+| hello-tiles 20k, live commit | 2.48 s (2.44–2.56), 151 MB | 2.47 s (2.44–2.51), 146 MB |
+| hello-tiles 20k, live audit | 3.35 s (3.31–3.50), 168 MB | 3.32 s (3.26–3.38), 163 MB |
+
+All commitments are byte-identical, and so are the honest-audit handoffs (10 of each per
+workload). hello-tiles is unchanged within the noise; the +3% on its commit in the discarded
+run did not reproduce. Why the Gemma audit gains less than the commit is not measured.
+
+**Queue length.** The worker is now the slower side on Gemma, so the queue stays full, and each
+queued event holds a weight page. At the old default of 1024 events the commit ran as fast
+(3.52–3.67 s) but peaked at 415 MB, against 268 MB at 64. The default is now 64; hello-tiles runs
+the same with it.
+
+What's left: the worker's encoding writes a page one byte at a time. Serializing
+`BytesPageWireRef.bytes` as a byte buffer (`serde_bytes`, as `806e8e2` did for decoding) would
+make it a copy. The wire bytes stay the same, but tile ids would move (they did for the decode
+fix), and `bytes_page_parts` would have to accept `serialize_bytes`.
 
 ## Risks and open questions
 
