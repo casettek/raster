@@ -13,6 +13,8 @@ pub(crate) fn select(policy: WorkingStorage) {
         "working storage already initialized"
     );
 }
+/// A program keeps its objects in memory, as on main. Disk is for the CLI's
+/// replay of a saved trace, which asks for it explicitly.
 pub(crate) fn current() -> WorkingStorage {
-    *POLICY.get_or_init(|| WorkingStorage::Disk)
+    *POLICY.get_or_init(|| WorkingStorage::Memory)
 }

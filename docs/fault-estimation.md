@@ -11,7 +11,7 @@ cargo raster run --audit /path/disputed.commit.bin \
 ```
 
 The commitment must contain a detectable fault, produced with the existing
-corruption/fault-injection workflow. Audit executes the stage once, verifies the commitment incrementally, and keeps a rolling window of proof-ready evidence. It stops at the first divergence and uses that window for estimation or proving. An honest commitment
+corruption/fault-injection workflow. Audit executes the stage once, verifies the commitment incrementally, and keeps a rolling window of each step's recorded inputs and outputs. It stops at the first divergence, builds that window's proof evidence once, and uses it for estimation or proving. An honest commitment
 produces a `no-fault` report; it does not select a synthetic window. Native audit
 and cold guest builds still take time.
 
@@ -57,8 +57,9 @@ continue to run independent audits.
 
 `RASTER_AUDIT_PROGRESS` emits `audit` before `estimating` or `proving`. No raw
 trace is written by live auditing. The runtime retains authenticated storage,
-provenance, active scopes, and a bounded rolling window of proof-ready evidence;
-total memory is not constant. Window positions are zero-based `[start, end)`;
+provenance, active scopes, a log of storage writes, and a bounded rolling window of
+recorded step inputs and outputs; total memory is not constant. Proof evidence is built
+only for the divergent window, after rebuilding the storage proof state it opens with. Window positions are zero-based `[start, end)`;
 execution indices are one-based.
 
 Deploy the CLI and runtime together and rebuild native stages. Normal

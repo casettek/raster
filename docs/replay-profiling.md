@@ -64,7 +64,7 @@ example because the tile's code changed since the run, stops profiling.
 Replay profile — RISC Zero executor, no proving
   Run: 00000000001793385803-803200584-pid1401085-000000
   Status: complete
-  Calls: top 10 per tile by input + output bytes; 53 of 58 replayed
+  Calls: up to 10 per selected tile by input + output bytes; 53 of 58 replayed
   Cycles are guest user cycles, including the tile wrapper (input decode and hash, output encode).
   Exec: executor wall time on the measuring machine, release build.
 

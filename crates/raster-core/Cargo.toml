@@ -13,6 +13,10 @@ std = ["serde/std", "serde_json", "bincode"]
 alloc = []
 # Test instrumentation: count leaf hashes per thread (`tree::leaf_hash_count`).
 hash-count = ["std"]
+# Host-side: a coordinate index that can rewind (`coordinate_index_journal`).
+# Never enabled by guests: compiling it into their raster-core moves the
+# transition and defence image ids even though they do not call it.
+journal = ["std"]
 
 [dependencies]
 serde.workspace = true

@@ -1,13 +1,17 @@
-//! Live comparison and a bounded window of proof-ready execution evidence.
+//! Live comparison and a bounded window of execution evidence. Each step keeps
+//! only what the recorder releases; the window's proof evidence is built once,
+//! at a divergence.
 use super::Publisher;
-use crate::tracing::proof_input::{prepare_step_io, ProofStorageState};
+use crate::tracing::proof_input::{
+    build_step_selections, build_step_storage, take_step_io, CapturedStepIo,
+};
 use crate::TraceRecorder;
 use raster_compiler::{CfsBuilder, Project};
 use raster_core::{cfs::CfsCursor, merkle::EMPTY_LEAF, trace::TraceEvent};
 use raster_prover::{
     commitment_file::CommitmentFile,
-    trace::{SourceTracker, TraceVerifier},
-    transition::{AuditHandoff, PreparedFault, StepIo},
+    trace::{BytesHashable, SourceTracker, TraceVerifier},
+    transition::{AuditHandoff, PreparedFault},
 };
 use std::{
     collections::{HashMap, VecDeque},
@@ -23,12 +27,12 @@ pub const AUDIT_PROJECT_ENV: &str = "RASTER_AUDIT_PROJECT";
 pub const DIVERGENCE_EXIT_CODE: i32 = 86;
 
 struct WindowEntry {
-    io: StepIo,
+    captured: CapturedStepIo,
     sources:
         HashMap<(u64, raster_core::trace::StepRecord), raster_core::transition::StepRecordWitness>,
-    storage_frontier: raster_prover::trace::SerializableFrontier,
-    index_root: Vec<u8>,
-    entrypoint: Option<raster_core::transition::StorageReadWitness>,
+    /// How many storage writes precede this step: where the recorder's storage
+    /// rewinds to if the window opens here.
+    writes_before: usize,
     recur: raster_core::recur_progress::RecurProgressStack,
 }
 struct State {
@@ -36,7 +40,6 @@ struct State {
     verifier: TraceVerifier<CommitmentFile>,
     sources: SourceTracker,
     cursor: CfsCursor,
-    storage: ProofStorageState,
     window: VecDeque<WindowEntry>,
     steps: usize,
     completed: bool,
@@ -59,7 +62,11 @@ impl AuditPublisher {
         let verifier = TraceVerifier::new(disputed, &EMPTY_LEAF, &cfs)
             .map_err(|e| raster_core::Error::Other(e.to_string()))?;
         let cursor = CfsCursor::new(cfs.clone());
-        let mut recorder = TraceRecorder::for_live_audit(cfs);
+        // A step writes storage at most once, so a window's worth of storage
+        // history is enough to rewind to any window's start.
+        let mut recorder = TraceRecorder::for_live_audit(cfs)
+            .reading_program_objects()
+            .retaining_storage_undo(verifier.window_size);
         crate::storage::THREAD_STORAGE
             .with(|storage| recorder.set_source_resolver(storage.borrow().source_resolver()));
         Ok(Self {
@@ -70,7 +77,6 @@ impl AuditPublisher {
                 verifier,
                 cursor,
                 sources: SourceTracker::new(),
-                storage: ProofStorageState::new(),
                 window: VecDeque::new(),
                 steps: 0,
                 completed: false,
@@ -92,6 +98,10 @@ impl AuditPublisher {
 }
 impl Publisher for AuditPublisher {
     fn publish(&self, event: TraceEvent) {
+        self.publish_returning(event);
+    }
+
+    fn publish_returning(&self, event: TraceEvent) -> Option<TraceEvent> {
         let mut state = self.state.lock().expect("audit lock");
         assert!(
             !state.completed && !state.finished,
@@ -108,22 +118,14 @@ impl Publisher for AuditPublisher {
         );
         state.completed = matches!(&event, TraceEvent::ProgramEnd(_));
         let recur = state.recorder.live_recur_progress();
-        let (storage_frontier, index_root, entrypoint) = state
-            .storage
-            .initial(state.cursor.main_entrypoint_names().is_some());
-        let step = state.recorder.record(event);
+        let writes_before = state.recorder.storage_writes();
+        let step = state.recorder.record(&event);
         let sources = state.sources.witnesses(&step, &state.cursor);
-        let State {
-            recorder, storage, ..
-        } = &mut *state;
-        let io = prepare_step_io(&step, recorder, storage);
-        recorder.release_live_step(&step);
+        let captured = take_step_io(&step, &mut state.recorder);
         state.window.push_back(WindowEntry {
-            io,
+            captured,
             sources,
-            storage_frontier,
-            index_root,
-            entrypoint,
+            writes_before,
             recur,
         });
         if state.window.len() > state.verifier.window_size {
@@ -133,22 +135,53 @@ impl Publisher for AuditPublisher {
         if std::env::var_os("RASTER_AUDIT_DEBUG").is_some() && (index < 20 || index % 4096 == 0) {
             eprintln!("Audit prepared step {}", index + 1);
         }
-        let divergence = state.verifier.push(index, &step);
-        state.sources.append(&step);
+        // One trace tree serves both: the source tracker's, which can witness
+        // any earlier step, also yields the root the verifier compares.
+        let State {
+            verifier, sources, ..
+        } = &mut *state;
+        sources.append_hashed(&step, step.hash());
+        let root = sources.tree().root().expect("trace root").0;
+        let divergence = verifier.push_root(index, &step, &root, |size| {
+            sources.tree().frontier_at(size).expect("window frontier")
+        });
         state.steps += 1;
         if let Some(window) = divergence {
+            let State {
+                recorder,
+                window: entries,
+                cursor,
+                ..
+            } = &mut *state;
+            // Selections first, while the recorder still holds every object
+            // the window wrote. Then storage rewound to the window's start,
+            // and each step's storage proofs against it, advancing past the
+            // step's write: what building them on every step would have given.
+            let selections: Vec<_> = entries
+                .iter()
+                .map(|e| build_step_selections(&e.captured, recorder))
+                .collect();
+            let first = entries.front().expect("proof window");
+            let mut storage = recorder.storage_rewound_to(first.writes_before);
+            let (initial_storage_frontier, initial_index_root, entrypoint_membership_witness) =
+                storage.initial(cursor.main_entrypoint_names().is_some());
+            let io = entries
+                .iter()
+                .zip(selections)
+                .map(|(e, selections)| build_step_storage(&e.captured, selections, &mut storage))
+                .collect();
             let first = state.window.front().expect("proof window");
             let fault = PreparedFault {
                 window,
-                io: state.window.iter().map(|e| e.io.clone()).collect(),
+                io,
                 input_sources_witnesses: state
                     .window
                     .iter()
                     .flat_map(|e| e.sources.clone())
                     .collect(),
-                initial_storage_frontier: first.storage_frontier.clone(),
-                initial_index_root: first.index_root.clone(),
-                entrypoint_membership_witness: first.entrypoint.clone(),
+                initial_storage_frontier,
+                initial_index_root,
+                entrypoint_membership_witness,
                 window_start_recur_progress: (state.steps > state.verifier.window_size)
                     .then(|| first.recur.clone()),
             };
@@ -157,6 +190,7 @@ impl Publisher for AuditPublisher {
             // generation; a non-success exit alone is insufficient authorization.
             std::process::exit(DIVERGENCE_EXIT_CODE);
         }
+        Some(event)
     }
     fn finish(&self) {
         let mut state = self.state.lock().expect("audit lock");

@@ -873,11 +873,18 @@ impl Selectable for BytesPage {
 }
 
 /// Owning form — what `Deserialize` produces.
+///
+/// `bytes` is read as a byte buffer, not as a sequence of `u8`: a deserializer
+/// that holds the page whole hands it over in one piece instead of one element
+/// per byte, which made decoding a page cost more than the tile using it. Every
+/// format here writes a byte buffer and a `u8` sequence identically (postcard
+/// and bincode as a length and the raw bytes), so the encoding is unchanged.
 #[derive(Deserialize)]
 struct BytesPageWire {
     index: u64,
     offset: u64,
     len: u64,
+    #[serde(with = "serde_bytes")]
     bytes: Vec<u8>,
 }
 
@@ -886,11 +893,18 @@ struct BytesPageWire {
 /// `serialize` from cloning the whole page payload. The struct *name* differs
 /// and is not observable: postcard ignores struct names, and so does
 /// [`bytes_page_parts`].
+///
+/// `bytes` goes out as a byte buffer, not as a sequence of `u8`, for the same
+/// reason [`BytesPageWire`] reads it as one: element by element, encoding a
+/// page cost far more than copying it. postcard and bincode write both forms as
+/// a length and the raw bytes, and JSON as an array of numbers, so the encoding
+/// is unchanged.
 #[derive(Serialize)]
 struct BytesPageWireRef<'a> {
     index: u64,
     offset: u64,
     len: u64,
+    #[serde(with = "serde_bytes")]
     bytes: &'a [u8],
 }
 
@@ -1352,6 +1366,70 @@ mod tests {
         assert_eq!(parts.bytes, alloc::vec![5]);
     }
 
+    /// Reading `bytes` as a byte buffer must not change what a page is on the
+    /// wire: pages encoded before the change decode the same, and a page
+    /// encodes to the same bytes as the plain `Vec<u8>` struct it replaced.
+    #[test]
+    fn bytes_page_wire_is_unchanged_by_reading_bytes_whole() {
+        #[derive(Serialize, Deserialize)]
+        struct SequenceWire {
+            index: u64,
+            offset: u64,
+            len: u64,
+            bytes: Vec<u8>,
+        }
+        let region = Bytes::<4>::paged(vec![1, 2, 3, 4, 250, 251]).unwrap();
+        let page = region.pages()[1].clone();
+        let sequence = postcard::to_allocvec(&SequenceWire {
+            index: 1,
+            offset: 4,
+            len: 2,
+            bytes: vec![250, 251],
+        })
+        .unwrap();
+        assert_eq!(postcard::to_allocvec(&page).unwrap(), sequence);
+        assert!(page == postcard::from_bytes::<BytesPage>(&sequence).unwrap());
+    }
+
+    /// Writing `bytes` as a byte buffer must not change a page in any format it
+    /// is stored or traced in. 300 bytes so postcard's length takes two bytes.
+    #[cfg(feature = "std")]
+    #[test]
+    fn bytes_page_encodes_as_the_sequence_struct_in_every_format() {
+        #[derive(Serialize)]
+        struct SequenceWire {
+            index: u64,
+            offset: u64,
+            len: u64,
+            bytes: Vec<u8>,
+        }
+        let payload: Vec<u8> = (0..300u32).map(|i| (i * 7) as u8).collect();
+        let page = BytesPage::__from_parts(3, 1200, payload.clone());
+        let sequence = SequenceWire {
+            index: 3,
+            offset: 1200,
+            len: 300,
+            bytes: payload,
+        };
+        assert_eq!(
+            postcard::to_allocvec(&page).unwrap(),
+            postcard::to_allocvec(&sequence).unwrap()
+        );
+        assert_eq!(
+            bincode::serialize(&page).unwrap(),
+            bincode::serialize(&sequence).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_string(&page).unwrap(),
+            serde_json::to_string(&sequence).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_string_pretty(&page).unwrap(),
+            serde_json::to_string_pretty(&sequence).unwrap()
+        );
+        assert_eq!(bytes_page_parts(&page).unwrap().bytes, sequence.bytes);
+    }
+
     #[test]
     fn aligned_literal_converts_to_page_index() {
         let region = Bytes::<4>::paged(vec![0; 8]).unwrap();
@@ -1359,3 +1437,44 @@ mod tests {
         assert_eq!(page_range_for_region::<_, 0, 8>(&region), (0, 2));
     }
 }
+
+// At the end of the file, like everything added to it: guests embed the line of
+// every panic site, so lines added above existing code move their image ids.
+
+/// A promise that `Clone` gives an independent snapshot: encoding the clone
+/// later gives the bytes the original encoded to when it was cloned, whatever
+/// happens to the original in between.
+///
+/// A traced tile's input `data` is encoded after the call, from clones taken
+/// before it (`raster_runtime::tracing::deferred_input`). A clone that shares
+/// writable state with the argument (an `Arc<Mutex<_>>`, say) would let the
+/// tile change what the trace commits to as its input, so only types with this
+/// promise are deferred; every other argument is encoded before the call.
+/// Owned values keep it: scalars, `String`, `Block<T>`, `BytesPage`, and
+/// derived Rastered structs whose fields do.
+pub trait SnapshotClone {}
+
+macro_rules! impl_snapshot_clone_scalar {
+    ($($ty:ty),* $(,)?) => { $(impl SnapshotClone for $ty {})* };
+}
+impl_snapshot_clone_scalar!(
+    (), bool, char, String, u8, u16, u32, u64, u128, usize, i8, i16, i32, i64, i128, isize,
+);
+
+impl<T: SnapshotClone> SnapshotClone for Option<T> {}
+impl<T: SnapshotClone, const N: usize> SnapshotClone for [T; N] {}
+
+macro_rules! impl_snapshot_clone_tuple {
+    ($($name:ident),+) => {
+        impl<$($name: SnapshotClone),+> SnapshotClone for ($($name,)+) {}
+    };
+}
+impl_snapshot_clone_tuple!(A);
+impl_snapshot_clone_tuple!(A, B);
+impl_snapshot_clone_tuple!(A, B, C);
+impl_snapshot_clone_tuple!(A, B, C, D);
+impl_snapshot_clone_tuple!(A, B, C, D, E);
+impl_snapshot_clone_tuple!(A, B, C, D, E, F);
+
+impl<T: SnapshotClone> SnapshotClone for Block<T> {}
+impl SnapshotClone for BytesPage {}

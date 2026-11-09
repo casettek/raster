@@ -1,13 +1,13 @@
 {
   "format": 3,
-  "program_commitment": "24c9f31bd5e49d8aa5efdc092d7d53e432f2547a4ef9a0eaafec5d4fba881033",
+  "program_commitment": "5362f1707f99b060cf769067f7e9945fbe2c10de342d6f8f0e55a7edafb20e6e",
   "tiles": {
     "assemble_stats": {
       "image_id": "6d6d9a32ebc1adaecdd2281fd22e60fd90621c0301811d7aaf8d853b7de898a8",
       "source_hash": "ed9e55e4bce873d10000000000000853"
     },
     "fold_stats": {
-      "image_id": "1bebd49e579aa35c9a803fbd2f2765caa3df77518afee9753cf5cc2244b6802e",
+      "image_id": "5652f752115e9ea41fd5549dde053eeaa26475446573a146a3828b4a673b27f7",
       "source_hash": "ed9e55e4bce873d10000000000000853"
     }
   },
@@ -16,5 +16,5 @@
     "build_mode": "local",
     "rustc": "rustc 1.94.1-dev (06e01cb0d 2026-04-09)"
   },
-  "guest_inputs": "cfb592c0749b29d78e3fd57468311fbaefcdb6d3ae4228328cf465a078370138"
+  "guest_inputs": "da53df0add1b687fb24c18830f1d6fed0696d823d9848cd14e7b4f403903081e"
 }

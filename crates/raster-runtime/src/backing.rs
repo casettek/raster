@@ -45,6 +45,10 @@ pub(crate) enum ObjectBacking {
     /// maps onto buffers). Reads answer exactly as for the same object stored
     /// contiguously.
     Derived(DerivedObject),
+    /// An `Owned` raster object as disk storage loads it: its bytes stay in
+    /// the scratch archive and a read fetches only the range it touches.
+    /// Reads answer exactly as for the object in memory.
+    Archived(ArchivedObject),
 }
 
 #[derive(Debug, Clone)]
@@ -97,6 +101,29 @@ pub(crate) struct DerivedObject {
     /// The delta this object was built from, for the site close event that
     /// carries it to the recorder. Set on the child's side.
     pub delta: Option<Arc<raster_core::trace::DerivedPayload>>,
+}
+
+/// A raster object kept in the scratch archive. `pieces` is its payload as one
+/// disk piece; the blobs are kept to publish or re-persist it whole.
+#[derive(Debug, Clone)]
+pub(crate) struct ArchivedObject {
+    pub pieces: Arc<PieceTable>,
+    pub index: Arc<RasterIndex>,
+    pub root: Hash32,
+    archive: raster_prover::archive::Archive,
+    bytes: raster_prover::archive::Blob,
+    index_bytes: raster_prover::archive::Blob,
+}
+
+impl ArchivedObject {
+    /// The whole raster payload, read back from the archive.
+    pub(crate) fn payload(&self) -> Result<RasterPayload> {
+        Ok(RasterPayload {
+            bytes: read_blob(&self.archive, self.bytes)?,
+            index_bytes: read_blob(&self.archive, self.index_bytes)?,
+            root_hash: self.root,
+        })
+    }
 }
 
 /// A logical payload assembled from pieces of other buffers, in order and
@@ -252,6 +279,28 @@ pub(crate) struct ReferencedSource {
     pub name: String,
     pub commitment: Vec<u8>,
     pub kind: ReferencedSourceKind,
+    /// Set once the source's `Bytes<N>` page sizes have passed
+    /// [`check_schema_page_sizes`]; shared by every clone of the source.
+    pub page_sizes_checked: Arc<OnceLock<()>>,
+}
+
+impl ReferencedSource {
+    /// [`check_schema_page_sizes`] for this source, once. The source's content
+    /// is fixed for the run (the resolver hands out one cached copy, checked
+    /// against the source's commitment before every read), so the first pass
+    /// holds for every later read; repeating it cost a schema walk per page.
+    fn check_page_sizes(
+        &self,
+        schema: fn() -> SchemaNode,
+        index: &RasterIndex,
+        data: &impl RasterData,
+    ) -> Result<()> {
+        if self.page_sizes_checked.get().is_none() {
+            check_schema_page_sizes(&schema(), index, data)?;
+            let _ = self.page_sizes_checked.set(());
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -405,7 +454,7 @@ impl ReferencedObject {
                 let data = resolved
                     .raster_data_file()
                     .ok_or_else(|| Error::Other("Expected raster data file".into()))?;
-                check_schema_page_sizes(&schema(), index, data)?;
+                source.check_page_sizes(*schema, index, data)?;
                 let location = index.locate(remaining)?;
                 let tree = tree_value_from_raster_location(index, data, &location)?;
                 let selected = selected_payload_from_raster_location(data, remaining, location)?;
@@ -458,7 +507,7 @@ impl ReferencedObject {
                 let data = resolved
                     .raster_data_file()
                     .ok_or_else(|| Error::Other("Expected raster data file".into()))?;
-                check_schema_page_sizes(&schema(), index, data)?;
+                source.check_page_sizes(*schema, index, data)?;
                 let selection = index.select(&remaining)?;
                 match payload_kind {
                     SelectionPayloadKind::Raw => {
@@ -560,7 +609,7 @@ impl ReferencedObject {
             .raster_index()
             .ok_or_else(|| Error::Other("Expected raster index metadata".into()))?;
         if let Some(data) = resolved.raster_data_file() {
-            check_schema_page_sizes(&schema(), index, data)?;
+            source.check_page_sizes(*schema, index, data)?;
         }
         let (len, elements_root) = index.list_metadata(&remaining)?;
 
@@ -878,6 +927,7 @@ mod tests {
                     to_tree: postcard_bytes_to_tree::<EntryA>,
                     schema: EntryA::schema,
                 },
+                page_sizes_checked: Default::default(),
             },
             ReferencedSource {
                 name: "entry_b".into(),
@@ -886,6 +936,7 @@ mod tests {
                     to_tree: postcard_bytes_to_tree::<EntryB>,
                     schema: EntryB::schema,
                 },
+                page_sizes_checked: Default::default(),
             },
         ];
         let referenced = ReferencedObject { sources };
@@ -990,6 +1041,7 @@ mod tests {
                     name: format!("renamed_{}", index),
                     commitment: source.commitment.clone(),
                     kind: source.kind.clone(),
+                    page_sizes_checked: Default::default(),
                 })
                 .collect(),
         };
@@ -1045,6 +1097,8 @@ mod tests {
 }
 
 /// Only descriptors survive between operations; derived pieces never retain old buffers.
+/// Indexes are blobs too, so a lookup record stays small however large its
+/// object's index grows.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) enum PersistedBacking {
     Owned {
@@ -1053,7 +1107,7 @@ pub(crate) enum PersistedBacking {
     },
     Derived {
         pieces: Vec<(raster_prover::archive::Blob, u64, u64)>,
-        index: Vec<u8>,
+        index: raster_prover::archive::Blob,
         root: Hash32,
         delta: Option<raster_core::trace::DerivedPayload>,
     },
@@ -1062,8 +1116,17 @@ pub(crate) enum PersistedBacking {
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct RasterPayloadDescriptor {
     bytes: raster_prover::archive::Blob,
-    index_bytes: Vec<u8>,
+    index_bytes: raster_prover::archive::Blob,
     root_hash: Hash32,
+}
+
+fn read_blob(
+    archive: &raster_prover::archive::Archive,
+    blob: raster_prover::archive::Blob,
+) -> Result<Vec<u8>> {
+    archive
+        .read(blob, 0, blob.len)
+        .map_err(|e| Error::Other(format!("Read stored object: {e}")))
 }
 
 impl PersistedBacking {
@@ -1085,11 +1148,29 @@ impl PersistedBacking {
                     .map(|object| {
                         Ok::<_, Error>(RasterPayloadDescriptor {
                             bytes: append(&object.payload.bytes)?,
-                            index_bytes: object.payload.index_bytes.clone(),
+                            index_bytes: append(&object.payload.index_bytes)?,
                             root_hash: object.payload.root_hash,
                         })
                     })
                     .transpose()?,
+            },
+            // A raster object has no postcard bytes to keep (see `resolve`).
+            ObjectBacking::Archived(archived) => Self::Owned {
+                bytes: append(&[])?,
+                raster: Some(if archive.same_session(&archived.archive) {
+                    RasterPayloadDescriptor {
+                        bytes: archived.bytes,
+                        index_bytes: archived.index_bytes,
+                        root_hash: archived.root,
+                    }
+                } else {
+                    let payload = archived.payload()?;
+                    RasterPayloadDescriptor {
+                        bytes: append(&payload.bytes)?,
+                        index_bytes: append(&payload.index_bytes)?,
+                        root_hash: payload.root_hash,
+                    }
+                }),
             },
             ObjectBacking::Derived(derived) => {
                 let mut pieces = Vec::with_capacity(derived.pieces.pieces.len());
@@ -1104,7 +1185,7 @@ impl PersistedBacking {
                 }
                 Self::Derived {
                     pieces,
-                    index: derived.index.encode()?,
+                    index: append(&derived.index.encode()?)?,
                     root: derived.root,
                     delta: derived.delta.as_deref().cloned(),
                 }
@@ -1117,25 +1198,50 @@ impl PersistedBacking {
         })
     }
 
-    pub(crate) fn load(self, archive: &raster_prover::archive::Archive) -> Result<ObjectBacking> {
-        let read = |blob: raster_prover::archive::Blob| {
-            archive
-                .read(blob, 0, blob.len)
-                .map_err(|e| Error::Other(format!("Read stored object: {e}")))
-        };
+    /// The backing a read uses, and roughly how much memory it holds: a
+    /// raster object's bytes stay on disk, only its parsed index is resident.
+    pub(crate) fn load(
+        self,
+        archive: &raster_prover::archive::Archive,
+    ) -> Result<(ObjectBacking, usize)> {
         Ok(match self {
-            Self::Owned { bytes, raster } => ObjectBacking::Owned(OwnedObject {
-                bytes: read(bytes)?,
-                raster: raster
-                    .map(|payload| {
-                        Ok::<_, Error>(Arc::new(RasterObject::new(RasterPayload {
-                            bytes: read(payload.bytes)?,
-                            index_bytes: payload.index_bytes,
-                            root_hash: payload.root_hash,
-                        })))
-                    })
-                    .transpose()?,
-            }),
+            Self::Owned {
+                bytes,
+                raster: None,
+            } => {
+                let bytes = read_blob(archive, bytes)?;
+                let resident = bytes.len();
+                (
+                    ObjectBacking::Owned(OwnedObject {
+                        bytes,
+                        raster: None,
+                    }),
+                    resident,
+                )
+            }
+            Self::Owned {
+                raster: Some(payload),
+                ..
+            } => {
+                let index_bytes = read_blob(archive, payload.index_bytes)?;
+                let mut pieces = PieceTable::default();
+                pieces.push(
+                    PieceSource::Disk(archive.clone(), payload.bytes),
+                    0,
+                    payload.bytes.len,
+                );
+                (
+                    ObjectBacking::Archived(ArchivedObject {
+                        pieces: Arc::new(pieces),
+                        index: Arc::new(RasterIndex::from_bytes(&index_bytes)?),
+                        root: payload.root_hash,
+                        archive: archive.clone(),
+                        bytes: payload.bytes,
+                        index_bytes: payload.index_bytes,
+                    }),
+                    index_bytes.len(),
+                )
+            }
             Self::Derived {
                 pieces,
                 index,
@@ -1146,12 +1252,20 @@ impl PersistedBacking {
                 for (blob, offset, len) in pieces {
                     table.push(PieceSource::Disk(archive.clone(), blob), offset, len);
                 }
-                ObjectBacking::Derived(DerivedObject {
-                    pieces: Arc::new(table),
-                    index: Arc::new(RasterIndex::from_bytes(&index)?),
-                    root,
-                    delta: delta.map(Arc::new),
-                })
+                let index = read_blob(archive, index)?;
+                let resident = index.len()
+                    + delta
+                        .as_ref()
+                        .map_or(0, |delta| delta.overlay_nodes.len() + delta.tail.len());
+                (
+                    ObjectBacking::Derived(DerivedObject {
+                        pieces: Arc::new(table),
+                        index: Arc::new(RasterIndex::from_bytes(&index)?),
+                        root,
+                        delta: delta.map(Arc::new),
+                    }),
+                    resident,
+                )
             }
         })
     }
