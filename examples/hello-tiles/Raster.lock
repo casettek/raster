@@ -1,13 +1,13 @@
 {
   "format": 3,
-  "program_commitment": "8db95fff37fa4ef2e874324e746ba4ee041d17cbd217318811a6ae3c6852552d",
+  "program_commitment": "0655714c8fe4bf26bd82f942100cefdaf70893b8bbd8a12c4fbcdbbdd2464c21",
   "tiles": {
     "advance_line_cursor": {
       "image_id": "eb319e667130eaa1b59347144fbfbb6aa967801ace483e6185cfc6cc47d2816c",
       "source_hash": "f4c5c8d4d34ff5e30000000000002aa7"
     },
     "begin_greeting": {
-      "image_id": "83f4e7f7e44ce072222ef0b1e54b47e2b8957525692d7766812be3140b5ad8dd",
+      "image_id": "6a03c1f2424b0d35fc3453c5e797e644e4fb23cee48901db736f45d2e0eb0e1f",
       "source_hash": "f4c5c8d4d34ff5e30000000000002aa7"
     },
     "begin_line_cursor": {
@@ -15,23 +15,23 @@
       "source_hash": "f4c5c8d4d34ff5e30000000000002aa7"
     },
     "build_greeting": {
-      "image_id": "84b819d44670d4162e85bd86a01be47a10d820d978dd9152c651e0e927ccd9ef",
+      "image_id": "b0798040507411cec284773cf326db49778446e2e5f25444cd7acd4b68dc89c2",
       "source_hash": "f4c5c8d4d34ff5e30000000000002aa7"
     },
     "build_limited_recur_greeting": {
-      "image_id": "9440636f31d9d7d544d49029f561e974732e0ce3c4c2cce1ca455f88ff553f09",
+      "image_id": "7c2696856dc2cae128fff4935401d0c7622771ec1799d10ce51a6fe1eee16f1d",
       "source_hash": "f4c5c8d4d34ff5e30000000000002aa7"
     },
     "build_recur_draft_greeting": {
-      "image_id": "627da0e74f0c9e4a1a531bfdf56c9651be01027cf3670f9497344301d243b9e8",
+      "image_id": "d2437c5dc9b83a99939f9cc468def7f4872e7f99790586aaa251f0b4080cacf3",
       "source_hash": "f4c5c8d4d34ff5e30000000000002aa7"
     },
     "collect_line_chunk": {
-      "image_id": "8f166a76041dbfe97d5300278ebcb26fc9e07ff8f969eaf71093510161b9bcf6",
+      "image_id": "f1108147681e00f37d2b8ecd077ed3402b718d066610e8ed968dd1571fdaff6e",
       "source_hash": "f4c5c8d4d34ff5e30000000000002aa7"
     },
     "compute_recur_max_line_len": {
-      "image_id": "6065007b1bc23c263f3da31463c4cf720cbf928205dc0202235d3a2cc1f1b557",
+      "image_id": "ce646fdff39535f88b245420c34baf8d8b9793ceeeb4e3bfc396e1465e690093",
       "source_hash": "f4c5c8d4d34ff5e30000000000002aa7"
     },
     "concat_messages": {
@@ -87,7 +87,7 @@
       "source_hash": "f4c5c8d4d34ff5e30000000000002aa7"
     },
     "push_draft_greeting_line": {
-      "image_id": "3dfd397bf10abb399ebd40d771527d94024fbb7cea00295d236d205b74357ffd",
+      "image_id": "82b5d4bfbdd26deed656247638c6af4d8c64033f3f4f41deca66c2a68caddcd2",
       "source_hash": "f4c5c8d4d34ff5e30000000000002aa7"
     },
     "raster_wish": {
@@ -104,5 +104,5 @@
     "build_mode": "local",
     "rustc": "rustc 1.94.1-dev (06e01cb0d 2026-04-09)"
   },
-  "guest_inputs": "7e094364182ede2b3e56cc69b3f9fc056471166e79b44adf04a3cd50d858a1f5"
+  "guest_inputs": "96a1d96d6d2ee624694fb9deaeb411e2bd65e6c7604b6eab85c39a69cac08e1d"
 }

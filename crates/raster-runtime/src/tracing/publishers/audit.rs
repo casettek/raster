@@ -3,7 +3,7 @@
 //! at a divergence.
 use super::Publisher;
 use crate::tracing::proof_input::{
-    build_step_selections, build_step_storage, capture_step_io, CapturedStepIo,
+    build_step_selections, build_step_storage, take_step_io, CapturedStepIo,
 };
 use crate::TraceRecorder;
 use raster_compiler::{CfsBuilder, Project};
@@ -98,6 +98,10 @@ impl AuditPublisher {
 }
 impl Publisher for AuditPublisher {
     fn publish(&self, event: TraceEvent) {
+        self.publish_returning(event);
+    }
+
+    fn publish_returning(&self, event: TraceEvent) -> Option<TraceEvent> {
         let mut state = self.state.lock().expect("audit lock");
         assert!(
             !state.completed && !state.finished,
@@ -115,10 +119,9 @@ impl Publisher for AuditPublisher {
         state.completed = matches!(&event, TraceEvent::ProgramEnd(_));
         let recur = state.recorder.live_recur_progress();
         let writes_before = state.recorder.storage_writes();
-        let step = state.recorder.record(event);
+        let step = state.recorder.record(&event);
         let sources = state.sources.witnesses(&step, &state.cursor);
-        let captured = capture_step_io(&step, &state.recorder);
-        state.recorder.release_live_step(&step);
+        let captured = take_step_io(&step, &mut state.recorder);
         state.window.push_back(WindowEntry {
             captured,
             sources,
@@ -187,6 +190,7 @@ impl Publisher for AuditPublisher {
             // generation; a non-success exit alone is insufficient authorization.
             std::process::exit(DIVERGENCE_EXIT_CODE);
         }
+        Some(event)
     }
     fn finish(&self) {
         let mut state = self.state.lock().expect("audit lock");

@@ -92,9 +92,20 @@ pub mod runtime {
 // Runtime helpers are only available with std feature.
 #[cfg(feature = "std")]
 pub use raster_runtime::{
-    entry_argument_spec, finish, init, init_with, publish_trace_event, start_program,
-    take_recur_item_binding, EntryArgumentSpec, EntryArgumentsBinding,
+    entry_argument_spec, finish, init, init_with, note_untraced_tile, publish_trace_event,
+    start_program, take_recur_item_binding, trace_events_consumed, EntryArgumentSpec,
+    EntryArgumentsBinding,
 };
+
+/// What a generated tile wrapper uses to leave its input `data` to the
+/// publisher. Not public API.
+#[cfg(feature = "std")]
+#[doc(hidden)]
+pub mod __deferred_input {
+    pub use raster_runtime::{
+        publish_tile_event, DeferArg, DeferByClone, DeferredInput, EncodeNow, InputPart,
+    };
+}
 
 /// Guest tiles still expand `::raster::take_recur_item_binding()`; the host
 /// driver is the only caller that ever stashes a binding. On `no_std` there is
@@ -795,3 +806,5 @@ pub mod prelude {
     #[cfg(feature = "std")]
     pub use crate::{resolve_storage_value, store_value};
 }
+
+pub use crate::core::SnapshotClone;

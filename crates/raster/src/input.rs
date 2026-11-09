@@ -3457,3 +3457,8 @@ pub fn stored_object_output(
 ) -> raster_core::Result<raster_core::trace::FnOutput> {
     raster_runtime::stored_object_output(reference, ty)
 }
+
+// Owned wrappers: a clone is a snapshot when the value's is. At the end of the
+// file so no existing line moves (see `raster_core::SnapshotClone`).
+impl<T: raster_core::SnapshotClone> raster_core::SnapshotClone for RecurInput<T> {}
+impl<T: raster_core::SnapshotClone> raster_core::SnapshotClone for RecurState<T> {}
