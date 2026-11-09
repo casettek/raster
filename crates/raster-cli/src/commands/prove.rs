@@ -38,12 +38,8 @@ pub fn verify(
     cfs: &ControlFlowSchema,
 ) -> Result<VerificationResult> {
     let trace_commitment = read_trace_commitment(commit_path)?;
-
-    if trace.len() != trace_commitment.len() {
-        return Err(Error::Other(
-            "execution and commitment lengths differ".into(),
-        ));
-    }
+    // A commitment that ends before or after the trace does is refuted by
+    // the window ending where the two disagree, not rejected here.
     let mut trace_verifier = TraceVerifier::new(trace_commitment, &EMPTY_LEAF, cfs)
         .map_err(|e| Error::Other(e.to_string()))?;
 

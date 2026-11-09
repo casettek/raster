@@ -336,6 +336,57 @@ impl RasterIndex {
         Ok(index)
     }
 
+    /// Roughly the heap this index holds: its nodes and everything they own.
+    /// Parsed, an index is two to three times its encoding (a node is 112
+    /// bytes before its vectors, and a list's element ids widen from varints
+    /// to `u64`), so a cache charging the encoded length holds far more than
+    /// its budget. A `base` is shared with the object it came from and not
+    /// counted; allocator overhead is not either.
+    pub(crate) fn heap_size(&self) -> usize {
+        use std::mem::size_of;
+        fn fields(fields: &Vec<RasterStructField>) -> usize {
+            fields.capacity() * size_of::<RasterStructField>()
+                + fields
+                    .iter()
+                    .map(|field| field.name.capacity())
+                    .sum::<usize>()
+        }
+        fn levels(levels: &Vec<RasterMerkleLevel>) -> usize {
+            levels.capacity() * size_of::<RasterMerkleLevel>()
+                + levels
+                    .iter()
+                    .map(|level| level.hashes.capacity() * size_of::<Hash32>())
+                    .sum::<usize>()
+        }
+        let owned: usize = self
+            .nodes
+            .iter()
+            .map(|node| match &node.kind {
+                RasterNodeKind::Unit => 0,
+                RasterNodeKind::Leaf { type_name } => type_name.capacity(),
+                RasterNodeKind::Struct { fields: f } => fields(f),
+                RasterNodeKind::List {
+                    elements,
+                    merkle_levels,
+                    ..
+                } => elements.capacity() * size_of::<u64>() + levels(merkle_levels),
+                RasterNodeKind::ListContinuation {
+                    extra_elements,
+                    level_tails,
+                    ..
+                } => extra_elements.capacity() * size_of::<u64>() + levels(level_tails),
+                RasterNodeKind::Map { entries } => entries.capacity() * size_of::<RasterMapEntry>(),
+                RasterNodeKind::EnumUnit { variant }
+                | RasterNodeKind::EnumNewtype { variant, .. } => variant.capacity(),
+                RasterNodeKind::EnumTuple { variant, elements } => {
+                    variant.capacity() + elements.capacity() * size_of::<u64>()
+                }
+                RasterNodeKind::EnumStruct { variant, fields: f } => variant.capacity() + fields(f),
+            })
+            .sum();
+        self.nodes.capacity() * size_of::<RasterNode>() + owned
+    }
+
     #[allow(dead_code)]
     pub(crate) fn encode(&self) -> Result<Vec<u8>> {
         self.validate()?;

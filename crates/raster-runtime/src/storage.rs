@@ -124,13 +124,25 @@ impl std::fmt::Debug for ObjectStore {
 /// Disk-backed objects recently read, so a run of small reads from one large
 /// object parses its index once and leaves its bytes on disk. An object never
 /// changes once written, so an entry is never stale; the budget bounds the
-/// indexes and small values held.
-#[derive(Default)]
+/// parsed indexes, pieces and small values held.
 struct LoadedObjects {
     objects: BTreeMap<CfsCoordinates, (Arc<StoredObject>, u64, usize)>,
     by_use: BTreeMap<u64, CfsCoordinates>,
     clock: u64,
     resident: usize,
+    budget: usize,
+}
+
+impl Default for LoadedObjects {
+    fn default() -> Self {
+        Self {
+            objects: BTreeMap::new(),
+            by_use: BTreeMap::new(),
+            clock: 0,
+            resident: 0,
+            budget: LOADED_OBJECTS_BUDGET,
+        }
+    }
 }
 
 const LOADED_OBJECTS_BUDGET: usize = 256 << 20;
@@ -149,10 +161,10 @@ impl LoadedObjects {
 
     fn insert(&mut self, coordinates: CfsCoordinates, stored: Arc<StoredObject>, resident: usize) {
         let resident = resident + LOADED_OBJECT_OVERHEAD;
-        if resident > LOADED_OBJECTS_BUDGET {
+        if resident > self.budget {
             return;
         }
-        while self.resident + resident > LOADED_OBJECTS_BUDGET {
+        while self.resident + resident > self.budget {
             let Some((_, oldest)) = self.by_use.pop_first() else {
                 break;
             };
@@ -2706,6 +2718,73 @@ mod tests {
             loaded.get(&CfsCoordinates(vec![5])).is_none(),
             "oversized is not cached"
         );
+    }
+
+    /// Objects loaded from disk are charged for their index as parsed, which
+    /// is about twice its encoding here: a budget that would hold all four
+    /// lists by encoded length holds two, and a read of an evicted one loads
+    /// it again and still answers.
+    #[test]
+    fn loaded_objects_are_charged_as_parsed_and_evicted_within_budget() {
+        use raster_core::input::SelectorSegment;
+        let mut store = ObjectStore::with_storage(crate::WorkingStorage::Disk);
+        let mut objects = Vec::new();
+        for key in 1..=4u64 {
+            let value: raster_core::List<u64> = (0..16384u64).map(|i| i * key).collect();
+            let (bytes, index_bytes, root) = crate::encode_raster_value(&value).unwrap();
+            let root_hash: [u8; 32] = (0..32)
+                .map(|i| u8::from_str_radix(&root[i * 2..i * 2 + 2], 16).unwrap())
+                .collect::<Vec<_>>()
+                .try_into()
+                .unwrap();
+            let entry = store.append_serialized_bytes(
+                &raster_core::postcard::to_allocvec(&value).unwrap(),
+                CfsCoordinates(vec![key as i32]),
+                Some(raster_core::trace::RasterPayload {
+                    bytes,
+                    index_bytes: index_bytes.clone(),
+                    root_hash,
+                }),
+            );
+            let parsed = crate::raster_index::RasterIndex::from_bytes(&index_bytes)
+                .unwrap()
+                .heap_size();
+            let reference = StorageRef::new(entry.coordinates, entry.object_commitment);
+            objects.push((key, reference, index_bytes.len(), parsed));
+        }
+        let (_, _, encoded, parsed) = objects[0];
+        assert!(parsed > encoded * 3 / 2, "parsed {parsed} vs encoded {encoded}");
+        let budget = parsed * 5 / 2;
+        assert!(
+            4 * (encoded + LOADED_OBJECT_OVERHEAD) <= budget,
+            "the old charge would fit all four"
+        );
+        store.loaded.lock().unwrap().budget = budget;
+
+        let read = |store: &ObjectStore, key: u64, reference: &StorageRef| {
+            let selector = SelectorPath::new(vec![SelectorSegment::Index(100)]);
+            assert_eq!(store.select::<u64>(reference, &selector).unwrap().value, 100 * key);
+        };
+        for (key, reference, _, _) in &objects {
+            read(&store, *key, reference);
+        }
+        {
+            let loaded = store.loaded.lock().unwrap();
+            assert!(loaded.resident <= budget);
+            let cached: Vec<i32> = loaded.objects.keys().map(|c| c.0[0]).collect();
+            assert_eq!(cached, vec![3, 4], "only the two most recent fit");
+            for (stored, _, charged) in loaded.objects.values() {
+                let ObjectBacking::Archived(archived) = &stored.backing else {
+                    panic!("a disk raster object loads archived");
+                };
+                assert!(*charged >= archived.index.heap_size() + archived.pieces.heap_size());
+            }
+        }
+        let (key, reference, _, _) = &objects[0];
+        read(&store, *key, reference);
+        let loaded = store.loaded.lock().unwrap();
+        assert!(loaded.objects.contains_key(&CfsCoordinates(vec![1])), "reloaded");
+        assert!(loaded.resident <= budget);
     }
 
     /// Storage as of a past write count, by rewinding or by rebuilding, is

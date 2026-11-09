@@ -21,6 +21,16 @@ pub fn audit(
     report: PathBuf,
     format: crate::TraceFormat,
 ) -> Result<()> {
+    // Before the error-report fallback below: a refused audit writes nothing.
+    let mut inputs = vec![
+        ("trace", trace.clone()),
+        ("commitment", std::path::PathBuf::from(commitment)),
+    ];
+    inputs.extend(input_files(Some(input), Some(manifest)));
+    check_outputs(
+        &inputs,
+        &[("--proof-output", &proof_output), ("--report", &report)],
+    )?;
     let result = audit_inner(
         project,
         trace,
@@ -57,11 +67,7 @@ fn audit_inner(
     let (records, recorder) =
         load_trace_from_file(&trace, format, &cfs, Some(input), Some(manifest))?;
     let disputed = read_trace_commitment(commitment)?;
-    if records.len() != disputed.len() {
-        return Err(Error::Other(
-            "execution and commitment lengths differ".into(),
-        ));
-    }
+    // Lengths that differ are a fault `verify` proves, not an error.
     let result = verify(&records, commitment, &cfs)?;
     let audit_ms = started.elapsed().as_secs_f64() * 1000.0;
     let outcome = match result {
@@ -158,6 +164,120 @@ fn publish(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Refuse outputs that would replace an input or each other. Call it before
+/// anything is written, an error report included, so a refused command
+/// leaves every file as it was.
+fn check_outputs(
+    inputs: &[(&str, std::path::PathBuf)],
+    outputs: &[(&str, &std::path::Path)],
+) -> Result<()> {
+    let outputs = outputs
+        .iter()
+        .map(|(label, path)| Ok((*label, resolve_path(path).map_err(Error::Io)?)))
+        .collect::<Result<Vec<_>>>()?;
+    for (at, (label, path)) in outputs.iter().enumerate() {
+        if let Some((other, _)) = outputs[..at]
+            .iter()
+            .find(|(_, other)| same_file(path, other))
+        {
+            return Err(Error::Other(format!(
+                "{other} and {label} must be different files ({})",
+                path.display()
+            )));
+        }
+        for (input, input_path) in inputs {
+            if same_file(path, &resolve_path(input_path).map_err(Error::Io)?) {
+                return Err(Error::Other(format!(
+                    "{label} would replace the {input} ({})",
+                    path.display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A path as the filesystem resolves it, for one that may not exist yet: its
+/// parent's canonical path, so `./x`, `dir/../x` and a symlinked directory
+/// all name the same file.
+fn resolve_path(path: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+    if let Ok(path) = std::fs::canonicalize(path) {
+        return Ok(path);
+    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(std::path::Path::new("."));
+    match (std::fs::canonicalize(parent), path.file_name()) {
+        (Ok(parent), Some(name)) => Ok(parent.join(name)),
+        _ => std::path::absolute(path),
+    }
+}
+
+/// Two resolved paths naming one file, a hard link included.
+fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
+    if a == b {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let (Ok(a), Ok(b)) = (std::fs::metadata(a), std::fs::metadata(b)) {
+            return a.dev() == b.dev() && a.ino() == b.ino();
+        }
+    }
+    false
+}
+
+/// The files an audit reads its inputs from: the input document and the
+/// manifest when they are files rather than inline JSON, and the data files
+/// the document names. An unreadable document names none here; the audit
+/// reports it.
+fn input_files(
+    input: Option<&str>,
+    manifest: Option<&str>,
+) -> Vec<(&'static str, std::path::PathBuf)> {
+    let mut files: Vec<_> = [(input, "input"), (manifest, "input manifest")]
+        .into_iter()
+        .filter_map(|(raw, label)| {
+            raw.filter(|raw| std::path::Path::new(raw).is_file())
+                .map(|raw| (label, std::path::PathBuf::from(raw)))
+        })
+        .collect();
+    let entries = crate::utils::authorization::read_json_source(input, "input")
+        .ok()
+        .filter(|bytes| !bytes.is_empty())
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+    if let Some(entries) = entries {
+        files.extend(
+            input_document_files(input, &entries)
+                .into_iter()
+                .map(|path| ("input data file", path)),
+        );
+    }
+    files
+}
+
+/// The data files an input document names, resolved as the program resolves
+/// them: next to the document when it is a file.
+fn input_document_files(
+    raw: Option<&str>,
+    entries: &raster_core::input::InputDocument,
+) -> Vec<std::path::PathBuf> {
+    let base = raw
+        .filter(|s| std::path::Path::new(s).is_file())
+        .and_then(|s| std::path::Path::new(s).parent())
+        .unwrap_or(std::path::Path::new("."));
+    let mut files = Vec::new();
+    for entry in entries.values() {
+        files.push(base.join(entry.path()));
+        if let Some(index) = entry.index_path() {
+            files.push(base.join(index));
+        }
+    }
+    files
+}
+
 /// Recover commitment generation after execution succeeded but trace processing failed.
 pub fn commit_recorded(
     project: PathBuf,
@@ -168,6 +288,9 @@ pub fn commit_recorded(
     window: usize,
     format: crate::TraceFormat,
 ) -> Result<()> {
+    let mut inputs = vec![("trace", trace.clone())];
+    inputs.extend(input_files(Some(input), Some(manifest)));
+    check_outputs(&inputs, &[("--output", &output)])?;
     let project = Project::new(project)?;
     let cfs = CfsBuilder::new(&project).build()?;
     let config = raster_prover::trace::FraudProofConfig::from_window_size(window)
@@ -207,22 +330,12 @@ pub fn run_live(
             "audit.json"
         })
     });
-    let resolve_output =
-        |path: &std::path::Path| std::fs::canonicalize(path).or_else(|_| std::path::absolute(path));
-    if resolve_output(&proof_output).map_err(Error::Io)?
-        == resolve_output(&report).map_err(Error::Io)?
-    {
-        return Err(Error::Other("proof output and report must differ".into()));
-    }
-    for destination in [&proof_output, &report] {
-        let resolved = std::fs::canonicalize(destination)
-            .unwrap_or(std::path::absolute(destination).map_err(Error::Io)?);
-        if resolved == disputed_path {
-            return Err(Error::Other(
-                "audit output cannot replace the disputed commitment".into(),
-            ));
-        }
-    }
+    let mut inputs = vec![("disputed commitment", disputed_path.clone())];
+    inputs.extend(input_files(input, manifest));
+    check_outputs(
+        &inputs,
+        &[("proof output", &proof_output), ("report", &report)],
+    )?;
     let mut cancellation = AuditCancellation::install()?;
     let mut failure_report = None;
     let result = (|| -> Result<()> {
@@ -561,16 +674,7 @@ fn audit_context(
         if label == "input" && !bytes.is_empty() {
             let entries: raster_core::input::InputDocument = serde_json::from_slice(&bytes)
                 .map_err(|e| Error::Other(format!("invalid audit input document: {e}")))?;
-            let base = raw
-                .filter(|s| std::path::Path::new(s).is_file())
-                .and_then(|s| std::path::Path::new(s).parent())
-                .unwrap_or(std::path::Path::new("."));
-            for entry in entries.values() {
-                files.push(base.join(entry.path()));
-                if let Some(index) = entry.index_path() {
-                    files.push(base.join(index));
-                }
-            }
+            files.extend(input_document_files(raw, &entries));
         }
     }
     for path in files {
@@ -704,6 +808,137 @@ mod live_tests {
         assert!(publish_pair(proof_pending, &receipt, report_pending, &report).is_err());
         assert_eq!(std::fs::read(receipt).unwrap(), b"previous valid receipt");
     }
+    /// An evidence directory: a trace, a commitment, and an input document
+    /// naming one data file, each holding its own name.
+    fn evidence() -> (tempfile::TempDir, [std::path::PathBuf; 5]) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = |name: &str| dir.path().join(name);
+        let files = [
+            path("trace.bin"),
+            path("commit.bin"),
+            path("input.json"),
+            path("manifest.json"),
+            path("data.rastered"),
+        ];
+        for file in &files[..2] {
+            std::fs::write(file, file.file_name().unwrap().as_encoded_bytes()).unwrap();
+        }
+        std::fs::write(
+            &files[2],
+            br#"{"data":{"path":"data.rastered","load_preference":"read"}}"#,
+        )
+        .unwrap();
+        std::fs::write(&files[3], b"{}").unwrap();
+        std::fs::write(&files[4], b"data").unwrap();
+        (dir, files)
+    }
+
+    fn contents(files: &[std::path::PathBuf]) -> Vec<Vec<u8>> {
+        files
+            .iter()
+            .map(|file| std::fs::read(file).unwrap())
+            .collect()
+    }
+
+    fn trace_audit(
+        files: &[std::path::PathBuf; 5],
+        proof_output: std::path::PathBuf,
+        report: std::path::PathBuf,
+    ) -> Result<()> {
+        let [trace, commitment, input, manifest, _] = files;
+        // A project whose CFS builds, so an audit that passes the check fails
+        // only later, on the trace, which is not one.
+        let project = trace.parent().unwrap().join("project");
+        std::fs::create_dir_all(project.join("src")).unwrap();
+        std::fs::write(
+            project.join("Cargo.toml"),
+            "[package]\nname=\"audit-paths-test\"\nversion=\"0.1.0\"\nedition=\"2021\"\n[workspace]\n",
+        )
+        .unwrap();
+        std::fs::write(project.join("src/main.rs"), "#[sequence] fn main() {} ").unwrap();
+        audit(
+            project,
+            trace.clone(),
+            input.to_str().unwrap(),
+            manifest.to_str().unwrap(),
+            commitment.to_str().unwrap(),
+            proof_output,
+            report,
+            crate::TraceFormat::Binary,
+        )
+    }
+
+    /// Outputs that would replace evidence, or each other, are refused before
+    /// anything runs, and the refusal writes no error report over them.
+    #[test]
+    fn trace_audit_refuses_outputs_that_replace_its_evidence() {
+        let (dir, files) = evidence();
+        let before = contents(&files);
+        let fresh = dir.path().join("fresh.json");
+        let receipt = dir.path().join("fault.receipt");
+        let spelled = dir.path().join(".").join("trace.bin");
+        let linked = dir.path().join("commit-link.bin");
+        std::fs::hard_link(&files[1], &linked).unwrap();
+        for (proof_output, report, reason) in [
+            (receipt.clone(), files[1].clone(), "replace the commitment"),
+            (fresh.clone(), fresh.clone(), "must be different files"),
+            (receipt.clone(), spelled, "replace the trace"),
+            (linked, fresh.clone(), "replace the commitment"),
+            (receipt.clone(), files[2].clone(), "replace the input"),
+            (
+                receipt.clone(),
+                files[3].clone(),
+                "replace the input manifest",
+            ),
+            (
+                files[4].clone(),
+                fresh.clone(),
+                "replace the input data file",
+            ),
+        ] {
+            let error = trace_audit(&files, proof_output, report).unwrap_err();
+            assert!(error.to_string().contains(reason), "{error}");
+            assert_eq!(contents(&files), before, "after: {error}");
+            assert!(!fresh.exists() && !receipt.exists(), "after: {error}");
+        }
+    }
+
+    /// Distinct outputs pass the check; this audit then fails on its trace
+    /// and reports that, as before.
+    #[test]
+    fn trace_audit_with_distinct_outputs_still_reports_its_error() {
+        let (dir, files) = evidence();
+        let report = dir.path().join("audit.json");
+        assert!(trace_audit(&files, dir.path().join("fault.receipt"), report.clone()).is_err());
+        let report: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(report).unwrap()).unwrap();
+        assert_eq!(report["outcome"], "error");
+    }
+
+    #[test]
+    fn trace_commit_refuses_to_replace_its_trace() {
+        let (_dir, files) = evidence();
+        let before = contents(&files);
+        let [trace, _, input, manifest, _] = &files;
+        let error = commit_recorded(
+            "/nonexistent-project".into(),
+            trace.clone(),
+            input.to_str().unwrap(),
+            manifest.to_str().unwrap(),
+            trace.clone(),
+            32,
+            crate::TraceFormat::Binary,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("--output would replace the trace"),
+            "{error}"
+        );
+        assert_eq!(contents(&files), before);
+    }
+
     #[test]
     fn publication_preparation_preserves_existing_receipt_on_error() {
         let dir = tempfile::tempdir().unwrap();

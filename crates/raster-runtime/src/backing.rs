@@ -224,6 +224,12 @@ impl PieceTable {
         }
         Ok(out)
     }
+
+    /// The heap the table itself holds. A piece's source is an archive handle
+    /// or a buffer shared with other objects, so only the pieces are counted.
+    pub(crate) fn heap_size(&self) -> usize {
+        self.pieces.capacity() * std::mem::size_of::<Piece>()
+    }
 }
 
 impl RasterData for PieceTable {
@@ -1199,7 +1205,9 @@ impl PersistedBacking {
     }
 
     /// The backing a read uses, and roughly how much memory it holds: a
-    /// raster object's bytes stay on disk, only its parsed index is resident.
+    /// raster object's bytes stay on disk; its parsed index, its pieces and a
+    /// derived object's delta are resident. The index is charged as parsed,
+    /// not as encoded, which is two to three times smaller.
     pub(crate) fn load(
         self,
         archive: &raster_prover::archive::Archive,
@@ -1223,23 +1231,24 @@ impl PersistedBacking {
                 raster: Some(payload),
                 ..
             } => {
-                let index_bytes = read_blob(archive, payload.index_bytes)?;
+                let index = RasterIndex::from_bytes(&read_blob(archive, payload.index_bytes)?)?;
                 let mut pieces = PieceTable::default();
                 pieces.push(
                     PieceSource::Disk(archive.clone(), payload.bytes),
                     0,
                     payload.bytes.len,
                 );
+                let resident = index.heap_size() + pieces.heap_size();
                 (
                     ObjectBacking::Archived(ArchivedObject {
                         pieces: Arc::new(pieces),
-                        index: Arc::new(RasterIndex::from_bytes(&index_bytes)?),
+                        index: Arc::new(index),
                         root: payload.root_hash,
                         archive: archive.clone(),
                         bytes: payload.bytes,
                         index_bytes: payload.index_bytes,
                     }),
-                    index_bytes.len(),
+                    resident,
                 )
             }
             Self::Derived {
@@ -1252,15 +1261,20 @@ impl PersistedBacking {
                 for (blob, offset, len) in pieces {
                     table.push(PieceSource::Disk(archive.clone(), blob), offset, len);
                 }
-                let index = read_blob(archive, index)?;
-                let resident = index.len()
-                    + delta
-                        .as_ref()
-                        .map_or(0, |delta| delta.overlay_nodes.len() + delta.tail.len());
+                let index = RasterIndex::from_bytes(&read_blob(archive, index)?)?;
+                let resident = index.heap_size()
+                    + table.heap_size()
+                    + delta.as_ref().map_or(0, |delta| {
+                        delta.overlay_nodes.capacity()
+                            + delta.tail.capacity()
+                            + delta.base_commitment.capacity()
+                            + delta.segments.capacity()
+                                * std::mem::size_of::<raster_core::trace::DerivedSegment>()
+                    });
                 (
                     ObjectBacking::Derived(DerivedObject {
                         pieces: Arc::new(table),
-                        index: Arc::new(RasterIndex::from_bytes(&index)?),
+                        index: Arc::new(index),
                         root,
                         delta: delta.map(Arc::new),
                     }),

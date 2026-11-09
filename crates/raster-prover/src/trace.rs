@@ -1192,6 +1192,21 @@ impl<C: CommitmentRead> TraceVerifier<C> {
         None
     }
 
+    /// The window ending at item `index`, the last one pushed through
+    /// [`Self::push_root`], for a trace whose every item matched but which
+    /// ends somewhere other than the commitment does: the commitment stops at
+    /// `index` while execution goes on, or execution ends at `index` while the
+    /// commitment goes on. The guest proves either (`window_end`), as
+    /// [`Self::verify`] finds them for a recorded trace.
+    pub fn length_fault_window(
+        &self,
+        index: usize,
+        frontier_at: impl FnOnce(u64) -> TraceTreeFrontier,
+    ) -> TraceWindow {
+        let first_item = (index + 1).saturating_sub(self.window_size);
+        self.window_at(index, frontier_at(first_item as u64 + 1))
+    }
+
     /// Whether the trace root after item `index` refutes the commitment there.
     fn diverges_at(&self, index: usize, root: &[u8]) -> bool {
         // Across the final window the committed roots are revealed in full,
@@ -1985,6 +2000,50 @@ mod tests {
         assert_eq!(window_start + window_len, trace.len(), "ends at the honest end");
         assert!(window_start + window_len < fingerprint_len, "not terminal");
         assert_eq!(evidence.window.items.last(), trace.last());
+    }
+
+    /// Live audit drives `push_root` over the source tracker's tree and, when
+    /// every item matched but the two end apart, asks for the length-fault
+    /// window. It must be the window a recorded `verify` finds for the same
+    /// truncated or padded commitment.
+    #[test]
+    fn a_live_length_fault_window_is_the_one_verify_finds() {
+        let encode = |window: &TraceWindow| raster_core::bincode::serialize(window).unwrap();
+        let trace = Trace((0..8).map(|i| make_tile_trace_item(i, i)).collect());
+        let truncated = Trace(trace.iter().take(6).cloned().collect());
+        let mut padded = trace.clone();
+        padded.0.extend((8..11).map(|i| make_tile_trace_item(i, i)));
+        let cfs = make_test_cfs();
+        // (commitment, the trace execution produces, the last item both hold)
+        for (committed, executed, last) in [(&truncated, &trace, 5), (&padded, &trace, 7)] {
+            let commitment =
+                TraceCommitment::build(committed, &EMPTY_LEAF, test_fraud_proof_config());
+            let VerificationResult::Fraud(expected) =
+                TraceVerifier::new(commitment.clone(), &EMPTY_LEAF, &cfs)
+                    .unwrap()
+                    .verify(executed)
+            else {
+                panic!("a length fault must be refutable");
+            };
+
+            let mut live = TraceVerifier::new(commitment, &EMPTY_LEAF, &cfs).unwrap();
+            let mut sources = SourceTracker::new();
+            for (index, step) in executed.iter().take(last + 1).enumerate() {
+                sources.append_hashed(step, step.hash());
+                let root = sources.tree().root().unwrap().0;
+                let divergence = live.push_root(index, step, &root, |size| {
+                    sources.tree().frontier_at(size).unwrap()
+                });
+                assert!(divergence.is_none(), "item {index} matches");
+            }
+            let window =
+                live.length_fault_window(last, |size| sources.tree().frontier_at(size).unwrap());
+            assert_eq!(
+                encode(&window),
+                encode(&expected.window),
+                "last item {last}"
+            );
+        }
     }
 
     /// Window geometry across the head boundary.
