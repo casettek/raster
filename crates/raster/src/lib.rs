@@ -806,3 +806,5 @@ pub mod prelude {
     #[cfg(feature = "std")]
     pub use crate::{resolve_storage_value, store_value};
 }
+
+pub use crate::core::SnapshotClone;

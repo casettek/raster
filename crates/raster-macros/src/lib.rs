@@ -4086,6 +4086,15 @@ pub fn derive_selectable(item: TokenStream) -> TokenStream {
             where
                 #(#field_types: ::raster::core::Materializable,)*
             {}
+
+            // Field-wise too: a clone of owned fields shares nothing. The
+            // bounds are higher-ranked so a field without the promise (a
+            // hand-written `Materializable`) makes the impl not apply, and the
+            // tile encodes the struct eagerly, rather than failing to compile.
+            impl #impl_generics ::raster::core::SnapshotClone for #ident #ty_generics
+            where
+                #(for<'__raster_snapshot> #field_types: ::raster::core::SnapshotClone,)*
+            {}
         }
     };
 

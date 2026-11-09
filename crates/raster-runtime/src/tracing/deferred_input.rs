@@ -9,10 +9,15 @@
 //! each argument before the call and sends the clones with the event; the
 //! publisher encodes them, on its own thread when it has one.
 //!
+//! The encoding happens after the call, so a clone must not share anything the
+//! tile could change: only [`SnapshotClone`] types are deferred, and any other
+//! argument is encoded before the call, as it was.
+//!
 //! The bytes are the same either way: postcard encodes a tuple as its elements
 //! one after another, so the parts concatenated are the tuple the wrapper
 //! encoded before.
 use raster_core::trace::TraceEvent;
+use raster_core::SnapshotClone;
 use serde::Serialize;
 
 /// An argument kept for encoding later.
@@ -104,8 +109,9 @@ pub(crate) fn take_input_data(event: &mut TraceEvent) -> Vec<u8> {
 }
 
 /// An argument of the generated wrapper, choosing how its part of `data` is
-/// made: a clone kept for later where the type allows it ([`DeferByClone`]),
-/// else encoded on the spot ([`EncodeNow`]). Call as
+/// made: a clone kept for later where the type promises the clone is an
+/// independent snapshot ([`DeferByClone`]), else encoded on the spot
+/// ([`EncodeNow`]). Call as
 /// `(&DeferArg(&value)).__raster_input_part()`, with both traits in scope:
 /// method lookup tries `DeferByClone` first and falls back to `EncodeNow`
 /// one auto-reference later, when the clone's bounds don't hold.
@@ -115,7 +121,7 @@ pub trait DeferByClone {
     fn __raster_input_part(&self) -> InputPart;
 }
 
-impl<T: Serialize + Clone + Send + 'static> DeferByClone for DeferArg<'_, T> {
+impl<T: SnapshotClone + Serialize + Clone + Send + 'static> DeferByClone for DeferArg<'_, T> {
     fn __raster_input_part(&self) -> InputPart {
         InputPart::Deferred(Box::new(self.0.clone()))
     }

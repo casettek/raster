@@ -1437,3 +1437,44 @@ mod tests {
         assert_eq!(page_range_for_region::<_, 0, 8>(&region), (0, 2));
     }
 }
+
+// At the end of the file, like everything added to it: guests embed the line of
+// every panic site, so lines added above existing code move their image ids.
+
+/// A promise that `Clone` gives an independent snapshot: encoding the clone
+/// later gives the bytes the original encoded to when it was cloned, whatever
+/// happens to the original in between.
+///
+/// A traced tile's input `data` is encoded after the call, from clones taken
+/// before it (`raster_runtime::tracing::deferred_input`). A clone that shares
+/// writable state with the argument (an `Arc<Mutex<_>>`, say) would let the
+/// tile change what the trace commits to as its input, so only types with this
+/// promise are deferred; every other argument is encoded before the call.
+/// Owned values keep it: scalars, `String`, `Block<T>`, `BytesPage`, and
+/// derived Rastered structs whose fields do.
+pub trait SnapshotClone {}
+
+macro_rules! impl_snapshot_clone_scalar {
+    ($($ty:ty),* $(,)?) => { $(impl SnapshotClone for $ty {})* };
+}
+impl_snapshot_clone_scalar!(
+    (), bool, char, String, u8, u16, u32, u64, u128, usize, i8, i16, i32, i64, i128, isize,
+);
+
+impl<T: SnapshotClone> SnapshotClone for Option<T> {}
+impl<T: SnapshotClone, const N: usize> SnapshotClone for [T; N] {}
+
+macro_rules! impl_snapshot_clone_tuple {
+    ($($name:ident),+) => {
+        impl<$($name: SnapshotClone),+> SnapshotClone for ($($name,)+) {}
+    };
+}
+impl_snapshot_clone_tuple!(A);
+impl_snapshot_clone_tuple!(A, B);
+impl_snapshot_clone_tuple!(A, B, C);
+impl_snapshot_clone_tuple!(A, B, C, D);
+impl_snapshot_clone_tuple!(A, B, C, D, E);
+impl_snapshot_clone_tuple!(A, B, C, D, E, F);
+
+impl<T: SnapshotClone> SnapshotClone for Block<T> {}
+impl SnapshotClone for BytesPage {}
