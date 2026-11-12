@@ -30,6 +30,8 @@ pub struct RunManifest {
     /// The `--input-manifest` the run was given, stored like `input`.
     pub input_manifest: Option<String>,
     pub trace_format: TraceFormat,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay_source: Option<String>,
     /// Hex sha256 of the CFS's JSON. A reader rebuilding the CFS from the
     /// project compares against it to notice that the project changed since
     /// the run. Not the program commitment: that needs `program.bin` or
@@ -58,6 +60,7 @@ impl RunManifest {
                 .transpose()?,
             project_root,
             trace_format,
+            replay_source: None,
             cfs_digest: cfs_digest(cfs)?,
         })
     }
@@ -79,7 +82,7 @@ impl RunManifest {
         })?;
         let manifest: Self = serde_json::from_slice(&bytes)
             .map_err(|error| Error::Other(format!("{} is malformed: {error}", path.display())))?;
-        if manifest.version != RUN_MANIFEST_VERSION {
+        if manifest.version != RUN_MANIFEST_VERSION && manifest.version != 2 {
             return Err(Error::Other(format!(
                 "{} has version {}, expected {RUN_MANIFEST_VERSION}",
                 path.display(),
@@ -213,7 +216,7 @@ mod tests {
             &cfs(),
         )
         .unwrap();
-        manifest.version = RUN_MANIFEST_VERSION + 1;
+        manifest.version = RUN_MANIFEST_VERSION + 2;
         manifest.write(&dir).unwrap();
         let foreign = RunManifest::read(&dir).unwrap_err().to_string();
         assert!(foreign.contains("version"), "{foreign}");

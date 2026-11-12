@@ -12,6 +12,7 @@
 
 include!(concat!(env!("OUT_DIR"), "/methods.rs"));
 
+pub mod archive;
 pub mod authorization;
 pub mod availability;
 pub mod chain_fraud;
@@ -19,8 +20,13 @@ pub mod defence;
 pub mod challenge;
 pub mod error;
 pub mod replay;
+pub mod estimate;
 pub mod trace;
 pub mod transition;
 pub mod utils;
 
 pub use error::{BitPackerError, Result};
+
+pub mod commitment_file;
+
+pub mod compression;

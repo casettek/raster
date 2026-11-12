@@ -4,6 +4,7 @@
 
 mod chain;
 mod commands;
+mod live_commitment;
 mod program;
 mod run_manifest;
 mod runtime_env;
@@ -24,7 +25,70 @@ enum Cli {
 }
 
 #[derive(Parser)]
+enum TraceCommand {
+    /// Commit an existing complete trace without executing the program again.
+    Commit {
+        #[arg(long)]
+        project: std::path::PathBuf,
+        #[arg(long)]
+        trace: std::path::PathBuf,
+        #[arg(long)]
+        input: String,
+        #[arg(long)]
+        input_manifest: String,
+        #[arg(long)]
+        output: std::path::PathBuf,
+        #[arg(long, default_value_t = 2)]
+        fraud_proof_window_size: usize,
+        #[arg(long, value_enum, default_value = "binary")]
+        trace_format: TraceFormat,
+    },
+    Audit {
+        #[arg(long)]
+        project: std::path::PathBuf,
+        #[arg(long)]
+        trace: std::path::PathBuf,
+        #[arg(long)]
+        input: String,
+        #[arg(long)]
+        input_manifest: String,
+        #[arg(long)]
+        commitment: String,
+        #[arg(long)]
+        proof_output: std::path::PathBuf,
+        #[arg(long)]
+        report: std::path::PathBuf,
+        #[arg(long, value_enum, default_value = "binary")]
+        trace_format: TraceFormat,
+    },
+}
+
+#[derive(Parser)]
+enum ProofCommand {
+    /// Compress a saved, verified fault receipt to Groth16 without replaying execution.
+    Compress {
+        #[arg(long)]
+        receipt: std::path::PathBuf,
+        #[arg(long)]
+        commitment: std::path::PathBuf,
+        /// New output directory; existing paths are never overwritten.
+        #[arg(long)]
+        output: std::path::PathBuf,
+    },
+}
+
+#[derive(Parser)]
 enum Commands {
+    /// Operations on saved fault proofs; no project directory is required.
+    Proof {
+        #[command(subcommand)]
+        command: ProofCommand,
+    },
+    /// Audit a recorded execution without running the stage again.
+    Trace {
+        #[command(subcommand)]
+        command: TraceCommand,
+    },
     /// Build tiles and generate schemas
     Build {
         /// Backend to use for compilation
@@ -199,7 +263,7 @@ enum Commands {
         #[arg(long = "input-manifest")]
         input_manifest: Option<String>,
 
-        /// Write trace to file (mutually exclusive with --audit)
+        /// Execute and write a commitment; raw traces require --save-trace
         #[arg(long, conflicts_with = "audit", requires = "fraud_proof_config")]
         commit: Option<String>,
 
@@ -229,9 +293,25 @@ enum Commands {
         #[arg(long = "fraud-step", requires = "commit")]
         fraud_step: Option<commands::fraud::FraudTarget>,
 
-        /// Read and verify trace from file (mutually exclusive with --commit)
+        /// Audit events live against this commitment; stop at divergence and prove it.
         #[arg(long, conflicts_with = "commit")]
         audit: Option<String>,
+
+        /// Execute fault-window guests and report cycles without generating proofs.
+        #[arg(long, requires = "audit", conflicts_with = "proof_output")]
+        estimate: bool,
+
+        /// Measure only the first N window steps (default: the complete window).
+        #[arg(long, requires = "estimate", value_parser = clap::value_parser!(u64).range(1..))]
+        estimate_steps: Option<u64>,
+
+        /// Verified Groth16 fault receipt destination (default: run artifacts/fault.receipt). Requires Docker.
+        #[arg(long, requires = "audit")]
+        proof_output: Option<std::path::PathBuf>,
+
+        /// Audit result report (default: run artifacts/audit.json).
+        #[arg(long, requires = "audit")]
+        report: Option<std::path::PathBuf>,
 
         /// Run without authenticated storage: tile outputs are passed as plain
         /// Rust values, nothing is hashed or stored between tiles, and no trace
@@ -250,7 +330,24 @@ enum Commands {
         #[arg(long = "show-output")]
         show_output: bool,
 
-        /// Trace transport format used between the user process and Raster CLI
+        /// Retain the raw trace alongside a live-generated commitment.
+        #[arg(long, requires = "commit", conflicts_with = "no_auth")]
+        save_trace: bool,
+
+        /// Measure all native calls while retaining bounded top candidates.
+        #[arg(long, requires="commit", conflicts_with_all=["capture_profile_calls","no_auth","audit","save_trace","fraud_step"])]
+        profile_native_top: bool,
+        #[arg(long, default_value_t = 3)]
+        profile_top_tiles: usize,
+        #[arg(long, default_value_t = 1)]
+        profile_calls_per_tile: usize,
+        /// Capture only exact invocations from a native selection document.
+        #[arg(long, requires="commit", conflicts_with_all=["profile_native_top","no_auth","audit","save_trace","fraud_step"])]
+        capture_profile_calls: Option<std::path::PathBuf>,
+        #[arg(long, default_value_t = 8589934592u64)]
+        sample_max_bytes: u64,
+
+        /// Raw trace format, used when a trace is recorded (including --save-trace).
         #[arg(long = "trace-format", value_enum, default_value = "binary")]
         trace_format: TraceFormat,
 
@@ -336,10 +433,12 @@ enum ChainCommand {
         #[arg(long = "show-output")]
         show_output: bool,
 
-        /// Trace transport format used between each stage process and the
-        /// Raster CLI. Transport only: every stage's commitment is built from
-        /// the decoded trace, so this changes no commitment and no audit.
-        /// Ignored under `--no-auth`, which records no trace at all.
+        /// Retain each stage's raw trace for later auditing or debugging.
+        #[arg(long, conflicts_with = "no_auth")]
+        save_trace: bool,
+
+        /// Saved trace format; only used with --save-trace.
+        /// The commitment is built live and is independent of this format.
         #[arg(long = "trace-format", value_enum, default_value = "binary")]
         trace_format: TraceFormat,
     },
@@ -509,7 +608,78 @@ fn try_main() -> Result<()> {
     let Cli::Raster(cmd) = Cli::parse();
 
     match cmd {
+        Commands::Proof {
+            command:
+                ProofCommand::Compress {
+                    receipt,
+                    commitment,
+                    output,
+                },
+        } => {
+            let report = raster_prover::compression::compress_fault(
+                &receipt,
+                &commitment,
+                &output,
+                |phase| {
+                    println!("Compression: {phase}");
+                    Ok(())
+                },
+            )?;
+            println!(
+                "Verified Groth16 receipt: {}",
+                output.join("fault.groth16.receipt").display()
+            );
+            println!(
+                "Proof seals: {} -> {} bytes; compression: {:.3}s",
+                report.input.seal_bytes,
+                report.output.seal_bytes,
+                report.compression_ms / 1000.0
+            );
+            Ok(())
+        }
         Commands::Build { backend, tile } => commands::build(backend, tile),
+        Commands::Trace {
+            command:
+                TraceCommand::Commit {
+                    project,
+                    trace,
+                    input,
+                    input_manifest,
+                    output,
+                    fraud_proof_window_size,
+                    trace_format,
+                },
+        } => commands::audit::commit_recorded(
+            project,
+            trace,
+            &input,
+            &input_manifest,
+            output,
+            fraud_proof_window_size,
+            trace_format,
+        ),
+        Commands::Trace {
+            command:
+                TraceCommand::Audit {
+                    project,
+                    trace,
+                    input,
+                    input_manifest,
+                    commitment,
+                    proof_output,
+                    report,
+                    trace_format,
+                },
+        } => commands::audit::audit(
+            project,
+            trace,
+            &input,
+            &input_manifest,
+            &commitment,
+            proof_output,
+            report,
+            trace_format,
+        ),
         Commands::RunTile {
             backend,
             tile,
@@ -550,6 +720,7 @@ fn try_main() -> Result<()> {
                 run_dir,
                 show_output,
                 trace_format,
+                save_trace,
             } => chain::run(
                 chain.as_deref(),
                 fraud_proof_window_size,
@@ -558,6 +729,7 @@ fn try_main() -> Result<()> {
                 run_dir.as_deref(),
                 show_output,
                 trace_format,
+                save_trace,
             ),
             ChainCommand::Audit {
                 chain,
@@ -583,7 +755,11 @@ fn try_main() -> Result<()> {
                 chain,
                 chain_commitment,
                 challenge,
-            } => chain::defend(chain.as_deref(), chain_commitment.as_deref(), challenge.as_deref()),
+            } => chain::defend(
+                chain.as_deref(),
+                chain_commitment.as_deref(),
+                challenge.as_deref(),
+            ),
             ChainCommand::DefendVerify { defence, challenge } => {
                 chain::defend_verify(&defence, challenge.as_deref())
             }
@@ -596,10 +772,20 @@ fn try_main() -> Result<()> {
             fraud_proof_config,
             fraud_step,
             audit,
+            estimate,
+            estimate_steps,
+            proof_output,
+            report,
             no_auth,
             verbose,
             show_output,
             trace_format,
+            save_trace,
+            profile_native_top,
+            profile_top_tiles,
+            profile_calls_per_tile,
+            capture_profile_calls,
+            sample_max_bytes,
             features,
             all_features,
             no_default_features,
@@ -611,10 +797,23 @@ fn try_main() -> Result<()> {
             fraud_proof_config,
             fraud_step.as_ref(),
             audit.as_deref(),
+            estimate.then_some(
+                estimate_steps.map(|n| usize::try_from(n).expect("step limit fits usize")),
+            ),
+            proof_output.as_deref(),
+            report.as_deref(),
             no_auth,
             verbose,
             show_output,
             trace_format,
+            save_trace,
+            commands::selective::Options {
+                timing: profile_native_top,
+                top_tiles: profile_top_tiles,
+                calls_per_tile: profile_calls_per_tile,
+                capture: capture_profile_calls,
+                max_bytes: sample_max_bytes,
+            },
             &features,
             all_features,
             no_default_features,
@@ -636,5 +835,49 @@ fn try_main() -> Result<()> {
             max_fields,
             depth,
         ),
+    }
+}
+
+#[cfg(test)]
+mod estimation_arguments {
+    use super::*;
+    #[test]
+    fn estimation_is_explicit_and_live_only() {
+        let parse = |args: &[&str]| {
+            Cli::try_parse_from(
+                ["cargo-raster", "raster"]
+                    .into_iter()
+                    .chain(args.iter().copied()),
+            )
+        };
+        for args in [
+            vec!["run", "--estimate"],
+            vec!["run", "--audit", "c", "--estimate-steps", "1"],
+            vec!["run", "--audit", "c", "--estimate", "--estimate-steps", "0"],
+            vec!["run", "--audit", "c", "--estimate", "--proof-output", "p"],
+            vec!["trace", "audit", "--estimate"],
+        ] {
+            assert!(parse(&args).is_err(), "{args:?}");
+        }
+        for (args, expected, limit) in [
+            (vec!["run", "--audit", "c"], false, None),
+            (vec!["run", "--audit", "c", "--estimate"], true, None),
+            (
+                vec!["run", "--audit", "c", "--estimate", "--estimate-steps", "1"],
+                true,
+                Some(1),
+            ),
+        ] {
+            let Cli::Raster(Commands::Run {
+                estimate,
+                estimate_steps,
+                ..
+            }) = parse(&args).unwrap()
+            else {
+                panic!()
+            };
+            assert_eq!(estimate, expected);
+            assert_eq!(estimate_steps, limit);
+        }
     }
 }

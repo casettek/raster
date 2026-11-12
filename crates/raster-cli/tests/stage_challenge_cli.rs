@@ -59,7 +59,10 @@ impl Scratch {
             .duration_since(UNIX_EPOCH)
             .expect("system time should be after epoch")
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("raster-challenge-{tag}-{nanos}"));
+        // Authenticated replay uses disk-backed archives; /tmp may be tmpfs.
+        let dir = workspace_root()
+            .join("target")
+            .join(format!("raster-challenge-{tag}-{nanos}"));
         fs::create_dir_all(&dir).expect("scratch dir should be creatable");
         let mut scratch = Self {
             dir,
@@ -132,9 +135,15 @@ impl Scratch {
     /// Post a forged challenge against `normalize`, check it is admitted,
     /// defend it and verify the defence; the `defend-verify` output.
     fn defend_forged(&self, forge: &str) -> String {
-        let stdout = assert_ok(&self.challenge(Some("normalize"), Some(forge)), "chain challenge");
+        let stdout = assert_ok(
+            &self.challenge(Some("normalize"), Some(forge)),
+            "chain challenge",
+        );
         assert!(stdout.contains("disputed challenge"), "{stdout}");
-        assert!(stdout.contains("stage            0 'normalize'"), "{stdout}");
+        assert!(
+            stdout.contains("stage            0 'normalize'"),
+            "{stdout}"
+        );
 
         let stdout = assert_ok(&self.challenge_verify(), "chain challenge-verify");
         assert!(stdout.contains("disputed challenge admitted"), "{stdout}");
@@ -179,7 +188,10 @@ fn assert_fails(output: &Output, what: &str) -> String {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(!output.status.success(), "{what} should have failed\n{combined}");
+    assert!(
+        !output.status.success(),
+        "{what} should have failed\n{combined}"
+    );
     combined
 }
 
@@ -223,7 +235,10 @@ fn a_mislabelled_output_is_defended_with_a_mislabel_proof() {
     let scratch = Scratch::new("claimed-output");
     let stdout = scratch.defend_forged("claimed-output");
     assert!(stdout.contains("reason           mislabelled"), "{stdout}");
-    assert!(stdout.contains("attested output"), "a mislabel attests the honest output\n{stdout}");
+    assert!(
+        stdout.contains("attested output"),
+        "a mislabel attests the honest output\n{stdout}"
+    );
 }
 
 #[test]
@@ -260,7 +275,10 @@ fn a_defence_answers_only_its_own_challenge() {
 
     // A different challenge against the same stage: posting it clears the old
     // defence from beside it, and the old defence does not answer it.
-    assert_ok(&scratch.challenge(Some("normalize"), Some("pad")), "chain challenge");
+    assert_ok(
+        &scratch.challenge(Some("normalize"), Some("pad")),
+        "chain challenge",
+    );
     assert!(
         !scratch.challenge_file("defence.bin").exists(),
         "a new challenge must not sit beside an earlier challenge's defence"
@@ -270,7 +288,10 @@ fn a_defence_answers_only_its_own_challenge() {
         &scratch.defend_verify(&defence, Some(&challenge)),
         "chain defend-verify against another challenge",
     );
-    assert!(combined.contains("the defence answers challenge"), "{combined}");
+    assert!(
+        combined.contains("the defence answers challenge"),
+        "{combined}"
+    );
 }
 
 #[test]

@@ -330,6 +330,9 @@ pub struct SelectionCommitment {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct SelectionWitness {
+    /// A byte buffer on the wire, for the reason given on
+    /// [`crate::trace::FnInput`].
+    #[serde(with = "serde_bytes")]
     pub bytes: Vec<u8>,
     pub proof: SelectionProof,
     /// Set **instead of** `bytes` when the step only *forwards* this binding as

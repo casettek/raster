@@ -19,6 +19,7 @@ name = "cargo-raster"
 path = "src/main.rs"
 
 [dependencies]
+tempfile = "3"
 raster-core = { workspace = true, features = ["std"] }
 raster-backend.workspace = true
 raster-backend-native.workspace = true
@@ -42,3 +43,6 @@ rand.workspace = true
 sha2.workspace = true
 toml = "0.8"
 serde = { workspace = true, features = ["derive"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

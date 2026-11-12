@@ -58,6 +58,15 @@ pub fn profile(run_dir: &str) -> Result<()> {
         );
     }
 
+    if manifest.version == 2 {
+        if manifest.replay_source.as_deref() != Some("selected-capture.json") {
+            return Err(Error::Other(
+                "run has no captured samples; run --capture-profile-calls first".into(),
+            ));
+        }
+        return profile_samples(&run_dir, &manifest, &project, &cfs);
+    }
+
     let (trace, recorder) = load_trace_from_file(
         &manifest.trace_path(&run_dir),
         manifest.trace_format,
@@ -74,11 +83,11 @@ pub fn profile(run_dir: &str) -> Result<()> {
     // The executor runs in this process, so this build's profile sets its speed.
     report.release_build = !cfg!(debug_assertions);
     let mut calls: BTreeMap<String, Vec<Candidate>> = BTreeMap::new();
-    for step in &trace.0 {
-        let Some(tile) = tile_id(step) else {
+    for step in trace.iter() {
+        let Some(tile) = tile_id(&step) else {
             continue;
         };
-        let (input, output) = recorded_io(&recorder, step)?;
+        let (input, output) = recorded_io(&recorder, &step)?;
         let candidate = Candidate {
             exec_index: step.exec_index,
             coordinates: step.coordinates.clone(),
@@ -307,5 +316,166 @@ mod tests {
     fn a_tile_with_few_calls_is_replayed_in_full() {
         assert_eq!(picked(vec![call(1, 1, 1), call(2, 2, 2)], 10).len(), 2);
         assert!(picked(vec![], 10).is_empty());
+    }
+}
+
+fn sample_bytes(
+    dir: &std::path::Path,
+    index: u64,
+    side: &str,
+    expected_len: u64,
+    hash: &str,
+) -> Result<Vec<u8>> {
+    let path = raster_runtime::selective_profile::payload_path(dir, index, side);
+    let meta = std::fs::symlink_metadata(&path)?;
+    if !meta.is_file()
+        || meta.file_type().is_symlink()
+        || meta.len() != expected_len
+        || std::fs::canonicalize(&path)? != path
+    {
+        return Err(Error::Other("invalid sample payload path or size".into()));
+    }
+    let data = std::fs::read(&path)?;
+    if raster_runtime::selective_profile::hash(&data) != hash {
+        return Err(Error::Other("sample payload hash mismatch".into()));
+    }
+    Ok(data)
+}
+fn profile_samples(
+    dir: &std::path::Path,
+    manifest: &crate::run_manifest::RunManifest,
+    project: &Project,
+    cfs: &raster_core::cfs::ControlFlowSchema,
+) -> Result<()> {
+    let samples = super::selective::read(&dir.join("selected-capture.json"))?;
+    samples.validate()?;
+    if samples.version != 1
+        || samples.kind != "selected-capture"
+        || !samples.complete
+        || samples.binding["identity"]
+            != super::selective::identity(
+                project,
+                cfs,
+                manifest.input.as_deref(),
+                manifest.input_manifest.as_deref(),
+            )?
+        || samples.binding["output_sha256"]
+            != super::selective::output_hash(&dir.join("output.bin"))?
+        || samples.binding["output_manifest_sha256"]
+            != super::selective::output_hash(&dir.join("output_manifest.json"))?
+    {
+        return Err(Error::Other("captured sample identity mismatch".into()));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for c in &samples.calls {
+        if c.exec_index == 0 || c.exec_index > samples.step_count || !seen.insert(c.exec_index) {
+            return Err(Error::Other("invalid captured execution index".into()));
+        }
+    }
+    let mut report = ReplayProfile::new(
+        &manifest.run_id,
+        cfs.tiles.iter().map(|t| t.id.clone()),
+        samples.calls_per_tile,
+    );
+    report.version = 5;
+    report.release_build = !cfg!(debug_assertions);
+    report.selection = Some(
+        serde_json::json!({"policy":"native-runtime","top_tiles":samples.top_tiles,"calls":samples.calls,"payload_bytes":samples.payload_bytes}),
+    );
+    for (tile, count) in &samples.calls_recorded {
+        report.tiles.entry(tile.clone()).or_default().calls_recorded = *count;
+    }
+    let backend = Risc0Backend::new(project.output_dir.clone())
+        .with_user_crate(project.root_dir.clone())
+        .with_guest_stdout(false);
+    let replayer = Replayer::new(&backend, project);
+    let lock = lock_image_ids(project);
+    let outcome = (|| -> Result<()> {
+        for call in &samples.calls {
+            let measured = (|| -> Result<_> {
+                let prepared = replayer.prepare_profile(&call.tile_id)?;
+                let image = prepared.image_id();
+                if lock.get(&call.tile_id) != Some(&image) {
+                    return Err(Error::Other(
+                        "selected guest identity differs from Raster.lock".into(),
+                    ));
+                }
+                let input = sample_bytes(
+                    dir,
+                    call.exec_index,
+                    "input",
+                    call.input_bytes,
+                    &call.input_sha256,
+                )?;
+                let output = sample_bytes(
+                    dir,
+                    call.exec_index,
+                    "output",
+                    call.output_bytes,
+                    &call.output_sha256,
+                )?;
+                Ok((image, prepared.measure(&input, &output)?))
+            })();
+            let (image, m) = match measured {
+                Ok(v) => v,
+                Err(e) => {
+                    report.failure = Some(ReplayFailure {
+                        tile: call.tile_id.clone(),
+                        exec_index: call.exec_index,
+                        coordinates: call.coordinates.clone(),
+                        message: e.to_string(),
+                    });
+                    return Err(e);
+                }
+            };
+            let entry = report
+                .tiles
+                .get_mut(&call.tile_id)
+                .ok_or_else(|| Error::Other("selected tile absent from CFS".into()))?;
+            entry.image_id = Some(image.clone());
+            entry.lock_image_id = Some(image);
+            entry.replayed.push(ReplayedCall {
+                exec_index: call.exec_index,
+                coordinates: call.coordinates.clone(),
+                input_bytes: call.input_bytes,
+                output_bytes: call.output_bytes,
+                byte_rank: 0,
+                user_cycles: m.user_cycles,
+                segments: m.segments.len() as u64,
+                padded_cycles: m.padded_cycles,
+                exec_ns: duration_ns(m.exec_time),
+            });
+            println!(
+                "Measured selected invocation {} ({})",
+                call.exec_index, call.tile_id
+            );
+        }
+        Ok(())
+    })();
+    report.complete = outcome.is_ok();
+    std::fs::write(dir.join(REPLAY_PROFILE_FILE), report.to_json()?)?;
+    println!(
+        "Replay profile saved to: {}",
+        dir.join(REPLAY_PROFILE_FILE).display()
+    );
+    outcome
+}
+
+#[cfg(test)]
+mod selective_tests {
+    use super::*;
+    #[test]
+    fn rejects_corrupt_or_missing_sample_payloads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().canonicalize().unwrap();
+        std::fs::create_dir(dir.join("samples")).unwrap();
+        let path = raster_runtime::selective_profile::payload_path(&dir, 1, "input");
+        std::fs::write(&path, b"abc").unwrap();
+        let hash = raster_runtime::selective_profile::hash(b"abc");
+        assert_eq!(sample_bytes(&dir, 1, "input", 3, &hash).unwrap(), b"abc");
+        assert!(sample_bytes(&dir, 1, "input", 2, &hash).is_err());
+        std::fs::write(&path, b"xyz").unwrap();
+        assert!(sample_bytes(&dir, 1, "input", 3, &hash).is_err());
+        assert!(sample_bytes(&dir, 2, "input", 3, &hash).is_err());
     }
 }

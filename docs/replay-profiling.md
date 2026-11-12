@@ -21,7 +21,9 @@ cargo raster replay report target/raster/runs/<run-id>
 Requirements:
 - **A completed authenticated run.** `run` writes `run.json` into the run directory only when the
   program completed. `run.json` records the input files and the CFS digest. `--no-auth` runs
-  record no trace, and failed runs are incomplete, so neither can be profiled.
+  record no trace, and failed runs are incomplete, so neither can be profiled. When using
+  `run --commit`, also pass `--save-trace`; live commitments alone do not retain replay data.
+  `run --audit` streams verification without retaining a replay trace.
 - **The RISC Zero guest toolchain.** Each tile's guest is compiled on first use and cached, the
   same as for `cargo raster build --backend risc0`.
 - **A release build of `cargo-raster` for meaningful times.** The executor runs inside the
@@ -62,7 +64,7 @@ example because the tile's code changed since the run, stops profiling.
 Replay profile — RISC Zero executor, no proving
   Run: 00000000001793385803-803200584-pid1401085-000000
   Status: complete
-  Calls: top 10 per tile by input + output bytes; 53 of 58 replayed
+  Calls: up to 10 per selected tile by input + output bytes; 53 of 58 replayed
   Cycles are guest user cycles, including the tile wrapper (input decode and hash, output encode).
   Exec: executor wall time on the measuring machine, release build.
 

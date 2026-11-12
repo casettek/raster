@@ -992,7 +992,13 @@ pub(crate) fn selected_payload_from_raster_location(
         selection.len,
         selection.range,
     )?;
-    let selected_hash = selection_payload_hash(&bytes);
+    // Only an authenticated run records a selection. Without one the hash goes
+    // nowhere, and on a weight page it is most of the cost of the read.
+    let selected_hash = if crate::auth::auth_mode().is_authenticated() {
+        selection_payload_hash(&bytes)
+    } else {
+        Hash32::default()
+    };
     let selected_len = bytes.len() as u64;
     Ok(SelectedPayload {
         bytes,
@@ -2064,7 +2070,7 @@ mod tests {
     }
 
     /// A range selection served straight from the `.rindex`, the way
-    /// `AuthenticatedObjectStore::selection_witness` serves one at `--commit` time.
+    /// `StorageLedger::selection_witness` serves one at `--commit` time.
     ///
     /// The in-memory `typed_proven_selection` path has supported ranges since
     /// `Block<T>` landed, so `select!(Block<T>, xs[a..b])` resolves in-process

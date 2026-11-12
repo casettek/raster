@@ -1,0 +1,9 @@
+# Windows host builds only: `cargo build --config vendor/windows.toml`.
+# Kept out of the workspace `Cargo.toml` so Linux and macOS builds, the root
+# `Cargo.lock` and every guest image id stay on the registry crates (a root
+# `[patch]` strips their lock pins and moves tile ids). Cargo resolves these
+# paths against this directory's parent, the workspace root.
+[patch.crates-io]
+risc0-zkvm-platform = { path = "vendor/risc0-zkvm-platform" }
+risc0-circuit-keccak = { path = "vendor/risc0-circuit-keccak" }
+risc0-zkvm = { path = "vendor/risc0-zkvm" }

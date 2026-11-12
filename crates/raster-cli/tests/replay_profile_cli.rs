@@ -151,14 +151,34 @@ fn replay_report_refuses_files_that_are_not_a_replay_profile() {
 #[ignore = "replays hello-tiles in the RISC Zero executor; needs the guest toolchain"]
 fn hello_tiles_run_then_replay_profile_and_report() {
     let example = hello_tiles_dir();
+    let inputs = tempfile::tempdir().unwrap();
+    assert_ok(
+        &Command::new("cargo")
+            .current_dir(&example)
+            .args([
+                "run",
+                "--release",
+                "--features",
+                "gen-input",
+                "--bin",
+                "gen_input",
+                "--",
+            ])
+            .arg(inputs.path())
+            .output()
+            .expect("input generator should execute"),
+        "generate replay inputs",
+    );
+    let input = inputs.path().join("input.json");
+    let manifest = inputs.path().join("input_manifest.json");
     let run = cargo_raster(
         &example,
         &[
             "run",
             "--input",
-            "input.json",
+            path_arg(&input),
             "--input-manifest",
-            "input_manifest.json",
+            path_arg(&manifest),
         ],
     );
     assert_ok(&run, "run");

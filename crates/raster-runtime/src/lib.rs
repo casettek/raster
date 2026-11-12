@@ -6,6 +6,8 @@
 //! - Trace capture and storage
 
 pub mod auth;
+mod working_storage;
+pub use working_storage::WorkingStorage;
 mod backing;
 mod entry_arguments;
 pub mod input;
@@ -49,14 +51,18 @@ pub use storage::{
     select_stored_value, stash_pending_output_encoding, stash_recur_item_binding,
     store_execution_output_value, store_value, stored_list_metadata, take_recur_item_binding,
     PendingRecurItemBinding,
-    AuthenticatedObjectStore, DraftCaptureSnapshot, ObjectStore, StorageSnapshot,
+    DraftCaptureSnapshot, ObjectSource, ObjectStore, StorageLedger, StorageSnapshot,
     StorageWriteRecord, StoredObject,
     TileExecutionScopeGuard,
 };
 pub use tracing::{
     commitment::Sha256Commitment,
-    finish, init, init_with, publish_trace_event,
+    deferred_input::{DeferArg, DeferByClone, DeferredInput, EncodeNow, InputPart},
+    finish, init, init_with, note_untraced_tile, publish_tile_event, publish_trace_event,
     publishers::{BinaryTraceEventPublisher, JsonTraceEventPublisher, Publisher},
     recorder::TraceRecorder,
-    RecurTraceScopeGuard, TraceFormat, OUTPUT_DIR_ENV, TRACE_FORMAT_ENV, TRACE_PATH_ENV,
+    trace_events_consumed, RecurTraceScopeGuard, TraceFormat, OUTPUT_DIR_ENV, TRACE_FORMAT_ENV,
+    TRACE_PATH_ENV,
 };
+
+pub mod selective_profile;

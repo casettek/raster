@@ -412,7 +412,7 @@ thread_local! {
 
 #[cfg(feature = "profiling")]
 pub(crate) fn profiling_enabled() -> bool {
-    PROFILER_STATE.with(|state| state.borrow().enabled())
+    crate::selective_profile::timing() || PROFILER_STATE.with(|state| state.borrow().enabled())
 }
 
 #[cfg(not(feature = "profiling"))]
@@ -592,10 +592,8 @@ pub(crate) fn record_sequence_draft_finalize(
                 .self_breakdown
                 .draft_materialize_ns
                 .saturating_add(materialize_ns);
-            frame.self_breakdown.draft_store_ns = frame
-                .self_breakdown
-                .draft_store_ns
-                .saturating_add(store_ns);
+            frame.self_breakdown.draft_store_ns =
+                frame.self_breakdown.draft_store_ns.saturating_add(store_ns);
         }
 
         state
@@ -688,6 +686,10 @@ pub fn record_tile_profile(
     overhead_breakdown: TileProfileOverheadBreakdown,
     sizes: TileProfileSizes,
 ) {
+    if crate::selective_profile::timing() {
+        crate::selective_profile::record_native(tile_id, &coordinates, total_duration_ns);
+        return;
+    }
     PROFILER_STATE.with(|state| {
         let mut state = state.borrow_mut();
         if !state.enabled() {
@@ -745,6 +747,10 @@ pub fn record_tile_profile(
 
 #[cfg(feature = "profiling")]
 pub fn record_tile_output_store_profile(output_store_ns: u64) {
+    if crate::selective_profile::timing() {
+        crate::selective_profile::add_output_store(output_store_ns);
+        return;
+    }
     PROFILER_STATE.with(|state| {
         let mut state = state.borrow_mut();
         if !state.enabled() || output_store_ns == 0 {
@@ -883,6 +889,7 @@ mod tests {
             30,
             20,
             TileProfileOverheadBreakdown::default(),
+            TileProfileSizes::default(),
         );
         begin_sequence_profile("nested");
         record_tile_profile(
@@ -891,6 +898,7 @@ mod tests {
             10,
             7,
             TileProfileOverheadBreakdown::default(),
+            TileProfileSizes::default(),
         );
         finish_sequence_profile("nested", 25, SequenceProfileSelfBreakdown::default());
         finish_sequence_profile("main", 100, SequenceProfileSelfBreakdown::default());
@@ -939,6 +947,7 @@ mod tests {
                 draft_capture_ns: 1,
                 ..TileProfileOverheadBreakdown::default()
             },
+            TileProfileSizes::default(),
         );
         record_tile_output_store_profile(7);
         finish_sequence_profile("main", 50, SequenceProfileSelfBreakdown::default());

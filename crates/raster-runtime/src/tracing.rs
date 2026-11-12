@@ -1,4 +1,6 @@
 pub mod commitment;
+pub mod deferred_input;
+pub mod proof_input;
 pub mod publishers;
 pub mod recorder;
 
@@ -12,6 +14,9 @@ use std::cell::Cell;
 use std::str::FromStr;
 use std::sync::Once;
 
+pub const COMMIT_PATH_ENV: &str = "RASTER_COMMIT_PATH";
+pub const COMMIT_PROJECT_ENV: &str = "RASTER_COMMIT_PROJECT";
+pub const COMMIT_WINDOW_ENV: &str = "RASTER_COMMIT_WINDOW_SIZE";
 pub const TRACE_FORMAT_ENV: &str = "RASTER_TRACE_FORMAT";
 pub const TRACE_PATH_ENV: &str = "RASTER_TRACE_PATH";
 /// Directory the program's output artifact (`output.bin` / `output.rindex` /
@@ -63,8 +68,8 @@ impl FromStr for TraceFormat {
 
 /// Initializes tracing for a program entry point.
 ///
-/// `cargo raster run` sets `RASTER_TRACE_PATH`, which enables trace capture
-/// for the CLI. `RASTER_TRACE_FORMAT` selects the file format and defaults to
+/// Commitment runs set `RASTER_COMMIT_PATH` and process events live in RAM.
+/// `RASTER_TRACE_PATH` optionally enables saved trace capture for the CLI. `RASTER_TRACE_FORMAT` selects the file format and defaults to
 /// `binary`. Plain Rust runs stay quiet by default.
 ///
 /// This function should be called once at the start of your program.
@@ -97,29 +102,82 @@ pub fn init() {
         return;
     }
 
+    if std::env::var_os(COMMIT_PATH_ENV).is_some()
+        || std::env::var_os(publishers::audit::AUDIT_PATH_ENV).is_some()
+    {
+        crate::working_storage::select(crate::WorkingStorage::Memory);
+    }
     init_runtime_state();
     if GLOBAL_PUBLISHER.get().is_some() {
         return;
     }
 
-    if let Some(trace_path) = std::env::var_os(TRACE_PATH_ENV) {
-        match trace_format_from_env() {
-            TraceFormat::Binary => {
-                let publisher = BinaryTraceEventPublisher::from_path(trace_path.into())
-                    .unwrap_or_else(|error| {
-                        panic!("Failed to initialize binary trace publisher: {}", error)
-                    });
-                install_publisher(publisher);
-            }
-            TraceFormat::Json => {
-                let publisher = JsonTraceEventPublisher::from_path(trace_path.into())
-                    .unwrap_or_else(|error| {
-                        panic!("Failed to initialize JSON trace publisher: {}", error)
-                    });
-                install_publisher(publisher);
-            }
-        }
+    if let Some(disputed) = std::env::var_os(publishers::audit::AUDIT_PATH_ENV) {
+        use publishers::audit::*;
+        install_instrumentation(
+            Box::new(AuditPublisher::new(
+                std::env::var_os(AUDIT_PROJECT_ENV)
+                    .expect("audit project")
+                    .into(),
+                disputed.into(),
+                std::env::var_os(AUDIT_OUTPUT_ENV)
+                    .expect("audit pending output")
+                    .into(),
+                std::env::var(AUDIT_BINDING_ENV).expect("audit binding"),
+            )
+            .expect("initialize live audit")),
+            false,
+        );
+        return;
     }
+
+    let trace: Option<Box<dyn Publisher>> =
+        std::env::var_os(TRACE_PATH_ENV).map(|trace_path| match trace_format_from_env() {
+            TraceFormat::Binary => Box::new(
+                BinaryTraceEventPublisher::from_path(trace_path.into())
+                    .expect("initialize binary trace"),
+            ) as Box<dyn Publisher>,
+            TraceFormat::Json => Box::new(
+                JsonTraceEventPublisher::from_path(trace_path.into())
+                    .expect("initialize JSON trace"),
+            ) as Box<dyn Publisher>,
+        });
+    if let Some(output) = std::env::var_os(COMMIT_PATH_ENV) {
+        let project = std::env::var_os(COMMIT_PROJECT_ENV).expect("missing commitment project");
+        let window = std::env::var(COMMIT_WINDOW_ENV)
+            .expect("missing commitment window")
+            .parse()
+            .expect("invalid commitment window");
+        let config = raster_prover::trace::FraudProofConfig::from_window_size(window)
+            .expect("invalid commitment window");
+        let publisher = publishers::commitment::CommitmentPublisher::new(
+            project.into(),
+            output.into(),
+            config,
+            trace,
+        )
+        .expect("initialize live commitment");
+        let program_thread = publisher.needs_program_thread();
+        install_instrumentation(Box::new(publisher), program_thread);
+    } else if let Some(trace) = trace {
+        install_instrumentation(trace, false);
+    }
+}
+
+/// Install the run's publisher on its own thread, so the program does not wait
+/// for its instrumentation, unless it has to share the program's thread:
+/// profiling and selective capture read that thread's state.
+fn install_instrumentation(publisher: Box<dyn Publisher>, program_thread: bool) {
+    use publishers::worker::WorkerPublisher;
+    let publisher = if program_thread
+        || crate::profiling::profiling_enabled()
+        || !WorkerPublisher::enabled()
+    {
+        publisher
+    } else {
+        Box::new(WorkerPublisher::spawn(publisher))
+    };
+    let _ = GLOBAL_PUBLISHER.set(publisher);
 }
 
 /// Initializes the global subscriber with a custom subscriber.
@@ -203,6 +261,23 @@ pub fn finish() {
 
 #[doc(hidden)]
 pub fn publish_trace_event(event: TraceEvent) {
+    let event = census_and_rewrite(event);
+    if let Some(publisher) = GLOBAL_PUBLISHER.get() {
+        publisher.publish(event);
+    }
+}
+
+/// [`publish_trace_event`] for a tile event whose `FnInput::data` is still to
+/// be encoded from `input`, by the publisher.
+#[doc(hidden)]
+pub fn publish_tile_event(event: TraceEvent, input: deferred_input::DeferredInput) {
+    let event = census_and_rewrite(event);
+    if let Some(publisher) = GLOBAL_PUBLISHER.get() {
+        publisher.publish_deferred(event, input);
+    }
+}
+
+fn census_and_rewrite(event: TraceEvent) -> TraceEvent {
     // Before the publisher check: an unauthenticated run installs no publisher,
     // and its tiles — and the events it would have traced — are exactly the
     // ones an authenticated run has.
@@ -222,9 +297,30 @@ pub fn publish_trace_event(event: TraceEvent) {
         }
     });
     crate::tile_census::note_trace_event(trace_event_variant(&event));
-    if let Some(publisher) = GLOBAL_PUBLISHER.get() {
-        publisher.publish(event);
-    }
+    event
+}
+
+/// Whether anything reads trace events: only an installed publisher does.
+/// Without one (an unauthenticated run, or an authenticated one that records
+/// nothing) a tile's generated code skips building its event, the costliest
+/// part of which is serializing every argument once more, and calls
+/// [`note_untraced_tile`] instead.
+#[doc(hidden)]
+pub fn trace_events_consumed() -> bool {
+    GLOBAL_PUBLISHER.get().is_some()
+}
+
+/// What [`publish_trace_event`] does with a tile's event when nothing reads
+/// it: count it in the census, under the variant it would have been traced as.
+#[doc(hidden)]
+pub fn note_untraced_tile(fn_name: &str) {
+    crate::tile_census::note_tile_execution(fn_name);
+    let in_recur = RECUR_TRACE_DEPTH.with(|depth| depth.get() > 0);
+    crate::tile_census::note_trace_event(if in_recur {
+        "RecurTileIterationExec"
+    } else {
+        "TileExec"
+    });
 }
 
 /// The variant's own name, for the census. Kept exhaustive on purpose: a new

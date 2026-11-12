@@ -47,7 +47,7 @@ pub use collections::{
     bytes_field_key, bytes_schema, check_bytes_geometry, check_page_partition, check_page_shape,
     expected_page_len, page_count, page_index_for_field, page_index_for_region,
     page_range_for_field, page_range_for_region, Block, Bytes, BytesFieldPageSize, BytesPage, List,
-    Materializable, PageSized,
+    Materializable, PageSized, SnapshotClone,
 };
 pub use error::{Error, Result};
 
@@ -57,3 +57,7 @@ pub use postcard;
 // Re-export bincode for std-only code that needs it
 #[cfg(feature = "std")]
 pub use bincode;
+
+// Host-side: a coordinate index that can rewind. Kept out of the guests.
+#[cfg(feature = "journal")]
+pub mod coordinate_index_journal;
