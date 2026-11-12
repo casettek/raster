@@ -11,8 +11,11 @@ description = "CLI tool for the Raster toolchain"
 default = []
 # Enable Metal GPU acceleration for proving (macOS Apple Silicon)
 metal = ["raster-backend-risc0/metal"]
-# Enable CUDA GPU acceleration for proving (NVIDIA GPUs)
+# Enable CUDA GPU acceleration for proving (NVIDIA GPUs). The final Groth16 wrap
+# stays on the Docker prover.
 cuda = ["raster-backend-risc0/cuda"]
+# `cuda`, with the Groth16 wrap on the GPU as well (see raster-backend-risc0).
+cuda-groth16 = ["raster-backend-risc0/cuda-groth16"]
 
 [[bin]]
 name = "cargo-raster"

@@ -11,8 +11,21 @@ description = "RISC0 zkVM backend for the Raster toolchain"
 default = []
 # Enable Metal GPU acceleration for proving (macOS Apple Silicon)
 metal = ["risc0-zkvm/metal"]
-# Enable CUDA GPU acceleration for proving (NVIDIA GPUs)
-cuda = ["risc0-zkvm/cuda"]
+# Enable CUDA GPU acceleration for proving (NVIDIA GPUs): the STARK provers and
+# recursion. The final Groth16 wrap stays on RISC Zero's Docker prover.
+#
+# risc0-zkvm's own `cuda` is only a list of its provers' `cuda` features, and it
+# includes `risc0-groth16/cuda`, which replaces the Docker wrapper with a native
+# CUDA one. On an RTX 5080 that wrapper returned a receipt that fails
+# verification. So the provers are named here one by one, without the wrapper.
+cuda = [
+    "risc0-circuit-keccak/cuda",
+    "risc0-circuit-recursion/cuda",
+    "risc0-circuit-rv32im/cuda",
+    "risc0-zkp/cuda",
+]
+# `cuda`, with the Groth16 wrap on the GPU as well: all of risc0-zkvm's `cuda`.
+cuda-groth16 = ["cuda", "risc0-zkvm/cuda"]
 
 [dependencies]
 # This crate uses std-gated raster-core APIs (e.g. `Error::Io`), so it must
@@ -29,6 +42,13 @@ rayon.workspace = true
 # RISC0 zkVM dependencies
 risc0-zkvm = { version = "3.0", default-features = false, features = ["prove", "std"] }
 risc0-build = "3.0"
+# risc0-zkvm's provers, named only so `cuda` can turn on their GPU code without
+# risc0-zkvm's own `cuda` (see [features]). Declared as risc0-zkvm declares
+# them; without `cuda` they are not dependencies of this crate at all.
+risc0-circuit-keccak = { version = "4.0", default-features = false, optional = true }
+risc0-circuit-recursion = { version = "4.0", default-features = false, optional = true }
+risc0-circuit-rv32im = { version = "4.0", default-features = false, optional = true }
+risc0-zkp = { version = "3.0", default-features = false, optional = true }
 
 # Tile guests: staged, path-independent builds
 raster-guest-build.workspace = true

@@ -241,11 +241,13 @@ matching Raster build. Development mode and fake receipts are forbidden.
 
 For composite or succinct inputs, the Groth16 wrapping step requires a working
 local Docker engine: `docker info` must succeed. Build Raster with
-`--features cuda` to accelerate STARK proof compression on the GPU. RISC Zero's
-`cuda` feature also switches the final Groth16 wrapper from Docker to its native
-CUDA prover, which hit an illegal CUDA memory access on an RTX 5080. The first
-run may download proving assets/container images. Remote proving settings are
-not used.
+`--features cuda` to prove and compress STARKs on the GPU; the final Groth16
+wrapper still runs in Docker. `--features cuda-groth16` moves that wrapper to
+RISC Zero's native CUDA prover as well, which is what RISC Zero's own `cuda`
+feature does. That prover is opt-in because on an RTX 5080 it hit an illegal
+CUDA memory access and, later, returned a receipt that fails verification. The
+first run may download proving assets/container images. Remote proving settings
+are not used.
 Already-Groth16 inputs are verified and exported without recompression or Docker.
 
 
